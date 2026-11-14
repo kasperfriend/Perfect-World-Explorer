@@ -1456,6 +1456,17 @@ pub struct FarVertex {
     pos: [f32; 3],
     normal: [i8; 4],
 }
+/// Custom far-mesh stride beyond the native terrain window. Increasing the
+/// stride lowers far-geometry vertex/index work quadratically; near terrain is
+/// still selected and meshed by the recovered client LOD rules.
+pub fn far_lod_step(setting: u8) -> usize {
+    match setting {
+        0 => 4,
+        1 => 8,
+        _ => 16,
+    }
+}
+
 pub fn world_mesh(
     t: &Terrain,
     step: usize,
@@ -1542,6 +1553,15 @@ fn grid_axis(size: usize, step: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_far_lod_steps_get_coarser_without_changing_the_native_window() {
+        let steps = [0, 1, 2].map(far_lod_step);
+        assert_eq!(steps, [4, 8, 16]);
+        assert_eq!((32 / steps[0]).pow(2), 4 * (32 / steps[1]).pow(2));
+        assert_eq!((32 / steps[0]).pow(2), 16 * (32 / steps[2]).pow(2));
+        assert_eq!(far_lod_step(u8::MAX), 16);
+    }
 
     #[test]
     fn run_records_draw_what_the_per_run_loop_draws() {

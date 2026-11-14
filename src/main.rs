@@ -234,6 +234,7 @@ struct Terrain {
     /// (`0x424020`). Owned here because `Terrain` lives on the streaming worker.
     scenery_residency: scenery_visibility::RegionResidency,
     terrain_material_window: Option<Option<[usize; 4]>>,
+    terrain_far_lod: Option<u8>,
     models: world_models::Assets,
     water_normals: Vec<Vec<image::RgbaImage>>,
     water_simple_frames: Vec<Vec<image::RgbaImage>>,
@@ -1043,6 +1044,7 @@ fn terrain(
         scene,
         scenery_residency: scenery_visibility::RegionResidency::default(),
         terrain_material_window: None,
+        terrain_far_lod: None,
         map: map.clone(),
         element: element.clone(),
         grass,

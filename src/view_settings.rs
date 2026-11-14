@@ -85,6 +85,9 @@ pub struct DetailSettings {
     pub radius: isize,
     /// Restore the finite native terrain window instead of the viewer far mesh.
     pub terrain_cutoff: bool,
+    /// Coarseness of the custom far-terrain mesh beyond the native window.
+    /// `0/1/2` select strides 4/8/16; the near-window perimeter is stitched to match.
+    pub far_terrain_lod: u8,
     pub tree_lod_scale: f32,
     /// Native `CECSceneBlock` quality preset (`0x424230`, `Sight+1` at
     /// `0x40e155`). Preset 2 is the shipped `detail_scene = 1` default and
@@ -96,6 +99,7 @@ impl Default for DetailSettings {
         Self {
             radius: 7,
             terrain_cutoff: false,
+            far_terrain_lod: 0,
             tree_lod_scale: 1.0,
             scenery_quality: 2,
         }
@@ -328,6 +332,11 @@ impl ViewSettings {
             match k {
                 "sharpen" => flag!(s.sharpen),
                 "terrain_cutoff" => flag!(s.detail.terrain_cutoff),
+                "far_terrain_lod" => {
+                    if let Ok(x) = v.parse::<u8>() {
+                        s.detail.far_terrain_lod = x.min(2)
+                    }
+                }
                 "radius" => {
                     if let Ok(x) = v.parse::<isize>() {
                         s.detail.radius = x.clamp(2, 12)
@@ -475,11 +484,11 @@ impl ViewSettings {
     }
     fn encode(&self) -> String {
         format!(concat!("# Perfect World Explorer settings, version 1\n",
-            "radius={}\nterrain_cutoff={}\ntree_lod_scale={}\nscenery_quality={}\ncamera_speed={}\nboost={}\nsensitivity={}\nfar={}\ntime_of_day={}\ntime_pass_enabled={}\ntime_pass_speed={}\nall_to_vram={}\n",
+            "radius={}\nterrain_cutoff={}\nfar_terrain_lod={}\ntree_lod_scale={}\nscenery_quality={}\ncamera_speed={}\nboost={}\nsensitivity={}\nfar={}\ntime_of_day={}\ntime_pass_enabled={}\ntime_pass_speed={}\nall_to_vram={}\n",
             "whole_world={}\nwater_reflections={}\nworld_effects={}\natmospheric_fog={}\nbloom={}\nbloom_strength={}\nbloom_mode={}\nbloom_tint={}\nbloom_brightness_fade={}\nbloom_opacity_fade={}\nclient_gamma={}\ngamma_setting={}\n",
             "terrain_lightmaps={}\nmodel_backface_culling={}\nmusic_enabled={}\nmusic_volume={}\nambience_enabled={}\nsound_volume={}\neffects_enabled={}\neffects_volume={}\nfullscreen={}\nshow_zone_entry={}\n",
             "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\nselected_world={}\n"),
-            self.detail.radius,self.detail.terrain_cutoff,self.detail.tree_lod_scale,self.detail.scenery_quality,self.camera_speed,self.boost,self.sensitivity,self.far,self.time_of_day,self.time_pass_enabled,self.time_pass_speed,self.all_to_vram,
+            self.detail.radius,self.detail.terrain_cutoff,self.detail.far_terrain_lod,self.detail.tree_lod_scale,self.detail.scenery_quality,self.camera_speed,self.boost,self.sensitivity,self.far,self.time_of_day,self.time_pass_enabled,self.time_pass_speed,self.all_to_vram,
             self.whole_world,self.water_reflections,self.world_effects,self.atmospheric_fog,self.bloom,self.bloom_strength,self.bloom_mode,self.bloom_tint,self.bloom_brightness_fade,self.bloom_opacity_fade,self.client_gamma,self.gamma_setting,
             self.terrain_lightmaps,self.model_backface_culling,self.music_enabled,self.music_volume,self.ambience_enabled,self.sound_volume,self.effects_enabled,self.effects_volume,self.fullscreen,self.show_zone_entry,
             self.show_minimap,self.minimap_range,self.tree_wind_strength,self.client_tree_wind_preview,self.regional_tree_lighting,self.grass_distance_fade,self.grass_wind_enabled,self.grass_wind_amplitude,self.streamed_regions,self.area_grass_lightmaps,self.vegetation_authored_mips,self.celestial_discs,self.celestial_brightness,self.ignore_celestial_flags,self.cloud_detail,self.sharpen,self.resolution_scale,
@@ -643,6 +652,7 @@ mod tests {
         let mut s = ViewSettings::default();
         s.detail.radius = 11;
         s.detail.terrain_cutoff = true;
+        s.detail.far_terrain_lod = 2;
         s.bloom = true;
         s.whole_world = true;
         s.camera_speed = 511.;
@@ -689,6 +699,34 @@ mod tests {
         assert!(ViewSettings::decode(&enabled.encode()).client_tree_wind_preview);
         assert!(!ViewSettings::decode("client_tree_wind_preview=invalid").client_tree_wind_preview);
     }
+    #[test]
+    fn far_terrain_lod_round_trips_and_is_bounded() {
+        assert_eq!(ViewSettings::default().detail.far_terrain_lod, 0);
+        assert_eq!(
+            ViewSettings::decode("far_terrain_lod=1")
+                .detail
+                .far_terrain_lod,
+            1
+        );
+        assert_eq!(
+            ViewSettings::decode("far_terrain_lod=99")
+                .detail
+                .far_terrain_lod,
+            2
+        );
+        assert_eq!(
+            ViewSettings::decode("far_terrain_lod=bad")
+                .detail
+                .far_terrain_lod,
+            0
+        );
+        let settings = ViewSettings::decode("far_terrain_lod=2");
+        assert_eq!(
+            ViewSettings::decode(&settings.encode()).detail.far_terrain_lod,
+            2
+        );
+    }
+
     #[test]
     fn scenery_quality_preset_round_trips_and_is_bounded() {
         assert_eq!(ViewSettings::default().detail.scenery_quality, 2);

@@ -246,7 +246,7 @@ pub fn block_surface(level: u8, cases: [u8; 4]) -> BlockSurface {
     // that half of the corner cell, which is what keeps the corners gap- and
     // overlap-free (see the coverage tests).
     for side in 0..4usize {
-        let m = 1usize << cases[side].min(2);
+        let m = 1usize << cases[side].min(4);
         let (outer_line, inner_line) = match side {
             0 => (0usize, 1usize), // north: j = 0 / 1
             1 => (u, u - 1),       // south: j = u / u-1
@@ -337,14 +337,23 @@ pub struct WindowLod {
 }
 
 impl WindowLod {
-    /// Viewer-only join to the persistent four-cell far grid. Internal edges
-    /// still use the recovered neighbor rule; only the perimeter is matched.
+    /// Viewer-only join to a custom far grid. Internal edges still use the
+    /// recovered neighbour rule; only the perimeter is matched. The surface
+    /// builder accepts up to four extra edge doublings so custom far strides up
+    /// to 16 cells can meet the native level-3 one-cell edge without a T-junction.
     pub fn stitch_far_boundary(&mut self) {
+        self.stitch_far_boundary_stride(4);
+    }
+
+    pub fn stitch_far_boundary_stride(&mut self, far_stride: usize) {
+        assert!(far_stride.is_power_of_two());
         let win = self.window;
         for y in win.y0..win.y1 {
             for x in win.x0..win.x1 {
                 let i = (y - win.y0) * (win.x1 - win.x0) + x - win.x0;
-                let case = self.level(x, y).saturating_sub(1);
+                let own_stride = step(self.level(x, y));
+                assert!(far_stride >= own_stride && far_stride % own_stride == 0);
+                let case = (far_stride / own_stride).trailing_zeros() as u8;
                 for (side, boundary) in [y == win.y0, y + 1 == win.y1, x == win.x0, x + 1 == win.x1]
                     .into_iter()
                     .enumerate()
@@ -492,6 +501,40 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_far_strides_stitch_to_every_native_edge_level_without_holes() {
+        for far_stride in [4usize, 8, 16] {
+            for level in 1..=MAX_LEVEL {
+                let own_stride = step(level);
+                let ratio = far_stride / own_stride;
+                assert!(ratio.is_power_of_two());
+                let mut lod = WindowLod {
+                    window: Window {
+                        x0: 0,
+                        y0: 0,
+                        x1: 1,
+                        y1: 1,
+                    },
+                    levels: vec![level],
+                    cases: vec![[0; 4]],
+                };
+                lod.stitch_far_boundary_stride(far_stride);
+                let cases = lod.cases[0];
+                for side in 0..4 {
+                    assert_eq!(edge_stride(level, cases[side]), far_stride);
+                }
+                let surface = block_surface(level, cases);
+                let (samples, uncovered_or_overlapped) =
+                    coverage(&[([0., 0.], surface)], 0., CELLS as f32, 0.25);
+                assert!(samples > 0);
+                assert_eq!(
+                    uncovered_or_overlapped, 0,
+                    "far stride {far_stride}, native level {level}"
+                );
             }
         }
     }
