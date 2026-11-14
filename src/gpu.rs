@@ -3775,7 +3775,7 @@ impl Camera {
 /// format choice matches the first creation exactly.
 fn recreate_surface(
     instance: &wgpu::Instance,
-    window: &Arc<Window>,
+    window: &Arc<winit::window::Window>,
     adapter: &wgpu::Adapter,
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
