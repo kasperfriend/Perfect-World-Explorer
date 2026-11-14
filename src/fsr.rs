@@ -79,6 +79,7 @@ mod imp_stub {
             _render_extent: (u32, u32),
             _display_extent: (u32, u32),
             _format: wgpu::TextureFormat,
+            _fsr_version_major: u32,
         ) -> Result<FsrUpscaler, String> {
             Err("FSR is only supported on Windows with a DX12 backend".to_string())
         }
@@ -118,6 +119,10 @@ mod imp_stub {
 
         pub fn display_extent(&self) -> (u32, u32) {
             (0, 0)
+        }
+
+        pub fn version_major(&self) -> u32 {
+            0
         }
     }
 }
