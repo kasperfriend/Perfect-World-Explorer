@@ -26,11 +26,17 @@
 //! and lights do not, and [`Manager::set_effects_enabled`] gates it, so a host
 //! can turn world effects off without losing its light producers.
 //!
-//! Explicitly NOT implemented: the visual effect's alpha/attenuation fade over
-//! distance, and a ground sample for `MatchGrnd`/`GroundHeight` — world owners
-//! advance with no ground, so those two keys stay inert here exactly as they do
-//! for an owner whose +0x1f4 byte is clear. Those remain in
-//! Findings/Unsupported-client-paths.md; they do not fake light producers.
+//! The distance fade is carried here as [`Manager::set_attenuation`]: the
+//! ornament manager computes it (`CECOrnamentMan::Update` compares the record's
+//! position with the host player against `SCNRES_EFFECT` and calls `FadeGFX`,
+//! EC_ManOrnament.cpp:279-292), and the owner only multiplies it into the root
+//! alpha. The owner stays loaded through the fade, exactly as the client leaves
+//! it loaded after `SetAlphaTransition`.
+//!
+//! Explicitly NOT implemented: a ground sample for `MatchGrnd`/`GroundHeight` —
+//! world owners advance with no ground, so those two keys stay inert here
+//! exactly as they do for an owner whose +0x1f4 byte is clear. That remains in
+//! Findings/Unsupported-client-paths.md; it does not fake light producers.
 
 #![allow(dead_code)]
 
@@ -193,6 +199,43 @@ pub fn placement_transform(
     ])
 }
 
+/// The intensity factor an ECWLD effect record authors, in the shape
+/// [`Request::outer`] carries it: white, with the record's alpha (`0x5b33f3`
+/// copies offset 52 straight into the GFX node) as the fourth component.
+///
+/// Dropping it is what made a scene effect louder than the client draws it.
+/// `A3DOrnamentMan::LoadEffect` reads that float for every placement, and the
+/// player folds it into every element's colour, so an owner installed without it
+/// runs at full strength: the seal dome around the City of Raging Tides crystal
+/// is authored **0.300** and the floating city **2.000**. 266 of the map's 2,274
+/// placements differ from 1.0 (min 0.2, max 5.0), so this is not a rounding
+/// detail — it is the difference between a soft dome and a white sheet.
+pub fn scene_alpha(alpha: f32) -> Option<[f32; 4]> {
+    if !alpha.is_finite() {
+        return None;
+    }
+    // The node's alpha is a byte once it reaches a vertex, so the authored
+    // multiplier is clamped before it is folded in. The 10 November report is
+    // the measurement for the upper bound: records authoring 2.0 (the floating
+    // city, `主城光球小`) and 5.0 turned the craters' blue sheets brighter than
+    // retail, because a half-alpha element at x2 saturates where the client
+    // leaves it at half.
+    Some([1., 1., 1., alpha.clamp(0., 1.)])
+}
+
+/// The uniform scale a placement matrix carries. [`placement_transform`] bakes
+/// the authored scale into the three basis columns, so the column length is the
+/// scale and nothing else.
+pub fn placement_scale(columns: &[f32; 16]) -> f32 {
+    let length =
+        (columns[0] * columns[0] + columns[1] * columns[1] + columns[2] * columns[2]).sqrt();
+    if length.is_finite() && length > 1e-6 {
+        length
+    } else {
+        1.
+    }
+}
+
 /// Normalize an ECWLD/ECM GFX reference into an archive path. Mirrors the
 /// normalized-PCK lookup used for models so `scene\\x.gfx` and `gfx/scene/x.gfx`
 /// name the same root.
@@ -233,6 +276,17 @@ struct Owner {
     /// owner keeps publishing its lights, which is what it did before the graph
     /// was implemented at all.
     player_failed: bool,
+    /// Distance fade, 0..1, multiplied into the root alpha every tick.
+    ///
+    /// The client fades a placed effect rather than popping it:
+    /// `CECOrnamentMan::Update` calls `FadeGFX(node, near)` whenever a node with
+    /// `bAttenuation` is further from the host player than
+    /// `CECSceneBlock::GetResLoadDists(SCNRES_EFFECT)` (EC_ManOrnament.cpp:279),
+    /// and `FadeGFX` is a 3,000 ms `SetAlphaTransition(max_alpha * fAlpha)`
+    /// (`:961-966`) with `max_alpha` pinned to `1.0f` at load (`:957`). The owner
+    /// stays *loaded* through the fade — `Release()` runs only in the
+    /// time-of-day branch — so this is an alpha ramp, not activation.
+    attenuation: f32,
 }
 
 /// Publication identity: owner serial in the high half, element index in the
@@ -315,6 +369,150 @@ pub struct Manager {
     effects: bool,
     effect_failures: Vec<String>,
     effect_warnings: Vec<String>,
+    /// `PWE_EFFECT_CENSUS=1` turns the effect pass into a report: every visible
+    /// root's largest quad, its texture, its blend pair and where it sat. A
+    /// screenshot can say "white blob at the altar" but not which of the 2,275
+    /// installed roots drew it, and the status line only counts quads.
+    census: Option<Census>,
+    /// Each root's clock at the previous census report, so the next one can say
+    /// whether it moved. Keyed by path: the census is about roots, not instances.
+    census_clocks: std::collections::HashMap<String, f32>,
+}
+
+/// How often the census repeats while the variable is set. Two seconds is long
+/// enough to read one report before the next, and short enough that walking to
+/// an artefact and back does not need a restart.
+const CENSUS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// One root's contribution to a census line.
+struct CensusRow {
+    path: String,
+    quads: usize,
+    width: f32,
+    height: f32,
+    centre: [f32; 3],
+    texture: String,
+    source: u32,
+    destination: u32,
+    alpha: f32,
+    /// The root clock in milliseconds when this row was taken. A row that keeps
+    /// quoting the same clock across two reports is a frozen effect, whatever its
+    /// sheet looks like.
+    clock: f32,
+    /// How far that clock moved since the previous report, or `None` on the first
+    /// one. The census repeats every two seconds, so a running root says
+    /// `+2001ms` and a frozen one `+0ms` — which is the whole question a "the
+    /// waterfall stands still" report turns on.
+    since_last: Option<f32>,
+}
+
+struct Census {
+    next: std::time::Instant,
+}
+
+fn census_width(row: &CensusRow) -> f32 {
+    row.width * row.height
+}
+
+/// The largest quad one root drew this frame, with the identity of the element
+/// that submitted it. `EffectQuad` carries no element id, so the texture, the
+/// blend pair and the world size are what identify it; between them and the
+/// root path a corpus search finds the element.
+fn census_row(path: &str, quads: &[EffectQuad], clock: f32) -> CensusRow {
+    let span = |a: [f32; 3], b: [f32; 3]| {
+        let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+    };
+    let mut row = CensusRow {
+        path: path.to_string(),
+        quads: quads.len(),
+        width: 0.,
+        height: 0.,
+        centre: [0.; 3],
+        texture: String::new(),
+        source: 0,
+        destination: 0,
+        alpha: 0.,
+        clock,
+        since_last: None,
+    };
+    let mut best = 0f32;
+    for quad in quads {
+        let corners = quad.positions;
+        // Corner order is (top-left, top-right, bottom-left, bottom-right), so
+        // the height is corner 2 and corner 0 — not corner 3, which is the
+        // diagonal. Reading the diagonal reported a square 404-unit ring as
+        // `404 x 571` and a 71.83 x 2514 shaft as `71.83 x 2515.07`.
+        let width = span(corners[0], corners[1]);
+        let height = span(corners[0], corners[2]);
+        let area = width * height;
+        if !(area > best) {
+            continue;
+        }
+        best = area;
+        row.width = width;
+        row.height = height;
+        row.centre = [
+            (corners[0][0] + corners[1][0] + corners[2][0] + corners[3][0]) / 4.,
+            (corners[0][1] + corners[1][1] + corners[2][1] + corners[3][1]) / 4.,
+            (corners[0][2] + corners[1][2] + corners[2][2] + corners[3][2]) / 4.,
+        ];
+        row.texture = quad.texture.clone();
+        row.source = quad.source_blend;
+        row.destination = quad.destination_blend;
+        row.alpha = quad.color[3];
+    }
+    row
+}
+
+/// Format the census: total quads plus the roots that drew the largest single
+/// quad. Largest first, because a "blob" in a screenshot is a big quad.
+///
+/// `previous` carries each root's clock from the last report into this one, so a
+/// line can say `dclock=+2001ms` (the effect is running) or `dclock=+0ms` (it is
+/// frozen) rather than leaving a reader to compare two files by hand.
+fn census_report(
+    rows: &mut [CensusRow],
+    total: usize,
+    previous: &mut std::collections::HashMap<String, f32>,
+) -> String {
+    for row in rows.iter_mut() {
+        row.since_last = previous
+            .insert(row.path.clone(), row.clock)
+            .map(|last| row.clock - last);
+    }
+    rows.sort_by(|a, b| census_width(b).total_cmp(&census_width(a)));
+    let mut report = format!(
+        "Effect census: {total} quads from {} visible roots\n",
+        rows.len()
+    );
+    for row in rows.iter().take(20) {
+        let texture = if row.texture.is_empty() {
+            "-"
+        } else {
+            row.texture.as_str()
+        };
+        let moved = match row.since_last {
+            Some(delta) => format!("{delta:+.0}ms"),
+            None => "first".to_string(),
+        };
+        report.push_str(&format!(
+            "  {:.1}x{:.1} at ({:.1},{:.1},{:.1}) quads={} clock={:.0}ms dclock={moved} \
+             tex={texture} blend={}/{} alpha={:.2} {}\n",
+            row.width,
+            row.height,
+            row.centre[0],
+            row.centre[1],
+            row.centre[2],
+            row.quads,
+            row.clock,
+            row.source,
+            row.destination,
+            row.alpha,
+            row.path
+        ));
+    }
+    report
 }
 
 impl Default for Manager {
@@ -339,6 +537,10 @@ impl Manager {
             effects: true,
             effect_failures: Vec::new(),
             effect_warnings: Vec::new(),
+            census: std::env::var_os("PWE_EFFECT_CENSUS").map(|_| Census {
+                next: std::time::Instant::now() + CENSUS_INTERVAL,
+            }),
+            census_clocks: std::collections::HashMap::new(),
         }
     }
 
@@ -390,6 +592,36 @@ impl Manager {
         {
             return Err(format!("duplicate GFX owner identity {}", request.identity));
         }
+        // The scene channel: the record exactly as the map asked for it. Paired
+        // with `effect-roots` (which says what the loader did with it) this is the
+        // whole path from `world.ecwld` to a drawn card.
+        crate::diag!(
+            SceneEffects,
+            "{} -> {} speed={:.3} start={}ms span={:?} alpha={:?} active={} \
+             pos=({:.1},{:.1},{:.1}) right=({:.2},{:.2},{:.2}) up=({:.2},{:.2},{:.2}) \
+             dir=({:.2},{:.2},{:.2}) scale_x={:.3} attached={}",
+            request.origin,
+            request.path,
+            request.speed,
+            request.start_ms,
+            request.span_ms,
+            request.outer.map(|outer| outer[3]),
+            request.active,
+            request.transform[12],
+            request.transform[13],
+            request.transform[14],
+            request.transform[0],
+            request.transform[1],
+            request.transform[2],
+            request.transform[4],
+            request.transform[5],
+            request.transform[6],
+            request.transform[8],
+            request.transform[9],
+            request.transform[10],
+            placement_scale(&request.transform),
+            request.attachment.is_some()
+        );
         let serial = self.next_serial;
         self.next_serial = self.next_serial.wrapping_add(1);
         self.owners.push(Owner {
@@ -399,6 +631,7 @@ impl Manager {
             state: State::Pending,
             player: None,
             player_failed: false,
+            attenuation: 1.,
         });
         Ok(())
     }
@@ -436,6 +669,30 @@ impl Manager {
             }
             None => false,
         }
+    }
+
+    /// Fade one owner's root to `fade` (0..1) without unloading it.
+    ///
+    /// Called once per frame for owners whose ECWLD record sets `bAttenuation`;
+    /// the manager only carries the number, `CECOrnamentMan` owns the ramp.
+    /// Returns false when the identity is not owned, so a stale producer can
+    /// never dim somebody else's root.
+    pub fn set_attenuation(&mut self, identity: u64, fade: f32) -> bool {
+        let Some(owner) = self
+            .owners
+            .iter_mut()
+            .find(|o| o.request.identity == identity)
+        else {
+            return false;
+        };
+        let fade = if fade.is_finite() {
+            fade.clamp(0., 1.)
+        } else {
+            1.
+        };
+        let changed = (owner.attenuation - fade).abs() > f32::EPSILON;
+        owner.attenuation = fade;
+        changed
     }
 
     /// Install or replace the live parent transform of an attached owner.
@@ -613,41 +870,150 @@ impl Manager {
     /// factor `0x5b33f3` copies into the GFX node — scales the root the way it
     /// scales a light. The placement already carries the authored scale, so the
     /// player is given a unit one. Nothing at this level can answer a ground
-    /// query, so `MatchGrnd` and `GroundHeight` stay inert for world effects.
+    /// query, so this entry point leaves `MatchGrnd` and `GroundHeight` inert;
+    /// [`Self::effect_quads_with_ground`] is the one that can.
     pub fn effect_quads(&mut self, delta_ms: u32, view: &View) -> Vec<EffectQuad> {
+        self.effect_quads_with_ground(delta_ms, view, None)
+    }
+
+    /// The same pass with the world's terrain in hand, so a ground-matched decal
+    /// can be draped over the surface instead of drawn as one flat card.
+    ///
+    /// This is the only way ground data reaches a player at this level. The
+    /// client's owner raycasts at its own position every frame (`0x6e53f0`), and
+    /// nothing here owns terrain, so the caller that does — the renderer, which
+    /// holds the map's height grid — hands the query down. Without it every
+    /// ground path stays inert and the 906 corpus elements that set `MatchGrnd`
+    /// on a sprite keep their single flat quad.
+    pub fn effect_quads_with_ground(
+        &mut self,
+        delta_ms: u32,
+        view: &View,
+        terrain: Option<crate::gfx_player::GroundHeightQuery<'_>>,
+    ) -> Vec<EffectQuad> {
         let mut out = Vec::new();
         if !self.effects {
             return out;
         }
+        // Report only when one is due; the rows themselves allocate, so nothing
+        // is collected on the frames between reports.
+        let mut rows = match self.census.as_mut() {
+            Some(census) if std::time::Instant::now() >= census.next => {
+                census.next = std::time::Instant::now() + CENSUS_INTERVAL;
+                Some(Vec::with_capacity(self.owners.len()))
+            }
+            _ => None,
+        };
         let mut failures = Vec::new();
         for owner in &mut self.owners {
             if !matches!(owner.state, State::Live { .. }) {
                 continue;
             }
             if !owner.request.active || owner.elapsed < owner.request.start_ms {
-                owner.player = None;
+                if owner.player.take().is_some() {
+                    crate::diag!(
+                        EffectRoots,
+                        "{} released: active={} elapsed={:.0}ms start={:.0}ms",
+                        owner.request.path,
+                        owner.request.active,
+                        owner.elapsed,
+                        owner.request.start_ms
+                    );
+                }
+                // Culling is the channel that filled a report with one repeated
+                // line per root per frame. Keyed by root, so every root says
+                // once why it is not drawn, and says it again only every ten
+                // seconds while that stays true.
+                crate::diag_keyed!(
+                    EffectCulling,
+                    format!("{} skipped", owner.request.path),
+                    10_000,
+                    "{} skipped: active={} elapsed={:.0}ms start={:.0}ms",
+                    owner.request.path,
+                    owner.request.active,
+                    owner.elapsed,
+                    owner.request.start_ms
+                );
                 continue;
             }
-            let scaled = (delta_ms as f32 * owner.request.speed).max(0.);
-            let alpha = owner.request.outer.map_or(1., |outer| outer[3]);
-            let transform = match owner.request.world_transform() {
-                Ok(columns) => Mat4::from_cols_array(&columns),
+            // The record's alpha is the *target* of the client's distance fade,
+            // not a second factor beside it: `FadeGFX` ramps the root to
+            // `max_alpha * fAlpha` and then holds it there, so the drawn alpha is
+            // `fAlpha * fade`. An owner with no `outer` colour draws at the
+            // fade alone (full alpha when nothing attenuates it).
+            let alpha = owner.request.outer.map_or(1., |outer| outer[3]) * owner.attenuation;
+            let world = match owner.request.world_transform() {
+                Ok(columns) => columns,
                 Err(error) => {
                     failures.push((owner.request.origin.clone(), error));
                     owner.player = None;
                     continue;
                 }
             };
+            let transform = Mat4::from_cols_array(&world);
+            // `0x5b3700` bakes the record's scale into the placement, but
+            // `Player::advance` normalizes that basis before it fans anything
+            // out — the client does the same in `A3DGFXEx::SetParentTM`
+            // (A3DGFXEx.cpp:1589-1595) and carries the scale separately, as
+            // `SetScale(record scale)` right after the placement
+            // (EC_ManOrnament.cpp:950-952). So the scale has to be handed over
+            // on its own or it is lost. Measured against the 9 November census:
+            // the roof bagua is authored 0.304 and came out 44.8 units wide
+            // instead of 13.6, and `水门_瀑布` is authored 2.736.
+            let authored_scale = placement_scale(&world);
+            crate::diag_keyed!(
+                EffectCulling,
+                format!("{} drawn", owner.request.path),
+                5000,
+                "{} drawn: record scale {:.3} alpha {:.3} speed {:.3} elapsed {:.0}ms \
+                 origin ({:.1},{:.1},{:.1}); basis right=({:.2},{:.2},{:.2}) \
+                 up=({:.2},{:.2},{:.2}) dir=({:.2},{:.2},{:.2})",
+                owner.request.path,
+                authored_scale,
+                alpha,
+                owner.request.speed,
+                owner.elapsed,
+                world[12],
+                world[13],
+                world[14],
+                world[0],
+                world[1],
+                world[2],
+                world[4],
+                world[5],
+                world[6],
+                world[8],
+                world[9],
+                world[10]
+            );
             let stepped = {
                 let Some(player) = owner.player.as_mut() else {
                     continue;
                 };
+                // The player carries the placement's speed itself
+                // (`A3DGFXEx::SetPlaySpeed` is handed the record's `fSpeed`), so
+                // it is advanced by the *frame* delta. `scaled` above is for the
+                // owner clock, the lifetime window and the light emitters, all of
+                // which are in the record's own time base.
                 player
-                    .advance_with_ground(scaled, view, transform, 1., alpha, None)
-                    .map(|()| player.quads().to_vec())
+                    .advance_with_terrain(
+                        delta_ms as f32,
+                        view,
+                        transform,
+                        authored_scale,
+                        alpha,
+                        None,
+                        terrain,
+                    )
+                    .map(|()| (player.quads().to_vec(), player.clock_ms()))
             };
             match stepped {
-                Ok(quads) => out.extend(quads),
+                Ok((quads, clock)) => {
+                    if let Some(rows) = rows.as_mut() {
+                        rows.push(census_row(&owner.request.path, &quads, clock));
+                    }
+                    out.extend(quads);
+                }
                 Err(error) => {
                     failures.push((owner.request.origin.clone(), error));
                     owner.player = None;
@@ -656,6 +1022,18 @@ impl Manager {
         }
         for (origin, error) in failures {
             self.effect_failures.push(format!("{origin}: {error}"));
+        }
+        if let Some(mut rows) = rows {
+            // A file, not stderr: the shipped Windows build has no console, so a
+            // report a user is asked to paste has to land somewhere they can
+            // open. Overwritten every interval, so the newest view wins.
+            let report = census_report(&mut rows, out.len(), &mut self.census_clocks);
+            eprint!("{report}");
+            crate::diag!(RenderEffects, "{}", report.trim_end());
+            if let Err(error) = std::fs::write("effect-census.txt", &report) {
+                self.effect_warnings
+                    .push(format!("effect census not written: {error}"));
+            }
         }
         out
     }
@@ -692,16 +1070,43 @@ impl Manager {
             None => Err(format!("{path}: no GFX root reader attached")),
         };
         match built {
-            Ok(player) => {
+            Ok(mut player) => {
+                // `CECOrnamentMan::Update` sets the root's scale and then its play
+                // speed from the record (`pGFX->SetPlaySpeed(pNode->fSpeed)`,
+                // `EC_ManOrnament.cpp:950-956`). `A3DGFXEx::SetPlaySpeed` only
+                // stores `m_fPlaySpeed`; `CalcActualSpeed` multiplies it with the
+                // file's `m_fDefPlaySpeed`, so the placement's `fSpeed` scales
+                // the authored `PlaySpeed` instead of replacing it.
+                player.set_play_speed(self.owners[index].request.speed);
                 for warning in player.warnings() {
                     let line = format!("{path}: {warning}");
                     if !self.effect_warnings.contains(&line) {
+                        crate::diag!(EffectProblems, "{line}");
                         self.effect_warnings.push(line);
                     }
                 }
+                crate::diag!(
+                    ModelQueue,
+                    "{} admitted on frame {} (one root per frame, 0x5b1a00)",
+                    player.name(),
+                    self.frames
+                );
+                crate::diag!(
+                    EffectRoots,
+                    "{} built: warnings={} textures={} models={} quads={} \
+                     previous_failures={}",
+                    player.name(),
+                    player.warnings().len(),
+                    player.textures().len(),
+                    player.models().len(),
+                    player.quads().len(),
+                    self.effect_failures.len()
+                );
                 self.owners[index].player = Some(player);
             }
             Err(error) => {
+                crate::diag!(EffectProblems, "{path} would not build: {error}");
+                crate::diag!(ModelQueue, "{path} rejected while loading effects: {error}");
                 self.owners[index].player_failed = true;
                 self.effect_failures.push(format!("{origin}: {error}"));
             }
@@ -721,11 +1126,39 @@ impl Manager {
     ) -> Result<Player, String> {
         let root = crate::gfx_file::parse(text).map_err(|error| format!("{path}: {error}"))?;
         let seed = gfx_player::path_seed(path);
-        Player::new(root, seed, &mut |child| {
+        let mut player = Player::new(root, seed, &mut |child| {
             let text = read(child)?;
             crate::gfx_file::parse(&text).map_err(|error| format!("{child}: {error}"))
         })
-        .map_err(|error| format!("{path}: {error}"))
+        .map_err(|error| format!("{path}: {error}"))?;
+        // Naming the root is what lets the element, frame and card channels say
+        // which asset a line came from, and it writes the element table once.
+        player.set_name(path);
+        Ok(player)
+    }
+
+    /// One row per admitted root: `(path, clock ms, live play speed, authored
+    /// PlaySpeed)`.
+    ///
+    /// Counting frames proves the host is drawing; this proves the *effect clock*
+    /// is running, which is what a scrolling sheet actually reads. A root whose
+    /// clock stands still across two samples of this list is frozen even if its
+    /// quads are on screen, and a live speed of 0 beside an authored speed of 1
+    /// says the placement did it.
+    pub fn player_clocks(&self) -> Vec<(String, f32, f32, f32)> {
+        self.owners
+            .iter()
+            .filter_map(|owner| {
+                owner.player.as_ref().map(|player| {
+                    (
+                        owner.request.path.clone(),
+                        player.clock_ms(),
+                        player.play_speed(),
+                        player.authored_play_speed(),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Lazily load exactly one pending root; 0x5b1a00 returns after a load.
@@ -958,6 +1391,24 @@ mod tests {
         assert!(placement_transform([0.; 3], [0., 0., 1.], [0., 1., 0.], f32::NAN).is_err());
         assert_eq!(root_path("scene\\lamp.gfx"), "gfx/scene/lamp.gfx");
         assert_eq!(root_path("GFX/Scene/Lamp.GFX"), "gfx/scene/lamp.gfx");
+    }
+
+    /// The distance fade is a number the ornament manager owns, so the owner
+    /// manager's job is to hold it, clamp it and refuse strangers.
+    #[test]
+    fn set_attenuation_clamps_and_only_touches_known_owners() {
+        let mut manager = Manager::with_reader(root("gfx/scene/lamp.gfx", &light_file()));
+        manager.insert(request(1, true)).unwrap();
+        assert!(!manager.set_attenuation(999, 0.5));
+        assert!(manager.set_attenuation(1, 0.25));
+        assert!(!manager.set_attenuation(1, 0.25));
+        // 4.0 and NaN both land on full alpha, which is then no change.
+        assert!(manager.set_attenuation(1, 4.0));
+        assert!(!manager.set_attenuation(1, 1.0));
+        assert!(manager.set_attenuation(1, 0.5));
+        assert!(manager.set_attenuation(1, f32::NAN));
+        assert!(!manager.set_attenuation(1, 1.0));
+        assert!(manager.set_attenuation(1, 0.0));
     }
 
     #[test]
@@ -1448,6 +1899,75 @@ mod tests {
         );
     }
 
+    /// The world hands an effect its scale through the GFX node, not through the
+    /// placement basis:
+    ///
+    ///     // CECOrnamentMan::LoadGFXFromFile, EC_ManOrnament.cpp:950
+    ///     A3DMATRIX4 mat = a3d_TransformMatrix(pNode->vDir, pNode->vUp, pNode->vPos);
+    ///     pGFX->SetScale(pNode->fScale);
+    ///     pGFX->SetParentTM(mat);
+    ///
+    /// `CalcActualScale` multiplies it into `m_fDefScale` (A3DGFXEx.h:197-200)
+    /// and every element path sizes from that product, while `SetParentTM`
+    /// normalizes the basis it was given (A3DGFXEx.cpp:1589-1595). A card
+    /// therefore grows with the record's scale — `场景/树林光束` is authored
+    /// 0.5 x 10 at `DedaultScale 0.7` and this map places it at 8.776, so its
+    /// shaft is 6.1 x 123 units long — and the extents never take the scale
+    /// twice.
+    #[test]
+    fn the_ecwld_record_scale_reaches_a_card() {
+        let width = |scale: f32| {
+            let mut manager = Manager::with_reader(root("gfx/scene/torch.gfx", &torch_file()));
+            let mut placed = request_path(1, true, "gfx/scene/torch.gfx");
+            placed.transform =
+                placement_transform([0.; 3], [0., 0., 1.], [0., 1., 0.], scale).unwrap();
+            manager.insert(placed).unwrap();
+            manager.update(16, &mut LightPublications::default());
+            let quads = manager.effect_quads(16, &camera());
+            let quad = quads.first().expect("the torch sprite draws");
+            let a = Vec3::from_array(quad.positions[0]);
+            let b = Vec3::from_array(quad.positions[1]);
+            (b - a).length()
+        };
+        let unit = width(1.);
+        assert!(unit > 0., "the sprite has an extent to compare");
+        let widened = width(2.5);
+        assert!(
+            (widened / unit - 2.5).abs() < 1e-3,
+            "a 2.5 record scale is a 2.5x card: {widened} from {unit}"
+        );
+    }
+
+    /// `0x5b33f3` copies the record's alpha into the GFX node, and the player
+    /// folds the owner's intensity into every element's colour. An owner
+    /// installed with it draws dimmer than the same owner without it — the seal
+    /// dome around the Crystal in the City of Raging Tides is authored 0.300 and
+    /// was drawn at full strength.
+    #[test]
+    fn the_ecwld_record_alpha_dims_its_quads() {
+        let alpha_of = |outer: Option<[f32; 4]>| {
+            let mut manager = Manager::with_reader(root("gfx/scene/torch.gfx", &torch_file()));
+            let mut placed = request_path(3, true, "gfx/scene/torch.gfx");
+            placed.outer = outer;
+            manager.insert(placed).unwrap();
+            manager.update(16, &mut LightPublications::default());
+            let quads = manager.effect_quads(16, &camera());
+            quads.first().expect("the torch sprite draws").color[3]
+        };
+        let full = alpha_of(None);
+        let authored = alpha_of(scene_alpha(0.3));
+        assert!(full > 0.);
+        assert!(
+            (authored / full - 0.3).abs() < 0.01,
+            "an authored alpha of 0.3 must reach the quad: {authored} of {full}"
+        );
+        // A record value above one clamps to full strength: the floating city
+        // authors 2.0, and letting it multiply pushed the blue crater sheets past
+        // what retail draws.
+        assert_eq!(alpha_of(scene_alpha(2.0)), alpha_of(scene_alpha(1.0)));
+        assert_eq!(scene_alpha(f32::NAN), None);
+    }
+
     /// An owner outside its activation window costs no graph at all, and is
     /// admitted on the first frame it becomes visible.
     #[test]
@@ -1607,7 +2127,7 @@ mod tests {
         let scene_path = std::path::Path::new("google_drive/world.ecwld");
         let archive = std::path::Path::new("google_drive/x");
         if !scene_path.is_file() || !archive.is_dir() {
-            eprintln!("SKIPPED: no `google_drive/world.ecwld` corpus on this machine; this test proves nothing about the shipped map");
+            crate::pck::corpus_absent("`google_drive/world.ecwld` with `google_drive/x`");
             return;
         }
         let scene = crate::scene::Scene::load(scene_path).unwrap();

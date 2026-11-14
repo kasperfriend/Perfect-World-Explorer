@@ -221,14 +221,19 @@ impl CharacterGfx {
             // `GroundHeight` stay inert exactly as they do for an owner whose
             // +0x1f4 byte is clear.
             let ground = map.map(|map| physics::effect_ground(map, parent.w_axis.truncate()));
+            // The same grid answers the decal drape, which asks a height per
+            // vertex rather than the one sample the frames are built from.
+            let height = |x: f32, z: f32| map.map(|map| physics::ground(map, x, z).height);
+            let terrain: Option<gfx_player::GroundHeightQuery<'_>> = Some(&height);
             player
-                .advance_with_ground(
+                .advance_with_terrain(
                     dt_ms * effect.speed,
                     view,
                     parent,
                     effect.scale,
                     effect.alpha,
                     ground,
+                    terrain,
                 )
                 .map_err(|error| format!("{}: {error}", effect.path))?;
             out.extend(player.quads().iter().cloned());

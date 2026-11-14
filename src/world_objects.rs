@@ -384,7 +384,7 @@ fn run(
             for (mesh_index, mesh) in model.meshes.iter().enumerate() {
                 // Stage, culling and alpha state come from the single recovered
                 // table, not from per-asset guesses.
-                let kind = match crate::bmd_baked::classify(
+                let mut kind = match crate::bmd_baked::classify(
                     mesh.version,
                     !mesh.texture.trim().is_empty(),
                     mesh.material.as_ref().is_some_and(|m| m.two_sided),
@@ -398,6 +398,11 @@ fn run(
                         return Err(format!("unsupported baked mesh {}: {e}", mesh.name));
                     }
                 };
+                if crate::objects::SdrUvAnim::from_texture_path(&mesh.texture)
+                    .is_some_and(|a| a.tc_scroll[1] < 0.0)
+                {
+                    kind += 0.02;
+                }
                 // Content-keyed slot sharing (P3.08 cross-name dedup):
                 // references with identical pixels collapse onto one atlas
                 // slot regardless of how many names point at them.

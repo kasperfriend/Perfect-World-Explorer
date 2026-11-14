@@ -556,7 +556,7 @@ mod tests {
     fn corpus_effect_records_agree_on_one_layout() {
         let path = std::path::Path::new("google_drive/world.ecwld");
         if !path.is_file() {
-            eprintln!("SKIPPED: no `google_drive/world.ecwld` on this machine; this test proves nothing about the shipped map");
+            crate::pck::corpus_absent("`google_drive/world.ecwld`");
             return;
         }
         let scene = Scene::load(path).unwrap();

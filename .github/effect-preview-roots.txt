@@ -1,0 +1,39 @@
+# Roots the effect preview sweeps: one path substring per line, `#` comments
+# allowed. `PWE_PREVIEW_ROOTS` on the command line or a `workflow_dispatch`
+# input overrides this file; nothing here changes how a root is drawn.
+#
+# This pass reads the particle sizes at Wraithgate (`绿鬼火3`, `骷髅光柱`), the
+# Archosaur beam pair and the forest's axial cards, with the aquarium as the
+# model-element control. The particle channel now prints the authored scale
+# range, the keypoint the class actually applies and the world size that comes
+# out, so "oversized" can be checked against the client's own product instead
+# of the parsed half width.
+天煞光束
+树林光束
+绿鬼火3
+骷髅光柱
+水族箱
+蓝蘑菇2
+# Element 101's `ZOffset` is a depth, not a translation (§59.1). This is the
+# root with the largest offset in the pack — eleven cards at 2.6, 2.85 and 3.0 —
+# and it is placed in this map at (2733.7, 223.8, -2708.3) and (2889.1, 223.7,
+# -3048.3), so the cards' drawn extents can be measured either side of the fix.
+暗语者营地
+# The tile-mode control: four `TileMode: 1` sheets (`TexCol x TexRow` 3x2, 2x2,
+# 1x1) scrolling V at -1.5/-1.8/-2.0, plus the `Warp` veil that must not draw.
+# No other previewed root authors a tile, so without this line the tiled-UV law
+# has no frame evidence at all — which is how the one-sheet window slipped
+# through (§59.2).
+水门_瀑布
+# The other two waterfall classes the gate does not cover. 瀑布1 is an
+# element-210 grid curtain (`A3DGridDecalEx`, authored lattice, `TexSpeed` V
+# -0.5 on 连续水流纹理.tga), and 瀑布大 is the element-150 fractal veil: nine
+# noise strips (Segs 10, three U speeds 0.30/0.35/0.45 on 气连续04.tga and
+# 流动01_通道.dds, blend 5/6) plus its bound spray root. This map's world.ecwld
+# places neither (its 31 waterfall placements are 水门_瀑布 x4 and the
+# 瀑布水花* spray family only), so these two lines draw frames only when a map
+# that installs them is swept; until then their runtime law is pinned by
+# `the_shipped_waterfall_veil_fractals_scroll_their_sheets` in the pack-tests
+# step. A line that matches no placement is skipped without a warning.
+瀑布1
+瀑布大

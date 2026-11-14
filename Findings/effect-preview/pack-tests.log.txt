@@ -1,0 +1,268 @@
+    Updating crates.io index
+   Compiling perfect-world-explorer v0.1.0 (/home/runner/work/Perfect-World-Explorer/Perfect-World-Explorer)
+error[E0432]: unresolved import `gfx_file`
+    --> src/gfx_player.rs:2822:21
+     |
+2822 |                 use gfx_file::NoiseKind;
+     |                     ^^^^^^^^
+     |
+     = note: `use` statements changed in Rust 2018; read more at <https://doc.rust-lang.org/edition-guide/rust-2018/module-system/path-clarity.html>
+help: a similar path exists
+     |
+2822 |                 use crate::gfx_file::NoiseKind;
+     |                     +++++++
+
+error[E0432]: unresolved import `gfx_file`
+    --> src/gfx_player.rs:6519:21
+     |
+6519 |                 use gfx_file::NoiseKind;
+     |                     ^^^^^^^^
+     |
+     = note: `use` statements changed in Rust 2018; read more at <https://doc.rust-lang.org/edition-guide/rust-2018/module-system/path-clarity.html>
+help: a similar path exists
+     |
+6519 |                 use crate::gfx_file::NoiseKind;
+     |                     +++++++
+
+warning: unused import: `std::collections::HashMap`
+  --> src/gfx_catalog.rs:36:5
+   |
+36 | use std::collections::HashMap;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: duplicated attribute
+    --> src/gfx_file.rs:3002:5
+     |
+3002 |     #[test]
+     |     ^^^^^^^
+     |
+     = note: `#[warn(duplicate_macro_attributes)]` on by default
+
+warning: unnecessary parentheses around closure body
+    --> src/gfx_player.rs:2964:30
+     |
+2964 |         .map(|(last, first)| (*last - *first))
+     |                              ^              ^
+     |
+     = note: `#[warn(unused_parens)]` (part of `#[warn(unused)]`) on by default
+help: remove these parentheses
+     |
+2964 -         .map(|(last, first)| (*last - *first))
+2964 +         .map(|(last, first)| *last - *first)
+     |
+
+warning: duplicated attribute
+     --> src/gfx_player.rs:13025:5
+      |
+13025 |     #[test]
+      |     ^^^^^^^
+
+warning: duplicated attribute
+     --> src/gfx_player.rs:14053:5
+      |
+14053 |     #[test]
+      |     ^^^^^^^
+
+warning: unnecessary parentheses around type
+    --> src/modules/walker/collision.rs:1371:28
+     |
+1371 |     fn model_with(quads: &[(([[f32; 3]; 3], [[f32; 3]; 3]))]) -> crate::bmd::Model {
+     |                            ^                              ^
+     |
+help: remove these parentheses
+     |
+1371 -     fn model_with(quads: &[(([[f32; 3]; 3], [[f32; 3]; 3]))]) -> crate::bmd::Model {
+1371 +     fn model_with(quads: &[([[f32; 3]; 3], [[f32; 3]; 3])]) -> crate::bmd::Model {
+     |
+
+warning: duplicated attribute
+   --> src/scene.rs:555:5
+    |
+555 |     #[test]
+    |     ^^^^^^^
+
+warning: unused import: `collections::HashMap`
+  --> src/weather_gpu.rs:17:11
+   |
+17 | use std::{collections::HashMap, fs::File, path::Path};
+   |           ^^^^^^^^^^^^^^^^^^^^
+
+error[E0063]: missing field `kind` in initializer of `gfx_file::ControlData`
+    --> src/gfx_file.rs:2684:13
+     |
+2684 |             ControlData::Fractal {
+     |             ^^^^^^^^^^^^^^^^^^^^ missing `kind`
+
+error[E0027]: pattern does not mention field `kind`
+    --> src/gfx_file.rs:2778:13
+     |
+2778 | /             ControlData::Fractal {
+2779 | |                 buffer_length,
+2780 | |                 amplitude,
+2781 | |                 wave_length,
+...    |
+2784 | |                 base_color,
+2785 | |             } => {
+     | |_____________^ missing field `kind`
+     |
+help: include the missing field in the pattern
+     |
+2784 -                 base_color,
+2785 -             } => {
+2784 +                 base_color, kind } => {
+     |
+help: if you don't care about this missing field, you can explicitly ignore it
+     |
+2784 -                 base_color,
+2785 -             } => {
+2784 +                 base_color, kind: _ } => {
+     |
+help: or always ignore missing fields here
+     |
+2784 -                 base_color,
+2785 -             } => {
+2784 +                 base_color, .. } => {
+     |
+
+error[E0027]: pattern does not mention field `kind`
+    --> src/gfx_file.rs:3241:13
+     |
+3241 | /             ControlData::Fractal {
+3242 | |                 buffer_length,
+3243 | |                 amplitude,
+3244 | |                 wave_length,
+...    |
+3247 | |                 base_color,
+3248 | |             } => {
+     | |_____________^ missing field `kind`
+     |
+help: include the missing field in the pattern
+     |
+3247 -                 base_color,
+3248 -             } => {
+3247 +                 base_color, kind } => {
+     |
+help: if you don't care about this missing field, you can explicitly ignore it
+     |
+3247 -                 base_color,
+3248 -             } => {
+3247 +                 base_color, kind: _ } => {
+     |
+help: or always ignore missing fields here
+     |
+3247 -                 base_color,
+3248 -             } => {
+3247 +                 base_color, .. } => {
+     |
+
+warning: unreachable expression
+   --> src/scene.rs:575:26
+    |
+575 |                     _ => return panic!("valid_time {} is not an authored mode", e.valid_time),
+    |                          ^^^^^^^-------------------------------------------------------------
+    |                          |      |
+    |                          |      any code following this expression is unreachable
+    |                          unreachable expression
+    |
+    = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `trailer`
+   --> src/angelica_pck.rs:167:13
+    |
+167 |         let trailer = out.len();
+    |             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_trailer`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/gfx_player.rs:8667:13
+     |
+8667 |         let mut name = |text: &str, out: &mut Vec<u8>| {
+     |             ----^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> src/gfx_player.rs:9830:13
+     |
+9830 |         let mut count = |half: Vec3| {
+     |             ----^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: unused variable: `sun`
+    --> src/gpu.rs:2114:13
+     |
+2114 |         let sun = [
+     |             ^^^ help: if this is intentional, prefix it with an underscore: `_sun`
+
+warning: unused variable: `camera`
+    --> src/gpu.rs:3693:5
+     |
+3693 |     camera: &Camera,
+     |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_camera`
+
+warning: unused variable: `changed`
+    --> src/gpu.rs:4484:465
+     |
+4484 | ...logging_dir.clone();let changed=crate::diagnostics::ui(ui,&mut mask,&mut directory);if mask!=settings.logging_mask{settings.log...
+     |                            ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_changed`
+
+warning: unused variable: `action`
+   --> src/modules/populator/mod.rs:640:13
+    |
+640 |         let action = &source.model.actions[action_index];
+    |             ^^^^^^ help: if this is intentional, prefix it with an underscore: `_action`
+
+warning: unused variable: `index`
+    --> src/modules/populator/mod.rs:2196:14
+     |
+2196 |         let (index, spawn) = population
+     |              ^^^^^ help: if this is intentional, prefix it with an underscore: `_index`
+
+warning: unused variable: `nv`
+   --> src/terrain_block.rs:107:9
+    |
+107 |     let nv = (grid + 1) * (grid + 1);
+    |         ^^ help: if this is intentional, prefix it with an underscore: `_nv`
+
+warning: variable does not need to be mutable
+  --> src/terrain_residency.rs:93:9
+   |
+93 |         mut build: B,
+   |         ----^^^^^
+   |         |
+   |         help: remove this `mut`
+
+warning: unused variable: `y`
+   --> src/terrain_residency.rs:353:44
+    |
+353 |             .update(&second, |_, _| 3, |x, y, _| Ok(block(x as f32)))
+    |                                            ^ help: if this is intentional, prefix it with an underscore: `_y`
+
+warning: unused variable: `y`
+   --> src/terrain_residency.rs:338:43
+    |
+338 |             .update(&first, |_, _| 3, |x, y, _| Ok(block(x as f32)))
+    |                                           ^ help: if this is intentional, prefix it with an underscore: `_y`
+
+warning: unused variable: `y`
+   --> src/terrain_residency.rs:379:21
+    |
+379 |                 |x, y, level| {
+    |                     ^ help: if this is intentional, prefix it with an underscore: `_y`
+
+warning: unused variable: `y`
+   --> src/terrain_residency.rs:373:41
+    |
+373 |             .update(&win, |_, _| 3, |x, y, _| Ok(block(x as f32)))
+    |                                         ^ help: if this is intentional, prefix it with an underscore: `_y`
+
+Some errors have detailed explanations: E0027, E0063, E0432.
+For more information about an error, try `rustc --explain E0027`.
+warning: `perfect-world-explorer` (bin "perfect-world-explorer" test) generated 23 warnings
+error: could not compile `perfect-world-explorer` (bin "perfect-world-explorer" test) due to 5 previous errors; 23 warnings emitted

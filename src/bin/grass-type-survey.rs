@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+#[path = "../pck.rs"]
+mod pck;
 #[path = "../scene.rs"]
 mod scene;
 fn main() {

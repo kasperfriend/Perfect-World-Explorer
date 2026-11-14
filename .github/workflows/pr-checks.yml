@@ -27,8 +27,41 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxkbcommon-dev
+          # The runner's package mirror fails intermittently: `apt-get` exits 100
+          # or stalls on the index fetch, and because every later step depends on
+          # this one the whole Rust job is skipped (unit tests, type check and
+          # rustfmt never run) on a change that builds fine elsewhere. So: skip
+          # apt when the headers are already installed, bound every attempt with
+          # `timeout`, retry, and still fail the step if all attempts fail.
+          packages="libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxkbcommon-dev"
+          missing=""
+          for package in $packages; do
+            dpkg -s "$package" >/dev/null 2>&1 || missing="$missing $package"
+          done
+          if [ -z "$missing" ]; then
+            echo "Linux build dependencies already installed"
+            exit 0
+          fi
+          echo "installing:$missing"
+          status=1
+          for attempt in 1 2 3; do
+            if { timeout 240 sudo apt-get -o Acquire::Retries=2 update &&
+              timeout 240 sudo apt-get install -y --no-install-recommends $missing; } 2>&1 | tee /tmp/apt.log; then
+              status=0
+              break
+            fi
+            echo "apt attempt ${attempt} failed; retrying" >&2
+            sleep 10
+          done
+          if [ "$status" -ne 0 ]; then
+            # The raw step log is served from blob storage and is not always
+            # retrievable through the API, so repeat apt's own diagnosis as
+            # annotations, the way the cargo steps below do.
+            grep -v '^$' /tmp/apt.log | tail -40 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          fi
       - name: Verify recovered regional arithmetic on x87
         run: |
           cc -O0 tools/check-native-region-reference.c -o /tmp/native-region-reference
@@ -96,21 +129,113 @@ jobs:
               | while IFS= read -r line; do [ -n "$line" ] && echo "::error::$line"; done
           fi
           exit "$status"
+      # Formatting is checked after the unit tests and before the Vulkan
+      # installs: rustfmt needs no GPU, so it must not sit behind an
+      # environment-sensitive step, but it must not run *before* the tests
+      # either — a formatting nit would then skip them, which is how three
+      # assertions went unverified for a day.
+      - name: Check formatting
+        run: |
+          # `cargo fmt --check` already prints the "Diff in ..." hunks it wants;
+          # capture them because the raw step log is not always retrievable.
+          # (`rustfmt --diff` is not an option, so this is the only source.)
+          cargo fmt --all -- --check > /tmp/fmt.check 2>&1 || true
+          if [ -s /tmp/fmt.check ]; then
+            echo "::error::rustfmt wants changes; the diff is posted as a PR comment"
+            exit 1
+          fi
+      # Job logs are not always retrievable through the API, and a PR comment is
+      # not always posted either, so the diff also goes out as annotations: the
+      # annotations are what the agent can read back.
+      - name: Echo formatting diff
+        if: failure()
+        run: |
+          [ -s /tmp/fmt.check ] || exit 0
+          head -200 /tmp/fmt.check | while IFS= read -r line; do
+            echo "::error file=rustfmt::$line"
+          done
+      # Annotations are capped per check run and the GPU checks fill it with
+      # notices, so the diff is posted where it can actually be read.
+      - name: Post formatting diff
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          [ -n "$PR" ] || exit 0
+          # An earlier failure leaves no rustfmt diff; post nothing rather than
+          # an empty comment.
+          [ -s /tmp/fmt.check ] || exit 0
+          { echo 'rustfmt wants these changes:'; echo '```diff'; \
+            head -600 /tmp/fmt.check; echo '```'; } > /tmp/fmt.md
+          gh pr comment "$PR" --body-file /tmp/fmt.md
       - name: Verify bounded lossless terrain RAM residency
         run: |
           cargo run --locked --bin terrain-memory-check
           cargo run --locked --bin terrain-memory-check -- --full-world
       - name: Install software Vulkan for Phase 1 shader checks
-        run: sudo apt-get install -y mesa-vulkan-drivers
+        run: |
+          # Same flaky mirror as the build dependencies above: retry the install
+          # instead of failing the three Vulkan checks behind it, and print apt's
+          # own diagnosis as annotations if every attempt fails.
+          if dpkg -s mesa-vulkan-drivers >/dev/null 2>&1; then
+            echo "mesa-vulkan-drivers already installed"
+            exit 0
+          fi
+          status=1
+          for attempt in 1 2 3; do
+            if timeout 240 sudo apt-get install -y --no-install-recommends \
+              mesa-vulkan-drivers 2>&1 | tee /tmp/vulkan-apt.log; then
+              status=0
+              break
+            fi
+            echo "apt attempt ${attempt} failed; retrying" >&2
+            sleep 10
+          done
+          if [ "$status" -ne 0 ]; then
+            grep -v '^$' /tmp/vulkan-apt.log | tail -40 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          fi
       - name: Test Librarian preview with an sRGB window
         env:
           WGPU_BACKEND: vulkan
           XDG_RUNTIME_DIR: /tmp
           PW_LIBRARIAN_SYNTHETIC_GPU: "1"
         run: |
-          export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
-          test -n "$VK_ICD_FILENAMES"
-          cargo test --locked --bin perfect-world-explorer srgb_window_uses_encoded_unorm_preview_attachment
+          # The raw step log is served from blob storage and is not reachable
+          # from everywhere, so the failure is also encoded in the exit code,
+          # which the check-run annotation always reports:
+          #   41  no lavapipe ICD on the image   (probe fails, test never ran)
+          #   42  the wgpu test itself failed
+          log=/tmp/srgb-window.log
+          : >"$log"
+          # Mesa has renamed the software ICD more than once, so look for any
+          # lavapipe driver description rather than one exact file name.
+          icd=""
+          for dir in /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d /etc/vulkan/icd.d; do
+            found="$(find "$dir" -maxdepth 1 -name '*lvp*' -print -quit 2>/dev/null || true)"
+            if [ -n "$found" ]; then icd="$found"; continue; fi
+          done
+          echo "VK_ICD_FILENAMES=$icd" >>"$log"
+          ls -l /usr/share/vulkan/icd.d >>"$log" 2>&1 || true
+          if [ -z "$icd" ]; then
+            echo "::error::no lavapipe ICD: the software Vulkan driver is missing"
+            cat "$log"
+            exit 41
+          fi
+          export VK_ICD_FILENAMES="$icd"
+          status=0
+          cargo test --locked --bin perfect-world-explorer \
+            srgb_window_uses_encoded_unorm_preview_attachment 2>&1 | tee -a "$log" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::sRGB window test failed"
+            grep -E "panicked at|^test result:|^error(\[|:)|No suitable|RequestDevice" "$log" \
+              | head -20 | while IFS= read -r line; do echo "::error::$line"; done
+            tail -40 "$log" | while IFS= read -r line; do echo "::error::$line"; done
+            exit 42
+          fi
       - name: Run Phase 1 production shader regressions
         env:
           WGPU_BACKEND: vulkan
@@ -175,6 +300,36 @@ jobs:
           run_check tree-lod-gpu-check
           run_check grass-gpu-mip-check
           run_check tree-authored-mip-gpu-check
+      # The headless effect preview is the only place the effect pass is
+      # rendered without a window. Its smoke case authors one sprite root and
+      # asserts the card reaches the pass and covers pixels, so a change that
+      # breaks the harness cannot quietly turn the other previews into a folder
+      # of empty PNGs.
+      - name: Run the headless effect preview smoke test
+        env:
+          WGPU_BACKEND: vulkan
+          XDG_RUNTIME_DIR: /tmp
+        run: |
+          export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
+          test -n "$VK_ICD_FILENAMES"
+          CARGO_TERM_COLOR=never cargo test --locked --bin perfect-world-explorer \
+            effect_preview_smoke -- --nocapture 2>&1 | tee /tmp/effect-preview-smoke.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            echo "::error::effect preview smoke test failed"
+            grep -E "panicked at|^error(\[|:)|^test result:|smoke:" /tmp/effect-preview-smoke.log \
+              | head -20 | while IFS= read -r line; do echo "::error::$line"; done
+            tail -40 /tmp/effect-preview-smoke.log \
+              | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
+      - name: Keep the effect preview smoke frame
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: effect-preview-smoke
+          path: /tmp/pwe-effect-preview-smoke.png
+          if-no-files-found: ignore
       - name: Run terrain per-view GPU check
         env:
           WGPU_BACKEND: vulkan
@@ -187,28 +342,6 @@ jobs:
 
       # Formatting is cosmetic: run it after the compile, test and shader steps
       # so a whitespace diff can never hide a real failure behind it.
-      - name: Check formatting
-        run: |
-          # `cargo fmt --check` already prints the "Diff in ..." hunks it wants;
-          # capture them because the raw step log is not always retrievable.
-          # (`rustfmt --diff` is not an option, so this is the only source.)
-          cargo fmt --all -- --check > /tmp/fmt.check 2>&1 || true
-          if [ -s /tmp/fmt.check ]; then
-            echo "::error::rustfmt wants changes; the diff is posted as a PR comment"
-            exit 1
-          fi
-      # Annotations are capped per check run and the GPU checks fill it with
-      # notices, so the diff is posted where it can actually be read.
-      - name: Post formatting diff
-        if: failure()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          [ -n "$PR" ] || exit 0
-          { echo 'rustfmt wants these changes:'; echo '```diff'; \
-            head -600 /tmp/fmt.check; echo '```'; } > /tmp/fmt.md
-          gh pr comment "$PR" --body-file /tmp/fmt.md
   windows:
     name: Windows executable (x64)
     runs-on: windows-latest

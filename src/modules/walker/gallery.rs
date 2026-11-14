@@ -174,9 +174,13 @@ impl Gallery {
             // this and 393 of them change shape once a query answers.
             let ground =
                 map.map(|map| physics::effect_ground(map, spawn.transform.w_axis.truncate()));
+            // The drape needs the surface under the sheet, not the one sample
+            // the frames are built from.
+            let height = |x: f32, z: f32| map.map(|map| physics::ground(map, x, z).height);
+            let terrain: Option<gfx_player::GroundHeightQuery<'_>> = Some(&height);
             spawn
                 .player
-                .advance_with_ground(dt_ms, view, spawn.transform, 1., 1., ground)
+                .advance_with_terrain(dt_ms, view, spawn.transform, 1., 1., ground, terrain)
                 .map_err(|error| format!("{}: {error}", spawn.path))?;
             out.extend(spawn.player.quads().iter().cloned());
         }

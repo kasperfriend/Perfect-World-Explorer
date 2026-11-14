@@ -28,6 +28,40 @@ struct Producer {
     position: [f32; 3],
     /// Skeleton hook this root is attached to (ECM `HookName`).
     hook: Option<HookBinding>,
+    /// The record's `bAttenuation` byte (`ECWDFILEEFFECT12.bAttenuation`,
+    /// EC_WorldFile.h:248). ECM model events carry no such record and stay at
+    /// full alpha.
+    attenuation: bool,
+    /// Current distance fade, 0..1, ramped toward the target at 1/3000 per ms.
+    fade: f32,
+}
+
+/// `FadeGFX`'s transition length: `SetAlphaTransition(max_alpha * fAlpha, 3000)`
+/// over three seconds, `EC_ManOrnament.cpp:961-966`.
+const FADE_MS: f32 = 3000.;
+
+/// One frame of a `FadeGFX` transition: linear in elapsed time, so a full
+/// 0 -> 1 ramp takes exactly `FADE_MS` no matter the frame rate, and a shorter
+/// frame never overshoots the target.
+fn attenuation_step(fade: f32, target: f32, delta_ms: u32) -> f32 {
+    let step = (delta_ms as f32 / FADE_MS).clamp(0., 1.);
+    (fade + (target - fade).clamp(-step, step)).clamp(0., 1.)
+}
+
+/// The fade a root asks for: full alpha when the fade is switched off, else
+/// `CECOrnamentMan::Update`'s ground-plane distance test against
+/// `SCNRES_EFFECT`. `eye` is the camera; its height is skipped on purpose.
+fn attenuation_target(effect_distance: f32, position: [f32; 3], eye: [f32; 3]) -> f32 {
+    if effect_distance <= 0. {
+        return 1.;
+    }
+    let dx = position[0] - eye[0];
+    let dz = position[2] - eye[2];
+    if dx * dx + dz * dz >= effect_distance * effect_distance {
+        0.
+    } else {
+        1.
+    }
 }
 
 /// A root bound to a hook of one of this world's models.
@@ -86,6 +120,16 @@ pub struct World {
     grid: StaticGrid,
     publications: LightPublications,
     owners: gfx_owner::Manager,
+    /// The map's height grid, when the renderer installed one. It is the only
+    /// terrain the effect pass can see, and it is what lets a `MatchGrnd` decal
+    /// be draped over the surface (`A3DDecalEx`'s ground branch) rather than
+    /// drawn as one flat card at the record's own height.
+    /// Surface height under a world X/Z, when the renderer installed the map's
+    /// height grid. Boxed rather than typed on `navigation::MapSpace` because
+    /// this module is also compiled into binaries whose crate root has no
+    /// `navigation` (the shipped survey tools), and the query is all the effect
+    /// pass needs anyway.
+    terrain: Option<Box<dyn Fn(f32, f32) -> Option<f32>>>,
     producers: Vec<Producer>,
     /// The animated half of the world's effects. Created on the first update that
     /// needs it, because `with_reader` has no queue to build a draw object with.
@@ -101,6 +145,13 @@ pub struct World {
     catalog_spawns: u64,
     /// Explorer position and effect activation radius in world units.
     view: Option<(f32, f32, f32)>,
+    /// Retail `SCNRES_EFFECT` distance in world units; 0 disables the fade and
+    /// leaves every root at its authored alpha (the explorer default).
+    effect_distance: f32,
+    /// Why the last activation pass left producers out, so a zone that draws
+    /// nothing can say which gate closed on it: beyond the activation radius,
+    /// outside the resident terrain window, or outside its day/night window.
+    census: [usize; 3],
     resident_bounds: Option<[f32; 4]>,
     /// Retail alpha insertion order as (slot, mesh) pairs.
     alpha: Vec<model_queue::AlphaCandidate>,
@@ -184,6 +235,7 @@ impl World {
             grid: StaticGrid::default(),
             publications: LightPublications::default(),
             owners: gfx_owner::Manager::new(),
+            terrain: None,
             producers: Vec::new(),
             effects: None,
             effect_trace_printed: false,
@@ -191,6 +243,8 @@ impl World {
             catalog: crate::gfx_catalog::Catalog::default(),
             catalog_spawns: 0,
             view: None,
+            effect_distance: 0.,
+            census: [0; 3],
             resident_bounds: None,
             alpha: Vec::new(),
             reported: Vec::new(),
@@ -369,7 +423,9 @@ impl World {
                     speed: effect.speed,
                     start_ms: 0,
                     span_ms: None,
-                    outer: None,
+                    // 0x5b33f3 copies the record's alpha into the GFX node; the
+                    // player folds it into every element's colour.
+                    outer: gfx_owner::scene_alpha(effect.alpha),
                     attachment: None,
                     active: false,
                     origin: origin.clone(),
@@ -378,11 +434,16 @@ impl World {
                     self.reported.push(format!("{origin}: {error}"));
                     continue;
                 }
+                // A fresh root starts where `LoadGFXFromFile` + `FadeGFX(true)`
+                // leave it: at zero alpha, three seconds from full, or at full
+                // alpha when the record says it never attenuates.
                 self.producers.push(Producer {
                     identity,
                     valid_time: Some(effect.valid_time),
                     position: effect.position,
                     hook: None,
+                    attenuation: effect.attenuation,
+                    fade: if effect.attenuation { 0. } else { 1. },
                 });
                 installed += 1;
             }
@@ -475,6 +536,8 @@ impl World {
                     identity,
                     valid_time: None,
                     position: instance.placement.position,
+                    attenuation: false,
+                    fade: 1.,
                     hook: record.map(|record| HookBinding {
                         instance: index,
                         record,
@@ -511,6 +574,28 @@ impl World {
     /// Effect activation radius (independent of resident geometry bounds).
     pub fn set_view_center(&mut self, x: f32, z: f32, radius: f32) {
         self.view = Some((x, z, radius.max(0.)));
+    }
+    /// Producers the last activation pass left out, by reason: beyond the
+    /// activation radius, outside the resident terrain window, outside their
+    /// day/night window. The three overlap, so they are not a partition.
+    pub fn activation_census(&self) -> [usize; 3] {
+        self.census
+    }
+    /// Radius of the client's effect distance fade, in world units.
+    ///
+    /// `CECSceneBlock::SetResLoadDists` sets `SCNRES_EFFECT` to 60 units in its
+    /// near scheme and 120 in its far one (`EC_SceneBlock.cpp:1109`, `:1133`),
+    /// and `CECOrnamentMan::Update` fades any `bAttenuation` node outside that
+    /// radius of the host player to zero over three seconds. The explorer has no
+    /// player, so the camera stands in for one and the test is horizontal, as the
+    /// client's ground positions make it. `0` turns the fade off: every root is
+    /// restored to full alpha, including one an earlier distance had dimmed.
+    pub fn set_effect_distance(&mut self, distance: f32) {
+        self.effect_distance = if distance.is_finite() {
+            distance.max(0.)
+        } else {
+            0.
+        };
     }
     /// Manager light-priority limit (native `[[0x9b3eec]+0x28]+0x134`, written
     /// from an authored scene/environment byte at `0x40dc97`/`0x40e394`).
@@ -569,28 +654,81 @@ impl World {
         failures.extend(self.reported.iter().cloned());
         failures
     }
-    fn apply_activation(&mut self, night: f32) {
+    fn apply_activation(&mut self, night: f32, delta_ms: u32, eye: [f32; 3]) {
         if self.producers.is_empty() {
             return;
         }
         let (x, z, radius) = self.view.unwrap_or((0., 0., -1.));
+        let mut census = [0usize; 3];
         let updates: Vec<(u64, bool)> = self
             .producers
             .iter()
             .map(|producer| {
                 let dx = producer.position[0] - x;
                 let dz = producer.position[2] - z;
-                let inside = dx * dx + dz * dz <= radius * radius
-                    && cutoff_residency::contains(self.resident_bounds, producer.position);
+                let near = dx * dx + dz * dz <= radius * radius;
+                let resident = cutoff_residency::contains(self.resident_bounds, producer.position);
                 let visible = match producer.valid_time {
                     Some(mode) => crate::scene::effect_visible(mode, night),
                     None => true,
                 };
-                (producer.identity, inside && visible)
+                if !near {
+                    census[0] += 1;
+                }
+                if !resident {
+                    census[1] += 1;
+                }
+                if !visible {
+                    census[2] += 1;
+                }
+                (producer.identity, near && resident && visible)
             })
             .collect();
+        self.census = census;
         for (identity, active) in updates {
             self.owners.set_active(identity, active);
+        }
+        self.apply_attenuation(delta_ms, eye);
+    }
+    /// Ramp every attenuating root's alpha toward "visible inside the retail
+    /// effect distance, transparent outside it".
+    ///
+    /// `CECOrnamentMan::Update` (EC_ManOrnament.cpp:279-292) tests
+    /// `a3d_Magnitude(pNode->vPos - vHostPos) >= SCNRES_EFFECT` and calls
+    /// `FadeGFX(node, true/false)` accordingly; the transition is 3,000 ms
+    /// either way, so a root crossing the radius takes three seconds to appear
+    /// or vanish instead of popping. The step is linear in elapsed time, which
+    /// is what `SetAlphaTransition` interpolates.
+    ///
+    /// The test is horizontal. `vHostPos` is the character's position and both
+    /// it and `vPos` sit on the map's ground, so the recovered magnitude is a
+    /// ground-plane distance; the explorer's camera stands in for the character
+    /// and only its X and Z are used. Reading the camera's height into the
+    /// distance would empty a whole city the moment the camera rose above it,
+    /// which is not what the client's fade does to a player standing there.
+    ///
+    /// A distance of zero means the fade is off, and off must leave every root
+    /// at the alpha the map authored. That is a restore, not an early return: a
+    /// root faded out under a previous distance keeps the alpha the owner
+    /// stored, and nothing else in the frame writes it back, so returning early
+    /// here would hold that root invisible for the rest of the session.
+    fn apply_attenuation(&mut self, delta_ms: u32, eye: [f32; 3]) {
+        let off = self.effect_distance <= 0.;
+        let mut updates: Vec<(u64, f32)> = Vec::new();
+        for producer in self.producers.iter_mut().filter(|p| p.attenuation) {
+            if off {
+                if producer.fade != 1. {
+                    producer.fade = 1.;
+                    updates.push((producer.identity, 1.));
+                }
+                continue;
+            }
+            let target = attenuation_target(self.effect_distance, producer.position, eye);
+            producer.fade = attenuation_step(producer.fade, target, delta_ms);
+            updates.push((producer.identity, producer.fade));
+        }
+        for (identity, fade) in updates {
+            self.owners.set_attenuation(identity, fade);
         }
     }
     pub fn update(
@@ -627,7 +765,7 @@ impl World {
             //    (0x7b2520), then publish before the grid consumes, so a light
             //    created or moved on this tick already lights this frame.
             self.resolve_attachments();
-            self.apply_activation(night);
+            self.apply_activation(night, delta_ms, center);
             self.owners.update(delta_ms, &mut self.publications);
             self.update_effects(device, queue, frame, delta_ms);
             self.grid.update(lights, center);
@@ -638,6 +776,43 @@ impl World {
             self.rebuild_alpha_order(center);
         }
     }
+    /// Install the surface query the effect pass needs to drape a
+    /// ground-matched decal over the terrain.
+    ///
+    /// The renderer owns the map's height grid and builds it once per world, so
+    /// it hands a query over after the world is constructed; the heights
+    /// themselves sit behind an `Arc`, so the closure costs a refcount bump
+    /// rather than a second copy of the map. Without this the ground branch of
+    /// `A3DDecalEx::Fill_Verts_3D` cannot run and every ground sheet stays one
+    /// flat quad.
+    ///
+    /// The height function is wrapped here rather than at the call site: a
+    /// `navigation::MapSpace::ground` call goes through `Heights::height`,
+    /// which `expect`s on a damaged backing block, and the drape reaches it
+    /// every frame where the minimap teleport only reached it on a click. One
+    /// panic is caught, the sheet stays flat, and the grid is dropped for the
+    /// rest of the run — a corrupt terrain cache must not turn into a crash on
+    /// the first frame.
+    pub fn set_terrain<F>(&mut self, height: F)
+    where
+        F: Fn(f32, f32) -> Option<f32> + 'static,
+    {
+        let broken = std::cell::Cell::new(false);
+        self.terrain = Some(Box::new(move |x: f32, z: f32| {
+            if broken.get() {
+                return None;
+            }
+            let read = || height(x, z);
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)) {
+                Ok(value) => value,
+                Err(_) => {
+                    broken.set(true);
+                    None
+                }
+            }
+        }));
+    }
+
     /// Advance the world's animated effects and upload this frame's quads.
     ///
     /// Main pass only, straight after the light producers, so the geometry and the
@@ -675,7 +850,12 @@ impl World {
                 return;
             }
         };
-        let quads = self.owners.effect_quads(delta_ms, &view);
+        // The field and the owner manager are separate places, so the sampler
+        // borrows one and the pass advances the other.
+        let sampler: Option<crate::gfx_player::GroundHeightQuery<'_>> = self.terrain.as_deref();
+        let quads = self
+            .owners
+            .effect_quads_with_ground(delta_ms, &view, sampler);
         // Say once, on stderr, what the invisible pipeline is doing. Nothing in
         // the world told a user *which* stage was empty when no effect appeared:
         // the roots could be unloaded, out of radius, failed to parse, or drawing
@@ -718,15 +898,28 @@ impl World {
         } = self;
         *effect_quads = quads;
         if effects.is_none() {
-            // The same reverse-Z depth the world's models use, so an effect in
-            // front of a wall is occluded by nothing and one behind it is hidden.
+            // The same reverse-Z depth buffer the world's models use, so an
+            // effect in front of a wall is occluded by nothing and one behind it
+            // is hidden — but with `LESSEQUAL`'s tie rule, not `LESS`.
+            //
+            // The client's effect path never writes `D3DRS_ZFUNC`: the slot
+            // record in `A3DGFXRenderSlot.h` carries `m_bZTestEnable` (the
+            // ZENABLE byte) and no Z-func field, so every effect slot runs on the
+            // D3D8 device default, `D3DCMP_LESSEQUAL`. Under the reversed
+            // projection that is `GreaterEqual`. The strict `Greater` this pass
+            // used to ask for dropped every sheet drawn at the same depth as one
+            // before it — a decal and its overlay glow, the two halves of a card
+            // pair, the coplanar layers of a portal — and because those depths
+            // are computed per vertex in floating point, the loser swapped with
+            // each hair of camera movement: the flicker. Two blended draws at
+            // equal depth both pass in the client, and both must pass here.
             match gfx_effect_gpu::Draw::new(
                 device,
                 queue,
                 *format,
                 Some((
                     wgpu::TextureFormat::Depth32Float,
-                    wgpu::CompareFunction::Greater,
+                    wgpu::CompareFunction::GreaterEqual,
                 )),
             ) {
                 Ok(draw) => *effects = Some(draw),
@@ -739,6 +932,21 @@ impl World {
         let Some(draw) = effects.as_mut() else {
             return;
         };
+        // Element 160 is the same `A3DSkinModel` a scenery model is, so it takes
+        // the same `LIGHTINFO`: this frame's ambient and directional colour, and
+        // its direction. `bPtLight` is forced off inside the pass, as
+        // `A3DGFXModel::UpdateModel` does for every model it builds.
+        let light = gfx_effect_gpu::EffectLight {
+            lighting: frame.lighting,
+            direction: frame.direction,
+            fog_range: frame.fog_range,
+            fog_color: frame.fog_color,
+            // `A3DGFXModel::ChangeModel` enables specular on every effect model,
+            // so the pass needs the light's specular colour and the eye the
+            // Blinn half-vector is built from.
+            directional_specular: frame.directional_specular,
+            eye_direction: frame.eye_direction,
+        };
         if let Err(error) = draw.update(
             device,
             queue,
@@ -746,6 +954,7 @@ impl World {
             frame.matrix,
             frame.clip_plane,
             [view.position.x, view.position.y, view.position.z, 0.],
+            Some(light),
             &mut **read,
         ) {
             reported.push(format!("world effects: {error}"));
@@ -768,9 +977,34 @@ impl World {
         self.owners.effects_enabled()
     }
 
+    /// `(path, clock ms, live play speed, authored PlaySpeed)` for every root this
+    /// world has admitted. The headless preview prints it so a "900 ms" shot can
+    /// quote the clock the effect actually reached, and a report can say whether
+    /// the map's `fSpeed` overrode the file's `PlaySpeed`.
+    pub fn effect_clocks(&self) -> Vec<(String, f32, f32, f32)> {
+        self.owners.player_clocks()
+    }
+
     /// Quads the world's animated effects produced this frame.
     pub fn effect_quad_count(&self) -> usize {
         self.effect_quads.len()
+    }
+
+    /// Textures the effect pass could not decode, newest first. A bucket whose
+    /// map will not load is drawn with a transparent stand-in, so a preview that
+    /// submitted quads and covered no pixels is exactly this list being non-empty.
+    pub fn effect_texture_failures(&self) -> &[String] {
+        match &self.effects {
+            Some(draw) => draw.failures(),
+            None => &[],
+        }
+    }
+
+    /// This frame's submitted effect quads. The headless preview in
+    /// `effect_preview` frames its shot from these, and a test can measure what
+    /// a root actually draws instead of trusting its authored numbers.
+    pub fn effect_quads(&self) -> &[crate::gfx_player::EffectQuad] {
+        &self.effect_quads
     }
 
     /// Roots whose animated graph would not build, as `origin: error`. Their
@@ -1174,4 +1408,43 @@ fn event_milliseconds(event: &crate::ecmodel::EcmEvent, key: &str) -> Result<f32
         return Err(format!("nonfinite GFX event {key}"));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `FadeGFX` is `SetAlphaTransition(alpha, 3000)`: a full ramp takes three
+    /// seconds at any frame rate, and the step never overshoots.
+    #[test]
+    fn the_distance_fade_takes_three_seconds_either_way() {
+        let mut fade = 1.;
+        for _ in 0..30 {
+            fade = attenuation_step(fade, 0., 100);
+        }
+        assert!(fade < 1e-6);
+        let mut fade = 0.;
+        for _ in 0..60 {
+            fade = attenuation_step(fade, 1., 50);
+        }
+        assert!(fade > 1. - 1e-6);
+        assert_eq!(attenuation_step(0.25, 1., 3000), 1.);
+        assert_eq!(attenuation_step(0.25, 0., 3000), 0.);
+        // A stalled clock steps nothing; one huge frame lands on the target.
+        assert_eq!(attenuation_step(0.5, 1., 0), 0.5);
+        assert_eq!(attenuation_step(0.5, 1., 100_000), 1.);
+    }
+
+    /// The fade follows `vHostPos`, a ground position, so the camera's height is
+    /// not part of the distance, and a distance of zero is the fade switched
+    /// off: every root it had dimmed comes back to the alpha the map authored.
+    #[test]
+    fn the_fade_is_horizontal_and_zero_restores_full_alpha() {
+        let ground = [100., 200., -4000.];
+        assert_eq!(attenuation_target(60., ground, [100., 700., -4000.]), 1.);
+        assert_eq!(attenuation_target(60., ground, [1000., 200., -4000.]), 0.);
+        assert_eq!(attenuation_target(0., ground, [9000., 0., 9000.]), 1.);
+        assert_eq!(attenuation_target(60., ground, [159.9, 200., -4000.]), 1.);
+        assert_eq!(attenuation_target(60., ground, [160.1, 200., -4000.]), 0.);
+    }
 }

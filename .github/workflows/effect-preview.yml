@@ -1,0 +1,290 @@
+name: Effect previews
+
+# Render the shipped effect roots headlessly and keep the frames.
+#
+# `src/effect_preview.rs` builds the viewer's own `World`, installs one authored
+# placement, ticks the real frame loop and renders the real effect pass into an
+# offscreen texture. It needs the retail `gfx.pck` (the roots and their
+# textures) and an `.ecwld` (which placements the map authors), neither of which
+# is in the repository, so this job fetches them on a runner and runs the
+# `#[ignore]`d corpus test. `effect_preview_smoke` runs in `pr-checks.yml`
+# instead: it authors its own root and needs no client file.
+#
+# Manual only. Every run uploads `target/effect-preview/*.png` plus the log that
+# carries the measured box of each effect, which is what says whether a sheet
+# was drawn at the size its root authored, and commits both to
+# `Findings/effect-preview/` so a reviewer reads them without an artifact
+# download.
+
+on:
+  # `workflow_dispatch` cannot start a workflow that is not yet on the default
+  # branch, so a push to this one file is the "run it now" switch used while the
+  # workflow itself is still under review.
+  push:
+    paths:
+      - ".github/effect-preview-trigger.txt"
+  workflow_dispatch:
+    inputs:
+      roots:
+        description: "; separated substrings of the effect paths to render (empty renders everything)"
+        required: false
+        default: "水门_瀑布;树林光束;圣城之光"
+      limit:
+        description: "how many placements to render"
+        required: false
+        default: "9"
+      per_root:
+        description: "at most this many placements per effect root, so one root cannot spend the whole limit"
+        required: false
+        default: "3"
+      frames:
+        description: "comma separated shot times, in milliseconds"
+        required: false
+        default: "0,900,3000"
+      zooms:
+        description: "comma separated distances; 1 fits the measured box, 0.45 is twice as close"
+        required: false
+        default: "1"
+      angles:
+        description: "comma separated azimuth:elevation degrees"
+        required: false
+        default: "35:20,0:80"
+      size:
+        description: "PNG edge in pixels"
+        required: false
+        default: "384"
+      quads:
+        description: "1 prints every submitted card's own width, length, centre, texture and blend"
+        required: false
+        default: "1"
+      census:
+        description: "1 prints the scale distribution of every placement and the range each wanted root is placed with"
+        required: false
+        default: "1"
+      log:
+        description: "comma separated logging channels to write next to the frames (PWE_LOG)"
+        required: false
+        default: "effect-elements,effect-decals"
+      gfx_id:
+        description: "Drive id of the gfx.pck to render"
+        required: false
+        default: "1a_q8Xew2gDY5hlLcKxcuFnmkP_2gsfAH"
+      world_id:
+        description: "Drive id of the world.ecwld to take placements from"
+        required: false
+        default: "1nYOesKLxtlHD6fy1M_hqBSRSNBiTLd8I"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: effect-preview
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    name: Render the effect roots
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update || sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            mesa-vulkan-drivers || \
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libxkbcommon-dev libwayland-dev \
+            mesa-vulkan-drivers
+
+      - name: Download the client effect archive
+        env:
+          # Two `gfx.pck` builds exist on the Drive folder. A pack names its own
+          # version in the guard words of the 280-byte header that ends the
+          # catalogue, and `pck::directory` only accepts 0xfdfdfeee/0xf00dbeef,
+          # so the step checks the words before the build instead of spending
+          # twenty minutes to be told "unsupported PCK guard keys".
+          GFX_IDS: ${{ inputs.gfx_id || '1a_q8Xew2gDY5hlLcKxcuFnmkP_2gsfAH,1B0QY1vwtv8G06aqUvxsFfqlGHzvuVk2i' }}
+          WORLD_ID: ${{ inputs.world_id || '1nYOesKLxtlHD6fy1M_hqBSRSNBiTLd8I' }}
+        run: |
+          set -euo pipefail
+          mkdir -p client
+          fetch() {
+            curl -fsSL --retry 3 --retry-delay 5 -o "client/$2" \
+              "https://drive.usercontent.google.com/download?id=$1&export=download&confirm=t"
+            size=$(stat -c%s "client/$2")
+            echo "client/$2: $size bytes"
+            if [ "$size" -lt 1000 ]; then
+              echo "::error::client/$2 is only $size bytes - the Drive download returned a page, not the file"
+              head -c 400 "client/$2" || true
+              exit 1
+            fi
+          }
+          fetch "$WORLD_ID" world.ecwld
+          IFS=',' read -r -a ids <<< "$GFX_IDS"
+          for id in "${ids[@]}"; do
+            id="${id// /}"
+            [ -n "$id" ] || continue
+            fetch "$id" gfx.pck
+            # `end` is the catalogue's end offset, little endian at file offset 4;
+            # the guard words are the first and 269th word of the header before it.
+            end=$(od -An -tu4 -j4 -N4 client/gfx.pck | tr -d ' \n')
+            head=$(od -An -tx4 -j$((end - 280)) -N4 client/gfx.pck | tr -d ' \n')
+            tail=$(od -An -tx4 -j$((end - 280 + 268)) -N4 client/gfx.pck | tr -d ' \n')
+            echo "gfx.pck id=$id end=$end guards=$head/$tail"
+            if [ "$head" = "fdfdfeee" ] && [ "$tail" = "f00dbeef" ]; then
+              echo "::notice::using gfx.pck id=$id ($(stat -c%s client/gfx.pck) bytes)"
+              exit 0
+            fi
+          done
+          echo "::error::none of the gfx.pck ids carries the guard words this reader accepts"
+          exit 1
+
+      # The pack-corpus tests (`the_shipped_*`, the editor-garbage scales) read
+      # `google_drive/gfx.pck` and `open_pack` turns a missing pack into a silent
+      # skip — which is how two tests asserting opposite tiled-UV laws both
+      # stayed green while the waterfalls froze (§59.2). The archive is already
+      # downloaded above, so link it where the tests look and set
+      # `PWE_CORPUS=require`: from here on, absence is a failure and a wrong
+      # assertion about a shipped root turns this job red instead of quiet.
+      - name: Shipped pack tests (cannot skip)
+        run: |
+          set -euo pipefail
+          mkdir -p google_drive target/effect-preview
+          ln -sf "$PWD/client/gfx.pck" google_drive/gfx.pck
+          CARGO_TERM_COLOR=never PWE_CORPUS=require cargo test --locked \
+            --bin perfect-world-explorer -- --nocapture \
+            the_shipped_ the_roots_with_editor_garbage \
+            2>&1 | tee target/effect-preview/pack-tests.log
+          status=${PIPESTATUS[0]}
+          grep -E "^test result:" target/effect-preview/pack-tests.log || true
+          if [ "$status" -ne 0 ]; then
+            echo "::error::a shipped-pack test failed; the corpus is present, so this is a real disagreement with the retail files"
+            grep -A3 -E "panicked at" target/effect-preview/pack-tests.log \
+              | head -20 | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
+
+      - name: Render
+        env:
+          WGPU_BACKEND: vulkan
+          XDG_RUNTIME_DIR: /tmp
+          PWE_PREVIEW_ELEMENT: client
+          PWE_PREVIEW_WORLD: client/world.ecwld
+          # A `push` to the trigger file cannot carry inputs, so the list of
+          # roots to sweep lives in a file next to this workflow and is read
+          # below. That is what makes a sweep a one-line edit instead of a
+          # workflow change: the run that answers "are these roots still what
+          # the reports say" is the same code path every time.
+          PWE_PREVIEW_ROOTS: ${{ inputs.roots || '' }}
+          PWE_PREVIEW_MAX: ${{ inputs.limit || '24' }}
+          PWE_PREVIEW_PER_ROOT: ${{ inputs.per_root || '1' }}
+          PWE_PREVIEW_FRAMES: ${{ inputs.frames || '0,3000' }}
+          PWE_PREVIEW_ZOOMS: ${{ inputs.zooms || '1' }}
+          PWE_PREVIEW_ANGLES: ${{ inputs.angles || '35:20' }}
+          PWE_PREVIEW_CENSUS: ${{ inputs.census || '1' }}
+          PWE_PREVIEW_QUADS: ${{ inputs.quads || '1' }}
+          PWE_PREVIEW_SIZE: ${{ inputs.size || '384' }}
+          # The element table and the decal channel are the two that answer "which
+          # element, built by which basis"; they cost nothing until a line is
+          # written and the file ride along with the frames.
+          PWE_LOG: ${{ inputs.log || 'effect-elements,effect-cards,effect-uv,effect-clock,effect-frames,effect-particles' }}
+        run: |
+          # The sweep list: one root substring per line, `#` comments allowed.
+          if [ -z "${PWE_PREVIEW_ROOTS}" ]; then
+            if [ -s .github/effect-preview-roots.txt ]; then
+              PWE_PREVIEW_ROOTS="$(grep -v '^[[:space:]]*#' .github/effect-preview-roots.txt \
+                | sed '/^[[:space:]]*$/d' | paste -sd';')"
+            else
+              PWE_PREVIEW_ROOTS='水门_瀑布;树林光束;天煞光束;圣城之光;骷髅光柱;绿鬼火3;暗语者营地'
+            fi
+            export PWE_PREVIEW_ROOTS
+          fi
+          echo "sweep roots: ${PWE_PREVIEW_ROOTS}"
+          export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
+          if [ -z "$VK_ICD_FILENAMES" ]; then
+            echo "::error::no lavapipe ICD; nothing rendered"
+            exit 1
+          fi
+          mkdir -p target/effect-preview
+          CARGO_TERM_COLOR=never cargo test --locked --bin perfect-world-explorer \
+            -- --ignored --nocapture effect_previews \
+            2>&1 | tee target/effect-preview/render.log
+          status=${PIPESTATUS[0]}
+          grep -E "^preview:" target/effect-preview/render.log || true
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the effect preview run failed"
+            grep -A3 -E "panicked at" target/effect-preview/render.log \
+              | head -20 | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
+          fi
+
+      # The frames and the log line that measures each effect are the evidence,
+      # so they go onto the branch where a reviewer can read them next to the
+      # code. `render.log` carries one `preview:` line per shot with the
+      # world-space box and diagonal of the quads that were submitted.
+      - name: Commit the frames and the measured sizes
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p Findings/effect-preview
+          # Frames are evidence for this run, not an archive of every past one.
+          rm -f Findings/effect-preview/*.png Findings/effect-preview/metrics.md
+          if [ -f target/effect-preview/render.log ]; then
+            cp target/effect-preview/render.log Findings/effect-preview/
+          fi
+          find target/effect-preview -name '*.png' -size -2M -exec cp {} Findings/effect-preview/ \;
+          # `PWE_LOG` writes the element tables and the decal channel here: the
+          # per-card `basis=`/`id=` lines are what say which builder drew a ring.
+          # They are copied with a `.txt` suffix because `*.log` is ignored in
+          # this repository, and a `git add -f`ed ignored file does not survive a
+          # squash: the 12 November run published three channel files and the
+          # squashed branch kept none of them.
+          for file in target/effect-preview/*.log; do
+            [ -s "$file" ] || continue
+            [ "$(stat -c%s "$file")" -lt 4194304 ] || continue
+            cp "$file" "Findings/effect-preview/$(basename "$file").txt"
+          done
+          if [ -f target/effect-preview/metrics.md ]; then
+            cp target/effect-preview/metrics.md Findings/effect-preview/
+          fi
+          ls -l Findings/effect-preview | head -40
+          git config user.name "effect preview"
+          git config user.email "preview@users.noreply.github.com"
+          # `-f` because the frames directory also carries `render.log`, which is
+          # ignored: the channel files themselves arrive as `.txt` above.
+          git add -f Findings/effect-preview
+          if git diff --cached --quiet; then
+            echo "nothing new to commit"
+            exit 0
+          fi
+          git commit -m "Effect preview frames [skip ci]"
+          # The branch may have moved while the frames rendered — a code commit
+          # landing during the run used to leave the frames uncommitted, which is
+          # how a run can be green and still publish nothing. Rebase onto the
+          # branch and try again instead.
+          pushed=0
+          for attempt in 1 2 3 4 5; do
+            if git push origin HEAD; then pushed=1; break; fi
+            sleep 5
+            git fetch origin "$GITHUB_REF_NAME"
+            git rebase "origin/$GITHUB_REF_NAME" || git rebase --abort || true
+          done
+          if [ "$pushed" -ne 1 ]; then
+            echo "::error::the frames could not be pushed after five attempts"
+            exit 1
+          fi
+
+      - name: Keep the frames and the measured sizes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: effect-preview
+          path: target/effect-preview
+          if-no-files-found: warn

@@ -407,6 +407,16 @@ pub struct Control {
     pub data: ControlData,
 }
 
+/// Which noise controller a `Fractal` payload belongs to; `ID_KPCTRL_CL_NOISE`
+/// (107), `ID_KPCTRL_SCA_NOISE` (109) or `ID_KPCTRL_NOISE_BASE` (112) in
+/// `A3DGFXKeyPoint.h`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum NoiseKind {
+    Color,
+    Scale,
+    Base,
+}
+
 /// The 13 controller payloads, with the client's own field names.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ControlData {
@@ -414,21 +424,42 @@ pub enum ControlData {
     Motion { dir: Vec3, vel: f32, acc: f32 },
     /// 101: scalar speed change (particle speed over life).
     Speed { vel: f32, acc: f32 },
-    /// 102 and 103: rotation about `axis` through `pos`.
+    /// 102: rotation about `axis` through `pos` — spins the keypoint
+    /// direction (`A3DGFXCtrlRotAxis::Process` rotates `m_vDir`) and orbits
+    /// the position around the line.
     Orbit {
         pos: Vec3,
         axis: Vec3,
         vel: f32,
         acc: f32,
     },
-    /// 104: motion relative to `pos`; `vel == -1` disables it.
+    /// 103: revolution about `axis` through `pos`. `A3DGFXCtrlRevol::Process`
+    /// moves only the position; the direction is left alone (only 102 spins
+    /// it), so this is a separate variant.
+    Revol {
+        pos: Vec3,
+        axis: Vec3,
+        vel: f32,
+        acc: f32,
+    },
+    /// 104: `A3DGFXCtrlCentriMove::Process` steps the position toward (or,
+    /// with a negative step, away from) the centre `pos + m_vAxisOff` by the
+    /// integrated distance, clamping at the centre on overshoot. The old
+    /// `vel == -1` / `dspl == -1` sentinels came from a disassembly reading
+    /// and are not in the source.
     Attract { pos: Vec3, vel: f32, acc: f32 },
     /// 105: per-channel colour rate, four signed integers per second.
     ColorDelta { delta: [i32; 4] },
     /// 106: scale rate per second with the authored clamp.
     ScaleChange { rate: f32, min: f32, max: f32 },
-    /// 107, 109 and 112: fractal noise. 107 adds `base_color`.
+    /// 107, 109 and 112: fractal noise. The three share the payload but act
+    /// differently in `Process`: 109 (`A3DGFXCtrlScaleNoise`) writes the
+    /// `PROC_DATA::m_fScaleNoise` slot the keypoint read adds to the output
+    /// scale, 107 (`A3DGFXCtrlColorNoise`) drives the alpha of a colour whose
+    /// RGB come from `BaseColor`, and 112 (`A3DGFXCtrlNoiseBase`) is the
+    /// shared generator holder and does nothing on its own.
     Fractal {
+        kind: NoiseKind,
         buffer_length: u32,
         amplitude: f32,
         wave_length: f32,
@@ -818,9 +849,9 @@ impl Fractal {
     }
 
     /// The authored alpha at fraction `t` of the strip, on the same three-point
-    /// profile and with the same `[end, midpoint, start]` order as
-    /// [`Fractal::width_at`]: the client reads `+0x2cc`/`+0x2d0`/`+0x2d4`,
-    /// which the loader fills from the three `Alpha` lines in file order.
+    /// profile and in the same `[start, end, midpoint]` file order as
+    /// [`Fractal::width_at`]: the loader fills `+0x2cc`/`+0x2d0`/`+0x2d4` from
+    /// the three `Alpha` lines in file order.
     pub fn alpha_at(&self, t: f32) -> f32 {
         profile_at(&self.alphas, t)
     }
@@ -828,20 +859,29 @@ impl Fractal {
 
 /// Sample a three-point authored profile.
 ///
-/// Order is `[end, midpoint, start]`. One value is constant, two interpolate
-/// end to start with no midpoint, three use the midpoint as the apex of a
-/// two-segment ramp.
+/// Order is the file's own: `[start, end, midpoint]`. `A3DGFXLightning::Load`
+/// reads the lines in exactly that order (`A3DGFXLightning.cpp:467-500`):
+///
+///     Width -> m_fWidthStart   // line 1
+///     Width -> m_fWidthEnd     // line 2
+///     ... (version >= 7) Alpha -> m_fAlphaStart, Alpha -> m_fAlphaEnd
+///     ... (version >= 35) Width -> m_fWidthMid, Alpha -> m_fAlphaMid   // line 3
+///
+/// and `FillVertexBuffer` ramps `Start -> Mid` over the first half of the path
+/// and `Mid -> End` over the second (`:888-903`). So the third line is the
+/// apex, not the second. One value is constant, two interpolate start to end
+/// with no midpoint.
 fn profile_at(values: &[f32], t: f32) -> f32 {
     let t = t.clamp(0., 1.);
     match values {
         [] => 0.,
         [only] => *only,
-        [end, start] => end + (start - end) * t,
-        [end, mid, start, ..] => {
+        [start, end] => start + (end - start) * t,
+        [start, end, mid, ..] => {
             if t <= 0.5 {
-                end + (mid - end) * (t / 0.5)
+                start + (mid - start) * (t / 0.5)
             } else {
-                mid + (start - mid) * ((t - 0.5) / 0.5)
+                mid + (end - mid) * ((t - 0.5) / 0.5)
             }
         }
     }
@@ -922,17 +962,40 @@ pub struct Trail {
 pub struct ModelRef {
     /// Path relative to the model archive root, e.g. `地图\水晶.SMD`.
     pub path: String,
+    /// `ModelActName`, the action `PlayActionByNameDC` starts (version 19+).
+    /// The viewer poses the bind pose, so the action is not played yet.
     pub action: String,
+    /// `Loops`, passed straight to `PlayActionByNameDC`: `-1` repeats forever,
+    /// `1` plays once and holds. 174 shipped models author `-1`, 72 author `1`
+    /// and 201 predate the version-31 key, whose constructor value is 1.
     pub loops: i32,
+    /// `AlphaCmp`, fed to `A3DSkinModel::EnableAlphaComp` (version 29+). Only 9
+    /// of the 447 shipped models set it.
     pub alpha_compare: bool,
+    /// `WriteZ`, the `ZWRITEENABLE` state `PrepareRenderSkinModel` installs
+    /// (version 49+). 115 shipped models author `1`; the constructor value and
+    /// therefore the meaning of an absent key is false.
     pub write_z: bool,
+    /// `Use3DCam` (version 77+). Read and saved by the client but dead in it:
+    /// `A3DGFXModel::IsForceUse3DCamera` returns `false` unconditionally, with
+    /// `m_bIsUse3DCamera` commented out of both that return and its
+    /// `GetProperty`. Nothing may act on this value.
     pub use_3d_camera: bool,
 }
 
 /// Sound (element 170).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SoundRef {
+    /// The first of `paths`, what single-consumers key on.
     pub path: String,
+    /// Every `Path` row of the record. The client keeps a random file
+    /// container here: `GFXSOUNDIMP::Load` (A3DGFXSoundImp.cpp) reads
+    /// `PathNum: %d` and then that many `Path: %s` rows at root version 88
+    /// or later — one `Path` row before 88 — into a `RandStringContainer(5)`,
+    /// and `ChangeSoundFile` draws one at random per sound change. The editor
+    /// calls this list DropFileNames; the rows are the sound's alternate
+    /// takes, not a single path with junk after it.
+    pub paths: Vec<String>,
     pub version: u32,
     pub force_2d: bool,
     pub is_loop: bool,
@@ -1626,11 +1689,30 @@ fn spec(id: u32, fields: &[Field], version: u32) -> Result<Spec, String> {
             action: lookup.one("ModelActName").unwrap_or_default().to_string(),
             loops: lookup.integer("Loops", 1)? as i32,
             alpha_compare: lookup.flag("AlphaCmp", false)?,
-            write_z: lookup.flag("WriteZ", true)?,
+            // `A3DGFXModel`'s constructor starts at `m_bZWriteEnable(false)` and
+            // the key only arrived at version 49: of the 447 models in the
+            // shipped `gfx.pck`, 115 author `WriteZ: 1`, 131 author `0` and 201
+            // predate the key.
+            write_z: lookup.flag("WriteZ", false)?,
             use_3d_camera: lookup.flag("Use3DCam", false)?,
         }),
         170 => Spec::Sound(SoundRef {
             path: lookup.one("Path").unwrap_or_default().to_string(),
+            paths: {
+                // `PathNum` is the count the client reads at version 88 or
+                // later and then consumes exactly that many `Path` rows
+                // (A3DGFXSoundImp.cpp, `GFXSOUNDIMP::Load`); a record that
+                // authors the count takes exactly its rows, and an older
+                // single-path record takes the one row it has.
+                let mut paths: Vec<String> =
+                    lookup.all("Path").into_iter().map(str::to_string).collect();
+                if let Ok(count) = lookup.integer("PathNum", 0) {
+                    if count > 0 {
+                        paths.truncate(count as usize);
+                    }
+                }
+                paths
+            },
             version: clamp_u32(lookup.integer("SoundVer", 1)?),
             force_2d: lookup.flag("Force2D", false)?,
             is_loop: lookup.flag("IsLoop", false)?,
@@ -2100,7 +2182,13 @@ fn control(reader: &mut Reader) -> Result<Control, String> {
             vel: reader.number("Vel")?,
             acc: reader.number("Acc")?,
         },
-        102 | 103 => ControlData::Orbit {
+        102 => ControlData::Orbit {
+            pos: reader.vector("Pos")?,
+            axis: reader.vector("Axis")?,
+            vel: reader.number("Vel")?,
+            acc: reader.number("Acc")?,
+        },
+        103 => ControlData::Revol {
             pos: reader.vector("Pos")?,
             axis: reader.vector("Axis")?,
             vel: reader.number("Vel")?,
@@ -2146,8 +2234,13 @@ fn control(reader: &mut Reader) -> Result<Control, String> {
                 max: parts[2],
             }
         }
-        // 107 adds a base colour to the noise payload of 109 and 112.
+        // 107, 109 and 112 share one payload; the kind picks the Process law.
         107 | 109 | 112 => ControlData::Fractal {
+            kind: match kind {
+                107 => NoiseKind::Color,
+                109 => NoiseKind::Scale,
+                _ => NoiseKind::Base,
+            },
             buffer_length: clamp_u32(reader.integer("BufLen")?),
             amplitude: reader.number("Amplitude")?,
             wave_length: reader.number("WaveLen")?,
@@ -2332,6 +2425,7 @@ const KNOWN_KEYS: &[&str] = &[
     "ParticleHeight",
     "ParticleWidth",
     "Path",
+    "PathNum",
     "PerBolts",
     "Persistence",
     "Phi",
@@ -2588,6 +2682,7 @@ mod tests {
         assert_eq!(
             control.data,
             ControlData::Fractal {
+                kind: NoiseKind::Base,
                 buffer_length: 256,
                 amplitude: 1.,
                 wave_length: 1.,
@@ -2682,6 +2777,7 @@ mod tests {
         );
         match &element.affectors[4].data {
             ControlData::Fractal {
+                kind,
                 buffer_length,
                 amplitude,
                 wave_length,
@@ -2689,6 +2785,7 @@ mod tests {
                 octaves,
                 base_color,
             } => {
+                assert_eq!(*kind, NoiseKind::Scale);
                 assert_eq!(*buffer_length, 256);
                 assert_eq!(*amplitude, 0.5);
                 assert_eq!(*wave_length, 50.);
@@ -2868,7 +2965,57 @@ mod tests {
         }
     }
 
+    /// Element 160 starts life at `A3DGFXModel`'s constructor values —
+    /// `m_nLoops(1)`, `m_bAlphaCmp(false)`, `m_bZWriteEnable(false)` — and each
+    /// key only arrived later (`Loops` at 31, `AlphaCmp` at 29, `WriteZ` at 49),
+    /// so a block that omits them must read back as those defaults. The 201
+    /// shipped models without `WriteZ` therefore never write depth.
     #[test]
+    fn model_defaults_do_not_write_depth() {
+        let block = "GFXELEMENTID: 160\nName: m\nSrcBlend: 5\nDestBlend: 2\n\
+            ModelPath: 地图\\水晶.SMD\nStartTime: 0\nKEYPOINTCOUNT: 0\n";
+        let model = "GFXELEMENTID: 160\nName: m\nSrcBlend: 5\nDestBlend: 2\n\
+            ModelPath: 地图\\水晶.SMD\nModelActName: \nLoops: -1\nAlphaCmp: 1\nWriteZ: 0\n\
+            StartTime: 0\nKEYPOINTCOUNT: 0\n";
+        let source = header37(2) + block + model;
+        let root = parse(&source).unwrap();
+        let Spec::Model(bare) = &root.elements[0].spec else {
+            panic!("element 160 is a model");
+        };
+        assert_eq!(bare.path, "地图\\水晶.SMD");
+        assert_eq!(bare.loops, 1, "constructor default is one loop");
+        assert!(!bare.alpha_compare, "constructor default is no alpha test");
+        assert!(!bare.write_z, "constructor default writes no depth");
+        assert!(!bare.use_3d_camera);
+        let Spec::Model(authored) = &root.elements[1].spec else {
+            panic!("element 160 is a model");
+        };
+        assert_eq!(authored.loops, -1);
+        assert!(authored.alpha_compare);
+        assert!(!authored.write_z, "an authored zero stays off");
+    }
+
+    #[test]
+    /// The sound's file list is `PathNum` rows of `Path` at root version 88
+    /// or later: `GFXSOUNDIMP::Load` (A3DGFXSoundImp.cpp) reads the count
+    /// and then exactly that many names into its `RandStringContainer(5)`,
+    /// and `ChangeSoundFile` draws one at random per sound change. The
+    /// editor labels that list DropFileNames; two rows are two takes of one
+    /// cue, and the count is the number of rows, not a boolean.
+    #[test]
+    fn a_sound_carries_its_whole_path_list() {
+        let sound = "GFXELEMENTID: 170\nName: s\nSrcBlend: 5\nDestBlend: 2\n\
+            PathNum: 2\nPath: Sfx\\a.wav\nPath: Sfx\\b.wav\nSoundVer: 1\nForce2D: 0\n\
+            IsLoop: 0\nVolume: 100\nMinDist: 6.000000\nMaxDist: 25.000000\n\
+            StartTime: 0\nKEYPOINTCOUNT: 0\n";
+        let root = parse(&(header37(1) + sound)).unwrap();
+        let Spec::Sound(sound) = &root.elements[0].spec else {
+            panic!("element 170 is a sound");
+        };
+        assert_eq!(sound.path, "Sfx\\a.wav");
+        assert_eq!(sound.paths, ["Sfx\\a.wav", "Sfx\\b.wav"]);
+    }
+
     fn trail_152_cylinders_grids_children_lights_and_sounds() {
         let trail = "GFXELEMENTID: 152\nName: t\nSrcBlend: 5\nDestBlend: 2\nTexFile: 轨迹\\trail003.dds\n\
             BufLen: 256\nAmplitude: 1.000000\nWaveLen: 1\nPersistence: 0.250000\nOctaveNum: 5\n\
@@ -2954,6 +3101,7 @@ mod tests {
             panic!("element 170 is a sound");
         };
         assert_eq!(sound.path, "Effect\\Player\\魔力燃烧.wav");
+        assert_eq!(sound.paths, ["Effect\\Player\\魔力燃烧.wav"]);
         assert_eq!(sound.volume, 100);
         assert!(!root.elements[5].spec.is_visual());
 
@@ -3094,6 +3242,7 @@ mod tests {
         assert_eq!(control.kind, 107);
         match &control.data {
             ControlData::Fractal {
+                kind,
                 buffer_length,
                 amplitude,
                 wave_length,
@@ -3101,6 +3250,7 @@ mod tests {
                 octaves,
                 base_color,
             } => {
+                assert_eq!(*kind, NoiseKind::Color);
                 assert_eq!(*buffer_length, 128);
                 assert_eq!(*amplitude, 3.);
                 assert_eq!(*wave_length, 2.);

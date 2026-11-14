@@ -620,7 +620,7 @@ mod tests {
     fn authentic_static_weapon_decals_cover_the_audited_root_set() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("gfx.pck").exists() {
-            eprintln!("SKIPPED: no `google_drive/pw142/element` on this machine; this test proves nothing about the shipped decals");
+            crate::pck::corpus_absent("`google_drive/pw142/element`");
             return;
         }
         let mut file = std::fs::File::open(element.join("gfx.pck")).unwrap();

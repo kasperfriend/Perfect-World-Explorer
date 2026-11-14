@@ -1275,6 +1275,17 @@ impl Walker {
                 // free-standing root renders exactly like an attached one.
                 quads.extend(self.gallery.advance(&view, dt_ms, map)?);
                 if let Some(gpu) = self.gpu.as_mut() {
+                    // Element 160 is a skin model like any other, so it takes this
+                    // frame's `LIGHTINFO` — the same ambient and directional colour
+                    // the character's own meshes are drawn with.
+                    let light = gfx_effect_gpu::EffectLight {
+                        lighting: frame.lighting,
+                        direction: frame.direction,
+                        fog_range: frame.fog_range,
+                        fog_color: frame.fog_color,
+                        directional_specular: frame.directional_specular,
+                        eye_direction: frame.eye_direction,
+                    };
                     gpu.effects.update(
                         device,
                         queue,
@@ -1282,6 +1293,7 @@ impl Walker {
                         frame.matrix,
                         frame.clip_plane,
                         [view.position.x, view.position.y, view.position.z, 0.],
+                        Some(light),
                         &mut |path| assets.read(path),
                     )?;
                 }
