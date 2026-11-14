@@ -57,11 +57,11 @@
 //! Windows build is the compile authority.
 
 #[cfg(windows)]
-mod mv;
-#[cfg(windows)]
 mod fg;
 #[cfg(windows)]
 mod imp;
+#[cfg(windows)]
+mod mv;
 #[cfg(windows)]
 pub use fg::*;
 #[cfg(windows)]

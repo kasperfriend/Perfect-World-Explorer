@@ -965,7 +965,7 @@ impl FsrUpscaler {
             prev_valid: u32::from(self.prev_view_proj.is_some()),
             pad: 0,
         };
-        queue.write_buffer(&self.mv_pass.params, 0, bytemuck::bytes_of(&params));
+        queue.write_buffer(self.mv_pass.params_buffer(), 0, bytemuck::bytes_of(&params));
         let depth_view = depth.create_view(&wgpu::TextureViewDescriptor {
             aspect: wgpu::TextureAspect::All,
             ..Default::default()
@@ -982,7 +982,7 @@ impl FsrUpscaler {
             .create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fsr motion vector bind group"),
-            layout: &self.mv_pass.layout,
+            layout: self.mv_pass.layout(),
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -990,7 +990,7 @@ impl FsrUpscaler {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: self.mv_pass.params.as_entire_binding(),
+                    resource: self.mv_pass.params_buffer().as_entire_binding(),
                 },
             ],
         });
@@ -1019,7 +1019,7 @@ impl FsrUpscaler {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.mv_pass.pipeline);
+            pass.set_pipeline(self.mv_pass.pipeline());
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
