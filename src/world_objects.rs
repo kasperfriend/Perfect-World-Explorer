@@ -30,6 +30,33 @@ pub struct PlacementRange {
     /// Original model/mesh encounter order, independent of storage chunking.
     pub order: u64,
     pub visibility: Visibility,
+    /// Conservative world-space mesh bounds; `None` keeps legacy or diagnostic
+    /// ranges uncullable rather than risking a false rejection.
+    pub bounds: Option<[f32; 6]>,
+}
+
+pub fn empty_bounds() -> [f32; 6] {
+    [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ]
+}
+
+/// Extend `[min_x, min_y, min_z, max_x, max_y, max_z]`; return false for a
+/// non-finite vertex so callers can conservatively mark the range uncullable.
+pub fn extend_bounds(bounds: &mut [f32; 6], point: [f32; 3]) -> bool {
+    if !point.iter().all(|value| value.is_finite()) {
+        return false;
+    }
+    for axis in 0..3 {
+        bounds[axis] = bounds[axis].min(point[axis]);
+        bounds[axis + 3] = bounds[axis + 3].max(point[axis]);
+    }
+    true
 }
 
 /// The part of a page the command builder reads. Kept separate from `GpuPage`
@@ -52,6 +79,28 @@ pub struct PageSpans<'a> {
 /// placement the view hides can never be swallowed by a neighbour: it is
 /// skipped and leaves a gap the merge rule refuses to cross.
 pub fn fold_commands(pages: &[PageSpans], order: &[(usize, usize)], view: Pass) -> Vec<DrawCmd> {
+    fold_commands_visible(pages, order, view, |_| true)
+}
+
+/// Frustum-aware twin of `fold_commands`. Missing bounds are conservatively kept.
+pub fn fold_commands_culled(
+    pages: &[PageSpans],
+    order: &[(usize, usize)],
+    view: Pass,
+    mut intersects: impl FnMut([f32; 6]) -> bool,
+) -> Vec<DrawCmd> {
+    fold_commands_visible(pages, order, view, |bounds| match bounds {
+        Some(bounds) => intersects(bounds),
+        None => true,
+    })
+}
+
+fn fold_commands_visible(
+    pages: &[PageSpans],
+    order: &[(usize, usize)],
+    view: Pass,
+    mut keep_bounds: impl FnMut(Option<[f32; 6]>) -> bool,
+) -> Vec<DrawCmd> {
     let mut cmds: Vec<DrawCmd> = Vec::with_capacity(order.len());
     for &(page, range) in order {
         let p = &pages[page];
@@ -59,7 +108,9 @@ pub fn fold_commands(pages: &[PageSpans], order: &[(usize, usize)], view: Pass) 
             (0, p.count)
         } else {
             let r = &p.placements[range];
-            if !allows_with_context(view, r.visibility, RenderContext::default()) {
+            if !allows_with_context(view, r.visibility, RenderContext::default())
+                || !keep_bounds(r.bounds)
+            {
                 continue;
             }
             (r.start, r.end)
@@ -473,11 +524,14 @@ fn run(
                 let oy = slot.y as f32 / SIDE as f32;
                 let sx = slot.w as f32 / SIDE as f32;
                 let sy = slot.h as f32 / SIDE as f32;
+                let mut bounds = empty_bounds();
+                let mut bounds_valid = !mesh.vertices.is_empty();
                 for v in &mesh.vertices {
                     let pos = Vec3::from_array(model.position)
                         + x * (v.position[0] * model.scale[0])
                         + y * (v.position[1] * model.scale[1])
                         + z * (v.position[2] * model.scale[2]);
+                    bounds_valid &= extend_bounds(&mut bounds, pos.to_array());
                     let normal =
                         (x * v.normal[0] + y * v.normal[1] + z * v.normal[2]).normalize_or_zero();
                     page.vertices.push(Vertex {
@@ -500,6 +554,7 @@ fn run(
                         export_id: objects.ornaments[id].export_id,
                         order: ((id as u64) << 32) | mesh_index as u64,
                         visibility,
+                        bounds: bounds_valid.then_some(bounds),
                     });
                 }
             }
@@ -866,6 +921,37 @@ impl GpuPage {
             .collect();
         fold_commands(&spans, order, view)
     }
+    /// Build per-view whole-world commands from conservative mesh bounds.
+    pub fn draw_commands_culled(
+        pages: &[Self],
+        order: &[(usize, usize)],
+        view: Pass,
+        intersects: impl FnMut([f32; 6]) -> bool,
+    ) -> Vec<DrawCmd> {
+        let spans: Vec<PageSpans> = pages
+            .iter()
+            .map(|p| PageSpans {
+                count: p.count,
+                placements: &p.placements,
+            })
+            .collect();
+        fold_commands_culled(&spans, order, view, intersects)
+    }
+    pub fn sdr_draw_commands_culled(
+        pages: &[Self],
+        order: &[(usize, usize)],
+        view: Pass,
+        intersects: impl FnMut([f32; 6]) -> bool,
+    ) -> Vec<DrawCmd> {
+        let spans: Vec<PageSpans> = pages
+            .iter()
+            .map(|p| PageSpans {
+                count: p.sdr_count,
+                placements: &p.sdr_placements,
+            })
+            .collect();
+        fold_commands_culled(&spans, order, view, intersects)
+    }
     /// The command lists the viewer keeps for the whole-world pages: the main
     /// (unfiltered) list, then the reflection and refraction gates.
     pub fn world_commands(pages: &[Self]) -> [Vec<DrawCmd>; WORLD_VIEWS] {
@@ -1107,6 +1193,7 @@ mod page_tests {
             export_id: 0,
             order,
             visibility: Visibility { reflect, refract },
+            bounds: None,
         }
     }
 
@@ -1148,6 +1235,30 @@ mod page_tests {
         let cmds = fold_commands(&pages, &order, Pass::Main);
         assert_eq!(cmds, vec![cmd(0, 0, 140)]);
         assert_eq!(drawn(&cmds).len(), 140);
+    }
+
+    #[test]
+    fn frustum_culling_keeps_visible_mesh_order_and_gaps() {
+        let mut near_a = span(0, 30, 0, true, true);
+        near_a.bounds = Some([-2., -1., -5., 2., 1., -3.]);
+        let mut far = span(30, 60, 1, true, true);
+        far.bounds = Some([100., -1., -5., 104., 1., -3.]);
+        let mut near_b = span(60, 90, 2, true, true);
+        near_b.bounds = Some([-1., -1., -8., 1., 1., -6.]);
+        let p = [near_a, far, near_b];
+        let pages = pages(&[&p], &[90]);
+        let order = [(0, 0), (0, 1), (0, 2)];
+        let commands = fold_commands_culled(&pages, &order, Pass::Main, |bounds| {
+            bounds[0] < 10.
+        });
+        assert_eq!(commands, vec![cmd(0, 0, 30), cmd(0, 60, 90)]);
+        assert_eq!(
+            drawn(&commands),
+            (0..30)
+                .chain(60..90)
+                .map(|i| (0, i))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

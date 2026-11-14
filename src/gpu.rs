@@ -1022,11 +1022,14 @@ fn build(
             let oy = slot.y as f32 / ATLAS as f32;
             let sx = slot.w as f32 / ATLAS as f32;
             let sy = slot.h as f32 / ATLAS as f32;
+            let mut bounds = crate::world_objects::empty_bounds();
+            let mut bounds_valid = !mesh.vertices.is_empty();
             for vert in &mesh.vertices {
                 let p = Vec3::from_array(model.position)
                     + x * (vert.position[0] * model.scale[0])
                     + y * (vert.position[1] * model.scale[1])
                     + z * (vert.position[2] * model.scale[2]);
+                bounds_valid &= crate::world_objects::extend_bounds(&mut bounds, p.to_array());
                 let n = (x * vert.normal[0] + y * vert.normal[1] + z * vert.normal[2])
                     .normalize_or_zero();
                 page.vertices.push(Vertex {
@@ -1049,6 +1052,7 @@ fn build(
                     export_id: t.objects.ornaments[id].export_id,
                     order: 0,
                     visibility,
+                    bounds: bounds_valid.then_some(bounds),
                 });
             }
         }
@@ -1376,9 +1380,9 @@ struct Renderer {
     object_start: u32,
     local_pages: Vec<crate::world_objects::GpuPage>,
     world_pages: Vec<crate::world_objects::GpuPage>,
-    /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
-    world_draw_cmds: [Vec<crate::world_objects::DrawCmd>; crate::world_objects::WORLD_VIEWS],
-    world_sdr_draw_cmds: [Vec<crate::world_objects::DrawCmd>; crate::world_objects::WORLD_VIEWS],
+    /// Frozen global placement order; each pass filters it against its own
+    /// frustum before building contiguous page draws.
+    world_order: Vec<(usize, usize)>,
     world_done: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -2096,8 +2100,7 @@ impl Renderer {
             object_start: m.object_start,
             local_pages,
             world_pages: Vec::new(),
-            world_draw_cmds: Default::default(),
-            world_sdr_draw_cmds: Default::default(),
+            world_order: Vec::new(),
             world_done: false,
             layout,
             sampler,
@@ -2639,6 +2642,31 @@ impl Renderer {
         crate::grass_mips::upload(&self.queue, &self.atlas, &m.atlas, &m.grass_mips, ATLAS);
         Ok(())
     }
+    fn world_commands_for_view(
+        &self,
+        matrix: Mat4,
+        view: Pass,
+    ) -> (Vec<crate::world_objects::DrawCmd>, Vec<crate::world_objects::DrawCmd>) {
+        if !self.world_done {
+            return (Vec::new(), Vec::new());
+        }
+        let frustum = crate::terrain_residency::Frustum::from_matrix(matrix);
+        (
+            crate::world_objects::GpuPage::draw_commands_culled(
+                &self.world_pages,
+                &self.world_order,
+                view,
+                |bounds| frustum.intersects(bounds),
+            ),
+            crate::world_objects::GpuPage::sdr_draw_commands_culled(
+                &self.world_pages,
+                &self.world_order,
+                view,
+                |bounds| frustum.intersects(bounds),
+            ),
+        )
+    }
+
     fn draw_opaque(
         &self,
         e: &mut wgpu::CommandEncoder,
@@ -2650,6 +2678,8 @@ impl Renderer {
         sky_reflected: bool,
         pass_kind: Pass,
         view_runs: ViewRuns,
+        world_cmds: &[crate::world_objects::DrawCmd],
+        world_sdr_cmds: &[crate::world_objects::DrawCmd],
         terrain_depth_source: Option<&wgpu::Texture>,
         clear_color: Option<wgpu::Color>,
     ) {
@@ -2757,13 +2787,11 @@ impl Renderer {
         // ornaments while preload is in progress: the coplanar duplicates
         // caused depth flicker. Switch atomically only after all pages arrive.
         if self.world_done {
-            // The view's commands were folded once when the world finished
-            // loading: its placements are frozen, so nothing here is per-frame
-            // work beyond the page binds and the draws themselves.
-            let slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
+            // Placement order is frozen at load completion; this view's
+            // frustum-filtered command spans were built for this frame.
             crate::world_objects::GpuPage::draw_world(
                 &self.world_pages,
-                &self.world_draw_cmds[slot],
+                world_cmds,
                 &mut p,
                 reflected,
             );
@@ -2772,9 +2800,8 @@ impl Renderer {
         // replayed every scenery index through the vertex shader and discarded
         // almost all of it in `fs_sdr`; compact index streams preserve original
         // ordering while keeping ordinary scenery off this part of the pass.
-        let slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
         let local_sdr = !self.world_done && self.local_pages.iter().any(|page| page.has_sdr());
-        let world_sdr = self.world_done && !self.world_sdr_draw_cmds[slot].is_empty();
+        let world_sdr = self.world_done && !world_sdr_cmds.is_empty();
         if self.sdr_count != 0 || local_sdr || world_sdr {
             p.set_pipeline(&self.sdr_blend_pipeline);
             if self.sdr_count != 0 {
@@ -2791,7 +2818,7 @@ impl Renderer {
             if self.world_done {
                 crate::world_objects::GpuPage::draw_world_sdr(
                     &self.world_pages,
-                    &self.world_sdr_draw_cmds[slot],
+                    world_sdr_cmds,
                     &mut p,
                     reflected,
                 );
@@ -2969,6 +2996,8 @@ impl Renderer {
             self.queue_map_runs(matrix);
             ViewRuns::Map
         };
+        let map_pass = if full_world { Pass::FullMap } else { Pass::Minimap };
+        let (world_cmds, world_sdr_cmds) = self.world_commands_for_view(matrix, map_pass);
         let frame = self.frame;
         debug_assert!(
             frame.time_advances > 0,
@@ -2996,12 +3025,10 @@ impl Renderer {
             &self.bind,
             false,
             false,
-            if full_world {
-                Pass::FullMap
-            } else {
-                Pass::Minimap
-            },
+            map_pass,
             view_runs,
+            &world_cmds,
+            &world_sdr_cmds,
             None,
             None,
         );
@@ -3156,6 +3183,8 @@ impl Renderer {
         } else {
             Pass::Main
         };
+        let (main_world_cmds, main_world_sdr_cmds) =
+            self.world_commands_for_view(matrix, main_pass);
         let normal = frame.uniform(
             matrix,
             [direction.x, direction.y, direction.z, daylight],
@@ -3213,6 +3242,8 @@ impl Renderer {
             false,
             main_pass,
             ViewRuns::Main,
+            &main_world_cmds,
+            &main_world_sdr_cmds,
             Some(&self.depth),
             None,
         );
@@ -3385,6 +3416,8 @@ impl Renderer {
             }
             return;
         }
+        let (refraction_world_cmds, refraction_world_sdr_cmds) =
+            self.world_commands_for_view(matrix, Pass::Refraction);
         for batch in visible {
             if batch.simple {
                 let mut e = self.device.create_command_encoder(&Default::default());
@@ -3457,6 +3490,8 @@ impl Renderer {
                     // main view's blocks are the right set.
                     Pass::Refraction,
                     ViewRuns::Main,
+                    &refraction_world_cmds,
+                    &refraction_world_sdr_cmds,
                     None,
                     Some(wgpu::Color {
                         r: linear(fog[0]),
@@ -3514,6 +3549,8 @@ impl Renderer {
                     // Queued as `above = normal`: the main matrix again.
                     Pass::Refraction,
                     ViewRuns::Main,
+                    &refraction_world_cmds,
+                    &refraction_world_sdr_cmds,
                     None,
                     None,
                 );
@@ -3581,8 +3618,11 @@ impl Renderer {
             }
             let flip = Mat4::from_translation(Vec3::new(0., 2. * plane, 0.))
                 * Mat4::from_scale(Vec3::new(1., -1., 1.));
+            let reflected_matrix = matrix * flip;
+            let (reflection_world_cmds, reflection_world_sdr_cmds) =
+                self.world_commands_for_view(reflected_matrix, Pass::Reflection);
             let reflected = Uniform {
-                matrix: (matrix * flip).to_cols_array_2d(),
+                matrix: reflected_matrix.to_cols_array_2d(),
                 direction: [direction.x, -direction.y, direction.z, daylight],
                 // The water reflection cancels the main projection's X flip,
                 // so the original front-face winding applies again.
@@ -3616,7 +3656,7 @@ impl Renderer {
             };
             self.queue
                 .write_buffer(&self.reflected_uniform, 0, bytemuck::bytes_of(&reflected));
-            self.queue_reflected_runs(matrix * flip);
+            self.queue_reflected_runs(reflected_matrix);
             let mut e = self.device.create_command_encoder(&Default::default());
             self.draw_opaque(
                 &mut e,
@@ -3630,6 +3670,8 @@ impl Renderer {
                 // reflected block set queued just above it.
                 Pass::Reflection,
                 ViewRuns::Reflected,
+                &reflection_world_cmds,
+                &reflection_world_sdr_cmds,
                 None,
                 None,
             );
@@ -4626,7 +4668,7 @@ pub fn run(
                     if want_world != world_enabled {
                         world_enabled=want_world;
                         if let Some(c)=world_cancel.take(){c.store(true,std::sync::atomic::Ordering::Relaxed);}
-                        world_rx=None;renderer.world_pages.clear();renderer.world_draw_cmds=Default::default();renderer.world_sdr_draw_cmds=Default::default();renderer.world_done=false;
+                        world_rx=None;renderer.world_pages.clear();renderer.world_order.clear();renderer.world_done=false;
                         if world_enabled {
                             let (tx,rx)=std::sync::mpsc::sync_channel(1);let cancel=Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
@@ -4641,7 +4683,7 @@ pub fn run(
                             renderer.world_pages.push(uploaded);world_status=format!("Loading: {processed}/{} objects, {} GPU chunks",whole_ornaments.len(),renderer.world_pages.len());
                             eprintln!("{world_status}");
                         },
-                        Ok(crate::world_objects::Message::Done{processed,skipped,stats})=>{renderer.world_draw_cmds=crate::world_objects::GpuPage::world_commands(&renderer.world_pages);renderer.world_sdr_draw_cmds=crate::world_objects::GpuPage::world_sdr_commands(&renderer.world_pages);renderer.world_done=true;world_status=world_loading_summary(processed,skipped,&stats);eprintln!("{world_status}");},
+                        Ok(crate::world_objects::Message::Done{processed,skipped,stats})=>{renderer.world_order=crate::world_objects::GpuPage::draw_order(&renderer.world_pages);renderer.world_done=true;world_status=world_loading_summary(processed,skipped,&stats);eprintln!("{world_status}");},
                         Ok(crate::world_objects::Message::Error(e))=>{world_status=format!("World load failed: {e}");eprintln!("{world_status}");},
                         Err(_)=>{}
                     }}
@@ -5336,10 +5378,8 @@ pub fn preview(
                         stats.residency.budget_bytes >> 20,
                         stats.residency.evictions
                     );
-                    renderer.world_draw_cmds =
-                        crate::world_objects::GpuPage::world_commands(&renderer.world_pages);
-                    renderer.world_sdr_draw_cmds =
-                        crate::world_objects::GpuPage::world_sdr_commands(&renderer.world_pages);
+                    renderer.world_order =
+                        crate::world_objects::GpuPage::draw_order(&renderer.world_pages);
                     renderer.world_done = true;
                     break;
                 }
@@ -5712,8 +5752,14 @@ mod frame_snapshot_tests {
             "local pages must use the data-driven pass gate"
         );
         assert!(
-            src.contains("GpuPage::world_view_slot(pass_kind)"),
-            "whole-world pages must pick their command list from the pass"
+            src.contains("self.world_commands_for_view(matrix, main_pass)"),
+            "whole-world pages must be culled from the current view matrix"
+        );
+        assert!(
+            src.contains(
+                "self.world_commands_for_view(reflected_matrix, Pass::Reflection)"
+            ),
+            "reflection scenery must use its mirrored view matrix"
         );
     }
 
@@ -5738,10 +5784,10 @@ mod frame_snapshot_tests {
     fn pass_kinds_are_submitted_from_production_call_sites() {
         let src = source();
         for needle in [
-            "            main_pass,\n            ViewRuns::Main,\n            Some(&self.depth),",
-            "                    Pass::Refraction,\n                    ViewRuns::Main,",
-            "                Pass::Reflection,\n                ViewRuns::Reflected,",
-            "                Pass::Minimap\n            },\n            view_runs,",
+            "            main_pass,\n            ViewRuns::Main,\n            &main_world_cmds,\n            &main_world_sdr_cmds,",
+            "                    Pass::Refraction,\n                    ViewRuns::Main,\n                    &refraction_world_cmds,",
+            "                Pass::Reflection,\n                ViewRuns::Reflected,\n                &reflection_world_cmds,",
+            "            map_pass,\n            view_runs,\n            &world_cmds,",
             "&normal, camera, Pass::Main, true);",
             "                        &above,\n                        camera,\n                        Pass::Refraction,",
             "                &reflected,\n                camera,\n                Pass::Reflection,",

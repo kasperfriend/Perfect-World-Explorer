@@ -205,11 +205,11 @@ impl Residency {
 /// Six homogeneous clip planes for one view. Construct once per view so the
 /// span loop does not repeatedly extract the same matrix rows.
 #[derive(Clone, Copy)]
-struct ClipFrustum {
+pub struct Frustum {
     planes: [[f32; 4]; 6],
 }
-impl ClipFrustum {
-    fn from_matrix(matrix: Mat4) -> Self {
+impl Frustum {
+    pub fn from_matrix(matrix: Mat4) -> Self {
         let x = matrix.x_axis;
         let y = matrix.y_axis;
         let z = matrix.z_axis;
@@ -230,7 +230,7 @@ impl ClipFrustum {
     /// corners, but uses six plane evaluations instead of eight matrix-vector
     /// products. The tolerance only keeps borderline boxes; it cannot cull
     /// geometry the previous corner test would retain.
-    fn intersects(self, bounds: [f32; 6]) -> bool {
+    pub fn intersects(self, bounds: [f32; 6]) -> bool {
         for [a, b, c, d] in self.planes {
             let px = if a >= 0. { bounds[3] } else { bounds[0] };
             let py = if b >= 0. { bounds[4] } else { bounds[1] };
@@ -252,7 +252,7 @@ impl ClipFrustum {
 /// Conservative bounding-box/frustum test, the viewer's stand-in for the view
 /// call that fills `block+0x74`.
 pub fn in_frustum(matrix: Mat4, bounds: [f32; 6]) -> bool {
-    ClipFrustum::from_matrix(matrix).intersects(bounds)
+    Frustum::from_matrix(matrix).intersects(bounds)
 }
 
 /// Merge the visible blocks of one view into contiguous index ranges, so a
@@ -271,7 +271,7 @@ pub fn visible_runs(spans: &[Span], matrix: Mat4) -> Vec<(u32, u32)> {
 /// emptied first and refilled in span order.
 pub fn visible_runs_into(spans: &[Span], matrix: Mat4, runs: &mut Vec<(u32, u32)>) {
     runs.clear();
-    let frustum = ClipFrustum::from_matrix(matrix);
+    let frustum = Frustum::from_matrix(matrix);
     for span in spans {
         if span.count == 0 || !frustum.intersects(span.bounds) {
             continue;
@@ -287,7 +287,7 @@ pub fn visible_runs_into(spans: &[Span], matrix: Mat4, runs: &mut Vec<(u32, u32)
 /// `visible_runs`; this stays as the standalone census.
 #[allow(dead_code)]
 pub fn visible_blocks(spans: &[Span], matrix: Mat4) -> usize {
-    let frustum = ClipFrustum::from_matrix(matrix);
+    let frustum = Frustum::from_matrix(matrix);
     spans
         .iter()
         .filter(|s| s.count != 0 && frustum.intersects(s.bounds))

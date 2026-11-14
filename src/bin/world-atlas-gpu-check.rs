@@ -73,6 +73,7 @@ fn page(right: bool, shared: bool) -> Page {
                 reflect: true,
                 refract: true,
             },
+            bounds: None,
         }],
     }
     .finish()
