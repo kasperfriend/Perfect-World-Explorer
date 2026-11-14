@@ -6,6 +6,8 @@
 mod animation;
 #[path = "../ecmodel.rs"]
 mod ecmodel;
+#[path = "../pck.rs"]
+mod pck;
 #[path = "../scene.rs"]
 mod scene;
 #[path = "../scene_lights.rs"]

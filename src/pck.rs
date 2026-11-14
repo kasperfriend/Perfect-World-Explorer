@@ -132,9 +132,102 @@ pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Environment variable that turns a shipped-corpus skip into a failure.
+///
+/// The tests that read the retail data (`gfx.pck`, `world.ecwld`, the loose
+/// `element` directory) have to skip on a machine that does not stage them: CI
+/// stages none of it, and the archives are 97 MB and more, so they are not in the
+/// repository. Printing `SKIPPED: …` is better than returning a bare `ok`, but it
+/// still means a corpus assertion can rot for months while every run is green —
+/// which is exactly what happened here, where four expectations about the shipped
+/// waterfall, beams and portal were written, reviewed and pushed without ever being
+/// executed.
+///
+/// `PWE_CORPUS=require` turns every skip into a failure, so a machine that does
+/// stage the archives can run the suite as a gate:
+///
+/// ```sh
+/// PWE_CORPUS=require cargo test --bin perfect-world-explorer
+/// ```
+///
+/// It is deliberately all-or-nothing: a machine missing one archive fails with the
+/// path it is missing rather than quietly testing the rest, because the point of the
+/// switch is to know that the shipped data was checked, not which fraction of it.
+///
+/// The helper lives here, beside the archive reader, because every module that has
+/// a corpus test already reaches this one — a module of its own would have to be
+/// declared in each of the 29 `src/bin` crates that include those modules. It is
+/// `cfg(test)` so no release build carries it.
+#[cfg(test)]
+pub const CORPUS_ENV: &str = "PWE_CORPUS";
+
+/// Whether the caller asked for the corpus suite to be run as a gate.
+#[cfg(test)]
+pub fn corpus_required() -> bool {
+    corpus_required_with(std::env::var(CORPUS_ENV).ok().as_deref())
+}
+
+/// [`corpus_required`] over an already-read value, so the rule can be tested
+/// without mutating the process environment.
+#[cfg(test)]
+pub fn corpus_required_with(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case("require"))
+}
+
+/// Report a missing shipped archive, and fail when the corpus is required.
+///
+/// `what` names the archive the way a reader would stage it, e.g.
+/// `` `google_drive/gfx.pck` ``.
+#[cfg(test)]
+pub fn corpus_absent(what: &str) {
+    corpus_absent_with(corpus_required(), what);
+}
+
+/// [`corpus_absent`] with the decision already made.
+#[cfg(test)]
+pub fn corpus_absent_with(required: bool, what: &str) {
+    if required {
+        panic!("{CORPUS_ENV}=require, but this machine has no {what}");
+    }
+    eprintln!(
+        "SKIPPED: no {what} on this machine; this test proves nothing about the shipped data \
+         (set {CORPUS_ENV}=require to make this a failure)"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default has to be "off": CI stages no archives, so a corpus test that
+    /// failed there would fail every run for a reason the change cannot fix.
+    #[test]
+    fn only_the_word_require_turns_the_corpus_gate_on() {
+        assert!(!corpus_required_with(None));
+        assert!(!corpus_required_with(Some("")));
+        assert!(!corpus_required_with(Some("0")));
+        assert!(!corpus_required_with(Some("skip")));
+        assert!(corpus_required_with(Some("require")));
+        assert!(corpus_required_with(Some("REQUIRE")));
+        assert!(corpus_required_with(Some("Require")));
+    }
+
+    /// With the gate on, a missing archive is a failure that names the path —
+    /// that message is the whole point, because it tells the operator which
+    /// archive to stage.
+    #[test]
+    #[should_panic(expected = "PWE_CORPUS=require, but this machine has no `google_drive/gfx.pck`")]
+    fn a_required_corpus_fails_instead_of_skipping() {
+        corpus_absent_with(true, "`google_drive/gfx.pck`");
+    }
+
+    /// With the gate off it prints and returns, which is what every run without a
+    /// staged archive does.
+    #[test]
+    fn an_optional_corpus_skips() {
+        corpus_absent_with(false, "`google_drive/gfx.pck`");
+    }
+
     use std::io::Write;
     #[test]
     fn bounded_streaming_decode_matches_the_original_member() {

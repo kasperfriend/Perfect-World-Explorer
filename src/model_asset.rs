@@ -481,8 +481,47 @@ impl ModelAsset {
     pub fn load_static_skins_with(
         skeleton_path: &str,
         skin_paths: &[String],
+        read: impl FnMut(&str) -> Result<Vec<u8>, String>,
+    ) -> Result<Self, String> {
+        Self::load_static_smd_with(
+            "",
+            ecmodel::SkinModel {
+                version: 0,
+                skeleton: skeleton_path.to_string(),
+                skins: skin_paths.to_vec(),
+                physique: String::new(),
+                track_directory: String::new(),
+                actions: Vec::new(),
+                hangers: Vec::new(),
+                properties: Vec::new(),
+            },
+            skeleton_path,
+            skin_paths,
+            read,
+        )
+    }
+
+    /// The same static rig, keeping the `.SMD`'s action list and the bone tracks
+    /// those actions name.
+    ///
+    /// `CECFace` never animates a face part, which is why the constructor above
+    /// drops both. Element 160 does animate: `A3DGFXModel::UpdateModel` calls
+    /// `pSkinModel->PlayActionByNameDC(m_strActName, m_nLoops, 0)` on its first
+    /// tick, so the rig has to carry the clips for `pose_action_at_time`.
+    ///
+    /// A track file that is missing or unreadable, or one whose joint count does
+    /// not match this skeleton, leaves that single action with no external
+    /// tracks instead of refusing the model: the client's `BindTrackSet` failing
+    /// makes `PlayActionByName` return false and play nothing, while the bind
+    /// pose is still drawable.
+    pub fn load_static_smd_with(
+        smd_path: &str,
+        model: ecmodel::SkinModel,
+        skeleton_path: &str,
+        skin_paths: &[String],
         mut read: impl FnMut(&str) -> Result<Vec<u8>, String>,
     ) -> Result<Self, String> {
+        let smd_path = ecmodel::normalize(smd_path);
         let skeleton_path = ecmodel::normalize(skeleton_path);
         let mut bytes = |path: &str| read(path).map_err(|error| format!("{path}: {error}"));
         let skeleton = skeleton::Skeleton::parse(&bytes(&skeleton_path)?)
@@ -492,6 +531,36 @@ impl ModelAsset {
             let path = ecmodel::normalize(reference);
             let data = skin::Skin::parse(&bytes(&path)?).map_err(|e| format!("{path}: {e}"))?;
             skins.push(SkinAsset { path, data });
+        }
+        // Track files are per action and usually shared with the model's other
+        // descriptors, so one cache per rig keeps a repeated action cheap.
+        let mut cache = TrackCache::default();
+        let mut tracks = Vec::with_capacity(model.actions.len());
+        for action in &model.actions {
+            let mut set = None;
+            if let Some(path) = model.action_track_path(&smd_path, action) {
+                let path = ecmodel::normalize(&path);
+                let parsed = match cache.0.get(&path).cloned() {
+                    Some(tracks) => Some(tracks),
+                    None => match bytes(&path) {
+                        Ok(raw) => match animation::TrackSet::parse(&raw) {
+                            Ok(tracks) => {
+                                let tracks = std::sync::Arc::new(tracks);
+                                cache.0.insert(path, tracks.clone());
+                                Some(tracks)
+                            }
+                            Err(_) => None,
+                        },
+                        Err(_) => None,
+                    },
+                };
+                if let Some(tracks) = parsed {
+                    if tracks.validate_joint_count(skeleton.joints.len()).is_ok() {
+                        set = Some(tracks);
+                    }
+                }
+            }
+            tracks.push(set);
         }
         Ok(Self {
             descriptor: ecmodel::EcModel {
@@ -505,19 +574,10 @@ impl ModelAsset {
                 events: Vec::new(),
                 additional_skins: Vec::new(),
             },
-            model: ecmodel::SkinModel {
-                version: 0,
-                skeleton: skeleton_path,
-                skins: skin_paths.to_vec(),
-                physique: String::new(),
-                track_directory: String::new(),
-                actions: Vec::new(),
-                hangers: Vec::new(),
-                properties: Vec::new(),
-            },
+            model,
             skeleton,
             skins,
-            tracks: Vec::new(),
+            tracks,
             texture_overrides: HashMap::new(),
             mesh_tints: HashMap::new(),
             face_shaders: HashMap::new(),

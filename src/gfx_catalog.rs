@@ -765,7 +765,7 @@ mod tests {
     fn presets_resolve_in_the_archive() {
         let archive = Path::new("google_drive/gfx.pck");
         if !archive.is_file() {
-            eprintln!("SKIPPED: no `google_drive/gfx.pck` on this machine; this test proves nothing about the shipped archive");
+            crate::pck::corpus_absent("`google_drive/gfx.pck`");
             return;
         }
         // The offline harness stubs `pck` and cannot read a real archive; it

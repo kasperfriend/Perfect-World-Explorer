@@ -662,3 +662,54 @@ mod tests {
         assert!(cache.get("other").is_none(), "untouched LRU goes first");
     }
 }
+
+/// UV scale and scroll velocity authored by an Angelica `.sdr` shader script
+/// (`A3DTextureMan.cpp:150-163`, `A3DShaderMan.cpp:139-178`, `A3DShader.cpp:528-598, 2081-2085`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SdrUvAnim {
+    pub tc_scale: [f32; 2],
+    pub tc_scroll: [f32; 2],
+}
+
+impl SdrUvAnim {
+    pub const IDENTITY: Self = Self {
+        tc_scale: [1.0, 1.0],
+        tc_scroll: [0.0, 0.0],
+    };
+
+    /// Match the 7 animated `.sdr` scripts in 1.4.2 `shaders.pck` by `.sdr.` texture path.
+    pub fn from_texture_path(tex_path: &str) -> Option<Self> {
+        let lower = tex_path.to_ascii_lowercase();
+        let idx = lower.find(".sdr.")?;
+        let prefix = &tex_path[..idx];
+        let stem = prefix.rsplit(['\\', '/']).next().unwrap_or(prefix).trim();
+        let anim = match stem {
+            "瀑布" | "瀑布细长" => Self {
+                tc_scale: [1.0, 1.0],
+                tc_scroll: [0.0, -0.5],
+            },
+            "青云山小瀑布" => Self {
+                tc_scale: [0.6, 0.6],
+                tc_scroll: [0.0, -0.5],
+            },
+            "池水" => Self {
+                tc_scale: [0.7, 0.7],
+                tc_scroll: [0.004, 0.004],
+            },
+            "岩浆" => Self {
+                tc_scale: [1.0, 1.0],
+                tc_scroll: [0.0, -0.15],
+            },
+            "水" => Self {
+                tc_scale: [1.0, 1.0],
+                tc_scroll: [0.0, 0.10],
+            },
+            "血池" => Self {
+                tc_scale: [1.0, 1.0],
+                tc_scroll: [0.001, 0.001],
+            },
+            _ => Self::IDENTITY,
+        };
+        Some(anim)
+    }
+}

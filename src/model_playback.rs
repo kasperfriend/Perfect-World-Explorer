@@ -89,6 +89,65 @@ impl Playback {
             speed,
         })
     }
+    /// A directly named action with the caller's own loop budget.
+    ///
+    /// Element 160 hands its `ModelActName` and `Loops` straight to
+    /// `A3DSkinModel::PlayActionByNameDC(m_strActName, m_nLoops, 0)`, so no
+    /// combined-action name is involved and the loop count is the element's,
+    /// not a base action's. The range arithmetic is the same one `new` uses:
+    /// each endpoint is a frame index truncated to whole milliseconds, and the
+    /// loop length is `end - start + 1` (`0x7c5580`, `0x7c50e0`).
+    ///
+    /// `A3DSkinModelAction::Update` decrements `m_iLoopCnt` once per wrap and
+    /// stops when it reaches zero, holding the last moment's pose
+    /// (`dwAbsTime = GetEndTime()`), so `loops` counts whole plays: `1` plays
+    /// once and holds, `-1` never stops. `loops == 0` never plays at all — see
+    /// the `!iNumLoop` guard in `A3DSkinModelAction::Play` — and the caller is
+    /// expected not to build a playback for it.
+    pub fn from_action(
+        asset: &ModelAsset,
+        action: usize,
+        loops: i32,
+        speed: f32,
+    ) -> Result<Self, String> {
+        let clip = asset
+            .model
+            .actions
+            .get(action)
+            .ok_or("model action index out of range")?;
+        let fps = clip
+            .fps
+            .filter(|fps| *fps > 0)
+            .unwrap_or(asset.skeleton.fps);
+        if fps <= 0
+            || !clip.start.is_finite()
+            || !clip.end.is_finite()
+            || clip.start < 0.
+            || clip.end < clip.start
+        {
+            return Err("invalid ordinary action range/frame rate".into());
+        }
+        let start = (clip.start * 1000. / fps as f32).trunc();
+        let end = (clip.end * 1000. / fps as f32).trunc();
+        if end >= u32::MAX as f32 {
+            return Err("action millisecond range overflow".into());
+        }
+        if loops == 0 {
+            return Err("a zero loop count never plays".into());
+        }
+        if !speed.is_finite() || speed < 0. {
+            return Err("negative/nonfinite ordinary playback speed is not implemented".into());
+        }
+        Ok(Self {
+            action: Some(action),
+            start: start as u32,
+            end: end as u32,
+            current: start as u32,
+            remaining: loops,
+            loops,
+            speed,
+        })
+    }
     /// CECModel::Tick 0x6d0e4f–0x6d0e62 truncates delta*speed on EACH tick;
     /// it does not retain fractional milliseconds across ticks.
     pub fn tick(&mut self, delta_ms: u32) -> Result<(), String> {
@@ -267,6 +326,30 @@ mod tests {
         assert_eq!(p.current, 1000);
         assert!(!p.stopped());
     }
+    #[test]
+    fn a_named_model_action_counts_whole_plays_and_holds_the_last_frame() {
+        let a = asset();
+        // `Loops: -1`: 174 of the shipped element-160 blocks. It never stops.
+        let mut p = Playback::from_action(&a, 0, -1, 1.).unwrap();
+        for _ in 0..5 {
+            p.tick(2000).unwrap();
+            assert!(!p.stopped());
+        }
+        // `Loops: 1`: 72 blocks, plus the 201 blocks whose model predates the
+        // key and uses the constructor's default of 1. One play, then the end
+        // frame is held: `dwAbsTime = m_pCore->GetEndTime()`.
+        let mut p = Playback::from_action(&a, 0, 1, 1.).unwrap();
+        p.tick(1000).unwrap();
+        assert_eq!(p.current, 2000, "the inclusive 1.000 s endpoint");
+        assert!(!p.stopped());
+        p.tick(1).unwrap();
+        assert!(p.stopped());
+        assert_eq!(p.sample(), Some((0, 2.)));
+        // `A3DSkinModelAction::Play` refuses `iNumLoop == 0` outright.
+        assert!(Playback::from_action(&a, 0, 0, 1.).is_err());
+        assert!(Playback::from_action(&a, 9, 1, 1.).is_err());
+    }
+
     #[test]
     fn zero_span_and_invalid_or_complex_policies_are_explicit() {
         let mut a = asset();

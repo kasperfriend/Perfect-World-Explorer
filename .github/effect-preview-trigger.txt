@@ -1,0 +1,3 @@
+2026-11-13 live-log fix list: sampler wrap/clamp, fractal width+UV, element-generic warp gates, census records mode, lightning strip UV law test (v5: rustfmt pair binding)
+2026-11-09 average-generation walks + two-list reconciliation
+2026-11-09 emitter-id swap + MatchGrnd ground law

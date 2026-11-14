@@ -7,6 +7,10 @@ mod angelica_pck;
 mod animation;
 #[path = "../client_regional_light.rs"]
 mod client_regional_light;
+// `gfx_owner` and `gfx_player` log through the shared channel registry, so this
+// target needs the same module the main binary declares.
+#[path = "../diagnostics.rs"]
+mod diagnostics;
 #[path = "../ecmodel.rs"]
 mod ecmodel;
 #[path = "../gfx_catalog.rs"]

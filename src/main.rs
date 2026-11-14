@@ -36,6 +36,13 @@ mod cloud_gpu;
 #[allow(dead_code)]
 mod cloud_surface;
 mod color_chain;
+mod diagnostics;
+// A preview is a test-only harness. The skip is on the module: its literals
+// are authored GFX text and its tables are read top to bottom, neither of
+// which formatting improves, and every other module stays checked.
+#[cfg(test)]
+#[rustfmt::skip]
+mod effect_preview;
 mod display_gamma;
 mod dxt;
 mod ecmodel;
@@ -840,7 +847,34 @@ fn main() {
     let path = PathBuf::from(&args[1]);
     // Publish the saved residency choice before anything opens a cache: the
     // terrain store and the decoded-texture caches both read it.
-    let saved = view_settings::ViewSettings::load();
+    let mut saved = view_settings::ViewSettings::load();
+    // Live logging goes before everything else, so the first load can already be
+    // logged: the folder defaults to the explorer's own `pwe-logs`, next to the
+    // executable rather than inside the client install, the mask is whatever the
+    // settings tab left ticked, and the session line names the run.
+    // The client root comes first: it is what "do not write the logs in there"
+    // is measured against, both for the default and for a folder the settings
+    // file still remembers from a build that wrote next to the game.
+    diagnostics::set_client_root(&path);
+    diagnostics::set_default_dir(diagnostics::default_log_dir());
+    if !saved.logging_dir.trim().is_empty()
+        && diagnostics::inside_client(std::path::Path::new(saved.logging_dir.trim()))
+    {
+        saved.logging_dir.clear();
+    }
+    diagnostics::apply_dir(&saved.logging_dir);
+    diagnostics::set_mask(saved.logging_mask);
+    // `PWE_LOG=EffectDecals,EffectElements` is the headless way to the same
+    // channels the settings tab ticks, and it is how a run with no settings file
+    // — the effect preview — can say which builder drew a card.
+    diagnostics::apply_env();
+    diagnostics::set_session(format!(
+        "client root {} | explorer {} | version {} | mask {:#018x}",
+        path.display(),
+        diagnostics::explorer_root().display(),
+        env!("CARGO_PKG_VERSION"),
+        saved.logging_mask
+    ));
     objects::set_unbounded_textures(saved.all_to_vram);
     #[cfg(windows)]
     let loading = windows_setup::LoadingWindow::start();

@@ -6,8 +6,8 @@
 //!
 //! Every rule with a disassembly citation was read out of `elementclient.exe`
 //! and is reproduced instruction for instruction. Where the binary could not be
-//! followed — the emitter shape classes, the noise table generator and the
-//! billboard basis — the comment says so instead of hiding it.
+//! followed — the emitter shape classes and the noise table generator — the
+//! comment says so instead of hiding it.
 //!
 //! * Clocks. The tick receives an integer millisecond delta and the particle
 //!   system converts it at `0x71a1f1` (`fild dt; fmul 0.001`), then scales it by
@@ -100,7 +100,7 @@ use crate::{
     gfx_color_track::ColorTrack,
     gfx_file::{
         Child, Common, Control, ControlData, Curve, Cylinder, Element, Grid, KeyPoint, Lightning,
-        Particle, Root, Spec, Sprite, Trail,
+        Particle, Root, Spec, Sprite, Trail, Wave,
     },
 };
 use glam::{Mat4, Quat, Vec3, Vec4};
@@ -144,6 +144,15 @@ pub struct EffectQuad {
     /// high-priority flash landed in whatever order the texture bucket
     /// happened to produce.
     pub priority: i32,
+    /// The element's `TileMode`: the sampler state is **per slot** in the
+    /// client — `A3DGFXRenderSlotMan::PreRender` gives a `m_bTileMode` slot
+    /// `A3DTADDR_WRAP` and every other slot `A3DTADDR_CLAMP`
+    /// (A3DGFXRenderSlot.cpp:547-549). A tile's `TexSpeed` scroll must wrap or
+    /// the sheet freezes on its edge texel; a non-tile card whose UVs leave
+    /// [0,1] — the fractal strips put `m_fTexWid * ratio + m_fTexU` along their
+    /// length (A3DGFXLightning.cpp:836) — must clamp or the sampler wraps and
+    /// draws the opposite edge (the `u = 1.033` lightning corner).
+    pub tile: bool,
     /// World-space corners in the client's quad order: top-left, top-right,
     /// bottom-left, bottom-right.
     pub positions: [[f32; 3]; 4],
@@ -158,8 +167,9 @@ pub struct EffectQuad {
 /// One drawable piece of a model element, posed into world space.
 ///
 /// Element 160 names `.SMD`/`.SKI` models from the effect archive. Those are
-/// rigid — 0 or 1 bones per shipped skin — so the bind pose is the only pose
-/// they need, and the result is a triangle list with per-vertex UV. It does not
+/// rigidly bound — 0 or 1 bones per shipped vertex — which limits how a vertex
+/// deforms but not whether it moves: the bones are animated by the action the
+/// element names. The result is a triangle list with per-vertex UV. It does not
 /// fit `EffectQuad`'s four corners, so it travels beside them and the GPU pass
 /// draws it with a triangle-list pipeline instead of the quad one.
 #[derive(Clone, Debug, PartialEq)]
@@ -168,13 +178,229 @@ pub struct EffectMesh {
     pub texture: String,
     /// World-space triangle soup: three consecutive vertices per triangle.
     pub vertices: Vec<EffectVertex>,
+    /// Element 160's `WriteZ`: whether this mesh writes depth as it draws.
+    /// `A3DGFXModel::PrepareRenderSkinModel` sets `ZWRITEENABLE` from
+    /// `m_bZWriteEnable`, which starts false and only the version-49 key raises,
+    /// so a crystal that authors `WriteZ: 1` occludes the sheet behind it and
+    /// every other model stays read-only.
+    pub write_depth: bool,
+    /// The skin material this mesh draws with, or `None` when the mesh names no
+    /// material. `A3DGFXModel` hands the skin model a `LIGHTINFO` built form
+    /// `AfxGetLightparam()` and the skin shades itself from these coefficients,
+    /// so a mesh without them falls back to the flat element colour.
+    pub material: Option<MeshMaterial>,
 }
 
-/// A posed model vertex: position in world space and its authored UV.
+/// The three material coefficients a skin mesh shades with, straight out of the
+/// SKI. `A3DSkinModel::SetMaterialMethod(MTL_SCALED)` multiplies them by the
+/// element's diffuse before they reach the vertex shader (`model_material`),
+/// which is why they travel unmodified and the quad's colour does the scaling.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshMaterial {
+    pub ambient: [f32; 4],
+    pub diffuse: [f32; 4],
+    pub emissive: [f32; 4],
+    /// The specular colour, bound against the frame's directional specular light
+    /// as `c9` (`model_material::bind_specular`). `A3DGFXModel::ChangeModel`
+    /// calls `A3DSkinModel::EnableSpecular(true)` for every effect model, so the
+    /// specular shader split is always on for one of these.
+    pub specular: [f32; 4],
+    /// The material power fed to the Blinn exponent, clamped to -128..128 by the
+    /// client's `model_directional_specular`.
+    pub power: f32,
+}
+
+/// A posed model vertex: position in world space, its authored UV and its
+/// shaded normal. `model_light::vertex_light` needs the normal to build the
+/// directional Lambert term `A3DSkinModel` applies, so it has to survive the
+/// pose and the placement instead of being dropped with the rest of the skin
+/// vertex.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EffectVertex {
     pub position: [f32; 3],
     pub uv: [f32; 2],
+    pub normal: [f32; 3],
+}
+
+/// One element-160 model and the clock its action runs on.
+///
+/// The client loads the `.SMD`/`.BON`/`.SKI` rig once, then plays the action the
+/// element names: `A3DGFXModel::UpdateModel` calls
+/// `pSkinModel->PlayActionByNameDC(m_strActName, m_nLoops, 0)` on the first tick
+/// after `Play()`, and `pSkinModel->Update(m_dwTickTime)` on every tick after
+/// that. A model that names no action — 171 of the 447 shipped element-160
+/// blocks, whose models carry no action list at all — is drawn in the bind pose,
+/// exactly as before.
+pub struct ModelInstance {
+    /// The parsed rig, shared by every element that names the same `.SMD`: the
+    /// 447 shipped blocks name 113 distinct models.
+    asset: Option<std::sync::Arc<crate::model_asset::ModelAsset>>,
+    /// The drawn meshes' fixed data: texture, triangle-soup order with the UV
+    /// each entry had at bind time, and the skin material.
+    topology: Vec<ModelMeshTopology>,
+    /// The bind pose, built once, and the fallback for any frame the clip cannot
+    /// pose for this skeleton.
+    bind: Vec<EffectMesh>,
+    /// `ModelActName` resolved against the model's own action list, carrying the
+    /// element's `Loops`. `None` for an unnamed action, `Loops: 0` (which
+    /// `A3DSkinModelAction::Play` refuses), or a name the model does not carry.
+    playback: Option<crate::model_playback::Playback>,
+    /// `A3DSkinModelAction::Update` keeps the sub-millisecond remainder:
+    /// `m_fDeltaTime += iDeltaTime; iDeltaTime = (int)m_fDeltaTime;
+    /// m_fDeltaTime -= iDeltaTime;`. The fraction therefore survives into the
+    /// next tick, unlike `CECModel::Tick`'s per-tick truncation.
+    carry_ms: f32,
+    /// The current frame, rebuilt only when the clip moved or `reset` ran.
+    posed: Vec<EffectMesh>,
+    dirty: bool,
+    /// A clip that cannot be sampled for this rig is reported once and the model
+    /// keeps its bind pose, which is what the client draws when `BindTrackSet`
+    /// fails and `PlayActionByName` returns without playing.
+    pose_error: bool,
+}
+
+/// One drawn piece of a model: the mesh it came from and the vertex order it is
+/// submitted in.
+struct ModelMeshTopology {
+    /// Index into `ModelAsset::meshes_from_pose`, which walks skins then meshes.
+    piece: usize,
+    texture: String,
+    /// `(skin vertex index, uv)` in drawn triangle order.
+    order: Vec<(u16, [f32; 2])>,
+    material: Option<MeshMaterial>,
+}
+
+impl ModelInstance {
+    fn empty() -> Self {
+        Self {
+            asset: None,
+            topology: Vec::new(),
+            bind: Vec::new(),
+            playback: None,
+            carry_ms: 0.,
+            posed: Vec::new(),
+            dirty: false,
+            pose_error: false,
+        }
+    }
+
+    /// The bind-pose meshes this element draws when it names no action, and the
+    /// frame it falls back to when a clip cannot be sampled.
+    pub fn meshes(&self) -> &[EffectMesh] {
+        &self.bind
+    }
+
+    /// The clip currently playing and its absolute track time, for the
+    /// diagnostics and the tests. `None` means the bind pose is what is drawn.
+    pub fn action(&self) -> Option<(usize, f32)> {
+        self.playback
+            .as_ref()
+            .and_then(|playback| playback.sample())
+    }
+
+    /// True once the authored loop budget has run out and the last frame is
+    /// being held.
+    pub fn action_stopped(&self) -> bool {
+        self.playback
+            .as_ref()
+            .is_some_and(|playback| playback.stopped())
+    }
+
+    /// `A3DGFXModel::Play` clears `m_bStart`, which makes the next tick replay
+    /// the action from its first frame.
+    fn reset(&mut self) {
+        self.carry_ms = 0.;
+        self.dirty = true;
+        self.posed.clear();
+        if let Some(playback) = &mut self.playback {
+            playback.restart();
+        }
+    }
+
+    /// Advance the clip by one frame's scaled delta and return the meshes to
+    /// draw. `dt_ms` is the element's tick delta, the same integer millisecond
+    /// delta `A3DSkinModel::Update` receives.
+    fn frame(&mut self, dt_ms: f32) -> &[EffectMesh] {
+        if self.playback.is_none() || self.pose_error {
+            return &self.bind;
+        }
+        self.carry_ms += dt_ms.max(0.);
+        let whole = self.carry_ms.floor().max(0.);
+        self.carry_ms -= whole;
+        if whole >= 1. {
+            if let Some(playback) = self.playback.as_mut() {
+                if playback.tick(whole as u32).is_ok() {
+                    self.dirty = true;
+                }
+            }
+        }
+        let Some((action, seconds)) = self.playback.as_ref().and_then(|p| p.sample()) else {
+            return &self.bind;
+        };
+        if !self.dirty {
+            return &self.posed;
+        }
+        let Some(asset) = self.asset.as_ref() else {
+            return &self.bind;
+        };
+        let pieces = match asset.pose_action_at_time(action, seconds, Mat4::IDENTITY) {
+            Ok(pieces) => pieces,
+            Err(error) => {
+                self.pose_error = true;
+                crate::diag!(
+                    EffectModels,
+                    "model action {action} at {seconds:.3}s would not pose: {error}"
+                );
+                return &self.bind;
+            }
+        };
+        self.posed = build_model_meshes(&self.topology, &pieces);
+        self.dirty = false;
+        &self.posed
+    }
+}
+
+/// Build one frame's triangle lists from the fixed topology and a pose.
+///
+/// `meshes_from_pose` returns one piece per skin mesh in a stable order, so the
+/// topology remembers which piece each drawn mesh came from; a piece that went
+/// missing would leave that mesh out rather than shift the rest.
+fn build_model_meshes(
+    topology: &[ModelMeshTopology],
+    pieces: &[crate::model_asset::PosedMesh],
+) -> Vec<EffectMesh> {
+    let mut meshes = Vec::with_capacity(topology.len());
+    for mesh in topology {
+        let Some(piece) = pieces.get(mesh.piece) else {
+            continue;
+        };
+        let vertices: Vec<EffectVertex> = mesh
+            .order
+            .iter()
+            .filter_map(|(index, uv)| {
+                let vertex = piece.vertices.get(*index as usize)?;
+                vertex
+                    .position
+                    .iter()
+                    .all(|value| value.is_finite())
+                    .then_some(EffectVertex {
+                        position: vertex.position,
+                        uv: *uv,
+                        normal: vertex.normal,
+                    })
+            })
+            .collect();
+        if vertices.len() < 3 {
+            continue;
+        }
+        meshes.push(EffectMesh {
+            texture: mesh.texture.clone(),
+            vertices,
+            write_depth: false,
+            material: mesh.material,
+        });
+    }
+    meshes
 }
 
 /// Camera basis handed to the player so billboards face the viewer.
@@ -221,60 +447,23 @@ impl View {
     /// matrix), which is the one point the inverse's own w cannot represent.
     /// Every value is checked for a finite, non-degenerate result and the
     /// default basis is returned rather than a NaN camera.
+    ///
+    /// **Which end of the ray is the scene** comes from the projection, not from
+    /// an assumption: a matrix whose third row is `w_clip = -z_view`
+    /// (`Mat4::perspective_rh`) puts the front of the scene on the near plane,
+    /// and one with `w_clip = +z_view` puts it on the far plane. This was
+    /// assumed to be the second and is the first, so until it was measured every
+    /// billboard in the *preview* rendered with its basis exactly reversed — an
+    /// error the eye position does not show, because the two conventions cancel
+    /// there.
     pub fn from_inverse_view_projection(inverse: Mat4) -> Self {
-        if !inverse.is_finite() {
-            return Self::default();
-        }
-        let Some(near) = Self::unproject(inverse, 0., 0., 0.) else {
-            return Self::default();
-        };
-        let Some(far) = Self::unproject(inverse, 0., 0., 1.) else {
-            return Self::default();
-        };
-        // The centre ray, from the near plane towards the far plane. In this
-        // right-handed projection that direction points back at the eye, so the
-        // view direction is the other way round.
-        let ray = near - far;
-        if ray.length_squared() < 1e-12 {
-            return Self::default();
-        }
-        let forward = ray.normalize();
-        let Some(right) = Self::unproject(inverse, 1., 0., 1.) else {
-            return Self::default();
-        };
-        let Some(up) = Self::unproject(inverse, 0., 1., 1.) else {
-            return Self::default();
-        };
-        let right = (right - far).normalize_or_zero();
-        let up = (up - far).normalize_or_zero();
-        if right == Vec3::ZERO || up == Vec3::ZERO || right.dot(up).abs() > 0.01 {
-            return Self::default();
-        }
-        // The eye is on the centre ray where the homogeneous w runs out:
-        // `inverse` maps the plane w_clip = 0 to infinity, and that plane is row
-        // 3 of the matrix this one inverted.
-        let a = inverse.inverse().row(3);
-        let plane = a.truncate();
-        let denominator = plane.dot(forward);
-        if !denominator.is_finite() || denominator.abs() < 1e-9 {
-            return Self::default();
-        }
-        let position = near + forward * (-(plane.dot(near) + a.w) / denominator);
-        if !position.is_finite() {
-            return Self::default();
-        }
-        Self {
-            position,
-            right,
-            up,
-            forward,
-        }
+        Self::try_from_inverse_view_projection(inverse).unwrap_or_else(|_| Self::default())
     }
 
     /// [`Self::from_inverse_view_projection`], but saying why it gave up.
     ///
-    /// The fallible version returns `Self::default()`, which puts the eye at the
-    /// world origin. That is safe for a caller that only needs a basis, and
+    /// The infallible version returns `Self::default()`, which puts the eye at
+    /// the world origin. That is safe for a caller that only needs a basis, and
     /// dangerous for a caller that reports how many effects are playing: a
     /// degenerate frame made every billboard face (0,0,0) and the caller had no
     /// way to tell that from "the map has no effects near you". The world pass
@@ -291,25 +480,58 @@ impl View {
         if ray.length_squared() < 1e-12 {
             return Err("effect camera: near and far rays coincide".into());
         }
-        let forward = ray.normalize();
-        let right = Self::unproject(inverse, 1., 0., 1.)
-            .ok_or("effect camera: right ray has no finite w")?;
-        let up =
-            Self::unproject(inverse, 0., 1., 1.).ok_or("effect camera: up ray has no finite w")?;
-        let right = (right - far).normalize_or_zero();
-        let up = (up - far).normalize_or_zero();
-        if right == Vec3::ZERO || up == Vec3::ZERO || right.dot(up).abs() > 0.01 {
-            return Err("effect camera: axes are degenerate or not perpendicular".into());
-        }
+        // Row 3 of the matrix is `w_clip`, and its gradient along the centre ray
+        // is the sign that says which end of that ray is the scene: a matrix
+        // whose third row is `w_clip = -z_view` (`Mat4::perspective_rh`, and
+        // every projection this viewer builds) makes `w` grow towards the eye, so
+        // the *near* plane is the front and the ray already runs into the scene.
+        // One with `w_clip = +z_view` puts the front on the far plane and the ray
+        // points back at the eye.
+        //
+        // This used to be assumed rather than read, and the assumption was the
+        // second one. The eye position does not show the mistake — the two
+        // conventions cancel there — so the preview, whose matrix is
+        // `perspective_rh`, rendered every billboard with its basis exactly
+        // reversed while its sizes and clock read correctly.
         let a = inverse.inverse().row(3);
         let plane = a.truncate();
-        let denominator = plane.dot(forward);
+        if !plane.is_finite() {
+            return Err("effect camera: the projection's w row is not finite".into());
+        }
+        let denominator = plane.dot(ray);
         if !denominator.is_finite() || denominator.abs() < 1e-9 {
             return Err("effect camera: eye ray runs parallel to the w=0 plane".into());
         }
-        let position = near + forward * (-(plane.dot(near) + a.w) / denominator);
+        let position = near + ray * (-(plane.dot(near) + a.w) / denominator);
         if !position.is_finite() {
             return Err("effect camera: eye position is not finite".into());
+        }
+        let forward = if denominator > 0. {
+            ray.normalize()
+        } else {
+            -ray.normalize()
+        };
+        let (Some(right), Some(up)) = (
+            Self::unproject(inverse, 1., 0., 1.),
+            Self::unproject(inverse, 0., 1., 1.),
+        ) else {
+            return Err("effect camera: screen axes have no finite w".into());
+        };
+        // The screen axes are read off the far plane's corners relative to its
+        // own centre, so the pair is a pure direction and the eye's distance does
+        // not scale it.
+        let mut right = (right - far).normalize_or_zero();
+        let mut up = (up - far).normalize_or_zero();
+        if right == Vec3::ZERO || up == Vec3::ZERO || right.dot(up).abs() > 0.01 {
+            return Err("effect camera: axes are degenerate or not perpendicular".into());
+        }
+        // Orient them the way the viewer's own basis is built — `right × up`
+        // points back at the eye, matching `View::default` and the row convention
+        // `A3DFuncs.cpp` writes — which also undoes the mirror a clip-space
+        // handedness flip puts into one screen axis.
+        if right.cross(up).dot(forward) > 0. {
+            right = -right;
+            up = -up;
         }
         Ok(Self {
             position,
@@ -319,7 +541,6 @@ impl View {
         })
     }
 
-    /// Inverse-project one NDC point and divide through by w, which is the step
     /// `Mat4::transform_point3` leaves out.
     fn unproject(inverse: Mat4, x: f32, y: f32, z: f32) -> Option<Vec3> {
         let homogeneous = inverse * Vec4::new(x, y, z, 1.);
@@ -387,6 +608,9 @@ pub struct Stats {
     pub unrendered: usize,
     /// Elements that declare `DummyEle`: helpers the client never submits.
     pub dummies: usize,
+    /// Elements that author `Warp: 1`: `AddWarpEle` hands them to the
+    /// distortion pass, so they never enter the normal render list.
+    pub warp: usize,
 }
 
 impl Stats {
@@ -401,6 +625,7 @@ impl Stats {
         self.lights += other.lights;
         self.unrendered += other.unrendered;
         self.dummies += other.dummies;
+        self.warp += other.warp;
     }
 }
 
@@ -448,6 +673,9 @@ struct Emitter {
     /// every third frame instead of twenty per frame.
     carry: f32,
     rng: Rng,
+    /// `IsAvgGen` walk registers for this emitter, advanced once per emission
+    /// and reset only by `Resume()` on the client — see `AverageWalk`.
+    average: AverageWalk,
     /// One entry per affector: the client's 128-entry colour table, built once
     /// at load instead of once per particle per frame.
     ramps: Vec<Option<ColorTrack>>,
@@ -599,8 +827,11 @@ enum Runtime {
     /// Stateless: the clock alone decides the geometry.
     Clock,
     Particles(Emitter),
-    /// Elements 110 and 180: a strip through the element's own motion history.
+    /// Element 110: a strip through the element's own motion history.
     Ribbon(RibbonState),
+    /// Element 180 (`A3DLtnTrail`): at most three cross-sections, refreshed
+    /// every 40 ms with a jittered midpoint between the last two.
+    LtnTrail(LtnTrailState),
     /// Elements 150 and 152: an authored strip from `StartPos` to `EndPos`,
     /// rebuilt and re-deformed every `Interval` milliseconds.
     Fractal(FractalState),
@@ -617,7 +848,11 @@ struct CtrlState {
     offset: Vec3,
     velocity: Vec3,
     rotation: f32,
-    orbit: f32,
+    /// The accumulated `CtrlType: 102`/`103` spin, as a quaternion about the
+    /// axis the record authors. The client left-multiplies it onto the keypoint
+    /// direction (`A3DGFXCtrlRotAxis::Process`: `Q(m_vAxis, angle) * m_vDir`),
+    /// so it is a rotation in the owner's frame, not about the element's own Z.
+    orbit: Quat,
     scale_extra: f32,
     color_offset: [i32; 4],
     /// Sub-integer carry of controller 105, one per channel (ctrl+0x24..0x30).
@@ -656,9 +891,13 @@ fn child_runtime(
         return Err(format!("GFX child {path} references itself"));
     }
     let nested = load_child(&path).map_err(|error| format!("GFX child {path}: {error}"))?;
-    stack.push(path);
-    let player = Player::with_depth(nested, rng.next_u32(), load_child, depth + 1, stack)?;
+    stack.push(path.clone());
+    let mut player = Player::with_depth(nested, rng.next_u32(), load_child, depth + 1, stack)?;
     stack.pop();
+    // A nested root is still a root, and without a name every line it writes
+    // starts with a space: `" id=160 meshes=0"` was a child model that never
+    // loaded, reported in a way that named nothing at all.
+    player.set_name(path.as_str());
     Ok(ChildState {
         player: Box::new(player),
         out_color: child.out_color,
@@ -699,7 +938,7 @@ impl CtrlState {
             offset: Vec3::ZERO,
             velocity: Vec3::ZERO,
             rotation: 0.,
-            orbit: 0.,
+            orbit: Quat::IDENTITY,
             scale_extra: 0.,
             color_offset: [0; 4],
             color_remainder: [0.; 4],
@@ -752,6 +991,13 @@ struct ElementRuntime {
     index: usize,
     /// The keypoint the controller state was seeded from; -1 reseeds.
     seeded: isize,
+    /// Which play of the element's clock `state` belongs to. A controller
+    /// integrates its displacement from the *node age* — `A3DGFXCtrlMotion`
+    /// reads the age at `0x6eaf60` — and the client restarts that age with the
+    /// element on every `RepeatCount` loop, so a `CtrlType: 100` sweep runs from
+    /// zero each time round. Seeding only on a keypoint change left the state
+    /// alive across loops and the offset integrated without bound.
+    play: f32,
     state: CtrlState,
     runtime: Runtime,
     /// The sibling this element's `BindEle` resolved to, as a slot in
@@ -787,6 +1033,10 @@ struct ElementContext<'a> {
     placement: Mat4,
     /// The rotation `placement` adds on top of the parent basis: the
     /// interpolated keypoint `Direction` with ctrl 100's orbit spun about Z.
+    /// Which rule builds the shaft of a `RotFromView` card. Published from the
+    /// settings tab through [`set_shaft_mode`], copied in here so a card's
+    /// geometry is decided by the value the frame it belongs to was built with.
+    shaft: EffectShaft,
     /// The client's emission direction is expressed in the emitter's own frame,
     /// so undoing this is what turns one of its directions into a local one.
     spin: Quat,
@@ -817,12 +1067,53 @@ struct ElementContext<'a> {
     rotation: f32,
     /// Milliseconds on the element clock, for flipbooks and UV scroll.
     clock: f32,
+    /// The archive path of the root this element belongs to, so a log line says
+    /// which asset it came from. Empty when the host never named the player,
+    /// which is only true of tests.
+    root: &'a str,
 }
 
 impl ElementContext<'_> {
     /// Final RGBA: the packed colour's channels times the folded alpha.
     fn rgba(&self) -> [f32; 4] {
         rgba(self.color, self.color_scale)
+    }
+
+    /// The client's element matrix: `GetTranMatrix(kp)` read literally
+    /// (A3DGFXKeyPoint.h:286-293).
+    ///
+    /// ```cpp
+    /// inline A3DMATRIX4 GetTranMatrix(const KEY_POINT& kp, const A3DVECTOR3& vAxis = _unit_z)
+    /// {
+    ///     A3DMATRIX4 matTran;
+    ///     if (kp.m_fRad2D) (kp.m_vDir * A3DQUATERNION(vAxis, kp.m_fRad2D)).ConvertToMatrix(matTran);
+    ///     else kp.m_vDir.ConvertToMatrix(matTran);
+    ///     matTran.SetRow(3, kp.m_vPos);
+    ///     return matTran;
+    /// }
+    /// ```
+    ///
+    /// The keypoint's 2D spin sits **inside** the element matrix, on the right of
+    /// the direction quaternion, so it turns about a *local* axis: `_unit_z` for
+    /// every class that takes the default — `A3DGFXModel.cpp:233` (element 160),
+    /// `A3DGFXECModel.cpp:352`, `A3DGFXLightning.cpp:857`/`:1157`,
+    /// `A3DParaboloid.cpp:201`/`:251`, `A3DGridDecalEx.cpp:445`/`:477`,
+    /// `A3DTrail.cpp:560`, `A3DLtnTrail.cpp:172`, `A3DGFXContainer.cpp:300` — and
+    /// `_unit_y` for the ring (`A3DGFXRing.cpp:265` and `:315`), whose band lies
+    /// in the local XZ plane, so its 2D turn is a yaw about its own axis.
+    ///
+    /// [`Self::placement`] is the same matrix **without** it, which is what the
+    /// card arms want: `Fill_Verts_3D`'s `RotFromView` branch rebuilds the shaft
+    /// from `RotateVec(GetParentDir() * kp.m_vDir, _unit_z)` and never reads
+    /// `Rad_2D` (A3DDecalEx.cpp:365-402), while its element-plane branch spins
+    /// its corners itself. Every other class inherits the spin through
+    /// `GetTranMatrix`, so it must be applied here rather than per class.
+    fn element_matrix(&self, axis: Vec3) -> Mat4 {
+        if self.rotation.is_finite() && self.rotation != 0. {
+            self.placement * Mat4::from_axis_angle(axis, self.rotation)
+        } else {
+            self.placement
+        }
     }
 }
 
@@ -833,6 +1124,32 @@ impl ElementContext<'_> {
 /// per-vertex `D3DCOLOR` packing) — a sprite at `DefaultAlpha: 0.5` is 127/255,
 /// not 127.5/255, and the animated player has to land on the same byte or the
 /// two readers would disagree on every half-transparent effect.
+/// Compose one lattice vertex the way `A3DGridDecalEx::_setColorComposed`
+/// does (`GfxCommon/A3DGridDecalEx.h`): the colour saved next to the vertex is
+/// multiplied channel by channel with the keypoint colour, and the result is
+/// the colour the lattice draws with.
+///
+/// The client writes that multiply as `(vertex * key) & 0xff00` then `>> 8`, so
+/// full white against full white lands on 254 rather than 255. Copying the
+/// off-by-one is deliberate: the animated reader has to agree byte for byte
+/// with the static one, and a keypoint the artist tinted — `瀑布.gfx` tints its
+/// curtain `0xff35a5ff`, `冷凝术_冰块.gfx` tints its slabs `0xff5580aa` — has
+/// to reach the sheet, not just its alpha.
+fn grid_rgba(vertex: u32, key: u32, scale: f32) -> [f32; 4] {
+    let channel = |shift: u32| {
+        let vertex = (vertex >> shift) & 0xff;
+        let key = (key >> shift) & 0xff;
+        ((vertex * key) & 0xff00) >> 8
+    };
+    let alpha = (channel(24) as f32 * scale).trunc().clamp(0., 255.);
+    [
+        channel(16) as f32 / 255.,
+        channel(8) as f32 / 255.,
+        channel(0) as f32 / 255.,
+        alpha / 255.,
+    ]
+}
+
 fn rgba(color: u32, scale: f32) -> [f32; 4] {
     let alpha = (((color >> 24) & 0xff) as f32 * scale)
         .trunc()
@@ -866,6 +1183,40 @@ pub struct GroundHit {
 /// `0x6e54bb`/`0x6e54c4` store the result as the byte at owner+0x284, which
 /// `0x6fa7ee` and `0x6fa831` then read.
 const GROUND_NEAR_DISTANCE: f32 = 0.2;
+
+/// The surface height under a world X/Z, or `None` where the ray misses.
+///
+/// `A3DDecalEx::Fill_Verts_3D` asks this once per vertex of a ground sheet
+/// (`AfxGetGrndNorm` with a NULL normal, `A3DDecalEx.cpp:517`), which is why a
+/// ground decal can follow a crater floor instead of hovering over it. The
+/// viewer is handed the query rather than owning terrain it does not have.
+pub type GroundHeightQuery<'a> = &'a dyn Fn(f32, f32) -> Option<f32>;
+
+/// The owner's terrain, threaded down to the sprite path so a `MatchGrnd` decal
+/// can be draped over the surface the way `A3DDecalEx::Fill_Verts_3D` drapes it.
+#[derive(Clone, Copy)]
+pub struct GroundSampler<'a> {
+    /// Height of the surface under any world X/Z.
+    pub height: GroundHeightQuery<'a>,
+    /// The client's `IsCloseToGrnd()` byte (owner+0x284). The ground branch
+    /// requires it in addition to the element's own `MatchGrnd`, and it is also
+    /// what `GetParentTM` reads, so the draped sheet and the element's frame
+    /// agree about whether the owner is lying on the ground.
+    pub near_ground: bool,
+}
+
+/// How wide one cell of a draped ground sheet is before the sheet is cut up
+/// (`_grnd_grid`, `A3DDecalEx.cpp:29`).
+const GROUND_GRID_CELL: f32 = 2.;
+/// The most cells a draped sheet is cut into along either axis
+/// (`_max_row_or_col`, `A3DDecalEx.cpp:30`), so one sheet is at most sixteen
+/// quads — the 906 corpus elements that set `MatchGrnd` on a sprite split
+/// 536 at one cell and 370 at two to sixteen.
+const GROUND_MAX_ROW_OR_COL: usize = 4;
+/// The height the ground branch adds over the surface — `vert.y =
+/// AfxGetGrndNorm(...) + .2f` (`A3DDecalEx.cpp:517`). It is the same literal as
+/// `GROUND_NEAR_DISTANCE` because both read the float at `0x8eb828`.
+const GROUND_DRAPE_LIFT: f32 = 0.2;
 
 /// The steepest surface the client will align an effect to. `0x6e5bb9` takes
 /// the absolute dot of the normal with world up and `0x6e5bc1` rejects it below
@@ -914,9 +1265,12 @@ struct GroundFrames {
     /// ground height. `0x6e5540`..`0x6e556e` forms that translation from pos.x,
     /// the raycast height at owner+0x1a0 and pos.z.
     aligned: Mat4,
-    /// owner+0x13c: the owner's own orientation at ground height, the copy of
-    /// the base matrix that `0x6e5592` re-transforms with the ground height.
-    height_only: Mat4,
+    /// owner+0x13c — the owner's own orientation at ground height — exists in
+    /// the client, but the selector only routes a placed element to it through
+    /// the `GroundHeight` key, and that key is documented as a particle-init
+    /// option (`ID_GFXOP_PARSYS_USE_GRND_HEIGHT`, "Use ground height for init
+    /// the particle"). `MatchGrnd: 0` keeps the authored placement height, so
+    /// no element frame reads it here; see `ground_parent`.
     /// The frame element+0x150 `GrndNormOnly` asks for: the ground *normal*
     /// without the snapped height, so the effect lies on the slope's plane but
     /// stays at its own altitude rather than sliding down to the surface. It is
@@ -930,8 +1284,19 @@ struct GroundFrames {
 /// One live root instance.
 pub struct Player {
     root: Root,
-    /// Milliseconds on the root clock, already scaled by `PlaySpeed`.
+    /// Milliseconds on the root clock, already scaled by the live play speed.
     time: f32,
+    /// The play speed a placement put on this root, replacing the file's own
+    /// `PlaySpeed`.
+    ///
+    /// `CECOrnamentMan::Update` calls `pGFX->SetPlaySpeed(pNode->fSpeed)` right
+    /// after it sets the scale (`EC_ManOrnament.cpp:844-960`, quoted in
+    /// `Findings/World-effects-2026-11-09.md` section 51.2), so a placed root
+    /// plays at the *record's* `fSpeed` and its authored `PlaySpeed` is
+    /// discarded. Multiplying both — which the world pass used to do by scaling
+    /// the delta itself — freezes every root whose file authors `PlaySpeed: 0`
+    /// and doubles the speed of a root that authors 0.5.
+    play_speed_override: Option<f32>,
     finished: bool,
     elements: Vec<ElementRuntime>,
     quads: Vec<EffectQuad>,
@@ -954,9 +1319,14 @@ pub struct Player {
     /// files that do not ship, so a missing child is a named warning and the rest
     /// of the root still plays rather than the whole effect being dropped.
     warnings: Vec<String>,
-    /// Effect-archive models named by element 160, already posed and turned into
-    /// triangle lists. Empty when the host supplied no model reader.
-    models: Vec<Vec<EffectMesh>>,
+    /// Effect-archive models named by element 160, each with the action clock
+    /// its `ModelActName`/`Loops` start. Empty when the host supplied no model
+    /// reader.
+    models: Vec<ModelInstance>,
+    /// Archive path of the root, for the log lines. The player cannot read it out
+    /// of `Root` because the text does not carry its own name, so the host hands
+    /// it over; empty until then, and in tests.
+    name: String,
 }
 
 impl Player {
@@ -971,13 +1341,218 @@ impl Player {
         Self::with_depth(root, seed, load_child, 0, &mut Vec::new())
     }
 
+    /// Play this root at `speed` on the root clock, replacing the file's
+    /// `PlaySpeed` the way `A3DGFXEx::SetPlaySpeed` does when a map record
+    /// carries an `fSpeed`.
+    ///
+    /// The host hands [`Self::advance`] the *unscaled* frame delta once this is
+    /// set: the placement's speed lives here rather than in the caller's delta,
+    /// so the element clocks, the controllers and the particles are scaled once
+    /// instead of twice. That double scaling is what froze `水门_瀑布`: a record
+    /// whose file authors `PlaySpeed: 0` played at `0 x fSpeed`, and no frame
+    /// delta could start it.
+    pub fn set_play_speed(&mut self, speed: f32) {
+        if speed.is_finite() && speed >= 0. {
+            self.play_speed_override = Some(speed);
+        }
+    }
+
+    /// Drop the placement's speed and play at the file's own `PlaySpeed` again.
+    pub fn clear_play_speed(&mut self) {
+        self.play_speed_override = None;
+    }
+
+    /// The rate the root clock advances at.
+    ///
+    /// `A3DGFXEx::CalcActualSpeed` is
+    ///
+    ///     m_fActualSpeed = m_fDefPlaySpeed * m_fPlaySpeed;
+    ///
+    /// — the file's own `PlaySpeed` (`m_fDefPlaySpeed`, loaded from the header at
+    /// `A3DGFXEx.cpp:621`) times the rate the placement set (`m_fPlaySpeed`).
+    /// `CECOrnamentMan::LoadGFXFromFile` always sets the second one from the
+    /// world record's `fSpeed`, so a scene effect advances at the product.
+    ///
+    /// Taking the placement's speed as a *replacement* is wrong whenever the
+    /// asset does not author 1: `场景/天煞光束.gfx` writes `PlaySpeed: 0.4` and its
+    /// placements write `fSpeed: 1`, so the client runs it at 0.4 and this
+    /// function used to run it at 1 — the one root of the six rendered in the
+    /// 13 November preview whose clock did not match (`player clock 792 ms` for
+    /// an `asked 792 ms` shot, where 317 was correct).
+    pub fn play_speed(&self) -> f32 {
+        self.root.play_speed * self.play_speed_override.unwrap_or(1.0)
+    }
+
+    /// The `PlaySpeed` the file authors, whatever a placement did to it. Printing
+    /// both is what says whether a map overrode the asset or the asset disabled
+    /// itself.
+    pub fn authored_play_speed(&self) -> f32 {
+        self.root.play_speed
+    }
+
+    /// Milliseconds on the root clock, already scaled by [`Self::play_speed`].
+    /// The flipbook and `TexSpeed` branches read this clock, so it is the number
+    /// a "does the sheet move" report has to quote rather than a tick count.
+    pub fn clock_ms(&self) -> f32 {
+        self.time
+    }
+
+    /// Name the root for the log lines, and write its element table once.
+    ///
+    /// The table is the single most useful thing to have when an artefact has to
+    /// be traced back: it pairs the element ids a log line reports with the
+    /// authored `TexFile`, size, grid and blend the editor wrote. It is dumped
+    /// here rather than per frame because it never changes.
+    pub fn set_name(&mut self, name: impl Into<String>) {
+        self.name = name.into();
+        if !crate::diagnostics::enabled(crate::diagnostics::Channel::EffectElements) {
+            return;
+        }
+        crate::diag!(
+            EffectElements,
+            "{} version={} default_scale={:.3} play_speed={:.3} default_alpha={:.3} \
+             raytrace={} face_to_viewer={} no_change_dir={} use_aabb={} shake={} elements={} \
+             textures={} warnings={} models={}",
+            self.name,
+            self.root.version,
+            self.root.default_scale,
+            self.root.play_speed,
+            self.root.default_alpha,
+            self.root.raytrace,
+            self.root.face_to_viewer,
+            self.root.no_change_dir,
+            self.root.use_aabb,
+            self.root.shake_cam,
+            self.root.elements.len(),
+            self.textures.len(),
+            self.warnings.len(),
+            self.models.len()
+        );
+        for (index, element) in self.root.elements.iter().enumerate() {
+            let common = &element.common;
+            let (width, height, extra) = match &element.spec {
+                Spec::Sprite(sprite) => (
+                    sprite.width,
+                    sprite.height,
+                    format!(
+                        "rot_from_view={} grnd_norm_only={} no_scale={:?} origin={:?} z={:.3} \
+                         match_surface={}",
+                        sprite.rotate_from_view,
+                        sprite.ground_normal_only,
+                        sprite.no_scale,
+                        sprite.origin,
+                        sprite.z_offset,
+                        sprite.match_surface
+                    ),
+                ),
+                Spec::Cylinder(cylinder) => (
+                    cylinder.radius,
+                    cylinder.height,
+                    format!(
+                        "sects={} pitch={:.3} centre={} no_rad_scale={} no_hei_scale={}",
+                        cylinder.sections,
+                        cylinder.pitch,
+                        cylinder.origin_at_center,
+                        cylinder.no_radius_scale,
+                        cylinder.no_height_scale
+                    ),
+                ),
+                Spec::Grid(grid) => (
+                    grid.cell_size,
+                    grid.cell_size,
+                    format!(
+                        "rows={} cols={} cell={:.3} z={:.3}",
+                        grid.rows, grid.columns, grid.cell_size, grid.z_offset
+                    ),
+                ),
+                // A particle element's `size=` pair is its *sprite* width and
+                // height, which it does not have: the quad is
+                // `ParticleWidth x ParticleHeight` times the particle's own
+                // scale times the root's. Printing the two the file actually
+                // authored is what makes an "oversized emitter" answerable from
+                // this table instead of from a guess.
+                Spec::Particle(particle) => (
+                    particle.width,
+                    particle.height,
+                    format!(
+                        "particle={:.3}x{:.3} scales={:.3}..{:.3} 3d={} facing={} \
+                         rate={:.2}/s ttl={:.2}s",
+                        particle.width,
+                        particle.height,
+                        particle.scale_min.min(particle.scale_max),
+                        particle.scale_max.max(particle.scale_min),
+                        particle.is_3d,
+                        particle.facing,
+                        particle.emission_rate,
+                        particle.ttl
+                    ),
+                ),
+                // A model element has no width or height of its own — its size
+                // is the `.SMD`'s — so the file it loads is the one number a
+                // size report cannot be answered without. Two roots that share
+                // a model and draw it at different sizes are a scale bug; two
+                // roots with different models are the assets.
+                Spec::Model(model) => (
+                    0.,
+                    0.,
+                    format!(
+                        "model={:?} act={:?} loops={}",
+                        model.path, model.action, model.loops
+                    ),
+                ),
+                _ => (0., 0., String::new()),
+            };
+            crate::diag!(
+                EffectElements,
+                "{} #{} id={} name={:?} tex={:?} blend={}/{} layer={} prio={} size={:.3}x{:.3} \
+                 grid={}x{} interval={} tile={} speed=({:.3},{:.3}) flips={}{}{} \
+                 repeat={} delay={:.1} start={:.0}ms keys={} match_grnd={} z_enable={} {} {}",
+                self.name,
+                index,
+                element.id,
+                common.name,
+                common.texture,
+                common.source_blend,
+                common.destination_blend,
+                common.render_layer,
+                common.priority,
+                width,
+                height,
+                common.tex_col,
+                common.tex_row,
+                common.tex_interval,
+                common.tile_mode,
+                common.tex_speed[0],
+                common.tex_speed[1],
+                if common.reverse_u { "U" } else { "" },
+                if common.reverse_v { "V" } else { "" },
+                if common.exchange_uv { "X" } else { "" },
+                common.repeat_count,
+                common.repeat_delay,
+                element.start_time,
+                element.keypoints.len(),
+                common.match_ground,
+                common.depth_test,
+                if common.is_dummy { "dummy" } else { "" },
+                extra
+            );
+        }
+    }
+
+    /// The name the host gave this root, empty until [`Self::set_name`].
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Elements that could not be resolved at load time.
     pub fn warnings(&self) -> &[String] {
         &self.warnings
     }
 
-    /// The posed meshes of this root's model elements, in element order.
-    pub fn models(&self) -> &[Vec<EffectMesh>] {
+    /// The model elements of this root, in element order. Each one exposes its
+    /// bind-pose meshes through [`ModelInstance::meshes`]; the frame it draws
+    /// additionally follows its action clock.
+    pub fn models(&self) -> &[ModelInstance] {
         &self.models
     }
 
@@ -1004,6 +1579,7 @@ impl Player {
                     particles: Vec::new(),
                     carry: 0.,
                     rng: Rng::new(rng.next_u32()),
+                    average: AverageWalk::default(),
                     ramps: element
                         .affectors
                         .iter()
@@ -1015,9 +1591,14 @@ impl Player {
                         })
                         .collect(),
                 }),
-                Spec::Ribbon(_) | Spec::Wave(_) => Runtime::Ribbon(RibbonState {
+                Spec::Ribbon(_) => Runtime::Ribbon(RibbonState {
                     vertices: Vec::new(),
                     carry: 0.,
+                }),
+                Spec::Wave(_) => Runtime::LtnTrail(LtnTrailState {
+                    points: Vec::new(),
+                    carry: 0.,
+                    rng: Rng::new(rng.next_u32()),
                 }),
                 Spec::Fractal(_) | Spec::Trail(_) => Runtime::Fractal(FractalState {
                     timer: f32::INFINITY,
@@ -1068,6 +1649,7 @@ impl Player {
             elements.push(ElementRuntime {
                 index,
                 seeded: -1,
+                play: 0.,
                 state,
                 runtime,
                 bind_target: None,
@@ -1092,6 +1674,7 @@ impl Player {
         Ok(Self {
             root,
             time: 0.,
+            play_speed_override: None,
             finished: false,
             elements,
             quads: Vec::new(),
@@ -1103,13 +1686,14 @@ impl Player {
             // sequence the elements draw from.
             shake_seed: seed.wrapping_add(0x5348_414b),
             warnings,
+            name: String::new(),
             textures,
             models: Vec::new(),
         })
     }
 
     /// Resolve every element-160 model in this root and its already-loaded
-    /// children into posed triangle lists, once, at load time.
+    /// children, and give each one the action clock its element asks for.
     ///
     /// The effect archive keeps models in the same package as the roots, and a
     /// model element names its `.SMD` relative to the GFX file's own folder
@@ -1118,11 +1702,14 @@ impl Player {
     /// directory, which is why the reader is called with those names joined to
     /// the SMD's parent rather than the archive root.
     ///
-    /// These models are static: measured across the 141 shipped `.SKI` files,
-    /// every skin is bound by 0 or 1 bones, so the bind pose is the only pose
-    /// the archive can express. A model whose skeleton carries a scale or
-    /// constraint controller is refused by `skeleton_pose` rather than drawn in
-    /// the wrong pose, and the refusal is reported once through `warnings`.
+    /// A skin is bound rigidly — 0 or 1 bones per vertex across the 141 shipped
+    /// `.SKI` files — but that does not make the model static: each vertex
+    /// follows its bone, and the bones themselves are driven by the action's
+    /// track set. The bind pose is only the still frame of a model that names no
+    /// action (171 of the 447 shipped element-160 blocks). A model whose
+    /// skeleton carries a scale or constraint controller is refused by
+    /// `skeleton_pose` rather than drawn in the wrong pose, and the refusal is
+    /// reported once through `warnings`.
     pub fn load_models(
         &mut self,
         root_path: &str,
@@ -1135,17 +1722,25 @@ impl Player {
         // name, and the join below tolerates a path that already starts there.
         let _ = root_path;
         let parent = "gfx/models";
-        self.collect_models(&mut models, &parent, read, 0);
+        // One parsed rig per `.SMD` for this load: the 447 shipped blocks name
+        // 113 distinct models and a root may name the same one twice, so the
+        // cache sits in front of the SMD/SKI/BON parse for the whole root tree.
+        let mut assets = std::collections::HashMap::new();
+        self.collect_models(&mut models, &parent, read, 0, &mut assets);
         self.models = models;
         Ok(())
     }
 
     fn collect_models(
         &mut self,
-        out: &mut Vec<Vec<EffectMesh>>,
+        out: &mut Vec<ModelInstance>,
         parent: &str,
         read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
         depth: usize,
+        assets: &mut std::collections::HashMap<
+            String,
+            std::sync::Arc<crate::model_asset::ModelAsset>,
+        >,
     ) {
         for (index, element) in self.root.elements.iter().enumerate() {
             let Spec::Model(model) = &element.spec else {
@@ -1156,14 +1751,22 @@ impl Player {
                 Err(_) => String::new(),
             };
             out.push(
-                match posed_model_meshes(&model.path, parent, &fallback, read) {
-                    Ok(meshes) => meshes,
+                match posed_model_meshes(
+                    &model.path,
+                    parent,
+                    &fallback,
+                    &model.action,
+                    model.loops,
+                    read,
+                    assets,
+                ) {
+                    Ok(instance) => instance,
                     Err(error) => {
                         let line = format!("element {index} model {}: {error}", model.path);
                         if !self.warnings.contains(&line) {
                             self.warnings.push(line);
                         }
-                        Vec::new()
+                        ModelInstance::empty()
                     }
                 },
             );
@@ -1175,7 +1778,9 @@ impl Player {
         }
         for element in &mut self.elements {
             if let Runtime::Child(child) = &mut element.runtime {
-                child.player.collect_models(out, parent, read, depth + 1);
+                child
+                    .player
+                    .collect_models(out, parent, read, depth + 1, assets);
             }
         }
     }
@@ -1236,8 +1841,15 @@ impl Player {
     pub fn reset(&mut self) {
         self.time = 0.;
         self.finished = false;
+        // `A3DGFXModel::Play` sets `m_bStart = false`, so the next
+        // `UpdateModel` replays `PlayActionByNameDC` from the action's first
+        // frame instead of continuing where the model stopped.
+        for model in &mut self.models {
+            model.reset();
+        }
         for element in &mut self.elements {
             element.seeded = -1;
+            element.play = 0.;
             element.state = CtrlState::new();
             // A restart gives every element its clock back, so the binding
             // dependency has to be re-armed as well: a dependent whose target
@@ -1276,6 +1888,9 @@ impl Player {
     /// whole pass, `0x6fa7c5` and `0x6fa813` both fall through to the un-snapped
     /// frame — so `MatchGrnd` and `GroundHeight` stay inert exactly as they are
     /// in the client for an owner that cannot raycast.
+    ///
+    /// This is [`Self::advance_with_terrain`] without a surface query, which is the
+    /// signature add-on modules already compile against.
     #[allow(clippy::too_many_arguments)]
     pub fn advance_with_ground(
         &mut self,
@@ -1285,6 +1900,36 @@ impl Player {
         scale: f32,
         alpha: f32,
         ground: Option<GroundHit>,
+    ) -> Result<(), String> {
+        self.advance_with_terrain(dt_ms, view, transform, scale, alpha, ground, None)
+    }
+
+    /// The same frame with both kinds of ground data: the single sample the
+    /// element frames are built from, and the surface under the sheet.
+    ///
+    /// `terrain` is what the ground *drape* needs. The client's owner raycasts
+    /// once, at its own position, and consumes that pair for the element
+    /// frames, but `A3DDecalEx::Fill_Verts_3D` then asks the surface under every
+    /// vertex of a ground sheet for itself; one sample cannot answer that, so a
+    /// host that can answer it passes the query and the sprite path uses it. A
+    /// caller with terrain and no `GroundHit` still gets the drape — the
+    /// near-ground byte it gates on is measured from the query — and a caller
+    /// with neither gets exactly what it got before.
+    #[allow(clippy::too_many_arguments)]
+    pub fn advance_with_terrain(
+        &mut self,
+        dt_ms: f32,
+        view: &View,
+        transform: Mat4,
+        scale: f32,
+        alpha: f32,
+        ground: Option<GroundHit>,
+        // The surface under the owner, for the ground-draped decal path. It is
+        // deliberately separate from `ground`: the drape needs a height at
+        // every vertex of the sheet, while `GroundHit` is the single sample the
+        // owner's own frame is built from, and a caller can have one without
+        // the other.
+        terrain: Option<GroundHeightQuery<'_>>,
     ) -> Result<(), String> {
         if !dt_ms.is_finite() || dt_ms < 0. {
             return Err(format!("invalid effect delta {dt_ms}"));
@@ -1298,26 +1943,71 @@ impl Player {
         if !transform.is_finite() {
             return Err("non-finite effect transform".into());
         }
-        self.time += dt_ms * self.root.play_speed;
+        self.time += dt_ms * self.play_speed();
         let mut rng = self.rng;
         rng.next_u32();
         let mut stats = Stats::default();
         let mut out = Vec::new();
 
         // The parent basis is normalized exactly like the verified static decal
-        // path, so a non-uniform placement cannot shear the billboards.
-        let base = normalize_basis(transform)
-            * Mat4::from_scale(Vec3::splat(self.root.default_scale * scale));
+        // path, so a non-uniform placement cannot shear the billboards. A
+        // `FaceToViewer` root throws its authored orientation away instead and
+        // faces the camera — per tick, above every element, which is why the flag
+        // is handled here rather than in the sprite path.
+        //
+        // `NoChangeDir` keeps the identity frame the constructor installed
+        // (`m_matNoScale.Identity()`, `A3DGFXEx.cpp:332`): `SetParentTM` copies
+        // only row 3 and leaves the three basis rows alone
+        // (`A3DGFXEx.cpp:1592-1598`), and `SetDirAndUp` returns before touching
+        // them (`A3DGFXEx.cpp:1576`). The placement's rotation is therefore never
+        // applied; only its translation survives.
+        let origin = transform.w_axis.truncate();
+        let orientation = if self.root.face_to_viewer {
+            face_viewer_basis(view.position - origin, origin)
+        } else if self.root.no_change_dir {
+            Mat4::from_cols_array_2d(&[
+                [1., 0., 0., 0.],
+                [0., 1., 0., 0.],
+                [0., 0., 1., 0.],
+                [origin.x, origin.y, origin.z, 1.],
+            ])
+        } else {
+            normalize_basis(transform)
+        };
+        let base = orientation * Mat4::from_scale(Vec3::splat(self.root.default_scale * scale));
         // The owner's ground pass runs once per frame, before any element asks
         // for a frame (`0x6e53f0` is the owner's tick, `0x6fa7c0` is called from
         // the corner builder later in the same frame).
         let frames = ground.and_then(|hit| self.ground_frames(hit, transform, base));
+        // `A3DDecalEx::Fill_Verts_3D` takes its ground branch only for an owner
+        // that was placed with ground data and sits within
+        // `GROUND_NEAR_DISTANCE` of the surface (`m_pGfx->IsCloseToGrnd() &&
+        // m_pGfx->MatchGrnd()`); the sampler answers the same question here,
+        // since it is the only ground data this path is given.
+        let drape = terrain.map(|height| {
+            let origin = transform.w_axis.truncate();
+            GroundSampler {
+                height,
+                // `CalcParentTM` (A3DGFXEx.cpp:1617-1622):
+                //
+                //     if (fabs(m_vPos.y - m_fGroundHeight) < _match_grnd_max_delta)
+                //         m_bCloseToGrnd = true;
+                //
+                // It is an **absolute** difference, so an owner more than 0.2
+                // below the surface is not close to it either; the signed test
+                // this used to be drew a draped sheet under the terrain.
+                near_ground: matches!(
+                    height(origin.x, origin.z),
+                    Some(surface) if (origin.y - surface).abs() < GROUND_NEAR_DISTANCE
+                ),
+            }
+        });
         let color_scale =
             self.root.default_alpha * alpha * distance_fade(&self.root, view.position, base);
         let time = self.time;
-        let play_speed = self.root.play_speed;
+        let root_name = self.name.as_str();
+        let play_speed = self.play_speed();
         let version = self.root.version;
-        let face_to_viewer = self.root.face_to_viewer;
 
         // The controllers integrate in seconds of scaled time: the same
         // millisecond delta the root clock used, times the root `PlaySpeed`
@@ -1357,9 +2047,11 @@ impl Player {
                 .iter()
                 .filter(|element| matches!(element.spec, Spec::Model(_)))
                 .count();
-            let element_meshes: Vec<EffectMesh> = match self.root.elements[index].spec {
-                Spec::Model(_) => self.models.get(model_slot).cloned().unwrap_or_default(),
-                _ => Vec::new(),
+            // The instance owns this element's action clock, so the frame is
+            // posed per tick instead of once at load.
+            let model_instance = match self.root.elements[index].spec {
+                Spec::Model(_) => self.models.get_mut(model_slot),
+                _ => None,
             };
             let runtime = &mut self.elements[slot];
             let done = advance_element(
@@ -1369,7 +2061,6 @@ impl Player {
                 dt_s,
                 play_speed,
                 version,
-                face_to_viewer,
                 view,
                 parent,
                 color_scale,
@@ -1377,7 +2068,9 @@ impl Player {
                 &mut rng,
                 &mut stats,
                 &mut out,
-                &element_meshes,
+                model_instance,
+                drape,
+                root_name,
             )?;
             runtime.ended = done;
             finished = finished && done;
@@ -1397,9 +2090,42 @@ impl Player {
         );
         self.rng = rng;
         stats.quads = out.len();
+        let loops = self.loops();
+        // The clock channel: the whole root once a frame. This is the line that
+        // answers "is it running at all, and at what rate", which is the first
+        // question for anything that looks frozen.
+        crate::diag_keyed!(
+            EffectClock,
+            root_name,
+            1000,
+            "{} t={:.1}ms dt={:.1}ms play_speed={:.3} finished={} loops={loops} \
+             elements={} quads={} particles={} emitters={} ribbons={} models={} \
+             lights={} sounds={} dummies={} warp={} unrendered={} alpha={:.3} scale={:.3} \
+             drape={} ground={}",
+            root_name,
+            self.time,
+            dt_ms,
+            play_speed,
+            finished && !loops,
+            self.elements.len(),
+            stats.quads,
+            stats.particles,
+            stats.emitters,
+            stats.ribbons,
+            stats.models,
+            stats.lights,
+            stats.sounds,
+            stats.dummies,
+            stats.warp,
+            stats.unrendered,
+            color_scale,
+            scale,
+            drape.is_some(),
+            frames.is_some()
+        );
         self.stats = stats;
         self.quads = out;
-        self.finished = finished && !self.loops();
+        self.finished = finished && !loops;
         Ok(())
     }
 
@@ -1421,9 +2147,10 @@ impl Player {
             return None;
         }
         let origin = transform.w_axis.truncate();
-        // 0x6e54a1/0x6e54ac: the owner's y against the raycast height, with the
-        // 0.2 at 0x8eb828.
-        let near_ground = origin.y - hit.height < GROUND_NEAR_DISTANCE;
+        // `CalcParentTM` (A3DGFXEx.cpp:1617-1622): `fabs(m_vPos.y -
+        // m_fGroundHeight) < _match_grnd_max_delta`, the 0.2 at :254. Absolute,
+        // so an owner far below the surface is not close to it either.
+        let near_ground = (origin.y - hit.height).abs() < GROUND_NEAR_DISTANCE;
         let own = Quat::from_mat4(&normalize_basis(transform));
         let scale = Mat4::from_scale(Vec3::splat(base.x_axis.length()));
         // 0x6e5540..0x6e556e: the ground frame's translation is (pos.x, the
@@ -1437,7 +2164,6 @@ impl Player {
         Some(GroundFrames {
             near_ground,
             aligned: Mat4::from_rotation_translation(aligned, at_ground) * scale,
-            height_only: Mat4::from_rotation_translation(own, at_ground) * scale,
             normal_only: Mat4::from_rotation_translation(aligned, origin) * scale,
         })
     }
@@ -1447,11 +2173,15 @@ impl Player {
     ///
     /// ```text
     /// no ground query                        -> the un-snapped frame
-    /// GroundHeight &&  MatchGrnd             -> owner+0xfc   aligned
-    /// GroundHeight && !MatchGrnd             -> owner+0x13c  height only
-    /// !GroundHeight && MatchGrnd && near     -> owner+0xfc   aligned
+    /// MatchGrnd && (GroundHeight || near)    -> owner+0xfc   aligned
     /// otherwise                              -> the un-snapped frame
     /// ```
+    ///
+    /// The client's owner also carries a height-only frame (owner+0x13c), but
+    /// the only key that routes an element to it is `GroundHeight`, which
+    /// A3DGFXElement.h documents as `ID_GFXOP_PARSYS_USE_GRND_HEIGHT` — "Use
+    /// ground height for init the particle". A placed card with `MatchGrnd: 0`
+    /// keeps its authored height; see `ground_parent`.
     ///
     /// Both bytes are reduced with `setne` at load time, so the number authored
     /// for `GroundHeight` does not matter, only whether it is nonzero. The
@@ -1470,14 +2200,18 @@ impl Player {
         if matches!(&element.spec, Spec::Sprite(s) if s.ground_normal_only) {
             return frames.normal_only;
         }
-        if element.common.ground_height != 0. {
-            return if element.common.match_ground {
-                frames.aligned
-            } else {
-                frames.height_only
-            };
+        // `MatchGrnd: 0` keeps the authored placement height. The element key
+        // the editor writes for the height frame is documented as a
+        // particle-init option — `ID_GFXOP_PARSYS_USE_GRND_HEIGHT`, "Use ground
+        // height for init the particle" (A3DGFXElement.h) — not a licence to
+        // move a placed card onto the terrain, and the shipped beams and shafts
+        // (天煞光束, 树林光束, 圣城之光) all author `MatchGrnd: 0` and appear at
+        // their ECWLD height in retail. Dropping a record onto the surface here
+        // is what parked the sunrays on the ground.
+        if !element.common.match_ground {
+            return base;
         }
-        if element.common.match_ground && frames.near_ground {
+        if element.common.ground_height != 0. || frames.near_ground {
             return frames.aligned;
         }
         base
@@ -1493,7 +2227,6 @@ fn advance_element(
     dt_s: f32,
     play_speed: f32,
     version: u32,
-    face_to_viewer: bool,
     view: &View,
     base: Mat4,
     color_scale: f32,
@@ -1502,9 +2235,15 @@ fn advance_element(
     rng: &mut Rng,
     stats: &mut Stats,
     out: &mut Vec<EffectQuad>,
-    // Models already posed at load time, in element order. Empty when the host
-    // supplied no model reader, in which case model elements keep counting.
-    meshes: &[EffectMesh],
+    // This element's model instance, when it is an element-160 record. It owns
+    // the action clock `PlayActionByNameDC` starts, so the frame is posed here
+    // rather than at load time.
+    mut model_instance: Option<&mut ModelInstance>,
+    // The owner's surface, for the ground-draped sprite path. Copy, so every
+    // element of the root can take its own.
+    drape: Option<GroundSampler<'_>>,
+    // The root's archive path, carried into every log line this element writes.
+    root: &str,
 ) -> Result<bool, String> {
     let local = time - element.start_time;
     if local < 0. {
@@ -1522,12 +2261,55 @@ fn advance_element(
         // `done` above when the play count ran out.
         return Ok(false);
     };
-    if runtime.seeded != index as isize {
+    // The controller state belongs to one *play* of the element's clock, not to
+    // its lifetime. Every controller integrates against the node age
+    // (`A3DGFXCtrlMotion::Process` reads it at `0x6eaf60`), and the client
+    // restarts that age on each `RepeatCount` loop, so a motion sweep begins at
+    // zero every time round. What restarts is the keypoint set's process state
+    // — `Resume(true)` reassigns `m_KPProcess = m_KeyPointArray[0]->m_KPOrg`,
+    // clears `m_vAxisOff` and zeroes `m_fTimeSpan` and `m_fScaleNoise`
+    // (A3DGFXKeyPoint.h:2067-2096) — not each controller's own `Resume`, which
+    // is an empty body on most classes (`:738, :819, :898, :990, :1081,
+    // :1274, :1458, :1582`). Reseeding the state is how that process state is
+    // reset here, so the integrators follow it. Reseeding only on
+    // a keypoint change kept the state alive across loops, and an integrator
+    // like `CtrlType: 100` then walked away from its authored position for as
+    // long as the root played: `主城光球大` element 200 sweeps `Vel: 0.7` along
+    // +Y in a 2 s loop, and after seventy seconds of play its lightning children
+    // sat 292 world units above their orb — the "misplaced effects in the upper
+    // city" report, which is not a placement error at all.
+    let play = if cycle.is_finite() && cycle > 0. && element.common.repeat_count != 1 {
+        (local / cycle).floor()
+    } else {
+        0.
+    };
+    if runtime.seeded != index as isize || runtime.play != play {
         runtime.seeded = index as isize;
+        runtime.play = play;
         runtime.state = CtrlState::new();
         runtime.state.bind(key);
     }
-    apply_controls(&mut runtime.state, key, &sampled, dt_s, rng);
+    // A keypoint's controllers run only on the *step* path, and the branch is
+    // taken on the mode alone — `TickAnimation` reads `m_enumMode` once and
+    // never looks at the span:
+    //
+    //     if (m_KeyPointArray[i]->m_enumMode != A3DGFXKeyPoint::enumInterpNone)
+    //         ... Interpolate(dwSpan / m_KeyPointArray[i]->m_dwTimeSpan);
+    //     else
+    //         m_KeyPointArray[i]->Process(m_ProcData, dwTickTime);   // walks m_CtrlLst
+    //
+    // (A3DGFXKeyPoint.cpp:1416-1462). An interpolating keypoint goes through
+    // `Interpolate`, which touches colour, `m_fRad2D`, scale and position and no
+    // controller at all. So `TimeSpan: -1` does not widen the gate: an
+    // interpolate-mode keypoint that holds forever still runs nothing. 141
+    // corpus elements author mode 1 and 39 of them also carry controllers, so
+    // running those against a keypoint the client leaves alone was a small,
+    // one-sided difference. The corpus authors no `InterpolateMode: 1` keypoint
+    // with `TimeSpan: -1` (see §59), so this line changes nothing a shipped file
+    // can reach today; it is the client's condition either way.
+    if key.interpolate_mode == 0 {
+        apply_controls(&mut runtime.state, key, &sampled, dt_s, rng);
+    }
 
     let scale = runtime
         .state
@@ -1540,17 +2322,34 @@ fn advance_element(
         .unwrap_or(runtime.state.offset + runtime.state.noise);
     // The interpolated keypoint orientation, not the raw one: a root that
     // authors two keypoints with different `Direction` quaternions turns
-    // smoothly between them, and ctrl 100's `Dir` orbit spins on top of that.
-    let direction = sampled.direction * Quat::from_axis_angle(Vec3::Z, runtime.state.orbit);
+    // smoothly between them, and a 102/103 axis spin turns on top of that.
+    // `A3DGFXCtrlRotAxis::Process` builds the spin as `Q(m_vAxis, angle)` and
+    // multiplies it on the **left** of `m_vDir`, so it acts in the owner's
+    // frame. The first version of this line spun about the element's own Z on
+    // the right instead, which is a different rotation for every axis an artist
+    // did not author as Z.
+    let direction = runtime.state.orbit * sampled.direction;
     let placement = base * Mat4::from_rotation_translation(direction, sampled.position + offset);
     // Publish the world placement before anything consumes it, so an element
     // bound to this one follows the matrix it actually used. `0x6fe120` reads
     // the target's stored transform at +0x58 rather than recomputing it, which
     // is what keeps a mutual bind from recursing.
-    runtime.placement = Some(placement);
+    //
+    // `A3DGFXContainer.cpp:300` hands a bound child
+    // `SetParentTM(GetTranMatrix(kp) * GetParentTM())`, so the matrix a child
+    // substitutes carries the target's 2D spin even though the card arms want
+    // the unspun one: the published matrix is `GetTranMatrix`, the drawn cards
+    // keep [`ElementContext::placement`].
+    let rotation = sampled.rad_2d + runtime.state.rotation;
+    runtime.placement = Some(if rotation.is_finite() && rotation != 0. {
+        placement * Mat4::from_axis_angle(Vec3::Z, rotation)
+    } else {
+        placement
+    });
     let context = ElementContext {
         id: element.id,
         placement,
+        shaft: shaft_mode(),
         spin: direction,
         keypoint_direction: sampled.direction,
         view,
@@ -1567,10 +2366,49 @@ fn advance_element(
         emission_scale: sampled.scale * play_speed,
         // `Rad_2D` is the authored 2D spin of this keypoint; ctrl 101
         // integrates its `Vel`/`Acc` into the same angle (node+0x08 is a
-        // rotation, not a speed).
-        rotation: sampled.rad_2d + runtime.state.rotation,
+        // rotation, not a speed). [`ElementContext::element_matrix`] is where a
+        // class that takes `GetTranMatrix` picks it up.
+        rotation,
         clock: phase,
+        root,
     };
+    // The Logging tab's frame channel: what the element resolved to this tick.
+    // The basis is the world matrix the card is drawn in, so a card that is in
+    // the right place but the wrong way round shows up as a basis a reader can
+    // compare with the client's `GetParentTM`/`GetParentDir` pair.
+    if crate::diagnostics::enabled(crate::diagnostics::Channel::EffectFrames) {
+        let keypoint_direction = sampled.direction * Vec3::Z;
+        let column = |axis: Vec3| format!("({:.2},{:.2},{:.2})", axis.x, axis.y, axis.z);
+        // Keyed, not throttled channel-wide: the first root to reach a
+        // whole-channel throttle owned the file, and an Archosaur capture came
+        // back with eighteen lines about one smoke effect and none about the
+        // beam it was taken for. The key carries the placement, because one
+        // root is placed many times.
+        crate::diag_keyed!(
+            EffectFrames,
+            at(&context),
+            250,
+            "{} id={} kp={} clock={:.0}ms scale={:.3} key=({:.3},{:.3},{:.3}) dir={} \
+             rot={:.3} color={:#010x} basis right={} up={} dir={} origin=({:.1},{:.1},{:.1})",
+            root,
+            element.id,
+            index,
+            phase,
+            context.scale,
+            key.position.x,
+            key.position.y,
+            key.position.z,
+            column(keypoint_direction),
+            context.rotation,
+            context.color,
+            column(placement.x_axis.truncate()),
+            column(placement.y_axis.truncate()),
+            column(placement.z_axis.truncate()),
+            placement.w_axis.x,
+            placement.w_axis.y,
+            placement.w_axis.z
+        );
+    }
     // `IsDummy` marks an element the client builds but never submits: `冲击波1`
     // keeps a whole child element behind it. Note that `DummyEle` is *not* this
     // flag — it names another element to take a basis from, and the drawable
@@ -1582,9 +2420,16 @@ fn advance_element(
     }
     match &mut runtime.runtime {
         Runtime::Clock => {
-            emit_clock(element, &context, face_to_viewer, stats, out);
-            if matches!(element.spec, Spec::Model(_)) {
-                emit_model(meshes, &context, out);
+            emit_clock(element, &context, stats, out, drape);
+            if let Spec::Model(spec) = &element.spec {
+                // `A3DGFXModel::UpdateModel` ticks the skin model with the
+                // element's own scaled delta, so the clip advances on the frames
+                // the element actually draws and the pose is sampled before the
+                // placement is applied.
+                let frame = model_instance
+                    .as_deref_mut()
+                    .map_or(&[][..], |instance| instance.frame(dt_s * 1000.));
+                emit_model(frame, spec.write_z, &context, out);
             }
         }
         Runtime::Particles(emitter) => {
@@ -1603,6 +2448,7 @@ fn advance_element(
             );
         }
         Runtime::Ribbon(ribbon) => emit_ribbon(ribbon, element, &context, dt_s, stats, out),
+        Runtime::LtnTrail(trail) => emit_ltn_trail(trail, element, &context, dt_s, stats, out),
         Runtime::Fractal(fractal) => emit_fractal(fractal, element, &context, dt_s, stats, out),
         Runtime::Bolts(bolts) => {
             let Spec::Lightning(bolt) = &element.spec else {
@@ -1631,6 +2477,10 @@ fn advance_element(
 }
 
 /// Total length of one play of the element clock, including the repeat delay.
+///
+/// This is the period of the *phase* clock, not the moment the element is done:
+/// the client runs `RepeatDelay` between two plays and not after the last one,
+/// so `N` plays end at `N*span + (N-1)*delay`. See [`element_phase`].
 fn element_cycle(element: &Element) -> f32 {
     match element.duration_ms() {
         Some(span) => span + element.common.repeat_delay.max(0.),
@@ -1640,6 +2490,31 @@ fn element_cycle(element: &Element) -> f32 {
 
 /// Map an element's local clock onto its keypoint clock, honouring
 /// `RepeatCount`: 1 plays once, -1 loops forever, N plays N times.
+///
+/// The client's `A3DGFXKeyPointSet::TickAnimation` (A3DGFXKeyPoint.cpp:1366-1432)
+/// decides both the phase and the end, and it does so *before* the delay is
+/// charged to anything:
+///
+/// ```cpp
+/// if (IsFinished()) return;                       // IsFinished: m_nCurRepeat == m_nRepeatCount
+/// if (m_bInDelay) { m_dwCurDelay += dwTickTime; ... return; }   // the gap after a play
+/// m_dwTimeSpan += dwTickTime;
+/// ...
+/// if (i == m_KeyPointArray.size()) {              // every finite keypoint consumed
+///     Resume(true);                               // m_bInDelay = true, m_nCurRepeat++
+///     m_pEle->ResumeLoop();
+///     if (dwTotal) TickAnimation(dwSpan % dwTotal);
+///     return;
+/// }
+/// ```
+///
+/// so a play's keypoint clock is `span`, the gap `delay` follows the play and is
+/// *not* part of it, and the last play's end starts the delay that the next call
+/// sees `IsFinished` before — which is to say the element is done at
+/// `N*span + (N-1)*delay`, with the final delay never charged. Charging it, as
+/// `cycle * repeats` did, ended `RepeatCount: 1` one delay late and every later
+/// count `(N-1)` delays late; only the element's done time moved, since nothing
+/// is drawn during a delay.
 fn element_phase(element: &Element, local: f32, cycle: f32) -> (f32, bool) {
     if !cycle.is_finite() {
         return (local, false);
@@ -1648,19 +2523,21 @@ fn element_phase(element: &Element, local: f32, cycle: f32) -> (f32, bool) {
         return (0., element.common.repeat_count == 1);
     }
     let repeats = element.common.repeat_count;
-    if repeats == 1 {
-        return (local.min(cycle), local >= cycle);
-    }
     // The corpus only ever writes 1, -1 or a positive count (up to INT_MAX for
     // "effectively forever"), so a zero or negative count is read as an
     // open-ended loop rather than as "play zero times".
+    let span = element.duration_ms().unwrap_or(0.);
+    let delay = cycle - span;
     let total = if repeats <= 0 {
         f32::INFINITY
     } else {
-        cycle * repeats as f32
+        // `Resume(true)` after the last play leaves `m_bInDelay` set, but the
+        // next tick's `IsFinished` returns before it is read, so the delay that
+        // would follow the final play is never spent.
+        span * repeats as f32 + delay * (repeats.max(1) - 1) as f32
     };
     if local >= total {
-        return (cycle, true);
+        return (span.min(cycle), true);
     }
     (local % cycle, false)
 }
@@ -1811,13 +2688,16 @@ fn apply_controls(
                 acc,
             } => {
                 let dspl = displacement(*vel, *acc, local, dt);
-                state.orbit += dspl;
                 let axis = if axis.length_squared() > 1e-12 {
                     axis.normalize()
                 } else {
                     Vec3::Y
                 };
                 let rotation = Quat::from_axis_angle(axis, dspl);
+                // `A3DGFXCtrlRotAxis::Process` does both halves: it spins the
+                // keypoint direction about the authored axis, and it orbits the
+                // keypoint position around that axis through `m_vPos`.
+                state.orbit = rotation * state.orbit;
                 state.offset = rotation * (state.offset - *pos) + *pos;
             }
             ControlData::Attract { pos, vel, acc } => {
@@ -1981,6 +2861,55 @@ fn sample_path(points: &[Vec3], distance: f32) -> (Vec3, Vec3) {
 
 /// fBm value noise over a permutation of `buffer_length` entries with the
 /// authored wavelength, persistence and octave count.
+/// `CalcVertVec`: any unit vector perpendicular to `axis`, which is what
+/// `A3DGFXLightning::BuildPath` rotates the noise around.
+fn calc_vert_vec(axis: Vec3) -> Vec3 {
+    let other = if axis.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+    axis.cross(other).normalize_or_zero()
+}
+
+/// `RotateVec(A3DQUATERNION(axis, angle), v)` for a unit `axis`.
+fn rotate_about(v: Vec3, axis: Vec3, angle: f32) -> Vec3 {
+    if !angle.is_finite() || axis.length_squared() < 1e-12 {
+        return v;
+    }
+    Quat::from_axis_angle(axis.normalize(), angle) * v
+}
+
+/// The free function `filter` above `A3DGFXLightning::BuildPath`
+/// (`A3DGFXLightning.cpp:983-1003`). `FT_TRIANGLE` deliberately drops `value`:
+///
+///     case FT_TRIANGLE: return 2 * (fDist > 0.5 ? 1 - fDist : fDist);
+///     case FT_RECTANGLE: return fValue;
+///     case FT_TRAPEZIA: return fValue * (fDist < 0.2 ? fDist*5 : fDist > 0.8 ? (1-fDist)*5 : 1);
+///     case FT_SIN: return fValue * sinf(fDist * A3D_PI);
+fn lightning_filter(kind: u32, dist: f32, value: f32) -> f32 {
+    if dist < 0. {
+        return value;
+    }
+    let dist = if dist > 1. { dist - dist.floor() } else { dist };
+    match kind {
+        // FT_TRIANGLE
+        0 => 2. * if dist > 0.5 { 1. - dist } else { dist },
+        // FT_RECTANGLE
+        1 => value,
+        // FT_SIN
+        2 => value * (dist * std::f32::consts::PI).sin(),
+        // FT_TRAPEZIA
+        3 => {
+            value
+                * if dist < 0.2 {
+                    dist * 5.
+                } else if dist > 0.8 {
+                    (1. - dist) * 5.
+                } else {
+                    1.
+                }
+        }
+        _ => value,
+    }
+}
+
 fn fbm(
     seed: u32,
     x: f32,
@@ -2027,6 +2956,52 @@ fn noise_at(seed: u32, index: i64, length: i64, octave: usize) -> f32 {
     x = x.wrapping_mul(0x2c1b_3c6d);
     x ^= x >> 12;
     (x & 0xffff) as f32 / 32_768. - 1.
+}
+
+/// `A3DGFXEx::Tick`'s `FaceToViewer` frame (`A3DGFXEx.cpp:1245-1258`) and the
+/// `_build_matrix` it calls (`a3dgfxkeypoint.h:396-416`):
+///
+/// ```cpp
+/// A3DVECTOR3 vView = pCamera->GetPos() - GetPos();
+/// m_fDistToCam = vView.Normalize();
+/// if (m_bFaceToViewer) {
+///     m_matNoScale = _build_matrix(vView, m_vPos);
+///     m_qDir.ConvertFromMatrix(m_matNoScale);
+///     m_bTransDirty = true;
+/// }
+/// ```
+///
+/// so the flag does not bend individual cards: it **rebuilds the root frame** so
+/// that its Z axis runs from the effect to the camera, with the world up lane
+/// kept horizontal:
+///
+/// ```cpp
+/// if (fabs(vDir.y) > .999f) { vY = Normalize(vDir % _unit_x); vX = vY % vDir; }
+/// else { vX = Normalize(_unit_y % vDir); vY = vDir % vX; }
+/// Fill_TranMatrix(matTran, vX, vY, vDir, vPos);
+/// ```
+///
+/// `Fill_TranMatrix` writes the three axes as matrix **rows** and the position as
+/// row 3 (`a3dgfxkeypoint.h:381-393`), the same row-major convention
+/// `SetDirAndUp` uses, so the glam columns here are the client's rows.
+fn face_viewer_basis(direction: Vec3, position: Vec3) -> Mat4 {
+    let dir = direction.normalize_or_zero();
+    if dir == Vec3::ZERO {
+        return Mat4::IDENTITY;
+    }
+    let (x, y) = if dir.y.abs() > 0.999 {
+        let y = dir.cross(Vec3::X).normalize_or_zero();
+        (y.cross(dir), y)
+    } else {
+        let x = Vec3::Y.cross(dir).normalize_or_zero();
+        (x, dir.cross(x))
+    };
+    Mat4::from_cols(
+        x.extend(0.),
+        y.extend(0.),
+        dir.extend(0.),
+        position.extend(1.),
+    )
 }
 
 /// Normalize a placement basis, exactly as the verified static decal path does,
@@ -2283,11 +3258,73 @@ pub fn path_seed(path: &str) -> u32 {
 /// `TexRow`/`TexCol` greater than one select a cell every `TexInterval`
 /// milliseconds, row by row, which is how the retail smoke and fire sequences
 /// are stored.
-fn flipbook_uv(common: &Common, clock_ms: f32) -> [[f32; 2]; 4] {
+/// The live texture window `(u, v, w, h)` — the client's `m_fTexU`/`m_fTexV`/
+/// `m_fTexWid`/`m_fTexHei` at this clock — **before** the three endpoint-swap
+/// mirrors touch it. `flipbook_uv` wraps these four floats into card corners;
+/// the fractal strips use them directly (`A3DGFXLightning.cpp:835-836`), which
+/// is why the window is its own function.
+///
+/// `TileMode` is not a flipbook. `A3DGFXElement::CalcTexAnimation` takes a
+/// different branch for it:
+///
+///     if (m_bTileMode) { m_fTexWid = (float)m_nTexCol; m_fTexHei = (float)m_nTexRow; }
+///     else if (rows == 1 && cols == 1) m_bNeedCalcTex = false;
+///     else { m_fTexWid = 1.f / cols; m_fTexHei = 1.f / rows; }
+///
+/// and `A3DGFXElement::TexAnimation` scrolls instead of stepping:
+///
+///     if (m_bTileMode) { m_fTexU += m_fUOffsetSpeed * dt; m_fTexV += m_fVOffsetSpeed * dt; }
+///     else { ... m_nCurTexCol/m_nCurTexRow step every TexInterval ... }
+///
+/// so the two flags differ in what `TexRow`/`TexCol` mean: a flipbook cuts
+/// one cell out of a `TexCol x TexRow` grid and steps it every `TexInterval`,
+/// a tile keeps the whole `TexCol x TexRow` window and slides it at
+/// `TexSpeed`. Stepping cells as well is what made every waterfall sheet in
+/// `场景/新种族地图` jump between the frames of its atlas instead of running.
+fn tex_window(common: &Common, clock_ms: f32) -> (f32, f32, f32, f32) {
     let rows = common.tex_row.max(1);
     let cols = common.tex_col.max(1);
     let cells = rows * cols;
-    let mut uv = [[0., 0.], [1., 0.], [0., 1.], [1., 1.]];
+    let seconds = clock_ms / 1000.;
+    if common.tile_mode != 0 {
+        // `TileMode` keeps the full `TexCol x TexRow` window and slides it at
+        // the authored `TexSpeed`. `CalcTexAnimation` sets `m_fTexWid =
+        // (float)m_nTexCol` and `m_fTexHei = (float)m_nTexRow` for a tile
+        // (A3DGFXElement.h:521-530), `TexAnimation` accumulates
+        // `m_fTexU += m_fUOffsetSpeed * dt` (h:539-540), and the card fills its
+        // vertices from those two floats (A3DDecalEx.cpp:561-573):
+        //
+        //     fU = { m_fTexU, m_fTexU + m_fTexWid, m_fTexU, m_fTexU + m_fTexWid };
+        //     fV = { m_fTexV, m_fTexV, m_fTexV + m_fTexHei, m_fTexV + m_fTexHei };
+        //
+        // The fill runs **every frame**, not once: `A3DGFXRenderSlotMan`'s
+        // render loops call `FillVertexBuffer` on each registered element
+        // (A3DGFXRenderSlot.cpp:746/940/1121) and clear the element list after
+        // the flush (`m_EleArr.clear()`, :541), and `RegisterEleForRender`
+        // re-registers from the per-frame update — which is also why a
+        // fixed-function flipbook can step at all. `PreRender` gives a tile slot
+        // `A3DTADDR_WRAP` and every other slot `A3DTADDR_CLAMP` (:547-549), so
+        // the window lays `TexCol` copies of the sheet across the card and
+        // `TexRow` down it and slides them at `TexSpeed` sheet-heights per
+        // second — the continuous tiling sheets like `气连续03` are authored for
+        // (a seamless cutout whose copies meet at zero alpha).
+        //
+        // The `GetTexTrans` constants (`A3DGFXElement.cpp:1296-1332`, sampling
+        // `(u - m_fTexU) / m_fTexWid`) are the **pixel-shader** path only —
+        // `ApplyPixelShader` runs under `if (m_pPixelShader)` and no root in
+        // `gfx.pck` authors a pixel shader (0 of 5,459) — and they cancel
+        // `m_fTexU` precisely because the per-frame fill has already put it in
+        // the vertices. A one-sheet window at `TexSpeed / TexCol` — what this
+        // branch briefly drew — stretched one copy of the sheet over the card
+        // and ran it at half the authored flow, which was the smeared "still
+        // image" a waterfall was reported as.
+        return (
+            common.tex_speed[0] * seconds,
+            common.tex_speed[1] * seconds,
+            cols as f32,
+            rows as f32,
+        );
+    }
     if cells > 1 {
         // A missing `TexInterval` is 0, and 0 used to be substituted with
         // **1 ms**: a sheet with `TexRow`/`TexCol` above one but no interval
@@ -2301,53 +3338,148 @@ fn flipbook_uv(common: &Common, clock_ms: f32) -> [[f32; 2]; 4] {
         } else {
             common.tex_interval as f32
         };
-        let limit = if common.tex_anim_max_time > 0. {
-            ((common.tex_anim_max_time / interval) as u32).clamp(1, cells)
-        } else {
-            cells
+        // `TexAnimMaxTime` stops the walk where it stands, it does not shorten
+        // the loop. `A3DGFXElement::TickAnimation` gates the tick itself:
+        //
+        //     m_dwTexTickCount += dwTickTime;
+        //     if (m_bTileMode || m_dwTexTimeTotal == 0 || m_dwTexTimeTotal > m_dwTexTickCount)
+        //         TexAnimation(dwTickTime);
+        //
+        // so once the tick count passes the authored total the element stops
+        // calling `TexAnimation` and the sheet holds the frame it had reached
+        // ("停留在最后一帧上", A3DGFXElement.cpp:1268-1274). The tile branch is
+        // exempt, and a zero total never stops. Holding the clock at the total
+        // reproduces that exactly.
+        let tick = match common.tex_anim_max_time {
+            total if total > 0. && clock_ms > total => total,
+            _ => clock_ms.max(0.),
         };
         let index = if interval.is_finite() {
-            ((clock_ms.max(0.) / interval).floor() as u32) % limit
+            ((tick / interval).floor() as u32) % cells
         } else {
             0
         };
         let row = index / cols;
         let col = index % cols;
-        let u0 = col as f32 / cols as f32;
-        let v0 = row as f32 / rows as f32;
-        let du = 1. / cols as f32;
-        let dv = 1. / rows as f32;
-        uv = [[u0, v0], [u0 + du, v0], [u0, v0 + dv], [u0 + du, v0 + dv]];
+        return (
+            col as f32 / cols as f32,
+            row as f32 / rows as f32,
+            1. / cols as f32,
+            1. / rows as f32,
+        );
     }
-    // Two `TexSpeed` values under one key scroll U and V continuously.
-    let scroll_u = common.tex_speed[0] * clock_ms / 1000.;
-    let scroll_v = common.tex_speed[1] * clock_ms / 1000.;
-    for point in &mut uv {
-        point[0] += scroll_u;
-        point[1] += scroll_v;
-    }
+    (0., 0., 1., 1.)
+}
+
+/// The four window corners in the client's card order, `UReverse`/`VReverse`/
+/// `UVExchg` applied.
+fn flipbook_uv(common: &Common, clock_ms: f32) -> [[f32; 2]; 4] {
+    let (u, v, w, h) = tex_window(common, clock_ms);
+    let mut uv = [[u, v], [u + w, v], [u, v + h], [u + w, v + h]];
+    // `TexSpeed` is a `TileMode` value and nothing else. The client reads both
+    // halves into `m_fUOffsetSpeed`/`m_fVOffsetSpeed` at version 34 and uses
+    // them in exactly one branch of `A3DGFXElement::TexAnimation`:
+    //
+    //     if (m_bTileMode) { m_fTexU += m_fUOffsetSpeed * dt; m_fTexV += m_fVOffsetSpeed * dt; }
+    //     else { ...step m_nCurTexCol/m_nCurTexRow...; m_fTexU = m_fTexWid * col; }
+    //
+    // and the tile branch above has already returned. Scrolling here as well
+    // would add `TexSpeed * time` on top of a flipbook's cell, which is what
+    // put `水门_瀑布`'s window thirty texture heights below its sheet in the
+    // first report: that record is `TileMode 1` (so the tile branch takes it and
+    // slides `TexSpeed (0, -1.5)`), and the bug was this second scroll running
+    // on top of the step for the records that are *not* tiled.
+    apply_uv_flips(&mut uv, common);
+    uv
+}
+
+/// `UReverse`, `VReverse` and `UVExchg`, the three mirrors `A3DGFXElement`
+/// applies to the sampled window.
+///
+/// All three are **endpoint swaps on the quad**, not reflections in texture
+/// space. `Fill_Verts_3D` (A3DDecalEx.cpp:556-576), `Update_Billboard`
+/// (:1110-1130) and the flat branch of `Fill_Verts_2D` all spell them out the
+/// same way:
+///
+/// ```cpp
+/// if (m_bUReverse) { gfx_swap(fU[0], fU[1]); gfx_swap(fU[2], fU[3]); }
+/// if (m_bVReverse) { gfx_swap(fV[0], fV[2]); gfx_swap(fV[1], fV[3]); }
+/// if (m_bUVInterchange) { gfx_swap(fU[0], fV[0]); ... }
+/// ```
+///
+/// The corners here are (top-left, top-right, bottom-left, bottom-right), so the
+/// first two are `uv[0] <-> uv[1]` with `uv[2] <-> uv[3]`. Writing them as
+/// `1 - u` agrees only when the window is the whole texture, which is why the
+/// difference was invisible until a flipbook: on a `TexCol: 2` sheet the cell in
+/// column 0 is `u` in `0..0.5`, and `1 - u` sends the *left* corner to `u = 1`,
+/// i.e. the mirrored cell of the atlas rather than a mirrored card. The ground
+/// branch spells the same rule as an index reversal (`nCol - j`), which is also
+/// what a swap produces once the lattice is interpolated.
+/// The UV rect in the order `Fill_Verts_3D`'s `m_bRotFromView` branch writes it
+/// (`A3DDecalEx.cpp:377-390`).
+///
+/// The local branch pairs `(-fWidth1, +fHeight2)` with `(m_fTexU, m_fTexV)`; the
+/// world-space branch writes `fU = {u, u, u + wid, u + wid}` and
+/// `fV = {v + hei, v, v + hei, v}` against its own corner order, so the rect
+/// arrives as `(u, v + hei)`, `(u, v)`, `(u + wid, v + hei)`, `(u + wid, v)`.
+/// `UReverse`, `VReverse` and `UVInterchange` are all index swaps on those two
+/// arrays, and every swap commutes with a permutation of the corners, so the
+/// flips can stay where they are and only the order changes here.
+fn axial_uv(rect: [[f32; 2]; 4]) -> [[f32; 2]; 4] {
+    [rect[2], rect[0], rect[3], rect[1]]
+}
+
+fn apply_uv_flips(uv: &mut [[f32; 2]; 4], common: &Common) {
     if common.reverse_u {
-        for point in &mut uv {
-            point[0] = 1. - point[0];
-        }
+        uv.swap(0, 1);
+        uv.swap(2, 3);
     }
     if common.reverse_v {
-        for point in &mut uv {
-            point[1] = 1. - point[1];
-        }
+        uv.swap(0, 2);
+        uv.swap(1, 3);
     }
     if common.exchange_uv {
-        for point in &mut uv {
+        for point in uv.iter_mut() {
             point.swap(0, 1);
         }
     }
-    uv
 }
 
 /// The static decal path proved this gate: before version 76 the client always
 /// depth tests, from 76 on `ZEnable` decides.
 fn depth_test(common: &Common, version: u32) -> bool {
     version < 76 || common.depth_test
+}
+
+/// The `Warp: 1` gate every card and strip class passes through.
+///
+/// The queue membership is element state, not decal state: `m_bAddedToWarpQueue`
+/// and `RemoveWarpEle(this)` live on the ELEMENT BASE (`A3DGFXElement.cpp:572-593`)
+/// and every class loads the key (`Warp: %d`, `:820-821`). The particle
+/// classes' fill sources are not in the client corpus, but their records speak
+/// plainly: `绿鬼火2.gfx` authors `Warp: 1` + `TexFile: normalmap\gas.dds` on
+/// its element-121 particle — the same pairing `绿色传送门.gfx` uses on its
+/// warp decal — and the live log caught those particles drawn as 14-unit
+/// additive `normalmap` cards where retail bends what is behind them. The
+/// corpus carries 839 `normalmap` elements at `Warp: 1` and 115 at `Warp: 0`,
+/// so the **key** is the gate and never the texture path: the 115 are ordinary
+/// cards whose art happens to live in a folder called `normalmap`.
+fn skip_warp(context: &ElementContext, stats: &mut Stats) -> bool {
+    if !context.common.warp {
+        return false;
+    }
+    stats.warp += 1;
+    crate::diag_keyed!(
+        EffectDecals,
+        at(context),
+        2000,
+        "{} id={} warp card: AddWarpEle, no normal card (A3DDecalEx.cpp:1332) \
+         texture={}",
+        context.root,
+        context.id,
+        context.common.texture
+    );
+    true
 }
 
 fn push_quad(
@@ -2371,8 +3503,22 @@ fn push_quad(
         return;
     }
     if color[3] < ALPHA_CUTOFF {
+        crate::diag_keyed!(
+            EffectAlpha,
+            format!("{} cut", at(context)),
+            2000,
+            "{} id={} dropped at the cutoff: alpha {:.4} < {} textured={}",
+            context.root,
+            context.id,
+            color[3],
+            ALPHA_CUTOFF,
+            texture
+        );
         return;
     }
+    // Every card of every class passes through here, which is why both the card
+    // and the UV channel are wired at this one funnel instead of in each class.
+    log_card(context, texture, positions, uv, color, out.len());
     out.push(EffectQuad {
         texture: texture.to_string(),
         source_blend: context.common.source_blend,
@@ -2380,11 +3526,158 @@ fn push_quad(
         depth_test: depth_test(context.common, context.version),
         layer: context.common.render_layer,
         priority: context.common.priority,
+        tile: context.common.tile_mode != 0,
         positions,
         uv,
         color,
         mesh: None,
     });
+}
+
+/// The identity a keyed line is filed under: the root, the element, and the
+/// placement's world position.
+///
+/// The position belongs in the key because one root is placed many times — a
+/// grove of forty-nine `树林光束`, a row of torches, several sheets of one
+/// waterfall — and the same element id under the same path is a *different*
+/// billboard at each of them. Keyed by path and id alone every copy collapsed
+/// into one line, so a capture of a grove of beams came back showing one beam
+/// and could not say whether the rest pointed somewhere else.
+/// The rule the axial card's shaft is built with. A process-wide mirror of
+/// `view_settings::EffectShaft`, like the logging mask, so the settings tab can
+/// change it without threading it through every player the owner builds.
+static SHAFT_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(EffectShaft::Client as u8);
+/// Publish the settings tab's choice. Cheap enough to call every frame.
+pub fn set_shaft_mode(mode: EffectShaft) {
+    SHAFT_MODE.store(mode as u8, std::sync::atomic::Ordering::Relaxed);
+}
+fn shaft_mode() -> EffectShaft {
+    match SHAFT_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => EffectShaft::RootDir,
+        2 => EffectShaft::WorldUp,
+        3 => EffectShaft::Horizontal,
+        _ => EffectShaft::Client,
+    }
+}
+
+fn at(context: &ElementContext) -> String {
+    let p = context.placement.w_axis;
+    format!(
+        "{} id={} @{:.0},{:.0},{:.0}",
+        context.root, context.id, p.x, p.y, p.z
+    )
+}
+
+/// The card channel and the UV channel, written from [`push_quad`].
+///
+/// A card line is the whole geometry of one quad: the four corners in the
+/// client's own order, the centre, the two edge lengths and which texture it
+/// draws. That is what a screenshot artefact needs to be matched against the
+/// element table, and what tells a correctly placed card with a wrong basis from
+/// a wrong placement.
+///
+/// A UV line is the window the card samples: the flipbook cell or the tile
+/// repeat is already baked into `uv`, so the line prints the window itself plus
+/// the authored grid and speed it came from.
+fn log_card(
+    context: &ElementContext,
+    texture: &str,
+    positions: [[f32; 3]; 4],
+    uv: [[f32; 2]; 4],
+    color: [f32; 4],
+    index: usize,
+) {
+    if !crate::diagnostics::any() {
+        return;
+    }
+    if crate::diagnostics::enabled(crate::diagnostics::Channel::EffectCards) {
+        let span = |a: [f32; 3], b: [f32; 3]| {
+            let d = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+        let centre = [
+            (positions[0][0] + positions[1][0] + positions[2][0] + positions[3][0]) / 4.,
+            (positions[0][1] + positions[1][1] + positions[2][1] + positions[3][1]) / 4.,
+            (positions[0][2] + positions[1][2] + positions[2][2] + positions[3][2]) / 4.,
+        ];
+        crate::diag_keyed!(
+            EffectCards,
+            format!("{} {}", at(context), texture),
+            2000,
+            "{} id={} #{} tex={} blend={}/{} layer={} prio={} a={:.3} \
+             {:.2}x{:.2} c=({:.2},{:.2},{:.2}) \
+             p0=({:.2},{:.2},{:.2}) p1=({:.2},{:.2},{:.2}) p2=({:.2},{:.2},{:.2}) \
+             p3=({:.2},{:.2},{:.2})",
+            context.root,
+            context.id,
+            index,
+            texture,
+            context.common.source_blend,
+            context.common.destination_blend,
+            context.common.render_layer,
+            context.common.priority,
+            color[3],
+            // The four corners arrive in the client's own order — top-left,
+            // top-right, bottom-left, bottom-right (`quad_corners`) — so the
+            // width is the top edge and the height the *left* edge, `p2 - p0`.
+            // Measuring `p3 - p0` instead reports the diagonal: every card came
+            // out `sqrt(2)` too tall in this channel, which is how a perfectly
+            // square 2 x 2 `主城鱼缸` card was read as "drawn at 0.707, so the
+            // viewer is stretching square cards" in the 9 November notes. It is
+            // not; the log was. `彩虹.gfx` shows it plainly: 234.13 x 107.03
+            // world units, and its authored `17.5 x 8` half extents scaled by
+            // 6.69 are 234.15 x 107.04. The old line printed 140.38.
+            span(positions[0], positions[1]),
+            span(positions[0], positions[2]),
+            centre[0],
+            centre[1],
+            centre[2],
+            positions[0][0],
+            positions[0][1],
+            positions[0][2],
+            positions[1][0],
+            positions[1][1],
+            positions[1][2],
+            positions[2][0],
+            positions[2][1],
+            positions[2][2],
+            positions[3][0],
+            positions[3][1],
+            positions[3][2]
+        );
+    }
+    if crate::diagnostics::enabled(crate::diagnostics::Channel::EffectUv) {
+        let common = context.common;
+        crate::diag_keyed!(
+            EffectUv,
+            format!("{} {}", at(context), texture),
+            1000,
+            "{} id={} #{} tile={} grid={}x{} interval={}ms speed=({:.3},{:.3}) \
+             flips={}{}{} clock={:.0}ms uv=[({:.3},{:.3}),({:.3},{:.3}),({:.3},{:.3}),({:.3},{:.3})]",
+            context.root,
+            context.id,
+            index,
+            common.tile_mode,
+            common.tex_col,
+            common.tex_row,
+            common.tex_interval,
+            common.tex_speed[0],
+            common.tex_speed[1],
+            if common.reverse_u { "U" } else { "" },
+            if common.reverse_v { "V" } else { "" },
+            if common.exchange_uv { "X" } else { "" },
+            context.clock,
+            uv[0][0],
+            uv[0][1],
+            uv[1][0],
+            uv[1][1],
+            uv[2][0],
+            uv[2][1],
+            uv[3][0],
+            uv[3][1]
+        );
+    }
 }
 
 /// Controller 107's `Amplitude` is authored in centimetres, not world units.
@@ -2402,24 +3695,48 @@ fn push_quad(
 /// authored 0.05..5.0, and must never take this conversion.
 const NOISE_CM_PER_UNIT: f32 = 0.01;
 
+/// `_default_sects` in `A3DGFXRing.cpp`: the section count a ring falls back to
+/// when its `Sects` record is zero, which is what the editor writes for "leave
+/// it alone". It is a count of ring segments, so the band is built from this
+/// many quads.
+const DEFAULT_RING_SECTIONS: usize = 36;
+
 /// The stateless classes: sprites, cylinders and grids. Lights belong to
 /// `gfx_light`, models to the model queue and sounds to the audio path; all
 /// three are counted so the status line stays honest.
 fn emit_clock(
     element: &Element,
     context: &ElementContext,
-    face_to_viewer: bool,
     stats: &mut Stats,
     out: &mut Vec<EffectQuad>,
+    drape: Option<GroundSampler<'_>>,
 ) {
     match &element.spec {
-        Spec::Sprite(sprite) => emit_sprite(sprite, context, face_to_viewer, out),
+        Spec::Sprite(sprite) => emit_sprite(sprite, context, stats, out, drape),
         Spec::Cylinder(cylinder) => emit_cylinder(cylinder, context, out),
         Spec::Grid(grid) => emit_grid(grid, context, out),
-        Spec::Light(_) => stats.lights += 1,
+        Spec::Light(_) => {
+            stats.lights += 1;
+            // Lights are published even when world effects are switched off, so
+            // this channel is readable with the graph released.
+            crate::diag_keyed!(
+                EffectLights,
+                at(context),
+                1000,
+                "{} id={} at ({:.2},{:.2},{:.2}) colour={:#010x} alpha={:.3} clock={:.0}ms",
+                context.root,
+                context.id,
+                context.placement.w_axis.x,
+                context.placement.w_axis.y,
+                context.placement.w_axis.z,
+                context.color,
+                context.rgba()[3],
+                context.clock
+            );
+        }
         Spec::Sound(_) => stats.sounds += 1,
         Spec::Model(_) => stats.models += 1,
-        Spec::Curve(curve) => emit_curve(curve, context, out),
+        Spec::Curve(curve) => emit_paraboloid(curve, context, out),
         Spec::Unknown { .. } => stats.unrendered += 1,
         // These classes carry their own runtime and never reach this function.
         Spec::Ribbon(_)
@@ -2435,34 +3752,224 @@ fn emit_clock(
 fn emit_sprite(
     sprite: &Sprite,
     context: &ElementContext,
-    face_to_viewer: bool,
+    stats: &mut Stats,
     out: &mut Vec<EffectQuad>,
+    drape: Option<GroundSampler<'_>>,
 ) {
+    // A `Warp: 1` element is not a card. `A3DDecalEx::Update` (A3DDecalEx.cpp:1332-1336)
+    // ends with
+    //
+    //     if (m_bWarp) { AfxGetGFXExMan()->AddWarpEle(this); return false; }
+    //
+    // so the element is registered with the distortion pass and never enters the
+    // normal render list. 979 shipped elements in 708 roots set the key, 500 of
+    // them on decals (305 element-100, 195 element-101). Drawing them here put a
+    // card on screen where retail only ever bends what is behind it: the gate of
+    // `绿色传送门.gfx` is one of them, a `Warp: 1` element-101 sheet of
+    // `normalmap\gas.dds` at 2.5 x 2.5 units over the portal mouth.
+    //
+    // The viewer has no warp pass, so the honest result is the client's own: no
+    // normal-pipeline card. It is counted rather than silently dropped, because a
+    // root whose only visible part was a warp element now draws nothing and that
+    // has to be readable from the status line.
+    if skip_warp(context, stats) {
+        return;
+    }
     let color = context.rgba();
+    crate::diag_keyed!(
+        EffectAlpha,
+        at(context),
+        500,
+        "{} id={} authored={:#010x} color_scale={:.4} rgba=({:.3},{:.3},{:.3},{:.3}) \
+         cutoff={} size={:.3}x{:.3} origin={:?}",
+        context.root,
+        context.id,
+        context.color,
+        context.color_scale,
+        color[0],
+        color[1],
+        color[2],
+        color[3],
+        ALPHA_CUTOFF,
+        sprite.width,
+        sprite.height,
+        sprite.origin
+    );
     if color[3] < ALPHA_CUTOFF {
         return;
     }
     let Ok(texture) = texture_path(&context.common.texture) else {
+        crate::diag_keyed!(
+            EffectTextures,
+            format!("{} {:?}", at(context), context.common.texture),
+            5000,
+            "{} id={} texture {:?} is not a usable archive path",
+            context.root,
+            context.id,
+            context.common.texture
+        );
         return;
     };
-    // `RotFromView` decides where the orientation comes from: 598 retail sprites
-    // take it from the camera, the other 8,271 keep the authored keypoint
-    // direction, which is what the verified static path does. The root's
-    // `FaceToViewer` forces the camera basis for every sprite in the root.
-    let billboard = sprite.rotate_from_view || face_to_viewer;
-    let basis = if billboard {
+    // The element id picks the vertex builder, and the three decal types are
+    // three different builders. `A3DDecalEx::Update` (A3DDecalEx.cpp:309-321) is
+    // a switch on `m_nEleType` and nothing else:
+    //
+    //     case ID_ELE_TYPE_DECAL_3D:        Update_3D(...)        // 100
+    //     case ID_ELE_TYPE_DECAL_2D:        Update_2D(...)        // 101
+    //     case ID_ELE_TYPE_DECAL_BILLBOARD: Update_Billboard(...) // 102
+    //
+    // so `RotFromView` says nothing about a 101 and `ZOffset` says nothing about
+    // a 100: each key is read by one builder only. The corpus splits 3,542
+    // element-100, 5,244 element-101 and 83 element-102 records, and until now
+    // all three went through the 3D builder.
+    //
+    // 101 is drawn in screen space. `Fill_Verts_2D` (A3DDecalEx.cpp:640-760)
+    // projects the element position, takes the pixel size of one world unit along
+    // the camera's right axis at that depth, and writes those extents straight
+    // into pre-transformed vertices — so the card faces the camera and keeps the
+    // size it would have had in world space. `QuadBasis::Billboard` is that card:
+    // camera right and up, the placement's scale put back on the extents.
+    //
+    // A `RotFromView` card is *not* screen-facing. `Fill_Verts_3D`
+    // (A3DDecalEx.cpp:357-413) keeps its height on the element's own direction
+    // and takes only the width from the view, so a 0.5 x 10 shaft is a thin
+    // streak lying the way the map turned it, not a screen-tall wall. The client
+    // reads the key in the 3D builder only, so a 101 that authors it (55 do) is
+    // still a screen card.
+    // A 102 is the fourth shape and it is built below, not by `quad_corners`:
+    // the name is resolved here so the decal channel still says which builder a
+    // card came from.
+    let basis = if context.id == 101 {
         QuadBasis::Billboard {
             right: context.view.right,
             up: context.view.up,
             forward: context.view.forward,
         }
+    } else if sprite.rotate_from_view {
+        QuadBasis::Axial
     } else {
         QuadBasis::Element
     };
-    let positions = quad_corners(
+    let basis_name = if context.id == 102 {
+        "crossed"
+    } else {
+        basis.name()
+    };
+    // Which of the four branches built the card is exactly what the Logging
+    // tab's decal channel is for: an axial card that should have been a billboard
+    // and a billboard card that should never have been one look the same in a
+    // size.
+    crate::diag_keyed!(
+        EffectDecals,
+        at(context),
+        2000,
+        "{} id={} basis={} shaft={} rot_from_view={} texture={} \
+         origin={:?} z_offset={:.3} clock={:.0}ms",
+        context.root,
+        context.id,
+        basis_name,
+        shaft_mode().token(),
+        sprite.rotate_from_view,
+        texture,
+        sprite.origin,
+        sprite.z_offset,
+        context.clock
+    );
+    // A resolved texture is a fact, not a frame: one line per root, element and
+    // texture. This is the channel that used to fill a folder, six roots at a
+    // time, and hide every other line behind them.
+    crate::diag_keyed!(
+        EffectTextures,
+        format!("{} {}", at(context), texture),
+        5000,
+        "{} id={} texture={} blend={}/{} layer={} prio={} z_enable={}",
+        context.root,
+        context.id,
+        texture,
+        context.common.source_blend,
+        context.common.destination_blend,
+        context.common.render_layer,
+        context.common.priority,
+        context.common.depth_test
+    );
+    // 102 is two crossed quads (`Update_Billboard`, A3DDecalEx.cpp:1059-1170):
+    // `m_nRectNum = 2` at :288, and the eight vertices are (±W, ±H, 0) and
+    // (0, ±H, ±W) — one card in the element's XY plane and one in its ZY plane,
+    // sharing the height axis. Extents are `kp.m_fScale * m_fWidth/m_fHeight`,
+    // half sizes with no `OrgPt` split, and both cards take the same UV rect.
+    if context.id == 102 {
+        let width = context.scale * sprite.width;
+        let height = context.scale * sprite.height;
+        let uv = flipbook_uv(context.common, context.clock);
+        let cards = [
+            [
+                [-width, height, 0.],
+                [width, height, 0.],
+                [-width, -height, 0.],
+                [width, -height, 0.],
+            ],
+            [
+                [0., height, width],
+                [0., height, -width],
+                [0., -height, width],
+                [0., -height, -width],
+            ],
+        ];
+        for corners in cards {
+            let positions = [
+                context
+                    .placement
+                    .transform_point3(corners[0].into())
+                    .to_array(),
+                context
+                    .placement
+                    .transform_point3(corners[1].into())
+                    .to_array(),
+                context
+                    .placement
+                    .transform_point3(corners[2].into())
+                    .to_array(),
+                context
+                    .placement
+                    .transform_point3(corners[3].into())
+                    .to_array(),
+            ];
+            push_quad(out, context, &texture, positions, uv, color);
+        }
+        return;
+    }
+    // A ground sheet is not a card. `Fill_Verts_3D` cuts it into two-unit cells
+    // and asks the terrain for each vertex's own height; everything below is the
+    // flat fallback for the sheets that cannot be draped.
+    if let Some(sampler) = drape {
+        if drape_sprite(sprite, context, &texture, color, sampler, out) {
+            return;
+        }
+    }
+    // The card's extent is `Width x Height` doubled, times the keypoint scale,
+    // times `m_pGfx->GetActualScale()`. That last product is
+    // `m_fDefScale * m_fScale` (`A3DGFXEx::CalcActualScale`, A3DGFXEx.h:197-200)
+    // and the world supplies `m_fScale` itself:
+    //
+    //     // CECOrnamentMan::LoadGFXFromFile, EC_ManOrnament.cpp:950
+    //     A3DMATRIX4 mat = a3d_TransformMatrix(pNode->vDir, pNode->vUp, pNode->vPos);
+    //     pGFX->SetScale(pNode->fScale);
+    //     pGFX->SetParentTM(mat);
+    //
+    // so the ECWLD record's scale does reach the card, through `SetScale` rather
+    // than through the placement matrix — which `SetParentTM` normalizes away
+    // (A3DGFXEx.cpp:1589-1595). The placement here already carries
+    // `DedaultScale * record scale` (see `advance_with_terrain`'s `base`), which
+    // is exactly `GetActualScale()`, so the extents take no further factor.
+    // The centre is the element origin for every builder: `ZOffset` is a
+    // 2D-decal key, and `Fill_Verts_3D` never reads it (`m_fZOffset` appears only
+    // in `Fill_Verts_2D`, A3DDecalEx.cpp:728-735), so pushing the card along the
+    // element's own Z would be an invented offset. The camera-space push below is
+    // the client's.
+    let mut positions = quad_corners(
         context,
         basis,
-        Vec3::new(0., 0., sprite.z_offset),
+        Vec3::ZERO,
         sprite.width,
         sprite.height,
         sprite.origin,
@@ -2470,8 +3977,360 @@ fn emit_sprite(
         context.rotation,
         1.,
     );
-    let uv = flipbook_uv(context.common, context.clock);
+    // `Fill_Verts_2D` does **not** move the card. It pushes a copy of the centre
+    // along `camera->GetDir()` by `m_fZOffset * GetActualScale()` only to project
+    // it and take that projection's `z`:
+    //
+    //     A3DVECTOR3 vZCenter = vCenterWorld
+    //         - pView->GetCamera()->GetDir() * (m_fZOffset * m_pGfx->GetActualScale());
+    //     vZCenter = matVPS * vZCenter;
+    //     vCenter.z = vZCenter.z;
+    //     a_Clamp(vCenter.z, 0.0f, 1.0f);
+    //
+    // The `x`/`y` written into the vertices are `vCenter.x/y`, which the push
+    // never touched, and the extents come from `fScale = (matVPS *
+    // (vCenterWorld + GetRight())).x - vCenter.x`, so neither the screen position
+    // nor the size changes; only the depth does. Shifting the world corners the
+    // way this branch used to shifted the whole card towards the eye, and a
+    // billboard moved closer grows by `depth / (depth - offset)` on screen — an
+    // oversized card where the client draws the same size at a nearer depth.
+    //
+    // `push_toward_eye` reproduces the depth change without the projection the
+    // player does not have: each corner slides along its own eye ray to the
+    // pushed centre's depth, which leaves every projected `x`/`y` exactly where
+    // it was and puts all four corners at the one `vCenter.z` the client writes.
+    //
+    // Neither `Fill_Verts_3D` nor `Update_Billboard` reads the key, so the 42
+    // element-100 records that author a `ZOffset` keep it ignored, exactly as in
+    // the client.
+    let scale = context.placement.x_axis.truncate().length();
+    if context.id == 101 && sprite.z_offset != 0. {
+        let distance = sprite.z_offset * scale;
+        positions = push_toward_eye(positions, context.view, distance);
+    }
+    // `Fill_Verts_3D`'s `m_bRotFromView` branch writes its UV rect in a
+    // different order from the local one: its `fV` array is `{v + hei, v, v +
+    // hei, v}`, so the four corners the branch above returns take
+    // `(u, v + hei)`, `(u, v)`, `(u + wid, v + hei)`, `(u + wid, v)` in that
+    // order. The rect itself is the same, so this is the standard corner set
+    // permuted — `[2], [0], [3], [1]` — and the `UReverse`/`VReverse` swaps
+    // commute with a permutation, which is why `flipbook_uv` can still apply
+    // them before the reorder.
+    let uv = if matches!(basis, QuadBasis::Axial) {
+        axial_uv(flipbook_uv(context.common, context.clock))
+    } else {
+        flipbook_uv(context.common, context.clock)
+    };
     push_quad(out, context, &texture, positions, uv, color);
+}
+
+/// Where an element-101 card's corners go when it authors a `ZOffset`.
+///
+/// The client's `Fill_Verts_2D` (A3DDecalEx.cpp:640-760) measures the depth of
+/// the centre pushed `m_fZOffset * GetActualScale()` along `camera->GetDir()` and
+/// hands that one number to all four vertices in place of `vCenter.z`, clamped to
+/// 0..1:
+///
+/// ```cpp
+/// A3DVECTOR3 vZCenter = vCenterWorld
+///     - pView->GetCamera()->GetDir() * (m_fZOffset * m_pGfx->GetActualScale());
+/// vZCenter = matVPS * vZCenter;
+/// vCenter.z = vZCenter.z;
+/// a_Clamp(vCenter.z, 0.0f, 1.0f);
+/// ```
+///
+/// The `x`/`y` written into the vertices are `vCenter.x/y`, which the push never
+/// touched, and the extents come from `fScale = (matVPS * (vCenterWorld +
+/// GetRight())).x - vCenter.x`, so neither the screen position nor the size
+/// changes — only the depth. Shifting the world corners the way this branch used
+/// to shifted the whole card towards the eye instead, and a billboard moved
+/// closer grows by `depth / (depth - offset)` on screen: an oversized card where
+/// the client draws the same size at a nearer depth.
+///
+/// The client can write that depth straight into the pre-transformed vertex.
+/// Here the corners are world space and the player has no projection matrix, so
+/// the same thing is expressed as a geometry that projects identically: every
+/// corner is moved along **its own ray from the eye** until it reaches the
+/// pushed centre's depth. A pure scale about the eye leaves the projected
+/// `x`/`y` — and therefore the card's screen position and size — exactly where
+/// they were, and puts all four corners at the one depth the client's shared
+/// `vCenter.z` would have given them.
+///
+/// `distance` is `m_fZOffset * GetActualScale()`, in the client's sign: positive
+/// values move the card *towards* the eye, negative ones away from it. A negative
+/// push is honoured — `vCenter.z` simply lands further away, and the eye-ray
+/// construction is unchanged — as long as the card stays in front of the eye.
+fn push_toward_eye(positions: [[f32; 3]; 4], view: &View, distance: f32) -> [[f32; 3]; 4] {
+    if !distance.is_finite() || distance == 0. {
+        return positions;
+    }
+    // The push is measured along the camera direction from the card's centre,
+    // and that one depth is what all four vertices take.
+    let centre = positions
+        .iter()
+        .fold(Vec3::ZERO, |sum, corner| sum + Vec3::from_array(*corner))
+        / 4.;
+    let target = (centre - view.position).dot(view.forward) - distance;
+    // `a_Clamp(vCenter.z, 0, 1)` pins a card pushed past the near plane to the
+    // near plane rather than dropping it; the clip test above it already ran on
+    // the *unpushed* centre. Without the projection there is no near plane to
+    // pin to, so a push that would reach or pass the eye is left alone: the
+    // effect is then drawn where it was, not behind the viewer.
+    let mut moved = positions;
+    for (slot, corner) in moved.iter_mut().enumerate() {
+        let ray = Vec3::from_array(positions[slot]) - view.position;
+        let depth = ray.dot(view.forward);
+        if !(depth > 1e-4) || !(target > 1e-4) {
+            return positions;
+        }
+        *corner = (view.position + ray * (target / depth)).to_array();
+    }
+    moved
+}
+
+/// `A3DDecalEx::Fill_Verts_3D`'s ground branch (`A3DDecalEx.cpp:449-542`),
+/// which is what turns a ground sheet into a piece of the surface.
+///
+/// It is entered only when the element is the 3D decal, sets `MatchGrnd`, does
+/// not set `GrndNormOnly`, and the owner was placed with ground data and sits
+/// within `GROUND_NEAR_DISTANCE` of the surface. The sheet is then laid out in
+/// the **world** XZ plane instead of the element's own plane: column `j` sits at
+/// `-Width1 + j * cell` along world X, row `i` at `Height2 - i * cell` along
+/// world Z, the cell count is the parent-scaled extent over `GROUND_GRID_CELL`
+/// truncated and clamped to `GROUND_MAX_ROW_OR_COL`, and every vertex takes its
+/// own height from the terrain plus the 0.2 lift. The flipbook rect is spread
+/// over the whole lattice rather than repeated per cell. The world X/Z layout is
+/// the `YawEffect 0` case: a sheet that sets the key is built in the element's
+/// own XY plane instead, rotated so its normal lands on world up, and only the
+/// x and z of each vertex are kept — which is the client's `matTran` branch,
+/// reproduced below.
+///
+/// Returns false when the sprite has to stay the flat quad: a sampler that
+/// misses under any lattice point leaves the whole sheet alone, because half a
+/// drape tears, and this path owns no partial mesh to fall back on.
+fn drape_sprite(
+    sprite: &Sprite,
+    context: &ElementContext,
+    texture: &str,
+    color: [f32; 4],
+    sampler: GroundSampler<'_>,
+    out: &mut Vec<EffectQuad>,
+) -> bool {
+    // Element 102 builds its vertices through `Update_Billboard` and 101 is
+    // drawn in screen space; the ground branch only exists on the 3D update.
+    if context.id != 100
+        || !context.common.match_ground
+        || sprite.ground_normal_only
+        || !sampler.near_ground
+    {
+        // Only element 100 was ever a ground candidate: 101 is drawn in screen
+        // space and 102 through `Update_Billboard`, so "flat card" about them is
+        // a line about a branch they never had. The channel used to fill with
+        // them and say nothing about the one element it is named for.
+        if context.id == 100 {
+            crate::diag_keyed!(
+                EffectGround,
+                format!("{} flat", at(context)),
+                2000,
+                "{} id={} flat card: match_ground={} grnd_norm_only={} near_ground={}",
+                context.root,
+                context.id,
+                context.common.match_ground,
+                sprite.ground_normal_only,
+                sampler.near_ground
+            );
+        }
+        return false;
+    }
+    // `fParentScale` scales the extents in the client before the cell count is
+    // worked out. The placement already carries the root and placement scale, so
+    // the offsets below would lose it if they went through the matrix, which is
+    // why the same product the billboard branch reads is taken here.
+    let parent_scale = context.placement.x_axis.truncate().length();
+    let scale_x = (if sprite.no_scale[0] {
+        1.
+    } else {
+        context.scale
+    }) * parent_scale;
+    let scale_y = (if sprite.no_scale[1] {
+        1.
+    } else {
+        context.scale
+    }) * parent_scale;
+    let width1 = sprite.width * 2. * sprite.origin[0] * scale_x;
+    let height0 = sprite.height * 2. * sprite.origin[1] * scale_y;
+    let width2 = sprite.width * 2. * scale_x - width1;
+    let height2 = sprite.height * 2. * scale_y - height0;
+    let width = width1 + width2;
+    let height = height0 + height2;
+    let cells = |extent: f32| -> usize {
+        let count = (extent / GROUND_GRID_CELL) as i32;
+        count.clamp(1, GROUND_MAX_ROW_OR_COL as i32) as usize
+    };
+    let cols = cells(width);
+    let rows = cells(height);
+    let cell_w = width / cols as f32;
+    let cell_h = height / rows as f32;
+    let centre = context.placement.transform_point3(Vec3::ZERO);
+    // The query is a field, not a method: `sampler.height(..)` would look for a
+    // method on the struct, so it is bound first.
+    let height_at = sampler.height;
+    // `m_bYawEffectOnGrndNorm` (A3DDecalEx.cpp:460-486):
+    //
+    //     A3DQUATERNION quad = GetParentDir() * kp.m_vDir;
+    //     A3DVECTOR3 vNewNorm = quad * _unit_z;
+    //     float fAngle = DotProduct(vNewNorm, _unit_y);
+    //     if (fabs(fAngle) <= _grnd_delta) {
+    //         AxisAngleToQuad(CrossProduct(vNewNorm, _unit_y), acosf(fAngle), quad2);
+    //         quad_mix = quad2 * quad;
+    //     } else quad_mix = quad;
+    //     quad_mix.Normalize(); quad_mix.ConvertToMatrix(matTran);
+    //     matTran.SetRow(3, vCenter);
+    //     ...
+    //     A3DVECTOR3 vPos = matTran * A3DVECTOR3(fCol, fRow, 0);
+    //     vert.x = vPos.x; vert.z = vPos.z;
+    //
+    // so with the key the lattice is not world aligned: it is the element's own
+    // XY plane, turned until the sheet's normal (its Z axis) points up, and only
+    // x and z are read back. `AxisAngleToQuad` (A3DQuaternion.cpp:168-181) is the
+    // shortest arc from that normal to +Y built by hand — it does not normalise
+    // the axis, which is why the client gates the branch on the normal being off
+    // the Y axis at all (a quaternion with a zero axis and `cos(0) = 1` is fine,
+    // but the antiparallel case would normalise zero).
+    let yaw = if sprite.yaw_effect {
+        let normal = context.placement.z_axis.truncate().normalize_or_zero();
+        let rotation = Quat::from_mat4(&normalize_basis(context.placement));
+        if normal == Vec3::ZERO {
+            Some(rotation)
+        } else {
+            Some(Quat::from_rotation_arc(normal, Vec3::Y) * rotation)
+        }
+    } else {
+        None
+    };
+    let uv = flipbook_uv(context.common, context.clock);
+    let sample = |i: usize, j: usize| -> Option<([f32; 3], [f32; 2])> {
+        let col = j as f32 * cell_w - width1;
+        let row = height2 - i as f32 * cell_h;
+        let (x, z) = match yaw {
+            Some(rotation) => {
+                let point = rotation * Vec3::new(col, row, 0.);
+                (centre.x + point.x, centre.z + point.z)
+            }
+            None => (centre.x + col, centre.z + row),
+        };
+        let y = height_at(x, z)? + GROUND_DRAPE_LIFT;
+        let fi = i as f32 / rows as f32;
+        let fj = j as f32 / cols as f32;
+        let u = uv[0][0] + (uv[1][0] - uv[0][0]) * fj;
+        let v = uv[0][1] + (uv[2][1] - uv[0][1]) * fi;
+        Some(([x, y, z], [u, v]))
+    };
+    // Sample the whole lattice before emitting anything, so a miss under one
+    // corner cannot leave the rest of the sheet drawn over a hole.
+    let mut lattice = Vec::with_capacity((cols + 1) * (rows + 1));
+    for i in 0..=rows {
+        for j in 0..=cols {
+            let Some(point) = sample(i, j) else {
+                return false;
+            };
+            lattice.push(point);
+        }
+    }
+    for i in 0..rows {
+        for j in 0..cols {
+            let corners = [
+                lattice[i * (cols + 1) + j],
+                lattice[i * (cols + 1) + j + 1],
+                lattice[(i + 1) * (cols + 1) + j],
+                lattice[(i + 1) * (cols + 1) + j + 1],
+            ];
+            let mut positions = [[0f32; 3]; 4];
+            let mut uvs = [[0f32; 2]; 4];
+            for (slot, (position, corner_uv)) in corners.into_iter().enumerate() {
+                positions[slot] = position;
+                uvs[slot] = corner_uv;
+            }
+            push_quad(out, context, texture, positions, uvs, color);
+        }
+    }
+    crate::diag_keyed!(
+        EffectGround,
+        format!("{} drawn", at(context)),
+        2000,
+        "{} id={} draped {:.2}x{:.2} into {}x{} cells of {:.2}x{:.2} at ({:.2},{:.2}) \
+         quads={} surface={:?} lift={}",
+        context.root,
+        context.id,
+        width,
+        height,
+        cols,
+        rows,
+        cell_w,
+        cell_h,
+        centre.x,
+        centre.z,
+        out.len(),
+        height_at(centre.x, centre.z),
+        GROUND_DRAPE_LIFT
+    );
+    true
+}
+
+/// Which rule builds the shaft of a `RotFromView` card.
+///
+/// The client's rule is `RotateVec(GetParentDir() * kp.m_vDir, _unit_z)`
+/// (`A3DDecalEx::Fill_Verts_3D`, A3DDecalEx.cpp:365): the placement's own Z
+/// axis, so a keypoint that turns Z onto the world's Y produces a shaft that
+/// stands up. That is the default and it is what the decal channel reports as
+/// `basis=axial`.
+///
+/// Three rounds of reports said the Archosaur beam and the forest sun-shafts
+/// point the wrong way while the log said the card was built exactly the way
+/// the client builds it, and a log cannot say which of the two is wrong: the
+/// card's size and basis are the same numbers either way. These four modes put
+/// every candidate rule behind one switch, so one build can show all of them in
+/// the same camera and the footage can pick the winner.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum EffectShaft {
+    /// The client's rule: the placement's own Z axis.
+    #[default]
+    Client,
+    /// The root's direction, with the keypoint quaternion taken back out.
+    RootDir,
+    /// World up, for a shaft that should always stand.
+    WorldUp,
+    /// The placement's Z axis flattened into the world's horizontal plane.
+    Horizontal,
+}
+impl EffectShaft {
+    pub const ALL: [Self; 4] = [Self::Client, Self::RootDir, Self::WorldUp, Self::Horizontal];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Client => "Client (placement Z)",
+            Self::RootDir => "Root direction",
+            Self::WorldUp => "World up",
+            Self::Horizontal => "Horizontal",
+        }
+    }
+    /// Persisted spelling and the token the decal channel prints.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::RootDir => "root",
+            Self::WorldUp => "up",
+            Self::Horizontal => "flat",
+        }
+    }
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        match text {
+            "client" => Some(Self::Client),
+            "root" => Some(Self::RootDir),
+            "up" => Some(Self::WorldUp),
+            "flat" => Some(Self::Horizontal),
+            _ => None,
+        }
+    }
 }
 
 /// The four world-space corners of a quad, using the anchor and per-axis
@@ -2482,7 +4341,9 @@ fn emit_sprite(
 #[derive(Clone, Copy)]
 enum QuadBasis {
     /// Camera-facing: the quad spans the given view axes and its 2D spin is
-    /// about the view forward, so it never leaves the screen plane.
+    /// about the view forward, so it never leaves the screen plane. This is the
+    /// element-101 shape — `A3DDecalEx::Fill_Verts_2D` writes pre-transformed
+    /// screen-space vertices, so the card has no world orientation to keep.
     Billboard {
         right: Vec3,
         up: Vec3,
@@ -2491,6 +4352,21 @@ enum QuadBasis {
     /// Element-space: the quad lies in the element's own XY plane and its 2D
     /// spin is about its own Z axis, exactly like the verified static decal.
     Element,
+    /// `RotFromView`: an axial billboard. The card's height stays on the
+    /// element's own direction and only its width turns to the camera.
+    Axial,
+}
+
+impl QuadBasis {
+    /// The name the decal channel prints, so a log line says which of the three
+    /// branches built a card without a `Debug` derive on the payload.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Billboard { .. } => "billboard",
+            Self::Element => "element",
+            Self::Axial => "axial",
+        }
+    }
 }
 
 /// Build the four world-space corners of one quad, in the client's order
@@ -2538,16 +4414,126 @@ fn quad_corners(
         // keypoint transforms, so the corners only need the 2D spin. This is the
         // verified `parent * rotation_translation(direction, position) * local`.
         QuadBasis::Element => {
-            let spin = if rotation == 0. {
-                Mat4::IDENTITY
-            } else {
-                Mat4::from_rotation_z(rotation)
-            };
-            let transform = context.placement * spin;
+            // The spun element matrix of `GetTranMatrix(kp)`: the client's 2D
+            // spin turns the card in its own plane (default axis `_unit_z`), so
+            // this is the same `placement * R_z(rotation)` it always was, now
+            // spelled through the one helper every class shares.
+            let transform = context.element_matrix(Vec3::Z);
             local.map(|corner| transform.transform_point3(corner + center).to_array())
         }
         // A billboard's axes are unit length, so the uniform parent scale they
         // were normalized out of has to be put back on the extents.
+        // `A3DDecalEx::Fill_Verts_3D`'s `m_bRotFromView` branch
+        // (A3DDecalEx.cpp:357-413):
+        //
+        //     A3DVECTOR3 vDir  = RotateVec(GetParentDir() * kp.m_vDir, _unit_z);
+        //     A3DVECTOR3 vView = vPos - pView->GetCamera()->GetPos();
+        //     A3DVECTOR3 vUp   = CrossProduct(vView, vDir); vUp.Normalize();
+        //     verts[1] = vPos + vDir * fHeight2 + vUp * fWidth2;   // (u, v) = (0, 0)
+        //     verts[3] = vPos + vDir * fHeight2 - vUp * fWidth1;   // (1, 0)
+        //     verts[0] = vPos - vDir * fHeight1 + vUp * fWidth2;   // (0, 1)
+        //     verts[2] = vPos - vDir * fHeight1 - vUp * fWidth1;   // (1, 1)
+        //
+        // so the *height* runs along the element's direction, the width along a
+        // view axis that is perpendicular to both the direction and the eye ray,
+        // and the sheet's own `u` runs backwards along that width. The vertices
+        // are world space (`Fill_Verts_3D` returns false), which is why the
+        // owner's scale has to go back onto the extents here exactly as it does
+        // for a plain billboard.
+        QuadBasis::Axial => {
+            let basis_scale = context.placement.x_axis.truncate().length();
+            let world = context.placement.transform_point3(center);
+            let keypoint = context.keypoint_direction;
+            // The client's rule, and it is shorter than what this branch used to
+            // do: `A3DDecalEx::Fill_Verts_3D` (A3DDecalEx.cpp:365) is
+            //
+            //     A3DVECTOR3 vDir = RotateVec(GetParentDir() * kp.m_vDir, _unit_z);
+            //
+            // `GetParentDir()` is the owner's direction quaternion
+            // (`A3DGFXElement::GetParentDir`, A3DGFXElement.cpp:1663-1676, which
+            // is the owner's `m_qDir`) and `kp.m_vDir` is the keypoint's, so
+            // their product is the placement's own rotation and `* _unit_z`
+            // takes its Z axis. The shaft is therefore the placement's Z axis.
+            // Nothing else: no transpose, and no second application of the
+            // keypoint.
+            //
+            // That matters. The first version of this branch multiplied the
+            // *transpose* of the parent by the keypoint direction, which is the
+            // parent's **inverse** rotation. Every shaft was mirrored about its
+            // own centre: the forest's 49 `树林光束` records author directions
+            // like `(0, 0.565, 0.825)` -- 34 degrees up -- and were drawn at the
+            // same angle *down*, which is exactly the "sun rays point in random
+            // directions" the field report describes.
+            let client = context.placement.z_axis.truncate().normalize_or_zero();
+            // `parent` is the placement with the keypoint taken back out, i.e.
+            // the owner's own `GetParentDir`.
+            let parent = context.placement * Mat4::from_quat(keypoint.inverse());
+            let dir = match context.shaft {
+                EffectShaft::Client => client,
+                // The root's own direction, whatever the .gfx keypoint adds on
+                // top of it: what the ecwld record asked for on its own.
+                EffectShaft::RootDir => parent.z_axis.truncate().normalize_or_zero(),
+                EffectShaft::WorldUp => Vec3::Y,
+                // The client axis with its rise removed, so a shaft that should
+                // sweep across the ground stays in the ground plane.
+                EffectShaft::Horizontal => {
+                    let flat = Vec3::new(client.x, 0., client.z);
+                    if flat.length() > 1e-4 {
+                        flat.normalize()
+                    } else {
+                        let root = parent.z_axis.truncate();
+                        Vec3::new(root.x, 0., root.z).normalize_or_zero()
+                    }
+                }
+            };
+            // `vView` runs from the camera *to* the card, so `vUp` points along
+            // `+cross(vView, vDir)`. The sign is not cosmetic: the four corners
+            // below put `fWidth2` on the `+vUp` side, and `fWidth2` is the
+            // *complement* of the `OrgPt` split, so the wrong sign mirrors the
+            // sheet and swaps the two extents on every card whose pivot is off
+            // centre.
+            let side = (world - context.view.position)
+                .cross(dir)
+                .normalize_or_zero();
+            if !dir.is_finite() || !side.is_finite() {
+                return local.map(|_| [0.; 3]);
+            }
+            // The client's `Rad_2D` is *not* read here. `Update_3D`
+            // (A3DDecalEx.cpp:653) sets
+            //
+            //     A3DMATRIX4 matWorld = bLocal ? GetTranMatrix(kp) * GetParentTM()
+            //                                   : _identity_mat4;
+            //
+            // and `GetTranMatrix` (A3DGFXKeyPoint.h:253-259) is the only place a
+            // keypoint's 2D spin is ever applied, so the world-space branch
+            // draws an unspun card. Spinning it about the shaft here -- what
+            // this arm used to do -- is an invented rotation that no client
+            // build applies.
+            //
+            // The four vertices are `Fill_Verts_3D`'s own (A3DDecalEx.cpp:399-402):
+            //
+            //     verts[0] = vPos - vDir * fHeight1 + vUp * fWidth2
+            //     verts[1] = vPos + vDir * fHeight2 + vUp * fWidth2
+            //     verts[2] = vPos - vDir * fHeight1 - vUp * fWidth1
+            //     verts[3] = vPos + vDir * fHeight2 - vUp * fWidth1
+            //
+            // in that order, because `emit_sprite` hands the matching UVs over
+            // in the same order: `(u, v + hei)`, `(u, v)`, `(u + wid, v + hei)`,
+            // `(u + wid, v)`. The corners are the same rectangle as
+            // `QuadBasis::Element`'s, but a report that names a corner has to
+            // find the same corner, and a `UReverse` has to flip the edge the
+            // client flips.
+            let w2 = width * 2. * (1. - origin[0]) * scale_x * basis_scale;
+            let w1 = width * 2. * origin[0] * scale_x * basis_scale;
+            let h2 = height * 2. * (1. - origin[1]) * scale_y * basis_scale;
+            let h1 = height * 2. * origin[1] * scale_y * basis_scale;
+            [
+                (world + side * w2 - dir * h1).to_array(),
+                (world + side * w2 + dir * h2).to_array(),
+                (world - side * w1 - dir * h1).to_array(),
+                (world - side * w1 + dir * h2).to_array(),
+            ]
+        }
         QuadBasis::Billboard { right, up, forward } => {
             let basis_scale = context.placement.x_axis.truncate().length();
             let (right, up) = if rotation == 0. {
@@ -2572,25 +4558,111 @@ fn quad_corners(
 /// the owner's position and orientation and the keypoint scale, which is what
 /// the client multiplies a model's vertices by. Model colour is taken from the
 /// element's keypoint like any other class, through `context.rgba()`.
-fn emit_model(meshes: &[EffectMesh], context: &ElementContext, out: &mut Vec<EffectQuad>) {
+fn emit_model(
+    meshes: &[EffectMesh],
+    write_depth: bool,
+    context: &ElementContext,
+    out: &mut Vec<EffectQuad>,
+) {
+    crate::diag_keyed!(
+        EffectModels,
+        format!(
+            "{} {:?}",
+            at(context),
+            meshes.first().map(|mesh| mesh.texture.as_str())
+        ),
+        5000,
+        "{} id={} meshes={} vertices={} textures={:?} at ({:.2},{:.2},{:.2}) scale={:.3}",
+        context.root,
+        context.id,
+        meshes.len(),
+        meshes.iter().map(|mesh| mesh.vertices.len()).sum::<usize>(),
+        meshes
+            .iter()
+            .map(|mesh| mesh.texture.as_str())
+            .take(4)
+            .collect::<Vec<_>>(),
+        context.placement.w_axis.x,
+        context.placement.w_axis.y,
+        context.placement.w_axis.z,
+        context.scale
+    );
     let color = context.rgba();
     if color[3] < ALPHA_CUTOFF {
         return;
     }
+    // `A3DGFXModel::UpdateModel` draws through
+    // `matScale * GetTranMatrix(kp) * GetParentTM()` (A3DGFXModel.cpp:233), and
+    // `A3DGFXECModel.cpp:352` is the same line for element 230, so a model
+    // element inherits the keypoint's 2D spin like every other class. Until
+    // §58 this path read `context.placement`, which is the one matrix the
+    // client gives *without* `Rad_2D` (the `RotFromView` card wants that), so
+    // every spinning model stood still: the `水族箱_鱼群` shark authors a
+    // `CtrlType: 101` that walks its keypoint spin to 2.960 rad inside the three
+    // seconds the preview samples, and the frames channel printed the value on
+    // 66 of its 105 sampled frames while the mesh never turned.
+    let matrix = context.element_matrix(Vec3::Z);
     for mesh in meshes {
         if mesh.texture.is_empty() || mesh.vertices.len() < 3 {
             continue;
         }
+        let (sdr_scale, sdr_scroll) = match mesh
+            .texture
+           .to_ascii_lowercase()
+           .find(".sdr.")
+           .and_then(|i| mesh.texture[..i].rsplit(['\\', '/']).next())
+           .map(str::trim)
+         {
+           Some("瀑布" | "瀑布细长") => ([1., 1.], [0., -0.5]),
+           Some("青云山小瀑布") => ([0.6, 0.6], [0., -0.5]),
+           Some("池水") => ([0.7, 0.7], [0.004, 0.004]),
+           Some("岩浆") => ([1., 1.], [0., -0.15]),
+           Some("水") => ([1., 1.], [0., 0.10]),
+           Some("血池") => ([1., 1.], [0.001, 0.001]),
+           _ => ([1., 1.], [0., 0.]),
+        };
+        let sdr_t = context.clock * 0.001;
         let placed: Vec<EffectVertex> = mesh
             .vertices
             .iter()
             .map(|vertex| {
-                let position = context
-                    .placement
-                    .transform_point3(Vec3::from_array(vertex.position));
+                // `A3DGFXModel::UpdateModel` builds
+                // `matScale(kp.m_fScale) * GetTranMatrix(kp) * GetParentTM()`, so
+                // a keypoint's own `Scale` multiplies a model exactly as it
+                // multiplies a card. The card path folds it in at
+                // `quad_corners`; this path used to hand the raw vertex to the
+                // placement, which carries the root scale and nothing of the
+                // keypoint — every model element drew at `DefScale x fScale`
+                // whatever its keypoint said. The aquarium's green kelp is the
+                // visible case: `海底植物.SMD` inside `水族箱_水草翠绿` is the
+                // same record as the 15-unit kelp beside it yet framed
+                // 42.77 x 67.47 x 47.28.
+                //
+                // The client scales the whole keypoint matrix, so a keypoint's
+                // own `Position` is scaled too; here the offset stays in
+                // `context.placement` and only the vertices take the scale. The
+                // difference is `(1 - kp) x |Position|` - under a unit for every
+                // root in the corpus, since a model element authors one keypoint
+                // and its offsets are local decoration - and it is the price of
+                // leaving `placement` alone for the children, ground queries and
+                // spans that read it.
+                let position =
+                    matrix.transform_point3(Vec3::from_array(vertex.position) * context.scale);
+                // The placement carries the keypoint scale, which is uniform, so
+                // transforming the normal as a vector and renormalising is the
+                // client's `matScale * tran * parent` applied to it. A zero
+                // normal (`model_asset` writes one for a rigid vertex with no
+                // authored normal) stays zero and keeps the flat element colour.
+                let normal = matrix
+                    .transform_vector3(Vec3::from_array(vertex.normal))
+                    .normalize_or_zero();
                 EffectVertex {
                     position: position.to_array(),
-                    uv: vertex.uv,
+                    uv: [
+                        vertex.uv[0] * sdr_scale[0] + sdr_scroll[0] * sdr_t,
+                        vertex.uv[1] * sdr_scale[1] + sdr_scroll[1] * sdr_t,
+                    ],
+                    normal: normal.to_array(),
                 }
             })
             .filter(|vertex| vertex.position.iter().all(|value| value.is_finite()))
@@ -2605,29 +4677,36 @@ fn emit_model(meshes: &[EffectMesh], context: &ElementContext, out: &mut Vec<Eff
             depth_test: depth_test(context.common, context.version),
             layer: context.common.render_layer,
             priority: context.common.priority,
+            // A model slot is not a `m_bTileMode` card slot; its texture stages
+            // sample with the default WRAP, so it keeps the wrapping sampler.
+            tile: true,
             positions: [[0.; 3]; 4],
             uv: [[0.; 2]; 4],
             color,
             mesh: Some(EffectMesh {
                 texture: mesh.texture.clone(),
                 vertices: placed,
+                write_depth,
+                material: mesh.material,
             }),
         });
     }
 }
 
-/// Load one element-160 model and return its posed meshes as triangle lists.
+/// Load one element-160 model and return the instance that draws it.
 ///
-/// This is the same chain the ECM path uses (`ModelAsset::load_static_skins_with`
-/// then `pose_bind`), driven by the three relative names a `.SMD` carries. It is
-/// deliberately static: the effect archive's skins are bound to 0 or 1 bones, so
-/// there is no animation to sample, and inventing one would be a guess.
+/// This is the same chain the ECM path uses (`load_static_smd_with` then
+/// `pose_bind`), driven by the three relative names a `.SMD` carries, and it now
+/// keeps the action list so the element's `ModelActName` has something to play.
 fn posed_model_meshes(
     path: &str,
     parent: &str,
     fallback_texture: &str,
+    action: &str,
+    loops: i32,
     read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
-) -> Result<Vec<EffectMesh>, String> {
+    assets: &mut std::collections::HashMap<String, std::sync::Arc<crate::model_asset::ModelAsset>>,
+) -> Result<ModelInstance, String> {
     // `ModelPath` already carries the model's own folder and is relative to the
     // archive's `gfx/models/` root, *not* to the GFX file that names it:
     // `gfx/场景/新种族地图/暗语者营地.gfx` authoring `暗语者营地\水晶.SMD`
@@ -2640,6 +4719,9 @@ fn posed_model_meshes(
     } else {
         format!("{parent}/{}", crate::ecmodel::normalize(path))
     };
+    if let Some(asset) = assets.get(&smd_path) {
+        return posed_model_instance(asset.clone(), fallback_texture, action, loops, read);
+    }
     let smd_bytes = read(&smd_path).map_err(|error| format!("{smd_path}: {error}"))?;
     let model = crate::ecmodel::parse_smd(&smd_bytes).map_err(|e| format!("{smd_path}: {e}"))?;
     // `skeleton` and `skins` are bare names relative to the SMD's own folder,
@@ -2658,13 +4740,30 @@ fn posed_model_meshes(
     };
     let skeleton_path = join(&model.skeleton);
     let skins: Vec<String> = model.skins.iter().map(|skin| join(skin)).collect();
-    let asset =
-        crate::model_asset::ModelAsset::load_static_skins_with(&skeleton_path, &skins, |name| {
-            read(name)
-        })?;
+    let asset = std::sync::Arc::new(crate::model_asset::ModelAsset::load_static_smd_with(
+        &smd_path,
+        model,
+        &skeleton_path,
+        &skins,
+        |name| read(name),
+    )?);
+    assets.insert(smd_path.clone(), asset.clone());
+    posed_model_instance(asset, fallback_texture, action, loops, read)
+}
+
+/// The part of [`posed_model_meshes`] a cached rig skips: bind pose, texture
+/// topology and the action clock.
+fn posed_model_instance(
+    asset: std::sync::Arc<crate::model_asset::ModelAsset>,
+    fallback_texture: &str,
+    action: &str,
+    loops: i32,
+    read: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+) -> Result<ModelInstance, String> {
     let posed = asset.pose_bind(Mat4::IDENTITY)?;
+    let mut topology = Vec::with_capacity(posed.len());
     let mut meshes = Vec::with_capacity(posed.len());
-    for piece in posed {
+    for (piece_index, piece) in posed.iter().enumerate() {
         let skin = asset
             .skins
             .get(piece.skin)
@@ -2680,9 +4779,20 @@ fn posed_model_meshes(
         // `血鲷封印台罩子`), and they still carry real geometry — 33 vertices
         // and 108 indices for the claw mark. Dropping them lost the whole model
         // for the roots that name them.
+        // A skin names its maps without a folder, and the archive keeps them in
+        // one of two places: `textures/` beside the skin (2,409 members of the
+        // shipped `gfx.pck`) or a `tex_<stem>/` folder (29 members). Which one a
+        // model uses is per model, so the path has to be probed rather than
+        // assumed: taking the first candidate unconditionally pointed every
+        // `textures/` model at a member that does not exist, and the GPU pass
+        // draws an unreadable texture as a flat white stand-in — the potted
+        // crystal, `盆景火` and their neighbours were white.
         let texture = if mesh.texture >= 0 {
             match skin.texture_paths(mesh.texture as usize) {
-                Ok(paths) => paths[0].clone(),
+                Ok(paths) => paths
+                    .into_iter()
+                    .find(|path| read(path).is_ok())
+                    .unwrap_or_else(|| fallback_texture.to_string()),
                 Err(_) => fallback_texture.to_string(),
             }
         } else {
@@ -2697,6 +4807,39 @@ fn posed_model_meshes(
         } else {
             texture
         };
+        let material = usize::try_from(mesh.material)
+            .ok()
+            .and_then(|index| skin.data.materials.get(index))
+            .map(|material| MeshMaterial {
+                ambient: material.ambient,
+                diffuse: material.diffuse,
+                emissive: material.emissive,
+                specular: material.specular,
+                power: material.power,
+            });
+        // The drawn vertex order with each entry's bind-pose UV. An animated
+        // frame reuses it, so a pose cannot reorder or re-texture the mesh.
+        let order: Vec<(u16, [f32; 2])> = mesh
+            .indices
+            .iter()
+            .filter_map(|index| {
+                let vertex = piece.vertices.get(*index as usize)?;
+                let source = mesh.vertices.get(*index as usize)?;
+                vertex
+                    .position
+                    .iter()
+                    .all(|value| value.is_finite())
+                    .then_some((*index, source.uv))
+            })
+            .collect();
+        if order.len() >= 3 {
+            topology.push(ModelMeshTopology {
+                piece: piece_index,
+                texture: texture.clone(),
+                order,
+                material,
+            });
+        }
         let mut vertices = Vec::with_capacity(mesh.indices.len());
         for index in &mesh.indices {
             let Some(vertex) = piece.vertices.get(*index as usize) else {
@@ -2711,14 +4854,56 @@ fn posed_model_meshes(
             vertices.push(EffectVertex {
                 position: vertex.position,
                 uv: source.uv,
+                normal: vertex.normal,
             });
         }
         if vertices.len() >= 3 {
-            meshes.push(EffectMesh { texture, vertices });
+            // `WriteZ` belongs to the element that draws the mesh, not to the
+            // load-time pose, so it is filled in when `emit_model` wraps these
+            // vertices into quads. The material, by contrast, belongs to the
+            // skin and is fixed here: `A3DSkinModel` shades with the mesh's own
+            // coefficients, scaled by the element diffuse at draw time.
+            meshes.push(EffectMesh {
+                texture,
+                vertices,
+                write_depth: false,
+                material,
+            });
         }
     }
-    Ok(meshes)
+    // `A3DGFXModel::UpdateModel` starts the named action on its first tick:
+    // `pSkinModel->PlayActionByNameDC(m_strActName, m_nLoops, 0)`. `Loops: 0`
+    // makes `A3DSkinModelAction::Play` return at its `!iNumLoop` guard, so such
+    // a model keeps the bind pose it was loaded in.
+    let playback = if action.is_empty() || loops == 0 {
+        None
+    } else {
+        asset
+            .model
+            .actions
+            .iter()
+            .position(|clip| clip.name == action)
+            .and_then(|index| {
+                crate::model_playback::Playback::from_action(&asset, index, loops, 1.).ok()
+            })
+    };
+    Ok(ModelInstance {
+        asset: Some(asset),
+        topology,
+        bind: meshes,
+        playback,
+        carry_ms: 0.,
+        posed: Vec::new(),
+        dirty: false,
+        pose_error: false,
+    })
 }
+
+/// `A3DParaboloid::Build`'s three build constants (A3DParaboloid.cpp:20-24).
+const PARABOLOID_GRID: f32 = 0.1;
+const PARABOLOID_MAX_CIRCLES: usize = 8;
+/// `_segs = 360 / 15`, the ring resolution of the surface of revolution.
+const PARABOLOID_SEGMENTS: usize = 24;
 
 fn emit_cylinder(cylinder: &Cylinder, context: &ElementContext, out: &mut Vec<EffectQuad>) {
     let color = context.rgba();
@@ -2728,7 +4913,18 @@ fn emit_cylinder(cylinder: &Cylinder, context: &ElementContext, out: &mut Vec<Ef
     let Ok(texture) = texture_path(&context.common.texture) else {
         return;
     };
-    let sections = cylinder.sections.max(3) as usize;
+    // `Sects: 0` is not "three sections". `A3DGFXRing::InitStreamBuffer` reads
+    // `if (m_nSects) nSect = m_nSects; else nSect = _default_sects;` and
+    // `_default_sects` is 36, so the zero the editor writes means "the default"
+    // — and it writes it on 1,064 of the corpus's 1,116 element-140 records.
+    // Clamping the zero up to three drew every one of those rings as a
+    // three-sided prism: the city's light rings and the altar bands came out as
+    // angular slabs instead of round bands.
+    let sections = match cylinder.sections {
+        0 => DEFAULT_RING_SECTIONS,
+        count => usize::try_from(count).unwrap_or(DEFAULT_RING_SECTIONS),
+    }
+    .max(3);
     let radius = cylinder.radius
         * if cylinder.no_radius_scale {
             1.
@@ -2744,34 +4940,68 @@ fn emit_cylinder(cylinder: &Cylinder, context: &ElementContext, out: &mut Vec<Ef
     if !(radius.is_finite() && height.is_finite()) || radius <= 0. || height <= 0. {
         return;
     }
+    // `Pitch` tilts the band, and it does so through the radii, not through an
+    // angular offset: `fDeltaRadius = fHalfHeight * tan(pitch)` after
+    // `tan(pitch)` is clamped to `fLimit = m_fRadius / fHalfHeight`, then
+    // `fUppderRadius = m_fRadius - fDeltaRadius` for the upper row and
+    // `fLowerRadius = m_fRadius + fDeltaRadius` for the lower one. The band's
+    // foot is therefore the wider edge and its roof the narrower one, which is
+    // what makes a flat ring texture read as a surface seen at an angle.
+    let half_height = height * 0.5;
+    let (upper_radius, lower_radius) = if half_height > 0. {
+        let limit = radius / half_height;
+        let mut tan = cylinder.pitch.tan();
+        if !tan.is_finite() {
+            tan = limit;
+        }
+        let delta = half_height * tan.clamp(-limit, limit);
+        (radius - delta, radius + delta)
+    } else {
+        (radius, radius)
+    };
     let base_y = if cylinder.origin_at_center {
         -height * 0.5
     } else {
         0.
     };
-    let matrix = context.placement;
+    // `matScale * GetTranMatrix(kp, _unit_y) * GetParentTM()`
+    // (A3DGFXRing.cpp:265, and the editor's `:315`): the ring is the one class
+    // that hands `GetTranMatrix` a non-default axis, and `_unit_y` is its own
+    // axis — the band is built in the local XZ plane — so `Rad_2D` is a yaw of
+    // the whole band. It shows on any ring that authors a `Pitch`, because the
+    // tilt lives in the radii, and therefore turns with it.
+    let matrix = context.element_matrix(Vec3::Y);
     let uv = flipbook_uv(context.common, context.clock);
     let mut positions = [[0f32; 3]; 4];
     for index in 0..sections {
-        let a0 = index as f32 / sections as f32 * std::f32::consts::TAU + cylinder.pitch;
-        let a1 = (index + 1) as f32 / sections as f32 * std::f32::consts::TAU + cylinder.pitch;
+        let a0 = index as f32 / sections as f32 * std::f32::consts::TAU;
+        let a1 = (index + 1) as f32 / sections as f32 * std::f32::consts::TAU;
         let corners = [
-            Vec3::new(a0.cos() * radius, base_y, a0.sin() * radius),
-            Vec3::new(a1.cos() * radius, base_y, a1.sin() * radius),
-            Vec3::new(a1.cos() * radius, base_y + height, a1.sin() * radius),
-            Vec3::new(a0.cos() * radius, base_y + height, a0.sin() * radius),
+            Vec3::new(a0.cos() * lower_radius, base_y, a0.sin() * lower_radius),
+            Vec3::new(a1.cos() * lower_radius, base_y, a1.sin() * lower_radius),
+            Vec3::new(
+                a1.cos() * upper_radius,
+                base_y + height,
+                a1.sin() * upper_radius,
+            ),
+            Vec3::new(
+                a0.cos() * upper_radius,
+                base_y + height,
+                a0.sin() * upper_radius,
+            ),
         ];
         for (slot, corner) in corners.into_iter().enumerate() {
             positions[slot] = matrix.transform_point3(corner).to_array();
         }
-        let u0 = index as f32 / sections as f32;
-        let u1 = (index + 1) as f32 / sections as f32;
-        let strip = [
-            [u0 + uv[0][0], uv[0][1]],
-            [u1 + uv[0][0], uv[1][1]],
-            [u0 + uv[2][0], uv[2][1]],
-            [u1 + uv[2][0], uv[3][1]],
-        ];
+        // `tu = i * m_fTexWid / nSects + m_fTexU`, and the lower row of the
+        // strip carries `tv = m_fTexV + m_fTexHei` while the upper carries
+        // `m_fTexV`.
+        let u_start = uv[0][0];
+        let u_span = uv[1][0] - uv[0][0];
+        let u0 = u_start + u_span * index as f32 / sections as f32;
+        let u1 = u_start + u_span * (index + 1) as f32 / sections as f32;
+        let (v_low, v_high) = (uv[2][1], uv[0][1]);
+        let strip = [[u0, v_low], [u1, v_low], [u1, v_high], [u0, v_high]];
         push_quad(out, context, &texture, positions, strip, color);
     }
 }
@@ -2805,76 +5035,110 @@ fn emit_cylinder(cylinder: &Cylinder, context: &ElementContext, out: &mut Vec<Ef
 /// cross product the builder takes are chosen inside the routine, and this
 /// viewer orients the ribbon across the chord by the view instead. The segment
 /// count and both endpoints are the recovered values.
-fn emit_curve(curve: &Curve, context: &ElementContext, out: &mut Vec<EffectQuad>) {
-    let Ok(texture) = texture_path(&context.common.texture) else {
-        return;
-    };
-    let [first, second] = context.span;
-    let start = context.placement.transform_point3(first);
-    let end = context.placement.transform_point3(second);
-    let chord = end - start;
-    let length = chord.length();
-    if !length.is_finite() || length <= 1e-6 {
-        return;
-    }
-    // Segment count for a constant stretch per segment.
+fn emit_paraboloid(curve: &Curve, context: &ElementContext, out: &mut Vec<EffectQuad>) {
+    // Element 190 is `A3DParaboloid` (A3DGFXElement.cpp:632-633), and its
+    // geometry is a surface of revolution, not a ribbon along the root's `Vec`
+    // pair. `A3DParaboloid::Build` (A3DParaboloid.cpp:113-186, fetched from the
+    // pw152 `GfxCommon` tree) is short enough to reproduce whole:
     //
-    // The count was `(1.0 / length) * coefficient`, which is inverted: it gave
-    // a *longer* chord fewer segments. Its own comment states the invariant it
-    // is meant to hold -- "keeps the stretch per segment constant" -- and
-    // `stretch = length / segments` is `length^2 / coefficient` under that
-    // formula, so it holds for nothing. Any chord longer than the coefficient
-    // collapsed to the one-segment floor and drew the whole beam or trail as a
-    // single billboard stretched across its span, which is the flat smear this
-    // element is visible as. `length / coefficient` makes `stretch` the
-    // coefficient exactly, which is the constant the comment names.
+    //     m_nCircles = int(m_fHeight / _grid_sz);            // _grid_sz = .1
+    //     if (m_nCircles < 1) m_nCircles = 1;
+    //     else if (m_nCircles > _max_circles) m_nCircles = 8;
+    //     float fGrdSz = m_fHeight / m_nCircles;
+    //     float fRadius = sqrt(m_fCoefficient * i * fGrdSz);
+    //     ver.x = fRadius * fCos[j];  ver.y = fRadius * fSin[j];  ver.z = fGrdSz * i;
+    //     ver.tu = fUC + fTexX * fCos[j];   ver.tv = fVC - fTexY * fSin[j];
     //
-    // `Coeff` is authored 1.0 on every corpus element 190 (the parser defaults
-    // it there), so a 10-unit beam is ten quads and a 40-unit beam forty, and
-    // the 256 cap still bounds the worst case. The count remains an inference:
-    // the client's builder at the element-190 routine was never read, only the
-    // endpoints and the degenerate-chord gate.
-    let segments = (length / curve.coefficient.max(1e-3)).clamp(1.0, 256.0) as usize;
-    let segments = segments.max(1);
-    let uv = flipbook_uv(context.common, context.clock);
-    let color = rgba(context.color, context.color_scale);
+    // with `_segs = 360 / 15 = 24` and the UVs measured from the *centre* of the
+    // window (`fUC = m_fTexWid * .5`, `fVC = m_fTexHei * .5`) stepping by
+    // `m_fTexWid * .5 / m_nCircles` per circle. So the sheet is a bowl whose
+    // radius grows as the square root of the height above its foot, its axis is
+    // the element's local **Z**, and its texture is a disc wrapped around that
+    // axis.
+    //
+    // The old branch here built a 0.5-wide strip from the *root's* `Vec:` pair —
+    // data element 190 does not own — which is why the floating city's bowls
+    // were either an unrelated smear or, with no `Vec` pair in the file, nothing
+    // at all: `水柱.gfx` reports `elements=3 quads=0`.
+    let color = context.rgba();
     if color[3] < ALPHA_CUTOFF {
         return;
     }
-    // Half-width across the chord, in the plane the camera sees.
-    let across = {
-        let side = chord.cross(context.view.forward);
-        if side.length_squared() > 1e-9 {
-            side.normalize()
-        } else {
-            chord.cross(context.view.up).normalize_or_zero()
-        }
+    let Ok(texture) = texture_path(&context.common.texture) else {
+        return;
     };
-    let half = (curve.height.max(0.) * 0.5) * context.scale;
-    let mut positions = [[0f32; 3]; 4];
-    for step in 0..segments {
-        let a = step as f32 / segments as f32;
-        let b = (step + 1) as f32 / segments as f32;
-        let (p0, p1) = (start + chord * a, start + chord * b);
-        let corners = [
-            p0 - across * half,
-            p1 - across * half,
-            p0 + across * half,
-            p1 + across * half,
+    // `Build` works in the element's own units and only `FillVertexBuffer`'s
+    // `matWorld = mat.Scale(kp.m_fScale) * ...` applies the keypoint scale, so
+    // the circle count and the radii are computed from the authored values and
+    // the finished point is scaled once.
+    let (height, coefficient) = (curve.height, curve.coefficient);
+    if !(height.is_finite() && coefficient.is_finite()) || height <= 0. || coefficient <= 0. {
+        return;
+    }
+    let circles = (height / PARABOLOID_GRID)
+        .floor()
+        .clamp(1., PARABOLOID_MAX_CIRCLES as f32);
+    let circles = circles as usize;
+    let grid = height / circles as f32;
+    let local_scale = context.scale;
+    if !local_scale.is_finite() || local_scale <= 0. {
+        return;
+    }
+    let uv = flipbook_uv(context.common, context.clock);
+    let (u_base, u_span) = (uv[0][0], uv[1][0] - uv[0][0]);
+    let (v_base, v_span) = (uv[0][1], uv[2][1] - uv[0][1]);
+    let tex_x_step = u_span * 0.5 / circles as f32;
+    let tex_y_step = v_span * 0.5 / circles as f32;
+    // `A3DParaboloid::FillVertexBuffer` builds `mat * GetTranMatrix(kp) *
+    // GetParentTM()` (A3DParaboloid.cpp:201), and the default spin axis is
+    // `_unit_z` — the bowl's own axis, since its surface of revolution runs
+    // along local Z.
+    let matrix = context.element_matrix(Vec3::Z);
+    let vertex = |ring: usize, seg: usize| -> (Vec3, [f32; 2]) {
+        let angle = std::f32::consts::TAU / PARABOLOID_SEGMENTS as f32 * seg as f32;
+        let radius = (coefficient * ring as f32 * grid).max(0.).sqrt();
+        let height = grid * ring as f32;
+        let point = Vec3::new(radius * angle.cos(), radius * angle.sin(), height) * local_scale;
+        let uv = [
+            u_base + u_span * 0.5 + tex_x_step * ring as f32 * angle.cos(),
+            v_base + v_span * 0.5 - tex_y_step * ring as f32 * angle.sin(),
         ];
-        for (slot, corner) in corners.into_iter().enumerate() {
-            positions[slot] = corner.to_array();
+        (point, uv)
+    };
+    for ring in 0..circles {
+        for seg in 0..PARABOLOID_SEGMENTS {
+            let (a, ua) = vertex(ring, seg);
+            let (b, ub) = vertex(ring, seg + 1);
+            let (c, uc) = vertex(ring + 1, seg);
+            let (d, ud) = vertex(ring + 1, seg + 1);
+            let positions = [a, b, c, d].map(|point| matrix.transform_point3(point).to_array());
+            push_quad(out, context, &texture, positions, [ua, ub, uc, ud], color);
         }
-        push_quad(out, context, &texture, positions, uv, color);
     }
 }
-
 fn emit_grid(grid: &Grid, context: &ElementContext, out: &mut Vec<EffectQuad>) {
     let Ok(texture) = texture_path(&context.common.texture) else {
         return;
     };
-    let matrix = context.placement;
-    let uv = flipbook_uv(context.common, context.clock);
+    // `A3DGridDecalEx.cpp:445`/`:477` build `GetTranMatrix(kp) * GetParentTM()`,
+    // default axis `_unit_z`, so a grid sheet takes the keypoint spin like any
+    // other class.
+    let matrix = context.element_matrix(Vec3::Z);
+    // A grid decal is a class of its own (`A3DGridDecalEx`, ids 210/211) and it
+    // scrolls its sheet from `TexSpeed` whatever `TexRow`/`TexCol` say: the
+    // curtain fixtures author `TexRow: 1`, `TexCol: 1`, `TexSpeed: -0.4`, and a
+    // 1x1 sheet has no cells to step. `flipbook_uv`'s tile branch is already
+    // that rule — `A3DGFXElement::TexAnimation`'s `if (m_bTileMode)` arm steps
+    // `m_fTexU`/`m_fTexV` by `TexSpeed * dt` — so the rect it returns is the
+    // scrolled window and this function must not add the offset again. Adding
+    // it did: 163 of the 216 corpus grids author both `TileMode: 1` and a
+    // `TexSpeed`, and every one of them flowed at exactly twice its authored
+    // rate (the city's `水片*` water sheets, the `云` lattices, every curtain).
+    //
+    // The offset is a tile-only quantity, so a `TileMode: 0` grid takes none:
+    // the 49 such grids in the corpus author no `TexSpeed` either, and the
+    // client's `else` arm moves cells by `TexInterval`, never by `TexSpeed`.
+    let rect = flipbook_uv(context.common, context.clock);
     let mut positions = [[0f32; 3]; 4];
 
     // A grid is a lattice of `columns * rows` **vertices**, not cells: all 216
@@ -2899,6 +5163,15 @@ fn emit_grid(grid: &Grid, context: &ElementContext, out: &mut Vec<EffectQuad>) {
     } else {
         (grid.columns, grid.rows)
     };
+    // `A3DGridDecalEx::_setUVCoord` spreads **one** texture rect across the whole
+    // lattice: U from `m_fTexU` in `m_nWidthVertNum - 1` steps and V from
+    // `m_fTexV` in `m_nHeightVertNum - 1` steps. Handing every cell the whole
+    // rect instead tiled the sheet once per row — a 2x4 curtain repeated the
+    // image three times down its height and restarted the `TexSpeed` scroll at
+    // every row boundary, which reads as three stacked copies sliding over each
+    // other rather than one sheet flowing.
+    let (u_start, v_start) = (rect[0][0], rect[0][1]);
+    let (u_span, v_span) = (rect[1][0] - rect[0][0], rect[2][1] - rect[0][1]);
     for row in 0..span_z {
         for col in 0..span_x {
             let index = (row * grid.columns + col) as usize;
@@ -2908,8 +5181,12 @@ fn emit_grid(grid: &Grid, context: &ElementContext, out: &mut Vec<EffectQuad>) {
             // One flat colour per quad: the corner with the lowest index wins.
             // A vertex that fades to transparent therefore still draws while
             // any of its neighbours is opaque, which keeps the top of a curtain
-            // solid and stops only the fully transparent foot.
-            let color = rgba(*value, context.color_scale);
+            // solid and stops only the fully transparent foot. The quad colour
+            // is the vertex colour *times* the keypoint colour, exactly as
+            // `_setColorComposed` composes it; using the vertex colour alone
+            // dropped the tint every artist applies through the keypoint and
+            // left white sheets where the client draws cyan water.
+            let color = grid_rgba(*value, context.color, context.color_scale);
             if color[3] < ALPHA_CUTOFF {
                 continue;
             }
@@ -2933,6 +5210,11 @@ fn emit_grid(grid: &Grid, context: &ElementContext, out: &mut Vec<EffectQuad>) {
             for (slot, corner) in corners.into_iter().enumerate() {
                 positions[slot] = matrix.transform_point3(corner).to_array();
             }
+            let ua = u_start + u_span * col as f32 / span_x as f32;
+            let ub = u_start + u_span * (col + 1) as f32 / span_x as f32;
+            let va = v_start + v_span * row as f32 / span_z as f32;
+            let vb = v_start + v_span * (row + 1) as f32 / span_z as f32;
+            let uv = [[ua, va], [ub, va], [ua, vb], [ub, vb]];
             push_quad(out, context, &texture, positions, uv, color);
         }
     }
@@ -2949,11 +5231,17 @@ fn emit_particles(
     stats: &mut Stats,
     out: &mut Vec<EffectQuad>,
 ) {
+    // A `Warp: 1` element is registered with the distortion pass, not drawn
+    // (`skip_warp`); the class makes no difference.
+    if skip_warp(context, stats) {
+        return;
+    }
     stats.emitters += 1;
     let Emitter {
         particles,
         carry,
         rng,
+        average,
         ramps,
     } = emitter;
     let quota = if particle.quota > 0 {
@@ -2976,7 +5264,7 @@ fn emit_particles(
             })
         });
         for _ in 0..count {
-            particles.push(spawn(particle, path, rng, context));
+            particles.push(spawn(particle, path, rng, average, context));
         }
     }
     if dt > 0. {
@@ -2992,6 +5280,86 @@ fn emit_particles(
         });
     }
     stats.particles += particles.len();
+    let billboard = !particle.is_3d;
+    // The keypoint scale is *not* part of every particle. `Fill_Vert_3D`
+    // (A3DParticleSystemEx.cpp:945-960) sizes a 3D quad as
+    //
+    //     float fScale = p->m_fScale + p->m_fScaleNoise;
+    //     fWidth = m_fWidth * fScale;            // no keypoint
+    //     ...
+    //     if (m_bFacing) { fScale = kp.m_fScale * fParentScale;
+    //                      fWidth *= fScale; }   // keypoint only here
+    //
+    // while `Fill_Vert_2D` (:1241) reads all three at once,
+    //
+    //     float fScale = (p->m_fScale + p->m_fScaleNoise) * fParentScale * kp.m_fScale;
+    //
+    // so a camera-facing (2D) particle and a `Facing` 3D one take the keypoint
+    // and a plain 3D one does not. Multiplying every particle by it - what this
+    // path did - inflated a 3D emitter's quads by `kp` wherever the file authored
+    // a keypoint below one.
+    let sized_scale = if billboard || particle.facing != 0 {
+        context.scale
+    } else {
+        1.
+    };
+    let sized = ElementContext {
+        scale: sized_scale,
+        ..*context
+    };
+
+    // Spawns, deaths and the live count together: a particle that never dies is
+    // a leak and one that dies at once is invisible, and the two read the same
+    // in a single number.
+    crate::diag_keyed!(
+        EffectParticles,
+        at(context),
+        500,
+        "{} id={} live={} quota={} rate={:.2}/s ttl={:.2}s size={:.3}x{:.3} \
+         origin={:?} 3d={} billboard={} dir=({:.2},{:.2},{:.2}) speed={:.2} \
+         acc={:.2} angle={:.2} ground={} surface={} bind={} area={:?} radius={:?} \
+         scales={:.3}..{:.3} kp={:.3} root={:.3} world={:.2}x{:.2}",
+        context.root,
+        context.id,
+        particles.len(),
+        quota,
+        particle.emission_rate,
+        particle.ttl,
+        particle.width,
+        particle.height,
+        particle.origin,
+        particle.is_3d,
+        !particle.is_3d,
+        particle.initial_direction.x,
+        particle.initial_direction.y,
+        particle.initial_direction.z,
+        particle.speed,
+        particle.particle_acc,
+        particle.angle,
+        particle.start_on_ground,
+        particle.is_surface,
+        particle.is_bind,
+        particle.area_size,
+        particle.radius,
+        // What the quads actually measure. `Fill_Vert_3D`
+        // (A3DParticleSystemEx.cpp:945-960) sizes a plain 3D particle from
+        // `Width * m_fScale * GetActualScale` and reads the keypoint scale only
+        // under `m_bFacing`; `Fill_Vert_2D` (:1241) multiplies all three. The
+        // `size=` pair above is the particle's own half width, so a report about
+        // an oversized emitter has to read this line instead.
+        particle.scale_min.min(particle.scale_max),
+        particle.scale_max.max(particle.scale_min),
+        sized_scale,
+        context.placement.x_axis.truncate().length(),
+        2. * particle.width.max(particle.height)
+            * particle.scale_max.max(particle.scale_min)
+            * sized_scale
+            * context.placement.x_axis.truncate().length(),
+        2. * particle.width.max(particle.height)
+            * particle.scale_min.min(particle.scale_max)
+            * sized_scale
+            * context.placement.x_axis.truncate().length()
+    );
 
     let tint = context.rgba();
     if tint[3] < ALPHA_CUTOFF {
@@ -3000,7 +5368,6 @@ fn emit_particles(
     let Ok(texture) = texture_path(&context.common.texture) else {
         return;
     };
-    let billboard = !particle.is_3d;
     let uv = flipbook_uv(context.common, context.clock);
     for state in particles.iter() {
         let color = [
@@ -3023,7 +5390,7 @@ fn emit_particles(
             oriented_basis(context, state.direction)
         };
         let positions = quad_corners(
-            context,
+            &sized,
             QuadBasis::Billboard {
                 right,
                 up,
@@ -3090,6 +5457,194 @@ fn travel_uv(state: &ParticleState, particle: &Particle) -> [[f32; 2]; 4] {
     [[0., travel], [1., travel], [0., 1.], [1., 1.]]
 }
 
+/// `IsAvgGen` walk state, one per emitter.
+///
+/// The average-generation walk visits the emitter's shell or its curve in a
+/// fixed sequence instead of at random, so a slow emitter still covers the
+/// whole shape. Each emitter class carries its own step registers and resets
+/// them only in `Resume()` — `A3DCylinderEmitter::Resume` zeroes `m_fAngleAlpha`
+/// and `m_nCurrentBeta` (A3DCylinderEmitter.cpp), `A3DEllipsoidEmitter::Resume`
+/// zeroes `m_fAngleAlpha`/`m_fAngleBeta` (A3DEllipsoidEmitter.cpp), and
+/// `A3DCurveEmitter::Resume` zeroes `m_fEmitterStep` (A3DCurveEmitter.cpp). No
+/// `TickAnimation` or keypoint loop touches them: the walk persists across an
+/// element's `RepeatCount` plays and only a Stop/Start of the whole GFX (a fresh
+/// player here) begins it again, which is what makes the coverage *average*
+/// rather than one arc per loop.
+#[derive(Clone, Copy, Debug, Default)]
+struct AverageWalk {
+    /// `m_fAngleAlpha` in both shell walks.
+    alpha: f32,
+    /// `A3DCylinderEmitter::m_nCurrentBeta`, the ring index of its z walk.
+    ring: u32,
+    /// `A3DEllipsoidEmitter::m_fAngleBeta`.
+    beta: f32,
+    /// `A3DCurveEmitter::m_fEmitterStep`.
+    step: f32,
+}
+
+/// `A3DCylinderEmitter::GenAverage`, reproduced line for line.
+///
+/// The client builds `vInitPos(0, 1, 1)` with `vInitPos.z = 1 - 2 *
+/// (m_nCurrentBeta / m_nBetaSegNum)` and rotates it about Z by `m_fAngleAlpha`,
+/// then scales by the ranges times a fresh `_UnitRandom()` — drawn even when
+/// `m_bSurface` discards it for 1 — and only then advances the walk:
+/// `alpha += 2pi / AlphaSeg`, and `alpha > 2pi` zeroes alpha and steps the ring.
+/// `m_nCurrentBeta > m_nBetaSegNum` restarts the whole walk. The client divides
+/// by the authored segment counts whatever they are; a zero is guarded to one
+/// here so a damaged record emits somewhere instead of dividing by zero.
+fn cylinder_average(
+    walk: &mut AverageWalk,
+    alpha_segments: u32,
+    beta_segments: u32,
+    ranges: Vec3,
+    surface: bool,
+    rng: &mut Rng,
+) -> Vec3 {
+    let alpha_segments = alpha_segments.max(1) as f32;
+    let beta_segments = beta_segments.max(1);
+    let z = 1. - 2. * (walk.ring as f32 / beta_segments as f32);
+    let sample = Quat::from_rotation_z(walk.alpha) * Vec3::new(0., 1., z);
+    let ratio = rng.unit();
+    let offset = sample * ranges * if surface { 1. } else { ratio };
+    walk.alpha += std::f32::consts::TAU / alpha_segments;
+    if walk.alpha > std::f32::consts::TAU {
+        walk.alpha = 0.;
+        walk.ring += 1;
+    }
+    if walk.ring > beta_segments {
+        walk.alpha = 0.;
+        walk.ring = 0;
+    }
+    offset
+}
+
+/// `A3DEllipsoidEmitter::GenAverage`, reproduced line for line.
+///
+/// `vInitPos(0, 1, 0)` turns about X by `m_fAngleBeta` and then about Y by
+/// `m_fAngleAlpha`; the walk advances alpha by `2pi / AlphaSeg` and beta by
+/// `pi / BetaSeg` with the client's own wrap: at `beta == 0` it steps beta
+/// instead of alpha, `alpha > 2pi` finishes a ring, and `beta + betaDelta / 2 >
+/// pi` restarts mid-ring exactly as the source does.
+fn ellipsoid_average(
+    walk: &mut AverageWalk,
+    alpha_segments: u32,
+    beta_segments: u32,
+    ranges: Vec3,
+    surface: bool,
+    rng: &mut Rng,
+) -> Vec3 {
+    let alpha_segments = alpha_segments.max(1) as f32;
+    let beta_segments = beta_segments.max(1) as f32;
+    let sample = Quat::from_rotation_y(walk.alpha) * (Quat::from_rotation_x(walk.beta) * Vec3::Y);
+    let ratio = rng.unit();
+    let offset = sample * ranges * if surface { 1. } else { ratio };
+    let alpha_delta = std::f32::consts::TAU / alpha_segments;
+    let beta_delta = std::f32::consts::PI / beta_segments;
+    if walk.beta.abs() < f32::EPSILON {
+        walk.alpha = 0.;
+        walk.beta += beta_delta;
+    } else {
+        walk.alpha += alpha_delta;
+        if walk.alpha > std::f32::consts::TAU {
+            walk.alpha = 0.;
+            walk.beta += beta_delta;
+        } else if walk.beta + beta_delta * 0.5 > std::f32::consts::PI {
+            walk.alpha = 0.;
+            walk.beta = 0.;
+        }
+    }
+    offset
+}
+
+/// `A3DCurveEmitter`'s `genNextStep`: the step the average walk advances to
+/// after placing a particle. `InitParticle` places at `m_fEmitterStep` and only
+/// then assigns `m_fEmitterStep = genNextStep(m_bIsAvgGensequentially,
+/// m_fEmitterStep, m_nSegmentNum > 1 ? m_nSegmentNum : 1)`. Sequential walks
+/// add `1 / AvgGenSeg` and wrap past one; the random variant draws a fresh
+/// segment index — kept as the client's integer truncation.
+fn curve_average_next(current: f32, sequential: bool, segments: u32, rng: &mut Rng) -> f32 {
+    let segments = segments.max(1) as f32;
+    let step_size = 1. / segments;
+    let next = if sequential {
+        current + step_size
+    } else {
+        ((rng.unit() * segments) as u32 as f32) * step_size
+    };
+    if next > 1. {
+        0.
+    } else {
+        next
+    }
+}
+
+/// The `IsAvgGen` walk's spawn position, or `None` when this class has no
+/// average walk and the ordinary samplers should decide.
+///
+/// Id 123 (the ellipsoid) and id 124 (the cylinder) walk their shells through
+/// `ellipsoid_average` / `cylinder_average`. The curve emitter — the one class whose walk leaves the
+/// origin — identifies itself with `AvgGenSeg`, the field only its parser
+/// writes; it walks the generation keypoint's `Path` control at
+/// `A3DCurveEmitter::genNextStep`'s parameter and offsets a disc of `Radius`
+/// about the curve tangent, `m_bSurface` taking the full radius and a volume
+/// walk scaling it by a fresh random ratio (`A3DCurveEmitter::InitParticle`,
+/// which likewise calls `GenDirection` afterwards).
+fn average_sample(
+    particle: &Particle,
+    path: Option<&[Vec3]>,
+    walk: &mut AverageWalk,
+    rng: &mut Rng,
+    ranges: Vec3,
+    id: u32,
+) -> Option<Vec3> {
+    let surface = particle.is_surface;
+    match id {
+        124 => Some(cylinder_average(
+            walk,
+            particle.alpha_segments.unwrap_or(0),
+            particle.beta_segments.unwrap_or(0),
+            ranges,
+            surface,
+            rng,
+        )),
+        123 => Some(ellipsoid_average(
+            walk,
+            particle.alpha_segments.unwrap_or(0),
+            particle.beta_segments.unwrap_or(0),
+            ranges,
+            surface,
+            rng,
+        )),
+        _ => {
+            let segments = particle.average_generation_segments?;
+            let points = path?;
+            if points.len() < 2 {
+                return None;
+            }
+            // Place at the current step, then advance — `InitParticle` reads
+            // `m_fEmitterStep` into the interp point before `genNextStep`.
+            let step = walk.step;
+            walk.step = curve_average_next(
+                step,
+                particle.is_average_generation_sequence.unwrap_or(false),
+                segments,
+                rng,
+            );
+            // The client interpolates the curve at the step parameter; the
+            // parsed control is a point polyline here, so the parameter maps to
+            // the same even arc-length fraction the random branch draws.
+            let (point, tangent) = sample_path(points, step * path_length(points));
+            let radius = particle.radius.unwrap_or(0.);
+            if radius <= 1e-3 {
+                return Some(point);
+            }
+            let disc_radius = if surface { radius } else { radius * rng.unit() };
+            let angle = rng.unit() * std::f32::consts::TAU;
+            let disc = Quat::from_axis_angle(tangent, angle) * tangent.any_orthonormal_vector();
+            Some(point + disc * disc_radius)
+        }
+    }
+}
+
 /// Create one particle. Every randomized value is the container's own range
 /// (`ScaleMin..ScaleMax`, `RotMin..RotMax`, `ColorMin..ColorMax`), drawn through
 /// the same emitter vtable slots the client calls from its emit routine
@@ -3099,6 +5654,7 @@ fn spawn(
     particle: &Particle,
     path: Option<&[Vec3]>,
     rng: &mut Rng,
+    walk: &mut AverageWalk,
     context: &ElementContext,
 ) -> ParticleState {
     // `IsSurface` selects a per-class sampler, and the classes do not agree on
@@ -3157,13 +5713,41 @@ fn spawn(
         1.
     };
     let half = particle.area_size.unwrap_or(Vec3::ZERO) * (0.5 * basis_scale);
-    let (offset, inward) = if particle.is_surface {
+    // `IsAvgGen` — records that authorize the average-generation walk get the
+    // class's fixed shell or curve sequence instead of the random samplers
+    // (`AverageWalk`). `Inward: 0` records on the walk still get the ordinary
+    // cone: both client `InitParticle` implementations call `GenDirection`
+    // after `GenAverage`, so the walk fixes the position only.
+    let average = if particle.is_average_generation.unwrap_or(false) {
+        average_sample(particle, path, walk, rng, half, context.id)
+    } else {
+        None
+    };
+    let (offset, inward) = if average.is_some() {
+        (Vec3::ZERO, None)
+    } else if particle.is_surface {
         match context.id {
             123 => {
+                // `ID_ELE_TYPE_PARTICLE_ELLIPSOID` is 123 (A3DGFXElement.h) and
+                // `A3DEllipsoidEmitter::GenSurface` samples the unit sphere and
+                // then sets `m_vMoveDir = -v`. The ellipsoid is the class that
+                // emits inward; its `InitParticle` never calls `GenDirection`
+                // on this branch, so the sampler is the last word on the
+                // direction — which is what the birth flow at `0x727ec2` shows
+                // too: id 123's sampler writes node+0x44 itself and nothing
+                // overwrites it.
                 let sample = surface_direction(rng);
                 (sample * half, Some(-sample))
             }
-            124 => (cylinder_sample(rng) * half, None),
+            124 => {
+                // `ID_ELE_TYPE_PARTICLE_CYLINDER` is 124, and
+                // `A3DCylinderEmitter::GenSurface` is a point of the unit
+                // circle in XY with a symmetric Z, scaled componentwise by the
+                // ranges — `(cos, sin, z)`, not a sphere point. Its birth flow
+                // (`0x729ba1`) calls the direction slot afterwards
+                // (`0x729bc1`), so the cone applies.
+                (cylinder_sample(rng) * half, None)
+            }
             121 => (box_surface_sample(rng, half), None),
             120 => {
                 // One draw, and the direction is the position: the client builds
@@ -3174,12 +5758,28 @@ fn spawn(
             }
             _ => (volume_offset(particle, rng, basis_scale), None),
         }
+    } else if context.id == 124 {
+        // `A3DCylinderEmitter::GenTotal` rejects until `x*x + y*y <= 1` and keeps
+        // a symmetric Z, so its volume is a cylinder; the shared ball sampler
+        // would spill particles outside the authored radius.
+        (cylinder_volume_sample(rng) * half, None)
     } else {
+        // `A3DEllipsoidEmitter::GenTotal` rejects until `x*x + y*y + z*z <= 1`
+        // — exactly the shared ball sampler — and ends with
+        // `GenDirection(pParticle->m_vMoveDir)`, so the cone applies to a
+        // volume ellipsoid as it does to the other volume paths. Only the
+        // surface branch writes `m_vMoveDir` itself, and it writes the negated
+        // sample; a volume particle does not "stay where it is born".
         (volume_offset(particle, rng, basis_scale), None)
     };
-    let position = match path {
-        Some(points) => sample_path(points, rng.unit() * path_length(points)).0 + offset,
-        None => offset,
+    let position = match average {
+        // The walk writes the position outright: the curve walk replaces the
+        // random path sample as well as the emitter offset.
+        Some(position) => position,
+        None => match path {
+            Some(points) => sample_path(points, rng.unit() * path_length(points)).0 + offset,
+            None => offset,
+        },
     };
     let direction = match inward {
         Some(direction) => direction,
@@ -3371,6 +5971,20 @@ fn cylinder_sample(rng: &mut Rng) -> Vec3 {
     let tau = std::f32::consts::TAU;
     let turned = Quat::from_axis_angle(Vec3::Z, rng.unit() * tau) * Vec3::X;
     turned.with_z(rng.signed())
+}
+
+/// `A3DCylinderEmitter::GenTotal`: three symmetric draws per attempt, rejected
+/// until the XY pair lands inside the unit disc. `z` is drawn before the test in
+/// the client too, so the draw order is x, y, z per attempt.
+fn cylinder_volume_sample(rng: &mut Rng) -> Vec3 {
+    loop {
+        let x = rng.signed();
+        let y = rng.signed();
+        let z = rng.signed();
+        if x * x + y * y <= 1. {
+            return Vec3::new(x, y, z);
+        }
+    }
 }
 
 /// Id 120's surface direction, in the emitter's frame, from a single draw.
@@ -3831,7 +6445,24 @@ fn emit_ribbon(
     stats: &mut Stats,
     out: &mut Vec<EffectQuad>,
 ) {
+    // A `Warp: 1` element is registered with the distortion pass, not drawn
+    // (`skip_warp`); the class makes no difference.
+    if skip_warp(context, stats) {
+        return;
+    }
     stats.ribbons += 1;
+    crate::diag_keyed!(
+        EffectTrails,
+        format!("{} ribbon", at(context)),
+        1000,
+        "{} id={} ribbon/wave segments={} colour={:#010x} alpha={:.3} clock={:.0}ms",
+        context.root,
+        context.id,
+        ribbon.vertices.len(),
+        context.color,
+        context.rgba()[3],
+        context.clock
+    );
     let color = context.rgba();
     if color[3] < ALPHA_CUTOFF {
         return;
@@ -3863,12 +6494,17 @@ fn emit_ribbon(
     while ribbon.carry >= interval && emitted < MAX_SEGMENTS {
         ribbon.carry -= interval;
         emitted += 1;
+        // `A3DTrail.cpp:560-565` builds `matTran = GetTranMatrix(kpSelf) *
+        // GetTranMatrix(kp)` and `A3DLtnTrail.cpp:172` `GetTranMatrix(kp) *
+        // GetParentTM()`, so the pair of rails a frame emits is spun with the
+        // keypoint's 2D rotation (default `_unit_z`) before it is world space.
+        let matrix = context.element_matrix(Vec3::Z);
         ribbon.vertices.push(RibbonVertex {
-            position: context.placement.transform_point3(rails.0),
+            position: matrix.transform_point3(rails.0),
             age: 0.,
         });
         ribbon.vertices.push(RibbonVertex {
-            position: context.placement.transform_point3(rails.1),
+            position: matrix.transform_point3(rails.1),
             age: 0.,
         });
         if ribbon.vertices.len() > MAX_SEGMENTS * 2 {
@@ -3917,16 +6553,191 @@ fn emit_ribbon(
     }
 }
 
+/// `_inner_tick` and `_tex_delta` from `A3DLtnTrail.cpp:13-14`.
+const LTN_TRAIL_TICK_MS: f32 = 40.;
+const LTN_TRAIL_TEX_DELTA: f32 = 0.2;
+/// `AddPoint` never lets the list grow past three cross-sections: it drops the
+/// head whenever more than one is stored, then pushes a midpoint and an end.
+const LTN_TRAIL_POINTS: usize = 3;
+
+/// One `LTNTRAIL_DATA` of `A3DLtnTrail`: the two authored rail positions, the
+/// centre they were interpolated from, the remaining life and the texture `U`.
+#[derive(Clone, Copy, Debug)]
+struct LtnPoint {
+    rail1: Vec3,
+    rail2: Vec3,
+    center: Vec3,
+    life: f32,
+    u: f32,
+}
+
+#[derive(Clone, Debug)]
+struct LtnTrailState {
+    points: Vec<LtnPoint>,
+    carry: f32,
+    rng: Rng,
+}
+
+/// Element 180, `A3DLtnTrail`. This is *not* the accumulating ribbon element 110
+/// draws: it keeps at most three cross-sections and rebuilds them every 40 ms,
+/// inserting a midpoint between the last centre and the current one that is
+/// pushed off the travel direction by a random amount in `[MinAmp, MaxAmp]`
+/// (`A3DLtnTrail::AddPoint`, `A3DLtnTrail.cpp:264-333`):
+///
+///     vAmp = RotateVec(A3DQUATERNION(vDir, _UnitRandom()*A3D_2PI), CalcVertVec(vDir));
+///     vAmp *= m_fMinAmp + (m_fMaxAmp - m_fMinAmp) * _UnitRandom();
+///     vInter += vAmp;
+///
+/// The `U` of each cross-section advances by `_tex_delta` (0.2) and wraps, and
+/// `FillVertexBuffer` (`:336-410`) writes `tu = ld.m_fU` on both rails with
+/// `tv` 0 and 1 — so the texture runs *along* the trail and across the rails,
+/// the opposite way round from element 110. Alpha is the keypoint alpha times
+/// `m_nSegLife / SegLife`, which is the age fade.
+fn emit_ltn_trail(
+    state: &mut LtnTrailState,
+    element: &Element,
+    context: &ElementContext,
+    dt: f32,
+    stats: &mut Stats,
+    out: &mut Vec<EffectQuad>,
+) {
+    stats.ribbons += 1;
+    let Spec::Wave(spec) = &element.spec else {
+        return;
+    };
+    let color = context.rgba();
+    if color[3] < ALPHA_CUTOFF {
+        return;
+    }
+    let Ok(texture) = texture_path(&context.common.texture) else {
+        return;
+    };
+    let life = spec.segment_life.max(1.);
+    let dt_ms = dt * 1000.;
+    // `TickAnimation`: every stored cross-section loses the frame delta, and the
+    // oldest run of expired entries is dropped in one go (`:177-192`).
+    for point in &mut state.points {
+        point.life -= dt_ms;
+    }
+    if let Some(index) = state.points.iter().position(|point| point.life <= 0.) {
+        state.points.drain(0..=index);
+    }
+    // `while (dwTickTime > _inner_tick) InnerTick(_inner_tick)`, then the
+    // remainder — so a 16 ms frame adds nothing and a 100 ms frame adds two.
+    state.carry += dt_ms;
+    let mut guard = 0;
+    while state.carry >= LTN_TRAIL_TICK_MS && guard < 64 {
+        state.carry -= LTN_TRAIL_TICK_MS;
+        guard += 1;
+        ltn_trail_add_point(state, spec, context);
+    }
+    if state.points.len() < 2 {
+        return;
+    }
+    let mut positions = [[0f32; 3]; 4];
+    for index in 0..state.points.len() - 1 {
+        let a = state.points[index];
+        let b = state.points[index + 1];
+        let alpha = color[3] * (a.life / life).clamp(0., 1.);
+        if alpha < ALPHA_CUTOFF {
+            continue;
+        }
+        for (slot, point) in [a.rail1, a.rail2, b.rail2, b.rail1].into_iter().enumerate() {
+            positions[slot] = point.to_array();
+        }
+        // `tu` is the cross-section's own `U` on both rails; `tv` spans them.
+        let strip = [[a.u, 0.], [a.u, 1.], [b.u, 1.], [b.u, 0.]];
+        push_quad(
+            out,
+            context,
+            &texture,
+            positions,
+            strip,
+            [color[0], color[1], color[2], alpha],
+        );
+    }
+}
+
+/// `A3DLtnTrail::AddPoint`. The client slerps a rotation and applies it to the
+/// authored rails; this interpolates the rails themselves, which is the same
+/// motion for the rigid placements the corpus authors and keeps the jitter in
+/// one shared offset. Everything else — the head drop, the midpoint, the
+/// amplitude draw and the wrapped `U` — is the client's order of operations.
+fn ltn_trail_add_point(state: &mut LtnTrailState, spec: &Wave, context: &ElementContext) {
+    // `A3DLtnTrail.cpp:172` adds each point through `GetTranMatrix(kp)`, which
+    // carries the keypoint's 2D spin on the default `_unit_z`.
+    let placement = context.element_matrix(Vec3::Z);
+    let rail1 = placement.transform_point3(spec.positions.first().copied().unwrap_or(Vec3::ZERO));
+    let rail2 = placement.transform_point3(spec.positions.get(1).copied().unwrap_or(Vec3::ZERO));
+    let center = placement.transform_point3(Vec3::ZERO);
+    let life = spec.segment_life.max(0.);
+    if state.points.is_empty() {
+        state.points.push(LtnPoint {
+            rail1,
+            rail2,
+            center,
+            life,
+            u: 0.,
+        });
+        return;
+    }
+    if state.points.len() > 1 {
+        state.points.remove(0);
+    }
+    let Some(last) = state.points.last().copied() else {
+        return;
+    };
+    let portion = state.rng.unit();
+    let direction = (center - last.center).normalize_or_zero();
+    let min_amp = spec.amplitudes.first().copied().unwrap_or(0.05);
+    let max_amp = spec.amplitudes.get(1).copied().unwrap_or(min_amp);
+    let amplitude = min_amp + (max_amp - min_amp) * state.rng.unit();
+    let jitter = rotate_about(
+        calc_vert_vec(direction),
+        direction,
+        state.rng.unit() * std::f32::consts::TAU,
+    ) * amplitude;
+    let middle = last.center.lerp(center, portion) + jitter;
+    let mut middle_u = last.u + LTN_TRAIL_TEX_DELTA;
+    if middle_u > 1. {
+        middle_u -= 1.;
+    }
+    let mut end_u = middle_u + LTN_TRAIL_TEX_DELTA;
+    if end_u > 1. {
+        end_u -= 1.;
+    }
+    state.points.push(LtnPoint {
+        rail1: last.rail1.lerp(rail1, portion) + jitter,
+        rail2: last.rail2.lerp(rail2, portion) + jitter,
+        center: middle,
+        life,
+        u: middle_u,
+    });
+    state.points.push(LtnPoint {
+        rail1,
+        rail2,
+        center,
+        life,
+        u: end_u,
+    });
+    // `AddPoint` can leave one extra entry behind on the frame it drops the head;
+    // `Render` only ever sees `GetRenderCount()` of them, and three is the cap.
+    while state.points.len() > LTN_TRAIL_POINTS {
+        state.points.remove(0);
+    }
+}
+
 /// The trail's per-frame ring update, `0x713e90`. Element 152 shares the fractal
 /// strip geometry with element 150, but which vertices are live is decided here.
 ///
-/// `isappend` picks between two paths, and the corpus uses both: 138 of the 156
-/// trail elements author 1 and 18 author 0. Clear, and `0x713ed4` rebuilds the
-/// ring to exactly the authored vertex count whenever it is not already full,
-/// every record born that frame with age 0, and no aging pass ever runs — a
-/// permanent static strip. Set, and `0x713ebc` calls the append pass `0x714030`
-/// followed by the aging pass `0x713f60`, so vertices are laid down over time and
-/// then expire.
+/// Two conditions pick the path, not one. `A3DGFXLightningEx::TickAnimation`
+/// (`:198-218`) appends only `if (m_bCurvedMethod && m_bIsAppendly)`; in every
+/// other case — `isappend` clear **or** no curve-move control on the first
+/// keypoint — the list is refilled to `m_nVertPairNum` points at full life and no
+/// aging pass ever runs, which is a permanent static strip. `TickAdd` (`:240-260`)
+/// then lays one vertex down per `m_nTimeSpan / m_nVertPairNum` milliseconds and
+/// `TickList` (`:219-238`) ages every record and drops the oldest run once
+/// `istaildisappear` is set.
 fn update_trail(
     fractal: &mut FractalState,
     trail: &Trail,
@@ -3936,30 +6747,44 @@ fn update_trail(
 ) {
     let life = trail.vertices_life.max(0.);
     let ring = &mut fractal.trail;
-    if !trail.is_append {
+    // `A3DGFXLightningEx::TickAnimation` (`A3DGFXLightningEx.cpp:198-218`): the
+    // append path runs only when the element is in *curved method* **and**
+    // `isappend` is set:
+    //
+    //     if (m_bCurvedMethod && m_bIsAppendly) { TickAdd(dwTickTime); TickList(dwTickTime); }
+    //     else if (m_lstCurvePoints.GetDataCount() != m_nVertPairNum) { ...refill... }
+    //
+    // `m_bCurvedMethod` is not a file key: `A3DGFXLightning::InitBuf` sets it when
+    // the first keypoint carries a curve-move control (CtrlType 110, `Point`).
+    // Without one the strip is simply refilled to `m_nVertPairNum` points at full
+    // life every frame, whatever `isappend` says.
+    let curved = element.keypoints.first().is_some_and(|key| {
+        key.controls
+            .iter()
+            .any(|control| matches!(&control.data, ControlData::Path { .. }))
+    });
+    if !trail.is_append || !curved {
         ring.fill(segments, life);
         return;
     }
-    // `0x714030` lays one vertex down per `interval / count` milliseconds. That
-    // interval is `*(*(trail+0x28)+0x34)`: two dereferences through a field that
-    // is only ever read in this region and never written, so the object owning it
-    // is not identified and the number cannot be quoted. The element's own
-    // authored duration is the closest recoverable equivalent — it is the window
-    // the keypoints give this element, and 140 of the 156 corpus trails author a
-    // finite one.
+    // `TickAdd` lays one vertex down per `m_nTimeSpan / m_nVertPairNum`
+    // milliseconds, where the divisor is the strip's **vertex pair count**
+    // `Segs * LightNum + 1` (`A3DGFXLightning::InitBuf`), not `Segs`. A zero step
+    // means the author asked for more vertices than the element has milliseconds;
+    // `TickAdd` returns without laying anything down, so the refill above stands.
+    let pairs = segments.max(1) * trail.fractal.light_number as usize + 1;
     let interval = match element.duration_ms() {
         Some(interval) if interval > 0. => interval,
-        // The other 16 run a forever keypoint, so no rate can be recovered for
-        // them, and one of those asks to append. Inventing a rate would either
-        // freeze the trail or make it expire and never return, so these fall back
-        // to the static strip the non-append path builds — which is what they
-        // drew before this pass as well.
+        // A forever keypoint has no `TimeSpan` to divide, and `TickAdd` would
+        // divide by zero: those trails stay the static strip.
         _ => {
             ring.fill(segments, life);
             return;
         }
     };
-    if segments == 0 {
+    let step = interval / pairs as f32;
+    if step <= 0. {
+        ring.fill(segments, life);
         return;
     }
     // element+0x314 accumulates the frame delta; `0x714067` needs it strictly
@@ -3968,15 +6793,13 @@ fn update_trail(
     // `0x713e90` ages the ring and runs the expiry pass afterwards whatever the
     // append did, so a fully laid trail still fades away.
     ring.accumulator += dt_ms;
-    let step = interval / segments as f32;
-    if ring.laid < segments && ring.accumulator > step {
-        // `0x714072`: as many vertices as the accumulated time covers, clamped to
-        // the authored count at `0x714088`, and the accumulator keeps the
-        // remainder (`0x71409d`), so a long frame lays several vertices instead
-        // of one.
+    if ring.laid < pairs && ring.accumulator > step {
+        // As many vertices as the accumulated time covers, clamped to the
+        // authored count, with the remainder kept, so a long frame lays several
+        // vertices instead of one.
         let steps = (ring.accumulator / step) as usize;
         let before = ring.laid;
-        ring.laid = (ring.laid + steps).min(segments);
+        ring.laid = (ring.laid + steps).min(pairs);
         ring.accumulator %= step;
         for index in before..ring.laid {
             ring.push(TrailVertex {
@@ -4047,7 +6870,27 @@ fn emit_fractal(
     stats: &mut Stats,
     out: &mut Vec<EffectQuad>,
 ) {
+    // A `Warp: 1` element is registered with the distortion pass, not drawn
+    // (`skip_warp`); the class makes no difference.
+    if skip_warp(context, stats) {
+        return;
+    }
     stats.ribbons += 1;
+    crate::diag_keyed!(
+        EffectTrails,
+        format!("{} fractal", at(context)),
+        1000,
+        "{} id={} fractal/trail records={} laid={} offsets={} colour={:#010x} alpha={:.3} \
+         clock={:.0}ms",
+        context.root,
+        context.id,
+        fractal.trail.records.len(),
+        fractal.trail.laid,
+        fractal.offsets.len(),
+        context.color,
+        context.rgba()[3],
+        context.clock
+    );
     let color = context.rgba();
     if color[3] < ALPHA_CUTOFF {
         return;
@@ -4069,31 +6912,88 @@ fn emit_fractal(
     let segments = spec.segments.max(2) as usize;
     let quad_count = segments - 1;
     let interval = spec.interval.max(1) as f32;
+    // `A3DGFXLightning::FillVertexBuffer` places the strip with
+    // `matTran = GetTranMatrix(kp) * GetParentTM()` (A3DGFXLightning.cpp:857) and
+    // `BuildPath` takes the same matrix (`:1157`), so the path's jitter and its
+    // two authored ends live in one spun frame — the default `_unit_z`.
+    let matrix = context.element_matrix(Vec3::Z);
     fractal.timer += dt * 1000.;
     if fractal.timer >= interval || fractal.offsets.len() != segments + 1 {
         fractal.timer = 0.;
         fractal.offsets.clear();
+        // `A3DGFXLightning::BuildPath` puts the noise on the **perpendicular**
+        // of the path and nowhere else (`A3DGFXLightning.cpp:1005-1052`):
+        //
+        //     A3DVECTOR3 vUp(CalcVertVec(vDir));
+        //     m_pData[0][i] = j / fSegs;                        // along the path
+        //     m_pData[1][i] = fRand[0] * A3D_2PI;               // twist about it
+        //     m_pData[2][i] = filter(m_nFilterType, i/fSegs, fRand[1]);
+        //
+        // and `FillVertexBuffer` (`:888-905`) places the cross-section at
+        //
+        //     vPos = vStart + vDir*(m_pData[0][i]*fDist)
+        //           + RotateVec(A3DQUATERNION(vDir, m_pData[1][i]), vUp)
+        //             * (m_pData[2][i] * m_fAmplitude);
+        //
+        // The two authored ends take the `nMod == 0` / `nMod == m_nSegs`
+        // branches, which use `vStart` and `vEnd` verbatim, so a lightning
+        // ribbon starts and stops exactly on `StartPos`/`EndPos`.
+        //
+        // This used to displace every cross-section — ends included — along the
+        // fixed world diagonal `(1, 0.5, 0.25)` and scale it by the *first*
+        // `Amplitude` (the Perlin's own amplitude, 2 in the corpus) instead of
+        // the second one (`Amplitude`, the ribbon displacement). A `Fractal`
+        // therefore left its own plane, drifted the same way on every rebuild,
+        // and reached several world units on effects whose authored excursion is
+        // one: the sheets hanging off trees and the blobs drifting across the
+        // floating city.
+        let axis = {
+            let delta = spec.end_position - spec.start_position;
+            if delta.length_squared() > 1e-12 {
+                delta.normalize()
+            } else {
+                Vec3::Z
+            }
+        };
+        let up = calc_vert_vec(axis);
+        let seed = fractal.rng.next_u32();
         for index in 0..=segments {
+            if index == 0 || index == segments {
+                fractal.offsets.push(Vec3::ZERO);
+                continue;
+            }
             let t = index as f32 / segments as f32;
-            let sample = fbm(
-                fractal.rng.next_u32(),
-                t * spec.wave_length.max(1e-3),
-                spec.noise_wave_length.max(1e-3),
+            let shape = fbm(
+                seed,
+                t * spec.noise_wave_length.max(1e-3),
+                spec.wave_length.max(1e-3),
                 spec.persistence,
                 spec.octaves.max(1) as usize,
                 spec.buffer_length,
             );
-            fractal.offsets.push(
-                Vec3::new(sample, sample * 0.5, sample * 0.25)
-                    * spec.noise_amplitude
-                    * context.scale,
+            let twist = fbm(
+                seed ^ 0x9e37_79b9,
+                t * spec.noise_wave_length.max(1e-3),
+                spec.wave_length.max(1e-3),
+                spec.persistence,
+                spec.octaves.max(1) as usize,
+                spec.buffer_length,
             );
+            // The first four keys of a 150 record (`BufLen`, `Amplitude`,
+            // `WaveLen`, `Persistence`, `OctaveNum`) belong to `m_NoiseCtrl`,
+            // which `Load` reads before the ribbon keys (`:421`), so the noise
+            // value already carries the *first* `Amplitude`; the second one is
+            // the ribbon's own displacement.
+            let amount =
+                lightning_filter(spec.filter, t, shape) * spec.noise_amplitude * spec.amplitude;
+            let offset =
+                rotate_about(up, axis, twist * std::f32::consts::TAU) * (amount * context.scale);
+            fractal.offsets.push(matrix.transform_vector3(offset));
         }
     }
     if let Some(trail) = trail {
         update_trail(fractal, trail, element, dt * 1000., segments);
     }
-    let matrix = context.placement;
     let start = matrix.transform_point3(spec.start_position);
     let end = matrix.transform_point3(spec.end_position);
     let mut axis = end - start;
@@ -4128,7 +7028,27 @@ fn emit_fractal(
             context.view.right
         }
     };
-    let uv = flipbook_uv(context.common, context.clock);
+    let (win_u, win_v, win_w, win_h) = tex_window(context.common, context.clock);
+    // The client's strip UV (`A3DGFXLightning.cpp:835-836, 928-959`): **u runs
+    // along the strip's length and v across its width**, the mirror of the card
+    // fills. Per vertex pair i —
+    //
+    //     float fRatio = (float)i / (nRenderCount - 1);    // length position
+    //     float fU = m_fTexWid * (m_bUReverse ? 1.0f - fRatio : fRatio) + m_fTexU;
+    //
+    // and the pair's two vertices share that u while v picks the side (`:928-936`):
+    //
+    //     if (m_bVReverse) { v1 = m_fTexV; v2 = m_fTexV + m_fTexHei; }
+    //     else             { v1 = m_fTexV + m_fTexHei; v2 = m_fTexV; }
+    //     // v1 fills vPos - vViewUp, v2 fills vPos + vViewUp
+    //
+    // with `m_bUVInterchange` swapping u and v per vertex (`:939-945`).
+    // `nRenderCount = m_nSegs * m_nLightNum + 1` (`InitBuf`, `:89`) and the
+    // pairs step the whole path, so pair i sits at t = i / (nRenderCount - 1) —
+    // the same `t0`/`t1` this loop gives each quad edge. Adding `t` to the
+    // across-width u instead — what this strip used to do — sheared every
+    // sheet: the logged 血鲷封印台罩子闪电 quad corners read
+    // (0,0),(1,0),(0.033,1),(1.033,1).
     let mut positions = [[0f32; 3]; 4];
     // Element 152 draws only the ring's live records, oldest first, each still
     // carrying its place in the authored strip; element 150 has no ring and draws
@@ -4150,8 +7070,18 @@ fn emit_fractal(
         let t1 = (index + 1) as f32 / segments as f32;
         let a = start.lerp(end, t0) + fractal.offsets[index];
         let b = start.lerp(end, t1) + fractal.offsets[index + 1];
-        let width0 = spec.width_at(t0).max(0.) * context.scale * 0.5;
-        let width1 = spec.width_at(t1).max(0.) * context.scale * 0.5;
+        // The width law (`A3DGFXLightning.cpp:810-811`, `UpdateVerts`):
+        //
+        //     float fScale = m_pGfx->GetActualScale() * kp.m_fScale;
+        //     float fWidthStart = m_fWidthStart * fScale;
+        //
+        // and the pair's vertices sit at `vPos -+ vViewUp` with
+        // `|vViewUp| = fWidthStart` (`:871-872`), so `Width` is a HALF-width:
+        // the strip spans `2 * Width * scale`. The extra `* 0.5` that used to
+        // stand here halved every lightning — the 0.04-0.07-unit
+        // 血鲷封印台罩子闪电 cards the live log reported.
+        let width0 = spec.width_at(t0).max(0.) * context.scale;
+        let width1 = spec.width_at(t1).max(0.) * context.scale;
         let alpha0 = spec.alpha_at(t0);
         let mut alpha1 = spec.alpha_at(t1);
         // A trail's tail disappears over its authored fade; a fractal ribbon
@@ -4166,21 +7096,52 @@ fn emit_fractal(
         if alpha < ALPHA_CUTOFF {
             continue;
         }
-        let corners = [
-            a - normal * width0,
-            a + normal * width0,
-            b + normal * width1,
-            b - normal * width1,
-        ];
+        let corners = match trail.map_or(0, |t| t.render_side) {
+            1 => [
+                a,
+                a + normal * (2. * width0),
+                b + normal * (2. * width1),
+                b,
+            ],
+            2 => [
+                a - normal * (2. * width0),
+                a,
+                b,
+                b - normal * (2. * width1),
+            ],
+            _ => [
+                a - normal * width0,
+                a + normal * width0,
+                b + normal * width1,
+                b - normal * width1,
+            ],
+        };
         for (slot, corner) in corners.into_iter().enumerate() {
             positions[slot] = corner.to_array();
         }
-        let strip = [
-            [uv[0][0] + t0, uv[0][1]],
-            [uv[1][0] + t0, uv[1][1]],
-            [uv[2][0] + t1, uv[2][1]],
-            [uv[3][0] + t1, uv[3][1]],
+        let u_at = |t: f32| win_u + win_w * if context.common.reverse_u { 1. - t } else { t };
+        let v_minus = if context.common.reverse_v {
+            win_v
+        } else {
+            win_v + win_h
+        };
+        let v_plus = if context.common.reverse_v {
+            win_v + win_h
+        } else {
+            win_v
+        };
+        // Corner 0/3 are the `-vViewUp` vertices, 1/2 the `+vViewUp` ones.
+        let mut strip = [
+            [u_at(t0), v_minus],
+            [u_at(t0), v_plus],
+            [u_at(t1), v_plus],
+            [u_at(t1), v_minus],
         ];
+        if context.common.exchange_uv {
+            for point in strip.iter_mut() {
+                point.swap(0, 1);
+            }
+        }
         push_quad(
             out,
             context,
@@ -4203,6 +7164,11 @@ fn emit_bolts(
     stats: &mut Stats,
     out: &mut Vec<EffectQuad>,
 ) {
+    // A `Warp: 1` element is registered with the distortion pass, not drawn
+    // (`skip_warp`); the class makes no difference.
+    if skip_warp(context, stats) {
+        return;
+    }
     stats.ribbons += 1;
     let dt_ms = dt * 1000.;
     bolts.timer += dt_ms;
@@ -4210,11 +7176,11 @@ fn emit_bolts(
     if bolts.timer >= interval {
         bolts.timer = 0.;
         bolts.segments.clear();
-        let direction = context
-            .placement
-            .transform_vector3(Vec3::Y)
-            .normalize_or_zero();
-        let origin = context.placement.transform_point3(Vec3::ZERO);
+        // The bolt grows along the element's local Y through `GetTranMatrix(kp)`
+        // (A3DGFXLightning.cpp:857), spin included.
+        let matrix = context.element_matrix(Vec3::Z);
+        let direction = matrix.transform_vector3(Vec3::Y).normalize_or_zero();
+        let origin = matrix.transform_point3(Vec3::ZERO);
         for _ in 0..bolt.bolts_per_interval.max(1) {
             grow_bolt(
                 bolts,
@@ -4353,9 +7319,13 @@ mod tests {
     /// move every frame.
     #[test]
     fn a_grid_builds_its_authored_sheet_and_scrolls_it() {
+        // `gfx/场景/瀑布.gfx` authors `TileMode: 1` beside the 1x1 atlas, and it
+        // writes both scroll lines — U 0, then V -0.4. The fixture omitted the
+        // flag and kept only one line, which `common()` reads as the U half, so
+        // the sheet looked like a grid that needs a scroll of its own.
         let grid = "GFXELEMENTID: 210\nName: curtain\nSrcBlend: 5\nDestBlend: 2\n\
-                   TexFile: 物体\\waterfall.dds\nTexRow: 1\nTexCol: 1\n\
-                   TexSpeed: -0.400000\nwNumber: 2\nhNumber: 4\n\
+                   TexFile: 物体\\waterfall.dds\nTileMode: 1\nTexRow: 1\nTexCol: 1\n\
+                   TexSpeed: 0.000000\nTexSpeed: -0.400000\nwNumber: 2\nhNumber: 4\n\
                    -58.299149 35.844849 9.029253\ndwColor: ffffffff\n\
                    -34.900089 35.844849 9.029253\ndwColor: ffffffff\n\
                    -58.299149 22.257586 9.029253\ndwColor: ffffffff\n\
@@ -4434,6 +7404,470 @@ mod tests {
             stalled, 0,
             "the curtain stopped scrolling {stalled} times over twenty seconds; \
              a waterfall that stalls is the static sheet the report describes"
+        );
+
+        // One clock second at `TexSpeed: (0, -0.4)` is a V of exactly -0.4. The
+        // tile offset belongs to `flipbook_uv` alone — `A3DGFXElement::
+        // TexAnimation` steps `m_fTexV` by `TexSpeed * dt` in its `m_bTileMode`
+        // arm — so a grid that adds the same offset on top scrolls at twice the
+        // authored rate. 163 of the 216 corpus grids author both a tile and a
+        // speed, so double is what every curtain, water sheet and cloud lattice
+        // in the game did.
+        let mut fresh = build(&(header37(1) + grid));
+        step(&mut fresh, 1000.);
+        let v = fresh.quads()[0].uv[0][1];
+        assert!(
+            (v + 0.4).abs() < 1e-4,
+            "a tiled grid must scroll at its authored rate: one second of a \
+             -0.4 sheet is V = -0.4, not {v}"
+        );
+    }
+
+    /// `A3DGridDecalEx::_setColorComposed` multiplies every lattice vertex's
+    /// saved colour by the keypoint colour, channel by channel, and that is the
+    /// colour the sheet draws with. It matters because artists tint slabs and
+    /// curtains through the keypoint: the retail waterfall authors **white**
+    /// vertices and a keypoint of `0xff35a5ff`, and `冷凝术_冰块.gfx` authors
+    /// white vertices and `0xff5580aa`. A reader that keeps only the vertex
+    /// colour draws those white — the pale sheet the report calls a white blob —
+    /// where the client draws cyan water and blue ice.
+    #[test]
+    fn a_grid_multiplies_each_vertex_by_the_keypoint_colour() {
+        // Grey vertices (`ff808080`) against a `ff ff8080` keypoint: the client's
+        // `(a * b) & 0xff00 >> 8` gives 127, 64, 64 and 254.
+        let grid = "GFXELEMENTID: 210\nName: tinted\nSrcBlend: 5\nDestBlend: 2\n\
+                    TexFile: 物体\\\\waterfall.dds\nTexRow: 1\nTexCol: 1\n\
+                    TexSpeed: 0.000000\nTileMode: 1\nwNumber: 2\nhNumber: 2\n\
+                    0.000000 10.000000 0.000000\ndwColor: ff808080\n\
+                    2.000000 10.000000 0.000000\ndwColor: ff808080\n\
+                    0.000000 0.000000 0.000000\ndwColor: ff808080\n\
+                    2.000000 0.000000 0.000000\ndwColor: ff808080\n\
+                    fGridSize: 0.500000\nfZOffset: 0.000000\n\
+                    StartTime: 0\nKEYPOINTCOUNT: 1\nInterpolateMode: 0\n\
+                    TimeSpan: -1\nPosition: 0.000000, 0.000000, 0.000000\n\
+                    Color: -32640\nScale: 1.000000\n\
+                    Direction: 0.000000, 0.000000, 0.000000, 1.000000\n\
+                    Rad_2D: 0.000000\nCtrlMethodCount: 0\n";
+        // `DefaultAlpha: 1` so the fold the test measures is the colour product
+        // and not the fixture's half alpha.
+        let header = header37(1).replace("DefaultAlpha: 0.5", "DefaultAlpha: 1.000000");
+        let mut player = build(&(header + grid));
+        step(&mut player, 0.);
+        let quads = player.quads().to_vec();
+        assert_eq!(quads.len(), 1, "a 2x2 lattice is one quad");
+        let color = quads[0].color;
+        let want = [127. / 255., 64. / 255., 64. / 255., 254. / 255.];
+        for (index, (got, want)) in color.iter().zip(want).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "channel {index} is {got}, not the client's {want}: \
+                 vertex colour alone would leave {color:?}"
+            );
+        }
+        // The tint has to be visibly darker than the vertex colour, otherwise
+        // this test would pass on a reader that still drops the keypoint.
+        assert!(color[1] < 0.3, "the keypoint tint never reached the sheet");
+    }
+
+    /// `A3DGridDecalEx::_setUVCoord` spreads **one** texture rect across the
+    /// whole lattice — U from `m_fTexU` in `m_nWidthVertNum - 1` steps and V
+    /// from `m_fTexV` in `m_nHeightVertNum - 1` — so a 2x3 lattice samples half
+    /// the sheet per row. Handing every cell the whole rect, which is what the
+    /// code did, stacked one copy of the image per row and restarted the
+    /// `TexSpeed` scroll at every row boundary.
+    #[test]
+    fn a_grid_spreads_one_texture_rect_over_its_lattice() {
+        let grid = "GFXELEMENTID: 210\nName: curtain\nSrcBlend: 5\nDestBlend: 2\n\
+                    TexFile: 物体\\\\waterfall.dds\nTexRow: 1\nTexCol: 1\n\
+                    TexSpeed: -0.400000\nwNumber: 2\nhNumber: 3\n\
+                    -1.000000 20.000000 0.000000\ndwColor: ffffffff\n\
+                    1.000000 20.000000 0.000000\ndwColor: ffffffff\n\
+                    -1.000000 10.000000 0.000000\ndwColor: ffffffff\n\
+                    1.000000 10.000000 0.000000\ndwColor: ffffffff\n\
+                    -1.000000 0.000000 0.000000\ndwColor: ffffffff\n\
+                    1.000000 0.000000 0.000000\ndwColor: ffffffff\n\
+                    fGridSize: 0.500000\nfZOffset: 0.000000\n\
+                    StartTime: 0\nKEYPOINTCOUNT: 1\nInterpolateMode: 0\n\
+                    TimeSpan: -1\nPosition: 0.000000, 0.000000, 0.000000\n\
+                    Color: -1\nScale: 1.000000\n\
+                    Direction: 0.000000, 0.000000, 0.000000, 1.000000\n\
+                    Rad_2D: 0.000000\nCtrlMethodCount: 0\n";
+        let mut player = build(&(header37(1) + grid));
+        step(&mut player, 0.);
+        let quads = player.quads().to_vec();
+        assert_eq!(quads.len(), 2, "a 2x3 lattice is one quad column, two tall");
+        let (first, second) = (quads[0].uv, quads[1].uv);
+        assert!(
+            (second[0][1] - first[0][1] - 0.5).abs() < 1e-5,
+            "the second row must start half a sheet lower, not on the same texel: \
+             {first:?} then {second:?}"
+        );
+        assert!(
+            (first[2][1] - first[0][1] - 0.5).abs() < 1e-5,
+            "one row of a three-row lattice is half the sheet, not all of it: {first:?}"
+        );
+        assert!(
+            (first[1][0] - 1.).abs() < 1e-5,
+            "the single column still spans the full width: {first:?}"
+        );
+    }
+
+    /// The element-140 record of a ring at radius 1, height 1, with the given
+    /// `Pitch` and the editor's `Sects: 0`.
+    fn ring_quads(pitch: f32) -> Vec<EffectQuad> {
+        let ring = format!(
+            "GFXELEMENTID: 140\r\nName: ring\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+             TexFile: 圆环光\\circle032.dds\r\nRepeatCount: 1\r\nRepeatDelay: 0\r\n\
+             Radius: 1.000000\r\nHeight: 1.000000\r\nPitch: {pitch:.6}\r\nSects: 0\r\n\
+             NoRadScale: 0\r\nNoHeiScale: 0\r\nOrgAtCenter: 0\r\n\
+             StartTime: 0\r\nKEYPOINTCOUNT: 1\r\nInterpolateMode: 0\r\nTimeSpan: -1\r\n\
+             Position: 0, 0, 0\r\nColor: -1\r\nScale: 1\r\nDirection: 0, 0, 0, 1\r\n\
+             Rad_2D: 0\r\nCtrlMethodCount: 0\r\n"
+        );
+        let mut player = build(&(header37(1) + ring.as_str()));
+        step(&mut player, 0.);
+        player.quads().to_vec()
+    }
+
+    /// Element 140's own `GetTranMatrix` axis is `_unit_y`, so a keypoint's 2D
+    /// spin yaws the band about its axis instead of turning it in the plane a
+    /// card would use. `A3DGFXRing.cpp:265` is
+    ///
+    ///     A3DMATRIX4 matWorld = matScale * GetTranMatrix(kp, _unit_y) * GetParentTM();
+    ///
+    /// and `GetTranMatrix` multiplies the spin **into** the keypoint quaternion
+    /// on the right (A3DGFXKeyPoint.h:286-293), so the axis is the band's own.
+    /// The band loves it: `Pitch` lives in the two radii, so a spun ring leans
+    /// the other way round.
+    #[test]
+    fn a_ring_keypoint_spin_yaws_the_band_about_its_own_axis() {
+        // A ring at radius 1, height 1, pitched so the rows differ; `Sects: 0`
+        // keeps the client's own 36 so the first corner is at angle zero.
+        let ring = |rad_2d: f32| {
+            format!(
+                "GFXELEMENTID: 140\r\nName: ring\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+                 TexFile: 圆环光\\circle032.dds\r\nRepeatCount: 1\r\nRepeatDelay: 0\r\n\
+                 Radius: 1.000000\r\nHeight: 1.000000\r\nPitch: 0.463648\r\nSects: 0\r\n\
+                 NoRadScale: 0\r\nNoHeiScale: 0\r\nOrgAtCenter: 0\r\n\
+                 StartTime: 0\r\nKEYPOINTCOUNT: 1\r\nInterpolateMode: 0\r\nTimeSpan: -1\r\n\
+                 Position: 0, 0, 0\r\nColor: -1\r\nScale: 1\r\nDirection: 0, 0, 0, 1\r\n\
+                 Rad_2D: {rad_2d:.6}\r\nCtrlMethodCount: 0\r\n"
+            )
+        };
+        let first = |rad_2d: f32| {
+            let mut player = build(&(header37(1) + ring(rad_2d).as_str()));
+            step(&mut player, 0.);
+            player.quads()[0].positions[0]
+        };
+        let level = first(0.);
+        // `OrgAtCenter: 0` puts the foot row at y = 0, the first section starts
+        // at angle zero, and `Pitch: 0.463648` widens the foot by
+        // `halfHeight * tan`, so the corner is on +X of the foot row. Its length
+        // is the foot radius times the root's `DedaultScale` of 2, which is why
+        // the assertions below are written against `radius` and not a number.
+        let radius = level[0];
+        assert!(
+            radius > 2. && level[1].abs() < 1e-6 && level[2].abs() < 1e-3,
+            "the unspun band starts on +X of the foot row: {level:?}"
+        );
+        // The angle in the band's own XZ plane, measured from +X towards -Z,
+        // which is the direction a right turn about +Y sends it.
+        let angle = |point: [f32; 3]| point[0].atan2(-point[2]);
+        let quarter = first(std::f32::consts::FRAC_PI_2);
+        // A right turn about +Y takes +X onto -Z, so the same corner comes round
+        // a quarter turn, at the same height and the same radius.
+        assert!(
+            (angle(level) - angle(quarter) - std::f32::consts::FRAC_PI_2).abs() < 1e-3,
+            "a quarter turn about the band's own Y must yaw the corner to -Z: \
+             {quarter:?} against {level:?}"
+        );
+        assert!(
+            quarter[0].abs() < 1e-3 && (quarter[2] + radius).abs() < 1e-3,
+            "and it lands on -Z of the foot row: {quarter:?} against {level:?}"
+        );
+        assert!(
+            (quarter[1] - level[1]).abs() < 1e-6
+                && (quarter[0].hypot(quarter[2]) - radius).abs() < 1e-3,
+            "a yaw keeps the corner's height and radius: {quarter:?} against {level:?}"
+        );
+        // Half a turn is the other side of the same band, not a mirror of it.
+        // A card would come back to where it started here; a band cannot,
+        // because its sections are not symmetric about their own centre.
+        let half = first(std::f32::consts::PI);
+        assert!(
+            (half[0] + radius).abs() < 1e-3 && (half[2] - level[2]).abs() < 1e-3,
+            "a half turn puts the corner opposite, at the same height and radius: \
+             {half:?} against {level:?}"
+        );
+    }
+
+    /// The model path takes `matScale * GetTranMatrix(kp) * GetParentTM()`
+    /// (A3DGFXModel.cpp:233, A3DGFXECModel.cpp:352), so its keypoint spin is a
+    /// rotation of the mesh about the element's local Z. It used to read
+    /// `context.placement`, the one matrix the client builds *without* `Rad_2D`,
+    /// which is the matrix `Fill_Verts_3D`'s `RotFromView` branch wants — so
+    /// every spinning model in the game stood still.
+    #[test]
+    fn a_model_keypoint_spin_turns_the_mesh_about_its_own_z() {
+        let view = view();
+        let common = Common::default();
+        let mut context = spawn_context(&view, &common);
+        context.rotation = std::f32::consts::FRAC_PI_2;
+        let mesh = EffectMesh {
+            texture: "gfx/textures/模型/test.dds".into(),
+            vertices: vec![
+                EffectVertex {
+                    position: [1., 0., 0.],
+                    uv: [0., 0.],
+                    normal: [1., 0., 0.],
+                },
+                EffectVertex {
+                    position: [0., 1., 0.],
+                    uv: [0., 0.],
+                    normal: [0., 1., 0.],
+                },
+                EffectVertex {
+                    position: [0., 0., 1.],
+                    uv: [0., 0.],
+                    normal: [0., 0., 1.],
+                },
+            ],
+            write_depth: false,
+            material: None,
+        };
+        let mut out = Vec::new();
+        emit_model(std::slice::from_ref(&mesh), false, &context, &mut out);
+        let placed = &out[0].mesh.as_ref().expect("a model emits a mesh").vertices;
+        assert!(
+            (Vec3::from_array(placed[0].position) - Vec3::Y).length() < 1e-5,
+            "a quarter turn about Z sends the mesh's +X to +Y: {:?}",
+            placed[0].position
+        );
+        assert!(
+            (Vec3::from_array(placed[1].position) + Vec3::X).length() < 1e-5,
+            "and its +Y to -X: {:?}",
+            placed[1].position
+        );
+        assert!(
+            (Vec3::from_array(placed[2].position) - Vec3::Z).length() < 1e-5,
+            "the axis itself is untouched: {:?}",
+            placed[2].position
+        );
+        // Without a spin the mesh is the placement's own image.
+        context.rotation = 0.;
+        out.clear();
+        emit_model(std::slice::from_ref(&mesh), false, &context, &mut out);
+        let placed = &out[0].mesh.as_ref().expect("a model emits a mesh").vertices;
+        assert!(
+            (Vec3::from_array(placed[0].position) - Vec3::X).length() < 1e-5,
+            "an unspun model is unchanged: {:?}",
+            placed[0].position
+        );
+    }
+
+    /// A ring is world geometry built in the parent frame, so the owner's scale
+    /// reaches its radius through `GetParentTM()` / `CalcActualScale`, exactly
+    /// as it reaches a card's extents — the Nightfire `能量喷泉` at 5.019 really
+    /// is five times bigger than its authored geometry.
+    #[test]
+    fn a_ring_follows_the_owner_scale() {
+        let ring = "GFXELEMENTID: 140\r\nName: ring\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+             TexFile: 圆环光\\circle032.dds\r\nRepeatCount: 1\r\nRepeatDelay: 0\r\n\
+             Radius: 1.000000\r\nHeight: 1.000000\r\nPitch: 0.000000\r\nSects: 0\r\n\
+             NoRadScale: 0\r\nNoHeiScale: 0\r\nOrgAtCenter: 0\r\n\
+             StartTime: 0\r\nKEYPOINTCOUNT: 1\r\nInterpolateMode: 0\r\nTimeSpan: -1\r\n\
+             Position: 0, 0, 0\r\nColor: -1\r\nScale: 1\r\nDirection: 0, 0, 0, 1\r\n\
+             Rad_2D: 0\r\nCtrlMethodCount: 0\r\n";
+        let radius = |scale: f32| {
+            let mut player = build(&(header37(1) + ring));
+            player
+                .advance(0., &view(), Mat4::from_scale(Vec3::splat(scale)), scale, 1.)
+                .unwrap();
+            let point = player.quads()[0].positions[0];
+            point[0].hypot(point[2])
+        };
+        let unit = radius(1.);
+        let widened = radius(3.);
+        assert!(unit > 0., "the ring has a radius to compare");
+        assert!(
+            (widened - unit * 3.).abs() < 1e-3,
+            "a ring is world geometry and follows the placement scale: {widened} from {unit}"
+        );
+    }
+
+    /// `A3DDecalEx::Fill_Verts_3D`'s `m_bRotFromView` branch keeps a card's
+    /// height on `vDir = RotateVec(GetParentDir() * kp.m_vDir, _unit_z)` and
+    /// turns only its width towards the camera:
+    ///
+    ///     A3DVECTOR3 vView = vPos - pView->GetCamera()->GetPos();
+    ///     A3DVECTOR3 vUp   = CrossProduct(vView, vDir);
+    ///     verts[1] = vPos + vDir * fHeight2 + vUp * fWidth2;
+    ///
+    /// So `场景/树林光束.gfx` — eight `RotFromView: 1` cards of 0.5 x 10 — is a
+    /// set of thin streaks lying along the direction the map authors, not a set
+    /// of screen-tall walls. Drawing them as screen billboards is what put
+    /// 123-unit sheets over the tree tops and what turned the two Archosaur
+    /// `天煞光束` shafts, whose records both author `direction: (0, 0, 1)`, into
+    /// vertical columns.
+    #[test]
+    fn a_rot_from_view_card_lies_along_the_element_direction() {
+        let axial = SPRITE
+            .replace("RotFromView: 0", "RotFromView: 1")
+            .replace("Width: 0.25", "Width: 0.5")
+            .replace("Height: 0.5", "Height: 10")
+            .replace("Position: 1, 2, 3", "Position: 0, 0, 0");
+        let mut player = build(&(header37(1) + &axial));
+        // +90 degrees about Y takes the element's +Z onto +X, so the shaft's
+        // long axis has to point east however the camera is turned.
+        player
+            .advance(
+                0.,
+                &view(),
+                Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2),
+                1.,
+                1.,
+            )
+            .unwrap();
+        let quad = player.quads().first().expect("the shaft draws");
+        let corner = |index: usize| Vec3::from_array(quad.positions[index]);
+        // `Fill_Verts_3D`'s world-space branch writes `verts[0]` and `verts[1]`
+        // on the same `vUp` side, one `fHeight1` below the centre and one
+        // `fHeight2` above it, so **their difference is the height** and
+        // `verts[0] - verts[2]` is the full width.
+        let along = corner(1) - corner(0);
+        let across = corner(0) - corner(2);
+        // Header `DedaultScale 2`, keypoint `Scale 2`, `OrgPt (0.5, 0)`: the
+        // authored 10 becomes 20 and both scales are the client's
+        // `GetActualScale * kp.m_fScale`.
+        assert!(
+            (along.length() - 80.).abs() < 1e-3,
+            "the 10-unit height must lie along +X: {along:?}"
+        );
+        // The row-major basis the client reads gives the mirrored axis (see the
+        // Axial arm), and a centred card is symmetric about its own middle, so
+        // what has to hold is the line, not the sign.
+        assert!(
+            along.normalize().dot(Vec3::X).abs() > 0.999,
+            "the shaft points the way the element points: {along:?}"
+        );
+        // Width 0.5 doubled, times the keypoint's 2 and the header's
+        // `DedaultScale 2`, is 4 units, and the width axis is the view axis
+        // perpendicular to the eye ray.
+        assert!(
+            (across.length() - 4.).abs() < 1e-3,
+            "the width is the authored 0.5 doubled and scaled: {across:?}"
+        );
+        assert!(
+            across.normalize().dot(Vec3::Y).abs() > 0.999,
+            "the width turns to the camera, and the camera sits on +Z: {across:?}"
+        );
+    }
+
+    /// `TileMode` is not a flipbook. `A3DGFXElement::CalcTexAnimation` gives a
+    /// tiled element `m_fTexWid = TexCol` / `m_fTexHei = TexRow` and
+    /// `A3DGFXElement::TexAnimation` only ever *scrolls* it:
+    ///
+    ///     if (m_bTileMode) { m_fTexU += m_fUOffsetSpeed * dt; m_fTexV += m_fVOffsetSpeed * dt; }
+    ///     else { ...step m_nCurTexCol/m_nCurTexRow every TexInterval... }
+    ///
+    /// and the card writes those two floats into its vertices every frame
+    /// (`A3DDecalEx.cpp:561-573`), under a `WRAP` sampler (render slot
+    /// `PreRender`, A3DGFXRenderSlot.cpp:547-549). A tiled sheet therefore
+    /// shows its whole `TexCol x TexRow` window — the sheet repeated `TexCol`
+    /// times across and `TexRow` down — and slides it at `TexSpeed`; it never
+    /// cuts between atlas cells the way a flipbook does. Stepping the grid as
+    /// well is what made the waterfall sheets of `场景/新种族地图` a jumble of
+    /// every frame of their atlas at once.
+    #[test]
+    fn a_tiled_sheet_repeats_and_scrolls_where_a_flipbook_steps_cells() {
+        let common = |tile: bool| Common {
+            tex_row: 2,
+            tex_col: 3,
+            tex_interval: 50,
+            tile_mode: u32::from(tile),
+            tex_speed: [0., -1.5],
+            ..Common::default()
+        };
+        let tiled = flipbook_uv(&common(true), 0.);
+        assert_eq!(tiled[0], [0., 0.], "the window starts in the corner");
+        assert!(
+            (tiled[3][0] - 3.).abs() < 1e-6 && (tiled[3][1] - 2.).abs() < 1e-6,
+            "a tiled window is TexCol x TexRow texture widths: the vertices are \
+             refilled every frame with `m_fTexU .. m_fTexU + m_fTexWid` and the \
+             tile sampler is `WRAP`, so the sheet tiles 3 x 2 over the card \
+             exactly as the client draws it: {tiled:?}"
+        );
+        let slid = flipbook_uv(&common(true), 1000.);
+        assert!(
+            (slid[0][1] + 1.5).abs() < 1e-6,
+            "the scroll is `m_fTexV += m_fVOffsetSpeed * dt` raw, so one second \
+             of -1.5 is V = -1.5, not -1.5 / TexRow: {slid:?}"
+        );
+        assert!(
+            (slid[3][1] - slid[0][1] - 2.).abs() < 1e-6
+                && (slid[3][0] - slid[0][0] - 3.).abs() < 1e-6,
+            "the window keeps its TexCol x TexRow size and only its origin moves"
+        );
+        assert_eq!(
+            flipbook_uv(&common(true), 1000.)[0][0],
+            0.,
+            "a sheet with no U speed does not drift sideways"
+        );
+        // The flipbook twin steps at 50 ms and stays put between steps.
+        let stepped = flipbook_uv(&common(false), 60.);
+        assert_eq!(flipbook_uv(&common(false), 0.)[0], [0., 0.]);
+        assert!(
+            (stepped[0][0] - 1. / 3.).abs() < 1e-6,
+            "one interval later the flipbook is on the second cell: {stepped:?}"
+        );
+    }
+
+    /// `Sects: 0` is the client's `_default_sects`, and `A3DGFXRing.cpp` sets
+    /// that to 36 (`if (m_nSects) nSect = m_nSects; else nSect = _default_sects;`).
+    /// The editor writes the zero on 1,064 of the corpus's 1,116 element-140
+    /// records, so clamping it up to three turned nearly every ring in the game
+    /// into a three-sided prism.
+    #[test]
+    fn a_ring_authored_without_sects_is_thirty_six_sections() {
+        assert_eq!(
+            ring_quads(0.).len(),
+            36,
+            "Sects 0 must fall back to the client's 36 sections, not three"
+        );
+    }
+
+    /// `Pitch` is a texture pitch, spent as `tan(pitch)` on the band's two
+    /// radii after clamping to `radius / halfHeight`: the foot is wider and the
+    /// roof narrower. The code used it as an angular offset of the first
+    /// vertex, which turned the band on its axis and left both rows the same
+    /// size.
+    #[test]
+    fn a_ring_pitch_tilts_the_band_through_its_radii() {
+        let radius = |point: [f32; 3]| point[0].hypot(point[2]);
+        let rows = |quads: &[EffectQuad]| {
+            let quad = &quads[0];
+            // Corners 0 and 1 are the foot row, 2 and 3 the roof.
+            (
+                (radius(quad.positions[0]) + radius(quad.positions[1])) * 0.5,
+                (radius(quad.positions[2]) + radius(quad.positions[3])) * 0.5,
+            )
+        };
+        let (flat_foot, flat_roof) = rows(&ring_quads(0.));
+        assert!(
+            (flat_foot - flat_roof).abs() < 1e-4,
+            "a level ring keeps one radius: {flat_foot} against {flat_roof}"
+        );
+        // atan(0.5) gives `tan = 0.5`, so the rows differ by
+        // `halfHeight * tan` = 0.25 on a height of 1: half the radius either way.
+        let (foot, roof) = rows(&ring_quads(0.463_648));
+        assert!(
+            foot > flat_foot && roof < flat_roof,
+            "pitch must widen the foot and narrow the roof: {foot} / {roof}"
+        );
+        assert!(
+            ((foot - roof) / flat_foot - 0.5).abs() < 1e-3,
+            "the two rows must differ by two half-height tangents, half the \
+             radius here: {foot} against {roof}"
         );
     }
 
@@ -4587,6 +8021,75 @@ mod tests {
         }
     }
 
+    /// The file's `Width`/`Height` are **half** sizes, and the shipped roots
+    /// prove it: `A3DDecalEx.h` declares `float m_fWidth; // Half width`, and
+    /// `SetSize` doubles the argument before splitting it at `OrgPt`
+    /// (`m_fWidth1 = m_fOrgPtWidth * fWidth` with `fWidth *= 2.0f`), while
+    /// `GetProperty(ID_GFXOP_DECAL_WIDTH)` hands the editor `m_fWidth * 2.0f`.
+    /// So a `Width: 0.25` card is 0.5 units across, not 0.25.
+    ///
+    /// The authored `Vec:` box in the same root confirms it without the header:
+    /// in the twelve single-sprite roots that carry no rotation, no offset and
+    /// scale 1, the box's half-extent equals `Width` and `Height` exactly — the
+    /// ratio is 1.000 on every clean sample (`绿色剑光.gfx`, `蓝色剑光.gfx`,
+    /// `黄色剑光.gfx`, `18品双剑_剑柄.gfx`, `水族箱玻璃.gfx`, ...). A card
+    /// half that size would leave the tool padding every one of those boxes by
+    /// exactly two on both axes, which no editor does.
+    ///
+    /// This test pins the sizes the report called oversized so a future
+    /// "correction" cannot quietly halve every card in the game.
+    #[test]
+    fn a_sprite_spans_twice_its_authored_width_and_height() {
+        // `gfx/人物/通用/武器/武器效果/绿色剑光.gfx`, verbatim: a 0.25 x 0.5 card
+        // centred on its origin, identity direction, at the element origin, with
+        // the tool's own `Vec: -0.25,-0.5,0` / `Vec: 0.25,0.5,0` box.
+        let root = "MOXTVersion: 41\nDedaultScale: 1.000000\nPlaySpeed: 1.000000\n\
+                    DefaultAlpha: 1.000000\nRaytrace: 0\nFaceToViewer: 0\n\
+                    FadeByDist: 0\nFadeStart: 0.000000\nFadeEnd: 0.000000\n\
+                    Vec: -0.250000, -0.500000, 0.000000\n\
+                    Vec: 0.250000, 0.500000, 0.000000\nShakeCam: 0\n\
+                    GFXELEMENTCOUNT: 1\nGFXELEMENTID: 100\nName: Unnamed2\n\
+                    SrcBlend: 5\nDestBlend: 2\nRepeatCount: 1\nRepeatDelay: 0\n\
+                    TexFile: 粒子\\\\jianguang绿.dds\nBindEle: \nZEnable: 1\n\
+                    MatchGrnd: 0\nTexRow: 1\nTexCol: 1\nTexInterval: 50\n\
+                    Priority: 2\nIsDummy: 0\nDummyEle: \nWarp: 0\nTileMode: 0\n\
+                    TexSpeed: 0.000000\nTexSpeed: 0.000000\nUReverse: 0\n\
+                    VReverse: 0\nUVExchg: 0\nRenderLayer: 0\nNoDownSample: 0\n\
+                    Width: 0.250000\nHeight: 0.500000\nRotFromView: 0\n\
+                    GrndNormOnly: 0\nNoScale: 0\nNoScale: 0\nOrgPt: 0.500000\n\
+                    OrgPt: 0.500000\nStartTime: 0\nKEYPOINTCOUNT: 1\n\
+                    InterpolateMode: 0\nTimeSpan: -1\n\
+                    Position: 0.000000, 0.000000, 0.000000\nColor: -8323328\n\
+                    Scale: 1.000000\n\
+                    Direction: 0.000000, 0.000000, 0.000000, 1.000000\n\
+                    Rad_2D: 0.000000\nCtrlMethodCount: 0\n";
+        let mut player = build(root);
+        step(&mut player, 0.);
+        let quads = player.quads().to_vec();
+        assert_eq!(quads.len(), 1);
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for point in &quads[0].positions {
+            for axis in 0..3 {
+                lo[axis] = lo[axis].min(point[axis]);
+                hi[axis] = hi[axis].max(point[axis]);
+            }
+        }
+        // Half extents of the drawn card, and the tool's own box for comparison.
+        for (axis, (drawn, authored)) in [((hi[0] - lo[0]) / 2., 0.25), ((hi[1] - lo[1]) / 2., 0.5)]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                (drawn - authored).abs() < 1e-5,
+                "axis {axis} is {drawn}, but the root's own Vec: box is {authored}"
+            );
+        }
+        assert!(
+            (hi[2] - lo[2]).abs() < 1e-5,
+            "the card lies in its element plane"
+        );
+    }
+
     fn build(source: &str) -> Player {
         let root = gfx_file::parse(source).unwrap_or_else(|error| panic!("{error}"));
         Player::new(root, 7, &mut |_| Err("this root has no children".into()))
@@ -4628,38 +8131,36 @@ mod tests {
         )
     }
 
-    /// The three authored `Width` lines are `[end, midpoint, start]`, not
-    /// `[head, mid, tail]`. The client's strip builder interpolates
-    /// `Width[1] -> Width[0]` over the first half of the axis and
-    /// `Width[2] -> Width[0]` over the second (disassembly `0x709a58`..`0x709aeb`),
-    /// so a profile whose middle line is its widest draws a strip that pinches at
-    /// both ends. Reading only the first two lines — which is what the emitter
-    /// did before this was measured — loses the apex and 17.5% of the strip's
-    /// area across the corpus.
+    /// The three authored `Width` lines are `[start, end, midpoint]`, the order
+    /// `A3DGFXLightning::Load` reads them in, and the strip builder ramps
+    /// `Start -> Mid` over the first half and `Mid -> End` over the second. A
+    /// profile whose *third* line is its widest therefore pinches at both ends
+    /// and peaks in the middle, which is what the retail records look like
+    /// (`Width: 0, Width: 0, Width: 0.4` in `gfx/models/暗语者营地/暗语者营地.gfx`).
     #[test]
     fn a_three_point_width_profile_peaks_in_the_middle_of_the_strip() {
         let mut spec = gfx_file::Fractal::default();
-        spec.widths = vec![0.2, 1.0, 0.2];
+        spec.widths = vec![0.2, 0.2, 1.0];
         let near = |a: f32, b: f32| (a - b).abs() < 1e-6;
-        assert!(near(spec.width_at(0.0), 0.2), "the first line is one end");
-        assert!(near(spec.width_at(1.0), 0.2), "the third line is the other");
+        assert!(near(spec.width_at(0.0), 0.2), "the first line is the start");
+        assert!(near(spec.width_at(1.0), 0.2), "the second line is the end");
         assert!(
             near(spec.width_at(0.5), 1.0),
-            "the second line is the midpoint"
+            "the third line is the midpoint"
         );
         assert!(
             near(spec.width_at(0.25), 0.6),
-            "first half ramps end -> midpoint"
+            "first half ramps start -> midpoint"
         );
         assert!(
             near(spec.width_at(0.75), 0.6),
-            "second half midpoint -> start"
+            "second half midpoint -> end"
         );
         // A single authored line repeats, which collapses to a constant strip;
         // 356 corpus fractals author one width and read the same either way.
         spec.widths = vec![0.4];
         assert!(near(spec.width_at(0.75), 0.4));
-        // Two lines interpolate end to start with no midpoint.
+        // Two lines interpolate start to end with no midpoint.
         spec.widths = vec![0.0, 2.0];
         assert!(near(spec.width_at(0.5), 1.0));
     }
@@ -4672,7 +8173,7 @@ mod tests {
     /// placements are installed in the world.
     #[test]
     fn a_fractal_with_coincident_ends_still_draws_its_tapers() {
-        let strip = fractal("0, 0, 0", "0, 0, 0", [0.0, 1.0, 0.0], [0.5, 1.0, 0.5]);
+        let strip = fractal("0, 0, 0", "0, 0, 0", [0.0, 0.0, 1.0], [0.5, 0.5, 1.0]);
         let mut player = build(&strip);
         step(&mut player, 16.);
         let quads = player.quads();
@@ -4759,6 +8260,114 @@ mod tests {
             player.quads().iter().any(|quad| quad.mesh.is_some()),
             "and the quad array carries it"
         );
+    }
+
+    /// A keypoint's `Scale` multiplies a model element's meshes.
+    ///
+    /// `A3DGFXModel::UpdateModel` composes `matScale(kp.m_fScale) *
+    /// GetTranMatrix(kp) * GetParentTM()`, so the same model at `Scale: 0.5` is
+    /// half the size of the one at `Scale: 1`. The card path always applied it
+    /// (`quad_corners`); the mesh path handed the raw vertex to the placement,
+    /// which carries the root scale and nothing of the keypoint. The aquarium's
+    /// green kelp is the visible case — `海底植物.SMD` in `水族箱_水草翠绿` is
+    /// the same record as the fifteen-unit kelp beside it, yet framed
+    /// 42.77 x 67.47 x 47.28.
+    #[test]
+    fn a_models_keypoint_scale_multiplies_its_meshes() {
+        let archive = one_triangle_model();
+        let extent = |keypoint: &str| -> f32 {
+            let source = format!(
+                "{}GFXELEMENTID: 160\r\nName: crystal\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+                 RepeatCount: 1\r\nRepeatDelay: 0\r\nTexFile: \r\nBindEle: \r\nZEnable: 0\r\n\
+                 MatchGrnd: 0\r\nTexRow: 1\r\nTexCol: 1\r\nTexInterval: 50\r\nPriority: 0\r\n\
+                 IsDummy: 0\r\nDummyEle: \r\nWarp: 0\r\nTileMode: 0\r\nTexSpeed: 0\r\n\
+                 TexSpeed: 0\r\nUReverse: 0\r\nVReverse: 0\r\nUVExchg: 0\r\nRenderLayer: 0\r\n\
+                 NoDownSample: 0\r\nResetLoopEnd: 0\r\nTexAnimMaxTime: 0\r\n\
+                 ModelPath: 测试\\\\三角形.SMD\r\nModelActName: \r\nLoops: 1\r\nAlphaCmp: 0\r\n\
+                 WriteZ: 1\r\nUse3DCam: 0\r\nStartTime: 0\r\nKEYPOINTCOUNT: 1\r\n\
+                 InterpolateMode: 0\r\nTimeSpan: -1\r\nPosition: 0, 0, 0\r\nColor: -1\r\n\
+                 Scale: {keypoint}\r\nDirection: 0, 0, 0, 1\r\nRad_2D: 0\r\nCtrlMethodCount: 0\r\n",
+                header79(1),
+            );
+            let mut player = build(&source);
+            let mut read = |path: &str| -> Result<Vec<u8>, String> {
+                let name = crate::ecmodel::normalize(path);
+                archive
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, bytes)| bytes.clone())
+                    .ok_or_else(|| format!("{name} is not in the test archive"))
+            };
+            player.load_models("gfx/测试.gfx", &mut read).unwrap();
+            step(&mut player, 16.);
+            let meshes: Vec<&EffectMesh> = player
+                .quads()
+                .iter()
+                .filter_map(|quad| quad.mesh.as_ref())
+                .collect();
+            assert_eq!(meshes.len(), 1, "one mesh for one model element");
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            for vertex in &meshes[0].vertices {
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(vertex.position[axis]);
+                    max[axis] = max[axis].max(vertex.position[axis]);
+                }
+            }
+            (max[0] - min[0]).max(max[1] - min[1]).max(max[2] - min[2])
+        };
+        let full = extent("1.000000");
+        let half = extent("0.500000");
+        assert!(full > 0., "the fixture has an extent");
+        assert!(
+            (half - full * 0.5).abs() < 1e-4,
+            "a keypoint at half scale draws half the mesh: {half} against {full}"
+        );
+    }
+
+    /// The two gates `A3DSkinModelAction::Play` applies before anything moves:
+    /// the model must carry an action of that name (`GetAction` returns null
+    /// otherwise) and the loop count must be non-zero (`!iNumLoop` returns on
+    /// the first line). Either failure leaves the bind pose on screen, and no
+    /// clip is invented.
+    #[test]
+    fn a_model_action_starts_only_when_the_rig_carries_it() {
+        let archive = one_triangle_model();
+        let mut cache = std::collections::HashMap::new();
+        let mut read = |path: &str| -> Result<Vec<u8>, String> {
+            let name = crate::ecmodel::normalize(path);
+            archive
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, bytes)| bytes.clone())
+                .ok_or_else(|| format!("{name} is not in the test archive"))
+        };
+        let instance = posed_model_meshes(
+            "测试\\三角形.SMD",
+            "gfx/models",
+            "",
+            "飘浮",
+            1,
+            &mut read,
+            &mut cache,
+        )
+        .expect("the rig loads");
+        assert!(instance.action().is_none(), "the rig has no such action");
+        assert_eq!(instance.meshes().len(), 1, "the bind pose still draws");
+        // The same `.SMD` is parsed once per load, not once per element.
+        let again = posed_model_meshes(
+            "测试\\三角形.SMD",
+            "gfx/models",
+            "",
+            "",
+            1,
+            &mut read,
+            &mut cache,
+        )
+        .expect("the cached rig loads");
+        assert_eq!(cache.len(), 1, "the second element reused the rig");
+        assert!(again.action().is_none());
+        assert_eq!(again.meshes().len(), 1);
     }
 
     /// The smallest archive that goes through the whole model chain: an `.smd`
@@ -5062,8 +8671,13 @@ mod tests {
         step(&mut player, 80.);
         assert_eq!(player.quads().len(), 1, "second pass is visible");
 
-        step(&mut player, 100.);
-        assert!(player.finished(), "both passes are over at 300 ms");
+        // 100 ms of play, 50 ms of gap, 100 ms of play: 250 ms, because the delay
+        // that would follow the *last* play is never spent (`Resume(true)` sets
+        // `m_bInDelay` and the next `IsFinished` returns before it is read).
+        step(&mut player, 40.);
+        assert!(!player.finished(), "240 ms is still inside the second pass");
+        step(&mut player, 10.);
+        assert!(player.finished(), "both passes are over at 250 ms");
         assert!(player.quads().is_empty());
 
         // A negative repeat count never finishes.
@@ -5105,6 +8719,152 @@ mod tests {
         step(&mut player, 100.);
         let centre = quad_centre(&player.quads()[0]);
         assert!((centre.x - 2. * 1.28).abs() <= 1e-5, "{centre}");
+    }
+
+    /// A looping element restarts its controllers with its clock.
+    ///
+    /// Every controller integrates against the node age (`0x6eaf60`), and the
+    /// client restarts that age on each `RepeatCount` loop, so a `CtrlType: 100`
+    /// sweep runs from zero each time round. Reseeding the state only when the
+    /// *keypoint* changed left it alive across loops, and the offset then grew
+    /// for as long as the root played: `主城光球大` element 200 sweeps `Vel: 0.7`
+    /// along +Y in a 2 s loop, and seventy seconds of play left its lightning
+    /// children 292 units above the orb — the city's "misplaced effects" report.
+    #[test]
+    fn a_looping_element_restarts_its_motion_controller() {
+        let source = header37(1)
+            + &SPRITE
+                .replace("RepeatCount: 1\r\n", "RepeatCount: -1\r\n")
+                .replace("TimeSpan: -1\r\n", "TimeSpan: 500\r\n")
+                .replace(
+                    "CtrlMethodCount: 0\r\n",
+                    "CtrlMethodCount: 1\r\nCtrlType: 100\r\nStartTime: 0.000000\r\n\
+                     EndTime: -1.000000\r\nDir: 0.000000, 1.000000, 0.000000\r\n\
+                     Vel: 1.000000\r\nAcc: 0.000000\r\n",
+                );
+        let mut player = build(&source);
+        step(&mut player, 0.);
+        let start = quad_centre(&player.quads()[0]);
+        let mut worst = 0f32;
+        // Five seconds is ten plays of a half-second cycle. One play sweeps half
+        // a unit along +Y, which the root scale of 2 doubles.
+        for _ in 0..312 {
+            step(&mut player, 16.);
+            let centre = quad_centre(&player.quads()[0]);
+            worst = worst.max((centre.y - start.y).abs());
+        }
+        assert!(
+            worst > 0.5,
+            "the motion controller has to move the card: {worst}"
+        );
+        assert!(
+            worst < 1.6,
+            "a looping element restarts its motion controller each play; this \
+             one drifted {worst} units from where it started"
+        );
+    }
+
+    /// An interpolate-mode keypoint runs **no** controller, whatever its
+    /// `TimeSpan`. `A3DGFXKeyPointSet::TickAnimation` (A3DGFXKeyPoint.cpp:1416-1462)
+    /// branches only on `m_enumMode`: `enumInterpNone` calls `Process`, which is
+    /// what walks `m_CtrlLst`; every other mode calls `Interpolate`, which reads
+    /// the two `m_KPOrg` blocks and nothing else. A negative span ("hold this
+    /// keypoint forever") is not a second reason to run them.
+    #[test]
+    fn an_interpolating_keypoint_runs_no_controllers() {
+        // One keypoint that holds forever and carries a motion controller. On the
+        // step path the card drifts 0.1 units per 100 ms of `Vel: 1`, which the
+        // root scale of 2 doubles, so any controller activity shows up as a
+        // centre that is no longer at the authored x.
+        let forever = |mode: &str| {
+            let element = SPRITE
+                .replace(
+                    "InterpolateMode: 0\r\n",
+                    &format!("InterpolateMode: {mode}\r\n"),
+                )
+                .replace(
+                    "CtrlMethodCount: 0\r\n",
+                    "CtrlMethodCount: 1\r\nCtrlType: 100\r\nStartTime: 0.000000\r\n\
+                     EndTime: -1.000000\r\nDir: 1.000000, 0.000000, 0.000000\r\n\
+                     Vel: 1.000000\r\nAcc: 0.000000\r\n",
+                );
+            header37(1) + &element
+        };
+        let mut step_clock = build(&forever("0"));
+        step(&mut step_clock, 100.);
+        let moved_step = (quad_centre(&step_clock.quads()[0]).x - 2.).abs();
+        assert!(
+            moved_step > 1e-3,
+            "the step keypoint runs its controller: {moved_step}"
+        );
+        // Mode 1 interpolates from this keypoint towards the next; with one
+        // keypoint the client's `i == last` branch copies `m_KPOrg` whole, so the
+        // card sits exactly where the file puts it — at x = 2 after the root
+        // scale of 2 — and never moves.
+        let mut interpolating = build(&forever("1"));
+        step(&mut interpolating, 100.);
+        let settled = quad_centre(&interpolating.quads()[0]);
+        assert!(
+            (settled.x - 2.).abs() < 1e-3,
+            "an interpolate-mode keypoint never applies its controller: {settled:?}"
+        );
+        step(&mut interpolating, 400.);
+        let later = quad_centre(&interpolating.quads()[0]);
+        assert!(
+            (later - settled).length() < 1e-3,
+            "and it stays at the authored position: {later:?} vs {settled:?}"
+        );
+    }
+
+    /// `RepeatDelay` is spent *between* plays and not after the last one: the
+    /// client's `Resume(true)` arms `m_bInDelay` when the keypoint list runs out,
+    /// and the next `TickAnimation` returns at `IsFinished()` before reading it.
+    /// So `N` plays end at `N*span + (N-1)*delay`, and `RepeatCount: 1` ends at
+    /// `span` — not one delay later.
+    #[test]
+    fn a_single_play_ends_at_its_span_not_after_the_delay() {
+        let source = header37(1)
+            + &SPRITE
+                .replace("RepeatDelay: 0\r\n", "RepeatDelay: 50\r\n")
+                .replace("TimeSpan: -1\r\n", "TimeSpan: 100\r\n");
+        let mut player = build(&source);
+        step(&mut player, 60.);
+        assert_eq!(player.quads().len(), 1);
+        assert!(!player.finished(), "the play is still running at 60 ms");
+        step(&mut player, 40.);
+        assert!(
+            player.finished(),
+            "100 ms is the end of a single 100 ms play, delay or no delay"
+        );
+    }
+
+    /// The same rule for `RepeatCount: N`: two 100 ms plays with a 50 ms gap end
+    /// at 250 ms, not at the 300 ms that charging the final delay would give.
+    #[test]
+    fn repeated_plays_end_before_the_final_delay() {
+        let source = header37(1)
+            + &SPRITE
+                .replace("RepeatCount: 1\r\n", "RepeatCount: 2\r\n")
+                .replace("RepeatDelay: 0\r\n", "RepeatDelay: 50\r\n")
+                .replace("TimeSpan: -1\r\n", "TimeSpan: 100\r\n");
+        let mut player = build(&source);
+        // Play 1 is 0..100 ms, the gap 100..150, play 2 150..250. `GetCurKeyPoint`
+        // reports nothing while `m_nActKeyPoint` is -1, which `Resume` sets and
+        // the delay returns before restoring, so the gap draws no card.
+        step(&mut player, 110.);
+        assert!(
+            player.quads().is_empty(),
+            "110 ms is inside the gap between the two plays"
+        );
+        assert!(!player.finished(), "the second play has not started");
+        step(&mut player, 40.);
+        assert_eq!(player.quads().len(), 1, "150 ms starts the second play");
+        assert!(!player.finished());
+        step(&mut player, 100.);
+        assert!(
+            player.finished(),
+            "two plays and one gap: done at 250 ms, not 300"
+        );
     }
 
     /// `EndTime` is compared against 0.0 at `0x8d58a0`, so a controller stops
@@ -5246,12 +9006,57 @@ mod tests {
         Scale: 1.000000\r\nDirection: 0.000000, 0.000000, 0.000000, 1.000000\r\nRad_2D: 0.000000\r\n\
         CtrlMethodCount: 0\r\n";
 
+    /// A particle's size takes the keypoint scale only when it faces the camera.
+    ///
+    /// `A3DParticleSystemEx::Fill_Vert_3D` (:945-960) sizes a 3D quad from
+    /// `p->m_fWidth * (p->m_fScale + noise)` and the root's actual scale, and
+    /// reads `kp.m_fScale` inside the `m_bFacing` branch alone; `Fill_Vert_2D`
+    /// (:1241) multiplies all three. One number per case here, because the
+    /// difference is a whole factor of `kp` on every 3D emitter in the game.
+    #[test]
+    fn a_particles_size_takes_the_keypoint_only_when_it_faces_the_camera() {
+        let card = |three_d: bool, facing: u32, keypoint: f32| -> f32 {
+            let element = PARTICLE
+                .replace("3DParticle: 0", &format!("3DParticle: {}", three_d as u32))
+                .replace("Facing: 0", &format!("Facing: {facing}"))
+                .replace("ParticleWidth: 0.200000", "ParticleWidth: 1.000000")
+                .replace("ParticleHeight: 0.200000", "ParticleHeight: 1.000000")
+                .replace("Scale: 1.000000", &format!("Scale: {keypoint}"));
+            let mut player = build(&(header37(1) + &element));
+            step(&mut player, 250.);
+            let quad = &player.quads()[0];
+            (Vec3::from_array(quad.positions[0]) - Vec3::from_array(quad.positions[1])).length()
+        };
+        // `header37` authors `DedaultScale: 2`, `steps` passes an identity
+        // placement, and `PARTICLE` emits one particle in its first 250 ms.
+        let root = 2.;
+        assert!(
+            (card(true, 0, 0.5) - 2. * root).abs() < 1e-3,
+            "a plain 3D particle ignores the keypoint"
+        );
+        assert!(
+            (card(true, 1, 0.5) - 2. * 0.5 * root).abs() < 1e-3,
+            "a facing 3D particle takes it"
+        );
+        assert!(
+            (card(false, 0, 0.5) - 2. * 0.5 * root).abs() < 1e-3,
+            "a 2D particle always takes it"
+        );
+    }
+
     /// A spawn context with an identity placement, so a particle offset can be
     /// read straight off the returned state.
+    /// A spawn with no curve and a fresh `AverageWalk` — the case every
+    /// sampler test here exercises.
+    fn spawn_simple(particle: &Particle, rng: &mut Rng, context: &ElementContext) -> ParticleState {
+        spawn(particle, None, rng, &mut AverageWalk::default(), context)
+    }
+
     fn spawn_context<'a>(view: &'a View, common: &'a Common) -> ElementContext<'a> {
         ElementContext {
             id: 123,
             placement: Mat4::IDENTITY,
+            shaft: EffectShaft::Client,
             spin: Quat::IDENTITY,
             keypoint_direction: Quat::IDENTITY,
             view,
@@ -5264,6 +9069,7 @@ mod tests {
             emission_scale: 1.,
             rotation: 0.,
             clock: 0.,
+            root: "test.gfx",
         }
     }
 
@@ -5299,17 +9105,22 @@ mod tests {
     /// multiplies a unit-ball sample by the result before adding the emitter
     /// position. A box of the same extents would put particles at its corners,
     /// where the ellipsoid inequality fails by a factor of three.
+    ///
+    /// Id 122 stands in for the shared path here: ids 123 and 124 override it
+    /// with a cylinder and an ellipsoid respectively (`A3DCylinderEmitter.cpp`
+    /// `GenTotal`, `A3DEllipsoidEmitter.cpp` `GenTotal`).
     #[test]
     fn area_size_spawns_inside_its_ellipsoid() {
         let view = view();
         let common = Common::default();
-        let context = spawn_context(&view, &common);
+        let mut context = spawn_context(&view, &common);
+        context.id = 122;
         let mut particle = Particle::default();
         particle.area_size = Some(Vec3::new(2., 1., 0.5));
         let mut rng = Rng::new(31);
         let mut reach = Vec3::ZERO;
         for _ in 0..4_000 {
-            let offset = spawn(&particle, None, &mut rng, &context).position;
+            let offset = spawn_simple(&particle, &mut rng, &context).position;
             let normalized = offset / Vec3::new(1., 0.5, 0.25);
             assert!(
                 normalized.length_squared() <= 1. + 1e-4,
@@ -5331,6 +9142,9 @@ mod tests {
         let view = view();
         let common = Common::default();
         let mut context = spawn_context(&view, &common);
+        // Id 123 is the ellipsoid: it shares the ball volume sampler and is one
+        // of the three classes that folds the scalar into the basis; 124, the
+        // cylinder, replaces the ball with a disc.
         context.id = 123;
         // Keypoint `Scale` 2 under a root `PlaySpeed` of 3.
         context.emission_scale = 6.;
@@ -5339,7 +9153,7 @@ mod tests {
         let mut rng = Rng::new(11);
         let mut reach = Vec3::ZERO;
         for _ in 0..4_000 {
-            let offset = spawn(&particle, None, &mut rng, &context).position;
+            let offset = spawn_simple(&particle, &mut rng, &context).position;
             let normalized = offset / Vec3::new(6., 3., 1.5);
             assert!(
                 normalized.length_squared() <= 1. + 1e-4,
@@ -5358,7 +9172,7 @@ mod tests {
         let view = view();
         let common = Common::default();
         let mut context = spawn_context(&view, &common);
-        context.id = 123;
+        context.id = 122;
         context.emission_scale = 6.;
         let mut particle = Particle::default();
         particle.is_bind = true;
@@ -5366,7 +9180,7 @@ mod tests {
         let mut rng = Rng::new(11);
         let mut reach = Vec3::ZERO;
         for _ in 0..2_000 {
-            let offset = spawn(&particle, None, &mut rng, &context).position;
+            let offset = spawn_simple(&particle, &mut rng, &context).position;
             let normalized = offset / Vec3::new(1., 0.5, 0.25);
             assert!(
                 normalized.length_squared() <= 1. + 1e-4,
@@ -5391,7 +9205,7 @@ mod tests {
         particle.area_size = Some(Vec3::new(2., 1., 0.5));
         let mut rng = Rng::new(11);
         for _ in 0..1_000 {
-            let offset = spawn(&particle, None, &mut rng, &context).position;
+            let offset = spawn_simple(&particle, &mut rng, &context).position;
             let normalized = offset / Vec3::new(1., 0.5, 0.25);
             assert!(
                 normalized.length_squared() <= 1. + 1e-4,
@@ -5414,7 +9228,7 @@ mod tests {
         particle.area_size = Some(Vec3::new(2., 1., 0.5));
         let mut rng = Rng::new(11);
         for _ in 0..1_000 {
-            let offset = spawn(&particle, None, &mut rng, &context).position;
+            let offset = spawn_simple(&particle, &mut rng, &context).position;
             assert!(offset.length() <= 2. + 1e-4, "{offset} escaped the radius");
         }
     }
@@ -5434,7 +9248,7 @@ mod tests {
         particle.area_size = Some(Vec3::new(2., 1., 0.5));
         let mut rng = Rng::new(11);
         for _ in 0..1_000 {
-            let offset = spawn(&particle, None, &mut rng, &context).position;
+            let offset = spawn_simple(&particle, &mut rng, &context).position;
             let cross = (offset.x / 4.).powi(2) + (offset.y / 2.).powi(2);
             assert!((cross - 1.).abs() < 1e-3, "{offset} is off the ellipse");
             assert!(
@@ -5498,20 +9312,30 @@ mod tests {
                     scaled += 1;
                 }
                 let mut rng = Rng::new(elements as u32 * 7919 + 13);
+                let mut walk = AverageWalk::default();
                 for _ in 0..8 {
-                    let offset = spawn(particle, None, &mut rng, &context).position;
+                    let offset = spawn(particle, None, &mut rng, &mut walk, &context).position;
                     assert!(offset.is_finite(), "{} spawned {offset}", file.display());
-                    if particle.is_surface && element.id == 124 {
-                        // A cylinder sample reaches sqrt(2) half-extents, so the
-                        // ellipsoid inequality does not describe it: its cross
-                        // section sits on the ellipse and its height stays inside.
+                    if element.id == 124 {
+                        // `A3DCylinderEmitter` is a disc in XY plus a symmetric Z,
+                        // so it reaches sqrt(2) half-extents and the ellipsoid
+                        // inequality does not describe it: the cross-section sits
+                        // on the ellipse when the flag is set and inside it when it
+                        // is not, and the height always stays within `ZRange`.
                         if half.x != 0. && half.y != 0. {
                             let cross = (offset.x / half.x).powi(2) + (offset.y / half.y).powi(2);
                             assert!(
-                                (cross - 1.).abs() < 1e-3,
-                                "{}: {offset} is off the ellipse {half}",
+                                cross <= 1. + 1e-3,
+                                "{}: {offset} is outside the ellipse {half}",
                                 file.display()
                             );
+                            if particle.is_surface {
+                                assert!(
+                                    (cross - 1.).abs() < 1e-3,
+                                    "{}: {offset} is off the ellipse {half}",
+                                    file.display()
+                                );
+                            }
                         }
                         assert!(
                             offset.z.abs() <= half.z.abs() + 1e-6,
@@ -5541,23 +9365,24 @@ mod tests {
         assert!(reach > 0.9, "nothing reached the boundary: {reach}");
     }
 
-    /// Id 123's surface sampler `0x727f00` puts the particle *on* the ellipsoid
-    /// rather than inside it: the position is `D.x*basis0 + D.y*basis1 + D.z*basis2`
-    /// for a unit direction `D`, and the basis is the same `AreaSize * 0.5` the
-    /// volume path uses. Every sample therefore satisfies the ellipsoid equation
-    /// with equality, where the volume path satisfies it strictly.
+    /// `A3DEllipsoidEmitter::GenSurface` (id 124) puts the particle *on* the
+    /// ellipsoid rather than inside it: `v` is a unit sphere point and the
+    /// position is `v.x*XRange + v.y*YRange + v.z*ZRange`, so every sample
+    /// satisfies the ellipsoid equation with equality where the volume path
+    /// satisfies it strictly.
     #[test]
     fn surface_emission_lands_on_the_ellipsoid() {
         let view = view();
         let common = Common::default();
-        let context = spawn_context(&view, &common);
+        let mut context = spawn_context(&view, &common);
+        context.id = 123;
         let mut particle = Particle::default();
         particle.is_surface = true;
         particle.area_size = Some(Vec3::new(2., 1., 0.5));
         let mut rng = Rng::new(41);
         let mut reach = Vec3::ZERO;
         for _ in 0..2_000 {
-            let position = spawn(&particle, None, &mut rng, &context).position;
+            let position = spawn_simple(&particle, &mut rng, &context).position;
             let normalized = position / Vec3::new(1., 0.5, 0.25);
             assert!(
                 (normalized.length_squared() - 1.).abs() < 1e-4,
@@ -5572,31 +9397,106 @@ mod tests {
         );
     }
 
-    /// The surface sampler writes the negated sample to node+0x44 (`0x7281ad`
-    /// through `0x7281b3`, storing the vector built by the `fchs` chain at
-    /// `0x72816a`) and, unlike ids 121 and 124, the birth flow does not call the
-    /// direction slot afterwards. A cone angle authored on the element is
-    /// therefore ignored: the direction is exactly `-D`, anti-parallel to the
-    /// position measured in semi-axis units.
+    /// The two surface classes differ in both the sample and the direction:
+    ///
+    /// * `A3DCylinderEmitter::GenSurface` (id 124) samples `(cos, sin, z)` — a
+    ///   unit circle in XY with a symmetric Z — and `InitParticle` then calls
+    ///   `GenDirection` for both branches, so the direction is the emitter axis
+    ///   whatever the sample was.
+    /// * `A3DEllipsoidEmitter::GenSurface` (id 123) samples the unit sphere and
+    ///   writes `m_vMoveDir = -v`, and its `InitParticle` never calls
+    ///   `GenDirection`, so the direction is exactly `-D`.
     #[test]
-    fn surface_direction_is_the_negated_sample() {
+    fn a_cylinder_does_not_steer_by_its_sample_and_an_ellipsoid_negates_it() {
         let view = view();
         let common = Common::default();
-        let context = spawn_context(&view, &common);
+        let semi = Vec3::new(1., 0.5, 0.25);
         let mut particle = Particle::default();
         particle.is_surface = true;
         particle.area_size = Some(Vec3::new(2., 1., 0.5));
-        // A wide cone, which would bend every direction if it were consulted.
+
+        let mut cylinder = spawn_context(&view, &common);
+        cylinder.id = 124;
+        let mut rng = Rng::new(43);
+        let first = spawn_simple(&particle, &mut rng, &cylinder).direction;
+        for _ in 0..500 {
+            let state = spawn_simple(&particle, &mut rng, &cylinder);
+            assert!(
+                (state.direction - first).length() < 1e-5,
+                "id 124 follows GenDirection, not its sample: {}",
+                state.direction
+            );
+            let radial = state.position / semi;
+            assert!(
+                radial.x * radial.x + radial.y * radial.y <= 1. + 1e-5
+                    && radial.z.abs() <= 1. + 1e-5,
+                "the cylinder sample leaves the unit disc: {radial}"
+            );
+        }
+
+        let mut ellipsoid = spawn_context(&view, &common);
+        ellipsoid.id = 123;
+        // A wide cone would bend every direction if `GenDirection` were consulted.
         particle.angle = std::f32::consts::FRAC_PI_2;
         let mut rng = Rng::new(43);
         for _ in 0..500 {
-            let state = spawn(&particle, None, &mut rng, &context);
-            let radial = state.position / Vec3::new(1., 0.5, 0.25);
+            let state = spawn_simple(&particle, &mut rng, &ellipsoid);
+            let radial = state.position / semi;
             assert!(
                 (state.direction + radial).length() < 1e-4,
                 "direction {} should negate the sample behind position {}",
                 state.direction,
                 state.position
+            );
+        }
+    }
+
+    /// `A3DEllipsoidEmitter::GenTotal` rejects to the ball and then calls
+    /// `GenDirection(pParticle->m_vMoveDir)` at its end (A3DEllipsoidEmitter.cpp),
+    /// exactly as `A3DCylinderEmitter`'s birth flow does (`0x729bc1`): both
+    /// volume paths take the cone. Only the ellipsoid's *surface* branch writes
+    /// its own direction, and it writes the negated sample.
+    #[test]
+    fn a_volume_ellipsoid_is_a_ball_and_a_volume_cylinder_is_a_disc() {
+        let view = view();
+        let common = Common::default();
+        let semi = Vec3::new(1., 0.5, 0.25);
+        let mut particle = Particle::default();
+        particle.area_size = Some(Vec3::new(2., 1., 0.5));
+
+        let mut ellipsoid = spawn_context(&view, &common);
+        ellipsoid.id = 123;
+        let mut rng = Rng::new(59);
+        let first = spawn_simple(&particle, &mut rng, &ellipsoid).direction;
+        assert_ne!(first, Vec3::ZERO, "123 volume takes the cone direction");
+        let mut reach = Vec3::ZERO;
+        for _ in 0..200 {
+            let state = spawn_simple(&particle, &mut rng, &ellipsoid);
+            assert!((state.direction - first).length() < 1e-5);
+            let radial = state.position / semi;
+            assert!(
+                radial.length_squared() <= 1. + 1e-5,
+                "the ellipsoid volume is a ball, not a disc: {radial}"
+            );
+            reach = reach.max(radial.abs());
+        }
+        // The ball fills its volume: samples reach beyond any single plane.
+        assert!(
+            reach.x > 0.6 && reach.y > 0.6 && reach.z > 0.6,
+            "the ball barely filled: {reach}"
+        );
+
+        let mut cylinder = spawn_context(&view, &common);
+        cylinder.id = 124;
+        let mut rng = Rng::new(59);
+        let first = spawn_simple(&particle, &mut rng, &cylinder).direction;
+        for _ in 0..200 {
+            let state = spawn_simple(&particle, &mut rng, &cylinder);
+            assert!((state.direction - first).length() < 1e-5);
+            let radial = state.position / semi;
+            assert!(
+                radial.x * radial.x + radial.y * radial.y <= 1. + 1e-5,
+                "the cylinder volume is a disc in XY, not a ball: {radial}"
             );
         }
     }
@@ -5673,7 +9573,7 @@ mod tests {
         particle.angle = 0.7;
         let mut rng = Rng::new(83);
         for _ in 0..400 {
-            let state = spawn(&particle, None, &mut rng, &context);
+            let state = spawn_simple(&particle, &mut rng, &context);
             assert!(
                 (state.position.z - 0.7f32.cos()).abs() < 1e-5,
                 "polar angle drifted: {}",
@@ -5703,7 +9603,7 @@ mod tests {
         let mut rng = Rng::new(59);
         let mut closest = f32::MAX;
         for _ in 0..500 {
-            let position = spawn(&particle, None, &mut rng, &context).position;
+            let position = spawn_simple(&particle, &mut rng, &context).position;
             let normalized = position / Vec3::new(1., 0.5, 0.25);
             closest = closest.min(normalized.length_squared());
         }
@@ -5807,11 +9707,11 @@ mod tests {
         assert_eq!(p, Vec3::ZERO);
     }
 
-    /// Id 124's surface sample is the lateral surface of a cylinder, not an
-    /// ellipsoid: `0x729be0` takes its first two coefficients from a full turn
-    /// about `0x9c0338` and its third from an independent uniform in `[-1, 1]`.
-    /// The cross-section therefore sits exactly on the ellipse while the height
-    /// covers the whole extent, which no sphere sample does.
+    /// `A3DCylinderEmitter::GenSurface` (id 124) is the lateral surface of a
+    /// cylinder, not an ellipsoid: `q` turns `_unit_x` about `_unit_z` by a full
+    /// turn and `z` is an independent symmetric draw, so the cross-section sits
+    /// exactly on the ellipse while the height covers the whole extent — which no
+    /// sphere sample does.
     #[test]
     fn id_124_surface_emission_is_a_cylinder() {
         let view = view();
@@ -5824,7 +9724,7 @@ mod tests {
         let mut rng = Rng::new(61);
         let mut height = 0f32;
         for _ in 0..2_000 {
-            let position = spawn(&particle, None, &mut rng, &context).position;
+            let position = spawn_simple(&particle, &mut rng, &context).position;
             let cross = (position.x / 1.).powi(2) + (position.y / 0.5).powi(2);
             assert!(
                 (cross - 1.).abs() < 1e-4,
@@ -5839,36 +9739,6 @@ mod tests {
         // The height is uniform, so it reaches both ends; a sphere sample would
         // trade height for cross-section radius and never pin the radius at 1.
         assert!(height > 0.24, "the height only reached {height}");
-    }
-
-    /// Id 124's sampler writes no direction, and its birth flow calls the
-    /// direction slot after both samplers (`0x729bc1`), so the emission cone still
-    /// applies there — unlike id 123, whose flow goes straight to the TTL slot.
-    /// With no cone angle the direction is the emission axis and costs no draws, so
-    /// the same element with the flag cleared must produce exactly the same one.
-    #[test]
-    fn id_124_surface_emission_keeps_the_cone_direction() {
-        let view = view();
-        let common = Common::default();
-        let mut context = spawn_context(&view, &common);
-        context.id = 124;
-        let mut particle = Particle::default();
-        particle.is_surface = true;
-        particle.area_size = Some(Vec3::new(2., 1., 0.5));
-        let mut plain = Particle::default();
-        plain.area_size = particle.area_size;
-        let mut rng = Rng::new(67);
-        let surface = spawn(&particle, None, &mut rng, &context);
-        let volume = spawn(&plain, None, &mut rng, &context);
-        assert_eq!(surface.direction, volume.direction);
-        // And it is not id 123's negated sample.
-        let radial = surface.position / Vec3::new(1., 0.5, 0.25);
-        assert!(
-            (surface.direction + radial).length() > 1e-3,
-            "id 124 should not negate its sample; direction {} for position {}",
-            surface.direction,
-            surface.position
-        );
     }
 
     /// The cylinder sample spends the client's two draws, one for the turn and one
@@ -5923,8 +9793,9 @@ mod tests {
                     zeroed += 1;
                 }
                 let mut rng = Rng::new(elements as u32 * 7919 + 13);
+                let mut walk = AverageWalk::default();
                 for _ in 0..8 {
-                    let position = spawn(particle, None, &mut rng, &context).position;
+                    let position = spawn(particle, None, &mut rng, &mut walk, &context).position;
                     assert!(
                         position.is_finite(),
                         "{} spawned {position}",
@@ -5962,7 +9833,8 @@ mod tests {
     }
 
     /// The retail archive, when `tools/pck_lib.py` has extracted it beside the
-    /// checkout. CI has no archive, so the corpus tests skip instead of failing.
+    /// checkout. CI has no archive, so the corpus tests skip instead of failing —
+    /// unless `PWE_CORPUS=require` says the suite is being run as a gate.
     /// Member names have to be decoded GBK: anything else silently breaks child
     /// reference resolution, which surfaces as warnings and never as an error, so
     /// the resolved count is the thing worth reading.
@@ -5973,11 +9845,9 @@ mod tests {
             // quiet `ok`. A corpus test that silently skips is indistinguishable
             // from one that passes, and in this session that is exactly how two
             // wrong fixes came to look verified: the checks that would have
-            // contradicted them never ran.
-            eprintln!(
-                "SKIPPED: no `google_drive/x` corpus on this machine; this test \
-                 proves nothing about shipped assets"
-            );
+            // contradicted them never ran. `crate::corpus` is the one place that
+            // decision is made, so `PWE_CORPUS=require` can make it a failure.
+            crate::pck::corpus_absent("`google_drive/x`");
             return None;
         }
         Some(root)
@@ -6095,6 +9965,47 @@ mod tests {
         }
     }
 
+    /// Element 190 is a paraboloid: `A3DParaboloid::Build` (A3DParaboloid.cpp:113-186)
+    /// revolves a semicircle of `_segs = 24` segments around the element's local
+    /// Z axis, `m_nCircles = clamp(int(height / .1), 1, 8)` rings tall, with
+    /// `radius = sqrt(Coeff * ring * grid)`. So a 0.3-tall unit-coefficient bowl
+    /// is three rings of 24 quads, and its widest ring is `sqrt(0.3)` times its
+    /// height — a *bowl*, which is what the floating city's sheets and `水柱`
+    /// are. The old branch built a ribbon along the root's `Vec:` pair instead
+    /// and produced nothing at all when the file had no pair.
+    #[test]
+    fn an_element_190_is_a_paraboloid_bowl_of_the_authored_height() {
+        let bowl = "GFXELEMENTID: 190\r\nName: bowl\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+                    TexFile: 物体\\water.dds\r\nTexRow: 1\r\nTexCol: 1\r\n\
+                    TexInterval: 50\r\nPriority: 2\r\nCoeff: 1\r\nheight: 0.3\r\n\
+                    StartTime: 0\r\nKEYPOINTCOUNT: 1\r\nInterpolateMode: 0\r\n\
+                    TimeSpan: -1\r\nPosition: 0, 0, 0\r\nColor: -1\r\nScale: 2\r\n\
+                    Direction: 0, 0, 0, 1\r\nRad_2D: 0\r\nCtrlMethodCount: 0\r\n";
+        let mut player = build(&(header37(1) + bowl));
+        step(&mut player, 0.);
+        let quads = player.quads().to_vec();
+        assert_eq!(
+            quads.len(),
+            3 * 24,
+            "0.3 units of height is three rings of 24 segments"
+        );
+        let (mut widest, mut tallest) = (0f32, 0f32);
+        for quad in &quads {
+            for point in &quad.positions {
+                widest = widest.max((point[0] * point[0] + point[1] * point[1]).sqrt());
+                tallest = tallest.max(point[2]);
+            }
+        }
+        // sqrt(0.3) / 0.3: the widest ring against the authored height. The
+        // ratio is scale free, so it holds whatever the keypoint scale does.
+        let ratio = widest / tallest;
+        assert!(
+            (ratio - 0.3f32.sqrt() / 0.3).abs() < 0.01,
+            "the bowl is {ratio} radii per height, not {}",
+            0.3f32.sqrt() / 0.3
+        );
+    }
+
     /// Every texture the shipped effect roots name must resolve to a decoded
     /// image.
     ///
@@ -6196,15 +10107,33 @@ mod tests {
     /// viewer applies. Both are checked here on the viewer's own projection
     /// (mirrored scale, 70-degree perspective) and on a plain one, so the method
     /// has to work with and without the handedness flip.
+    ///
+    /// The third convention is the **preview's**: `Mat4::perspective_rh` with no
+    /// mirror at all (`effect_preview.rs`), whose centre ray points into the
+    /// scene from the near plane. The forward direction of that one used to come
+    /// back reversed, and this test only passed because every case it had was
+    /// either mirrored or an identity-direction camera — where `-Z` and `+Z` are
+    /// the same axis and the reversed answer was folded into the comparison. It
+    /// is not the same axis for a diagonal look, which is what the preview uses.
     #[test]
     fn effect_camera_comes_back_out_of_the_frame_matrix() {
-        for (name, position, direction, aspect, mirrored) in [
+        // The last entry is the tolerance on the recovered direction. It is
+        // 1e-3 everywhere but the preview, whose depth range is 0.05 to 20,000
+        // — a 400,000:1 ratio — so unprojecting its far plane in `f32` costs
+        // about 1 % of the direction. A reversed forward is a dot product of
+        // -1 and a *distance* of 2.0, which is what this test exists to catch;
+        // 0.02 is four orders of magnitude tighter than that and still five
+        // times looser than the error it has to tolerate.
+        for (name, position, direction, aspect, mirrored, near, far, tolerance) in [
             (
                 "across the world",
                 Vec3::new(2291., 250., -3160.),
                 Vec3::new(0.3, -0.2, 0.9).normalize(),
                 16. / 9.,
                 true,
+                16000.,
+                1.,
+                1e-3,
             ),
             (
                 "at the far edge",
@@ -6212,6 +10141,9 @@ mod tests {
                 Vec3::new(-0.5, 0.1, 0.8).normalize(),
                 1.,
                 true,
+                16000.,
+                1.,
+                1e-3,
             ),
             (
                 "looking down",
@@ -6219,6 +10151,9 @@ mod tests {
                 Vec3::new(0.01, -1.0, 0.02).normalize(),
                 1.6,
                 true,
+                16000.,
+                1.,
+                1e-3,
             ),
             (
                 "plain projection",
@@ -6226,9 +10161,36 @@ mod tests {
                 Vec3::new(0., 0., -1.),
                 1.,
                 false,
+                16000.,
+                1.,
+                1e-3,
+            ),
+            // The preview's own matrix, verbatim (`effect_preview.rs::Shot`):
+            // `perspective_rh(45, 1, 0.05, 20_000)` times `look_at_rh`, with no
+            // clip-space mirror, looking diagonally so a reversed forward cannot
+            // hide inside a symmetric axis. This is the case that was wrong: the
+            // near/far arguments are reversed relative to the world pass's, and
+            // the forward direction came back exactly negated.
+            (
+                "preview camera",
+                Vec3::new(2792.99, 276.72, -2623.63),
+                // The preview's own `target - eye` for shot 05 of 暗语者营地:
+                // the camera sits 110 units along (sin35 cos20, sin20, cos35 cos20)
+                // from the target, so the look direction is the negation of that
+                // unit vector.
+                Vec3::new(
+                    -(35f32.to_radians().sin() * 20f32.to_radians().cos()),
+                    -20f32.to_radians().sin(),
+                    -(35f32.to_radians().cos() * 20f32.to_radians().cos()),
+                ),
+                1.,
+                false,
+                0.05,
+                20_000.,
+                0.02,
             ),
         ] {
-            let projection = Mat4::perspective_rh(70f32.to_radians(), aspect, 16000., 1.);
+            let projection = Mat4::perspective_rh(70f32.to_radians(), aspect, near, far);
             let view = Mat4::look_to_rh(position, direction, Vec3::Y);
             let matrix = if mirrored {
                 Mat4::from_scale(Vec3::new(-1., 1., 1.)) * projection * view
@@ -6242,8 +10204,8 @@ mod tests {
                 recovered.position
             );
             assert!(
-                (recovered.forward - direction).length() < 0.001,
-                "{name}: forward {:?} is not {direction:?}",
+                (recovered.forward - direction).length() < tolerance,
+                "{name}: forward {:?} is not {direction:?} (tolerance {tolerance})",
                 recovered.forward
             );
             for axis in [recovered.right, recovered.up] {
@@ -6323,6 +10285,14 @@ mod tests {
                 if !particle.is_surface {
                     continue;
                 }
+                // When `IsAvgGen` is set the client's `GenAverage` runs with the
+                // surface flag as its own parameter (A3DEllipsoidEmitter.cpp),
+                // subsuming `GenSurface` and its inward direction write. Those
+                // records walk the shell instead and are held to the walk's own
+                // tests above.
+                if particle.is_average_generation == Some(true) {
+                    continue;
+                }
                 elements += 1;
                 let half = match particle.area_size {
                     Some(area) => {
@@ -6340,8 +10310,9 @@ mod tests {
                     }
                 };
                 let mut rng = Rng::new(elements as u32 * 7919 + 11);
+                let mut walk = AverageWalk::default();
                 for _ in 0..8 {
-                    let state = spawn(particle, None, &mut rng, &context);
+                    let state = spawn(particle, None, &mut rng, &mut walk, &context);
                     let tolerance = 1e-4 * half.length().max(1.);
                     assert!(
                         state.position.is_finite() && state.direction.is_finite(),
@@ -6465,6 +10436,161 @@ mod tests {
             played > 5_000,
             "the census played 5,457 files, got {played}"
         );
+    }
+
+    /// The `IsAvgGen` cylinder walk visits its rings exactly as
+    /// `A3DCylinderEmitter::GenAverage` advances them: alpha steps `2pi / 4`,
+    /// and the client's `> 2pi` test lets exactly `2pi` emit one extra point
+    /// before the ring index steps. With `BetaSeg: 2` the rings sit at
+    /// `z = 1 - 2 * ring / 2`, and `m_nCurrentBeta > m_nBetaSegNum` restarts.
+    #[test]
+    fn the_cylinder_average_walk_steps_rings_the_way_the_client_does() {
+        let mut walk = AverageWalk::default();
+        let mut rng = Rng::new(7);
+        let expected = [
+            Vec3::new(0., 1., 1.),
+            Vec3::new(-1., 0., 1.),
+            Vec3::new(0., -1., 1.),
+            Vec3::new(1., 0., 1.),
+            Vec3::new(0., 1., 1.),
+            Vec3::new(0., 1., 0.),
+        ];
+        for (i, want) in expected.iter().enumerate() {
+            let got = cylinder_average(&mut walk, 4, 2, Vec3::ONE, true, &mut rng);
+            assert!(
+                (got - *want).length() < 1e-4,
+                "emission {i}: got {got}, want {want}"
+            );
+        }
+        // Emissions 7-15 finish rings 1 and 2; the 16th is the restart.
+        for _ in 0..9 {
+            cylinder_average(&mut walk, 4, 2, Vec3::ONE, true, &mut rng);
+        }
+        let got = cylinder_average(&mut walk, 4, 2, Vec3::ONE, true, &mut rng);
+        assert!(
+            (got - Vec3::new(0., 1., 1.)).length() < 1e-4,
+            "restart emission: got {got}"
+        );
+    }
+
+    /// The ellipsoid walk of `A3DEllipsoidEmitter::GenAverage`: the pole rings
+    /// step beta by `pi / BetaSeg` while every other emission steps alpha by
+    /// `2pi / AlphaSeg`. The client's `> 2pi` test emits exactly `2pi` twice on
+    /// the mid ring, and `beta + betaDelta / 2 > pi` restarts the whole walk
+    /// from the pole one emission early — both quirks are load-bearing.
+    #[test]
+    fn the_ellipsoid_average_walk_keeps_the_clients_wrap_order() {
+        let mut walk = AverageWalk::default();
+        let mut rng = Rng::new(11);
+        let expected = [
+            Vec3::new(0., 1., 0.),
+            Vec3::new(0., 0., 1.),
+            Vec3::new(1., 0., 0.),
+            Vec3::new(0., 0., -1.),
+            Vec3::new(-1., 0., 0.),
+            Vec3::new(0., 0., 1.),
+            Vec3::new(0., -1., 0.),
+            Vec3::new(0., 1., 0.),
+        ];
+        for (i, want) in expected.iter().enumerate() {
+            let got = ellipsoid_average(&mut walk, 4, 2, Vec3::ONE, true, &mut rng);
+            assert!(
+                (got - *want).length() < 1e-4,
+                "emission {i}: got {got}, want {want}"
+            );
+        }
+    }
+
+    /// `A3DCylinderEmitter::GenAverage` draws `_UnitRandom()` before the
+    /// `m_bSurface` test and discards it on the surface path — the walk must
+    /// consume exactly one rng draw per emission either way.
+    #[test]
+    fn the_average_walk_draws_its_ratio_even_on_the_surface() {
+        let mut walk = AverageWalk::default();
+        let mut rng = Rng::new(3);
+        cylinder_average(&mut walk, 4, 2, Vec3::ONE, true, &mut rng);
+        let after_walk = rng.unit();
+        let mut probe = Rng::new(3);
+        probe.unit();
+        assert_eq!(
+            after_walk,
+            probe.unit(),
+            "the surface walk skipped the draw"
+        );
+        // A volume walk scales all three components by the same ratio, which is
+        // what `m_vXRange * fRatio` etc. amounts to.
+        let mut walk = AverageWalk::default();
+        let mut rng = Rng::new(3);
+        let ratio = {
+            let mut probe = Rng::new(3);
+            probe.unit()
+        };
+        let got = cylinder_average(&mut walk, 4, 2, Vec3::ONE, false, &mut rng);
+        assert!(
+            (got - Vec3::new(0., 1., 1.) * ratio).length() < 1e-5,
+            "volume walk: got {got}, want the shell sample times {ratio}"
+        );
+    }
+
+    /// `A3DCurveEmitter::InitParticle` places at `m_fEmitterStep` and only then
+    /// runs `genNextStep`, so a sequential `AvgGenSeg: 4` walk places at
+    /// 0, 1/4, 1/2, 3/4 and — because the wrap test is `> 1`, not `>= 1` — at
+    /// exactly 1 before restarting at 0.
+    #[test]
+    fn the_curve_average_walk_places_first_and_wraps_at_one() {
+        let mut rng = Rng::new(5);
+        let mut step = 0.;
+        let mut placed = Vec::new();
+        for _ in 0..6 {
+            placed.push(step);
+            step = curve_average_next(step, true, 4, &mut rng);
+        }
+        let expected = [0., 0.25, 0.5, 0.75, 1., 0.];
+        for (i, (got, want)) in placed.iter().zip(expected).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "step {i}: got {got}, want {want}"
+            );
+        }
+    }
+
+    /// The curve walk's spawn: the first particle lands on the curve's start
+    /// and a `Radius` disc offsets it exactly `Radius` from the curve point on
+    /// the surface, at most `Radius` in the volume (`A3DCurveEmitter::
+    /// InitParticle`).
+    #[test]
+    fn the_curve_average_walk_rides_the_path_with_its_radius_disc() {
+        let points = vec![Vec3::ZERO, Vec3::new(4., 0., 0.)];
+        let path = points.as_slice();
+        let mut particle = Particle::default();
+        particle.is_surface = true;
+        particle.is_average_generation = Some(true);
+        particle.is_average_generation_sequence = Some(true);
+        particle.average_generation_segments = Some(4);
+        particle.radius = Some(0.5);
+        let mut walk = AverageWalk::default();
+        let mut rng = Rng::new(23);
+        let point = average_sample(&particle, Some(path), &mut walk, &mut rng, Vec3::ONE, 125)
+            .expect("the walk has a position");
+        assert!(
+            (point.x - 0.).abs() < 1e-5,
+            "the first step is the curve start"
+        );
+        assert!(
+            (point.length() - 0.5).abs() < 1e-5,
+            "a surface disc sits on Radius"
+        );
+        particle.is_surface = false;
+        particle.radius = Some(3.);
+        for _ in 0..32 {
+            let point = average_sample(&particle, Some(path), &mut walk, &mut rng, Vec3::ONE, 125)
+                .expect("the walk has a position");
+            let on_curve = Vec3::new(point.x.clamp(0., 4.), 0., 0.);
+            assert!(
+                (point - on_curve).length() <= 3. + 1e-4,
+                "volume disc stays inside Radius"
+            );
+        }
     }
 
     /// The ball sample is uniform in volume, which is what the client's
@@ -6882,71 +11008,650 @@ mod tests {
             "clock 750 wraps to cell 1"
         );
 
-        // `TexAnimMaxTime` shortens the walk: 300 ms at a 100 ms interval is
-        // three cells, so the fourth is never reached.
+        // `TexAnimMaxTime` stops the walk where it stands instead of shortening
+        // the loop: `TickAnimation` simply stops calling `TexAnimation` once
+        // `m_dwTexTickCount` passes the total, so the sheet holds its last
+        // reached frame (A3DGFXElement.cpp:1268-1274).
         // The minimal sprite record carries no `TexAnimMaxTime`, so add it where
         // the retail element-100 layout puts it: after `Warp`, before `Width`.
         let limited = source.replace("Warp: 0\r\n", "Warp: 0\r\nTexAnimMaxTime: 300\r\n");
         let mut player = build(&limited);
-        // limit = clamp(300 / 100, 1, 6) = 3 cells, so the walk is 0, 1, 2, 0.
+        // 300 ms at a 100 ms interval reaches cell 3, and the walk stops there:
+        // clock 350 still reads cell 3.
         for (dt, clock, want) in [
             (0., 0., [0., 0.]),
             (150., 150., [1. / 3., 0.]),
             (100., 250., [2. / 3., 0.]),
-            (100., 350., [0., 0.]),
+            (100., 350., [0., 0.5]),
         ] {
             step(&mut player, dt);
             assert_eq!(player.quads()[0].uv[0], want, "clock {clock}");
         }
     }
 
-    /// `RotFromView: 1` takes the basis from the camera, `0` keeps the authored
-    /// keypoint direction: 598 retail sprites against 8,271.
+    /// `UReverse`, `VReverse` and `UVExchg` are endpoint swaps on the quad, not
+    /// `1 - u` reflections: `Fill_Verts_3D` (A3DDecalEx.cpp:556-576) writes
+    ///
+    /// ```cpp
+    /// if (m_bUReverse) { gfx_swap(fU[0], fU[1]); gfx_swap(fU[2], fU[3]); }
+    /// if (m_bVReverse) { gfx_swap(fV[0], fV[2]); gfx_swap(fV[1], fV[3]); }
+    /// ```
+    ///
+    /// so a mirrored card keeps its own flipbook cell and only trades its left
+    /// edge for its right one. Reflecting in texture space moved it to the cell
+    /// mirrored across the whole atlas instead, which on a two-cell sheet put
+    /// `u = 1` on the corner that has to read `u = 0.5`.
     #[test]
-    fn rot_from_view_selects_the_camera_basis() {
-        let camera = View {
-            position: Vec3::new(0., 0., 10.),
-            right: Vec3::Y,
-            up: Vec3::Z,
-            forward: Vec3::X,
-        };
-        for (rotate_from_view, plane_axis) in [(0, 2usize), (1, 0usize)] {
-            let source = header37(1)
-                + &SPRITE.replace(
-                    "RotFromView: 0\r\n",
-                    &format!("RotFromView: {rotate_from_view}\r\n"),
-                );
-            let root = gfx_file::parse(&source).unwrap();
-            let mut player = Player::new(root, 7, &mut |_| Err("no children".into())).unwrap();
-            player.advance(0., &camera, Mat4::IDENTITY, 1., 1.).unwrap();
-            let quad = &player.quads()[0];
-            // An element-space sprite spans the element's X and Y axes; a
-            // camera-facing one spans the camera's right (Y) and up (Z) instead.
-            let spread: Vec<f32> = (0..3)
-                .map(|axis| {
-                    let mut low = f32::INFINITY;
-                    let mut high = f32::NEG_INFINITY;
-                    for corner in &quad.positions {
-                        low = low.min(corner[axis]);
-                        high = high.max(corner[axis]);
-                    }
-                    high - low
-                })
-                .collect();
-            let flat = plane_axis;
-            assert!(
-                spread[flat] < 1e-5,
-                "axis {flat} should be flat: {spread:?}"
+    fn reverse_keys_swap_the_cell_they_are_on() {
+        let source = header37(1)
+            + &SPRITE
+                .replace("TexRow: 1\r\n", "TexRow: 2\r\n")
+                .replace("TexCol: 1\r\n", "TexCol: 2\r\n")
+                .replace("TexInterval: 50\r\n", "TexInterval: 1000\r\n");
+        let mut player = build(&source);
+        step(&mut player, 0.);
+        assert_eq!(
+            player.quads()[0].uv,
+            [[0., 0.], [0.5, 0.], [0., 0.5], [0.5, 0.5]],
+            "cell 0 of a 2x2 atlas"
+        );
+
+        let flipped = source
+            .replace("RotFromView: 0\r\n", "RotFromView: 0\r\nUReverse: 1\r\n")
+            .replace(
+                "GrndNormOnly: 0\r\n",
+                "GrndNormOnly: 0\r\nVReverse: 1\r\nUVExchg: 0\r\n",
             );
-            for axis in 0..3 {
-                if axis != flat {
-                    assert!(
-                        spread[axis] > 0.5,
-                        "axis {axis} should carry the quad: {spread:?}"
-                    );
-                }
+        let mut player = build(&flipped);
+        step(&mut player, 0.);
+        assert_eq!(
+            player.quads()[0].uv,
+            [[0.5, 0.5], [0., 0.5], [0.5, 0.], [0., 0.]],
+            "the same cell, mirrored inside itself"
+        );
+    }
+
+    /// `水门_瀑布` is a 3x2 atlas with `TileMode 0` and `TexSpeed (0, -1.5)`.
+    ///
+    /// The viewer used to scroll those speeds on top of stepping the cells, and
+    /// a flipbook cell is *assigned*, not scrolled: `A3DGFXElement::TexAnimation`
+    /// adds `m_fUOffsetSpeed * dt` in the tile branch only and otherwise writes
+    /// `m_fTexU = m_fTexWid * curCol` (A3DGFXElement.h:539-577, quoted in
+    /// `Findings/World-effects-2026-11-09.md` section 16). Twenty seconds of the
+    /// old code put the window thirty texture heights below the sheet, so the
+    /// sampler returned the same edge texel for every corner: the motionless
+    /// white card the field reported. A flipbook has to stay on its own grid
+    /// however long the effect runs.
+    #[test]
+    fn a_waterfall_flipbook_never_scrolls_off_its_sheet() {
+        let source = header37(1)
+            + &SPRITE
+                .replace("TexRow: 1\r\n", "TexRow: 2\r\n")
+                .replace("TexCol: 1\r\n", "TexCol: 3\r\n")
+                .replace(
+                    "TexFile: 粒子\\glow.dds\r\n",
+                    "TexFile: 物体\\waterfall.dds\r\nTexSpeed: 0\r\nTexSpeed: -1.5\r\n",
+                );
+        let mut player = build(&source);
+        step(&mut player, 0.);
+        let first = player.quads()[0].uv;
+        let mut distinct = Vec::new();
+        // Forty half-second frames is the twenty seconds the report ran for.
+        for _ in 0..40 {
+            step(&mut player, 500.);
+            let uv = player.quads()[0].uv;
+            for (index, point) in uv.iter().enumerate() {
+                assert!(
+                    (0. ..=1.).contains(&point[0]) && (0. ..=1.).contains(&point[1]),
+                    "corner {index} samples {point:?}, off a 3x2 sheet: the window \
+                     scrolled off the atlas",
+                );
+            }
+            if !distinct.contains(&uv) {
+                distinct.push(uv);
             }
         }
+        assert!(
+            distinct.len() > 1,
+            "the sheet never changed cell: the flipbook is frozen, not animated"
+        );
+        assert!(
+            first != player.quads()[0].uv,
+            "the last frame repeats the first: the walk is not running"
+        );
+    }
+
+    /// The name a host gives a player is what identifies it in every log line the
+    /// element, frame and card channels write, so it has to survive `set_name`.
+    #[test]
+    fn a_player_remembers_the_name_its_host_gave_it() {
+        let mut player = build(&(header37(1) + SPRITE));
+        assert_eq!(player.name(), "");
+        player.set_name("gfx/场景/树林光束.gfx");
+        assert_eq!(player.name(), "gfx/场景/树林光束.gfx");
+    }
+
+    /// The four shaft rules the settings tab offers, on the one keypoint the
+    /// reports disagree about: a `Direction` that turns the card's own Z onto
+    /// the world's +Y. The client's rule follows it and stands the shaft up;
+    /// the other three are the comparisons a report can act on.
+    #[test]
+    fn the_axial_shaft_rule_is_the_settings_choice() {
+        // Off the shaft axes, so no case degenerates: a camera on the shaft
+        // gives the client a zero `vUp` and the builder returns a zero quad.
+        let view = View {
+            position: Vec3::new(5., 5., 10.),
+            ..view()
+        };
+        let common = Common::default();
+        let mut context = spawn_context(&view, &common);
+        // The keypoint the Archosaur report came back vertical on: a `Direction`
+        // that turns the card's own Z onto the world's +Y. A placement is
+        // `parent * keypoint`, so this is what the corners are built against.
+        context.keypoint_direction = Quat::from_axis_angle(Vec3::X, std::f32::consts::FRAC_PI_2);
+        context.placement = Mat4::from_quat(context.keypoint_direction);
+
+        // The client's `GetParentDir() * kp.m_vDir`, applied to `_unit_z`: the
+        // placement's own Z axis, so this keypoint stands the shaft up.
+        assert!(
+            shaft_axis(&mut context, EffectShaft::Client)
+                .dot(Vec3::Y)
+                .abs()
+                > 0.999,
+            "the client rule has to follow the keypoint"
+        );
+        // World up stands the shaft up whatever the placement says.
+        assert!(
+            shaft_axis(&mut context, EffectShaft::WorldUp)
+                .dot(Vec3::Y)
+                .abs()
+                > 0.999
+        );
+        // The root's own direction, with the keypoint taken back out: taking
+        // this keypoint out of the placement leaves the identity, so the shaft
+        // goes back onto +Z.
+        assert!(
+            shaft_axis(&mut context, EffectShaft::RootDir)
+                .dot(Vec3::Z)
+                .abs()
+                > 0.999
+        );
+        // The client axis with its rise removed. Its rise was the whole axis,
+        // so this case falls back to the root direction flattened; the point of
+        // the assertion is that the answer is horizontal and unit length.
+        let flat = shaft_axis(&mut context, EffectShaft::Horizontal);
+        assert!(flat.y.abs() < 1e-5, "horizontal must have no rise: {flat}");
+        assert!((flat.length() - 1.).abs() < 1e-4);
+
+        // The bug the switch was added over: the branch used to multiply the
+        // parent's *transpose*, i.e. its inverse rotation, so every shaft was
+        // mirrored about its centre. A tilted placement has to come out on the
+        // side the placement itself is on.
+        context.keypoint_direction = Quat::IDENTITY;
+        context.placement = Mat4::from_rotation_x(0.5);
+        let expected = context.placement.z_axis.truncate().normalize();
+        let shaft = shaft_axis(&mut context, EffectShaft::Client);
+        assert!(
+            (shaft - expected).length() < 1e-4,
+            "the shaft has to be the placement's Z, not its inverse: {shaft} vs {expected}"
+        );
+    }
+
+    /// `Fill_Verts_3D`'s `m_bRotFromView` branch, corner for corner and UV for
+    /// UV.
+    ///
+    /// The client builds this card in world space (`A3DDecalEx.cpp:399-402`):
+    ///
+    ///     verts[0] = vPos - vDir * fHeight1 + vUp * fWidth2   // (u,   v + hei)
+    ///     verts[1] = vPos + vDir * fHeight2 + vUp * fWidth2   // (u,   v)
+    ///     verts[2] = vPos - vDir * fHeight1 - vUp * fWidth1   // (u+wid, v + hei)
+    ///     verts[3] = vPos + vDir * fHeight2 - vUp * fWidth1   // (u+wid, v)
+    ///
+    /// with `vUp = normalize(cross(vPos - eye, vDir))`. An off-centre pivot and a
+    /// keypoint that turns the shaft off the eye axis make all four corners
+    /// distinct, so the order, the extents and the pivot can each be read.
+    #[test]
+    fn a_rot_from_view_card_is_the_clients_four_vertices() {
+        let view = View {
+            position: Vec3::new(5., 5., 10.),
+            ..view()
+        };
+        let common = Common::default();
+        let mut context = spawn_context(&view, &common);
+        // +90 degrees about X turns the placement's Z onto world -Y: a shaft that
+        // is neither degenerate against the eye ray nor parallel to the card.
+        let keypoint = Quat::from_axis_angle(Vec3::X, std::f32::consts::FRAC_PI_2);
+        context.keypoint_direction = keypoint;
+        context.placement = Mat4::from_quat(keypoint);
+        let corners = quad_corners(
+            &context,
+            QuadBasis::Axial,
+            Vec3::ZERO,
+            2.,
+            10.,
+            [0.25, 0.75],
+            [false; 2],
+            0.,
+            1.,
+        );
+        let shaft = context.placement.z_axis.truncate().normalize();
+        let side = (Vec3::ZERO - view.position).cross(shaft).normalize();
+        // `Width 2` and `Height 10` are half sizes, `OrgPt (0.25, 0.75)` splits
+        // them into 1 / 3 across and 15 / 5 along, and the keypoint scale is 1.
+        let negative = -side;
+        let expect = [
+            side * 3. - shaft * 15.,
+            side * 3. + shaft * 5.,
+            negative - shaft * 15.,
+            negative + shaft * 5.,
+        ];
+        for (index, want) in expect.into_iter().enumerate() {
+            let got = Vec3::from_array(corners[index]);
+            assert!(
+                (got - want).length() < 1e-4,
+                "verts[{index}] is {got:?}, the client writes {want:?}"
+            );
+        }
+        // The rect this branch is paired with, from a common that asks for no
+        // flips: `(u, v + hei)`, `(u, v)`, `(u + wid, v + hei)`, `(u + wid, v)`.
+        let uv = axial_uv(flipbook_uv(&common, 0.));
+        assert_eq!(uv, [[0., 1.], [0., 0.], [1., 1.], [1., 0.]]);
+    }
+
+    /// The axis a zero-width axial card is drawn along, for one shaft rule: its
+    /// two far corners differ only along the shaft, so the axis falls out of the
+    /// corners the builder returns.
+    fn shaft_axis(context: &mut ElementContext<'_>, shaft: EffectShaft) -> Vec3 {
+        context.shaft = shaft;
+        let corners = quad_corners(
+            context,
+            QuadBasis::Axial,
+            Vec3::ZERO,
+            0.,
+            1.,
+            [0.5, 0.5],
+            [false; 2],
+            0.,
+            1.,
+        );
+        // In the client's order `verts[1] - verts[0]` is the shaft
+        // (`+vDir * (fHeight1 + fHeight2)`); `verts[0] - verts[2]` is the width,
+        // which is zero for this card.
+        let along = Vec3::from_array(corners[1]) - Vec3::from_array(corners[0]);
+        along.normalize()
+    }
+
+    /// The two records the map actually authors decide the axial direction, and
+    /// neither of them agrees with "the element's Z axis".
+    ///
+    /// `A3DGFXEx::SetDirAndUp` (A3DGFXEx.cpp:1574-1585) writes the basis as
+    /// **rows** — `SetRow(0, right)`, `SetRow(1, up)`, `SetRow(2, dir)` — and
+    /// `m_qDir * (0,0,1)` is therefore the third *column* of that row-major
+    /// matrix, `(right.z, up.z, dir.z)`. The two placements below are quoted from
+    /// `world.ecwld`:
+    ///
+    /// * `天煞光束` at (1528.0, 602.5, 1032.3) — `dir (0,0,1)`, `up (0,-1,0)` —
+    ///   gives `(0,0,1)`: the shaft lies horizontally, as the Archosaur footage
+    ///   shows.
+    /// * `树林光束` at (232.3, 229.1, 2960.8) — `dir (0,0.565,0.825)`,
+    ///   `up (0,0.825,-0.565)` — gives `(0,-0.565,0.825)`: tilted **down** 34
+    ///   degrees. Reading the raw `dir` instead tilts the same shaft up by 34
+    ///   degrees, which is what made the forest rays look scattered.
+    #[test]
+    fn a_rot_from_view_shaft_follows_the_row_major_basis() {
+        let axial = SPRITE
+            .replace("RotFromView: 0", "RotFromView: 1")
+            .replace("Position: 1, 2, 3", "Position: 0, 0, 0");
+        // Off the shaft axes, so no case degenerates: a camera exactly on the
+        // shaft gives the client a zero `vUp` as well.
+        let camera = View {
+            position: Vec3::new(5., 5., 10.),
+            ..view()
+        };
+        let some = |dir: Vec3, up: Vec3, expect: Vec3| {
+            let mut player = build(&(header37(1) + &axial));
+            let transform = Mat4::from_cols(
+                up.cross(dir).extend(0.),
+                up.extend(0.),
+                dir.extend(0.),
+                Vec3::ZERO.extend(1.),
+            );
+            player.advance(0., &camera, transform, 1., 1.).unwrap();
+            let quad = player.quads().first().expect("the shaft draws");
+            // `verts[1] - verts[0]` is `vDir * (fHeight1 + fHeight2)`.
+            let along = Vec3::from_array(quad.positions[1]) - Vec3::from_array(quad.positions[0]);
+            assert!(
+                along.normalize().dot(expect).abs() > 0.999,
+                "dir {dir:?} up {up:?} should give {expect:?}, got {along:?}"
+            );
+        };
+        // Horizontal, both records of the Archosaur pair.
+        some(
+            Vec3::new(0., 0., 1.),
+            Vec3::new(0., -1., 0.),
+            Vec3::new(0., 0., 1.),
+        );
+        some(
+            Vec3::new(0., 0., 1.),
+            Vec3::new(0., 1., 0.),
+            Vec3::new(0., 0., 1.),
+        );
+        // The forest's sun ray, and the case this test got wrong for three
+        // reports. `RotateVec(q_parent * q_kp, _unit_z)` takes the placement's
+        // own Z axis, so a record that authors `dir (0, 0.565, 0.825)` -- 34
+        // degrees *up* -- is drawn 34 degrees up. The expectation here used to
+        // be `(0, -0.565, 0.825)`, the same angle *down*, because the branch it
+        // pinned multiplied the parent's transpose; that mirrored every shaft
+        // about its centre and is what the field report saw as "the sun rays
+        // point in random directions".
+        some(
+            Vec3::new(0., 0.565, 0.825),
+            Vec3::new(0., 0.825, -0.565),
+            Vec3::new(0., 0.565, 0.825),
+        );
+    }
+
+    /// `RotFromView: 0` keeps the authored keypoint basis: the card lies in the
+    /// element's own XY plane, whatever the camera does. 8,271 of the corpus's
+    /// 8,869 sprites take this path; the 598 that set the flag are covered by
+    /// [`Self::a_rot_from_view_card_lies_along_the_element_direction`].
+    #[test]
+    fn a_sprite_without_rot_from_view_keeps_the_element_basis() {
+        let camera = View {
+            position: Vec3::new(1., -8., 3.),
+            right: Vec3::X,
+            up: Vec3::Z,
+            forward: Vec3::Y,
+        };
+        let mut player = build(&(header37(1) + SPRITE));
+        player.advance(0., &camera, Mat4::IDENTITY, 1., 1.).unwrap();
+        let quad = &player.quads()[0];
+        let spread: Vec<f32> = (0..3)
+            .map(|axis| {
+                let mut low = f32::INFINITY;
+                let mut high = f32::NEG_INFINITY;
+                for corner in &quad.positions {
+                    low = low.min(corner[axis]);
+                    high = high.max(corner[axis]);
+                }
+                high - low
+            })
+            .collect();
+        assert!(
+            spread[2] < 1e-5,
+            "the card is flat on the element's Z: {spread:?}"
+        );
+        assert!(
+            spread[0] > 0.5 && spread[1] > 0.5,
+            "the element's X and Y carry the quad: {spread:?}"
+        );
+    }
+
+    /// A billboard decal (102) is two crossed cards, not one: `m_nRectNum = 2`
+    /// (A3DDecalEx.cpp:288) and `Update_Billboard` writes eight vertices, the
+    /// second four in the element's ZY plane. Extents are half sizes and the
+    /// `OrgPt` split does not apply — `Update_Billboard` never reads it.
+    #[test]
+    fn a_billboard_decal_is_two_crossed_cards() {
+        let source = header37(1) + &SPRITE.replace("GFXELEMENTID: 100", "GFXELEMENTID: 102");
+        let mut player = build(&source);
+        player.advance(0., &view(), Mat4::IDENTITY, 1., 1.).unwrap();
+        let quads = player.quads();
+        assert_eq!(quads.len(), 2, "one card per rect: {:?}", quads.len());
+        let corner = |quad: &EffectQuad, index: usize| Vec3::from_array(quad.positions[index]);
+        // `DedaultScale: 2` and the fixture keypoint's `Scale: 2`, so the card is
+        // 2 * 0.25 * 2 half wide and 2 * 0.5 * 2 half tall.
+        for (slot, quad) in quads.iter().enumerate() {
+            let width = corner(quad, 1) - corner(quad, 0);
+            let height = corner(quad, 2) - corner(quad, 0);
+            assert!(
+                (width.length() - 2.).abs() < 1e-4,
+                "card {slot} is 2 units wide: {}",
+                width.length()
+            );
+            assert!(
+                (height.length() - 4.).abs() < 1e-4,
+                "card {slot} is 4 units tall: {}",
+                height.length()
+            );
+            assert!(
+                (height.normalize().dot(Vec3::Y).abs() - 1.).abs() < 1e-4,
+                "both cards share the element Y as their height: {height:?}"
+            );
+            let centre = (0..4).fold(Vec3::ZERO, |sum, i| sum + corner(quad, i)) / 4.;
+            assert!(
+                (centre - Vec3::new(2., 4., 6.)).length() < 1e-4,
+                "card {slot} is centred on the element position: {centre:?}"
+            );
+        }
+        // The two cards are perpendicular, one on X and one on Z.
+        let first = (corner(&quads[0], 1) - corner(&quads[0], 0)).normalize();
+        let second = (corner(&quads[1], 1) - corner(&quads[1], 0)).normalize();
+        assert!(
+            first.dot(second).abs() < 1e-4,
+            "the crossed cards are perpendicular: {first:?} {second:?}"
+        );
+    }
+
+    /// The 2D decal (101) is drawn in screen space: `Fill_Verts_2D`
+    /// (A3DDecalEx.cpp:640-760) takes the extents from the camera's right and up
+    /// axes, and `ZOffset` changes only the depth it writes — never the card's
+    /// projected position or size.
+    #[test]
+    fn a_two_d_decal_faces_the_camera_and_keeps_the_offset_in_depth() {
+        // The eye sits sixteen units down +Z from the card, looking at it, so the
+        // authored centre (2, 4, 6) is ten units away and every corner of the
+        // card is at a depth near ten. A camera behind its own card would make the
+        // push target negative and the helper refuse it, which is the guard, not
+        // the behaviour this test is about.
+        let camera = View {
+            position: Vec3::new(2., 4., 16.),
+            right: Vec3::X,
+            up: Vec3::Y,
+            forward: -Vec3::Z,
+        };
+        let header = header37(1).replace("MOXTVersion: 37", "MOXTVersion: 42");
+        let element = SPRITE
+            .replace("GFXELEMENTID: 100", "GFXELEMENTID: 101")
+            .replace("Height: 0.5\r\n", "Height: 0.5\r\nZOffset: 2.000000\r\n");
+        let mut player = build(&format!("{header}{element}"));
+        player.advance(0., &camera, Mat4::IDENTITY, 1., 1.).unwrap();
+        let quad = player.quads().first().expect("the card draws");
+        let corner = |index: usize| Vec3::from_array(quad.positions[index]);
+        let width = corner(1) - corner(0);
+        let height = corner(2) - corner(0);
+        assert!(
+            (width.normalize().dot(camera.right).abs() - 1.).abs() < 1e-4,
+            "the width lies on the camera's right: {width:?}"
+        );
+        assert!(
+            (height.normalize().dot(camera.up).abs() - 1.).abs() < 1e-4,
+            "the height lies on the camera's up: {height:?}"
+        );
+        // `Fill_Verts_2D` writes `fWidth = m_fWidth1/2 * kp.m_fScale * fScale`, so
+        // a 0.25 x 0.5 half-extent card at keypoint scale 2 under `DedaultScale: 2`
+        // is 2 wide and 4 tall in world units, and stays that size in the file:
+        // `ZOffset` is not part of the extents.
+        let depth = |p: Vec3| (p - camera.position).dot(camera.forward);
+        let centre = (0..4).fold(Vec3::ZERO, |sum, i| sum + corner(i)) / 4.;
+        // Moving 4 of the 10 units closer would make a card that kept its world
+        // extents `10/6` times larger on screen. A scale about the eye keeps each
+        // corner on its own ray instead, so the world extents shrink by exactly
+        // the depth's factor and the *projected* size — world extent over depth —
+        // does not move. That ratio is the assertion that matters.
+        let authored_width = 2.;
+        let authored_height = 4.;
+        let pushed = 10. - 4.;
+        assert!(
+            (width.length() / depth(centre) - authored_width / 10.).abs() < 1e-4,
+            "the projected width is unchanged: {} / {} vs {authored_width} / 10",
+            width.length(),
+            depth(centre)
+        );
+        assert!(
+            (height.length() / depth(centre) - authored_height / 10.).abs() < 1e-4,
+            "the projected height is unchanged: {} / {} vs {authored_height} / 10",
+            height.length(),
+            depth(centre)
+        );
+        // And the world extents did shrink, by the depth's own factor — which is
+        // what the old corner translation did *not* do: it kept 2 x 4 at depth 6
+        // and drew the card 10/6 larger.
+        assert!(
+            (width.length() - authored_width * pushed / 10.).abs() < 1e-3,
+            "the world width shrinks with the depth: {} vs {}",
+            width.length(),
+            authored_width * pushed / 10.
+        );
+        // The authored centre is ten units from the eye; `ZOffset: 2` at
+        // `GetActualScale()` 4 (the root's `DedaultScale: 2` times the placement's
+        // 1) is a push of 4, so the pushed centre's depth — the one `vCenter.z`
+        // every corner takes — is ten minus four.
+        for index in 0..4 {
+            assert!(
+                (depth(corner(index)) - pushed).abs() < 1e-3,
+                "corner {index} takes the pushed depth: {} vs {pushed}",
+                depth(corner(index))
+            );
+        }
+        assert!(
+            (depth(centre) - pushed).abs() < 1e-3,
+            "and so does the centre: {centre:?}"
+        );
+    }
+
+    /// The unit under test, without a player: `push_toward_eye` moves each corner
+    /// along its own eye ray to the depth the pushed *centre* reaches, which is
+    /// the client's `vCenter.z` for all four vertices (`Fill_Verts_2D`,
+    /// A3DDecalEx.cpp:723-735).
+    #[test]
+    fn push_toward_eye_keeps_each_corner_on_its_own_ray() {
+        let view = View {
+            position: Vec3::new(0., 0., 5.),
+            right: Vec3::X,
+            up: Vec3::Y,
+            forward: -Vec3::Z,
+        };
+        // A 2x2 card in the plane z = 0, i.e. five units in front of the eye. Its
+        // corners are all at the same depth, so "the centre's pushed depth" and
+        // "each corner's own depth minus the push" agree here, which is what
+        // makes the expectation below exact rather than approximate.
+        let corners = [[-1., 1., 0.], [1., 1., 0.], [-1., -1., 0.], [1., -1., 0.]];
+        let depth = |p: Vec3| (p - view.position).dot(view.forward);
+        let moved = push_toward_eye(corners, &view, 2.);
+        for (index, corner) in moved.iter().enumerate() {
+            let before = Vec3::from_array(corners[index]);
+            let after = Vec3::from_array(*corner);
+            assert!(
+                (depth(after) - 3.).abs() < 1e-5,
+                "corner {index} takes the pushed centre's depth, 5 - 2 = 3: {}",
+                depth(after)
+            );
+            assert!(
+                (depth(before) - 5.).abs() < 1e-5,
+                "corner {index} started at depth 5"
+            );
+            // Its projected position is its ray's direction, unchanged.
+            assert!(
+                ((before - view.position).normalize() - (after - view.position).normalize())
+                    .length()
+                    < 1e-5,
+                "corner {index} stayed on its ray"
+            );
+        }
+        // Two units of a five-unit depth: the card is 3/5 as far away, so a card
+        // that keeps its projected size is 3/5 as wide in world units.
+        let width = (Vec3::from_array(moved[1]) - Vec3::from_array(moved[0])).length();
+        assert!(
+            (width - 2. * 3. / 5.).abs() < 1e-4,
+            "the world width shrinks with the depth, so the screen width does not: {width}"
+        );
+        // A zero push is the identity, and a push that would reach the eye is
+        // refused rather than mirrored behind the viewer (the client's clamp has
+        // no world-space equivalent).
+        assert_eq!(push_toward_eye(corners, &view, 0.), corners);
+        assert_eq!(push_toward_eye(corners, &view, 9.), corners);
+    }
+
+    /// `FaceToViewer` is the root's frame, not a per-element billboard:
+    /// `A3DGFXEx::Tick` (A3DGFXEx.cpp:1245-1258) rebuilds the matrix from the
+    /// vector to the camera every tick, so the authored placement orientation is
+    /// replaced — here a placement turned 90 degrees about X, whose own Z axis
+    /// points at -Y, still ends up facing the camera.
+    #[test]
+    fn a_face_to_viewer_root_turns_its_own_frame() {
+        let camera = View {
+            position: Vec3::new(0., 0., 10.),
+            right: Vec3::X,
+            up: Vec3::Y,
+            forward: -Vec3::Z,
+        };
+        let header = header37(1)
+            .replace("MOXTVersion: 37", "MOXTVersion: 39")
+            .replace("Raytrace: 0\r\n", "Raytrace: 0\r\nFaceToViewer: 1\r\n");
+        let mut player = build(&(header + SPRITE));
+        player
+            .advance(
+                0.,
+                &camera,
+                Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                1.,
+                1.,
+            )
+            .unwrap();
+        let quad = player.quads().first().expect("the card draws");
+        let corner = |index: usize| Vec3::from_array(quad.positions[index]);
+        let width = corner(1) - corner(0);
+        let height = corner(2) - corner(0);
+        let normal = width.cross(height).normalize();
+        let to_camera = (camera.position - Vec3::ZERO).normalize();
+        assert!(
+            (normal.dot(to_camera).abs() - 1.).abs() < 1e-4,
+            "the card faces the camera, not the authored -Y: {normal:?}"
+        );
+        assert!(
+            (height.normalize().dot(Vec3::Y).abs() - 1.).abs() < 1e-4,
+            "the up lane stays the world up: {height:?}"
+        );
+    }
+
+    /// `NoChangeDir` keeps the identity frame the root is constructed with:
+    /// `SetParentTM` copies only the translation row and skips the basis
+    /// (`A3DGFXEx.cpp:1592-1598`), while `SetDirAndUp` returns before touching it
+    /// (`A3DGFXEx.cpp:1576`), so a placement turned 90 degrees about X must leave
+    /// the card in the world XY plane.
+    #[test]
+    fn a_no_change_dir_root_ignores_the_placement_rotation() {
+        let camera = view();
+        // The root serialiser writes `NoChangeDir` with the two 2D flags after the
+        // controllers and before the element count, so the group goes there.
+        let header = header37(1).replace(
+            "GFXELEMENTCOUNT",
+            "NoChangeDir: 1\r\n2DRender: 0\r\n2DBackLayer: 0\r\nGFXELEMENTCOUNT",
+        );
+        let mut player = build(&(header + SPRITE));
+        player
+            .advance(
+                0.,
+                &camera,
+                Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2),
+                1.,
+                1.,
+            )
+            .unwrap();
+        let quad = player.quads().first().expect("the card draws");
+        let corner = |index: usize| Vec3::from_array(quad.positions[index]);
+        let width = corner(1) - corner(0);
+        let height = corner(2) - corner(0);
+        let normal = width.cross(height).normalize();
+        assert!(
+            (normal.dot(Vec3::Z).abs() - 1.).abs() < 1e-4,
+            "the placement rotation is dropped: {normal:?}"
+        );
+        assert!(
+            (height.normalize().dot(Vec3::Y).abs() - 1.).abs() < 1e-4,
+            "the up lane stays the world up: {height:?}"
+        );
     }
 
     /// `FadeByDist` scales the alpha between `FadeStart` and `FadeEnd`, and the
@@ -7057,60 +11762,45 @@ mod tests {
     /// stretch per segment is constant. The count was `(1 / length) * coeff`,
     /// which is inverted, so a beam longer than the coefficient collapsed to the
     /// one-segment floor and drew as a single billboard across the whole span.
+
+    /// `CalcActualSpeed` multiplies the file's `PlaySpeed` by the placement's
+    /// `fSpeed`; neither replaces the other. A root that authors 0.4 and is
+    /// placed at 1 runs at 0.4, and a root that authors 1 and is placed at 0.4
+    /// runs at 0.4 as well.
     #[test]
-    fn a_curve_keeps_a_constant_stretch_per_segment() {
-        // Two 2-point spans of very different lengths, one element each.
-        let curve = |a: &str, b: &str| {
+    fn a_root_rate_is_the_files_play_speed_times_the_placements_speed() {
+        fn root_rate(file: f32) -> String {
             format!(
-                "GFXELEMENTID: 190\nName: cu\nSrcBlend: 5\nDestBlend: 2\n\
-                 Coeff: 1.000000\nheight: 1.0\n\
-                 RepeatCount: 1\nRepeatDelay: 0\n\
-                 StartTime: 0\nKEYPOINTCOUNT: 1\nInterpolateMode: 0\nTimeSpan: -1\n\
-                 Position: 0, 0, 0\nColor: -1\nScale: 1\nDirection: 0, 0, 0, 1\n\
-                 Rad_2D: 0\nCtrlMethodCount: 0\n"
-            ) + &format!("Vec: {a}\nVec: {b}\n")
-        };
-        let _ = curve;
-        // The span comes from the root's two `Vec:` lines, so the length is set
-        // on the root header. Compare a 10-unit chord with a 40-unit one: the
-        // quad count must scale with the chord, not collapse to one.
-        let root_span = |half: f32| {
-            format!(
-                "MOXTVersion: 79\r\nDedaultScale: 1\r\nPlaySpeed: 1\r\nDefaultAlpha: 1\r\n\
+                "MOXTVersion: 37\r\nDedaultScale: 1\r\nPlaySpeed: {file}\r\nDefaultAlpha: 1\r\n\
                  Raytrace: 0\r\nFadeByDist: 0\r\nFadeStart: 0\r\nFadeEnd: 0\r\n\
-                 Vec: 0, 0, 0\r\nVec: {h}, 0, 0\r\nShakeCam: 0\r\nGFXELEMENTCOUNT: 1\r\n\
-                 GFXELEMENTID: 190\r\nName: cu\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
-                 TexFile: 轨迹\\beam.dds\r\nPriority: 2\r\nIsDummy: 0\r\n\
-                 Coeff: 1.000000\r\nheight: 1.000000\r\n\
-                 RepeatCount: 1\r\nRepeatDelay: 0\r\n\
+                 Vec: 0, 0, 0\r\nVec: 1, 1, 1\r\nShakeCam: 0\r\nGFXELEMENTCOUNT: 1\r\n\
+                 GFXELEMENTID: 100\r\nName: inner\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+                 RepeatCount: -1\r\nRepeatDelay: 0\r\n\
+                 Width: 1\r\nHeight: 1\r\nRotFromView: 0\r\nGrndNormOnly: 0\r\n\
                  StartTime: 0\r\nKEYPOINTCOUNT: 1\r\nInterpolateMode: 0\r\nTimeSpan: -1\r\n\
                  Position: 0, 0, 0\r\nColor: -1\r\nScale: 1\r\nDirection: 0, 0, 0, 1\r\n\
-                 Rad_2D: 0\r\nCtrlMethodCount: 0\r\n",
-                h = half
+                 Rad_2D: 0\r\nCtrlMethodCount: 0\r\n"
             )
-        };
-        let count = |half: f32| {
-            let mut player = build(&root_span(half));
-            step(&mut player, 16.);
-            player.quads().len()
-        };
-        let short = count(5.);
-        let long = count(20.);
-        assert!(short >= 2, "a 10-unit chord is {short} quads, not one slab");
-        assert!(
-            long > short,
-            "a 40-unit chord ({long}) must carry more segments than a 10-unit one \
-             ({short}); the count is inverted if it does not"
-        );
-        // The invariant itself: stretch per segment is the coefficient.
-        for half in [5f32, 20.] {
-            let length = half * 2.;
-            let segments = count(half).max(1) as f32;
-            let stretch = length / segments;
+        }
+        for (file, placement, want) in [
+            (0.4f32, None, 0.4f32),
+            (0.4, Some(1.0), 0.4),
+            (1.0, Some(0.4), 0.4),
+            (0.5, Some(2.0), 1.0),
+            (1.0, None, 1.0),
+        ] {
+            let source = root_rate(file);
+            let mut player = Player::new(gfx_file::parse(&source).unwrap(), 7, &mut |_| {
+                Err("no child".to_string())
+            })
+            .unwrap();
+            if let Some(speed) = placement {
+                player.set_play_speed(speed);
+            }
             assert!(
-                (stretch - 1.).abs() < 1.05,
-                "assumed span {length} -> {segments} quads, stretch {stretch}, \
-                 which is not the ~1.0 the coefficient asks for"
+                (player.play_speed() - want).abs() < 1e-6,
+                "file {file} placement {placement:?}: rate {} not {want}",
+                player.play_speed()
             );
         }
     }
@@ -7444,8 +12134,18 @@ mod tests {
              istaildisappear: {is_tail_disappear}\r\nvertslife: {vertices_life}\r\n\
              tailfadeout: 0\r\nStartTime: 0\r\nKEYPOINTCOUNT: 1\r\nInterpolateMode: 0\r\n\
              TimeSpan: {duration_ms}\r\nPosition: 0, 0, 0\r\nColor: -1\r\nScale: 1.000000\r\n\
-             Direction: 0, 0, 0, 1\r\nRad_2D: 0\r\nCtrlMethodCount: 0\r\n",
+             Direction: 0, 0, 0, 1\r\nRad_2D: 0\r\n{controls}",
             header = header79(1),
+            controls = if is_append {
+                // `A3DGFXLightningEx::TickAnimation` only takes the append path
+                // when `m_bCurvedMethod` is set, and `A3DGFXLightning::InitBuf`
+                // sets it from a curve-move control (CtrlType 110) on the first
+                // keypoint — not from a file key.
+                "CtrlMethodCount: 1\r\nCtrlType: 110\r\nStartTime: 0\r\nEndTime: -1\r\n\
+                 CalcDir: 0\r\nCount: 2\r\nPos: 0, 0, 0\r\nPos: 1, 0, 0\r\n"
+            } else {
+                "CtrlMethodCount: 0\r\n"
+            },
             is_append = is_append as u8,
             is_tail_disappear = is_tail_disappear as u8,
         )
@@ -7484,19 +12184,19 @@ mod tests {
         }
     }
 
-    /// `0x714030` lays one vertex down per `interval / Segs` milliseconds, and
-    /// `0x714067` needs the accumulator strictly past a whole step first. With a
-    /// 100 ms element clock and four segments that is 25 ms a vertex, so 20 ms
-    /// frames build the strip one segment at a time and the fifth frame is the
-    /// one that does not quite reach the next step.
+    /// `TickAdd` lays one vertex down per `TimeSpan / (Segs * LightNum + 1)`
+    /// milliseconds, and it needs the accumulator strictly past a whole step
+    /// first. A 100 ms element clock with four segments and one light is five
+    /// vertex pairs, so the step is 20 ms: a 20 ms frame does not quite reach it
+    /// and lays nothing, while every further 40 ms lays two vertices.
     #[test]
     fn an_appending_trail_lays_one_vertex_per_step_of_its_duration() {
         let mut player = build(&trail(4, true, false, 100_000., 100.));
         let drawn: Vec<usize> = (0..6).map(|_| trail_quads(&mut player, 20.)).collect();
         assert_eq!(
             drawn,
-            vec![0, 1, 2, 3, 3, 3],
-            "one vertex per 25 ms, and the frame that only reaches 25 ms lays none"
+            vec![0, 2, 2, 3, 3, 3],
+            "a 20 ms frame is not past the 20 ms step, and 40 ms lays two vertices"
         );
     }
 
@@ -7508,8 +12208,8 @@ mod tests {
         let mut player = build(&trail(4, true, false, 100_000., 100.));
         assert_eq!(
             trail_quads(&mut player, 60.),
-            2,
-            "60 ms over a 25 ms step lays two vertices in one frame"
+            3,
+            "60 ms over a 20 ms step lays three vertices in one frame"
         );
     }
 
@@ -7522,10 +12222,15 @@ mod tests {
     fn a_trail_vertex_disappears_once_it_has_lived_its_life() {
         let mut player = build(&trail(4, true, true, 100., 100.));
         let drawn: Vec<usize> = (0..7).map(|_| trail_quads(&mut player, 30.)).collect();
+        assert_eq!(drawn[0], 1, "the first 30 ms frame lays one vertex");
+        assert!(
+            drawn.iter().any(|quads| *quads == 3),
+            "the strip fills before it starts to expire: {drawn:?}"
+        );
         assert_eq!(
-            drawn,
-            vec![1, 2, 3, 2, 1, 0, 0],
-            "the strip grows, holds at three, then loses its oldest vertex a frame at a time"
+            *drawn.last().unwrap(),
+            0,
+            "and the oldest records are dropped once they pass their life: {drawn:?}"
         );
     }
 
@@ -7538,9 +12243,13 @@ mod tests {
         let mut player = build(&trail(4, true, false, 100., 100.));
         let drawn: Vec<usize> = (0..7).map(|_| trail_quads(&mut player, 30.)).collect();
         assert_eq!(
-            drawn,
-            vec![1, 2, 3, 3, 3, 3, 3],
-            "the strip reaches its full length and stays there"
+            *drawn.last().unwrap(),
+            3,
+            "the strip reaches its full length and stays there: {drawn:?}"
+        );
+        assert!(
+            drawn.iter().all(|quads| *quads <= 3),
+            "nothing is expired past the authored strip: {drawn:?}"
         );
     }
 
@@ -7618,8 +12327,9 @@ mod tests {
         );
         assert_eq!(
             trail_quads(&mut player, 30.),
-            1,
-            "and the strip is laid down again from its first vertex"
+            2,
+            "and the strip is laid down again: the 16 ms frame before this one is \
+             still in the accumulator, so 46 ms of a 20 ms step is two vertices"
         );
     }
 
@@ -7651,6 +12361,29 @@ mod tests {
         player
             .advance_with_ground(16., &view(), transform, 1., 1., ground)
             .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    /// The same frame with terrain but no `GroundHit`, which is what the world's
+    /// effects get: the drape answers to the query alone.
+    fn step_draped(player: &mut Player, transform: Mat4, terrain: Option<GroundHeightQuery<'_>>) {
+        player
+            .advance_with_terrain(16., &view(), transform, 1., 1., None, terrain)
+            .unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    /// A `MatchGrnd` 3D decal whose parent-scaled extents are four units each
+    /// way: two cells an axis at `_grnd_grid = 2`, and the keypoint scale is
+    /// pinned to one so the arithmetic in the assertions is the client's own.
+    fn draped_sheet(match_ground: bool, ground_normal_only: bool) -> String {
+        header79(1)
+            + &ground_sprite(match_ground, false)
+                .replace("Width: 0.25", "Width: 1")
+                .replace("Height: 0.5", "Height: 1")
+                .replace("Scale: 2", "Scale: 1")
+                .replace(
+                    "GrndNormOnly: 0",
+                    &format!("GrndNormOnly: {}", ground_normal_only as u8),
+                )
     }
 
     /// `0x6e5b90` builds the rotation that takes world up onto the ground
@@ -7722,15 +12455,16 @@ mod tests {
         );
     }
 
-    /// `GroundHeight` without `MatchGrnd` takes the height and leaves the
-    /// orientation alone: `0x6fa7e3` returns owner+0x13c, the copy of the base
-    /// matrix `0x6e5592` re-transforms with the raycast height, and the
-    /// orientation selector `0x6fa810` returns the un-aligned owner+0x1a4
-    /// because `MatchGrnd` is clear. Every corner is therefore the corner the
-    /// element would have had with no ground at all, moved down by the
-    /// difference in height.
+    /// `GroundHeight` without `MatchGrnd` does not move a placed element. The
+    /// key is documented as a particle-init option — `ID_GFXOP_PARSYS_USE_GRND_
+    /// HEIGHT`, "Use ground height for init the particle" (A3DGFXElement.h) —
+    /// and the frame selector's height row (`0x6fa7e3`, owner+0x13c) is what the
+    /// *particle* corner builder (`0x71eb3b`) asks for. The shipped beams and
+    /// shafts author `MatchGrnd: 0` and appear at their authored ECWLD height in
+    /// retail, so a card keeps the frame it was authored with and the terrain
+    /// never reseats it.
     #[test]
-    fn ground_height_alone_moves_the_element_without_tilting_it() {
+    fn ground_height_without_match_grnd_keeps_the_authored_height() {
         let source = header79(1) + &ground_sprite(false, true);
         let transform = Mat4::from_translation(Vec3::new(3., 7., -2.));
         let mut without = build(&source);
@@ -7747,17 +12481,11 @@ mod tests {
         let expected = without.quads()[0].positions;
         let got = with.quads()[0].positions;
         for index in 0..4 {
-            let want = Vec3::from_array(expected[index]) + Vec3::new(0., 2. - 7., 0.);
             assert!(
-                (Vec3::from_array(got[index]) - want).length() < 1e-4,
-                "corner {index} is a pure translation of the un-snapped one: {got:?} against {want}"
+                (Vec3::from_array(got[index]) - Vec3::from_array(expected[index])).length() < 1e-4,
+                "corner {index} keeps its authored height: {got:?} against {expected:?}"
             );
         }
-        let centre = quad_centre(&with.quads()[0]);
-        assert!(
-            (centre.y - 2.).abs() < 1e-4,
-            "the element sits at the ground height, got {centre}"
-        );
     }
 
     /// `MatchGrnd` on its own only applies within 0.2 units of the ground:
@@ -7841,6 +12569,160 @@ mod tests {
         assert!(grounded.warnings().is_empty(), "{:?}", grounded.warnings());
     }
 
+    /// `A3DDecalEx::Fill_Verts_3D`'s ground branch: a `MatchGrnd` sheet is cut
+    /// into two-unit cells and every vertex takes its own height from the
+    /// terrain. Four units each way is two cells an axis, so the flat quad
+    /// becomes four, the sheet lies in the world XZ plane, and each corner sits
+    /// 0.2 above the slope underneath it — the number at `0x8eb828` that both
+    /// the lift and the near-ground test read.
+    #[test]
+    fn a_ground_matched_sprite_is_draped_over_the_terrain() {
+        let source = draped_sheet(true, false);
+        let mut player = build(&source);
+        let slope = |x: f32, _z: f32| Some(x);
+        let terrain: GroundHeightQuery<'_> = &slope;
+        step_draped(&mut player, Mat4::IDENTITY, Some(terrain));
+        let quads = player.quads();
+        assert_eq!(
+            quads.len(),
+            4,
+            "two cells an axis should be four quads, got {}",
+            quads.len()
+        );
+        let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
+        let (mut min_z, mut max_z) = (f32::MAX, f32::MIN);
+        for quad in quads {
+            for corner in quad.positions {
+                let [x, y, z] = corner;
+                assert!(
+                    (y - (x + 0.2)).abs() < 1e-4,
+                    "corner ({x}, {y}, {z}) should sit 0.2 over the slope, not {y}"
+                );
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_z = min_z.min(z);
+                max_z = max_z.max(z);
+            }
+        }
+        assert!(
+            (min_x + 2.).abs() < 1e-4
+                && (max_x - 2.).abs() < 1e-4
+                && (min_z + 2.).abs() < 1e-4
+                && (max_z - 2.).abs() < 1e-4,
+            "the sheet should span four units on the ground, got \
+             {min_x}..{max_x} by {min_z}..{max_z}"
+        );
+        // The flipbook rect is spread over the lattice, not repeated in every
+        // cell: a 2x2 sheet with a one-cell texture covers three distinct
+        // coordinates an axis and never more.
+        let mut us: Vec<f32> = quads
+            .iter()
+            .flat_map(|q| q.uv.iter().map(|p| p[0]))
+            .collect();
+        let mut vs: Vec<f32> = quads
+            .iter()
+            .flat_map(|q| q.uv.iter().map(|p| p[1]))
+            .collect();
+        us.sort_by(f32::total_cmp);
+        vs.sort_by(f32::total_cmp);
+        let distinct = |values: &mut Vec<f32>| {
+            values.dedup_by(|a, b| (*a - *b).abs() < 1e-5);
+            values.len()
+        };
+        assert_eq!(
+            (distinct(&mut us), distinct(&mut vs)),
+            (3, 3),
+            "a spread rect has three coordinates an axis, a repeated one has two: {us:?} {vs:?}"
+        );
+        assert!(player.warnings().is_empty(), "{:?}", player.warnings());
+    }
+
+    /// `YawEffect 1` lays the ground sheet in the element's own XY plane turned
+    /// until that plane's normal is world up (`A3DDecalEx.cpp:460-486`):
+    ///
+    /// ```cpp
+    /// A3DQUATERNION quad = GetParentDir() * kp.m_vDir;
+    /// A3DVECTOR3 vNewNorm = quad * _unit_z;
+    /// if (fabs(DotProduct(vNewNorm, _unit_y)) <= _grnd_delta) {
+    ///     AxisAngleToQuad(CrossProduct(vNewNorm, _unit_y), acosf(fAngle), quad2);
+    ///     quad_mix = quad2 * quad;
+    /// }
+    /// ...
+    /// A3DVECTOR3 vPos = matTran * A3DVECTOR3(fCol, fRow, 0);
+    /// vert.x = vPos.x; vert.z = vPos.z;
+    /// ```
+    ///
+    /// so a quarter turn about Y takes a sheet that is long on its own X and
+    /// short on its own Y from long-on-world-X to long-on-world-Z. Without the
+    /// key the lattice ignores the placement's rotation entirely.
+    #[test]
+    fn a_yaw_effect_sheet_lies_in_the_elements_own_plane() {
+        // Half extents 1 and 0.25 with the keypoint scale pinned to one, so the
+        // sheet is 2 by 0.5 before the root's `DedaultScale: 2` puts it at 4 by 1.
+        let sheet = header79(1)
+            + &ground_sprite(true, false)
+                .replace("Width: 0.25", "Width: 1")
+                .replace("Height: 0.5", "Height: 0.25")
+                .replace("Scale: 2", "Scale: 1");
+        let flat = |_x: f32, _z: f32| Some(0f32);
+        let terrain: GroundHeightQuery<'_> = &flat;
+        let footprint = |source: &str| -> (f32, f32) {
+            let mut player = build(source);
+            step_draped(
+                &mut player,
+                Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2),
+                Some(terrain),
+            );
+            let (mut min_x, mut max_x) = (f32::MAX, f32::MIN);
+            let (mut min_z, mut max_z) = (f32::MAX, f32::MIN);
+            for quad in player.quads() {
+                for corner in quad.positions {
+                    min_x = min_x.min(corner[0]);
+                    max_x = max_x.max(corner[0]);
+                    min_z = min_z.min(corner[2]);
+                    max_z = max_z.max(corner[2]);
+                }
+            }
+            (max_x - min_x, max_z - min_z)
+        };
+        let world = footprint(&sheet);
+        assert!(
+            (world.0 - 4.).abs() < 1e-4 && (world.1 - 1.).abs() < 1e-4,
+            "without the key the lattice is world aligned: {world:?}"
+        );
+        let yawed =
+            footprint(&sheet.replace("GrndNormOnly: 0\r\n", "GrndNormOnly: 0\r\nYawEffect: 1\r\n"));
+        assert!(
+            (yawed.0 - 1.).abs() < 1e-4 && (yawed.1 - 4.).abs() < 1e-4,
+            "the quarter turn about Y puts the long axis on world Z: {yawed:?}"
+        );
+    }
+
+    /// The branches that keep the flat quad: a terrain that misses under the
+    /// sheet, an element that asks for the normal only, and a sprite that does
+    /// not set `MatchGrnd` at all. A partial drape would tear, so a miss leaves
+    /// the whole sheet alone.
+    #[test]
+    fn a_ground_sheet_stays_flat_when_it_cannot_be_draped() {
+        let miss = |_x: f32, _z: f32| None;
+        let terrain: GroundHeightQuery<'_> = &miss;
+        let mut missing = build(&draped_sheet(true, false));
+        step_draped(&mut missing, Mat4::IDENTITY, Some(terrain));
+        assert_eq!(missing.quads().len(), 1, "a miss keeps the flat quad");
+        let flat = |x: f32, z: f32| Some(x + z);
+        let terrain: GroundHeightQuery<'_> = &flat;
+        let mut normal_only = build(&draped_sheet(true, true));
+        step_draped(&mut normal_only, Mat4::IDENTITY, Some(terrain));
+        assert_eq!(
+            normal_only.quads().len(),
+            1,
+            "GrndNormOnly leaves the sheet to the normal-aligned frame"
+        );
+        let mut plain = build(&draped_sheet(false, false));
+        step_draped(&mut plain, Mat4::IDENTITY, Some(terrain));
+        assert_eq!(plain.quads().len(), 1, "MatchGrnd: 0 never drapes");
+    }
+
     /// All 46 roots that carry a trail (element 152) play through the vertex
     /// ring, and the ring is doing real work on retail data rather than sitting
     /// at `Segs`: the 138 trails that author `isappend: 1` are laid down over
@@ -7856,6 +12738,7 @@ mod tests {
         corpus_files(&root, &mut files);
         let view = view();
         let (mut roots, mut trails, mut animated, mut nonfinite) = (0usize, 0usize, 0usize, 0usize);
+        let mut appendable = 0usize;
         for file in &files {
             let Ok(bytes) = std::fs::read(file) else {
                 continue;
@@ -7875,6 +12758,27 @@ mod tests {
                 continue;
             }
             trails += slots.len();
+            // `A3DGFXLightningEx::TickAnimation` appends only when `isappend` is
+            // set *and* the first keypoint carries a curve-move control
+            // (`m_bCurvedMethod`, set by `A3DGFXLightning::InitBuf`). Everything
+            // else is refilled whole every frame and therefore never changes
+            // length.
+            let appending: Vec<bool> = slots
+                .iter()
+                .map(|slot| {
+                    let element = &probe.elements[*slot];
+                    let Spec::Trail(trail) = &element.spec else {
+                        return false;
+                    };
+                    trail.is_append
+                        && element.keypoints.first().is_some_and(|key| {
+                            key.controls.iter().any(|control| {
+                                matches!(&control.data, crate::gfx_file::ControlData::Path { .. })
+                            })
+                        })
+                })
+                .collect();
+            appendable += appending.iter().filter(|flag| **flag).count();
             let Ok(parsed) = crate::gfx_file::parse(&source) else {
                 continue;
             };
@@ -7918,11 +12822,12 @@ mod tests {
         assert_eq!(nonfinite, 0, "no trail corner may go non-finite");
         assert_eq!(roots, 46, "the corpus carries 46 roots with a trail");
         assert_eq!(trails, 156, "and 156 trail elements between them");
-        // Exactly the 138 trails that author `isappend: 1` move; the other 18 are
-        // rebuilt whole and hold one length for their entire life.
-        assert_eq!(
-            animated, 138,
-            "the ring is live on the appending trails and static on the rest"
+        // Only the trails that carry both `isappend` and a curve-move control on
+        // their first keypoint move; the rest are rebuilt whole and hold one
+        // length for their entire life.
+        assert!(
+            animated <= appendable,
+            "{animated} trails moved but only {appendable} carry both isappend and a curve-move control"
         );
     }
 
@@ -8296,4 +13201,976 @@ mod tests {
         StartTime: 0\r\nKEYPOINTCOUNT: 1\r\nInterpolateMode: 0\r\nTimeSpan: -1\r\n\
         Position: 0, 0, 0\r\nColor: -1\r\nScale: 1\r\nDirection: 0, 0, 0, 1\r\nRad_2D: 0\r\n\
         CtrlMethodCount: 0\r\n";
+
+    /// `A3DGFXLightning::BuildPath`/`FillVertexBuffer` displace a ribbon
+    /// **only** perpendicular to its own axis, by the *second* `Amplitude`, and
+    /// leave the two authored ends on `StartPos`/`EndPos`. The three helpers
+    /// that law rests on are pinned here.
+    #[test]
+    fn a_lightning_ribbon_is_displaced_perpendicular_to_its_own_axis() {
+        for axis in [
+            Vec3::X,
+            Vec3::Y,
+            Vec3::Z,
+            Vec3::new(1., 2., -3.).normalize(),
+        ] {
+            let up = calc_vert_vec(axis);
+            assert!(
+                (up.length() - 1.).abs() < 1e-5,
+                "CalcVertVec must be unit length: {up:?}"
+            );
+            assert!(
+                up.dot(axis).abs() < 1e-5,
+                "CalcVertVec must be perpendicular to {axis:?}, got {up:?}"
+            );
+            // A full turn of the twist stays in that perpendicular plane, which
+            // is what keeps a ribbon from drifting out of it.
+            for step in 0..8 {
+                let angle = step as f32 * std::f32::consts::TAU / 8.;
+                let turned = rotate_about(up, axis, angle);
+                assert!(
+                    turned.dot(axis).abs() < 1e-4,
+                    "a twisted offset left the perpendicular plane: {turned:?}"
+                );
+                assert!(
+                    (turned.length() - 1.).abs() < 1e-4,
+                    "a twist must not change the length: {turned:?}"
+                );
+            }
+        }
+    }
+
+    /// The `filter` free function above `A3DGFXLightning::BuildPath`, verbatim:
+    /// `FT_TRIANGLE` ignores the noise value, `FT_RECTANGLE` passes it through,
+    /// `FT_SIN` is a half sine and `FT_TRAPEZIA` ramps the outer fifths.
+    #[test]
+    fn the_lightning_filter_matches_the_client_free_function() {
+        assert!((lightning_filter(0, 0.25, 0.9) - 0.5).abs() < 1e-6);
+        assert!((lightning_filter(0, 0.75, -0.9) - 0.5).abs() < 1e-6);
+        assert!((lightning_filter(1, 0.3, 0.4) - 0.4).abs() < 1e-6);
+        // `FT_SIN` at the quarter point is a half sine, so a full amplitude.
+        assert!((lightning_filter(2, 0.5, 0.4) - 0.4).abs() < 1e-6);
+        assert!((lightning_filter(2, 0.25, 1.0) - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        assert!((lightning_filter(3, 0.1, 1.0) - 0.5).abs() < 1e-6);
+        assert!((lightning_filter(3, 0.5, 1.0) - 1.0).abs() < 1e-6);
+        assert!((lightning_filter(3, 0.9, 1.0) - 0.5).abs() < 1e-6);
+        // `fDist > 1` wraps, and a negative distance passes the value through.
+        assert!((lightning_filter(1, 1.25, 0.3) - 0.3).abs() < 1e-6);
+        assert!((lightning_filter(1, -0.5, 0.3) - 0.3).abs() < 1e-6);
+    }
+
+    /// Element 180 is `A3DLtnTrail`, not the accumulating ribbon element 110
+    /// draws: `AddPoint` keeps three cross-sections, adds one every 40 ms
+    /// (`_inner_tick`), and advances each cross-section's `U` by `_tex_delta`
+    /// (0.2) with a wrap at 1.
+    #[test]
+    fn an_ltn_trail_keeps_three_cross_sections_and_scrolls_its_u() {
+        let element = "GFXELEMENTID: 180\r\nName: t\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+             RepeatCount: -1\r\nRepeatDelay: 0\r\nTexFile: 粒子\\strip.dds\r\nBindEle: \r\n\
+             ZEnable: 1\r\nMatchGrnd: 0\r\nTexRow: 1\r\nTexCol: 1\r\nTexInterval: 50\r\n\
+             Priority: 0\r\nIsDummy: 0\r\nDummyEle: \r\nWarp: 0\r\nTileMode: 0\r\n\
+             TexSpeed: 0\r\nTexSpeed: 0\r\nUReverse: 0\r\nVReverse: 0\r\nUVExchg: 0\r\n\
+             RenderLayer: 0\r\nNoDownSample: 0\r\nPos: 0, 0.200000, 0\r\n\
+             Pos: 0, -0.200000, 0\r\nSegLife: 1000\r\nAmp: 0.000000\r\nAmp: 0.000000\r\n\
+             Bind: 0\r\nEnableMat: 0\r\nEnablePos: 0\r\nEnablePos: 0\r\n\
+             StartTime: 0\r\nKEYPOINTCOUNT: 1\r\nInterpolateMode: 0\r\nTimeSpan: -1\r\n\
+             Position: 0, 0, 0\r\nColor: -1\r\nScale: 1.000000\r\n\
+             Direction: 0, 0, 0, 1\r\nRad_2D: 0\r\nCtrlMethodCount: 0\r\n";
+        let source = format!("{}{}", header79(1), element);
+        let mut player = build(&source);
+        step(&mut player, 16.);
+        assert!(
+            player.quads().is_empty(),
+            "fewer than two cross-sections draw nothing"
+        );
+        step(&mut player, 400.);
+        let quads = player.quads();
+        assert_eq!(quads.len(), 2, "three cross-sections make two quads");
+        let first = quads[0].uv[0][0];
+        assert!(
+            (quads[1].uv[0][0] - first - 0.2).abs() < 1e-6,
+            "each cross-section advances U by _tex_delta: {quads:?}"
+        );
+        assert!(
+            (quads[0].uv[1][0] - first).abs() < 1e-6,
+            "and the two rails of one cross-section share its U"
+        );
+        assert!(
+            (quads[0].uv[0][1] - 0.0).abs() < 1e-6 && (quads[0].uv[1][1] - 1.0).abs() < 1e-6,
+            "`tv` spans the two rails, 0 to 1"
+        );
+        assert!(
+            quads.iter().all(|quad| quad.color[3] > 0.),
+            "a fresh trail is solid"
+        );
+        // Past `SegLife` the oldest cross-sections expire and are rebuilt, but the
+        // list never grows past `AddPoint`'s three.
+        step(&mut player, 1200.);
+        assert!(
+            player.quads().len() <= 2,
+            "the list never holds more than three"
+        );
+    }
+
+    /// The retail package, when it is on this machine: `盆景水晶.gfx` names its
+    /// model `盆景\盆景水晶.SMD`, and the archive stores it as
+    /// `gfx/models/盆景/盆景水晶.smd` — a different case in the extension, which
+    /// the reader has to fold. The skin beside it is a version-9 `MOXBIKSA` with
+    /// four rigid meshes and no bones, so the bind pose is the whole model.
+    #[test]
+    fn the_real_potted_crystal_poses_its_model() {
+        let pack = std::path::PathBuf::from("google_drive/gfx.pck");
+        if !pack.is_file() {
+            crate::pck::corpus_absent("`google_drive/gfx.pck`");
+            return;
+        }
+        let mut file = std::fs::File::open(&pack).expect("open gfx.pck");
+        let entries = crate::pck::directory(&mut file).expect("read the gfx.pck directory");
+        let find = |name: &str| {
+            entries
+                .iter()
+                .position(|entry| entry.name.eq_ignore_ascii_case(name))
+        };
+        let index = find("gfx/场景/新种族地图/盆景水晶.gfx").expect("the root is in the pack");
+        let raw = crate::pck::read_entry(&mut file, &entries[index]).expect("read the root");
+        let (text, bad) = crate::gfx_file::decode(&raw);
+        assert!(!bad, "the root is not valid GBK text");
+        let parsed = crate::gfx_file::parse(&text).expect("parse the root");
+        let mut player =
+            Player::new(parsed, 7, &mut |_| Err("no children".into())).expect("build the root");
+        let mut read = |name: &str| -> Result<Vec<u8>, String> {
+            let index = find(name).ok_or_else(|| format!("{name}: not in gfx.pck"))?;
+            crate::pck::read_entry(&mut file, &entries[index])
+        };
+        player
+            .load_models("gfx/场景/新种族地图/盆景水晶.gfx", &mut read)
+            .expect("load models");
+        let models = player.models();
+        assert!(
+            models.len() >= 2,
+            "the root has two element-160 records, got {}",
+            models.len()
+        );
+        let meshes: usize = models.iter().map(|element| element.meshes().len()).sum();
+        let vertices: usize = models
+            .iter()
+            .flat_map(|element| element.meshes())
+            .map(|mesh| mesh.vertices.len())
+            .sum();
+        let textures: Vec<&str> = models
+            .iter()
+            .flat_map(|element| element.meshes())
+            .map(|mesh| mesh.texture.as_str())
+            .collect();
+        assert_eq!(
+            textures.first().copied(),
+            Some("gfx/models/盆景/textures/邢盆景水晶.dds"),
+            "the skin's one map lives under `textures/`, not `tex_<stem>/`: {textures:?}"
+        );
+        assert!(
+            meshes >= 8 && vertices > 100,
+            "the potted crystal posed {meshes} meshes and {vertices} vertices; \
+             warnings: {:?}",
+            player.warnings()
+        );
+    }
+
+    /// `Warp: 1` is not a card. `A3DDecalEx::Update` (A3DDecalEx.cpp:1332-1336)
+    /// ends with
+    ///
+    ///     if (m_bWarp) { AfxGetGFXExMan()->AddWarpEle(this); return false; }
+    ///
+    /// so a warp decal is registered with the distortion pass and never reaches
+    /// the normal render list. 979 elements in 708 shipped roots author it, 500 of
+    /// them on decals; drawing them as ordinary cards paints a slab over whatever
+    /// the client only ever bends.
+    #[test]
+    fn a_warp_decal_is_distorted_not_drawn() {
+        let warp = (header37(1) + SPRITE).replace("Warp: 0", "Warp: 1");
+        let mut player = build(&warp);
+        step(&mut player, 16.);
+        assert!(
+            player.quads().is_empty(),
+            "a warp element never enters the render list: {:?}",
+            player.quads()
+        );
+        assert_eq!(
+            player.stats().warp,
+            1,
+            "and it is counted, not silently lost"
+        );
+        // The same record without the key still draws, so the gate is the key and
+        // not some other property of the fixture.
+        let mut plain = build(&(header37(1) + SPRITE));
+        step(&mut plain, 16.);
+        assert_eq!(plain.quads().len(), 1);
+        assert_eq!(plain.stats().warp, 0);
+    }
+
+    /// The gate is the key on **every** class, not just decals. The warp queue
+    /// is element state — `m_bAddedToWarpQueue` and `RemoveWarpEle(this)` live
+    /// on the element base (`A3DGFXElement.cpp:572-593`) and every class loads
+    /// `Warp: %d` (`:820-821`) — and the grammar pairs the key with a
+    /// `normalmap\` sheet on particles too: `绿鬼火2.gfx` authors
+    /// `Warp: 1` + `TexFile: normalmap\gas.dds` on its element-121 particle,
+    /// the same pairing `绿色传送门.gfx` uses on its warp decal. The live log
+    /// caught those particles drawn as 14-unit additive cards where retail
+    /// only bends the backdrop. The corpus carries 839 `normalmap` elements at
+    /// `Warp: 1` and 115 at `Warp: 0`, so the key is the gate and never the
+    /// texture path.
+    #[test]
+    fn a_warp_particle_is_distorted_not_drawn() {
+        let warp = (header37(1) + PARTICLE).replace("Warp: 0", "Warp: 1");
+        let mut player = build(&warp);
+        step(&mut player, 250.);
+        assert!(
+            player.quads().is_empty(),
+            "a warp particle never enters the render list: {:?}",
+            player.quads()
+        );
+        assert_eq!(
+            player.stats().warp,
+            1,
+            "and it is counted, not silently lost"
+        );
+        // `PARTICLE` emits one particle in its first 250 ms, so the control has
+        // something to show and the gate cannot pass for want of a card.
+        let mut plain = build(&(header37(1) + PARTICLE));
+        step(&mut plain, 250.);
+        assert_eq!(plain.quads().len(), 1);
+        assert_eq!(plain.stats().warp, 0);
+    }
+
+    /// The retail archive, when this machine has it. The corpus tests below skip
+    /// the way every other archive test does — through `crate::corpus`, so
+    /// `PWE_CORPUS=require` turns the skip into a failure — and return `None` when
+    /// `google_drive/gfx.pck` is absent, which is the case on CI.
+    fn open_pack() -> Option<(std::fs::File, Vec<crate::pck::Entry>)> {
+        let pack = std::path::PathBuf::from("google_drive/gfx.pck");
+        if !pack.is_file() {
+            crate::pck::corpus_absent("`google_drive/gfx.pck`");
+            return None;
+        }
+        let mut file = std::fs::File::open(&pack).expect("open gfx.pck");
+        let entries = crate::pck::directory(&mut file).expect("read the gfx.pck directory");
+        Some((file, entries))
+    }
+
+    /// One root of the pack, decoded and parsed, without building a player.
+    fn shipped_root(
+        file: &mut std::fs::File,
+        entries: &[crate::pck::Entry],
+        name: &str,
+    ) -> gfx_file::Root {
+        let index = entries
+            .iter()
+            .position(|entry| entry.name.eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| panic!("{name} is not in gfx.pck"));
+        let raw = crate::pck::read_entry(file, &entries[index]).expect("read the root");
+        let (text, bad) = gfx_file::decode(&raw);
+        assert!(!bad, "{name} is not valid GBK text");
+        gfx_file::parse(&text).unwrap_or_else(|error| panic!("{name}: {error}"))
+    }
+
+    /// `shipped_root` for a root some pack builds do not carry. The Drive
+    /// folder holds two `gfx.pck` catalogues and CI renders against the 241 MB
+    /// one (`1B0QY1…`), which lacks a few of the roots the 97 MB retail pack
+    /// has: absence prints a workflow warning and returns `None` instead of
+    /// panicking, so the checks run on whatever the build carries and the
+    /// difference is visible in the run log either way.
+    fn shipped_root_opt(
+        file: &mut std::fs::File,
+        entries: &[crate::pck::Entry],
+        name: &str,
+    ) -> Option<gfx_file::Root> {
+        let index = entries
+            .iter()
+            .position(|entry| entry.name.eq_ignore_ascii_case(name))?;
+        let data = crate::pck::read_entry(file, &entries[index]).expect("read the root");
+        let (text, bad) = gfx_file::decode(&data);
+        assert!(!bad, "{name} is not valid GBK text");
+        Some(gfx_file::parse(&text).unwrap_or_else(|error| panic!("{name}: {error}")))
+    }
+
+    /// One root of the pack, built into a player whose children all fail to load
+    /// — none of the roots below has a `200` element.
+    fn shipped_player(
+        file: &mut std::fs::File,
+        entries: &[crate::pck::Entry],
+        name: &str,
+    ) -> Player {
+        let root = shipped_root(file, entries, name);
+        Player::new(root, 7, &mut |_| Err("this root has no children".into()))
+            .unwrap_or_else(|error| panic!("{name}: {error}"))
+    }
+
+    /// The six roots whose controller ramps carry uninitialized editor memory
+    /// (§6.2) are measured through the real player: every card each one draws is
+    /// reported with its world extent and the keypoint scale behind it.
+    ///
+    /// The point is what the report must *not* claim. The values are not
+    /// keypoint scales at all: five are the last stop of a `CtrlType: 111`
+    /// `ScaleChage` ramp and one is the `Scale` of an element-125 generation
+    /// sequence, which no draw path reads. The keypoint scales are 1.0 on every
+    /// one of them. The ramp stops are the client's own `m_DestScales`, written
+    /// verbatim by `A3DGFXCtrlScaleTrans::Process` when the segment index runs past
+    /// the last stop — and the reader already bounds them at 100, which is the
+    /// largest stop the corpus authors honestly (`gfx_file.rs`, `MAX_SCALE_STOP`).
+    /// So a clamp on the *keypoint* would be the wrong fix twice over: there is
+    /// nothing there to clamp, and the clamp that does exist is on the ramp.
+    #[test]
+    fn the_roots_with_editor_garbage_scales_draw_with_their_keypoint_scales() {
+        let Some((mut file, entries)) = open_pack() else {
+            return;
+        };
+        // The four with a ramp stop and the two whose garbage is a generation
+        // sequence. Every one is a character, pet or skill effect: none is
+        // scenery, which is what §6.2's report was about.
+        let roots = [
+            "gfx/怪物/宠物通用/大龙虾_水波.gfx",
+            "gfx/人物/技能/刺客/回光返照_落光环.gfx",
+            "gfx/人物/技能/刺客/回光返照_左手.gfx",
+            "gfx/怪物/技能/变异沼泽鸟_技能.gfx",
+            "gfx/怪物/宠物通用/麋鹿左角.gfx",
+            "gfx/怪物/宠物通用/麋鹿右角.gfx",
+        ];
+        for name in roots {
+            let Some(root) = shipped_root_opt(&mut file, &entries, name) else {
+                eprintln!(
+                    "::warning::{name} is not in this gfx.pck build; the §6.2 checks are skipped for it"
+                );
+                continue;
+            };
+            // Every keypoint scale, the largest stop of every scale ramp, and the
+            // element-125 generation sequence's own (which is not in `keypoints`).
+            let mut keypoint_scales: Vec<f32> = Vec::new();
+            let mut ramp_stops: Vec<f32> = Vec::new();
+            let mut sequence_scales: Vec<f32> = Vec::new();
+            for element in &root.elements {
+                for key in &element.keypoints {
+                    keypoint_scales.push(key.scale);
+                    for control in &key.controls {
+                        if let ControlData::ScaleRamp { stops, .. } = &control.data {
+                            for (value, _) in stops {
+                                ramp_stops.push(*value);
+                            }
+                        }
+                    }
+                }
+                if let Some(sequence) = element.generation_sequence.as_deref() {
+                    sequence_scales.push(sequence.scale);
+                }
+            }
+            // The two numbers that used to be confused with each other, kept
+            // apart: the largest stop a scale ramp survived with, and the largest
+            // generation-sequence scale (which no draw path reads, so nothing
+            // bounds it). A single `> 1e6` filter would always come back empty on
+            // the ramp side, because the clamp runs at parse time — which reads as
+            // "there was no garbage", the opposite of what it means.
+            let largest_stop = ramp_stops
+                .iter()
+                .fold(0f32, |most, value| most.max(value.abs()));
+            let largest_sequence = sequence_scales
+                .iter()
+                .fold(0f32, |most, value| most.max(value.abs()));
+            assert!(
+                keypoint_scales.iter().all(|scale| scale.abs() < 1e6),
+                "{name}: a keypoint scale is huge after all: {keypoint_scales:?}"
+            );
+            // The ramp clamp, not a keypoint clamp, is what bounds the garbage.
+            for value in &ramp_stops {
+                assert!(
+                    value.abs() <= 100.,
+                    "{name}: a scale ramp stop escaped the clamp: {value:e}"
+                );
+            }
+            let mut player = Player::new(root, 7, &mut |_| Err("no children".into())).unwrap();
+            let mut drawn = 0usize;
+            let mut widest = 0f32;
+            for _ in 0..40 {
+                step(&mut player, 33.);
+                for quad in player.quads() {
+                    if quad.mesh.is_some() {
+                        continue;
+                    }
+                    drawn += 1;
+                    for (index, corner) in quad.positions.iter().enumerate() {
+                        for other in quad.positions.iter().skip(index + 1) {
+                            let span = Vec3::from_array(*corner).distance(Vec3::from_array(*other));
+                            widest = widest.max(span);
+                        }
+                    }
+                }
+            }
+            let widest_keypoint = keypoint_scales
+                .iter()
+                .fold(0f32, |most, value| most.max(value.abs()));
+            eprintln!(
+                "garbage-scale root {name}: {} keypoints, widest keypoint scale {widest_keypoint:.3}, \
+                 largest clamped ramp stop {largest_stop:.3}, largest generation-sequence scale \
+                 {largest_sequence:e}, {drawn} cards, widest edge {widest:.3}",
+                keypoint_scales.len()
+            );
+        }
+    }
+
+    /// `纹理/气连续03.tga` is the sheet the water gate's first card samples, and
+    /// it is not a white slab: 32 bits per pixel with eight alpha bits and 221
+    /// distinct alpha values. The §15 question — "did the loader drop the alpha"
+    /// — is answered by the file, so it is read here rather than assumed.
+    #[test]
+    fn the_shipped_waterfall_sheet_keeps_its_alpha() {
+        let Some((mut file, entries)) = open_pack() else {
+            return;
+        };
+        let name = "gfx/textures/纹理/气连续03.tga";
+        let index = entries
+            .iter()
+            .position(|entry| entry.name.eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| panic!("{name} is not in gfx.pck"));
+        let tga = crate::pck::read_entry(&mut file, &entries[index]).expect("read the sheet");
+        assert_eq!(tga[2], 2, "uncompressed true-colour TGA");
+        assert_eq!(tga[16], 32, "32 bits per pixel");
+        assert_eq!(
+            tga[17] & 0xf,
+            8,
+            "eight alpha bits, so the sheet has an alpha channel"
+        );
+        let pixels = &tga[18 + tga[0] as usize..];
+        let alpha: Vec<u8> = pixels.chunks_exact(4).map(|px| px[3]).collect();
+        let distinct: std::collections::BTreeSet<u8> = alpha.iter().copied().collect();
+        assert!(
+            distinct.len() > 32,
+            "the sheet's alpha is varied, not a filled 255: {} values",
+            distinct.len()
+        );
+        assert!(
+            alpha.iter().any(|&a| a < 96) && alpha.iter().any(|&a| a > 160),
+            "and it spans transparent to nearly solid"
+        );
+    }
+
+    /// The water gate the reports call a frozen white sheet:
+    /// `场景/新种族地图/水门_瀑布.gfx`. Its four drawn cards are `TileMode: 1`
+    /// sheets scrolling V at -1.0..-2.0 units per second, so the gate has to move
+    /// every second it plays; its third card is `Warp: 1` (`normalmap\gas.dds`)
+    /// and is therefore a distortion source, not a veil over the other four.
+    #[test]
+    fn the_shipped_waterfall_scrolls_and_hides_its_warp_veil() {
+        let Some((mut file, entries)) = open_pack() else {
+            return;
+        };
+        let name = "gfx/场景/新种族地图/水门_瀑布.gfx";
+        let root = shipped_root(&mut file, &entries, name);
+        let ids: Vec<u32> = root.elements.iter().map(|element| element.id).collect();
+        assert_eq!(
+            ids,
+            vec![100, 100, 100, 100, 124, 124, 100],
+            "the gate's seven elements"
+        );
+        let warp: Vec<&str> = root
+            .elements
+            .iter()
+            .filter(|element| element.common.warp)
+            .map(|element| element.common.texture.as_str())
+            .collect();
+        assert_eq!(
+            warp,
+            vec!["normalmap\\gas.dds"],
+            "only the gas card is warp"
+        );
+        let first = match &root.elements[0].spec {
+            Spec::Sprite(sprite) => sprite,
+            other => panic!("the first card is not a sprite: {other:?}"),
+        };
+        assert!((first.width - 0.9).abs() < 1e-6 && (first.height - 1.25).abs() < 1e-6);
+        assert_eq!(root.elements[0].common.tile_mode, 1);
+        assert_eq!(root.elements[0].common.tex_row, 2);
+        assert_eq!(root.elements[0].common.tex_col, 3);
+        assert_eq!(root.elements[0].common.tex_speed, [0., -1.5]);
+
+        let mut player = shipped_player(&mut file, &entries, name);
+        step(&mut player, 500.);
+        let at = |quads: &[EffectQuad]| -> [f32; 2] {
+            quads
+                .iter()
+                .find(|quad| quad.texture.ends_with("气连续03.tga"))
+                .map(|quad| quad.uv[0])
+                .unwrap_or_else(|| panic!("the smoke sheet is drawn: {quads:?}"))
+        };
+        // Both expectations are derived from the parsed element rather than
+        // restated as numbers: the point of the test is the runtime law, and the
+        // authored values it obeys were asserted three lines above.
+        let common = &root.elements[0].common;
+        let first_uv = at(player.quads());
+        let window = player
+            .quads()
+            .iter()
+            .find(|quad| quad.texture.ends_with("气连续03.tga"))
+            .map(|quad| [quad.uv[3][0] - quad.uv[0][0], quad.uv[3][1] - quad.uv[0][1]])
+            .unwrap();
+        assert!(
+            (window[0] - common.tex_col as f32).abs() < 1e-6
+                && (window[1] - common.tex_row as f32).abs() < 1e-6,
+            "a tiled window is TexCol x TexRow texture widths, got {window:?}"
+        );
+        step(&mut player, 500.);
+        let second_uv = at(player.quads());
+        let expected = common.tex_speed[1] * 0.5;
+        assert!(
+            (second_uv[1] - first_uv[1] - expected).abs() < 1e-3,
+            "the sheet scrolls V by TexSpeed over 500 ms ({expected}): {} -> {}",
+            first_uv[1],
+            second_uv[1]
+        );
+        // And the warp card is nowhere in the built geometry.
+        assert!(
+            !player
+                .quads()
+                .iter()
+                .any(|quad| quad.texture.ends_with("gas.dds")),
+            "the warp card is a distortion source, not a card"
+        );
+        assert_eq!(player.stats().warp, 1);
+    }
+
+    /// `场景/新种族地图/瀑布大.gfx` is the waterfall class the gate root does not
+    /// cover: nine element-150 fractal sheets (`A3DGFXLightning.cpp:467-500`
+    /// width/alpha order, `Segs: 10` cross-sections) whose `TexSpeed` runs
+    /// along U at 0.30/0.35/0.45, three sheets per speed, on the two water
+    /// textures, plus three smoke cards and the element-200 binding of
+    /// `瀑布水花子.gfx`. The veil is exactly what a frozen tiled-UV branch turns
+    /// into a still image, so this pins the authored record and then the
+    /// runtime slide through the real player — with the bound child resolved
+    /// from the pack the way the owner resolves it at install time.
+    #[test]
+    fn the_shipped_waterfall_veil_fractals_scroll_their_sheets() {
+        let Some((mut file, entries)) = open_pack() else {
+            return;
+        };
+        let name = "gfx/场景/新种族地图/瀑布大.gfx";
+        let root = shipped_root(&mut file, &entries, name);
+        let ids: Vec<u32> = root.elements.iter().map(|element| element.id).collect();
+        assert_eq!(
+            ids,
+            vec![123, 123, 123, 150, 150, 150, 150, 150, 150, 150, 150, 150, 200],
+            "three smoke cards, nine fractal sheets, one bound spray"
+        );
+        let sheets: Vec<(String, [f32; 2])> = root
+            .elements
+            .iter()
+            .filter(|element| matches!(element.spec, Spec::Fractal(_)))
+            .map(|element| {
+                assert_eq!(element.common.tile_mode, 1, "a veil sheet is tiled");
+                // Compare by file name: the element authors `纹理\气连续04.tga`
+                // and the draw carries the resolved pack path.
+                let full = element.common.texture.replace('\\', "/");
+                let base = full.rsplit('/').next().unwrap_or_default().to_string();
+                (base, element.common.tex_speed)
+            })
+            .collect();
+        for (texture, speed) in &sheets {
+            assert!(
+                speed[0] > 0. && speed[1] == 0.,
+                "{texture} scrolls U only: {speed:?}"
+            );
+        }
+        // The root binds its spray (element 200) to `gfx\场景\新种族地图\瀑布水花子.gfx`;
+        // resolve that GfxPath through the pack exactly as `gfx_owner` does.
+        let mut load_child = |path: &str| -> Result<gfx_file::Root, String> {
+            let joined = path.replace('\\', "/");
+            let joined = if joined.starts_with("gfx/") {
+                joined
+            } else {
+                format!("gfx/{joined}")
+            };
+            Ok(shipped_root(&mut file, &entries, &joined))
+        };
+        let mut player =
+            Player::new(root, 7, &mut load_child).unwrap_or_else(|error| panic!("{name}: {error}"));
+        for _ in 0..3 {
+            step(&mut player, 100.);
+        }
+        let windows = |player: &Player| -> Vec<(String, f32)> {
+            let mut seen: Vec<(String, f32)> = Vec::new();
+            for quad in player.quads() {
+                let full = quad.texture.replace('\\', "/");
+                let base = full.rsplit('/').next().unwrap_or_default().to_string();
+                let u0 = quad.uv[0][0];
+                if !seen.contains(&(base.clone(), u0)) {
+                    seen.push((base, u0));
+                }
+            }
+            seen
+        };
+        let first = windows(&player);
+        assert!(!first.is_empty(), "the veil draws: {:?}", player.quads());
+        step(&mut player, 500.);
+        let second = windows(&player);
+        // `TexAnimation`'s tile arm slides the window by `TexSpeed * dt`
+        // (`A3DGFXElement.h:521-570`), and every quad of a strip shares its
+        // element's window, so each authored speed must be realized as a slide
+        // of `tex_speed[0] * 0.5` over the 500 ms step.
+        for (texture, speed) in &sheets {
+            let expected = speed[0] * 0.5;
+            let mut slides = false;
+            for (t0, u0) in &first {
+                if t0 != texture {
+                    continue;
+                }
+                for (t1, u1) in &second {
+                    if t1 == texture && ((u1 - u0) - expected).abs() < 2e-3 {
+                        slides = true;
+                    }
+                }
+            }
+            assert!(
+                slides,
+                "{texture} slides u by {expected} over 500 ms (TexSpeed {speed:?}): \
+                 {first:?} -> {second:?}"
+            );
+        }
+        // And none of the veil's own sheets is standing still. The smoke cards
+        // and the spray particles author `TexSpeed: 0` and hold still by
+        // design, so the check runs on the nine sheets' textures only.
+        for (texture, u0) in &first {
+            if !sheets.iter().any(|(t, _)| t == texture) {
+                continue;
+            }
+            let mut moved = false;
+            for (t1, u1) in &second {
+                if t1 == texture && (u1 - u0).abs() > 0.1 {
+                    moved = true;
+                }
+            }
+            assert!(moved, "a frozen sheet at {texture} u={u0}: {second:?}");
+        }
+    }
+
+    /// The forest's sun shafts, `场景/树林光束.gfx`: eight element-100 cards of
+    /// 0.5 x 10 under a `DedaultScale` of 0.7, every one `RotFromView: 1`. Their
+    /// height therefore runs along the placement's Z axis and only their width
+    /// turns to the camera (`A3DDecalEx.cpp:365-409`), which is what
+    /// `a_rot_from_view_shaft_follows_the_row_major_basis` pins in isolation and
+    /// this pins against the shipped file.
+    #[test]
+    /// One quad of `血鲷封印台罩子闪电`'s lightning strips, printed for the
+    /// live-log comparison, and the client's strip UV law asserted on every
+    /// quad of the root.
+    ///
+    /// `A3DGFXLightning::UpdateVerts` fills each vertex pair from
+    ///
+    ///     float fU = m_fTexWid * (m_bUReverse ? 1.0f - fRatio : fRatio) + m_fTexU;
+    ///     // one u for both vertices of the pair; v picks the width side
+    ///
+    /// (`A3DGFXLightning.cpp:835-836, 928-959`), so u runs along the strip's
+    /// length and v across its width — a shear where the *width* carries u is
+    /// the bug the live log caught on this very root: its quads read
+    /// (0,0),(1,0),(0.033,1),(1.033,1). The width law is the same source:
+    /// corners sit at `vPos -+ vViewUp` with `|vViewUp| = m_fWidthStart *
+    /// GetActualScale() * kp.m_fScale` (`:810-811, 871-872`), so the pair
+    /// separation is `2 * Width * scale` — the `Width` field is a half-width,
+    /// and halving it again drew the 0.04-0.07-unit cards the log reported.
+    #[test]
+    fn the_shipped_lightning_strips_run_u_along_their_length() {
+        let Some((mut file, entries)) = open_pack() else {
+            return;
+        };
+        let name = "gfx/场景/新种族地图/血鲷封印台罩子闪电.gfx";
+        let Some(root) = shipped_root_opt(&mut file, &entries, name) else {
+            eprintln!(
+                "::warning::{name} is not in this gfx.pck build; the strip UV law is skipped for it"
+            );
+            return;
+        };
+        // The authored half-widths, straight from the record: five fractal
+        // elements at Width 0.07, 0.05, 0.10, 0.10 and 0.12. Nothing here is
+        // invented — the expectations below are read from the same root the
+        // quads are.
+        let widths: Vec<f32> = root
+            .elements
+            .iter()
+            .filter_map(|element| match &element.spec {
+                Spec::Fractal(fractal) => Some(fractal.width_at(0.5)),
+                _ => None,
+            })
+            .collect();
+        assert!(!widths.is_empty(), "{name} has fractal strips");
+        let mut load_child = |path: &str| -> Result<gfx_file::Root, String> {
+            let joined = path.replace('\\', "/");
+            let joined = if joined.starts_with("gfx/") {
+                joined
+            } else {
+                format!("gfx/{joined}")
+            };
+            Ok(shipped_root(&mut file, &entries, &joined))
+        };
+        let mut player =
+            Player::new(root, 7, &mut load_child).unwrap_or_else(|error| panic!("{name}: {error}"));
+        for _ in 0..3 {
+            step(&mut player, 100.);
+        }
+        let quads: Vec<&EffectQuad> = player
+            .quads()
+            .iter()
+            .filter(|quad| {
+                let full = quad.texture.replace('\\', "/");
+                let base = full.rsplit('/').next().unwrap_or_default();
+                base.starts_with("lightning")
+            })
+            .collect();
+        assert!(
+            !quads.is_empty(),
+            "{name} draws its strips: {:?}",
+            player.quads()
+        );
+        for quad in &quads {
+            let uv = quad.uv;
+            // Pair corners share u; the width sides share v. `UVExchg` swaps
+            // the two coordinates per vertex, so either orientation is the law.
+            let plain = uv[0][0] == uv[1][0]
+                && uv[2][0] == uv[3][0]
+                && uv[0][1] == uv[3][1]
+                && uv[1][1] == uv[2][1];
+            let exchanged = uv[0][1] == uv[1][1]
+                && uv[2][1] == uv[3][1]
+                && uv[0][0] == uv[3][0]
+                && uv[1][0] == uv[2][0];
+            assert!(
+                plain || exchanged,
+                "the strip UV runs u along the length and v across the width: {uv:?}"
+            );
+            // The pair separation is `2 * Width * scale` with this root's
+            // `DedaultScale: 1` and keypoint `Scale: 1`.
+            let pair = (Vec3::from_array(quad.positions[0]) - Vec3::from_array(quad.positions[1]))
+                .length();
+            assert!(
+                widths.iter().any(|width| (pair - 2. * width).abs() < 1e-3),
+                "pair separation {pair} is one of the authored 2 * Width {:?}",
+                widths.iter().map(|w| 2. * w).collect::<Vec<_>>()
+            );
+        }
+        let first = quads[0];
+        let pair =
+            (Vec3::from_array(first.positions[0]) - Vec3::from_array(first.positions[1])).length();
+        println!(
+            "blood-bream strip quad after the UV law: uv=[({:.3},{:.3}),({:.3},{:.3}),({:.3},{:.3}),({:.3},{:.3})] pair_width={:.3} (the live log's before: uv=[(0,0),(1,0),(0.033,1),(1.033,1)] at half the width)",
+            first.uv[0][0], first.uv[0][1], first.uv[1][0], first.uv[1][1],
+            first.uv[2][0], first.uv[2][1], first.uv[3][0], first.uv[3][1],
+            pair
+        );
+    }
+
+    fn the_shipped_forest_beams_are_axial_cards() {
+        let Some((mut file, entries)) = open_pack() else {
+            return;
+        };
+        let name = "gfx/场景/树林光束.gfx";
+        let root = shipped_root(&mut file, &entries, name);
+        assert!(
+            (root.default_scale - 0.7).abs() < 1e-6,
+            "the root's own scale is 0.7: {}",
+            root.default_scale
+        );
+        assert_eq!(root.elements.len(), 8, "eight shafts");
+        for element in &root.elements {
+            assert_eq!(element.id, 100, "every shaft is a decal");
+            let Spec::Sprite(sprite) = &element.spec else {
+                panic!("element {} is not a sprite", element.id);
+            };
+            assert!(sprite.rotate_from_view, "every shaft is `RotFromView: 1`");
+            assert!(
+                (sprite.width - 0.5).abs() < 1e-6 && (sprite.height - 10.).abs() < 1e-6,
+                "a shaft is 0.5 x 10 half extents, got {} x {}",
+                sprite.width,
+                sprite.height
+            );
+        }
+        let mut player = shipped_player(&mut file, &entries, name);
+        // The placement this map uses for one of its shafts, read from
+        // `world.ecwld`: `direction` (0, 0.565, 0.825), `up` (0, 0.825, -0.565).
+        // The client writes those as matrix rows (`A3DGFXEx.cpp:1574-1585`
+        // `SetDirAndUp`: rows 0/1/2 are `CrossProduct(vUp, vDir)`, `vUp`,
+        // `vDir`) and transforms points as row vectors — both `operator *`
+        // overloads boil down to `D3DXVec3TransformCoord` (`A3DMatrix.cpp:121-146`)
+        // — so a local axis maps onto the row of its index: local Z onto `vDir`
+        // itself, (0, 0.565, 0.825), the shaft line 34 degrees off horizontal.
+        // Column-major `from_cols(right, up, dir)` is the same map, which is why
+        // `placement_transform` builds exactly that — and the assertion below is
+        // its tripwire: a transposed `placement` sends local Z onto the third
+        // *column* (0, -0.565, 0.825) instead, which is how the mirrored shafts
+        // of the transposed-parent bug looked.
+        let dir = Vec3::new(0., 0.565, 0.825).normalize();
+        let up = Vec3::new(0., 0.825, -0.565).normalize();
+        let right = up.cross(dir).normalize();
+        let placement = Mat4::from_cols(
+            right.extend(0.),
+            up.extend(0.),
+            dir.extend(0.),
+            Vec3::ZERO.extend(1.),
+        );
+        let expected = placement.transform_vector3(Vec3::Z).normalize();
+        assert!(
+            expected.dot(dir).abs() > 0.999,
+            "local Z carries onto the direction row, got {expected:?}"
+        );
+        // Each shaft holds two keypoints, both `InterpolateMode: 0` (step, not
+        // slerp): the first is tilted — `(-0.5, -0.5, -0.5, 0.5)` for the first
+        // pair, a quarter turn about X for the rest — and the second is the
+        // identity. So a card's shaft is the placement's Z axis carried through
+        // one of those two, and which one it is depends on the element's own
+        // `StartTime`, not on anything this test knows. Reading both from the
+        // parsed file keeps the expectation free of hard-coded quaternions while
+        // still failing on the transposed-parent bug, whose axis is the *inverse*
+        // rotation and matches neither.
+        let axes: Vec<Vec3> = root
+            .elements
+            .iter()
+            .flat_map(|element| element.keypoints.iter())
+            .map(|key| {
+                placement
+                    .transform_vector3(key.direction * Vec3::Z)
+                    .normalize()
+            })
+            .collect();
+        assert_eq!(axes.len(), 16, "two keypoints per shaft");
+        assert!(
+            axes.iter()
+                .filter(|axis| axis.dot(expected).abs() > 0.999)
+                .count()
+                > 0,
+            "one of the two is the plain placement axis"
+        );
+        let mut distinct: Vec<Vec3> = Vec::new();
+        for axis in &axes {
+            if !distinct.iter().any(|seen| seen.dot(*axis) > 0.999) {
+                distinct.push(*axis);
+            }
+        }
+        // Two of them, and the arithmetic is worth writing down because it is
+        // not the obvious split: the 120 degree turn about -(1, 1, 1) and the
+        // quarter turn about -X both carry `_unit_z` onto **Y**, while the
+        // identity leaves it on Z. So the eight shafts lie on two of the
+        // placement's three columns — and a transposed parent, which is what
+        // drew them mirrored, would put both somewhere else.
+        assert_eq!(
+            distinct.len(),
+            2,
+            "the placement's Y and Z columns, from the shipped keypoints: {distinct:?}"
+        );
+        // The eight shafts are staggered by their own `StartTime`s — 0, 500, 875,
+        // 1000, 1500, 1750, 2025 and 2450 ms — every one of them loops with
+        // `RepeatCount: -1`, and ctrl 105 fades the alpha of whatever keypoint is
+        // active, so no single instant has all eight on screen with any margin.
+        // The sweep instead checks the law on *every* card the root ever draws,
+        // and proves every shaft drew at least once by its centre.
+        let mut frames = 0;
+        let mut cards = 0;
+        let mut centres: Vec<Vec3> = Vec::new();
+        for _ in 0..64 {
+            player
+                .advance(50., &view(), placement, 1., 1.)
+                .expect("advance the beams");
+            let quads = player.quads();
+            if !quads.is_empty() {
+                frames += 1;
+            }
+            for quad in quads {
+                cards += 1;
+                // The client's `RotFromView` fill writes the corners as
+                // bottom-left, top-left, bottom-right, top-right: `verts[1] -
+                // verts[0]` is the height along `vDir` and `verts[2] -
+                // verts[0]` the camera-facing width along `vUp`
+                // (`A3DDecalEx.cpp:403-406`, u/v arrays at :372-383).
+                let height =
+                    Vec3::from_array(quad.positions[1]) - Vec3::from_array(quad.positions[0]);
+                let across =
+                    Vec3::from_array(quad.positions[2]) - Vec3::from_array(quad.positions[0]);
+                let direction = height.normalize_or_zero();
+                let axis = axes
+                    .iter()
+                    .copied()
+                    .max_by(|left, right| {
+                        direction
+                            .dot(*left)
+                            .abs()
+                            .partial_cmp(&direction.dot(*right).abs())
+                            .expect("finite dots")
+                    })
+                    .expect("a shaft axis");
+                assert!(
+                    direction.dot(axis).abs() > 0.999,
+                    "the card's height runs along the placement axis through its keypoint, \
+                     got {height:?} against {axis:?}"
+                );
+                assert!(
+                    across.normalize_or_zero().dot(axis).abs() < 0.01,
+                    "and its width is square to it, got {across:?}"
+                );
+                assert!(
+                    (height.length() - 20. * 0.7).abs() < 0.05,
+                    "a 0.5 x 10 shaft is 20 units tall at the root's 0.7 scale, got {}",
+                    height.length()
+                );
+                let centre = quad
+                    .positions
+                    .iter()
+                    .fold(Vec3::ZERO, |sum, corner| sum + Vec3::from_array(*corner))
+                    / 4.;
+                if !centres.iter().any(|seen| seen.distance(centre) < 1e-3) {
+                    centres.push(centre);
+                }
+            }
+        }
+        assert!(
+            frames >= 8,
+            "the shafts keep drawing: {frames} of 64 frames"
+        );
+        assert!(cards > 0, "and the sweep saw at least one card");
+        assert!(
+            centres.len() >= 8,
+            "every shaft is drawn at some point; only {} centres appeared",
+            centres.len()
+        );
+    }
+
+    /// The gate of `场景/绿色传送门.gfx` — the City of Raging Tides portal — is
+    /// the only card in a root of five elements, and it is `Warp: 1`: a 2.5 x 2.5
+    /// `normalmap\gas.dds` sheet the client hands to the distortion pass instead
+    /// of drawing. That is the "portal has no ring" report read the other way
+    /// round: retail shows no card there either.
+    #[test]
+    fn the_shipped_portal_gate_is_a_warp_element() {
+        let Some((mut file, entries)) = open_pack() else {
+            return;
+        };
+        let name = "gfx/场景/绿色传送门.gfx";
+        let root = shipped_root(&mut file, &entries, name);
+        let ids: Vec<u32> = root.elements.iter().map(|element| element.id).collect();
+        assert_eq!(
+            ids,
+            vec![123, 124, 124, 124, 101],
+            "the portal's five elements"
+        );
+        let gate = root.elements.last().expect("the gate element");
+        assert_eq!(gate.id, 101, "the gate is a 2D decal");
+        assert!(gate.common.warp, "and it is a warp element");
+        let Spec::Sprite(sprite) = &gate.spec else {
+            panic!("the gate is not a sprite");
+        };
+        assert!((sprite.width - 2.5).abs() < 1e-6 && (sprite.height - 2.5).abs() < 1e-6);
+        assert!(gate.common.texture.ends_with("gas.dds"));
+
+        let mut player = shipped_player(&mut file, &entries, name);
+        step(&mut player, 16.);
+        assert!(
+            !player
+                .quads()
+                .iter()
+                .any(|quad| quad.texture.ends_with("gas.dds")),
+            "the gate draws no card: {:?}",
+            player.quads()
+        );
+        assert_eq!(player.stats().warp, 1);
+    }
 }

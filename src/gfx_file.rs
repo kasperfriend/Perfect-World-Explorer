@@ -818,9 +818,9 @@ impl Fractal {
     }
 
     /// The authored alpha at fraction `t` of the strip, on the same three-point
-    /// profile and with the same `[end, midpoint, start]` order as
-    /// [`Fractal::width_at`]: the client reads `+0x2cc`/`+0x2d0`/`+0x2d4`,
-    /// which the loader fills from the three `Alpha` lines in file order.
+    /// profile and in the same `[start, end, midpoint]` file order as
+    /// [`Fractal::width_at`]: the loader fills `+0x2cc`/`+0x2d0`/`+0x2d4` from
+    /// the three `Alpha` lines in file order.
     pub fn alpha_at(&self, t: f32) -> f32 {
         profile_at(&self.alphas, t)
     }
@@ -828,20 +828,29 @@ impl Fractal {
 
 /// Sample a three-point authored profile.
 ///
-/// Order is `[end, midpoint, start]`. One value is constant, two interpolate
-/// end to start with no midpoint, three use the midpoint as the apex of a
-/// two-segment ramp.
+/// Order is the file's own: `[start, end, midpoint]`. `A3DGFXLightning::Load`
+/// reads the lines in exactly that order (`A3DGFXLightning.cpp:467-500`):
+///
+///     Width -> m_fWidthStart   // line 1
+///     Width -> m_fWidthEnd     // line 2
+///     ... (version >= 7) Alpha -> m_fAlphaStart, Alpha -> m_fAlphaEnd
+///     ... (version >= 35) Width -> m_fWidthMid, Alpha -> m_fAlphaMid   // line 3
+///
+/// and `FillVertexBuffer` ramps `Start -> Mid` over the first half of the path
+/// and `Mid -> End` over the second (`:888-903`). So the third line is the
+/// apex, not the second. One value is constant, two interpolate start to end
+/// with no midpoint.
 fn profile_at(values: &[f32], t: f32) -> f32 {
     let t = t.clamp(0., 1.);
     match values {
         [] => 0.,
         [only] => *only,
-        [end, start] => end + (start - end) * t,
-        [end, mid, start, ..] => {
+        [start, end] => start + (end - start) * t,
+        [start, end, mid, ..] => {
             if t <= 0.5 {
-                end + (mid - end) * (t / 0.5)
+                start + (mid - start) * (t / 0.5)
             } else {
-                mid + (start - mid) * ((t - 0.5) / 0.5)
+                mid + (end - mid) * ((t - 0.5) / 0.5)
             }
         }
     }
@@ -922,10 +931,24 @@ pub struct Trail {
 pub struct ModelRef {
     /// Path relative to the model archive root, e.g. `地图\水晶.SMD`.
     pub path: String,
+    /// `ModelActName`, the action `PlayActionByNameDC` starts (version 19+).
+    /// The viewer poses the bind pose, so the action is not played yet.
     pub action: String,
+    /// `Loops`, passed straight to `PlayActionByNameDC`: `-1` repeats forever,
+    /// `1` plays once and holds. 174 shipped models author `-1`, 72 author `1`
+    /// and 201 predate the version-31 key, whose constructor value is 1.
     pub loops: i32,
+    /// `AlphaCmp`, fed to `A3DSkinModel::EnableAlphaComp` (version 29+). Only 9
+    /// of the 447 shipped models set it.
     pub alpha_compare: bool,
+    /// `WriteZ`, the `ZWRITEENABLE` state `PrepareRenderSkinModel` installs
+    /// (version 49+). 115 shipped models author `1`; the constructor value and
+    /// therefore the meaning of an absent key is false.
     pub write_z: bool,
+    /// `Use3DCam` (version 77+). Read and saved by the client but dead in it:
+    /// `A3DGFXModel::IsForceUse3DCamera` returns `false` unconditionally, with
+    /// `m_bIsUse3DCamera` commented out of both that return and its
+    /// `GetProperty`. Nothing may act on this value.
     pub use_3d_camera: bool,
 }
 
@@ -1626,7 +1649,11 @@ fn spec(id: u32, fields: &[Field], version: u32) -> Result<Spec, String> {
             action: lookup.one("ModelActName").unwrap_or_default().to_string(),
             loops: lookup.integer("Loops", 1)? as i32,
             alpha_compare: lookup.flag("AlphaCmp", false)?,
-            write_z: lookup.flag("WriteZ", true)?,
+            // `A3DGFXModel`'s constructor starts at `m_bZWriteEnable(false)` and
+            // the key only arrived at version 49: of the 447 models in the
+            // shipped `gfx.pck`, 115 author `WriteZ: 1`, 131 author `0` and 201
+            // predate the key.
+            write_z: lookup.flag("WriteZ", false)?,
             use_3d_camera: lookup.flag("Use3DCam", false)?,
         }),
         170 => Spec::Sound(SoundRef {
@@ -2866,6 +2893,36 @@ mod tests {
                 "version {version} reads every trail key"
             );
         }
+    }
+
+    /// Element 160 starts life at `A3DGFXModel`'s constructor values —
+    /// `m_nLoops(1)`, `m_bAlphaCmp(false)`, `m_bZWriteEnable(false)` — and each
+    /// key only arrived later (`Loops` at 31, `AlphaCmp` at 29, `WriteZ` at 49),
+    /// so a block that omits them must read back as those defaults. The 201
+    /// shipped models without `WriteZ` therefore never write depth.
+    #[test]
+    fn model_defaults_do_not_write_depth() {
+        let block = "GFXELEMENTID: 160\nName: m\nSrcBlend: 5\nDestBlend: 2\n\
+            ModelPath: 地图\\水晶.SMD\nStartTime: 0\nKEYPOINTCOUNT: 0\n";
+        let model = "GFXELEMENTID: 160\nName: m\nSrcBlend: 5\nDestBlend: 2\n\
+            ModelPath: 地图\\水晶.SMD\nModelActName: \nLoops: -1\nAlphaCmp: 1\nWriteZ: 0\n\
+            StartTime: 0\nKEYPOINTCOUNT: 0\n";
+        let source = header37(2) + block + model;
+        let root = parse(&source).unwrap();
+        let Spec::Model(bare) = &root.elements[0].spec else {
+            panic!("element 160 is a model");
+        };
+        assert_eq!(bare.path, "地图\\水晶.SMD");
+        assert_eq!(bare.loops, 1, "constructor default is one loop");
+        assert!(!bare.alpha_compare, "constructor default is no alpha test");
+        assert!(!bare.write_z, "constructor default writes no depth");
+        assert!(!bare.use_3d_camera);
+        let Spec::Model(authored) = &root.elements[1].spec else {
+            panic!("element 160 is a model");
+        };
+        assert_eq!(authored.loops, -1);
+        assert!(authored.alpha_compare);
+        assert!(!authored.write_z, "an authored zero stays off");
     }
 
     #[test]
