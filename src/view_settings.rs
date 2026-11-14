@@ -722,7 +722,9 @@ mod tests {
         );
         let settings = ViewSettings::decode("far_terrain_lod=2");
         assert_eq!(
-            ViewSettings::decode(&settings.encode()).detail.far_terrain_lod,
+            ViewSettings::decode(&settings.encode())
+                .detail
+                .far_terrain_lod,
             2
         );
     }
