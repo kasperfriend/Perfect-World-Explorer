@@ -124,6 +124,14 @@ mod imp_stub {
         pub fn version_major(&self) -> u32 {
             0
         }
+
+        pub fn jitter(&self) -> (f32, f32) {
+            (0.0, 0.0)
+        }
+
+        pub fn wants_reset(&self) -> bool {
+            true
+        }
     }
 }
 #[cfg(not(windows))]
