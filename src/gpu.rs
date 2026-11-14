@@ -3779,7 +3779,7 @@ fn recreate_surface(
     adapter: &wgpu::Adapter,
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
-) -> Result<wgpu::Surface<Arc<Window>>, String> {
+) -> Result<wgpu::Surface<'static>, String> {
     let surface = instance
         .create_surface(window.clone())
         .map_err(|error| error.to_string())?;
@@ -4093,7 +4093,7 @@ pub fn run(
     // destroyed. `framegen` failing disables it for the rest of the session.
     let mut framegen: Option<crate::fsr::FrameGeneration> = None;
     let mut fg_failed = false;
-    let mut surface: Option<wgpu::Surface<Arc<Window>>> = Some(surface);
+    let mut surface: Option<wgpu::Surface<'static>> = Some(surface);
     let mut last_fsr_camera_pos = camera.pos;
     let mut display_gamma: Option<crate::display_gamma::DisplayGamma> = None;
     // Only allocated for UNORM-only swapchains; None is the normal sRGB route.
