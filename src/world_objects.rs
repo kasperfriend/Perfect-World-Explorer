@@ -1248,9 +1248,7 @@ mod page_tests {
         let p = [near_a, far, near_b];
         let pages = pages(&[&p], &[90]);
         let order = [(0, 0), (0, 1), (0, 2)];
-        let commands = fold_commands_culled(&pages, &order, Pass::Main, |bounds| {
-            bounds[0] < 10.
-        });
+        let commands = fold_commands_culled(&pages, &order, Pass::Main, |bounds| bounds[0] < 10.);
         assert_eq!(commands, vec![cmd(0, 0, 30), cmd(0, 60, 90)]);
         assert_eq!(
             drawn(&commands),
