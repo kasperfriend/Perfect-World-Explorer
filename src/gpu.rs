@@ -2646,7 +2646,10 @@ impl Renderer {
         &self,
         matrix: Mat4,
         view: Pass,
-    ) -> (Vec<crate::world_objects::DrawCmd>, Vec<crate::world_objects::DrawCmd>) {
+    ) -> (
+        Vec<crate::world_objects::DrawCmd>,
+        Vec<crate::world_objects::DrawCmd>,
+    ) {
         if !self.world_done {
             return (Vec::new(), Vec::new());
         }
@@ -2996,7 +2999,11 @@ impl Renderer {
             self.queue_map_runs(matrix);
             ViewRuns::Map
         };
-        let map_pass = if full_world { Pass::FullMap } else { Pass::Minimap };
+        let map_pass = if full_world {
+            Pass::FullMap
+        } else {
+            Pass::Minimap
+        };
         let (world_cmds, world_sdr_cmds) = self.world_commands_for_view(matrix, map_pass);
         let frame = self.frame;
         debug_assert!(
@@ -5756,9 +5763,7 @@ mod frame_snapshot_tests {
             "whole-world pages must be culled from the current view matrix"
         );
         assert!(
-            src.contains(
-                "self.world_commands_for_view(reflected_matrix, Pass::Reflection)"
-            ),
+            src.contains("self.world_commands_for_view(reflected_matrix, Pass::Reflection)"),
             "reflection scenery must use its mirrored view matrix"
         );
     }

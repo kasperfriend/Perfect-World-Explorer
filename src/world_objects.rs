@@ -1252,10 +1252,7 @@ mod page_tests {
         assert_eq!(commands, vec![cmd(0, 0, 30), cmd(0, 60, 90)]);
         assert_eq!(
             drawn(&commands),
-            (0..30)
-                .chain(60..90)
-                .map(|i| (0, i))
-                .collect::<Vec<_>>()
+            (0..30).chain(60..90).map(|i| (0, i)).collect::<Vec<_>>()
         );
     }
 
