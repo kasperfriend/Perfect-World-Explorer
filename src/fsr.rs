@@ -57,6 +57,8 @@
 //! Windows build is the compile authority.
 
 #[cfg(windows)]
+mod mv;
+#[cfg(windows)]
 mod fg;
 #[cfg(windows)]
 mod imp;

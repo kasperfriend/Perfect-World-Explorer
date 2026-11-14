@@ -1,7 +1,7 @@
 //! Windows + DX12 implementation of the FSR upscaler. See the module-level
 //! documentation in `super` for the overall design and its limits.
 
-use super::mv::{FsrMotionVectorPass, FsrMvParams};
+use super::mv::{FsrMotionVectorPass, FsrMvParams, COMPOSITE_SHADER};
 use glam::Mat4;
 use std::ffi::c_void;
 use winapi::shared::dxgiformat::{

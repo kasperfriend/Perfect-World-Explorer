@@ -57,7 +57,7 @@ struct FOut {
 }
 "#;
 
-const COMPOSITE_SHADER: &str = r#"
+pub(crate) const COMPOSITE_SHADER: &str = r#"
 @group(0) @binding(0) var frame: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
 struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };

@@ -33,10 +33,10 @@
 use super::imp::{
     choose_version_for_major, raw_dx12, FfxApiDimensions2D, FfxApiFloatCoords2D, FfxApiHeader,
     FfxApiResource, FfxCreateBackendDX12Desc, FfxLoader, FfxOverrideVersion,
-    FfxQueryDescGetVersions, FsrMotionVectorPass, FsrMvParams, NativeTexture2D,
-    FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ, FFX_API_SURFACE_FORMAT_R16G16_FLOAT,
-    FFX_API_SURFACE_FORMAT_R32_FLOAT,
+    FfxQueryDescGetVersions, NativeTexture2D, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ,
+    FFX_API_SURFACE_FORMAT_R16G16_FLOAT, FFX_API_SURFACE_FORMAT_R32_FLOAT,
 };
+use super::mv::{FsrMotionVectorPass, FsrMvParams};
 use glam::Mat4;
 use std::ffi::c_void;
 use winapi::shared::dxgi::{
