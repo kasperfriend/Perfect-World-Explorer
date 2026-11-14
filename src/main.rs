@@ -2222,7 +2222,12 @@ mod tests {
         let sdk = SdkReport::default();
         for gpu in [nvidia_rtx4070(), amd_rx9070(), intel_arc_a770(), software()] {
             for method in UpscaleMethod::ALL {
-                let expected = matches!(method, UpscaleMethod::Off);
+                // FSR 1 is in-tree (no SDK); everything else needs one.
+                let expected = match method {
+                    UpscaleMethod::Off => true,
+                    UpscaleMethod::Fsr1 => !gpu.cpu_fallback,
+                    _ => false,
+                };
                 assert_eq!(support(method, &gpu, &sdk).is_available(), expected);
             }
             for method in FrameGenMethod::ALL {
