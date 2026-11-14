@@ -85,10 +85,22 @@ pub struct RenderScale {
     sampler: wgpu::Sampler,
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
+    /// Lazily built FSR 1 spatial upscaler; only used while
+    /// `upscaling == Fsr1` and both axes are inside EASU's supported range.
+    fsr1: Option<crate::fsr1_gpu::Fsr1Gpu>,
+    input_extent: (u32, u32),
+    output_extent: (u32, u32),
 }
 
 impl RenderScale {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        w: u32,
+        h: u32,
+        output_w: u32,
+        output_h: u32,
+    ) -> Self {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("resolution scale layout"),
             entries: &[
@@ -155,13 +167,25 @@ impl RenderScale {
             sampler,
             pipeline,
             layout,
+            fsr1: None,
+            input_extent: (w, h),
+            output_extent: (output_w, output_h),
         }
     }
 
     /// Reallocate the offscreen target when the window or the scale changes.
     /// The pipeline, layout and sampler are size-independent and are reused.
-    pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) {
-        self.frame = target_texture(device, self.format, w, h);
+    pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32, output_w: u32, output_h: u32) {
+        if self.input_extent != (w, h) {
+            self.frame = target_texture(device, self.format, w, h);
+            self.input_extent = (w, h);
+        }
+        if self.output_extent != (output_w, output_h) {
+            self.output_extent = (output_w, output_h);
+            if let Some(fsr1) = &mut self.fsr1 {
+                fsr1.resize(device, self.output_extent);
+            }
+        }
     }
 
     /// The raw texture; used by the FSR path to copy the world frame into
@@ -184,11 +208,38 @@ impl RenderScale {
         })
     }
 
-    /// Bilinearly present the scaled world into the full-resolution composition
-    /// view. Runs after `Renderer::render` and before the UI pass, which loads
-    /// this result with `LoadOp::Load`.
-    pub fn blit(&self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView) {
+    /// Present the scaled world into the full-resolution composition view.
+    /// Runs after `Renderer::render` and before the UI pass, which loads this
+    /// result with `LoadOp::Load`. FSR 1 replaces the bilinear blit while it
+    /// is selected and both axes stay inside EASU's supported range; anything
+    /// else (including a device-limit clamp) falls back to bilinear.
+    pub fn blit(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target: &wgpu::TextureView,
+        upscaling: crate::UpscaleMethod,
+        sharpness_stops: f32,
+    ) {
         let source = self.view();
+        if upscaling == crate::UpscaleMethod::Fsr1
+            && crate::fsr1_eligible(self.input_extent, self.output_extent)
+        {
+            let size = self.output_extent;
+            let format = self.format;
+            let fsr1 = self
+                .fsr1
+                .get_or_insert_with(|| crate::fsr1_gpu::Fsr1Gpu::new(device, format, size));
+            fsr1.present(
+                device,
+                queue,
+                &source,
+                target,
+                self.input_extent,
+                sharpness_stops,
+            );
+            return;
+        }
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("resolution scale source"),
             layout: &self.layout,

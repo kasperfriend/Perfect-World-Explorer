@@ -215,11 +215,9 @@ pub struct ViewSettings {
     /// Graphics: frame generator, chosen independently of the upscaler.
     /// Illegal pairings are refused at decode time (see `crate::pairing`).
     pub frame_generation: FrameGenMethod,
-    /// Graphics: FSR provider major version to request from the FFX loader:
-    /// 0 = newest advertised (default), 3 = FSR 3.1.x (FFX temporal),
-    /// 4 = FSR Upscaling 4.x (ML). FSR 2 is not exposed through the FFX
-    /// API loader and cannot be selected.
-    pub fsr_version: u32,
+    /// Graphics: AMD FSR 1 RCAS sharpness in stops (lower = sharper).
+    /// Applies only while `upscaling` is `fsr1`.
+    pub fsr1_sharpness: f32,
     /// Graphics: folder to load the vendor upscaling SDKs from. Empty means
     /// `PW_UPSCALER_SDK_DIR`, or `<exe>\sdk\` beside the viewer. The SDKs are
     /// not shipped with the viewer and are never committed to the repository.
@@ -301,7 +299,7 @@ impl Default for ViewSettings {
             upscaling: UpscaleMethod::Off,
             upscale_quality: UpscaleQuality::Quality,
             frame_generation: FrameGenMethod::Off,
-            fsr_version: 0,
+            fsr1_sharpness: 0.2,
             upscale_sdk_dir: String::new(),
             // Both overrides default to the client's own behaviour; the World
             // tab offers them only so the recovered sets and particle
@@ -323,6 +321,11 @@ impl ViewSettings {
     fn decode_with_fog_default(text: &str, fog_enabled: bool) -> Self {
         let mut s = Self::default();
         s.atmospheric_fog = fog_enabled;
+        // Legacy `upscaling=fsr` (pre-FSR-version-selector settings) carries
+        // the chosen provider in `fsr_version`; either key may appear before
+        // the other in the file, so resolve the pair after the key loop.
+        let mut legacy_fsr_bare = false;
+        let mut legacy_fsr_version: Option<u32> = None;
         for line in text.lines().take(100) {
             let Some((k, v)) = line.split_once('=') else {
                 continue;
@@ -413,8 +416,11 @@ impl ViewSettings {
                 "upscaling" => {
                     if let Some(method) = UpscaleMethod::parse(v) {
                         s.upscaling = method;
+                    } else if v.trim().eq_ignore_ascii_case("fsr") {
+                        legacy_fsr_bare = true;
                     }
                 }
+                "fsr1_sharpness" => number!(s.fsr1_sharpness, 0., 2.),
                 "upscale_quality" => {
                     if let Some(quality) = UpscaleQuality::parse(v) {
                         s.upscale_quality = quality;
@@ -426,12 +432,8 @@ impl ViewSettings {
                     }
                 }
                 "fsr_version" => {
-                    s.fsr_version = match v.trim() {
-                        "0" | "auto" => 0,
-                        "3" | "fsr3" => 3,
-                        "4" | "fsr4" => 4,
-                        _ => 0,
-                    };
+                    // Legacy key, consumed for the `upscaling=fsr` migration.
+                    legacy_fsr_version = v.trim().parse::<u32>().ok();
                 }
                 "upscale_sdk_dir" => {
                     // An empty value is the default (env var or <exe>\sdk), so
@@ -505,6 +507,15 @@ impl ViewSettings {
                 _ => {}
             }
         }
+        if legacy_fsr_bare {
+            s.upscaling = match legacy_fsr_version {
+                Some(1) => UpscaleMethod::Fsr1,
+                Some(2) => UpscaleMethod::Fsr2,
+                Some(3) => UpscaleMethod::Fsr3,
+                // "newest advertised" (the old 0/4 default) is FSR 4 today.
+                _ => UpscaleMethod::Fsr4,
+            };
+        }
         // Settings written by another build (or hand-edited) can hold an
         // upscaler/quality/frame-generator triple this build cannot honour;
         // coerce it to a legal one rather than failing the whole file.
@@ -520,12 +531,12 @@ impl ViewSettings {
             "radius={}\nterrain_cutoff={}\ntree_lod_scale={}\nscenery_quality={}\ncamera_speed={}\nboost={}\nsensitivity={}\nfar={}\ntime_of_day={}\ntime_pass_enabled={}\ntime_pass_speed={}\nall_to_vram={}\n",
             "whole_world={}\nwater_reflections={}\nworld_effects={}\natmospheric_fog={}\nbloom={}\nbloom_strength={}\nbloom_mode={}\nbloom_tint={}\nbloom_brightness_fade={}\nbloom_opacity_fade={}\nclient_gamma={}\ngamma_setting={}\n",
             "terrain_lightmaps={}\nmodel_backface_culling={}\nmusic_enabled={}\nmusic_volume={}\nambience_enabled={}\nsound_volume={}\neffects_enabled={}\neffects_volume={}\nfullscreen={}\nshow_zone_entry={}\n",
-            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nfsr_version={}\nupscale_sdk_dir={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\n"),
+            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nfsr1_sharpness={}\nupscale_sdk_dir={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\n"),
             self.detail.radius,self.detail.terrain_cutoff,self.detail.tree_lod_scale,self.detail.scenery_quality,self.camera_speed,self.boost,self.sensitivity,self.far,self.time_of_day,self.time_pass_enabled,self.time_pass_speed,self.all_to_vram,
             self.whole_world,self.water_reflections,self.world_effects,self.atmospheric_fog,self.bloom,self.bloom_strength,self.bloom_mode,self.bloom_tint,self.bloom_brightness_fade,self.bloom_opacity_fade,self.client_gamma,self.gamma_setting,
             self.terrain_lightmaps,self.model_backface_culling,self.music_enabled,self.music_volume,self.ambience_enabled,self.sound_volume,self.effects_enabled,self.effects_volume,self.fullscreen,self.show_zone_entry,
             self.show_minimap,self.minimap_range,self.tree_wind_strength,self.client_tree_wind_preview,self.regional_tree_lighting,self.grass_distance_fade,self.grass_wind_enabled,self.grass_wind_amplitude,self.streamed_regions,self.area_grass_lightmaps,self.vegetation_authored_mips,self.celestial_discs,self.celestial_brightness,self.ignore_celestial_flags,self.cloud_detail,self.sharpen,self.resolution_scale,
-            self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.fsr_version,self.upscale_sdk_dir,
+            self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.fsr1_sharpness,self.upscale_sdk_dir,
             self.world_map_style.label(),self.minimap_style.label(),
             self.minimap_shape.label(),
             self.weather_override.token(),self.sky_override.token(),self.effect_shaft.token(),self.effect_distance,self.logging_mask,self.logging_dir)
@@ -1129,17 +1140,43 @@ effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs
         let xess = ViewSettings::decode("upscaling=xess\nupscale_quality=ultraperformance\n");
         assert_eq!(xess.upscale_quality, crate::UpscaleQuality::Quality);
         // Cross-vendor XeSS frame generation is not exposed: coerced to Off.
-        let cross = ViewSettings::decode("upscaling=fsr\nframe_generation=xess\n");
+        let cross = ViewSettings::decode("upscaling=fsr2\nframe_generation=xess\n");
         assert_eq!(cross.frame_generation, crate::FrameGenMethod::Off);
         // DLSS + DLSS FG is legal and survives.
         let legal = ViewSettings::decode("upscaling=dlss\nframe_generation=dlss\n");
         assert_eq!(legal.frame_generation, crate::FrameGenMethod::Dlss);
         // Mixed case tokens parse.
-        let mixed = ViewSettings::decode("upscaling=FSR\nframe_generation=FSR\n");
-        assert_eq!(mixed.upscaling, crate::UpscaleMethod::Fsr);
+        let mixed = ViewSettings::decode("upscaling=FSR3\nframe_generation=FSR\n");
+        assert_eq!(mixed.upscaling, crate::UpscaleMethod::Fsr3);
         assert_eq!(mixed.frame_generation, crate::FrameGenMethod::Fsr);
         // Case-insensitive parse keeps the rest of the file intact.
         assert_eq!(ViewSettings::decode(&mixed.encode()), mixed);
+    }
+    #[test]
+    fn legacy_bare_fsr_migrates_via_fsr_version() {
+        // Pre-selector settings files: `upscaling=fsr` with an `fsr_version`
+        // discriminator, in either key order.
+        for (text, expected) in [
+            ("upscaling=fsr\n", crate::UpscaleMethod::Fsr4),
+            ("upscaling=fsr\nfsr_version=0\n", crate::UpscaleMethod::Fsr4),
+            ("upscaling=fsr\nfsr_version=4\n", crate::UpscaleMethod::Fsr4),
+            ("upscaling=fsr\nfsr_version=3\n", crate::UpscaleMethod::Fsr3),
+            ("upscaling=fsr\nfsr_version=2\n", crate::UpscaleMethod::Fsr2),
+            ("upscaling=fsr\nfsr_version=1\n", crate::UpscaleMethod::Fsr1),
+            ("fsr_version=3\nupscaling=fsr\n", crate::UpscaleMethod::Fsr3),
+            // An explicit modern choice wins; the legacy key is ignored.
+            (
+                "upscaling=fsr2\nfsr_version=4\n",
+                crate::UpscaleMethod::Fsr2,
+            ),
+        ] {
+            assert_eq!(ViewSettings::decode(text).upscaling, expected, "{text:?}");
+        }
+        // The migrated triple is re-encoded as the modern token.
+        let s = ViewSettings::decode("upscaling=fsr\nfsr_version=3\n");
+        assert_eq!(ViewSettings::decode(&s.encode()), s);
+        assert!(s.encode().contains("upscaling=fsr3"));
+        assert!(!s.encode().contains("fsr_version"));
     }
     #[test]
     fn every_independent_post_effect_activates_the_renderer_chain() {

@@ -80,7 +80,7 @@ print exactly which names were found):
   FSR Upscaling 4 (4.1.2), FSR 3.1.6 and FSR 2; one DX12 frame-generation
   DLL provides FSR Frame Generation 4.0.2, FSR Frame Generation (Swapchain)
   4.0.0 and FSR 3 frame generation (3.1.7). Works on AMD, NVIDIA and Intel
-  GPUs. (FSR 1 is EASU/RCAS shaders, not a DLL; it is not part of this SDK.)
+  GPUs. (FSR 1 is EASU/RCAS shaders, not a DLL; it is not part of this SDK — see the FSR 1 notice below.)
 - **License:** AMD FSR SDK v2.4.0 (`Kits/FidelityFX/docs/license.md`).
   The signed binaries (`signedbin/*.dll`) are expressly excepted from the
   SDK's binary-only terms and are covered by the following MIT-style
@@ -128,6 +128,39 @@ print exactly which names were found):
   FG 3.1.7). Not verified on hardware in this build environment. Earlier
   SDK 1.x DLL names (`ffx_*.dll`) are deprecated by AMD and are no longer
   probed.
+
+## AMD FidelityFX Super Resolution 1 (EASU + RCAS)
+
+- **What it is:** AMD's FSR 1 spatial upscaler. This build ships a scalar
+  WGSL port of the EASU (edge-adaptive spatial upsampler) and RCAS (robust
+  contrast-adaptive sharpening) passes in `src/fsr1.wgsl` and
+  `src/fsr1_gpu.rs`. It is **not** part of the FidelityFX SDK and needs no
+  vendor binary; the Graphics tab lists it as "FSR 1 (EASU + RCAS)".
+- **License:** MIT License.
+  Derived from GPUOpen-Effects/FidelityFX-FSR, `ffx-fsr/ffx_fsr1.h`.
+  Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
+  The copyright, permission and warranty notice in that header are
+  reproduced here:
+
+  "Permission is hereby granted, free of charge, to any person obtaining a
+  copy of this software and associated documentation files (the
+  "Software"), to deal in the Software without restriction, including
+  without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to permit
+  persons to whom the Software is furnished to do so, subject to the
+  following conditions:
+  The above copyright notice and this permission notice shall be included
+  in all copies or substantial portions of the Software."
+
+  The scalar (non-gather4) formulation, the WGSL syntax and the integration
+  are this project's work; the algorithm, constants and structure follow
+  the AMD reference closely enough to be considered a derivative work.
+- **Attribution:** "FidelityFX Super Resolution" is a trademark of Advanced
+  Micro Devices, Inc.
+- **Where to get it:** <https://gpuopen.com/fidelityfx-fsr/> and
+  <https://github.com/GPUOpen-Effects/FidelityFX-FSR>.
+- **Version documented against:** FSR 1.0 (ffx_fsr1.h, 2021). Not verified
+  on hardware in this build environment.
 
 ## Intel XeSS / XeSS 2
 

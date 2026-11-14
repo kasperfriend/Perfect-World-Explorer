@@ -78,9 +78,14 @@ done.
     every provider stays disabled with a visible reason until a real SDK is
     present.
   - AMD FSR **is** now implemented (`src/fsr.rs`, Windows + DX12 only) and
-    wired behind the same `Upscaling = FSR` setting. The upscaler is the FFX
-    **Upscaling 4.1.2** provider by default; `fsr_version=` pins the major
-    (0 newest / 3 FSR 3.1.6 / 4 Upscaling 4.x). The AMD loader DLL is
+    wired behind the same `Upscaling` setting as three selectable providers.
+    The Graphics tab lists **FSR 1** (in-tree WGSL EASU + RCAS spatial pass,
+    no FFX context and no SDK), **FSR 2** (FFX provider 2.3.4), **FSR 3.1**
+    (FFX provider 3.1.6) and **FSR 4.1** (FFX provider 4.1.2, ML; the option
+    is disabled up front unless an RDNA 4 / RX 9000 series AMD GPU is
+    detected). Legacy `upscaling=fsr` + `fsr_version=` settings migrate on
+    read (`1|2|3|4` → `fsr1|fsr2|fsr3|fsr4`; absent/`0` → `fsr4`). The AMD
+    loader DLL is
     loaded with LoadLibraryW/GetProcAddress; the FFX 2.4.0 upscaler provider
     is enumerated with `ffxQueryDescGetVersions` and pinned with
     `ffxOverrideVersion`; the world projection is jittered with the FFX jitter

@@ -51,6 +51,7 @@ mod far_trees_gpu;
 mod fog_matrix;
 mod foliage_mips;
 mod fsr;
+mod fsr1_gpu;
 #[allow(dead_code)]
 mod gfx_catalog;
 mod gfx_color_track;
@@ -845,9 +846,10 @@ fn export_height_png(
 //
 // ## Settings tokens
 //
-// `upscaling=off|dlss|fsr|xess`,
+// `upscaling=off|dlss|fsr1|fsr2|fsr3|fsr4|xess`,
 // `upscale_quality=ultraquality|quality|balanced|performance|ultraperformance`,
-// `frame_generation=off|dlss|fsr|xess`, `upscale_sdk_dir=<path>`.
+// `frame_generation=off|dlss|fsr|xess`, `fsr1_sharpness=<0..2 stops>`,
+// `upscale_sdk_dir=<path>`.
 //
 // This logic is intentionally free of GPU and windowing dependencies so it
 // can be unit-tested headless. The provider FFI lives in gpu.rs.
@@ -1098,18 +1100,32 @@ pub enum UpscaleMethod {
     #[default]
     Off,
     Dlss,
-    Fsr,
+    Fsr1,
+    Fsr2,
+    Fsr3,
+    Fsr4,
     Xess,
 }
 
 impl UpscaleMethod {
-    pub const ALL: [Self; 4] = [Self::Off, Self::Dlss, Self::Fsr, Self::Xess];
+    pub const ALL: [Self; 7] = [
+        Self::Off,
+        Self::Dlss,
+        Self::Fsr1,
+        Self::Fsr2,
+        Self::Fsr3,
+        Self::Fsr4,
+        Self::Xess,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "Off",
             Self::Dlss => "DLSS Super Resolution",
-            Self::Fsr => "FSR",
+            Self::Fsr1 => "FSR 1 (EASU + RCAS)",
+            Self::Fsr2 => "FSR 2 (FFX temporal)",
+            Self::Fsr3 => "FSR 3.1 (FFX temporal)",
+            Self::Fsr4 => "FSR 4.1 (FFX ML)",
             Self::Xess => "XeSS",
         }
     }
@@ -1118,19 +1134,45 @@ impl UpscaleMethod {
         match self {
             Self::Off => "off",
             Self::Dlss => "dlss",
-            Self::Fsr => "fsr",
+            Self::Fsr1 => "fsr1",
+            Self::Fsr2 => "fsr2",
+            Self::Fsr3 => "fsr3",
+            Self::Fsr4 => "fsr4",
             Self::Xess => "xess",
         }
     }
 
+    /// `fsr` is deliberately rejected: settings written by earlier builds
+    /// carry it together with `fsr_version`, and the caller (settings
+    /// decode) resolves that legacy pair explicitly so the user's saved
+    /// choice is honoured instead of silently becoming the newest provider.
     pub fn parse(text: &str) -> Option<Self> {
         match text.trim().to_ascii_lowercase().as_str() {
             "off" => Some(Self::Off),
             "dlss" => Some(Self::Dlss),
-            "fsr" => Some(Self::Fsr),
+            "fsr1" | "fsr 1" | "fsr-1" => Some(Self::Fsr1),
+            "fsr2" | "fsr 2" | "fsr-2" => Some(Self::Fsr2),
+            "fsr3" | "fsr 3" | "fsr-3" => Some(Self::Fsr3),
+            "fsr4" | "fsr 4" | "fsr-4" | "fsr4.1" | "fsr 4.1" => Some(Self::Fsr4),
             "xess" => Some(Self::Xess),
             _ => None,
         }
+    }
+
+    /// FFX provider major version requested from the loader, or `None` for
+    /// the FSR 1 spatial path (no FFX context is involved).
+    pub fn ffx_major(self) -> Option<u32> {
+        match self {
+            Self::Fsr2 => Some(2),
+            Self::Fsr3 => Some(3),
+            Self::Fsr4 => Some(4),
+            _ => None,
+        }
+    }
+
+    /// True for the three FFX SDK providers (FSR 2/3/4).
+    pub fn is_ffx_fsr(self) -> bool {
+        matches!(self, Self::Fsr2 | Self::Fsr3 | Self::Fsr4)
     }
 }
 
@@ -1234,7 +1276,12 @@ impl UpscaleQuality {
 /// Performance mode; DLSS maps Ultra Quality onto DLAA.
 pub fn quality_available(method: UpscaleMethod, quality: UpscaleQuality) -> bool {
     match method {
-        UpscaleMethod::Off | UpscaleMethod::Dlss | UpscaleMethod::Fsr => true,
+        UpscaleMethod::Off
+        | UpscaleMethod::Dlss
+        | UpscaleMethod::Fsr1
+        | UpscaleMethod::Fsr2
+        | UpscaleMethod::Fsr3
+        | UpscaleMethod::Fsr4 => true,
         UpscaleMethod::Xess => quality != UpscaleQuality::UltraPerformance,
     }
 }
@@ -1255,13 +1302,17 @@ pub fn internal_factor(method: UpscaleMethod, quality: UpscaleQuality) -> f64 {
             UpscaleQuality::Performance => 0.5,
             UpscaleQuality::UltraPerformance => 1.0 / 3.0,
         },
-        UpscaleMethod::Fsr => match quality {
-            UpscaleQuality::UltraQuality => 1.0 / 1.3,
-            UpscaleQuality::Quality => 1.0 / 1.5,
-            UpscaleQuality::Balanced => 1.0 / 1.7,
-            UpscaleQuality::Performance => 0.5,
-            UpscaleQuality::UltraPerformance => 1.0 / 3.0,
-        },
+        // FSR 1 EASU spans the same documented scale ladder as the FFX
+        // providers; the spatial pass has no DLAA-style native accumulation.
+        UpscaleMethod::Fsr1 | UpscaleMethod::Fsr2 | UpscaleMethod::Fsr3 | UpscaleMethod::Fsr4 => {
+            match quality {
+                UpscaleQuality::UltraQuality => 1.0 / 1.3,
+                UpscaleQuality::Quality => 1.0 / 1.5,
+                UpscaleQuality::Balanced => 1.0 / 1.7,
+                UpscaleQuality::Performance => 0.5,
+                UpscaleQuality::UltraPerformance => 1.0 / 3.0,
+            }
+        }
         UpscaleMethod::Xess => match quality {
             UpscaleQuality::UltraQuality => 1.0 / 1.3,
             UpscaleQuality::Quality => 1.0 / 1.5,
@@ -1311,6 +1362,32 @@ fn sdk_reason(sdk: &SdkReport, what: &str) -> String {
     }
 }
 
+/// Name-based gate for the RDNA 4 generation that FSR 4's ML provider
+/// targets (RX 9060/9070 family, desktop and mobile). AMD exposes no
+/// feature-query API in the in-tree FFX headers, so this is deliberately
+/// conservative: anything ambiguous is reported as unsupported, and a false
+/// positive still fails safe at context creation (the frame loop falls back
+/// to bilinear with a log line).
+pub fn is_rdna4(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains("rx 90") || name.contains("rx90") || name.contains("radeon 90")
+}
+
+/// EASU is specified for up to 4x area upscaling (at most 2x per axis), not
+/// downsampling. Outside that range, or if clamping to the device limit
+/// makes even one input axis larger than the output, feed bilinear instead.
+pub fn fsr1_eligible(input: (u32, u32), output: (u32, u32)) -> bool {
+    input.0 > 0
+        && input.1 > 0
+        && output.0 > 0
+        && output.1 > 0
+        && input.0 <= output.0
+        && input.1 <= output.1
+        && u64::from(input.0) * 2 >= u64::from(output.0)
+        && u64::from(input.1) * 2 >= u64::from(output.1)
+        && input != output
+}
+
 /// Hardware + SDK gate for one upscaler. `Off` is always available.
 pub fn support(method: UpscaleMethod, gpu: &GpuFacts, sdk: &SdkReport) -> Support {
     match method {
@@ -1332,21 +1409,62 @@ pub fn support(method: UpscaleMethod, gpu: &GpuFacts, sdk: &SdkReport) -> Suppor
                 Support::Available("DLSS SDK found")
             }
         }
-        UpscaleMethod::Fsr => {
+        UpscaleMethod::Fsr1 => {
+            // FSR 1 is a spatial EASU+RCAS fragment pass, not an FFX
+            // context; it ships in-tree and needs no vendor SDK.
             if gpu.cpu_fallback {
                 Support::Disabled("Requires a real GPU (software adapter detected)".into())
+            } else {
+                Support::Available("FSR 1 EASU + RCAS, in-tree (AMD, NVIDIA and Intel GPUs)")
+            }
+        }
+        UpscaleMethod::Fsr2 | UpscaleMethod::Fsr3 | UpscaleMethod::Fsr4 => {
+            let sdk_missing = if gpu.cpu_fallback {
+                Some("Requires a real GPU (software adapter detected)".to_string())
             } else if !sdk.fsr_upscale {
-                Support::Disabled(sdk_reason(
+                Some(sdk_reason(
                     sdk,
                     "FSR SDK (amd_fidelityfx_upscaler_dx12.dll)",
                 ))
             } else if !sdk.fsr_loader {
-                Support::Disabled(sdk_reason(
+                Some(sdk_reason(
                     sdk,
                     "FSR loader (amd_fidelityfx_loader_dx12.dll)",
                 ))
             } else {
-                Support::Available("FSR SDK found (works on AMD, NVIDIA and Intel GPUs)")
+                None
+            };
+            if let Some(reason) = sdk_missing {
+                Support::Disabled(reason)
+            } else {
+                match method {
+                    UpscaleMethod::Fsr2 => Support::Available(
+                        "FSR 2 (provider 2.3.4) via FFX — AMD, NVIDIA and Intel GPUs",
+                    ),
+                    UpscaleMethod::Fsr3 => Support::Available(
+                        "FSR 3.1 (provider 3.1.6) via FFX — AMD, NVIDIA and Intel GPUs",
+                    ),
+                    UpscaleMethod::Fsr4 => {
+                        // FSR 4's ML path is only exposed on RDNA 4
+                        // (RX 9000 series); AMD hardware below that falls
+                        // back to bilinear at context creation, but the
+                        // option is marked unavailable up front instead.
+                        if !gpu.is_amd() {
+                            Support::Disabled(format!(
+                                "FSR 4 ML requires an AMD Radeon RX 9000 series GPU (detected: {})",
+                                gpu.name
+                            ))
+                        } else if !is_rdna4(&gpu.name) {
+                            Support::Disabled(format!(
+                                "FSR 4 ML requires an AMD Radeon RX 9000 series GPU (detected: {})",
+                                gpu.name
+                            ))
+                        } else {
+                            Support::Available("FSR 4.1 (provider 4.1.2) via FFX on RDNA 4")
+                        }
+                    }
+                    _ => unreachable!("matched above"),
+                }
             }
         }
         UpscaleMethod::Xess => {
@@ -1466,7 +1584,11 @@ pub fn pairing(upscale: UpscaleMethod, frame_generation: FrameGenMethod) -> Pair
         FrameGenMethod::Fsr => PairingVerdict::Supported,
         FrameGenMethod::Xess => match upscale {
             UpscaleMethod::Off | UpscaleMethod::Xess => PairingVerdict::Supported,
-            UpscaleMethod::Dlss | UpscaleMethod::Fsr => PairingVerdict::Unsupported(
+            UpscaleMethod::Dlss
+            | UpscaleMethod::Fsr1
+            | UpscaleMethod::Fsr2
+            | UpscaleMethod::Fsr3
+            | UpscaleMethod::Fsr4 => PairingVerdict::Unsupported(
                 "Intel documents XeSS Frame Generation for use with XeSS only",
             ),
         },
@@ -1607,6 +1729,10 @@ mod tests {
         GpuFacts::from_parts(VENDOR_AMD, 0x7550, "AMD Radeon RX 9070 XT", "dx12", false)
     }
 
+    fn amd_rx7900xtx() -> GpuFacts {
+        GpuFacts::from_parts(VENDOR_AMD, 0x744c, "AMD Radeon RX 7900 XTX", "dx12", false)
+    }
+
     fn intel_arc_a770() -> GpuFacts {
         GpuFacts::from_parts(
             VENDOR_INTEL,
@@ -1695,18 +1821,73 @@ mod tests {
     }
 
     #[test]
-    fn fsr_works_cross_vendor_but_needs_sdk() {
+    fn fsr1_is_in_tree_and_needs_no_sdk() {
         for gpu in [nvidia_rtx4070(), amd_rx9070(), intel_arc_a770()] {
-            assert!(support(UpscaleMethod::Fsr, &gpu, &no_sdk())
-                .reason()
-                .unwrap()
-                .contains("FSR SDK"));
-            assert!(support(UpscaleMethod::Fsr, &gpu, &full_sdk()).is_available());
+            assert!(support(UpscaleMethod::Fsr1, &gpu, &no_sdk()).is_available());
         }
-        assert!(support(UpscaleMethod::Fsr, &software(), &full_sdk())
+        assert!(support(UpscaleMethod::Fsr1, &software(), &no_sdk())
             .reason()
             .unwrap()
             .contains("software adapter"));
+    }
+
+    #[test]
+    fn fsr2_and_fsr3_are_cross_vendor_but_need_the_sdk() {
+        for gpu in [nvidia_rtx4070(), amd_rx9070(), intel_arc_a770()] {
+            for method in [UpscaleMethod::Fsr2, UpscaleMethod::Fsr3] {
+                assert!(support(method, &gpu, &no_sdk())
+                    .reason()
+                    .unwrap()
+                    .contains("FSR SDK"));
+                assert!(support(method, &gpu, &full_sdk()).is_available());
+            }
+        }
+        for method in [UpscaleMethod::Fsr2, UpscaleMethod::Fsr3] {
+            assert!(support(method, &software(), &full_sdk())
+                .reason()
+                .unwrap()
+                .contains("software adapter"));
+        }
+    }
+
+    #[test]
+    fn fsr4_is_gated_to_rdna4() {
+        let rdna4 =
+            GpuFacts::from_parts(VENDOR_AMD, 0x744c, "AMD Radeon RX 9070 XT", "dx12", false);
+        assert!(support(UpscaleMethod::Fsr4, &rdna4, &full_sdk()).is_available());
+        // Pre-RDNA-4 AMD is disabled with a reason, not silently substituted.
+        assert!(support(UpscaleMethod::Fsr4, &amd_rx7900xtx(), &full_sdk())
+            .reason()
+            .unwrap()
+            .contains("RX 9000"));
+        // Non-AMD is disabled too.
+        assert!(support(UpscaleMethod::Fsr4, &nvidia_rtx4070(), &full_sdk())
+            .reason()
+            .unwrap()
+            .contains("RX 9000"));
+        // SDK still required on supported hardware.
+        assert!(support(UpscaleMethod::Fsr4, &rdna4, &no_sdk())
+            .reason()
+            .unwrap()
+            .contains("FSR SDK"));
+    }
+
+    #[test]
+    fn fsr_tokens_parse_and_roundtrip() {
+        for (method, token) in [
+            (UpscaleMethod::Off, "off"),
+            (UpscaleMethod::Fsr1, "fsr1"),
+            (UpscaleMethod::Fsr2, "fsr2"),
+            (UpscaleMethod::Fsr3, "fsr3"),
+            (UpscaleMethod::Fsr4, "fsr4"),
+        ] {
+            assert_eq!(UpscaleMethod::parse(token), Some(method));
+            assert_eq!(method.token(), token);
+        }
+        // The bare legacy token is rejected; the settings decoder resolves
+        // `upscaling=fsr` + `fsr_version` explicitly (see view_settings).
+        assert_eq!(UpscaleMethod::parse("fsr"), None);
+        assert_eq!(UpscaleMethod::parse("FSR4.1"), Some(UpscaleMethod::Fsr4));
     }
 
     #[test]
@@ -1755,12 +1936,15 @@ mod tests {
     fn fsr_frame_generation_needs_fg_and_loader() {
         let mut sdk = no_sdk();
         sdk.fsr_frame_generation = true;
-        assert!(
-            support_framegen(FrameGenMethod::Fsr, UpscaleMethod::Fsr, &amd_rx9070(), &sdk)
-                .reason()
-                .unwrap()
-                .contains("amd_fidelityfx_loader_dx12.dll")
-        );
+        assert!(support_framegen(
+            FrameGenMethod::Fsr,
+            UpscaleMethod::Fsr3,
+            &amd_rx9070(),
+            &sdk
+        )
+        .reason()
+        .unwrap()
+        .contains("amd_fidelityfx_loader_dx12.dll"));
         sdk.fsr_loader = true;
         assert!(support_framegen(
             FrameGenMethod::Fsr,
@@ -1799,7 +1983,14 @@ mod tests {
         assert!(pairing(UpscaleMethod::Xess, FrameGenMethod::Xess).is_supported());
         assert!(pairing(UpscaleMethod::Off, FrameGenMethod::Xess).is_supported());
         assert!(!pairing(UpscaleMethod::Dlss, FrameGenMethod::Xess).is_supported());
-        assert!(!pairing(UpscaleMethod::Fsr, FrameGenMethod::Xess).is_supported());
+        for fsr in [
+            UpscaleMethod::Fsr1,
+            UpscaleMethod::Fsr2,
+            UpscaleMethod::Fsr3,
+            UpscaleMethod::Fsr4,
+        ] {
+            assert!(!pairing(fsr, FrameGenMethod::Xess).is_supported());
+        }
     }
 
     #[test]
@@ -1813,7 +2004,7 @@ mod tests {
         assert_eq!(quality, UpscaleQuality::Quality);
         // Cross-vendor XeSS frame generation is not exposed.
         let (_, _, fg) = sanitise(
-            UpscaleMethod::Fsr,
+            UpscaleMethod::Fsr2,
             UpscaleQuality::Quality,
             FrameGenMethod::Xess,
         );
@@ -1835,8 +2026,53 @@ mod tests {
     }
 
     #[test]
+    fn ffx_major_maps_only_the_sdk_providers() {
+        assert_eq!(UpscaleMethod::Off.ffx_major(), None);
+        assert_eq!(UpscaleMethod::Fsr1.ffx_major(), None);
+        assert_eq!(UpscaleMethod::Fsr2.ffx_major(), Some(2));
+        assert_eq!(UpscaleMethod::Fsr3.ffx_major(), Some(3));
+        assert_eq!(UpscaleMethod::Fsr4.ffx_major(), Some(4));
+        assert_eq!(UpscaleMethod::Dlss.ffx_major(), None);
+        assert_eq!(UpscaleMethod::Xess.ffx_major(), None);
+        assert!(UpscaleMethod::Fsr2.is_ffx_fsr());
+        assert!(UpscaleMethod::Fsr3.is_ffx_fsr());
+        assert!(UpscaleMethod::Fsr4.is_ffx_fsr());
+        assert!(!UpscaleMethod::Fsr1.is_ffx_fsr());
+    }
+
+    #[test]
+    fn fsr1_eligible_bounds() {
+        assert!(fsr1_eligible((960, 540), (1920, 1080)));
+        assert!(fsr1_eligible((1, 1), (2, 2)));
+        assert!(!fsr1_eligible((192, 108), (1920, 1080)));
+        assert!(!fsr1_eligible((999, 540), (2000, 1080)));
+        assert!(!fsr1_eligible((1920, 1080), (1920, 1080)));
+        assert!(!fsr1_eligible((3840, 2160), (1920, 1080)));
+        assert!(!fsr1_eligible((2048, 540), (1920, 1080)));
+        assert!(!fsr1_eligible((0, 100), (1920, 1080)));
+        assert!(!fsr1_eligible((960, 540), (0, 0)));
+    }
+
+    #[test]
+    fn is_rdna4_matches_rx_9_models_only() {
+        assert!(is_rdna4("AMD Radeon RX 9070 XT"));
+        assert!(is_rdna4("AMD Radeon RX 9060"));
+        assert!(is_rdna4("AMD Radeon RX 9010M XT"));
+        assert!(!is_rdna4("AMD Radeon RX 7900 XTX"));
+        assert!(!is_rdna4("NVIDIA GeForce RTX 4070"));
+        assert!(!is_rdna4("Intel Arc A770"));
+    }
+
+    #[test]
     fn internal_factors_shrink_the_image_monotonically() {
-        for method in [UpscaleMethod::Dlss, UpscaleMethod::Fsr, UpscaleMethod::Xess] {
+        for method in [
+            UpscaleMethod::Dlss,
+            UpscaleMethod::Fsr1,
+            UpscaleMethod::Fsr2,
+            UpscaleMethod::Fsr3,
+            UpscaleMethod::Fsr4,
+            UpscaleMethod::Xess,
+        ] {
             let factors: Vec<f64> = UpscaleQuality::ALL
                 .iter()
                 .map(|quality| internal_factor(method, *quality))
@@ -1864,7 +2100,7 @@ mod tests {
     fn provider_extent_scales_and_clamps() {
         assert_eq!(
             provider_extent(
-                UpscaleMethod::Fsr,
+                UpscaleMethod::Fsr3,
                 UpscaleQuality::Performance,
                 1920,
                 1080,
@@ -1885,7 +2121,7 @@ mod tests {
         let (w, h) = provider_extent(UpscaleMethod::Xess, UpscaleQuality::Balanced, 1, 1, 8192);
         assert_eq!((w, h), (1, 1));
         let (w, h) = provider_extent(
-            UpscaleMethod::Fsr,
+            UpscaleMethod::Fsr2,
             UpscaleQuality::UltraPerformance,
             4000,
             3000,
@@ -1929,7 +2165,7 @@ mod tests {
                 (1221, 717),
                 (1920, 1080),
                 8192,
-                UpscaleMethod::Fsr,
+                UpscaleMethod::Fsr3,
                 UpscaleQuality::Performance,
                 &amd_rx9070(),
                 &full_sdk(),
@@ -2152,7 +2388,10 @@ fn diagnose_upscale(args: &[String]) -> i32 {
             }
             println!();
             println!("Quality modes and internal render factors (1920×1080 window):");
-            for method in [UpscaleMethod::Dlss, UpscaleMethod::Fsr, UpscaleMethod::Xess] {
+            for method in UpscaleMethod::ALL {
+                if method == UpscaleMethod::Off {
+                    continue;
+                }
                 println!("  {}:", method.label());
                 for quality in UpscaleQuality::ALL {
                     let available = quality_available(method, quality);

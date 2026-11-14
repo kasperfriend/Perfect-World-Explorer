@@ -678,6 +678,12 @@ impl FrameGeneration {
         self.size
     }
 
+    /// How many frames the pipeline has finished (presented real frames
+    /// plus interpolated ones). Shown in the on-screen mark.
+    pub fn frames_presented(&self) -> u64 {
+        self.frame_index
+    }
+
     /// The size of the world render targets the pipeline consumes.
     pub fn render_extent(&self) -> (u32, u32) {
         self.render_extent

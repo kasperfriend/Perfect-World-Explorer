@@ -677,6 +677,10 @@ pub struct FsrUpscaler {
     reset_history: bool,
     last_instant: std::time::Instant,
     version_major: u32,
+    /// The provider version the loader actually advertised and the override
+    /// pinned (FFX version id: major << 22 | minor << 12 | patch). `None`
+    /// when enumeration failed and the loader picked the provider itself.
+    selected_version: Option<u64>,
 }
 
 impl Drop for FsrUpscaler {
@@ -859,6 +863,7 @@ impl FsrUpscaler {
             reset_history: true,
             last_instant: std::time::Instant::now(),
             version_major: fsr_version_major,
+            selected_version: chosen_version,
         })
     }
 
@@ -873,6 +878,13 @@ impl FsrUpscaler {
     /// The requested FFX provider major version (0 = newest advertised).
     pub(crate) fn version_major(&self) -> u32 {
         self.version_major
+    }
+
+    /// The full FFX version id of the selected provider, when enumeration
+    /// succeeded. Decoded for display with `(id >> 22) & 0x3ff` (major),
+    /// `(id >> 12) & 0xff` (minor) and `id & 0xfff` (patch).
+    pub fn selected_provider(&self) -> Option<u64> {
+        self.selected_version
     }
 
     pub fn next_jitter(&mut self) -> (f32, f32) {

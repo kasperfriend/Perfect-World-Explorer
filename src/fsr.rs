@@ -127,6 +127,10 @@ mod imp_stub {
             0
         }
 
+        pub fn selected_provider(&self) -> Option<u64> {
+            None
+        }
+
         pub fn jitter(&self) -> (f32, f32) {
             (0.0, 0.0)
         }
@@ -195,6 +199,10 @@ mod fg_stub {
 
         pub fn finish(&mut self, _ui_visible: bool, _reset: bool) -> Result<(), String> {
             unimplemented!()
+        }
+
+        pub fn frames_presented(&self) -> u64 {
+            0
         }
     }
 }

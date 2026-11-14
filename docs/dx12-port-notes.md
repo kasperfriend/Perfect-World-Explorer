@@ -185,10 +185,19 @@ defaults (see the migration test in `view_settings.rs`).
    retained so the Graphics tab can state the real backend/GPU/driver.
    This is *not* a native DX12 rewrite — see §0 and `docs/blockers.md`.
 2. **Settings → Graphics → Upscaling** (`Off` / DLSS Super Resolution /
-   FSR / XeSS) and **Frame generation** (`Off` / DLSS Frame Generation /
-   FSR Frame Generation / XeSS Frame Generation), independent selectors,
-   disabled options with a visible reason, Resolution scale slider active only
-   when Upscaling is Off. This module (the former `src/upscaling.rs`, now merged
+   FSR 1 / FSR 2 / FSR 3.1 / FSR 4.1 / XeSS) and **Frame generation**
+   (`Off` / DLSS Frame Generation / FSR Frame Generation / XeSS Frame
+   Generation), independent selectors, disabled options with a visible reason,
+   Resolution scale slider active only when Upscaling is Off. FSR 1 is the
+   in-tree spatial EASU + RCAS pass (`src/fsr1.wgsl`, `src/fsr1_gpu.rs`);
+   FSR 2/3/4 select the FFX provider major (2 → 2.3.4, 3 → 3.1.6, 4 → 4.1.2)
+   in the unified upscaler DLL. FSR 4 additionally requires an RDNA 4
+   (RX 9000 series) GPU, gated by adapter vendor/name; FSR 1 has no SDK
+   requirement at all. Frame generation works with any upscaler or Off
+   (it has its own depth-reprojection motion-vector pass). While upscaling
+   or frame generation is active, a small on-screen mark (top-left) shows
+   the upscaler version and the FG frame counter (or a red fallback note
+   when a path failed). This module (the former `src/upscaling.rs`, now merged
    into the viewer) holds the state
    machine, jitter sequence, per-provider recommended internal resolutions,
    the pairing table, and `probe_sdk`, which probes a user-chosen directory
