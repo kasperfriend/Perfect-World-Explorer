@@ -207,21 +207,24 @@ impl Residency {
 /// fall outside the same clip plane, so nothing that could be on screen is
 /// dropped.
 pub fn in_frustum(matrix: Mat4, bounds: [f32; 6]) -> bool {
-    let mut corners = [Vec3::ZERO; 8];
-    for (i, corner) in corners.iter_mut().enumerate() {
-        *corner = Vec3::new(
-            if i & 1 == 0 { bounds[0] } else { bounds[3] },
-            if i & 2 == 0 { bounds[1] } else { bounds[4] },
-            if i & 4 == 0 { bounds[2] } else { bounds[5] },
-        );
+    let m = matrix.to_cols_array();
+    let planes = [
+        [m[3] + m[0], m[7] + m[4], m[11] + m[8], m[15] + m[12]],
+    [m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]],
+        [m[3] + m[1], m[7] + m[5], m[11] + m[9], m[15] + m[13]],
+        [m[3] - m[1], m[7] - m[5], m[11] - m[9], m[15] - m[13]],
+        [m[2], m[6], m[10], m[14]],
+        [m[3] - m[2], m[7] - m[6], m[11] - m[10], m[15] - m[14]],
+    ];
+    for [a, b, c, d] in planes {
+        let px = if a >= 0.0 { bounds[3] } else { bounds[0] };
+        let py = if b >= 0.0 { bounds[4] } else { bounds[1] };
+        let pz = if c >= 0.0 { bounds[5] } else { bounds[2] };
+        if a * px + b * py + c * pz + d < 0.0 {
+            return false;
+        }
     }
-    let clip = corners.map(|c| matrix * c.extend(1.));
-    !(clip.iter().all(|c| c.x < -c.w)
-        || clip.iter().all(|c| c.x > c.w)
-        || clip.iter().all(|c| c.y < -c.w)
-        || clip.iter().all(|c| c.y > c.w)
-        || clip.iter().all(|c| c.z < 0.)
-        || clip.iter().all(|c| c.z > c.w))
+    true
 }
 
 /// Merge the visible blocks of one view into contiguous index ranges, so a
