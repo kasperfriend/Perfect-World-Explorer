@@ -39,20 +39,15 @@ use super::imp::{
 use super::mv::{FsrMotionVectorPass, FsrMvParams};
 use glam::Mat4;
 use std::ffi::c_void;
-use winapi::shared::dxgi::{
-    IDXGISwapChain, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-    DXGI_SWAP_EFFECT_FLIP_DISCARD,
-};
-use winapi::shared::dxgi1_2::{DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1};
-use winapi::shared::dxgi1_3;
-use winapi::shared::dxgi1_4::{IDXGIFactory4, IDXGISwapChain3};
+use winapi::shared::dxgi::IDXGISwapChain;
+use winapi::shared::dxgi1_2::{DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FULLSCREEN_DESC};
+use winapi::shared::dxgi1_4::IDXGISwapChain3;
 use winapi::shared::dxgi1_5::IDXGISwapChain4;
 use winapi::shared::dxgiformat::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
     DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
     DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
 };
-use winapi::shared::dxgitype::{DXGI_SAMPLE_DESC, DXGI_USAGE_RENDER_TARGET_OUTPUT};
 use winapi::um::d3d12 as d3d12_ty;
 use winapi::Interface;
 
@@ -310,7 +305,9 @@ impl FrameGeneration {
     /// Create the frame generation pipeline for `hwnd` at `display_extent`.
     ///
     /// The caller must have destroyed the wgpu surface already: DX12 allows
-    /// exactly one swapchain per hwnd.
+    /// exactly one flip-model swapchain per hwnd, and dropping the surface is
+    /// not enough on its own, so [`crate::fsr::swapchain::prepare`] proves
+    /// that DXGI hands the window back before the SDK asks for its own.
     ///
     /// # Safety
     /// `hwnd` must be a valid window handle for this thread's process.
@@ -400,35 +397,18 @@ impl FrameGeneration {
         let ring = super::imp::NativeCommandRing::new(&raw_device, "FSR FG")?;
 
         // --- Create the proxy swapchain. FFX creates the new swapchain
-        // internally using the factory and description we hand it.
-        let mut factory: *mut winapi::shared::dxgi1_4::IDXGIFactory4 = std::ptr::null_mut();
-        let hr = unsafe {
-            dxgi1_3::CreateDXGIFactory2(
-                0,
-                &IDXGIFactory4::uuidof(),
-                &mut factory as *mut *mut _ as *mut *mut c_void,
-            )
-        };
-        if hr < 0 || factory.is_null() {
-            return Err(format!("CreateDXGIFactory2 failed (HRESULT 0x{hr:08x})"));
-        }
+        // internally, on a present queue of its own, from the factory and the
+        // description we hand it. DXGI allows one flip-model swapchain per
+        // window, so the window has to be free of wgpu's first: the hand-over
+        // drains the device, probes the window with a real
+        // CreateSwapChainForHwnd until DXGI accepts a description, and returns
+        // that description plus a factory parented to our device's adapter.
         let (width, height) = display_extent;
-        let mut desc1 = DXGI_SWAP_CHAIN_DESC1 {
-            Width: width,
-            Height: height,
-            Format: backbuffer_format,
-            Stereo: 0,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: 3,
-            Scaling: DXGI_SCALING_STRETCH,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            AlphaMode: 0, // DXGI_ALPHA_MODE_UNSPECIFIED
-            Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-        };
+        let prepared = super::swapchain::prepare(device, hwnd, width, height, backbuffer_format)?;
+        let factory = prepared.factory;
+        let mut desc1 = prepared.desc;
+        let mut fullscreen = prepared.fullscreen;
+        let handover = prepared.report;
         let mut proxy: *mut c_void = std::ptr::null_mut();
         let mut version = FfxCreateContextDescFrameGenerationSwapChainVersionDX12 {
             header: FfxApiHeader::new(
@@ -443,17 +423,20 @@ impl FrameGeneration {
             swapchain: &mut proxy,
             hwnd,
             desc: &mut desc1,
-            // Windowed mode: the header allows NULL here.
-            fullscreen_desc: std::ptr::null_mut(),
+            // A real windowed fullscreen description, as the FSR sample passes
+            // (the header also allows NULL, but the sample's choice is the one
+            // that has been exercised).
+            fullscreen_desc: &mut fullscreen as *mut DXGI_SWAP_CHAIN_FULLSCREEN_DESC as *mut c_void,
             dxgi_factory: factory as *mut c_void,
             game_queue: queue_ptr,
         };
-        // --- Pre-flight sanity checks. These mirror the internal steps
-        // FFX performs inside its proxy-swapchain creation (GetDevice on the
-        // game queue, QueryInterface for IDXGIFactory2 on the factory) so a
-        // failure below can be attributed to a specific step. Failures here
-        // do not abort creation; they are logged so the next retest can
-        // pinpoint the rejecting component.
+        // --- Pre-flight sanity checks. The hand-over already proved that
+        // DXGI will create a swapchain for this window with this description;
+        // these checks cover the other two inputs FFX has to be able to use —
+        // the game queue (it calls GetDevice on it and creates its own present
+        // queue from that device) and the factory (it needs IDXGIFactory2).
+        // Failures here do not abort creation; they are logged so a failure
+        // below can be attributed to a component.
         let (qi_device_hr, qi_queue_hr) = unsafe {
             let mut probe_device: *mut winapi::um::d3d12::ID3D12Device = std::ptr::null_mut();
             let hr = (*(queue_ptr as *mut winapi::um::unknwnbase::IUnknown)).QueryInterface(
@@ -474,26 +457,19 @@ impl FrameGeneration {
             }
             (hr, hr_q)
         };
-        // IID_IDXGIFactory2 — winapi does not re-export the type in a module
-        // reachable here, so the IID is inlined instead.
-        const IID_IDXGI_FACTORY2: winapi::shared::guiddef::GUID = winapi::shared::guiddef::GUID {
-            Data1: 0xdc9b5b12,
-            Data2: 0xa1d2,
-            Data3: 0x11da,
-            Data4: [0x88, 0xa7, 0x00, 0x74, 0x27, 0xab, 0x8f, 0x49],
-        };
-        let qi_factory2_hr = unsafe {
-            let mut probe_factory: *mut c_void = std::ptr::null_mut();
-            let hr = (*(factory as *mut winapi::um::unknwnbase::IUnknown))
-                .QueryInterface(&IID_IDXGI_FACTORY2, &mut probe_factory);
-            if !probe_factory.is_null() {
-                (&*(probe_factory as *const winapi::um::unknwnbase::IUnknown)).Release();
-            }
-            hr
-        };
         super::diag(&format!(
-            "[FSR FG] proxy swapchain: hwnd 0x{:x}, extent {}x{}, backbuffer_format 0x{:08x}, alpha 0 (unspecified), factory 0x{:x}, queue GetDevice hr 0x{:08x}, queue QI hr 0x{:08x}, factory QI(IDXGIFactory2) hr 0x{:08x}",
-            hwnd as usize, width, height, backbuffer_format, factory as usize, qi_device_hr, qi_queue_hr, qi_factory2_hr
+            "[FSR FG] proxy swapchain: hwnd 0x{:x}, extent {}x{}, backbuffer_format 0x{:08x}, buffer_count {}, flags 0x{:x}, alpha {}, scaling {}, factory 0x{:x}, queue GetDevice hr 0x{:08x}, queue QI hr 0x{:08x}; hand-over: {handover}",
+            hwnd as usize,
+            width,
+            height,
+            backbuffer_format,
+            desc1.BufferCount,
+            desc1.Flags,
+            desc1.AlphaMode,
+            desc1.Scaling,
+            factory as usize,
+            qi_device_hr,
+            qi_queue_hr
         ));
         swapchain_desc.header.p_next = &mut version.header as *mut FfxApiHeader;
         let mut swapchain_context: *mut c_void = std::ptr::null_mut();
@@ -509,7 +485,7 @@ impl FrameGeneration {
         }
         if rc != super::imp::FFX_API_RETURN_OK || proxy.is_null() {
             return Err(format!(
-                "creating the frame generation swapchain failed (0x{rc:x})"
+                "creating the frame generation swapchain failed (FFX return code 0x{rc:x}): DXGI                  does create one for this window with the same description ({handover}), so the                  failure is inside FFX's own swapchain setup"
             ));
         }
 

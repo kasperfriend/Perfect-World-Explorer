@@ -223,8 +223,16 @@ picks `xell`.
    native-resolution texture that the swapchain composites onto real and
    generated frames, and `ffxDispatchDescFrameGeneration` runs on the
    interpolation command list (`src/fsr/fg.rs`). Release destroys the FFX
-   contexts and hands the window back to a recreated wgpu surface. Runtime
-   unverified — it has not run on hardware yet (see B-7). **XeSS Super Resolution**
+   contexts and hands the window back to a recreated wgpu surface. Both frame
+   generation paths share the hand-over in `src/fsr/swapchain.rs`: DXGI allows
+   one flip-model swapchain per window, and dropping `wgpu::Surface` does not
+   retire the frames that still reference the old swapchain, so the hand-over
+   drains the device and retries a real `CreateSwapChainForHwnd` probe — with a
+   matrix of descriptions (buffer count, alpha mode, scaling, tearing flag) as
+   the fallback — until DXGI accepts one. The accepted description, a factory
+   parented to the device's adapter and a real windowed fullscreen description
+   are what the SDK is given (see B-10). Runtime unverified — it has not run on
+   hardware yet (see B-7). **XeSS Super Resolution**
    and **XeSS Frame Generation** are wired the same way (`src/xess*.rs`): XeSS-SR
    dispatches `xessD3D12Execute` on its own native command list, and XeSS-FG
    creates its own proxy swapchain from a flip-model swapchain description,

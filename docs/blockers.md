@@ -286,3 +286,39 @@ done.
   behaviour; a XeLL failure is sticky, logged once, shown on the mark, and
   leaves the vsync'd present path untouched.
 - **Status:** open (needs a Windows/DX12 machine with a display).
+
+## B-10 — Frame generation swapchain hand-over (screen report, Phase 4.2x)
+
+- **Step:** Settings → Graphics → **Frame generation** = FSR or XeSS (both take
+  the window from wgpu and present through a proxy swapchain of their own).
+- **Symptom on the reporting machine (RX 7900-class, Adrenalin):** XeSS
+  *upscaling* works, but FSR-FG reports
+  `creating the frame generation swapchain failed (0x3)` and XeSS-FG reports
+  `xefgSwapChainD3D12InitFromSwapChainDesc failed
+  (XEFG_SWAPCHAIN_RESULT_ERROR_HRESULT_FAILURE)`. XeLL is greyed out because
+  Intel enables it on a non-Intel GPU only while XeSS-FG is active (B-9), so
+  both symptoms are the same failure.
+- **Diagnosis:** `0x3` is `FFX_API_RETURN_ERROR_RUNTIME_ERROR` ("the underlying
+  runtime returned an error") and `-17` is XeSS-FG's generic
+  "an HRESULT call failed" — both mean DXGI refused
+  `CreateSwapChainForHwnd` for the window. DXGI allows one flip-model swapchain
+  per HWND, and dropping `wgpu::Surface` is not sufficient on its own: wgpu
+  keeps the backbuffer textures of a submission alive until that submission
+  retires, and each backbuffer holds a reference to the swapchain.
+- **Fix:** `src/fsr/swapchain.rs` — a shared hand-over used by both frame
+  generation paths. It drains the device (`poll(Wait)`), then probes the window
+  with a real `CreateSwapChainForHwnd` (create and release a throwaway
+  swapchain, never presented), retrying for up to ~0.3 s with a growing sleep
+  and falling back through a matrix of descriptions (buffer count, alpha mode,
+  scaling, tearing flag). The description DXGI accepted is the one the SDK is
+  given, together with a factory parented to the device's adapter and a real
+  windowed fullscreen description. Both frame generation transitions now also
+  wait for the window to have presented once, and a failure is retryable by
+  re-selecting the setting instead of being sticky for the session.
+- **What the retest has to show:** the `[FSR FG]`/`[XeSS FG]` "hand-over" line
+  in stderr/`session.log` names the accepted description, the factory and the
+  attempt count — and, when it cannot find any, the exact HRESULT DXGI kept
+  answering (`0x887a0001` = `DXGI_ERROR_INVALID_CALL` means the window is still
+  associated with a flip-model swapchain).
+- **Status:** open (fix is written and compiles on Windows CI; not yet
+  confirmed on hardware).

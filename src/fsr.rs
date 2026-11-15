@@ -80,6 +80,8 @@ pub use fg::*;
 pub use imp::*;
 #[cfg(windows)]
 pub(crate) use mv::{FsrMotionVectorPass, FsrMvParams};
+#[cfg(windows)]
+pub(crate) mod swapchain;
 
 #[cfg(not(windows))]
 mod imp_stub {

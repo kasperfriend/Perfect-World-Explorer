@@ -52,18 +52,13 @@ use crate::fsr::{
 };
 use glam::Mat4;
 use std::ffi::c_void;
-use winapi::shared::dxgi::{
-    IDXGISwapChain, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-    DXGI_SWAP_EFFECT_FLIP_DISCARD,
-};
-use winapi::shared::dxgi1_2::{DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1};
-use winapi::shared::dxgi1_3;
-use winapi::shared::dxgi1_4::{IDXGIFactory4, IDXGISwapChain3};
+use winapi::shared::dxgi::IDXGISwapChain;
+use winapi::shared::dxgi1_2::{DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FULLSCREEN_DESC};
+use winapi::shared::dxgi1_4::IDXGISwapChain3;
 use winapi::shared::dxgiformat::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_FLOAT,
     DXGI_FORMAT_R8G8B8A8_UNORM,
 };
-use winapi::shared::dxgitype::{DXGI_SAMPLE_DESC, DXGI_USAGE_RENDER_TARGET_OUTPUT};
 use winapi::um::d3d12 as d3d12_ty;
 use winapi::Interface;
 
@@ -386,7 +381,9 @@ impl XessFrameGeneration {
     /// Create the frame generation pipeline for `hwnd` at `display_extent`.
     ///
     /// The caller must have destroyed the wgpu surface already: DX12 allows
-    /// exactly one swapchain per hwnd.
+    /// exactly one flip-model swapchain per hwnd, and dropping the surface is
+    /// not enough on its own, so [`crate::fsr::swapchain::prepare`] proves
+    /// that DXGI hands the window back before the SDK asks for its own.
     ///
     /// # Safety
     /// `hwnd` must be a valid window handle for this thread's process.
@@ -417,6 +414,24 @@ impl XessFrameGeneration {
         } else {
             DXGI_FORMAT_R8G8B8A8_UNORM
         };
+
+        // Hand the window over from wgpu's swapchain. DXGI allows one
+        // flip-model swapchain per window and XeSS-FG is about to create its
+        // own, so the surface must not only be dropped but its queued frames
+        // retired: `prepare` drains the device, retries until DXGI actually
+        // accepts a description for this window, and hands back the
+        // description it accepted.
+        let prepared = crate::fsr::swapchain::prepare(
+            device,
+            hwnd,
+            display_extent.0,
+            display_extent.1,
+            backbuffer_format,
+        )?;
+        let mut desc1 = prepared.desc;
+        let mut fullscreen = prepared.fullscreen;
+        let handover = prepared.report;
+        crate::xess::diag(&format!("[XeSS FG] window hand-over: {handover}"));
 
         let mut loader = XefgLoader::load(sdk_dir)?;
 
@@ -493,40 +508,13 @@ impl XessFrameGeneration {
             ));
         }
 
-        let (width, height) = display_extent;
-        let desc1 = DXGI_SWAP_CHAIN_DESC1 {
-            Width: width,
-            Height: height,
-            Format: backbuffer_format,
-            Stereo: 0,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-            BufferCount: 3,
-            Scaling: DXGI_SCALING_STRETCH,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-            AlphaMode: 0, // DXGI_ALPHA_MODE_UNSPECIFIED
-            Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-        };
-        let mut factory: *mut IDXGIFactory4 = std::ptr::null_mut();
-        let hr = unsafe {
-            dxgi1_3::CreateDXGIFactory2(
-                0,
-                &IDXGIFactory4::uuidof(),
-                &mut factory as *mut *mut IDXGIFactory4 as *mut *mut c_void,
-            )
-        };
-        if hr < 0 || factory.is_null() {
-            return Err(format!("CreateDXGIFactory2 failed (HRESULT 0x{hr:08x})"));
-        }
+        let factory = prepared.factory;
         let rc = unsafe {
             (loader.init_from_desc)(
                 context,
                 hwnd,
                 &desc1,
-                std::ptr::null(),
+                &fullscreen as *const DXGI_SWAP_CHAIN_FULLSCREEN_DESC as *const c_void,
                 queue_ptr,
                 factory as *mut c_void,
                 &init_params,
@@ -537,7 +525,9 @@ impl XessFrameGeneration {
         }
         if rc != 0 {
             return Err(format!(
-                "xefgSwapChainD3D12InitFromSwapChainDesc failed ({})",
+                "xefgSwapChainD3D12InitFromSwapChainDesc failed ({}): DXGI does create a \
+                 swapchain for this window with the same description ({handover}), so the \
+                 failure is inside XeSS-FG's own swapchain setup",
                 xefg_result_name(rc)
             ));
         }

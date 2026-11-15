@@ -4099,9 +4099,12 @@ pub fn run(
     let mut xess_upscaler: Option<crate::xess::XessUpscaler> = None;
     let mut xess_failed = false;
     let mut xess_fail_reason: Option<String> = None;
-    // Frame generation drops wgpu's swapchain (FFX creates its own proxy for
-    // the hwnd); `surface` is recreated when the pipeline is created or
-    // destroyed. `framegen` failing disables it for the rest of the session.
+    // Frame generation drops wgpu's swapchain (the SDK creates its own proxy
+    // for the hwnd); `surface` is recreated when the pipeline is created or
+    // destroyed. A failure disables it until the Frame generation setting is
+    // changed again: the setting tracker below clears `fg_failed`, so a
+    // transient hand-over problem (a swapchain still holding the window, a
+    // resize in flight) is retryable without restarting.
     let mut framegen: Option<crate::fsr::FrameGeneration> = None;
     let mut fg_failed = false;
     let mut fg_fail_reason: Option<String> = None;
@@ -4118,6 +4121,12 @@ pub fn run(
     let mut latency_fail_reason: Option<String> = None;
     let mut surface: Option<wgpu::Surface<'static>> = Some(surface);
     let mut last_fsr_camera_pos = camera.pos;
+    // Settings the sticky failure flags are keyed to (see below).
+    let mut applied_frame_gen = settings.frame_generation;
+    let mut applied_latency = settings.latency;
+    // Frame generation takes the window over from wgpu, which presupposes
+    // that wgpu has presented on it at least once.
+    let mut presented_once = false;
     let mut display_gamma: Option<crate::display_gamma::DisplayGamma> = None;
     // Only allocated for UNORM-only swapchains; None is the normal sRGB route.
     let mut present_encode: Option<crate::present_encode::PresentEncode> =
@@ -4482,9 +4491,27 @@ pub fn run(
                     } else if !want_xess {
                         xess_upscaler = None;
                     }
+                    // A changed Frame generation or Latency setting clears
+                    // the sticky failure of that feature, so the new choice
+                    // is really attempted instead of inheriting the previous
+                    // one's verdict. Without this a single failed hand-over
+                    // disables frame generation for the rest of the session.
+                    if settings.frame_generation != applied_frame_gen {
+                        applied_frame_gen = settings.frame_generation;
+                        fg_failed = false;
+                        fg_fail_reason = None;
+                        xess_fg_failed = false;
+                        xess_fg_fail_reason = None;
+                    }
+                    if settings.latency != applied_latency {
+                        applied_latency = settings.latency;
+                        latency_failed = false;
+                        latency_fail_reason = None;
+                    }
                     // Frame generation transitions (enable / disable / extent
                     // change). Runs before any surface access this frame.
                     let want_fg = settings.frame_generation == crate::FrameGenMethod::Fsr
+                        && presented_once
                         && !fg_failed
                         && crate::support_framegen(
                             crate::FrameGenMethod::Fsr,
@@ -4510,6 +4537,7 @@ pub fn run(
                     // XeSS Frame Generation transitions (enable / disable /
                     // extent change). Same one-swapchain-per-hwnd rule.
                     let want_xess_fg = settings.frame_generation == crate::FrameGenMethod::Xess
+                        && presented_once
                         && !xess_fg_failed
                         && crate::support_framegen(
                             crate::FrameGenMethod::Xess,
@@ -5396,6 +5424,9 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 }
                             } else if let Some(frame) = frame {
                                 frame.present();
+                                // The window now has a presentation history, so
+                                // frame generation may take the swapchain over.
+                                presented_once = true;
                             }
                             if let Some(session) = latency.as_mut() {
                                 session.present_end();
