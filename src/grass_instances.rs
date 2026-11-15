@@ -411,7 +411,9 @@ impl Gpu {
         bind: &'a wgpu::BindGroup,
         light: Option<&'a wgpu::BindGroup>,
     ) {
-        if self.batches.is_empty() { return; }
+        if self.batches.is_empty() {
+            return; 
+        }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind, &[]);
         if let Some(l) = light {
