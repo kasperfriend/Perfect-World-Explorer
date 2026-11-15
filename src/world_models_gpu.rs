@@ -1033,6 +1033,74 @@ impl World {
     /// (main, reflection, refraction) reuses it.
     fn advance_poses(&mut self, delta_ms: u32) {
         let bounds = self.resident_bounds;
+        let len = self.slots.len();
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(16);
+        if len >= 64 && threads > 1 {
+            let assets = &self.assets.assets;
+            let chunk_size = (len + threads - 1) / threads;
+            std::thread::scope(|s| {
+                for (inst_chunk, slot_chunk) in self
+                    .assets
+                    .instances
+                    .chunks_mut(chunk_size)
+                    .zip(self.slots.chunks_mut(chunk_size))
+                {
+                    s.spawn(move || {
+                        for (instance, slot) in inst_chunk.iter_mut().zip(slot_chunk.iter_mut()) {
+                            if !cutoff_residency::contains(bounds, instance.placement.position) {
+                                continue;
+                            }
+                            if slot.failed {
+                                continue;
+                            }
+                            let asset = &assets[instance.asset];
+                            let sample = match instance.playback.as_mut() {
+                                Ok(clock) => {
+                                    if delta_ms != 0 {
+                                        if let Err(e) = clock.tick(delta_ms) {
+                                            slot.posed = Some(Err(e));
+                                            continue;
+                                        }
+                                    }
+                                    clock.sample()
+                                }
+                                Err(e) => {
+                                    slot.posed = Some(Err(e.clone()));
+                                    continue;
+                                }
+                            };
+                            if let Some(Ok(previous)) = &slot.posed {
+                                if previous.sample == sample {
+                                    continue;
+                                }
+                            }
+                            let result = (|| -> Result<SlotPose, String> {
+                                let transform = *slot.transform.as_ref().map_err(Clone::clone)?;
+                                let pose = match sample {
+                                    Some((action, time)) => {
+                                        asset.action_pose(action, time, transform)?
+                                    }
+                                    None => asset.bind_pose(transform)?,
+                                };
+                                let meshes = asset.meshes_from_pose(&pose)?;
+                                Ok(SlotPose {
+                                    sample,
+                                    pose,
+                                    meshes,
+                                })
+                            })();
+                            slot.geometry_dirty = true;
+                            slot.posed = Some(result);
+                        }
+                    });
+                }
+            });
+            return;
+        }
+        
         for (instance, slot) in self.assets.instances.iter_mut().zip(&mut self.slots) {
             if !cutoff_residency::contains(bounds, instance.placement.position) {
                 continue;
