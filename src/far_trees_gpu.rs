@@ -1202,7 +1202,8 @@ impl FarTrees {
                             z0.max(far_bounds[2]),
                             z1.min(far_bounds[3]),
                         ];
-                        if intersection[0] <= intersection[1] && intersection[2] <= intersection[3] {
+                        if intersection[0] <= intersection[1] && intersection[2] <= intersection[3]
+                        {
                             Some(intersection)
                         } else {
                             self.active_placements.clear();
@@ -1218,10 +1219,8 @@ impl FarTrees {
         } else {
             bounds
         };
-        let disjoint_empty = far_range.is_finite()
-            && far_range >= 0.
-            && query_bounds.is_none()
-            && bounds.is_some();
+        let disjoint_empty =
+            far_range.is_finite() && far_range >= 0. && query_bounds.is_none() && bounds.is_some();
         if !disjoint_empty {
             select_placement_indices(
                 &self.placement_bins,
@@ -1462,10 +1461,8 @@ mod tests {
         let mut selected = Vec::new();
         select_placement_indices(&bins, placements.len() as u32, Some(bounds), &mut selected);
         for (index, p) in positions.iter().enumerate() {
-            let admitted = p[0] >= bounds[0]
-                && p[0] < bounds[1]
-                && p[2] >= bounds[2]
-                && p[2] < bounds[3];
+            let admitted =
+                p[0] >= bounds[0] && p[0] < bounds[1] && p[2] >= bounds[2] && p[2] < bounds[3];
             if admitted {
                 assert!(selected.binary_search(&(index as u32)).is_ok());
             }

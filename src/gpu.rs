@@ -2798,11 +2798,25 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            self.draw_scenery(&mut scenery, bind, reflected, pass_kind, world_cmds, world_sdr_cmds);
+            self.draw_scenery(
+                &mut scenery,
+                bind,
+                reflected,
+                pass_kind,
+                world_cmds,
+                world_sdr_cmds,
+            );
         } else {
             // Without an intervening terrain-depth copy, retain the original
             // clear/depth state and switch pipelines in the already-open pass.
-            self.draw_scenery(&mut p, bind, reflected, pass_kind, world_cmds, world_sdr_cmds);
+            self.draw_scenery(
+                &mut p,
+                bind,
+                reflected,
+                pass_kind,
+                world_cmds,
+                world_sdr_cmds,
+            );
         }
     }
 
@@ -2838,12 +2852,7 @@ impl Renderer {
         // Do not submit world pages on top of the same locally streamed
         // ornaments while preload is in progress: coplanar duplicates flicker.
         if self.world_done {
-            crate::world_objects::GpuPage::draw_world(
-                &self.world_pages,
-                world_cmds,
-                p,
-                reflected,
-            );
+            crate::world_objects::GpuPage::draw_world(&self.world_pages, world_cmds, p, reflected);
         }
         let local_sdr = !self.world_done && self.local_pages.iter().any(|page| page.has_sdr());
         let world_sdr = self.world_done && !world_sdr_cmds.is_empty();

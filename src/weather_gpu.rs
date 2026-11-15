@@ -442,11 +442,13 @@ impl WeatherGpu {
         });
         let generate_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("weather particle instance generation"),
-            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("weather instance generation pipeline layout"),
-                bind_group_layouts: &[&generate_layout],
-                push_constant_ranges: &[],
-            })),
+            layout: Some(
+                &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("weather instance generation pipeline layout"),
+                    bind_group_layouts: &[&generate_layout],
+                    push_constant_ranges: &[],
+                }),
+            ),
             module: &generate_module,
             entry_point: "main",
         });
@@ -576,11 +578,7 @@ impl WeatherGpu {
             motion: lanes.1,
         };
         if self.generated_frame.get() != Some(self.frame_serial) {
-            queue.write_buffer(
-                &self.generate_uniform,
-                0,
-                bytemuck::bytes_of(&generation),
-            );
+            queue.write_buffer(&self.generate_uniform, 0, bytemuck::bytes_of(&generation));
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("generate shared weather particle instances"),
                 timestamp_writes: None,
