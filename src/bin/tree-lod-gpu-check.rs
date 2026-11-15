@@ -251,7 +251,12 @@ pub fn run(authored_mips: bool) {
             uni[382] = 0.;
             queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&uni));
         }
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
         renderer.update_resident_lods(&device, &queue, [dist, 0., 0.], 1., 100000., bounds);
+        device.poll(wgpu::Maintain::Wait);
+        if let Some(error) = pollster::block_on(device.pop_error_scope()) {
+            panic!("frame {frame_index}: tree LOD validation failed: {error}");
+        }
         let (count, bytes) = renderer.residency_stats();
         // The instance buffer keeps every (group, level) slice: two `vec4`s per
         // record, three levels per group.
