@@ -1536,8 +1536,16 @@ fn world_mesh_with_custom_far_blocks(
             let mut low = [f32::INFINITY; 3];
             let mut high = [f32::NEG_INFINITY; 3];
             for [lx, ly] in &points {
-                let x = bx + *lx as usize;
-                let y = by + *ly as usize;
+                // TRN2 stores one height sample per cell and omits each
+                // block's final shared row/column. As in the native mesh
+                // builder, the map's outermost block boundary reuses the last
+                // stored sample rather than reading at width/height.
+                let (x, y) = clamped_far_sample(
+                    bx + *lx as usize,
+                    by + *ly as usize,
+                    t.width,
+                    t.height,
+                );
                 let (height, normal) = reader.cell(y * t.width + x)?;
                 let pos = [
                     (x as f32 - t.width as f32 * 0.5) * t.grid_spacing,
@@ -1563,6 +1571,10 @@ fn world_mesh_with_custom_far_blocks(
         }
     }
     Ok((vertices, indices, spans))
+}
+
+fn clamped_far_sample(x: usize, y: usize, width: usize, height: usize) -> (usize, usize) {
+    (x.min(width - 1), y.min(height - 1))
 }
 
 /// A coarse block core with a four-cell perimeter. The perimeter is the same
@@ -1756,6 +1768,13 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn custom_far_sampling_clamps_shared_outer_block_edges() {
+        assert_eq!(clamped_far_sample(64, 32, 64, 32), (63, 31));
+        assert_eq!(clamped_far_sample(32, 16, 64, 32), (32, 16));
+        assert_eq!(clamped_far_sample(65, 33, 64, 32), (63, 31));
     }
 
     #[test]
