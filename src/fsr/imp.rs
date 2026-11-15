@@ -727,6 +727,13 @@ pub struct FsrUpscaler {
     prev_view_proj: Option<Mat4>,
     reset_history: bool,
     last_instant: std::time::Instant,
+    /// Fence+event pair guarding the single native command list/allocator:
+    /// resetting the allocator while the GPU still executes the list that
+    /// uses it is invalid D3D12, so every raw-list section waits for the
+    /// previous submission before recording again.
+    fence: d3d12::Fence,
+    fence_event: d3d12::Event,
+    fence_value: u64,
     version_major: u32,
     /// The provider version the loader actually advertised and the override
     /// pinned (FFX version id: major << 22 | minor << 12 | patch). `None`
@@ -736,6 +743,7 @@ pub struct FsrUpscaler {
 
 impl Drop for FsrUpscaler {
     fn drop(&mut self) {
+        self.wait_for_gpu();
         if !self.context.is_null() {
             unsafe {
                 (self.loader.destroy_context)(&mut self.context, std::ptr::null());
@@ -950,6 +958,12 @@ impl FsrUpscaler {
                 return Err(error);
             }
         };
+        let (fence, hr) = raw_device.create_fence(0);
+        if hr < 0 {
+            unsafe { (loader.destroy_context)(&mut context, std::ptr::null()) };
+            return Err(format!("create_fence failed (HRESULT 0x{hr:08x})"));
+        }
+        let fence_event = d3d12::Event::create(false, false);
         let mv_pass = FsrMotionVectorPass::new(device);
         let composite = FsrComposite::new(device, format);
 
@@ -971,6 +985,9 @@ impl FsrUpscaler {
             prev_view_proj: None,
             reset_history: true,
             last_instant: std::time::Instant::now(),
+            fence,
+            fence_event,
+            fence_value: 0,
             version_major: fsr_version_major,
             selected_version: chosen_version,
         })
@@ -994,6 +1011,23 @@ impl FsrUpscaler {
     /// `(id >> 12) & 0xff` (minor) and `id & 0xfff` (patch).
     pub fn selected_provider(&self) -> Option<u64> {
         self.selected_version
+    }
+
+    /// Block (bounded) until the GPU has finished every native command list
+    /// submitted so far. Without this, resetting the command allocator races
+    /// the still-executing list. 5 seconds is generous for a frame of work;
+    /// on timeout the code proceeds and D3D12 will surface any real problem.
+    fn wait_for_gpu(&self) {
+        if self.fence.get_value() >= self.fence_value {
+            return;
+        }
+        let _ = self.fence.set_event_on_completion(self.fence_event, self.fence_value);
+        self.fence_event.wait(5_000);
+    }
+
+    fn signal_fence(&mut self) {
+        self.fence_value += 1;
+        let _ = self.queue.signal(&self.fence, self.fence_value);
     }
 
     pub fn next_jitter(&mut self) -> (f32, f32) {
@@ -1150,6 +1184,7 @@ impl FsrUpscaler {
         // wgpu uses, after the submit above, and restores every state it
         // moves so wgpu's tracker (and the next frame's copies) see the
         // states they expect.
+        self.wait_for_gpu();
         self.allocator.reset();
         let hr = self
             .list
@@ -1284,6 +1319,7 @@ impl FsrUpscaler {
             ));
         }
         self.queue.execute_command_lists(&[self.list.as_list()]);
+        self.signal_fence();
 
         if rc != FFX_API_RETURN_OK {
             return Err(format!("ffxDispatch upscale failed (0x{rc:x})"));

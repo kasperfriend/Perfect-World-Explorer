@@ -273,10 +273,17 @@ pub struct FrameGeneration {
     /// call accepted (major << 22 | minor << 12 | patch). `None` when the
     /// enumeration failed and the loader picked the provider itself.
     selected_version: Option<u64>,
+    /// Fence+event pair guarding the single native command list/allocator;
+    /// see `wait_for_gpu`. Resetting the allocator while the GPU still
+    /// executes the list is invalid D3D12.
+    fence: d3d12::Fence,
+    fence_event: d3d12::Event,
+    fence_value: u64,
 }
 
 impl Drop for FrameGeneration {
     fn drop(&mut self) {
+        self.wait_for_gpu();
         if !self.fg_context.is_null() {
             // Disabling via configuration first flushes the swapchain's
             // pending work; destroying both contexts afterwards releases the
@@ -390,6 +397,11 @@ impl FrameGeneration {
             eprintln!("[FSR FG] provider enumeration returned 0x{rc:x}; the loader will pick");
         }
 
+        let (fence, hr) = raw_device.create_fence(0);
+        if hr < 0 {
+            return Err(format!("create_fence failed (HRESULT 0x{hr:08x})"));
+        }
+        let fence_event = d3d12::Event::create(false, false);
         let (allocator, hr) = raw_device.create_command_allocator(d3d12::CmdListType::Direct);
         if hr < 0 {
             return Err(format!(
@@ -645,6 +657,9 @@ impl FrameGeneration {
             frame_index: 0,
             ui_needs_rt_restore: false,
             selected_version: created_override,
+            fence,
+            fence_event,
+            fence_value: 0,
         })
     }
 
@@ -757,6 +772,25 @@ impl FrameGeneration {
     /// `id & 0xfff` (patch).
     pub fn selected_provider(&self) -> Option<u64> {
         self.selected_version
+    }
+
+    /// Block (bounded) until the GPU has finished every native command list
+    /// submitted so far. Without this, resetting the command allocator races
+    /// the still-executing list. 5 seconds is generous for a frame of work;
+    /// on timeout the code proceeds and D3D12 will surface any real problem.
+    fn wait_for_gpu(&self) {
+        if self.fence.get_value() >= self.fence_value {
+            return;
+        }
+        let _ = self
+            .fence
+            .set_event_on_completion(self.fence_event, self.fence_value);
+        self.fence_event.wait(5_000);
+    }
+
+    fn signal_fence(&mut self) {
+        self.fence_value += 1;
+        let _ = self.queue.signal(&self.fence, self.fence_value);
     }
 
     /// The size of the world render targets the pipeline consumes.
@@ -879,6 +913,7 @@ impl FrameGeneration {
         queue.submit(Some(encoder.finish()));
 
         // --- Native FFX prepare on the same queue, right after wgpu's submit.
+        self.wait_for_gpu();
         self.allocator.reset();
         let hr = self
             .list
@@ -979,6 +1014,7 @@ impl FrameGeneration {
             ));
         }
         self.queue.execute_command_lists(&[self.list.as_list()]);
+        self.signal_fence();
         if rc != super::imp::FFX_API_RETURN_OK {
             return Err(format!(
                 "ffxDispatch frame generation prepare failed (0x{rc:x})"
@@ -1014,6 +1050,7 @@ impl FrameGeneration {
         let backbuffer: d3d12::Resource = unsafe { std::mem::transmute(raw_backbuffer) };
 
         // --- Native copy: composition -> backbuffer.
+        self.wait_for_gpu();
         self.allocator.reset();
         let hr = self
             .list
@@ -1070,6 +1107,7 @@ impl FrameGeneration {
             ));
         }
         self.queue.execute_command_lists(&[self.list.as_list()]);
+        self.signal_fence();
         if ui_visible {
             // FFX reads the UI surface during Present; it stays parked in
             // PIXEL_COMPUTE_READ until the next prepare restores it.
