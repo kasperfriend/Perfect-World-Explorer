@@ -190,6 +190,12 @@ mod fg_stub {
             unimplemented!()
         }
 
+        /// The Windows path draws the UI into the composition, so this is the
+        /// value the real frame generator reports.
+        pub fn ui_in_composition(&self) -> bool {
+            true
+        }
+
         pub fn size(&self) -> (u32, u32) {
             unimplemented!()
         }
