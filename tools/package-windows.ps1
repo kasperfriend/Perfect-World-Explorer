@@ -291,8 +291,11 @@ if (-not [string]::IsNullOrWhiteSpace($ArchivePath)) {
         if ($entries | Where-Object { $_ -match '(?i)bmd.*survey|survey.*bmd' }) {
             throw 'A BMD survey executable was unexpectedly included in the release archive.'
         }
-        if ($entries | Where-Object { $_ -match '(?i)(nvngx.*|sl\..*)\.dll$' }) {
-            throw 'A NVIDIA proprietary DLL was unexpectedly included in the release archive.'
+        $archiveNvidia = @($entries |
+            Where-Object { $_ -match '(?i)(nvngx.*|sl\..*)\.dll$' } |
+            Where-Object { [System.IO.Path]::GetFileName($_) -notin $nvidiaAllowed })
+        if ($archiveNvidia.Count -gt 0) {
+            throw "The release archive contains NVIDIA DLLs that are not vendored here: $($archiveNvidia -join ', ')"
         }
         # The checksum manifest must name exactly the non-manifest files in the archive.
         $manifestEntry = $archive.Entries | Where-Object { $_.FullName.Replace('\', '/') -eq 'Perfect World Explorer/SHA256SUMS.txt' } | Select-Object -First 1

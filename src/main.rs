@@ -44,13 +44,13 @@ mod diagnostics;
 #[rustfmt::skip]
 mod effect_preview;
 mod display_gamma;
+mod dlss;
 mod dxt;
 mod ecmodel;
 mod environment;
 mod far_trees_gpu;
 mod fog_matrix;
 mod foliage_mips;
-mod dlss;
 mod fsr;
 mod fsr1_gpu;
 #[allow(dead_code)]
