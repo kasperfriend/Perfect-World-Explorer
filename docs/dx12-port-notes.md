@@ -194,7 +194,9 @@ defaults (see the migration test in `view_settings.rs`).
    in the unified upscaler DLL. FSR 4 additionally requires an RDNA 4
    (RX 9000 series) GPU, gated by adapter vendor/name; FSR 1 has no SDK
    requirement at all. Frame generation works with any upscaler or Off
-   (it has its own depth-reprojection motion-vector pass). While upscaling
+   for the FSR path (it has its own depth-reprojection motion-vector pass);
+   XeSS Frame Generation is offered only with XeSS upscaling or Off, as the
+   vendor documents. While upscaling
    or frame generation is active, a small on-screen mark (top-left) shows
    the upscaler version and the FG frame counter (or a red fallback note
    when a path failed). This module (the former `src/upscaling.rs`, now merged
@@ -216,9 +218,16 @@ defaults (see the migration test in `view_settings.rs`).
    generated frames, and `ffxDispatchDescFrameGeneration` runs on the
    interpolation command list (`src/fsr/fg.rs`). Release destroys the FFX
    contexts and hands the window back to a recreated wgpu surface. Runtime
-   unverified — it has not run on hardware yet (see B-7). DLSS/XeSS cannot
-   dispatch and still render through the fallback path. When a provider is
-   selected but its SDK cannot be used, the world renders through the
+   unverified — it has not run on hardware yet (see B-7). **XeSS Super Resolution**
+   and **XeSS Frame Generation** are wired the same way (`src/xess*.rs`): XeSS-SR
+   dispatches `xessD3D12Execute` on its own native command list, and XeSS-FG
+   creates its own proxy swapchain from a flip-model swapchain description,
+   owning an XeLL low-latency context (mandatory on every GPU) with the
+   required markers each frame; the UI is drawn into a separate
+   premultiplied-alpha surface tagged in `HUDLESS_UITEXTURE` mode. The Intel
+   DLLs are user-supplied and never committed (`sdk/SDK_GOES_HERE.txt`). DLSS
+   cannot dispatch and still renders through the fallback path. When a provider
+   is selected but its SDK cannot be used, the world renders through the
    existing fallback path at the provider's recommended internal resolution —
    the UI says so, and no temporal accumulation is faked (see
    `docs/blockers.md` B-3).

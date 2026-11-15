@@ -3763,11 +3763,16 @@ impl Camera {
         let (sp, cp) = self.pitch.sin_cos();
         Vec3::new(s * cp, sp, -c * cp)
     }
-    fn matrix(&self, w: u32, h: u32, far: f32) -> Mat4 {
+    fn view_matrix(&self) -> Mat4 {
+        Mat4::look_to_rh(self.pos, self.direction(), Vec3::Y)
+    }
+    fn projection_matrix(&self, w: u32, h: u32, far: f32) -> Mat4 {
         // Client world is left-handed; a right-handed view must reverse screen X.
         Mat4::from_scale(Vec3::new(-1., 1., 1.))
             * Mat4::perspective_rh(70f32.to_radians(), w as f32 / h.max(1) as f32, far, 1.)
-            * Mat4::look_to_rh(self.pos, self.direction(), Vec3::Y)
+    }
+    fn matrix(&self, w: u32, h: u32, far: f32) -> Mat4 {
+        self.projection_matrix(w, h, far) * self.view_matrix()
     }
 }
 /// Recreate the wgpu present path after frame generation released the hwnd.
@@ -4091,12 +4096,18 @@ pub fn run(
     let mut fsr_upscaler: Option<crate::fsr::FsrUpscaler> = None;
     let mut fsr_failed = false;
     let mut fsr_fail_reason: Option<String> = None;
+    let mut xess_upscaler: Option<crate::xess::XessUpscaler> = None;
+    let mut xess_failed = false;
+    let mut xess_fail_reason: Option<String> = None;
     // Frame generation drops wgpu's swapchain (FFX creates its own proxy for
     // the hwnd); `surface` is recreated when the pipeline is created or
     // destroyed. `framegen` failing disables it for the rest of the session.
     let mut framegen: Option<crate::fsr::FrameGeneration> = None;
     let mut fg_failed = false;
     let mut fg_fail_reason: Option<String> = None;
+    let mut xess_framegen: Option<crate::xess::XessFrameGeneration> = None;
+    let mut xess_fg_failed = false;
+    let mut xess_fg_fail_reason: Option<String> = None;
     let mut surface: Option<wgpu::Surface<'static>> = Some(surface);
     let mut last_fsr_camera_pos = camera.pos;
     let mut display_gamma: Option<crate::display_gamma::DisplayGamma> = None;
@@ -4377,6 +4388,11 @@ pub fn run(
                     if let Some(encode)=present_encode.as_mut() {encode.resize(&renderer.device,s.width,s.height);}
                 }
                 WindowEvent::RedrawRequested => {
+                    // XeSS Frame Generation: xellSleep must be called once per
+                    // frame before any simulation or render work for it.
+                    if let Some(fg) = xess_framegen.as_mut() {
+                        fg.begin_frame();
+                    }
                     // One place handles both a window resize and a Graphics-tab
                     // scale change: reallocate only when the scaled extent moves.
                     let slider_extent = crate::render_scale::scaled_extent(config.width, config.height, settings.resolution_scale, max_texture_dimension);
@@ -4419,6 +4435,29 @@ pub fn run(
                     } else if !want_fsr {
                         fsr_upscaler = None;
                     }
+                    // Recreate the XeSS context lazily on the same schedule.
+                    if let Some(xess) = xess_upscaler.as_ref() {
+                        if xess.render_extent() != applied_extent
+                            || xess.display_extent() != (config.width, config.height)
+                        {
+                            xess_upscaler = None;
+                        }
+                    }
+                    let want_xess = settings.upscaling == crate::UpscaleMethod::Xess
+                        && !xess_failed
+                        && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
+                    if want_xess && xess_upscaler.is_none() {
+                        match crate::xess::XessUpscaler::new(&renderer.device, &renderer.queue, &settings.upscale_sdk_dir, applied_extent, (config.width, config.height), format, settings.upscale_quality) {
+                            Ok(up) => xess_upscaler = Some(up),
+                            Err(error) => {
+                                crate::xess::diag(&format!("XeSS unavailable, using bilinear scaling instead: {error}"));
+                                xess_fail_reason = Some(error);
+                                xess_failed = true;
+                            }
+                        }
+                    } else if !want_xess {
+                        xess_upscaler = None;
+                    }
                     // Frame generation transitions (enable / disable / extent
                     // change). Runs before any surface access this frame.
                     let want_fg = settings.frame_generation == crate::FrameGenMethod::Fsr
@@ -4441,6 +4480,73 @@ pub fn run(
                             Err(error) => {
                                 crate::fsr::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
                                 fg_failed = true;
+                            }
+                        }
+                    }
+                    // XeSS Frame Generation transitions (enable / disable /
+                    // extent change). Same one-swapchain-per-hwnd rule.
+                    let want_xess_fg = settings.frame_generation == crate::FrameGenMethod::Xess
+                        && !xess_fg_failed
+                        && crate::support_framegen(
+                            crate::FrameGenMethod::Xess,
+                            settings.upscaling,
+                            &gpu_facts,
+                            &sdk_report,
+                        )
+                        .is_available();
+                    let xess_fg_extent_changed = xess_framegen.as_ref().is_some_and(|fg| {
+                        fg.size() != (config.width, config.height)
+                            || fg.render_extent() != applied_extent
+                    });
+                    if (!want_xess_fg || xess_fg_extent_changed) && xess_framegen.is_some() {
+                        xess_framegen = None; // Destroying drops XeSS-FG, the proxy and then XeLL.
+                        match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                            Ok(s) => surface = Some(s),
+                            Err(error) => {
+                                crate::xess::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                xess_fg_failed = true;
+                            }
+                        }
+                    }
+                    if want_xess_fg && xess_framegen.is_none() {
+                        surface = None;
+                        match window_hwnd(&window) {
+                            Ok(hwnd) => match crate::xess::XessFrameGeneration::new(
+                                &renderer.device,
+                                &renderer.queue,
+                                &settings.upscale_sdk_dir,
+                                hwnd,
+                                applied_extent,
+                                (config.width, config.height),
+                                surface_format,
+                                format,
+                            ) {
+                                Ok(fg) => {
+                                    crate::xess::diag("XeSS frame generation active (proxy swapchain on the HWND)");
+                                    xess_framegen = Some(fg);
+                                }
+                                Err(error) => {
+                                    crate::xess::diag(&format!("XeSS frame generation unavailable, using the standard present path: {error}"));
+                                    xess_fg_fail_reason = Some(error);
+                                    xess_fg_failed = true;
+                                    match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                        Ok(s) => surface = Some(s),
+                                        Err(error) => {
+                                            crate::xess::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                        }
+                                    }
+                                }
+                            },
+                            Err(error) => {
+                                crate::xess::diag(&format!("XeSS frame generation unavailable (no Win32 hwnd): {error}"));
+                                xess_fg_fail_reason = Some(error);
+                                xess_fg_failed = true;
+                                match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                    Ok(s) => surface = Some(s),
+                                    Err(error) => {
+                                        crate::xess::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                    }
+                                }
                             }
                         }
                     }
@@ -4493,6 +4599,9 @@ pub fn run(
                     if camera_jumped {
                         if let Some(fsr) = fsr_upscaler.as_mut() {
                             fsr.reset_history();
+                        }
+                        if let Some(xess) = xess_upscaler.as_mut() {
+                            xess.reset_history();
                         }
                     }
                     last_fsr_camera_pos = camera.pos;
@@ -4732,7 +4841,7 @@ pub fn run(
                     // Acquire the frame. Frame generation owns presentation:
                     // no wgpu swapchain exists in that mode, so there is
                     // nothing to acquire — the pipeline presents instead.
-                    let frame = if framegen.is_some() {
+                    let frame = if framegen.is_some() || xess_framegen.is_some() {
                         None
                     } else if let Some(active_surface) = surface.as_ref() {
                         match active_surface.get_current_texture() {
@@ -4754,13 +4863,18 @@ pub fn run(
                         eprintln!("surface: presentation unavailable (no swapchain)");
                         None
                     };
-                    if framegen.is_some() || frame.is_some() {
+                    if framegen.is_some() || xess_framegen.is_some() || frame.is_some() {
                             let surface_view = frame
                                 .as_ref()
                                 .map(|frame| frame.texture.create_view(&Default::default()));
                             let fg_views = framegen
                                 .as_ref()
-                                .map(|fg| (fg.compose_view(), fg.ui_view()));
+                                .map(|fg| (fg.compose_view(), fg.ui_view()))
+                                .or_else(|| {
+                                    xess_framegen
+                                        .as_ref()
+                                        .map(|fg| (fg.compose_view(), fg.ui_view()))
+                                });
                             let final_view: &wgpu::TextureView = match fg_views.as_ref() {
                                 Some((compose, _)) => compose,
                                 None => surface_view
@@ -4781,10 +4895,16 @@ pub fn run(
                             if let Some(fsr) = fsr_upscaler.as_mut() {
                                 fsr.next_jitter();
                             }
+                            if let Some(xess) = xess_upscaler.as_mut() {
+                                xess.next_jitter();
+                            }
                             let unjittered_vp = camera.matrix(config.width, config.height, camera.far);
                             let world_matrix = match fsr_upscaler.as_ref() {
                                 Some(fsr) => fsr.jittered_matrix(unjittered_vp),
-                                None => unjittered_vp,
+                                None => match xess_upscaler.as_ref() {
+                                    Some(xess) => xess.jittered_matrix(unjittered_vp),
+                                    None => unjittered_vp,
+                                },
                             };
                             renderer.render(
                                 &world_view,
@@ -4802,6 +4922,17 @@ pub fn run(
                                         fsr_fail_reason = Some(error);
                                         fsr_upscaler = None;
                                         fsr_failed = true;
+                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                    }
+                                }
+                            } else if let Some(xess) = xess_upscaler.as_mut() {
+                                match xess.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &unjittered_vp) {
+                                    Ok(()) => xess.composite(&renderer.device, &renderer.queue, scene_view),
+                                    Err(error) => {
+                                        crate::xess::diag(&format!("XeSS failed, using bilinear scaling instead: {error}"));
+                                        xess_fail_reason = Some(error);
+                                        xess_upscaler = None;
+                                        xess_failed = true;
                                         render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
                                     }
                                 }
@@ -4842,6 +4973,35 @@ pub fn run(
                                     }
                                 }
                             }
+                            if let Some(fg) = xess_framegen.as_mut() {
+                                let view = camera.view_matrix();
+                                let projection = camera.projection_matrix(config.width, config.height, camera.far);
+                                let jitter = xess_upscaler.as_ref().map_or((0.0, 0.0), |xess| xess.jitter());
+                                let frame_time_ms = (dt * 1000.0).clamp(0.1, 1000.0);
+                                let prepare_result = fg.prepare(
+                                    &renderer.device,
+                                    &renderer.queue,
+                                    &renderer.depth,
+                                    &view,
+                                    &projection,
+                                    &unjittered_vp,
+                                    frame_time_ms,
+                                    camera_jumped,
+                                    jitter,
+                                );
+                                if let Err(error) = prepare_result {
+                                    crate::xess::diag(&format!("XeSS frame generation prepare failed, disabling it: {error}"));
+                                    xess_fg_fail_reason = Some(error);
+                                    xess_framegen = None;
+                                    xess_fg_failed = true;
+                                    match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                        Ok(s) => surface = Some(s),
+                                        Err(error) => {
+                                            crate::xess::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                        }
+                                    }
+                                }
+                            }
                             // Refresh the top-down view on every presented frame. The old
                             // 350ms timer capped minimap motion to fewer than 3 FPS.
                             // The realistic minimap is a live top-down render; the
@@ -4874,6 +5034,13 @@ pub fn run(
                                     (settings.upscaling == crate::UpscaleMethod::Fsr1)
                                         .then_some("FSR 1 (EASU + RCAS)".to_string())
                                 });
+                            let xess_badge = xess_upscaler
+                                .as_ref()
+                                .map(|x| format!("XeSS ({})", x.quality_name()));
+                            let xess_failed_note = xess_failed && settings.upscaling == crate::UpscaleMethod::Xess;
+                            let xess_fg_badge = xess_framegen
+                                .as_ref()
+                                .map(|fg| format!("XeSS FG x2 - {} frames", fg.frames_presented()));
                             let fsr_failed_note = fsr_failed && settings.upscaling.is_ffx_fsr();
                             let fg_badge = framegen.as_ref().map(|fg| match fg.selected_provider() {
                                 Some(id) => format!(
@@ -4886,9 +5053,13 @@ pub fn run(
                                 None => format!("FG x2 - {} frames", fg.frames_presented()),
                             });
                             let show_status_badge = fsr_badge.is_some()
+                                || xess_badge.is_some()
                                 || fsr_failed_note
+                                || xess_failed_note
                                 || fg_badge.is_some()
-                                || fg_failed;
+                                || xess_fg_badge.is_some()
+                                || fg_failed
+                                || xess_fg_failed;
                             if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
                                 let input=egui_state.take_egui_input(&window);
                                 let output=egui_ctx.run(input,|ctx| {
@@ -4932,7 +5103,7 @@ pub fn run(
                                                 let defaults=ViewSettings::default();
                                                 ui.label(egui::RichText::new("Gold tick and label show the default value").small().weak());
                                                 match settings_tab {
-                                                    0=>{ui.heading("Graphics");let upscaling_off=settings.upscaling==crate::UpscaleMethod::Off;marked_slider(ui,egui::Slider::new(&mut settings.resolution_scale,10.0..=200.0).integer().suffix("%"),"Resolution scale",defaults.resolution_scale,10.,200.,false,upscaling_off);ui.label(egui::RichText::new("3D render resolution (10%–200% of the window). Applies only when Upscaling is Off; UI stays at native resolution.").small().weak());egui::ComboBox::from_label("Upscaling").selected_text(settings.upscaling.label()).show_ui(ui,|ui|{for method in crate::UpscaleMethod::ALL {let available=crate::support(method,&gpu_facts,&sdk_report).is_available();let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.upscaling==method,method.label()));if available && response.clicked() {settings.upscaling=method;}}});ui.label(egui::RichText::new(sdk_report.summary()).small().weak());{let mut notes:Vec<String>=Vec::new();for method in [crate::UpscaleMethod::Dlss,crate::UpscaleMethod::Fsr1,crate::UpscaleMethod::Fsr2,crate::UpscaleMethod::Fsr3,crate::UpscaleMethod::Fsr4,crate::UpscaleMethod::Xess] {if let Some(reason)=crate::support(method,&gpu_facts,&sdk_report).reason() {notes.push(format!("{}: {reason}",method.label()));}}if !notes.is_empty() {ui.label(egui::RichText::new(notes.join("  ·  ")).small().weak());}}if settings.upscaling==crate::UpscaleMethod::Fsr1 {marked_slider(ui,egui::Slider::new(&mut settings.fsr1_sharpness,0.0..=2.0),"FSR 1 RCAS sharpness (stops; lower = sharper)",defaults.fsr1_sharpness,0.,2.,false,true);}if settings.upscaling!=crate::UpscaleMethod::Off {egui::ComboBox::from_label("Upscaling quality").selected_text(settings.upscale_quality.label()).show_ui(ui,|ui|{for quality in crate::UpscaleQuality::ALL {let available=crate::quality_available(settings.upscaling,quality);let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.upscale_quality==quality,quality.label()));if available && response.clicked() {settings.upscale_quality=quality;}}});let(internal_width,internal_height)=crate::provider_extent(settings.upscaling,settings.upscale_quality,config.width,config.height,max_texture_dimension);ui.label(egui::RichText::new(format!("Renders the world at {internal_width}×{internal_height} ({}), presented at native window resolution; the UI always stays native.",settings.upscaling.label())).small().weak());}egui::ComboBox::from_label("Frame generation").selected_text(settings.frame_generation.label()).show_ui(ui,|ui|{for method in crate::FrameGenMethod::ALL {let available=crate::support_framegen(method,settings.upscaling,&gpu_facts,&sdk_report).is_available();let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.frame_generation==method,method.label()));if available && response.clicked() {settings.frame_generation=method;}}});{let mut notes:Vec<String>=Vec::new();for method in [crate::FrameGenMethod::Dlss,crate::FrameGenMethod::Fsr,crate::FrameGenMethod::Xess] {if let Some(reason)=crate::support_framegen(method,settings.upscaling,&gpu_facts,&sdk_report).reason() {notes.push(format!("{}: {reason}",method.label()));}}if !notes.is_empty() {ui.label(egui::RichText::new(notes.join("  ·  ")).small().weak());}}if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=crate::FrameGenMethod::Off {ui.label(egui::RichText::new("FSR 1 is in-tree spatial EASU + RCAS (AMD, NVIDIA and Intel GPUs; no SDK). FSR 2/3.1/4.1 render through the FFX upscaler from the vendored AMD SDK (Windows+DX12; camera-motion only; runtime-unverified). DLSS and XeSS render through the fallback path at their recommended internal resolution. FSR frame generation is synthesised natively on Windows+DX12 via the FFX frame-generation swapchain and works with any upscaler or Off; DLSS/XeSS frame generation is not synthesised.").small().weak());}ui.checkbox(&mut settings.all_to_vram,"All to VRAM (maximum speed, uses more memory)").on_hover_text("Keep the whole world resident instead of paging it. Restores the pre-optimisation residency as an option: the complete terrain height/normal grid stays decoded in memory (no disk paging, no per-block decode), the decoded scenery/model texture caches stop evicting, and the whole-world, tree and model preloads keep every page they build. Load time, block-window rebuilds and revisiting areas are much faster; steady-state memory is much higher (the recovered whole-world texture corpus is about 5.4 GiB of sources before geometry, terrain and models). The terrain half is applied when the world loads, so a change takes effect after Load World; the in-viewer caches follow the checkbox live. Leave it off to keep the bounded paged caches, which is the default.");ui.checkbox(&mut settings.fullscreen,"Fullscreen (borderless)");ui.checkbox(&mut settings.bloom,"Bloom");ui.checkbox(&mut settings.sharpen,"Client fullscreen sharpen");marked_slider(ui,egui::Slider::new(&mut settings.bloom_strength,0.0..=4.0),"Bloom strength",defaults.bloom_strength,0.,4.,false,settings.bloom);egui::ComboBox::from_label("Bloom mode").selected_text(match settings.bloom_mode {4=>"Client special 4 (mono)",5=>"Client special 5 (low glow)",_=>"Automatic"}).show_ui(ui,|ui| {ui.selectable_value(&mut settings.bloom_mode,0,"Automatic");ui.selectable_value(&mut settings.bloom_mode,4,"Client special 4 (mono)");ui.selectable_value(&mut settings.bloom_mode,5,"Client special 5 (low glow)");});ui.label("Client glow caller tint / opacity (preview)");let mut tint=[((settings.bloom_tint>>16)&255)as f32/255.,((settings.bloom_tint>>8)&255)as f32/255.,(settings.bloom_tint&255)as f32/255.,(settings.bloom_tint>>24)as f32/255.];if ui.color_edit_button_rgba_unmultiplied(&mut tint).changed() {let c=tint.map(|v|(v.clamp(0.,1.)*255.).round()as u32);settings.bloom_tint=(c[3]<<24)|(c[0]<<16)|(c[1]<<8)|c[2];}marked_slider(ui,egui::Slider::new(&mut settings.bloom_brightness_fade,0.0..=1.0),"Glow fade target (1s transition)",0.,0.,1.,false,settings.bloom);marked_slider(ui,egui::Slider::new(&mut settings.bloom_opacity_fade,0.0..=1.0),"Glow opacity fade (preview)",0.,0.,1.,false,settings.bloom);ui.checkbox(&mut settings.client_gamma,"Client gamma (fullscreen only)");marked_slider(ui,egui::Slider::new(&mut settings.gamma_setting,0.0..=100.0),"Gamma",defaults.gamma_setting,0.,100.,false,settings.client_gamma);}
+                                                    0=>{ui.heading("Graphics");let upscaling_off=settings.upscaling==crate::UpscaleMethod::Off;marked_slider(ui,egui::Slider::new(&mut settings.resolution_scale,10.0..=200.0).integer().suffix("%"),"Resolution scale",defaults.resolution_scale,10.,200.,false,upscaling_off);ui.label(egui::RichText::new("3D render resolution (10%–200% of the window). Applies only when Upscaling is Off; UI stays at native resolution.").small().weak());egui::ComboBox::from_label("Upscaling").selected_text(settings.upscaling.label()).show_ui(ui,|ui|{for method in crate::UpscaleMethod::ALL {let available=crate::support(method,&gpu_facts,&sdk_report).is_available();let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.upscaling==method,method.label()));if available && response.clicked() {settings.upscaling=method;}}});ui.label(egui::RichText::new(sdk_report.summary()).small().weak());{let mut notes:Vec<String>=Vec::new();for method in [crate::UpscaleMethod::Dlss,crate::UpscaleMethod::Fsr1,crate::UpscaleMethod::Fsr2,crate::UpscaleMethod::Fsr3,crate::UpscaleMethod::Fsr4,crate::UpscaleMethod::Xess] {if let Some(reason)=crate::support(method,&gpu_facts,&sdk_report).reason() {notes.push(format!("{}: {reason}",method.label()));}}if !notes.is_empty() {ui.label(egui::RichText::new(notes.join("  ·  ")).small().weak());}}if settings.upscaling==crate::UpscaleMethod::Fsr1 {marked_slider(ui,egui::Slider::new(&mut settings.fsr1_sharpness,0.0..=2.0),"FSR 1 RCAS sharpness (stops; lower = sharper)",defaults.fsr1_sharpness,0.,2.,false,true);}if settings.upscaling!=crate::UpscaleMethod::Off {egui::ComboBox::from_label("Upscaling quality").selected_text(settings.upscale_quality.label()).show_ui(ui,|ui|{for quality in crate::UpscaleQuality::ALL {let available=crate::quality_available(settings.upscaling,quality);let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.upscale_quality==quality,quality.label()));if available && response.clicked() {settings.upscale_quality=quality;}}});let(internal_width,internal_height)=crate::provider_extent(settings.upscaling,settings.upscale_quality,config.width,config.height,max_texture_dimension);ui.label(egui::RichText::new(format!("Renders the world at {internal_width}×{internal_height} ({}), presented at native window resolution; the UI always stays native.",settings.upscaling.label())).small().weak());}egui::ComboBox::from_label("Frame generation").selected_text(settings.frame_generation.label()).show_ui(ui,|ui|{for method in crate::FrameGenMethod::ALL {let available=crate::support_framegen(method,settings.upscaling,&gpu_facts,&sdk_report).is_available();let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.frame_generation==method,method.label()));if available && response.clicked() {settings.frame_generation=method;}}});{let mut notes:Vec<String>=Vec::new();for method in [crate::FrameGenMethod::Dlss,crate::FrameGenMethod::Fsr,crate::FrameGenMethod::Xess] {if let Some(reason)=crate::support_framegen(method,settings.upscaling,&gpu_facts,&sdk_report).reason() {notes.push(format!("{}: {reason}",method.label()));}}if !notes.is_empty() {ui.label(egui::RichText::new(notes.join("  ·  ")).small().weak());}}if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=crate::FrameGenMethod::Off {ui.label(egui::RichText::new("FSR 1 is in-tree spatial EASU + RCAS (AMD, NVIDIA and Intel GPUs; no SDK). FSR 2/3.1/4.1 render through the FFX upscaler from the vendored AMD SDK (Windows+DX12; camera-motion only; runtime-unverified). XeSS renders through the XeSS SDK (libxess.dll, SM 6.4) the same way. FSR and XeSS frame generation are synthesised natively on Windows+DX12 via each vendor's frame-generation swapchain and work with any upscaler or Off (XeSS FG with XeSS or Off only); DLSS is reported but not synthesised.").small().weak());}ui.checkbox(&mut settings.all_to_vram,"All to VRAM (maximum speed, uses more memory)").on_hover_text("Keep the whole world resident instead of paging it. Restores the pre-optimisation residency as an option: the complete terrain height/normal grid stays decoded in memory (no disk paging, no per-block decode), the decoded scenery/model texture caches stop evicting, and the whole-world, tree and model preloads keep every page they build. Load time, block-window rebuilds and revisiting areas are much faster; steady-state memory is much higher (the recovered whole-world texture corpus is about 5.4 GiB of sources before geometry, terrain and models). The terrain half is applied when the world loads, so a change takes effect after Load World; the in-viewer caches follow the checkbox live. Leave it off to keep the bounded paged caches, which is the default.");ui.checkbox(&mut settings.fullscreen,"Fullscreen (borderless)");ui.checkbox(&mut settings.bloom,"Bloom");ui.checkbox(&mut settings.sharpen,"Client fullscreen sharpen");marked_slider(ui,egui::Slider::new(&mut settings.bloom_strength,0.0..=4.0),"Bloom strength",defaults.bloom_strength,0.,4.,false,settings.bloom);egui::ComboBox::from_label("Bloom mode").selected_text(match settings.bloom_mode {4=>"Client special 4 (mono)",5=>"Client special 5 (low glow)",_=>"Automatic"}).show_ui(ui,|ui| {ui.selectable_value(&mut settings.bloom_mode,0,"Automatic");ui.selectable_value(&mut settings.bloom_mode,4,"Client special 4 (mono)");ui.selectable_value(&mut settings.bloom_mode,5,"Client special 5 (low glow)");});ui.label("Client glow caller tint / opacity (preview)");let mut tint=[((settings.bloom_tint>>16)&255)as f32/255.,((settings.bloom_tint>>8)&255)as f32/255.,(settings.bloom_tint&255)as f32/255.,(settings.bloom_tint>>24)as f32/255.];if ui.color_edit_button_rgba_unmultiplied(&mut tint).changed() {let c=tint.map(|v|(v.clamp(0.,1.)*255.).round()as u32);settings.bloom_tint=(c[3]<<24)|(c[0]<<16)|(c[1]<<8)|c[2];}marked_slider(ui,egui::Slider::new(&mut settings.bloom_brightness_fade,0.0..=1.0),"Glow fade target (1s transition)",0.,0.,1.,false,settings.bloom);marked_slider(ui,egui::Slider::new(&mut settings.bloom_opacity_fade,0.0..=1.0),"Glow opacity fade (preview)",0.,0.,1.,false,settings.bloom);ui.checkbox(&mut settings.client_gamma,"Client gamma (fullscreen only)");marked_slider(ui,egui::Slider::new(&mut settings.gamma_setting,0.0..=100.0),"Gamma",defaults.gamma_setting,0.,100.,false,settings.client_gamma);}
                                                     1=>{ui.heading("World");ui.checkbox(&mut settings.detail.terrain_cutoff,"Original-game terrain cutoff (saves memory)").on_hover_text("Live, saved terrain and scenery cutoff. Keeps the block window below; releases distant terrain geometry and unused blend-mask atlas pages. Combine independently with Client atmospheric fog. Fog keeps the authored colour and caps its distance to the resident window (viewer adaptation). Distant scenery preload is paused; global lightmaps and shared tree assets still have memory costs; realistic maps show only resident terrain.");ui.label(renderer.terrain_gpu.residency_label());let (trees,bytes)=renderer.far_trees.residency_stats();ui.label(format!("Tree LOD instances: {trees}; instance buffer {:.1} KiB",bytes as f64/1024.));ui.add_enabled(!settings.detail.terrain_cutoff,egui::Checkbox::new(&mut settings.whole_world,"Render whole world (trees, rocks, buildings)")).on_hover_text("Paused and its pages released while native cutoff is enabled.");ui.label(&world_status);if let Some(models)=&renderer.models {let (ready,failed,total)=models.status();{let clocks=models.effect_clocks();if !clocks.is_empty(){let (mut low,mut high)=(f32::MAX,f32::MIN);for (_,clock,_,_) in &clocks{low=low.min(*clock);high=high.max(*clock);}ui.label(format!("World effect clocks: {:.0}..{:.0} ms across {} playing roots",low,high,clocks.len())).on_hover_text("The clock each playing root has reached, read out of the effect player itself after the fSpeed the map record puts on it (A3DGFXEx::SetPlaySpeed). A sheet that flows reads a clock that keeps rising; a root whose number stands still is frozen however many of its cards are on screen, and then the fault is the frame delta rather than the texture. The same numbers, with the change since the previous report, are what PWE_EFFECT_CENSUS=1 writes into effect-census.txt next to the executable.");}}ui.label(format!("Animated world models: {ready}/{total}; rejected {failed}"));let g=models.gfx_status();let alpha=models.alpha_status();{let fx_status=ui.label(format!("FX light producers: {} loaded, {} pending, {} elements, {} non-light roots, {} failed, {} unsupported binary roots; world effects: {} roots playing, {} quads, {} would not build, {} beyond the radius, {} outside the resident window, {} off by the day/night window; alpha meshes ordered {}/{} ({} drawable of {} slots, {} failed, {} without bounds)",g.live,g.pending,g.emitters,g.non_light_owners,g.failures,g.unsupported,g.players,models.effect_quad_count(),g.player_failures,models.activation_census()[0],models.activation_census()[1],models.activation_census()[2],alpha.ordered,alpha.alpha_meshes,alpha.drawable,alpha.slots,alpha.failed,alpha.without_bounds));if fx_status.hovered(){fx_status.on_hover_text(format!("Loader queue: {} frame(s) ticked, one pending root admitted per frame (native 0x5b1a00). Non-light roots loaded cleanly but contain no LightType element; their sprites/particles/trails are what the world-effects count draws, from the placements world.ecwld and the model events authored. Failed counts FX roots only; world-model and alpha-queue problems are listed below. Unsupported binary roots are valid assets in a container this reader cannot parse yet. World effects are built one root per frame and only while their owner is inside the activation radius, so the playing count grows for a moment after a move. The three counts after the would-not-build count say which gate left the rest out: the radius around the camera, the resident terrain window while the cutoff is on, and each record\'s own day/night window from its iValidTime byte.{}{}{}{}",g.frames,models.gfx_failures().iter().take(4).map(|e|format!("\nFailed: {e}")).collect::<String>(),models.gfx_unsupported().iter().take(2).map(|e|format!("\nUnsupported: {e}")).collect::<String>(),models.effect_failures().iter().take(3).map(|e|format!("\nEffect graph failed: {e}")).collect::<String>(),models.effect_warnings().iter().take(3).map(|e|format!("\nWorld effect notice: {e}")).collect::<String>()));}}}ui.checkbox(&mut settings.world_effects,"World effects (waterfalls, torch fire, glows)").on_hover_text("Draws the effect roots the map itself places: every world.ecwld effect record and every ECM model event, at the position, scale, play speed and day/night window the area authored. Nothing here follows the explorer or belongs to an add-on module. Off releases the animated graph and keeps the light producers those same roots carry, so a torch stops drawing its flame but still lights the wall. On rebuilds one root per frame."); marked_slider(ui,egui::Slider::new(&mut settings.effect_distance,0.0..=120.0).suffix(" m"),"Effect fade distance",defaults.effect_distance,0.,120.,false,settings.world_effects).on_hover_text("The client's own distance cull, applied as a fade instead of a pop. A placed effect whose record sets bAttenuation (the default) fades to invisible once it is further from the player than SCNRES_EFFECT - 60 units in the near scheme, 120 in the far one (EC_SceneBlock.cpp:1109/:1133) - and back in when the player returns, over 3,000 ms each way (CECOrnamentMan::Update, EC_ManOrnament.cpp:279; FadeGFX, :961). The client measures from the character\'s ground position, so the explorer measures horizontally from the camera, X and Z only: a camera 500 units above a city is still standing on that city. 0 (the left end, and the default) turns the fade off and restores every root to the alpha the map authored, including roots an earlier distance had already dimmed; 60 reproduces a player standing among the effects. Roots that are not attenuating, and every ECM model event, ignore the radius.");ui.label("RotFromView card axis:"); for m in crate::view_settings::EffectShaft::ALL { ui.selectable_value(&mut settings.effect_shaft,m,m.label()); } ui.label(egui::RichText::new(format!("decal channel will print shaft={}",settings.effect_shaft.token())).small().weak()).on_hover_text("A RotFromView card is an axial billboard: its height runs along one axis and only its width turns to the camera. The client builds that axis from the placement's own Z (A3DDecalEx.cpp:365, GetParentDir()*kp.m_vDir), which is the Client row and the faithful answer. Root direction drops the .gfx keypoint quaternion, World up always stands the shaft up, and Horizontal flattens the client axis into the world ground plane. The row is persisted as effect_shaft= and reprinted in the decal channel, so one report says which rule produced the picture.");marked_slider(ui,egui::Slider::new(&mut settings.far,2000.0..=24000.0),"View distance",defaults.far,2000.,24000.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.detail.radius,2..=12),"Terrain block window (blocks)",defaults.detail.radius as f32,2.,12.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.detail.tree_lod_scale,0.25..=4.0),"Tree LOD distance scale",defaults.detail.tree_lod_scale,0.25,4.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.detail.scenery_quality,0..=5),"Scenery quality preset",defaults.detail.scenery_quality as f32,0.,5.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.tree_wind_strength,0.0..=1.0),"Tree leaf rocking",defaults.tree_wind_strength,0.,1.,false,true);ui.checkbox(&mut settings.client_tree_wind_preview,"Client wind signal (preview)").on_hover_text("Modulates the existing 16-second sampled leaf loop with the recovered client wind signal. This is an approximation, not the original live leaf animation.");marked_slider(ui,egui::Slider::new(&mut settings.time_of_day,0.0..=24.0),"Time of day",defaults.time_of_day,0.,24.,false,true).on_hover_text("The sky clock the recovery put back: hour 0..24, stored in the settings file. Enabling the pass below makes the client's own clock run from here.");ui.checkbox(&mut settings.time_pass_enabled,"Enable time pass").on_hover_text("Runs the sky clock with wall-clock time instead of pinning it. The rate is the client's own: CECSunMoon::Tick (elementclient 0x4b5f10) adds elapsed_ms * ds:0x8db108 to the day fraction, and that constant is 1/14,400,000, so one authored day takes four real hours (one authored hour is ten real minutes) at speed 1.0. Sun and moon elevations, the dusk/night sky-set swap, the regional light blend, weather light and the zone music day/night choice all follow the same clock, so the world really does get dark. The slider below multiplies that rate.");marked_slider(ui,egui::Slider::new(&mut settings.time_pass_speed,0.1..=600.0).logarithmic(true).suffix("x"),"Time pass speed",defaults.time_pass_speed,0.1,600.,true,settings.time_pass_enabled).on_hover_text("Multiplier on the client's 4-real-hour day: 1x is the shipped speed, 2x is a day every two real hours, 60x is a day every four minutes, 600x is the fastest offered (one day per 14.4 real seconds). The label below shows the resulting length of one authored day.");ui.label(egui::RichText::new(format!("Client rate: 1 game day = {}",crate::sky_time::day_length_label(settings.time_pass_speed))).small().weak());egui::ComboBox::from_label("Sky set").selected_text(settings.sky_override.label()).show_ui(ui,|ui|{for o in crate::sky_transition::SkyOverride::ALL{ui.selectable_value(&mut settings.sky_override,o,o.label());}}).response.on_hover_text("Pins one sky.lst row (0 晴天 clear, 1 阴天01 overcast, 2 夕阳 sunset) instead of the client's day/night ladder (0x4203f4 -> autoscene sky_id_day/sky_id_night). Auto is the shipped behaviour; a pinned row never fades and the swap machine keeps running underneath, so returning to Auto resumes where the clock says. The night row is the overcast set, not a painted night panorama: the client darkens it with the regional light colour.");egui::ComboBox::from_label("Weather").selected_text(settings.weather_override.label()).show_ui(ui,|ui|{for o in crate::client_weather::WeatherOverride::ALL{ui.selectable_value(&mut settings.weather_override,o,o.label());}}).response.on_hover_text("Auto is the area's own EC-BSD flag word (world.ecbsd+0x04 bits 1 and 2, read at 0x421520): rain and snow are independent, and a zone may ask for both. The other rows force one effect anywhere. Rain and snow are falling particle quads, not a simulated weather system: the client owns the clock (33 ms object tick) and the textures (rain.tga, snow.bmp); the viewer now spawns them with the objects' own Speed 0.5 / Size 0.04 (rain, +-30 % size, +-50 % speed) and Size 0.3 (snow). The fall volume, the streak length and the flake descent scale are viewer values.");ui.checkbox(&mut settings.water_reflections,"Water reflections");ui.checkbox(&mut settings.celestial_discs,"Client sun and moon").on_hover_text("Native billboards: centre at direction*100 at the recovered template sizes (20-unit sun, 11.42 degrees; 40-unit moon, 22.62 degrees), gated on the recovered elevation curve and the 0.0003/ms visibility ramps. Sun adds its texture, moon alpha-blends it. The sun swells by 1+2n and adds its recovered 120x40 sunshine.bmp strip inside the recovered night-strength window; the moon carries no halo quad (retail takes every moon halo from the flare chain, and a centred quad landed off the painted disc because moon.tga's art is not centred in its texture). Both discs are submitted at half their object colour: 0x4b405f packs ([+0x48] & 0xfefefe | 0x01010100) >> 1, i.e. the recovered halving applied to the object's white default, so the texture is drawn at 127/255 instead of at full strength. Which record fills +0x48 is not recovered. The sun is tinted by the region's light colour (the object's only colour data is light data) and the sun also draws the client's whole flare chain: the fifteen quads `0x4b6270` pre-builds from `textures/nature/flares.bmp` (a 4x4 atlas, six vertices each, `add ebx,0xc0` per sprite and `cmp ebp,0x3c`), with the builder's own size, offset and UV tables. Sprite i sits `offset[i]` pixels from the sun along the line from the sun through the screen centre - the direction `0x450b30` computes - and its half extent is `metric * size[i]`, where the metric is the viewport height: `0x4360a0` hands `0x4b6270` a host block, the builder copies six dwords of it from `+0x14` and reads the fifth (`+0x24`) as an integer (`fild qword [esp+0x5c]`), which is the height of the viewport rectangle that block carries. The sprite colour is the disc's, so the chain shares the disc's half colour and the region light tint. The disc sizes and textures are the client's; the status line below says which part is which.");marked_slider(ui,egui::Slider::new(&mut settings.celestial_brightness,0.1..=1.0),"Star brightness",defaults.celestial_brightness,0.1,1.,false,settings.celestial_discs).on_hover_text("How strongly the sun and moon are drawn. 1.0 (the mark) is the texture itself. 0x4b405f packs each disc as ([+0x48] & 0xfefefe | 0x01010100) >> 1, half the object colour, but drawn that way both discs read as dim grey circles, so the recovered 0.498 is not the default; slide to it to compare. The region light is not multiplied into the discs for the same reason; it stays on the shine strip and the flare sprites, where 0x4b3e22 really does apply the +0x44 colour.");ui.checkbox(&mut settings.ignore_celestial_flags,"Ignore area sun/moon flags").on_hover_text("Every zone\'s EC-BSD record carries a flag word (record +4, read at 0x420992): bit 3 draws the sun, bit 4 the moon. A zone authored without bit 3 has no sun disc in the client either, which is what makes the sun vanish in some open areas while sky and lighting stay correct. This switch latches 0x18 instead of the zone word, so the disc always draws; the status line still prints the zone\'s own word, so flipping it tells the two causes apart.");ui.checkbox(&mut settings.cloud_detail,"Cloud detail (Client CloudDetail gate)").on_hover_text("Shows the native world.cld cloud surface. Point sizing and water-view parity remain approximate.");ui.checkbox(&mut settings.atmospheric_fog,"Client atmospheric fog (limits distant visibility)");ui.checkbox(&mut settings.terrain_lightmaps,"Client terrain lightmaps");ui.checkbox(&mut settings.area_grass_lightmaps,"Grass area-centered lightmaps").on_hover_text("Client area-center selection with clamped tile edges. Disable only to compare the legacy per-vertex selection.");ui.checkbox(&mut settings.regional_tree_lighting,"Experimental regional tree lighting");ui.checkbox(&mut settings.vegetation_authored_mips,"Authored vegetation mips (experimental, restart)").on_hover_text("P4.07 opt-in: preserve authored DDS mip chains for vegetation and use SpeedTree PWTREE08 per-LOD branch/frond alpha references plus the verified leaf reference 84. Default off keeps the approved legacy path. Applied at startup; restart after changing. Native sampler parity, grass anisotropy, and deeper-than-LOD-7 tails remain unresolved.");ui.checkbox(&mut settings.streamed_regions,"Streamed regional lighting/fog (experimental)").on_hover_text("Select environment regions from nearby world blocks using client-like priority. Changes atmospheric and underwater fog; affects trees only when experimental regional tree lighting is enabled. Asynchronous client load order is not yet reproduced.");ui.checkbox(&mut settings.grass_distance_fade,"Client grass distance fade");ui.checkbox(&mut settings.grass_wind_enabled,"Grass wind").on_hover_text("Native wind from the recovered logic clock. The client scales it with authored per-area data (+0x6c..+0x74), not a user setting, so this is an on/off switch.");marked_slider(ui,egui::Slider::new(&mut settings.grass_wind_amplitude,0.0..=2.0),"Grass wind sway",defaults.grass_wind_amplitude,0.,2.,false,settings.grass_wind_enabled).on_hover_text("Viewer-only multiplier on the wind history. The mark (1.0) is the recovered amplitude: the client's only wind inputs are the noise sample and the authored axis weights (+0x6c..+0x74 = 1.0, -0.5, 0.0), with no scale of its own, so there is no single retail number to show. The spring is critically damped at the recovered stiffness, which bounds the sway by that target instead of letting it resonate.");ui.checkbox(&mut settings.model_backface_culling,"Cull building back faces (experimental)");if camera.underwater_depth>0.{ui.label("Underwater effect active");}ui.label("Whole-world texture atlases are shared; geometry and unique source textures still require GPU memory.");}
                                                     2=>{ui.heading("Sound");ui.checkbox(&mut settings.music_enabled,"Play music from current zone");marked_slider(ui,egui::Slider::new(&mut settings.music_volume,0.0..=1.0),"Music volume",defaults.music_volume,0.,1.,false,true);ui.label(music.status());let audio_diagnostic=music.diagnostic();if !audio_diagnostic.is_empty(){ui.label(audio_diagnostic);}ui.checkbox(&mut settings.ambience_enabled,"Play zone ambience (experimental)");marked_slider(ui,egui::Slider::new(&mut settings.sound_volume,0.0..=1.0),"Ambience volume",defaults.sound_volume,0.,1.,false,true);ui.label(ambience.status());ui.checkbox(&mut settings.effects_enabled,"Play world effect sounds (experimental)");marked_slider(ui,egui::Slider::new(&mut settings.effects_volume,0.0..=1.0),"Effects volume",defaults.effects_volume,0.,1.,false,true);ui.label(world_audio.status());if let Some(error)=world_audio.diagnostic(){ui.label(error);}ui.label("Zone selection, world sound timing and spatialization are approximations. Gameplay, combat and weather effects are not implemented.");}
                                                     3=>{ui.heading("Interface");ui.checkbox(&mut settings.show_zone_entry,"Show entering zone notification");ui.checkbox(&mut settings.show_minimap,"Show minimap");marked_slider(ui,egui::Slider::new(&mut settings.minimap_range,100.0..=600.0),"Minimap half-width (world units)",defaults.minimap_range,100.,600.,false,settings.show_minimap);ui.separator();egui::ComboBox::from_label("Minimap style").selected_text(settings.minimap_style.label()).show_ui(ui,|ui|{ui.selectable_value(&mut settings.minimap_style,MapStyle::Realistic,"Realistic");ui.selectable_value(&mut settings.minimap_style,MapStyle::Original,"Original");});ui.label(egui::RichText::new("Realistic renders the world from above each frame; Original shows the client's own minimap tiles (surfaces/minimaps/world) at their native resolution.").small().weak());egui::ComboBox::from_label("Minimap shape").selected_text(settings.minimap_shape.label()).show_ui(ui,|ui|{ui.selectable_value(&mut settings.minimap_shape,MinimapShape::Square,"Square");ui.selectable_value(&mut settings.minimap_shape,MinimapShape::Circular,"Circular");});egui::ComboBox::from_label("World map style").selected_text(settings.world_map_style.label()).show_ui(ui,|ui|{ui.selectable_value(&mut settings.world_map_style,MapStyle::Realistic,"Realistic");ui.selectable_value(&mut settings.world_map_style,MapStyle::Original,"Original");});ui.label(egui::RichText::new("Realistic renders the whole world from above; Original shows the client's map tiles (surfaces/maps).").small().weak());ui.separator();ui.heading("Camera controls");marked_slider(ui,egui::Slider::new(&mut settings.camera_speed,10.0..=3000.0).logarithmic(true),"Flight speed",defaults.camera_speed,10.,3000.,true,true);marked_slider(ui,egui::Slider::new(&mut settings.boost,1.0..=10.0),"Shift multiplier",defaults.boost,1.,10.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.sensitivity,0.0005..=0.01).logarithmic(true),"Mouse sensitivity",defaults.sensitivity,0.0005,0.01,true,true);}
@@ -4991,7 +5162,7 @@ pub fn run(
                                             }
                                         } else { ui.add(egui::Image::new((map_id,egui::vec2(MINIMAP_HUD,MINIMAP_HUD))).rounding(round)) };
                                         let center=image.rect.center();let dir=egui::vec2(camera.yaw.sin(),camera.yaw.cos());let side=egui::vec2(-dir.y,dir.x);let points=vec![center+dir*10.,center-dir*7.+side*5.,center-dir*7.-side*5.];ui.painter().add(egui::Shape::convex_polygon(points,egui::Color32::from_rgb(255,225,130),egui::Stroke::new(1.0f32,egui::Color32::BLACK)));ui.painter().text(image.rect.left_top()+egui::vec2(5.,5.),egui::Align2::LEFT_TOP,"N",egui::FontId::proportional(14.),egui::Color32::WHITE);});});}
-                                    if show_status_badge {egui::Area::new(egui::Id::new("fsr-status-hud")).anchor(egui::Align2::LEFT_TOP,egui::vec2(16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.0).show(ui,|ui|{if let Some(label)=&fsr_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if fsr_failed_note {ui.label(egui::RichText::new("FSR failed -> bilinear").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&fsr_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if fg_failed {ui.label(egui::RichText::new("FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}});});}
+                                    if show_status_badge {egui::Area::new(egui::Id::new("fsr-status-hud")).anchor(egui::Align2::LEFT_TOP,egui::vec2(16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.0).show(ui,|ui|{if let Some(label)=&fsr_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&xess_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&xess_fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if fsr_failed_note {ui.label(egui::RichText::new("FSR failed -> bilinear").small().color(egui::Color32::LIGHT_RED));}if xess_failed_note {ui.label(egui::RichText::new("XeSS failed -> bilinear").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&fsr_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if fg_failed {ui.label(egui::RichText::new("FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if xess_fg_failed {ui.label(egui::RichText::new("XeSS FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&xess_fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&xess_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}});});}
                                     if menu_page.is_open(){renderer.modules.settings_panel(ctx,config.width as f32/window.scale_factor() as f32);}
                                     if renderer.modules.overlay_active() {
                                         // Overhead names: the same view-projection the world
@@ -5029,6 +5200,39 @@ pub fn run(
                                 renderer.queue.submit(cmd.into_iter().chain(std::iter::once(encoder.finish())));
                                 for id in &output.textures_delta.free {egui_renderer.free_texture(id);}
                             }
+                            // XeSS frame generation consumes a UI texture every
+                            // frame; when no UI was drawn, clear one to
+                            // transparent and treat it as visible.
+                            if xess_framegen.is_some() && !ui_visible {
+                                if let Some(fg) = xess_framegen.as_ref() {
+                                    let ui_surface = fg.ui_view();
+                                    let mut encoder = renderer.device.create_command_encoder(&Default::default());
+                                    {
+                                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                            label: Some("xess frame generation clear ui"),
+                                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                                view: &ui_surface,
+                                                resolve_target: None,
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                            })],
+                                            depth_stencil_attachment: None,
+                                            timestamp_writes: None,
+                                            occlusion_query_set: None,
+                                        });
+                                        let _ = &mut pass;
+                                    }
+                                    renderer.queue.submit(Some(encoder.finish()));
+                                    ui_visible = true;
+                                }
+                            }
+                            // All world + UI work has been submitted; close the
+                            // render-submit phase for XeLL.
+                            if let Some(fg) = xess_framegen.as_mut() {
+                                fg.render_submit_end();
+                            }
                             // Exactly one ramp stage, then exactly one output encode.
                             if let Some(encode) = present_encode.as_ref() {
                                 // Ramp into the sRGB intermediate, then copy it once.
@@ -5050,7 +5254,27 @@ pub fn run(
                                     frame_gamma_setting,
                                 );
                             }
-                            if let Some(fg) = framegen.as_mut() {
+                            if let Some(fg) = xess_framegen.as_mut() {
+                                // XeSS frame generation owns presentation:
+                                // copy the composition into the proxy
+                                // backbuffer, present (the proxy paces real and
+                                // generated frames).
+                                match fg.finish(ui_visible) {
+                                    Ok(()) => {}
+                                    Err(error) => {
+                                        crate::xess::diag(&format!("XeSS frame generation failed, restoring the standard present path: {error}"));
+                                        xess_fg_fail_reason = Some(error);
+                                        xess_framegen = None;
+                                        xess_fg_failed = true;
+                                        match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                            Ok(s) => surface = Some(s),
+                                            Err(error) => {
+                                                crate::xess::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(fg) = framegen.as_mut() {
                                 // Frame generation owns presentation: copy the
                                 // composition into the proxy backbuffer,
                                 // dispatch the interpolation workload, and

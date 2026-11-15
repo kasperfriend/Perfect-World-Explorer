@@ -42,8 +42,9 @@ print exactly which names were found):
 | AMD FSR API loader (DX12) | `amd_fidelityfx_loader_dx12.dll` |
 | AMD FSR upscaler (FSR Upscaling 4 / FSR 3 / FSR 2) | `amd_fidelityfx_upscaler_dx12.dll` |
 | AMD FSR Frame Generation (FG 4 / FG Swapchain 4 / FSR 3 FG) | `amd_fidelityfx_framegeneration_dx12.dll` |
-| Intel XeSS | `libxess.dll`, `libxess_d3d12.dll` |
-| Intel XeSS 2 Frame Generation | `libxess_fg.dll` |
+| Intel XeSS | `libxess.dll` |
+| Intel XeSS Frame Generation | `libxess_fg.dll` |
+| Intel XeLL (low latency, mandatory for XeSS Frame Generation) | `libxell.dll` |
 
 ## NVIDIA DLSS Super Resolution / DLSS Frame Generation
 
@@ -162,27 +163,38 @@ print exactly which names were found):
 - **Version documented against:** FSR 1.0 (ffx_fsr1.h, 2021). Not verified
   on hardware in this build environment.
 
-## Intel XeSS / XeSS 2
+## Intel XeSS / XeSS Frame Generation
 
-- **What it is:** Intel's temporal upscaler. Native on Intel Arc; runs on
-  other GPUs through a DP4a fallback path. XeSS 2 adds XeSS Frame Generation
-  (`libxess_fg.dll`).
-- **License:** MIT License.
-  Copyright © 2022–2024 Intel Corporation.
-  The full license text ships in the XeSS repository (`LICENSE`) and permits
-  redistribution with the copyright and permission notice preserved.
-- **Redistribution:** permitted by the MIT license with notice. This package
-  does not include the binaries by default; the packaging script can stage
-  `libxess*.dll` when pointed at a user-supplied SDK folder.
-- **Attribution:** "XeSS" and "Intel Arc" are trademarks of Intel Corporation.
-  Intel XeSS SR technology.
-- **Where to get it:** <https://www.intel.com/content/www/us/en/developer/topic/technology/xess.html>
-  and <https://github.com/GameTechDev/xess> (see its `LICENSE` file).
-- **Version documented against:** XeSS 2.0.x. Unverified in this build
-  environment. XeSS has no Ultra Performance mode; the Graphics tab disables
-  that choice for XeSS. XeSS Frame Generation is only exposed with XeSS
-  upscaling or none — cross-vendor frame-generation pairings are not
-  documented by Intel and are not offered.
+- **What it is:** Intel's temporal upscaler and frame interpolator. Native on
+  Intel Arc (XMX matrix cores); runs on other GPUs with Shader Model 6.4
+  through a DP4a fallback path. XeSS Frame Generation (`libxess_fg.dll`)
+  creates its own proxy swapchain for the window, paces real and interpolated
+  frames, and requires a XeLL (Intel Xe Low Latency, `libxell.dll`) context on
+  every GPU — Intel or otherwise — which the application must create, mark
+  and sleep per frame.
+- **License:** Intel Simplified Software License (October 2022).
+  The full license text is vendored in this repository as
+  `sdk/Intel_XeSS-SDK-3.0.2-LICENSE.txt` and permits redistribution with the
+  notice preserved. (The previously referenced MIT `LICENSE` file no longer
+  exists in the SDK v3.0.2 release; the Intel Simplified Software License
+  governs the SDK.)
+- **Redistribution:** permitted by the Intel Simplified Software License with
+  the notice preserved. This package does not include the binaries; the user
+  supplies them from the official release. The packaging script never stages
+  vendor binaries that are not committed (NVIDIA binaries are never staged;
+  FSR binaries are committed).
+- **Attribution:** "XeSS", "XeLL" and "Intel Arc" are trademarks of Intel
+  Corporation. Intel XeSS SR technology.
+- **Where to get it:** the official `v3.0.2` release of the XeSS SDK —
+  <https://github.com/intel/xess/releases/tag/v3.0.2> (asset `XeSS_SDK_3.0.2.zip`).
+  Copy `libxess.dll`, `libxess_fg.dll` and `libxell.dll` into `sdk/` (see
+  `sdk/SDK_GOES_HERE.txt`). Intel's XeSS topic page:
+  <https://www.intel.com/content/www/us/en/developer/topic/technology/xess.html>.
+- **Version documented against:** Intel XeSS SDK **3.0.2** (XeSS Super
+  Resolution, XeSS Frame Generation, XeLL). Unverified in this build
+  environment — the CI runner has no GPU. XeSS Frame Generation is only
+  exposed with XeSS upscaling or none — cross-vendor frame-generation
+  pairings are not documented by Intel and are not offered.
 
 ## Everything else
 

@@ -37,3 +37,10 @@ google_drive/
 # same license terms as the binaries above; kept for reference and review).
 !/sdk/include/
 !/sdk/include/**
+# The Intel XeSS SDK headers used by the FFI integration (Intel Simplified
+# Software License; see sdk/Intel_XeSS-SDK-3.0.2-LICENSE.txt and
+# THIRD_PARTY_NOTICES.md). The XeSS DLLs (libxess.dll, libxess_fg.dll,
+# libxell.dll, ~100 MB) are NOT committed — download the XeSS SDK 3.0.2
+# release from https://github.com/intel/xess/releases and copy the three
+# DLLs into sdk/ (see sdk/SDK_GOES_HERE.txt).
+!/sdk/Intel_XeSS-SDK-3.0.2-LICENSE.txt

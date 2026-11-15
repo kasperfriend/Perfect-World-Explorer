@@ -99,15 +99,19 @@ done.
     expects. If the loader or any call fails, the viewer logs and falls back
     to the bilinear path for the rest of the session. This FFI was written
     without a GPU to test on: the jitter sign, the motion-vector direction
-    and basic operation are all runtime-unverified. DLSS and XeSS are
-    **not** implemented; an active DLSS/XeSS provider renders through the
-    bilinear path (no temporal accumulation is faked for those). NVIDIA/Intel
-    SDKs still could not be obtained. The Graphics tab states this verbatim.
+    and basic operation are all runtime-unverified. Intel XeSS Super
+    Resolution and XeSS Frame Generation are now **implemented but equally
+    runtime-unverified** (same depth-reprojection MV pass, same FFI pattern;
+    XeLL low-latency context owned by the FG integration). An active DLSS
+    provider still renders through the bilinear path (no temporal accumulation
+    is faked for it). The NVIDIA SDK still could not be obtained; the Intel
+    DLLs are user-supplied (`sdk/SDK_GOES_HERE.txt`) and are never committed.
   - Licenses/attribution are recorded in `THIRD_PARTY_NOTICES.md` from the
     vendor terms as published (with the requirement to re-check the license
     shipped inside the SDK you download).
 - **Status:** open (needs the SDKs on a Windows machine; see README "Upscaling
-and frame generation").
+and frame generation"). XeSS code is written and CI-compile-clean but has not
+run on hardware; DLSS remains not integrated.
 
 ## B-4 — Native pass-by-pass DX12 rewrite (Phase 2)
 
@@ -146,8 +150,9 @@ and frame generation").
   feeds the SDK a raw R32_FLOAT copy of the reversed-Z depth buffer.
 - **Workaround:** the FFX upscaler (Upscaling 4.1.2) consumes camera-motion MVs; actors that move in
   world space are reprojected as if static (ghosting on animated geometry is
-  expected). There is still no per-object or skeletal velocity pass. DLSS/XeSS
-  paths render bilinearly as before.
+  expected). There is still no per-object or skeletal velocity pass. XeSS uses
+  the same camera-only MVs; an active DLSS provider renders bilinearly as
+  before.
 - **Status:** open (per-actor velocity pass + a verified FSR run on a real
   Windows GPU).
 

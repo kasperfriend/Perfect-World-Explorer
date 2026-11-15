@@ -52,6 +52,7 @@ mod fog_matrix;
 mod foliage_mips;
 mod fsr;
 mod fsr1_gpu;
+mod xess;
 #[allow(dead_code)]
 mod gfx_catalog;
 mod gfx_color_track;
@@ -986,10 +987,14 @@ pub struct SdkReport {
     /// `amd_fidelityfx_framegeneration_dx12.dll` — FSR Frame Generation 4 /
     /// FSR Frame Generation (Swapchain) 4 / FSR 3 frame generation.
     pub fsr_frame_generation: bool,
-    /// `libxess.dll` or `libxess_d3d12.dll` — XeSS Super Resolution.
+    /// `libxess.dll` — XeSS Super Resolution (SM 6.4; Intel Arc or DP4a
+    /// fallback on other vendors).
     pub xess: bool,
     /// `libxess_fg.dll` — XeSS 2 Frame Generation.
     pub xess_frame_generation: bool,
+    /// `libxell.dll` — Intel Xe Low Latency. Mandatory for XeSS Frame
+    /// Generation: the proxy swapchain refuses to initialize without it.
+    pub xell: bool,
 }
 
 const DLSS_SR_NAMES: [&str; 1] = ["nvngx_dlss.dll"];
@@ -998,8 +1003,9 @@ const STREAMLINE_NAMES: [&str; 1] = ["sl.interposer.dll"];
 const FSR_LOADER_NAMES: [&str; 1] = ["amd_fidelityfx_loader_dx12.dll"];
 const FSR_UPSCALE_NAMES: [&str; 1] = ["amd_fidelityfx_upscaler_dx12.dll"];
 const FSR_FG_NAMES: [&str; 1] = ["amd_fidelityfx_framegeneration_dx12.dll"];
-const XESS_NAMES: [&str; 2] = ["libxess.dll", "libxess_d3d12.dll"];
+const XESS_NAMES: [&str; 1] = ["libxess.dll"];
 const XESS_FG_NAMES: [&str; 1] = ["libxess_fg.dll"];
+const XELL_NAMES: [&str; 1] = ["libxell.dll"];
 
 fn probe_any(dir: &Path, names: &[&str]) -> bool {
     names.iter().any(|name| dir.join(name).is_file())
@@ -1051,6 +1057,7 @@ pub fn probe_sdk(settings_dir: &str) -> SdkReport {
     let fsr_frame_generation = probe(&FSR_FG_NAMES);
     let xess = probe(&XESS_NAMES);
     let xess_frame_generation = probe(&XESS_FG_NAMES);
+    let xell = probe(&XELL_NAMES);
     SdkReport {
         dir,
         source,
@@ -1063,6 +1070,7 @@ pub fn probe_sdk(settings_dir: &str) -> SdkReport {
         fsr_frame_generation,
         xess,
         xess_frame_generation,
+        xell,
     }
 }
 
@@ -1093,6 +1101,9 @@ impl SdkReport {
         }
         if self.xess_frame_generation {
             found.push("XeSS FG");
+        }
+        if self.xell {
+            found.push("XeLL");
         }
         match &self.dir {
             Some(dir) if !self.dir_is_dir => format!(
@@ -1569,13 +1580,13 @@ pub fn support_framegen(
                 Support::Disabled(
                     "XeSS Frame Generation is exposed with XeSS upscaling or Off only".into(),
                 )
-            } else if !sdk.xess_frame_generation {
+            } else if !sdk.xess_frame_generation || !sdk.xell {
                 Support::Disabled(sdk_reason(
                     sdk,
-                    "XeSS 2 Frame Generation SDK (libxess_fg.dll)",
+                    "XeSS 2 Frame Generation SDK (libxess_fg.dll and libxell.dll)",
                 ))
             } else {
-                Support::Available("XeSS 2 Frame Generation SDK found")
+                Support::Available("XeSS 2 Frame Generation SDK found (XeLL latency reduction included)")
             }
         }
     }
@@ -1788,6 +1799,7 @@ mod tests {
             fsr_frame_generation: true,
             xess: true,
             xess_frame_generation: true,
+            xell: true,
         }
     }
 
@@ -2395,9 +2407,10 @@ fn diagnose_upscale(args: &[String]) -> i32 {
         yes_no(sdk.fsr_frame_generation)
     );
     println!(
-        "  libxess.dll: {}   libxess_fg.dll: {}",
+        "  libxess.dll: {}   libxess_fg.dll: {}   libxell.dll: {}",
         yes_no(sdk.xess),
-        yes_no(sdk.xess_frame_generation)
+        yes_no(sdk.xess_frame_generation),
+        yes_no(sdk.xell)
     );
     println!();
 
@@ -2481,11 +2494,12 @@ fn diagnose_framegen(args: &[String]) -> i32 {
     let sdk = probe_sdk(&parsed.sdk_dir);
     println!("SDK probe: {}", sdk.summary());
     println!(
-        "  DLSS FG: {}   FSR FG: {} (loader: {})   XeSS 2 FG: {}",
+        "  DLSS FG: {}   FSR FG: {} (loader: {})   XeSS 2 FG: {}   XeLL: {}",
         yes_no(sdk.dlss_frame_generation),
         yes_no(sdk.fsr_frame_generation),
         yes_no(sdk.fsr_loader),
-        yes_no(sdk.xess_frame_generation)
+        yes_no(sdk.xess_frame_generation),
+        yes_no(sdk.xell)
     );
     println!();
 

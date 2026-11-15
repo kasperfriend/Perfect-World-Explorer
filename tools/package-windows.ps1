@@ -11,11 +11,12 @@ param(
     [string]$ArchivePath = '',
 
     # Optional: folder containing a *user-supplied* vendor SDK (never part of
-    # this repository). Only the MIT-licensed AMD FidelityFX/FSR and Intel
-    # XeSS runtime DLLs are staged, and only from this folder. NVIDIA
-    # DLSS/Streamline binaries are never staged by this script: users who are
-    # licensed to redistribute them must stage them manually and review the
-    # NVIDIA license themselves. See THIRD_PARTY_NOTICES.md.
+# this repository). Only the MIT-licensed AMD FidelityFX/FSR and Intel
+# XeSS runtime DLLs (Intel Simplified Software License) are staged, and
+# only from this folder. NVIDIA DLSS/Streamline binaries are never staged
+# by this script: users who are licensed to redistribute them must stage
+# them manually and review the NVIDIA license themselves. See
+# THIRD_PARTY_NOTICES.md.
     [string]$SdkDirectory = ''
 )
 
@@ -95,18 +96,22 @@ if ([string]::IsNullOrWhiteSpace($SdkDirectory) -and (Test-Path -LiteralPath $ve
     }
 }
 
-# Optional: stage the MIT-licensed vendor runtime DLLs from a user-supplied
-# SDK folder. Everything else in the folder is ignored; NVIDIA proprietary
+# Optional: stage the vendor runtime DLLs from a user-supplied
+# SDK folder (licenses: MIT-style for AMD, Intel Simplified Software License for XeSS). Everything else in the folder is ignored; NVIDIA proprietary
 # DLLs are refused outright so they can never enter a package by accident.
 if (-not [string]::IsNullOrWhiteSpace($SdkDirectory)) {
     $sdkRoot = (Resolve-Path -LiteralPath $SdkDirectory).Path
+    # Intel XeSS SDK 3.0.2: libxess.dll (super resolution), libxess_fg.dll
+    # (frame generation), libxell.dll (low latency; mandatory for XeSS-FG on
+    # every GPU, Intel or not). Staged only from the user-supplied folder;
+    # never committed to the repository.
     $mitAllowlist = @(
         'amd_fidelityfx_loader_dx12.dll',
         'amd_fidelityfx_upscaler_dx12.dll',
         'amd_fidelityfx_framegeneration_dx12.dll',
         'libxess.dll',
-        'libxess_d3d12.dll',
-        'libxess_fg.dll'
+        'libxess_fg.dll',
+        'libxell.dll'
     )
     $forbidden = @(Get-ChildItem -LiteralPath $sdkRoot -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -match '(?i)^(nvngx.*|sl\..*)\.dll$' })
@@ -128,7 +133,16 @@ if (-not [string]::IsNullOrWhiteSpace($SdkDirectory)) {
     }
     if ($staged -eq 0) {
         Remove-Item -LiteralPath $sdkTarget -Force
-        Write-Host "No allowlisted MIT SDK DLLs found under $sdkRoot; nothing staged."
+        Write-Host "No allowlisted vendor SDK DLLs found under $sdkRoot; nothing staged."
+    } else {
+        # Ship the licenses of whatever this branch staged inside sdk/ so the
+        # binaries carry their permission notices with them.
+        foreach ($extra in @('AMD_FidelityFX-SDK-2.4.0-LICENSE.md', 'AMD_FidelityFX-SDK-2.4.0-notices.md', 'Intel_XeSS-SDK-3.0.2-LICENSE.txt')) {
+            $extraPath = Join-Path $vendoredSdk $extra
+            if (Test-Path -LiteralPath $extraPath -PathType Leaf) {
+                Copy-Item -LiteralPath $extraPath -Destination (Join-Path $sdkTarget $extra)
+            }
+        }
     }
 }
 

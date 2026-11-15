@@ -1,1 +1,39 @@
-Heya
+Vendor SDK drop-in folder
+=========================
+
+Windows + DX12 builds load the vendor DLLs out of this folder (next to the
+executable, or `<repo>/sdk` for cargo builds, or the folder in Settings ->
+Graphics -> "Upscale SDK folder", or the `PW_UPSCALER_SDK_DIR` environment
+variable). Never ship these DLLs inside the source tree.
+
+AMD FSR (vendored in this repository for convenience)
+-----------------------------------------------------
+Already present: amd_fidelityfx_loader_dx12.dll,
+amd_fidelityfx_upscaler_dx12.dll, amd_fidelityfx_framegeneration_dx12.dll
+(FidelityFX SDK 3.1.6 FSR 2/3/4 + frame generation) and AMD's license
+notices. Keep them.
+
+Intel XeSS (NOT vendored - download once)
+-----------------------------------------
+The XeSS SDK 3.0.2 binaries are too large to commit. Download the release
+from:
+
+    https://github.com/intel/xess/releases/tag/v3.0.2
+
+(asset: XeSS_SDK_3.0.2.zip). From the extracted package's `bin/` folder,
+copy these three DLLs into THIS folder, next to the AMD ones:
+
+    libxess.dll     (XeSS Super Resolution, ~78 MB)
+    libxess_fg.dll  (XeSS Frame Generation, ~23 MB)
+    libxell.dll     (Intel Xe Low Latency, required by XeSS-FG)
+
+Notes:
+* libxell.dll is mandatory for XeSS Frame Generation on every GPU, not just
+  Intel. Without it the proxy swapchain refuses to initialize and the
+  frame generator disables itself.
+* The Intel Simplified Software License (see Intel_XeSS-SDK-3.0.2-LICENSE.txt
+  in this folder) covers the XeSS SDK; the headers it was built from are
+  vendored under sdk/include/xess, sdk/include/xess_fg and sdk/include/xell.
+* XeSS requires an SM 6.4 capable GPU. On Intel Arc it uses XMX cores; on
+  other vendors it uses a DP4a compute fallback and generates at most one
+  interpolated frame.
