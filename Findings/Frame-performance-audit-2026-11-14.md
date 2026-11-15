@@ -20,7 +20,7 @@ The first five entries above are concrete repeated work and exact fixes, not cla
 
 ## Validation and next measurement
 
-- The prior branch CI run `43701936265` passed Linux Rust checks/tests and the Windows x64 build (before the current diff).
-- This environment does not have `cargo`/`rustfmt` installed, so the current diff has not been compiled locally. Run the branch CI after this change before treating it as validated.
+- Branch CI run `43703644260` passed Linux Rust checks/tests, rustfmt, shader/regression checks and the Windows x64 build for the current diff.
+- This environment does not have `cargo`/`rustfmt` installed; validation was performed by that CI run, not locally.
 - For a real comparison, use the same map, camera route, resolution, present mode, and scene settings before/after; record `PW_FRAME_TIMING=1` plus GPU timestamp/capture data if supported. Existing timing can separate acquisition/presentation from CPU submission, but GPU execution still needs a graphics capture or timestamp-query instrumentation.
 - Do not infer a GPU bottleneck from a short CPU submit duration, nor an FPS gain from the algorithmic complexity reductions alone.
