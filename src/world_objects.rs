@@ -126,6 +126,21 @@ pub struct WorldDrawCmd {
     pub has_sdr: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct WorldDrawChunk {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub has_sdr: bool,
+    pub start: usize,
+    pub end: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorldDrawList {
+    pub cmds: Vec<WorldDrawCmd>,
+    pub chunks: Vec<WorldDrawChunk>,
+}
+
 pub fn frustum_planes_from_matrix(m: [f32; 16]) -> [[f32; 4]; 6] {
     let r0 = [m[0], m[4], m[8], m[12]];
     let r1 = [m[1], m[5], m[9], m[13]];
@@ -859,11 +874,11 @@ impl GpuPage {
             }
             pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
         }
-         }
+    }
 
-    pub fn world_culled_commands(pages: &[Self]) -> [Vec<WorldDrawCmd>; WORLD_VIEWS] {
+    pub fn world_culled_commands(pages: &[Self]) -> [WorldDrawList; WORLD_VIEWS] {
         let order = Self::draw_order(pages);
-        let build = |view: Pass| -> Vec<WorldDrawCmd> {
+        let build = |view: Pass| -> WorldDrawList {
             let mut out: Vec<WorldDrawCmd> = Vec::new();
             for &(page_idx, range_idx) in &order {
                 let p = &pages[page_idx];
@@ -924,7 +939,31 @@ impl GpuPage {
                     has_sdr: b.has_sdr,
                 });
             }
-            out
+            let mut chunks = Vec::with_capacity(out.len().div_ceil(32));
+            for (i, group) in out.chunks(32).enumerate() {
+                let start = i * 32;
+                let end = start + group.len();
+                let mut min = group[0].min;
+                let mut max = group[0].max;
+                let mut has_sdr = group[0].has_sdr;
+                for cmd in &group[1..] {
+                    min[0] = min[0].min(cmd.min[0]);
+                    min[1] = min[1].min(cmd.min[1]);
+                    min[2] = min[2].min(cmd.min[2]);
+                    max[0] = max[0].max(cmd.max[0]);
+                    max[1] = max[1].max(cmd.max[1]);
+                    max[2] = max[2].max(cmd.max[2]);
+                    has_sdr |= cmd.has_sdr;
+                }
+                chunks.push(WorldDrawChunk {
+                    min,
+                    max,
+                    has_sdr,
+                    start,
+                    end,
+                });
+            }
+            WorldDrawList { cmds: out, chunks }
         };
         [
             build(Pass::Main),
@@ -935,28 +974,33 @@ impl GpuPage {
 
     pub fn draw_world_culled<'a>(
         pages: &'a [Self],
-        cmds: &[WorldDrawCmd],
+        list: &WorldDrawList,
         pass: &mut wgpu::RenderPass<'a>,
         reflected: bool,
         frustum: &[[f32; 4]; 6],
         sdr_only: bool,
     ) {
         let mut bound = None;
-        for cmd in cmds {
-            if sdr_only && !cmd.has_sdr {
+        for chunk in &list.chunks {
+            if (sdr_only && !chunk.has_sdr) || !aabb_in_frustum(frustum, chunk.min, chunk.max) {
                 continue;
             }
-            if !aabb_in_frustum(frustum, cmd.min, cmd.max) {
-                continue;
-            }
-            let p = &pages[cmd.page];
-            if bound != Some(cmd.page) {
-                pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
-                pass.set_vertex_buffer(0, p.vertex.slice(..));
-                pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
-                bound = Some(cmd.page);
-            }
-            pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
+            for cmd in &list.cmds[chunk.start..chunk.end] {
+                    if sdr_only && !cmd.has_sdr {
+                        continue;
+                    }
+                    if !aabb_in_frustum(frustum, cmd.min, cmd.max) {
+                        continue;
+                    }
+                    let p = &pages[cmd.page];
+                    if bound != Some(cmd.page) {
+                        pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
+                        pass.set_vertex_buffer(0, p.vertex.slice(..));
+                        pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
+                        bound = Some(cmd.page);
+                    }
+                    pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
+                }
         }
     }
 
