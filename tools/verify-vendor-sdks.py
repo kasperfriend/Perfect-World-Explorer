@@ -213,6 +213,7 @@ HEADER_CONSTANTS = {
         "XEFG_INIT_FLAG_INVERTED_DEPTH": ("xess_fg/xefg_swapchain.h", "XEFG_SWAPCHAIN_INIT_FLAG_INVERTED_DEPTH"),
         "XEFG_UI_MODE_HUDLESS_UITEXTURE": ("xess_fg/xefg_swapchain.h", "XEFG_SWAPCHAIN_UI_MODE_HUDLESS_UITEXTURE"),
         "XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT": ("xess_fg/xefg_swapchain.h", "XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT"),
+        "XEFG_SWAPCHAIN_RV_ONLY_NOW": ("xess_fg/xefg_swapchain.h", "XEFG_SWAPCHAIN_RV_ONLY_NOW"),
         "XEFG_SWAPCHAIN_RES_DEPTH": ("xess_fg/xefg_swapchain.h", "XEFG_SWAPCHAIN_RES_DEPTH"),
         "XEFG_SWAPCHAIN_RES_MOTION_VECTOR": ("xess_fg/xefg_swapchain.h", "XEFG_SWAPCHAIN_RES_MOTION_VECTOR"),
         "XEFG_SWAPCHAIN_RES_UI": ("xess_fg/xefg_swapchain.h", "XEFG_SWAPCHAIN_RES_UI"),

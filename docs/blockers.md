@@ -358,3 +358,39 @@ done.
   context creation and named in that log line.
 - **Status:** open (fix is written and compiles on Windows CI; not yet
   confirmed on hardware).
+
+## B-12 — XeSS Frame Generation: black frame every other present (screen report, Phase 4.2x)
+
+- **Step:** Settings → Graphics → **Frame generation** = XeSS Frame Generation,
+  with the HUD-less colour tagging from B-11 in place (the HUD was back).
+- **Symptom on the reporting machine:** the scene renders correctly, but the
+  whole screen flickers black "every frame, very fast" — an alternating
+  good/black image, not a partial or torn one.
+- **Diagnosis:** the viewer tagged its inputs with
+  `XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT`, which tells XeSS-FG that it may defer
+  (or skip) the copy and read the *live* texture during `Present`. Those reads
+  happen on the proxy swapchain's own queue, while the viewer writes the
+  composition, UI, depth and motion vectors with wgpu on the app's direct
+  queue; the two queues are not synchronised, so the SDK could consume a
+  half-written or not-yet-written texture. The real frame is the viewer's own
+  back-buffer copy and stayed correct; the *interpolated* frame — the one the
+  model derives from those inputs — came out black, which at 2× present rate
+  reads as a very fast black flicker. It could not show up before B-11 because
+  in that mode XeSS-FG had no HUD-less input and therefore never interpolated.
+- **Fix:** every input (`DEPTH`, `MOTION_VECTOR`, `HUDLESS_COLOR`, `UI`) is now
+  tagged `XEFG_SWAPCHAIN_RV_ONLY_NOW` with the command list that the viewer
+  owns (`tag_frame_resource_now` in `src/xess/fg.rs`): XeSS-FG records its
+  copies on that list, they execute on the app's queue in order after the
+  producing work, and each texture is available again as soon as the list
+  retires. The park/un-park bookkeeping (`depth_mv_parked`,
+  `ui_needs_rt_restore`, `compose_parked`) is gone with it — each list now
+  returns its textures to `RENDER_TARGET` itself. This is the pattern the
+  vendor's own samples and third-party XeSS-FG integrations use.
+- **What the retest has to show:** no black frames with XeSS-FG active, and the
+  first presents in `session.log` report `2 frame(s) presented` — that line was
+  added for exactly this triage: `1` means the SDK is passing frames through
+  (frame generation is not actually running), `2` means it is interpolating.
+  `PW_XEFG_UI_MODE` from B-11 still selects the composition mode if the HUD
+  needs to be narrowed down separately.
+- **Status:** open (fix is written and compiles on Windows CI; not yet
+  confirmed on hardware).

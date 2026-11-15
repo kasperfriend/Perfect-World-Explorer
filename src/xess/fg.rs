@@ -15,8 +15,12 @@
 //!   produces low-resolution reprojected motion vectors from the reversed-Z
 //!   depth, tags depth/motion vectors and the frame constants with XeSS-FG,
 //!   and [`XessFrameGeneration::finish`] copies the composition into the
-//!   proxy backbuffer, tags the UI texture, sets the present id and calls
-//!   `Present` on the proxy (which paces real and interpolated frames).
+//!   proxy backbuffer, tags the HUD-less colour and the UI texture, sets the
+//!   present id and calls `Present` on the proxy (which paces real and
+//!   interpolated frames). Every input is tagged as
+//!   `XEFG_SWAPCHAIN_RV_ONLY_NOW` on the app's own command list, so XeSS-FG
+//!   copies it on the app's queue instead of reading the live texture during
+//!   `Present` — see the note in [`tag_frame_resource_now`].
 //! * On disable, the XeSS-FG context is destroyed first, then XeLL (the SDK
 //!   requires this order), and the engine recreates the wgpu surface.
 //!
@@ -47,8 +51,7 @@ use super::xell::{
 };
 use crate::fsr::{
     dxgi_for_format, raw_dx12, FsrMotionVectorPass, FsrMvParams, NativeCommandRing,
-    NativeTexture2D, D3D12_STATE_COMMON, D3D12_STATE_COPY_DEST, D3D12_STATE_PIXEL_COMPUTE_READ,
-    D3D12_STATE_RENDER_TARGET,
+    NativeTexture2D, D3D12_STATE_COMMON, D3D12_STATE_COPY_DEST, D3D12_STATE_RENDER_TARGET,
 };
 use glam::Mat4;
 use std::ffi::c_void;
@@ -71,7 +74,19 @@ const D3D12_RESOURCE_BARRIER_FLAG_NONE: u32 = d3d12_ty::D3D12_RESOURCE_BARRIER_F
 const XEFG_INIT_FLAG_INVERTED_DEPTH: u32 = 1 << 0;
 const XEFG_UI_MODE_HUDLESS_UITEXTURE: i32 = 3;
 const XEFG_UI_COMPOSITION_STATE_ENABLED: u32 = 1;
+/// Resource validity: XeSS-FG may defer (or skip) the copy entirely and read
+/// the resource during `Present`. This viewer no longer uses it: that read can
+/// happen on the swapchain's own present queue, which is not ordered against
+/// the next frame's writes to the same texture, and on hardware that race
+/// showed up as a black frame every other present. Kept because
+/// `tools/verify-vendor-sdks.py` checks it against the vendored header.
+#[allow(dead_code)]
 const XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT: u32 = 0;
+/// Resource validity: XeSS-FG records the copy of the resource onto the
+/// command list the app passes to `xefgSwapChainD3D12TagFrameResource`, so the
+/// copy executes on the app's own direct queue right after the work that
+/// produced it, and the texture may be reused as soon as that list retires.
+const XEFG_SWAPCHAIN_RV_ONLY_NOW: u32 = 1;
 const XEFG_SWAPCHAIN_RES_HUDLESS_COLOR: u32 = 0;
 const XEFG_SWAPCHAIN_RES_DEPTH: u32 = 1;
 const XEFG_SWAPCHAIN_RES_MOTION_VECTOR: u32 = 2;
@@ -79,6 +94,51 @@ const XEFG_SWAPCHAIN_RES_UI: u32 = 3;
 const XEFG_LOGGING_LEVEL_INFO: i32 = 1;
 
 /// Human-readable XeSS-FG result codes for diagnostics.
+/// Tag one frame resource as `XEFG_SWAPCHAIN_RV_ONLY_NOW`.
+///
+/// XeSS-FG records the copy of that resource onto `list`, so it executes on the
+/// app's own direct queue immediately after the work that produced the texture
+/// — and the texture may be rewritten as soon as the list retires. Tagging with
+/// `RV_UNTIL_NEXT_PRESENT` instead lets the SDK read the live texture during
+/// `Present`, possibly from the swapchain's own queue, which is where a black
+/// alternating frame came from on hardware.
+///
+/// # Safety
+/// `list` must be the app's open command list on the queue that wrote
+/// `resource`, and `incoming_state` the state `resource` is in at that point.
+#[allow(clippy::too_many_arguments)]
+unsafe fn tag_frame_resource_now(
+    tag_frame_resource: PfnXefgD3D12TagFrameResource,
+    context: *mut c_void,
+    list: *mut c_void,
+    frame_id: u32,
+    resource_type: u32,
+    resource: *mut c_void,
+    size: (u32, u32),
+    incoming_state: u32,
+) -> Result<(), String> {
+    let data = XefgD3D12ResourceData {
+        resource_type,
+        validity: XEFG_SWAPCHAIN_RV_ONLY_NOW,
+        resource_base: Xefg2d { x: 0, y: 0 },
+        resource_size: Xefg2d {
+            x: size.0,
+            y: size.1,
+        },
+        resource,
+        incoming_state,
+    };
+    let rc = (tag_frame_resource)(context, list, frame_id, &data);
+    if rc != 0 {
+        return Err(format!(
+            "xefgSwapChainD3D12TagFrameResource(type {}) failed ({})",
+            resource_type,
+            xefg_result_name(rc)
+        ));
+    }
+    Ok(())
+}
+
 /// Human-readable UI composition mode, for the ready line and for retests.
 fn xefg_ui_mode_name(mode: i32) -> &'static str {
     match mode {
@@ -361,17 +421,6 @@ pub struct XessFrameGeneration {
     frame_id: u64,
     /// Number of frames presented through the proxy.
     frames: u64,
-    /// `true` while the UI texture is parked in the compute/read state
-    /// XeSS-FG expects during Present; the next `prepare` restores it.
-    ui_needs_rt_restore: bool,
-    /// `true` while depth/MV are parked in the compute/read state XeSS-FG
-    /// reads them in during Present; the next `prepare` restores them
-    /// before the motion-vector pass writes them again.
-    depth_mv_parked: bool,
-    /// `true` while the composition (the HUD-less color XeSS-FG interpolates)
-    /// is parked in the compute/read state; the next `prepare` restores it so
-    /// the world pass can render into it again.
-    compose_parked: bool,
 }
 
 impl Drop for XessFrameGeneration {
@@ -694,9 +743,6 @@ impl XessFrameGeneration {
             prev_view_proj: None,
             frame_id: 1,
             frames: 0,
-            ui_needs_rt_restore: false,
-            depth_mv_parked: false,
-            compose_parked: false,
         })
     }
 
@@ -816,47 +862,6 @@ impl XessFrameGeneration {
             )
         };
 
-        // --- Native list: un-park the resources the previous present
-        // consumed (depth/MV/UI are in PIXEL_COMPUTE_READ after the last
-        // finish()). Must run BEFORE the wgpu motion-vector pass writes
-        // depth/MV as RENDER_TARGET next frame.
-        if self.depth_mv_parked || self.ui_needs_rt_restore || self.compose_parked {
-            let slot_index = self.ring.acquire("XeSS FG")?;
-            let list = &mut self.ring.slot_mut(slot_index).list;
-            let mut barriers = Vec::with_capacity(4);
-            if self.depth_mv_parked {
-                barriers.push(barrier(
-                    &self.depth.resource,
-                    D3D12_STATE_PIXEL_COMPUTE_READ,
-                    D3D12_STATE_RENDER_TARGET,
-                ));
-                barriers.push(barrier(
-                    &self.mv.resource,
-                    D3D12_STATE_PIXEL_COMPUTE_READ,
-                    D3D12_STATE_RENDER_TARGET,
-                ));
-            }
-            if self.ui_needs_rt_restore {
-                barriers.push(barrier(
-                    &self.ui.resource,
-                    D3D12_STATE_PIXEL_COMPUTE_READ,
-                    D3D12_STATE_RENDER_TARGET,
-                ));
-            }
-            if self.compose_parked {
-                barriers.push(barrier(
-                    &self.compose.resource,
-                    D3D12_STATE_PIXEL_COMPUTE_READ,
-                    D3D12_STATE_RENDER_TARGET,
-                ));
-            }
-            list.resource_barrier(&barriers);
-            self.ring.retire(slot_index, &self.queue, "XeSS FG")?;
-            self.depth_mv_parked = false;
-            self.ui_needs_rt_restore = false;
-            self.compose_parked = false;
-        }
-
         // --- wgpu side: raw depth copy + MV pass (same math as FSR).
         let inv_vp = unjittered_vp.inverse();
         let prev_vp = self.prev_view_proj.unwrap_or(*unjittered_vp);
@@ -926,28 +931,31 @@ impl XessFrameGeneration {
         }
         queue.submit(Some(encoder.finish()));
 
-        // --- Native list: move depth/MV into the compute/read state
-        // XeSS-FG reads them in during Present. They stay parked until the
-        // next prepare un-parks them.
+        // --- Native list: hand this frame's depth and motion vectors to
+        // XeSS-FG as `RV_ONLY_NOW` resources. The SDK records their copies on
+        // this command list, so they run on the app's own direct queue right
+        // after the motion-vector pass above instead of being read later from
+        // the swapchain's present queue; the same list returns both textures to
+        // RENDER_TARGET for the next frame.
         let slot_index = self.ring.acquire("XeSS FG")?;
-        let list = &mut self.ring.slot_mut(slot_index).list;
-        let barriers = [
-            barrier(
-                &self.depth.resource,
-                D3D12_STATE_RENDER_TARGET,
-                D3D12_STATE_PIXEL_COMPUTE_READ,
-            ),
-            barrier(
-                &self.mv.resource,
-                D3D12_STATE_RENDER_TARGET,
-                D3D12_STATE_PIXEL_COMPUTE_READ,
-            ),
-        ];
-        list.resource_barrier(&barriers);
-        self.ring.retire(slot_index, &self.queue, "XeSS FG")?;
-        self.depth_mv_parked = true;
+        let list_ptr = {
+            let list = &mut self.ring.slot_mut(slot_index).list;
+            list.resource_barrier(&[
+                barrier(
+                    &self.depth.resource,
+                    D3D12_STATE_RENDER_TARGET,
+                    D3D12_STATE_COPY_SRC,
+                ),
+                barrier(
+                    &self.mv.resource,
+                    D3D12_STATE_RENDER_TARGET,
+                    D3D12_STATE_COPY_SRC,
+                ),
+            ]);
+            list.as_mut_ptr() as *mut c_void
+        };
 
-        // --- Tag the frame constants and resources for this frame.
+        // --- Frame constants and inputs for this frame id.
         let constants = XefgFrameConstantData {
             view_matrix: row_major(view),
             projection_matrix: row_major(projection),
@@ -965,46 +973,44 @@ impl XessFrameGeneration {
                 xefg_result_name(rc)
             ));
         }
-        let tag_resource =
-            |resource_type: u32, resource: *mut c_void, size: (u32, u32)| -> Result<(), String> {
-                let data = XefgD3D12ResourceData {
-                    resource_type,
-                    validity: XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT,
-                    resource_base: Xefg2d { x: 0, y: 0 },
-                    resource_size: Xefg2d {
-                        x: size.0,
-                        y: size.1,
-                    },
-                    resource,
-                    incoming_state: D3D12_STATE_PIXEL_COMPUTE_READ,
-                };
-                let rc = unsafe {
-                    (self.loader.tag_frame_resource)(
-                        self.loader.context,
-                        std::ptr::null_mut(),
-                        id,
-                        &data,
-                    )
-                };
-                if rc != 0 {
-                    return Err(format!(
-                        "xefgSwapChainD3D12TagFrameResource(type {}) failed ({})",
-                        resource_type,
-                        xefg_result_name(rc)
-                    ));
-                }
-                Ok(())
-            };
-        tag_resource(
-            XEFG_SWAPCHAIN_RES_DEPTH,
-            self.depth.resource.as_mut_ptr() as *mut c_void,
-            (rw, rh),
-        )?;
-        tag_resource(
-            XEFG_SWAPCHAIN_RES_MOTION_VECTOR,
-            self.mv.resource.as_mut_ptr() as *mut c_void,
-            (rw, rh),
-        )?;
+        unsafe {
+            tag_frame_resource_now(
+                self.loader.tag_frame_resource,
+                self.loader.context,
+                list_ptr,
+                id,
+                XEFG_SWAPCHAIN_RES_DEPTH,
+                self.depth.resource.as_mut_ptr() as *mut c_void,
+                (rw, rh),
+                D3D12_STATE_COPY_SRC,
+            )?;
+            tag_frame_resource_now(
+                self.loader.tag_frame_resource,
+                self.loader.context,
+                list_ptr,
+                id,
+                XEFG_SWAPCHAIN_RES_MOTION_VECTOR,
+                self.mv.resource.as_mut_ptr() as *mut c_void,
+                (rw, rh),
+                D3D12_STATE_COPY_SRC,
+            )?;
+        }
+        {
+            let list = &mut self.ring.slot_mut(slot_index).list;
+            list.resource_barrier(&[
+                barrier(
+                    &self.depth.resource,
+                    D3D12_STATE_COPY_SRC,
+                    D3D12_STATE_RENDER_TARGET,
+                ),
+                barrier(
+                    &self.mv.resource,
+                    D3D12_STATE_COPY_SRC,
+                    D3D12_STATE_RENDER_TARGET,
+                ),
+            ]);
+        }
+        self.ring.retire(slot_index, &self.queue, "XeSS FG")?;
         self.prev_view_proj = Some(*unjittered_vp);
         Ok(())
     }
@@ -1045,9 +1051,15 @@ impl XessFrameGeneration {
         }
         let backbuffer: d3d12::Resource = unsafe { std::mem::transmute(raw_backbuffer) };
 
-        // --- Native copy: composition -> backbuffer.
-        let slot_index = self.ring.acquire("XeSS FG")?;
-        let list = &mut self.ring.slot_mut(slot_index).list;
+        // --- Native list: composition -> backbuffer, and the two inputs
+        // `HUDLESS_UITEXTURE` mode requires (the HUD-less colour and the UI
+        // texture) handed to XeSS-FG as `RV_ONLY_NOW` resources. Both tags
+        // happen on this command list, so the SDK records its copies here and
+        // they execute on the app's own direct queue right after the
+        // composition/UI writes. Tagging them as `RV_UNTIL_NEXT_PRESENT`
+        // instead made the SDK read the live textures during Present — the
+        // proxy's own queue is not ordered against the next frame's writes, and
+        // on hardware that showed up as a black frame every other present.
         let barrier = |resource: &d3d12::Resource, before: u32, after: u32| {
             d3d12::ResourceBarrier::transition(
                 resource.clone(),
@@ -1057,107 +1069,77 @@ impl XessFrameGeneration {
                 D3D12_RESOURCE_BARRIER_FLAG_NONE,
             )
         };
-        let mut barriers = vec![
-            barrier(
-                &self.compose.resource,
-                D3D12_STATE_RENDER_TARGET,
-                D3D12_STATE_COPY_SRC,
-            ),
-            barrier(&backbuffer, D3D12_STATE_PRESENT, D3D12_STATE_COPY_DEST),
-        ];
-        if ui_visible {
-            barriers.push(barrier(
-                &self.ui.resource,
-                D3D12_STATE_RENDER_TARGET,
-                D3D12_STATE_PIXEL_COMPUTE_READ,
-            ));
-        }
-        list.resource_barrier(&barriers);
-        // The d3d12 crate has no safe `CopyResource` wrapper, so call the
-        // COM method on the underlying raw interface directly.
-        unsafe {
-            (*list.as_mut_ptr())
-                .CopyResource(backbuffer.as_mut_ptr(), self.compose.resource.as_mut_ptr());
-        }
-        // The composition is the HUD-less colour XeSS-FG interpolates, so it
-        // has to stay readable (PIXEL_COMPUTE_READ) when Present runs; the
-        // next prepare() puts it back into RENDER_TARGET for the world pass.
-        let restore = [
-            barrier(
-                &self.compose.resource,
-                D3D12_STATE_COPY_SRC,
-                D3D12_STATE_PIXEL_COMPUTE_READ,
-            ),
-            barrier(&backbuffer, D3D12_STATE_COPY_DEST, D3D12_STATE_PRESENT),
-        ];
-        list.resource_barrier(&restore);
-        self.ring.retire(slot_index, &self.queue, "XeSS FG")?;
-        self.compose_parked = true;
-        if ui_visible {
-            // XeSS-FG reads the UI surface during Present; it stays parked
-            // in PIXEL_COMPUTE_READ until the next prepare restores it.
-            self.ui_needs_rt_restore = true;
-        }
-
-        // --- Tag the HUD-less colour. `HUDLESS_UITEXTURE` mode has two
-        // required inputs — the HUD-less colour and the UI texture — and the
-        // proxy's back buffer only supplies the presentation target: without
-        // this tag XeSS-FG has no colour to interpolate and composites no UI,
-        // which reads on screen as "the whole HUD vanished".
-        let hudless = XefgD3D12ResourceData {
-            resource_type: XEFG_SWAPCHAIN_RES_HUDLESS_COLOR,
-            validity: XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT,
-            resource_base: Xefg2d { x: 0, y: 0 },
-            resource_size: Xefg2d {
-                x: width,
-                y: height,
-            },
-            resource: self.compose.resource.as_mut_ptr() as *mut c_void,
-            incoming_state: D3D12_STATE_PIXEL_COMPUTE_READ,
-        };
-        let rc = unsafe {
-            (self.loader.tag_frame_resource)(
-                self.loader.context,
-                std::ptr::null_mut(),
-                id,
-                &hudless,
-            )
-        };
-        if rc != 0 {
-            super::diag(&format!(
-                "[XeSS FG] tagging the HUD-less colour failed ({}); UI composition will be missing",
-                xefg_result_name(rc)
-            ));
-        }
-
-        // --- Tag the UI texture so generated frames composite it sharp.
-        if ui_visible {
-            let data = XefgD3D12ResourceData {
-                resource_type: XEFG_SWAPCHAIN_RES_UI,
-                validity: XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT,
-                resource_base: Xefg2d { x: 0, y: 0 },
-                resource_size: Xefg2d {
-                    x: width,
-                    y: height,
-                },
-                resource: self.ui.resource.as_mut_ptr() as *mut c_void,
-                incoming_state: D3D12_STATE_PIXEL_COMPUTE_READ,
-            };
-            let rc = unsafe {
-                (self.loader.tag_frame_resource)(
-                    self.loader.context,
-                    std::ptr::null_mut(),
-                    id,
-                    &data,
-                )
-            };
-            if rc != 0 {
-                super::diag(&format!(
-                    "[XeSS FG] tagging the UI resource failed ({}); UI may be missing from generated frames",
-                    xefg_result_name(rc)
+        let slot_index = self.ring.acquire("XeSS FG")?;
+        let list_ptr = {
+            let list = &mut self.ring.slot_mut(slot_index).list;
+            let mut barriers = vec![
+                barrier(
+                    &self.compose.resource,
+                    D3D12_STATE_RENDER_TARGET,
+                    D3D12_STATE_COPY_SRC,
+                ),
+                barrier(&backbuffer, D3D12_STATE_PRESENT, D3D12_STATE_COPY_DEST),
+            ];
+            if ui_visible {
+                barriers.push(barrier(
+                    &self.ui.resource,
+                    D3D12_STATE_RENDER_TARGET,
+                    D3D12_STATE_COPY_SRC,
                 ));
             }
+            list.resource_barrier(&barriers);
+            // The d3d12 crate has no safe `CopyResource` wrapper, so call the
+            // COM method on the underlying raw interface directly.
+            unsafe {
+                (*list.as_mut_ptr())
+                    .CopyResource(backbuffer.as_mut_ptr(), self.compose.resource.as_mut_ptr());
+            }
+            list.as_mut_ptr() as *mut c_void
+        };
+        unsafe {
+            tag_frame_resource_now(
+                self.loader.tag_frame_resource,
+                self.loader.context,
+                list_ptr,
+                id,
+                XEFG_SWAPCHAIN_RES_HUDLESS_COLOR,
+                self.compose.resource.as_mut_ptr() as *mut c_void,
+                (width, height),
+                D3D12_STATE_COPY_SRC,
+            )?;
+            if ui_visible {
+                tag_frame_resource_now(
+                    self.loader.tag_frame_resource,
+                    self.loader.context,
+                    list_ptr,
+                    id,
+                    XEFG_SWAPCHAIN_RES_UI,
+                    self.ui.resource.as_mut_ptr() as *mut c_void,
+                    (width, height),
+                    D3D12_STATE_COPY_SRC,
+                )?;
+            }
         }
+        {
+            let list = &mut self.ring.slot_mut(slot_index).list;
+            let mut restore = vec![
+                barrier(
+                    &self.compose.resource,
+                    D3D12_STATE_COPY_SRC,
+                    D3D12_STATE_RENDER_TARGET,
+                ),
+                barrier(&backbuffer, D3D12_STATE_COPY_DEST, D3D12_STATE_PRESENT),
+            ];
+            if ui_visible {
+                restore.push(barrier(
+                    &self.ui.resource,
+                    D3D12_STATE_COPY_SRC,
+                    D3D12_STATE_RENDER_TARGET,
+                ));
+            }
+            list.resource_barrier(&restore);
+        }
+        self.ring.retire(slot_index, &self.queue, "XeSS FG")?;
 
         // --- Present id and markers.
         let rc = unsafe { (self.loader.set_present_id)(self.loader.context, id) };
@@ -1192,6 +1174,22 @@ impl XessFrameGeneration {
             super::diag(&format!(
                 "[XeSS FG] interpolation reported {} on the last present",
                 xefg_result_name(status.frame_gen_result)
+            ));
+        }
+        // One-off visibility for retests: 2 frames per Present means the SDK is
+        // really interpolating, 1 means it is passing our frame straight
+        // through. A black-frame report is impossible to triage without this.
+        if rc == 0 && self.frames < 3 {
+            super::diag(&format!(
+                "[XeSS FG] present id {}: {} frame(s) presented, generation {}, frame generation {}",
+                id,
+                status.frames_presented,
+                xefg_result_name(status.frame_gen_result),
+                if status.is_frame_gen_enabled != 0 {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             ));
         }
 
