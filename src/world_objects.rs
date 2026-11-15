@@ -96,7 +96,10 @@ impl WorldCullIndex {
         let mut index = Self::default();
         for (order_index, bounds) in bounds.iter().copied().enumerate() {
             match bounds.filter(|bounds| valid_bounds(*bounds)) {
-                Some(bounds) => index.items.push(SpatialItem { order_index, bounds }),
+                Some(bounds) => index.items.push(SpatialItem {
+                    order_index,
+                    bounds,
+                }),
                 None => index.always_visible.push(order_index),
             }
         }
@@ -140,8 +143,7 @@ impl WorldCullIndex {
 }
 
 fn valid_bounds(bounds: [f32; 6]) -> bool {
-    bounds.iter().all(|v| v.is_finite())
-        && (0..3).all(|axis| bounds[axis] <= bounds[axis + 3])
+    bounds.iter().all(|v| v.is_finite()) && (0..3).all(|axis| bounds[axis] <= bounds[axis + 3])
 }
 
 fn build_cull_node(
@@ -150,8 +152,14 @@ fn build_cull_node(
     first: usize,
     end: usize,
 ) -> usize {
-    let mut bounds = [f32::INFINITY, f32::INFINITY, f32::INFINITY,
-        f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+    let mut bounds = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
     for item in &items[first..end] {
         for axis in 0..3 {
             bounds[axis] = bounds[axis].min(item.bounds[axis]);
@@ -159,16 +167,20 @@ fn build_cull_node(
         }
     }
     let index = nodes.len();
-    nodes.push(CullNode { bounds, left: 0, right: 0, first: 0, end: 0 });
+    nodes.push(CullNode {
+        bounds,
+        left: 0,
+        right: 0,
+        first: 0,
+        end: 0,
+    });
     if end - first <= 8 {
         nodes[index].first = first;
         nodes[index].end = end;
         return index;
     }
     let axis = (0..3)
-        .max_by(|&a, &b| {
-            (bounds[a + 3] - bounds[a]).total_cmp(&(bounds[b + 3] - bounds[b]))
-        })
+        .max_by(|&a, &b| (bounds[a + 3] - bounds[a]).total_cmp(&(bounds[b + 3] - bounds[b])))
         .unwrap();
     items[first..end].sort_unstable_by(|a, b| {
         let ac = a.bounds[axis] + a.bounds[axis + 3];
@@ -711,7 +723,9 @@ fn run(
                     atlas_bytes += atlas_mip_bytes(finished.used_height);
                     remember_atlas(&finished, pages, &mut shared_slots);
                     pages += 1;
-                    if send_page(&tx, pages - 1, finished.page(id), &mut ordered_placements).is_err() {
+                    if send_page(&tx, pages - 1, finished.page(id), &mut ordered_placements)
+                        .is_err()
+                    {
                         return Ok(());
                     }
                 }
@@ -727,7 +741,9 @@ fn run(
                             Builder::shared(shared.source, shared.height),
                         );
                         pages += 1;
-                        if send_page(&tx, pages - 1, ready.page(id), &mut ordered_placements).is_err() {
+                        if send_page(&tx, pages - 1, ready.page(id), &mut ordered_placements)
+                            .is_err()
+                        {
                             return Ok(());
                         }
                     }
@@ -739,7 +755,9 @@ fn run(
                         atlas_bytes += atlas_mip_bytes(finished.used_height);
                         remember_atlas(&finished, pages, &mut shared_slots);
                         pages += 1;
-                        if send_page(&tx, pages - 1, finished.page(id), &mut ordered_placements).is_err() {
+                        if send_page(&tx, pages - 1, finished.page(id), &mut ordered_placements)
+                            .is_err()
+                        {
                             return Ok(());
                         }
                     }
@@ -807,9 +825,8 @@ fn run(
             return Ok(());
         }
     }
-    ordered_placements.sort_unstable_by_key(|placement| {
-        (placement.order, placement.page, placement.range)
-    });
+    ordered_placements
+        .sort_unstable_by_key(|placement| (placement.order, placement.page, placement.range));
     let world_order: Vec<_> = ordered_placements
         .iter()
         .map(|placement| (placement.page, placement.range))
