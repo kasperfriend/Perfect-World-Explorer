@@ -244,8 +244,8 @@ struct O {@builtin(position) p:vec4<f32>,@location(0) uv:vec2<f32>};
     queue.submit(Some(e.finish()));
     let time = 0.3f32;
     post.render(
-        &device, &queue, &tv, &dv, false, 64, 64, time, 100., 1., fog, false, false, false, 0., [0.; 6],
-        false, 41.,
+        &device, &queue, &tv, &dv, false, 64, 64, time, 100., 1., fog, false, false, false, 0.,
+        [0.; 6], false, 41.,
     );
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
