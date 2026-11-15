@@ -153,6 +153,10 @@ pub struct World {
     /// outside the resident terrain window, or outside its day/night window.
     census: [usize; 3],
     resident_bounds: Option<[f32; 4]>,
+    /// Slot indices inside the current terrain window. Rebuilt only when the
+    /// window changes so steady-state pose, upload and alpha work avoid walking
+    /// every placement in a whole-world map.
+    resident_slots: Vec<usize>,
     /// Retail alpha insertion order as (slot, mesh) pairs.
     alpha: Vec<model_queue::AlphaCandidate>,
     reported: Vec<String>,
@@ -215,6 +219,7 @@ impl World {
                 vertex_fog: None,
             })
             .collect();
+        let resident_slots = (0..assets.instances.len()).collect();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("ordinary model wrap sampler"),
             address_mode_u: wgpu::AddressMode::Repeat,
@@ -246,6 +251,7 @@ impl World {
             effect_distance: 0.,
             census: [0; 3],
             resident_bounds: None,
+            resident_slots,
             alpha: Vec::new(),
             reported: Vec::new(),
         })
@@ -556,8 +562,12 @@ impl World {
             return;
         }
         self.resident_bounds = bounds;
-        for (instance, slot) in self.assets.instances.iter().zip(&mut self.slots) {
-            if !cutoff_residency::contains(bounds, instance.placement.position) {
+        self.resident_slots.clear();
+        for (index, instance) in self.assets.instances.iter().enumerate() {
+            if cutoff_residency::contains(bounds, instance.placement.position) {
+                self.resident_slots.push(index);
+            } else {
+                let slot = &mut self.slots[index];
                 slot.draw = None;
                 slot.posed = None;
                 slot.geometry_dirty = true;
@@ -659,15 +669,15 @@ impl World {
             return;
         }
         let (x, z, radius) = self.view.unwrap_or((0., 0., -1.));
+        let bounds = self.resident_bounds;
         let mut census = [0usize; 3];
-        let updates: Vec<(u64, bool)> = self
-            .producers
-            .iter()
-            .map(|producer| {
+        {
+            let (producers, owners) = (&self.producers, &mut self.owners);
+            for producer in producers {
                 let dx = producer.position[0] - x;
                 let dz = producer.position[2] - z;
                 let near = dx * dx + dz * dz <= radius * radius;
-                let resident = cutoff_residency::contains(self.resident_bounds, producer.position);
+                let resident = cutoff_residency::contains(bounds, producer.position);
                 let visible = match producer.valid_time {
                     Some(mode) => crate::scene::effect_visible(mode, night),
                     None => true,
@@ -681,13 +691,10 @@ impl World {
                 if !visible {
                     census[2] += 1;
                 }
-                (producer.identity, near && resident && visible)
-            })
-            .collect();
-        self.census = census;
-        for (identity, active) in updates {
-            self.owners.set_active(identity, active);
+                owners.set_active(producer.identity, near && resident && visible);
+            }
         }
+        self.census = census;
         self.apply_attenuation(delta_ms, eye);
     }
     /// Ramp every attenuating root's alpha toward "visible inside the retail
@@ -1024,15 +1031,15 @@ impl World {
     /// 0x7b2520 resolves hooks from this pose, and every pass of the frame
     /// (main, reflection, refraction) reuses it.
     fn advance_poses(&mut self, delta_ms: u32) {
-        let bounds = self.resident_bounds;
-        for (instance, slot) in self.assets.instances.iter_mut().zip(&mut self.slots) {
-            if !cutoff_residency::contains(bounds, instance.placement.position) {
-                continue;
-            }
+        let (assets, slots, resident_slots) =
+            (&mut self.assets, &mut self.slots, &self.resident_slots);
+        for &index in resident_slots {
+            let instance = &mut assets.instances[index];
+            let slot = &mut slots[index];
             if slot.failed {
                 continue;
             }
-            let asset = &self.assets.assets[instance.asset];
+            let asset = &assets.assets[instance.asset];
             let sample = match instance.playback.as_mut() {
                 Ok(clock) => {
                     if delta_ms != 0 {
@@ -1133,10 +1140,10 @@ impl World {
         frame: Frame,
         night: f32,
     ) {
-        let bounds = self.resident_bounds;
         let Self {
             assets,
             slots,
+            resident_slots,
             read,
             textures,
             receivers,
@@ -1146,10 +1153,9 @@ impl World {
             reported,
             ..
         } = self;
-        for (instance, slot) in assets.instances.iter().zip(slots.iter_mut()) {
-            if !cutoff_residency::contains(bounds, instance.placement.position) {
-                continue;
-            }
+        for &index in resident_slots.iter() {
+            let instance = &assets.instances[index];
+            let slot = &mut slots[index];
             if slot.failed {
                 continue;
             }
@@ -1186,7 +1192,8 @@ impl World {
     fn rebuild_alpha_order(&mut self, eye: [f32; 3]) {
         let mut candidates: Vec<model_queue::AlphaCandidate> = Vec::new();
         let mut failures: Vec<(usize, String)> = Vec::new();
-        for (slot, entry) in self.slots.iter().enumerate() {
+        for &slot in &self.resident_slots {
+            let entry = &self.slots[slot];
             let Some(draw) = &entry.draw else {
                 continue;
             };
