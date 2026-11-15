@@ -24,9 +24,12 @@ google_drive/
 # Lossless runtime terrain backing store (rebuildable client data)
 /cache/
 
-# Vendored AMD FSR SDK 2.4.0 DX12 runtime (MIT, redistributable with notice;
-# see THIRD_PARTY_NOTICES.md). Everything else under sdk/ stays ignored —
-# NVIDIA proprietary DLLs are never committed, and any other vendor files stay out.
+# Vendored vendor runtimes: AMD FidelityFX SDK 2.4.0 DX12 (MIT-style), Intel
+# XeSS SDK 3.0.2 and NVIDIA DLSS/NGX (unmodified runtime DLLs from
+# https://github.com/NVIDIA/DLSS under the NVIDIA RTX SDKs License). Each
+# vendor's license text is vendored beside its binaries and
+# THIRD_PARTY_NOTICES.md records the SHA-256 of every file. Everything else
+# under sdk/ stays ignored — Streamline's sl.*.dll included.
 /sdk/*
 !/sdk/amd_fidelityfx_loader_dx12.dll
 !/sdk/amd_fidelityfx_upscaler_dx12.dll
@@ -47,6 +50,13 @@ google_drive/
 !/sdk/libxess.dll
 !/sdk/libxess_fg.dll
 !/sdk/libxell.dll
+!/sdk/nvngx_dlss.dll
+!/sdk/nvngx_dlssg.dll
+!/sdk/NVIDIA_DLSS-SDK-LICENSE.txt
+# The NGX headers the DLSS FFI was written against (same repository and
+# license); kept for review and for tools/verify-vendor-sdks.py.
+!/sdk/include/nvidia/
+!/sdk/include/nvidia/**
 !/sdk/Intel_XeSS-SDK-3.0.2-LICENSE.txt
 !/sdk/Intel_XeSS-SDK-3.0.2-third-party-programs.txt
 # The Intel XeSS headers the FFI integration was written against (XeSS SDK

@@ -82,7 +82,7 @@ mod fg;
 #[cfg(windows)]
 mod imp;
 #[cfg(windows)]
-mod loader;
+pub(crate) mod loader;
 #[cfg(windows)]
 pub(crate) mod xell;
 #[cfg(windows)]

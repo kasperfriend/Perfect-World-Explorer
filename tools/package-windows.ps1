@@ -58,7 +58,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $packageRoot 'THIRD_PARTY_NOTICES.md
     throw "Staging did not produce THIRD_PARTY_NOTICES.md in $packageRoot"
 }
 
-# Vendored runtime DLLs. Two vendors ship redistributable binaries *inside*
+# Vendored runtime DLLs. Three vendors ship redistributable binaries *inside*
 # this repository under sdk/:
 #   * AMD FidelityFX SDK 2.4.0 DX12 (MIT-style; sdk/AMD_FidelityFX-SDK-2.4.0-LICENSE.md)
 #   * Intel XeSS SDK 3.0.2: libxess.dll (super resolution), libxess_fg.dll
@@ -66,6 +66,11 @@ if (-not (Test-Path -LiteralPath (Join-Path $packageRoot 'THIRD_PARTY_NOTICES.md
 #     every GPU and used by the Graphics -> Latency -> XeLL mode). Intel
 #     Simplified Software License; see sdk/Intel_XeSS-SDK-3.0.2-LICENSE.txt and
 #     sdk/Intel_XeSS-SDK-3.0.2-third-party-programs.txt.
+#   * NVIDIA DLSS / NGX: nvngx_dlss.dll (super resolution) and nvngx_dlssg.dll
+#     (frame generation), from the official NVIDIA/DLSS repository
+#     (lib/Windows_x86_64/rel/). NVIDIA RTX SDKs License; see
+#     sdk/NVIDIA_DLSS-SDK-LICENSE.txt. No other NVIDIA binary (Streamline's
+#     sl.*.dll included) is ever staged.
 # They are staged into every package by default unless the caller passes
 # -SdkDirectory (an explicit folder then takes precedence) or a file is absent.
 $vendoredSdk = Join-Path $repoRoot 'sdk'
@@ -76,19 +81,25 @@ if ([string]::IsNullOrWhiteSpace($SdkDirectory) -and (Test-Path -LiteralPath $ve
         'amd_fidelityfx_framegeneration_dx12.dll',
         'libxess.dll',
         'libxess_fg.dll',
-        'libxell.dll'
+        'libxell.dll',
+        'nvngx_dlss.dll',
+        'nvngx_dlssg.dll'
     )
     $sdkTarget = Join-Path $packageRoot 'sdk'
     New-Item -ItemType Directory -Force -Path $sdkTarget | Out-Null
     $stagedVendored = 0
     $stagedAmdVendored = 0
     $stagedIntelVendored = 0
+    $stagedNvidiaVendored = 0
     foreach ($name in $vendoredAllowlist) {
         $source = Join-Path $vendoredSdk $name
         if (Test-Path -LiteralPath $source -PathType Leaf) {
             Copy-Item -LiteralPath $source -Destination (Join-Path $sdkTarget $name)
             $stagedVendored++
-            if ($name -like 'libxess*' -or $name -eq 'libxell.dll') {
+            if ($name -like 'nvngx_*') {
+                $stagedNvidiaVendored++
+                Write-Host "Staged vendored NVIDIA DLSS/NGX binary: sdk/$name"
+            } elseif ($name -like 'libxess*' -or $name -eq 'libxell.dll') {
                 $stagedIntelVendored++
                 Write-Host "Staged vendored Intel XeSS/XeLL binary: sdk/$name"
             } else {
@@ -109,6 +120,9 @@ if ([string]::IsNullOrWhiteSpace($SdkDirectory) -and (Test-Path -LiteralPath $ve
         }
         if ($stagedIntelVendored -gt 0) {
             $extras += @('Intel_XeSS-SDK-3.0.2-LICENSE.txt', 'Intel_XeSS-SDK-3.0.2-third-party-programs.txt')
+        }
+        if ($stagedNvidiaVendored -gt 0) {
+            $extras += @('NVIDIA_DLSS-SDK-LICENSE.txt')
         }
         foreach ($extra in $extras) {
             $extraPath = Join-Path $vendoredSdk $extra
@@ -139,11 +153,15 @@ if (-not [string]::IsNullOrWhiteSpace($SdkDirectory)) {
         'libxess_fg.dll',
         'libxell.dll'
     )
+    $nvidiaNames = @(
+        'nvngx_dlss.dll',
+        'nvngx_dlssg.dll'
+    )
     $forbidden = @(Get-ChildItem -LiteralPath $sdkRoot -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '(?i)^(nvngx.*|sl\..*)\.dll$' })
+        Where-Object { $_.Name -match '(?i)^(nvngx.*|sl\..*)\.dll$' -and ($_.Name -notin $nvidiaNames) })
     if ($forbidden.Count -gt 0) {
         $names = ($forbidden | ForEach-Object { $_.Name } | Sort-Object) -join ', '
-        throw "The SDK folder contains NVIDIA proprietary DLLs ($names). This script never stages them; remove them or review and stage them manually under the NVIDIA DLSS license (see THIRD_PARTY_NOTICES.md)."
+        throw "The SDK folder contains NVIDIA DLLs this script never stages ($names). Only nvngx_dlss.dll and nvngx_dlssg.dll are allowed, under the NVIDIA RTX SDKs License (see THIRD_PARTY_NOTICES.md)."
     }
     $sdkTarget = Join-Path $packageRoot 'sdk'
     New-Item -ItemType Directory -Force -Path $sdkTarget | Out-Null
@@ -170,6 +188,17 @@ if (-not [string]::IsNullOrWhiteSpace($SdkDirectory)) {
             Write-Host "Staged Intel Simplified Software License SDK binary: sdk/$name"
         }
     }
+    $stagedNvidia = 0
+    foreach ($name in $nvidiaNames) {
+        $source = Get-ChildItem -LiteralPath $sdkRoot -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -ne $source) {
+            Copy-Item -LiteralPath $source.FullName -Destination (Join-Path $sdkTarget $name)
+            $staged++
+            $stagedNvidia++
+            Write-Host "Staged NVIDIA RTX SDKs License binary: sdk/$name"
+        }
+    }
     if ($staged -eq 0) {
         Remove-Item -LiteralPath $sdkTarget -Force
         Write-Host "No allowlisted vendor SDK DLLs found under $sdkRoot; nothing staged."
@@ -183,6 +212,9 @@ if (-not [string]::IsNullOrWhiteSpace($SdkDirectory)) {
         if ($stagedIntel -gt 0) {
             $extras += @('Intel_XeSS-SDK-3.0.2-LICENSE.txt', 'Intel_XeSS-SDK-3.0.2-third-party-programs.txt')
         }
+        if ($stagedNvidia -gt 0) {
+            $extras += @('NVIDIA_DLSS-SDK-LICENSE.txt')
+        }
         foreach ($extra in $extras) {
             $extraPath = Join-Path $vendoredSdk $extra
             if (Test-Path -LiteralPath $extraPath -PathType Leaf) {
@@ -192,13 +224,14 @@ if (-not [string]::IsNullOrWhiteSpace($SdkDirectory)) {
     }
 }
 
-# Hard stop regardless of staging mode: NVIDIA proprietary runtime DLLs must
-# never enter the package.
+# Hard stop regardless of staging mode: no NVIDIA binary other than the two
+# vendored DLSS DLLs may enter the package (Streamline's sl.*.dll included).
+$nvidiaAllowed = @('nvngx_dlss.dll', 'nvngx_dlssg.dll')
 $nvidiaBinaries = @(Get-ChildItem -LiteralPath $packageRoot -Recurse -File |
-    Where-Object { $_.Name -match '(?i)^(nvngx.*|sl\..*)\.dll$' })
+    Where-Object { $_.Name -match '(?i)^(nvngx.*|sl\..*)\.dll$' -and ($_.Name -notin $nvidiaAllowed) })
 if ($nvidiaBinaries.Count -gt 0) {
     $names = ($nvidiaBinaries | ForEach-Object { $_.FullName }) -join ', '
-    throw "Package contains NVIDIA proprietary DLLs: $names"
+    throw "Package contains NVIDIA DLLs that are not vendored here: $names"
 }
 
 # Keep checksums with the portable folder. No development/survey executables

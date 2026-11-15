@@ -4,8 +4,10 @@ Vendor SDK drop-in folder
 Windows + DX12 builds load the vendor DLLs out of this folder (next to the
 executable, or `<repo>/sdk` for cargo builds, or the folder in Settings ->
 Graphics -> "Upscale SDK folder", or the `PW_UPSCALER_SDK_DIR` environment
-variable). Both SDKs the viewer can actually drive are vendored here; NVIDIA
-DLSS/Streamline binaries are never committed and never staged (see
+variable). All three SDKs the viewer drives are vendored here, including the
+NVIDIA DLSS/NGX binaries (`nvngx_dlss.dll`, `nvngx_dlssg.dll`, under the NVIDIA
+RTX SDKs License in `NVIDIA_DLSS-SDK-LICENSE.txt`); Streamline's `sl.*.dll` is
+never committed and never staged (see
 THIRD_PARTY_NOTICES.md).
 
 Check the wiring at any time with:

@@ -1,4 +1,5 @@
-//! Shared LoadLibraryW/GetProcAddress helper for the Intel XeSS SDK DLLs.
+//! Shared LoadLibraryW/GetProcAddress helper for the vendor upscaling SDK
+//! DLLs (Intel XeSS, NVIDIA NGX).
 //!
 //! The DLLs live in the same SDK directory the probe scanned (Settings →
 //! `upscale_sdk_dir`, `PW_UPSCALER_SDK_DIR`, or `<exe>\sdk\`). Nothing is

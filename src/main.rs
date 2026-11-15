@@ -50,6 +50,7 @@ mod environment;
 mod far_trees_gpu;
 mod fog_matrix;
 mod foliage_mips;
+mod dlss;
 mod fsr;
 mod fsr1_gpu;
 #[allow(dead_code)]
@@ -827,8 +828,9 @@ fn export_height_png(
 //
 // The gating, settings and SDK-probe logic below is real and unit-tested.
 // The vendor SDK calls live in gpu.rs (the render loop owns the device):
-// FSR is integrated there; DLSS and XeSS are not. The parts that are
-// implemented for real:
+// FSR, XeSS, DLSS and the three frame generators are integrated there
+// (`src/fsr`, `src/xess`, `src/dlss`). The parts that are implemented for
+// real:
 //
 // * the option state machine and the settings tokens (`upscaling`,
 //   `upscale_quality`, `frame_generation`, `upscale_sdk_dir`);

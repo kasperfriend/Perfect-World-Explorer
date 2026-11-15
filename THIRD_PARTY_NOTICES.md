@@ -2,11 +2,12 @@
 
 Perfect World Explorer is licensed **GPL-2.0-or-later** (see [LICENSE](LICENSE)).
 
-This file covers the **optional** GPU-upscaling and frame-generation SDK
-technologies that Settings → Graphics can use. **None of the vendor SDK
-binaries are distributed with this repository or with the viewer packages.**
-Every option is disabled with a visible reason until you supply the SDKs
-yourself; see [README](README.md#upscaling-and-frame-generation-optional) and
+This file covers the GPU-upscaling and frame-generation SDK technologies that
+Settings → Graphics can use. The runtime DLLs of **all three** vendors are
+vendored in `sdk/` under the licenses below (AMD FidelityFX, Intel XeSS/XeLL,
+NVIDIA DLSS/NGX) and are staged into every viewer package; each DLL's license
+text ships beside it. See
+[README](README.md#upscaling-and-frame-generation-optional) and
 [docs/blockers.md](docs/blockers.md).
 
 Versions below are the ones this build was documented against at the time of
@@ -27,13 +28,15 @@ it, not this page, is authoritative for your copy.
 3. Run `perfect-world-explorer --diagnose-upscale --sdk-dir <path>`
    and `perfect-world-explorer --diagnose-framegen --sdk-dir <path>`
    to see what was detected.
-4. `.gitignore` ignores `*.dll` and `/sdk/`, then un-ignores exactly the two
-   redistributable sets described below (AMD FidelityFX and Intel
-   XeSS/XeSS-FG/XeLL) plus the headers and licenses that go with them. Nothing
-   else under `sdk/` can be committed, and NVIDIA binaries never are.
+4. `.gitignore` ignores `*.dll` and `/sdk/`, then un-ignores exactly the
+   vendored sets described below (AMD FidelityFX, Intel XeSS/XeSS-FG/XeLL and
+   NVIDIA `nvngx_dlss.dll` / `nvngx_dlssg.dll`) plus the headers and licenses
+   that go with them. Nothing else under `sdk/` can be committed — in
+   particular no Streamline `sl.*.dll`.
    `tools/package-windows.ps1` stages only those allowlisted files, and
    `tools/verify-vendor-sdks.py` fails if the allowlist, the probe in
-   `src/main.rs` and the loaders in `src/xess/` and `src/fsr/` ever disagree.
+   `src/main.rs` and the loaders in `src/xess/`, `src/fsr/` and `src/dlss/`
+   ever disagree.
 
 Expected file names probed (names vary between SDK releases; the diagnostics
 print exactly which names were found):
@@ -56,27 +59,35 @@ print exactly which names were found):
   for RTX GPUs. DLSS Super Resolution raises internal render resolution; DLAA
   runs DLSS at native resolution; DLSS Frame Generation synthesises a
   presented frame between each rendered frame.
-- **License:** proprietary — the *NVIDIA DLSS SDK* is distributed to
-  registered developers and is governed by the NVIDIA Software License
-  Agreement / DLSS SDK license terms included with your download. It is not
-  open source.
-- **Redistribution:** historically, NVIDIA's DLSS terms permit redistribution
-  of the unmodified runtime DLLs (`nvngx_dlss.dll`, `nvngx_dlssg.dll`) as part
-  of an application that uses the SDK. **This package does not include them.**
-  Do not copy them into a release without reading the license in your SDK
-  download; if your license does not grant you redistribution rights, users
-  must supply the DLLs themselves. `tools/package-windows.ps1` never stages
-  NVIDIA proprietary binaries (it refuses to package any `nvngx*.dll` or
-  `sl.*.dll`).
+- **License:** proprietary, not open source. The unmodified runtime DLLs are
+  redistributed under the **NVIDIA RTX SDKs License**, the text of which is
+  vendored verbatim at [`sdk/NVIDIA_DLSS-SDK-LICENSE.txt`](sdk/NVIDIA_DLSS-SDK-LICENSE.txt)
+  and shipped inside every package next to the binaries.
+- **Redistribution:** both DLLs are taken unmodified from the official
+  [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) repository, directory
+  `lib/Windows_x86_64/rel/`, and are staged into the package by
+  `tools/package-windows.ps1` together with that license text. No other NVIDIA
+  binary is redistributed: Streamline (`sl.*.dll`) and every other `nvngx*.dll`
+  are still refused by both the ignore rules and the packaging script.
+- **Provenance and integrity:** recorded in
+  [`tools/verify-vendor-sdks.py`](tools/verify-vendor-sdks.py), which checks
+  the size, the SHA-256 and the export table of each DLL on every CI run:
+
+  | File | Source | Size | SHA-256 |
+  |---|---|---|---|
+  | `nvngx_dlss.dll` | `NVIDIA/DLSS` `lib/Windows_x86_64/rel/` (git blob `23c4672e…`) | 58,956,912 B | `d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e` |
+  | `nvngx_dlssg.dll` | `NVIDIA/DLSS` `lib/Windows_x86_64/rel/` (git blob `71b8070c…`) | 7,506,544 B | `8d59d49b36410dd6b62fef2503a5871d347415bd85d943fa0848563a95dd50c7` |
+
+  The matching SDK headers (`nvsdk_ngx*.h`, NGX API version `0x15` = 1.5.0)
+  are vendored under `sdk/include/nvidia/` for review; the viewer loads the two
+  DLLs directly with `LoadLibraryW` and uses NGX's snippet ABI, so no NVIDIA
+  SDK library is linked in.
 - **Attribution:** "NVIDIA", "DLSS", "DLSS Super Resolution", "DLSS Frame
   Generation", "DLAA" and the NVIDIA logo are trademarks and/or registered
   trademarks of NVIDIA Corporation. "DLSS" technology is powered by NVIDIA RTX.
-- **Where to get it:** <https://developer.nvidia.com/rtx/dlss> (developer
-  registration required). `sl.interposer.dll` et al. come from the Streamline
-  SDK: <https://github.com/NVIDIA/Streamline>.
-- **Version documented against:** DLSS SDK 3.x with Streamline 2.x (DLSS SR +
-  DLSS-G, RTX 40 series required for frame generation). Unverified in this
-  build environment.
+- **Where to get it:** <https://github.com/NVIDIA/DLSS> (the same repository the
+  vendored files came from); the registered-developer SDK page remains
+  <https://developer.nvidia.com/rtx/dlss>.
 
 ## AMD FidelityFX SDK — FSR (upscaling) and FSR Frame Generation
 
@@ -119,9 +130,9 @@ print exactly which names were found):
 
   They are signed by AMD and are MIT-style licensed, so committing and
   redistributing them with this notice is permitted. The loader DLL is
-  required at runtime; the effect DLLs are dispatched through it. Any Intel
-  XeSS or NVIDIA binaries remain user-supplied; the packaging script never
-  stages NVIDIA binaries.
+  required at runtime; the effect DLLs are dispatched through it. The Intel
+  and NVIDIA runtime DLLs are vendored too, each under its own license (see
+  the sections below), and the packaging script stages exactly those files.
 - **Attribution:** "FidelityFX", "FSR", "FidelityFX Super Resolution" are
   trademarks of Advanced Micro Devices, Inc.
 - **Where to get it:** <https://gpuopen.com/fidelityfx-sdk/> and
@@ -200,8 +211,7 @@ print exactly which names were found):
 
   `python3 tools/verify-vendor-sdks.py` re-checks those hashes, the PE export
   tables (every symbol the viewer resolves with `GetProcAddress`) and the
-  numeric constants against the vendored headers. NVIDIA binaries are never
-  staged or committed.
+  numeric constants against the vendored headers.
 - **Attribution:** "XeSS", "XeLL" and "Intel Arc" are trademarks of Intel
   Corporation. Intel XeSS SR technology.
 - **Where it comes from:** the official `v3.0.2` release of the XeSS SDK —

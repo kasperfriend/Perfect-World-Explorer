@@ -2,7 +2,8 @@
 """Verify the vendored upscaling SDKs against the code that loads them.
 
 There is no Windows/DX12 machine (and no GPU) in the development environment,
-so the XeSS / XeFG / XeLL / FSR integration cannot be *run* here. What can be
+so the XeSS / XeFG / XeLL / FSR / DLSS / DLSS-G integration cannot be *run*
+here. What can be
 checked mechanically is everything up to the driver call:
 
 1. Presence, size and SHA-256 of every runtime DLL the viewer names, and that
@@ -44,6 +45,8 @@ EXPECTED_DLLS = {
     "amd_fidelityfx_loader_dx12.dll": "AMD_FidelityFX-SDK-2.4.0-LICENSE.md",
     "amd_fidelityfx_upscaler_dx12.dll": "AMD_FidelityFX-SDK-2.4.0-LICENSE.md",
     "amd_fidelityfx_framegeneration_dx12.dll": "AMD_FidelityFX-SDK-2.4.0-LICENSE.md",
+    "nvngx_dlss.dll": "NVIDIA_DLSS-SDK-LICENSE.txt",
+    "nvngx_dlssg.dll": "NVIDIA_DLSS-SDK-LICENSE.txt",
 }
 
 # Recorded from the Intel XeSS SDK 3.0.2 release (and the AMD FidelityFX SDK
@@ -54,6 +57,9 @@ KNOWN_SHA256 = {
     "libxess.dll": "251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7",
     "libxess_fg.dll": "ec5e0c65e075570c6ede72618bb666d0be0c2e10b2ea9762c0fe8cb8e375ab27",
     "libxell.dll": "d2030dcd694fda8f2ec7e044b13e6db8f0b56d4ba9113a5efad334e3f3ded8c7",
+    # NVIDIA/DLSS, lib/Windows_x86_64/rel/ (git blobs 23c4672e…, 71b8070c…).
+    "nvngx_dlss.dll": "d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e",
+    "nvngx_dlssg.dll": "8d59d49b36410dd6b62fef2503a5871d347415bd85d943fa0848563a95dd50c7",
 }
 
 # --- PE export table ------------------------------------------------------
@@ -219,6 +225,36 @@ HEADER_CONSTANTS = {
         "XEFG_SWAPCHAIN_RES_UI": ("xess_fg/xefg_swapchain.h", "XEFG_SWAPCHAIN_RES_UI"),
         "XEFG_LOGGING_LEVEL_INFO": ("xess_fg/xefg_swapchain.h", "XEFG_SWAPCHAIN_LOGGING_LEVEL_INFO"),
     },
+    "src/dlss/imp.rs": {
+        "NGX_QUALITY_MAX_PERF": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_PerfQuality_Value_MaxPerf"),
+        "NGX_QUALITY_BALANCED": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_PerfQuality_Value_Balanced"),
+        "NGX_QUALITY_MAX_QUALITY": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_PerfQuality_Value_MaxQuality"),
+        "NGX_QUALITY_ULTRA_PERFORMANCE": (
+            "nvidia/nvsdk_ngx_defs.h",
+            "NVSDK_NGX_PerfQuality_Value_UltraPerformance",
+        ),
+        "NGX_QUALITY_ULTRA_QUALITY": (
+            "nvidia/nvsdk_ngx_defs.h",
+            "NVSDK_NGX_PerfQuality_Value_UltraQuality",
+        ),
+        "NGX_QUALITY_DLAA": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_PerfQuality_Value_DLAA"),
+        "NGX_DLSS_FEATURE_DEPTH_INVERTED": (
+            "nvidia/nvsdk_ngx_defs.h",
+            "NVSDK_NGX_DLSS_Feature_Flags_DepthInverted",
+        ),
+    },
+    "src/dlss/loader.rs": {
+        "NGX_VERSION_API": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_VERSION_API_MACRO"),
+        "NGX_FEATURE_SUPER_SAMPLING": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_Feature_SuperSampling"),
+        "NGX_FEATURE_FRAME_GENERATION": (
+            "nvidia/nvsdk_ngx_defs.h",
+            "NVSDK_NGX_Feature_FrameGeneration",
+        ),
+    },
+    "src/dlss/params.rs": {
+        "NGX_SUCCESS": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_Result_Success"),
+        "NGX_FAIL": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_Result_Fail"),
+    },
 }
 
 INT_LITERAL = re.compile(r"^(?P<value>0x[0-9a-fA-F_]+|\d[\d_]*|\d\s*<<\s*\d+)$")
@@ -248,7 +284,14 @@ ENUM_MEMBER = re.compile(r"(?P<name>\w+)\s*(?:=\s*(?P<value>[^,\r\n]+))?")
 
 
 def header_constant_value(text: str, name: str) -> int | None:
-    """Resolve one enumerator, including implicitly numbered ones."""
+    """Resolve one enumerator (including implicitly numbered ones) or #define."""
+    define = re.search(
+        rf"^[ \t]*#[ \t]*define[ \t]+{re.escape(name)}[ \t]+(\S+)[ \t]*$", text, re.M
+    )
+    if define:
+        value = parse_int(define.group(1))
+        if value is not None:
+            return value
     for block in ENUM_BLOCK.finditer(text):
         running = -1
         for member in ENUM_MEMBER.finditer(block.group("body")):
