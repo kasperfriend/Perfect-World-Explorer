@@ -259,8 +259,8 @@ jobs:
               # expected and actual values on these lines.
               # The assert message itself, which carries the actual and
               # expected values, plus the panic location.
-              grep -A3 -E "panicked at" "/tmp/gpu-$1.log" \
-                | head -12 | while IFS= read -r line; do echo "::error::$1: $line"; done
+              tail -30 "/tmp/gpu-$1.log" \
+                | while IFS= read -r line; do echo "::error::$1: $line"; done
               exit 1
             fi
           }
