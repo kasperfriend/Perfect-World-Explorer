@@ -90,6 +90,7 @@ struct Slot {
     posed: Option<Result<SlotPose, String>>,
     geometry_dirty: bool,
     vertex_fog: Option<f32>,
+    visible: bool,
 }
 
 /// Per-frame alpha-pass diagnostics; see [`World::alpha_status`].
@@ -156,6 +157,7 @@ pub struct World {
     /// Retail alpha insertion order as (slot, mesh) pairs.
     alpha: Vec<model_queue::AlphaCandidate>,
     reported: Vec<String>,
+    frustum: Option<[[f32; 4]; 6]>,
 }
 
 impl World {
@@ -213,6 +215,7 @@ impl World {
                 posed: None,
                 geometry_dirty: true,
                 vertex_fog: None,
+                visible: true,
             })
             .collect();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -248,6 +251,7 @@ impl World {
             resident_bounds: None,
             alpha: Vec::new(),
             reported: Vec::new(),
+            frustum: None,
         })
     }
     /// A world with no model assets of its own.
@@ -263,6 +267,10 @@ impl World {
             Err(format!("no model archive attached: {path}"))
         })
         .expect("an empty world model set cannot be invalid")
+    }
+
+    pub fn set_frustum(&mut self, frustum: Option<[[f32; 4]; 6]>) {
+        self.frustum = frustum;
     }
     /// Attach the real GFX archive so installed producers can load their roots.
     /// Root text is GBK-decoded here; the owner manager never guesses an
@@ -1134,6 +1142,7 @@ impl World {
         night: f32,
     ) {
         let bounds = self.resident_bounds;
+        let frustum = self.frustum;
         let Self {
             assets,
             slots,
@@ -1148,11 +1157,20 @@ impl World {
         } = self;
         for (instance, slot) in assets.instances.iter().zip(slots.iter_mut()) {
             if !cutoff_residency::contains(bounds, instance.placement.position) {
+                slot.visible = false;
                 continue;
             }
             if slot.failed {
+                slot.visible = false;
                 continue;
             }
+            if let Some(planes) = frustum {
+                if !sphere_in_frustum(&planes, instance.placement.position, 128.0) {
+                    slot.visible = false;
+                    continue;
+                }
+            }
+            slot.visible = true;
             let asset = &assets.assets[instance.asset];
             let outcome = draw_one(
                 device,
@@ -1187,6 +1205,9 @@ impl World {
         let mut candidates: Vec<model_queue::AlphaCandidate> = Vec::new();
         let mut failures: Vec<(usize, String)> = Vec::new();
         for (slot, entry) in self.slots.iter().enumerate() {
+            if !entry.visible {
+                continue;
+            }
             let Some(draw) = &entry.draw else {
                 continue;
             };
@@ -1252,6 +1273,9 @@ impl World {
     /// Opaque meshes first, then the retail alpha list in its insertion order.
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         for slot in &self.slots {
+            if !slot.visible {
+                continue;
+            }
             if let Some(draw) = &slot.draw {
                 draw.draw_opaque(pass);
             }
@@ -1305,6 +1329,16 @@ impl World {
         }
         status
     }
+}
+
+fn sphere_in_frustum(planes: &[[f32; 4]; 6], center: [f32; 3], radius: f32) -> bool {
+    for &[a, b, c, d] in planes {
+        let len = (a * a + b * b + c * c).sqrt();
+        if len > 0.0 && a * center[0] + b * center[1] + c * center[2] + d < -radius * len {
+            return false;
+        }
+    }
+    true
 }
 
 /// Upload one slot's already-evaluated pose. Split out of `World::draw_models`
