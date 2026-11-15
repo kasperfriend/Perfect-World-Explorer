@@ -406,6 +406,26 @@ fn ffx_color_format(format: wgpu::TextureFormat) -> u32 {
     }
 }
 
+/// DXGI format for the FSR *output* UAV. D3D12 forbids
+/// D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS on _UNORM_SRGB formats
+/// (E_INVALIDARG), so the output must use the plain UNORM twins. The output
+/// is only ever sampled, so losing the sRGB view type costs nothing.
+fn ffx_output_format(format: wgpu::TextureFormat) -> u32 {
+    if is_bgra_format(format) {
+        FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM
+    } else {
+        FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM
+    }
+}
+
+pub(crate) fn dxgi_output_format(format: wgpu::TextureFormat) -> DXGI_FORMAT {
+    if is_bgra_format(format) {
+        DXGI_FORMAT_B8G8R8A8_UNORM
+    } else {
+        DXGI_FORMAT_R8G8B8A8_UNORM
+    }
+}
+
 pub(crate) fn dxgi_color_format(format: wgpu::TextureFormat) -> DXGI_FORMAT {
     if is_bgra_format(format) {
         DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
@@ -413,7 +433,6 @@ pub(crate) fn dxgi_color_format(format: wgpu::TextureFormat) -> DXGI_FORMAT {
         DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
     }
 }
-
 pub(crate) fn hr_ok(hr: winapi::shared::winerror::HRESULT) -> bool {
     hr >= 0
 }
@@ -460,8 +479,10 @@ impl NativeTexture2D {
             Type: d3d12_ty::D3D12_HEAP_TYPE_DEFAULT,
             CPUPageProperty: d3d12_ty::D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
             MemoryPoolPreference: d3d12_ty::D3D12_MEMORY_POOL_UNKNOWN,
-            CreationNodeMask: 1,
-            VisibleNodeMask: 1,
+            // 0, like wgpu's own committed resources — a non-zero node mask
+            // on a single-GPU adapter is rejected by some drivers.
+            CreationNodeMask: 0,
+            VisibleNodeMask: 0,
         };
         let mut resource_ptr: *mut d3d12_ty::ID3D12Resource = std::ptr::null_mut();
         let hr = raw_device.CreateCommittedResource(
@@ -474,6 +495,14 @@ impl NativeTexture2D {
             &mut resource_ptr as *mut *mut d3d12_ty::ID3D12Resource as *mut *mut c_void,
         );
         if !hr_ok(hr) || resource_ptr.is_null() {
+            super::diag(&format!(
+                "[FSR] CreateCommittedResource failed for {label}: extent {}x{}, dxgi_format 0x{:08x}, flags 0x{:08x}, initial_state 0x{:08x}",
+                size.0,
+                size.1,
+                dxgi_format as u32,
+                resource_flags as u32,
+                initial_state
+            ));
             return Err(format!(
                 "CreateCommittedResource failed for {label} (HRESULT 0x{hr:08x})"
             ));
@@ -699,16 +728,22 @@ impl FsrNatives {
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             D3D12_STATE_COMMON,
         )?;
+        // The UAV flag forbids _UNORM_SRGB formats (E_INVALIDARG), so the
+        // output resource is created with the plain UNORM twins, imported
+        // with the matching non-sRGB wgpu format, and starts life in
+        // COMMON (the one initial state D3D12 accepts for UAV resources
+        // besides UNORDERED_ACCESS itself). The first dispatch barrier
+        // promotes it to UNORDERED_ACCESS; steady state is unchanged.
         let output = NativeTexture2D::create(
             device,
             raw_device,
             "fsr output",
-            format,
-            dxgi_color_format(format),
+            format.remove_srgb_suffix(),
+            dxgi_output_format(format),
             display_extent,
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
-            D3D12_STATE_PIXEL_COMPUTE_READ,
+            D3D12_STATE_COMMON,
         )?;
         Ok(FsrNatives {
             color,
@@ -1213,6 +1248,14 @@ impl FsrUpscaler {
         let barrier = |resource: &d3d12::Resource, before: u32, after: u32| {
             d3d12::ResourceBarrier::transition(resource.clone(), subresource, before, after, none)
         };
+        // The output resource starts in COMMON on frame 0 (the one extra
+        // state D3D12 allows for UAV resources); afterwards the restore
+        // barrier below parks it in PIXEL_COMPUTE_READ.
+        let output_before = if self.frame_index == 0 {
+            D3D12_STATE_COMMON
+        } else {
+            D3D12_STATE_PIXEL_COMPUTE_READ
+        };
         let barriers = [
             barrier(
                 &self.natives.color.resource,
@@ -1231,7 +1274,7 @@ impl FsrUpscaler {
             ),
             barrier(
                 &self.natives.output.resource,
-                D3D12_STATE_PIXEL_COMPUTE_READ,
+                output_before,
                 D3D12_STATE_UNORDERED_ACCESS,
             ),
         ];
@@ -1269,7 +1312,7 @@ impl FsrUpscaler {
             transparency_and_composition: FfxApiResource::EMPTY,
             output: FfxApiResource::texture2d(
                 &self.natives.output.resource,
-                ffx_color_format(self.format),
+                ffx_output_format(self.format),
                 self.display_extent.0,
                 self.display_extent.1,
                 FFX_API_RESOURCE_USAGE_UAV,

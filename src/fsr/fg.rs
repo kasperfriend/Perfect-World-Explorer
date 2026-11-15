@@ -477,6 +477,49 @@ impl FrameGeneration {
             dxgi_factory: factory as *mut c_void,
             game_queue: queue_ptr,
         };
+        // --- Pre-flight sanity checks. These mirror the internal steps
+        // FFX performs inside its proxy-swapchain creation (GetDevice on the
+        // game queue, QueryInterface for IDXGIFactory2 on the factory) so a
+        // failure below can be attributed to a specific step. Failures here
+        // do not abort creation; they are logged so the next retest can
+        // pinpoint the rejecting component.
+        let (qi_device_hr, qi_queue_hr) = unsafe {
+            let mut probe_device: *mut winapi::um::d3d12::ID3D12Device = std::ptr::null_mut();
+            let hr = (queue_ptr as *mut winapi::um::unknwnbase::IUnknown).QueryInterface(
+                &winapi::um::d3d12::ID3D12Device::uuidof(),
+                &mut probe_device as *mut *mut winapi::um::d3d12::ID3D12Device as *mut *mut c_void,
+            );
+            if !probe_device.is_null() {
+                (*probe_device).Release();
+            }
+            let mut probe_queue: *mut winapi::um::d3d12::ID3D12CommandQueue = std::ptr::null_mut();
+            let hr_q = (queue_ptr as *mut winapi::um::unknwnbase::IUnknown).QueryInterface(
+                &winapi::um::d3d12::ID3D12CommandQueue::uuidof(),
+                &mut probe_queue as *mut *mut winapi::um::d3d12::ID3D12CommandQueue
+                    as *mut *mut c_void,
+            );
+            if !probe_queue.is_null() {
+                (*probe_queue).Release();
+            }
+            (hr, hr_q)
+        };
+        let qi_factory2_hr = unsafe {
+            let mut probe_factory: *mut winapi::shared::dxgi1_1::IDXGIFactory2 =
+                std::ptr::null_mut();
+            let hr = (factory as *mut winapi::um::unknwnbase::IUnknown).QueryInterface(
+                &winapi::shared::dxgi1_1::IDXGIFactory2::uuidof(),
+                &mut probe_factory as *mut *mut winapi::shared::dxgi1_1::IDXGIFactory2
+                    as *mut *mut c_void,
+            );
+            if !probe_factory.is_null() {
+                (*probe_factory).Release();
+            }
+            hr
+        };
+        super::diag(&format!(
+            "[FSR FG] proxy swapchain: hwnd 0x{:x}, extent {}x{}, backbuffer_format 0x{:08x}, alpha 0 (unspecified), factory 0x{:x}, queue GetDevice hr 0x{:08x}, queue QI hr 0x{:08x}, factory QI(IDXGIFactory2) hr 0x{:08x}",
+            hwnd as usize, width, height, backbuffer_format, factory as usize, qi_device_hr, qi_queue_hr, qi_factory2_hr
+        ));
         swapchain_desc.header.p_next = &mut version.header as *mut FfxApiHeader;
         let mut swapchain_context: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
