@@ -1337,12 +1337,13 @@ struct Renderer {
     local_pages: Vec<crate::world_objects::GpuPage>,
     world_pages: Vec<crate::world_objects::GpuPage>,
     /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
-    world_draw_cmds: [Vec<crate::world_objects::DrawCmd>; crate::world_objects::WORLD_VIEWS],
+    world_draw_cmds: [Vec<crate::world_objects::WorldDrawCmd>; crate::world_objects::WORLD_VIEWS],
     world_done: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     water_start: u32,
     water_batches: Vec<WaterBatch>,
+    visible_water_batches: Vec<WaterBatch>,
     started: Instant,
     wind_last: Instant,
     /// Snapshot computed once by `render()`; secondary views reuse it.
@@ -2011,6 +2012,7 @@ impl Renderer {
             sampler,
             water_start: m.water_start,
             water_batches: m.water_batches,
+            visible_water_batches: Vec::new(),
             started: Instant::now(),
             frame: FrameSnapshot::default(),
             world_glow: crate::post_gpu::WorldGlow::default(),
@@ -2540,6 +2542,7 @@ impl Renderer {
         view_runs: ViewRuns,
         terrain_depth_source: Option<&wgpu::Texture>,
         clear_color: Option<wgpu::Color>,
+        frustum: &[[f32; 4]; 6],
     ) {
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
@@ -2638,7 +2641,7 @@ impl Renderer {
         p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
         if !self.world_done {
             for page in &self.local_pages {
-                page.draw_selected(&mut p, reflected, pass_kind);
+                page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, false);
             }
         }
         // Do not submit world pages on top of the same locally streamed
@@ -2649,11 +2652,13 @@ impl Renderer {
             // loading: its placements are frozen, so nothing here is per-frame
             // work beyond the page binds and the draws themselves.
             let slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
-            crate::world_objects::GpuPage::draw_world(
+            crate::world_objects::GpuPage::draw_world_culled(
                 &self.world_pages,
                 &self.world_draw_cmds[slot],
                 &mut p,
                 reflected,
+                frustum,
+                false,
             );
         }
         // The `.sdr.` water/lava curtains draw in their own blended pass over
@@ -2670,16 +2675,18 @@ impl Renderer {
         p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
         if !self.world_done {
             for page in &self.local_pages {
-                page.draw_selected(&mut p, reflected, pass_kind);
+                page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, true);
             }
         }
         if self.world_done {
             let slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
-            crate::world_objects::GpuPage::draw_world(
+            crate::world_objects::GpuPage::draw_world_culled(
                 &self.world_pages,
                 &self.world_draw_cmds[slot],
                 &mut p,
                 reflected,
+                frustum,
+                true,
             );
         }
     }
@@ -2692,6 +2699,7 @@ impl Renderer {
         camera: &Camera,
         view: Pass,
         advance: bool,
+        frustum: &[[f32; 4]; 6],
     ) {
         // WaterEffect 0 (shipped default) hides EC models and home ornaments
         // in reflection/refraction (0x5b2015, 0x5b2336). RenderContext carries
@@ -2732,6 +2740,7 @@ impl Renderer {
             // Water passes reuse the sampled pose; never tick again per view.
             let delta = if advance { camera.logic_delta_ms } else { 0 };
             let frame = receiving_model_frame(uniform, camera, light);
+            models.set_frustum(Some(*frustum));
             models.update_pass(
                 &self.device,
                 &self.queue,
@@ -2889,6 +2898,7 @@ impl Renderer {
             view_runs,
             None,
             None,
+            &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
         );
         {
             let mut pass = e.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3092,6 +3102,7 @@ impl Renderer {
             ViewRuns::Main,
             Some(&self.depth),
             None,
+            &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
         );
         let model_target = self.water.scene_raw();
         self.draw_models(
@@ -3102,6 +3113,7 @@ impl Renderer {
             camera,
             Pass::Main,
             true,
+            &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
         );
         self.draw_addons(
             &mut e,
@@ -3175,12 +3187,9 @@ impl Renderer {
 
         // The reflection texture is reused only after its previous water draw is
         // submitted. Each distinct height gets its own mirror and clip plane.
-        let mut visible: Vec<WaterBatch> = self
-            .water_batches
-            .iter()
-            .filter(|b| b.visible(matrix))
-            .cloned()
-            .collect();
+        let mut visible = std::mem::take(&mut self.visible_water_batches);
+        visible.clear();
+        visible.extend(self.water_batches.iter().filter(|b| b.visible(matrix)).cloned());
         visible.sort_by(|a, b| {
             b.distance_squared(camera.pos)
                 .total_cmp(&a.distance_squared(camera.pos))
@@ -3196,7 +3205,7 @@ impl Renderer {
         }
         if !camera.water_reflections {
             let mut e = self.device.create_command_encoder(&Default::default());
-            for batch in visible {
+            for batch in &visible {
                 if batch.simple {
                     self.simple_water.draw(
                         &mut e,
@@ -3260,9 +3269,10 @@ impl Renderer {
                     camera.gamma_setting,
                 );
             }
+            self.visible_water_batches = visible;
             return;
         }
-        for batch in visible {
+        for batch in &visible {
             if batch.simple {
                 let mut e = self.device.create_command_encoder(&Default::default());
                 self.simple_water.draw(
@@ -3341,6 +3351,7 @@ impl Renderer {
                         b: linear(fog[2]),
                         a: 1.,
                     }),
+                &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
                 );
                 let model_view = self.water.refraction_raw();
                 self.draw_addons(
@@ -3393,6 +3404,7 @@ impl Renderer {
                     ViewRuns::Main,
                     None,
                     None,
+                &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
                 );
                 if let Some(cloud) = &self.cloud {
                     cloud.draw(
@@ -3434,6 +3446,7 @@ impl Renderer {
                         camera,
                         Pass::Refraction,
                         false,
+                    &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
                     );
                 }
                 self.draw_addons(
@@ -3509,8 +3522,9 @@ impl Renderer {
                 ViewRuns::Reflected,
                 None,
                 None,
+            &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
             );
-            if let Some(cloud) = &self.cloud {
+           if let Some(cloud) = &self.cloud {
                 cloud.draw(
                     &self.queue,
                     &mut e,
@@ -3547,6 +3561,7 @@ impl Renderer {
                 camera,
                 Pass::Reflection,
                 false,
+            &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
             );
             self.draw_addons(
                 &mut e,
@@ -3567,6 +3582,7 @@ impl Renderer {
             );
             self.queue.submit(Some(e.finish()));
         }
+        self.visible_water_batches = visible;
         if let Some(shore) = &self.shore {
             shore.draw(
                 &self.device,
@@ -3918,6 +3934,11 @@ pub fn run(
         .get_default_config(&adapter, size.width.max(1), size.height.max(1))
         .ok_or("surface configuration unavailable")?;
     config.format = surface_format;
+    if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+        config.present_mode = wgpu::PresentMode::Mailbox;
+    } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+        config.present_mode = wgpu::PresentMode::Immediate;
+    }
     if surface_format.is_srgb() {
         config
             .view_formats
@@ -4395,7 +4416,7 @@ pub fn run(
                             renderer.world_pages.push(uploaded);world_status=format!("Loading: {processed}/{} objects, {} GPU chunks",whole_ornaments.len(),renderer.world_pages.len());
                             eprintln!("{world_status}");
                         },
-                        Ok(crate::world_objects::Message::Done{processed,skipped,stats})=>{renderer.world_draw_cmds=crate::world_objects::GpuPage::world_commands(&renderer.world_pages);renderer.world_done=true;world_status=format!("Loaded {processed} objects; {skipped} meshes use fallback texture; {} geometry chunks, {} shared atlases ({} MiB); peak decoded-texture residency {} MiB of {} MiB budget, {} evictions, {} dedup alias hits",stats.pages,stats.atlas_pages,stats.atlas_bytes>>20,stats.residency.peak_resident_bytes>>20,stats.residency.budget_bytes>>20,stats.residency.evictions,stats.residency.alias_hits);eprintln!("{world_status}");},
+                        Ok(crate::world_objects::Message::Done{processed,skipped,stats})=>{renderer.world_draw_cmds=crate::world_objects::GpuPage::world_culled_commands(&renderer.world_pages);renderer.world_done=true;world_status=format!("Loaded {processed} objects; {skipped} meshes use fallback texture; {} geometry chunks, {} shared atlases ({} MiB); peak decoded-texture residency {} MiB of {} MiB budget, {} evictions, {} dedup alias hits",stats.pages,stats.atlas_pages,stats.atlas_bytes>>20,stats.residency.peak_resident_bytes>>20,stats.residency.budget_bytes>>20,stats.residency.evictions,stats.residency.alias_hits);eprintln!("{world_status}");},
                         Ok(crate::world_objects::Message::Error(e))=>{world_status=format!("World load failed: {e}");eprintln!("{world_status}");},
                         Err(_)=>{}
                     }}
@@ -4908,7 +4929,7 @@ pub fn preview(
                         stats.residency.evictions
                     );
                     renderer.world_draw_cmds =
-                        crate::world_objects::GpuPage::world_commands(&renderer.world_pages);
+                        crate::world_objects::GpuPage::world_culled_commands(&renderer.world_pages);
                     renderer.world_done = true;
                     break;
                 }
