@@ -79,7 +79,7 @@ fn placement_bins(placements: &[Placement]) -> HashMap<(i32, i32), Vec<u32>> {
                 (z / PLACEMENT_BIN_SIZE).floor() as i32,
             ))
             .or_default()
-                .push(index as u32);
+            .push(index as u32);
         }
     }
     bins
