@@ -157,7 +157,9 @@ pub struct World {
     /// Retail alpha insertion order as (slot, mesh) pairs.
     alpha: Vec<model_queue::AlphaCandidate>,
     reported: Vec<String>,
-    frustum: Option<[[f32; 4]; 6]>,
+    frustum: Option<[[f32; 4]; 6],>
+    scratch_candidates: Vec<model_queue::AlphaCandidate>,
+    scratch_failures: Vec<(usize, String)>,,
 }
 
 impl World {
@@ -252,6 +254,8 @@ impl World {
             alpha: Vec::new(),
             reported: Vec::new(),
             frustum: None,
+            scratch_candidates: Vec::new(),
+            scratch_failures: Vec::new(),
         })
     }
     /// A world with no model assets of its own.
@@ -1270,8 +1274,8 @@ impl World {
     /// priority weights of the original insertion routine were not recovered, so
     /// they stay zero and the comparison falls through to distance.
     fn rebuild_alpha_order(&mut self, eye: [f32; 3]) {
-        let mut candidates: Vec<model_queue::AlphaCandidate> = Vec::new();
-        let mut failures: Vec<(usize, String)> = Vec::new();
+        self.scratch_candidates.clear();
+        self.scratch_failures.clear();
         for (slot, entry) in self.slots.iter().enumerate() {
             if !entry.visible {
                 continue;
@@ -1292,7 +1296,7 @@ impl World {
                     transform.to_cols_array_2d(),
                     eye,
                 ) {
-                    Ok(distance) => candidates.push(model_queue::AlphaCandidate {
+                    Ok(distance) => self.scratch_candidates.push(model_queue::AlphaCandidate {
                         slot,
                         mesh,
                         node: model_queue::AlphaNode {
@@ -1306,25 +1310,25 @@ impl World {
                             distance,
                         },
                     }),
-                    Err(e) => failures.push((slot, e)),
+                    Err(e) => self.scratch_failures.push((slot, e)),
                 }
             }
         }
-        match model_queue::alpha_order(&candidates) {
+        match model_queue::alpha_order(&self.scratch_candidates) {
             Ok(order) => self.alpha = order,
             Err(e) => {
                 self.alpha.clear();
                 self.reported.push(format!("alpha queue: {e}"));
             }
         }
-        for (slot, error) in failures {
+        for (slot, error) in &self.scratch_failures {
             self.reported
                 .push(format!("alpha queue slot {slot}: {error}"));
-            if let Some(entry) = self.slots.get_mut(slot) {
+            if let Some(entry) = self.slots.get_mut(*slot) {
                 entry.failed = true;
                 entry.draw = None;
             }
-            self.alpha.retain(|candidate| candidate.slot != slot);
+            self.alpha.retain(|candidate| candidate.slot != *slot);
         }
     }
     /// Include dependency failures in the UI; never count a skipped asset ready.
