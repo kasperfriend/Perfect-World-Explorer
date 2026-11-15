@@ -4090,11 +4090,13 @@ pub fn run(
     // blit instead of retrying every frame.
     let mut fsr_upscaler: Option<crate::fsr::FsrUpscaler> = None;
     let mut fsr_failed = false;
+    let mut fsr_fail_reason: Option<String> = None;
     // Frame generation drops wgpu's swapchain (FFX creates its own proxy for
     // the hwnd); `surface` is recreated when the pipeline is created or
     // destroyed. `framegen` failing disables it for the rest of the session.
     let mut framegen: Option<crate::fsr::FrameGeneration> = None;
     let mut fg_failed = false;
+    let mut fg_fail_reason: Option<String> = None;
     let mut surface: Option<wgpu::Surface<'static>> = Some(surface);
     let mut last_fsr_camera_pos = camera.pos;
     let mut display_gamma: Option<crate::display_gamma::DisplayGamma> = None;
@@ -4409,7 +4411,8 @@ pub fn run(
                         match crate::fsr::FsrUpscaler::new(&renderer.device, &renderer.queue, &settings.upscale_sdk_dir, applied_extent, (config.width, config.height), format, want_fsr_version) {
                             Ok(up) => fsr_upscaler = Some(up),
                             Err(error) => {
-                                eprintln!("FSR unavailable, using bilinear scaling instead: {error}");
+                                crate::fsr::diag(&format!("FSR unavailable, using bilinear scaling instead: {error}"));
+                                fsr_fail_reason = Some(error);
                                 fsr_failed = true;
                             }
                         }
@@ -4436,7 +4439,7 @@ pub fn run(
                         match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
                             Ok(s) => surface = Some(s),
                             Err(error) => {
-                                eprintln!("Recreating the swapchain failed; presentation unavailable: {error}");
+                                crate::fsr::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
                                 fg_failed = true;
                             }
                         }
@@ -4457,27 +4460,29 @@ pub fn run(
                                 format,
                             ) {
                                 Ok(fg) => {
-                                    eprintln!("FSR frame generation active (proxy swapchain on the HWND)");
+                                    crate::fsr::diag("FSR frame generation active (proxy swapchain on the HWND)");
                                     framegen = Some(fg);
                                 }
                                 Err(error) => {
-                                    eprintln!("FSR frame generation unavailable, using the standard present path: {error}");
+                                    crate::fsr::diag(&format!("FSR frame generation unavailable, using the standard present path: {error}"));
+                                    fg_fail_reason = Some(error);
                                     fg_failed = true;
                                     match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
                                         Ok(s) => surface = Some(s),
                                         Err(error) => {
-                                            eprintln!("Recreating the swapchain failed; presentation unavailable: {error}");
+                                            crate::fsr::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
                                         }
                                     }
                                 }
                             },
                             Err(error) => {
-                                eprintln!("FSR frame generation unavailable (no Win32 hwnd): {error}");
+                                crate::fsr::diag(&format!("FSR frame generation unavailable (no Win32 hwnd): {error}"));
+                                fg_fail_reason = Some(error);
                                 fg_failed = true;
                                 match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
                                     Ok(s) => surface = Some(s),
                                     Err(error) => {
-                                        eprintln!("Recreating the swapchain failed; presentation unavailable: {error}");
+                                        crate::fsr::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
                                     }
                                 }
                             }
@@ -4793,7 +4798,8 @@ pub fn run(
                                 match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &unjittered_vp) {
                                     Ok(()) => fsr.composite(&renderer.device, &renderer.queue, scene_view),
                                     Err(error) => {
-                                        eprintln!("FSR failed, using bilinear scaling instead: {error}");
+                                        crate::fsr::diag(&format!("FSR failed, using bilinear scaling instead: {error}"));
+                                        fsr_fail_reason = Some(error);
                                         fsr_upscaler = None;
                                         fsr_failed = true;
                                         render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
@@ -4824,13 +4830,14 @@ pub fn run(
                                     d.to_array(),
                                 );
                                 if let Err(error) = prepare_result {
-                                    eprintln!("FSR frame generation prepare failed, disabling it: {error}");
+                                    crate::fsr::diag(&format!("FSR frame generation prepare failed, disabling it: {error}"));
+                                    fg_fail_reason = Some(error);
                                     framegen = None;
                                     fg_failed = true;
                                     match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
                                         Ok(s) => surface = Some(s),
                                         Err(error) => {
-                                            eprintln!("Recreating the swapchain failed; presentation unavailable: {error}");
+                                            crate::fsr::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
                                         }
                                     }
                                 }
@@ -4984,7 +4991,7 @@ pub fn run(
                                             }
                                         } else { ui.add(egui::Image::new((map_id,egui::vec2(MINIMAP_HUD,MINIMAP_HUD))).rounding(round)) };
                                         let center=image.rect.center();let dir=egui::vec2(camera.yaw.sin(),camera.yaw.cos());let side=egui::vec2(-dir.y,dir.x);let points=vec![center+dir*10.,center-dir*7.+side*5.,center-dir*7.-side*5.];ui.painter().add(egui::Shape::convex_polygon(points,egui::Color32::from_rgb(255,225,130),egui::Stroke::new(1.0f32,egui::Color32::BLACK)));ui.painter().text(image.rect.left_top()+egui::vec2(5.,5.),egui::Align2::LEFT_TOP,"N",egui::FontId::proportional(14.),egui::Color32::WHITE);});});}
-                                    if show_status_badge {egui::Area::new(egui::Id::new("fsr-status-hud")).anchor(egui::Align2::LEFT_TOP,egui::vec2(16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.0).show(ui,|ui|{if let Some(label)=&fsr_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if fsr_failed_note {ui.label(egui::RichText::new("FSR failed -> bilinear").small().color(egui::Color32::LIGHT_RED));}if fg_failed {ui.label(egui::RichText::new("FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}});});}
+                                    if show_status_badge {egui::Area::new(egui::Id::new("fsr-status-hud")).anchor(egui::Align2::LEFT_TOP,egui::vec2(16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.0).show(ui,|ui|{if let Some(label)=&fsr_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if fsr_failed_note {ui.label(egui::RichText::new("FSR failed -> bilinear").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&fsr_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if fg_failed {ui.label(egui::RichText::new("FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}});});}
                                     if menu_page.is_open(){renderer.modules.settings_panel(ctx,config.width as f32/window.scale_factor() as f32);}
                                     if renderer.modules.overlay_active() {
                                         // Overhead names: the same view-projection the world
@@ -5052,13 +5059,14 @@ pub fn run(
                                 match fg.finish(ui_visible, camera_jumped) {
                                     Ok(()) => {}
                                     Err(error) => {
-                                        eprintln!("FSR frame generation failed, restoring the standard present path: {error}");
+                                        crate::fsr::diag(&format!("FSR frame generation failed, restoring the standard present path: {error}"));
+                                        fg_fail_reason = Some(error);
                                         framegen = None;
                                         fg_failed = true;
                                         match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
                                             Ok(s) => surface = Some(s),
                                             Err(error) => {
-                                                eprintln!("Recreating the swapchain failed; presentation unavailable: {error}");
+                                                crate::fsr::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
                                             }
                                         }
                                     }

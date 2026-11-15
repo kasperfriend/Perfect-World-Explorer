@@ -939,6 +939,11 @@ pub enum SdkSource {
     Settings,
     /// `<exe directory>\sdk\` auto-detected beside the viewer.
     ExeFolder,
+    /// `<exe directory>\..\..\sdk\` — the vendored SDK at the repository
+    /// root when the binary runs from `target\<profile>\`.
+    RepoFolder,
+    /// `sdk\` relative to the current working directory.
+    WorkingDir,
 }
 
 impl SdkSource {
@@ -948,6 +953,8 @@ impl SdkSource {
             Self::Env => "PW_UPSCALER_SDK_DIR",
             Self::Settings => "upscale_sdk_dir (settings)",
             Self::ExeFolder => "sdk folder next to the executable",
+            Self::RepoFolder => "sdk folder at the repository root",
+            Self::WorkingDir => "sdk folder in the working directory",
         }
     }
 }
@@ -1005,12 +1012,29 @@ pub fn probe_sdk(settings_dir: &str) -> SdkReport {
     let exe_sdk = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("sdk")));
+    // A release package carries `sdk\` beside the executable; running the
+    // cargo build from the repository root (`target\<profile>\*.exe`) has
+    // the repo's own `sdk\` two levels up. Keep the loader candidates in
+    // `fsr/imp.rs` symmetric with these.
+    let repo_sdk = std::env::current_exe().ok().and_then(|exe| {
+        exe.parent()
+            .and_then(|dir| dir.parent())
+            .and_then(|dir| dir.parent())
+            .map(|dir| dir.join("sdk"))
+    });
+    let cwd_sdk = std::path::PathBuf::from("sdk");
+    let autodetect = exe_sdk
+        .map(|dir| (dir, SdkSource::ExeFolder))
+        .into_iter()
+        .chain(repo_sdk.map(|dir| (dir, SdkSource::RepoFolder)))
+        .chain(std::iter::once((cwd_sdk, SdkSource::WorkingDir)))
+        .find(|(dir, _)| dir.is_dir());
     let (dir, source) = if !trimmed.is_empty() {
         (Some(PathBuf::from(trimmed)), SdkSource::Settings)
     } else if let Some(env) = std::env::var_os("PW_UPSCALER_SDK_DIR") {
         (Some(PathBuf::from(env)), SdkSource::Env)
-    } else if let Some(detected) = exe_sdk.filter(|dir| dir.is_dir()) {
-        (Some(detected), SdkSource::ExeFolder)
+    } else if let Some((detected, source)) = autodetect {
+        (Some(detected), source)
     } else {
         (None, SdkSource::Unset)
     };

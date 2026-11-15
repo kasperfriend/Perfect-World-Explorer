@@ -45,16 +45,28 @@
 //! either. Everything past "does it compile on Windows" is runtime-unverified:
 //! the jitter sign convention, the motion-vector direction and even basic
 //! operation. If FFX context creation or the dispatch fails, the viewer logs
-//! the error and falls back to the bilinear path for the rest of the session
-//! instead of crashing. DLSS and XeSS are not integrated; neither is frame
-//! generation (the wgpu swapchain is owned by wgpu-hal 0.19 and FSR Frame
-//! Generation needs to create/wrap the swapchain itself).
+//! the error (stderr *and* the always-on `session.log` in the diagnostics
+//! folder), shows the reason in the on-screen fallback note, and falls back
+//! to the bilinear path for the rest of the session instead of crashing.
+//! DLSS and XeSS are not integrated. FSR frame generation is: it takes over
+//! the HWND with its own proxy swapchain (`FrameGenerationSwapChainForHwndDX12`),
+//! renders the UI into a separate native-resolution texture and presents
+//! through the FFX frame-interpolation swapchain.
 //!
 //! ## Non-Windows
 //!
-//! The whole module is a stub off Windows: `FsrUpscaler::new` always fails
-//! with "not supported on this platform", so Linux builds stay green and the
-//! Windows build is the compile authority.
+/// Single channel for every FSR/FG diagnostic: stderr for console runs,
+/// and the always-on `session.log` in the diagnostics folder (the viewer
+/// is a GUI-subsystem app — stderr alone vanishes when it is launched
+/// from Explorer). Never per-frame; call sites are lifecycle events.
+pub(crate) fn diag(line: &str) {
+    eprintln!("{line}");
+    crate::diagnostics::session(line);
+}
+
+// The whole module is a stub off Windows: `FsrUpscaler::new` always fails
+// with "not supported on this platform", so Linux builds stay green and the
+// Windows build is the compile authority.
 
 #[cfg(windows)]
 mod fg;

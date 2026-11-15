@@ -262,7 +262,7 @@ extern "C" fn fsr_message_callback(message_type: u32, message: *const u16) {
         len
     };
     let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(message, len) });
-    eprintln!(
+    super::diag(
         "[FSR {}] {text}",
         if message_type == 0 {
             "error"
@@ -303,6 +303,14 @@ impl FfxLoader {
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 candidates.push(dir.join("sdk").join("amd_fidelityfx_loader_dx12.dll"));
+            }
+            // Cargo layout: `<repo>/target/<profile>/*.exe` -> `<repo>/sdk`.
+            if let Some(repo) = exe
+                .parent()
+                .and_then(|dir| dir.parent())
+                .and_then(|dir| dir.parent())
+            {
+                candidates.push(repo.join("sdk").join("amd_fidelityfx_loader_dx12.dll"));
             }
         }
         candidates.push(std::path::PathBuf::from("sdk").join("amd_fidelityfx_loader_dx12.dll"));
@@ -364,7 +372,7 @@ impl FfxLoader {
                         )
                     };
                     if rc != FFX_API_RETURN_OK {
-                        eprintln!("[FSR] installing the FFX debug callback failed (0x{rc:x})");
+                        super::diag("[FSR] installing the FFX debug callback failed (0x{rc:x})");
                     }
                     return Ok(loader);
                 }
@@ -812,7 +820,7 @@ impl FsrUpscaler {
                 );
             }
         } else {
-            eprintln!(
+            super::diag(
                 "[FSR] provider enumeration returned 0x{rc:x}; the loader will pick a provider"
             );
         }
@@ -909,7 +917,7 @@ impl FsrUpscaler {
                 created_override = *candidate;
                 break;
             }
-            eprintln!(
+            super::diag(
                 "[FSR] ffxCreateContext with override {}failed (0x{rc:x}); trying the next provider",
                 candidate
                     .map(|id| format!("0x{id:x} "))
@@ -929,7 +937,7 @@ impl FsrUpscaler {
         } else {
             format!("{provider_note}; created with the loader's default provider")
         };
-        eprintln!(
+        super::diag(
             "[FSR] upscaler context 0x{:x} created ({provider_note})",
             context as usize
         );
@@ -1044,7 +1052,7 @@ impl FsrUpscaler {
         };
         let rc = unsafe { (self.loader.query)(&mut self.context, &mut query.header) };
         if rc != FFX_API_RETURN_OK {
-            eprintln!("[FSR] GetJitterOffset failed (0x{rc:x}); using zero jitter");
+            super::diag("[FSR] GetJitterOffset failed (0x{rc:x}); using zero jitter");
             x = 0.0;
             y = 0.0;
         }
@@ -1391,7 +1399,7 @@ pub(crate) fn choose_version_for_major(ids: &[u64], wanted_major: u32) -> Option
         .filter(|&id| real(id) && major(id) == wanted_major)
         .max()
         .or_else(|| {
-            eprintln!(
+            super::diag(
                 "[FSR] no FSR major.{} provider advertised (found {:?}); using the newest available",
                 wanted_major,
                 ids.iter().map(|i| format!("0x{i:x}")).collect::<Vec<_>>()
