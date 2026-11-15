@@ -158,9 +158,12 @@ minimap_style, minimap_shape, weather_override, sky_override, effect_shaft,
 effect_distance, logging_mask, logging_dir`.
 
 New keys added by this work (§6): `upscaling`, `upscale_quality`,
-`frame_generation`, `upscale_sdk_dir`. Defaults keep behaviour identical; an
-old file without them decodes to the same values as before plus the new
-defaults (see the migration test in `view_settings.rs`).
+`frame_generation`, `upscale_sdk_dir`, `latency`. Defaults keep behaviour
+identical; an old file without them decodes to the same values as before plus
+the new defaults (see the migration test in `view_settings.rs`). `latency`
+defaults to `vsync`, which is exactly the pre-existing present path (wgpu's
+default `PresentMode::Fifo`), so adding the key changes nothing until the user
+picks `xell`.
 
 ## 5. Keep-unchanged invariants (checked, not aspirational)
 
@@ -204,10 +207,13 @@ defaults (see the migration test in `view_settings.rs`).
    machine, jitter sequence, per-provider recommended internal resolutions,
    the pairing table, and `probe_sdk`, which probes a user-chosen directory
    (Settings → `upscale_sdk_dir` or `PW_UPSCALER_SDK_DIR` or `<exe>\sdk\`)
-   for the documented DLL names without loading any of them. NVIDIA/Intel
-   SDK binaries are not shipped or committed; the AMD FSR SDK 2.4.0 signed
-   DX12 binaries **are** vendored under `sdk/` at the user's request
-   (MIT-style license; notices reproduced; packaging stages them). AMD FSR
+   for the documented DLL names without loading any of them. NVIDIA SDK
+   binaries are not shipped or committed; the AMD FSR SDK 2.4.0 signed DX12
+   binaries **and** the Intel XeSS SDK 3.0.2 binaries (`libxess.dll`,
+   `libxess_fg.dll`, `libxell.dll`) **are** vendored under `sdk/` at the user's
+   request (MIT-style license for AMD; Intel Simplified Software License for
+   Intel, both notices reproduced, SHA-256 recorded in
+   `THIRD_PARTY_NOTICES.md`; packaging stages them). AMD FSR
    can and does dispatch from this wgpu 0.19.x renderer: the FFX upscaler runs
    on its own native D3D12 command list chained to the wgpu device/queue
    (`wgpu::Device::as_hal`; see `src/fsr.rs` and `docs/blockers.md` B-3/B-5).

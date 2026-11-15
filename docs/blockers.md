@@ -106,12 +106,33 @@ done.
     provider still renders through the bilinear path (no temporal accumulation
     is faked for it). The NVIDIA SDK still could not be obtained; the Intel
     DLLs are user-supplied (`sdk/SDK_GOES_HERE.txt`) and are never committed.
+  - **Intel XeSS is now vendored too** (2026-11-15): the XeSS SDK 3.0.2 release
+    is published on a reachable host — `https://github.com/intel/xess`, tag
+    `v3.0.2`, whose tree (codeload tarball) is the same material the
+    `XeSS_SDK_3.0.2.zip` asset is built from and carries `bin/libxess.dll`,
+    `bin/libxess_fg.dll` and `bin/libxell.dll`. The three files were copied
+    into `sdk/` unmodified. The Intel Simplified Software License (vendored as
+    `sdk/Intel_XeSS-SDK-3.0.2-LICENSE.txt`) permits redistributing the
+    unmodified binaries provided the notice travels with them, so the license
+    and the SDK's `third-party-programs.txt` sit beside them and
+    `THIRD_PARTY_NOTICES.md` records each file's size and SHA-256.
+    `.gitignore` un-ignores exactly those files (and the Intel headers), and
+    `tools/package-windows.ps1` stages them into every package by default.
+  - `tools/verify-vendor-sdks.py` (new) makes the wiring checkable without a
+    GPU: it parses the PE export tables and proves every symbol the loaders
+    resolve is exported (`xessD3D12*` 7/7, `xefgSwapChain*` 14/14, `xell*` 6/6,
+    `ffx*` 5/5), compares the FFI constants with the vendored headers, and
+    checks that the probe, the loaders, the packaging script and the ignore
+    rules agree. B-3 is therefore **closed for XeSS/XeSS-FG/XeLL** in the
+    sense that the files are present and resolvable; what remains open is
+    hardware verification (B-2).
   - Licenses/attribution are recorded in `THIRD_PARTY_NOTICES.md` from the
     vendor terms as published (with the requirement to re-check the license
     shipped inside the SDK you download).
-- **Status:** open (needs the SDKs on a Windows machine; see README "Upscaling
-and frame generation"). XeSS code is written and CI-compile-clean but has not
-run on hardware; DLSS remains not integrated.
+- **Status:** closed for AMD FSR and Intel XeSS/XeSS-FG/XeLL (binaries vendored,
+  exports and constants verified); **open for NVIDIA DLSS/Streamline**, which is
+  not published on a reachable host, may not be redistributed, and remains not
+  integrated. Hardware verification of the Intel path is tracked in B-2.
 
 ## B-4 — Native pass-by-pass DX12 rewrite (Phase 2)
 
@@ -242,3 +263,26 @@ run on hardware; DLSS remains not integrated.
   byte-identical when `Upscaling = Off`; only the Windows backend *selection*
   changes), but no frame-level evidence exists.
 - **Status:** open (needs client + Windows GPU).
+
+## B-9 — XeLL latency pacing is unmeasurable here
+
+- **Step:** Phase 4 — Settings → Graphics → **Latency** (`VSync` / `XeLL`).
+- **Error:** XeLL reduces input-to-screen latency by delaying the CPU start of a
+  frame; whether it does anything at all depends on the driver, the monitor and
+  the application's frame time. None of those exist in this environment (no
+  Windows, no GPU, no display), and the CI runners have no GPU either.
+- **What is verified:** the integration follows Intel's documented checklist —
+  `xellSleep` + `xellAddMarkerData` on every frame, features controlled only
+  through `xellSetSleepMode`, an idle device before the sleep mode is set,
+  present kept at sync interval 1 (`PresentMode::Fifo`), the XeLL context
+  destroyed after the XeSS-FG context, and a second context never created when
+  XeSS-FG already owns one. The exports it resolves exist in the vendored DLL
+  (`tools/verify-vendor-sdks.py`), and the mode/owner/gate logic is unit-tested.
+- **Not verified:** that the library actually lowers latency on the user's
+  hardware, that its measured timings match this frame structure, and the
+  behaviour of the delayed `xellSleep` on a frame loop that also contains
+  upscaler and frame-generation dispatches.
+- **Workaround until then:** `VSync` is the default and is exactly the previous
+  behaviour; a XeLL failure is sticky, logged once, shown on the mark, and
+  leaves the vsync'd present path untouched.
+- **Status:** open (needs a Windows/DX12 machine with a display).

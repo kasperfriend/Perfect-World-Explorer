@@ -2214,7 +2214,21 @@ mod tests {
             &SdkReport::default()
         )
         .is_available());
-        // No libxell.dll -> disabled with the folder named.
+        if !cfg!(windows) {
+            // The platform gate is checked before the SDK probe, so off Windows
+            // even a perfectly good Arc + SDK pair is disabled — and that is the
+            // only thing testable here.
+            let off_platform = support_latency(
+                LatencyMode::Xell,
+                FrameGenMethod::Off,
+                &intel_arc_a770(),
+                &full_sdk(),
+            );
+            assert!(!off_platform.is_available());
+            assert!(off_platform.reason().unwrap().contains("Windows"));
+            return;
+        }
+        // No libxell.dll -> disabled, and the reason names the file.
         let no_sdk = support_latency(
             LatencyMode::Xell,
             FrameGenMethod::Off,
@@ -2223,19 +2237,6 @@ mod tests {
         );
         assert!(!no_sdk.is_available());
         assert!(no_sdk.reason().unwrap().contains("libxell.dll"));
-        if !cfg!(windows) {
-            // Nothing else is testable off Windows: the platform gate wins.
-            assert!(support_latency(
-                LatencyMode::Xell,
-                FrameGenMethod::Off,
-                &intel_arc_a770(),
-                &full_sdk()
-            )
-            .reason()
-            .unwrap()
-            .contains("Windows"));
-            return;
-        }
         // Intel Arc + SDK + no frame generation: the viewer owns the context.
         assert!(support_latency(
             LatencyMode::Xell,

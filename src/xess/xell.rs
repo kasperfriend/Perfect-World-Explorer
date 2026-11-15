@@ -31,14 +31,15 @@ type PfnXellAddMarkerData =
 type PfnXellDestroyContext = unsafe extern "C" fn(context: *mut c_void) -> i32;
 type PfnXellGetVersion = unsafe extern "C" fn(version: *mut XellVersion) -> i32;
 
-/// `xell_version_t`: four `uint16_t`s, major.minor.patch.
+/// `xell_version_t`: four `uint16_t`s, major.minor.patch. `_reserved` keeps the
+/// SDK's fourth word so the layout matches the header; it is never read.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct XellVersion {
     major: u16,
     minor: u16,
     patch: u16,
-    reserved: u16,
+    _reserved: u16,
 }
 type PfnXellSetLoggingCallback = unsafe extern "C" fn(
     context: *mut c_void,
