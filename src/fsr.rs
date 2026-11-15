@@ -81,7 +81,7 @@ pub use fg::*;
 #[cfg(windows)]
 pub use imp::*;
 #[cfg(windows)]
-pub(crate) use mv::{FsrMotionVectorPass, FsrMvParams};
+pub(crate) use mv::{jittered_clip_vp, FsrMotionVectorPass, FsrMvParams};
 #[cfg(windows)]
 pub(crate) mod swapchain;
 

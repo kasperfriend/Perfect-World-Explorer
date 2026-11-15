@@ -175,6 +175,7 @@ mod fg_stub {
             _display_extent: (u32, u32),
             _surface_format: wgpu::TextureFormat,
             _ui_format: wgpu::TextureFormat,
+            _interpolated_frames: u32,
         ) -> Result<XessFrameGeneration, String> {
             Err(
                 "XeSS Frame Generation is only supported on Windows with a DX12 backend"

@@ -2,7 +2,7 @@
 //! documentation in `super` for the overall design and its limits.
 
 use super::mv::{FsrMotionVectorPass, FsrMvParams, COMPOSITE_SHADER};
-use glam::{Mat4, Vec3};
+use glam::Mat4;
 use std::ffi::c_void;
 use winapi::shared::dxgiformat::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -748,7 +748,12 @@ fn wgpu_format_for_dxgi(dxgi: DXGI_FORMAT, reference: wgpu::TextureFormat) -> wg
 }
 
 pub(crate) struct FsrComposite {
+    /// Passthrough pipeline: source bytes are already in the target's encoding.
     pipeline: wgpu::RenderPipeline,
+    /// Decoding pipeline: the target is sRGB and would encode the upscaler's
+    /// sRGB bytes a second time (see `COMPOSITE_SHADER`).
+    pipeline_decode: wgpu::RenderPipeline,
+    decode_source: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
 }
@@ -807,6 +812,28 @@ impl FsrComposite {
             multisample: Default::default(),
             multiview: None,
         });
+        let pipeline_decode = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("fsr composite (sRGB decode)"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_decode",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+        });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("fsr composite sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -817,6 +844,11 @@ impl FsrComposite {
         });
         Self {
             pipeline,
+            pipeline_decode,
+            // The upscaler's output carries the encoding of its input, and the
+            // input is the sRGB world target; so anything that writes into an
+            // sRGB target has to decode first.
+            decode_source: format.is_srgb(),
             layout,
             sampler,
         }
@@ -860,7 +892,11 @@ impl FsrComposite {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            if self.decode_source {
+                pass.set_pipeline(&self.pipeline_decode);
+            } else {
+                pass.set_pipeline(&self.pipeline);
+            }
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
         }
@@ -1375,25 +1411,14 @@ impl FsrUpscaler {
         (x, y)
     }
 
-    /// Post-projection clip-space translation matching `current_jitter`.
+    /// The jittered view-projection for this frame.
     ///
-    /// AMD FSR 2/3 expects the jitter to move the rendered image by a whole
-    /// clip-space offset: `jitteredVP = T * VP` where `T` translates clip
-    /// space in NDC units. A constant added to the translation column of the
-    /// combined view-projection matrix instead shifts clip space by a fixed
-    /// amount *before* the perspective divide, which makes the on-screen
-    /// offset scale with 1/w (depth-dependent shake and heavy jitter on
-    /// high-frequency geometry). The jitter Y is negated because unit pixel
-    /// space is +y down while NDC is +y up; the same raw halton offsets are
-    /// passed to the FFX dispatch as `jitterOffset`.
+    /// The same raw offsets are handed to the FFX dispatch as `jitterOffset`;
+    /// [`crate::fsr::jittered_clip_vp`] explains why the shear is built in the
+    /// `w` column (a constant NDC offset) rather than as a clip-space
+    /// translation.
     pub fn jittered_matrix(&self, matrix: Mat4) -> Mat4 {
-        let (jx, jy) = self.current_jitter;
-        let (w, h) = self.render_extent;
-        Mat4::from_translation(Vec3::new(
-            2.0 * jx / w.max(1) as f32,
-            -2.0 * jy / h.max(1) as f32,
-            0.0,
-        )) * matrix
+        crate::fsr::jittered_clip_vp(matrix, self.current_jitter, self.render_extent)
     }
 }
 

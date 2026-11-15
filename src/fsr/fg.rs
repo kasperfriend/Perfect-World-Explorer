@@ -19,11 +19,15 @@
 //! * On disable, the FFX contexts are destroyed and the proxy released,
 //!   freeing the hwnd; the engine recreates the wgpu surface afterwards.
 //!
-//! UI composition uses the "render the UI to a separate surface" mode: the
-//! UI is drawn into [`FrameGeneration::ui_view`] by the caller and registered
-//! with the swapchain every frame, so generated frames composite a sharp UI
-//! on top of the interpolated scene. Frames without UI register an empty UI
-//! resource instead.
+//! UI composition keeps the UI inside the composition by default: the caller
+//! draws the HUD into [`FrameGeneration::compose_view`] like any other frame
+//! content and the swapchain receives no UI resource, so the interpolator
+//! never touches HUD pixels. The alternative — the caller drawing the UI into
+//! [`FrameGeneration::ui_view`], which the swapchain blends back in — is one
+//! environment variable away (`PW_FSRFG_UI_COMPOSITION=0`); it keeps the HUD
+//! sharp on generated frames, but FFX treats that surface as colour data, so
+//! the HUD picks up the interpolator's tone mapping and comes back washed out.
+//! See [`FrameGeneration::ui_in_composition`].
 //!
 //! Synchronisation follows the same pattern as the upscaler: everything
 //! native runs on the one D3D12 direct queue wgpu-hal created, wgpu submits
@@ -264,6 +268,10 @@ pub struct FrameGeneration {
     /// expects during `Present`; the next `prepare` moves it back to
     /// `RENDER_TARGET` before wgpu draws the UI again.
     ui_needs_rt_restore: bool,
+    /// Draw the UI into the composition instead of handing it to the
+    /// interpolator. Always on; see
+    /// [`FrameGeneration::ui_in_composition`] for why.
+    ui_in_composition: bool,
     /// The FFX provider version the loader actually advertised and the create
     /// call accepted (major << 22 | minor << 12 | patch). `None` when the
     /// enumeration failed and the loader picked the provider itself.
@@ -651,6 +659,9 @@ impl FrameGeneration {
             prev_view_proj: None,
             frame_index: 0,
             ui_needs_rt_restore: false,
+            ui_in_composition: std::env::var("PW_FSRFG_UI_COMPOSITION")
+                .map(|value| value.trim() != "0")
+                .unwrap_or(true),
             selected_version: created_override,
         })
     }
@@ -749,6 +760,23 @@ impl FrameGeneration {
     /// View of the separate UI surface (alpha-composited by the swapchain).
     pub fn ui_view(&self) -> wgpu::TextureView {
         self.ui.texture.create_view(&Default::default())
+    }
+
+    /// `true` when the UI is part of the composition instead of a separate
+    /// surface handed to the interpolator.
+    ///
+    /// The FFX frame-generation swapchain blends the UI surface by itself.
+    /// FSR treats that surface as colour data, so the HUD comes back with the
+    /// interpolator's tone mapping applied — flat headings, washed-out bars,
+    /// a translucent panel that is noticeably brighter than the frame it sits
+    /// on. Keeping the UI in the composition avoids the blend entirely (the
+    /// interpolator only ever sees HUD-less pixels and generated frames get no
+    /// HUD) at the cost of a HUD that is re-rendered rather than composited
+    /// per generated frame. That is the trade the other two providers make by
+    /// default, so FSR matches them; `PW_FSRFG_UI_COMPOSITION=0` restores the
+    /// separate-surface path for comparison.
+    pub fn ui_in_composition(&self) -> bool {
+        self.ui_in_composition
     }
 
     /// The size of the composition / UI targets.
@@ -993,6 +1021,9 @@ impl FrameGeneration {
     /// `ui_visible` must reflect whether the UI was drawn into [`Self::ui_view`]
     /// this frame; an empty UI resource is registered otherwise.
     pub fn finish(&mut self, ui_visible: bool, reset: bool) -> Result<(), String> {
+        // Composition mode turns the separate UI surface off entirely: see
+        // `ui_in_composition`.
+        let ui_visible = ui_visible && !self.ui_in_composition;
         let (width, height) = self.size;
         // --- Acquire the current backbuffer.
         let sc3 = self.proxy as *mut IDXGISwapChain3;

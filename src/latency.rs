@@ -1,4 +1,4 @@
-//! Settings → Graphics → **Latency**: `VSync` vs `XeLL`.
+//! Settings → Graphics → **Latency**: `VSync` vs `Reflex` vs `XeLL`.
 //!
 //! This module owns the *standalone* XeLL session — the one the viewer creates
 //! when the user picks `Latency = XeLL` and XeSS Frame Generation is not
@@ -57,6 +57,19 @@
 //! * All GPU work must be finished before `xellSetSleepMode` is called; the
 //!   session therefore waits for an idle device first.
 //!
+//! ## `Reflex` — the same idea without Streamline
+//!
+//! NVIDIA Reflex is a Streamline feature (`sl.reflex.dll` behind
+//! `sl.interposer`), and Streamline is not vendored: it takes over the
+//! swapchain, which the frame generators already own. What Reflex does for a
+//! vsync'd presenter is an ordering rule — keep exactly one frame in flight and
+//! wake the CPU just before the vblank instead of right after the previous
+//! present. [`ReflexPacer`] implements that rule directly on the viewer's own
+//! present loop: it learns the display period from the present timestamps and
+//! sleeps the surplus CPU-ahead time away. Presentation stays `Fifo` with sync
+//! interval 1, so the only observable difference from `VSync` is input-to-
+//! photon latency, not frame pacing or tearing.
+//!
 //! ## Verification status
 //!
 //! Everything here compiles for Windows and is linked against DLLs whose exports
@@ -66,6 +79,8 @@
 //! session fails with a readable reason (stderr *and* `session.log`), the
 //! on-screen mark says so, and the viewer keeps presenting exactly as it does
 //! with `Latency = VSync`; it never drops the swapchain.
+
+use std::time::{Duration, Instant};
 
 /// Single channel for latency diagnostics: stderr for console runs and the
 /// always-on `session.log` (the viewer is a GUI-subsystem app, so stderr alone
@@ -238,8 +253,155 @@ mod imp_stub {
 #[cfg(not(windows))]
 pub use imp_stub::LatencySession;
 
+/// CPU pacing with the shape of NVIDIA Reflex, without Streamline.
+///
+/// ## Why this is not `sl.reflex.dll`
+///
+/// Reflex ships as a Streamline feature, and Streamline is deliberately not
+/// vendored here: it takes over the swapchain and the present cadence through
+/// `sl.interposer`, which is the same surface the three frame generators
+/// already fight over (see `docs/blockers.md`). What Reflex actually changes
+/// for a vsync'd presenter is not a magic call but an ordering rule: the CPU
+/// must not start recording the next frame until the frame currently in flight
+/// is nearly done on the GPU, so the queue in flight stays at one instead of
+/// two. That rule needs no SDK — it needs a clock, the previous present time
+/// and the display's frame period, which is exactly what this pacer keeps.
+///
+/// ## What it does per frame
+///
+/// * [`ReflexPacer::begin_frame`] sleeps until the next present is due minus a
+///   submission lead. The lead is a quarter of the frame period capped at
+///   3 ms, so frame recording has room to finish before the vblank and the
+///   wait never swallows the whole budget on a slow CPU.
+/// * [`ReflexPacer::present`] records the present instant and folds the
+///   observed interval into the budget with a slow exponential average, so the
+///   pacer follows the real cadence — a 144 Hz display converges in a few
+///   frames, and a missed vblank widens the budget instead of making the next
+///   frame spin.
+///
+/// Presenting stays `Fifo` with sync interval 1, exactly as with
+/// [`LatencyMode::Vsync`](crate::LatencyMode::Vsync): this pacer only decides
+/// *when the CPU wakes up*, it never tears or drops frames, and dropping it
+/// mid-run restores the unpaced path without touching the swapchain.
+pub struct ReflexPacer {
+    /// Smoothed frame period; seeded by the caller and re-learned from the
+    /// present timestamps.
+    budget: Duration,
+    /// Present instant of the previous frame.
+    last_present: Instant,
+    frames: u64,
+    slept: Duration,
+}
+
+impl ReflexPacer {
+    /// Shortest budget the pacer will settle on, so a broken interval cannot
+    /// spin the frame loop.
+    const MIN_BUDGET: Duration = Duration::from_millis(2);
+    /// Longest budget, matching a 10 Hz display; anything slower is a stall,
+    /// not a cadence.
+    const MAX_BUDGET: Duration = Duration::from_millis(100);
+    /// How much of the budget is kept back for recording and submitting.
+    const MAX_LEAD: Duration = Duration::from_millis(3);
+
+    /// `refresh_hz` is only a starting point (the frame loop passes the 60 Hz
+    /// default and never queries the monitor): out-of-range and non-finite
+    /// values are clamped instead of rejected, because the pacer re-learns the
+    /// cadence from the present timestamps anyway.
+    pub fn new(refresh_hz: f32) -> Self {
+        let hz = if refresh_hz.is_finite() {
+            refresh_hz.clamp(30.0, 500.0)
+        } else {
+            60.0
+        };
+        Self {
+            budget: Duration::from_secs_f32(1.0 / hz),
+            last_present: Instant::now(),
+            frames: 0,
+            slept: Duration::ZERO,
+        }
+    }
+
+    /// Sleep until the current frame may start. Call once per frame, before
+    /// anything is recorded.
+    pub fn begin_frame(&mut self) {
+        let lead = Self::MAX_LEAD.min(self.budget / 4);
+        let due = self.last_present + self.budget.saturating_sub(lead);
+        let now = Instant::now();
+        if let Some(wait) = due.checked_duration_since(now) {
+            if wait > Duration::from_micros(200) {
+                std::thread::sleep(wait);
+                self.slept += wait;
+            }
+        }
+    }
+
+    /// Record the present instant and re-learn the frame period.
+    pub fn present(&mut self) {
+        let now = Instant::now();
+        let observed = now.saturating_duration_since(self.last_present);
+        self.last_present = now;
+        self.frames += 1;
+        // A first frame or a stall says nothing about the cadence.
+        if observed >= Self::MIN_BUDGET && observed <= Self::MAX_BUDGET {
+            let smoothed = self.budget.mul_f32(0.9) + observed.mul_f32(0.1);
+            self.budget = smoothed.clamp(Self::MIN_BUDGET, Self::MAX_BUDGET);
+        }
+    }
+
+    /// Frames paced so far.
+    pub fn frames(&self) -> u64 {
+        self.frames
+    }
+
+    /// Current frame period estimate, in milliseconds.
+    pub fn budget_ms(&self) -> f32 {
+        self.budget.as_secs_f32() * 1000.0
+    }
+
+    /// Total time spent sleeping, in milliseconds — the part of the frame the
+    /// CPU gave back.
+    pub fn slept_ms(&self) -> f32 {
+        self.slept.as_secs_f32() * 1000.0
+    }
+
+    /// One-line status for the on-screen mark.
+    pub fn status(&self) -> String {
+        format!(
+            "Reflex pacing - {} frames, {:.1} ms budget, {:.0} ms slept",
+            self.frames,
+            self.budget_ms(),
+            self.slept_ms()
+        )
+    }
+}
+
+impl Default for ReflexPacer {
+    fn default() -> Self {
+        Self::new(60.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The pacer must never crash on a nonsense refresh rate, must clamp the
+    /// inputs it does not believe, and must not sleep the first frame away.
+    #[test]
+    fn reflex_pacer_seeds_from_the_refresh_rate() {
+        use super::ReflexPacer;
+        assert!((ReflexPacer::new(60.0).budget_ms() - 16.67).abs() < 0.1);
+        assert!((ReflexPacer::new(144.0).budget_ms() - 6.94).abs() < 0.1);
+        // Out-of-range and non-finite inputs clamp to a sane cadence.
+        assert!((ReflexPacer::new(0.0).budget_ms() - 1000.0 / 30.0).abs() < 0.1);
+        assert_eq!(ReflexPacer::new(f32::NAN).frames(), 0);
+        let mut pacer = ReflexPacer::default();
+        let start = std::time::Instant::now();
+        pacer.begin_frame();
+        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+        pacer.present();
+        assert_eq!(pacer.frames(), 1);
+        assert!(pacer.status().contains("1 frames"));
+    }
+
     /// The owner rule this module relies on lives in `main.rs`; keep the two
     /// names in sync and pin the one case that would otherwise create two XeLL
     /// contexts on the same device.

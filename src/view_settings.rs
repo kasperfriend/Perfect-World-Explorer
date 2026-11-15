@@ -1,7 +1,7 @@
 //! Persisted viewer controls; malformed values fall back safely.
 use crate::client_weather::WeatherOverride;
 use crate::sky_transition::SkyOverride;
-use crate::{FrameGenMethod, LatencyMode, UpscaleMethod, UpscaleQuality};
+use crate::{FrameGenMethod, FrameMultiplier, LatencyMode, UpscaleMethod, UpscaleQuality};
 
 #[path = "post_plan.rs"]
 mod post_plan;
@@ -215,6 +215,11 @@ pub struct ViewSettings {
     /// Graphics: frame generator, chosen independently of the upscaler.
     /// Illegal pairings are refused at decode time (see `crate::pairing`).
     pub frame_generation: FrameGenMethod,
+    /// Graphics: presented frames per rendered frame for the frame generator
+    /// (`x2` … `x6`). What each vendor can actually do is decided by
+    /// `crate::multiplier_support`; FSR frame generation is 2x only and DLSS
+    /// multi frame generation needs Blackwell.
+    pub frame_multiplier: FrameMultiplier,
     /// Graphics: AMD FSR 1 RCAS sharpness in stops (lower = sharper).
     /// Applies only while `upscaling` is `fsr1`.
     pub fsr1_sharpness: f32,
@@ -313,6 +318,7 @@ impl Default for ViewSettings {
             upscaling: UpscaleMethod::Off,
             upscale_quality: UpscaleQuality::Quality,
             frame_generation: FrameGenMethod::Off,
+            frame_multiplier: FrameMultiplier::X2,
             fsr1_sharpness: 0.2,
             fsr3_sharpness: 0.75,
             upscale_sdk_dir: String::new(),
@@ -448,6 +454,11 @@ impl ViewSettings {
                         s.frame_generation = method;
                     }
                 }
+                "frame_multiplier" => {
+                    if let Some(multiplier) = FrameMultiplier::parse(v) {
+                        s.frame_multiplier = multiplier;
+                    }
+                }
                 "fsr_version" => {
                     // Legacy key, consumed for the `upscaling=fsr` migration.
                     legacy_fsr_version = v.trim().parse::<u32>().ok();
@@ -556,12 +567,12 @@ impl ViewSettings {
             "radius={}\nterrain_cutoff={}\ntree_lod_scale={}\nscenery_quality={}\ncamera_speed={}\nboost={}\nsensitivity={}\nfar={}\ntime_of_day={}\ntime_pass_enabled={}\ntime_pass_speed={}\nall_to_vram={}\n",
             "whole_world={}\nwater_reflections={}\nworld_effects={}\natmospheric_fog={}\nbloom={}\nbloom_strength={}\nbloom_mode={}\nbloom_tint={}\nbloom_brightness_fade={}\nbloom_opacity_fade={}\nclient_gamma={}\ngamma_setting={}\n",
             "terrain_lightmaps={}\nmodel_backface_culling={}\nmusic_enabled={}\nmusic_volume={}\nambience_enabled={}\nsound_volume={}\neffects_enabled={}\neffects_volume={}\nfullscreen={}\nshow_zone_entry={}\n",
-            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nfsr1_sharpness={}\nfsr3_sharpness={}\nupscale_sdk_dir={}\nlatency={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\n"),
+            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nframe_multiplier={}\nfsr1_sharpness={}\nfsr3_sharpness={}\nupscale_sdk_dir={}\nlatency={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\n"),
             self.detail.radius,self.detail.terrain_cutoff,self.detail.tree_lod_scale,self.detail.scenery_quality,self.camera_speed,self.boost,self.sensitivity,self.far,self.time_of_day,self.time_pass_enabled,self.time_pass_speed,self.all_to_vram,
             self.whole_world,self.water_reflections,self.world_effects,self.atmospheric_fog,self.bloom,self.bloom_strength,self.bloom_mode,self.bloom_tint,self.bloom_brightness_fade,self.bloom_opacity_fade,self.client_gamma,self.gamma_setting,
             self.terrain_lightmaps,self.model_backface_culling,self.music_enabled,self.music_volume,self.ambience_enabled,self.sound_volume,self.effects_enabled,self.effects_volume,self.fullscreen,self.show_zone_entry,
             self.show_minimap,self.minimap_range,self.tree_wind_strength,self.client_tree_wind_preview,self.regional_tree_lighting,self.grass_distance_fade,self.grass_wind_enabled,self.grass_wind_amplitude,self.streamed_regions,self.area_grass_lightmaps,self.vegetation_authored_mips,self.celestial_discs,self.celestial_brightness,self.ignore_celestial_flags,self.cloud_detail,self.sharpen,self.resolution_scale,
-            self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.fsr1_sharpness,self.fsr3_sharpness,self.upscale_sdk_dir,self.latency.token(),
+            self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.frame_multiplier.token(),self.fsr1_sharpness,self.fsr3_sharpness,self.upscale_sdk_dir,self.latency.token(),
             self.world_map_style.label(),self.minimap_style.label(),
             self.minimap_shape.label(),
             self.weather_override.token(),self.sky_override.token(),self.effect_shaft.token(),self.effect_distance,self.logging_mask,self.logging_dir)
@@ -1180,6 +1191,54 @@ effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs
         assert_eq!(ViewSettings::decode(&mixed.encode()), mixed);
     }
 
+    /// The Graphics -> Frame multiplier key: round-trips, defaults to x2, and
+    /// ignores anything it does not recognise (a stale or hand-edited file
+    /// must not change how many frames are presented).
+    #[test]
+    fn frame_multiplier_round_trip() {
+        use crate::FrameMultiplier;
+        assert_eq!(
+            ViewSettings::default().frame_multiplier,
+            FrameMultiplier::X2
+        );
+        for multiplier in FrameMultiplier::ALL {
+            let text = format!("frame_multiplier={}\n", multiplier.token());
+            let decoded = ViewSettings::decode(&text);
+            assert_eq!(decoded.frame_multiplier, multiplier, "{text:?}");
+            let encoded = decoded.encode();
+            assert!(
+                encoded.contains(&format!("frame_multiplier={}", multiplier.token())),
+                "encode lost the frame multiplier key: {encoded}"
+            );
+            assert_eq!(ViewSettings::decode(&encoded).frame_multiplier, multiplier);
+        }
+        // Accepted spellings and junk.
+        assert_eq!(
+            ViewSettings::decode("frame_multiplier=x4\n").frame_multiplier,
+            FrameMultiplier::X4
+        );
+        for junk in [
+            "frame_multiplier=\n",
+            "frame_multiplier=5\n",
+            "frame_multiplier=x8\n",
+        ] {
+            assert_eq!(
+                ViewSettings::decode(junk).frame_multiplier,
+                FrameMultiplier::X2,
+                "{junk:?}"
+            );
+        }
+        // Trailing-`x` spellings are accepted too.
+        assert_eq!(
+            ViewSettings::decode("frame_multiplier=6x\n").frame_multiplier,
+            FrameMultiplier::X6
+        );
+        // It does not disturb the neighbouring frame generation key.
+        let both = ViewSettings::decode("frame_generation=dlss\nframe_multiplier=3\n");
+        assert_eq!(both.frame_multiplier, FrameMultiplier::X3);
+        assert_eq!(both.frame_generation, crate::FrameGenMethod::Off);
+    }
+
     /// The Graphics -> Latency key: round-trips, defaults to VSync, and falls
     /// back to VSync on anything it does not recognise (a viewer that loses
     /// its latency setting must not lose its present path).
@@ -1197,9 +1256,10 @@ effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs
             );
             assert_eq!(ViewSettings::decode(&encoded).latency, mode);
         }
+        // `reflex` is a real mode now, so only near-misses stay junk.
         for junk in [
             "latency=\n",
-            "latency=reflex\n",
+            "latency=reflexx\n",
             "latency=2\n",
             "latency=xel\n",
         ] {

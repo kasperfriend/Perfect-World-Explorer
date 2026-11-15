@@ -438,3 +438,37 @@ done.
   | 3 | `PW_XEFG_UI_COMPOSITION=1` | Back to the sharp-UI composition path. Flicker returns ⇒ it is specific to the composition inputs; no flicker ⇒ that path is usable again. |
 - **Status:** open (fix is written and compiles on Windows CI; not yet
   confirmed on hardware).
+
+## B-14 — Multi frame generation is hardware-gated (screen report, Phase 4.2x)
+
+- **Step:** Settings → Graphics → **Frame generation** = DLSS Frame Generation
+  with **Frame multiplier** = x3 / x4 / x6.
+- **What the runtime allows:** NGX reports
+  `DLSSG.MultiFrameCountMax` from the GPU architecture. On Ada (RTX 40 series)
+  it is **1**, i.e. one interpolated frame per rendered frame, which is the 2x
+  path this project has always used. Blackwell (RTX 50 series) reports up to
+  **5** — the x6 entry. There is no supported way to ask an Ada card for more:
+  third-party "MFG unlockers" patch `nvngx_dlssg.dll` in memory, which this
+  project does not do, so the entries that the hardware cannot serve are greyed
+  out in the combo with the architecture reason next to them
+  (`crate::multiplier_support`).
+- **What is implemented:** the real NGX multi frame generation path — one
+  `EvaluateFeature` per generated frame with `DLSSG.MultiFrameCount` = n,
+  `DLSSG.MultiFrameIndex` = 1..n and a monotonic `DLSSG.BackbufferFrameID`, each
+  generated frame writing into its own backbuffer (`desc.BufferCount` is sized
+  `n + 2` *before* the swapchain is created), the whole group presented with
+  `Present(1, 0)` so the generated frames land on consecutive vblanks. XeSS-FG
+  takes the same setting through `maxInterpolatedFrames` +
+  `xefgSwapChainSetNumInterpolatedFrames`, clamped to the
+  `maxSupportedInterpolations` the SDK reports (logged). FSR-FG is 2x by design
+  (`numGeneratedFrames`).
+- **Not verified:** that DLSS-G fills every requested index on Blackwell, that
+  the pacing holds at x3/x4/x6 under a real vblank, and the XeSS-FG clamp on
+  Intel hardware. No Blackwell GPU exists in this environment; the 2x path is
+  what was previously written and is unchanged apart from the present interval.
+- **Why the present interval changed:** presenting the generated frames with
+  `Present(0, 0)` let the *next* real frame onto the same vblank, so a group
+  collapsed into fewer flips — reported as "stutters when an upscaler and frame
+  generation are both on". Every present in a group now uses `Present(1, 0)`.
+- **Status:** open (needs a Blackwell machine for x3/x4/x6; x2 is the previously
+  reported configuration and needs a re-report).

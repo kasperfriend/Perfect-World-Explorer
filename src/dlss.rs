@@ -211,6 +211,7 @@ mod fg_stub {
             _render_extent: (u32, u32),
             _display_extent: (u32, u32),
             _surface_format: wgpu::TextureFormat,
+            _generated_frames: u32,
         ) -> Result<DlssFrameGeneration, String> {
             Err(
                 "DLSS Frame Generation is only supported on Windows with a DX12 backend"

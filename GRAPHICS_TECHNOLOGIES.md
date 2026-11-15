@@ -31,6 +31,21 @@ straight through as `ffxDispatchDescUpscale.sharpness` with
 alike. The value is read every frame, so dragging the slider takes effect
 without recreating the context.
 
+**Jitter and colour, fixed in this build.** All three temporal providers share
+one jitter helper (`crate::fsr::jittered_clip_vp`): the Halton offset lands as a
+constant NDC offset, by putting the offset in the `w` column of the
+view-projection (`clip.xy += offset * clip.w`) — which is what "jitter the
+projection matrix" means in all three vendor guides. Adding a clip-space
+translation instead (`T * VP`) divides the on-screen displacement by `clip.w`, so
+near geometry moves several pixels while the horizon barely moves; no temporal
+accumulator can converge on that, and it showed up as blur and ghosting from
+DLSS and XeSS. The same raw pixel offsets still go to `ffxDispatchDescUpscale.
+jitterOffset`, `xessExecute` and NGX `Jitter.Offset`. Separately, the composite
+pass that writes the FFX result into the sRGB world target now decodes first
+(`fs_decode`, `src/fsr/mv.rs`): copying sRGB bytes into an sRGB render target
+encoded them a second time (mid grey 0.5 landed at 0.735), which is exactly the
+washed-out, flat look FSR had next to FSR 1.
+
 FSR 1 and the FFX providers are independent implementations; picking
 `FSR 1` never touches FFX, and picking `FSR 2/3/4` never loads the FSR 1
 pipelines. Legacy `viewer-settings.txt` files with `upscaling=fsr` and
@@ -43,9 +58,42 @@ from the tab.
 | Entry (Graphics tab) | Status | Gate |
 |---|---|---|
 | Off | **Works.** | Always available. |
-| FSR Frame Generation | **Implemented, runtime-unverified.** FFX swapchain (`FrameGenerationSwapChainForHwndDX12`) takes over the window through the shared hand-over (`src/fsr/swapchain.rs`, see `docs/blockers.md` B-10); composites a separate native-resolution UI texture onto real *and* generated frames; `ffxDispatchDescFrameGeneration` runs on the swapchain's interpolation command list. **Independent of the upscaler — works with FSR 1, FSR 2/3/4, the DLSS/XeSS fallback, or Upscaling Off entirely.** The FG context creates with the mandatory `ffxCreateContextDescFrameGenerationVersion` plus the DX12 backend descriptor, and retries the older advertised FG providers before giving up; FFX diagnostic messages are piped to stderr (`[FSR ...]`). Failure restores the standard present path for the session. | Vendored AMD SDK 2.4.0 (included) + Windows/DX12 + any real GPU. |
-| DLSS Frame Generation | **Implemented, runtime-unverified.** `NVSDK_NGX_Feature_FrameGeneration` from the vendored `nvngx_dlssg.dll`, driven without Streamline: the viewer owns a flip-model swapchain for the window (shared hand-over, `src/fsr/swapchain.rs`), copies the composition into the current backbuffer, evaluates the feature so NGX writes the interpolated image into the next backbuffer, and presents both (`Present(1, 0)` then `Present(0, 0)`). Depth and the shared reprojected motion vectors are fed at internal resolution, the unwarped camera matrices as `ClipToPrevClip`/`PrevClipToClip`. **Independent of the upscaler — works with DLSS SR, FSR, XeSS or Upscaling Off, but needs an RTX 40-series or newer GPU** (the setting is gated on the GPU name). The UI is interpolated with the scene, so no UI mode can drop the HUD. Any init/create/evaluate failure logs the named `NVSDK_NGX_Result` and restores the standard present path for the session. | Vendored NVIDIA DLSS/NGX (`nvngx_dlssg.dll`, included in `sdk/`) + Windows/DX12 + an RTX 40-series or newer GPU. |
-| XeSS Frame Generation | **Implemented, runtime-unverified.** XeSS-FG proxy swapchain (`xefgSwapChainD3D12InitFromSwapChainDesc`) takes over the window through the same hand-over, exactly like the FSR path. It paces real and interpolated frames and, by default, the UI is drawn into the composition so the model interpolates it together with the scene (Intel's first recommendation: UI composition disabled); `PW_XEFG_UI_COMPOSITION=1` switches to a separate native-resolution premultiplied-alpha UI texture (`HUDLESS_UITEXTURE`) that the proxy composites onto real *and* generated frames, keeping the UI sharp and never interpolated. **Documented pairing: XeSS upscaling or none.** Failure restores the standard present path for the session. | Vendored Intel XeSS SDK 3.0.2 (`libxess_fg.dll` **and** `libxell.dll`, included in `sdk/`) + Windows/DX12 + SM 6.4 GPU. |
+| FSR Frame Generation | **Implemented, runtime-unverified.** FFX swapchain (`FrameGenerationSwapChainForHwndDX12`) takes over the window through the shared hand-over (`src/fsr/swapchain.rs`, see `docs/blockers.md` B-10); keeps the UI in the composition by default so the interpolator never blends HUD pixels (`PW_FSRFG_UI_COMPOSITION=0` restores the separate native-resolution UI texture, which the proxy composites onto real *and* generated frames but which FFX tone-maps with the scene); `ffxDispatchDescFrameGeneration` runs on the swapchain's interpolation command list for `numGeneratedFrames = 1`, i.e. 2x. **Independent of the upscaler — works with FSR 1, FSR 2/3/4, the DLSS/XeSS fallback, or Upscaling Off entirely.** The FG context creates with the mandatory `ffxCreateContextDescFrameGenerationVersion` plus the DX12 backend descriptor, and retries the older advertised FG providers before giving up; FFX diagnostic messages are piped to stderr (`[FSR ...]`). Failure restores the standard present path for the session. | Vendored AMD SDK 2.4.0 (included) + Windows/DX12 + any real GPU. |
+| DLSS Frame Generation | **Implemented, runtime-unverified.** `NVSDK_NGX_Feature_FrameGeneration` from the vendored `nvngx_dlssg.dll`, driven without Streamline: the viewer owns a flip-model swapchain for the window (shared hand-over, `src/fsr/swapchain.rs`), copies the composition into the current backbuffer, then evaluates the feature once per generated frame — `DLSSG.MultiFrameCount` = n, `DLSSG.MultiFrameIndex` = 1..n, `DLSSG.BackbufferFrameID` monotonic — with each generated frame writing into its own backbuffer (`desc.BufferCount = n + 2`), and finally presents the real frame and every generated frame with `Present(1, 0)`. Presenting the generated frames with sync interval 0 instead lets the next real frame land on the same vblank, which coalesces the group away and reads as stutter. n = 1 on Ada (`DLSSG.MultiFrameCountMax` = 1, the 2x path); **DLSS Multi Frame Generation** (n > 1) needs Blackwell — see *Frame multiplier* below. Depth and the shared reprojected motion vectors are fed at internal resolution, the unwarped camera matrices as `ClipToPrevClip`/`PrevClipToClip`. **Independent of the upscaler — works with DLSS SR, FSR, XeSS or Upscaling Off, but needs an RTX 40-series or newer GPU** (the setting is gated on the GPU name). The UI is interpolated with the scene, so no UI mode can drop the HUD. Any init/create/evaluate failure logs the named `NVSDK_NGX_Result` and restores the standard present path for the session. | Vendored NVIDIA DLSS/NGX (`nvngx_dlssg.dll`, included in `sdk/`) + Windows/DX12 + an RTX 40-series or newer GPU. |
+| XeSS Frame Generation | **Implemented, runtime-unverified.** XeSS-FG proxy swapchain (`xefgSwapChainD3D12InitFromSwapChainDesc`) takes over the window through the same hand-over, exactly like the FSR path. It paces real and interpolated frames, takes the Frame multiplier through `XefgD3D12InitParams.maxInterpolatedFrames` (clamped to the `maxSupportedInterpolations` the SDK reports) and confirms it with `xefgSwapChainSetNumInterpolatedFrames`, and, by default, the UI is drawn into the composition so the model interpolates it together with the scene (Intel's first recommendation: UI composition disabled); `PW_XEFG_UI_COMPOSITION=1` switches to a separate native-resolution premultiplied-alpha UI texture (`HUDLESS_UITEXTURE`) that the proxy composites onto real *and* generated frames, keeping the UI sharp and never interpolated. **Documented pairing: XeSS upscaling or none.** Failure restores the standard present path for the session. | Vendored Intel XeSS SDK 3.0.2 (`libxess_fg.dll` **and** `libxell.dll`, included in `sdk/`) + Windows/DX12 + SM 6.4 GPU. |
+
+### Frame multiplier (x2 / x3 / x4 / x6)
+
+`Graphics → Frame multiplier` is how many frames are presented per rendered
+frame: the real frame plus `multiplier - 1` generated ones. It is a separate
+setting because the vendors genuinely differ, and nothing is unlocked behind a
+runtime's back — an entry that the hardware cannot do is greyed out with the
+reason on screen.
+
+| Multiplier | FSR Frame Generation | DLSS Frame Generation | XeSS Frame Generation |
+|---|---|---|---|
+| x2 | **yes** (`numGeneratedFrames = 1`) | **yes** (RTX 40 series and later) | **yes** |
+| x3 | no — greyed out | **yes** on Blackwell (RTX 50 series) | requested; the SDK clamps to the device maximum |
+| x4 | no — greyed out | **yes** on Blackwell | requested; clamped |
+| x6 | no — greyed out | **yes** on Blackwell (5 generated frames) | requested; clamped |
+
+* **DLSS** reads `DLSSG.MultiFrameCountMax` from the GPU architecture: the
+  runtime reports **1 on Ada**, so a 40-series card cannot interpolate more than
+  the single frame that 2x produces, and up to **5 on Blackwell**. Unlocking it
+  on Ada would mean patching `nvngx_dlssg.dll`, which this project does not do;
+  the option says so instead.
+* **XeSS** has `xefgSwapChainSetNumInterpolatedFrames`, and
+  `xefgSwapChainD3D12GetProperties` reports `maxSupportedInterpolations`. The
+  viewer asks for the setting, clamps to that maximum, and logs both numbers to
+  `session.log`, because Intel refuses an out-of-range count rather than
+  clamping it.
+* **FSR** frame generation generates exactly one frame per present
+  (`ffxDispatchDescFrameGeneration.numGeneratedFrames`; `outputs[4]` exists in
+  the header but the shipped runtime only fills one).
+
+Changing the multiplier rebuilds the active frame generator (the count is part
+of its construction), and the whole group is paced onto consecutive vsync
+intervals rather than being queued at once.
 
 XeLL (`libxell.dll`) is mandatory for XeSS-FG on every GPU — Intel Arc included — and the
 viewer creates the context itself, enables low-latency mode (`xellSetSleepMode`) and delivers
@@ -81,6 +129,7 @@ any upscaler (including Off) and with any frame generator.
 | Entry (Graphics tab) | Status | Gate |
 |---|---|---|
 | VSync | **Works** — the default, and what every build before this setting did. The display paces presents (`PresentMode::Fifo`); no latency library is involved. | Always available. |
+| Reflex | **Implemented, runtime-unverified.** NVIDIA's Reflex algorithm without Streamline: Streamline is never vendored (it takes the swapchain over through `sl.interposer`, which the frame generators already own), but what Reflex changes for a vsync'd presenter is an ordering rule — keep one frame in flight and start recording the next one only just before the display needs it. `crate::latency::ReflexPacer` implements exactly that: it seeds the frame period at 60 Hz, learns the real cadence from the present timestamps (slow exponential average), and sleeps the CPU until `budget - min(3 ms, budget/4)` after the previous present. Presentation is untouched (`Fifo`, sync interval 1), so this lowers input-to-photon latency without tearing, frame drops or a swapchain change, and it works with every upscaler and every frame generator (including none). The mark shows `Reflex pacing - N frames, X ms budget`. | Always available (any real GPU; no SDK, no vendor check, nothing to fail). |
 | XeLL | **Implemented, runtime-unverified.** Intel Xe Low Latency (`libxell.dll`): `xellSleep` holds the CPU back until the GPU queue is nearly empty (render-queue reduction), and the simulation / render-submit / present markers are delivered every frame so the library can line the end of rendering up with the display's refresh while keeping the wait short. Present stays vsync'd with sync interval 1 — Intel requires exactly that while low-latency mode is on — so this lowers latency *relative to* VSync rather than replacing it. The viewer creates the context itself (`src/latency.rs`), waits for an idle device before `xellSetSleepMode` (SDK requirement), keeps the marker edges ordered, and drops the context when the setting stops asking for it. Any failure logs, shows the reason on the mark, and leaves the vsync'd present path untouched. | Vendored Intel XeSS SDK 3.0.2 (`libxell.dll`, included in `sdk/`) + Windows/DX12 + a real GPU. XeLL is **selectable on every vendor** — the library, `xellSleep` and the per-frame markers work on any GPU, and the note under the combo says so. **On a non-Intel GPU, though, Intel only turns that into actual latency reduction while XeSS Frame Generation is active**, so on NVIDIA/AMD expect the markers to run without a measurable gain unless Frame generation = XeSS Frame Generation (where the frame generator owns the context). |
 
 Ownership: XeSS Frame Generation needs a XeLL context of its own and refuses to
@@ -95,8 +144,10 @@ generator — or none — the viewer's own session runs.
 While an upscaler, frame generation or XeLL is active, the viewer draws a small
 non-interactive mark (top-left) showing the live path: the FFX provider
 actually selected (e.g. `FSR 4.1.2`), `FSR 1 (EASU + RCAS)`, `XeSS (<quality>)`,
-`FG x2` / `XeSS FG x2` with the pipeline's finished-frame counter, and
-`XeLL <version> - N frames paced` (or `XeLL via XeSS FG`) for the latency
+`FG x2` / `XeSS FG x2` with the pipeline's finished-frame counter (the
+multiplier shown is the one the frame generator was built with, so a clamped
+XeSS request still reads honestly), and `XeLL <version> - N frames paced` (or
+`XeLL via XeSS FG`, or `Reflex pacing - N frames, X ms budget`) for the latency
 setting. When a path
 fails and the fallback engaged, the mark shows a red line (with the reason,
 truncated) saying so instead of vanishing.
@@ -108,7 +159,8 @@ truncated) saying so instead of vanishing.
 `fsr1_sharpness=<0..2 stops>` ·
 `fsr3_sharpness=<0..1>` (FFX sharpening for FSR 3.1/4 and Native AA) ·
 `frame_generation=off|dlss|fsr|xess` ·
-`latency=vsync|xell` ·
+`frame_multiplier=2|3|4|6` (also accepted: `x2`, `2x`, …) ·
+`latency=vsync|reflex|xell` ·
 `upscale_sdk_dir=<path>` (FFX / XeSS SDKs; empty = env var or `<exe>\sdk\`).
 
 ## Verifying the vendor binaries

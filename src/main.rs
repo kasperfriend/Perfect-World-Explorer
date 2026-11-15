@@ -908,6 +908,21 @@ impl GpuFacts {
         self.vendor == VENDOR_INTEL
     }
 
+    /// Heuristic for DLSS Multi Frame Generation (more than one interpolated
+    /// frame per present).
+    ///
+    /// The runtime is the authority and reports it as
+    /// `DLSSG.MultiFrameCountMax`: 1 on Ada (RTX 40 series), so a 40-series
+    /// card can only interpolate the single frame that 2x produces, and up to
+    /// 5 on Blackwell (RTX 50 series) — which is what x3/x4/x6 need. This
+    /// decides whether the higher multipliers are offered at all; it never
+    /// unlocks anything the DLL does not already allow.
+    pub fn supports_dlss_multi_frame_generation(name: &str) -> bool {
+        let n = name.to_lowercase();
+        const NEEDLES: [&str; 6] = ["rtx 50", "rtx 5888", "b100", "b200", "gb200", "gb300"];
+        NEEDLES.iter().any(|needle| n.contains(needle))
+    }
+
     /// Heuristic for DLSS Frame Generation eligibility (Ada/Lovelace-class,
     /// i.e. RTX 40 series and later). The NVIDIA SDK is the authority; this
     /// only decides whether the option is offered before the SDK says so.
@@ -1288,14 +1303,20 @@ pub enum LatencyMode {
     /// Intel Xe Low Latency: xellSleep + per-frame markers over a vsync'd
     /// present with sync interval 1.
     Xell,
+    /// NVIDIA-style low latency without Streamline: the CPU is held back so a
+    /// frame is submitted just before the display is ready for it, instead of a
+    /// frame or two early. Decoupled from frame generation and from the
+    /// upscaler, and it needs no vendor library.
+    Reflex,
 }
 
 impl LatencyMode {
-    pub const ALL: [Self; 2] = [Self::Vsync, Self::Xell];
+    pub const ALL: [Self; 3] = [Self::Vsync, Self::Reflex, Self::Xell];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Vsync => "VSync",
+            Self::Reflex => "Reflex (decoupled CPU pacing)",
             Self::Xell => "XeLL (Intel Xe Low Latency)",
         }
     }
@@ -1303,6 +1324,7 @@ impl LatencyMode {
     pub fn token(self) -> &'static str {
         match self {
             Self::Vsync => "vsync",
+            Self::Reflex => "reflex",
             Self::Xell => "xell",
         }
     }
@@ -1311,6 +1333,7 @@ impl LatencyMode {
     pub fn parse(text: &str) -> Option<Self> {
         match text.trim().to_ascii_lowercase().as_str() {
             "vsync" | "vsync (on)" => Some(Self::Vsync),
+            "reflex" | "reflex (decoupled)" => Some(Self::Reflex),
             "xell" | "xell (low latency)" => Some(Self::Xell),
             _ => None,
         }
@@ -1325,7 +1348,9 @@ impl LatencyMode {
     /// whenever it changes, so the setting is wired rather than decorative.
     pub fn present_mode(self) -> wgpu::PresentMode {
         match self {
-            Self::Vsync | Self::Xell => wgpu::PresentMode::Fifo,
+            // Reflex only moves the CPU wake-up, XeLL needs sync interval 1;
+            // all three latency modes present with vsync.
+            Self::Vsync | Self::Reflex | Self::Xell => wgpu::PresentMode::Fifo,
         }
     }
 }
@@ -1349,10 +1374,138 @@ pub enum LatencyOwner {
 pub fn latency_owner(mode: LatencyMode, frame_generation: FrameGenMethod) -> LatencyOwner {
     match mode {
         LatencyMode::Vsync => LatencyOwner::Vsync,
+        // Reflex-style pacing is the viewer's own: no vendor library, and no
+        // interaction with the frame generator's own present queue.
+        LatencyMode::Reflex => LatencyOwner::Independent,
         LatencyMode::Xell => match frame_generation {
             FrameGenMethod::Xess => LatencyOwner::FrameGeneration,
             _ => LatencyOwner::Independent,
         },
+    }
+}
+
+/// How many frames the frame generator produces per rendered frame: one real
+/// frame followed by `multiplier - 1` interpolated ones.
+///
+/// It is a separate setting from [`FrameGenMethod`] because the vendors differ
+/// in what they can do:
+///
+/// * DLSS Frame Generation reports `DLSSG.MultiFrameCountMax` from the GPU
+///   architecture — 1 (2x only) on Ada, up to 5 (6x) on Blackwell.
+/// * XeSS Frame Generation has `xefgSwapChainSetNumInterpolatedFrames` and
+///   reports its own maximum through `xefgSwapChainD3D12GetProperties`; the
+///   viewer asks for the setting and the runtime clamps to what it supports.
+/// * FSR Frame Generation interpolates exactly one frame per present
+///   (`ffxDispatchDescFrameGeneration`), so it is 2x only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FrameMultiplier {
+    #[default]
+    X2,
+    X3,
+    X4,
+    X6,
+}
+
+impl FrameMultiplier {
+    pub const ALL: [Self; 4] = [Self::X2, Self::X3, Self::X4, Self::X6];
+
+    /// Presented frames per rendered frame.
+    pub fn multiplier(self) -> u32 {
+        match self {
+            Self::X2 => 2,
+            Self::X3 => 3,
+            Self::X4 => 4,
+            Self::X6 => 6,
+        }
+    }
+
+    /// Frames the generator has to interpolate per rendered frame.
+    pub fn generated(self) -> u32 {
+        self.multiplier() - 1
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::X2 => "x2 (1 generated frame)",
+            Self::X3 => "x3 (2 generated frames)",
+            Self::X4 => "x4 (3 generated frames)",
+            Self::X6 => "x6 (5 generated frames)",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::X2 => "x2",
+            Self::X3 => "x3",
+            Self::X4 => "x4",
+            Self::X6 => "x6",
+        }
+    }
+
+    /// Persisted spelling.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::X2 => "2",
+            Self::X3 => "3",
+            Self::X4 => "4",
+            Self::X6 => "6",
+        }
+    }
+
+    /// Accepted spellings; anything else keeps the default instead of guessing.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "2" | "x2" | "2x" => Some(Self::X2),
+            "3" | "x3" | "3x" => Some(Self::X3),
+            "4" | "x4" | "4x" => Some(Self::X4),
+            "6" | "x6" | "6x" => Some(Self::X6),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `method` can present `multiplier` frames per rendered frame.
+///
+/// 2x is whatever the frame generation gate already allows; the higher
+/// multipliers are vendor- and GPU-specific, so each one carries its own
+/// reason when it is not available.
+pub fn multiplier_support(
+    method: FrameGenMethod,
+    multiplier: FrameMultiplier,
+    gpu: &GpuFacts,
+    sdk: &SdkReport,
+) -> Support {
+    if multiplier == FrameMultiplier::X2 {
+        return Support::Available("every frame generator interpolates one frame per present");
+    }
+    let base = support_framegen(method, UpscaleMethod::Off, gpu, sdk);
+    match method {
+        FrameGenMethod::Off => Support::Disabled("frame generation is off".to_string()),
+        FrameGenMethod::Fsr => Support::Disabled(
+            "AMD's FSR frame generation interpolates exactly one frame per present (2x)"
+                .to_string(),
+        ),
+        FrameGenMethod::Dlss => {
+            if !base.is_available() {
+                return base;
+            }
+            if !GpuFacts::supports_dlss_multi_frame_generation(&gpu.name) {
+                Support::Disabled(format!(
+                    "DLSS Multi Frame Generation needs an RTX 50-series (Blackwell) GPU; on this GPU the runtime reports one generated frame (detected: {})",
+                    gpu.name
+                ))
+            } else {
+                Support::Available("DLSS Multi Frame Generation (DLSSG.MultiFrameCount)")
+            }
+        }
+        FrameGenMethod::Xess => {
+            if !base.is_available() {
+                return base;
+            }
+            Support::Available(
+                "XeSS Frame Generation sets the count through xefgSwapChainSetNumInterpolatedFrames; the runtime clamps to its own maximum (logged)",
+            )
+        }
     }
 }
 
@@ -1376,6 +1529,18 @@ pub fn support_latency(
 ) -> Support {
     match mode {
         LatencyMode::Vsync => Support::Available("vsync'd present, no latency library"),
+        LatencyMode::Reflex => {
+            if gpu.cpu_fallback {
+                Support::Disabled("Requires a real GPU (software adapter detected)".to_string())
+            } else {
+                // No SDK and no vendor check: the pacer only needs a present
+                // cadence to lock onto, so it works on every GPU, with or
+                // without frame generation, and with any upscaler.
+                Support::Available(
+                    "CPU pacing to the present cadence (NVIDIA's Reflex algorithm, no Streamline)",
+                )
+            }
+        }
         LatencyMode::Xell => {
             if !cfg!(windows) {
                 Support::Disabled(
@@ -2632,6 +2797,136 @@ mod tests {
             .reason()
             .unwrap()
             .contains("PW_UPSCALER_SDK_DIR"));
+    }
+
+    fn nvidia_rtx5090() -> GpuFacts {
+        GpuFacts::from_parts(
+            VENDOR_NVIDIA,
+            0x2b85,
+            "NVIDIA GeForce RTX 5090",
+            "dx12",
+            false,
+        )
+    }
+
+    /// Every multiplier keeps its token, its label spelling and the frame
+    /// arithmetic the generators are driven with.
+    #[test]
+    fn frame_multiplier_round_trips() {
+        for multiplier in FrameMultiplier::ALL {
+            assert_eq!(FrameMultiplier::parse(multiplier.token()), Some(multiplier));
+            assert_eq!(
+                FrameMultiplier::parse(multiplier.short_label()),
+                Some(multiplier)
+            );
+            assert_eq!(multiplier.multiplier(), multiplier.generated() + 1);
+            assert!(multiplier.label().starts_with(multiplier.short_label()));
+        }
+        assert_eq!(FrameMultiplier::default(), FrameMultiplier::X2);
+        assert_eq!(FrameMultiplier::X6.generated(), 5);
+        assert_eq!(FrameMultiplier::parse("8"), None);
+        assert_eq!(FrameMultiplier::parse("x5"), None);
+        // Both spellings a user might type are accepted; the persisted form is
+        // the bare number, so a round trip cannot drift.
+        assert_eq!(FrameMultiplier::parse("3x"), Some(FrameMultiplier::X3));
+    }
+
+    /// 2x is always available; the rest follow the vendor and the GPU, and
+    /// every refusal says why (the UI greys the option out with that text).
+    #[test]
+    fn multiplier_support_matrix() {
+        let sdk = full_sdk();
+        // 2x never depends on anything: it is what every generator does.
+        for method in FrameGenMethod::ALL {
+            assert!(
+                multiplier_support(method, FrameMultiplier::X2, &nvidia_rtx4070(), &sdk)
+                    .is_available()
+            );
+        }
+        // Ada reports `MultiFrameCountMax = 1`, so nothing above 2x there.
+        let ada = multiplier_support(
+            FrameGenMethod::Dlss,
+            FrameMultiplier::X4,
+            &nvidia_rtx4070(),
+            &sdk,
+        );
+        assert!(!ada.is_available());
+        assert!(ada.reason().unwrap().contains("RTX 50-series"));
+        // Blackwell does, up to 6x (5 generated frames).
+        for multiplier in [
+            FrameMultiplier::X3,
+            FrameMultiplier::X4,
+            FrameMultiplier::X6,
+        ] {
+            assert!(
+                multiplier_support(FrameGenMethod::Dlss, multiplier, &nvidia_rtx5090(), &sdk)
+                    .is_available()
+            );
+        }
+        // FSR interpolates exactly one frame per present, by design.
+        let fsr = multiplier_support(
+            FrameGenMethod::Fsr,
+            FrameMultiplier::X3,
+            &amd_rx9070(),
+            &sdk,
+        );
+        assert!(!fsr.is_available());
+        assert!(fsr.reason().unwrap().contains("exactly one frame"));
+        // XeSS is offered and clamped at runtime.
+        assert!(multiplier_support(
+            FrameGenMethod::Xess,
+            FrameMultiplier::X4,
+            &intel_arc_a770(),
+            &sdk
+        )
+        .is_available());
+        // Without the SDK the underlying generator is unavailable, and that
+        // reason wins over the multiplier-specific one.
+        let no_xess = multiplier_support(
+            FrameGenMethod::Xess,
+            FrameMultiplier::X4,
+            &intel_arc_a770(),
+            &no_sdk(),
+        );
+        assert!(!no_xess.is_available());
+        assert!(!no_xess.reason().unwrap().is_empty());
+        // Frame generation off disables every multiplier above 2x.
+        assert!(!multiplier_support(
+            FrameGenMethod::Off,
+            FrameMultiplier::X3,
+            &nvidia_rtx5090(),
+            &sdk
+        )
+        .is_available());
+    }
+
+    /// Reflex is the viewer's own pacer: independent of the frame generator,
+    /// and available without any vendor library.
+    #[test]
+    fn reflex_is_an_independent_latency_owner() {
+        for frame_generation in FrameGenMethod::ALL {
+            assert_eq!(
+                latency_owner(LatencyMode::Reflex, frame_generation),
+                LatencyOwner::Independent
+            );
+            let support = support_latency(
+                LatencyMode::Reflex,
+                frame_generation,
+                &amd_rx9070(),
+                &no_sdk(),
+            );
+            assert!(support.is_available());
+        }
+        assert!(!support_latency(
+            LatencyMode::Reflex,
+            FrameGenMethod::Off,
+            &software(),
+            &no_sdk()
+        )
+        .is_available());
+        assert_eq!(LatencyMode::parse("reflex"), Some(LatencyMode::Reflex));
+        assert_eq!(LatencyMode::Reflex.token(), "reflex");
+        assert_eq!(LatencyMode::Reflex.present_mode(), wgpu::PresentMode::Fifo);
     }
 }
 

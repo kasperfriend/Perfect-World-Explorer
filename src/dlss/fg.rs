@@ -77,6 +77,7 @@ const P_BACKBUFFER: &str = "DLSSG.Backbuffer";
 const P_DEPTH: &str = "DLSSG.Depth";
 const P_MVECS: &str = "DLSSG.MVecs";
 const P_OUTPUT_INTERPOLATED: &str = "DLSSG.OutputInterpolated";
+const P_BACKBUFFER_FRAME_ID: &str = "DLSSG.BackbufferFrameID";
 // Per-frame scalars.
 const P_MULTI_FRAME_COUNT: &str = "DLSSG.MultiFrameCount";
 const P_MULTI_FRAME_INDEX: &str = "DLSSG.MultiFrameIndex";
@@ -105,6 +106,8 @@ pub struct DlssFrameGeneration {
     /// Our own flip-model swapchain for the window.
     swapchain: *mut IDXGISwapChain1,
     buffer_count: u32,
+    /// Frames NGX interpolates per rendered frame (`MultiFrameCount`).
+    generated_frames: u32,
     display_extent: (u32, u32),
     render_extent: (u32, u32),
     /// The full-resolution image the caller renders into.
@@ -147,7 +150,9 @@ impl DlssFrameGeneration {
         render_extent: (u32, u32),
         display_extent: (u32, u32),
         surface_format: wgpu::TextureFormat,
+        generated_frames: u32,
     ) -> Result<Self, String> {
+        let generated_frames = generated_frames.clamp(1, 5);
         let _ = queue;
         let (raw_device, raw_queue) = raw_dx12(device)?;
         let device_ptr = raw_device.as_mut_ptr() as *mut c_void;
@@ -177,6 +182,11 @@ impl DlssFrameGeneration {
         let handover = prepared.report;
         // Two presents per app frame: no waitable object, see the module docs.
         desc.Flags &= !DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        // One backbuffer for the real frame and one per generated frame, plus
+        // DXGI's spare: a presented group cannot come out of fewer buffers.
+        // This has to be decided before the swapchain is created — the buffer
+        // count is an immutable property of it.
+        desc.BufferCount = desc.BufferCount.max(generated_frames + 2);
         let mut fullscreen = prepared.fullscreen;
         crate::dlss::diag(&format!(
             "[DLSS FG] window hand-over: {handover}; proxy swapchain {}x{}, {} buffers, format 0x{:08x}, flags 0x{:x}",
@@ -299,8 +309,14 @@ impl DlssFrameGeneration {
         let mv_pass = FsrMotionVectorPass::new(device);
 
         crate::dlss::diag(&format!(
-            "[DLSS FG] DLSS-G ready: {}x{} internal -> {}x{} presented, {} buffers",
-            render_extent.0, render_extent.1, display_extent.0, display_extent.1, buffer_count
+            "[DLSS FG] DLSS-G ready: {}x{} internal -> {}x{} presented, {} buffers, x{} ({} generated frame(s) per rendered frame)",
+            render_extent.0,
+            render_extent.1,
+            display_extent.0,
+            display_extent.1,
+            buffer_count,
+            generated_frames + 1,
+            generated_frames
         ));
 
         Ok(Self {
@@ -311,6 +327,7 @@ impl DlssFrameGeneration {
             ring,
             swapchain,
             buffer_count,
+            generated_frames,
             display_extent,
             render_extent,
             compose,
@@ -450,14 +467,23 @@ impl DlssFrameGeneration {
         Ok(())
     }
 
-    /// Interpolates one frame and presents the real frame followed by the
-    /// generated one.
+    /// Interpolates `generated_frames` frames and presents the real frame
+    /// followed by each generated one.
+    ///
+    /// One `EvaluateFeature` per generated frame, each writing into its own
+    /// backbuffer (`DLSSG.MultiFrameIndex` 1..n, `DLSSG.MultiFrameCount` = n) —
+    /// that is how the runtime's multi frame generation is driven; it decides
+    /// from the GPU architecture whether it will fill more than the first
+    /// (`DLSSG.MultiFrameCountMax` is 1 on Ada, higher on Blackwell).
     pub fn finish(&mut self, _ui_visible: bool) -> Result<(), String> {
         let sc3 = self.swapchain as *mut IDXGISwapChain3;
         let index = unsafe { (*sc3).GetCurrentBackBufferIndex() };
-        let next = (index + 1) % self.buffer_count.max(2);
+        let count = self.buffer_count.max(2);
         let mut real = self.backbuffer(index)?;
-        let mut interpolated = self.backbuffer(next)?;
+        let mut generated = Vec::with_capacity(self.generated_frames as usize);
+        for step in 1..=self.generated_frames {
+            generated.push(self.backbuffer((index + step) % count)?);
+        }
 
         let slot_index = self.ring.acquire("DLSS FG")?;
         let subresource = d3d12_ty::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
@@ -467,36 +493,37 @@ impl DlssFrameGeneration {
         };
 
         let list = &mut self.ring.slot_mut(slot_index).list;
-        let barriers = [
-            barrier(
-                &self.compose.resource,
-                D3D12_STATE_RENDER_TARGET,
-                D3D12_STATE_COPY_SRC,
-            ),
-            barrier(
-                &self.depth.resource,
-                D3D12_STATE_RENDER_TARGET,
-                D3D12_STATE_NON_PIXEL_READ,
-            ),
-            barrier(
-                &self.mv.resource,
-                D3D12_STATE_RENDER_TARGET,
-                D3D12_STATE_NON_PIXEL_READ,
-            ),
-            barrier(&real, D3D12_STATE_PRESENT, D3D12_STATE_COPY_DEST),
-            barrier(
-                &interpolated,
+        let mut barriers = Vec::with_capacity(5 + generated.len());
+        barriers.push(barrier(
+            &self.compose.resource,
+            D3D12_STATE_RENDER_TARGET,
+            D3D12_STATE_COPY_SRC,
+        ));
+        barriers.push(barrier(
+            &self.depth.resource,
+            D3D12_STATE_RENDER_TARGET,
+            D3D12_STATE_NON_PIXEL_READ,
+        ));
+        barriers.push(barrier(
+            &self.mv.resource,
+            D3D12_STATE_RENDER_TARGET,
+            D3D12_STATE_NON_PIXEL_READ,
+        ));
+        barriers.push(barrier(&real, D3D12_STATE_PRESENT, D3D12_STATE_COPY_DEST));
+        for target in &generated {
+            barriers.push(barrier(
+                target,
                 D3D12_STATE_PRESENT,
                 D3D12_STATE_UNORDERED_ACCESS,
-            ),
-        ];
+            ));
+        }
         list.resource_barrier(&barriers);
         // `CopyResource` has no safe wrapper in the d3d12 crate.
         unsafe {
             (*list.as_mut_ptr())
                 .CopyResource(real.as_mut_ptr(), self.compose.resource.as_mut_ptr());
         }
-        // NGX reads the real backbuffer and writes the next one.
+        // NGX reads the real backbuffer and writes the generated ones.
         let to_input = [barrier(
             &real,
             D3D12_STATE_COPY_DEST,
@@ -510,19 +537,20 @@ impl DlssFrameGeneration {
             .set_d3d12_resource(P_DEPTH, self.depth.resource.as_mut_ptr() as *mut c_void);
         self.params
             .set_d3d12_resource(P_MVECS, self.mv.resource.as_mut_ptr() as *mut c_void);
-        self.params.set_d3d12_resource(
-            P_OUTPUT_INTERPOLATED,
-            interpolated.as_mut_ptr() as *mut c_void,
-        );
-        // One interpolated frame per rendered frame (2x).
-        self.params.set_u32(P_MULTI_FRAME_COUNT, 1);
-        self.params.set_u32(P_MULTI_FRAME_INDEX, 1);
+        // `MultiFrameCount` is how many frames this pair gets; `MultiFrameIndex`
+        // identifies which one the call is producing.
+        self.params
+            .set_u32(P_MULTI_FRAME_COUNT, self.generated_frames.max(1));
+        self.params
+            .set_u32(P_BACKBUFFER_FRAME_ID, self.frame_index as u32);
         // The viewer renders jittered for DLSS SR and unjittered otherwise; the
         // interpolation is driven by the motion vectors either way, so no
         // jitter offset is reported (`prepare` feeds unjittered matrices).
         self.params.set_f32(P_JITTER_X, 0.0);
         self.params.set_f32(P_JITTER_Y, 0.0);
-        // Motion vectors are in pixels, so the scale is 1:1.
+        // Motion vectors are in pixels, so the scale is 1:1. (The header's
+        // "[-1,1] range" wording is Streamline's convention; feeding
+        // 1/render-size here makes DLSS-G see no motion and produce cross-fades.)
         self.params.set_f32(P_MVEC_SCALE_X, 1.0);
         self.params.set_f32(P_MVEC_SCALE_Y, 1.0);
         // Reversed-Z depth, camera motion is in the vectors, LDR swapchain.
@@ -543,63 +571,82 @@ impl DlssFrameGeneration {
             &self.prev_clip_to_clip as *const _ as *mut c_void,
         );
 
-        let result = unsafe {
-            (self.api.evaluate_feature)(
-                list.as_mut_ptr() as *mut c_void,
-                self.handle,
-                self.params.as_ptr(),
-                std::ptr::null(),
-            )
-        };
+        let mut failure = 0;
+        for (step, target) in generated.iter_mut().enumerate() {
+            self.params.set_u32(P_MULTI_FRAME_INDEX, step as u32 + 1);
+            self.params
+                .set_d3d12_resource(P_OUTPUT_INTERPOLATED, target.as_mut_ptr() as *mut c_void);
+            let result = unsafe {
+                (self.api.evaluate_feature)(
+                    list.as_mut_ptr() as *mut c_void,
+                    self.handle,
+                    self.params.as_ptr(),
+                    std::ptr::null(),
+                )
+            };
+            if !crate::dlss::succeeded(result) {
+                failure = result;
+                break;
+            }
+        }
 
-        let restore = [
-            barrier(
-                &self.compose.resource,
-                D3D12_STATE_COPY_SRC,
-                D3D12_STATE_RENDER_TARGET,
-            ),
-            barrier(
-                &self.depth.resource,
-                D3D12_STATE_NON_PIXEL_READ,
-                D3D12_STATE_RENDER_TARGET,
-            ),
-            barrier(
-                &self.mv.resource,
-                D3D12_STATE_NON_PIXEL_READ,
-                D3D12_STATE_RENDER_TARGET,
-            ),
-            barrier(&real, D3D12_STATE_NON_PIXEL_READ, D3D12_STATE_PRESENT),
-            barrier(
-                &interpolated,
+        let mut restore = Vec::with_capacity(4 + generated.len());
+        restore.push(barrier(
+            &self.compose.resource,
+            D3D12_STATE_COPY_SRC,
+            D3D12_STATE_RENDER_TARGET,
+        ));
+        restore.push(barrier(
+            &self.depth.resource,
+            D3D12_STATE_NON_PIXEL_READ,
+            D3D12_STATE_RENDER_TARGET,
+        ));
+        restore.push(barrier(
+            &self.mv.resource,
+            D3D12_STATE_NON_PIXEL_READ,
+            D3D12_STATE_RENDER_TARGET,
+        ));
+        restore.push(barrier(
+            &real,
+            D3D12_STATE_NON_PIXEL_READ,
+            D3D12_STATE_PRESENT,
+        ));
+        for target in &generated {
+            restore.push(barrier(
+                target,
                 D3D12_STATE_UNORDERED_ACCESS,
                 D3D12_STATE_PRESENT,
-            ),
-        ];
+            ));
+        }
         list.resource_barrier(&restore);
         self.ring.retire(slot_index, &self.queue, "DLSS FG")?;
 
-        if !crate::dlss::succeeded(result) {
-            return Err(format!(
-                "NVSDK_NGX_D3D12_EvaluateFeature(DLSS-G) failed ({})",
-                crate::dlss::result_name(result)
-            ));
-        }
-
-        // Real frame, then the interpolated one. `Present(1, 0)` paces against
-        // vblank; the second present is queued and shown on the next refresh.
+        // Every frame in the group flips on its own vblank. Presenting the
+        // generated frames with sync interval 0 instead lets the app queue the
+        // next group's real frame on the same vblank, so the generated frames
+        // get coalesced away and the result judders — which is exactly what
+        // "stutters when frame generation is on" looks like.
         let sc = self.swapchain as *mut IDXGISwapChain;
         let hr = unsafe { (*sc).Present(1, 0) };
         if hr < 0 {
             return Err(format!("DLSS FG Present(real) failed (HRESULT 0x{hr:08x})"));
         }
-        let hr = unsafe { (*sc).Present(0, 0) };
-        if hr < 0 {
+        self.frame_index += 1;
+        if failure != 0 {
             return Err(format!(
-                "DLSS FG Present(interpolated) failed (HRESULT 0x{hr:08x})"
+                "NVSDK_NGX_D3D12_EvaluateFeature(DLSS-G) failed ({})",
+                crate::dlss::result_name(failure)
             ));
         }
-
-        self.frame_index += 1;
+        for step in 0..generated.len() {
+            let hr = unsafe { (*sc).Present(1, 0) };
+            if hr < 0 {
+                return Err(format!(
+                    "DLSS FG Present(generated {}) failed (HRESULT 0x{hr:08x})",
+                    step + 1
+                ));
+            }
+        }
         self.presents += 1;
         Ok(())
     }

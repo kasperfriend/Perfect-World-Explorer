@@ -44,10 +44,13 @@
 //! (`PW_XEFG_UI_COMPOSITION=1`); it keeps the UI un-interpolated at the cost of
 //! putting four SDK-visible inputs on the critical path.
 //!
-//! Non-Intel GPUs fall back to SM 6.4 kernels and produce a maximum of one
-//! interpolated frame per real frame; Intel discrete GPUs may support more,
-//! but this path asks for exactly one everywhere (2x), matching the FSR
-//! frame generation behavior.
+//! How many frames are interpolated per real frame is the Graphics tab's
+//! Frame multiplier: the request goes into `XefgD3D12InitParams`'
+//! `maxInterpolatedFrames` and, for live changes, through
+//! `xefgSwapChainSetNumInterpolatedFrames`. The SDK caps it per device
+//! (`maxSupportedInterpolations` from `xefgSwapChainD3D12GetProperties`) and
+//! the viewer logs what it actually handed over, so a clamp is visible in
+//! `session.log` instead of being silently ignored.
 
 use super::loader::{free_sdk_dll, load_sdk_dll};
 use super::xell::{
@@ -320,6 +323,8 @@ type PfnXefgSetUiCompositionState = unsafe extern "C" fn(context: *mut c_void, s
 type PfnXefgSetLatencyReduction =
     unsafe extern "C" fn(context: *mut c_void, xell: *mut c_void) -> i32;
 type PfnXefgSetPresentId = unsafe extern "C" fn(context: *mut c_void, present_id: u32) -> i32;
+type PfnXefgSetNumInterpolatedFrames =
+    unsafe extern "C" fn(context: *mut c_void, num_interpolated_frames: u32) -> i32;
 type PfnXefgGetLastPresentStatus =
     unsafe extern "C" fn(context: *mut c_void, out_status: *mut XefgPresentStatus) -> i32;
 type PfnXefgDestroy = unsafe extern "C" fn(context: *mut c_void) -> i32;
@@ -352,6 +357,7 @@ struct XefgLoader {
     set_ui_composition_state: PfnXefgSetUiCompositionState,
     set_latency_reduction: PfnXefgSetLatencyReduction,
     set_present_id: PfnXefgSetPresentId,
+    set_num_interpolated_frames: PfnXefgSetNumInterpolatedFrames,
     get_last_present_status: PfnXefgGetLastPresentStatus,
     destroy_context: PfnXefgDestroy,
     get_properties: PfnXefgD3D12GetProperties,
@@ -370,6 +376,7 @@ impl XefgLoader {
             b"xefgSwapChainSetUiCompositionState\0",
             b"xefgSwapChainSetLatencyReduction\0",
             b"xefgSwapChainSetPresentId\0",
+            b"xefgSwapChainSetNumInterpolatedFrames\0",
             b"xefgSwapChainGetLastPresentStatus\0",
             b"xefgSwapChainDestroy\0",
             b"xefgSwapChainD3D12GetProperties\0",
@@ -389,10 +396,11 @@ impl XefgLoader {
             set_ui_composition_state: unsafe { std::mem::transmute(exports[7]) },
             set_latency_reduction: unsafe { std::mem::transmute(exports[8]) },
             set_present_id: unsafe { std::mem::transmute(exports[9]) },
-            get_last_present_status: unsafe { std::mem::transmute(exports[10]) },
-            destroy_context: unsafe { std::mem::transmute(exports[11]) },
-            get_properties: unsafe { std::mem::transmute(exports[12]) },
-            set_logging: unsafe { std::mem::transmute(exports[13]) },
+            set_num_interpolated_frames: unsafe { std::mem::transmute(exports[10]) },
+            get_last_present_status: unsafe { std::mem::transmute(exports[11]) },
+            destroy_context: unsafe { std::mem::transmute(exports[12]) },
+            get_properties: unsafe { std::mem::transmute(exports[13]) },
+            set_logging: unsafe { std::mem::transmute(exports[14]) },
         };
         Ok(loader)
     }
@@ -485,8 +493,10 @@ impl XessFrameGeneration {
         display_extent: (u32, u32),
         surface_format: wgpu::TextureFormat,
         ui_format: wgpu::TextureFormat,
+        interpolated_frames: u32,
     ) -> Result<XessFrameGeneration, String> {
         let _ = queue;
+        let interpolated_frames = interpolated_frames.max(1);
         let (raw_device, raw_queue) = raw_dx12(device)?;
         let device_ptr = raw_device.as_mut_ptr() as *mut c_void;
         let queue_ptr = raw_queue.as_mut_ptr() as *mut c_void;
@@ -585,10 +595,10 @@ impl XessFrameGeneration {
             Ok(value) => value.trim() != "0",
             Err(_) => true,
         };
-        let init_params = XefgD3D12InitParams {
+        let mut init_params = XefgD3D12InitParams {
             application_swapchain: std::ptr::null_mut(), // desc-based: XeSS-FG creates the proxy
             init_flags,
-            max_interpolated_frames: 1,
+            max_interpolated_frames: interpolated_frames,
             creation_node_mask: 0,
             visible_node_mask: 0,
             temp_buffer_heap: std::ptr::null_mut(),
@@ -615,11 +625,23 @@ impl XessFrameGeneration {
                 &mut properties,
             )
         };
+        // `maxInterpolatedFrames` must be between one and the device maximum
+        // (or `XEFG_SWAPCHAIN_USE_MAX_SUPPORTED_INTERPOLATED_FRAMES`), and init
+        // rejects anything above it, so the request is clamped here instead of
+        // failing the whole frame generator on a x3/x4/x6 pick.
         if rc == 0 {
+            let max = properties.max_supported_interpolations.max(1);
             crate::xess::diag(&format!(
-                "[XeSS FG] maximum supported interpolations on this GPU: {}",
-                properties.max_supported_interpolations
+                "[XeSS FG] maximum supported interpolations on this GPU: {max}"
             ));
+            if init_params.max_interpolated_frames > max {
+                crate::xess::diag(&format!(
+                    "[XeSS FG] frame multiplier x{} becomes x{}: the device supports {max} interpolated frame(s)",
+                    init_params.max_interpolated_frames + 1,
+                    max + 1
+                ));
+                init_params.max_interpolated_frames = max;
+            }
         }
 
         // Latency reduction is mandatory for XeSS-FG.
@@ -680,6 +702,27 @@ impl XessFrameGeneration {
                  failure is inside XeSS-FG's own swapchain setup",
                 xefg_result_name(rc)
             ));
+        }
+
+        // Hand the clamped count to the live swapchain as well: `init` recorded
+        // the maximum, and the setter is what the runtime actually generates
+        // with (Intel recommends it for changes, and the value starts at the
+        // initialised maximum, so this is normally a no-op that proves the
+        // export is present and accepted).
+        let interpolated_frames = init_params.max_interpolated_frames.max(1);
+        unsafe {
+            let rc = (loader.set_num_interpolated_frames)(context, interpolated_frames);
+            if rc != 0 {
+                crate::xess::diag(&format!(
+                    "[XeSS FG] xefgSwapChainSetNumInterpolatedFrames({interpolated_frames}) returned {}; staying at the initialised count",
+                    xefg_result_name(rc)
+                ));
+            } else {
+                crate::xess::diag(&format!(
+                    "[XeSS FG] frame multiplier x{}: {interpolated_frames} interpolated frame(s) per rendered frame",
+                    interpolated_frames + 1
+                ));
+            }
         }
 
         // UI composition is off unless asked for: with it on, the proxy

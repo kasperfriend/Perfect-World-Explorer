@@ -17,7 +17,7 @@ use crate::fsr::{
     FsrMvParams, NativeCommandRing, NativeTexture2D, D3D12_STATE_COMMON, D3D12_STATE_COPY_DEST,
     D3D12_STATE_PIXEL_COMPUTE_READ, D3D12_STATE_RENDER_TARGET, D3D12_STATE_UNORDERED_ACCESS,
 };
-use glam::{Mat4, Vec3};
+use glam::Mat4;
 use std::ffi::c_void;
 use winapi::shared::dxgiformat::{DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_FLOAT};
 use winapi::um::d3d12 as d3d12_ty;
@@ -317,19 +317,14 @@ impl DlssUpscaler {
         self.current_jitter
     }
 
-    /// Post-projection clip-space translation matching `current_jitter`.
+    /// The jittered view-projection for this frame.
     ///
-    /// Same construction as the FSR and XeSS paths: DLSS wants the shear on
-    /// the projection matrix *and* the same pixel offset in its evaluate call,
-    /// so both describe the same sub-pixel sample position.
+    /// DLSS wants the shear on the projection matrix *and* the same pixel
+    /// offset in its evaluate call (`Jitter.Offset.X/Y`), so both describe the
+    /// same sub-pixel sample position — see
+    /// [`crate::fsr::jittered_clip_vp`].
     pub fn jittered_matrix(&self, matrix: Mat4) -> Mat4 {
-        let (jx, jy) = self.current_jitter;
-        let (w, h) = self.render_extent;
-        Mat4::from_translation(Vec3::new(
-            2.0 * jx / w.max(1) as f32,
-            -2.0 * jy / h.max(1) as f32,
-            0.0,
-        )) * matrix
+        crate::fsr::jittered_clip_vp(matrix, self.current_jitter, self.render_extent)
     }
 
     /// On camera cuts, teleports and DLSS re-enables the accumulation history

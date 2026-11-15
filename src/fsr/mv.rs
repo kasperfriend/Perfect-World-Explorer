@@ -3,7 +3,35 @@
 //! consume the same Rg16Float motion vectors and R32_FLOAT raw reversed-Z
 //! depth this pass emits.
 
+use glam::Mat4;
 use wgpu::TextureFormat;
+
+/// Clip-space jitter for a view-projection matrix.
+///
+/// The jitter must land as a constant *NDC* offset, i.e. `clip.xy += offset *
+/// clip.w` — the same thing the vendor guides describe as editing the
+/// projection matrix's `[2][0]` / `[2][1]` shear terms (DLSS: "jitter must be
+/// applied to the projection matrix", FSR: `jitteredVP`, XeSS: `xessSetJitter`).
+///
+/// Adding a plain translation to the combined matrix instead (`T * VP`) shifts
+/// *clip* space: after the perspective divide the on-screen offset becomes
+/// `offset / clip.w`, so it shrinks with depth. Near geometry jumps by whole
+/// pixels while the distance barely moves, which is exactly what a temporal
+/// accumulator cannot undo — it reads as heavy blur and ghosting that gets worse
+/// towards the horizon, and none of DLSS, XeSS or FSR can converge. Building the
+/// shear with the offset in the `w` column gives every pixel the same sub-pixel
+/// displacement, which is the premise they all share when they are also handed
+/// the same offset in pixels.
+///
+/// `jitter` is in render pixels with y down (the convention every vendor uses);
+/// NDC y is up, so the y term flips.
+pub(crate) fn jittered_clip_vp(matrix: Mat4, jitter: (f32, f32), extent: (u32, u32)) -> Mat4 {
+    let w = extent.0.max(1) as f32;
+    let h = extent.1.max(1) as f32;
+    let mut shear = Mat4::IDENTITY;
+    shear.w_axis = glam::Vec4::new(2.0 * jitter.0 / w, -2.0 * jitter.1 / h, 0.0, 1.0);
+    shear * matrix
+}
 
 const MV_SHADER: &str = r#"
 struct MvParams {
@@ -71,6 +99,21 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 }
 @fragment fn fs(i: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(textureSample(frame, samp, i.uv).rgb, 1.0);
+}
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let low = c / vec3<f32>(12.92);
+    let high = pow((c + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
+    return select(high, low, c <= vec3<f32>(0.04045));
+}
+// The world is rendered into an sRGB target, so the bytes the upscaler reads -
+// and the bytes it writes back - are sRGB encoded. Copying them straight into an
+// sRGB render target encodes them a second time: mid grey (0.5 encoded) lands at
+// 0.735, so every upscaled frame came out washed out and flat while the bilinear
+// `RenderScale` path (which samples an sRGB texture, i.e. let the hardware
+// decode) looked correct. Decoding here lets the target's own encode restore the
+// exact original bytes.
+@fragment fn fs_decode(i: VOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(srgb_to_linear(textureSample(frame, samp, i.uv).rgb), 1.0);
 }
 "#;
 
