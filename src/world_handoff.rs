@@ -9,6 +9,7 @@ use std::{
 
 const READY_ENV: &str = "PWE_WORLD_HANDOFF_READY_FILE";
 const STATUS_ENV: &str = "PWE_WORLD_HANDOFF_STATUS_FILE";
+const FOCUS_ENV: &str = "PWE_WORLD_HANDOFF_FOCUS_FILE";
 
 #[cfg(windows)]
 #[link(name = "user32")]
@@ -28,9 +29,11 @@ pub enum Message {
     Failed(String),
 }
 
+#[derive(Clone)]
 pub struct Files {
     ready: PathBuf,
     status: PathBuf,
+    focus: PathBuf,
 }
 impl Files {
     pub fn new() -> Self {
@@ -40,15 +43,23 @@ impl Files {
             .as_nanos();
         let stem = format!("pwe-world-handoff-{}-{nonce}", std::process::id());
         let root = std::env::temp_dir();
+        let focus = root.join(format!("{stem}.focus"));
+        let _ = fs::write(&focus, b"focused");
         Self {
             ready: root.join(format!("{stem}.ready")),
             status: root.join(format!("{stem}.status")),
+            focus,
         }
     }
     pub fn configure(&self, command: &mut Command) {
         command
             .env(READY_ENV, &self.ready)
-            .env(STATUS_ENV, &self.status);
+            .env(STATUS_ENV, &self.status)
+            .env(FOCUS_ENV, &self.focus);
+    }
+    pub fn set_focused(&self, focused: bool) {
+        let value: &[u8] = if focused { b"focused" } else { b"unfocused" };
+        let _ = fs::write(&self.focus, value);
     }
     pub fn watch(self, mut child: Child, tx: Sender<Message>) {
         std::thread::Builder::new()
@@ -66,6 +77,7 @@ impl Files {
                     if self.ready.is_file() {
                         let _ = fs::remove_file(&self.ready);
                         let _ = fs::remove_file(&self.status);
+                        let _ = fs::remove_file(&self.focus);
                         let _ = tx.send(Message::Ready);
                         return;
                     }
@@ -75,6 +87,7 @@ impl Files {
                         let _ = child.kill();
                         let _ = child.wait();
                         let _ = fs::remove_file(&self.status);
+                        let _ = fs::remove_file(&self.focus);
                         let _ = tx.send(Message::Failed(
                             "The new world did not become ready within 20 minutes.".into(),
                         ));
@@ -83,6 +96,7 @@ impl Files {
                     match child.try_wait() {
                         Ok(Some(status)) => {
                             let _ = fs::remove_file(&self.status);
+                            let _ = fs::remove_file(&self.focus);
                             let _ = tx.send(Message::Failed(format!(
                                 "The new world process exited before it was ready ({status})."
                             )));
@@ -90,6 +104,8 @@ impl Files {
                         }
                         Ok(None) => {}
                         Err(error) => {
+                            let _ = fs::remove_file(&self.status);
+                            let _ = fs::remove_file(&self.focus);
                             let _ = tx.send(Message::Failed(format!(
                                 "Could not monitor the new world process: {error}"
                             )));
@@ -122,6 +138,16 @@ pub fn allow_child_foreground(process_id: u32) {
 #[cfg(windows)]
 pub fn activate_child_window(window: &winit::window::Window) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Some(focus_path) = std::env::var_os(FOCUS_ENV).map(PathBuf::from) else {
+        return;
+    };
+    if !fs::read(focus_path).is_ok_and(|status| status == b"focused") {
+        eprintln!(
+            "Not activating replacement map because the old window lost focus during loading"
+        );
+        return;
+    }
 
     let Ok(handle) = window.window_handle() else {
         eprintln!("Could not obtain the replacement map window handle for focus activation");

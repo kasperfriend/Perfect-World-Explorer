@@ -4559,6 +4559,7 @@ pub fn run(
     let mut handoff_ready_signaled = false;
     let mut world_handoff_rx: Option<std::sync::mpsc::Receiver<crate::world_handoff::Message>> =
         None;
+    let mut world_handoff_files: Option<crate::world_handoff::Files> = None;
     let mut last_zone: Option<usize> = None;
     let mut zone_initialized = false;
     let mut zone_check = Instant::now() - std::time::Duration::from_secs(1);
@@ -4662,7 +4663,15 @@ pub fn run(
                         window.set_cursor_visible(true);
                         captured = false;
                     }
+                    if let Some(files) = &world_handoff_files {
+                        files.set_focused(false);
+                    }
                     keys.clear();
+                }
+                WindowEvent::Focused(true) => {
+                    if let Some(files) = &world_handoff_files {
+                        files.set_focused(true);
+                    }
                 }
                 WindowEvent::Resized(s) if s.width > 0 && s.height > 0 => {
                     config.width = s.width;
@@ -5106,7 +5115,8 @@ pub fn run(
                                                             #[cfg(windows)]
                                                             crate::world_handoff::allow_child_foreground(child.id());
                                                             let (tx, rx) = std::sync::mpsc::channel();
-                                                            files.watch(child, tx);
+                                                            files.clone().watch(child, tx);
+                                                            world_handoff_files = Some(files);
                                                             world_handoff_rx = Some(rx);
                                                             world_loading_status = format!("Loading {display}...");
                                                             world_change_error.clear();
@@ -5325,6 +5335,7 @@ pub fn run(
                 }
                 if let Some(result) = completion {
                     world_handoff_rx = None;
+                    world_handoff_files = None;
                     match result {
                         Ok(()) => target.exit(),
                         Err(error) => {
