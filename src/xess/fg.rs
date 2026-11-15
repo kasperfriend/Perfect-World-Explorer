@@ -61,8 +61,7 @@ use crate::fsr::{
 use glam::Mat4;
 use std::ffi::c_void;
 use winapi::shared::dxgi::{
-    IDXGIFactory, IDXGISwapChain, DXGI_MWA_NO_ALT_ENTER, DXGI_MWA_NO_WINDOW_CHANGES,
-    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+    IDXGIFactory, IDXGISwapChain, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
 };
 use winapi::shared::dxgi1_2::{DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FULLSCREEN_DESC};
 use winapi::shared::dxgi1_4::IDXGISwapChain3;
@@ -84,6 +83,12 @@ const XEFG_INIT_FLAG_INVERTED_DEPTH: u32 = 1 << 0;
 /// UI included. Intel's first recommendation, and the default here.
 const XEFG_UI_MODE_NONE: i32 = 1;
 /// Separate UI texture + HUD-less colour; UI composited by the proxy.
+/// `DXGI_MWA_NO_WINDOW_CHANGES` — winapi does not define the
+/// `MakeWindowAssociation` flags, so they are spelled out here.
+const DXGI_MWA_NO_WINDOW_CHANGES: u32 = 0x1;
+/// `DXGI_MWA_NO_ALT_ENTER`.
+const DXGI_MWA_NO_ALT_ENTER: u32 = 0x2;
+
 const XEFG_UI_MODE_HUDLESS_UITEXTURE: i32 = 3;
 const XEFG_UI_COMPOSITION_STATE_ENABLED: u32 = 1;
 /// Resource validity: XeSS-FG may defer (or skip) the copy entirely and read
@@ -658,8 +663,12 @@ impl XessFrameGeneration {
                 &mut association as *mut *mut _ as *mut *mut c_void,
             );
             if hr >= 0 && !association.is_null() {
-                (*association)
-                    .MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+                // winapi's `HWND` is a typed pointer, not `*mut c_void`.
+                let window = hwnd as winapi::shared::windef::HWND;
+                (*association).MakeWindowAssociation(
+                    window,
+                    DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES,
+                );
                 (*association).Release();
             }
             (*factory).Release();
