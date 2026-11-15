@@ -215,6 +215,13 @@ run on hardware; DLSS remains not integrated.
   through, zero provider ids filtered, debug callback installed, provider
   retry-down, fence-before-allocator-reset) are on the branch; awaiting the
   next hardware run. See `docs/dx12-port-notes.md` §6a.
+- **XeSS frame generation (2026-11-15):** the XeSS-FG integration implements
+  the same present-loop contract — proxy swapchain created by
+  `libxess_fg.dll` for the hwnd (`xefgSwapChainD3D12InitFromSwapChainDesc`),
+  UI via `HUDLESS_UITEXTURE`, frame pacing inside `Present(1, 0)`, XeLL pacing
+  markers — but it has not run on hardware either, so the pacing behaviour
+  and the input-rate contract are unverified for both providers. See
+  `docs/dx12-port-notes.md` (XeSS section) and `src/xess/fg.rs`.
 - **Tried:** diagnostics `TimingFrame`/`EffectFrames` channels exist
   (`src/diagnostics.rs`) and are the right probe; the pacing contract is
   documented for the implementer in `README.md` and

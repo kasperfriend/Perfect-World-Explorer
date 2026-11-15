@@ -105,10 +105,12 @@ if (-not [string]::IsNullOrWhiteSpace($SdkDirectory)) {
     # (frame generation), libxell.dll (low latency; mandatory for XeSS-FG on
     # every GPU, Intel or not). Staged only from the user-supplied folder;
     # never committed to the repository.
-    $mitAllowlist = @(
+    $amdNames = @(
         'amd_fidelityfx_loader_dx12.dll',
         'amd_fidelityfx_upscaler_dx12.dll',
-        'amd_fidelityfx_framegeneration_dx12.dll',
+        'amd_fidelityfx_framegeneration_dx12.dll'
+    )
+    $intelNames = @(
         'libxess.dll',
         'libxess_fg.dll',
         'libxell.dll'
@@ -122,22 +124,42 @@ if (-not [string]::IsNullOrWhiteSpace($SdkDirectory)) {
     $sdkTarget = Join-Path $packageRoot 'sdk'
     New-Item -ItemType Directory -Force -Path $sdkTarget | Out-Null
     $staged = 0
-    foreach ($name in $mitAllowlist) {
+    $stagedAmd = 0
+    $stagedIntel = 0
+    foreach ($name in $amdNames) {
         $source = Get-ChildItem -LiteralPath $sdkRoot -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
             Select-Object -First 1
         if ($null -ne $source) {
             Copy-Item -LiteralPath $source.FullName -Destination (Join-Path $sdkTarget $name)
             $staged++
+            $stagedAmd++
             Write-Host "Staged MIT-licensed SDK binary: sdk/$name"
+        }
+    }
+    foreach ($name in $intelNames) {
+        $source = Get-ChildItem -LiteralPath $sdkRoot -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($null -ne $source) {
+            Copy-Item -LiteralPath $source.FullName -Destination (Join-Path $sdkTarget $name)
+            $staged++
+            $stagedIntel++
+            Write-Host "Staged Intel Simplified Software License SDK binary: sdk/$name"
         }
     }
     if ($staged -eq 0) {
         Remove-Item -LiteralPath $sdkTarget -Force
         Write-Host "No allowlisted vendor SDK DLLs found under $sdkRoot; nothing staged."
     } else {
-        # Ship the licenses of whatever this branch staged inside sdk/ so the
-        # binaries carry their permission notices with them.
-        foreach ($extra in @('AMD_FidelityFX-SDK-2.4.0-LICENSE.md', 'AMD_FidelityFX-SDK-2.4.0-notices.md', 'Intel_XeSS-SDK-3.0.2-LICENSE.txt')) {
+        # Ship the license of each vendor whose binaries actually entered the
+        # package, so the binaries carry their permission notices with them.
+        $extras = @()
+        if ($stagedAmd -gt 0) {
+            $extras += @('AMD_FidelityFX-SDK-2.4.0-LICENSE.md', 'AMD_FidelityFX-SDK-2.4.0-notices.md')
+        }
+        if ($stagedIntel -gt 0) {
+            $extras += @('Intel_XeSS-SDK-3.0.2-LICENSE.txt')
+        }
+        foreach ($extra in $extras) {
             $extraPath = Join-Path $vendoredSdk $extra
             if (Test-Path -LiteralPath $extraPath -PathType Leaf) {
                 Copy-Item -LiteralPath $extraPath -Destination (Join-Path $sdkTarget $extra)
