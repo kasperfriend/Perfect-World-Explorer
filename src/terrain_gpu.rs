@@ -959,7 +959,7 @@ impl TerrainGpu {
      scratch.clear();
         scratch.extend(
             runs.iter()
-                .map(|&(start, count)| crate::indirect_args::DrawIndexedArgs::new(count, start)),
+                .map(|&(start, count)| crate::indirect_args::record(start..start + count, 0..1)),
         );
         queue.write_buffer(buffer, 0, bytemuck::cast_slice(scratch));
         records
@@ -1023,6 +1023,7 @@ fn can_multi_draw(multi_draw: bool, records: u32, runs: &[(u32, u32)]) -> bool {
 }
 /// One record per run: the same index range and a single instance, which is
 /// what `draw_indexed(start..start + count, 0, 0..1)` asks for.
+#[allow(dead_code)]
 fn run_records(runs: &[(u32, u32)]) -> Vec<crate::indirect_args::DrawIndexedArgs> {
     runs.iter()
         .map(|&(start, count)| crate::indirect_args::record(start..start + count, 0..1))
