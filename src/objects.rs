@@ -237,6 +237,7 @@ pub struct Objects {
     litfile: Option<File>,
     texfile: Option<File>,
     litentries: HashMap<String, pck::Entry>,
+    litbasenames: HashMap<String, Vec<String>>,
     texentries: HashMap<String, pck::Entry>,
     /// Optional scenery dependencies absent or unusable in this client/map.
     /// Keep a negative cache so a missing placement is not retried every frame.
@@ -293,6 +294,37 @@ fn litmodel_entry_candidates(path: &str) -> [String; 4] {
     ]
 }
 
+/// Resolve an EC-BSD model reference against the archive index. Exact archive
+/// paths take precedence; only fall back to a filename when that basename is
+/// unique, so another world's same-named model can never be selected by guess.
+fn litmodel_entry_key(
+    path: &str,
+    entries: &HashMap<String, pck::Entry>,
+    by_basename: &HashMap<String, Vec<String>>,
+) -> Result<String, String> {
+    if let Some(key) = litmodel_entry_candidates(path)
+        .iter()
+        .find(|candidate| entries.contains_key(*candidate))
+    {
+        return Ok(key.clone());
+    }
+    let basename = litmodel_key(path)
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .to_string();
+    match by_basename.get(&basename).map(Vec::as_slice) {
+        Some([only]) => Ok(only.clone()),
+        Some(matches) => Err(format!(
+            "no exact archive path for {path}; basename {basename} is ambiguous ({} matches)",
+            matches.len()
+        )),
+        None => Err(format!(
+            "missing model {path}; litmodels.pck has no member named {basename}"
+        )),
+    }
+}
+
 fn open_optional_archive(path: &Path) -> (Option<File>, HashMap<String, pck::Entry>) {
     let mut file = match File::open(path) {
         Ok(file) => file,
@@ -337,6 +369,11 @@ impl Objects {
     pub fn open(element: &Path, ornaments: Vec<Ornament>) -> Result<Self, String> {
         let (litfile, litentries) = open_optional_archive(&element.join("litmodels.pck"));
         let (texfile, texentries) = open_optional_archive(&element.join("building.pck"));
+        let mut litbasenames = HashMap::<String, Vec<String>>::new();
+        for name in litentries.keys() {
+            let basename = name.rsplit('/').next().unwrap_or(name).to_string();
+            litbasenames.entry(basename).or_default().push(name.clone());
+        }
         // Mount order matches the open order above. The retail mount order
         // of the two packages is not recoverable from the executable alone,
         // but it is also unobservable in this corpus: the census found 0
@@ -363,6 +400,7 @@ impl Objects {
             litfile,
             texfile,
             litentries,
+            litbasenames,
             texentries,
             unavailable_models: HashSet::new(),
             unavailable_examples: Vec::new(),
@@ -406,10 +444,9 @@ impl Objects {
             }
             if !self.models.contains_key(&name) {
                 let loaded = (|| -> Result<bmd::Model, String> {
-                    let entry = litmodel_entry_candidates(&name)
-                        .iter()
-                        .find_map(|candidate| self.litentries.get(candidate))
-                        .ok_or_else(|| format!("missing model {name}"))?;
+                    let entry_key =
+                        litmodel_entry_key(&name, &self.litentries, &self.litbasenames)?;
+                    let entry = &self.litentries[&entry_key];
                     let file = self
                         .litfile
                         .as_mut()
@@ -715,6 +752,56 @@ mod tests {
         assert_eq!(candidates[1], "litmodels/1/litmodel_1318.bmd");
         assert_eq!(candidates[2], "world/1/litmodel_1318.bmd");
         assert_eq!(candidates[3], "1/litmodel_1318.bmd");
+    }
+
+    #[test]
+    fn map_model_lookup_uses_only_unique_archive_basename_fallbacks() {
+        let name = "litmodels/world/10/litmodel_1318.bmd";
+        let mut entries = HashMap::new();
+        entries.insert(
+            name.to_string(),
+            pck::Entry {
+                name: name.to_string(),
+                offset: 0,
+                size: 0,
+                compressed: 0,
+            },
+        );
+        let mut by_basename = HashMap::from([(
+            "litmodel_1318.bmd".to_string(),
+            vec![name.to_string()],
+        )]);
+        assert_eq!(
+            litmodel_entry_key(
+                "litmodels/world/1/litmodel_1318.bmd",
+                &entries,
+                &by_basename
+            )
+            .unwrap(),
+            name
+        );
+
+        let other = "litmodels/world/11/litmodel_1318.bmd";
+        entries.insert(
+            other.to_string(),
+            pck::Entry {
+                name: other.to_string(),
+                offset: 0,
+                size: 0,
+                compressed: 0,
+            },
+        );
+        by_basename
+            .get_mut("litmodel_1318.bmd")
+            .unwrap()
+            .push(other.to_string());
+        assert!(litmodel_entry_key(
+            "litmodels/world/1/litmodel_1318.bmd",
+            &entries,
+            &by_basename
+        )
+        .unwrap_err()
+        .contains("ambiguous"));
     }
 
     fn tex(fill: u8, side: usize) -> Texture {
