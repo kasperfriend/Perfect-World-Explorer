@@ -2,7 +2,7 @@
 //! Client scene-light grid and candidate selection in 0x425470 / 0x4250c0.
 //! Published runtime lights feed ordinary world-model queries. GFX controller
 //! playback/production is a separate, still unfinished integration path.
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneLight {
@@ -103,6 +103,8 @@ pub struct DynamicLight {
 #[derive(Default, Debug)]
 pub struct LightPublications {
     entries: Vec<(u64, DynamicLight)>,
+    indices: HashMap<u64, usize>,
+    scratch: Vec<DynamicLight>,
 }
 impl LightPublications {
     /// Pending publications for this frame. Membership is not live-light state:
@@ -115,19 +117,33 @@ impl LightPublications {
         self.entries.is_empty()
     }
     pub fn publish(&mut self, identity: u64, light: DynamicLight) {
-        if let Some((_, current)) = self.entries.iter_mut().find(|(id, _)| *id == identity) {
-            *current = light;
+        if let Some(&index) = self.indices.get(&identity) {
+            self.entries[index].1 = light;
         } else {
+            self.indices.insert(identity, self.entries.len());
             self.entries.push((identity, light));
         }
     }
     /// Destroy/unregister before consumption, preserving other insertion order.
     pub fn unregister(&mut self, identity: u64) {
+        if self.indices.remove(&identity).is_none() {
+            return;
+        }
         self.entries.retain(|(id, _)| *id != identity);
+        self.indices.clear();
+        self.indices.extend(
+            self.entries
+                .iter()
+                .enumerate()
+                .map(|(index, (id, _))| (*id, index)),
+        );
     }
     pub fn consume_into(&mut self, grid: &mut StaticGrid) {
-        let lights: Vec<_> = self.entries.drain(..).map(|(_, light)| light).collect();
-        grid.update_dynamic(&lights);
+        self.scratch.clear();
+        self.scratch
+            .extend(self.entries.drain(..).map(|(_, light)| light));
+        self.indices.clear();
+        grid.update_dynamic(&self.scratch);
     }
 }
 

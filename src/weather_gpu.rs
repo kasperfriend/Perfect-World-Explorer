@@ -15,7 +15,6 @@ use crate::client_weather::{
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use std::{collections::HashMap, fs::File, path::Path};
-use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -28,7 +27,7 @@ struct Params {
     fog_range: [f32; 4],
     fog_color: [f32; 4],
     clip: [f32; 4],
-    clock_weather: [f32; 4], // wrapped ticks, water-area count, rain, snow
+    clock_weather: [f32; 4], // wrapped ticks, reserved, rain, snow
     /// `[rain half width, rain size variation, snow half width, snow variation]`
     /// from the two constructors' `Size`/`SizeVariation` stores.
     particle: [f32; 4],
@@ -43,6 +42,15 @@ struct Params {
 /// and `motion` is `[rain speed, rain speed variation, snow speed, snow speed
 /// variation]`. A store a constructor never writes contributes `0.0`, which the
 /// shader reads as "no spread" rather than as a zero particle.
+fn active_instance_range(selection: WeatherSelection) -> (u32, u32) {
+    match (selection.rain, selection.snow) {
+        (true, true) => (0, 480),
+        (true, false) => (0, 320),
+        (false, true) => (320, 480),
+        (false, false) => (0, 0),
+    }
+}
+
 fn profile_lanes(
     rain: PrecipitationProfile,
     snow: PrecipitationProfile,
@@ -64,47 +72,6 @@ fn profile_lanes(
     )
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-struct WaterAreaGpu {
-    bounds: [f32; 4], // center x, surface height, center z, cell spacing
-    data: [u32; 4],   // columns, rows, byte offset into mask storage, reserved
-}
-
-fn pack_water_masks(areas: &[crate::water::WaterArea]) -> (Vec<WaterAreaGpu>, Vec<u32>) {
-    let mut metadata = Vec::with_capacity(areas.len().max(1));
-    let mut bytes = Vec::new();
-    for area in areas {
-        let offset = bytes.len().min(u32::MAX as usize) as u32;
-        bytes.extend_from_slice(&area.mask);
-        metadata.push(WaterAreaGpu {
-            bounds: [area.center[0], area.height, area.center[2], area.grid_size],
-            data: [
-                area.columns as u32,
-                area.rows as u32,
-                offset,
-                area.mask.len().min(u32::MAX as usize) as u32,
-            ],
-        });
-    }
-    if metadata.is_empty() {
-        metadata.push(WaterAreaGpu::zeroed());
-    }
-    let words = if bytes.is_empty() {
-        vec![0]
-    } else {
-        bytes
-            .chunks(4)
-            .map(|chunk| {
-                let mut word = [0u8; 4];
-                word[..chunk.len()].copy_from_slice(chunk);
-                u32::from_le_bytes(word)
-            })
-            .collect()
-    };
-    (metadata, words)
-}
-
 const SHADER: &str = r#"
 struct Params {
     matrix: mat4x4<f32>, camera: vec4<f32>, right: vec4<f32>, up: vec4<f32>,
@@ -112,12 +79,9 @@ struct Params {
     clip: vec4<f32>, clock_weather: vec4<f32>,
     particle: vec4<f32>, motion: vec4<f32>,
 };
-struct WaterArea { bounds: vec4<f32>, data: vec4<u32> };
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var images: texture_2d_array<f32>;
 @group(0) @binding(2) var smp: sampler;
-@group(0) @binding(3) var<storage, read> water_areas: array<WaterArea>;
-@group(0) @binding(4) var<storage, read> water_mask: array<u32>;
 struct Out {
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -127,29 +91,6 @@ struct Out {
     @location(4) world_y: f32,
 };
 fn hash(n: f32) -> f32 { return fract(sin(n * 127.1 + 311.7) * 43758.5453); }
-fn camera_in_mapped_water(camera: vec3<f32>) -> bool {
-    let count = u32(p.clock_weather.y);
-    for (var i = 0u; i < count; i = i + 1u) {
-        let area = water_areas[i];
-        let columns = area.data.x;
-        let rows = area.data.y;
-        let grid = area.bounds.w;
-        if columns == 0u || rows == 0u || grid <= 0.0 { continue; }
-        let half_x = f32(columns) * grid * 0.5;
-        let half_z = f32(rows) * grid * 0.5;
-        if abs(camera.x - area.bounds.x) >= half_x || abs(camera.z - area.bounds.z) >= half_z { continue; }
-        let column = u32(floor((camera.x - (area.bounds.x - half_x)) / grid));
-        let row = u32(floor(((area.bounds.z + half_z) - camera.z) / grid));
-        if column >= columns || row >= rows { continue; }
-        let cell_index = row * columns + column;
-        if cell_index >= area.data.w { continue; }
-        let byte_index = area.data.z + cell_index;
-        let packed = water_mask[byte_index / 4u];
-        let value = (packed >> ((byte_index % 4u) * 8u)) & 255u;
-        if value != 0u && camera.y < area.bounds.y { return true; }
-    }
-    return false;
-}
 @vertex fn vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> Out {
     let snow = instance >= 320u;
     let local_id = f32(select(instance, instance - 320u, snow));
@@ -171,9 +112,9 @@ fn camera_in_mapped_water(camera: vec3<f32>) -> bool {
     // which made every drop and flake climb - the reported "rain goes up".
     let fall = 55.0 - fract(phase + seconds * speed) * 110.0;
     let center = p.camera.xyz + p.right.xyz * x + p.forward.xyz * z + vec3<f32>(0.0, fall, 0.0);
-    // Native CECWorld render admission tests the camera against the terrain
-    // water mask and skips precipitation for a submerged view.
-    let visible = enabled > 0.5 && !camera_in_mapped_water(p.camera.xyz);
+    // The renderer already tested this camera against the same active-cell
+    // water mask and zeroes both weather lanes when submerged.
+    let visible = enabled > 0.5;
     // The generated quad consists of six triangle-list vertices. Compute the
     // corners from the vertex ID instead of indexing an immutable local WGSL
     // array: naga 0.19 correctly rejects non-constant indexing of that value.
@@ -294,9 +235,6 @@ pub struct WeatherGpu {
     uniform: wgpu::Buffer,
     _texture: wgpu::Texture,
     _sampler: wgpu::Sampler,
-    _water_areas: wgpu::Buffer,
-    _water_mask: wgpu::Buffer,
-    water_area_count: u32,
     clock: WeatherClock,
     ticks: u32,
 }
@@ -306,7 +244,6 @@ impl WeatherGpu {
         queue: &wgpu::Queue,
         element: &Path,
         format: wgpu::TextureFormat,
-        water_areas: &[crate::water::WaterArea],
     ) -> Self {
         let images = weather_images(element);
         let mut pixels = Vec::with_capacity(64 * 64 * 4 * 2);
@@ -388,26 +325,6 @@ impl WeatherGpu {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
             ],
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -415,17 +332,6 @@ impl WeatherGpu {
             size: std::mem::size_of::<Params>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-        let (water_area_data, water_mask_data) = pack_water_masks(water_areas);
-        let water_areas_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("native precipitation water-area bounds"),
-            contents: bytemuck::cast_slice(&water_area_data),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let water_mask_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("native precipitation water masks"),
-            contents: bytemuck::cast_slice(&water_mask_data),
-            usage: wgpu::BufferUsages::STORAGE,
         });
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("world weather particle bindings"),
@@ -442,14 +348,6 @@ impl WeatherGpu {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: water_areas_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: water_mask_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -503,9 +401,6 @@ impl WeatherGpu {
             uniform,
             _texture: texture,
             _sampler: sampler,
-            _water_areas: water_areas_buffer,
-            _water_mask: water_mask_buffer,
-            water_area_count: water_areas.len().min(u32::MAX as usize) as u32,
             clock: WeatherClock::default(),
             ticks: 0,
         }
@@ -517,9 +412,10 @@ impl WeatherGpu {
     }
 
     /// Submit a depth-tested world-space precipitation view. The generated
-    /// particles fall through a camera-centred volume and the parsed water
-    /// mask suppresses a submerged camera view. Native RNG/lifetimes and
-    /// terrain collision remain outstanding.
+    /// particles fall through a camera-centred volume. The renderer suppresses
+    /// the pass when its exact CPU water-mask query marks the camera submerged,
+    /// avoiding a repeated water-area scan in every particle vertex. Native
+    /// RNG/lifetimes and terrain collision remain outstanding.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &self,
@@ -555,7 +451,7 @@ impl WeatherGpu {
             clip,
             clock_weather: [
                 (self.ticks % 1_000_000) as f32,
-                self.water_area_count as f32,
+                0.,
                 selection.rain as u8 as f32,
                 selection.snow as u8 as f32,
             ],
@@ -586,15 +482,15 @@ impl WeatherGpu {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind, &[]);
-        pass.draw(0..6, 0..480);
+        let (first_instance, end_instance) = active_instance_range(selection);
+        pass.draw(0..6, first_instance..end_instance);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{pack_water_masks, profile_lanes, snow_luminance_mask};
+    use super::{active_instance_range, profile_lanes, snow_luminance_mask};
     use crate::client_weather::{RAIN, SNOW, SNOW_SPEED_SCALE};
-    use crate::water::WaterArea;
 
     #[test]
     fn the_shader_lanes_carry_the_two_constructors_stores() {
@@ -615,27 +511,35 @@ mod tests {
     }
 
     #[test]
-    fn water_masks_pack_with_byte_offsets_for_shader_lookup() {
-        let area = |center: f32, mask: Vec<u8>| WaterArea {
-            export_id: 1,
-            color: 0,
-            simple: false,
-            height: 12.0,
-            grid_size: 4.0,
-            columns: mask.len(),
-            rows: 1,
-            center: [center, 0.0, 0.0],
-            mask,
-            shore_waves: Vec::new(),
-        };
-        let (metadata, words) =
-            pack_water_masks(&[area(0.0, vec![0, 1, 2]), area(8.0, vec![3, 4])]);
-        assert_eq!(metadata.len(), 2);
-        assert_eq!(metadata[0].data[2], 0);
-        assert_eq!(metadata[1].data[2], 3); // second mask intentionally starts mid-word
-        assert_eq!(metadata[0].data[3], 3);
-        assert_eq!(metadata[1].data[3], 2);
-        assert_eq!(words.as_slice(), &[0x0302_0100, 0x0000_0004]);
+    fn only_enabled_weather_particle_instances_are_submitted() {
+        assert_eq!(
+            active_instance_range(crate::client_weather::WeatherSelection {
+                rain: true,
+                snow: false,
+            }),
+            (0, 320)
+        );
+        assert_eq!(
+            active_instance_range(crate::client_weather::WeatherSelection {
+                rain: false,
+                snow: true,
+            }),
+            (320, 480)
+        );
+        assert_eq!(
+            active_instance_range(crate::client_weather::WeatherSelection {
+                rain: true,
+                snow: true,
+            }),
+            (0, 480)
+        );
+    }
+
+    #[test]
+    fn particle_vertices_do_not_rewalk_water_masks() {
+        assert!(!super::SHADER.contains("camera_in_mapped_water"));
+        assert!(!super::SHADER.contains("water_areas"));
+        assert!(!super::SHADER.contains("water_mask"));
     }
 
     #[test]

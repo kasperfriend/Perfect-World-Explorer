@@ -315,7 +315,7 @@ enum ViewRuns {
     Reflected,
     Map,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct WaterBatch {
     // Do not merge different authored area classes.
     simple: bool,
@@ -336,6 +336,9 @@ impl WaterBatch {
         let z = p.z.clamp(z0, z1);
         (p - Vec3::new(x, self.height, z)).length_squared()
     }
+}
+fn water_requires_refraction(batches: &[WaterBatch], visible: &[(f32, usize)]) -> bool {
+    visible.iter().any(|&(_, index)| !batches[index].simple)
 }
 fn basis(v: [f32; 3]) -> Vec3 {
     let v = Vec3::from_array(v);
@@ -1730,8 +1733,7 @@ impl Renderer {
         });
         let depth_tex = depth(&device, w, h);
         let sky = crate::sky_gpu::SkyGpu::new(&device, &queue, format, &t.element)?;
-        let weather =
-            crate::weather_gpu::WeatherGpu::new(&device, &queue, &t.element, format, &t.water);
+        let weather = crate::weather_gpu::WeatherGpu::new(&device, &queue, &t.element, format);
         let cloud = t.cloud_surface.as_deref().and_then(|surface| {
             match crate::cloud_gpu::CloudGpu::new(&device, &queue, format, &t.element, surface) {
                 Ok(cloud) => {
@@ -3155,7 +3157,10 @@ impl Renderer {
         // view consumes them, so the main, reflection and above-water passes all
         // see one selection. `Auto` is the client's `0x421520` answer.
         let selected_weather = camera.weather_override.apply(selected_weather);
-        let main_weather = if camera.underwater_depth > 0.0 {
+        // `water_depth` used the same active-cell masks as the old precipitation
+        // vertex shader. Suppress all weather views on the CPU when submerged,
+        // rather than making every particle vertex scan every water area.
+        let view_weather = if camera.underwater_depth > 0.0 {
             crate::client_weather::WeatherSelection::default()
         } else {
             selected_weather
@@ -3204,48 +3209,85 @@ impl Renderer {
         );
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&normal));
-        self.water.update(
-            &self.queue,
-            &crate::water_gpu::WaterUniform {
-                matrix: matrix.to_cols_array_2d(),
-                inverse_matrix: matrix.inverse().to_cols_array_2d(),
-                eye_time: [camera.pos.x, camera.pos.y, camera.pos.z, frame.elapsed],
-                size: [
-                    w as f32,
-                    h as f32,
-                    camera.far,
-                    if camera.water_reflections { 1. } else { 0. },
-                ],
-                animation: [
-                    crate::water_gpu::normal_phase(frame.elapsed64),
-                    camera.underwater_fog.end,
-                    0.,
-                    crate::water_gpu::normal_offset_angle(frame.elapsed64),
-                ],
-                edge_mode: [if camera.water_reflections { 1. } else { 0. }, 0., 0., 0.],
-                // Water-surface fog: the client binds the region's own triple
-                // (white 100..400 above water, blue 10..60 below).
-                fog: frame.active_fog_range,
-                fog_color: frame.active_fog_color,
-            },
-        );
-        self.simple_water.update(
-            &self.queue,
-            matrix,
-            frame.elapsed64,
-            frame.active_fog_range,
-            frame.active_fog_color,
-        );
+        let mut visible_water: Vec<(f32, usize)> = self
+            .water_batches
+            .iter()
+            .enumerate()
+            .filter(|(_, batch)| batch.visible(matrix))
+            .map(|(index, batch)| (batch.distance_squared(camera.pos), index))
+            .collect();
+        visible_water.sort_by(|a, b| b.0.total_cmp(&a.0));
+        if water_debug() {
+            static LOG_ONCE: std::sync::Once = std::sync::Once::new();
+            LOG_ONCE.call_once(|| {
+                eprintln!(
+                    "Visible water reflection planes: {:?}",
+                    visible_water
+                        .iter()
+                        .map(|&(_, index)| self.water_batches[index].height)
+                        .collect::<Vec<_>>()
+                );
+            });
+        }
+        let needs_refraction = water_requires_refraction(&self.water_batches, &visible_water);
+        let needs_terrain_edge_depth = camera.water_reflections
+            && visible_water.iter().any(|&(_, index)| {
+                let batch = self.water_batches[index];
+                !batch.simple && camera.pos.y > batch.height
+            });
+        if needs_refraction {
+            self.water.update(
+                &self.queue,
+                &crate::water_gpu::WaterUniform {
+                    matrix: matrix.to_cols_array_2d(),
+                    inverse_matrix: matrix.inverse().to_cols_array_2d(),
+                    eye_time: [camera.pos.x, camera.pos.y, camera.pos.z, frame.elapsed],
+                    size: [
+                        w as f32,
+                        h as f32,
+                        camera.far,
+                        if camera.water_reflections { 1. } else { 0. },
+                    ],
+                    animation: [
+                        crate::water_gpu::normal_phase(frame.elapsed64),
+                        camera.underwater_fog.end,
+                        0.,
+                        crate::water_gpu::normal_offset_angle(frame.elapsed64),
+                    ],
+                    edge_mode: [if camera.water_reflections { 1. } else { 0. }, 0., 0., 0.],
+                    // Water-surface fog: the client binds the region's own triple
+                    // (white 100..400 above water, blue 10..60 below).
+                    fog: frame.active_fog_range,
+                    fog_color: frame.active_fog_color,
+                },
+            );
+        }
+        if visible_water
+            .iter()
+            .any(|&(_, index)| self.water_batches[index].simple)
+        {
+            self.simple_water.update(
+                &self.queue,
+                matrix,
+                frame.elapsed64,
+                frame.active_fog_range,
+                frame.active_fog_color,
+            );
+        }
         let reflection = self.water.reflection();
         let reflect_depth = self.water.depth();
         let refraction = self.water.refraction();
-        let scene_color = self.water.scene();
+        let water_scene = needs_refraction.then(|| self.water.scene());
+        let scene_color = water_scene.as_ref().unwrap_or(scene_target);
+        let water_scene_raw = needs_refraction.then(|| self.water.scene_raw());
+        let model_target = water_scene_raw.as_ref().unwrap_or(scene_target_raw);
         let scene_depth = self.depth.create_view(&Default::default());
+        let post_depth = needs_refraction.then(|| self.water.sample_depth());
         let mut e = self.device.create_command_encoder(&Default::default());
         self.draw_opaque(
             &mut e,
             "main scene",
-            &scene_color,
+            scene_color,
             &scene_depth,
             &self.bind,
             false,
@@ -3254,13 +3296,12 @@ impl Renderer {
             ViewRuns::Main,
             &main_world_cmds,
             &main_world_sdr_cmds,
-            Some(&self.depth),
+            needs_terrain_edge_depth.then_some(&self.depth),
             None,
         );
-        let model_target = self.water.scene_raw();
         self.draw_models(
             &mut e,
-            &model_target,
+            model_target,
             &scene_depth,
             &normal,
             camera,
@@ -3269,7 +3310,7 @@ impl Renderer {
         );
         self.draw_addons(
             &mut e,
-            &model_target,
+            model_target,
             &scene_depth,
             &normal,
             camera,
@@ -3279,7 +3320,7 @@ impl Renderer {
             cloud.draw(
                 &self.queue,
                 &mut e,
-                &scene_color,
+                scene_color,
                 &scene_depth,
                 matrix,
                 camera.yaw,
@@ -3293,7 +3334,7 @@ impl Renderer {
         self.weather.draw(
             &self.queue,
             &mut e,
-            &scene_color,
+            scene_color,
             &scene_depth,
             matrix,
             camera.pos,
@@ -3301,11 +3342,13 @@ impl Renderer {
             camera.pitch,
             camera.active_fog(),
             normal.clip,
-            main_weather,
+            view_weather,
         );
-        self.water.copy_scene_to_refraction(&mut e);
-        self.water.copy_depth(&mut e, &self.depth);
-        self.water.blit(&mut e, scene_target);
+        if needs_refraction {
+            self.water.copy_scene_to_refraction(&mut e);
+            self.water.copy_depth(&mut e, &self.depth);
+            self.water.blit(&mut e, scene_target);
+        }
         self.queue.submit(Some(e.finish()));
         // Diagnostic mode for exercising window/input UI on memory-limited software GPUs.
         if ui_test() {
@@ -3314,7 +3357,7 @@ impl Renderer {
                     &self.device,
                     &self.queue,
                     target,
-                    &self.water.sample_depth(),
+                    post_depth.as_ref().unwrap_or(&scene_depth),
                     w,
                     h,
                     frame.elapsed,
@@ -3339,28 +3382,10 @@ impl Renderer {
 
         // The reflection texture is reused only after its previous water draw is
         // submitted. Each distinct height gets its own mirror and clip plane.
-        let mut visible: Vec<WaterBatch> = self
-            .water_batches
-            .iter()
-            .filter(|b| b.visible(matrix))
-            .cloned()
-            .collect();
-        visible.sort_by(|a, b| {
-            b.distance_squared(camera.pos)
-                .total_cmp(&a.distance_squared(camera.pos))
-        });
-        if water_debug() {
-            static LOG_ONCE: std::sync::Once = std::sync::Once::new();
-            LOG_ONCE.call_once(|| {
-                eprintln!(
-                    "Visible water reflection planes: {:?}",
-                    visible.iter().map(|b| b.height).collect::<Vec<_>>()
-                );
-            });
-        }
         if !camera.water_reflections {
             let mut e = self.device.create_command_encoder(&Default::default());
-            for batch in visible {
+            for &(_, index) in &visible_water {
+                let batch = self.water_batches[index];
                 if batch.simple {
                     self.simple_water.draw(
                         &mut e,
@@ -3404,7 +3429,7 @@ impl Renderer {
                     &self.device,
                     &self.queue,
                     target,
-                    &self.water.sample_depth(),
+                    post_depth.as_ref().unwrap_or(&scene_depth),
                     w,
                     h,
                     frame.elapsed,
@@ -3426,9 +3451,13 @@ impl Renderer {
             }
             return;
         }
-        let (refraction_world_cmds, refraction_world_sdr_cmds) =
-            self.world_commands_for_view(matrix, Pass::Refraction);
-        for batch in visible {
+        let (refraction_world_cmds, refraction_world_sdr_cmds) = if needs_refraction {
+            self.world_commands_for_view(matrix, Pass::Refraction)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        for &(_, index) in &visible_water {
+            let batch = self.water_batches[index];
             if batch.simple {
                 let mut e = self.device.create_command_encoder(&Default::default());
                 self.simple_water.draw(
@@ -3590,7 +3619,7 @@ impl Renderer {
                     camera.pitch,
                     above_fog,
                     above.clip,
-                    selected_weather,
+                    view_weather,
                 );
                 // Ornamental EC models enter refraction only from underwater;
                 // the host player follows its own AABB gate in either view.
@@ -3711,7 +3740,7 @@ impl Renderer {
                 -camera.pitch,
                 camera.active_fog(),
                 reflected.clip,
-                selected_weather,
+                view_weather,
             );
             let model_view = self.water.reflection_raw();
             self.draw_models(
@@ -3762,7 +3791,7 @@ impl Renderer {
                 &self.device,
                 &self.queue,
                 target,
-                &self.water.sample_depth(),
+                post_depth.as_ref().unwrap_or(&scene_depth),
                 w,
                 h,
                 frame.elapsed,
@@ -5594,6 +5623,19 @@ mod water_batch_tests {
             bounds,
         }
     }
+    #[test]
+    fn scene_intermediate_is_only_needed_for_visible_full_water() {
+        let simple = WaterBatch {
+            simple: true,
+            ..batch([-5., 5., -5., 5.], 0.)
+        };
+        let full = batch([-5., 5., -5., 5.], 0.);
+        assert!(!water_requires_refraction(&[], &[]));
+        assert!(!water_requires_refraction(&[simple], &[(0., 0)]));
+        assert!(water_requires_refraction(&[simple, full], &[(0., 1)]));
+        assert!(!water_requires_refraction(&[simple, full], &[(0., 0)]));
+    }
+
     #[test]
     fn top_down_minimap_water_bounds_reject_off_window_batches() {
         let matrix = minimap_matrix(0., 0., 10.);

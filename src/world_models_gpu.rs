@@ -720,22 +720,20 @@ impl World {
     /// stored, and nothing else in the frame writes it back, so returning early
     /// here would hold that root invisible for the rest of the session.
     fn apply_attenuation(&mut self, delta_ms: u32, eye: [f32; 3]) {
-        let off = self.effect_distance <= 0.;
-        let mut updates: Vec<(u64, f32)> = Vec::new();
-        for producer in self.producers.iter_mut().filter(|p| p.attenuation) {
+        let distance = self.effect_distance;
+        let off = distance <= 0.;
+        let (producers, owners) = (&mut self.producers, &mut self.owners);
+        for producer in producers.iter_mut().filter(|p| p.attenuation) {
             if off {
                 if producer.fade != 1. {
                     producer.fade = 1.;
-                    updates.push((producer.identity, 1.));
+                    owners.set_attenuation(producer.identity, 1.);
                 }
                 continue;
             }
-            let target = attenuation_target(self.effect_distance, producer.position, eye);
+            let target = attenuation_target(distance, producer.position, eye);
             producer.fade = attenuation_step(producer.fade, target, delta_ms);
-            updates.push((producer.identity, producer.fade));
-        }
-        for (identity, fade) in updates {
-            self.owners.set_attenuation(identity, fade);
+            owners.set_attenuation(producer.identity, producer.fade);
         }
     }
     pub fn update(
@@ -1080,56 +1078,62 @@ impl World {
     /// a destroyed parent all surface as recorded failures instead of leaving a
     /// light attached to a stale or invented transform.
     fn resolve_attachments(&mut self) {
-        let mut resolved: Vec<(u64, Result<Option<[f32; 16]>, String>)> = Vec::new();
-        for producer in &self.producers {
+        let (producers, slots, assets, owners, publications, reported) = (
+            &mut self.producers,
+            &self.slots,
+            &self.assets,
+            &mut self.owners,
+            &mut self.publications,
+            &mut self.reported,
+        );
+        // Normal frames resolve in place without staging one Result/String per
+        // attachment. This vector allocates only if an attachment is actually
+        // lost or malformed and must be detached.
+        let mut detached = Vec::new();
+        for producer in producers.iter() {
             let Some(binding) = &producer.hook else {
                 continue;
             };
-            let origin = format!("producer {}", producer.identity);
+            let identity = producer.identity;
             let outcome = (|| -> Result<Option<[f32; 16]>, String> {
-                let slot = self
-                    .slots
-                    .get(binding.instance)
-                    .ok_or_else(|| format!("{origin}: parent slot is gone"))?;
-                let parent = self
-                    .assets
-                    .instances
-                    .get(binding.instance)
-                    .ok_or_else(|| format!("{origin}: parent instance is gone"))?;
+                let slot = slots.get(binding.instance).ok_or_else(|| {
+                    format!("producer {identity}: parent slot is gone")
+                })?;
+                let parent = assets.instances.get(binding.instance).ok_or_else(|| {
+                    format!("producer {identity}: parent instance is gone")
+                })?;
                 let posed = match &slot.posed {
                     Some(Ok(posed)) => posed,
-                    Some(Err(e)) => return Err(format!("{origin}: parent pose failed: {e}")),
-                    None => return Err(format!("{origin}: parent has no pose")),
+                    Some(Err(e)) => {
+                        return Err(format!("producer {identity}: parent pose failed: {e}"));
+                    }
+                    None => return Err(format!("producer {identity}: parent has no pose")),
                 };
-                let asset = self
-                    .assets
-                    .assets
-                    .get(parent.asset)
-                    .ok_or_else(|| format!("{origin}: parent asset is gone"))?;
+                let asset = assets.assets.get(parent.asset).ok_or_else(|| {
+                    format!("producer {identity}: parent asset is gone")
+                })?;
                 let hook = asset.hook_matrix(&posed.pose, &binding.record.hook)?;
                 let composed = model_attachment::world(hook, binding.local)?;
                 Ok(Some(composed.to_cols_array()))
             })();
-            resolved.push((producer.identity, outcome));
-        }
-        let mut detached = Vec::new();
-        for (identity, outcome) in resolved {
             match outcome {
                 Ok(parent) => {
-                    if !self.owners.set_attachment(identity, parent) {
+                    if !owners.set_attachment(identity, parent) {
                         detached.push(identity);
                     }
                 }
-                Err(e) => {
-                    self.reported.push(e);
-                    self.owners.remove(identity, &mut self.publications);
+                Err(error) => {
+                    reported.push(error);
+                    owners.remove(identity, publications);
                     detached.push(identity);
                 }
             }
         }
-        // A producer whose owner is gone or whose hook cannot be resolved is
-        // dropped instead of retrying against a stale parent every frame.
-        self.producers.retain(|p| !detached.contains(&p.identity));
+        if !detached.is_empty() {
+            // A producer whose owner is gone or whose hook cannot be resolved
+            // is dropped instead of retrying against stale parents each frame.
+            producers.retain(|p| !detached.contains(&p.identity));
+        }
     }
     /// Upload this frame's already-evaluated poses. Runs for every pass without
     /// touching playback, producer clocks or publications.
