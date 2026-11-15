@@ -32,17 +32,18 @@
 //! every frame using the same frame id that is passed to `xellSleep` and to
 //! the XeSS-FG tagging calls.
 //!
-//! UI handling defaults to Intel's first recommendation: **UI composition
-//! disabled** (`XEFG_SWAPCHAIN_UI_MODE_NONE`). The caller draws the UI into
-//! [`XessFrameGeneration::compose_view`] together with the scene
-//! ([`XessFrameGeneration::ui_in_composition`] is `true`), every presented
-//! frame is exactly what the app rendered, and the model interpolates the UI
-//! along with the scene. The alternative — the UI drawn into
-//! [`XessFrameGeneration::ui_view`] and composited sharp by the proxy
-//! (`HUDLESS_UITEXTURE`, premultiplied alpha because egui blends with
-//! One/OneMinusSrcAlpha) — is one environment variable away
-//! (`PW_XEFG_UI_COMPOSITION=1`); it keeps the UI un-interpolated at the cost of
-//! putting four SDK-visible inputs on the critical path.
+//! UI handling defaults to `XEFG_SWAPCHAIN_UI_MODE_BACKBUFFER_HUDLESS`
+//! ("Interpolate hudless color, extract UI from backbuffer"): the caller draws
+//! the world into [`XessFrameGeneration::compose_view`], `prepare` copies that
+//! into [`XessFrameGeneration::ui_view`] and the UI pass draws the HUD on top of
+//! the copy. The copy is what goes into the proxy's backbuffer and the
+//! composition is tagged as `XEFG_SWAPCHAIN_RES_HUDLESS_COLOR`, so the model
+//! interpolates a HUD-free scene and recomposites the extracted UI — HUD pixels
+//! are never interpolated. `PW_XEFG_UI_COMPOSITION=0` falls back to
+//! `XEFG_SWAPCHAIN_UI_MODE_NONE` (UI interpolated with the scene), and
+//! `PW_XEFG_UI_MODE=3|5` selects the separate-UI-texture variants, where the UI
+//! surface is the HUD alone (premultiplied alpha, because egui blends with
+//! One/OneMinusSrcAlpha).
 //!
 //! How many frames are interpolated per real frame is the Graphics tab's
 //! Frame multiplier: the request goes into `XefgD3D12InitParams`'
