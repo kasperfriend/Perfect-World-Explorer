@@ -3274,9 +3274,6 @@ impl Renderer {
                 frame.active_fog_color,
             );
         }
-        let reflection = self.water.reflection();
-        let reflect_depth = self.water.depth();
-        let refraction = self.water.refraction();
         let water_scene = needs_refraction.then(|| self.water.scene());
         let scene_color = water_scene.as_ref().unwrap_or(scene_target);
         let water_scene_raw = needs_refraction.then(|| self.water.scene_raw());
@@ -3451,6 +3448,9 @@ impl Renderer {
             }
             return;
         }
+        let reflection = needs_refraction.then(|| self.water.reflection());
+        let reflect_depth = needs_refraction.then(|| self.water.depth());
+        let refraction = needs_refraction.then(|| self.water.refraction());
         let (refraction_world_cmds, refraction_world_sdr_cmds) = if needs_refraction {
             self.world_commands_for_view(matrix, Pass::Refraction)
         } else {
@@ -3472,6 +3472,15 @@ impl Renderer {
                 self.queue.submit(Some(e.finish()));
                 continue;
             }
+            let reflection = reflection
+                .as_ref()
+                .expect("visible complex water needs reflection target");
+            let reflect_depth = reflect_depth
+                .as_ref()
+                .expect("visible complex water needs reflection depth");
+            let refraction = refraction
+                .as_ref()
+                .expect("visible complex water needs refraction target");
             let plane = batch.height;
             // A previous plane's reflection left its mirrored records in the
             // buffer; the refraction passes below draw through the main matrix.
