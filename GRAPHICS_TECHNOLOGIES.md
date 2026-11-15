@@ -45,18 +45,32 @@ from the tab.
 | Off | **Works.** | Always available. |
 | FSR Frame Generation | **Implemented, runtime-unverified.** FFX swapchain (`FrameGenerationSwapChainForHwndDX12`) takes over the window through the shared hand-over (`src/fsr/swapchain.rs`, see `docs/blockers.md` B-10); composites a separate native-resolution UI texture onto real *and* generated frames; `ffxDispatchDescFrameGeneration` runs on the swapchain's interpolation command list. **Independent of the upscaler — works with FSR 1, FSR 2/3/4, the DLSS/XeSS fallback, or Upscaling Off entirely.** The FG context creates with the mandatory `ffxCreateContextDescFrameGenerationVersion` plus the DX12 backend descriptor, and retries the older advertised FG providers before giving up; FFX diagnostic messages are piped to stderr (`[FSR ...]`). Failure restores the standard present path for the session. | Vendored AMD SDK 2.4.0 (included) + Windows/DX12 + any real GPU. |
 | DLSS Frame Generation | Not integrated. No frames are synthesised. | Requires NVIDIA RTX 40 + SDK (not shipped). |
-| XeSS Frame Generation | **Implemented, runtime-unverified.** XeSS-FG proxy swapchain (`xefgSwapChainD3D12InitFromSwapChainDesc`) takes over the window through the same hand-over, exactly like the FSR path: it paces real and interpolated frames and composites a separate native-resolution premultiplied-alpha UI texture (`HUDLESS_UITEXTURE`) onto both, so the UI is never interpolated. Every input — depth, motion vectors, the HUD-less colour and the UI texture —
-is tagged as `XEFG_SWAPCHAIN_RV_ONLY_NOW` on the viewer's own command list, so
-XeSS-FG records its copies there and they execute on the app's direct queue
-right after the writes that produced the textures. Tagging them as
-`RV_UNTIL_NEXT_PRESENT` instead let the SDK read the live textures during
-`Present` from the proxy's own queue, where nothing orders them against the next
-frame's writes; on hardware that surfaced as a black frame every other present.
+| XeSS Frame Generation | **Implemented, runtime-unverified.** XeSS-FG proxy swapchain (`xefgSwapChainD3D12InitFromSwapChainDesc`) takes over the window through the same hand-over, exactly like the FSR path. It paces real and interpolated frames and, by default, the UI is drawn into the composition so the model interpolates it together with the scene (Intel's first recommendation: UI composition disabled); `PW_XEFG_UI_COMPOSITION=1` switches to a separate native-resolution premultiplied-alpha UI texture (`HUDLESS_UITEXTURE`) that the proxy composites onto real *and* generated frames, keeping the UI sharp and never interpolated. **Documented pairing: XeSS upscaling or none.** Failure restores the standard present path for the session. | Vendored Intel XeSS SDK 3.0.2 (`libxess_fg.dll` **and** `libxell.dll`, included in `sdk/`) + Windows/DX12 + SM 6.4 GPU. |
 
-That mode has **two** required inputs — the UI texture *and* the HUD-less colour, which is tagged every frame (`XEFG_SWAPCHAIN_RES_HUDLESS_COLOR`, `RV_UNTIL_NEXT_PRESENT`, parked in `PIXEL_COMPUTE_READ` and restored by the next frame's `prepare`). Tagging only the UI texture leaves XeSS-FG with no colour to interpolate and no UI to composite, which reads on screen as "the whole HUD vanished" while the scene keeps rendering; both tags are unconditional. The mode itself is 3 by default and can be
-overridden per run with `PW_XEFG_UI_MODE=<0..5>` (the ready line in
-`session.log` names the mode it used) so a HUD problem can be narrowed to one
-composition mode without a rebuild. XeLL (`libxell.dll`) is mandatory on every GPU — Intel Arc included — and the viewer creates the XeLL context itself, enables low-latency mode (`xellSetSleepMode`), and delivers the required simulation / render-submit / present markers each frame; the XeLL context is destroyed after the XeSS-FG context, as the SDK requires. **Documented pairing: XeSS upscaling or none.** Failure restores the standard present path for the session. | Vendored Intel XeSS SDK 3.0.2 (`libxess_fg.dll` **and** `libxell.dll`, included in `sdk/`) + Windows/DX12 + SM 6.4 GPU. |
+XeLL (`libxell.dll`) is mandatory for XeSS-FG on every GPU — Intel Arc included — and the
+viewer creates the context itself, enables low-latency mode (`xellSetSleepMode`) and delivers
+the simulation / render-submit / present markers each frame; the XeLL context is destroyed
+after the XeSS-FG context, as the SDK requires.
+
+Depth and motion vectors are always tagged as `XEFG_SWAPCHAIN_RV_ONLY_NOW` on the viewer's own
+command list, so XeSS-FG records its copies there and they execute on the app's direct queue
+right after the writes that produced the textures (with `RV_UNTIL_NEXT_PRESENT` the SDK could
+read the live textures during `Present` instead). With `PW_XEFG_UI_COMPOSITION=1` the same
+applies to the two composition inputs — the UI texture *and* the HUD-less colour, which that
+mode requires (`XEFG_SWAPCHAIN_RES_HUDLESS_COLOR`); tagging only the UI texture leaves XeSS-FG
+with no colour to interpolate and no UI to composite, which reads on screen as "the whole HUD
+vanished" while the scene keeps rendering. `PW_XEFG_UI_MODE=<0..5>` selects the composition
+mode, and the ready line in `session.log` names the mode, the UI target and whether generation
+is on.
+
+The proxy swapchain is created **without**
+`DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`, even though the shared hand-over prefers
+it for FSR: XeSS-FG presents two frames per app Present, and with the flag set the proxy is
+capped at one queued frame unless its owner also calls `SetMaximumFrameLatency`, which leaves
+the generated frame nowhere to go. `PW_XEFG_ENABLED=0` keeps the proxy as the presenter but
+turns generation off — one run with it separates "the generated frames are broken" from
+"presenting through the proxy is broken".
+
 
 ## Latency
 

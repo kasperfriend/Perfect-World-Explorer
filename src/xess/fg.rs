@@ -32,12 +32,17 @@
 //! every frame using the same frame id that is passed to `xellSleep` and to
 //! the XeSS-FG tagging calls.
 //!
-//! UI composition uses the "separate UI texture" mode
-//! (`HUDLESS_UITEXTURE`): the UI is drawn into
-//! [`XessFrameGeneration::ui_view`] by the caller and tagged with XeSS-FG
-//! every presented frame, so interpolated frames composite a sharp UI on
-//! top of the interpolated scene. The UI texture is expected to be
-//! premultiplied (egui blends with One/OneMinusSrcAlpha).
+//! UI handling defaults to Intel's first recommendation: **UI composition
+//! disabled** (`XEFG_SWAPCHAIN_UI_MODE_NONE`). The caller draws the UI into
+//! [`XessFrameGeneration::compose_view`] together with the scene
+//! ([`XessFrameGeneration::ui_in_composition`] is `true`), every presented
+//! frame is exactly what the app rendered, and the model interpolates the UI
+//! along with the scene. The alternative — the UI drawn into
+//! [`XessFrameGeneration::ui_view`] and composited sharp by the proxy
+//! (`HUDLESS_UITEXTURE`, premultiplied alpha because egui blends with
+//! One/OneMinusSrcAlpha) — is one environment variable away
+//! (`PW_XEFG_UI_COMPOSITION=1`); it keeps the UI un-interpolated at the cost of
+//! putting four SDK-visible inputs on the critical path.
 //!
 //! Non-Intel GPUs fall back to SM 6.4 kernels and produce a maximum of one
 //! interpolated frame per real frame; Intel discrete GPUs may support more,
@@ -55,7 +60,10 @@ use crate::fsr::{
 };
 use glam::Mat4;
 use std::ffi::c_void;
-use winapi::shared::dxgi::IDXGISwapChain;
+use winapi::shared::dxgi::{
+    IDXGIFactory, IDXGISwapChain, DXGI_MWA_NO_ALT_ENTER, DXGI_MWA_NO_WINDOW_CHANGES,
+    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+};
 use winapi::shared::dxgi1_2::{DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FULLSCREEN_DESC};
 use winapi::shared::dxgi1_4::IDXGISwapChain3;
 use winapi::shared::dxgiformat::{
@@ -72,6 +80,10 @@ const D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES: u32 =
 const D3D12_RESOURCE_BARRIER_FLAG_NONE: u32 = d3d12_ty::D3D12_RESOURCE_BARRIER_FLAG_NONE;
 
 const XEFG_INIT_FLAG_INVERTED_DEPTH: u32 = 1 << 0;
+/// UI composition disabled: the model interpolates whatever the app presents,
+/// UI included. Intel's first recommendation, and the default here.
+const XEFG_UI_MODE_NONE: i32 = 1;
+/// Separate UI texture + HUD-less colour; UI composited by the proxy.
 const XEFG_UI_MODE_HUDLESS_UITEXTURE: i32 = 3;
 const XEFG_UI_COMPOSITION_STATE_ENABLED: u32 = 1;
 /// Resource validity: XeSS-FG may defer (or skip) the copy entirely and read
@@ -421,6 +433,10 @@ pub struct XessFrameGeneration {
     frame_id: u64,
     /// Number of frames presented through the proxy.
     frames: u64,
+    /// `true` when the proxy composites the UI from the tagged UI texture and
+    /// the HUD-less colour; `false` (the default) when the caller draws the UI
+    /// into [`Self::compose_view`] and XeSS-FG interpolates it with the scene.
+    ui_composed_by_proxy: bool,
 }
 
 impl Drop for XessFrameGeneration {
@@ -500,6 +516,20 @@ impl XessFrameGeneration {
         let handover = prepared.report;
         crate::xess::diag(&format!("[XeSS FG] window hand-over: {handover}"));
 
+        // The shared hand-over prefers `FRAME_LATENCY_WAITABLE_OBJECT` (FSR's
+        // frame generator manages that object itself). XeSS-FG presents two
+        // frames per app Present — the real one and the interpolated one — and
+        // its own integrations create the proxy swapchain without the flag:
+        // with the flag set the proxy is capped at one queued frame unless the
+        // owner also calls `SetMaximumFrameLatency`, which leaves the generated
+        // frame nowhere to go. That is what "a black frame every second
+        // present" looks like, so drop it for this path.
+        desc1.Flags &= !DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+        crate::xess::diag(&format!(
+            "[XeSS FG] proxy swapchain: {}x{}, {} buffers, format {}, flags 0x{:x} (waitable object cleared)",
+            desc1.Width, desc1.Height, desc1.BufferCount, desc1.Format, desc1.Flags
+        ));
+
         let mut loader = XefgLoader::load(sdk_dir)?;
 
         let mut context: *mut c_void = std::ptr::null_mut();
@@ -520,17 +550,36 @@ impl XessFrameGeneration {
             )
         };
         let init_flags = XEFG_INIT_FLAG_INVERTED_DEPTH;
-        // UI composition mode. 3 = HUDLESS_UITEXTURE is what this build ships:
-        // the proxy interpolates the tagged HUD-less colour and blends the UI
-        // texture on top. `PW_XEFG_UI_MODE` lets a retest try another mode
-        // without a rebuild — 5 = BACKBUFFER_HUDLESS_UITEXTURE (UI refinement
-        // from the back buffer, the Unreal-Engine-recommended variant) or
-        // 2 = BACKBUFFER_UITEXTURE (no HUD-less colour needed).
-        let ui_mode = std::env::var("PW_XEFG_UI_MODE")
-            .ok()
-            .and_then(|value| value.trim().parse::<i32>().ok())
-            .filter(|mode| (0..=5).contains(mode))
-            .unwrap_or(XEFG_UI_MODE_HUDLESS_UITEXTURE);
+        // UI handling. Intel's first recommendation is UI composition disabled:
+        // the app draws its UI into the colour it presents and the model
+        // interpolates it together with the scene. That keeps every presented
+        // frame exactly what the app rendered, so neither a missing HUD nor a
+        // black interpolated frame can come from the composition inputs — and
+        // every retest so far has blamed those. The separate-UI-texture path
+        // (sharp UI on generated frames, UI never interpolated) stays available
+        // with PW_XEFG_UI_COMPOSITION=1.
+        let ui_in_composition = match std::env::var("PW_XEFG_UI_COMPOSITION") {
+            Ok(value) => value.trim() != "0",
+            Err(_) => false,
+        };
+        let ui_mode = if ui_in_composition {
+            std::env::var("PW_XEFG_UI_MODE")
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok())
+                .filter(|mode| (0..=5).contains(mode))
+                .unwrap_or(XEFG_UI_MODE_HUDLESS_UITEXTURE)
+        } else {
+            XEFG_UI_MODE_NONE
+        };
+        // PW_XEFG_ENABLED=0 keeps the proxy swapchain as the presenter but turns
+        // frame generation off (`xefgSwapChainSetEnabled(0)`), which is a
+        // passthrough that still copies the app's back buffers. It exists to
+        // tell "the generated frames are broken" apart from "presenting through
+        // the proxy is broken" in one run.
+        let frame_generation_enabled = match std::env::var("PW_XEFG_ENABLED") {
+            Ok(value) => value.trim() != "0",
+            Err(_) => true,
+        };
         let init_params = XefgD3D12InitParams {
             application_swapchain: std::ptr::null_mut(), // desc-based: XeSS-FG creates the proxy
             init_flags,
@@ -599,6 +648,20 @@ impl XessFrameGeneration {
             )
         };
         unsafe {
+            // DXGI must not take the window over from the app now that the
+            // proxy owns it. The association call lives on `IDXGIFactory`,
+            // which `IDXGIFactory2` does not derive from (DXGI interfaces are
+            // independent), hence the query.
+            let mut association: *mut IDXGIFactory = std::ptr::null_mut();
+            let hr = (*factory).QueryInterface(
+                &IDXGIFactory::uuidof(),
+                &mut association as *mut *mut _ as *mut *mut c_void,
+            );
+            if hr >= 0 && !association.is_null() {
+                (*association)
+                    .MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+                (*association).Release();
+            }
             (*factory).Release();
         }
         if rc != 0 {
@@ -610,23 +673,27 @@ impl XessFrameGeneration {
             ));
         }
 
-        // The UI composition state is disabled by default; enable it so the
-        // UI texture (HUDLESS_UITEXTURE mode) is composited onto real and
-        // generated frames.
-        let rc = unsafe {
-            (loader.set_ui_composition_state)(context, XEFG_UI_COMPOSITION_STATE_ENABLED)
-        };
-        if rc != 0 {
-            crate::xess::diag(&format!(
-                "[XeSS FG] xefgSwapChainSetUiCompositionState(ENABLED) returned {}; UI may be missing from generated frames",
-                xefg_result_name(rc)
-            ));
+        // UI composition is off unless asked for: with it on, the proxy
+        // composites the tagged UI texture over the HUD-less colour, which is
+        // the only way to keep the UI perfectly sharp on generated frames but
+        // also puts four SDK-visible inputs on the critical path.
+        if ui_in_composition {
+            let rc = unsafe {
+                (loader.set_ui_composition_state)(context, XEFG_UI_COMPOSITION_STATE_ENABLED)
+            };
+            if rc != 0 {
+                crate::xess::diag(&format!(
+                    "[XeSS FG] xefgSwapChainSetUiCompositionState(ENABLED) returned {}; UI may be missing from generated frames",
+                    xefg_result_name(rc)
+                ));
+            }
         }
         // Frame generation ships disabled until explicitly enabled.
-        let rc = unsafe { (loader.set_enabled)(context, 1) };
+        let rc = unsafe { (loader.set_enabled)(context, u32::from(frame_generation_enabled)) };
         if rc != 0 {
             return Err(format!(
-                "xefgSwapChainSetEnabled(1) failed ({})",
+                "xefgSwapChainSetEnabled({}) failed ({})",
+                u32::from(frame_generation_enabled),
                 xefg_result_name(rc)
             ));
         }
@@ -718,9 +785,19 @@ impl XessFrameGeneration {
         let mv_pass = FsrMotionVectorPass::new(device);
 
         crate::xess::diag(&format!(
-            "[XeSS FG] frame generation ready (2x, depth-inverted, UI composition mode {} = {}) at {}x{}",
+            "[XeSS FG] frame generation ready (2x, depth-inverted, UI composition mode {} = {}, UI drawn {}, frame generation {}) at {}x{}",
             ui_mode,
             xefg_ui_mode_name(ui_mode),
+            if ui_in_composition {
+                "into the tagged UI texture"
+            } else {
+                "into the composition (interpolated by the model)"
+            },
+            if frame_generation_enabled {
+                "enabled"
+            } else {
+                "disabled by PW_XEFG_ENABLED=0 (proxy as passthrough presenter)"
+            },
             display_extent.0,
             display_extent.1
         ));
@@ -743,6 +820,7 @@ impl XessFrameGeneration {
             prev_view_proj: None,
             frame_id: 1,
             frames: 0,
+            ui_composed_by_proxy: ui_in_composition,
         })
     }
 
@@ -790,8 +868,18 @@ impl XessFrameGeneration {
     }
 
     /// View of the separate UI surface (composited by the proxy swapchain).
+    ///
+    /// Only meaningful while [`Self::ui_in_composition`] is `true`; otherwise
+    /// the caller draws the UI into [`Self::compose_view`] and this surface is
+    /// unused.
     pub fn ui_view(&self) -> wgpu::TextureView {
         self.ui.texture.create_view(&Default::default())
+    }
+
+    /// `true` when the caller must draw the UI into [`Self::compose_view`]
+    /// (the proxy composites nothing) rather than into [`Self::ui_view`].
+    pub fn ui_in_composition(&self) -> bool {
+        !self.ui_composed_by_proxy
     }
 
     /// The size of the composition / UI targets.
@@ -1023,13 +1111,15 @@ impl XessFrameGeneration {
         }
     }
 
-    /// Copy the composition into the proxy backbuffer, tag the HUD-less colour
-    /// and the UI texture (both required by `HUDLESS_UITEXTURE` mode), set the
-    /// present id and present through the proxy.
+    /// Copy the composition into the proxy backbuffer, hand over the UI inputs
+    /// when the proxy composites them, set the present id and present through
+    /// the proxy.
     ///
     /// `ui_visible` must reflect whether the UI was drawn into
     /// [`Self::ui_view`] this frame (the surface must still hold the UI or
-    /// a fully transparent image, never uninitialized garbage).
+    /// a fully transparent image, never uninitialized garbage). It is ignored
+    /// on the default path, where [`Self::ui_in_composition`] tells the caller
+    /// to draw the UI into [`Self::compose_view`] instead.
     pub fn finish(&mut self, ui_visible: bool) -> Result<(), String> {
         let id = self.current_frame_id();
         let (width, height) = self.size;
@@ -1080,7 +1170,8 @@ impl XessFrameGeneration {
                 ),
                 barrier(&backbuffer, D3D12_STATE_PRESENT, D3D12_STATE_COPY_DEST),
             ];
-            if ui_visible {
+            let tag_ui = ui_visible && self.ui_composed_by_proxy;
+            if tag_ui {
                 barriers.push(barrier(
                     &self.ui.resource,
                     D3D12_STATE_RENDER_TARGET,
@@ -1096,30 +1187,38 @@ impl XessFrameGeneration {
             }
             list.as_mut_ptr() as *mut c_void
         };
-        unsafe {
-            tag_frame_resource_now(
-                self.loader.tag_frame_resource,
-                self.loader.context,
-                list_ptr,
-                id,
-                XEFG_SWAPCHAIN_RES_HUDLESS_COLOR,
-                self.compose.resource.as_mut_ptr() as *mut c_void,
-                (width, height),
-                D3D12_STATE_COPY_SRC,
-            )?;
-            if ui_visible {
+        if self.ui_composed_by_proxy {
+            // Composition path: the two inputs `HUDLESS_UITEXTURE` mode needs.
+            unsafe {
                 tag_frame_resource_now(
                     self.loader.tag_frame_resource,
                     self.loader.context,
                     list_ptr,
                     id,
-                    XEFG_SWAPCHAIN_RES_UI,
-                    self.ui.resource.as_mut_ptr() as *mut c_void,
+                    XEFG_SWAPCHAIN_RES_HUDLESS_COLOR,
+                    self.compose.resource.as_mut_ptr() as *mut c_void,
                     (width, height),
                     D3D12_STATE_COPY_SRC,
                 )?;
             }
+            if ui_visible {
+                unsafe {
+                    tag_frame_resource_now(
+                        self.loader.tag_frame_resource,
+                        self.loader.context,
+                        list_ptr,
+                        id,
+                        XEFG_SWAPCHAIN_RES_UI,
+                        self.ui.resource.as_mut_ptr() as *mut c_void,
+                        (width, height),
+                        D3D12_STATE_COPY_SRC,
+                    )?;
+                }
+            }
         }
+        // Otherwise the composition already *is* HUD-less colour + UI (the
+        // caller drew both into it), so there is nothing to hand over: mode
+        // `NONE` interpolates the presented frame as it is.
         {
             let list = &mut self.ring.slot_mut(slot_index).list;
             let mut restore = vec![
@@ -1130,7 +1229,7 @@ impl XessFrameGeneration {
                 ),
                 barrier(&backbuffer, D3D12_STATE_COPY_DEST, D3D12_STATE_PRESENT),
             ];
-            if ui_visible {
+            if ui_visible && self.ui_composed_by_proxy {
                 restore.push(barrier(
                     &self.ui.resource,
                     D3D12_STATE_COPY_SRC,

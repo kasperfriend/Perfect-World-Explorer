@@ -4960,6 +4960,13 @@ pub fn run(
                                         .as_ref()
                                         .map(|fg| (fg.compose_view(), fg.ui_view()))
                                 });
+                            // XeSS frame generation defaults to "UI in the
+                            // composition": the proxy composites nothing and
+                            // the model interpolates the frame as presented.
+                            let xefg_ui_in_composition = xess_framegen
+                                .as_ref()
+                                .map(|fg| fg.ui_in_composition())
+                                .unwrap_or(false);
                             let final_view: &wgpu::TextureView = match fg_views.as_ref() {
                                 Some((compose, _)) => compose,
                                 None => surface_view
@@ -5301,11 +5308,18 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 let mut encoder=renderer.device.create_command_encoder(&Default::default());
                                 let cmd=egui_renderer.update_buffers(&renderer.device,&renderer.queue,&mut encoder,&jobs,&screen);
                                 {
-                                    // In frame generation mode the UI is
+                                    // With UI composition enabled the UI is
                                     // rendered into its own transparent
-                                    // surface; the swapchain composites it
-                                    // onto real and generated frames.
+                                    // surface and the swapchain composites it
+                                    // onto real and generated frames. On the
+                                    // default XeSS-FG path (and everywhere
+                                    // else) it is drawn on top of the already
+                                    // composed frame, so what is presented is
+                                    // exactly what was rendered.
                                     let (egui_target, egui_load) = match fg_views.as_ref() {
+                                        Some(_) if xefg_ui_in_composition => {
+                                            (scene_view, wgpu::LoadOp::Load)
+                                        }
                                         Some((_, ui)) => {
                                             (ui, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT))
                                         }
@@ -5321,7 +5335,8 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                             // XeSS frame generation consumes a UI texture every
                             // frame; when no UI was drawn, clear one to
                             // transparent and treat it as visible.
-                            if xess_framegen.is_some() && !ui_visible {
+                            if xess_framegen.is_some() && !xefg_ui_in_composition && !ui_visible
+                            {
                                 if let Some(fg) = xess_framegen.as_ref() {
                                     let ui_surface = fg.ui_view();
                                     let mut encoder = renderer.device.create_command_encoder(&Default::default());

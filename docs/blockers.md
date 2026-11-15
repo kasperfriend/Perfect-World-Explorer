@@ -394,3 +394,44 @@ done.
   needs to be narrowed down separately.
 - **Status:** open (fix is written and compiles on Windows CI; not yet
   confirmed on hardware).
+
+## B-13 — XeSS-FG black frame every other present, second attempt (screen report)
+
+- **Report:** the `RV_ONLY_NOW` re-tagging from B-12 changed nothing: "same
+  flickering every second frame", everything else works.
+- **What that rules out:** the app↔SDK copy ordering. The inputs were already
+  copied onto the viewer's own command list when the flicker was reproduced, so
+  the black frames are not a stale-read race on those textures.
+- **Consequence — two changes, both aimed at the remaining candidates:**
+  1. **UI composition is now disabled by default** (`XEFG_SWAPCHAIN_UI_MODE_NONE`,
+     Intel's first recommendation). The UI is drawn into the composition, every
+     presented frame is exactly what the viewer rendered, and XeSS-FG only
+     consumes depth + motion vectors + the presented colour. That takes the
+     HUD-less colour and the UI texture out of the critical path entirely, so
+     the composition inputs can no longer be what turns a frame black. The
+     sharp-UI path from B-11/B-12 is still there behind
+     `PW_XEFG_UI_COMPOSITION=1`.
+  2. **The proxy swapchain is created without
+     `DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`.** The shared
+     hand-over sets that flag for FSR (whose swapchain manages the waitable
+     object itself), and a waitable swapchain is capped at one queued frame
+     unless its owner also calls `SetMaximumFrameLatency`. XeSS-FG presents
+     *two* frames per app Present — the real one and the generated one — so with
+     the cap in place the generated frame has nowhere to go, which is exactly
+     what "a black frame every second present" looks like. The reference
+     integrations create the proxy without the flag. `MakeWindowAssociation`
+     (followed by `DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES`) is now
+     called on the proxy's factory right after init, as those integrations do.
+- **What the retest has to show:** no black frames, and the ready line in
+  `session.log` reading `UI composition mode 1 = NONE, UI drawn into the
+  composition (interpolated by the model), frame generation enabled`, plus
+  `present id …: 2 frame(s) presented`.
+- **If it still flickers, these three runs decide the next step** (all are
+  environment variables, no rebuild):
+  | Run | Setting | Meaning of the result |
+  |---|---|---|
+  | 1 | (default) | — |
+  | 2 | `PW_XEFG_ENABLED=0` | Proxy stays the presenter, generation off. Flicker **gone** ⇒ the *generated* frames are black: the interpolation inputs (depth, motion vectors, jitter, frame constants) are next. Flicker **still there** ⇒ presenting through the proxy itself is broken on this machine. |
+  | 3 | `PW_XEFG_UI_COMPOSITION=1` | Back to the sharp-UI composition path. Flicker returns ⇒ it is specific to the composition inputs; no flicker ⇒ that path is usable again. |
+- **Status:** open (fix is written and compiles on Windows CI; not yet
+  confirmed on hardware).
