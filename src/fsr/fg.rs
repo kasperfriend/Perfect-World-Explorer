@@ -19,15 +19,14 @@
 //! * On disable, the FFX contexts are destroyed and the proxy released,
 //!   freeing the hwnd; the engine recreates the wgpu surface afterwards.
 //!
-//! UI composition keeps the UI inside the composition by default: the caller
-//! draws the HUD into [`FrameGeneration::compose_view`] like any other frame
-//! content and the swapchain receives no UI resource, so the interpolator
-//! never touches HUD pixels. The alternative — the caller drawing the UI into
-//! [`FrameGeneration::ui_view`], which the swapchain blends back in — is one
-//! environment variable away (`PW_FSRFG_UI_COMPOSITION=0`); it keeps the HUD
-//! sharp on generated frames, but FFX treats that surface as colour data, so
-//! the HUD picks up the interpolator's tone mapping and comes back washed out.
-//! See [`FrameGeneration::ui_in_composition`].
+//! The UI is separated from the render by default: the caller draws the world
+//! into [`FrameGeneration::compose_view`], `prepare` copies that into
+//! [`FrameGeneration::ui_view`], and the caller draws the HUD on top of the
+//! copy. That copy is the presented frame; the composition goes to FFX as
+//! `HUDLessColor`, so it interpolates a HUD-free scene and composites the
+//! extracted UI onto generated frames (never interpolated, never blended by
+//! FFX itself). See [`FrameGeneration::ui_in_composition`] for the legacy
+//! in-composition path.
 //!
 //! Synchronisation follows the same pattern as the upscaler: everything
 //! native runs on the one D3D12 direct queue wgpu-hal created, wgpu submits
@@ -255,8 +254,9 @@ pub struct FrameGeneration {
     /// Composition target: everything except the UI is drawn here, then it is
     /// copied into the proxy backbuffer at present time.
     compose: NativeTexture2D,
-    /// Separate UI surface, composited onto real and generated frames by the
-    /// swapchain.
+    /// The frame that is presented: a copy of `compose` with the UI drawn on
+    /// top, handed to FFX as `presentColor` while `compose` is handed to it as
+    /// `HUDLessColor` (see [`FrameGeneration::ui_in_composition`]).
     ui: NativeTexture2D,
     /// Native depth/MV copies at render extent (independent of the FSR
     /// upscaler, so frame generation works with any upscaler or none).
@@ -265,13 +265,12 @@ pub struct FrameGeneration {
     mv_pass: FsrMotionVectorPass,
     prev_view_proj: Option<Mat4>,
     frame_index: u64,
-    /// `true` while the UI surface is parked in the compute/read state FFX
-    /// expects during `Present`; the next `prepare` moves it back to
-    /// `RENDER_TARGET` before wgpu draws the UI again.
-    ui_needs_rt_restore: bool,
-    /// Draw the UI into the composition instead of handing it to the
-    /// interpolator. Always on; see
-    /// [`FrameGeneration::ui_in_composition`] for why.
+    /// Draw the UI into the composition instead of a separate surface.
+    ///
+    /// Off by default: the UI is drawn into a copy of the composition and the
+    /// composition itself goes to FFX as `HUDLessColor`, so the interpolator
+    /// never sees HUD pixels and recomposites them from the presented frame.
+    /// `PW_FSRFG_UI_COMPOSITION=1` restores the old in-composition path.
     ui_in_composition: bool,
     /// The FFX provider version the loader actually advertised and the create
     /// call accepted (major << 22 | minor << 12 | patch). `None` when the
@@ -659,10 +658,9 @@ impl FrameGeneration {
             mv_pass,
             prev_view_proj: None,
             frame_index: 0,
-            ui_needs_rt_restore: false,
             ui_in_composition: std::env::var("PW_FSRFG_UI_COMPOSITION")
-                .map(|value| value.trim() != "0")
-                .unwrap_or(true),
+                .map(|value| value.trim() == "1")
+                .unwrap_or(false),
             selected_version: created_override,
         })
     }
@@ -709,7 +707,11 @@ impl FrameGeneration {
             dxgi_for_format(format),
             size,
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                // The presented frame starts as a copy of the composition
+                // (`prepare`), then the UI is drawn on top of it.
+                | wgpu::TextureUsages::COPY_DST,
             super::imp::D3D12_STATE_COMMON,
             false,
         )
@@ -758,24 +760,35 @@ impl FrameGeneration {
         self.compose.texture.create_view(&Default::default())
     }
 
-    /// View of the separate UI surface (alpha-composited by the swapchain).
+    /// View of the surface the UI is drawn into.
+    ///
+    /// It already holds an exact copy of the composition when this is called
+    /// (see [`Self::ui_surface_prefilled`]), so the UI pass must `Load`, not
+    /// `Clear`: the result is the frame that gets presented.
     pub fn ui_view(&self) -> wgpu::TextureView {
         self.ui.texture.create_view(&Default::default())
     }
 
+    /// `true` when the UI surface already contains the scene, i.e. the UI pass
+    /// composites on top of it instead of starting from transparency.
+    pub fn ui_surface_prefilled(&self) -> bool {
+        !self.ui_in_composition
+    }
+
     /// `true` when the UI is part of the composition instead of a separate
-    /// surface handed to the interpolator.
+    /// surface the interpolator is told about.
     ///
-    /// The FFX frame-generation swapchain blends the UI surface by itself.
-    /// FSR treats that surface as colour data, so the HUD comes back with the
-    /// interpolator's tone mapping applied — flat headings, washed-out bars,
-    /// a translucent panel that is noticeably brighter than the frame it sits
-    /// on. Keeping the UI in the composition avoids the blend entirely (the
-    /// interpolator only ever sees HUD-less pixels and generated frames get no
-    /// HUD) at the cost of a HUD that is re-rendered rather than composited
-    /// per generated frame. That is the trade the other two providers make by
-    /// default, so FSR matches them; `PW_FSRFG_UI_COMPOSITION=0` restores the
-    /// separate-surface path for comparison.
+    /// Off by default. The UI is drawn into a copy of the composition, that
+    /// copy becomes the presented frame, and the composition itself is handed
+    /// to FFX as `HUDLessColor`. FFX extracts the UI from the difference
+    /// between the two, interpolates the HUD-less scene and composites the
+    /// extracted UI onto generated frames — so HUD pixels are never
+    /// interpolated and never pass through FFX's own blend (which is what
+    /// washed them out when the UI was registered as a separate resource).
+    ///
+    /// `PW_FSRFG_UI_COMPOSITION=1` restores the old path, where the UI is drawn
+    /// into the composition itself and the interpolator sees it as scene
+    /// content.
     pub fn ui_in_composition(&self) -> bool {
         self.ui_in_composition
     }
@@ -814,7 +827,23 @@ impl FrameGeneration {
             frame_generation_callback_user_context: std::ptr::null_mut(),
             frame_generation_enabled: enabled,
             allow_async_workloads: false,
-            hudless_color: FfxApiResource::EMPTY,
+            // The scene without the UI. FFX extracts the UI as the difference
+            // between it and `presentColor` (the presented frame, which does
+            // contain it) and composites that extraction onto generated
+            // frames at native resolution, so HUD pixels are never
+            // interpolated and never pass through FFX's own blending.
+            hudless_color: if enabled && !self.ui_in_composition {
+                FfxApiResource::texture2d(
+                    &self.compose.resource,
+                    self.ui_ffx_format,
+                    self.size.0,
+                    self.size.1,
+                    super::imp::FFX_API_RESOURCE_USAGE_READ_ONLY,
+                    FFX_API_RESOURCE_STATE_RENDER_TARGET,
+                )
+            } else {
+                FfxApiResource::EMPTY
+            },
             flags: 0,
             only_present_generated: false,
             generation_rect: FfxApiRect2D {
@@ -917,6 +946,21 @@ impl FrameGeneration {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        if !self.ui_in_composition {
+            // The presented frame is the composition with the UI on top: start
+            // it as an exact copy, then the caller draws the UI into
+            // `ui_view()` (`Load`, not `Clear`). FFX gets both images and
+            // extracts the UI from the difference.
+            encoder.copy_texture_to_texture(
+                self.compose.texture.as_image_copy(),
+                self.ui.texture.as_image_copy(),
+                wgpu::Extent3d {
+                    width: self.size.0,
+                    height: self.size.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         queue.submit(Some(encoder.finish()));
 
         // --- Native FFX prepare on the same queue, right after wgpu's submit.
@@ -932,13 +976,6 @@ impl FrameGeneration {
             )
         };
         let mut barriers = Vec::with_capacity(3);
-        if self.ui_needs_rt_restore {
-            barriers.push(barrier(
-                &self.ui.resource,
-                D3D12_STATE_PIXEL_COMPUTE_READ,
-                D3D12_STATE_RENDER_TARGET,
-            ));
-        }
         barriers.push(barrier(
             &self.depth.resource,
             D3D12_STATE_RENDER_TARGET,
@@ -950,7 +987,6 @@ impl FrameGeneration {
             D3D12_STATE_PIXEL_COMPUTE_READ,
         ));
         list.resource_barrier(&barriers);
-        self.ui_needs_rt_restore = false;
         let mut prepare = FfxDispatchDescFrameGenerationPrepareV2 {
             header: FfxApiHeader::new(FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2),
             frame_id: self.frame_index,
@@ -1017,16 +1053,27 @@ impl FrameGeneration {
         Ok(())
     }
 
-    /// Copy the composition into the proxy backbuffer, register the UI,
-    /// configure frame generation, dispatch the interpolation workload, and
-    /// present through the proxy swapchain.
+    /// Copy the presented frame into the proxy backbuffer, hand the UI and
+    /// HUD-less inputs to FFX, configure frame generation, dispatch the
+    /// interpolation workload, and present through the proxy swapchain.
     ///
     /// `ui_visible` must reflect whether the UI was drawn into [`Self::ui_view`]
-    /// this frame; an empty UI resource is registered otherwise.
+    /// this frame. It only matters on the legacy in-composition path, where the
+    /// separate-surface registration is skipped entirely.
     pub fn finish(&mut self, ui_visible: bool, reset: bool) -> Result<(), String> {
-        // Composition mode turns the separate UI surface off entirely: see
-        // `ui_in_composition`.
-        let ui_visible = ui_visible && !self.ui_in_composition;
+        // Only the legacy in-composition path registers a UI resource for the
+        // swapchain to blend; the default path hands FFX `HUDLessColor` and lets
+        // it extract the UI from the presented frame instead.
+        let ui_visible = ui_visible && self.ui_in_composition;
+        // With the UI on its own surface the presented frame (`ui`: composition
+        // plus UI, see `prepare`) is what goes to the backbuffer, and FFX gets
+        // the composition as `HUDLessColor` — no UI resource is registered at
+        // all, because that would let FFX blend the UI a second time.
+        let present_source = if self.ui_in_composition {
+            &self.compose
+        } else {
+            &self.ui
+        };
         let (width, height) = self.size;
         // --- Acquire the current backbuffer.
         let sc3 = self.proxy as *mut IDXGISwapChain3;
@@ -1059,7 +1106,7 @@ impl FrameGeneration {
         };
         let mut barriers = vec![
             barrier(
-                &self.compose.resource,
+                &present_source.resource,
                 D3D12_STATE_RENDER_TARGET,
                 D3D12_STATE_COPY_SRC,
             ),
@@ -1076,12 +1123,14 @@ impl FrameGeneration {
         // The d3d12 crate has no safe `CopyResource` wrapper, so call the
         // COM method on the underlying raw interface directly.
         unsafe {
-            (*list.as_mut_ptr())
-                .CopyResource(backbuffer.as_mut_ptr(), self.compose.resource.as_mut_ptr());
+            (*list.as_mut_ptr()).CopyResource(
+                backbuffer.as_mut_ptr(),
+                present_source.resource.as_mut_ptr(),
+            );
         }
         let restore = [
             barrier(
-                &self.compose.resource,
+                &present_source.resource,
                 D3D12_STATE_COPY_SRC,
                 D3D12_STATE_RENDER_TARGET,
             ),
@@ -1089,13 +1138,8 @@ impl FrameGeneration {
         ];
         list.resource_barrier(&restore);
         self.ring.retire(slot_index, &self.queue, "FSR FG")?;
-        if ui_visible {
-            // FFX reads the UI surface during Present; it stays parked in
-            // PIXEL_COMPUTE_READ until the next prepare restores it.
-            self.ui_needs_rt_restore = true;
-        }
 
-        // --- Register the UI (or an empty UI resource for frames without it).
+        // --- Legacy path only: register the UI so the swapchain blends it.
         let ui_resource = if ui_visible {
             FfxApiResource::texture2d(
                 &self.ui.resource,
@@ -1125,10 +1169,13 @@ impl FrameGeneration {
                 0
             },
         };
-        let rc =
-            unsafe { (self.loader.configure)(&mut self.swapchain_context, &mut register.header) };
-        if rc != super::imp::FFX_API_RETURN_OK {
-            super::diag(&format!("[FSR FG] registering the UI resource failed (0x{rc:x}); UI may be missing from generated frames"));
+        if self.ui_in_composition {
+            let rc = unsafe {
+                (self.loader.configure)(&mut self.swapchain_context, &mut register.header)
+            };
+            if rc != super::imp::FFX_API_RETURN_OK {
+                super::diag(&format!("[FSR FG] registering the UI resource failed (0x{rc:x}); UI may be missing from generated frames"));
+            }
         }
 
         // --- Configure frame generation for this frame.

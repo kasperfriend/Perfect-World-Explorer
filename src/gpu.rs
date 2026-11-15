@@ -5191,6 +5191,15 @@ pub fn run(
                                     dlss_framegen.as_ref().map(|fg| fg.ui_in_composition())
                                 })
                                 .unwrap_or(false);
+                            // FSR frame generation hands the UI its own surface
+                            // *pre-filled with the scene*: the UI pass composites
+                            // on top of that copy and the result is the
+                            // presented frame, while the scene goes to FFX as
+                            // `HUDLessColor`.
+                            let ui_surface_prefilled = framegen
+                                .as_ref()
+                                .map(|fg| fg.ui_surface_prefilled())
+                                .unwrap_or(false);
                             let final_view: &wgpu::TextureView = match fg_views.as_ref() {
                                 Some((compose, _)) => compose,
                                 None => surface_view
@@ -5621,6 +5630,11 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     let (egui_target, egui_load) = match fg_views.as_ref() {
                                         Some(_) if xefg_ui_in_composition => {
                                             (scene_view, wgpu::LoadOp::Load)
+                                        }
+                                        // The surface already holds the scene:
+                                        // draw the UI on top, keep the rest.
+                                        Some((_, Some(ui))) if ui_surface_prefilled => {
+                                            (ui, wgpu::LoadOp::Load)
                                         }
                                         Some((_, Some(ui))) => {
                                             (ui, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT))

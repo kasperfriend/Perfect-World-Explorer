@@ -218,9 +218,14 @@ mod fg_stub {
             unimplemented!()
         }
 
-        /// The Windows path draws the UI into the composition, so this is the
+        /// The Windows path keeps the UI on its own surface, so this is the
         /// value the real frame generator reports.
         pub fn ui_in_composition(&self) -> bool {
+            false
+        }
+
+        /// The Windows path pre-fills the UI surface with the composition.
+        pub fn ui_surface_prefilled(&self) -> bool {
             true
         }
 
