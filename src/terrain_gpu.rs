@@ -1456,9 +1456,8 @@ pub struct FarVertex {
     pos: [f32; 3],
     normal: [i8; 4],
 }
-/// Custom far-mesh stride beyond the native terrain window. Increasing the
-/// stride lowers far-geometry vertex/index work quadratically; near terrain is
-/// still selected and meshed by the recovered client LOD rules.
+/// Custom far-mesh stride beyond the native terrain window. Larger strides
+/// lower far-geometry work; near terrain still uses the recovered client LOD.
 pub fn far_lod_step(setting: u8) -> usize {
     match setting {
         0 => 4,
@@ -1478,6 +1477,9 @@ pub fn world_mesh(
     ),
     String,
 > {
+    if step > 4 {
+        return world_mesh_with_custom_far_blocks(t, step);
+    }
     let xs = grid_axis(t.width, step);
     let ys = grid_axis(t.height, step);
     let mut v = Vec::with_capacity(xs.len() * ys.len());
@@ -1498,6 +1500,169 @@ pub fn world_mesh(
     }
     let (indices, spans) = far_indices(&v, xs.len(), ys.len());
     Ok((v, indices, spans))
+}
+
+/// Build coarser far blocks without changing the native near-window mesh.
+/// Every block perimeter retains the established four-cell samples, so this
+/// mesh meets the fixed far-boundary stitch at any camera window position.
+fn world_mesh_with_custom_far_blocks(
+    t: &Terrain,
+    stride: usize,
+) -> Result<
+    (
+        Vec<FarVertex>,
+        Vec<u32>,
+        Vec<crate::terrain_residency::Span>,
+    ),
+    String,
+> {
+    if !matches!(stride, 8 | 16) {
+        return Err(format!("unsupported custom far stride {stride}"));
+    }
+    const BLOCK: usize = crate::terrain_lod::CELLS;
+    if t.width % BLOCK != 0 || t.height % BLOCK != 0 {
+        return Err("custom far terrain requires whole terrain blocks".into());
+    }
+    let (points, local_indices) = custom_far_block_topology(stride);
+    let blocks = (t.width / BLOCK) * (t.height / BLOCK);
+    let mut vertices = Vec::with_capacity(blocks * points.len());
+    let mut indices = Vec::with_capacity(blocks * local_indices.len());
+    let mut spans = Vec::with_capacity(blocks);
+    let mut reader = t.heights.reader();
+    for by in (0..t.height).step_by(BLOCK) {
+        for bx in (0..t.width).step_by(BLOCK) {
+            let start = indices.len() as u32;
+            let base = vertices.len() as u32;
+            let mut low = [f32::INFINITY; 3];
+            let mut high = [f32::NEG_INFINITY; 3];
+            for [lx, ly] in &points {
+                let x = bx + *lx as usize;
+                let y = by + *ly as usize;
+                let (height, normal) = reader.cell(y * t.width + x)?;
+                let pos = [
+                    (x as f32 - t.width as f32 * 0.5) * t.grid_spacing,
+                    height,
+                    (t.height as f32 * 0.5 - y as f32) * t.grid_spacing,
+                ];
+                for axis in 0..3 {
+                    low[axis] = low[axis].min(pos[axis]);
+                    high[axis] = high[axis].max(pos[axis]);
+                }
+                vertices.push(FarVertex {
+                    pos,
+                    normal: [normal[0], normal[1], normal[2], 0],
+                });
+            }
+            indices.extend(local_indices.iter().map(|index| base + *index));
+            spans.push(crate::terrain_residency::Span {
+                block: (bx, by),
+                start,
+                count: indices.len() as u32 - start,
+                bounds: [low[0], low[1], low[2], high[0], high[1], high[2]],
+            });
+        }
+    }
+    Ok((vertices, indices, spans))
+}
+
+/// A coarse block core with a four-cell perimeter. The perimeter is the same
+/// grid used by the legacy far mesh, so the native near LOD does not need to be
+/// modified to accommodate custom far detail.
+fn custom_far_block_topology(stride: usize) -> (Vec<[u32; 2]>, Vec<u32>) {
+    const BLOCK: u32 = crate::terrain_lod::CELLS as u32;
+    const EDGE: u32 = 4;
+    let outer = rect_border(0, BLOCK, EDGE);
+    let mut points = outer.clone();
+    let mut indices = Vec::new();
+    if stride == 8 {
+        let inner = rect_border(8, BLOCK - 8, 8);
+        let inner_offset = points.len() as u32;
+        points.extend_from_slice(&inner);
+        zipper_ring(&outer, &inner, inner_offset, &mut indices);
+        let center = points.len() as u32;
+        points.push([BLOCK / 2, BLOCK / 2]);
+        for i in 0..inner.len() {
+            indices.extend_from_slice(&[
+                center,
+                inner_offset + i as u32,
+                inner_offset + ((i + 1) % inner.len()) as u32,
+            ]);
+        }
+    } else {
+        let center = points.len() as u32;
+        points.push([BLOCK / 2, BLOCK / 2]);
+        for i in 0..outer.len() {
+            indices.extend_from_slice(&[
+                center,
+                i as u32,
+                ((i + 1) % outer.len()) as u32,
+            ]);
+        }
+    }
+    (points, indices)
+}
+
+fn rect_border(min: u32, max: u32, stride: u32) -> Vec<[u32; 2]> {
+    let mut points = Vec::new();
+    for x in (min..=max).step_by(stride as usize) {
+        points.push([x, min]);
+    }
+    for y in (min + stride..=max).step_by(stride as usize) {
+        points.push([max, y]);
+    }
+    for x in (min..max).step_by(stride as usize).rev() {
+        points.push([x, max]);
+    }
+    for y in (min + stride..max).step_by(stride as usize).rev() {
+        points.push([min, y]);
+    }
+    points
+}
+
+/// Stitch two nested convex boundary loops into a triangle strip. Each loop is
+/// ordered clockwise; advancing whichever loop reaches the next normalized
+/// perimeter position preserves a non-crossing triangulation.
+fn zipper_ring(
+    outer: &[[u32; 2]],
+    inner: &[[u32; 2]],
+    inner_offset: u32,
+    indices: &mut Vec<u32>,
+) {
+    fn cumulative(points: &[[u32; 2]]) -> Vec<f32> {
+        let mut lengths = Vec::with_capacity(points.len() + 1);
+        lengths.push(0.);
+        for i in 0..points.len() {
+            let a = points[i];
+            let b = points[(i + 1) % points.len()];
+            let edge = a[0].abs_diff(b[0]) + a[1].abs_diff(b[1]);
+            lengths.push(lengths.last().copied().unwrap() + edge as f32);
+        }
+        let total = *lengths.last().unwrap();
+        lengths.iter_mut().for_each(|length| *length /= total);
+        lengths
+    }
+    let outer_t = cumulative(outer);
+    let inner_t = cumulative(inner);
+    let (mut oi, mut ii) = (0, 0);
+    while oi < outer.len() || ii < inner.len() {
+        let next_outer = outer_t.get(oi + 1).copied().unwrap_or(f32::INFINITY);
+        let next_inner = inner_t.get(ii + 1).copied().unwrap_or(f32::INFINITY);
+        if next_outer <= next_inner {
+            indices.extend_from_slice(&[
+                (oi % outer.len()) as u32,
+                ((oi + 1) % outer.len()) as u32,
+                inner_offset + (ii % inner.len()) as u32,
+            ]);
+            oi += 1;
+        } else {
+            indices.extend_from_slice(&[
+                (oi % outer.len()) as u32,
+                inner_offset + ((ii + 1) % inner.len()) as u32,
+                inner_offset + (ii % inner.len()) as u32,
+            ]);
+            ii += 1;
+        }
+    }
 }
 
 fn far_indices(
@@ -1555,11 +1720,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn custom_far_blocks_keep_four_cell_edges_and_cover_each_patch_once() {
+        fn inside(point: [f32; 2], triangle: [[f32; 2]; 3]) -> bool {
+            let sign = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| {
+                (a[0] - c[0]) * (b[1] - c[1]) - (b[0] - c[0]) * (a[1] - c[1])
+            };
+            let a = sign(point, triangle[0], triangle[1]);
+            let b = sign(point, triangle[1], triangle[2]);
+            let c = sign(point, triangle[2], triangle[0]);
+            !((a < 0. || b < 0. || c < 0.) && (a > 0. || b > 0. || c > 0.))
+        }
+
+        for stride in [8, 16] {
+            let (points, indices) = custom_far_block_topology(stride);
+            let outer = &points[..32];
+            for i in 0..outer.len() {
+                let a = outer[i];
+                let b = outer[(i + 1) % outer.len()];
+                assert_eq!(a[0].abs_diff(b[0]) + a[1].abs_diff(b[1]), 4);
+            }
+            let triangles: Vec<_> = indices
+                .chunks_exact(3)
+                .map(|tri| {
+                    let indices: [u32; 3] = tri.try_into().unwrap();
+                    indices.map(|index| {
+                        let point = points[index as usize];
+                        [point[0] as f32, point[1] as f32]
+                    })
+                })
+                .collect();
+            assert_eq!(triangles.len(), if stride == 8 { 48 } else { 32 });
+            assert!(triangles.len() < 128, "stride {stride} did not reduce geometry");
+            for y in 0..128 {
+                for x in 0..128 {
+                    let point = [(x as f32 + 0.37) * 0.25, (y as f32 + 0.61) * 0.25];
+                    let count = triangles
+                        .iter()
+                        .filter(|triangle| inside(point, **triangle))
+                        .count();
+                    assert_eq!(count, 1, "stride {stride}: {point:?} covered {count} times");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn custom_far_lod_steps_get_coarser_without_changing_the_native_window() {
         let steps = [0, 1, 2].map(far_lod_step);
         assert_eq!(steps, [4, 8, 16]);
-        assert_eq!((32 / steps[0]).pow(2), 4 * (32 / steps[1]).pow(2));
-        assert_eq!((32 / steps[0]).pow(2), 16 * (32 / steps[2]).pow(2));
         assert_eq!(far_lod_step(u8::MAX), 16);
     }
 

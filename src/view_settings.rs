@@ -86,7 +86,7 @@ pub struct DetailSettings {
     /// Restore the finite native terrain window instead of the viewer far mesh.
     pub terrain_cutoff: bool,
     /// Coarseness of the custom far-terrain mesh beyond the native window.
-    /// `0/1/2` select strides 4/8/16; the near-window perimeter is stitched to match.
+    /// `0/1/2` select far strides 4/8/16; native near-window LOD is unchanged.
     pub far_terrain_lod: u8,
     pub tree_lod_scale: f32,
     /// Native `CECSceneBlock` quality preset (`0x424230`, `Sight+1` at
