@@ -159,7 +159,7 @@ pub struct World {
     reported: Vec<String>,
     frustum: Option<[[f32; 4]; 6],>
     scratch_candidates: Vec<model_queue::AlphaCandidate>,
-    scratch_failures: Vec<(usize, String)>,,
+    scratch_failures: Vec<(usize, String)>,
 }
 
 impl World {
