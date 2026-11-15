@@ -404,6 +404,15 @@ pub struct Ornament {
     pub up: [f32; 3],
     pub extra: u32,
     pub path: String,
+    /// Map namespace used by the retail scenery archive (`litmodels/a01/...`).
+    pub map_id: String,
+}
+fn map_id_from_ecbsd_path(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("world")
+        .to_ascii_lowercase()
 }
 impl Scene {
     /// Read placed lit-model references in the ECWLD's associated EC-BSD file.
@@ -413,6 +422,7 @@ impl Scene {
         if u32at(&b, 0)? != 0x42584f4d || u32at(&b, 4)? != 0x42534446 || u32at(&b, 8)? != 12 {
             return Err("unsupported EC-BSD header".into());
         }
+        let map_id = map_id_from_ecbsd_path(path);
         let mut seen = std::collections::HashMap::<u32, u32>::new();
         let mut result = Vec::new();
         for block in &self.blocks {
@@ -444,6 +454,7 @@ impl Scene {
                     up,
                     extra,
                     path,
+                    map_id: map_id.clone(),
                 });
             }
         }
@@ -453,6 +464,19 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scenery_map_namespace_comes_from_the_map_ecbsd_filename() {
+        assert_eq!(
+            map_id_from_ecbsd_path(Path::new("element/maps/a01/a01.ecbsd")),
+            "a01"
+        );
+        assert_eq!(
+            map_id_from_ecbsd_path(Path::new("element/maps/world/world.ecbsd")),
+            "world"
+        );
+    }
+
     fn effect_bytes() -> Vec<u8> {
         let mut b = vec![0; 60];
         // Corrected record layout, measured on the shipped world.ecwld: id at

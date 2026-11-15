@@ -237,6 +237,7 @@ pub struct Objects {
     texfile: Option<pck::PackageFile>,
     lit_archive_error: Option<String>,
     lit_archive_entries: usize,
+    litmodel_map_id: String,
     litentries: HashMap<String, pck::Entry>,
     litbasenames: HashMap<String, Vec<String>>,
     texentries: HashMap<String, pck::Entry>,
@@ -316,9 +317,36 @@ fn litmodel_entry_candidates(path: &str) -> [String; 4] {
 /// unique, so another world's same-named model can never be selected by guess.
 fn litmodel_entry_key(
     path: &str,
+    map_id: &str,
     entries: &HashMap<String, pck::Entry>,
     by_basename: &HashMap<String, Vec<String>>,
 ) -> Result<String, String> {
+    // Retail stores map-specific scenery under `litmodels/<map-id>/...`,
+    // while EC-BSD records store only the relative `1/litmodel_N.bmd` path.
+    // Preserve the current map namespace before considering legacy layouts;
+    // otherwise a common basename can resolve to another map's model.
+    let archive_path = normalize(path);
+    if let Some(key) = entries.get_key_value(&archive_path).map(|(key, _)| key) {
+        return Ok(key.clone());
+    }
+    let map_id = normalize(map_id).trim_matches('/').to_string();
+    if !map_id.is_empty() && !map_id.contains('/') {
+        let canonical = litmodel_key(path);
+        let relative = canonical
+            .strip_prefix("litmodels/world/")
+            .unwrap_or(&canonical);
+        let map_prefix = format!("litmodels/{map_id}/");
+        let map_scoped = entries.keys().any(|key| key.starts_with(&map_prefix));
+        let scoped_candidate = format!("{map_prefix}{relative}");
+        if entries.contains_key(&scoped_candidate) {
+            return Ok(scoped_candidate);
+        }
+        if map_scoped && map_id != "world" {
+            return Err(format!(
+                "missing model {path} in map namespace {map_prefix}; refusing cross-map basename fallback"
+            ));
+        }
+    }
     if let Some(key) = litmodel_entry_candidates(path)
         .iter()
         .find(|candidate| entries.contains_key(*candidate))
@@ -426,6 +454,16 @@ fn tex_budget_bytes() -> usize {
 }
 impl Objects {
     pub fn open(element: &Path, ornaments: Vec<Ornament>) -> Result<Self, String> {
+        let litmodel_map_id = ornaments
+            .first()
+            .map(|ornament| ornament.map_id.clone())
+            .unwrap_or_else(|| "world".to_string());
+        if ornaments
+            .iter()
+            .any(|ornament| !ornament.map_id.eq_ignore_ascii_case(&litmodel_map_id))
+        {
+            return Err("scenery placements from multiple map namespaces were mixed".into());
+        }
         let (litfile, litentries, lit_archive_error) =
             open_optional_archive(&element.join("litmodels.pck"));
         let (texfile, texentries, _tex_archive_error) =
@@ -463,6 +501,7 @@ impl Objects {
             texfile,
             lit_archive_error,
             lit_archive_entries,
+            litmodel_map_id,
             litentries,
             litbasenames,
             texentries,
@@ -513,10 +552,15 @@ impl Objects {
                     if let Some(error) = &archive_error {
                         return Err(format!("litmodels.pck was not indexed: {error}"));
                     }
-                    let entry_key = litmodel_entry_key(&name, &self.litentries, &self.litbasenames)
-                        .map_err(|error| {
-                            format!("{error}; litmodels.pck index has {indexed_count} members")
-                        })?;
+                    let entry_key = litmodel_entry_key(
+                        &name,
+                        &self.litmodel_map_id,
+                        &self.litentries,
+                        &self.litbasenames,
+                    )
+                    .map_err(|error| {
+                        format!("{error}; litmodels.pck index has {indexed_count} members")
+                    })?;
                     let entry = &self.litentries[&entry_key];
                     let file = self
                         .litfile
@@ -827,6 +871,49 @@ mod tests {
     }
 
     #[test]
+    fn map_scoped_archive_paths_select_the_current_maps_models() {
+        let a01 = "litmodels/a01/1/litmodel_0.bmd";
+        let a02 = "litmodels/a02/1/litmodel_0.bmd";
+        let entries = HashMap::from([
+            (
+                a01.to_string(),
+                pck::Entry {
+                    name: a01.to_string(),
+                    offset: 0,
+                    size: 1,
+                    compressed: 1,
+                },
+            ),
+            (
+                a02.to_string(),
+                pck::Entry {
+                    name: a02.to_string(),
+                    offset: 1,
+                    size: 1,
+                    compressed: 1,
+                },
+            ),
+        ]);
+        let by_basename = HashMap::from([(
+            "litmodel_0.bmd".to_string(),
+            vec![a01.to_string(), a02.to_string()],
+        )]);
+
+        assert_eq!(
+            litmodel_entry_key("1/litmodel_0.bmd", "a01", &entries, &by_basename).unwrap(),
+            a01
+        );
+        assert_eq!(
+            litmodel_entry_key("1/litmodel_0.bmd", "a02", &entries, &by_basename).unwrap(),
+            a02
+        );
+        let missing =
+            litmodel_entry_key("1/litmodel_1.bmd", "a01", &entries, &by_basename).unwrap_err();
+        assert!(missing.contains("map namespace litmodels/a01/"));
+        assert!(missing.contains("refusing cross-map basename fallback"));
+    }
+
+    #[test]
     fn map_model_lookup_uses_only_unique_archive_basename_fallbacks() {
         let name = "litmodels/world/10/litmodel_1318.bmd";
         let mut entries = HashMap::new();
@@ -844,6 +931,7 @@ mod tests {
         assert_eq!(
             litmodel_entry_key(
                 "litmodels/world/1/litmodel_1318.bmd",
+                "world",
                 &entries,
                 &by_basename
             )
@@ -867,6 +955,7 @@ mod tests {
             .push(other.to_string());
         assert!(litmodel_entry_key(
             "litmodels/world/1/litmodel_1318.bmd",
+            "world",
             &entries,
             &by_basename
         )
@@ -905,6 +994,7 @@ mod tests {
         assert_eq!(
             litmodel_entry_key(
                 "litmodels/world/1/litmodel_1318.bmd",
+                "world",
                 &entries,
                 &by_basename,
             )
@@ -938,6 +1028,7 @@ mod tests {
                 up: [0., 1., 0.],
                 extra: 0,
                 path: path.into(),
+                map_id: "world".into(),
             }],
         )
         .unwrap();
@@ -1026,6 +1117,7 @@ mod tests {
                 up: [0., 1., 0.],
                 extra: 0,
                 path: "1/litrmodel_1399.bmd".into(),
+                map_id: "world".into(),
             }],
         )
         .unwrap();
@@ -1064,6 +1156,7 @@ mod tests {
                 up: [0., 1., 0.],
                 extra: 0,
                 path: "1/litrmodel_1399.bmd".into(),
+                map_id: "world".into(),
             }],
         )
         .unwrap();
