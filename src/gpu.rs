@@ -4460,16 +4460,12 @@ pub fn run(
                                     );
                                 renderer.world_done = true;
                                 world_status = format!(
-                                    "Loaded {processed} objects; {skipped} meshes use fallback texture; {} geometry chunks, {} shared atlases ({} MiB); peak decoded-texture residency {} MiB of {} MiB across {} decoded textures ({} hits / {} misses, {} evictions)",
+                                    "Loaded {processed} objects; {skipped} meshes use fallback texture; {} geometry chunks ({} pages); peak decoded-texture residency {} MiB / {} MiB, {} evictions",
                                     renderer.world_pages.len(),
-                                    stats.shared_atlases,
-                                    stats.shared_atlas_bytes / (1024 * 1024),
-                                    stats.resident_bytes / (1024 * 1024),
-                                    stats.resident_budget_bytes / (1024 * 1024),
-                                    stats.resident_textures,
-                                    stats.cache_hits,
-                                    stats.cache_misses,
-                                    stats.evictions
+                                    stats.pages,
+                                    stats.residency.peak_resident_bytes >> 20,
+                                    stats.residency.budget_bytes >> 20,
+                                    stats.residency.evictions,
                                 );
                                 eprintln!("{world_status}");
                                 break;
