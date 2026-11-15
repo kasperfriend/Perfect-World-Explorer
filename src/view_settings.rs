@@ -1190,7 +1190,12 @@ effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs
             );
             assert_eq!(ViewSettings::decode(&encoded).latency, mode);
         }
-        for junk in ["latency=\n", "latency=reflex\n", "latency=2\n", "latency=\n"] {
+        for junk in [
+            "latency=\n",
+            "latency=reflex\n",
+            "latency=2\n",
+            "latency=xel\n",
+        ] {
             assert_eq!(
                 ViewSettings::decode(junk).latency,
                 LatencyMode::Vsync,
