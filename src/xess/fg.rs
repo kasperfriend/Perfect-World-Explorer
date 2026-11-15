@@ -565,24 +565,24 @@ impl XessFrameGeneration {
             )
         };
         let init_flags = XEFG_INIT_FLAG_INVERTED_DEPTH;
-        // UI handling. Intel's first recommendation is UI composition disabled:
-        // the app draws its UI into the colour it presents and the model
-        // interpolates it together with the scene. That keeps every presented
-        // frame exactly what the app rendered, so neither a missing HUD nor a
-        // black interpolated frame can come from the composition inputs — and
-        // every retest so far has blamed those. The separate-UI-texture path
-        // (sharp UI on generated frames, UI never interpolated) stays available
-        // with PW_XEFG_UI_COMPOSITION=1.
+        // UI handling. `BACKBUFFER_HUDLESS` is the mode that keeps the HUD out
+        // of the interpolated image without a second UI surface: the proxy is
+        // told the HUD-less colour, the backbuffer it receives contains the HUD,
+        // and it extracts the difference and recomposites that onto generated
+        // frames ("Interpolate hudless color, extract UI from backbuffer",
+        // `xefg_swapchain.h`). Interpolating the whole frame (`NONE`) smears the
+        // HUD; `PW_XEFG_UI_COMPOSITION=0` restores it for comparison, and
+        // `PW_XEFG_UI_MODE=3|5` selects the separate-UI-texture variants.
         let ui_in_composition = match std::env::var("PW_XEFG_UI_COMPOSITION") {
             Ok(value) => value.trim() != "0",
-            Err(_) => false,
+            Err(_) => true,
         };
         let ui_mode = if ui_in_composition {
             std::env::var("PW_XEFG_UI_MODE")
                 .ok()
                 .and_then(|value| value.trim().parse::<i32>().ok())
                 .filter(|mode| (0..=5).contains(mode))
-                .unwrap_or(XEFG_UI_MODE_HUDLESS_UITEXTURE)
+                .unwrap_or(XEFG_UI_MODE_BACKBUFFER_HUDLESS)
         } else {
             XEFG_UI_MODE_NONE
         };
@@ -796,7 +796,11 @@ impl XessFrameGeneration {
                     dxgi_for_format(ui_format),
                     display_extent,
                     d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                    wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        // In the backbuffer-extraction modes this surface
+                        // starts as a copy of the composition (`prepare`).
+                        | wgpu::TextureUsages::COPY_DST,
                     D3D12_STATE_COMMON,
                     false,
                 )?
@@ -919,13 +923,25 @@ impl XessFrameGeneration {
         self.compose.texture.create_view(&Default::default())
     }
 
-    /// View of the separate UI surface (composited by the proxy swapchain).
+    /// View of the surface the UI is drawn into.
     ///
-    /// Only meaningful while [`Self::ui_in_composition`] is `true`; otherwise
-    /// the caller draws the UI into [`Self::compose_view`] and this surface is
-    /// unused.
+    /// In the default `BACKBUFFER_HUDLESS` mode it already holds a copy of the
+    /// composition (see [`Self::ui_surface_prefilled`]) and becomes the
+    /// presented frame; in the separate-UI-texture modes it starts transparent.
+    /// When the proxy composites nothing ([`Self::ui_in_composition`] is `true`)
+    /// the caller draws the UI into [`Self::compose_view`] instead.
     pub fn ui_view(&self) -> wgpu::TextureView {
         self.ui.texture.create_view(&Default::default())
+    }
+
+    /// `true` when the UI surface contains the scene, so the UI pass must
+    /// `Load` it instead of clearing to transparent.
+    ///
+    /// Modes 2 and 4 keep the UI in the presented frame and let the proxy
+    /// extract it; modes 3 and 5 take the UI on its own (premultiplied alpha,
+    /// transparent where nothing was drawn).
+    pub fn ui_surface_prefilled(&self) -> bool {
+        self.ui_composed_by_proxy && matches!(self.ui_mode, 2 | 4)
     }
 
     /// `true` when the caller must draw the UI into [`Self::compose_view`]
@@ -1068,6 +1084,20 @@ impl XessFrameGeneration {
             pass.set_pipeline(self.mv_pass.pipeline());
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
+        }
+        if self.ui_surface_prefilled() {
+            // The presented frame is the composition with the UI on top: start
+            // it as an exact copy; the caller draws the UI into `ui_view()`
+            // (`Load`) and the proxy extracts the difference.
+            encoder.copy_texture_to_texture(
+                self.compose.texture.as_image_copy(),
+                self.ui.texture.as_image_copy(),
+                wgpu::Extent3d {
+                    width: self.size.0,
+                    height: self.size.1,
+                    depth_or_array_layers: 1,
+                },
+            );
         }
         queue.submit(Some(encoder.finish()));
 
@@ -1212,17 +1242,25 @@ impl XessFrameGeneration {
             )
         };
         let slot_index = self.ring.acquire("XeSS FG")?;
+        // What goes into the backbuffer: the presented frame (`ui`: composition
+        // plus UI) in the modes that keep the UI in it, the composition itself
+        // on the legacy `NONE` path.
+        let present_source = if self.ui_surface_prefilled() {
+            &self.ui
+        } else {
+            &self.compose
+        };
         let list_ptr = {
             let list = &mut self.ring.slot_mut(slot_index).list;
             let mut barriers = vec![
                 barrier(
-                    &self.compose.resource,
+                    &present_source.resource,
                     D3D12_STATE_RENDER_TARGET,
                     D3D12_STATE_COPY_SRC,
                 ),
                 barrier(&backbuffer, D3D12_STATE_PRESENT, D3D12_STATE_COPY_DEST),
             ];
-            let tag_ui = ui_visible && self.ui_composed_by_proxy;
+            let tag_ui = ui_visible && self.ui_composed_by_proxy && !self.ui_surface_prefilled();
             if tag_ui {
                 barriers.push(barrier(
                     &self.ui.resource,
@@ -1234,13 +1272,16 @@ impl XessFrameGeneration {
             // The d3d12 crate has no safe `CopyResource` wrapper, so call the
             // COM method on the underlying raw interface directly.
             unsafe {
-                (*list.as_mut_ptr())
-                    .CopyResource(backbuffer.as_mut_ptr(), self.compose.resource.as_mut_ptr());
+                (*list.as_mut_ptr()).CopyResource(
+                    backbuffer.as_mut_ptr(),
+                    present_source.resource.as_mut_ptr(),
+                );
             }
             list.as_mut_ptr() as *mut c_void
         };
         if self.ui_composed_by_proxy {
-            // Composition path: the two inputs `HUDLESS_UITEXTURE` mode needs.
+            // The HUD-less colour, always: every UI mode that is not `NONE`
+            // interpolates this instead of the presented frame.
             unsafe {
                 tag_frame_resource_now(
                     self.loader.tag_frame_resource,
@@ -1253,7 +1294,9 @@ impl XessFrameGeneration {
                     D3D12_STATE_COPY_SRC,
                 )?;
             }
-            if ui_visible {
+            // The UI on its own only for the separate-texture modes; the
+            // backbuffer-extraction modes take the UI from the presented frame.
+            if ui_visible && !self.ui_surface_prefilled() {
                 unsafe {
                     tag_frame_resource_now(
                         self.loader.tag_frame_resource,
@@ -1279,9 +1322,14 @@ impl XessFrameGeneration {
                     D3D12_STATE_COPY_SRC,
                     D3D12_STATE_RENDER_TARGET,
                 ),
+                barrier(
+                    &present_source.resource,
+                    D3D12_STATE_COPY_SRC,
+                    D3D12_STATE_RENDER_TARGET,
+                ),
                 barrier(&backbuffer, D3D12_STATE_COPY_DEST, D3D12_STATE_PRESENT),
             ];
-            if ui_visible && self.ui_composed_by_proxy {
+            if ui_visible && self.ui_composed_by_proxy && !self.ui_surface_prefilled() {
                 restore.push(barrier(
                     &self.ui.resource,
                     D3D12_STATE_COPY_SRC,

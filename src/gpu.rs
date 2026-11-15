@@ -5200,6 +5200,9 @@ pub fn run(
                                 .as_ref()
                                 .map(|fg| fg.ui_surface_prefilled())
                                 .or_else(|| {
+                                    xess_framegen.as_ref().map(|fg| fg.ui_surface_prefilled())
+                                })
+                                .or_else(|| {
                                     dlss_framegen.as_ref().map(|fg| fg.ui_surface_prefilled())
                                 })
                                 .unwrap_or(false);
@@ -5674,7 +5677,10 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                             // XeSS frame generation consumes a UI texture every
                             // frame; when no UI was drawn, clear one to
                             // transparent and treat it as visible.
-                            if xess_framegen.is_some() && !xefg_ui_in_composition && !ui_visible
+                            if xess_framegen.is_some()
+                                && !xefg_ui_in_composition
+                                && !ui_surface_prefilled
+                                && !ui_visible
                             {
                                 if let Some(fg) = xess_framegen.as_ref() {
                                     let ui_surface = fg.ui_view();

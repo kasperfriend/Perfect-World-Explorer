@@ -227,9 +227,13 @@ mod fg_stub {
             0
         }
 
-        /// Whether this frame generator wants the UI drawn into the composition
-        /// (and therefore interpolated) rather than into a separate UI texture.
+        /// The Windows path keeps the UI out of the interpolated image.
         pub fn ui_in_composition(&self) -> bool {
+            false
+        }
+
+        /// The Windows path pre-fills the UI surface with the composition.
+        pub fn ui_surface_prefilled(&self) -> bool {
             true
         }
     }
