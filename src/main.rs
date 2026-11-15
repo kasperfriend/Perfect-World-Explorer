@@ -79,9 +79,9 @@ mod grass_instances;
 mod grass_mips;
 mod grass_wind;
 mod indirect_args;
+mod latency;
 #[cfg(windows)]
 mod launcher_ui;
-mod latency;
 mod light_consumers;
 mod material;
 mod model_asset;

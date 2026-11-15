@@ -306,6 +306,263 @@ def verify_constants(repo: Path, verbose: bool) -> list[str]:
     return problems
 
 
+# --- FFI struct layouts ---------------------------------------------------
+#
+# A wrong field order here does not fail to compile: it silently hands the SDK
+# garbage. The check below compares the *kind sequence* of every struct the FFI
+# fills in with the vendored header (pointer / 4-byte int / 4-byte float /
+# double word / array / 2D pair), which catches reordering, omission and
+# wrong-width fields. Signedness of 4-byte enums is not compared (C enums are
+# `int`; the Rust side picks a 4-byte type for each).
+
+STRUCT_PAIRS = {
+    "src/xess/imp.rs": [
+        ("Xess2d", "xess/xess.h", "_xess_2d_t"),
+        ("XessInitParams", "xess/xess_d3d12.h", "_xess_d3d12_init_params_t"),
+        ("XessExecuteParams", "xess/xess_d3d12.h", "_xess_d3d12_execute_params_t"),
+    ],
+    "src/xess/fg.rs": [
+        ("Xefg2d", "xess_fg/xefg_swapchain.h", "_xefg_swapchain_2d_t"),
+        (
+            "XefgFrameConstantData",
+            "xess_fg/xefg_swapchain.h",
+            "_xefg_swapchain_frame_constant_data_t",
+        ),
+        (
+            "XefgD3D12InitParams",
+            "xess_fg/xefg_swapchain_d3d12.h",
+            "_xefg_swapchain_d3d12_init_params_t",
+        ),
+        (
+            "XefgD3D12ResourceData",
+            "xess_fg/xefg_swapchain_d3d12.h",
+            "_xefg_swapchain_d3d12_resource_data_t",
+        ),
+        ("XefgProperties", "xess_fg/xefg_swapchain.h", "_xefg_swapchain_properties_t"),
+        ("XefgPresentStatus", "xess_fg/xefg_swapchain.h", "_xefg_swapchain_present_status_t"),
+    ],
+    "src/xess/xell.rs": [
+        ("XellVersion", "xell/xell.h", "_xell_version_t"),
+        ("XellSleepParams", "xell/xell.h", "_xell_sleep_params_t"),
+    ],
+}
+
+RUST_STRUCT = re.compile(r"struct\s+(?P<name>\w+)\s*\{(?P<body>[^}]*)\}", re.S)
+RUST_FIELD = re.compile(r"^\s*(?:pub\s+)?(?P<name>\w+)\s*:\s*(?P<type>[^,]+),", re.M)
+
+C_ENUM_ALIASES = ("xess_quality_settings_t", "xefg_swapchain_ui_mode_t")
+C_2D_ALIASES = ("xess_coord_t", "xess_2d_t", "xefg_swapchain_2d_t")
+
+
+def rust_kind(type_text: str) -> str | None:
+    text = type_text.strip()
+    if text.startswith("*"):
+        return "pointer"
+    array = re.fullmatch(r"\[(\w+);\s*(\d+)\]", text)
+    if array:
+        inner = rust_kind(array.group(1))
+        return f"{inner}x{array.group(2)}"
+    if text in ("Xess2d", "Xefg2d"):
+        return "u32x2"
+    return {
+        "f32": "f32",
+        "u32": "int32",
+        "i32": "int32",
+        "u64": "u64",
+        "u16": "u16",
+        "u8": "u8",
+        "bool": "u8",
+    }.get(text)
+
+
+def c_kind(decl: str) -> str | None:
+    """Map one C member declaration to the same vocabulary as rust_kind."""
+    text = " ".join(decl.split())
+    if "*" in text:
+        return "pointer"
+    array = re.search(r"\[(\d+)\]", text)
+    body = text.split(":")[0]
+    words = body.replace(";", " ").split()
+    if not words:
+        return None
+    type_words = [w for w in words if not re.fullmatch(r"[A-Za-z_]\w*(\[\d+\])?", w) or w in C_ENUM_ALIASES or w in C_2D_ALIASES or w.endswith("_t") or w in ("float", "uint32_t", "uint64_t", "int32_t", "int", "bool", "D3D12_RESOURCE_STATES", "D3D12_RESOURCE_FLAGS")]
+    base = type_words[0] if type_words else words[0]
+    # Order matters: `uint64_t`/`uint16_t` also end in `_t`, so the fixed-width
+    # types are matched before the "any other SDK enum" fallback.
+    if base in C_2D_ALIASES:
+        kind = "u32x2"
+    elif base == "float":
+        kind = "f32"
+    elif base == "uint64_t":
+        kind = "u64"
+    elif base == "uint16_t":
+        kind = "u16"
+    elif base in ("uint32_t", "D3D12_RESOURCE_STATES", "D3D12_RESOURCE_FLAGS"):
+        kind = "int32"
+    elif base in ("int32_t", "int") or base.endswith("_t"):
+        kind = "int32"
+    elif base == "bool":
+        kind = "u8"
+    else:
+        return None
+    if array:
+        return f"{kind}x{array.group(1)}"
+    return kind
+
+
+# Fields whose Rust name deliberately differs from the header's.
+DELIBERATE_RENAMES = {
+    ("XefgD3D12ResourceData", "resource_type"): "type",
+    # `xell_sleep_params_t` packs its flags into bitfields; Rust keeps one word.
+    ("XellSleepParams", "flags"): "bLowLatencyMode",
+}
+
+
+def normalise_field(name: str) -> str:
+    """`outputColorBase` and `output_color_base` normalise to the same word."""
+    return name.strip().lstrip("_").lower().replace("_", "")
+
+
+def field_matches(rust_name: str, c_name: str) -> bool:
+    """Rust drops the SDK's `p` pointer prefix; nothing else may differ."""
+    rust = normalise_field(rust_name)
+    c = normalise_field(c_name)
+    return rust == c or (c.startswith("p") and rust == c[1:])
+
+
+def member_name(decl: str) -> str | None:
+    text = " ".join(decl.split())
+    text = text.split(":")[0]
+    match = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*$", text.strip().rstrip(";"))
+    return match.group(1) if match else None
+
+
+def c_member_names(header_text: str, struct_tag: str) -> list[str] | None:
+    match = re.search(
+        rf"typedef\s+struct\s+{re.escape(struct_tag)}\s*\{{(?P<body>.*?)\}}\s*\w+;",
+        header_text,
+        re.S,
+    )
+    if not match:
+        return None
+    body = re.sub(r"/\*.*?\*/", "", match.group("body"), flags=re.S)
+    body = re.sub(r"//[^\n]*", "", body)
+    names: list[str] = []
+    previous_bitfield = None
+    for decl in body.split(";"):
+        decl = decl.strip()
+        if not decl:
+            continue
+        base_kind = c_kind(decl)
+        if base_kind is None:
+            return None
+        bitfield = ":" in decl
+        name = member_name(decl)
+        if name is None:
+            return None
+        if bitfield:
+            if previous_bitfield == base_kind:
+                continue
+            previous_bitfield = base_kind
+        else:
+            previous_bitfield = None
+        names.append(name)
+    return names
+
+
+def c_members(header_text: str, struct_tag: str) -> list[str] | None:
+    match = re.search(
+        rf"typedef\s+struct\s+{re.escape(struct_tag)}\s*\{{(?P<body>.*?)\}}\s*\w+;",
+        header_text,
+        re.S,
+    )
+    if not match:
+        return None
+    body = re.sub(r"/\*.*?\*/", "", match.group("body"), flags=re.S)
+    body = re.sub(r"//[^\n]*", "", body)
+    kinds: list[str] = []
+    previous_bitfield: str | None = None
+    for decl in body.split(";"):
+        decl = decl.strip()
+        if not decl:
+            continue
+        bitfield = ":" in decl
+        kind = c_kind(decl)
+        if kind is None:
+            return None
+        if bitfield:
+            # Consecutive bitfields of one base type share a storage unit.
+            if previous_bitfield == kind:
+                continue
+            previous_bitfield = kind
+        else:
+            previous_bitfield = None
+        kinds.append(kind)
+    return kinds
+
+
+def verify_struct_layouts(repo: Path, verbose: bool) -> list[str]:
+    problems: list[str] = []
+    checked = 0
+    for rust_file, pairs in STRUCT_PAIRS.items():
+        rust_text = (repo / rust_file).read_text(encoding="utf-8", errors="replace")
+        structs = {
+            match.group("name"): match.group("body")
+            for match in RUST_STRUCT.finditer(rust_text)
+        }
+        for rust_name, header_file, header_tag in pairs:
+            body = structs.get(rust_name)
+            if body is None:
+                problems.append(f"{rust_file}: struct {rust_name} is missing")
+                continue
+            header_text = (repo / "sdk/include" / header_file).read_text(
+                encoding="utf-8", errors="replace"
+            )
+            rust_fields = list(RUST_FIELD.finditer(body))
+            rust_kinds = [rust_kind(m.group("type")) for m in rust_fields]
+            rust_names = [m.group("name") for m in rust_fields]
+            header_kinds = c_members(header_text, header_tag)
+            header_names = c_member_names(header_text, header_tag)
+            if any(kind is None for kind in rust_kinds):
+                problems.append(
+                    f"{rust_file}: {rust_name} has a field type this check does not understand"
+                )
+                continue
+            if header_kinds is None:
+                problems.append(f"{header_file}: cannot read {header_tag}")
+                continue
+            if header_names is None:
+                problems.append(f"{header_file}: cannot read {header_tag} member names")
+                continue
+            checked += 1
+            if rust_kinds != header_kinds:
+                problems.append(
+                    f"{rust_file}: {rust_name} layout {rust_kinds} != "
+                    f"{header_file}:{header_tag} layout {header_kinds}"
+                )
+                continue
+            # Same-width fields can be swapped without changing the layout; the
+            # names are what catches a jitter X/Y swap or a depth/MV mix-up.
+            mismatched: list[str] = []
+            for rust_field, header_field in zip(rust_names, header_names):
+                if (rust_name, rust_field) in DELIBERATE_RENAMES:
+                    # Reviewed rename; the table records both spellings.
+                    assert DELIBERATE_RENAMES[(rust_name, rust_field)] == header_field
+                    continue
+                if not field_matches(rust_field, header_field):
+                    mismatched.append(f"{rust_field} != {header_field}")
+            if mismatched:
+                problems.append(
+                    f"{rust_file}: {rust_name} field names do not line up with "
+                    f"{header_file}:{header_tag}: " + ", ".join(mismatched)
+                )
+            elif verbose:
+                print(f"    ok  {rust_name:<24} {len(rust_kinds)} fields ({header_tag})")
+    if verbose:
+        print(f"  {checked} FFI struct layouts match their headers")
+    return problems
+
+
 # --- repository wiring ----------------------------------------------------
 
 
@@ -443,6 +700,10 @@ def main() -> int:
     # 3. Constants vs. the vendored headers.
     print("\n3. FFI constants vs. the vendored Intel headers")
     problems.extend(verify_constants(repo, args.verbose))
+
+    # 3b. Struct layouts the FFI fills in.
+    print("\n3b. FFI struct layouts vs. the vendored Intel headers")
+    problems.extend(verify_struct_layouts(repo, args.verbose))
 
     # 4. The probe / loader / packaging / ignore rules agree.
     print("\n4. viewer wiring (probe, loader, packaging, ignore rules)")
