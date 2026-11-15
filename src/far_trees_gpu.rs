@@ -149,11 +149,16 @@ struct GroupInfo {height:f32,args_base:u32,first_instance:u32,capacity:u32};
 struct Args {index_count:u32,instance_count:atomic<u32>,first_index:u32,base_vertex:i32,first_instance:u32};
 struct Instance {data0:vec4<f32>,data1:vec4<f32>};
 @group(0) @binding(0) var<uniform> p:LodParamsGpu;
-@group(0) @binding(1) var<storage,read> placements:array<Placement>;
+@group(0) @binding(1) var<storage,read> placement_words:array<u32>;
 @group(0) @binding(2) var<storage,read> groups:array<GroupInfo>;
 @group(0) @binding(3) var<storage,read_write> instances:array<Instance>;
 @group(0) @binding(4) var<storage,read_write> args:array<Args>;
-@group(0) @binding(5) var<storage,read> active_indices:array<u32>;
+fn read_placement(index:u32)->Placement {
+ let base=index*8u;
+ return Placement(
+  vec4<f32>(bitcast<f32>(placement_words[base]),bitcast<f32>(placement_words[base+1u]),bitcast<f32>(placement_words[base+2u]),bitcast<f32>(placement_words[base+3u])),
+  placement_words[base+4u],placement_words[base+5u],placement_words[base+6u],placement_words[base+7u]);
+}
 fn is_finite(v:f32)->bool {return v>=-3.0e38 && v<=3.0e38;}
 // SpeedTreeRT 0x100282b0's estimate: f32 squared distance, then the float-bit
 // square root. Matches `tree_lod::client_distance`.
@@ -197,9 +202,9 @@ fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>) {
 fn main(@builtin(global_invocation_id) id:vec3<u32>) {
  let active_slot=id.x;
  if active_slot>=p.counts.x {return;}
- let index=active_indices[active_slot];
+ let index=placement_words[p.counts.w*8u+active_slot];
  if index>=p.counts.w {return;}
- let placement=placements[index];
+ let placement=read_placement(index);
  let position=placement.pos_height.xyz;
  if !is_finite(position.x) || !is_finite(position.y) || !is_finite(position.z) {return;}
  if p.counts.z!=0u {
@@ -294,7 +299,8 @@ pub struct FarTrees {
     placements: u32,
     placement_bins: HashMap<(i32, i32), Vec<u32>>,
     active_placements: Vec<u32>,
-    active_index_buffer: wgpu::Buffer,
+    /// Packed placement records followed by the active placement indices.
+    placement_buffer: wgpu::Buffer,
     /// Indirect args, one record per batch (`DRAW_ARGS` bytes each), plus the
     /// static part of each record with `instance_count` zeroed.
     lod_args: wgpu::Buffer,
@@ -960,15 +966,14 @@ impl FarTrees {
         }
         let placement_count = placement_data.len() as u32;
         let placement_bins = placement_bins(&placement_data);
-        let active_index_seed = vec![0u32; placement_count as usize];
-        let active_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("active tree placement indices"),
-            contents: bytemuck::cast_slice(&active_index_seed),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
+        // Downlevel devices expose only four compute storage buffers. Pack the
+        // active-index list after the immutable placement records in one read-only
+        // storage binding; queue writes update only this appended u32 region.
+        let mut placement_words: Vec<u32> = bytemuck::cast_slice(&placement_data).to_vec();
+        placement_words.resize(placement_words.len() + placement_count as usize, 0);
         let placement_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tree placements"),
-            contents: bytemuck::cast_slice(&placement_data),
+            label: Some("tree placements and active indices"),
+            contents: bytemuck::cast_slice(&placement_words),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
         let lod_group_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1070,16 +1075,6 @@ impl FarTrees {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
             ],
         });
         let lod_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1118,10 +1113,6 @@ impl FarTrees {
                     binding: 4,
                     resource: lod_args.as_entire_binding(),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: active_index_buffer.as_entire_binding(),
-                },
             ],
         });
         eprintln!(
@@ -1155,7 +1146,7 @@ impl FarTrees {
             placements: placement_count,
             placement_bins,
             active_placements: Vec::new(),
-            active_index_buffer,
+            placement_buffer,
             lod_args,
             lod_args_reset,
             multi_draw: one_call,
@@ -1245,8 +1236,8 @@ impl FarTrees {
         queue.write_buffer(&self.lod_params, 0, bytemuck::bytes_of(&params));
         if !self.active_placements.is_empty() {
             queue.write_buffer(
-                &self.active_index_buffer,
-                0,
+                &self.placement_buffer,
+                self.placements as u64 * std::mem::size_of::<Placement>() as u64,
                 bytemuck::cast_slice(&self.active_placements),
             );
         }
