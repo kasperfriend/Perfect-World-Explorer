@@ -4868,9 +4868,16 @@ pub fn run(
                                         .then_some("FSR 1 (EASU + RCAS)".to_string())
                                 });
                             let fsr_failed_note = fsr_failed && settings.upscaling.is_ffx_fsr();
-                            let fg_badge = framegen
-                                .as_ref()
-                                .map(|fg| format!("FG x2 - {} frames", fg.frames_presented()));
+                            let fg_badge = framegen.as_ref().map(|fg| match fg.selected_provider() {
+                                Some(id) => format!(
+                                    "FG {}.{}.{} x2 - {} frames",
+                                    (id >> 22) & 0x3ff,
+                                    (id >> 12) & 0xff,
+                                    id & 0xfff,
+                                    fg.frames_presented()
+                                ),
+                                None => format!("FG x2 - {} frames", fg.frames_presented()),
+                            });
                             let show_status_badge = fsr_badge.is_some()
                                 || fsr_failed_note
                                 || fg_badge.is_some()

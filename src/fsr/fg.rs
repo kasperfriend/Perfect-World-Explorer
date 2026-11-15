@@ -269,6 +269,10 @@ pub struct FrameGeneration {
     /// expects during `Present`; the next `prepare` moves it back to
     /// `RENDER_TARGET` before wgpu draws the UI again.
     ui_needs_rt_restore: bool,
+    /// The FFX provider version the loader actually advertised and the create
+    /// call accepted (major << 22 | minor << 12 | patch). `None` when the
+    /// enumeration failed and the loader picked the provider itself.
+    selected_version: Option<u64>,
 }
 
 impl Drop for FrameGeneration {
@@ -499,6 +503,7 @@ impl FrameGeneration {
         let mut fg_context: *mut c_void = std::ptr::null_mut();
         let mut last_rc = super::imp::FFX_API_RETURN_OK;
         let mut fg_created = false;
+        let mut created_override: Option<u64> = None;
         for candidate in &candidates {
             let mut backend = FfxCreateBackendDX12Desc {
                 header: FfxApiHeader::new(
@@ -546,6 +551,7 @@ impl FrameGeneration {
                         .unwrap_or_default()
                 );
                 fg_created = true;
+                created_override = *candidate;
                 break;
             }
             eprintln!(
@@ -638,6 +644,7 @@ impl FrameGeneration {
             prev_view_proj: None,
             frame_index: 0,
             ui_needs_rt_restore: false,
+            selected_version: created_override,
         })
     }
 
@@ -742,6 +749,14 @@ impl FrameGeneration {
     /// plus interpolated ones). Shown in the on-screen mark.
     pub fn frames_presented(&self) -> u64 {
         self.frame_index
+    }
+
+    /// The FFX provider version actually driving frame generation, when
+    /// enumeration succeeded. Decoded for display with
+    /// `(id >> 22) & 0x3ff` (major), `(id >> 12) & 0xff` (minor) and
+    /// `id & 0xfff` (patch).
+    pub fn selected_provider(&self) -> Option<u64> {
+        self.selected_version
     }
 
     /// The size of the world render targets the pipeline consumes.
