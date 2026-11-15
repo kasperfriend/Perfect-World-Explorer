@@ -61,6 +61,37 @@ pipelines. Legacy `viewer-settings.txt` files with `upscaling=fsr` and
 absent/`0` → `fsr4` (the old "newest" default). The old sub-selector is gone
 from the tab.
 
+**Colour space: what the upscaler is told it is reading.** The world target
+holds sRGB-encoded bytes (mid grey is 0.5 in the *encoded* domain), and every
+provider is configured for exactly that: FSR creates with
+`FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE` and dispatches with
+`FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB`, XeSS with
+`XESS_INIT_FLAG_LDR_INPUT_COLOR` ("disable tonemapping for input and output"),
+NGX with the LDR `SuperSampling` feature and `IsHDR` clear. All three build
+their own SRV from the resource *description*, so the description of the colour
+input has to be the plain UNORM twin: describing it as `_UNORM_SRGB` made the
+hardware decode the bytes to linear *before* the upscaler ran, and the provider
+then performed its own perceptual→linear step for the bytes it had been told
+were perceptual. XeSS showed it as a world noticeably darker than the bilinear
+path while the HUD (composited later, outside the provider) stayed correct.
+The declaration and the description now agree — UNORM resource, perceptual
+flags — and the upscaler's output is likewise read as sRGB by the composite
+pass, which decodes once (`fs_decode`).
+
+**Camera: one lens for the matrices and the providers.** The projection is
+built with `perspective_rh(70°, aspect, far, CAMERA_NEAR)` (reversed-Z: near→1,
+far→0), and the same three numbers are handed to the providers instead of being
+repeated as literals: `crate::fsr::CameraLens` (`near`, `far`,
+`fov_y_radians`) comes from `Camera::lens()` and reaches
+`ffxDispatchDescUpscale.cameraNear/cameraFar/cameraFovAngleVertical` and the
+`FrameGenerationPrepareV2` descriptor. The values used to be
+`1.0 / 16000.0 / 70°` regardless of the live far plane, so every provider
+linearised depth against a matrix that did not exist; FFX uses those numbers to
+turn the sampled reversed-Z depth into view-space distance, and a mismatch skews
+every depth-derivative and disocclusion test — blur towards the horizon,
+ghosting on silhouette edges. `viewSpaceToMetersFactor` stays 1.0: the viewer's
+world unit *is* a metre.
+
 ## Frame generation
 
 | Entry (Graphics tab) | Status | Gate |
@@ -69,6 +100,26 @@ from the tab.
 | FSR Frame Generation | **Implemented, runtime-unverified.** FFX swapchain (`FrameGenerationSwapChainForHwndDX12`) takes over the window through the shared hand-over (`src/fsr/swapchain.rs`, see `docs/blockers.md` B-10); keeps the UI in the composition by default so the interpolator never blends HUD pixels (`PW_FSRFG_UI_COMPOSITION=0` restores the separate native-resolution UI texture, which the proxy composites onto real *and* generated frames but which FFX tone-maps with the scene); `ffxDispatchDescFrameGeneration` runs on the swapchain's interpolation command list for `numGeneratedFrames = 1`, i.e. 2x. **Independent of the upscaler — works with FSR 1, FSR 2/3/4, the DLSS/XeSS fallback, or Upscaling Off entirely.** The FG context creates with the mandatory `ffxCreateContextDescFrameGenerationVersion` plus the DX12 backend descriptor, and retries the older advertised FG providers before giving up; FFX diagnostic messages are piped to stderr (`[FSR ...]`). Failure restores the standard present path for the session. | Vendored AMD SDK 2.4.0 (included) + Windows/DX12 + any real GPU. |
 | DLSS Frame Generation | **Implemented, runtime-unverified.** `NVSDK_NGX_Feature_FrameGeneration` from the vendored `nvngx_dlssg.dll`, created through the driver's NGX Core (same bootstrap as DLSS SR) and driven without Streamline: the viewer owns a flip-model swapchain for the window (shared hand-over, `src/fsr/swapchain.rs`), copies the composition into the current backbuffer, then evaluates the feature once per generated frame — `DLSSG.MultiFrameCount` = n, `DLSSG.MultiFrameIndex` = 1..n, `DLSSG.BackbufferFrameID` monotonic — with each generated frame writing into its own backbuffer (`desc.BufferCount = n + 2`), and finally presents the real frame and every generated frame with `Present(1, 0)`. Presenting the generated frames with sync interval 0 instead lets the next real frame land on the same vblank, which coalesces the group away and reads as stutter. n = 1 on Ada (`DLSSG.MultiFrameCountMax` = 1, the 2x path); **DLSS Multi Frame Generation** (n > 1) needs Blackwell — see *Frame multiplier* below. Depth and the shared reprojected motion vectors are fed at internal resolution, the unwarped camera matrices as `ClipToPrevClip`/`PrevClipToClip`. **Independent of the upscaler — works with DLSS SR, FSR, XeSS or Upscaling Off, but needs an RTX 40-series or newer GPU** (the setting is gated on the GPU name). The UI is interpolated with the scene, so no UI mode can drop the HUD. Any init/create/evaluate failure logs the named `NVSDK_NGX_Result` and restores the standard present path for the session. | Vendored NVIDIA DLSS/NGX (`nvngx_dlssg.dll`, included in `sdk/`) + Windows/DX12 + an RTX 40-series or newer GPU. |
 | XeSS Frame Generation | **Implemented, runtime-unverified.** XeSS-FG proxy swapchain (`xefgSwapChainD3D12InitFromSwapChainDesc`) takes over the window through the same hand-over, exactly like the FSR path. It paces real and interpolated frames, takes the Frame multiplier through `XefgD3D12InitParams.maxInterpolatedFrames` (clamped to the `maxSupportedInterpolations` the SDK reports) and confirms it with `xefgSwapChainSetNumInterpolatedFrames`, and, by default, the UI is drawn into the composition so the model interpolates it together with the scene (Intel's first recommendation: UI composition disabled); `PW_XEFG_UI_COMPOSITION=1` switches to a separate native-resolution premultiplied-alpha UI texture (`HUDLESS_UITEXTURE`) that the proxy composites onto real *and* generated frames, keeping the UI sharp and never interpolated. **Documented pairing: XeSS upscaling or none.** Failure restores the standard present path for the session. | Vendored Intel XeSS SDK 3.0.2 (`libxess_fg.dll` **and** `libxell.dll`, included in `sdk/`) + Windows/DX12 + SM 6.4 GPU. |
+
+**DLSS-G gets the whole parameter set, not a subset.** Three of them decide
+whether the interpolated frame lines up with the real ones. `DLSSG.JitterOffsetX/Y`
+is *clip space* jitter (`2 * jx / width`, `-2 * jy / height` for the y-down pixel
+offsets the world was rendered with) and the matrices are deliberately
+unjittered, so leaving the offset at 0,0 — which is what the viewer used to do —
+leaves the generated frame sampling a sub-pixel position the real frame never
+used. `DLSSG.MvecScale` "specifies scale factors used to normalize motion
+vectors (so the values are in [-1,1] range)": the reprojection pass writes
+render-resolution *pixels*, so the factor is `1 / renderWidth, 1 / renderHeight`,
+the same convention `DLSS.MV.Scale` uses for Super Resolution; feeding `1.0`
+told the runtime the vectors were already normalised and it interpolated as if
+the camera had not moved. The camera basis (`CameraPos/Up/Right/Fwd`) and lens
+(`CameraNear/Far/FOV/AspectRatio`) are filled from the same `CameraLens` and
+`Camera` the matrices came from, so the runtime can separate camera motion from
+object motion. `DLSSG.Reset` is set on the first frame *and* on every camera cut
+(`prepare`'s `reset`), not just the first. On the vector pass, all four
+providers now zero their motion vectors on a reset frame: the matrices on either
+side of a cut describe unrelated views, so reprojecting through them yields
+garbage that the upscaler would otherwise blend into its first post-cut frame.
 
 ### Frame multiplier (x2 / x3 / x4 / x6)
 

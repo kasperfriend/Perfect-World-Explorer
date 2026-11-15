@@ -401,14 +401,6 @@ pub(crate) fn is_bgra_format(format: wgpu::TextureFormat) -> bool {
     )
 }
 
-fn ffx_color_format(format: wgpu::TextureFormat) -> u32 {
-    if is_bgra_format(format) {
-        FFX_API_SURFACE_FORMAT_B8G8R8A8_SRGB
-    } else {
-        FFX_API_SURFACE_FORMAT_R8G8B8A8_SRGB
-    }
-}
-
 /// DXGI format for the FSR *output* UAV. D3D12 forbids
 /// D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS on _UNORM_SRGB formats
 /// (E_INVALIDARG), so the output must use the plain UNORM twins. The output
@@ -429,13 +421,6 @@ pub(crate) fn dxgi_output_format(format: wgpu::TextureFormat) -> DXGI_FORMAT {
     }
 }
 
-pub(crate) fn dxgi_color_format(format: wgpu::TextureFormat) -> DXGI_FORMAT {
-    if is_bgra_format(format) {
-        DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
-    } else {
-        DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
-    }
-}
 pub(crate) fn hr_ok(hr: winapi::shared::winerror::HRESULT) -> bool {
     hr >= 0
 }
@@ -923,12 +908,22 @@ impl FsrNatives {
         display_extent: (u32, u32),
         format: wgpu::TextureFormat,
     ) -> Result<FsrNatives, String> {
+        // The colour the upscaler reads is the world target's sRGB-encoded
+        // bytes, and every provider is told exactly that: FSR takes
+        // `NON_LINEAR_COLORSPACE` (perceptual input), XeSS takes
+        // `LDR_INPUT_COLOR` ("disable tonemapping for input and output") and NGX
+        // takes LDR (`IsHDR` clear). Providers create their own SRV from the
+        // resource *description*, so an `_UNORM_SRGB` description would make the
+        // hardware decode the bytes to linear before the upscaler sees them, and
+        // each of them would then convert perceptual->linear a second time
+        // (XeSS: visibly darker world). The description is therefore the plain
+        // UNORM twin and the bytes the world pass wrote arrive unchanged.
         let color = NativeTexture2D::create(
             device,
             raw_device,
             "fsr color",
             format,
-            dxgi_color_format(format),
+            dxgi_output_format(format),
             render_extent,
             d3d12_ty::D3D12_RESOURCE_FLAG_NONE,
             wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
@@ -1439,6 +1434,7 @@ impl FsrUpscaler {
         color: &wgpu::Texture,
         depth: &wgpu::Texture,
         unjittered_vp: &Mat4,
+        lens: crate::fsr::CameraLens,
         sharpness: f32,
     ) -> Result<(), String> {
         let now = std::time::Instant::now();
@@ -1479,7 +1475,11 @@ impl FsrUpscaler {
             inv_vp: inv_vp.to_cols_array_2d(),
             prev_vp: prev_vp.to_cols_array_2d(),
             render_size: [rw as f32, rh as f32],
-            prev_valid: u32::from(self.prev_view_proj.is_some()),
+            // A reset frame has no usable history: the matrices on either
+            // side of a cut describe unrelated views, so the reprojection would
+            // produce garbage vectors. Zero them, exactly as the upscaler's own
+            // `reset` tells it to expect.
+            prev_valid: u32::from(self.prev_view_proj.is_some() && !self.reset_history),
             pad: 0,
         };
         queue.write_buffer(self.mv_pass.params_buffer(), 0, bytemuck::bytes_of(&params));
@@ -1590,7 +1590,11 @@ impl FsrUpscaler {
             command_list: list.as_mut_ptr() as *mut c_void,
             color: FfxApiResource::texture2d(
                 &self.natives.color.resource,
-                ffx_color_format(self.format),
+                // The resource is the UNORM twin (see `FsrNatives::create`), so
+                // the view FFX makes must be UNORM too; `NON_LINEAR_COLORSPACE`
+                // plus the dispatch's `NON_LINEAR_COLOR_SRGB` then tell FFX to do
+                // the sRGB conversion in its own shaders.
+                ffx_output_format(self.format),
                 rw,
                 rh,
                 FFX_API_RESOURCE_USAGE_READ_ONLY,
@@ -1645,9 +1649,15 @@ impl FsrUpscaler {
             frame_time_delta: frame_time_ms.clamp(0.1, 1000.0),
             pre_exposure: 1.0,
             reset: self.reset_history,
-            camera_near: 1.0,
-            camera_far: 16000.0,
-            camera_fov_angle_vertical: 70f32.to_radians(),
+            // The same numbers the projection matrix was built from. FFX uses
+            // them to linearise the depth it samples; a far plane that does not
+            // match the matrix skews every depth-derivative and disocclusion
+            // test (ghosting on edges, blur towards the horizon).
+            camera_near: lens.near,
+            camera_far: lens.far,
+            camera_fov_angle_vertical: lens.fov_y_radians,
+            // Pure World's world unit is a metre (`gfx` positions, the camera's
+            // speed settings and the fog ranges are all in metres).
             view_space_to_meters_factor: 1.0,
             flags: FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB,
         };

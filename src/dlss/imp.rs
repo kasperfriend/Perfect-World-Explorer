@@ -13,8 +13,8 @@
 use super::loader::{NgxApi, NGX_FEATURE_SUPER_SAMPLING, NGX_VERSION_API};
 use super::params::NgxParams;
 use crate::fsr::{
-    dxgi_color_format, dxgi_output_format, raw_dx12, FsrComposite, FsrMotionVectorPass,
-    FsrMvParams, NativeCommandRing, NativeTexture2D, D3D12_STATE_COMMON, D3D12_STATE_COPY_DEST,
+    dxgi_output_format, raw_dx12, FsrComposite, FsrMotionVectorPass, FsrMvParams,
+    NativeCommandRing, NativeTexture2D, D3D12_STATE_COMMON, D3D12_STATE_COPY_DEST,
     D3D12_STATE_PIXEL_COMPUTE_READ, D3D12_STATE_RENDER_TARGET, D3D12_STATE_UNORDERED_ACCESS,
 };
 use glam::Mat4;
@@ -97,12 +97,16 @@ impl DlssNatives {
         display_extent: (u32, u32),
         format: wgpu::TextureFormat,
     ) -> Result<Self, String> {
+        // UNORM description, not `_UNORM_SRGB`: NGX builds its SRV from the
+        // resource description, so an sRGB one would give DLSS linear pixels
+        // while `IsHDR` is clear (i.e. "the input is sRGB-encoded LDR"), and it
+        // would convert a second time. See `FsrNatives::create`.
         let color = NativeTexture2D::create(
             device,
             raw_device,
             "dlss color",
             format,
-            dxgi_color_format(format),
+            dxgi_output_format(format),
             render_extent,
             d3d12_ty::D3D12_RESOURCE_FLAG_NONE,
             wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
@@ -370,7 +374,9 @@ impl DlssUpscaler {
             inv_vp: inv_vp.to_cols_array_2d(),
             prev_vp: prev_vp.to_cols_array_2d(),
             render_size: [rw as f32, rh as f32],
-            prev_valid: u32::from(self.prev_view_proj.is_some()),
+            // See the FSR pass: on a reset frame the previous matrices
+            // describe an unrelated view, so the vectors must be zero.
+            prev_valid: u32::from(self.prev_view_proj.is_some() && !self.reset_history),
             pad: 0,
         };
         queue.write_buffer(self.mv_pass.params_buffer(), 0, bytemuck::bytes_of(&params));

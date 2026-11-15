@@ -3617,6 +3617,14 @@ fn water_depth(areas: &[crate::water::WaterArea], pos: Vec3) -> f32 {
         .min_by(|a, b| a.total_cmp(b))
         .unwrap_or(0.)
 }
+/// Distance to the near plane, in world units. Passed to `perspective_rh` as its
+/// `z_far` argument (see `projection_matrix`) and reported to the upscalers as
+/// `cameraNear`.
+const CAMERA_NEAR: f32 = 1.0;
+/// Vertical field of view of the world camera, in radians (70°, the client's
+/// own world FOV).
+const CAMERA_FOV_Y_RADIANS: f32 = 70.0 * std::f32::consts::PI / 180.0;
+
 struct Camera {
     pos: Vec3,
     yaw: f32,
@@ -3768,8 +3776,27 @@ impl Camera {
     }
     fn projection_matrix(&self, w: u32, h: u32, far: f32) -> Mat4 {
         // Client world is left-handed; a right-handed view must reverse screen X.
+        // `perspective_rh` takes (fov_y, aspect, z_near, z_far); passing the far
+        // plane as `z_near` and `CAMERA_NEAR` as `z_far` is what makes this a
+        // reversed-Z projection (near→1, far→0) in the [0, 1] convention wgpu
+        // uses. Every upscaler is told the same three numbers through
+        // `CameraLens`, so their depth linearisation matches this matrix.
         Mat4::from_scale(Vec3::new(-1., 1., 1.))
-            * Mat4::perspective_rh(70f32.to_radians(), w as f32 / h.max(1) as f32, far, 1.)
+            * Mat4::perspective_rh(
+                CAMERA_FOV_Y_RADIANS,
+                w as f32 / h.max(1) as f32,
+                far,
+                CAMERA_NEAR,
+            )
+    }
+
+    /// The lens this camera's projection is built from.
+    fn lens(&self) -> crate::fsr::CameraLens {
+        crate::fsr::CameraLens {
+            near: CAMERA_NEAR,
+            far: self.far,
+            fov_y_radians: CAMERA_FOV_Y_RADIANS,
+        }
     }
     fn matrix(&self, w: u32, h: u32, far: f32) -> Mat4 {
         self.projection_matrix(w, h, far) * self.view_matrix()
@@ -5213,7 +5240,7 @@ pub fn run(
                                 applied_extent.1,
                             );
                             if let Some(fsr) = fsr_upscaler.as_mut() {
-                                match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &unjittered_vp, settings.fsr3_sharpness) {
+                                match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {
                                     Ok(()) => fsr.composite(&renderer.device, &renderer.queue, scene_view),
                                     Err(error) => {
                                         crate::fsr::diag(&format!("FSR failed, using bilinear scaling instead: {error}"));
@@ -5264,6 +5291,7 @@ pub fn run(
                                     frame_time_ms,
                                     camera_jumped,
                                     jitter,
+                                    camera.lens(),
                                     camera.pos.to_array(),
                                     [0.0, 1.0, 0.0],
                                     [-yaw_c, 0.0, -yaw_s],
@@ -5283,12 +5311,18 @@ pub fn run(
                                 }
                             }
                             if let Some(fg) = dlss_framegen.as_mut() {
+                                let (yaw_s, yaw_c) = camera.yaw.sin_cos();
                                 let prepare_result = fg.prepare(
                                     &renderer.device,
                                     &renderer.queue,
                                     &renderer.depth,
                                     &unjittered_vp,
                                     camera_jumped,
+                                    camera.lens(),
+                                    camera.pos.to_array(),
+                                    [0.0, 1.0, 0.0],
+                                    [-yaw_c, 0.0, -yaw_s],
+                                    camera.direction().to_array(),
                                 );
                                 if let Err(error) = prepare_result {
                                     crate::dlss::diag(&format!("DLSS Frame Generation prepare failed, disabling it: {error}"));
@@ -5658,7 +5692,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 // the composition into the current backbuffer,
                                 // let NGX write the interpolated image into the
                                 // next one, and present both.
-                                match fg.finish(ui_visible) {
+                                match fg.finish(ui_visible, frame_jitter) {
                                     Ok(()) => {}
                                     Err(error) => {
                                         crate::dlss::diag(&format!("DLSS Frame Generation failed, restoring the standard present path: {error}"));

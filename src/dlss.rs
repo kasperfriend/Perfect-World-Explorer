@@ -236,6 +236,7 @@ mod fg_stub {
 
         pub fn begin_frame(&mut self) {}
 
+        #[allow(clippy::too_many_arguments)]
         pub fn prepare(
             &mut self,
             _device: &wgpu::Device,
@@ -243,13 +244,18 @@ mod fg_stub {
             _depth: &wgpu::Texture,
             _unjittered_vp: &glam::Mat4,
             _reset: bool,
+            _lens: crate::fsr::CameraLens,
+            _camera_pos: [f32; 3],
+            _camera_up: [f32; 3],
+            _camera_right: [f32; 3],
+            _camera_forward: [f32; 3],
         ) -> Result<(), String> {
             unimplemented!()
         }
 
         pub fn render_submit_end(&mut self) {}
 
-        pub fn finish(&mut self, _ui_visible: bool) -> Result<(), String> {
+        pub fn finish(&mut self, _ui_visible: bool, _jitter: (f32, f32)) -> Result<(), String> {
             unimplemented!()
         }
 

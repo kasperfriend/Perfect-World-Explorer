@@ -95,6 +95,23 @@ const P_MENU_DETECTION: &str = "DLSSG.MenuDetectionEnabled";
 // Reprojection matrices (void pointers to 16 floats, column major).
 const P_CLIP_TO_PREV_CLIP: &str = "DLSSG.ClipToPrevClip";
 const P_PREV_CLIP_TO_CLIP: &str = "DLSSG.PrevClipToClip";
+const P_CAMERA_POS_X: &str = "DLSSG.CameraPosX";
+const P_CAMERA_POS_Y: &str = "DLSSG.CameraPosY";
+const P_CAMERA_POS_Z: &str = "DLSSG.CameraPosZ";
+const P_CAMERA_UP_X: &str = "DLSSG.CameraUpX";
+const P_CAMERA_UP_Y: &str = "DLSSG.CameraUpY";
+const P_CAMERA_UP_Z: &str = "DLSSG.CameraUpZ";
+const P_CAMERA_RIGHT_X: &str = "DLSSG.CameraRightX";
+const P_CAMERA_RIGHT_Y: &str = "DLSSG.CameraRightY";
+const P_CAMERA_RIGHT_Z: &str = "DLSSG.CameraRightZ";
+const P_CAMERA_FWD_X: &str = "DLSSG.CameraFwdX";
+const P_CAMERA_FWD_Y: &str = "DLSSG.CameraFwdY";
+const P_CAMERA_FWD_Z: &str = "DLSSG.CameraFwdZ";
+const P_CAMERA_NEAR: &str = "DLSSG.CameraNear";
+const P_CAMERA_FAR: &str = "DLSSG.CameraFar";
+const P_CAMERA_FOV: &str = "DLSSG.CameraFOV";
+const P_CAMERA_ASPECT: &str = "DLSSG.CameraAspectRatio";
+const P_MVEC_DILATED: &str = "DLSSG.MvecDilated";
 
 /// The NGX handle owner plus everything the frame loop needs.
 pub struct DlssFrameGeneration {
@@ -118,6 +135,15 @@ pub struct DlssFrameGeneration {
     clip_to_prev: [[f32; 4]; 4],
     prev_clip_to_clip: [[f32; 4]; 4],
     prev_view_proj: Option<Mat4>,
+    /// `true` while NGX has to drop its interpolation history: the first frame
+    /// and every camera cut (`prepare`'s `reset`).
+    reset_pending: bool,
+    /// The camera the matrices were built from, for `DLSSG.Camera*`.
+    lens: crate::fsr::CameraLens,
+    camera_pos: [f32; 3],
+    camera_up: [f32; 3],
+    camera_right: [f32; 3],
+    camera_forward: [f32; 3],
     frame_index: u64,
     presents: u64,
 }
@@ -342,6 +368,16 @@ impl DlssFrameGeneration {
             clip_to_prev: Mat4::IDENTITY.to_cols_array_2d(),
             prev_clip_to_clip: Mat4::IDENTITY.to_cols_array_2d(),
             prev_view_proj: None,
+            reset_pending: true,
+            lens: crate::fsr::CameraLens {
+                near: 1.0,
+                far: 16000.0,
+                fov_y_radians: 70f32.to_radians(),
+            },
+            camera_pos: [0.0; 3],
+            camera_up: [0.0, 1.0, 0.0],
+            camera_right: [1.0, 0.0, 0.0],
+            camera_forward: [0.0, 0.0, -1.0],
             frame_index: 0,
             presents: 0,
         })
@@ -387,8 +423,21 @@ impl DlssFrameGeneration {
         depth: &wgpu::Texture,
         unjittered_vp: &Mat4,
         reset: bool,
+        lens: crate::fsr::CameraLens,
+        camera_pos: [f32; 3],
+        camera_up: [f32; 3],
+        camera_right: [f32; 3],
+        camera_forward: [f32; 3],
     ) -> Result<(), String> {
         let (rw, rh) = self.render_extent;
+        self.lens = lens;
+        self.camera_pos = camera_pos;
+        self.camera_up = camera_up;
+        self.camera_right = camera_right;
+        self.camera_forward = camera_forward;
+        if reset {
+            self.reset_pending = true;
+        }
         let inv_vp = unjittered_vp.inverse();
         let prev_vp = self.prev_view_proj.unwrap_or(*unjittered_vp);
         let params = FsrMvParams {
@@ -480,7 +529,12 @@ impl DlssFrameGeneration {
     /// that is how the runtime's multi frame generation is driven; it decides
     /// from the GPU architecture whether it will fill more than the first
     /// (`DLSSG.MultiFrameCountMax` is 1 on Ada, higher on Blackwell).
-    pub fn finish(&mut self, _ui_visible: bool) -> Result<(), String> {
+    ///
+    /// `jitter` is the sub-pixel offset the world was rendered with this frame
+    /// (render-resolution pixels, y down); DLSS-G wants it in clip space, and
+    /// the matrices handed to it must stay unjittered — the header is explicit
+    /// about both.
+    pub fn finish(&mut self, _ui_visible: bool, jitter: (f32, f32)) -> Result<(), String> {
         let sc3 = self.swapchain as *mut IDXGISwapChain3;
         let index = unsafe { (*sc3).GetCurrentBackBufferIndex() };
         let count = self.buffer_count.max(2);
@@ -548,16 +602,21 @@ impl DlssFrameGeneration {
             .set_u32(P_MULTI_FRAME_COUNT, self.generated_frames.max(1));
         self.params
             .set_u32(P_BACKBUFFER_FRAME_ID, self.frame_index as u32);
-        // The viewer renders jittered for DLSS SR and unjittered otherwise; the
-        // interpolation is driven by the motion vectors either way, so no
-        // jitter offset is reported (`prepare` feeds unjittered matrices).
-        self.params.set_f32(P_JITTER_X, 0.0);
-        self.params.set_f32(P_JITTER_Y, 0.0);
-        // Motion vectors are in pixels, so the scale is 1:1. (The header's
-        // "[-1,1] range" wording is Streamline's convention; feeding
-        // 1/render-size here makes DLSS-G see no motion and produce cross-fades.)
-        self.params.set_f32(P_MVEC_SCALE_X, 1.0);
-        self.params.set_f32(P_MVEC_SCALE_Y, 1.0);
+        // `DLSSG.JitterOffsetX/Y` is documented as *clip space* jitter, and the
+        // matrices handed over deliberately do not contain it, so the offset has
+        // to be reported here or the interpolated frame is off by the sub-pixel
+        // sample position the real frame used (shimmering edges). The world is
+        // jittered by whichever upscaler is active (`frame_jitter`).
+        let (rw, rh) = self.render_extent;
+        self.params
+            .set_f32(P_JITTER_X, 2.0 * jitter.0 / rw.max(1) as f32);
+        self.params
+            .set_f32(P_JITTER_Y, -2.0 * jitter.1 / rh.max(1) as f32);
+        // `DLSSG.MvecScale` "specifies scale factors used to normalize motion
+        // vectors (so the values are in [-1,1] range)" — the reprojection pass
+        // writes render-resolution *pixels*, so the factor is 1/size.
+        self.params.set_f32(P_MVEC_SCALE_X, 1.0 / rw.max(1) as f32);
+        self.params.set_f32(P_MVEC_SCALE_Y, 1.0 / rh.max(1) as f32);
         // Reversed-Z depth, camera motion is in the vectors, LDR swapchain.
         self.params.set_u32(P_DEPTH_INVERTED, 1);
         self.params.set_u32(P_CAMERA_MOTION_INCLUDED, 1);
@@ -565,8 +624,39 @@ impl DlssFrameGeneration {
         self.params.set_u32(P_NOT_RENDERING_FRAMES, 0);
         self.params.set_u32(P_ORTHO_PROJECTION, 0);
         self.params.set_u32(P_MENU_DETECTION, 0);
-        self.params
-            .set_u32(P_RESET, u32::from(self.frame_index == 0));
+        // The optional parameters the header lists (`NVSDK_NGX_DLSSG_Opt_Eval_Params`):
+        // the camera the matrices came from, so the runtime can separate camera
+        // motion from object motion, and the lens the depth was projected with.
+        // Vectors are in world space, `CameraFOV` in radians, aspect = w / h.
+        self.params.set_f32(P_CAMERA_POS_X, self.camera_pos[0]);
+        self.params.set_f32(P_CAMERA_POS_Y, self.camera_pos[1]);
+        self.params.set_f32(P_CAMERA_POS_Z, self.camera_pos[2]);
+        self.params.set_f32(P_CAMERA_UP_X, self.camera_up[0]);
+        self.params.set_f32(P_CAMERA_UP_Y, self.camera_up[1]);
+        self.params.set_f32(P_CAMERA_UP_Z, self.camera_up[2]);
+        self.params.set_f32(P_CAMERA_RIGHT_X, self.camera_right[0]);
+        self.params.set_f32(P_CAMERA_RIGHT_Y, self.camera_right[1]);
+        self.params.set_f32(P_CAMERA_RIGHT_Z, self.camera_right[2]);
+        self.params.set_f32(P_CAMERA_FWD_X, self.camera_forward[0]);
+        self.params.set_f32(P_CAMERA_FWD_Y, self.camera_forward[1]);
+        self.params.set_f32(P_CAMERA_FWD_Z, self.camera_forward[2]);
+        self.params.set_f32(P_CAMERA_NEAR, self.lens.near);
+        self.params.set_f32(P_CAMERA_FAR, self.lens.far);
+        self.params.set_f32(P_CAMERA_FOV, self.lens.fov_y_radians);
+        self.params.set_f32(
+            P_CAMERA_ASPECT,
+            crate::fsr::CameraLens::aspect(self.display_extent.0, self.display_extent.1),
+        );
+        // The reprojection pass writes one vector per pixel, not a dilated field.
+        self.params.set_u32(P_MVEC_DILATED, 0);
+        // `Reset` covers the first frame *and* every camera cut: without it a
+        // teleport interpolates from a history that has nothing to do with the
+        // new view (a visible smear for a second or two).
+        self.params.set_u32(
+            P_RESET,
+            u32::from(self.reset_pending || self.frame_index == 0),
+        );
+        self.reset_pending = false;
         self.params.set_void_pointer(
             P_CLIP_TO_PREV_CLIP,
             &self.clip_to_prev as *const _ as *mut c_void,

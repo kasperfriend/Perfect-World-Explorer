@@ -66,6 +66,33 @@ pub(crate) fn diag(line: &str) {
     crate::diagnostics::session(line);
 }
 
+/// The lens of the world camera, exactly as the projection matrix was built
+/// from it.
+///
+/// Every upscaler takes the same three numbers (FFX: `cameraNear`, `cameraFar`,
+/// `cameraFovAngleVertical`; XeSS derives them from the projection it is handed
+/// and the depth flags; NGX-SR needs none and NGX-G takes the whole basis). They
+/// are handed over instead of being repeated as literals in each provider file,
+/// because a far plane that disagrees with the matrix makes the vendor's
+/// depth-linearisation — and with it every disocclusion test — wrong, which
+/// reads as ghosting on geometry edges and blur on the horizon.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CameraLens {
+    /// Distance to the near plane, in world units.
+    pub(crate) near: f32,
+    /// Distance to the far plane, in world units.
+    pub(crate) far: f32,
+    /// Vertical field of view, in radians.
+    pub(crate) fov_y_radians: f32,
+}
+
+impl CameraLens {
+    /// Aspect ratio helper (`view space width / height`), as DLSS-G wants it.
+    pub(crate) fn aspect(width: u32, height: u32) -> f32 {
+        width.max(1) as f32 / height.max(1) as f32
+    }
+}
+
 // The whole module is a stub off Windows: `FsrUpscaler::new` always fails
 // with "not supported on this platform", so Linux builds stay green and the
 // Windows build is the compile authority.
@@ -119,6 +146,7 @@ mod imp_stub {
             _color: &wgpu::Texture,
             _depth: &wgpu::Texture,
             _unjittered_vp: &glam::Mat4,
+            _lens: crate::fsr::CameraLens,
             _sharpness: f32,
         ) -> Result<(), String> {
             Err("unsupported".to_string())
@@ -214,6 +242,7 @@ mod fg_stub {
             _frame_time_ms: f32,
             _reset: bool,
             _jitter: (f32, f32),
+            _lens: crate::fsr::CameraLens,
             _camera_position: [f32; 3],
             _camera_up: [f32; 3],
             _camera_right: [f32; 3],

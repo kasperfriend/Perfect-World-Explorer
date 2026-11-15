@@ -107,9 +107,10 @@ fn ffx_color_for_format(format: wgpu::TextureFormat) -> u32 {
     }
 }
 
-/// DXGI format matching a common wgpu color format. Unlike `dxgi_color_format`
-/// (which is always sRGB, as the FSR inputs expect), this preserves sRGB-ness
-/// so the composition target matches the wgpu texture created from it.
+/// DXGI format matching a common wgpu color format, preserving sRGB-ness so a
+/// composition target matches the wgpu texture created from it. (The upscaler
+/// *inputs* use the UNORM twins instead: every provider is told its colour is
+/// perceptual, so the description must not make the hardware decode first.)
 pub(crate) fn dxgi_for_format(format: wgpu::TextureFormat) -> DXGI_FORMAT {
     match format {
         wgpu::TextureFormat::Bgra8Unorm => DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -841,6 +842,7 @@ impl FrameGeneration {
         frame_time_ms: f32,
         reset: bool,
         jitter: (f32, f32),
+        lens: crate::fsr::CameraLens,
         camera_position: [f32; 3],
         camera_up: [f32; 3],
         camera_right: [f32; 3],
@@ -855,7 +857,7 @@ impl FrameGeneration {
             inv_vp: inv_vp.to_cols_array_2d(),
             prev_vp: prev_vp.to_cols_array_2d(),
             render_size: [rw as f32, rh as f32],
-            prev_valid: u32::from(self.prev_view_proj.is_some()),
+            prev_valid: u32::from(self.prev_view_proj.is_some() && !reset),
             pad: 0,
         };
         queue.write_buffer(self.mv_pass.params_buffer(), 0, bytemuck::bytes_of(&params));
@@ -965,9 +967,10 @@ impl FrameGeneration {
             motion_vector_scale: FfxApiFloatCoords2D { x: 1.0, y: 1.0 },
             frame_time_delta: frame_time_ms.clamp(0.1, 1000.0),
             reset,
-            camera_near: 1.0,
-            camera_far: 16000.0,
-            camera_fov_angle_vertical: 70f32.to_radians(),
+            // The camera the matrices were built from, not a literal.
+            camera_near: lens.near,
+            camera_far: lens.far,
+            camera_fov_angle_vertical: lens.fov_y_radians,
             view_space_to_meters_factor: 1.0,
             depth: FfxApiResource::texture2d(
                 &self.depth.resource,

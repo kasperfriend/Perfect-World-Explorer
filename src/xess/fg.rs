@@ -1009,7 +1009,7 @@ impl XessFrameGeneration {
             inv_vp: inv_vp.to_cols_array_2d(),
             prev_vp: prev_vp.to_cols_array_2d(),
             render_size: [rw as f32, rh as f32],
-            prev_valid: u32::from(self.prev_view_proj.is_some()),
+            prev_valid: u32::from(self.prev_view_proj.is_some() && !reset),
             pad: 0,
         };
         queue.write_buffer(self.mv_pass.params_buffer(), 0, bytemuck::bytes_of(&params));
