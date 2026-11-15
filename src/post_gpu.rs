@@ -9,6 +9,7 @@ pub mod glow_modulation;
 #[path = "post_plan.rs"]
 pub mod post_plan;
 use bytemuck::{Pod, Zeroable};
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 #[path = "glow_state.rs"]
 pub mod glow_state;
@@ -179,13 +180,13 @@ pub struct PostGpu {
     modulation: [f32; 4],
     sharpen: bool,
     composite_target: wgpu::Texture,
-    scene_view: wgpu::TextureView,
-    scene_raw_view: wgpu::TextureView,
-    fogged_view: wgpu::TextureView,
-    warped_view: wgpu::TextureView,
-    downsample_view: wgpu::TextureView,
-    blur_view: wgpu::TextureView,
-    composite_view: wgpu::TextureView,
+    scene_view: Arc<wgpu::TextureView>,
+    scene_raw_view: Arc<wgpu::TextureView>,
+    fogged_view: Arc<wgpu::TextureView>,
+    warped_view: Arc<wgpu::TextureView>,
+    downsample_view: Arc<wgpu::TextureView>,
+    blur_view: Arc<wgpu::TextureView>,
+    composite_view: Arc<wgpu::TextureView>,
     bind_groups: std::cell::RefCell<[Option<Vec<wgpu::BindGroup>>; 2]>,
     encoded_finish: wgpu::RenderPipeline,
     sharpen_finish: wgpu::RenderPipeline,
@@ -331,16 +332,16 @@ impl PostGpu {
             h,
             "encoded glow before sharpen",
         );
-        let scene_view = scene.create_view(&Default::default());
-        let scene_raw_view = scene.create_view(&wgpu::TextureViewDescriptor {
+        let scene_view = Arc::new(scene.create_view(&Default::default()));
+        let scene_raw_view = Arc::new(scene.create_view(&wgpu::TextureViewDescriptor {
             format: Some(format.remove_srgb_suffix()),
             ..Default::default()
-        });
-        let fogged_view = fogged.create_view(&Default::default());
-        let warped_view = warped.create_view(&Default::default());
-        let downsample_view = downsample.create_view(&Default::default());
-        let blur_view = blur.create_view(&Default::default());
-        let composite_view = composite_target.create_view(&Default::default());
+        }));
+        let fogged_view = Arc::new(fogged.create_view(&Default::default()));
+        let warped_view = Arc::new(warped.create_view(&Default::default()));
+        let downsample_view = Arc::new(downsample.create_view(&Default::default()));
+        let blur_view = Arc::new(blur.create_view(&Default::default()));
+        let composite_view = Arc::new(composite_target.create_view(&Default::default()));
         Self {
             modulation: [1.; 4],
             sharpen: false,
@@ -416,24 +417,24 @@ impl PostGpu {
             (h / 4).max(1),
             "glow blur",
         );
-        self.scene_view = self.scene.create_view(&Default::default());
-        self.scene_raw_view = self.scene.create_view(&wgpu::TextureViewDescriptor {
+        self.scene_view = Arc::new(self.scene.create_view(&Default::default()));
+        self.scene_raw_view = Arc::new(self.scene.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.format.remove_srgb_suffix()),
             ..Default::default()
-        });
-        self.fogged_view = self.fogged.create_view(&Default::default());
-        self.warped_view = self.warped.create_view(&Default::default());
-        self.downsample_view = self.downsample.create_view(&Default::default());
-        self.blur_view = self.blur.create_view(&Default::default());
-        self.composite_view = self.composite_target.create_view(&Default::default());
+        }));
+        self.fogged_view = Arc::new(self.fogged.create_view(&Default::default()));
+        self.warped_view = Arc::new(self.warped.create_view(&Default::default()));
+        self.downsample_view = Arc::new(self.downsample.create_view(&Default::default()));
+        self.blur_view = Arc::new(self.blur.create_view(&Default::default()));
+        self.composite_view = Arc::new(self.composite_target.create_view(&Default::default()));
         *self.bind_groups.borrow_mut() = [None, None];
     }
-    pub fn scene_view(&self) -> &wgpu::TextureView {
-        &self.scene_view
+    pub fn scene_view(&self) -> Arc<wgpu::TextureView> {
+        Arc::clone(&self.scene_view)
     }
     /// Raw view permits legacy encoded-space alpha blending for shoreline waves.
-    pub fn scene_raw_view(&self) -> &wgpu::TextureView {
-        &self.scene_raw_view
+    pub fn scene_raw_view(&self) -> Arc<wgpu::TextureView> {
+        Arc::clone(&self.scene_raw_view)
     }
     pub fn render(
         &self,

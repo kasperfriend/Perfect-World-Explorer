@@ -1,6 +1,7 @@
 //! Experimental multi-pass water, informed by client water_expensive.txt.
 //! Reflection is rendered per distinct visible water elevation.
 use bytemuck::{Pod, Zeroable};
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -190,14 +191,14 @@ struct Targets {
     reflect_depth: wgpu::Texture,
     sample_depth: wgpu::Texture,
     terrain_depth: wgpu::Texture,
-    reflection_view: wgpu::TextureView,
-    refraction_view: wgpu::TextureView,
-    scene_view: wgpu::TextureView,
-    reflection_raw: wgpu::TextureView,
-    refraction_raw: wgpu::TextureView,
-    scene_raw: wgpu::TextureView,
-    reflect_depth_view: wgpu::TextureView,
-    sample_depth_view: wgpu::TextureView,
+    reflection_view: Arc<wgpu::TextureView>,
+    refraction_view: Arc<wgpu::TextureView>,
+    scene_view: Arc<wgpu::TextureView>,
+    reflection_raw: Arc<wgpu::TextureView>,
+    refraction_raw: Arc<wgpu::TextureView>,
+    scene_raw: Arc<wgpu::TextureView>,
+    reflect_depth_view: Arc<wgpu::TextureView>,
+    sample_depth_view: Arc<wgpu::TextureView>,
     width: u32,
     height: u32,
     bind: wgpu::BindGroup,
@@ -630,7 +631,7 @@ impl WaterGpu {
             view_formats: &[],
         });
         let terrain_depth_view = terrain_depth.create_view(&Default::default());
-        let sample_depth_view = sample_depth.create_view(&Default::default());
+        let sample_depth_view = Arc::new(sample_depth.create_view(&Default::default()));
         let normal_view = normal.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
@@ -641,13 +642,13 @@ impl WaterGpu {
             format: Some(format.remove_srgb_suffix()),
             ..Default::default()
         };
-        let reflection_view = reflection.create_view(&Default::default());
-        let refraction_view = refraction.create_view(&Default::default());
-        let scene_view = scene.create_view(&Default::default());
-        let reflection_raw = reflection.create_view(&raw_view);
-        let refraction_raw = refraction.create_view(&raw_view);
-        let scene_raw = scene.create_view(&raw_view);
-        let reflect_depth_view = reflect_depth.create_view(&Default::default());
+        let reflection_view = Arc::new(reflection.create_view(&Default::default()));
+        let refraction_view = Arc::new(refraction.create_view(&Default::default()));
+        let scene_view = Arc::new(scene.create_view(&Default::default()));
+        let reflection_raw = Arc::new(reflection.create_view(&raw_view));
+        let refraction_raw = Arc::new(refraction.create_view(&raw_view));
+        let scene_raw = Arc::new(scene.create_view(&raw_view));
+        let reflect_depth_view = Arc::new(reflect_depth.create_view(&Default::default()));
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("water maps"),
             layout,
@@ -723,23 +724,23 @@ impl WaterGpu {
             &self.tile_sampler,
         );
     }
-    pub fn sample_depth(&self) -> &wgpu::TextureView {
-        &self.targets.sample_depth_view
+    pub fn sample_depth(&self) -> Arc<wgpu::TextureView> {
+        Arc::clone(&self.targets.sample_depth_view)
     }
     pub fn is_srgb(&self) -> bool {
         self.format.is_srgb()
     }
-    pub fn scene(&self) -> &wgpu::TextureView {
-        &self.targets.scene_view
+    pub fn scene(&self) -> Arc<wgpu::TextureView> {
+        Arc::clone(&self.targets.scene_view)
     }
-    pub fn reflection_raw(&self) -> &wgpu::TextureView {
-        &self.targets.reflection_raw
+    pub fn reflection_raw(&self) -> Arc<wgpu::TextureView> {
+        Arc::clone(&self.targets.reflection_raw)
     }
-    pub fn refraction_raw(&self) -> &wgpu::TextureView {
-        &self.targets.refraction_raw
+    pub fn refraction_raw(&self) -> Arc<wgpu::TextureView> {
+        Arc::clone(&self.targets.refraction_raw)
     }
-    pub fn scene_raw(&self) -> &wgpu::TextureView {
-        &self.targets.scene_raw
+    pub fn scene_raw(&self) -> Arc<wgpu::TextureView> {
+        Arc::clone(&self.targets.scene_raw)
     }
     pub fn copy_scene_to_refraction(&self, e: &mut wgpu::CommandEncoder) {
         e.copy_texture_to_texture(
@@ -762,18 +763,18 @@ impl WaterGpu {
             },
         );
     }
-    pub fn reflection(&self) -> &wgpu::TextureView {
-        &self.targets.reflection_view
+    pub fn reflection(&self) -> Arc<wgpu::TextureView> {
+        Arc::clone(&self.targets.reflection_view)
     }
     #[allow(dead_code)]
     pub fn refraction_texture(&self) -> &wgpu::Texture {
         &self.targets.refraction
     }
-    pub fn refraction(&self) -> &wgpu::TextureView {
-        &self.targets.refraction_view
+    pub fn refraction(&self) -> Arc<wgpu::TextureView> {
+        Arc::clone(&self.targets.refraction_view)
     }
-    pub fn depth(&self) -> &wgpu::TextureView {
-        &self.targets.reflect_depth_view
+    pub fn depth(&self) -> Arc<wgpu::TextureView> {
+        Arc::clone(&self.targets.reflect_depth_view)
     }
     pub fn update(&self, queue: &wgpu::Queue, u: &WaterUniform) {
         let mut value = *u;

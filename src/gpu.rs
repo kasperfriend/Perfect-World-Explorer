@@ -3223,13 +3223,13 @@ impl Renderer {
         } else {
             None
         };
-        let scene_target = post_view.unwrap_or(target);
+        let scene_target = post_view.as_deref().unwrap_or(target);
         let post_raw = if use_post {
             Some(self.post.scene_raw_view())
         } else {
             None
         };
-        let scene_target_raw = post_raw.unwrap_or(target_raw);
+        let scene_target_raw = post_raw.as_deref().unwrap_or(target_raw);
         // Fog is a uniform state of the main scene pass, not a separate view.
         let main_pass = if camera.active_fog().enabled {
             Pass::Fog
@@ -3322,9 +3322,9 @@ impl Renderer {
             );
         }
         let water_scene = needs_refraction.then(|| self.water.scene());
-        let scene_color = water_scene.unwrap_or(scene_target);
+        let scene_color = water_scene.as_deref().unwrap_or(scene_target);
         let water_scene_raw = needs_refraction.then(|| self.water.scene_raw());
-        let model_target = water_scene_raw.unwrap_or(scene_target_raw);
+        let model_target = water_scene_raw.as_deref().unwrap_or(scene_target_raw);
         let scene_depth = self.depth.create_view(&Default::default());
         let post_depth = needs_refraction.then(|| self.water.sample_depth());
         let mut e = self.device.create_command_encoder(&Default::default());
@@ -3401,7 +3401,7 @@ impl Renderer {
                     &self.device,
                     &self.queue,
                     target,
-                    post_depth.unwrap_or(&scene_depth),
+                    post_depth.as_deref().unwrap_or(&scene_depth),
                     post_depth.is_some(),
                     w,
                     h,
@@ -3474,7 +3474,7 @@ impl Renderer {
                     &self.device,
                     &self.queue,
                     target,
-                    post_depth.unwrap_or(&scene_depth),
+                    post_depth.as_deref().unwrap_or(&scene_depth),
                     post_depth.is_some(),
                     w,
                     h,
@@ -3522,10 +3522,13 @@ impl Renderer {
                 continue;
             }
             let reflection = reflection
+                .as_deref()
                 .expect("visible complex water needs reflection target");
             let reflect_depth = reflect_depth
+                .as_deref()
                 .expect("visible complex water needs reflection depth");
             let refraction = refraction
+                .as_deref()
                 .expect("visible complex water needs refraction target");
             let plane = batch.height;
             // A previous plane's reflection left its mirrored records in the
@@ -3846,7 +3849,7 @@ impl Renderer {
                 &self.device,
                 &self.queue,
                 target,
-                post_depth.unwrap_or(&scene_depth),
+                post_depth.as_deref().unwrap_or(&scene_depth),
                 post_depth.is_some(),
                 w,
                 h,
