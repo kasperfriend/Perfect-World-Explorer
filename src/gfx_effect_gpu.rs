@@ -495,19 +495,19 @@ impl Draw {
             let position = if groups.last_mut().is_some_and(|(last_key, _)| {
                 last_key.layer == quad.layer
                     && last_key.pipeline == pipeline
-                       && last_key.priority == quad.priority
-                       && last_key.tile == quad.tile
-                       && last_key.texture == quad.texture.as_str()
-               }) {
+                   && last_key.priority == quad.priority
+                   && last_key.tile == quad.tile
+                   && last_key.texture == quad.texture.as_str()
+           }) {
                 groups.len() - 1
             } else {
                 let key = BucketKey {
-                       layer: quad.layer,
-                       pipeline,
-                       priority: quad.priority,
-                       tile: quad.tile,
-                       texture: quad.texture.clone(),
-               };
+                   layer: quad.layer,
+                   pipeline,
+                   priority: quad.priority,
+                   tile: quad.tile,
+                   texture: quad.texture.clone(),
+                   };
                 match self.scratch_index.get(&key) {
                        Some(position) => *position,
                        None => {
