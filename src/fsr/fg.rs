@@ -1069,10 +1069,10 @@ impl FrameGeneration {
         // plus UI, see `prepare`) is what goes to the backbuffer, and FFX gets
         // the composition as `HUDLessColor` — no UI resource is registered at
         // all, because that would let FFX blend the UI a second time.
-        let present_source = if self.ui_in_composition {
-            &self.compose
+        let present_resource: d3d12::Resource = if self.ui_in_composition {
+            self.compose.resource.clone()
         } else {
-            &self.ui
+            self.ui.resource.clone()
         };
         let (width, height) = self.size;
         // --- Acquire the current backbuffer.
@@ -1106,7 +1106,7 @@ impl FrameGeneration {
         };
         let mut barriers = vec![
             barrier(
-                &present_source.resource,
+                &present_resource,
                 D3D12_STATE_RENDER_TARGET,
                 D3D12_STATE_COPY_SRC,
             ),
@@ -1123,14 +1123,12 @@ impl FrameGeneration {
         // The d3d12 crate has no safe `CopyResource` wrapper, so call the
         // COM method on the underlying raw interface directly.
         unsafe {
-            (*list.as_mut_ptr()).CopyResource(
-                backbuffer.as_mut_ptr(),
-                present_source.resource.as_mut_ptr(),
-            );
+            (*list.as_mut_ptr())
+                .CopyResource(backbuffer.as_mut_ptr(), present_resource.as_mut_ptr());
         }
         let restore = [
             barrier(
-                &present_source.resource,
+                &present_resource,
                 D3D12_STATE_COPY_SRC,
                 D3D12_STATE_RENDER_TARGET,
             ),

@@ -25,6 +25,11 @@ pub(crate) const FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_WARNINGS: u32 = 0x2;
 pub(crate) const FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION: u64 = 0x0001000b;
 pub(crate) const FFX_API_RESOURCE_STATE_UNORDERED_ACCESS: u32 = 1 << 1;
 pub(crate) const FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ: u32 = (1 << 2) | (1 << 3);
+/// `FFX_API_RESOURCE_STATE_RENDER_TARGET` (`ffx_api_types.h`): a resource the
+/// application renders into. The frame-generation `HUDLessColor` is exactly
+/// that — the composition target — and FFX wants the state it is in, not the
+/// state FFX will use.
+pub(crate) const FFX_API_RESOURCE_STATE_RENDER_TARGET: u32 = 1 << 8;
 pub(crate) const FFX_API_RESOURCE_USAGE_READ_ONLY: u32 = 0;
 pub(crate) const FFX_API_RESOURCE_USAGE_UAV: u32 = 1 << 1;
 pub(crate) const FFX_API_RESOURCE_USAGE_DEPTHTARGET: u32 = 1 << 2;

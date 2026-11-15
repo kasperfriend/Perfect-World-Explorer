@@ -94,6 +94,9 @@ const DXGI_MWA_NO_WINDOW_CHANGES: u32 = 0x1;
 const DXGI_MWA_NO_ALT_ENTER: u32 = 0x2;
 
 const XEFG_UI_MODE_HUDLESS_UITEXTURE: i32 = 3;
+/// `XEFG_SWAPCHAIN_UI_MODE_BACKBUFFER_HUDLESS`: interpolate the HUD-less colour,
+/// extract the UI from the backbuffer.
+const XEFG_UI_MODE_BACKBUFFER_HUDLESS: i32 = 4;
 const XEFG_UI_COMPOSITION_STATE_ENABLED: u32 = 1;
 /// Resource validity: XeSS-FG may defer (or skip) the copy entirely and read
 /// the resource during `Present`. This viewer no longer uses it: that read can
@@ -451,6 +454,10 @@ pub struct XessFrameGeneration {
     /// the HUD-less colour; `false` (the default) when the caller draws the UI
     /// into [`Self::compose_view`] and XeSS-FG interpolates it with the scene.
     ui_composed_by_proxy: bool,
+    /// The `xefg_swapchain_ui_mode_t` the context was created with; decides
+    /// whether the UI surface is the presented frame (2, 4) or the UI alone
+    /// (3, 5).
+    ui_mode: i32,
 }
 
 impl Drop for XessFrameGeneration {
@@ -878,6 +885,7 @@ impl XessFrameGeneration {
             frame_id: 1,
             frames: 0,
             ui_composed_by_proxy: ui_in_composition,
+            ui_mode,
         })
     }
 
@@ -1246,16 +1254,16 @@ impl XessFrameGeneration {
         // What goes into the backbuffer: the presented frame (`ui`: composition
         // plus UI) in the modes that keep the UI in it, the composition itself
         // on the legacy `NONE` path.
-        let present_source = if self.ui_surface_prefilled() {
-            &self.ui
+        let present_resource: d3d12::Resource = if self.ui_surface_prefilled() {
+            self.ui.resource.clone()
         } else {
-            &self.compose
+            self.compose.resource.clone()
         };
         let list_ptr = {
             let list = &mut self.ring.slot_mut(slot_index).list;
             let mut barriers = vec![
                 barrier(
-                    &present_source.resource,
+                    &present_resource,
                     D3D12_STATE_RENDER_TARGET,
                     D3D12_STATE_COPY_SRC,
                 ),
@@ -1273,10 +1281,8 @@ impl XessFrameGeneration {
             // The d3d12 crate has no safe `CopyResource` wrapper, so call the
             // COM method on the underlying raw interface directly.
             unsafe {
-                (*list.as_mut_ptr()).CopyResource(
-                    backbuffer.as_mut_ptr(),
-                    present_source.resource.as_mut_ptr(),
-                );
+                (*list.as_mut_ptr())
+                    .CopyResource(backbuffer.as_mut_ptr(), present_resource.as_mut_ptr());
             }
             list.as_mut_ptr() as *mut c_void
         };
@@ -1324,7 +1330,7 @@ impl XessFrameGeneration {
                     D3D12_STATE_RENDER_TARGET,
                 ),
                 barrier(
-                    &present_source.resource,
+                    &present_resource,
                     D3D12_STATE_COPY_SRC,
                     D3D12_STATE_RENDER_TARGET,
                 ),
