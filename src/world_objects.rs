@@ -859,7 +859,7 @@ impl GpuPage {
             }
             pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
         }
-        }
+         }
 
     pub fn world_culled_commands(pages: &[Self]) -> [Vec<WorldDrawCmd>; WORLD_VIEWS] {
         let order = Self::draw_order(pages);
