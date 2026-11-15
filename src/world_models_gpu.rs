@@ -1096,12 +1096,13 @@ impl World {
             };
             let identity = producer.identity;
             let outcome = (|| -> Result<Option<[f32; 16]>, String> {
-                let slot = slots.get(binding.instance).ok_or_else(|| {
-                    format!("producer {identity}: parent slot is gone")
-                })?;
-                let parent = assets.instances.get(binding.instance).ok_or_else(|| {
-                    format!("producer {identity}: parent instance is gone")
-                })?;
+                let slot = slots
+                    .get(binding.instance)
+                    .ok_or_else(|| format!("producer {identity}: parent slot is gone"))?;
+                let parent = assets
+                    .instances
+                    .get(binding.instance)
+                    .ok_or_else(|| format!("producer {identity}: parent instance is gone"))?;
                 let posed = match &slot.posed {
                     Some(Ok(posed)) => posed,
                     Some(Err(e)) => {
@@ -1109,9 +1110,10 @@ impl World {
                     }
                     None => return Err(format!("producer {identity}: parent has no pose")),
                 };
-                let asset = assets.assets.get(parent.asset).ok_or_else(|| {
-                    format!("producer {identity}: parent asset is gone")
-                })?;
+                let asset = assets
+                    .assets
+                    .get(parent.asset)
+                    .ok_or_else(|| format!("producer {identity}: parent asset is gone"))?;
                 let hook = asset.hook_matrix(&posed.pose, &binding.record.hook)?;
                 let composed = model_attachment::world(hook, binding.local)?;
                 Ok(Some(composed.to_cols_array()))
