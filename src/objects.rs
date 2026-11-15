@@ -329,9 +329,10 @@ fn litmodel_entry_key(
     // the meaningful world-relative suffix (for example `.../world/1/foo.bmd`).
     // Prefer that full suffix over a basename-only match, which could select an
     // unrelated model from another numeric world folder.
-    let relative = litmodel_key(path)
+    let canonical = litmodel_key(path);
+    let relative = canonical
         .strip_prefix("litmodels/world/")
-        .unwrap_or(path);
+        .unwrap_or(&canonical);
     let suffix = format!("/{relative}");
     let suffix_matches: Vec<_> = entries
         .keys()
