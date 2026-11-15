@@ -1021,7 +1021,9 @@ impl FsrUpscaler {
         if self.fence.get_value() >= self.fence_value {
             return;
         }
-        let _ = self.fence.set_event_on_completion(self.fence_event, self.fence_value);
+        let _ = self
+            .fence
+            .set_event_on_completion(self.fence_event, self.fence_value);
         self.fence_event.wait(5_000);
     }
 
