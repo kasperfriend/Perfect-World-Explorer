@@ -1213,6 +1213,9 @@ impl XessFrameGeneration {
     /// to draw the UI into [`Self::compose_view`] instead.
     pub fn finish(&mut self, ui_visible: bool) -> Result<(), String> {
         let id = self.current_frame_id();
+        // Read once: these are `&self` calls, and the command-list borrows below
+        // are exclusive of the whole struct.
+        let prefilled = self.ui_surface_prefilled();
         let (width, height) = self.size;
 
         // --- Acquire the current backbuffer.
@@ -1254,7 +1257,7 @@ impl XessFrameGeneration {
         // What goes into the backbuffer: the presented frame (`ui`: composition
         // plus UI) in the modes that keep the UI in it, the composition itself
         // on the legacy `NONE` path.
-        let present_resource: d3d12::Resource = if self.ui_surface_prefilled() {
+        let present_resource: d3d12::Resource = if prefilled {
             self.ui.resource.clone()
         } else {
             self.compose.resource.clone()
@@ -1269,7 +1272,7 @@ impl XessFrameGeneration {
                 ),
                 barrier(&backbuffer, D3D12_STATE_PRESENT, D3D12_STATE_COPY_DEST),
             ];
-            let tag_ui = ui_visible && self.ui_composed_by_proxy && !self.ui_surface_prefilled();
+            let tag_ui = ui_visible && self.ui_composed_by_proxy && !prefilled;
             if tag_ui {
                 barriers.push(barrier(
                     &self.ui.resource,
@@ -1303,7 +1306,7 @@ impl XessFrameGeneration {
             }
             // The UI on its own only for the separate-texture modes; the
             // backbuffer-extraction modes take the UI from the presented frame.
-            if ui_visible && !self.ui_surface_prefilled() {
+            if ui_visible && !prefilled {
                 unsafe {
                     tag_frame_resource_now(
                         self.loader.tag_frame_resource,
@@ -1336,7 +1339,7 @@ impl XessFrameGeneration {
                 ),
                 barrier(&backbuffer, D3D12_STATE_COPY_DEST, D3D12_STATE_PRESENT),
             ];
-            if ui_visible && self.ui_composed_by_proxy && !self.ui_surface_prefilled() {
+            if ui_visible && self.ui_composed_by_proxy && !prefilled {
                 restore.push(barrier(
                     &self.ui.resource,
                     D3D12_STATE_COPY_SRC,
