@@ -420,6 +420,20 @@ impl PostGpu {
         client_gamma: bool,
         gamma_setting: f32,
     ) {
+        // Resolve every enable/disable rule in one audited place.
+        let plan = post_plan::plan(post_plan::Inputs {
+            bloom,
+            sharpen: self.sharpen,
+            underwater: underwater > 0.,
+            screen_fog,
+            fog_enabled: atmospheric_fog || underwater > 0.,
+            display_gamma: client_gamma,
+            srgb_target: self.format.is_srgb(),
+        });
+        if !plan.active() {
+            // Nothing writes the frame: do not copy or quantize it.
+            return;
+        }
         queue.write_buffer(
             &self.uniform,
             0,
@@ -454,20 +468,6 @@ impl PostGpu {
                 ramp: gamma_curve::table(gamma_setting),
             }),
         );
-        // Resolve every enable/disable rule in one audited place.
-        let plan = post_plan::plan(post_plan::Inputs {
-            bloom,
-            sharpen: self.sharpen,
-            underwater: underwater > 0.,
-            screen_fog,
-            fog_enabled: atmospheric_fog || underwater > 0.,
-            display_gamma: client_gamma,
-            srgb_target: self.format.is_srgb(),
-        });
-        if !plan.active() {
-            // Nothing writes the frame: do not copy or quantize it.
-            return;
-        }
         let scene = self.scene.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.format.remove_srgb_suffix()),
             ..Default::default()
