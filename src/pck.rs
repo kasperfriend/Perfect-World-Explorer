@@ -3,16 +3,117 @@
 use flate2::read::ZlibDecoder;
 use std::{
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{self, Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
 };
 const MASK: u32 = 0xa8937462;
 const CHECK: u32 = 0x59374231;
+
+/// A PCK and its optional `.pkx` overflow file as one seekable logical package.
+/// Angelica stores payload bytes across the pair contiguously; directory offsets
+/// and the package-end field address that combined byte stream.
+pub struct PackageFile {
+    path: PathBuf,
+    pck: File,
+    pkx: Option<File>,
+    pck_len: u64,
+    pkx_len: u64,
+    pos: u64,
+}
+
+impl PackageFile {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let pck = File::open(path)?;
+        let pck_len = pck.metadata()?.len();
+        let lower_pkx = path.with_extension("pkx");
+        let upper_pkx = path.with_extension("PKX");
+        let pkx_path = if lower_pkx.is_file() {
+            Some(lower_pkx)
+        } else if upper_pkx.is_file() {
+            Some(upper_pkx)
+        } else {
+            None
+        };
+        let (pkx, pkx_len) = if let Some(pkx_path) = pkx_path {
+            let pkx = File::open(&pkx_path).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("{}: {error}", pkx_path.display()),
+                )
+            })?;
+            let len = pkx.metadata()?.len();
+            (Some(pkx), len)
+        } else {
+            (None, 0)
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            pck,
+            pkx,
+            pck_len,
+            pkx_len,
+            pos: 0,
+        })
+    }
+
+    fn total_len(&self) -> u64 {
+        self.pck_len.saturating_add(self.pkx_len)
+    }
+
+    pub fn uses_pkx(&self) -> bool {
+        self.pkx.is_some()
+    }
+}
+
+impl Read for PackageFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.total_len() {
+            return Ok(0);
+        }
+        if self.pos < self.pck_len {
+            self.pck.seek(SeekFrom::Start(self.pos))?;
+            let span = (self.pck_len - self.pos).min(buf.len() as u64) as usize;
+            let read = self.pck.read(&mut buf[..span])?;
+            self.pos += read as u64;
+            if read != span || read == buf.len() {
+                return Ok(read);
+            }
+            return self.read(&mut buf[read..]).map(|next| read + next);
+        }
+        let Some(pkx) = self.pkx.as_mut() else {
+            return Ok(0);
+        };
+        pkx.seek(SeekFrom::Start(self.pos - self.pck_len))?;
+        let read = pkx.read(buf)?;
+        self.pos += read as u64;
+        Ok(read)
+    }
+}
+
+impl Seek for PackageFile {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let next = match from {
+            SeekFrom::Start(pos) => pos as i128,
+            SeekFrom::Current(delta) => self.pos as i128 + delta as i128,
+            SeekFrom::End(delta) => self.total_len() as i128 + delta as i128,
+        };
+        if next < 0 || next > u64::MAX as i128 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid seek in {}", self.path.display()),
+            ));
+        }
+        self.pos = next as u64;
+        Ok(self.pos)
+    }
+}
+
 fn u32le(b: &[u8], p: usize) -> Result<u32, String> {
     Ok(u32::from_le_bytes(
         b.get(p..p + 4).ok_or("truncated")?.try_into().unwrap(),
     ))
 }
-fn at(f: &mut File, p: u64, n: usize) -> Result<Vec<u8>, String> {
+fn at<R: Read + Seek>(f: &mut R, p: u64, n: usize) -> Result<Vec<u8>, String> {
     let mut b = vec![0; n];
     f.seek(SeekFrom::Start(p))
         .and_then(|_| f.read_exact(&mut b))
@@ -40,8 +141,8 @@ pub struct Entry {
     pub size: u32,
     pub compressed: u32,
 }
-pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
-    let size = f.metadata().map_err(|e| e.to_string())?.len();
+pub fn directory<R: Read + Seek>(f: &mut R) -> Result<Vec<Entry>, String> {
+    let size = f.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
     if size < 292 {
         return Err("archive too small".into());
     }
@@ -50,8 +151,13 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
         return Err("unsupported PCK safe header".into());
     }
     let end = u32le(&safe, 4)? as u64;
-    if end > size || end < 292 {
-        return Err("bad package end offset (split packages unsupported)".into());
+    if end > size {
+        return Err(format!(
+            "package end offset {end} exceeds available bytes {size} (missing or truncated .pkx companion if split)"
+        ));
+    }
+    if end < 292 {
+        return Err("bad package end offset".into());
     }
     let header = at(f, end - 280, 280)?;
     if u32le(&header, 0)? != 0xfdfdfeee || u32le(&header, 268)? != 0xf00dbeef {
@@ -108,7 +214,7 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     Ok(result)
 }
 
-pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
+pub fn read_entry<R: Read + Seek>(f: &mut R, e: &Entry) -> Result<Vec<u8>, String> {
     if e.compressed < e.size {
         // Decode directly from a bounded file reader. The old path retained a
         // complete compressed member alongside its expanded output.
@@ -229,6 +335,89 @@ mod tests {
     }
 
     use std::io::Write;
+
+    fn one_entry_package(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut record = vec![0u8; 276];
+        record[..name.len()].copy_from_slice(name.as_bytes());
+        record[260..264].copy_from_slice(&12u32.to_le_bytes());
+        record[264..268].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        record[268..272].copy_from_slice(&(compressed.len() as u32).to_le_bytes());
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x4dca23efu32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // patched with logical length
+        bytes.extend_from_slice(&0x56a089b7u32.to_le_bytes());
+        bytes.extend_from_slice(&compressed);
+        let directory_at = bytes.len() as u32;
+        bytes.extend_from_slice(&276u32.to_le_bytes());
+        bytes.extend_from_slice(&(276u32 ^ MASK ^ CHECK).to_le_bytes());
+        bytes.extend_from_slice(&record);
+        let end = bytes.len() as u32 + 280;
+        let mut footer = vec![0u8; 280];
+        footer[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
+        footer[8..12].copy_from_slice(&(directory_at ^ MASK).to_le_bytes());
+        footer[268..272].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
+        footer[272..276].copy_from_slice(&1u32.to_le_bytes());
+        footer[276..280].copy_from_slice(&0x20002u32.to_le_bytes());
+        bytes.extend_from_slice(&footer);
+        bytes[4..8].copy_from_slice(&end.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn split_pck_and_pkx_are_read_as_one_logical_archive() {
+        let root = std::env::temp_dir().join(format!(
+            "pw-pck-split-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pck_path = root.join("litmodels.pck");
+        let pkx_path = root.join("litmodels.pkx");
+        let payload = vec![0x42; 4096];
+        let bytes = one_entry_package("litmodels/world/1/example.bmd", &payload);
+        let split = 19; // split inside both the payload and the logical stream
+        std::fs::write(&pck_path, &bytes[..split]).unwrap();
+        std::fs::write(&pkx_path, &bytes[split..]).unwrap();
+
+        let mut package = PackageFile::open(&pck_path).unwrap();
+        let entries = directory(&mut package).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "litmodels/world/1/example.bmd");
+        assert!(entries[0].compressed < entries[0].size);
+        assert_eq!(read_entry(&mut package, &entries[0]).unwrap(), payload);
+
+        drop(package);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn truncated_split_archive_names_the_missing_pkx_companion() {
+        let root = std::env::temp_dir().join(format!(
+            "pw-pck-no-pkx-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let pck_path = root.join("litmodels.pck");
+        let bytes = one_entry_package("litmodels/world/1/example.bmd", &vec![0x42; 4096]);
+        let truncated_at = bytes.len() - 100;
+        std::fs::write(&pck_path, &bytes[..truncated_at]).unwrap();
+        let mut package = PackageFile::open(&pck_path).unwrap();
+        let error = directory(&mut package).unwrap_err();
+        assert!(error.contains("missing or truncated .pkx companion"));
+        drop(package);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn bounded_streaming_decode_matches_the_original_member() {
         let expected = vec![37u8; 128 * 1024];

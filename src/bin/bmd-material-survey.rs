@@ -4,14 +4,12 @@
 mod bmd;
 #[path = "../pck.rs"]
 mod pck;
-use std::{collections::BTreeMap, fs::File};
+use std::{collections::BTreeMap, path::Path};
 fn main() -> Result<(), String> {
-    let mut f = File::open(
-        std::env::args()
-            .nth(1)
-            .ok_or("usage: bmd-material-survey litmodels.pck")?,
-    )
-    .map_err(|e| e.to_string())?;
+    let path = std::env::args()
+        .nth(1)
+        .ok_or("usage: bmd-material-survey litmodels.pck")?;
+    let mut f = pck::PackageFile::open(Path::new(&path)).map_err(|e| e.to_string())?;
     let entries = pck::directory(&mut f)?;
     let mut ver = BTreeMap::new();
     let mut sided = [0, 0];

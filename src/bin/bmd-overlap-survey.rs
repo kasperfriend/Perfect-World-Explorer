@@ -6,14 +6,12 @@ mod bmd;
 mod bmd_baked;
 #[path = "../pck.rs"]
 mod pck;
-use std::{collections::HashMap, env, fs::File};
+use std::{collections::HashMap, env, path::Path};
 fn main() {
-    let mut f = File::open(
-        env::args()
-            .nth(1)
-            .expect("usage: bmd-overlap-survey litmodels.pck"),
-    )
-    .unwrap();
+    let path = env::args()
+        .nth(1)
+        .expect("usage: bmd-overlap-survey litmodels.pck");
+    let mut f = pck::PackageFile::open(Path::new(&path)).unwrap();
     let entries = pck::directory(&mut f).unwrap();
     let mut models = 0;
     let mut unparsed = 0u64;

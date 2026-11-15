@@ -843,7 +843,8 @@ fn model_decks(model: &crate::bmd::Model) -> Vec<PropDeck> {
 
 fn building_worker(element: PathBuf, paths: Vec<String>, tx: SyncSender<BuildingMessage>) {
     let result = (|| -> Result<(), String> {
-        let mut file = File::open(element.join("litmodels.pck")).map_err(|e| e.to_string())?;
+        let mut file =
+            pck::PackageFile::open(&element.join("litmodels.pck")).map_err(|e| e.to_string())?;
         let entries: HashMap<_, _> = pck::directory(&mut file)?
             .into_iter()
             .map(|entry| (entry.name.to_lowercase(), entry))

@@ -4,7 +4,7 @@ mod pck;
 #[allow(dead_code)]
 #[path = "../scene.rs"]
 mod scene;
-use std::{collections::HashSet, env, fs::File, path::Path};
+use std::{collections::HashSet, env, path::Path};
 fn run() -> Result<(), String> {
     let a: Vec<_> = env::args().collect();
     if a.len() != 2 {
@@ -46,7 +46,8 @@ fn run() -> Result<(), String> {
     );
     println!("Trees {} water refs {} grass refs {} ornaments {} boxes {} effects {} models {} critters {} bezier refs {} sounds {}",n[0],n[1],n[2],n[3],n[4],n[5],n[6],n[7],n[8],n[9]);
     let ornaments = scene.load_ornaments(&element.join("maps/world/world.ecbsd"))?;
-    let mut lit = File::open(element.join("litmodels.pck")).map_err(|e| e.to_string())?;
+    let mut lit = pck::PackageFile::open(&element.join("litmodels.pck"))
+        .map_err(|e| e.to_string())?;
     let litset: HashSet<String> = pck::directory(&mut lit)?
         .into_iter()
         .map(|e| e.name.to_lowercase())

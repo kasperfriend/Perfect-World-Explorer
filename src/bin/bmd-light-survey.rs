@@ -4,12 +4,12 @@
 mod bmd;
 #[path = "../pck.rs"]
 mod pck;
-use std::{env, fs::File};
+use std::{env, path::Path};
 fn main() {
     let path = env::args()
         .nth(1)
         .expect("usage: bmd-light-survey path-to-litmodels.pck");
-    let mut file = File::open(path).unwrap();
+    let mut file = pck::PackageFile::open(Path::new(&path)).unwrap();
     let entries = pck::directory(&mut file).unwrap();
     let mut models = 0u64;
     let mut meshes = 0u64;

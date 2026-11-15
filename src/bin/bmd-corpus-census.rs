@@ -15,7 +15,6 @@ mod pck;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    fs::File,
     path::Path,
 };
 
@@ -466,7 +465,7 @@ fn run() -> Result<(), String> {
         if !path.exists() {
             return Err(format!("missing archive {}", path.display()));
         }
-        let mut f = File::open(&path).map_err(|e| e.to_string())?;
+        let mut f = pck::PackageFile::open(&path).map_err(|e| e.to_string())?;
         let entries = pck::directory(&mut f)?;
         for e in &entries {
             let name = norm_name(&e.name);

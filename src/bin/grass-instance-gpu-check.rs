@@ -1222,7 +1222,8 @@ fn main() {
     }
     println!("Grass day/night lightmap test green: {greens:?}");
     let (day_color, night_color) = if let Ok(path) = std::env::var("PW_REAL_BMD_PCK") {
-        let mut f = std::fs::File::open(path).expect("open real BMD archive");
+        let mut f = pck::PackageFile::open(std::path::Path::new(&path))
+            .expect("open real BMD archive");
         let entries = pck::directory(&mut f).unwrap();
         let entry = entries
             .iter()

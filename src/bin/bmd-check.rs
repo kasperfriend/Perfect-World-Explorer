@@ -4,7 +4,7 @@ mod bmd;
 #[allow(dead_code)]
 #[path = "../pck.rs"]
 mod pck;
-use std::{collections::BTreeMap, env, fs::File, path::Path};
+use std::{collections::BTreeMap, env, path::Path};
 fn run() -> Result<(), String> {
     let a: Vec<_> = env::args().collect();
     if a.len() != 2 {
@@ -16,7 +16,8 @@ fn run() -> Result<(), String> {
     } else {
         r.to_path_buf()
     };
-    let mut f = File::open(root.join("litmodels.pck")).map_err(|e| e.to_string())?;
+    let mut f = pck::PackageFile::open(&root.join("litmodels.pck"))
+        .map_err(|e| e.to_string())?;
     let entries = pck::directory(&mut f)?;
     let mut ok = 0;
     let mut fail = 0;
@@ -48,7 +49,8 @@ fn run() -> Result<(), String> {
         "BMD decoded {ok}, failed {fail}, vertices {vertex_count}, unique texture paths {}",
         tex.len()
     );
-    let mut texture_file = File::open(root.join("building.pck")).map_err(|e| e.to_string())?;
+    let mut texture_file = pck::PackageFile::open(&root.join("building.pck"))
+        .map_err(|e| e.to_string())?;
     let paths: std::collections::HashSet<String> = pck::directory(&mut texture_file)?
         .into_iter()
         .map(|e| e.name.to_lowercase())

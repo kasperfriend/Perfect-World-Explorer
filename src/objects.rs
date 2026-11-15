@@ -26,7 +26,6 @@ use crate::{
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
     path::Path,
 };
 pub struct Texture {
@@ -234,8 +233,10 @@ pub struct Objects {
     models: HashMap<String, bmd::Model>,
     cache: TextureCache,
     resolver: TextureResolver,
-    litfile: Option<File>,
-    texfile: Option<File>,
+    litfile: Option<pck::PackageFile>,
+    texfile: Option<pck::PackageFile>,
+    lit_archive_error: Option<String>,
+    lit_archive_entries: usize,
     litentries: HashMap<String, pck::Entry>,
     litbasenames: HashMap<String, Vec<String>>,
     texentries: HashMap<String, pck::Entry>,
@@ -318,6 +319,28 @@ fn litmodel_entry_key(
     {
         return Ok(key.clone());
     }
+    // Some client builds add an extra archive root directory while preserving
+    // the meaningful world-relative suffix (for example `.../world/1/foo.bmd`).
+    // Prefer that full suffix over a basename-only match, which could select an
+    // unrelated model from another numeric world folder.
+    let relative = litmodel_key(path)
+        .strip_prefix("litmodels/world/")
+        .unwrap_or(path);
+    let suffix = format!("/{relative}");
+    let suffix_matches: Vec<_> = entries
+        .keys()
+        .filter(|key| key.ends_with(&suffix))
+        .collect();
+    match suffix_matches.as_slice() {
+        [only] => return Ok((*only).clone()),
+        matches if !matches.is_empty() => {
+            return Err(format!(
+                "no exact archive path for {path}; world-relative suffix {relative} is ambiguous ({} matches)",
+                matches.len()
+            ));
+        }
+        _ => {}
+    }
     let basename = litmodel_key(path)
         .rsplit('/')
         .next()
@@ -335,31 +358,53 @@ fn litmodel_entry_key(
     }
 }
 
-fn open_optional_archive(path: &Path) -> (Option<File>, HashMap<String, pck::Entry>) {
-    let mut file = match File::open(path) {
+fn open_optional_archive(
+    path: &Path,
+) -> (
+    Option<pck::PackageFile>,
+    HashMap<String, pck::Entry>,
+    Option<String>,
+) {
+    let mut file = match pck::PackageFile::open(path) {
         Ok(file) => file,
         Err(error) => {
-            eprintln!(
-                "Optional scenery archive {} unavailable: {error}",
-                path.display()
-            );
-            return (None, HashMap::new());
+            let reason = format!("{}: {error}", path.display());
+            eprintln!("Optional scenery archive unavailable: {reason}");
+            return (None, HashMap::new(), Some(reason));
         }
     };
     match pck::directory(&mut file) {
-        Ok(entries) => (
-            Some(file),
-            entries
+        Ok(entries) => {
+            let indexed: HashMap<_, _> = entries
                 .into_iter()
                 .map(|entry| (normalize(&entry.name), entry))
-                .collect(),
-        ),
-        Err(error) => {
+                .collect();
+            let bmd_count = indexed
+                .keys()
+                .filter(|name| name.ends_with(".bmd"))
+                .count();
+            let world_bmd_count = indexed
+                .keys()
+                .filter(|name| name.contains("world/") && name.ends_with(".bmd"))
+                .count();
             eprintln!(
-                "Optional scenery archive {} could not be read: {error}",
-                path.display()
+                "Indexed scenery archive {}: {} members, {} BMDs ({} under world/){}",
+                path.display(),
+                indexed.len(),
+                bmd_count,
+                world_bmd_count,
+                if file.uses_pkx() {
+                    ", with .pkx overflow"
+                } else {
+                    ""
+                }
             );
-            (None, HashMap::new())
+            (Some(file), indexed, None)
+        }
+        Err(error) => {
+            let reason = format!("{}: {error}", path.display());
+            eprintln!("Optional scenery archive could not be read: {reason}");
+            (None, HashMap::new(), Some(reason))
         }
     }
 }
@@ -377,8 +422,11 @@ fn tex_budget_bytes() -> usize {
 }
 impl Objects {
     pub fn open(element: &Path, ornaments: Vec<Ornament>) -> Result<Self, String> {
-        let (litfile, litentries) = open_optional_archive(&element.join("litmodels.pck"));
-        let (texfile, texentries) = open_optional_archive(&element.join("building.pck"));
+        let (litfile, litentries, lit_archive_error) =
+            open_optional_archive(&element.join("litmodels.pck"));
+        let (texfile, texentries, _tex_archive_error) =
+            open_optional_archive(&element.join("building.pck"));
+        let lit_archive_entries = litentries.len();
         let mut litbasenames = HashMap::<String, Vec<String>>::new();
         for name in litentries.keys() {
             let basename = name.rsplit('/').next().unwrap_or(name).to_string();
@@ -409,6 +457,8 @@ impl Objects {
             resolver,
             litfile,
             texfile,
+            lit_archive_error,
+            lit_archive_entries,
             litentries,
             litbasenames,
             texentries,
@@ -453,9 +503,20 @@ impl Objects {
                 continue;
             }
             if !self.models.contains_key(&name) {
+                let archive_error = self.lit_archive_error.clone();
+                let indexed_count = self.lit_archive_entries;
                 let loaded = (|| -> Result<bmd::Model, String> {
-                    let entry_key =
-                        litmodel_entry_key(&name, &self.litentries, &self.litbasenames)?;
+                    if let Some(error) = &archive_error {
+                        return Err(format!("litmodels.pck was not indexed: {error}"));
+                    }
+                    let entry_key = litmodel_entry_key(
+                        &name,
+                        &self.litentries,
+                        &self.litbasenames,
+                    )
+                    .map_err(|error| {
+                        format!("{error}; litmodels.pck index has {indexed_count} members")
+                    })?;
                     let entry = &self.litentries[&entry_key];
                     let file = self
                         .litfile
@@ -814,6 +875,45 @@ mod tests {
         )
         .unwrap_err()
         .contains("ambiguous"));
+    }
+
+    #[test]
+    fn model_lookup_prefers_unique_world_relative_suffix_before_basename() {
+        let name = "vendor-layout/world/1/litmodel_1318.bmd";
+        let other = "vendor-layout/world/2/litmodel_1318.bmd";
+        let entries = HashMap::from([
+            (
+                name.to_string(),
+                pck::Entry {
+                    name: name.to_string(),
+                    offset: 0,
+                    size: 0,
+                    compressed: 0,
+                },
+            ),
+            (
+                other.to_string(),
+                pck::Entry {
+                    name: other.to_string(),
+                    offset: 0,
+                    size: 0,
+                    compressed: 0,
+                },
+            ),
+        ]);
+        let by_basename = HashMap::from([(
+            "litmodel_1318.bmd".to_string(),
+            vec![name.to_string(), other.to_string()],
+        )]);
+        assert_eq!(
+            litmodel_entry_key(
+                "litmodels/world/1/litmodel_1318.bmd",
+                &entries,
+                &by_basename,
+            )
+            .unwrap(),
+            name
+        );
     }
 
     #[test]
