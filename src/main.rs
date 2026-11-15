@@ -52,7 +52,6 @@ mod fog_matrix;
 mod foliage_mips;
 mod fsr;
 mod fsr1_gpu;
-mod xess;
 #[allow(dead_code)]
 mod gfx_catalog;
 mod gfx_color_track;
@@ -161,6 +160,7 @@ mod windows_setup;
 mod world_models;
 mod world_models_gpu;
 mod world_objects;
+mod xess;
 struct Terrain {
     element: PathBuf,
     /// Cells per T2BK block edge (`world.trn2` header dword @20).

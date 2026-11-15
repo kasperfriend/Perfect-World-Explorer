@@ -1070,7 +1070,7 @@ impl NativeCommandRing {
                 "{tag}: ID3D12GraphicsCommandList::Close failed (HRESULT 0x{hr:08x})"
             ));
         }
-        queue.execute_command_lists(std::slice::from_ref(slot.list.as_list()));
+        queue.execute_command_lists(std::slice::from_ref(&slot.list.as_list()));
         self.fence_value += 1;
         slot.retired = self.fence_value;
         let _ = queue.signal(&self.fence, self.fence_value);
