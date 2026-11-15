@@ -21,9 +21,9 @@ fn install_recoverable_panic_location_hook() {
         std::panic::set_hook(Box::new(move |info| {
             if RECOVERABLE_MAP_OPERATION.load(Ordering::SeqCst) {
                 RECOVERABLE_PANIC_LOCATION.with(|location| {
-                    *location.borrow_mut() = info.location().map(|at| {
-                        format!("{}:{}:{}", at.file(), at.line(), at.column())
-                    });
+                    *location.borrow_mut() = info
+                        .location()
+                        .map(|at| format!("{}:{}:{}", at.file(), at.line(), at.column()));
                 });
             }
             previous(info);
