@@ -265,6 +265,10 @@ pub struct FrameGeneration {
     mv_pass: FsrMotionVectorPass,
     prev_view_proj: Option<Mat4>,
     frame_index: u64,
+    /// `true` while the UI surface is parked in the compute/read state FFX
+    /// expects during `Present`; the next `prepare` moves it back to
+    /// `RENDER_TARGET` before wgpu draws the UI again.
+    ui_needs_rt_restore: bool,
 }
 
 impl Drop for FrameGeneration {
@@ -350,10 +354,11 @@ impl FrameGeneration {
         };
         let rc = unsafe { (loader.query)(std::ptr::null_mut(), &mut probe.header) };
         let mut chosen_version: Option<u64> = None;
+        let mut fg_ids: Vec<u64> = Vec::new();
         if rc == super::imp::FFX_API_RETURN_OK && count > 0 {
-            let mut ids = vec![0u64; (count as usize).min(1024)];
-            count = count.min(1024);
-            count = 0;
+            let capacity = (count as usize).min(1024);
+            let mut ids = vec![0u64; capacity];
+            count = capacity as u64;
             let mut probe = FfxQueryDescGetVersions {
                 header: FfxApiHeader::new(super::imp::FFX_API_QUERY_DESC_TYPE_GET_VERSIONS),
                 create_desc_type: FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION,
@@ -364,11 +369,16 @@ impl FrameGeneration {
             };
             let rc = unsafe { (loader.query)(std::ptr::null_mut(), &mut probe.header) };
             if rc == super::imp::FFX_API_RETURN_OK {
-                ids.truncate(count as usize);
+                ids.truncate((count as usize).min(ids.len()));
+                ids.retain(|&id| id != 0);
                 chosen_version = choose_version_for_major(&ids, 0);
+                fg_ids = ids;
                 eprintln!(
                     "[FSR FG] frame generation providers {:?}, selected 0x{:x}",
-                    ids.iter().map(|i| format!("0x{i:x}")).collect::<Vec<_>>(),
+                    fg_ids
+                        .iter()
+                        .map(|i| format!("0x{i:x}"))
+                        .collect::<Vec<_>>(),
                     chosen_version.unwrap_or(0)
                 );
             }
@@ -467,42 +477,87 @@ impl FrameGeneration {
             ));
         }
 
-        // --- Create the frame generation context itself.
-        let mut backend = FfxCreateBackendDX12Desc {
-            header: FfxApiHeader::new(super::imp::FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12),
-            device: device_ptr,
-        };
-        let mut fg_version = FfxCreateContextDescFrameGenerationVersion {
-            header: FfxApiHeader::new(FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION),
-            version: FFX_FRAMEGENERATION_VERSION,
-        };
-        let mut override_version = FfxOverrideVersion {
-            header: FfxApiHeader::new(super::imp::FFX_API_DESC_TYPE_OVERRIDE_VERSION),
-            version_id: chosen_version.unwrap_or(0),
-        };
-        let mut fg_desc = FfxCreateContextDescFrameGeneration {
-            header: FfxApiHeader::new(FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION),
-            flags: FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED,
-            display_size: FfxApiDimensions2D { width, height },
-            max_render_size: FfxApiDimensions2D { width, height },
-            back_buffer_format: ffx_backbuffer_format,
-        };
-        fg_desc.header.p_next = &mut backend.header as *mut FfxApiHeader;
-        if chosen_version.is_some() {
-            override_version.header.p_next = &mut fg_version.header as *mut FfxApiHeader;
-            fg_desc.header.p_next = &mut override_version.header as *mut FfxApiHeader;
-        } else {
-            fg_desc.header.p_next = &mut fg_version.header as *mut FfxApiHeader;
+        // --- Create the frame generation context itself. The SDK 2.x
+        // providers require a ffxCreateContextDescFrameGenerationVersion in
+        // the chain, and the DX12 backend descriptor must stay reachable
+        // from it; retry every advertised FG provider newest-first before
+        // giving up.
+        let mut override_ids: Vec<u64> = Vec::new();
+        if let Some(id) = chosen_version {
+            override_ids.push(id);
         }
-        let mut fg_context: *mut c_void = std::ptr::null_mut();
-        let rc = unsafe {
-            (loader.create_context)(
-                &mut fg_context,
-                &mut fg_desc.header as *mut FfxApiHeader,
-                std::ptr::null(),
-            )
+        for id in fg_ids.iter().copied() {
+            if Some(id) != chosen_version {
+                override_ids.push(id);
+            }
+        }
+        let candidates: Vec<Option<u64>> = if override_ids.is_empty() {
+            vec![None]
+        } else {
+            override_ids.into_iter().map(Some).collect()
         };
-        if rc != super::imp::FFX_API_RETURN_OK {
+        let mut fg_context: *mut c_void = std::ptr::null_mut();
+        let mut last_rc = super::imp::FFX_API_RETURN_OK;
+        let mut fg_created = false;
+        for candidate in &candidates {
+            let mut backend = FfxCreateBackendDX12Desc {
+                header: FfxApiHeader::new(
+                    super::imp::FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12,
+                ),
+                device: device_ptr,
+            };
+            backend.header.p_next = std::ptr::null_mut();
+            let mut fg_version = FfxCreateContextDescFrameGenerationVersion {
+                header: FfxApiHeader::new(FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION),
+                version: FFX_FRAMEGENERATION_VERSION,
+            };
+            fg_version.header.p_next = &mut backend.header as *mut FfxApiHeader;
+            let mut override_version = candidate.map(|id| {
+                let mut ov = FfxOverrideVersion {
+                    header: FfxApiHeader::new(super::imp::FFX_API_DESC_TYPE_OVERRIDE_VERSION),
+                    version_id: id,
+                };
+                ov.header.p_next = &mut fg_version.header as *mut FfxApiHeader;
+                ov
+            });
+            let mut fg_desc = FfxCreateContextDescFrameGeneration {
+                header: FfxApiHeader::new(FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION),
+                flags: FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED,
+                display_size: FfxApiDimensions2D { width, height },
+                max_render_size: FfxApiDimensions2D { width, height },
+                back_buffer_format: ffx_backbuffer_format,
+            };
+            fg_desc.header.p_next = match override_version.as_mut() {
+                Some(ov) => &mut ov.header as *mut FfxApiHeader,
+                None => &mut fg_version.header as *mut FfxApiHeader,
+            };
+            let rc = unsafe {
+                (loader.create_context)(
+                    &mut fg_context,
+                    &mut fg_desc.header as *mut FfxApiHeader,
+                    std::ptr::null(),
+                )
+            };
+            if rc == super::imp::FFX_API_RETURN_OK && !fg_context.is_null() {
+                eprintln!(
+                    "[FSR FG] frame generation context created{}",
+                    candidate
+                        .map(|id| format!(" with override 0x{id:x}"))
+                        .unwrap_or_default()
+                );
+                fg_created = true;
+                break;
+            }
+            eprintln!(
+                "[FSR FG] ffxCreateContext with override {}failed (0x{rc:x}); trying the next provider",
+                candidate
+                    .map(|id| format!("0x{id:x} "))
+                    .unwrap_or_default()
+            );
+            last_rc = rc;
+            fg_context = std::ptr::null_mut();
+        }
+        if !fg_created {
             // Unwind the swapchain context we created before returning.
             let mut sc_ctx = swapchain_context;
             unsafe {
@@ -510,7 +565,7 @@ impl FrameGeneration {
                 (*(proxy as *mut IDXGISwapChain4)).Release();
             }
             return Err(format!(
-                "creating the frame generation context failed (0x{rc:x})"
+                "creating the frame generation context failed (0x{last_rc:x})"
             ));
         }
 
@@ -582,6 +637,7 @@ impl FrameGeneration {
             mv_pass,
             prev_view_proj: None,
             frame_index: 0,
+            ui_needs_rt_restore: false,
         })
     }
 
@@ -605,6 +661,7 @@ impl FrameGeneration {
             size,
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            super::imp::D3D12_STATE_COMMON,
         )
     }
 
@@ -626,6 +683,7 @@ impl FrameGeneration {
             size,
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            super::imp::D3D12_STATE_COMMON,
         )
     }
 
@@ -643,6 +701,7 @@ impl FrameGeneration {
             render_extent,
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             wgpu::TextureUsages::RENDER_ATTACHMENT,
+            super::imp::D3D12_STATE_COMMON,
         )
     }
 
@@ -660,6 +719,7 @@ impl FrameGeneration {
             render_extent,
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            super::imp::D3D12_STATE_COMMON,
         )
     }
 
@@ -822,19 +882,26 @@ impl FrameGeneration {
                 D3D12_RESOURCE_BARRIER_FLAG_NONE,
             )
         };
-        let barriers = [
-            barrier(
-                &self.depth.resource,
-                D3D12_STATE_RENDER_TARGET,
+        let mut barriers = Vec::with_capacity(3);
+        if self.ui_needs_rt_restore {
+            barriers.push(barrier(
+                &self.ui.resource,
                 D3D12_STATE_PIXEL_COMPUTE_READ,
-            ),
-            barrier(
-                &self.mv.resource,
                 D3D12_STATE_RENDER_TARGET,
-                D3D12_STATE_PIXEL_COMPUTE_READ,
-            ),
-        ];
+            ));
+        }
+        barriers.push(barrier(
+            &self.depth.resource,
+            D3D12_STATE_RENDER_TARGET,
+            D3D12_STATE_PIXEL_COMPUTE_READ,
+        ));
+        barriers.push(barrier(
+            &self.mv.resource,
+            D3D12_STATE_RENDER_TARGET,
+            D3D12_STATE_PIXEL_COMPUTE_READ,
+        ));
         self.list.resource_barrier(&barriers);
+        self.ui_needs_rt_restore = false;
         let mut prepare = FfxDispatchDescFrameGenerationPrepareV2 {
             header: FfxApiHeader::new(FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2),
             frame_id: self.frame_index,
@@ -950,7 +1017,7 @@ impl FrameGeneration {
                 D3D12_RESOURCE_BARRIER_FLAG_NONE,
             )
         };
-        let barriers = [
+        let mut barriers = vec![
             barrier(
                 &self.compose.resource,
                 D3D12_STATE_RENDER_TARGET,
@@ -958,6 +1025,13 @@ impl FrameGeneration {
             ),
             barrier(&backbuffer, D3D12_STATE_PRESENT, D3D12_STATE_COPY_DEST),
         ];
+        if ui_visible {
+            barriers.push(barrier(
+                &self.ui.resource,
+                D3D12_STATE_RENDER_TARGET,
+                D3D12_STATE_PIXEL_COMPUTE_READ,
+            ));
+        }
         self.list.resource_barrier(&barriers);
         // The d3d12 crate has no safe `CopyResource` wrapper, so call the
         // COM method on the underlying raw interface directly.
@@ -981,6 +1055,11 @@ impl FrameGeneration {
             ));
         }
         self.queue.execute_command_lists(&[self.list.as_list()]);
+        if ui_visible {
+            // FFX reads the UI surface during Present; it stays parked in
+            // PIXEL_COMPUTE_READ until the next prepare restores it.
+            self.ui_needs_rt_restore = true;
+        }
 
         // --- Register the UI (or an empty UI resource for frames without it).
         let ui_resource = if ui_visible {

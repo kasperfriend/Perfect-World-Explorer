@@ -18,6 +18,10 @@ pub(crate) const FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTEROFFSET: u64 = 0x000100
 pub(crate) const FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12: u64 = 0x00000002;
 pub(crate) const FFX_API_QUERY_DESC_TYPE_GET_VERSIONS: u64 = 4;
 pub(crate) const FFX_API_DESC_TYPE_OVERRIDE_VERSION: u64 = 5;
+pub(crate) const FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG: u64 = 7;
+pub(crate) const FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_ERRORS: u32 = 0x1;
+pub(crate) const FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_WARNINGS: u32 = 0x2;
+pub(crate) const FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION: u64 = 0x0001000b;
 pub(crate) const FFX_API_RESOURCE_STATE_UNORDERED_ACCESS: u32 = 1 << 1;
 pub(crate) const FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ: u32 = (1 << 2) | (1 << 3);
 pub(crate) const FFX_API_RESOURCE_USAGE_READ_ONLY: u32 = 0;
@@ -155,6 +159,27 @@ pub(crate) struct FfxCreateBackendDX12Desc {
 pub(crate) struct FfxOverrideVersion {
     pub(crate) header: FfxApiHeader,
     pub(crate) version_id: u64,
+}
+
+/// Required by every SDK 2.x upscaler provider ("As of SDK 2.1 it is
+/// necessary to create and fill in a ffxCreateContextDescUpscaleVersion ...
+/// and link this in the header.pNext field of ffxCreateContextDescUpscale").
+/// Without it ffxCreateContext refuses to create the context.
+#[repr(C)]
+pub(crate) struct FfxCreateContextDescUpscaleVersion {
+    pub(crate) header: FfxApiHeader,
+    pub(crate) version: u32,
+}
+
+/// Registers the application-wide FFX diagnostic message callback. The
+/// loader ignores effect_id for this descriptor type (the callback is
+/// process-global), so a single call covers every effect.
+#[repr(C)]
+pub(crate) struct FfxConfigureDescGlobalDebug {
+    pub(crate) header: FfxApiHeader,
+    pub(crate) effect_id: u64,
+    pub(crate) fp_message: *mut c_void,
+    pub(crate) debug_level: u32,
 }
 
 #[repr(C)]
@@ -321,7 +346,28 @@ impl FfxLoader {
                 })
             })();
             match loaded {
-                Ok(loader) => return Ok(loader),
+                Ok(mut loader) => {
+                    // The SDK only reports creation/provider problems through
+                    // this callback; without it failures surface as bare
+                    // return codes with no explanation.
+                    let mut global_debug = FfxConfigureDescGlobalDebug {
+                        header: FfxApiHeader::new(FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG),
+                        effect_id: 0,
+                        fp_message: fsr_message_callback as usize as *mut c_void,
+                        debug_level: FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_ERRORS
+                            | FFX_API_CONFIGURE_GLOBALDEBUG_LEVEL_WARNINGS,
+                    };
+                    let rc = unsafe {
+                        (loader.configure)(
+                            std::ptr::null_mut(),
+                            &global_debug.header as *const FfxApiHeader,
+                        )
+                    };
+                    if rc != FFX_API_RETURN_OK {
+                        eprintln!("[FSR] installing the FFX debug callback failed (0x{rc:x})");
+                    }
+                    return Ok(loader);
+                }
                 Err(error) => {
                     unsafe { winapi::um::libloaderapi::FreeLibrary(handle) };
                     errors.push(format!("{}: {error}", candidate.display()));
@@ -381,6 +427,7 @@ impl NativeTexture2D {
         size: (u32, u32),
         resource_flags: d3d12_ty::D3D12_RESOURCE_FLAGS,
         wgpu_usage: wgpu::TextureUsages,
+        initial_state: u32,
     ) -> Result<NativeTexture2D, String> {
         use winapi::shared::dxgitype::DXGI_SAMPLE_DESC;
         use winapi::Interface;
@@ -411,7 +458,7 @@ impl NativeTexture2D {
             &heap,
             d3d12_ty::D3D12_HEAP_FLAG_NONE,
             &desc,
-            d3d12_ty::D3D12_RESOURCE_STATE_COMMON,
+            initial_state,
             std::ptr::null(),
             &d3d12_ty::ID3D12Resource::uuidof(),
             &mut resource_ptr as *mut *mut d3d12_ty::ID3D12Resource as *mut *mut c_void,
@@ -618,6 +665,7 @@ impl FsrNatives {
             render_extent,
             d3d12_ty::D3D12_RESOURCE_FLAG_NONE,
             wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            D3D12_STATE_COMMON,
         )?;
         let depth = NativeTexture2D::create(
             device,
@@ -628,6 +676,7 @@ impl FsrNatives {
             render_extent,
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             wgpu::TextureUsages::RENDER_ATTACHMENT,
+            D3D12_STATE_COMMON,
         )?;
         let mv = NativeTexture2D::create(
             device,
@@ -638,6 +687,7 @@ impl FsrNatives {
             render_extent,
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            D3D12_STATE_COMMON,
         )?;
         let output = NativeTexture2D::create(
             device,
@@ -648,6 +698,7 @@ impl FsrNatives {
             display_extent,
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            D3D12_STATE_PIXEL_COMPUTE_READ,
         )?;
         Ok(FsrNatives {
             color,
@@ -724,10 +775,14 @@ impl FsrUpscaler {
         let mut provider_note = String::new();
         let rc = unsafe { (loader.query)(std::ptr::null_mut(), &mut probe.header) };
         let mut chosen_version: Option<u64> = None;
+        // Every advertised provider id, kept so context creation can fall
+        // back down the list (e.g. an advertised FSR 4.1.2 that refuses to
+        // create on this GPU) instead of giving up to bilinear upscaling.
+        let mut enumerated_ids: Vec<u64> = Vec::new();
         if rc == FFX_API_RETURN_OK && count > 0 {
-            let mut ids = vec![0u64; (count as usize).min(1024)];
-            count = count.min(1024);
-            count = 0;
+            let capacity = (count as usize).min(1024);
+            let mut ids = vec![0u64; capacity];
+            count = capacity as u64;
             let mut probe = FfxQueryDescGetVersions {
                 header: FfxApiHeader::new(FFX_API_QUERY_DESC_TYPE_GET_VERSIONS),
                 create_desc_type: FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE,
@@ -738,7 +793,9 @@ impl FsrUpscaler {
             };
             let rc = unsafe { (loader.query)(std::ptr::null_mut(), &mut probe.header) };
             if rc == FFX_API_RETURN_OK {
-                ids.truncate(count as usize);
+                ids.truncate((count as usize).min(ids.len()));
+                ids.retain(|&id| id != 0);
+                enumerated_ids = ids.clone();
                 chosen_version = choose_version_for_major(&ids, fsr_version_major);
                 provider_note = format!(
                     "providers {:?}, selected 0x{:x}",
@@ -778,40 +835,92 @@ impl FsrUpscaler {
             ));
         }
 
-        let mut backend = FfxCreateBackendDX12Desc {
-            header: FfxApiHeader::new(FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12),
-            device: device_ptr,
-        };
-        let mut override_version = FfxOverrideVersion {
-            header: FfxApiHeader::new(FFX_API_DESC_TYPE_OVERRIDE_VERSION),
-            version_id: chosen_version.unwrap_or(0),
-        };
-        let mut upscale = FfxCreateContextDescUpscale {
-            header: FfxApiHeader::new(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE),
-            flags: FFX_UPSCALE_ENABLE_DEPTH_INVERTED | FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE,
-            max_render_size: FfxApiDimensions2D {
-                width: render_extent.0,
-                height: render_extent.1,
-            },
-            max_upscale_size: FfxApiDimensions2D {
-                width: display_extent.0,
-                height: display_extent.1,
-            },
-            fp_message: fsr_message_callback as usize as *mut c_void,
-        };
-        backend.header.p_next = std::ptr::null_mut();
-        if chosen_version.is_some() {
-            override_version.header.p_next = &mut backend.header as *mut FfxApiHeader;
-            upscale.header.p_next = &mut override_version.header as *mut FfxApiHeader;
+        // Try the selected provider first, then every other advertised
+        // provider newest-first, and finally the loader's own default choice
+        // when the enumeration came back empty. SDK 2.x providers require a
+        // ffxCreateContextDescUpscaleVersion in the chain; every advertised
+        // id is trusted to be create-able, but hardware the SDK under-filters
+        // still reaches us here.
+        let mut override_ids: Vec<u64> = Vec::new();
+        if let Some(id) = chosen_version {
+            override_ids.push(id);
+        }
+        for id in enumerated_ids.iter().copied() {
+            if Some(id) != chosen_version {
+                override_ids.push(id);
+            }
+        }
+        let candidates: Vec<Option<u64>> = if override_ids.is_empty() {
+            vec![None]
         } else {
-            upscale.header.p_next = &mut backend.header as *mut FfxApiHeader;
-        }
+            override_ids.into_iter().map(Some).collect()
+        };
         let mut context: *mut c_void = std::ptr::null_mut();
-        let rc =
-            unsafe { (loader.create_context)(&mut context, &mut upscale.header, std::ptr::null()) };
-        if rc != FFX_API_RETURN_OK || context.is_null() {
-            return Err(format!("ffxCreateContext failed (0x{rc:x}); is amd_fidelityfx_upscaler_dx12.dll next to the loader?"));
+        let mut last_rc: FfxReturnCode = FFX_API_RETURN_OK;
+        let mut created_override: Option<u64> = None;
+        for candidate in &candidates {
+            let mut backend = FfxCreateBackendDX12Desc {
+                header: FfxApiHeader::new(FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12),
+                device: device_ptr,
+            };
+            backend.header.p_next = std::ptr::null_mut();
+            let mut upscale_version = FfxCreateContextDescUpscaleVersion {
+                header: FfxApiHeader::new(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION),
+                version: FFX_UPSCALER_VERSION,
+            };
+            upscale_version.header.p_next = &mut backend.header as *mut FfxApiHeader;
+            let mut override_version = candidate.map(|id| {
+                let mut ov = FfxOverrideVersion {
+                    header: FfxApiHeader::new(FFX_API_DESC_TYPE_OVERRIDE_VERSION),
+                    version_id: id,
+                };
+                ov.header.p_next = &mut upscale_version.header as *mut FfxApiHeader;
+                ov
+            });
+            let mut upscale = FfxCreateContextDescUpscale {
+                header: FfxApiHeader::new(FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE),
+                flags: FFX_UPSCALE_ENABLE_DEPTH_INVERTED | FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE,
+                max_render_size: FfxApiDimensions2D {
+                    width: render_extent.0,
+                    height: render_extent.1,
+                },
+                max_upscale_size: FfxApiDimensions2D {
+                    width: display_extent.0,
+                    height: display_extent.1,
+                },
+                fp_message: fsr_message_callback as usize as *mut c_void,
+            };
+            upscale.header.p_next = match override_version.as_mut() {
+                Some(ov) => &mut ov.header as *mut FfxApiHeader,
+                None => &mut upscale_version.header as *mut FfxApiHeader,
+            };
+            let rc = unsafe {
+                (loader.create_context)(&mut context, &mut upscale.header, std::ptr::null())
+            };
+            if rc == FFX_API_RETURN_OK && !context.is_null() {
+                created_override = *candidate;
+                break;
+            }
+            eprintln!(
+                "[FSR] ffxCreateContext with override {}failed (0x{rc:x}); trying the next provider",
+                candidate
+                    .map(|id| format!("0x{id:x} "))
+                    .unwrap_or_default()
+            );
+            last_rc = rc;
+            context = std::ptr::null_mut();
         }
+        if created_override.is_none() && context.is_null() {
+            return Err(format!(
+                "ffxCreateContext failed (0x{last_rc:x}); is amd_fidelityfx_upscaler_dx12.dll next to the loader?"
+            ));
+        }
+        chosen_version = created_override;
+        provider_note = if let Some(id) = created_override {
+            format!("{provider_note}; created with override 0x{id:x}")
+        } else {
+            format!("{provider_note}; created with the loader's default provider")
+        };
         eprintln!(
             "[FSR] upscaler context 0x{:x} created ({provider_note})",
             context as usize
@@ -1063,7 +1172,7 @@ impl FsrUpscaler {
             ),
             barrier(
                 &self.natives.depth.resource,
-                D3D12_STATE_COPY_DEST,
+                D3D12_STATE_RENDER_TARGET,
                 D3D12_STATE_PIXEL_COMPUTE_READ,
             ),
             barrier(
@@ -1073,7 +1182,7 @@ impl FsrUpscaler {
             ),
             barrier(
                 &self.natives.output.resource,
-                D3D12_STATE_COMMON,
+                D3D12_STATE_PIXEL_COMPUTE_READ,
                 D3D12_STATE_UNORDERED_ACCESS,
             ),
         ];
@@ -1151,7 +1260,7 @@ impl FsrUpscaler {
             barrier(
                 &self.natives.depth.resource,
                 D3D12_STATE_PIXEL_COMPUTE_READ,
-                D3D12_STATE_COPY_DEST,
+                D3D12_STATE_RENDER_TARGET,
             ),
             barrier(
                 &self.natives.mv.resource,
@@ -1161,7 +1270,7 @@ impl FsrUpscaler {
             barrier(
                 &self.natives.output.resource,
                 D3D12_STATE_UNORDERED_ACCESS,
-                D3D12_STATE_COMMON,
+                D3D12_STATE_PIXEL_COMPUTE_READ,
             ),
         ];
         self.list.resource_barrier(&restore);
@@ -1235,12 +1344,13 @@ pub(crate) fn choose_version_for_major(ids: &[u64], wanted_major: u32) -> Option
         return None;
     }
     let major = |id: u64| ((id >> 22) & 0x3ff) as u32;
+    let real = |id: u64| id != 0;
     if wanted_major == 0 {
-        return ids.iter().copied().max();
+        return ids.iter().copied().filter(|&id| real(id)).max();
     }
     ids.iter()
         .copied()
-        .filter(|id| major(*id) == wanted_major)
+        .filter(|&id| real(id) && major(id) == wanted_major)
         .max()
         .or_else(|| {
             eprintln!(
@@ -1248,7 +1358,7 @@ pub(crate) fn choose_version_for_major(ids: &[u64], wanted_major: u32) -> Option
                 wanted_major,
                 ids.iter().map(|i| format!("0x{i:x}")).collect::<Vec<_>>()
             );
-            ids.iter().copied().max()
+            ids.iter().copied().filter(|&id| real(id)).max()
         })
 }
 
