@@ -1323,12 +1323,24 @@ fn world_loading_summary(
     let missing = if unavailable == 0 {
         String::new()
     } else if more == 0 {
-        format!("; missing BMDs: {examples}")
+        format!("; unavailable BMDs: {examples}")
     } else {
-        format!("; missing BMDs: {examples} (+{more} more; see log)")
+        format!("; unavailable BMDs: {examples} (+{more} more; see log)")
+    };
+    let causes = stats
+        .unavailable_examples
+        .iter()
+        .take(2)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let cause_detail = if causes.is_empty() {
+        String::new()
+    } else {
+        format!("; load cause: {causes}")
     };
     format!(
-        "Loaded {processed} placements; {unavailable} model assets unavailable, {skipped} meshes use fallback texture, {} unresolved texture references; {} geometry chunks, {} shared atlases ({} MiB); peak decoded-texture residency {} MiB of {} MiB budget, {} evictions, {} dedup alias hits{missing}",
+        "Loaded {processed} placements; {unavailable} model assets unavailable, {skipped} meshes use fallback texture, {} unresolved texture references; {} geometry chunks, {} shared atlases ({} MiB); peak decoded-texture residency {} MiB of {} MiB budget, {} evictions, {} dedup alias hits{missing}{cause_detail}",
         stats.unresolved_rows,
         stats.pages,
         stats.atlas_pages,
@@ -1393,6 +1405,8 @@ struct Renderer {
     /// frustum before building contiguous page draws.
     world_order: Vec<(usize, usize)>,
     world_cull_index: crate::world_objects::WorldCullIndex,
+    main_visible_order: Vec<usize>,
+    cull_stack: Vec<usize>,
     world_done: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -2121,6 +2135,8 @@ impl Renderer {
             world_pages: Vec::new(),
             world_order: Vec::new(),
             world_cull_index: crate::world_objects::WorldCullIndex::default(),
+            main_visible_order: Vec::new(),
+            cull_stack: Vec::new(),
             world_done: false,
             layout,
             sampler,
@@ -3247,9 +3263,14 @@ impl Renderer {
         };
         // Main and refraction use the same matrix and whole-world frustum.
         // Keep the exact ordered visibility result for the later water pass.
-        let main_visible_order = self.world_visible_order(matrix);
+        let world_frustum = crate::terrain_residency::Frustum::from_matrix(matrix);
+        self.world_cull_index.visible_order_indices_into(
+            |bounds| world_frustum.intersects(bounds),
+            &mut self.main_visible_order,
+            &mut self.cull_stack,
+        );
         let (main_world_cmds, main_world_sdr_cmds) =
-            self.world_commands_for_order(&main_visible_order, main_pass);
+            self.world_commands_for_order(&self.main_visible_order, main_pass);
         let normal = frame.uniform(
             matrix,
             [direction.x, direction.y, direction.z, daylight],
@@ -3510,7 +3531,7 @@ impl Renderer {
         let reflect_depth = needs_refraction.then(|| self.water.depth());
         let refraction = needs_refraction.then(|| self.water.refraction());
         let (refraction_world_cmds, refraction_world_sdr_cmds) = if needs_refraction {
-            self.world_commands_for_order(&main_visible_order, Pass::Refraction)
+            self.world_commands_for_order(&self.main_visible_order, Pass::Refraction)
         } else {
             (Vec::new(), Vec::new())
         };

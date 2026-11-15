@@ -114,13 +114,30 @@ impl WorldCullIndex {
     /// nodes prune whole groups; leaf bounds retain the prior per-mesh test.
     pub fn visible_order_indices(
         &self,
-        mut intersects: impl FnMut([f32; 6]) -> bool,
+        intersects: impl FnMut([f32; 6]) -> bool,
     ) -> Vec<usize> {
-        let mut visible = self.always_visible.clone();
+        let mut visible = Vec::with_capacity(self.always_visible.len());
+        let mut stack = Vec::new();
+        self.visible_order_indices_into(intersects, &mut visible, &mut stack);
+        visible
+    }
+
+    /// Reuse caller-owned scratch storage for per-frame frustum queries.
+    /// Both vectors retain capacity between views/frames, avoiding repeated
+    /// heap allocation while preserving the same ordered visibility result.
+    pub fn visible_order_indices_into(
+        &self,
+        mut intersects: impl FnMut([f32; 6]) -> bool,
+        visible: &mut Vec<usize>,
+        stack: &mut Vec<usize>,
+    ) {
+        visible.clear();
+        visible.extend_from_slice(&self.always_visible);
+        stack.clear();
         let Some(root) = self.root else {
-            return visible;
+            return;
         };
-        let mut stack = vec![root];
+        stack.push(root);
         while let Some(node_index) = stack.pop() {
             let node = self.nodes[node_index];
             if !intersects(node.bounds) {
@@ -138,7 +155,6 @@ impl WorldCullIndex {
             }
         }
         visible.sort_unstable();
-        visible
     }
 }
 
@@ -439,6 +455,9 @@ pub struct DoneStats {
     /// Distinct BMD assets that could not be opened or parsed. Placements using
     /// these assets do not produce geometry and must remain visible in the UI.
     pub unavailable_models: Vec<String>,
+    /// A few direct lookup/parse causes, so an all-empty world can be diagnosed
+    /// without relying on the process log.
+    pub unavailable_examples: Vec<String>,
     /// Pages emitted by this preload.
     pub pages: usize,
     pub atlas_pages: usize,
@@ -844,6 +863,7 @@ fn run(
             resolver: objects.resolver_stats(),
             unresolved_rows: objects.unresolved().len(),
             unavailable_models: objects.unavailable_models(),
+            unavailable_examples: objects.unavailable_examples().to_vec(),
             pages,
             atlas_pages,
             atlas_bytes,
@@ -1581,6 +1601,17 @@ mod page_tests {
         });
         assert_eq!(visible, vec![0, 1, 2, 3, 64, 65]);
         assert!(tests < 64, "spatial query made {tests} bounds tests");
+
+        let mut reused = Vec::with_capacity(128);
+        let mut stack = Vec::with_capacity(128);
+        index.visible_order_indices_into(|aabb| aabb[0] < 4., &mut reused, &mut stack);
+        assert_eq!(reused, visible);
+        let visible_capacity = reused.capacity();
+        let stack_capacity = stack.capacity();
+        index.visible_order_indices_into(|_| true, &mut reused, &mut stack);
+        assert_eq!(reused.len(), bounds.len());
+        assert_eq!(reused.capacity(), visible_capacity);
+        assert_eq!(stack.capacity(), stack_capacity);
     }
 
     #[test]

@@ -605,6 +605,7 @@ impl Channel {
                 | Self::EffectDecals
                 | Self::EffectProblems
                 | Self::SceneEffects
+                | Self::ModelLoads
                 | Self::ModelQueue
                 | Self::RenderEffects
                 | Self::RenderWater
@@ -2486,6 +2487,7 @@ mod tests {
             wired > 0 && wired < CHANNELS,
             "some channels have to be unwired for this test to mean anything"
         );
+        assert!(Channel::ModelLoads.wired());
         for preset in PRESETS.iter() {
             let mask = preset.mask();
             for channel in Channel::ALL {

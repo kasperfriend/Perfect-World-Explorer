@@ -241,6 +241,7 @@ pub struct Objects {
     /// Optional scenery dependencies absent or unusable in this client/map.
     /// Keep a negative cache so a missing placement is not retried every frame.
     unavailable_models: HashSet<String>,
+    unavailable_examples: Vec<String>,
     unresolved: Vec<UnresolvedTexture>,
     unresolved_seen: HashSet<String>,
 }
@@ -264,6 +265,34 @@ pub fn set_unbounded_textures(on: bool) {
 pub fn unbounded_textures() -> bool {
     UNBOUNDED_TEXTURES.load(std::sync::atomic::Ordering::Relaxed)
 }
+/// Canonical in-memory key for EC-BSD ornament paths. Different map exports
+/// use mixed slash styles and may include the archive's own path prefix; make
+/// them agree with the normalized PCK directory before attempting a lookup.
+fn litmodel_key(path: &str) -> String {
+    let path = normalize(path);
+    let relative = path
+        .strip_prefix("litmodels/world/")
+        .or_else(|| path.strip_prefix("world/"))
+        .unwrap_or(&path);
+    format!("litmodels/world/{relative}")
+}
+
+/// Try the canonical corpus path first, then alternate prefix layouts used by
+/// client packs. Cache identity remains canonical across all maps.
+fn litmodel_entry_candidates(path: &str) -> [String; 4] {
+    let canonical = litmodel_key(path);
+    let relative = canonical
+        .strip_prefix("litmodels/world/")
+        .unwrap_or(&canonical)
+        .to_string();
+    [
+        canonical,
+        format!("litmodels/{relative}"),
+        format!("world/{relative}"),
+        relative,
+    ]
+}
+
 fn open_optional_archive(path: &Path) -> (Option<File>, HashMap<String, pck::Entry>) {
     let mut file = match File::open(path) {
         Ok(file) => file,
@@ -280,7 +309,7 @@ fn open_optional_archive(path: &Path) -> (Option<File>, HashMap<String, pck::Ent
             Some(file),
             entries
                 .into_iter()
-                .map(|entry| (entry.name.to_lowercase(), entry))
+                .map(|entry| (normalize(&entry.name), entry))
                 .collect(),
         ),
         Err(error) => {
@@ -336,6 +365,7 @@ impl Objects {
             litentries,
             texentries,
             unavailable_models: HashSet::new(),
+            unavailable_examples: Vec::new(),
             unresolved: Vec::new(),
             unresolved_seen: HashSet::new(),
         })
@@ -362,7 +392,7 @@ impl Objects {
             let Some(ornament) = self.ornaments.get(i) else {
                 return Err(format!("invalid ornament index {i}"));
             };
-            active.insert(format!("litmodels/world/{}", ornament.path.to_lowercase()));
+            active.insert(litmodel_key(&ornament.path));
         }
         self.models.retain(|name, _| active.contains(name));
         self.cache.begin_batch();
@@ -370,15 +400,15 @@ impl Objects {
             let Some(ornament) = self.ornaments.get(i) else {
                 return Err(format!("invalid ornament index {i}"));
             };
-            let name = format!("litmodels/world/{}", ornament.path.to_lowercase());
+            let name = litmodel_key(&ornament.path);
             if self.unavailable_models.contains(&name) {
                 continue;
             }
             if !self.models.contains_key(&name) {
                 let loaded = (|| -> Result<bmd::Model, String> {
-                    let entry = self
-                        .litentries
-                        .get(&name)
+                    let entry = litmodel_entry_candidates(&name)
+                        .iter()
+                        .find_map(|candidate| self.litentries.get(candidate))
                         .ok_or_else(|| format!("missing model {name}"))?;
                     let file = self
                         .litfile
@@ -436,7 +466,17 @@ impl Objects {
     }
     fn skip_model(&mut self, name: &str, reason: &str) {
         if self.unavailable_models.insert(name.to_string()) {
+            crate::diag_keyed!(
+                ModelLoads,
+                name,
+                0,
+                "world BMD unavailable: {name}: {reason}"
+            );
             eprintln!("Skipping unavailable scenery model {name}: {reason}");
+            if self.unavailable_examples.len() < 3 {
+                self.unavailable_examples
+                    .push(format!("{name}: {reason}"));
+            }
         }
     }
     fn load_texture_reference(&mut self, raw: &str) -> Result<(), String> {
@@ -601,13 +641,15 @@ impl Objects {
         });
     }
     pub fn get(&self, idx: usize) -> Option<&bmd::Model> {
-        self.models.get(&format!(
-            "litmodels/world/{}",
-            self.ornaments.get(idx)?.path.to_lowercase()
-        ))
+        self.models
+            .get(&litmodel_key(&self.ornaments.get(idx)?.path))
     }
     pub fn unavailable_model_count(&self) -> usize {
         self.unavailable_models.len()
+    }
+    /// First failures with causes, retained for the whole-world status summary.
+    pub fn unavailable_examples(&self) -> &[String] {
+        &self.unavailable_examples
     }
     /// Paths of scenery models that failed archive lookup or model parsing,
     /// sorted for stable diagnostics and UI summaries.
@@ -657,6 +699,24 @@ mod tests {
         put(&mut bytes, 288, 0x20002);
         std::fs::write(path, bytes).unwrap();
     }
+    #[test]
+    fn map_litmodel_keys_normalize_separators_and_archive_prefixes() {
+        let canonical = "litmodels/world/1/litmodel_1318.bmd";
+        for path in [
+            "1/litmodel_1318.bmd",
+            r"1\litmodel_1318.bmd",
+            r"litmodels\world\1\litmodel_1318.bmd",
+            "//litmodels//world//1/litmodel_1318.bmd",
+        ] {
+            assert_eq!(litmodel_key(path), canonical);
+        }
+        let candidates = litmodel_entry_candidates("1/litmodel_1318.bmd");
+        assert_eq!(candidates[0], canonical);
+        assert_eq!(candidates[1], "litmodels/1/litmodel_1318.bmd");
+        assert_eq!(candidates[2], "world/1/litmodel_1318.bmd");
+        assert_eq!(candidates[3], "1/litmodel_1318.bmd");
+    }
+
     fn tex(fill: u8, side: usize) -> Texture {
         Texture {
             width: side,
@@ -693,6 +753,10 @@ mod tests {
         objects.load_ids(&[0]).unwrap();
         assert!(objects.get(0).is_none());
         assert_eq!(objects.unavailable_model_count(), 1);
+        assert_eq!(objects.unavailable_examples().len(), 1);
+        assert!(objects.unavailable_examples()[0].contains(
+            "missing model litmodels/world/1/litrmodel_1399.bmd"
+        ));
         // A later visible-frame batch doesn't turn the same absent optional
         // model back into a fatal error or repeat the archive lookup.
         objects.load_ids(&[0]).unwrap();

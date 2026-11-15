@@ -57,6 +57,17 @@ $checksumLines = @(
     [System.Text.Encoding]::ASCII
 )
 
+# Make package-size regressions visible in CI/release logs without uploading
+# an uncompressed diagnostic manifest. This quickly exposes accidentally
+# staged SDK runtimes or other large files before anyone downloads the artifact.
+$totalBytes = ($files | Measure-Object -Property Length -Sum).Sum
+Write-Host ("Portable payload: {0:N1} MiB across {1} files" -f ($totalBytes / 1MB), $files.Count)
+Write-Host 'Largest packaged files:'
+foreach ($file in ($files | Sort-Object Length -Descending | Select-Object -First 10)) {
+    $relative = [System.IO.Path]::GetRelativePath($packageRoot, $file.FullName).Replace('\', '/')
+    Write-Host ("  {0,10:N0} bytes  {1}" -f $file.Length, $relative)
+}
+
 if (-not [string]::IsNullOrWhiteSpace($ArchivePath)) {
     $archiveFullPath = [System.IO.Path]::GetFullPath($ArchivePath)
     $archiveDirectory = Split-Path -Parent $archiveFullPath
