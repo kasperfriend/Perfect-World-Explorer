@@ -3189,7 +3189,12 @@ impl Renderer {
         // submitted. Each distinct height gets its own mirror and clip plane.
         let mut visible = std::mem::take(&mut self.visible_water_batches);
         visible.clear();
-        visible.extend(self.water_batches.iter().filter(|b| b.visible(matrix)).cloned());
+        visible.extend(
+            self.water_batches
+                .iter()
+                .filter(|b| b.visible(matrix))
+                .cloned(),
+        );
         visible.sort_by(|a, b| {
             b.distance_squared(camera.pos)
                 .total_cmp(&a.distance_squared(camera.pos))
@@ -3351,7 +3356,7 @@ impl Renderer {
                         b: linear(fog[2]),
                         a: 1.,
                     }),
-                &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+                    &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
                 );
                 let model_view = self.water.refraction_raw();
                 self.draw_addons(
@@ -3404,7 +3409,7 @@ impl Renderer {
                     ViewRuns::Main,
                     None,
                     None,
-                &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+                    &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
                 );
                 if let Some(cloud) = &self.cloud {
                     cloud.draw(
@@ -3446,7 +3451,7 @@ impl Renderer {
                         camera,
                         Pass::Refraction,
                         false,
-                    &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+                        &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
                     );
                 }
                 self.draw_addons(
@@ -3522,7 +3527,7 @@ impl Renderer {
                 ViewRuns::Reflected,
                 None,
                 None,
-            &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
+                    &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
             );
            if let Some(cloud) = &self.cloud {
                 cloud.draw(
@@ -3561,7 +3566,7 @@ impl Renderer {
                 camera,
                 Pass::Reflection,
                 false,
-            &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
+                &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
             );
             self.draw_addons(
                 &mut e,
