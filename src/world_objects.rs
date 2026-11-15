@@ -1021,7 +1021,6 @@ impl GpuPage {
             pass.draw_indexed(start..end, 0, 0..1);
         }
     }
-    }
     /// Convenience wrapper for callers that hold the raw order (the atlas
     /// check): build the view's commands, then draw them.
     pub fn draw_ordered<'a>(
