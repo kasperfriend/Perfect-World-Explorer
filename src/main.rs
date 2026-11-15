@@ -1141,6 +1141,10 @@ fn export_height_png(
 }
 mod viewer;
 
+fn log_model_load(key: &str, line: &str) {
+    diagnostics::emit_keyed(diagnostics::Channel::ModelLoads, key, 0, line);
+}
+
 fn main() {
     #[cfg(windows)]
     std::panic::set_hook(Box::new(|info| {
@@ -1209,6 +1213,7 @@ fn main() {
         env!("CARGO_PKG_VERSION"),
         saved.logging_mask
     ));
+    objects::set_model_load_logger(log_model_load);
     objects::set_unbounded_textures(saved.all_to_vram);
     #[cfg(windows)]
     let loading = if world_handoff::is_handoff_child() {

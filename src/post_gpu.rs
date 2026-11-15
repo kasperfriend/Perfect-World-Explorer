@@ -585,7 +585,6 @@ impl PostGpu {
             pass.set_bind_group(0, group, &[]);
             pass.draw(0..3, 0..1);
         }
-        let before_warp = if apply_fog { fogged } else { scene };
         let before_warp_index = if apply_fog { 1 } else { 0 };
         // 0x40fd33: spacewarp consumes the quantized capture, before glow.
         if plan.warp {

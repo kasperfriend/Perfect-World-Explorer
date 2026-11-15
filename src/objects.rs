@@ -252,6 +252,16 @@ pub struct Objects {
 /// building.pck textures is ~445 MiB compressed on disk and far larger
 /// decoded, so the full world never fits under this budget by design.
 pub const DEFAULT_TEX_BUDGET_MIB: usize = 32;
+
+/// Optional host-provided logger for scenery BMD failures. `objects.rs` is also
+/// compiled directly into several standalone survey binaries, so it cannot
+/// depend on the main viewer's diagnostics macros.
+static MODEL_LOAD_LOGGER: std::sync::OnceLock<fn(&str, &str)> = std::sync::OnceLock::new();
+
+pub fn set_model_load_logger(logger: fn(&str, &str)) {
+    let _ = MODEL_LOAD_LOGGER.set(logger);
+}
+
 /// Process-wide "All to VRAM" switch. `Objects` instances read it when their
 /// cache evicts and when a new one is opened, so the whole-world preload and
 /// later streamed batches follow a live toggle without a restart.
@@ -507,12 +517,10 @@ impl Objects {
     }
     fn skip_model(&mut self, name: &str, reason: &str) {
         if self.unavailable_models.insert(name.to_string()) {
-            crate::diag_keyed!(
-                ModelLoads,
-                name,
-                0,
-                "world BMD unavailable: {name}: {reason}"
-            );
+            let line = format!("world BMD unavailable: {name}: {reason}");
+            if let Some(logger) = MODEL_LOAD_LOGGER.get() {
+                logger(name, &line);
+            }
             eprintln!("Skipping unavailable scenery model {name}: {reason}");
             if self.unavailable_examples.len() < 3 {
                 self.unavailable_examples
