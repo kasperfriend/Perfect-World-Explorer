@@ -4415,23 +4415,74 @@ pub fn run(
                         if let Some(c)=world_cancel.take(){c.store(true,std::sync::atomic::Ordering::Relaxed);}
                         world_rx=None;renderer.world_pages.clear();renderer.world_draw_cmds=Default::default();renderer.world_done=false;
                         if world_enabled {
-                            let (tx,rx)=std::sync::mpsc::sync_channel(1);let cancel=Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let (tx,rx)=std::sync::mpsc::sync_channel(8;let cancel=Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
                             std::thread::Builder::new().name("whole-world-objects".into()).spawn(move ||crate::world_objects::build(root,ornaments,tx,c)).expect("world preload thread");
                             world_rx=Some(rx);world_cancel=Some(cancel);world_status=String::from("Loading world objects...");
                         } else {world_status=String::from("Off");}
                     }
-                    if let Some(rx)=&world_rx {match rx.try_recv(){
-                        Ok(crate::world_objects::Message::Page(page))=>{
-                            let processed=page.processed;
-                            let uploaded=crate::world_objects::GpuPage::upload_world(&renderer.device,&renderer.queue,&renderer.layout,&renderer.sampler,&renderer.uniform,&renderer.reflected_uniform,&renderer.world_pages,page);
-                            renderer.world_pages.push(uploaded);world_status=format!("Loading: {processed}/{} objects, {} GPU chunks",whole_ornaments.len(),renderer.world_pages.len());
-                            eprintln!("{world_status}");
-                        },
-                        Ok(crate::world_objects::Message::Done{processed,skipped,stats})=>{renderer.world_draw_cmds=crate::world_objects::GpuPage::world_culled_commands(&renderer.world_pages);renderer.world_done=true;world_status=format!("Loaded {processed} objects; {skipped} meshes use fallback texture; {} geometry chunks, {} shared atlases ({} MiB); peak decoded-texture residency {} MiB of {} MiB budget, {} evictions, {} dedup alias hits",stats.pages,stats.atlas_pages,stats.atlas_bytes>>20,stats.residency.peak_resident_bytes>>20,stats.residency.budget_bytes>>20,stats.residency.evictions,stats.residency.alias_hits);eprintln!("{world_status}");},
-                        Ok(crate::world_objects::Message::Error(e))=>{world_status=format!("World load failed: {e}");eprintln!("{world_status}");},
-                        Err(_)=>{}
-                    }}
+                if let Some(rx) = &world_rx {
+                    let upload_start = std::time::Instant::now();
+                    let mut uploaded_this_frame = 0usize;
+                    while uploaded_this_frame < 8
+                        && (uploaded_this_frame == 0 || upload_start.elapsed().as_millis() < 12)
+                    {
+                        match rx.try_recv() {
+                            Ok(crate::world_objects::Message::Page(page)) => {
+                                let processed = page.processed;
+                                let uploaded = crate::world_objects::GpuPage::upload_world(
+                                    &renderer.device,
+                                    &renderer.queue,
+                                    &renderer.layout,
+                                    &renderer.sampler,
+                                    &renderer.uniform,
+                                    &renderer.reflected_uniform,
+                                    &renderer.world_pages,
+                                    page,
+                                );
+                                renderer.world_pages.push(uploaded);
+                                uploaded_this_frame += 1;
+                                world_status = format!(
+                                    "Loading: {processed}/{} objects, {} GPU chunks",
+                                    whole_ornaments.len(),
+                                    renderer.world_pages.len()
+                                );
+                                eprintln!("{world_status}");
+                            }
+                            Ok(crate::world_objects::Message::Done {
+                                processed,
+                                skipped,
+                                stats,
+                            }) => {
+                                renderer.world_draw_cmds =
+                                    crate::world_objects::GpuPage::world_culled_commands(
+                                        &renderer.world_pages,
+                                    );
+                                renderer.world_done = true;
+                                world_status = format!(
+                                    "Loaded {processed} objects; {skipped} meshes use fallback texture; {} geometry chunks, {} shared atlases ({} MiB); peak decoded-texture residency {} MiB of {} MiB across {} decoded textures ({} hits / {} misses, {} evictions)",
+                                    renderer.world_pages.len(),
+                                    stats.shared_atlases,
+                                    stats.shared_atlas_bytes / (1024 * 1024),
+                                    stats.resident_bytes / (1024 * 1024),
+                                    stats.resident_budget_bytes / (1024 * 1024),
+                                    stats.resident_textures,
+                                    stats.cache_hits,
+                                    stats.cache_misses,
+                                    stats.evictions
+                                );
+                                eprintln!("{world_status}");
+                                break;
+                            }
+                            Ok(crate::world_objects::Message::Error(e)) => {
+                                world_status = format!("World load failed: {e}");
+                                eprintln!("{world_status}");
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
                     camera.far = if world_enabled {settings.far.max(32000.)} else {settings.far};
                     // Time pass: the client's own clock, replayed on wall-clock
                     // time. `sky_time::advance` is 1/600 authored hour per real
