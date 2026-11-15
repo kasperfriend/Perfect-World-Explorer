@@ -95,6 +95,52 @@ pub fn fold_commands_culled(
     })
 }
 
+/// Build the opaque and SDR-curtain lists together. Each SDR range corresponds
+/// to the same placement slot as its opaque range, so one ordered walk and one
+/// bounds test can safely generate both pass lists.
+pub fn fold_commands_culled_pair(
+    pages: &[PageSpans],
+    sdr_pages: &[PageSpans],
+    order: &[(usize, usize)],
+    view: Pass,
+    mut intersects: impl FnMut([f32; 6]) -> bool,
+) -> (Vec<DrawCmd>, Vec<DrawCmd>) {
+    let mut opaque = Vec::with_capacity(order.len());
+    let mut sdr = Vec::with_capacity(order.len());
+    for &(page, range) in order {
+        let p = &pages[page];
+        let s = &sdr_pages[page];
+        if range == usize::MAX {
+            append_folded(&mut opaque, page, 0, p.count);
+            append_folded(&mut sdr, page, 0, s.count);
+            continue;
+        }
+        let placement = &p.placements[range];
+        if !allows_with_context(view, placement.visibility, RenderContext::default())
+            || placement.bounds.is_some_and(|bounds| !intersects(bounds))
+        {
+            continue;
+        }
+        append_folded(&mut opaque, page, placement.start, placement.end);
+        let curtain = &s.placements[range];
+        append_folded(&mut sdr, page, curtain.start, curtain.end);
+    }
+    (opaque, sdr)
+}
+
+fn append_folded(commands: &mut Vec<DrawCmd>, page: usize, start: u32, end: u32) {
+    if start == end {
+        return;
+    }
+    if let Some(last) = commands.last_mut() {
+        if last.page == page && last.end == start {
+            last.end = end;
+            return;
+        }
+    }
+    commands.push(DrawCmd { page, start, end });
+}
+
 fn fold_commands_visible(
     pages: &[PageSpans],
     order: &[(usize, usize)],
@@ -952,6 +998,28 @@ impl GpuPage {
             .collect();
         fold_commands_culled(&spans, order, view, intersects)
     }
+    pub fn draw_commands_pair_culled(
+        pages: &[Self],
+        order: &[(usize, usize)],
+        view: Pass,
+        intersects: impl FnMut([f32; 6]) -> bool,
+    ) -> (Vec<DrawCmd>, Vec<DrawCmd>) {
+        let opaque: Vec<PageSpans> = pages
+            .iter()
+            .map(|p| PageSpans {
+                count: p.count,
+                placements: &p.placements,
+            })
+            .collect();
+        let sdr: Vec<PageSpans> = pages
+            .iter()
+            .map(|p| PageSpans {
+                count: p.sdr_count,
+                placements: &p.sdr_placements,
+            })
+            .collect();
+        fold_commands_culled_pair(&opaque, &sdr, order, view, intersects)
+    }
     /// The command lists the viewer keeps for the whole-world pages: the main
     /// (unfiltered) list, then the reflection and refraction gates.
     pub fn world_commands(pages: &[Self]) -> [Vec<DrawCmd>; WORLD_VIEWS] {
@@ -1254,6 +1322,39 @@ mod page_tests {
             drawn(&commands),
             (0..30).chain(60..90).map(|i| (0, i)).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn paired_culling_reuses_one_bounds_test_for_both_world_passes() {
+        let mut first = span(0, 30, 0, true, true);
+        first.bounds = Some([-2., -1., -5., 2., 1., -3.]);
+        let mut hidden = span(30, 60, 1, true, true);
+        hidden.bounds = Some([100., -1., -5., 104., 1., -3.]);
+        let mut last = span(60, 90, 2, true, true);
+        last.bounds = Some([-1., -1., -8., 1., 1., -6.]);
+        let opaque_spans = [first, hidden, last];
+        let sdr_spans = [
+            span(0, 12, 0, true, true),
+            span(12, 12, 1, true, true),
+            span(12, 24, 2, true, true),
+        ];
+        let opaque_pages = pages(&[&opaque_spans], &[90]);
+        let sdr_pages = pages(&[&sdr_spans], &[24]);
+        let order = [(0, 0), (0, 1), (0, 2)];
+        let mut bounds_tests = 0;
+        let (opaque, sdr) = fold_commands_culled_pair(
+            &opaque_pages,
+            &sdr_pages,
+            &order,
+            Pass::Reflection,
+            |bounds| {
+                bounds_tests += 1;
+                bounds[0] < 10.
+            },
+        );
+        assert_eq!(bounds_tests, 3);
+        assert_eq!(opaque, vec![cmd(0, 0, 30), cmd(0, 60, 90)]);
+        assert_eq!(sdr, vec![cmd(0, 0, 24)]);
     }
 
     #[test]

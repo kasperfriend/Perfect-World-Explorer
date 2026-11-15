@@ -2660,19 +2660,11 @@ impl Renderer {
             return (Vec::new(), Vec::new());
         }
         let frustum = crate::terrain_residency::Frustum::from_matrix(matrix);
-        (
-            crate::world_objects::GpuPage::draw_commands_culled(
-                &self.world_pages,
-                &self.world_order,
-                view,
-                |bounds| frustum.intersects(bounds),
-            ),
-            crate::world_objects::GpuPage::sdr_draw_commands_culled(
-                &self.world_pages,
-                &self.world_order,
-                view,
-                |bounds| frustum.intersects(bounds),
-            ),
+        crate::world_objects::GpuPage::draw_commands_pair_culled(
+            &self.world_pages,
+            &self.world_order,
+            view,
+            |bounds| frustum.intersects(bounds),
         )
     }
 
