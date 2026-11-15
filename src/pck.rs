@@ -351,7 +351,7 @@ mod tests {
         bytes.extend_from_slice(&0x56a089b7u32.to_le_bytes());
         bytes.extend_from_slice(&compressed);
         let directory_at = bytes.len() as u32;
-        bytes.extend_from_slice(&276u32.to_le_bytes());
+        bytes.extend_from_slice(&(276u32 ^ MASK).to_le_bytes());
         bytes.extend_from_slice(&(276u32 ^ MASK ^ CHECK).to_le_bytes());
         bytes.extend_from_slice(&record);
         let end = bytes.len() as u32 + 280;
