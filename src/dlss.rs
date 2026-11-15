@@ -226,6 +226,26 @@ mod fg_stub {
             unimplemented!()
         }
 
+        /// The Windows path draws the UI into a copy of the composition.
+        pub fn ui_view(&self) -> wgpu::TextureView {
+            unimplemented!()
+        }
+
+        /// The Windows path hands NGX a UI-only surface (`DLSSG.UI`).
+        pub fn ui_only_view(&self) -> Option<wgpu::TextureView> {
+            None
+        }
+
+        /// The Windows path pre-fills the UI surface with the composition.
+        pub fn ui_surface_prefilled(&self) -> bool {
+            true
+        }
+
+        /// The Windows path separates the UI from the interpolated image.
+        pub fn ui_in_composition(&self) -> bool {
+            false
+        }
+
         pub fn size(&self) -> (u32, u32) {
             unimplemented!()
         }
@@ -261,12 +281,6 @@ mod fg_stub {
 
         pub fn frames_presented(&self) -> u64 {
             0
-        }
-
-        /// DLSS Frame Generation composites nothing itself: the UI has to be
-        /// part of the frame it interpolates, or provided as HUD-less colour.
-        pub fn ui_in_composition(&self) -> bool {
-            true
         }
     }
 }

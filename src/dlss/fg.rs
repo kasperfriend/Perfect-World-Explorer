@@ -25,11 +25,12 @@
 //!
 //! ## UI
 //!
-//! [`DlssFrameGeneration::ui_in_composition`] is `true`: the UI is part of the
-//! colour the viewer presents and DLSS-G interpolates it along with the scene.
-//! No HUD-less colour or UI texture is supplied, so there is no UI mode that can
-//! drop the HUD — the failure the XeSS-FG integration had to fix by tagging a
-//! HUD-less colour (see `docs/blockers.md`).
+//! The UI is separated from the interpolated image, using DLSS-G's User
+//! Interface Recomposition: the scene is handed over as `DLSSG.HUDLess`, the UI
+//! on its own as `DLSSG.UI`, and the presented frame (scene plus UI, which is
+//! what the viewer draws) as the backbuffer. NGX interpolates the HUD-less
+//! scene and recomposites the UI onto generated frames, so HUD pixels are never
+//! interpolated and cannot be dropped by a UI mode.
 //!
 //! ## Presenting
 //!
@@ -78,6 +79,12 @@ const P_DEPTH: &str = "DLSSG.Depth";
 const P_MVECS: &str = "DLSSG.MVecs";
 const P_OUTPUT_INTERPOLATED: &str = "DLSSG.OutputInterpolated";
 const P_BACKBUFFER_FRAME_ID: &str = "DLSSG.BackbufferFrameID";
+// User Interface Recomposition (UIR). `HUDLess` is the scene before any UI,
+// `UI` the UI on its own (premultiplied alpha, as egui renders it); the header
+// requires both for UIR: "For User Interface Recomposition (UIR) frame
+// generation, both HUDless and one of UI or UIAlpha must be provided."
+const P_HUDLESS: &str = "DLSSG.HUDLess";
+const P_UI: &str = "DLSSG.UI";
 // Per-frame scalars.
 const P_MULTI_FRAME_COUNT: &str = "DLSSG.MultiFrameCount";
 const P_MULTI_FRAME_INDEX: &str = "DLSSG.MultiFrameIndex";
@@ -127,8 +134,15 @@ pub struct DlssFrameGeneration {
     generated_frames: u32,
     display_extent: (u32, u32),
     render_extent: (u32, u32),
-    /// The full-resolution image the caller renders into.
+    /// The full-resolution image the caller renders into: the scene, without
+    /// any UI. Handed to NGX as `DLSSG.HUDLess`.
     compose: NativeTexture2D,
+    /// The presented frame: a copy of `compose` with the UI drawn on top.
+    present: NativeTexture2D,
+    /// The UI on its own, transparent where nothing was drawn. Handed to NGX
+    /// as `DLSSG.UI` so generated frames carry HUD pixels that were never
+    /// interpolated.
+    ui_only: NativeTexture2D,
     depth: NativeTexture2D,
     mv: NativeTexture2D,
     mv_pass: FsrMotionVectorPass,
@@ -301,6 +315,44 @@ impl DlssFrameGeneration {
             unsafe { (*swapchain).Release() };
             error
         })?;
+        let present = unsafe {
+            NativeTexture2D::create(
+                device,
+                &raw_device,
+                "dlss frame generation present",
+                surface_format,
+                compose_dxgi,
+                display_extent,
+                d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST,
+                D3D12_STATE_COMMON,
+                false,
+            )
+        }
+        .map_err(|error| {
+            unsafe { (*swapchain).Release() };
+            error
+        })?;
+        let ui_only = unsafe {
+            NativeTexture2D::create(
+                device,
+                &raw_device,
+                "dlss frame generation ui",
+                surface_format,
+                compose_dxgi,
+                display_extent,
+                d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                D3D12_STATE_COMMON,
+                false,
+            )
+        }
+        .map_err(|error| {
+            unsafe { (*swapchain).Release() };
+            error
+        })?;
         let depth = unsafe {
             NativeTexture2D::create(
                 device,
@@ -362,6 +414,8 @@ impl DlssFrameGeneration {
             display_extent,
             render_extent,
             compose,
+            present,
+            ui_only,
             depth,
             mv,
             mv_pass,
@@ -388,9 +442,29 @@ impl DlssFrameGeneration {
         self.compose.texture.create_view(&Default::default())
     }
 
-    /// DLSS-G interpolates the whole presented image, UI included.
-    pub fn ui_in_composition(&self) -> bool {
+    /// View of the surface the UI is drawn into: a copy of the composition, so
+    /// the UI pass `Load`s it and the result is the presented frame.
+    pub fn ui_view(&self) -> wgpu::TextureView {
+        self.present.texture.create_view(&Default::default())
+    }
+
+    /// View of the UI-only surface (transparent where nothing was drawn),
+    /// handed to NGX as `DLSSG.UI`.
+    pub fn ui_only_view(&self) -> Option<wgpu::TextureView> {
+        Some(self.ui_only.texture.create_view(&Default::default()))
+    }
+
+    /// `true` when the UI surface already contains the scene.
+    pub fn ui_surface_prefilled(&self) -> bool {
         true
+    }
+
+    /// `false`: the UI is not part of the image the interpolator sees. The
+    /// scene goes to NGX as `DLSSG.HUDLess`, the UI as `DLSSG.UI`, and the
+    /// runtime recomposes the UI onto generated frames (User Interface
+    /// Recomposition), so HUD pixels are never interpolated.
+    pub fn ui_in_composition(&self) -> bool {
+        false
     }
 
     /// Presented colour extent.
@@ -505,6 +579,18 @@ impl DlssFrameGeneration {
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
+        // The presented frame starts as an exact copy of the composition; the
+        // caller draws the UI into `ui_view()` on top of it (`Load`), and NGX
+        // gets the composition as `DLSSG.HUDLess` plus the UI as `DLSSG.UI`.
+        encoder.copy_texture_to_texture(
+            self.compose.texture.as_image_copy(),
+            self.present.texture.as_image_copy(),
+            wgpu::Extent3d {
+                width: self.display_extent.0,
+                height: self.display_extent.1,
+                depth_or_array_layers: 1,
+            },
+        );
         queue.submit(Some(encoder.finish()));
 
         // Matrices for the interpolation: everything here is *unjittered*, as
@@ -534,7 +620,7 @@ impl DlssFrameGeneration {
     /// (render-resolution pixels, y down); DLSS-G wants it in clip space, and
     /// the matrices handed to it must stay unjittered — the header is explicit
     /// about both.
-    pub fn finish(&mut self, _ui_visible: bool, jitter: (f32, f32)) -> Result<(), String> {
+    pub fn finish(&mut self, ui_visible: bool, jitter: (f32, f32)) -> Result<(), String> {
         let sc3 = self.swapchain as *mut IDXGISwapChain3;
         let index = unsafe { (*sc3).GetCurrentBackBufferIndex() };
         let count = self.buffer_count.max(2);
@@ -552,12 +638,19 @@ impl DlssFrameGeneration {
         };
 
         let list = &mut self.ring.slot_mut(slot_index).list;
-        let mut barriers = Vec::with_capacity(5 + generated.len());
+        let mut barriers = Vec::with_capacity(6 + generated.len());
         barriers.push(barrier(
-            &self.compose.resource,
+            &self.present.resource,
             D3D12_STATE_RENDER_TARGET,
             D3D12_STATE_COPY_SRC,
         ));
+        if ui_visible {
+            barriers.push(barrier(
+                &self.ui_only.resource,
+                D3D12_STATE_RENDER_TARGET,
+                D3D12_STATE_NON_PIXEL_READ,
+            ));
+        }
         barriers.push(barrier(
             &self.depth.resource,
             D3D12_STATE_RENDER_TARGET,
@@ -580,7 +673,7 @@ impl DlssFrameGeneration {
         // `CopyResource` has no safe wrapper in the d3d12 crate.
         unsafe {
             (*list.as_mut_ptr())
-                .CopyResource(real.as_mut_ptr(), self.compose.resource.as_mut_ptr());
+                .CopyResource(real.as_mut_ptr(), self.present.resource.as_mut_ptr());
         }
         // NGX reads the real backbuffer and writes the generated ones.
         let to_input = [barrier(
@@ -592,6 +685,15 @@ impl DlssFrameGeneration {
 
         self.params
             .set_d3d12_resource(P_BACKBUFFER, real.as_mut_ptr() as *mut c_void);
+        // User Interface Recomposition: the scene the interpolator works on,
+        // and the UI it recomposites afterwards. Handing over both keeps HUD
+        // pixels out of the interpolated image *and* on generated frames.
+        self.params
+            .set_d3d12_resource(P_HUDLESS, self.compose.resource.as_mut_ptr() as *mut c_void);
+        if ui_visible {
+            self.params
+                .set_d3d12_resource(P_UI, self.ui_only.resource.as_mut_ptr() as *mut c_void);
+        }
         self.params
             .set_d3d12_resource(P_DEPTH, self.depth.resource.as_mut_ptr() as *mut c_void);
         self.params
@@ -685,12 +787,19 @@ impl DlssFrameGeneration {
             }
         }
 
-        let mut restore = Vec::with_capacity(4 + generated.len());
+        let mut restore = Vec::with_capacity(5 + generated.len());
         restore.push(barrier(
-            &self.compose.resource,
+            &self.present.resource,
             D3D12_STATE_COPY_SRC,
             D3D12_STATE_RENDER_TARGET,
         ));
+        if ui_visible {
+            restore.push(barrier(
+                &self.ui_only.resource,
+                D3D12_STATE_NON_PIXEL_READ,
+                D3D12_STATE_RENDER_TARGET,
+            ));
+        }
         restore.push(barrier(
             &self.depth.resource,
             D3D12_STATE_NON_PIXEL_READ,

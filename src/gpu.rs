@@ -5173,7 +5173,7 @@ pub fn run(
                                 .or_else(|| {
                                     dlss_framegen
                                         .as_ref()
-                                        .map(|fg| (fg.compose_view(), None))
+                                        .map(|fg| (fg.compose_view(), Some(fg.ui_view())))
                                 });
                             // Frame generators can keep the UI in the
                             // composition instead of a separate surface the
@@ -5199,7 +5199,17 @@ pub fn run(
                             let ui_surface_prefilled = framegen
                                 .as_ref()
                                 .map(|fg| fg.ui_surface_prefilled())
+                                .or_else(|| {
+                                    dlss_framegen.as_ref().map(|fg| fg.ui_surface_prefilled())
+                                })
                                 .unwrap_or(false);
+                            // DLSS frame generation also wants the UI on its own
+                            // (`DLSSG.UI`), so the HUD pass runs twice: once over
+                            // the presented frame and once into a transparent
+                            // surface NGX recomposites onto generated frames.
+                            let ui_only_view = dlss_framegen
+                                .as_ref()
+                                .and_then(|fg| fg.ui_only_view());
                             let final_view: &wgpu::TextureView = match fg_views.as_ref() {
                                 Some((compose, _)) => compose,
                                 None => surface_view
@@ -5645,8 +5655,17 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         Some((_, None)) => (scene_view, wgpu::LoadOp::Load),
                                         None => (scene_view, wgpu::LoadOp::Load),
                                     };
-                                    let mut pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor{label:Some("settings menu"),color_attachments:&[Some(wgpu::RenderPassColorAttachment{view:egui_target,resolve_target:None,ops:wgpu::Operations{load:egui_load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None});
-                                    egui_renderer.render(&mut pass,&jobs,&screen);
+                                    {
+                                        let mut pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor{label:Some("settings menu"),color_attachments:&[Some(wgpu::RenderPassColorAttachment{view:egui_target,resolve_target:None,ops:wgpu::Operations{load:egui_load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None});
+                                        egui_renderer.render(&mut pass,&jobs,&screen);
+                                    }
+                                    if let Some(ui_only)=ui_only_view.as_ref(){
+                                        // The same draw calls into a transparent
+                                        // surface: that is `DLSSG.UI`, the copy
+                                        // NGX recomposites onto generated frames.
+                                        let mut ui_pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor{label:Some("frame generation ui only"),color_attachments:&[Some(wgpu::RenderPassColorAttachment{view:ui_only,resolve_target:None,ops:wgpu::Operations{load:wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None});
+                                        egui_renderer.render(&mut ui_pass,&jobs,&screen);
+                                    }
                                     ui_visible = true;
                                 }
                                 renderer.queue.submit(cmd.into_iter().chain(std::iter::once(encoder.finish())));
