@@ -1389,6 +1389,7 @@ struct Renderer {
     /// Frozen global placement order; each pass filters it against its own
     /// frustum before building contiguous page draws.
     world_order: Vec<(usize, usize)>,
+    world_cull_index: crate::world_objects::WorldCullIndex,
     world_done: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -2107,6 +2108,7 @@ impl Renderer {
             local_pages,
             world_pages: Vec::new(),
             world_order: Vec::new(),
+            world_cull_index: crate::world_objects::WorldCullIndex::default(),
             world_done: false,
             layout,
             sampler,
@@ -2660,11 +2662,14 @@ impl Renderer {
             return (Vec::new(), Vec::new());
         }
         let frustum = crate::terrain_residency::Frustum::from_matrix(matrix);
-        crate::world_objects::GpuPage::draw_commands_pair_culled(
+        let visible_order = self
+            .world_cull_index
+            .visible_order_indices(|bounds| frustum.intersects(bounds));
+        crate::world_objects::GpuPage::draw_commands_pair_visible(
             &self.world_pages,
             &self.world_order,
+            &visible_order,
             view,
-            |bounds| frustum.intersects(bounds),
         )
     }
 
@@ -4673,7 +4678,7 @@ pub fn run(
                     if want_world != world_enabled {
                         world_enabled=want_world;
                         if let Some(c)=world_cancel.take(){c.store(true,std::sync::atomic::Ordering::Relaxed);}
-                        world_rx=None;renderer.world_pages.clear();renderer.world_order.clear();renderer.world_done=false;
+                        world_rx=None;renderer.world_pages.clear();renderer.world_order.clear();renderer.world_cull_index=crate::world_objects::WorldCullIndex::default();renderer.world_done=false;
                         if world_enabled {
                             let (tx,rx)=std::sync::mpsc::sync_channel(1);let cancel=Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
@@ -4688,7 +4693,7 @@ pub fn run(
                             renderer.world_pages.push(uploaded);world_status=format!("Loading: {processed}/{} objects, {} GPU chunks",whole_ornaments.len(),renderer.world_pages.len());
                             eprintln!("{world_status}");
                         },
-                        Ok(crate::world_objects::Message::Done{processed,skipped,stats})=>{renderer.world_order=crate::world_objects::GpuPage::draw_order(&renderer.world_pages);renderer.world_done=true;world_status=world_loading_summary(processed,skipped,&stats);eprintln!("{world_status}");},
+                        Ok(crate::world_objects::Message::Done{processed,skipped,stats,world_order,cull_index})=>{renderer.world_order=world_order;renderer.world_cull_index=cull_index;renderer.world_done=true;world_status=world_loading_summary(processed,skipped,&stats);eprintln!("{world_status}");},
                         Ok(crate::world_objects::Message::Error(e))=>{world_status=format!("World load failed: {e}");eprintln!("{world_status}");},
                         Err(_)=>{}
                     }}
@@ -5389,6 +5394,8 @@ pub fn preview(
                     processed,
                     skipped,
                     stats,
+                    world_order,
+                    cull_index,
                 } => {
                     eprintln!(
                         "Preview world preload: {processed} objects, {skipped} fallback meshes, {} pages, peak residency {} MiB / {} MiB budget, {} evictions",
@@ -5397,8 +5404,8 @@ pub fn preview(
                         stats.residency.budget_bytes >> 20,
                         stats.residency.evictions
                     );
-                    renderer.world_order =
-                        crate::world_objects::GpuPage::draw_order(&renderer.world_pages);
+                    renderer.world_order = world_order;
+                    renderer.world_cull_index = cull_index;
                     renderer.world_done = true;
                     break;
                 }

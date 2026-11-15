@@ -60,6 +60,7 @@ fn main() {
                 processed,
                 skipped,
                 stats,
+                ..
             } => {
                 println!(
                     "residency: decodes={} alias_hits={} alias_bytes_saved={} evictions={} evicted_bytes={} peak_resident_bytes={} resident_bytes={} pinned_over_budget={} budget_bytes={}",

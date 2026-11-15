@@ -66,6 +66,123 @@ pub struct PageSpans<'a> {
     pub placements: &'a [PlacementRange],
 }
 
+#[derive(Default)]
+pub struct WorldCullIndex {
+    nodes: Vec<CullNode>,
+    items: Vec<SpatialItem>,
+    always_visible: Vec<usize>,
+    root: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct CullNode {
+    bounds: [f32; 6],
+    left: usize,
+    right: usize,
+    first: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy)]
+struct SpatialItem {
+    order_index: usize,
+    bounds: [f32; 6],
+}
+
+impl WorldCullIndex {
+    /// Build once, off the render path, from submission-ordered mesh bounds.
+    /// Invalid or absent bounds remain conservative and are always included.
+    pub fn from_ordered_bounds(bounds: &[Option<[f32; 6]>]) -> Self {
+        let mut index = Self::default();
+        for (order_index, bounds) in bounds.iter().copied().enumerate() {
+            match bounds.filter(|bounds| valid_bounds(*bounds)) {
+                Some(bounds) => index.items.push(SpatialItem { order_index, bounds }),
+                None => index.always_visible.push(order_index),
+            }
+        }
+        if !index.items.is_empty() {
+            let end = index.items.len();
+            index.root = Some(build_cull_node(&mut index.nodes, &mut index.items, 0, end));
+        }
+        index
+    }
+
+    /// Return exact frustum-visible indices in original draw order. Internal
+    /// nodes prune whole groups; leaf bounds retain the prior per-mesh test.
+    pub fn visible_order_indices(
+        &self,
+        mut intersects: impl FnMut([f32; 6]) -> bool,
+    ) -> Vec<usize> {
+        let mut visible = self.always_visible.clone();
+        let Some(root) = self.root else {
+            return visible;
+        };
+        let mut stack = vec![root];
+        while let Some(node_index) = stack.pop() {
+            let node = self.nodes[node_index];
+            if !intersects(node.bounds) {
+                continue;
+            }
+            if node.first < node.end {
+                for item in &self.items[node.first..node.end] {
+                    if intersects(item.bounds) {
+                        visible.push(item.order_index);
+                    }
+                }
+            } else {
+                stack.push(node.left);
+                stack.push(node.right);
+            }
+        }
+        visible.sort_unstable();
+        visible
+    }
+}
+
+fn valid_bounds(bounds: [f32; 6]) -> bool {
+    bounds.iter().all(|v| v.is_finite())
+        && (0..3).all(|axis| bounds[axis] <= bounds[axis + 3])
+}
+
+fn build_cull_node(
+    nodes: &mut Vec<CullNode>,
+    items: &mut [SpatialItem],
+    first: usize,
+    end: usize,
+) -> usize {
+    let mut bounds = [f32::INFINITY, f32::INFINITY, f32::INFINITY,
+        f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+    for item in &items[first..end] {
+        for axis in 0..3 {
+            bounds[axis] = bounds[axis].min(item.bounds[axis]);
+            bounds[axis + 3] = bounds[axis + 3].max(item.bounds[axis + 3]);
+        }
+    }
+    let index = nodes.len();
+    nodes.push(CullNode { bounds, left: 0, right: 0, first: 0, end: 0 });
+    if end - first <= 8 {
+        nodes[index].first = first;
+        nodes[index].end = end;
+        return index;
+    }
+    let axis = (0..3)
+        .max_by(|&a, &b| {
+            (bounds[a + 3] - bounds[a]).total_cmp(&(bounds[b + 3] - bounds[b]))
+        })
+        .unwrap();
+    items[first..end].sort_unstable_by(|a, b| {
+        let ac = a.bounds[axis] + a.bounds[axis + 3];
+        let bc = b.bounds[axis] + b.bounds[axis + 3];
+        ac.total_cmp(&bc)
+    });
+    let middle = first + (end - first) / 2;
+    let left = build_cull_node(nodes, items, first, middle);
+    let right = build_cull_node(nodes, items, middle, end);
+    nodes[index].left = left;
+    nodes[index].right = right;
+    index
+}
+
 /// Fold the frozen submission order into the minimum set of draws for `view`.
 ///
 /// Placements inside a page are stored back to back, so two consecutive order
@@ -105,9 +222,35 @@ pub fn fold_commands_culled_pair(
     view: Pass,
     mut intersects: impl FnMut([f32; 6]) -> bool,
 ) -> (Vec<DrawCmd>, Vec<DrawCmd>) {
-    let mut opaque = Vec::with_capacity(order.len());
-    let mut sdr = Vec::with_capacity(order.len());
-    for &(page, range) in order {
+    let mut visible = Vec::with_capacity(order.len());
+    for (order_index, &(page, range)) in order.iter().enumerate() {
+        if range == usize::MAX {
+            visible.push(order_index);
+            continue;
+        }
+        let placement = &pages[page].placements[range];
+        if allows_with_context(view, placement.visibility, RenderContext::default())
+            && placement.bounds.map_or(true, |bounds| intersects(bounds))
+        {
+            visible.push(order_index);
+        }
+    }
+    fold_commands_pair_indices(pages, sdr_pages, order, &visible, view)
+}
+
+/// Fold the exact visible subset returned by `WorldCullIndex` into the same
+/// ordered draws as a linear scan, without repeating per-placement culling.
+pub fn fold_commands_pair_indices(
+    pages: &[PageSpans],
+    sdr_pages: &[PageSpans],
+    order: &[(usize, usize)],
+    visible_order: &[usize],
+    view: Pass,
+) -> (Vec<DrawCmd>, Vec<DrawCmd>) {
+    let mut opaque = Vec::with_capacity(visible_order.len());
+    let mut sdr = Vec::with_capacity(visible_order.len());
+    for &order_index in visible_order {
+        let (page, range) = order[order_index];
         let p = &pages[page];
         let s = &sdr_pages[page];
         if range == usize::MAX {
@@ -116,9 +259,7 @@ pub fn fold_commands_culled_pair(
             continue;
         }
         let placement = &p.placements[range];
-        if !allows_with_context(view, placement.visibility, RenderContext::default())
-            || placement.bounds.is_some_and(|bounds| !intersects(bounds))
-        {
+        if !allows_with_context(view, placement.visibility, RenderContext::default()) {
             continue;
         }
         append_folded(&mut opaque, page, placement.start, placement.end);
@@ -297,6 +438,8 @@ pub enum Message {
         processed: usize,
         skipped: usize,
         stats: DoneStats,
+        world_order: Vec<(usize, usize)>,
+        cull_index: WorldCullIndex,
     },
     Error(String),
 }
@@ -318,6 +461,43 @@ struct Builder {
     used_height: usize,
     placements: Vec<PlacementRange>,
 }
+#[derive(Clone, Copy)]
+struct OrderedPlacement {
+    order: u64,
+    page: usize,
+    range: usize,
+    bounds: Option<[f32; 6]>,
+}
+
+fn send_page(
+    tx: &SyncSender<Message>,
+    page_index: usize,
+    page: Page,
+    placements: &mut Vec<OrderedPlacement>,
+) -> Result<(), ()> {
+    if page.placements.is_empty() {
+        placements.push(OrderedPlacement {
+            order: u64::MAX,
+            page: page_index,
+            range: usize::MAX,
+            bounds: None,
+        });
+    } else {
+        placements.extend(
+            page.placements
+                .iter()
+                .enumerate()
+                .map(|(range, placement)| OrderedPlacement {
+                    order: placement.order,
+                    page: page_index,
+                    range,
+                    bounds: placement.bounds,
+                }),
+        );
+    }
+    tx.send(Message::Page(page)).map_err(|_| ())
+}
+
 impl Builder {
     fn new() -> Self {
         Self {
@@ -459,6 +639,7 @@ fn run(
     let mut shared_geometry = HashMap::<usize, Builder>::new();
     let mut skipped = 0usize;
     let mut pages = 0usize;
+    let mut ordered_placements = Vec::new();
     let mut atlas_pages = 0usize;
     let mut atlas_bytes = 0usize;
     let fallback = crate::objects::Texture {
@@ -530,7 +711,7 @@ fn run(
                     atlas_bytes += atlas_mip_bytes(finished.used_height);
                     remember_atlas(&finished, pages, &mut shared_slots);
                     pages += 1;
-                    if tx.send(Message::Page(finished.page(id))).is_err() {
+                    if send_page(&tx, pages - 1, finished.page(id), &mut ordered_placements).is_err() {
                         return Ok(());
                     }
                 }
@@ -546,7 +727,7 @@ fn run(
                             Builder::shared(shared.source, shared.height),
                         );
                         pages += 1;
-                        if tx.send(Message::Page(ready.page(id))).is_err() {
+                        if send_page(&tx, pages - 1, ready.page(id), &mut ordered_placements).is_err() {
                             return Ok(());
                         }
                     }
@@ -558,7 +739,7 @@ fn run(
                         atlas_bytes += atlas_mip_bytes(finished.used_height);
                         remember_atlas(&finished, pages, &mut shared_slots);
                         pages += 1;
-                        if tx.send(Message::Page(finished.page(id))).is_err() {
+                        if send_page(&tx, pages - 1, finished.page(id), &mut ordered_placements).is_err() {
                             return Ok(());
                         }
                     }
@@ -612,7 +793,7 @@ fn run(
         for (_, builder) in ready {
             if !builder.indices.is_empty() {
                 pages += 1;
-                if tx.send(Message::Page(builder.page(end))).is_err() {
+                if send_page(&tx, pages - 1, builder.page(end), &mut ordered_placements).is_err() {
                     return Ok(());
                 }
             }
@@ -622,10 +803,22 @@ fn run(
         atlas_pages += 1;
         atlas_bytes += atlas_mip_bytes(page.used_height);
         pages += 1;
-        if tx.send(Message::Page(page.page(limit))).is_err() {
+        if send_page(&tx, pages - 1, page.page(limit), &mut ordered_placements).is_err() {
             return Ok(());
         }
     }
+    ordered_placements.sort_unstable_by_key(|placement| {
+        (placement.order, placement.page, placement.range)
+    });
+    let world_order: Vec<_> = ordered_placements
+        .iter()
+        .map(|placement| (placement.page, placement.range))
+        .collect();
+    let ordered_bounds: Vec<_> = ordered_placements
+        .iter()
+        .map(|placement| placement.bounds)
+        .collect();
+    let cull_index = WorldCullIndex::from_ordered_bounds(&ordered_bounds);
     let _ = tx.send(Message::Done {
         processed: limit,
         skipped,
@@ -638,6 +831,8 @@ fn run(
             atlas_pages,
             atlas_bytes,
         },
+        world_order,
+        cull_index,
     });
     Ok(())
 }
@@ -998,6 +1193,29 @@ impl GpuPage {
             .collect();
         fold_commands_culled(&spans, order, view, intersects)
     }
+    pub fn draw_commands_pair_visible(
+        pages: &[Self],
+        order: &[(usize, usize)],
+        visible_order: &[usize],
+        view: Pass,
+    ) -> (Vec<DrawCmd>, Vec<DrawCmd>) {
+        let opaque: Vec<PageSpans> = pages
+            .iter()
+            .map(|p| PageSpans {
+                count: p.count,
+                placements: &p.placements,
+            })
+            .collect();
+        let sdr: Vec<PageSpans> = pages
+            .iter()
+            .map(|p| PageSpans {
+                count: p.sdr_count,
+                placements: &p.sdr_placements,
+            })
+            .collect();
+        fold_commands_pair_indices(&opaque, &sdr, order, visible_order, view)
+    }
+
     pub fn draw_commands_pair_culled(
         pages: &[Self],
         order: &[(usize, usize)],
@@ -1322,6 +1540,23 @@ mod page_tests {
             drawn(&commands),
             (0..30).chain(60..90).map(|i| (0, i)).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn world_cull_index_matches_linear_visibility_in_submission_order() {
+        let mut bounds = (0..64)
+            .map(|x| Some([x as f32, 0., 0., x as f32 + 0.5, 1., 1.]))
+            .collect::<Vec<_>>();
+        bounds.push(None);
+        bounds.push(Some([f32::NAN, 0., 0., 1., 1., 1.]));
+        let index = WorldCullIndex::from_ordered_bounds(&bounds);
+        let mut tests = 0;
+        let visible = index.visible_order_indices(|aabb| {
+            tests += 1;
+            aabb[0] < 4.
+        });
+        assert_eq!(visible, vec![0, 1, 2, 3, 64, 65]);
+        assert!(tests < 64, "spatial query made {tests} bounds tests");
     }
 
     #[test]
