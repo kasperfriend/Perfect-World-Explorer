@@ -153,6 +153,7 @@ pub fn run(authored_mips: bool) {
             "per-batch indirect draws"
         }
     );
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
     let mut renderer = far_trees_gpu::FarTrees::new(
         &device,
         &queue,
@@ -162,6 +163,10 @@ pub fn run(authored_mips: bool) {
         &uniform,
         authored_mips,
     );
+    device.poll(wgpu::Maintain::Wait);
+    if let Some(error) = pollster::block_on(device.pop_error_scope()) {
+        panic!("tree LOD initialization validation failed: {error}");
+    }
     let size = wgpu::Extent3d {
         width: 128,
         height: 128,
@@ -530,6 +535,7 @@ fn multi_group(device: &wgpu::Device, queue: &wgpu::Queue) {
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    device.push_error_scope(wgpu::ErrorFilter::Validation);
     let mut renderer = far_trees_gpu::FarTrees::new(
         device,
         queue,
@@ -539,6 +545,10 @@ fn multi_group(device: &wgpu::Device, queue: &wgpu::Queue) {
         &camera,
         false,
     );
+    device.poll(wgpu::Maintain::Wait);
+    if let Some(error) = pollster::block_on(device.pop_error_scope()) {
+        panic!("multi-group tree LOD initialization validation failed: {error}");
+    }
     let heights = renderer.group_heights();
     assert_eq!(heights.len(), 3, "three tree types, three groups");
     for dist in [20f32, 40., 120., 300., 1000., 3000., 12000.] {
