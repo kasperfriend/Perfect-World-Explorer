@@ -485,7 +485,7 @@ impl FrameGeneration {
         // pinpoint the rejecting component.
         let (qi_device_hr, qi_queue_hr) = unsafe {
             let mut probe_device: *mut winapi::um::d3d12::ID3D12Device = std::ptr::null_mut();
-            let hr = (queue_ptr as *mut winapi::um::unknwnbase::IUnknown).QueryInterface(
+            let hr = (*(queue_ptr as *mut winapi::um::unknwnbase::IUnknown)).QueryInterface(
                 &winapi::um::d3d12::ID3D12Device::uuidof(),
                 &mut probe_device as *mut *mut winapi::um::d3d12::ID3D12Device as *mut *mut c_void,
             );
@@ -493,7 +493,7 @@ impl FrameGeneration {
                 (*probe_device).Release();
             }
             let mut probe_queue: *mut winapi::um::d3d12::ID3D12CommandQueue = std::ptr::null_mut();
-            let hr_q = (queue_ptr as *mut winapi::um::unknwnbase::IUnknown).QueryInterface(
+            let hr_q = (*(queue_ptr as *mut winapi::um::unknwnbase::IUnknown)).QueryInterface(
                 &winapi::um::d3d12::ID3D12CommandQueue::uuidof(),
                 &mut probe_queue as *mut *mut winapi::um::d3d12::ID3D12CommandQueue
                     as *mut *mut c_void,
@@ -513,7 +513,7 @@ impl FrameGeneration {
         };
         let qi_factory2_hr = unsafe {
             let mut probe_factory: *mut c_void = std::ptr::null_mut();
-            let hr = (factory as *mut winapi::um::unknwnbase::IUnknown)
+            let hr = (*(factory as *mut winapi::um::unknwnbase::IUnknown))
                 .QueryInterface(&IID_IDXGI_FACTORY2, &mut probe_factory);
             if !probe_factory.is_null() {
                 (&*(probe_factory as *const winapi::um::unknwnbase::IUnknown)).Release();
