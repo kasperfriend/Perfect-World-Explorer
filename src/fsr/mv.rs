@@ -49,7 +49,7 @@ struct FOut {
             if (abs(clip.w) >= 1e-8) {
                 let prev_ndc = clip.xy / clip.w;
                 let prev_uv = vec2<f32>((prev_ndc.x + 1.0) * 0.5, (1.0 - prev_ndc.y) * 0.5);
-                out.mv = (uv - prev_uv) * size;
+                out.mv = (prev_uv - uv) * size;
             }
         }
     }

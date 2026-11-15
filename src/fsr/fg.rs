@@ -249,7 +249,7 @@ pub struct FrameGeneration {
     proxy_alive: bool,
     size: (u32, u32),
     render_extent: (u32, u32),
-    srgb_backbuffer: bool,
+    backbuffer_ffx_format: u32,
     /// FFX surface format describing the UI texture.
     ui_ffx_format: u32,
     /// Composition target: everything except the UI is drawn here, then it is
@@ -336,20 +336,22 @@ impl FrameGeneration {
         let device_ptr = raw_device.as_mut_ptr() as *mut c_void;
         let queue_ptr = raw_queue.as_mut_ptr() as *mut c_void;
 
-        // Mirror wgpu's own swapchain format choice: UNORM backbuffer, and
-        // the sRGB conversion happens in the final composite (the caller uses
-        // the present-encode path). For sRGB-only surfaces we pick the sRGB
-        // format for both instead.
-        let srgb_backbuffer = surface_format.is_srgb();
-        let backbuffer_format = if srgb_backbuffer {
-            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
-        } else {
+        // The flip-model backbuffer must be the plain UNORM format (sRGB is
+        // not a valid flip-model format; wgpu creates its own backbuffer
+        // UNORM for the same reason, with the sRGB conversion done in
+        // shaders). DXGI rejects an sRGB flip-model backbuffer, which FFX
+        // reports as FFX_API_RETURN_ERROR_RUNTIME_ERROR (0x3) when creating
+        // the proxy swapchain. The sRGB conversion happens in the final
+        // composite (the caller uses the present-encode path).
+        let backbuffer_format = if super::imp::is_bgra_format(surface_format) {
             DXGI_FORMAT_B8G8R8A8_UNORM
-        };
-        let ffx_backbuffer_format = if srgb_backbuffer {
-            FFX_API_SURFACE_FORMAT_B8G8R8A8_SRGB
         } else {
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        };
+        let ffx_backbuffer_format = if super::imp::is_bgra_format(surface_format) {
             FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM
+        } else {
+            FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM
         };
 
         // Enumerate the frame generation providers the loader can reach and
@@ -695,7 +697,7 @@ impl FrameGeneration {
             proxy_alive: true,
             size: display_extent,
             render_extent,
-            srgb_backbuffer,
+            backbuffer_ffx_format: ffx_backbuffer_format,
             ui_ffx_format: ffx_color_for_format(ui_format),
             compose,
             ui,
@@ -1234,11 +1236,7 @@ impl FrameGeneration {
         }
         let present_color = FfxApiResource::texture2d(
             &backbuffer,
-            if self.srgb_backbuffer {
-                FFX_API_SURFACE_FORMAT_B8G8R8A8_SRGB
-            } else {
-                FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM
-            },
+            self.backbuffer_ffx_format,
             width,
             height,
             super::imp::FFX_API_RESOURCE_USAGE_READ_ONLY,

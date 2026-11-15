@@ -2,7 +2,7 @@
 //! documentation in `super` for the overall design and its limits.
 
 use super::mv::{FsrMotionVectorPass, FsrMvParams, COMPOSITE_SHADER};
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 use std::ffi::c_void;
 use winapi::shared::dxgiformat::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -394,7 +394,7 @@ impl FfxLoader {
     }
 }
 
-fn is_bgra_format(format: wgpu::TextureFormat) -> bool {
+pub(crate) fn is_bgra_format(format: wgpu::TextureFormat) -> bool {
     matches!(
         format,
         wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm
@@ -1295,14 +1295,25 @@ impl FsrUpscaler {
         (x, y)
     }
 
-    /// Clip-space translation matching `current_jitter`, in NDC units.
+    /// Post-projection clip-space translation matching `current_jitter`.
+    ///
+    /// AMD FSR 2/3 expects the jitter to move the rendered image by a whole
+    /// clip-space offset: `jitteredVP = T * VP` where `T` translates clip
+    /// space in NDC units. A constant added to the translation column of the
+    /// combined view-projection matrix instead shifts clip space by a fixed
+    /// amount *before* the perspective divide, which makes the on-screen
+    /// offset scale with 1/w (depth-dependent shake and heavy jitter on
+    /// high-frequency geometry). The jitter Y is negated because unit pixel
+    /// space is +y down while NDC is +y up; the same raw halton offsets are
+    /// passed to the FFX dispatch as `jitterOffset`.
     pub fn jittered_matrix(&self, matrix: Mat4) -> Mat4 {
         let (jx, jy) = self.current_jitter;
         let (w, h) = self.render_extent;
-        let mut m = matrix;
-        m.col_mut(3).x += 2.0 * jx / w.max(1) as f32;
-        m.col_mut(3).y += 2.0 * jy / h.max(1) as f32;
-        m
+        Mat4::from_translation(Vec3::new(
+            2.0 * jx / w.max(1) as f32,
+            -2.0 * jy / h.max(1) as f32,
+            0.0,
+        )) * matrix
     }
 }
 
@@ -1527,8 +1538,11 @@ impl FsrUpscaler {
                 width: self.display_extent.0,
                 height: self.display_extent.1,
             },
-            enable_sharpening: false,
-            sharpness: 0.0,
+            // FFX sharpening pass (FSR 1 gets RCAS on the blit path, so
+            // match it here). 0.5 is a moderate amount, the mid grey between
+            // "no additional sharpness" and "maximum" from the FFX docs.
+            enable_sharpening: true,
+            sharpness: 0.5,
             frame_time_delta: frame_time_ms.clamp(0.1, 1000.0),
             pre_exposure: 1.0,
             reset: self.reset_history,
