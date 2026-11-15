@@ -1337,7 +1337,7 @@ struct Renderer {
     local_pages: Vec<crate::world_objects::GpuPage>,
     world_pages: Vec<crate::world_objects::GpuPage>,
     /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
-    world_draw_cmds: [Vec<crate::world_objects::WorldDrawCmd>; crate::world_objects::WORLD_VIEWS],
+    world_draw_cmds: [crate::world_objects::WorldDrawList; crate::world_objects::WORLD_VIEWS],
     world_done: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -2006,7 +2006,7 @@ impl Renderer {
             object_start: m.object_start,
             local_pages,
             world_pages: Vec::new(),
-            world_draw_cmds: Default::default(),
+            world_draw_cmds: std::array::from_fn(|_| crate::world_objects::WorldDrawList::default()),
             world_done: false,
             layout,
             sampler,
@@ -2989,9 +2989,14 @@ impl Renderer {
         // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
         // the same block walk the client runs before the level rule.
         // Both buffers are reused: this runs for every view of every frame.
-        crate::terrain_residency::visible_runs_into(&self.spans, matrix, &mut self.terrain_runs);
-        self.terrain_gpu
-            .visible_far_runs_into(matrix, &mut self.far_terrain_runs);
+        let spans = &self.spans;
+        let terrain_runs = &mut self.terrain_runs;
+        let terrain_gpu = &self.terrain_gpu;
+        let far_terrain_runs = &mut self.far_terrain_runs;
+        std::thread::scope(|s| {
+            s.spawn(|| crate::terrain_residency::visible_runs_into(spans, matrix, terrain_runs));
+            s.spawn(|| terrain_gpu.visible_far_runs_into(matrix, far_terrain_runs));
+        });
         // One indirect record per run, so the terrain itself is one call per mesh
         // instead of one call per run.
         self.queue_main_runs();
@@ -3527,9 +3532,9 @@ impl Renderer {
                 ViewRuns::Reflected,
                 None,
                 None,
-                    &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
+                &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
             );
-           if let Some(cloud) = &self.cloud {
+                if let Some(cloud) = &self.cloud {
                 cloud.draw(
                     &self.queue,
                     &mut e,
