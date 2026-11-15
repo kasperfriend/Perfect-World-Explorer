@@ -1202,9 +1202,7 @@ impl FarTrees {
                             z0.max(far_bounds[2]),
                             z1.min(far_bounds[3]),
                         ];
-                        if intersection[0] <= intersection[1]
-                            && intersection[2] <= intersection[3]
-                        {
+                        if intersection[0] <= intersection[1] && intersection[2] <= intersection[3] {
                             Some(intersection)
                         } else {
                             self.active_placements.clear();
