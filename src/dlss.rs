@@ -16,17 +16,20 @@
 //!   resolution) and `nvngx_dlssg.dll` (frame generation), taken from the
 //!   official [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) repository
 //!   (`lib/Windows_x86_64/rel/`). The SDK headers they were built from are
-//!   kept under `sdk/include/nvidia/` for reference and review. Both are
-//!   loaded with `LoadLibraryW`/`GetProcAddress` from the SDK directory the
-//!   probe scanned (Settings → `upscale_sdk_dir`, `PW_UPSCALER_SDK_DIR`, or
-//!   `<exe>\sdk\`).
-//! * NGX has no "create a parameter table" export in these DLLs: the entry
-//!   points the app is expected to call are `NVSDK_NGX_D3D12_Init_Ext`,
-//!   `…CreateFeature`, `…EvaluateFeature`, `…ReleaseFeature` and `…Shutdown1`,
-//!   and the `NVSDK_NGX_Parameter` table is a C++ object the *application*
-//!   supplies. `params` implements that object in Rust (a vtable of the eight
-//!   `Set` / eight `Get` overloads plus `Reset`), which is how the plugin reads
-//!   and writes everything from "Width" to "DLSS.Feature.Create.Flags".
+//!   kept under `sdk/include/nvidia/` for reference and review.
+//! * Those two DLLs are NGX *snippets*: they only initialise when NGX **Core**
+//!   (`%SystemRoot%\System32\nvngx.dll`, installed with the display driver)
+//!   drives them — called directly they answer `0xBAD00002`
+//!   (`FAIL_PlatformError`), which is what an earlier revision reported on
+//!   perfectly good RTX hardware. `loader` therefore loads the driver's core,
+//!   initialises it once per device and creates both features through it, with
+//!   the viewer's SDK folder first in `PathListInfo` so the vendored DLSS build
+//!   is the one that runs.
+//! * `NVSDK_NGX_Parameter` is a C++ object. Core allocates it
+//!   (`NVSDK_NGX_D3D12_AllocateParameters`) and exports the `Set*` helpers the
+//!   viewer writes it through; `params` also carries a complete Rust
+//!   implementation of the object (eight `Set` / eight `Get` overloads plus
+//!   `Reset`) as the fallback for drivers without those exports.
 //! * `NVSDK_NGX_Result_Success` is **`0x1`**, not 0: every result is checked
 //!   with `NVSDK_NGX_SUCCEED` semantics (`value & 0xfff0_0000 != 0xbad0_0000`)
 //!   and the failing codes are reported by name (`0xbad00001` is

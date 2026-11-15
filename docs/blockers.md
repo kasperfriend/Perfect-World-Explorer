@@ -472,3 +472,48 @@ done.
   generation are both on". Every present in a group now uses `Present(1, 0)`.
 - **Status:** open (needs a Blackwell machine for x3/x4/x6; x2 is the previously
   reported configuration and needs a re-report).
+
+## B-15 — DLSS refused to initialise: `0xBAD00002` (screen report, RTX 3080)
+
+- **Step:** Settings → Graphics → **Upscaling** = DLSS, any quality. Reported on
+  an RTX 3080 as `NVSDK_NGX_D3D12_Init_Ext failed (0xbad00002
+  FAIL_PlatformError)` followed by `DLSS failed -> bilinear`; FSR and XeSS were
+  fine on the same frame, so it was never a GPU or driver-support verdict.
+- **Error:** `0xBAD00002` / `FAIL_PlatformError` from
+  `NVSDK_NGX_D3D12_Init_Ext`, from every DLSS build tried
+  (`DLSS 2.3` … `3.7`), on hardware NGX supports.
+- **Cause:** the entry point the viewer used is the *snippet* variant. Both
+  vendored DLLs (`nvngx_dlss.dll`, `nvngx_dlssg.dll`) are NGX snippets, which
+  are written to be loaded and driven by NGX **Core** — the `nvngx.dll` the
+  display driver installs into `%SystemRoot%\System32`. The snippet's
+  `NVSDK_NGX_D3D12_Init_Ext` prologue resolves the module the call came from
+  (`GetModuleHandleExW(FROM_ADDRESS, <return address>, &h)`), takes that
+  module's file name and requires it to contain `nvngx.dll`; the viewer's own
+  `.exe` never matches, so the snippet refuses with `FAIL_PlatformError` before
+  it looks at the device. NGX also resolves its feature DLLs from the running
+  executable's folder, not the game's.
+- **Fix:** the viewer now bootstraps NGX Core the way an `nvsdk_ngx_*.lib`
+  application does (`src/dlss/loader.rs`): load `%SystemRoot%\System32\nvngx.dll`,
+  initialise it once per process with `NVSDK_NGX_D3D12_Init_with_ProjectID`
+  (GUID project id, `NVSDK_NGX_ENGINE_TYPE_CUSTOM`; falls back to
+  `…D3D12_Init` when a driver rejects the project id), then create and evaluate
+  both features through Core. `NVSDK_NGX_FeatureCommonInfo.PathListInfo` lists
+  the viewer's `sdk/` folder first, so the vendored DLSS build is the one Core
+  loads rather than the copy in the driver store. The parameter map is Core's
+  (`…AllocateParameters` + `NVSDK_NGX_Parameter_Set*`); the in-tree table stays
+  as the fallback for driver builds that do not export those.
+- **Diagnostics added:** the loaded core path, the application data folder (now
+  `%LOCALAPPDATA%\PerfectWorldExplorer\NGX`, because NGX answers
+  `FAIL_PlatformError` when it cannot write its log next to an executable in
+  `Program Files`), each init attempt's named result, every NGX log line
+  (through `NVSDK_NGX_LoggingInfo`, prefixed `[NGX …]`, written to
+  `session.log` alongside the viewer's own lines) and, after init,
+  `SuperSampling.Available` and `SuperSampling.FeatureInitResult`.
+- **Not verified:** that Core accepts the project id on every driver branch and
+  that DLSS then creates and evaluates on the 3080 — no GPU in this
+  environment. If it still fails, the log now says which part: the core's load
+  path, the refused init call with its named result, NGX's own reason, or
+  `SuperSampling.Available`.
+- **If `nvngx.dll` is missing:** a driver install cleaned by NVCleanstall/DDU
+  can omit the NGX component. The error names the path it tried.
+- **Status:** open on hardware (needs a re-report on the 3080).

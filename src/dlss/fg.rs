@@ -137,7 +137,8 @@ impl Drop for DlssFrameGeneration {
             }
             self.swapchain = std::ptr::null_mut();
         }
-        // `NgxApi::drop` runs `NVSDK_NGX_D3D12_Shutdown1` and unloads the DLL.
+        // NGX Core stays loaded for the process (both features share it) and
+        // the feature handle is released in `finish`/`Drop` above.
     }
 }
 
@@ -212,11 +213,15 @@ impl DlssFrameGeneration {
         }
         let buffer_count = desc.BufferCount.max(2);
 
-        let mut api = NgxApi::load(sdk_dir, "nvngx_dlssg.dll")?;
-        let mut params = NgxParams::new();
-        api.init(0x5045_5752, &app_data_dir(), device_ptr, &mut params)?;
+        // NGX Core (`nvngx.dll`, from the driver) initialises once for the
+        // device and loads the vendored `nvngx_dlssg.dll` itself; the snippet is
+        // never called directly, because it refuses to initialise anything that
+        // is not an NGX runtime (0xBAD00002).
+        let api = NgxApi::load(sdk_dir, "nvngx_dlssg.dll", device_ptr)?;
+        let mut params = api.new_parameters();
         crate::dlss::diag(&format!(
-            "[DLSS FG] NGX initialised (snippet API 0x{NGX_VERSION_API:x}), creating DLSS-G"
+            "[DLSS FG] NGX ready (API 0x{NGX_VERSION_API:x}, core {}), creating DLSS-G",
+            api.core_path()
         ));
 
         params.set_u32(P_WIDTH, display_extent.0.max(1));
@@ -670,14 +675,4 @@ impl DlssFrameGeneration {
         }
         Ok(unsafe { std::mem::transmute(raw) })
     }
-}
-
-/// The folder NGX may write its logs to (same choice as the SR path).
-fn app_data_dir() -> String {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            return dir.to_string_lossy().into_owned();
-        }
-    }
-    ".".to_string()
 }

@@ -187,16 +187,6 @@ impl Drop for DlssUpscaler {
     }
 }
 
-/// The folder NGX may write its logs to.
-fn app_data_dir() -> String {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            return dir.to_string_lossy().into_owned();
-        }
-    }
-    ".".to_string()
-}
-
 impl DlssUpscaler {
     pub fn new(
         device: &wgpu::Device,
@@ -223,11 +213,15 @@ impl DlssUpscaler {
         let (raw_device, raw_queue) = raw_dx12(device)?;
         let device_ptr = raw_device.as_mut_ptr() as *mut c_void;
 
-        let mut api = NgxApi::load(sdk_dir, "nvngx_dlss.dll")?;
-        let mut params = NgxParams::new();
-        api.init(0x5045_5752, &app_data_dir(), device_ptr, &mut params)?;
+        // NGX Core (`nvngx.dll`, from the driver) initialises once for the
+        // device and loads the vendored `nvngx_dlss.dll` itself; the snippet is never
+        // called directly, because it refuses to initialise anything that is
+        // not an NGX runtime (0xBAD00002).
+        let api = NgxApi::load(sdk_dir, "nvngx_dlss.dll", device_ptr)?;
+        let mut params = api.new_parameters();
         crate::dlss::diag(&format!(
-            "[DLSS] NGX initialised (snippet API 0x{NGX_VERSION_API:x}), creating DLSS"
+            "[DLSS] NGX ready (API 0x{NGX_VERSION_API:x}, core {}), creating DLSS",
+            api.core_path()
         ));
 
         params.set_u32(P_WIDTH, render_extent.0.max(1));

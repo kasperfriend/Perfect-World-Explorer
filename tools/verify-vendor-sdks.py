@@ -49,6 +49,15 @@ EXPECTED_DLLS = {
     "nvngx_dlssg.dll": "NVIDIA_DLSS-SDK-LICENSE.txt",
 }
 
+# DLLs the viewer names in `src/` but that are not vendored: they are installed
+# by something else and must never be staged in `sdk/`.
+RUNTIME_DLLS = {
+    # NGX Core: shipped by the display driver as %SystemRoot%\System32\nvngx.dll.
+    # `src/dlss/loader.rs` loads it from there and drives the vendored DLSS
+    # snippets through it; the vendored files stay the only ones in `sdk/`.
+    "nvngx.dll": "NVIDIA display driver (NGX Core)",
+}
+
 # Recorded from the Intel XeSS SDK 3.0.2 release (and the AMD FidelityFX SDK
 # 2.4.0 binaries). A mismatch is not automatically a failure — it means the
 # vendored binary changed and THIRD_PARTY_NOTICES.md must be updated — but it
@@ -727,6 +736,13 @@ def main() -> int:
         )
     for dll, names in sorted(wants.items()):
         image = images.get(dll)
+        if image is None and dll in RUNTIME_DLLS:
+            # Supplied by the driver, not vendored: only the *name* is checked.
+            print(
+                f"  {dll}: runtime DLL from the {RUNTIME_DLLS[dll]}, "
+                f"{len(names)} export(s) resolved dynamically"
+            )
+            continue
         if image is None:
             problems.append(f"{dll}: named by src/ but not in sdk/")
             print(f"  {dll}: MISSING, {len(names)} export(s) cannot resolve")
