@@ -204,6 +204,10 @@ mod fg_stub {
         pub fn frames_presented(&self) -> u64 {
             0
         }
+
+        pub fn selected_provider(&self) -> Option<u64> {
+            None
+        }
     }
 }
 
