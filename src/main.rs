@@ -48,9 +48,7 @@ fn recoverable_map_operation<T>(operation: impl FnOnce() -> T) -> Result<T, Stri
             Some(location) => format!(
                 "unexpected error while loading/rendering the selected map: {message} ({location})"
             ),
-            None => format!(
-                "unexpected error while loading/rendering the selected map: {message}"
-            ),
+            None => format!("unexpected error while loading/rendering the selected map: {message}"),
         }
     })
 }
