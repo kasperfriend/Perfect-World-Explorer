@@ -384,17 +384,19 @@ impl FrameGeneration {
                 ids.retain(|&id| id != 0);
                 chosen_version = choose_version_for_major(&ids, 0);
                 fg_ids = ids;
-                super::diag(
+                super::diag(&format!(
                     "[FSR FG] frame generation providers {:?}, selected 0x{:x}",
                     fg_ids
                         .iter()
                         .map(|i| format!("0x{i:x}"))
                         .collect::<Vec<_>>(),
                     chosen_version.unwrap_or(0)
-                );
+                ));
             }
         } else {
-            super::diag("[FSR FG] provider enumeration returned 0x{rc:x}; the loader will pick");
+            super::diag(&format!(
+                "[FSR FG] provider enumeration returned 0x{rc:x}; the loader will pick"
+            ));
         }
 
         let (fence, hr) = raw_device.create_fence(0);
@@ -556,22 +558,22 @@ impl FrameGeneration {
                 )
             };
             if rc == super::imp::FFX_API_RETURN_OK && !fg_context.is_null() {
-                super::diag(
+                super::diag(&format!(
                     "[FSR FG] frame generation context created{}",
                     candidate
                         .map(|id| format!(" with override 0x{id:x}"))
                         .unwrap_or_default()
-                );
+                ));
                 fg_created = true;
                 created_override = *candidate;
                 break;
             }
-            super::diag(
+            super::diag(&format!(
                 "[FSR FG] ffxCreateContext with override {}failed (0x{rc:x}); trying the next provider",
                 candidate
                     .map(|id| format!("0x{id:x} "))
                     .unwrap_or_default()
-            );
+            ));
             last_rc = rc;
             fg_context = std::ptr::null_mut();
         }
@@ -1141,7 +1143,7 @@ impl FrameGeneration {
         let rc =
             unsafe { (self.loader.configure)(&mut self.swapchain_context, &mut register.header) };
         if rc != super::imp::FFX_API_RETURN_OK {
-            super::diag("[FSR FG] registering the UI resource failed (0x{rc:x}); UI may be missing from generated frames");
+            super::diag(&format!("[FSR FG] registering the UI resource failed (0x{rc:x}); UI may be missing from generated frames"));
         }
 
         // --- Configure frame generation for this frame.
@@ -1222,7 +1224,7 @@ impl FrameGeneration {
         // --- Present through the proxy (frame pacing + interpolation).
         let hr = unsafe { (*sc).Present(1, 0) };
         if hr < 0 {
-            super::diag("[FSR FG] present through the frame generation swapchain failed (HRESULT 0x{hr:08x})");
+            super::diag(&format!("[FSR FG] present through the frame generation swapchain failed (HRESULT 0x{hr:08x})"));
         }
         drop(backbuffer);
         self.frame_index += 1;

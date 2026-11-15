@@ -262,14 +262,14 @@ extern "C" fn fsr_message_callback(message_type: u32, message: *const u16) {
         len
     };
     let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(message, len) });
-    super::diag(
+    super::diag(&format!(
         "[FSR {}] {text}",
         if message_type == 0 {
             "error"
         } else {
             "warning"
         }
-    );
+    ));
 }
 
 pub(crate) struct FfxLoader {
@@ -372,7 +372,9 @@ impl FfxLoader {
                         )
                     };
                     if rc != FFX_API_RETURN_OK {
-                        super::diag("[FSR] installing the FFX debug callback failed (0x{rc:x})");
+                        super::diag(&format!(
+                            "[FSR] installing the FFX debug callback failed (0x{rc:x})"
+                        ));
                     }
                     return Ok(loader);
                 }
@@ -820,9 +822,9 @@ impl FsrUpscaler {
                 );
             }
         } else {
-            super::diag(
+            super::diag(&format!(
                 "[FSR] provider enumeration returned 0x{rc:x}; the loader will pick a provider"
-            );
+            ));
         }
 
         let (allocator, hr) = raw_device.create_command_allocator(d3d12::CmdListType::Direct);
@@ -917,12 +919,12 @@ impl FsrUpscaler {
                 created_override = *candidate;
                 break;
             }
-            super::diag(
+            super::diag(&format!(
                 "[FSR] ffxCreateContext with override {}failed (0x{rc:x}); trying the next provider",
                 candidate
                     .map(|id| format!("0x{id:x} "))
                     .unwrap_or_default()
-            );
+            ));
             last_rc = rc;
             context = std::ptr::null_mut();
         }
@@ -937,10 +939,10 @@ impl FsrUpscaler {
         } else {
             format!("{provider_note}; created with the loader's default provider")
         };
-        super::diag(
+        super::diag(&format!(
             "[FSR] upscaler context 0x{:x} created ({provider_note})",
             context as usize
-        );
+        ));
 
         let mut phase_count: i32 = 0;
         let mut phase_query = FfxQueryDescUpscaleGetJitterPhaseCount {
@@ -1052,7 +1054,9 @@ impl FsrUpscaler {
         };
         let rc = unsafe { (self.loader.query)(&mut self.context, &mut query.header) };
         if rc != FFX_API_RETURN_OK {
-            super::diag("[FSR] GetJitterOffset failed (0x{rc:x}); using zero jitter");
+            super::diag(&format!(
+                "[FSR] GetJitterOffset failed (0x{rc:x}); using zero jitter"
+            ));
             x = 0.0;
             y = 0.0;
         }
@@ -1399,11 +1403,11 @@ pub(crate) fn choose_version_for_major(ids: &[u64], wanted_major: u32) -> Option
         .filter(|&id| real(id) && major(id) == wanted_major)
         .max()
         .or_else(|| {
-            super::diag(
+            super::diag(&format!(
                 "[FSR] no FSR major.{} provider advertised (found {:?}); using the newest available",
                 wanted_major,
                 ids.iter().map(|i| format!("0x{i:x}")).collect::<Vec<_>>()
-            );
+            ));
             ids.iter().copied().filter(|&id| real(id)).max()
         })
 }
