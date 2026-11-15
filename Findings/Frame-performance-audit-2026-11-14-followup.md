@@ -22,8 +22,8 @@ This follow-up contains **only new, not-yet-implemented optimization options**. 
 - Moved submerged-weather rejection to the CPU’s existing active-water-mask result and removed the per-particle-vertex water-area/mask scan and its two storage buffers.
 - Submitted only the selected rain/snow instance range.
 - Removed per-frame staging allocations from attenuation and normal attachment resolution; switched current-frame dynamic-light publication lookup to an identity map and reused its consume scratch buffer.
-- Cached each visible water batch’s distance once for far-to-near sorting, replaced batch clones with indices, and bypassed the full water scene/refraction/depth/blit path when no visible complex-water batch needs it. Terrain-edge depth is copied only when a visible reflected plane needs that pass.
+- Cached each visible water batch’s distance once for far-to-near sorting, replaced batch clones with indices, and bypassed the full water scene/refraction/depth/blit path when no visible complex-water batch needs it. Terrain-edge depth is copied only when a visible reflected plane needs that pass; reflection/refraction/depth views are created only for visible complex reflective water.
 
 ## Validation boundary
 
-Branch CI run `43706554825` passed Linux checks/tests, formatting, shader/regression checks, and the Windows x64 build for the current code. No representative target-machine profile has been collected. Compare the same camera route with/without visible complex water and with rain-only, snow-only, and submerged weather. GPU time and actual frame-time improvements remain unmeasured.
+Branch CI run `43707389675` passed Linux checks/tests, formatting, shader/regression checks, and the Windows x64 build for the current code. No representative target-machine profile has been collected. Compare the same camera route with/without visible complex water and with rain-only, snow-only, and submerged weather. GPU time and actual frame-time improvements remain unmeasured.
