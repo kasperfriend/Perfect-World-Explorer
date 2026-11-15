@@ -29,6 +29,17 @@ type PfnXellSleep = unsafe extern "C" fn(context: *mut c_void, frame_id: u32) ->
 type PfnXellAddMarkerData =
     unsafe extern "C" fn(context: *mut c_void, frame_id: u32, marker: i32) -> i32;
 type PfnXellDestroyContext = unsafe extern "C" fn(context: *mut c_void) -> i32;
+type PfnXellGetVersion = unsafe extern "C" fn(version: *mut XellVersion) -> i32;
+
+/// `xell_version_t`: four `uint16_t`s, major.minor.patch.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct XellVersion {
+    major: u16,
+    minor: u16,
+    patch: u16,
+    reserved: u16,
+}
 type PfnXellSetLoggingCallback = unsafe extern "C" fn(
     context: *mut c_void,
     level: i32,
@@ -77,6 +88,11 @@ pub(crate) struct Xell {
     sleep_fn: PfnXellSleep,
     marker_fn: PfnXellAddMarkerData,
     destroy_context: PfnXellDestroyContext,
+    /// Version reported by `xellGetVersion`, formatted once at creation.
+    version: String,
+    /// A broken XeLL context would otherwise write a diagnostic every frame;
+    /// the first failure is reported, the rest are counted.
+    failure_logged: bool,
 }
 
 impl Xell {
@@ -90,6 +106,7 @@ impl Xell {
             b"xellAddMarkerData\0",
             b"xellDestroyContext\0",
             b"xellSetLoggingCallback\0",
+            b"xellGetVersion\0",
         ];
         let (handle, exports) = load_sdk_dll(sdk_dir, "libxell.dll", EXPORTS)?;
         let create_context: PfnXellD3D12CreateContext = unsafe { std::mem::transmute(exports[0]) };
@@ -99,6 +116,7 @@ impl Xell {
         let destroy_context: PfnXellDestroyContext = unsafe { std::mem::transmute(exports[4]) };
         let set_logging_callback: PfnXellSetLoggingCallback =
             unsafe { std::mem::transmute(exports[5]) };
+        let get_version: PfnXellGetVersion = unsafe { std::mem::transmute(exports[6]) };
 
         let mut context: *mut c_void = std::ptr::null_mut();
         let rc = unsafe { create_context(device, &mut context) };
@@ -124,12 +142,20 @@ impl Xell {
                 xell_result_name(rc)
             ));
         }
+        let mut version = XellVersion::default();
+        let version = if unsafe { get_version(&mut version) } == XELL_RESULT_SUCCESS {
+            format!("{}.{}.{}", version.major, version.minor, version.patch)
+        } else {
+            "unknown".to_string()
+        };
         Ok(Self {
             handle,
             context,
             sleep_fn,
             marker_fn,
             destroy_context,
+            version,
+            failure_logged: false,
         })
     }
 
@@ -138,15 +164,30 @@ impl Xell {
         self.context
     }
 
+    /// XeLL version as reported by `xellGetVersion` ("major.minor.patch").
+    pub(crate) fn version_string(&self) -> &str {
+        &self.version
+    }
+
+    /// Report a per-frame failure once, so a broken context cannot fill the
+    /// session log at frame rate.
+    fn report(&mut self, what: &str, rc: i32) {
+        if self.failure_logged {
+            return;
+        }
+        self.failure_logged = true;
+        crate::xess::diag(&format!(
+            "[XeLL] {what} failed ({}); latency pacing is now a no-op for the rest of the session",
+            xell_result_name(rc)
+        ));
+    }
+
     /// Sleep until this frame may start (render-queue reduction). Call once
     /// per frame before any markers for `frame_id`.
     pub(crate) fn sleep(&mut self, frame_id: u32) {
         let rc = unsafe { (self.sleep_fn)(self.context, frame_id) };
         if rc != XELL_RESULT_SUCCESS {
-            crate::xess::diag(&format!(
-                "[XeLL] xellSleep failed ({})",
-                xell_result_name(rc)
-            ));
+            self.report("xellSleep", rc);
         }
     }
 

@@ -81,6 +81,7 @@ mod grass_wind;
 mod indirect_args;
 #[cfg(windows)]
 mod launcher_ui;
+mod latency;
 mod light_consumers;
 mod material;
 mod model_asset;
@@ -1254,6 +1255,155 @@ impl FrameGenMethod {
     }
 }
 
+/// The pacing strategy chosen in Settings → Graphics → **Latency**.
+///
+/// The two options are exclusive because they answer the same question — who
+/// decides when this frame's CPU work and its present happen:
+///
+/// * [`LatencyMode::Vsync`] — the display paces presents and nothing else is
+///   involved (wgpu `PresentMode::Fifo`). This is what every build before this
+///   setting did, so it is the default.
+/// * [`LatencyMode::Xell`] — Intel Xe Low Latency (`libxell.dll`) decides:
+///   `xellSleep` holds the CPU back until the GPU queue is nearly empty and the
+///   per-frame markers report simulation / render-submit / present timing, so
+///   the frame is submitted as late as possible without losing throughput.
+///   Present stays vsync'd with sync interval 1 — Intel requires exactly that
+///   while low-latency mode is on — so this is a latency improvement *relative
+///   to VSync*, not a replacement for it.
+///
+/// XeLL is not tied to XeSS: it works with any upscaler, with frame generation
+/// and with Upscaling Off. The one hard constraint is that XeSS Frame
+/// Generation needs its own XeLL context, and Intel's cross-vendor rule is that
+/// a non-Intel GPU only gets XeLL latency reduction while XeSS-FG is running;
+/// [`support_latency`] and [`latency_owner`] encode both rules.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LatencyMode {
+    /// Vsync'd present, no latency library (the previous behaviour).
+    #[default]
+    Vsync,
+    /// Intel Xe Low Latency: xellSleep + per-frame markers over a vsync'd
+    /// present with sync interval 1.
+    Xell,
+}
+
+impl LatencyMode {
+    pub const ALL: [Self; 2] = [Self::Vsync, Self::Xell];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Vsync => "VSync",
+            Self::Xell => "XeLL (Intel Xe Low Latency)",
+        }
+    }
+
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Vsync => "vsync",
+            Self::Xell => "xell",
+        }
+    }
+
+    /// Persisted spelling; anything else keeps the default instead of guessing.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "vsync" | "vsync (on)" => Some(Self::Vsync),
+            "xell" | "xell (low latency)" => Some(Self::Xell),
+            _ => None,
+        }
+    }
+
+    /// Present mode this strategy asks the swapchain for.
+    ///
+    /// Both are `Fifo`: XeLL's latency reduction only engages when DXGI is
+    /// called with sync interval 1, and `Immediate` (tearing) would trade the
+    /// tearing away for the very staleness a latency setting is supposed to
+    /// remove. The choice is still expressed here, and applied to the swapchain
+    /// whenever it changes, so the setting is wired rather than decorative.
+    pub fn present_mode(self) -> wgpu::PresentMode {
+        match self {
+            Self::Vsync | Self::Xell => wgpu::PresentMode::Fifo,
+        }
+    }
+}
+
+/// Who owns the XeLL context for this session. XeLL allows one context per
+/// device/window, so the two owners below are mutually exclusive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LatencyOwner {
+    /// No latency library; the swapchain paces presents.
+    Vsync,
+    /// The viewer's own session in [`crate::latency`], created for the
+    /// Graphics → Latency → XeLL mode.
+    Independent,
+    /// XeSS Frame Generation creates XeLL itself (it refuses to initialise its
+    /// proxy swapchain without one), so it is the owner and the viewer must not
+    /// create a second context.
+    FrameGeneration,
+}
+
+/// Decide who runs XeLL for this settings pair. Pure; unit-tested.
+pub fn latency_owner(mode: LatencyMode, frame_generation: FrameGenMethod) -> LatencyOwner {
+    match mode {
+        LatencyMode::Vsync => LatencyOwner::Vsync,
+        LatencyMode::Xell => match frame_generation {
+            FrameGenMethod::Xess => LatencyOwner::FrameGeneration,
+            _ => LatencyOwner::Independent,
+        },
+    }
+}
+
+/// Hardware + SDK gate for one latency strategy. VSync is always available.
+///
+/// The non-Intel rule is Intel's own: in the XeLL developer guide, latency
+/// reduction on a third-party GPU is only enabled while XeSS Frame Generation
+/// is active ("application must ensure that XeSS-FG is enabled if running in
+/// cross-vendor mode"), and the app "must disable the latency reduction feature
+/// if XeSS-FG is not supported on a non-Intel device". So on NVIDIA/AMD
+/// hardware the option is offered only once XeSS-FG is selected in the same
+/// tab — and in that case the frame generator's context is the one doing the
+/// work, which `latency_owner` reports.
+pub fn support_latency(
+    mode: LatencyMode,
+    frame_generation: FrameGenMethod,
+    gpu: &GpuFacts,
+    sdk: &SdkReport,
+) -> Support {
+    match mode {
+        LatencyMode::Vsync => Support::Available("vsync'd present, no latency library"),
+        LatencyMode::Xell => {
+            if !cfg!(windows) {
+                Support::Disabled(
+                    "XeLL needs a Windows DX12 flip-model swapchain (this build is not Windows)"
+                        .to_string(),
+                )
+            } else if gpu.cpu_fallback {
+                Support::Disabled("Requires a real GPU (software adapter detected)".to_string())
+            } else if !sdk.xell {
+                Support::Disabled(sdk_reason(sdk, "XeLL SDK (libxell.dll)"))
+            } else {
+                match latency_owner(mode, frame_generation) {
+                    LatencyOwner::FrameGeneration => Support::Available(
+                        "XeLL runs through XeSS Frame Generation's own context (latency reduction included)",
+                    ),
+                    LatencyOwner::Independent => {
+                        if gpu.is_intel() {
+                            Support::Available(
+                                "XeLL found (xellSleep + per-frame markers; present stays vsync'd)",
+                            )
+                        } else {
+                            Support::Disabled(format!(
+                                "Intel enables XeLL latency reduction on a non-Intel GPU only with XeSS Frame Generation (set Frame generation = XeSS Frame Generation); detected: {}",
+                                gpu.name
+                            ))
+                        }
+                    }
+                    LatencyOwner::Vsync => Support::Available("vsync'd present"),
+                }
+            }
+        }
+    }
+}
+
 /// Quality mode for the upscaler. "UltraQuality" maps to DLAA on DLSS
 /// (native resolution with temporal accumulation).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2011,6 +2161,108 @@ mod tests {
         .is_available());
     }
 
+    /// The Latency setting: token round-trip, and the owner rule that decides
+    /// whether the viewer creates its own XeLL context, hands the job to XeSS
+    /// Frame Generation, or does nothing.
+    #[test]
+    fn latency_mode_tokens_and_xell_ownership() {
+        // Default is the previous behaviour: vsync'd present, no library.
+        assert_eq!(LatencyMode::default(), LatencyMode::Vsync);
+        for mode in LatencyMode::ALL {
+            assert_eq!(LatencyMode::parse(mode.token()), Some(mode));
+            assert_eq!(LatencyMode::parse(&mode.token().to_uppercase()), Some(mode));
+            // Both strategies present on the display refresh.
+            assert_eq!(mode.present_mode(), wgpu::PresentMode::Fifo);
+        }
+        // Unknown spellings keep the default instead of guessing.
+        assert_eq!(LatencyMode::parse("reflex"), None);
+        assert_eq!(LatencyMode::parse(""), None);
+        // The persisted key round-trips through the settings file (the
+        // view_settings tests cover the file format itself).
+        assert_eq!(LatencyMode::parse("xell"), Some(LatencyMode::Xell));
+        assert_eq!(LatencyMode::parse("vsync"), Some(LatencyMode::Vsync));
+        // VSync never involves XeLL, whatever frame generation is selected.
+        for fg in FrameGenMethod::ALL {
+            assert_eq!(latency_owner(LatencyMode::Vsync, fg), LatencyOwner::Vsync);
+        }
+        // XeLL is independent of the upscaler and of every frame generator
+        // except the one that must own a context itself.
+        for fg in [
+            FrameGenMethod::Off,
+            FrameGenMethod::Dlss,
+            FrameGenMethod::Fsr,
+        ] {
+            assert_eq!(
+                latency_owner(LatencyMode::Xell, fg),
+                LatencyOwner::Independent
+            );
+        }
+        assert_eq!(
+            latency_owner(LatencyMode::Xell, FrameGenMethod::Xess),
+            LatencyOwner::FrameGeneration
+        );
+    }
+
+    /// The gate follows Intel's cross-vendor rule: XeLL latency reduction on a
+    /// non-Intel GPU only while XeSS Frame Generation is the active owner.
+    #[test]
+    fn latency_support_gate() {
+        assert!(support_latency(
+            LatencyMode::Vsync,
+            FrameGenMethod::Off,
+            &amd_rx7900xtx(),
+            &SdkReport::default()
+        )
+        .is_available());
+        // No libxell.dll -> disabled with the folder named.
+        let no_sdk = support_latency(
+            LatencyMode::Xell,
+            FrameGenMethod::Off,
+            &intel_arc_a770(),
+            &SdkReport::default(),
+        );
+        assert!(!no_sdk.is_available());
+        assert!(no_sdk.reason().unwrap().contains("libxell.dll"));
+        if !cfg!(windows) {
+            // Nothing else is testable off Windows: the platform gate wins.
+            assert!(support_latency(
+                LatencyMode::Xell,
+                FrameGenMethod::Off,
+                &intel_arc_a770(),
+                &full_sdk()
+            )
+            .reason()
+            .unwrap()
+            .contains("Windows"));
+            return;
+        }
+        // Intel Arc + SDK + no frame generation: the viewer owns the context.
+        assert!(support_latency(
+            LatencyMode::Xell,
+            FrameGenMethod::Off,
+            &intel_arc_a770(),
+            &full_sdk()
+        )
+        .is_available());
+        // Non-Intel GPU without XeSS-FG: Intel does not enable it.
+        let cross = support_latency(
+            LatencyMode::Xell,
+            FrameGenMethod::Off,
+            &amd_rx7900xtx(),
+            &full_sdk(),
+        );
+        assert!(!cross.is_available());
+        assert!(cross.reason().unwrap().contains("XeSS Frame Generation"));
+        // ... but with XeSS-FG selected it is available, through that context.
+        assert!(support_latency(
+            LatencyMode::Xell,
+            FrameGenMethod::Xess,
+            &amd_rx7900xtx(),
+            &full_sdk()
+        )
+        .is_available());
+    }
+
     #[test]
     fn pairing_table_legal_and_illegal() {
         for up in UpscaleMethod::ALL {
@@ -2431,6 +2683,24 @@ fn diagnose_upscale(args: &[String]) -> i32 {
                 println!("  {} — {}", method.label(), describe_support(&fg));
             }
             println!();
+            println!("Latency support (Graphics -> Latency):");
+            for mode in LatencyMode::ALL {
+                let support = support_latency(mode, FrameGenMethod::Off, &gpu, &sdk);
+                println!("  {} — {}", mode.label(), describe_support(&support));
+            }
+            // XeLL is also reachable through XeSS Frame Generation's mandatory
+            // context; that is the only cross-vendor route Intel documents.
+            println!(
+                "  {} + Frame generation = XeSS — {}",
+                LatencyMode::Xell.label(),
+                describe_support(&support_latency(
+                    LatencyMode::Xell,
+                    FrameGenMethod::Xess,
+                    &gpu,
+                    &sdk
+                ))
+            );
+            println!();
             println!("Quality modes and internal render factors (1920×1080 window):");
             for method in UpscaleMethod::ALL {
                 if method == UpscaleMethod::Off {
@@ -2470,14 +2740,14 @@ fn diagnose_upscale(args: &[String]) -> i32 {
         }
     }
 
-    let any_sdk = sdk.dlss || sdk.fsr_upscale || sdk.xess;
+    let any_sdk = sdk.dlss || sdk.fsr_upscale || sdk.xess || sdk.xell;
     if parsed.require_sdk && !any_sdk {
         println!();
         println!("FAIL: --require-sdk and no vendor SDK DLL was found in the probed folder(s).");
         return 4;
     }
     println!();
-    println!("Done. FSR is integrated in this build (see README → Graphics); unavailable providers are reported, not faked.");
+    println!("Done. FSR, XeSS and XeLL are integrated in this build (see README -> Graphics); unavailable providers are reported, not faked.");
     0
 }
 

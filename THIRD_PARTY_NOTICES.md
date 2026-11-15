@@ -27,9 +27,13 @@ it, not this page, is authoritative for your copy.
 3. Run `perfect-world-explorer --diagnose-upscale --sdk-dir <path>`
    and `perfect-world-explorer --diagnose-framegen --sdk-dir <path>`
    to see what was detected.
-4. `.gitignore` ignores `*.dll` and `/sdk/`; never commit vendor binaries.
-   `tools/package-windows.ps1` stages only the redistributable set described
-   below.
+4. `.gitignore` ignores `*.dll` and `/sdk/`, then un-ignores exactly the two
+   redistributable sets described below (AMD FidelityFX and Intel
+   XeSS/XeSS-FG/XeLL) plus the headers and licenses that go with them. Nothing
+   else under `sdk/` can be committed, and NVIDIA binaries never are.
+   `tools/package-windows.ps1` stages only those allowlisted files, and
+   `tools/verify-vendor-sdks.py` fails if the allowlist, the probe in
+   `src/main.rs` and the loaders in `src/xess/` and `src/fsr/` ever disagree.
 
 Expected file names probed (names vary between SDK releases; the diagnostics
 print exactly which names were found):
@@ -179,16 +183,34 @@ print exactly which names were found):
   exists in the SDK v3.0.2 release; the Intel Simplified Software License
   governs the SDK.)
 - **Redistribution:** permitted by the Intel Simplified Software License with
-  the notice preserved. This package does not include the binaries; the user
-  supplies them from the official release. The packaging script never stages
-  vendor binaries that are not committed (NVIDIA binaries are never staged;
-  FSR binaries are committed).
+  the notice preserved, and **the three binaries are committed to this
+  repository** under `sdk/` (they are the same files Intel publishes in the
+  `XeSS_SDK_3.0.2.zip` release, unmodified — the license forbids any
+  modification). The copyright notice and terms travel with them as
+  `sdk/Intel_XeSS-SDK-3.0.2-LICENSE.txt`, and the SDK's third-party terms as
+  `sdk/Intel_XeSS-SDK-3.0.2-third-party-programs.txt`.
+  `tools/package-windows.ps1` stages all three into every package's `sdk/`
+  folder next to the executable.
+
+  | File | Bytes | SHA-256 |
+  |---|---|---|
+  | `sdk/libxess.dll` | 77,795,704 | `251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7` |
+  | `sdk/libxess_fg.dll` | 22,957,432 | `ec5e0c65e075570c6ede72618bb666d0be0c2e10b2ea9762c0fe8cb8e375ab27` |
+  | `sdk/libxell.dll` | 415,368 | `d2030dcd694fda8f2ec7e044b13e6db8f0b56d4ba9113a5efad334e3f3ded8c7` |
+
+  `python3 tools/verify-vendor-sdks.py` re-checks those hashes, the PE export
+  tables (every symbol the viewer resolves with `GetProcAddress`) and the
+  numeric constants against the vendored headers. NVIDIA binaries are never
+  staged or committed.
 - **Attribution:** "XeSS", "XeLL" and "Intel Arc" are trademarks of Intel
   Corporation. Intel XeSS SR technology.
-- **Where to get it:** the official `v3.0.2` release of the XeSS SDK —
-  <https://github.com/intel/xess/releases/tag/v3.0.2> (asset `XeSS_SDK_3.0.2.zip`).
-  Copy `libxess.dll`, `libxess_fg.dll` and `libxell.dll` into `sdk/` (see
-  `sdk/SDK_GOES_HERE.txt`). Intel's XeSS topic page:
+- **Where it comes from:** the official `v3.0.2` release of the XeSS SDK —
+  <https://github.com/intel/xess/releases/tag/v3.0.2> (asset `XeSS_SDK_3.0.2.zip`;
+  the `bin/` folder of the same tree is served as
+  <https://codeload.github.com/intel/xess/tar.gz/refs/tags/v3.0.2>). To update,
+  copy `libxess.dll`, `libxess_fg.dll` and `libxell.dll` from that `bin/` folder
+  into `sdk/` and refresh the hashes above (see `sdk/SDK_GOES_HERE.txt`).
+  Intel's XeSS topic page:
   <https://www.intel.com/content/www/us/en/developer/topic/technology/xess.html>.
 - **Version documented against:** Intel XeSS SDK **3.0.2** (XeSS Super
   Resolution, XeSS Frame Generation, XeLL). Unverified in this build

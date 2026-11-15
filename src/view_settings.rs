@@ -1,7 +1,7 @@
 //! Persisted viewer controls; malformed values fall back safely.
 use crate::client_weather::WeatherOverride;
 use crate::sky_transition::SkyOverride;
-use crate::{FrameGenMethod, UpscaleMethod, UpscaleQuality};
+use crate::{FrameGenMethod, LatencyMode, UpscaleMethod, UpscaleQuality};
 
 #[path = "post_plan.rs"]
 mod post_plan;
@@ -218,6 +218,15 @@ pub struct ViewSettings {
     /// Graphics: AMD FSR 1 RCAS sharpness in stops (lower = sharper).
     /// Applies only while `upscaling` is `fsr1`.
     pub fsr1_sharpness: f32,
+    /// Graphics: pacing strategy — `vsync` is the previous behaviour (the
+    /// display paces presents and no latency library is involved), `xell`
+    /// hands the decision to Intel Xe Low Latency (`xellSleep` plus the
+    /// per-frame simulation / render-submit / present markers) while keeping a
+    /// vsync'd, sync-interval-1 present. Independent of the upscaler and of
+    /// frame generation; XeSS Frame Generation owns its own XeLL context, in
+    /// which case that context is the one that runs (see
+    /// `crate::latency_owner`).
+    pub latency: LatencyMode,
     /// Graphics: folder to load the vendor upscaling SDKs from. Empty means
     /// `PW_UPSCALER_SDK_DIR`, or `<exe>\sdk\` beside the viewer. The SDKs are
     /// not shipped with the viewer and are never committed to the repository.
@@ -301,6 +310,7 @@ impl Default for ViewSettings {
             frame_generation: FrameGenMethod::Off,
             fsr1_sharpness: 0.2,
             upscale_sdk_dir: String::new(),
+            latency: LatencyMode::Vsync,
             // Both overrides default to the client's own behaviour; the World
             // tab offers them only so the recovered sets and particle
             // constants can be inspected anywhere.
@@ -440,6 +450,14 @@ impl ViewSettings {
                     // it is stored rather than ignored.
                     s.upscale_sdk_dir = v.to_string();
                 }
+                "latency" => {
+                    // Unknown spellings keep VSync: a settings file written by
+                    // a newer build must not silently change the present
+                    // behaviour of this one.
+                    if let Some(mode) = LatencyMode::parse(v) {
+                        s.latency = mode;
+                    }
+                }
                 "regional_tree_lighting" => flag!(s.regional_tree_lighting),
                 "streamed_regions" => flag!(s.streamed_regions),
                 "grass_distance_fade" => flag!(s.grass_distance_fade),
@@ -531,12 +549,12 @@ impl ViewSettings {
             "radius={}\nterrain_cutoff={}\ntree_lod_scale={}\nscenery_quality={}\ncamera_speed={}\nboost={}\nsensitivity={}\nfar={}\ntime_of_day={}\ntime_pass_enabled={}\ntime_pass_speed={}\nall_to_vram={}\n",
             "whole_world={}\nwater_reflections={}\nworld_effects={}\natmospheric_fog={}\nbloom={}\nbloom_strength={}\nbloom_mode={}\nbloom_tint={}\nbloom_brightness_fade={}\nbloom_opacity_fade={}\nclient_gamma={}\ngamma_setting={}\n",
             "terrain_lightmaps={}\nmodel_backface_culling={}\nmusic_enabled={}\nmusic_volume={}\nambience_enabled={}\nsound_volume={}\neffects_enabled={}\neffects_volume={}\nfullscreen={}\nshow_zone_entry={}\n",
-            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nfsr1_sharpness={}\nupscale_sdk_dir={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\n"),
+            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nfsr1_sharpness={}\nupscale_sdk_dir={}\nlatency={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\n"),
             self.detail.radius,self.detail.terrain_cutoff,self.detail.tree_lod_scale,self.detail.scenery_quality,self.camera_speed,self.boost,self.sensitivity,self.far,self.time_of_day,self.time_pass_enabled,self.time_pass_speed,self.all_to_vram,
             self.whole_world,self.water_reflections,self.world_effects,self.atmospheric_fog,self.bloom,self.bloom_strength,self.bloom_mode,self.bloom_tint,self.bloom_brightness_fade,self.bloom_opacity_fade,self.client_gamma,self.gamma_setting,
             self.terrain_lightmaps,self.model_backface_culling,self.music_enabled,self.music_volume,self.ambience_enabled,self.sound_volume,self.effects_enabled,self.effects_volume,self.fullscreen,self.show_zone_entry,
             self.show_minimap,self.minimap_range,self.tree_wind_strength,self.client_tree_wind_preview,self.regional_tree_lighting,self.grass_distance_fade,self.grass_wind_enabled,self.grass_wind_amplitude,self.streamed_regions,self.area_grass_lightmaps,self.vegetation_authored_mips,self.celestial_discs,self.celestial_brightness,self.ignore_celestial_flags,self.cloud_detail,self.sharpen,self.resolution_scale,
-            self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.fsr1_sharpness,self.upscale_sdk_dir,
+            self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.fsr1_sharpness,self.upscale_sdk_dir,self.latency.token(),
             self.world_map_style.label(),self.minimap_style.label(),
             self.minimap_shape.label(),
             self.weather_override.token(),self.sky_override.token(),self.effect_shaft.token(),self.effect_distance,self.logging_mask,self.logging_dir)
@@ -1095,6 +1113,7 @@ effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs
         assert_eq!(s.upscale_quality, crate::UpscaleQuality::Quality);
         assert_eq!(s.frame_generation, crate::FrameGenMethod::Off);
         assert_eq!(s.upscale_sdk_dir, "");
+        assert_eq!(s.latency, LatencyMode::Vsync);
         let re_encoded = s.encode();
         // `bloom_tint` is the one legacy key whose value is re-encoded in a
         // different spelling (hex input, decimal output).
@@ -1120,6 +1139,7 @@ effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs
         assert_eq!(defaults.upscale_quality, crate::UpscaleQuality::Quality);
         assert_eq!(defaults.frame_generation, crate::FrameGenMethod::Off);
         assert_eq!(defaults.upscale_sdk_dir, "");
+        assert_eq!(defaults.latency, LatencyMode::Vsync);
         let s = ViewSettings::decode(
             "upscaling=dlss\nupscale_quality=performance\nframe_generation=dlss\n\
              upscale_sdk_dir=D:\\vendor-sdks\n",
@@ -1151,6 +1171,47 @@ effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs
         assert_eq!(mixed.frame_generation, crate::FrameGenMethod::Fsr);
         // Case-insensitive parse keeps the rest of the file intact.
         assert_eq!(ViewSettings::decode(&mixed.encode()), mixed);
+    }
+
+    /// The Graphics -> Latency key: round-trips, defaults to VSync, and falls
+    /// back to VSync on anything it does not recognise (a viewer that loses
+    /// its latency setting must not lose its present path).
+    #[test]
+    fn latency_settings_round_trip() {
+        assert_eq!(ViewSettings::default().latency, LatencyMode::Vsync);
+        for mode in LatencyMode::ALL {
+            let text = format!("latency={}\n", mode.token());
+            let decoded = ViewSettings::decode(&text);
+            assert_eq!(decoded.latency, mode, "{text:?}");
+            let encoded = decoded.encode();
+            assert!(
+                encoded.contains(&format!("latency={}", mode.token())),
+                "encode lost the latency key: {encoded}"
+            );
+            assert_eq!(ViewSettings::decode(&encoded).latency, mode);
+        }
+        for junk in ["latency=\n", "latency=reflex\n", "latency=2\n", "latency=\n"] {
+            assert_eq!(
+                ViewSettings::decode(junk).latency,
+                LatencyMode::Vsync,
+                "{junk:?}"
+            );
+        }
+        // Case and surrounding whitespace are tolerated like every other key.
+        assert_eq!(
+            ViewSettings::decode("latency=XE LL\n").latency,
+            LatencyMode::Vsync
+        );
+        assert_eq!(
+            ViewSettings::decode("latency= XeLL \n").latency,
+            LatencyMode::Xell
+        );
+        // The latency choice never disturbs the upscaler / frame generator,
+        // and coercion of those does not disturb it.
+        let both = ViewSettings::decode("upscaling=fsr2\nframe_generation=xess\nlatency=xell\n");
+        assert_eq!(both.frame_generation, FrameGenMethod::Off);
+        assert_eq!(both.latency, LatencyMode::Xell);
+        assert_eq!(ViewSettings::decode(&both.encode()), both);
     }
     #[test]
     fn legacy_bare_fsr_migrates_via_fsr_version() {
