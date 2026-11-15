@@ -1592,11 +1592,7 @@ fn custom_far_block_topology(stride: usize) -> (Vec<[u32; 2]>, Vec<u32>) {
         let center = points.len() as u32;
         points.push([BLOCK / 2, BLOCK / 2]);
         for i in 0..outer.len() {
-            indices.extend_from_slice(&[
-                center,
-                i as u32,
-                ((i + 1) % outer.len()) as u32,
-            ]);
+            indices.extend_from_slice(&[center, i as u32, ((i + 1) % outer.len()) as u32]);
         }
     }
     (points, indices)
@@ -1622,12 +1618,7 @@ fn rect_border(min: u32, max: u32, stride: u32) -> Vec<[u32; 2]> {
 /// Stitch two nested convex boundary loops into a triangle strip. Each loop is
 /// ordered clockwise; advancing whichever loop reaches the next normalized
 /// perimeter position preserves a non-crossing triangulation.
-fn zipper_ring(
-    outer: &[[u32; 2]],
-    inner: &[[u32; 2]],
-    inner_offset: u32,
-    indices: &mut Vec<u32>,
-) {
+fn zipper_ring(outer: &[[u32; 2]], inner: &[[u32; 2]], inner_offset: u32, indices: &mut Vec<u32>) {
     fn cumulative(points: &[[u32; 2]]) -> Vec<f32> {
         let mut lengths = Vec::with_capacity(points.len() + 1);
         lengths.push(0.);
@@ -1750,7 +1741,10 @@ mod tests {
                 })
                 .collect();
             assert_eq!(triangles.len(), if stride == 8 { 48 } else { 32 });
-            assert!(triangles.len() < 128, "stride {stride} did not reduce geometry");
+            assert!(
+                triangles.len() < 128,
+                "stride {stride} did not reduce geometry"
+            );
             for y in 0..128 {
                 for x in 0..128 {
                     let point = [(x as f32 + 0.37) * 0.25, (y as f32 + 0.61) * 0.25];
