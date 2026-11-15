@@ -58,36 +58,59 @@ if (-not (Test-Path -LiteralPath (Join-Path $packageRoot 'THIRD_PARTY_NOTICES.md
     throw "Staging did not produce THIRD_PARTY_NOTICES.md in $packageRoot"
 }
 
-# Vendored AMD FSR SDK 2.4.0 DX12 runtime (MIT-style licensed; see
-# THIRD_PARTY_NOTICES.md and sdk/AMD_FidelityFX-SDK-2.4.0-LICENSE.md). These
-# three DLLs are committed to the repository under sdk/ and are staged into
-# every package by default unless the caller passes -SdkDirectory (an
-# explicit folder then takes precedence) or the DLLs are absent.
+# Vendored runtime DLLs. Two vendors ship redistributable binaries *inside*
+# this repository under sdk/:
+#   * AMD FidelityFX SDK 2.4.0 DX12 (MIT-style; sdk/AMD_FidelityFX-SDK-2.4.0-LICENSE.md)
+#   * Intel XeSS SDK 3.0.2: libxess.dll (super resolution), libxess_fg.dll
+#     (frame generation) and libxell.dll (Xe Low Latency; required by XeSS-FG on
+#     every GPU and used by the Graphics -> Latency -> XeLL mode). Intel
+#     Simplified Software License; see sdk/Intel_XeSS-SDK-3.0.2-LICENSE.txt and
+#     sdk/Intel_XeSS-SDK-3.0.2-third-party-programs.txt.
+# They are staged into every package by default unless the caller passes
+# -SdkDirectory (an explicit folder then takes precedence) or a file is absent.
 $vendoredSdk = Join-Path $repoRoot 'sdk'
 if ([string]::IsNullOrWhiteSpace($SdkDirectory) -and (Test-Path -LiteralPath $vendoredSdk -PathType Container)) {
     $vendoredAllowlist = @(
         'amd_fidelityfx_loader_dx12.dll',
         'amd_fidelityfx_upscaler_dx12.dll',
-        'amd_fidelityfx_framegeneration_dx12.dll'
+        'amd_fidelityfx_framegeneration_dx12.dll',
+        'libxess.dll',
+        'libxess_fg.dll',
+        'libxell.dll'
     )
     $sdkTarget = Join-Path $packageRoot 'sdk'
     New-Item -ItemType Directory -Force -Path $sdkTarget | Out-Null
     $stagedVendored = 0
+    $stagedAmdVendored = 0
+    $stagedIntelVendored = 0
     foreach ($name in $vendoredAllowlist) {
         $source = Join-Path $vendoredSdk $name
         if (Test-Path -LiteralPath $source -PathType Leaf) {
             Copy-Item -LiteralPath $source -Destination (Join-Path $sdkTarget $name)
             $stagedVendored++
-            Write-Host "Staged vendored AMD FSR binary: sdk/$name"
+            if ($name -like 'libxess*' -or $name -eq 'libxell.dll') {
+                $stagedIntelVendored++
+                Write-Host "Staged vendored Intel XeSS/XeLL binary: sdk/$name"
+            } else {
+                $stagedAmdVendored++
+                Write-Host "Staged vendored AMD FSR binary: sdk/$name"
+            }
         }
     }
     if ($stagedVendored -eq 0) {
         Remove-Item -LiteralPath $sdkTarget -Force
-        Write-Host "No vendored AMD FSR DLLs found under sdk/; nothing staged."
+        Write-Host "No vendored SDK DLLs found under sdk/; nothing staged."
     } else {
-        # Ship the AMD license + third-party notice inside sdk/ so the staged
-        # binaries carry their permission notice with them (MIT-style terms).
-        foreach ($extra in @('AMD_FidelityFX-SDK-2.4.0-LICENSE.md', 'AMD_FidelityFX-SDK-2.4.0-notices.md')) {
+        # Ship each vendor's license + third-party notice inside sdk/ so the
+        # staged binaries carry their permission notices with them.
+        $extras = @()
+        if ($stagedAmdVendored -gt 0) {
+            $extras += @('AMD_FidelityFX-SDK-2.4.0-LICENSE.md', 'AMD_FidelityFX-SDK-2.4.0-notices.md')
+        }
+        if ($stagedIntelVendored -gt 0) {
+            $extras += @('Intel_XeSS-SDK-3.0.2-LICENSE.txt', 'Intel_XeSS-SDK-3.0.2-third-party-programs.txt')
+        }
+        foreach ($extra in $extras) {
             $extraPath = Join-Path $vendoredSdk $extra
             if (Test-Path -LiteralPath $extraPath -PathType Leaf) {
                 Copy-Item -LiteralPath $extraPath -Destination (Join-Path $sdkTarget $extra)
@@ -103,8 +126,9 @@ if (-not [string]::IsNullOrWhiteSpace($SdkDirectory)) {
     $sdkRoot = (Resolve-Path -LiteralPath $SdkDirectory).Path
     # Intel XeSS SDK 3.0.2: libxess.dll (super resolution), libxess_fg.dll
     # (frame generation), libxell.dll (low latency; mandatory for XeSS-FG on
-    # every GPU, Intel or not). Staged only from the user-supplied folder;
-    # never committed to the repository.
+    # every GPU, Intel or not). The same three files are vendored under sdk/
+    # and staged by default; supplying this folder overrides them (for example
+    # to ship a newer XeSS release).
     $amdNames = @(
         'amd_fidelityfx_loader_dx12.dll',
         'amd_fidelityfx_upscaler_dx12.dll',
@@ -157,7 +181,7 @@ if (-not [string]::IsNullOrWhiteSpace($SdkDirectory)) {
             $extras += @('AMD_FidelityFX-SDK-2.4.0-LICENSE.md', 'AMD_FidelityFX-SDK-2.4.0-notices.md')
         }
         if ($stagedIntel -gt 0) {
-            $extras += @('Intel_XeSS-SDK-3.0.2-LICENSE.txt')
+            $extras += @('Intel_XeSS-SDK-3.0.2-LICENSE.txt', 'Intel_XeSS-SDK-3.0.2-third-party-programs.txt')
         }
         foreach ($extra in $extras) {
             $extraPath = Join-Path $vendoredSdk $extra

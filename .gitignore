@@ -37,10 +37,24 @@ google_drive/
 # same license terms as the binaries above; kept for reference and review).
 !/sdk/include/
 !/sdk/include/**
-# The Intel XeSS SDK headers used by the FFI integration (Intel Simplified
-# Software License; see sdk/Intel_XeSS-SDK-3.0.2-LICENSE.txt and
-# THIRD_PARTY_NOTICES.md). The XeSS DLLs (libxess.dll, libxess_fg.dll,
-# libxell.dll, ~100 MB) are NOT committed — download the XeSS SDK 3.0.2
-# release from https://github.com/intel/xess/releases and copy the three
-# DLLs into sdk/ (see sdk/SDK_GOES_HERE.txt).
+# The Intel XeSS / XeSS-FG / XeLL runtime DLLs (XeSS SDK 3.0.2). The Intel
+# Simplified Software License allows redistribution of the unmodified binaries
+# provided the copyright notice and terms travel with them, which is why
+# sdk/Intel_XeSS-SDK-3.0.2-LICENSE.txt and the third-party notice are vendored
+# next to them and THIRD_PARTY_NOTICES.md records the SHA-256 of each file.
+# Without these three files the Graphics tab keeps XeSS, XeSS Frame Generation
+# and the XeLL Latency mode disabled with a "not found" reason.
+!/sdk/libxess.dll
+!/sdk/libxess_fg.dll
+!/sdk/libxell.dll
 !/sdk/Intel_XeSS-SDK-3.0.2-LICENSE.txt
+!/sdk/Intel_XeSS-SDK-3.0.2-third-party-programs.txt
+# The Intel XeSS headers the FFI integration was written against (XeSS SDK
+# 3.0.2, same license); kept for review and for tools/verify-vendor-sdks.py,
+# which checks every constant and export against them.
+!/sdk/include/xess/
+!/sdk/include/xess/**
+!/sdk/include/xess_fg/
+!/sdk/include/xess_fg/**
+!/sdk/include/xell/
+!/sdk/include/xell/**
