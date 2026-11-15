@@ -225,6 +225,12 @@ mod fg_stub {
         pub fn frames_presented(&self) -> u64 {
             0
         }
+
+        /// Whether this frame generator wants the UI drawn into the composition
+        /// (and therefore interpolated) rather than into a separate UI texture.
+        pub fn ui_in_composition(&self) -> bool {
+            true
+        }
     }
 }
 
