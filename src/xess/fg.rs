@@ -79,6 +79,19 @@ const XEFG_SWAPCHAIN_RES_UI: u32 = 3;
 const XEFG_LOGGING_LEVEL_INFO: i32 = 1;
 
 /// Human-readable XeSS-FG result codes for diagnostics.
+/// Human-readable UI composition mode, for the ready line and for retests.
+fn xefg_ui_mode_name(mode: i32) -> &'static str {
+    match mode {
+        0 => "AUTO",
+        1 => "NONE",
+        2 => "BACKBUFFER_UITEXTURE",
+        3 => "HUDLESS_UITEXTURE",
+        4 => "BACKBUFFER_HUDLESS",
+        5 => "BACKBUFFER_HUDLESS_UITEXTURE",
+        _ => "unknown",
+    }
+}
+
 pub(crate) fn xefg_result_name(rc: i32) -> &'static str {
     match rc {
         0 => "XEFG_SWAPCHAIN_RESULT_SUCCESS",
@@ -458,6 +471,17 @@ impl XessFrameGeneration {
             )
         };
         let init_flags = XEFG_INIT_FLAG_INVERTED_DEPTH;
+        // UI composition mode. 3 = HUDLESS_UITEXTURE is what this build ships:
+        // the proxy interpolates the tagged HUD-less colour and blends the UI
+        // texture on top. `PW_XEFG_UI_MODE` lets a retest try another mode
+        // without a rebuild — 5 = BACKBUFFER_HUDLESS_UITEXTURE (UI refinement
+        // from the back buffer, the Unreal-Engine-recommended variant) or
+        // 2 = BACKBUFFER_UITEXTURE (no HUD-less colour needed).
+        let ui_mode = std::env::var("PW_XEFG_UI_MODE")
+            .ok()
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .filter(|mode| (0..=5).contains(mode))
+            .unwrap_or(XEFG_UI_MODE_HUDLESS_UITEXTURE);
         let init_params = XefgD3D12InitParams {
             application_swapchain: std::ptr::null_mut(), // desc-based: XeSS-FG creates the proxy
             init_flags,
@@ -469,7 +493,7 @@ impl XessFrameGeneration {
             temp_texture_heap: std::ptr::null_mut(),
             texture_heap_offset: 0,
             pipeline_library: std::ptr::null_mut(),
-            ui_mode: XEFG_UI_MODE_HUDLESS_UITEXTURE,
+            ui_mode,
         };
         let mut properties = XefgProperties {
             required_descriptor_count: 0,
@@ -645,8 +669,11 @@ impl XessFrameGeneration {
         let mv_pass = FsrMotionVectorPass::new(device);
 
         crate::xess::diag(&format!(
-            "[XeSS FG] frame generation ready (2x, depth-inverted, UI via HUDLESS_UITEXTURE) at {}x{}",
-            display_extent.0, display_extent.1
+            "[XeSS FG] frame generation ready (2x, depth-inverted, UI composition mode {} = {}) at {}x{}",
+            ui_mode,
+            xefg_ui_mode_name(ui_mode),
+            display_extent.0,
+            display_extent.1
         ));
 
         Ok(XessFrameGeneration {

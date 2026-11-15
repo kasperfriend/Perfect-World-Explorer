@@ -349,6 +349,12 @@ done.
   failing silently.
 - **What the retest has to show:** with XeSS-FG active the HUD stays visible
   and sharp on real *and* generated frames; `session.log` names neither of the
-  two tagging failures.
+  two tagging failures, and its `[XeSS FG] frame generation ready (...)` line
+  says `UI composition mode 3 = HUDLESS_UITEXTURE`. If the HUD is still
+  missing, `PW_XEFG_UI_MODE=5` (BACKBUFFER_HUDLESS_UITEXTURE: same inputs plus
+  UI refinement from the back buffer) and then `PW_XEFG_UI_MODE=2`
+  (BACKBUFFER_UITEXTURE: UI texture only) isolate whether the HUD-less tag or
+  the blend formula is at fault — no rebuild needed, the mode is read at
+  context creation and named in that log line.
 - **Status:** open (fix is written and compiles on Windows CI; not yet
   confirmed on hardware).

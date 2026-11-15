@@ -117,6 +117,7 @@ mod imp_stub {
             _color: &wgpu::Texture,
             _depth: &wgpu::Texture,
             _unjittered_vp: &glam::Mat4,
+            _sharpness: f32,
         ) -> Result<(), String> {
             Err("unsupported".to_string())
         }
