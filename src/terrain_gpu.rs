@@ -868,10 +868,9 @@ impl TerrainGpu {
         self.bind = self.resources.bind(device, normal, &masks);
         self.reflect_bind = self.resources.bind(device, reflection, &masks);
         self.far = upload.far.as_ref().map(|mesh| FarGpu::upload(device, mesh));
-        // Submit/poll also retires old in-flight atlas/buffer references. No
-        // permanent full-world allocation remains behind the cutoff checkbox.
-        queue.submit(std::iter::empty());
-        device.poll(wgpu::Maintain::Wait);
+        // Non-blocking poll lets wgpu retire old in-flight atlas/buffer
+        // references without stalling the CPU/GPU pipeline.
+        device.poll(wgpu::Maintain::Poll);
         Ok(())
     }
     /// `runs` is the per-view visibility result (`block+0x74`): `None` draws the
