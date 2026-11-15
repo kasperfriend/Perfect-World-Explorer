@@ -425,9 +425,14 @@ done.
      integrations create the proxy without the flag. `MakeWindowAssociation`
      (followed by `DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES`) is now
      called on the proxy's factory right after init, as those integrations do.
+- **Superseded by the HUD contract in `GRAPHICS_TECHNOLOGIES.md`:** the default
+  UI mode is `XEFG_SWAPCHAIN_UI_MODE_BACKBUFFER_HUDLESS` (4) again. The UI is
+  drawn into a copy of the composition and the proxy extracts it from the
+  presented frame, so the HUD is neither interpolated nor handed over as a
+  separate texture; `PW_XEFG_UI_COMPOSITION=0` selects the `NONE` behaviour
+  described above.
 - **What the retest has to show:** no black frames, and the ready line in
-  `session.log` reading `UI composition mode 1 = NONE, UI drawn into the
-  composition (interpolated by the model), frame generation enabled`, plus
+  `session.log` reading `UI composition mode 4 = BACKBUFFER_HUDLESS`, plus
   `present id …: 2 frame(s) presented`.
 - **If it still flickers, these three runs decide the next step** (all are
   environment variables, no rebuild):
