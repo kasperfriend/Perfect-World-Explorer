@@ -1100,7 +1100,7 @@ impl World {
             });
             return;
         }
-        
+
         for (instance, slot) in self.assets.instances.iter_mut().zip(&mut self.slots) {
             if !cutoff_residency::contains(bounds, instance.placement.position) {
                 continue;
