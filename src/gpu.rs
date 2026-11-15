@@ -5191,6 +5191,19 @@ pub fn run(
                                     },
                                 },
                             };
+                            // The offset the world was actually rendered with this
+                            // frame, from whichever upscaler is active. Every
+                            // frame-generation prepare has to see this exact value:
+                            // taking it from one specific provider meant FSR frame
+                            // generation was handed (0, 0) while DLSS or XeSS
+                            // jittered the world, so the interpolator corrected for
+                            // a jitter that was not there (wobble on still edges).
+                            let frame_jitter = fsr_upscaler
+                                .as_ref()
+                                .map(|fsr| fsr.jitter())
+                                .or_else(|| xess_upscaler.as_ref().map(|xess| xess.jitter()))
+                                .or_else(|| dlss_upscaler.as_ref().map(|dlss| dlss.jitter()))
+                                .unwrap_or((0.0, 0.0));
                             renderer.render(
                                 &world_view,
                                 &world_raw_view,
@@ -5241,7 +5254,7 @@ pub fn run(
                             if let Some(fg) = framegen.as_mut() {
                                 let d = camera.direction();
                                 let (yaw_s, yaw_c) = camera.yaw.sin_cos();
-                                let jitter = fsr_upscaler.as_ref().map_or((0.0, 0.0), |fsr| fsr.jitter());
+                                let jitter = frame_jitter;
                                 let frame_time_ms = (dt * 1000.0).clamp(0.1, 1000.0);
                                 let prepare_result = fg.prepare(
                                     &renderer.device,
@@ -5293,7 +5306,7 @@ pub fn run(
                             if let Some(fg) = xess_framegen.as_mut() {
                                 let view = camera.view_matrix();
                                 let projection = camera.projection_matrix(config.width, config.height, camera.far);
-                                let jitter = xess_upscaler.as_ref().map_or((0.0, 0.0), |xess| xess.jitter());
+                                let jitter = frame_jitter;
                                 let frame_time_ms = (dt * 1000.0).clamp(0.1, 1000.0);
                                 let prepare_result = fg.prepare(
                                     &renderer.device,

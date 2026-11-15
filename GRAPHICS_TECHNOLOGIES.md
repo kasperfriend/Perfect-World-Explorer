@@ -40,7 +40,15 @@ translation instead (`T * VP`) divides the on-screen displacement by `clip.w`, s
 near geometry moves several pixels while the horizon barely moves; no temporal
 accumulator can converge on that, and it showed up as blur and ghosting from
 DLSS and XeSS. The same raw pixel offsets still go to `ffxDispatchDescUpscale.
-jitterOffset`, `xessExecute` and NGX `Jitter.Offset`. Separately, the composite
+jitterOffset`, `xessExecute` and NGX `Jitter.Offset`. FSR 2/3/4 takes its
+sequence from FFX itself (`GetJitterOffset`, resets on a camera cut), DLSS and
+XeSS use the in-tree 16-phase Halton(2,3) sequence, and every provider applies
+it to the world matrix *and* its own evaluate call from the same value. The
+frame loop keeps that value in one place (`frame_jitter` in `src/gpu.rs`), so
+frame generation sees the jitter the world was actually rendered with no matter
+which upscaler is active — FSR-FG used to be handed `(0, 0)` while DLSS or XeSS
+jittered the world, which made the interpolator correct for a jitter that was
+not there. Separately, the composite
 pass that writes the FFX result into the sRGB world target now decodes first
 (`fs_decode`, `src/fsr/mv.rs`): copying sRGB bytes into an sRGB render target
 encoded them a second time (mid grey 0.5 landed at 0.735), which is exactly the
