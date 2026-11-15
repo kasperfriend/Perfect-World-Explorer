@@ -858,7 +858,7 @@ impl GpuPage {
                 bound = Some(cmd.page);
             }
             pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
-      
+        }
         }
 
     pub fn world_culled_commands(pages: &[Self]) -> [Vec<WorldDrawCmd>; WORLD_VIEWS] {
