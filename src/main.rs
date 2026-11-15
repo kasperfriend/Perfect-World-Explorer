@@ -849,8 +849,10 @@ fn export_height_png(
 // ## Settings tokens
 //
 // `upscaling=off|dlss|fsr1|fsr2|fsr3|fsr4|xess`,
-// `upscale_quality=ultraquality|quality|balanced|performance|ultraperformance`,
+// `upscale_quality=nativeaa|ultraquality|quality|balanced|performance|ultraperformance`
+// (`nativeaa` is FSR 3.1 only: the same dispatch at a 1.0x render ratio),
 // `frame_generation=off|dlss|fsr|xess`, `fsr1_sharpness=<0..2 stops>`,
+// `fsr3_sharpness=<0..1>` (FFX `sharpness` for FSR 3.1/4), `latency=vsync|xell`,
 // `upscale_sdk_dir=<path>`.
 //
 // This logic is intentionally free of GPU and windowing dependencies so it
@@ -1354,14 +1356,16 @@ pub fn latency_owner(mode: LatencyMode, frame_generation: FrameGenMethod) -> Lat
 
 /// Hardware + SDK gate for one latency strategy. VSync is always available.
 ///
-/// The non-Intel rule is Intel's own: in the XeLL developer guide, latency
-/// reduction on a third-party GPU is only enabled while XeSS Frame Generation
-/// is active ("application must ensure that XeSS-FG is enabled if running in
-/// cross-vendor mode"), and the app "must disable the latency reduction feature
-/// if XeSS-FG is not supported on a non-Intel device". So on NVIDIA/AMD
-/// hardware the option is offered only once XeSS-FG is selected in the same
-/// tab — and in that case the frame generator's context is the one doing the
-/// work, which `latency_owner` reports.
+/// XeLL itself — the library, the per-frame markers, `xellSleep` — loads and
+/// runs on every vendor; only the driver-side latency *reduction* is gated by
+/// Intel. In the XeLL developer guide that reduction on a third-party GPU is
+/// enabled only while XeSS Frame Generation is active ("application must
+/// ensure that XeSS-FG is enabled if running in cross-vendor mode"). The
+/// option therefore stays selectable on NVIDIA/AMD hardware — the user asked
+/// for it, and a session that starts and reports markers is still useful — but
+/// the reason string says plainly what the driver will and will not do, and
+/// the HUD badge reports a failed session if `xellSleep` is refused at
+/// runtime.
 pub fn support_latency(
     mode: LatencyMode,
     frame_generation: FrameGenMethod,
@@ -1391,10 +1395,14 @@ pub fn support_latency(
                                 "XeLL found (xellSleep + per-frame markers; present stays vsync'd)",
                             )
                         } else {
-                            Support::Disabled(format!(
-                                "Intel enables XeLL latency reduction on a non-Intel GPU only with XeSS Frame Generation (set Frame generation = XeSS Frame Generation); detected: {}",
-                                gpu.name
-                            ))
+                            // Selectable by request: the session still runs and
+                            // reports markers. Intel only turns the sleep hint
+                            // into real latency reduction on a non-Intel GPU
+                            // while XeSS Frame Generation owns the context, and
+                            // the note says so instead of greying the option.
+                            Support::Available(
+                                "XeLL found; on a non-Intel GPU Intel applies its latency reduction only while XeSS Frame Generation is active — the session still runs xellSleep + per-frame markers",
+                            )
                         }
                     }
                     LatencyOwner::Vsync => Support::Available("vsync'd present"),
@@ -1405,9 +1413,12 @@ pub fn support_latency(
 }
 
 /// Quality mode for the upscaler. "UltraQuality" maps to DLAA on DLSS
-/// (native resolution with temporal accumulation).
+/// (native resolution with temporal accumulation); `NativeAa` is the explicit
+/// "render at 1.0×, only run the provider's temporal antialiasing" mode, which
+/// FSR 3.1 dispatches as an upscale with `renderSize == upscaleSize`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UpscaleQuality {
+    NativeAa,
     UltraQuality,
     #[default]
     Quality,
@@ -1417,7 +1428,8 @@ pub enum UpscaleQuality {
 }
 
 impl UpscaleQuality {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
+        Self::NativeAa,
         Self::UltraQuality,
         Self::Quality,
         Self::Balanced,
@@ -1427,6 +1439,7 @@ impl UpscaleQuality {
 
     pub fn label(self) -> &'static str {
         match self {
+            Self::NativeAa => "Native AA (1.0× render, no upscaling)",
             Self::UltraQuality => "Ultra Quality (DLAA on DLSS)",
             Self::Quality => "Quality",
             Self::Balanced => "Balanced",
@@ -1437,6 +1450,7 @@ impl UpscaleQuality {
 
     pub fn token(self) -> &'static str {
         match self {
+            Self::NativeAa => "nativeaa",
             Self::UltraQuality => "ultraquality",
             Self::Quality => "quality",
             Self::Balanced => "balanced",
@@ -1447,6 +1461,7 @@ impl UpscaleQuality {
 
     pub fn parse(text: &str) -> Option<Self> {
         match text.trim().to_ascii_lowercase().as_str() {
+            "nativeaa" | "native_aa" | "native aa" => Some(Self::NativeAa),
             "ultraquality" | "ultra_quality" => Some(Self::UltraQuality),
             "quality" => Some(Self::Quality),
             "balanced" => Some(Self::Balanced),
@@ -1458,16 +1473,22 @@ impl UpscaleQuality {
 }
 
 /// Which quality modes each provider documents. XeSS (1.x/2.x) has no Ultra
-/// Performance mode; DLSS maps Ultra Quality onto DLAA.
+/// Performance mode; DLSS maps Ultra Quality onto DLAA. Native AA — the
+/// explicit `renderSize == upscaleSize` dispatch — is offered for FSR 3.1,
+/// where AMD documents it; the other providers either replace it with their
+/// own Ultra Quality/DLAA mode or reject a 1.0× ratio.
 pub fn quality_available(method: UpscaleMethod, quality: UpscaleQuality) -> bool {
-    match method {
-        UpscaleMethod::Off
-        | UpscaleMethod::Dlss
-        | UpscaleMethod::Fsr1
-        | UpscaleMethod::Fsr2
-        | UpscaleMethod::Fsr3
-        | UpscaleMethod::Fsr4 => true,
-        UpscaleMethod::Xess => quality != UpscaleQuality::UltraPerformance,
+    match quality {
+        UpscaleQuality::NativeAa => matches!(method, UpscaleMethod::Fsr3),
+        _ => match method {
+            UpscaleMethod::Off
+            | UpscaleMethod::Dlss
+            | UpscaleMethod::Fsr1
+            | UpscaleMethod::Fsr2
+            | UpscaleMethod::Fsr3
+            | UpscaleMethod::Fsr4 => true,
+            UpscaleMethod::Xess => quality != UpscaleQuality::UltraPerformance,
+        },
     }
 }
 
@@ -1481,6 +1502,7 @@ pub fn internal_factor(method: UpscaleMethod, quality: UpscaleQuality) -> f64 {
     match method {
         UpscaleMethod::Off => 1.0,
         UpscaleMethod::Dlss => match quality {
+            UpscaleQuality::NativeAa => 1.0,
             UpscaleQuality::UltraQuality => 1.0,
             UpscaleQuality::Quality => 1.0 / 1.5,
             UpscaleQuality::Balanced => 1.0 / 1.7,
@@ -1491,6 +1513,7 @@ pub fn internal_factor(method: UpscaleMethod, quality: UpscaleQuality) -> f64 {
         // providers; the spatial pass has no DLAA-style native accumulation.
         UpscaleMethod::Fsr1 | UpscaleMethod::Fsr2 | UpscaleMethod::Fsr3 | UpscaleMethod::Fsr4 => {
             match quality {
+                UpscaleQuality::NativeAa => 1.0,
                 UpscaleQuality::UltraQuality => 1.0 / 1.3,
                 UpscaleQuality::Quality => 1.0 / 1.5,
                 UpscaleQuality::Balanced => 1.0 / 1.7,
@@ -1499,6 +1522,7 @@ pub fn internal_factor(method: UpscaleMethod, quality: UpscaleQuality) -> f64 {
             }
         }
         UpscaleMethod::Xess => match quality {
+            UpscaleQuality::NativeAa => 1.0,
             UpscaleQuality::UltraQuality => 1.0 / 1.3,
             UpscaleQuality::Quality => 1.0 / 1.5,
             UpscaleQuality::Balanced => 1.0 / 1.7,
@@ -1523,6 +1547,17 @@ impl Support {
     /// The disabled reason, if any — what the UI shows next to the option.
     pub fn reason(&self) -> Option<&str> {
         match self {
+            Self::Available(_) => None,
+            Self::Disabled(reason) => Some(reason),
+        }
+    }
+
+    /// The explanation for this option whether it is available or not: a
+    /// disabled reason, or the caveat that comes with an available option
+    /// (XeLL on a non-Intel GPU, for instance).
+    pub fn note(&self) -> Option<&str> {
+        match self {
+            Self::Available(note) if !note.is_empty() => Some(note),
             Self::Available(_) => None,
             Self::Disabled(reason) => Some(reason),
         }
@@ -2203,8 +2238,8 @@ mod tests {
         );
     }
 
-    /// The gate follows Intel's cross-vendor rule: XeLL latency reduction on a
-    /// non-Intel GPU only while XeSS Frame Generation is the active owner.
+    /// The gate keeps XeLL selectable on every vendor, and reports the
+    /// cross-vendor caveat instead of greying the option out.
     #[test]
     fn latency_support_gate() {
         assert!(support_latency(
@@ -2245,15 +2280,18 @@ mod tests {
             &full_sdk()
         )
         .is_available());
-        // Non-Intel GPU without XeSS-FG: Intel does not enable it.
+        // Non-Intel GPU without XeSS-FG: selectable, with Intel's cross-vendor
+        // caveat spelled out.
         let cross = support_latency(
             LatencyMode::Xell,
             FrameGenMethod::Off,
             &amd_rx7900xtx(),
             &full_sdk(),
         );
-        assert!(!cross.is_available());
-        assert!(cross.reason().unwrap().contains("XeSS Frame Generation"));
+        assert!(cross.is_available());
+        let note = cross.note().unwrap();
+        assert!(note.contains("non-Intel"));
+        assert!(note.contains("XeSS Frame Generation"));
         // ... but with XeSS-FG selected it is available, through that context.
         assert!(support_latency(
             LatencyMode::Xell,
@@ -2385,6 +2423,47 @@ mod tests {
             internal_factor(UpscaleMethod::Dlss, UpscaleQuality::UltraQuality),
             1.0
         );
+    }
+
+    /// Native AA is the FSR 3.1 `renderSize == upscaleSize` dispatch: it must
+    /// render at exactly the output resolution, be offered for FSR 3.1 only,
+    /// and survive the settings round-trip.
+    #[test]
+    fn native_aa_is_native_and_fsr3_only() {
+        assert_eq!(UpscaleQuality::parse("native_aa"), Some(UpscaleQuality::NativeAa));
+        assert_eq!(UpscaleQuality::parse("Native AA"), Some(UpscaleQuality::NativeAa));
+        assert_eq!(
+            UpscaleQuality::parse(UpscaleQuality::NativeAa.token()),
+            Some(UpscaleQuality::NativeAa)
+        );
+        assert_eq!(internal_factor(UpscaleMethod::Fsr3, UpscaleQuality::NativeAa), 1.0);
+        assert_eq!(
+            provider_extent(UpscaleMethod::Fsr3, UpscaleQuality::NativeAa, 1920, 1080, 8192),
+            (1920, 1080)
+        );
+        assert!(quality_available(UpscaleMethod::Fsr3, UpscaleQuality::NativeAa));
+        for method in UpscaleMethod::ALL {
+            if method != UpscaleMethod::Fsr3 {
+                assert!(
+                    !quality_available(method, UpscaleQuality::NativeAa),
+                    "{method:?} must not offer native AA"
+                );
+            }
+        }
+        // A persisted native-AA choice degrades instead of being dropped when
+        // the upscaler changes to one that cannot dispatch a 1.0x ratio.
+        let (_, quality, _) = sanitise(
+            UpscaleMethod::Dlss,
+            UpscaleQuality::NativeAa,
+            FrameGenMethod::Off,
+        );
+        assert_eq!(quality, UpscaleQuality::Quality);
+        let (_, quality, _) = sanitise(
+            UpscaleMethod::Fsr3,
+            UpscaleQuality::NativeAa,
+            FrameGenMethod::Fsr,
+        );
+        assert_eq!(quality, UpscaleQuality::NativeAa);
     }
 
     #[test]

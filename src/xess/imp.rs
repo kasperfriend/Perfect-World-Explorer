@@ -316,7 +316,9 @@ impl XessUpscaler {
     ) -> Result<Self, String> {
         let _ = queue;
         let (quality_setting, quality_name) = match quality {
-            crate::UpscaleQuality::UltraQuality => {
+            // Not offered for XeSS (see `quality_available`); the 1.0× render
+            // extent still works, so map it onto the sharpest XeSS mode.
+            crate::UpscaleQuality::NativeAa | crate::UpscaleQuality::UltraQuality => {
                 (XESS_QUALITY_SETTING_ULTRA_QUALITY, "ultra quality")
             }
             crate::UpscaleQuality::Quality => (XESS_QUALITY_SETTING_QUALITY, "quality"),

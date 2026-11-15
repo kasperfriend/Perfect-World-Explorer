@@ -1414,6 +1414,7 @@ impl FsrUpscaler {
         color: &wgpu::Texture,
         depth: &wgpu::Texture,
         unjittered_vp: &Mat4,
+        sharpness: f32,
     ) -> Result<(), String> {
         let now = std::time::Instant::now();
         let frame_time_ms = (now - self.last_instant).as_secs_f32() * 1000.0;
@@ -1610,11 +1611,12 @@ impl FsrUpscaler {
                 width: self.display_extent.0,
                 height: self.display_extent.1,
             },
-            // FFX sharpening pass (FSR 1 gets RCAS on the blit path, so
-            // match it here). 0.5 is a moderate amount, the mid grey between
-            // "no additional sharpness" and "maximum" from the FFX docs.
-            enable_sharpening: true,
-            sharpness: 0.75,
+            // FFX sharpening pass (FSR 1 gets RCAS on the blit path, so the
+            // two stay consistent). `sharpness` is the Graphics slider: 0
+            // disables the pass entirely (FFX ignores the value unless
+            // `enableSharpening` is set) and 1 is FFX's documented maximum.
+            enable_sharpening: sharpness > 0.0,
+            sharpness: sharpness.clamp(0.0, 1.0),
             frame_time_delta: frame_time_ms.clamp(0.1, 1000.0),
             pre_exposure: 1.0,
             reset: self.reset_history,

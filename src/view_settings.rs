@@ -218,6 +218,11 @@ pub struct ViewSettings {
     /// Graphics: AMD FSR 1 RCAS sharpness in stops (lower = sharper).
     /// Applies only while `upscaling` is `fsr1`.
     pub fsr1_sharpness: f32,
+    /// Graphics: sharpening strength handed to the FSR 3.1 / FSR 4 FFX
+    /// upscale dispatch (0 = off, 1 = maximum; FFX calls it `sharpness` and
+    /// only applies it while `enableSharpening` is set). Applies while
+    /// `upscaling` is `fsr3` or `fsr4`.
+    pub fsr3_sharpness: f32,
     /// Graphics: pacing strategy — `vsync` is the previous behaviour (the
     /// display paces presents and no latency library is involved), `xell`
     /// hands the decision to Intel Xe Low Latency (`xellSleep` plus the
@@ -309,6 +314,7 @@ impl Default for ViewSettings {
             upscale_quality: UpscaleQuality::Quality,
             frame_generation: FrameGenMethod::Off,
             fsr1_sharpness: 0.2,
+            fsr3_sharpness: 0.75,
             upscale_sdk_dir: String::new(),
             latency: LatencyMode::Vsync,
             // Both overrides default to the client's own behaviour; the World
@@ -431,6 +437,7 @@ impl ViewSettings {
                     }
                 }
                 "fsr1_sharpness" => number!(s.fsr1_sharpness, 0., 2.),
+                "fsr3_sharpness" => number!(s.fsr3_sharpness, 0., 1.),
                 "upscale_quality" => {
                     if let Some(quality) = UpscaleQuality::parse(v) {
                         s.upscale_quality = quality;
@@ -549,12 +556,12 @@ impl ViewSettings {
             "radius={}\nterrain_cutoff={}\ntree_lod_scale={}\nscenery_quality={}\ncamera_speed={}\nboost={}\nsensitivity={}\nfar={}\ntime_of_day={}\ntime_pass_enabled={}\ntime_pass_speed={}\nall_to_vram={}\n",
             "whole_world={}\nwater_reflections={}\nworld_effects={}\natmospheric_fog={}\nbloom={}\nbloom_strength={}\nbloom_mode={}\nbloom_tint={}\nbloom_brightness_fade={}\nbloom_opacity_fade={}\nclient_gamma={}\ngamma_setting={}\n",
             "terrain_lightmaps={}\nmodel_backface_culling={}\nmusic_enabled={}\nmusic_volume={}\nambience_enabled={}\nsound_volume={}\neffects_enabled={}\neffects_volume={}\nfullscreen={}\nshow_zone_entry={}\n",
-            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nfsr1_sharpness={}\nupscale_sdk_dir={}\nlatency={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\n"),
+            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nfsr1_sharpness={}\nfsr3_sharpness={}\nupscale_sdk_dir={}\nlatency={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\n"),
             self.detail.radius,self.detail.terrain_cutoff,self.detail.tree_lod_scale,self.detail.scenery_quality,self.camera_speed,self.boost,self.sensitivity,self.far,self.time_of_day,self.time_pass_enabled,self.time_pass_speed,self.all_to_vram,
             self.whole_world,self.water_reflections,self.world_effects,self.atmospheric_fog,self.bloom,self.bloom_strength,self.bloom_mode,self.bloom_tint,self.bloom_brightness_fade,self.bloom_opacity_fade,self.client_gamma,self.gamma_setting,
             self.terrain_lightmaps,self.model_backface_culling,self.music_enabled,self.music_volume,self.ambience_enabled,self.sound_volume,self.effects_enabled,self.effects_volume,self.fullscreen,self.show_zone_entry,
             self.show_minimap,self.minimap_range,self.tree_wind_strength,self.client_tree_wind_preview,self.regional_tree_lighting,self.grass_distance_fade,self.grass_wind_enabled,self.grass_wind_amplitude,self.streamed_regions,self.area_grass_lightmaps,self.vegetation_authored_mips,self.celestial_discs,self.celestial_brightness,self.ignore_celestial_flags,self.cloud_detail,self.sharpen,self.resolution_scale,
-            self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.fsr1_sharpness,self.upscale_sdk_dir,self.latency.token(),
+            self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.fsr1_sharpness,self.fsr3_sharpness,self.upscale_sdk_dir,self.latency.token(),
             self.world_map_style.label(),self.minimap_style.label(),
             self.minimap_shape.label(),
             self.weather_override.token(),self.sky_override.token(),self.effect_shaft.token(),self.effect_distance,self.logging_mask,self.logging_dir)
@@ -1218,6 +1225,24 @@ effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs
         assert_eq!(both.latency, LatencyMode::Xell);
         assert_eq!(ViewSettings::decode(&both.encode()), both);
     }
+    /// The FSR sharpening slider persists, is clamped, and defaults to the
+    /// value the dispatch used before the slider existed.
+    #[test]
+    fn fsr3_sharpness_round_trip() {
+        assert_eq!(ViewSettings::default().fsr3_sharpness, 0.75);
+        let decoded = ViewSettings::decode("upscaling=fsr3\nfsr3_sharpness=0.25\n");
+        assert_eq!(decoded.fsr3_sharpness, 0.25);
+        let encoded = decoded.encode();
+        assert!(encoded.contains("fsr3_sharpness=0.25"), "{encoded}");
+        assert_eq!(ViewSettings::decode(&encoded).fsr3_sharpness, 0.25);
+        // Out-of-range values clamp to the 0..1 range, junk keeps the default.
+        assert_eq!(ViewSettings::decode("fsr3_sharpness=-1\n").fsr3_sharpness, 0.0);
+        assert_eq!(ViewSettings::decode("fsr3_sharpness=7\n").fsr3_sharpness, 1.0);
+        assert_eq!(ViewSettings::decode("fsr3_sharpness=abc\n").fsr3_sharpness, 0.75);
+        // 0 is a legal value and means "no sharpening", not "unset".
+        assert_eq!(ViewSettings::decode("fsr3_sharpness=0\n").fsr3_sharpness, 0.0);
+    }
+
     #[test]
     fn legacy_bare_fsr_migrates_via_fsr_version() {
         // Pre-selector settings files: `upscaling=fsr` with an `fsr_version`

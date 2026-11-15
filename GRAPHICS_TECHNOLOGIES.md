@@ -17,6 +17,20 @@ the selected one.
 | DLSS Super Resolution | Not integrated. Renders bilinear at the DLSS-recommended internal resolution. | Requires NVIDIA RTX + SDK (not shipped). |
 | XeSS | **Implemented, runtime-unverified.** Intel XeSS Super Resolution (SDK 3.0.2, `libxess.dll`) as a temporal `xessD3D12Execute` on a native DX12 command list: reversed-Z depth, LDR sRGB input, Halton(2,3) jitter, and the shared reversed-Z depth-reprojection motion-vector pass. Any loader/dispatch failure logs and falls back to bilinear for the session. | Vendored Intel XeSS SDK 3.0.2 (`libxess.dll`, included in `sdk/`) + Windows/DX12 + SM 6.4 GPU. |
 
+**Native AA** is a quality entry, not a provider: `upscale_quality=nativeaa`
+renders at exactly the window resolution (factor 1.0) and dispatches the
+provider with `renderSize == upscaleSize`, which is how FSR 3.1 exposes
+temporal antialiasing without upscaling. It is offered for FSR 3.1 only — the
+other providers either have their own name for the same thing (DLSS Ultra
+Quality = DLAA) or refuse a 1.0× ratio. A persisted `nativeaa` choice degrades
+to `quality` when the upscaler is changed to one that cannot dispatch it
+(`crate::sanitise`). The FFX sharpening pass is a slider too: **FSR
+sharpening** (`fsr3_sharpness`, 0 = off, 1 = maximum, default 0.75) is passed
+straight through as `ffxDispatchDescUpscale.sharpness` with
+`enableSharpening = sharpness > 0`, and applies to FSR 3.1/4 and to Native AA
+alike. The value is read every frame, so dragging the slider takes effect
+without recreating the context.
+
 FSR 1 and the FFX providers are independent implementations; picking
 `FSR 1` never touches FFX, and picking `FSR 2/3/4` never loads the FSR 1
 pipelines. Legacy `viewer-settings.txt` files with `upscaling=fsr` and
@@ -31,7 +45,7 @@ from the tab.
 | Off | **Works.** | Always available. |
 | FSR Frame Generation | **Implemented, runtime-unverified.** FFX swapchain (`FrameGenerationSwapChainForHwndDX12`) takes over the window through the shared hand-over (`src/fsr/swapchain.rs`, see `docs/blockers.md` B-10); composites a separate native-resolution UI texture onto real *and* generated frames; `ffxDispatchDescFrameGeneration` runs on the swapchain's interpolation command list. **Independent of the upscaler — works with FSR 1, FSR 2/3/4, the DLSS/XeSS fallback, or Upscaling Off entirely.** The FG context creates with the mandatory `ffxCreateContextDescFrameGenerationVersion` plus the DX12 backend descriptor, and retries the older advertised FG providers before giving up; FFX diagnostic messages are piped to stderr (`[FSR ...]`). Failure restores the standard present path for the session. | Vendored AMD SDK 2.4.0 (included) + Windows/DX12 + any real GPU. |
 | DLSS Frame Generation | Not integrated. No frames are synthesised. | Requires NVIDIA RTX 40 + SDK (not shipped). |
-| XeSS Frame Generation | **Implemented, runtime-unverified.** XeSS-FG proxy swapchain (`xefgSwapChainD3D12InitFromSwapChainDesc`) takes over the window through the same hand-over, exactly like the FSR path: it paces real and interpolated frames and composites a separate native-resolution premultiplied-alpha UI texture (`HUDLESS_UITEXTURE`) onto both, so the UI is never interpolated. XeLL (`libxell.dll`) is mandatory on every GPU — Intel Arc included — and the viewer creates the XeLL context itself, enables low-latency mode (`xellSetSleepMode`), and delivers the required simulation / render-submit / present markers each frame; the XeLL context is destroyed after the XeSS-FG context, as the SDK requires. **Documented pairing: XeSS upscaling or none.** Failure restores the standard present path for the session. | Vendored Intel XeSS SDK 3.0.2 (`libxess_fg.dll` **and** `libxell.dll`, included in `sdk/`) + Windows/DX12 + SM 6.4 GPU. |
+| XeSS Frame Generation | **Implemented, runtime-unverified.** XeSS-FG proxy swapchain (`xefgSwapChainD3D12InitFromSwapChainDesc`) takes over the window through the same hand-over, exactly like the FSR path: it paces real and interpolated frames and composites a separate native-resolution premultiplied-alpha UI texture (`HUDLESS_UITEXTURE`) onto both, so the UI is never interpolated. That mode has **two** required inputs — the UI texture *and* the HUD-less colour, which is tagged every frame (`XEFG_SWAPCHAIN_RES_HUDLESS_COLOR`, `RV_UNTIL_NEXT_PRESENT`, parked in `PIXEL_COMPUTE_READ` and restored by the next frame's `prepare`). Tagging only the UI texture leaves XeSS-FG with no colour to interpolate and no UI to composite, which reads on screen as "the whole HUD vanished" while the scene keeps rendering; both tags are unconditional. XeLL (`libxell.dll`) is mandatory on every GPU — Intel Arc included — and the viewer creates the XeLL context itself, enables low-latency mode (`xellSetSleepMode`), and delivers the required simulation / render-submit / present markers each frame; the XeLL context is destroyed after the XeSS-FG context, as the SDK requires. **Documented pairing: XeSS upscaling or none.** Failure restores the standard present path for the session. | Vendored Intel XeSS SDK 3.0.2 (`libxess_fg.dll` **and** `libxell.dll`, included in `sdk/`) + Windows/DX12 + SM 6.4 GPU. |
 
 ## Latency
 
@@ -42,7 +56,7 @@ any upscaler (including Off) and with any frame generator.
 | Entry (Graphics tab) | Status | Gate |
 |---|---|---|
 | VSync | **Works** — the default, and what every build before this setting did. The display paces presents (`PresentMode::Fifo`); no latency library is involved. | Always available. |
-| XeLL | **Implemented, runtime-unverified.** Intel Xe Low Latency (`libxell.dll`): `xellSleep` holds the CPU back until the GPU queue is nearly empty (render-queue reduction), and the simulation / render-submit / present markers are delivered every frame so the library can line the end of rendering up with the display's refresh while keeping the wait short. Present stays vsync'd with sync interval 1 — Intel requires exactly that while low-latency mode is on — so this lowers latency *relative to* VSync rather than replacing it. The viewer creates the context itself (`src/latency.rs`), waits for an idle device before `xellSetSleepMode` (SDK requirement), keeps the marker edges ordered, and drops the context when the setting stops asking for it. Any failure logs, shows the reason on the mark, and leaves the vsync'd present path untouched. | Vendored Intel XeSS SDK 3.0.2 (`libxell.dll`, included in `sdk/`) + Windows/DX12 + a real GPU. **On a non-Intel GPU Intel only enables latency reduction while XeSS Frame Generation is active**, so the entry stays disabled with that reason until Frame generation = XeSS Frame Generation. |
+| XeLL | **Implemented, runtime-unverified.** Intel Xe Low Latency (`libxell.dll`): `xellSleep` holds the CPU back until the GPU queue is nearly empty (render-queue reduction), and the simulation / render-submit / present markers are delivered every frame so the library can line the end of rendering up with the display's refresh while keeping the wait short. Present stays vsync'd with sync interval 1 — Intel requires exactly that while low-latency mode is on — so this lowers latency *relative to* VSync rather than replacing it. The viewer creates the context itself (`src/latency.rs`), waits for an idle device before `xellSetSleepMode` (SDK requirement), keeps the marker edges ordered, and drops the context when the setting stops asking for it. Any failure logs, shows the reason on the mark, and leaves the vsync'd present path untouched. | Vendored Intel XeSS SDK 3.0.2 (`libxell.dll`, included in `sdk/`) + Windows/DX12 + a real GPU. XeLL is **selectable on every vendor** — the library, `xellSleep` and the per-frame markers work on any GPU, and the note under the combo says so. **On a non-Intel GPU, though, Intel only turns that into actual latency reduction while XeSS Frame Generation is active**, so on NVIDIA/AMD expect the markers to run without a measurable gain unless Frame generation = XeSS Frame Generation (where the frame generator owns the context). |
 
 Ownership: XeSS Frame Generation needs a XeLL context of its own and refuses to
 initialise its proxy swapchain without one, so with `Frame generation = XeSS
@@ -65,8 +79,9 @@ truncated) saying so instead of vanishing.
 ## Settings tokens
 
 `upscaling=off|dlss|fsr1|fsr2|fsr3|fsr4|xess` ·
-`upscale_quality=ultraquality|quality|balanced|performance|ultraperformance` ·
+`upscale_quality=nativeaa|ultraquality|quality|balanced|performance|ultraperformance` ·
 `fsr1_sharpness=<0..2 stops>` ·
+`fsr3_sharpness=<0..1>` (FFX sharpening for FSR 3.1/4 and Native AA) ·
 `frame_generation=off|dlss|fsr|xess` ·
 `latency=vsync|xell` ·
 `upscale_sdk_dir=<path>` (FFX / XeSS SDKs; empty = env var or `<exe>\sdk\`).

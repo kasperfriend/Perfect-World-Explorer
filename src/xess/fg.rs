@@ -72,6 +72,7 @@ const XEFG_INIT_FLAG_INVERTED_DEPTH: u32 = 1 << 0;
 const XEFG_UI_MODE_HUDLESS_UITEXTURE: i32 = 3;
 const XEFG_UI_COMPOSITION_STATE_ENABLED: u32 = 1;
 const XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT: u32 = 0;
+const XEFG_SWAPCHAIN_RES_HUDLESS_COLOR: u32 = 0;
 const XEFG_SWAPCHAIN_RES_DEPTH: u32 = 1;
 const XEFG_SWAPCHAIN_RES_MOTION_VECTOR: u32 = 2;
 const XEFG_SWAPCHAIN_RES_UI: u32 = 3;
@@ -354,6 +355,10 @@ pub struct XessFrameGeneration {
     /// reads them in during Present; the next `prepare` restores them
     /// before the motion-vector pass writes them again.
     depth_mv_parked: bool,
+    /// `true` while the composition (the HUD-less color XeSS-FG interpolates)
+    /// is parked in the compute/read state; the next `prepare` restores it so
+    /// the world pass can render into it again.
+    compose_parked: bool,
 }
 
 impl Drop for XessFrameGeneration {
@@ -664,6 +669,7 @@ impl XessFrameGeneration {
             frames: 0,
             ui_needs_rt_restore: false,
             depth_mv_parked: false,
+            compose_parked: false,
         })
     }
 
@@ -787,10 +793,10 @@ impl XessFrameGeneration {
         // consumed (depth/MV/UI are in PIXEL_COMPUTE_READ after the last
         // finish()). Must run BEFORE the wgpu motion-vector pass writes
         // depth/MV as RENDER_TARGET next frame.
-        if self.depth_mv_parked || self.ui_needs_rt_restore {
+        if self.depth_mv_parked || self.ui_needs_rt_restore || self.compose_parked {
             let slot_index = self.ring.acquire("XeSS FG")?;
             let list = &mut self.ring.slot_mut(slot_index).list;
-            let mut barriers = Vec::with_capacity(3);
+            let mut barriers = Vec::with_capacity(4);
             if self.depth_mv_parked {
                 barriers.push(barrier(
                     &self.depth.resource,
@@ -810,10 +816,18 @@ impl XessFrameGeneration {
                     D3D12_STATE_RENDER_TARGET,
                 ));
             }
+            if self.compose_parked {
+                barriers.push(barrier(
+                    &self.compose.resource,
+                    D3D12_STATE_PIXEL_COMPUTE_READ,
+                    D3D12_STATE_RENDER_TARGET,
+                ));
+            }
             list.resource_barrier(&barriers);
             self.ring.retire(slot_index, &self.queue, "XeSS FG")?;
             self.depth_mv_parked = false;
             self.ui_needs_rt_restore = false;
+            self.compose_parked = false;
         }
 
         // --- wgpu side: raw depth copy + MV pass (same math as FSR).
@@ -976,8 +990,9 @@ impl XessFrameGeneration {
         }
     }
 
-    /// Copy the composition into the proxy backbuffer, tag the UI texture,
-    /// set the present id and present through the proxy.
+    /// Copy the composition into the proxy backbuffer, tag the HUD-less colour
+    /// and the UI texture (both required by `HUDLESS_UITEXTURE` mode), set the
+    /// present id and present through the proxy.
     ///
     /// `ui_visible` must reflect whether the UI was drawn into
     /// [`Self::ui_view`] this frame (the surface must still hold the UI or
@@ -1037,20 +1052,55 @@ impl XessFrameGeneration {
             (*list.as_mut_ptr())
                 .CopyResource(backbuffer.as_mut_ptr(), self.compose.resource.as_mut_ptr());
         }
+        // The composition is the HUD-less colour XeSS-FG interpolates, so it
+        // has to stay readable (PIXEL_COMPUTE_READ) when Present runs; the
+        // next prepare() puts it back into RENDER_TARGET for the world pass.
         let restore = [
             barrier(
                 &self.compose.resource,
                 D3D12_STATE_COPY_SRC,
-                D3D12_STATE_RENDER_TARGET,
+                D3D12_STATE_PIXEL_COMPUTE_READ,
             ),
             barrier(&backbuffer, D3D12_STATE_COPY_DEST, D3D12_STATE_PRESENT),
         ];
         list.resource_barrier(&restore);
         self.ring.retire(slot_index, &self.queue, "XeSS FG")?;
+        self.compose_parked = true;
         if ui_visible {
             // XeSS-FG reads the UI surface during Present; it stays parked
             // in PIXEL_COMPUTE_READ until the next prepare restores it.
             self.ui_needs_rt_restore = true;
+        }
+
+        // --- Tag the HUD-less colour. `HUDLESS_UITEXTURE` mode has two
+        // required inputs — the HUD-less colour and the UI texture — and the
+        // proxy's back buffer only supplies the presentation target: without
+        // this tag XeSS-FG has no colour to interpolate and composites no UI,
+        // which reads on screen as "the whole HUD vanished".
+        let hudless = XefgD3D12ResourceData {
+            resource_type: XEFG_SWAPCHAIN_RES_HUDLESS_COLOR,
+            validity: XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT,
+            resource_base: Xefg2d { x: 0, y: 0 },
+            resource_size: Xefg2d {
+                x: width,
+                y: height,
+            },
+            resource: self.compose.resource.as_mut_ptr() as *mut c_void,
+            incoming_state: D3D12_STATE_PIXEL_COMPUTE_READ,
+        };
+        let rc = unsafe {
+            (self.loader.tag_frame_resource)(
+                self.loader.context,
+                std::ptr::null_mut(),
+                id,
+                &hudless,
+            )
+        };
+        if rc != 0 {
+            super::diag(&format!(
+                "[XeSS FG] tagging the HUD-less colour failed ({}); UI composition will be missing",
+                xefg_result_name(rc)
+            ));
         }
 
         // --- Tag the UI texture so generated frames composite it sharp.

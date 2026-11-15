@@ -47,9 +47,13 @@
 //!   [`crate::xess::XessFrameGeneration`], so when frame generation is XeSS this
 //!   module creates nothing and the frame generator's context performs the
 //!   latency reduction ([`crate::LatencyOwner::FrameGeneration`]).
-//! * Intel only enables latency reduction on a **non-Intel** GPU while XeSS-FG
-//!   is active, so on NVIDIA/AMD hardware the Graphics tab leaves the XeLL
-//!   option disabled until XeSS-FG is selected (`crate::support_latency`).
+//! * Intel only turns the sleep hint into real latency reduction on a
+//!   **non-Intel** GPU while XeSS-FG is active. The Graphics tab keeps XeLL
+//!   selectable on every vendor anyway (a session that starts and reports
+//!   markers is still useful, and the note next to the option says exactly
+//!   what the driver will do — `crate::support_latency`); on NVIDIA/AMD the
+//!   session may also be refused at runtime, in which case the mark reports the
+//!   failure and the vsync'd present path continues unchanged.
 //! * All GPU work must be finished before `xellSetSleepMode` is called; the
 //!   session therefore waits for an idle device first.
 //!

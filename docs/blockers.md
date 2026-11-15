@@ -322,3 +322,33 @@ done.
   associated with a flip-model swapchain).
 - **Status:** open (fix is written and compiles on Windows CI; not yet
   confirmed on hardware).
+
+## B-11 — XeSS Frame Generation hides the whole HUD (screen report, Phase 4.2x)
+
+- **Step:** Settings → Graphics → **Frame generation** = XeSS Frame Generation
+  with XeSS-FG initialising successfully.
+- **Symptom on the reporting machine:** the scene renders and animates, the
+  frame rate doubles, but *every* HUD element disappears — minimap, status
+  badge, menus, all of it. FSR-FG does not show the problem.
+- **Diagnosis:** the XeSS-FG initialisation asks for
+  `XEFG_SWAPCHAIN_UI_MODE_HUDLESS_UITEXTURE` (mode 3). Per Intel's XeSS-FG
+  guide that mode has **two required inputs** — the UI-only texture *and* the
+  HUD-less colour ("HUD-less Color: Required" in the mode table) — and the
+  proxy's own back buffer is only the presentation target. `finish()` tagged
+  the UI texture (`XEFG_SWAPCHAIN_RES_UI`) but never the HUD-less colour
+  (`XEFG_SWAPCHAIN_RES_HUDLESS_COLOR`, type 0), so the model had nothing to
+  interpolate and nothing to composite the UI onto: the presented frames came
+  out of the passthrough copy of the composition target, which by design does
+  not contain the UI, and the HUD was gone rather than interpolated.
+- **Fix:** `src/xess/fg.rs` tags the composition texture as the HUD-less colour
+  on every frame (`RV_UNTIL_NEXT_PRESENT`, no command list, `PIXEL_COMPUTE_READ`
+  incoming state), parks it in that state after the back-buffer copy and
+  restores it to `RENDER_TARGET` in the next frame's `prepare()` — the same
+  pattern already used for the UI texture, depth and motion vectors. A failed
+  tag logs `[XeSS FG] tagging the HUD-less colour failed (...)` instead of
+  failing silently.
+- **What the retest has to show:** with XeSS-FG active the HUD stays visible
+  and sharp on real *and* generated frames; `session.log` names neither of the
+  two tagging failures.
+- **Status:** open (fix is written and compiles on Windows CI; not yet
+  confirmed on hardware).
