@@ -1586,7 +1586,9 @@ pub fn support_framegen(
                     "XeSS 2 Frame Generation SDK (libxess_fg.dll and libxell.dll)",
                 ))
             } else {
-                Support::Available("XeSS 2 Frame Generation SDK found (XeLL latency reduction included)")
+                Support::Available(
+                    "XeSS 2 Frame Generation SDK found (XeLL latency reduction included)",
+                )
             }
         }
     }

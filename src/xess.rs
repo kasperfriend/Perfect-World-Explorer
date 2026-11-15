@@ -176,7 +176,10 @@ mod fg_stub {
             _surface_format: wgpu::TextureFormat,
             _ui_format: wgpu::TextureFormat,
         ) -> Result<XessFrameGeneration, String> {
-            Err("XeSS Frame Generation is only supported on Windows with a DX12 backend".to_string())
+            Err(
+                "XeSS Frame Generation is only supported on Windows with a DX12 backend"
+                    .to_string(),
+            )
         }
 
         pub fn compose_view(&self) -> wgpu::TextureView {

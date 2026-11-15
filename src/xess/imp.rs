@@ -8,12 +8,12 @@
 
 use super::loader::{free_sdk_dll, load_sdk_dll};
 use crate::fsr::{
-    raw_dx12, D3D12_STATE_COMMON, D3D12_STATE_COPY_DEST, D3D12_STATE_PIXEL_COMPUTE_READ,
-    D3D12_STATE_RENDER_TARGET, D3D12_STATE_UNORDERED_ACCESS,
-};
-use crate::fsr::{
     dxgi_color_format, dxgi_output_format, FsrComposite, FsrMotionVectorPass, FsrMvParams,
     NativeCommandRing, NativeTexture2D,
+};
+use crate::fsr::{
+    raw_dx12, D3D12_STATE_COMMON, D3D12_STATE_COPY_DEST, D3D12_STATE_PIXEL_COMPUTE_READ,
+    D3D12_STATE_RENDER_TARGET, D3D12_STATE_UNORDERED_ACCESS,
 };
 use glam::{Mat4, Vec3};
 use std::ffi::c_void;
@@ -321,9 +321,7 @@ impl XessUpscaler {
             }
             crate::UpscaleQuality::Quality => (XESS_QUALITY_SETTING_QUALITY, "quality"),
             crate::UpscaleQuality::Balanced => (XESS_QUALITY_SETTING_BALANCED, "balanced"),
-            crate::UpscaleQuality::Performance => {
-                (XESS_QUALITY_SETTING_PERFORMANCE, "performance")
-            }
+            crate::UpscaleQuality::Performance => (XESS_QUALITY_SETTING_PERFORMANCE, "performance"),
             crate::UpscaleQuality::UltraPerformance => {
                 (XESS_QUALITY_SETTING_ULTRA_PERFORMANCE, "ultra performance")
             }
@@ -341,7 +339,8 @@ impl XessUpscaler {
             ));
         }
         loader.context = context;
-        let _ = unsafe { (loader.set_logging)(context, XESS_LOGGING_LEVEL_INFO, xess_log_callback) };
+        let _ =
+            unsafe { (loader.set_logging)(context, XESS_LOGGING_LEVEL_INFO, xess_log_callback) };
         let rc = unsafe { (loader.is_optimal_driver)(context) };
         if rc == 2 {
             crate::xess::diag("[XeSS] warning: the installed driver may degrade XeSS quality or performance; a newer driver is recommended");
@@ -349,7 +348,8 @@ impl XessUpscaler {
 
         let init_flags = XESS_INIT_FLAG_INVERTED_DEPTH | XESS_INIT_FLAG_LDR_INPUT_COLOR;
         // Pre-build kernels so init() does not stall on pipeline creation.
-        let rc = unsafe { (loader.build_pipelines)(context, std::ptr::null_mut(), true, init_flags) };
+        let rc =
+            unsafe { (loader.build_pipelines)(context, std::ptr::null_mut(), true, init_flags) };
         if rc != 0 {
             crate::xess::diag(&format!(
                 "[XeSS] xessD3D12BuildPipelines returned {}; init will compile pipelines instead",
@@ -627,11 +627,7 @@ impl XessUpscaler {
             descriptor_heap_offset: 0,
         };
         let rc = unsafe {
-            (self.loader.execute)(
-                self.loader.context,
-                list.as_mut_ptr() as *mut c_void,
-                &exec,
-            )
+            (self.loader.execute)(self.loader.context, list.as_mut_ptr() as *mut c_void, &exec)
         };
 
         let restore = [

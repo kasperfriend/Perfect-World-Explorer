@@ -21,10 +21,8 @@ pub(crate) const XELL_PRESENT_END: i32 = 5;
 
 const XELL_LOGGING_LEVEL_WARNING: i32 = 2;
 
-type PfnXellD3D12CreateContext = unsafe extern "C" fn(
-    dev: *mut c_void,
-    out_context: *mut *mut c_void,
-) -> i32;
+type PfnXellD3D12CreateContext =
+    unsafe extern "C" fn(dev: *mut c_void, out_context: *mut *mut c_void) -> i32;
 type PfnXellSetSleepMode =
     unsafe extern "C" fn(context: *mut c_void, param: *const XellSleepParams) -> i32;
 type PfnXellSleep = unsafe extern "C" fn(context: *mut c_void, frame_id: u32) -> i32;
@@ -94,8 +92,7 @@ impl Xell {
             b"xellSetLoggingCallback\0",
         ];
         let (handle, exports) = load_sdk_dll(sdk_dir, "libxell.dll", EXPORTS)?;
-        let create_context: PfnXellD3D12CreateContext =
-            unsafe { std::mem::transmute(exports[0]) };
+        let create_context: PfnXellD3D12CreateContext = unsafe { std::mem::transmute(exports[0]) };
         let set_sleep_mode: PfnXellSetSleepMode = unsafe { std::mem::transmute(exports[1]) };
         let sleep_fn: PfnXellSleep = unsafe { std::mem::transmute(exports[2]) };
         let marker_fn: PfnXellAddMarkerData = unsafe { std::mem::transmute(exports[3]) };
@@ -112,9 +109,8 @@ impl Xell {
                 xell_result_name(rc)
             ));
         }
-        let _ = unsafe {
-            set_logging_callback(context, XELL_LOGGING_LEVEL_WARNING, xell_log_callback)
-        };
+        let _ =
+            unsafe { set_logging_callback(context, XELL_LOGGING_LEVEL_WARNING, xell_log_callback) };
         // Latency reduction is always enabled while XeLL lives. The frame
         // limiter is not used (0 = no cap), matching the engine's own pace.
         let params = XellSleepParams {

@@ -230,14 +230,12 @@ type PfnXefgTagFrameConstants = unsafe extern "C" fn(
     constants: *const XefgFrameConstantData,
 ) -> i32;
 type PfnXefgSetEnabled = unsafe extern "C" fn(context: *mut c_void, enable: u32) -> i32;
-type PfnXefgSetUiCompositionState =
-    unsafe extern "C" fn(context: *mut c_void, state: u32) -> i32;
-type PfnXefgSetLatencyReduction = unsafe extern "C" fn(context: *mut c_void, xell: *mut c_void) -> i32;
+type PfnXefgSetUiCompositionState = unsafe extern "C" fn(context: *mut c_void, state: u32) -> i32;
+type PfnXefgSetLatencyReduction =
+    unsafe extern "C" fn(context: *mut c_void, xell: *mut c_void) -> i32;
 type PfnXefgSetPresentId = unsafe extern "C" fn(context: *mut c_void, present_id: u32) -> i32;
-type PfnXefgGetLastPresentStatus = unsafe extern "C" fn(
-    context: *mut c_void,
-    out_status: *mut XefgPresentStatus,
-) -> i32;
+type PfnXefgGetLastPresentStatus =
+    unsafe extern "C" fn(context: *mut c_void, out_status: *mut XefgPresentStatus) -> i32;
 type PfnXefgDestroy = unsafe extern "C" fn(context: *mut c_void) -> i32;
 type PfnXefgD3D12GetProperties = unsafe extern "C" fn(
     context: *mut c_void,
@@ -432,7 +430,12 @@ impl XessFrameGeneration {
         }
         loader.context = context;
         let _ = unsafe {
-            (loader.set_logging)(context, XEFG_LOGGING_LEVEL_INFO, xefg_log_callback, std::ptr::null_mut())
+            (loader.set_logging)(
+                context,
+                XEFG_LOGGING_LEVEL_INFO,
+                xefg_log_callback,
+                std::ptr::null_mut(),
+            )
         };
         let init_flags = XEFG_INIT_FLAG_INVERTED_DEPTH;
         let init_params = XefgD3D12InitParams {
@@ -542,7 +545,9 @@ impl XessFrameGeneration {
         // The UI composition state is disabled by default; enable it so the
         // UI texture (HUDLESS_UITEXTURE mode) is composited onto real and
         // generated frames.
-        let rc = unsafe { (loader.set_ui_composition_state)(context, XEFG_UI_COMPOSITION_STATE_ENABLED) };
+        let rc = unsafe {
+            (loader.set_ui_composition_state)(context, XEFG_UI_COMPOSITION_STATE_ENABLED)
+        };
         if rc != 0 {
             crate::xess::diag(&format!(
                 "[XeSS FG] xefgSwapChainSetUiCompositionState(ENABLED) returned {}; UI may be missing from generated frames",
@@ -559,13 +564,8 @@ impl XessFrameGeneration {
         }
 
         let mut proxy: *mut c_void = std::ptr::null_mut();
-        let rc = unsafe {
-            (loader.get_swapchain_ptr)(
-                context,
-                &IDXGISwapChain::uuidof(),
-                &mut proxy,
-            )
-        };
+        let rc =
+            unsafe { (loader.get_swapchain_ptr)(context, &IDXGISwapChain::uuidof(), &mut proxy) };
         if rc != 0 || proxy.is_null() {
             // If a pointer was handed back despite the error, release it
             // before the context is destroyed by the loader's Drop.
@@ -927,49 +927,53 @@ impl XessFrameGeneration {
             reset_history: u32::from(reset),
             frame_render_time: frame_time_ms.clamp(0.1, 1000.0),
         };
-        let rc = unsafe {
-            (self.loader.tag_frame_constants)(
-                self.loader.context,
-                id,
-                &constants,
-            )
-        };
+        let rc = unsafe { (self.loader.tag_frame_constants)(self.loader.context, id, &constants) };
         if rc != 0 {
             return Err(format!(
                 "xefgSwapChainTagFrameConstants failed ({})",
                 xefg_result_name(rc)
             ));
         }
-        let tag_resource = |resource_type: u32,
-                                resource: *mut c_void,
-                                size: (u32, u32)| -> Result<(), String> {
-            let data = XefgD3D12ResourceData {
-                resource_type,
-                validity: XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT,
-                resource_base: Xefg2d { x: 0, y: 0 },
-                resource_size: Xefg2d { x: size.0, y: size.1 },
-                resource,
-                incoming_state: D3D12_STATE_PIXEL_COMPUTE_READ,
-            };
-            let rc = unsafe {
-                (self.loader.tag_frame_resource)(
-                    self.loader.context,
-                    std::ptr::null_mut(),
-                    id,
-                    &data,
-                )
-            };
-            if rc != 0 {
-                return Err(format!(
-                    "xefgSwapChainD3D12TagFrameResource(type {}) failed ({})",
+        let tag_resource =
+            |resource_type: u32, resource: *mut c_void, size: (u32, u32)| -> Result<(), String> {
+                let data = XefgD3D12ResourceData {
                     resource_type,
-                    xefg_result_name(rc)
-                ));
-            }
-            Ok(())
-        };
-        tag_resource(XEFG_SWAPCHAIN_RES_DEPTH, self.depth.resource.as_mut_ptr() as *mut c_void, (rw, rh))?;
-        tag_resource(XEFG_SWAPCHAIN_RES_MOTION_VECTOR, self.mv.resource.as_mut_ptr() as *mut c_void, (rw, rh))?;
+                    validity: XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT,
+                    resource_base: Xefg2d { x: 0, y: 0 },
+                    resource_size: Xefg2d {
+                        x: size.0,
+                        y: size.1,
+                    },
+                    resource,
+                    incoming_state: D3D12_STATE_PIXEL_COMPUTE_READ,
+                };
+                let rc = unsafe {
+                    (self.loader.tag_frame_resource)(
+                        self.loader.context,
+                        std::ptr::null_mut(),
+                        id,
+                        &data,
+                    )
+                };
+                if rc != 0 {
+                    return Err(format!(
+                        "xefgSwapChainD3D12TagFrameResource(type {}) failed ({})",
+                        resource_type,
+                        xefg_result_name(rc)
+                    ));
+                }
+                Ok(())
+            };
+        tag_resource(
+            XEFG_SWAPCHAIN_RES_DEPTH,
+            self.depth.resource.as_mut_ptr() as *mut c_void,
+            (rw, rh),
+        )?;
+        tag_resource(
+            XEFG_SWAPCHAIN_RES_MOTION_VECTOR,
+            self.mv.resource.as_mut_ptr() as *mut c_void,
+            (rw, rh),
+        )?;
         self.prev_view_proj = Some(*unjittered_vp);
         Ok(())
     }
@@ -1065,7 +1069,10 @@ impl XessFrameGeneration {
                 resource_type: XEFG_SWAPCHAIN_RES_UI,
                 validity: XEFG_SWAPCHAIN_RV_UNTIL_NEXT_PRESENT,
                 resource_base: Xefg2d { x: 0, y: 0 },
-                resource_size: Xefg2d { x: width, y: height },
+                resource_size: Xefg2d {
+                    x: width,
+                    y: height,
+                },
                 resource: self.ui.resource.as_mut_ptr() as *mut c_void,
                 incoming_state: D3D12_STATE_PIXEL_COMPUTE_READ,
             };
