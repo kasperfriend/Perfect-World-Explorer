@@ -233,6 +233,64 @@ defaults (see the migration test in `view_settings.rs`).
    `-SdkDirectory`, SHA256SUMS regenerated over the final list, NVIDIA proprietary
    DLLs never staged).
 
+## 6a. FFX bring-up fixes (2026-11-15, after the first hardware run)
+
+Hardware result on the first DX12 build: FSR 1 (in-tree) works; FSR 2 / 3.1 /
+4.1 fell back to bilinear; FSR frame generation fell back to standard present.
+Root causes fixed in `src/fsr/imp.rs` and `src/fsr/fg.rs`:
+
+1. **FSR upscaler: the create chain never linked
+   `ffxCreateContextDescUpscaleVersion`.** SDK 2.x is explicit that this
+   descriptor must be attached to `ffxCreateContextDescUpscale` ("As of SDK
+   2.1 it is necessary to create and fill in an ffxCreateContextDescUpscaleVersion
+   ... and link this in the header.pNext field"). Every FFX FSR provider
+   therefore failed at `ffxCreateContext`. The chain is now
+   `upscale -> [override ->] upscaleVersion -> backend`, in all cases.
+2. **FSR frame generation: the backend descriptor was dropped from the
+   chain.** The FG create built `fg_desc -> backend` but then overwrote
+   `fg_desc.p_next` with the version-override descriptor when a provider had
+   been selected, so `MustCreateBackend` found no DX12 backend and
+   `ffxCreateContext` failed. The chain is now
+   `fg_desc -> [override ->] fgVersion -> backend`, in all cases.
+3. **Zero provider ids poisoned the provider selection.** the two-step
+   `GetVersions` query passed the returned count back as the array capacity
+   while also leaving the scratch zero, so a fill beyond the written count
+   would be read as id 0 (and 0 decodes to major 0). The capacity is now kept
+   explicitly, `count` is clamped to it, and zero ids are filtered everywhere.
+4. **Raw/native resource barriers disagreed with wgpu's tracked states.**
+   The FSR depth native is written by the MV pass render pass (wgpu leaves it
+   in `RENDER_TARGET`) but was transitioned out of `COPY_DEST`; the FSR output
+   native (FFX UAV) was created in `COMMON` and returned to `COMMON`, while
+   wgpu composites from `PIXEL_SHADER_RESOURCE` (and the first composite
+   transitions `COMMON -> PIXEL|NON_PIXEL_SHADER_RESOURCE`, leaving the actual
+   state at 384 from frame 1 on). Both protocols now match wgpu's tracked
+   states exactly; the output native is created directly in the combined read
+   state. The FG UI surface is parked in `PIXEL_COMPUTE_READ` for the FFX read
+   during `Present` and restored to `RENDER_TARGET` before the next egui
+   pass (in the next frame's `prepare` list, to avoid a second list).
+5. **No synchronization before allocator reset.** `record()`/`prepare()`/
+   `present()` reset the shared command allocator with no fence, which is
+   invalid D3D12 while the GPU still executes the previous list. Both FFX
+   pipelines now carry a fence+event: signal after every native list
+   submission, bounded wait (5 s) before each allocator reset and before
+   context teardown.
+6. **Failures were invisible.** The FFX global-debug message callback is now
+   registered once per loader, so FFX prints its errors/warnings to stderr
+   (`[FSR ...]`); create/dispatch return codes are surfaced (FG create in
+   particular used to vanish into the fallback), and the jitter-phase and
+   prepare failures print their codes.
+7. **No retry across providers.** The create paths now walk every advertised
+   provider id newest-first (e.g. FSR 4.1.2 -> 3.1.6 -> 2.3.4, FG 4.x ->
+   3.1.x) before falling back, because the SDK's `IsSupported` never rejects
+   an unsupported GPU — the failure only shows up at context creation.
+   The on-screen mark shows the provider version FFX actually created
+   (`FG 3.1.7 x2 - 1234 frames`), matching the FSR badge.
+
+Still runtime-unverified until the next hardware run; see `docs/blockers.md`.
+If FSR still falls back, the `[FSR]` stderr lines now name the exact provider
+and return code, and the retry chain will have already walked down the list —
+please capture stderr and the on-screen mark and report them.
+
 ## 7. What a native DX12 port would require (not done — blocked)
 
 - Device/swapchain: `ID3D12Device`, flip-model `IDXGISwapChain3`

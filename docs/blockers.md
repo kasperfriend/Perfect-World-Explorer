@@ -201,6 +201,15 @@ and frame generation").
   `IDXGISwapChain4` on the hwnd, UI composition texture,
   frame pacing inside `Present(1, 0)`); it has not run on hardware, so the
   pacing behaviour and the input-rate contract are unverified.
+- **2026-11-15 hardware run:** FG reported "falls back to standard present".
+  Root causes found in review (never hardware-verified): the FG create chain
+  dropped the DX12 backend descriptor whenever a provider override was set
+  (`fg_desc.p_next` was overwritten), and the upscaler chain omitted the
+  mandatory `ffxCreateContextDescUpscaleVersion`, so every FFX path failed at
+  `ffxCreateContext`. Fixes (version descriptor linked, backend threaded
+  through, zero provider ids filtered, debug callback installed, provider
+  retry-down, fence-before-allocator-reset) are on the branch; awaiting the
+  next hardware run. See `docs/dx12-port-notes.md` §6a.
 - **Tried:** diagnostics `TimingFrame`/`EffectFrames` channels exist
   (`src/diagnostics.rs`) and are the right probe; the pacing contract is
   documented for the implementer in `README.md` and
