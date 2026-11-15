@@ -26,7 +26,7 @@
 use crate::pck::Entry;
 use flate2::{Decompress, FlushDecompress};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 
 const WINDOWS: [usize; 3] = [1 << 16, 1 << 19, 1 << 22];
 
@@ -43,7 +43,9 @@ fn u32le(b: &[u8], p: usize) -> Result<u32, String> {
 /// Mirrors `_stream_ending_at`: scan backwards for a zlib header (CM=8,
 /// window <= 7) and accept the first stream that consumes exactly the bytes up
 /// to `end` and produces one record.
-fn record_ending_at(blob: &[u8], end: usize) -> Result<(Vec<u8>, usize), String> {
+fn record_ending_at(blob: &[u8], end: usize) -> Result<([u8; 276], usize), String> {
+    let mut out = [0u8; 276];
+    let mut decoder = Decompress::new(true);
     for span in WINDOWS {
         let low = end.saturating_sub(span);
         let mut start = end;
@@ -53,13 +55,10 @@ fn record_ending_at(blob: &[u8], end: usize) -> Result<(Vec<u8>, usize), String>
             if header & 0x0F != 8 || header >> 4 > 7 {
                 continue;
             }
-            let mut out = vec![0u8; 276];
-            let mut decoder = Decompress::new(true);
-            // Most candidate starts are not zlib streams at all: a bad one is
-            // skipped, not fatal, or the scan would stop at its first decoy.
             let input = &blob[start..end];
+            decoder.reset(true);
             let Ok(status) = decoder.decompress(input, &mut out, FlushDecompress::Finish) else {
-                continue;
+             continue;
             };
             if status == flate2::Status::StreamEnd
                 && decoder.total_out() == 276
@@ -76,17 +75,24 @@ fn record_ending_at(blob: &[u8], end: usize) -> Result<(Vec<u8>, usize), String>
 /// [`crate::pck::Entry`] values the retail reader produces, so
 /// [`crate::pck::read_entry`] can read their payloads unchanged.
 pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
-    let mut blob = Vec::new();
-    f.read_to_end(&mut blob).map_err(|e| e.to_string())?;
-    if blob.len() < 12 + 280 {
+   let file_len = f.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+    if file_len < 12 + 280 {
         return Err("Angelica package too small".into());
     }
-    let magic = u32le(&blob, 0)?;
-    let size = u32le(&blob, 4)?;
-    let tag = u32le(&blob, 8)?;
-    if magic != 0x4dca23ef || tag != 0x56a089b7 || size as usize != blob.len() {
+    f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let mut prefix = [0u8; 12];
+    f.read_exact(&mut prefix).map_err(|e| e.to_string())?;
+    let magic = u32le(&prefix, 0)?;
+    let size = u32le(&prefix, 4)?;
+    let tag = u32le(&prefix, 8)?;
+    if magic != 0x4dca23ef || tag != 0x56a089b7 || size as u64 != file_len {
         return Err("bad Angelica prefix".into());
     }
+    let tail_start = file_len.saturating_sub(64 * 1024 * 1024);
+    f.seek(SeekFrom::Start(tail_start))
+        .map_err(|e| e.to_string())?;
+    let mut blob = Vec::with_capacity((file_len - tail_start) as usize);
+    f.read_to_end(&mut blob).map_err(|e| e.to_string())?;
     let trailer = blob.len() - 280;
     let guard = u32le(&blob, trailer)?;
     let guard2 = u32le(&blob, trailer + 268)?;
@@ -112,7 +118,7 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
         let offset = u32le(&record, 260)?;
         let usize_ = u32le(&record, 264)?;
         let compressed = u32le(&record, 268)?;
-        if offset as usize + compressed as usize > blob.len()
+        if offset as u64 + compressed as u64 > file_len       
             || usize_ > 512 * 1024 * 1024
             || compressed > usize_
         {
