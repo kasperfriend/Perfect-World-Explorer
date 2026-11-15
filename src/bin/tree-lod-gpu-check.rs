@@ -165,7 +165,7 @@ pub fn run(authored_mips: bool) {
     );
     device.poll(wgpu::Maintain::Wait);
     if let Some(error) = pollster::block_on(device.pop_error_scope()) {
-        panic!("tree LOD initialization validation failed: {error}");
+        panic!("tree LOD initialization validation failed: {error:?}");
     }
     let size = wgpu::Extent3d {
         width: 128,
@@ -260,7 +260,7 @@ pub fn run(authored_mips: bool) {
         renderer.update_resident_lods(&device, &queue, [dist, 0., 0.], 1., 100000., bounds);
         device.poll(wgpu::Maintain::Wait);
         if let Some(error) = pollster::block_on(device.pop_error_scope()) {
-            panic!("frame {frame_index}: tree LOD validation failed: {error}");
+            panic!("frame {frame_index}: tree LOD validation failed: {error:?}");
         }
         let (count, bytes) = renderer.residency_stats();
         // The instance buffer keeps every (group, level) slice: two `vec4`s per
@@ -547,7 +547,7 @@ fn multi_group(device: &wgpu::Device, queue: &wgpu::Queue) {
     );
     device.poll(wgpu::Maintain::Wait);
     if let Some(error) = pollster::block_on(device.pop_error_scope()) {
-        panic!("multi-group tree LOD initialization validation failed: {error}");
+        panic!("multi-group tree LOD initialization validation failed: {error:?}");
     }
     let heights = renderer.group_heights();
     assert_eq!(heights.len(), 3, "three tree types, three groups");
