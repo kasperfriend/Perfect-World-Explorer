@@ -668,11 +668,6 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
     {
         return Err("ECWLD and TRN2 world dimensions differ".into());
     }
-    let water = water::load(&world_scene, &dir)?;
-    eprintln!(
-        "Loaded {} water areas from client BSData grids",
-        water.len()
-    );
     let ornaments = world_scene.load_ornaments(&dir.join("world.ecbsd"))?;
     eprintln!(
         "Loaded {} unique world ornament placements; nearby BMD meshes will stream during flight",
@@ -684,28 +679,15 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
     eprintln!("Loading world terrain textures and masks...");
     #[cfg(windows)]
     windows_setup::loading_progress("Loading terrain materials and masks...".into());
-    let materials = material::Materials::load(&dir, &t, &names, w, h, grid_spacing)?;
     let element = dir
         .parent()
         .and_then(Path::parent)
         .ok_or("invalid world path")?;
-    let water_normals = water::load_normals(element)?;
-    let water_simple_frames = water::load_simple_frames(element)?;
-    let objects = objects::Objects::open(element, ornaments)?;
     let placements: Vec<_> = world_scene
         .blocks
         .iter()
         .flat_map(|b| b.models.iter().cloned())
         .collect();
-    let models = match world_models::Assets::open(element, placements.clone()) {
-        Ok(models) => models,
-        Err(e) => world_models::Assets::load_with(placements, |_| Err(e.clone())),
-    };
-    eprintln!("Retained {} EC model assets for {} placements; {} unloaded placements (ordinary animated submission enabled unless PW_DISABLE_WORLD_MODELS is set)", models.assets.len(), models.instances.len(), models.unloaded.len());
-    for failure in &models.failures {
-        eprintln!("EC model dependency: {failure}");
-    }
-    let grass = grass::Grass::load(&world_scene, &dir, element)?;
     #[cfg(windows)]
     windows_setup::loading_progress(
         "Preparing trees (first run may take several minutes)...".into(),
@@ -722,7 +704,56 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
             PathBuf::from("tree-cache")
         }
     };
-    let trees = trees::Trees::open(element, &world_scene, &tree_cache)?;
+    let (water, materials, (water_normals, water_simple_frames), objects, models, grass, trees) =
+        std::thread::scope(|s| {
+           let water_task = s.spawn(|| water::load(&world_scene, &dir).map_err(|e| e.to_string()));
+            let materials_task = s.spawn(|| {
+                material::Materials::load(&dir, &t, &names, w, h, grid_spacing)
+                    .map_err(|e| e.to_string())
+            });
+            let water_frames_task = s.spawn(|| -> Result<_, String> {
+                Ok((
+                    water::load_normals(element).map_err(|e| e.to_string())?,
+                    water::load_simple_frames(element).map_err(|e| e.to_string())?,
+                ))
+            });
+            let objects_task =
+                s.spawn(|| objects::Objects::open(element, ornaments).map_err(|e| e.to_string()));
+            let models_task =
+                s.spawn(|| match world_models::Assets::open(element, placements.clone()) {
+                    Ok(models) => models,
+                    Err(e) => world_models::Assets::load_with(placements, |_| Err(e.clone())),
+                });
+            let grass_task = s.spawn(|| {
+                grass::Grass::load(&world_scene, &dir, element).map_err(|e| e.to_string())
+            });
+            let trees_task = s.spawn(|| {
+                trees::Trees::open(element, &world_scene, &tree_cache).map_err(|e| e.to_string())
+            });
+
+            Ok::<_, String>((
+                water_task.join().unwrap()?,
+                materials_task.join().unwrap()?,
+                water_frames_task.join().unwrap()?,
+                objects_task.join().unwrap()?,
+                models_task.join().unwrap(),
+                grass_task.join().unwrap()?,
+                trees_task.join().unwrap()?,
+            ))
+        })?;
+    eprintln!(
+        "Loaded {} water areas from client BSData grids",
+        water.len()
+    );
+    eprintln!(
+        "Retained {} EC model assets for {} placements; {} unloaded placements (ordinary animated submission enabled unless PW_DISABLE_WORLD_MODELS is set)",
+        models.assets.len(),
+        models.placements.len(),
+        models.unloaded.len()
+    );
+    for failure in &models.failures {
+        eprintln!("EC model dependency: {failure}");
+    }
     #[cfg(windows)]
     if std::env::var_os("PW_TREE_CACHE").is_none() && trees.types.iter().any(|tree| tree.is_none())
     {
