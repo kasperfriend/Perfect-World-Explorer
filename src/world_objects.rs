@@ -209,18 +209,56 @@ impl Page {
             };
             let (nw, nh) = (w / 2, h / 2);
             let mut out = vec![0u8; nw * nh * 4];
-            for y in 0..nh {
-                for x in 0..nw {
-                    let a = (2 * y * w + 2 * x) * 4;
-                    let b = a + w * 4;
-                    let dst = (y * nw + x) * 4;
-                    for c in 0..4 {
-                        out[dst + c] = ((source[a + c] as u32
-                            + source[a + 4 + c] as u32
-                            + source[b + c] as u32
-                            + source[b + 4 + c] as u32
-                            + 2)
-                            / 4) as u8;
+            let threads = if nh >= 64 {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1)
+                    .min(16)
+            } else {
+                1
+            };
+            if threads > 1 {
+                let chunk_rows = nh.div_ceil(threads);
+                std::thread::scope(|s| {
+                    for (chunk_idx, out_chunk) in out.chunks_mut(chunk_rows * nw * 4).enumerate() {
+                        let y_start = chunk_idx * chunk_rows;
+                        let rows = out_chunk.len() / (nw * 4);
+                        s.spawn(move || {
+                            for dy in 0..rows {
+                                let y = y_start + dy;
+                                let row0 = 2 * y * w * 4;
+                                let row1 = row0 + w * 4;
+                                let dst_row = dy * nw * 4;
+                                for x in 0..nw {
+                                    let x0 = x * 8;
+                                    let dst = dst_row + x * 4;
+                                    for c in 0..4 {
+                                        out_chunk[dst + c] = ((source[row0 + x0 + c] as u32
+                                            + source[row0 + x0 + 4 + c] as u32
+                                            + source[row1 + x0 + c] as u32
+                                            + source[row1 + x0 + 4 + c] as u32
+                                            + 2)
+                                            >> 2) as u8;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                });
+            } else {
+                for y in 0..nh {
+                    for x in 0..nw {
+                        let a = (2 * y * w + 2 * x) * 4;
+                        let b = a + w * 4;
+                        let dst = (y * nw + x) * 4;
+                        for c in 0..4 {
+                            out[dst + c] = ((source[a + c] as u32
+                                + source[a + 4 + c] as u32
+                                + source[b + c] as u32
+                                + source[b + 4 + c] as u32
+                                + 2)
+                                >> 2) as u8;
+                        }
                     }
                 }
             }
@@ -420,11 +458,11 @@ fn run(
         height: 1,
         rgba: vec![160, 160, 160, 255],
     };
-    for start in (first..limit).step_by(32) {
+    for start in (first..limit).step_by(64) {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let end = (start + 32).min(limit);
+        let end = (start + 64).min(limit);
         let ids: Vec<_> = (start..end).collect();
         objects.load_ids(&ids)?;
         for id in ids {
