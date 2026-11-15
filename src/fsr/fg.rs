@@ -503,16 +503,20 @@ impl FrameGeneration {
             }
             (hr, hr_q)
         };
+        // IID_IDXGIFactory2 — winapi does not re-export the type in a module
+        // reachable here, so the IID is inlined instead.
+        const IID_IDXGI_FACTORY2: winapi::shared::guiddef::GUID = winapi::shared::guiddef::GUID {
+            Data1: 0xdc9b5b12,
+            Data2: 0xa1d2,
+            Data3: 0x11da,
+            Data4: [0x88, 0xa7, 0x00, 0x74, 0x27, 0xab, 0x8f, 0x49],
+        };
         let qi_factory2_hr = unsafe {
-            let mut probe_factory: *mut winapi::shared::dxgi1_1::IDXGIFactory2 =
-                std::ptr::null_mut();
-            let hr = (factory as *mut winapi::um::unknwnbase::IUnknown).QueryInterface(
-                &winapi::shared::dxgi1_1::IDXGIFactory2::uuidof(),
-                &mut probe_factory as *mut *mut winapi::shared::dxgi1_1::IDXGIFactory2
-                    as *mut *mut c_void,
-            );
+            let mut probe_factory: *mut c_void = std::ptr::null_mut();
+            let hr = (factory as *mut winapi::um::unknwnbase::IUnknown)
+                .QueryInterface(&IID_IDXGI_FACTORY2, &mut probe_factory);
             if !probe_factory.is_null() {
-                (*probe_factory).Release();
+                (&*(probe_factory as *const winapi::um::unknwnbase::IUnknown)).Release();
             }
             hr
         };
