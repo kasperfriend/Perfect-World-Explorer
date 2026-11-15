@@ -1236,11 +1236,23 @@ effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs
         assert!(encoded.contains("fsr3_sharpness=0.25"), "{encoded}");
         assert_eq!(ViewSettings::decode(&encoded).fsr3_sharpness, 0.25);
         // Out-of-range values clamp to the 0..1 range, junk keeps the default.
-        assert_eq!(ViewSettings::decode("fsr3_sharpness=-1\n").fsr3_sharpness, 0.0);
-        assert_eq!(ViewSettings::decode("fsr3_sharpness=7\n").fsr3_sharpness, 1.0);
-        assert_eq!(ViewSettings::decode("fsr3_sharpness=abc\n").fsr3_sharpness, 0.75);
+        assert_eq!(
+            ViewSettings::decode("fsr3_sharpness=-1\n").fsr3_sharpness,
+            0.0
+        );
+        assert_eq!(
+            ViewSettings::decode("fsr3_sharpness=7\n").fsr3_sharpness,
+            1.0
+        );
+        assert_eq!(
+            ViewSettings::decode("fsr3_sharpness=abc\n").fsr3_sharpness,
+            0.75
+        );
         // 0 is a legal value and means "no sharpening", not "unset".
-        assert_eq!(ViewSettings::decode("fsr3_sharpness=0\n").fsr3_sharpness, 0.0);
+        assert_eq!(
+            ViewSettings::decode("fsr3_sharpness=0\n").fsr3_sharpness,
+            0.0
+        );
     }
 
     #[test]

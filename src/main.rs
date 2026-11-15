@@ -2430,18 +2430,36 @@ mod tests {
     /// and survive the settings round-trip.
     #[test]
     fn native_aa_is_native_and_fsr3_only() {
-        assert_eq!(UpscaleQuality::parse("native_aa"), Some(UpscaleQuality::NativeAa));
-        assert_eq!(UpscaleQuality::parse("Native AA"), Some(UpscaleQuality::NativeAa));
+        assert_eq!(
+            UpscaleQuality::parse("native_aa"),
+            Some(UpscaleQuality::NativeAa)
+        );
+        assert_eq!(
+            UpscaleQuality::parse("Native AA"),
+            Some(UpscaleQuality::NativeAa)
+        );
         assert_eq!(
             UpscaleQuality::parse(UpscaleQuality::NativeAa.token()),
             Some(UpscaleQuality::NativeAa)
         );
-        assert_eq!(internal_factor(UpscaleMethod::Fsr3, UpscaleQuality::NativeAa), 1.0);
         assert_eq!(
-            provider_extent(UpscaleMethod::Fsr3, UpscaleQuality::NativeAa, 1920, 1080, 8192),
+            internal_factor(UpscaleMethod::Fsr3, UpscaleQuality::NativeAa),
+            1.0
+        );
+        assert_eq!(
+            provider_extent(
+                UpscaleMethod::Fsr3,
+                UpscaleQuality::NativeAa,
+                1920,
+                1080,
+                8192
+            ),
             (1920, 1080)
         );
-        assert!(quality_available(UpscaleMethod::Fsr3, UpscaleQuality::NativeAa));
+        assert!(quality_available(
+            UpscaleMethod::Fsr3,
+            UpscaleQuality::NativeAa
+        ));
         for method in UpscaleMethod::ALL {
             if method != UpscaleMethod::Fsr3 {
                 assert!(
