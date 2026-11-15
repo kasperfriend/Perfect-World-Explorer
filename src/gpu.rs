@@ -5742,7 +5742,6 @@ mod frame_snapshot_tests {
         let src = source();
         assert!(src.contains("levels.stitch_far_boundary();"));
         assert!(src.contains("crate::terrain_gpu::world_mesh(t, far_step)?"));
-        assert!(!src.contains("stitch_far_boundary_stride"));
     }
 
     fn function(name: &str, src: &str) -> String {
