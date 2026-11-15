@@ -142,7 +142,6 @@ struct Out {
     @location(3) view_depth: f32,
     @location(4) world_y: f32,
 };
-fn hash(n: f32) -> f32 { return fract(sin(n * 127.1 + 311.7) * 43758.5453); }
 @vertex fn vs(
     @builtin(vertex_index) vertex: u32,
     @location(0) instance_center: vec4<f32>,
