@@ -733,6 +733,7 @@ impl FrameGeneration {
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             super::imp::D3D12_STATE_COMMON,
+            false,
         )
     }
 
@@ -755,6 +756,7 @@ impl FrameGeneration {
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             super::imp::D3D12_STATE_COMMON,
+            false,
         )
     }
 
@@ -773,6 +775,7 @@ impl FrameGeneration {
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             wgpu::TextureUsages::RENDER_ATTACHMENT,
             super::imp::D3D12_STATE_COMMON,
+            false,
         )
     }
 
@@ -791,6 +794,7 @@ impl FrameGeneration {
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             super::imp::D3D12_STATE_COMMON,
+            false,
         )
     }
 

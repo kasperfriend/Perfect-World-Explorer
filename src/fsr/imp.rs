@@ -5,9 +5,9 @@ use super::mv::{FsrMotionVectorPass, FsrMvParams, COMPOSITE_SHADER};
 use glam::Mat4;
 use std::ffi::c_void;
 use winapi::shared::dxgiformat::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-    DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
-    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_FLOAT,
+    DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
 };
 use winapi::um::d3d12 as d3d12_ty;
 
@@ -447,6 +447,93 @@ pub(crate) struct NativeTexture2D {
     pub(crate) texture: wgpu::Texture,
 }
 
+/// One heap/format combination to attempt when the requested creation
+/// fails, varying exactly one property from the documented default.
+struct CreateFallback {
+    name: &'static str,
+    dxgi_format: Option<DXGI_FORMAT>,
+    heap_type: d3d12_ty::D3D12_HEAP_TYPE,
+    memory_pool: d3d12_ty::D3D12_MEMORY_POOL,
+}
+
+fn fallback_matrix(dxgi_format: DXGI_FORMAT, allow_format_twins: bool) -> Vec<CreateFallback> {
+    const DEFAULT: d3d12_ty::D3D12_HEAP_TYPE = d3d12_ty::D3D12_HEAP_TYPE_DEFAULT;
+    const CUSTOM: d3d12_ty::D3D12_HEAP_TYPE = d3d12_ty::D3D12_HEAP_TYPE_CUSTOM;
+    const UNKNOWN: d3d12_ty::D3D12_MEMORY_POOL = d3d12_ty::D3D12_MEMORY_POOL_UNKNOWN;
+    const L0: d3d12_ty::D3D12_MEMORY_POOL = d3d12_ty::D3D12_MEMORY_POOL_L0;
+    const L1: d3d12_ty::D3D12_MEMORY_POOL = d3d12_ty::D3D12_MEMORY_POOL_L1;
+    let (unorm_twin, typeless_twin) = if allow_format_twins {
+        match dxgi_format {
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => (
+                Some(DXGI_FORMAT_B8G8R8A8_UNORM),
+                Some(DXGI_FORMAT_B8G8R8A8_TYPELESS),
+            ),
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => (
+                Some(DXGI_FORMAT_R8G8B8A8_UNORM),
+                Some(DXGI_FORMAT_R8G8B8A8_TYPELESS),
+            ),
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+    let mut matrix = vec![
+        CreateFallback {
+            name: "custom heap, L1 pool",
+            dxgi_format: None,
+            heap_type: CUSTOM,
+            memory_pool: L1,
+        },
+        CreateFallback {
+            name: "custom heap, L0 pool",
+            dxgi_format: None,
+            heap_type: CUSTOM,
+            memory_pool: L0,
+        },
+        CreateFallback {
+            name: "default heap, UNKNOWN pool",
+            dxgi_format: None,
+            heap_type: DEFAULT,
+            memory_pool: UNKNOWN,
+        },
+    ];
+    if let Some(twin) = unorm_twin {
+        matrix.push(CreateFallback {
+            name: "UNORM twin, default heap",
+            dxgi_format: Some(twin),
+            heap_type: DEFAULT,
+            memory_pool: UNKNOWN,
+        });
+        matrix.push(CreateFallback {
+            name: "UNORM twin, custom heap L1",
+            dxgi_format: Some(twin),
+            heap_type: CUSTOM,
+            memory_pool: L1,
+        });
+        matrix.push(CreateFallback {
+            name: "UNORM twin, custom heap L0",
+            dxgi_format: Some(twin),
+            heap_type: CUSTOM,
+            memory_pool: L0,
+        });
+    }
+    if let Some(twin) = typeless_twin {
+        matrix.push(CreateFallback {
+            name: "TYPELESS twin, default heap",
+            dxgi_format: Some(twin),
+            heap_type: DEFAULT,
+            memory_pool: UNKNOWN,
+        });
+        matrix.push(CreateFallback {
+            name: "TYPELESS twin, custom heap L1",
+            dxgi_format: Some(twin),
+            heap_type: CUSTOM,
+            memory_pool: L1,
+        });
+    }
+    matrix
+}
+
 impl NativeTexture2D {
     /// # Safety
     /// The caller guarantees the wgpu device was created by `raw_device`.
@@ -460,6 +547,91 @@ impl NativeTexture2D {
         resource_flags: d3d12_ty::D3D12_RESOURCE_FLAGS,
         wgpu_usage: wgpu::TextureUsages,
         initial_state: u32,
+        allow_format_twins: bool,
+    ) -> Result<NativeTexture2D, String> {
+        let primary = Self::create_in_heap(
+            device,
+            raw_device,
+            label,
+            format,
+            dxgi_format,
+            size,
+            resource_flags,
+            wgpu_usage,
+            initial_state,
+            d3d12_ty::D3D12_HEAP_TYPE_DEFAULT,
+            d3d12_ty::D3D12_MEMORY_POOL_UNKNOWN,
+            false,
+        );
+        match primary {
+            Ok(native) => Ok(native),
+            Err(error) => {
+                super::diag(&format!(
+                    "[FSR] CreateCommittedResource failed for {label}: extent {}x{}, dxgi_format 0x{:08x}, flags 0x{:08x}, initial_state 0x{:08x}: {error}",
+                    size.0,
+                    size.1,
+                    dxgi_format as u32,
+                    resource_flags as u32,
+                    initial_state
+                ));
+                // Driver-quirk fallback: retry the same request with one
+                // property varied at a time, in order, until one succeeds.
+                // The winning combination is used for real, so FSR can come
+                // up on machines that reject the documented default.
+                for fallback in fallback_matrix(dxgi_format, allow_format_twins) {
+                    let (candidate_dxgi, candidate_format) = match fallback.dxgi_format {
+                        Some(twin) => (twin, wgpu_format_for_dxgi(twin, format)),
+                        None => (dxgi_format, format),
+                    };
+                    match Self::create_in_heap(
+                        device,
+                        raw_device,
+                        label,
+                        candidate_format,
+                        candidate_dxgi,
+                        size,
+                        resource_flags,
+                        wgpu_usage,
+                        initial_state,
+                        fallback.heap_type,
+                        fallback.memory_pool,
+                        true,
+                    ) {
+                        Ok(native) => {
+                            super::diag(&format!(
+                                "[FSR] {label}: \"{}\" succeeded; continuing with it",
+                                fallback.name
+                            ));
+                            return Ok(native);
+                        }
+                        Err(error) => {
+                            super::diag(&format!(
+                                "[FSR] probe \"{}\" for {label} failed: {error}",
+                                fallback.name
+                            ));
+                        }
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// # Safety
+    /// The caller guarantees the wgpu device was created by `raw_device`.
+    unsafe fn create_in_heap(
+        device: &wgpu::Device,
+        raw_device: &d3d12::Device,
+        label: &str,
+        format: wgpu::TextureFormat,
+        dxgi_format: DXGI_FORMAT,
+        size: (u32, u32),
+        resource_flags: d3d12_ty::D3D12_RESOURCE_FLAGS,
+        wgpu_usage: wgpu::TextureUsages,
+        initial_state: u32,
+        heap_type: d3d12_ty::D3D12_HEAP_TYPE,
+        memory_pool: d3d12_ty::D3D12_MEMORY_POOL,
+        log_failure: bool,
     ) -> Result<NativeTexture2D, String> {
         use winapi::shared::dxgitype::DXGI_SAMPLE_DESC;
         use winapi::Interface;
@@ -479,9 +651,9 @@ impl NativeTexture2D {
             Flags: resource_flags,
         };
         let heap = d3d12_ty::D3D12_HEAP_PROPERTIES {
-            Type: d3d12_ty::D3D12_HEAP_TYPE_DEFAULT,
+            Type: heap_type,
             CPUPageProperty: d3d12_ty::D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
-            MemoryPoolPreference: d3d12_ty::D3D12_MEMORY_POOL_UNKNOWN,
+            MemoryPoolPreference: memory_pool,
             // 0, like wgpu's own committed resources — a non-zero node mask
             // on a single-GPU adapter is rejected by some drivers.
             CreationNodeMask: 0,
@@ -498,16 +670,18 @@ impl NativeTexture2D {
             &mut resource_ptr as *mut *mut d3d12_ty::ID3D12Resource as *mut *mut c_void,
         );
         if !hr_ok(hr) || resource_ptr.is_null() {
-            super::diag(&format!(
-                "[FSR] CreateCommittedResource failed for {label}: extent {}x{}, dxgi_format 0x{:08x}, flags 0x{:08x}, initial_state 0x{:08x}",
-                size.0,
-                size.1,
-                dxgi_format as u32,
-                resource_flags as u32,
-                initial_state
-            ));
+            if log_failure {
+                super::diag(&format!(
+                    "[FSR] create_in_heap failed for {label}: extent {}x{}, dxgi_format 0x{:08x}, flags 0x{:08x}, initial_state 0x{:08x} (hr 0x{hr:08x})",
+                    size.0,
+                    size.1,
+                    dxgi_format as u32,
+                    resource_flags as u32,
+                    initial_state
+                ));
+            }
             return Err(format!(
-                "CreateCommittedResource failed for {label} (HRESULT 0x{hr:08x})"
+                "CreateCommittedResource failed (HRESULT 0x{hr:08x})"
             ));
         }
         // ComPtr is transparent over the raw pointer; adopt the reference
@@ -555,6 +729,21 @@ impl NativeTexture2D {
             device.create_texture_from_hal::<wgpu_hal::dx12::Api>(hal_texture, &import_desc)
         };
         Ok(NativeTexture2D { resource, texture })
+    }
+}
+
+/// wgpu format that matches a plain-UNORM/TYPELESS DXGI twin of `fallback`.
+fn wgpu_format_for_dxgi(dxgi: DXGI_FORMAT, reference: wgpu::TextureFormat) -> wgpu::TextureFormat {
+    let bgra = is_bgra_format(reference);
+    match dxgi {
+        DXGI_FORMAT_B8G8R8A8_UNORM => wgpu::TextureFormat::Bgra8Unorm,
+        DXGI_FORMAT_R8G8B8A8_UNORM => wgpu::TextureFormat::Rgba8Unorm,
+        // TYPELESS twins import as the plain UNORM view; the sRGB bytes are
+        // never re-encoded by wgpu (raw copy only), so the view type is safe.
+        DXGI_FORMAT_B8G8R8A8_TYPELESS => wgpu::TextureFormat::Bgra8Unorm,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS => wgpu::TextureFormat::Rgba8Unorm,
+        _ if bgra => wgpu::TextureFormat::Bgra8Unorm,
+        _ => wgpu::TextureFormat::Rgba8Unorm,
     }
 }
 
@@ -708,6 +897,7 @@ impl FsrNatives {
             d3d12_ty::D3D12_RESOURCE_FLAG_NONE,
             wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             D3D12_STATE_COMMON,
+            false,
         )?;
         let depth = NativeTexture2D::create(
             device,
@@ -719,6 +909,7 @@ impl FsrNatives {
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             wgpu::TextureUsages::RENDER_ATTACHMENT,
             D3D12_STATE_COMMON,
+            false,
         )?;
         let mv = NativeTexture2D::create(
             device,
@@ -730,6 +921,7 @@ impl FsrNatives {
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             D3D12_STATE_COMMON,
+            false,
         )?;
         // The UAV flag forbids _UNORM_SRGB formats (E_INVALIDARG), so the
         // output resource is created with the plain UNORM twins, imported
@@ -747,6 +939,7 @@ impl FsrNatives {
             d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             D3D12_STATE_COMMON,
+            true,
         )?;
         Ok(FsrNatives {
             color,
