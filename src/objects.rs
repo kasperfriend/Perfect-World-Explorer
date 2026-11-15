@@ -273,6 +273,31 @@ fn tex_budget_bytes() -> usize {
         .unwrap_or(DEFAULT_TEX_BUDGET_MIB)
         << 20
 }
+enum PendingTexture {
+    Archive { mount: usize, key: String },
+    Disk { key: String, path: std::path::PathBuf },
+}
+
+fn decode_texture_bytes(key: &str, data: &[u8]) -> Result<Texture, String> {
+    let decoded = if key.ends_with(".tga") {
+        image::load_from_memory_with_format(data, image::ImageFormat::Tga)
+    } else {
+        image::load_from_memory(data)
+    };
+    match decoded {
+        Ok(img) => {
+            let img = img.to_rgba8();
+            let (w, h) = img.dimensions();
+            Ok(Texture {
+                width: w as usize,
+                height: h as usize,
+                rgba: img.into_raw(),
+            })
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 impl Objects {
     pub fn open(element: &Path, ornaments: Vec<Ornament>) -> Result<Self, String> {
         let mut litfile = File::open(element.join("litmodels.pck")).map_err(|e| e.to_string())?;
@@ -339,51 +364,206 @@ impl Objects {
             .collect();
         self.models.retain(|name, _| active.contains(name));
         self.cache.begin_batch();
+        let mut missing_models: Vec<(String, &pck::Entry)> = Vec::new();
+        let mut seen_missing = HashSet::new();
         for &i in ids {
             let name = format!("litmodels/world/{}", self.ornaments[i].path.to_lowercase());
-            if !self.models.contains_key(&name) {
+            if !self.models.contains_key(&name) && seen_missing.insert(name.clone()) {
                 let entry = self
                     .litentries
                     .get(&name)
                     .ok_or_else(|| format!("missing model {name}"))?;
-                let data = pck::read_entry(&mut self.litfile, entry)?;
-                let model = bmd::Model::parse(&data).map_err(|e| format!("{name}: {e}"))?;
-                self.models.insert(name.clone(), model);
+                missing_models.push((name, entry));
             }
-            let references: Vec<String> = self.models[&name]
-                .meshes
-                .iter()
-                .map(|m| m.texture.clone())
-                .collect();
-            for raw in references {
-                self.load_texture_reference(&raw)?;
-                // Derived normal-map reference (A3DLitMesh::LoadTexture step
-                // 4). The client tolerates every failure here (a missing file
-                // inside A3DTexture::Load returns TRUE), and this renderer
-                // has no normal-map consumer, so the derivation is resolved
-                // and counted but never decoded.
-                if let Some((nrf, used_default)) = self.resolver.resolve_nrf(&raw) {
-                    if matches!(nrf, Resolution::Missing { .. }) {
-                        self.register(
-                            &raw,
-                            if used_default {
-                                "nrf-default-missing"
-                            } else {
-                                "nrf-derived-missing"
-                            },
-                            "derived normal-map reference resolves nowhere; client tolerates (A3DTexture::Load returns TRUE on open failure, 0x78a440)",
-                        );
+        }
+
+        if !missing_models.is_empty() {
+            let litfile = &self.litfile;
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(missing_models.len());
+            let chunk_size = (missing_models.len() + workers - 1) / workers;
+            let parsed: Vec<Result<Vec<(String, bmd::Model)>, String>> = std::thread::scope(|s| {
+                let handles: Vec<_> = missing_models
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        s.spawn(move || {
+                            let mut out = Vec::with_capacity(chunk.len());
+                            for (name, entry) in chunk {
+                                let data = pck::read_entry_at(litfile, entry)
+                                    .map_err(|e| e.to_string())?;
+                                let model = bmd::Model::parse(&data)
+                                    .map_err(|e| format!("{name}: {e}"))?;
+                                out.push((name.clone(), model));
+                            }
+                            Ok(out)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for batch in parsed {
+                for (name, model) in batch? {
+                    self.models.insert(name, model);
+                }
+            }
+        }
+
+        let mut seen_models = HashSet::new();
+        let mut seen_refs = HashSet::new();
+        let mut unique_refs = Vec::new();
+        for &i in ids {
+            let name = format!("litmodels/world/{}", self.ornaments[i].path.to_lowercase());
+            if !seen_models.insert(name.clone()) {
+                continue;
+            }
+            for mesh in &self.models[&name].meshes {
+                if seen_refs.insert(mesh.texture.clone()) {
+                    unique_refs.push(mesh.texture.clone());
+                }
+            }
+        }
+
+        let mut pending = Vec::new();
+        let mut queued_keys = HashSet::new();
+        for raw in unique_refs {
+            if let Some(job) = self.resolve_texture_job(&raw) {
+                let key = match &job {
+                    PendingTexture::Archive { key, .. } | PendingTexture::Disk { key, .. } => {
+                        key.clone()
+                    }
+                };
+                if queued_keys.insert(key) {
+                    pending.push(job);
+                }
+            }
+            // Derived normal-map reference (A3DLitMesh::LoadTexture step
+            // 4). The client tolerates every failure here (a missing file
+            // inside A3DTexture::Load returns TRUE), and this renderer
+            // has no normal-map consumer, so the derivation is resolved
+            // and counted but never decoded.
+            if let Some((nrf, used_default)) = self.resolver.resolve_nrf(&raw) {
+                if matches!(nrf, Resolution::Missing { .. }) {
+                    self.register(
+                        &raw,
+                        if used_default {
+                            "nrf-default-missing"
+                        } else {
+                            "nrf-derived-missing"
+                        },
+                        "derived normal-map reference resolves nowhere; client tolerates (A3DTexture::Load returns TRUE on open failure, 0x78a440)",
+                    );
+                }
+            }
+        }
+
+        if !pending.is_empty() {
+            enum ResolvedJob<'a> {
+                Archive {
+                    key: String,
+                    file: &'a File,
+                    entry: &'a pck::Entry,
+                },
+                Disk {
+                    key: String,
+                    path: std::path::PathBuf,
+                },
+            }
+
+            let mut jobs = Vec::with_capacity(pending.len());
+            for job in pending {
+                match job {
+                    PendingTexture::Archive { mount, key } => {
+                        let (file, entries) = if mount == 0 {
+                            (&self.litfile, &self.litentries)
+                        } else {
+                            (&self.texfile, &self.texentries)
+                        };
+                        let entry = entries
+                            .get(&key)
+                            .ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
+                        jobs.push(ResolvedJob::Archive { key, file, entry });
+                    }
+                    PendingTexture::Disk { key, path } => {
+                        jobs.push(ResolvedJob::Disk { key, path });
+                    }
+                }
+            }
+
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(jobs.len());
+            let chunk_size = (jobs.len() + workers - 1) / workers;
+            let decoded: Vec<Result<Vec<(String, Result<Texture, String>)>, String>> =
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = jobs
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            s.spawn(move || {
+                                let mut out = Vec::with_capacity(chunk.len());
+                                for job in chunk {
+                                    let (key, data) = match job {
+                                        ResolvedJob::Archive { key, file, entry } => {
+                                            let data = pck::read_entry_at(file, entry)
+                                                .map_err(|e| e.to_string())?;
+                                            (key.clone(), data)
+                                        }
+                                        ResolvedJob::Disk { key, path } => {
+                                            let data = std::fs::read(path).map_err(|e| {
+                                                format!("disk texture {}: {e}", path.display())
+                                            })?;
+                                            (key.clone(), data)
+                                        }
+                                    };
+                                    let tex = decode_texture_bytes(&key, &data);
+                                    out.push((key, tex));
+                                }
+                                Ok(out)
+                            })
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+
+            for batch in decoded {
+                for (key, res) in batch? {
+                    match res {
+                        Ok(texture) => {
+                            self.cache.store(key, texture);
+                        }
+                        Err(err) => {
+                            self.register(
+                                &key,
+                                "decode-failed",
+                                &format!("bytes read but image decode failed: {err}"),
+                            );
+                        }
                     }
                 }
             }
         }
+
         Ok(())
     }
     fn load_texture_reference(&mut self, raw: &str) -> Result<(), String> {
+        match self.resolve_texture_job(raw) {
+            None => Ok(()),
+            Some(PendingTexture::Archive { mount, key }) => self.load_from_archive(mount, &key),
+            Some(PendingTexture::Disk { key, path }) => {
+                let data = std::fs::read(&path)
+                    .map_err(|e| format!("disk texture {}: {e}", path.display()))?;
+                self.decode_and_store(&key, &data)
+            }
+        }
+    }
+
+    fn resolve_texture_job(&mut self, raw: &str) -> Option<PendingTexture> {
         let resolution = self.resolver.resolve(raw);
         let key = normalize(raw);
         match resolution {
-            Resolution::Trivial => Ok(()),
+            Resolution::Trivial => None,
             Resolution::ShaderRegistry { key: registry_key } => {
                 // The client looks the truncated key up in the runtime
                 // shader-texture registry (0x77c2e4 -> 0x785d30); a miss is
@@ -406,9 +586,9 @@ impl Objects {
                         );
                         if self.cache.contains(&fkey) {
                             self.cache.touch(&fkey);
-                            return Ok(());
+                            return None;
                         }
-                        self.load_from_archive(mount, &fkey)
+                        Some(PendingTexture::Archive { mount, key: fkey })
                     }
                     Resolution::Disk { path } => {
                         self.resolver.stats.shader_registry_file_backed += 1;
@@ -421,7 +601,7 @@ impl Objects {
                         );
                         if self.cache.contains(&key) {
                             self.cache.touch(&key);
-                            return Ok(());
+                            return None;
                         }
                         let data = std::fs::read(&path)
                             .map_err(|e| format!("disk texture {}: {e}", path.display()))?;
@@ -457,18 +637,16 @@ impl Objects {
             Resolution::Archive { mount, key } => {
                 if self.cache.contains(&key) {
                     self.cache.touch(&key);
-                    return Ok(());
+                    return None;
                 }
-                self.load_from_archive(mount, &key)
+                Some(PendingTexture::Archive { mount, key })
             }
             Resolution::Disk { path } => {
                 if self.cache.contains(&key) {
                     self.cache.touch(&key);
-                    return Ok(());
+                    return None;
                 }
-                let data = std::fs::read(&path)
-                    .map_err(|e| format!("disk texture {}: {e}", path.display()))?;
-                self.decode_and_store(&key, &data)
+                Some(PendingTexture::Disk { key, path })
             }
         }
     }
@@ -489,25 +667,9 @@ impl Objects {
         self.decode_and_store(key, &data)
     }
     fn decode_and_store(&mut self, key: &str, data: &[u8]) -> Result<(), String> {
-        // TGA has no magic header, so generic format sniffing rejects
-        // valid client TGAs (including .sdr.tga files).
-        let decoded = if key.ends_with(".tga") {
-            image::load_from_memory_with_format(data, image::ImageFormat::Tga)
-        } else {
-            image::load_from_memory(data)
-        };
-        match decoded {
-            Ok(img) => {
-                let img = img.to_rgba8();
-                let (w, h) = img.dimensions();
-                self.cache.store(
-                    key.to_string(),
-                    Texture {
-                        width: w as usize,
-                        height: h as usize,
-                        rgba: img.into_raw(),
-                    },
-                );
+        match decode_texture_bytes(key, data) {
+            Ok(tex) => {
+                self.cache.store(key.to_string(), tex);
                 Ok(())
             }
             Err(err) => {
