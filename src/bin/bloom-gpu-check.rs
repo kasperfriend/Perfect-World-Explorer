@@ -226,6 +226,7 @@ fn main() {
                             &queue,
                             &target_view,
                             &depth_view,
+                            false,
                             w,
                             h,
                             time,

@@ -670,20 +670,18 @@ fn main() {
         &world,
         [[48, 16, 32, 136], [16, 32, 48, 136]],
     );
-    let lights = scene_lights::SceneLights {
-        lights: vec![scene_lights::SceneLight {
-            position: [0., 0., 0.5],
-            range: 2.,
-            stored_attenuation: [0., 0.4, 0.],
-            diffuse: [0., 0., 0., 1.],
-            ambient: [0.5, 0.5, 0.5, 1.],
-            bounds_center: [0., 0., 0.5],
-            bounds_half_extent: [2.; 3],
-            bounds_min: [-2., -2., -1.5],
-            bounds_max: [2., 2., 2.5],
-            flags: 1,
-        }],
-    };
+    let lights = scene_lights::SceneLights::from_lights(vec![scene_lights::SceneLight {
+        position: [0., 0., 0.5],
+        range: 2.,
+        stored_attenuation: [0., 0.4, 0.],
+        diffuse: [0., 0., 0., 1.],
+        ambient: [0.5, 0.5, 0.5, 1.],
+        bounds_center: [0., 0., 0.5],
+        bounds_half_extent: [2.; 3],
+        bounds_min: [-2., -2., -1.5],
+        bounds_max: [2., 2., 2.5],
+        flags: 1,
+    }]);
     world.update(&device, &queue, opaque_dim, [13., 0., 0.], &lights, 0., 17);
     check(
         &device,

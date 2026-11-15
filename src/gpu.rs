@@ -1398,6 +1398,7 @@ struct Renderer {
     sampler: wgpu::Sampler,
     water_start: u32,
     water_batches: Vec<WaterBatch>,
+    water_cull_index: crate::world_objects::WorldCullIndex,
     started: Instant,
     wind_last: Instant,
     /// Snapshot computed once by `render()`; secondary views reuse it.
@@ -2075,6 +2076,15 @@ impl Renderer {
             crate::sky_transition::Triple(sky.day_set().min(2) as u8),
             crate::sky_transition::Triple(sky.night_set().min(2) as u8),
         );
+        let water_cull_index = crate::world_objects::WorldCullIndex::from_ordered_bounds(
+            &m.water_batches
+                .iter()
+                .map(|batch| {
+                    let [x0, x1, z0, z1] = batch.bounds;
+                    Some([x0, batch.height, z0, x1, batch.height, z1])
+                })
+                .collect::<Vec<_>>(),
+        );
         Ok(Self {
             modules: crate::modules::Modules::default(),
             module_format: format.remove_srgb_suffix(),
@@ -2116,6 +2126,7 @@ impl Renderer {
             sampler,
             water_start: m.water_start,
             water_batches: m.water_batches,
+            water_cull_index,
             started: Instant::now(),
             frame: FrameSnapshot::default(),
             world_glow: crate::post_gpu::WorldGlow::default(),
@@ -2470,6 +2481,7 @@ impl Renderer {
             &self.queue,
             camera.pos.to_array(),
             self.detail.tree_lod_scale * lod_scale(self.detail.scenery_quality, Class::Trees),
+            camera.far,
             resident_bounds,
         );
         // Use the actual uploaded window. The native window shifts at map
@@ -2652,6 +2664,31 @@ impl Renderer {
         crate::grass_mips::upload(&self.queue, &self.atlas, &m.atlas, &m.grass_mips, ATLAS);
         Ok(())
     }
+    fn world_visible_order(&self, matrix: Mat4) -> Vec<usize> {
+        if !self.world_done {
+            return Vec::new();
+        }
+        let frustum = crate::terrain_residency::Frustum::from_matrix(matrix);
+        self.world_cull_index
+            .visible_order_indices(|bounds| frustum.intersects(bounds))
+    }
+
+    fn world_commands_for_order(
+        &self,
+        visible_order: &[usize],
+        view: Pass,
+    ) -> (
+        Vec<crate::world_objects::DrawCmd>,
+        Vec<crate::world_objects::DrawCmd>,
+    ) {
+        crate::world_objects::GpuPage::draw_commands_pair_visible(
+            &self.world_pages,
+            &self.world_order,
+            visible_order,
+            view,
+        )
+    }
+
     fn world_commands_for_view(
         &self,
         matrix: Mat4,
@@ -2660,19 +2697,8 @@ impl Renderer {
         Vec<crate::world_objects::DrawCmd>,
         Vec<crate::world_objects::DrawCmd>,
     ) {
-        if !self.world_done {
-            return (Vec::new(), Vec::new());
-        }
-        let frustum = crate::terrain_residency::Frustum::from_matrix(matrix);
-        let visible_order = self
-            .world_cull_index
-            .visible_order_indices(|bounds| frustum.intersects(bounds));
-        crate::world_objects::GpuPage::draw_commands_pair_visible(
-            &self.world_pages,
-            &self.world_order,
-            &visible_order,
-            view,
-        )
+        let visible_order = self.world_visible_order(matrix);
+        self.world_commands_for_order(&visible_order, view)
     }
 
     fn draw_opaque(
@@ -2746,36 +2772,54 @@ impl Renderer {
             runs,
             far_runs,
         );
-        drop(p);
         if let Some(source) = terrain_depth_source {
+            // The water-edge depth snapshot must observe terrain but not scenery,
+            // so this view still requires a split pass.
+            drop(p);
             self.water.copy_terrain_depth(e, source);
-        }
-        let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("opaque scenery after terrain"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
+            let mut scenery = e.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("opaque scenery after terrain depth copy"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
                 }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.draw_scenery(&mut scenery, bind, reflected, pass_kind, world_cmds, world_sdr_cmds);
+        } else {
+            // Without an intervening terrain-depth copy, retain the original
+            // clear/depth state and switch pipelines in the already-open pass.
+            self.draw_scenery(&mut p, bind, reflected, pass_kind, world_cmds, world_sdr_cmds);
+        }
+    }
+
+    fn draw_scenery(
+        &self,
+        p: &mut wgpu::RenderPass<'_>,
+        bind: &wgpu::BindGroup,
+        reflected: bool,
+        pass_kind: Pass,
+        world_cmds: &[crate::world_objects::DrawCmd],
+        world_sdr_cmds: &[crate::world_objects::DrawCmd],
+    ) {
         if !ui_test() && !skip_trees_test() {
-            self.far_trees.draw(&mut p, reflected);
+            self.far_trees.draw(p, reflected);
         }
         self.grass
-            .draw(&mut p, bind, Some(&self.terrain_gpu.grass_light_bind));
+            .draw(p, bind, Some(&self.terrain_gpu.grass_light_bind));
         p.set_pipeline(&self.scenery_pipeline);
         p.set_bind_group(0, bind, &[]);
         p.set_vertex_buffer(0, self.vertex.slice(..));
@@ -2788,26 +2832,19 @@ impl Renderer {
         p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
         if !self.world_done {
             for page in &self.local_pages {
-                page.draw_selected(&mut p, reflected, pass_kind);
+                page.draw_selected(p, reflected, pass_kind);
             }
         }
         // Do not submit world pages on top of the same locally streamed
-        // ornaments while preload is in progress: the coplanar duplicates
-        // caused depth flicker. Switch atomically only after all pages arrive.
+        // ornaments while preload is in progress: coplanar duplicates flicker.
         if self.world_done {
-            // Placement order is frozen at load completion; this view's
-            // frustum-filtered command spans were built for this frame.
             crate::world_objects::GpuPage::draw_world(
                 &self.world_pages,
                 world_cmds,
-                &mut p,
+                p,
                 reflected,
             );
         }
-        // The SDR pipeline only needs curtain triangles. The previous version
-        // replayed every scenery index through the vertex shader and discarded
-        // almost all of it in `fs_sdr`; compact index streams preserve original
-        // ordering while keeping ordinary scenery off this part of the pass.
         let local_sdr = !self.world_done && self.local_pages.iter().any(|page| page.has_sdr());
         let world_sdr = self.world_done && !world_sdr_cmds.is_empty();
         if self.sdr_count != 0 || local_sdr || world_sdr {
@@ -2820,19 +2857,20 @@ impl Renderer {
             }
             if !self.world_done {
                 for page in &self.local_pages {
-                    page.draw_selected_sdr(&mut p, reflected, pass_kind);
+                    page.draw_selected_sdr(p, reflected, pass_kind);
                 }
             }
             if self.world_done {
                 crate::world_objects::GpuPage::draw_world_sdr(
                     &self.world_pages,
                     world_sdr_cmds,
-                    &mut p,
+                    p,
                     reflected,
                 );
             }
         }
     }
+
     fn draw_models(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -3185,21 +3223,24 @@ impl Renderer {
         } else {
             None
         };
-        let scene_target = post_view.as_ref().unwrap_or(target);
+        let scene_target = post_view.unwrap_or(target);
         let post_raw = if use_post {
             Some(self.post.scene_raw_view())
         } else {
             None
         };
-        let scene_target_raw = post_raw.as_ref().unwrap_or(target_raw);
+        let scene_target_raw = post_raw.unwrap_or(target_raw);
         // Fog is a uniform state of the main scene pass, not a separate view.
         let main_pass = if camera.active_fog().enabled {
             Pass::Fog
         } else {
             Pass::Main
         };
+        // Main and refraction use the same matrix and whole-world frustum.
+        // Keep the exact ordered visibility result for the later water pass.
+        let main_visible_order = self.world_visible_order(matrix);
         let (main_world_cmds, main_world_sdr_cmds) =
-            self.world_commands_for_view(matrix, main_pass);
+            self.world_commands_for_order(&main_visible_order, main_pass);
         let normal = frame.uniform(
             matrix,
             [direction.x, direction.y, direction.z, daylight],
@@ -3209,12 +3250,18 @@ impl Renderer {
         );
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&normal));
-        let mut visible_water: Vec<(f32, usize)> = self
-            .water_batches
-            .iter()
-            .enumerate()
-            .filter(|(_, batch)| batch.visible(matrix))
-            .map(|(index, batch)| (batch.distance_squared(camera.pos), index))
+        let water_frustum = crate::terrain_residency::Frustum::from_matrix(matrix);
+        let visible_water_indices = self
+            .water_cull_index
+            .visible_order_indices(|bounds| water_frustum.intersects(bounds));
+        let mut visible_water: Vec<(f32, usize)> = visible_water_indices
+            .into_iter()
+            .map(|index| {
+                (
+                    self.water_batches[index].distance_squared(camera.pos),
+                    index,
+                )
+            })
             .collect();
         visible_water.sort_by(|a, b| b.0.total_cmp(&a.0));
         if water_debug() {
@@ -3275,9 +3322,9 @@ impl Renderer {
             );
         }
         let water_scene = needs_refraction.then(|| self.water.scene());
-        let scene_color = water_scene.as_ref().unwrap_or(scene_target);
+        let scene_color = water_scene.unwrap_or(scene_target);
         let water_scene_raw = needs_refraction.then(|| self.water.scene_raw());
-        let model_target = water_scene_raw.as_ref().unwrap_or(scene_target_raw);
+        let model_target = water_scene_raw.unwrap_or(scene_target_raw);
         let scene_depth = self.depth.create_view(&Default::default());
         let post_depth = needs_refraction.then(|| self.water.sample_depth());
         let mut e = self.device.create_command_encoder(&Default::default());
@@ -3354,7 +3401,8 @@ impl Renderer {
                     &self.device,
                     &self.queue,
                     target,
-                    post_depth.as_ref().unwrap_or(&scene_depth),
+                    post_depth.unwrap_or(&scene_depth),
+                    post_depth.is_some(),
                     w,
                     h,
                     frame.elapsed,
@@ -3426,7 +3474,8 @@ impl Renderer {
                     &self.device,
                     &self.queue,
                     target,
-                    post_depth.as_ref().unwrap_or(&scene_depth),
+                    post_depth.unwrap_or(&scene_depth),
+                    post_depth.is_some(),
                     w,
                     h,
                     frame.elapsed,
@@ -3452,7 +3501,7 @@ impl Renderer {
         let reflect_depth = needs_refraction.then(|| self.water.depth());
         let refraction = needs_refraction.then(|| self.water.refraction());
         let (refraction_world_cmds, refraction_world_sdr_cmds) = if needs_refraction {
-            self.world_commands_for_view(matrix, Pass::Refraction)
+            self.world_commands_for_order(&main_visible_order, Pass::Refraction)
         } else {
             (Vec::new(), Vec::new())
         };
@@ -3473,13 +3522,10 @@ impl Renderer {
                 continue;
             }
             let reflection = reflection
-                .as_ref()
                 .expect("visible complex water needs reflection target");
             let reflect_depth = reflect_depth
-                .as_ref()
                 .expect("visible complex water needs reflection depth");
             let refraction = refraction
-                .as_ref()
                 .expect("visible complex water needs refraction target");
             let plane = batch.height;
             // A previous plane's reflection left its mirrored records in the
@@ -3800,7 +3846,8 @@ impl Renderer {
                 &self.device,
                 &self.queue,
                 target,
-                post_depth.as_ref().unwrap_or(&scene_depth),
+                post_depth.unwrap_or(&scene_depth),
+                post_depth.is_some(),
                 w,
                 h,
                 frame.elapsed,
@@ -4838,19 +4885,37 @@ pub fn run(
                             }
                             let surface_view = frame.texture.create_view(&Default::default());
                             // Composition target: the whole-frame gamma intermediate, else the
-                            // present-encode intermediate, else the swapchain itself. This is
-                            // always the full window resolution: UI and the final present chain
-                            // stay sharp regardless of the 3D resolution scale.
+                            // present-encode intermediate, else the swapchain itself. UI and the
+                            // final presentation transforms stay at native resolution.
                             let composed_view=if whole_frame_gamma {Some(display_gamma.as_ref().unwrap().view())} else if let Some(encode)=present_encode.as_ref() {Some(encode.view())} else {None};
                             let scene_view=composed_view.as_ref().unwrap_or(&surface_view);
-                            // Draw the world into the scaled offscreen target, then bilinearly
-                            // present it into `scene_view` before the UI pass loads that result.
-                            let world_view = render_scale.view();
-                            let world_raw_view = render_scale.raw_view();
+                            let direct = crate::render_scale::direct_render_compatible(
+                                applied_extent,
+                                (config.width, config.height),
+                                format,
+                                surface_format,
+                                whole_frame_gamma || present_encode.is_some(),
+                            );
+                            let surface_raw_view = direct.then(|| {
+                                frame.texture.create_view(&wgpu::TextureViewDescriptor {
+                                    format: Some(surface_format.remove_srgb_suffix()),
+                                    ..Default::default()
+                                })
+                            });
+                            // At native extent and with no color-composition stage, render
+                            // straight to the compatible swapchain views. Otherwise keep the
+                            // scaled target and its color-neutral bilinear blit.
+                            let scaled_world_view = (!direct).then(|| render_scale.view());
+                            let scaled_world_raw_view = (!direct).then(|| render_scale.raw_view());
+                            let world_view = scaled_world_view.as_ref().unwrap_or(&surface_view);
+                            let world_raw_view = scaled_world_raw_view
+                                .as_ref()
+                                .or(surface_raw_view.as_ref())
+                                .expect("direct mode has a compatible raw surface view");
                             let timing_render_start = frame_timing.then(Instant::now);
                             renderer.render(
-                                &world_view,
-                                &world_raw_view,
+                                world_view,
+                                world_raw_view,
                                 camera.matrix(config.width, config.height, camera.far),
                                 &camera,
                                 applied_extent.0,
@@ -4859,7 +4924,9 @@ pub fn run(
                             if let Some(start) = timing_render_start {
                                 timing_render += start.elapsed();
                             }
-                            render_scale.blit(&renderer.device, &renderer.queue, scene_view);
+                            if !direct {
+                                render_scale.blit(&renderer.device, &renderer.queue, scene_view);
+                            }
                             // Refresh the top-down view on every presented frame. The old
                             // 350ms timer capped minimap motion to fewer than 3 FPS.
                             // The realistic minimap is a live top-down render; the
@@ -5837,8 +5904,12 @@ mod frame_snapshot_tests {
             "local pages must use the data-driven pass gate"
         );
         assert!(
-            src.contains("self.world_commands_for_view(matrix, main_pass)"),
-            "whole-world pages must be culled from the current view matrix"
+            src.contains("self.world_commands_for_order(&main_visible_order, main_pass)"),
+            "main scenery must use the current matrix's shared visibility result"
+        );
+        assert!(
+            src.contains("self.world_commands_for_order(&main_visible_order, Pass::Refraction)"),
+            "refraction must reuse the main view's identical frustum-visible order"
         );
         assert!(
             src.contains("self.world_commands_for_view(reflected_matrix, Pass::Reflection)"),

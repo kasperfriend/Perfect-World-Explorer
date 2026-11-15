@@ -2,7 +2,7 @@
 //! Client scene-light grid and candidate selection in 0x425470 / 0x4250c0.
 //! Published runtime lights feed ordinary world-model queries. GFX controller
 //! playback/production is a separate, still unfinished integration path.
-use std::{collections::HashMap, fs, path::Path};
+use std::{collections::HashMap, fs, path::Path, sync::Arc};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneLight {
@@ -19,7 +19,9 @@ pub struct SceneLight {
 }
 #[derive(Debug, Clone, Default)]
 pub struct SceneLights {
-    pub lights: Vec<SceneLight>,
+    /// Immutable snapshot: replacing it changes Arc identity, while in-place
+    /// edits cannot silently invalidate the static grid's cached indices.
+    pub lights: Arc<[SceneLight]>,
 }
 fn u32_at(b: &[u8], p: usize) -> Result<u32, String> {
     Ok(u32::from_le_bytes(
@@ -44,6 +46,11 @@ fn floats<const N: usize>(b: &[u8], p: usize) -> Result<[f32; N], String> {
     Ok(a)
 }
 impl SceneLights {
+    pub fn from_lights(lights: Vec<SceneLight>) -> Self {
+        Self {
+            lights: lights.into(),
+        }
+    }
     pub fn load(path: &Path) -> Result<Self, String> {
         let b = fs::read(path).map_err(|e| e.to_string())?;
         Self::parse(&b)
@@ -83,7 +90,9 @@ impl SceneLights {
             }
             lights.push(light);
         }
-        Ok(Self { lights })
+        Ok(Self {
+            lights: lights.into(),
+        })
     }
 }
 /// Runtime effect light fields read by 0x42592f–0x425b09.
@@ -154,7 +163,7 @@ impl LightPublications {
 pub struct StaticGrid {
     center: [f32; 3],
     initialized: bool,
-    static_records: Vec<SceneLight>,
+    static_records: Arc<[SceneLight]>,
     cells: [Vec<usize>; 100],
     dynamic_cells: [Vec<usize>; 100],
     dynamic: Vec<DynamicLight>,
@@ -164,7 +173,7 @@ impl Default for StaticGrid {
         Self {
             center: [0.; 3],
             initialized: false,
-            static_records: Vec::new(),
+            static_records: Arc::from(Vec::<SceneLight>::new()),
             cells: std::array::from_fn(|_| Vec::new()),
             dynamic_cells: std::array::from_fn(|_| Vec::new()),
             dynamic: Vec::new(),
@@ -174,15 +183,18 @@ impl Default for StaticGrid {
 impl StaticGrid {
     pub fn update(&mut self, lights: &SceneLights, center: [f32; 3]) {
         if self.initialized
-            && self.static_records == lights.lights
+            && Arc::ptr_eq(&self.static_records, &lights.lights)
             && (center[0] - self.center[0]).abs() < 12.
             && (center[2] - self.center[2]).abs() < 12.
         {
             return;
         }
-        // A replacement scene corpus invalidates cached indices even if the
-        // camera did not move. Stable client data retains the retail threshold.
-        self.static_records.clone_from(&lights.lights);
+        // A replacement immutable snapshot invalidates cached indices even if
+        // the camera did not move. Pointer identity is safe because the public
+        // record slice cannot be mutated in place.
+        if !Arc::ptr_eq(&self.static_records, &lights.lights) {
+            self.static_records = Arc::clone(&lights.lights);
+        }
         self.center = center;
         self.initialized = true;
         for cell in &mut self.cells {
@@ -372,22 +384,20 @@ mod tests {
 
     #[test]
     fn replacing_static_corpus_invalidates_cells_without_camera_motion() {
-        let mut lights = SceneLights {
-            lights: vec![fixture([0.; 3], 10.)],
-        };
+        let mut lights = SceneLights::from_lights(vec![fixture([0.; 3], 10.)]);
         let mut grid = StaticGrid::default();
         grid.update(&lights, [0.; 3]);
         assert!(grid.query([0.; 3], 1.).is_some());
-        lights.lights.clear();
+        lights.lights = Vec::new().into();
         // Queries own the captured corpus, never caller-mutated record IDs.
         assert!(grid.query([0.; 3], 1.).is_some());
         grid.update(&lights, [0.; 3]);
         assert!(grid.query([0.; 3], 1.).is_none());
-        lights.lights.push(fixture([0.; 3], 10.));
+        lights.lights = vec![fixture([0.; 3], 10.)].into();
         grid.update(&lights, [0.; 3]);
         assert!(grid.query([0.; 3], 1.).is_some());
         // Same-size replacement must also rebuild bounds, not reuse ID 0's cell.
-        lights.lights[0] = fixture([1000.; 3], 10.);
+        lights.lights = vec![fixture([1000.; 3], 10.)].into();
         grid.update(&lights, [0.; 3]);
         assert!(grid.query([0.; 3], 1.).is_none());
     }
@@ -464,9 +474,7 @@ mod tests {
         let mut second = first.clone();
         second.flags = 0;
         second.diffuse = [1.; 4];
-        let lights = SceneLights {
-            lights: vec![first.clone(), second],
-        };
+        let lights = SceneLights::from_lights(vec![first.clone(), second]);
         let mut grid = StaticGrid::default();
         grid.update(&lights, [0., 100., 0.]);
         // The chosen cell's AABBs overlap the query even though range does not.
@@ -490,9 +498,7 @@ mod tests {
 
     #[test]
     fn runtime_light_replaces_static_only_when_strictly_closer() {
-        let lights = SceneLights {
-            lights: vec![fixture([8., 100., 0.], 20.)],
-        };
+        let lights = SceneLights::from_lights(vec![fixture([8., 100., 0.], 20.)]);
         let mut grid = StaticGrid::default();
         grid.update(&lights, [0., 100., 0.]);
         for (x, expected) in [(9., 8.), (8., 8.), (7., 7.)] {
@@ -517,9 +523,7 @@ mod tests {
 
     #[test]
     fn query_bounds_are_inclusive_and_edge_indices_are_clamped() {
-        let lights = SceneLights {
-            lights: vec![fixture([0., 100., 0.], 1.)],
-        };
+        let lights = SceneLights::from_lights(vec![fixture([0., 100., 0.], 1.)]);
         let mut grid = StaticGrid::default();
         grid.update(&lights, [0., 100., 0.]);
         for x in [-60., 60.] {
@@ -582,9 +586,7 @@ mod tests {
                 flags: flag,
             }
         }
-        let lights = SceneLights {
-            lights: vec![light(0., 20., 1), light(30., 5., 0)],
-        };
+        let lights = SceneLights::from_lights(vec![light(0., 20., 1), light(30., 5., 0)]);
         let mut grid = StaticGrid::default();
         grid.update(&lights, [0., 100., 0.]);
         let l = grid.query([0., 100., 0.], 0.5).unwrap();

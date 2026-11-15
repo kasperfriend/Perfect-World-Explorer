@@ -179,6 +179,14 @@ pub struct PostGpu {
     modulation: [f32; 4],
     sharpen: bool,
     composite_target: wgpu::Texture,
+    scene_view: wgpu::TextureView,
+    scene_raw_view: wgpu::TextureView,
+    fogged_view: wgpu::TextureView,
+    warped_view: wgpu::TextureView,
+    downsample_view: wgpu::TextureView,
+    blur_view: wgpu::TextureView,
+    composite_view: wgpu::TextureView,
+    bind_groups: std::cell::RefCell<[Option<Vec<wgpu::BindGroup>>; 2]>,
     encoded_finish: wgpu::RenderPipeline,
     sharpen_finish: wgpu::RenderPipeline,
     format: wgpu::TextureFormat,
@@ -316,16 +324,35 @@ impl PostGpu {
                 multiview: None,
             })
         };
+        let composite_target = texture(
+            device,
+            format.remove_srgb_suffix(),
+            w,
+            h,
+            "encoded glow before sharpen",
+        );
+        let scene_view = scene.create_view(&Default::default());
+        let scene_raw_view = scene.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(format.remove_srgb_suffix()),
+            ..Default::default()
+        });
+        let fogged_view = fogged.create_view(&Default::default());
+        let warped_view = warped.create_view(&Default::default());
+        let downsample_view = downsample.create_view(&Default::default());
+        let blur_view = blur.create_view(&Default::default());
+        let composite_view = composite_target.create_view(&Default::default());
         Self {
             modulation: [1.; 4],
             sharpen: false,
-            composite_target: texture(
-                device,
-                format.remove_srgb_suffix(),
-                w,
-                h,
-                "encoded glow before sharpen",
-            ),
+            composite_target,
+            scene_view,
+            scene_raw_view,
+            fogged_view,
+            warped_view,
+            downsample_view,
+            blur_view,
+            composite_view,
+            bind_groups: std::cell::RefCell::new([None, None]),
             encoded_finish: make("finish_encoded", format.remove_srgb_suffix()),
             sharpen_finish: make("sharpen_finish", format),
             format,
@@ -389,16 +416,24 @@ impl PostGpu {
             (h / 4).max(1),
             "glow blur",
         );
-    }
-    pub fn scene_view(&self) -> wgpu::TextureView {
-        self.scene.create_view(&Default::default())
-    }
-    /// Raw view permits legacy encoded-space alpha blending for shoreline waves.
-    pub fn scene_raw_view(&self) -> wgpu::TextureView {
-        self.scene.create_view(&wgpu::TextureViewDescriptor {
+        self.scene_view = self.scene.create_view(&Default::default());
+        self.scene_raw_view = self.scene.create_view(&wgpu::TextureViewDescriptor {
             format: Some(self.format.remove_srgb_suffix()),
             ..Default::default()
-        })
+        });
+        self.fogged_view = self.fogged.create_view(&Default::default());
+        self.warped_view = self.warped.create_view(&Default::default());
+        self.downsample_view = self.downsample.create_view(&Default::default());
+        self.blur_view = self.blur.create_view(&Default::default());
+        self.composite_view = self.composite_target.create_view(&Default::default());
+        *self.bind_groups.borrow_mut() = [None, None];
+    }
+    pub fn scene_view(&self) -> &wgpu::TextureView {
+        &self.scene_view
+    }
+    /// Raw view permits legacy encoded-space alpha blending for shoreline waves.
+    pub fn scene_raw_view(&self) -> &wgpu::TextureView {
+        &self.scene_raw_view
     }
     pub fn render(
         &self,
@@ -406,6 +441,7 @@ impl PostGpu {
         queue: &wgpu::Queue,
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
+        water_depth: bool,
         w: u32,
         h: u32,
         time: f32,
@@ -468,54 +504,72 @@ impl PostGpu {
             // Nothing writes the frame: do not copy or quantize it.
             return;
         }
-        let scene = self.scene.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(self.format.remove_srgb_suffix()),
-            ..Default::default()
-        });
-        let fogged = self.fogged.create_view(&Default::default());
-        let warped = self.warped.create_view(&Default::default());
-        let downsample = self.downsample.create_view(&Default::default());
-        let blur = self.blur.create_view(&Default::default());
-        // Separate horizontal and composite bind groups avoid binding the blur texture
-        // as both render target and shader resource in the same pass.
-        let bind = |input: &wgpu::TextureView, other: &wgpu::TextureView| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("post textures"),
-                layout: &self.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(input),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(other),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(depth),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: self.uniform.as_entire_binding(),
-                    },
-                ],
-            })
-        };
+        // All attachment views are stable until resize. The depth texture is
+        // likewise replaced only with the post targets, so these finite input
+        // pair groups can be reused for every active post frame.
+        let depth_slot = if water_depth { 1 } else { 0 };
+        if self.bind_groups.borrow()[depth_slot].is_none() {
+            let bind = |input: &wgpu::TextureView, other: &wgpu::TextureView| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("post textures"),
+                    layout: &self.layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(input),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(other),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(depth),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.uniform.as_entire_binding(),
+                        },
+                    ],
+                })
+            };
+            let groups = vec![
+                bind(&self.scene_raw_view, &self.scene_raw_view),
+                bind(&self.fogged_view, &self.fogged_view),
+                bind(&self.warped_view, &self.warped_view),
+                bind(&self.scene_raw_view, &self.downsample_view),
+                bind(&self.fogged_view, &self.downsample_view),
+                bind(&self.warped_view, &self.downsample_view),
+                bind(&self.scene_raw_view, &self.blur_view),
+                bind(&self.fogged_view, &self.blur_view),
+                bind(&self.warped_view, &self.blur_view),
+                bind(&self.composite_view, &self.blur_view),
+            ];
+            self.bind_groups.borrow_mut()[depth_slot] = Some(groups);
+        }
+        let cached_groups = self.bind_groups.borrow();
+        let groups = cached_groups[depth_slot]
+            .as_ref()
+            .expect("post groups initialized");
+        let scene = &self.scene_raw_view;
+        let fogged = &self.fogged_view;
+        let warped = &self.warped_view;
+        let downsample = &self.downsample_view;
+        let blur = &self.blur_view;
         let mut encoder = device.create_command_encoder(&Default::default());
         // Diagnostic depth fog only. Production shading is fogged per material,
         // so this stage is never part of the shipped chain (`post_plan`).
         let apply_fog = plan.fog;
         if apply_fog {
-            let group = bind(&scene, &scene);
+            let group = &groups[0];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene fog before glow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &fogged,
+                    view: fogged,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -527,17 +581,18 @@ impl PostGpu {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.fog_pipeline);
-            pass.set_bind_group(0, &group, &[]);
+            pass.set_bind_group(0, group, &[]);
             pass.draw(0..3, 0..1);
         }
-        let before_warp = if apply_fog { &fogged } else { &scene };
+        let before_warp = if apply_fog { fogged } else { scene };
+        let before_warp_index = if apply_fog { 1 } else { 0 };
         // 0x40fd33: spacewarp consumes the quantized capture, before glow.
         if plan.warp {
-            let group = bind(before_warp, before_warp);
+            let group = &groups[before_warp_index];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("underwater distortion before glow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &warped,
+                    view: warped,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -549,19 +604,19 @@ impl PostGpu {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.warp_pipeline);
-            pass.set_bind_group(0, &group, &[]);
+            pass.set_bind_group(0, group, &[]);
             pass.draw(0..3, 0..1);
         }
-        let input = if plan.warp { &warped } else { before_warp };
+        let input_index = if plan.warp { 2 } else { before_warp_index };
         // 0x40fdb0/0x40f053: quarter-size copy, horizontal blur, then the
         // vertical blur + composite in the finish pass.
         if plan.glow {
             {
-                let group = bind(input, input);
+                let group = &groups[input_index];
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("glow quarter-size stretch copy"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &downsample,
+                        view: downsample,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -573,14 +628,14 @@ impl PostGpu {
                     occlusion_query_set: None,
                 });
                 pass.set_pipeline(&self.downsample_pipeline);
-                pass.set_bind_group(0, &group, &[]);
+                pass.set_bind_group(0, group, &[]);
                 pass.draw(0..3, 0..1);
             }
-            let group = bind(input, &downsample);
+            let group = &groups[3 + input_index];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("glow horizontal"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &blur,
+                    view: blur,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -592,17 +647,16 @@ impl PostGpu {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.horizontal);
-            pass.set_bind_group(0, &group, &[]);
+            pass.set_bind_group(0, group, &[]);
             pass.draw(0..3, 0..1);
         }
-        let composite_target = self.composite_target.create_view(&Default::default());
         {
-            let group = bind(input, &blur);
+            let group = &groups[6 + input_index];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("underwater and glow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: if plan.sharpen {
-                        &composite_target
+                        &self.composite_view
                     } else {
                         target
                     },
@@ -621,12 +675,12 @@ impl PostGpu {
             } else {
                 &self.finish
             });
-            pass.set_bind_group(0, &group, &[]);
+            pass.set_bind_group(0, group, &[]);
             pass.draw(0..3, 0..1);
         }
         // 0x40fd64..0x40fd9c: authored fullsharpen_14 after the encoded glow.
         if plan.sharpen {
-            let group = bind(&composite_target, &blur);
+            let group = &groups[9];
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("client fullscreen sharpen after encoded glow"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -642,7 +696,7 @@ impl PostGpu {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.sharpen_finish);
-            pass.set_bind_group(0, &group, &[]);
+            pass.set_bind_group(0, group, &[]);
             pass.draw(0..3, 0..1);
         }
         queue.submit(Some(encoder.finish()));

@@ -1216,21 +1216,28 @@ impl GpuPage {
         visible_order: &[usize],
         view: Pass,
     ) -> (Vec<DrawCmd>, Vec<DrawCmd>) {
-        let opaque: Vec<PageSpans> = pages
-            .iter()
-            .map(|p| PageSpans {
-                count: p.count,
-                placements: &p.placements,
-            })
-            .collect();
-        let sdr: Vec<PageSpans> = pages
-            .iter()
-            .map(|p| PageSpans {
-                count: p.sdr_count,
-                placements: &p.sdr_placements,
-            })
-            .collect();
-        fold_commands_pair_indices(&opaque, &sdr, order, visible_order, view)
+        // Walk GpuPage data directly: the previous implementation built two
+        // temporary PageSpans vectors for every camera view just to borrow the
+        // same placement arrays.
+        let mut opaque = Vec::with_capacity(visible_order.len());
+        let mut sdr = Vec::with_capacity(visible_order.len());
+        for &order_index in visible_order {
+            let (page, range) = order[order_index];
+            let p = &pages[page];
+            if range == usize::MAX {
+                append_folded(&mut opaque, page, 0, p.count);
+                append_folded(&mut sdr, page, 0, p.sdr_count);
+                continue;
+            }
+            let placement = &p.placements[range];
+            if !allows_with_context(view, placement.visibility, RenderContext::default()) {
+                continue;
+            }
+            append_folded(&mut opaque, page, placement.start, placement.end);
+            let curtain = &p.sdr_placements[range];
+            append_folded(&mut sdr, page, curtain.start, curtain.end);
+        }
+        (opaque, sdr)
     }
 
     pub fn draw_commands_pair_culled(

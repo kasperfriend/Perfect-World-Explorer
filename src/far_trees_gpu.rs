@@ -4,6 +4,7 @@ use crate::{gpu::Vertex, trees::Trees};
 mod cutoff_residency;
 use crate::indirect_args::{base_instance, multi_draw, record, DrawIndexedArgs, DRAW_ARGS};
 use bytemuck::{Pod, Zeroable};
+use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 /// One instance record: `[position.xyz, 0]`, then `[fraction, mode, 0, 0]`.
 ///
@@ -62,17 +63,80 @@ pub(crate) struct LodParams {
     pub(crate) camera: [f32; 4],
     /// Admitted XZ square (`x0, x1, z0, z1`); ignored when `counts.z` is 0.
     pub(crate) bounds: [f32; 4],
-    /// `placements, groups, bounds_active, 0`.
+    /// `active placements, groups, bounds_active, total placements`.
     pub(crate) counts: [u32; 4],
+}
+
+const PLACEMENT_BIN_SIZE: f32 = 128.;
+
+fn placement_bins(placements: &[Placement]) -> HashMap<(i32, i32), Vec<u32>> {
+    let mut bins: HashMap<(i32, i32), Vec<u32>> = HashMap::new();
+    for (index, placement) in placements.iter().enumerate() {
+        let [x, _, z, _] = placement.pos_height;
+        if x.is_finite() && z.is_finite() {
+            bins.entry((
+                (x / PLACEMENT_BIN_SIZE).floor() as i32,
+                (z / PLACEMENT_BIN_SIZE).floor() as i32,
+            ))
+            .or_default()
+                .push(index as u32);
+        }
+    }
+    bins
+}
+
+/// Gather placements whose 128-unit bins intersect the existing admitted
+/// square. The compute shader keeps the exact per-placement square test, so
+/// this broad phase may include extra candidates but cannot exclude a tree that
+/// the old dispatch would have admitted. Invalid or unreasonably large bounds
+/// conservatively fall back to the complete ordered placement list.
+fn select_placement_indices(
+    bins: &HashMap<(i32, i32), Vec<u32>>,
+    total: u32,
+    bounds: Option<[f32; 4]>,
+    out: &mut Vec<u32>,
+) {
+    out.clear();
+    let Some([x0, x1, z0, z1]) = bounds else {
+        out.extend(0..total);
+        return;
+    };
+    if ![x0, x1, z0, z1].iter().all(|v| v.is_finite()) || x0 > x1 || z0 > z1 {
+        out.extend(0..total);
+        return;
+    }
+    let (bx0, bx1, bz0, bz1) = (
+        (x0 / PLACEMENT_BIN_SIZE).floor() as i32,
+        (x1 / PLACEMENT_BIN_SIZE).floor() as i32,
+        (z0 / PLACEMENT_BIN_SIZE).floor() as i32,
+        (z1 / PLACEMENT_BIN_SIZE).floor() as i32,
+    );
+    let nx = i64::from(bx1) - i64::from(bx0) + 1;
+    let nz = i64::from(bz1) - i64::from(bz0) + 1;
+    if nx <= 0 || nz <= 0 || nx.saturating_mul(nz) > 1_000_000 {
+        out.extend(0..total);
+        return;
+    }
+    for z in bz0..=bz1 {
+        for x in bx0..=bx1 {
+            if let Some(indices) = bins.get(&(x, z)) {
+                out.extend_from_slice(indices);
+            }
+        }
+    }
+    // Preserve the original placement traversal order before the GPU's LOD
+    // atomics assign output slots.
+    out.sort_unstable();
 }
 
 /// The LOD selection pass.
 ///
 /// This is `tree_lod::client_distance` + `tree_lod::select` transcribed into
-/// WGSL and run once per placement on the GPU, so a camera move no longer costs
-/// a walk over every tree placement in the world plus a full instance-buffer
-/// upload. Both functions are pure arithmetic and are reproduced operation for
-/// operation: the same fast square root on the squared distance
+/// WGSL and run once per candidate placement on the GPU. A static spatial-bin
+/// query limits changed camera keys to bins intersecting the resident square
+/// and the camera far-distance square expanded by the measured tree-mesh halo;
+/// the compute shader keeps the exact resident-center bounds test. Both
+/// functions are pure arithmetic and are reproduced operation for operation: the same fast square root on the squared distance
 /// (`(bits >> 1) + 0x1fc00000`), the same 10 % transition windows around
 /// `height * 5 * scale` and `height * 16 * scale`. The only difference is that
 /// the CPU sums the squared deltas in f64 and rounds once; the GPU sums in f32,
@@ -89,6 +153,7 @@ struct Instance {data0:vec4<f32>,data1:vec4<f32>};
 @group(0) @binding(2) var<storage,read> groups:array<GroupInfo>;
 @group(0) @binding(3) var<storage,read_write> instances:array<Instance>;
 @group(0) @binding(4) var<storage,read_write> args:array<Args>;
+@group(0) @binding(5) var<storage,read> active_indices:array<u32>;
 fn is_finite(v:f32)->bool {return v>=-3.0e38 && v<=3.0e38;}
 // SpeedTreeRT 0x100282b0's estimate: f32 squared distance, then the float-bit
 // square root. Matches `tree_lod::client_distance`.
@@ -130,8 +195,10 @@ fn append(group_index:u32,level:u32,position:vec3<f32>,info:vec2<f32>) {
 }
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id:vec3<u32>) {
- let index=id.x;
- if index>=p.counts.x {return;}
+ let active_slot=id.x;
+ if active_slot>=p.counts.x {return;}
+ let index=active_indices[active_slot];
+ if index>=p.counts.w {return;}
  let placement=placements[index];
  let position=placement.pos_height.xyz;
  if !is_finite(position.x) || !is_finite(position.y) || !is_finite(position.z) {return;}
@@ -217,13 +284,17 @@ pub struct FarTrees {
     groups: Vec<Group>,
     /// Slots in the instance buffer: three level slices per placement.
     capacity: usize,
-    last_resident_update: Option<([f32; 3], f32, Option<[f32; 4]>)>,
+    last_resident_update: Option<([f32; 3], f32, f32, Option<[f32; 4]>)>,
+    tree_halo: f32,
     /// The LOD selection pass: a camera move dispatches this instead of walking
     /// every placement on the CPU and re-uploading the instance buffer.
     lod_pipeline: wgpu::ComputePipeline,
     lod_bind: wgpu::BindGroup,
     lod_params: wgpu::Buffer,
     placements: u32,
+    placement_bins: HashMap<(i32, i32), Vec<u32>>,
+    active_placements: Vec<u32>,
+    active_index_buffer: wgpu::Buffer,
     /// Indirect args, one record per batch (`DRAW_ARGS` bytes each), plus the
     /// static part of each record with `instance_count` zeroed.
     lod_args: wgpu::Buffer,
@@ -537,6 +608,17 @@ impl FarTrees {
         if instances.is_empty() {
             instances.push(Instance::zeroed())
         }
+        // Bound the far-plane broad phase by the actual furthest tree mesh
+        // vertex plus a generous wind allowance, so a crown intersecting the
+        // view is not lost when its placement origin is just beyond `far`.
+        let tree_halo = vertices
+            .iter()
+            .map(|vertex| {
+                let [x, y, z] = vertex.pos;
+                (x * x + y * y + z * z).sqrt() * 2.
+            })
+            .filter(|radius| radius.is_finite())
+            .fold(0f32, f32::max);
         let image = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("far tree textures"),
             size: wgpu::Extent3d {
@@ -846,9 +928,9 @@ impl FarTrees {
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
         });
-        // Placement table, per-group constants and the indirect args are built
-        // once here. Nothing per-frame is uploaded any more: a camera move only
-        // dispatches `LOD_COMPUTE` over the placement table.
+        // Placement table, spatial bins, per-group constants and indirect args
+        // are built once here. Each camera update uploads only the selected
+        // placement indices before dispatching the LOD compute pass.
         let mut placement_data = Vec::new();
         for (index, group) in groups.iter().enumerate() {
             for &position in &group.positions {
@@ -877,6 +959,13 @@ impl FarTrees {
             });
         }
         let placement_count = placement_data.len() as u32;
+        let placement_bins = placement_bins(&placement_data);
+        let active_index_seed = vec![0u32; placement_count as usize];
+        let active_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("active tree placement indices"),
+            contents: bytemuck::cast_slice(&active_index_seed),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
         let placement_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("tree placements"),
             contents: bytemuck::cast_slice(&placement_data),
@@ -981,6 +1070,16 @@ impl FarTrees {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let lod_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1019,6 +1118,10 @@ impl FarTrees {
                     binding: 4,
                     resource: lod_args.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: active_index_buffer.as_entire_binding(),
+                },
             ],
         });
         eprintln!(
@@ -1045,10 +1148,14 @@ impl FarTrees {
             groups,
             capacity,
             last_resident_update: None,
+            tree_halo,
             lod_pipeline,
             lod_bind,
             lod_params,
             placements: placement_count,
+            placement_bins,
+            active_placements: Vec::new(),
+            active_index_buffer,
             lod_args,
             lod_args_reset,
             multi_draw: one_call,
@@ -1059,36 +1166,93 @@ impl FarTrees {
     /// The CPU used to walk the whole placement table here — distance, LOD
     /// choice and a full instance-buffer upload — on every frame the camera
     /// moved, which on a whole-world load is tens of thousands of placements.
-    /// Now the placement table is uploaded once at load and a single compute
-    /// dispatch (`LOD_COMPUTE`) writes the visible instances and the per-batch
-    /// instance counts the indirect draws read. Nothing is uploaded per frame,
-    /// and the pass is skipped entirely when the camera, scale and cutoff are
-    /// unchanged, exactly like the old staging rebuild.
+    /// The placement table and its spatial bins are built once at load. Changed
+    /// camera keys query bins intersecting both the resident square and the
+    /// camera's far range expanded by the maximum tree-mesh radius. Only those
+    /// candidate indices are uploaded and dispatched; the exact resident-bounds
+    /// test remains on the GPU. Unchanged camera, scale, far range and cutoff
+    /// still skip the update entirely.
     pub fn update_resident_lods(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         camera: [f32; 3],
         scale: f32,
+        far_range: f32,
         bounds: Option<[f32; 4]>,
     ) {
-        let key = (camera, scale, bounds);
+        let key = (camera, scale, far_range, bounds);
         if self.last_resident_update == Some(key) {
             return;
+        }
+        let query_bounds = if far_range.is_finite() && far_range >= 0. {
+            let radius = far_range + self.tree_halo;
+            if radius.is_finite() {
+                let [x, _, z] = camera;
+                let far_bounds = [x - radius, x + radius, z - radius, z + radius];
+                match bounds {
+                    Some([x0, x1, z0, z1])
+                        if [x0, x1, z0, z1].iter().all(|v| v.is_finite())
+                            && x0 <= x1
+                            && z0 <= z1 =>
+                    {
+                        let intersection = [
+                            x0.max(far_bounds[0]),
+                            x1.min(far_bounds[1]),
+                            z0.max(far_bounds[2]),
+                            z1.min(far_bounds[3]),
+                        ];
+                        if intersection[0] <= intersection[1]
+                            && intersection[2] <= intersection[3]
+                        {
+                            Some(intersection)
+                        } else {
+                            self.active_placements.clear();
+                            None
+                        }
+                    }
+                    Some(invalid) => Some(invalid),
+                    None => Some(far_bounds),
+                }
+            } else {
+                bounds
+            }
+        } else {
+            bounds
+        };
+        let disjoint_empty = far_range.is_finite()
+            && far_range >= 0.
+            && query_bounds.is_none()
+            && bounds.is_some();
+        if !disjoint_empty {
+            select_placement_indices(
+                &self.placement_bins,
+                self.placements,
+                query_bounds,
+                &mut self.active_placements,
+            );
         }
         let params = LodParams {
             camera: [camera[0], camera[1], camera[2], scale],
             bounds: bounds.unwrap_or([0.; 4]),
             counts: [
-                self.placements,
+                self.active_placements.len() as u32,
                 self.groups.len() as u32,
                 u32::from(bounds.is_some()),
-                0,
+                self.placements,
             ],
         };
-        // Zero the per-batch instance counts, keep the static draw spans.
+        // Zero the per-batch instance counts, retain static draw spans, and
+        // upload only placements from intersecting spatial bins.
         queue.write_buffer(&self.lod_args, 0, &self.lod_args_reset);
         queue.write_buffer(&self.lod_params, 0, bytemuck::bytes_of(&params));
+        if !self.active_placements.is_empty() {
+            queue.write_buffer(
+                &self.active_index_buffer,
+                0,
+                bytemuck::cast_slice(&self.active_placements),
+            );
+        }
         let mut e = device.create_command_encoder(&Default::default());
         {
             let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1097,7 +1261,7 @@ impl FarTrees {
             });
             pass.set_pipeline(&self.lod_pipeline);
             pass.set_bind_group(0, &self.lod_bind, &[]);
-            pass.dispatch_workgroups(self.placements.div_ceil(64), 1, 1);
+            pass.dispatch_workgroups((self.active_placements.len() as u32).div_ceil(64), 1, 1);
         }
         queue.submit(Some(e.finish()));
         self.last_resident_update = Some(key);
@@ -1276,6 +1440,39 @@ mod tests {
     #[test]
     fn legacy_cutout_still_covers_fronds_and_leaves_without_native_refs() {
         assert!(super::SHADER.contains("else if i.kind>3.5 && tex.a<0.5 {discard;}"));
+    }
+
+    #[test]
+    fn spatial_bins_include_every_center_admitted_by_exact_bounds() {
+        let positions = [
+            [-300., 0., -80.],
+            [-1., 5., -1.],
+            [127., 0., 127.],
+            [128., 0., 128.],
+            [900., 0., 900.],
+        ];
+        let placements = positions
+            .iter()
+            .map(|p| Placement {
+                pos_height: [p[0], p[1], p[2], 0.],
+                group: 0,
+                pad: [0; 3],
+            })
+            .collect::<Vec<_>>();
+        let bins = placement_bins(&placements);
+        let bounds = [-2., 128., -2., 128.];
+        let mut selected = Vec::new();
+        select_placement_indices(&bins, placements.len() as u32, Some(bounds), &mut selected);
+        for (index, p) in positions.iter().enumerate() {
+            let admitted = p[0] >= bounds[0]
+                && p[0] < bounds[1]
+                && p[2] >= bounds[2]
+                && p[2] < bounds[3];
+            if admitted {
+                assert!(selected.binary_search(&(index as u32)).is_ok());
+            }
+        }
+        assert!(selected.windows(2).all(|w| w[0] < w[1]));
     }
 
     /// Three groups of three levels, one placement per group: the layout the

@@ -24,6 +24,23 @@ This follow-up contains **only new, not-yet-implemented optimization options**. 
 - Removed per-frame staging allocations from attenuation and normal attachment resolution; switched current-frame dynamic-light publication lookup to an identity map and reused its consume scratch buffer.
 - Cached each visible water batch’s distance once for far-to-near sorting, replaced batch clones with indices, and bypassed the full water scene/refraction/depth/blit path when no visible complex-water batch needs it. Terrain-edge depth is copied only when a visible reflected plane needs that pass; reflection/refraction/depth views are created only for visible complex reflective water.
 
+## Implementation status for the ten listed options
+
+This status tracks only the ten rows above; no additional optimization candidates were searched for.
+
+| # | Status and documented change |
+|---|---|
+| 1 | **Implemented, not yet validated.** `SceneLights.lights` and the grid's retained corpus are immutable `Arc<[SceneLight]>` snapshots. `StaticGrid::update` uses snapshot identity plus the existing camera-cell threshold; `SceneLights::from_lights` is the replacement/construction API. |
+| 2 | **Implemented, not yet validated.** `GpuPage::draw_commands_pair_visible` now folds directly from page placement/SDR ranges and no longer allocates the two temporary `PageSpans` vectors per call. |
+| 3 | **Implemented, not yet validated.** Main and refraction command generation reuse one frustum-visible placement-order list because both use the same matrix. The pass-specific admission and command folds remain separate. |
+| 4 | **Implemented, not yet validated.** `PostGpu` caches the fixed attachment views and ten finite texture-pair bind groups. It invalidates and rebuilds them on resize; post targets keep their raw/sRGB view choices. The stable renderer depth target is captured in those groups on first active use and the resize path invalidates them with the depth target. |
+| 5 | **Implemented, not yet validated.** Far-tree placements are binned once in 128-unit XZ cells. On a changed camera key, only indices from bins intersecting the existing resident bounds are uploaded and dispatched; the shader still applies its exact old bounds test and original placement order is restored before dispatch. A broad or malformed bound falls back to all placements. |
+| 6 | **Implemented, not yet validated.** A compute pass generates the deterministic rain/snow billboard centers and dimensions once on the first weather draw of each frame into a shared storage/vertex buffer. Main/reflection/refraction draws reuse it; each view still supplies its own matrix, clip and fog uniform. The generation expressions were moved without changing their constants/formulas. |
+| 7 | **Implemented, not yet validated.** `WaterTargets` now retains the default and raw/sRGB-compatible attachment views (and depth views); accessors borrow those cached views instead of recreating them per frame. Resize recreates them with the targets. |
+| 8 | **Implemented, not yet validated.** `draw_opaque` now keeps terrain and scenery in one render pass when no terrain-depth copy is requested. The split pass and terrain-only copy remain for the water-edge case. |
+| 9 | **Implemented, not yet validated.** The main loop directly renders to the swapchain only when extents and formats match and neither whole-frame gamma nor present encoding requires an intermediate; otherwise the existing scaled target and blit remain. |
+| 10 | **Implemented, not yet validated.** Static water-batch bounds are indexed once with the existing world BVH; each frame queries the frustum and then keeps the existing far-to-near distance sort. |
+
 ## Validation boundary
 
-Branch CI run `43707389675` passed Linux checks/tests, formatting, shader/regression checks, and the Windows x64 build for the current code. No representative target-machine profile has been collected. Compare the same camera route with/without visible complex water and with rain-only, snow-only, and submerged weather. GPU time and actual frame-time improvements remain unmeasured.
+The earlier branch CI run `43707389675` passed Linux checks/tests, formatting, shader/regression checks, and the Windows x64 build for the code at that time; it does **not** validate the changes above. Local validation is blocked because this environment has no `cargo` executable (`cargo: command not found`). `git diff --check` is run for the current patch. No representative target-machine profile has been collected. Do not infer FPS or frame-time gains from these code-path changes.

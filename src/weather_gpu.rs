@@ -36,6 +36,24 @@ struct Params {
     motion: [f32; 4],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, PartialEq)]
+struct GenerateParams {
+    camera: [f32; 4],
+    right: [f32; 4],
+    forward: [f32; 4],
+    clock_weather: [f32; 4],
+    particle: [f32; 4],
+    motion: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct ParticleInstance {
+    center: [f32; 4],
+    size_kind: [f32; 4], // half width, half height, snow flag, pad
+}
+
 /// The two uniform lanes the shader reads, built from the objects' stores.
 ///
 /// `particle` is `[rain size, rain size variation, snow size, snow variation]`
@@ -72,6 +90,40 @@ fn profile_lanes(
     )
 }
 
+const GENERATE_SHADER: &str = r#"
+struct GenerateParams {
+    camera: vec4<f32>, right: vec4<f32>, forward: vec4<f32>,
+    clock_weather: vec4<f32>, particle: vec4<f32>, motion: vec4<f32>,
+};
+struct ParticleInstance { center: vec4<f32>, size_kind: vec4<f32> };
+@group(0) @binding(0) var<uniform> p: GenerateParams;
+@group(0) @binding(1) var<storage, read_write> particles: array<ParticleInstance>;
+fn hash(n: f32) -> f32 { return fract(sin(n * 127.1 + 311.7) * 43758.5453); }
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let instance = id.x;
+    if instance >= 480u { return; }
+    let snow = instance >= 320u;
+    let local_id = f32(select(instance, instance - 320u, snow));
+    let kind = select(0u, 1u, snow);
+    let seed = local_id + f32(kind) * 8192.0;
+    let phase = hash(seed + 7.0);
+    let x = (hash(seed + 1.0) * 2.0 - 1.0) * 28.0;
+    let z = 4.0 + hash(seed + 3.0) * 72.0;
+    let speed_base = select(p.motion.x, p.motion.z, snow);
+    let speed_spread = select(p.motion.y, p.motion.w, snow);
+    let speed = speed_base * (1.0 + (hash(seed + 11.0) * 2.0 - 1.0) * speed_spread);
+    let seconds = p.clock_weather.x * 0.033;
+    let fall = 55.0 - fract(phase + seconds * speed) * 110.0;
+    let center = p.camera.xyz + p.right.xyz * x + p.forward.xyz * z + vec3<f32>(0.0, fall, 0.0);
+    let size_base = select(p.particle.x, p.particle.z, snow) * 0.5;
+    let size_spread = select(p.particle.y, p.particle.w, snow);
+    let half_width = size_base * (1.0 + (hash(seed + 5.0) * 2.0 - 1.0) * size_spread);
+    let half_height = select(1.1 + hash(seed + 17.0) * 1.3, half_width, snow);
+    particles[instance] = ParticleInstance(vec4<f32>(center, 0.0), vec4<f32>(half_width, half_height, f32(kind), 0.0));
+}
+"#;
+
 const SHADER: &str = r#"
 struct Params {
     matrix: mat4x4<f32>, camera: vec4<f32>, right: vec4<f32>, up: vec4<f32>,
@@ -91,52 +143,29 @@ struct Out {
     @location(4) world_y: f32,
 };
 fn hash(n: f32) -> f32 { return fract(sin(n * 127.1 + 311.7) * 43758.5453); }
-@vertex fn vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> Out {
-    let snow = instance >= 320u;
-    let local_id = f32(select(instance, instance - 320u, snow));
+@vertex fn vs(
+    @builtin(vertex_index) vertex: u32,
+    @location(0) instance_center: vec4<f32>,
+    @location(1) instance_size_kind: vec4<f32>,
+) -> Out {
+    let snow = instance_size_kind.z > 0.5;
     let kind = select(0u, 1u, snow);
-    let enabled = select(p.clock_weather.z, p.clock_weather.w, snow);
-    let seed = local_id + f32(kind) * 8192.0;
-    let phase = hash(seed + 7.0);
-    let x = (hash(seed + 1.0) * 2.0 - 1.0) * 28.0;
-    let z = 4.0 + hash(seed + 3.0) * 72.0;
-    // Speed/SpeedVariation: the object stores 0.5 for both effects and a
-    // 50 % variation for rain only, so the viewer reads the stored percentage
-    // literally as +- that fraction of Speed.
-    let speed_base = select(p.motion.x, p.motion.z, snow);
-    let speed_spread = select(p.motion.y, p.motion.w, snow);
-    let speed = speed_base * (1.0 + (hash(seed + 11.0) * 2.0 - 1.0) * speed_spread);
-    let seconds = p.clock_weather.x * 0.033;
-    // Y must *decrease* with time. `fract` grows, so the particle has to walk
-    // from +55 down to -55; the earlier expression added the growing phase,
-    // which made every drop and flake climb - the reported "rain goes up".
-    let fall = 55.0 - fract(phase + seconds * speed) * 110.0;
-    let center = p.camera.xyz + p.right.xyz * x + p.forward.xyz * z + vec3<f32>(0.0, fall, 0.0);
-    // The renderer already tested this camera against the same active-cell
-    // water mask and zeroes both weather lanes when submerged.
-    let visible = enabled > 0.5;
-    // The generated quad consists of six triangle-list vertices. Compute the
-    // corners from the vertex ID instead of indexing an immutable local WGSL
-    // array: naga 0.19 correctly rejects non-constant indexing of that value.
     let right = vertex == 1u || vertex == 4u || vertex == 5u;
     let top = vertex >= 2u;
     let corner = vec2<f32>(select(-1.0, 1.0, right), select(-1.0, 1.0, top));
     let uv_top = vertex == 0u || vertex == 1u || vertex == 4u;
     let uv = vec2<f32>(select(0.0, 1.0, right), select(0.0, 1.0, uv_top));
-    // Size/SizeVariation: the quad is the stored Size across, so the recovered
-    // 0.04 drop and 0.3 flake replace the viewer's 0.07/0.24 guesses. Rain
-    // stores a 30 % size spread; the flake keeps its square shape and has no
-    // stored spread. The streak length stays a viewer value: it is the visible
-    // consequence of a shutter the client does not have.
-    let size_base = select(p.particle.x, p.particle.z, snow) * 0.5;
-    let size_spread = select(p.particle.y, p.particle.w, snow);
-    let half_width = size_base * (1.0 + (hash(seed + 5.0) * 2.0 - 1.0) * size_spread);
-    let half_height = select(1.1 + hash(seed + 17.0) * 1.3, half_width, snow);
-    let vertical = select(vec3<f32>(0.0, corner.y * half_height, 0.0), p.up.xyz * (corner.y * half_height), snow);
-    let world = center + p.right.xyz * (corner.x * half_width) + vertical;
+    let vertical = select(
+        vec3<f32>(0.0, corner.y * instance_size_kind.y, 0.0),
+        p.up.xyz * (corner.y * instance_size_kind.y),
+        snow,
+    );
+    let world = instance_center.xyz
+        + p.right.xyz * (corner.x * instance_size_kind.x)
+        + vertical;
     let clip = p.matrix * vec4<f32>(world, 1.0);
     var o: Out;
-    o.position = select(clip, vec4<f32>(2.0, 2.0, 2.0, 1.0), !visible);
+    o.position = clip;
     o.uv = uv;
     o.color = select(vec3<f32>(0.66, 0.78, 0.91), vec3<f32>(0.91, 0.95, 1.0), snow);
     o.kind = kind;
@@ -233,6 +262,12 @@ pub struct WeatherGpu {
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
     uniform: wgpu::Buffer,
+    generate_pipeline: wgpu::ComputePipeline,
+    generate_bind: wgpu::BindGroup,
+    generate_uniform: wgpu::Buffer,
+    instances: wgpu::Buffer,
+    frame_serial: u64,
+    generated_frame: std::cell::Cell<Option<u64>>,
     _texture: wgpu::Texture,
     _sampler: wgpu::Sampler,
     clock: WeatherClock,
@@ -351,6 +386,71 @@ impl WeatherGpu {
                 },
             ],
         });
+        let generate_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("weather instance generation layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let generate_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("weather instance generation parameters"),
+            size: std::mem::size_of::<GenerateParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let instances = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("per-frame weather particle instances"),
+            size: (480 * std::mem::size_of::<ParticleInstance>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX,
+            mapped_at_creation: false,
+        });
+        let generate_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("weather instance generation bindings"),
+            layout: &generate_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: generate_uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: instances.as_entire_binding(),
+                },
+            ],
+        });
+        let generate_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("weather particle instance generator"),
+            source: wgpu::ShaderSource::Wgsl(GENERATE_SHADER.into()),
+        });
+        let generate_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("weather particle instance generation"),
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("weather instance generation pipeline layout"),
+                bind_group_layouts: &[&generate_layout],
+                push_constant_ranges: &[],
+            })),
+            module: &generate_module,
+            entry_point: "main",
+        });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("world weather particle shader"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()),
@@ -366,7 +466,22 @@ impl WeatherGpu {
             vertex: wgpu::VertexState {
                 module: &module,
                 entry_point: "vs",
-                buffers: &[],
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ParticleInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 16,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &module,
@@ -399,6 +514,12 @@ impl WeatherGpu {
             pipeline,
             bind,
             uniform,
+            generate_pipeline,
+            generate_bind,
+            generate_uniform,
+            instances,
+            frame_serial: 0,
+            generated_frame: std::cell::Cell::new(None),
             _texture: texture,
             _sampler: sampler,
             clock: WeatherClock::default(),
@@ -409,6 +530,7 @@ impl WeatherGpu {
     /// Advance the native fixed-step weather clock exactly once per world frame.
     pub fn advance(&mut self, delta_ms: u32) {
         self.ticks = self.ticks.wrapping_add(self.clock.advance(delta_ms));
+        self.frame_serial = self.frame_serial.wrapping_add(1);
     }
 
     /// Submit a depth-tested world-space precipitation view. The generated
@@ -440,6 +562,36 @@ impl WeatherGpu {
         let forward = Vec3::new(s * cp, sp, -c * cp);
         let up = right.cross(forward).normalize_or_zero();
         let lanes = profile_lanes(RAIN, SNOW, SNOW_SPEED_SCALE);
+        let clock_weather = [
+            (self.ticks % 1_000_000) as f32,
+            0.,
+            selection.rain as u8 as f32,
+            selection.snow as u8 as f32,
+        ];
+        let generation = GenerateParams {
+            camera: [camera.x, camera.y, camera.z, 1.],
+            right: [right.x, right.y, right.z, 0.],
+            forward: [forward.x, forward.y, forward.z, 0.],
+            clock_weather,
+            particle: lanes.0,
+            motion: lanes.1,
+        };
+        if self.generated_frame.get() != Some(self.frame_serial) {
+            queue.write_buffer(
+                &self.generate_uniform,
+                0,
+                bytemuck::bytes_of(&generation),
+            );
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("generate shared weather particle instances"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.generate_pipeline);
+            pass.set_bind_group(0, &self.generate_bind, &[]);
+            pass.dispatch_workgroups(480u32.div_ceil(64), 1, 1);
+            drop(pass);
+            self.generated_frame.set(Some(self.frame_serial));
+        }
         let params = Params {
             matrix: matrix.to_cols_array_2d(),
             camera: [camera.x, camera.y, camera.z, 1.],
@@ -449,12 +601,7 @@ impl WeatherGpu {
             fog_range: fog.range(),
             fog_color: fog.color4(),
             clip,
-            clock_weather: [
-                (self.ticks % 1_000_000) as f32,
-                0.,
-                selection.rain as u8 as f32,
-                selection.snow as u8 as f32,
-            ],
+            clock_weather,
             particle: lanes.0,
             motion: lanes.1,
         };
@@ -482,6 +629,7 @@ impl WeatherGpu {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind, &[]);
+        pass.set_vertex_buffer(0, self.instances.slice(..));
         let (first_instance, end_instance) = active_instance_range(selection);
         pass.draw(0..6, first_instance..end_instance);
     }
@@ -540,6 +688,10 @@ mod tests {
         assert!(!super::SHADER.contains("camera_in_mapped_water"));
         assert!(!super::SHADER.contains("water_areas"));
         assert!(!super::SHADER.contains("water_mask"));
+        assert!(!super::SHADER.contains("fn hash"));
+        assert!(super::GENERATE_SHADER.contains("@compute @workgroup_size(64)"));
+        assert!(super::GENERATE_SHADER.contains("fract(phase + seconds * speed)"));
+        assert!(super::SHADER.contains("@location(0) instance_center"));
     }
 
     #[test]

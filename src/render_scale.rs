@@ -22,6 +22,16 @@
 /// are clamped to 10–200 before use, and each dimension to
 /// `[1, max_dimension]` — a 200% scale on a large window can otherwise exceed
 /// `max_texture_dimension_2d`.
+pub fn direct_render_compatible(
+    scaled: (u32, u32),
+    output: (u32, u32),
+    render_format: wgpu::TextureFormat,
+    target_format: wgpu::TextureFormat,
+    composition_required: bool,
+) -> bool {
+    scaled == output && render_format == target_format && !composition_required
+}
+
 pub fn scaled_extent(w: u32, h: u32, percent: f32, max_dimension: u32) -> (u32, u32) {
     let raw = f64::from(percent) / 100.0;
     // `f64::clamp` propagates NaN, so a non-finite input falls back to native.
@@ -221,7 +231,40 @@ impl RenderScale {
 
 #[cfg(test)]
 mod tests {
-    use super::scaled_extent;
+    use super::{direct_render_compatible, scaled_extent};
+
+    #[test]
+    fn direct_route_requires_native_extent_compatible_format_and_no_composition() {
+        use wgpu::TextureFormat as F;
+        assert!(direct_render_compatible(
+            (1280, 720),
+            (1280, 720),
+            F::Bgra8UnormSrgb,
+            F::Bgra8UnormSrgb,
+            false
+        ));
+        assert!(!direct_render_compatible(
+            (1280, 720),
+            (1280, 720),
+            F::Bgra8UnormSrgb,
+            F::Rgba8UnormSrgb,
+            false
+        ));
+        assert!(!direct_render_compatible(
+            (640, 360),
+            (1280, 720),
+            F::Bgra8UnormSrgb,
+            F::Bgra8UnormSrgb,
+            false
+        ));
+        assert!(!direct_render_compatible(
+            (1280, 720),
+            (1280, 720),
+            F::Bgra8UnormSrgb,
+            F::Bgra8UnormSrgb,
+            true
+        ));
+    }
 
     #[test]
     fn native_scale_is_identity() {

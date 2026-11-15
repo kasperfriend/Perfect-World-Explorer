@@ -190,6 +190,14 @@ struct Targets {
     reflect_depth: wgpu::Texture,
     sample_depth: wgpu::Texture,
     terrain_depth: wgpu::Texture,
+    reflection_view: wgpu::TextureView,
+    refraction_view: wgpu::TextureView,
+    scene_view: wgpu::TextureView,
+    reflection_raw: wgpu::TextureView,
+    refraction_raw: wgpu::TextureView,
+    scene_raw: wgpu::TextureView,
+    reflect_depth_view: wgpu::TextureView,
+    sample_depth_view: wgpu::TextureView,
     width: u32,
     height: u32,
     bind: wgpu::BindGroup,
@@ -633,9 +641,13 @@ impl WaterGpu {
             format: Some(format.remove_srgb_suffix()),
             ..Default::default()
         };
-        let reflect_view = reflection.create_view(&raw_view);
-        let refract_view = refraction.create_view(&raw_view);
-        let scene_view = scene.create_view(&raw_view);
+        let reflection_view = reflection.create_view(&Default::default());
+        let refraction_view = refraction.create_view(&Default::default());
+        let scene_view = scene.create_view(&Default::default());
+        let reflection_raw = reflection.create_view(&raw_view);
+        let refraction_raw = refraction.create_view(&raw_view);
+        let scene_raw = scene.create_view(&raw_view);
+        let reflect_depth_view = reflect_depth.create_view(&Default::default());
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("water maps"),
             layout,
@@ -646,15 +658,15 @@ impl WaterGpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&reflect_view),
+                    resource: wgpu::BindingResource::TextureView(&reflection_raw),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&refract_view),
+                    resource: wgpu::BindingResource::TextureView(&refraction_raw),
                 },
                 wgpu::BindGroupEntry {
                     binding: 8,
-                    resource: wgpu::BindingResource::TextureView(&scene_view),
+                    resource: wgpu::BindingResource::TextureView(&scene_raw),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -685,6 +697,14 @@ impl WaterGpu {
             reflect_depth,
             sample_depth,
             terrain_depth,
+            reflection_view,
+            refraction_view,
+            scene_view,
+            reflection_raw,
+            refraction_raw,
+            scene_raw,
+            reflect_depth_view,
+            sample_depth_view,
             width: w.max(1),
             height: h.max(1),
             bind,
@@ -703,38 +723,23 @@ impl WaterGpu {
             &self.tile_sampler,
         );
     }
-    pub fn sample_depth(&self) -> wgpu::TextureView {
-        self.targets.sample_depth.create_view(&Default::default())
+    pub fn sample_depth(&self) -> &wgpu::TextureView {
+        &self.targets.sample_depth_view
     }
     pub fn is_srgb(&self) -> bool {
         self.format.is_srgb()
     }
-    pub fn scene(&self) -> wgpu::TextureView {
-        self.targets.scene.create_view(&Default::default())
+    pub fn scene(&self) -> &wgpu::TextureView {
+        &self.targets.scene_view
     }
-    pub fn reflection_raw(&self) -> wgpu::TextureView {
-        self.targets
-            .reflection
-            .create_view(&wgpu::TextureViewDescriptor {
-                format: Some(self.format.remove_srgb_suffix()),
-                ..Default::default()
-            })
+    pub fn reflection_raw(&self) -> &wgpu::TextureView {
+        &self.targets.reflection_raw
     }
-    pub fn refraction_raw(&self) -> wgpu::TextureView {
-        self.targets
-            .refraction
-            .create_view(&wgpu::TextureViewDescriptor {
-                format: Some(self.format.remove_srgb_suffix()),
-                ..Default::default()
-            })
+    pub fn refraction_raw(&self) -> &wgpu::TextureView {
+        &self.targets.refraction_raw
     }
-    pub fn scene_raw(&self) -> wgpu::TextureView {
-        self.targets
-            .scene
-            .create_view(&wgpu::TextureViewDescriptor {
-                format: Some(self.format.remove_srgb_suffix()),
-                ..Default::default()
-            })
+    pub fn scene_raw(&self) -> &wgpu::TextureView {
+        &self.targets.scene_raw
     }
     pub fn copy_scene_to_refraction(&self, e: &mut wgpu::CommandEncoder) {
         e.copy_texture_to_texture(
@@ -757,18 +762,18 @@ impl WaterGpu {
             },
         );
     }
-    pub fn reflection(&self) -> wgpu::TextureView {
-        self.targets.reflection.create_view(&Default::default())
+    pub fn reflection(&self) -> &wgpu::TextureView {
+        &self.targets.reflection_view
     }
     #[allow(dead_code)]
     pub fn refraction_texture(&self) -> &wgpu::Texture {
         &self.targets.refraction
     }
-    pub fn refraction(&self) -> wgpu::TextureView {
-        self.targets.refraction.create_view(&Default::default())
+    pub fn refraction(&self) -> &wgpu::TextureView {
+        &self.targets.refraction_view
     }
-    pub fn depth(&self) -> wgpu::TextureView {
-        self.targets.reflect_depth.create_view(&Default::default())
+    pub fn depth(&self) -> &wgpu::TextureView {
+        &self.targets.reflect_depth_view
     }
     pub fn update(&self, queue: &wgpu::Queue, u: &WaterUniform) {
         let mut value = *u;
