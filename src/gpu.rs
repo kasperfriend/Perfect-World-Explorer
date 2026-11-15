@@ -2806,10 +2806,10 @@ impl Renderer {
         }
     }
 
-    fn draw_scenery(
-        &self,
-        p: &mut wgpu::RenderPass<'_>,
-        bind: &wgpu::BindGroup,
+    fn draw_scenery<'a>(
+        &'a self,
+        p: &mut wgpu::RenderPass<'a>,
+        bind: &'a wgpu::BindGroup,
         reflected: bool,
         pass_kind: Pass,
         world_cmds: &[crate::world_objects::DrawCmd],
