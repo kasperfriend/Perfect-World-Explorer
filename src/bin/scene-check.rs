@@ -4,7 +4,7 @@ mod pck;
 #[allow(dead_code)]
 #[path = "../scene.rs"]
 mod scene;
-use std::{collections::HashSet, env, path::Path};
+use std::{collections::HashSet, env, fs::File, path::Path};
 fn run() -> Result<(), String> {
     let a: Vec<_> = env::args().collect();
     if a.len() != 2 {
