@@ -10,6 +10,7 @@ png = "0.17"
 minifb = { version = "0.27", default-features = false, features = ["x11"] }
 encoding_rs = "0.8"
 image = { version = "0.25", default-features = false, features = ["dds", "bmp", "tga", "png", "jpeg"] }
+raw-window-handle = "0.6"
 wgpu = "0.19"
 winit = "0.29"
 pollster = "0.3"

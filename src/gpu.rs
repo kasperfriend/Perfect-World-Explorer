@@ -4330,6 +4330,10 @@ pub fn run(
     // must have a real visible swapchain so Winit/Windows will deliver its
     // first redraw; hidden native windows can defer redraw indefinitely.
     window.set_visible(true);
+    #[cfg(windows)]
+    if crate::world_handoff::is_handoff_child() {
+        crate::world_handoff::activate_child_window(&window);
+    }
     let water_areas = t.water.clone();
     let environments = t.environments.clone();
     let mut fog_transition =
@@ -4652,10 +4656,12 @@ pub fn run(
                         eprintln!("Could not capture mouse: {:?}", result.err());
                     }
                 }
-                WindowEvent::Focused(false) if captured => {
-                    let _ = window.set_cursor_grab(CursorGrabMode::None);
-                    window.set_cursor_visible(true);
-                    captured = false;
+                WindowEvent::Focused(false) => {
+                    if captured {
+                        let _ = window.set_cursor_grab(CursorGrabMode::None);
+                        window.set_cursor_visible(true);
+                        captured = false;
+                    }
                     keys.clear();
                 }
                 WindowEvent::Resized(s) if s.width > 0 && s.height > 0 => {
@@ -5097,6 +5103,8 @@ pub fn run(
                                                     match command.spawn() {
                                                         Ok(child) => {
                                                             eprintln!("Loading world {display} in replacement process {}", child.id());
+                                                            #[cfg(windows)]
+                                                            crate::world_handoff::allow_child_foreground(child.id());
                                                             let (tx, rx) = std::sync::mpsc::channel();
                                                             files.watch(child, tx);
                                                             world_handoff_rx = Some(rx);

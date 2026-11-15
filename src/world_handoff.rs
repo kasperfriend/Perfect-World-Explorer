@@ -10,6 +10,17 @@ use std::{
 const READY_ENV: &str = "PWE_WORLD_HANDOFF_READY_FILE";
 const STATUS_ENV: &str = "PWE_WORLD_HANDOFF_STATUS_FILE";
 
+#[cfg(windows)]
+#[link(name = "user32")]
+extern "system" {
+    #[link_name = "AllowSetForegroundWindow"]
+    fn allow_set_foreground_window(process_id: u32) -> i32;
+    #[link_name = "SetForegroundWindow"]
+    fn set_foreground_window(window: isize) -> i32;
+    #[link_name = "SetFocus"]
+    fn set_focus(window: isize) -> isize;
+}
+
 #[derive(Debug)]
 pub enum Message {
     Progress(String),
@@ -94,6 +105,41 @@ impl Files {
 
 pub fn is_handoff_child() -> bool {
     std::env::var_os(READY_ENV).is_some()
+}
+
+/// Let the replacement map process become foreground when its ready window is
+/// shown. Windows normally prevents background processes from stealing focus;
+/// the old foreground process grants this permission immediately after spawn.
+#[cfg(windows)]
+pub fn allow_child_foreground(process_id: u32) {
+    if unsafe { allow_set_foreground_window(process_id) } == 0 {
+        eprintln!("Windows denied foreground permission for replacement map process {process_id}");
+    }
+}
+
+/// Activate a replacement map's visible window so movement keys go to the new
+/// renderer rather than the old loading window or another foreground app.
+#[cfg(windows)]
+pub fn activate_child_window(window: &winit::window::Window) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    let Ok(handle) = window.window_handle() else {
+        eprintln!("Could not obtain the replacement map window handle for focus activation");
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        eprintln!("Replacement map window did not expose a Win32 handle");
+        return;
+    };
+
+    let hwnd = handle.hwnd.get();
+    if unsafe { set_foreground_window(hwnd) } != 0 {
+        unsafe {
+            set_focus(hwnd);
+        }
+    } else {
+        eprintln!("Windows refused to focus the replacement map window");
+    }
 }
 
 /// Publish a status from the loading process for the old window's loading overlay.

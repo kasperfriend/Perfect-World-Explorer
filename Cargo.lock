@@ -1782,6 +1782,7 @@ dependencies = [
  "minifb",
  "png 0.17.16",
  "pollster",
+ "raw-window-handle",
  "rodio",
  "sha2",
  "wgpu",
