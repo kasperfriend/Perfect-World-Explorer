@@ -9,18 +9,49 @@ use std::{
 };
 
 static RECOVERABLE_MAP_OPERATION: AtomicBool = AtomicBool::new(false);
+static PANIC_LOCATION_HOOK: std::sync::Once = std::sync::Once::new();
+thread_local! {
+    static RECOVERABLE_PANIC_LOCATION: std::cell::RefCell<Option<String>> =
+        std::cell::RefCell::new(None);
+}
+
+fn install_recoverable_panic_location_hook() {
+    PANIC_LOCATION_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if RECOVERABLE_MAP_OPERATION.load(Ordering::SeqCst) {
+                RECOVERABLE_PANIC_LOCATION.with(|location| {
+                    *location.borrow_mut() = info.location().map(|at| {
+                        format!("{}:{}:{}", at.file(), at.line(), at.column())
+                    });
+                });
+            }
+            previous(info);
+        }));
+    });
+}
 
 fn recoverable_map_operation<T>(operation: impl FnOnce() -> T) -> Result<T, String> {
+    install_recoverable_panic_location_hook();
+    RECOVERABLE_PANIC_LOCATION.with(|location| *location.borrow_mut() = None);
     RECOVERABLE_MAP_OPERATION.store(true, Ordering::SeqCst);
     let result = catch_unwind(AssertUnwindSafe(operation));
     RECOVERABLE_MAP_OPERATION.store(false, Ordering::SeqCst);
+    let location = RECOVERABLE_PANIC_LOCATION.with(|location| location.borrow_mut().take());
     result.map_err(|payload| {
         let message = payload
             .downcast_ref::<String>()
             .cloned()
             .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
             .unwrap_or_else(|| "unknown panic during map loading".into());
-        format!("unexpected error while loading/rendering the selected map: {message}")
+        match location {
+            Some(location) => format!(
+                "unexpected error while loading/rendering the selected map: {message} ({location})"
+            ),
+            None => format!(
+                "unexpected error while loading/rendering the selected map: {message}"
+            ),
+        }
     })
 }
 
@@ -1334,6 +1365,13 @@ mod ram_export_tests {
         assert_eq!(loaded, "main terrain");
         assert_eq!(attempts, ["a02", "world"]);
         assert!(notice.unwrap().contains("unexpected error"));
+    }
+
+    #[test]
+    fn caught_map_panic_reports_its_source_location() {
+        let error = super::recoverable_map_operation(|| panic!("fixture panic")).unwrap_err();
+        assert!(error.contains("fixture panic"));
+        assert!(error.contains("src/main.rs:"), "{error}");
     }
 
     #[test]
