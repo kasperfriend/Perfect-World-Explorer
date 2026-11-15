@@ -2006,7 +2006,9 @@ impl Renderer {
             object_start: m.object_start,
             local_pages,
             world_pages: Vec::new(),
-            world_draw_cmds: std::array::from_fn(|_| crate::world_objects::WorldDrawList::default()),
+            world_draw_cmds: std::array::from_fn(|_| {
+                crate::world_objects::WorldDrawList::default()
+            }),
             world_done: false,
             layout,
             sampler,
@@ -3534,7 +3536,7 @@ impl Renderer {
                 None,
                 &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
             );
-                if let Some(cloud) = &self.cloud {
+            if let Some(cloud) = &self.cloud {
                 cloud.draw(
                     &self.queue,
                     &mut e,
