@@ -36,10 +36,7 @@ impl PackageFile {
         };
         let (pkx, pkx_len) = if let Some(pkx_path) = pkx_path {
             let pkx = File::open(&pkx_path).map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("{}: {error}", pkx_path.display()),
-                )
+                io::Error::new(error.kind(), format!("{}: {error}", pkx_path.display()))
             })?;
             let len = pkx.metadata()?.len();
             (Some(pkx), len)

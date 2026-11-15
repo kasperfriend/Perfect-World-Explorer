@@ -112,10 +112,7 @@ impl WorldCullIndex {
 
     /// Return exact frustum-visible indices in original draw order. Internal
     /// nodes prune whole groups; leaf bounds retain the prior per-mesh test.
-    pub fn visible_order_indices(
-        &self,
-        intersects: impl FnMut([f32; 6]) -> bool,
-    ) -> Vec<usize> {
+    pub fn visible_order_indices(&self, intersects: impl FnMut([f32; 6]) -> bool) -> Vec<usize> {
         let mut visible = Vec::with_capacity(self.always_visible.len());
         let mut stack = Vec::new();
         self.visible_order_indices_into(intersects, &mut visible, &mut stack);

@@ -18,8 +18,8 @@ fn run() -> Result<(), String> {
     } else {
         root.to_path_buf()
     };
-    let mut f = pck::PackageFile::open(&element.join("litmodels.pck"))
-        .map_err(|e| e.to_string())?;
+    let mut f =
+        pck::PackageFile::open(&element.join("litmodels.pck")).map_err(|e| e.to_string())?;
     let entries = pck::directory(&mut f)?;
     let mut model_versions = BTreeMap::new();
     let mut mesh_versions = BTreeMap::new();

@@ -386,10 +386,7 @@ fn open_optional_archive(
                 .into_iter()
                 .map(|entry| (normalize(&entry.name), entry))
                 .collect();
-            let bmd_count = indexed
-                .keys()
-                .filter(|name| name.ends_with(".bmd"))
-                .count();
+            let bmd_count = indexed.keys().filter(|name| name.ends_with(".bmd")).count();
             let world_bmd_count = indexed
                 .keys()
                 .filter(|name| name.contains("world/") && name.ends_with(".bmd"))
@@ -516,14 +513,10 @@ impl Objects {
                     if let Some(error) = &archive_error {
                         return Err(format!("litmodels.pck was not indexed: {error}"));
                     }
-                    let entry_key = litmodel_entry_key(
-                        &name,
-                        &self.litentries,
-                        &self.litbasenames,
-                    )
-                    .map_err(|error| {
-                        format!("{error}; litmodels.pck index has {indexed_count} members")
-                    })?;
+                    let entry_key = litmodel_entry_key(&name, &self.litentries, &self.litbasenames)
+                        .map_err(|error| {
+                            format!("{error}; litmodels.pck index has {indexed_count} members")
+                        })?;
                     let entry = &self.litentries[&entry_key];
                     let file = self
                         .litfile
@@ -591,8 +584,7 @@ impl Objects {
             }
             eprintln!("Skipping unavailable scenery model {name}: {reason}");
             if self.unavailable_examples.len() < 3 {
-                self.unavailable_examples
-                    .push(format!("{name}: {reason}"));
+                self.unavailable_examples.push(format!("{name}: {reason}"));
             }
         }
     }
@@ -847,10 +839,8 @@ mod tests {
                 compressed: 0,
             },
         );
-        let mut by_basename = HashMap::from([(
-            "litmodel_1318.bmd".to_string(),
-            vec![name.to_string()],
-        )]);
+        let mut by_basename =
+            HashMap::from([("litmodel_1318.bmd".to_string(), vec![name.to_string()])]);
         assert_eq!(
             litmodel_entry_key(
                 "litmodels/world/1/litmodel_1318.bmd",
@@ -1043,9 +1033,8 @@ mod tests {
         assert!(objects.get(0).is_none());
         assert_eq!(objects.unavailable_model_count(), 1);
         assert_eq!(objects.unavailable_examples().len(), 1);
-        assert!(objects.unavailable_examples()[0].contains(
-            "missing model litmodels/world/1/litrmodel_1399.bmd"
-        ));
+        assert!(objects.unavailable_examples()[0]
+            .contains("missing model litmodels/world/1/litrmodel_1399.bmd"));
         // A later visible-frame batch doesn't turn the same absent optional
         // model back into a fatal error or repeat the archive lookup.
         objects.load_ids(&[0]).unwrap();
