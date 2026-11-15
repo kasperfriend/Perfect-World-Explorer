@@ -747,14 +747,14 @@ fn wgpu_format_for_dxgi(dxgi: DXGI_FORMAT, reference: wgpu::TextureFormat) -> wg
     }
 }
 
-struct FsrComposite {
+pub(crate) struct FsrComposite {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
 }
 
 impl FsrComposite {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    pub(crate) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fsr composite layout"),
             entries: &[
@@ -822,7 +822,7 @@ impl FsrComposite {
         }
     }
 
-    fn draw(
+    pub(crate) fn draw(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -950,11 +950,149 @@ impl FsrNatives {
     }
 }
 
+/// One slot of a round-robin native command-ring. Each slot owns its own
+/// `CommandAllocator`+`GraphicsCommandList` pair, so an in-flight slot is
+/// never reset while the GPU may still be executing it.
+pub(crate) struct NativeCommandSlot {
+    pub(crate) allocator: d3d12::CommandAllocator,
+    pub(crate) list: d3d12::GraphicsCommandList,
+    /// Fence value the GPU reaches once this slot's latest submission retires.
+    retired: u64,
+}
+
+/// Three (allocator, list) pairs rotated per submission, guarded by a single
+/// fence. The previous single-allocator design forced a full CPU/GPU
+/// rendezvous every frame: the CPU blocked until the GPU retired the
+/// previous list before it could even start recording the next one. With a
+/// 3-slot ring the GPU typically runs one frame behind, so the slot being
+/// re-acquired has retired long ago and the fence check never waits; only
+/// real back-pressure (or 5 s of pathological latency) blocks.
+pub(crate) struct NativeCommandRing {
+    slots: [NativeCommandSlot; 3],
+    next: usize,
+    fence: d3d12::Fence,
+    fence_event: d3d12::Event,
+    fence_value: u64,
+}
+
+impl NativeCommandRing {
+    pub(crate) fn new(raw_device: &d3d12::Device, tag: &str) -> Result<Self, String> {
+        let (fence, hr) = raw_device.create_fence(0);
+        if hr < 0 {
+            return Err(format!("{tag}: create_fence failed (HRESULT 0x{hr:08x})"));
+        }
+        let fence_event = d3d12::Event::create(false, false);
+        let mut slots = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let (allocator, hr) = raw_device.create_command_allocator(d3d12::CmdListType::Direct);
+            if hr < 0 {
+                return Err(format!(
+                    "{tag}: create_command_allocator failed (HRESULT 0x{hr:08x})"
+                ));
+            }
+            let (list, hr) = raw_device.create_graphics_command_list(
+                d3d12::CmdListType::Direct,
+                &allocator,
+                d3d12::PipelineState::null(),
+                0,
+            );
+            if hr < 0 {
+                return Err(format!(
+                    "{tag}: create_graphics_command_list failed (HRESULT 0x{hr:08x})"
+                ));
+            }
+            // Close the still-open list so every use can follow the
+            // acquire -> record -> retire pattern.
+            let hr = list.close();
+            if hr < 0 {
+                return Err(format!(
+                    "{tag}: ID3D12GraphicsCommandList::Close failed (HRESULT 0x{hr:08x})"
+                ));
+            }
+            slots.push(NativeCommandSlot {
+                allocator,
+                list,
+                retired: 0,
+            });
+        }
+        let slots: [NativeCommandSlot; 3] = slots
+            .try_into()
+            .map_err(|_| format!("{tag}: internal ring size mismatch"))?;
+        Ok(Self {
+            slots,
+            next: 0,
+            fence,
+            fence_event,
+            fence_value: 0,
+        })
+    }
+
+    /// Wait (bounded, only if the slot's previous work has not retired),
+    /// reset the slot's allocator and list, and return its index.
+    pub(crate) fn acquire(&mut self, tag: &str) -> Result<usize, String> {
+        let index = self.next;
+        self.next = (self.next + 1) % self.slots.len();
+        let slot = &mut self.slots[index];
+        if slot.retired != 0 && self.fence.get_value() < slot.retired {
+            let _ = self
+                .fence
+                .set_event_on_completion(self.fence_event, slot.retired);
+            self.fence_event.wait(5_000);
+        }
+        slot.allocator.reset();
+        let hr = slot
+            .list
+            .reset(&slot.allocator, d3d12::PipelineState::null());
+        if hr < 0 {
+            return Err(format!(
+                "{tag}: ID3D12GraphicsCommandList::Reset failed (HRESULT 0x{hr:08x})"
+            ));
+        }
+        Ok(index)
+    }
+
+    pub(crate) fn slot_mut(&mut self, index: usize) -> &mut NativeCommandSlot {
+        &mut self.slots[index]
+    }
+
+    /// Close the slot's list, submit it on `queue`, and stamp it with the new
+    /// fence value so the next `acquire` of this slot waits only if needed.
+    pub(crate) fn retire(
+        &mut self,
+        index: usize,
+        queue: &d3d12::CommandQueue,
+        tag: &str,
+    ) -> Result<(), String> {
+        let slot = &mut self.slots[index];
+        let hr = slot.list.close();
+        if hr < 0 {
+            return Err(format!(
+                "{tag}: ID3D12GraphicsCommandList::Close failed (HRESULT 0x{hr:08x})"
+            ));
+        }
+        queue.execute_command_lists(std::slice::from_ref(slot.list.as_list()));
+        self.fence_value += 1;
+        slot.retired = self.fence_value;
+        let _ = queue.signal(&self.fence, self.fence_value);
+        Ok(())
+    }
+
+    /// Block until every submitted slot has retired (Drop paths only).
+    pub(crate) fn wait_idle(&self) {
+        if self.fence.get_value() >= self.fence_value {
+            return;
+        }
+        let _ = self
+            .fence
+            .set_event_on_completion(self.fence_event, self.fence_value);
+        self.fence_event.wait(5_000);
+    }
+}
+
 pub struct FsrUpscaler {
     loader: FfxLoader,
     queue: d3d12::CommandQueue,
-    allocator: d3d12::CommandAllocator,
-    list: d3d12::GraphicsCommandList,
+    ring: NativeCommandRing,
     context: *mut c_void,
     format: wgpu::TextureFormat,
     render_extent: (u32, u32),
@@ -968,13 +1106,6 @@ pub struct FsrUpscaler {
     prev_view_proj: Option<Mat4>,
     reset_history: bool,
     last_instant: std::time::Instant,
-    /// Fence+event pair guarding the single native command list/allocator:
-    /// resetting the allocator while the GPU still executes the list that
-    /// uses it is invalid D3D12, so every raw-list section waits for the
-    /// previous submission before recording again.
-    fence: d3d12::Fence,
-    fence_event: d3d12::Event,
-    fence_value: u64,
     version_major: u32,
     /// The provider version the loader actually advertised and the override
     /// pinned (FFX version id: major << 22 | minor << 12 | patch). `None`
@@ -984,7 +1115,7 @@ pub struct FsrUpscaler {
 
 impl Drop for FsrUpscaler {
     fn drop(&mut self) {
-        self.wait_for_gpu();
+        self.ring.wait_idle();
         if !self.context.is_null() {
             unsafe {
                 (self.loader.destroy_context)(&mut self.context, std::ptr::null());
@@ -1055,32 +1186,6 @@ impl FsrUpscaler {
         } else {
             super::diag(&format!(
                 "[FSR] provider enumeration returned 0x{rc:x}; the loader will pick a provider"
-            ));
-        }
-
-        let (allocator, hr) = raw_device.create_command_allocator(d3d12::CmdListType::Direct);
-        if hr < 0 {
-            return Err(format!(
-                "create_command_allocator failed (HRESULT 0x{hr:08x})"
-            ));
-        }
-        let (list, hr) = raw_device.create_graphics_command_list(
-            d3d12::CmdListType::Direct,
-            &allocator,
-            d3d12::PipelineState::null(),
-            0,
-        );
-        if hr < 0 {
-            return Err(format!(
-                "create_graphics_command_list failed (HRESULT 0x{hr:08x})"
-            ));
-        }
-        // Close the still-open list so every frame can follow the
-        // allocator.reset() + list.reset() pattern used for reused lists.
-        let hr = list.close();
-        if hr < 0 {
-            return Err(format!(
-                "ID3D12GraphicsCommandList::Close failed (HRESULT 0x{hr:08x})"
             ));
         }
 
@@ -1199,20 +1304,17 @@ impl FsrUpscaler {
                 return Err(error);
             }
         };
-        let (fence, hr) = raw_device.create_fence(0);
-        if hr < 0 {
+        let ring = NativeCommandRing::new(&raw_device, "FSR").map_err(|e| {
             unsafe { (loader.destroy_context)(&mut context, std::ptr::null()) };
-            return Err(format!("create_fence failed (HRESULT 0x{hr:08x})"));
-        }
-        let fence_event = d3d12::Event::create(false, false);
+            e
+        })?;
         let mv_pass = FsrMotionVectorPass::new(device);
         let composite = FsrComposite::new(device, format);
 
         Ok(FsrUpscaler {
             loader,
             queue: raw_queue,
-            allocator,
-            list,
+            ring,
             context,
             format,
             render_extent,
@@ -1226,9 +1328,6 @@ impl FsrUpscaler {
             prev_view_proj: None,
             reset_history: true,
             last_instant: std::time::Instant::now(),
-            fence,
-            fence_event,
-            fence_value: 0,
             version_major: fsr_version_major,
             selected_version: chosen_version,
         })
@@ -1252,25 +1351,6 @@ impl FsrUpscaler {
     /// `(id >> 12) & 0xff` (minor) and `id & 0xfff` (patch).
     pub fn selected_provider(&self) -> Option<u64> {
         self.selected_version
-    }
-
-    /// Block (bounded) until the GPU has finished every native command list
-    /// submitted so far. Without this, resetting the command allocator races
-    /// the still-executing list. 5 seconds is generous for a frame of work;
-    /// on timeout the code proceeds and D3D12 will surface any real problem.
-    fn wait_for_gpu(&self) {
-        if self.fence.get_value() >= self.fence_value {
-            return;
-        }
-        let _ = self
-            .fence
-            .set_event_on_completion(self.fence_event, self.fence_value);
-        self.fence_event.wait(5_000);
-    }
-
-    fn signal_fence(&mut self) {
-        self.fence_value += 1;
-        let _ = self.queue.signal(&self.fence, self.fence_value);
     }
 
     pub fn next_jitter(&mut self) -> (f32, f32) {
@@ -1440,16 +1520,8 @@ impl FsrUpscaler {
         // wgpu uses, after the submit above, and restores every state it
         // moves so wgpu's tracker (and the next frame's copies) see the
         // states they expect.
-        self.wait_for_gpu();
-        self.allocator.reset();
-        let hr = self
-            .list
-            .reset(&self.allocator, d3d12::PipelineState::null());
-        if hr < 0 {
-            return Err(format!(
-                "ID3D12GraphicsCommandList::Reset failed (HRESULT 0x{hr:08x})"
-            ));
-        }
+        let slot_index = self.ring.acquire("FSR")?;
+        let list = &mut self.ring.slot_mut(slot_index).list;
         let subresource = d3d12_ty::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         let none = d3d12_ty::D3D12_RESOURCE_BARRIER_FLAG_NONE;
         let barrier = |resource: &d3d12::Resource, before: u32, after: u32| {
@@ -1485,11 +1557,11 @@ impl FsrUpscaler {
                 D3D12_STATE_UNORDERED_ACCESS,
             ),
         ];
-        self.list.resource_barrier(&barriers);
+        list.resource_barrier(&barriers);
 
         let mut dispatch = FfxDispatchDescUpscale {
             header: FfxApiHeader::new(FFX_API_DISPATCH_DESC_TYPE_UPSCALE),
-            command_list: self.list.as_mut_ptr() as *mut c_void,
+            command_list: list.as_mut_ptr() as *mut c_void,
             color: FfxApiResource::texture2d(
                 &self.natives.color.resource,
                 ffx_color_format(self.format),
@@ -1542,7 +1614,7 @@ impl FsrUpscaler {
             // match it here). 0.5 is a moderate amount, the mid grey between
             // "no additional sharpness" and "maximum" from the FFX docs.
             enable_sharpening: true,
-            sharpness: 0.5,
+            sharpness: 0.75,
             frame_time_delta: frame_time_ms.clamp(0.1, 1000.0),
             pre_exposure: 1.0,
             reset: self.reset_history,
@@ -1575,18 +1647,8 @@ impl FsrUpscaler {
                 D3D12_STATE_PIXEL_COMPUTE_READ,
             ),
         ];
-        self.list.resource_barrier(&restore);
-        let hr = self.list.close();
-        if hr < 0 {
-            // The list never ran; move everything back anyway so the next
-            // frame starts from the tracked states. Dropping this list's
-            // barriers is fine because it never executed.
-            return Err(format!(
-                "ID3D12GraphicsCommandList::Close failed (HRESULT 0x{hr:08x})"
-            ));
-        }
-        self.queue.execute_command_lists(&[self.list.as_list()]);
-        self.signal_fence();
+        list.resource_barrier(&restore);
+        self.ring.retire(slot_index, &self.queue, "FSR")?;
 
         if rc != FFX_API_RETURN_OK {
             return Err(format!("ffxDispatch upscale failed (0x{rc:x})"));

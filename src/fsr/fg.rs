@@ -75,6 +75,7 @@ pub(crate) const FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_VERSI
     0x0003000b;
 pub(crate) const FFX_API_RESOURCE_STATE_PRESENT: u32 = 1 << 7;
 const FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED: u32 = 1 << 3;
+const FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA: u32 = 1 << 0;
 const FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING: u32 = 1 << 1;
 const FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM: u32 = 14;
 const FFX_API_SURFACE_FORMAT_B8G8R8A8_SRGB: u32 = 15;
@@ -110,7 +111,7 @@ fn ffx_color_for_format(format: wgpu::TextureFormat) -> u32 {
 /// DXGI format matching a common wgpu color format. Unlike `dxgi_color_format`
 /// (which is always sRGB, as the FSR inputs expect), this preserves sRGB-ness
 /// so the composition target matches the wgpu texture created from it.
-fn dxgi_for_format(format: wgpu::TextureFormat) -> DXGI_FORMAT {
+pub(crate) fn dxgi_for_format(format: wgpu::TextureFormat) -> DXGI_FORMAT {
     match format {
         wgpu::TextureFormat::Bgra8Unorm => DXGI_FORMAT_B8G8R8A8_UNORM,
         wgpu::TextureFormat::Bgra8UnormSrgb => DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
@@ -239,8 +240,7 @@ pub struct FrameGeneration {
     #[allow(dead_code)]
     raw_device: d3d12::Device,
     queue: d3d12::CommandQueue,
-    allocator: d3d12::CommandAllocator,
-    list: d3d12::GraphicsCommandList,
+    ring: super::imp::NativeCommandRing,
     fg_context: *mut c_void,
     swapchain_context: *mut c_void,
     /// Proxy `IDXGISwapChain4*` handed out by the swapchain context.
@@ -273,17 +273,11 @@ pub struct FrameGeneration {
     /// call accepted (major << 22 | minor << 12 | patch). `None` when the
     /// enumeration failed and the loader picked the provider itself.
     selected_version: Option<u64>,
-    /// Fence+event pair guarding the single native command list/allocator;
-    /// see `wait_for_gpu`. Resetting the allocator while the GPU still
-    /// executes the list is invalid D3D12.
-    fence: d3d12::Fence,
-    fence_event: d3d12::Event,
-    fence_value: u64,
 }
 
 impl Drop for FrameGeneration {
     fn drop(&mut self) {
-        self.wait_for_gpu();
+        self.ring.wait_idle();
         if !self.fg_context.is_null() {
             // Disabling via configuration first flushes the swapchain's
             // pending work; destroying both contexts afterwards releases the
@@ -401,34 +395,9 @@ impl FrameGeneration {
             ));
         }
 
-        let (fence, hr) = raw_device.create_fence(0);
-        if hr < 0 {
-            return Err(format!("create_fence failed (HRESULT 0x{hr:08x})"));
-        }
-        let fence_event = d3d12::Event::create(false, false);
-        let (allocator, hr) = raw_device.create_command_allocator(d3d12::CmdListType::Direct);
-        if hr < 0 {
-            return Err(format!(
-                "create_command_allocator failed (HRESULT 0x{hr:08x})"
-            ));
-        }
-        let (list, hr) = raw_device.create_graphics_command_list(
-            d3d12::CmdListType::Direct,
-            &allocator,
-            d3d12::PipelineState::null(),
-            0,
-        );
-        if hr < 0 {
-            return Err(format!(
-                "create_graphics_command_list failed (HRESULT 0x{hr:08x})"
-            ));
-        }
-        let hr = list.close();
-        if hr < 0 {
-            return Err(format!(
-                "ID3D12GraphicsCommandList::Close failed (HRESULT 0x{hr:08x})"
-            ));
-        }
+        // Contexts do not exist yet at this point; a ring failure only
+        // leaks nothing beyond what Drops clean up on the way out.
+        let ring = super::imp::NativeCommandRing::new(&raw_device, "FSR FG")?;
 
         // --- Create the proxy swapchain. FFX creates the new swapchain
         // internally using the factory and description we hand it.
@@ -689,8 +658,7 @@ impl FrameGeneration {
             loader,
             raw_device,
             queue: raw_queue,
-            allocator,
-            list,
+            ring,
             fg_context,
             swapchain_context,
             proxy,
@@ -708,9 +676,6 @@ impl FrameGeneration {
             frame_index: 0,
             ui_needs_rt_restore: false,
             selected_version: created_override,
-            fence,
-            fence_event,
-            fence_value: 0,
         })
     }
 
@@ -827,25 +792,6 @@ impl FrameGeneration {
     /// `id & 0xfff` (patch).
     pub fn selected_provider(&self) -> Option<u64> {
         self.selected_version
-    }
-
-    /// Block (bounded) until the GPU has finished every native command list
-    /// submitted so far. Without this, resetting the command allocator races
-    /// the still-executing list. 5 seconds is generous for a frame of work;
-    /// on timeout the code proceeds and D3D12 will surface any real problem.
-    fn wait_for_gpu(&self) {
-        if self.fence.get_value() >= self.fence_value {
-            return;
-        }
-        let _ = self
-            .fence
-            .set_event_on_completion(self.fence_event, self.fence_value);
-        self.fence_event.wait(5_000);
-    }
-
-    fn signal_fence(&mut self) {
-        self.fence_value += 1;
-        let _ = self.queue.signal(&self.fence, self.fence_value);
     }
 
     /// The size of the world render targets the pipeline consumes.
@@ -968,16 +914,8 @@ impl FrameGeneration {
         queue.submit(Some(encoder.finish()));
 
         // --- Native FFX prepare on the same queue, right after wgpu's submit.
-        self.wait_for_gpu();
-        self.allocator.reset();
-        let hr = self
-            .list
-            .reset(&self.allocator, d3d12::PipelineState::null());
-        if hr < 0 {
-            return Err(format!(
-                "ID3D12GraphicsCommandList::Reset failed (HRESULT 0x{hr:08x})"
-            ));
-        }
+        let slot_index = self.ring.acquire("FSR FG")?;
+        let list = &mut self.ring.slot_mut(slot_index).list;
         let barrier = |resource: &d3d12::Resource, before: u32, after: u32| {
             d3d12::ResourceBarrier::transition(
                 resource.clone(),
@@ -1005,13 +943,13 @@ impl FrameGeneration {
             D3D12_STATE_RENDER_TARGET,
             D3D12_STATE_PIXEL_COMPUTE_READ,
         ));
-        self.list.resource_barrier(&barriers);
+        list.resource_barrier(&barriers);
         self.ui_needs_rt_restore = false;
         let mut prepare = FfxDispatchDescFrameGenerationPrepareV2 {
             header: FfxApiHeader::new(FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2),
             frame_id: self.frame_index,
             flags: 0,
-            command_list: self.list.as_mut_ptr() as *mut c_void,
+            command_list: list.as_mut_ptr() as *mut c_void,
             render_size: FfxApiDimensions2D {
                 width: rw,
                 height: rh,
@@ -1061,15 +999,8 @@ impl FrameGeneration {
                 D3D12_STATE_RENDER_TARGET,
             ),
         ];
-        self.list.resource_barrier(&restore);
-        let hr = self.list.close();
-        if hr < 0 {
-            return Err(format!(
-                "ID3D12GraphicsCommandList::Close failed (HRESULT 0x{hr:08x})"
-            ));
-        }
-        self.queue.execute_command_lists(&[self.list.as_list()]);
-        self.signal_fence();
+        list.resource_barrier(&restore);
+        self.ring.retire(slot_index, &self.queue, "FSR FG")?;
         if rc != super::imp::FFX_API_RETURN_OK {
             return Err(format!(
                 "ffxDispatch frame generation prepare failed (0x{rc:x})"
@@ -1105,16 +1036,8 @@ impl FrameGeneration {
         let backbuffer: d3d12::Resource = unsafe { std::mem::transmute(raw_backbuffer) };
 
         // --- Native copy: composition -> backbuffer.
-        self.wait_for_gpu();
-        self.allocator.reset();
-        let hr = self
-            .list
-            .reset(&self.allocator, d3d12::PipelineState::null());
-        if hr < 0 {
-            return Err(format!(
-                "ID3D12GraphicsCommandList::Reset failed (HRESULT 0x{hr:08x})"
-            ));
-        }
+        let slot_index = self.ring.acquire("FSR FG")?;
+        let list = &mut self.ring.slot_mut(slot_index).list;
         let barrier = |resource: &d3d12::Resource, before: u32, after: u32| {
             d3d12::ResourceBarrier::transition(
                 resource.clone(),
@@ -1139,11 +1062,11 @@ impl FrameGeneration {
                 D3D12_STATE_PIXEL_COMPUTE_READ,
             ));
         }
-        self.list.resource_barrier(&barriers);
+        list.resource_barrier(&barriers);
         // The d3d12 crate has no safe `CopyResource` wrapper, so call the
         // COM method on the underlying raw interface directly.
         unsafe {
-            (*self.list.as_mut_ptr())
+            (*list.as_mut_ptr())
                 .CopyResource(backbuffer.as_mut_ptr(), self.compose.resource.as_mut_ptr());
         }
         let restore = [
@@ -1154,15 +1077,8 @@ impl FrameGeneration {
             ),
             barrier(&backbuffer, D3D12_STATE_COPY_DEST, D3D12_STATE_PRESENT),
         ];
-        self.list.resource_barrier(&restore);
-        let hr = self.list.close();
-        if hr < 0 {
-            return Err(format!(
-                "ID3D12GraphicsCommandList::Close failed (HRESULT 0x{hr:08x})"
-            ));
-        }
-        self.queue.execute_command_lists(&[self.list.as_list()]);
-        self.signal_fence();
+        list.resource_barrier(&restore);
+        self.ring.retire(slot_index, &self.queue, "FSR FG")?;
         if ui_visible {
             // FFX reads the UI surface during Present; it stays parked in
             // PIXEL_COMPUTE_READ until the next prepare restores it.
@@ -1187,8 +1103,14 @@ impl FrameGeneration {
                 FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_REGISTERUIRESOURCE_DX12,
             ),
             ui_resource,
+            // egui renders premultiplied-alpha content (egui-wgpu blends
+            // with One/OneMinusSrcAlpha), so tell FFX the UI is already
+            // premultiplied; registering it as straight alpha makes the
+            // swapchain multiply by alpha a second time and turns the HUD
+            // almost black.
             flags: if ui_visible {
-                FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING
+                FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_USE_PREMUL_ALPHA
+                    | FFX_FRAMEGENERATION_UI_COMPOSITION_FLAG_ENABLE_INTERNAL_UI_DOUBLE_BUFFERING
             } else {
                 0
             },

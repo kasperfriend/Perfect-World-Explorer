@@ -78,6 +78,8 @@ mod mv;
 pub use fg::*;
 #[cfg(windows)]
 pub use imp::*;
+#[cfg(windows)]
+pub(crate) use mv::{FsrMotionVectorPass, FsrMvParams};
 
 #[cfg(not(windows))]
 mod imp_stub {
