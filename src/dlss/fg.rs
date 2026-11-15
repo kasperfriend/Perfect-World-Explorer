@@ -49,12 +49,13 @@ use crate::fsr::{
 };
 use glam::Mat4;
 use std::ffi::c_void;
-use winapi::shared::dxgi::{
-    IDXGISwapChain, IDXGISwapChain1, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-};
+use winapi::shared::dxgi::{IDXGISwapChain, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT};
+use winapi::shared::dxgi1_2::IDXGISwapChain1;
 use winapi::shared::dxgi1_4::IDXGISwapChain3;
 use winapi::shared::dxgiformat::{DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_FLOAT};
 use winapi::um::d3d12 as d3d12_ty;
+// Provides `uuidof()` on the COM interfaces.
+use winapi::Interface;
 
 /// `D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE` — the state NGX wants the
 /// backbuffer, depth and motion vectors in (DLSS-G dispatches compute).

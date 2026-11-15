@@ -5488,6 +5488,10 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         Some((_, Some(ui))) => {
                                             (ui, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT))
                                         }
+                                        // DLSS Frame Generation has no separate
+                                        // UI surface: the UI is part of the
+                                        // frame it interpolates.
+                                        Some((_, None)) => (scene_view, wgpu::LoadOp::Load),
                                         None => (scene_view, wgpu::LoadOp::Load),
                                     };
                                     let mut pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor{label:Some("settings menu"),color_attachments:&[Some(wgpu::RenderPassColorAttachment{view:egui_target,resolve_target:None,ops:wgpu::Operations{load:egui_load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None});
