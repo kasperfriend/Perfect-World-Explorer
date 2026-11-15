@@ -3,6 +3,7 @@ use crate::{pck, scene};
 use std::{
     collections::HashMap,
     fs::{self, File},
+    io::Read,
     path::Path,
 };
 #[derive(Clone)]
@@ -224,79 +225,105 @@ impl Trees {
             );
             return Ok(Self { types, placements });
         }
-        let dll = fs::read(element.join("speedtreert.dll"))
+        let mut dll_file = File::open(element.join("speedtreert.dll"))
             .map_err(|e| format!("SpeedTreeRT.dll: {e}"))?;
         let mut dll_hash = 2166136261u32;
-        for byte in dll {
-            dll_hash = (dll_hash ^ u32::from(byte)).wrapping_mul(16777619);
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = dll_file.read(&mut buf).map_err(|e| format!("SpeedTreeRT.dll: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            for &byte in &buf[..n] {
+                dll_hash = (dll_hash ^ u32::from(byte)).wrapping_mul(16777619);
+            }
         }
         let mut file = File::open(element.join("trees.pck")).map_err(|e| e.to_string())?;
         let entries: HashMap<_, _> = pck::directory(&mut file)?
             .into_iter()
             .map(|e| (e.name.to_lowercase(), e))
             .collect();
+        let load_one = |i: usize| -> Result<TreeMesh, String> {
+            let ty = &scene.tree_types[i];
+            let data =
+                fs::read(cache.join(format!("tree-{i:03}.pwt"))).map_err(|e| e.to_string())?;
+            let src = entries.get(&ty.tree.to_lowercase()).ok_or("missing SPT")?;
+            let original = pck::read_entry_at(&file, src)?;
+            let (name, lods) = parse(&data, &original, dll_hash)?;
+            let bark_name = ty.bark.as_deref().ok_or("missing bark name")?;
+            let bark_key = find_tree_tex(&entries, bark_name);
+            let bark_entry = entries
+                .get(&bark_key)
+                .ok_or_else(|| format!("missing branch material texture {bark_key}"))?;
+            let tex_key = if let Some(ref tex) = ty.tex {
+                find_tree_tex(&entries, tex)
+            } else {
+                find_tree_tex(&entries, &format!("{name}.dds"))
+            };
+            let tex_entry = entries
+                .get(&tex_key)
+                .ok_or_else(|| format!("missing frond/leaf material texture {tex_key}"))?;
+            let bark_bytes = pck::read_entry_at(&file, bark_entry)
+                .map_err(|e| format!("branch material texture {}: {e}", bark_entry.name))?;
+            let tex_bytes = pck::read_entry_at(&file, tex_entry)
+                .map_err(|e| format!("frond/leaf material texture {}: {e}", tex_entry.name))?;
+            let bark = image::load_from_memory_with_format(&bark_bytes, image::ImageFormat::Dds)
+                .map_err(|e| format!("branch material texture {}: {e}", bark_entry.name))?
+                .to_rgba8();
+            let composite =
+                image::load_from_memory_with_format(&tex_bytes, image::ImageFormat::Dds)
+                    .map_err(|e| {
+                        format!("frond/leaf material texture {}: {e}", tex_entry.name)
+                    })?
+                    .to_rgba8();
+            let bark_mips = crate::vegetation_textures::authored_lower_mips(&bark_bytes)
+                .unwrap_or_else(|e| {
+                    eprintln!("Tree type {i} bark authored mips unavailable: {e}");
+                    Vec::new()
+                });
+            let composite_mips = crate::vegetation_textures::authored_lower_mips(&tex_bytes)
+                .unwrap_or_else(|e| {
+                    eprintln!("Tree type {i} composite authored mips unavailable: {e}");
+                    Vec::new()
+                });
+            Ok(TreeMesh {
+                lods,
+                bark,
+                composite,
+                bark_mips,
+                composite_mips,
+            })
+        };
+        let workers = if scene.tree_types.len() > 1 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(scene.tree_types.len())
+        } else {
+            1
+        };
+        let results: Vec<Result<TreeMesh, String>> = if workers > 1 {
+            let chunk_size = scene.tree_types.len().div_ceil(workers);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = (0..scene.tree_types.len())
+                    .step_by(chunk_size)
+                    .map(|start| {
+                        let end = (start + chunk_size).min(scene.tree_types.len());
+                        let load = &load_one;
+                        s.spawn(move || (start..end).map(load).collect::<Vec<_>>())
+                    })
+                    .collect();
+                handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+            })
+        } else {
+            (0..scene.tree_types.len()).map(&load_one).collect()
+        };
         let mut count = 0;
-        for (i, ty) in scene.tree_types.iter().enumerate() {
-            let result = (|| -> Result<TreeMesh, String> {
-                let data =
-                    fs::read(cache.join(format!("tree-{i:03}.pwt"))).map_err(|e| e.to_string())?;
-                let src = entries.get(&ty.tree.to_lowercase()).ok_or("missing SPT")?;
-                let original = pck::read_entry(&mut file, src)?;
-                let (name, lods) = parse(&data, &original, dll_hash)?;
-                let name = name.replace('\\', "/");
-                let stem = Path::new(&name)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .ok_or("missing bark name")?;
-                let parent = ty.tree.rsplit_once('/').map(|x| x.0).unwrap_or("trees");
-                let bark_path = format!("{parent}/{stem}.dds").to_lowercase();
-                let fallback = format!("trees/{stem}.dds").to_lowercase();
-                let bark_entry = entries
-                    .get(&bark_path)
-                    .or_else(|| entries.get(&fallback))
-                    .ok_or_else(|| format!("branch material: missing bark texture {bark_path}"))?;
-                let tex_entry = entries.get(&ty.composite.to_lowercase()).ok_or_else(|| {
-                    format!(
-                        "frond/leaf material: missing composite texture {}",
-                        ty.composite
-                    )
-                })?;
-                let bark_bytes = pck::read_entry(&mut file, bark_entry)
-                    .map_err(|e| format!("branch material texture {}: {e}", bark_entry.name))?;
-                let tex_bytes = pck::read_entry(&mut file, tex_entry)
-                    .map_err(|e| format!("frond/leaf material texture {}: {e}", tex_entry.name))?;
-                let bark =
-                    image::load_from_memory_with_format(&bark_bytes, image::ImageFormat::Dds)
-                        .map_err(|e| format!("branch material texture {}: {e}", bark_entry.name))?
-                        .to_rgba8();
-                let composite =
-                    image::load_from_memory_with_format(&tex_bytes, image::ImageFormat::Dds)
-                        .map_err(|e| {
-                            format!("frond/leaf material texture {}: {e}", tex_entry.name)
-                        })?
-                        .to_rgba8();
-                let bark_mips = crate::vegetation_textures::authored_lower_mips(&bark_bytes)
-                    .unwrap_or_else(|e| {
-                        eprintln!("Tree type {i} bark authored mips unavailable: {e}");
-                        Vec::new()
-                    });
-                let composite_mips = crate::vegetation_textures::authored_lower_mips(&tex_bytes)
-                    .unwrap_or_else(|e| {
-                        eprintln!("Tree type {i} composite authored mips unavailable: {e}");
-                        Vec::new()
-                    });
-                Ok(TreeMesh {
-                    lods,
-                    bark,
-                    composite,
-                    bark_mips,
-                    composite_mips,
-                })
-            })();
+        for ((i, ty), result) in scene.tree_types.iter().enumerate().zip(results) {
             match result {
                 Ok(mesh) => {
                     types[i] = Some(mesh);
-                    count += 1
+                    count += 1;
                 }
                 Err(e) => eprintln!("Tree type {i} ({}): {e}", ty.tree),
             }
