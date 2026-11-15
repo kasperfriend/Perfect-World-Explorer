@@ -4560,6 +4560,9 @@ pub fn run(
     let mut world_handoff_rx: Option<std::sync::mpsc::Receiver<crate::world_handoff::Message>> =
         None;
     let mut world_handoff_files: Option<crate::world_handoff::Files> = None;
+    let mut world_handoff_child_pid: Option<u32> = None;
+    let handoff_child = crate::world_handoff::is_handoff_child();
+    let mut focus_retry = Instant::now() - std::time::Duration::from_millis(500);
     let mut last_zone: Option<usize> = None;
     let mut zone_initialized = false;
     let mut zone_check = Instant::now() - std::time::Duration::from_secs(1);
@@ -4671,6 +4674,10 @@ pub fn run(
                 WindowEvent::Focused(true) => {
                     if let Some(files) = &world_handoff_files {
                         files.set_focused(true);
+                    }
+                    #[cfg(windows)]
+                    if let Some(process_id) = world_handoff_child_pid {
+                        crate::world_handoff::allow_child_foreground(process_id);
                     }
                 }
                 WindowEvent::Resized(s) if s.width > 0 && s.height > 0 => {
@@ -5111,9 +5118,11 @@ pub fn run(
                                                     files.configure(&mut command);
                                                     match command.spawn() {
                                                         Ok(child) => {
-                                                            eprintln!("Loading world {display} in replacement process {}", child.id());
+                                                            let child_pid = child.id();
+                                                            eprintln!("Loading world {display} in replacement process {child_pid}");
+                                                            world_handoff_child_pid = Some(child_pid);
                                                             #[cfg(windows)]
-                                                            crate::world_handoff::allow_child_foreground(child.id());
+                                                            crate::world_handoff::allow_child_foreground(child_pid);
                                                             let (tx, rx) = std::sync::mpsc::channel();
                                                             files.clone().watch(child, tx);
                                                             world_handoff_files = Some(files);
@@ -5292,7 +5301,11 @@ pub fn run(
                                     timing_present = std::time::Duration::ZERO;
                                 }
                             }
-                            if !handoff_ready_signaled {
+                            let focus_transfer_pending = cfg!(windows)
+                                && handoff_child
+                                && crate::world_handoff::child_focus_allowed()
+                                && !window.has_focus();
+                            if !handoff_ready_signaled && !focus_transfer_pending {
                                 crate::world_handoff::signal_ready();
                                 handoff_ready_signaled = true;
                             }
@@ -5319,6 +5332,17 @@ pub fn run(
                 camera.pitch = (camera.pitch - delta.1 as f32 * settings.sensitivity).clamp(-1.5, 1.5);
             }
             Event::AboutToWait => {
+                #[cfg(windows)]
+                if handoff_child
+                    && !handoff_ready_signaled
+                    && crate::world_handoff::child_focus_allowed()
+                    && !window.has_focus()
+                    && focus_retry.elapsed() >= std::time::Duration::from_millis(200)
+                {
+                    crate::world_handoff::activate_child_window(&window);
+                    focus_retry = Instant::now();
+                }
+
                 let mut completion = None;
                 if let Some(receiver) = &world_handoff_rx {
                     for message in receiver.try_iter() {
@@ -5336,6 +5360,7 @@ pub fn run(
                 if let Some(result) = completion {
                     world_handoff_rx = None;
                     world_handoff_files = None;
+                    world_handoff_child_pid = None;
                     match result {
                         Ok(()) => target.exit(),
                         Err(error) => {

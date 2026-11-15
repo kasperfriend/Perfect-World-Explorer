@@ -123,6 +123,15 @@ pub fn is_handoff_child() -> bool {
     std::env::var_os(READY_ENV).is_some()
 }
 
+/// The old process updates this as its window gains or loses focus. The child
+/// uses it to avoid stealing focus after the user switches to another app.
+pub fn child_focus_allowed() -> bool {
+    let Some(focus_path) = std::env::var_os(FOCUS_ENV).map(PathBuf::from) else {
+        return false;
+    };
+    fs::read(focus_path).is_ok_and(|status| status == b"focused")
+}
+
 /// Let the replacement map process become foreground when its ready window is
 /// shown. Windows normally prevents background processes from stealing focus;
 /// the old foreground process grants this permission immediately after spawn.
@@ -139,10 +148,7 @@ pub fn allow_child_foreground(process_id: u32) {
 pub fn activate_child_window(window: &winit::window::Window) {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-    let Some(focus_path) = std::env::var_os(FOCUS_ENV).map(PathBuf::from) else {
-        return;
-    };
-    if !fs::read(focus_path).is_ok_and(|status| status == b"focused") {
+    if !child_focus_allowed() {
         eprintln!(
             "Not activating replacement map because the old window lost focus during loading"
         );
