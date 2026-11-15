@@ -110,6 +110,51 @@ pub struct DrawCmd {
 
 /// Command lists kept for the whole-world pages: main, reflection, refraction.
 pub const WORLD_VIEWS: usize = 3;
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PlacementBounds {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub has_sdr: bool,
+}
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct WorldDrawCmd {
+    pub page: usize,
+    pub start: u32,
+    pub end: u32,
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub has_sdr: bool,
+}
+
+pub fn frustum_planes_from_matrix(m: [f32; 16]) -> [[f32; 4]; 6] {
+    let r0 = [m[0], m[4], m[8], m[12]];
+    let r1 = [m[1], m[5], m[9], m[13]];
+    let r2 = [m[2], m[6], m[10], m[14]];
+    let r3 = [m[3], m[7], m[11], m[15]];
+    [
+        [r3[0] + r0[0], r3[1] + r0[1], r3[2] + r0[2], r3[3] + r0[3]],
+        [r3[0] - r0[0], r3[1] - r0[1], r3[2] - r0[2], r3[3] - r0[3]],
+        [r3[0] + r1[0], r3[1] + r1[1], r3[2] + r1[2], r3[3] + r1[3]],
+        [r3[0] - r1[0], r3[1] - r1[1], r3[2] - r1[2], r3[3] - r1[3]],
+        r2,
+        [r3[0] - r2[0], r3[1] - r2[1], r3[2] - r2[2], r3[3] - r2[3]],
+    ]
+}
+
+pub fn aabb_in_frustum(planes: &[[f32; 4]; 6], min: [f32; 3], max: [f32; 3]) -> bool {
+    if min[0] > max[0] {
+        return false;
+    }
+    for p in planes {
+        let px = if p[0] >= 0.0 { max[0] } else { min[0] };
+        let py = if p[1] >= 0.0 { max[1] } else { min[1] };
+        let pz = if p[2] >= 0.0 { max[2] } else { min[2] };
+        if p[0] * px + p[1] * py + p[2] * pz + p[3] < 0.0 {
+            return false;
+        }
+    }
+    true
+}
 
 pub struct Page {
     pub vertices: Vec<Vertex>,
@@ -537,6 +582,10 @@ pub struct GpuPage {
     normal: Arc<wgpu::BindGroup>,
     reflected: Arc<wgpu::BindGroup>,
     placements: Vec<PlacementRange>,
+    bounds: Vec<PlacementBounds>,
+    page_min: [f32; 3],
+    page_max: [f32; 3],
+    page_has_sdr: bool,
 }
 impl GpuPage {
     pub fn upload(
@@ -667,6 +716,40 @@ impl GpuPage {
             contents: bytemuck::cast_slice(&page.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
+        let mut page_min = [f32::INFINITY; 3];
+        let mut page_max = [f32::NEG_INFINITY; 3];
+        let mut page_has_sdr = false;
+        let mut bounds = Vec::with_capacity(page.placements.len());
+        for p in &page.placements {
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            let mut has_sdr = false;
+            let start = (p.start as usize).min(page.indices.len());
+            let end = (p.end as usize).min(page.indices.len());
+            if start < end {
+                for &idx in &page.indices[start..end] {
+                    if let Some(v) = page.vertices.get(idx as usize) {
+                        for i in 0..3 {
+                            min[i] = min[i].min(v.pos[i]);
+                            max[i] = max[i].max(v.pos[i]);
+                        }
+                        if (v.kind > 2.01 && v.kind < 2.03) || (v.kind > 2.11 && v.kind < 2.13) {
+                            has_sdr = true;
+                        }
+                    }
+                }
+            }
+            if min[0] <= max[0] {
+                for i in 0..3 {
+                    page_min[i] = page_min[i].min(min[i]);
+                    page_max[i] = page_max[i].max(max[i]);
+                }
+            }
+            if has_sdr {
+                page_has_sdr = true;
+            }
+            bounds.push(PlacementBounds { min, max, has_sdr });
+        }
         Self {
             vertex,
             index,
@@ -674,6 +757,10 @@ impl GpuPage {
             normal,
             reflected,
             placements: page.placements,
+            bounds,
+            page_min,
+            page_max,
+            page_has_sdr,
         }
     }
     /// Submits only the placements the recovered EC-BSD flags admit in this
@@ -771,7 +858,169 @@ impl GpuPage {
                 bound = Some(cmd.page);
             }
             pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
+      
         }
+
+    pub fn world_culled_commands(pages: &[Self]) -> [Vec<WorldDrawCmd>; WORLD_VIEWS] {
+        let order = Self::draw_order(pages);
+        let build = |view: Pass| -> Vec<WorldDrawCmd> {
+            let mut out: Vec<WorldDrawCmd> = Vec::new();
+            for &(page_idx, range_idx) in &order {
+                let p = &pages[page_idx];
+                if p.count == 0 {
+                    continue;
+                }
+                if range_idx == usize::MAX {
+                    out.push(WorldDrawCmd {
+                        page: page_idx,
+                        start: 0,
+                        end: p.count,
+                        min: p.page_min,
+                        max: p.page_max,
+                        has_sdr: p.page_has_sdr,
+                    });
+                    continue;
+                }
+                let r = &p.placements[range_idx];
+                if !allows_with_context(view, r.visibility, RenderContext::default()) {
+                    continue;
+                }
+                let start = r.start.min(p.count);
+                let end = r.end.min(p.count);
+                if start >= end {
+                    continue;
+                }
+                let b = p.bounds[range_idx];
+                if let Some(prev) = out.last_mut() {
+                    if prev.page == page_idx && prev.end == start {
+                        let cmin = [
+                            prev.min[0].min(b.min[0]),
+                            prev.min[1].min(b.min[1]),
+                            prev.min[2].min(b.min[2]),
+                        ];
+                        let cmax = [
+                            prev.max[0].max(b.max[0]),
+                            prev.max[1].max(b.max[1]),
+                            prev.max[2].max(b.max[2]),
+                        ];
+                        if cmax[0] - cmin[0] <= 128.0
+                            && cmax[1] - cmin[1] <= 128.0
+                            && cmax[2] - cmin[2] <= 128.0
+                        {
+                            prev.end = end;
+                            prev.min = cmin;
+                            prev.max = cmax;
+                            prev.has_sdr |= b.has_sdr;
+                            continue;
+                        }
+                    }
+                }
+                out.push(WorldDrawCmd {
+                    page: page_idx,
+                    start,
+                    end,
+                    min: b.min,
+                    max: b.max,
+                    has_sdr: b.has_sdr,
+                });
+            }
+            out
+        };
+        [
+            build(Pass::Main),
+            build(Pass::Reflection),
+            build(Pass::Refraction),
+        ]
+    }
+
+    pub fn draw_world_culled<'a>(
+        pages: &'a [Self],
+        cmds: &[WorldDrawCmd],
+        pass: &mut wgpu::RenderPass<'a>,
+        reflected: bool,
+        frustum: &[[f32; 4]; 6],
+        sdr_only: bool,
+    ) {
+        let mut bound = None;
+        for cmd in cmds {
+            if sdr_only && !cmd.has_sdr {
+                continue;
+            }
+            if !aabb_in_frustum(frustum, cmd.min, cmd.max) {
+                continue;
+            }
+            let p = &pages[cmd.page];
+            if bound != Some(cmd.page) {
+                pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
+                pass.set_vertex_buffer(0, p.vertex.slice(..));
+                pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
+                bound = Some(cmd.page);
+            }
+            pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
+        }
+    }
+
+    pub fn draw_selected_culled<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        reflected: bool,
+        view: Pass,
+        frustum: &[[f32; 4]; 6],
+        sdr_only: bool,
+    ) {
+        if self.count == 0 {
+            return;
+        }
+        if sdr_only && !self.page_has_sdr {
+            return;
+        }
+        if !aabb_in_frustum(frustum, self.page_min, self.page_max) {
+            return;
+        }
+        pass.set_bind_group(
+            0,
+            if reflected {
+                &self.reflected
+            } else {
+                &self.normal
+            },
+            &[],
+        );
+        pass.set_vertex_buffer(0, self.vertex.slice(..));
+        pass.set_index_buffer(self.index.slice(..), wgpu::IndexFormat::Uint32);
+        if self.placements.is_empty() {
+            pass.draw_indexed(0..self.count, 0, 0..1);
+            return;
+        }
+        let mut cursor = None::<(u32, u32)>;
+        for (r, b) in self.placements.iter().zip(&self.bounds) {
+            if sdr_only && !b.has_sdr {
+                continue;
+            }
+            if !allows_with_context(view, r.visibility, RenderContext::default()) {
+                continue;
+            }
+            if !aabb_in_frustum(frustum, b.min, b.max) {
+                continue;
+            }
+            let start = r.start.min(self.count);
+            let end = r.end.min(self.count);
+            if start >= end {
+                continue;
+            }
+            match &mut cursor {
+                Some((_, prev_end)) if *prev_end == start => *prev_end = end,
+                Some((prev_start, prev_end)) => {
+                    pass.draw_indexed(*prev_start..*prev_end, 0, 0..1);
+                    cursor = Some((start, end));
+                }
+                None => cursor = Some((start, end)),
+            }
+        }
+        if let Some((start, end)) = cursor {
+            pass.draw_indexed(start..end, 0, 0..1);
+        }
+    }
     }
     /// Convenience wrapper for callers that hold the raw order (the atlas
     /// check): build the view's commands, then draw them.
