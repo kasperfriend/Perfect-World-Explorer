@@ -281,7 +281,13 @@ pub fn unbounded_textures() -> bool {
 /// use mixed slash styles and may include the archive's own path prefix; make
 /// them agree with the normalized PCK directory before attempting a lookup.
 fn litmodel_key(path: &str) -> String {
-    let path = normalize(path);
+    // Scene strings are generally clean, but map exports can contain leading
+    // or repeated separators. Collapse those before stripping the archive root.
+    let path = normalize(path)
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
     let relative = path
         .strip_prefix("litmodels/world/")
         .or_else(|| path.strip_prefix("world/"))
