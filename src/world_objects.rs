@@ -986,22 +986,22 @@ impl GpuPage {
                 continue;
             }
             for cmd in &list.cmds[chunk.start..chunk.end] {
-                        if sdr_only && !cmd.has_sdr {
-                            continue;
-                        }
-                        if !aabb_in_frustum(frustum, cmd.min, cmd.max) {
-                            continue;
-                        }
-                        let p = &pages[cmd.page];
-                        if bound != Some(cmd.page) {
-                            pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
-                            pass.set_vertex_buffer(0, p.vertex.slice(..));
-                            pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
-                            bound = Some(cmd.page);
-                        }
-                        pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
-                }
-        }
+                    if sdr_only && !cmd.has_sdr {
+                        continue;
+                    }
+                    if !aabb_in_frustum(frustum, cmd.min, cmd.max) {
+                        continue;
+                    }
+                    let p = &pages[cmd.page];
+                    if bound != Some(cmd.page) {
+                        pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
+                        pass.set_vertex_buffer(0, p.vertex.slice(..));
+                        pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
+                        bound = Some(cmd.page);
+                    }
+                    pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
+            }
+    }
     }
 
     pub fn draw_selected_culled<'a>(
