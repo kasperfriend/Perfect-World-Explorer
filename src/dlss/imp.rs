@@ -24,8 +24,7 @@ use winapi::um::d3d12 as d3d12_ty;
 
 /// `D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE` — the state NGX wants its
 /// inputs in (DLSS and DLSS-G both dispatch compute).
-const D3D12_STATE_NON_PIXEL_READ: u32 =
-    d3d12_ty::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+const D3D12_STATE_NON_PIXEL_READ: u32 = d3d12_ty::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
 // `NVSDK_NGX_PerfQuality_Value`, in declaration order.
 const NGX_QUALITY_MAX_PERF: u32 = 0;
@@ -484,10 +483,14 @@ impl DlssUpscaler {
         let list = &mut self.ring.slot_mut(slot_index).list;
         list.resource_barrier(&barriers);
 
-        self.params
-            .set_d3d12_resource(P_COLOR, self.natives.color.resource.as_mut_ptr() as *mut c_void);
-        self.params
-            .set_d3d12_resource(P_DEPTH, self.natives.depth.resource.as_mut_ptr() as *mut c_void);
+        self.params.set_d3d12_resource(
+            P_COLOR,
+            self.natives.color.resource.as_mut_ptr() as *mut c_void,
+        );
+        self.params.set_d3d12_resource(
+            P_DEPTH,
+            self.natives.depth.resource.as_mut_ptr() as *mut c_void,
+        );
         self.params.set_d3d12_resource(
             P_MOTION_VECTORS,
             self.natives.mv.resource.as_mut_ptr() as *mut c_void,

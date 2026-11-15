@@ -211,10 +211,11 @@ mod fg_stub {
             _render_extent: (u32, u32),
             _display_extent: (u32, u32),
             _surface_format: wgpu::TextureFormat,
-            _ui_format: wgpu::TextureFormat,
         ) -> Result<DlssFrameGeneration, String> {
-            Err("DLSS Frame Generation is only supported on Windows with a DX12 backend"
-                .to_string())
+            Err(
+                "DLSS Frame Generation is only supported on Windows with a DX12 backend"
+                    .to_string(),
+            )
         }
 
         pub fn compose_view(&self) -> wgpu::TextureView {
@@ -231,18 +232,13 @@ mod fg_stub {
 
         pub fn begin_frame(&mut self) {}
 
-        #[allow(clippy::too_many_arguments)]
         pub fn prepare(
             &mut self,
             _device: &wgpu::Device,
             _queue: &wgpu::Queue,
             _depth: &wgpu::Texture,
-            _view: &glam::Mat4,
-            _projection: &glam::Mat4,
             _unjittered_vp: &glam::Mat4,
-            _frame_time_ms: f32,
             _reset: bool,
-            _jitter: (f32, f32),
         ) -> Result<(), String> {
             unimplemented!()
         }

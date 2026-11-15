@@ -85,7 +85,11 @@ impl NgxApi {
         let (handle, exports) = match dll_name {
             "nvngx_dlss.dll" => load_sdk_dll(sdk_dir, "nvngx_dlss.dll", EXPORTS)?,
             "nvngx_dlssg.dll" => load_sdk_dll(sdk_dir, "nvngx_dlssg.dll", EXPORTS)?,
-            other => return Err(format!("{other} is not an NGX feature library this viewer loads")),
+            other => {
+                return Err(format!(
+                    "{other} is not an NGX feature library this viewer loads"
+                ))
+            }
         };
         Ok(Self {
             handle,

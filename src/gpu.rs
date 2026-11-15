@@ -4114,6 +4114,12 @@ pub fn run(
     let mut xess_framegen: Option<crate::xess::XessFrameGeneration> = None;
     let mut xess_fg_failed = false;
     let mut xess_fg_fail_reason: Option<String> = None;
+    // DLSS Frame Generation: NGX owns the feature, the viewer owns a flip-model
+    // swapchain for the window (DXGI allows one per hwnd, so it excludes the
+    // other two frame generators while it is active).
+    let mut dlss_framegen: Option<crate::dlss::DlssFrameGeneration> = None;
+    let mut dlss_fg_failed = false;
+    let mut dlss_fg_fail_reason: Option<String> = None;
     // Graphics -> Latency -> XeLL owns a XeLL context of its own, unless XeSS
     // Frame Generation is active (it must create one itself, and two contexts
     // on the same device/window are not supported). `crate::latency_owner`
@@ -4530,6 +4536,8 @@ pub fn run(
                         fg_fail_reason = None;
                         xess_fg_failed = false;
                         xess_fg_fail_reason = None;
+                        dlss_fg_failed = false;
+                        dlss_fg_fail_reason = None;
                     }
                     if settings.latency != applied_latency {
                         applied_latency = settings.latency;
@@ -4625,6 +4633,74 @@ pub fn run(
                                     Ok(s) => surface = Some(s),
                                     Err(error) => {
                                         crate::xess::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // DLSS Frame Generation. Same one-swapchain-per-hwnd rule as
+                    // the other two: the wgpu surface is dropped first.
+                    let want_dlss_fg = settings.frame_generation
+                        == crate::FrameGenMethod::Dlss
+                        && presented_once
+                        && !dlss_fg_failed
+                        && crate::support_framegen(
+                            crate::FrameGenMethod::Dlss,
+                            settings.upscaling,
+                            &gpu_facts,
+                            &sdk_report,
+                        )
+                        .is_available();
+                    let dlss_fg_extent_changed = dlss_framegen.as_ref().is_some_and(|fg| {
+                        fg.size() != (config.width, config.height)
+                            || fg.render_extent() != applied_extent
+                    });
+                    if (!want_dlss_fg || dlss_fg_extent_changed) && dlss_framegen.is_some() {
+                        dlss_framegen = None; // Releases the NGX feature and the swapchain.
+                        match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                            Ok(s) => surface = Some(s),
+                            Err(error) => {
+                                crate::dlss::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                dlss_fg_failed = true;
+                            }
+                        }
+                    }
+                    if want_dlss_fg && dlss_framegen.is_none() {
+                        surface = None;
+                        match window_hwnd(&window) {
+                            Ok(hwnd) => match crate::dlss::DlssFrameGeneration::new(
+                                &renderer.device,
+                                &renderer.queue,
+                                &settings.upscale_sdk_dir,
+                                hwnd,
+                                applied_extent,
+                                (config.width, config.height),
+                                surface_format,
+                            ) {
+                                Ok(fg) => {
+                                    crate::dlss::diag("DLSS Frame Generation active (flip-model swapchain on the HWND)");
+                                    dlss_framegen = Some(fg);
+                                }
+                                Err(error) => {
+                                    crate::dlss::diag(&format!("DLSS Frame Generation unavailable, using the standard present path: {error}"));
+                                    dlss_fg_fail_reason = Some(error);
+                                    dlss_fg_failed = true;
+                                    match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                        Ok(s) => surface = Some(s),
+                                        Err(error) => {
+                                            crate::dlss::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                        }
+                                    }
+                                }
+                            },
+                            Err(error) => {
+                                crate::dlss::diag(&format!("DLSS Frame Generation unavailable (no Win32 hwnd): {error}"));
+                                dlss_fg_fail_reason = Some(error);
+                                dlss_fg_failed = true;
+                                match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                    Ok(s) => surface = Some(s),
+                                    Err(error) => {
+                                        crate::dlss::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
                                     }
                                 }
                             }
@@ -4954,7 +5030,10 @@ pub fn run(
                     // Acquire the frame. Frame generation owns presentation:
                     // no wgpu swapchain exists in that mode, so there is
                     // nothing to acquire — the pipeline presents instead.
-                    let frame = if framegen.is_some() || xess_framegen.is_some() {
+                    let frame = if framegen.is_some()
+                        || xess_framegen.is_some()
+                        || dlss_framegen.is_some()
+                    {
                         None
                     } else if let Some(active_surface) = surface.as_ref() {
                         match active_surface.get_current_texture() {
@@ -4976,17 +5055,25 @@ pub fn run(
                         eprintln!("surface: presentation unavailable (no swapchain)");
                         None
                     };
-                    if framegen.is_some() || xess_framegen.is_some() || frame.is_some() {
+                    if framegen.is_some() || xess_framegen.is_some() || dlss_framegen.is_some() || frame.is_some() {
                             let surface_view = frame
                                 .as_ref()
                                 .map(|frame| frame.texture.create_view(&Default::default()));
+                            // (composition, UI surface): DLSS Frame Generation
+                            // has no separate UI surface — the UI is part of the
+                            // frame it interpolates, so it passes `None`.
                             let fg_views = framegen
                                 .as_ref()
-                                .map(|fg| (fg.compose_view(), fg.ui_view()))
+                                .map(|fg| (fg.compose_view(), Some(fg.ui_view())))
                                 .or_else(|| {
                                     xess_framegen
                                         .as_ref()
-                                        .map(|fg| (fg.compose_view(), fg.ui_view()))
+                                        .map(|fg| (fg.compose_view(), Some(fg.ui_view())))
+                                })
+                                .or_else(|| {
+                                    dlss_framegen
+                                        .as_ref()
+                                        .map(|fg| (fg.compose_view(), None))
                                 });
                             // XeSS frame generation defaults to "UI in the
                             // composition": the proxy composites nothing and
@@ -4994,6 +5081,9 @@ pub fn run(
                             let xefg_ui_in_composition = xess_framegen
                                 .as_ref()
                                 .map(|fg| fg.ui_in_composition())
+                                .or_else(|| {
+                                    dlss_framegen.as_ref().map(|fg| fg.ui_in_composition())
+                                })
                                 .unwrap_or(false);
                             let final_view: &wgpu::TextureView = match fg_views.as_ref() {
                                 Some((compose, _)) => compose,
@@ -5115,6 +5205,27 @@ pub fn run(
                                     }
                                 }
                             }
+                            if let Some(fg) = dlss_framegen.as_mut() {
+                                let prepare_result = fg.prepare(
+                                    &renderer.device,
+                                    &renderer.queue,
+                                    &renderer.depth,
+                                    &unjittered_vp,
+                                    camera_jumped,
+                                );
+                                if let Err(error) = prepare_result {
+                                    crate::dlss::diag(&format!("DLSS Frame Generation prepare failed, disabling it: {error}"));
+                                    dlss_fg_fail_reason = Some(error);
+                                    dlss_framegen = None;
+                                    dlss_fg_failed = true;
+                                    match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                        Ok(s) => surface = Some(s),
+                                        Err(error) => {
+                                            crate::dlss::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                        }
+                                    }
+                                }
+                            }
                             if let Some(fg) = xess_framegen.as_mut() {
                                 let view = camera.view_matrix();
                                 let projection = camera.projection_matrix(config.width, config.height, camera.far);
@@ -5187,6 +5298,9 @@ pub fn run(
                             let xess_fg_badge = xess_framegen
                                 .as_ref()
                                 .map(|fg| format!("XeSS FG x2 - {} frames", fg.frames_presented()));
+                            let dlss_fg_badge = dlss_framegen.as_ref().map(|fg| {
+                                format!("DLSS FG x2 - {} frames", fg.frames_presented())
+                            });
                             let latency_badge = latency
                                 .as_ref()
                                 .map(|session| {
@@ -5229,10 +5343,12 @@ pub fn run(
                                 || xess_failed_note
                                 || fg_badge.is_some()
                                 || xess_fg_badge.is_some()
+                                || dlss_fg_badge.is_some()
                                 || latency_badge.is_some()
                                 || latency_failed_note
                                 || fg_failed
-                                || xess_fg_failed;
+                                || xess_fg_failed
+                                || dlss_fg_failed;
                             if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
                                 let input=egui_state.take_egui_input(&window);
                                 let output=egui_ctx.run(input,|ctx| {
@@ -5336,7 +5452,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                             }
                                         } else { ui.add(egui::Image::new((map_id,egui::vec2(MINIMAP_HUD,MINIMAP_HUD))).rounding(round)) };
                                         let center=image.rect.center();let dir=egui::vec2(camera.yaw.sin(),camera.yaw.cos());let side=egui::vec2(-dir.y,dir.x);let points=vec![center+dir*10.,center-dir*7.+side*5.,center-dir*7.-side*5.];ui.painter().add(egui::Shape::convex_polygon(points,egui::Color32::from_rgb(255,225,130),egui::Stroke::new(1.0f32,egui::Color32::BLACK)));ui.painter().text(image.rect.left_top()+egui::vec2(5.,5.),egui::Align2::LEFT_TOP,"N",egui::FontId::proportional(14.),egui::Color32::WHITE);});});}
-                                    if show_status_badge {egui::Area::new(egui::Id::new("fsr-status-hud")).anchor(egui::Align2::LEFT_TOP,egui::vec2(16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.0).show(ui,|ui|{if let Some(label)=&fsr_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&xess_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&dlss_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,150)));}if let Some(label)=&fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&xess_fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&latency_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(190,255,140)));}if latency_failed_note {ui.label(egui::RichText::new("XeLL failed -> VSync pacing").small().color(egui::Color32::LIGHT_RED));}if fsr_failed_note {ui.label(egui::RichText::new("FSR failed -> bilinear").small().color(egui::Color32::LIGHT_RED));}if xess_failed_note {ui.label(egui::RichText::new("XeSS failed -> bilinear").small().color(egui::Color32::LIGHT_RED));}if dlss_failed_note {ui.label(egui::RichText::new("DLSS failed -> bilinear").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&fsr_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if fg_failed {ui.label(egui::RichText::new("FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if xess_fg_failed {ui.label(egui::RichText::new("XeSS FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&xess_fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&xess_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&dlss_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&latency_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}});});}
+                                    if show_status_badge {egui::Area::new(egui::Id::new("fsr-status-hud")).anchor(egui::Align2::LEFT_TOP,egui::vec2(16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.0).show(ui,|ui|{if let Some(label)=&fsr_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&xess_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&dlss_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,150)));}if let Some(label)=&fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&xess_fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&dlss_fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&latency_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(190,255,140)));}if latency_failed_note {ui.label(egui::RichText::new("XeLL failed -> VSync pacing").small().color(egui::Color32::LIGHT_RED));}if fsr_failed_note {ui.label(egui::RichText::new("FSR failed -> bilinear").small().color(egui::Color32::LIGHT_RED));}if xess_failed_note {ui.label(egui::RichText::new("XeSS failed -> bilinear").small().color(egui::Color32::LIGHT_RED));}if dlss_failed_note {ui.label(egui::RichText::new("DLSS failed -> bilinear").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&fsr_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if fg_failed {ui.label(egui::RichText::new("FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if xess_fg_failed {ui.label(egui::RichText::new("XeSS FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if dlss_fg_failed {ui.label(egui::RichText::new("DLSS FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&dlss_fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"\u{2026}";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&xess_fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&xess_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&dlss_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&latency_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}});});}
                                     if menu_page.is_open(){renderer.modules.settings_panel(ctx,config.width as f32/window.scale_factor() as f32);}
                                     if renderer.modules.overlay_active() {
                                         // Overhead names: the same view-projection the world
@@ -5369,7 +5485,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         Some(_) if xefg_ui_in_composition => {
                                             (scene_view, wgpu::LoadOp::Load)
                                         }
-                                        Some((_, ui)) => {
+                                        Some((_, Some(ui))) => {
                                             (ui, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT))
                                         }
                                         None => (scene_view, wgpu::LoadOp::Load),
@@ -5445,7 +5561,27 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                             if let Some(session) = latency.as_mut() {
                                 session.present_start();
                             }
-                            if let Some(fg) = xess_framegen.as_mut() {
+                            if let Some(fg) = dlss_framegen.as_mut() {
+                                // DLSS Frame Generation owns presentation: copy
+                                // the composition into the current backbuffer,
+                                // let NGX write the interpolated image into the
+                                // next one, and present both.
+                                match fg.finish(ui_visible) {
+                                    Ok(()) => {}
+                                    Err(error) => {
+                                        crate::dlss::diag(&format!("DLSS Frame Generation failed, restoring the standard present path: {error}"));
+                                        dlss_fg_fail_reason = Some(error);
+                                        dlss_framegen = None;
+                                        dlss_fg_failed = true;
+                                        match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                            Ok(s) => surface = Some(s),
+                                            Err(error) => {
+                                                crate::dlss::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(fg) = xess_framegen.as_mut() {
                                 // XeSS frame generation owns presentation:
                                 // copy the composition into the proxy
                                 // backbuffer, present (the proxy paces real and

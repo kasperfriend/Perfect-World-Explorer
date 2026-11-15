@@ -60,8 +60,10 @@ done.
   FSR SDK is on a reachable host (github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
   and its signed DX12 binaries were vendored into `sdk/` at the user's request
   (2026-11-14): `amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll`,
-  `amd_fidelityfx_framegeneration_dx12.dll` (FSR SDK v2.4.0). NVIDIA's DLSS SDK
-  is not published on a reachable host and is not available at all.
+  `amd_fidelityfx_framegeneration_dx12.dll` (FSR SDK v2.4.0). The Intel XeSS
+  SDK 3.0.2 and the NVIDIA DLSS/NGX runtime (from `github.com/NVIDIA/DLSS`,
+  `lib/Windows_x86_64/rel/`) followed the same way, with their license texts
+  vendored beside the binaries; see `THIRD_PARTY_NOTICES.md`.
 - **Tried:** reachability is defined by the sandbox proxy; no fetch to vendor
   hosts was attempted beyond the allowlist (they are unreachable).
 - **Workaround:** **no proprietary SDK binaries are committed**. The only
@@ -102,10 +104,11 @@ done.
     and basic operation are all runtime-unverified. Intel XeSS Super
     Resolution and XeSS Frame Generation are now **implemented but equally
     runtime-unverified** (same depth-reprojection MV pass, same FFI pattern;
-    XeLL low-latency context owned by the FG integration). An active DLSS
-    provider still renders through the bilinear path (no temporal accumulation
-    is faked for it). The NVIDIA SDK still could not be obtained; the Intel
-    DLLs are user-supplied (`sdk/SDK_GOES_HERE.txt`) and are never committed.
+    XeLL low-latency context owned by the FG integration). DLSS Super
+    Resolution and DLSS Frame Generation are implemented over the same MV pass
+    and are equally runtime-unverified (`src/dlss/`), driven over NGX's snippet
+    ABI with a parameter table the viewer owns, because the shipped NGX DLLs
+    export no parameter allocator.
   - **Intel XeSS is now vendored too** (2026-11-15): the XeSS SDK 3.0.2 release
     is published on a reachable host — `https://github.com/intel/xess`, tag
     `v3.0.2`, whose tree (codeload tarball) is the same material the
@@ -129,10 +132,11 @@ done.
   - Licenses/attribution are recorded in `THIRD_PARTY_NOTICES.md` from the
     vendor terms as published (with the requirement to re-check the license
     shipped inside the SDK you download).
-- **Status:** closed for AMD FSR and Intel XeSS/XeSS-FG/XeLL (binaries vendored,
-  exports and constants verified); **open for NVIDIA DLSS/Streamline**, which is
-  not published on a reachable host, may not be redistributed, and remains not
-  integrated. Hardware verification of the Intel path is tracked in B-2.
+- **Status:** closed for AMD FSR, Intel XeSS/XeSS-FG/XeLL and NVIDIA
+  DLSS/DLSS-G (binaries vendored, exports and constants verified). Streamline
+  stays out: `sl.*.dll` is neither vendored nor staged, and the DLSS-G
+  integration deliberately uses its own swapchain instead. Hardware
+  verification is tracked in B-2.
 
 ## B-4 — Native pass-by-pass DX12 rewrite (Phase 2)
 
@@ -172,8 +176,7 @@ done.
 - **Workaround:** the FFX upscaler (Upscaling 4.1.2) consumes camera-motion MVs; actors that move in
   world space are reprojected as if static (ghosting on animated geometry is
   expected). There is still no per-object or skeletal velocity pass. XeSS uses
-  the same camera-only MVs; an active DLSS provider renders bilinearly as
-  before.
+  the same camera-only MVs, and DLSS/DLSS-G consume them unchanged.
 - **Status:** open (per-actor velocity pass + a verified FSR run on a real
   Windows GPU).
 

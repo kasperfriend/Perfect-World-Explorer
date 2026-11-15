@@ -48,10 +48,12 @@
 //! the error (stderr *and* the always-on `session.log` in the diagnostics
 //! folder), shows the reason in the on-screen fallback note, and falls back
 //! to the bilinear path for the rest of the session instead of crashing.
-//! DLSS and XeSS are not integrated. FSR frame generation is: it takes over
-//! the HWND with its own proxy swapchain (`FrameGenerationSwapChainForHwndDX12`),
-//! renders the UI into a separate native-resolution texture and presents
-//! through the FFX frame-interpolation swapchain.
+//! This module owns the upscaler abstraction only; XeSS (`src/xess`) and DLSS
+//! (`src/dlss`) are separate backends behind the same interface. FSR frame
+//! generation takes over the HWND with its own proxy swapchain
+//! (`FrameGenerationSwapChainForHwndDX12`), renders the UI into a separate
+//! native-resolution texture and presents through the FFX frame-interpolation
+//! swapchain.
 //!
 //! ## Non-Windows
 //!
