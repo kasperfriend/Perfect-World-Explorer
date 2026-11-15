@@ -274,9 +274,9 @@ impl NgxCore {
         let mut core = Self {
             _handle: handle,
             path: system32.join("nvngx.dll").to_string_lossy().into_owned(),
-            create_feature: unsafe { std::mem::transmute(exports[1]) },
-            evaluate_feature: unsafe { std::mem::transmute(exports[2]) },
-            release_feature: unsafe { std::mem::transmute(exports[3]) },
+            create_feature: unsafe { read_function(exports[1]) },
+            evaluate_feature: unsafe { read_function(exports[2]) },
+            release_feature: unsafe { read_function(exports[3]) },
             allocate_parameters: None,
             destroy_parameters: None,
             get_capability_parameters: None,
@@ -291,24 +291,20 @@ impl NgxCore {
         // viewer degrades to its own parameter table instead of failing.
         unsafe {
             core.allocate_parameters =
-                std::mem::transmute(resolve(handle, b"NVSDK_NGX_D3D12_AllocateParameters\0"));
+                resolve_function(handle, b"NVSDK_NGX_D3D12_AllocateParameters\0");
             core.destroy_parameters =
-                std::mem::transmute(resolve(handle, b"NVSDK_NGX_D3D12_DestroyParameters\0"));
-            core.get_capability_parameters = std::mem::transmute(resolve(
-                handle,
-                b"NVSDK_NGX_D3D12_GetCapabilityParameters\0",
-            ));
-            core.set_u32 = std::mem::transmute(resolve(handle, b"NVSDK_NGX_Parameter_SetUI\0"));
-            core.set_i32 = std::mem::transmute(resolve(handle, b"NVSDK_NGX_Parameter_SetI\0"));
-            core.set_f32 = std::mem::transmute(resolve(handle, b"NVSDK_NGX_Parameter_SetF\0"));
-            core.set_d3d12 =
-                std::mem::transmute(resolve(handle, b"NVSDK_NGX_Parameter_SetD3d12Resource\0"));
-            core.set_void =
-                std::mem::transmute(resolve(handle, b"NVSDK_NGX_Parameter_SetVoidPointer\0"));
-            core.get_u32 = std::mem::transmute(resolve(handle, b"NVSDK_NGX_Parameter_GetUI\0"));
+                resolve_function(handle, b"NVSDK_NGX_D3D12_DestroyParameters\0");
+            core.get_capability_parameters =
+                resolve_function(handle, b"NVSDK_NGX_D3D12_GetCapabilityParameters\0");
+            core.set_u32 = resolve_function(handle, b"NVSDK_NGX_Parameter_SetUI\0");
+            core.set_i32 = resolve_function(handle, b"NVSDK_NGX_Parameter_SetI\0");
+            core.set_f32 = resolve_function(handle, b"NVSDK_NGX_Parameter_SetF\0");
+            core.set_d3d12 = resolve_function(handle, b"NVSDK_NGX_Parameter_SetD3d12Resource\0");
+            core.set_void = resolve_function(handle, b"NVSDK_NGX_Parameter_SetVoidPointer\0");
+            core.get_u32 = resolve_function(handle, b"NVSDK_NGX_Parameter_GetUI\0");
         }
         core.initialise(sdk_dir, device, handle, unsafe {
-            std::mem::transmute(exports[0])
+            read_function(exports[0])
         })?;
         Ok(core)
     }
@@ -320,9 +316,8 @@ impl NgxCore {
         handle: HMODULE,
         init: PfnInit,
     ) -> Result<(), String> {
-        let init_with_project_id: Option<PfnInitWithProjectId> = unsafe {
-            std::mem::transmute(resolve(handle, b"NVSDK_NGX_D3D12_Init_with_ProjectID\0"))
-        };
+        let init_with_project_id: Option<PfnInitWithProjectId> =
+            unsafe { resolve_function(handle, b"NVSDK_NGX_D3D12_Init_with_ProjectID\0") };
         let app_dir = ngx_app_dir();
         super::diag(&format!(
             "[NGX] core {} initialising (application data folder: {app_dir})",
@@ -482,6 +477,26 @@ impl NgxCore {
 unsafe fn resolve(handle: HMODULE, name: &[u8]) -> Option<*const c_void> {
     let proc = winapi::um::libloaderapi::GetProcAddress(handle, name.as_ptr() as *const i8);
     (!proc.is_null()).then_some(proc as *const c_void)
+}
+
+/// One resolved entry point as its `extern "C"` function type.
+///
+/// `transmute_copy` rather than `transmute`: a function pointer and a data
+/// pointer are the same width on every target this viewer builds for, and
+/// `transmute_copy` keeps a single generic path for both the mandatory and the
+/// optional entry points instead of one `transmute` per signature.
+unsafe fn read_function<T: Copy>(pointer: *const c_void) -> T {
+    debug_assert_eq!(
+        std::mem::size_of::<T>(),
+        std::mem::size_of::<*const c_void>(),
+        "an entry point must be one pointer wide"
+    );
+    std::mem::transmute_copy(&pointer)
+}
+
+/// `resolve` + `read_function`: an optional entry point.
+unsafe fn resolve_function<T: Copy>(handle: HMODULE, name: &[u8]) -> Option<T> {
+    resolve(handle, name).map(|pointer| read_function(pointer))
 }
 
 /// `%SystemRoot%\System32`, which is where the driver installs `nvngx.dll`.

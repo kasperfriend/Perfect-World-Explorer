@@ -39,7 +39,7 @@
 //! build drives it.
 
 use std::collections::HashMap;
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{c_char, c_void, CStr, CString};
 
 /// `NVSDK_NGX_Result_Success`. NGX success is `0x1`, not `0`.
 pub(crate) const NGX_SUCCESS: u32 = 0x0000_0001;
