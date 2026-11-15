@@ -469,11 +469,19 @@ impl Objects {
                 .iter()
                 .map(|m| m.texture.clone())
                 .collect();
-            let mut failure = None;
             for raw in references {
                 if let Err(error) = self.load_texture_reference(&raw) {
-                    failure = Some(format!("texture {raw}: {error}"));
-                    break;
+                    // A texture I/O/decode failure must not discard valid BMD
+                    // geometry. The world builder already has a white fallback
+                    // slot for an unavailable texture, matching the client's
+                    // tolerant texture-open path more closely than rejecting the
+                    // entire model.
+                    self.register(
+                        &raw,
+                        "texture-load-failed",
+                        &format!("texture unavailable; retaining model geometry: {error}"),
+                    );
+                    continue;
                 }
                 // Derived normal-map reference (A3DLitMesh::LoadTexture step
                 // 4). The client tolerates every failure here (a missing file
@@ -493,10 +501,6 @@ impl Objects {
                         );
                     }
                 }
-            }
-            if let Some(error) = failure {
-                self.models.remove(&name);
-                self.skip_model(&name, &error);
             }
         }
         Ok(())
@@ -802,6 +806,89 @@ mod tests {
         )
         .unwrap_err()
         .contains("ambiguous"));
+    }
+
+    #[test]
+    fn texture_read_failure_keeps_valid_bmd_geometry_available() {
+        let root = std::env::temp_dir().join(format!(
+            "pw-bmd-texture-failure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        write_empty_pck(&root.join("litmodels.pck"));
+        write_empty_pck(&root.join("building.pck"));
+        let path = "1/litmodel_1318.bmd";
+        let raw_texture = "building/textures/not-readable.dds";
+        let mut objects = Objects::open(
+            &root,
+            vec![Ornament {
+                export_id: 78,
+                offset: 0,
+                position: [0.; 3],
+                direction: [0., 0., 1.],
+                up: [0., 1., 0.],
+                extra: 0,
+                path: path.into(),
+            }],
+        )
+        .unwrap();
+        let texture_key = normalize(raw_texture);
+        objects.texentries.insert(
+            texture_key.clone(),
+            pck::Entry {
+                name: texture_key.clone(),
+                offset: 0,
+                size: 8,
+                compressed: 4,
+            },
+        );
+        let mut texture_names = HashSet::new();
+        texture_names.insert(texture_key);
+        objects.resolver = TextureResolver::new(
+            vec![
+                MountedArchive {
+                    tag: "litmodels".into(),
+                    index: HashSet::new(),
+                },
+                MountedArchive {
+                    tag: "building".into(),
+                    index: texture_names,
+                },
+            ],
+            root.clone(),
+        );
+        objects.models.insert(
+            litmodel_key(path),
+            bmd::Model {
+                scale: [1.; 3],
+                direction: [0., 0., 1.],
+                up: [0., 1., 0.],
+                position: [0.; 3],
+                meshes: vec![bmd::Mesh {
+                    name: "fixture-wall".into(),
+                    version: 0x10000004,
+                    material: None,
+                    texture: raw_texture.into(),
+                    vertices: Vec::new(),
+                    indices: Vec::new(),
+                }],
+                collision: Vec::new(),
+            },
+        );
+
+        objects.load_ids(&[0]).unwrap();
+
+        assert!(objects.get(0).is_some());
+        assert_eq!(objects.unavailable_model_count(), 0);
+        assert!(objects
+            .unresolved()
+            .iter()
+            .any(|row| row.kind == "texture-load-failed"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn tex(fill: u8, side: usize) -> Texture {
