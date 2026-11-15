@@ -748,7 +748,7 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
     eprintln!(
         "Retained {} EC model assets for {} placements; {} unloaded placements (ordinary animated submission enabled unless PW_DISABLE_WORLD_MODELS is set)",
         models.assets.len(),
-        models.placements.len(),
+        models.instances.len(),
         models.unloaded.len()
     );
     for failure in &models.failures {
