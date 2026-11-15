@@ -853,9 +853,10 @@ fn export_height_png(
 // `upscaling=off|dlss|fsr1|fsr2|fsr3|fsr4|xess`,
 // `upscale_quality=nativeaa|ultraquality|quality|balanced|performance|ultraperformance`
 // (`nativeaa` is FSR 3.1 only: the same dispatch at a 1.0x render ratio),
-// `frame_generation=off|dlss|fsr|xess`, `fsr1_sharpness=<0..2 stops>`,
-// `fsr3_sharpness=<0..1>` (FFX `sharpness` for FSR 3.1/4), `latency=vsync|xell`,
-// `upscale_sdk_dir=<path>`.
+// `frame_generation=off|dlss|fsr|xess`, `frame_multiplier=2|3|4|6`,
+// `fsr1_sharpness=<0..2 stops>`,
+// `fsr3_sharpness=<0..1>` (FFX `sharpness` for FSR 3.1/4),
+// `latency=vsync|reflex|xell`, `upscale_sdk_dir=<path>`.
 //
 // This logic is intentionally free of GPU and windowing dependencies so it
 // can be unit-tested headless. The provider FFI lives in gpu.rs.
@@ -2373,11 +2374,11 @@ mod tests {
         for mode in LatencyMode::ALL {
             assert_eq!(LatencyMode::parse(mode.token()), Some(mode));
             assert_eq!(LatencyMode::parse(&mode.token().to_uppercase()), Some(mode));
-            // Both strategies present on the display refresh.
+            // All three present on the display refresh.
             assert_eq!(mode.present_mode(), wgpu::PresentMode::Fifo);
         }
         // Unknown spellings keep the default instead of guessing.
-        assert_eq!(LatencyMode::parse("reflex"), None);
+        assert_eq!(LatencyMode::parse("reflexx"), None);
         assert_eq!(LatencyMode::parse(""), None);
         // The persisted key round-trips through the settings file (the
         // view_settings tests cover the file format itself).

@@ -1233,10 +1233,12 @@ effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs
             ViewSettings::decode("frame_multiplier=6x\n").frame_multiplier,
             FrameMultiplier::X6
         );
-        // It does not disturb the neighbouring frame generation key.
+        // It does not disturb the neighbouring frame generation key (DLSS
+        // frame generation is legal with any upscaler, including Off).
         let both = ViewSettings::decode("frame_generation=dlss\nframe_multiplier=3\n");
         assert_eq!(both.frame_multiplier, FrameMultiplier::X3);
-        assert_eq!(both.frame_generation, crate::FrameGenMethod::Off);
+        assert_eq!(both.frame_generation, crate::FrameGenMethod::Dlss);
+        assert_eq!(ViewSettings::decode(&both.encode()), both);
     }
 
     /// The Graphics -> Latency key: round-trips, defaults to VSync, and falls
