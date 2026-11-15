@@ -1540,12 +1540,8 @@ fn world_mesh_with_custom_far_blocks(
                 // block's final shared row/column. As in the native mesh
                 // builder, the map's outermost block boundary reuses the last
                 // stored sample rather than reading at width/height.
-                let (x, y) = clamped_far_sample(
-                    bx + *lx as usize,
-                    by + *ly as usize,
-                    t.width,
-                    t.height,
-                );
+                let (x, y) =
+                    clamped_far_sample(bx + *lx as usize, by + *ly as usize, t.width, t.height);
                 let (height, normal) = reader.cell(y * t.width + x)?;
                 let pos = [
                     (x as f32 - t.width as f32 * 0.5) * t.grid_spacing,
