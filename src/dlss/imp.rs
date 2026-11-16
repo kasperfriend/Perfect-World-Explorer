@@ -34,6 +34,9 @@ const NGX_QUALITY_ULTRA_PERFORMANCE: u32 = 3;
 const NGX_QUALITY_ULTRA_QUALITY: u32 = 4;
 const NGX_QUALITY_DLAA: u32 = 5;
 
+/// `NVSDK_NGX_DLSS_Feature_Flags_MVLowRes`: motion vectors are at render
+/// resolution rather than display resolution.
+const NGX_DLSS_FEATURE_MV_LOW_RES: i32 = 1 << 1;
 /// `NVSDK_NGX_DLSS_Feature_Flags_DepthInverted`: the viewer's depth is
 /// reversed-Z (near→1, far→0), the same convention FSR and XeSS are told.
 const NGX_DLSS_FEATURE_DEPTH_INVERTED: i32 = 1 << 3;
@@ -59,9 +62,7 @@ const P_RENDER_WIDTH: &str = "DLSS.Render.Subrect.Dimensions.Width";
 const P_RENDER_HEIGHT: &str = "DLSS.Render.Subrect.Dimensions.Height";
 const P_SHARPNESS: &str = "Sharpness";
 
-/// Jitter pattern length; Halton(2,3) is what the DLSS integration guide
-/// recommends and what the FSR/XeSS paths already use.
-const PHASE_COUNT: usize = 16;
+
 
 /// In-tree Halton jitter in pixels ([-0.5, 0.5)), 16 phases.
 fn halton(mut index: u32, base: u32) -> f32 {
@@ -75,8 +76,8 @@ fn halton(mut index: u32, base: u32) -> f32 {
     result
 }
 
-fn jitter_for_frame(frame: u64) -> (f32, f32) {
-    let n = (frame % PHASE_COUNT as u64) as u32 + 1;
+fn jitter_for_frame(frame: u64, phase_count: u64) -> (f32, f32) {
+    let n = (frame % phase_count.max(1)) as u32 + 1;
     (halton(n, 2) - 0.5, halton(n, 3) - 0.5)
 }
 
@@ -173,6 +174,7 @@ pub struct DlssUpscaler {
     mv_pass: FsrMotionVectorPass,
     composite: FsrComposite,
     frame_index: u64,
+    phase_count: u64,
     current_jitter: (f32, f32),
     prev_view_proj: Option<Mat4>,
     reset_history: bool,
@@ -234,7 +236,10 @@ impl DlssUpscaler {
         params.set_u32(P_OUT_WIDTH, display_extent.0.max(1));
         params.set_u32(P_OUT_HEIGHT, display_extent.1.max(1));
         params.set_u32(P_PERF_QUALITY, quality_setting);
-        params.set_i32(P_CREATE_FLAGS, NGX_DLSS_FEATURE_DEPTH_INVERTED);
+        params.set_i32(
+            P_CREATE_FLAGS,
+            NGX_DLSS_FEATURE_MV_LOW_RES | NGX_DLSS_FEATURE_DEPTH_INVERTED,
+        );    
 
         let mut ring = NativeCommandRing::new(&raw_device, "DLSS")?;
         let mut handle: *mut c_void = std::ptr::null_mut();
@@ -271,6 +276,8 @@ impl DlssUpscaler {
         let mv_pass = FsrMotionVectorPass::new(device);
         let composite = FsrComposite::new(device, format);
 
+        let ratio = display_extent.0.max(1) as f32 / render_extent.0.max(1) as f32;
+        let phase_count = ((8.0 * ratio * ratio).ceil() as u64).clamp(16, 64);
         Ok(Self {
             api,
             params,
@@ -283,6 +290,7 @@ impl DlssUpscaler {
             mv_pass,
             composite,
             frame_index: 0,
+            phase_count,
             current_jitter: (0.0, 0.0),
             prev_view_proj: None,
             reset_history: true,
@@ -308,7 +316,7 @@ impl DlssUpscaler {
 
     /// Halton jitter for the next frame, in pixels. Advances at record().
     pub fn next_jitter(&mut self) -> (f32, f32) {
-        self.current_jitter = jitter_for_frame(self.frame_index);
+        self.current_jitter = jitter_for_frame(self.frame_index, self.phase_count);
         self.current_jitter
     }
 
