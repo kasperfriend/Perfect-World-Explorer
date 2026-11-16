@@ -25,7 +25,7 @@
 
 ## Work selected for this pass
 
-1. Fix the SDK-enabled Windows build path and stage the redistributable runtime/licenses correctly. The SDK appeared in the user's PR after the earlier CI pass, so Windows now takes a different build path. The failed check exposes only exit code 101; the raw Actions log download returned EOF, so the compiler diagnostic is not confirmed. The workflow now explicitly enters the x64 MSVC environment before Cargo runs the SDK bridge build and echoes its diagnostic tail on failure.
+1. Fix the SDK-enabled Windows build path and stage the redistributable runtime/licenses correctly. The SDK appeared in the user's PR after the earlier CI pass, so Windows now takes a different build path. Run `43978558371` confirms the Windows standalone build passes with the workflow explicitly entering the x64 MSVC environment. Its later Windows audio fixture test failed; the raw Actions log download returned EOF, so that test's diagnostic is still unknown. The test step now echoes its log tail on failure.
 2. Change DirectStorage from one globally serialized queue to per-calling-thread queues and completion events, so independent asset-loader threads can overlap I/O while keeping error records isolated. Keep safe fallback and error recovery.
 3. Package x64 runtime DLLs beside the viewer when present and preserve the package license/notices; otherwise explicitly retain ordinary file-I/O fallback.
 4. Confirm both ordinary Windows CI and Linux tests. SDK/hardware throughput still needs a user's machine.
