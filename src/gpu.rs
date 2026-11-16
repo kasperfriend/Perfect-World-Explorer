@@ -2745,6 +2745,7 @@ impl Renderer {
             let delta = if advance { camera.logic_delta_ms } else { 0 };
             let frame = receiving_model_frame(uniform, camera, light);
             models.set_frustum(Some(*frustum));
+            models.set_keep_unbounded(crate::objects::unbounded_textures());
             models.update_pass(
                 &self.device,
                 &self.queue,
