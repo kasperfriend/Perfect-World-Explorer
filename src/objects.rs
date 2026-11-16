@@ -274,8 +274,14 @@ fn tex_budget_bytes() -> usize {
         << 20
 }
 enum PendingTexture {
-    Archive { mount: usize, key: String },
-    Disk { key: String, path: std::path::PathBuf },
+    Archive {
+        mount: usize, 
+        key: String,
+    },
+    Disk {
+        key: String, 
+        path: std::path::PathBuf,
+    },
 }
 
 fn decode_texture_bytes(key: &str, data: &[u8]) -> Result<Texture, String> {
@@ -393,8 +399,8 @@ impl Objects {
                             for (name, entry) in chunk {
                                 let data = pck::read_entry_at(litfile, entry)
                                     .map_err(|e| e.to_string())?;
-                                let model = bmd::Model::parse(&data)
-                                    .map_err(|e| format!("{name}: {e}"))?;
+                                let model =
+                                    bmd::Model::parse(&data).map_err(|e| format!("{name}: {e}"))?;
                                 out.push((name.clone(), model));
                             }
                             Ok(out)
