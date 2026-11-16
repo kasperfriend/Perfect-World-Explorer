@@ -21,7 +21,7 @@ fn at(f: &mut File, p: u64, n: usize) -> Result<Vec<u8>, String> {
     Ok(b)
 }
 fn inflate(bytes: &[u8], expected: usize) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(expected));
+    let mut out = Vec::with_capacity(expected);
     ZlibDecoder::new(bytes)
         .take((expected + 1) as u64)
         .read_to_end(&mut out)
