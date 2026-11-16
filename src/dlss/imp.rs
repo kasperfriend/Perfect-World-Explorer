@@ -505,8 +505,7 @@ impl DlssUpscaler {
         // Motion vectors are in pixels, so the scale is 1:1.
         self.params.set_f32(P_MV_SCALE_X, 1.0);
         self.params.set_f32(P_MV_SCALE_Y, 1.0);
-        self.params
-                .set_f32(P_FRAME_TIME_MS, frame_time_ms.clamp(0.1, 1000.0));
+        self.params.set_f32(P_FRAME_TIME_MS, frame_time_ms.clamp(0.1, 1000.0));
         // Sharpness is deprecated in current DLSS builds (sharpening moved to
         // the game); 0 keeps the vendor default and is what the guide passes.
         self.params.set_f32(P_SHARPNESS, 0.0);
