@@ -412,7 +412,7 @@ impl Gpu {
         light: Option<&'a wgpu::BindGroup>,
     ) {
         if self.batches.is_empty() {
-          return; 
+            return;
         }
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind, &[]);
