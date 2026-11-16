@@ -164,8 +164,8 @@ pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
 pub fn read_entry_at(f: &File, e: &Entry) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut raw = vec![0u8; e.compressed as usize];
     #[cfg(windows)]
-    let accelerated = raw.len() >= 64 * 1024
-        && direct_storage::read_range(f, e.offset as u64, &mut raw);
+    let accelerated =
+        raw.len() >= 64 * 1024 && direct_storage::read_range(f, e.offset as u64, &mut raw);
     #[cfg(not(windows))]
     let accelerated = false;
     if !accelerated {

@@ -40,24 +40,19 @@ mod enabled {
         // First query the required capacity, then obtain the canonical path
         // from the already-open handle. Never reconstruct a path from archive
         // metadata or trust an entry name for filesystem access.
-        let needed = unsafe {
-            GetFinalPathNameByHandleW(handle, core::ptr::null_mut(), 0, 0)
-        };
+        let needed = unsafe { GetFinalPathNameByHandleW(handle, core::ptr::null_mut(), 0, 0) };
         if needed == 0 || needed > 32767 {
             return false;
         }
         let mut path = vec![0u16; needed as usize + 1];
-        let written = unsafe {
-            GetFinalPathNameByHandleW(handle, path.as_mut_ptr(), path.len() as u32, 0)
-        };
+        let written =
+            unsafe { GetFinalPathNameByHandleW(handle, path.as_mut_ptr(), path.len() as u32, 0) };
         if written == 0 || written as usize >= path.len() {
             return false;
         }
         path.truncate(written as usize);
         path.push(0);
-        unsafe {
-            pwe_dstorage_read(path.as_ptr(), offset, size, output.as_mut_ptr().cast()) != 0
-        }
+        unsafe { pwe_dstorage_read(path.as_ptr(), offset, size, output.as_mut_ptr().cast()) != 0 }
     }
 }
 

@@ -9,10 +9,17 @@ fn main() {
     if !target.contains("windows-msvc") {
         return;
     }
-    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let sdk = env::var_os("DIRECTSTORAGE_SDK_DIR")
         .map(PathBuf::from)
-        .map(|path| if path.is_absolute() { path } else { manifest_dir.join(path) })
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                manifest_dir.join(path)
+            }
+        })
         .unwrap_or_else(|| manifest_dir.join("sdk/DirectStorage/1.4.0-preview2-2606.904"));
     if !sdk.join("native/include/dstorage.h").is_file() {
         println!("cargo:warning=DirectStorage SDK not found at {}; run tools/fetch-directstorage.ps1 or set DIRECTSTORAGE_SDK_DIR. Using standard file I/O.", sdk.display());
@@ -28,7 +35,10 @@ fn main() {
     } else {
         panic!("DIRECTSTORAGE_SDK_DIR does not contain native/include/dstorage.h (or include/dstorage.h): {}", sdk.display());
     };
-    println!("cargo:rerun-if-changed={}", header_dir.join("dstorage.h").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        header_dir.join("dstorage.h").display()
+    );
 
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let object = out.join("directstorage_shim.obj");
@@ -42,7 +52,10 @@ fn main() {
         .arg(&source)
         .status()
         .expect("DirectStorage enabled but cl.exe was not found; build from a Visual Studio developer environment");
-    assert!(status.success(), "failed to compile the DirectStorage bridge");
+    assert!(
+        status.success(),
+        "failed to compile the DirectStorage bridge"
+    );
 
     let status = Command::new("lib.exe")
         .arg("/nologo")
@@ -50,7 +63,10 @@ fn main() {
         .arg(&object)
         .status()
         .expect("DirectStorage enabled but lib.exe was not found");
-    assert!(status.success(), "failed to archive the DirectStorage bridge");
+    assert!(
+        status.success(),
+        "failed to archive the DirectStorage bridge"
+    );
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=pwe_directstorage_shim");
