@@ -318,9 +318,9 @@ impl Grass {
         // Read each BSData file exactly once, retaining only one at a time.
         // Restore original area order afterwards so draw order stays unchanged.
         records.sort_by_key(|r| r.0);
-        
+
     let mut groups: Vec<(usize, &[(usize, usize, usize)])> = Vec::new();
-    let mut g_start = 0usize;
+        let mut g_start = 0usize;
         while g_start < records.len() {
             let idx = records[g_start].0;
             let mut g_end = g_start + 1;
