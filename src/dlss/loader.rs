@@ -721,8 +721,13 @@ impl NgxCore {
     /// `FAIL_InvalidParameter` (`0xbad00005`) on some drivers — so every
     /// NGX-owned accessor is tried *first*:
     ///
-    /// 1. `NVSDK_NGX_D3D12_AllocateParameters` — the modern allocator,
-    /// 2. `NVSDK_NGX_D3D12_GetCapabilityParameters` — pre-populated, NGX-owned,
+    /// 1. `NVSDK_NGX_D3D12_GetCapabilityParameters` — pre-populated with NGX's
+    ///    capabilities, which is the map NVIDIA's own DLSS samples create and
+    ///    evaluate with. A map from `AllocateParameters` is documented as
+    ///    usable "in the same ways", but it is *not* pre-populated
+    ///    (`nvsdk_ngx.h:356-359`), and the feature reads capability entries
+    ///    that only this one carries.
+    /// 2. `NVSDK_NGX_D3D12_AllocateParameters` — the modern allocator,
     /// 3. `NVSDK_NGX_D3D12_GetParameters` — deprecated, and the *only* one an
     ///    older core exports (`nvsdk_ngx.h` documents it as the fallback when
     ///    the other two answer `FAIL_OutOfDate`).
@@ -742,13 +747,13 @@ impl NgxCore {
     fn new_parameters(&self) -> Box<NgxParams> {
         let sources: [(&str, Option<PfnGetCapabilityParameters>, bool); 3] = [
             (
-                "NVSDK_NGX_D3D12_AllocateParameters",
-                self.allocate_parameters,
+                "NVSDK_NGX_D3D12_GetCapabilityParameters",
+                self.get_capability_parameters,
                 true,
             ),
             (
-                "NVSDK_NGX_D3D12_GetCapabilityParameters",
-                self.get_capability_parameters,
+                "NVSDK_NGX_D3D12_AllocateParameters",
+                self.allocate_parameters,
                 true,
             ),
             ("NVSDK_NGX_D3D12_GetParameters", self.get_parameters, false),
@@ -788,6 +793,7 @@ impl NgxCore {
                     self.set_f32,
                     self.set_d3d12,
                     self.set_void,
+                    self.get_u32,
                 ));
             }
             super::diag(&format!(

@@ -117,6 +117,7 @@ const SLOT_SET_U32: usize = 3;
 const SLOT_SET_I32: usize = 4;
 const SLOT_SET_D3D12: usize = 6;
 const SLOT_SET_VOID: usize = 7;
+const SLOT_GET_U32: usize = 11;
 
 /// One `Set` overload of an `NVSDK_NGX_Parameter` the viewer does not own.
 ///
@@ -194,6 +195,16 @@ impl Owned {
         self.values.insert(name.to_string(), Value::Ptr(pointer));
     }
 
+    /// Read an integer back, the way `NVSDK_NGX_Parameter_GetUI` would.
+    pub(crate) fn get_u32(&self, name: &str) -> Option<u32> {
+        match self.values.get(name)? {
+            Value::U32(value) => Some(*value),
+            Value::I32(value) => u32::try_from(*value).ok(),
+            Value::U64(value) => u32::try_from(*value).ok(),
+            _ => None,
+        }
+    }
+
     /// Drop every entry; NGX calls this between frames in some paths.
     pub(crate) fn reset(&mut self) {
         self.values.clear();
@@ -242,6 +253,7 @@ pub(crate) struct NgxMap {
     set_f32: Option<unsafe extern "C" fn(*mut c_void, *const c_char, f32)>,
     set_d3d12: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void)>,
     set_void: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void)>,
+    get_u32: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut u32) -> u32>,
 }
 
 impl NgxMap {
@@ -253,6 +265,7 @@ impl NgxMap {
         set_f32: Option<unsafe extern "C" fn(*mut c_void, *const c_char, f32)>,
         set_d3d12: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void)>,
         set_void: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void)>,
+        get_u32: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut u32) -> u32>,
     ) -> Self {
         Self {
             object,
@@ -262,6 +275,7 @@ impl NgxMap {
             set_f32,
             set_d3d12,
             set_void,
+            get_u32,
         }
     }
 
@@ -287,6 +301,7 @@ impl NgxMap {
             set_f32: unsafe { vtable_setter(object, SLOT_SET_F32) },
             set_d3d12: unsafe { vtable_setter(object, SLOT_SET_D3D12) },
             set_void: unsafe { vtable_setter(object, SLOT_SET_VOID) },
+            get_u32: unsafe { vtable_setter(object, SLOT_GET_U32) },
         }
     }
 
@@ -329,6 +344,14 @@ impl NgxMap {
 
     fn set_void_pointer(&mut self, name: &str, value: *mut c_void) {
         Self::set_pointer(self.set_void, self.object, name, value);
+    }
+
+    fn get_u32(&mut self, name: &str) -> Option<u32> {
+        let get = self.get_u32?;
+        let name = Self::c_name(name)?;
+        let mut value = 0u32;
+        let result = unsafe { get(self.object, name.as_ptr(), &mut value) };
+        (result == NGX_SUCCESS).then_some(value)
     }
 }
 
@@ -394,6 +417,20 @@ impl NgxParams {
         match &mut self.kind {
             Kind::Owned(table) => table.set_d3d12_resource(name, resource),
             Kind::Ngx(map) => map.set_d3d12_resource(name, resource),
+        }
+    }
+
+    /// `NVSDK_NGX_Parameter_GetUI`: read an integer back out of the map.
+    ///
+    /// NGX writes its own verdicts into the map it is given
+    /// (`SuperSampling.Available` from the capability map,
+    /// `SuperSampling.FeatureInitResult` from `CreateFeature`), so this is how
+    /// the viewer asks "did the feature really initialise?" instead of assuming
+    /// success from a `Success` HRESULT.
+    pub(crate) fn get_u32(&mut self, name: &str) -> Option<u32> {
+        match &mut self.kind {
+            Kind::Owned(table) => table.get_u32(name),
+            Kind::Ngx(map) => map.get_u32(name),
         }
     }
 

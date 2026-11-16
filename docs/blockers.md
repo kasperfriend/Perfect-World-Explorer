@@ -758,89 +758,130 @@ done.
   not a licence to invent a prototype; a wrong prototype inside a graphics
   driver is a process kill.
 
-## B-22 — DLSS initialises and creates its feature, then every evaluate is `0xbad00005` (hardware report, RTX 3080)
+## B-22 — DLSS initialises and creates its feature, then every evaluate is `0xbad00005` (hardware reports, RTX 3080)
 
-- **Report:** `session-2.log`, 107 lines. The crash is gone and the bootstrap is
-  healthy:
-  * `[NGX] initialised through NVSDK_NGX_D3D12_Init (SDK API 0x0015)`,
-  * `[DLSS] NGX ready (API 0x15, core …\_nvngx.dll)`, DLSS created at quality,
-  * `[DLSS] super resolution ready (quality, 2293x913 -> 3440x1369)`.
+- **Report 1** (`session-2.log`): NGX initialises
+  (`[NGX] initialised through NVSDK_NGX_D3D12_Init (SDK API 0x0015)`), DLSS
+  creates its feature (`[DLSS] super resolution ready (quality, 2293x913 ->
+  3440x1369)`), and every `NVSDK_NGX_D3D12_EvaluateFeature(DLSS)` then fails
+  `0xbad00005 FAIL_InvalidParameter`. Above each attempt:
+  `[NGX] no NVSDK_NGX_Parameter_Set* helpers were exported by the core or the
+  snippet; the viewer's own parameter table is in use`, plus four
+  `[FSR] … CreateCommittedResource failed … (HRESULT 0x80070057)`.
+- **Report 2** (`session-3.log`, after the parameter-map fix): NGX now hands out
+  its own map (`[NGX] parameter map: NGX's own, from
+  NVSDK_NGX_D3D12_AllocateParameters (written through its vtable)`), and the
+  four `CreateCommittedResource failed … 0x80070057` lines are still there —
+  every texture, every size — followed by the same
+  `EvaluateFeature(DLSS) failed (0xbad00005)`.
 
-  What still fails, six times, is the evaluation:
-  `NVSDK_NGX_D3D12_EvaluateFeature(DLSS) failed (0xbad00005 FAIL_InvalidParameter)`.
-  Immediately above each attempt sit two lines that had never been reached
-  before:
-  * `[NGX] no NVSDK_NGX_Parameter_Set* helpers were exported by the core or the
-    snippet; the viewer's own parameter table is in use`,
-  * four `[FSR] … CreateCommittedResource failed … (HRESULT 0x80070057)` for the
-    DLSS colour, depth, motion-vector and output textures, each "succeeding"
-    only through the `"custom heap, L1 pool"` fallback.
+### Cause 1 — `D3D12_HEAP_PROPERTIES` broke its own validity rule (the real bug)
 
-- **Cause 1 — the parameter-map ladder was inverted.** `new_parameters`
-  required the exported `NVSDK_NGX_Parameter_Set*` *setters* before it would
-  even try to obtain an NGX-owned map, and it bailed out to the viewer's own
-  table when they were missing. Nothing in the vendored 310.9.16 build exports
-  them:
+`create_in_heap` passed `CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE`
+for **every** heap type. `ns-d3d12-d3d12_heap_properties` states the rule
+exactly:
 
-  ```
-  $ objdump -p sdk/nvngx_dlss.dll | grep NVSDK_NGX_Parameter   # nothing
-  ```
+> When **Type** is `D3D12_HEAP_TYPE_CUSTOM`, **CPUPageProperty** and
+> **MemoryPoolPreference** must not be `..._UNKNOWN`.
+> When **Type** is not `D3D12_HEAP_TYPE_CUSTOM`,
+> **CPUPageProperty** and **MemoryPoolPreference** must be `..._UNKNOWN`.
 
-  `nvngx_dlss.dll` 310.9.16 exports no `NVSDK_NGX_Parameter_*` name at all, nor
-  `…AllocateParameters`, `…GetCapabilityParameters` or `…GetParameters` — those
-  belong to NGX Core (`_nvngx.dll`), and the feature plugin only exports
-  `…D3D12_Init*`, `…D3D12_CreateFeature`, `…D3D12_EvaluateFeature`,
-  `…D3D12_ReleaseFeature`, `…D3D12_PopulateParameters_Impl` and friends. So the
-  allocator ladder (`AllocateParameters` → `GetCapabilityParameters` →
-  `GetParameters`) was skipped on every run, and NGX was handed a map it did not
-  create — the documented `FAIL_InvalidParameter` case.
-- **Fixed:** the ladder runs *first*, the setters are no longer a precondition,
-  and a map handed out by Core is filled through **its own vtable**
-  (`NgxMap::through_vtable`) — the eight `Set` overloads are slots 0–7 of
-  `NVSDK_NGX_Parameter`, in the declaration order of `nvsdk_ngx_params.h:55–73`,
-  so no exported helper is needed to write into it. The viewer's own table is
-  now reached only when every allocator declines, and that message says so.
-  `NVSDK_NGX_D3D12_PopulateParameters_Impl` is deliberately *not* called: no
-  header declares it (B-21's rule), and it is not needed once Core allocates the
-  map.
-- **Cause 2 — committed resources were created with adapter mask `0`.** The
-  `D3D12_HEAP_PROPERTIES` in `create_in_heap` passed `CreationNodeMask: 0,
-  VisibleNodeMask: 0` with a comment claiming that is what wgpu does. For a
-  committed resource the mask is a bitmask of adapters and `0` names none, so
-  `CreateCommittedResource` answers `E_INVALIDARG`
-  (`0x80070057`) — exactly the four failures in the log, and the reason every
-  DLSS texture came out of the `"custom heap, L1 pool"` retry instead of the
-  default heap NGX expects its inputs in. **Fixed:** both masks are `1`
-  (adapter 0). The fallback stays in the matrix as a probe, but it should stop
-  firing.
-- **Cause 3 — the DLSS feature was created without the node-mask parameters.**
-  `NGX_D3D12_CREATE_DLSS_EXT` (`nvsdk_ngx_helpers_d3d.h:283-284`) sets
-  `NVSDK_NGX_Parameter_CreationNodeMask` and `…_VisibilityNodeMask` on every
-  create, plus `DLSS.Enable.Output.Subrects`. The viewer set none of them, so
-  the feature was created with an adapter mask of `0` and validated at evaluate
-  time — the same mistake as cause 2, one layer up. **Fixed:** all three are set
-  (`1`, `1`, `0`).
-- **Diagnostics added:** the run now names the feature module and its version
-  (`[NGX] feature module …\nvngx_dlss.dll version 310.9.16`), warns when an
-  installed snippet predates DLSS 4 (`major < 310`), and prints each module's
-  parameter surface (`[NGX] parameter surface of this core: …`), plus one line
-  per allocator it tries. A report therefore distinguishes "the core gave us its
-  map" from "we fell back to ours" without guessing.
-- **On the version question — this is not an old-SDK problem.** The vendored
-  binaries are `nvngx_dlss.dll` 310.9.16 (58,956,912 B) and `nvngx_dlssg.dll`
-  310.9.16 (7,506,544 B), i.e. exactly `NVIDIA/DLSS` `v310.9.16` — the newest
-  release — and the driver's core reports `32.0.16.2114`. The `0xbad00005` was a
-  parameter-table and texture-allocation defect, and no older DLL is involved.
-- **Frame Generation is hardware-gated, on purpose.** DLSS-FG (including 4×
-  Multi Frame Generation, which reorders/duplicates frames on the GPU) needs an
-  RTX 40/50-series GPU. On an RTX 3080 the Graphics tab lists DLSS Frame
-  Generation as disabled with the reason (`support_framegen`,
-  `GpuFacts::supports_dlss_frame_generation`), and Multi Frame Generation above
-  ×2 is disabled everywhere it is not reported by the runtime — refusing up front
-  beats a create call that fails. DLSS Super Resolution with the transformer
-  model does run on RTX 20/30-series hardware.
+`NOT_AVAILABLE` is `1`, not `0`, so every `D3D12_HEAP_TYPE_DEFAULT` request was
+`{DEFAULT, NOT_AVAILABLE, UNKNOWN}` — invalid — and `CreateCommittedResource`
+answered `E_INVALIDARG` (`0x80070057`). The custom-heap probe then succeeded
+(`{CUSTOM, NOT_AVAILABLE, L1}` *is* the documented valid custom combination), so
+nothing ever failed loudly: every FSR, XeSS, DLSS-G and DLSS texture in this
+viewer has been created on a **custom heap** instead of the default heap.
+
+That is what NGX rejected. NGX validates the resources it is given — it reads
+their description and their heap — and a custom-heap resource is not the
+default-heap resource its kernels and views are built for, so
+`EvaluateFeature(DLSS)` answered `FAIL_InvalidParameter` however correct the
+formats (they were: `R8G8B8A8_UNORM`, `R32_FLOAT`, `R16G16_FLOAT`,
+`R8G8B8A8_UNORM`+UAV) and the sizes were.
+
+**Fixed:** `CPUPageProperty` is `..._UNKNOWN` for every non-custom heap and
+`NOT_AVAILABLE` only for `D3D12_HEAP_TYPE_CUSTOM`. The probe matrix stays as a
+safety net, and `NativeTexture2D::heap_kind()` now queries `GetHeapProperties`
+on the resource it actually got, so the log says which heap won instead of
+leaving it to inference:
+`[DLSS] textures: colour default heap, depth default, motion vectors default,
+output default`.
+
+**Correction to the first report's diagnosis:** the `CreationNodeMask: 0` →
+`1` change made no difference and was never the bug. The same page says
+"passing zero is equivalent to passing one, in order to simplify the usage of
+single-GPU adapters", which is why wgpu-hal's own zero-buffer allocation passes
+zeros. The masks stay at `1` because they are explicit, not because they fix
+anything.
+
+### Cause 2 — the parameter map was a `AllocateParameters` map, not a capability map
+
+`NVSDK_NGX_D3D12_GetCapabilityParameters` allocates a map **pre-populated** with
+NGX's capabilities; `AllocateParameters` does not
+(`nvsdk_ngx.h:346-359, 393-403`). NVIDIA's own DLSS samples create *and*
+evaluate with the capability map, and the helpers warn about exactly this case
+("You used NVSDK_NGX_AllocateParameters() for creating InParams. Try using
+NVSDK_NGX_GetCapabilityParameters() instead", `nvsdk_ngx_helpers.h`). The ladder
+now prefers `GetCapabilityParameters`, then `AllocateParameters`, then the
+deprecated `GetParameters`.
+
+### Cause 3 — required extent keys were only written at create time
+
+`EvaluateFeature` answers `FAIL_InvalidParameter` for a *missing* required entry,
+not only a wrong one. `Width`, `Height`, `OutWidth`, `OutHeight` and the DLSS 4
+era `ResourceWidth`/`ResourceHeight`/`ResourceOutWidth`/`ResourceOutHeight`
+(`nvsdk_ngx_defs.h:747-750`) are now written on every evaluate, not just once.
+
+### Cause 4 — the parameter-map ladder was inverted (fixed in `cf98e3b`… `3fb19e7`)
+
+The previous build required the exported `NVSDK_NGX_Parameter_Set*` setters
+before asking Core for a map. Neither the vendored `nvngx_dlss.dll` nor the
+driver's `_nvngx.dll` exports them — `session-3.log` lists the core's entire
+parameter surface and it is nothing but `*Parameters` allocators — so the ladder
+was skipped. Core's map is now filled through its own vtable (the eight `Set`
+overloads are slots 0-7 of `NVSDK_NGX_Parameter`, `nvsdk_ngx_params.h:55-73`).
+
+### What is verified rather than assumed
+
+* every parameter name the viewer writes was diffed against
+  `nvsdk_ngx_defs.h` (38 keys, all exact) and every overload type against
+  `nvsdk_ngx_helpers_d3d.h:297-365` (`SetF` for jitter/sharpness/MV scale/
+  pre-exposure, `SetUI` for extents/subrects/tonemapper, `SetI` for
+  reset/create-flags/output-subrects/invert-axes);
+* `EvaluateFeature` cannot see D3D12 resource *states*, so a missing barrier
+  cannot produce `FAIL_InvalidParameter`; what it can inspect is the handle, the
+  map entries, and each resource's description and heap — which is why the heap
+  is the suspect that fits every observation;
+* the formats are the ones the DLSS samples use, and `heap_kind()` now proves
+  the heap.
+
+### Diagnostics added in this round
+
+`[DLSS] NGX reports SuperSampling.Available = …` before create,
+`[DLSS] feature init result: …` (NGX's own verdict, read back out of the map)
+after create, `[DLSS] textures: … heap` for all four resources, and the
+`[NGX] parameter map: NGX's own, from …` line that already existed.
+
 - **Status:** fixed in source; needs one hardware report. A working run shows
-  `[NGX] parameter surface of this core: …` followed by
-  `[NGX] parameter map: NGX's own, from <allocator>`, no `CreateCommittedResource
-  failed` block, and then `[DLSS] first evaluate OK …` /
-  `[upscaler] DLSS (quality) … running …`.
+  `[DLSS] textures: colour default heap, …` (no `CreateCommittedResource
+  failed` block at all), `[DLSS] feature init result: 0x00000001 Success`, then
+  `[DLSS] first evaluate OK …` and `[upscaler] DLSS (quality) … running …`.
+  If evaluate still fails, the next artifact to look at is NGX's own log in
+  `C:\Users\<user>\AppData\Local\PerfectWorldExplorer\NGX`.
+
+### The version question
+
+The vendored binaries are `nvngx_dlss.dll` 310.9.16 and `nvngx_dlssg.dll`
+310.9.16 — exactly `NVIDIA/DLSS` `v310.9.16`, the newest release — and the
+driver's core reports `32.0.16.2114`. `0xbad00005` was never an SDK-age problem.
+
+### Frame Generation is hardware-gated, on purpose
+
+DLSS-FG (including 4× Multi Frame Generation, which reorders and duplicates
+frames on the GPU) needs an RTX 40/50-series GPU. On an RTX 3080 the Graphics
+tab lists DLSS Frame Generation as disabled with the reason
+(`support_framegen`, `GpuFacts::supports_dlss_frame_generation`), and
+multipliers above ×2 stay disabled wherever the runtime does not report them.
+DLSS Super Resolution with the transformer model does run on RTX 20/30-series
+hardware.

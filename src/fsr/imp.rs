@@ -525,6 +525,29 @@ fn fallback_matrix(dxgi_format: DXGI_FORMAT, allow_format_twins: bool) -> Vec<Cr
 }
 
 impl NativeTexture2D {
+    /// Which D3D12 heap this allocation actually lives in (diagnostics).
+    ///
+    /// NGX validates the resources it is handed, and a resource out of the
+    /// custom-heap probe is not the same thing as a default-heap one — so the
+    /// log names the heap that won instead of leaving it to inference.
+    pub(crate) fn heap_kind(&self) -> &'static str {
+        let mut properties: d3d12_ty::D3D12_HEAP_PROPERTIES = unsafe { std::mem::zeroed() };
+        let mut flags: d3d12_ty::D3D12_HEAP_FLAGS = 0;
+        let hr = unsafe {
+            (*(self.resource.as_mut_ptr())).GetHeapProperties(&mut properties, &mut flags)
+        };
+        if !hr_ok(hr) {
+            return "unknown";
+        }
+        match properties.Type {
+            d3d12_ty::D3D12_HEAP_TYPE_DEFAULT => "default",
+            d3d12_ty::D3D12_HEAP_TYPE_UPLOAD => "upload",
+            d3d12_ty::D3D12_HEAP_TYPE_READBACK => "readback",
+            d3d12_ty::D3D12_HEAP_TYPE_CUSTOM => "custom",
+            _ => "unknown",
+        }
+    }
+
     /// # Safety
     /// The caller guarantees the wgpu device was created by `raw_device`.
     pub(crate) unsafe fn create(
@@ -640,16 +663,36 @@ impl NativeTexture2D {
             Layout: d3d12_ty::D3D12_TEXTURE_LAYOUT_UNKNOWN,
             Flags: resource_flags,
         };
-        // `CreateCommittedResource` rejects a heap whose node masks are 0 with
-        // `E_INVALIDARG` (`0x80070057`) — for a committed resource the mask is a
-        // bitmask of adapters and must name at least one. A single-GPU machine
-        // wants 1. Leaving these at 0 is why every DLSS texture used to fall
-        // through to the "custom heap, L1 pool" quirk below, and NGX then
-        // answered `EvaluateFeature(DLSS) -> 0xbad00005 FAIL_InvalidParameter`
-        // about resources that came out of a heap it does not expect.
+        // `D3D12_HEAP_PROPERTIES` has one validity rule that this function used
+        // to break for every heap it ever asked for. From
+        // `ns-d3d12-d3d12_heap_properties` ("Valid combinations of struct
+        // member values"):
+        //
+        //   * when `Type` is `D3D12_HEAP_TYPE_CUSTOM`, `CPUPageProperty` and
+        //     `MemoryPoolPreference` must *not* be `..._UNKNOWN`;
+        //   * when `Type` is **not** `D3D12_HEAP_TYPE_CUSTOM`, both must
+        //     `..._UNKNOWN`.
+        //
+        // This passed `D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE` (= 1, not 0) with
+        // `D3D12_HEAP_TYPE_DEFAULT`, so `CreateCommittedResource` answered
+        // `E_INVALIDARG` (`0x80070057`) for every single texture — all sizes,
+        // all formats — and each one was then created through the custom-heap
+        // probe below. Those resources are legal D3D12, but they are not the
+        // default-heap resources NGX builds its views and kernels against, and
+        // `NVSDK_NGX_D3D12_EvaluateFeature(DLSS)` rejected them with
+        // `0xbad00005 FAIL_InvalidParameter`.
+        //
+        // `CreationNodeMask`/`VisibleNodeMask` are not part of the problem:
+        // "passing zero is equivalent to passing one, in order to simplify the
+        // usage of single-GPU adapters" (same page). They stay at 1 for clarity.
+        let custom = heap_type == d3d12_ty::D3D12_HEAP_TYPE_CUSTOM;
         let heap = d3d12_ty::D3D12_HEAP_PROPERTIES {
             Type: heap_type,
-            CPUPageProperty: d3d12_ty::D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+            CPUPageProperty: if custom {
+                d3d12_ty::D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE
+            } else {
+                d3d12_ty::D3D12_CPU_PAGE_PROPERTY_UNKNOWN
+            },
             MemoryPoolPreference: memory_pool,
             CreationNodeMask: 1,
             VisibleNodeMask: 1,

@@ -66,6 +66,19 @@ const P_COLOR: &str = "Color";
 const P_DEPTH: &str = "Depth";
 const P_MOTION_VECTORS: &str = "MotionVectors";
 const P_OUTPUT: &str = "Output";
+/// `NVSDK_NGX_Parameter_SuperSampling_Available` / `…FeatureInitResult`:
+/// NGX's own verdicts, written into the map it was handed. Reading them back is
+/// how the viewer knows whether DLSS is supported at all and whether the feature
+/// really initialised, instead of trusting a `Success` HRESULT.
+const P_SUPER_SAMPLING_AVAILABLE: &str = "SuperSampling.Available";
+const P_FEATURE_INIT_RESULT: &str = "SuperSampling.FeatureInitResult";
+/// `NVSDK_NGX_Parameter_Resource_*`: the dimensions of the *resources* holding
+/// each image, which only differ from `Width`/`Height` when subrects are used.
+/// This viewer hands over whole resources, so they repeat the extents.
+const P_RESOURCE_WIDTH: &str = "ResourceWidth";
+const P_RESOURCE_HEIGHT: &str = "ResourceHeight";
+const P_RESOURCE_OUT_WIDTH: &str = "ResourceOutWidth";
+const P_RESOURCE_OUT_HEIGHT: &str = "ResourceOutHeight";
 const P_JITTER_X: &str = "Jitter.Offset.X";
 const P_JITTER_Y: &str = "Jitter.Offset.Y";
 const P_RESET: &str = "Reset";
@@ -180,7 +193,11 @@ impl DlssNatives {
             format,
             dxgi_output_format(format),
             render_extent,
-            d3d12_ty::D3D12_RESOURCE_FLAG_NONE,
+            // A render-target flag on top of the plain SRV the feature needs:
+            // NGX is handed the viewer's colour buffer, which in every DLSS
+            // sample is a render target, and a resource that cannot be a render
+            // target at all is one more thing for its validation to reject.
+            d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
             wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
             D3D12_STATE_COMMON,
             false,
@@ -219,11 +236,19 @@ impl DlssNatives {
             format.remove_srgb_suffix(),
             dxgi_output_format(format),
             display_extent,
-            d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
+                | d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             D3D12_STATE_COMMON,
             true,
         )?;
+        crate::dlss::diag(&format!(
+            "[DLSS] textures: colour {} heap, depth {}, motion vectors {}, output {}",
+            color.heap_kind(),
+            depth.heap_kind(),
+            mv.heap_kind(),
+            output.heap_kind()
+        ));
         Ok(Self {
             color,
             depth,
@@ -302,6 +327,14 @@ impl DlssUpscaler {
             api.core_path()
         ));
 
+        match params.get_u32(P_SUPER_SAMPLING_AVAILABLE) {
+            Some(available) => crate::dlss::diag(&format!(
+                "[DLSS] NGX reports SuperSampling.Available = {available}"
+            )),
+            None => crate::dlss::diag(
+                "[DLSS] the parameter map does not carry SuperSampling.Available (not a capability map)",
+            ),
+        }
         params.set_u32(P_WIDTH, render_extent.0.max(1));
         params.set_u32(P_HEIGHT, render_extent.1.max(1));
         params.set_u32(P_OUT_WIDTH, display_extent.0.max(1));
@@ -336,6 +369,15 @@ impl DlssUpscaler {
             ));
         }
         let _ = ring.retire(slot_index, &raw_queue, "DLSS");
+        match params.get_u32(P_FEATURE_INIT_RESULT) {
+            Some(result) => crate::dlss::diag(&format!(
+                "[DLSS] feature init result: {}",
+                crate::dlss::result_name(result)
+            )),
+            None => {
+                crate::dlss::diag("[DLSS] the parameter map has no SuperSampling.FeatureInitResult")
+            }
+        }
 
         crate::dlss::diag(&format!(
             "[DLSS] super resolution ready ({quality_name}, {}x{} -> {}x{})",
@@ -615,6 +657,25 @@ impl DlssUpscaler {
             .set_u32(P_RENDER_WIDTH, self.render_extent.0.max(1));
         self.params
             .set_u32(P_RENDER_HEIGHT, self.render_extent.1.max(1));
+        // The extents again, and the `Resource*` twins. NGX checks the resources
+        // in the map against the feature it created, and `EvaluateFeature` is
+        // documented to answer `FAIL_InvalidParameter` when a required entry is
+        // missing rather than when it is wrong — so every extent key the header
+        // names is written on every evaluate, not only at create.
+        let (render_width, render_height) = self.render_extent;
+        let (display_width, display_height) = self.display_extent;
+        for (name, value) in [
+            (P_WIDTH, render_width.max(1)),
+            (P_HEIGHT, render_height.max(1)),
+            (P_OUT_WIDTH, display_width.max(1)),
+            (P_OUT_HEIGHT, display_height.max(1)),
+            (P_RESOURCE_WIDTH, render_width.max(1)),
+            (P_RESOURCE_HEIGHT, render_height.max(1)),
+            (P_RESOURCE_OUT_WIDTH, display_width.max(1)),
+            (P_RESOURCE_OUT_HEIGHT, display_height.max(1)),
+        ] {
+            self.params.set_u32(name, value);
+        }
 
         let result = unsafe {
             (self.api.evaluate_feature)(
