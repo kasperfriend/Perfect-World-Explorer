@@ -493,12 +493,12 @@ impl Draw {
                 write_depth: quad.mesh.as_ref().is_some_and(|mesh| mesh.write_depth),
             };
             let position = if groups.last_mut().is_some_and(|(last_key, _)| {
-                    last_key.layer == quad.layer
+                last_key.layer == quad.layer
                     && last_key.pipeline == pipeline
                     && last_key.priority == quad.priority
                     && last_key.tile == quad.tile
                     && last_key.texture == quad.texture.as_str()
-           }) {
+       }) {
                 groups.len() - 1
             } else {
                 let key = BucketKey {
@@ -511,17 +511,17 @@ impl Draw {
                 match self.scratch_index.get(&key) {
                     Some(position) => *position,
                     None => {
-                           let verts = self
-                               .scratch_pool
-                               .pop()
-                               .map(|mut v| {
-                                      v.clear();
-                                      v
-                                  })
-                               .unwrap_or_default();
-                           self.scratch_index.insert(key.clone(), groups.len());
-                           groups.push((key, verts));
-                           groups.len() - 1
+                       let verts = self
+                           .scratch_pool
+                           .pop()
+                           .map(|mut v| {
+                                  v.clear();
+                                  v
+                              })
+                           .unwrap_or_default();
+                       self.scratch_index.insert(key.clone(), groups.len());
+                       groups.push((key, verts));
+                       groups.len() - 1
                    }
                 }
             };
