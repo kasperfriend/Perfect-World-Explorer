@@ -17,14 +17,18 @@
 //!   official [NVIDIA/DLSS](https://github.com/NVIDIA/DLSS) repository
 //!   (`lib/Windows_x86_64/rel/`). The SDK headers they were built from are
 //!   kept under `sdk/include/nvidia/` for reference and review.
-//! * Those two DLLs are NGX *snippets*: they only initialise when NGX **Core**
-//!   (`%SystemRoot%\System32\nvngx.dll`, installed with the display driver)
-//!   drives them — called directly they answer `0xBAD00002`
-//!   (`FAIL_PlatformError`), which is what an earlier revision reported on
-//!   perfectly good RTX hardware. `loader` therefore loads the driver's core,
-//!   initialises it once per device and creates both features through it, with
-//!   the viewer's SDK folder first in `PathListInfo` so the vendored DLSS build
-//!   is the one that runs.
+//! * Those two DLLs are NGX *snippets*: they are driven by NGX **Core**, which
+//!   ships with the display driver (`_nvngx.dll` in the `DriverStore` since
+//!   driver 471.11). Their `Init_Ext` entry point answers `0xBAD00002`
+//!   (`FAIL_PlatformError`) when an application calls it directly, which is
+//!   what an earlier revision reported on perfectly good RTX hardware;
+//!   `Init`/`Init_with_ProjectID` are the SDK-facing ones. `loader` therefore
+//!   loads a core, initialises it once per device and creates both features
+//!   through it, with the viewer's SDK folder first in `PathListInfo` so the
+//!   vendored DLSS build is the one that runs. It tries every core module it
+//!   can find (DriverStore, next to the executable, the viewer's `sdk/`,
+//!   `System32`), because a stale `nvngx.dll` answers `FAIL_OutOfDate`
+//!   (`0xBAD0000C`) to everything newer than itself.
 //! * `NVSDK_NGX_Parameter` is a C++ object. Core allocates it
 //!   (`NVSDK_NGX_D3D12_AllocateParameters`) and exports the `Set*` helpers the
 //!   viewer writes it through; `params` also carries a complete Rust

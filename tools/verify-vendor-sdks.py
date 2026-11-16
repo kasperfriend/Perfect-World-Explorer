@@ -52,9 +52,11 @@ EXPECTED_DLLS = {
 # DLLs the viewer names in `src/` but that are not vendored: they are installed
 # by something else and must never be staged in `sdk/`.
 RUNTIME_DLLS = {
-    # NGX Core: shipped by the display driver as %SystemRoot%\System32\nvngx.dll.
-    # `src/dlss/loader.rs` loads it from there and drives the vendored DLSS
-    # snippets through it; the vendored files stay the only ones in `sdk/`.
+    # NGX Core: shipped by the display driver (DriverStore `_nvngx.dll` since
+    # driver 471.11, older copies `nvngx.dll`, including a legacy one in
+    # %SystemRoot%\System32). `src/dlss/loader.rs` finds it at run time and
+    # drives the vendored DLSS snippets through it; the vendored files stay the
+    # only ones in `sdk/`.
     "nvngx.dll": "NVIDIA display driver (NGX Core)",
 }
 
