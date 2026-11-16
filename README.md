@@ -124,6 +124,7 @@ build.rs                 optional DirectStorage SDK bridge build
 src/                     viewer, parsers, GPU code and diagnostics
 Modules/                 installed module packages copied beside the executable
 tools/package-windows.ps1 shared PR/release portable-package builder
+tools/fetch-directstorage.ps1 downloads/extracts pinned DirectStorage preview
 tools/speedtree/         bridge source, probes and embedded helper
 tools/launcher-art.jpg   embedded launcher image
 Findings/                research, evidence, assessment and roadmap
@@ -138,30 +139,31 @@ The project is marked **GPL-2.0-or-later**; see [LICENSE](LICENSE). BMD and terr
 
 ### Optional Windows DirectStorage archive reads
 
-Windows/MSVC builds can use the Microsoft DirectStorage **system-memory file
-queue** for large (64 KiB and up) PCK payload reads. This is opt-in at build
-time and runtime-safe: if the SDK or runtime is absent, or a request fails, the
-reader transparently uses the existing positioned `ReadFile` path.
-
-On a Windows x64 machine with Visual Studio Build Tools installed, run this in a Visual Studio developer PowerShell. `nuget.exe` must be on `PATH`:
+Windows/MSVC builds can use Microsoft's DirectStorage **system-memory file
+queue** for large (64 KiB and up) PCK payload reads. Fetch the official 1.4
+public-preview package (currently pinned to preview 2) from a Visual Studio
+PowerShell in the repository root:
 
 ```powershell
-$repo = (Get-Location).Path
-nuget install Microsoft.Direct3D.DirectStorage -Version 1.3.0 -OutputDirectory "$repo\sdk\directstorage"
-$env:DIRECTSTORAGE_SDK_DIR = "$repo\sdk\directstorage\Microsoft.Direct3D.DirectStorage.1.3.0"
+.\tools\fetch-directstorage.ps1
+$env:DIRECTSTORAGE_SDK_DIR = "$PWD\sdk\DirectStorage\1.4.0-preview2-2606.904"
 cargo build --release
 
-# Optional: enable the runtime too for this local build. Keep these licensed
-# redistributables beside the EXE; do not commit them to Git.
+# For a local run, copy the preview runtime beside the compiled EXE.
 $runtime = Join-Path $env:DIRECTSTORAGE_SDK_DIR 'native\bin\x64'
 Copy-Item "$runtime\dstorage.dll" 'target\release\'
 Copy-Item "$runtime\dstoragecore.dll" 'target\release\'
 ```
 
-The repository ignores `sdk/directstorage/`, so the locally extracted package
-won't enter a commit. Follow the package's license/redistribution terms when
-copying runtime DLLs. If the SDK path is unset, builds do not compile the bridge;
-if the runtime DLLs are absent, the application falls back to ordinary I/O.
+The fetcher downloads the version-pinned `.nupkg` from NuGet, checks for the
+expected header, x64 runtime files and both package license files, then extracts
+the whole package under `sdk/DirectStorage/`. The build automatically uses that
+pinned directory; `DIRECTSTORAGE_SDK_DIR` only overrides it. The extracted
+package is intentionally not ignored so its contents can be included in a
+checkout/PR if the package's licenses have been reviewed. Preserve
+`LICENSE.txt` and `LICENSE-CODE.txt` when redistributing it. If no SDK is present,
+the build omits the bridge; if the runtime DLLs are absent or a request fails,
+normal file I/O remains the fallback.
 
 The bridge uses the DirectStorage runtime to issue large archive range reads
 into system memory. It does **not** make this client instantly load: scene
