@@ -762,7 +762,13 @@ impl NgxCore {
                 None
             };
             return NgxParams::from_ngx(NgxMap::new(
-                parameters, destroy, set_u32, set_i32, set_f32, set_d3d12, set_void,
+                parameters,
+                destroy,
+                Some(set_u32),
+                Some(set_i32),
+                Some(set_f32),
+                Some(set_d3d12),
+                Some(set_void),
             ));
         }
         super::diag(
