@@ -242,7 +242,7 @@ impl Page {
                                             + source[row1 + x0 + 4 + c] as u32
                                             + 2)
                                             >> 2)
-                                                as u8;
+                                            as u8;
                                     }
                                 }
                             }
@@ -464,9 +464,9 @@ fn run(
     };
     let batch_size = if crate::objects::unbounded_textures() {
         64
-        } else {
+    } else {
         24
-        };
+    };
     for start in (first..limit).step_by(batch_size) {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
@@ -1054,11 +1054,11 @@ impl GpuPage {
                     }
                     if bound != Some(cur_page) {
                         let p = &pages[cur_page];
-                           pass.set_bind_group(
+                       pass.set_bind_group(
                             0,
-                            if reflected { &p.reflected } else { &p.normal },
-                           &[],
-                          );
+                           if reflected { &p.reflected } else { &p.normal },
+                             &[],
+                      );
                         pass.set_vertex_buffer(0, p.vertex.slice(..));
                         pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
                         bound = Some(cur_page);
