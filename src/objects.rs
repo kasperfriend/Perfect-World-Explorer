@@ -603,9 +603,7 @@ impl Objects {
                             self.cache.touch(&key);
                             return None;
                         }
-                        let data = std::fs::read(&path)
-                            .map_err(|e| format!("disk texture {}: {e}", path.display()))?;
-                        self.decode_and_store(&key, &data)
+                        Some(PendingTexture::Disk { key, path })
                     }
                     _ => {
                         self.register(
@@ -615,7 +613,7 @@ impl Objects {
                                 "name truncates to registry key {registry_key:?} (0x77c2e4 -> 0x785d30); the registry is runtime state and no same-named file exists in any staged archive or on disk"
                             ),
                         );
-                        Ok(())
+                        None
                     }
                 }
             }
@@ -632,7 +630,7 @@ impl Objects {
                         }
                     ),
                 );
-                Ok(())
+                None
             }
             Resolution::Archive { mount, key } => {
                 if self.cache.contains(&key) {
