@@ -723,10 +723,14 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
                     objects::Objects::open(element, ornaments).map_err(|e| e.to_string())
                 });
                 let models_task =
-                    s.spawn(|| match world_models::Assets::open(element, placements.clone()) {
-                        Ok(models) => models,
-                        Err(e) => world_models::Assets::load_with(placements, |_| Err(e.clone())),
-                    });
+                    s.spawn(
+                        || match world_models::Assets::open(element, placements.clone()) {
+                            Ok(models) => models,
+                            Err(e) => {
+                                world_models::Assets::load_with(placements, |_| Err(e.clone()))
+                            }
+                        },
+                );
                 let grass_task = s.spawn(|| {
                     grass::Grass::load(&world_scene, &dir, element).map_err(|e| e.to_string())
                 });
@@ -773,10 +777,14 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
                 })?;
             let (models, grass, trees) = std::thread::scope(|s| {
                 let models_task =
-                    s.spawn(|| match world_models::Assets::open(element, placements.clone()) {
-                        Ok(models) => models,
-                        Err(e) => world_models::Assets::load_with(placements, |_| Err(e.clone())),
-                    });
+                    s.spawn(
+                        || match world_models::Assets::open(element, placements.clone()) {
+                            Ok(models) => models,
+                            Err(e) => {
+                                world_models::Assets::load_with(placements, |_| Err(e.clone()))
+                            }
+                        },
+                );
                 let grass_task = s.spawn(|| {
                     grass::Grass::load(&world_scene, &dir, element).map_err(|e| e.to_string())
                 });
@@ -791,7 +799,15 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
                     trees_task.join().unwrap()?,
                 ))
             })?;
-            (water, materials, (water_normals, water_simple_frames), objects, models, grass, trees)
+            (
+                water,
+                materials,
+                (water_normals, water_simple_frames), 
+                objects,
+                models, 
+                grass, 
+                trees,
+            )
         };
     eprintln!(
         "Loaded {} water areas from client BSData grids",
