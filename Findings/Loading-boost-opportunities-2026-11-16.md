@@ -30,4 +30,6 @@
 3. Package x64 runtime DLLs beside the viewer when present and preserve the package license/notices; otherwise explicitly retain ordinary file-I/O fallback.
 4. Confirm both ordinary Windows CI and Linux tests. SDK/hardware throughput still needs a user's machine.
 
+CI run `43980129054` passes on both Linux and Windows, including the SDK-enabled standalone build, audio fixtures, package staging, and artifact-layout audit. However, the checked-in SDK directory still has **no** `native/bin/x64/dstorage.dll` or `dstoragecore.dll`; the staged Windows package therefore exercises the safe standard-I/O fallback, not live DirectStorage. `.gitignore` now permits those official redistributable DLLs. On a Windows checkout with the already-extracted partial package, rerun `tools/fetch-directstorage.ps1 -Force`, then stage the two `native/bin/x64/*.dll` files and preserve the package license/notices before pushing, if you want the PR's portable artifact to actually use DirectStorage. No hardware throughput result is claimed.
+
 The progressive-first-frame split, priority streaming scheduler, and persistent asset-cache proposal remain separate follow-ups because each changes ownership/lifetimes and needs client-asset measurements. No amount of these software changes guarantees an instant cold read from arbitrary storage or hardware.
