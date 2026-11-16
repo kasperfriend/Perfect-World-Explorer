@@ -331,7 +331,9 @@ let mut g_start = 0usize;
             g_start = g_end;
         }
         let process_group = |&(index, group): &(usize, &[(usize, usize, usize)])| {
-            let name = names.get(index).ok_or_else(|| "grass BSData index".to_string())?;
+            let name = names
+                .get(index)
+                .ok_or_else(|| "grass BSData index".to_string())?;
             let path = water::resolve_case_insensitive(dir, name).map_err(|e| e.to_string())?;
             let data = fs::read(path).map_err(|e| e.to_string())?;
             if u(&data, 0).map_err(|e| e.to_string())? != 0x42584f4d
@@ -431,7 +433,10 @@ let mut g_start = 0usize;
                         s.spawn(move || chunk.iter().map(process).collect::<Vec<_>>())
                     })
                     .collect();
-                handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                .collect()
             })
         } else {
             groups.iter().map(process_group).collect()
@@ -470,7 +475,7 @@ let mut g_start = 0usize;
                         let archive = &archive;
                         s.spawn(move || {
                             chunk.iter().map(|t| {
-            
+
                                 // A grass type may name either the `.mox` geometry directly or the
                                 // `.mod` text container that wraps it. The archive ships both (155
                                 // `.mox` and 144 `.mod`); the `.mod` is a one-child manifest, so
@@ -484,7 +489,7 @@ let mut g_start = 0usize;
                                            .and_then(|e| {
                                                pck::read_entry_at(archive, e)
                                                    .map_err(|e| e.to_string())
-                                            })   
+                                            })
                                         .and_then(|b| mox_wrapper_child(&b))
                                     {
                                         Ok(child) => {
@@ -524,44 +529,44 @@ let mut g_start = 0usize;
                             })
                         })
                         .collect();
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
                 });
-                for chunk in chunks {
-                    models.extend(chunk);
-                }
+            for chunk in chunks {
+                models.extend(chunk);
+            }
         } 
         for m in models.iter().flatten() {
-                for mesh in &m.meshes {
-                    if !textures.contains_key(&mesh.texture) {
-                        let alt = mesh.texture.replace("/textures/", "/");
-                        // One retail asset names its DDS with a space while the
-                        // matching archive member uses an underscore.
-                        let spaced = mesh.texture.replace(' ', "_");
-                        let entry = entries
-                            .get(&mesh.texture)
-                            .or_else(|| entries.get(&alt))
-                            .or_else(|| entries.get(&spaced));
-                        if let Some(entry) = entry {
-                            if let Ok(bytes) = pck::read_entry(&mut archive, entry) {
-                                if let Ok(img) = image::load_from_memory(&bytes) {
-                                    textures.insert(mesh.texture.clone(), img.to_rgba8());
-                                    match crate::vegetation_textures::authored_lower_mips(&bytes) {
-                                        Ok(mips) => {
-                                            texture_mips.insert(mesh.texture.clone(), mips);
-                                        }
-                                        Err(e) => eprintln!(
-                                            "Grass texture {} authored mips unavailable: {e}",
-                                            mesh.texture
-                                        ),
+            for mesh in &m.meshes {
+                if !textures.contains_key(&mesh.texture) {
+                    let alt = mesh.texture.replace("/textures/", "/");
+                    // One retail asset names its DDS with a space while the
+                    // matching archive member uses an underscore.
+                    let spaced = mesh.texture.replace(' ', "_");
+                    let entry = entries
+                        .get(&mesh.texture)
+                        .or_else(|| entries.get(&alt))
+                        .or_else(|| entries.get(&spaced));
+                    if let Some(entry) = entry {
+                        if let Ok(bytes) = pck::read_entry(&mut archive, entry) {
+                            if let Ok(img) = image::load_from_memory(&bytes) {
+                                textures.insert(mesh.texture.clone(), img.to_rgba8());
+                                match crate::vegetation_textures::authored_lower_mips(&bytes) {
+                                    Ok(mips) => {
+                                        texture_mips.insert(mesh.texture.clone(), mips);
                                     }
-                                    continue;
+                                    Err(e) => eprintln!(
+                                        "Grass texture {} authored mips unavailable: {e}",
+                                        mesh.texture
+                                    ),
                                 }
+                                continue;
                             }
                         }
-                        warnings.insert(mesh.texture.clone());
                     }
+                    warnings.insert(mesh.texture.clone());
                 }
             }
+        }
     
         for path in &warnings {
             eprintln!("Missing or unsupported grass texture: {path}");
