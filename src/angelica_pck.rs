@@ -58,7 +58,7 @@ fn record_ending_at(blob: &[u8], end: usize) -> Result<([u8; 276], usize), Strin
             let input = &blob[start..end];
             decoder.reset(true);
             let Ok(status) = decoder.decompress(input, &mut out, FlushDecompress::Finish) else {
-               continue;
+                continue;
             };
             if status == flate2::Status::StreamEnd
                 && decoder.total_out() == 276
@@ -118,7 +118,7 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
         let offset = u32le(&record, 260)?;
         let usize_ = u32le(&record, 264)?;
         let compressed = u32le(&record, 268)?;
-        if offset as u64 + compressed as u64 > file_len       
+        if offset as u64 + compressed as u64 > file_len   
             || usize_ > 512 * 1024 * 1024
             || compressed > usize_
         {
