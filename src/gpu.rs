@@ -3221,7 +3221,7 @@ impl Renderer {
         if !camera.water_reflections {
             let mut e = self.device.create_command_encoder(&Default::default());
             for batch in &visible {
-             if batch.simple {               
+                if batch.simple {               
                     self.simple_water.draw(
                         &mut e,
                         scene_target_raw,
@@ -3288,7 +3288,7 @@ impl Renderer {
             return;
         }
         let mut simple_encoder: Option<wgpu::CommandEncoder> = None;
-    for (batch_idx, batch) in visible.iter().enumerate() {
+        for (batch_idx, batch) in visible.iter().enumerate() {
             if batch.simple {
                 if simple_encoder.is_none() {
                     let enc = self.device.create_command_encoder(&Default::default());
@@ -4434,7 +4434,7 @@ pub fn run(
                          let (tx, rx) = std::sync::mpsc::sync_channel(
                              if crate::objects::unbounded_textures() { 8 } else { 2 },
                          );
-                         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));   
+                         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
                             std::thread::Builder::new().name("whole-world-objects".into()).spawn(move ||crate::world_objects::build(root,ornaments,tx,c)).expect("world preload thread");
                             world_rx=Some(rx);world_cancel=Some(cancel);world_status=String::from("Loading world objects...");
