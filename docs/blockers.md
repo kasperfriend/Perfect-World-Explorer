@@ -522,3 +522,44 @@ done.
 - **If `nvngx.dll` is missing:** a driver install cleaned by NVCleanstall/DDU
   can omit the NGX component. The error names the path it tried.
 - **Status:** open on hardware (needs a re-report on the 3080).
+
+## B-16 — "DLSS is blurry at Quality" and per-upscaler sharpening (screen report)
+
+- **Report:** DLSS at `upscale_quality=quality` looked blurry next to FSR, even
+  though the same quality entry is 1.5× on both.
+- **What the ratios show:** they are identical and match the vendor tables
+  (`src/main.rs::internal_factor`): Quality `1/1.5`, Balanced `1/1.7`,
+  Performance `0.5`, Ultra Performance `1/3`. So the softness was not a wrong
+  render resolution — it was the reconstruction pipeline.
+- **Cause 1 — motion-vector units.** DLSS assumes the motion-vector buffer is at
+  *output* resolution unless `NVSDK_NGX_DLSS_Feature_Flags_MVLowRes` is set, and
+  this viewer writes them at *render* resolution. At Quality that made NGX read
+  1.5× more motion than the world actually had, so history was matched to the
+  wrong pixels and detail was averaged away. XeSS is the mirror image: its
+  `XESS_INIT_FLAG_HIGH_RES_MV` (1<<0) is what requests *output*-resolution
+  vectors, so leaving it clear — as the viewer does — is already correct for
+  render-resolution vectors, and `XESS_INIT_FLAG_USE_NDC_VELOCITY` (1<<4) stays
+  clear because the vectors are in pixels. `MV.Scale.X/Y` stays 1.0 for the same
+  reason (already in pixels).
+- **Cause 2 — no sharpening at all.** DLSS was handed a hard-coded
+  `Sharpness = 0`, i.e. none, while FSR arrives with RCAS at 0.75. The vendored
+  header deprecates `NVSDK_NGX_DLSS_Feature_Flags_DoSharpening`
+  (`nvsdk_ngx_defs.h`: "Sharpness is not supported") but still honours
+  `NVSDK_NGX_Parameter_Sharpness` (`"Sharpness"`), which is what the new
+  `dlss_sharpness` setting drives.
+- **Cause 3 — frame time.** `InFrameTimeDeltaInMsec` was unset, so NGX had no
+  idea how fast content moved and kept its accumulation at whatever its default
+  is. It is now measured per evaluate call.
+- **Sharpening for every provider:** `fsr1_sharpness` (RCAS stops),
+  `fsr3_sharpness` (FFX, now also shown for FSR 2), `dlss_sharpness` (NGX) and
+  `xess_sharpness` (the viewer's own pass in `FsrComposite`, because Intel's SDK
+  3.0.2 has no sharpening control). Defaults: 0.2 / 0.75 / 0.35 / 0.35.
+- **Verified here:** the WGSL compiles through a WGSL parser (`wgsl_reflect`:
+  entry points and the group-0 binding layout match the Rust bind group), every
+  constant used was read out of the vendored headers, the settings round-trip
+  test covers both new keys, and rustfmt + the tree-sitter syntax check pass.
+- **Not verified:** how it *looks*. There is no GPU in this environment, so the
+  sharpness defaults (0.35) are a judgement call, and the claim that MVLowRes
+  removes the softness needs a screen report on the RTX 3080. If 0.35 is too
+  much, the slider goes to 0 for the raw vendor look.
+- **Status:** open on hardware (re-report needed: Quality at 0 / 0.35 / 0.75).
