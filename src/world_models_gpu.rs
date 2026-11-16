@@ -112,6 +112,7 @@ pub struct AlphaStatus {
 
 pub struct World {
     assets: Assets,
+    keep_unbounded: bool,
     slots: Vec<Slot>,
     read: Box<dyn FnMut(&str) -> Result<Vec<u8>, String>>,
     textures: HashMap<String, (std::sync::Arc<wgpu::Texture>, bool)>,
@@ -231,6 +232,7 @@ impl World {
         });
         Ok(Self {
             assets,
+            keep_unbounded: false,
             slots,
             read: Box::new(read),
             textures: HashMap::new(),
@@ -272,6 +274,8 @@ impl World {
         })
         .expect("an empty world model set cannot be invalid")
     }
+    pub fn set_keep_unbounded(&mut self, keep: bool) { self.keep_unbounded = keep; }
+    
 
     pub fn set_frustum(&mut self, frustum: Option<[[f32; 4]; 6]>) {
         self.frustum = frustum;
@@ -1215,6 +1219,7 @@ impl World {
     ) {
         let bounds = self.resident_bounds;
         let frustum = self.frustum;
+        let keep_unbounded = self.keep_unbounded;
         let Self {
             assets,
             slots,
@@ -1230,7 +1235,7 @@ impl World {
         for (instance, slot) in assets.instances.iter().zip(slots.iter_mut()) {
             if !cutoff_residency::contains(bounds, instance.placement.position) {
                 slot.visible = false;
-                if !crate::objects::unbounded_textures() {
+                if !keep_unbounded {
                     slot.draw = None;
                     slot.posed = None;
                 }
