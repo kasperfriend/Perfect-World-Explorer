@@ -755,6 +755,9 @@ mod tests {
             None,
             None,
             None,
+            // No `NVSDK_NGX_Parameter_GetUI` either: a read then answers `None`
+            // instead of touching the object.
+            None,
         );
         {
             let mut params = NgxParams::from_ngx(map);
@@ -768,6 +771,7 @@ mod tests {
             params.reset();
             assert_eq!(SET_U32_CALLS.load(Ordering::SeqCst), 1);
             assert_eq!(params.len(), 0, "NGX's map has no local entries");
+            assert_eq!(params.get_u32("SuperSampling.Available"), None);
         }
         assert!(
             DESTROYED.load(Ordering::SeqCst),
