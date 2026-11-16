@@ -4096,6 +4096,11 @@ pub fn run(
         settings.resolution_scale,
         max_texture_dimension,
     );
+    // The extent the world is actually drawn at. It equals `applied_extent`
+    // while a provider is alive, and the plain (Off) extent when the provider
+    // the settings ask for is not running — see the `upscaler_running` block in
+    // the redraw loop. Keeping it in one variable is what stops the world,
+    // depth, water and post targets from being reallocated every frame.
     let mut applied_extent = crate::render_extent(
         slider_extent,
         (config.width, config.height),
@@ -4105,6 +4110,7 @@ pub fn run(
         &gpu_facts,
         &sdk_report,
     );
+    let mut world_extent = applied_extent;
     let mut render_scale = crate::render_scale::RenderScale::new(
         &renderer.device,
         format,
@@ -4487,17 +4493,7 @@ pub fn run(
                     // scale change: reallocate only when the scaled extent moves.
                     let slider_extent = crate::render_scale::scaled_extent(config.width, config.height, settings.resolution_scale, max_texture_dimension);
                     let wanted_extent = crate::render_extent(slider_extent, (config.width, config.height), max_texture_dimension, settings.upscaling, settings.upscale_quality, &gpu_facts, &sdk_report);
-                    if wanted_extent != applied_extent {
-                        applied_extent = wanted_extent;
-                        resize_world_targets(&mut renderer, wanted_extent.0, wanted_extent.1);
-                    }
-                    render_scale.resize(
-                        &renderer.device,
-                        wanted_extent.0,
-                        wanted_extent.1,
-                        config.width,
-                        config.height,
-                    );
+                    applied_extent = wanted_extent;
                     // Recreate the FSR context lazily; a pure window resize
                     // can move the display extent even when the render
                     // extent holds.
@@ -4596,6 +4592,37 @@ pub fn run(
                     } else if !want_dlss {
                         dlss_upscaler = None;
                     }
+                    // The world is drawn at the extent of the provider that is
+                    // actually *alive*, not at the one the settings ask for
+                    // (`applied_extent` comes from the support table and keeps
+                    // answering e.g. 1280x720 even when the provider failed to
+                    // initialise). Without this, a failed provider left the world
+                    // at 1280x720 while the present path fell back to a bilinear
+                    // stretch — blurrier than Upscaling Off, and identical to it
+                    // at a 1.0x ratio. FSR 1 has no context object (it is the
+                    // in-tree EASU+RCAS pass inside `RenderScale::blit`), so it
+                    // counts as running only while `crate::fsr1_eligible`.
+                    let upscaler_running = fsr_upscaler.is_some()
+                        || xess_upscaler.is_some()
+                        || dlss_upscaler.is_some()
+                        || (settings.upscaling == crate::UpscaleMethod::Fsr1
+                            && crate::fsr1_eligible(applied_extent, (config.width, config.height)));
+                    let wanted_world = if upscaler_running {
+                        applied_extent
+                    } else {
+                        slider_extent
+                    };
+                    if wanted_world != world_extent {
+                        world_extent = wanted_world;
+                        resize_world_targets(&mut renderer, world_extent.0, world_extent.1);
+                    }
+                    render_scale.resize(
+                        &renderer.device,
+                        world_extent.0,
+                        world_extent.1,
+                        config.width,
+                        config.height,
+                    );
                     // A changed Frame generation or Latency setting clears
                     // the sticky failure of that feature, so the new choice
                     // is really attempted instead of inheriting the previous
@@ -4665,7 +4692,7 @@ pub fn run(
                     let fg_extent_changed = multiplier_changed
                         || framegen.as_ref().is_some_and(|fg| {
                             fg.size() != (config.width, config.height)
-                                || fg.render_extent() != applied_extent
+                                || fg.render_extent() != world_extent
                         });
                     if (!want_fg || fg_extent_changed) && framegen.is_some() {
                         framegen = None; // Destroying drops the FFX contexts and releases the proxy.
@@ -4692,7 +4719,7 @@ pub fn run(
                     let xess_fg_extent_changed = multiplier_changed
                         || xess_framegen.as_ref().is_some_and(|fg| {
                             fg.size() != (config.width, config.height)
-                                || fg.render_extent() != applied_extent
+                                || fg.render_extent() != world_extent
                         });
                     if (!want_xess_fg || xess_fg_extent_changed) && xess_framegen.is_some() {
                         xess_framegen = None; // Destroying drops XeSS-FG, the proxy and then XeLL.
@@ -4712,7 +4739,7 @@ pub fn run(
                                 &renderer.queue,
                                 &settings.upscale_sdk_dir,
                                 hwnd,
-                                applied_extent,
+                                world_extent,
                                 (config.width, config.height),
                                 surface_format,
                                 format,
@@ -4763,7 +4790,7 @@ pub fn run(
                     let dlss_fg_extent_changed = multiplier_changed
                         || dlss_framegen.as_ref().is_some_and(|fg| {
                             fg.size() != (config.width, config.height)
-                                || fg.render_extent() != applied_extent
+                                || fg.render_extent() != world_extent
                         });
                     if (!want_dlss_fg || dlss_fg_extent_changed) && dlss_framegen.is_some() {
                         dlss_framegen = None; // Releases the NGX feature and the swapchain.
@@ -4783,7 +4810,7 @@ pub fn run(
                                 &renderer.queue,
                                 &settings.upscale_sdk_dir,
                                 hwnd,
-                                applied_extent,
+                                world_extent,
                                 (config.width, config.height),
                                 surface_format,
                                 format,
@@ -4828,7 +4855,7 @@ pub fn run(
                                 &renderer.queue,
                                 &settings.upscale_sdk_dir,
                                 hwnd,
-                                applied_extent,
+                                world_extent,
                                 (config.width, config.height),
                                 surface_format,
                                 format,
@@ -5262,55 +5289,6 @@ pub fn run(
                             // stay sharp regardless of the 3D resolution scale.
                             let composed_view=if whole_frame_gamma {Some(display_gamma.as_ref().unwrap().view())} else if let Some(encode)=present_encode.as_ref() {Some(encode.view())} else {None};
                             let scene_view=composed_view.as_ref().unwrap_or(final_view);
-                            // A provider that is *requested* but not *running* must not
-                            // keep the world at its reduced render extent. `applied_extent`
-                            // comes from `crate::render_extent`, which answers from the
-                            // support table — it stays at e.g. 1280x720 even when
-                            // `DlssUpscaler::new` failed, and the fallback is a plain
-                            // bilinear stretch. Stretching 1280x720 to 1920x1080 is much
-                            // blurrier than not upscaling at all, and at 1.0x (DLAA /
-                            // Ultra Quality) the stretch is the identity, which is exactly
-                            // why "DLAA" and "Upscaling Off" looked identical while DLSS
-                            // was reported as unavailable. So the render extent follows the
-                            // provider that is actually alive: no provider, native render.
-                            // FSR 1 has no context object (it is the in-tree
-                            // EASU+RCAS pass inside `RenderScale::blit`), so it
-                            // counts as running whenever it is selected and both
-                            // axes are inside EASU's supported range; otherwise
-                            // `blit` falls back to bilinear and the world must be
-                            // native again.
-                            let upscaler_running = fsr_upscaler.is_some()
-                                || xess_upscaler.is_some()
-                                || dlss_upscaler.is_some()
-                                || (settings.upscaling == crate::UpscaleMethod::Fsr1
-                                    && crate::fsr1_eligible(
-                                        applied_extent,
-                                        (config.width, config.height),
-                                    ));
-                            let wanted_world_extent = if upscaler_running {
-                                applied_extent
-                            } else {
-                                crate::render_scale::scaled_extent(
-                                    config.width,
-                                    config.height,
-                                    settings.resolution_scale,
-                                    max_texture_dimension,
-                                )
-                            };
-                            if wanted_world_extent != render_scale.input_extent() {
-                                resize_world_targets(
-                                    &mut renderer,
-                                    wanted_world_extent.0,
-                                    wanted_world_extent.1,
-                                );
-                                render_scale.resize(
-                                    &renderer.device,
-                                    wanted_world_extent.0,
-                                    wanted_world_extent.1,
-                                    config.width,
-                                    config.height,
-                                );
-                            }
                             // Draw the world into the scaled offscreen target, then bilinearly
                             // present it into `scene_view` before the UI pass loads that result.
                             let world_view = render_scale.view();
@@ -5364,8 +5342,8 @@ pub fn run(
                                 &world_raw_view,
                                 world_matrix,
                                 &camera,
-                                applied_extent.0,
-                                applied_extent.1,
+                                world_extent.0,
+                                world_extent.1,
                             );
                             if let Some(fsr) = fsr_upscaler.as_mut() {
                                 match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {

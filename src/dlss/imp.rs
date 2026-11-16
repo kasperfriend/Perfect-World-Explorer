@@ -61,6 +61,65 @@ const P_FRAME_TIME_MS: &str = "FrameTimeDeltaInMsec";
 const P_RENDER_WIDTH: &str = "DLSS.Render.Subrect.Dimensions.Width";
 const P_RENDER_HEIGHT: &str = "DLSS.Render.Subrect.Dimensions.Height";
 const P_SHARPNESS: &str = "Sharpness";
+/// `NVSDK_NGX_Parameter_DLSS_Pre_Exposure`. The reference wrapper
+/// (`NGX_D3D12_EVALUATE_DLSS_EXT`, `nvsdk_ngx_helpers_d3d.h:355`) always sets
+/// this and its sibling below, converting `0.0` to `1.0` — NGX divides by the
+/// pre-exposure, so a missing/zero value is rejected with
+/// `FAIL_InvalidParameter` (`0xbad00005`). That is exactly what every DLSS
+/// evaluate returned until this was added: `NVSDK_NGX_D3D12_EvaluateFeature(DLSS)
+/// failed (0xbad00005)`.
+const P_PRE_EXPOSURE: &str = "DLSS.Pre.Exposure";
+const P_EXPOSURE_SCALE: &str = "DLSS.Exposure.Scale";
+const P_TONEMAPPER_TYPE: &str = "TonemapperType";
+const P_INDICATOR_INVERT_X: &str = "DLSS.Indicator.Invert.X.Axis";
+const P_INDICATOR_INVERT_Y: &str = "DLSS.Indicator.Invert.Y.Axis";
+/// Subrect bases, all zero because the viewer renders and upscales full-frame.
+/// The reference wrapper sets every one of them on every evaluate.
+const P_ZERO_SUBRECTS: [&str; 12] = [
+    "DLSS.Input.Color.Subrect.Base.X",
+    "DLSS.Input.Color.Subrect.Base.Y",
+    "DLSS.Input.Depth.Subrect.Base.X",
+    "DLSS.Input.Depth.Subrect.Base.Y",
+    "DLSS.Input.MV.Subrect.Base.X",
+    "DLSS.Input.MV.Subrect.Base.Y",
+    "DLSS.Input.Translucency.Subrect.Base.X",
+    "DLSS.Input.Translucency.Subrect.Base.Y",
+    "DLSS.Output.Subrect.Base.X",
+    "DLSS.Output.Subrect.Base.Y",
+    "DLSS.Input.Bias.Current.Color.Subrect.Base.X",
+    "DLSS.Input.Bias.Current.Color.Subrect.Base.Y",
+];
+/// Optional resources the reference wrapper binds as `nullptr` on every
+/// evaluate. NGX's parameter map is expected to carry the keys even when
+/// nothing is bound, so they are set explicitly rather than left out.
+const P_NULL_RESOURCES: [&str; 26] = [
+    "TransparencyMask",
+    "ExposureTexture",
+    "DLSS.Input.Bias.Current.Color.Mask",
+    "GBuffer.Albedo",
+    "GBuffer.Roughness",
+    "GBuffer.Metallic",
+    "GBuffer.Specular",
+    "GBuffer.Subsurface",
+    "GBuffer.Normals",
+    "GBuffer.ShadingModelId",
+    "GBuffer.MaterialId",
+    "GBuffer.Attrib.8",
+    "GBuffer.Attrib.9",
+    "GBuffer.Attrib.10",
+    "GBuffer.Attrib.11",
+    "GBuffer.Attrib.12",
+    "GBuffer.Attrib.13",
+    "GBuffer.Attrib.14",
+    "GBuffer.Attrib.15",
+    "MotionVectors3D",
+    "IsParticleMask",
+    "AnimatedTextureMask",
+    "DepthHighRes",
+    "Position.ViewSpace",
+    "RayTracingHitDistance",
+    "MotionVectorsReflection",
+];
 
 /// In-tree Halton jitter in pixels ([-0.5, 0.5)), 16 phases.
 fn halton(mut index: u32, base: u32) -> f32 {
@@ -513,15 +572,28 @@ impl DlssUpscaler {
         // anti-aliases by how far content moves per frame.
         self.params
             .set_f32(P_FRAME_TIME_MS, frame_time_ms.clamp(0.1, 1000.0));
-        // `Sharpness` stays 0: NGX reads it from the *create* parameter map in
-        // every shipped wrapper (`NVSDK_NGX_D3D12_DlssCreateParams`,
-        // `nvsdk_ngx_helpers_d3d.h`), so setting it per evaluate did nothing —
-        // which is precisely the report ("the DLSS sharpness slider does
-        // nothing"). The Graphics slider now runs the viewer's own
-        // RCAS-style pass in `DlssUpscaler::composite` instead, so it works
-        // whatever NGX decides to do with the legacy parameter, and it cannot
-        // sharpen twice.
+        // `Sharpness` stays 0 and the Graphics slider runs the viewer's own
+        // RCAS-style pass in `DlssUpscaler::composite` instead: NGX's own
+        // sharpening is deprecated ("Sharpness is not supported") and doing
+        // both would double the halos.
         self.params.set_f32(P_SHARPNESS, 0.0);
+        // Everything below is what `NGX_D3D12_EVALUATE_DLSS_EXT` sets on every
+        // call and this viewer used to leave out. The two exposure values are
+        // the important ones: NGX divides by the pre-exposure, so leaving it at
+        // the map's default 0 made every evaluate return
+        // `FAIL_InvalidParameter` — the feature created fine and then never
+        // ran, which is why DLSS looked like "no upscaling at all".
+        self.params.set_f32(P_PRE_EXPOSURE, 1.0);
+        self.params.set_f32(P_EXPOSURE_SCALE, 1.0);
+        self.params.set_u32(P_TONEMAPPER_TYPE, 0);
+        self.params.set_i32(P_INDICATOR_INVERT_X, 0);
+        self.params.set_i32(P_INDICATOR_INVERT_Y, 0);
+        for name in P_ZERO_SUBRECTS {
+            self.params.set_u32(name, 0);
+        }
+        for name in P_NULL_RESOURCES {
+            self.params.set_d3d12_resource(name, std::ptr::null_mut());
+        }
         self.params
             .set_u32(P_RENDER_WIDTH, self.render_extent.0.max(1));
         self.params
