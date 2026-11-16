@@ -705,42 +705,94 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
         }
     };
     let (water, materials, (water_normals, water_simple_frames), objects, models, grass, trees) =
-        std::thread::scope(|s| {
-           let water_task = s.spawn(|| water::load(&world_scene, &dir).map_err(|e| e.to_string()));
-            let materials_task = s.spawn(|| {
-                material::Materials::load(&dir, &t, &names, w, h, grid_spacing)
-                    .map_err(|e| e.to_string())
-            });
-            let water_frames_task = s.spawn(|| -> Result<_, String> {
-                Ok((
-                    water::load_normals(element).map_err(|e| e.to_string())?,
-                    water::load_simple_frames(element).map_err(|e| e.to_string())?,
-                ))
-            });
-            let objects_task =
-                s.spawn(|| objects::Objects::open(element, ornaments).map_err(|e| e.to_string()));
-            let models_task =
-                s.spawn(|| match world_models::Assets::open(element, placements.clone()) {
-                    Ok(models) => models,
-                    Err(e) => world_models::Assets::load_with(placements, |_| Err(e.clone())),
+        if all_to_vram  {
+            std::thread::scope(|s| {
+                let water_task =
+                    s.spawn(|| water::load(&world_scene, &dir).map_err(|e| e.to_string()));
+                let materials_task = s.spawn(|| {
+                    material::Materials::load(&dir, &t, &names, w, h, grid_spacing)
+                        .map_err(|e| e.to_string())
                 });
-            let grass_task = s.spawn(|| {
-                grass::Grass::load(&world_scene, &dir, element).map_err(|e| e.to_string())
-            });
-            let trees_task = s.spawn(|| {
-                trees::Trees::open(element, &world_scene, &tree_cache).map_err(|e| e.to_string())
-            });
+                let water_frames_task = s.spawn(|| -> Result<_, String> {
+                    Ok((
+                        water::load_normals(element).map_err(|e| e.to_string())?,
+                        water::load_simple_frames(element).map_err(|e| e.to_string())?,
+                    ))
+                });
+                let objects_task = s.spawn(|| {
+                    objects::Objects::open(element, ornaments).map_err(|e| e.to_string())
+                });
+                let models_task =
+                    s.spawn(|| match world_models::Assets::open(element, placements.clone()) {
+                        Ok(models) => models,
+                        Err(e) => world_models::Assets::load_with(placements, |_| Err(e.clone())),
+                    });
+                let grass_task = s.spawn(|| {
+                    grass::Grass::load(&world_scene, &dir, element).map_err(|e| e.to_string())
+                });
+                let trees_task = s.spawn(|| {
+                    trees::Trees::open(element, &world_scene, &tree_cache)
+                        .map_err(|e| e.to_string())
+                });
 
-            Ok::<_, String>((
-                water_task.join().unwrap()?,
-                materials_task.join().unwrap()?,
-                water_frames_task.join().unwrap()?,
-                objects_task.join().unwrap()?,
-                models_task.join().unwrap(),
-                grass_task.join().unwrap()?,
-                trees_task.join().unwrap()?,
-            ))
-        })?;
+                Ok::<_, String>((
+                    water_task.join().unwrap()?,
+                    materials_task.join().unwrap()?,
+                    water_frames_task.join().unwrap()?,
+                    objects_task.join().unwrap()?,
+                    models_task.join().unwrap(),
+                    grass_task.join().unwrap()?,
+                    trees_task.join().unwrap()?,
+                ))
+            })?
+        } else {
+            let (water, materials, (water_normals, water_simple_frames), objects) =
+                std::thread::scope(|s| {
+                    let water_task =
+                        s.spawn(|| water::load(&world_scene, &dir).map_err(|e| e.to_string()));
+                    let materials_task = s.spawn(|| {
+                        material::Materials::load(&dir, &t, &names, w, h, grid_spacing)
+                            .map_err(|e| e.to_string())
+                    });
+                    let water_frames_task = s.spawn(|| -> Result<_, String> {
+                        Ok((
+                            water::load_normals(element).map_err(|e| e.to_string())?,
+                            water::load_simple_frames(element).map_err(|e| e.to_string())?,
+                        ))
+                    });
+                    let objects_task = s.spawn(|| {
+                        objects::Objects::open(element, ornaments).map_err(|e| e.to_string())
+                    });
+
+                    Ok::<_, String>((
+                        water_task.join().unwrap()?,
+                        materials_task.join().unwrap()?,
+                        water_frames_task.join().unwrap()?,
+                        objects_task.join().unwrap()?,
+                    ))
+                })?;
+            let (models, grass, trees) = std::thread::scope(|s| {
+                let models_task =
+                    s.spawn(|| match world_models::Assets::open(element, placements.clone()) {
+                        Ok(models) => models,
+                        Err(e) => world_models::Assets::load_with(placements, |_| Err(e.clone())),
+                    });
+                let grass_task = s.spawn(|| {
+                    grass::Grass::load(&world_scene, &dir, element).map_err(|e| e.to_string())
+                });
+                let trees_task = s.spawn(|| {
+                    trees::Trees::open(element, &world_scene, &tree_cache)
+                        .map_err(|e| e.to_string())
+                });
+
+                Ok::<_, String>((
+                    models_task.join().unwrap(),
+                    grass_task.join().unwrap()?,
+                    trees_task.join().unwrap()?,
+                ))
+            })?;
+            (water, materials, (water_normals, water_simple_frames), objects, models, grass, trees)
+        };
     eprintln!(
         "Loaded {} water areas from client BSData grids",
         water.len()
