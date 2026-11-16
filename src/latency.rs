@@ -252,6 +252,66 @@ mod imp_stub {
 
 #[cfg(not(windows))]
 pub use imp_stub::LatencySession;
+#[cfg(windows)]
+struct TimerPeriodGuard {
+    active: bool,
+}
+
+#[cfg(windows)]
+impl TimerPeriodGuard {
+fn acquire_1ms() -> Self {
+use std::os::windows::ffi::OsStrExt;
+let name: Vec<u16> = std::ffi::OsStr::new("winmm.dll")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let active = unsafe {
+            let module = winapi::um::libloaderapi::LoadLibraryW(name.as_ptr());
+            if module.is_null() {
+                false
+            } else {
+                let proc = winapi::um::libloaderapi::GetProcAddress(
+                    module,
+                    b"timeBeginPeriod\0".as_ptr() as *const i8,
+                );
+                if proc.is_null() {
+                    false
+                } else {
+                    let begin: unsafe extern "system" fn(u32) -> u32 = std::mem::transmute(proc);
+                    begin(1) == 0
+                }
+            }
+        };
+        Self { active }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TimerPeriodGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        use std::os::windows::ffi::OsStrExt;
+        let name: Vec<u16> = std::ffi::OsStr::new("winmm.dll")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let module = winapi::um::libloaderapi::GetModuleHandleW(name.as_ptr());
+            if !module.is_null() {
+                let proc = winapi::um::libloaderapi::GetProcAddress(
+                    module,
+                    b"timeEndPeriod\0".as_ptr() as *const i8,
+                );
+                if !proc.is_null() {
+                    let end: unsafe extern "system" fn(u32) -> u32 = std::mem::transmute(proc);
+                    let _ = end(1);
+                }
+            }
+        }
+    }
+}
 
 /// CPU pacing with the shape of NVIDIA Reflex, without Streamline.
 ///
@@ -291,6 +351,8 @@ pub struct ReflexPacer {
     last_present: Instant,
     frames: u64,
     slept: Duration,
+    #[cfg(windows)]
+    _timer_guard: TimerPeriodGuard,
 }
 
 impl ReflexPacer {
@@ -301,7 +363,7 @@ impl ReflexPacer {
     /// not a cadence.
     const MAX_BUDGET: Duration = Duration::from_millis(100);
     /// How much of the budget is kept back for recording and submitting.
-    const MAX_LEAD: Duration = Duration::from_millis(3);
+    const MIN_LEAD: Duration = Duration::from_millis(5);
 
     /// `refresh_hz` is only a starting point (the frame loop passes the 60 Hz
     /// default and never queries the monitor): out-of-range and non-finite
@@ -318,19 +380,27 @@ impl ReflexPacer {
             last_present: Instant::now(),
             frames: 0,
             slept: Duration::ZERO,
+            #[cfg(windows)]
+            _timer_guard: TimerPeriodGuard::acquire_1ms(),
         }
     }
 
     /// Sleep until the current frame may start. Call once per frame, before
     /// anything is recorded.
     pub fn begin_frame(&mut self) {
-        let lead = Self::MAX_LEAD.min(self.budget / 4);
+        // Above ~100 Hz, Windows sleep jitter is too large relative to the
+        // frame budget; let Present(1, 0) pace directly without extra sleeps.
+        if self.budget < Duration::from_millis(10) {
+            return;
+        }
+        let lead = Self::MIN_LEAD.max(self.budget / 3).min(self.budget / 2);
         let due = self.last_present + self.budget.saturating_sub(lead);
         let now = Instant::now();
         if let Some(wait) = due.checked_duration_since(now) {
-            if wait > Duration::from_micros(200) {
-                std::thread::sleep(wait);
-                self.slept += wait;
+            let capped = wait.min(self.budget / 2);
+            if capped >= Duration::from_millis(2) {
+                std::thread::sleep(capped);
+                self.slept += capped;
             }
         }
     }
@@ -341,11 +411,15 @@ impl ReflexPacer {
         let observed = now.saturating_duration_since(self.last_present);
         self.last_present = now;
         self.frames += 1;
-        // A first frame or a stall says nothing about the cadence.
-        if observed >= Self::MIN_BUDGET && observed <= Self::MAX_BUDGET {
-            let smoothed = self.budget.mul_f32(0.9) + observed.mul_f32(0.1);
-            self.budget = smoothed.clamp(Self::MIN_BUDGET, Self::MAX_BUDGET);
-        }
+       if observed >= Self::MIN_BUDGET && observed <= Self::MAX_BUDGET {
+            if observed < self.budget {
+                let smoothed = self.budget.mul_f32(0.7) + observed.mul_f32(0.3);
+                self.budget = smoothed.clamp(Self::MIN_BUDGET, Self::MAX_BUDGET);
+            } else if observed <= self.budget.mul_f32(1.15) {
+                let smoothed = self.budget.mul_f32(0.95) + observed.mul_f32(0.05);
+                self.budget = smoothed.clamp(Self::MIN_BUDGET, Self::MAX_BUDGET);
+            }
+       }
     }
 
     /// Frames paced so far.
