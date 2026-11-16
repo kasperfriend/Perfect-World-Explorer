@@ -176,6 +176,7 @@ pub struct DlssUpscaler {
     current_jitter: (f32, f32),
     prev_view_proj: Option<Mat4>,
     reset_history: bool,
+    last_instant: std::time::Instant,
     quality_name: &'static str,
 }
 
@@ -285,6 +286,7 @@ impl DlssUpscaler {
             current_jitter: (0.0, 0.0),
             prev_view_proj: None,
             reset_history: true,
+            last_instant: std::time::Instant::now(),
             quality_name,
         })
     }
@@ -342,6 +344,9 @@ impl DlssUpscaler {
         depth: &wgpu::Texture,
         unjittered_vp: &Mat4,
     ) -> Result<(), String> {
+        let now = std::time::Instant::now();
+        let frame_time_ms = (now - self.last_instant).as_secs_f32() * 1000.0;
+        self.last_instant = now;
         let (rw, rh) = self.render_extent;
         let size = wgpu::Extent3d {
             width: rw.max(1),
@@ -500,6 +505,8 @@ impl DlssUpscaler {
         // Motion vectors are in pixels, so the scale is 1:1.
         self.params.set_f32(P_MV_SCALE_X, 1.0);
         self.params.set_f32(P_MV_SCALE_Y, 1.0);
+        self.params
+                .set_f32(P_FRAME_TIME_MS, frame_time_ms.clamp(0.1, 1000.0));
         // Sharpness is deprecated in current DLSS builds (sharpening moved to
         // the game); 0 keeps the vendor default and is what the guide passes.
         self.params.set_f32(P_SHARPNESS, 0.0);
