@@ -1018,7 +1018,8 @@ impl GpuPage {
         frustum: &[[f32; 4]; 6],
         sdr_only: bool,
     ) {
-        let mut bound = None;
+        let mut bound = None; 
+        let mut pending: Option<(usize, u32, u32)> = None;
         for chunk in &list.chunks {
             if (sdr_only && !chunk.has_sdr) || !aabb_in_frustum(frustum, chunk.min, chunk.max) {
                 continue;
@@ -1030,15 +1031,35 @@ impl GpuPage {
                 if !aabb_in_frustum(frustum, cmd.min, cmd.max) {
                     continue;
                 }
-                let p = &pages[cmd.page];
-                if bound != Some(cmd.page) {
-                    pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
-                    pass.set_vertex_buffer(0, p.vertex.slice(..));
-                    pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
-                    bound = Some(cmd.page);
-                }
-                pass.draw_indexed(cmd.start..cmd.end, 0, 0..1);
+                if let Some((cur_page, cur_start, cur_end)) = pending {
+                    if cur_page == cmd.page && cur_end == cmd.start {
+                        pending = Some((cur_page, cur_start, cmd.end));
+                        continue;
                     }
+                    if bound != Some(cur_page) {
+                        let p = &pages[cur_page];
+                       pass.set_bind_group(
+                           0,
+                           if reflected { &p.reflected } else { &p.normal },
+                           &[],
+                       );
+                        pass.set_vertex_buffer(0, p.vertex.slice(..));
+                        pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
+                        bound = Some(cur_page);
+                    }
+                   pass.draw_indexed(cur_start..cur_end, 0, 0..1);
+                }
+                pending = Some((cmd.page, cmd.start, cmd.end));
+            }
+        }
+        if let Some((cur_page, cur_start, cur_end)) = pending {
+            if bound != Some(cur_page) {
+               let p = &pages[cur_page];
+               pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
+               pass.set_vertex_buffer(0, p.vertex.slice(..));
+               pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
+            }
+            pass.draw_indexed(cur_start..cur_end, 0, 0..1);
         }
     }
 
