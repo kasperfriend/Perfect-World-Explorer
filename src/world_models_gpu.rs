@@ -1230,6 +1230,10 @@ impl World {
         for (instance, slot) in assets.instances.iter().zip(slots.iter_mut()) {
             if !cutoff_residency::contains(bounds, instance.placement.position) {
                 slot.visible = false;
+                if !crate::objects::unbounded_textures() {
+                    slot.draw = None;
+                    slot.posed = None;
+                }
                 continue;
             }
             if slot.failed {
