@@ -101,7 +101,10 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
                 .decompress(raw, &mut buf, FlushDecompress::Finish)
                 .map_err(|e| e.to_string())?;
             if decomp.total_out() != 276 {
-                return Err(format!("unexpected entry record size: {}", decomp.total_out()));
+                return Err(format!(
+                    "unexpected entry record size: {}", 
+                    decomp.total_out()
+                ));
             }
             &buf
         };
@@ -130,7 +133,7 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
 
 pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
     if e.compressed < e.size {
-       let compressed = at(f, e.offset as u64, e.compressed as usize)?;
+        let compressed = at(f, e.offset as u64, e.compressed as usize)?;
         let mut out = Vec::with_capacity(e.size as usize);
         ZlibDecoder::new(compressed.as_slice())
             .take(e.size as u64 + 1)
