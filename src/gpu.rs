@@ -2359,8 +2359,10 @@ impl Renderer {
         };
         self.sky
             .update(&self.queue, direction, w, h, frame, main_sets, false);
-        self.sky
-            .update(&self.queue, direction, w, h, frame, reflected_sets, true);
+        if camera.water_reflections {
+            self.sky
+                .update(&self.queue, direction, w, h, frame, reflected_sets, true);
+        }
         let resident_bounds = self.resident_bounds();
         self.far_trees.update_resident_lods(
             &self.device,
@@ -2823,7 +2825,7 @@ impl Renderer {
                     frame,
                 );
             }
-            if population {
+            if population && matches!(view, Pass::Main) {
                 self.modules.render_population(
                     &self.device,
                     &self.queue,
@@ -3284,7 +3286,7 @@ impl Renderer {
             self.visible_water_batches = visible;
             return;
         }
-        for batch in &visible {
+        for (batch_idx, batch) in visible.iter().enumerate() {
             if batch.simple {
                 let mut e = self.device.create_command_encoder(&Default::default());
                 self.simple_water.draw(
@@ -3302,7 +3304,9 @@ impl Renderer {
             let plane = batch.height;
             // A previous plane's reflection left its mirrored records in the
             // buffer; the refraction passes below draw through the main matrix.
-            self.queue_main_runs();
+            if batch_idx > 0 {
+                self.queue_main_runs();
+            }
             if camera.pos.y > plane {
                 // Client 0x7cc6ac-0x7cc8b5: render below this plane into
                 // refraction, cleared to the region's water fog color. Fog
@@ -4196,6 +4200,7 @@ pub fn run(
     let mut last_settings_save = Instant::now();
     let mut last = Instant::now();
     let mut region_tick_ms = renderer.started.elapsed().as_millis() as u64;
+    let mut last_minimap_key: Option<([i32; 3], bool, usize)> = None;
     event_loop
         .run(move |event, target| match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => {
@@ -4602,7 +4607,19 @@ pub fn run(
                             // overhead pass is skipped rather than rendered and
                             // hidden.
                             if settings.show_minimap && settings.minimap_style==MapStyle::Realistic {
-                                renderer.render_minimap(&map_view,&map_depth,&camera,settings.minimap_range,false);
+                              let minimap_key = (
+                                 [
+                                 camera.pos.x.round() as i32,
+                                 camera.pos.y.round() as i32,
+                                 camera.pos.z.round() as i32,
+                                 ],
+                              renderer.world_done,
+                              renderer.world_pages.len(),
+                              );
+                              if last_minimap_key != Some(minimap_key) {
+                                  renderer.render_minimap(&map_view,&map_depth,&camera,settings.minimap_range,false);
+                                    last_minimap_key = Some(minimap_key);
+                              }
                             }
                             if menu_page==MenuPage::WorldMap && settings.world_map_style==MapStyle::Realistic && map_refresh.elapsed()>=std::time::Duration::from_secs(2) {
                                 renderer.render_minimap(&full_map_view,&full_map_depth,&camera,0.,true);
