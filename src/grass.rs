@@ -534,7 +534,7 @@ impl Grass {
             for chunk in chunks {
                 models.extend(chunk);
             }
-        } 
+       } 
         for m in models.iter().flatten() {
             for mesh in &m.meshes {
                 if !textures.contains_key(&mesh.texture) {
