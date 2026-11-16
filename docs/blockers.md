@@ -603,3 +603,45 @@ done.
   `1280x720 -> 1920x1080 - sharp 0.35` line plus `[DLSS] first evaluate OK` in
   the log decides it, and the next report should quote them.
 - **Status:** open on hardware (needs one more screen report).
+
+## B-18 — "with DLSS on, the water breaks" + `EvaluateFeature(DLSS)` fails `0xbad00005`
+
+- **Report:** with DLSS selected, the water renders wrong and the Graphics tab
+  says `DLSS is NOT running - the world is rendered at native resolution
+  instead (no upscaling)`. `session.log` carries
+  `NVSDK_NGX_D3D12_EvaluateFeature(DLSS) failed (0xbad00005
+  FAIL_InvalidParameter)` — the feature *creates* and then never evaluates.
+- **Cause 1 (the failure):** `NGX_D3D12_EVALUATE_DLSS_EXT` in the vendored
+  `sdk/include/nvidia/nvsdk_ngx_helpers_d3d.h` sets
+  `NVSDK_NGX_Parameter_DLSS_Pre_Exposure` and `…_DLSS_Exposure_Scale` on every
+  evaluate, converting `0.0` to `1.0` (`nvsdk_ngx_defs.h:813-814`). NGX divides
+  by the pre-exposure, so the parameter map's default of 0 is rejected with
+  `FAIL_InvalidParameter`. This viewer never set either key, so *every*
+  evaluate failed — DLSS could not run at all. `src/dlss/imp.rs` now sets both
+  to 1.0, and for parity with the same wrapper also sets `TonemapperType`, the
+  two indicator inverts, the twelve subrect bases (zero, full-frame) and the
+  optional resources the wrapper binds as `nullptr` (transparency mask,
+  exposure texture, bias-current mask, the `GBuffer.*` set, 3D and reflection
+  motion vectors, `DepthHighRes`, `Position.ViewSpace`,
+  `RayTracingHitDistance`, `IsParticleMask`, `AnimatedTextureMask`). Types
+  follow the wrapper exactly: `SetUI` → `set_u32`, `SetF` → `set_f32`,
+  `SetI` → `set_i32`.
+- **Cause 2 (the water):** the fallback added in B-17 resized the world, depth,
+  water and post targets against `RenderScale::input_extent()` *inside the
+  redraw loop*, but `Renderer::render` and the three frame-generation contexts
+  were still handed `applied_extent` — the support table's answer (1280×720 at
+  Quality) even when nothing was running. The buffers became 1920×1080 while
+  every pass still believed it drew at 1280×720: the water uniform's
+  `size: [w, h, …]` (reflection/refraction UV math), the viewport and the
+  projections all disagreed with the actual targets. Fixed by deciding the
+  extent once per frame in the settings block (`world_extent`: provider alive →
+  `applied_extent`, otherwise the plain scaled extent), reallocating only when
+  it moves, and passing `world_extent` to `Renderer::render` and to the
+  FSR/XeSS/DLSS frame-generation contexts and their recreate checks.
+- **Rule:** every per-frame pass must be told the extent its targets are
+  actually allocated at. `RenderScale::input_extent()` is the authority; no
+  pass may be handed `applied_extent` directly, because that value describes
+  what the *settings* asked for, not what is alive.
+- **Status:** fixed in source; needs one hardware report with DLSS at Quality to
+  confirm `[DLSS] first evaluate OK (1280x720 -> 1920x1080, quality)` and
+  `[upscaler] DLSS (quality) running 1280x720 -> 1920x1080 sharp 0.35`.
