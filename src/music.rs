@@ -150,7 +150,11 @@ struct DirectoryIndex {
 }
 impl DirectoryIndex {
     fn resolve_under(&mut self, root: &Path, raw: &str, prefix: &str) -> Option<PathBuf> {
-        let cache_key = format!("{}|{}", prefix.to_ascii_lowercase(), raw.to_ascii_lowercase());
+        let cache_key = format!(
+            "{}|{}",
+            prefix.to_ascii_lowercase(),
+            raw.to_ascii_lowercase()
+        );
         if let Some(cached) = self.resolutions.get(&cache_key) {
             return cached.clone();
         }
@@ -169,13 +173,19 @@ impl DirectoryIndex {
                         entries
                             .filter_map(Result::ok)
                             .map(|entry| {
-                                (entry.file_name().to_string_lossy().to_lowercase(), entry.path())
+                                (
+                                    entry.file_name().to_string_lossy().to_lowercase(),
+                                    entry.path(),
+                                )
                             })
                             .collect::<HashMap<_, _>>()
                     });
                     self.directories.insert(path.clone(), entries);
                 }
-                match self.directories.get(&path).and_then(Option::as_ref)
+                match self
+                    .directories
+                    .get(&path)
+                    .and_then(Option::as_ref)
                     .and_then(|entries| entries.get(&part.to_lowercase()))
                 {
                     Some(next) => path = next.clone(),
@@ -185,7 +195,11 @@ impl DirectoryIndex {
                     }
                 }
             }
-            if found && path.is_file() { Some(path) } else { None }
+            if found && path.is_file() {
+                Some(path)
+            } else {
+                None
+            }
         };
         self.resolutions.insert(cache_key, result.clone());
         result
@@ -371,7 +385,12 @@ impl MusicPlayer {
         self.unresolved.clear();
         if let Some(q) = zone.and_then(|i| self.zones.as_ref().map(|z| &z.zones[i])) {
             for path in &q.tracks {
-                match resolve_track_indexed(&self.element, &self.packed, path, &mut self.loose_index) {
+                match resolve_track_indexed(
+                    &self.element,
+                    &self.packed,
+                    path,
+                    &mut self.loose_index,
+                ) {
                     Some(track) => paths.push(track),
                     None => self.unresolved.push(path.clone()),
                 }
@@ -530,11 +549,8 @@ impl AmbiencePlayer {
             }
         });
         let path = raw.and_then(|p| {
-            self.loose_index.resolve_under(
-                &self.element.join("music"),
-                p,
-                "ambiencestereo",
-            )
+            self.loose_index
+                .resolve_under(&self.element.join("music"), p, "ambiencestereo")
         });
         let paths = path.map(Track::Loose).into_iter().collect::<Vec<_>>();
         self.status = if !enabled {
@@ -747,8 +763,16 @@ mod tests {
             index.resolve_under(&root, "MUSIC/TRACKS/DAY.OGG", "music"),
             Some(track)
         );
-        assert_eq!(index.directories.len(), 3, "each directory is enumerated once");
-        assert_eq!(index.resolutions.len(), 1, "case-folded requests share cache keys");
+        assert_eq!(
+            index.directories.len(),
+            3,
+            "each directory is enumerated once"
+        );
+        assert_eq!(
+            index.resolutions.len(),
+            1,
+            "case-folded requests share cache keys"
+        );
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
