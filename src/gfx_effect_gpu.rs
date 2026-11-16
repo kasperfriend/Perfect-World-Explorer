@@ -498,7 +498,7 @@ impl Draw {
                     && last_key.priority == quad.priority
                     && last_key.tile == quad.tile
                     && last_key.texture == quad.texture.as_str()
-       }) {
+        }) {
                 groups.len() - 1
             } else {
                 let key = BucketKey {
@@ -510,19 +510,18 @@ impl Draw {
                 };
                 match self.scratch_index.get(&key) {
                     Some(position) => *position,
-                    None => {
-                       let verts = self
-                           .scratch_pool
-                           .pop()
-                           .map(|mut v| {
-                                  v.clear();
-                                  v
-                              })
-                           .unwrap_or_default();
-                       self.scratch_index.insert(key.clone(), groups.len());
-                       groups.push((key, verts));
-                       groups.len() - 1
-                   }
+                None => {
+                    let verts = self
+                            .scratch_pool
+                        .pop()
+                        .map(|mut v| {
+                            v.clear();
+                            v
+                            })
+                        .unwrap_or_default();
+                    self.scratch_index.insert(key.clone(), groups.len());
+                    groups.push((key, verts));
+                    groups.len() - 1
                 }
             };
             let vertices = &mut groups[position].1;
