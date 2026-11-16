@@ -548,6 +548,17 @@ impl NativeTexture2D {
         }
     }
 
+    /// The created resource's format and size, e.g. `0x00000057 2293x913`
+    /// (diagnostics: what NGX will read off `GetDesc`).
+    pub(crate) fn desc_summary(&self) -> String {
+        let mut desc: d3d12_ty::D3D12_RESOURCE_DESC = unsafe { std::mem::zeroed() };
+        unsafe { (*(self.resource.as_mut_ptr())).GetDesc(&mut desc) };
+        format!(
+            "0x{:08x} {}x{}",
+            desc.Format as u32, desc.Width, desc.Height
+        )
+    }
+
     /// # Safety
     /// The caller guarantees the wgpu device was created by `raw_device`.
     pub(crate) unsafe fn create(

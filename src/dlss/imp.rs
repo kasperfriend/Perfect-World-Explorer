@@ -243,10 +243,14 @@ impl DlssNatives {
             true,
         )?;
         crate::dlss::diag(&format!(
-            "[DLSS] textures: colour {} heap, depth {}, motion vectors {}, output {}",
+            "[DLSS] textures: colour {} {} heap, depth {} {}, motion vectors {} {}, output {} {}",
+            color.desc_summary(),
             color.heap_kind(),
+            depth.desc_summary(),
             depth.heap_kind(),
+            mv.desc_summary(),
             mv.heap_kind(),
+            output.desc_summary(),
             output.heap_kind()
         ));
         Ok(Self {
