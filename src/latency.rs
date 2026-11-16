@@ -419,7 +419,7 @@ impl ReflexPacer {
                 let smoothed = self.budget.mul_f32(0.95) + observed.mul_f32(0.05);
                 self.budget = smoothed.clamp(Self::MIN_BUDGET, Self::MAX_BUDGET);
             }
-       }
+        }
     }
 
     /// Frames paced so far.
