@@ -195,6 +195,9 @@ impl Page {
         self.atlas.truncate(SIDE * height * 4);
         self.atlas.shrink_to_fit();
         self.used_height = height;
+        self.vertices.shrink_to_fit();
+        self.indices.shrink_to_fit();
+        self.placements.shrink_to_fit();
         if self.shared_atlas.is_some() {
             assert!(self.atlas.is_empty() && self.mips.is_empty());
             return self;
@@ -458,11 +461,12 @@ fn run(
         height: 1,
         rgba: vec![160, 160, 160, 255],
     };
-    for start in (first..limit).step_by(64) {
+    let batch_size = if crate::objects::unbounded_textures() { 64 } else { 24 };
+    for start in (first..limit).step_by(batch_size) {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
         }
-        let end = (start + 64).min(limit);
+        let end = (start + batch_size).min(limit);
         let ids: Vec<_> = (start..end).collect();
         objects.load_ids(&ids)?;
         for id in ids {
@@ -641,6 +645,13 @@ pub struct GpuPage {
     page_has_sdr: bool,
 }
 impl GpuPage {
+    pub fn release_cpu_ranges(&mut self) {
+        self.placements.clear();
+        self.placements.shrink_to_fit();
+        self.bounds.clear();
+        self.bounds.shrink_to_fit();
+    }
+
     pub fn upload(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
