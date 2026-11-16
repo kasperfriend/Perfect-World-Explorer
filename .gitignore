@@ -13,6 +13,7 @@ Thumbs.db
 .env.*
 # Local toolchains and validation scratch data
 /.cache/
+/sdk/directstorage/
 # Private client files staged by the Drive connector
 /google_drive/
 

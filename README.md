@@ -120,6 +120,7 @@ The water render target details, simple-water lighting/fog, quality modes, wave 
 
 ```text
 Cargo.toml, Cargo.lock   Rust package and locked dependencies
+build.rs                 optional DirectStorage SDK bridge build
 src/                     viewer, parsers, GPU code and diagnostics
 Modules/                 installed module packages copied beside the executable
 tools/package-windows.ps1 shared PR/release portable-package builder
@@ -134,6 +135,41 @@ LICENSE                  project license
 The project is marked **GPL-2.0-or-later**; see [LICENSE](LICENSE). BMD and terrain format research was informed by the GPL-2.0-or-later [GameForge static importer](https://github.com/shaddowdaniel/GameForge-3D-Studio-/blob/0a7fae8fcba0df7b0daa988db8696a0feaf49f7b/source/blender/io/angelica/formats/angelica_static.cc) and [terrain importer](https://github.com/shaddowdaniel/GameForge-3D-Studio-/blob/0a7fae8fcba0df7b0daa988db8696a0feaf49f7b/source/blender/io/angelica/formats/angelica_terrain.cc), copyright 2026 GameForge 3D Studio Authors. Leaf-card methods were informed by the GPL-2.0 [mt2-world-baker](https://github.com/moleh1307/mt2-world-baker); ECWLD layout research used the [RaGEZONE discussion](https://forum.ragezone.com/threads/map-editor.1252114/). Dependency licenses also apply.
 
 **Before public distribution**, verify that you have the rights to publish the launcher artwork and all included code/binaries, and review third-party dependencies and applicable game terms. The provenance and redistribution rights of `tools/launcher-art.jpg` have not been established in this package; replace it with artwork you have rights to if necessary. Do not redistribute the proprietary game client, its DLLs, archives, extracted assets, or derived caches. The `.gitignore` reduces accidental commits but is not a substitute for reviewing staged files.
+
+### Optional Windows DirectStorage archive reads
+
+Windows/MSVC builds can use the Microsoft DirectStorage **system-memory file
+queue** for large (64 KiB and up) PCK payload reads. This is opt-in at build
+time and runtime-safe: if the SDK or runtime is absent, or a request fails, the
+reader transparently uses the existing positioned `ReadFile` path.
+
+On a Windows x64 machine with Visual Studio Build Tools installed, run this in a Visual Studio developer PowerShell. `nuget.exe` must be on `PATH`:
+
+```powershell
+$repo = (Get-Location).Path
+nuget install Microsoft.Direct3D.DirectStorage -Version 1.3.0 -OutputDirectory "$repo\sdk\directstorage"
+$env:DIRECTSTORAGE_SDK_DIR = "$repo\sdk\directstorage\Microsoft.Direct3D.DirectStorage.1.3.0"
+cargo build --release
+
+# Optional: enable the runtime too for this local build. Keep these licensed
+# redistributables beside the EXE; do not commit them to Git.
+$runtime = Join-Path $env:DIRECTSTORAGE_SDK_DIR 'native\bin\x64'
+Copy-Item "$runtime\dstorage.dll" 'target\release\'
+Copy-Item "$runtime\dstoragecore.dll" 'target\release\'
+```
+
+The repository ignores `sdk/directstorage/`, so the locally extracted package
+won't enter a commit. Follow the package's license/redistribution terms when
+copying runtime DLLs. If the SDK path is unset, builds do not compile the bridge;
+if the runtime DLLs are absent, the application falls back to ordinary I/O.
+
+The bridge uses the DirectStorage runtime to issue large archive range reads
+into system memory. It does **not** make this client instantly load: scene
+parsing and GPU uploads remain, the PCK content still needs its normal CPU
+processing, and the bridge waits for each individual request. GPU GDeflate
+acceleration is not applicable to the client's existing PCK encoding. No
+DirectStorage hardware benchmark has been run here; use the normal build unless
+you have the SDK/runtime and can measure on the target machine.
 
 ### RAM-first lossless terrain cache
 

@@ -2,6 +2,9 @@
 //! Layout informed by GameForge's GPL-2.0-or-later Angelica importer.
 use flate2::read::ZlibDecoder;
 use flate2::{Decompress, FlushDecompress};
+#[cfg(windows)]
+#[path = "direct_storage.rs"]
+mod direct_storage;
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -15,6 +18,14 @@ fn u32le(b: &[u8], p: usize) -> Result<u32, String> {
 }
 fn at(f: &mut File, p: u64, n: usize) -> Result<Vec<u8>, String> {
     let mut b = vec![0; n];
+    // Small directory/header reads are cheaper through the regular file API.
+    // Larger archive payloads can use the optional DirectStorage system-memory
+    // queue when the user built against Microsoft's SDK and installed runtime.
+    // Every request retains the original positional-read fallback.
+    #[cfg(windows)]
+    if n >= 64 * 1024 && direct_storage::read_range(f, p, &mut b) {
+        return Ok(b);
+    }
     f.seek(SeekFrom::Start(p))
         .and_then(|_| f.read_exact(&mut b))
         .map_err(|e| e.to_string())?;
@@ -152,17 +163,24 @@ pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
 
 pub fn read_entry_at(f: &File, e: &Entry) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut raw = vec![0u8; e.compressed as usize];
-    let mut read = 0usize;
-    while read < raw.len() {
-        let off = e.offset as u64 + read as u64;
-        #[cfg(windows)]
-        let n = std::os::windows::fs::FileExt::seek_read(f, &mut raw[read..], off)?;
-        #[cfg(unix)]
-        let n = std::os::unix::fs::FileExt::read_at(f, &mut raw[read..], off)?;
-        if n == 0 {
-            return Err("unexpected EOF".into());
+    #[cfg(windows)]
+    let accelerated = raw.len() >= 64 * 1024
+        && direct_storage::read_range(f, e.offset as u64, &mut raw);
+    #[cfg(not(windows))]
+    let accelerated = false;
+    if !accelerated {
+        let mut read = 0usize;
+        while read < raw.len() {
+            let off = e.offset as u64 + read as u64;
+            #[cfg(windows)]
+            let n = std::os::windows::fs::FileExt::seek_read(f, &mut raw[read..], off)?;
+            #[cfg(unix)]
+            let n = std::os::unix::fs::FileExt::read_at(f, &mut raw[read..], off)?;
+            if n == 0 {
+                return Err("unexpected EOF".into());
+            }
+            read += n;
         }
-        read += n;
     }
     if e.compressed < e.size {
         let out = inflate(&raw, e.size as usize)?;
