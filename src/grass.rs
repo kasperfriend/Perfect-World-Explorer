@@ -319,8 +319,8 @@ impl Grass {
         // Restore original area order afterwards so draw order stays unchanged.
         records.sort_by_key(|r| r.0);
         
-let mut groups: Vec<(usize, &[(usize, usize, usize)])> = Vec::new();
-let mut g_start = 0usize;
+    let mut groups: Vec<(usize, &[(usize, usize, usize)])> = Vec::new();
+    let mut g_start = 0usize;
         while g_start < records.len() {
             let idx = records[g_start].0;
             let mut g_end = g_start + 1;
@@ -436,7 +436,7 @@ let mut g_start = 0usize;
                 handles
                     .into_iter()
                     .flat_map(|h| h.join().unwrap())
-                .collect()
+                    .collect()
             })
         } else {
             groups.iter().map(process_group).collect()
@@ -463,8 +463,8 @@ let mut g_start = 0usize;
         if !scene.grass_types.is_empty() {
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
-                    .unwrap_or(1)
-                    .min(scene.grass_types.len());
+                .unwrap_or(1)
+                .min(scene.grass_types.len());
             let chunk_size = scene.grass_types.len().div_ceil(workers);
             let chunks: Vec<Vec<_>> = std::thread::scope(|s| {
                 let handles: Vec<_> = scene
@@ -530,7 +530,7 @@ let mut g_start = 0usize;
                         })
                         .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
-                });
+            });
             for chunk in chunks {
                 models.extend(chunk);
             }
@@ -567,7 +567,7 @@ let mut g_start = 0usize;
                 }
             }
         }
-    
+
         for path in &warnings {
             eprintln!("Missing or unsupported grass texture: {path}");
         }
