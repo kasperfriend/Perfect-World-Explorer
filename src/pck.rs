@@ -1,6 +1,7 @@
 //! Reader for the retail client's v2 PCK directory and entries.
 //! Layout informed by GameForge's GPL-2.0-or-later Angelica importer.
 use flate2::read::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress};
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -20,7 +21,7 @@ fn at(f: &mut File, p: u64, n: usize) -> Result<Vec<u8>, String> {
     Ok(b)
 }
 fn inflate(bytes: &[u8], expected: usize) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(expected.min(1024 * 1024));
+    let mut out = Vec::with_capacity(expected);
     ZlibDecoder::new(bytes)
         .take((expected + 1) as u64)
         .read_to_end(&mut out)
@@ -68,23 +69,43 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     if count > 1_000_000 {
         return Err("entry count exceeds limit".into());
     }
-    let mut pos = (u32le(&header, 8)? ^ MASK) as u64;
+    let pos = (u32le(&header, 8)? ^ MASK) as u64;
+    let table_end = end - 280;
+    if pos > table_end {
+        return Err("entry table overlaps footer".into());
+    }
+    let table = at(f, pos, (table_end - pos) as usize)?;
+    let mut cursor = 0usize;
+    let mut decomp = Decompress::new(true);
+    let mut buf = [0u8; 276];
     let mut result = Vec::with_capacity(count);
     for _ in 0..count {
-        if pos + 8 > end - 280 {
+        if cursor + 8 > table.len() {
             return Err("entry table overlaps footer".into());
         }
-        let h = at(f, pos, 8)?;
-        let len = (u32le(&h, 0)? ^ MASK) as usize;
-        if u32le(&h, 4)? ^ MASK ^ CHECK != len as u32
+        let h = &table[cursor..cursor + 8];
+        let len = (u32le(h, 0)? ^ MASK) as usize;
+        if u32le(h, 4)? ^ MASK ^ CHECK != len as u32
             || len == 0
             || len > 276
-            || pos + 8 + len as u64 > end - 280
+            || cursor + 8 + len > table.len()
         {
             return Err("invalid entry table record".into());
         }
-        let raw = at(f, pos + 8, len)?;
-        let data = if len == 276 { raw } else { inflate(&raw, 276)? };
+        let raw = &table[cursor + 8..cursor + 8 + len];
+        let data: &[u8] = if len == 276 {
+            raw
+        } else {
+            decomp.reset(true);
+            decomp
+                .decompress(raw, &mut buf, FlushDecompress::Finish)
+                .map_err(|e| e.to_string())?;
+            if decomp.total_out() != 276 {
+                let n = decomp.total_out();
+                return Err(format!("unexpected entry record size: {n}"));
+            }
+            &buf
+        };
         let zero = data[..260].iter().position(|&x| x == 0).unwrap_or(260);
         let (decoded, _, _) = encoding_rs::GBK.decode(&data[..zero]);
         let name = decoded.replace('\\', "/");
@@ -103,19 +124,16 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
             size: usize_,
             compressed,
         });
-        pos += 8 + len as u64;
+        cursor += 8 + len;
     }
     Ok(result)
 }
 
 pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
     if e.compressed < e.size {
-        // Decode directly from a bounded file reader. The old path retained a
-        // complete compressed member alongside its expanded output.
-        f.seek(SeekFrom::Start(e.offset as u64))
-            .map_err(|err| err.to_string())?;
-        let mut out = Vec::with_capacity((e.size as usize).min(1024 * 1024));
-        ZlibDecoder::new(f.take(e.compressed as u64))
+        let compressed = at(f, e.offset as u64, e.compressed as usize)?;
+        let mut out = Vec::with_capacity(e.size as usize);
+        ZlibDecoder::new(compressed.as_slice())
             .take(e.size as u64 + 1)
             .read_to_end(&mut out)
             .map_err(|err| err.to_string())?;
@@ -129,6 +147,31 @@ pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
         Ok(out)
     } else {
         at(f, e.offset as u64, e.compressed as usize)
+    }
+}
+
+pub fn read_entry_at(f: &File, e: &Entry) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut raw = vec![0u8; e.compressed as usize];
+    let mut read = 0usize;
+    while read < raw.len() {
+        let off = e.offset as u64 + read as u64;
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(f, &mut raw[read..], off)?;
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(f, &mut raw[read..], off)?;
+        if n == 0 {
+            return Err("unexpected EOF".into());
+        }
+        read += n;
+    }
+    if e.compressed < e.size {
+        let out = inflate(&raw, e.size as usize)?;
+        if out.len() != e.size as usize {
+            return Err(format!("bad decompressed size: {} != {}", out.len(), e.size).into());
+        }
+        Ok(out)
+    } else {
+        Ok(raw)
     }
 }
 

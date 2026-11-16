@@ -20,7 +20,7 @@ use std::{
 /// whole window plus its neighbours and the in-viewer rebuild stops decoding
 /// the same blocks again. Smaller budgets trade RAM for I/O stalls; the
 /// environment override still accepts 1..256 MiB.
-const DEFAULT_BUDGET: usize = 32 * 1024 * 1024;
+const DEFAULT_BUDGET: usize = 16 * 1024 * 1024;
 static NEXT: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 struct Record {

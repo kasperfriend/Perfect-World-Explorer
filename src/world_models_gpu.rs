@@ -90,6 +90,7 @@ struct Slot {
     posed: Option<Result<SlotPose, String>>,
     geometry_dirty: bool,
     vertex_fog: Option<f32>,
+    visible: bool,
 }
 
 /// Per-frame alpha-pass diagnostics; see [`World::alpha_status`].
@@ -111,6 +112,7 @@ pub struct AlphaStatus {
 
 pub struct World {
     assets: Assets,
+    keep_unbounded: bool,
     slots: Vec<Slot>,
     read: Box<dyn FnMut(&str) -> Result<Vec<u8>, String>>,
     textures: HashMap<String, (std::sync::Arc<wgpu::Texture>, bool)>,
@@ -156,6 +158,9 @@ pub struct World {
     /// Retail alpha insertion order as (slot, mesh) pairs.
     alpha: Vec<model_queue::AlphaCandidate>,
     reported: Vec<String>,
+    frustum: Option<[[f32; 4]; 6]>,
+    scratch_candidates: Vec<model_queue::AlphaCandidate>,
+    scratch_failures: Vec<(usize, String)>,
 }
 
 impl World {
@@ -213,6 +218,7 @@ impl World {
                 posed: None,
                 geometry_dirty: true,
                 vertex_fog: None,
+                visible: true,
             })
             .collect();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -226,6 +232,7 @@ impl World {
         });
         Ok(Self {
             assets,
+            keep_unbounded: false,
             slots,
             read: Box::new(read),
             textures: HashMap::new(),
@@ -248,6 +255,9 @@ impl World {
             resident_bounds: None,
             alpha: Vec::new(),
             reported: Vec::new(),
+            frustum: None,
+            scratch_candidates: Vec::new(),
+            scratch_failures: Vec::new(),
         })
     }
     /// A world with no model assets of its own.
@@ -263,6 +273,13 @@ impl World {
             Err(format!("no model archive attached: {path}"))
         })
         .expect("an empty world model set cannot be invalid")
+    }
+    pub fn set_keep_unbounded(&mut self, keep: bool) {
+        self.keep_unbounded = keep;
+    }
+
+    pub fn set_frustum(&mut self, frustum: Option<[[f32; 4]; 6]>) {
+        self.frustum = frustum;
     }
     /// Attach the real GFX archive so installed producers can load their roots.
     /// Root text is GBK-decoded here; the owner manager never guesses an
@@ -1025,6 +1042,74 @@ impl World {
     /// (main, reflection, refraction) reuses it.
     fn advance_poses(&mut self, delta_ms: u32) {
         let bounds = self.resident_bounds;
+        let len = self.slots.len();
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(16);
+        if len >= 64 && threads > 1 {
+            let assets = &self.assets.assets;
+            let chunk_size = (len + threads - 1) / threads;
+            std::thread::scope(|s| {
+                for (inst_chunk, slot_chunk) in self
+                    .assets
+                    .instances
+                    .chunks_mut(chunk_size)
+                    .zip(self.slots.chunks_mut(chunk_size))
+                {
+                    s.spawn(move || {
+                        for (instance, slot) in inst_chunk.iter_mut().zip(slot_chunk.iter_mut()) {
+                            if !cutoff_residency::contains(bounds, instance.placement.position) {
+                                continue;
+                            }
+                            if slot.failed {
+                                continue;
+                            }
+                            let asset = &assets[instance.asset];
+                            let sample = match instance.playback.as_mut() {
+                                Ok(clock) => {
+                                    if delta_ms != 0 {
+                                        if let Err(e) = clock.tick(delta_ms) {
+                                            slot.posed = Some(Err(e));
+                                            continue;
+                                        }
+                                    }
+                                    clock.sample()
+                                }
+                                Err(e) => {
+                                    slot.posed = Some(Err(e.clone()));
+                                    continue;
+                                }
+                            };
+                            if let Some(Ok(previous)) = &slot.posed {
+                                if previous.sample == sample {
+                                    continue;
+                                }
+                            }
+                            let result = (|| -> Result<SlotPose, String> {
+                                let transform = *slot.transform.as_ref().map_err(Clone::clone)?;
+                                let pose = match sample {
+                                    Some((action, time)) => {
+                                        asset.action_pose(action, time, transform)?
+                                    }
+                                    None => asset.bind_pose(transform)?,
+                                };
+                                let meshes = asset.meshes_from_pose(&pose)?;
+                                Ok(SlotPose {
+                                    sample,
+                                    pose,
+                                    meshes,
+                                })
+                            })();
+                            slot.geometry_dirty = true;
+                            slot.posed = Some(result);
+                        }
+                    });
+                }
+            });
+            return;
+        }
+
         for (instance, slot) in self.assets.instances.iter_mut().zip(&mut self.slots) {
             if !cutoff_residency::contains(bounds, instance.placement.position) {
                 continue;
@@ -1134,6 +1219,8 @@ impl World {
         night: f32,
     ) {
         let bounds = self.resident_bounds;
+        let frustum = self.frustum;
+        let keep_unbounded = self.keep_unbounded;
         let Self {
             assets,
             slots,
@@ -1148,11 +1235,24 @@ impl World {
         } = self;
         for (instance, slot) in assets.instances.iter().zip(slots.iter_mut()) {
             if !cutoff_residency::contains(bounds, instance.placement.position) {
+                slot.visible = false;
+                if !keep_unbounded {
+                    slot.draw = None;
+                    slot.posed = None;
+                }
                 continue;
             }
             if slot.failed {
+                slot.visible = false;
                 continue;
             }
+            if let Some(planes) = frustum {
+                if !sphere_in_frustum(&planes, instance.placement.position, 128.0) {
+                    slot.visible = false;
+                    continue;
+                }
+            }
+            slot.visible = true;
             let asset = &assets.assets[instance.asset];
             let outcome = draw_one(
                 device,
@@ -1184,9 +1284,12 @@ impl World {
     /// priority weights of the original insertion routine were not recovered, so
     /// they stay zero and the comparison falls through to distance.
     fn rebuild_alpha_order(&mut self, eye: [f32; 3]) {
-        let mut candidates: Vec<model_queue::AlphaCandidate> = Vec::new();
-        let mut failures: Vec<(usize, String)> = Vec::new();
+        self.scratch_candidates.clear();
+        self.scratch_failures.clear();
         for (slot, entry) in self.slots.iter().enumerate() {
+            if !entry.visible {
+                continue;
+            }
             let Some(draw) = &entry.draw else {
                 continue;
             };
@@ -1203,7 +1306,7 @@ impl World {
                     transform.to_cols_array_2d(),
                     eye,
                 ) {
-                    Ok(distance) => candidates.push(model_queue::AlphaCandidate {
+                    Ok(distance) => self.scratch_candidates.push(model_queue::AlphaCandidate {
                         slot,
                         mesh,
                         node: model_queue::AlphaNode {
@@ -1217,25 +1320,25 @@ impl World {
                             distance,
                         },
                     }),
-                    Err(e) => failures.push((slot, e)),
+                    Err(e) => self.scratch_failures.push((slot, e)),
                 }
             }
         }
-        match model_queue::alpha_order(&candidates) {
+        match model_queue::alpha_order(&self.scratch_candidates) {
             Ok(order) => self.alpha = order,
             Err(e) => {
                 self.alpha.clear();
                 self.reported.push(format!("alpha queue: {e}"));
             }
         }
-        for (slot, error) in failures {
+        for (slot, error) in &self.scratch_failures {
             self.reported
                 .push(format!("alpha queue slot {slot}: {error}"));
-            if let Some(entry) = self.slots.get_mut(slot) {
+            if let Some(entry) = self.slots.get_mut(*slot) {
                 entry.failed = true;
                 entry.draw = None;
             }
-            self.alpha.retain(|candidate| candidate.slot != slot);
+            self.alpha.retain(|candidate| candidate.slot != *slot);
         }
     }
     /// Include dependency failures in the UI; never count a skipped asset ready.
@@ -1252,6 +1355,9 @@ impl World {
     /// Opaque meshes first, then the retail alpha list in its insertion order.
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         for slot in &self.slots {
+            if !slot.visible {
+                continue;
+            }
             if let Some(draw) = &slot.draw {
                 draw.draw_opaque(pass);
             }
@@ -1305,6 +1411,16 @@ impl World {
         }
         status
     }
+}
+
+fn sphere_in_frustum(planes: &[[f32; 4]; 6], center: [f32; 3], radius: f32) -> bool {
+    for &[a, b, c, d] in planes {
+        let len = (a * a + b * b + c * c).sqrt();
+        if len > 0.0 && a * center[0] + b * center[1] + c * center[2] + d < -radius * len {
+            return false;
+        }
+    }
+    true
 }
 
 /// Upload one slot's already-evaluated pose. Split out of `World::draw_models`

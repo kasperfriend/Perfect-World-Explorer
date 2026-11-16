@@ -169,7 +169,8 @@ pub struct Draw {
     fallback: TextureEntry,
     /// This frame's groups in draw order, with their vertex counts.
     order: Vec<(BucketKey, u32)>,
-    staging: Vec<Vertex>,
+    scratch_index: HashMap<BucketKey, usize>,
+    scratch_pool: Vec<Vec<Vertex>>,
     failed: Vec<String>,
 }
 
@@ -409,7 +410,8 @@ impl Draw {
             sampler_clamp,
             fallback,
             order: Vec::new(),
-            staging: Vec::new(),
+            scratch_index: HashMap::new(),
+            scratch_pool: Vec::new(),
             failed: Vec::new(),
         })
     }
@@ -482,26 +484,39 @@ impl Draw {
         // Group and order: `RenderLayer` first, then depth-tested quads, then
         // the blend pair and the texture so a group reuses one pipeline.
         let mut groups: Vec<(BucketKey, Vec<Vertex>)> = Vec::new();
-        let mut index: HashMap<BucketKey, usize> = HashMap::new();
+        self.scratch_index.clear();
         for quad in quads {
-            let key = BucketKey {
-                layer: quad.layer,
-                pipeline: PipelineKey {
-                    source: quad.source_blend,
-                    destination: quad.destination_blend,
-                    depth_test: quad.depth_test,
-                    write_depth: quad.mesh.as_ref().is_some_and(|mesh| mesh.write_depth),
-                },
-                priority: quad.priority,
-                tile: quad.tile,
-                texture: quad.texture.clone(),
+            let pipeline = PipelineKey {
+                source: quad.source_blend,
+                destination: quad.destination_blend,
+                depth_test: quad.depth_test,
+                write_depth: quad.mesh.as_ref().is_some_and(|mesh| mesh.write_depth),
             };
-            let position = match index.get(&key) {
-                Some(position) => *position,
-                None => {
-                    index.insert(key.clone(), groups.len());
-                    groups.push((key.clone(), Vec::new()));
-                    groups.len() - 1
+            let position = if groups.last_mut().is_some_and(|(last_key, _)| {
+                last_key.layer == quad.layer
+                    && last_key.pipeline == pipeline
+                    && last_key.priority == quad.priority
+                    && last_key.tile == quad.tile
+                    && last_key.texture == quad.texture.as_str()
+            }) {
+                groups.len() - 1
+            } else {
+                let key = BucketKey {
+                    layer: quad.layer,
+                    pipeline,
+                    priority: quad.priority,
+                    tile: quad.tile,
+                    texture: quad.texture.clone(),
+                };
+                match self.scratch_index.get(&key) {
+                    Some(position) => *position,
+                    None => {
+                        let mut verts = self.scratch_pool.pop().unwrap_or_default();
+                        verts.clear();
+                        self.scratch_index.insert(key.clone(), groups.len());
+                        groups.push((key, verts));
+                        groups.len() - 1
+                    }
                 }
             };
             let vertices = &mut groups[position].1;
@@ -651,10 +666,12 @@ impl Draw {
                     mapped_at_creation: false,
                 });
             }
-            self.staging.clear();
-            self.staging.extend_from_slice(vertices);
-            queue.write_buffer(&bucket.buffer, 0, bytemuck::cast_slice(&self.staging));
+            queue.write_buffer(&bucket.buffer, 0, bytemuck::cast_slice(vertices));
             self.order.push((key.clone(), vertices.len() as u32));
+        }
+        for (_, mut verts) in groups {
+            verts.clear();
+            self.scratch_pool.push(verts);
         }
         Ok(())
     }
@@ -667,13 +684,17 @@ impl Draw {
     }
 
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        let mut last_pipeline = None;
         for (key, count) in &self.order {
             let (Some(bucket), Some(pipeline)) =
                 (self.buckets.get(key), self.pipelines.get(&key.pipeline))
             else {
                 continue;
             };
-            pass.set_pipeline(pipeline);
+            if last_pipeline != Some(key.pipeline) {
+                pass.set_pipeline(pipeline);
+                last_pipeline = Some(key.pipeline);
+            }
             pass.set_bind_group(0, &bucket.binding, &[]);
             pass.set_vertex_buffer(0, bucket.buffer.slice(..));
             pass.draw(0..*count, 0..1);

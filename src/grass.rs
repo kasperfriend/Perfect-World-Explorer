@@ -301,11 +301,8 @@ impl Grass {
         for _ in 0..n {
             names.push(water::path_string(&b, &mut p)?)
         }
-        let mut file_index = None;
-        let mut file_data = Vec::new();
         let mut records = Vec::new();
         let mut seen = HashMap::new();
-        let mut areas = Vec::new();
         for block in &scene.blocks {
             for r in &block.grass {
                 if let Some(previous) = seen.insert(r.export_id, r.offset) {
@@ -321,81 +318,133 @@ impl Grass {
         // Read each BSData file exactly once, retaining only one at a time.
         // Restore original area order afterwards so draw order stays unchanged.
         records.sort_by_key(|r| r.0);
-        for (index, order, off) in records {
-            let type_id = u(&b, off)? as usize;
-            if type_id >= scene.grass_types.len() {
-                return Err("grass type index".into());
+
+        let mut groups: Vec<(usize, &[(usize, usize, usize)])> = Vec::new();
+        let mut g_start = 0usize;
+        while g_start < records.len() {
+            let idx = records[g_start].0;
+            let mut g_end = g_start + 1;
+            while g_end < records.len() && records[g_end].0 == idx {
+                g_end += 1;
             }
-            let center = [f(&b, off + 4)?, f(&b, off + 8)?, f(&b, off + 12)?];
-            let grid = f(&b, off + 16)?;
-            let width = u(&b, off + 20)? as usize;
-            let height = u(&b, off + 24)? as usize;
-            if width == 0
-                || height == 0
-                || width > 4096
-                || height > 4096
-                || width % 8 != 0
-                || grid <= 0.
-                || grid > 10000.
-            {
-                return Err("invalid grass bitmap dimensions".into());
-            }
-            let bytes = width.checked_mul(height).ok_or("grass mask overflow")? / 8;
-            let rec = u(&b, off + 32)? as usize;
-            if file_index != Some(index) {
-                let name = names.get(index).ok_or("grass BSData index")?;
-                drop(std::mem::take(&mut file_data));
-                file_data = fs::read(water::resolve_case_insensitive(dir, name)?)
-                    .map_err(|e| e.to_string())?;
-                file_index = Some(index);
-            }
-            let data = &file_data;
-            if u(data, 0)? != 0x42584f4d || u(data, 4)? != 2 {
-                return Err("unsupported grass BSData".into());
-            }
-            let tail = data.len().checked_sub(4).ok_or("short grass BSData")?;
-            let count = u(data, tail)? as usize;
-            let table = tail
-                .checked_sub(count.checked_mul(4).ok_or("grass table overflow")?)
-                .ok_or("bad grass table")?;
-            if rec >= count {
-                return Err("grass record index".into());
-            }
-            let start = u(data, table + rec * 4)? as usize;
-            let stored = u(data, start)? as usize;
-            let raw = u(data, start + 4)? as usize;
-            if raw != bytes || stored > bytes * 2 + 1024 {
-                return Err("invalid grass compressed size".into());
-            }
-            let src = data
-                .get(start + 8..start + 8 + stored)
-                .ok_or("short grass compressed bitmap")?;
-            let mut output = Vec::with_capacity(bytes);
-            ZlibDecoder::new(src)
-                .take((bytes + 1) as u64)
-                .read_to_end(&mut output)
-                .map_err(|e| e.to_string())?;
-            if output.len() != bytes {
-                return Err("bad grass bitmap length".into());
-            }
-            let count = output.iter().map(|byte| byte.count_ones() as usize).sum();
-            let active = ActiveMask {
-                packed: src.to_vec(),
-                count,
-            };
-            areas.push((
-                order,
-                Area {
-                    type_id,
-                    center,
-                    grid,
-                    width,
-                    height,
-                    active,
-                },
-            ));
+            groups.push((idx, &records[g_start..g_end]));
+            g_start = g_end;
         }
-        drop(file_data);
+        let process_group = |&(index, group): &(usize, &[(usize, usize, usize)])| {
+            let name = names
+                .get(index)
+                .ok_or_else(|| "grass BSData index".to_string())?;
+            let path = water::resolve_case_insensitive(dir, name).map_err(|e| e.to_string())?;
+            let data = fs::read(path).map_err(|e| e.to_string())?;
+            if u(&data, 0).map_err(|e| e.to_string())? != 0x42584f4d
+                || u(&data, 4).map_err(|e| e.to_string())? != 2
+            {
+                return Err("unsupported grass BSData".to_string());
+            }
+            let tail = data
+                .len()
+                .checked_sub(4)
+                .ok_or_else(|| "short grass BSData".to_string())?;
+            let count = u(&data, tail).map_err(|e| e.to_string())? as usize;
+            let table_len = count
+                .checked_mul(4)
+                .ok_or_else(|| "grass table overflow".to_string())?;
+            let table = tail
+                .checked_sub(table_len)
+                .ok_or_else(|| "bad grass table".to_string())?;
+            let mut group_areas = Vec::with_capacity(group.len());
+            for &(_, order, off) in group {
+                let type_id = u(&b, off).map_err(|e| e.to_string())? as usize;
+                if type_id >= scene.grass_types.len() {
+                    return Err("grass type index".to_string());
+                }
+                let cx = f(&b, off + 4).map_err(|e| e.to_string())?;
+                let cy = f(&b, off + 8).map_err(|e| e.to_string())?;
+                let cz = f(&b, off + 12).map_err(|e| e.to_string())?;
+                let center = [cx, cy, cz];
+                let grid = f(&b, off + 16).map_err(|e| e.to_string())?;
+                let width = u(&b, off + 20).map_err(|e| e.to_string())? as usize;
+                let height = u(&b, off + 24).map_err(|e| e.to_string())? as usize;
+                if width == 0
+                    || height == 0
+                    || width > 4096
+                    || height > 4096
+                    || width * height % 8 != 0
+                {
+                    return Err("grass mask size".to_string());
+                }
+                let cells = width
+                    .checked_mul(height)
+                    .ok_or_else(|| "grass mask overflow".to_string())?;
+                let bytes = cells / 8;
+                let rec = u(&b, off + 32).map_err(|e| e.to_string())? as usize;
+                if rec >= count {
+                    return Err("grass record index".to_string());
+                }
+                let start = u(&data, table + rec * 4).map_err(|e| e.to_string())? as usize;
+                let stored = u(&data, start).map_err(|e| e.to_string())? as usize;
+                let raw = u(&data, start + 4).map_err(|e| e.to_string())? as usize;
+                if raw != bytes || stored > bytes * 2 + 1024 {
+                    return Err("invalid grass compressed size".to_string());
+                }
+                let src = data
+                    .get(start + 8..start + 8 + stored)
+                    .ok_or_else(|| "short grass compressed bitmap".to_string())?;
+                let mut output = Vec::with_capacity(bytes);
+                let mut dec = ZlibDecoder::new(src).take((bytes + 1) as u64);
+                dec.read_to_end(&mut output).map_err(|e| e.to_string())?;
+                if output.len() != bytes {
+                    return Err("bad grass bitmap length".to_string());
+                }
+                let count = output.iter().map(|byte| byte.count_ones() as usize).sum();
+                let active = ActiveMask {
+                    packed: src.to_vec(),
+                    count,
+                };
+                group_areas.push((
+                    order,
+                    Area {
+                        type_id,
+                        center,
+                        grid,
+                        width,
+                        height,
+                        active,
+                    },
+                ));
+            }
+            Ok::<_, String>(group_areas)
+        };
+        let bsd_workers = if groups.len() > 1 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(groups.len())
+        } else {
+            1
+        };
+        let bsd_results: Vec<Result<Vec<(usize, Area)>, String>> = if bsd_workers > 1 {
+            let chunk_size = groups.len().div_ceil(bsd_workers);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = groups
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        let process = &process_group;
+                        s.spawn(move || chunk.iter().map(process).collect::<Vec<_>>())
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .collect()
+            })
+        } else {
+            groups.iter().map(process_group).collect()
+        };
+        let mut areas = Vec::with_capacity(records.len());
+        for res in bsd_results {
+            areas.extend(res?);
+        }
         areas.sort_by_key(|a| a.0);
         let areas: Vec<_> = areas.into_iter().map(|(_, area)| area).collect();
         let packed: usize = areas.iter().map(|a| a.active.packed.len()).sum();
@@ -407,87 +456,118 @@ impl Grass {
             .into_iter()
             .map(|e| (e.name.to_lowercase(), e))
             .collect();
-        let mut models = Vec::new();
+        let mut models = Vec::with_capacity(scene.grass_types.len());
         let mut textures = HashMap::new();
         let mut texture_mips = HashMap::new();
         let mut warnings = HashSet::new();
-        for t in &scene.grass_types {
-            // A grass type may name either the `.mox` geometry directly or the
-            // `.mod` text container that wraps it. The archive ships both (155
-            // `.mox` and 144 `.mod`); the `.mod` is a one-child manifest, so
-            // resolving it here keeps the rest of the loader unchanged.
-            let mut name = t.path.to_lowercase();
-            let mut skip = false;
-            if name.ends_with(".mod") {
-                match entries
-                    .get(&name)
-                    .ok_or_else(|| "missing MOXTMODEL".to_string())
-                    .and_then(|e| pck::read_entry(&mut archive, e))
-                    .and_then(|b| mox_wrapper_child(&b))
-                {
-                    Ok(child) => {
-                        let dir = name.rsplit_once('/').map(|x| x.0).unwrap_or("");
-                        name = format!("{dir}/{child}");
-                    }
-                    Err(error) => {
-                        eprintln!("Unsupported grass model wrapper {name}: {error}");
-                        skip = true;
-                    }
-                }
-            }
-            let model = if skip {
-                None
-            } else {
-                match entries.get(&name) {
-                    Some(e) => match pck::read_entry(&mut archive, e)
-                        .and_then(|bytes| parse_model(&bytes, &name))
-                    {
-                        Ok(model) => Some(model),
-                        Err(error) => {
-                            eprintln!("Unsupported grass model {name}: {error}");
-                            None
-                        }
-                    },
-                    None => {
-                        eprintln!("Missing grass model {name}");
-                        None
-                    }
-                }
-            };
-            if let Some(m) = &model {
-                for mesh in &m.meshes {
-                    if !textures.contains_key(&mesh.texture) {
-                        let alt = mesh.texture.replace("/textures/", "/");
-                        // One retail asset names its DDS with a space while the
-                        // matching archive member uses an underscore.
-                        let spaced = mesh.texture.replace(' ', "_");
-                        let entry = entries
-                            .get(&mesh.texture)
-                            .or_else(|| entries.get(&alt))
-                            .or_else(|| entries.get(&spaced));
-                        if let Some(entry) = entry {
-                            if let Ok(bytes) = pck::read_entry(&mut archive, entry) {
-                                if let Ok(img) = image::load_from_memory(&bytes) {
-                                    textures.insert(mesh.texture.clone(), img.to_rgba8());
-                                    match crate::vegetation_textures::authored_lower_mips(&bytes) {
-                                        Ok(mips) => {
-                                            texture_mips.insert(mesh.texture.clone(), mips);
+        if !scene.grass_types.is_empty() {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(scene.grass_types.len());
+            let chunk_size = scene.grass_types.len().div_ceil(workers);
+            let chunks: Vec<Vec<_>> = std::thread::scope(|s| {
+                let handles: Vec<_> = scene
+                    .grass_types
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        let entries = &entries;
+                        let archive = &archive;
+                        s.spawn(move || {
+                            chunk.iter().map(|t| {
+
+                                // A grass type may name either the `.mox` geometry directly or the
+                                // `.mod` text container that wraps it. The archive ships both (155
+                                // `.mox` and 144 `.mod`); the `.mod` is a one-child manifest, so
+                                // resolving it here keeps the rest of the loader unchanged.
+                                let mut name = t.path.to_lowercase();
+                                let mut skip = false;
+                                if name.ends_with(".mod") {
+                                    match entries
+                                        .get(&name)
+                                        .ok_or_else(|| "missing MOXTMODEL".to_string())
+                                           .and_then(|e| {
+                                               pck::read_entry_at(archive, e)
+                                                   .map_err(|e| e.to_string())
+                                            })
+                                        .and_then(|b| mox_wrapper_child(&b))
+                                    {
+                                        Ok(child) => {
+                                            let dir = name.rsplit_once('/').map(|x| x.0).unwrap_or("");
+                                            name = format!("{dir}/{child}");
                                         }
-                                        Err(e) => eprintln!(
-                                            "Grass texture {} authored mips unavailable: {e}",
-                                            mesh.texture
-                                        ),
+                                        Err(error) => {
+                                            eprintln!(
+                                                "Unsupported grass model wrapper {name}: {error}"
+                                            );
+                                            skip = true;
+                                        }
                                     }
-                                    continue;
                                 }
+                                if skip {
+                                    None
+                                } else {
+                                    match entries.get(&name) {
+                                        Some(e) => match pck::read_entry_at(archive, e)
+                                            .map_err(|e| e.to_string())
+                                            .and_then(|bytes| parse_model(&bytes, &name))
+                                        {
+                                            Ok(model) => Some(model),
+                                            Err(error) => {
+                                                eprintln!("Unsupported grass model {name}: {error}");
+                                                None
+                                            }
+                                        },
+                                        None => {
+                                            eprintln!("Missing grass model {name}");
+                                            None
+                                        }
+                                    }
+                                }
+                               })
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for chunk in chunks {
+                models.extend(chunk);
+            }
+        }
+        for m in models.iter().flatten() {
+            for mesh in &m.meshes {
+                if !textures.contains_key(&mesh.texture) {
+                    let alt = mesh.texture.replace("/textures/", "/");
+                    // One retail asset names its DDS with a space while the
+                    // matching archive member uses an underscore.
+                    let spaced = mesh.texture.replace(' ', "_");
+                    let entry = entries
+                        .get(&mesh.texture)
+                        .or_else(|| entries.get(&alt))
+                        .or_else(|| entries.get(&spaced));
+                    if let Some(entry) = entry {
+                        if let Ok(bytes) = pck::read_entry(&mut archive, entry) {
+                            if let Ok(img) = image::load_from_memory(&bytes) {
+                                textures.insert(mesh.texture.clone(), img.to_rgba8());
+                                match crate::vegetation_textures::authored_lower_mips(&bytes) {
+                                    Ok(mips) => {
+                                        texture_mips.insert(mesh.texture.clone(), mips);
+                                    }
+                                    Err(e) => eprintln!(
+                                        "Grass texture {} authored mips unavailable: {e}",
+                                        mesh.texture
+                                    ),
+                                }
+                                continue;
                             }
                         }
-                        warnings.insert(mesh.texture.clone());
                     }
+                    warnings.insert(mesh.texture.clone());
                 }
             }
-            models.push(model)
         }
+
         for path in &warnings {
             eprintln!("Missing or unsupported grass texture: {path}");
         }
