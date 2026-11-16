@@ -347,7 +347,6 @@ impl DlssUpscaler {
         color: &wgpu::Texture,
         depth: &wgpu::Texture,
         unjittered_vp: &Mat4,
-        sharpness: f32,
     ) -> Result<(), String> {
         let now = std::time::Instant::now();
         let frame_time_ms = (now - self.last_instant).as_secs_f32() * 1000.0;
@@ -514,12 +513,15 @@ impl DlssUpscaler {
         // anti-aliases by how far content moves per frame.
         self.params
             .set_f32(P_FRAME_TIME_MS, frame_time_ms.clamp(0.1, 1000.0));
-        // `NVSDK_NGX_Parameter_Sharpness` (0 = off, 1 = maximum). DLSS does no
-        // sharpening of its own when this is 0, and its reconstruction is
-        // softer than an RCAS-sharpened FSR frame, which is exactly the
-        // "blurry even at Quality" report. The Graphics tab's DLSS sharpness
-        // slider drives this value.
-        self.params.set_f32(P_SHARPNESS, sharpness.clamp(0.0, 1.0));
+        // `Sharpness` stays 0: NGX reads it from the *create* parameter map in
+        // every shipped wrapper (`NVSDK_NGX_D3D12_DlssCreateParams`,
+        // `nvsdk_ngx_helpers_d3d.h`), so setting it per evaluate did nothing —
+        // which is precisely the report ("the DLSS sharpness slider does
+        // nothing"). The Graphics slider now runs the viewer's own
+        // RCAS-style pass in `DlssUpscaler::composite` instead, so it works
+        // whatever NGX decides to do with the legacy parameter, and it cannot
+        // sharpen twice.
+        self.params.set_f32(P_SHARPNESS, 0.0);
         self.params
             .set_u32(P_RENDER_WIDTH, self.render_extent.0.max(1));
         self.params
@@ -566,23 +568,45 @@ impl DlssUpscaler {
             ));
         }
 
+        if self.frame_index == 0 {
+            // One line per session that proves the feature really evaluated on
+            // the buffers it was given (the extents are what a screen report
+            // needs to be actionable).
+            crate::dlss::diag(&format!(
+                "[DLSS] first evaluate OK ({}x{} -> {}x{}, {})",
+                self.render_extent.0,
+                self.render_extent.1,
+                self.display_extent.0,
+                self.display_extent.1,
+                self.quality_name
+            ));
+        }
         self.reset_history = false;
         self.prev_view_proj = Some(*unjittered_vp);
         self.frame_index += 1;
         Ok(())
     }
 
-    /// Blit the DLSS result into the composition.
+    /// Blit the DLSS result into the composition, sharpening it.
     ///
-    /// Sharpening is applied by NGX itself (`Sharpness`), so this pass is a
-    /// straight copy: sharpening twice would double the halos.
+    /// `sharpness` is the Graphics tab's DLSS slider (0 = off, 1 = maximum). It
+    /// runs the same clamped unsharp pass as the XeSS path: NGX only accepts
+    /// `Sharpness` in the create parameter map, and the feature flag that used
+    /// to enable its own sharpening is deprecated ("Sharpness is not
+    /// supported", `nvsdk_ngx_defs.h`), so the viewer does it.
     pub fn composite(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         target: &wgpu::TextureView,
+        sharpness: f32,
     ) {
-        self.composite
-            .draw(device, queue, &self.natives.output.texture, target, 0.0);
+        self.composite.draw(
+            device,
+            queue,
+            &self.natives.output.texture,
+            target,
+            sharpness,
+        );
     }
 }

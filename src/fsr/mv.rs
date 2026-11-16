@@ -88,7 +88,8 @@ struct FOut {
 pub(crate) const COMPOSITE_SHADER: &str = r#"
 @group(0) @binding(0) var frame: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
-// x = sharpen strength (0 = off), yz = source texel size in UV units.
+// x = sharpen gain (0 = off; the slider's 1.0 arrives as 1.5), yz = source
+// texel size in UV units.
 @group(0) @binding(2) var<uniform> sharpen: vec4<f32>;
 fn srgb_to_linear(c_: vec3<f32>) -> vec3<f32> {
     let low = c_ / vec3<f32>(12.92);

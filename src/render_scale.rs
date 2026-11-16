@@ -194,6 +194,14 @@ impl RenderScale {
         &self.frame
     }
 
+    /// Extent the world is currently rendered at. The frame loop compares this
+    /// with the extent it wants (see the `upscaler_running` check in
+    /// `src/gpu.rs`) so a provider that failed to initialise cannot leave the
+    /// world at a reduced resolution.
+    pub fn input_extent(&self) -> (u32, u32) {
+        self.input_extent
+    }
+
     /// sRGB view the world is rendered into.
     pub fn view(&self) -> wgpu::TextureView {
         self.frame.create_view(&Default::default())

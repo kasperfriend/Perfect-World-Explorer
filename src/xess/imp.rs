@@ -667,6 +667,16 @@ impl XessUpscaler {
             ));
         }
 
+        if self.frame_index == 0 {
+            crate::xess::diag(&format!(
+                "[XeSS] first execute OK ({}x{} -> {}x{}, {})",
+                self.render_extent.0,
+                self.render_extent.1,
+                self.display_extent.0,
+                self.display_extent.1,
+                self.quality_name
+            ));
+        }
         self.reset_history = false;
         self.prev_view_proj = Some(*unjittered_vp);
         self.frame_index += 1;

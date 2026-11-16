@@ -878,7 +878,11 @@ impl FsrComposite {
         target: &wgpu::TextureView,
         sharpness: f32,
     ) {
-        let strength = sharpness.clamp(0.0, 1.0);
+        // The slider's 0..1 maps to a 0..1.5 unsharp gain. 1.0 alone is already a
+        // visible sharpen on a 1.5x reconstruction; allowing 1.5 at the top of
+        // the range makes the control unmistakably active, and the
+        // neighbourhood clamp keeps it halo-free.
+        let strength = sharpness.clamp(0.0, 1.0) * 1.5;
         queue.write_buffer(
             &self.sharpen,
             0,

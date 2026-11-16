@@ -36,16 +36,21 @@ its own setting instead of one shared one:
 | --- | --- | --- | --- |
 | FSR 1 | `fsr1_sharpness` (0–2 stops, lower = sharper) | RCAS in `src/fsr1.wgsl` | 0.2 |
 | FSR 2 / 3.1 / 4 | `fsr3_sharpness` (0 = off, 1 = maximum) | `ffxDispatchDescUpscale.sharpness` with `enableSharpening = sharpness > 0` | 0.75 |
-| DLSS | `dlss_sharpness` (0 = off, 1 = maximum) | NGX `NVSDK_NGX_Parameter_Sharpness` (`"Sharpness"`) in the eval params | 0.35 |
+| DLSS | `dlss_sharpness` (0 = off, 1 = maximum) | the viewer's own pass, in `DlssUpscaler::composite` (same filter as XeSS) | 0.35 |
 | XeSS | `xess_sharpness` (0 = off, 1 = maximum) | the viewer's own RCAS-style pass while the XeSS result is copied into the composition | 0.35 |
 
 DLSS used to be handed `Sharpness = 0`, i.e. *no* sharpening at all, which is
 what made Quality look blurry next to FSR: FSR arrives with RCAS at 0.75 and
-DLSS arrived with nothing. The default is now a mild 0.35 (0 still reproduces
-the raw vendor look). The NGX feature flag
-`NVSDK_NGX_DLSS_Feature_Flags_DoSharpening` is *not* used — the vendored header
-(`nvsdk_ngx_defs.h:296`) marks it deprecated with the comment "Sharpness is not
-supported"; the `"Sharpness"` parameter is the supported channel.
+DLSS arrived with nothing. Setting `NVSDK_NGX_Parameter_Sharpness` per
+*evaluate* did not change anything on screen, though, and that is a real
+limitation rather than a mystery: every shipped NGX wrapper writes `Sharpness`
+in the **create** parameter map (`NVSDK_NGX_D3D12_DlssCreateParams`,
+`nvsdk_ngx_helpers_d3d.h`), so an evaluate-time value is simply not read. The
+feature flag that used to enable NGX's own sharpening is deprecated as well
+(`nvsdk_ngx_defs.h:296`, "Sharpness is not supported"). So the DLSS slider now
+runs the *same* pass as XeSS, after `EvaluateFeature`, inside
+`DlssUpscaler::composite` — predictable, live, and impossible to apply twice
+(NGX is still handed `Sharpness = 0`).
 
 XeSS has no sharpening control at all: Intel's SDK 3.0.2 (`sdk/include/xess/xess.h`)
 exposes `xessD3D12CreateContext`, `xessD3D12Init`, `xessD3D12Execute` and the
@@ -57,7 +62,22 @@ target is sRGB. FSR and DLSS pass 0 to that pass, because their own runtime
 already sharpened; sharpening twice would double the halos.
 
 Every one of these values is read every frame, so dragging a slider takes
-effect without recreating the context.
+effect without recreating the context. The filter's gain is the slider value
+times 1.5 (so 1.0 is a strong but still halo-free sharpen) and it is applied in
+linear light whenever the composition target is sRGB.
+
+**A provider that is not running does not get to shrink the world.** The render
+extent comes from the *support* table (`crate::render_extent`), which keeps
+answering "1280×720" for a quality preset even when the provider itself failed
+to initialise. The fallback in that case is `RenderScale::blit`, a bilinear
+stretch — so a failed DLSS/XeSS used to be *worse* than Upscaling Off: 720p
+bilinearly stretched to 1080p instead of a native 1080p render. At a 1.0× ratio
+(DLAA / Ultra Quality) that stretch is the identity, which is why "DLAA" and
+"Upscaling Off" were indistinguishable. The frame loop now asks
+`RenderScale::input_extent` and, when no provider is actually alive (FSR 1
+counts only while `crate::fsr1_eligible`), renders the world at the native
+extent. A provider that failed once is retried three times, three seconds
+apart, before the failure becomes final.
 
 **Jitter and colour, fixed in this build.** All three temporal providers share
 one jitter helper (`crate::fsr::jittered_clip_vp`): the Halton offset lands as a

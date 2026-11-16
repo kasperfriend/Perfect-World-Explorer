@@ -563,3 +563,40 @@ done.
   removes the softness needs a screen report on the RTX 3080. If 0.35 is too
   much, the slider goes to 0 for the raw vendor look.
 - **Status:** open on hardware (re-report needed: Quality at 0 / 0.35 / 0.75).
+
+## B-17 — "DLSS/XeSS still blurry, the sharpness slider does nothing" (screen report)
+
+- **Report:** after B-16, DLSS and XeSS still looked blurry, their sharpness
+  sliders changed nothing, and DLAA / Ultra Quality looked identical to
+  Upscaling Off.
+- **What those three symptoms have in common:** a provider that is *requested*
+  but not *running*. `crate::render_extent` answers from the support table, so
+  the world kept rendering at 1280×720 while the actual present path was
+  `RenderScale::blit` — a plain bilinear stretch. That is blurrier than
+  Upscaling Off (native 1080p), it makes every sharpness slider inert (the
+  provider's composite pass never runs), and at a 1.0× ratio the stretch is the
+  identity, which is exactly "DLAA looks the same as off".
+- **Fixed:** the world's render extent now follows the provider that is
+  actually alive (`RenderScale::input_extent`), so a failed provider degrades to
+  a *native* render instead of a stretched one. The Graphics tab shows
+  `DLSS/XeSS/FSR is NOT running - the world is rendered at native resolution
+  instead` with the SDK's own reason, the corner mark says the same, and a
+  failed init is retried three times, three seconds apart, instead of being
+  fatal for the session. The DLSS/XeSS badges now carry
+  `render → display - sharp <value>` so a screenshot says everything.
+- **Also fixed:** the DLSS sharpness slider could never have worked through NGX.
+  Every shipped wrapper writes `NVSDK_NGX_Parameter_Sharpness` in the **create**
+  parameter map (`nvsdk_ngx_helpers_d3d.h`, `NVSDK_NGX_D3D12_DlssCreateParams`),
+  and the feature flag that enables NGX's own sharpening is deprecated
+  ("Sharpness is not supported"). The slider now runs the viewer's own
+  RCAS-style pass in `DlssUpscaler::composite`, the same one XeSS uses, with the
+  gain scaled to 1.5 at the top of the range.
+- **Diagnostics added:** `[DLSS] first evaluate OK (1280x720 -> 1920x1080,
+  quality)` / `[XeSS] first execute OK (…)` in `session.log`, and the failure
+  lines now say "rendering at native resolution instead" with the reason.
+- **Not verified:** which branch the report was actually on. If the mark already
+  showed a green `DLSS (quality)` badge, then DLSS *was* evaluating and the
+  softness has another cause — in that case the badge's new
+  `1280x720 -> 1920x1080 - sharp 0.35` line plus `[DLSS] first evaluate OK` in
+  the log decides it, and the next report should quote them.
+- **Status:** open on hardware (needs one more screen report).
