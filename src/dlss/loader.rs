@@ -39,10 +39,16 @@
 //! arguments in both flavours, so `super::imp` and `super::fg` only needed the
 //! module they call to change.
 //!
-//! Initialisation uses `NVSDK_NGX_D3D12_Init_with_ProjectID` with a GUID-shaped
-//! project id and `NVSDK_NGX_ENGINE_TYPE_CUSTOM` (the documented way for an
-//! application without an NVIDIA-issued application id), and falls back to
-//! `NVSDK_NGX_D3D12_Init` if a driver build rejects that.
+//! Initialisation tries **every** documented entry point, because which of them
+//! a given driver implements is not knowable up front: the project-id forms
+//! (`…_Init_with_ProjectID` — the documented way for an application without an
+//! NVIDIA-issued id — then its predecessor `…_Init_ProjectID`), then the
+//! application-id forms (`…_Init`, then `…_Init_Ext` with a parameter map).
+//! Each is retried with a ladder of SDK API versions, because
+//! `FAIL_OutOfDate` means the version asked for is newer than the module. On a
+//! *snippet* the same symbol also exists in the Core-to-snippet flavour (no
+//! `NVSDK_NGX_FeatureCommonInfo`), which is tried last — and only on a snippet,
+//! since a core would dereference the version number as a pointer.
 //!
 //! The `0xBAD00002` above is specific to `Init_Ext`, which is the
 //! **Core-to-snippet** entry point (`nvsdk_ngx.h` groups it with the
@@ -106,8 +112,20 @@ const NGX_ENGINE_VERSION: &str = "1.0.0";
 const P_SUPER_SAMPLING_AVAILABLE: &str = "SuperSampling.Available";
 const P_SUPER_SAMPLING_INIT_RESULT: &str = "SuperSampling.FeatureInitResult";
 
+/// `NVSDK_NGX_D3D12_Init` as an **SDK-to-Core** signature
+/// (`const NVSDK_NGX_FeatureCommonInfo *` before the version).
 type PfnInit =
     unsafe extern "C" fn(u64, *const u16, *mut c_void, *const NgxFeatureCommonInfo, i32) -> u32;
+/// `NVSDK_NGX_D3D12_Init` as a **Core-to-snippet** signature: no feature info.
+/// `nvsdk_ngx.h` declares this flavour under `NGX_SNIPPET_BUILD`, so a snippet
+/// implements this one and a core the one above — the viewer tries both.
+type PfnInitSnippet = unsafe extern "C" fn(u64, *const u16, *mut c_void, i32) -> u32;
+/// `NVSDK_NGX_D3D12_Init_ProjectID` (DLSS 2.1 era). Same arguments as
+/// `…_with_ProjectID` minus the feature info.
+type PfnInitProjectId =
+    unsafe extern "C" fn(*const c_char, i32, *const c_char, *const u16, *mut c_void, i32) -> u32;
+/// `NVSDK_NGX_D3D12_Init_Ext` — the application-id form with a parameter map.
+type PfnInitExt = unsafe extern "C" fn(u64, *const u16, *mut c_void, i32, *const c_void) -> u32;
 type PfnInitWithProjectId = unsafe extern "C" fn(
     *const c_char,
     i32,
@@ -208,6 +226,11 @@ pub(crate) struct NgxCore {
     allocate_parameters: Option<PfnAllocateParameters>,
     destroy_parameters: Option<PfnDestroyParameters>,
     get_capability_parameters: Option<PfnGetCapabilityParameters>,
+    /// `NVSDK_NGX_D3D12_GetParameters`: the deprecated accessor that is the
+    /// only one an older core has (`nvsdk_ngx.h` names it as the fallback when
+    /// `AllocateParameters`/`GetCapabilityParameters` answer
+    /// `FAIL_OutOfDate`). Its maps are owned by NGX and must not be freed.
+    get_parameters: Option<PfnGetCapabilityParameters>,
     set_u32: Option<PfnSetU32>,
     set_i32: Option<PfnSetI32>,
     set_f32: Option<PfnSetF32>,
@@ -284,6 +307,10 @@ impl NgxApi {
 impl NgxCore {
     fn create(sdk_dir: &str, snippet: Option<&Path>, device: *mut c_void) -> Result<Self, String> {
         let mut candidates = ngx_core_candidates(sdk_dir);
+        // The snippet is tried as a *module* only after every core, but its
+        // handle is offered to each candidate as the source of the parameter
+        // helpers, because a legacy core may not export them.
+        let helper = snippet.map(Path::to_path_buf);
         if let Some(snippet) = snippet {
             push_candidate(&mut candidates, snippet.to_path_buf());
         }
@@ -306,7 +333,7 @@ impl NgxCore {
         // what turned a working RTX install into "NGX refused to initialise".
         let mut failures: Vec<String> = Vec::new();
         for path in candidates {
-            match Self::create_at(&path, sdk_dir, device) {
+            match Self::create_at(&path, helper.as_deref(), sdk_dir, device) {
                 Ok(core) => {
                     if !failures.is_empty() {
                         super::diag(&format!(
@@ -342,8 +369,20 @@ impl NgxCore {
     /// Load and initialise one candidate module that provides the SDK side of
     /// the NGX API (`nvsdk_ngx.h`: `Init`, `Init_with_ProjectID`,
     /// `CreateFeature`, `EvaluateFeature`, `ReleaseFeature`).
-    fn create_at(path: &Path, sdk_dir: &str, device: *mut c_void) -> Result<Self, String> {
-        // Mandatory: the whole Core bootstrap.
+    ///
+    /// `helper` is the feature snippet the caller is about to use. The
+    /// `NVSDK_NGX_Parameter_*` helpers and the parameter allocators are
+    /// resolved from the candidate first and from the snippet only when the
+    /// candidate does not export them: a legacy `_nvngx.dll` exports
+    /// `CreateFeature`/`EvaluateFeature` but not the whole parameter surface,
+    /// and the snippet forwards to the same process-global map.
+    fn create_at(
+        path: &Path,
+        helper: Option<&Path>,
+        sdk_dir: &str,
+        device: *mut c_void,
+    ) -> Result<Self, String> {
+        // Mandatory: the whole bootstrap.
         const EXPORTS: &[&[u8]] = &[
             b"NVSDK_NGX_D3D12_Init\0",
             b"NVSDK_NGX_D3D12_CreateFeature\0",
@@ -351,59 +390,99 @@ impl NgxCore {
             b"NVSDK_NGX_D3D12_ReleaseFeature\0",
         ];
         let (handle, exports) = load_module(path, EXPORTS)?;
+        let helper_handle = helper
+            .filter(|helper| !same_file(helper, path))
+            .and_then(|helper| load_module(helper, &[]).ok())
+            .map(|(handle, _)| handle);
         let mut core = Self {
             _handle: handle,
             path: path.to_string_lossy().into_owned(),
             create_feature: unsafe { read_function(exports[1]) },
             evaluate_feature: unsafe { read_function(exports[2]) },
             release_feature: unsafe { read_function(exports[3]) },
-            allocate_parameters: None,
-            destroy_parameters: None,
-            get_capability_parameters: None,
-            set_u32: None,
-            set_i32: None,
-            set_f32: None,
-            set_d3d12: None,
-            set_void: None,
-            get_u32: None,
+            allocate_parameters: unsafe {
+                optional_export(
+                    handle,
+                    helper_handle,
+                    b"NVSDK_NGX_D3D12_AllocateParameters\0",
+                )
+            },
+            destroy_parameters: unsafe {
+                optional_export(
+                    handle,
+                    helper_handle,
+                    b"NVSDK_NGX_D3D12_DestroyParameters\0",
+                )
+            },
+            get_capability_parameters: unsafe {
+                optional_export(
+                    handle,
+                    helper_handle,
+                    b"NVSDK_NGX_D3D12_GetCapabilityParameters\0",
+                )
+            },
+            get_parameters: unsafe {
+                optional_export(handle, helper_handle, b"NVSDK_NGX_D3D12_GetParameters\0")
+            },
+            set_u32: unsafe {
+                optional_export(handle, helper_handle, b"NVSDK_NGX_Parameter_SetUI\0")
+            },
+            set_i32: unsafe {
+                optional_export(handle, helper_handle, b"NVSDK_NGX_Parameter_SetI\0")
+            },
+            set_f32: unsafe {
+                optional_export(handle, helper_handle, b"NVSDK_NGX_Parameter_SetF\0")
+            },
+            set_d3d12: unsafe {
+                optional_export(
+                    handle,
+                    helper_handle,
+                    b"NVSDK_NGX_Parameter_SetD3d12Resource\0",
+                )
+            },
+            set_void: unsafe {
+                optional_export(
+                    handle,
+                    helper_handle,
+                    b"NVSDK_NGX_Parameter_SetVoidPointer\0",
+                )
+            },
+            get_u32: unsafe {
+                optional_export(handle, helper_handle, b"NVSDK_NGX_Parameter_GetUI\0")
+            },
         };
-        // Everything else is optional: older drivers lack parts of it, and the
-        // viewer degrades to its own parameter table instead of failing.
-        unsafe {
-            core.allocate_parameters =
-                resolve_function(handle, b"NVSDK_NGX_D3D12_AllocateParameters\0");
-            core.destroy_parameters =
-                resolve_function(handle, b"NVSDK_NGX_D3D12_DestroyParameters\0");
-            core.get_capability_parameters =
-                resolve_function(handle, b"NVSDK_NGX_D3D12_GetCapabilityParameters\0");
-            core.set_u32 = resolve_function(handle, b"NVSDK_NGX_Parameter_SetUI\0");
-            core.set_i32 = resolve_function(handle, b"NVSDK_NGX_Parameter_SetI\0");
-            core.set_f32 = resolve_function(handle, b"NVSDK_NGX_Parameter_SetF\0");
-            core.set_d3d12 = resolve_function(handle, b"NVSDK_NGX_Parameter_SetD3d12Resource\0");
-            core.set_void = resolve_function(handle, b"NVSDK_NGX_Parameter_SetVoidPointer\0");
-            core.get_u32 = resolve_function(handle, b"NVSDK_NGX_Parameter_GetUI\0");
-        }
+        super::diag(&format!(
+            "[NGX] candidate {} {}",
+            path.display(),
+            match module_version(path) {
+                Some(version) => format!("version {version}"),
+                None => "version unknown".to_string(),
+            }
+        ));
         // The module stays loaded even when initialisation fails: NGX keeps
         // process-global state from the attempt, so unloading it would be worse
         // than leaking one handle.
-        core.initialise(sdk_dir, device, handle, unsafe {
-            read_function(exports[0])
-        })?;
+        core.initialise(sdk_dir, device, handle)?;
         Ok(core)
     }
 
+    /// Try every documented initialisation entry point on this module.
+    ///
+    /// A core and a snippet implement *different* signatures of the same symbol
+    /// name (`nvsdk_ngx.h` switches the declarations on `NGX_SNIPPET_BUILD`),
+    /// so both are tried, and each is tried with a ladder of SDK API versions:
+    /// `FAIL_OutOfDate` means exactly "this call needs a newer driver than the
+    /// one installed", i.e. the version we asked for is too new for this
+    /// module, and one step down is the documented fix.
     fn initialise(
         &self,
         sdk_dir: &str,
         device: *mut c_void,
         handle: HMODULE,
-        init: PfnInit,
     ) -> Result<(), String> {
-        let init_with_project_id: Option<PfnInitWithProjectId> =
-            unsafe { resolve_function(handle, b"NVSDK_NGX_D3D12_Init_with_ProjectID\0") };
         let app_dir = ngx_app_dir();
         super::diag(&format!(
-            "[NGX] core {} initialising (application data folder: {app_dir})",
+            "[NGX] initialising through {} (application data folder: {app_dir})",
             self.path
         ));
 
@@ -425,62 +504,165 @@ impl NgxCore {
         let app_dir_wide: Vec<u16> = app_dir.encode_utf16().chain(std::iter::once(0)).collect();
         let project = std::ffi::CString::new(NGX_PROJECT_ID).expect("project id is ASCII");
         let engine = std::ffi::CString::new(NGX_ENGINE_VERSION).expect("engine version is ASCII");
+        let application_id: u64 = 0x5045_5752_4e47_5800;
 
         let mut failures: Vec<String> = Vec::new();
-        if let Some(init_with_project_id) = init_with_project_id {
-            let result = unsafe {
-                init_with_project_id(
-                    project.as_ptr(),
-                    NGX_ENGINE_TYPE_CUSTOM,
-                    engine.as_ptr(),
-                    app_dir_wide.as_ptr(),
-                    device,
-                    &info,
-                    NGX_VERSION_API,
-                )
-            };
-            if super::succeeded(result) {
-                super::diag(&format!(
-                    "[NGX] initialised through NVSDK_NGX_D3D12_Init_with_ProjectID (project id {NGX_PROJECT_ID}); feature folders: {}",
-                    paths.join(", ")
-                ));
-                self.log_capabilities();
-                return Ok(());
+        unsafe {
+            // 1. The documented entry point for an application without an
+            //    NVIDIA-issued id.
+            match resolve_function::<PfnInitWithProjectId>(
+                handle,
+                b"NVSDK_NGX_D3D12_Init_with_ProjectID\0",
+            ) {
+                Some(init) => {
+                    let mut results = Vec::new();
+                    for version in NGX_VERSIONS {
+                        let result = init(
+                            project.as_ptr(),
+                            NGX_ENGINE_TYPE_CUSTOM,
+                            engine.as_ptr(),
+                            app_dir_wide.as_ptr(),
+                            device,
+                            &info,
+                            version,
+                        );
+                        if super::succeeded(result) {
+                            return self.ready(
+                                "NVSDK_NGX_D3D12_Init_with_ProjectID",
+                                version,
+                                &paths,
+                            );
+                        }
+                        results.push(result);
+                    }
+                    failures.push(describe("NVSDK_NGX_D3D12_Init_with_ProjectID", &results));
+                }
+                None => failures.push("NVSDK_NGX_D3D12_Init_with_ProjectID is not exported".into()),
             }
-            failures.push(format!(
-                "NVSDK_NGX_D3D12_Init_with_ProjectID -> {}",
-                super::result_name(result)
-            ));
-        } else {
-            failures.push("NVSDK_NGX_D3D12_Init_with_ProjectID is not exported".to_string());
+            // 2. Its predecessor, which older cores have instead.
+            match resolve_function::<PfnInitProjectId>(handle, b"NVSDK_NGX_D3D12_Init_ProjectID\0")
+            {
+                Some(init) => {
+                    let mut results = Vec::new();
+                    for version in NGX_VERSIONS {
+                        let result = init(
+                            project.as_ptr(),
+                            NGX_ENGINE_TYPE_CUSTOM,
+                            engine.as_ptr(),
+                            app_dir_wide.as_ptr(),
+                            device,
+                            version,
+                        );
+                        if super::succeeded(result) {
+                            return self.ready("NVSDK_NGX_D3D12_Init_ProjectID", version, &paths);
+                        }
+                        results.push(result);
+                    }
+                    failures.push(describe("NVSDK_NGX_D3D12_Init_ProjectID", &results));
+                }
+                None => failures.push("NVSDK_NGX_D3D12_Init_ProjectID is not exported".into()),
+            }
+            // 3. The application-id forms. `Init` first: it is the one an older
+            //    core accepts (a report from an RTX machine shows exactly that,
+            //    with `Init_Ext` never having been tried), then `Init_Ext`, which
+            //    takes a parameter map and is what a newer core prefers.
+            for (name, ext) in [
+                ("NVSDK_NGX_D3D12_Init", false),
+                ("NVSDK_NGX_D3D12_Init_Ext", true),
+            ] {
+                let mut results = Vec::new();
+                let mut called = false;
+                for version in NGX_VERSIONS {
+                    let result = if ext {
+                        match resolve_function::<PfnInitExt>(handle, b"NVSDK_NGX_D3D12_Init_Ext\0")
+                        {
+                            Some(init) => {
+                                called = true;
+                                init(
+                                    application_id,
+                                    app_dir_wide.as_ptr(),
+                                    device,
+                                    version,
+                                    std::ptr::null(),
+                                )
+                            }
+                            None => break,
+                        }
+                    } else {
+                        match resolve_function::<PfnInit>(handle, b"NVSDK_NGX_D3D12_Init\0") {
+                            Some(init) => {
+                                called = true;
+                                init(
+                                    application_id,
+                                    app_dir_wide.as_ptr(),
+                                    device,
+                                    &info,
+                                    version,
+                                )
+                            }
+                            None => break,
+                        }
+                    };
+                    if super::succeeded(result) {
+                        return self.ready(name, version, &paths);
+                    }
+                    results.push(result);
+                }
+                failures.push(if called {
+                    describe(name, &results)
+                } else {
+                    format!("{name} is not exported")
+                });
+            }
+            // 4. `NVSDK_NGX_D3D12_Init` with the Core-to-snippet signature. A
+            //    snippet implements this one and a core the one above; passing a
+            //    `FeatureCommonInfo*` where a version belongs is exactly the
+            //    `FAIL_FeatureNotSupported` a snippet answers an application.
+            //
+            //    Only ever done on a snippet: the reverse mistake is fatal, not
+            //    merely rejected — a core would read the version we pass in the
+            //    `FeatureCommonInfo*` slot and dereference a small integer.
+            let snippet_module = self
+                .path
+                .rsplit(['\\', '/'])
+                .next()
+                .is_some_and(|name| name.to_ascii_lowercase().starts_with("nvngx_dlss"));
+            if let (true, Some(init)) = (
+                snippet_module,
+                resolve_function::<PfnInitSnippet>(handle, b"NVSDK_NGX_D3D12_Init\0"),
+            ) {
+                let mut results = Vec::new();
+                for version in NGX_VERSIONS {
+                    let result = init(application_id, app_dir_wide.as_ptr(), device, version);
+                    if super::succeeded(result) {
+                        return self.ready(
+                            "NVSDK_NGX_D3D12_Init (snippet signature)",
+                            version,
+                            &paths,
+                        );
+                    }
+                    results.push(result);
+                }
+                failures.push(describe(
+                    "NVSDK_NGX_D3D12_Init (snippet signature)",
+                    &results,
+                ));
+            }
         }
-
-        // Driver builds that reject a custom project id still accept the plain
-        // application-id entry point.
-        let result = unsafe {
-            init(
-                0x5045_5752_4e47_5800,
-                app_dir_wide.as_ptr(),
-                device,
-                &info,
-                NGX_VERSION_API,
-            )
-        };
-        if super::succeeded(result) {
-            super::diag(&format!(
-                "[NGX] initialised through NVSDK_NGX_D3D12_Init; feature folders: {}",
-                paths.join(", ")
-            ));
-            self.log_capabilities();
-            return Ok(());
-        }
-        failures.push(format!(
-            "NVSDK_NGX_D3D12_Init -> {}",
-            super::result_name(result)
-        ));
         // The hint is appended once, by `NgxCore::create`, so this is only the
         // list of what this module said.
-        Err(failures.join(", "))
+        Err(failures.join("; "))
+    }
+
+    /// Log the line a successful initialisation prints and read the capability
+    /// map.
+    fn ready(&self, via: &str, version: i32, paths: &[String]) -> Result<(), String> {
+        super::diag(&format!(
+            "[NGX] initialised through {via} (SDK API {version:#06x}); feature folders: {}",
+            paths.join(", ")
+        ));
+        self.log_capabilities();
+        Ok(())
     }
 
     /// Log `SuperSampling.Available` / `FeatureInitResult` when the driver
@@ -518,39 +700,179 @@ impl NgxCore {
         ));
     }
 
+    /// An `NVSDK_NGX_Parameter` map: NGX's own whenever it can hand one out,
+    /// otherwise the viewer's table.
+    ///
+    /// Order matters. NGX validates a map it did not create, and a foreign
+    /// implementation is what turns `EvaluateFeature` into
+    /// `FAIL_InvalidParameter` on some drivers, so every NGX-owned accessor is
+    /// tried before falling back:
+    ///
+    /// 1. `NVSDK_NGX_D3D12_AllocateParameters` — the modern allocator,
+    /// 2. `NVSDK_NGX_D3D12_GetCapabilityParameters` — pre-populated, NGX-owned,
+    /// 3. `NVSDK_NGX_D3D12_GetParameters` — deprecated, and the *only* one an
+    ///    older core exports (`nvsdk_ngx.h` documents it as the fallback when
+    ///    the other two answer `FAIL_OutOfDate`). NGX owns those maps, so they
+    ///    are never destroyed.
     fn new_parameters(&self) -> Box<NgxParams> {
-        let (Some(allocate), Some(destroy)) = (self.allocate_parameters, self.destroy_parameters)
-        else {
-            return NgxParams::new();
-        };
-        if self.set_u32.is_none()
-            || self.set_i32.is_none()
-            || self.set_f32.is_none()
-            || self.set_d3d12.is_none()
-            || self.set_void.is_none()
-        {
-            return NgxParams::new();
-        }
-        let mut parameters: *mut c_void = std::ptr::null_mut();
-        let result = unsafe { allocate(&mut parameters) };
-        if !super::succeeded(result) || parameters.is_null() {
-            super::diag(&format!(
-                "[NGX] NVSDK_NGX_D3D12_AllocateParameters -> {}; falling back to the viewer's \
-                 own parameter table",
-                super::result_name(result)
-            ));
-            return NgxParams::new();
-        }
-        NgxParams::from_ngx(NgxMap::new(
-            parameters,
-            Some(destroy),
+        let (set_u32, set_i32, set_f32, set_d3d12, set_void) = match (
             self.set_u32,
             self.set_i32,
             self.set_f32,
             self.set_d3d12,
             self.set_void,
+        ) {
+            (Some(set_u32), Some(set_i32), Some(set_f32), Some(set_d3d12), Some(set_void)) => {
+                (set_u32, set_i32, set_f32, set_d3d12, set_void)
+            }
+            _ => {
+                super::diag(
+                    "[NGX] no NVSDK_NGX_Parameter_Set* helpers were exported by the core or the \
+                     snippet; the viewer's own parameter table is in use (NGX may reject it at \
+                     EvaluateFeature)",
+                );
+                return NgxParams::new();
+            }
+        };
+        let sources: [(&str, Option<PfnGetCapabilityParameters>, bool); 3] = [
+            (
+                "NVSDK_NGX_D3D12_AllocateParameters",
+                self.allocate_parameters,
+                true,
+            ),
+            (
+                "NVSDK_NGX_D3D12_GetCapabilityParameters",
+                self.get_capability_parameters,
+                false,
+            ),
+            ("NVSDK_NGX_D3D12_GetParameters", self.get_parameters, false),
+        ];
+        for (name, function, destroyable) in sources {
+            let Some(function) = function else { continue };
+            let mut parameters: *mut c_void = std::ptr::null_mut();
+            let result = unsafe { function(&mut parameters) };
+            if !super::succeeded(result) || parameters.is_null() {
+                super::diag(&format!("[NGX] {name} -> {}", super::result_name(result)));
+                continue;
+            }
+            super::diag(&format!("[NGX] parameter map: NGX's own, from {name}"));
+            let destroy = if destroyable {
+                self.destroy_parameters
+            } else {
+                None
+            };
+            return NgxParams::from_ngx(NgxMap::new(
+                parameters, destroy, set_u32, set_i32, set_f32, set_d3d12, set_void,
+            ));
+        }
+        super::diag(
+            "[NGX] no NVSDK_NGX parameter allocator answered; the viewer's own parameter table \
+             is in use (NGX may reject it at EvaluateFeature)",
+        );
+        NgxParams::new()
+    }
+}
+
+/// The SDK API versions `init` is tried with, newest first.
+///
+/// `FAIL_OutOfDate` means "a function was used which requires a newer version of
+/// the NVIDIA Display Driver or feature library than is currently installed"
+/// (`nvsdk_ngx_defs.h`), i.e. the version asked for is newer than this module.
+/// `0x15` is the vendored header's `NVSDK_NGX_VERSION_API_MACRO`; the older
+/// entries are what pre-DLSS-3 cores understand.
+const NGX_VERSIONS: [i32; 3] = [NGX_VERSION_API, 0x0f, 0x03];
+
+/// One `init` variant's outcome across the version ladder, compressed to a
+/// single line for `session.log`.
+fn describe(name: &str, results: &[u32]) -> String {
+    let Some(first) = results.first() else {
+        return format!("{name} -> not called");
+    };
+    if results.iter().all(|result| result == first) {
+        return format!("{name} -> {}", super::result_name(*first));
+    }
+    let ladder: Vec<String> = results
+        .iter()
+        .zip(NGX_VERSIONS)
+        .map(|(result, version)| format!("{version:#06x}: {}", super::result_name(*result)))
+        .collect();
+    format!("{name} -> {}", ladder.join(", "))
+}
+
+/// Whether two paths name the same file, case-insensitively.
+fn same_file(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+/// The module's `VS_FIXEDFILEINFO` version, e.g. `310.2.1.0`.
+///
+/// This is what tells a stale NGX core from a current one in a report: DLSS
+/// builds report `310.x.y.z`, and the driver's `_nvngx.dll` carries the driver's
+/// own `32.0.x.y` version.
+fn module_version(path: &Path) -> Option<String> {
+    #[link(name = "version")]
+    extern "system" {
+        fn GetFileVersionInfoSizeW(file: *const u16, handle: *mut u32) -> u32;
+        fn GetFileVersionInfoW(file: *const u16, handle: u32, length: u32, data: *mut u8) -> i32;
+        fn VerQueryValueW(
+            data: *const u8,
+            sub: *const u16,
+            out: *mut *mut c_void,
+            length: *mut u32,
+        ) -> i32;
+    }
+    use std::os::windows::ffi::OsStrExt;
+    let file: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let mut handle: u32 = 0;
+        let size = GetFileVersionInfoSizeW(file.as_ptr(), &mut handle);
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        if GetFileVersionInfoW(file.as_ptr(), 0, size, data.as_mut_ptr()) == 0 {
+            return None;
+        }
+        let root: Vec<u16> = "\\".encode_utf16().chain(std::iter::once(0)).collect();
+        let mut info: *mut c_void = std::ptr::null_mut();
+        let mut length: u32 = 0;
+        if VerQueryValueW(data.as_ptr(), root.as_ptr(), &mut info, &mut length) == 0
+            || info.is_null()
+            || length < 16
+        {
+            return None;
+        }
+        // `VS_FIXEDFILEINFO`: signature, struct version, file version MS, LS, …
+        let words = std::slice::from_raw_parts(info as *const u32, 4);
+        let (ms, ls) = (words[2], words[3]);
+        Some(format!(
+            "{}.{}.{}.{}",
+            ms >> 16,
+            ms & 0xffff,
+            ls >> 16,
+            ls & 0xffff
         ))
     }
+}
+
+/// Resolve an optional entry point on `handle`, or on the snippet `helper` when
+/// the candidate does not export it.
+///
+/// # Safety
+/// `handle` and `helper` must be modules loaded with `LoadLibraryW`, and `T`
+/// must be the exact signature the module implements.
+unsafe fn optional_export<T: Copy>(
+    handle: HMODULE,
+    helper: Option<HMODULE>,
+    name: &[u8],
+) -> Option<T> {
+    resolve_function(handle, name)
+        .or_else(|| helper.and_then(|helper| resolve_function(helper, name)))
 }
 
 /// `GetProcAddress`, returning `None` instead of a null pointer.
