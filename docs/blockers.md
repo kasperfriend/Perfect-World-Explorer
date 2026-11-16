@@ -863,12 +863,18 @@ overloads are slots 0-7 of `NVSDK_NGX_Parameter`, `nvsdk_ngx_params.h:55-73`).
 after create, `[DLSS] textures: … heap` for all four resources, and the
 `[NGX] parameter map: NGX's own, from …` line that already existed.
 
-- **Status:** fixed in source; needs one hardware report. A working run shows
-  `[DLSS] textures: colour default heap, …` (no `CreateCommittedResource
-  failed` block at all), `[DLSS] feature init result: 0x00000001 Success`, then
-  `[DLSS] first evaluate OK …` and `[upscaler] DLSS (quality) … running …`.
-  If evaluate still fails, the next artifact to look at is NGX's own log in
-  `C:\Users\<user>\AppData\Local\PerfectWorldExplorer\NGX`.
+- **Status:** the heap bug is fixed and verified on hardware (`session-4.log`:
+  no `CreateCommittedResource failed` line at all, and all four textures report
+  `default heap`), but it was **not** what NGX rejected: evaluate still answered
+  `0xbad00005`. The extent half of the same failure is **B-23**.
+
+### Aftermath: the report that closed this cause and opened the next one
+
+`session-4.log` also settles the other half of the diagnosis, in the opposite
+direction from what this entry first assumed. `FeatureInitResult` came back
+`0x00000001`, which is `NVSDK_NGX_Result_Success` (`nvsdk_ngx_defs.h:99`) — the
+feature **was** created. So `SuperSampling.Available = 1` and feature creation
+both succeeded, and every refusal is confined to `EvaluateFeature`. That is B-23.
 
 ### The version question
 
@@ -885,3 +891,104 @@ tab lists DLSS Frame Generation as disabled with the reason
 multipliers above ×2 stay disabled wherever the runtime does not report them.
 DLSS Super Resolution with the transformer model does run on RTX 20/30-series
 hardware.
+
+## B-23 — DLSS creates its feature and then refuses every evaluate `0xbad00005`: the render extent was the viewer's own arithmetic (hardware report, RTX 3080)
+
+- **Report** (`session-4.log`, HEAD `83446a5`): NGX initialises
+  (`NVSDK_NGX_D3D12_Init`, SDK API `0x0015`), the capability map is NGX's own,
+  `SuperSampling.Available = 1`, `[DLSS] textures: colour default heap, depth
+  default, motion vectors default, output default`, `FeatureInitResult` is
+  `0x00000001` = `NVSDK_NGX_Result_Success` — the feature is created — and then
+  every `NVSDK_NGX_D3D12_EvaluateFeature(DLSS)` answers `0xbad00005`
+  (`FAIL_InvalidParameter`), retried on several frames, with
+  `[upscaler] … DLSS Super Resolution is NOT running` at the end.
+- **What that rules out:** the heaps (B-22, verified fixed), the SDK and DLL age
+  (`nvngx_dlss.dll` 310.9.16 is the newest `NVIDIA/DLSS` release; core
+  32.0.16.2114), the parameter-map kind (a real capability map from
+  `GetCapabilityParameters`, written through its vtable), and feature creation
+  itself. `FAIL_InvalidParameter` on evaluate can only come from what evaluate
+  is handed: the handle (valid, just created), the map entries, or the D3D12
+  resources' descriptions.
+
+### Cause — the render size was computed instead of asked for
+
+The viewer derived its render extent from the quality ratio
+(`display / scale`). The programming guide is explicit about the alternative
+(§3.2.2):
+
+> The values returned … must then be passed exactly as given to the next
+> `NGX_API_CREATE_DLSS_EXT()` call … If the `InRenderSubrectDimensions` are
+> outside of the min/max range, the call will fail with
+> `NVSDK_NGX_Result_FAIL_InvalidParameter`.
+
+`NGX_DLSS_GET_OPTIMAL_SETTINGS` (`nvsdk_ngx_helpers.h:65-114`) is the documented
+way to obtain that range, and for a mode **without** dynamic resolution min and
+max both collapse to the single optimal pair — so *any* deviation, including one
+pixel, is "outside the min/max range". The arithmetic differs in exactly that
+way: for 3440x1369 at Quality (ratio 1.5) the viewer produced `2293x913`, while
+`1369 / 1.5 = 912.67` truncates to `912`; for the same display at Balanced the
+viewer produced `2024x805` where `1369 / 1.7 = 805.3` truncates to `805`. One
+mode is off by a pixel, the other is not — which is precisely the kind of
+one-pixel disagreement the guide says is fatal and which the viewer could never
+notice, because a wrong subrect is not something a log line reports.
+
+**Fixed** in `src/dlss/loader.rs` + `src/dlss/imp.rs`:
+
+* `NgxApi::optimal_settings()` reproduces the helper byte for byte — read
+  `DLSSOptimalSettingsCallback` out of the capability map with
+  `NVSDK_NGX_Parameter_GetVoidPointer` (vtable slot 15, the eight `Get`
+  overloads' position after `GetUI` = 11, both verified by
+  `SuperSampling.Available` already reading correctly), write the *user-selected*
+  display size into `Width`/`Height`, `PerfQualityValue`, `RTXValue = 0`, call
+  the callback, then read `OutWidth`/`OutHeight` and the
+  `DLSS.Get.Dynamic.{Min,Max}.Render.{Width,Height}` range.
+* The answer, not the viewer's ratio, is now what the feature is created with
+  (`Width`/`Height`/`ResourceWidth`/`ResourceHeight`), what every evaluate
+  re-states, and — through `DlssUpscaler::render_extent()` — what `src/gpu.rs`
+  sizes the world colour/depth targets to. The extent the *settings table* asked
+  for is kept separately (`requested_extent()`) and is what decides whether the
+  feature must be rebuilt, so NGX moving the size by a pixel cannot cause a
+  rebuild every frame.
+* When the capability map carries no callback, the old behaviour is kept and the
+  line says so, rather than silently pretending DLSS agreed.
+
+### The instrumentation that makes the next report decisive
+
+All 37 `[NGX]` lines in `session-4.log` are the viewer's own; NGX's callback
+produced none. `NVSDK_NGX_FeatureCommonInfo.LoggingInfo` only reaches an
+application NGX accepts as verified, and an unverified one gets nothing at all —
+no error either. So:
+
+* `MinimumLoggingLevel` is now `NVSDK_NGX_LOGGING_LEVEL_VERBOSE` (2), not `ON`,
+  because that is the level the guide says reports parameter-level detail;
+* `__NGX_LOG_LEVEL`, `NVNGX_LOG_LEVEL` and `__NGX_LOG_PATH_OVERRIDE` are set to
+  `3` and to the viewer's application-data folder before `Init`, which is what
+  NGX's own binary reads when the registry says nothing (§3.19);
+* on the *first* failed evaluate the viewer now copies the tail of every `*.log`
+  in `%LOCALAPPDATA%\PerfectWorldExplorer\NGX` into `session.log`
+  (`[NGX file …] last N line(s)`). NGX writes those files regardless of whether
+  the callback is honoured, so that is the channel that survives.
+
+### Everything else that could produce `FAIL_InvalidParameter`, and where it stands
+
+| Class | State |
+| --- | --- |
+| Subrect outside NGX's min/max range | **the cause above — fixed** |
+| `Width`/`Height` vs the created textures disagreeing | already equal; now sourced from one value |
+| Extent keys missing on evaluate | written on every evaluate since `3fb19e7` |
+| Output texture with mips | one mip (`dlss5-d3d12-fix` report) |
+| `TYPELESS` output format | typed `R8G8B8A8_UNORM`, asserted in `DlssNatives` |
+| `DLSS.Render.Subrect.Dimensions` / `Output.Subrects` incoherent | both written from the same extent |
+| `MVLowRes` vs `InMVScaleX/Y` | flags and scale set from one source (`MVLowRes`, scale 1.0) |
+| Resource states | inputs `NON_PIXEL_SHADER_RESOURCE`, output UAV with `ALLOW_UNORDERED_ACCESS`; NGX restores states itself (§3.4) |
+| Heap properties | default heap, `GetHeapProperties` verified (B-22) |
+| Parameter map kind | capability map (B-22 cause 2) |
+| SDK / DLL age | current (B-22, "The version question") |
+| Handle validity / ordering | `CreateFeature` returns `0x1`; evaluate runs on a recording, non-copy list with the feature's node mask (B-21) |
+
+- **Status:** fixed in source; needs one hardware report. A working run shows
+  `[DLSS] optimal settings: quality at 3440x1369 -> render 2293x912 (range …;
+  the viewer asked 2293x913)`, then `[DLSS] first evaluate OK (… -> …)` and
+  `[upscaler] DLSS (quality) … running …`. If it still fails, `session.log` now
+  carries NGX's own `[NGX file …]` lines naming the refused parameter, which is
+  the one thing this round could not obtain.

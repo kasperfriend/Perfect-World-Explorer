@@ -142,6 +142,9 @@ type PfnReleaseFeature = unsafe extern "C" fn(*mut c_void) -> u32;
 type PfnAllocateParameters = unsafe extern "C" fn(*mut *mut c_void) -> u32;
 type PfnDestroyParameters = unsafe extern "C" fn(*mut c_void) -> u32;
 type PfnGetCapabilityParameters = unsafe extern "C" fn(*mut *mut c_void) -> u32;
+/// `NVSDK_NGX_Parameter_GetVoidPointer` — the accessor that hands out the
+/// callbacks a capability map carries.
+type PfnGetVoid = unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_void) -> u32;
 type PfnSetU32 = unsafe extern "C" fn(*mut c_void, *const c_char, u32);
 type PfnSetI32 = unsafe extern "C" fn(*mut c_void, *const c_char, i32);
 type PfnSetF32 = unsafe extern "C" fn(*mut c_void, *const c_char, f32);
@@ -187,9 +190,12 @@ impl Default for NgxFeatureCommonInfo {
             internal_data: std::ptr::null_mut(),
             logging_info: NgxLoggingInfo {
                 logging_callback: Some(ngx_log),
-                // `NVSDK_NGX_LOGGING_LEVEL_ON`: init-time problems are what we
-                // want; VERBOSE also logs per-evaluate chatter.
-                minimum_logging_level: 1,
+                // `NVSDK_NGX_LOGGING_LEVEL_VERBOSE`. `ON` (1) is not enough:
+                // the lines that explain a refused `EvaluateFeature` — the
+                // offending parameter name and its value — are only emitted at
+                // VERBOSE (§3.19 of the programming guide). This is a floor, not
+                // a ceiling: NGX itself may log less.
+                minimum_logging_level: 2,
                 disable_other_logging_sinks: 0,
             },
         }
@@ -236,6 +242,7 @@ pub(crate) struct NgxCore {
     set_d3d12: Option<PfnSetPointer>,
     set_void: Option<PfnSetPointer>,
     get_u32: Option<PfnGetU32>,
+    get_void: Option<PfnGetVoid>,
 }
 
 // The instance is created and used on the render thread only; the statics below
@@ -261,6 +268,19 @@ fn core(
         Err(error) => Err(error.clone()),
     }
 }
+
+/// What DLSS says it is willing to evaluate.
+pub(crate) struct OptimalSettings {
+    /// The render size the feature has to be created at and evaluated with.
+    pub(crate) render: (u32, u32),
+    /// The inclusive range `Evaluate` accepts, when the mode supports dynamic
+    /// resolution at all. Both are `None` for a mode without it.
+    pub(crate) min: Option<(u32, u32)>,
+    pub(crate) max: Option<(u32, u32)>,
+}
+
+/// `NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback`.
+const P_OPTIMAL_SETTINGS_CALLBACK: &str = "DLSSOptimalSettingsCallback";
 
 /// The per-feature handle. It carries no state of its own: Core owns the
 /// instance, and the feature DLLs are loaded by Core.
@@ -298,6 +318,70 @@ impl NgxApi {
     /// otherwise the viewer's table.
     pub(crate) fn new_parameters(&self) -> Box<NgxParams> {
         self.core.new_parameters()
+    }
+
+    /// `NGX_DLSS_GET_OPTIMAL_SETTINGS`, spelled out (`nvsdk_ngx_helpers.h`).
+    ///
+    /// The programming guide is explicit that these values "must then be passed
+    /// exactly as given to the next `NGX_API_CREATE_DLSS_EXT()` call", and that
+    /// an `InRenderSubrectDimensions` outside the range they define makes
+    /// `EvaluateFeature` answer `FAIL_InvalidParameter` (§3.2.2). Deriving the
+    /// render size from the quality ratio alone — which is what this viewer did
+    /// — is therefore a coin flip that DLSS may answer with `0xbad00005`, and
+    /// when the mode supports no dynamic resolution the range collapses to a
+    /// single pair of values, so even one pixel is out of range.
+    pub(crate) fn optimal_settings(
+        &self,
+        params: &mut NgxParams,
+        display: (u32, u32),
+        quality: u32,
+    ) -> Result<OptimalSettings, String> {
+        let callback = params
+            .get_void_pointer(P_OPTIMAL_SETTINGS_CALLBACK)
+            .ok_or_else(|| {
+                "the parameter map carries no DLSSOptimalSettingsCallback".to_string()
+            })?;
+        // The query is asked in *display* size and answers with the render size
+        // it recommends: `NGX_DLSS_GET_OPTIMAL_SETTINGS` reads the result out of
+        // `OutWidth`/`OutHeight`, not out of the inputs.
+        params.set_u32("Width", display.0.max(1));
+        params.set_u32("Height", display.1.max(1));
+        params.set_i32("PerfQualityValue", quality as i32);
+        params.set_i32("RTXValue", 0);
+        let query: unsafe extern "C" fn(*mut c_void) -> u32 =
+            unsafe { std::mem::transmute_copy(&callback) };
+        let result = unsafe { query(params.as_ptr()) };
+        if !super::succeeded(result) {
+            return Err(format!(
+                "DLSSOptimalSettingsCallback -> {}",
+                super::result_name(result)
+            ));
+        }
+        let width = params
+            .get_u32("OutWidth")
+            .ok_or_else(|| "the callback wrote no OutWidth".to_string())?;
+        let height = params
+            .get_u32("OutHeight")
+            .ok_or_else(|| "the callback wrote no OutHeight".to_string())?;
+        let min = match (
+            params.get_u32("DLSS.Get.Dynamic.Min.Render.Width"),
+            params.get_u32("DLSS.Get.Dynamic.Min.Render.Height"),
+        ) {
+            (Some(width), Some(height)) => Some((width, height)),
+            _ => None,
+        };
+        let max = match (
+            params.get_u32("DLSS.Get.Dynamic.Max.Render.Width"),
+            params.get_u32("DLSS.Get.Dynamic.Max.Render.Height"),
+        ) {
+            (Some(width), Some(height)) => Some((width, height)),
+            _ => None,
+        };
+        Ok(OptimalSettings {
+            render: (width.max(1), height.max(1)),
+            min,
+            max,
+        })
     }
 
     /// Where NGX Core came from (the ready line names it).
@@ -452,6 +536,13 @@ impl NgxCore {
             get_u32: unsafe {
                 optional_export(handle, helper_handle, b"NVSDK_NGX_Parameter_GetUI\0")
             },
+            get_void: unsafe {
+                optional_export(
+                    handle,
+                    helper_handle,
+                    b"NVSDK_NGX_Parameter_GetVoidPointer\0",
+                )
+            },
         };
         let exports = init_exports(path);
         super::diag(&format!(
@@ -497,7 +588,19 @@ impl NgxCore {
         device: *mut c_void,
         handle: HMODULE,
     ) -> Result<(), String> {
-        let app_dir = ngx_app_dir();
+        // NGX's own diagnostics `.log` the folder named here, and the
+        // `__NGX_LOG_*` variables are what its binary reads when the registry
+        // says nothing (§3.19). Both are best-effort: NGX ignores a path it
+        // cannot write and never reports that.
+        let log_dir = ngx_app_dir();
+        for (name, value) in [
+            ("__NGX_LOG_LEVEL", "3"),
+            ("NVNGX_LOG_LEVEL", "3"),
+            ("__NGX_LOG_PATH_OVERRIDE", log_dir.as_str()),
+        ] {
+            std::env::set_var(name, value);
+        }
+        let app_dir = log_dir;
         super::diag(&format!(
             "[NGX] initialising through {} (application data folder: {app_dir})",
             self.path
@@ -794,6 +897,7 @@ impl NgxCore {
                     self.set_d3d12,
                     self.set_void,
                     self.get_u32,
+                    self.get_void,
                 ));
             }
             super::diag(&format!(
@@ -1265,6 +1369,44 @@ fn feature_search_paths(sdk_dir: &str) -> Vec<String> {
 /// It has to be writable: NGX answers `FAIL_PlatformError` when it cannot open
 /// its log there, which is what happens when the viewer runs from `Program
 /// Files`. `%LOCALAPPDATA%` is the first choice for that reason.
+/// Append whatever NGX wrote to its own log files to `session.log`.
+///
+/// The logging callback in `NVSDK_NGX_FeatureCommonInfo` only reaches an
+/// application NGX has accepted as verified; an unverified one gets nothing and
+/// no error, which is exactly the silence every run so far showed. Its files do
+/// not depend on that, so after a refusal this is the only way to hear NGX's own
+/// reason. Missing, empty or unreadable files are simply no lines.
+pub(crate) fn dump_ngx_log_files() {
+    let dir = PathBuf::from(ngx_app_dir());
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_log = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("log"));
+        if !is_log {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let tail: Vec<&str> = text.lines().rev().take(40).collect();
+        if tail.is_empty() {
+            continue;
+        }
+        super::diag(&format!(
+            "[NGX file {}] last {} line(s):",
+            path.display(),
+            tail.len()
+        ));
+        for line in tail.into_iter().rev() {
+            super::diag(&format!("[NGX file {}] {line}", path.display()));
+        }
+    }
+}
+
 fn ngx_app_dir() -> String {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {

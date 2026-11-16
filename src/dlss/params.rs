@@ -118,6 +118,7 @@ const SLOT_SET_I32: usize = 4;
 const SLOT_SET_D3D12: usize = 6;
 const SLOT_SET_VOID: usize = 7;
 const SLOT_GET_U32: usize = 11;
+const SLOT_GET_VOID: usize = 15;
 
 /// One `Set` overload of an `NVSDK_NGX_Parameter` the viewer does not own.
 ///
@@ -205,6 +206,14 @@ impl Owned {
         }
     }
 
+    /// Read a pointer back, the way `NVSDK_NGX_Parameter_GetVoidPointer` would.
+    pub(crate) fn get_void_pointer(&self, name: &str) -> Option<*mut c_void> {
+        match self.values.get(name)? {
+            Value::Ptr(value) => Some(*value),
+            _ => None,
+        }
+    }
+
     /// Drop every entry; NGX calls this between frames in some paths.
     pub(crate) fn reset(&mut self) {
         self.values.clear();
@@ -254,6 +263,7 @@ pub(crate) struct NgxMap {
     set_d3d12: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void)>,
     set_void: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void)>,
     get_u32: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut u32) -> u32>,
+    get_void: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_void) -> u32>,
 }
 
 impl NgxMap {
@@ -266,6 +276,7 @@ impl NgxMap {
         set_d3d12: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void)>,
         set_void: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void)>,
         get_u32: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut u32) -> u32>,
+        get_void: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_void) -> u32>,
     ) -> Self {
         Self {
             object,
@@ -276,6 +287,7 @@ impl NgxMap {
             set_d3d12,
             set_void,
             get_u32,
+            get_void,
         }
     }
 
@@ -302,6 +314,7 @@ impl NgxMap {
             set_d3d12: unsafe { vtable_setter(object, SLOT_SET_D3D12) },
             set_void: unsafe { vtable_setter(object, SLOT_SET_VOID) },
             get_u32: unsafe { vtable_setter(object, SLOT_GET_U32) },
+            get_void: unsafe { vtable_setter(object, SLOT_GET_VOID) },
         }
     }
 
@@ -352,6 +365,14 @@ impl NgxMap {
         let mut value = 0u32;
         let result = unsafe { get(self.object, name.as_ptr(), &mut value) };
         (result == NGX_SUCCESS).then_some(value)
+    }
+
+    fn get_void_pointer(&mut self, name: &str) -> Option<*mut c_void> {
+        let get = self.get_void?;
+        let name = Self::c_name(name)?;
+        let mut value: *mut c_void = std::ptr::null_mut();
+        let result = unsafe { get(self.object, name.as_ptr(), &mut value) };
+        (result == NGX_SUCCESS && !value.is_null()).then_some(value)
     }
 }
 
@@ -431,6 +452,16 @@ impl NgxParams {
         match &mut self.kind {
             Kind::Owned(table) => table.get_u32(name),
             Kind::Ngx(map) => map.get_u32(name),
+        }
+    }
+
+    /// `NVSDK_NGX_Parameter_GetVoidPointer`: how NGX hands out the callbacks a
+    /// capability map carries — `DLSSOptimalSettingsCallback` above all, which
+    /// is the only way to ask what render size DLSS is willing to evaluate.
+    pub(crate) fn get_void_pointer(&mut self, name: &str) -> Option<*mut c_void> {
+        match &mut self.kind {
+            Kind::Owned(table) => table.get_void_pointer(name),
+            Kind::Ngx(map) => map.get_void_pointer(name),
         }
     }
 
@@ -757,6 +788,8 @@ mod tests {
             None,
             // No `NVSDK_NGX_Parameter_GetUI` either: a read then answers `None`
             // instead of touching the object.
+            None,
+            // Nor `NVSDK_NGX_Parameter_GetVoidPointer`.
             None,
         );
         {

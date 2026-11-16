@@ -4570,7 +4570,12 @@ pub fn run(
                     // schedule: DLSS feature creation is bound to the render
                     // and display extents.
                     if let Some(dlss) = dlss_upscaler.as_ref() {
-                        if dlss.render_extent() != applied_extent
+                        // Compared against what the settings *asked* for, not
+                        // what DLSS chose: NGX's optimal settings decide the
+                        // render size and can differ by a pixel from the
+                        // settings table's ratio, and comparing the effective
+                        // extent would rebuild the feature every single frame.
+                        if dlss.requested_extent() != applied_extent
                             || dlss.display_extent() != (config.width, config.height)
                         {
                             dlss_upscaler = None;
@@ -4607,8 +4612,16 @@ pub fn run(
                         || dlss_upscaler.is_some()
                         || (settings.upscaling == crate::UpscaleMethod::Fsr1
                             && crate::fsr1_eligible(applied_extent, (config.width, config.height)));
+                    // DLSS evaluates at the render size NGX's optimal settings
+                    // returned, which is not necessarily the settings table's
+                    // guess; the world has to be drawn at the size the feature
+                    // will actually be handed.
+                    let live_extent = dlss_upscaler
+                        .as_ref()
+                        .map(|dlss| dlss.render_extent())
+                        .unwrap_or(applied_extent);
                     let wanted_world = if upscaler_running {
-                        applied_extent
+                        live_extent
                     } else {
                         slider_extent
                     };

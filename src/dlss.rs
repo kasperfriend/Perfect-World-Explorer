@@ -174,6 +174,10 @@ mod imp_stub {
             (0, 0)
         }
 
+        pub fn requested_extent(&self) -> (u32, u32) {
+            (0, 0)
+        }
+
         pub fn display_extent(&self) -> (u32, u32) {
             (0, 0)
         }

@@ -19,8 +19,14 @@ use crate::fsr::{
 };
 use glam::Mat4;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use winapi::shared::dxgiformat::{DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_FLOAT};
 use winapi::um::d3d12 as d3d12_ty;
+
+/// Whether the NGX file logs have already been copied into `session.log`. One
+/// copy is enough: the refusal repeats every frame, and each line would only
+/// push the first frame's evidence out of the report.
+static DUMPED_NGX_LOGS: AtomicBool = AtomicBool::new(false);
 
 /// `D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE` — the state NGX wants its
 /// inputs in (DLSS and DLSS-G both dispatch compute).
@@ -268,7 +274,14 @@ pub struct DlssUpscaler {
     handle: *mut c_void,
     queue: d3d12::CommandQueue,
     ring: NativeCommandRing,
+    /// The extent DLSS actually evaluates at: NGX's own optimal-settings answer
+    /// when the capability map could be asked, otherwise what the viewer asked
+    /// for.
     render_extent: (u32, u32),
+    /// What the settings table asked for. The caller compares *this* when it
+    /// decides whether the upscaler still matches the settings, so NGX moving
+    /// the render size by a pixel cannot make it rebuild every frame.
+    requested_extent: (u32, u32),
     display_extent: (u32, u32),
     natives: DlssNatives,
     mv_pass: FsrMotionVectorPass,
@@ -299,7 +312,7 @@ impl DlssUpscaler {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         sdk_dir: &str,
-        render_extent: (u32, u32),
+        requested_extent: (u32, u32),
         display_extent: (u32, u32),
         format: wgpu::TextureFormat,
         quality: crate::UpscaleQuality,
@@ -338,6 +351,37 @@ impl DlssUpscaler {
             None => crate::dlss::diag(
                 "[DLSS] the parameter map does not carry SuperSampling.Available (not a capability map)",
             ),
+        }
+        // DLSS decides the render size, not the viewer. The programming guide
+        // requires the values from the optimal-settings query to be passed to
+        // create "exactly as given" (§3.2.2), and an evaluate subrect outside
+        // the range those settings define is answered with
+        // `FAIL_InvalidParameter` — the `0xbad00005` every run reported. When a
+        // mode supports no dynamic resolution the range collapses to a single
+        // pair, so even one pixel of the viewer's own ratio arithmetic is out of
+        // range.
+        let mut render_extent = requested_extent;
+        match api.optimal_settings(&mut params, display_extent, quality_setting) {
+            Ok(settings) => {
+                render_extent = settings.render;
+                let range = match (settings.min, settings.max) {
+                    (Some(min), Some(max)) => format!("{}x{}..{}x{}", min.0, min.1, max.0, max.1),
+                    _ => format!("fixed {}x{}", settings.render.0, settings.render.1),
+                };
+                crate::dlss::diag(&format!(
+                    "[DLSS] optimal settings: {quality_name} at {}x{} -> render {}x{} (range {range}; the viewer asked {}x{})",
+                    display_extent.0,
+                    display_extent.1,
+                    render_extent.0,
+                    render_extent.1,
+                    requested_extent.0,
+                    requested_extent.1
+                ));
+            }
+            Err(error) => crate::dlss::diag(&format!(
+                "[DLSS] optimal settings unavailable ({error}); using the viewer's {}x{}",
+                requested_extent.0, requested_extent.1
+            )),
         }
         params.set_u32(P_WIDTH, render_extent.0.max(1));
         params.set_u32(P_HEIGHT, render_extent.1.max(1));
@@ -403,6 +447,7 @@ impl DlssUpscaler {
             queue: raw_queue,
             ring,
             render_extent,
+            requested_extent,
             display_extent,
             natives,
             mv_pass,
@@ -425,6 +470,11 @@ impl DlssUpscaler {
     /// The display extent the output is produced at.
     pub fn display_extent(&self) -> (u32, u32) {
         self.display_extent
+    }
+
+    /// The render extent the settings asked for, before DLSS had its say.
+    pub fn requested_extent(&self) -> (u32, u32) {
+        self.requested_extent
     }
 
     /// Human-readable name of the active quality preset (UI badge).
@@ -716,6 +766,12 @@ impl DlssUpscaler {
         self.ring.retire(slot_index, &self.queue, "DLSS")?;
 
         if !crate::dlss::succeeded(result) {
+            // `FAIL_InvalidParameter` names no parameter: the line that does is
+            // in NGX's own log file, which is written whether or not the
+            // logging callback is honoured.
+            if !DUMPED_NGX_LOGS.swap(true, Ordering::Relaxed) {
+                super::loader::dump_ngx_log_files();
+            }
             return Err(format!(
                 "NVSDK_NGX_D3D12_EvaluateFeature(DLSS) failed ({})",
                 crate::dlss::result_name(result)
