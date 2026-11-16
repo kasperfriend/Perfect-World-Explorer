@@ -102,7 +102,7 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
                 .map_err(|e| e.to_string())?;
             if decomp.total_out() != 276 {
                 return Err(format!(
-                        "unexpected entry record size: {}", 
+                    "unexpected entry record size: {}", 
                     decomp.total_out()
                 ));
             }
