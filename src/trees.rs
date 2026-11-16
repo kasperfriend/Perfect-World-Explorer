@@ -230,7 +230,9 @@ impl Trees {
         let mut dll_hash = 2166136261u32;
         let mut buf = [0u8; 65536];
         loop {
-            let n = dll_file.read(&mut buf).map_err(|e| format!("SpeedTreeRT.dll: {e}"))?;
+            let n = dll_file
+                .read(&mut buf)
+                .map_err(|e| format!("SpeedTreeRT.dll: {e}"))?;
             if n == 0 {
                 break;
             }
@@ -250,9 +252,11 @@ impl Trees {
             let src = entries.get(&ty.tree.to_lowercase()).ok_or("missing SPT")?;
             let original = pck::read_entry_at(&file, src).map_err(|e| e.to_string())?;
             let (name, lods) = parse(&data, &original, dll_hash)?;
-              let name = name.replace('\\', "/");
+            let name = name.replace('\\', "/");
             let stem = Path::new(&name)
-                .file_stem().and_then(|s| s.to_str()).ok_or("missing bark name")?;
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or("missing bark name")?;
             let parent = ty.tree.rsplit_once('/').map(|x| x.0).unwrap_or("trees");
             let bark_path = format!("{parent}/{stem}.dds").to_lowercase();
             let fallback = format!("trees/{stem}.dds").to_lowercase();
@@ -262,7 +266,9 @@ impl Trees {
                 .ok_or_else(|| format!("branch material: missing bark texture {bark_path}"))?;
             let tex_entry = entries
                 .get(&ty.composite.to_lowercase())
-                .ok_or_else(|| format!("frond/leaf material: missing composite texture {}", ty.composite))?;
+                .ok_or_else(|| {
+                    format!("frond/leaf material: missing composite texture {}", ty.composite)
+                })?;
             let bark_bytes = pck::read_entry_at(&file, bark_entry)
                 .map_err(|e| format!("branch material texture {}: {e}", bark_entry.name))?;
             let tex_bytes = pck::read_entry_at(&file, tex_entry)
@@ -272,9 +278,7 @@ impl Trees {
                 .to_rgba8();
             let composite =
                 image::load_from_memory_with_format(&tex_bytes, image::ImageFormat::Dds)
-                    .map_err(|e| {
-                        format!("frond/leaf material texture {}: {e}", tex_entry.name)
-                    })?
+                    .map_err(|e| format!("frond/leaf material texture {}: {e}", tex_entry.name))?
                     .to_rgba8();
             let bark_mips = crate::vegetation_textures::authored_lower_mips(&bark_bytes)
                 .unwrap_or_else(|e| {
@@ -313,7 +317,10 @@ impl Trees {
                         s.spawn(move || (start..end).map(load).collect::<Vec<_>>())
                     })
                     .collect();
-                handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
             })
         } else {
             (0..scene.tree_types.len()).map(&load_one).collect()
