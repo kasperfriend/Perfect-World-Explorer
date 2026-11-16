@@ -784,7 +784,7 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
                                 world_models::Assets::load_with(placements, |_| Err(e.clone()))
                             }
                         },
-                        );
+                    );
                 let grass_task = s.spawn(|| {
                     grass::Grass::load(&world_scene, &dir, element).map_err(|e| e.to_string())
                 });
