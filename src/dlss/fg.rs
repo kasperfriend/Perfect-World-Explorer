@@ -85,6 +85,7 @@ const P_BACKBUFFER_FRAME_ID: &str = "DLSSG.BackbufferFrameID";
 // generation, both HUDless and one of UI or UIAlpha must be provided."
 const P_HUDLESS: &str = "DLSSG.HUDLess";
 const P_UI: &str = "DLSSG.UI";
+const P_UIR_ENABLED: &str = "DLSSG.UserInterfaceRecompositionEnabled";
 // Per-frame scalars.
 const P_MULTI_FRAME_COUNT: &str = "DLSSG.MultiFrameCount";
 const P_MULTI_FRAME_INDEX: &str = "DLSSG.MultiFrameIndex";
@@ -183,6 +184,7 @@ impl Drop for DlssFrameGeneration {
 }
 
 impl DlssFrameGeneration {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -191,6 +193,7 @@ impl DlssFrameGeneration {
         render_extent: (u32, u32),
         display_extent: (u32, u32),
         surface_format: wgpu::TextureFormat,
+        ui_format: wgpu::TextureFormat,
         generated_frames: u32,
     ) -> Result<Self, String> {
         let generated_frames = generated_frames.clamp(1, 5);
@@ -205,6 +208,7 @@ impl DlssFrameGeneration {
         // pipelines match it.
         let backbuffer_format = dxgi_output_format(surface_format);
         let compose_dxgi = dxgi_for_format(surface_format);
+        let ui_dxgi = dxgi_for_format(ui_format);
 
         // Hand the window over from wgpu's swapchain: DXGI allows one flip-model
         // swapchain per window and we are about to create our own, so the
@@ -271,6 +275,7 @@ impl DlssFrameGeneration {
         params.set_u32(P_BACKBUFFER_FORMAT, backbuffer_format as u32);
         // The viewer always renders at a fixed scale for the session.
         params.set_u32(P_DYNAMIC_RESOLUTION, 0);
+        params.set_u32(P_UIR_ENABLED, 1);
 
         let mut ring = NativeCommandRing::new(&raw_device, "DLSS FG")?;
         let mut handle: *mut c_void = std::ptr::null_mut();
@@ -320,8 +325,8 @@ impl DlssFrameGeneration {
                 device,
                 &raw_device,
                 "dlss frame generation present",
-                surface_format,
-                compose_dxgi,
+                ui_format,
+                ui_dxgi,
                 display_extent,
                 d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                 wgpu::TextureUsages::RENDER_ATTACHMENT
@@ -340,8 +345,8 @@ impl DlssFrameGeneration {
                 device,
                 &raw_device,
                 "dlss frame generation ui",
-                surface_format,
-                compose_dxgi,
+                ui_format,
+                ui_dxgi,
                 display_extent,
                 d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
@@ -596,7 +601,7 @@ impl DlssFrameGeneration {
         // Matrices for the interpolation: everything here is *unjittered*, as
         // the header requires ("All matrices should NOT contain temporal AA
         // jitter offset").
-        if let Some(prev) = self.prev_view_proj {
+        if let Some(prev) = self.prev_view_proj.filter(|_| !reset) {
             self.clip_to_prev = (prev * inv_vp).to_cols_array_2d();
             self.prev_clip_to_clip = (*unjittered_vp * prev.inverse()).to_cols_array_2d();
         } else {
@@ -693,6 +698,8 @@ impl DlssFrameGeneration {
         if ui_visible {
             self.params
                 .set_d3d12_resource(P_UI, self.ui_only.resource.as_mut_ptr() as *mut c_void);
+        } else {
+            self.params.set_d3d12_resource(P_UI, std::ptr::null_mut());
         }
         self.params
             .set_d3d12_resource(P_DEPTH, self.depth.resource.as_mut_ptr() as *mut c_void);
