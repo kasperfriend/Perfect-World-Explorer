@@ -101,10 +101,8 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
                 .decompress(raw, &mut buf, FlushDecompress::Finish)
                 .map_err(|e| e.to_string())?;
             if decomp.total_out() != 276 {
-                return Err(format!(
-                    "unexpected entry record size: {}", 
-                    decomp.total_out()
-                ));
+                let n = decomp.total_out();
+                return Err(format!("unexpected entry record size: {n}"));
             }
             &buf
         };
