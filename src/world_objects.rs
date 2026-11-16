@@ -1054,11 +1054,11 @@ impl GpuPage {
                     }
                     if bound != Some(cur_page) {
                         let p = &pages[cur_page];
-                       pass.set_bind_group(
-                            0,
-                           if reflected { &p.reflected } else { &p.normal },
-                             &[],
-                      );
+                        pass.set_bind_group(
+                             0,
+                            if reflected { &p.reflected } else { &p.normal },
+                              &[],
+                       );
                         pass.set_vertex_buffer(0, p.vertex.slice(..));
                         pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
                         bound = Some(cur_page);
@@ -1070,10 +1070,10 @@ impl GpuPage {
         }
         if let Some((cur_page, cur_start, cur_end)) = pending {
             if bound != Some(cur_page) {
-                   let p = &pages[cur_page];
-                   pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
-                   pass.set_vertex_buffer(0, p.vertex.slice(..));
-                   pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
+               let p = &pages[cur_page];
+               pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
+               pass.set_vertex_buffer(0, p.vertex.slice(..));
+               pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
             }
             pass.draw_indexed(cur_start..cur_end, 0, 0..1);
         }
