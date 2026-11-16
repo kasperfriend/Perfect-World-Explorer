@@ -278,7 +278,7 @@ impl Materials {
                             .ok_or("truncated mask")?;
                         if u32at(&data, 16)? != 0 {
                             if !(size == 256 && small_mask_atlas) {
-                            packed = Some(bytes.to_vec());
+                                packed = Some(bytes.to_vec());
                             }
                             ZlibDecoder::new(bytes)
                                 .take((size * size + 1) as u64)
