@@ -802,10 +802,10 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
             (
                 water,
                 materials,
-                (water_normals, water_simple_frames), 
+                (water_normals, water_simple_frames),
                 objects,
-                models, 
-                grass, 
+                models,
+                grass,
                 trees,
             )
         };

@@ -898,22 +898,22 @@ impl TerrainGpu {
         far_runs: Option<&[(u32, u32)]>,
     ) {
         if let Some(runs) = runs {
-             if self.last_near_runs.as_slice() != runs {
-                 self.last_near_runs.clear();
-                 self.last_near_runs.extend_from_slice(runs);
-                 self.near_records = Self::upload_runs(
-                     device,
-                     queue,
-                     &mut self.near_args,
-                     &mut self.near_capacity,
-                     &mut self.scratch_records,
-                     "terrain near run args",
-                     runs,
-                 );
-             }
-          } else {
-              self.last_near_runs.clear();
-                self.near_records = 0;
+            if self.last_near_runs.as_slice() != runs {
+                self.last_near_runs.clear();
+                self.last_near_runs.extend_from_slice(runs);
+                self.near_records = Self::upload_runs(
+                    device,
+                    queue,
+                    &mut self.near_args,
+                    &mut self.near_capacity,
+                    &mut self.scratch_records,
+                    "terrain near run args",
+                    runs,
+                );
+            }
+        } else {
+            self.last_near_runs.clear();
+            self.near_records = 0;
         }
         if let Some(far_runs) = far_runs {
             if self.last_far_runs.as_slice() != far_runs {
@@ -956,7 +956,7 @@ impl TerrainGpu {
                 mapped_at_creation: false,
             });
         }
-       scratch.clear();
+        scratch.clear();
         scratch.extend(
             runs.iter()
                 .map(|&(start, count)| crate::indirect_args::record(start..start + count, 0..1)),
@@ -974,10 +974,10 @@ impl TerrainGpu {
         runs: Option<&[(u32, u32)]>,
         far_runs: Option<&[(u32, u32)]>,
     ) {
-        let bind = if reflected { 
-            &self.reflect_bind 
+        let bind = if reflected {
+            &self.reflect_bind
         } else {
-            &self.bind 
+            &self.bind
         };
         if let Some(far) = &self.far {
             if far_runs.is_none() || self.far_records > 0 {
