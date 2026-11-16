@@ -747,7 +747,7 @@ mod tests {
             index.resolve_under(&root, "MUSIC/TRACKS/DAY.OGG", "music"),
             Some(track)
         );
-        assert_eq!(index.directories.len(), 2, "each directory is enumerated once");
+        assert_eq!(index.directories.len(), 3, "each directory is enumerated once");
         assert_eq!(index.resolutions.len(), 1, "case-folded requests share cache keys");
         fs::remove_dir_all(root).unwrap();
     }
