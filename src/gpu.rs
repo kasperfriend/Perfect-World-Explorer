@@ -3221,7 +3221,7 @@ impl Renderer {
         if !camera.water_reflections {
             let mut e = self.device.create_command_encoder(&Default::default());
             for batch in &visible {
-                 if batch.simple {               
+             if batch.simple {               
                     self.simple_water.draw(
                         &mut e,
                         scene_target_raw,
@@ -3609,7 +3609,7 @@ impl Renderer {
         if let Some(e) = simple_encoder {
             self.queue.submit(Some(e.finish()));
         }
-    self.visible_water_batches = visible;
+        self.visible_water_batches = visible;
         if let Some(shore) = &self.shore {
             shore.draw(
                 &self.device,
