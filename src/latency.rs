@@ -411,7 +411,7 @@ impl ReflexPacer {
         let observed = now.saturating_duration_since(self.last_present);
         self.last_present = now;
         self.frames += 1;
-       if observed >= Self::MIN_BUDGET && observed <= Self::MAX_BUDGET {
+     if observed >= Self::MIN_BUDGET && observed <= Self::MAX_BUDGET {
             if observed < self.budget {
                 let smoothed = self.budget.mul_f32(0.7) + observed.mul_f32(0.3);
                 self.budget = smoothed.clamp(Self::MIN_BUDGET, Self::MAX_BUDGET);
