@@ -246,7 +246,7 @@ pub struct Objects {
 /// The whole corpus of
 /// building.pck textures is ~445 MiB compressed on disk and far larger
 /// decoded, so the full world never fits under this budget by design.
-pub const DEFAULT_TEX_BUDGET_MIB: usize = 32;
+pub const DEFAULT_TEX_BUDGET_MIB: usize = 16;
 /// Process-wide "All to VRAM" switch. `Objects` instances read it when their
 /// cache evicts and when a new one is opened, so the whole-world preload and
 /// later streamed batches follow a live toggle without a restart.
