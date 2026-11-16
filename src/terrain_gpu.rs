@@ -912,7 +912,7 @@ impl TerrainGpu {
                );
            }
           } else {
-          self.last_near_runs.clear();
+              self.last_near_runs.clear();
             self.near_records = 0;
         }
         if let Some(far_runs) = far_runs {
