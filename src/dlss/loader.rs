@@ -258,22 +258,22 @@ impl NgxCore {
             b"NVSDK_NGX_D3D12_EvaluateFeature\0",
             b"NVSDK_NGX_D3D12_ReleaseFeature\0",
         ];
-        let system32 = system32_dir().ok_or_else(|| {
+        let (core_dir, core_dll) = find_ngx_core(sdk_dir).ok_or_else(|| {
             "the NVIDIA NGX runtime (nvngx.dll) is not installed: it ships with the display \
              driver, so reinstall the driver with all components (a driver cleaned by \
              NVCleanstall/DDU can leave it out)"
                 .to_string()
         })?;
-        let (handle, exports) = load_sdk_dll(&system32.to_string_lossy(), "nvngx.dll", EXPORTS)
+        let (handle, exports) = load_sdk_dll(&core_dir.to_string_lossy(), core_dll, EXPORTS)
             .map_err(|error| {
                 format!(
-                    "the NVIDIA NGX runtime (nvngx.dll) could not be loaded from {}: {error}",
-                    system32.display()
+                    "the NVIDIA NGX runtime ({core_dll}) could not be loaded from {}: {error}",
+                    core_dir.display()
                 )
             })?;
         let mut core = Self {
             _handle: handle,
-            path: system32.join("nvngx.dll").to_string_lossy().into_owned(),
+            path: core_dir.join(core_dll).to_string_lossy().into_owned(),
             create_feature: unsafe { read_function(exports[1]) },
             evaluate_feature: unsafe { read_function(exports[2]) },
             release_feature: unsafe { read_function(exports[3]) },
@@ -499,15 +499,61 @@ unsafe fn resolve_function<T: Copy>(handle: HMODULE, name: &[u8]) -> Option<T> {
     resolve(handle, name).map(|pointer| read_function(pointer))
 }
 
-/// `%SystemRoot%\System32`, which is where the driver installs `nvngx.dll`.
-fn system32_dir() -> Option<PathBuf> {
-    let root = std::env::var_os("SystemRoot")
-        .or_else(|| std::env::var_os("windir"))
-        .map(PathBuf::from)?;
-    let dir = root.join("System32");
-    dir.join("nvngx.dll").is_file().then_some(dir)
-}
+/// Locate NGX Core (`nvngx.dll` or `_nvngx.dll`): check `%SystemRoot%\System32`,
+/// then NVIDIA's `DriverStore\FileRepository\nv*` folders (where modern DCH
+/// drivers keep it), then the viewer's own SDK search folders.
+fn find_ngx_core(sdk_dir: &str) -> Option<(PathBuf, &'static str)> {
+    let check_dir = |dir: &Path| -> Option<(PathBuf, &'static str)> {
+        for name in ["nvngx.dll", "_nvngx.dll"] {
+            if dir.join(name).is_file() {
+                return Some((dir.to_path_buf(), name));
+            }
+        }
+        None
+    };
 
+    if let Some(root) = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map(PathBuf::from)
+    {
+        let system32 = root.join("System32");
+        if let Some(found) = check_dir(&system32) {
+            return Some(found);
+        }
+        let repo = system32.join("DriverStore").join("FileRepository");
+        if let Ok(entries) = std::fs::read_dir(&repo) {
+            let mut candidates: Vec<(std::time::SystemTime, PathBuf, &'static str)> = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if !name.to_ascii_lowercase().starts_with("nv") || !path.is_dir() {
+                    continue;
+                }
+                if let Some((dir, dll)) = check_dir(&path) {
+                    let modified = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    candidates.push((modified, dir, dll));
+                }
+            }
+            candidates.sort_by(|a, b| b.0.cmp(&a.0));
+            if let Some((_, dir, dll)) = candidates.into_iter().next() {
+                return Some((dir, dll));
+            }
+        }
+    }
+
+    for folder in feature_search_paths(sdk_dir) {
+        if let Some(found) = check_dir(Path::new(&folder)) {
+            return Some(found);
+        }
+    }
+    None
+}
+    
 /// Folders NGX Core searches for feature DLLs, most specific first.
 fn feature_search_paths(sdk_dir: &str) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
