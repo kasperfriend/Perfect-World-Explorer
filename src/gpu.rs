@@ -4754,6 +4754,7 @@ pub fn run(
                                 applied_extent,
                                 (config.width, config.height),
                                 surface_format,
+                                format,
                                 effective_multiplier.generated(),
                             ) {
                                 Ok(fg) => {
@@ -4891,6 +4892,9 @@ pub fn run(
                         }
                         if let Some(xess) = xess_upscaler.as_mut() {
                             xess.reset_history();
+                        }
+                        if let Some(dlss) = dlss_upscaler.as_mut() {
+                            dlss.reset_history();
                         }
                     }
                     last_fsr_camera_pos = camera.pos;
@@ -5312,6 +5316,31 @@ pub fn run(
                             } else {
                                 render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
                             }
+                            // When frame generation separates the UI from the scene,
+                            // finish any gamma ramp / UNORM encode into `final_view`
+                            // (`fg.compose_view()`) *before* `fg.prepare` copies it to
+                            // `ui_view()`, otherwise `compose` is still empty/stale.
+                            if fg_views.is_some() && !xefg_ui_in_composition {
+                                if let Some(encode) = present_encode.as_ref() {
+                                    let ramp_target = encode.view();
+                                    if let Some(gamma) = display_gamma.as_ref() {
+                                        gamma.present(
+                                            &renderer.device,
+                                            &renderer.queue,
+                                            &ramp_target,
+                                            frame_gamma_setting,
+                                        );
+                                    }
+                                    encode.present(&renderer.device, &renderer.queue, final_view);
+                                } else if let Some(gamma) = display_gamma.as_ref() {
+                                    gamma.present(
+                                        &renderer.device,
+                                        &renderer.queue,
+                                        final_view,
+                                        frame_gamma_setting,
+                                    );
+                                }
+                            }
                             // Frame generation prepare: raw depth + motion
                             // vectors and the FG PrepareV2 dispatch, before the
                             // UI and the present encode write anything.
@@ -5330,7 +5359,7 @@ pub fn run(
                                     jitter,
                                     camera.lens(),
                                     camera.pos.to_array(),
-                                    [0.0, 1.0, 0.0],
+                                    d.cross(glam::Vec3::new(-yaw_c, 0.0, -yaw_s)).normalize().to_array(),
                                     [-yaw_c, 0.0, -yaw_s],
                                     d.to_array(),
                                 );
@@ -5348,6 +5377,7 @@ pub fn run(
                                 }
                             }
                             if let Some(fg) = dlss_framegen.as_mut() {
+                                let d = camera.direction();
                                 let (yaw_s, yaw_c) = camera.yaw.sin_cos();
                                 let prepare_result = fg.prepare(
                                     &renderer.device,
@@ -5357,9 +5387,9 @@ pub fn run(
                                     camera_jumped,
                                     camera.lens(),
                                     camera.pos.to_array(),
-                                    [0.0, 1.0, 0.0],
+                                    d.cross(glam::Vec3::new(-yaw_c, 0.0, -yaw_s)).normalize().to_array(),
                                     [-yaw_c, 0.0, -yaw_s],
-                                    camera.direction().to_array(),
+                                    d.to_array(),
                                 );
                                 if let Err(error) = prepare_result {
                                     crate::dlss::diag(&format!("DLSS Frame Generation prepare failed, disabling it: {error}"));
@@ -5716,7 +5746,8 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 session.render_submit_end();
                             }
                             // Exactly one ramp stage, then exactly one output encode.
-                            if let Some(encode) = present_encode.as_ref() {
+                            if fg_views.is_none() || xefg_ui_in_composition {
+                                if let Some(encode) = present_encode.as_ref() {
                                 // Ramp into the sRGB intermediate, then copy it once.
                                 let ramp_target = encode.view();
                                 if let Some(gamma) = display_gamma.as_ref() {
@@ -5735,6 +5766,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     final_view,
                                     frame_gamma_setting,
                                 );
+                                }
                             }
                             // XeLL: present phase opens immediately before the
                             // present and closes immediately after it.
