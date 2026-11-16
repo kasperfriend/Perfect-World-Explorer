@@ -351,6 +351,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+      - name: Prepare MSVC environment for SDK bridge builds
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "MSVC x64 tools not found" }
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path -LiteralPath $vcvars)) { throw "MSVC environment script not found: $vcvars" }
+          $capture = Join-Path $env:RUNNER_TEMP 'capture-msvc-env.cmd'
+          @"
+          @echo off
+          call "$vcvars" >nul
+          if errorlevel 1 exit /b %errorlevel%
+          set
+          "@ | Set-Content -LiteralPath $capture -Encoding ascii
+          $msvcEnvironment = & cmd.exe /d /c $capture
+          if ($LASTEXITCODE -ne 0) { throw "vcvars64.bat failed with exit $LASTEXITCODE" }
+          foreach ($name in @('PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCToolsInstallDir', 'WindowsSdkDir', 'WindowsSDKVersion', 'UniversalCRTSdkDir', 'UCRTVersion')) {
+            $entry = $msvcEnvironment | Where-Object { $_.StartsWith("$name=", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+            if (-not $entry) { throw "MSVC environment did not define $name" }
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value $entry -Encoding utf8
+          }
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW32
