@@ -705,7 +705,7 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
         }
     };
     let (water, materials, (water_normals, water_simple_frames), objects, models, grass, trees) =
-        if all_to_vram  {
+        if all_to_vram {
             std::thread::scope(|s| {
                 let water_task =
                     s.spawn(|| water::load(&world_scene, &dir).map_err(|e| e.to_string()));
