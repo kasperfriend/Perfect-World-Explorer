@@ -234,8 +234,8 @@ impl DlssUpscaler {
         params.set_u32(P_OUT_WIDTH, display_extent.0.max(1));
         params.set_u32(P_OUT_HEIGHT, display_extent.1.max(1));
         params.set_u32(P_PERF_QUALITY, quality_setting);
-            let flags = NGX_DLSS_FEATURE_MV_LOW_RES | NGX_DLSS_FEATURE_DEPTH_INVERTED;
-            params.set_i32(P_CREATE_FLAGS, flags);  
+        let flags = NGX_DLSS_FEATURE_MV_LOW_RES | NGX_DLSS_FEATURE_DEPTH_INVERTED;
+        params.set_i32(P_CREATE_FLAGS, flags);  
 
         let mut ring = NativeCommandRing::new(&raw_device, "DLSS")?;
         let mut handle: *mut c_void = std::ptr::null_mut();
