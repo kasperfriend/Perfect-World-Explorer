@@ -645,3 +645,40 @@ done.
 - **Status:** fixed in source; needs one hardware report with DLSS at Quality to
   confirm `[DLSS] first evaluate OK (1280x720 -> 1920x1080, quality)` and
   `[upscaler] DLSS (quality) running 1280x720 -> 1920x1080 sharp 0.35`.
+
+## B-19 — "DLSS is NOT running … `Init_with_ProjectID` is not exported, `Init` -> `0xbad0000c`"
+
+- **Report:** water is fine now, but DLSS still reports `DLSS is NOT running -
+  the world is rendered at native resolution instead (no upscaling)`, with
+  `NVSDK_NGX_D3D12_Init_with_ProjectID is not exported` and
+  `NVSDK_NGX_D3D12_Init -> 0xbad0000c FAIL_OutOfDate`.
+- **What the codes actually mean:** `nvsdk_ngx_defs.h:152-154` defines
+  `FAIL_OutOfDate` as "a function was used which requires a newer version of the
+  NVIDIA Display Driver or feature library than is currently installed". So the
+  module that answered is *older than the driver* — it is not an overlay, an
+  injector or a GPU problem, which is what the old hint pointed at.
+- **Cause:** `find_ngx_core` checked `%SystemRoot%\System32` **first**, and then
+  returned the first file it found. That is not where NGX Core lives: driver
+  471.11 and later install it as `_nvngx.dll` in
+  `System32\DriverStore\FileRepository\*`, and `nvsdk_ngx_loader.h`
+  (`NGXLoadCoreLibrary`) never looks in `System32` at all. A leftover legacy
+  `nvngx.dll` in `System32` therefore shadowed the real core, answered
+  `FAIL_OutOfDate` to everything newer than itself, and — because only one
+  candidate was ever tried — ended the search for the whole session.
+- **Fixed:** `ngx_core_candidates` lists every module that can provide the SDK
+  side of NGX: each `DriverStore` package with a core (newest first), then the
+  executable's and the viewer's `sdk/` folders, then the legacy `System32` copy;
+  `_nvngx.dll` before `nvngx.dll` in every folder, duplicates removed. `NgxCore`
+  tries **all** of them until one initialises, so a stale copy cannot block a
+  good one, and each rejection is logged as
+  `[NGX] <path> cannot be used: <reason>`. The vendored snippet is appended as
+  the last resort: a snippet resolves the core itself and forwards the
+  SDK-facing entry points — the earlier `0xBAD00002` finding was about
+  `Init_Ext`, the Core-to-snippet entry point, which the viewer never calls.
+- **Rule:** never let a *discovery* failure be fatal while untried candidates
+  remain. `system32` is a legacy location, not the install location, for
+  NVIDIA's NGX component.
+- **Status:** fixed in source; needs a hardware report. A working run shows
+  either no `[NGX] <path> cannot be used:` lines at all, or a few followed by
+  `[NGX] … is the first of N candidate NGX modules that initialised`, then
+  `[DLSS] first evaluate OK (…)`.
