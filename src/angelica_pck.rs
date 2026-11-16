@@ -58,7 +58,7 @@ fn record_ending_at(blob: &[u8], end: usize) -> Result<([u8; 276], usize), Strin
             let input = &blob[start..end];
             decoder.reset(true);
             let Ok(status) = decoder.decompress(input, &mut out, FlushDecompress::Finish) else {
-             continue;
+               continue;
             };
             if status == flate2::Status::StreamEnd
                 && decoder.total_out() == 276
@@ -75,7 +75,7 @@ fn record_ending_at(blob: &[u8], end: usize) -> Result<([u8; 276], usize), Strin
 /// [`crate::pck::Entry`] values the retail reader produces, so
 /// [`crate::pck::read_entry`] can read their payloads unchanged.
 pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
-   let file_len = f.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
+    let file_len = f.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
     if file_len < 12 + 280 {
         return Err("Angelica package too small".into());
     }
