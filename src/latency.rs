@@ -259,9 +259,9 @@ struct TimerPeriodGuard {
 
 #[cfg(windows)]
 impl TimerPeriodGuard {
-fn acquire_1ms() -> Self {
-use std::os::windows::ffi::OsStrExt;
-let name: Vec<u16> = std::ffi::OsStr::new("winmm.dll")
+    fn acquire_1ms() -> Self {
+        use std::os::windows::ffi::OsStrExt;
+        let name: Vec<u16> = std::ffi::OsStr::new("winmm.dll")
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
