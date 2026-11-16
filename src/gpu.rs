@@ -4133,6 +4133,7 @@ pub fn run(
     // session. NGX and XeSS both refuse to initialise on the first frame of
     // some runs (the driver is still bringing its runtime up), so each
     // provider gets a small budget of delayed retries before "failed" is final.
+    let mut last_upscaler_state: Option<String> = None;
     let mut xess_retries: u32 = 0;
     let mut xess_retry_at: Option<Instant> = None;
     let mut dlss_retries: u32 = 0;
@@ -5620,6 +5621,65 @@ pub fn run(
                             let latency_failed_note =
                                 latency_failed && settings.latency == crate::LatencyMode::Xell;
                             let fsr_failed_note = fsr_failed && settings.upscaling.is_ffx_fsr();
+                            // One session.log line per *change* of the live
+                            // upscaling state. "Requested" and "running" look
+                            // completely different on screen but identical in
+                            // the settings file, so a "DLSS looks blurry"
+                            // report needs this line to be actionable.
+                            {
+                                let (world_w, world_h) = render_scale.input_extent();
+                                let state = if let Some(fsr) = fsr_upscaler.as_ref() {
+                                    format!(
+                                        "FSR {} running {}x{} -> {}x{} sharp {:.2}",
+                                        fsr.selected_provider()
+                                            .map(|id| format!(
+                                                "{}.{}.{}",
+                                                (id >> 22) & 0x3ff,
+                                                (id >> 12) & 0xff,
+                                                id & 0xfff
+                                            ))
+                                            .unwrap_or_else(|| {
+                                                format!("(FFX major {})", fsr.version_major())
+                                            }),
+                                        fsr.render_extent().0,
+                                        fsr.render_extent().1,
+                                        fsr.display_extent().0,
+                                        fsr.display_extent().1,
+                                        settings.fsr3_sharpness
+                                    )
+                                } else if let Some(xess) = xess_upscaler.as_ref() {
+                                    format!(
+                                        "XeSS ({}) running {}x{} -> {}x{} sharp {:.2}",
+                                        xess.quality_name(),
+                                        xess.render_extent().0,
+                                        xess.render_extent().1,
+                                        xess.display_extent().0,
+                                        xess.display_extent().1,
+                                        settings.xess_sharpness
+                                    )
+                                } else if let Some(dlss) = dlss_upscaler.as_ref() {
+                                    format!(
+                                        "DLSS ({}) running {}x{} -> {}x{} sharp {:.2}",
+                                        dlss.quality_name(),
+                                        dlss.render_extent().0,
+                                        dlss.render_extent().1,
+                                        dlss.display_extent().0,
+                                        dlss.display_extent().1,
+                                        settings.dlss_sharpness
+                                    )
+                                } else {
+                                    format!(
+                                        "upscaling={} is NOT running, world rendered {}x{} (native)",
+                                        settings.upscaling.label(),
+                                        world_w,
+                                        world_h
+                                    )
+                                };
+                                if last_upscaler_state.as_deref() != Some(state.as_str()) {
+                                    crate::fsr::diag(&format!("[upscaler] {state}"));
+                                    last_upscaler_state = Some(state);
+                                }
+                            }
                             let fg_badge = framegen.as_ref().map(|fg| match fg.selected_provider() {
                                 Some(id) => format!(
                                     "FG {}.{}.{} x2 - {} frames",

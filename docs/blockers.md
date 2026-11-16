@@ -592,8 +592,11 @@ done.
   RCAS-style pass in `DlssUpscaler::composite`, the same one XeSS uses, with the
   gain scaled to 1.5 at the top of the range.
 - **Diagnostics added:** `[DLSS] first evaluate OK (1280x720 -> 1920x1080,
-  quality)` / `[XeSS] first execute OK (…)` in `session.log`, and the failure
-  lines now say "rendering at native resolution instead" with the reason.
+  quality)` / `[XeSS] first execute OK (…)` in `session.log`, a `[upscaler]`
+  line every time the live state changes (`… running 1280x720 -> 1920x1080
+  sharp 0.35` or `upscaling=DLSS is NOT running, world rendered 1920x1080
+  (native)`), and failure lines that say "rendering at native resolution
+  instead" with the SDK's reason.
 - **Not verified:** which branch the report was actually on. If the mark already
   showed a green `DLSS (quality)` badge, then DLSS *was* evaluating and the
   softness has another cause — in that case the badge's new
