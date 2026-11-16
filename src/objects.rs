@@ -275,11 +275,11 @@ fn tex_budget_bytes() -> usize {
 }
 enum PendingTexture {
     Archive {
-        mount: usize, 
+        mount: usize,
         key: String,
     },
     Disk {
-        key: String, 
+        key: String,
         path: std::path::PathBuf,
     },
 }
