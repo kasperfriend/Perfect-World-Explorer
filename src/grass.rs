@@ -319,7 +319,7 @@ impl Grass {
         // Restore original area order afterwards so draw order stays unchanged.
         records.sort_by_key(|r| r.0);
 
-    let mut groups: Vec<(usize, &[(usize, usize, usize)])> = Vec::new();
+        let mut groups: Vec<(usize, &[(usize, usize, usize)])> = Vec::new();
         let mut g_start = 0usize;
         while g_start < records.len() {
             let idx = records[g_start].0;
@@ -533,7 +533,7 @@ impl Grass {
             });
             for chunk in chunks {
                 models.extend(chunk);
-            }
+                }
             } 
         for m in models.iter().flatten() {
             for mesh in &m.meshes {
