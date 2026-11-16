@@ -210,7 +210,7 @@ pub fn in_frustum(matrix: Mat4, bounds: [f32; 6]) -> bool {
     let m = matrix.to_cols_array();
     let planes = [
         [m[3] + m[0], m[7] + m[4], m[11] + m[8], m[15] + m[12]],
-    [m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]],
+        [m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]],
         [m[3] + m[1], m[7] + m[5], m[11] + m[9], m[15] + m[13]],
         [m[3] - m[1], m[7] - m[5], m[11] - m[9], m[15] - m[13]],
         [m[2], m[6], m[10], m[14]],
