@@ -553,7 +553,7 @@ fn find_ngx_core(sdk_dir: &str) -> Option<(PathBuf, &'static str)> {
     }
     None
 }
-    
+
 /// Folders NGX Core searches for feature DLLs, most specific first.
 fn feature_search_paths(sdk_dir: &str) -> Vec<String> {
     let mut paths: Vec<String> = Vec::new();
