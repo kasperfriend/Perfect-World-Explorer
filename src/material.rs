@@ -177,7 +177,7 @@ impl Materials {
         if count > 4096 {
             return Err("too many textures".into());
         }
-        let mut paths = Vec::with_capacity(count));
+        let mut paths = Vec::with_capacity(count);
         for _ in 0..count {
             paths.push(gbk_string(trn, &mut pos)?)
         }
