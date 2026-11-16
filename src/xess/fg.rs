@@ -849,7 +849,8 @@ impl XessFrameGeneration {
         let mv_pass = FsrMotionVectorPass::new(device);
 
         crate::xess::diag(&format!(
-            "[XeSS FG] frame generation ready (2x, depth-inverted, UI composition mode {} = {}, UI drawn {}, frame generation {}) at {}x{}",
+            "[XeSS FG] frame generation ready (x{}, depth-inverted, UI composition mode {} = {}, UI drawn {}, frame generation {}) at {}x{}",
+            interpolated_frames + 1,
             ui_mode,
             xefg_ui_mode_name(ui_mode),
             if ui_in_composition {
