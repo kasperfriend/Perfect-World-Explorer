@@ -157,7 +157,7 @@ pub struct World {
     /// Retail alpha insertion order as (slot, mesh) pairs.
     alpha: Vec<model_queue::AlphaCandidate>,
     reported: Vec<String>,
-    frustum: Option<[[f32; 4]; 6],>
+    frustum: Option<[[f32; 4]; 6],>,
     scratch_candidates: Vec<model_queue::AlphaCandidate>,
     scratch_failures: Vec<(usize, String)>,
 }
