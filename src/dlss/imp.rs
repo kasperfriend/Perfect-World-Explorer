@@ -62,8 +62,6 @@ const P_RENDER_WIDTH: &str = "DLSS.Render.Subrect.Dimensions.Width";
 const P_RENDER_HEIGHT: &str = "DLSS.Render.Subrect.Dimensions.Height";
 const P_SHARPNESS: &str = "Sharpness";
 
-
-
 /// In-tree Halton jitter in pixels ([-0.5, 0.5)), 16 phases.
 fn halton(mut index: u32, base: u32) -> f32 {
     let mut result = 0.0f32;
