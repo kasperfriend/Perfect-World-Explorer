@@ -248,21 +248,21 @@ impl Trees {
             let data =
                 fs::read(cache.join(format!("tree-{i:03}.pwt"))).map_err(|e| e.to_string())?;
             let src = entries.get(&ty.tree.to_lowercase()).ok_or("missing SPT")?;
-            let original = pck::read_entry_at(&file, src)?;
+            let original = pck::read_entry_at(&file, src).map_err(|e| e.to_string())?;
             let (name, lods) = parse(&data, &original, dll_hash)?;
-            let bark_name = ty.bark.as_deref().ok_or("missing bark name")?;
-            let bark_key = find_tree_tex(&entries, bark_name);
+              let name = name.replace('\\', "/");
+            let stem = Path::new(&name)
+                .file_stem().and_then(|s| s.to_str()).ok_or("missing bark name")?;
+            let parent = ty.tree.rsplit_once('/').map(|x| x.0).unwrap_or("trees");
+            let bark_path = format!("{parent}/{stem}.dds").to_lowercase();
+            let fallback = format!("trees/{stem}.dds").to_lowercase();
             let bark_entry = entries
-                .get(&bark_key)
-                .ok_or_else(|| format!("missing branch material texture {bark_key}"))?;
-            let tex_key = if let Some(ref tex) = ty.tex {
-                find_tree_tex(&entries, tex)
-            } else {
-                find_tree_tex(&entries, &format!("{name}.dds"))
-            };
+                .get(&bark_path)
+                .or_else(|| entries.get(&fallback))
+                .ok_or_else(|| format!("branch material: missing bark texture {bark_path}"))?;
             let tex_entry = entries
-                .get(&tex_key)
-                .ok_or_else(|| format!("missing frond/leaf material texture {tex_key}"))?;
+                .get(&ty.composite.to_lowercase())
+                .ok_or_else(|| format!("frond/leaf material: missing composite texture {}", ty.composite))?;
             let bark_bytes = pck::read_entry_at(&file, bark_entry)
                 .map_err(|e| format!("branch material texture {}: {e}", bark_entry.name))?;
             let tex_bytes = pck::read_entry_at(&file, tex_entry)
