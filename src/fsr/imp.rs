@@ -640,14 +640,19 @@ impl NativeTexture2D {
             Layout: d3d12_ty::D3D12_TEXTURE_LAYOUT_UNKNOWN,
             Flags: resource_flags,
         };
+        // `CreateCommittedResource` rejects a heap whose node masks are 0 with
+        // `E_INVALIDARG` (`0x80070057`) — for a committed resource the mask is a
+        // bitmask of adapters and must name at least one. A single-GPU machine
+        // wants 1. Leaving these at 0 is why every DLSS texture used to fall
+        // through to the "custom heap, L1 pool" quirk below, and NGX then
+        // answered `EvaluateFeature(DLSS) -> 0xbad00005 FAIL_InvalidParameter`
+        // about resources that came out of a heap it does not expect.
         let heap = d3d12_ty::D3D12_HEAP_PROPERTIES {
             Type: heap_type,
             CPUPageProperty: d3d12_ty::D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
             MemoryPoolPreference: memory_pool,
-            // 0, like wgpu's own committed resources — a non-zero node mask
-            // on a single-GPU adapter is rejected by some drivers.
-            CreationNodeMask: 0,
-            VisibleNodeMask: 0,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
         };
         let mut resource_ptr: *mut d3d12_ty::ID3D12Resource = std::ptr::null_mut();
         let hr = raw_device.CreateCommittedResource(

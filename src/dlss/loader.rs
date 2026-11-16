@@ -282,6 +282,9 @@ impl NgxApi {
     pub(crate) fn load(sdk_dir: &str, dll_name: &str, device: *mut c_void) -> Result<Self, String> {
         let (_snippet, _) = load_sdk_dll(sdk_dir, dll_name, &[])?;
         let snippet = sdk_module_path(sdk_dir, dll_name);
+        if let Some(snippet) = snippet.as_deref() {
+            log_feature_module(snippet);
+        }
         let core = core(sdk_dir, snippet.as_deref(), device)?;
         Ok(Self {
             core,
@@ -462,6 +465,15 @@ impl NgxCore {
                 "none of the NVSDK_NGX_D3D12_Init* names".to_string()
             } else {
                 exports.join(", ")
+            }
+        ));
+        let surface = parameter_exports(path);
+        super::diag(&format!(
+            "[NGX] parameter surface of this core: {}",
+            if surface.is_empty() {
+                "none (no NVSDK_NGX_Parameter_*/*Parameters exports)".to_string()
+            } else {
+                surface.join(", ")
             }
         ));
         // The module stays loaded even when initialisation fails: NGX keeps
@@ -703,37 +715,31 @@ impl NgxCore {
     /// An `NVSDK_NGX_Parameter` map: NGX's own whenever it can hand one out,
     /// otherwise the viewer's table.
     ///
-    /// Order matters. NGX validates a map it did not create, and a foreign
-    /// implementation is what turns `EvaluateFeature` into
-    /// `FAIL_InvalidParameter` on some drivers, so every NGX-owned accessor is
-    /// tried before falling back:
+    /// The order matters, and it used to be wrong. The map NGX's features
+    /// receive is the one they validate at `EvaluateFeature`, and a foreign
+    /// implementation is what turns that call into
+    /// `FAIL_InvalidParameter` (`0xbad00005`) on some drivers — so every
+    /// NGX-owned accessor is tried *first*:
     ///
     /// 1. `NVSDK_NGX_D3D12_AllocateParameters` — the modern allocator,
     /// 2. `NVSDK_NGX_D3D12_GetCapabilityParameters` — pre-populated, NGX-owned,
     /// 3. `NVSDK_NGX_D3D12_GetParameters` — deprecated, and the *only* one an
     ///    older core exports (`nvsdk_ngx.h` documents it as the fallback when
-    ///    the other two answer `FAIL_OutOfDate`). NGX owns those maps, so they
-    ///    are never destroyed.
+    ///    the other two answer `FAIL_OutOfDate`).
+    ///
+    /// Lifetimes follow the header: a map from either allocator belongs to the
+    /// application and must be freed with `NVSDK_NGX_D3D12_DestroyParameters`
+    /// (`nvsdk_ngx.h:346-359, 393-403`), while a map from `…GetParameters` is
+    /// NGX's own and must *not* be destroyed (`nvsdk_ngx.h:432-436`).
+    ///
+    /// The map obtained that way is filled through its own vtable
+    /// ([`NgxMap::through_vtable`]), so the exported `NVSDK_NGX_Parameter_Set*`
+    /// helpers are not needed to use it. Requiring them first — as this used to
+    /// — skipped the whole ladder on the current DLSS 4.x build, which exports
+    /// neither the setters nor the allocators in `nvngx_dlss.dll`, and handed
+    /// NGX the viewer's own table even when the driver's core could have given
+    /// it one.
     fn new_parameters(&self) -> Box<NgxParams> {
-        let (set_u32, set_i32, set_f32, set_d3d12, set_void) = match (
-            self.set_u32,
-            self.set_i32,
-            self.set_f32,
-            self.set_d3d12,
-            self.set_void,
-        ) {
-            (Some(set_u32), Some(set_i32), Some(set_f32), Some(set_d3d12), Some(set_void)) => {
-                (set_u32, set_i32, set_f32, set_d3d12, set_void)
-            }
-            _ => {
-                super::diag(
-                    "[NGX] no NVSDK_NGX_Parameter_Set* helpers were exported by the core or the \
-                     snippet; the viewer's own parameter table is in use (NGX may reject it at \
-                     EvaluateFeature)",
-                );
-                return NgxParams::new();
-            }
-        };
         let sources: [(&str, Option<PfnGetCapabilityParameters>, bool); 3] = [
             (
                 "NVSDK_NGX_D3D12_AllocateParameters",
@@ -743,33 +749,53 @@ impl NgxCore {
             (
                 "NVSDK_NGX_D3D12_GetCapabilityParameters",
                 self.get_capability_parameters,
-                false,
+                true,
             ),
             ("NVSDK_NGX_D3D12_GetParameters", self.get_parameters, false),
         ];
         for (name, function, destroyable) in sources {
-            let Some(function) = function else { continue };
+            let Some(function) = function else {
+                super::diag(&format!("[NGX] {name} is not exported by this core"));
+                continue;
+            };
             let mut parameters: *mut c_void = std::ptr::null_mut();
             let result = unsafe { function(&mut parameters) };
             if !super::succeeded(result) || parameters.is_null() {
                 super::diag(&format!("[NGX] {name} -> {}", super::result_name(result)));
                 continue;
             }
-            super::diag(&format!("[NGX] parameter map: NGX's own, from {name}"));
             let destroy = if destroyable {
                 self.destroy_parameters
             } else {
                 None
             };
-            return NgxParams::from_ngx(NgxMap::new(
-                parameters,
-                destroy,
-                Some(set_u32),
-                Some(set_i32),
-                Some(set_f32),
-                Some(set_d3d12),
-                Some(set_void),
+            if super::params::is_writable(parameters) {
+                super::diag(&format!(
+                    "[NGX] parameter map: NGX's own, from {name} (written through its vtable)"
+                ));
+                return NgxParams::from_ngx(NgxMap::through_vtable(parameters, destroy));
+            }
+            if self.set_u32.is_some() {
+                super::diag(&format!(
+                    "[NGX] parameter map: NGX's own, from {name} (written through the exported \
+                     NVSDK_NGX_Parameter_Set* helpers)"
+                ));
+                return NgxParams::from_ngx(NgxMap::new(
+                    parameters,
+                    destroy,
+                    self.set_u32,
+                    self.set_i32,
+                    self.set_f32,
+                    self.set_d3d12,
+                    self.set_void,
+                ));
+            }
+            super::diag(&format!(
+                "[NGX] {name} returned a map the viewer cannot write to; ignoring it"
             ));
+            if let Some(destroy) = destroy {
+                unsafe { destroy(parameters) };
+            }
         }
         super::diag(
             "[NGX] no NVSDK_NGX parameter allocator answered; the viewer's own parameter table \
@@ -787,6 +813,43 @@ impl NgxCore {
 /// `0x15` is the vendored header's `NVSDK_NGX_VERSION_API_MACRO`; the older
 /// entries are what pre-DLSS-3 cores understand.
 const NGX_VERSIONS: [i32; 3] = [NGX_VERSION_API, 0x0f, 0x03];
+
+/// Say which DLSS build is installed and what it exports.
+///
+/// The vendored `nvngx_dlss.dll` of this project is DLSS 4.x (`310.9.16`, the
+/// current release). An older file left in `sdk/` by a previous install is the
+/// one thing that silently changes how the whole bootstrap behaves, so it is
+/// named in the log together with the parameter surface it does or does not
+/// export.
+fn log_feature_module(path: &Path) {
+    let version = module_version(path);
+    let major = version
+        .as_deref()
+        .and_then(|version| version.split('.').next())
+        .and_then(|major| major.parse::<u32>().ok());
+    super::diag(&format!(
+        "[NGX] feature module {} version {}",
+        path.display(),
+        version.clone().unwrap_or_else(|| "unknown".to_string())
+    ));
+    if major.is_some_and(|major| major < 310) {
+        super::diag(&format!(
+            "[NGX] this DLSS build ({}) predates DLSS 4: replace sdk\\nvngx_dlss.dll and \
+             sdk\\nvngx_dlssg.dll with the 310.x release (NVIDIA/DLSS, \
+             lib/Windows_x86_64/rel/)",
+            version.unwrap_or_default()
+        ));
+    }
+    let parameters = parameter_exports(path);
+    super::diag(&format!(
+        "[NGX] parameter surface of the feature module: {}",
+        if parameters.is_empty() {
+            "none (no NVSDK_NGX_Parameter_* / *Parameters exports)".to_string()
+        } else {
+            parameters.join(", ")
+        }
+    ));
+}
 
 /// Announce a call before making it.
 ///
@@ -834,7 +897,7 @@ fn same_file(left: &Path, right: &Path) -> bool {
 /// This is what makes the bootstrap decidable instead of guessed: which of the
 /// entry points a given driver build implements is otherwise invisible from
 /// `session.log`, and a name we do not recognise is a call we must not make.
-fn init_exports(path: &Path) -> Vec<String> {
+fn exported_names(path: &Path) -> Vec<String> {
     /// `None` for anything that is not a well-formed PE image.
     fn parse(bytes: &[u8]) -> Option<Vec<String>> {
         let read_u16 = |offset: usize| -> Option<u16> {
@@ -903,11 +966,29 @@ fn init_exports(path: &Path) -> Vec<String> {
     let mut names: Vec<String> = parse(&bytes)
         .unwrap_or_default()
         .into_iter()
-        .filter(|name| name.starts_with("NVSDK_NGX_D3D12_Init"))
+        .filter(|name| name.starts_with("NVSDK_NGX_"))
         .collect();
     names.sort();
     names.dedup();
     names
+}
+
+/// The `NVSDK_NGX_D3D12_Init*` entries of [`exported_names`].
+fn init_exports(path: &Path) -> Vec<String> {
+    exported_names(path)
+        .into_iter()
+        .filter(|name| name.starts_with("NVSDK_NGX_D3D12_Init"))
+        .collect()
+}
+
+/// The `NVSDK_NGX_Parameter_*` helpers and the parameter-map allocators of
+/// [`exported_names`] — the surface `NgxCore::new_parameters` needs to hand NGX
+/// a map of its own.
+fn parameter_exports(path: &Path) -> Vec<String> {
+    exported_names(path)
+        .into_iter()
+        .filter(|name| name.starts_with("NVSDK_NGX_Parameter_") || name.ends_with("Parameters"))
+        .collect()
 }
 
 /// The module's `VS_FIXEDFILEINFO` version, e.g. `310.2.1.0`.

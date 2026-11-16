@@ -48,6 +48,20 @@ const P_OUT_WIDTH: &str = "OutWidth";
 const P_OUT_HEIGHT: &str = "OutHeight";
 const P_PERF_QUALITY: &str = "PerfQualityValue";
 const P_CREATE_FLAGS: &str = "DLSS.Feature.Create.Flags";
+/// `NVSDK_NGX_Parameter_CreationNodeMask` / `..._VisibilityNodeMask`.
+///
+/// `NGX_D3D12_CREATE_DLSS_EXT` (`nvsdk_ngx_helpers_d3d.h:283-284`) sets both on
+/// every create, and NGX keeps them on the feature it hands back. Leaving them
+/// unset means the feature was created with an adapter mask of `0`, which names
+/// no adapter at all — the same mistake the D3D12 heaps used to make (see
+/// `docs/blockers.md`, B-22). This viewer renders on one GPU, so both masks name
+/// adapter 0.
+const P_CREATION_NODE_MASK: &str = "CreationNodeMask";
+const P_VISIBILITY_NODE_MASK: &str = "VisibilityNodeMask";
+/// `NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects`, which the reference
+/// wrapper also always writes. The viewer upscales the whole frame, so subrect
+/// output stays off.
+const P_OUTPUT_SUBRECTS: &str = "DLSS.Enable.Output.Subrects";
 const P_COLOR: &str = "Color";
 const P_DEPTH: &str = "Depth";
 const P_MOTION_VECTORS: &str = "MotionVectors";
@@ -295,6 +309,9 @@ impl DlssUpscaler {
         params.set_u32(P_PERF_QUALITY, quality_setting);
         let flags = NGX_DLSS_FEATURE_MV_LOW_RES | NGX_DLSS_FEATURE_DEPTH_INVERTED;
         params.set_i32(P_CREATE_FLAGS, flags);
+        params.set_u32(P_CREATION_NODE_MASK, 1);
+        params.set_u32(P_VISIBILITY_NODE_MASK, 1);
+        params.set_i32(P_OUTPUT_SUBRECTS, 0);
 
         let mut ring = NativeCommandRing::new(&raw_device, "DLSS")?;
         let mut handle: *mut c_void = std::ptr::null_mut();

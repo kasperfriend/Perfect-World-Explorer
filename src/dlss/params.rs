@@ -8,8 +8,13 @@
 //! is that path and [`NgxMap`] the thin wrapper around it.
 //!
 //! The *feature* DLLs (`nvngx_dlss.dll`, `nvngx_dlssg.dll`) export neither the
-//! allocator nor the helpers, so the viewer also carries a complete table of its
-//! own ([`Owned`]) as the fallback — which is exactly what the vendored
+//! allocator nor the helpers — `nvngx_dlss.dll` 310.9.16 exports no
+//! `NVSDK_NGX_Parameter_*` name at all — and the driver's core is where the
+//! allocators live. Whatever map the core hands out is then filled through its
+//! own vtable ([`NgxMap::through_vtable`]) rather than through the exported
+//! helpers, so a core that exports only the allocators is enough. When no
+//! allocator answers, the viewer falls back to a complete table of its own
+//! ([`Owned`]), which is exactly what the vendored
 //! `include/nvidia/nvsdk_ngx_params.h` describes:
 //!
 //! ```c
@@ -102,6 +107,46 @@ static VTABLE: NgxParamVTable = NgxParamVTable {
     reset: vtable_reset,
 };
 
+// `NVSDK_NGX_Parameter` vtable slots, in declaration order
+// (`nvsdk_ngx_params.h:55-73`): eight `Set` overloads, eight `Get` overloads,
+// then `Reset`. NGX's own map is a C++ object with no virtual destructor and no
+// virtual bases, so its vtable pointer is at offset 0 and these indices address
+// the same overloads [`NgxParamVTable`] implements.
+const SLOT_SET_F32: usize = 1;
+const SLOT_SET_U32: usize = 3;
+const SLOT_SET_I32: usize = 4;
+const SLOT_SET_D3D12: usize = 6;
+const SLOT_SET_VOID: usize = 7;
+
+/// One `Set` overload of an `NVSDK_NGX_Parameter` the viewer does not own.
+///
+/// `None` when the object or its vtable is missing, or when the slot is null —
+/// a map that cannot be written is worse than no map at all.
+unsafe fn vtable_setter<F: Copy>(object: *mut c_void, index: usize) -> Option<F> {
+    if object.is_null() {
+        return None;
+    }
+    let vtable = *(object as *const *const *const c_void);
+    if vtable.is_null() {
+        return None;
+    }
+    let entry = *vtable.add(index);
+    if entry.is_null() {
+        return None;
+    }
+    // A `*const c_void` and a function pointer are both one word here, but
+    // Rust forbids `transmute` between them (`E0512` on Windows x64).
+    Some(std::mem::transmute_copy(&entry))
+}
+
+/// Whether `object` looks like an `NVSDK_NGX_Parameter` the viewer can fill
+/// through its own vtable.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn is_writable(object: *mut c_void) -> bool {
+    type SetU32 = unsafe extern "C" fn(*mut c_void, *const c_char, u32);
+    unsafe { vtable_setter::<SetU32>(object, SLOT_SET_U32) }.is_some()
+}
+
 /// The parameter table the viewer supplies itself. Pass [`Owned::as_ptr`] to
 /// NGX as `NVSDK_NGX_Parameter*`; the first field is the vtable pointer, so the
 /// object and the `this` pointer NGX passes back are the same address.
@@ -184,8 +229,11 @@ enum Kind {
 /// unused — it still has to compile, and the unit test below exercises it.
 #[cfg_attr(not(windows), allow(dead_code))]
 ///
-/// The `Set*` family is exported by `nvngx.dll` (`nvsdk_ngx_params.h`), so the
-/// viewer never has to guess the C++ vtable layout of NGX's own class.
+/// Two ways in, both supported here: the exported `NVSDK_NGX_Parameter_Set*`
+/// helpers ([`NgxMap::new`]), and the object's own vtable
+/// ([`NgxMap::through_vtable`]). The vtable layout is not a guess — it is the
+/// declaration order in `nvsdk_ngx_params.h`, the same one [`NgxParamVTable`]
+/// implements for the map the viewer supplies itself.
 pub(crate) struct NgxMap {
     object: *mut c_void,
     destroy: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
@@ -214,6 +262,31 @@ impl NgxMap {
             set_f32,
             set_d3d12,
             set_void,
+        }
+    }
+
+    /// NGX's own map, written through its vtable.
+    ///
+    /// The vendored DLSS 4.x build exports none of `NVSDK_NGX_Parameter_Set*`,
+    /// `…AllocateParameters`, `…GetCapabilityParameters` or `…GetParameters`
+    /// (checked against `nvngx_dlss.dll` 310.9.16's export table), so requiring
+    /// those helpers before asking Core for a map was backwards: it sent the
+    /// viewer's own table to NGX even when an NGX-owned one was available.
+    /// Filling the map through the object's own `Set` slots needs no exported
+    /// helper at all.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn through_vtable(
+        object: *mut c_void,
+        destroy: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    ) -> Self {
+        Self {
+            object,
+            destroy,
+            set_u32: unsafe { vtable_setter(object, SLOT_SET_U32) },
+            set_i32: unsafe { vtable_setter(object, SLOT_SET_I32) },
+            set_f32: unsafe { vtable_setter(object, SLOT_SET_F32) },
+            set_d3d12: unsafe { vtable_setter(object, SLOT_SET_D3D12) },
+            set_void: unsafe { vtable_setter(object, SLOT_SET_VOID) },
         }
     }
 
@@ -577,6 +650,28 @@ mod tests {
             assert_eq!(result, NGX_SUCCESS);
             assert_eq!(out_ptr as usize, 0x1234);
         }
+    }
+
+    #[test]
+    fn ngx_maps_are_written_through_their_own_vtable() {
+        // `Owned` is itself a complete `NVSDK_NGX_Parameter`, so pointing
+        // `NgxMap` at one exercises exactly the path an NGX-owned map takes:
+        // no exported `NVSDK_NGX_Parameter_Set*` helper in sight.
+        let mut own = Owned::new();
+        assert!(is_writable(own.as_ptr()));
+        {
+            let mut map = NgxMap::through_vtable(own.as_ptr(), None);
+            map.set_u32("Width", 3440);
+            map.set_i32("Reset", 1);
+            map.set_f32("Sharpness", 0.35);
+            map.set_d3d12_resource("Color", std::ptr::null_mut());
+        }
+        assert!(matches!(own.values.get("Width"), Some(Value::U32(3440))));
+        assert!(matches!(own.values.get("Reset"), Some(Value::I32(1))));
+        assert!(matches!(own.values.get("Sharpness"), Some(Value::F32(_))));
+        assert!(matches!(own.values.get("Color"), Some(Value::Ptr(_))));
+        // A null object has no vtable, so it is never handed to NGX.
+        assert!(!is_writable(std::ptr::null_mut()));
     }
 
     #[test]
