@@ -3221,7 +3221,7 @@ impl Renderer {
         if !camera.water_reflections {
             let mut e = self.device.create_command_encoder(&Default::default());
             for batch in &visible {
-                if batch.simple {               
+                if batch.simple {
                     self.simple_water.draw(
                         &mut e,
                         scene_target_raw,
