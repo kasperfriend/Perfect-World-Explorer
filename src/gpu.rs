@@ -4430,7 +4430,10 @@ pub fn run(
                         if let Some(c)=world_cancel.take(){c.store(true,std::sync::atomic::Ordering::Relaxed);}
                         world_rx=None;renderer.world_pages.clear();renderer.world_draw_cmds=Default::default();renderer.world_done=false;
                         if world_enabled {
-                            let (tx,rx)=std::sync::mpsc::sync_channel(8);let cancel=Arc::new(std::sync::atomic::AtomicBool::new(false));
+                         let (tx, rx) = std::sync::mpsc::sync_channel(
+                             if crate::objects::unbounded_textures() { 8 } else { 2 },
+                         );
+                         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));   
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
                             std::thread::Builder::new().name("whole-world-objects".into()).spawn(move ||crate::world_objects::build(root,ornaments,tx,c)).expect("world preload thread");
                             world_rx=Some(rx);world_cancel=Some(cancel);world_status=String::from("Loading world objects...");
@@ -4473,6 +4476,11 @@ pub fn run(
                                     crate::world_objects::GpuPage::world_culled_commands(
                                         &renderer.world_pages,
                                     );
+                                for page in &mut renderer.world_pages {
+                                    page.release_cpu_ranges();
+                                }
+                                renderer.local_pages.clear();
+                                renderer.local_pages.shrink_to_fit();
                                 renderer.world_done = true;
                                 world_status = format!(
                                     "Loaded {processed} objects; {skipped} meshes use fallback texture; {} geometry chunks ({} pages); peak decoded-texture residency {} MiB / {} MiB, {} evictions",
@@ -5016,6 +5024,11 @@ pub fn preview(
                     );
                     renderer.world_draw_cmds =
                         crate::world_objects::GpuPage::world_culled_commands(&renderer.world_pages);
+                    for page in &mut renderer.world_pages {
+                        page.release_cpu_ranges();
+                    }
+                    renderer.local_pages.clear();
+                    renderer.local_pages.shrink_to_fit();
                     renderer.world_done = true;
                     break;
                 }
