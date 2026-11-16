@@ -241,7 +241,8 @@ impl Page {
                                             + source[row1 + x0 + c] as u32
                                             + source[row1 + x0 + 4 + c] as u32
                                             + 2)
-                                            >> 2) as u8;
+                                            >> 2)
+                                                as u8;
                                     }
                                 }
                             }
@@ -461,7 +462,11 @@ fn run(
         height: 1,
         rgba: vec![160, 160, 160, 255],
     };
-    let batch_size = if crate::objects::unbounded_textures() { 64 } else { 24 };
+    let batch_size = if crate::objects::unbounded_textures() {
+        64
+        } else {
+        24
+        };
     for start in (first..limit).step_by(batch_size) {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
@@ -1049,11 +1054,11 @@ impl GpuPage {
                     }
                     if bound != Some(cur_page) {
                         let p = &pages[cur_page];
-                       pass.set_bind_group(
-                           0,
-                           if reflected { &p.reflected } else { &p.normal },
+                           pass.set_bind_group(
+                            0,
+                            if reflected { &p.reflected } else { &p.normal },
                            &[],
-                       );
+                          );
                         pass.set_vertex_buffer(0, p.vertex.slice(..));
                         pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
                         bound = Some(cur_page);
@@ -1065,10 +1070,10 @@ impl GpuPage {
         }
         if let Some((cur_page, cur_start, cur_end)) = pending {
             if bound != Some(cur_page) {
-               let p = &pages[cur_page];
-               pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
-               pass.set_vertex_buffer(0, p.vertex.slice(..));
-               pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
+                   let p = &pages[cur_page];
+                   pass.set_bind_group(0, if reflected { &p.reflected } else { &p.normal }, &[]);
+                   pass.set_vertex_buffer(0, p.vertex.slice(..));
+                   pass.set_index_buffer(p.index.slice(..), wgpu::IndexFormat::Uint32);
             }
             pass.draw_indexed(cur_start..cur_end, 0, 0..1);
         }
