@@ -24,12 +24,40 @@ temporal antialiasing without upscaling. It is offered for FSR 3.1 only — the
 other providers either have their own name for the same thing (DLSS Ultra
 Quality = DLAA) or refuse a 1.0× ratio. A persisted `nativeaa` choice degrades
 to `quality` when the upscaler is changed to one that cannot dispatch it
-(`crate::sanitise`). The FFX sharpening pass is a slider too: **FSR
-sharpening** (`fsr3_sharpness`, 0 = off, 1 = maximum, default 0.75) is passed
-straight through as `ffxDispatchDescUpscale.sharpness` with
-`enableSharpening = sharpness > 0`, and applies to FSR 3.1/4 and to Native AA
-alike. The value is read every frame, so dragging the slider takes effect
-without recreating the context.
+(`crate::sanitise`).
+
+**Sharpening is a per-upscaler slider, for every provider.** A temporal
+upscaler reconstructs detail from jittered history rather than inventing it
+with a spatial filter, so its output is softer than a Lanczos/EASU upscale, and
+which knob sharpens it back is vendor-specific — that is why each upscaler has
+its own setting instead of one shared one:
+
+| Upscaler | Setting | Where it is applied | Default |
+| --- | --- | --- | --- |
+| FSR 1 | `fsr1_sharpness` (0–2 stops, lower = sharper) | RCAS in `src/fsr1.wgsl` | 0.2 |
+| FSR 2 / 3.1 / 4 | `fsr3_sharpness` (0 = off, 1 = maximum) | `ffxDispatchDescUpscale.sharpness` with `enableSharpening = sharpness > 0` | 0.75 |
+| DLSS | `dlss_sharpness` (0 = off, 1 = maximum) | NGX `NVSDK_NGX_Parameter_Sharpness` (`"Sharpness"`) in the eval params | 0.35 |
+| XeSS | `xess_sharpness` (0 = off, 1 = maximum) | the viewer's own RCAS-style pass while the XeSS result is copied into the composition | 0.35 |
+
+DLSS used to be handed `Sharpness = 0`, i.e. *no* sharpening at all, which is
+what made Quality look blurry next to FSR: FSR arrives with RCAS at 0.75 and
+DLSS arrived with nothing. The default is now a mild 0.35 (0 still reproduces
+the raw vendor look). The NGX feature flag
+`NVSDK_NGX_DLSS_Feature_Flags_DoSharpening` is *not* used — the vendored header
+(`nvsdk_ngx_defs.h:296`) marks it deprecated with the comment "Sharpness is not
+supported"; the `"Sharpness"` parameter is the supported channel.
+
+XeSS has no sharpening control at all: Intel's SDK 3.0.2 (`sdk/include/xess/xess.h`)
+exposes `xessD3D12CreateContext`, `xessD3D12Init`, `xessD3D12Execute` and the
+jitter/logging helpers, and nothing else. Its slider therefore runs our own
+pass — an unsharp filter against the 4-neighbour average, clamped to the local
+neighbourhood minimum/maximum so even 1 cannot ring or halo — inside
+`FsrComposite`, in linear light (after the sRGB decode) when the composition
+target is sRGB. FSR and DLSS pass 0 to that pass, because their own runtime
+already sharpened; sharpening twice would double the halos.
+
+Every one of these values is read every frame, so dragging a slider takes
+effect without recreating the context.
 
 **Jitter and colour, fixed in this build.** All three temporal providers share
 one jitter helper (`crate::fsr::jittered_clip_vp`): the Halton offset lands as a
@@ -53,6 +81,29 @@ pass that writes the FFX result into the sRGB world target now decodes first
 (`fs_decode`, `src/fsr/mv.rs`): copying sRGB bytes into an sRGB render target
 encoded them a second time (mid grey 0.5 landed at 0.735), which is exactly the
 washed-out, flat look FSR had next to FSR 1.
+
+**DLSS parameters that describe the buffers, not a preference.** Four NGX
+values have to match the buffers the viewer actually uploads, and getting any of
+them wrong shows up as softness or ghosting rather than as an error:
+
+* `NVSDK_NGX_DLSS_Feature_Flags_MVLowRes` (create flag) — the motion vectors are
+  written at *render* resolution (`FsrMotionVectorPass` runs over the render
+  extent and subtracts previous/current UVs in render pixels), not at display
+  resolution. DLSS defaults to display-resolution vectors, so without this flag
+  it read 1.5× more motion than there was at Quality and reconstructed detail
+  from badly matched history.
+* `MV.Scale.X/Y = 1.0` — because the vectors are already in pixels; NGX's own
+  helper sets the same default when the field is zero.
+* `FrameTimeDeltaInMsec` — measured per evaluate call
+  (`DlssUpscaler::record`). NGX uses it to decide how far it may trust history
+  and how hard to denoise/anti-alias, so it must be the real frame time, not a
+  constant.
+* `Jitter.Offset.X/Y` in render pixels (same value that jitters the world
+  matrix, `nvsdk_ngx_helpers_d3d.h`: "Jitter offset must be in input/render
+  pixel space"), and the in-tree Halton(2,3) pattern lengthened with the
+  reconstruction ratio (`ceil(8 · ratio²)`, clamped to 16…64) so that a 1.5×
+  or 3× reconstruction still sees distinct sub-pixel phases instead of repeating
+  the same 16.
 
 FSR 1 and the FFX providers are independent implementations; picking
 `FSR 1` never touches FFX, and picking `FSR 2/3/4` never loads the FSR 1
@@ -240,7 +291,9 @@ truncated) saying so instead of vanishing.
 `upscaling=off|dlss|fsr1|fsr2|fsr3|fsr4|xess` ·
 `upscale_quality=nativeaa|ultraquality|quality|balanced|performance|ultraperformance` ·
 `fsr1_sharpness=<0..2 stops>` ·
-`fsr3_sharpness=<0..1>` (FFX sharpening for FSR 3.1/4 and Native AA) ·
+`fsr3_sharpness=<0..1>` (FFX sharpening for FSR 2/3.1/4 and Native AA) ·
+`dlss_sharpness=<0..1>` (NGX `Sharpness`; 0 = the raw, softer DLSS look) ·
+`xess_sharpness=<0..1>` (our own pass, XeSS has no control of its own) ·
 `frame_generation=off|dlss|fsr|xess` ·
 `frame_multiplier=2|3|4|6` (also accepted: `x2`, `2x`, …) ·
 `latency=vsync|reflex|xell` ·

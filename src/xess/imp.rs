@@ -674,13 +674,25 @@ impl XessUpscaler {
     }
 
     /// Composites the upscaled frame into the composition view.
+    /// Blit the XeSS result into the composition.
+    ///
+    /// `sharpness` runs the viewer's own RCAS-style pass: Intel's SDK 3.0.2
+    /// exposes no sharpening control (`xess.h` has only `xessExecute` and the
+    /// jitter/logging helpers), so this is the only way to give XeSS the same
+    /// slider FSR and DLSS have.
     pub fn composite(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         target: &wgpu::TextureView,
+        sharpness: f32,
     ) {
-        self.composite
-            .draw(device, queue, &self.natives.output.texture, target);
+        self.composite.draw(
+            device,
+            queue,
+            &self.natives.output.texture,
+            target,
+            sharpness,
+        );
     }
 }

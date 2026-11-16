@@ -347,6 +347,7 @@ impl DlssUpscaler {
         color: &wgpu::Texture,
         depth: &wgpu::Texture,
         unjittered_vp: &Mat4,
+        sharpness: f32,
     ) -> Result<(), String> {
         let now = std::time::Instant::now();
         let frame_time_ms = (now - self.last_instant).as_secs_f32() * 1000.0;
@@ -509,11 +510,16 @@ impl DlssUpscaler {
         // Motion vectors are in pixels, so the scale is 1:1.
         self.params.set_f32(P_MV_SCALE_X, 1.0);
         self.params.set_f32(P_MV_SCALE_Y, 1.0);
-        let frame_time_ms = frame_time_ms.clamp(0.1, 1000.0);
-        self.params.set_f32(P_FRAME_TIME_MS, frame_time_ms);
-        // Sharpness is deprecated in current DLSS builds (sharpening moved to
-        // the game); 0 keeps the vendor default and is what the guide passes.
-        self.params.set_f32(P_SHARPNESS, 0.0);
+        // `InFrameTimeDeltaInMsec`: NGX scales how much it denoises and
+        // anti-aliases by how far content moves per frame.
+        self.params
+            .set_f32(P_FRAME_TIME_MS, frame_time_ms.clamp(0.1, 1000.0));
+        // `NVSDK_NGX_Parameter_Sharpness` (0 = off, 1 = maximum). DLSS does no
+        // sharpening of its own when this is 0, and its reconstruction is
+        // softer than an RCAS-sharpened FSR frame, which is exactly the
+        // "blurry even at Quality" report. The Graphics tab's DLSS sharpness
+        // slider drives this value.
+        self.params.set_f32(P_SHARPNESS, sharpness.clamp(0.0, 1.0));
         self.params
             .set_u32(P_RENDER_WIDTH, self.render_extent.0.max(1));
         self.params
@@ -566,7 +572,10 @@ impl DlssUpscaler {
         Ok(())
     }
 
-    /// Composites the upscaled frame into the composition view.
+    /// Blit the DLSS result into the composition.
+    ///
+    /// Sharpening is applied by NGX itself (`Sharpness`), so this pass is a
+    /// straight copy: sharpening twice would double the halos.
     pub fn composite(
         &self,
         device: &wgpu::Device,
@@ -574,6 +583,6 @@ impl DlssUpscaler {
         target: &wgpu::TextureView,
     ) {
         self.composite
-            .draw(device, queue, &self.natives.output.texture, target);
+            .draw(device, queue, &self.natives.output.texture, target, 0.0);
     }
 }

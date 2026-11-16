@@ -855,7 +855,11 @@ fn export_height_png(
 // (`nativeaa` is FSR 3.1 only: the same dispatch at a 1.0x render ratio),
 // `frame_generation=off|dlss|fsr|xess`, `frame_multiplier=2|3|4|6`,
 // `fsr1_sharpness=<0..2 stops>`,
-// `fsr3_sharpness=<0..1>` (FFX `sharpness` for FSR 3.1/4),
+// `fsr3_sharpness=<0..1>` (FFX `sharpness` for FSR 2/3.1/4),
+// `dlss_sharpness=<0..1>` (NGX `Sharpness`; DLSS sharpens nothing at 0, which
+// is what made Quality look blurry next to FSR),
+// `xess_sharpness=<0..1>` (the viewer's own RCAS-style pass after XeSS, whose
+// SDK has no sharpening control),
 // `latency=vsync|reflex|xell`, `upscale_sdk_dir=<path>`.
 //
 // This logic is intentionally free of GPU and windowing dependencies so it

@@ -134,6 +134,7 @@ mod imp_stub {
             _device: &wgpu::Device,
             _queue: &wgpu::Queue,
             _target: &wgpu::TextureView,
+            _sharpness: f32,
         ) {
         }
 

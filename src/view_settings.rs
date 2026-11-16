@@ -226,8 +226,21 @@ pub struct ViewSettings {
     /// Graphics: sharpening strength handed to the FSR 3.1 / FSR 4 FFX
     /// upscale dispatch (0 = off, 1 = maximum; FFX calls it `sharpness` and
     /// only applies it while `enableSharpening` is set). Applies while
-    /// `upscaling` is `fsr3` or `fsr4`.
+    /// `upscaling` is `fsr2`, `fsr3` or `fsr4` — all three go through the same
+    /// FFX upscale dispatch.
     pub fsr3_sharpness: f32,
+    /// Graphics: sharpening strength handed to NGX as `Sharpness`
+    /// (`NVSDK_NGX_Parameter_Sharpness`, 0 = off, 1 = maximum). DLSS does no
+    /// sharpening of its own when this is 0, which is why the reconstruction
+    /// looks soft next to an RCAS-sharpened FSR frame. Applies while
+    /// `upscaling` is `dlss`.
+    pub dlss_sharpness: f32,
+    /// Graphics: sharpening applied by the viewer's own RCAS-style pass after
+    /// XeSS (0 = off, 1 = maximum). Intel's SDK 3.0.2 has no sharpening
+    /// control — it exposes `xessExecute` and nothing else — so the only way to
+    /// give XeSS the same control the other two providers have is to sharpen
+    /// its output ourselves. Applies while `upscaling` is `xess`.
+    pub xess_sharpness: f32,
     /// Graphics: pacing strategy — `vsync` is the previous behaviour (the
     /// display paces presents and no latency library is involved), `xell`
     /// hands the decision to Intel Xe Low Latency (`xellSleep` plus the
@@ -321,6 +334,11 @@ impl Default for ViewSettings {
             frame_multiplier: FrameMultiplier::X2,
             fsr1_sharpness: 0.2,
             fsr3_sharpness: 0.75,
+            // DLSS and XeSS default to a mild sharpen: both reconstruct softer
+            // than an RCAS-sharpened FSR frame, and 0 (no sharpening at all) is
+            // what made DLSS look blurry next to it.
+            dlss_sharpness: 0.35,
+            xess_sharpness: 0.35,
             upscale_sdk_dir: String::new(),
             latency: LatencyMode::Vsync,
             // Both overrides default to the client's own behaviour; the World
@@ -444,6 +462,8 @@ impl ViewSettings {
                 }
                 "fsr1_sharpness" => number!(s.fsr1_sharpness, 0., 2.),
                 "fsr3_sharpness" => number!(s.fsr3_sharpness, 0., 1.),
+                "dlss_sharpness" => number!(s.dlss_sharpness, 0., 1.),
+                "xess_sharpness" => number!(s.xess_sharpness, 0., 1.),
                 "upscale_quality" => {
                     if let Some(quality) = UpscaleQuality::parse(v) {
                         s.upscale_quality = quality;
@@ -567,12 +587,12 @@ impl ViewSettings {
             "radius={}\nterrain_cutoff={}\ntree_lod_scale={}\nscenery_quality={}\ncamera_speed={}\nboost={}\nsensitivity={}\nfar={}\ntime_of_day={}\ntime_pass_enabled={}\ntime_pass_speed={}\nall_to_vram={}\n",
             "whole_world={}\nwater_reflections={}\nworld_effects={}\natmospheric_fog={}\nbloom={}\nbloom_strength={}\nbloom_mode={}\nbloom_tint={}\nbloom_brightness_fade={}\nbloom_opacity_fade={}\nclient_gamma={}\ngamma_setting={}\n",
             "terrain_lightmaps={}\nmodel_backface_culling={}\nmusic_enabled={}\nmusic_volume={}\nambience_enabled={}\nsound_volume={}\neffects_enabled={}\neffects_volume={}\nfullscreen={}\nshow_zone_entry={}\n",
-            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nframe_multiplier={}\nfsr1_sharpness={}\nfsr3_sharpness={}\nupscale_sdk_dir={}\nlatency={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\n"),
+            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nframe_multiplier={}\nfsr1_sharpness={}\nfsr3_sharpness={}\ndlss_sharpness={}\nxess_sharpness={}\nupscale_sdk_dir={}\nlatency={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\n"),
             self.detail.radius,self.detail.terrain_cutoff,self.detail.tree_lod_scale,self.detail.scenery_quality,self.camera_speed,self.boost,self.sensitivity,self.far,self.time_of_day,self.time_pass_enabled,self.time_pass_speed,self.all_to_vram,
             self.whole_world,self.water_reflections,self.world_effects,self.atmospheric_fog,self.bloom,self.bloom_strength,self.bloom_mode,self.bloom_tint,self.bloom_brightness_fade,self.bloom_opacity_fade,self.client_gamma,self.gamma_setting,
             self.terrain_lightmaps,self.model_backface_culling,self.music_enabled,self.music_volume,self.ambience_enabled,self.sound_volume,self.effects_enabled,self.effects_volume,self.fullscreen,self.show_zone_entry,
             self.show_minimap,self.minimap_range,self.tree_wind_strength,self.client_tree_wind_preview,self.regional_tree_lighting,self.grass_distance_fade,self.grass_wind_enabled,self.grass_wind_amplitude,self.streamed_regions,self.area_grass_lightmaps,self.vegetation_authored_mips,self.celestial_discs,self.celestial_brightness,self.ignore_celestial_flags,self.cloud_detail,self.sharpen,self.resolution_scale,
-            self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.frame_multiplier.token(),self.fsr1_sharpness,self.fsr3_sharpness,self.upscale_sdk_dir,self.latency.token(),
+            self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.frame_multiplier.token(),self.fsr1_sharpness,self.fsr3_sharpness,self.dlss_sharpness,self.xess_sharpness,self.upscale_sdk_dir,self.latency.token(),
             self.world_map_style.label(),self.minimap_style.label(),
             self.minimap_shape.label(),
             self.weather_override.token(),self.sky_override.token(),self.effect_shaft.token(),self.effect_distance,self.logging_mask,self.logging_dir)
@@ -1287,6 +1307,46 @@ effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs
         assert_eq!(both.latency, LatencyMode::Xell);
         assert_eq!(ViewSettings::decode(&both.encode()), both);
     }
+    /// The DLSS and XeSS sharpening sliders persist and are clamped too: DLSS
+    /// hands its value to NGX, XeSS runs the viewer's own pass.
+    #[test]
+    fn dlss_and_xess_sharpness_round_trip() {
+        // Both default to a mild sharpen: 0 is what made DLSS (and XeSS, which
+        // has no sharpening of its own) look soft next to an RCAS-sharpened FSR
+        // frame, so the neutral "vendor" look is a deliberate choice, not the
+        // default.
+        let defaults = ViewSettings::default();
+        assert_eq!(defaults.dlss_sharpness, 0.35);
+        assert_eq!(defaults.xess_sharpness, 0.35);
+        let decoded =
+            ViewSettings::decode("upscaling=dlss\ndlss_sharpness=0.6\nxess_sharpness=0.9\n");
+        assert_eq!(decoded.dlss_sharpness, 0.6);
+        assert_eq!(decoded.xess_sharpness, 0.9);
+        let encoded = decoded.encode();
+        assert!(encoded.contains("dlss_sharpness=0.6"), "{encoded}");
+        assert!(encoded.contains("xess_sharpness=0.9"), "{encoded}");
+        let round = ViewSettings::decode(&encoded);
+        assert_eq!(round.dlss_sharpness, 0.6);
+        assert_eq!(round.xess_sharpness, 0.9);
+        // Out-of-range values are clamped, garbage keeps the default.
+        assert_eq!(
+            ViewSettings::decode("dlss_sharpness=-3\n").dlss_sharpness,
+            0.
+        );
+        assert_eq!(
+            ViewSettings::decode("xess_sharpness=9\n").xess_sharpness,
+            1.
+        );
+        assert_eq!(
+            ViewSettings::decode("dlss_sharpness=abc\n").dlss_sharpness,
+            defaults.dlss_sharpness
+        );
+        assert_eq!(
+            ViewSettings::decode("xess_sharpness=0\n").xess_sharpness,
+            0.
+        );
+    }
+
     /// The FSR sharpening slider persists, is clamped, and defaults to the
     /// value the dispatch used before the slider existed.
     #[test]

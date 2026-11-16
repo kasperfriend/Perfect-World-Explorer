@@ -746,6 +746,8 @@ pub(crate) struct FsrComposite {
     decode_source: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+    /// `(strength, 1/width, 1/height, 0)`, written per draw.
+    sharpen: wgpu::Buffer,
 }
 
 impl FsrComposite {
@@ -767,6 +769,16 @@ impl FsrComposite {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 },
             ],
@@ -832,6 +844,12 @@ impl FsrComposite {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
+        let sharpen = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fsr composite sharpen"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Self {
             pipeline,
             pipeline_decode,
@@ -841,16 +859,36 @@ impl FsrComposite {
             decode_source: format.is_srgb(),
             layout,
             sampler,
+            sharpen,
         }
     }
 
+    /// Blit `source` into `target`, optionally sharpening.
+    ///
+    /// `sharpness` is the viewer's own RCAS-style pass (0 = off, 1 = maximum).
+    /// It exists for XeSS, whose SDK has no sharpening control at all; FSR and
+    /// DLSS sharpen inside their own runtimes (`ffxDispatchDescUpscale.sharpness`
+    /// and `NVSDK_NGX_Parameter_Sharpness`), so they pass 0 here and are never
+    /// sharpened twice.
     pub(crate) fn draw(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         source: &wgpu::Texture,
         target: &wgpu::TextureView,
+        sharpness: f32,
     ) {
+        let strength = sharpness.clamp(0.0, 1.0);
+        queue.write_buffer(
+            &self.sharpen,
+            0,
+            bytemuck::cast_slice(&[
+                strength,
+                1.0 / source.width().max(1) as f32,
+                1.0 / source.height().max(1) as f32,
+                0.0f32,
+            ]),
+        );
         let view = source.create_view(&wgpu::TextureViewDescriptor::default());
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("fsr composite source"),
@@ -863,6 +901,10 @@ impl FsrComposite {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.sharpen.as_entire_binding(),
                 },
             ],
         });
@@ -1709,8 +1751,9 @@ impl FsrUpscaler {
         queue: &wgpu::Queue,
         target: &wgpu::TextureView,
     ) {
+        // FFX applies its own RCAS sharpening (`ffxDispatchDescUpscale.sharpness`).
         self.composite
-            .draw(device, queue, &self.natives.output.texture, target);
+            .draw(device, queue, &self.natives.output.texture, target, 0.0);
     }
 }
 

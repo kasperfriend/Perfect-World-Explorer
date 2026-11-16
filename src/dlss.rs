@@ -185,6 +185,7 @@ mod imp_stub {
             _color: &wgpu::Texture,
             _depth: &wgpu::Texture,
             _unjittered_vp: &Mat4,
+            _sharpness: f32,
         ) -> Result<(), String> {
             Err("DLSS is only supported on Windows with a DX12 backend".to_string())
         }

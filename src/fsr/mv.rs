@@ -88,6 +88,33 @@ struct FOut {
 pub(crate) const COMPOSITE_SHADER: &str = r#"
 @group(0) @binding(0) var frame: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
+// x = sharpen strength (0 = off), yz = source texel size in UV units.
+@group(0) @binding(2) var<uniform> sharpen: vec4<f32>;
+fn srgb_to_linear(c_: vec3<f32>) -> vec3<f32> {
+    let low = c_ / vec3<f32>(12.92);
+    let high = pow((c_ + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
+    return select(high, low, c_ <= vec3<f32>(0.04045));
+}
+// Unsharp against the 4-neighbour average, clamped to the local neighbourhood so
+// even the maximum slider setting cannot ring or halo. `decode` is set when the
+// source is sRGB-encoded and the target expects linear (see `fs_decode`).
+fn sharpen_rgb(uv: vec2<f32>, centre: vec3<f32>, decode: bool) -> vec3<f32> {
+    let t = sharpen.yz;
+    var n = textureSample(frame, samp, uv + vec2<f32>(0.0, -t.y)).rgb;
+    var s_ = textureSample(frame, samp, uv + vec2<f32>(0.0, t.y)).rgb;
+    var e = textureSample(frame, samp, uv + vec2<f32>(t.x, 0.0)).rgb;
+    var w = textureSample(frame, samp, uv + vec2<f32>(-t.x, 0.0)).rgb;
+    if (decode) {
+        n = srgb_to_linear(n);
+        s_ = srgb_to_linear(s_);
+        e = srgb_to_linear(e);
+        w = srgb_to_linear(w);
+    }
+    let avg = (n + s_ + e + w) * 0.25;
+    let lo = min(centre, min(min(n, s_), min(e, w)));
+    let hi = max(centre, max(max(n, s_), max(e, w)));
+    return clamp(centre + (centre - avg) * sharpen.x, lo, hi);
+}
 struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 @vertex fn vs(@builtin(vertex_index) id: u32) -> VOut {
     var o: VOut;
@@ -97,13 +124,13 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
     o.uv = vec2<f32>(x, y);
     return o;
 }
+// No branch on the strength: at 0 the filter reduces to the centre texel
+// exactly (the clamp keeps the centre inside [lo, hi]), so leaving it
+// unconditional costs four taps and cannot trip WGSL's uniform-control-flow
+// rules for the sampler reads inside `sharpen_rgb`.
 @fragment fn fs(i: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(textureSample(frame, samp, i.uv).rgb, 1.0);
-}
-fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
-    let low = c / vec3<f32>(12.92);
-    let high = pow((c + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
-    return select(high, low, c <= vec3<f32>(0.04045));
+    let c_ = textureSample(frame, samp, i.uv).rgb;
+    return vec4<f32>(sharpen_rgb(i.uv, c_, false), 1.0);
 }
 // The world is rendered into an sRGB target, so the bytes the upscaler reads -
 // and the bytes it writes back - are sRGB encoded. Copying them straight into an
@@ -113,7 +140,8 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
 // decode) looked correct. Decoding here lets the target's own encode restore the
 // exact original bytes.
 @fragment fn fs_decode(i: VOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(srgb_to_linear(textureSample(frame, samp, i.uv).rgb), 1.0);
+    let c_ = srgb_to_linear(textureSample(frame, samp, i.uv).rgb);
+    return vec4<f32>(sharpen_rgb(i.uv, c_, true), 1.0);
 }
 "#;
 
