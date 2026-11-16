@@ -725,3 +725,35 @@ done.
   `[NGX] initialised through <variant> (SDK API 0x…)` followed by
   `[NGX] parameter map: NGX's own, from <allocator>` and then
   `[DLSS] first evaluate OK (…)`.
+
+## B-21 — "it simply crashes when selecting DLSS upscaling"
+
+- **Report:** selecting DLSS kills the process. `session.log` ends one line after
+  `[NGX] initialising through …\_nvngx.dll (application data folder: …)`, twice,
+  with `[NGX] candidate … version 32.0.16.2114` above it.
+- **Cause:** the init ladder added in B-20 called
+  `NVSDK_NGX_D3D12_Init_ProjectID` — a DLSS 2.1-era name that the vendored
+  `nvsdk_ngx.h` does not declare. Its signature was a guess, and a driver that
+  implements that name differently (or implements a *newer* argument list under
+  it) dereferences whatever lands in the register the missing argument came from.
+  A version number read as a `FeatureCommonInfo*` is a crash, not a rejected
+  call. Nothing else in that build had never been called before.
+- **Fixed:** the name is gone. Every remaining variant uses the signature the
+  vendored header declares — `…_Init_with_ProjectID`, `…_Init`, `…_Init_Ext`, and
+  `…_Init` in the Core-to-snippet flavour on `nvngx_dlss*.dll` only.
+- **Diagnostics added, so the next attempt is decidable rather than another
+  round trip:**
+  * `[NGX] calling <name> (SDK API 0x…)` is written before every call, so a
+    crash names the entry point and the version rung that caused it;
+  * the candidate line lists the module's real `NVSDK_NGX_D3D12_Init*` exports,
+    read from its PE export directory
+    (`[NGX] candidate …\_nvngx.dll version 32.0.16.2114, exports:
+    NVSDK_NGX_D3D12_Init, …]`) — ground truth about what this driver build has;
+  * the version ladder only steps down on `FAIL_OutOfDate`, the one result that
+    means "the version asked for is newer than this module". Every other code
+    would answer identically at every version, and each extra call is another
+    chance to be inside the driver when it fails.
+- **Rule:** an entry point may only be called with the argument list a header in
+  `sdk/include` declares. "It is probably the same name from an older SDK" is
+  not a licence to invent a prototype; a wrong prototype inside a graphics
+  driver is a process kill.
