@@ -483,7 +483,7 @@ let mut g_start = 0usize;
                                         .ok_or_else(|| "missing MOXTMODEL".to_string())
                                            .and_then(|e| {
                                                pck::read_entry_at(archive, e)
-                                                   .map_err(|e| e.to_string()
+                                                   .map_err(|e| e.to_string())
                                             })   
                                         .and_then(|b| mox_wrapper_child(&b))
                                     {
