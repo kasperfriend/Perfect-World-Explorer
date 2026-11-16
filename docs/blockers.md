@@ -682,3 +682,46 @@ done.
   either no `[NGX] <path> cannot be used:` lines at all, or a few followed by
   `[NGX] … is the first of N candidate NGX modules that initialised`, then
   `[DLSS] first evaluate OK (…)`.
+
+## B-20 — "none of the 3 NVSDK_NGX modules found could be used"
+
+- **Report:** `_nvngx.dll` and `nvngx.dll` from the driver store both answered
+  `Init_with_ProjectID is not exported, Init -> 0xbad0000c FAIL_OutOfDate`; the
+  vendored `sdk\nvngx_dlss.dll` answered
+  `Init -> 0xbad00001 FAIL_FeatureNotSupported`. In the *same* `session.log`,
+  one run earlier, the **same build** and the **same `_nvngx.dll`** initialised
+  successfully through `NVSDK_NGX_D3D12_Init` after a ~10 s stall.
+- **What that means:** a single `Init` attempt per module is the actual bug.
+  Which entry point a given driver implements, and which SDK API version it
+  accepts, cannot be known up front: this machine's core has no
+  `Init_with_ProjectID` at all, so the application-id `Init` is the only way in,
+  and its answer varies run to run.
+- **Fixed:** `NgxCore::initialise` tries every documented entry point, each with
+  a ladder of SDK API versions (`0x15` -> `0x0F` -> `0x03`), because
+  `FAIL_OutOfDate` is defined as "a function was used which requires a newer
+  version of the NVIDIA Display Driver or feature library than is currently
+  installed":
+  1. `NVSDK_NGX_D3D12_Init_with_ProjectID`,
+  2. `NVSDK_NGX_D3D12_Init_ProjectID` (DLSS 2.1-era),
+  3. `NVSDK_NGX_D3D12_Init` (application id, SDK signature),
+  4. `NVSDK_NGX_D3D12_Init_Ext` (application id, parameter map),
+  5. `NVSDK_NGX_D3D12_Init` with the Core-to-snippet signature — **only** on an
+     `nvngx_dlss*.dll`; a core would read the version we pass as a
+     `FeatureCommonInfo*` and dereference a small integer.
+- **Diagnostics:** every candidate logs its PE file version
+  (`[NGX] candidate …\nvngx.dll version 32.0.15.6094`) and every variant logs
+  its outcome, so the next report says which build answered what.
+- **Also fixed, from the run that got past init:** that run created DLSS and
+  then failed `EvaluateFeature(DLSS)` with `0xbad00005 FAIL_InvalidParameter`
+  again. The `NVSDK_NGX_Parameter_*` helpers are now resolved from the core
+  *and*, when it does not export them, from the feature snippet — a legacy
+  `_nvngx.dll` exports `CreateFeature`/`EvaluateFeature` but not the whole
+  parameter surface. `NVSDK_NGX_D3D12_GetParameters` joins the map sources after
+  `AllocateParameters` and `GetCapabilityParameters`: it is deprecated and it is
+  the only allocator an older core has, and NGX validating a map it did not
+  create is exactly the `FAIL_InvalidParameter` case. Falling back to the
+  viewer's own table is logged loudly now.
+- **Status:** fixed in source; needs one hardware report. A working run shows
+  `[NGX] initialised through <variant> (SDK API 0x…)` followed by
+  `[NGX] parameter map: NGX's own, from <allocator>` and then
+  `[DLSS] first evaluate OK (…)`.
