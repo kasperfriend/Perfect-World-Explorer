@@ -3220,7 +3220,7 @@ impl Renderer {
         if !camera.water_reflections {
             let mut e = self.device.create_command_encoder(&Default::default());
             for batch in &visible {
-                if batch.simple {
+                
                     self.simple_water.draw(
                         &mut e,
                         scene_target_raw,
@@ -3286,11 +3286,16 @@ impl Renderer {
             self.visible_water_batches = visible;
             return;
         }
-        for (batch_idx, batch) in visible.iter().enumerate() {
+        let mut simple_encoder: Option<wgpu::CommandEncoder> = None;
+    for (batch_idx, batch) in visible.iter().enumerate() {
             if batch.simple {
-                let mut e = self.device.create_command_encoder(&Default::default());
+                if simple_encoder.is_none() {
+                    let enc = self.device.create_command_encoder(&Default::default());
+                    simple_encoder = Some(enc);
+                }
+                let e = simple_encoder.as_mut().unwrap();
                 self.simple_water.draw(
-                    &mut e,
+                    e,
                     scene_target_raw,
                     &scene_depth,
                     &self.vertex,
@@ -3298,8 +3303,9 @@ impl Renderer {
                     batch.start,
                     batch.end,
                 );
-                self.queue.submit(Some(e.finish()));
                 continue;
+            if let Some(e) = simple_encoder.take() {
+                self.queue.submit(Some(e.finish()));
             }
             let plane = batch.height;
             // A previous plane's reflection left its mirrored records in the
@@ -3598,7 +3604,10 @@ impl Renderer {
             );
             self.queue.submit(Some(e.finish()));
         }
-        self.visible_water_batches = visible;
+        if let Some(e) = simple_encoder {
+            self.queue.submit(Some(e.finish()));
+        }
+    self.visible_water_batches = visible;
         if let Some(shore) = &self.shore {
             shore.draw(
                 &self.device,
