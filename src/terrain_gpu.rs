@@ -898,22 +898,22 @@ impl TerrainGpu {
         far_runs: Option<&[(u32, u32)]>,
     ) {
         if let Some(runs) = runs {
-           if self.last_near_runs.as_slice() != runs {
-               self.last_near_runs.clear();
-               self.last_near_runs.extend_from_slice(runs);
-               self.near_records = Self::upload_runs(
-                   device,
-                   queue,
-                   &mut self.near_args,
-                   &mut self.near_capacity,
-                   &mut self.scratch_records,
-                   "terrain near run args",
-                   runs,
-               );
-           }
+         if self.last_near_runs.as_slice() != runs {
+             self.last_near_runs.clear();
+             self.last_near_runs.extend_from_slice(runs);
+             self.near_records = Self::upload_runs(
+                 device,
+                 queue,
+                 &mut self.near_args,
+                 &mut self.near_capacity,
+                 &mut self.scratch_records,
+                 "terrain near run args",
+                 runs,
+             );
+         }
           } else {
               self.last_near_runs.clear();
-            self.near_records = 0;
+                self.near_records = 0;
         }
         if let Some(far_runs) = far_runs {
             if self.last_far_runs.as_slice() != far_runs {
