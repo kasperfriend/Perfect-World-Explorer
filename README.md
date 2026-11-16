@@ -161,17 +161,22 @@ the whole package under `sdk/DirectStorage/`. The build automatically uses that
 pinned directory; `DIRECTSTORAGE_SDK_DIR` only overrides it. The extracted
 package is intentionally not ignored so its contents can be included in a
 checkout/PR if the package's licenses have been reviewed. Preserve
-`LICENSE.txt` and `LICENSE-CODE.txt` when redistributing it. If no SDK is present,
+`LICENSE.txt`, `LICENSE-CODE.txt` and `NOTICES.txt` when redistributing applicable
+package contents. The Windows portable packager includes the x64 runtime beside
+the EXE, with license/notices, when both DLLs are available in the SDK; otherwise
+it warns and stages a viewer that uses standard file I/O. If no SDK is present,
 the build omits the bridge; if the runtime DLLs are absent or a request fails,
 normal file I/O remains the fallback.
 
 The bridge uses the DirectStorage runtime to issue large archive range reads
-into system memory. It does **not** make this client instantly load: scene
+into system memory. Independent loader threads use separate queues so reads can
+overlap without sharing completion/error state; each calling thread still waits
+for its own request. It does **not** make this client instantly load: scene
 parsing and GPU uploads remain, the PCK content still needs its normal CPU
-processing, and the bridge waits for each individual request. GPU GDeflate
-acceleration is not applicable to the client's existing PCK encoding. No
-DirectStorage hardware benchmark has been run here; use the normal build unless
-you have the SDK/runtime and can measure on the target machine.
+processing, and runtime availability is optional. GPU GDeflate acceleration is
+not applicable to the client's existing PCK encoding. No DirectStorage hardware
+benchmark has been run here; use the normal build unless you have the
+SDK/runtime and can measure on the target machine.
 
 ### RAM-first lossless terrain cache
 

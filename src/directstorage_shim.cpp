@@ -7,16 +7,14 @@
 using DStorageGetFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
 
 namespace {
-SRWLOCK g_lock = SRWLOCK_INIT;
+SRWLOCK g_factory_lock = SRWLOCK_INIT;
 HMODULE g_runtime = nullptr;
 IDStorageFactory* g_factory = nullptr;
-IDStorageQueue1* g_queue = nullptr;
-HANDLE g_event = nullptr;
-bool g_attempted = false;
+bool g_factory_attempted = false;
 
-bool initialize() {
-    if (g_attempted) return g_factory && g_queue && g_event;
-    g_attempted = true;
+bool initialize_factory() {
+    if (g_factory_attempted) return g_factory != nullptr;
+    g_factory_attempted = true;
 
     // The package runtime is optional. Failure leaves the caller on the normal
     // ReadFile path; do not make it a hard startup dependency.
@@ -31,54 +29,91 @@ bool initialize() {
         g_factory = nullptr;
         return false;
     }
-
-    DSTORAGE_QUEUE_DESC desc{};
-    desc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-    desc.Capacity = DSTORAGE_MIN_QUEUE_CAPACITY;
-    desc.Priority = DSTORAGE_PRIORITY_NORMAL;
-    desc.Name = "Perfect World Explorer CPU reads";
-    // A null device selects the DirectStorage system-memory destination queue.
-    if (FAILED(g_factory->CreateQueue(&desc, __uuidof(IDStorageQueue1),
-                                      reinterpret_cast<void**>(&g_queue)))) {
-        g_queue = nullptr;
-        return false;
-    }
-    g_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    return g_event != nullptr;
+    return true;
 }
+
+IDStorageFactory* get_factory() {
+    AcquireSRWLockExclusive(&g_factory_lock);
+    const bool ready = initialize_factory();
+    IDStorageFactory* factory = ready ? g_factory : nullptr;
+    ReleaseSRWLockExclusive(&g_factory_lock);
+    return factory;
+}
+
+// Each calling thread owns its own queue. This keeps request completion/error
+// records isolated while allowing independent asset-loader threads to issue
+// and wait for reads concurrently; a process-global queue lock must never be
+// held across a storage wait.
+struct ThreadQueue {
+    IDStorageQueue1* queue = nullptr;
+    HANDLE event = nullptr;
+
+    bool initialize(IDStorageFactory* factory) {
+        if (queue && event) return true;
+        DSTORAGE_QUEUE_DESC desc{};
+        desc.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+        desc.Capacity = DSTORAGE_MIN_QUEUE_CAPACITY;
+        desc.Priority = DSTORAGE_PRIORITY_NORMAL;
+        desc.Name = "Perfect World Explorer CPU reads";
+        // A null device selects the DirectStorage system-memory destination queue.
+        if (FAILED(factory->CreateQueue(&desc, __uuidof(IDStorageQueue1),
+                                        reinterpret_cast<void**>(&queue)))) {
+            queue = nullptr;
+            return false;
+        }
+        event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!event) {
+            queue->Release();
+            queue = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    ~ThreadQueue() {
+        if (queue) queue->Release();
+        if (event) CloseHandle(event);
+    }
+};
+
+thread_local ThreadQueue g_thread_queue;
 } // namespace
 
 extern "C" __declspec(dllexport) int __cdecl pwe_dstorage_read(
     const wchar_t* path, unsigned long long offset, unsigned int size, void* output) {
     if (!path || !output || size == 0) return 0;
-    AcquireSRWLockExclusive(&g_lock);
-    int result = 0;
-    if (initialize()) {
-        IDStorageFile* file = nullptr;
-        if (SUCCEEDED(g_factory->OpenFile(path, __uuidof(IDStorageFile),
-                                          reinterpret_cast<void**>(&file)))) {
-            DSTORAGE_REQUEST request{};
-            request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-            request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
-            request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
-            request.Source.File.Source = file;
-            request.Source.File.Offset = offset;
-            request.Source.File.Size = size;
-            request.Destination.Memory.Buffer = output;
-            request.Destination.Memory.Size = size;
-            request.UncompressedSize = size;
 
-            g_queue->EnqueueRequest(&request);
-            g_queue->EnqueueSetEvent(g_event);
-            g_queue->Submit();
-            if (WaitForSingleObject(g_event, INFINITE) == WAIT_OBJECT_0) {
-                DSTORAGE_ERROR_RECORD errors{};
-                g_queue->RetrieveErrorRecord(&errors);
-                result = errors.FailureCount == 0 ? 1 : 0;
-            }
-            file->Release();
-        }
+    IDStorageFactory* factory = get_factory();
+    if (!factory || !g_thread_queue.initialize(factory)) return 0;
+
+    IDStorageFile* file = nullptr;
+    if (FAILED(factory->OpenFile(path, __uuidof(IDStorageFile),
+                                 reinterpret_cast<void**>(&file)))) {
+        return 0;
     }
-    ReleaseSRWLockExclusive(&g_lock);
-    return result;
+
+    DSTORAGE_REQUEST request{};
+    request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+    request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
+    request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
+    request.Source.File.Source = file;
+    request.Source.File.Offset = offset;
+    request.Source.File.Size = size;
+    request.Destination.Memory.Buffer = output;
+    request.Destination.Memory.Size = size;
+    request.UncompressedSize = size;
+
+    g_thread_queue.queue->EnqueueRequest(&request);
+    g_thread_queue.queue->EnqueueSetEvent(g_thread_queue.event);
+    g_thread_queue.queue->Submit();
+    const bool completed = WaitForSingleObject(g_thread_queue.event, INFINITE) == WAIT_OBJECT_0;
+
+    bool succeeded = false;
+    if (completed) {
+        DSTORAGE_ERROR_RECORD errors{};
+        g_thread_queue.queue->RetrieveErrorRecord(&errors);
+        succeeded = errors.FailureCount == 0;
+    }
+    file->Release();
+    return succeeded ? 1 : 0;
 }

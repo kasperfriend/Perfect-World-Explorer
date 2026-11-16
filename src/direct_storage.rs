@@ -1,10 +1,10 @@
 //! Optional DirectStorage range reads for large archive payloads.
 //!
-//! This is deliberately a best-effort accelerator: the Microsoft SDK and
-//! runtime are not redistributed with the viewer, and all calls fall back to
-//! ordinary positioned reads when they are absent or reject a request. The
-//! current client formats still require CPU-side parsing/decompression; this
-//! does not claim GPU decompression or instant startup.
+//! This is deliberately a best-effort accelerator: the Microsoft SDK is
+//! optional, the runtime may be bundled with a Windows package when available,
+//! and calls fall back to ordinary positioned reads when it is absent or rejects
+//! a request. The current client formats still require CPU-side
+//! parsing/decompression; this does not claim GPU decompression or instant startup.
 
 #[cfg(all(windows, pwe_directstorage))]
 mod enabled {
