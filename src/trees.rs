@@ -264,11 +264,12 @@ impl Trees {
                 .get(&bark_path)
                 .or_else(|| entries.get(&fallback))
                 .ok_or_else(|| format!("branch material: missing bark texture {bark_path}"))?;
-            let tex_entry = entries
-                .get(&ty.composite.to_lowercase())
-                .ok_or_else(|| {
-                    format!("frond/leaf material: missing composite texture {}", ty.composite)
-                })?;
+            let tex_entry = entries.get(&ty.composite.to_lowercase()).ok_or_else(|| {
+                format!(
+                    "frond/leaf material: missing composite texture {}",
+                    ty.composite
+                )
+            })?;
             let bark_bytes = pck::read_entry_at(&file, bark_entry)
                 .map_err(|e| format!("branch material texture {}: {e}", bark_entry.name))?;
             let tex_bytes = pck::read_entry_at(&file, tex_entry)
@@ -317,10 +318,10 @@ impl Trees {
                         s.spawn(move || (start..end).map(load).collect::<Vec<_>>())
                     })
                     .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().unwrap())
-                .collect()
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .collect()
             })
         } else {
             (0..scene.tree_types.len()).map(&load_one).collect()
