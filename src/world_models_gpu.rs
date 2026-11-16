@@ -158,7 +158,7 @@ pub struct World {
     /// Retail alpha insertion order as (slot, mesh) pairs.
     alpha: Vec<model_queue::AlphaCandidate>,
     reported: Vec<String>,
-    frustum: Option<[[f32; 4]; 6],>,
+    frustum: Option<[[f32; 4]; 6]>,
     scratch_candidates: Vec<model_queue::AlphaCandidate>,
     scratch_failures: Vec<(usize, String)>,
 }
@@ -274,7 +274,9 @@ impl World {
         })
         .expect("an empty world model set cannot be invalid")
     }
-    pub fn set_keep_unbounded(&mut self, keep: bool) { self.keep_unbounded = keep; }
+    pub fn set_keep_unbounded(&mut self, keep: bool) { 
+        self.keep_unbounded = keep; 
+    }
     
 
     pub fn set_frustum(&mut self, frustum: Option<[[f32; 4]; 6]>) {
