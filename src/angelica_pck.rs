@@ -58,7 +58,7 @@ fn record_ending_at(blob: &[u8], end: usize) -> Result<([u8; 276], usize), Strin
             let input = &blob[start..end];
             decoder.reset(true);
             let Ok(status) = decoder.decompress(input, &mut out, FlushDecompress::Finish) else {
-               continue;
+                   continue;
             };
             if status == flate2::Status::StreamEnd
                 && decoder.total_out() == 276
