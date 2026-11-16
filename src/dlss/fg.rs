@@ -311,7 +311,9 @@ impl DlssFrameGeneration {
                 compose_dxgi,
                 display_extent,
                 d3d12_ty::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
                 D3D12_STATE_COMMON,
                 false,
             )
