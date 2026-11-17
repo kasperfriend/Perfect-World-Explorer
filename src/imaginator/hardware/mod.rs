@@ -105,6 +105,11 @@ pub mod support {
             false
         }
 
+        /// No DXR here, so nothing can be a RayQuery pipeline.
+        pub fn ray_query(&self) -> bool {
+            false
+        }
+
         /// No DXR here, so there is nothing to dispatch. The signature mirrors
         /// the Windows one so the module page compiles on both halves.
         #[allow(clippy::too_many_arguments)]

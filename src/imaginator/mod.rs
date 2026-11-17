@@ -75,7 +75,6 @@ mod composite_gpu_test;
 use bvh::SharedScene;
 use composite::Composite;
 use gpu::GpuParams;
-use hardware::HardwareStatus;
 use math::V3;
 use settings::{ImaginatorSettings, Tracer as TracerKind};
 use std::path::{Path, PathBuf};
@@ -195,10 +194,7 @@ pub struct Imaginator {
     requests: u64,
     /// Frames the composite actually ran.
     pub frames: u64,
-    /// Frames the hardware selection drew on the CPU because no DXIL blob was
-    /// installed yet. Reported in the status line so a fallback is never mistaken
-    /// for the RT-core path.
-    cpu_fallback_frames: u64,
+
     pub last_error: Option<String>,
     /// Set while the page is open, so the preview can be read back.
     page_open: bool,
@@ -238,7 +234,6 @@ impl Imaginator {
             generation: 0,
             requests: 0,
             frames: 0,
-            cpu_fallback_frames: 0,
             last_error: None,
             page_open: false,
             capture_state: CaptureState::WaitingForWorld,
@@ -382,6 +377,19 @@ impl Imaginator {
             .into();
     }
 
+    /// Tell the module the frame is composed by a frame generator this frame.
+    ///
+    /// Not an error: it is the one case the compositor has to skip, because the
+    /// generator owns the composition image and the module cannot write to it.
+    /// Reporting it is what stops that from looking like a broken tracer.
+    pub fn report_frame_generation(&mut self) {
+        let why = "frame generation is composing this frame, so the traced terms are not \
+                   applied; turn frame generation off to see them (tracing keeps running)";
+        if self.status != why {
+            self.status = why.to_string();
+        }
+    }
+
     /// Build the GPU objects. Called once, after the device exists.
     pub fn init(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
         // `wgpu` panics on an uncaptured error by default. A validation mistake
@@ -408,7 +416,17 @@ impl Imaginator {
 
     /// Start or stop the background CPU tracer to match the settings.
     pub fn sync_worker(&mut self) {
-        let want_software = self.settings.active() && self.settings.tracer == TracerKind::Software;
+        // A worker is needed for the software tracer, and also for a hardware
+        // selection that has no DXIL blob: there is no RayQuery shader to
+        // dispatch, so the CPU trace is what keeps the picture moving and the
+        // page honest until the blob is installed.
+        let hardware_without_blob = self.settings.tracer == TracerKind::Hardware
+            && self
+                .hardware
+                .as_ref()
+                .is_none_or(|hardware| !hardware.dxil_present(&self.directory));
+        let want_software = self.settings.active()
+            && (self.settings.tracer == TracerKind::Software || hardware_without_blob);
         if want_software && self.software.is_none() {
             self.software = Some(self.spawn_software());
         } else if !want_software {
@@ -423,16 +441,22 @@ impl Imaginator {
                 self.active = Active::Idle;
                 self.status = "hardware selected, but no device has been probed yet".into();
             } else if let Some(hardware) = &self.hardware {
-                if hardware.status.available() {
-                    self.active = Active::Hardware;
-                    self.status = hardware.status.label();
+                // Active whether or not the probe called itself available.
+                // Going `Idle` here was the dead end: `composite` returns early
+                // for anything but the active tracer, so a probe that failed for
+                // an unrelated reason meant no tracing, no fallback, and a page
+                // that just repeated the probe's complaint. Marking it active lets
+                // the frame run, and the frame path reports what actually
+                // happened — including that it is drawing on the CPU meanwhile.
+                self.active = Active::Hardware;
+                self.status = if hardware.status.available() {
+                    hardware.status.label()
                 } else {
-                    // Selecting hardware does not silently fall back: the page
-                    // says why it is not running and the software option is one
-                    // click away.
-                    self.active = Active::Idle;
-                    self.status = hardware.status.label();
-                }
+                    format!(
+                        "{}\n(drawing on the CPU until this is resolved)",
+                        hardware.status.label()
+                    )
+                };
             }
         } else if self.settings.tracer == TracerKind::Software {
             if self.software.is_some() {
@@ -889,12 +913,12 @@ impl Imaginator {
                 let Some(hardware) = self.hardware.as_ref() else {
                     return false;
                 };
-                // Only a probe that says the GPU cannot do this at all is fatal.
-                // A build failure is a note, not a veto.
-                if matches!(hardware.status, HardwareStatus::Untried) {
-                    self.status = hardware.status.label();
-                    return false;
-                }
+                // Nothing here returns early on the probe's opinion any more.
+                // It used to bail out on `Untried` and on anything the probe
+                // called unavailable, which is how "hardware is selected and
+                // nothing happens" was possible: the frame path stopped before it
+                // had tried anything. Every branch below now does its best and
+                // reports what it did.
                 let base = hardware.status.label();
                 let has_blob = hardware.dxil_present(&self.directory);
                 let ready = hardware.pipeline_ready();
@@ -962,12 +986,20 @@ impl Imaginator {
                         }
                     }
                 } else {
-                    // No DXIL blob yet: trace the same frame on the CPU so the
-                    // image still changes, and say so. `submit_software` needs a
-                    // worker, which `sync_worker` only spawns for the software
-                    // tracer, so this one runs inline at a reduced extent — a
-                    // frame of latency here is better than a frozen picture.
-                    self.publish_cpu_fallback((tw, th), params, device, queue);
+                    // No DXIL blob yet. Doing nothing here was the whole of the
+                    // "hardware says green and nothing changes" report, so the
+                    // same frame is traced on the CPU worker instead: off the
+                    // render thread, at the full traced extent, published through
+                    // the identical composite. `sync_worker` keeps a worker alive
+                    // for exactly this case.
+                    let camera = self.software_camera(extent, params);
+                    let settings = self.settings.clone();
+                    self.submit_software(camera, (tw, th), &settings);
+                    if let (Some((packed, arrived)), Some(composite)) =
+                        (self.take_software_result(), self.composite.as_mut())
+                    {
+                        composite.upload_software(&packed, arrived, device, queue);
+                    }
                 }
             }
             TracerKind::Software => {
@@ -1026,50 +1058,6 @@ impl Imaginator {
         }
     }
 
-    /// Trace one frame on the CPU for a hardware selection that has no DXIL blob
-    /// to dispatch.
-    ///
-    /// This keeps the promise that enabling the module changes the picture. It is
-    /// deliberately cheap: a quarter of the requested extent, one sample, and
-    /// only when the previous fallback frame has already been published, so the
-    /// render loop is never held up by more than a small trace.
-    fn publish_cpu_fallback(
-        &mut self,
-        extent: (u32, u32),
-        params: GpuParams,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) {
-        let (tw, th) = extent;
-        if tw == 0 || th == 0 {
-            return;
-        }
-        let Some(bvh) = self.scene.bvh.as_ref() else {
-            return;
-        };
-        // Nothing to draw from an empty capture.
-        if bvh.triangles.is_empty() {
-            return;
-        }
-        // Halve each axis again: this is a stand-in for a GPU trace, not the
-        // software tracer's full-quality image.
-        let (fw, fh) = (tw.div_ceil(2).max(1), th.div_ceil(2).max(1));
-        let camera = self.software_camera(extent, params);
-        let options = tracer::TraceOptions::from_settings(&self.settings);
-        let tracer = tracer::Tracer::new(self.scene.clone(), self.environment.clone());
-        let samples = tracer.trace(&camera, &options, fw, fh, 1);
-        let mut packed = vec![0f32; samples.len() * 4];
-        tracer::Tracer::pack(&samples, &mut packed);
-        if let Some(composite) = self.composite.as_mut() {
-            // `upload_software` sizes the traced target to whatever it is handed,
-            // so the half-size image lands as a half-size target and the composite
-            // samples it across the whole frame. That is exactly what the
-            // full-size CPU tracer relies on too.
-            composite.upload_software(&packed, (fw, fh), device, queue);
-        }
-        self.cpu_fallback_frames += 1;
-    }
-
     /// The tracer's camera for this frame, derived from the parameters the
     /// composite will hand the GPU. `fov_y` is recovered from the `tan(fov/2)`
     /// the params carry, so both tracers see the same lens.
@@ -1121,22 +1109,30 @@ impl Imaginator {
         );
         ui.horizontal(|ui| {
             for tracer in TracerKind::ALL {
-                let enabled = match tracer {
-                    TracerKind::Off => true,
-                    TracerKind::Software => true,
-                    TracerKind::Hardware => self
-                        .hardware
-                        .as_ref()
-                        .map(|h| h.status.available())
-                        .unwrap_or(false),
-                };
+                // Every tracer stays selectable. Disabling the hardware button
+                // when the probe does not report available is a dead end: on a
+                // machine where the probe failed for an unrelated reason, the user
+                // could never even try the RT-core path, and nothing on the page
+                // said why the button was grey. Selecting it now runs it, and the
+                // status line states exactly what happened and why.
                 let response = ui.add_enabled(
-                    enabled,
+                    true,
                     egui::SelectableLabel::new(self.settings.tracer == tracer, tracer.label()),
                 );
-                if response.clicked() {
+                if response.clicked() && self.settings.tracer != tracer {
                     self.settings.tracer = tracer;
                     changed = true;
+                }
+                if tracer == TracerKind::Hardware && !self.settings.tracer.eq(&tracer) {
+                    if let Some(hardware) = self.hardware.as_ref() {
+                        if !hardware.status.available() {
+                            response.on_hover_text(format!(
+                                "Selecting this runs it and reports what happens. \
+                                 The probe currently says: {}",
+                                hardware.status.label()
+                            ));
+                        }
+                    }
                 }
             }
         });
@@ -1500,5 +1496,64 @@ mod tests {
             "the final 14 rows must still be traced"
         );
         assert_eq!(bands.iter().map(|(s, e)| e - s).sum::<u32>(), 344);
+    }
+
+    /// A hardware selection must never be "active but idle".
+    ///
+    /// This is the shape of the report that started all this: the page said the
+    /// module was green, and nothing happened, because a probe that did not call
+    /// itself available put the module back to `Idle` — and `composite` returns
+    /// early for anything that is not the active tracer. Selecting hardware now
+    /// always yields `Active::Hardware`, so the frame path gets to try and to say
+    /// what it found.
+    #[test]
+    fn selecting_hardware_is_always_active() {
+        let source = include_str!("mod.rs");
+        let sync = source
+            .split("pub fn sync_worker")
+            .nth(1)
+            .expect("sync_worker is defined")
+            .split("\n    /// Stop the CPU tracer")
+            .next()
+            .expect("the body ends before retire_software");
+        assert!(
+            !sync.contains(
+                "self.active = Active::Idle;\n                    self.status = hardware"
+            ),
+            "a hardware selection must not fall back to Idle"
+        );
+        assert!(
+            sync.contains("self.active = Active::Hardware;"),
+            "a hardware selection must mark the hardware tracer active"
+        );
+        // And the frame path must not bail out on the probe's opinion.
+        let composite = source
+            .split("pub fn composite(")
+            .nth(1)
+            .expect("composite is defined");
+        assert!(
+            !composite.contains("HardwareStatus::Untried"),
+            "composite must not skip the hardware path because the probe is untried"
+        );
+    }
+
+    /// The tracer page must leave the hardware option clickable.
+    #[test]
+    fn the_hardware_tracer_stays_selectable() {
+        let source = include_str!("mod.rs");
+        let page = source
+            .split("for tracer in TracerKind::ALL {")
+            .nth(1)
+            .expect("the tracer selector exists");
+        let head = &page[..page
+            .find("ui.add_space(6.);")
+            .unwrap_or(700)
+            .min(page.len())];
+        assert!(
+            head.contains("ui.add_enabled(\n                    true,")
+                || head.contains("ui.add_enabled(true,"),
+            "the hardware tracer must stay selectable, or the RT-core path is unreachable \
+             whenever the probe is unhappy"
+        );
     }
 }

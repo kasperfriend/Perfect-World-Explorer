@@ -5992,6 +5992,18 @@ pub fn run(
                             // its format and usage are the generator's business,
                             // not this compositor's. Rather than guess, the traced
                             // terms wait for a frame the viewer composes itself.
+                            // Frame generation means this frame is composed by the
+                            // generator, so the Imaginator cannot write to it. That
+                            // used to be a silent skip: the module said it was
+                            // running and the picture never changed. Say so instead,
+                            // and keep tracing so the terms are ready the moment the
+                            // generator is switched off.
+                            if renderer.modules.imaginator_active() && fg_views.is_some() {
+                                renderer
+                                    .modules
+                                    .imaginator()
+                                    .report_frame_generation();
+                            }
                             if renderer.modules.imaginator_active() && fg_views.is_none() {
                                 let (fw, fh) = (config.width.max(1), config.height.max(1));
                                 let d = camera.direction();
