@@ -33,7 +33,7 @@ pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
                 .map_err(|e| e.to_string())?;
             if out.len() > expected {
                 return Err(format!(
-                        "bad decompressed size: {} != {expected}",
+                    "bad decompressed size: {} != {expected}",
                     out.len()
                 ));
             }
@@ -48,7 +48,7 @@ pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
         }
         if out.len() != expected {
             return Err(format!(
-                    "bad decompressed size: {} != {expected}",
+                "bad decompressed size: {} != {expected}",
             out.len()
             ));
         }
