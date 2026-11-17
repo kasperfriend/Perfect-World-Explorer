@@ -380,6 +380,13 @@ pub struct DrawCmd {
 /// Command lists kept for the whole-world pages: main, reflection, refraction.
 pub const WORLD_VIEWS: usize = 3;
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PlacementBounds {
+    pub min: [f32; 3],
+    pub max: [f32; 3],
+    pub has_sdr: bool,
+}
+
 pub struct Page {
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
@@ -390,6 +397,10 @@ pub struct Page {
     pub used_height: usize,
     pub mips: Vec<Vec<u8>>,
     pub placements: Vec<PlacementRange>,
+    pub bounds: Vec<PlacementBounds>,
+    pub page_min: [f32; 3],
+    pub page_max: [f32; 3],
+    pub page_has_sdr: bool,
 }
 impl Page {
     pub fn finish(mut self) -> Self {
@@ -404,6 +415,34 @@ impl Page {
         self.atlas.truncate(SIDE * height * 4);
         self.atlas.shrink_to_fit();
         self.used_height = height;
+        self.bounds.clear();
+        self.bounds.reserve(self.placements.len());
+        self.page_min = [f32::INFINITY; 3];
+        self.page_max = [f32::NEG_INFINITY; 3];
+        self.page_has_sdr = false;
+        for placement in &self.placements {
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            let mut has_sdr = false;
+            let start = (placement.start as usize).min(self.indices.len());
+            let end = (placement.end as usize).min(self.indices.len());
+            for &index in self.indices.get(start..end).unwrap_or_default() {
+                if let Some(vertex) = self.vertices.get(index as usize) {
+                    for axis in 0..3 {
+                        min[axis] = min[axis].min(vertex.pos[axis]);
+                        max[axis] = max[axis].max(vertex.pos[axis]);
+                    }
+                    has_sdr |= (vertex.kind > 2.01 && vertex.kind < 2.03)
+                        || (vertex.kind > 2.11 && vertex.kind < 2.13);
+                }
+            }
+            for axis in 0..3 {
+                self.page_min[axis] = self.page_min[axis].min(min[axis]);
+                self.page_max[axis] = self.page_max[axis].max(max[axis]);
+            }
+            self.page_has_sdr |= has_sdr;
+            self.bounds.push(PlacementBounds { min, max, has_sdr });
+        }
         if self.shared_atlas.is_some() {
             assert!(self.atlas.is_empty() && self.mips.is_empty());
             return self;
@@ -561,6 +600,10 @@ impl Builder {
             used_height: self.used_height,
             mips: Vec::new(),
             placements: self.placements,
+            bounds: Vec::new(),
+            page_min: [f32::INFINITY; 3],
+            page_max: [f32::NEG_INFINITY; 3],
+            page_has_sdr: false,
         }
         .finish()
     }
@@ -1504,6 +1547,10 @@ mod page_tests {
             used_height: 256,
             mips: Vec::new(),
             placements: Vec::new(),
+            bounds: Vec::new(),
+            page_min: [f32::INFINITY; 3],
+            page_max: [f32::NEG_INFINITY; 3],
+            page_has_sdr: false,
         }
         .finish();
         assert_eq!(page.mips.len(), 7);

@@ -959,6 +959,10 @@ fn build(
                     used_height: 0,
                     mips: Vec::new(),
                     placements: Vec::new(),
+                    bounds: Vec::new(),
+                    page_min: [f32::INFINITY; 3],
+                    page_max: [f32::NEG_INFINITY; 3],
+                    page_has_sdr: false,
                 },
             ));
             (i, slot)

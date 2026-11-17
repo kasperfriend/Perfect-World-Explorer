@@ -390,6 +390,7 @@ impl Reader {
                     reflect: flags[0] != 0,
                     refract: flags[1] != 0,
                 },
+                bounds: None,
             });
         }
         let mut bounds = Vec::with_capacity(bounds_count);
