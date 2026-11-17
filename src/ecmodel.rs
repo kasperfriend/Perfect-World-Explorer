@@ -395,10 +395,11 @@ pub fn parse_smd(bytes: &[u8]) -> Result<SkinModel, String> {
     let mut actions = Vec::with_capacity(action_count);
     for _ in 0..action_count {
         let name = r.string()?;
+        let mut joints = Vec::new();
         let (start, end, fps) = if version < 6 {
             let _group = r.i32()?;
             let n = r.count(100000)?;
-            let mut joints = Vec::with_capacity((n as usize).min(1024));
+            joints.reserve((n as usize).min(1024));
             let _flags = r.i32()?;
             for _ in 0..n {
                 joints.push(JointAction {
