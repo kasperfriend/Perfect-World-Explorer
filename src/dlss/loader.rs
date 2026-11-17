@@ -345,8 +345,13 @@ impl NgxApi {
 
     /// A `NVSDK_NGX_Parameter` map: NGX's own when Core can allocate one,
     /// otherwise the viewer's table.
-    pub(crate) fn new_parameters(&self) -> Box<NgxParams> {
-        self.core.new_parameters()
+    ///
+    /// `capabilities` picks which end of the ladder is tried first — the
+    /// pre-populated capability map for querying features, or the plain
+    /// allocator for the map a feature creates and evaluates with
+    /// (`docs/blockers.md` B-27).
+    pub(crate) fn new_parameters(&self, capabilities: bool) -> Box<NgxParams> {
+        self.core.new_parameters(capabilities)
     }
 
     /// `NGX_DLSS_GET_OPTIMAL_SETTINGS`, spelled out (`nvsdk_ngx_helpers.h`).
@@ -884,20 +889,36 @@ impl NgxCore {
     /// neither the setters nor the allocators in `nvngx_dlss.dll`, and handed
     /// NGX the viewer's own table even when the driver's core could have given
     /// it one.
-    fn new_parameters(&self) -> Box<NgxParams> {
-        let sources: [(&str, Option<PfnGetCapabilityParameters>, bool); 3] = [
-            (
-                "NVSDK_NGX_D3D12_GetCapabilityParameters",
-                self.get_capability_parameters,
-                true,
-            ),
-            (
-                "NVSDK_NGX_D3D12_AllocateParameters",
-                self.allocate_parameters,
-                true,
-            ),
-            ("NVSDK_NGX_D3D12_GetParameters", self.get_parameters, false),
-        ];
+    fn new_parameters(&self, capabilities: bool) -> Box<NgxParams> {
+        let capability = (
+            "NVSDK_NGX_D3D12_GetCapabilityParameters",
+            self.get_capability_parameters,
+            true,
+        );
+        let allocate = (
+            "NVSDK_NGX_D3D12_AllocateParameters",
+            self.allocate_parameters,
+            true,
+        );
+        // `nvsdk_ngx.h:393-403` documents the capability map as usable "in the
+        // same ways" as an allocated one, and recommends it only for querying —
+        // so the queries take it first and the feature map takes the allocator
+        // first. Which end answers matters: a map that cannot store
+        // `ID3D12Resource *` entries is a feature map that fails every evaluate
+        // with `FAIL_InvalidParameter` (`docs/blockers.md` B-27).
+        let sources: [(&str, Option<PfnGetCapabilityParameters>, bool); 3] = if capabilities {
+            [
+                capability,
+                allocate,
+                ("NVSDK_NGX_D3D12_GetParameters", self.get_parameters, false),
+            ]
+        } else {
+            [
+                allocate,
+                capability,
+                ("NVSDK_NGX_D3D12_GetParameters", self.get_parameters, false),
+            ]
+        };
         for (name, function, destroyable) in sources {
             let Some(function) = function else {
                 super::diag(&format!("[NGX] {name} is not exported by this core"));

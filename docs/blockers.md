@@ -1289,6 +1289,14 @@ DLSS-G parameter type.
   written through Set slot N (…)`. The map also reports its own writability once
   per session (`[NGX] parameter map: integer write round trip works / does not
   work`, and which pointer slots a null probe round-trips).
+- **Second candidate, changed in the same pass.** The feature map is now a map
+  from `NVSDK_NGX_D3D12_AllocateParameters`, and the capability map is kept only
+  for `SuperSampling.Available` and the optimal-settings callback. `nvsdk_ngx.h`
+  documents the capability map as usable "in the same ways" but recommends the
+  allocator, and the allocator is what NVIDIA's own samples create and evaluate
+  with. Both changes are in the same run on purpose: the log distinguishes them
+  (`[NGX] parameter map: NGX's own, from …AllocateParameters` versus
+  `…GetCapabilityParameters`), and either one alone would have cost a session.
 - **What a run has to settle.** Whether one of the three slots is accepted. If
   the log shows `integer write round trip does not work`, the map itself is the
   problem rather than the slot, and the next step is to stop evaluating through

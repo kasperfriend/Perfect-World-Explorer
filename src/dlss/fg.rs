@@ -262,7 +262,9 @@ impl DlssFrameGeneration {
         // never called directly, because it refuses to initialise anything that
         // is not an NGX runtime (0xBAD00002).
         let api = NgxApi::load(sdk_dir, "nvngx_dlssg.dll", device_ptr)?;
-        let mut params = api.new_parameters();
+        // The frame-generation feature creates and evaluates with the allocated
+        // map, the same choice the super-resolution path makes (B-27).
+        let mut params = api.new_parameters(false);
         crate::dlss::diag(&format!(
             "[DLSS FG] NGX ready (API 0x{NGX_VERSION_API:x}, core {}), creating DLSS-G",
             api.core_path()

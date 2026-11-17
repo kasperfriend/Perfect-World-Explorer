@@ -351,18 +351,24 @@ impl DlssUpscaler {
         // called directly, because it refuses to initialise anything that is
         // not an NGX runtime (0xBAD00002).
         let api = NgxApi::load(sdk_dir, "nvngx_dlss.dll", device_ptr)?;
-        let mut params = api.new_parameters();
+        // Two maps, because they are asked different questions. The capability
+        // map carries the pre-populated verdicts and the optimal-settings
+        // callback; the feature map is the one `CreateFeature` and
+        // `EvaluateFeature` are handed, and it comes from the allocator the
+        // header recommends for that job (B-27).
+        let mut capabilities = api.new_parameters(true);
+        let mut params = api.new_parameters(false);
         crate::dlss::diag(&format!(
             "[DLSS] NGX ready (API 0x{NGX_VERSION_API:x}, core {}), creating DLSS",
             api.core_path()
         ));
 
-        match params.get_u32(P_SUPER_SAMPLING_AVAILABLE) {
+        match capabilities.get_u32(P_SUPER_SAMPLING_AVAILABLE) {
             Some(available) => crate::dlss::diag(&format!(
                 "[DLSS] NGX reports SuperSampling.Available = {available}"
             )),
             None => crate::dlss::diag(
-                "[DLSS] the parameter map does not carry SuperSampling.Available (not a capability map)",
+                "[DLSS] the capability map does not carry SuperSampling.Available",
             ),
         }
         // DLSS decides the render size, not the viewer. The programming guide
@@ -374,7 +380,7 @@ impl DlssUpscaler {
         // pair, so even one pixel of the viewer's own ratio arithmetic is out of
         // range.
         let mut render_extent = requested_extent;
-        match api.optimal_settings(&mut params, display_extent, quality_setting) {
+        match api.optimal_settings(&mut capabilities, display_extent, quality_setting) {
             Ok(settings) => {
                 render_extent = settings.render;
                 let range = match (settings.min, settings.max) {
