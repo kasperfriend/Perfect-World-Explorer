@@ -21,7 +21,9 @@ fn read_string(b: &[u8], pos: &mut usize) -> Result<String, String> {
     }
     let s = b.get(*pos..*pos + n).ok_or("truncated string")?;
     *pos += n;
-    std::str::from_utf8(s).map(str::to_owned).map_err(|e| format!("invalid string: {e}"))
+    std::str::from_utf8(s)
+        .map(str::to_owned)
+        .map_err(|e| format!("invalid string: {e}"))
 }
 mod angelica_pck;
 mod animation;
@@ -270,7 +272,6 @@ impl Default for BlockScratch {
             normals: Vec::new(),
         }
     }
-    
 }
 /// Decode one block and move its two arrays out of the worker's scratch.
 fn decode_block_owned(
