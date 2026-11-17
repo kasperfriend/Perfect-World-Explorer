@@ -205,12 +205,12 @@ fn upload_dds(
     let data = if native {
         &bytes[128..]
     } else {
-        decoded = d
-            .mips
-            .iter()
-            .map(|m| decode_mip(bytes, d.format, m))
-            .collect::<Result<Vec<_>, _>>()?
-            .concat();
+        let total: usize = d.mips.iter().map(|m| (m.width as usize) * (m.height as usize) * 4).sum();
+        let mut out = Vec::with_capacity(total);
+        for m in &d.mips {
+            out.extend_from_slice(&decode_mip(bytes, d.format, m)?);
+        }
+        decoded = out;
         &decoded
     };
     let texture = device.create_texture_with_data(
