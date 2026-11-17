@@ -203,10 +203,8 @@ pub fn read_entries_at(
         }
     }
 
-    for ((entry, bytes), used_direct_storage) in entries
-        .iter()
-        .zip(raw.iter_mut())
-        .zip(direct_storage_done)
+    for ((entry, bytes), used_direct_storage) in
+        entries.iter().zip(raw.iter_mut()).zip(direct_storage_done)
     {
         if used_direct_storage {
             continue;
@@ -232,12 +230,9 @@ pub fn read_entries_at(
             if entry.compressed < entry.size {
                 let out = inflate(&bytes, entry.size as usize)?;
                 if out.len() != entry.size as usize {
-                    return Err(format!(
-                        "bad decompressed size: {} != {}",
-                        out.len(),
-                        entry.size
-                    )
-                    .into());
+                    return Err(
+                        format!("bad decompressed size: {} != {}", out.len(), entry.size).into(),
+                    );
                 }
                 Ok(out)
             } else {
