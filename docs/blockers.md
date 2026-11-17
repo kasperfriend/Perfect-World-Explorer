@@ -1276,35 +1276,54 @@ DLSS-G parameter type.
   `ID3D12Resource *`, `void *`), and this viewer addressed the resource ones by
   that declaration. The integer half of that order demonstrably holds on this
   core; the pointer half does not.
-- **The fix, as implemented.** The slot is *measured with the feature*, because
-  the feature is the only thing whose opinion matters: the four resources are
-  written through the declared slot and evaluated, and on
-  `FAIL_InvalidParameter` the same four pointers are written through the next
-  candidate slot and evaluated again (`src/dlss/imp.rs`, the ladder in `record`).
-  A rejected evaluate validates before it records anything, so the command list
-  carries no half-applied state between attempts. The winning slot is remembered
-  for the session, so the ladder is paid once, and each attempt logs one line:
-  `[DLSS] resource parameters reach the feature through Set slot N; the declared
-  slot M was rejected` or `[DLSS] evaluate rejected the resource parameters
-  written through Set slot N (…)`. The map also reports its own writability once
-  per session (`[NGX] parameter map: integer write round trip works / does not
-  work`, and which pointer slots a null probe round-trips).
-- **Second candidate, changed in the same pass.** The feature map is now a map
-  from `NVSDK_NGX_D3D12_AllocateParameters`, and the capability map is kept only
-  for `SuperSampling.Available` and the optimal-settings callback. `nvsdk_ngx.h`
+- **The measurement this viewer shipped first was invalid — session-6 says so.**
+  The three attempts were evaluated while the map still held *only* the four
+  resource pointers: jitter, `Reset`, `MVScaleX/Y`, `InFrameTimeDeltaInMsec`,
+  `Sharpness`, `PreExposure`, `ExposureScale`, the extent keys and the
+  sub-rectangle keys were all written **after** the ladder loop. NGX validates
+  the map against the feature it created, so each attempt was missing most of
+  the block `NGX_D3D12_EVALUATE_DLSS_EXT` fills in before it evaluates, and
+  `FAIL_InvalidParameter` on all three slots is what that produces regardless of
+  which slot the pointers went through. The log of that run is what the bug
+  looks like from outside: three rejections, one every 0.x s, with the integer
+  round-trip line above them proving the map itself writes fine.
+- **So the slot question is still open, and it is now asked properly.** One
+  function writes the whole evaluate block — `write_evaluate_parameters` in
+  `src/dlss/imp.rs`, in `nvsdk_ngx_helpers_d3d.h`'s order, resources last so the
+  optional-null entries cannot overwrite them — and the ladder calls it once per
+  attempt. Each attempt after the first uses a **fresh map** from
+  `NVSDK_NGX_D3D12_AllocateParameters`: a map keeps one value per key, and if it
+  also keeps the type a key was first stored with, re-writing the same four keys
+  on the same map through a different overload would test nothing. The winning
+  slot and the map that won are kept for the session, so the search is paid once
+  and later frames evaluate through the winner with the complete block.
+- **Each rejection is now explained in the same tick.** `evaluate_feature`
+  answers `FAIL_InvalidParameter` without naming anything, but the feature module
+  writes the reason to its own log, so `loader::last_missing_parameter()` reads
+  the newest `could not find … parameter` line back and the rejection line
+  carries it (`… (0xbad00005 FAIL_InvalidParameter); its log says: … could not
+  find Color parameter (3x)`). The repetition count separates "the same key is
+  still missing" from "the ladder got past that key and stopped somewhere else":
+  a *different* name is the signal that the slot was right and the block is
+  wrong somewhere else. The same line also reports what the map says about the
+  key it just wrote — `Color reads back as slot 14 0x1d3f…, slot 13 untouched,
+  slot 15 0x1d3f…` — which distinguishes "the map lost the value" from "the map
+  has it and the feature does not read it".
+- **Second candidate, changed in the same pass.** The feature map is a map from
+  `NVSDK_NGX_D3D12_AllocateParameters`, and the capability map is kept only for
+  `SuperSampling.Available` and the optimal-settings callback. `nvsdk_ngx.h`
   documents the capability map as usable "in the same ways" but recommends the
-  allocator, and the allocator is what NVIDIA's own samples create and evaluate
-  with. Both changes are in the same run on purpose: the log distinguishes them
-  (`[NGX] parameter map: NGX's own, from …AllocateParameters` versus
-  `…GetCapabilityParameters`), and either one alone would have cost a session.
-- **What a run has to settle.** Whether one of the three slots is accepted. If
-  the log shows `integer write round trip does not work`, the map itself is the
-  problem rather than the slot, and the next step is to stop evaluating through
-  the capability map (`NVSDK_NGX_D3D12_GetCapabilityParameters`) and use a map
-  from `NVSDK_NGX_D3D12_AllocateParameters` for `CreateFeature`/`EvaluateFeature`,
-  keeping the capability map only for `SuperSampling.Available` and the optimal
-  settings callback — the header documents the capability map as usable "in the
-  same ways" but recommends the allocator. If all three slots are rejected with
-  the integer round trip working, the ladder needs a fourth candidate (the
-  remainder of the vtable) and the NGX log dump will name the resource it could
-  not find.
+  allocator, and the allocator is what NVIDIA's programming guide's own
+  integration sequence shows (`docs/dlss-fidelity.md`).
+- **What a run has to settle.** One of three outcomes, each with its own next
+  step:
+  1. `[DLSS] first evaluate OK` and the upscaler stops reporting "NOT running"
+     — the defect was the incomplete block, and B-27 closes.
+  2. A rejection whose complaint names a *different* key than `Color` — the slot
+     is right, and the named key is the next thing to fix (the line prints it).
+  3. A rejection that still names `Color`, with `Color` read back as an address
+     through the measured slots — then the map holds the pointer and the feature
+     does not read it: the next candidates are the resource *states* and flags
+     (`ALLOW_UNORDERED_ACCESS` on the output, `NON_PIXEL_SHADER_RESOURCE` on the
+     inputs, both already logged at creation) and the resource's own identity
+     (the four handles are logged with their addresses on the first frame).

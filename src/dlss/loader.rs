@@ -1465,6 +1465,65 @@ pub(crate) fn dump_ngx_log_files() {
     }
 }
 
+/// The last thing NGX's own feature log said about a *missing* parameter.
+///
+/// `EvaluateFeature` answers `FAIL_InvalidParameter` without naming anything, and
+/// `NVSDK_NGX_Parameter` gives no error either — but the feature module writes the
+/// reason to its log on the same tick:
+///
+/// ```text
+/// [NGXDLAA::EvaluateFeature:788] error: could not find Color parameter
+/// ```
+///
+/// Reading it back turns a blind retry into an experiment: the ladder in
+/// [crate::dlss::DlssUpscaler] writes one key through each candidate slot, so the
+/// *name* NGX reports is what identifies which slot its own reader agrees with
+/// (`docs/blockers.md` B-27).
+pub(crate) fn last_missing_parameter() -> Option<String> {
+    let dir = PathBuf::from(ngx_app_dir());
+    let entries = std::fs::read_dir(&dir).ok()?;
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("log"))
+        {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if newest.as_ref().is_some_and(|(stamp, _)| *stamp > modified) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let hits: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("could not find"))
+            .collect();
+        // The count matters: the same complaint repeated after the next
+        // attempt means the *same* key is still missing, while a different one
+        // means the ladder got past that key and stopped somewhere else. Both
+        // are readable from a single line only if the repetition is visible.
+        if let Some(line) = hits.last() {
+            // Repetitions of *this* complaint count it once per rejected
+            // attempt; older complaints about other keys are irrelevant here.
+            let repeats = hits.iter().filter(|hit| *hit == line).count();
+            let complaint = match repeats {
+                0 | 1 => line.trim().to_string(),
+                2 => format!("{} (2nd time)", line.trim()),
+                count => format!("{} ({count}x)", line.trim()),
+            };
+            newest = Some((modified, complaint));
+        }
+    }
+    newest.map(|(_, line)| line)
+}
+
 fn ngx_app_dir() -> String {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {

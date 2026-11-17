@@ -291,6 +291,11 @@ pub struct DlssUpscaler {
     current_jitter: (f32, f32),
     prev_view_proj: Option<Mat4>,
     reset_history: bool,
+    /// Which `NVSDK_NGX_Parameter::Set` overload this core's map answers the
+    /// resource keys through, measured on the first evaluate (see `record`).
+    /// It starts at the slot the header declares and stays there unless the
+    /// feature itself disagrees.
+    param_slot: usize,
     last_instant: std::time::Instant,
     quality_name: &'static str,
 }
@@ -304,6 +309,98 @@ impl Drop for DlssUpscaler {
             }
             self.handle = std::ptr::null_mut();
         }
+    }
+}
+
+/// Everything one `NVSDK_NGX_D3D12_EvaluateFeature` call needs from the frame.
+///
+/// Kept as a plain value so the parameter block is written by one function, in
+/// one order, from whichever map the evaluate attempt is using — the ladder in
+/// `DlssUpscaler::record` writes the *same* block into a fresh map per attempt,
+/// and a block written differently per attempt would make the attempts
+/// incomparable.
+struct EvaluateFrame {
+    render: (u32, u32),
+    display: (u32, u32),
+    jitter: (f32, f32),
+    reset: bool,
+    frame_time_ms: f32,
+}
+
+/// Write the whole evaluate parameter block, resources included, through
+/// `slot`.
+///
+/// This mirrors `NGX_D3D12_EVALUATE_DLSS_EXT` from `nvsdk_ngx_helpers_d3d.h`,
+/// in the helper's order, plus the extent keys the header also names
+/// (`Width`, `Height`, `OutWidth`, `OutHeight` and their `Resource*` twins):
+/// NGX validates the map against the feature it created, and a key the helper
+/// sets that the viewer leaves out is exactly how an evaluate ends up
+/// answering `FAIL_InvalidParameter` while the create succeeds.
+fn write_evaluate_parameters(
+    params: &mut crate::dlss::params::NgxParams,
+    slot: usize,
+    frame: &EvaluateFrame,
+    resources: [*mut c_void; 4],
+) {
+    // Which `Set` overload the pointer keys go through. Every write below the
+    // numeric block uses this slot, so all four resources and the optional-null
+    // entries agree with each other.
+    params.set_resource_set_slot(slot);
+    params.set_f32(P_JITTER_X, frame.jitter.0);
+    params.set_f32(P_JITTER_Y, frame.jitter.1);
+    params.set_i32(P_RESET, i32::from(frame.reset));
+    // Motion vectors are in pixels, so the scale is 1:1.
+    params.set_f32(P_MV_SCALE_X, 1.0);
+    params.set_f32(P_MV_SCALE_Y, 1.0);
+    // `InFrameTimeDeltaInMsec`: NGX scales how much it denoises and
+    // anti-aliases by how far content moves per frame.
+    params.set_f32(P_FRAME_TIME_MS, frame.frame_time_ms.clamp(0.1, 1000.0));
+    // `Sharpness` stays 0 and the Graphics slider runs the viewer's own
+    // RCAS-style pass in `DlssUpscaler::composite` instead: NGX's own
+    // sharpening is deprecated ("Sharpness is not supported") and doing both
+    // would double the halos.
+    params.set_f32(P_SHARPNESS, 0.0);
+    // NGX divides by the pre-exposure, so leaving it at the map's default 0
+    // made every evaluate return `FAIL_InvalidParameter` — the feature created
+    // fine and then never ran, which is why DLSS looked like "no upscaling at
+    // all".
+    params.set_f32(P_PRE_EXPOSURE, 1.0);
+    params.set_f32(P_EXPOSURE_SCALE, 1.0);
+    params.set_u32(P_TONEMAPPER_TYPE, 0);
+    params.set_i32(P_INDICATOR_INVERT_X, 0);
+    params.set_i32(P_INDICATOR_INVERT_Y, 0);
+    for name in P_ZERO_SUBRECTS {
+        params.set_u32(name, 0);
+    }
+    // The optional inputs stay absent rather than bogus: a null through the
+    // resource overload is "not provided", which is what the helper does.
+    for name in P_NULL_RESOURCES {
+        params.set_d3d12_resource(name, std::ptr::null_mut());
+    }
+    params.set_u32(P_RENDER_WIDTH, frame.render.0.max(1));
+    params.set_u32(P_RENDER_HEIGHT, frame.render.1.max(1));
+    let (render_width, render_height) = frame.render;
+    let (display_width, display_height) = frame.display;
+    for (name, value) in [
+        (P_WIDTH, render_width.max(1)),
+        (P_HEIGHT, render_height.max(1)),
+        (P_OUT_WIDTH, display_width.max(1)),
+        (P_OUT_HEIGHT, display_height.max(1)),
+        (P_RESOURCE_WIDTH, render_width.max(1)),
+        (P_RESOURCE_HEIGHT, render_height.max(1)),
+        (P_RESOURCE_OUT_WIDTH, display_width.max(1)),
+        (P_RESOURCE_OUT_HEIGHT, display_height.max(1)),
+    ] {
+        params.set_u32(name, value);
+    }
+    // Colour, depth, motion vectors and output, in the helper's order.
+    for (name, resource) in [
+        (P_COLOR, resources[0]),
+        (P_DEPTH, resources[1]),
+        (P_MOTION_VECTORS, resources[2]),
+        (P_OUTPUT, resources[3]),
+    ] {
+        params.set_d3d12_resource(name, resource);
     }
 }
 
@@ -467,6 +564,9 @@ impl DlssUpscaler {
 
         let ratio = display_extent.0.max(1) as f32 / render_extent.0.max(1) as f32;
         let phase_count = ((8.0 * ratio * ratio).ceil() as u64).clamp(16, 64);
+        // The slot the map's own pointer round-trip reports, so the first
+        // evaluate uses the measured overload rather than the declared one.
+        let param_slot = params.resource_set_slot();
         Ok(Self {
             api,
             params,
@@ -484,6 +584,7 @@ impl DlssUpscaler {
             current_jitter: (0.0, 0.0),
             prev_view_proj: None,
             reset_history: true,
+            param_slot,
             last_instant: std::time::Instant::now(),
             quality_name,
         })
@@ -691,135 +792,97 @@ impl DlssUpscaler {
         let list = &mut self.ring.slot_mut(slot_index).list;
         list.resource_barrier(&barriers);
 
-        // The four evaluate resources go in through a `Set` overload whose slot
-        // is *measured with the feature itself*, not taken from the header.
+        // The evaluate parameters, and the four resource pointers, whose `Set`
+        // overload is measured with the feature itself.
         //
-        // `nvsdk_ngx_params.h` declares eight `Set` overloads and eight `Get`
-        // overloads — eight numeric ones, then `ID3D11Resource *`,
-        // `ID3D12Resource *`, `void *`. This core's integer entries behave
-        // exactly as declared (`SuperSampling.Available` reads back,
-        // `CreateFeature` takes `Width`/`Height`/`PerfQualityValue`), and its
-        // pointer entries do not: every evaluate was answered
+        // `nvsdk_ngx_params.h` declares eight `Set` overloads — five numeric, then
+        // `ID3D11Resource *`, `ID3D12Resource *`, `void *` — and eight `Get`
+        // overloads in the mirror order, and this viewer addressed the resource
+        // ones by that declaration. A real session shows the integer half of the
+        // order holding and the pointer half not: NGX's own feature log answers
+        // every evaluate with `NGXDLAA::EvaluateFeature:788 error: could not find
+        // Color parameter`, which is what a pointer stored under the wrong *type
+        // tag* looks like from the feature's side.
         //
-        //   [NGXDLAA::EvaluateFeature:788] error: could not find Color parameter
-        //   NVSDK_NGX_D3D12_EvaluateFeature(DLSS) failed (0xbad00005)
-        //
-        // which is what a pointer stored under the *wrong type tag* looks like
-        // from the outside — the feature's own `Get(…, ID3D12Resource **)` finds
-        // no such key. Which of the three pointer overloads this map's reader
-        // agrees with cannot be read off the declaration, so it is found by
-        // asking: write the same four pointers through the next candidate and
-        // evaluate again. A rejected evaluate validates before it records
-        // anything, so the command list carries no half-applied state between
-        // attempts, and the winning slot is remembered for the session.
+        // So the slot is found by asking the feature. On the first frame the four
+        // resources are written through each candidate slot in turn and evaluated,
+        // each attempt on a **fresh map**: a map can hold one value per key, and if
+        // it keeps the type a key was first stored with, retrying the same key on
+        // the same map with a different slot would test nothing (B-27). A rejected
+        // evaluate validates before it records anything, so the command list is
+        // still clean between attempts, and the winning slot and map are kept for
+        // the session.
+        let resources = [
+            self.natives.color.resource.as_mut_ptr() as *mut c_void,
+            self.natives.depth.resource.as_mut_ptr() as *mut c_void,
+            self.natives.mv.resource.as_mut_ptr() as *mut c_void,
+            self.natives.output.resource.as_mut_ptr() as *mut c_void,
+        ];
+        let evaluate = EvaluateFrame {
+            render: self.render_extent,
+            display: self.display_extent,
+            jitter: self.current_jitter,
+            reset: self.reset_history,
+            frame_time_ms: frame_time_ms.clamp(0.1, 1000.0),
+        };
+        let ladder: Vec<usize> = if self.frame_index == 0 {
+            crate::dlss::params::resource_slot_ladder(self.param_slot)
+        } else {
+            vec![self.param_slot]
+        };
         let mut result = crate::dlss::params::NGX_FAIL;
-        let accepted = self.params.resource_set_slot();
-        let mut ladder = Vec::with_capacity(3);
-        ladder.push(accepted);
-        for slot in crate::dlss::params::RESOURCE_SET_SLOT_CANDIDATES {
-            if slot != accepted {
-                ladder.push(slot);
+        let mut winning_slot = self.param_slot;
+        let mut replacement: Option<Box<crate::dlss::params::NgxParams>> = None;
+        for (attempt, slot) in ladder.into_iter().enumerate() {
+            if attempt > 0 {
+                // A fresh map per attempt, so a key already stored as one type is
+                // not silently kept that way.
+                replacement = Some(self.api.new_parameters(false));
             }
-        }
-        for slot in ladder {
-            self.params.set_d3d12_resource_with_slot(
-                slot,
-                P_COLOR,
-                self.natives.color.resource.as_mut_ptr() as *mut c_void,
-            );
-            self.params.set_d3d12_resource_with_slot(
-                slot,
-                P_DEPTH,
-                self.natives.depth.resource.as_mut_ptr() as *mut c_void,
-            );
-            self.params.set_d3d12_resource_with_slot(
-                slot,
-                P_MOTION_VECTORS,
-                self.natives.mv.resource.as_mut_ptr() as *mut c_void,
-            );
-            self.params.set_d3d12_resource_with_slot(
-                slot,
-                P_OUTPUT,
-                self.natives.output.resource.as_mut_ptr() as *mut c_void,
-            );
+            let params = match attempt {
+                0 => &mut self.params,
+                _ => replacement.as_mut().expect("a map for every attempt after the first"),
+            };
+            write_evaluate_parameters(params, slot, &evaluate, resources);
             result = unsafe {
                 (self.api.evaluate_feature)(
                     list.as_mut_ptr() as *mut c_void,
                     self.handle,
-                    self.params.as_ptr(),
+                    params.as_ptr(),
                     std::ptr::null(),
                 )
             };
             if crate::dlss::succeeded(result) {
-                if slot != accepted {
+                if attempt > 0 {
                     crate::dlss::diag(&format!(
-                        "[DLSS] resource parameters reach the feature through Set slot {slot}; \
-                         the declared slot {accepted} was rejected"
+                        "[DLSS] resource parameters reach the feature through Set slot {slot} \
+                         on a fresh map; slot {} was rejected",
+                        self.param_slot
                     ));
                 }
-                self.params.set_resource_set_slot(slot);
+                winning_slot = slot;
                 break;
             }
+            // NGX names nothing in the HRESULT but names the key in its own log,
+            // and the key is the experiment's result: the four were written
+            // through one slot, so a complaint about one of them means that slot
+            // is not the overload the feature reads through.
+            let complaint = crate::dlss::loader::last_missing_parameter()
+                .map(|line| format!("; its log says: {line}"))
+                .unwrap_or_default();
+            let described = params.describe_pointer_gets(P_COLOR);
             crate::dlss::diag(&format!(
-                "[DLSS] evaluate rejected the resource parameters written through Set slot \
-                 {slot} ({})",
+                "[DLSS] evaluate rejected Set slot {slot} ({}){complaint}; Color reads back as \
+                 {described}",
                 crate::dlss::result_name(result)
             ));
         }
-        self.params.set_f32(P_JITTER_X, self.current_jitter.0);
-        self.params.set_f32(P_JITTER_Y, self.current_jitter.1);
-        self.params.set_i32(P_RESET, i32::from(self.reset_history));
-        // Motion vectors are in pixels, so the scale is 1:1.
-        self.params.set_f32(P_MV_SCALE_X, 1.0);
-        self.params.set_f32(P_MV_SCALE_Y, 1.0);
-        // `InFrameTimeDeltaInMsec`: NGX scales how much it denoises and
-        // anti-aliases by how far content moves per frame.
-        self.params
-            .set_f32(P_FRAME_TIME_MS, frame_time_ms.clamp(0.1, 1000.0));
-        // `Sharpness` stays 0 and the Graphics slider runs the viewer's own
-        // RCAS-style pass in `DlssUpscaler::composite` instead: NGX's own
-        // sharpening is deprecated ("Sharpness is not supported") and doing
-        // both would double the halos.
-        self.params.set_f32(P_SHARPNESS, 0.0);
-        // Everything below is what `NGX_D3D12_EVALUATE_DLSS_EXT` sets on every
-        // call and this viewer used to leave out. The two exposure values are
-        // the important ones: NGX divides by the pre-exposure, so leaving it at
-        // the map's default 0 made every evaluate return
-        // `FAIL_InvalidParameter` — the feature created fine and then never
-        // ran, which is why DLSS looked like "no upscaling at all".
-        self.params.set_f32(P_PRE_EXPOSURE, 1.0);
-        self.params.set_f32(P_EXPOSURE_SCALE, 1.0);
-        self.params.set_u32(P_TONEMAPPER_TYPE, 0);
-        self.params.set_i32(P_INDICATOR_INVERT_X, 0);
-        self.params.set_i32(P_INDICATOR_INVERT_Y, 0);
-        for name in P_ZERO_SUBRECTS {
-            self.params.set_u32(name, 0);
-        }
-        for name in P_NULL_RESOURCES {
-            self.params.set_d3d12_resource(name, std::ptr::null_mut());
-        }
-        self.params
-            .set_u32(P_RENDER_WIDTH, self.render_extent.0.max(1));
-        self.params
-            .set_u32(P_RENDER_HEIGHT, self.render_extent.1.max(1));
-        // The extents again, and the `Resource*` twins. NGX checks the resources
-        // in the map against the feature it created, and `EvaluateFeature` is
-        // documented to answer `FAIL_InvalidParameter` when a required entry is
-        // missing rather than when it is wrong — so every extent key the header
-        // names is written on every evaluate, not only at create.
-        let (render_width, render_height) = self.render_extent;
-        let (display_width, display_height) = self.display_extent;
-        for (name, value) in [
-            (P_WIDTH, render_width.max(1)),
-            (P_HEIGHT, render_height.max(1)),
-            (P_OUT_WIDTH, display_width.max(1)),
-            (P_OUT_HEIGHT, display_height.max(1)),
-            (P_RESOURCE_WIDTH, render_width.max(1)),
-            (P_RESOURCE_HEIGHT, render_height.max(1)),
-            (P_RESOURCE_OUT_WIDTH, display_width.max(1)),
-            (P_RESOURCE_OUT_HEIGHT, display_height.max(1)),
-        ] {
-            self.params.set_u32(name, value);
+        if crate::dlss::succeeded(result) {
+            if let Some(map) = replacement.take() {
+                self.params = map;
+            }
+            self.param_slot = winning_slot;
+            self.params.set_resource_set_slot(winning_slot);
         }
 
         let restore = [

@@ -143,6 +143,23 @@ const POINTER_GET_SLOTS: [usize; 3] = [SLOT_GET_D3D12, SLOT_GET_D3D11, SLOT_GET_
 pub(crate) const RESOURCE_SET_SLOT_CANDIDATES: [usize; 3] =
     [SLOT_SET_D3D12, SLOT_SET_D3D11, SLOT_SET_VOID];
 
+/// The `Set` slots one session tries, in order, for the resource keys.
+///
+/// The measured slot goes first — it is the one the map's own pointer
+/// round-trip answered, so it is the most likely to be right — and the rest of
+/// the ladder follows. On later frames the caller passes only the winner, so
+/// this is a first-frame search, not a per-frame cost.
+pub(crate) fn resource_slot_ladder(measured: usize) -> Vec<usize> {
+    let mut ladder = Vec::with_capacity(RESOURCE_SET_SLOT_CANDIDATES.len());
+    ladder.push(measured);
+    for slot in RESOURCE_SET_SLOT_CANDIDATES {
+        if slot != measured {
+            ladder.push(slot);
+        }
+    }
+    ladder
+}
+
 /// One `Set` overload of an `NVSDK_NGX_Parameter` the viewer does not own.
 ///
 /// `None` when the object or its vtable is missing, or when the slot is null —
@@ -307,6 +324,42 @@ pub(crate) struct NgxMap {
     resource_set_slot: usize,
 }
 
+/// Read a pointer key back out of an `NVSDK_NGX_Parameter` through every
+/// candidate `Get` slot.
+///
+/// The companion to the `Set` ladder: after a rejected evaluate this says
+/// whether the map still holds the pointer that was just written, and through
+/// which reader. Three outcomes are distinguishable — an address (stored and
+/// readable), `untouched` (the reader did not recognise the key) and `fail` —
+/// and they separate "the map lost the value" from "the map has it under a tag
+/// the feature does not read" (`docs/blockers.md` B-27).
+fn pointer_get_report(object: *mut c_void, name: &str) -> String {
+    type GetPtr = unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_void) -> u32;
+    let Ok(name) = CString::new(name) else {
+        return String::from("unreadable key");
+    };
+    let sentinel = 1usize as *mut c_void;
+    let mut parts = Vec::with_capacity(POINTER_GET_SLOTS.len());
+    for slot in POINTER_GET_SLOTS {
+        let Some(get) = (unsafe { vtable_getter::<GetPtr>(object, slot) }) else {
+            parts.push(format!("slot {slot} absent"));
+            continue;
+        };
+        // A map that does not hold the key leaves the out-parameter alone, so it
+        // is pre-filled to tell "not stored" from "stored as null".
+        let mut value = sentinel;
+        let result = unsafe { get(object, name.as_ptr(), &mut value) };
+        if result != NGX_SUCCESS {
+            parts.push(format!("slot {slot} fail(0x{result:08x})"));
+        } else if value == sentinel {
+            parts.push(format!("slot {slot} untouched"));
+        } else {
+            parts.push(format!("slot {slot} 0x{:x}", value as usize));
+        }
+    }
+    parts.join(", ")
+}
+
 impl NgxMap {
     pub(crate) fn new(
         object: *mut c_void,
@@ -360,6 +413,11 @@ impl NgxMap {
             get_void: unsafe { vtable_setter(object, SLOT_GET_VOID) },
             resource_set_slot: SLOT_SET_D3D12,
         }
+    }
+
+    /// Read a pointer key back through every candidate `Get` slot.
+    pub(crate) fn describe_pointer_gets(&self, name: &str) -> String {
+        pointer_get_report(self.object, name)
     }
 
     /// Which `Set` slot resource pointers go through.
@@ -475,6 +533,11 @@ impl NgxMap {
 
     fn c_name(name: &str) -> Option<CString> {
         CString::new(name).ok()
+    }
+
+    /// Read one pointer key back through every candidate `Get` slot.
+    fn describe_pointer_gets(&self, name: &str) -> String {
+        pointer_get_report(self as *const Owned as *mut c_void, name)
     }
 
     fn set_u32(&mut self, name: &str, value: u32) {
@@ -671,6 +734,18 @@ impl NgxParams {
     pub(crate) fn set_resource_set_slot(&mut self, slot: usize) {
         if let Kind::Ngx(map) = &mut self.kind {
             map.set_resource_set_slot(slot);
+        }
+    }
+
+    /// Read a pointer key back through every candidate `Get` slot.
+    ///
+    /// The viewer's own table has a single pointer variant, so there it always
+    /// reads back through the one slot it has; NGX's map is asked through all
+    /// three, which is what makes a rejected evaluate diagnosable.
+    pub(crate) fn describe_pointer_gets(&self, name: &str) -> String {
+        match &self.kind {
+            Kind::Owned(table) => table.describe_pointer_gets(name),
+            Kind::Ngx(map) => map.describe_pointer_gets(name),
         }
     }
 
@@ -986,6 +1061,59 @@ mod tests {
         params.set_d3d12_resource("Output", 0x5678 as *mut c_void);
         let stored = unsafe { (*own).values.get("Output").copied() };
         assert!(matches!(stored, Some(Value::Ptr(ptr)) if ptr as usize == 0x5678));
+    }
+
+    /// The ladder starts with the slot the map's own pointer round-trip
+    /// reported, then the rest of the declared candidates, each exactly once.
+    ///
+    /// Order is the whole experiment: a ladder that started anywhere else could
+    /// spend three rejected evaluates before reaching the one slot the map
+    /// already answered for, and a duplicated entry would evaluate the same
+    /// wrong write twice and read as "two slots failed" (`B-27`).
+    #[test]
+    fn the_slot_ladder_tries_the_measured_slot_first() {
+        for measured in RESOURCE_SET_SLOT_CANDIDATES {
+            let ladder = resource_slot_ladder(measured);
+            assert_eq!(ladder.first().copied(), Some(measured));
+            assert_eq!(ladder.len(), RESOURCE_SET_SLOT_CANDIDATES.len());
+            for candidate in RESOURCE_SET_SLOT_CANDIDATES {
+                assert_eq!(
+                    ladder.iter().filter(|slot| **slot == candidate).count(),
+                    1,
+                    "slot {candidate} must appear exactly once"
+                );
+            }
+        }
+    }
+
+    /// A pointer key the table holds reads back as an address through every
+    /// candidate `Get` slot; a key it does not hold reads back as no address at
+    /// all.
+    ///
+    /// That is the distinction the evaluate diagnostics lean on: `0x…` means
+    /// "the map still has what was just written, through a reader the feature
+    /// may not be using", while `untouched` or `fail` means the key is not
+    /// there — the out-parameter is pre-filled with a sentinel so the two can
+    /// be told apart, and neither is mistaken for a stored pointer.
+    #[test]
+    fn a_pointer_key_reads_back_and_a_missing_one_reads_as_untouched() {
+        let mut params = NgxParams::new();
+        params.set_d3d12_resource("Color", 0x1234 as *mut c_void);
+        let stored = params.describe_pointer_gets("Color");
+        assert_eq!(
+            stored.matches("0x1234").count(),
+            POINTER_GET_SLOTS.len(),
+            "every getter of a table the viewer owns must see the pointer: {stored}"
+        );
+        let missing = params.describe_pointer_gets("Transparency");
+        assert!(
+            !missing.contains("0x1234"),
+            "a key that was never written must not read back as the stored pointer: {missing}"
+        );
+        assert!(
+            missing.contains("untouched") || missing.contains("fail"),
+            "a missing key must be reported as untouched or failed, not as an address: {missing}"
+        );
     }
 
     #[test]
