@@ -51,11 +51,7 @@ impl Area {
         typ: &scene::GrassType,
     ) -> Result<random::PlacementIter<'static>, String> {
         let size = self.width * self.height / 8;
-        let mut bits = Vec::with_capacity(size);
-        ZlibDecoder::new(self.active.packed.as_slice())
-            .take((size + 1) as u64)
-            .read_to_end(&mut bits)
-            .map_err(|e| e.to_string())?;
+        let bits = crate::pck::inflate(&self.active.packed, size)?;
         if bits.len() != size {
             return Err("bad grass bitmap length".into());
         }
