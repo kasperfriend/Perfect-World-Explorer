@@ -347,80 +347,80 @@ impl LoadingWindow {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             );
-            let (status_label, ds_state_label, ds_graph_label, ds_totals_label) =
-                if hwnd.is_null() {
-                    (
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                    )
-                } else {
-                    let instance = GetModuleHandleW(std::ptr::null());
-                    let status = control(
-                        hwnd,
-                        instance,
-                        "STATIC",
-                        "Loading the world...",
-                        0x50000000,
-                        24,
-                        20,
-                        560,
-                        25,
-                        0,
-                    );
-                    control(
-                        hwnd,
-                        instance,
-                        "STATIC",
-                        "First launch may take several minutes while trees are prepared.",
-                        0x50000000,
-                        24,
-                        51,
-                        560,
-                        25,
-                        0,
-                    );
-                    let ds_state = control(
-                        hwnd,
-                        instance,
-                        "STATIC",
-                        "DirectStorage status is being checked...",
-                        0x50000000,
-                        24,
-                        87,
-                        560,
-                        25,
-                        0,
-                    );
-                    let ds_graph = control(
-                        hwnd,
-                        instance,
-                        "STATIC",
-                        "Read throughput (MiB/s): ······························",
-                        0x50000000,
-                        24,
-                        115,
-                        560,
-                        28,
-                        0,
-                    );
-                    let ds_totals = control(
-                        hwnd,
-                        instance,
-                        "STATIC",
-                        "DirectStorage: 0 reads / 0 MiB | attempts: 0 | fallback: 0 | active: 0",
-                        0x50000000,
-                        24,
-                        148,
-                        560,
-                        38,
-                        0,
-                    );
-                    ShowWindow(hwnd, 5);
-                    UpdateWindow(hwnd);
-                    (status, ds_state, ds_graph, ds_totals)
-                };
+            let (status_label, ds_state_label, ds_graph_label, ds_totals_label) = if hwnd.is_null()
+            {
+                (
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            } else {
+                let instance = GetModuleHandleW(std::ptr::null());
+                let status = control(
+                    hwnd,
+                    instance,
+                    "STATIC",
+                    "Loading the world...",
+                    0x50000000,
+                    24,
+                    20,
+                    560,
+                    25,
+                    0,
+                );
+                control(
+                    hwnd,
+                    instance,
+                    "STATIC",
+                    "First launch may take several minutes while trees are prepared.",
+                    0x50000000,
+                    24,
+                    51,
+                    560,
+                    25,
+                    0,
+                );
+                let ds_state = control(
+                    hwnd,
+                    instance,
+                    "STATIC",
+                    "DirectStorage status is being checked...",
+                    0x50000000,
+                    24,
+                    87,
+                    560,
+                    25,
+                    0,
+                );
+                let ds_graph = control(
+                    hwnd,
+                    instance,
+                    "STATIC",
+                    "Read throughput (MiB/s): ······························",
+                    0x50000000,
+                    24,
+                    115,
+                    560,
+                    28,
+                    0,
+                );
+                let ds_totals = control(
+                    hwnd,
+                    instance,
+                    "STATIC",
+                    "DirectStorage: 0 reads / 0 MiB | attempts: 0 | fallback: 0 | active: 0",
+                    0x50000000,
+                    24,
+                    148,
+                    560,
+                    38,
+                    0,
+                );
+                ShowWindow(hwnd, 5);
+                UpdateWindow(hwnd);
+                (status, ds_state, ds_graph, ds_totals)
+            };
             let _ = ready_tx.send(());
 
             let mut samples = std::collections::VecDeque::<f64>::with_capacity(32);
