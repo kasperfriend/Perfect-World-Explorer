@@ -361,21 +361,24 @@ impl Gpu {
                 usage,
             })
         };
+        // `COPY_DST` from the start: `update` rewrites these buffers in place
+        // whenever the field fits, which is what stops a block crossing from
+        // destroying and recreating them.
         (
             buffer(
                 "grass mesh vertices",
                 bytemuck::cast_slice(&data.vertices),
-                wgpu::BufferUsages::VERTEX,
+                wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             ),
             buffer(
                 "grass mesh indices",
                 bytemuck::cast_slice(&data.indices),
-                wgpu::BufferUsages::INDEX,
+                wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
             ),
             buffer(
                 "grass placement instances",
                 bytemuck::cast_slice(&data.instances),
-                wgpu::BufferUsages::VERTEX,
+                wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             ),
             Self::args_buffer(device, &data.batches),
             data.batches,
@@ -399,7 +402,7 @@ impl Gpu {
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("grass draw args"),
             contents: bytemuck::cast_slice(&args),
-            usage: wgpu::BufferUsages::INDIRECT,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
         })
     }
     /// Replace the grass field with a rebuilt one.
