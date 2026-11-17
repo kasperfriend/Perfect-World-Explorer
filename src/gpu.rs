@@ -3142,6 +3142,9 @@ impl Renderer {
                 daylight,
                 camera.active_fog(),
                 normal.clip,
+                // This depth is the one the motion-vector pass and every
+                // upscaler read, so the clouds owe it their real distance.
+                true,
             );
         }
         self.weather.draw(
@@ -3425,6 +3428,9 @@ impl Renderer {
                         daylight,
                         above_fog,
                         above.clip,
+                        // The refraction view's depth is not a motion-vector
+                        // input; leave it untouched.
+                        false,
                     );
                 }
                 self.weather.draw(
@@ -3542,6 +3548,8 @@ impl Renderer {
                     daylight,
                     camera.active_fog(),
                     reflected.clip,
+                    // The mirror's depth feeds the water, not the upscalers.
+                    false,
                 );
             }
             self.weather.draw(

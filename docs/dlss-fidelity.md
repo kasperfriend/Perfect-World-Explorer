@@ -174,7 +174,7 @@ DLSS but is not" looks like:
 | --- | --- | --- |
 | Color | LDR: 0..1 in a perceptually linear (sRGB) encoding, `IsHDR` clear; or linear with `IsHDR` set | 8-bit sRGB-encoded world/post color, `IsHDR` clear. The native texture is created with the **UNORM** DXGI description on purpose: NGX builds its SRV from the resource description, so an `_UNORM_SRGB` one would hand DLSS linear pixels while the flag says sRGB-encoded, and decode twice |
 | Depth | `DepthInverted` when near is 1 | reversed-Z (`perspective_matrix` passes the far plane as `z_near`), copied into a plain `R32_FLOAT` surface NGX can bind as an SRV |
-| Motion vectors | render-resolution pixels, `[0,0]` top-left, `current + mv = previous`, not dilated; `MVLowRes` when they are at render resolution, `MVJittered` when they carry the jitter | `R16G16_FLOAT` at render extent, `(prev_uv - uv) * size` from a depth reprojection against the **unjittered** view-projection; `MVLowRes` set, `MVJittered` clear |
+| Motion vectors | render-resolution pixels, `[0,0]` top-left, `current + mv = previous`, not dilated; `MVLowRes` when they are at render resolution, `MVJittered` when they carry the jitter | `R16G16_FLOAT` at render extent, `(prev_uv - uv) * size` from a depth reprojection against the **unjittered** view-projection; `MVLowRes` set, `MVJittered` clear. Content that writes no depth has no motion of its own — the cloud coverage pass in `cloud_gpu` now gives the clouds a depth so their vectors are real (`docs/blockers.md` B-25) |
 | Jitter | a projection-matrix jitter, and the same value reported to NGX | NDC shear in the `w` column (`jittered_clip_vp`), reported per evaluate; motion vectors are computed from the unjittered matrices |
 | Aspect ratio | display aspect | the projection is built from the *display* extent, so a non-integer render scale does not stretch |
 | Mip bias | `log2(renderX / displayX) - 1.0` | implemented, see §6 |
@@ -207,6 +207,19 @@ The order is: world + fog/glow/post at the render extent → DLSS → display-re
 composition → the viewer's sharpening → UI. That is "as early in post as
 possible" with no display-resolution work upstream of the upscale, which is what
 the guide asks for.
+
+Nothing is upscaled *per object*, and nothing can be: DLSS, FSR and XeSS are
+screen-space temporal upscalers that reconstruct one frame from one jittered
+frame plus history. What is per-object is the **level of detail**: the mip bias
+of §6 makes every object's textures resolve at display-resolution detail even
+though the object is rasterised at the render extent. Without that bias an
+upscaled frame is a sharpening of a genuinely lower-detail image — which is why
+it used to look like a plain downscale. The other half of that impression can be
+the bilinear fallback: when a provider fails, `render_scale.blit` stretches the
+render-extent image, which really is "scale down the whole image", and the log
+(`[DLSS]`/`[FSR]`/`[XeSS] … failed`) and the on-screen status mark say so.
+UI, text, the minimap and the gamma/encode ramp deliberately stay at native
+resolution and are never upscaled.
 
 The guide's HDR rule ("run before tone mapping") applies to linear HDR input. This
 engine renders LDR: the color handed to DLSS is already sRGB-encoded and 0..1,
