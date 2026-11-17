@@ -399,12 +399,22 @@ jobs:
       - name: Build standalone viewer
         shell: bash
         run: |
+          set +e
           CARGO_TERM_COLOR=never cargo build --locked --release --target x86_64-pc-windows-msvc --bin perfect-world-explorer 2>&1 | tee /tmp/win-build.log
           status=${PIPESTATUS[0]}
+          set -e
           if [ "$status" -ne 0 ]; then
-            grep -E "(^error|: error)" /tmp/win-build.log | head -40 | while IFS= read -r line; do
+            # Preserve compiler context as check annotations: workflow log
+            # downloads are not reliably available from the runner API.
+            awk '/^error(\\[|:)/{show=14} show>0 {print; show--}' /tmp/win-build.log \
+              | head -120 | while IFS= read -r line; do
               echo "::error::$line"
             done
+            if ! grep -qE '^error(\\[|:)' /tmp/win-build.log; then
+              tail -50 /tmp/win-build.log | while IFS= read -r line; do
+                echo "::error::$line"
+              done
+            fi
           fi
           exit "$status"
       - name: Build audio corpus and scene diagnostics
