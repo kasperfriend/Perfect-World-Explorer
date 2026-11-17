@@ -212,6 +212,7 @@ mod imp_stub {
             _queue: &wgpu::Queue,
             _color: &wgpu::Texture,
             _depth: &wgpu::Texture,
+            _object_mv: &wgpu::TextureView,
             _unjittered_vp: &Mat4,
         ) -> Result<(), String> {
             Err("DLSS is only supported on Windows with a DX12 backend".to_string())
@@ -292,6 +293,7 @@ mod fg_stub {
             _device: &wgpu::Device,
             _queue: &wgpu::Queue,
             _depth: &wgpu::Texture,
+            _object_mv: &wgpu::TextureView,
             _unjittered_vp: &glam::Mat4,
             _reset: bool,
             _lens: crate::fsr::CameraLens,

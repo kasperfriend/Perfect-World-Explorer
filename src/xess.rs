@@ -124,6 +124,7 @@ mod imp_stub {
             _queue: &wgpu::Queue,
             _color: &wgpu::Texture,
             _depth: &wgpu::Texture,
+            _object_mv: &wgpu::TextureView,
             _unjittered_vp: &glam::Mat4,
         ) -> Result<(), String> {
             Err("unsupported".to_string())
@@ -208,6 +209,7 @@ mod fg_stub {
             _device: &wgpu::Device,
             _queue: &wgpu::Queue,
             _depth: &wgpu::Texture,
+            _object_mv: &wgpu::TextureView,
             _view: &glam::Mat4,
             _projection: &glam::Mat4,
             _unjittered_vp: &glam::Mat4,
