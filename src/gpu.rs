@@ -56,6 +56,14 @@ pub(crate) struct Uniform {
     /// the native blend instead of inverting the lightmap-availability flag.
     fog_range: [f32; 4],
     fog_color: [f32; 4], // encoded client ARGB
+    /// Gradient multiplier in lane y, matching `terrain_gpu::Camera::lod`.
+    lod: [f32; 4],
+}
+const _: [(); 1568] = [(); std::mem::size_of::<Uniform>()];
+
+/// Turn a sampler LOD bias into the gradient scale used by terrain.
+fn terrain_lod_scale() -> f32 {
+    2.0_f32.powf(crate::render_scale::mip_bias())
 }
 
 /// One lighting/playback snapshot per rendered frame. `render()` samples wall
@@ -150,6 +158,7 @@ impl FrameSnapshot {
             grass_history: self.grass_history,
             fog_range,
             fog_color,
+            lod: [0., terrain_lod_scale(), 0., 0.],
         }
     }
     fn secondary(&self, pass: Pass) -> crate::scenery_visibility::SecondaryView {
@@ -1636,6 +1645,7 @@ impl Renderer {
                 grass_history: [[0.; 4]; 80],
                 fog_range: [0.; 4],
                 fog_color: [0.; 4],
+                lod: [0., terrain_lod_scale(), 0., 0.],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -1657,6 +1667,7 @@ impl Renderer {
                 grass_history: [[0.; 4]; 80],
                 fog_range: [0.; 4],
                 fog_color: [0.; 4],
+                lod: [0., terrain_lod_scale(), 0., 0.],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -3786,6 +3797,7 @@ impl Renderer {
                 grass_history: frame.grass_history,
                 fog_range: frame.fog_range,
                 fog_color: frame.fog_color,
+                lod: [0., terrain_lod_scale(), 0., 0.],
             };
             self.queue
                 .write_buffer(&self.reflected_uniform, 0, bytemuck::bytes_of(&reflected));
