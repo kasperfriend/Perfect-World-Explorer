@@ -824,5 +824,23 @@
   "Width": [
    "u32"
   ]
+ },
+ "vtable": {
+  "SET_U64": 0,
+  "SET_F32": 1,
+  "SET_F64": 2,
+  "SET_U32": 3,
+  "SET_I32": 4,
+  "SET_D3D11": 5,
+  "SET_D3D12": 6,
+  "SET_VOID": 7,
+  "GET_U64": 8,
+  "GET_F32": 9,
+  "GET_F64": 10,
+  "GET_U32": 11,
+  "GET_I32": 12,
+  "GET_D3D11": 13,
+  "GET_D3D12": 14,
+  "GET_VOID": 15
  }
 }

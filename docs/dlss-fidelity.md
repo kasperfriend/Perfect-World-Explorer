@@ -100,11 +100,25 @@ Constants, all read out of `nvsdk_ngx_defs.h` at `v310.9.16`:
    smaller output fails with `InvalidParameter` and a minimised window would
    otherwise spend the retry budget on a condition that fixes itself.
 
-The parameter names and setter types are not taken on trust. The NGX DLLs export
-the feature entry points but **no** parameter allocator, so the viewer owns the
-`NVSDK_NGX_Parameter` table (`src/dlss/params.rs`: the D3D12 vtable in header
-order, with `SetI`/`SetUI`/`SetF`/`SetD3D12Resource`/`SetVoidPointer` at their
-documented slots, plus `…_Destroy`). To keep that hand-built table honest:
+The parameter names, setter types and vtable order are not taken on trust. The
+NGX DLLs export the feature entry points but **no** parameter allocator, so the
+viewer owns the `NVSDK_NGX_Parameter` table (`src/dlss/params.rs`). That table is
+an ABI: `NVSDK_NGX_Parameter` is an abstract C++ class in
+`nvsdk_ngx_params.h`, so the n-th declared virtual method *is* vtable slot n, and
+a call through the wrong slot writes the wrong type into NGX's map. The header's
+declaration order and the viewer's slots agree exactly —
+
+| Slot | `nvsdk_ngx_params.h` | `params.rs` |
+| --- | --- | --- |
+| 1 | `Set(const char *, float)` | `SLOT_SET_F32` |
+| 3 | `Set(const char *, unsigned int)` | `SLOT_SET_U32` |
+| 4 | `Set(const char *, int)` | `SLOT_SET_I32` |
+| 6 | `Set(const char *, ID3D12Resource *)` | `SLOT_SET_D3D12` |
+| 7 | `Set(const char *, void *)` | `SLOT_SET_VOID` |
+| 11 | `Get(const char *, unsigned int *)` | `SLOT_GET_U32` |
+| 15 | `Get(const char *, void **)` | `SLOT_GET_VOID` |
+
+To keep that hand-built table honest:
 
 ```sh
 python3 tools/verify-ngx-params.py            # offline, vendored table
@@ -113,10 +127,11 @@ python3 tools/verify-ngx-params.py --headers DIR   # re-derive it from the heade
 
 extracts every `#define NVSDK_NGX_[DLSSG_]Parameter_*` from the `v310.9.16`
 headers, every `NVSDK_NGX_Parameter_Set*(Parameters, <name>, …)` call in NVIDIA's
-create and evaluate helpers, and every `set_*(P_*)` in `src/dlss/imp.rs` /
-`src/dlss/fg.rs`, then fails when a name does not exist or a setter type differs.
-Current result: **74 writes over 73 distinct names, 0 unknown, 0 mistyped**, in
-CI (`PR checks and Windows build` → "Verify NGX parameter names and setter
+create and evaluate helpers, the `NVSDK_NGX_Parameter` virtual-method order, and
+every `set_*(P_*)` in `src/dlss/imp.rs` / `src/dlss/fg.rs` / `src/dlss/params.rs`,
+then fails when a name does not exist, a setter type differs, or a slot index is
+not where the header puts it. Current result: **74 writes over 73 distinct names,
+0 unknown, 0 mistyped, all 7 slots in header order**, in CI (`PR checks and Windows build` → "Verify NGX parameter names and setter
 types", offline from `tools/fixtures/ngx-v310.9.16-params.json`).
 
 That check is the reason `PerfQualityValue` is a `SetI` today: it found the one

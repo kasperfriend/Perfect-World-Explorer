@@ -60,10 +60,48 @@ CALL = re.compile(
     r"NVSDK_NGX_Parameter_(Set[A-Za-z0-9]+)\s*\(\s*[A-Za-z0-9_]+\s*,\s*(" + SYMBOL + r")",
     re.S,
 )
+VIRTUAL = re.compile(
+    r"virtual\s+[A-Za-z0-9_\s]+?\s(Set|Get)\s*\(\s*const\s+char\s*\*\s*\w+\s*,\s*([^)]*?)\)",
+)
+VALUE_TYPES = [
+    ("unsigned long long", "u64"),
+    ("double", "f64"),
+    ("float", "f32"),
+    ("unsigned int", "u32"),
+    ("ID3D11Resource", "d3d11"),
+    ("ID3D12Resource", "d3d12"),
+    ("void", "void"),
+    ("int", "i32"),
+]
+RUST_SLOT = re.compile(r"const\s+SLOT_([A-Z0-9_]+)\s*:\s*usize\s*=\s*(\d+)\s*;")
 RUST_CONST = re.compile(r'const\s+(P_[A-Z0-9_]+)\s*:\s*&str\s*=\s*"([^"]*)"')
 RUST_ARRAY = re.compile(r"const\s+(P_[A-Z0-9_]+)\s*:\s*\[&str;\s*\d+\]\s*=\s*\[(.*?)\]", re.S)
 RUST_ITEM = re.compile(r"P_[A-Z0-9_]+")
 RUST_WRITE = re.compile(r"\.set_([a-z0-9_]+)\(\s*(P_[A-Z0-9_]+)")
+
+
+def header_vtable(paths):
+    """Slot index -> `Set`/`Get` of which value type, from nvsdk_ngx_params.h.
+
+    `NVSDK_NGX_Parameter` is an abstract C++ class, so its virtual methods are
+    the ABI: the n-th declared method is vtable slot n. MSVC emits no destructor
+    slot for a class that declares no destructor, which is why `Reset()` lands
+    last and the setters start at 0.
+    """
+    for path in paths:
+        text = path.read_text(errors="replace")
+        start = text.find("typedef struct NVSDK_NGX_Parameter")
+        if start < 0:
+            continue
+        block = text[start : text.find("NVSDK_NGX_Parameter;", start)]
+        slots = {}
+        for index, match in enumerate(VIRTUAL.finditer(block)):
+            method, tail = match.group(1), match.group(2)
+            kind = next((kind for token, kind in VALUE_TYPES if token in tail), "?")
+            slots[f"{method.upper()}_{kind.upper()}"] = index
+        if slots:
+            return slots
+    return {}
 
 
 def header_tables(paths):
@@ -121,7 +159,11 @@ def main(argv=None):
         "--source",
         type=pathlib.Path,
         nargs="+",
-        default=[pathlib.Path("src/dlss/imp.rs"), pathlib.Path("src/dlss/fg.rs")],
+        default=[
+            pathlib.Path("src/dlss/imp.rs"),
+            pathlib.Path("src/dlss/fg.rs"),
+            pathlib.Path("src/dlss/params.rs"),
+        ],
     )
     args = parser.parse_args(argv)
 
@@ -130,6 +172,7 @@ def main(argv=None):
         if not headers:
             return f"no headers in {args.headers}", 1
         names, setters = header_tables(headers)
+        vtable = header_vtable(headers)
         if args.dump_fixture is not None:
             args.dump_fixture.parent.mkdir(parents=True, exist_ok=True)
             args.dump_fixture.write_text(
@@ -138,6 +181,7 @@ def main(argv=None):
                         "source": f"NVIDIA/DLSS include/, tag {HEADER_TAG}",
                         "names": dict(sorted(names.items())),
                         "setters": {k: sorted(v) for k, v in sorted(setters.items())},
+                        "vtable": dict(sorted(vtable.items(), key=lambda kv: kv[1])),
                     },
                     indent=1,
                 )
@@ -148,6 +192,7 @@ def main(argv=None):
         data = json.loads(args.fixture.read_text())
         names = data["names"]
         setters = {k: set(v) for k, v in data["setters"].items()}
+        vtable = data["vtable"]
     else:
         return f"no --headers and no fixture at {args.fixture}", 1
     consts, _, writes = rust_writes(args.source)
@@ -169,6 +214,27 @@ def main(argv=None):
                 f"{', '.join(sorted(RUST_TO_SETTER[k] for k in expected))}"
             )
 
+    slot_mismatch = []
+    if vtable:
+        slots = {}
+        for path in args.source:
+            for kind, index in RUST_SLOT.findall(path.read_text()):
+                slots[kind] = int(index)
+        for kind, index in sorted(slots.items(), key=lambda kv: kv[1]):
+            expected = vtable.get(kind)
+            if expected is None:
+                slot_mismatch.append(f"SLOT_{kind} = {index}: the header declares no {kind} slot")
+            elif expected != index:
+                slot_mismatch.append(
+                    f"SLOT_{kind} = {index}, but nvsdk_ngx_params.h puts {kind} at slot {expected}"
+                )
+        print(
+            f"vtable: {len(vtable)} virtual methods in the header, "
+            f"{len(slots)} slots used by params.rs"
+        )
+        for line in slot_mismatch:
+            print(f"ERROR   {line}")
+
     used = {name for _, _, name, _ in writes}
     source = (
         f"{len(sorted(args.headers.glob('*.h')))} header files"
@@ -183,10 +249,17 @@ def main(argv=None):
         print(f"ERROR   {line}")
     for name in sorted(unchecked):
         print(f"note    {name}: the create/evaluate helpers never set it (query or capability key)")
-    if unknown or mismatched:
-        print(f"FAILED: {len(unknown)} unknown, {len(mismatched)} mistyped")
+    if unknown or mismatched or slot_mismatch:
+        print(
+            f"FAILED: {len(unknown)} unknown, {len(mismatched)} mistyped, "
+            f"{len(slot_mismatch)} bad vtable slots"
+        )
         return None, 1
-    print(f"OK: every name exists in the headers, every setter type conforms ({len(writes)} writes)")
+    print(
+        f"OK: every name exists in the headers, every setter type conforms "
+        f"({len(writes)} writes)"
+        + (", every vtable slot matches the header order" if vtable else "")
+    )
     return None, 0
 
 
