@@ -6574,6 +6574,7 @@ pub fn preview(
                 cam,
                 width,
                 height,
+                false,
             );
         };
         // Drain the one-root-per-frame queue first: an effect still waiting for
