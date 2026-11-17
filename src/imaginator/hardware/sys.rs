@@ -103,6 +103,7 @@ pub const DEVICE5_SLOTS: usize = 69;
 /// Slots of `ID3D12GraphicsCommandList4` (0..=76).
 pub const GCL4_SLOTS: usize = 77;
 
+pub const DEVICE5_CREATE_STATE_OBJECT_SLOT: usize = 67;
 pub const DEVICE5_PREBUILD_INFO_SLOT: usize = 68;
 pub const GCL4_BUILD_AS_SLOT: usize = 72;
 
@@ -249,10 +250,15 @@ pub struct ID3D12Device5Vtbl {
         unsafe extern "system" fn(*mut IUnknown, *const GUID, *mut *mut c_void) -> HRESULT,
     pub AddRef: unsafe extern "system" fn(*mut IUnknown) -> u32,
     pub Release: unsafe extern "system" fn(*mut IUnknown) -> u32,
-    /// Slots 3..=68: `ID3D12Object` through `CreateStateObject`. The whole chain
-    /// is opaque here — nothing but the prebuild-info call is reached — so the
-    /// prefix is only sized to place that call on slot 68.
-    pub prefix: [usize; DEVICE5_PREBUILD_INFO_SLOT - IUNKNOWN_SLOTS],
+    /// Slots 3..=66: `ID3D12Object` through `EnumerateMetaCommandParameters`.
+    pub prefix: [usize; DEVICE5_CREATE_STATE_OBJECT_SLOT - IUNKNOWN_SLOTS],
+    /// Slot 67: build a ray-tracing state object from a DXIL library.
+    pub CreateStateObject: unsafe extern "system" fn(
+        *mut c_void,
+        *const D3D12_STATE_OBJECT_DESC,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> HRESULT,
     pub GetRaytracingAccelerationStructurePrebuildInfo: unsafe extern "system" fn(
         *mut c_void,
         *const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS,
@@ -329,6 +335,150 @@ pub struct D3D12_SHADER_TABLE {
     pub SizeInBytes: u64,
     pub StrideInBytes: u64,
 }
+
+// ---------------------------------------------------------------------------
+// Ray-tracing pipeline objects (D3D12 state objects, DXIL subobjects)
+//
+// These mirror `d3d12.h`. The state object is how DX12 spells a ray-tracing
+// pipeline: one description carrying the DXIL library, the hit groups and the
+// global root signature, turned into a single object that `SetPipelineState1`
+// binds and `DispatchRays` launches.
+// ---------------------------------------------------------------------------
+
+/// A shader identifier is 32 bytes: `D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES`. A
+/// shader table record starts with one, then the record's own data.
+pub const SHADER_IDENTIFIER_SIZE: usize = 32;
+
+/// `D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE`.
+pub const D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE: u32 = 3;
+
+/// `D3D12_STATE_SUBOBJECT_TYPE_*`, taken from the enum in `d3d12.h` rather than
+/// from memory: the numbering is not the declaration order and guessing it
+/// produces a state object the runtime rejects.
+pub const D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG: u32 = 0;
+pub const D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE: u32 = 1;
+pub const D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY: u32 = 5;
+pub const D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG: u32 = 9;
+pub const D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG: u32 = 10;
+pub const D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP: u32 = 11;
+
+/// `D3D12_SHADER_VISIBILITY_ALL`, the visibility a ray-tracing export ignores.
+pub const D3D12_SHADER_VISIBILITY_ALL: u32 = 0;
+
+#[repr(C)]
+pub struct D3D12_STATE_OBJECT_CONFIG {
+    pub Flags: u32,
+}
+
+/// `D3D12_DXIL_LIBRARY_DESC`: the compiled blob plus optional per-export renames.
+#[repr(C)]
+pub struct D3D12_DXIL_LIBRARY_DESC {
+    pub DXILLibrary: D3D12_SHADER_BYTECODE,
+    pub NumExports: u32,
+    pub pExports: *const D3D12_EXPORT_DESC,
+}
+
+#[repr(C)]
+pub struct D3D12_SHADER_BYTECODE {
+    pub pShaderBytecode: *const c_void,
+    pub BytecodeLength: usize,
+}
+
+#[repr(C)]
+pub struct D3D12_EXPORT_DESC {
+    pub Name: *const u16,
+    pub ExportToRename: *const u16,
+    pub Flags: u32,
+}
+
+/// `D3D12_HIT_GROUP_DESC`: which intersection, any-hit and closest-hit shaders
+/// make up one hit group, and the name a shader table record addresses.
+#[repr(C)]
+pub struct D3D12_HIT_GROUP_DESC {
+    pub HitGroupExport: *const u16,
+    pub Type: u32,
+    pub AnyHitShaderImport: *const u16,
+    pub ClosestHitShaderImport: *const u16,
+    pub IntersectionShaderImport: *const u16,
+}
+
+/// `D3D12_RAYTRACING_SHADER_CONFIG`: the payload and attribute sizes the
+/// traversal must reserve. The payload is 8 floats — the four traced channels
+/// the shader writes — and the attribute is a triangle's barycentrics.
+#[repr(C)]
+pub struct D3D12_RAYTRACING_SHADER_CONFIG {
+    pub MaxPayloadSizeInBytes: u32,
+    pub MaxAttributeSizeInBytes: u32,
+}
+
+/// `D3D12_RAYTRACING_PIPELINE_CONFIG`: the recursion depth. This tracer is
+/// iterative, so one level of inline `RayQuery` per ray, never nested.
+#[repr(C)]
+pub struct D3D12_RAYTRACING_PIPELINE_CONFIG {
+    pub MaxTraceRecursionDepth: u32,
+}
+
+#[repr(C)]
+pub struct D3D12_STATE_SUBOBJECT {
+    pub Type: u32,
+    pub pDesc: *const c_void,
+}
+
+/// `D3D12_STATE_OBJECT_DESC`. `Subobjects` and `pSubobjects` are *aliased* in
+/// the C struct as `{ UINT NumSubobjects; const D3D12_STATE_SUBOBJECT
+/// *pSubobjects; }`, spelled here as a pointer to a small struct so the layout
+/// stays honest on 64-bit.
+#[repr(C)]
+pub struct D3D12_STATE_OBJECT_DESC {
+    pub Type: u32,
+    pub NumSubobjects: u32,
+    pub pSubobjects: *const D3D12_STATE_SUBOBJECT,
+}
+
+#[repr(C)]
+pub struct D3D12_ROOT_SIGNATURE_DESC {
+    pub NumParameters: u32,
+    pub pParameters: *const c_void,
+    pub NumStaticSamplers: u32,
+    pub pStaticSamplers: *const c_void,
+    pub Flags: u32,
+}
+
+/// `ID3D12RootSignature` is an `ID3D12DeviceChild`; only the `IUnknown` head is
+/// needed to keep and release one.
+#[repr(C)]
+pub struct ID3D12RootSignature {
+    pub lpVtbl: *const c_void,
+}
+
+/// `ID3D12StateObject` likewise.
+#[repr(C)]
+pub struct ID3D12StateObject {
+    pub lpVtbl: *const c_void,
+}
+
+/// `ID3D12StateObjectProperties`, whose one interesting call hands back the
+/// 32-byte shader identifier a shader table record starts with.
+#[repr(C)]
+pub struct ID3D12StateObjectPropertiesVtbl {
+    pub QueryInterface:
+        unsafe extern "system" fn(*mut IUnknown, *const GUID, *mut *mut c_void) -> HRESULT,
+    pub AddRef: unsafe extern "system" fn(*mut IUnknown) -> u32,
+    pub Release: unsafe extern "system" fn(*mut IUnknown) -> u32,
+    pub GetShaderIdentifier: unsafe extern "system" fn(*mut c_void, *const u16) -> *const c_void,
+    pub GetShaderStackSize: unsafe extern "system" fn(*mut c_void, *const u16) -> u64,
+    pub GetPipelineStackSize: unsafe extern "system" fn(*mut c_void) -> u64,
+    pub SetPipelineStackSize: unsafe extern "system" fn(*mut c_void, u64),
+}
+
+#[repr(C)]
+pub struct ID3D12StateObjectProperties {
+    pub lpVtbl: *mut ID3D12StateObjectPropertiesVtbl,
+}
+
+/// `__uuidof(ID3D12StateObjectProperties)`, from the `MIDL_INTERFACE` in
+/// `d3d12.h`.
+pub const IID_ID3D12STATEOBJECTPROPERTIES: &str = "de5fa827-9bf9-4f26-89ff-d7f56fde3860";
 
 // ---------------------------------------------------------------------------
 // Compile-time slot assertions
@@ -466,6 +616,41 @@ mod tests {
         );
         // BOOL must be a 4-byte Win32 BOOL here, not Rust's `bool`.
         assert_eq!(std::mem::size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS5>(), 12);
+    }
+
+    /// The state-object numbering is not the declaration order, and guessing it
+    /// from memory produced a wrong set the runtime would reject outright.
+    #[test]
+    fn state_subobject_types_match_the_header_enum() {
+        // From the `D3D12_STATE_SUBOBJECT_TYPE` enum in `d3d12.h`.
+        assert_eq!(D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG, 0);
+        assert_eq!(D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, 1);
+        assert_eq!(D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, 5);
+        assert_eq!(D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, 9);
+        assert_eq!(D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, 10);
+        assert_eq!(D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, 11);
+        assert_eq!(SHADER_IDENTIFIER_SIZE, 32);
+    }
+
+    /// The dispatch description is handed straight to `DispatchRays`, so its
+    /// layout has to be the C one.
+    #[test]
+    fn the_dispatch_description_is_the_c_layout() {
+        let word = std::mem::size_of::<usize>();
+        // RayGenerationShaderRecord: {u64 address, u64 size}
+        assert_eq!(std::mem::size_of::<D3D12_GPU_VIRTUAL_ADDRESS_RANGE>(), 2 * 8);
+        // Each shader table: {u64 address, u64 size, u64 stride}
+        assert_eq!(std::mem::size_of::<D3D12_SHADER_TABLE>(), 3 * 8);
+        // One address range (2 words) and three shader tables (3 words each) is
+        // 88 bytes, then Width/Height/Depth is 12 more. The struct is 8-byte
+        // aligned, so the C compiler pads it to 104 and Rust must agree — a
+        // mismatch here would hand `DispatchRays` a truncated description.
+        assert_eq!(
+            std::mem::size_of::<D3D12_DISPATCH_RAYS_DESC>(),
+            104,
+            "88 bytes of tables plus 3 UINTs, padded to the struct's 8-byte alignment"
+        );
+        assert_eq!(104 % word, 0);
     }
 
     #[test]
