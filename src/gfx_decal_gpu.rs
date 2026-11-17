@@ -264,12 +264,14 @@ impl Draw {
     }
 
     pub fn draw_quads<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        if self.quads.is_empty() { return; }
+        if self.quads.is_empty() {
+            return; 
+        }
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint16);
         let mut last_key = None;
         for quad in &self.quads {
             if last_key != Some(quad.key) {
-                    pass.set_pipeline(&self.pipelines[&quad.key]);
+                pass.set_pipeline(&self.pipelines[&quad.key]);
                 last_key = Some(quad.key);
             }
             pass.set_bind_group(0, &quad.binding, &[]);
