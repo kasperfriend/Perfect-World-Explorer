@@ -41,6 +41,9 @@ pub fn deform(
         if !m.is_finite() {
             return Err("nonfinite skin matrix");
         }
+        if weights[i] == 0.0 {
+            continue;
+        }
         p += (*m * Vec4::from((Vec3::from_array(position), 1.))).truncate() * weights[i];
         n += (*m * Vec4::from((Vec3::from_array(normal), 0.))).truncate() * weights[i];
     }
@@ -60,7 +63,23 @@ pub fn deform_rigid(
     normal: [f32; 3],
     matrix: Mat4,
 ) -> Result<PosedVertex, &'static str> {
-    deform(position, normal, [1., 0., 0.], [0; 4], &[matrix])
+    if !position.iter().chain(normal.iter()).all(|v| v.is_finite()) {
+        return Err("nonfinite skin vertex");
+    }
+    if !matrix.is_finite() {
+        return Err("nonfinite skin matrix");
+    }
+    let p = matrix.transform_point3(Vec3::from_array(position));
+    let n = matrix
+        .transform_vector3(Vec3::from_array(normal))
+        .normalize_or_zero();
+    if !p.is_finite() || !n.is_finite() {
+        return Err("nonfinite deformed vertex");
+    }
+    Ok(PosedVertex {
+        position: p.to_array(),
+        normal: n.to_array(),
+    })
 }
 
 pub const WGSL: &str = r#"
