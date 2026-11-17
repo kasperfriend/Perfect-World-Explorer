@@ -1289,11 +1289,15 @@ mod tests {
     /// in pixels, y down) with the y flip that makes it so.
     #[test]
     fn the_shader_carries_the_motion_entry_point() {
-        assert_eq!(WGSL.matches("@fragment fn cover(").count(), 1, "one entry");
-        assert_eq!(WGSL.matches("<0.5 {discard;}").count(), 1, "one gate");
+        // One entry point, one opacity gate, one convention. The shared pass
+        // reads `current + motion = previous` in pixels with y down, and nothing
+        // in this shader may drift from that: a sign flip slides every sheet the
+        // wrong way at twice the camera's speed.
+        assert!(WGSL.matches("@fragment fn cover(").count() == 1);
+        assert!(WGSL.matches("<0.5 {discard;}").count() == 1);
         let motion =
             "let motion=(prev.xy/prev.w-cur.xy/cur.w)*vec2<f32>(0.5*p.mv_size.x,-0.5*p.mv_size.y);";
-        assert_eq!(WGSL.matches(motion).count(), 1, "one convention");
+        assert!(WGSL.matches(motion).count() == 1);
     }
 
     /// The object-motion pixel and the depth at (0,0) of a 4x4 target after a
@@ -1505,10 +1509,12 @@ mod tests {
             &[quad("a.png", 5, 6, 0, true, [1., 1., 1., 1.])],
             glam::Mat4::IDENTITY.to_cols_array_2d(),
         );
-        assert_eq!([still[4], still[5]], [0x00, 0x3c], "opaque sheet owns the pixel");
-        assert_eq!(&still[..4], &[0, 0, 0, 0][..], "still sheet carries no motion");
-        assert_eq!(&still[6..], &[0, 0][..], "and nothing in the padding");
-        assert_eq!(depth, 0.0, "the motion pass writes no depth");
+        // Owned, and the vector is zero because the camera has not moved.
+        assert!([still[4], still[5]] == [0x00, 0x3c]);
+        assert!(still[..4].iter().all(|byte| *byte == 0));
+        assert!(still[6..].iter().all(|byte| *byte == 0));
+        // And the pass recorded no surface: the depth buffer is still the clear.
+        assert!(depth == 0.0);
         // Frame two: the same sheet, and a camera that moved one world unit along
         // x. The vector is previous minus current in pixels, so it is non-zero and
         // the sheet still owns the pixel.
@@ -1518,12 +1524,9 @@ mod tests {
             &[quad("a.png", 5, 6, 0, true, [1., 1., 1., 1.])],
             glam::Mat4::from_translation(glam::Vec3::new(1., 0., 0.)).to_cols_array_2d(),
         );
-        assert_eq!([moved[4], moved[5]], [0x00, 0x3c], "moved sheet owns the pixel");
-        assert!(
-            moved[..4].iter().any(|byte| *byte != 0),
-            "a moved sheet carries its own motion, got {moved:?}"
-        );
-        assert_eq!(depth, 0.0, "the motion pass writes no depth");
+        assert!([moved[4], moved[5]] == [0x00, 0x3c]);
+        assert!(moved[..4].iter().any(|byte| *byte != 0));
+        assert!(depth == 0.0);
         // Frame three: the same sheet at 20% opacity does not dominate the pixel,
         // so it claims nothing at all -- no vector and no surface.
         let (faint, depth) = covered_motion(
@@ -1532,8 +1535,8 @@ mod tests {
             &[quad("a.png", 5, 6, 0, true, [1., 1., 1., 0.2])],
             glam::Mat4::IDENTITY.to_cols_array_2d(),
         );
-        assert_eq!(faint, [0; 8], "faint sheet claims nothing");
-        assert_eq!(depth, 0.0, "and writes no depth either");
+        assert!(faint.iter().all(|byte| *byte == 0));
+        assert!(depth == 0.0);
     }
 
     #[test]
