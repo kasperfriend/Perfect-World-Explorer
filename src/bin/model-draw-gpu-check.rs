@@ -93,7 +93,9 @@ impl TestDraw for world_models_gpu::World {
         true
     }
     fn submit<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
-        self.draw(pass);
+        // No coverage: this check renders one frame to prove the pipeline and
+        // the draw order, and has no motion-vector pass to feed.
+        self.draw(pass, false);
     }
 }
 fn white_dds() -> Vec<u8> {
