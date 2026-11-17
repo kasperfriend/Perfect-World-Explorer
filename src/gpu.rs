@@ -4069,8 +4069,7 @@ impl Renderer {
                 water_view_scissor(matrix, w, h, batch.bounds, plane, water_margin);
             if let Some([_, _, sw, sh]) = refraction_scissor {
                 self.water_scissored += 1;
-                self.water_scissor_cover +=
-                    (sw as f32 * sh as f32) / (w as f32 * h as f32);
+                self.water_scissor_cover += (sw as f32 * sh as f32) / (w as f32 * h as f32);
             }
             // A previous plane's reflection left its mirrored records in the
             // buffer; the refraction passes below draw through the main matrix.
@@ -7958,20 +7957,29 @@ mod water_scissor_tests {
         let matrix = camera(Vec3::new(0., 30., 0.), Vec3::new(0., -0.5, -0.866));
         let bounds = [-40., 40., -160., -60.];
         let margin = 0.12;
-        let rect =
-            water_view_scissor(matrix, W, H, bounds, 0., margin).expect("a small pond is scissored");
+        let rect = water_view_scissor(matrix, W, H, bounds, 0., margin)
+            .expect("a small pond is scissored");
         let [x, y, w, h] = rect;
         assert!(
             (w * h) as f32 <= (W * H) as f32 * 0.5,
             "the pond is a third of the view, not most of it: {rect:?}"
         );
-        assert!(x + w <= W && y + h <= H, "the rectangle stays inside the target");
+        assert!(
+            x + w <= W && y + h <= H,
+            "the rectangle stays inside the target"
+        );
 
         let corners = corners(matrix, bounds, 0.);
         let min_x = corners.iter().map(|c| c[0]).fold(f32::INFINITY, f32::min);
-        let max_x = corners.iter().map(|c| c[0]).fold(f32::NEG_INFINITY, f32::max);
+        let max_x = corners
+            .iter()
+            .map(|c| c[0])
+            .fold(f32::NEG_INFINITY, f32::max);
         let min_y = corners.iter().map(|c| c[1]).fold(f32::INFINITY, f32::min);
-        let max_y = corners.iter().map(|c| c[1]).fold(f32::NEG_INFINITY, f32::max);
+        let max_y = corners
+            .iter()
+            .map(|c| c[1])
+            .fold(f32::NEG_INFINITY, f32::max);
         // Every side must reach the sampling margin past the pond, or be clamped
         // by the target's own edge.
         let margin_x = W as f32 * margin;
@@ -7979,12 +7987,18 @@ mod water_scissor_tests {
         // A pixel of slack each way for the floor/ceil that turns the rectangle
         // outwards.
         let slack = 2.;
-        assert!(x as f32 <= min_x - margin_x + slack || x == 0, "left margin short");
+        assert!(
+            x as f32 <= min_x - margin_x + slack || x == 0,
+            "left margin short"
+        );
         assert!(
             (x + w) as f32 >= max_x + margin_x - slack || x + w == W,
             "right margin short"
         );
-        assert!(y as f32 <= min_y - margin_y + slack || y == 0, "top margin short");
+        assert!(
+            y as f32 <= min_y - margin_y + slack || y == 0,
+            "top margin short"
+        );
         assert!(
             (y + h) as f32 >= max_y + margin_y - slack || y + h == H,
             "bottom margin short"
