@@ -1252,7 +1252,7 @@ DLSS-G parameter type.
   in front of water with no hole in it, and no sliding of the glow against the wall
   behind it as the camera translates.
 
-## B-27 — DLSS evaluates fail with `FAIL_InvalidParameter` (open)
+## B-27 — DLSS evaluates fail with `FAIL_InvalidParameter` (cause found, fix awaiting a run)
 
 - **Step:** enable DLSS Super Resolution in the viewer.
 - **Symptom:** `DLSS failed, rendering at native resolution instead:
@@ -1315,66 +1315,47 @@ DLSS-G parameter type.
   documents the capability map as usable "in the same ways" but recommends the
   allocator, and the allocator is what NVIDIA's programming guide's own
   integration sequence shows (`docs/dlss-fidelity.md`).
-- **Session-7 measured the map instead of the slot, and the map lost.** With the
-  complete block in place, all three pointer slots still answered
-  `FAIL_InvalidParameter` — and the `Get` read-back is the new fact:
+- **The cause, measured in session-8, and it was the slot table.** The matrix
+  wrote one real handle through *all eight* declared `Set` overloads and read it
+  back through four readers, and one distinctive integer through the same eight.
+  Every line agrees with a vtable order that is the **reverse** of
+  `nvsdk_ngx_params.h:55-73`:
 
   ```text
-  Set 7: Color reads back as slot 14 0x53da7157, slot 13 0x427b4e2adab10000,
-                    slot 15 0x1b4e2adab10
+  Set 0 void*   1 ID3D12Resource*  2 ID3D11Resource*  3 int  4 uint
+      5 double  6 float            7 unsigned long long      [Reset last]
+  Get 8 void**  9 ID3D12Resource** 10 ID3D11Resource** 11 int* 12 uint*
+      13 double* 14 float*         15 unsigned long long*
   ```
 
-  `0x1b4e2adab10` is the resource that was written; `0x427b4e2adab10000` is that
-  same number converted to `double` and `0x53da7157` is it converted to `float`.
-  So this core's readers at 13/14 *convert* a stored value numerically rather
-  than hand a resource back, and the resource is only recoverable through the
-  reader at 15. A `Get(…, ID3D12Resource **)` that the feature performs cannot
-  be answered by a numeric conversion, which is exactly "could not find Color
-  parameter".
+  The evidence, in the log's own numbers:
 
-  Two other attempts show the same shape from another side: after `Set 6` (the
-  declared `ID3D12Resource *` overload) nothing came back at all — slot 15 read
-  `0x8000000000000000` — while after `Set 7` the pointer came back intact
-  through slot 15. The declared order therefore does not describe this core's
-  map, and the ladder's three candidates were three different *types* rather
-  than three readers of the same entry.
+  - `Set 5` and `Set 6` store what looks like a `double` and a `float`: the
+    value arriving in a general-purpose register is not what they read, so the
+    read-backs come out as large doubles and `float` overflows (`0x7f800000`).
+  - `Set 3`/`Set 4` store a 32-bit integer: readers 11/12 return exactly its low
+    half, readers 13/14 return it converted to `double` and `float`.
+  - `Set 1` stores a **resource**: the numeric readers then refuse it with
+    `0xbad00010 FAIL_UnsupportedParameter`, while the pointer reader at 8 hands
+    it back.
+  - `Set 7` stores `unsigned long long`, which the reader at 15 returns intact.
 
-- **What the next run measures, and it decides the blocker.** Instead of
-  guessing again, `resource_slot_matrix` writes one **real** resource pointer
-  through *all eight* declared `Set` overloads and reads it back through four
-  readers (`GetD3D12`, `GetD3D11`, `GetVoidPointer`, `GetULL`), logging which
-  combination returns the address unchanged:
+  So the four resources were being written through `Set(float)` (slot 6, the
+  declaration's `ID3D12Resource *`), `Set(double)` (slot 5) and `Set(unsigned
+  long long)` (slot 7) — three *numeric* overloads — and the feature, which
+  reads `Color` at slot 9, never saw a resource in the map at all. That is
+  `could not find Color parameter`, and it was this viewer's slot table every
+  time, not the driver. The integer round-trip that made the map look healthy
+  was slot 3 (`Set(int)`) against slot 11 (`Get(int *)`), a genuine pair — but a
+  different pair from the one the header describes.
 
-  ```text
-  [DLSS] resource slot matrix: Color = 0x1b4e2adab10, 8 declared Set overloads against 4 readers
-  [DLSS]   Set 0: d3d12 ->0x…, d3d11 ->0x…, void ->0x…, ull ->0x…
-  [DLSS]   …
-  [DLSS]   Set 6: d3d12 keeps it, d3d11 untouched, void ->0x…, ull untouched
-  ```
+- **The fix.** [`NgxParamVTable`] and the `SLOT_*` table in `src/dlss/params.rs`
+  now carry the measured order, both for NGX's own map and for the table the
+  viewer supplies, so `Set(ID3D12Resource *)` goes to slot 1 and
+  `Get(ID3D12Resource **)` reads slot 9 everywhere: the four evaluate resources,
+  the optional-null entries, `get_u32` (`Get(uint *)`, slot 12) and the
+  optimal-settings probe (`Get(void **)`, slot 8). The runtime matrix stays in
+  as a guard and now logs the pair it measured, so a core with a different order
+  again is one line away from being visible. A unit test pins the whole table and
+  the pairs the two halves have to agree on.
 
-  A null pointer cannot answer this — a null stored as a number and a null
-  stored as a resource both read back as zero, which is why the null probe
-  reported a working pair in a session where nothing worked. The ladder now
-  starts at the slot the matrix names instead of at the declared one.
-
-  If the matrix reports **no** pair that keeps a resource, then the map cannot
-  carry resources for this feature at all and the remaining explanation is a
-  generation mismatch between the app-side `nvngx_dlss.dll` (310.9.16) and the
-  driver's NGX core (`_nvngx.dll` 32.0.16.2114) — the core's own readers
-  disagree with the header the feature was compiled against. That is settled by
-  the same log line, not by another guess, and its remedy is a matching pair
-  (a DLSS build from the core's generation, or a driver update), not more
-  parameter plumbing.
-
-- **What a run has to settle.** One of three outcomes, each with its own next
-  step:
-  1. `[DLSS] first evaluate OK` and the upscaler stops reporting "NOT running"
-     — the defect was the incomplete block, and B-27 closes.
-  2. A rejection whose complaint names a *different* key than `Color` — the slot
-     is right, and the named key is the next thing to fix (the line prints it).
-  3. A rejection that still names `Color`, with `Color` read back as an address
-     through the measured slots — then the map holds the pointer and the feature
-     does not read it: the next candidates are the resource *states* and flags
-     (`ALLOW_UNORDERED_ACCESS` on the output, `NON_PIXEL_SHADER_RESOURCE` on the
-     inputs, both already logged at creation) and the resource's own identity
-     (the four handles are logged with their addresses on the first frame).

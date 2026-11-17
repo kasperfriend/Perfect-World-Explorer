@@ -64,26 +64,43 @@ enum Value {
     Ptr(*mut c_void),
 }
 
-/// The vtable NGX sees. Field order is the declaration order in
-/// `nvsdk_ngx_params.h`; it must not be reordered.
+/// The vtable NGX sees.
+///
+/// The order is **measured, not declared**. `nvsdk_ngx_params.h:55-73` lists the
+/// overloads as eight `Set`s (u64, float, double, uint, int, D3D11, D3D12,
+/// void*), then eight `Get`s in the same order, then `Reset` — and this table
+/// used to follow it. A real driver core (`_nvngx.dll` 32.0.16.2114) implements
+/// the *reverse* of that list, which a session measured overload by overload
+/// (`docs/blockers.md` B-27):
+///
+/// ```text
+/// Set 0 void*   1 D3D12*  2 D3D11*  3 int  4 uint  5 double  6 float  7 u64   [16 Reset]
+/// Get 8 void**  9 D3D12** 10 D3D11** 11 int* 12 uint* 13 double* 14 float* 15 u64*
+/// ```
+///
+/// Every pointer written at slot 6 (which the declaration calls `Set(ID3D12Resource
+/// *)`) was therefore stored as a **float**, the `Get` read-backs at 13/14 came
+/// back as numeric conversions, and the feature — which reads at slot 9 — never
+/// found `Color`. The field order below is that measured order, so both NGX's
+/// map and this one answer the same overloads at the same indices.
 #[repr(C)]
 struct NgxParamVTable {
-    set_u64: unsafe extern "C" fn(*mut Owned, *const c_char, u64),
-    set_f32: unsafe extern "C" fn(*mut Owned, *const c_char, f32),
-    set_f64: unsafe extern "C" fn(*mut Owned, *const c_char, f64),
-    set_u32: unsafe extern "C" fn(*mut Owned, *const c_char, u32),
-    set_i32: unsafe extern "C" fn(*mut Owned, *const c_char, i32),
-    set_d3d11: unsafe extern "C" fn(*mut Owned, *const c_char, *mut c_void),
-    set_d3d12: unsafe extern "C" fn(*mut Owned, *const c_char, *mut c_void),
     set_void: unsafe extern "C" fn(*mut Owned, *const c_char, *mut c_void),
-    get_u64: unsafe extern "C" fn(*mut Owned, *const c_char, *mut u64) -> u32,
-    get_f32: unsafe extern "C" fn(*mut Owned, *const c_char, *mut f32) -> u32,
-    get_f64: unsafe extern "C" fn(*mut Owned, *const c_char, *mut f64) -> u32,
-    get_u32: unsafe extern "C" fn(*mut Owned, *const c_char, *mut u32) -> u32,
-    get_i32: unsafe extern "C" fn(*mut Owned, *const c_char, *mut i32) -> u32,
-    get_d3d11: unsafe extern "C" fn(*mut Owned, *const c_char, *mut *mut c_void) -> u32,
-    get_d3d12: unsafe extern "C" fn(*mut Owned, *const c_char, *mut *mut c_void) -> u32,
+    set_d3d12: unsafe extern "C" fn(*mut Owned, *const c_char, *mut c_void),
+    set_d3d11: unsafe extern "C" fn(*mut Owned, *const c_char, *mut c_void),
+    set_i32: unsafe extern "C" fn(*mut Owned, *const c_char, i32),
+    set_u32: unsafe extern "C" fn(*mut Owned, *const c_char, u32),
+    set_f64: unsafe extern "C" fn(*mut Owned, *const c_char, f64),
+    set_f32: unsafe extern "C" fn(*mut Owned, *const c_char, f32),
+    set_u64: unsafe extern "C" fn(*mut Owned, *const c_char, u64),
     get_void: unsafe extern "C" fn(*mut Owned, *const c_char, *mut *mut c_void) -> u32,
+    get_d3d12: unsafe extern "C" fn(*mut Owned, *const c_char, *mut *mut c_void) -> u32,
+    get_d3d11: unsafe extern "C" fn(*mut Owned, *const c_char, *mut *mut c_void) -> u32,
+    get_i32: unsafe extern "C" fn(*mut Owned, *const c_char, *mut i32) -> u32,
+    get_u32: unsafe extern "C" fn(*mut Owned, *const c_char, *mut u32) -> u32,
+    get_f64: unsafe extern "C" fn(*mut Owned, *const c_char, *mut f64) -> u32,
+    get_f32: unsafe extern "C" fn(*mut Owned, *const c_char, *mut f32) -> u32,
+    get_u64: unsafe extern "C" fn(*mut Owned, *const c_char, *mut u64) -> u32,
     reset: unsafe extern "C" fn(*mut Owned),
 }
 
@@ -107,22 +124,27 @@ static VTABLE: NgxParamVTable = NgxParamVTable {
     reset: vtable_reset,
 };
 
-// `NVSDK_NGX_Parameter` vtable slots, in declaration order
-// (`nvsdk_ngx_params.h:55-73`): eight `Set` overloads, eight `Get` overloads,
-// then `Reset`. NGX's own map is a C++ object with no virtual destructor and no
-// virtual bases, so its vtable pointer is at offset 0 and these indices address
-// the same overloads [`NgxParamVTable`] implements.
-const SLOT_SET_F32: usize = 1;
-const SLOT_SET_U32: usize = 3;
-const SLOT_SET_I32: usize = 4;
-const SLOT_SET_D3D11: usize = 5;
-const SLOT_SET_D3D12: usize = 6;
-const SLOT_SET_VOID: usize = 7;
-const SLOT_GET_ULL: usize = 8;
-const SLOT_GET_U32: usize = 11;
-const SLOT_GET_D3D11: usize = 13;
-const SLOT_GET_D3D12: usize = 14;
-const SLOT_GET_VOID: usize = 15;
+// `NVSDK_NGX_Parameter` vtable slots **as this core implements them**, which is
+// the reverse of the declaration in `nvsdk_ngx_params.h:55-73` (see
+// [`NgxParamVTable`] for the measurement). The comment on each line is the
+// overload that slot actually is on the driver core, and the site that verified
+// it is in `docs/blockers.md` B-27.
+const SLOT_SET_VOID: usize = 0;
+const SLOT_SET_D3D12: usize = 1;
+const SLOT_SET_D3D11: usize = 2;
+const SLOT_SET_I32: usize = 3;
+const SLOT_SET_U32: usize = 4;
+const SLOT_SET_F64: usize = 5;
+const SLOT_SET_F32: usize = 6;
+const SLOT_SET_U64: usize = 7;
+const SLOT_GET_VOID: usize = 8;
+const SLOT_GET_D3D12: usize = 9;
+const SLOT_GET_D3D11: usize = 10;
+const SLOT_GET_I32: usize = 11;
+const SLOT_GET_U32: usize = 12;
+const SLOT_GET_F64: usize = 13;
+const SLOT_GET_F32: usize = 14;
+const SLOT_GET_U64: usize = 15;
 
 /// The `Set` slots that can carry a resource pointer, in the order the
 /// declaration puts them.
@@ -432,7 +454,7 @@ fn pointer_slot_matrix(
             ("d3d12", SLOT_GET_D3D12),
             ("d3d11", SLOT_GET_D3D11),
             ("void", SLOT_GET_VOID),
-            ("ull", SLOT_GET_ULL),
+            ("u64", SLOT_GET_U64),
         ] {
             let Some(get) = (unsafe { vtable_getter::<GetPtr>(object, get_slot) }) else {
                 parts.push(format!("{label} absent"));
@@ -481,14 +503,14 @@ fn numeric_slot_matrix(object: *mut c_void) -> Vec<String> {
         return Vec::new();
     };
     const READERS: [(usize, &str); 8] = [
-        (8, "ull"),
-        (9, "f32"),
-        (10, "f64"),
-        (11, "ui"),
-        (12, "i32"),
-        (13, "d3d11"),
-        (14, "d3d12"),
-        (15, "void"),
+        (SLOT_GET_VOID, "void"),
+        (SLOT_GET_D3D12, "d3d12"),
+        (SLOT_GET_D3D11, "d3d11"),
+        (SLOT_GET_I32, "i32"),
+        (SLOT_GET_U32, "ui"),
+        (SLOT_GET_F64, "f64"),
+        (SLOT_GET_F32, "f32"),
+        (SLOT_GET_U64, "u64"),
     ];
     let mut lines = Vec::with_capacity(SLOT_SET_VOID + 1);
     for set_slot in 0..=SLOT_SET_VOID {
@@ -1271,6 +1293,44 @@ mod tests {
         params.set_d3d12_resource("Output", 0x5678 as *mut c_void);
         let stored = unsafe { (*own).values.get("Output").copied() };
         assert!(matches!(stored, Some(Value::Ptr(ptr)) if ptr as usize == 0x5678));
+    }
+
+    /// The slot table is the *measured* one, not the one the public header
+    /// prints, and this pins it: swapping any two of these puts a `Set` where a
+    /// reader looks for it and the evaluate fails with a message about a key the
+    /// viewer never stopped writing (`docs/blockers.md` B-27).
+    #[test]
+    fn the_slot_table_is_the_one_this_core_implements() {
+        assert_eq!(
+            [
+                SLOT_SET_VOID,
+                SLOT_SET_D3D12,
+                SLOT_SET_D3D11,
+                SLOT_SET_I32,
+                SLOT_SET_U32,
+                SLOT_SET_F64,
+                SLOT_SET_F32,
+                SLOT_SET_U64,
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        assert_eq!(
+            [
+                SLOT_GET_VOID,
+                SLOT_GET_D3D12,
+                SLOT_GET_D3D11,
+                SLOT_GET_I32,
+                SLOT_GET_U32,
+                SLOT_GET_F64,
+                SLOT_GET_F32,
+                SLOT_GET_U64,
+            ],
+            [8, 9, 10, 11, 12, 13, 14, 15]
+        );
+        // The pairs the two halves of the API have to agree on.
+        assert_eq!(RESOURCE_SET_SLOT_CANDIDATES[0], SLOT_SET_D3D12);
+        assert_eq!(POINTER_GET_SLOTS[0], SLOT_GET_D3D12);
+        assert_eq!(POINTER_GET_SLOTS.len(), POINTER_SET_SLOTS.len());
     }
 
     /// The ladder starts with the slot the map's own pointer round-trip
