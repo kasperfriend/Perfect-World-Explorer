@@ -2236,16 +2236,6 @@ impl Renderer {
         let daylight = crate::environment::daylight(camera.time_of_day);
         let angle = (camera.time_of_day - 6.0) * std::f32::consts::PI / 12.0;
         let twilight = (1. - ((angle.sin().abs()) / 0.35).clamp(0., 1.)) * daylight;
-        let sun = [
-            angle.cos() * 0.8,
-            angle.sin().max(0.05),
-            0.46,
-            if camera.terrain_lightmaps {
-                daylight
-            } else {
-                -1.
-            },
-        ];
         let light = [
             0.17 + 0.38 * daylight,
             0.07 + 0.38 * daylight,

@@ -92,10 +92,16 @@ impl Device {
     pub fn create_fence(&self, _initial: u64) -> D3DResult<Fence> {
         (Fence::null(), 0)
     }
-    pub fn CheckFeatureSupport(&self, _feature: u32, _data: *mut c_void, _size: u32) -> HRESULT {
+    /// `unsafe` on the real `winapi` declaration; the shim matches it.
+    pub unsafe fn CheckFeatureSupport(
+        &self,
+        _feature: u32,
+        _data: *mut c_void,
+        _size: u32,
+    ) -> HRESULT {
         0
     }
-    pub fn CreateCommittedResource(
+    pub unsafe fn CreateCommittedResource(
         &self,
         _heap: &raw::D3D12_HEAP_PROPERTIES,
         _heap_flags: u32,
@@ -116,11 +122,19 @@ impl CommandQueue {
 }
 
 impl Resource {
+    /// Safe wrapper in the real crate (`Resource::gpu_virtual_address`).
     pub fn gpu_virtual_address(&self) -> u64 {
         0
     }
-    pub fn Map(&self, _subresource: u32, _range: *const c_void, _out: *mut *mut c_void) -> HRESULT {
+    /// Raw `ID3D12Resource::Map`, `unsafe` on the real declaration.
+    pub unsafe fn Map(
+        &self,
+        _subresource: u32,
+        _range: *const c_void,
+        _out: *mut *mut c_void,
+    ) -> HRESULT {
         0
     }
-    pub fn Unmap(&self, _subresource: u32, _range: *const c_void) {}
+    /// Raw `ID3D12Resource::Unmap`, `unsafe` on the real declaration.
+    pub unsafe fn Unmap(&self, _subresource: u32, _range: *const c_void) {}
 }

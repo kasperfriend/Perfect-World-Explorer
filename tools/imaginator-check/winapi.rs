@@ -6,6 +6,12 @@
 //! The real crate (and the real `d3d12` wrapper) is what ships.
 #![allow(non_snake_case, non_camel_case_types, dead_code, unused_imports)]
 
+/// `winapi::Interface`: the trait `uuidof()` comes from. Kept because code that
+/// forgets `use winapi::Interface` must fail here, not only on Windows.
+pub trait Interface {
+    fn uuidof() -> crate::shared::guiddef::GUID;
+}
+
 pub mod shared {
     pub mod minwindef {
         pub type UINT = u32;
@@ -29,6 +35,11 @@ pub mod shared {
             pub Data3: u16,
             pub Data4: [u8; 8],
         }
+    }
+    pub mod dxgiformat {
+        /// `DXGI_FORMAT` is an `ENUM!` alias in the real crate.
+        pub type DXGI_FORMAT = u32;
+        pub const DXGI_FORMAT_UNKNOWN: DXGI_FORMAT = 0;
     }
     pub mod dxgitype {
         /// `DXGI_SAMPLE_DESC` lives here in the real crate and is what
@@ -63,11 +74,14 @@ pub mod um {
         use crate::shared::{guiddef::GUID, winerror::HRESULT};
         use std::ffi::c_void;
 
-        pub use crate::shared::dxgitype::DXGI_SAMPLE_DESC;
+        // `DXGI_FORMAT`/`DXGI_SAMPLE_DESC` are *private* `use`s in the real
+        // module, so callers must reach them via `shared::dxgiformat` /
+        // `shared::dxgitype`. Nothing is re-exported here on purpose.
+        use crate::shared::dxgiformat::DXGI_FORMAT;
+        use crate::shared::dxgitype::DXGI_SAMPLE_DESC;
 
         pub type D3D12_GPU_VIRTUAL_ADDRESS = u64;
         pub type D3D12_FEATURE = u32;
-        pub type DXGI_FORMAT = u32;
         pub type D3D12_RESOURCE_STATES = u32;
         pub type D3D12_RESOURCE_FLAGS = u32;
         pub type D3D12_RESOURCE_BARRIER_TYPE = u32;
@@ -92,7 +106,6 @@ pub mod um {
         pub const D3D12_RESOURCE_BARRIER_TYPE_TRANSITION: D3D12_RESOURCE_BARRIER_TYPE = 0;
         pub const D3D12_RESOURCE_BARRIER_FLAG_NONE: D3D12_RESOURCE_BARRIER_FLAGS = 0;
         pub const D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES: u32 = 0xffff_ffff;
-        pub const DXGI_FORMAT_UNKNOWN: DXGI_FORMAT = 0;
 
         #[repr(C)]
         pub struct D3D12_RANGE {
@@ -117,7 +130,7 @@ pub mod um {
             pub DepthOrArraySize: u16,
             pub MipLevels: u16,
             pub Format: DXGI_FORMAT,
-            pub SampleDesc: crate::shared::dxgitype::DXGI_SAMPLE_DESC,
+            pub SampleDesc: DXGI_SAMPLE_DESC,
             pub Layout: D3D12_TEXTURE_LAYOUT,
             pub Flags: D3D12_RESOURCE_FLAGS,
         }
@@ -135,7 +148,9 @@ pub mod um {
             _pad: [u8; 32],
         }
         impl D3D12_RESOURCE_BARRIER_u {
-            pub fn Transition_mut(&mut self) -> &mut D3D12_RESOURCE_TRANSITION_BARRIER {
+            /// `unsafe` in the real `UNION!` macro: the caller asserts which
+            /// member is live.
+            pub unsafe fn Transition_mut(&mut self) -> &mut D3D12_RESOURCE_TRANSITION_BARRIER {
                 unsafe { &mut self.Transition }
             }
         }
@@ -185,8 +200,11 @@ pub mod um {
         pub struct ID3D12Resource {
             pub lpVtbl: *mut c_void,
         }
-        impl ID3D12Resource {
-            pub fn uuidof() -> GUID {
+        // `uuidof` is `winapi::Interface`'s method, not an inherent one; the
+        // shim keeps that shape so a missing `use winapi::Interface` fails here
+        // exactly as it fails on Windows.
+        impl crate::Interface for ID3D12Resource {
+            fn uuidof() -> GUID {
                 GUID {
                     Data1: 0x696442be,
                     Data2: 0xa72e,
@@ -204,22 +222,22 @@ pub mod um {
             pub lpVtbl: *mut D3D12_GRAPHICS_COMMAND_LIST_VTBL,
         }
         impl ID3D12GraphicsCommandList {
-            pub fn Reset(
+            pub unsafe fn Reset(
                 &self,
                 allocator: *mut ID3D12CommandAllocator,
                 pso: *mut ID3D12PipelineState,
             ) -> HRESULT {
                 unsafe { ((*self.lpVtbl).Reset)(self as *const _ as *mut _, allocator, pso) }
             }
-            pub fn Close(&self) -> HRESULT {
+            pub unsafe fn Close(&self) -> HRESULT {
                 unsafe { ((*self.lpVtbl).Close)(self as *const _ as *mut _) }
             }
-            pub fn ResourceBarrier(&self, count: u32, barriers: *const D3D12_RESOURCE_BARRIER) {
+            pub unsafe fn ResourceBarrier(&self, count: u32, barriers: *const D3D12_RESOURCE_BARRIER) {
                 unsafe {
                     ((*self.lpVtbl).ResourceBarrier)(self as *const _ as *mut _, count, barriers)
                 }
             }
-            pub fn CopyBufferRegion(
+            pub unsafe fn CopyBufferRegion(
                 &self,
                 dst: *mut ID3D12Resource,
                 dst_offset: u64,
@@ -244,7 +262,7 @@ pub mod um {
             pub lpVtbl: *mut D3D12_QUEUE_VTBL,
         }
         impl ID3D12CommandQueue {
-            pub fn ExecuteCommandLists(&self, count: u32, lists: *const *mut ID3D12CommandList) {
+            pub unsafe fn ExecuteCommandLists(&self, count: u32, lists: *const *mut ID3D12CommandList) {
                 unsafe {
                     ((*self.lpVtbl).ExecuteCommandLists)(self as *const _ as *mut _, count, lists)
                 }
@@ -267,7 +285,7 @@ pub mod um {
             pub lpVtbl: *mut D3D12_FENCE_VTBL,
         }
         impl ID3D12Fence {
-            pub fn GetCompletedValue(&self) -> u64 {
+            pub unsafe fn GetCompletedValue(&self) -> u64 {
                 unsafe { ((*self.lpVtbl).GetCompletedValue)(self as *const _ as *mut _) }
             }
         }

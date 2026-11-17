@@ -68,7 +68,7 @@ pub mod support {
     }
 
     impl HardwareTracer {
-        pub fn probe(_device: &crate::wgpu::Device) -> Self {
+        pub fn probe(_device: &wgpu::Device) -> Self {
             Self {
                 status: HardwareStatus::Unsupported(
                     "DXR needs the D3D12 backend, which only exists on Windows".into(),

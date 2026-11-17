@@ -32,9 +32,14 @@ use crate::imaginator::bvh::{Bvh, SharedScene};
 use d3d12::{CmdListType, CommandQueue, Device, Resource};
 use std::ffi::c_void;
 use std::sync::Arc;
+use winapi::shared::dxgiformat::DXGI_FORMAT_UNKNOWN;
+use winapi::shared::dxgitype::DXGI_SAMPLE_DESC;
 use winapi::shared::guiddef::GUID;
 use winapi::shared::winerror::SUCCEEDED;
 use winapi::um::d3d12 as win;
+// `ID3D12Resource::uuidof()` is a method of `winapi::Interface`, not an inherent
+// one, exactly as `fsr::imp` imports it for its own `CreateCommittedResource`.
+use winapi::Interface;
 
 /// Bytes per triangle record the BLAS is built from: three `f32x3` positions.
 pub const GEOMETRY_STRIDE: u64 = 36;
@@ -149,14 +154,16 @@ impl HardwareTracer {
     fn probe_raw(&mut self) {
         // 1. The tier. `CheckFeatureSupport` is a plain `ID3D12Device` member,
         //    so `winapi`'s own declaration is used.
-        // `CheckFeatureSupport` is a safe wrapper in `winapi`: it forwards to the
-        // vtable but takes ordinary references, so no `unsafe` rides on this.
         let mut options = sys::D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
-        let hr = self.device.CheckFeatureSupport(
-            sys::FEATURE_D3D12_OPTIONS5 as win::D3D12_FEATURE,
-            &mut options as *mut _ as *mut c_void,
-            std::mem::size_of::<sys::D3D12_FEATURE_DATA_D3D12_OPTIONS5>() as u32,
-        );
+        // SAFETY: `options` is a live, correctly-typed local and the size matches
+        // the feature constant being queried.
+        let hr = unsafe {
+            self.device.CheckFeatureSupport(
+                sys::FEATURE_D3D12_OPTIONS5 as win::D3D12_FEATURE,
+                &mut options as *mut _ as *mut c_void,
+                std::mem::size_of::<sys::D3D12_FEATURE_DATA_D3D12_OPTIONS5>() as u32,
+            )
+        };
         if !SUCCEEDED(hr) {
             self.status = HardwareStatus::Unsupported(format!(
                 "CheckFeatureSupport(D3D12_OPTIONS5) failed (HRESULT 0x{hr:08x}); the driver exposes no ray-tracing tier"
@@ -316,7 +323,7 @@ impl HardwareTracer {
             Flags: sys::GEOMETRY_FLAG_OPAQUE,
             Triangles: sys::D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
                 Transform3x4: 0,
-                IndexFormat: win::DXGI_FORMAT_UNKNOWN,
+                IndexFormat: DXGI_FORMAT_UNKNOWN,
                 VertexFormat: sys::DXGI_FORMAT_R32G32B32_FLOAT,
                 IndexCount: 0,
                 VertexCount: (bvh.triangles.len() * 3) as u32,
@@ -493,8 +500,8 @@ impl HardwareTracer {
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
-            Format: win::DXGI_FORMAT_UNKNOWN,
-            SampleDesc: win::DXGI_SAMPLE_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,
             },
@@ -502,16 +509,20 @@ impl HardwareTracer {
             Flags: win::D3D12_RESOURCE_FLAG_NONE,
         };
         let mut resource: *mut win::ID3D12Resource = std::ptr::null_mut();
-        // Safe wrapper in the `d3d12` crate, exactly as `fsr::imp` calls it.
-        let hr = self.device.CreateCommittedResource(
-            &heap,
-            win::D3D12_HEAP_FLAG_NONE,
-            &desc,
-            win::D3D12_RESOURCE_STATE_COMMON,
-            std::ptr::null(),
-            &win::ID3D12Resource::uuidof(),
-            &mut resource as *mut _ as *mut *mut c_void,
-        );
+        // SAFETY: `heap`/`desc` outlive the call, the IID is `ID3D12Resource`'s and
+        // the out-parameter is a live local of exactly that type. Mirrors
+        // `fsr::imp`'s call.
+        let hr = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                win::D3D12_HEAP_FLAG_NONE,
+                &desc,
+                win::D3D12_RESOURCE_STATE_COMMON,
+                std::ptr::null(),
+                &win::ID3D12Resource::uuidof(),
+                &mut resource as *mut _ as *mut *mut c_void,
+            )
+        };
         if !SUCCEEDED(hr) || resource.is_null() {
             return Err(format!(
                 "CreateCommittedResource({label}, {bytes} bytes) failed (HRESULT 0x{hr:08x})"
@@ -586,7 +597,8 @@ impl HardwareTracer {
         // a load-time event, and the alternative (an event object plus a wait) is
         // more Win32 surface for the same effect.
         let mut spins = 0u64;
-        while fence.GetCompletedValue() < 1 {
+        // SAFETY: `fence` is the live fence this submit signalled.
+        while unsafe { fence.GetCompletedValue() } < 1 {
             std::hint::spin_loop();
             spins += 1;
             if spins > 500_000_000 {
@@ -612,9 +624,10 @@ fn transition_barrier(
     let mut barrier: win::D3D12_RESOURCE_BARRIER = unsafe { std::mem::zeroed() };
     barrier.Type = win::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Flags = win::D3D12_RESOURCE_BARRIER_FLAG_NONE;
-    // The union's accessor is a safe method on a local; writing through it is
-    // ordinary field assignment.
-    let transition = barrier.u.Transition_mut();
+    // SAFETY: `winapi`'s union accessors are `unsafe` because the caller has to
+    // know which member is live. `Type` is set to `TRANSITION` immediately above,
+    // so `Transition` is the active member, and the local is exclusively borrowed.
+    let transition = unsafe { barrier.u.Transition_mut() };
     transition.pResource = resource.as_mut_ptr();
     transition.Subresource = win::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     transition.StateBefore = before;

@@ -460,6 +460,15 @@ jobs:
           $status = $LASTEXITCODE
           if ($status -ne 0) {
             Write-Host "::error::Windows viewer build failed (exit $status); diagnostic tail follows"
+            # The tail alone is not enough: rustc can emit more than 100 lines of
+            # warnings after the first `error[E....]`, and then the actual failure
+            # scrolls out of the window. Print every error line from the whole log
+            # first, then the tail for context.
+            $errors = Select-String -LiteralPath $log -Pattern '^(error|warning: unused|note: )' -Raw
+            if ($errors) {
+              Write-Host "::error::all error lines from the build log:"
+              $errors | ForEach-Object { Write-Host "::error::$_" }
+            }
             Get-Content -LiteralPath $log -Tail 100 | ForEach-Object { Write-Host "::error::$_" }
           }
           exit $status
