@@ -3407,6 +3407,7 @@ impl Renderer {
                 daylight,
                 camera.active_fog(),
                 normal.clip,
+                true,
             );
         }
         self.weather.draw(
@@ -3698,6 +3699,7 @@ impl Renderer {
                         daylight,
                         above_fog,
                         above.clip,
+                        false,
                     );
                 }
                 self.weather.draw(
@@ -3819,6 +3821,7 @@ impl Renderer {
                     daylight,
                     camera.active_fog(),
                     reflected.clip,
+                    false,
                 );
             }
             self.weather.draw(
