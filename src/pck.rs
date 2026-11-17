@@ -60,7 +60,7 @@ pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
         if out.len() != expected {
             return Err(format!(
                 "bad decompressed size: {} != {expected}",
-            out.len()
+                out.len()
             ));
         }
         Ok(out)
@@ -167,7 +167,7 @@ pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
         inflate(&compressed, e.size as usize)
     } else {
         at(f, e.offset as u64, e.compressed as usize)
-    }    
+        }    
 }
 
 /// Read a bounded set of entries from one archive. Large reads are queued
