@@ -35,10 +35,16 @@ impl EcModel {
     /// SMD/base name alone is not a scene action. None means playback failed,
     /// not permission to pick the first action or reinterpret the namespace.
     pub fn scene_action(&self, requested: &str) -> Option<usize> {
-        self.actions
-            .iter()
-            .position(|a| a.name == requested)
-            .or_else(|| self.actions.iter().position(|a| a.name == "休闲"))
+    let mut fallback = None;
+        for (i, a) in self.actions.iter().enumerate() {
+            if a.name == requested {
+                return Some(i);
+            }
+            if fallback.is_none() && a.name == "休闲" {
+                fallback = Some(i);
+            }
+        }
+        fallback
     }
     /// Static-data constructor: 0x6d453f/0x6d4547 set white and speed 1;
     /// 0x6d46b5/0x6d46bc set SRCALPHA/INVSRCALPHA. Raw optional fields
@@ -157,13 +163,17 @@ fn gbk(bytes: &[u8]) -> Result<String, String> {
     }
 }
 pub fn normalize(path: &str) -> String {
-    path.trim()
-        .replace('\\', "/")
-        .split('/')
-        .filter(|x| !x.is_empty())
-        .collect::<Vec<_>>()
-        .join("/")
-        .to_lowercase()
+   let trimmed = path.trim();
+    let mut out = String::with_capacity(trimmed.len());
+    for seg in trimmed.split(['/', '\\']).filter(|s| !s.is_empty()) {
+        if !out.is_empty() {
+            out.push('/');
+        }
+        for c in seg.chars() {
+            out.extend(c.to_lowercase());
+        }
+    }
+    out
 }
 pub fn parse_ecm(bytes: &[u8]) -> Result<EcModel, String> {
     let text = gbk(bytes)?;
@@ -385,10 +395,10 @@ pub fn parse_smd(bytes: &[u8]) -> Result<SkinModel, String> {
     let mut actions = Vec::with_capacity(action_count);
     for _ in 0..action_count {
         let name = r.string()?;
-        let mut joints = Vec::new();
         let (start, end, fps) = if version < 6 {
             let _group = r.i32()?;
             let n = r.count(100000)?;
+            let mut joints = Vec::with_capacity((n as usize).min(1024));
             let _flags = r.i32()?;
             for _ in 0..n {
                 joints.push(JointAction {
