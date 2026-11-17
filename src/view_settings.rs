@@ -1197,7 +1197,10 @@ effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs
         // Each provider keeps the modes it advertises: XeSS has the full
         // ladder (SDK 3.0.2), so Ultra Performance survives…
         let xess = ViewSettings::decode("upscaling=xess\nupscale_quality=ultraperformance\n");
-        assert_eq!(xess.upscale_quality, crate::UpscaleQuality::UltraPerformance);
+        assert_eq!(
+            xess.upscale_quality,
+            crate::UpscaleQuality::UltraPerformance
+        );
         // …and a mode the provider does not have degrades to the nearest ratio
         // it does (DLSS has no Ultra Quality: 1.3x -> Quality's 1.5x).
         let dlss = ViewSettings::decode("upscaling=dlss\nupscale_quality=ultraquality\n");

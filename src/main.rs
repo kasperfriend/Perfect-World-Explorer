@@ -1830,7 +1830,11 @@ impl UpscaleQuality {
         } else {
             Some(match modes::rejection(method, self) {
                 Some(reason) => {
-                    format!("{} does not offer {}: {reason}", method.label(), self.label())
+                    format!(
+                        "{} does not offer {}: {reason}",
+                        method.label(),
+                        self.label()
+                    )
                 }
                 None => format!("{} does not offer {}", method.label(), self.label()),
             })
@@ -2753,7 +2757,10 @@ mod tests {
             UpscaleMethod::Fsr4,
             UpscaleMethod::Xess,
         ] {
-            let factors: Vec<f64> = modes::modes(method).iter().map(|mode| mode.factor).collect();
+            let factors: Vec<f64> = modes::modes(method)
+                .iter()
+                .map(|mode| mode.factor)
+                .collect();
             assert!(factors.iter().all(|factor| *factor > 0.0 && *factor <= 1.0));
             for pair in factors.windows(2) {
                 assert!(
@@ -2777,10 +2784,11 @@ mod tests {
         );
         // XeSS Ultra Performance is 3.0x, not the 2.0x it used to borrow from
         // Performance.
-        assert!((internal_factor(UpscaleMethod::Xess, UpscaleQuality::UltraPerformance)
-            - 1.0 / 3.0)
-            .abs()
-            < 1e-9);
+        assert!(
+            (internal_factor(UpscaleMethod::Xess, UpscaleQuality::UltraPerformance) - 1.0 / 3.0)
+                .abs()
+                < 1e-9
+        );
     }
 
     /// Native AA is "1.0× render, provider's own temporal antialiasing". It is
@@ -2813,13 +2821,7 @@ mod tests {
             );
             assert_eq!(internal_factor(method, UpscaleQuality::NativeAa), 1.0);
             assert_eq!(
-                provider_extent(
-                    method,
-                    UpscaleQuality::NativeAa,
-                    1920,
-                    1080,
-                    8192
-                ),
+                provider_extent(method, UpscaleQuality::NativeAa, 1920, 1080, 8192),
                 (1920, 1080),
                 "{method:?} native AA must render at native resolution"
             );

@@ -120,9 +120,24 @@ pub fn nominal_factor(quality: UpscaleQuality) -> f64 {
 /// core rejects the Ultra Quality enum value outright.
 const DLSS_MODES: [Mode; 5] = [
     Mode::new(UpscaleQuality::NativeAa, "DLAA", 1.0, NGX_DLAA),
-    Mode::new(UpscaleQuality::Quality, "Quality", 1.0 / 1.5, NGX_MAX_QUALITY),
-    Mode::new(UpscaleQuality::Balanced, "Balanced", 1.0 / 1.7, NGX_BALANCED),
-    Mode::new(UpscaleQuality::Performance, "Performance", 0.5, NGX_MAX_PERF),
+    Mode::new(
+        UpscaleQuality::Quality,
+        "Quality",
+        1.0 / 1.5,
+        NGX_MAX_QUALITY,
+    ),
+    Mode::new(
+        UpscaleQuality::Balanced,
+        "Balanced",
+        1.0 / 1.7,
+        NGX_BALANCED,
+    ),
+    Mode::new(
+        UpscaleQuality::Performance,
+        "Performance",
+        0.5,
+        NGX_MAX_PERF,
+    ),
     Mode::new(
         UpscaleQuality::UltraPerformance,
         "Ultra Performance",
@@ -137,15 +152,30 @@ const FSR1_MODES: [Mode; 4] = [
     Mode::new(UpscaleQuality::Quality, "Quality", 1.0 / 1.5, 0),
     Mode::new(UpscaleQuality::Balanced, "Balanced", 1.0 / 1.7, 0),
     Mode::new(UpscaleQuality::Performance, "Performance", 0.5, 0),
-    Mode::new(UpscaleQuality::UltraPerformance, "Ultra Performance", 1.0 / 3.0, 0),
+    Mode::new(
+        UpscaleQuality::UltraPerformance,
+        "Ultra Performance",
+        1.0 / 3.0,
+        0,
+    ),
 ];
 
 /// FSR 2 (FFX temporal): the FFX ladder without Native AA — AMD introduced
 /// `FFX_UPSCALE_QUALITY_MODE_NATIVEAA` with the 3.1 provider.
 const FSR2_MODES: [Mode; 4] = [
     Mode::new(UpscaleQuality::Quality, "Quality", 1.0 / 1.5, FFX_QUALITY),
-    Mode::new(UpscaleQuality::Balanced, "Balanced", 1.0 / 1.7, FFX_BALANCED),
-    Mode::new(UpscaleQuality::Performance, "Performance", 0.5, FFX_PERFORMANCE),
+    Mode::new(
+        UpscaleQuality::Balanced,
+        "Balanced",
+        1.0 / 1.7,
+        FFX_BALANCED,
+    ),
+    Mode::new(
+        UpscaleQuality::Performance,
+        "Performance",
+        0.5,
+        FFX_PERFORMANCE,
+    ),
     Mode::new(
         UpscaleQuality::UltraPerformance,
         "Ultra Performance",
@@ -158,8 +188,18 @@ const FSR2_MODES: [Mode; 4] = [
 const FSR3_MODES: [Mode; 5] = [
     Mode::new(UpscaleQuality::NativeAa, "Native AA", 1.0, FFX_NATIVE_AA),
     Mode::new(UpscaleQuality::Quality, "Quality", 1.0 / 1.5, FFX_QUALITY),
-    Mode::new(UpscaleQuality::Balanced, "Balanced", 1.0 / 1.7, FFX_BALANCED),
-    Mode::new(UpscaleQuality::Performance, "Performance", 0.5, FFX_PERFORMANCE),
+    Mode::new(
+        UpscaleQuality::Balanced,
+        "Balanced",
+        1.0 / 1.7,
+        FFX_BALANCED,
+    ),
+    Mode::new(
+        UpscaleQuality::Performance,
+        "Performance",
+        0.5,
+        FFX_PERFORMANCE,
+    ),
     Mode::new(
         UpscaleQuality::UltraPerformance,
         "Ultra Performance",
@@ -181,8 +221,18 @@ const XESS_MODES: [Mode; 6] = [
         XESS_ULTRA_QUALITY,
     ),
     Mode::new(UpscaleQuality::Quality, "Quality", 1.0 / 1.5, XESS_QUALITY),
-    Mode::new(UpscaleQuality::Balanced, "Balanced", 1.0 / 1.7, XESS_BALANCED),
-    Mode::new(UpscaleQuality::Performance, "Performance", 0.5, XESS_PERFORMANCE),
+    Mode::new(
+        UpscaleQuality::Balanced,
+        "Balanced",
+        1.0 / 1.7,
+        XESS_BALANCED,
+    ),
+    Mode::new(
+        UpscaleQuality::Performance,
+        "Performance",
+        0.5,
+        XESS_PERFORMANCE,
+    ),
     Mode::new(
         UpscaleQuality::UltraPerformance,
         "Ultra Performance",
@@ -236,10 +286,7 @@ pub fn rejection(method: UpscaleMethod, quality: UpscaleQuality) -> Option<&'sta
             Some("FFX_UPSCALE_QUALITY_MODE_NATIVEAA is a 3.1/4.0 provider mode")
         }
         (
-            UpscaleMethod::Fsr1
-            | UpscaleMethod::Fsr2
-            | UpscaleMethod::Fsr3
-            | UpscaleMethod::Fsr4,
+            UpscaleMethod::Fsr1 | UpscaleMethod::Fsr2 | UpscaleMethod::Fsr3 | UpscaleMethod::Fsr4,
             UpscaleQuality::UltraQuality,
         ) => Some(
             "the FFX upscaler has no Ultra Quality preset: its ladder runs Native AA \
@@ -364,18 +411,40 @@ mod tests {
                 UpscaleQuality::Performance,
                 UpscaleQuality::UltraPerformance,
             ] {
-                assert!(quality_available(fsr, quality), "{fsr:?} {}", quality.token());
+                assert!(
+                    quality_available(fsr, quality),
+                    "{fsr:?} {}",
+                    quality.token()
+                );
             }
         }
         // FSR 3.1 and FSR 4 carry AMD's Native AA mode; FSR 1 is spatial and
         // FSR 2 predates the enum value.
-        assert!(quality_available(UpscaleMethod::Fsr3, UpscaleQuality::NativeAa));
-        assert!(quality_available(UpscaleMethod::Fsr4, UpscaleQuality::NativeAa));
-        assert!(!quality_available(UpscaleMethod::Fsr1, UpscaleQuality::NativeAa));
-        assert!(!quality_available(UpscaleMethod::Fsr2, UpscaleQuality::NativeAa));
+        assert!(quality_available(
+            UpscaleMethod::Fsr3,
+            UpscaleQuality::NativeAa
+        ));
+        assert!(quality_available(
+            UpscaleMethod::Fsr4,
+            UpscaleQuality::NativeAa
+        ));
+        assert!(!quality_available(
+            UpscaleMethod::Fsr1,
+            UpscaleQuality::NativeAa
+        ));
+        assert!(!quality_available(
+            UpscaleMethod::Fsr2,
+            UpscaleQuality::NativeAa
+        ));
         // XeSS: Native AA *and* Ultra Quality.
-        assert!(quality_available(UpscaleMethod::Xess, UpscaleQuality::NativeAa));
-        assert!(quality_available(UpscaleMethod::Xess, UpscaleQuality::UltraQuality));
+        assert!(quality_available(
+            UpscaleMethod::Xess,
+            UpscaleQuality::NativeAa
+        ));
+        assert!(quality_available(
+            UpscaleMethod::Xess,
+            UpscaleQuality::UltraQuality
+        ));
         // Nothing is advertised for "Upscaling Off".
         assert!(modes(UpscaleMethod::Off).is_empty());
         for quality in UpscaleQuality::ALL {
