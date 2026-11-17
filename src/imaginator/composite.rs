@@ -146,8 +146,9 @@ impl Composite {
             entries: &[
                 uniform_entry(0),
                 traced_texture_entry(1),
-                sampler_entry(2),
-                traced_texture_entry(3),
+                // No sampler: the traced image is unfilterable, so `COMPOSITE`
+                // reconstructs the bilinear sample itself.
+                filterable_texture_entry(3),
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -162,7 +163,7 @@ impl Composite {
         });
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("imaginator blit bindings"),
-            entries: &[traced_texture_entry(0), sampler_entry(1)],
+            entries: &[filterable_texture_entry(0), sampler_entry(1)],
         });
 
         let trace = compute_pipeline(device, "imaginator trace", &trace_layout, gpu::TRACE);
@@ -518,10 +519,6 @@ impl Composite {
                     resource: wgpu::BindingResource::TextureView(&target.traced_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.pipelines.sampler),
-                },
-                wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(scene_input),
                 },
@@ -776,15 +773,29 @@ fn read_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+/// The tracer's `rgba32float` image.
+///
+/// `rgba32float` is only *filterable* when the optional `FLOAT32_FILTERABLE`
+/// feature is enabled, which this device does not request. Declaring it
+/// filterable here made `create_bind_group` fail validation on the very first
+/// frame ("binding 1 expects Float { filterable: true }, but given a view with
+/// format = Rgba32Float"), which surfaced as a white window. The composite
+/// shader therefore loads four texels and blends them itself.
 fn traced_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    texture_entry(binding, false)
+}
+
+/// A texture the shaders may sample through a filtering sampler.
+fn filterable_texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    texture_entry(binding, true)
+}
+
+fn texture_entry(binding: u32, filterable: bool) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE | wgpu::ShaderStages::FRAGMENT,
         ty: wgpu::BindingType::Texture {
-            // `rgba32float` is filterable on every backend `wgpu` targets for a
-            // non-multisampled 2D texture, and `rgba16float` certainly is, so the
-            // same entry serves the traced image and the intermediate.
-            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+            sample_type: wgpu::TextureSampleType::Float { filterable },
             view_dimension: wgpu::TextureViewDimension::D2,
             multisampled: false,
         },

@@ -473,7 +473,6 @@ pub const COMPOSITE: &str = r#"
 struct Params { strength: vec4<f32>, flags: vec4<u32> };
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var traced: texture_2d<f32>;
-@group(0) @binding(2) var traced_sampler: sampler;
 @group(0) @binding(3) var frame: texture_2d<f32>;
 @group(0) @binding(4) var out_tex: texture_storage_2d<rgba16float, write>;
 
@@ -481,6 +480,30 @@ struct Params { strength: vec4<f32>, flags: vec4<u32> };
 // already linear. `out_tex` is a half-float storage texture holding linear
 // radiance; the blit that follows writes it to the sRGB target, which encodes
 // exactly once. No transfer function is applied in this shader.
+
+// The traced image is `rgba32float`, which wgpu only lets a bind group declare
+// filterable when the optional FLOAT32_FILTERABLE feature is on. It is not, so
+// the texture is bound as non-filterable and the bilinear reconstruction the
+// sampler used to do is written out here with four explicit taps. Same result,
+// no optional feature required.
+fn trace_sample(uv: vec2<f32>) -> vec4<f32> {
+ let dims = vec2<i32>(textureDimensions(traced));
+ if dims.x == 0 || dims.y == 0 {
+  return vec4<f32>(0.0, 0.0, 0.0, -1.0);
+ }
+ let coord = uv * vec2<f32>(dims) - vec2<f32>(0.5);
+ let base = floor(coord);
+ let f = coord - base;
+ let lo = vec2<i32>(0, 0);
+ let hi = dims - vec2<i32>(1, 1);
+ let p = vec2<i32>(base);
+ let c00 = textureLoad(traced, clamp(p, lo, hi), 0);
+ let c10 = textureLoad(traced, clamp(p + vec2<i32>(1, 0), lo, hi), 0);
+ let c01 = textureLoad(traced, clamp(p + vec2<i32>(0, 1), lo, hi), 0);
+ let c11 = textureLoad(traced, clamp(p + vec2<i32>(1, 1), lo, hi), 0);
+ return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+
 
 @compute @workgroup_size(8, 8, 1)
 fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -491,7 +514,7 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
  // and the frame pixel under it therefore always describe the same direction.
  let frame_dims = vec2<f32>(f32(dims.x), f32(dims.y));
  let uv = (vec2<f32>(f32(id.x) + 0.5, f32(id.y) + 0.5)) / frame_dims;
- let traced_s = textureSampleLevel(traced, traced_sampler, uv, 0.0);
+ let traced_s = trace_sample(uv);
  let frame_s = textureLoad(frame, vec2<i32>(i32(id.x), i32(id.y)), 0);
  let strength = p.strength.x;
  let exposure = p.strength.y;
@@ -744,14 +767,25 @@ mod tests {
     /// covers the WGSL.
     #[test]
     fn shader_sources_mention_every_binding_they_declare() {
-        for (name, src, bindings) in [("trace", TRACE, 6), ("composite", COMPOSITE, 5)] {
-            for b in 0..bindings {
+        // The composite's bindings are 0, 1, 3, 4: binding 2 used to be the
+        // filtering sampler the traced image was read through, and it is gone
+        // because `rgba32float` is not filterable without an optional feature.
+        let shaders: [(&str, &str, &[u32]); 2] = [
+            ("trace", TRACE, &[0, 1, 2, 3, 4, 5]),
+            ("composite", COMPOSITE, &[0, 1, 3, 4]),
+        ];
+        for (name, src, bindings) in shaders {
+            for b in bindings {
                 assert!(
                     src.contains(&format!("@binding({b})")),
                     "{name} is missing binding {b}"
                 );
             }
         }
+        assert!(
+            !COMPOSITE.contains("@binding(2)"),
+            "the composite binds no sampler any more"
+        );
         assert!(TRACE.contains("fn cs("));
         assert!(COMPOSITE.contains("fn cs("));
         assert!(TRACE.contains("TERM_SHADOWS") && TRACE.contains("TERM_REFLECTIONS"));
