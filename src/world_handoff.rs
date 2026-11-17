@@ -283,6 +283,15 @@ pub fn publish_failure(reason: &str) {
     }
 }
 
+/// A post-load main-world restart is a fresh independent viewer, not another
+/// handoff child. Remove the parent's temporary-file environment so the new
+/// process does not publish readiness or failure into the old overlay.
+pub fn clear_child_environment(command: &mut Command) {
+    for name in [READY_ENV, STATUS_ENV, FOCUS_ENV, HWND_ENV] {
+        command.env_remove(name);
+    }
+}
+
 /// Called only after a visible window and its first usable frame are presented.
 pub fn signal_ready() {
     if let Some(path) = std::env::var_os(READY_ENV).map(PathBuf::from) {
@@ -395,6 +404,22 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_progress_notice_completes_handoff_as_ready() {
+        let mut state = snapshot();
+        state.ready = true;
+        state.hwnd = None;
+        state.status = Some(
+            "Map a01 failed after loading. The explorer is restarting in the main world.".into(),
+        );
+        assert_eq!(
+            decide(&state),
+            Decision::Ready {
+                activate_hwnd: None
+            }
+        );
+    }
+
+    #[test]
     fn child_environment_and_focus_file_carry_the_handoff_state() {
         let files = Files::new();
         let mut command = Command::new("ignored");
@@ -410,6 +435,22 @@ mod tests {
         assert!(files.focused());
         files.set_focused(false);
         assert!(!files.focused());
+        files.cleanup();
+    }
+
+    #[test]
+    fn a_restart_command_does_not_inherit_the_handoff_environment() {
+        let files = Files::new();
+        let mut command = Command::new("ignored");
+        files.configure(&mut command);
+        clear_child_environment(&mut command);
+        let env: std::collections::HashMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| (key.to_string_lossy().into_owned(), value.is_some()))
+            .collect();
+        for name in [READY_ENV, STATUS_ENV, FOCUS_ENV, HWND_ENV] {
+            assert!(!env.get(name).copied().unwrap_or(false), "{name} inherited");
+        }
         files.cleanup();
     }
 

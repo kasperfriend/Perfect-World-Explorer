@@ -5650,8 +5650,17 @@ pub fn run(
                                         stats.residency.budget_bytes >> 20,
                                         stats.residency.evictions)
                                 };
+                                let unavailable = stats.unavailable_models.len();
+                                let unavailable_detail = if unavailable == 0 {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "; {unavailable} unavailable scenery models: {}",
+                                        stats.unavailable_examples.join("; ")
+                                    )
+                                };
                                 world_status = format!(
-                                    "Loaded {processed} objects in {:.1}s{}; {skipped} meshes use fallback texture; {} geometry chunks ({} pages); {load_detail}",
+                                    "Loaded {processed} objects in {:.1}s{}; {skipped} meshes use fallback texture; {} geometry chunks ({} pages); {load_detail}{unavailable_detail}",
                                     elapsed.unwrap_or_default(),
                                     if stats.cache_hit { " (warm page cache)" } else { "" },
                                     renderer.world_pages.len(),
@@ -7026,11 +7035,17 @@ pub fn preview(
                     world_draw_cmds,
                 } => {
                     eprintln!(
-                        "Preview world preload: {processed} objects, {skipped} fallback meshes, {} pages, peak residency {} MiB / {} MiB budget, {} evictions",
+                        "Preview world preload: {processed} objects, {skipped} fallback meshes, {} pages, peak residency {} MiB / {} MiB budget, {} evictions, {} unavailable scenery models{}",
                         stats.pages,
                         stats.residency.peak_resident_bytes >> 20,
                         stats.residency.budget_bytes >> 20,
-                        stats.residency.evictions
+                        stats.residency.evictions,
+                        stats.unavailable_models.len(),
+                        if stats.unavailable_examples.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", stats.unavailable_examples.join("; "))
+                        }
                     );
                     renderer.world_draw_cmds = world_draw_cmds;
                     for page in &mut renderer.world_pages {

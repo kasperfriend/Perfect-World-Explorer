@@ -3536,6 +3536,10 @@ fn diagnose_framegen(args: &[String]) -> i32 {
 
 mod viewer;
 
+fn log_model_load(key: &str, line: &str) {
+    diagnostics::emit_keyed(diagnostics::Channel::ModelLoads, key, 0, line);
+}
+
 fn main() {
     #[cfg(windows)]
     std::panic::set_hook(Box::new(|info| {
@@ -3670,32 +3674,78 @@ fn main() {
         selected_world,
         saved.logging_mask
     ));
+    objects::set_model_load_logger(log_model_load);
     objects::set_unbounded_textures(saved.all_to_vram);
     let all_to_vram = saved.all_to_vram;
-    let launch = |world_id: &str, notice: Option<String>| -> Result<(), String> {
-        world_handoff::publish_progress(&format!("Loading world {world_id}..."));
-        // A handoff child already has the old process's non-interactive
-        // overlay; do not create a second Win32 loading window behind it.
-        #[cfg(windows)]
-        let loading = if world_handoff::is_handoff_child() {
-            None
+    let viewer_mode = args.len() == 2;
+    // The old process's non-interactive overlay is the only loading UI for a
+    // handoff child. Create the standalone loading window once, before terrain
+    // fallback, so a second attempt never opens another Win32 window.
+    #[cfg(windows)]
+    let loading = if world_handoff::is_handoff_child() {
+        None
+    } else {
+        Some(windows_setup::LoadingWindow::start())
+    };
+    // Loading terrain is the only operation that can be retried in-process.
+    // PR #40 showed that retrying `gpu::run` after a visible window has been
+    // created fails with "EventLoop can't be recreated"; a post-load failure
+    // therefore restarts a fresh process on the main world.
+    let mut preferred_world = selected_world.clone();
+    let load_terrain = |world_id: &str, notice: Option<String>| -> Result<Terrain, String> {
+        let fallback = notice.is_some();
+        let progress = if fallback {
+            "Selected map failed; preparing the main world...".to_string()
         } else {
-            Some(windows_setup::LoadingWindow::start())
+            format!("Loading world {world_id}...")
         };
+        world_handoff::publish_progress(&progress);
         // An unsafe direct folder name is resolved from the path itself on the
         // first attempt; the fallback retry uses the owning client root and the
         // safe main-world ID, so a broken instance can still return to `world`.
-        let preferred = if direct_without_safe_id && notice.is_none() {
+        let preferred = if direct_without_safe_id && !fallback {
             None
         } else {
             Some(world_id)
         };
-        let load_root = if notice.is_some() {
+        let load_root = if fallback {
             client_root.as_path()
         } else {
             path.as_path()
         };
-        let mut t = terrain(load_root, all_to_vram, preferred, notice)?;
+        terrain(load_root, all_to_vram, preferred, notice)
+    };
+    let (t, fallback_notice) =
+        match world_load::load_with_main_world_fallback_notified(&preferred_world, load_terrain) {
+            Ok((loaded, notice)) => (loaded, notice),
+            Err(error) => {
+                // A replacement child must report failure before showing its
+                // own error; otherwise the old window would wait for a
+                // readiness signal that will never arrive.
+                world_handoff::publish_failure(&error);
+                eprintln!("Error: {error}");
+                #[cfg(windows)]
+                if !world_handoff::is_handoff_child() {
+                    windows_setup::show_error(&error);
+                }
+                std::process::exit(1);
+            }
+        };
+    if let Some(notice) = fallback_notice.as_deref() {
+        preferred_world = "world".into();
+        saved.selected_world = "world".into();
+        if let Err(error) = saved.save() {
+            eprintln!("Could not persist main-world fallback: {error}");
+        }
+        eprintln!("{notice}");
+        #[cfg(windows)]
+        if !world_handoff::is_handoff_child() {
+            windows_setup::show_error(notice);
+        }
+        world_handoff::publish_progress("Selected map failed; preparing the main world...");
+    }
+    let run_result = world_load::recoverable_map_operation(move || {
+        let mut t = t;
         match args.len() {
             #[cfg(windows)]
             2 => gpu::run(t, loading),
@@ -3734,26 +3784,72 @@ fn main() {
             }
             _ => Err("invalid arguments".into()),
         }
-    };
-    match world_load::load_with_main_world_fallback_notified(&selected_world, launch) {
-        Ok(((), notice)) => {
-            if notice.is_some() {
-                saved.selected_world = "world".into();
-                if let Err(error) = saved.save() {
-                    eprintln!("Settings save after map fallback: {error}");
+    })
+    .and_then(|result| result);
+    if let Err(error) = run_result {
+        if world_load::post_load_failure_decision(&preferred_world, viewer_mode)
+            == world_load::PostLoadDecision::RestartMainWorld
+        {
+            saved.selected_world = "world".into();
+            if let Err(save_error) = saved.save() {
+                eprintln!("Could not persist main-world fallback: {save_error}");
+            }
+            let notice = format!(
+                "Map {} failed after loading. The explorer is restarting in the main world.\n\n{error}",
+                preferred_world
+            );
+            eprintln!("{notice}");
+            let restarted = env::current_exe()
+                .map_err(|e| e.to_string())
+                .and_then(|exe| {
+                    let mut command = std::process::Command::new(exe);
+                    command.arg(&client_root).arg("--world").arg("world");
+                    world_handoff::clear_child_environment(&mut command);
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        // Do not flash a console window behind the GUI restart.
+                        command.creation_flags(0x08000000);
+                    }
+                    command
+                        .spawn()
+                        .map(|_| ())
+                        .map_err(|restart_error| restart_error.to_string())
+                });
+            match restarted {
+                Ok(()) => {
+                    // Publish after the fresh process exists. The parent sees a
+                    // progress notice and readiness, so it exits its overlay
+                    // instead of leaving a second window with a failure dialog.
+                    // The restart deliberately inherits no handoff files.
+                    world_handoff::publish_progress(&notice);
+                    world_handoff::signal_ready();
+                    #[cfg(windows)]
+                    if !world_handoff::is_handoff_child() {
+                        windows_setup::show_error(&notice);
+                    }
+                    return;
+                }
+                Err(restart_error) => {
+                    let fatal =
+                        format!("{notice}\n\nCould not restart the explorer: {restart_error}");
+                    world_handoff::publish_failure(&fatal);
+                    eprintln!("Error: {fatal}");
+                    #[cfg(windows)]
+                    if !world_handoff::is_handoff_child() {
+                        windows_setup::show_error(&fatal);
+                    }
+                    std::process::exit(1);
                 }
             }
         }
-        Err(error) => {
-            // A replacement child must report failure to the old process before
-            // showing its own error; otherwise the old window would wait for a
-            // readiness signal that will never arrive.
-            world_handoff::publish_failure(&error);
-            eprintln!("Error: {error}");
-            #[cfg(windows)]
+        world_handoff::publish_failure(&error);
+        eprintln!("Error: {error}");
+        #[cfg(windows)]
+        if !world_handoff::is_handoff_child() {
             windows_setup::show_error(&error);
-            std::process::exit(1)
         }
+        std::process::exit(1);
     }
 }
 

@@ -109,6 +109,23 @@ pub fn load_with_main_world_fallback<T>(
     load_with_main_world_fallback_notified(preferred, |id, _| load(id))
 }
 
+/// What to do after a selected map has already loaded but the viewer fails.
+/// Winit cannot create a second event loop in the same process, so an instance
+/// map must be retried in a fresh process with the safe main-world setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostLoadDecision {
+    Fatal,
+    RestartMainWorld,
+}
+
+pub fn post_load_failure_decision(selected_world: &str, viewer_mode: bool) -> PostLoadDecision {
+    if viewer_mode && !selected_world.eq_ignore_ascii_case("world") {
+        PostLoadDecision::RestartMainWorld
+    } else {
+        PostLoadDecision::Fatal
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +205,21 @@ mod tests {
             load_with_main_world_fallback("world", |_| Ok::<_, String>(42)).unwrap();
         assert_eq!(loaded, 42);
         assert!(notice.is_none());
+    }
+
+    #[test]
+    fn a_post_load_instance_failure_restarts_in_a_fresh_process() {
+        assert_eq!(
+            post_load_failure_decision("a01", true),
+            PostLoadDecision::RestartMainWorld
+        );
+        assert_eq!(
+            post_load_failure_decision("A01", false),
+            PostLoadDecision::Fatal
+        );
+        assert_eq!(
+            post_load_failure_decision("world", true),
+            PostLoadDecision::Fatal
+        );
     }
 }

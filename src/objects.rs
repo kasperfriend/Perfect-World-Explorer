@@ -21,7 +21,10 @@
 use crate::{
     bmd, pck,
     scene::Ornament,
-    texture_resolution::{normalize, MountedArchive, Resolution, TextureResolver},
+    texture_resolution::{
+        litmodel_basename_index, litmodel_entry_key, litmodel_key, normalize, MountedArchive,
+        Resolution, TextureResolver,
+    },
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -232,16 +235,27 @@ pub struct UnresolvedTexture {
 }
 pub struct Objects {
     pub ornaments: Arc<[Ornament]>,
-    /// Normalized archive keys built once instead of formatting and lowercasing
+    /// Canonical in-memory keys built once instead of formatting and lowercasing
     /// the same placement path on every streamed batch.
     model_names: Vec<String>,
     models: HashMap<String, bmd::Model>,
     cache: TextureCache,
     resolver: TextureResolver,
-    litfile: File,
-    texfile: File,
+    /// Scenery archives are optional: an instance map can still show terrain,
+    /// water, trees and the models it does have when one package is absent.
+    litfile: Option<File>,
+    texfile: Option<File>,
+    lit_archive_error: Option<String>,
+    lit_archive_entries: usize,
+    litmodel_map_id: String,
     litentries: HashMap<String, pck::Entry>,
+    litentry_names: Vec<String>,
+    litbasenames: HashMap<String, Vec<String>>,
     texentries: HashMap<String, pck::Entry>,
+    /// Missing or unparsable BMDs are skipped once and negative-cached, so a
+    /// single bad placement cannot abort the whole world or retry every frame.
+    unavailable_models: HashSet<String>,
+    unavailable_examples: Vec<String>,
     unresolved: Vec<UnresolvedTexture>,
     unresolved_seen: HashSet<String>,
 }
@@ -251,6 +265,13 @@ pub struct Objects {
 /// building.pck textures is ~445 MiB compressed on disk and far larger
 /// decoded, so the full world never fits under this budget by design.
 pub const DEFAULT_TEX_BUDGET_MIB: usize = 16;
+/// Optional host-provided logger for scenery BMD failures. `objects.rs` is also
+/// compiled directly into standalone survey binaries, so it cannot depend on
+/// the viewer's diagnostics module.
+static MODEL_LOAD_LOGGER: std::sync::OnceLock<fn(&str, &str)> = std::sync::OnceLock::new();
+pub fn set_model_load_logger(logger: fn(&str, &str)) {
+    let _ = MODEL_LOAD_LOGGER.set(logger);
+}
 /// Process-wide "All to VRAM" switch. `Objects` instances read it when their
 /// cache evicts and when a new one is opened, so the whole-world preload and
 /// later streamed batches follow a live toggle without a restart.
@@ -265,6 +286,40 @@ pub fn set_unbounded_textures(on: bool) {
 pub fn unbounded_textures() -> bool {
     UNBOUNDED_TEXTURES.load(std::sync::atomic::Ordering::Relaxed)
 }
+fn open_optional_archive(
+    path: &Path,
+) -> (Option<File>, HashMap<String, pck::Entry>, Option<String>) {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            let reason = format!("{}: {error}", path.display());
+            eprintln!("Optional scenery archive unavailable: {reason}");
+            return (None, HashMap::new(), Some(reason));
+        }
+    };
+    match pck::directory(&mut file) {
+        Ok(entries) => {
+            let indexed: HashMap<_, _> = entries
+                .into_iter()
+                .map(|entry| (normalize(&entry.name), entry))
+                .collect();
+            let bmd_count = indexed.keys().filter(|name| name.ends_with(".bmd")).count();
+            eprintln!(
+                "Indexed scenery archive {}: {} members, {} BMDs",
+                path.display(),
+                indexed.len(),
+                bmd_count
+            );
+            (Some(file), indexed, None)
+        }
+        Err(error) => {
+            let reason = format!("{}: {error}", path.display());
+            eprintln!("Optional scenery archive could not be read: {reason}");
+            (None, HashMap::new(), Some(reason))
+        }
+    }
+}
+
 fn tex_budget_bytes() -> usize {
     if unbounded_textures() {
         // Not literally infinite: the LRU comparison adds bytes to this, so it
@@ -310,31 +365,38 @@ fn decode_texture_bytes(key: &str, data: &[u8]) -> Result<Texture, String> {
 
 impl Objects {
     pub fn open<O: Into<Arc<[Ornament]>>>(element: &Path, ornaments: O) -> Result<Self, String> {
-        let mut litfile = File::open(element.join("litmodels.pck")).map_err(|e| e.to_string())?;
-        let mut texfile = File::open(element.join("building.pck")).map_err(|e| e.to_string())?;
-        let litentries = pck::directory(&mut litfile)?
-            .into_iter()
-            .map(|e| (e.name.to_lowercase(), e))
-            .collect::<HashMap<_, _>>();
-        let texentries = pck::directory(&mut texfile)?
-            .into_iter()
-            .map(|e| (e.name.to_lowercase(), e))
-            .collect::<HashMap<_, _>>();
+        let ornaments = ornaments.into();
+        let litmodel_map_id = ornaments
+            .first()
+            .map(|ornament| ornament.map_id.clone())
+            .unwrap_or_else(|| "world".to_string());
+        if ornaments
+            .iter()
+            .any(|ornament| !ornament.map_id.eq_ignore_ascii_case(&litmodel_map_id))
+        {
+            return Err("scenery placements from multiple map namespaces were mixed".into());
+        }
+        let (litfile, litentries, lit_archive_error) =
+            open_optional_archive(&element.join("litmodels.pck"));
+        let (texfile, texentries, _tex_archive_error) =
+            open_optional_archive(&element.join("building.pck"));
+        let lit_archive_entries = litentries.len();
+        let litentry_names = litentries.keys().cloned().collect::<Vec<_>>();
+        let litbasenames = litmodel_basename_index(&litentry_names);
         // Mount order matches the open order above. The retail mount order
         // of the two packages is not recoverable from the executable alone,
         // but it is also unobservable in this corpus: the census found 0
         // texture names present in both archives and litmodels.pck contains
         // no texture members at all (28858/28858 are .bmd).
-        let ornaments = ornaments.into();
         let model_names = ornaments
             .iter()
-            .map(|ornament| format!("litmodels/world/{}", ornament.path.to_lowercase()))
+            .map(|ornament| litmodel_key(&ornament.path))
             .collect();
         let resolver = TextureResolver::new(
             vec![
                 MountedArchive {
                     tag: "litmodels".into(),
-                    index: litentries.keys().cloned().collect(),
+                    index: litentry_names.iter().cloned().collect(),
                 },
                 MountedArchive {
                     tag: "building".into(),
@@ -351,8 +413,15 @@ impl Objects {
             resolver,
             litfile,
             texfile,
+            lit_archive_error,
+            lit_archive_entries,
+            litmodel_map_id,
             litentries,
+            litentry_names,
+            litbasenames,
             texentries,
+            unavailable_models: HashSet::new(),
+            unavailable_examples: Vec::new(),
             unresolved: Vec::new(),
             unresolved_seen: HashSet::new(),
         })
@@ -374,28 +443,68 @@ impl Objects {
     }
     /// Loads a small explicit batch for the independent world preload worker.
     pub fn load_ids(&mut self, ids: &[usize]) -> Result<(), String> {
-        let active: HashSet<&str> = ids.iter().map(|&i| self.model_names[i].as_str()).collect();
-        self.models.retain(|name, _| active.contains(name.as_str()));
+        let mut active = HashSet::with_capacity(ids.len());
+        for &i in ids {
+            let Some(_) = self.ornaments.get(i) else {
+                return Err(format!("invalid ornament index {i}"));
+            };
+            active.insert(self.model_names[i].clone());
+        }
+        self.models.retain(|name, _| active.contains(name));
         self.cache.begin_batch();
-        let mut missing_models: Vec<(usize, &pck::Entry)> = Vec::new();
+
+        // Resolve each absent BMD independently. A missing archive member, a
+        // failed archive read or a malformed BMD skips only that prop; the
+        // remaining scenery continues to load.
+        let mut missing_models: Vec<(usize, String, pck::Entry)> = Vec::new();
         let mut seen_missing = HashSet::new();
         for &i in ids {
-            let name = &self.model_names[i];
-            if !self.models.contains_key(name.as_str()) && seen_missing.insert(name.as_str()) {
-                let entry = self
-                    .litentries
-                    .get(name.as_str())
-                    .ok_or_else(|| format!("missing model {name}"))?;
-                missing_models.push((i, entry));
+            let name = self.model_names[i].clone();
+            if self.unavailable_models.contains(&name) {
+                continue;
             }
+            if self.models.contains_key(&name) || !seen_missing.insert(name.clone()) {
+                continue;
+            }
+            if let Some(error) = self.lit_archive_error.clone() {
+                self.skip_model(&name, &format!("litmodels.pck was not indexed: {error}"));
+                continue;
+            }
+            let resolved = {
+                let map_id = self.litmodel_map_id.clone();
+                litmodel_entry_key(&name, &map_id, &self.litentry_names, &self.litbasenames)
+            };
+            let entry_key = match resolved {
+                Ok(key) => key,
+                Err(error) => {
+                    self.skip_model(
+                        &name,
+                        &format!(
+                            "{error}; litmodels.pck index has {} members",
+                            self.lit_archive_entries
+                        ),
+                    );
+                    continue;
+                }
+            };
+            let Some(entry) = self.litentries.get(&entry_key).cloned() else {
+                self.skip_model(&name, &format!("resolver/index mismatch for {entry_key}"));
+                continue;
+            };
+            missing_models.push((i, name, entry));
         }
 
+        if self.litfile.is_none() {
+            for (_, name, _) in &missing_models {
+                self.skip_model(name, "litmodels.pck unavailable");
+            }
+            missing_models.clear();
+        }
         if !missing_models.is_empty() {
-            let litfile = &self.litfile;
-            let model_names = &self.model_names;
             // Keep several archive ranges per worker so DirectStorage can
-            // submit a real batch instead of paying one queue submit/wait per
-            // model. Four workers still parse independent BMDs concurrently.
+            // submit a real batch instead of paying one queue submit/wait
+            // per model. Four workers still parse independent BMDs
+            // concurrently.
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
@@ -407,32 +516,55 @@ impl Objects {
             };
             let workers = workers.min(missing_models.len());
             let chunk_size = (missing_models.len() + workers - 1) / workers;
-            let parsed: Vec<Result<Vec<(usize, bmd::Model)>, String>> = std::thread::scope(|s| {
-                let handles: Vec<_> = missing_models
-                    .chunks(chunk_size)
-                    .map(|chunk| {
-                        s.spawn(move || {
-                            let mut out = Vec::with_capacity(chunk.len());
-                            for batch in chunk.chunks(16) {
-                                let entries: Vec<_> =
-                                    batch.iter().map(|(_, entry)| *entry).collect();
-                                let data = pck::read_entries_at(litfile, &entries)
-                                    .map_err(|e| e.to_string())?;
-                                for ((index, _), data) in batch.iter().zip(data) {
-                                    let model = bmd::Model::parse(&data)
-                                        .map_err(|e| format!("{}: {e}", model_names[*index]))?;
-                                    out.push((*index, model));
+            let parsed: Vec<Vec<(usize, String, Result<bmd::Model, String>)>> = {
+                let litfile = self
+                    .litfile
+                    .as_ref()
+                    .ok_or_else(|| "litmodels.pck unavailable".to_string())?;
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = missing_models
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            s.spawn(move || {
+                                let mut out = Vec::with_capacity(chunk.len());
+                                for batch in chunk.chunks(16) {
+                                    let entries: Vec<&pck::Entry> =
+                                        batch.iter().map(|(_, _, entry)| entry).collect();
+                                    match pck::read_entries_at(litfile, &entries) {
+                                        Ok(data) => {
+                                            for ((index, name, _), data) in batch.iter().zip(data) {
+                                                let result = bmd::Model::parse(&data)
+                                                    .map_err(|error| format!("{name}: {error}"));
+                                                out.push((*index, name.clone(), result));
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let error = error.to_string();
+                                            for (index, name, _) in batch {
+                                                out.push((
+                                                    *index,
+                                                    name.clone(),
+                                                    Err(format!("archive read failed: {error}")),
+                                                ));
+                                            }
+                                        }
+                                    }
                                 }
-                            }
-                            Ok(out)
+                                out
+                            })
                         })
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            };
             for batch in parsed {
-                for (index, model) in batch? {
-                    self.models.insert(self.model_names[index].clone(), model);
+                for (_, name, result) in batch {
+                    match result {
+                        Ok(model) => {
+                            self.models.insert(name, model);
+                        }
+                        Err(error) => self.skip_model(&name, &error),
+                    }
                 }
             }
         }
@@ -442,10 +574,13 @@ impl Objects {
         let mut unique_refs = Vec::new();
         for &i in ids {
             let name = self.model_names[i].as_str();
-            if !seen_models.insert(name) {
+            if self.unavailable_models.contains(name) || !seen_models.insert(name) {
                 continue;
             }
-            for mesh in &self.models[name].meshes {
+            let Some(model) = self.models.get(name) else {
+                continue;
+            };
+            for mesh in &model.meshes {
                 if seen_refs.insert(mesh.texture.clone()) {
                     unique_refs.push(mesh.texture.clone());
                 }
@@ -486,11 +621,11 @@ impl Objects {
         }
 
         if !pending.is_empty() {
-            enum ResolvedJob<'a> {
+            enum ResolvedJob {
                 Archive {
                     key: String,
-                    file: &'a File,
-                    entry: &'a pck::Entry,
+                    mount: usize,
+                    entry: pck::Entry,
                 },
                 Disk {
                     key: String,
@@ -502,15 +637,14 @@ impl Objects {
             for job in pending {
                 match job {
                     PendingTexture::Archive { mount, key } => {
-                        let (file, entries) = if mount == 0 {
-                            (&self.litfile, &self.litentries)
+                        let entry = if mount == 0 {
+                            self.litentries.get(&key).cloned()
                         } else {
-                            (&self.texfile, &self.texentries)
+                            self.texentries.get(&key).cloned()
                         };
-                        let entry = entries
-                            .get(&key)
-                            .ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
-                        jobs.push(ResolvedJob::Archive { key, file, entry });
+                        let entry =
+                            entry.ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
+                        jobs.push(ResolvedJob::Archive { key, mount, entry });
                     }
                     PendingTexture::Disk { key, path } => {
                         jobs.push(ResolvedJob::Disk { key, path });
@@ -529,9 +663,9 @@ impl Objects {
             };
             let workers = workers.min(jobs.len());
             let chunk_size = (jobs.len() + workers - 1) / workers;
-            let litfile = &self.litfile;
-            let texfile = &self.texfile;
-            let decoded: Vec<Result<Vec<(String, Result<Texture, String>)>, String>> =
+            let decoded: Vec<Vec<(String, Result<Texture, String>)>> = {
+                let litfile = self.litfile.as_ref();
+                let texfile = self.texfile.as_ref();
                 std::thread::scope(|s| {
                     let handles: Vec<_> = jobs
                         .chunks(chunk_size)
@@ -539,56 +673,92 @@ impl Objects {
                             s.spawn(move || {
                                 let mut out = Vec::with_capacity(chunk.len());
                                 for jobs_batch in chunk.chunks(16) {
-                                    let mut lit_jobs = Vec::new();
-                                    let mut tex_jobs = Vec::new();
+                                    let mut lit_jobs: Vec<(String, pck::Entry)> = Vec::new();
+                                    let mut tex_jobs: Vec<(String, pck::Entry)> = Vec::new();
                                     for job in jobs_batch {
-                                        if let ResolvedJob::Archive { key, file, entry } = job {
-                                            if std::ptr::eq(*file, litfile) {
-                                                lit_jobs.push((key, *entry));
+                                        if let ResolvedJob::Archive { key, mount, entry } = job {
+                                            let file = if *mount == 0 { litfile } else { texfile };
+                                            if file.is_none() {
+                                                let archive = if *mount == 0 {
+                                                    "litmodels.pck"
+                                                } else {
+                                                    "building.pck"
+                                                };
+                                                out.push((
+                                                    key.clone(),
+                                                    Err(format!(
+                                                        "scenery archive {archive} unavailable"
+                                                    )),
+                                                ));
+                                            } else if *mount == 0 {
+                                                lit_jobs.push((key.clone(), entry.clone()));
                                             } else {
-                                                tex_jobs.push((key, *entry));
+                                                tex_jobs.push((key.clone(), entry.clone()));
                                             }
                                         }
                                     }
                                     for (file, archive_jobs) in
                                         [(litfile, lit_jobs), (texfile, tex_jobs)]
                                     {
+                                        let Some(file) = file else { continue };
                                         if archive_jobs.is_empty() {
                                             continue;
                                         }
-                                        let entries: Vec<_> =
-                                            archive_jobs.iter().map(|(_, entry)| *entry).collect();
-                                        let bytes = pck::read_entries_at(file, &entries)
-                                            .map_err(|e| e.to_string())?;
-                                        for ((key, _), data) in archive_jobs.into_iter().zip(bytes)
-                                        {
-                                            out.push((
-                                                key.clone(),
-                                                decode_texture_bytes(key, &data),
-                                            ));
+                                        let read = {
+                                            let entries: Vec<&pck::Entry> = archive_jobs
+                                                .iter()
+                                                .map(|(_, entry)| entry)
+                                                .collect();
+                                            pck::read_entries_at(file, &entries)
+                                        };
+                                        match read {
+                                            Ok(bytes) => {
+                                                for ((key, _), data) in
+                                                    archive_jobs.into_iter().zip(bytes)
+                                                {
+                                                    out.push((
+                                                        key.clone(),
+                                                        decode_texture_bytes(&key, &data),
+                                                    ));
+                                                }
+                                            }
+                                            Err(error) => {
+                                                let error = error.to_string();
+                                                for (key, _) in archive_jobs {
+                                                    out.push((
+                                                        key,
+                                                        Err(format!(
+                                                            "archive read failed: {error}"
+                                                        )),
+                                                    ));
+                                                }
+                                            }
                                         }
                                     }
                                     for job in jobs_batch {
                                         if let ResolvedJob::Disk { key, path } = job {
-                                            let data = std::fs::read(path).map_err(|e| {
-                                                format!("disk texture {}: {e}", path.display())
-                                            })?;
-                                            out.push((
-                                                key.clone(),
-                                                decode_texture_bytes(key, &data),
-                                            ));
+                                            let result = std::fs::read(path)
+                                                .map_err(|error| {
+                                                    format!(
+                                                        "disk texture {}: {error}",
+                                                        path.display()
+                                                    )
+                                                })
+                                                .and_then(|data| decode_texture_bytes(key, &data));
+                                            out.push((key.clone(), result));
                                         }
                                     }
                                 }
-                                Ok(out)
+                                out
                             })
                         })
                         .collect();
                     handles.into_iter().map(|h| h.join().unwrap()).collect()
-                });
+                })
+            };
 
             for batch in decoded {
-                for (key, res) in batch? {
+                for (key, res) in batch {
                     match res {
                         Ok(texture) => {
                             self.cache.store(key, texture);
@@ -606,6 +776,18 @@ impl Objects {
         }
 
         Ok(())
+    }
+    fn skip_model(&mut self, name: &str, reason: &str) {
+        if self.unavailable_models.insert(name.to_string()) {
+            let line = format!("world BMD unavailable: {name}: {reason}");
+            if let Some(logger) = MODEL_LOAD_LOGGER.get() {
+                logger(name, &line);
+            }
+            eprintln!("Skipping unavailable scenery model {name}: {reason}");
+            if self.unavailable_examples.len() < 3 {
+                self.unavailable_examples.push(format!("{name}: {reason}"));
+            }
+        }
     }
     fn load_texture_reference(&mut self, raw: &str) -> Result<(), String> {
         match self.resolve_texture_job(raw) {
@@ -693,6 +875,24 @@ impl Objects {
                 None
             }
             Resolution::Archive { mount, key } => {
+                let archive = if mount == 0 {
+                    "litmodels.pck"
+                } else {
+                    "building.pck"
+                };
+                let available = if mount == 0 {
+                    self.litfile.is_some()
+                } else {
+                    self.texfile.is_some()
+                };
+                if !available {
+                    self.register(
+                        raw,
+                        "texture-load-failed",
+                        &format!("{archive} unavailable; retaining model geometry"),
+                    );
+                    return None;
+                }
                 if self.cache.contains(&key) {
                     self.cache.touch(&key);
                     return None;
@@ -713,14 +913,24 @@ impl Objects {
             let entry = self
                 .litentries
                 .get(key)
+                .cloned()
                 .ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
-            pck::read_entry(&mut self.litfile, entry)?
+            let file = self
+                .litfile
+                .as_mut()
+                .ok_or_else(|| "litmodels.pck unavailable".to_string())?;
+            pck::read_entry(file, &entry)?
         } else {
             let entry = self
                 .texentries
                 .get(key)
+                .cloned()
                 .ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
-            pck::read_entry(&mut self.texfile, entry)?
+            let file = self
+                .texfile
+                .as_mut()
+                .ok_or_else(|| "building.pck unavailable".to_string())?;
+            pck::read_entry(file, &entry)?
         };
         self.decode_and_store(key, &data)
     }
@@ -753,10 +963,22 @@ impl Objects {
         });
     }
     pub fn get(&self, idx: usize) -> Option<&bmd::Model> {
-        self.models.get(&format!(
-            "litmodels/world/{}",
-            self.ornaments.get(idx)?.path.to_lowercase()
-        ))
+        self.models
+            .get(&litmodel_key(&self.ornaments.get(idx)?.path))
+    }
+    /// Distinct BMDs that could not be resolved or parsed for this map.
+    pub fn unavailable_model_count(&self) -> usize {
+        self.unavailable_models.len()
+    }
+    /// First failure causes, retained for the whole-world status summary.
+    pub fn unavailable_examples(&self) -> &[String] {
+        &self.unavailable_examples
+    }
+    /// Sorted paths of scenery models that failed archive lookup or parsing.
+    pub fn unavailable_models(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.unavailable_models.iter().cloned().collect();
+        names.sort();
+        names
     }
     pub fn texture(&self, path: &str) -> Option<&Texture> {
         self.cache.get(&normalize(path))
@@ -782,6 +1004,136 @@ impl Objects {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const MASK: u32 = 0xa8937462;
+    const CHECK: u32 = 0x59374231;
+
+    fn put_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    /// A minimal, valid BMD with one empty mesh. The scenery path resolver is
+    /// what these tests exercise, not model geometry.
+    fn empty_bmd() -> Vec<u8> {
+        let mut b = Vec::new();
+        put_u32(&mut b, 0x42584f4d);
+        put_u32(&mut b, 0x10000002);
+        b.extend_from_slice(&[0; 48]);
+        put_u32(&mut b, 1);
+        put_u32(&mut b, 0x10000004);
+        b.extend_from_slice(&[0; 320]);
+        put_u32(&mut b, 0);
+        put_u32(&mut b, 0);
+        b.extend_from_slice(&[0; 48]);
+        b
+    }
+    /// Write an uncompressed v2 PCK whose entries have the given normalized
+    /// names. `compressed == size`, so the production batched reader returns
+    /// the payload bytes without needing a compression fixture.
+    fn write_pck(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, 0x4dca23ef);
+        put_u32(&mut bytes, 0); // patched with the logical package end
+        put_u32(&mut bytes, 0x56a089b7);
+        let mut records = Vec::new();
+        for (name, payload) in entries {
+            records.push((bytes.len() as u32, *name, payload.len() as u32));
+            bytes.extend_from_slice(payload);
+        }
+        let directory_at = bytes.len() as u32;
+        for (offset, name, size) in records {
+            let mut record = vec![0u8; 276];
+            assert!(name.len() <= 260);
+            record[..name.len()].copy_from_slice(name.as_bytes());
+            record[260..264].copy_from_slice(&offset.to_le_bytes());
+            record[264..268].copy_from_slice(&size.to_le_bytes());
+            record[268..272].copy_from_slice(&size.to_le_bytes());
+            put_u32(&mut bytes, 276 ^ MASK);
+            put_u32(&mut bytes, 276 ^ MASK ^ CHECK);
+            bytes.extend_from_slice(&record);
+        }
+        let end = bytes.len() as u32 + 280;
+        let mut footer = vec![0u8; 280];
+        footer[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
+        footer[8..12].copy_from_slice(&(directory_at ^ MASK).to_le_bytes());
+        footer[268..272].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
+        footer[272..276].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        footer[276..280].copy_from_slice(&0x20002u32.to_le_bytes());
+        bytes.extend_from_slice(&footer);
+        bytes[4..8].copy_from_slice(&end.to_le_bytes());
+        std::fs::write(path, &bytes).unwrap();
+    }
+    fn fixture_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "pw-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+    fn ornament(map_id: &str) -> Ornament {
+        Ornament {
+            export_id: 77,
+            offset: 0,
+            position: [0.; 3],
+            direction: [0., 0., 1.],
+            up: [0., 1., 0.],
+            extra: 0,
+            path: "1/litmodel_1399.bmd".into(),
+            map_id: map_id.into(),
+        }
+    }
+    #[test]
+    fn map_partitioned_litmodels_load_from_the_selected_instance_namespace() {
+        let root = fixture_root("map-scoped-litmodels");
+        let bmd = empty_bmd();
+        write_pck(
+            &root.join("litmodels.pck"),
+            &[
+                ("litmodels/a01/1/litmodel_1399.bmd", &bmd),
+                ("litmodels/a11/1/litmodel_1399.bmd", &bmd),
+            ],
+        );
+        write_pck(&root.join("building.pck"), &[]);
+        let mut objects = Objects::open(&root, vec![ornament("a01")]).unwrap();
+        objects.load_ids(&[0]).unwrap();
+        assert!(objects.get(0).is_some());
+        assert_eq!(objects.unavailable_model_count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn a_missing_instance_model_is_skipped_without_aborting_the_world() {
+        let root = fixture_root("missing-instance-litmodel");
+        let bmd = empty_bmd();
+        write_pck(
+            &root.join("litmodels.pck"),
+            &[("litmodels/a11/1/litmodel_1399.bmd", &bmd)],
+        );
+        write_pck(&root.join("building.pck"), &[]);
+        let mut objects = Objects::open(&root, vec![ornament("a01")]).unwrap();
+        objects.load_ids(&[0]).unwrap();
+        assert!(objects.get(0).is_none());
+        assert_eq!(objects.unavailable_model_count(), 1);
+        let reason = &objects.unavailable_examples()[0];
+        assert!(reason.contains("litmodels/a01/"));
+        assert!(reason.contains("refusing cross-map basename fallback"));
+        // A later visible-frame batch must not retry the same absent model.
+        objects.load_ids(&[0]).unwrap();
+        assert_eq!(objects.unavailable_model_count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn missing_optional_scenery_archives_do_not_block_map_objects() {
+        let root = fixture_root("missing-object-archives");
+        let mut objects = Objects::open(&root, vec![ornament("a01")]).unwrap();
+        objects.load_ids(&[0]).unwrap();
+        assert!(objects.get(0).is_none());
+        assert_eq!(objects.unavailable_model_count(), 1);
+        assert!(objects.unavailable_examples()[0].contains("litmodels.pck was not indexed"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     fn tex(fill: u8, side: usize) -> Texture {
         Texture {
             width: side,
