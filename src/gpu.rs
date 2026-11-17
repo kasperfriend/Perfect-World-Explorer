@@ -3758,7 +3758,11 @@ impl Renderer {
         // full-frame texture copy every frame. The depth copy is the post chain's
         // input and only that (`sample_depth` is read by `PostGpu::render`
         // alone), so it follows `use_post`.
-        if self.water_batches.iter().any(|b| !b.simple && b.visible(matrix)) {
+        if self
+            .water_batches
+            .iter()
+            .any(|b| !b.simple && b.visible(matrix))
+        {
             self.water.copy_scene_to_refraction(&mut e);
         }
         if use_post {
