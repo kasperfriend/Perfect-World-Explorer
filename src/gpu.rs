@@ -56,6 +56,10 @@ pub(crate) struct Uniform {
     /// the native blend instead of inverting the lightmap-availability flag.
     fog_range: [f32; 4],
     fog_color: [f32; 4], // encoded client ARGB
+    /// `x`: LOD bias in mip levels for the mipmapped world atlases, `y`:
+    /// `exp2(x)`, the factor that folds the bias into a texture gradient (see
+    /// `crate::render_scale::mip_bias`). `z`/`w` unused.
+    lod: [f32; 4],
 }
 
 /// One lighting/playback snapshot per rendered frame. `render()` samples wall
@@ -133,6 +137,7 @@ impl FrameSnapshot {
         clip: [f32; 4],
         fog_range: [f32; 4],
         fog_color: [f32; 4],
+        lod: [f32; 4],
     ) -> Uniform {
         Uniform {
             matrix: matrix.to_cols_array_2d(),
@@ -150,6 +155,7 @@ impl FrameSnapshot {
             grass_history: self.grass_history,
             fog_range,
             fog_color,
+            lod,
         }
     }
     fn secondary(&self, pass: Pass) -> crate::scenery_visibility::SecondaryView {
@@ -1246,7 +1252,7 @@ fn build(
     })
 }
 const SHADER: &str = r#"
-struct Camera { matrix: mat4x4<f32>, direction: vec4<f32>, clip: vec4<f32>, bounds:vec4<f32>, tree_bounds:vec4<f32>, sun:vec4<f32>, light:vec4<f32>, region_ambient:vec4<f32>, region_diffuse:vec4<f32>, region_direction:vec4<f32>, grass_eye:vec4<f32>, grass_wind:vec4<f32>, grass_history:array<vec4<f32>,80>, fog_range:vec4<f32>, fog_color:vec4<f32> }; @group(0) @binding(0) var<uniform> camera:Camera;
+struct Camera { matrix: mat4x4<f32>, direction: vec4<f32>, clip: vec4<f32>, bounds:vec4<f32>, tree_bounds:vec4<f32>, sun:vec4<f32>, light:vec4<f32>, region_ambient:vec4<f32>, region_diffuse:vec4<f32>, region_direction:vec4<f32>, grass_eye:vec4<f32>, grass_wind:vec4<f32>, grass_history:array<vec4<f32>,80>, fog_range:vec4<f32>, fog_color:vec4<f32>, lod:vec4<f32> }; @group(0) @binding(0) var<uniform> camera:Camera;
 @group(0) @binding(1) var atlas:texture_2d<f32>; @group(0) @binding(2) var atlas_sampler:sampler;
 fn fogged(linear:vec3<f32>, reciprocal_w:f32)->vec3<f32> {
  if camera.fog_range.z<0.5 {return linear;}
@@ -1287,7 +1293,7 @@ fn bmd_baked_rgb(day:u32, night:u32, night_factor:f32)->vec3<u32> {
  if i.kind>4.5 { let d=normalize(camera.direction.xyz); let az=atan2(d.z,d.x); let el=asin(clamp(d.y,-1.,1.)); let rho=i.color.w; let q=vec3<f32>(cos(el)*i.normal.x-sin(el)*i.normal.z,i.normal.y,sin(el)*i.normal.x+cos(el)*i.normal.z); let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. { v=i.normal; }pos+=vec3<f32>(v.x,v.z,v.y);norm=vec3<f32>(0.,1.,0.); }
  o.pos=camera.matrix*vec4<f32>(pos,1.);o.bmd_refraction=1.;if camera.clip.y<0. && i.kind>1.5 && i.kind<2.5 {o.bmd_refraction=bmd_refraction_transmittance(pos);}o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;o.diffuse=vec3<f32>(bmd_baked_rgb(i.diffuse,i.night_diffuse,1.-camera.direction.w))/255.;o.opacity=f32((i.diffuse>>24u)&255u)/255.;return o; }
 fn sdr_blend_band(kind:f32)->bool { return (kind>2.01 && kind<2.03)||(kind>2.11 && kind<2.13); }
-fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || (i.kind>1.5 && i.kind<2.05)) && camera.clip.w == 0. && (front == (camera.clip.z != 0.)) {discard;} if camera.clip.y != 0.0 && (i.world.y-camera.clip.x)*camera.clip.y < 0.0 {discard;} if i.kind>0.5 && i.kind<1.05 {return vec4<f32>(fogged(i.color.rgb,i.pos.w),1.);} if i.kind>1.05 && i.kind<1.25 {return vec4<f32>(bmd_pass_fog(clamp(i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.)),i.pos.w,i.bmd_refraction),1.);} let uv_dx=dpdx(i.uv);let uv_dy=dpdy(i.uv);var uv=i.uv; if i.kind>1.5 {let scale=vec2<f32>(i.color.z,select(i.color.z,i.color.w,i.kind<2.5));let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(uv_dx*dims),length(uv_dy*dims)),1.)),0.,7.);let border=0.5*exp2(mip);let half_pixel=min(vec2<f32>(border)/dims,scale*0.499);let sdr_v=select(0.,-0.5*camera.grass_wind.x,sdr_blend_band(i.kind));let local=fract((i.uv-i.color.xy)/scale+vec2<f32>(0.,sdr_v))*scale;uv=i.color.xy+clamp(local,half_pixel,scale-half_pixel);} let raw_tex=textureSampleGrad(atlas,atlas_sampler,uv,uv_dx,uv_dy);let encoded=raw_tex.rgb;let linear=select(encoded/12.92,pow((encoded+0.055)/1.055,vec3<f32>(2.4)),encoded>vec3<f32>(0.04045));let tex=vec4<f32>(linear,raw_tex.a);if !sdr_blend_band(i.kind) && ((i.kind>1.5 && i.kind<2.5) || i.kind>3.5) && tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9) {discard;} if i.kind>1.5 && i.kind<2.5 {let c=clamp(raw_tex.rgb*i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.));let rgb=select(c/12.92,pow((c+0.055)/1.055,vec3<f32>(2.4)),c>vec3<f32>(0.04045));return vec4<f32>(bmd_pass_fog(rgb,i.pos.w,i.bmd_refraction),select(1.,raw_tex.a*i.opacity,sdr_blend_band(i.kind)));} let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.pos.w),1.); }
+fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || (i.kind>1.5 && i.kind<2.05)) && camera.clip.w == 0. && (front == (camera.clip.z != 0.)) {discard;} if camera.clip.y != 0.0 && (i.world.y-camera.clip.x)*camera.clip.y < 0.0 {discard;} if i.kind>0.5 && i.kind<1.05 {return vec4<f32>(fogged(i.color.rgb,i.pos.w),1.);} if i.kind>1.05 && i.kind<1.25 {return vec4<f32>(bmd_pass_fog(clamp(i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.)),i.pos.w,i.bmd_refraction),1.);} let uv_dx=dpdx(i.uv);let uv_dy=dpdy(i.uv);var uv=i.uv; if i.kind>1.5 {let scale=vec2<f32>(i.color.z,select(i.color.z,i.color.w,i.kind<2.5));let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(uv_dx*dims),length(uv_dy*dims)),1.)),0.,7.);let border=0.5*exp2(mip);let half_pixel=min(vec2<f32>(border)/dims,scale*0.499);let sdr_v=select(0.,-0.5*camera.grass_wind.x,sdr_blend_band(i.kind));let local=fract((i.uv-i.color.xy)/scale+vec2<f32>(0.,sdr_v))*scale;uv=i.color.xy+clamp(local,half_pixel,scale-half_pixel);} let raw_tex=textureSampleGrad(atlas,atlas_sampler,uv,uv_dx*camera.lod.y,uv_dy*camera.lod.y);let encoded=raw_tex.rgb;let linear=select(encoded/12.92,pow((encoded+0.055)/1.055,vec3<f32>(2.4)),encoded>vec3<f32>(0.04045));let tex=vec4<f32>(linear,raw_tex.a);if !sdr_blend_band(i.kind) && ((i.kind>1.5 && i.kind<2.5) || i.kind>3.5) && tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9) {discard;} if i.kind>1.5 && i.kind<2.5 {let c=clamp(raw_tex.rgb*i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.));let rgb=select(c/12.92,pow((c+0.055)/1.055,vec3<f32>(2.4)),c>vec3<f32>(0.04045));return vec4<f32>(bmd_pass_fog(rgb,i.pos.w,i.bmd_refraction),select(1.,raw_tex.a*i.opacity,sdr_blend_band(i.kind)));} let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.pos.w),1.); }
 @fragment fn fs(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
 @fragment fn fs_sdr(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if !sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
 "#;
@@ -1381,7 +1387,41 @@ struct Renderer {
     index: wgpu::Buffer,
     count: u32,
     depth: wgpu::Texture,
+    /// Object-motion attachment for the shared motion-vector pass: `rg` pixel
+    /// motion, `a` coverage, `b` spare, at render extent. Cleared every frame and
+    /// written only by the passes that know an object's own motion
+    /// (`weather_gpu`); see `src/fsr/mv.rs`. The view is cached because the six
+    /// consumer call sites need one per frame.
+    /// Kept alive for the view below; nothing reads the texture directly.
+    #[allow(dead_code)]
+    object_mv: wgpu::Texture,
+    object_mv_view: wgpu::TextureView,
     center: (isize, isize),
+}
+
+/// The object-motion attachment: `Rgba16Float` at the render extent.
+///
+/// `xy` is a pixel-space motion vector (`current + mv = previous`), `z` a
+/// coverage flag. `Rgba16Float` rather than `Rg16Float` because the flag needs a
+/// channel of its own and zero is a legal vector — the consumer must be able to
+/// tell "no producer wrote this pixel" from "the producer says it did not move".
+fn object_mv_target(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("object motion vectors"),
+        size: wgpu::Extent3d {
+            width: w.max(1),
+            height: h.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
 }
 pub(crate) fn depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
@@ -1487,6 +1527,9 @@ pub fn ten_class_placements(t: &Terrain) -> Vec<crate::scenery_visibility::Place
 /// intermediates stay at the full window size and are resized separately.
 fn resize_world_targets(renderer: &mut Renderer, w: u32, h: u32) {
     renderer.depth = depth(&renderer.device, w, h);
+    let (object_mv, object_mv_view) = object_mv_target(&renderer.device, w, h);
+    renderer.object_mv = object_mv;
+    renderer.object_mv_view = object_mv_view;
     // Sky keeps its dummy depth — sampling the real depth in the same
     // pass that writes it is a feedback hazard.
     renderer.water.resize(&renderer.device, w, h);
@@ -1533,6 +1576,7 @@ impl Renderer {
                 grass_history: [[0.; 4]; 80],
                 fog_range: [0.; 4],
                 fog_color: [0.; 4],
+                lod: [0., 1., 0., 0.],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -1554,6 +1598,7 @@ impl Renderer {
                 grass_history: [[0.; 4]; 80],
                 fog_range: [0.; 4],
                 fog_color: [0.; 4],
+                lod: [0., 1., 0., 0.],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -1903,6 +1948,7 @@ impl Renderer {
             Some(&terrain_gpu.grass_light_layout),
         );
         let d = depth_tex;
+        let (object_mv, object_mv_view) = object_mv_target(&device, w, h);
         let post = crate::post_gpu::PostGpu::new(&device, format, w, h);
         let local_pages = m
             .local_pages
@@ -2038,6 +2084,8 @@ impl Renderer {
             index,
             count,
             depth: d,
+            object_mv,
+            object_mv_view,
             center: m.center,
             lod: m.lod,
             spans: m.spans,
@@ -2708,6 +2756,9 @@ impl Renderer {
         view: Pass,
         advance: bool,
         frustum: &[[f32; 4]; 6],
+        // The unjittered view-projection, so a sheet's published motion is the
+        // camera's real motion and not the sub-pixel jitter of the frame.
+        unjittered_vp: Mat4,
     ) {
         // WaterEffect 0 (shipped default) hides EC models and home ornaments
         // in reflection/refraction (0x5b2015, 0x5b2336). RenderContext carries
@@ -2782,6 +2833,43 @@ impl Renderer {
                 occlusion_query_set: None,
             });
             models.draw(&mut pass);
+        }
+        // The sheets' own motion, in a pass of its own: their vector goes into the
+        // object-motion attachment, which the shared pass substitutes where a
+        // producer claims a pixel, and no depth is written. Published here, before
+        // any later view rewrites the frame block and the bucket order, and before
+        // the water and the add-ons are drawn, so nothing they draw is rejected
+        // behind a sheet (`docs/blockers.md` B-26).
+        if matches!(view, Pass::Main) {
+            let size = self.object_mv.size();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("world effect sheet motion"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.object_mv_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                // Tested, never written: a sheet behind a wall claims nothing.
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            models.draw_effect_motion(
+                &self.queue,
+                &mut pass,
+                unjittered_vp.to_cols_array_2d(),
+                (size.width, size.height),
+            );
         }
     }
 
@@ -2883,6 +2971,7 @@ impl Renderer {
             frame.clip,
             [0.; 4],
             [0.; 4],
+            [0., 1., 0., 0.],
         );
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
@@ -2994,6 +3083,11 @@ impl Renderer {
         camera: &Camera,
         w: u32,
         h: u32,
+        // The camera moved discontinuously: every temporal consumer is told to
+        // forget its history this frame, and the object-motion producers have to
+        // obey the same cut or they hand the motion-vector pass a vector built
+        // against a view that no longer exists.
+        reset_history: bool,
     ) {
         // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
         // the same block walk the client runs before the level rule.
@@ -3063,6 +3157,15 @@ impl Renderer {
             frame.clip,
             frame.fog_range,
             frame.fog_color,
+            // The world atlases are mipmapped and the world is drawn below the
+            // display resolution whenever an upscaler runs; the bias is what
+            // keeps the mip choice tied to the display size.
+            [
+                crate::render_scale::mip_bias(),
+                crate::render_scale::mip_gradient_scale(),
+                0.,
+                0.,
+            ],
         );
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&normal));
@@ -3103,7 +3206,32 @@ impl Renderer {
         let refraction = self.water.refraction();
         let scene_color = self.water.scene();
         let scene_depth = self.depth.create_view(&Default::default());
+        // The main view's unjittered view-projection. `matrix` carries the
+        // upscaler's sub-pixel jitter, and a motion vector must not: it describes
+        // where the surface was, not where this frame sampled it. Same expression
+        // the caller derives its own `unjittered_vp` from, so the vectors agree
+        // with the ones the reprojection pass writes.
+        let unjittered_vp = camera.matrix(w, h, camera.far);
         let mut e = self.device.create_command_encoder(&Default::default());
+        // The object-motion attachment is cleared here, before any pass that may
+        // write it, so a frame with no producer still hands the motion-vector
+        // pass a zeroed surface instead of the previous frame's vectors.
+        {
+            let _ = e.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("object motion clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.object_mv_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
         self.draw_opaque(
             &mut e,
             "main scene",
@@ -3128,6 +3256,7 @@ impl Renderer {
             Pass::Main,
             true,
             &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+            unjittered_vp,
         );
         self.draw_addons(
             &mut e,
@@ -3150,6 +3279,9 @@ impl Renderer {
                 daylight,
                 camera.active_fog(),
                 normal.clip,
+                // This depth is the one the motion-vector pass and every
+                // upscaler read, so the clouds owe it their real distance.
+                true,
             );
         }
         self.weather.draw(
@@ -3157,6 +3289,12 @@ impl Renderer {
             &mut e,
             &scene_color,
             &scene_depth,
+            // Main view only: this depth is what the motion-vector pass and the
+            // upscalers read, and this pass also records each particle's own
+            // motion in the object-motion attachment.
+            &self.object_mv_view,
+            (w, h),
+            unjittered_vp,
             matrix,
             camera.pos,
             camera.yaw,
@@ -3164,6 +3302,8 @@ impl Renderer {
             camera.active_fog(),
             normal.clip,
             main_weather,
+            true,
+            reset_history,
         );
         self.water.copy_scene_to_refraction(&mut e);
         self.water.copy_depth(&mut e, &self.depth);
@@ -3447,6 +3587,9 @@ impl Renderer {
                         daylight,
                         above_fog,
                         above.clip,
+                        // The refraction view's depth is not a motion-vector
+                        // input; leave it untouched.
+                        false,
                     );
                 }
                 self.weather.draw(
@@ -3454,6 +3597,9 @@ impl Renderer {
                     &mut re,
                     &refraction,
                     &reflect_depth,
+                    &self.object_mv_view,
+                    (w, h),
+                    unjittered_vp,
                     matrix,
                     camera.pos,
                     camera.yaw,
@@ -3461,6 +3607,10 @@ impl Renderer {
                     above_fog,
                     above.clip,
                     selected_weather,
+                    // The refraction view's depth feeds the water, not the
+                    // motion vectors.
+                    false,
+                    false,
                 );
                 // Ornamental EC models enter refraction only from underwater;
                 // the host player follows its own AABB gate in either view.
@@ -3475,6 +3625,7 @@ impl Renderer {
                         Pass::Refraction,
                         false,
                         &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+                        unjittered_vp,
                     );
                 }
                 self.draw_addons(
@@ -3531,6 +3682,7 @@ impl Renderer {
                 grass_history: frame.grass_history,
                 fog_range: frame.fog_range,
                 fog_color: frame.fog_color,
+                lod: [0., 1., 0., 0.],
             };
             self.queue
                 .write_buffer(&self.reflected_uniform, 0, bytemuck::bytes_of(&reflected));
@@ -3565,6 +3717,8 @@ impl Renderer {
                     daylight,
                     camera.active_fog(),
                     reflected.clip,
+                    // The mirror's depth feeds the water, not the upscalers.
+                    false,
                 );
             }
             self.weather.draw(
@@ -3572,6 +3726,9 @@ impl Renderer {
                 &mut e,
                 &reflection,
                 &reflect_depth,
+                &self.object_mv_view,
+                (w, h),
+                unjittered_vp,
                 matrix * flip,
                 camera.pos,
                 camera.yaw,
@@ -3579,6 +3736,9 @@ impl Renderer {
                 camera.active_fog(),
                 reflected.clip,
                 selected_weather,
+                // The mirror's depth feeds the water, not the motion vectors.
+                false,
+                false,
             );
             let model_view = self.water.reflection_raw();
             self.draw_models(
@@ -3590,6 +3750,7 @@ impl Renderer {
                 Pass::Reflection,
                 false,
                 &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
+                unjittered_vp,
             );
             self.draw_addons(
                 &mut e,
@@ -3664,6 +3825,14 @@ fn water_depth(areas: &[crate::water::WaterArea], pos: Vec3) -> f32 {
         .min_by(|a, b| a.total_cmp(b))
         .unwrap_or(0.)
 }
+/// Distance to the near plane, in world units. Passed to `perspective_rh` as its
+/// `z_far` argument (see `projection_matrix`) and reported to the upscalers as
+/// `cameraNear`.
+const CAMERA_NEAR: f32 = 1.0;
+/// Vertical field of view of the world camera, in radians (70°, the client's
+/// own world FOV).
+const CAMERA_FOV_Y_RADIANS: f32 = 70.0 * std::f32::consts::PI / 180.0;
+
 struct Camera {
     pos: Vec3,
     yaw: f32,
@@ -3810,13 +3979,85 @@ impl Camera {
         let (sp, cp) = self.pitch.sin_cos();
         Vec3::new(s * cp, sp, -c * cp)
     }
-    fn matrix(&self, w: u32, h: u32, far: f32) -> Mat4 {
+    fn view_matrix(&self) -> Mat4 {
+        Mat4::look_to_rh(self.pos, self.direction(), Vec3::Y)
+    }
+    fn projection_matrix(&self, w: u32, h: u32, far: f32) -> Mat4 {
         // Client world is left-handed; a right-handed view must reverse screen X.
+        // `perspective_rh` takes (fov_y, aspect, z_near, z_far); passing the far
+        // plane as `z_near` and `CAMERA_NEAR` as `z_far` is what makes this a
+        // reversed-Z projection (near→1, far→0) in the [0, 1] convention wgpu
+        // uses. Every upscaler is told the same three numbers through
+        // `CameraLens`, so their depth linearisation matches this matrix.
         Mat4::from_scale(Vec3::new(-1., 1., 1.))
-            * Mat4::perspective_rh(70f32.to_radians(), w as f32 / h.max(1) as f32, far, 1.)
-            * Mat4::look_to_rh(self.pos, self.direction(), Vec3::Y)
+            * Mat4::perspective_rh(
+                CAMERA_FOV_Y_RADIANS,
+                w as f32 / h.max(1) as f32,
+                far,
+                CAMERA_NEAR,
+            )
+    }
+
+    /// The lens this camera's projection is built from.
+    fn lens(&self) -> crate::fsr::CameraLens {
+        crate::fsr::CameraLens {
+            near: CAMERA_NEAR,
+            far: self.far,
+            fov_y_radians: CAMERA_FOV_Y_RADIANS,
+        }
+    }
+    fn matrix(&self, w: u32, h: u32, far: f32) -> Mat4 {
+        self.projection_matrix(w, h, far) * self.view_matrix()
     }
 }
+/// Recreate the wgpu present path after frame generation released the hwnd.
+/// The swapchain is rebuilt from the current adapter and size so the sRGB
+/// format choice matches the first creation exactly.
+fn recreate_surface(
+    instance: &wgpu::Instance,
+    window: &Arc<winit::window::Window>,
+    adapter: &wgpu::Adapter,
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> Result<wgpu::Surface<'static>, String> {
+    let surface = instance
+        .create_surface(window.clone())
+        .map_err(|error| error.to_string())?;
+    let caps = surface.get_capabilities(adapter);
+    let surface_format = *caps
+        .formats
+        .iter()
+        .find(|x| x.is_srgb())
+        .unwrap_or(&caps.formats[0]);
+    let mut cfg = surface
+        .get_default_config(adapter, config.width.max(1), config.height.max(1))
+        .ok_or("surface configuration unavailable")?;
+    cfg.format = surface_format;
+    if surface_format.is_srgb() {
+        cfg.view_formats.push(surface_format.remove_srgb_suffix());
+    }
+    surface.configure(device, &cfg);
+    Ok(surface)
+}
+
+/// The Win32 hwnd of `window`, for handing the window to the frame
+/// generation swapchain.
+#[cfg(windows)]
+fn window_hwnd(window: &winit::window::Window) -> Result<*mut std::ffi::c_void, String> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = window.window_handle().map_err(|error| error.to_string())?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(handle) => Ok(handle.hwnd.get() as *mut std::ffi::c_void),
+        _ => Err("the window is not a Win32 window".to_string()),
+    }
+}
+
+/// Frame generation is only supported on Windows.
+#[cfg(not(windows))]
+fn window_hwnd(_window: &winit::window::Window) -> Result<*mut std::ffi::c_void, String> {
+    Err("frame generation requires a Win32 window".to_string())
+}
+
 /// The neutral light a map gets when no environment record answers: full white
 /// ambient and diffuse from straight above, which is the every-material default
 /// the client's own shaders fall back to. Geometry — and therefore every effect
@@ -3863,6 +4104,7 @@ fn receiving_model_frame_with(
         reverse_front: uniform.clip[2] != 0.,
         alpha_compare: 5,
         alpha_reference: 84. / 255.,
+        lod_bias: crate::render_scale::mip_bias(),
     }
 }
 fn receiving_model_frame(
@@ -3876,6 +4118,31 @@ fn receiving_model_frame(
         light.unwrap_or_else(neutral_regional_light),
     )
 }
+/// Backends to request for the viewer's instance. Windows renders on the
+/// D3D12 API: `Backends::DX12` only, so a working DX12 driver can never be
+/// silently bypassed. If no DX12 adapter exists (very old drivers), the
+/// caller falls back to `Backends::all()` with a printed warning. `WGPU_BACKEND`
+/// always wins, which is what the CI GPU checks use.
+fn preferred_backends() -> wgpu::Backends {
+    wgpu::util::backend_bits_from_env().unwrap_or({
+        #[cfg(windows)]
+        {
+            wgpu::Backends::DX12
+        }
+        #[cfg(not(windows))]
+        {
+            wgpu::Backends::all()
+        }
+    })
+}
+
+fn make_instance() -> wgpu::Instance {
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: preferred_backends(),
+        ..Default::default()
+    })
+}
+
 async fn adapter(
     instance: &wgpu::Instance,
     surface: Option<&wgpu::Surface<'_>>,
@@ -3936,14 +4203,28 @@ pub fn run(
             .build(&event_loop)
             .map_err(|e| e.to_string())?,
     );
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all()),
-        ..Default::default()
-    });
-    let surface = instance
+    let mut instance = make_instance();
+    let mut surface = instance
         .create_surface(window.clone())
         .map_err(|e| e.to_string())?;
-    let (adapter, device, queue) = pollster::block_on(adapter(&instance, Some(&surface)))?;
+    let mut adapter_result = pollster::block_on(adapter(&instance, Some(&surface)));
+    if let Err(error) = &adapter_result {
+        if std::env::var_os("WGPU_BACKEND").is_none() {
+            eprintln!(
+                "Perfect World Explorer: no D3D12 adapter ({error}); falling back to all backends"
+            );
+            let fallback = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
+                ..Default::default()
+            });
+            surface = fallback
+                .create_surface(window.clone())
+                .map_err(|e| format!("surface unavailable on the fallback backend: {e}"))?;
+            instance = fallback;
+            adapter_result = pollster::block_on(adapter(&instance, Some(&surface)));
+        }
+    }
+    let (adapter, device, queue) = adapter_result?;
     let software_adapter = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
     window.set_title(&format!(
         "Perfect World Explorer — {} — click mouse to look, Esc menu, WASD fly",
@@ -3984,6 +4265,16 @@ pub fn run(
         .environments
         .atmosphere(camera.pos.to_array(), camera.time_of_day);
     let mut settings = ViewSettings::load_with_default_fog(t.environments.auto_fog_enabled());
+    // Facts for the Graphics-tab upscaler gating. The adapter is not moved
+    // into the renderer, so it is still available here.
+    let gpu_facts = crate::GpuFacts::from_parts(
+        adapter.get_info().vendor,
+        adapter.get_info().device,
+        adapter.get_info().name.as_str(),
+        &format!("{:?}", adapter.get_info().backend),
+        adapter.get_info().device_type == wgpu::DeviceType::Cpu,
+    );
+    let sdk_report = crate::probe_sdk(&settings.upscale_sdk_dir);
     // The axial card rule is read by the player, not by this loop, so it has to
     // be published before the first effect is built as well as on every change.
     crate::gfx_player::set_shaft_mode(settings.effect_shaft);
@@ -4013,21 +4304,111 @@ pub fn run(
     // view each frame. `applied_extent` is tracked so a window resize or a
     // slider change reallocates the offscreen and world targets exactly once.
     let max_texture_dimension = renderer.device.limits().max_texture_dimension_2d;
-    let mut applied_extent = crate::render_scale::scaled_extent(
+    let slider_extent = crate::render_scale::scaled_extent(
         config.width,
         config.height,
         settings.resolution_scale,
         max_texture_dimension,
     );
+    // The extent the world is actually drawn at. It equals `applied_extent`
+    // while a provider is alive, and the plain (Off) extent when the provider
+    // the settings ask for is not running — see the `upscaler_running` block in
+    // the redraw loop. Keeping it in one variable is what stops the world,
+    // depth, water and post targets from being reallocated every frame.
+    // The provider x mode table (`crate::modes`) decides which modes exist. A
+    // saved mode the selected provider does not advertise — a config file
+    // written while another provider was active — degrades to the nearest ratio
+    // that provider does offer, here, so the extent the world renders at and
+    // the mode handed to `CreateFeature` can never disagree.
+    settings.upscale_quality =
+        crate::nearest_available(settings.upscaling, settings.upscale_quality);
+    let mut applied_extent = crate::render_extent(
+        slider_extent,
+        (config.width, config.height),
+        max_texture_dimension,
+        settings.upscaling,
+        settings.upscale_quality,
+        &gpu_facts,
+        &sdk_report,
+    );
+    let mut world_extent = applied_extent;
     let mut render_scale = crate::render_scale::RenderScale::new(
         &renderer.device,
         format,
         applied_extent.0,
         applied_extent.1,
+        config.width,
+        config.height,
     );
     if applied_extent != (config.width, config.height) {
         resize_world_targets(&mut renderer, applied_extent.0, applied_extent.1);
     }
+    // Optional FSR path. Created lazily inside the redraw loop once the
+    // session selects it; recreated whenever the render extent moves. A
+    // failure is sticky for the session and falls back to the bilinear
+    // blit instead of retrying every frame.
+    let mut fsr_upscaler: Option<crate::fsr::FsrUpscaler> = None;
+    let mut fsr_failed = false;
+    let mut fsr_fail_reason: Option<String> = None;
+    let mut xess_upscaler: Option<crate::xess::XessUpscaler> = None;
+    let mut xess_failed = false;
+    let mut xess_fail_reason: Option<String> = None;
+    let mut dlss_upscaler: Option<crate::dlss::DlssUpscaler> = None;
+    let mut dlss_failed = false;
+    let mut dlss_fail_reason: Option<String> = None;
+    // A single failed init used to disable a provider for the rest of the
+    // session. NGX and XeSS both refuse to initialise on the first frame of
+    // some runs (the driver is still bringing its runtime up), so each
+    // provider gets a small budget of delayed retries before "failed" is final.
+    let mut last_upscaler_state: Option<String> = None;
+    let mut xess_retries: u32 = 0;
+    let mut xess_retry_at: Option<Instant> = None;
+    let mut dlss_retries: u32 = 0;
+    let mut dlss_retry_at: Option<Instant> = None;
+    // Frame generation drops wgpu's swapchain (the SDK creates its own proxy
+    // for the hwnd); `surface` is recreated when the pipeline is created or
+    // destroyed. A failure disables it until the Frame generation setting is
+    // changed again: the setting tracker below clears `fg_failed`, so a
+    // transient hand-over problem (a swapchain still holding the window, a
+    // resize in flight) is retryable without restarting.
+    let mut framegen: Option<crate::fsr::FrameGeneration> = None;
+    let mut fg_failed = false;
+    let mut fg_fail_reason: Option<String> = None;
+    let mut xess_framegen: Option<crate::xess::XessFrameGeneration> = None;
+    let mut xess_fg_failed = false;
+    let mut xess_fg_fail_reason: Option<String> = None;
+    // DLSS Frame Generation: NGX owns the feature, the viewer owns a flip-model
+    // swapchain for the window (DXGI allows one per hwnd, so it excludes the
+    // other two frame generators while it is active).
+    let mut dlss_framegen: Option<crate::dlss::DlssFrameGeneration> = None;
+    let mut dlss_fg_failed = false;
+    let mut dlss_fg_fail_reason: Option<String> = None;
+    // Graphics -> Latency -> XeLL owns a XeLL context of its own, unless XeSS
+    // Frame Generation is active (it must create one itself, and two contexts
+    // on the same device/window are not supported). `crate::latency_owner`
+    // decides; a failed creation is sticky for the session and leaves the
+    // vsync'd present path untouched.
+    let mut latency: Option<crate::latency::LatencySession> = None;
+    // Reflex is a CPU-side pacer (no SDK, no device object); it exists while
+    // Graphics -> Latency -> Reflex is selected.
+    let mut reflex: Option<crate::latency::ReflexPacer> = None;
+    let mut latency_failed = false;
+    let mut latency_fail_reason: Option<String> = None;
+    let mut surface: Option<wgpu::Surface<'static>> = Some(surface);
+    let mut last_fsr_camera_pos = camera.pos;
+    // The direction the previous frame was rendered with, for the discontinuity
+    // test below. `direction()` is unit length by construction.
+    let mut last_fsr_camera_dir = camera.direction();
+    // Settings the sticky failure flags are keyed to (see below).
+    let mut applied_upscaling = settings.upscaling;
+    let mut applied_frame_gen = settings.frame_generation;
+    // The frame multiplier is part of a frame generator's construction, so a
+    // change to it tears the active one down and builds it again.
+    let mut applied_frame_multiplier = settings.frame_multiplier;
+    let mut applied_latency = settings.latency;
+    // Frame generation takes the window over from wgpu, which presupposes
+    // that wgpu has presented on it at least once.
+    let mut presented_once = false;
     let mut display_gamma: Option<crate::display_gamma::DisplayGamma> = None;
     // Only allocated for UNORM-only swapchains; None is the normal sRGB route.
     let mut present_encode: Option<crate::present_encode::PresentEncode> =
@@ -4306,21 +4687,553 @@ pub fn run(
                 WindowEvent::Resized(s) if s.width > 0 && s.height > 0 => {
                     config.width = s.width;
                     config.height = s.height;
-                    surface.configure(&renderer.device, &config);
+                    if let Some(surface) = surface.as_ref() {
+                        surface.configure(&renderer.device, &config);
+                    }
                     // Scaled world targets are reallocated by the next redraw,
                     // which notices the new window extent (see below).
                     if let Some(gamma)=display_gamma.as_mut() {gamma.resize(&renderer.device,s.width,s.height);}
                     if let Some(encode)=present_encode.as_mut() {encode.resize(&renderer.device,s.width,s.height);}
                 }
                 WindowEvent::RedrawRequested => {
+                    // Reflex pacing first: everything below belongs to the
+                    // frame the CPU is only allowed to start now.
+                    if let Some(pacer) = reflex.as_mut() {
+                        pacer.begin_frame();
+                    }
+                    // XeSS Frame Generation: xellSleep must be called once per
+                    // frame before any simulation or render work for it.
+                    if let Some(fg) = xess_framegen.as_mut() {
+                        fg.begin_frame();
+                    }
+                    // Same edge for the standalone XeLL session (Graphics ->
+                    // Latency -> XeLL without XeSS Frame Generation).
+                    if let Some(session) = latency.as_mut() {
+                        session.begin_frame();
+                    }
+                    // Graphics -> Latency also answers "who paces presents".
+                    // Both strategies ask for Fifo (XeLL requires sync interval
+                    // 1), but the swapchain is reconfigured when it changes so
+                    // the setting is wired rather than decorative.
+                    let wanted_present_mode = settings.latency.present_mode();
+                    if config.present_mode != wanted_present_mode {
+                        config.present_mode = wanted_present_mode;
+                        if let Some(active_surface) = surface.as_ref() {
+                            active_surface.configure(&renderer.device, &config);
+                        }
+                    }
                     // One place handles both a window resize and a Graphics-tab
                     // scale change: reallocate only when the scaled extent moves.
-                    let wanted_extent = crate::render_scale::scaled_extent(config.width, config.height, settings.resolution_scale, max_texture_dimension);
-                    if wanted_extent != applied_extent {
-                        applied_extent = wanted_extent;
-                        resize_world_targets(&mut renderer, wanted_extent.0, wanted_extent.1);
-                        render_scale.resize(&renderer.device, wanted_extent.0, wanted_extent.1);
+                    let slider_extent = crate::render_scale::scaled_extent(config.width, config.height, settings.resolution_scale, max_texture_dimension);
+                    settings.upscale_quality =
+                        crate::nearest_available(settings.upscaling, settings.upscale_quality);
+                    let wanted_extent = crate::render_extent(slider_extent, (config.width, config.height), max_texture_dimension, settings.upscaling, settings.upscale_quality, &gpu_facts, &sdk_report);
+                    applied_extent = wanted_extent;
+                    // Recreate the FSR context lazily; a pure window resize
+                    // can move the display extent even when the render
+                    // extent holds.
+                    let want_fsr_version = settings.upscaling.ffx_major().unwrap_or(0);
+                    if let Some(fsr) = fsr_upscaler.as_ref() {
+                        if fsr.render_extent() != applied_extent
+                            || fsr.display_extent() != (config.width, config.height)
+                            || fsr.version_major() != want_fsr_version
+                        {
+                            fsr_upscaler = None;
+                        }
                     }
+                    let want_fsr = settings.upscaling.is_ffx_fsr()
+                        && !fsr_failed
+                        && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
+                    if want_fsr && fsr_upscaler.is_none() {
+                        match crate::fsr::FsrUpscaler::new(&renderer.device, &renderer.queue, &settings.upscale_sdk_dir, applied_extent, (config.width, config.height), format, want_fsr_version) {
+                            Ok(up) => fsr_upscaler = Some(up),
+                            Err(error) => {
+                                crate::fsr::diag(&format!("FSR unavailable, rendering at native resolution instead: {error}"));
+                                fsr_fail_reason = Some(error);
+                                fsr_failed = true;
+                            }
+                        }
+                    } else if !want_fsr {
+                        fsr_upscaler = None;
+                    }
+                    // Recreate the XeSS context lazily on the same schedule.
+                    if let Some(xess) = xess_upscaler.as_ref() {
+                        if xess.render_extent() != applied_extent
+                            || xess.display_extent() != (config.width, config.height)
+                        {
+                            xess_upscaler = None;
+                        }
+                    }
+                    // Delayed retries: a sticky failure is only final after the
+                    // budget is spent (three attempts, three seconds apart).
+                    if xess_failed
+                        && xess_retries < 3
+                        && xess_retry_at.map_or(true, |t| t.elapsed().as_secs() >= 3)
+                    {
+                        xess_retries += 1;
+                        xess_retry_at = Some(Instant::now());
+                        xess_failed = false;
+                        xess_fail_reason = None;
+                    }
+                    if dlss_failed
+                        && dlss_retries < 3
+                        && dlss_retry_at.map_or(true, |t| t.elapsed().as_secs() >= 3)
+                    {
+                        dlss_retries += 1;
+                        dlss_retry_at = Some(Instant::now());
+                        dlss_failed = false;
+                        dlss_fail_reason = None;
+                    }
+                    let want_xess = settings.upscaling == crate::UpscaleMethod::Xess
+                        && !xess_failed
+                        && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
+                    if want_xess && xess_upscaler.is_none() {
+                        match crate::xess::XessUpscaler::new(&renderer.device, &renderer.queue, &settings.upscale_sdk_dir, applied_extent, (config.width, config.height), format, settings.upscale_quality) {
+                            Ok(up) => xess_upscaler = Some(up),
+                            Err(error) => {
+                                crate::xess::diag(&format!("XeSS unavailable, rendering at native resolution instead: {error}"));
+                                xess_fail_reason = Some(error);
+                                xess_failed = true;
+                                // First retry in three seconds, not on the next frame.
+                                xess_retry_at = Some(Instant::now());
+                            }
+                        }
+                    } else if !want_xess {
+                        xess_upscaler = None;
+                    }
+                    // Recreate the DLSS (NGX) context lazily on the same
+                    // schedule: DLSS feature creation is bound to the render
+                    // and display extents.
+                    if let Some(dlss) = dlss_upscaler.as_ref() {
+                        // Compared against what the settings *asked* for, not
+                        // what DLSS chose: NGX's optimal settings decide the
+                        // render size and can differ by a pixel from the
+                        // settings table's ratio, and comparing the effective
+                        // extent would rebuild the feature every single frame.
+                        if dlss.requested_extent() != applied_extent
+                            || dlss.display_extent() != (config.width, config.height)
+                        {
+                            dlss_upscaler = None;
+                        }
+                    }
+                    // Below 32x32 NGX refuses the feature outright (§3.3.1 of the
+                    // DLSS guide), and a minimised window is not a reason to
+                    // spend the retry budget or to record a failure the user
+                    // would then read in the Graphics tab.
+                    let dlss_window_big_enough = config.width >= 32 && config.height >= 32;
+                    let want_dlss = settings.upscaling == crate::UpscaleMethod::Dlss
+                        && !dlss_failed
+                        && dlss_window_big_enough
+                        && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
+                    if want_dlss && dlss_upscaler.is_none() {
+                        match crate::dlss::DlssUpscaler::new(&renderer.device, &renderer.queue, &settings.upscale_sdk_dir, applied_extent, (config.width, config.height), format, settings.upscale_quality) {
+                            Ok(up) => dlss_upscaler = Some(up),
+                            Err(error) => {
+                                crate::dlss::diag(&format!("DLSS unavailable, rendering at native resolution instead: {error}"));
+                                dlss_fail_reason = Some(error);
+                                dlss_failed = true;
+                                dlss_retry_at = Some(Instant::now());
+                            }
+                        }
+                    } else if !want_dlss {
+                        dlss_upscaler = None;
+                    }
+                    // The world is drawn at the extent of the provider that is
+                    // actually *alive*, not at the one the settings ask for
+                    // (`applied_extent` comes from the support table and keeps
+                    // answering e.g. 1280x720 even when the provider failed to
+                    // initialise). Without this, a failed provider left the world
+                    // at 1280x720 while the present path fell back to a bilinear
+                    // stretch — blurrier than Upscaling Off, and identical to it
+                    // at a 1.0x ratio. FSR 1 has no context object (it is the
+                    // in-tree EASU+RCAS pass inside `RenderScale::blit`), so it
+                    // counts as running only while `crate::fsr1_eligible`.
+                    let upscaler_running = fsr_upscaler.is_some()
+                        || xess_upscaler.is_some()
+                        || dlss_upscaler.is_some()
+                        || (settings.upscaling == crate::UpscaleMethod::Fsr1
+                            && crate::fsr1_eligible(applied_extent, (config.width, config.height)));
+                    // DLSS evaluates at the render size NGX's optimal settings
+                    // returned, which is not necessarily the settings table's
+                    // guess; the world has to be drawn at the size the feature
+                    // will actually be handed.
+                    let live_extent = dlss_upscaler
+                        .as_ref()
+                        .map(|dlss| dlss.render_extent())
+                        .unwrap_or(applied_extent);
+                    let wanted_world = if upscaler_running {
+                        live_extent
+                    } else {
+                        slider_extent
+                    };
+                    if wanted_world != world_extent {
+                        world_extent = wanted_world;
+                        resize_world_targets(&mut renderer, world_extent.0, world_extent.1);
+                    }
+                    render_scale.resize(
+                        &renderer.device,
+                        world_extent.0,
+                        world_extent.1,
+                        config.width,
+                        config.height,
+                    );
+                    // Mip bias for the world atlases (programming guide, "Mip
+                    // bias"): a temporal upscaler is given the guide's
+                    // `log2(render/display) - 1`, the resolution slider on its
+                    // own only the ratio. `world_extent` is the extent the world
+                    // is really drawn at, so a failed provider cannot leave a
+                    // stale bias behind.
+                    crate::render_scale::set_mip_bias(
+                        world_extent,
+                        (config.width, config.height),
+                        upscaler_running,
+                    );
+                    // A changed Frame generation or Latency setting clears
+                    // the sticky failure of that feature, so the new choice
+                    // is really attempted instead of inheriting the previous
+                    // one's verdict. Without this a single failed hand-over
+                    // disables frame generation for the rest of the session.
+                    // A different upscaler is a different failure domain: the
+                    // sticky "failed -> bilinear" verdict belongs to the provider
+                    // that failed. Without this, a DLSS failure stayed on screen
+                    // underneath a perfectly working XeSS badge, and a provider
+                    // that failed once could never be retried in that session.
+                    if settings.upscaling != applied_upscaling {
+                        applied_upscaling = settings.upscaling;
+                        fsr_failed = false;
+                        fsr_fail_reason = None;
+                        xess_failed = false;
+                        xess_fail_reason = None;
+                        dlss_failed = false;
+                        dlss_fail_reason = None;
+                    }
+                    let multiplier_changed = settings.frame_multiplier != applied_frame_multiplier;
+                    if settings.frame_generation != applied_frame_gen {
+                        applied_frame_gen = settings.frame_generation;
+                        fg_failed = false;
+                        fg_fail_reason = None;
+                        xess_fg_failed = false;
+                        xess_fg_fail_reason = None;
+                        dlss_fg_failed = false;
+                        dlss_fg_fail_reason = None;
+                    }
+                    if multiplier_changed {
+                        applied_frame_multiplier = settings.frame_multiplier;
+                    }
+                    if settings.latency != applied_latency {
+                        applied_latency = settings.latency;
+                        latency_failed = false;
+                        latency_fail_reason = None;
+                    }
+                    // A persisted multiplier this GPU cannot serve (an RTX 40
+                    // card that once saw `x6`, or FSR with `x3`) degrades to
+                    // x2 here instead of failing the frame generator: the
+                    // combo greys those entries out, but a settings file can
+                    // still carry one.
+                    let effective_multiplier = if crate::multiplier_support(
+                        settings.frame_generation,
+                        settings.frame_multiplier,
+                        &gpu_facts,
+                        &sdk_report,
+                    )
+                    .is_available()
+                    {
+                        settings.frame_multiplier
+                    } else {
+                        crate::FrameMultiplier::X2
+                    };
+                    // Frame generation transitions (enable / disable / extent
+                    // change). Runs before any surface access this frame.
+                    let want_fg = settings.frame_generation == crate::FrameGenMethod::Fsr
+                        && presented_once
+                        && !fg_failed
+                        && crate::support_framegen(
+                            crate::FrameGenMethod::Fsr,
+                            settings.upscaling,
+                            &gpu_facts,
+                            &sdk_report,
+                        )
+                        .is_available();
+                    let fg_extent_changed = multiplier_changed
+                        || framegen.as_ref().is_some_and(|fg| {
+                            fg.size() != (config.width, config.height)
+                                || fg.render_extent() != world_extent
+                        });
+                    if (!want_fg || fg_extent_changed) && framegen.is_some() {
+                        framegen = None; // Destroying drops the FFX contexts and releases the proxy.
+                        match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                            Ok(s) => surface = Some(s),
+                            Err(error) => {
+                                crate::fsr::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                fg_failed = true;
+                            }
+                        }
+                    }
+                    // XeSS Frame Generation transitions (enable / disable /
+                    // extent change). Same one-swapchain-per-hwnd rule.
+                    let want_xess_fg = settings.frame_generation == crate::FrameGenMethod::Xess
+                        && presented_once
+                        && !xess_fg_failed
+                        && crate::support_framegen(
+                            crate::FrameGenMethod::Xess,
+                            settings.upscaling,
+                            &gpu_facts,
+                            &sdk_report,
+                        )
+                        .is_available();
+                    let xess_fg_extent_changed = multiplier_changed
+                        || xess_framegen.as_ref().is_some_and(|fg| {
+                            fg.size() != (config.width, config.height)
+                                || fg.render_extent() != world_extent
+                        });
+                    if (!want_xess_fg || xess_fg_extent_changed) && xess_framegen.is_some() {
+                        xess_framegen = None; // Destroying drops XeSS-FG, the proxy and then XeLL.
+                        match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                            Ok(s) => surface = Some(s),
+                            Err(error) => {
+                                crate::xess::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                xess_fg_failed = true;
+                            }
+                        }
+                    }
+                    if want_xess_fg && xess_framegen.is_none() {
+                        surface = None;
+                        match window_hwnd(&window) {
+                            Ok(hwnd) => match crate::xess::XessFrameGeneration::new(
+                                &renderer.device,
+                                &renderer.queue,
+                                &settings.upscale_sdk_dir,
+                                hwnd,
+                                world_extent,
+                                (config.width, config.height),
+                                surface_format,
+                                format,
+                                effective_multiplier.generated(),
+                            ) {
+                                Ok(fg) => {
+                                    crate::xess::diag("XeSS frame generation active (proxy swapchain on the HWND)");
+                                    xess_framegen = Some(fg);
+                                }
+                                Err(error) => {
+                                    crate::xess::diag(&format!("XeSS frame generation unavailable, using the standard present path: {error}"));
+                                    xess_fg_fail_reason = Some(error);
+                                    xess_fg_failed = true;
+                                    match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                        Ok(s) => surface = Some(s),
+                                        Err(error) => {
+                                            crate::xess::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                        }
+                                    }
+                                }
+                            },
+                            Err(error) => {
+                                crate::xess::diag(&format!("XeSS frame generation unavailable (no Win32 hwnd): {error}"));
+                                xess_fg_fail_reason = Some(error);
+                                xess_fg_failed = true;
+                                match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                    Ok(s) => surface = Some(s),
+                                    Err(error) => {
+                                        crate::xess::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // DLSS Frame Generation. Same one-swapchain-per-hwnd rule as
+                    // the other two: the wgpu surface is dropped first.
+                    let want_dlss_fg = settings.frame_generation
+                        == crate::FrameGenMethod::Dlss
+                        && presented_once
+                        && !dlss_fg_failed
+                        && crate::support_framegen(
+                            crate::FrameGenMethod::Dlss,
+                            settings.upscaling,
+                            &gpu_facts,
+                            &sdk_report,
+                        )
+                        .is_available();
+                    let dlss_fg_extent_changed = multiplier_changed
+                        || dlss_framegen.as_ref().is_some_and(|fg| {
+                            fg.size() != (config.width, config.height)
+                                || fg.render_extent() != world_extent
+                        });
+                    if (!want_dlss_fg || dlss_fg_extent_changed) && dlss_framegen.is_some() {
+                        dlss_framegen = None; // Releases the NGX feature and the swapchain.
+                        match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                            Ok(s) => surface = Some(s),
+                            Err(error) => {
+                                crate::dlss::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                dlss_fg_failed = true;
+                            }
+                        }
+                    }
+                    if want_dlss_fg && dlss_framegen.is_none() {
+                        surface = None;
+                        match window_hwnd(&window) {
+                            Ok(hwnd) => match crate::dlss::DlssFrameGeneration::new(
+                                &renderer.device,
+                                &renderer.queue,
+                                &settings.upscale_sdk_dir,
+                                hwnd,
+                                world_extent,
+                                (config.width, config.height),
+                                surface_format,
+                                format,
+                                effective_multiplier.generated(),
+                            ) {
+                                Ok(fg) => {
+                                    crate::dlss::diag("DLSS Frame Generation active (flip-model swapchain on the HWND)");
+                                    dlss_framegen = Some(fg);
+                                }
+                                Err(error) => {
+                                    crate::dlss::diag(&format!("DLSS Frame Generation unavailable, using the standard present path: {error}"));
+                                    dlss_fg_fail_reason = Some(error);
+                                    dlss_fg_failed = true;
+                                    match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                        Ok(s) => surface = Some(s),
+                                        Err(error) => {
+                                            crate::dlss::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                        }
+                                    }
+                                }
+                            },
+                            Err(error) => {
+                                crate::dlss::diag(&format!("DLSS Frame Generation unavailable (no Win32 hwnd): {error}"));
+                                dlss_fg_fail_reason = Some(error);
+                                dlss_fg_failed = true;
+                                match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                    Ok(s) => surface = Some(s),
+                                    Err(error) => {
+                                        crate::dlss::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if want_fg && framegen.is_none() {
+                        // DX12 allows exactly one swapchain per hwnd; drop ours
+                        // so FFX can create its proxy for the same window.
+                        surface = None;
+                        match window_hwnd(&window) {
+                            Ok(hwnd) => match crate::fsr::FrameGeneration::new(
+                                &renderer.device,
+                                &renderer.queue,
+                                &settings.upscale_sdk_dir,
+                                hwnd,
+                                world_extent,
+                                (config.width, config.height),
+                                surface_format,
+                                format,
+                            ) {
+                                Ok(fg) => {
+                                    crate::fsr::diag("FSR frame generation active (proxy swapchain on the HWND)");
+                                    framegen = Some(fg);
+                                }
+                                Err(error) => {
+                                    crate::fsr::diag(&format!("FSR frame generation unavailable, using the standard present path: {error}"));
+                                    fg_fail_reason = Some(error);
+                                    fg_failed = true;
+                                    match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                        Ok(s) => surface = Some(s),
+                                        Err(error) => {
+                                            crate::fsr::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                        }
+                                    }
+                                }
+                            },
+                            Err(error) => {
+                                crate::fsr::diag(&format!("FSR frame generation unavailable (no Win32 hwnd): {error}"));
+                                fg_fail_reason = Some(error);
+                                fg_failed = true;
+                                match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                    Ok(s) => surface = Some(s),
+                                    Err(error) => {
+                                        crate::fsr::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Latency transitions. The owner rule decides whether the
+                    // viewer runs XeLL itself, leaves it to XeSS Frame
+                    // Generation, or does not run it at all.
+                    // Only XeLL creates a context; Reflex is the viewer's own
+                    // pacer and never touches `libxell.dll`.
+                    let want_latency = matches!(
+                        crate::latency_owner(settings.latency, settings.frame_generation),
+                        crate::LatencyOwner::Independent
+                    ) && settings.latency == crate::LatencyMode::Xell
+                        && !latency_failed
+                        && crate::support_latency(
+                            settings.latency,
+                            settings.frame_generation,
+                            &gpu_facts,
+                            &sdk_report,
+                        )
+                        .is_available();
+                    // Graphics -> Latency -> Reflex: pure CPU pacing, so it is
+                    // created whenever the mode is selected and needs no
+                    // capability probe or failure path.
+                    if settings.latency == crate::LatencyMode::Reflex {
+                        if reflex.is_none() {
+                            // Seeded at 60 Hz and re-learned from the present
+                            // timestamps within a few frames, so this needs no
+                            // monitor query and has no failure path.
+                            let pacer = crate::latency::ReflexPacer::new(60.0);
+                            crate::latency::diag(&format!(
+                                "Reflex pacing active ({:.1} ms initial frame budget, re-learned from the present cadence); presents stay vsync'd with sync interval 1",
+                                pacer.budget_ms()
+                            ));
+                            reflex = Some(pacer);
+                        }
+                    } else {
+                        reflex = None;
+                    }
+                    if !want_latency {
+                        // Dropping the session destroys the XeLL context; the
+                        // swapchain is untouched, so nothing else changes.
+                        latency = None;
+                    } else if latency.is_none() {
+                        match crate::latency::LatencySession::new(
+                            &renderer.device,
+                            &settings.upscale_sdk_dir,
+                        ) {
+                            Ok(session) => latency = Some(session),
+                            Err(error) => {
+                                crate::latency::diag(&format!(
+                                    "XeLL unavailable, presenting with VSync pacing instead: {error}"
+                                ));
+                                latency_fail_reason = Some(error);
+                                latency_failed = true;
+                            }
+                        }
+                    }
+                    // Any discontinuous camera move invalidates the upscaler
+                    // history. Position alone is not enough: a respawn that keeps
+                    // the position, a look-behind snap or a cut that turns the
+                    // view most of the way round reprojects every pixel to the
+                    // wrong place, and the history takes many frames to wash out.
+                    //
+                    // Thirty degrees in one frame is far past anything a hand
+                    // produces — a 1000 deg/s flick is 16 deg at 60 Hz — and well
+                    // under the turn of a cut, so the threshold separates them
+                    // without resetting on ordinary fast play.
+                    let turned = last_fsr_camera_dir.dot(camera.direction()) < 0.866_025_4;
+                    let camera_jumped = camera.pos.distance_squared(last_fsr_camera_pos) > 64.0 * 64.0
+                        || turned;
+                    if camera_jumped {
+                        if let Some(fsr) = fsr_upscaler.as_mut() {
+                            fsr.reset_history();
+                        }
+                        if let Some(xess) = xess_upscaler.as_mut() {
+                            xess.reset_history();
+                        }
+                        if let Some(dlss) = dlss_upscaler.as_mut() {
+                            dlss.reset_history();
+                        }
+                    }
+                    last_fsr_camera_pos = camera.pos;
+                    last_fsr_camera_dir = camera.direction();
                     if settings != saved_settings && last_settings_save.elapsed().as_secs_f32() >= 1. {
                         if let Err(e)=settings.save(){eprintln!("Settings save: {e}");} else {saved_settings=settings.clone();}
                         last_settings_save=Instant::now();
@@ -4638,28 +5551,323 @@ pub fn run(
                         match result { Ok(img)=>{let size=[img.width() as usize,img.height() as usize];let pixels=img.into_raw();let color=egui::ColorImage::from_rgba_unmultiplied(size,&pixels);original_minimap_id=Some(egui_ctx.load_texture("original minimap",color,egui::TextureOptions::LINEAR));},Err(e)=>{eprintln!("Original minimap: {e}");original_minimap_error=Some(e);}}
                         original_minimap_rx=None;
                     }}
-                    match surface.get_current_texture() {
-                        Ok(frame) => {
-                            let surface_view = frame.texture.create_view(&Default::default());
+                    // Acquire the frame. Frame generation owns presentation:
+                    // no wgpu swapchain exists in that mode, so there is
+                    // nothing to acquire — the pipeline presents instead.
+                    let frame = if framegen.is_some()
+                        || xess_framegen.is_some()
+                        || dlss_framegen.is_some()
+                    {
+                        None
+                    } else if let Some(active_surface) = surface.as_ref() {
+                        match active_surface.get_current_texture() {
+                            Ok(frame) => Some(frame),
+                            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                                active_surface.configure(&renderer.device, &config);
+                                None
+                            }
+                            Err(wgpu::SurfaceError::OutOfMemory) => {
+                                target.exit();
+                                None
+                            }
+                            Err(e) => {
+                                eprintln!("surface: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        eprintln!("surface: presentation unavailable (no swapchain)");
+                        None
+                    };
+                    if framegen.is_some() || xess_framegen.is_some() || dlss_framegen.is_some() || frame.is_some() {
+                            let surface_view = frame
+                                .as_ref()
+                                .map(|frame| frame.texture.create_view(&Default::default()));
+                            // (composition, UI surface): DLSS Frame Generation
+                            // has no separate UI surface — the UI is part of the
+                            // frame it interpolates, so it passes `None`.
+                            let fg_views = framegen
+                                .as_ref()
+                                .map(|fg| (fg.compose_view(), Some(fg.ui_view())))
+                                .or_else(|| {
+                                    xess_framegen
+                                        .as_ref()
+                                        .map(|fg| (fg.compose_view(), Some(fg.ui_view())))
+                                })
+                                .or_else(|| {
+                                    dlss_framegen
+                                        .as_ref()
+                                        .map(|fg| (fg.compose_view(), Some(fg.ui_view())))
+                                });
+                            // Frame generators can keep the UI in the
+                            // composition instead of a separate surface the
+                            // swapchain blends back in: the proxy then
+                            // composites nothing and the model interpolates
+                            // the frame as presented. `ui_in_composition`
+                            // reports which side a provider landed on.
+                            let xefg_ui_in_composition = framegen
+                                .as_ref()
+                                .map(|fg| fg.ui_in_composition())
+                                .or_else(|| {
+                                    xess_framegen.as_ref().map(|fg| fg.ui_in_composition())
+                                })
+                                .or_else(|| {
+                                    dlss_framegen.as_ref().map(|fg| fg.ui_in_composition())
+                                })
+                                .unwrap_or(false);
+                            // FSR frame generation hands the UI its own surface
+                            // *pre-filled with the scene*: the UI pass composites
+                            // on top of that copy and the result is the
+                            // presented frame, while the scene goes to FFX as
+                            // `HUDLessColor`.
+                            let ui_surface_prefilled = framegen
+                                .as_ref()
+                                .map(|fg| fg.ui_surface_prefilled())
+                                .or_else(|| {
+                                    xess_framegen.as_ref().map(|fg| fg.ui_surface_prefilled())
+                                })
+                                .or_else(|| {
+                                    dlss_framegen.as_ref().map(|fg| fg.ui_surface_prefilled())
+                                })
+                                .unwrap_or(false);
+                            // DLSS frame generation also wants the UI on its own
+                            // (`DLSSG.UI`), so the HUD pass runs twice: once over
+                            // the presented frame and once into a transparent
+                            // surface NGX recomposites onto generated frames.
+                            let ui_only_view = dlss_framegen
+                                .as_ref()
+                                .and_then(|fg| fg.ui_only_view());
+                            let final_view: &wgpu::TextureView = match fg_views.as_ref() {
+                                Some((compose, _)) => compose,
+                                None => surface_view
+                                    .as_ref()
+                                    .expect("a frame exists whenever the frame generation pipeline does not"),
+                            };
+                            let mut ui_visible = false;
                             // Composition target: the whole-frame gamma intermediate, else the
-                            // present-encode intermediate, else the swapchain itself. This is
+                            // present-encode intermediate, else the final target. This is
                             // always the full window resolution: UI and the final present chain
                             // stay sharp regardless of the 3D resolution scale.
                             let composed_view=if whole_frame_gamma {Some(display_gamma.as_ref().unwrap().view())} else if let Some(encode)=present_encode.as_ref() {Some(encode.view())} else {None};
-                            let scene_view=composed_view.as_ref().unwrap_or(&surface_view);
+                            let scene_view=composed_view.as_ref().unwrap_or(final_view);
                             // Draw the world into the scaled offscreen target, then bilinearly
                             // present it into `scene_view` before the UI pass loads that result.
                             let world_view = render_scale.view();
                             let world_raw_view = render_scale.raw_view();
+                            // XeLL: the frame's render-submit phase opens before
+                            // the first command list (world) is submitted.
+                            if let Some(session) = latency.as_mut() {
+                                session.render_submit_start();
+                            }
+                            if let Some(fsr) = fsr_upscaler.as_mut() {
+                                fsr.next_jitter();
+                            }
+                            if let Some(xess) = xess_upscaler.as_mut() {
+                                xess.next_jitter();
+                            }
+                            if let Some(dlss) = dlss_upscaler.as_mut() {
+                                dlss.next_jitter();
+                            }
+                            let unjittered_vp = camera.matrix(config.width, config.height, camera.far);
+                            let world_matrix = match fsr_upscaler.as_ref() {
+                                Some(fsr) => fsr.jittered_matrix(unjittered_vp),
+                                None => match xess_upscaler.as_ref() {
+                                    Some(xess) => xess.jittered_matrix(unjittered_vp),
+                                    None => match dlss_upscaler.as_ref() {
+                                        Some(dlss) => dlss.jittered_matrix(unjittered_vp),
+                                        None => unjittered_vp,
+                                    },
+                                },
+                            };
+                            // Milliseconds per rendered frame, as the vendors want
+                            // it: NGX scales how much it denoises / anti-aliases by
+                            // how far content moves per frame
+                            // (`NVSDK_NGX_Parameter_FrameTimeDeltaInMsec`), and FFX
+                            // frame generation takes the same value.
+                            let frame_time_ms = (dt * 1000.0).clamp(0.1, 1000.0);
+                            // The offset the world was actually rendered with this
+                            // frame, from whichever upscaler is active. Every
+                            // frame-generation prepare has to see this exact value:
+                            // taking it from one specific provider meant FSR frame
+                            // generation was handed (0, 0) while DLSS or XeSS
+                            // jittered the world, so the interpolator corrected for
+                            // a jitter that was not there (wobble on still edges).
+                            let frame_jitter = fsr_upscaler
+                                .as_ref()
+                                .map(|fsr| fsr.jitter())
+                                .or_else(|| xess_upscaler.as_ref().map(|xess| xess.jitter()))
+                                .or_else(|| dlss_upscaler.as_ref().map(|dlss| dlss.jitter()))
+                                .unwrap_or((0.0, 0.0));
                             renderer.render(
                                 &world_view,
                                 &world_raw_view,
-                                camera.matrix(config.width, config.height, camera.far),
+                                world_matrix,
                                 &camera,
-                                applied_extent.0,
-                                applied_extent.1,
+                                world_extent.0,
+                                world_extent.1,
+                                camera_jumped,
                             );
-                            render_scale.blit(&renderer.device, &renderer.queue, scene_view);
+                            if let Some(fsr) = fsr_upscaler.as_mut() {
+                                match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {
+                                    Ok(()) => fsr.composite(&renderer.device, &renderer.queue, scene_view),
+                                    Err(error) => {
+                                        crate::fsr::diag(&format!("FSR failed, rendering at native resolution instead: {error}"));
+                                        fsr_fail_reason = Some(error);
+                                        fsr_upscaler = None;
+                                        fsr_failed = true;
+                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                    }
+                                }
+                            } else if let Some(xess) = xess_upscaler.as_mut() {
+                                match xess.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp) {
+                                    Ok(()) => xess.composite(&renderer.device, &renderer.queue, scene_view, settings.xess_sharpness),
+                                    Err(error) => {
+                                        crate::xess::diag(&format!("XeSS failed, rendering at native resolution instead: {error}"));
+                                        xess_fail_reason = Some(error);
+                                        xess_upscaler = None;
+                                        xess_failed = true;
+                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                    }
+                                }
+                            } else if let Some(dlss) = dlss_upscaler.as_mut() {
+                                match dlss.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp) {
+                                    Ok(()) => {
+                                        // A frame that evaluated proves the feature
+                                        // works, so the transient-failure budget is
+                                        // replenished instead of staying spent for
+                                        // the rest of the session.
+                                        dlss_retries = 0;
+                                        dlss.composite(&renderer.device, &renderer.queue, scene_view, settings.dlss_sharpness);
+                                    }
+                                    Err(error) => {
+                                        crate::dlss::diag(&format!("DLSS failed, rendering at native resolution instead: {error}"));
+                                        dlss_fail_reason = Some(error);
+                                        dlss_upscaler = None;
+                                        dlss_failed = true;
+                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                    }
+                                }
+                            } else {
+                                render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                            }
+                            // When frame generation separates the UI from the scene,
+                            // finish any gamma ramp / UNORM encode into `final_view`
+                            // (`fg.compose_view()`) *before* `fg.prepare` copies it to
+                            // `ui_view()`, otherwise `compose` is still empty/stale.
+                            if fg_views.is_some() && !xefg_ui_in_composition {
+                                if let Some(encode) = present_encode.as_ref() {
+                                    let ramp_target = encode.view();
+                                    if let Some(gamma) = display_gamma.as_ref() {
+                                        gamma.present(
+                                            &renderer.device,
+                                            &renderer.queue,
+                                            &ramp_target,
+                                            frame_gamma_setting,
+                                        );
+                                    }
+                                    encode.present(&renderer.device, &renderer.queue, final_view);
+                                } else if let Some(gamma) = display_gamma.as_ref() {
+                                    gamma.present(
+                                        &renderer.device,
+                                        &renderer.queue,
+                                        final_view,
+                                        frame_gamma_setting,
+                                    );
+                                }
+                            }
+                            // Frame generation prepare: raw depth + motion
+                            // vectors and the FG PrepareV2 dispatch, before the
+                            // UI and the present encode write anything.
+                            if let Some(fg) = framegen.as_mut() {
+                                let d = camera.direction();
+                                let (yaw_s, yaw_c) = camera.yaw.sin_cos();
+                                let jitter = frame_jitter;
+                                let prepare_result = fg.prepare(
+                                    &renderer.device,
+                                    &renderer.queue,
+                                    &renderer.depth,
+                                    &renderer.object_mv_view,
+                                    &unjittered_vp,
+                                    frame_time_ms,
+                                    camera_jumped,
+                                    jitter,
+                                    camera.lens(),
+                                    camera.pos.to_array(),
+                                    d.cross(glam::Vec3::new(-yaw_c, 0.0, -yaw_s)).normalize().to_array(),
+                                    [-yaw_c, 0.0, -yaw_s],
+                                    d.to_array(),
+                                );
+                                if let Err(error) = prepare_result {
+                                    crate::fsr::diag(&format!("FSR frame generation prepare failed, disabling it: {error}"));
+                                    fg_fail_reason = Some(error);
+                                    framegen = None;
+                                    fg_failed = true;
+                                    match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                        Ok(s) => surface = Some(s),
+                                        Err(error) => {
+                                            crate::fsr::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(fg) = dlss_framegen.as_mut() {
+                                let d = camera.direction();
+                                let (yaw_s, yaw_c) = camera.yaw.sin_cos();
+                                let prepare_result = fg.prepare(
+                                    &renderer.device,
+                                    &renderer.queue,
+                                    &renderer.depth,
+                                    &renderer.object_mv_view,
+                                    &unjittered_vp,
+                                    camera_jumped,
+                                    camera.lens(),
+                                    camera.pos.to_array(),
+                                    d.cross(glam::Vec3::new(-yaw_c, 0.0, -yaw_s)).normalize().to_array(),
+                                    [-yaw_c, 0.0, -yaw_s],
+                                    d.to_array(),
+                                );
+                                if let Err(error) = prepare_result {
+                                    crate::dlss::diag(&format!("DLSS Frame Generation prepare failed, disabling it: {error}"));
+                                    dlss_fg_fail_reason = Some(error);
+                                    dlss_framegen = None;
+                                    dlss_fg_failed = true;
+                                    match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                        Ok(s) => surface = Some(s),
+                                        Err(error) => {
+                                            crate::dlss::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(fg) = xess_framegen.as_mut() {
+                                let view = camera.view_matrix();
+                                let projection = camera.projection_matrix(config.width, config.height, camera.far);
+                                let jitter = frame_jitter;
+                                let prepare_result = fg.prepare(
+                                    &renderer.device,
+                                    &renderer.queue,
+                                    &renderer.depth,
+                                    &renderer.object_mv_view,
+                                    &view,
+                                    &projection,
+                                    &unjittered_vp,
+                                    frame_time_ms,
+                                    camera_jumped,
+                                    jitter,
+                                );
+                                if let Err(error) = prepare_result {
+                                    crate::xess::diag(&format!("XeSS frame generation prepare failed, disabling it: {error}"));
+                                    xess_fg_fail_reason = Some(error);
+                                    xess_framegen = None;
+                                    xess_fg_failed = true;
+                                    match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                        Ok(s) => surface = Some(s),
+                                        Err(error) => {
+                                            crate::xess::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                        }
+                                    }
+                                }
+                            }
                             // Refresh the top-down view on every presented frame. The old
                             // 350ms timer capped minimap motion to fewer than 3 FPS.
                             // The realistic minimap is a live top-down render; the
@@ -4686,7 +5894,177 @@ pub fn run(
                                 map_refresh=Instant::now();
                             }
                             renderer.modules.prepare_librarian_preview(&renderer.device, &renderer.queue, &mut egui_renderer, format, menu_page==MenuPage::Modules);
-                            if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
+                            // On-screen mark: the active upscaler / frame-generation
+                            // path, so a player can see it is really on. Shown even
+                            // with the menu closed (the egui pass runs for it too).
+                            let fsr_badge = fsr_upscaler
+                                .as_ref()
+                                .map(|f| match f.selected_provider() {
+                                    Some(id) => format!(
+                                        "FSR {}.{}.{}",
+                                        (id >> 22) & 0x3ff,
+                                        (id >> 12) & 0xff,
+                                        id & 0xfff
+                                    ),
+                                    None => format!("FSR (FFX major {})", f.version_major()),
+                                })
+                                .or_else(|| {
+                                    (settings.upscaling == crate::UpscaleMethod::Fsr1)
+                                        .then_some("FSR 1 (EASU + RCAS)".to_string())
+                                });
+                            // The mark carries the numbers, not just the name: a
+                            // screen report ("DLSS looks blurry") is only
+                            // actionable if it also says which extents the
+                            // provider was given and what sharpness arrived.
+                            let xess_badge = xess_upscaler.as_ref().map(|x| {
+                                format!(
+                                    "XeSS ({}) {}x{} -> {}x{} - sharp {:.2}",
+                                    x.quality_name(),
+                                    x.render_extent().0,
+                                    x.render_extent().1,
+                                    x.display_extent().0,
+                                    x.display_extent().1,
+                                    settings.xess_sharpness
+                                )
+                            });
+                            let xess_failed_note = xess_failed && settings.upscaling == crate::UpscaleMethod::Xess;
+                            let dlss_badge = dlss_upscaler.as_ref().map(|d| {
+                                format!(
+                                    "DLSS ({}) {}x{} -> {}x{} - sharp {:.2}",
+                                    d.quality_name(),
+                                    d.render_extent().0,
+                                    d.render_extent().1,
+                                    d.display_extent().0,
+                                    d.display_extent().1,
+                                    settings.dlss_sharpness
+                                )
+                            });
+                            let dlss_failed_note = dlss_failed && settings.upscaling == crate::UpscaleMethod::Dlss;
+                            let xess_fg_badge = xess_framegen.as_ref().map(|fg| {
+                                format!(
+                                    "XeSS FG {} - {} frames",
+                                    effective_multiplier.short_label(),
+                                    fg.frames_presented()
+                                )
+                            });
+                            let dlss_fg_badge = dlss_framegen.as_ref().map(|fg| {
+                                format!(
+                                    "DLSS FG {} - {} frames",
+                                    effective_multiplier.short_label(),
+                                    fg.frames_presented()
+                                )
+                            });
+                            let latency_badge = latency
+                                .as_ref()
+                                .map(|session| {
+                                    format!(
+                                        "XeLL {} - {} frames paced",
+                                        session.version(),
+                                        session.frames()
+                                    )
+                                })
+                                .or_else(|| {
+                                    reflex.as_ref().map(|pacer| pacer.status())
+                                })
+                                .or_else(|| {
+                                    // XeSS Frame Generation owns the context in this
+                                    // combination; say so instead of claiming nothing
+                                    // is running.
+                                    (settings.latency == crate::LatencyMode::Xell
+                                        && matches!(
+                                            crate::latency_owner(
+                                                settings.latency,
+                                                settings.frame_generation
+                                            ),
+                                            crate::LatencyOwner::FrameGeneration
+                                        ))
+                                    .then_some("XeLL via XeSS FG (latency reduction)".to_string())
+                                });
+                            let latency_failed_note =
+                                latency_failed && settings.latency == crate::LatencyMode::Xell;
+                            let fsr_failed_note = fsr_failed && settings.upscaling.is_ffx_fsr();
+                            // One session.log line per *change* of the live
+                            // upscaling state. "Requested" and "running" look
+                            // completely different on screen but identical in
+                            // the settings file, so a "DLSS looks blurry"
+                            // report needs this line to be actionable.
+                            {
+                                let (world_w, world_h) = render_scale.input_extent();
+                                let state = if let Some(fsr) = fsr_upscaler.as_ref() {
+                                    format!(
+                                        "FSR {} running {}x{} -> {}x{} sharp {:.2}",
+                                        fsr.selected_provider()
+                                            .map(|id| format!(
+                                                "{}.{}.{}",
+                                                (id >> 22) & 0x3ff,
+                                                (id >> 12) & 0xff,
+                                                id & 0xfff
+                                            ))
+                                            .unwrap_or_else(|| {
+                                                format!("(FFX major {})", fsr.version_major())
+                                            }),
+                                        fsr.render_extent().0,
+                                        fsr.render_extent().1,
+                                        fsr.display_extent().0,
+                                        fsr.display_extent().1,
+                                        settings.fsr3_sharpness
+                                    )
+                                } else if let Some(xess) = xess_upscaler.as_ref() {
+                                    format!(
+                                        "XeSS ({}) running {}x{} -> {}x{} sharp {:.2}",
+                                        xess.quality_name(),
+                                        xess.render_extent().0,
+                                        xess.render_extent().1,
+                                        xess.display_extent().0,
+                                        xess.display_extent().1,
+                                        settings.xess_sharpness
+                                    )
+                                } else if let Some(dlss) = dlss_upscaler.as_ref() {
+                                    format!(
+                                        "DLSS ({}) running {}x{} -> {}x{} sharp {:.2}",
+                                        dlss.quality_name(),
+                                        dlss.render_extent().0,
+                                        dlss.render_extent().1,
+                                        dlss.display_extent().0,
+                                        dlss.display_extent().1,
+                                        settings.dlss_sharpness
+                                    )
+                                } else {
+                                    format!(
+                                        "upscaling={} is NOT running, world rendered {}x{} (native)",
+                                        settings.upscaling.label(),
+                                        world_w,
+                                        world_h
+                                    )
+                                };
+                                if last_upscaler_state.as_deref() != Some(state.as_str()) {
+                                    crate::fsr::diag(&format!("[upscaler] {state}"));
+                                    last_upscaler_state = Some(state);
+                                }
+                            }
+                            let fg_badge = framegen.as_ref().map(|fg| match fg.selected_provider() {
+                                Some(id) => format!(
+                                    "FG {}.{}.{} x2 - {} frames",
+                                    (id >> 22) & 0x3ff,
+                                    (id >> 12) & 0xff,
+                                    id & 0xfff,
+                                    fg.frames_presented()
+                                ),
+                                None => format!("FG x2 - {} frames", fg.frames_presented()),
+                            });
+                            let show_status_badge = fsr_badge.is_some()
+                                || xess_badge.is_some()
+                                || fsr_failed_note
+                                || xess_failed_note
+                                || fg_badge.is_some()
+                                || xess_fg_badge.is_some()
+                                || dlss_fg_badge.is_some()
+                                || latency_badge.is_some()
+                                || latency_failed_note
+                                || fg_failed
+                                || xess_fg_failed
+                                || dlss_fg_failed;
+                            if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
                                 let input=egui_state.take_egui_input(&window);
                                 let output=egui_ctx.run(input,|ctx| {
                                     if menu_page==MenuPage::Main {
@@ -4729,7 +6107,8 @@ pub fn run(
                                                 let defaults=ViewSettings::default();
                                                 ui.label(egui::RichText::new("Gold tick and label show the default value").small().weak());
                                                 match settings_tab {
-                                                    0=>{ui.heading("Graphics");marked_slider(ui,egui::Slider::new(&mut settings.resolution_scale,10.0..=200.0).integer().suffix("%"),"Resolution scale",defaults.resolution_scale,10.,200.,false,true);ui.label(egui::RichText::new("3D render resolution (10%–200% of the window). UI stays at native resolution.").small().weak());ui.checkbox(&mut settings.all_to_vram,"All to VRAM (maximum speed, uses more memory)").on_hover_text("Keep the whole world resident instead of paging it. Restores the pre-optimisation residency as an option: the complete terrain height/normal grid stays decoded in memory (no disk paging, no per-block decode), the decoded scenery/model texture caches stop evicting, and the whole-world, tree and model preloads keep every page they build. Load time, block-window rebuilds and revisiting areas are much faster; steady-state memory is much higher (the recovered whole-world texture corpus is about 5.4 GiB of sources before geometry, terrain and models). The terrain half is applied when the world loads, so a change takes effect after Load World; the in-viewer caches follow the checkbox live. Leave it off to keep the bounded paged caches, which is the default.");ui.checkbox(&mut settings.fullscreen,"Fullscreen (borderless)");ui.checkbox(&mut settings.bloom,"Bloom");ui.checkbox(&mut settings.sharpen,"Client fullscreen sharpen");marked_slider(ui,egui::Slider::new(&mut settings.bloom_strength,0.0..=4.0),"Bloom strength",defaults.bloom_strength,0.,4.,false,settings.bloom);egui::ComboBox::from_label("Bloom mode").selected_text(match settings.bloom_mode {4=>"Client special 4 (mono)",5=>"Client special 5 (low glow)",_=>"Automatic"}).show_ui(ui,|ui| {ui.selectable_value(&mut settings.bloom_mode,0,"Automatic");ui.selectable_value(&mut settings.bloom_mode,4,"Client special 4 (mono)");ui.selectable_value(&mut settings.bloom_mode,5,"Client special 5 (low glow)");});ui.label("Client glow caller tint / opacity (preview)");let mut tint=[((settings.bloom_tint>>16)&255)as f32/255.,((settings.bloom_tint>>8)&255)as f32/255.,(settings.bloom_tint&255)as f32/255.,(settings.bloom_tint>>24)as f32/255.];if ui.color_edit_button_rgba_unmultiplied(&mut tint).changed() {let c=tint.map(|v|(v.clamp(0.,1.)*255.).round()as u32);settings.bloom_tint=(c[3]<<24)|(c[0]<<16)|(c[1]<<8)|c[2];}marked_slider(ui,egui::Slider::new(&mut settings.bloom_brightness_fade,0.0..=1.0),"Glow fade target (1s transition)",0.,0.,1.,false,settings.bloom);marked_slider(ui,egui::Slider::new(&mut settings.bloom_opacity_fade,0.0..=1.0),"Glow opacity fade (preview)",0.,0.,1.,false,settings.bloom);ui.checkbox(&mut settings.client_gamma,"Client gamma (fullscreen only)");marked_slider(ui,egui::Slider::new(&mut settings.gamma_setting,0.0..=100.0),"Gamma",defaults.gamma_setting,0.,100.,false,settings.client_gamma);}
+                                                    0=>{ui.heading("Graphics");let upscaling_off=settings.upscaling==crate::UpscaleMethod::Off;marked_slider(ui,egui::Slider::new(&mut settings.resolution_scale,10.0..=200.0).integer().suffix("%"),"Resolution scale",defaults.resolution_scale,10.,200.,false,upscaling_off);ui.label(egui::RichText::new("3D render resolution (10%–200% of the window). Applies only when Upscaling is Off; UI stays at native resolution.").small().weak());egui::ComboBox::from_label("Upscaling").selected_text(settings.upscaling.label()).show_ui(ui,|ui|{for method in crate::UpscaleMethod::ALL {let available=crate::support(method,&gpu_facts,&sdk_report).is_available();let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.upscaling==method,method.label()));if available && response.clicked() {settings.upscaling=method;}}});ui.label(egui::RichText::new(sdk_report.summary()).small().weak());{let mut notes:Vec<String>=Vec::new();for method in [crate::UpscaleMethod::Dlss,crate::UpscaleMethod::Fsr1,crate::UpscaleMethod::Fsr2,crate::UpscaleMethod::Fsr3,crate::UpscaleMethod::Fsr4,crate::UpscaleMethod::Xess] {if let Some(reason)=crate::support(method,&gpu_facts,&sdk_report).reason() {notes.push(format!("{}: {reason}",method.label()));}}if !notes.is_empty() {ui.label(egui::RichText::new(notes.join("  ·  ")).small().weak());}}if settings.upscaling==crate::UpscaleMethod::Fsr1 {marked_slider(ui,egui::Slider::new(&mut settings.fsr1_sharpness,0.0..=2.0),"FSR 1 RCAS sharpness (stops; lower = sharper)",defaults.fsr1_sharpness,0.,2.,false,true);}if settings.upscaling==crate::UpscaleMethod::Fsr2||settings.upscaling==crate::UpscaleMethod::Fsr3||settings.upscaling==crate::UpscaleMethod::Fsr4 {marked_slider(ui,egui::Slider::new(&mut settings.fsr3_sharpness,0.0..=1.0),"FSR sharpening (RCAS; 0 = off, 1 = maximum)",defaults.fsr3_sharpness,0.,1.,false,true);ui.label(egui::RichText::new("Passed to the FSR upscale dispatch as ffxDispatchDescUpscale.sharpness; it applies to FSR 2, FSR 3.1 and FSR 4 (and to Native AA, which is the same dispatch at a 1.0x ratio).").small().weak());}if settings.upscaling==crate::UpscaleMethod::Dlss {marked_slider(ui,egui::Slider::new(&mut settings.dlss_sharpness,0.0..=1.0),"DLSS sharpening (0 = off, 1 = maximum)",defaults.dlss_sharpness,0.,1.,false,true);ui.label(egui::RichText::new("Handed to NGX as NVSDK_NGX_Parameter_Sharpness (\"Sharpness\"). DLSS applies no sharpening of its own at 0, and its reconstruction is deliberately softer than a spatial filter, so 0 is what made Quality look blurry next to FSR. The default is a mild 0.35; use 0 for the raw vendor look or 1 for maximum.").small().weak());}if settings.upscaling==crate::UpscaleMethod::Xess {marked_slider(ui,egui::Slider::new(&mut settings.xess_sharpness,0.0..=1.0),"XeSS sharpening (0 = off, 1 = maximum)",defaults.xess_sharpness,0.,1.,false,true);ui.label(egui::RichText::new("Applied by the viewer after xessExecute: Intel's SDK 3.0.2 exposes no sharpening control at all, so this runs as an RCAS-style pass while the XeSS result is copied into the composition. It is clamped to the local neighbourhood, so it cannot halo or ring even at 1.").small().weak());}if settings.upscaling==crate::UpscaleMethod::Dlss {if let Some(reason)=&dlss_fail_reason {ui.label(egui::RichText::new(format!("DLSS is NOT running - the world is rendered at native resolution instead (no upscaling). {reason}")).small().color(egui::Color32::LIGHT_RED));}}if settings.upscaling==crate::UpscaleMethod::Xess {if let Some(reason)=&xess_fail_reason {ui.label(egui::RichText::new(format!("XeSS is NOT running - the world is rendered at native resolution instead (no upscaling). {reason}")).small().color(egui::Color32::LIGHT_RED));}}if settings.upscaling==crate::UpscaleMethod::Fsr2||settings.upscaling==crate::UpscaleMethod::Fsr3||settings.upscaling==crate::UpscaleMethod::Fsr4 {if let Some(reason)=&fsr_fail_reason {ui.label(egui::RichText::new(format!("FSR is NOT running - the world is rendered at native resolution instead (no upscaling). {reason}")).small().color(egui::Color32::LIGHT_RED));}}if settings.upscaling!=crate::UpscaleMethod::Off {egui::ComboBox::from_label("Upscaling quality").selected_text(settings.upscale_quality.label_for(settings.upscaling)).show_ui(ui,|ui|{for quality in crate::UpscaleQuality::ALL {let available=crate::quality_available(settings.upscaling,quality);let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.upscale_quality==quality,quality.label_for(settings.upscaling)));if available && response.clicked() {settings.upscale_quality=quality;}if let Some(note)=quality.availability_note(settings.upscaling) {response.on_disabled_hover_text(note);}}});let(internal_width,internal_height)=crate::provider_extent(settings.upscaling,settings.upscale_quality,config.width,config.height,max_texture_dimension);ui.label(egui::RichText::new(format!("Renders the world at {internal_width}×{internal_height} ({}), presented at native window resolution; the UI always stays native.",settings.upscaling.label())).small().weak());}egui::ComboBox::from_label("Frame generation").selected_text(settings.frame_generation.label()).show_ui(ui,|ui|{for method in crate::FrameGenMethod::ALL {let available=crate::support_framegen(method,settings.upscaling,&gpu_facts,&sdk_report).is_available();let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.frame_generation==method,method.label()));if available && response.clicked() {settings.frame_generation=method;}}});{let mut notes:Vec<String>=Vec::new();for method in [crate::FrameGenMethod::Dlss,crate::FrameGenMethod::Fsr,crate::FrameGenMethod::Xess] {if let Some(reason)=crate::support_framegen(method,settings.upscaling,&gpu_facts,&sdk_report).reason() {notes.push(format!("{}: {reason}",method.label()));}}if !notes.is_empty() {ui.label(egui::RichText::new(notes.join("  ·  ")).small().weak());}}egui::ComboBox::from_label("Frame multiplier").selected_text(settings.frame_multiplier.label()).show_ui(ui,|ui|{for multiplier in crate::FrameMultiplier::ALL {let available=crate::multiplier_support(settings.frame_generation,multiplier,&gpu_facts,&sdk_report).is_available();let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.frame_multiplier==multiplier,multiplier.label()));if available && response.clicked() {settings.frame_multiplier=multiplier;}}});if settings.frame_generation!=crate::FrameGenMethod::Off {let mut notes:Vec<String>=Vec::new();for multiplier in [crate::FrameMultiplier::X3,crate::FrameMultiplier::X4,crate::FrameMultiplier::X6] {if let Some(reason)=crate::multiplier_support(settings.frame_generation,multiplier,&gpu_facts,&sdk_report).reason() {notes.push(format!("{}: {reason}",multiplier.label()));}}if !notes.is_empty() {ui.label(egui::RichText::new(notes.join("  ·  ")).small().weak());}}ui.label(egui::RichText::new("Frame multiplier is how many frames are presented per rendered frame: x2 is classic frame generation (one interpolated frame per present), x3/x4/x6 need a generator that can interpolate several. DLSS Multi Frame Generation does that on RTX 50-series (Blackwell) GPUs through NGX DLSSG.MultiFrameCount; on Ada the runtime reports a maximum of one generated frame, so the higher multipliers are disabled there instead of being unlocked. XeSS Frame Generation asks libxess_fg for the count (xefgSwapChainSetNumInterpolatedFrames) and the SDK clamps it to the device maximum it reports. FSR frame generation interpolates exactly one frame per present. Changing the multiplier rebuilds the frame generator, and the generated frames are paced onto consecutive vsync intervals.").small().weak());egui::ComboBox::from_label("Latency").selected_text(settings.latency.label()).show_ui(ui,|ui|{for mode in crate::LatencyMode::ALL {let available=crate::support_latency(mode,settings.frame_generation,&gpu_facts,&sdk_report).is_available();let response=ui.add_enabled(available,egui::SelectableLabel::new(settings.latency==mode,mode.label()));if available && response.clicked() {settings.latency=mode;}}});{let mut notes:Vec<String>=Vec::new();for mode in [crate::LatencyMode::Xell] {if let Some(note)=crate::support_latency(mode,settings.frame_generation,&gpu_facts,&sdk_report).note() {notes.push(format!("{}: {note}",mode.label()));}}if !notes.is_empty() {ui.label(egui::RichText::new(notes.join("  ·  ")).small().weak());}}ui.label(egui::RichText::new("VSync paces presents on the display refresh and is the default. Reflex paces the CPU instead of the presentation: NVIDIA's algorithm without Streamline, it keeps one frame in flight and holds the CPU until just before the next vblank, so presents stay vsync'd (Fifo, sync interval 1) and only the input-to-photon latency changes. XeLL (Intel Xe Low Latency, libxell.dll) keeps the same vsync'd present (sync interval 1, as Intel requires) but lets the library decide when each frame may start: xellSleep holds the CPU until the GPU queue is nearly empty, and the simulation / render-submit / present markers are delivered every frame. It is independent of the upscaler and works with Upscaling Off; XeSS Frame Generation needs its own XeLL context, so in that combination the frame generator performs the latency reduction. XeLL is selectable on every vendor; on a non-Intel GPU Intel only applies the latency reduction while XeSS Frame Generation is active, so expect the markers to run without a measurable gain there. Windows + DX12 only; runtime-unverified here.").small().weak());
+if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=crate::FrameGenMethod::Off {ui.label(egui::RichText::new("FSR 1 is in-tree spatial EASU + RCAS (AMD, NVIDIA and Intel GPUs; no SDK). FSR 2/3.1/4.1 render through the FFX upscaler from the vendored AMD SDK (Windows+DX12; camera-motion only; runtime-unverified). XeSS renders through the XeSS SDK (libxess.dll, SM 6.4) the same way. DLSS renders through the NGX DLLs from the vendored NVIDIA SDK (nvngx_dlss.dll; Windows+DX12, RTX GPU). FSR, XeSS and DLSS frame generation are synthesised natively on Windows+DX12 through each vendor's frame-generation interface and work with any upscaler or Off (XeSS FG with XeSS or Off only; DLSS FG with Upscaling Off or any upscaler on an RTX 40 series or later GPU).").small().weak());}ui.checkbox(&mut settings.all_to_vram,"All to VRAM (maximum speed, uses more memory)").on_hover_text("Keep the whole world resident instead of paging it. Restores the pre-optimisation residency as an option: the complete terrain height/normal grid stays decoded in memory (no disk paging, no per-block decode), the decoded scenery/model texture caches stop evicting, and the whole-world, tree and model preloads keep every page they build. Load time, block-window rebuilds and revisiting areas are much faster; steady-state memory is much higher (the recovered whole-world texture corpus is about 5.4 GiB of sources before geometry, terrain and models). The terrain half is applied when the world loads, so a change takes effect after Load World; the in-viewer caches follow the checkbox live. Leave it off to keep the bounded paged caches, which is the default.");ui.checkbox(&mut settings.fullscreen,"Fullscreen (borderless)");ui.checkbox(&mut settings.bloom,"Bloom");ui.checkbox(&mut settings.sharpen,"Client fullscreen sharpen");marked_slider(ui,egui::Slider::new(&mut settings.bloom_strength,0.0..=4.0),"Bloom strength",defaults.bloom_strength,0.,4.,false,settings.bloom);egui::ComboBox::from_label("Bloom mode").selected_text(match settings.bloom_mode {4=>"Client special 4 (mono)",5=>"Client special 5 (low glow)",_=>"Automatic"}).show_ui(ui,|ui| {ui.selectable_value(&mut settings.bloom_mode,0,"Automatic");ui.selectable_value(&mut settings.bloom_mode,4,"Client special 4 (mono)");ui.selectable_value(&mut settings.bloom_mode,5,"Client special 5 (low glow)");});ui.label("Client glow caller tint / opacity (preview)");let mut tint=[((settings.bloom_tint>>16)&255)as f32/255.,((settings.bloom_tint>>8)&255)as f32/255.,(settings.bloom_tint&255)as f32/255.,(settings.bloom_tint>>24)as f32/255.];if ui.color_edit_button_rgba_unmultiplied(&mut tint).changed() {let c=tint.map(|v|(v.clamp(0.,1.)*255.).round()as u32);settings.bloom_tint=(c[3]<<24)|(c[0]<<16)|(c[1]<<8)|c[2];}marked_slider(ui,egui::Slider::new(&mut settings.bloom_brightness_fade,0.0..=1.0),"Glow fade target (1s transition)",0.,0.,1.,false,settings.bloom);marked_slider(ui,egui::Slider::new(&mut settings.bloom_opacity_fade,0.0..=1.0),"Glow opacity fade (preview)",0.,0.,1.,false,settings.bloom);ui.checkbox(&mut settings.client_gamma,"Client gamma (fullscreen only)");marked_slider(ui,egui::Slider::new(&mut settings.gamma_setting,0.0..=100.0),"Gamma",defaults.gamma_setting,0.,100.,false,settings.client_gamma);}
                                                     1=>{ui.heading("World");ui.checkbox(&mut settings.detail.terrain_cutoff,"Original-game terrain cutoff (saves memory)").on_hover_text("Live, saved terrain and scenery cutoff. Keeps the block window below; releases distant terrain geometry and unused blend-mask atlas pages. Combine independently with Client atmospheric fog. Fog keeps the authored colour and caps its distance to the resident window (viewer adaptation). Distant scenery preload is paused; global lightmaps and shared tree assets still have memory costs; realistic maps show only resident terrain.");ui.label(renderer.terrain_gpu.residency_label());let (trees,bytes)=renderer.far_trees.residency_stats();ui.label(format!("Tree LOD instances: {trees}; instance buffer {:.1} KiB",bytes as f64/1024.));ui.add_enabled(!settings.detail.terrain_cutoff,egui::Checkbox::new(&mut settings.whole_world,"Render whole world (trees, rocks, buildings)")).on_hover_text("Paused and its pages released while native cutoff is enabled.");ui.label(&world_status);if let Some(models)=&renderer.models {let (ready,failed,total)=models.status();{let clocks=models.effect_clocks();if !clocks.is_empty(){let (mut low,mut high)=(f32::MAX,f32::MIN);for (_,clock,_,_) in &clocks{low=low.min(*clock);high=high.max(*clock);}ui.label(format!("World effect clocks: {:.0}..{:.0} ms across {} playing roots",low,high,clocks.len())).on_hover_text("The clock each playing root has reached, read out of the effect player itself after the fSpeed the map record puts on it (A3DGFXEx::SetPlaySpeed). A sheet that flows reads a clock that keeps rising; a root whose number stands still is frozen however many of its cards are on screen, and then the fault is the frame delta rather than the texture. The same numbers, with the change since the previous report, are what PWE_EFFECT_CENSUS=1 writes into effect-census.txt next to the executable.");}}ui.label(format!("Animated world models: {ready}/{total}; rejected {failed}"));let g=models.gfx_status();let alpha=models.alpha_status();{let fx_status=ui.label(format!("FX light producers: {} loaded, {} pending, {} elements, {} non-light roots, {} failed, {} unsupported binary roots; world effects: {} roots playing, {} quads, {} would not build, {} beyond the radius, {} outside the resident window, {} off by the day/night window; alpha meshes ordered {}/{} ({} drawable of {} slots, {} failed, {} without bounds)",g.live,g.pending,g.emitters,g.non_light_owners,g.failures,g.unsupported,g.players,models.effect_quad_count(),g.player_failures,models.activation_census()[0],models.activation_census()[1],models.activation_census()[2],alpha.ordered,alpha.alpha_meshes,alpha.drawable,alpha.slots,alpha.failed,alpha.without_bounds));if fx_status.hovered(){fx_status.on_hover_text(format!("Loader queue: {} frame(s) ticked, one pending root admitted per frame (native 0x5b1a00). Non-light roots loaded cleanly but contain no LightType element; their sprites/particles/trails are what the world-effects count draws, from the placements world.ecwld and the model events authored. Failed counts FX roots only; world-model and alpha-queue problems are listed below. Unsupported binary roots are valid assets in a container this reader cannot parse yet. World effects are built one root per frame and only while their owner is inside the activation radius, so the playing count grows for a moment after a move. The three counts after the would-not-build count say which gate left the rest out: the radius around the camera, the resident terrain window while the cutoff is on, and each record\'s own day/night window from its iValidTime byte.{}{}{}{}",g.frames,models.gfx_failures().iter().take(4).map(|e|format!("\nFailed: {e}")).collect::<String>(),models.gfx_unsupported().iter().take(2).map(|e|format!("\nUnsupported: {e}")).collect::<String>(),models.effect_failures().iter().take(3).map(|e|format!("\nEffect graph failed: {e}")).collect::<String>(),models.effect_warnings().iter().take(3).map(|e|format!("\nWorld effect notice: {e}")).collect::<String>()));}}}ui.checkbox(&mut settings.world_effects,"World effects (waterfalls, torch fire, glows)").on_hover_text("Draws the effect roots the map itself places: every world.ecwld effect record and every ECM model event, at the position, scale, play speed and day/night window the area authored. Nothing here follows the explorer or belongs to an add-on module. Off releases the animated graph and keeps the light producers those same roots carry, so a torch stops drawing its flame but still lights the wall. On rebuilds one root per frame."); marked_slider(ui,egui::Slider::new(&mut settings.effect_distance,0.0..=120.0).suffix(" m"),"Effect fade distance",defaults.effect_distance,0.,120.,false,settings.world_effects).on_hover_text("The client's own distance cull, applied as a fade instead of a pop. A placed effect whose record sets bAttenuation (the default) fades to invisible once it is further from the player than SCNRES_EFFECT - 60 units in the near scheme, 120 in the far one (EC_SceneBlock.cpp:1109/:1133) - and back in when the player returns, over 3,000 ms each way (CECOrnamentMan::Update, EC_ManOrnament.cpp:279; FadeGFX, :961). The client measures from the character\'s ground position, so the explorer measures horizontally from the camera, X and Z only: a camera 500 units above a city is still standing on that city. 0 (the left end, and the default) turns the fade off and restores every root to the alpha the map authored, including roots an earlier distance had already dimmed; 60 reproduces a player standing among the effects. Roots that are not attenuating, and every ECM model event, ignore the radius.");ui.label("RotFromView card axis:"); for m in crate::view_settings::EffectShaft::ALL { ui.selectable_value(&mut settings.effect_shaft,m,m.label()); } ui.label(egui::RichText::new(format!("decal channel will print shaft={}",settings.effect_shaft.token())).small().weak()).on_hover_text("A RotFromView card is an axial billboard: its height runs along one axis and only its width turns to the camera. The client builds that axis from the placement's own Z (A3DDecalEx.cpp:365, GetParentDir()*kp.m_vDir), which is the Client row and the faithful answer. Root direction drops the .gfx keypoint quaternion, World up always stands the shaft up, and Horizontal flattens the client axis into the world ground plane. The row is persisted as effect_shaft= and reprinted in the decal channel, so one report says which rule produced the picture.");marked_slider(ui,egui::Slider::new(&mut settings.far,2000.0..=24000.0),"View distance",defaults.far,2000.,24000.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.detail.radius,2..=12),"Terrain block window (blocks)",defaults.detail.radius as f32,2.,12.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.detail.tree_lod_scale,0.25..=4.0),"Tree LOD distance scale",defaults.detail.tree_lod_scale,0.25,4.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.detail.scenery_quality,0..=5),"Scenery quality preset",defaults.detail.scenery_quality as f32,0.,5.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.tree_wind_strength,0.0..=1.0),"Tree leaf rocking",defaults.tree_wind_strength,0.,1.,false,true);ui.checkbox(&mut settings.client_tree_wind_preview,"Client wind signal (preview)").on_hover_text("Modulates the existing 16-second sampled leaf loop with the recovered client wind signal. This is an approximation, not the original live leaf animation.");marked_slider(ui,egui::Slider::new(&mut settings.time_of_day,0.0..=24.0),"Time of day",defaults.time_of_day,0.,24.,false,true).on_hover_text("The sky clock the recovery put back: hour 0..24, stored in the settings file. Enabling the pass below makes the client's own clock run from here.");ui.checkbox(&mut settings.time_pass_enabled,"Enable time pass").on_hover_text("Runs the sky clock with wall-clock time instead of pinning it. The rate is the client's own: CECSunMoon::Tick (elementclient 0x4b5f10) adds elapsed_ms * ds:0x8db108 to the day fraction, and that constant is 1/14,400,000, so one authored day takes four real hours (one authored hour is ten real minutes) at speed 1.0. Sun and moon elevations, the dusk/night sky-set swap, the regional light blend, weather light and the zone music day/night choice all follow the same clock, so the world really does get dark. The slider below multiplies that rate.");marked_slider(ui,egui::Slider::new(&mut settings.time_pass_speed,0.1..=600.0).logarithmic(true).suffix("x"),"Time pass speed",defaults.time_pass_speed,0.1,600.,true,settings.time_pass_enabled).on_hover_text("Multiplier on the client's 4-real-hour day: 1x is the shipped speed, 2x is a day every two real hours, 60x is a day every four minutes, 600x is the fastest offered (one day per 14.4 real seconds). The label below shows the resulting length of one authored day.");ui.label(egui::RichText::new(format!("Client rate: 1 game day = {}",crate::sky_time::day_length_label(settings.time_pass_speed))).small().weak());egui::ComboBox::from_label("Sky set").selected_text(settings.sky_override.label()).show_ui(ui,|ui|{for o in crate::sky_transition::SkyOverride::ALL{ui.selectable_value(&mut settings.sky_override,o,o.label());}}).response.on_hover_text("Pins one sky.lst row (0 晴天 clear, 1 阴天01 overcast, 2 夕阳 sunset) instead of the client's day/night ladder (0x4203f4 -> autoscene sky_id_day/sky_id_night). Auto is the shipped behaviour; a pinned row never fades and the swap machine keeps running underneath, so returning to Auto resumes where the clock says. The night row is the overcast set, not a painted night panorama: the client darkens it with the regional light colour.");egui::ComboBox::from_label("Weather").selected_text(settings.weather_override.label()).show_ui(ui,|ui|{for o in crate::client_weather::WeatherOverride::ALL{ui.selectable_value(&mut settings.weather_override,o,o.label());}}).response.on_hover_text("Auto is the area's own EC-BSD flag word (world.ecbsd+0x04 bits 1 and 2, read at 0x421520): rain and snow are independent, and a zone may ask for both. The other rows force one effect anywhere. Rain and snow are falling particle quads, not a simulated weather system: the client owns the clock (33 ms object tick) and the textures (rain.tga, snow.bmp); the viewer now spawns them with the objects' own Speed 0.5 / Size 0.04 (rain, +-30 % size, +-50 % speed) and Size 0.3 (snow). The fall volume, the streak length and the flake descent scale are viewer values.");ui.checkbox(&mut settings.water_reflections,"Water reflections");ui.checkbox(&mut settings.celestial_discs,"Client sun and moon").on_hover_text("Native billboards: centre at direction*100 at the recovered template sizes (20-unit sun, 11.42 degrees; 40-unit moon, 22.62 degrees), gated on the recovered elevation curve and the 0.0003/ms visibility ramps. Sun adds its texture, moon alpha-blends it. The sun swells by 1+2n and adds its recovered 120x40 sunshine.bmp strip inside the recovered night-strength window; the moon carries no halo quad (retail takes every moon halo from the flare chain, and a centred quad landed off the painted disc because moon.tga's art is not centred in its texture). Both discs are submitted at half their object colour: 0x4b405f packs ([+0x48] & 0xfefefe | 0x01010100) >> 1, i.e. the recovered halving applied to the object's white default, so the texture is drawn at 127/255 instead of at full strength. Which record fills +0x48 is not recovered. The sun is tinted by the region's light colour (the object's only colour data is light data) and the sun also draws the client's whole flare chain: the fifteen quads `0x4b6270` pre-builds from `textures/nature/flares.bmp` (a 4x4 atlas, six vertices each, `add ebx,0xc0` per sprite and `cmp ebp,0x3c`), with the builder's own size, offset and UV tables. Sprite i sits `offset[i]` pixels from the sun along the line from the sun through the screen centre - the direction `0x450b30` computes - and its half extent is `metric * size[i]`, where the metric is the viewport height: `0x4360a0` hands `0x4b6270` a host block, the builder copies six dwords of it from `+0x14` and reads the fifth (`+0x24`) as an integer (`fild qword [esp+0x5c]`), which is the height of the viewport rectangle that block carries. The sprite colour is the disc's, so the chain shares the disc's half colour and the region light tint. The disc sizes and textures are the client's; the status line below says which part is which.");marked_slider(ui,egui::Slider::new(&mut settings.celestial_brightness,0.1..=1.0),"Star brightness",defaults.celestial_brightness,0.1,1.,false,settings.celestial_discs).on_hover_text("How strongly the sun and moon are drawn. 1.0 (the mark) is the texture itself. 0x4b405f packs each disc as ([+0x48] & 0xfefefe | 0x01010100) >> 1, half the object colour, but drawn that way both discs read as dim grey circles, so the recovered 0.498 is not the default; slide to it to compare. The region light is not multiplied into the discs for the same reason; it stays on the shine strip and the flare sprites, where 0x4b3e22 really does apply the +0x44 colour.");ui.checkbox(&mut settings.ignore_celestial_flags,"Ignore area sun/moon flags").on_hover_text("Every zone\'s EC-BSD record carries a flag word (record +4, read at 0x420992): bit 3 draws the sun, bit 4 the moon. A zone authored without bit 3 has no sun disc in the client either, which is what makes the sun vanish in some open areas while sky and lighting stay correct. This switch latches 0x18 instead of the zone word, so the disc always draws; the status line still prints the zone\'s own word, so flipping it tells the two causes apart.");ui.checkbox(&mut settings.cloud_detail,"Cloud detail (Client CloudDetail gate)").on_hover_text("Shows the native world.cld cloud surface. Point sizing and water-view parity remain approximate.");ui.checkbox(&mut settings.atmospheric_fog,"Client atmospheric fog (limits distant visibility)");ui.checkbox(&mut settings.terrain_lightmaps,"Client terrain lightmaps");ui.checkbox(&mut settings.area_grass_lightmaps,"Grass area-centered lightmaps").on_hover_text("Client area-center selection with clamped tile edges. Disable only to compare the legacy per-vertex selection.");ui.checkbox(&mut settings.regional_tree_lighting,"Experimental regional tree lighting");ui.checkbox(&mut settings.vegetation_authored_mips,"Authored vegetation mips (experimental, restart)").on_hover_text("P4.07 opt-in: preserve authored DDS mip chains for vegetation and use SpeedTree PWTREE08 per-LOD branch/frond alpha references plus the verified leaf reference 84. Default off keeps the approved legacy path. Applied at startup; restart after changing. Native sampler parity, grass anisotropy, and deeper-than-LOD-7 tails remain unresolved.");ui.checkbox(&mut settings.streamed_regions,"Streamed regional lighting/fog (experimental)").on_hover_text("Select environment regions from nearby world blocks using client-like priority. Changes atmospheric and underwater fog; affects trees only when experimental regional tree lighting is enabled. Asynchronous client load order is not yet reproduced.");ui.checkbox(&mut settings.grass_distance_fade,"Client grass distance fade");ui.checkbox(&mut settings.grass_wind_enabled,"Grass wind").on_hover_text("Native wind from the recovered logic clock. The client scales it with authored per-area data (+0x6c..+0x74), not a user setting, so this is an on/off switch.");marked_slider(ui,egui::Slider::new(&mut settings.grass_wind_amplitude,0.0..=2.0),"Grass wind sway",defaults.grass_wind_amplitude,0.,2.,false,settings.grass_wind_enabled).on_hover_text("Viewer-only multiplier on the wind history. The mark (1.0) is the recovered amplitude: the client's only wind inputs are the noise sample and the authored axis weights (+0x6c..+0x74 = 1.0, -0.5, 0.0), with no scale of its own, so there is no single retail number to show. The spring is critically damped at the recovered stiffness, which bounds the sway by that target instead of letting it resonate.");ui.checkbox(&mut settings.model_backface_culling,"Cull building back faces (experimental)");if camera.underwater_depth>0.{ui.label("Underwater effect active");}ui.label("Whole-world texture atlases are shared; geometry and unique source textures still require GPU memory.");}
                                                     2=>{ui.heading("Sound");ui.checkbox(&mut settings.music_enabled,"Play music from current zone");marked_slider(ui,egui::Slider::new(&mut settings.music_volume,0.0..=1.0),"Music volume",defaults.music_volume,0.,1.,false,true);ui.label(music.status());let audio_diagnostic=music.diagnostic();if !audio_diagnostic.is_empty(){ui.label(audio_diagnostic);}ui.checkbox(&mut settings.ambience_enabled,"Play zone ambience (experimental)");marked_slider(ui,egui::Slider::new(&mut settings.sound_volume,0.0..=1.0),"Ambience volume",defaults.sound_volume,0.,1.,false,true);ui.label(ambience.status());ui.checkbox(&mut settings.effects_enabled,"Play world effect sounds (experimental)");marked_slider(ui,egui::Slider::new(&mut settings.effects_volume,0.0..=1.0),"Effects volume",defaults.effects_volume,0.,1.,false,true);ui.label(world_audio.status());if let Some(error)=world_audio.diagnostic(){ui.label(error);}ui.label("Zone selection, world sound timing and spatialization are approximations. Gameplay, combat and weather effects are not implemented.");}
                                                     3=>{ui.heading("Interface");ui.checkbox(&mut settings.show_zone_entry,"Show entering zone notification");ui.checkbox(&mut settings.show_minimap,"Show minimap");marked_slider(ui,egui::Slider::new(&mut settings.minimap_range,100.0..=600.0),"Minimap half-width (world units)",defaults.minimap_range,100.,600.,false,settings.show_minimap);ui.separator();egui::ComboBox::from_label("Minimap style").selected_text(settings.minimap_style.label()).show_ui(ui,|ui|{ui.selectable_value(&mut settings.minimap_style,MapStyle::Realistic,"Realistic");ui.selectable_value(&mut settings.minimap_style,MapStyle::Original,"Original");});ui.label(egui::RichText::new("Realistic renders the world from above each frame; Original shows the client's own minimap tiles (surfaces/minimaps/world) at their native resolution.").small().weak());egui::ComboBox::from_label("Minimap shape").selected_text(settings.minimap_shape.label()).show_ui(ui,|ui|{ui.selectable_value(&mut settings.minimap_shape,MinimapShape::Square,"Square");ui.selectable_value(&mut settings.minimap_shape,MinimapShape::Circular,"Circular");});egui::ComboBox::from_label("World map style").selected_text(settings.world_map_style.label()).show_ui(ui,|ui|{ui.selectable_value(&mut settings.world_map_style,MapStyle::Realistic,"Realistic");ui.selectable_value(&mut settings.world_map_style,MapStyle::Original,"Original");});ui.label(egui::RichText::new("Realistic renders the whole world from above; Original shows the client's map tiles (surfaces/maps).").small().weak());ui.separator();ui.heading("Camera controls");marked_slider(ui,egui::Slider::new(&mut settings.camera_speed,10.0..=3000.0).logarithmic(true),"Flight speed",defaults.camera_speed,10.,3000.,true,true);marked_slider(ui,egui::Slider::new(&mut settings.boost,1.0..=10.0),"Shift multiplier",defaults.boost,1.,10.,false,true);marked_slider(ui,egui::Slider::new(&mut settings.sensitivity,0.0005..=0.01).logarithmic(true),"Mouse sensitivity",defaults.sensitivity,0.0005,0.01,true,true);}
@@ -4788,6 +6167,7 @@ pub fn run(
                                             }
                                         } else { ui.add(egui::Image::new((map_id,egui::vec2(MINIMAP_HUD,MINIMAP_HUD))).rounding(round)) };
                                         let center=image.rect.center();let dir=egui::vec2(camera.yaw.sin(),camera.yaw.cos());let side=egui::vec2(-dir.y,dir.x);let points=vec![center+dir*10.,center-dir*7.+side*5.,center-dir*7.-side*5.];ui.painter().add(egui::Shape::convex_polygon(points,egui::Color32::from_rgb(255,225,130),egui::Stroke::new(1.0f32,egui::Color32::BLACK)));ui.painter().text(image.rect.left_top()+egui::vec2(5.,5.),egui::Align2::LEFT_TOP,"N",egui::FontId::proportional(14.),egui::Color32::WHITE);});});}
+                                    if show_status_badge {egui::Area::new(egui::Id::new("fsr-status-hud")).anchor(egui::Align2::LEFT_TOP,egui::vec2(16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.0).show(ui,|ui|{if let Some(label)=&fsr_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&xess_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&dlss_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,150)));}if let Some(label)=&fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&xess_fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&dlss_fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&latency_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(190,255,140)));}if latency_failed_note {ui.label(egui::RichText::new("XeLL failed -> VSync pacing").small().color(egui::Color32::LIGHT_RED));}if fsr_failed_note {ui.label(egui::RichText::new("FSR failed -> native render, no upscaling").small().color(egui::Color32::LIGHT_RED));}if xess_failed_note {ui.label(egui::RichText::new("XeSS failed -> native render, no upscaling").small().color(egui::Color32::LIGHT_RED));}if dlss_failed_note {ui.label(egui::RichText::new("DLSS failed -> native render, no upscaling").small().color(egui::Color32::LIGHT_RED));}if fsr_failed_note {if let Some(reason)=&fsr_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}}if fg_failed {ui.label(egui::RichText::new("FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if xess_fg_failed {ui.label(egui::RichText::new("XeSS FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if dlss_fg_failed {ui.label(egui::RichText::new("DLSS FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&dlss_fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"\u{2026}";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&xess_fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if xess_failed_note {if let Some(reason)=&xess_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}}if dlss_failed_note {if let Some(reason)=&dlss_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}}if let Some(reason)=&latency_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}});});}
                                     if menu_page.is_open(){renderer.modules.settings_panel(ctx,config.width as f32/window.scale_factor() as f32);}
                                     if renderer.modules.overlay_active() {
                                         // Overhead names: the same view-projection the world
@@ -4807,12 +6187,93 @@ pub fn run(
                                 for (id,delta) in &output.textures_delta.set {egui_renderer.update_texture(&renderer.device,&renderer.queue,*id,delta);}
                                 let mut encoder=renderer.device.create_command_encoder(&Default::default());
                                 let cmd=egui_renderer.update_buffers(&renderer.device,&renderer.queue,&mut encoder,&jobs,&screen);
-                                {let mut pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor{label:Some("settings menu"),color_attachments:&[Some(wgpu::RenderPassColorAttachment{view:scene_view,resolve_target:None,ops:wgpu::Operations{load:wgpu::LoadOp::Load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None});egui_renderer.render(&mut pass,&jobs,&screen);}
+                                {
+                                    // With UI composition enabled the UI is
+                                    // rendered into its own transparent
+                                    // surface and the swapchain composites it
+                                    // onto real and generated frames. On the
+                                    // default XeSS-FG path (and everywhere
+                                    // else) it is drawn on top of the already
+                                    // composed frame, so what is presented is
+                                    // exactly what was rendered.
+                                    let (egui_target, egui_load) = match fg_views.as_ref() {
+                                        Some(_) if xefg_ui_in_composition => {
+                                            (scene_view, wgpu::LoadOp::Load)
+                                        }
+                                        // The surface already holds the scene:
+                                        // draw the UI on top, keep the rest.
+                                        Some((_, Some(ui))) if ui_surface_prefilled => {
+                                            (ui, wgpu::LoadOp::Load)
+                                        }
+                                        Some((_, Some(ui))) => {
+                                            (ui, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT))
+                                        }
+                                        // DLSS Frame Generation has no separate
+                                        // UI surface: the UI is part of the
+                                        // frame it interpolates.
+                                        Some((_, None)) => (scene_view, wgpu::LoadOp::Load),
+                                        None => (scene_view, wgpu::LoadOp::Load),
+                                    };
+                                    {
+                                        let mut pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor{label:Some("settings menu"),color_attachments:&[Some(wgpu::RenderPassColorAttachment{view:egui_target,resolve_target:None,ops:wgpu::Operations{load:egui_load,store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None});
+                                        egui_renderer.render(&mut pass,&jobs,&screen);
+                                    }
+                                    if let Some(ui_only)=ui_only_view.as_ref(){
+                                        // The same draw calls into a transparent
+                                        // surface: that is `DLSSG.UI`, the copy
+                                        // NGX recomposites onto generated frames.
+                                        let mut ui_pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor{label:Some("frame generation ui only"),color_attachments:&[Some(wgpu::RenderPassColorAttachment{view:ui_only,resolve_target:None,ops:wgpu::Operations{load:wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),store:wgpu::StoreOp::Store}})],depth_stencil_attachment:None,timestamp_writes:None,occlusion_query_set:None});
+                                        egui_renderer.render(&mut ui_pass,&jobs,&screen);
+                                    }
+                                    ui_visible = true;
+                                }
                                 renderer.queue.submit(cmd.into_iter().chain(std::iter::once(encoder.finish())));
                                 for id in &output.textures_delta.free {egui_renderer.free_texture(id);}
                             }
+                            // XeSS frame generation consumes a UI texture every
+                            // frame; when no UI was drawn, clear one to
+                            // transparent and treat it as visible.
+                            if xess_framegen.is_some()
+                                && !xefg_ui_in_composition
+                                && !ui_surface_prefilled
+                                && !ui_visible
+                            {
+                                if let Some(fg) = xess_framegen.as_ref() {
+                                    let ui_surface = fg.ui_view();
+                                    let mut encoder = renderer.device.create_command_encoder(&Default::default());
+                                    {
+                                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                            label: Some("xess frame generation clear ui"),
+                                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                                view: &ui_surface,
+                                                resolve_target: None,
+                                                ops: wgpu::Operations {
+                                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                                    store: wgpu::StoreOp::Store,
+                                                },
+                                            })],
+                                            depth_stencil_attachment: None,
+                                            timestamp_writes: None,
+                                            occlusion_query_set: None,
+                                        });
+                                        let _ = &mut pass;
+                                    }
+                                    renderer.queue.submit(Some(encoder.finish()));
+                                    ui_visible = true;
+                                }
+                            }
+                            // All world + UI work has been submitted; close the
+                            // render-submit phase for XeLL (whichever component
+                            // owns the context this frame).
+                            if let Some(fg) = xess_framegen.as_mut() {
+                                fg.render_submit_end();
+                            }
+                            if let Some(session) = latency.as_mut() {
+                                session.render_submit_end();
+                            }
                             // Exactly one ramp stage, then exactly one output encode.
-                            if let Some(encode) = present_encode.as_ref() {
+                            if fg_views.is_none() || xefg_ui_in_composition {
+                                if let Some(encode) = present_encode.as_ref() {
                                 // Ramp into the sRGB intermediate, then copy it once.
                                 let ramp_target = encode.view();
                                 if let Some(gamma) = display_gamma.as_ref() {
@@ -4823,24 +6284,98 @@ pub fn run(
                                         frame_gamma_setting,
                                     );
                                 }
-                                encode.present(&renderer.device, &renderer.queue, &surface_view);
+                                encode.present(&renderer.device, &renderer.queue, final_view);
                             } else if let Some(gamma) = display_gamma.as_ref() {
                                 gamma.present(
                                     &renderer.device,
                                     &renderer.queue,
-                                    &surface_view,
+                                    final_view,
                                     frame_gamma_setting,
                                 );
+                                }
                             }
-                            frame.present();
+                            // XeLL: present phase opens immediately before the
+                            // present and closes immediately after it.
+                            if let Some(session) = latency.as_mut() {
+                                session.present_start();
+                            }
+                            if let Some(fg) = dlss_framegen.as_mut() {
+                                // DLSS Frame Generation owns presentation: copy
+                                // the composition into the current backbuffer,
+                                // let NGX write the interpolated image into the
+                                // next one, and present both.
+                                match fg.finish(ui_visible, frame_jitter) {
+                                    Ok(()) => {}
+                                    Err(error) => {
+                                        crate::dlss::diag(&format!("DLSS Frame Generation failed, restoring the standard present path: {error}"));
+                                        dlss_fg_fail_reason = Some(error);
+                                        dlss_framegen = None;
+                                        dlss_fg_failed = true;
+                                        match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                            Ok(s) => surface = Some(s),
+                                            Err(error) => {
+                                                crate::dlss::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(fg) = xess_framegen.as_mut() {
+                                // XeSS frame generation owns presentation:
+                                // copy the composition into the proxy
+                                // backbuffer, present (the proxy paces real and
+                                // generated frames).
+                                match fg.finish(ui_visible) {
+                                    Ok(()) => {}
+                                    Err(error) => {
+                                        crate::xess::diag(&format!("XeSS frame generation failed, restoring the standard present path: {error}"));
+                                        xess_fg_fail_reason = Some(error);
+                                        xess_framegen = None;
+                                        xess_fg_failed = true;
+                                        match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                            Ok(s) => surface = Some(s),
+                                            Err(error) => {
+                                                crate::xess::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(fg) = framegen.as_mut() {
+                                // Frame generation owns presentation: copy the
+                                // composition into the proxy backbuffer,
+                                // dispatch the interpolation workload, and
+                                // present (the proxy paces real and generated
+                                // frames).
+                                match fg.finish(ui_visible, camera_jumped) {
+                                    Ok(()) => {}
+                                    Err(error) => {
+                                        crate::fsr::diag(&format!("FSR frame generation failed, restoring the standard present path: {error}"));
+                                        fg_fail_reason = Some(error);
+                                        framegen = None;
+                                        fg_failed = true;
+                                        match recreate_surface(&instance, &window, &adapter, &renderer.device, &config) {
+                                            Ok(s) => surface = Some(s),
+                                            Err(error) => {
+                                                crate::fsr::diag(&format!("Recreating the swapchain failed; presentation unavailable: {error}"));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if let Some(frame) = frame {
+                                frame.present();
+                                // The window now has a presentation history, so
+                                // frame generation may take the swapchain over.
+                                presented_once = true;
+                            }
+                            if let Some(session) = latency.as_mut() {
+                                session.present_end();
+                            }
+                            // Reflex: the present instant is the cadence the
+                            // pacer learns its budget from.
+                            if let Some(pacer) = reflex.as_mut() {
+                                pacer.present();
+                            }
                             if software_adapter { renderer.device.poll(wgpu::Maintain::Wait); }
                         }
-                        Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                            surface.configure(&renderer.device, &config)
-                        }
-                        Err(wgpu::SurfaceError::OutOfMemory) => target.exit(),
-                        Err(e) => eprintln!("surface: {e}"),
-                    }
                 }
                 _ => {}
             }
@@ -4918,11 +6453,21 @@ pub fn preview(
     path: &std::path::Path,
     camera: Option<[f32; 5]>,
 ) -> Result<(), String> {
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all()),
-        ..Default::default()
-    });
-    let (_adapter, device, queue) = pollster::block_on(adapter(&instance, None))?;
+    let mut instance = make_instance();
+    let mut adapter_result = pollster::block_on(adapter(&instance, None));
+    if let Err(error) = &adapter_result {
+        if std::env::var_os("WGPU_BACKEND").is_none() {
+            eprintln!(
+                "Perfect World Explorer preview: no D3D12 adapter ({error}); falling back to all backends"
+            );
+            instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
+                ..Default::default()
+            });
+            adapter_result = pollster::block_on(adapter(&instance, None));
+        }
+    }
+    let (_adapter, device, queue) = adapter_result?;
     let mut cam = if let Some([x, y, z, yaw, pitch]) = camera {
         if ![x, y, z, yaw, pitch].iter().all(|x| x.is_finite()) {
             return Err("non-finite camera".into());
@@ -5125,6 +6670,7 @@ pub fn preview(
                 cam,
                 width,
                 height,
+                false,
             );
         };
         // Drain the one-root-per-frame queue first: an effect still waiting for
@@ -5172,6 +6718,7 @@ pub fn preview(
         &cam,
         width,
         height,
+        false,
     );
     if std::env::var_os("PW_PREVIEW_MINIMAP").is_some() {
         let d = depth(&renderer.device, width, height);

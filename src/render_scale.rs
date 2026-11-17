@@ -16,6 +16,8 @@
 //! `scaled_extent` is deliberately separate from GPU objects so its bounds are
 //! unit-testable without an adapter.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 /// Scale a window extent by a percentage and clamp to device limits.
 ///
 /// `percent` is the persisted 10–200 value (100 = native). Out-of-range inputs
@@ -35,6 +37,43 @@ pub fn scaled_extent(w: u32, h: u32, percent: f32, max_dimension: u32) -> (u32, 
     // the intermediate float/int conversion; `as u64` saturates NaN to 0.
     let scale = |v: u32| ((f64::from(v.max(1)) * s).round() as u64).clamp(1, limit) as u32;
     (scale(w), scale(h))
+}
+
+/// LOD (mip) bias for the world pass, stored as `f32` bits (`0` = no bias).
+///
+/// The world atlases are mipmapped, so an upscaled frame would otherwise pick
+/// the mips that belong to the *render* resolution and lose the detail the
+/// display resolution implies. The figure is the programming guide's
+/// `log2(render/display) - 1` while a temporal upscaler runs, and the plain
+/// `log2(render/display)` for the resolution slider on its own.
+static MIP_BIAS: AtomicU32 = AtomicU32::new(0);
+
+/// Record the bias for the current render/display extent pair.
+///
+/// Supersampled render sizes use no bias at all, and neither does the slider on
+/// its own at 100 %. A temporal upscaler keeps the guide's `- 1` even at a 1.0x
+/// ratio, because that is what DLAA is. The result is clamped to `-3..=0` so a
+/// degenerate extent can never push a world atlas past its last mip.
+pub fn set_mip_bias(render: (u32, u32), display: (u32, u32), temporal: bool) {
+    let bias = if render.0 == 0 || render.1 == 0 || display.0 == 0 || display.1 == 0 {
+        0.
+    } else if render.0 <= display.0 && render.1 <= display.1 {
+        let ratio = (render.0 as f32 / display.0 as f32).log2();
+        ratio - if temporal { 1. } else { 0. }
+    } else {
+        0.
+    };
+    MIP_BIAS.store(bias.clamp(-3., 0.).to_bits(), Ordering::Relaxed);
+}
+
+/// Current LOD bias in mip levels; negative biases towards the sharper mips.
+pub fn mip_bias() -> f32 {
+    f32::from_bits(MIP_BIAS.load(Ordering::Relaxed))
+}
+
+/// `exp2` of the bias: the factor that folds a mip bias into a texture gradient.
+pub fn mip_gradient_scale() -> f32 {
+    mip_bias().exp2()
 }
 
 const SHADER: &str = r#"
@@ -71,7 +110,9 @@ fn target_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: if format.is_srgb() { &alternate } else { &[] },
     })
 }
@@ -83,10 +124,22 @@ pub struct RenderScale {
     sampler: wgpu::Sampler,
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
+    /// Lazily built FSR 1 spatial upscaler; only used while
+    /// `upscaling == Fsr1` and both axes are inside EASU's supported range.
+    fsr1: Option<crate::fsr1_gpu::Fsr1Gpu>,
+    input_extent: (u32, u32),
+    output_extent: (u32, u32),
 }
 
 impl RenderScale {
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        w: u32,
+        h: u32,
+        output_w: u32,
+        output_h: u32,
+    ) -> Self {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("resolution scale layout"),
             entries: &[
@@ -153,13 +206,39 @@ impl RenderScale {
             sampler,
             pipeline,
             layout,
+            fsr1: None,
+            input_extent: (w, h),
+            output_extent: (output_w, output_h),
         }
     }
 
     /// Reallocate the offscreen target when the window or the scale changes.
     /// The pipeline, layout and sampler are size-independent and are reused.
-    pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) {
-        self.frame = target_texture(device, self.format, w, h);
+    pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32, output_w: u32, output_h: u32) {
+        if self.input_extent != (w, h) {
+            self.frame = target_texture(device, self.format, w, h);
+            self.input_extent = (w, h);
+        }
+        if self.output_extent != (output_w, output_h) {
+            self.output_extent = (output_w, output_h);
+            if let Some(fsr1) = &mut self.fsr1 {
+                fsr1.resize(device, self.output_extent);
+            }
+        }
+    }
+
+    /// The raw texture; used by the FSR path to copy the world frame into
+    /// its native target.
+    pub fn texture(&self) -> &wgpu::Texture {
+        &self.frame
+    }
+
+    /// Extent the world is currently rendered at. The frame loop compares this
+    /// with the extent it wants (see the `upscaler_running` check in
+    /// `src/gpu.rs`) so a provider that failed to initialise cannot leave the
+    /// world at a reduced resolution.
+    pub fn input_extent(&self) -> (u32, u32) {
+        self.input_extent
     }
 
     /// sRGB view the world is rendered into.
@@ -176,11 +255,38 @@ impl RenderScale {
         })
     }
 
-    /// Bilinearly present the scaled world into the full-resolution composition
-    /// view. Runs after `Renderer::render` and before the UI pass, which loads
-    /// this result with `LoadOp::Load`.
-    pub fn blit(&self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView) {
+    /// Present the scaled world into the full-resolution composition view.
+    /// Runs after `Renderer::render` and before the UI pass, which loads this
+    /// result with `LoadOp::Load`. FSR 1 replaces the bilinear blit while it
+    /// is selected and both axes stay inside EASU's supported range; anything
+    /// else (including a device-limit clamp) falls back to bilinear.
+    pub fn blit(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        target: &wgpu::TextureView,
+        upscaling: crate::UpscaleMethod,
+        sharpness_stops: f32,
+    ) {
         let source = self.view();
+        if upscaling == crate::UpscaleMethod::Fsr1
+            && crate::fsr1_eligible(self.input_extent, self.output_extent)
+        {
+            let size = self.output_extent;
+            let format = self.format;
+            let fsr1 = self
+                .fsr1
+                .get_or_insert_with(|| crate::fsr1_gpu::Fsr1Gpu::new(device, format, size));
+            fsr1.present(
+                device,
+                queue,
+                &source,
+                target,
+                self.input_extent,
+                sharpness_stops,
+            );
+            return;
+        }
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("resolution scale source"),
             layout: &self.layout,
@@ -221,7 +327,7 @@ impl RenderScale {
 
 #[cfg(test)]
 mod tests {
-    use super::scaled_extent;
+    use super::{mip_bias, mip_gradient_scale, scaled_extent, set_mip_bias};
 
     #[test]
     fn native_scale_is_identity() {
@@ -243,6 +349,36 @@ mod tests {
         assert_eq!(scaled_extent(1000, 1000, 500., 8192), (2000, 2000));
         assert_eq!(scaled_extent(1000, 1000, f32::NAN, 8192), (1000, 1000));
         assert_eq!(scaled_extent(1000, 1000, f32::INFINITY, 8192), (1000, 1000));
+    }
+
+    /// One test, not two: the bias lives in a process-wide atomic, and separate
+    /// tests would race each other's stores.
+    #[test]
+    fn mip_bias_follows_the_guide_formula_and_stays_bounded() {
+        // 3440x1440 display from a 2293x960 DLSS render extent.
+        set_mip_bias((2293, 960), (3440, 1440), true);
+        assert!((mip_bias() + 1.585).abs() < 0.01, "{}", mip_bias());
+        assert!((mip_gradient_scale() - 1. / 3.).abs() < 0.01);
+        // The resolution slider on its own only carries the ratio.
+        set_mip_bias((1720, 720), (3440, 1440), false);
+        assert!((mip_bias() + 1.).abs() < 1e-6, "{}", mip_bias());
+        // Native AA is the same feature at a 1.0x ratio (DLAA), so the guide's
+        // -1 still applies; the slider alone at 100 % takes none.
+        set_mip_bias((3440, 1440), (3440, 1440), true);
+        assert_eq!(mip_bias(), -1.);
+        set_mip_bias((3440, 1440), (3440, 1440), false);
+        assert_eq!(mip_bias(), 0.);
+        // Supersampling is never biased, with or without an upscaler.
+        set_mip_bias((6880, 2880), (3440, 1440), false);
+        assert_eq!(mip_bias(), 0.);
+        set_mip_bias((6880, 2880), (3440, 1440), true);
+        assert_eq!(mip_bias(), 0.);
+        assert_eq!(mip_gradient_scale(), 1.);
+        // 1x1 from a full-size display would be log2(1/8192) - 1 = -14.
+        set_mip_bias((1, 1), (8192, 8192), true);
+        assert_eq!(mip_bias(), -3.);
+        set_mip_bias((0, 0), (0, 0), true);
+        assert_eq!(mip_bias(), 0.);
     }
 
     #[test]

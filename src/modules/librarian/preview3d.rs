@@ -612,6 +612,9 @@ impl Preview {
             reverse_front: true,
             alpha_compare: 5,
             alpha_reference: 84. / 255.,
+            // The librarian preview draws a single model into its own target:
+            // there is no world atlas and no upscaler, so no LOD bias.
+            lod_bias: 0.,
         }
     }
 }

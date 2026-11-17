@@ -41,6 +41,8 @@ pub struct Params {
     /// and brow/eye `c1` (`colorFace`). Unused otherwise.
     pub face_color: [f32; 4],
     pub face_skin: [f32; 4],
+    /// `x`: LOD bias for the object atlas (see `crate::render_scale::mip_bias`).
+    pub lod: [f32; 4],
 }
 pub struct Mesh {
     vertex: wgpu::Buffer,
@@ -311,7 +313,7 @@ struct Params {
  matrix:mat4x4<f32>,ambient:vec4<f32>,diffuse:vec4<f32>,point_ambient:vec4<f32>,point_diffuse:vec4<f32>,
  direction:vec4<f32>,point_position:vec4<f32>,attenuation:vec4<f32>,eye_direction:vec4<f32>,specular:vec4<f32>,lighting:vec4<f32>,
  fog_color:vec4<f32>,fog_range:vec4<f32>,clip_plane:vec4<f32>,raster:vec4<f32>,alpha:vec4<f32>,
- face_color:vec4<f32>,face_skin:vec4<f32>
+ face_color:vec4<f32>,face_skin:vec4<f32>,lod:vec4<f32>
 };
 @group(0) @binding(0) var<uniform> p:Params;
 @group(0) @binding(1) var image:texture_2d<f32>;
@@ -333,9 +335,9 @@ struct Output {@builtin(position) position:vec4<f32>,@location(0) uv:vec2<f32>,@
 @fragment fn fs(v:Output,@builtin(front_facing) front:bool)->@location(0) vec4<f32> {
  if p.raster.x<0.5 && front==(p.raster.y>0.5) {discard;}
  if dot(vec4<f32>(v.world,1.),p.clip_plane)<0. {discard;}
- let t=textureSample(image,image_sampler,v.uv);
- let h=textureSample(highlight_image,image_sampler,v.uv);
- let g=textureSample(gloss_image,image_sampler,v.uv);
+ let t=textureSampleBias(image,image_sampler,v.uv,p.lod.x);
+ let h=textureSampleBias(highlight_image,image_sampler,v.uv,p.lod.x);
+ let g=textureSampleBias(gloss_image,image_sampler,v.uv,p.lod.x);
  var rgb=t.rgb;
  // Native armor/fashion write v0.a. Other ordinary model shaders use base
  // alpha as opacity too; dedicated shaders below override that calculation.

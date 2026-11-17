@@ -158,7 +158,7 @@ impl MaterialBindings {
     }
 }
 const SHADER: &str = r#"
-struct Camera { matrix:mat4x4<f32>, direction:vec4<f32>, clip:vec4<f32>, bounds:vec4<f32>, tree_bounds:vec4<f32>, sun:vec4<f32>, light:vec4<f32>, region_ambient:vec4<f32>, region_diffuse:vec4<f32>, region_direction:vec4<f32>, grass_eye:vec4<f32>, grass_wind:vec4<f32>, grass_history:array<vec4<f32>,80>, fog_range:vec4<f32>, fog_color:vec4<f32> };
+struct Camera { matrix:mat4x4<f32>, direction:vec4<f32>, clip:vec4<f32>, bounds:vec4<f32>, tree_bounds:vec4<f32>, sun:vec4<f32>, light:vec4<f32>, region_ambient:vec4<f32>, region_diffuse:vec4<f32>, region_direction:vec4<f32>, grass_eye:vec4<f32>, grass_wind:vec4<f32>, grass_history:array<vec4<f32>,80>, fog_range:vec4<f32>, fog_color:vec4<f32>, lod:vec4<f32> };
 struct Settings { params:vec4<f32>, areas:vec4<u32>, light:vec4<u32> };
 struct Area { start:u32,count:u32,pad:vec2<u32> };
 struct Layer { tex:u32,axis:u32,mask:u32,pad:u32,uv:vec2<f32>,pad2:vec2<f32> };
@@ -242,7 +242,7 @@ fn terrain_pass_fog(linear:vec3<f32>,reciprocal_w:f32,transmittance:f32)->vec3<f
  for(var k=0u;k<a.count;k=k+1u){let l=layers[a.start+k];var v=vec2<f32>(i.world.x,-i.world.z);if l.axis==0u {v=vec2<f32>(i.world.z,-i.world.y);}else if l.axis==2u {v=vec2<f32>(i.world.x,-i.world.y);}
  var dx=vec2<f32>(wx.x,-wx.z);var dy=vec2<f32>(wy.x,-wy.z);
  if l.axis==0u {dx=vec2<f32>(wx.z,-wx.y);dy=vec2<f32>(wy.z,-wy.y);}else if l.axis==2u {dx=vec2<f32>(wx.x,-wx.y);dy=vec2<f32>(wy.x,-wy.y);}
- dx*=l.uv;dy*=l.uv;let kind=l.tex>>28u;let index=i32(l.tex & 0x0fffffffu);
+ dx*=l.uv*camera.lod.y;dy*=l.uv*camera.lod.y;let kind=l.tex>>28u;let index=i32(l.tex & 0x0fffffffu);
  // Pass the true screen-space gradient, not a scalar max-footprint LOD.
  // The sampler can then preserve detail along the minor axis at grazing angles.
  var tex:vec3<f32>;

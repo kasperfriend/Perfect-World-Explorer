@@ -88,6 +88,9 @@ fn main() {
     ]);
     uni.extend_from_slice(&[0.; 20]);
     uni.extend_from_slice(&[0.; 328]);
+    // The camera uniform ends with the mip-bias `lod` lane: no bias here, and a
+    // gradient scale of 1 keeps the atlas LOD this check measures.
+    uni.extend_from_slice(&[0., 1., 0., 0.]);
     let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
         contents: bytemuck::cast_slice(&uni),
@@ -1619,7 +1622,7 @@ fn main() {
         uni[60 + i * 4..64 + i * 4].copy_from_slice(&[0.3, -0.15, 0., 0.]);
     }
     // Keep the refraction rows above untouched: they read fog_range at 380.
-    assert_eq!(uni.len(), 388, "Camera uniform layout changed");
+    assert_eq!(uni.len(), 392, "Camera uniform layout changed");
     assert_eq!(uni[60], 0.3, "history[0] carries the displacement");
     let mut wind_frames = Vec::new();
     // `grass_wind.y` is an enable gate, not an amplitude: the viewer writes 1.0

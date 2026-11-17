@@ -13,8 +13,10 @@ fn main() {
         None,
     ))
     .unwrap();
-    let mut uniform = [0f32; 388];
+    let mut uniform = [0f32; 392];
     uniform[..16].copy_from_slice(&glam::Mat4::IDENTITY.to_cols_array());
+    // `lod`: no bias, and 1.0 leaves the atlas gradient scale untouched.
+    uniform[388..392].copy_from_slice(&[0., 1., 0., 0.]);
     uniform[52..56].copy_from_slice(&[0., 10., 0., 0.]);
     uniform[380..384].copy_from_slice(&[0., 2., 1., 0.]);
     uniform[384..388].copy_from_slice(&[0.1, 0.8, 0.2, 1.]);

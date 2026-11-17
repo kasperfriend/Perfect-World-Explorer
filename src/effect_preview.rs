@@ -221,6 +221,7 @@ fn effect_frame(
         reverse_front: false,
         alpha_compare: 5,
         alpha_reference: 84. / 255.,
+        lod_bias: 0.,
     }
 }
 
@@ -717,6 +718,8 @@ fn capture(
     {
         let mut pass = encoder.begin_render_pass(&pass_descriptor);
         yardstick.draw(&mut pass);
+        // No coverage: this capture has no motion-vector pass to feed, and its
+        // depth only serves the snapshot.
         world.draw(&mut pass);
     }
     let padded = (shot.width * 4).div_ceil(256) * 256;

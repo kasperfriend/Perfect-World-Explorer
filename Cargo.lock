@@ -1771,6 +1771,7 @@ name = "perfect-world-explorer"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "d3d12",
  "egui",
  "egui-wgpu",
  "egui-winit",
@@ -1782,9 +1783,12 @@ dependencies = [
  "minifb",
  "png 0.17.16",
  "pollster",
+ "raw-window-handle",
  "rodio",
  "sha2",
  "wgpu",
+ "wgpu-hal",
+ "winapi",
  "winit",
 ]
 

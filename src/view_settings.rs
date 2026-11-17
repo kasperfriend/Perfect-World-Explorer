@@ -1,6 +1,7 @@
 //! Persisted viewer controls; malformed values fall back safely.
 use crate::client_weather::WeatherOverride;
 use crate::sky_transition::SkyOverride;
+use crate::{FrameGenMethod, FrameMultiplier, LatencyMode, UpscaleMethod, UpscaleQuality};
 
 #[path = "post_plan.rs"]
 mod post_plan;
@@ -204,7 +205,55 @@ pub struct ViewSettings {
     /// Internal 3D render resolution as a percentage of the window size.
     /// 100 is native; the Graphics tab exposes 10 (fast/blurry) to 200
     /// (supersampled). UI and presentation always stay at native resolution.
+    /// Applies only while `upscaling` is `off`.
     pub resolution_scale: f32,
+    /// Graphics: temporal upscaler. `off` keeps the resolution-scale slider;
+    /// any provider renders the world at its recommended internal resolution.
+    pub upscaling: UpscaleMethod,
+    /// Graphics: quality mode for the active upscaler.
+    pub upscale_quality: UpscaleQuality,
+    /// Graphics: frame generator, chosen independently of the upscaler.
+    /// Illegal pairings are refused at decode time (see `crate::pairing`).
+    pub frame_generation: FrameGenMethod,
+    /// Graphics: presented frames per rendered frame for the frame generator
+    /// (`x2` … `x6`). What each vendor can actually do is decided by
+    /// `crate::multiplier_support`; FSR frame generation is 2x only and DLSS
+    /// multi frame generation needs Blackwell.
+    pub frame_multiplier: FrameMultiplier,
+    /// Graphics: AMD FSR 1 RCAS sharpness in stops (lower = sharper).
+    /// Applies only while `upscaling` is `fsr1`.
+    pub fsr1_sharpness: f32,
+    /// Graphics: sharpening strength handed to the FSR 3.1 / FSR 4 FFX
+    /// upscale dispatch (0 = off, 1 = maximum; FFX calls it `sharpness` and
+    /// only applies it while `enableSharpening` is set). Applies while
+    /// `upscaling` is `fsr2`, `fsr3` or `fsr4` — all three go through the same
+    /// FFX upscale dispatch.
+    pub fsr3_sharpness: f32,
+    /// Graphics: sharpening strength handed to NGX as `Sharpness`
+    /// (`NVSDK_NGX_Parameter_Sharpness`, 0 = off, 1 = maximum). DLSS does no
+    /// sharpening of its own when this is 0, which is why the reconstruction
+    /// looks soft next to an RCAS-sharpened FSR frame. Applies while
+    /// `upscaling` is `dlss`.
+    pub dlss_sharpness: f32,
+    /// Graphics: sharpening applied by the viewer's own RCAS-style pass after
+    /// XeSS (0 = off, 1 = maximum). Intel's SDK 3.0.2 has no sharpening
+    /// control — it exposes `xessExecute` and nothing else — so the only way to
+    /// give XeSS the same control the other two providers have is to sharpen
+    /// its output ourselves. Applies while `upscaling` is `xess`.
+    pub xess_sharpness: f32,
+    /// Graphics: pacing strategy — `vsync` is the previous behaviour (the
+    /// display paces presents and no latency library is involved), `xell`
+    /// hands the decision to Intel Xe Low Latency (`xellSleep` plus the
+    /// per-frame simulation / render-submit / present markers) while keeping a
+    /// vsync'd, sync-interval-1 present. Independent of the upscaler and of
+    /// frame generation; XeSS Frame Generation owns its own XeLL context, in
+    /// which case that context is the one that runs (see
+    /// `crate::latency_owner`).
+    pub latency: LatencyMode,
+    /// Graphics: folder to load the vendor upscaling SDKs from. Empty means
+    /// `PW_UPSCALER_SDK_DIR`, or `<exe>\sdk\` beside the viewer. The SDKs are
+    /// not shipped with the viewer and are never committed to the repository.
+    pub upscale_sdk_dir: String,
     /// World tab: force one precipitation effect instead of the area flags.
     pub weather_override: WeatherOverride,
     /// World tab: pin one `sky.lst` row instead of the day/night ladder.
@@ -279,6 +328,19 @@ impl Default for ViewSettings {
             minimap_style: MapStyle::Realistic,
             minimap_shape: MinimapShape::Square,
             resolution_scale: 100.,
+            upscaling: UpscaleMethod::Off,
+            upscale_quality: UpscaleQuality::Quality,
+            frame_generation: FrameGenMethod::Off,
+            frame_multiplier: FrameMultiplier::X2,
+            fsr1_sharpness: 0.2,
+            fsr3_sharpness: 0.75,
+            // DLSS and XeSS default to a mild sharpen: both reconstruct softer
+            // than an RCAS-sharpened FSR frame, and 0 (no sharpening at all) is
+            // what made DLSS look blurry next to it.
+            dlss_sharpness: 0.35,
+            xess_sharpness: 0.35,
+            upscale_sdk_dir: String::new(),
+            latency: LatencyMode::Vsync,
             // Both overrides default to the client's own behaviour; the World
             // tab offers them only so the recovered sets and particle
             // constants can be inspected anywhere.
@@ -299,6 +361,11 @@ impl ViewSettings {
     fn decode_with_fog_default(text: &str, fog_enabled: bool) -> Self {
         let mut s = Self::default();
         s.atmospheric_fog = fog_enabled;
+        // Legacy `upscaling=fsr` (pre-FSR-version-selector settings) carries
+        // the chosen provider in `fsr_version`; either key may appear before
+        // the other in the file, so resolve the pair after the key loop.
+        let mut legacy_fsr_bare = false;
+        let mut legacy_fsr_version: Option<u32> = None;
         for line in text.lines().take(100) {
             let Some((k, v)) = line.split_once('=') else {
                 continue;
@@ -386,6 +453,49 @@ impl ViewSettings {
                 "ambience_enabled" => flag!(s.ambience_enabled),
                 "minimap_range" => number!(s.minimap_range, 100., 600.),
                 "resolution_scale" => number!(s.resolution_scale, 10., 200.),
+                "upscaling" => {
+                    if let Some(method) = UpscaleMethod::parse(v) {
+                        s.upscaling = method;
+                    } else if v.trim().eq_ignore_ascii_case("fsr") {
+                        legacy_fsr_bare = true;
+                    }
+                }
+                "fsr1_sharpness" => number!(s.fsr1_sharpness, 0., 2.),
+                "fsr3_sharpness" => number!(s.fsr3_sharpness, 0., 1.),
+                "dlss_sharpness" => number!(s.dlss_sharpness, 0., 1.),
+                "xess_sharpness" => number!(s.xess_sharpness, 0., 1.),
+                "upscale_quality" => {
+                    if let Some(quality) = UpscaleQuality::parse(v) {
+                        s.upscale_quality = quality;
+                    }
+                }
+                "frame_generation" => {
+                    if let Some(method) = FrameGenMethod::parse(v) {
+                        s.frame_generation = method;
+                    }
+                }
+                "frame_multiplier" => {
+                    if let Some(multiplier) = FrameMultiplier::parse(v) {
+                        s.frame_multiplier = multiplier;
+                    }
+                }
+                "fsr_version" => {
+                    // Legacy key, consumed for the `upscaling=fsr` migration.
+                    legacy_fsr_version = v.trim().parse::<u32>().ok();
+                }
+                "upscale_sdk_dir" => {
+                    // An empty value is the default (env var or <exe>\sdk), so
+                    // it is stored rather than ignored.
+                    s.upscale_sdk_dir = v.to_string();
+                }
+                "latency" => {
+                    // Unknown spellings keep VSync: a settings file written by
+                    // a newer build must not silently change the present
+                    // behaviour of this one.
+                    if let Some(mode) = LatencyMode::parse(v) {
+                        s.latency = mode;
+                    }
+                }
                 "regional_tree_lighting" => flag!(s.regional_tree_lighting),
                 "streamed_regions" => flag!(s.streamed_regions),
                 "grass_distance_fade" => flag!(s.grass_distance_fade),
@@ -453,6 +563,23 @@ impl ViewSettings {
                 _ => {}
             }
         }
+        if legacy_fsr_bare {
+            s.upscaling = match legacy_fsr_version {
+                Some(1) => UpscaleMethod::Fsr1,
+                Some(2) => UpscaleMethod::Fsr2,
+                Some(3) => UpscaleMethod::Fsr3,
+                // "newest advertised" (the old 0/4 default) is FSR 4 today.
+                _ => UpscaleMethod::Fsr4,
+            };
+        }
+        // Settings written by another build (or hand-edited) can hold an
+        // upscaler/quality/frame-generator triple this build cannot honour;
+        // coerce it to a legal one rather than failing the whole file.
+        let (upscaling, upscale_quality, frame_generation) =
+            crate::sanitise(s.upscaling, s.upscale_quality, s.frame_generation);
+        s.upscaling = upscaling;
+        s.upscale_quality = upscale_quality;
+        s.frame_generation = frame_generation;
         s
     }
     fn encode(&self) -> String {
@@ -460,11 +587,12 @@ impl ViewSettings {
             "radius={}\nterrain_cutoff={}\ntree_lod_scale={}\nscenery_quality={}\ncamera_speed={}\nboost={}\nsensitivity={}\nfar={}\ntime_of_day={}\ntime_pass_enabled={}\ntime_pass_speed={}\nall_to_vram={}\n",
             "whole_world={}\nwater_reflections={}\nworld_effects={}\natmospheric_fog={}\nbloom={}\nbloom_strength={}\nbloom_mode={}\nbloom_tint={}\nbloom_brightness_fade={}\nbloom_opacity_fade={}\nclient_gamma={}\ngamma_setting={}\n",
             "terrain_lightmaps={}\nmodel_backface_culling={}\nmusic_enabled={}\nmusic_volume={}\nambience_enabled={}\nsound_volume={}\neffects_enabled={}\neffects_volume={}\nfullscreen={}\nshow_zone_entry={}\n",
-            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\n"),
+            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nframe_multiplier={}\nfsr1_sharpness={}\nfsr3_sharpness={}\ndlss_sharpness={}\nxess_sharpness={}\nupscale_sdk_dir={}\nlatency={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\n"),
             self.detail.radius,self.detail.terrain_cutoff,self.detail.tree_lod_scale,self.detail.scenery_quality,self.camera_speed,self.boost,self.sensitivity,self.far,self.time_of_day,self.time_pass_enabled,self.time_pass_speed,self.all_to_vram,
             self.whole_world,self.water_reflections,self.world_effects,self.atmospheric_fog,self.bloom,self.bloom_strength,self.bloom_mode,self.bloom_tint,self.bloom_brightness_fade,self.bloom_opacity_fade,self.client_gamma,self.gamma_setting,
             self.terrain_lightmaps,self.model_backface_culling,self.music_enabled,self.music_volume,self.ambience_enabled,self.sound_volume,self.effects_enabled,self.effects_volume,self.fullscreen,self.show_zone_entry,
             self.show_minimap,self.minimap_range,self.tree_wind_strength,self.client_tree_wind_preview,self.regional_tree_lighting,self.grass_distance_fade,self.grass_wind_enabled,self.grass_wind_amplitude,self.streamed_regions,self.area_grass_lightmaps,self.vegetation_authored_mips,self.celestial_discs,self.celestial_brightness,self.ignore_celestial_flags,self.cloud_detail,self.sharpen,self.resolution_scale,
+            self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.frame_multiplier.token(),self.fsr1_sharpness,self.fsr3_sharpness,self.dlss_sharpness,self.xess_sharpness,self.upscale_sdk_dir,self.latency.token(),
             self.world_map_style.label(),self.minimap_style.label(),
             self.minimap_shape.label(),
             self.weather_override.token(),self.sky_override.token(),self.effect_shaft.token(),self.effect_distance,self.logging_mask,self.logging_dir)
@@ -930,6 +1058,361 @@ mod tests {
             ViewSettings::decode("resolution_scale=NaN").resolution_scale,
             100.
         );
+    }
+
+    /// A settings file written by the previous release (no upscaling keys)
+    /// must load unchanged: every old key keeps its value, the new keys take
+    /// their documented defaults. The fixture is the pre-upscaling format
+    /// byte-for-byte, with non-default values so a silent fallback to the
+    /// default would be caught.
+    #[test]
+    fn settings_file_from_main_loads_unchanged() {
+        let legacy = "# Perfect World Explorer settings, version 1\n\
+radius=7\nterrain_cutoff=true\ntree_lod_scale=2.5\nscenery_quality=3\n\
+camera_speed=321\nboost=3\nsensitivity=0.0045\nfar=12000\ntime_of_day=9.5\n\
+time_pass_enabled=true\ntime_pass_speed=42\nall_to_vram=true\n\
+whole_world=true\nwater_reflections=false\nworld_effects=false\natmospheric_fog=true\n\
+bloom=true\nbloom_strength=2.5\nbloom_mode=4\nbloom_tint=0x80ff00ff\n\
+bloom_brightness_fade=0.25\nbloom_opacity_fade=0.5\nclient_gamma=true\ngamma_setting=55\n\
+terrain_lightmaps=false\nmodel_backface_culling=false\nmusic_enabled=false\n\
+music_volume=0.75\nambience_enabled=false\nsound_volume=0.25\n\
+effects_enabled=false\neffects_volume=0.125\nfullscreen=true\nshow_zone_entry=false\n\
+show_minimap=false\nminimap_range=333\ntree_wind_strength=0.5\n\
+client_tree_wind_preview=true\nregional_tree_lighting=true\ngrass_distance_fade=false\n\
+grass_wind_enabled=false\ngrass_wind_amplitude=1.5\nstreamed_regions=true\n\
+area_grass_lightmaps=false\nvegetation_authored_mips=true\ncelestial_discs=false\n\
+celestial_brightness=0.4\nignore_celestial_flags=false\ncloud_detail=false\nsharpen=true\n\
+resolution_scale=63.5\nworld_map_style=Original\nminimap_style=Original\n\
+minimap_shape=Circular\nweather_override=Rain\nsky_override=Sunset\n\
+effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs\n";
+        let s = ViewSettings::decode(legacy);
+        assert_eq!(s.detail.radius, 7);
+        assert!(s.detail.terrain_cutoff);
+        assert_eq!(s.detail.tree_lod_scale, 2.5);
+        assert_eq!(s.detail.scenery_quality, 3);
+        assert_eq!(s.camera_speed, 321.);
+        assert_eq!(s.boost, 3.);
+        assert_eq!(s.sensitivity, 0.0045);
+        assert_eq!(s.far, 12000.);
+        assert_eq!(s.time_of_day, 9.5);
+        assert!(s.time_pass_enabled);
+        assert_eq!(s.time_pass_speed, 42.);
+        assert!(s.all_to_vram);
+        assert!(s.whole_world);
+        assert!(!s.water_reflections);
+        assert!(!s.world_effects);
+        assert!(s.atmospheric_fog);
+        assert!(s.bloom);
+        assert_eq!(s.bloom_strength, 2.5);
+        assert_eq!(s.bloom_mode, 4);
+        assert_eq!(s.bloom_tint, 0x80ff00ff);
+        assert_eq!(s.bloom_brightness_fade, 0.25);
+        assert_eq!(s.bloom_opacity_fade, 0.5);
+        assert!(s.client_gamma);
+        assert_eq!(s.gamma_setting, 55.);
+        assert!(!s.terrain_lightmaps);
+        assert!(!s.model_backface_culling);
+        assert!(!s.music_enabled);
+        assert_eq!(s.music_volume, 0.75);
+        assert!(!s.ambience_enabled);
+        assert_eq!(s.sound_volume, 0.25);
+        assert!(!s.effects_enabled);
+        assert_eq!(s.effects_volume, 0.125);
+        assert!(s.fullscreen);
+        assert!(!s.show_zone_entry);
+        assert!(!s.show_minimap);
+        assert_eq!(s.minimap_range, 333.);
+        assert_eq!(s.tree_wind_strength, 0.5);
+        assert!(s.client_tree_wind_preview);
+        assert!(s.regional_tree_lighting);
+        assert!(!s.grass_distance_fade);
+        assert!(!s.grass_wind_enabled);
+        assert_eq!(s.grass_wind_amplitude, 1.5);
+        assert!(s.streamed_regions);
+        assert!(!s.area_grass_lightmaps);
+        assert!(s.vegetation_authored_mips);
+        assert!(!s.celestial_discs);
+        assert_eq!(s.celestial_brightness, 0.4);
+        assert!(!s.ignore_celestial_flags);
+        assert!(!s.cloud_detail);
+        assert!(s.sharpen);
+        assert_eq!(s.resolution_scale, 63.5);
+        assert_eq!(s.world_map_style, MapStyle::Original);
+        assert_eq!(s.minimap_style, MapStyle::Original);
+        assert_eq!(s.minimap_shape, MinimapShape::Circular);
+        assert_eq!(s.weather_override, WeatherOverride::Rain);
+        assert_eq!(s.sky_override, SkyOverride::Sunset);
+        assert_eq!(s.effect_shaft, EffectShaft::WorldUp);
+        assert_eq!(s.effect_distance, 125.5);
+        assert_eq!(s.logging_mask, 7);
+        assert_eq!(s.logging_dir, "C:\\pwe-logs");
+        // New keys take their defaults; encoding re-emits the old keys too.
+        assert_eq!(s.upscaling, crate::UpscaleMethod::Off);
+        assert_eq!(s.upscale_quality, crate::UpscaleQuality::Quality);
+        assert_eq!(s.frame_generation, crate::FrameGenMethod::Off);
+        assert_eq!(s.upscale_sdk_dir, "");
+        assert_eq!(s.latency, LatencyMode::Vsync);
+        let re_encoded = s.encode();
+        // `bloom_tint` is the one legacy key whose value is re-encoded in a
+        // different spelling (hex input, decimal output).
+        assert!(re_encoded.contains("bloom_tint=2164195583"));
+        for line in legacy
+            .lines()
+            .filter(|line| line.contains('=') && !line.starts_with("bloom_tint="))
+        {
+            assert!(
+                re_encoded.contains(line),
+                "settings re-encode lost legacy key line {line:?}"
+            );
+        }
+        assert_eq!(ViewSettings::decode(&re_encoded), s);
+    }
+
+    /// The new upscaling keys round-trip, and illegal persisted combinations
+    /// are coerced to legal ones instead of failing the whole settings file.
+    #[test]
+    fn upscale_settings_round_trip_and_coercion() {
+        let defaults = ViewSettings::default();
+        assert_eq!(defaults.upscaling, crate::UpscaleMethod::Off);
+        assert_eq!(defaults.upscale_quality, crate::UpscaleQuality::Quality);
+        assert_eq!(defaults.frame_generation, crate::FrameGenMethod::Off);
+        assert_eq!(defaults.upscale_sdk_dir, "");
+        assert_eq!(defaults.latency, LatencyMode::Vsync);
+        let s = ViewSettings::decode(
+            "upscaling=dlss\nupscale_quality=performance\nframe_generation=dlss\n\
+             upscale_sdk_dir=D:\\vendor-sdks\n",
+        );
+        assert_eq!(s.upscaling, crate::UpscaleMethod::Dlss);
+        assert_eq!(s.upscale_quality, crate::UpscaleQuality::Performance);
+        assert_eq!(s.frame_generation, crate::FrameGenMethod::Dlss);
+        assert_eq!(s.upscale_sdk_dir, "D:\\vendor-sdks");
+        assert_eq!(ViewSettings::decode(&s.encode()), s);
+        // Unknown tokens fall back to Off/Quality.
+        let unknown = ViewSettings::decode(
+            "upscaling=vendorx\nupscale_quality=gaga\nframe_generation=vendorx\n",
+        );
+        assert_eq!(unknown.upscaling, crate::UpscaleMethod::Off);
+        assert_eq!(unknown.upscale_quality, crate::UpscaleQuality::Quality);
+        assert_eq!(unknown.frame_generation, crate::FrameGenMethod::Off);
+        // Each provider keeps the modes it advertises: XeSS has the full
+        // ladder (SDK 3.0.2), so Ultra Performance survives…
+        let xess = ViewSettings::decode("upscaling=xess\nupscale_quality=ultraperformance\n");
+        assert_eq!(
+            xess.upscale_quality,
+            crate::UpscaleQuality::UltraPerformance
+        );
+        // …and a mode the provider does not have degrades to the nearest ratio
+        // it does (DLSS has no Ultra Quality: 1.3x -> Quality's 1.5x).
+        let dlss = ViewSettings::decode("upscaling=dlss\nupscale_quality=ultraquality\n");
+        assert_eq!(dlss.upscale_quality, crate::UpscaleQuality::Quality);
+        // XeSS Native AA is a real XeSS mode (`XESS_QUALITY_SETTING_AA`).
+        let xess_aa = ViewSettings::decode("upscaling=xess\nupscale_quality=nativeaa\n");
+        assert_eq!(xess_aa.upscale_quality, crate::UpscaleQuality::NativeAa);
+        // Cross-vendor XeSS frame generation is not exposed: coerced to Off.
+        let cross = ViewSettings::decode("upscaling=fsr2\nframe_generation=xess\n");
+        assert_eq!(cross.frame_generation, crate::FrameGenMethod::Off);
+        // DLSS + DLSS FG is legal and survives.
+        let legal = ViewSettings::decode("upscaling=dlss\nframe_generation=dlss\n");
+        assert_eq!(legal.frame_generation, crate::FrameGenMethod::Dlss);
+        // Mixed case tokens parse.
+        let mixed = ViewSettings::decode("upscaling=FSR3\nframe_generation=FSR\n");
+        assert_eq!(mixed.upscaling, crate::UpscaleMethod::Fsr3);
+        assert_eq!(mixed.frame_generation, crate::FrameGenMethod::Fsr);
+        // Case-insensitive parse keeps the rest of the file intact.
+        assert_eq!(ViewSettings::decode(&mixed.encode()), mixed);
+    }
+
+    /// The Graphics -> Frame multiplier key: round-trips, defaults to x2, and
+    /// ignores anything it does not recognise (a stale or hand-edited file
+    /// must not change how many frames are presented).
+    #[test]
+    fn frame_multiplier_round_trip() {
+        use crate::FrameMultiplier;
+        assert_eq!(
+            ViewSettings::default().frame_multiplier,
+            FrameMultiplier::X2
+        );
+        for multiplier in FrameMultiplier::ALL {
+            let text = format!("frame_multiplier={}\n", multiplier.token());
+            let decoded = ViewSettings::decode(&text);
+            assert_eq!(decoded.frame_multiplier, multiplier, "{text:?}");
+            let encoded = decoded.encode();
+            assert!(
+                encoded.contains(&format!("frame_multiplier={}", multiplier.token())),
+                "encode lost the frame multiplier key: {encoded}"
+            );
+            assert_eq!(ViewSettings::decode(&encoded).frame_multiplier, multiplier);
+        }
+        // Accepted spellings and junk.
+        assert_eq!(
+            ViewSettings::decode("frame_multiplier=x4\n").frame_multiplier,
+            FrameMultiplier::X4
+        );
+        for junk in [
+            "frame_multiplier=\n",
+            "frame_multiplier=5\n",
+            "frame_multiplier=x8\n",
+        ] {
+            assert_eq!(
+                ViewSettings::decode(junk).frame_multiplier,
+                FrameMultiplier::X2,
+                "{junk:?}"
+            );
+        }
+        // Trailing-`x` spellings are accepted too.
+        assert_eq!(
+            ViewSettings::decode("frame_multiplier=6x\n").frame_multiplier,
+            FrameMultiplier::X6
+        );
+        // It does not disturb the neighbouring frame generation key (DLSS
+        // frame generation is legal with any upscaler, including Off).
+        let both = ViewSettings::decode("frame_generation=dlss\nframe_multiplier=3\n");
+        assert_eq!(both.frame_multiplier, FrameMultiplier::X3);
+        assert_eq!(both.frame_generation, crate::FrameGenMethod::Dlss);
+        assert_eq!(ViewSettings::decode(&both.encode()), both);
+    }
+
+    /// The Graphics -> Latency key: round-trips, defaults to VSync, and falls
+    /// back to VSync on anything it does not recognise (a viewer that loses
+    /// its latency setting must not lose its present path).
+    #[test]
+    fn latency_settings_round_trip() {
+        assert_eq!(ViewSettings::default().latency, LatencyMode::Vsync);
+        for mode in LatencyMode::ALL {
+            let text = format!("latency={}\n", mode.token());
+            let decoded = ViewSettings::decode(&text);
+            assert_eq!(decoded.latency, mode, "{text:?}");
+            let encoded = decoded.encode();
+            assert!(
+                encoded.contains(&format!("latency={}", mode.token())),
+                "encode lost the latency key: {encoded}"
+            );
+            assert_eq!(ViewSettings::decode(&encoded).latency, mode);
+        }
+        // `reflex` is a real mode now, so only near-misses stay junk.
+        for junk in [
+            "latency=\n",
+            "latency=reflexx\n",
+            "latency=2\n",
+            "latency=xel\n",
+        ] {
+            assert_eq!(
+                ViewSettings::decode(junk).latency,
+                LatencyMode::Vsync,
+                "{junk:?}"
+            );
+        }
+        // Case and surrounding whitespace are tolerated like every other key.
+        assert_eq!(
+            ViewSettings::decode("latency=XE LL\n").latency,
+            LatencyMode::Vsync
+        );
+        assert_eq!(
+            ViewSettings::decode("latency= XeLL \n").latency,
+            LatencyMode::Xell
+        );
+        // The latency choice never disturbs the upscaler / frame generator,
+        // and coercion of those does not disturb it.
+        let both = ViewSettings::decode("upscaling=fsr2\nframe_generation=xess\nlatency=xell\n");
+        assert_eq!(both.frame_generation, FrameGenMethod::Off);
+        assert_eq!(both.latency, LatencyMode::Xell);
+        assert_eq!(ViewSettings::decode(&both.encode()), both);
+    }
+    /// The DLSS and XeSS sharpening sliders persist and are clamped too: DLSS
+    /// hands its value to NGX, XeSS runs the viewer's own pass.
+    #[test]
+    fn dlss_and_xess_sharpness_round_trip() {
+        // Both default to a mild sharpen: 0 is what made DLSS (and XeSS, which
+        // has no sharpening of its own) look soft next to an RCAS-sharpened FSR
+        // frame, so the neutral "vendor" look is a deliberate choice, not the
+        // default.
+        let defaults = ViewSettings::default();
+        assert_eq!(defaults.dlss_sharpness, 0.35);
+        assert_eq!(defaults.xess_sharpness, 0.35);
+        let decoded =
+            ViewSettings::decode("upscaling=dlss\ndlss_sharpness=0.6\nxess_sharpness=0.9\n");
+        assert_eq!(decoded.dlss_sharpness, 0.6);
+        assert_eq!(decoded.xess_sharpness, 0.9);
+        let encoded = decoded.encode();
+        assert!(encoded.contains("dlss_sharpness=0.6"), "{encoded}");
+        assert!(encoded.contains("xess_sharpness=0.9"), "{encoded}");
+        let round = ViewSettings::decode(&encoded);
+        assert_eq!(round.dlss_sharpness, 0.6);
+        assert_eq!(round.xess_sharpness, 0.9);
+        // Out-of-range values are clamped, garbage keeps the default.
+        assert_eq!(
+            ViewSettings::decode("dlss_sharpness=-3\n").dlss_sharpness,
+            0.
+        );
+        assert_eq!(
+            ViewSettings::decode("xess_sharpness=9\n").xess_sharpness,
+            1.
+        );
+        assert_eq!(
+            ViewSettings::decode("dlss_sharpness=abc\n").dlss_sharpness,
+            defaults.dlss_sharpness
+        );
+        assert_eq!(
+            ViewSettings::decode("xess_sharpness=0\n").xess_sharpness,
+            0.
+        );
+    }
+
+    /// The FSR sharpening slider persists, is clamped, and defaults to the
+    /// value the dispatch used before the slider existed.
+    #[test]
+    fn fsr3_sharpness_round_trip() {
+        assert_eq!(ViewSettings::default().fsr3_sharpness, 0.75);
+        let decoded = ViewSettings::decode("upscaling=fsr3\nfsr3_sharpness=0.25\n");
+        assert_eq!(decoded.fsr3_sharpness, 0.25);
+        let encoded = decoded.encode();
+        assert!(encoded.contains("fsr3_sharpness=0.25"), "{encoded}");
+        assert_eq!(ViewSettings::decode(&encoded).fsr3_sharpness, 0.25);
+        // Out-of-range values clamp to the 0..1 range, junk keeps the default.
+        assert_eq!(
+            ViewSettings::decode("fsr3_sharpness=-1\n").fsr3_sharpness,
+            0.0
+        );
+        assert_eq!(
+            ViewSettings::decode("fsr3_sharpness=7\n").fsr3_sharpness,
+            1.0
+        );
+        assert_eq!(
+            ViewSettings::decode("fsr3_sharpness=abc\n").fsr3_sharpness,
+            0.75
+        );
+        // 0 is a legal value and means "no sharpening", not "unset".
+        assert_eq!(
+            ViewSettings::decode("fsr3_sharpness=0\n").fsr3_sharpness,
+            0.0
+        );
+    }
+
+    #[test]
+    fn legacy_bare_fsr_migrates_via_fsr_version() {
+        // Pre-selector settings files: `upscaling=fsr` with an `fsr_version`
+        // discriminator, in either key order.
+        for (text, expected) in [
+            ("upscaling=fsr\n", crate::UpscaleMethod::Fsr4),
+            ("upscaling=fsr\nfsr_version=0\n", crate::UpscaleMethod::Fsr4),
+            ("upscaling=fsr\nfsr_version=4\n", crate::UpscaleMethod::Fsr4),
+            ("upscaling=fsr\nfsr_version=3\n", crate::UpscaleMethod::Fsr3),
+            ("upscaling=fsr\nfsr_version=2\n", crate::UpscaleMethod::Fsr2),
+            ("upscaling=fsr\nfsr_version=1\n", crate::UpscaleMethod::Fsr1),
+            ("fsr_version=3\nupscaling=fsr\n", crate::UpscaleMethod::Fsr3),
+            // An explicit modern choice wins; the legacy key is ignored.
+            (
+                "upscaling=fsr2\nfsr_version=4\n",
+                crate::UpscaleMethod::Fsr2,
+            ),
+        ] {
+            assert_eq!(ViewSettings::decode(text).upscaling, expected, "{text:?}");
+        }
+        // The migrated triple is re-encoded as the modern token.
+        let s = ViewSettings::decode("upscaling=fsr\nfsr_version=3\n");
+        assert_eq!(ViewSettings::decode(&s.encode()), s);
+        assert!(s.encode().contains("upscaling=fsr3"));
+        assert!(!s.encode().contains("fsr_version"));
     }
     #[test]
     fn every_independent_post_effect_activates_the_renderer_chain() {
