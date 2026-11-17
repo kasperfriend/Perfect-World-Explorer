@@ -288,6 +288,93 @@ struct LodState {
     window: crate::terrain_lod::Window,
     levels: Vec<u8>,
 }
+/// Stages a [`FrameBudget`] sample is split into, in the order the line prints
+/// them.
+const STAGE_COUNT: usize = 6;
+const STAGE_VISIBILITY: usize = 0;
+const STAGE_MAIN: usize = 1;
+const STAGE_EXTRA_VIEWS: usize = 2;
+const STAGE_POST: usize = 3;
+const STAGE_MINIMAP: usize = 4;
+const STAGE_REST: usize = 5;
+const STAGE_NAMES: [&str; STAGE_COUNT] = [
+    "visibility",
+    "main scene",
+    "extra views",
+    "post",
+    "minimap",
+    "rest",
+];
+
+/// Fold elapsed time into one stage and move the cursor.
+fn lap(stage: usize, stage_ms: &mut [f64; STAGE_COUNT], at: &mut Instant) {
+    let now = Instant::now();
+    stage_ms[stage] += now.duration_since(*at).as_secs_f64() * 1000.;
+    *at = now;
+}
+
+/// One second of frame CPU samples, split by the stage that spent them.
+///
+/// A world that is fully resident should read a cheap frame, and when it does
+/// not this is the line that says which stage grew: a frame that spends its time
+/// in "extra views" is paying for the water's mirror and refraction, one that
+/// spends it in "main scene" is paying for the pages and the models, and one that
+/// reads a few milliseconds here while the frame rate stays low is bound on the
+/// GPU instead, which is a different fix. The numbers are CPU-side command
+/// recording; they are reported with the page count so two runs can be compared.
+#[derive(Default)]
+struct FrameBudget {
+    stage_ms: [f64; STAGE_COUNT],
+    frames: u32,
+    since: Option<Instant>,
+    worst_ms: f64,
+}
+
+impl FrameBudget {
+    fn add(&mut self, stage_ms: [f64; STAGE_COUNT]) {
+        for (total, ms) in self.stage_ms.iter_mut().zip(stage_ms) {
+            *total += ms;
+        }
+        self.frames += 1;
+        self.worst_ms = self.worst_ms.max(stage_ms.iter().sum::<f64>());
+    }
+
+    /// Fold in a stage measured outside `render` (the minimap's own pass).
+    fn note(&mut self, stage: usize, started: Instant) {
+        self.stage_ms[stage] += started.elapsed().as_secs_f64() * 1000.;
+    }
+
+    /// Emit and reset once a second.
+    fn report(&mut self, pages: usize) {
+        let since = *self.since.get_or_insert_with(Instant::now);
+        let elapsed = since.elapsed().as_secs_f64();
+        if elapsed < 1. {
+            return;
+        }
+        if self.frames > 0
+            && crate::diagnostics::enabled(crate::diagnostics::Channel::TimingFrame)
+        {
+            use std::fmt::Write;
+            let mut stages = String::new();
+            for (name, ms) in STAGE_NAMES.iter().zip(self.stage_ms) {
+                let _ = write!(stages, "; {name} {:.2} ms", ms / self.frames as f64);
+            }
+            crate::diag!(
+                TimingFrame,
+                "CPU frame {:.2} ms average, {:.2} ms worst, {:.1} frames/s, {pages} world pages{}",
+                self.stage_ms.iter().sum::<f64>() / self.frames as f64,
+                self.worst_ms,
+                self.frames as f64 / elapsed,
+                stages
+            );
+        }
+        self.stage_ms = [0.; STAGE_COUNT];
+        self.frames = 0;
+        self.worst_ms = 0.;
+        self.since = Some(Instant::now());
+    }
+}
+
 struct MeshData {
     terrain_upload: Option<crate::terrain_gpu::TerrainUpload>,
     vertices: Vec<Vertex>,
@@ -316,6 +403,12 @@ struct MeshData {
     water_start: u32,
     water_batches: Vec<WaterBatch>,
     local_pages: Vec<crate::world_objects::Page>,
+    /// True when this build left the locally streamed scenery out because the
+    /// whole-world preload owns it. The renderer compares it against the state
+    /// it is drawing with, the same way `lod` is compared, so a crossing into
+    /// or out of the whole-world mode rebuilds instead of drawing the wrong
+    /// half of the world.
+    local_scenery_skipped: bool,
 }
 /// Which view's indirect terrain records the next submit draws. The records
 /// live in one buffer, so every pass re-queues the view it draws through: the
@@ -551,6 +644,13 @@ fn build(
     residency: &mut crate::terrain_residency::Residency,
     vegetation_authored_mips: bool,
     grass_atlas_hint: u64,
+    // The whole-world preload has finished and owns the scenery: the renderer
+    // draws its pages and ends the local index range at `object_start`, so the
+    // ornaments this function would otherwise select, pack into 4096² atlases
+    // and upload are pixels nothing samples. Skipping them is the difference
+    // between a crossing that rebuilds a terrain mesh and one that also uploads
+    // tens of megabytes of unused atlas.
+    skip_local_scenery: bool,
 ) -> Result<MeshData, String> {
     if vegetation_authored_mips {
         static WARN: std::sync::Once = std::sync::Once::new();
@@ -672,7 +772,12 @@ fn build(
         },
     )?;
     let spans = residency.append(&win, &mut vertices, &mut indices);
-    eprintln!(
+    // A channel line, not `eprintln!`: this runs on every block-window crossing,
+    // and a synchronous console write per crossing costs more than the append it
+    // reports. `TimingLoad` writes it to the log file when the Logging tab has
+    // that channel on.
+    crate::diag!(
+        TimingLoad,
         "Terrain residency: {} blocks resident ({} entered, {} evicted, {} re-meshed), \
          {} triangles; {} blocks submitted",
         census.resident,
@@ -987,14 +1092,41 @@ fn build(
     // Only the ornament class maps to Objects::load_ids indices; the other
     // nine classes use disjoint synthetic indices for the resident-bit set.
     let object_start = indices.len() as u32;
-    let scenery_placements = ten_class_placements(t);
     let scenery_margin = 0.5 * t.scene.block_size.max(0.);
-    let nearby = t.scenery_residency.select(
-        &scenery_placements,
-        [cx, cz],
-        detail.scenery_quality,
-        scenery_margin,
-    );
+    // While the whole-world preload owns the scenery, no ornament is selected:
+    // every list below is built from `nearby`, so an empty one turns the whole
+    // block (residency bits, texture packing, page atlases, ornament geometry)
+    // into no work at all and the mesh stays terrain-only. The residency bits
+    // are what the local draw reads; nothing else consumes them, and the
+    // whole-world pages were selected from the map's own records.
+    let nearby = if skip_local_scenery {
+        Vec::new()
+    } else {
+        // Built once for the map and kept: the list covers the whole scene, and
+        // the camera cannot change any entry in it. Cloning the `Arc` out of the
+        // field keeps the field free for the store below, which a borrow of it
+        // would not.
+        let scenery_placements = match t.scenery_placements.clone() {
+            Some(list) => list,
+            None => {
+                let list = std::sync::Arc::new(ten_class_placements(t));
+                t.scenery_placements = Some(list.clone());
+                crate::diag!(
+                    TimingLoad,
+                    "scenery placements built once: {} entries over {} blocks",
+                    list.len(),
+                    t.scene.blocks.len()
+                );
+                list
+            }
+        };
+        t.scenery_residency.select(
+            &scenery_placements,
+            [cx, cz],
+            detail.scenery_quality,
+            scenery_margin,
+        )
+    };
     let ornament_count = t.objects.ornaments.len();
     let ornament_ids: Vec<usize> = nearby
         .iter()
@@ -1006,18 +1138,26 @@ fn build(
         .collect();
     t.objects.load_ids(&ornament_ids)?;
     let tree_lod_scale = lod_scale(detail.scenery_quality, Class::Trees);
-    eprintln!(
-        "Scenery residency: quality {} ({} native classes, tree LOD {:.3}, ornament distance {:.1}), {} resident, {} ornaments retained, {} loads, {} evictions, {} distance culls",
-        detail.scenery_quality,
-        Class::ALL.len(),
-        tree_lod_scale,
-        crate::scenery_visibility::ornament_distance(detail.scenery_quality),
-        nearby.len(),
-        ornament_ids.len(),
-        t.scenery_residency.loads,
-        t.scenery_residency.evictions,
-        t.scenery_residency.distance_culls
-    );
+    if skip_local_scenery {
+        crate::diag!(
+            TimingLoad,
+            "Scenery residency: whole-world preload owns the scenery; no local ornaments selected"
+        );
+    } else {
+        crate::diag!(
+            TimingLoad,
+            "Scenery residency: quality {} ({} native classes, tree LOD {:.3}, ornament distance {:.1}), {} resident, {} ornaments retained, {} loads, {} evictions, {} distance culls",
+            detail.scenery_quality,
+            Class::ALL.len(),
+            tree_lod_scale,
+            crate::scenery_visibility::ornament_distance(detail.scenery_quality),
+            nearby.len(),
+            ornament_ids.len(),
+            t.scenery_residency.loads,
+            t.scenery_residency.evictions,
+            t.scenery_residency.distance_culls
+        );
+    }
     // Sort largest rectangles first, then use as many atlas pages as needed.
     // Unlike the legacy 128px atlas, local BMDs keep their source dimensions.
     let mut requested: HashMap<String, (usize, usize)> = HashMap::new();
@@ -1101,7 +1241,8 @@ fn build(
         }
         texture_slots.insert(key.clone(), (i, slot));
     }
-    eprintln!(
+    crate::diag!(
+        TimingLoad,
         "Local scenery: {} source-resolution textures in {} GPU pages",
         requested.len(),
         pages.len()
@@ -1392,6 +1533,7 @@ fn build(
         water_start,
         water_batches,
         local_pages,
+        local_scenery_skipped: skip_local_scenery,
     })
 }
 const SHADER: &str = r#"
@@ -1495,6 +1637,10 @@ struct Renderer {
     /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
     world_draw_cmds: [crate::world_objects::WorldDrawList; crate::world_objects::WORLD_VIEWS],
     world_done: bool,
+    /// The scenery half of the drawn mesh was left out because the whole-world
+    /// preload owns it. Unlike `world_done` this describes the *mesh*, so the
+    /// streamer and the renderer can agree on what a rebuild should contain.
+    local_scenery_skipped: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     water_start: u32,
@@ -1504,6 +1650,8 @@ struct Renderer {
     wind_last: Instant,
     /// Snapshot computed once by `render()`; secondary views reuse it.
     frame: FrameSnapshot,
+    /// This second's frame CPU samples, reported on the `TimingFrame` channel.
+    frame_budget: FrameBudget,
     world_glow: crate::post_gpu::WorldGlow,
     celestial_visibility: crate::client_sun::Visibility,
     /// Raw `+0x80` disc-flag word from the default area, before the viewer's
@@ -2231,6 +2379,7 @@ impl Renderer {
                 crate::world_objects::WorldDrawList::default()
             }),
             world_done: false,
+            local_scenery_skipped: m.local_scenery_skipped,
             layout,
             sampler,
             water_start: m.water_start,
@@ -2238,6 +2387,7 @@ impl Renderer {
             visible_water_batches: Vec::new(),
             started: Instant::now(),
             frame: FrameSnapshot::default(),
+            frame_budget: FrameBudget::default(),
             world_glow: crate::post_gpu::WorldGlow::default(),
             celestial_visibility: crate::client_sun::Visibility::default(),
             celestial_flags: 0x18,
@@ -2770,6 +2920,7 @@ impl Renderer {
         self.tree_center = m.tree_center;
         self.detail = m.detail;
         self.lod = m.lod;
+        self.local_scenery_skipped = m.local_scenery_skipped;
         self.spans = m.spans;
         self.terrain_end = m.terrain_end;
         self.object_start = m.object_start;
@@ -3177,6 +3328,7 @@ impl Renderer {
         range: f32,
         full_world: bool,
     ) {
+        let started = Instant::now();
         let matrix = if full_world {
             let w = self.world_width as f32 * self.world_spacing;
             let h = self.world_height as f32 * self.world_spacing;
@@ -3262,6 +3414,15 @@ impl Renderer {
             pass.draw_indexed(self.water_start..self.count, 0, 0..1);
         }
         self.queue.submit(Some(e.finish()));
+        // The map's records above overwrote the shared argument buffer, so put
+        // the main view's back before the next submit reads it. `prepare_runs`
+        // compares against the last list it uploaded, and without this every
+        // frame that also drew the minimap re-uploaded the main view's records
+        // on the next frame for no reason.
+        if !full_world {
+            self.queue_main_runs();
+        }
+        self.frame_budget.note(STAGE_MINIMAP, started);
     }
     /// Re-queues the main view's indirect terrain records for the next submit.
     /// Every pass drawn through the main matrix (`Main`, `Fog` and both
@@ -3324,6 +3485,10 @@ impl Renderer {
         // against a view that no longer exists.
         reset_history: bool,
     ) {
+        // Where this frame's CPU time goes, stage by stage. One line a second on
+        // the `TimingFrame` channel; see `FrameBudget`.
+        let mut stage_ms = [0f64; STAGE_COUNT];
+        let mut lap_at = Instant::now();
         // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
         // the same block walk the client runs before the level rule.
         // Both buffers are reused: this runs for every view of every frame.
@@ -3338,6 +3503,7 @@ impl Renderer {
         // One indirect record per run, so the terrain itself is one call per mesh
         // instead of one call per run.
         self.queue_main_runs();
+        lap(STAGE_VISIBILITY, &mut stage_ms, &mut lap_at);
         let frame = self.begin_frame(camera, w, h);
         self.weather.advance(camera.logic_delta_ms);
         let selected_weather = camera.regional_light.map_or(
@@ -3544,6 +3710,7 @@ impl Renderer {
         self.water.copy_depth(&mut e, &self.depth);
         self.water.blit(&mut e, scene_target);
         self.queue.submit(Some(e.finish()));
+        lap(STAGE_MAIN, &mut stage_ms, &mut lap_at);
         // Diagnostic mode for exercising window/input UI on memory-limited software GPUs.
         if ui_test() {
             if use_post {
@@ -3571,6 +3738,7 @@ impl Renderer {
                     camera.gamma_setting,
                 );
             }
+            self.end_frame(stage_ms, lap_at);
             return;
         }
 
@@ -3623,6 +3791,7 @@ impl Renderer {
                 );
             }
             self.queue.submit(Some(e.finish()));
+            lap(STAGE_EXTRA_VIEWS, &mut stage_ms, &mut lap_at);
             if let Some(shore) = &self.shore {
                 shore.draw(
                     &self.device,
@@ -3664,6 +3833,8 @@ impl Renderer {
                 );
             }
             self.visible_water_batches = visible;
+            lap(STAGE_POST, &mut stage_ms, &mut lap_at);
+            self.end_frame(stage_ms, lap_at);
             return;
         }
         let mut simple_encoder: Option<wgpu::CommandEncoder> = None;
@@ -4010,6 +4181,7 @@ impl Renderer {
             self.queue.submit(Some(e.finish()));
         }
         self.visible_water_batches = visible;
+        lap(STAGE_EXTRA_VIEWS, &mut stage_ms, &mut lap_at);
         if let Some(shore) = &self.shore {
             shore.draw(
                 &self.device,
@@ -4050,6 +4222,18 @@ impl Renderer {
                 camera.gamma_setting,
             );
         }
+        lap(STAGE_POST, &mut stage_ms, &mut lap_at);
+        self.end_frame(stage_ms, lap_at);
+    }
+
+    /// Close one frame's stage samples: whatever the last stage did not claim is
+    /// "rest" (the encoder finish, the present-side work and the branches this
+    /// frame skipped), then the budget decides whether a second has passed.
+    fn end_frame(&mut self, mut stage_ms: [f64; STAGE_COUNT], lap_at: Instant) {
+        stage_ms[STAGE_REST] += lap_at.elapsed().as_secs_f64() * 1000.;
+        let pages = self.world_pages.len();
+        self.frame_budget.add(stage_ms);
+        self.frame_budget.report(pages);
     }
 }
 fn water_depth(areas: &[crate::water::WaterArea], pos: Vec3) -> f32 {
@@ -4728,13 +4912,16 @@ pub fn run(
     // know that from the renderer: the pixels and their mip tiles are the
     // largest thing the streaming path uploads, and a camera crossing a block
     // almost never changes them.
-    let (request_tx, request_rx) = std::sync::mpsc::channel::<(f32, f32, DetailSettings, u64)>();
+    // The last element says whether the whole-world preload owns the scenery, so
+    // the worker can leave the local half of the mesh out (see `build`).
+    let (request_tx, request_rx) =
+        std::sync::mpsc::channel::<(f32, f32, DetailSettings, u64, bool)>();
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<MeshData, String>>(1);
     std::thread::Builder::new()
         .name("world-streaming".into())
         .spawn(move || {
             let mut residency = crate::terrain_residency::Residency::default();
-            while let Ok((x, z, detail, grass_atlas_key)) = request_rx.recv() {
+            while let Ok((x, z, detail, grass_atlas_key, skip_local_scenery)) = request_rx.recv() {
                 let started = Instant::now();
                 let result = build(
                     &mut t,
@@ -4744,8 +4931,10 @@ pub fn run(
                     &mut residency,
                     vegetation_authored_mips,
                     grass_atlas_key,
+                    skip_local_scenery,
                 );
-                eprintln!(
+                crate::diag!(
+                    TimingLoad,
                     "Background terrain build at ({x:.1},{z:.1}) took {:.2}s",
                     started.elapsed().as_secs_f32()
                 );
@@ -5570,8 +5759,19 @@ pub fn run(
                             levels,
                         })
                     };
+                    // The whole-world preload draws the scenery, so the local
+                    // half of the mesh is dead weight while it holds: skip it in
+                    // the build instead of packing and uploading ornament
+                    // atlases nothing samples. Crossing into or out of that
+                    // state changes what the mesh should contain, so it is part
+                    // of the staleness test and not just of the request.
+                    let skip_local_scenery = renderer.world_done;
                     let stale = match &aim {
-                        Some(aim) => aim != &renderer.lod || renderer.detail != settings.detail,
+                        Some(aim) => {
+                            aim != &renderer.lod
+                                || renderer.detail != settings.detail
+                                || renderer.local_scenery_skipped != skip_local_scenery
+                        }
                         None => false,
                     };
                     if stale {
@@ -5580,6 +5780,7 @@ pub fn run(
                             camera.pos.z,
                             settings.detail,
                             renderer.grass_atlas_key,
+                            skip_local_scenery,
                         );
                         if request_tx.send(request).is_err() {
                             eprintln!("World streaming worker exited");
@@ -7421,5 +7622,45 @@ mod world_stream_tests {
         assert_eq!(world_buffer_capacity(1000, 32), 32_768);
         assert_eq!(world_buffer_capacity(32_769, 32), 2_097_152);
         assert_eq!(world_buffer_capacity(1, 4), 4);
+    }
+}
+
+/// The per-second `TimingFrame` line is only worth having if the average it
+/// prints is the average of the frames it saw and if a quiet second is dropped
+/// from the next one. A budget that kept accumulating after a report would make
+/// every later average drift upward, and one that divided by a stale frame count
+/// would understate a hitch.
+mod frame_budget_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn sample(visibility: f64, main: f64) -> [f64; STAGE_COUNT] {
+        let mut sample = [0.; STAGE_COUNT];
+        sample[STAGE_VISIBILITY] = visibility;
+        sample[STAGE_MAIN] = main;
+        sample
+    }
+
+    #[test]
+    fn a_second_of_frames_averages_per_stage_and_then_starts_over() {
+        let mut budget = FrameBudget::default();
+        budget.add(sample(1., 3.));
+        budget.add(sample(1., 5.));
+        assert_eq!(budget.frames, 2);
+        assert_eq!(budget.worst_ms, 6.);
+        budget.since = Some(Instant::now() - Duration::from_secs(2));
+        budget.report(0);
+        assert_eq!(budget.frames, 0, "a reported second is not counted twice");
+        assert_eq!(budget.stage_ms, [0.; STAGE_COUNT]);
+        assert_eq!(budget.worst_ms, 0.);
+    }
+
+    #[test]
+    fn a_stage_measured_outside_render_lands_in_its_own_column() {
+        let mut budget = FrameBudget::default();
+        budget.note(STAGE_MINIMAP, Instant::now() - Duration::from_millis(4));
+        assert!(budget.stage_ms[STAGE_MINIMAP] >= 4.);
+        assert_eq!(budget.stage_ms[STAGE_MAIN], 0.);
+        assert_eq!(budget.frames, 0, "the minimap is a stage, not a frame");
     }
 }

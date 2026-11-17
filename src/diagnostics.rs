@@ -608,6 +608,8 @@ impl Channel {
                 | Self::ModelQueue
                 | Self::RenderEffects
                 | Self::RenderWater
+                | Self::TimingFrame
+                | Self::TimingLoad
         )
     }
 

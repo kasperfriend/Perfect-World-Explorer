@@ -144,3 +144,105 @@ is one entry and is keyed by path, so it cannot grow with the world.
 - `src/gfx_owner.rs` — identity index with `reindex`/`position_of`, the three
   setters through it, `last_root` reuse in `build_one_player`, two unit tests.
 - `src/bin/grass-instance-gpu-check.rs` — the new `Gpu::update` signature.
+
+## Second pass: fast flight with the world resident (same day)
+
+The first pass fixed what a crossing uploaded. The follow-up report was that the
+lag survives "flying fast over zones **with the world fully loaded to VRAM**" —
+so the cost is not streaming at all, it is work the crossing and the frame do
+regardless of how much is already resident. This pass re-walked the crossing
+path, the per-frame render path and the whole-world preload handover, and found
+four things, three of them work on data nothing samples.
+
+### 1. The ten-class placement list was rebuilt per crossing
+
+`ten_class_placements` walks every ECWLD block, then every tree, water cell and
+ornament in the scene and produces a `Placement` per one of them — tens of
+thousands of entries on a retail map — behind a `by_export` hash map it also
+builds from scratch. It ran on every block-window crossing. Nothing in its output
+depends on the camera, the window or the detail settings; the list covers the
+whole map by construction. It is now built once and held on `Terrain`
+(`scenery_placements`, an `Arc` so the streaming worker owns it and `build` can
+still borrow other fields mutably), and a `TimingLoad` line records the entry and
+block counts the one time it is built.
+
+This matters more than the crossing cost suggests: `build` runs on the
+`world-streaming` thread, so world-sized CPU work there competes with the render
+thread on every crossing instead of being a one-off during load.
+
+### 2. The local scenery half was rebuilt and uploaded while the whole world drew instead
+
+`draw_opaque` already ends the local index range at `object_start` and switches
+the pages over atomically (`world_done`). But the streamer did not know that: on
+every crossing it still selected ornaments, packed their textures into 4096²
+atlases and appended their geometry into the mesh, and `update_mesh` still
+created a texture per page, wrote its eight mip levels and uploaded the grown
+vertex/index buffers. All of it is skipped by the draw path:
+
+```rust
+let local_end = if self.world_done { self.object_start } else { self.water_start };
+```
+
+and `terrain_end == object_start` in every build (nothing is appended between the
+two markers), so the range that would draw the local ornaments is empty while
+`world_done` holds. The crossings were paying for tens of megabytes of atlas that
+no pass samples.
+
+The request now carries `skip_local_scenery` (the renderer's `world_done`), and
+`build` leaves the ornament half out entirely: `nearby` comes back empty, and
+every list below it — residency bits, atlas packing, page atlases, ornament
+geometry — is built from `nearby`, so an empty one makes the block do no work at
+all instead of needing a second code path. The flag travels back in `MeshData` and
+is part of the staleness test, so turning the whole-world preload *off* rebuilds
+with the local scenery again. That also closes a hole that predates this change:
+unchecking "Render whole world" cleared `local_pages` and set `world_done` false
+but changed nothing in the staleness test, so the objects stayed missing until the
+camera happened to cross a block.
+
+### 3. Console writes on the crossing path
+
+`Terrain residency`, `Scenery residency`, `Local scenery` and the background
+build time were `eprintln!`, i.e. a synchronous stderr write on the render thread
+on every crossing (and the background build line from the worker). They are
+`TimingLoad` lines now. `TimingFrame` (31) and `TimingLoad` (32) were also missing
+from `Channel::wired`, which is what the Logging tab reads to decide whether a
+channel can say anything — the tab marked both as having no call sites, so neither
+could be turned on deliberately. Both are wired.
+
+### 4. A per-second frame budget, because the next question is "which stage"
+
+`TimingFrame` was described in the channel list ("Frame time per stage, once a
+second") and had no call site. `Renderer::render` now times itself in stages —
+`visibility`, `main scene`, `extra views` (the water mirror and both refraction
+submits), `post`, `minimap`, and `rest` — and emits one averaged line a second
+with the worst frame, the frames per second and the world page count. The minimap
+pass, which runs outside `render`, adds its own stage. A frame that reads a few
+milliseconds of CPU while the frame rate stays low is GPU-bound, and the line says
+so by arithmetic rather than by guess.
+
+That pass also had a real defect: it overwrote the *shared* indirect-argument
+buffer with the map's terrain records, so the next frame's `queue_main_runs` always
+saw a different record list than `prepare_runs` had compared against and
+re-uploaded the main view's records. `render_minimap` now puts the main view's
+records back (and does not have to when it drew the full map, which uses the whole
+range).
+
+### Still unproven, and what to measure
+
+- The main view is recorded three times per frame: the scene, the water mirror and
+  the above-water refraction each draw the terrain runs and the world pages. That
+  is what a mirror costs; there is nothing to skip without changing what the water
+  reflects, so nothing was changed.
+- `world_models_gpu::draw_models` writes a uniform block per mesh per view, and
+  `WaterEffect 0` (the shipped default) already gates EC models out of the mirror
+  and the refraction, so in the default configuration it runs once per frame. A
+  non-default water effect would pay for it three times; that is a real cost and a
+  real lead, not a change this pass could make without a GPU to check it against.
+- The realistic minimap is re-rendered on every presented frame while the camera
+  moves, by design (the comment above the call explains that the old 350 ms timer
+  capped it below 3 FPS). Its cost now shows up in the `minimap` stage, so the next report can
+  either justify a rate cap or retire the idea.
+- Nothing here is a measured frame-time win. This sandbox has no GPU: the claims
+  above are about work removed from data no pass samples, and the counters that
+  make them checkable (`TimingLoad`, `TimingFrame`) are the evidence a GPU run has
+  to produce.
