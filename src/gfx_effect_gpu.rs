@@ -1299,7 +1299,8 @@ mod tests {
             1,
             "motion claims a pixel only where the sheet's opacity dominates it"
         );
-        let motion = "let motion=(prev.xy/prev.w-cur.xy/cur.w)*vec2<f32>(0.5*p.mv_size.x,-0.5*p.mv_size.y);";
+        let motion =
+            "let motion=(prev.xy/prev.w-cur.xy/cur.w)*vec2<f32>(0.5*p.mv_size.x,-0.5*p.mv_size.y);";
         assert_eq!(
             WGSL.matches(motion).count(),
             1,
