@@ -552,7 +552,8 @@ impl Objects {
                                             archive_jobs.iter().map(|(_, entry)| *entry).collect();
                                         let bytes = pck::read_entries_at(file, &entries)
                                             .map_err(|e| e.to_string())?;
-                                        for ((key, _), data) in archive_jobs.into_iter().zip(bytes) {
+                                        for ((key, _), data) in archive_jobs.into_iter().zip(bytes)
+                                        {
                                             out.push((
                                                 key.clone(),
                                                 decode_texture_bytes(key, &data),
