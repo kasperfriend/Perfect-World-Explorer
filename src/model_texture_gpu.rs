@@ -205,7 +205,11 @@ fn upload_dds(
     let data = if native {
         &bytes[128..]
     } else {
-        let total: usize = d.mips.iter().map(|m| (m.width as usize) * (m.height as usize) * 4).sum();
+        let total: usize = d
+            .mips
+            .iter()
+            .map(|m| (m.width as usize) * (m.height as usize) * 4)
+            .sum();
         let mut out = Vec::with_capacity(total);
         for m in &d.mips {
             out.extend_from_slice(&decode_mip(bytes, d.format, m)?);
