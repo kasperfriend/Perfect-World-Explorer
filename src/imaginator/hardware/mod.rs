@@ -36,9 +36,46 @@ pub const DXIL_FILE: &str = "imaginator/dxr_trace.cso";
 #[cfg(not(windows))]
 pub const PARAMS_FLOATS: usize = 40;
 
+/// Where the module directory may be, most specific first.
+///
+/// Shared by both halves so the probe, the frame path and the page all answer
+/// "is the blob installed" from one place. On a portable install the module sits
+/// beside the executable, which is not the process's working directory.
+#[cfg(not(windows))]
+pub use support::{module_candidates, ray_query_blob};
+
 #[cfg(not(windows))]
 pub mod support {
     use crate::imaginator::bvh::SharedScene;
+
+    /// Where the compiled RayQuery shader lives inside the module's folder.
+    ///
+    /// Off Windows there is no DXR, so this is only ever reported as missing;
+    /// `ray_query_blob` still has to exist so both halves satisfy the same
+    /// call sites and the module compiles everywhere the viewer does.
+    pub const DXIL_FILE: &str = super::DXIL_FILE;
+
+    /// The compiled RayQuery shader, if it is installed in `directory`.
+    pub fn ray_query_blob(directory: &std::path::Path) -> Option<(Vec<u8>, std::path::PathBuf)> {
+        let path = directory.join(DXIL_FILE);
+        match std::fs::read(&path) {
+            Ok(blob) if blob.len() > 4 => Some((blob, path)),
+            _ => None,
+        }
+    }
+
+    /// Where the module directory may be, most specific first: beside the
+    /// executable, then relative to the working directory.
+    pub fn module_candidates() -> Vec<std::path::PathBuf> {
+        let mut candidates = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("Modules/Imaginator"));
+            }
+        }
+        candidates.push(std::path::PathBuf::from("Modules/Imaginator"));
+        candidates
+    }
 
     /// Why the hardware tracer is not running, or what it is doing.
     #[derive(Clone, Debug, PartialEq, Eq)]

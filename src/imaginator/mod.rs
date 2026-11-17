@@ -767,8 +767,23 @@ impl Imaginator {
         // failure is reported rather than swallowed.
         let scene = self.scene.clone();
         let tlas = hardware.ensure_built(&scene)?;
-        let blob = std::fs::read(self.directory.join(hardware::DXIL_FILE))
-            .map_err(|why| format!("the RayQuery shader is not installed: {why}"))?;
+        // The module's own directory first, then the executable's sibling
+        // `Modules/Imaginator`. A portable install keeps the module beside the
+        // executable, and the module object is built from whatever client root the
+        // host had, which is not always the same thing.
+        let blob = hardware::ray_query_blob(&self.directory)
+            .or_else(|| {
+                hardware::module_candidates()
+                    .into_iter()
+                    .find_map(|dir| hardware::ray_query_blob(&dir))
+            })
+            .map(|(blob, _)| blob)
+            .ok_or_else(|| {
+                format!(
+                    "the RayQuery shader {} is not installed beside the executable;                      the module traced this frame on the CPU instead",
+                    hardware::DXIL_FILE
+                )
+            })?;
         // The shader's Params block, field for field.
         let mut block = [0f32; hardware::PARAMS_FLOATS];
         for (target, source) in block.chunks_exact_mut(4).zip(

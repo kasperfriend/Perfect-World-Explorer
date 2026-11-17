@@ -57,10 +57,41 @@ pub const BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// path under `Modules/Imaginator/`, which is the copy the module loads.
 pub const DXIL_FILE: &str = "imaginator/dxr_trace.cso";
 
+/// The compiled RayQuery shader, if it is installed in `directory`.
+///
+/// One function is the single source of truth for "is the blob there", because a
+/// second, subtly different answer is how the module came to disagree with itself:
+/// the probe looked in a working-directory-relative path while `trace_frame` read
+/// from the module directory, so the page could say "missing" for a shader that
+/// was about to be used, or "present" for one that was never going to be found.
+pub fn ray_query_blob(directory: &Path) -> Option<(Vec<u8>, std::path::PathBuf)> {
+    let path = directory.join(DXIL_FILE);
+    match std::fs::read(&path) {
+        Ok(blob) if blob.len() > 4 => Some((blob, path)),
+        _ => None,
+    }
+}
+
+/// Where the module directory may be, most specific first.
+///
+/// A portable install keeps `Modules/` beside the executable; a development run
+/// keeps it beside the crate. The executable's own directory is what matters, not
+/// the process's working directory.
+pub fn module_candidates() -> Vec<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(MODULE_DIR));
+        }
+    }
+    candidates.push(std::path::PathBuf::from(MODULE_DIR));
+    candidates
+}
+
 /// The module's own folder, from the working directory. Spelled here rather than
 /// imported so this file type-checks on its own; `imaginator::DIRECTORY` is the
 /// same string.
-const MODULE_DIR: &str = "Modules/Imaginator";
+pub const MODULE_DIR: &str = "Modules/Imaginator";
 
 /// The shader's `Params` block in 32-bit floats: ten `float4`/`uint4` members,
 /// i.e. 160 bytes, which is `PARAMS_BYTES` below.
@@ -183,9 +214,7 @@ impl HardwareTracer {
     /// `directory` is the module's own folder (`Modules/Imaginator`); the blob
     /// lives at `imaginator/dxr_trace.cso` beneath it.
     pub fn dxil_present(&self, directory: &Path) -> bool {
-        std::fs::read(directory.join(DXIL_FILE))
-            .map(|blob| blob.len() > 4)
-            .unwrap_or(false)
+        ray_query_blob(directory).is_some()
     }
 
     /// Probe `device` for DXR and prepare the command list the builds record on.
@@ -320,15 +349,32 @@ impl HardwareTracer {
         // 3. The one piece that cannot be produced in-tree. The probe has no
         //    module folder yet — it runs before the module page has one — so this
         //    only reports whether a blob exists where the module will look.
-        let note = match std::fs::read(Path::new(MODULE_DIR).join(DXIL_FILE)) {
-            Ok(blob) if blob.len() > 4 => format!(
-                "DXR tier {} on ID3D12Device5; {DXIL_FILE} present ({} KiB), build runs on the first traced frame",
+        // The blob's actual location, resolved the same way the module resolves
+        // its own directory. This used to read a *current-working-directory*
+        // relative path, so a module installed beside the executable reported the
+        // shader missing whenever the process had been started from elsewhere —
+        // which is most shortcuts on Windows.
+        let found = module_candidates()
+            .into_iter()
+            .find_map(|dir| ray_query_blob(&dir));
+        let note = match found {
+            Some((blob, path)) => format!(
+                "DXR tier {} on ID3D12Device5; {DXIL_FILE} present ({} KiB at {}), \
+                 build runs on the first traced frame",
                 self.tier_label(),
-                blob.len() / 1024
+                blob.len() / 1024,
+                path.display()
             ),
-            _ => format!(
-                "DXR tier {} on ID3D12Device5; acceleration structures build on demand, but the RayQuery shader {DXIL_FILE} is missing (run tools/imaginator-shaders.sh)",
-                self.tier_label()
+            None => format!(
+                "DXR tier {} on ID3D12Device5; acceleration structures build on demand, but \
+                 the RayQuery shader {DXIL_FILE} was not found in {} (run \
+                 tools/imaginator-shaders.sh)",
+                self.tier_label(),
+                module_candidates()
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" or ")
             ),
         };
         self.status = HardwareStatus::Ready(note);
@@ -1126,6 +1172,42 @@ mod tests {
         assert_eq!(
             std::mem::align_of::<sys::D3D12_RAYTRACING_INSTANCE_DESC>(),
             16
+        );
+    }
+
+    /// The blob probe and the frame path must agree on where the shader is.
+    ///
+    /// They used to disagree: the probe read a working-directory-relative path
+    /// while `trace_hardware` read the module's own directory, so a portable
+    /// install launched from anywhere but its own folder reported the shader
+    /// missing while the frame path would have found it — or the reverse.
+    #[test]
+    fn the_blob_probe_matches_the_path_the_trace_reads() {
+        let dir =
+            std::env::temp_dir().join(format!("imaginator-blob-probe-{}", std::process::id()));
+        let shader_dir = dir.join("imaginator");
+        std::fs::create_dir_all(&shader_dir).expect("a temp module directory");
+        // Too small: a four-byte file is not DXIL and must not count.
+        let small = dir.join(DXIL_FILE);
+        std::fs::write(&small, b"abcd").expect("write the stub");
+        assert!(
+            ray_query_blob(&dir).is_none(),
+            "a four-byte file is not a compiled shader"
+        );
+        // A plausible blob: the probe must find exactly what the trace reads.
+        std::fs::write(&small, vec![0u8; 512]).expect("write the blob");
+        let (blob, path) = ray_query_blob(&dir).expect("the blob must be found");
+        assert_eq!(path, dir.join(DXIL_FILE));
+        assert_eq!(blob.len(), 512);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The candidates must include a path beside the executable, which is
+        // where a portable install keeps the module.
+        let candidates = module_candidates();
+        assert!(!candidates.is_empty());
+        assert!(
+            candidates.iter().any(|c| c.ends_with(MODULE_DIR)),
+            "one candidate must be Modules/Imaginator"
         );
     }
 }
