@@ -79,9 +79,17 @@ struct ThreadQueue {
 thread_local ThreadQueue g_thread_queue;
 } // namespace
 
-extern "C" __declspec(dllexport) int __cdecl pwe_dstorage_read(
-    const wchar_t* path, unsigned long long offset, unsigned int size, void* output) {
-    if (!path || !output || size == 0) return 0;
+struct PweDStorageRange {
+    unsigned long long offset;
+    unsigned int size;
+    void* output;
+};
+
+// Submit several independent ranges before waiting. The caller groups entries
+// from one archive, so one file open and one queue submit cover the whole batch.
+extern "C" __declspec(dllexport) int __cdecl pwe_dstorage_read_batch(
+    const wchar_t* path, const PweDStorageRange* ranges, unsigned int count) {
+    if (!path || !ranges || count == 0 || count > DSTORAGE_MIN_QUEUE_CAPACITY) return 0;
 
     IDStorageFactory* factory = get_factory();
     if (!factory || !g_thread_queue.initialize(factory)) return 0;
@@ -92,18 +100,23 @@ extern "C" __declspec(dllexport) int __cdecl pwe_dstorage_read(
         return 0;
     }
 
-    DSTORAGE_REQUEST request{};
-    request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
-    request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
-    request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
-    request.Source.File.Source = file;
-    request.Source.File.Offset = offset;
-    request.Source.File.Size = size;
-    request.Destination.Memory.Buffer = output;
-    request.Destination.Memory.Size = size;
-    request.UncompressedSize = size;
-
-    g_thread_queue.queue->EnqueueRequest(&request);
+    for (unsigned int i = 0; i < count; ++i) {
+        if (!ranges[i].output || ranges[i].size == 0) {
+            file->Release();
+            return 0;
+        }
+        DSTORAGE_REQUEST request{};
+        request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+        request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
+        request.Options.CompressionFormat = DSTORAGE_COMPRESSION_FORMAT_NONE;
+        request.Source.File.Source = file;
+        request.Source.File.Offset = ranges[i].offset;
+        request.Source.File.Size = ranges[i].size;
+        request.Destination.Memory.Buffer = ranges[i].output;
+        request.Destination.Memory.Size = ranges[i].size;
+        request.UncompressedSize = ranges[i].size;
+        g_thread_queue.queue->EnqueueRequest(&request);
+    }
     g_thread_queue.queue->EnqueueSetEvent(g_thread_queue.event);
     g_thread_queue.queue->Submit();
     const bool completed = WaitForSingleObject(g_thread_queue.event, INFINITE) == WAIT_OBJECT_0;
@@ -116,4 +129,10 @@ extern "C" __declspec(dllexport) int __cdecl pwe_dstorage_read(
     }
     file->Release();
     return succeeded ? 1 : 0;
+}
+
+extern "C" __declspec(dllexport) int __cdecl pwe_dstorage_read(
+    const wchar_t* path, unsigned long long offset, unsigned int size, void* output) {
+    const PweDStorageRange range{offset, size, output};
+    return pwe_dstorage_read_batch(path, &range, 1);
 }

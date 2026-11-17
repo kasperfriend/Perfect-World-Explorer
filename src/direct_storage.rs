@@ -54,21 +54,38 @@ mod enabled {
         ) -> u32;
     }
 
+    #[repr(C)]
+    struct DirectStorageRange {
+        offset: u64,
+        size: u32,
+        output: *mut core::ffi::c_void,
+    }
+
     extern "C" {
-        fn pwe_dstorage_read(
+        fn pwe_dstorage_read_batch(
             path: *const u16,
-            offset: u64,
-            size: u32,
-            output: *mut core::ffi::c_void,
+            ranges: *const DirectStorageRange,
+            count: u32,
         ) -> i32;
     }
 
-    pub fn read(file: &File, offset: u64, output: &mut [u8]) -> bool {
-        let Ok(size) = u32::try_from(output.len()) else {
+    pub fn read_ranges(file: &File, ranges: &mut [(u64, &mut [u8])]) -> bool {
+        if ranges.is_empty() || ranges.len() > 64 {
             return false;
-        };
-        if output.is_empty() {
-            return true;
+        }
+        let mut descriptors = Vec::with_capacity(ranges.len());
+        for (offset, output) in ranges.iter_mut() {
+            let Ok(size) = u32::try_from(output.len()) else {
+                return false;
+            };
+            if size == 0 {
+                return false;
+            }
+            descriptors.push(DirectStorageRange {
+                offset: *offset,
+                size,
+                output: output.as_mut_ptr().cast(),
+            });
         }
         let handle = file.as_raw_handle();
         // First query the required capacity, then obtain the canonical path
@@ -86,36 +103,54 @@ mod enabled {
         }
         path.truncate(written as usize);
         path.push(0);
-        unsafe { pwe_dstorage_read(path.as_ptr(), offset, size, output.as_mut_ptr().cast()) != 0 }
+        unsafe {
+            pwe_dstorage_read_batch(
+                path.as_ptr(),
+                descriptors.as_ptr(),
+                descriptors.len() as u32,
+            ) != 0
+        }
     }
 }
 
-/// Read a range through the optional DirectStorage runtime. `false` means the
-/// caller should use its regular file-I/O path instead.
+/// Read several ranges from one archive in a single DirectStorage submit/wait.
+/// `false` means the caller should use its regular file-I/O path instead.
 #[cfg(windows)]
-pub fn read_range(file: &std::fs::File, offset: u64, output: &mut [u8]) -> bool {
+pub fn read_ranges(file: &std::fs::File, ranges: &mut [(u64, &mut [u8])]) -> bool {
     #[cfg(pwe_directstorage)]
     {
-        if output.is_empty() {
-            return true;
+        if ranges.is_empty() {
+            return false;
         }
-        ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-        ACTIVE_READS.fetch_add(1, Ordering::Relaxed);
-        let succeeded = enabled::read(file, offset, output);
-        ACTIVE_READS.fetch_sub(1, Ordering::Relaxed);
+        if ranges.len() > 64 {
+            return false;
+        }
+        let bytes = ranges.iter().map(|(_, output)| output.len() as u64).sum();
+        let count = ranges.len() as u64;
+        ATTEMPTS.fetch_add(count, Ordering::Relaxed);
+        ACTIVE_READS.fetch_add(count as usize, Ordering::Relaxed);
+        let succeeded = enabled::read_ranges(file, ranges);
+        ACTIVE_READS.fetch_sub(count as usize, Ordering::Relaxed);
         if succeeded {
-            SUCCESSES.fetch_add(1, Ordering::Relaxed);
-            BYTES_READ.fetch_add(output.len() as u64, Ordering::Relaxed);
+            SUCCESSES.fetch_add(count, Ordering::Relaxed);
+            BYTES_READ.fetch_add(bytes, Ordering::Relaxed);
         } else {
-            FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            FALLBACKS.fetch_add(count, Ordering::Relaxed);
         }
         succeeded
     }
     #[cfg(not(pwe_directstorage))]
     {
-        let _ = (file, offset, output);
+        let _ = (file, ranges);
         false
     }
+}
+
+/// Convenience wrapper for callers with one large range.
+#[cfg(windows)]
+pub fn read_range(file: &std::fs::File, offset: u64, output: &mut [u8]) -> bool {
+    let mut ranges = [(offset, output)];
+    read_ranges(file, &mut ranges)
 }
 
 #[cfg(test)]

@@ -385,10 +385,19 @@ impl Objects {
 
         if !missing_models.is_empty() {
             let litfile = &self.litfile;
+            // Keep several archive ranges per worker so DirectStorage can
+            // submit a real batch instead of paying one queue submit/wait per
+            // model. Four workers still parse independent BMDs concurrently.
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4)
-                .min(missing_models.len());
+                .unwrap_or(4);
+            #[cfg(windows)]
+            let workers = if pck::direct_storage::compiled_in() {
+                workers.min(4)
+            } else {
+                workers
+            };
+            let workers = workers.min(missing_models.len());
             let chunk_size = (missing_models.len() + workers - 1) / workers;
             let parsed: Vec<Result<Vec<(String, bmd::Model)>, String>> = std::thread::scope(|s| {
                 let handles: Vec<_> = missing_models
@@ -396,12 +405,16 @@ impl Objects {
                     .map(|chunk| {
                         s.spawn(move || {
                             let mut out = Vec::with_capacity(chunk.len());
-                            for (name, entry) in chunk {
-                                let data = pck::read_entry_at(litfile, entry)
+                            for batch in chunk.chunks(16) {
+                                let entries: Vec<_> =
+                                    batch.iter().map(|(_, entry)| *entry).collect();
+                                let data = pck::read_entries_at(litfile, &entries)
                                     .map_err(|e| e.to_string())?;
-                                let model =
-                                    bmd::Model::parse(&data).map_err(|e| format!("{name}: {e}"))?;
-                                out.push((name.clone(), model));
+                                for ((name, _), data) in batch.iter().zip(data) {
+                                    let model = bmd::Model::parse(&data)
+                                        .map_err(|e| format!("{name}: {e}"))?;
+                                    out.push((name.clone(), model));
+                                }
                             }
                             Ok(out)
                         })
@@ -499,9 +512,17 @@ impl Objects {
 
             let workers = std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4)
-                .min(jobs.len());
+                .unwrap_or(4);
+            #[cfg(windows)]
+            let workers = if pck::direct_storage::compiled_in() {
+                workers.min(4)
+            } else {
+                workers
+            };
+            let workers = workers.min(jobs.len());
             let chunk_size = (jobs.len() + workers - 1) / workers;
+            let litfile = &self.litfile;
+            let texfile = &self.texfile;
             let decoded: Vec<Result<Vec<(String, Result<Texture, String>)>, String>> =
                 std::thread::scope(|s| {
                     let handles: Vec<_> = jobs
@@ -509,22 +530,50 @@ impl Objects {
                         .map(|chunk| {
                             s.spawn(move || {
                                 let mut out = Vec::with_capacity(chunk.len());
-                                for job in chunk {
-                                    let (key, data) = match job {
-                                        ResolvedJob::Archive { key, file, entry } => {
-                                            let data = pck::read_entry_at(file, entry)
-                                                .map_err(|e| e.to_string())?;
-                                            (key.clone(), data)
+                                for jobs_batch in chunk.chunks(16) {
+                                    let mut lit_jobs = Vec::new();
+                                    let mut tex_jobs = Vec::new();
+                                    for job in jobs_batch {
+                                        if let ResolvedJob::Archive { key, file, entry } = job {
+                                            if std::ptr::eq(*file, litfile) {
+                                                lit_jobs.push((key, *entry));
+                                            } else {
+                                                tex_jobs.push((key, *entry));
+                                            }
                                         }
-                                        ResolvedJob::Disk { key, path } => {
+                                    }
+                                    for (file, archive_jobs) in
+                                        [(litfile, lit_jobs), (texfile, tex_jobs)]
+                                    {
+                                        if archive_jobs.is_empty() {
+                                            continue;
+                                        }
+                                        let entries: Vec<_> = archive_jobs
+                                            .iter()
+                                            .map(|(_, entry)| *entry)
+                                            .collect();
+                                        let bytes = pck::read_entries_at(file, &entries)
+                                            .map_err(|e| e.to_string())?;
+                                        for ((key, _), data) in
+                                            archive_jobs.into_iter().zip(bytes)
+                                        {
+                                            out.push((
+                                                key.clone(),
+                                                decode_texture_bytes(key, &data),
+                                            ));
+                                        }
+                                    }
+                                    for job in jobs_batch {
+                                        if let ResolvedJob::Disk { key, path } = job {
                                             let data = std::fs::read(path).map_err(|e| {
                                                 format!("disk texture {}: {e}", path.display())
                                             })?;
-                                            (key.clone(), data)
+                                            out.push((
+                                                key.clone(),
+                                                decode_texture_bytes(key, &data),
+                                            ));
                                         }
-                                    };
-                                    let tex = decode_texture_bytes(&key, &data);
-                                    out.push((key, tex));
+                                    }
                                 }
                                 Ok(out)
                             })

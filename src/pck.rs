@@ -161,36 +161,96 @@ pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
     }
 }
 
-pub fn read_entry_at(f: &File, e: &Entry) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut raw = vec![0u8; e.compressed as usize];
+/// Read a bounded set of entries from one archive. Large reads are queued
+/// together on DirectStorage when available; ordinary positioned I/O remains
+/// the correctness-preserving fallback for every failed batch.
+pub fn read_entries_at(
+    f: &File,
+    entries: &[&Entry],
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    let mut raw: Vec<Vec<u8>> = entries
+        .iter()
+        .map(|entry| vec![0u8; entry.compressed as usize])
+        .collect();
+    let mut direct_storage_done = vec![false; entries.len()];
+
     #[cfg(windows)]
-    let accelerated =
-        raw.len() >= 64 * 1024 && direct_storage::read_range(f, e.offset as u64, &mut raw);
-    #[cfg(not(windows))]
-    let accelerated = false;
-    if !accelerated {
+    {
+        const DIRECT_STORAGE_MIN: usize = 64 * 1024;
+        const BATCH_CAPACITY: usize = 64;
+        let mut ranges = Vec::with_capacity(BATCH_CAPACITY);
+        let mut range_indices = Vec::with_capacity(BATCH_CAPACITY);
+        for (index, (entry, bytes)) in entries.iter().zip(raw.iter_mut()).enumerate() {
+            if bytes.len() < DIRECT_STORAGE_MIN {
+                continue;
+            }
+            ranges.push((entry.offset as u64, bytes.as_mut_slice()));
+            range_indices.push(index);
+            if ranges.len() == BATCH_CAPACITY {
+                if direct_storage::read_ranges(f, &mut ranges) {
+                    for &index in &range_indices {
+                        direct_storage_done[index] = true;
+                    }
+                }
+                ranges.clear();
+                range_indices.clear();
+            }
+        }
+        if !ranges.is_empty() && direct_storage::read_ranges(f, &mut ranges) {
+            for &index in &range_indices {
+                direct_storage_done[index] = true;
+            }
+        }
+    }
+
+    for ((entry, bytes), used_direct_storage) in entries
+        .iter()
+        .zip(raw.iter_mut())
+        .zip(direct_storage_done)
+    {
+        if used_direct_storage {
+            continue;
+        }
         let mut read = 0usize;
-        while read < raw.len() {
-            let off = e.offset as u64 + read as u64;
+        while read < bytes.len() {
+            let off = entry.offset as u64 + read as u64;
             #[cfg(windows)]
-            let n = std::os::windows::fs::FileExt::seek_read(f, &mut raw[read..], off)?;
+            let n = std::os::windows::fs::FileExt::seek_read(f, &mut bytes[read..], off)?;
             #[cfg(unix)]
-            let n = std::os::unix::fs::FileExt::read_at(f, &mut raw[read..], off)?;
+            let n = std::os::unix::fs::FileExt::read_at(f, &mut bytes[read..], off)?;
             if n == 0 {
-                return Err("unexpected EOF".into());
+                return Err(format!("unexpected EOF in PCK entry {}", entry.name).into());
             }
             read += n;
         }
     }
-    if e.compressed < e.size {
-        let out = inflate(&raw, e.size as usize)?;
-        if out.len() != e.size as usize {
-            return Err(format!("bad decompressed size: {} != {}", out.len(), e.size).into());
-        }
-        Ok(out)
-    } else {
-        Ok(raw)
-    }
+
+    entries
+        .iter()
+        .zip(raw)
+        .map(|(entry, bytes)| {
+            if entry.compressed < entry.size {
+                let out = inflate(&bytes, entry.size as usize)?;
+                if out.len() != entry.size as usize {
+                    return Err(format!(
+                        "bad decompressed size: {} != {}",
+                        out.len(),
+                        entry.size
+                    )
+                    .into());
+                }
+                Ok(out)
+            } else {
+                Ok(bytes)
+            }
+        })
+        .collect()
+}
+
+pub fn read_entry_at(f: &File, e: &Entry) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    read_entries_at(f, &[e])?
+        .pop()
+        .ok_or_else(|| "empty PCK read batch".into())
 }
 
 /// Environment variable that turns a shipped-corpus skip into a failure.
