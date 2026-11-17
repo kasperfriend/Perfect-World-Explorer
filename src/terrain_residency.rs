@@ -164,40 +164,35 @@ impl Residency {
         indices: &mut Vec<u32>,
     ) -> Vec<Span> {
         // One exact allocation, not geometric growth of a second near mesh.
-        let (mut vertex_count, mut index_count) = (0, 0);
+        let mut collected = Vec::with_capacity(window.blocks());
+        let (mut total_v, mut total_i) = (0, 0);
         for y in window.y0..window.y1 {
             for x in window.x0..window.x1 {
                 if let Some(block) = self.blocks.get(&(x, y)) {
                     if !block.indices.is_empty() {
-                        vertex_count += block.vertices.len();
-                        index_count += block.indices.len();
+                        total_v += block.vertices.len();
+                        total_i += block.indices.len();
+                        collected.push(((x, y), block));
                     }
                 }
             }
-        }
-        vertices.reserve_exact(vertex_count);
-        indices.reserve_exact(index_count);
-        let mut spans = Vec::with_capacity(window.blocks());
-        for y in window.y0..window.y1 {
-            for x in window.x0..window.x1 {
-                let Some(block) = self.blocks.get(&(x, y)) else {
-                    continue;
-                };
-                if block.indices.is_empty() {
-                    continue;
                 }
-                let base = vertices.len() as u32;
-                let start = indices.len() as u32;
-                vertices.extend_from_slice(&block.vertices);
-                indices.extend(block.indices.iter().map(|i| base + *i));
-                spans.push(Span {
-                    block: (x, y),
-                    start,
-                    count: block.indices.len() as u32,
-                    bounds: block.bounds,
-                });
-            }
-        }
+                vertices.reserve(total_v);
+                indices.reserve(total_i);
+                let mut spans = Vec::with_capacity(collected.len());
+                for &((x, y), block) in &collected {
+                    let base = vertices.len() as u32;
+                    let start = indices.len() as u32;
+                    vertices.extend_from_slice(&block.vertices);
+                    indices.extend(block.indices.iter().map(|i| base + *i));
+                    spans.push(Span {
+                        block: (x, y),
+                        start,
+                        count: block.indices.len() as u32,
+                        bounds: block.bounds,
+                    });
+                }
+
         spans
     }
 }
@@ -243,6 +238,7 @@ pub fn visible_runs(spans: &[Span], matrix: Mat4) -> Vec<(u32, u32)> {
 /// emptied first and refilled in span order.
 pub fn visible_runs_into(spans: &[Span], matrix: Mat4, runs: &mut Vec<(u32, u32)>) {
     runs.clear();
+    runs.reserve(spans.len().min(256));
     for span in spans {
         if span.count == 0 || !in_frustum(matrix, span.bounds) {
             continue;
