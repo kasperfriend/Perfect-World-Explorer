@@ -379,6 +379,7 @@ pub struct D3D12_DXIL_LIBRARY_DESC {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct D3D12_SHADER_BYTECODE {
     pub pShaderBytecode: *const c_void,
     pub BytecodeLength: usize,
@@ -479,6 +480,330 @@ pub struct ID3D12StateObjectProperties {
 /// `__uuidof(ID3D12StateObjectProperties)`, from the `MIDL_INTERFACE` in
 /// `d3d12.h`.
 pub const IID_ID3D12STATEOBJECTPROPERTIES: &str = "de5fa827-9bf9-4f26-89ff-d7f56fde3860";
+
+// ---------------------------------------------------------------------------
+// A native compute pipeline
+//
+// The hardware tracer's shader is a *compute* shader (8x8 threads) that uses DXR
+// 1.1 inline `RayQuery` against a top-level acceleration structure. There is no
+// raygen/miss/hit-group pipeline and no `DispatchRays`: the traversal happens
+// inside `TraceRayInline`, so what has to be built is an ordinary compute
+// pipeline state object, and what has to be launched is an ordinary `Dispatch`.
+// ---------------------------------------------------------------------------
+
+/// `D3D12_COMPUTE_PIPELINE_STATE_DESC`. Only the members a compute pipeline
+/// without a cache, a root signature override or streaming set uses; the rest are
+/// left zeroed, which is what the header's own `{}` does.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D12_COMPUTE_PIPELINE_STATE_DESC {
+    pub pRootSignature: *mut c_void,
+    pub CS: D3D12_SHADER_BYTECODE,
+    pub NodeMask: u32,
+    pub CachedPSO: D3D12_CACHED_PIPELINE_STATE,
+    pub Flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D12_CACHED_PIPELINE_STATE {
+    pub pCachedBlob: *const c_void,
+    pub CachedBlobSizeInBytes: usize,
+}
+
+impl Default for D3D12_COMPUTE_PIPELINE_STATE_DESC {
+    fn default() -> Self {
+        Self {
+            pRootSignature: std::ptr::null_mut(),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: std::ptr::null(),
+                BytecodeLength: 0,
+            },
+            NodeMask: 0,
+            CachedPSO: D3D12_CACHED_PIPELINE_STATE {
+                pCachedBlob: std::ptr::null(),
+                CachedBlobSizeInBytes: 0,
+            },
+            Flags: 0,
+        }
+    }
+}
+
+/// `D3D12_PIPELINE_STATE_FLAG_NONE`.
+pub const D3D12_PIPELINE_STATE_FLAG_NONE: u32 = 0;
+
+/// `D3D12_ROOT_SIGNATURE_FLAG_NONE`: no restrictions on which stages may see the
+/// signature's descriptors.
+pub const D3D12_ROOT_SIGNATURE_FLAG_NONE: u32 = 0;
+
+/// `D3D12_ROOT_PARAMETER_TYPE_*` and `D3D12_DESCRIPTOR_RANGE_TYPE_*`.
+pub const D3D12_ROOT_PARAMETER_TYPE_CBV: u32 = 0;
+pub const D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: u32 = 4;
+pub const D3D12_DESCRIPTOR_RANGE_TYPE_SRV: u32 = 0;
+pub const D3D12_DESCRIPTOR_RANGE_TYPE_UAV: u32 = 3;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_ROOT_DESCRIPTOR {
+    pub ShaderRegister: u32,
+    pub RegisterSpace: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_DESCRIPTOR_RANGE {
+    pub RangeType: u32,
+    pub NumDescriptors: u32,
+    pub BaseShaderRegister: u32,
+    pub RegisterSpace: u32,
+    pub OffsetInDescriptorsFromTableStart: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_ROOT_DESCRIPTOR_TABLE {
+    pub NumDescriptorRanges: u32,
+    pub pDescriptorRanges: *const D3D12_DESCRIPTOR_RANGE,
+}
+
+/// `D3D12_ROOT_PARAMETER`: `{ Type, union, ShaderVisibility }`. The union's
+/// largest member is the descriptor table (a count plus a pointer), so the
+/// parameter is laid out as that plus padding.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_ROOT_PARAMETER {
+    pub ParameterType: u32,
+    pub Descriptor: D3D12_ROOT_DESCRIPTOR_TABLE,
+    pub ShaderVisibility: u32,
+}
+
+/// `ID3D12Blob`, the two accessors a serialised signature comes back in.
+#[repr(C)]
+pub struct ID3DBlobVtbl {
+    pub QueryInterface:
+        unsafe extern "system" fn(*mut IUnknown, *const GUID, *mut *mut c_void) -> HRESULT,
+    pub AddRef: unsafe extern "system" fn(*mut IUnknown) -> u32,
+    pub Release: unsafe extern "system" fn(*mut IUnknown) -> u32,
+    pub GetBufferPointer: unsafe extern "system" fn(*mut c_void) -> *const c_void,
+    pub GetBufferSize: unsafe extern "system" fn(*mut c_void) -> usize,
+}
+
+#[repr(C)]
+pub struct ID3DBlob {
+    pub lpVtbl: *mut ID3DBlobVtbl,
+}
+
+/// `D3D_ROOT_SIGNATURE_VERSION_1`.
+pub const D3D_ROOT_SIGNATURE_VERSION_1: u32 = 1;
+
+/// `D3D12SerializeRootSignature` from `d3d12.dll`.
+///
+/// Windows links it; everywhere else a stub stands in so this module can be
+/// type-checked by the Linux harness. Nothing off Windows ever creates a device,
+/// so the stub is unreachable rather than silently wrong.
+#[cfg(all(windows, not(test)))]
+#[link(name = "d3d12")]
+extern "system" {
+    fn D3D12SerializeRootSignature(
+        pRootSignature: *const D3D12_ROOT_SIGNATURE_DESC,
+        Version: u32,
+        ppBlob: *mut *mut ID3DBlob,
+        ppErrorBlob: *mut *mut ID3DBlob,
+    ) -> HRESULT;
+}
+
+#[cfg(not(all(windows, not(test))))]
+unsafe fn D3D12SerializeRootSignature(
+    _desc: *const D3D12_ROOT_SIGNATURE_DESC,
+    _version: u32,
+    _blob: *mut *mut ID3DBlob,
+    _error: *mut *mut ID3DBlob,
+) -> HRESULT {
+    -1
+}
+
+/// `IID_ID3D12RootSignature`: `c54a6b66-72df-4ee8-8be5-a946a1429914`.
+pub const IID_ID3D12ROOTSIGNATURE: &str = "c54a6b66-72df-4ee8-8be5-a946a1429914";
+/// `IID_ID3D12PipelineState`: `765a30f3-f624-4c6f-a828-ace948622445`.
+pub const IID_ID3D12PIPELINESTATE: &str = "765a30f3-f624-4c6f-a828-ace948622445";
+
+/// The text of an error blob, for a failure message.
+///
+/// # Safety
+/// `blob` must be live, or null.
+unsafe fn blob_text(blob: *mut ID3DBlob) -> String {
+    if blob.is_null() {
+        return String::new();
+    }
+    let vtable = &*((*blob).lpVtbl as *const ID3DBlobVtbl);
+    let pointer = (vtable.GetBufferPointer)(blob as *mut c_void);
+    let size = (vtable.GetBufferSize)(blob as *mut c_void);
+    if pointer.is_null() || size == 0 {
+        return String::new();
+    }
+    let bytes = std::slice::from_raw_parts(pointer as *const u8, size);
+    String::from_utf8_lossy(bytes).trim().to_string()
+}
+
+/// The root signature `dxr_trace.hlsl` is written against.
+///
+/// The shader declares `ConstantBuffer<Params> : register(b0)`, a
+/// `RaytracingAccelerationStructure` on `t0`, two `Buffer<float4>` on `t1` and
+/// `t2`, and `RWTexture2D<float4>` on `u0`, so the signature is:
+///
+/// * parameter 0 — a CBV at `b0`, the shader's `Params` block (ten vec4s);
+/// * parameter 1 — a descriptor table of three SRVs covering `t0..t2`;
+/// * parameter 2 — a descriptor table of one UAV at `u0`.
+///
+/// Returns the signature, or the serialiser's own complaint.
+///
+/// # Safety
+/// `device` must be a live `ID3D12Device` (`ID3D12Device5` begins with one).
+pub unsafe fn create_trace_root_signature(device: *mut c_void) -> Result<*mut c_void, String> {
+    let srv = [D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 3,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: 0,
+    }];
+    let uav = [D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+        NumDescriptors: 1,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: 0,
+    }];
+    let parameters = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+            Descriptor: D3D12_ROOT_DESCRIPTOR_TABLE {
+                NumDescriptorRanges: 0,
+                pDescriptorRanges: std::ptr::null(),
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Descriptor: D3D12_ROOT_DESCRIPTOR_TABLE {
+                NumDescriptorRanges: 1,
+                pDescriptorRanges: srv.as_ptr(),
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Descriptor: D3D12_ROOT_DESCRIPTOR_TABLE {
+                NumDescriptorRanges: 1,
+                pDescriptorRanges: uav.as_ptr(),
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+    ];
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: parameters.len() as u32,
+        pParameters: parameters.as_ptr() as *const c_void,
+        NumStaticSamplers: 0,
+        pStaticSamplers: std::ptr::null(),
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    let mut blob: *mut ID3DBlob = std::ptr::null_mut();
+    let mut error: *mut ID3DBlob = std::ptr::null_mut();
+    let hr =
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, &mut error);
+    if hr < 0 || blob.is_null() {
+        let why = blob_text(error);
+        release(error as *mut c_void);
+        return Err(if why.is_empty() {
+            format!("D3D12SerializeRootSignature failed (HRESULT 0x{hr:08x})")
+        } else {
+            format!("the trace root signature is rejected: {why}")
+        });
+    }
+    let vtable = &*((*blob).lpVtbl as *const ID3DBlobVtbl);
+    let buffer = (vtable.GetBufferPointer)(blob as *mut c_void);
+    let length = (vtable.GetBufferSize)(blob as *mut c_void);
+    let mut signature: *mut c_void = std::ptr::null_mut();
+    let hr = create_root_signature(device, buffer, length, &mut signature);
+    release(blob as *mut c_void);
+    release(error as *mut c_void);
+    if hr < 0 || signature.is_null() {
+        return Err(format!(
+            "ID3D12Device::CreateRootSignature failed (HRESULT 0x{hr:08x})"
+        ));
+    }
+    Ok(signature)
+}
+
+/// `ID3D12Device::CreateRootSignature`, slot 17 of the device vtable, counted
+/// from `d3d12.h`: `IUnknown` 0..2, `ID3D12Object` 3..6, `ID3D12DeviceChild` 7,
+/// then the ten `ID3D12Device` members from `GetNodeCount` (8) through
+/// `GetDescriptorHandleIncrementSize` (16), so `CreateRootSignature` is 17.
+///
+/// # Safety
+/// `device` must be live and `blob`/`length` a serialised signature.
+unsafe fn create_root_signature(
+    device: *mut c_void,
+    blob: *const c_void,
+    length: usize,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    let vtable = *(device as *mut *const usize);
+    let create: unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        *const c_void,
+        usize,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> HRESULT = std::mem::transmute(*vtable.add(17));
+    let Some(iid) = guid(IID_ID3D12ROOTSIGNATURE) else {
+        return -1;
+    };
+    create(device, 0, blob, length, &iid, out)
+}
+
+/// Create the compute pipeline state object that runs the DXIL trace shader.
+///
+/// # Safety
+/// `device` must be live and `dxil` a compiled compute shader for `signature`.
+pub unsafe fn create_compute_pipeline(
+    device: *mut c_void,
+    signature: *mut c_void,
+    dxil: &[u8],
+) -> Result<*mut c_void, String> {
+    let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        pRootSignature: signature,
+        CS: D3D12_SHADER_BYTECODE {
+            pShaderBytecode: dxil.as_ptr() as *const c_void,
+            BytecodeLength: dxil.len(),
+        },
+        ..Default::default()
+    };
+    // `ID3D12Device::CreateComputePipelineState` is slot 12, counted the same
+    // way: `GetNodeCount` 8, `CreateCommandQueue` 9, `CreateCommandAllocator` 10,
+    // `CreateGraphicsPipelineState` 11, `CreateComputePipelineState` 12.
+    let vtable = *(device as *mut *const usize);
+    let create: unsafe extern "system" fn(
+        *mut c_void,
+        *const D3D12_COMPUTE_PIPELINE_STATE_DESC,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> HRESULT = std::mem::transmute(*vtable.add(12));
+    let Some(iid) = guid(IID_ID3D12PIPELINESTATE) else {
+        return Err("the PipelineState GUID literal is invalid".into());
+    };
+    let mut state: *mut c_void = std::ptr::null_mut();
+    let hr = create(device, &desc, &iid, &mut state);
+    if hr < 0 || state.is_null() {
+        return Err(format!(
+            "CreateComputePipelineState rejected the DXIL trace shader (HRESULT \
+             0x{hr:08x}); it must be a compute shader compiled for this feature \
+             level with dxc"
+        ));
+    }
+    Ok(state)
+}
 
 // ---------------------------------------------------------------------------
 // Compile-time slot assertions
@@ -638,7 +963,10 @@ mod tests {
     fn the_dispatch_description_is_the_c_layout() {
         let word = std::mem::size_of::<usize>();
         // RayGenerationShaderRecord: {u64 address, u64 size}
-        assert_eq!(std::mem::size_of::<D3D12_GPU_VIRTUAL_ADDRESS_RANGE>(), 2 * 8);
+        assert_eq!(
+            std::mem::size_of::<D3D12_GPU_VIRTUAL_ADDRESS_RANGE>(),
+            2 * 8
+        );
         // Each shader table: {u64 address, u64 size, u64 stride}
         assert_eq!(std::mem::size_of::<D3D12_SHADER_TABLE>(), 3 * 8);
         // One address range (2 words) and three shader tables (3 words each) is
@@ -651,6 +979,60 @@ mod tests {
             "88 bytes of tables plus 3 UINTs, padded to the struct's 8-byte alignment"
         );
         assert_eq!(104 % word, 0);
+    }
+
+    /// The trace shader is a compute shader, so what runs it is an ordinary
+    /// compute pipeline state object. Its description has to be the C layout:
+    /// `{ ID3D12RootSignature*, D3D12_SHADER_BYTECODE CS, UINT NodeMask,
+    ///    D3D12_CACHED_PIPELINE_STATE, D3D12_PIPELINE_STATE_FLAGS}`.
+    #[test]
+    fn the_compute_pipeline_description_is_the_c_layout() {
+        use std::mem::size_of;
+        // A pointer, then {pointer, usize}.
+        assert_eq!(size_of::<D3D12_SHADER_BYTECODE>(), 2 * size_of::<usize>());
+        assert_eq!(
+            size_of::<D3D12_CACHED_PIPELINE_STATE>(),
+            2 * size_of::<usize>()
+        );
+        // Root signature pointer, bytecode, NodeMask (padded), cached state, flags.
+        // pRootSignature 8, CS 16, NodeMask 4 + 4 padding, CachedPSO 16, Flags 4
+        // and 4 bytes of tail padding to the struct's 8-byte alignment: 56.
+        assert_eq!(
+            size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>(),
+            56,
+            "pRootSignature, CS, padded NodeMask, CachedPSO, padded Flags"
+        );
+        assert_eq!(std::mem::align_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>(), 8);
+    }
+
+    /// `D3D12_ROOT_PARAMETER` is `{ Type, union, ShaderVisibility }`, and the
+    /// union's largest member is the descriptor table: a count plus a pointer,
+    /// which occupies 16 bytes on 64-bit.
+    #[test]
+    fn a_root_parameter_is_type_union_visibility() {
+        use std::mem::size_of;
+        let parameter = D3D12_ROOT_PARAMETER::default();
+        // The union member the CBV parameter leaves zeroed must still be the
+        // table's size, not the smaller `D3D12_ROOT_DESCRIPTOR`.
+        assert_eq!(
+            size_of::<D3D12_ROOT_DESCRIPTOR_TABLE>(),
+            16,
+            "a descriptor table is a count plus a pointer"
+        );
+        assert_eq!(size_of::<D3D12_DESCRIPTOR_RANGE>(), 20);
+        assert_eq!(parameter.ShaderVisibility, 0);
+    }
+
+    /// The two device slots the pipeline needs, counted from `d3d12.h`. Both are
+    /// reached by offset into a vtable this module does not spell out, so a wrong
+    /// number is a call into an unrelated function rather than a compile error.
+    #[test]
+    fn the_pipeline_device_slots_are_what_the_header_counts() {
+        // IUnknown 3, ID3D12Object 4, ID3D12DeviceChild 1 = 8 before the device's
+        // own members. GetNodeCount (8) ..= CreateRootSignature (17), and
+        // CreateComputePipelineState sits four earlier at 12.
+        assert_eq!(IUNKNOWN_SLOTS + 4 + 1 + 9, 17, "CreateRootSignature");
+        assert_eq!(IUNKNOWN_SLOTS + 4 + 1 + 4, 12, "CreateComputePipelineState");
     }
 
     #[test]

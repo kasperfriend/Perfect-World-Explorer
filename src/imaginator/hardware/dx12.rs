@@ -112,12 +112,30 @@ pub struct HardwareTracer {
     pub status: HardwareStatus,
     /// Triangles in the live structures, for the status line.
     pub built_triangles: usize,
+    /// The trace pipeline, built on the first frame that runs the hardware
+    /// tracer and kept for the lifetime of the tracer.
+    pipeline: Option<Pipeline>,
 }
+
+/// The compute pipeline that runs the DXIL trace shader.
+struct Pipeline {
+    root_signature: *mut c_void,
+    state: *mut c_void,
+}
+
+unsafe impl Send for Pipeline {}
 
 unsafe impl Send for HardwareTracer {}
 
 impl Drop for HardwareTracer {
     fn drop(&mut self) {
+        // The pipeline was made by the device, so it is released first.
+        if let Some(pipeline) = self.pipeline.take() {
+            unsafe {
+                sys::release(pipeline.state);
+                sys::release(pipeline.root_signature);
+            }
+        }
         unsafe {
             sys::release(self.list4);
             sys::release(self.device5);
@@ -157,6 +175,7 @@ impl HardwareTracer {
             structures: None,
             status: HardwareStatus::Untried,
             built_triangles: 0,
+            pipeline: None,
         };
         let Ok((raw_device, raw_queue)) = crate::fsr::raw_dx12(device) else {
             tracer.status = HardwareStatus::Unsupported(
@@ -318,6 +337,50 @@ impl HardwareTracer {
                 Err(why)
             }
         }
+    }
+
+    /// Build the trace pipeline from the DXIL blob, once.
+    ///
+    /// The shader is a compute shader (`[numthreads(8,8,1)] cs`) whose traversal
+    /// uses DXR 1.1 inline `RayQuery`, so the object that runs it is an ordinary
+    /// compute pipeline state object — not a ray-tracing state object, and there
+    /// is no `DispatchRays` anywhere in this path.
+    fn ensure_pipeline(&mut self, dxil: &[u8]) -> Result<(), String> {
+        if self.pipeline.is_some() {
+            return Ok(());
+        }
+        if self.device5.is_null() {
+            return Err("the DXR device is not ready".into());
+        }
+        if dxil.len() < 4 {
+            return Err(
+                "no compiled DXIL blob: imaginator/dxr_trace.cso is missing, and the \
+                 shader needs dxc to compile"
+                    .into(),
+            );
+        }
+        // SAFETY: `device5` is live (checked above) and `dxil` outlives the call;
+        // the runtime copies the bytecode during creation.
+        let (signature, pipeline) = unsafe {
+            let signature = sys::create_trace_root_signature(self.device5)?;
+            match sys::create_compute_pipeline(self.device5, signature, dxil) {
+                Ok(pipeline) => (signature, pipeline),
+                Err(why) => {
+                    sys::release(signature);
+                    return Err(why);
+                }
+            }
+        };
+        self.pipeline = Some(Pipeline {
+            root_signature: signature,
+            state: pipeline,
+        });
+        Ok(())
+    }
+
+    /// True once the trace pipeline exists.
+    pub fn pipeline_ready(&self) -> bool {
+        self.pipeline.is_some()
     }
 
     fn build(&mut self, bvh: &Bvh) -> Result<Structures, String> {
