@@ -6,9 +6,17 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
+
+pub fn default_zones_path(element: &Path) -> PathBuf {
+    element.join("maps/world/precinct.clt")
+}
 #[derive(Debug)]
 pub struct Zone {
     pub name: String,
+    /// Authored centre point present in version-7 instance precincts. It is not
+    /// a teleport target, but is a useful safe fly-to location when maps ship
+    /// no `world_targets.txt`.
+    pub center: Option<[f32; 3]>,
     polygon: Vec<[f32; 2]>,
     pub tracks: Vec<String>,
     /// Precinct stereo ambience paths surrounding the playlist.
@@ -58,8 +66,15 @@ impl Zones {
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with("//"))
             .collect();
-        if lines.len() < 2 || lines[0].split_whitespace().collect::<Vec<_>>() != ["version", "6"] {
-            return Err("unsupported precinct version (expected 6)".into());
+        if lines.len() < 2 {
+            return Err("truncated precinct file".into());
+        }
+        let header = lines[0].split_whitespace().collect::<Vec<_>>();
+        if header == ["version", "7"] {
+            return Self::parse_instance_zones(&lines[2..]);
+        }
+        if header != ["version", "6"] {
+            return Err("unsupported precinct version (expected 6 or 7)".into());
         }
         let mut i = 2usize;
         let mut zones = Vec::new();
@@ -109,6 +124,7 @@ impl Zones {
             }
             zones.push(Zone {
                 name,
+                center: None,
                 polygon: poly,
                 tracks: playlist,
                 ambience_day,
@@ -116,6 +132,72 @@ impl Zones {
                 area: area.abs() * 0.5,
             });
             i = list + tracks + 1;
+        }
+        Ok(Self { zones })
+    }
+    /// Version 7 `precinct.clt` files ship with instance maps (`a01`, ...).
+    /// They keep the zone name, a numeric header, one centre line, a polygon,
+    /// and two empty sound paths; no playlist tracks or stereo ambience.
+    fn parse_instance_zones(lines: &[&str]) -> Result<Self, String> {
+        fn header(line: &str) -> Option<Vec<usize>> {
+            line.split_whitespace()
+                .map(str::parse::<usize>)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+                .filter(|nums| nums.len() >= 10)
+        }
+        let mut zones = Vec::new();
+        let mut i = 0usize;
+        while i + 1 < lines.len() {
+            let Ok(name) = quoted(lines[i]) else {
+                i += 1;
+                continue;
+            };
+            let Some(nums) = header(lines[i + 1]) else {
+                i += 1;
+                continue;
+            };
+            let n = nums[1];
+            if !(3..=10000).contains(&n) {
+                return Err(format!("invalid precinct counts at {name}"));
+            }
+            // The first vector is the zone centre; the following `n` vectors are
+            // its polygon. Some instance files repeat the first vertex at the end.
+            let center = vector(lines.get(i + 2).ok_or("missing precinct centre")?)?;
+            let begin = i + 3;
+            let stop = begin.checked_add(n).ok_or("overflow")?;
+            if stop > lines.len() {
+                return Err(format!("truncated precinct {name}"));
+            }
+            let mut poly = Vec::with_capacity(n);
+            for line in &lines[begin..stop] {
+                let [x, _, z] = vector(line)?;
+                poly.push([x, z]);
+            }
+            let mut area = 0.;
+            for j in 0..n {
+                let p = poly[j];
+                let q = poly[(j + 1) % n];
+                area += p[0] * q[1] - q[0] * p[1];
+            }
+            zones.push(Zone {
+                name,
+                center: Some(center),
+                polygon: poly,
+                tracks: Vec::new(),
+                ambience_day: String::new(),
+                ambience_night: String::new(),
+                area: area.abs() * 0.5,
+            });
+            i = stop;
+            // Skip the two authored sound-path strings and any blank separators;
+            // the next record is a name followed by a numeric header.
+            while i + 1 < lines.len() && header(lines[i + 1]).is_none() {
+                i += 1;
+            }
+        }
+        if zones.is_empty() {
+            return Err("no instance precinct zones".into());
         }
         Ok(Self { zones })
     }
@@ -314,7 +396,11 @@ pub struct MusicPlayer {
 }
 impl MusicPlayer {
     pub fn new(element: &Path) -> Self {
-        let zones = Zones::open(&element.join("maps/world/precinct.clt"));
+        Self::new_for_map(element, &default_zones_path(element))
+    }
+    /// Use the selected map's precinct zones rather than the main world's.
+    pub fn new_for_map(element: &Path, zones_path: &Path) -> Self {
+        let zones = Zones::open(zones_path);
         let status = match &zones {
             Ok(z) => format!("{} music zones loaded", z.zones.len()),
             Err(e) => format!("Music zones unavailable: {e}"),
@@ -476,7 +562,11 @@ pub struct AmbiencePlayer {
 }
 impl AmbiencePlayer {
     pub fn new(element: &Path) -> Self {
-        let zones = Zones::open(&element.join("maps/world/precinct.clt"));
+        Self::new_for_map(element, &default_zones_path(element))
+    }
+    /// Use the selected map's precinct zones rather than the main world's.
+    pub fn new_for_map(element: &Path, zones_path: &Path) -> Self {
+        let zones = Zones::open(zones_path);
         let status = match &zones {
             Ok(z) => format!("{} ambience zones loaded", z.zones.len()),
             Err(e) => format!("Ambience zones unavailable: {e}"),
@@ -733,6 +823,39 @@ mod tests {
         assert_eq!(z.zones[1].tracks[0], "Music\\b.ogg");
         assert_eq!(z.zones[1].ambience_day, "");
     }
+    #[test]
+    fn instance_precinct_version_7_keeps_zone_names_and_polygons() {
+        let text = r#"version 7
+1220409703
+"Mirror"
+101001 5 0 0 101 0 60 1 101 0 0
+-455.420013, 18.000000, 420.273987
+-505.866333 100.492149 506.004578
+-506.247955 100.492149 63.982090
+-4.232555 100.492149 64.096809
+-4.042101 100.492149 506.024475
+-505.866333 100.492149 506.004578
+""
+""
+"Illusion"
+101002 5 0 0 101 0 60 1 101 0 0
+66.983101, 18.000000, 420.373993
+503.907745 100.492149 63.921486
+504.138245 100.492149 506.280426
+-4.042101 100.492149 506.024475
+-4.232555 100.492149 64.096809
+503.907745 100.492149 63.921486
+""
+"""#;
+        let zones = Zones::parse(text).unwrap();
+        assert_eq!(zones.zones.len(), 2);
+        assert_eq!(zones.zones[0].name, "Mirror");
+        assert_eq!(zones.zones[1].name, "Illusion");
+        assert_eq!(zones.zones[0].polygon.len(), 5);
+        assert_eq!(zones.zones[0].center, Some([-455.420013, 18.0, 420.273987]));
+        assert!(zones.find(-250., 280.).is_some());
+    }
+
     #[test]
     fn precinct_retains_ambience_paths_on_both_sides_of_playlist() {
         let s = "version 6\n123\n\"zone\"\n1 3 0 0 1 1 60 1 1 0\n0 0 0\n0 0 0\n1 0 0\n0 0 1\n\"ambiencestereo\\day.wav\"\n\"Music\\a.mp3\"\n\"ambiencestereo\\night.wav\"";

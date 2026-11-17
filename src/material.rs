@@ -4,15 +4,36 @@ use crate::{f32at, pck, u32at};
 use flate2::read::ZlibDecoder;
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     fs::{self, File},
     io::Read,
-    path::Path,
+    path::{Path, PathBuf},
     sync::OnceLock,
 };
 
 fn small_mask_atlas() -> bool {
     static SMALL_MASK_ATLAS: OnceLock<bool> = OnceLock::new();
     *SMALL_MASK_ATLAS.get_or_init(|| std::env::var_os("PW_SMALL_MASK_ATLAS").is_some())
+}
+
+/// Shared PCK archives belong to the `element` folder that owns the selected
+/// map. A direct map-directory argument may have that folder as its immediate
+/// parent instead of `element/maps/<id>`.
+fn archive_root(dir: &Path) -> Result<PathBuf, String> {
+    let parent = dir.parent().ok_or("bad map path")?;
+    let mut candidates = vec![parent.to_path_buf()];
+    if parent
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("maps"))
+    {
+        if let Some(element) = parent.parent() {
+            candidates.insert(0, element.to_path_buf());
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|root| root.join("textures.pck").is_file())
+        .ok_or_else(|| format!("textures.pck not found beside {}", dir.display()))
 }
 pub(crate) struct Texture {
     pub(crate) w: usize,
@@ -181,7 +202,7 @@ impl Materials {
         for _ in 0..count {
             paths.push(gbk_string(trn, &mut pos)?)
         }
-        let element = dir.parent().and_then(Path::parent).ok_or("bad map path")?;
+        let element = archive_root(dir)?;
         let mut file =
             File::open(element.join("textures.pck")).map_err(|e| format!("textures.pck: {e}"))?;
         let entries = if colors {

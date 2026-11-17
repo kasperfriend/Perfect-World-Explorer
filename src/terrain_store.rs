@@ -655,6 +655,11 @@ pub fn source_identity(header: &[u8], dir: &Path, names: &[String]) -> Result<St
     hash.update(b"PWTSRC01");
     hash.update((header.len() as u64).to_le_bytes());
     hash.update(header);
+    // The same TRN2/T2BK corpus can be copied into two instance folders. Those
+    // are separate coordinate spaces, so their warm caches must not collide.
+    hash.update(b"PWTMAPDIR");
+    let map_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    hash.update(map_dir.to_string_lossy().as_bytes());
     for name in names {
         let bytes =
             fs::read(dir.join(format!("{name}.t2bk"))).map_err(|e| format!("{name}: {e}"))?;
@@ -961,6 +966,15 @@ mod tests {
         );
         assert_eq!(p.normals, n);
     }
+    #[test]
+    fn source_identity_separates_identical_bytes_in_different_map_folders() {
+        let a = Temp::new();
+        let b = Temp::new();
+        let first = source_identity(b"same-header", &a.0, &[]).unwrap();
+        let second = source_identity(b"same-header", &b.0, &[]).unwrap();
+        assert_ne!(first, second);
+    }
+
     #[test]
     fn paging_is_exact_across_edges_evictions_and_shared_views() {
         let dir = Temp::new();

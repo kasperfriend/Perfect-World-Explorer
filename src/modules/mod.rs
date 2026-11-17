@@ -58,6 +58,7 @@ impl Default for Modules {
 impl Modules {
     pub fn new(
         element: PathBuf,
+        map_dir: PathBuf,
         map: MapSpace,
         water: Vec<WaterArea>,
         scene: &crate::scene::Scene,
@@ -65,7 +66,7 @@ impl Modules {
     ) -> Self {
         // The add-ons each own their state; the host only clones the two
         // handles they need (client root and the loaded world space).
-        let populator = Populator::new(element.clone(), map.clone());
+        let populator = Populator::new(element.clone(), map.clone(), map_dir);
         Self {
             walker: Walker::with_host(element.clone(), map, water, scene, ornaments),
             librarian: librarian::Librarian::new(element),
