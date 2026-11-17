@@ -514,6 +514,13 @@ impl Draw {
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
         self.last_params = Some(params);
 
+        // No sheets this frame — switched off, none admitted yet, nothing
+        // visible — means the previous vector has no successor. Dropping it makes
+        // the first frame back publish a still sheet's zero motion instead of
+        // reprojecting against a view from before the gap.
+        if quads.is_empty() {
+            self.prev_motion_vp = None;
+        }
         // Group and order: `RenderLayer` first, then depth-tested quads, then
         // the blend pair and the texture so a group reuses one pipeline.
         let mut groups: Vec<(BucketKey, Vec<Vertex>)> = Vec::new();
