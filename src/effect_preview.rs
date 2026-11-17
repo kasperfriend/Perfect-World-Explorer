@@ -718,7 +718,9 @@ fn capture(
     {
         let mut pass = encoder.begin_render_pass(&pass_descriptor);
         yardstick.draw(&mut pass);
-        world.draw(&mut pass);
+        // No coverage: this capture has no motion-vector pass to feed, and its
+        // depth only serves the snapshot.
+        world.draw(&mut pass, false);
     }
     let padded = (shot.width * 4).div_ceil(256) * 256;
     let readback_descriptor = wgpu::BufferDescriptor {

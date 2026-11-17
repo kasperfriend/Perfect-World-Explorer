@@ -1343,12 +1343,13 @@ struct Renderer {
     local_pages: Vec<crate::world_objects::GpuPage>,
     world_pages: Vec<crate::world_objects::GpuPage>,
     /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
-    world_draw_cmds: [Vec<crate::world_objects::DrawCmd>; crate::world_objects::WORLD_VIEWS],
+    world_draw_cmds: [crate::world_objects::WorldDrawList; crate::world_objects::WORLD_VIEWS],
     world_done: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     water_start: u32,
     water_batches: Vec<WaterBatch>,
+    visible_water_batches: Vec<WaterBatch>,
     started: Instant,
     wind_last: Instant,
     /// Snapshot computed once by `render()`; secondary views reuse it.
@@ -2013,12 +2014,15 @@ impl Renderer {
             object_start: m.object_start,
             local_pages,
             world_pages: Vec::new(),
-            world_draw_cmds: Default::default(),
+            world_draw_cmds: std::array::from_fn(|_| {
+                crate::world_objects::WorldDrawList::default()
+            }),
             world_done: false,
             layout,
             sampler,
             water_start: m.water_start,
             water_batches: m.water_batches,
+            visible_water_batches: Vec::new(),
             started: Instant::now(),
             frame: FrameSnapshot::default(),
             world_glow: crate::post_gpu::WorldGlow::default(),
@@ -2363,8 +2367,10 @@ impl Renderer {
         };
         self.sky
             .update(&self.queue, direction, w, h, frame, main_sets, false);
-        self.sky
-            .update(&self.queue, direction, w, h, frame, reflected_sets, true);
+        if camera.water_reflections {
+            self.sky
+                .update(&self.queue, direction, w, h, frame, reflected_sets, true);
+        }
         let resident_bounds = self.resident_bounds();
         self.far_trees.update_resident_lods(
             &self.device,
@@ -2548,6 +2554,7 @@ impl Renderer {
         view_runs: ViewRuns,
         terrain_depth_source: Option<&wgpu::Texture>,
         clear_color: Option<wgpu::Color>,
+        frustum: &[[f32; 4]; 6],
     ) {
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
@@ -2646,7 +2653,7 @@ impl Renderer {
         p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
         if !self.world_done {
             for page in &self.local_pages {
-                page.draw_selected(&mut p, reflected, pass_kind);
+                page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, false);
             }
         }
         // Do not submit world pages on top of the same locally streamed
@@ -2657,11 +2664,13 @@ impl Renderer {
             // loading: its placements are frozen, so nothing here is per-frame
             // work beyond the page binds and the draws themselves.
             let slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
-            crate::world_objects::GpuPage::draw_world(
+            crate::world_objects::GpuPage::draw_world_culled(
                 &self.world_pages,
                 &self.world_draw_cmds[slot],
                 &mut p,
                 reflected,
+                frustum,
+                false,
             );
         }
         // The `.sdr.` water/lava curtains draw in their own blended pass over
@@ -2678,16 +2687,18 @@ impl Renderer {
         p.draw_indexed(self.terrain_end..local_end, 0, 0..1);
         if !self.world_done {
             for page in &self.local_pages {
-                page.draw_selected(&mut p, reflected, pass_kind);
+                page.draw_selected_culled(&mut p, reflected, pass_kind, frustum, true);
             }
         }
         if self.world_done {
             let slot = crate::world_objects::GpuPage::world_view_slot(pass_kind);
-            crate::world_objects::GpuPage::draw_world(
+            crate::world_objects::GpuPage::draw_world_culled(
                 &self.world_pages,
                 &self.world_draw_cmds[slot],
                 &mut p,
                 reflected,
+                frustum,
+                true,
             );
         }
     }
@@ -2700,6 +2711,7 @@ impl Renderer {
         camera: &Camera,
         view: Pass,
         advance: bool,
+        frustum: &[[f32; 4]; 6],
     ) {
         // WaterEffect 0 (shipped default) hides EC models and home ornaments
         // in reflection/refraction (0x5b2015, 0x5b2336). RenderContext carries
@@ -2740,6 +2752,8 @@ impl Renderer {
             // Water passes reuse the sampled pose; never tick again per view.
             let delta = if advance { camera.logic_delta_ms } else { 0 };
             let frame = receiving_model_frame(uniform, camera, light);
+            models.set_frustum(Some(*frustum));
+            models.set_keep_unbounded(crate::objects::unbounded_textures());
             models.update_pass(
                 &self.device,
                 &self.queue,
@@ -2820,7 +2834,7 @@ impl Renderer {
                     frame,
                 );
             }
-            if population {
+            if population && matches!(view, Pass::Main) {
                 self.modules.render_population(
                     &self.device,
                     &self.queue,
@@ -2898,6 +2912,7 @@ impl Renderer {
             view_runs,
             None,
             None,
+            &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
         );
         {
             let mut pass = e.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2988,9 +3003,14 @@ impl Renderer {
         // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
         // the same block walk the client runs before the level rule.
         // Both buffers are reused: this runs for every view of every frame.
-        crate::terrain_residency::visible_runs_into(&self.spans, matrix, &mut self.terrain_runs);
-        self.terrain_gpu
-            .visible_far_runs_into(matrix, &mut self.far_terrain_runs);
+        let spans = &self.spans;
+        let terrain_runs = &mut self.terrain_runs;
+        let terrain_gpu = &self.terrain_gpu;
+        let far_terrain_runs = &mut self.far_terrain_runs;
+        std::thread::scope(|s| {
+            s.spawn(|| crate::terrain_residency::visible_runs_into(spans, matrix, terrain_runs));
+            s.spawn(|| terrain_gpu.visible_far_runs_into(matrix, far_terrain_runs));
+        });
         // One indirect record per run, so the terrain itself is one call per mesh
         // instead of one call per run.
         self.queue_main_runs();
@@ -3110,6 +3130,7 @@ impl Renderer {
             ViewRuns::Main,
             Some(&self.depth),
             None,
+            &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
         );
         let model_target = self.water.scene_raw();
         self.draw_models(
@@ -3120,6 +3141,7 @@ impl Renderer {
             camera,
             Pass::Main,
             true,
+            &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
         );
         self.draw_addons(
             &mut e,
@@ -3199,12 +3221,14 @@ impl Renderer {
 
         // The reflection texture is reused only after its previous water draw is
         // submitted. Each distinct height gets its own mirror and clip plane.
-        let mut visible: Vec<WaterBatch> = self
-            .water_batches
-            .iter()
-            .filter(|b| b.visible(matrix))
-            .cloned()
-            .collect();
+        let mut visible = std::mem::take(&mut self.visible_water_batches);
+        visible.clear();
+        visible.extend(
+            self.water_batches
+                .iter()
+                .filter(|b| b.visible(matrix))
+                .cloned(),
+        );
         visible.sort_by(|a, b| {
             b.distance_squared(camera.pos)
                 .total_cmp(&a.distance_squared(camera.pos))
@@ -3220,7 +3244,7 @@ impl Renderer {
         }
         if !camera.water_reflections {
             let mut e = self.device.create_command_encoder(&Default::default());
-            for batch in visible {
+            for batch in &visible {
                 if batch.simple {
                     self.simple_water.draw(
                         &mut e,
@@ -3284,13 +3308,19 @@ impl Renderer {
                     camera.gamma_setting,
                 );
             }
+            self.visible_water_batches = visible;
             return;
         }
-        for batch in visible {
+        let mut simple_encoder: Option<wgpu::CommandEncoder> = None;
+        for (batch_idx, batch) in visible.iter().enumerate() {
             if batch.simple {
-                let mut e = self.device.create_command_encoder(&Default::default());
+                if simple_encoder.is_none() {
+                    let enc = self.device.create_command_encoder(&Default::default());
+                    simple_encoder = Some(enc);
+                }
+                let e = simple_encoder.as_mut().unwrap();
                 self.simple_water.draw(
-                    &mut e,
+                    e,
                     scene_target_raw,
                     &scene_depth,
                     &self.vertex,
@@ -3298,13 +3328,17 @@ impl Renderer {
                     batch.start,
                     batch.end,
                 );
-                self.queue.submit(Some(e.finish()));
                 continue;
+            }
+            if let Some(e) = simple_encoder.take() {
+                self.queue.submit(Some(e.finish()));
             }
             let plane = batch.height;
             // A previous plane's reflection left its mirrored records in the
             // buffer; the refraction passes below draw through the main matrix.
-            self.queue_main_runs();
+            if batch_idx > 0 {
+                self.queue_main_runs();
+            }
             if camera.pos.y > plane {
                 // Client 0x7cc6ac-0x7cc8b5: render below this plane into
                 // refraction, cleared to the region's water fog color. Fog
@@ -3365,6 +3399,7 @@ impl Renderer {
                         b: linear(fog[2]),
                         a: 1.,
                     }),
+                    &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
                 );
                 let model_view = self.water.refraction_raw();
                 self.draw_addons(
@@ -3417,6 +3452,7 @@ impl Renderer {
                     ViewRuns::Main,
                     None,
                     None,
+                    &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
                 );
                 if let Some(cloud) = &self.cloud {
                     cloud.draw(
@@ -3464,6 +3500,7 @@ impl Renderer {
                         camera,
                         Pass::Refraction,
                         false,
+                        &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
                     );
                 }
                 self.draw_addons(
@@ -3540,6 +3577,7 @@ impl Renderer {
                 ViewRuns::Reflected,
                 None,
                 None,
+                &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
             );
             if let Some(cloud) = &self.cloud {
                 cloud.draw(
@@ -3582,6 +3620,7 @@ impl Renderer {
                 camera,
                 Pass::Reflection,
                 false,
+                &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
             );
             self.draw_addons(
                 &mut e,
@@ -3602,6 +3641,10 @@ impl Renderer {
             );
             self.queue.submit(Some(e.finish()));
         }
+        if let Some(e) = simple_encoder {
+            self.queue.submit(Some(e.finish()));
+        }
+        self.visible_water_batches = visible;
         if let Some(shore) = &self.shore {
             shore.draw(
                 &self.device,
@@ -4073,6 +4116,11 @@ pub fn run(
         .get_default_config(&adapter, size.width.max(1), size.height.max(1))
         .ok_or("surface configuration unavailable")?;
     config.format = surface_format;
+    if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+        config.present_mode = wgpu::PresentMode::Mailbox;
+    } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
+        config.present_mode = wgpu::PresentMode::Immediate;
+    }
     if surface_format.is_srgb() {
         config
             .view_formats
@@ -4408,6 +4456,7 @@ pub fn run(
     let mut last_settings_save = Instant::now();
     let mut last = Instant::now();
     let mut region_tick_ms = renderer.started.elapsed().as_millis() as u64;
+    let mut last_minimap_key: Option<([i32; 3], bool, usize)> = None;
     event_loop
         .run(move |event, target| match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => {
@@ -5145,23 +5194,78 @@ pub fn run(
                         if let Some(c)=world_cancel.take(){c.store(true,std::sync::atomic::Ordering::Relaxed);}
                         world_rx=None;renderer.world_pages.clear();renderer.world_draw_cmds=Default::default();renderer.world_done=false;
                         if world_enabled {
-                            let (tx,rx)=std::sync::mpsc::sync_channel(1);let cancel=Arc::new(std::sync::atomic::AtomicBool::new(false));
+                         let (tx, rx) = std::sync::mpsc::sync_channel(
+                             if crate::objects::unbounded_textures() { 8 } else { 2 },
+                         );
+                         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
                             std::thread::Builder::new().name("whole-world-objects".into()).spawn(move ||crate::world_objects::build(root,ornaments,tx,c)).expect("world preload thread");
                             world_rx=Some(rx);world_cancel=Some(cancel);world_status=String::from("Loading world objects...");
                         } else {world_status=String::from("Off");}
                     }
-                    if let Some(rx)=&world_rx {match rx.try_recv(){
-                        Ok(crate::world_objects::Message::Page(page))=>{
-                            let processed=page.processed;
-                            let uploaded=crate::world_objects::GpuPage::upload_world(&renderer.device,&renderer.queue,&renderer.layout,&renderer.sampler,&renderer.uniform,&renderer.reflected_uniform,&renderer.world_pages,page);
-                            renderer.world_pages.push(uploaded);world_status=format!("Loading: {processed}/{} objects, {} GPU chunks",whole_ornaments.len(),renderer.world_pages.len());
-                            eprintln!("{world_status}");
-                        },
-                        Ok(crate::world_objects::Message::Done{processed,skipped,stats})=>{renderer.world_draw_cmds=crate::world_objects::GpuPage::world_commands(&renderer.world_pages);renderer.world_done=true;world_status=format!("Loaded {processed} objects; {skipped} meshes use fallback texture; {} geometry chunks, {} shared atlases ({} MiB); peak decoded-texture residency {} MiB of {} MiB budget, {} evictions, {} dedup alias hits",stats.pages,stats.atlas_pages,stats.atlas_bytes>>20,stats.residency.peak_resident_bytes>>20,stats.residency.budget_bytes>>20,stats.residency.evictions,stats.residency.alias_hits);eprintln!("{world_status}");},
-                        Ok(crate::world_objects::Message::Error(e))=>{world_status=format!("World load failed: {e}");eprintln!("{world_status}");},
-                        Err(_)=>{}
-                    }}
+                if let Some(rx) = &world_rx {
+                    let upload_start = std::time::Instant::now();
+                    let mut uploaded_this_frame = 0usize;
+                    while uploaded_this_frame < 8
+                        && (uploaded_this_frame == 0 || upload_start.elapsed().as_millis() < 12)
+                    {
+                        match rx.try_recv() {
+                            Ok(crate::world_objects::Message::Page(page)) => {
+                                let processed = page.processed;
+                                let uploaded = crate::world_objects::GpuPage::upload_world(
+                                    &renderer.device,
+                                    &renderer.queue,
+                                    &renderer.layout,
+                                    &renderer.sampler,
+                                    &renderer.uniform,
+                                    &renderer.reflected_uniform,
+                                    &renderer.world_pages,
+                                    page,
+                                );
+                                renderer.world_pages.push(uploaded);
+                                uploaded_this_frame += 1;
+                                world_status = format!(
+                                    "Loading: {processed}/{} objects, {} GPU chunks",
+                                    whole_ornaments.len(),
+                                    renderer.world_pages.len()
+                                );
+                                eprintln!("{world_status}");
+                            }
+                            Ok(crate::world_objects::Message::Done {
+                                processed,
+                                skipped,
+                                stats,
+                            }) => {
+                                renderer.world_draw_cmds =
+                                    crate::world_objects::GpuPage::world_culled_commands(
+                                        &renderer.world_pages,
+                                    );
+                                for page in &mut renderer.world_pages {
+                                    page.release_cpu_ranges();
+                                }
+                                renderer.local_pages.clear();
+                                renderer.local_pages.shrink_to_fit();
+                                renderer.world_done = true;
+                                world_status = format!(
+                                    "Loaded {processed} objects; {skipped} meshes use fallback texture; {} geometry chunks ({} pages); peak decoded-texture residency {} MiB / {} MiB, {} evictions",
+                                    renderer.world_pages.len(),
+                                    stats.pages,
+                                    stats.residency.peak_resident_bytes >> 20,
+                                    stats.residency.budget_bytes >> 20,
+                                    stats.residency.evictions,
+                                );
+                                eprintln!("{world_status}");
+                                break;
+                            }
+                            Ok(crate::world_objects::Message::Error(e)) => {
+                                world_status = format!("World load failed: {e}");
+                                eprintln!("{world_status}");
+                                break;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
                     camera.far = if world_enabled {settings.far.max(32000.)} else {settings.far};
                     // Time pass: the client's own clock, replayed on wall-clock
                     // time. `sky_time::advance` is 1/600 authored hour per real
@@ -5576,7 +5680,19 @@ pub fn run(
                             // overhead pass is skipped rather than rendered and
                             // hidden.
                             if settings.show_minimap && settings.minimap_style==MapStyle::Realistic {
-                                renderer.render_minimap(&map_view,&map_depth,&camera,settings.minimap_range,false);
+                              let minimap_key = (
+                                 [
+                                 camera.pos.x.round() as i32,
+                                 camera.pos.y.round() as i32,
+                                 camera.pos.z.round() as i32,
+                                 ],
+                              renderer.world_done,
+                              renderer.world_pages.len(),
+                              );
+                              if last_minimap_key != Some(minimap_key) {
+                                  renderer.render_minimap(&map_view,&map_depth,&camera,settings.minimap_range,false);
+                                    last_minimap_key = Some(minimap_key);
+                              }
                             }
                             if menu_page==MenuPage::WorldMap && settings.world_map_style==MapStyle::Realistic && map_refresh.elapsed()>=std::time::Duration::from_secs(2) {
                                 renderer.render_minimap(&full_map_view,&full_map_depth,&camera,0.,true);
@@ -6299,7 +6415,12 @@ pub fn preview(
                         stats.residency.evictions
                     );
                     renderer.world_draw_cmds =
-                        crate::world_objects::GpuPage::world_commands(&renderer.world_pages);
+                        crate::world_objects::GpuPage::world_culled_commands(&renderer.world_pages);
+                    for page in &mut renderer.world_pages {
+                        page.release_cpu_ranges();
+                    }
+                    renderer.local_pages.clear();
+                    renderer.local_pages.shrink_to_fit();
                     renderer.world_done = true;
                     break;
                 }

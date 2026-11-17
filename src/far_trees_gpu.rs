@@ -1072,6 +1072,9 @@ impl FarTrees {
         scale: f32,
         bounds: Option<[f32; 4]>,
     ) {
+        if self.placements == 0 {
+            return;
+        }
         let key = (camera, scale, bounds);
         if self.last_resident_update == Some(key) {
             return;
@@ -1235,6 +1238,9 @@ impl FarTrees {
         bytes
     }
     pub fn draw<'a>(&'a self, p: &mut wgpu::RenderPass<'a>, reflected: bool) {
+        if self.batches.is_empty() {
+            return;
+        }
         p.set_pipeline(&self.pipeline);
         p.set_bind_group(
             0,

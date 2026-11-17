@@ -3,10 +3,17 @@
 use crate::{f32at, pck, u32at};
 use flate2::read::ZlibDecoder;
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::Read,
     path::Path,
+    sync::OnceLock,
 };
+
+fn small_mask_atlas() -> bool {
+    static SMALL_MASK_ATLAS: OnceLock<bool> = OnceLock::new();
+    *SMALL_MASK_ATLAS.get_or_init(|| std::env::var_os("PW_SMALL_MASK_ATLAS").is_some())
+}
 pub(crate) struct Texture {
     pub(crate) w: usize,
     pub(crate) h: usize,
@@ -170,7 +177,7 @@ impl Materials {
         if count > 4096 {
             return Err("too many textures".into());
         }
-        let mut paths = Vec::new();
+        let mut paths = Vec::with_capacity(count);
         for _ in 0..count {
             paths.push(gbk_string(trn, &mut pos)?)
         }
@@ -182,11 +189,16 @@ impl Materials {
         } else {
             Vec::new()
         };
-        let mut textures = Vec::new();
+        let entry_index: HashMap<String, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.name.to_ascii_lowercase(), i))
+            .collect();
+        let mut textures = Vec::with_capacity(paths.len());
         for path in paths.iter().filter(|_| colors) {
-            let entry = entries
-                .iter()
-                .find(|e| e.name.eq_ignore_ascii_case(path))
+            let entry = entry_index
+                .get(&path.to_ascii_lowercase())
+                .map(|&i| &entries[i])
                 .ok_or_else(|| format!("missing texture {path}"))?;
             let raw = pck::read_entry(&mut file, entry)?;
             // Terrain sources must be one of the compressed formats the client
@@ -206,6 +218,7 @@ impl Materials {
         let mut areas: Vec<Area> = (0..areas_x * areas_y)
             .map(|_| Area { layers: Vec::new() })
             .collect();
+        let small_mask_atlas = small_mask_atlas();
         for (si, name) in names.iter().enumerate() {
             if let Some([x0, y0, x1, y1]) = window {
                 let (sx, sy) = ((si % subs_x) * sub_areas, (si / subs_x) * sub_areas);
@@ -255,7 +268,7 @@ impl Materials {
                     if size > 8192 || (li > 0 && size == 0) {
                         return Err("invalid mask size".into());
                     }
-                    let mut mask = Vec::new();
+                    let mut mask = Vec::with_capacity(size * size);
                     let mut packed = None;
                     if li > 0 {
                         let off = u32at(&data, r + 4)? as usize;
@@ -264,7 +277,9 @@ impl Materials {
                             .get(off..off.checked_add(len).ok_or("mask overflow")?)
                             .ok_or("truncated mask")?;
                         if u32at(&data, 16)? != 0 {
-                            packed = Some(bytes.to_vec());
+                            if !(size == 256 && small_mask_atlas) {
+                                packed = Some(bytes.to_vec());
+                            }
                             ZlibDecoder::new(bytes)
                                 .take((size * size + 1) as u64)
                                 .read_to_end(&mut mask)
@@ -276,7 +291,7 @@ impl Materials {
                             return Err("invalid decoded mask size".into());
                         }
                         // Only downsample in the explicitly selected low-memory mode.
-                        if size == 256 && std::env::var_os("PW_SMALL_MASK_ATLAS").is_some() {
+                        if size == 256 && small_mask_atlas {
                             let mut half = vec![0u8; 128 * 128];
                             for y in 0..128 {
                                 for x in 0..128 {
