@@ -95,6 +95,8 @@ impl TestDraw for world_models_gpu::World {
         true
     }
     fn submit<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        // No coverage: this check renders one frame to prove the pipeline and
+        // the draw order, and has no motion-vector pass to feed.
         self.draw(pass);
     }
 }
@@ -295,6 +297,7 @@ fn main() {
         reverse_front: false,
         alpha_compare: 0,
         alpha_reference: 84. / 255.,
+        lod_bias: 0.,
     };
     let sampler = device.create_sampler(&Default::default());
     let mut reads = 0;

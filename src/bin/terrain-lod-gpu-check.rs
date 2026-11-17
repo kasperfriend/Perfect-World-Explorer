@@ -101,8 +101,10 @@ fn main() {
         contents: bytemuck::cast_slice(&[0u16, 1, 2, 1, 3, 2]),
         usage: wgpu::BufferUsages::INDEX,
     });
-    let mut camera = [0f32; 388];
+    let mut camera = [0f32; 392];
     camera[..16].copy_from_slice(&glam::Mat4::IDENTITY.to_cols_array());
+    // `lod`: no bias, and 1.0 leaves the atlas gradient scale untouched.
+    camera[388..392].copy_from_slice(&[0., 1., 0., 0.]);
     let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
         contents: bytemuck::cast_slice(&camera),

@@ -93,6 +93,13 @@ struct Params {
     fog_color: [f32; 4],
     /// `xyz` is the camera's forward direction for the model Blinn term.
     eye: [f32; 4],
+    /// The unjittered view-projection the sheet motion pass reprojects with, and
+    /// the one the previous frame used. Only `cover` reads them.
+    mv_matrix: [[f32; 4]; 4],
+    prev_matrix: [[f32; 4]; 4],
+    /// `xy` is the render extent in pixels, which turns a clip-space difference
+    /// into the pixel motion the shared motion-vector pass expects.
+    mv_size: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -107,6 +114,19 @@ struct PipelineKey {
     /// of the shipped 447 models author `1`, 131 author `0`, 201 predate the key.
     /// Without it a crystal cannot occlude the sheet drawn after it.
     write_depth: bool,
+    /// The motion twin used by the sheet-motion pass, not by the colour pass.
+    ///
+    /// A blended sheet may not write depth while it is being coloured — the next
+    /// sheet in the same layer must still blend over it — and it must not write
+    /// depth *afterwards* either: the sheets are the nearest blended content in
+    /// the scene, and a depth write there rejects the water surface, the player
+    /// and the add-ons that are drawn later, leaving a hole the shape of the
+    /// sheet. So the twin rasterises the same vertices with the same discard
+    /// rule into the object-motion attachment, never touches depth, and the
+    /// shared motion-vector pass substitutes that vector for the pixel
+    /// (`docs/blockers.md` B-26). It is a pipeline key field rather than a
+    /// separate map so both variants share one cache and one creation path.
+    motion: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -167,9 +187,16 @@ pub struct Draw {
     /// opaque pixel reproduces that: the geometry is still there, the colour is
     /// still the authored one, only the detail is missing.
     fallback: TextureEntry,
+    /// The frame block the last `update` wrote, so the motion pass can add its
+    /// own matrices without re-deriving them from the mirror or refraction view
+    /// that has overwritten the uniform in between.
+    last_params: Option<Params>,
+    /// The view-projection the previous sheet-motion pass used.
+    prev_motion_vp: Option<[[f32; 4]; 4]>,
     /// This frame's groups in draw order, with their vertex counts.
     order: Vec<(BucketKey, u32)>,
-    staging: Vec<Vertex>,
+    scratch_index: HashMap<BucketKey, usize>,
+    scratch_pool: Vec<Vec<Vertex>>,
     failed: Vec<String>,
 }
 
@@ -299,6 +326,9 @@ impl Draw {
                 fog_range: [0.; 4],
                 fog_color: [0.; 4],
                 eye: [0.; 4],
+                mv_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                prev_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                mv_size: [0.; 4],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -405,11 +435,14 @@ impl Draw {
             textures: HashMap::new(),
             buckets: HashMap::new(),
             uniform,
+            last_params: None,
+            prev_motion_vp: None,
             sampler_repeat,
             sampler_clamp,
             fallback,
             order: Vec::new(),
-            staging: Vec::new(),
+            scratch_index: HashMap::new(),
+            scratch_pool: Vec::new(),
             failed: Vec::new(),
         })
     }
@@ -465,43 +498,66 @@ impl Draw {
         if eye.iter().any(|value| !value.is_finite()) {
             return Err("non-finite GFX effect eye direction".into());
         }
-        queue.write_buffer(
-            &self.uniform,
-            0,
-            bytemuck::bytes_of(&Params {
-                matrix,
-                clip_plane,
-                camera,
-                light: [direction[0], direction[1], direction[2], 0.],
-                fog_range,
-                fog_color,
-                eye: [eye[0], eye[1], eye[2], 0.],
-            }),
-        );
+        let params = Params {
+            matrix,
+            clip_plane,
+            camera,
+            light: [direction[0], direction[1], direction[2], 0.],
+            fog_range,
+            fog_color,
+            eye: [eye[0], eye[1], eye[2], 0.],
+            // Filled in by `draw_motion`, which is the only reader.
+            mv_matrix: matrix,
+            prev_matrix: matrix,
+            mv_size: [0.; 4],
+        };
+        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
+        self.last_params = Some(params);
 
+        // No sheets this frame — switched off, none admitted yet, nothing
+        // visible — means the previous vector has no successor. Dropping it makes
+        // the first frame back publish a still sheet's zero motion instead of
+        // reprojecting against a view from before the gap.
+        if quads.is_empty() {
+            self.prev_motion_vp = None;
+        }
         // Group and order: `RenderLayer` first, then depth-tested quads, then
         // the blend pair and the texture so a group reuses one pipeline.
         let mut groups: Vec<(BucketKey, Vec<Vertex>)> = Vec::new();
-        let mut index: HashMap<BucketKey, usize> = HashMap::new();
+        self.scratch_index.clear();
         for quad in quads {
-            let key = BucketKey {
-                layer: quad.layer,
-                pipeline: PipelineKey {
-                    source: quad.source_blend,
-                    destination: quad.destination_blend,
-                    depth_test: quad.depth_test,
-                    write_depth: quad.mesh.as_ref().is_some_and(|mesh| mesh.write_depth),
-                },
-                priority: quad.priority,
-                tile: quad.tile,
-                texture: quad.texture.clone(),
+            let pipeline = PipelineKey {
+                source: quad.source_blend,
+                destination: quad.destination_blend,
+                depth_test: quad.depth_test,
+                write_depth: quad.mesh.as_ref().is_some_and(|mesh| mesh.write_depth),
+                motion: false,
             };
-            let position = match index.get(&key) {
-                Some(position) => *position,
-                None => {
-                    index.insert(key.clone(), groups.len());
-                    groups.push((key.clone(), Vec::new()));
-                    groups.len() - 1
+            let position = if groups.last_mut().is_some_and(|(last_key, _)| {
+                last_key.layer == quad.layer
+                    && last_key.pipeline == pipeline
+                    && last_key.priority == quad.priority
+                    && last_key.tile == quad.tile
+                    && last_key.texture == quad.texture.as_str()
+            }) {
+                groups.len() - 1
+            } else {
+                let key = BucketKey {
+                    layer: quad.layer,
+                    pipeline,
+                    priority: quad.priority,
+                    tile: quad.tile,
+                    texture: quad.texture.clone(),
+                };
+                match self.scratch_index.get(&key) {
+                    Some(position) => *position,
+                    None => {
+                        let mut verts = self.scratch_pool.pop().unwrap_or_default();
+                        verts.clear();
+                        self.scratch_index.insert(key.clone(), groups.len());
+                        groups.push((key, verts));
+                        groups.len() - 1
+                    }
                 }
             };
             let vertices = &mut groups[position].1;
@@ -605,6 +661,18 @@ impl Draw {
                 let pipeline = self.pipeline(device, key.pipeline)?;
                 self.pipelines.insert(key.pipeline, pipeline);
             }
+            // The motion twin, for a sheet that may not write depth while it is
+            // being coloured and must not write it afterwards either.
+            if !key.pipeline.write_depth {
+                let motion = PipelineKey {
+                    motion: true,
+                    ..key.pipeline
+                };
+                if !self.pipelines.contains_key(&motion) {
+                    let pipeline = self.pipeline(device, motion)?;
+                    self.pipelines.insert(motion, pipeline);
+                }
+            }
             let loaded = self.textures.contains_key(&key.texture);
             let was_fallback = self.buckets.get(key).is_some_and(|b| b.bound_fallback);
             if !self.buckets.contains_key(key) {
@@ -651,10 +719,12 @@ impl Draw {
                     mapped_at_creation: false,
                 });
             }
-            self.staging.clear();
-            self.staging.extend_from_slice(vertices);
-            queue.write_buffer(&bucket.buffer, 0, bytemuck::cast_slice(&self.staging));
+            queue.write_buffer(&bucket.buffer, 0, bytemuck::cast_slice(vertices));
             self.order.push((key.clone(), vertices.len() as u32));
+        }
+        for (_, mut verts) in groups {
+            verts.clear();
+            self.scratch_pool.push(verts);
         }
         Ok(())
     }
@@ -667,13 +737,94 @@ impl Draw {
     }
 
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        let mut last_pipeline = None;
         for (key, count) in &self.order {
             let (Some(bucket), Some(pipeline)) =
                 (self.buckets.get(key), self.pipelines.get(&key.pipeline))
             else {
                 continue;
             };
-            pass.set_pipeline(pipeline);
+            if last_pipeline != Some(key.pipeline) {
+                pass.set_pipeline(pipeline);
+                last_pipeline = Some(key.pipeline);
+            }
+            pass.set_bind_group(0, &bucket.binding, &[]);
+            pass.set_vertex_buffer(0, bucket.buffer.slice(..));
+            pass.draw(0..*count, 0..1);
+        }
+    }
+
+    /// Publish where this frame's blended sheets are, as motion, into the
+    /// object-motion attachment.
+    ///
+    /// The colour pass draws the sheets with `depth_write_enabled: false` — a
+    /// quad slot has no Z-write in the client either — so the depth buffer keeps
+    /// whatever opaque surface lies behind them. The shared motion-vector pass
+    /// rebuilds motion from that buffer alone, so a torch glow, a portal sheet or
+    /// a waterfall in front of a distant wall was reprojected at the *wall's*
+    /// distance: the sheet slid against the world whenever the camera
+    /// translated, and frame generation, which interpolates with those vectors,
+    /// doubled it.
+    ///
+    /// The first fix gave the sheets a depth of their own and let the shared pass
+    /// read the vector off it. That occluded everything drawn later — the sheets
+    /// are the nearest blended content in the scene, so the water surface and the
+    /// player behind a flame lost the pixels the flame covered. This publishes
+    /// the vector instead: sheets are static in world space (they animate their
+    /// UVs, not their position), so their motion is a pure camera reprojection of
+    /// their own interpolated world position, which the vertex stage already
+    /// carries. No depth write, nothing occluded, and the vector is the sheet's
+    /// own rather than the wall's — for everything but the element-160 meshes,
+    /// which write depth through `WriteZ` and are skipped here.
+    ///
+    /// Runs in its own pass immediately after `draw`, so the frame block and the
+    /// bucket order still describe this view, and so the attachment is written
+    /// once per pixel in the same order the sheets were blended.
+    pub fn draw_motion<'a>(
+        &'a mut self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'a>,
+        current_vp: [[f32; 4]; 4],
+        extent: (u32, u32),
+    ) {
+        // The frame block written by the main view's `update`, which is the last
+        // one written before this pass runs.
+        let Some(params) = self.last_params else {
+            return;
+        };
+        // A packet cut, a load or a first frame has no history: reprojecting
+        // against itself publishes the zero motion of a still sheet instead of a
+        // jump the length of the teleport.
+        let previous = self.prev_motion_vp.unwrap_or(current_vp);
+        self.prev_motion_vp = Some(current_vp);
+        queue.write_buffer(
+            &self.uniform,
+            0,
+            bytemuck::bytes_of(&Params {
+                mv_matrix: current_vp,
+                prev_matrix: previous,
+                mv_size: [extent.0 as f32, extent.1 as f32, 0., 0.],
+                ..params
+            }),
+        );
+        let mut last = None;
+        for (key, count) in &self.order {
+            if key.pipeline.write_depth {
+                continue;
+            }
+            let motion = PipelineKey {
+                motion: true,
+                ..key.pipeline
+            };
+            let (Some(bucket), Some(pipeline)) =
+                (self.buckets.get(key), self.pipelines.get(&motion))
+            else {
+                continue;
+            };
+            if last != Some(key.pipeline) {
+                pass.set_pipeline(pipeline);
+                last = Some(key.pipeline);
+            }
             pass.set_bind_group(0, &bucket.binding, &[]);
             pass.set_vertex_buffer(0, bucket.buffer.slice(..));
             pass.draw(0..*count, 0..1);
@@ -746,13 +897,23 @@ impl Draw {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &self.shader,
-                    entry_point: "fs",
+                    entry_point: if key.motion { "cover" } else { "fs" },
                     targets: &[Some(wgpu::ColorTargetState {
-                        format: self.device_format,
-                        blend: Some(wgpu::BlendState {
-                            color: component,
-                            alpha: component,
-                        }),
+                        // The motion twin writes the attachment the shared pass
+                        // reads, which is half-float and never the scene colour.
+                        format: if key.motion {
+                            wgpu::TextureFormat::Rgba16Float
+                        } else {
+                            self.device_format
+                        },
+                        blend: if key.motion {
+                            None
+                        } else {
+                            Some(wgpu::BlendState {
+                                color: component,
+                                alpha: component,
+                            })
+                        },
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                 }),
@@ -765,8 +926,11 @@ impl Draw {
                     format,
                     // Only a mesh whose element asks for `WriteZ` writes; a
                     // quad slot never does (A3DGFXRenderSlot has no Z-write
-                    // field) and a missing depth attachment suppresses it.
-                    depth_write_enabled: key.write_depth,
+                    // field) and a missing depth attachment suppresses it. The
+                    // motion twin never writes: it tests, so a sheet behind a
+                    // wall claims nothing, and leaves the buffer alone, so
+                    // nothing drawn afterwards is rejected behind it.
+                    depth_write_enabled: key.write_depth && !key.motion,
                     depth_compare: if key.depth_test {
                         compare
                     } else {
@@ -783,7 +947,7 @@ impl Draw {
 }
 
 const WGSL: &str = r#"
-struct Params { matrix:mat4x4<f32>, clip_plane:vec4<f32>, camera:vec4<f32>, light:vec4<f32>, fog_range:vec4<f32>, fog_color:vec4<f32>, eye:vec4<f32> };
+struct Params { matrix:mat4x4<f32>, clip_plane:vec4<f32>, camera:vec4<f32>, light:vec4<f32>, fog_range:vec4<f32>, fog_color:vec4<f32>, eye:vec4<f32>, mv_matrix:mat4x4<f32>, prev_matrix:mat4x4<f32>, mv_size:vec4<f32> };
 @group(0) @binding(0) var<uniform> p:Params;
 @group(0) @binding(1) var image:texture_2d<f32>;
 @group(0) @binding(2) var image_sampler:sampler;
@@ -846,6 +1010,22 @@ struct Output {
   rgb=mix(fog_rgb,rgb,keep);
  }
  return vec4<f32>(rgb,opacity);
+}
+// The sheet's own motion, for the shared motion-vector pass, written into the
+// object-motion attachment: the same quad, the same clip plane and the same
+// effective opacity. A sheet owns the pixel only where it dominates what is
+// drawn there, and it owns it with the motion of its own surface -- the camera
+// reprojection of the world position the vertex stage carried -- instead of the
+// motion of whatever wall lies behind it.
+@fragment fn cover(v:Output)->@location(0) vec4<f32> {
+ if dot(vec4<f32>(v.world,1.),p.clip_plane)<0. {discard;}
+ if clamp(textureSample(image,image_sampler,v.uv).a*v.color.a,0.,1.)<0.5 {discard;}
+ let cur=p.mv_matrix*vec4<f32>(v.world,1.);
+ let prev=p.prev_matrix*vec4<f32>(v.world,1.);
+ // In render pixels with y down, `current + motion = previous`, the same
+ // convention the shared pass writes for everything else.
+ let motion=(prev.xy/prev.w-cur.xy/cur.w)*vec2<f32>(0.5*p.mv_size.x,-0.5*p.mv_size.y);
+ return vec4<f32>(motion,1.,0.);
 }
 "#;
 
@@ -1107,6 +1287,263 @@ mod tests {
         drop(bytes);
         harness.readback.unmap();
         pixel
+    }
+
+    /// The motion entry point is the only place the effect pass can tell the
+    /// motion-vector pass where its sheets were, so both halves of the rule — the
+    /// entry point and the opacity threshold — have to stay in the shader, and so
+    /// does the convention the shared pass reads (`current + motion = previous`,
+    /// in pixels, y down) with the y flip that makes it so.
+    #[test]
+    fn the_shader_carries_the_motion_entry_point() {
+        // One entry point, one opacity gate, one convention. The shared pass
+        // reads `current + motion = previous` in pixels with y down, and nothing
+        // in this shader may drift from that: a sign flip slides every sheet the
+        // wrong way at twice the camera's speed.
+        assert!(WGSL.matches("@fragment fn cover(").count() == 1);
+        assert!(WGSL.matches("<0.5 {discard;}").count() == 1);
+        let motion =
+            "let motion=(prev.xy/prev.w-cur.xy/cur.w)*vec2<f32>(0.5*p.mv_size.x,-0.5*p.mv_size.y);";
+        assert!(WGSL.matches(motion).count() == 1);
+    }
+
+    /// The object-motion pixel and the depth at (0,0) of a 4x4 target after a
+    /// colour pass and a motion pass over `quads`, with `current_vp` as this
+    /// frame's unjittered view-projection.
+    ///
+    /// The depth buffer starts cleared to zero — the far plane in this renderer's
+    /// reversed-Z convention — and nothing in the motion pass is allowed to
+    /// change it: that is the whole point of publishing a vector instead of a
+    /// surface.
+    fn covered_motion(
+        draw: &mut Draw,
+        harness: &Harness,
+        quads: &[EffectQuad],
+        current_vp: [[f32; 4]; 4],
+    ) -> ([u8; 8], f32) {
+        let png = grey_png();
+        let mut read = |_: &str| Ok(png.clone());
+        draw.update(
+            &harness.device,
+            &harness.queue,
+            quads,
+            glam::Mat4::IDENTITY.to_cols_array_2d(),
+            [0.; 4],
+            [0., 0., 0., 100.],
+            None,
+            &mut read,
+        )
+        .unwrap();
+        let size = wgpu::Extent3d {
+            width: 4,
+            height: 4,
+            depth_or_array_layers: 1,
+        };
+        let motion = harness.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("effect motion attachment"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth = harness.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("effect motion depth"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let motion_view = motion.create_view(&Default::default());
+        let depth_view = depth.create_view(&Default::default());
+        let colour = harness.target.create_view(&Default::default());
+        let pixels = harness.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("effect motion readback"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let depths = harness.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("effect motion depth readback"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = harness.device.create_command_encoder(&Default::default());
+        // The colour pass first, as in the renderer: its own pass, its own
+        // attachments, and it leaves depth untouched because a quad slot has no
+        // Z-write.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("effect colour test pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &colour,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            draw.draw(&mut pass);
+        }
+        // Then the motion pass, which is a pass of its own in the renderer too:
+        // the attachment it targets is not the scene colour.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("effect motion test pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &motion_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            draw.draw_motion(&harness.queue, &mut pass, current_vp, (4, 4));
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &motion,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &pixels,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(4),
+                },
+            },
+            size,
+        );
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &depth,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::DepthOnly,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &depths,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(4),
+                },
+            },
+            size,
+        );
+        harness.queue.submit(Some(encoder.finish()));
+        let read = |buffer: &wgpu::Buffer| {
+            let slice = buffer.slice(..);
+            let (sender, receiver) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                sender.send(result).unwrap();
+            });
+            harness.device.poll(wgpu::Maintain::Wait);
+            receiver.recv().unwrap().unwrap();
+            let bytes = slice.get_mapped_range().to_vec();
+            buffer.unmap();
+            bytes
+        };
+        let pixel = read(&pixels);
+        let depth = read(&depths);
+        let value = f32::from_le_bytes([depth[0], depth[1], depth[2], depth[3]]);
+        (
+            [
+                pixel[0], pixel[1], pixel[2], pixel[3], pixel[4], pixel[5], pixel[6], pixel[7],
+            ],
+            value,
+        )
+    }
+
+    /// A blended sheet may not write depth, so the motion pass is the only thing
+    /// that can tell the shared motion-vector pass how the sheet moved. It has to
+    /// publish the sheet's own vector where the sheet dominates the pixel, leave
+    /// the pixel alone where it does not, and it must not record a surface: a
+    /// depth write there would depth-reject the water and the player drawn after
+    /// the sheet (`docs/blockers.md` B-26).
+    #[test]
+    fn motion_publishes_the_sheets_own_vector_and_never_a_surface() {
+        let Some(harness) = harness() else {
+            eprintln!("effect motion test skipped: no WGPU adapter");
+            return;
+        };
+        let mut draw = Draw::new(
+            &harness.device,
+            &harness.queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            Some((
+                wgpu::TextureFormat::Depth32Float,
+                wgpu::CompareFunction::GreaterEqual,
+            )),
+        )
+        .unwrap();
+        // Frame one: an opaque sheet, no camera motion yet, so the packet is
+        // owned (z == 1.0, half float 0x3c00) with a zero vector.
+        let (still, depth) = covered_motion(
+            &mut draw,
+            &harness,
+            &[quad("a.png", 5, 6, 0, true, [1., 1., 1., 1.])],
+            glam::Mat4::IDENTITY.to_cols_array_2d(),
+        );
+        // Owned, and the vector is zero because the camera has not moved.
+        assert!([still[4], still[5]] == [0x00, 0x3c]);
+        assert!(still[..4].iter().all(|byte| *byte == 0));
+        assert!(still[6..].iter().all(|byte| *byte == 0));
+        // And the pass recorded no surface: the depth buffer is still the clear.
+        assert!(depth == 0.0);
+        // Frame two: the same sheet, and a camera that moved one world unit along
+        // x. The vector is previous minus current in pixels, so it is non-zero and
+        // the sheet still owns the pixel.
+        let (moved, depth) = covered_motion(
+            &mut draw,
+            &harness,
+            &[quad("a.png", 5, 6, 0, true, [1., 1., 1., 1.])],
+            glam::Mat4::from_translation(glam::Vec3::new(1., 0., 0.)).to_cols_array_2d(),
+        );
+        assert!([moved[4], moved[5]] == [0x00, 0x3c]);
+        assert!(moved[..4].iter().any(|byte| *byte != 0));
+        assert!(depth == 0.0);
+        // Frame three: the same sheet at 20% opacity does not dominate the pixel,
+        // so it claims nothing at all -- no vector and no surface.
+        let (faint, depth) = covered_motion(
+            &mut draw,
+            &harness,
+            &[quad("a.png", 5, 6, 0, true, [1., 1., 1., 0.2])],
+            glam::Mat4::IDENTITY.to_cols_array_2d(),
+        );
+        assert!(faint.iter().all(|byte| *byte == 0));
+        assert!(depth == 0.0);
     }
 
     #[test]
@@ -1693,6 +2130,7 @@ mod tests {
             destination,
             depth_test,
             write_depth: false,
+            motion: false,
         };
         let mut sorted = vec![
             BucketKey {
@@ -1755,6 +2193,7 @@ mod tests {
             destination,
             depth_test,
             write_depth: false,
+            motion: false,
         };
         let mut sorted = vec![
             BucketKey {
@@ -1816,12 +2255,14 @@ mod tests {
             destination: 2,
             depth_test: true,
             write_depth: true,
+            motion: false,
         };
         let sheet = PipelineKey {
             source: 5,
             destination: 2,
             depth_test: true,
             write_depth: false,
+            motion: false,
         };
         let mut sorted = vec![
             BucketKey {

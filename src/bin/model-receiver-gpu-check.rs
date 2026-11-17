@@ -153,6 +153,7 @@ fn main() {
                         alpha: [1., 0., 0., 0.],
                         face_color: [1.; 4],
                         face_skin: [1.; 4],
+                        lod: [0.; 4],
                     };
                     let vertices: Vec<_> = positions
                         .iter()
@@ -352,6 +353,7 @@ fn main() {
         alpha: [1., 1., 0., 0.],
         face_color: brow,
         face_skin: skin,
+        lod: [0.; 4],
     };
     let vertices: Vec<_> = positions
         .iter()

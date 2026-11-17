@@ -156,10 +156,11 @@ fn main() {
         ],
     });
 
-    // Camera is 388 f32; Settings is 12 words.
+    // Camera is 392 f32 (the last four are the mip-bias `lod` lane); Settings
+    // is 12 words.
     let camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("camera"),
-        size: 388 * 4,
+        size: 392 * 4,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -647,8 +648,10 @@ fn write_camera(
     clip_y: f32,
     reflected: bool,
 ) {
-    let mut bytes = [0u8; 388 * 4];
-    let words: &mut [f32; 388] = bytemuck::from_bytes_mut(&mut bytes);
+    let mut bytes = [0u8; 392 * 4];
+    let words: &mut [f32; 392] = bytemuck::from_bytes_mut(&mut bytes);
+    // `lod`: no bias, and 1.0 leaves the atlas gradient scale untouched.
+    words[388..392].copy_from_slice(&[0., 1., 0., 0.]);
     // Identity view translated to the eye, so the sampled world position sits
     // at clip 0 without any projection.
     words[..16]

@@ -49,6 +49,9 @@ pub struct TerrainGpu {
     near_records: u32,
     far_records: u32,
     multi_draw: bool,
+    scratch_records: Vec<crate::indirect_args::DrawIndexedArgs>,
+    last_near_runs: Vec<(u32, u32)>,
+    last_far_runs: Vec<(u32, u32)>,
 }
 /// Owned worker result; dropped immediately after upload, never retained as a CPU mirror.
 pub struct TerrainUpload {
@@ -155,7 +158,7 @@ impl MaterialBindings {
     }
 }
 const SHADER: &str = r#"
-struct Camera { matrix:mat4x4<f32>, direction:vec4<f32>, clip:vec4<f32>, bounds:vec4<f32>, tree_bounds:vec4<f32>, sun:vec4<f32>, light:vec4<f32>, region_ambient:vec4<f32>, region_diffuse:vec4<f32>, region_direction:vec4<f32>, grass_eye:vec4<f32>, grass_wind:vec4<f32>, grass_history:array<vec4<f32>,80>, fog_range:vec4<f32>, fog_color:vec4<f32> };
+struct Camera { matrix:mat4x4<f32>, direction:vec4<f32>, clip:vec4<f32>, bounds:vec4<f32>, tree_bounds:vec4<f32>, sun:vec4<f32>, light:vec4<f32>, region_ambient:vec4<f32>, region_diffuse:vec4<f32>, region_direction:vec4<f32>, grass_eye:vec4<f32>, grass_wind:vec4<f32>, grass_history:array<vec4<f32>,80>, fog_range:vec4<f32>, fog_color:vec4<f32>, lod:vec4<f32> };
 struct Settings { params:vec4<f32>, areas:vec4<u32>, light:vec4<u32> };
 struct Area { start:u32,count:u32,pad:vec2<u32> };
 struct Layer { tex:u32,axis:u32,mask:u32,pad:u32,uv:vec2<f32>,pad2:vec2<f32> };
@@ -239,7 +242,7 @@ fn terrain_pass_fog(linear:vec3<f32>,reciprocal_w:f32,transmittance:f32)->vec3<f
  for(var k=0u;k<a.count;k=k+1u){let l=layers[a.start+k];var v=vec2<f32>(i.world.x,-i.world.z);if l.axis==0u {v=vec2<f32>(i.world.z,-i.world.y);}else if l.axis==2u {v=vec2<f32>(i.world.x,-i.world.y);}
  var dx=vec2<f32>(wx.x,-wx.z);var dy=vec2<f32>(wy.x,-wy.z);
  if l.axis==0u {dx=vec2<f32>(wx.z,-wx.y);dy=vec2<f32>(wy.z,-wy.y);}else if l.axis==2u {dx=vec2<f32>(wx.x,-wx.y);dy=vec2<f32>(wy.x,-wy.y);}
- dx*=l.uv;dy*=l.uv;let kind=l.tex>>28u;let index=i32(l.tex & 0x0fffffffu);
+ dx*=l.uv*camera.lod.y;dy*=l.uv*camera.lod.y;let kind=l.tex>>28u;let index=i32(l.tex & 0x0fffffffu);
  // Pass the true screen-space gradient, not a scalar max-footprint LOD.
  // The sampler can then preserve detail along the minor axis at grazing angles.
  var tex:vec3<f32>;
@@ -824,6 +827,9 @@ impl TerrainGpu {
             near_records: 0,
             far_records: 0,
             multi_draw: crate::indirect_args::multi_draw(device),
+            scratch_records: Vec::new(),
+            last_near_runs: Vec::new(),
+            last_far_runs: Vec::new(),
         })
     }
     pub fn residency_label(&self) -> String {
@@ -868,10 +874,11 @@ impl TerrainGpu {
         self.bind = self.resources.bind(device, normal, &masks);
         self.reflect_bind = self.resources.bind(device, reflection, &masks);
         self.far = upload.far.as_ref().map(|mesh| FarGpu::upload(device, mesh));
-        // Submit/poll also retires old in-flight atlas/buffer references. No
-        // permanent full-world allocation remains behind the cutoff checkbox.
-        queue.submit(std::iter::empty());
-        device.poll(wgpu::Maintain::Wait);
+        self.last_near_runs.clear();
+        self.last_far_runs.clear();
+        // Non-blocking poll lets wgpu retire old in-flight atlas/buffer
+        // references without stalling the CPU/GPU pipeline.
+        device.poll(wgpu::Maintain::Poll);
         Ok(())
     }
     /// `runs` is the per-view visibility result (`block+0x74`): `None` draws the
@@ -890,34 +897,52 @@ impl TerrainGpu {
         runs: Option<&[(u32, u32)]>,
         far_runs: Option<&[(u32, u32)]>,
     ) {
-        self.near_records = Self::upload_runs(
-            device,
-            queue,
-            &mut self.near_args,
-            &mut self.near_capacity,
-            "terrain near run args",
-            runs,
-        );
-        self.far_records = Self::upload_runs(
-            device,
-            queue,
-            &mut self.far_args,
-            &mut self.far_capacity,
-            "terrain far run args",
-            far_runs,
-        );
+        if let Some(runs) = runs {
+            if self.last_near_runs.as_slice() != runs {
+                self.last_near_runs.clear();
+                self.last_near_runs.extend_from_slice(runs);
+                self.near_records = Self::upload_runs(
+                    device,
+                    queue,
+                    &mut self.near_args,
+                    &mut self.near_capacity,
+                    &mut self.scratch_records,
+                    "terrain near run args",
+                    runs,
+                );
+            }
+        } else {
+            self.last_near_runs.clear();
+            self.near_records = 0;
+        }
+        if let Some(far_runs) = far_runs {
+            if self.last_far_runs.as_slice() != far_runs {
+                self.last_far_runs.clear();
+                self.last_far_runs.extend_from_slice(far_runs);
+                self.far_records = Self::upload_runs(
+                    device,
+                    queue,
+                    &mut self.far_args,
+                    &mut self.far_capacity,
+                    &mut self.scratch_records,
+                    "terrain far run args",
+                    far_runs,
+                );
+            }
+        } else {
+            self.last_far_runs.clear();
+            self.far_records = 0;
+        }
     }
     fn upload_runs(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         buffer: &mut wgpu::Buffer,
         capacity: &mut u32,
+        scratch: &mut Vec<crate::indirect_args::DrawIndexedArgs>,
         label: &str,
-        runs: Option<&[(u32, u32)]>,
+        runs: &[(u32, u32)],
     ) -> u32 {
-        let Some(runs) = runs else {
-            return 0;
-        };
         if runs.is_empty() {
             return 0;
         }
@@ -931,7 +956,12 @@ impl TerrainGpu {
                 mapped_at_creation: false,
             });
         }
-        queue.write_buffer(buffer, 0, bytemuck::cast_slice(&run_records(runs)));
+        scratch.clear();
+        scratch.extend(
+            runs.iter()
+                .map(|&(start, count)| crate::indirect_args::record(start..start + count, 0..1)),
+        );
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(scratch));
         records
     }
     pub fn draw<'a>(
@@ -944,46 +974,48 @@ impl TerrainGpu {
         runs: Option<&[(u32, u32)]>,
         far_runs: Option<&[(u32, u32)]>,
     ) {
-        p.set_pipeline(&self.far_pipeline);
-        p.set_bind_group(
-            0,
-            if reflected {
-                &self.reflect_bind
-            } else {
-                &self.bind
-            },
-            &[],
-        );
+        let bind = if reflected {
+            &self.reflect_bind
+        } else {
+            &self.bind
+        };
         if let Some(far) = &self.far {
-            p.set_vertex_buffer(0, far.vertex.slice(..));
-            p.set_index_buffer(far.index.slice(..), wgpu::IndexFormat::Uint32);
-            match far_runs {
+            if far_runs.is_none() || self.far_records > 0 {
+                p.set_pipeline(&self.far_pipeline);
+                p.set_bind_group(0, bind, &[]);
+                p.set_vertex_buffer(0, far.vertex.slice(..));
+                p.set_index_buffer(far.index.slice(..), wgpu::IndexFormat::Uint32);
+                match far_runs {
+                    Some(runs) => {
+                        if can_multi_draw(self.multi_draw, self.far_records, runs) {
+                            p.multi_draw_indexed_indirect(&self.far_args, 0, self.far_records);
+                        } else {
+                            for &(start, count) in runs {
+                                p.draw_indexed(start..start + count, 0, 0..1);
+                            }
+                        }
+                    }
+                    None => p.draw_indexed(0..far.count, 0, 0..1),
+                }
+            }
+        }
+        if (runs.is_none() && near_end > 0) || self.near_records > 0 {
+            p.set_pipeline(&self.pipeline);
+            p.set_bind_group(0, bind, &[]);
+            p.set_vertex_buffer(0, near_vertex.slice(..));
+            p.set_index_buffer(near_index.slice(..), wgpu::IndexFormat::Uint32);
+            match runs {
                 Some(runs) => {
-                    if can_multi_draw(self.multi_draw, self.far_records, runs) {
-                        p.multi_draw_indexed_indirect(&self.far_args, 0, self.far_records);
+                    if can_multi_draw(self.multi_draw, self.near_records, runs) {
+                        p.multi_draw_indexed_indirect(&self.near_args, 0, self.near_records);
                     } else {
                         for &(start, count) in runs {
                             p.draw_indexed(start..start + count, 0, 0..1);
                         }
                     }
                 }
-                None => p.draw_indexed(0..far.count, 0, 0..1),
+                None => p.draw_indexed(0..near_end, 0, 0..1),
             }
-        }
-        p.set_pipeline(&self.pipeline);
-        p.set_vertex_buffer(0, near_vertex.slice(..));
-        p.set_index_buffer(near_index.slice(..), wgpu::IndexFormat::Uint32);
-        match runs {
-            Some(runs) => {
-                if can_multi_draw(self.multi_draw, self.near_records, runs) {
-                    p.multi_draw_indexed_indirect(&self.near_args, 0, self.near_records);
-                } else {
-                    for &(start, count) in runs {
-                        p.draw_indexed(start..start + count, 0, 0..1);
-                    }
-                }
-            }
-            None => p.draw_indexed(0..near_end, 0, 0..1),
         }
     }
 }
@@ -995,6 +1027,7 @@ fn can_multi_draw(multi_draw: bool, records: u32, runs: &[(u32, u32)]) -> bool {
 }
 /// One record per run: the same index range and a single instance, which is
 /// what `draw_indexed(start..start + count, 0, 0..1)` asks for.
+#[allow(dead_code)]
 fn run_records(runs: &[(u32, u32)]) -> Vec<crate::indirect_args::DrawIndexedArgs> {
     runs.iter()
         .map(|&(start, count)| crate::indirect_args::record(start..start + count, 0..1))

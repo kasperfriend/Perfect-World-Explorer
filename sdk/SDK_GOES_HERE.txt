@@ -1,0 +1,78 @@
+Vendor SDK drop-in folder
+=========================
+
+Windows + DX12 builds load the vendor DLLs out of this folder (next to the
+executable, or `<repo>/sdk` for cargo builds, or the folder in Settings ->
+Graphics -> "Upscale SDK folder", or the `PW_UPSCALER_SDK_DIR` environment
+variable). All three SDKs the viewer drives are vendored here, including the
+NVIDIA DLSS/NGX binaries (`nvngx_dlss.dll`, `nvngx_dlssg.dll`, under the NVIDIA
+RTX SDKs License in `NVIDIA_DLSS-SDK-LICENSE.txt`); Streamline's `sl.*.dll` is
+never committed and never staged (see
+THIRD_PARTY_NOTICES.md).
+
+Check the wiring at any time with:
+
+    python3 tools/verify-vendor-sdks.py
+
+That script verifies the files below exist and match their recorded SHA-256,
+parses their PE export tables and proves every symbol the viewer resolves with
+`GetProcAddress` is really exported, checks the FFI constants against the
+vendored headers, and confirms the probe in `src/main.rs`, the loaders and
+`tools/package-windows.ps1` all name the same files.
+
+AMD FSR (vendored)
+------------------
+    amd_fidelityfx_loader_dx12.dll         (FFX API loader, required)
+    amd_fidelityfx_upscaler_dx12.dll       (FSR 2 / 3.1 / 4.1 upscaling)
+    amd_fidelityfx_framegeneration_dx12.dll(FSR frame generation)
+    AMD_FidelityFX-SDK-2.4.0-LICENSE.md
+    AMD_FidelityFX-SDK-2.4.0-notices.md
+    include/**                             (FFX headers the bindings use)
+
+Intel XeSS / XeSS Frame Generation / XeLL (vendored)
+----------------------------------------------------
+    libxess.dll                            (XeSS Super Resolution, 74.2 MiB)
+    libxess_fg.dll                         (XeSS Frame Generation, 21.9 MiB)
+    libxell.dll                            (Intel Xe Low Latency, 405 KiB)
+    Intel_XeSS-SDK-3.0.2-LICENSE.txt
+    Intel_XeSS-SDK-3.0.2-third-party-programs.txt
+    include/xess/**, include/xess_fg/**, include/xell/**
+
+These three DLLs are the unmodified files from the XeSS SDK 3.0.2 release
+(`bin/` folder of https://github.com/intel/xess/releases/tag/v3.0.2). The
+Intel Simplified Software License expressly permits redistribution of the
+unmodified binaries as long as the copyright notice and terms are reproduced,
+which is why the license and the SDK's third-party notice sit in this folder
+and why `THIRD_PARTY_NOTICES.md` records their size and SHA-256:
+
+    libxess.dll     251659dd84a3e84de67c886a4186e01f3eca49b00641906fe38bb6b807e5d5b7
+    libxess_fg.dll  ec5e0c65e075570c6ede72618bb666d0be0c2e10b2ea9762c0fe8cb8e375ab27
+    libxell.dll     d2030dcd694fda8f2ec7e044b13e6db8f0b56d4ba9113a5efad334e3f3ded8c7
+
+What each file turns on in Settings -> Graphics:
+
+* `libxess.dll` -> "Upscaling = XeSS" (and therefore the XeSS quality modes).
+  Without it the option is disabled with a "not found" reason.
+* `libxess_fg.dll` + `libxell.dll` -> "Frame generation = XeSS Frame
+  Generation". XeSS-FG refuses to create its proxy swapchain without a XeLL
+  context, so both files are required on every GPU, Intel or not.
+* `libxell.dll` -> "Latency = XeLL". This is independent of XeSS: XeLL is
+  Intel's low-latency pacing library (delayed frame start, markers per frame)
+  and works with any upscaler or with Upscaling Off. Intel only enables its
+  latency reduction on a non-Intel GPU when XeSS Frame Generation is active,
+  so on NVIDIA/AMD hardware the Latency option stays disabled until XeSS-FG is
+  selected — the Graphics tab states exactly that.
+
+Updating to a newer XeSS release: copy the three DLLs from the new release's
+`bin/` folder over these, refresh the hashes in `THIRD_PARTY_NOTICES.md`, and
+run `tools/verify-vendor-sdks.py` again (it will name any export or constant
+the new SDK changed). Do not modify the DLLs themselves: the license forbids
+reverse engineering and any alteration.
+
+Never ship these DLLs inside a release archive by hand — `tools/package-
+windows.ps1` stages the allowlisted set into `<package>/sdk/` for you and
+records it in `SHA256SUMS.txt`.
+
+Removing XeSS entirely: delete the three DLLs (and the headers if you like).
+The viewer keeps working; the Graphics tab shows each XeSS/XeLL option as
+disabled with the reason, and everything else is unaffected.

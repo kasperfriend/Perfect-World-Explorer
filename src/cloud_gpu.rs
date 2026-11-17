@@ -110,6 +110,23 @@ fn fogged(color: vec3<f32>, depth: f32) -> vec3<f32> {
     let rgb = fogged(tex.rgb * i.tint, i.view_depth);
     return vec4<f32>(rgb, tex.a * p.scene.y);
 }
+// Depth-only coverage, drawn after the colour pass into the same depth buffer.
+//
+// Cloud pixels are alpha blended and never wrote depth, so the shared
+// motion-vector pass (and every upscaler that reads that depth) used whatever
+// opaque surface lay behind them -- the far plane for sky pixels, i.e. pure
+// rotation. Frame generation therefore warped clouds at infinite parallax and
+// any real camera translation slid them against the world.
+//
+// A pixel belongs to the cloud only where the cloud's own alpha dominates it,
+// so the threshold is the *effective* alpha (the colour pass writes
+// `tex.a * p.scene.y`). Below it the pixel stays background and keeps the
+// background's motion, which is what it looks like.
+@fragment fn cover(i: VOut) -> @location(0) vec4<f32> {
+    if abs(p.clip.y) > 0.5 && (i.world_y - p.clip.x) * p.clip.y < 0.0 { discard; }
+    if textureSample(cumulus, cloud_sampler, i.uv).a * p.scene.y < 0.5 { discard; }
+    return vec4<f32>(0.0);
+}
 "#;
 
 fn unpack_rgb(c: u32) -> [f32; 3] {
@@ -263,11 +280,22 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> { return select(c/12.92, pow((c+vec
     }
     return vec4<f32>(rgb, alpha);
 }
+// Depth-only coverage: see the billboard module. Same effective-alpha rule, with
+// the triangle path's own daytime alpha scale.
+@fragment fn cover(i: VOut) -> @location(0) vec4<f32> {
+    if p.clip.y != 0.0 && (i.world_y - p.clip.x) * p.clip.y < 0.0 { discard; }
+    if textureSample(cumulus, cloud_sampler, i.uv).a * select(0.6, 1.0, p.scene.x > 0.5) < 0.5 { discard; }
+    return vec4<f32>(0.0);
+}
 "#;
 
 pub struct CloudGpu {
     pipeline: wgpu::RenderPipeline,
     tri_pipeline: wgpu::RenderPipeline,
+    /// Depth-only twins of the two colour pipelines: same geometry, same
+    /// discard rules, `depth_write_enabled` on and no colour writes.
+    cover_pipeline: wgpu::RenderPipeline,
+    tri_cover_pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
     tri_bind: wgpu::BindGroup,
     params: wgpu::Buffer,
@@ -461,6 +489,43 @@ impl CloudGpu {
             multisample: Default::default(),
             multiview: None,
         });
+        // The same billboards again, writing depth and nothing else. The colour
+        // target stays bound with an empty write mask so the fragment stage has
+        // somewhere to return to; it is never written.
+        let cover_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("native cloud billboard coverage"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: "vs",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: "cover",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::empty(),
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                // Reverse-Z: only a cloud nearer than what is already there
+                // writes, so the depth stays the nearest contributor.
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+        });
         // Indexed triangle path: native MOXB vertices + `0x646450` DrawIndexed.
         // Re-uses the same uniform/texture; vertex buffer carries world pos
         // + per-vertex `atlas_uv` + day/night colors from `CloudVertex`.
@@ -586,9 +651,47 @@ impl CloudGpu {
             multisample: Default::default(),
             multiview: None,
         });
+        let tri_cover_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("native cloud triangle coverage"),
+            layout: Some(&tri_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &tri_module,
+                entry_point: "vs",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<TriVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0=>Float32x3, 1=>Float32x2, 2=>Float32x4, 3=>Float32x4],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &tri_module,
+                entry_point: "cover",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::empty(),
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+        });
         Ok(Self {
             pipeline,
             tri_pipeline,
+            cover_pipeline,
+            tri_cover_pipeline,
             bind,
             tri_bind,
             params,
@@ -615,6 +718,7 @@ impl CloudGpu {
         daylight: f32,
         fog: crate::fog_matrix::Fog,
         clip: [f32; 4],
+        coverage: bool,
     ) {
         if !enabled || (self.instance_count == 0 && self.tri_count == 0) {
             return;
@@ -671,6 +775,44 @@ impl CloudGpu {
             pass.draw(0..6, 0..self.instance_count);
         }
         drop(pass);
+        if !coverage {
+            return;
+        }
+        // Depth-only coverage, so the shared motion-vector pass sees the cloud
+        // instead of the far plane behind it. Colour writes are masked off; the
+        // target is bound only because the fragment stage returns a value.
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("world cloud coverage"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        if self.tri_count > 0 {
+            pass.set_pipeline(&self.tri_cover_pipeline);
+            pass.set_bind_group(0, &self.tri_bind, &[]);
+            pass.set_vertex_buffer(0, self.tri_vertices.slice(..));
+            pass.set_index_buffer(self.tri_indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..self.tri_count, 0, 0..1);
+        } else {
+            pass.set_pipeline(&self.cover_pipeline);
+            pass.set_bind_group(0, &self.bind, &[]);
+            pass.draw(0..6, 0..self.instance_count);
+        }
     }
 }
 
@@ -678,7 +820,27 @@ impl CloudGpu {
 mod tests {
     use crate::cloud_surface::{CloudCell, CloudGroup, CloudSurface, CloudVertex};
 
-    use super::{atlas_uv, billboard_instances, group_scale, triangle_mesh};
+    use super::{atlas_uv, billboard_instances, group_scale, triangle_mesh, SHADER, SHADER_TRI};
+
+    /// The depth-only coverage pass exists in both cloud modules, and its
+    /// threshold is the effective-alpha half point rather than the colour pass's
+    /// 0.003 blend cutoff: a pixel only owns the cloud's depth where the cloud
+    /// dominates what is drawn there.
+    #[test]
+    fn both_cloud_modules_carry_the_coverage_entry_point() {
+        for (name, module) in [("billboard", SHADER), ("triangle", SHADER_TRI)] {
+            assert_eq!(
+                module.matches("@fragment fn cover(").count(),
+                1,
+                "{name} cloud module needs exactly one coverage entry point"
+            );
+            assert_eq!(
+                module.matches("< 0.5 { discard; }").count(),
+                1,
+                "{name} cloud module needs the half-alpha coverage threshold"
+            );
+        }
+    }
 
     #[test]
     fn anomalous_group_parameters_cannot_create_huge_billboards() {
