@@ -4234,9 +4234,10 @@ async fn adapter(
                 required_limits: {
                     let adapter = a.limits();
                     let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter);
+                    // `max_buffer_size` is `u64`, the binding size is `u32`.
                     limits.max_storage_buffer_binding_size = adapter
                         .max_storage_buffer_binding_size
-                        .min(adapter.max_buffer_size)
+                        .min(u32::try_from(adapter.max_buffer_size).unwrap_or(u32::MAX))
                         .max(limits.max_storage_buffer_binding_size);
                     limits
                 },
@@ -4654,7 +4655,7 @@ pub fn run(
     eprintln!(
         "Imaginator: {} triangles captured for tracing; storage binding limit {} MiB",
         renderer.modules.imaginator().captured_triangles(),
-        (renderer.device.limits().max_storage_buffer_binding_size / (1 << 20)).max(0)
+        renderer.device.limits().max_storage_buffer_binding_size / (1 << 20)
     );
     let mut egui_renderer = egui_wgpu::Renderer::new(&renderer.device, format, None, 1);
     let map_texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
