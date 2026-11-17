@@ -709,11 +709,23 @@ impl Imaginator {
                     self.status = hardware.status.label();
                     return false;
                 }
-                // The accelerated structures are built and the DXIL blob is
-                // present; the compute shader that binds the TLAS is the same one
-                // both paths share, so this frame dispatches it.
+                // Honesty about what "GPU" means here. The acceleration
+                // structures are built, but the shader that runs is the WGSL
+                // compute tracer: it walks the packed BVH in `nodes`/`order` as
+                // plain storage buffers and never binds the TLAS. On a world
+                // this size that loop is long enough to look like a hang. Say so
+                // rather than let the module appear to be tracing with DXR.
                 let _ = (tw, th);
-                self.status = hardware.status.label();
+                self.status = if hardware.dxil_present(&self.directory) {
+                    hardware.status.label()
+                } else {
+                    format!(
+                        "{} — but the RayQuery shader is not installed, so rays are \
+                         traced in software on the GPU (slow on this map); use the \
+                         CPU tracer for now",
+                        hardware.status.label()
+                    )
+                };
             }
             TracerKind::Software => {
                 // Start the next trace, then publish whatever the worker finished

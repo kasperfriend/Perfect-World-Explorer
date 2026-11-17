@@ -86,5 +86,10 @@ pub mod support {
         pub fn ensure_built(&mut self, _scene: &SharedScene) -> Result<u64, String> {
             Err(self.status.label())
         }
+
+        /// No DXR here, so there is never a RayQuery blob to find.
+        pub fn dxil_present(&self, _directory: &std::path::Path) -> bool {
+            false
+        }
     }
 }

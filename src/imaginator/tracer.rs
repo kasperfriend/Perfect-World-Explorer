@@ -539,12 +539,22 @@ impl Tracer {
     pub fn pack(samples: &[Sample], out: &mut [f32]) {
         for (i, s) in samples.iter().enumerate() {
             let o = i * 4;
-            out[o] = s.reflection.x + s.reflection.y + s.reflection.z;
-            out[o + 1] = s.indirect.x + s.indirect.y + s.indirect.z;
+            // Luminance, not the sum of the channels: the composite adds one
+            // scalar to every channel, and the GPU tracer already packs
+            // `dot(rgb, 1/3)`. Summing here made the CPU path up to three times
+            // brighter than the same scene traced on the GPU, which blew lit
+            // terrain out to flat white while untouched sky stayed correct.
+            out[o] = luminance(s.reflection);
+            out[o + 1] = luminance(s.indirect);
             out[o + 2] = s.occlusion;
             out[o + 3] = if s.hit > 0.5 { s.distance } else { -1. };
         }
     }
+}
+
+/// Perceptual luminance, matching the GPU tracer's `dot(rgb, vec3(1/3))`.
+fn luminance(colour: V3) -> f32 {
+    (colour.x + colour.y + colour.z) * (1. / 3.)
 }
 
 #[cfg(test)]
@@ -810,8 +820,14 @@ mod tests {
         ];
         let mut out = [0.0f32; 8];
         Tracer::pack(&samples, &mut out);
-        assert_eq!(out[0], 6.);
-        assert_eq!(out[1], 0.5);
+        // Channels are luminance, matching the GPU tracer's `dot(rgb, 1/3)`:
+        // the composite adds one scalar to all three channels, so packing a sum
+        // here made the CPU path three times too bright and clipped the terrain.
+        assert_eq!(
+            out[0], 2.,
+            "reflection packs luminance, not the channel sum"
+        );
+        assert!((out[1] - 1. / 6.).abs() < 1e-6);
         assert_eq!(out[2], 0.25);
         assert_eq!(out[3], 12.);
         assert_eq!(out[7], -1.);

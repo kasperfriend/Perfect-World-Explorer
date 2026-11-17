@@ -123,7 +123,14 @@ impl Default for ImaginatorSettings {
             shadows: true,
             strength: 0.6,
             samples: 1,
-            trace_scale: 50,
+            // A traced image is the *lighting*, not detail, so a low scale costs
+            // nothing visible on shadows and reflections. It costs a lot in the
+            // shader: the GPU tracer walks the packed BVH in a compute loop, and
+            // on a world with millions of triangles a half-resolution trace is
+            // long enough to trip the Windows display-driver watchdog, which
+            // freezes the window. 25% of the frame keeps the first traced frame
+            // cheap; the page's slider goes to 100% for anyone who wants it.
+            trace_scale: 25,
             water_reflection_fill: false,
             exposure: 1.0,
         }
@@ -146,9 +153,15 @@ impl ImaginatorSettings {
     }
 
     pub fn encode(&self) -> String {
+        self.encode_with_tracer(self.tracer)
+    }
+
+    /// `encode` with the tracer line overridden; `save` uses it so the module
+    /// is never remembered as running. See `save`.
+    fn encode_with_tracer(&self, tracer: Tracer) -> String {
         format!(
             "tracer={}\noutput={}\nlight_bounces={}\nreflections={}\nlighting={}\nshadows={}\nstrength={}\nsamples={}\ntrace_scale={}\nwater_reflection_fill={}\nexposure={}\n",
-            self.tracer.token(),
+            tracer.token(),
             self.output.token(),
             self.light_bounces,
             self.reflections as u8,
@@ -238,21 +251,32 @@ impl ImaginatorSettings {
 
     pub fn load(directory: &Path) -> Self {
         let path = Self::file(directory);
-        std::fs::read(&path)
+        let mut settings = std::fs::read(&path)
             .ok()
             .filter(|b| b.len() <= 16384)
             .and_then(|b| String::from_utf8(b).ok())
             .map(|text| Self::decode(&text))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        settings
     }
 
+    /// Write the settings, with one deliberate omission.
+    ///
+    /// The tracer is stored as `off`. Every other module starts switched off,
+    /// and this one is the most expensive: a remembered `cpu`/`gpu` used to
+    /// begin tracing the instant the window appeared, before the user had asked
+    /// for anything (and, while the tracer was broken, turned the terrain
+    /// white on launch). Everything else — strength, bounces, terms, scale —
+    /// is remembered, so the page comes back the way it was left and the
+    /// tracer is one click from where it was.
     pub fn save(&self, directory: &Path) -> Result<(), String> {
         let path = Self::file(directory);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, self.encode()).map_err(|e| e.to_string())?;
+        // See this function's comment: the tracer is never persisted as on.
+        std::fs::write(&tmp, self.encode_with_tracer(Tracer::Off)).map_err(|e| e.to_string())?;
         #[cfg(windows)]
         if path.exists() {
             std::fs::remove_file(&path).map_err(|e| e.to_string())?;
@@ -272,6 +296,31 @@ fn flag(value: &str, previous: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The module must start switched off, whatever the last session selected.
+    #[test]
+    fn a_saved_file_never_remembers_the_tracer_as_running() {
+        let mut s = ImaginatorSettings::default();
+        s.tracer = Tracer::Software;
+        s.strength = 0.85;
+        // `encode` round-trips the selection for tests and for on-page state…
+        assert_eq!(
+            ImaginatorSettings::decode(&s.encode()).tracer,
+            Tracer::Software
+        );
+        // …but what reaches the disk never does.
+        let persisted = ImaginatorSettings::decode(&s.encode_with_tracer(Tracer::Off));
+        assert_eq!(
+            persisted.tracer,
+            Tracer::Off,
+            "a launch must not begin tracing on its own"
+        );
+        assert_eq!(
+            persisted.strength, 0.85,
+            "everything else is still remembered"
+        );
+        assert!(!persisted.active());
+    }
 
     #[test]
     fn defaults_are_off_and_round_trip() {

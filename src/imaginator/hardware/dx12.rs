@@ -31,6 +31,7 @@ use super::sys;
 use crate::imaginator::bvh::{Bvh, SharedScene};
 use d3d12::{CmdListType, CommandQueue, Device, Resource};
 use std::ffi::c_void;
+use std::path::Path;
 use std::sync::Arc;
 use winapi::shared::dxgiformat::DXGI_FORMAT_UNKNOWN;
 use winapi::shared::dxgitype::DXGI_SAMPLE_DESC;
@@ -127,6 +128,18 @@ impl Drop for HardwareTracer {
 }
 
 impl HardwareTracer {
+    /// True when the RayQuery DXIL blob is installed, i.e. when a frame can be
+    /// traced by the GPU's ray-tracing hardware rather than the software BVH
+    /// walk the shared compute shader falls back to.
+    ///
+    /// `directory` is the module's own folder (`Modules/Imaginator`); the blob
+    /// lives at `imaginator/dxr_trace.cso` beneath it.
+    pub fn dxil_present(&self, directory: &Path) -> bool {
+        std::fs::read(directory.join(DXIL_FILE))
+            .map(|blob| blob.len() > 4)
+            .unwrap_or(false)
+    }
+
     /// Probe `device` for DXR and prepare the command list the builds record on.
     ///
     /// Never fails outward: every problem becomes a [`HardwareStatus`], because
