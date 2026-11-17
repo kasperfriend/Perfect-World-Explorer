@@ -174,16 +174,18 @@ impl Composite {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("imaginator blit"),
                 layout: Some(&layout),
+                // wgpu 0.19 has no `compilation_options` on either state; that
+                // field arrived in 22. Every other pipeline in this crate (see
+                // `src/bin/display-gamma-gpu-check.rs`) fills these two structs
+                // without it.
                 vertex: wgpu::VertexState {
                     module: &module,
                     entry_point: "vs",
-                    compilation_options: Default::default(),
                     buffers: &[],
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &module,
                     entry_point: "fs",
-                    compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         // The frame's own sRGB format: this attachment is where
                         // the linear intermediate is encoded, once.

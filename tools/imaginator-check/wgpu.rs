@@ -201,7 +201,7 @@ pub struct TextureViewDescriptor<'a> {
     pub label: Option<&'a str>,
     pub format: Option<TextureFormat>,
     pub dimension: Option<TextureViewDimension>,
-    pub usage: Option<TextureUsages>,
+    // No `usage`: 0.19.4 has no such field on a view descriptor.
     pub aspect: TextureAspect,
     pub base_mip_level: u32,
     pub mip_level_count: Option<u32>,
@@ -214,7 +214,6 @@ impl Default for TextureViewDescriptor<'_> {
             label: None,
             format: None,
             dimension: None,
-            usage: None,
             aspect: TextureAspect::All,
             base_mip_level: 0,
             mip_level_count: None,
@@ -371,16 +370,16 @@ pub struct ComputePipelineDescriptor<'a> {
     pub entry_point: &'a str,
 }
 
+// wgpu 0.19.4's shape: no `compilation_options` (added in 22). The shim had it,
+// which is why `composite.rs` compiled offline and failed `cargo check --bins`.
 pub struct VertexState<'a> {
     pub module: &'a ShaderModule,
     pub entry_point: &'a str,
-    pub compilation_options: (),
     pub buffers: &'a [()],
 }
 pub struct FragmentState<'a> {
     pub module: &'a ShaderModule,
     pub entry_point: &'a str,
-    pub compilation_options: (),
     pub targets: &'a [Option<ColorTargetState>],
 }
 pub struct ColorTargetState {
