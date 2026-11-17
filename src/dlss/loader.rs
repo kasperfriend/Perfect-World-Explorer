@@ -846,7 +846,9 @@ impl NgxCore {
             available
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "n/a".into()),
-            init_result.map(super::result_name).unwrap_or_else(|| "n/a".into()),
+            init_result
+                .map(super::result_name)
+                .unwrap_or_else(|| "n/a".into()),
         ));
     }
 
