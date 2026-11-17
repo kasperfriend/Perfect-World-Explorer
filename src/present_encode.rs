@@ -53,6 +53,7 @@ pub struct PresentEncode {
     frame: wgpu::Texture,
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
+    bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
 }
@@ -124,11 +125,13 @@ impl PresentEncode {
             multisample: Default::default(),
             multiview: None,
         });
+        let bind_group = Self::create_bind_group(device, &layout, &frame);
         Self {
             surface_format,
             frame,
             pipeline,
             layout,
+            bind_group,
             width: w.max(1),
             height: h.max(1),
         }
@@ -138,6 +141,7 @@ impl PresentEncode {
         self.width = w.max(1);
         self.height = h.max(1);
         self.frame = Self::texture(device, self.width, self.height);
+        self.bind_group = Self::create_bind_group(device, &self.layout, &self.frame);
     }
 
     pub fn surface_format(&self) -> wgpu::TextureFormat {
@@ -166,19 +170,25 @@ impl PresentEncode {
         })
     }
 
-    /// Copy the encoded frame to the swapchain. Runs after the whole-frame
-    /// display ramp (which writes into [`Self::view`]).
-    pub fn present(&self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView) {
-        let source = self.raw_view();
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("present encode source"),
-            layout: &self.layout,
+    fn create_bind_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout, frame: &wgpu::Texture) -> wgpu::BindGroup {
+        let source = frame.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(INTERMEDIATE.remove_srgb_suffix()),
+            ..Default::default()
+        });
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("present_encode_bg"),
+            layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::TextureView(&source),
             }],
-        });
-        let mut encoder = device.create_command_encoder(&Default::default());
+        })
+    }
+
+    /// Copy the encoded frame to the swapchain. Runs after the whole-frame
+    /// display ramp (which writes into [`Self::view`]).
+    pub fn present(&self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView) {
+              let mut encoder = device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("present encoded frame"),
@@ -195,7 +205,7 @@ impl PresentEncode {
                 occlusion_query_set: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &group, &[]);
+            pass.set_bind_group(0, &self.bind_group, &[]);
             pass.draw(0..3, 0..1);
         }
         queue.submit(Some(encoder.finish()));
