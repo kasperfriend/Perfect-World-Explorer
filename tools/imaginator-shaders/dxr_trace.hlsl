@@ -127,10 +127,8 @@ float4 material_of(uint triangle)
 // which is what the CPU tracer does too: a reflection ray is followed for
 // `bounces` steps, losing energy at each surface, and the loop stops early once
 // the throughput is negligible. Same picture, no recursion.
-float3 surface_light(float3 point, float3 normal, float3 view, uint terms,
-                     inout uint seed)
+float3 surface_light(float3 point, float3 normal, uint terms, inout uint seed)
 {
-    (void)view;
     float3 sun = normalize(p.sun.xyz);
     float lit = max(dot(normal, sun), 0.0);
     float vis = 1.0;
@@ -234,7 +232,6 @@ void cs(uint3 id : SV_DispatchThreadID)
                 // the surface's specular and gathers its own light.
                 float3 mirror = normalize(rd + normal * (2.0 * cos_i));
                 float3 origin = point + normal * 0.02;
-                float3 normal_here = normal;
                 float3 through = float3(1, 1, 1);
                 float3 gathered = float3(0, 0, 0);
                 uint max_steps = max(p.config.x, 1u);
@@ -250,7 +247,7 @@ void cs(uint3 id : SV_DispatchThreadID)
                     float3 hn = normalize(h.normal);
                     if (dot(hn, mirror) > 0.0) { hn = -hn; }
                     float4 hm = material_of(h.triangle);
-                    gathered += through * (hm.rgb * surface_light(hp, hn, mirror, terms, seed));
+                    gathered += through * (hm.rgb * surface_light(hp, hn, terms, seed));
                     through *= hm.a;
                     if (max(through.r, max(through.g, through.b)) < 0.02) { break; }
                     // Reflect again about the new surface.
@@ -259,10 +256,8 @@ void cs(uint3 id : SV_DispatchThreadID)
                     if (c <= 0.0) { break; }
                     mirror = normalize(in_dir + hn * (2.0 * c));
                     origin = hp + hn * 0.02;
-                    normal_here = hn;
                 }
                 reflection += dot(gathered, float3(0.3333, 0.3333, 0.3333));
-                (void)normal_here;
             }
         }
     }

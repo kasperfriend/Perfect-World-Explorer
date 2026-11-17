@@ -406,26 +406,40 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
+run: |
           New-Item -ItemType Directory -Force -Path "Modules\Imaginator\imaginator" | Out-Null
           $out = "Modules\Imaginator\imaginator\dxr_trace.cso"
-          & $env:DXC_PATH -T cs_6_5 -E cs -HV 2018 -O3 -Zpc -all_resources_bound `
-            -Fo $out "tools\imaginator-shaders\dxr_trace.hlsl"
-          if ($LASTEXITCODE -ne 0) {
-            # Neither the job log nor artifacts are readable from every
-            # environment, but a pull-request comment is, so the compiler's own
-            # words are posted there. This is the only channel that reliably
-            # carries *why* the shader was rejected.
-            $log | Set-Content -Path "dxc-errors.txt"
+          $logFile = "dxc-output.txt"
+          $args = @("-T","cs_6_5","-E","cs","-HV","2018","-O3","-Zpc",
+                    "-all_resources_bound","-Fo",$out,
+                    "tools\imaginator-shaders\dxr_trace.hlsl")
+          $proc = Start-Process -FilePath $env:DXC_PATH -ArgumentList $args `
+            -NoNewWindow -Wait -PassThru -RedirectStandardOutput $logFile `
+            -RedirectStandardError "dxc-stderr.txt"
+          $code = $proc.ExitCode
+          $log = @()
+          foreach ($f in @("dxc-stderr.txt", $logFile)) {
+            if (Test-Path $f) { $log += Get-Content $f }
+          }
+          $log | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) {
+            # Neither the job log nor artifacts are always readable through the
+            # API, but a pull-request comment is, so the compiler's own words go
+            # there. This is the channel that says *why* the shader was rejected.
             $body = ($log -join "`n")
+            if ([string]::IsNullOrWhiteSpace($body)) {
+              $body = "(dxc produced no diagnostic output; it exited with code $code)"
+            }
             if ($body.Length -gt 60000) { $body = $body.Substring(0, 60000) }
-            $payload = @{ body = "dxc rejected the RayQuery shader:`n``````n$body`n``````" } |
-              ConvertTo-Json -Depth 4
-            Invoke-RestMethod -Method Post `
-              -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/issues/$env:PR_NUMBER/comments" `
-              -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN" } `
-              -ContentType "application/json" -Body $payload
-            throw "dxc failed with $LASTEXITCODE"
+            if ($env:PR_NUMBER) {
+              $payload = @{ body = "dxc rejected the RayQuery shader:`n``````n$body`n``````" } |
+                ConvertTo-Json -Depth 4
+              Invoke-RestMethod -Method Post `
+                -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/issues/$env:PR_NUMBER/comments" `
+                -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN" } `
+                -ContentType "application/json" -Body $payload
+            }
+            throw "dxc exited with code $code"
           }
           $size = (Get-Item $out).Length
           Write-Host "wrote $out ($size bytes)"
