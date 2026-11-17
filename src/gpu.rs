@@ -1401,11 +1401,7 @@ struct Renderer {
 /// coverage flag. `Rgba16Float` rather than `Rg16Float` because the flag needs a
 /// channel of its own and zero is a legal vector — the consumer must be able to
 /// tell "no producer wrote this pixel" from "the producer says it did not move".
-fn object_mv_target(
-    device: &wgpu::Device,
-    w: u32,
-    h: u32,
-) -> (wgpu::Texture, wgpu::TextureView) {
+fn object_mv_target(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("object motion vectors"),
         size: wgpu::Extent3d {
