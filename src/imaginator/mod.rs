@@ -53,6 +53,13 @@
 pub mod bvh;
 pub mod capture;
 mod composite;
+
+/// Set when `wgpu` reports an uncaptured device error. `wgpu`'s default handler
+/// **panics**, which turned a single validation mistake in the composite into a
+/// silent white window: the frame loop died before the first present. The
+/// installed handler logs instead and latches this flag, so the module can stop
+/// drawing and say why while the rest of the viewer keeps running.
+static DEVICE_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 mod gpu;
 pub mod hardware;
 pub mod math;
@@ -349,6 +356,13 @@ impl Imaginator {
 
     /// Build the GPU objects. Called once, after the device exists.
     pub fn init(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
+        // `wgpu` panics on an uncaptured error by default. A validation mistake
+        // must not take the window down: log it, latch it, and let `composite`
+        // stop drawing so the viewer stays usable and the reason is readable.
+        device.on_uncaptured_error(Box::new(|error| {
+            DEVICE_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("Imaginator: uncaptured device error: {error}");
+        }));
         if self.composite.is_none() {
             self.composite = Some(Composite::new(device, format));
         }
@@ -666,6 +680,19 @@ impl Imaginator {
         if !self.settings.active() {
             return false;
         }
+        if DEVICE_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+            // Set once by the handler above. Drawing again would only repeat the
+            // same rejection, so the module goes quiet and says why. Saving the
+            // settings (any change on the page) clears it, which gives the user
+            // a way to retry without restarting.
+            let why = "the GPU rejected an Imaginator command (see startup.log); \
+                       tracing is paused — change any setting to retry";
+            if self.status != why {
+                self.status = why.to_string();
+                self.last_error = Some(why.to_string());
+            }
+            return false;
+        }
         if self.composite.is_none() {
             return false;
         }
@@ -757,6 +784,7 @@ impl Imaginator {
     /// Persist the settings next to the module. Called when the page changes
     /// something, not per frame.
     pub fn save(&self) -> Result<(), String> {
+        DEVICE_FAILED.store(false, std::sync::atomic::Ordering::Relaxed);
         self.settings.save(&self.directory)
     }
 

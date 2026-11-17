@@ -199,6 +199,25 @@ impl Origin3d {
 }
 
 pub struct Device;
+/// Mirrors `wgpu::Error`. Only the arms the module matches on need to exist.
+#[derive(Debug)]
+pub enum Error {
+    OutOfMemory {
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+    Validation {
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+        description: String,
+    },
+}
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::OutOfMemory { .. } => write!(f, "out of memory"),
+            Error::Validation { description, .. } => write!(f, "{description}"),
+        }
+    }
+}
 pub struct Queue;
 pub struct Texture;
 impl Texture {
@@ -528,6 +547,7 @@ pub enum Maintain {
 }
 
 impl Device {
+    pub fn on_uncaptured_error(&self, _handler: Box<dyn Fn(Error) + Send + 'static>) {}
     pub fn create_bind_group_layout(&self, _d: &BindGroupLayoutDescriptor<'_>) -> BindGroupLayout {
         BindGroupLayout
     }
