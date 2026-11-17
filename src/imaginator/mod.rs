@@ -244,8 +244,15 @@ impl Imaginator {
     /// The world is offered exactly once, before the renderer takes ownership of
     /// the tree meshes, so the host has to know whether the module wants it
     /// *before* the module itself exists.
-    pub fn saved_active(client_root: &Path) -> bool {
-        ImaginatorSettings::load(&client_root.join(DIRECTORY)).active()
+    /// Whether the module should be offered the world at load time.
+    ///
+    /// Always true. The capture cannot depend on the saved tracer: the module
+    /// starts switched off by design, and the geometry it captures only exists
+    /// while the map is loading. Deciding this from the settings is what made
+    /// switching a tracer on produce an empty scene and a "reload the world"
+    /// message that reloading could never satisfy.
+    pub fn wants_world_capture(_client_root: &Path) -> bool {
+        true
     }
 
     /// Adopt a capture the host took before this module existed.
@@ -1030,9 +1037,9 @@ impl Imaginator {
         if self.capture_state != CaptureState::Done {
             ui.label(
                 egui::RichText::new(
-                    "This world has not been captured. A capture is taken while the map loads, \
-                     where the resident scenery and the tree meshes still exist, so switching the \
-                     tracer on now takes effect the next time a map loads.",
+                    "No geometry has been captured for this world yet. The capture is taken \
+                     while the map loads, from the resident scenery and tree meshes, so a tracer \
+                     switched on now starts working the next time a map is loaded.",
                 )
                 .small()
                 .color(egui::Color32::from_rgb(0xd0, 0xa0, 0x40)),
@@ -1157,7 +1164,7 @@ impl Drop for Imaginator {
 #[cfg(test)]
 mod tests {
     use super::{row_bands, Imaginator};
-    use crate::imaginator::tracer;
+    use crate::imaginator::{settings, tracer};
 
     #[test]
     fn bands_cover_every_row_exactly_once() {
@@ -1223,6 +1230,23 @@ mod tests {
     /// `active()`, so a launch that began switched off captured nothing at all —
     /// the log said "0 triangles captured" and the page told the user to reload
     /// the world.
+    /// The load-time capture must never be gated on the saved tracer. Doing so
+    /// is what produced "0 triangles captured" followed by a "reload the world"
+    /// prompt: the module starts off, so nothing was captured, and reloading
+    /// reset the tracer to off again.
+    #[test]
+    fn the_world_is_always_offered_for_capture() {
+        let root = std::path::Path::new("C:/client");
+        assert!(
+            Imaginator::wants_world_capture(root),
+            "capture feeds every tracer, and starts before one is chosen"
+        );
+        // And the module still starts switched off, which is the reason the
+        // capture cannot ask the settings.
+        let settings = settings::ImaginatorSettings::default();
+        assert!(!settings.active());
+    }
+
     #[test]
     fn geometry_is_captured_even_though_the_module_starts_off() {
         let mut module = Imaginator::new(std::path::Path::new("Modules"));

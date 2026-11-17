@@ -4303,6 +4303,17 @@ async fn adapter(
                         .max_storage_buffer_binding_size
                         .min(u32::try_from(adapter.max_buffer_size).unwrap_or(u32::MAX))
                         .max(limits.max_storage_buffer_binding_size);
+                    // The Imaginator's compute trace binds five storage buffers
+                    // per shader stage — the packed BVH's triangles, nodes and
+                    // order, the material table, and the frame's punctual lights
+                    // — against `downlevel_defaults()`' four. D3D12 allows far
+                    // more, so a rejected bind group there is a limit this call
+                    // imposed on itself, not one the hardware has. Every other
+                    // limit stays at the downlevel_defaults() value on purpose:
+                    // this only asks for what the trace shader needs.
+                    limits.max_storage_buffers_per_shader_stage = adapter
+                        .max_storage_buffers_per_shader_stage
+                        .max(limits.max_storage_buffers_per_shader_stage);
                     limits
                 },
             },
@@ -4428,31 +4439,40 @@ pub fn run(
     // inside `Renderer::new`) and the streaming object set, and the module only
     // wants a triangle soup it owns outright, so the borrow ends at this call.
     //
-    // The module does not exist yet, so the settings decide whether it is worth
-    // the walk; a module that is off costs one settings read and nothing else.
-    let imaginator_scene = crate::imaginator::Imaginator::saved_active(&t.element).then(|| {
-        // Load-time and potentially a walk over every resident triangle, on the
-        // thread that has not drawn a frame yet. Say so, so a startup that hangs
-        // here is distinguishable from one that hangs later.
-        eprintln!("Imaginator: capturing world geometry...");
-        let grid = crate::navigation::MapSpace {
-            width: t.width,
-            height: t.height,
-            spacing: t.grid_spacing,
-            heights: t.heights.clone(),
-        };
-        crate::imaginator::capture::capture(
-            &crate::imaginator::capture::Sources {
-                map: &grid,
-                water: &t.water,
-                objects: &t.objects,
-                ornaments: &t.objects.ornaments,
-                scene: &t.scene,
-                trees: Some(&t.trees),
-            },
-            crate::imaginator::capture::CaptureBudget::default(),
-        )
-    });
+    // The capture happens whether or not the module is currently switched on.
+    //
+    // It has to: this is the last moment the resident tree meshes and the
+    // streaming object set exist, and the module can only trace geometry it
+    // captured here. Gating the walk on the *saved* tracer meant that with the
+    // module starting off — which is how it is meant to start — nothing was ever
+    // captured, and switching a tracer on later found an empty world and told
+    // the user to reload the map, which then reset the tracer to off again. The
+    // walk is one pass over resident geometry at load time; correctness is worth
+    // more than the second it costs.
+    let imaginator_scene =
+        crate::imaginator::Imaginator::wants_world_capture(&t.element).then(|| {
+            // Load-time and potentially a walk over every resident triangle, on the
+            // thread that has not drawn a frame yet. Say so, so a startup that hangs
+            // here is distinguishable from one that hangs later.
+            eprintln!("Imaginator: capturing world geometry...");
+            let grid = crate::navigation::MapSpace {
+                width: t.width,
+                height: t.height,
+                spacing: t.grid_spacing,
+                heights: t.heights.clone(),
+            };
+            crate::imaginator::capture::capture(
+                &crate::imaginator::capture::Sources {
+                    map: &grid,
+                    water: &t.water,
+                    objects: &t.objects,
+                    ornaments: &t.objects.ornaments,
+                    scene: &t.scene,
+                    trees: Some(&t.trees),
+                },
+                crate::imaginator::capture::CaptureBudget::default(),
+            )
+        });
     if let Some(scene) = &imaginator_scene {
         eprintln!("Imaginator: captured {} triangles", scene.triangle_count());
     }
