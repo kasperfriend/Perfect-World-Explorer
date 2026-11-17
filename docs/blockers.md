@@ -1315,6 +1315,57 @@ DLSS-G parameter type.
   documents the capability map as usable "in the same ways" but recommends the
   allocator, and the allocator is what NVIDIA's programming guide's own
   integration sequence shows (`docs/dlss-fidelity.md`).
+- **Session-7 measured the map instead of the slot, and the map lost.** With the
+  complete block in place, all three pointer slots still answered
+  `FAIL_InvalidParameter` — and the `Get` read-back is the new fact:
+
+  ```text
+  Set 7: Color reads back as slot 14 0x53da7157, slot 13 0x427b4e2adab10000,
+                    slot 15 0x1b4e2adab10
+  ```
+
+  `0x1b4e2adab10` is the resource that was written; `0x427b4e2adab10000` is that
+  same number converted to `double` and `0x53da7157` is it converted to `float`.
+  So this core's readers at 13/14 *convert* a stored value numerically rather
+  than hand a resource back, and the resource is only recoverable through the
+  reader at 15. A `Get(…, ID3D12Resource **)` that the feature performs cannot
+  be answered by a numeric conversion, which is exactly "could not find Color
+  parameter".
+
+  Two other attempts show the same shape from another side: after `Set 6` (the
+  declared `ID3D12Resource *` overload) nothing came back at all — slot 15 read
+  `0x8000000000000000` — while after `Set 7` the pointer came back intact
+  through slot 15. The declared order therefore does not describe this core's
+  map, and the ladder's three candidates were three different *types* rather
+  than three readers of the same entry.
+
+- **What the next run measures, and it decides the blocker.** Instead of
+  guessing again, `resource_slot_matrix` writes one **real** resource pointer
+  through *all eight* declared `Set` overloads and reads it back through four
+  readers (`GetD3D12`, `GetD3D11`, `GetVoidPointer`, `GetULL`), logging which
+  combination returns the address unchanged:
+
+  ```text
+  [DLSS] resource slot matrix: Color = 0x1b4e2adab10, 8 declared Set overloads against 4 readers
+  [DLSS]   Set 0: d3d12 ->0x…, d3d11 ->0x…, void ->0x…, ull ->0x…
+  [DLSS]   …
+  [DLSS]   Set 6: d3d12 keeps it, d3d11 untouched, void ->0x…, ull untouched
+  ```
+
+  A null pointer cannot answer this — a null stored as a number and a null
+  stored as a resource both read back as zero, which is why the null probe
+  reported a working pair in a session where nothing worked. The ladder now
+  starts at the slot the matrix names instead of at the declared one.
+
+  If the matrix reports **no** pair that keeps a resource, then the map cannot
+  carry resources for this feature at all and the remaining explanation is a
+  generation mismatch between the app-side `nvngx_dlss.dll` (310.9.16) and the
+  driver's NGX core (`_nvngx.dll` 32.0.16.2114) — the core's own readers
+  disagree with the header the feature was compiled against. That is settled by
+  the same log line, not by another guess, and its remedy is a matching pair
+  (a DLSS build from the core's generation, or a driver update), not more
+  parameter plumbing.
+
 - **What a run has to settle.** One of three outcomes, each with its own next
   step:
   1. `[DLSS] first evaluate OK` and the upscaler stops reporting "NOT running"

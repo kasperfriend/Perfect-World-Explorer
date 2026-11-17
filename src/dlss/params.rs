@@ -118,6 +118,7 @@ const SLOT_SET_I32: usize = 4;
 const SLOT_SET_D3D11: usize = 5;
 const SLOT_SET_D3D12: usize = 6;
 const SLOT_SET_VOID: usize = 7;
+const SLOT_GET_ULL: usize = 8;
 const SLOT_GET_U32: usize = 11;
 const SLOT_GET_D3D11: usize = 13;
 const SLOT_GET_D3D12: usize = 14;
@@ -264,6 +265,20 @@ impl Owned {
         }
     }
 
+    /// Write one real pointer through every declared `Set` overload and read it
+    /// back through four readers.
+    ///
+    /// The viewer's own table stores every pointer the same way, so the matrix
+    /// is uniform here — which is what makes it a useful baseline against NGX's
+    /// map in the same log.
+    fn resource_slot_matrix(
+        &self,
+        name: &str,
+        resource: *mut c_void,
+    ) -> (Option<usize>, Vec<String>) {
+        pointer_slot_matrix(self as *const Owned as *mut c_void, name, resource)
+    }
+
     /// Read one pointer key back through every candidate `Get` slot.
     ///
     /// Every pointer overload of the viewer's own table stores the same
@@ -369,6 +384,80 @@ fn pointer_get_report(object: *mut c_void, name: &str) -> String {
     parts.join(", ")
 }
 
+/// Write one *real* resource pointer through every declared `Set` overload and
+/// read it back through four readers, reporting which combination keeps it.
+///
+/// This is the measurement a null probe cannot make: a null stored as a number
+/// and a null stored as a resource both read back as zero. A real handle
+/// survives exactly through the overload that stores it as a resource, comes
+/// back *converted* through a numeric reader, and comes back as unrelated bytes
+/// through a reader of another pointer type. Session-7 showed all three of
+/// those shapes for the same key, which is how the map — not the slot — became
+/// the suspect (`docs/blockers.md` B-27).
+///
+/// The returned slot is the `Set` overload after which the
+/// `ID3D12Resource **` reader returns the pointer *unchanged* — the pair the
+/// feature's own read has to agree with. `None` means no declared pair keeps a
+/// resource, which is a different defect from a wrong slot.
+fn pointer_slot_matrix(
+    object: *mut c_void,
+    name: &str,
+    resource: *mut c_void,
+) -> (Option<usize>, Vec<String>) {
+    type SetPtr = unsafe extern "C" fn(*mut c_void, *const c_char, *mut c_void);
+    type GetPtr = unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_void) -> u32;
+    let Ok(key) = CString::new(name) else {
+        return (None, Vec::new());
+    };
+    let sentinel = 1usize as *mut c_void;
+    // Every `Set` overload whose write the `ID3D12Resource **` reader returns
+    // unchanged. More than one can qualify — a map that converts pointer types
+    // answers through several — so the declared overload is preferred and only
+    // then the first that works.
+    let mut matches: Vec<usize> = Vec::with_capacity(3);
+    let mut lines = Vec::with_capacity(SLOT_SET_VOID + 1);
+    for set_slot in 0..=SLOT_SET_VOID {
+        let Some(set) = (unsafe { vtable_setter::<SetPtr>(object, set_slot) }) else {
+            lines.push(format!("Set {set_slot}: no vtable entry"));
+            continue;
+        };
+        unsafe { set(object, key.as_ptr(), resource) };
+        let mut parts = Vec::with_capacity(4);
+        for (label, get_slot) in [
+            ("d3d12", SLOT_GET_D3D12),
+            ("d3d11", SLOT_GET_D3D11),
+            ("void", SLOT_GET_VOID),
+            ("ull", SLOT_GET_ULL),
+        ] {
+            let Some(get) = (unsafe { vtable_getter::<GetPtr>(object, get_slot) }) else {
+                parts.push(format!("{label} absent"));
+                continue;
+            };
+            let mut value = sentinel;
+            let result = unsafe { get(object, key.as_ptr(), &mut value) };
+            if result != NGX_SUCCESS {
+                parts.push(format!("{label} fail(0x{result:08x})"));
+            } else if value == resource {
+                parts.push(format!("{label} keeps it"));
+                if get_slot == SLOT_GET_D3D12 {
+                    matches.push(set_slot);
+                }
+            } else if value == sentinel {
+                parts.push(format!("{label} untouched"));
+            } else {
+                parts.push(format!("{label} ->0x{:x}", value as usize));
+            }
+        }
+        lines.push(format!("Set {set_slot}: {}", parts.join(", ")));
+    }
+    let found = if matches.contains(&SLOT_SET_D3D12) {
+        Some(SLOT_SET_D3D12)
+    } else {
+        matches.first().copied()
+    };
+    (found, lines)
+}
+
 impl NgxMap {
     pub(crate) fn new(
         object: *mut c_void,
@@ -422,6 +511,17 @@ impl NgxMap {
             get_void: unsafe { vtable_setter(object, SLOT_GET_VOID) },
             resource_set_slot: SLOT_SET_D3D12,
         }
+    }
+
+    /// Write one real resource pointer through every declared `Set` overload and
+    /// read it back through four readers (see [`pointer_slot_matrix`]).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn resource_slot_matrix(
+        &self,
+        name: &str,
+        resource: *mut c_void,
+    ) -> (Option<usize>, Vec<String>) {
+        pointer_slot_matrix(self.object, name, resource)
     }
 
     /// The `Set` slot the map's own pointer round-trip answers, when it
@@ -754,6 +854,22 @@ impl NgxParams {
     pub(crate) fn set_resource_set_slot(&mut self, slot: usize) {
         if let Kind::Ngx(map) = &mut self.kind {
             map.set_resource_set_slot(slot);
+        }
+    }
+
+    /// Write one real resource pointer through every declared `Set` overload and
+    /// read it back through the declared readers, reporting the matrix.
+    ///
+    /// The viewer's own table stores every pointer the same way, so there is
+    /// nothing to measure and the declared slot is the answer.
+    pub(crate) fn resource_slot_matrix(
+        &self,
+        name: &str,
+        resource: *mut c_void,
+    ) -> (Option<usize>, Vec<String>) {
+        match &self.kind {
+            Kind::Owned(table) => table.resource_slot_matrix(name, resource),
+            Kind::Ngx(map) => map.resource_slot_matrix(name, resource),
         }
     }
 
@@ -1214,5 +1330,35 @@ mod tests {
         assert_eq!(params.len(), 1);
         params.reset();
         assert_eq!(params.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod resource_matrix_tests {
+    use super::*;
+
+    /// The matrix exists to separate "the map lost the pointer" from "the map
+    /// holds it under a tag the feature does not read", so it has to report a
+    /// kept pointer as `keeps it` and a converted one as the converted number —
+    /// the two shapes session-7 showed for the same key.
+    #[test]
+    fn the_matrix_reports_a_kept_pointer_through_every_reader_of_a_table_it_owns() {
+        let params = NgxParams::new();
+        let (found, lines) = params.resource_slot_matrix("Color", 0x1234 as *mut c_void);
+        assert_eq!(
+            found,
+            Some(SLOT_SET_D3D12),
+            "a table the viewer owns keeps a pointer through the declared slot"
+        );
+        assert_eq!(lines.len(), SLOT_SET_VOID + 1, "one line per declared Set");
+        let declared = &lines[SLOT_SET_D3D12];
+        assert!(
+            declared.contains("d3d12 keeps it"),
+            "the declared slot must report the pointer as kept: {declared}"
+        );
+        assert!(
+            declared.contains("void keeps it"),
+            "every reader of the viewer's table sees the same pointer: {declared}"
+        );
     }
 }

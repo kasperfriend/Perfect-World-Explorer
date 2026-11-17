@@ -825,6 +825,42 @@ impl DlssUpscaler {
             reset: self.reset_history,
             frame_time_ms: frame_time_ms.clamp(0.1, 1000.0),
         };
+        // A *real* resource pointer through every declared `Set` overload, read
+        // back through every declared reader.
+        //
+        // The null probe cannot answer this: a null stored as a number and a
+        // null stored as a resource both read back as zero, which is why the
+        // map reported "a null pointer round-trips Set slot 6 / Get slot 14" in
+        // a session where the feature could not find `Color` at all. A real
+        // handle distinguishes the overloads — it survives only through the
+        // resource one — and the log prints the address that went in, so the
+        // address that comes back can be compared with it (`docs/blockers.md`
+        // B-27).
+        if self.frame_index == 0 {
+            let (found, lines) = self.params.resource_slot_matrix(P_COLOR, resources[0]);
+            crate::dlss::diag(&format!(
+                "[DLSS] resource slot matrix: Color = 0x{:x}, {} declared Set overloads against 4 \
+                 readers",
+                resources[0] as usize,
+                lines.len()
+            ));
+            for line in &lines {
+                crate::dlss::diag(&format!("[DLSS]   {line}"));
+            }
+            match found {
+                Some(slot) => {
+                    crate::dlss::diag(&format!(
+                        "[DLSS] the ID3D12Resource reader keeps the pointer written through Set \
+                         slot {slot}; the ladder starts there"
+                    ));
+                    self.param_slot = slot;
+                }
+                None => crate::dlss::diag(
+                    "[DLSS] no declared Set overload leaves a resource pointer this map reads back \
+                     unchanged; the ladder runs its candidates anyway",
+                ),
+            }
+        }
         let ladder: Vec<usize> = if self.frame_index == 0 {
             crate::dlss::params::resource_slot_ladder(self.param_slot)
         } else {
