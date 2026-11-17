@@ -20,7 +20,7 @@ fn at(f: &mut File, p: u64, n: usize) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())?;
     Ok(b)
 }
-fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
     thread_local! { static INFLATE_DECOMP: std::cell::RefCell<Decompress> = std::cell::RefCell::new(Decompress::new(true)); }
 INFLATE_DECOMP.with(|cell| {
 let mut decomp = cell.borrow_mut();
