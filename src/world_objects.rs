@@ -16,8 +16,17 @@ use std::{
         Arc,
     },
 };
-const SIDE: usize = 4096;
-const MAX_VERTICES: usize = 1_000_000;
+pub(crate) const SIDE: usize = 4096;
+const DEFAULT_MAX_VERTICES: usize = 2_000_000;
+const MAX_PAGE_VERTICES: usize = 8_000_000;
+
+fn page_vertex_limit() -> usize {
+    std::env::var("PW_WORLD_PAGE_VERTICES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(1_000_000, MAX_PAGE_VERTICES))
+        .unwrap_or(DEFAULT_MAX_VERTICES)
+}
 
 /// One ornament's index range inside a page. The two EC-BSD flags decide
 /// whether this range is submitted in reflection/refraction; the main and map
@@ -181,6 +190,11 @@ pub struct Page {
     pub used_height: usize,
     pub mips: Vec<Vec<u8>>,
     pub placements: Vec<PlacementRange>,
+    /// Bounds are prepared by the loader worker rather than on the UI thread.
+    pub bounds: Vec<PlacementBounds>,
+    pub page_min: [f32; 3],
+    pub page_max: [f32; 3],
+    pub page_has_sdr: bool,
 }
 impl Page {
     pub fn finish(mut self) -> Self {
@@ -198,6 +212,37 @@ impl Page {
         self.vertices.shrink_to_fit();
         self.indices.shrink_to_fit();
         self.placements.shrink_to_fit();
+        self.bounds = Vec::with_capacity(self.placements.len());
+        self.page_min = [f32::INFINITY; 3];
+        self.page_max = [f32::NEG_INFINITY; 3];
+        self.page_has_sdr = false;
+        for placement in &self.placements {
+            let mut min = [f32::INFINITY; 3];
+            let mut max = [f32::NEG_INFINITY; 3];
+            let mut has_sdr = false;
+            let start = (placement.start as usize).min(self.indices.len());
+            let end = (placement.end as usize).min(self.indices.len());
+            if start < end {
+                for &index in &self.indices[start..end] {
+                    if let Some(vertex) = self.vertices.get(index as usize) {
+                        for axis in 0..3 {
+                            min[axis] = min[axis].min(vertex.pos[axis]);
+                            max[axis] = max[axis].max(vertex.pos[axis]);
+                        }
+                        has_sdr |= (vertex.kind > 2.01 && vertex.kind < 2.03)
+                            || (vertex.kind > 2.11 && vertex.kind < 2.13);
+                    }
+                }
+            }
+            if min[0] <= max[0] {
+                for axis in 0..3 {
+                    self.page_min[axis] = self.page_min[axis].min(min[axis]);
+                    self.page_max[axis] = self.page_max[axis].max(max[axis]);
+                }
+            }
+            self.page_has_sdr |= has_sdr;
+            self.bounds.push(PlacementBounds { min, max, has_sdr });
+        }
         if self.shared_atlas.is_some() {
             assert!(self.atlas.is_empty() && self.mips.is_empty());
             return self;
@@ -212,7 +257,9 @@ impl Page {
             };
             let (nw, nh) = (w / 2, h / 2);
             let mut out = vec![0u8; nw * nh * 4];
-            let threads = if nh >= 64 {
+            // Small reductions stay on this worker rather than starting a new
+            // scoped team at every mip level and every page.
+            let threads = if nw * nh * 4 >= 2 * 1024 * 1024 {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1)
@@ -286,13 +333,19 @@ pub struct DoneStats {
     pub pages: usize,
     pub atlas_pages: usize,
     pub atlas_bytes: usize,
+    /// Indicates this build restored completed pages from disk.
+    pub cache_hit: bool,
 }
 pub enum Message {
     Page(Page),
+    /// A cache page failed validation; discard prior cache pages and use the
+    /// cold-build pages that follow.
+    CacheInvalid,
     Done {
         processed: usize,
         skipped: usize,
         stats: DoneStats,
+        world_draw_cmds: [WorldDrawList; WORLD_VIEWS],
     },
     Error(String),
 }
@@ -304,12 +357,17 @@ fn basis(a: [f32; 3]) -> Vec3 {
         v.normalize()
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum TextureKey {
+    Content(u64),
+    Missing,
+}
 struct Builder {
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
     atlas: Vec<u8>,
     shared_atlas: Option<usize>,
-    slots: HashMap<String, crate::texture_atlas::Slot>,
+    slots: HashMap<TextureKey, crate::texture_atlas::Slot>,
     packing: crate::texture_atlas::Atlas,
     used_height: usize,
     placements: Vec<PlacementRange>,
@@ -319,7 +377,8 @@ impl Builder {
         Self {
             vertices: Vec::new(),
             indices: Vec::new(),
-            atlas: vec![0; SIDE * SIDE * 4],
+            // Grow only to occupied rows; a mostly-empty page needn't zero 64 MiB.
+            atlas: Vec::new(),
             shared_atlas: None,
             slots: HashMap::new(),
             packing: crate::texture_atlas::Atlas::new(),
@@ -349,6 +408,10 @@ impl Builder {
             used_height: self.used_height,
             mips: Vec::new(),
             placements: self.placements,
+            bounds: Vec::new(),
+            page_min: [f32::INFINITY; 3],
+            page_max: [f32::NEG_INFINITY; 3],
+            page_has_sdr: false,
         }
         .finish()
     }
@@ -359,7 +422,7 @@ struct SharedSlot {
     height: usize,
     slot: crate::texture_atlas::Slot,
 }
-fn remember_atlas(page: &Builder, source: usize, slots: &mut HashMap<String, SharedSlot>) {
+fn remember_atlas(page: &Builder, source: usize, slots: &mut HashMap<TextureKey, SharedSlot>) {
     assert!(page.shared_atlas.is_none());
     let height = page.used_height.clamp(crate::texture_atlas::UNIT, SIDE);
     for (key, &slot) in &page.slots {
@@ -389,10 +452,10 @@ fn atlas_mip_bytes(height: usize) -> usize {
 /// page replaces it in place and the finished page is returned for sending.
 fn allocate_slot(
     page: &mut Builder,
-    key: &str,
+    key: TextureKey,
     tex: &crate::objects::Texture,
 ) -> Result<(crate::texture_atlas::Slot, Option<Builder>), String> {
-    if let Some(&s) = page.slots.get(key) {
+    if let Some(&s) = page.slots.get(&key) {
         return Ok((s, None));
     }
     let mut slot = page.packing.allocate(tex.width, tex.height, 0, false);
@@ -402,44 +465,146 @@ fn allocate_slot(
         slot = page.packing.allocate(tex.width, tex.height, 0, false);
     }
     let s = slot.ok_or("scenery texture exceeds atlas capacity")?;
-    for py in 0..s.h {
-        for px in 0..s.w {
-            let sample = tex.sample_rgba(
-                (px as f32 + 0.5) / s.w as f32,
-                (py as f32 + 0.5) / s.h as f32,
-            );
-            let dst = ((s.y + py) * SIDE + s.x + px) * 4;
-            page.atlas[dst..dst + 4].copy_from_slice(&sample);
+    let required = (s.y + s.h) * SIDE * 4;
+    if page.atlas.len() < required {
+        page.atlas.resize(required, 0);
+    }
+    if tex.width == s.w && tex.height == s.h {
+        for py in 0..s.h {
+            let src = py * tex.width * 4;
+            let dst = ((s.y + py) * SIDE + s.x) * 4;
+            page.atlas[dst..dst + s.w * 4].copy_from_slice(&tex.rgba[src..src + s.w * 4]);
+        }
+    } else {
+        for py in 0..s.h {
+            let sy = (((2 * py + 1) * tex.height) / (2 * s.h)).min(tex.height - 1);
+            for px in 0..s.w {
+                let sx = (((2 * px + 1) * tex.width) / (2 * s.w)).min(tex.width - 1);
+                let src = (sy * tex.width + sx) * 4;
+                let dst = ((s.y + py) * SIDE + s.x + px) * 4;
+                page.atlas[dst..dst + 4].copy_from_slice(&tex.rgba[src..src + 4]);
+            }
         }
     }
     page.used_height = page.used_height.max(s.y + s.h);
-    page.slots.insert(key.to_string(), s);
+    page.slots.insert(key, s);
     Ok((s, turned))
 }
-pub fn build(
+fn emit_page(
+    tx: &SyncSender<Message>,
+    cache: &mut Option<crate::world_page_cache::Writer>,
+    metadata: &mut Vec<WorldPageMeta>,
+    mut page: Page,
+) -> bool {
+    let write_error = cache
+        .as_mut()
+        .and_then(|writer| writer.write_page(&page).err());
+    if let Some(error) = write_error {
+        eprintln!("Whole-world cache write disabled: {error}");
+        *cache = None;
+    }
+    metadata.push(WorldPageMeta::from_page(&page));
+    // The worker has frozen all world draw/cull commands from this metadata.
+    // Whole-world GPU pages need only the buffers afterward; avoid retaining a
+    // second copy of every placement and bound until the Done message arrives.
+    page.placements = Vec::new();
+    page.bounds = Vec::new();
+    tx.send(Message::Page(page)).is_ok()
+}
+
+pub fn build<O: Into<Arc<[Ornament]>>>(
     element: PathBuf,
-    ornaments: Vec<Ornament>,
+    ornaments: O,
     tx: SyncSender<Message>,
     cancel: Arc<AtomicBool>,
 ) {
-    let result = run(element, ornaments, &tx, &cancel);
+    let result = run(element, ornaments.into(), &tx, &cancel);
     if let Err(e) = result {
         let _ = tx.send(Message::Error(e));
     }
 }
 fn run(
     element: PathBuf,
-    ornaments: Vec<Ornament>,
+    ornaments: Arc<[Ornament]>,
     tx: &SyncSender<Message>,
     cancel: &AtomicBool,
 ) -> Result<(), String> {
-    let mut ornaments = ornaments;
-    // Group related models to reuse textures within a page. The supplied client
-    // fell from 101 to 66 native-resolution pages in the full-world survey.
+    // Sort compact indices instead of cloning/reordering every Ornament on
+    // each enable. This preserves the source array shared by the renderer and
+    // keeps the draw-order key tied to the original placement index.
+    let mut order: Vec<usize> = (0..ornaments.len()).collect();
     if std::env::var_os("PW_WORLD_KEEP_ORDER_TEST").is_none() {
-        ornaments.sort_by(|a, b| a.path.cmp(&b.path));
+        order.sort_by(|&a, &b| ornaments[a].path.cmp(&ornaments[b].path));
     }
-    let mut objects = Objects::open(&element, ornaments)?;
+    let vertex_limit = page_vertex_limit();
+    let cache_key = crate::world_page_cache::identity(&element, &ornaments, &order, vertex_limit);
+    if let Some(key) = cache_key {
+        if let Some(mut reader) = crate::world_page_cache::Reader::open(&key) {
+            let mut metadata = Vec::with_capacity(reader.page_count());
+            let mut valid = true;
+            for index in 0..reader.page_count() {
+                match reader.read_page(index) {
+                    Ok(page) => {
+                        if page.shared_atlas.is_some_and(|source| source >= index) {
+                            eprintln!("Whole-world cache rejected: forward/shared atlas reference at page {index}");
+                            reader.invalidate();
+                            let _ = tx.send(Message::CacheInvalid);
+                            valid = false;
+                            break;
+                        }
+                        metadata.push(WorldPageMeta::from_page(&page));
+                        let mut page = page;
+                        page.placements = Vec::new();
+                        page.bounds = Vec::new();
+                        if tx.send(Message::Page(page)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("Whole-world cache rejected at page {index}: {error}");
+                        reader.invalidate();
+                        let _ = tx.send(Message::CacheInvalid);
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if valid {
+                if let Err(error) = reader.complete() {
+                    eprintln!("Whole-world cache rejected after last page: {error}");
+                    reader.invalidate();
+                    let _ = tx.send(Message::CacheInvalid);
+                    valid = false;
+                }
+            }
+            if valid {
+                let world_draw_cmds = world_culled_commands_from_meta(&metadata);
+                let _ = tx.send(Message::Done {
+                    processed: reader.processed,
+                    skipped: reader.skipped,
+                    stats: DoneStats {
+                        residency: Default::default(),
+                        resolver: Default::default(),
+                        unresolved_rows: 0,
+                        pages: reader.page_count(),
+                        atlas_pages: reader.atlas_pages,
+                        atlas_bytes: reader.atlas_bytes,
+                        cache_hit: true,
+                    },
+                    world_draw_cmds,
+                });
+                return Ok(());
+            }
+        }
+    }
+    let mut cache = cache_key.and_then(|key| match crate::world_page_cache::Writer::new(key) {
+        Ok(writer) => Some(writer),
+        Err(error) => {
+            eprintln!("Whole-world cache unavailable: {error}");
+            None
+        }
+    });
+    let mut objects = Objects::open(&element, Arc::clone(&ornaments))?;
     let first = std::env::var("PW_WORLD_TEST_START")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -450,8 +615,10 @@ fn run(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(objects.ornaments.len());
     let limit = first.saturating_add(count).min(objects.ornaments.len());
+    let max_vertices = vertex_limit;
     let mut page = Builder::new();
-    let mut shared_slots = HashMap::new();
+    let mut world_metadata = Vec::new();
+    let mut shared_slots: HashMap<TextureKey, SharedSlot> = HashMap::new();
     let mut shared_geometry = HashMap::<usize, Builder>::new();
     let mut skipped = 0usize;
     let mut pages = 0usize;
@@ -472,9 +639,9 @@ fn run(
             return Ok(());
         }
         let end = (start + batch_size).min(limit);
-        let ids: Vec<_> = (start..end).collect();
-        objects.load_ids(&ids)?;
-        for id in ids {
+        let ids = &order[start..end];
+        objects.load_ids(ids)?;
+        for &id in ids {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
@@ -513,17 +680,17 @@ fn run(
                 // Content-keyed slot sharing (P3.08 cross-name dedup):
                 // references with identical pixels collapse onto one atlas
                 // slot regardless of how many names point at them.
-                let key = match objects.texture_key(&mesh.texture) {
-                    Some(hash) => format!("h{hash:016x}"),
-                    None => String::from("<missing-client-texture>"),
-                };
+                let key = objects
+                    .texture_key(&mesh.texture)
+                    .map(TextureKey::Content)
+                    .unwrap_or(TextureKey::Missing);
                 let tex = if let Some(t) = objects.texture(&mesh.texture) {
                     t
                 } else {
                     skipped += 1;
                     &fallback
                 };
-                if page.vertices.len() + mesh.vertices.len() > MAX_VERTICES
+                if page.vertices.len() + mesh.vertices.len() > max_vertices
                     && !page.indices.is_empty()
                 {
                     let finished = std::mem::replace(&mut page, Builder::new());
@@ -531,7 +698,7 @@ fn run(
                     atlas_bytes += atlas_mip_bytes(finished.used_height);
                     remember_atlas(&finished, pages, &mut shared_slots);
                     pages += 1;
-                    if tx.send(Message::Page(finished.page(id))).is_err() {
+                    if !emit_page(tx, &mut cache, &mut world_metadata, finished.page(id)) {
                         return Ok(());
                     }
                 }
@@ -539,7 +706,7 @@ fn run(
                     let target = shared_geometry
                         .entry(shared.source)
                         .or_insert_with(|| Builder::shared(shared.source, shared.height));
-                    if target.vertices.len() + mesh.vertices.len() > MAX_VERTICES
+                    if target.vertices.len() + mesh.vertices.len() > max_vertices
                         && !target.indices.is_empty()
                     {
                         let ready = std::mem::replace(
@@ -547,19 +714,19 @@ fn run(
                             Builder::shared(shared.source, shared.height),
                         );
                         pages += 1;
-                        if tx.send(Message::Page(ready.page(id))).is_err() {
+                        if !emit_page(tx, &mut cache, &mut world_metadata, ready.page(id)) {
                             return Ok(());
                         }
                     }
                     (target, shared.slot)
                 } else {
-                    let (slot, turned) = allocate_slot(&mut page, &key, tex)?;
+                    let (slot, turned) = allocate_slot(&mut page, key, tex)?;
                     if let Some(finished) = turned {
                         atlas_pages += 1;
                         atlas_bytes += atlas_mip_bytes(finished.used_height);
                         remember_atlas(&finished, pages, &mut shared_slots);
                         pages += 1;
-                        if tx.send(Message::Page(finished.page(id))).is_err() {
+                        if !emit_page(tx, &mut cache, &mut world_metadata, finished.page(id)) {
                             return Ok(());
                         }
                     }
@@ -609,7 +776,7 @@ fn run(
         for (_, builder) in ready {
             if !builder.indices.is_empty() {
                 pages += 1;
-                if tx.send(Message::Page(builder.page(end))).is_err() {
+                if !emit_page(tx, &mut cache, &mut world_metadata, builder.page(end)) {
                     return Ok(());
                 }
             }
@@ -619,8 +786,14 @@ fn run(
         atlas_pages += 1;
         atlas_bytes += atlas_mip_bytes(page.used_height);
         pages += 1;
-        if tx.send(Message::Page(page.page(limit))).is_err() {
+        if !emit_page(tx, &mut cache, &mut world_metadata, page.page(limit)) {
             return Ok(());
+        }
+    }
+    let world_draw_cmds = world_culled_commands_from_meta(&world_metadata);
+    if let Some(writer) = cache.take() {
+        if let Err(error) = writer.finish(limit, skipped, atlas_pages, atlas_bytes) {
+            eprintln!("Whole-world cache publish failed: {error}");
         }
     }
     let _ = tx.send(Message::Done {
@@ -633,7 +806,9 @@ fn run(
             pages,
             atlas_pages,
             atlas_bytes,
+            cache_hit: false,
         },
+        world_draw_cmds,
     });
     Ok(())
 }
@@ -648,6 +823,37 @@ pub struct GpuPage {
     page_min: [f32; 3],
     page_max: [f32; 3],
     page_has_sdr: bool,
+}
+#[derive(Clone)]
+struct WorldPageMeta {
+    count: u32,
+    placements: Vec<PlacementRange>,
+    bounds: Vec<PlacementBounds>,
+    page_min: [f32; 3],
+    page_max: [f32; 3],
+    page_has_sdr: bool,
+}
+impl WorldPageMeta {
+    fn from_page(page: &Page) -> Self {
+        Self {
+            count: page.indices.len() as u32,
+            placements: page.placements.clone(),
+            bounds: page.bounds.clone(),
+            page_min: page.page_min,
+            page_max: page.page_max,
+            page_has_sdr: page.page_has_sdr,
+        }
+    }
+    fn from_gpu(page: &GpuPage) -> Self {
+        Self {
+            count: page.count,
+            placements: page.placements.clone(),
+            bounds: page.bounds.clone(),
+            page_min: page.page_min,
+            page_max: page.page_max,
+            page_has_sdr: page.page_has_sdr,
+        }
+    }
 }
 impl GpuPage {
     pub fn release_cpu_ranges(&mut self) {
@@ -785,40 +991,6 @@ impl GpuPage {
             contents: bytemuck::cast_slice(&page.indices),
             usage: wgpu::BufferUsages::INDEX,
         });
-        let mut page_min = [f32::INFINITY; 3];
-        let mut page_max = [f32::NEG_INFINITY; 3];
-        let mut page_has_sdr = false;
-        let mut bounds = Vec::with_capacity(page.placements.len());
-        for p in &page.placements {
-            let mut min = [f32::INFINITY; 3];
-            let mut max = [f32::NEG_INFINITY; 3];
-            let mut has_sdr = false;
-            let start = (p.start as usize).min(page.indices.len());
-            let end = (p.end as usize).min(page.indices.len());
-            if start < end {
-                for &idx in &page.indices[start..end] {
-                    if let Some(v) = page.vertices.get(idx as usize) {
-                        for i in 0..3 {
-                            min[i] = min[i].min(v.pos[i]);
-                            max[i] = max[i].max(v.pos[i]);
-                        }
-                        if (v.kind > 2.01 && v.kind < 2.03) || (v.kind > 2.11 && v.kind < 2.13) {
-                            has_sdr = true;
-                        }
-                    }
-                }
-            }
-            if min[0] <= max[0] {
-                for i in 0..3 {
-                    page_min[i] = page_min[i].min(min[i]);
-                    page_max[i] = page_max[i].max(max[i]);
-                }
-            }
-            if has_sdr {
-                page_has_sdr = true;
-            }
-            bounds.push(PlacementBounds { min, max, has_sdr });
-        }
         Self {
             vertex,
             index,
@@ -826,10 +998,10 @@ impl GpuPage {
             normal,
             reflected,
             placements: page.placements,
-            bounds,
-            page_min,
-            page_max,
-            page_has_sdr,
+            bounds: page.bounds,
+            page_min: page.page_min,
+            page_max: page.page_max,
+            page_has_sdr: page.page_has_sdr,
         }
     }
     /// Submits only the placements the recovered EC-BSD flags admit in this
@@ -931,99 +1103,11 @@ impl GpuPage {
     }
 
     pub fn world_culled_commands(pages: &[Self]) -> [WorldDrawList; WORLD_VIEWS] {
-        let order = Self::draw_order(pages);
-        let build = |view: Pass| -> WorldDrawList {
-            let mut out: Vec<WorldDrawCmd> = Vec::new();
-            for &(page_idx, range_idx) in &order {
-                let p = &pages[page_idx];
-                if p.count == 0 {
-                    continue;
-                }
-                if range_idx == usize::MAX {
-                    out.push(WorldDrawCmd {
-                        page: page_idx,
-                        start: 0,
-                        end: p.count,
-                        min: p.page_min,
-                        max: p.page_max,
-                        has_sdr: p.page_has_sdr,
-                    });
-                    continue;
-                }
-                let r = &p.placements[range_idx];
-                if !allows_with_context(view, r.visibility, RenderContext::default()) {
-                    continue;
-                }
-                let start = r.start.min(p.count);
-                let end = r.end.min(p.count);
-                if start >= end {
-                    continue;
-                }
-                let b = p.bounds[range_idx];
-                if let Some(prev) = out.last_mut() {
-                    if prev.page == page_idx && prev.end == start {
-                        let cmin = [
-                            prev.min[0].min(b.min[0]),
-                            prev.min[1].min(b.min[1]),
-                            prev.min[2].min(b.min[2]),
-                        ];
-                        let cmax = [
-                            prev.max[0].max(b.max[0]),
-                            prev.max[1].max(b.max[1]),
-                            prev.max[2].max(b.max[2]),
-                        ];
-                        if cmax[0] - cmin[0] <= 128.0
-                            && cmax[1] - cmin[1] <= 128.0
-                            && cmax[2] - cmin[2] <= 128.0
-                        {
-                            prev.end = end;
-                            prev.min = cmin;
-                            prev.max = cmax;
-                            prev.has_sdr |= b.has_sdr;
-                            continue;
-                        }
-                    }
-                }
-                out.push(WorldDrawCmd {
-                    page: page_idx,
-                    start,
-                    end,
-                    min: b.min,
-                    max: b.max,
-                    has_sdr: b.has_sdr,
-                });
-            }
-            let mut chunks = Vec::with_capacity(out.len().div_ceil(32));
-            for (i, group) in out.chunks(32).enumerate() {
-                let start = i * 32;
-                let end = start + group.len();
-                let mut min = group[0].min;
-                let mut max = group[0].max;
-                let mut has_sdr = group[0].has_sdr;
-                for cmd in &group[1..] {
-                    min[0] = min[0].min(cmd.min[0]);
-                    min[1] = min[1].min(cmd.min[1]);
-                    min[2] = min[2].min(cmd.min[2]);
-                    max[0] = max[0].max(cmd.max[0]);
-                    max[1] = max[1].max(cmd.max[1]);
-                    max[2] = max[2].max(cmd.max[2]);
-                    has_sdr |= cmd.has_sdr;
-                }
-                chunks.push(WorldDrawChunk {
-                    min,
-                    max,
-                    has_sdr,
-                    start,
-                    end,
-                });
-            }
-            WorldDrawList { cmds: out, chunks }
-        };
-        [
-            build(Pass::Main),
-            build(Pass::Reflection),
-            build(Pass::Refraction),
-        ]
+        let metadata = pages
+            .iter()
+            .map(WorldPageMeta::from_gpu)
+            .collect::<Vec<_>>();
+        world_culled_commands_from_meta(&metadata)
     }
 
     pub fn draw_world_culled<'a>(
@@ -1160,6 +1244,110 @@ impl GpuPage {
     }
 }
 
+fn world_culled_commands_from_meta(pages: &[WorldPageMeta]) -> [WorldDrawList; WORLD_VIEWS] {
+    let mut order = Vec::new();
+    for (page_idx, page) in pages.iter().enumerate() {
+        if page.placements.is_empty() {
+            order.push((u64::MAX, page_idx, usize::MAX));
+        } else {
+            for (range_idx, range) in page.placements.iter().enumerate() {
+                order.push((range.order, page_idx, range_idx));
+            }
+        }
+    }
+    order.sort_unstable();
+    let build = |view: Pass| -> WorldDrawList {
+        let mut out: Vec<WorldDrawCmd> = Vec::new();
+        for &(_, page_idx, range_idx) in &order {
+            let page = &pages[page_idx];
+            if page.count == 0 {
+                continue;
+            }
+            if range_idx == usize::MAX {
+                out.push(WorldDrawCmd {
+                    page: page_idx,
+                    start: 0,
+                    end: page.count,
+                    min: page.page_min,
+                    max: page.page_max,
+                    has_sdr: page.page_has_sdr,
+                });
+                continue;
+            }
+            let range = &page.placements[range_idx];
+            if !allows_with_context(view, range.visibility, RenderContext::default()) {
+                continue;
+            }
+            let start = range.start.min(page.count);
+            let end = range.end.min(page.count);
+            if start >= end {
+                continue;
+            }
+            let bound = page.bounds[range_idx];
+            if let Some(previous) = out.last_mut() {
+                if previous.page == page_idx && previous.end == start {
+                    let min = [
+                        previous.min[0].min(bound.min[0]),
+                        previous.min[1].min(bound.min[1]),
+                        previous.min[2].min(bound.min[2]),
+                    ];
+                    let max = [
+                        previous.max[0].max(bound.max[0]),
+                        previous.max[1].max(bound.max[1]),
+                        previous.max[2].max(bound.max[2]),
+                    ];
+                    if max[0] - min[0] <= 128.0
+                        && max[1] - min[1] <= 128.0
+                        && max[2] - min[2] <= 128.0
+                    {
+                        previous.end = end;
+                        previous.min = min;
+                        previous.max = max;
+                        previous.has_sdr |= bound.has_sdr;
+                        continue;
+                    }
+                }
+            }
+            out.push(WorldDrawCmd {
+                page: page_idx,
+                start,
+                end,
+                min: bound.min,
+                max: bound.max,
+                has_sdr: bound.has_sdr,
+            });
+        }
+        let mut chunks = Vec::with_capacity(out.len().div_ceil(32));
+        for (i, group) in out.chunks(32).enumerate() {
+            let start = i * 32;
+            let end = start + group.len();
+            let mut min = group[0].min;
+            let mut max = group[0].max;
+            let mut has_sdr = group[0].has_sdr;
+            for cmd in &group[1..] {
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(cmd.min[axis]);
+                    max[axis] = max[axis].max(cmd.max[axis]);
+                }
+                has_sdr |= cmd.has_sdr;
+            }
+            chunks.push(WorldDrawChunk {
+                min,
+                max,
+                has_sdr,
+                start,
+                end,
+            });
+        }
+        WorldDrawList { cmds: out, chunks }
+    };
+    [
+        build(Pass::Main),
+        build(Pass::Reflection),
+        build(Pass::Refraction),
+    ]
+}
+
 #[cfg(test)]
 mod page_tests {
     use super::*;
@@ -1174,10 +1362,11 @@ mod page_tests {
     fn emitted_atlas_reuses_slots_without_pixels_or_mip_allocations() {
         let mut original = Builder::new();
         let texture = solid(71, 128);
-        let (slot, _) = allocate_slot(&mut original, "shared", &texture).unwrap();
+        let key = TextureKey::Content(71);
+        let (slot, _) = allocate_slot(&mut original, key, &texture).unwrap();
         let mut slots = HashMap::new();
         remember_atlas(&original, 3, &mut slots);
-        let reference = slots["shared"];
+        let reference = slots[&key];
         assert_eq!(reference.source, 3);
         assert_eq!(reference.height, 128);
         assert_eq!(reference.slot.x, slot.x);
@@ -1205,6 +1394,24 @@ mod page_tests {
         );
     }
     #[test]
+    fn integer_blit_preserves_center_nearest_texture_sampling() {
+        let texture = crate::objects::Texture {
+            width: 3,
+            height: 2,
+            rgba: (0u8..24).collect(),
+        };
+        let mut page = Builder::new();
+        let (slot, _) = allocate_slot(&mut page, TextureKey::Content(7), &texture).unwrap();
+        for (x, y) in [(0, 0), (1, 1), (63, 17), (127, 127)] {
+            let expected = texture.sample_rgba(
+                (x as f32 + 0.5) / slot.w as f32,
+                (y as f32 + 0.5) / slot.h as f32,
+            );
+            let offset = ((slot.y + y) * SIDE + slot.x + x) * 4;
+            assert_eq!(&page.atlas[offset..offset + 4], &expected);
+        }
+    }
+    #[test]
     fn content_dedup_reduces_page_turns() {
         // 512x512 textures occupy 16 atlas cells each; a 4096^2 page holds
         // 1024 cells = 64 of them. Push 128 references through both keying
@@ -1218,7 +1425,7 @@ mod page_tests {
         for i in 0..128 {
             let tex = &textures[i % 64];
             let (_slot, turned) =
-                allocate_slot(&mut page, &format!("h{:016x}", i % 64), tex).unwrap();
+                allocate_slot(&mut page, TextureKey::Content((i % 64) as u64), tex).unwrap();
             if turned.is_some() {
                 dedup_turns += 1;
             }
@@ -1234,7 +1441,8 @@ mod page_tests {
         let extra = solid(200, 512);
         for i in 0..65 {
             let tex = if i < 64 { &textures[i] } else { &extra };
-            let (_slot, turned) = allocate_slot(&mut page, &format!("name{i}"), tex).unwrap();
+            let (_slot, turned) =
+                allocate_slot(&mut page, TextureKey::Content(1000 + i as u64), tex).unwrap();
             if turned.is_some() {
                 unique_turns += 1;
             }
@@ -1247,8 +1455,8 @@ mod page_tests {
         let mut page = Builder::new();
         page.indices.push(0);
         let fallback = solid(160, 1);
-        for name in ["<missing-client-texture>"; 3] {
-            let (_slot, turned) = allocate_slot(&mut page, name, &fallback).unwrap();
+        for _ in 0..3 {
+            let (_slot, turned) = allocate_slot(&mut page, TextureKey::Missing, &fallback).unwrap();
             assert!(turned.is_none());
         }
         assert_eq!(page.slots.len(), 1);
@@ -1273,6 +1481,10 @@ mod page_tests {
             used_height: 256,
             mips: Vec::new(),
             placements: Vec::new(),
+            bounds: Vec::new(),
+            page_min: [f32::INFINITY; 3],
+            page_max: [f32::NEG_INFINITY; 3],
+            page_has_sdr: false,
         }
         .finish();
         assert_eq!(page.mips.len(), 7);

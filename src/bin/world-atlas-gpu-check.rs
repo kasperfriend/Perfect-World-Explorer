@@ -19,6 +19,8 @@ mod texture_atlas;
 mod texture_resolution;
 #[path = "../world_objects.rs"]
 mod world_objects;
+#[path = "../world_page_cache.rs"]
+mod world_page_cache;
 mod gpu {
     #[repr(C)]
     #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -64,6 +66,10 @@ fn page(right: bool, shared: bool) -> Page {
         processed: 1,
         used_height: 128,
         mips: Vec::new(),
+        bounds: Vec::new(),
+        page_min: [f32::INFINITY; 3],
+        page_max: [f32::NEG_INFINITY; 3],
+        page_has_sdr: false,
         placements: vec![world_objects::PlacementRange {
             start: 0,
             end: 3,
