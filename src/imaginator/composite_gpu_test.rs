@@ -104,6 +104,24 @@ fn the_composite_changes_a_frame_on_a_real_device() {
 
     let settings = settings();
     let mut composite = Composite::new(&device, format);
+    // `render` refuses to run without grown scene buffers, and it is right to:
+    // a trace with no geometry is a sky-only image. Give it one triangle so the
+    // buffers exist and the traced channels below are the only thing that varies.
+    let scene = std::sync::Arc::new(super::bvh::Scene {
+        bvh: Some(super::bvh::Bvh::build(vec![super::bvh::Triangle {
+            a: super::math::v3(-10., 0., 2.),
+            b: super::math::v3(10., 0., 2.),
+            c: super::math::v3(0., 10., 2.),
+            normal: super::math::v3(0., 0., -1.),
+            material: 0,
+        }])),
+        materials: vec![super::bvh::Material::new(
+            super::math::v3(0.6, 0.6, 0.6),
+            0.1,
+        )],
+        stats: Default::default(),
+    });
+    composite.sync_scene(&device, &queue, &scene);
 
     // A trace that says every pixel is fully shadowed, with a little traced
     // colour so the additive term is exercised too.
