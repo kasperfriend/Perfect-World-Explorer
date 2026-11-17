@@ -402,14 +402,22 @@ fn allocate_slot(
         slot = page.packing.allocate(tex.width, tex.height, 0, false);
     }
     let s = slot.ok_or("scenery texture exceeds atlas capacity")?;
-    for py in 0..s.h {
-        for px in 0..s.w {
-            let sample = tex.sample_rgba(
-                (px as f32 + 0.5) / s.w as f32,
-                (py as f32 + 0.5) / s.h as f32,
-            );
-            let dst = ((s.y + py) * SIDE + s.x + px) * 4;
-            page.atlas[dst..dst + 4].copy_from_slice(&sample);
+    if tex.width as usize == s.w && tex.height as usize == s.h && tex.rgba.len() == s.w * s.h * 4 {
+        for py in 0..s.h {
+            let src = py * s.w * 4;
+            let dst = ((s.y + py) * SIDE + s.x) * 4;
+            page.atlas[dst..dst + s.w * 4].copy_from_slice(&tex.rgba[src..src + s.w * 4]);
+        }
+    } else {
+        for py in 0..s.h {
+            for px in 0..s.w {
+                let sample = tex.sample_rgba(
+                    (px as f32 + 0.5) / s.w as f32,
+                    (py as f32 + 0.5) / s.h as f32,
+                );
+                let dst = ((s.y + py) * SIDE + s.x + px) * 4;
+                page.atlas[dst..dst + 4].copy_from_slice(&sample);
+            }
         }
     }
     page.used_height = page.used_height.max(s.y + s.h);
