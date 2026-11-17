@@ -406,7 +406,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-run: |
+        run: |
           New-Item -ItemType Directory -Force -Path "Modules\Imaginator\imaginator" | Out-Null
           $out = "Modules\Imaginator\imaginator\dxr_trace.cso"
           $logFile = "dxc-output.txt"
@@ -448,7 +448,10 @@ run: |
         if: always()
         with:
           name: dxc-diagnostics
-          path: dxc-errors.txt
+          path: |
+            dxc-errors.txt
+            dxc-output.txt
+            dxc-stderr.txt
           if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
