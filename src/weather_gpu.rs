@@ -264,23 +264,23 @@ fn fogged(color: vec3<f32>, depth: f32) -> vec3<f32> {
     if alpha < 0.003 { discard; }
     return vec4<f32>(fogged(tex.rgb * i.color, i.view_depth), alpha);
 }
-// Depth-only coverage, drawn right after the colour pass into the same depth
-// buffer. Rain and snow never wrote depth, so the shared motion-vector pass
-// reprojected every flake as whatever lay behind it -- the far plane when the
-// fall was against the sky, which makes precipitation swing with the whole
-// parallax of the sky on a fast translation.
+// Object motion, drawn right after the colour pass into the object-motion
+// attachment -- never depth. Rain and snow are the nearest things in the scene,
+// so writing their depth would depth-reject the water surface, the player and the
+// add-ons drawn afterwards and punch a hole the size of a flake in each of them.
 //
-// A flake belongs to the pixel only where its own alpha dominates it, so the
-// threshold is the same effective alpha the colour pass blends (0.52 for rain,
-// 0.82 for snow). A thin streak keeps the background's motion, which is what it
-// looks like; a flake core carries its own distance. What remains uncorrected is
-// the particle's *own* velocity: this depth buffer can only reproduce camera
-// motion, so a falling flake is reprojected as if it stood still and its
-// interpolation smears along the fall line -- which is the streak direction.
+// A flake owns the pixel only where its own alpha dominates it, so the threshold
+// is the same effective alpha the colour pass blends (0.52 for rain, 0.82 for
+// snow). The vector is the complete motion -- camera and fall together -- because
+// the depth-based pass cannot see a particle at all.
 @fragment fn cover(i: Out) -> @location(0) vec4<f32> {
     if abs(p.clip.y) > 0.5 && (i.world_y - p.clip.x) * p.clip.y < 0.0 { discard; }
     let tex = textureSample(images, smp, i.uv, i32(i.kind));
     if tex.a * select(0.52, 0.82, i.kind == 1u) < 0.5 { discard; }
+    // A discontinuous camera frame publishes no vector: the depth is still owed
+    // (the fragment keeps its depth write), but the vector would describe a view
+    // the motion-vector pass has just been told to forget.
+    if p.timing.w > 0.5 { return vec4<f32>(0.0); }
     // Object motion, in render pixels with y down: `current + mv = previous`.
     // Same convention the motion-vector pass writes, so the two are
     // interchangeable per pixel.
@@ -362,9 +362,10 @@ fn weather_images(element: &Path) -> [image::RgbaImage; 2] {
 
 pub struct WeatherGpu {
     pipeline: wgpu::RenderPipeline,
-    /// Depth-only twin of `pipeline`: same particles, same effective-alpha test,
-    /// depth written and colour masked off.
-    cover_pipeline: wgpu::RenderPipeline,
+    /// Motion twin of `pipeline`: same particles, same effective-alpha and depth
+    /// tests, writing a motion vector into the object-motion attachment instead of
+    /// colour, and never writing depth.
+    motion_pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
     uniform: wgpu::Buffer,
     _texture: wgpu::Texture,
@@ -579,10 +580,16 @@ impl WeatherGpu {
             multisample: Default::default(),
             multiview: None,
         });
-        // The same particles again, writing depth and nothing else, so the
-        // motion-vector pass sees a flake instead of the far plane behind it.
-        let cover_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("world weather particle coverage"),
+        // The same particles again, into the object-motion attachment.
+        //
+        // Deliberately **no depth write**: a flake is the nearest thing in the
+        // scene, so recording its depth would depth-reject everything drawn
+        // afterwards — the water surface, the player, the models' add-ons — and
+        // leave a hole the size of a raindrop in all of them. Alpha-blended
+        // precipitation does not occlude anything; it needs a *motion vector*, not
+        // a surface, and the attachment is how it gets one.
+        let motion_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("world weather particle motion"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &module,
@@ -607,7 +614,9 @@ impl WeatherGpu {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
+                // Test, never write: a flake behind a wall must not claim the
+                // pixel, and a flake in front of one must not hide it.
+                depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::GreaterEqual,
                 stencil: Default::default(),
                 bias: Default::default(),
@@ -617,7 +626,7 @@ impl WeatherGpu {
         });
         Self {
             pipeline,
-            cover_pipeline,
+            motion_pipeline,
             bind,
             uniform,
             _texture: texture,
@@ -666,8 +675,19 @@ impl WeatherGpu {
         clip: [f32; 4],
         selection: WeatherSelection,
         coverage: bool,
+        // The camera moved discontinuously. The coverage pass still owes the depth
+        // buffer a surface, but it must not publish a motion vector: the vector
+        // would be built against the pre-cut camera, and the motion-vector pass is
+        // being told to forget exactly that history this frame.
+        reset_history: bool,
     ) {
         if !selection.rain && !selection.snow {
+            // Nothing was drawn, so the cached previous frame would be older than
+            // one frame when the particles come back. Dropping it makes the first
+            // frame after the gap carry a zero own motion instead of a stale one.
+            if coverage {
+                self.prev_view = None;
+            }
             return;
         }
         let (s, c) = yaw.sin_cos();
@@ -707,7 +727,7 @@ impl WeatherGpu {
                 if coverage { self.last_dt } else { 0. },
                 if coverage { render_size.0 as f32 } else { 0. },
                 if coverage { render_size.1 as f32 } else { 0. },
-                0.,
+                if reset_history { 1. } else { 0. },
             ],
             prev_camera: [prev_camera.x, prev_camera.y, prev_camera.z, 1.],
             prev_right: [prev_right.x, prev_right.y, prev_right.z, 0.],
@@ -749,11 +769,11 @@ impl WeatherGpu {
         if !coverage {
             return;
         }
-        // Depth-only coverage: the uniform and bind group still hold this
-        // view's particles, so the twin pass rasterises exactly the geometry
-        // the colour pass just blended.
+        // The motion pass: the uniform and bind group still hold this view's
+        // particles, so the twin rasterises exactly the geometry the colour pass
+        // just blended, and writes each particle's own previous position.
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("world precipitation coverage"),
+            label: Some("world precipitation motion"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: object_mv,
                 resolve_target: None,
@@ -773,7 +793,7 @@ impl WeatherGpu {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        pass.set_pipeline(&self.cover_pipeline);
+        pass.set_pipeline(&self.motion_pipeline);
         pass.set_bind_group(0, &self.bind, &[]);
         pass.draw(0..6, 0..480);
     }

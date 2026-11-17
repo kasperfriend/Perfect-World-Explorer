@@ -3039,6 +3039,11 @@ impl Renderer {
         camera: &Camera,
         w: u32,
         h: u32,
+        // The camera moved discontinuously: every temporal consumer is told to
+        // forget its history this frame, and the object-motion producers have to
+        // obey the same cut or they hand the motion-vector pass a vector built
+        // against a view that no longer exists.
+        reset_history: bool,
     ) {
         // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
         // the same block walk the client runs before the level rule.
@@ -3253,6 +3258,7 @@ impl Renderer {
             normal.clip,
             main_weather,
             true,
+            reset_history,
         );
         self.water.copy_scene_to_refraction(&mut e);
         self.water.copy_depth(&mut e, &self.depth);
@@ -3559,6 +3565,7 @@ impl Renderer {
                     // The refraction view's depth feeds the water, not the
                     // motion vectors.
                     false,
+                    false,
                 );
                 // Ornamental EC models enter refraction only from underwater;
                 // the host player follows its own AABB gate in either view.
@@ -3684,6 +3691,7 @@ impl Renderer {
                 reflected.clip,
                 selected_weather,
                 // The mirror's depth feeds the water, not the motion vectors.
+                false,
                 false,
             );
             let model_view = self.water.reflection_raw();
@@ -4334,6 +4342,9 @@ pub fn run(
     let mut latency_fail_reason: Option<String> = None;
     let mut surface: Option<wgpu::Surface<'static>> = Some(surface);
     let mut last_fsr_camera_pos = camera.pos;
+    // The direction the previous frame was rendered with, for the discontinuity
+    // test below. `direction()` is unit length by construction.
+    let mut last_fsr_camera_dir = camera.direction();
     // Settings the sticky failure flags are keyed to (see below).
     let mut applied_upscaling = settings.upscaling;
     let mut applied_frame_gen = settings.frame_generation;
@@ -5133,8 +5144,19 @@ pub fn run(
                             }
                         }
                     }
-                    // Any discontinuous camera move invalidates the upscaler history.
-                    let camera_jumped = camera.pos.distance_squared(last_fsr_camera_pos) > 64.0 * 64.0;
+                    // Any discontinuous camera move invalidates the upscaler
+                    // history. Position alone is not enough: a respawn that keeps
+                    // the position, a look-behind snap or a cut that turns the
+                    // view most of the way round reprojects every pixel to the
+                    // wrong place, and the history takes many frames to wash out.
+                    //
+                    // Thirty degrees in one frame is far past anything a hand
+                    // produces — a 1000 deg/s flick is 16 deg at 60 Hz — and well
+                    // under the turn of a cut, so the threshold separates them
+                    // without resetting on ordinary fast play.
+                    let turned = last_fsr_camera_dir.dot(camera.direction()) < 0.866_025_4;
+                    let camera_jumped = camera.pos.distance_squared(last_fsr_camera_pos) > 64.0 * 64.0
+                        || turned;
                     if camera_jumped {
                         if let Some(fsr) = fsr_upscaler.as_mut() {
                             fsr.reset_history();
@@ -5147,6 +5169,7 @@ pub fn run(
                         }
                     }
                     last_fsr_camera_pos = camera.pos;
+                    last_fsr_camera_dir = camera.direction();
                     if settings != saved_settings && last_settings_save.elapsed().as_secs_f32() >= 1. {
                         if let Err(e)=settings.save(){eprintln!("Settings save: {e}");} else {saved_settings=settings.clone();}
                         last_settings_save=Instant::now();
@@ -5589,6 +5612,7 @@ pub fn run(
                                 &camera,
                                 world_extent.0,
                                 world_extent.1,
+                                camera_jumped,
                             );
                             if let Some(fsr) = fsr_upscaler.as_mut() {
                                 match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {
@@ -6597,6 +6621,7 @@ pub fn preview(
         &cam,
         width,
         height,
+        false,
     );
     if std::env::var_os("PW_PREVIEW_MINIMAP").is_some() {
         let d = depth(&renderer.device, width, height);

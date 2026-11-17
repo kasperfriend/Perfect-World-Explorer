@@ -1145,6 +1145,14 @@ DLSS-G parameter type.
   coplanar with the surface it is painted on — the depth buffer already holds that
   surface's depth at those pixels, so its motion vector is already the right one.
   Only content that stands *in front of* the surface behind it loses its motion.
+- **Precipitation writes no depth, on purpose.** An earlier revision of this fix
+  gave the flakes a place in the depth buffer as well. That is wrong for the
+  nearest content in the scene: a depth write depth-rejects everything drawn
+  afterwards, so a raindrop in front of the water surface, the player or an
+  add-on punched a hole the size of the drop in each of them. Alpha-blended
+  precipitation does not occlude anything; it needs a motion vector, not a surface,
+  and the attachment below is where it gets one. The pass still depth-*tests*, so a
+  flake behind a wall claims nothing.
 - **Object motion: the attachment.** Depth cannot express a *moving* surface —
   it carries no identity — so the motion-vector pass takes a second producer.
   `weather_gpu`'s coverage pass now renders into `object_mv`, an `Rgba16Float`
@@ -1202,3 +1210,41 @@ DLSS-G parameter type.
   lavapipe. A hardware run still has to show: the smear gone at speed with frame
   generation on, no new shimmer along the coverage edge, and whether the residual
   own-motion ghosting of precipitation is objectionable.
+
+## B-26 — An effect sheet's coverage depth occludes whatever is drawn after it
+
+- **Step:** frame generation or any upscaler on, with an animated effect root whose
+  sheets sit between the camera and something drawn later — the water surface, the
+  player model, an add-on.
+- **Symptom:** a hole the shape of the sheet in the surface behind it. A torch
+  flame in front of a lake erases the water under the flame; a glow in front of the
+  host player erases the part of the body it covers.
+- **Cause.** B-25's coverage pass for `gfx_effect_gpu` writes each sheet's depth
+  into the scene depth buffer at the end of the receiving-model pass, so the
+  motion-vector pass can reconstruct the sheet's motion. Everything the renderer
+  draws *afterwards* depth-tests against that buffer, and a sheet nearer than the
+  water or the player rejects them.
+- **Why it was not simply dropped.** Without the depth write the sheet has no
+  motion vector again — the pre-B-25 ghosting — because the depth-based pass can
+  only see a surface that is in the depth buffer.
+- **The fix, when it lands.** Sheets are static in world space, so their vector is
+  a pure camera reprojection of their own interpolated world position, which the
+  effect shader already has. Publishing that through the `object_mv` attachment —
+  the same mechanism precipitation now uses — needs no depth write at all: the pass
+  targets the attachment, depth-tests but does not write, and the sheet stops
+  occluding anything. It is deferred rather than half-done because it needs the
+  frame's *previous* view-projection in the effect pass, which the effect module
+  does not receive today: it would have to be carried through
+  `world_models_gpu::update_pass` into `gfx_effect_gpu::update`, cached in the
+  renderer for the main view only (the mirror and refraction views rewrite the same
+  uniform), and added to the effect `Params` block. That is a coordinated change
+  across three files plus a new pass in `draw_models`, so it is recorded here with
+  the plan rather than attempted blind.
+- **Severity.** Bounded by the size of a sheet: the quads are small next to the
+  water and the player, and the artifact only appears where a sheet overlaps
+  something drawn later. It is visible on a still frame if you look, which is why
+  it is a blocker entry and not a note.
+- **Verification, when fixed.** The effect module's device test grows a case that
+  renders a sheet into a target with a depth attachment and asserts the depth is
+  untouched while the motion attachment carries a non-zero vector; a hardware run
+  shows a torch in front of water with no hole in it.
