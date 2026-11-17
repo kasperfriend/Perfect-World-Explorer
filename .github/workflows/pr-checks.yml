@@ -443,6 +443,9 @@ jobs:
       - name: Test Windows audio decoding with synthetic fixtures
         shell: bash
         run: |
+          # GitHub's bash shell enables errexit and pipefail; disable errexit so
+          # the command status and focused diagnostics below are preserved.
+          set +e
           CARGO_TERM_COLOR=never cargo test --locked --target x86_64-pc-windows-msvc --bin audio-corpus-check -- --nocapture 2>&1 | tee /tmp/win-audio-test.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
