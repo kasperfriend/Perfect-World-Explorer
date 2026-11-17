@@ -502,6 +502,7 @@ impl DlssFrameGeneration {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         depth: &wgpu::Texture,
+        object_mv: &wgpu::TextureView,
         unjittered_vp: &Mat4,
         reset: bool,
         lens: crate::fsr::CameraLens,
@@ -554,6 +555,10 @@ impl DlssFrameGeneration {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: self.mv_pass.params_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(object_mv),
                 },
             ],
         });

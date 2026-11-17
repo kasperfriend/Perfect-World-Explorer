@@ -21,6 +21,10 @@ use wgpu::util::DeviceExt;
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Params {
     matrix: [[f32; 4]; 4],
+    /// The frame's view-projection one step earlier, for the object-motion output.
+    prev_matrix: [[f32; 4]; 4],
+    /// This frame's unjittered view-projection: vectors carry no jitter.
+    mv_matrix: [[f32; 4]; 4],
     camera: [f32; 4],
     right: [f32; 4],
     up: [f32; 4],
@@ -35,6 +39,16 @@ struct Params {
     /// `[rain speed, rain speed variation, snow speed, snow speed variation]`
     /// from the same objects' `Speed`/`SpeedVariation` stores.
     motion: [f32; 4],
+    /// `[seconds since the previous main-view frame, render width, render
+    /// height, 0]`. The particle's fall is analytic in the clock, so the previous
+    /// position needs only the elapsed time; the extents convert NDC to pixels.
+    timing: [f32; 4],
+    /// The previous main-view frame's camera position and basis. Particles live in
+    /// a camera-relative volume, so their world position moves with the camera even
+    /// when the particle itself does not.
+    prev_camera: [f32; 4],
+    prev_right: [f32; 4],
+    prev_forward: [f32; 4],
 }
 
 /// The two uniform lanes the shader reads, built from the objects' stores.
@@ -107,10 +121,22 @@ fn pack_water_masks(areas: &[crate::water::WaterArea]) -> (Vec<WaterAreaGpu>, Ve
 
 const SHADER: &str = r#"
 struct Params {
-    matrix: mat4x4<f32>, camera: vec4<f32>, right: vec4<f32>, up: vec4<f32>,
+    matrix: mat4x4<f32>,
+    // The same frame one step earlier: the particle's own fall is analytic in
+    // the clock, so the previous position comes from evaluating the same
+    // expression with the previous camera basis and `timing.x` seconds less.
+    prev_matrix: mat4x4<f32>,
+    // The current frame's *unjittered* view-projection. The rendered position uses
+    // `matrix`, which carries the upscaler's sub-pixel jitter, but a motion vector
+    // must not: the vector describes where the surface was, not where this frame
+    // happened to sample it.
+    mv_matrix: mat4x4<f32>,
+    camera: vec4<f32>, right: vec4<f32>, up: vec4<f32>,
     forward: vec4<f32>, fog_range: vec4<f32>, fog_color: vec4<f32>,
     clip: vec4<f32>, clock_weather: vec4<f32>,
     particle: vec4<f32>, motion: vec4<f32>,
+    timing: vec4<f32>,
+    prev_camera: vec4<f32>, prev_right: vec4<f32>, prev_forward: vec4<f32>,
 };
 struct WaterArea { bounds: vec4<f32>, data: vec4<u32> };
 @group(0) @binding(0) var<uniform> p: Params;
@@ -125,6 +151,10 @@ struct Out {
     @location(2) @interpolate(flat) kind: u32,
     @location(3) view_depth: f32,
     @location(4) world_y: f32,
+    // Current and previous clip positions of this corner, for the object-motion
+    // output. Interpolated, so the vector is per pixel rather than per corner.
+    @location(5) cur_clip: vec4<f32>,
+    @location(6) prev_clip: vec4<f32>,
 };
 fn hash(n: f32) -> f32 { return fract(sin(n * 127.1 + 311.7) * 43758.5453); }
 fn camera_in_mapped_water(camera: vec3<f32>) -> bool {
@@ -194,8 +224,23 @@ fn camera_in_mapped_water(camera: vec3<f32>) -> bool {
     let vertical = select(vec3<f32>(0.0, corner.y * half_height, 0.0), p.up.xyz * (corner.y * half_height), snow);
     let world = center + p.right.xyz * (corner.x * half_width) + vertical;
     let clip = p.matrix * vec4<f32>(world, 1.0);
+    // Previous position: the particle keeps its identity (seed, x, z, speed), so
+    // only the clock and the camera basis differ. A flake whose phase wraps
+    // between the two frames would otherwise carry a 110 unit jump, so the wrap
+    // is dropped for that one frame instead of being smeared across the screen.
+    var fall_prev = 55.0 - fract(phase + (seconds - p.timing.x) * speed) * 110.0;
+    if abs(fall - fall_prev) > 55.0 { fall_prev = fall; }
+    let prev_center = p.prev_camera.xyz + p.prev_right.xyz * x + p.prev_forward.xyz * z
+        + vec3<f32>(0.0, fall_prev, 0.0);
+    let prev_up = cross(p.prev_right.xyz, p.prev_forward.xyz);
+    let prev_vertical = select(vec3<f32>(0.0, corner.y * half_height, 0.0),
+                               prev_up * (corner.y * half_height), snow);
+    let prev_world = prev_center + p.prev_right.xyz * (corner.x * half_width) + prev_vertical;
+    let prev_clip = p.prev_matrix * vec4<f32>(prev_world, 1.0);
     var o: Out;
     o.position = select(clip, vec4<f32>(2.0, 2.0, 2.0, 1.0), !visible);
+    o.cur_clip = p.mv_matrix * vec4<f32>(world, 1.0);
+    o.prev_clip = select(prev_clip, vec4<f32>(2.0, 2.0, 2.0, 1.0), !visible);
     o.uv = uv;
     o.color = select(vec3<f32>(0.66, 0.78, 0.91), vec3<f32>(0.91, 0.95, 1.0), snow);
     o.kind = kind;
@@ -236,7 +281,15 @@ fn fogged(color: vec3<f32>, depth: f32) -> vec3<f32> {
     if abs(p.clip.y) > 0.5 && (i.world_y - p.clip.x) * p.clip.y < 0.0 { discard; }
     let tex = textureSample(images, smp, i.uv, i32(i.kind));
     if tex.a * select(0.52, 0.82, i.kind == 1u) < 0.5 { discard; }
-    return vec4<f32>(0.0);
+    // Object motion, in render pixels with y down: `current + mv = previous`.
+    // Same convention the motion-vector pass writes, so the two are
+    // interchangeable per pixel.
+    let cur_w = select(i.cur_clip.w, 1.0, abs(i.cur_clip.w) < 1e-5);
+    let prev_w = select(i.prev_clip.w, 1.0, abs(i.prev_clip.w) < 1e-5);
+    let cur = i.cur_clip.xy / cur_w;
+    let prev = i.prev_clip.xy / prev_w;
+    let mv = vec2<f32>(prev.x - cur.x, cur.y - prev.y) * 0.5 * p.timing.yz;
+    return vec4<f32>(mv, 1.0, 0.0);
 }
 "#;
 
@@ -321,6 +374,13 @@ pub struct WeatherGpu {
     water_area_count: u32,
     clock: WeatherClock,
     ticks: u32,
+    /// Seconds of the last `advance`, so the shader can re-evaluate a particle one
+    /// step earlier.
+    last_dt: f32,
+    /// The previous main-view frame's `(matrix, camera, right, forward)`. Only the
+    /// main view advances it: the refraction and mirror passes reuse the same
+    /// uniform buffer, and their matrices describe different views.
+    prev_view: Option<(Mat4, Vec3, Vec3, Vec3)>,
 }
 impl WeatherGpu {
     pub fn new(
@@ -533,9 +593,11 @@ impl WeatherGpu {
                 module: &module,
                 entry_point: "cover",
                 targets: &[Some(wgpu::ColorTargetState {
-                    format,
+                    // The coverage pass renders into the object-motion attachment,
+                    // not into the scene: `rg` the vector, `a` the coverage flag.
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: None,
-                    write_mask: wgpu::ColorWrites::empty(),
+                    write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
             primitive: wgpu::PrimitiveState {
@@ -565,11 +627,14 @@ impl WeatherGpu {
             water_area_count: water_areas.len().min(u32::MAX as usize) as u32,
             clock: WeatherClock::default(),
             ticks: 0,
+            last_dt: 0.,
+            prev_view: None,
         }
     }
 
     /// Advance the native fixed-step weather clock exactly once per world frame.
     pub fn advance(&mut self, delta_ms: u32) {
+        self.last_dt = (delta_ms as f32 / 1000.).max(0.);
         self.ticks = self.ticks.wrapping_add(self.clock.advance(delta_ms));
     }
 
@@ -579,11 +644,18 @@ impl WeatherGpu {
     /// terrain collision remain outstanding.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
-        &self,
+        &mut self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
+        /// Where the coverage pass records each particle's own motion vector, for
+        /// the shared motion-vector pass. Unused when `coverage` is false.
+        object_mv: &wgpu::TextureView,
+        /// Render extent, for the NDC-to-pixel conversion of those vectors.
+        render_size: (u32, u32),
+        /// The main view's *unjittered* view-projection, for the same vectors.
+        unjittered_vp: Mat4,
         matrix: Mat4,
         camera: Vec3,
         yaw: f32,
@@ -602,8 +674,15 @@ impl WeatherGpu {
         let forward = Vec3::new(s * cp, sp, -c * cp);
         let up = right.cross(forward).normalize_or_zero();
         let lanes = profile_lanes(RAIN, SNOW, SNOW_SPEED_SCALE);
+        // The previous frame this shader can re-evaluate. Before the first
+        // main-view frame the current one stands in, which yields a zero own
+        // motion rather than a jump.
+        let (prev_matrix, prev_camera, prev_right, prev_forward) =
+            self.prev_view.unwrap_or((unjittered_vp, camera, right, forward));
         let params = Params {
             matrix: matrix.to_cols_array_2d(),
+            prev_matrix: prev_matrix.to_cols_array_2d(),
+            mv_matrix: unjittered_vp.to_cols_array_2d(),
             camera: [camera.x, camera.y, camera.z, 1.],
             right: [right.x, right.y, right.z, 0.],
             up: [up.x, up.y, up.z, 0.],
@@ -619,8 +698,26 @@ impl WeatherGpu {
             ],
             particle: lanes.0,
             motion: lanes.1,
+            // A non-main view never has its vectors read, and a zero step plus a
+            // zero extent keep the arithmetic finite if one ever is.
+            timing: [
+                if coverage { self.last_dt } else { 0. },
+                if coverage { render_size.0 as f32 } else { 0. },
+                if coverage { render_size.1 as f32 } else { 0. },
+                0.,
+            ],
+            prev_camera: [prev_camera.x, prev_camera.y, prev_camera.z, 1.],
+            prev_right: [prev_right.x, prev_right.y, prev_right.z, 0.],
+            prev_forward: [prev_forward.x, prev_forward.y, prev_forward.z, 0.],
         };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&params));
+        if coverage {
+            // Only the main view advances the history: the refraction and mirror
+            // passes reuse this uniform for their own matrices, and a frame that
+            // took its previous state from one of those would reproject every
+            // particle through the wrong camera.
+            self.prev_view = Some((unjittered_vp, camera, right, forward));
+        }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("regional world-space precipitation"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -655,7 +752,7 @@ impl WeatherGpu {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("world precipitation coverage"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
+                view: object_mv,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Load,
@@ -700,6 +797,18 @@ mod tests {
             SHADER.matches("< 0.5 { discard; }").count(),
             1,
             "coverage threshold is the half-alpha rule"
+        );
+        // The coverage pass is also the object-motion producer: `rg` the vector,
+        // `a` the coverage flag the motion-vector pass tests.
+        assert_eq!(
+            SHADER.matches("return vec4<f32>(mv, 1.0, 0.0);").count(),
+            1,
+            "coverage must publish the particle's own motion"
+        );
+        assert_eq!(
+            SHADER.matches("p.mv_matrix * vec4<f32>(world, 1.0)").count(),
+            1,
+            "the vector must come from the unjittered matrix, not the rendered one"
         );
     }
 

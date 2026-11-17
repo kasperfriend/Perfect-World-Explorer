@@ -1006,6 +1006,7 @@ impl XessFrameGeneration {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         depth: &wgpu::Texture,
+        object_mv: &wgpu::TextureView,
         view: &Mat4,
         projection: &Mat4,
         unjittered_vp: &Mat4,
@@ -1064,6 +1065,10 @@ impl XessFrameGeneration {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: self.mv_pass.params_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(object_mv),
                 },
             ],
         });

@@ -1544,6 +1544,7 @@ impl FsrUpscaler {
         queue: &wgpu::Queue,
         color: &wgpu::Texture,
         depth: &wgpu::Texture,
+        object_mv: &wgpu::TextureView,
         unjittered_vp: &Mat4,
         lens: crate::fsr::CameraLens,
         sharpness: f32,
@@ -1619,6 +1620,10 @@ impl FsrUpscaler {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: self.mv_pass.params_buffer().as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(object_mv),
                 },
             ],
         });

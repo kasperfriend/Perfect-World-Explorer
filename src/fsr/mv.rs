@@ -1,7 +1,21 @@
-//! The shared depth-reprojection motion-vector pass. Used by the FSR
-//! upscaler and by the FSR frame-generation pipeline; the two FFX dispatches
-//! consume the same Rg16Float motion vectors and R32_FLOAT raw reversed-Z
-//! depth this pass emits.
+//! The shared motion-vector pass. Every consumer — the FSR upscaler, the FSR
+//! frame-generation pipeline, and the DLSS and XeSS equivalents on both paths —
+//! runs this one shader and hands the vendor the same Rg16Float vectors and
+//! R32_FLOAT raw reversed-Z depth it emits.
+//!
+//! **Camera motion comes from the depth buffer; object motion comes from an
+//! attachment.** The bulk of the pass reconstructs each pixel's world position
+//! from depth and reprojects it with the previous view-projection, which is exact
+//! for everything that stands still in the world. Content that moves *on its own*
+//! cannot be recovered that way — depth carries no identity — so the passes that
+//! draw such content rasterise it a second time into `object_mv`, an
+//! `Rgba16Float` target at render extent where `xy` is the pixel-space motion
+//! vector and `z` is a coverage flag (`> 0.5` means "this pixel is mine"). Those
+//! writes are authoritative: where the flag is set the pass takes the vector it
+//! was handed, otherwise it keeps the depth reprojection. Precipitation is the
+//! one producer today (`weather_gpu`), because its particles are analytic in the
+//! clock and therefore have an exact previous position; see `docs/blockers.md`
+//! B-25 for why model-attached sheets do not need a producer of their own.
 
 use glam::Mat4;
 use wgpu::TextureFormat;
@@ -43,6 +57,9 @@ struct MvParams {
 };
 @group(0) @binding(0) var depth: texture_depth_2d;
 @group(0) @binding(1) var<uniform> params: MvParams;
+// `xy` pixel-space motion (current + mv = previous), `z` coverage. Written by
+// the passes that know an object's own motion; zero everywhere else.
+@group(0) @binding(2) var object_mv: texture_2d<f32>;
 struct VOut { @builtin(position) pos: vec4<f32> };
 @vertex fn vs(@builtin(vertex_index) id: u32) -> VOut {
     var o: VOut;
@@ -80,6 +97,13 @@ struct FOut {
                 out.mv = (prev_uv - uv) * size;
             }
         }
+    }
+    // Content that moves on its own overrides the reprojection: the pass that
+    // drew it knew both the current and the previous position, which the depth
+    // buffer cannot express.
+    let object = textureLoad(object_mv, clamped, 0);
+    if (object.z > 0.5) {
+        out.mv = object.xy;
     }
     return out;
 }
@@ -201,6 +225,17 @@ impl FsrMotionVectorPass {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        // `textureLoad` only, so it never needs to be filterable.
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -252,5 +287,36 @@ impl FsrMotionVectorPass {
             layout,
             params,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MV_SHADER;
+
+    /// The pass has two producers: the depth reprojection it computes itself, and
+    /// the object-motion attachment a pass that knows an object's own motion
+    /// writes. The attachment wins where its coverage flag is set — otherwise a
+    /// falling particle would be reprojected as if it stood still, which is the
+    /// failure this binding exists to remove.
+    #[test]
+    fn the_attachment_overrides_the_reprojection_where_it_is_flagged() {
+        assert_eq!(
+            MV_SHADER.matches("textureLoad(object_mv, clamped, 0)").count(),
+            1,
+            "the pass must read the object-motion attachment"
+        );
+        assert_eq!(
+            MV_SHADER.matches("object.z > 0.5").count(),
+            1,
+            "the coverage flag decides who owns the pixel"
+        );
+        // The override has to happen after the reprojection so it replaces it.
+        let reproject = MV_SHADER.find("out.mv = (prev_uv - uv) * size").unwrap();
+        let override_at = MV_SHADER.find("out.mv = object.xy").unwrap();
+        assert!(
+            override_at > reproject,
+            "the attachment must override the reprojected vector, not be overwritten by it"
+        );
     }
 }

@@ -1383,7 +1383,45 @@ struct Renderer {
     index: wgpu::Buffer,
     count: u32,
     depth: wgpu::Texture,
+    /// Object-motion attachment for the shared motion-vector pass: `rg` pixel
+    /// motion, `a` coverage, `b` spare, at render extent. Cleared every frame and
+    /// written only by the passes that know an object's own motion
+    /// (`weather_gpu`); see `src/fsr/mv.rs`. The view is cached because the six
+    /// consumer call sites need one per frame.
+    /// Kept alive for the view below; nothing reads the texture directly.
+    #[allow(dead_code)]
+    object_mv: wgpu::Texture,
+    object_mv_view: wgpu::TextureView,
     center: (isize, isize),
+}
+
+/// The object-motion attachment: `Rgba16Float` at the render extent.
+///
+/// `xy` is a pixel-space motion vector (`current + mv = previous`), `z` a
+/// coverage flag. `Rgba16Float` rather than `Rg16Float` because the flag needs a
+/// channel of its own and zero is a legal vector — the consumer must be able to
+/// tell "no producer wrote this pixel" from "the producer says it did not move".
+fn object_mv_target(
+    device: &wgpu::Device,
+    w: u32,
+    h: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("object motion vectors"),
+        size: wgpu::Extent3d {
+            width: w.max(1),
+            height: h.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
 }
 pub(crate) fn depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
@@ -1489,6 +1527,9 @@ pub fn ten_class_placements(t: &Terrain) -> Vec<crate::scenery_visibility::Place
 /// intermediates stay at the full window size and are resized separately.
 fn resize_world_targets(renderer: &mut Renderer, w: u32, h: u32) {
     renderer.depth = depth(&renderer.device, w, h);
+    let (object_mv, object_mv_view) = object_mv_target(&renderer.device, w, h);
+    renderer.object_mv = object_mv;
+    renderer.object_mv_view = object_mv_view;
     // Sky keeps its dummy depth — sampling the real depth in the same
     // pass that writes it is a feedback hazard.
     renderer.water.resize(&renderer.device, w, h);
@@ -1907,6 +1948,7 @@ impl Renderer {
             Some(&terrain_gpu.grass_light_layout),
         );
         let d = depth_tex;
+        let (object_mv, object_mv_view) = object_mv_target(&device, w, h);
         let post = crate::post_gpu::PostGpu::new(&device, format, w, h);
         let local_pages = m
             .local_pages
@@ -2042,6 +2084,8 @@ impl Renderer {
             index,
             count,
             depth: d,
+            object_mv,
+            object_mv_view,
             center: m.center,
             lod: m.lod,
             spans: m.spans,
@@ -3117,7 +3161,32 @@ impl Renderer {
         let refraction = self.water.refraction();
         let scene_color = self.water.scene();
         let scene_depth = self.depth.create_view(&Default::default());
+        // The main view's unjittered view-projection. `matrix` carries the
+        // upscaler's sub-pixel jitter, and a motion vector must not: it describes
+        // where the surface was, not where this frame sampled it. Same expression
+        // the caller derives its own `unjittered_vp` from, so the vectors agree
+        // with the ones the reprojection pass writes.
+        let unjittered_vp = camera.matrix(w, h, camera.far);
         let mut e = self.device.create_command_encoder(&Default::default());
+        // The object-motion attachment is cleared here, before any pass that may
+        // write it, so a frame with no producer still hands the motion-vector
+        // pass a zeroed surface instead of the previous frame's vectors.
+        {
+            let _ = e.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("object motion clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.object_mv_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
         self.draw_opaque(
             &mut e,
             "main scene",
@@ -3174,6 +3243,12 @@ impl Renderer {
             &mut e,
             &scene_color,
             &scene_depth,
+            // Main view only: this depth is what the motion-vector pass and the
+            // upscalers read, and this pass also records each particle's own
+            // motion in the object-motion attachment.
+            &self.object_mv_view,
+            (w, h),
+            unjittered_vp,
             matrix,
             camera.pos,
             camera.yaw,
@@ -3181,8 +3256,6 @@ impl Renderer {
             camera.active_fog(),
             normal.clip,
             main_weather,
-            // Main view only: this depth is what the motion-vector pass and the
-            // upscalers read.
             true,
         );
         self.water.copy_scene_to_refraction(&mut e);
@@ -3477,6 +3550,9 @@ impl Renderer {
                     &mut re,
                     &refraction,
                     &reflect_depth,
+                    &self.object_mv_view,
+                    (w, h),
+                    unjittered_vp,
                     matrix,
                     camera.pos,
                     camera.yaw,
@@ -3601,6 +3677,9 @@ impl Renderer {
                 &mut e,
                 &reflection,
                 &reflect_depth,
+                &self.object_mv_view,
+                (w, h),
+                unjittered_vp,
                 matrix * flip,
                 camera.pos,
                 camera.yaw,
@@ -5516,7 +5595,7 @@ pub fn run(
                                 world_extent.1,
                             );
                             if let Some(fsr) = fsr_upscaler.as_mut() {
-                                match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {
+                                match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {
                                     Ok(()) => fsr.composite(&renderer.device, &renderer.queue, scene_view),
                                     Err(error) => {
                                         crate::fsr::diag(&format!("FSR failed, rendering at native resolution instead: {error}"));
@@ -5527,7 +5606,7 @@ pub fn run(
                                     }
                                 }
                             } else if let Some(xess) = xess_upscaler.as_mut() {
-                                match xess.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &unjittered_vp) {
+                                match xess.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp) {
                                     Ok(()) => xess.composite(&renderer.device, &renderer.queue, scene_view, settings.xess_sharpness),
                                     Err(error) => {
                                         crate::xess::diag(&format!("XeSS failed, rendering at native resolution instead: {error}"));
@@ -5538,7 +5617,7 @@ pub fn run(
                                     }
                                 }
                             } else if let Some(dlss) = dlss_upscaler.as_mut() {
-                                match dlss.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &unjittered_vp) {
+                                match dlss.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp) {
                                     Ok(()) => {
                                         // A frame that evaluated proves the feature
                                         // works, so the transient-failure budget is
@@ -5594,6 +5673,7 @@ pub fn run(
                                     &renderer.device,
                                     &renderer.queue,
                                     &renderer.depth,
+                                    &renderer.object_mv_view,
                                     &unjittered_vp,
                                     frame_time_ms,
                                     camera_jumped,
@@ -5624,6 +5704,7 @@ pub fn run(
                                     &renderer.device,
                                     &renderer.queue,
                                     &renderer.depth,
+                                    &renderer.object_mv_view,
                                     &unjittered_vp,
                                     camera_jumped,
                                     camera.lens(),
@@ -5653,6 +5734,7 @@ pub fn run(
                                     &renderer.device,
                                     &renderer.queue,
                                     &renderer.depth,
+                                    &renderer.object_mv_view,
                                     &view,
                                     &projection,
                                     &unjittered_vp,

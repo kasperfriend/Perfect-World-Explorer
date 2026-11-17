@@ -1145,14 +1145,48 @@ DLSS-G parameter type.
   coplanar with the surface it is painted on — the depth buffer already holds that
   surface's depth at those pixels, so its motion vector is already the right one.
   Only content that stands *in front of* the surface behind it loses its motion.
-- **What it does not fix.** The depth-based motion pass can only reproduce
-  **camera** motion, so content that also moves in world space is reprojected as
-  if it stood still: falling rain and snow smear along their fall line in the
-  interpolated frame, and animated effect sheets that translate (not just UV
-  scroll) ghost by their own motion. That residual is much smaller than the
-  parallax error it replaces — the smear follows the streak direction for rain,
-  and short dot trails for snow read as motion blur — and fixing it properly means
-  a second, per-object motion-vector writer, which this pass does not have.
+- **Object motion: the attachment.** Depth cannot express a *moving* surface —
+  it carries no identity — so the motion-vector pass takes a second producer.
+  `weather_gpu`'s coverage pass now renders into `object_mv`, an `Rgba16Float`
+  target at render extent (`xy` = the pixel-space vector, `z` = a coverage flag),
+  and `src/fsr/mv.rs` substitutes those vectors where the flag is set. All six
+  consumers of the pass (FSR, DLSS and XeSS, on both the upscaler and the
+  frame-generation paths) take the same attachment, cleared once per frame by the
+  renderer. Precipitation is exact there rather than approximated: a particle's
+  position is a pure function of the clock (`center = camera + right*x +
+  forward*z + (0, fall, 0)`, `fall = 55 - fract(phase + seconds*speed) * 110`), so
+  re-evaluating it with `seconds - dt` and the previous camera basis gives its
+  true previous position. Two details that matter: the vector is built from the
+  **unjittered** view-projection, because a vector must describe where the surface
+  *was*, not where this frame sampled it; and a particle whose phase wraps between
+  the two frames has its own-motion term dropped for that one frame instead of
+  carrying a 110-unit jump across the screen.
+- **Audit: what every alpha renderer needs** — the criterion is whether the pixel
+  stands in front of a *distant* surface (parallax error) or is essentially
+  coplanar with the surface behind it (its depth already gives the right vector):
+
+  | renderer | depth write | verdict |
+  |---|---|---|
+  | clouds (`cloud_gpu`) | no | **covered** — stands in front of terrain/sky |
+  | effect sheets (`gfx_effect_gpu`) | no | **covered** — stands in front of walls |
+  | precipitation (`weather_gpu`) | no | **covered + object motion** |
+  | decals (`gfx_decal_gpu`), shore band (`shore_gpu`), baked SDR blend (`gpu.rs`), alpha model meshes (`model_receiver_gpu`) | no | nothing to do — coplanar with, or a hair behind, the surface the depth buffer already holds at that pixel |
+  | water surface, complex path (`water_gpu`) | **yes** | already has depth, so already has vectors |
+  | water surface, alternate path (`simple_water_gpu`) | no | **open** — see below |
+  | sky (`sky_gpu`) | no | nothing to do — it *is* the far plane |
+  | reflection/refraction depth | — | not an input to any motion vector |
+
+- **What remains.** Two things. (1) *Attached* content — effect sheets, alpha model
+  meshes — still carries camera-only motion, so a sheet hanging off a moving
+  monster ghost at the monster's own speed. That is deliberately not "fixed" here:
+  the model it is attached to is reprojected the same way, so the two agree, and
+  giving the sheet its own vector while the model keeps a camera-only one would
+  make the sheet slide against the body it is attached to. The real fix is
+  per-object motion for *models*, which is a renderer-wide feature (rigid
+  transforms now, skinned vertices later), not an effect fix. (2) The alternate
+  water surface writes no depth; giving it coverage would also make it occlude the
+  submerged half of a player model drawn afterwards, so it needs a hardware
+  comparison rather than a blind change.
 - **Ordering note.** Coverage runs immediately after each class's colour pass, so
   a coverage write can depth-reject content blended *later* in the same frame
   (a big glow sheet in front of the clouds can now stop the cloud behind it). In
