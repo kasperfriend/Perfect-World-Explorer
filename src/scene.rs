@@ -197,13 +197,17 @@ fn string(b: &[u8], p: &mut usize) -> Result<String, String> {
     if bad {
         return Err("invalid GBK scene string".into());
     }
-    Ok(s.replace('\\', "/"))
+    Ok(if s.contains('\\') {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    })
 }
 fn vec3(b: &[u8], p: usize) -> Result<[f32; 3], String> {
     Ok([f32at(b, p)?, f32at(b, p + 4)?, f32at(b, p + 8)?])
 }
 fn refs(b: &[u8], p: &mut usize, n: usize) -> Result<Vec<Reference>, String> {
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(n.min(4096));
     for _ in 0..n {
         out.push(Reference {
             export_id: u32at(b, *p)?,
@@ -252,7 +256,7 @@ impl Scene {
         {
             return Err("invalid ECWLD block offsets".into());
         }
-        let mut boundaries = std::collections::HashMap::new();
+        let mut boundaries = std::collections::HashMap::with_capacity(offsets.len());
         for i in 0..count {
             boundaries.insert(
                 order[i],
@@ -298,7 +302,7 @@ impl Scene {
             ));
         }
         let mut blocks = Vec::with_capacity(count);
-        let mut coords = HashSet::new();
+        let mut coords = HashSet::with_capacity(offsets.len());
         for off in offsets {
             let end = boundaries[&off];
             let data = &b[off..end];
