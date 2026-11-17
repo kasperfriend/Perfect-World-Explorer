@@ -492,7 +492,15 @@ jobs:
             throw 'The artifact must contain only the Perfect World Explorer top-level folder.'
           }
           $package = Join-Path $uploaded 'Perfect World Explorer'
-          foreach ($relative in @('Perfect-World-Explorer.exe', 'Modules/Walker/module.ini', 'SHA256SUMS.txt')) {
+          foreach ($relative in @(
+            'Perfect-World-Explorer.exe',
+            'dstorage.dll',
+            'dstoragecore.dll',
+            'DirectStorage/LICENSE.txt',
+            'DirectStorage/NOTICES.txt',
+            'Modules/Walker/module.ini',
+            'SHA256SUMS.txt'
+          )) {
             if (-not (Test-Path -LiteralPath (Join-Path $package $relative) -PathType Leaf)) {
               throw "Uploaded artifact is missing: $relative"
             }

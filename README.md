@@ -160,11 +160,12 @@ expected header, x64 runtime files and both package license files, then extracts
 the whole package under `sdk/DirectStorage/`. The build automatically uses that
 pinned directory; `DIRECTSTORAGE_SDK_DIR` only overrides it. The extracted
 package is intentionally not ignored so its contents can be included in a
-checkout/PR if the package's licenses have been reviewed. Preserve
-`LICENSE.txt`, `LICENSE-CODE.txt` and `NOTICES.txt` when redistributing applicable
-package contents. The Windows portable packager includes the x64 runtime beside
-the EXE, with license/notices, when both DLLs are available in the SDK; otherwise
-it warns and stages a viewer that uses standard file I/O. If no SDK is present,
+checkout/PR if the package's licenses have been reviewed. This repository
+includes the official preview 2 x64 runtime DLLs under `native/bin/x64/`;
+preserve `LICENSE.txt`, `LICENSE-CODE.txt` and `NOTICES.txt` when redistributing
+applicable package contents. The Windows portable packager includes the x64
+runtime beside the EXE, with license/notices, when both DLLs are available in
+the SDK; otherwise it warns and stages a viewer that uses standard file I/O. If no SDK is present,
 the build omits the bridge; if the runtime DLLs are absent or a request fails,
 normal file I/O remains the fallback.
 
