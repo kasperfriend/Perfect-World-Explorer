@@ -157,10 +157,17 @@ impl Default for StaticGrid {
 }
 impl StaticGrid {
     pub fn update(&mut self, lights: &SceneLights, center: [f32; 3]) {
+        // The cheap tests come first: the retail rule is a move of one 12-unit
+        // cell in X or Z, and comparing the captured corpus is a record-by-record
+        // comparison of every light on the map. Flying fast crosses a cell nearly
+        // every frame, so the old order paid that whole comparison — and then
+        // rebuilt anyway — on each of those frames. The corpus test only has to
+        // answer "did the map change under a camera that did not", which cannot
+        // matter while the camera is moving.
         if self.initialized
-            && self.static_records == lights.lights
             && (center[0] - self.center[0]).abs() < 12.
             && (center[2] - self.center[2]).abs() < 12.
+            && self.static_records == lights.lights
         {
             return;
         }

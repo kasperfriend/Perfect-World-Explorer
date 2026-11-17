@@ -169,6 +169,37 @@ fn minimap_matrix(x: f32, z: f32, range: f32) -> Mat4 {
     Mat4::orthographic_rh(range, -range, -range, range, 20000., 1.)
         * Mat4::look_to_rh(eye, Vec3::NEG_Y, Vec3::Z)
 }
+/// Everything the top-down minimap's pixels can depend on.
+///
+/// `minimap_matrix` builds the orthographic window from the camera's ground
+/// position and the range alone, so the camera's *height* is deliberately not
+/// part of this key: climbing used to re-render the whole top-down scene once per
+/// frame for an image that could not have changed. The range is part of it
+/// because it is in the matrix — without it, dragging the minimap-range slider
+/// left the map showing the previous window until the camera moved a whole unit.
+/// The preload state and the page count are in it because the pages are what the
+/// map draws: a page that arrives is a page the map has not shown yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MinimapKey {
+    /// Ground position the orthographic window is centred on, in whole units.
+    block: [i32; 2],
+    /// Half-width of that window, as bits: the matrix reads it.
+    range: u32,
+    world_done: bool,
+    pages: usize,
+}
+
+impl MinimapKey {
+    fn new(x: f32, z: f32, range: f32, world_done: bool, pages: usize) -> Self {
+        Self {
+            block: [x.round() as i32, z.round() as i32],
+            range: range.to_bits(),
+            world_done,
+            pages,
+        }
+    }
+}
+
 /// Keep the world-map point under the cursor fixed when its image is scaled.
 fn anchored_zoom_offset(offset: egui::Vec2, cursor_in_image: egui::Vec2, ratio: f32) -> egui::Vec2 {
     (offset + cursor_in_image * (ratio - 1.)).max(egui::Vec2::ZERO)
@@ -328,14 +359,20 @@ struct FrameBudget {
     frames: u32,
     since: Option<Instant>,
     worst_ms: f64,
+    /// World renders submitted since the last report: the main view, the water's
+    /// mirror and refraction per visible plane, and the top-down map. A frame
+    /// that renders the world five times is bound on the GPU in a way no CPU
+    /// timing shows, so the line carries this count next to the milliseconds.
+    passes: u64,
 }
 
 impl FrameBudget {
-    fn add(&mut self, stage_ms: [f64; STAGE_COUNT]) {
+    fn add(&mut self, stage_ms: [f64; STAGE_COUNT], passes: u32) {
         for (total, ms) in self.stage_ms.iter_mut().zip(stage_ms) {
             *total += ms;
         }
         self.frames += 1;
+        self.passes += u64::from(passes);
         self.worst_ms = self.worst_ms.max(stage_ms.iter().sum::<f64>());
     }
 
@@ -360,16 +397,18 @@ impl FrameBudget {
             }
             crate::diag!(
                 TimingFrame,
-                "CPU frame {:.2} ms average, {:.2} ms worst, {:.1} frames/s, {pages} world pages{}",
+                "CPU frame {:.2} ms average, {:.2} ms worst, {:.1} frames/s, {:.1} world renders/frame, {pages} world pages{}",
                 self.stage_ms.iter().sum::<f64>() / self.frames as f64,
                 self.worst_ms,
                 self.frames as f64 / elapsed,
+                self.passes as f64 / self.frames as f64,
                 stages
             );
         }
         self.stage_ms = [0.; STAGE_COUNT];
         self.frames = 0;
         self.worst_ms = 0.;
+        self.passes = 0;
         self.since = Some(Instant::now());
     }
 }
@@ -1651,6 +1690,9 @@ struct Renderer {
     frame: FrameSnapshot,
     /// This second's frame CPU samples, reported on the `TimingFrame` channel.
     frame_budget: FrameBudget,
+    /// World renders this frame will submit: the main view plus a mirror and a
+    /// refraction pass for every visible water plane.
+    scene_passes: u32,
     world_glow: crate::post_gpu::WorldGlow,
     celestial_visibility: crate::client_sun::Visibility,
     /// Raw `+0x80` disc-flag word from the default area, before the viewer's
@@ -2387,6 +2429,7 @@ impl Renderer {
             started: Instant::now(),
             frame: FrameSnapshot::default(),
             frame_budget: FrameBudget::default(),
+            scene_passes: 1,
             world_glow: crate::post_gpu::WorldGlow::default(),
             celestial_visibility: crate::client_sun::Visibility::default(),
             celestial_flags: 0x18,
@@ -3422,6 +3465,7 @@ impl Renderer {
             self.queue_main_runs();
         }
         self.frame_budget.note(STAGE_MINIMAP, started);
+        self.frame_budget.passes += 1;
     }
     /// Re-queues the main view's indirect terrain records for the next submit.
     /// Every pass drawn through the main matrix (`Main`, `Fog` and both
@@ -3488,6 +3532,7 @@ impl Renderer {
         // the `TimingFrame` channel; see `FrameBudget`.
         let mut stage_ms = [0f64; STAGE_COUNT];
         let mut lap_at = Instant::now();
+        self.scene_passes = 1;
         // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
         // the same block walk the client runs before the level rule.
         // Both buffers are reused: this runs for every view of every frame.
@@ -3705,8 +3750,20 @@ impl Renderer {
             true,
             reset_history,
         );
-        self.water.copy_scene_to_refraction(&mut e);
-        self.water.copy_depth(&mut e, &self.depth);
+        // Two full-resolution copies that only the water and the post chain can
+        // read, so neither runs when nothing reads it: the refraction copy feeds
+        // the per-plane refraction renders and the water surface's own sampling,
+        // and both of those exist only for a visible non-simple water plane. A
+        // land view — or any view with the water off screen — used to pay for a
+        // full-frame texture copy every frame. The depth copy is the post chain's
+        // input and only that (`sample_depth` is read by `PostGpu::render`
+        // alone), so it follows `use_post`.
+        if self.water_batches.iter().any(|b| !b.simple && b.visible(matrix)) {
+            self.water.copy_scene_to_refraction(&mut e);
+        }
+        if use_post {
+            self.water.copy_depth(&mut e, &self.depth);
+        }
         self.water.blit(&mut e, scene_target);
         self.queue.submit(Some(e.finish()));
         lap(STAGE_MAIN, &mut stage_ms, &mut lap_at);
@@ -3836,6 +3893,11 @@ impl Renderer {
             self.end_frame(stage_ms, lap_at);
             return;
         }
+        // One main pass, then a mirror and a refraction pass per non-simple plane
+        // below. Nothing here is duplicated work to remove — a mirror is a mirror
+        // — but the count is what decides how much world the frame rasterises, so
+        // it goes into the `TimingFrame` line rather than staying invisible.
+        self.scene_passes = 1 + 2 * visible.iter().filter(|b| !b.simple).count() as u32;
         let mut simple_encoder: Option<wgpu::CommandEncoder> = None;
         for (batch_idx, batch) in visible.iter().enumerate() {
             if batch.simple {
@@ -4231,7 +4293,8 @@ impl Renderer {
     fn end_frame(&mut self, mut stage_ms: [f64; STAGE_COUNT], lap_at: Instant) {
         stage_ms[STAGE_REST] += lap_at.elapsed().as_secs_f64() * 1000.;
         let pages = self.world_pages.len();
-        self.frame_budget.add(stage_ms);
+        let passes = self.scene_passes;
+        self.frame_budget.add(stage_ms, passes);
         self.frame_budget.report(pages);
     }
 }
@@ -5038,7 +5101,7 @@ pub fn run(
     let mut last_settings_save = Instant::now();
     let mut last = Instant::now();
     let mut region_tick_ms = renderer.started.elapsed().as_millis() as u64;
-    let mut last_minimap_key: Option<([i32; 3], bool, usize)> = None;
+    let mut last_minimap_key: Option<MinimapKey> = None;
     event_loop
         .run(move |event, target| match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => {
@@ -6328,14 +6391,12 @@ pub fn run(
                             // overhead pass is skipped rather than rendered and
                             // hidden.
                             if settings.show_minimap && settings.minimap_style==MapStyle::Realistic {
-                              let minimap_key = (
-                                 [
-                                 camera.pos.x.round() as i32,
-                                 camera.pos.y.round() as i32,
-                                 camera.pos.z.round() as i32,
-                                 ],
-                              renderer.world_done,
-                              renderer.world_pages.len(),
+                              let minimap_key = MinimapKey::new(
+                                  camera.pos.x,
+                                  camera.pos.z,
+                                  settings.minimap_range,
+                                  renderer.world_done,
+                                  renderer.world_pages.len(),
                               );
                               if last_minimap_key != Some(minimap_key) {
                                   renderer.render_minimap(&map_view,&map_depth,&camera,settings.minimap_range,false);
@@ -7649,15 +7710,42 @@ mod frame_budget_tests {
     #[test]
     fn a_second_of_frames_averages_per_stage_and_then_starts_over() {
         let mut budget = FrameBudget::default();
-        budget.add(sample(1., 3.));
-        budget.add(sample(1., 5.));
+        budget.add(sample(1., 3.), 1);
+        budget.add(sample(1., 5.), 3);
         assert_eq!(budget.frames, 2);
+        assert_eq!(budget.passes, 4);
         assert_eq!(budget.worst_ms, 6.);
         budget.since = Some(Instant::now() - Duration::from_secs(2));
         budget.report(0);
         assert_eq!(budget.frames, 0, "a reported second is not counted twice");
         assert_eq!(budget.stage_ms, [0.; STAGE_COUNT]);
         assert_eq!(budget.worst_ms, 0.);
+        assert_eq!(budget.passes, 0, "the renders per frame start over too");
+    }
+
+    /// The minimap's key is the whole reason a top-down pass runs at all, so it
+    /// has to name exactly what the image depends on. The map matrix is built from
+    /// the ground position and the range, so height must not be in the key (a
+    /// climbing camera used to re-render the world once per frame for nothing) and
+    /// the range must be (dragging the slider used to leave the old window on
+    /// screen until the camera moved a whole unit).
+    #[test]
+    fn the_minimap_key_names_what_the_top_down_image_depends_on() {
+        let base = MinimapKey::new(10., -20., 256., false, 7);
+        // The key is built from a ground position, so a camera a kilometre up
+        // makes the same key as one on the floor: height has no way in.
+        assert_eq!(
+            base,
+            MinimapKey::new(10., -20., 256., false, 7),
+            "the same ground position is the same map, whatever the height"
+        );
+        // A different ground position, a different range, a page that arrived or
+        // the preload finishing are all new pixels.
+        assert_ne!(base, MinimapKey::new(11., -20., 256., false, 7));
+        assert_ne!(base, MinimapKey::new(10., -19., 256., false, 7));
+        assert_ne!(base, MinimapKey::new(10., -20., 300., false, 7));
+        assert_ne!(base, MinimapKey::new(10., -20., 256., true, 7));
+        assert_ne!(base, MinimapKey::new(10., -20., 256., false, 8));
     }
 
     #[test]
