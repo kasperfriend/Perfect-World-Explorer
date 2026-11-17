@@ -156,8 +156,11 @@ void cs(uint3 id : SV_DispatchThreadID)
     uint samples = max(p.config.z, 1u);
     uint seed = pcg(id.x * 1973u + id.y * 9277u + p.config.y * 26699u);
 
-    float reflection = 0.0;
-    float indirect = 0.0;
+    // Both are collected as colour, not as a luminance: the composite adds them
+    // to the frame as light, and collapsing them to one grey channel is what made
+    // every traced surface tint flat.
+    float3 reflection = float3(0.0, 0.0, 0.0);
+    float3 indirect = float3(0.0, 0.0, 0.0);
     float visibility = 0.0;
     float distance = 0.0;
     float hits = 0.0;
@@ -206,7 +209,7 @@ void cs(uint3 id : SV_DispatchThreadID)
                 Hit h = closest(origin, dir);
                 if (!h.hit)
                 {
-                    indirect += dot(weight * sky(dir.y), float3(0.3333, 0.3333, 0.3333));
+                    indirect += weight * sky(dir.y);
                     break;
                 }
                 float3 bp = origin + dir * h.t;
@@ -219,7 +222,7 @@ void cs(uint3 id : SV_DispatchThreadID)
                     bv = sun_visibility(bp, bn, seed);
                 }
                 float3 incoming = p.sun_color.rgb * (bl * bv) + sky(bn.y);
-                indirect += dot(weight * incoming, float3(0.3333, 0.3333, 0.3333));
+                indirect += weight * incoming;
                 weight *= material_of(h.primitive).rgb;
                 if (max(weight.r, max(weight.g, weight.b)) < 0.02) { break; }
                 origin = bp + bn * 0.02;
@@ -260,15 +263,25 @@ void cs(uint3 id : SV_DispatchThreadID)
                     mirror = normalize(in_dir + hn * (2.0 * c));
                     origin = hp + hn * 0.02;
                 }
-                reflection += dot(gathered, float3(0.3333, 0.3333, 0.3333));
+                reflection += gathered;
             }
         }
     }
 
+    // The composite's channel contract, byte for byte the same as the CPU
+    // tracer's `Tracer::pack`:
+    //
+    //   rgb = reflected + interreflected radiance, in colour
+    //   a   = traced sun visibility, and *negative* when the primary ray escaped
+    //         so the raster sky is left exactly as the core drew it
+    //
+    // This used to write (reflection, indirect, visibility, distance): the
+    // composite then read the hit *distance* as sun visibility (so everything was
+    // clamped to fully lit and nothing ever darkened) and added two luminance
+    // channels as if they were red and green. The dispatch ran, the pixels came
+    // back, and the picture was wrong in a way no status line could show.
     float inv = 1.0 / float(samples);
-    out_tex[int2(id.xy)] = float4(
-        reflection * inv,
-        indirect * inv,
-        hits > 0.0 ? visibility * inv : 0.0,
-        hits > 0.0 ? distance * inv : -1.0);
+    float mean_visibility = hits > 0.0 ? visibility * inv : 0.0;
+    float3 radiance = (reflection + indirect * mean_visibility) * inv;
+    out_tex[int2(id.xy)] = float4(radiance, hits > 0.0 ? mean_visibility : -1.0);
 }

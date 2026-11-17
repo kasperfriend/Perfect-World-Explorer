@@ -110,7 +110,10 @@ EXTERNS=(
     --extern bytemuck="$WORK/libbytemuck.rlib"
     -L "$CACHE" -L "$WORK"
 )
-WINDOWS=(--cfg windows --allow explicit_builtin_cfgs_in_flags)
+# `imaginator_offline` marks this harness: it supplies stub `wgpu`/D3D12 crates,
+# so tests that need a real device (the composite's end-to-end test) are compiled
+# out here and run by the ordinary `cargo test` CI job instead.
+WINDOWS=(--cfg windows --cfg imaginator_offline --allow explicit_builtin_cfgs_in_flags)
 
 mode="${1:-all}"
 
@@ -130,5 +133,5 @@ if [ "$mode" = all ] || [ "$mode" = module ]; then
         "$REPO/tools/imaginator-check/module_root.rs" > "$WORK/module_root.rs"
     "$RUSTC" "${CFLAGS[@]}" --edition 2021 --test "${WINDOWS[@]}" \
         "${EXTERNS[@]}" -o "$WORK/module.bin" "$WORK/module_root.rs"
-    "$WORK/module.bin"
+    "$WORK/module.bin" ${TEST_ARGS:-}
 fi

@@ -742,6 +742,68 @@ pub unsafe fn create_trace_root_signature(device: *mut c_void) -> Result<*mut c_
 ///
 /// # Safety
 /// `device` must be live and `blob`/`length` a serialised signature.
+// ---------------------------------------------------------------------------
+// COM vtable slots
+// ---------------------------------------------------------------------------
+//
+// Every one of these is a raw pointer offset into a COM object's vtable, so a
+// wrong number silently calls a *different* method: a mistyped `Dispatch` slot
+// can `ResolveSubresource` instead. There is no way for the type system to
+// notice, and the offline harness cannot notice either, because it stubs D3D12
+// out entirely. So each number below is recorded with the count that produces it
+// and pinned by the `const` assertions further down.
+//
+// The prefix shared by every interface here is IUnknown (3: QueryInterface,
+// AddRef, Release) then ID3D12Object (4: GetPrivateData, SetPrivateData,
+// SetPrivateDataInterface, SetName). `ID3D12Pageable` adds nothing at all.
+//
+// Verified twice against independent sources that agree exactly:
+//   * `tools/imaginator-check/real/winapi-rs-0.3.9/src/um/d3d12.rs` (checked in)
+//   * the Microsoft `DirectX-Headers` `include/directx/d3d12.h` declaration order
+//
+// The earlier values in this file were off by one across the whole `ID3D12Device`
+// block (a `GetNodeCount` slot was never counted), which is why the pipeline
+// "built" while `CreateComputePipelineState` actually invoked
+// `CreateCommandList`, and why nothing was ever traced.
+
+const IUNKNOWN_AND_OBJECT: usize = 7;
+
+/// `ID3D12Device`. Own members in declaration order, from `GetNodeCount`.
+const DEVICE_GET_NODE_COUNT: usize = IUNKNOWN_AND_OBJECT + 0;
+const DEVICE_CREATE_COMPUTE_PIPELINE_STATE: usize = IUNKNOWN_AND_OBJECT + 4;
+const DEVICE_CREATE_COMMAND_LIST: usize = IUNKNOWN_AND_OBJECT + 5;
+const DEVICE_CREATE_DESCRIPTOR_HEAP: usize = IUNKNOWN_AND_OBJECT + 7;
+const DEVICE_GET_DESCRIPTOR_HANDLE_INCREMENT_SIZE: usize = IUNKNOWN_AND_OBJECT + 8;
+const DEVICE_CREATE_ROOT_SIGNATURE: usize = IUNKNOWN_AND_OBJECT + 9;
+const DEVICE_CREATE_CONSTANT_BUFFER_VIEW: usize = IUNKNOWN_AND_OBJECT + 10;
+pub const DEVICE_CREATE_SHADER_RESOURCE_VIEW: usize = IUNKNOWN_AND_OBJECT + 11;
+pub const DEVICE_CREATE_UNORDERED_ACCESS_VIEW: usize = IUNKNOWN_AND_OBJECT + 12;
+/// `CreateCommittedResource` (`GetResourceAllocationInfo` and
+/// `GetCustomHeapProperties` each have two C++ overloads but one vtable slot).
+const DEVICE_CREATE_COMMITTED_RESOURCE: usize = IUNKNOWN_AND_OBJECT + 20;
+
+/// `ID3D12Resource`, after `ID3D12Pageable` (which adds nothing).
+const RESOURCE_MAP: usize = IUNKNOWN_AND_OBJECT + 1;
+const RESOURCE_UNMAP: usize = IUNKNOWN_AND_OBJECT + 2;
+pub const RESOURCE_GET_GPU_VIRTUAL_ADDRESS: usize = IUNKNOWN_AND_OBJECT + 4;
+
+/// `ID3D12DescriptorHeap`: `GetDesc`, then the two handle starts.
+const HEAP_GET_CPU_HANDLE_START: usize = IUNKNOWN_AND_OBJECT + 2;
+const HEAP_GET_GPU_HANDLE_START: usize = IUNKNOWN_AND_OBJECT + 3;
+
+/// `ID3D12GraphicsCommandList`, after `ID3D12CommandList::GetType` (one slot).
+const GCL_PREFIX: usize = IUNKNOWN_AND_OBJECT + 2;
+const GCL_RESET: usize = GCL_PREFIX + 1;
+pub const GCL_DISPATCH: usize = GCL_PREFIX + 5;
+const GCL_COPY_TEXTURE_REGION: usize = GCL_PREFIX + 7;
+const GCL_RESOURCE_BARRIER: usize = GCL_PREFIX + 17;
+const GCL_SET_DESCRIPTOR_HEAPS: usize = GCL_PREFIX + 19;
+const GCL_SET_COMPUTE_ROOT_SIGNATURE: usize = GCL_PREFIX + 20;
+pub const GCL_SET_COMPUTE_ROOT_DESCRIPTOR_TABLE: usize = GCL_PREFIX + 22;
+pub const GCL_SET_COMPUTE_ROOT_CONSTANT_BUFFER_VIEW: usize = GCL_PREFIX + 28;
+const GCL_SET_COMPUTE_ROOT_SHADER_RESOURCE_VIEW: usize = GCL_PREFIX + 30;
+const GCL_SET_COMPUTE_ROOT_UNORDERED_ACCESS_VIEW: usize = GCL_PREFIX + 32;
+
 unsafe fn create_root_signature(
     device: *mut c_void,
     blob: *const c_void,
@@ -756,7 +818,7 @@ unsafe fn create_root_signature(
         usize,
         *const GUID,
         *mut *mut c_void,
-    ) -> HRESULT = std::mem::transmute(*vtable.add(17));
+    ) -> HRESULT = std::mem::transmute(*vtable.add(DEVICE_CREATE_ROOT_SIGNATURE));
     let Some(iid) = guid(IID_ID3D12ROOTSIGNATURE) else {
         return -1;
     };
@@ -789,7 +851,7 @@ pub unsafe fn create_compute_pipeline(
         *const D3D12_COMPUTE_PIPELINE_STATE_DESC,
         *const GUID,
         *mut *mut c_void,
-    ) -> HRESULT = std::mem::transmute(*vtable.add(12));
+    ) -> HRESULT = std::mem::transmute(*vtable.add(DEVICE_CREATE_COMPUTE_PIPELINE_STATE));
     let Some(iid) = guid(IID_ID3D12PIPELINESTATE) else {
         return Err("the PipelineState GUID literal is invalid".into());
     };
@@ -914,7 +976,7 @@ pub unsafe fn create_descriptor_heap(
         *const D3D12_DESCRIPTOR_HEAP_DESC,
         *const GUID,
         *mut *mut c_void,
-    ) -> HRESULT = std::mem::transmute(*vtable.add(15));
+    ) -> HRESULT = std::mem::transmute(*vtable.add(DEVICE_CREATE_DESCRIPTOR_HEAP));
     let Some(iid) = guid(IID_ID3D12DESCRIPTORHEAP) else {
         return Err("the DescriptorHeap GUID literal is invalid".into());
     };
@@ -945,9 +1007,9 @@ pub unsafe fn heap_handles(heap: *mut c_void) -> (usize, u64) {
     // GPU handle start 10.
     let vtable = *(heap as *mut *const usize);
     let get_cpu: unsafe extern "system" fn(*mut c_void) -> usize =
-        std::mem::transmute(*vtable.add(9));
+        std::mem::transmute(*vtable.add(HEAP_GET_CPU_HANDLE_START));
     let get_gpu: unsafe extern "system" fn(*mut c_void) -> u64 =
-        std::mem::transmute(*vtable.add(10));
+        std::mem::transmute(*vtable.add(HEAP_GET_GPU_HANDLE_START));
     (get_cpu(heap), get_gpu(heap))
 }
 
@@ -958,7 +1020,7 @@ pub unsafe fn heap_handles(heap: *mut c_void) -> (usize, u64) {
 pub unsafe fn descriptor_increment(device: *mut c_void) -> u32 {
     let vtable = *(device as *mut *const usize);
     let size: unsafe extern "system" fn(*mut c_void, u32) -> u32 =
-        std::mem::transmute(*vtable.add(16));
+        std::mem::transmute(*vtable.add(DEVICE_GET_DESCRIPTOR_HANDLE_INCREMENT_SIZE));
     size(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
 }
 
@@ -982,7 +1044,7 @@ pub unsafe fn write_constant_buffer_view(
         *mut c_void,
         *const D3D12_CONSTANT_BUFFER_VIEW_DESC,
         usize,
-    ) = std::mem::transmute(*vtable.add(18));
+    ) = std::mem::transmute(*vtable.add(DEVICE_CREATE_CONSTANT_BUFFER_VIEW));
     write(device, std::ptr::null_mut(), &desc, handle);
 }
 
@@ -1016,7 +1078,7 @@ pub unsafe fn write_buffer_srv(
         *mut c_void,
         *const D3D12_SHADER_RESOURCE_VIEW_DESC,
         usize,
-    ) = std::mem::transmute(*vtable.add(19));
+    ) = std::mem::transmute(*vtable.add(DEVICE_CREATE_SHADER_RESOURCE_VIEW));
     write(device, resource, &desc, handle);
 }
 
@@ -1049,7 +1111,7 @@ pub unsafe fn write_buffer_uav(
         *mut c_void,
         *const D3D12_UNORDERED_ACCESS_VIEW_DESC,
         usize,
-    ) = std::mem::transmute(*vtable.add(20));
+    ) = std::mem::transmute(*vtable.add(DEVICE_CREATE_UNORDERED_ACCESS_VIEW));
     write(device, resource, &desc, handle);
 }
 
@@ -1085,7 +1147,7 @@ pub fn offset_gpu_handle(
 pub unsafe fn gpu_virtual_address(resource: *mut c_void) -> u64 {
     let vtable = *(resource as *mut *const usize);
     let address: unsafe extern "system" fn(*mut c_void) -> u64 =
-        std::mem::transmute(*vtable.add(11));
+        std::mem::transmute(*vtable.add(RESOURCE_GET_GPU_VIRTUAL_ADDRESS));
     address(resource)
 }
 
@@ -1201,7 +1263,7 @@ pub unsafe fn map(resource: *mut c_void, read_range: *const c_void) -> Result<*m
         u32,
         *const c_void,
         *mut *mut c_void,
-    ) -> HRESULT = std::mem::transmute(*vtable.add(8));
+    ) -> HRESULT = std::mem::transmute(*vtable.add(RESOURCE_MAP));
     let mut pointer: *mut c_void = std::ptr::null_mut();
     let hr = map(resource, 0, read_range, &mut pointer);
     if hr < 0 || pointer.is_null() {
@@ -1215,7 +1277,7 @@ pub unsafe fn map(resource: *mut c_void, read_range: *const c_void) -> Result<*m
 pub unsafe fn unmap(resource: *mut c_void) {
     let vtable = *(resource as *mut *const usize);
     let unmap: unsafe extern "system" fn(*mut c_void, u32, *const c_void) =
-        std::mem::transmute(*vtable.add(9));
+        std::mem::transmute(*vtable.add(RESOURCE_UNMAP));
     unmap(resource, 0, std::ptr::null());
 }
 
@@ -1251,7 +1313,7 @@ pub unsafe fn write_tlas_srv(device: *mut c_void, address: u64, handle: usize) {
         *mut c_void,
         *const D3D12_TLAS_SRV_DESC,
         usize,
-    ) = std::mem::transmute(*vtable.add(19));
+    ) = std::mem::transmute(*vtable.add(DEVICE_CREATE_SHADER_RESOURCE_VIEW));
     write(device, std::ptr::null_mut(), &desc, handle);
 }
 
@@ -1271,13 +1333,72 @@ pub unsafe fn set_compute_root_descriptor_table(list: *mut c_void, root: u32, ba
     // signatures 24..25, then SetComputeRootDescriptorTable at 30.
     let vtable = *(list as *mut *const usize);
     let set: unsafe extern "system" fn(*mut c_void, u32, u64) =
-        std::mem::transmute(*vtable.add(30));
+        std::mem::transmute(*vtable.add(GCL_SET_COMPUTE_ROOT_DESCRIPTOR_TABLE));
     set(list, root, base);
+}
+
+/// `ID3D12GraphicsCommandList::SetComputeRootConstantBufferView`.
+///
+/// Root parameter 0 of the trace root signature is a root CBV (`b0`), not a
+/// descriptor table, so it is bound by GPU virtual address. Nothing called this:
+/// the shader's `Params` block was therefore never written at all, and every
+/// dispatch traced with whatever the driver left in the register — an eye at the
+/// origin, a zero `config`, a zero `screen`. That is why the hardware path could
+/// report Ready while no pixel ever changed.
+///
+/// # Safety
+/// `list` must be a live command list with a root signature set, and `address`
+/// must be the GPU virtual address of a buffer at least `PARAMS_BYTES` long.
+pub unsafe fn set_compute_root_constant_buffer_view(list: *mut c_void, root: u32, address: u64) {
+    // Counted on `ID3D12GraphicsCommandList`: IUnknown 0..2, ID3D12Object 3..6,
+    // ID3D12DeviceChild 7, Close 8, Reset 9, ClearState 10, the draw calls
+    // 11..12, Dispatch 13, the copies 14..18, the pipeline calls 19..20,
+    // ResourceBarrier 21, ExecuteBundle 22, SetDescriptorHeaps 23, the two root
+    // signatures 24..25, then the graphics root arguments 26..29 (CBV, two
+    // descriptor tables, 32-bit constants) and the compute ones 30..33.
+    // `SetComputeRootConstantBufferView` is 31.
+    let vtable = *(list as *mut *const usize);
+    let set: unsafe extern "system" fn(*mut c_void, u32, u64) =
+        std::mem::transmute(*vtable.add(GCL_SET_COMPUTE_ROOT_CONSTANT_BUFFER_VIEW));
+    set(list, root, address);
 }
 
 // ---------------------------------------------------------------------------
 // Compile-time slot assertions
 // ---------------------------------------------------------------------------
+
+// Absolute values, so an edit to any count above that moves a call off its real
+// method fails this build instead of failing on the user's machine.
+const _: () = assert!(DEVICE_GET_NODE_COUNT == 7);
+const _: () = assert!(DEVICE_CREATE_COMPUTE_PIPELINE_STATE == 11);
+const _: () = assert!(DEVICE_CREATE_COMMAND_LIST == 12);
+const _: () = assert!(DEVICE_CREATE_DESCRIPTOR_HEAP == 14);
+const _: () = assert!(DEVICE_GET_DESCRIPTOR_HANDLE_INCREMENT_SIZE == 15);
+const _: () = assert!(DEVICE_CREATE_ROOT_SIGNATURE == 16);
+const _: () = assert!(DEVICE_CREATE_CONSTANT_BUFFER_VIEW == 17);
+const _: () = assert!(DEVICE_CREATE_SHADER_RESOURCE_VIEW == 18);
+const _: () = assert!(DEVICE_CREATE_UNORDERED_ACCESS_VIEW == 19);
+const _: () = assert!(DEVICE_CREATE_COMMITTED_RESOURCE == 27);
+
+const _: () = assert!(RESOURCE_MAP == 8);
+const _: () = assert!(RESOURCE_UNMAP == 9);
+const _: () = assert!(RESOURCE_GET_GPU_VIRTUAL_ADDRESS == 11);
+
+// `heap_handles` below also reads these; ID3D12DescriptorHeap's own members are
+// GetDesc 8, GetCPUDescriptorHandleForHeapStart 9, GetGPU… 10.
+const _: () = assert!(HEAP_GET_CPU_HANDLE_START == 9);
+const _: () = assert!(HEAP_GET_GPU_HANDLE_START == 10);
+
+const _: () = assert!(GCL_RESET == 10);
+const _: () = assert!(GCL_DISPATCH == 14);
+const _: () = assert!(GCL_COPY_TEXTURE_REGION == 16);
+const _: () = assert!(GCL_RESOURCE_BARRIER == 26);
+const _: () = assert!(GCL_SET_DESCRIPTOR_HEAPS == 28);
+const _: () = assert!(GCL_SET_COMPUTE_ROOT_SIGNATURE == 29);
+const _: () = assert!(GCL_SET_COMPUTE_ROOT_DESCRIPTOR_TABLE == 31);
+const _: () = assert!(GCL_SET_COMPUTE_ROOT_CONSTANT_BUFFER_VIEW == 37);
+const _: () = assert!(GCL_SET_COMPUTE_ROOT_SHADER_RESOURCE_VIEW == 39);
+const _: () = assert!(GCL_SET_COMPUTE_ROOT_UNORDERED_ACCESS_VIEW == 41);
 
 const _: () = assert!(
     DEVICE5_PREBUILD_INFO_SLOT + 1 == DEVICE5_SLOTS,
@@ -1589,5 +1710,59 @@ mod tests {
         // `DispatchRays` is the last member the header declares, so the struct
         // has to end exactly there.
         assert_eq!(GCL4_SLOTS - 1, 76, "DispatchRays is slot 76 of 77");
+    }
+
+    /// The vtable constants must name the methods the code says they do.
+    ///
+    /// The offline harness stubs D3D12 out, so it cannot notice a wrong slot: the
+    /// stub returns `Ok` for whatever number it is handed. That is precisely how
+    /// `CreateComputePipelineState` shipped pointing at `CreateCommandList` and
+    /// `SetComputeRootDescriptorTable` at `SetGraphicsRootSignature` — on Windows
+    /// the pipeline "built" (it created a command list) and the trace never ran.
+    /// These assertions are the compile-time half; this test is the readable half
+    /// and spells out the full order for the next person.
+    #[test]
+    fn every_vtable_slot_names_the_documented_method() {
+        // ID3D12Device, from `GetNodeCount`: 8 CreateCommandQueue,
+        // 9 CreateCommandAllocator, 10 CreateGraphicsPipelineState,
+        // 11 CreateComputePipelineState, 12 CreateCommandList,
+        // 13 CheckFeatureSupport, 14 CreateDescriptorHeap,
+        // 15 GetDescriptorHandleIncrementSize, 16 CreateRootSignature,
+        // 17 CreateConstantBufferView, 18 CreateShaderResourceView,
+        // 19 CreateUnorderedAccessView … 27 CreateCommittedResource.
+        assert_eq!(DEVICE_GET_NODE_COUNT, 7);
+        assert_eq!(DEVICE_CREATE_COMPUTE_PIPELINE_STATE, 11);
+        assert_eq!(DEVICE_CREATE_COMMAND_LIST, 12);
+        assert_eq!(DEVICE_CREATE_DESCRIPTOR_HEAP, 14);
+        assert_eq!(DEVICE_GET_DESCRIPTOR_HANDLE_INCREMENT_SIZE, 15);
+        assert_eq!(DEVICE_CREATE_ROOT_SIGNATURE, 16);
+        assert_eq!(DEVICE_CREATE_CONSTANT_BUFFER_VIEW, 17);
+        assert_eq!(DEVICE_CREATE_SHADER_RESOURCE_VIEW, 18);
+        assert_eq!(DEVICE_CREATE_UNORDERED_ACCESS_VIEW, 19);
+        assert_eq!(DEVICE_CREATE_COMMITTED_RESOURCE, 27);
+        // ID3D12Resource after ID3D12Pageable (no members).
+        assert_eq!(RESOURCE_MAP, 8);
+        assert_eq!(RESOURCE_UNMAP, 9);
+        assert_eq!(RESOURCE_GET_GPU_VIRTUAL_ADDRESS, 11);
+        // ID3D12DescriptorHeap.
+        assert_eq!(HEAP_GET_CPU_HANDLE_START, 9);
+        assert_eq!(HEAP_GET_GPU_HANDLE_START, 10);
+        // ID3D12GraphicsCommandList, after ID3D12CommandList::GetType.
+        assert_eq!(GCL_RESET, 10);
+        assert_eq!(GCL_DISPATCH, 14);
+        assert_eq!(GCL_COPY_TEXTURE_REGION, 16);
+        assert_eq!(GCL_RESOURCE_BARRIER, 26);
+        assert_eq!(GCL_SET_DESCRIPTOR_HEAPS, 28);
+        assert_eq!(GCL_SET_COMPUTE_ROOT_SIGNATURE, 29);
+        assert_eq!(GCL_SET_COMPUTE_ROOT_DESCRIPTOR_TABLE, 31);
+        assert_eq!(GCL_SET_COMPUTE_ROOT_CONSTANT_BUFFER_VIEW, 37);
+        // The neighbours of the CBV slot, so an off-by-one in either direction
+        // cannot hide: 36 SetGraphicsRoot32BitConstants, 37 compute CBV,
+        // 38 graphics CBV.
+        assert_eq!(GCL_SET_COMPUTE_ROOT_CONSTANT_BUFFER_VIEW - 1, 36);
+        assert_eq!(GCL_SET_COMPUTE_ROOT_SHADER_RESOURCE_VIEW, 39);
+        assert_eq!(GCL_SET_COMPUTE_ROOT_UNORDERED_ACCESS_VIEW, 41);
+        // The two root tables are adjacent, in the order the spec lists them.
+        assert_eq!(GCL_SET_COMPUTE_ROOT_DESCRIPTOR_TABLE + 1, 32);
     }
 }

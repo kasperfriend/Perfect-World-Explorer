@@ -1057,4 +1057,64 @@ mod tests {
         let away = env.escape(-env.sun_direction, f32::INFINITY);
         assert!(towards.length() > away.length() * 2.);
     }
+    /// The banded, multithreaded trace the worker actually runs, on a scene
+    /// the size of the real world (2.5 million triangles). This is a
+    /// regression test for the scoped-thread panic: it drives the exact
+    /// `split_at_mut` + `thread::scope` structure `spawn_software` uses, so a
+    /// panic there fails here instead of leaving the page saying "starting".
+    #[test]
+    fn banded_trace_of_a_world_sized_scene_publishes_a_frame() {
+        let count = 2_500_000u32;
+        let tris: Vec<Triangle> = (0..count)
+            .map(|i| {
+                let x = (i % 1580) as f32;
+                let z = (i / 1580) as f32;
+                Triangle {
+                    a: v3(x, 0., z),
+                    b: v3(x + 0.5, 0., z),
+                    c: v3(x, 0.7, z + 0.5),
+                    normal: v3(0., 1., 0.),
+                    material: 0,
+                }
+            })
+            .collect();
+        let scene = std::sync::Arc::new(Scene {
+            bvh: Some(Bvh::build(tris)),
+            materials: vec![Material::new(v3(0.6, 0.5, 0.4), 0.1)],
+            stats: Default::default(),
+        });
+        let tracer = Tracer::new(scene, Environment::default());
+        let camera = camera();
+        let options = options();
+        let (width, height) = (590u32, 343u32);
+        let mut samples = vec![Sample::default(); (width as usize) * (height as usize)];
+        let threads = 16u32;
+        let slice = (height + threads - 1) / threads;
+        std::thread::scope(|s| {
+            let mut rest: &mut [Sample] = &mut samples;
+            let mut row = 0u32;
+            while row < height {
+                let end = (row + slice).min(height);
+                let (band, tail) = rest.split_at_mut((end - row) as usize * width as usize);
+                rest = tail;
+                let tracer_ref = &tracer;
+                s.spawn(move || {
+                    tracer_ref.trace_rows(&camera, &options, width, height, 1, row, end, band);
+                });
+                row = end;
+            }
+        });
+        // Every sample must have been written by some band: the sky has
+        // `hit == 0`, so a zeroed default is indistinguishable, and the test
+        // instead checks that the trace actually ran and covered the image.
+        let covered = samples.iter().filter(|s| s.hit > 0.).count();
+        eprintln!(
+            "banded: {} rays, covered {} of {}",
+            tracer.rays.load(std::sync::atomic::Ordering::Relaxed),
+            covered,
+            samples.len()
+        );
+        assert!(covered > 0, "the banded trace produced no hits at all");
+        assert_eq!(samples.len(), (width as usize) * (height as usize));
+    }
 }

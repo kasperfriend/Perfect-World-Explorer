@@ -88,7 +88,19 @@ pub struct Composite {
     pipelines: Pipelines,
     scene: Option<SceneBuffers>,
     target: Option<Target>,
+    /// The composite pass's own uniform: strength, exposure and the output mode.
     params: wgpu::Buffer,
+    /// The trace pass's uniform: camera, sun, sky and the BVH config.
+    ///
+    /// This is a *separate* buffer from `params`, and it has to be. Both passes
+    /// are recorded into one command encoder and `queue.write_buffer` is ordered
+    /// against *submission*, not against the passes in the encoder, so writing
+    /// the composite's 32 bytes over the trace's 160 between the two `write_buffer`
+    /// calls meant the trace shader read `strength` as `eye.x` and `exposure` as
+    /// `forward.x`, with `config` and `screen` both zeros. Every dispatch was
+    /// therefore traced with a camera at (0.6, 0.6, 0, tan fov) looking at nothing,
+    /// which is why the hardware path reported Ready and changed no pixel.
+    trace_params: wgpu::Buffer,
     /// Traced channels of the last `read_channels`, for the module page.
     pub last_channels: Option<(Vec<f32>, (u32, u32))>,
     /// Cleared when the traced image changes, so the page re-reads it once.
@@ -235,9 +247,14 @@ impl Composite {
             ..Default::default()
         });
         let params = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("imaginator params"),
-            size: std::mem::size_of::<GpuParams>().max(std::mem::size_of::<CompositeParams>())
-                as u64,
+            label: Some("imaginator composite params"),
+            size: std::mem::size_of::<CompositeParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let trace_params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("imaginator trace params"),
+            size: std::mem::size_of::<GpuParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -255,6 +272,7 @@ impl Composite {
             scene: None,
             target: None,
             params,
+            trace_params,
             last_channels: None,
             preview_fresh: false,
             traced_row_pitch: 0,
@@ -490,14 +508,14 @@ impl Composite {
         if source == TraceSource::Gpu {
             let mut trace_params = params;
             trace_params.config[1] = self.frames as u32;
-            queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&trace_params));
+            queue.write_buffer(&self.trace_params, 0, bytemuck::bytes_of(&trace_params));
             let trace_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("imaginator trace"),
                 layout: &self.pipelines.trace_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: self.params.as_entire_binding(),
+                        resource: self.trace_params.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -1147,5 +1165,76 @@ mod tests {
         assert_eq!(padded_bytes_per_row(16, 16), 256);
         assert_eq!(padded_bytes_per_row(17, 16), 512);
         assert_eq!(padded_bytes_per_row(1920, 16), 30720);
+    }
+
+    /// The trace pass and the composite pass must not share one uniform buffer.
+    ///
+    /// Both are recorded into a single encoder, and `queue.write_buffer` is
+    /// ordered against submission rather than against passes, so writing the
+    /// composite's 32 bytes after the trace's 160 overwrote `eye`/`forward` with
+    /// `strength`/`exposure` before the trace ever ran. Nothing below the API
+    /// level could see that, which is why it needs a structural assertion.
+    #[test]
+    fn the_trace_and_composite_passes_use_separate_uniforms() {
+        let source = include_str!("composite.rs");
+        // The trace dispatch must write the trace buffer, not the composite one.
+        assert!(
+            source.contains("queue.write_buffer(&self.trace_params"),
+            "the trace pass has to write its own uniform buffer"
+        );
+        // The trace bind group must bind the trace buffer.
+        let trace_bind = source
+            .split("label: Some(\"imaginator trace\")")
+            .nth(1)
+            .expect("the trace bind group is labelled");
+        let head = &trace_bind[..trace_bind
+            .find("wgpu::BindGroupEntry {\n                        binding: 1,")
+            .unwrap_or(trace_bind.len())];
+        assert!(
+            head.contains("self.trace_params.as_entire_binding()"),
+            "the trace bind group must bind the trace uniform, not the composite's"
+        );
+        assert!(
+            !head.contains("self.params.as_entire_binding()"),
+            "the trace bind group must not bind the composite uniform"
+        );
+    }
+
+    /// A frame written by `render` must differ from an untouched frame once the
+    /// traced channels say the surface is shadowed.
+    ///
+    /// This is the CPU mirror of what the composite shader does, exercised with
+    /// the parameters the composite actually receives: if the blend ever becomes
+    /// a no-op (a zero strength, an inverted sign convention, a shadow term that
+    /// keeps all the light) this fails rather than shipping a module that draws
+    /// nothing.
+    #[test]
+    fn a_shadow_reaches_the_composited_pixel() {
+        let settings = settings();
+        assert!(settings.strength > 0., "the default must be visible");
+        let frame = [0.8f32, 0.7, 0.6];
+        // Fully shadowed surface with a little traced colour.
+        let shadowed = [0.05f32, 0.04, 0.03, 0.0];
+        let out = composite_pixel(frame, shadowed, settings.strength, settings.exposure, false);
+        for channel in 0..3 {
+            assert!(
+                out[channel] < frame[channel],
+                "channel {channel}: {} is not darker than {}",
+                out[channel],
+                frame[channel]
+            );
+        }
+        // A lit surface keeps its light and gains the traced colour.
+        let lit = [0.05f32, 0.04, 0.03, 1.0];
+        let bright = composite_pixel(frame, lit, settings.strength, settings.exposure, false);
+        for channel in 0..3 {
+            assert!(bright[channel] > out[channel]);
+        }
+        // A sky pixel (negative visibility) is left exactly as drawn.
+        let sky = [0.0f32, 0.0, 0.0, -1.0];
+        assert_eq!(
+            composite_pixel(frame, sky, settings.strength, settings.exposure, false),
+            frame
+        );
     }
 }

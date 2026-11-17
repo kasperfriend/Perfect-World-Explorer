@@ -131,6 +131,10 @@ jobs:
               | while IFS= read -r line; do [ -n "$line" ] && echo "::error::$line"; done
           fi
           exit "$status"
+      - name: Check the Imaginator shader matches the CPU tracer's channels
+        run: ./tools/imaginator-shader-contract.sh
+      - name: Run the Imaginator's offline harness
+        run: ./tools/imaginator-realcheck.sh all
       - name: Run viewer unit tests
         run: |
           CARGO_TERM_COLOR=never cargo test --locked --bin perfect-world-explorer 2>&1 | tee /tmp/cargo-test.log
@@ -253,6 +257,24 @@ jobs:
               | head -20 | while IFS= read -r line; do echo "::error::$line"; done
             tail -40 "$log" | while IFS= read -r line; do echo "::error::$line"; done
             exit 42
+          fi
+      - name: Prove the Imaginator composite changes a frame
+        env:
+          WGPU_BACKEND: vulkan
+          XDG_RUNTIME_DIR: /tmp
+          PW_IMAGINATOR_SYNTHETIC_GPU: "1"
+        run: |
+          # The same software Vulkan driver the sRGB window test uses. This runs
+          # the real COMPOSITE and BLIT shaders and reads the frame back, which is
+          # the only check that can catch "the module is enabled and nothing
+          # happens" — every unit test in the crate passed while that was true.
+          log=/tmp/imaginator-composite.log
+          cargo test --locked --bin perfect-world-explorer \
+            imaginator::composite_gpu_test 2>&1 | tee "$log"
+          if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+            grep -E "panicked at|^test result:|assertion|^error" "$log" | head -20 \
+              | while IFS= read -r line; do echo "::error::$line"; done
+            exit 1
           fi
       - name: Run Phase 1 production shader regressions
         env:
@@ -463,6 +485,12 @@ jobs:
     name: Windows executable (x64)
     runs-on: windows-latest
     timeout-minutes: 60
+    # The packaged viewer has to contain the compiled RayQuery shader, and only
+    # the `shader` job can produce one (there is no dxc on the build box). Without
+    # this the artifact shipped with a module that had no `dxr_trace.cso`, so the
+    # hardware tracer fell back to the compute shader forever and the user had to
+    # ask why hardware RT was not real.
+    needs: shader
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -589,6 +617,28 @@ jobs:
       - name: Build the shipped survey tool
         shell: bash
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin bmd-overlap-survey
+      - name: Install the compiled RayQuery shader
+        uses: actions/download-artifact@v4
+        with:
+          name: dxr-trace-dxil
+          path: Modules/Imaginator/imaginator
+      - name: Verify the RayQuery shader is present and is DXIL
+        shell: pwsh
+        run: |
+          # A blob that is not there, or is a stub, must fail the build. This is
+          # the file the hardware tracer loads at `Modules/Imaginator/imaginator/dxr_trace.cso`;
+          # shipping without it silently demotes the module to the compute tracer,
+          # which is exactly the "hardware says green but nothing changes" report.
+          $blob = "Modules\Imaginator\imaginator\dxr_trace.cso"
+          if (-not (Test-Path -LiteralPath $blob -PathType Leaf)) {
+            throw "the packaged module has no RayQuery shader at $blob"
+          }
+          $bytes = [System.IO.File]::ReadAllBytes($blob)
+          if ($bytes.Length -lt 256) { throw "the RayQuery shader is only $($bytes.Length) bytes" }
+          # 'DXBC' or 'DXIL' container magic, little-endian.
+          $magic = [System.Text.Encoding]::ASCII.GetString($bytes[0..3])
+          if ($magic -ne 'DXBC') { throw "the RayQuery shader is not a DXIL container (magic '$magic')" }
+          Write-Host "RayQuery shader: $($bytes.Length) bytes, magic $magic"
       - name: Stage portable viewer and installed modules
         shell: pwsh
         run: |

@@ -99,6 +99,14 @@ pub struct Bvh {
     pub triangles: Vec<Triangle>,
 }
 
+/// Depth bound for the traversal stack.
+///
+/// The builder always makes progress (binned or median split) and stops at
+/// [`LEAF_SIZE`], so the depth is bounded by `log2(triangles)`; for the 2.5 M
+/// triangle capture this is 20. 96 leaves an enormous margin while staying at
+/// 384 bytes of stack per ray, which the per-frame stacks already have.
+const MAX_STACK: usize = 96;
+
 const BINS: usize = 12;
 const LEAF_SIZE: usize = 4;
 
@@ -301,22 +309,36 @@ impl Bvh {
     }
 
     /// Closest hit along `ray` inside `(tmin, tmax]`.
+    ///
+    /// The traversal stack lives on the caller's own stack rather than in a
+    /// `Vec`. It used to be `Vec::with_capacity(64)` per ray: a full frame is
+    /// millions of rays, so that was millions of `malloc`/`free` pairs, and
+    /// profiling a 590x343 frame put the tracer at ~2 Mray/s. A fixed array sized
+    /// for the deepest tree the builder can produce removes the allocation
+    /// entirely; [`MAX_STACK`] is a hard bound because the builder splits until a
+    /// leaf holds at most [`LEAF_SIZE`] triangles and the tree is balanced, so the
+    /// depth is `log2(triangles)`, far under the cap for any world this loads.
     pub fn closest_hit(&self, ray: &Ray, tmin: f32, tmax: f32) -> Option<Hit> {
         if self.triangles.is_empty() {
             return None;
         }
         let mut best_t = tmax;
         let mut best: Option<Hit> = None;
-        let mut stack: Vec<u32> = Vec::with_capacity(64);
-        stack.push(0);
-        while let Some(index) = stack.pop() {
+        let mut stack = [0u32; MAX_STACK];
+        let mut top = 0usize;
+        stack[top] = 0;
+        top += 1;
+        while top > 0 {
+            top -= 1;
+            let index = stack[top];
             let node = &self.nodes[index as usize];
             if node.bounds.intersect(ray, best_t).is_none() {
                 continue;
             }
             if node.count > 0 {
                 for k in 0..node.count as usize {
-                    let tri = &self.triangles[self.order[node.left_first as usize + k] as usize];
+                    let slot = node.left_first as usize + k;
+                    let tri = &self.triangles[self.order[slot] as usize];
                     if let Some((t, bary)) = tri.intersect(ray, tmin, best_t) {
                         best_t = t;
                         best = Some(Hit {
@@ -324,13 +346,39 @@ impl Bvh {
                             normal: tri.normal,
                             bary,
                             material: tri.material,
-                            triangle: self.order[node.left_first as usize + k],
+                            triangle: self.order[slot],
                         });
                     }
                 }
             } else {
-                stack.push(node.left_first);
-                stack.push(node.left_first + 1);
+                // Children are stored adjacently and the tree is built by
+                // splitting the further side first, so the *first* child is the
+                // nearer one in the builder's own ordering only by accident. Push
+                // the further child first so the nearer one is popped next: the
+                // nearer box is the one that can tighten `best_t` before the
+                // further subtree is visited, which lets that subtree be skipped.
+                let left = node.left_first;
+                let right = left + 1;
+                let left_t = self.nodes[left as usize].bounds.intersect(ray, best_t);
+                let right_t = self.nodes[right as usize].bounds.intersect(ray, best_t);
+                match (left_t, right_t) {
+                    (Some(l), Some(r)) => {
+                        let (near, far) = if l <= r { (left, right) } else { (right, left) };
+                        stack[top] = far;
+                        top += 1;
+                        stack[top] = near;
+                        top += 1;
+                    }
+                    (Some(_), None) => {
+                        stack[top] = left;
+                        top += 1;
+                    }
+                    (None, Some(_)) => {
+                        stack[top] = right;
+                        top += 1;
+                    }
+                    (None, None) => {}
+                }
             }
         }
         best
@@ -342,23 +390,33 @@ impl Bvh {
         if self.triangles.is_empty() {
             return false;
         }
-        let mut stack: Vec<u32> = Vec::with_capacity(64);
-        stack.push(0);
-        while let Some(index) = stack.pop() {
+        // Shadow and occlusion rays are the majority of a frame's launches, and
+        // they stop at the first blocker, so this stack matters even more than
+        // the closest-hit one. See `closest_hit` for why it is an array.
+        let mut stack = [0u32; MAX_STACK];
+        let mut top = 0usize;
+        stack[top] = 0;
+        top += 1;
+        while top > 0 {
+            top -= 1;
+            let index = stack[top];
             let node = &self.nodes[index as usize];
             if node.bounds.intersect(ray, tmax).is_none() {
                 continue;
             }
             if node.count > 0 {
                 for k in 0..node.count as usize {
-                    let tri = &self.triangles[self.order[node.left_first as usize + k] as usize];
+                    let slot = node.left_first as usize + k;
+                    let tri = &self.triangles[self.order[slot] as usize];
                     if tri.intersect(ray, tmin, tmax).is_some() {
                         return true;
                     }
                 }
             } else {
-                stack.push(node.left_first);
-                stack.push(node.left_first + 1);
+                stack[top] = node.left_first;
+                top += 1;
+                stack[top] = node.left_first + 1;
+                top += 1;
             }
         }
         false

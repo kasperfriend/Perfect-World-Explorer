@@ -1,0 +1,182 @@
+//! End-to-end proof that the Imaginator's composite changes the frame.
+//!
+//! The offline harness (`tools/imaginator-check`) replaces `wgpu` and D3D12 with
+//! stubs, so it cannot catch a pass bound to the wrong uniform, a no-op blend or
+//! a dispatch that writes nothing. This test runs the real shaders on a real
+//! device — Mesa's lavapipe in CI — and reads the frame back.
+//!
+//! It exists because of a string of "the module is enabled and nothing happens"
+//! reports that every unit test passed straight through.
+
+use super::composite::{Composite, TraceSource};
+use super::settings::ImaginatorSettings;
+use crate::imaginator::gpu;
+
+fn settings() -> ImaginatorSettings {
+    ImaginatorSettings::default()
+}
+
+#[test]
+fn the_composite_changes_a_frame_on_a_real_device() {
+    if std::env::var_os("PW_IMAGINATOR_SYNTHETIC_GPU").is_none() {
+        return;
+    }
+    let instance = wgpu::Instance::default();
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+        .expect("a device to composite on");
+    let (device, queue) = pollster::block_on(adapter.request_device(
+        &wgpu::DeviceDescriptor {
+            label: Some("Imaginator composite regression"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::downlevel_defaults(),
+        },
+        None,
+    ))
+    .expect("a device to composite on");
+
+    const W: u32 = 64;
+    const H: u32 = 64;
+    // The frame the core drew: a mid grey wall, already linear because the
+    // composite reads it through an sRGB view.
+    let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+    let frame_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("frame"),
+        size: wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::TEXTURE_BINDING,
+        // Declared so the readback can be done through a *linear* view: an
+        // `Rgba8UnormSrgb` texture copied to a buffer yields the raw stored
+        // bytes, but the values compared below are meant to be the same ones a
+        // linear view would show, and declaring both keeps that explicit.
+        view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+    });
+    let frame_view = frame_texture.create_view(&Default::default());
+    // 200/255 sRGB is ~0.57 linear: a lit wall the composite must be able to
+    // visibly darken.
+    let fill = vec![200u8; (W * H * 4) as usize];
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &frame_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &fill,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(W * 4),
+            rows_per_image: Some(H),
+        },
+        wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    let settings = settings();
+    let mut composite = Composite::new(&device, format);
+
+    // A trace that says every pixel is fully shadowed, with a little traced
+    // colour so the additive term is exercised too.
+    let traced_extent = gpu::traced_extent(W, H, settings.trace_scale);
+    let mut packed = Vec::with_capacity((traced_extent.0 * traced_extent.1 * 4) as usize);
+    for _ in 0..(traced_extent.0 * traced_extent.1) {
+        packed.extend_from_slice(&[0.05, 0.04, 0.03, 0.0]);
+    }
+    composite.upload_software(&packed, traced_extent, &device, &queue);
+
+    let params = gpu::params(
+        super::math::v3(0., 1., 0.),
+        super::math::v3(0., 0., 1.),
+        super::math::v3(1., 0., 0.),
+        super::math::v3(0., 1., 0.),
+        1.0,
+        1.0,
+        H as f32,
+        super::math::v3(0., -1., 0.),
+        super::math::v3(1., 1., 1.),
+        super::math::v3(0.4, 0.5, 0.8),
+        super::math::v3(0.7, 0.7, 0.75),
+        2,
+        &settings,
+        1000.,
+    );
+    let mut encoder = device.create_command_encoder(&Default::default());
+    composite
+        .render(
+            &device,
+            &queue,
+            &mut encoder,
+            None,
+            &frame_view,
+            (W, H),
+            &settings,
+            params,
+            TraceSource::Software,
+        )
+        .expect("the composite must accept an sRGB frame and a packed trace");
+    queue.submit(Some(encoder.finish()));
+
+    // Read the result back through a linear (non-sRGB) view, so the values
+    // compared are the 8-bit ones actually written.
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size: (W * H * 4) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        wgpu::ImageCopyTexture {
+            texture: &frame_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::ImageCopyBuffer {
+            buffer: &readback,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(W * 4),
+                rows_per_image: Some(H),
+            },
+        },
+        wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+    readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::Maintain::Wait);
+    let pixels = readback.slice(..).get_mapped_range().to_vec();
+
+    // The wall was ~0.55 linear. A full shadow at the default strength must
+    // leave it markedly darker; if the composite were a no-op this would be
+    // 200 and the assertion below would fail with the value in the message.
+    let centre = {
+        let offset = (((H / 2) * W + W / 2) * 4) as usize;
+        pixels[offset] as u32
+    };
+    assert!(
+        centre < 190,
+        "the composite left the frame unchanged ({centre}); the shadowed trace \
+             never reached the pixels"
+    );
+    assert!(
+        centre > 0,
+        "the composite wrote black ({centre}) instead of a darkened frame"
+    );
+}

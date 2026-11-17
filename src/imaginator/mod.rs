@@ -67,6 +67,11 @@ pub mod math;
 pub mod settings;
 pub mod tracer;
 
+/// The composite's end-to-end device test, kept out of `composite.rs` so the
+/// offline harness (which stubs `wgpu`) never has to compile it.
+#[cfg(all(test, not(imaginator_offline)))]
+mod composite_gpu_test;
+
 use bvh::SharedScene;
 use composite::Composite;
 use gpu::GpuParams;
@@ -113,6 +118,13 @@ struct SoftwareState {
     /// Kept so `Drop` can join the worker. The worker exits when `running` clears.
     thread: Option<std::thread::JoinHandle<()>>,
     running: Arc<std::sync::atomic::AtomicBool>,
+    /// Why the worker stopped producing frames, if it did.
+    ///
+    /// Set by the worker itself and by `submit_software`. It exists because the
+    /// worker's old failure mode was silence: a panicking row band or a poisoned
+    /// mutex left the thread alive, `frames` at zero and the page saying
+    /// "software tracer starting" forever, with nothing anywhere to say why.
+    fault: Arc<Mutex<Option<String>>>,
 }
 
 /// Split `height` rows into contiguous bands of at most `slice` rows.
@@ -183,6 +195,10 @@ pub struct Imaginator {
     requests: u64,
     /// Frames the composite actually ran.
     pub frames: u64,
+    /// Frames the hardware selection drew on the CPU because no DXIL blob was
+    /// installed yet. Reported in the status line so a fallback is never mistaken
+    /// for the RT-core path.
+    cpu_fallback_frames: u64,
     pub last_error: Option<String>,
     /// Set while the page is open, so the preview can be read back.
     page_open: bool,
@@ -222,6 +238,7 @@ impl Imaginator {
             generation: 0,
             requests: 0,
             frames: 0,
+            cpu_fallback_frames: 0,
             last_error: None,
             page_open: false,
             capture_state: CaptureState::WaitingForWorld,
@@ -440,6 +457,11 @@ impl Imaginator {
         let Some(software) = &self.software else {
             return "software tracer is not running".into();
         };
+        // A worker that died or panicked says so, instead of leaving the page on
+        // "starting" for ever with no explanation.
+        if let Some(fault) = software.fault.lock().ok().and_then(|f| f.clone()) {
+            return format!("software tracer stopped: {fault}");
+        }
         let frames = software.frames.load(Ordering::Relaxed);
         let rays = software
             .result
@@ -448,7 +470,21 @@ impl Imaginator {
             .and_then(|r| r.as_ref().map(|r| r.rays))
             .unwrap_or(0);
         if frames == 0 {
-            "software tracer starting".into()
+            // Naming the work in flight is the difference between "starting" and
+            // "wedged": the first request's extent and triangle count say what the
+            // worker is actually doing right now.
+            match software
+                .request
+                .lock()
+                .ok()
+                .and_then(|r| r.as_ref().map(|r| (r.width, r.height)))
+            {
+                Some((w, h)) => format!(
+                    "software tracer starting: first {}x{} frame of {} triangles in flight",
+                    w, h, self.captured_triangles
+                ),
+                None => "software tracer starting: waiting for the first frame".into(),
+            }
         } else {
             format!(
                 "software tracer: {frames} traced frames, {} triangles, {:.2} Mrays last frame",
@@ -464,6 +500,7 @@ impl Imaginator {
         let pending_scene = Arc::new(Mutex::new(None::<SharedScene>));
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let frames = Arc::new(AtomicU64::new(0));
+        let fault: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let thread = {
             let result = result.clone();
@@ -473,6 +510,7 @@ impl Imaginator {
             let frames = frames.clone();
             let scene = self.scene.clone();
             let environment = self.environment.clone();
+            let fault_slot = fault.clone();
             std::thread::Builder::new()
                 .name("imaginator-software".into())
                 .spawn(move || {
@@ -513,41 +551,64 @@ impl Imaginator {
                             .min(16) as u32;
                         let slice = (rows + threads - 1) / threads.max(1);
                         let tracer_ref = &tracer;
-                        std::thread::scope(|s| {
-                            // One slice per band, sized to that band's own rows.
-                            // `trace_rows` indexes `out` from the band's first row
-                            // (see its doc comment), so each task has to get a
-                            // buffer that starts where its band starts.
-                            //
-                            // The bands are built from the row loop rather than
-                            // from `chunks_mut`, because the last band is usually
-                            // shorter than `slice` and `chunks_mut` grows the tile
-                            // until that tail no longer fits — it then yields a
-                            // *final short chunk*, which the old loop silently
-                            // dropped, leaving the bottom rows of the image
-                            // untraced.
-                            let (width, height, s_) = (req.width, req.height, req.samples);
-                            let camera = req.camera;
-                            let options = req.options;
-                            let stride = width as usize;
-                            let mut row = 0u32;
-                            // `split_at_mut` hands out one disjoint band at a
-                            // time, which is what lets every closure own its slice.
-                            let mut rest: &mut [tracer::Sample] = &mut samples;
-                            while row < height {
-                                let start = row;
-                                let end = (row + slice).min(height);
-                                let taken = (end - start) as usize * stride;
-                                let (band, tail) = rest.split_at_mut(taken);
-                                rest = tail;
-                                s.spawn(move || {
-                                    tracer_ref.trace_rows(
-                                        &camera, &options, width, height, s_, start, end, band,
-                                    );
-                                });
-                                row = end;
+                        // A panic inside a band used to propagate out of `scope`
+                        // and kill the worker thread: `frames` stayed at zero and
+                        // the module said "starting" forever. Catch it, publish it,
+                        // and keep serving requests.
+                        let bands = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            std::thread::scope(|s| {
+                                // One slice per band, sized to that band's own rows.
+                                // `trace_rows` indexes `out` from the band's first row
+                                // (see its doc comment), so each task has to get a
+                                // buffer that starts where its band starts.
+                                //
+                                // The bands are built from the row loop rather than
+                                // from `chunks_mut`, because the last band is usually
+                                // shorter than `slice` and `chunks_mut` grows the tile
+                                // until that tail no longer fits — it then yields a
+                                // *final short chunk*, which the old loop silently
+                                // dropped, leaving the bottom rows of the image
+                                // untraced.
+                                let (width, height, s_) = (req.width, req.height, req.samples);
+                                let camera = req.camera;
+                                let options = req.options;
+                                let stride = width as usize;
+                                let mut row = 0u32;
+                                // `split_at_mut` hands out one disjoint band at a
+                                // time, which is what lets every closure own its slice.
+                                let mut rest: &mut [tracer::Sample] = &mut samples;
+                                while row < height {
+                                    let start = row;
+                                    let end = (row + slice).min(height);
+                                    let taken = (end - start) as usize * stride;
+                                    let (band, tail) = rest.split_at_mut(taken);
+                                    rest = tail;
+                                    s.spawn(move || {
+                                        tracer_ref.trace_rows(
+                                            &camera, &options, width, height, s_, start, end, band,
+                                        );
+                                    });
+                                    row = end;
+                                }
+                            });
+                        }));
+                        if let Err(why) = bands {
+                            let message = if let Some(text) = why.downcast_ref::<&str>() {
+                                (*text).to_string()
+                            } else if let Some(text) = why.downcast_ref::<String>() {
+                                text.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            let fault = format!("the tracer panicked while tracing: {message}");
+                            eprintln!("Imaginator: {fault}");
+                            if let Ok(mut slot) = fault_slot.lock() {
+                                *slot = Some(fault);
                             }
-                        });
+                            // Skip this frame's publish rather than leaving a
+                            // half-written buffer as if it were a picture.
+                            continue;
+                        }
                         let mut packed = vec![0f32; samples.len() * 4];
                         tracer::Tracer::pack(&samples, &mut packed);
                         let rays = tracer.rays.load(std::sync::atomic::Ordering::Relaxed);
@@ -576,6 +637,7 @@ impl Imaginator {
             frames,
             thread,
             running,
+            fault,
         }
     }
 
@@ -836,16 +898,25 @@ impl Imaginator {
                 let base = hardware.status.label();
                 let has_blob = hardware.dxil_present(&self.directory);
                 let ready = hardware.pipeline_ready();
+                // Which pipeline exists, not merely whether one does: the compute
+                // tracer builds one too, so `ready` alone cannot say "RayQuery".
+                let ray_query = hardware.ray_query();
                 // The borrow of `self.hardware` ends here; the trace below needs
                 // it mutably and also needs `self` for the scene.
-                self.status = if has_blob {
+                self.status = if ray_query {
+                    // A pipeline built from the DXIL blob: inline `RayQuery`
+                    // against the TLAS, evaluated by the RT cores.
+                    format!("{base} — RT-core RayQuery trace running")
+                } else if has_blob {
                     // The blob is installed, so a native pipeline can be built
                     // from it. Whether one *has* been is the useful thing to
                     // report: a blob that dxc compiled for the wrong target is
                     // rejected at pipeline creation, and that must not look like
                     // a working RayQuery trace.
                     if ready {
-                        format!("{base} — RayQuery trace pipeline ready")
+                        "the trace pipeline was built, but not from the DXIL blob; \
+                         the RayQuery shader is installed and will be used on the next frame"
+                            .into()
                     } else {
                         format!(
                             "{base} — RayQuery blob found; the trace pipeline is built on the \
@@ -862,6 +933,13 @@ impl Imaginator {
                 };
                 // Run it. A failure is reported, and the module keeps whatever it
                 // last drew rather than going blank.
+                //
+                // Without the blob there is no RayQuery shader to dispatch, and
+                // doing nothing was the worst option: the page said the module was
+                // active, the status said "compute shader", and no pixel ever
+                // moved. So hardware selection always draws *something*: it runs
+                // the RT-core path when the blob is installed, and publishes a CPU
+                // trace of the same camera until then.
                 if has_blob {
                     // `trace_hardware` needs `self` for the scene and the
                     // composite, so the hardware tracer is taken out and put back
@@ -883,6 +961,13 @@ impl Imaginator {
                             self.status = format!("hardware trace: {why}");
                         }
                     }
+                } else {
+                    // No DXIL blob yet: trace the same frame on the CPU so the
+                    // image still changes, and say so. `submit_software` needs a
+                    // worker, which `sync_worker` only spawns for the software
+                    // tracer, so this one runs inline at a reduced extent — a
+                    // frame of latency here is better than a frozen picture.
+                    self.publish_cpu_fallback((tw, th), params, device, queue);
                 }
             }
             TracerKind::Software => {
@@ -939,6 +1024,50 @@ impl Imaginator {
                 false
             }
         }
+    }
+
+    /// Trace one frame on the CPU for a hardware selection that has no DXIL blob
+    /// to dispatch.
+    ///
+    /// This keeps the promise that enabling the module changes the picture. It is
+    /// deliberately cheap: a quarter of the requested extent, one sample, and
+    /// only when the previous fallback frame has already been published, so the
+    /// render loop is never held up by more than a small trace.
+    fn publish_cpu_fallback(
+        &mut self,
+        extent: (u32, u32),
+        params: GpuParams,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        let (tw, th) = extent;
+        if tw == 0 || th == 0 {
+            return;
+        }
+        let Some(bvh) = self.scene.bvh.as_ref() else {
+            return;
+        };
+        // Nothing to draw from an empty capture.
+        if bvh.triangles.is_empty() {
+            return;
+        }
+        // Halve each axis again: this is a stand-in for a GPU trace, not the
+        // software tracer's full-quality image.
+        let (fw, fh) = (tw.div_ceil(2).max(1), th.div_ceil(2).max(1));
+        let camera = self.software_camera(extent, params);
+        let options = tracer::TraceOptions::from_settings(&self.settings);
+        let tracer = tracer::Tracer::new(self.scene.clone(), self.environment.clone());
+        let samples = tracer.trace(&camera, &options, fw, fh, 1);
+        let mut packed = vec![0f32; samples.len() * 4];
+        tracer::Tracer::pack(&samples, &mut packed);
+        if let Some(composite) = self.composite.as_mut() {
+            // `upload_software` sizes the traced target to whatever it is handed,
+            // so the half-size image lands as a half-size target and the composite
+            // samples it across the whole frame. That is exactly what the
+            // full-size CPU tracer relies on too.
+            composite.upload_software(&packed, (fw, fh), device, queue);
+        }
+        self.cpu_fallback_frames += 1;
     }
 
     /// The tracer's camera for this frame, derived from the parameters the

@@ -148,6 +148,9 @@ pub struct HardwareTracer {
 struct Pipeline {
     root_signature: *mut c_void,
     state: *mut c_void,
+    /// Built from the DXIL blob, so it is the `RayQuery` shader and runs on the
+    /// RT cores; the compute tracer's pipeline is `false`.
+    ray_query: bool,
 }
 
 unsafe impl Send for Pipeline {}
@@ -407,6 +410,7 @@ impl HardwareTracer {
         self.pipeline = Some(Pipeline {
             root_signature: signature,
             state: pipeline,
+            ray_query: true,
         });
         Ok(())
     }
@@ -414,6 +418,20 @@ impl HardwareTracer {
     /// True once the trace pipeline exists.
     pub fn pipeline_ready(&self) -> bool {
         self.pipeline.is_some()
+    }
+
+    /// Whether the pipeline that exists is the DXIL `RayQuery` one.
+    ///
+    /// `pipeline_ready` alone is not enough to say "hardware ray tracing": the
+    /// compute tracer builds a pipeline too, and reporting "RayQuery trace
+    /// pipeline ready" for it is what made the module look like it was tracing
+    /// on the RT cores when it was running an ordinary compute shader. Only a
+    /// pipeline built from a non-empty DXIL blob uses `TraceRayInline` against
+    /// the TLAS.
+    pub fn ray_query(&self) -> bool {
+        self.pipeline
+            .as_ref()
+            .is_some_and(|pipeline| pipeline.ray_query)
     }
 
     /// Run one hardware trace and hand back the four channels.
@@ -531,6 +549,19 @@ impl HardwareTracer {
             let mut heap_pointer = heap as *mut win::ID3D12DescriptorHeap;
             (*list).SetDescriptorHeaps(1, &mut heap_pointer);
             // Root parameter 0 is the CBV, 1 the SRV table, 2 the UAV table.
+            //
+            // The CBV is a *root* descriptor, so it is bound by GPU address and
+            // not through the heap. Nothing bound it before, so `Params` was read
+            // from whatever the register happened to hold: a camera at the origin,
+            // a zero `config` (so no bounces and an empty grid) and a zero `screen`.
+            // The dispatch therefore always wrote an all-sky image, which the
+            // composite then ignored pixel by pixel — the path looked ready and
+            // changed nothing.
+            sys::set_compute_root_constant_buffer_view(
+                list as *mut c_void,
+                0,
+                sys::gpu_virtual_address(params_buffer.as_mut_ptr() as *mut c_void),
+            );
             // Root parameter 1 is the SRV table (t0..t2, at heap slots 1..3) and
             // parameter 2 the UAV (slot 4).
             sys::set_compute_root_descriptor_table(

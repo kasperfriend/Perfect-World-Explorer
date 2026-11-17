@@ -42,9 +42,62 @@ jobs:
       - name: Run viewer unit tests
         run: cargo test --locked --bin perfect-world-explorer
 
+  shader:
+    name: Compile the RayQuery shader to DXIL
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Find or install DXC
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\dxc.exe",
+            "${env:VULKAN_SDK}\Bin\dxc.exe",
+            "C:\VulkanSDK\*\Bin\dxc.exe"
+          )
+          foreach ($pattern in $candidates) {
+            $found = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1
+            if ($found) {
+              "DXC_PATH=$($found.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+              exit 0
+            }
+          }
+          $url = "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\vulkan-sdk.exe"
+          Start-Process -FilePath "$env:TEMP\vulkan-sdk.exe" -Wait -ArgumentList `
+            "--accept-licenses","--default-answer","--confirm-command","install","com.lunarg.vulkan.core","com.lunarg.vulkan.d3d12"
+          $dxc = Get-ChildItem -Path "C:\VulkanSDK\*\Bin\dxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dxc) { throw "dxc.exe was not installed" }
+          "DXC_PATH=$($dxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Compile the trace shader
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "Modules\Imaginator\imaginator" | Out-Null
+          $out = "Modules\Imaginator\imaginator\dxr_trace.cso"
+          $proc = Start-Process -FilePath $env:DXC_PATH -ArgumentList @(
+            "-T","cs_6_5","-E","cs","-HV","2018","-O3","-Zpc","-all_resources_bound",
+            "-Fo",$out,"tools\imaginator-shaders\dxr_trace.hlsl") `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput "dxc-output.txt" -RedirectStandardError "dxc-stderr.txt"
+          if ($proc.ExitCode -ne 0) {
+            Get-Content dxc-stderr.txt, dxc-output.txt -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+            throw "dxc exited with code $($proc.ExitCode)"
+          }
+          $size = (Get-Item -LiteralPath $out).Length
+          if ($size -lt 256) { throw "the blob is only $size bytes; dxc did not produce DXIL" }
+          Write-Host "wrote $out ($size bytes)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dxr-trace-dxil
+          path: Modules/Imaginator/imaginator/dxr_trace.cso
+          if-no-files-found: error
+
   release:
     name: Build and publish Windows release
-    needs: checks
+    needs: [checks, shader]
     runs-on: windows-latest
     timeout-minutes: 60
     permissions:
@@ -75,6 +128,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build standalone viewer
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin perfect-world-explorer
+      - name: Install the compiled RayQuery shader
+        uses: actions/download-artifact@v4
+        with:
+          name: dxr-trace-dxil
+          path: Modules/Imaginator/imaginator
+      - name: Verify the RayQuery shader ships in the release
+        shell: pwsh
+        run: |
+          $blob = "Modules\Imaginator\imaginator\dxr_trace.cso"
+          if (-not (Test-Path -LiteralPath $blob -PathType Leaf)) {
+            throw "the release has no RayQuery shader at $blob"
+          }
+          $bytes = [System.IO.File]::ReadAllBytes($blob)
+          $magic = [System.Text.Encoding]::ASCII.GetString($bytes[0..3])
+          if ($bytes.Length -lt 256 -or $magic -ne 'DXBC') {
+            throw "the RayQuery shader is not a usable DXIL container ($($bytes.Length) bytes, magic '$magic')"
+          }
+          Write-Host "RayQuery shader: $($bytes.Length) bytes"
       - name: Stage portable release ZIP and checksum
         shell: pwsh
         run: |
