@@ -119,12 +119,18 @@ float4 material_of(uint triangle)
     return materials[index];
 }
 
-float3 shade_surface(float3 point, float3 normal_in, uint triangle, float3 view,
-                     inout uint seed, uint terms)
+// One surface's own light, with no further scattering.
+//
+// This was recursive — a mirror hit called back into this function to shade what
+// it found — and DXC rejects any recursion outright, so the shader could never
+// have been compiled at all. Reflections are instead walked as a loop below,
+// which is what the CPU tracer does too: a reflection ray is followed for
+// `bounces` steps, losing energy at each surface, and the loop stops early once
+// the throughput is negligible. Same picture, no recursion.
+float3 surface_light(float3 point, float3 normal, float3 view, uint terms,
+                     inout uint seed)
 {
-    float3 normal = normalize(normal_in);
-    if (dot(normal, view) > 0.0) { normal = -normal; }
-    float4 mat = material_of(triangle);
+    (void)view;
     float3 sun = normalize(p.sun.xyz);
     float lit = max(dot(normal, sun), 0.0);
     float vis = 1.0;
@@ -132,32 +138,8 @@ float3 shade_surface(float3 point, float3 normal_in, uint triangle, float3 view,
     {
         vis = sun_visibility(point, normal, seed);
     }
-    float3 direct = float3(0, 0, 0);
-    if ((terms & TERM_LIGHTING) != 0u)
-    {
-        direct = p.sun_color.rgb * (lit * vis) + sky(normal.y);
-    }
-    float3 reflection = float3(0, 0, 0);
-    if ((terms & TERM_REFLECTIONS) != 0u)
-    {
-        float cos_i = dot(normal, -view);
-        if (cos_i > 0.0)
-        {
-            float3 mirror = normalize(view + normal * (2.0 * cos_i));
-            Hit h = closest(point + normal * 0.02, mirror);
-            if (h.hit)
-            {
-                float3 p2 = point + mirror * h.t;
-                reflection = material_of(h.triangle).rgb *
-                             shade_surface(p2, h.normal, h.triangle, mirror, seed, terms);
-            }
-            else
-            {
-                reflection = sky(mirror.y);
-            }
-        }
-    }
-    return mat.rgb * direct + reflection * mat.a;
+    if ((terms & TERM_LIGHTING) == 0u) { return float3(0, 0, 0); }
+    return p.sun_color.rgb * (lit * vis) + sky(normal.y);
 }
 
 [numthreads(8, 8, 1)]
@@ -248,18 +230,39 @@ void cs(uint3 id : SV_DispatchThreadID)
             float cos_i = dot(normal, -rd);
             if (cos_i > 0.0)
             {
+                // A mirror chain, walked rather than recursed: each step loses
+                // the surface's specular and gathers its own light.
                 float3 mirror = normalize(rd + normal * (2.0 * cos_i));
-                Hit h = closest(point + normal * 0.02, mirror);
-                if (h.hit)
+                float3 origin = point + normal * 0.02;
+                float3 normal_here = normal;
+                float3 through = float3(1, 1, 1);
+                float3 gathered = float3(0, 0, 0);
+                uint max_steps = max(p.config.x, 1u);
+                for (uint step = 0; step < max_steps; ++step)
                 {
-                    reflection += dot(shade_surface(point + mirror * h.t, h.normal,
-                                                    h.triangle, mirror, seed, terms),
-                                      float3(0.3333, 0.3333, 0.3333));
+                    Hit h = closest(origin, mirror);
+                    if (!h.hit)
+                    {
+                        gathered += through * sky(mirror.y);
+                        break;
+                    }
+                    float3 hp = origin + mirror * h.t;
+                    float3 hn = normalize(h.normal);
+                    if (dot(hn, mirror) > 0.0) { hn = -hn; }
+                    float4 hm = material_of(h.triangle);
+                    gathered += through * (hm.rgb * surface_light(hp, hn, mirror, terms, seed));
+                    through *= hm.a;
+                    if (max(through.r, max(through.g, through.b)) < 0.02) { break; }
+                    // Reflect again about the new surface.
+                    float3 in_dir = mirror;
+                    float c = dot(hn, -in_dir);
+                    if (c <= 0.0) { break; }
+                    mirror = normalize(in_dir + hn * (2.0 * c));
+                    origin = hp + hn * 0.02;
+                    normal_here = hn;
                 }
-                else
-                {
-                    reflection += dot(sky(mirror.y), float3(0.3333, 0.3333, 0.3333));
-                }
+                reflection += dot(gathered, float3(0.3333, 0.3333, 0.3333));
+                (void)normal_here;
             }
         }
     }
