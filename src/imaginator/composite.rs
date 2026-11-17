@@ -98,6 +98,11 @@ pub struct Composite {
     pub frames: u64,
     pub last_error: Option<String>,
     frame_format: wgpu::TextureFormat,
+    /// The frame size the last `render` composited at.
+    ///
+    /// A software result can arrive before the first `render`, and allocating the
+    /// target then needs the frame's size, not the trace's.
+    frame_extent: (u32, u32),
 }
 
 impl Composite {
@@ -242,6 +247,9 @@ impl Composite {
             frames: 0,
             last_error: None,
             frame_format,
+            // Until a frame says otherwise, the trace's own size is the best
+            // estimate of the frame; `render` corrects it on the first frame.
+            frame_extent: (1, 1),
         }
     }
 
@@ -259,14 +267,37 @@ impl Composite {
     /// The software tracer produces the same four channels the compute shader
     /// does, so it feeds the identical composite. Uploading is cheaper than
     /// dispatching a traversal the CPU has already done.
-    pub fn upload_software(&mut self, packed: &[f32], extent: (u32, u32), queue: &wgpu::Queue) {
+    pub fn upload_software(
+        &mut self,
+        packed: &[f32],
+        extent: (u32, u32),
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        // A finished CPU trace can arrive before the first `render`, which is
+        // where the target used to be allocated — and `upload_software` needs the
+        // traced texture. Allocate it here when it is absent, sized the way
+        // `render` will size it: traced at `extent`, composited at the frame's own
+        // extent.
+        if self.target.is_none() {
+            let frame = self.frame_extent;
+            self.ensure_target(device, extent.0, extent.1, frame.0, frame.1);
+        }
         let Some(target) = &self.target else { return };
+        // A result whose extent no longer matches the target is stale (the window
+        // was resized between the request and the answer). Dropping it is right:
+        // the next frame asks for the new size.
         if (target.width, target.height) != extent {
             return;
         }
         if packed.len() < (extent.0 as usize * extent.1 as usize * 4) {
             return;
         }
+        // The traced texture is `Rgba32Float`, so a row is `width * 4` floats *
+        // 4 bytes. Deriving it here rather than reading `traced_row_pitch` means
+        // an upload that lands before the first `render` cannot use a stale
+        // stride.
+        let row_pitch = extent.0 * 16;
         let bytes = bytemuck::cast_slice(packed);
         queue.write_texture(
             wgpu::ImageCopyTexture {
@@ -278,7 +309,7 @@ impl Composite {
             bytes,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(self.traced_row_pitch),
+                bytes_per_row: Some(row_pitch),
                 rows_per_image: Some(extent.1),
             },
             wgpu::Extent3d {
@@ -379,6 +410,7 @@ impl Composite {
             return Err("the frame has no extent".into());
         }
         let (tw, th) = gpu::traced_extent(width, height, settings.trace_scale);
+        self.frame_extent = (width, height);
         self.ensure_target(device, tw, th, width, height);
         let Some(buffers) = self.scene.as_ref() else {
             return Err("no scene has been captured yet".into());
@@ -612,7 +644,13 @@ impl Composite {
         Some((out, extent))
     }
 
-    fn ensure_target(
+    /// Allocate (or reallocate) the traced and composite targets.
+    ///
+    /// Public because a software *result* can arrive before the first
+    /// `render`: `upload_software` writes into the traced texture, so the target
+    /// has to exist by then or the first frames of a CPU trace are silently
+    /// dropped and the window stays blank until the sizes happen to match.
+    pub fn ensure_target(
         &mut self,
         device: &wgpu::Device,
         traced_width: u32,

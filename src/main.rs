@@ -3493,9 +3493,73 @@ fn diagnose_framegen(args: &[String]) -> i32 {
 
 mod viewer;
 
+/// Send `stderr` to `startup.log` beside the executable.
+///
+/// This build is `windows_subsystem = "windows"`: no console is allocated, so
+/// `eprintln!` has nowhere to go and a startup failure is completely silent —
+/// which is exactly the report this exists to answer ("loads, white window, log
+/// shows only a start"). The file is truncated per run so it always describes the
+/// launch that just happened.
+///
+/// Two redirections, because two things write to stderr. Rust's `eprintln!` goes
+/// through `GetStdHandle(STD_ERROR_HANDLE)` — cached on first use, which is why
+/// this has to run before any output — so the handle is replaced. C libraries
+/// loaded later (and anything using the CRT) write to file descriptor 2 instead,
+/// so that slot is pointed at the same file. Failure is ignored on purpose:
+/// logging must never be the reason the viewer does not start.
+#[cfg(windows)]
+fn redirect_stderr_to_file() {
+    use std::os::windows::io::AsRawHandle;
+    let path = diagnostics::explorer_root().join("startup.log");
+    let Ok(file) = std::fs::File::create(&path) else {
+        return;
+    };
+    let handle = file.as_raw_handle();
+    // SAFETY: `handle` belongs to `file`, which is leaked at the end of this
+    // function so it outlives every later write; `SetStdHandle` only records it.
+    unsafe {
+        SetStdHandle(STD_ERROR_HANDLE, handle);
+    }
+    // SAFETY: same handle, duplicated into the CRT's descriptor table so that
+    // `fd 2` and the Win32 stderr handle name the same file.
+    let fd = unsafe { _open_osfhandle(handle as isize, 0) };
+    if fd >= 0 {
+        // SAFETY: `fd` is a live descriptor for the file above.
+        unsafe {
+            let _ = _dup2(fd, 2);
+        }
+    }
+    std::mem::forget(file);
+    eprintln!("--- Perfect World Explorer: {}", path.display());
+}
+
+#[cfg(windows)]
+const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+
+#[cfg(windows)]
+extern "system" {
+    fn SetStdHandle(kind: u32, handle: *mut std::ffi::c_void) -> i32;
+}
+
+#[cfg(windows)]
+extern "C" {
+    fn _open_osfhandle(osfhandle: isize, flags: i32) -> i32;
+    fn _dup2(old: i32, new: i32) -> i32;
+}
+
 fn main() {
+    // The release build is `windows_subsystem = "windows"`, so there is no
+    // console and every `eprintln!` the viewer writes is discarded: a startup
+    // that dies before it can draw anything leaves no trace at all, and a blank
+    // window is all the user sees. Point stderr at a file next to the executable
+    // before anything else runs, so the load path can always be read afterwards.
+    #[cfg(windows)]
+    redirect_stderr_to_file();
     #[cfg(windows)]
     std::panic::set_hook(Box::new(|info| {
+        // The panic text is the single most useful line after a crash, and with
+        // a redirected stderr it would otherwise only reach the message box.
+        eprintln!("panic: {info}");
         windows_setup::show_error(&format!(
             "Perfect World Explorer encountered an unexpected error:\n{info}"
         ))

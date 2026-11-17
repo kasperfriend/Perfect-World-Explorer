@@ -136,11 +136,10 @@ fn ready(dir: &Path) -> bool {
     dir.join("ready").is_file() && (0..59).all(|i| dir.join(format!("tree-{i:03}.pwt")).is_file())
 }
 pub fn prepare_trees(element: &Path) -> Result<PathBuf, String> {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .ok_or("LOCALAPPDATA is not set")?
-        .join("PerfectWorldViewer")
-        .join("tree-cache");
+    // The tree cache is derived data, but it belongs to the viewer's own root for
+    // the same reason the settings do: one folder holds everything it creates,
+    // and deleting that folder is a complete reset.
+    let base = crate::diagnostics::explorer_root().join("tree-cache");
     fs::create_dir_all(&base).map_err(|e| format!("Cannot create tree cache: {e}"))?;
     let key = cache_key(element)?;
     let final_dir = base.join(format!("pwt08-{key:016x}"));
@@ -599,13 +598,34 @@ unsafe extern "system" fn launch_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
+/// The remembered client folder: `client-folder.utf16` beside the executable.
+///
+/// Kept in the viewer's own root with the settings and the logs, rather than in
+/// `%LOCALAPPDATA%`, so the whole of its state is one folder — which is what you
+/// want for a portable install and what makes "delete the config" a single
+/// obvious action.
 fn settings_file() -> Option<PathBuf> {
+    Some(crate::diagnostics::explorer_root().join("client-folder.utf16"))
+}
+
+/// Where earlier builds kept it, read once so an existing choice carries over.
+fn legacy_settings_file() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .map(|p| p.join("PerfectWorldViewer").join("client-folder.utf16"))
 }
 fn remembered() -> Option<PathBuf> {
-    let data = fs::read(settings_file()?).ok()?;
+    // Prefer the root folder; fall back to the pre-move location and migrate it.
+    if let Some(path) = remembered_at(settings_file()?) {
+        return Some(path);
+    }
+    let path = remembered_at(legacy_settings_file()?)?;
+    let _ = remember(&path);
+    Some(path)
+}
+
+fn remembered_at(file: PathBuf) -> Option<PathBuf> {
+    let data = fs::read(file).ok()?;
     if data.is_empty() || data.len() > 65536 || data.len() % 2 != 0 {
         return None;
     }

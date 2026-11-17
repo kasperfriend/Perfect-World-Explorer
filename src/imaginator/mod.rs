@@ -698,7 +698,7 @@ impl Imaginator {
                 if let (Some((packed, arrived)), Some(composite)) =
                     (self.take_software_result(), self.composite.as_mut())
                 {
-                    composite.upload_software(&packed, arrived, queue);
+                    composite.upload_software(&packed, arrived, device, queue);
                 }
                 self.status = self.software_status();
             }
@@ -1036,7 +1036,7 @@ impl Imaginator {
         }
         if let Some((packed, extent)) = self.take_software_result() {
             if let Some(composite) = self.composite.as_mut() {
-                composite.upload_software(&packed, extent, queue);
+                composite.upload_software(&packed, extent, device, queue);
             }
         }
         if self.page_open {

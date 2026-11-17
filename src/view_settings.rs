@@ -597,7 +597,21 @@ impl ViewSettings {
             self.minimap_shape.label(),
             self.weather_override.token(),self.sky_override.token(),self.effect_shaft.token(),self.effect_distance,self.logging_mask,self.logging_dir)
     }
+    /// The settings file: `viewer-settings.txt` beside the executable.
+    ///
+    /// It used to live in `%LOCALAPPDATA%\PerfectWorldViewer` (or
+    /// `~/.config/PerfectWorldViewer`), which is invisible when you are looking
+    /// at a portable folder and impossible to reset by hand without knowing the
+    /// path. Everything the viewer remembers now sits in its own root, next to
+    /// `pwe-logs`, so one folder is the whole of its state.
     fn file() -> Option<std::path::PathBuf> {
+        Some(crate::diagnostics::explorer_root().join("viewer-settings.txt"))
+    }
+
+    /// Where releases before the root-folder move kept the settings.
+    ///
+    /// Read only once, to carry an existing configuration across; never written.
+    fn legacy_file() -> Option<std::path::PathBuf> {
         #[cfg(windows)]
         {
             std::env::var_os("LOCALAPPDATA")
@@ -621,12 +635,23 @@ impl ViewSettings {
     pub fn load_with_default_fog(fog_enabled: bool) -> Self {
         let mut defaults = Self::default();
         defaults.atmospheric_fog = fog_enabled;
-        Self::file()
-            .and_then(|p| std::fs::read(p).ok())
+        if let Some(settings) = Self::read(Self::file(), fog_enabled) {
+            return settings;
+        }
+        // A settings file from before the move: adopt it and write it to the new
+        // place, so the next run finds it there and the old copy stops mattering.
+        if let Some(settings) = Self::read(Self::legacy_file(), fog_enabled) {
+            let _ = settings.save();
+            return settings;
+        }
+        defaults
+    }
+
+    fn read(path: Option<std::path::PathBuf>, fog_enabled: bool) -> Option<Self> {
+        path.and_then(|p| std::fs::read(p).ok())
             .filter(|b| b.len() <= 16384)
             .and_then(|b| String::from_utf8(b).ok())
             .map(|text| Self::decode_with_fog_default(&text, fog_enabled))
-            .unwrap_or(defaults)
     }
     pub fn save(&self) -> Result<(), String> {
         let Some(path) = Self::file() else {
