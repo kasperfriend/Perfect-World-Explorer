@@ -44,6 +44,13 @@ use winapi::Interface;
 /// Bytes per triangle record the BLAS is built from: three `f32x3` positions.
 pub const GEOMETRY_STRIDE: u64 = 36;
 
+/// How long the render thread will wait for one acceleration-structure build.
+///
+/// A build for a captured map is a few hundred milliseconds at worst; anything
+/// longer means the device is gone or wedged, and blocking the frame loop on it
+/// is strictly worse than turning hardware tracing off and saying so.
+pub const BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The DXIL blob's location, relative to the module's own folder.
 pub const DXIL_FILE: &str = "imaginator/dxr_trace.cso";
 
@@ -593,17 +600,30 @@ impl HardwareTracer {
         if !SUCCEEDED(hr) {
             return Err(format!("queue Signal failed (HRESULT 0x{hr:08x})"));
         }
-        // A bounded spin: builds happen when the captured scene changes, which is
-        // a load-time event, and the alternative (an event object plus a wait) is
-        // more Win32 surface for the same effect.
-        let mut spins = 0u64;
+        // Wait for a real deadline, not a spin count.
+        //
+        // This used to be `while GetCompletedValue() < 1 { spin_loop() }` bounded
+        // by a count of 500 million iterations. A spin count says nothing about
+        // time on a pre-empted thread: the loop pegs a core and, if the GPU has
+        // not reached the build (or the driver never signals — a device removed,
+        // a hung queue), the window never draws its first frame and the user sees
+        // a white screen with nothing in the log. A deadline at least turns that
+        // into a reported failure the module page can show.
+        //
+        // The yield matters for the same reason: this runs on the render thread,
+        // so a plain spin also starves whatever wgpu needs to make progress.
+        let deadline = std::time::Instant::now() + BUILD_TIMEOUT;
         // SAFETY: `fence` is the live fence this submit signalled.
         while unsafe { fence.GetCompletedValue() } < 1 {
-            std::hint::spin_loop();
-            spins += 1;
-            if spins > 500_000_000 {
-                return Err("the GPU never finished the acceleration-structure build".into());
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "the GPU did not finish the acceleration-structure build within {:?} \
+                     (fence value still {}); hardware tracing is disabled for this session",
+                    BUILD_TIMEOUT,
+                    unsafe { fence.GetCompletedValue() }
+                ));
             }
+            std::thread::yield_now();
         }
         Ok(())
     }

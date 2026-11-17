@@ -657,8 +657,10 @@ impl Composite {
             width,
             height,
             self.frame_format,
-            // Filled by `copy_texture_to_texture` from the swapchain image, then
-            // sampled by the composite pass.
+            // Filled by `copy_texture_to_texture` from the swapchain image and
+            // sampled by the composite pass. `RENDER_ATTACHMENT` is not needed:
+            // the blit writes the swapchain image itself, and the copy is what
+            // fills this one.
             wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         // The frame's own sRGB view is what the composite used to sample, and

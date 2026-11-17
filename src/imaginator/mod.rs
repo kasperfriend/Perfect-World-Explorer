@@ -586,6 +586,15 @@ impl Imaginator {
     /// geometry the software one does. A failure is reported, not swallowed: the
     /// page says why hardware is not running.
     fn rebuild_hardware(&mut self) {
+        // Only worth doing when the hardware tracer is the one that will run.
+        // `ensure_built` records a command list, submits it and then *spin-waits*
+        // on a GPU fence, so building these structures for a software trace is
+        // pure cost — and because `init` does it before the first frame is ever
+        // presented, that wait is the difference between a window that appears
+        // and one that sits white.
+        if self.settings.tracer != TracerKind::Hardware {
+            return;
+        }
         let Some(hardware) = self.hardware.as_mut() else {
             return;
         };
@@ -1081,6 +1090,33 @@ mod tests {
                 assert_eq!(covered, height, "{height}/{slice} covers {covered} rows");
             }
         }
+    }
+
+    /// Building DXR structures is only for the hardware tracer.
+    ///
+    /// `ensure_built` submits a command list and then waits on a GPU fence, and
+    /// `init` calls the builder before the first frame is presented. Doing that
+    /// for a software trace stalled startup on work whose result nothing reads,
+    /// which is what left the window white.
+    #[test]
+    fn the_hardware_build_is_gated_on_the_hardware_tracer() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("fn rebuild_hardware(&mut self)")
+            .expect("rebuild_hardware is gone");
+        let body = &source[start..];
+        let end = body.find("\n    }").expect("unterminated function");
+        let body = &body[..end];
+        let guard = body
+            .find("if self.settings.tracer != TracerKind::Hardware")
+            .expect("rebuild_hardware must not build for a tracer that will not read it");
+        let build = body
+            .find("hardware.ensure_built(")
+            .expect("ensure_built is how the build happens");
+        assert!(
+            guard < build,
+            "the tracer check has to come before any acceleration-structure build"
+        );
     }
 
     /// The geometry from the crash report: a 344-row trace split 16 ways.

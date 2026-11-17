@@ -4352,6 +4352,10 @@ pub fn run(
     // The module does not exist yet, so the settings decide whether it is worth
     // the walk; a module that is off costs one settings read and nothing else.
     let imaginator_scene = crate::imaginator::Imaginator::saved_active(&t.element).then(|| {
+        // Load-time and potentially a walk over every resident triangle, on the
+        // thread that has not drawn a frame yet. Say so, so a startup that hangs
+        // here is distinguishable from one that hangs later.
+        eprintln!("Imaginator: capturing world geometry...");
         let grid = crate::navigation::MapSpace {
             width: t.width,
             height: t.height,
@@ -4370,6 +4374,9 @@ pub fn run(
             crate::imaginator::capture::CaptureBudget::default(),
         )
     });
+    if let Some(scene) = &imaginator_scene {
+        eprintln!("Imaginator: captured {} triangles", scene.triangle_count());
+    }
     let mut renderer = Renderer::new(
         device,
         queue,
@@ -4380,6 +4387,7 @@ pub fn run(
         &mut t,
         vegetation_authored_mips,
     )?;
+    eprintln!("Renderer built; entering the frame loop");
     // Resolution scaling: the world renders into an offscreen target at a
     // scaled extent and is bilinearly blitted to the full-size composition
     // view each frame. `applied_extent` is tracked so a window resize or a
@@ -4619,7 +4627,9 @@ pub fn run(
     // The Imaginator's own GPU objects: its composite pipelines and a hardware
     // probe. Both are built here, once, because a device and the frame's format
     // are exactly what they need; a module that is switched off never draws.
+    eprintln!("Imaginator: building GPU objects...");
     renderer.modules.imaginator().init(&renderer.device, format);
+    eprintln!("Imaginator: {}", renderer.modules.imaginator().status);
     renderer.modules.imaginator().sync_worker();
     let mut egui_renderer = egui_wgpu::Renderer::new(&renderer.device, format, None, 1);
     let map_texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
