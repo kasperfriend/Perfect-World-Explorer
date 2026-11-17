@@ -2837,36 +2837,35 @@ impl Renderer {
         // the water and the add-ons are drawn, so nothing they draw is rejected
         // behind a sheet (`docs/blockers.md` B-26).
         if matches!(view, Pass::Main) {
-            if let Some(size) = self.object_mv.as_ref().map(|texture| texture.size()) {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("world effect sheet motion"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &self.object_mv_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    // Tested, never written: a sheet behind a wall claims nothing.
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: depth,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        }),
-                        stencil_ops: None,
+            let size = self.object_mv.size();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("world effect sheet motion"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.object_mv_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                // Tested, never written: a sheet behind a wall claims nothing.
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
                     }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                models.draw_effect_motion(
-                    &self.queue,
-                    &mut pass,
-                    unjittered_vp.to_cols_array_2d(),
-                    (size.width, size.height),
-                );
-            }
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            models.draw_effect_motion(
+                &self.queue,
+                &mut pass,
+                unjittered_vp.to_cols_array_2d(),
+                (size.width, size.height),
+            );
         }
     }
 

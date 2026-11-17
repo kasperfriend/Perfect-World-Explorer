@@ -326,6 +326,9 @@ impl Draw {
                 fog_range: [0.; 4],
                 fog_color: [0.; 4],
                 eye: [0.; 4],
+                mv_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                prev_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                mv_size: [0.; 4],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -771,7 +774,7 @@ impl Draw {
     /// bucket order still describe this view, and so the attachment is written
     /// once per pixel in the same order the sheets were blended.
     pub fn draw_motion<'a>(
-        &mut self,
+        &'a mut self,
         queue: &wgpu::Queue,
         pass: &mut wgpu::RenderPass<'a>,
         current_vp: [[f32; 4]; 4],

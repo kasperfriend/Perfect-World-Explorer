@@ -1388,7 +1388,7 @@ impl World {
     /// way the sheets found it: blended content that occludes nothing
     /// (`docs/blockers.md` B-26).
     pub fn draw_effect_motion<'a>(
-        &mut self,
+        &'a mut self,
         queue: &wgpu::Queue,
         pass: &mut wgpu::RenderPass<'a>,
         current_vp: [[f32; 4]; 4],
