@@ -17,14 +17,55 @@ the selected one.
 | DLSS Super Resolution | **Implemented, runtime-unverified.** NVIDIA NGX `NVSDK_NGX_Feature_SuperSampling` from the vendored `nvngx_dlss.dll`: reversed-Z depth (`DLSS.Feature.Create.Flags = DepthInverted`), LDR sRGB input, Halton(2,3) jitter passed both as the projection shear and as `Jitter.Offset.X/Y`, and the shared reversed-Z depth-reprojection motion vectors. The vendor DLL is an NGX *snippet*, driven by NGX **Core** — the `_nvngx.dll`/`nvngx.dll` that ships with the display driver and lives in the `DriverStore` since driver 471.11: the viewer initialises Core once per device (`NVSDK_NGX_D3D12_Init_with_ProjectID`, falling back to `…Init`; `…Init_Ext` is the Core-to-snippet entry point and answers `0xbad00002` when an application calls it, which is why the viewer never does) and creates both features through it, with the viewer's `sdk/` folder first in `PathListInfo` so the vendored build is the one that runs. Core is looked for in the DriverStore first, then next to the executable and in the viewer's `sdk/` folders, then in `System32` (a copy left there belongs to a pre-471.11 driver and answers `0xbad0000c FAIL_OutOfDate` to everything newer), and **every** module found is tried in that order, so a stale copy cannot block a good one; the vendored snippet itself is the last resort; the parameter map is Core's (`NVSDK_NGX_D3D12_AllocateParameters` + `NVSDK_NGX_Parameter_Set*`), with the viewer's own `NVSDK_NGX_Parameter` table (`src/dlss/params.rs`) as the fallback. NGX's log lines go into `session.log` and `SuperSampling.Available` is logged after init. `DLAA` is the Native AA entry. Any init/create/evaluate failure logs the named `NVSDK_NGX_Result` and falls back to bilinear for the session. | Vendored NVIDIA DLSS/NGX (`nvngx_dlss.dll`, included in `sdk/`) + Windows/DX12 + an RTX GPU. |
 | XeSS | **Implemented, runtime-unverified.** Intel XeSS Super Resolution (SDK 3.0.2, `libxess.dll`) as a temporal `xessD3D12Execute` on a native DX12 command list: reversed-Z depth, LDR sRGB input, Halton(2,3) jitter, and the shared reversed-Z depth-reprojection motion-vector pass. Any loader/dispatch failure logs and falls back to bilinear for the session. | Vendored Intel XeSS SDK 3.0.2 (`libxess.dll`, included in `sdk/`) + Windows/DX12 + SM 6.4 GPU. |
 
-**Native AA** is a quality entry, not a provider: `upscale_quality=nativeaa`
-renders at exactly the window resolution (factor 1.0) and dispatches the
-provider with `renderSize == upscaleSize`, which is how FSR 3.1 exposes
-temporal antialiasing without upscaling. It is offered for FSR 3.1 only — the
-other providers either have their own name for the same thing (DLSS Ultra
-Quality = DLAA) or refuse a 1.0× ratio. A persisted `nativeaa` choice degrades
-to `quality` when the upscaler is changed to one that cannot dispatch it
-(`crate::sanitise`).
+### Quality modes: one table per provider
+
+The providers do **not** share a quality list, and the same word does not mean
+the same thing in two of them, so the matrix lives in one place —
+`src/modes.rs` — and the UI, the CLI (`--diagnose`), the render-extent helper
+and both vendor `create` paths read it. Each row carries the provider's own
+name for the mode, the render ratio it asks for, and the vendor enum value:
+
+| Mode | DLSS (NGX `PerfQualityValue`) | FSR 3.1 / 4 (FFX `qualityMode`) | FSR 2 | FSR 1 (EASU) | XeSS (`qualitySetting`) |
+| --- | --- | --- | --- | --- | --- |
+| Native AA | **DLAA** `5`, 1.0× | **Native AA** `0`, 1.0× | — | — | **Native AA** `106`, 1.0× |
+| Ultra Quality | — | — | — | — | **Ultra Quality** `104`, 1.3× |
+| Quality | `2`, 1.5× | `1`, 1.5× | `1`, 1.5× | 1.5× | `103`, 1.5× |
+| Balanced | `1`, 1.7× | `2`, 1.7× | `2`, 1.7× | 1.7× | `102`, 1.7× |
+| Performance | `0` (`MaxPerf`), 2.0× | `3`, 2.0× | `3`, 2.0× | 2.0× | `101`, 2.0× |
+| Ultra Performance | `3`, 3.0× | `4`, 3.0× | `4`, 3.0× | 3.0× | `100`, 3.0× |
+
+The four dashes are not gaps in the viewer:
+
+* **DLSS has no Ultra Quality.** `NVSDK_NGX_PerfQuality_Value` declares value 4,
+  but the installed core (32.0.16.2114) answers `CreateFeature` with
+  `0xbad00010 FAIL_UnsupportedParameter` for it, and the optimal-settings
+  callback answers `0x0` (no render size) — measured, `docs/blockers.md` B-28.
+  DLSS's native-resolution mode is DLAA, which is `upscale_quality=nativeaa` on
+  DLSS.
+* **The FFX upscaler has no Ultra Quality preset.** `ffx_upscale.h` (SDK 2.4.0)
+  runs Native AA 1.0×, Quality 1.5×, Balanced 1.7×, Performance 2.0×, Ultra
+  Performance 3.0×.
+* **FSR 1's EASU is spatial**, so a 1.0× dispatch would be a no-op, and **FSR 2
+  predates `FFX_UPSCALE_QUALITY_MODE_NATIVEAA`** (a 3.1/4.0 provider mode).
+* **XeSS 1.x had no Ultra Performance**, which is why it used to be hidden; the
+  vendored 3.0.2 runtime documents it (`XESS_QUALITY_SETTING_ULTRA_PERFORMANCE`,
+  3.0×) and the viewer offers it.
+
+Three rules follow from the table, and they are what keep a mode from silently
+becoming another one:
+
+1. `modes::require` is what `DlssUpscaler::new` and `XessUpscaler::new` call. A
+   mode the table does not carry for that provider is an error naming the reason
+   (`… the NGX core rejects NVSDK_NGX_PerfQuality_Value 4 with 0xbad00010 …`),
+   never a fold into a neighbouring mode — XeSS "Native AA" used to become
+   `XESS_QUALITY_SETTING_ULTRA_QUALITY` at a 1.0× render, and XeSS "Ultra
+   Performance" used to render at Performance's 2.0×.
+2. A persisted mode the selected provider does not offer degrades to the
+   **nearest advertised ratio** (`modes::nearest_available`) — once, at the top
+   of the frame, before the extent and the create call — so `ultraquality` saved
+   with XeSS becomes Quality under DLSS rather than a 1.0× render that fails.
+3. `--diagnose` prints every provider's rows with the vendor value and lists the
+   modes it does not offer, with the reason.
 
 **Sharpening is a per-upscaler slider, for every provider.** A temporal
 upscaler reconstructs detail from jittered history rather than inventing it
@@ -309,7 +350,7 @@ truncated) saying so instead of vanishing.
 ## Settings tokens
 
 `upscaling=off|dlss|fsr1|fsr2|fsr3|fsr4|xess` ·
-`upscale_quality=nativeaa|ultraquality|quality|balanced|performance|ultraperformance` ·
+`upscale_quality=nativeaa|ultraquality|quality|balanced|performance|ultraperformance` (which of these a provider offers is the table above) ·
 `fsr1_sharpness=<0..2 stops>` ·
 `fsr3_sharpness=<0..1>` (FFX sharpening for FSR 2/3.1/4 and Native AA) ·
 `dlss_sharpness=<0..1>` (NGX `Sharpness`; 0 = the raw, softer DLSS look) ·

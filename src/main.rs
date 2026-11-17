@@ -100,6 +100,7 @@ mod model_queue;
 mod model_receiver_class;
 mod model_receiver_gpu;
 mod model_texture_gpu;
+mod modes;
 mod modules;
 mod music;
 mod navigation;
@@ -951,7 +952,10 @@ fn export_height_png(
 //
 // `upscaling=off|dlss|fsr1|fsr2|fsr3|fsr4|xess`,
 // `upscale_quality=nativeaa|ultraquality|quality|balanced|performance|ultraperformance`
-// (`nativeaa` is FSR 3.1 only: the same dispatch at a 1.0x render ratio),
+// (which of them a provider actually offers lives in `modes`: `nativeaa` is
+// DLAA on DLSS, Native AA on FSR 3.1/4 and XeSS; `ultraquality` is XeSS only;
+// a saved mode the selected provider does not offer degrades to the nearest
+// ratio it does offer and `--diagnose` prints the whole matrix),
 // `frame_generation=off|dlss|fsr|xess`, `frame_multiplier=2|3|4|6`,
 // `fsr1_sharpness=<0..2 stops>`,
 // `fsr3_sharpness=<0..1>` (FFX `sharpness` for FSR 2/3.1/4),
@@ -1683,10 +1687,20 @@ pub fn support_latency(
     }
 }
 
-/// Quality mode for the upscaler. "UltraQuality" maps to DLAA on DLSS
-/// (native resolution with temporal accumulation); `NativeAa` is the explicit
-/// "render at 1.0×, only run the provider's temporal antialiasing" mode, which
-/// FSR 3.1 dispatches as an upscale with `renderSize == upscaleSize`.
+/// Quality mode for the upscaler, in portable terms. What each provider makes
+/// of it lives in [`modes`] — the same word does not mean the same thing
+/// everywhere:
+///
+/// * `NativeAa` is "render at 1.0× and only run the provider's temporal
+///   antialiasing": DLAA on DLSS (`PerfQualityValue 5`), `Native AA` on FSR
+///   3.1/4 (`FFX_UPSCALE_QUALITY_MODE_NATIVEAA`) and on XeSS
+///   (`XESS_QUALITY_SETTING_AA`). FSR 1 is spatial and FSR 2 predates the enum
+///   value, so neither offers it.
+/// * `UltraQuality` is 1.3×. XeSS has it (`XESS_QUALITY_SETTING_ULTRA_QUALITY`);
+///   DLSS does not (the NGX core rejects `PerfQualityValue 4`) and the FFX
+///   upscaler has no such preset, so only XeSS lists it.
+/// * `Quality`/`Balanced`/`Performance`/`UltraPerformance` are 1.5×/1.7×/2.0×/
+///   3.0× everywhere.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum UpscaleQuality {
     NativeAa,
@@ -1710,8 +1724,8 @@ impl UpscaleQuality {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::NativeAa => "Native AA (1.0× render, no upscaling)",
-            Self::UltraQuality => "Ultra Quality (DLAA on DLSS)",
+            Self::NativeAa => "Native AA (1.0× render)",
+            Self::UltraQuality => "Ultra Quality (1.3× render)",
             Self::Quality => "Quality",
             Self::Balanced => "Balanced",
             Self::Performance => "Performance",
@@ -1730,6 +1744,30 @@ impl UpscaleQuality {
         }
     }
 
+    /// The name the *provider* gives this mode — "DLAA" on DLSS, "Native AA"
+    /// on FSR 3.1/4 and XeSS, "Ultra Quality" on XeSS — falling back to the
+    /// portable name when the provider does not offer it.
+    pub fn label_for(self, method: UpscaleMethod) -> &'static str {
+        modes::find(method, self)
+            .map(|mode| mode.name)
+            .unwrap_or_else(|| self.label())
+    }
+
+    /// `None` when `method` offers this mode, otherwise the reason it does not
+    /// (the UI shows it as a disabled entry, the diagnostics print it).
+    pub fn availability_note(self, method: UpscaleMethod) -> Option<String> {
+        if quality_available(method, self) {
+            None
+        } else {
+            Some(match modes::rejection(method, self) {
+                Some(reason) => {
+                    format!("{} does not offer {}: {reason}", method.label(), self.label())
+                }
+                None => format!("{} does not offer {}", method.label(), self.label()),
+            })
+        }
+    }
+
     pub fn parse(text: &str) -> Option<Self> {
         match text.trim().to_ascii_lowercase().as_str() {
             "nativeaa" | "native_aa" | "native aa" => Some(Self::NativeAa),
@@ -1743,65 +1781,16 @@ impl UpscaleQuality {
     }
 }
 
-/// Which quality modes each provider documents. XeSS (1.x/2.x) has no Ultra
-/// Performance mode; DLSS maps Ultra Quality onto DLAA. Native AA — the
-/// explicit `renderSize == upscaleSize` dispatch — is offered for FSR 3.1,
-/// where AMD documents it; the other providers either replace it with their
-/// own Ultra Quality/DLAA mode or reject a 1.0× ratio.
-pub fn quality_available(method: UpscaleMethod, quality: UpscaleQuality) -> bool {
-    match quality {
-        UpscaleQuality::NativeAa => matches!(method, UpscaleMethod::Fsr3),
-        _ => match method {
-            UpscaleMethod::Off
-            | UpscaleMethod::Dlss
-            | UpscaleMethod::Fsr1
-            | UpscaleMethod::Fsr2
-            | UpscaleMethod::Fsr3
-            | UpscaleMethod::Fsr4 => true,
-            UpscaleMethod::Xess => quality != UpscaleQuality::UltraPerformance,
-        },
-    }
-}
-
-/// Linear render scale relative to the output resolution, per provider and
-/// quality mode. Sources: NVIDIA DLSS (DLAA native, Quality 1.5×, Balanced
-/// 1.7×, Performance 2×, Ultra Performance 3×), AMD FSR 2/3 (Ultra Quality
-/// 1.3×, Quality 1.5×, Balanced 1.7×, Performance 2×, Ultra Performance 3×),
-/// Intel XeSS (Ultra Quality 1.3×, Quality 1.5×, Balanced 1.7×, Performance 2×).
-/// Verify against the SDK you obtain; these are the documented defaults.
-pub fn internal_factor(method: UpscaleMethod, quality: UpscaleQuality) -> f64 {
-    match method {
-        UpscaleMethod::Off => 1.0,
-        UpscaleMethod::Dlss => match quality {
-            UpscaleQuality::NativeAa => 1.0,
-            UpscaleQuality::UltraQuality => 1.0,
-            UpscaleQuality::Quality => 1.0 / 1.5,
-            UpscaleQuality::Balanced => 1.0 / 1.7,
-            UpscaleQuality::Performance => 0.5,
-            UpscaleQuality::UltraPerformance => 1.0 / 3.0,
-        },
-        // FSR 1 EASU spans the same documented scale ladder as the FFX
-        // providers; the spatial pass has no DLAA-style native accumulation.
-        UpscaleMethod::Fsr1 | UpscaleMethod::Fsr2 | UpscaleMethod::Fsr3 | UpscaleMethod::Fsr4 => {
-            match quality {
-                UpscaleQuality::NativeAa => 1.0,
-                UpscaleQuality::UltraQuality => 1.0 / 1.3,
-                UpscaleQuality::Quality => 1.0 / 1.5,
-                UpscaleQuality::Balanced => 1.0 / 1.7,
-                UpscaleQuality::Performance => 0.5,
-                UpscaleQuality::UltraPerformance => 1.0 / 3.0,
-            }
-        }
-        UpscaleMethod::Xess => match quality {
-            UpscaleQuality::NativeAa => 1.0,
-            UpscaleQuality::UltraQuality => 1.0 / 1.3,
-            UpscaleQuality::Quality => 1.0 / 1.5,
-            UpscaleQuality::Balanced => 1.0 / 1.7,
-            UpscaleQuality::Performance => 0.5,
-            UpscaleQuality::UltraPerformance => 0.5,
-        },
-    }
-}
+/// Re-exported from [`modes`], which owns the provider × mode table.
+///
+/// Quality modes are **not** one shared list: DLSS offers DLAA and the four
+/// upscaling modes, the FFX providers offer Native AA plus the four upscaling
+/// modes and no Ultra Quality, XeSS offers Native AA *and* Ultra Quality (plus
+/// the rest), FSR 1 offers the upscaling modes only. `modes::modes` is the
+/// list, `modes::require` is what the providers call at create time, and
+/// `modes::nearest_available` is how a settings value that outlived its
+/// provider degrades.
+pub use modes::{internal_factor, nearest_available, quality_available};
 
 /// The support verdict for one provider on this machine.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2088,6 +2077,17 @@ pub fn pairing(upscale: UpscaleMethod, frame_generation: FrameGenMethod) -> Pair
     }
 }
 
+/// The name of the vendor field a mode's `vendor` value is written to, for the
+/// diagnostics print. FSR 1's EASU takes a scale factor and has no enum.
+fn vendor_parameter_name(method: UpscaleMethod) -> &'static str {
+    match method {
+        UpscaleMethod::Dlss => "PerfQualityValue",
+        UpscaleMethod::Fsr2 | UpscaleMethod::Fsr3 | UpscaleMethod::Fsr4 => "FFX qualityMode",
+        UpscaleMethod::Xess => "XeSS qualitySetting",
+        UpscaleMethod::Fsr1 | UpscaleMethod::Off => "(extent only)",
+    }
+}
+
 /// Coerce a persisted triple into a legal one, dropping only values this
 /// build cannot honour. Used at settings-decode time; never rewrites what the
 /// user sees beyond these rules.
@@ -2096,11 +2096,11 @@ pub fn sanitise(
     quality: UpscaleQuality,
     frame_generation: FrameGenMethod,
 ) -> (UpscaleMethod, UpscaleQuality, FrameGenMethod) {
-    let quality = if quality_available(upscale, quality) {
-        quality
-    } else {
-        UpscaleQuality::Quality
-    };
+    // A mode the selected provider does not advertise degrades to the nearest
+    // ratio it *does* advertise (XeSS "Ultra Quality" -> Quality on DLSS,
+    // "Native AA" -> Quality on FSR 2). Never drop it to a fixed default: that
+    // is how a 1.0x request could turn into a 1.5x render with no trace.
+    let quality = nearest_available(upscale, quality);
     let frame_generation = if pairing(upscale, frame_generation).is_supported() {
         frame_generation
     } else {
@@ -2595,13 +2595,22 @@ mod tests {
 
     #[test]
     fn sanitise_fixes_illegal_combinations() {
-        // XeSS has no Ultra Performance mode.
+        // DLSS has no Ultra Quality mode (the NGX core rejects
+        // PerfQualityValue 4); the saved choice degrades to the nearest ratio
+        // DLSS does offer instead of being forced onto one fixed default.
+        let (_, quality, _) = sanitise(
+            UpscaleMethod::Dlss,
+            UpscaleQuality::UltraQuality,
+            FrameGenMethod::Off,
+        );
+        assert_eq!(quality, UpscaleQuality::Quality);
+        // XeSS offers its whole ladder, Ultra Performance included (SDK 3.0.2).
         let (_, quality, _) = sanitise(
             UpscaleMethod::Xess,
             UpscaleQuality::UltraPerformance,
             FrameGenMethod::Off,
         );
-        assert_eq!(quality, UpscaleQuality::Quality);
+        assert_eq!(quality, UpscaleQuality::UltraPerformance);
         // Cross-vendor XeSS frame generation is not exposed.
         let (_, _, fg) = sanitise(
             UpscaleMethod::Fsr2,
@@ -2665,6 +2674,8 @@ mod tests {
 
     #[test]
     fn internal_factors_shrink_the_image_monotonically() {
+        // Only the modes a provider actually advertises: an unadvertised mode
+        // is not part of its ladder, and `modes::require` refuses it.
         for method in [
             UpscaleMethod::Dlss,
             UpscaleMethod::Fsr1,
@@ -2673,34 +2684,42 @@ mod tests {
             UpscaleMethod::Fsr4,
             UpscaleMethod::Xess,
         ] {
-            let factors: Vec<f64> = UpscaleQuality::ALL
-                .iter()
-                .map(|quality| internal_factor(method, *quality))
-                .collect();
+            let factors: Vec<f64> = modes::modes(method).iter().map(|mode| mode.factor).collect();
             assert!(factors.iter().all(|factor| *factor > 0.0 && *factor <= 1.0));
             for pair in factors.windows(2) {
                 assert!(
                     pair[0] >= pair[1],
-                    "factor must not grow with lower quality"
+                    "{method:?}: factor must not grow with lower quality"
                 );
+            }
+            // The table and the extent helper agree, mode for mode.
+            for mode in modes::modes(method) {
+                assert_eq!(internal_factor(method, mode.quality), mode.factor);
             }
         }
         assert_eq!(
             internal_factor(UpscaleMethod::Off, UpscaleQuality::Quality),
             1.0
         );
-        // DLAA renders at native resolution.
+        // DLAA renders at native resolution, and it is DLSS's `NativeAa`.
         assert_eq!(
-            internal_factor(UpscaleMethod::Dlss, UpscaleQuality::UltraQuality),
+            internal_factor(UpscaleMethod::Dlss, UpscaleQuality::NativeAa),
             1.0
         );
+        // XeSS Ultra Performance is 3.0x, not the 2.0x it used to borrow from
+        // Performance.
+        assert!((internal_factor(UpscaleMethod::Xess, UpscaleQuality::UltraPerformance)
+            - 1.0 / 3.0)
+            .abs()
+            < 1e-9);
     }
 
-    /// Native AA is the FSR 3.1 `renderSize == upscaleSize` dispatch: it must
-    /// render at exactly the output resolution, be offered for FSR 3.1 only,
-    /// and survive the settings round-trip.
+    /// Native AA is "1.0× render, provider's own temporal antialiasing". It is
+    /// offered only where the provider has such a mode — DLAA on DLSS, Native
+    /// AA on FSR 3.1/4 and on XeSS — and it must render at exactly the output
+    /// resolution wherever it is offered.
     #[test]
-    fn native_aa_is_native_and_fsr3_only() {
+    fn native_aa_is_native_where_the_provider_offers_it() {
         assert_eq!(
             UpscaleQuality::parse("native_aa"),
             Some(UpscaleQuality::NativeAa)
@@ -2713,40 +2732,65 @@ mod tests {
             UpscaleQuality::parse(UpscaleQuality::NativeAa.token()),
             Some(UpscaleQuality::NativeAa)
         );
-        assert_eq!(
-            internal_factor(UpscaleMethod::Fsr3, UpscaleQuality::NativeAa),
-            1.0
-        );
-        assert_eq!(
-            provider_extent(
-                UpscaleMethod::Fsr3,
-                UpscaleQuality::NativeAa,
-                1920,
-                1080,
-                8192
-            ),
-            (1920, 1080)
-        );
-        assert!(quality_available(
-            UpscaleMethod::Fsr3,
-            UpscaleQuality::NativeAa
-        ));
-        for method in UpscaleMethod::ALL {
-            if method != UpscaleMethod::Fsr3 {
-                assert!(
-                    !quality_available(method, UpscaleQuality::NativeAa),
-                    "{method:?} must not offer native AA"
-                );
-            }
-        }
-        // A persisted native-AA choice degrades instead of being dropped when
-        // the upscaler changes to one that cannot dispatch a 1.0x ratio.
-        let (_, quality, _) = sanitise(
+        for method in [
             UpscaleMethod::Dlss,
+            UpscaleMethod::Fsr3,
+            UpscaleMethod::Fsr4,
+            UpscaleMethod::Xess,
+        ] {
+            assert!(
+                quality_available(method, UpscaleQuality::NativeAa),
+                "{method:?} must offer its native-AA mode"
+            );
+            assert_eq!(internal_factor(method, UpscaleQuality::NativeAa), 1.0);
+            assert_eq!(
+                provider_extent(
+                    method,
+                    UpscaleQuality::NativeAa,
+                    1920,
+                    1080,
+                    8192
+                ),
+                (1920, 1080),
+                "{method:?} native AA must render at native resolution"
+            );
+        }
+        // FSR 1 is spatial, FSR 2 predates the enum value, and Off is off.
+        for method in [UpscaleMethod::Off, UpscaleMethod::Fsr1, UpscaleMethod::Fsr2] {
+            assert!(
+                !quality_available(method, UpscaleQuality::NativeAa),
+                "{method:?} must not offer native AA"
+            );
+        }
+        // Each provider calls its native-AA mode by its own name: the UI is
+        // showing the provider's name, not a portable one.
+        assert_eq!(
+            UpscaleQuality::NativeAa.label_for(UpscaleMethod::Dlss),
+            "DLAA"
+        );
+        assert_eq!(
+            UpscaleQuality::NativeAa.label_for(UpscaleMethod::Fsr3),
+            "Native AA"
+        );
+        assert_eq!(
+            UpscaleQuality::NativeAa.label_for(UpscaleMethod::Xess),
+            "Native AA"
+        );
+        // A persisted native-AA choice degrades to the nearest ratio when the
+        // upscaler changes to one that cannot dispatch a 1.0x ratio, and
+        // survives untouched where it can.
+        let (_, quality, _) = sanitise(
+            UpscaleMethod::Fsr2,
             UpscaleQuality::NativeAa,
             FrameGenMethod::Off,
         );
         assert_eq!(quality, UpscaleQuality::Quality);
+        let (_, quality, _) = sanitise(
+            UpscaleMethod::Dlss,
+            UpscaleQuality::NativeAa,
+            FrameGenMethod::Dlss,
+        );
+        assert_eq!(quality, UpscaleQuality::NativeAa);
         let (_, quality, _) = sanitise(
             UpscaleMethod::Fsr3,
             UpscaleQuality::NativeAa,
@@ -2770,12 +2814,24 @@ mod tests {
         assert_eq!(
             provider_extent(
                 UpscaleMethod::Dlss,
-                UpscaleQuality::UltraQuality,
+                UpscaleQuality::NativeAa,
                 1920,
                 1080,
                 8192
             ),
             (1920, 1080)
+        );
+        // XeSS Ultra Quality is the 1.3x rung; it must not be 1.0x (that is
+        // `XESS_QUALITY_SETTING_AA`, i.e. Native AA) nor 1.5x.
+        assert_eq!(
+            provider_extent(
+                UpscaleMethod::Xess,
+                UpscaleQuality::UltraQuality,
+                1920,
+                1080,
+                8192
+            ),
+            (1477, 831)
         );
         let (w, h) = provider_extent(UpscaleMethod::Xess, UpscaleQuality::Balanced, 1, 1, 8192);
         assert_eq!((w, h), (1, 1));
@@ -3206,21 +3262,22 @@ fn diagnose_upscale(args: &[String]) -> i32 {
                     continue;
                 }
                 println!("  {}:", method.label());
-                for quality in UpscaleQuality::ALL {
-                    let available = quality_available(method, quality);
-                    let (w, h) = provider_extent(method, quality, 1920, 1080, 8192);
+                for mode in modes::modes(method) {
+                    let (w, h) = provider_extent(method, mode.quality, 1920, 1080, 8192);
                     println!(
-                        "    {} — internal {}×{} (factor {:.4}){}",
-                        quality.label(),
+                        "    {} — internal {}×{} (factor {:.4}, {} {})",
+                        mode.name,
                         w,
                         h,
-                        internal_factor(method, quality),
-                        if available {
-                            ""
-                        } else {
-                            "  [not offered by this provider]"
-                        }
+                        mode.factor,
+                        vendor_parameter_name(method),
+                        mode.vendor
                     );
+                }
+                for quality in UpscaleQuality::ALL {
+                    if let Some(note) = quality.availability_note(method) {
+                        println!("    [not offered] {note}");
+                    }
                 }
             }
             println!();

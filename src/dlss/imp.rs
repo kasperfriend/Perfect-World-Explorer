@@ -32,13 +32,11 @@ static DUMPED_NGX_LOGS: AtomicBool = AtomicBool::new(false);
 /// inputs in (DLSS and DLSS-G both dispatch compute).
 const D3D12_STATE_NON_PIXEL_READ: u32 = d3d12_ty::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
 
-// `NVSDK_NGX_PerfQuality_Value`, in declaration order.
-const NGX_QUALITY_MAX_PERF: u32 = 0;
-const NGX_QUALITY_BALANCED: u32 = 1;
-const NGX_QUALITY_MAX_QUALITY: u32 = 2;
-const NGX_QUALITY_ULTRA_PERFORMANCE: u32 = 3;
-const NGX_QUALITY_ULTRA_QUALITY: u32 = 4;
-const NGX_QUALITY_DLAA: u32 = 5;
+// `NVSDK_NGX_PerfQuality_Value` values for DLSS live in `crate::modes` (the
+// provider × quality table) rather than here, so the value handed to NGX and
+// the mode the UI advertises cannot drift apart. `UltraQuality` = 4 is
+// deliberately absent from that table: the installed core
+// (32.0.16.2114) rejects it with `0xbad00010`.
 
 /// `NVSDK_NGX_DLSS_Feature_Flags_MVLowRes`: motion vectors are at render
 /// resolution rather than display resolution.
@@ -415,18 +413,16 @@ impl DlssUpscaler {
         quality: crate::UpscaleQuality,
     ) -> Result<Self, String> {
         let _ = queue;
-        let (quality_setting, quality_name) = match quality {
-            // Native AA is DLAA: the same feature at a 1.0× ratio, which is
-            // what `provider_extent` gives this quality.
-            crate::UpscaleQuality::NativeAa => (NGX_QUALITY_DLAA, "DLAA (native)"),
-            crate::UpscaleQuality::UltraQuality => (NGX_QUALITY_ULTRA_QUALITY, "ultra quality"),
-            crate::UpscaleQuality::Quality => (NGX_QUALITY_MAX_QUALITY, "quality"),
-            crate::UpscaleQuality::Balanced => (NGX_QUALITY_BALANCED, "balanced"),
-            crate::UpscaleQuality::Performance => (NGX_QUALITY_MAX_PERF, "performance"),
-            crate::UpscaleQuality::UltraPerformance => {
-                (NGX_QUALITY_ULTRA_PERFORMANCE, "ultra performance")
-            }
-        };
+        // The mode comes from the shared matrix (`crate::modes`), so the value
+        // written to `PerfQualityValue` is the one the table advertises and a
+        // mode DLSS does not have is refused here instead of being folded into
+        // another one. `UltraQuality` (NGX value 4) is the case that matters:
+        // the installed core answers `CreateFeature` with `0xbad00010`
+        // (`FAIL_UnsupportedParameter`) for it — DLSS's native-resolution mode
+        // is DLAA (value 5), which `NativeAa` maps to.
+        let mode = crate::modes::require(crate::UpscaleMethod::Dlss, quality)?;
+        let quality_setting = mode.vendor;
+        let quality_name = mode.name;
         // §3.3.1 of the programming guide: "The minimum supported output
         // resolution for DLSS is 32x32. Attempting to initialize DLSS with a
         // smaller output resolution will fail with an Invalid Parameter error."

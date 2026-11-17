@@ -20,11 +20,12 @@ use std::ffi::c_void;
 use winapi::shared::dxgiformat::{DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32_FLOAT};
 use winapi::um::d3d12 as d3d12_ty;
 
-const XESS_QUALITY_SETTING_ULTRA_PERFORMANCE: i32 = 100;
-const XESS_QUALITY_SETTING_PERFORMANCE: i32 = 101;
-const XESS_QUALITY_SETTING_BALANCED: i32 = 102;
-const XESS_QUALITY_SETTING_QUALITY: i32 = 103;
-const XESS_QUALITY_SETTING_ULTRA_QUALITY: i32 = 104;
+// `XESS_QUALITY_SETTING_*` values live in `crate::modes` (the provider ×
+// quality table): `ULTRA_PERFORMANCE 100`, `PERFORMANCE 101`, `BALANCED 102`,
+// `QUALITY 103`, `ULTRA_QUALITY 104`, `AA 106`. They are read from there so
+// the mode the UI advertises is exactly the `xess_quality_settings_t` the
+// context is created with — XeSS's Native AA mode is `XESS_QUALITY_SETTING_AA`,
+// not "Ultra Quality at a 1.0x render".
 
 const XESS_INIT_FLAG_INVERTED_DEPTH: u32 = 1 << 1;
 /// The input color is post-tonemap, sRGB-encoded LDR — matching how the FSR
@@ -320,19 +321,13 @@ impl XessUpscaler {
         quality: crate::UpscaleQuality,
     ) -> Result<Self, String> {
         let _ = queue;
-        let (quality_setting, quality_name) = match quality {
-            // Not offered for XeSS (see `quality_available`); the 1.0× render
-            // extent still works, so map it onto the sharpest XeSS mode.
-            crate::UpscaleQuality::NativeAa | crate::UpscaleQuality::UltraQuality => {
-                (XESS_QUALITY_SETTING_ULTRA_QUALITY, "ultra quality")
-            }
-            crate::UpscaleQuality::Quality => (XESS_QUALITY_SETTING_QUALITY, "quality"),
-            crate::UpscaleQuality::Balanced => (XESS_QUALITY_SETTING_BALANCED, "balanced"),
-            crate::UpscaleQuality::Performance => (XESS_QUALITY_SETTING_PERFORMANCE, "performance"),
-            crate::UpscaleQuality::UltraPerformance => {
-                (XESS_QUALITY_SETTING_ULTRA_PERFORMANCE, "ultra performance")
-            }
-        };
+        // One row of the shared matrix per mode (see `crate::modes`): Native AA
+        // is `XESS_QUALITY_SETTING_AA` (1.0x), Ultra Quality is
+        // `XESS_QUALITY_SETTING_ULTRA_QUALITY` (1.3x), and a mode XeSS does not
+        // have is refused here rather than folded into the nearest one.
+        let mode = crate::modes::require(crate::UpscaleMethod::Xess, quality)?;
+        let quality_setting = mode.vendor as i32;
+        let quality_name = mode.name;
         let (raw_device, raw_queue) = raw_dx12(device)?;
         let device_ptr = raw_device.as_mut_ptr() as *mut c_void;
         let mut loader = XessLoader::load(sdk_dir)?;

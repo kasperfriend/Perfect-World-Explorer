@@ -1252,7 +1252,7 @@ DLSS-G parameter type.
   in front of water with no hole in it, and no sliding of the glow against the wall
   behind it as the camera translates.
 
-## B-27 — DLSS evaluates fail with `FAIL_InvalidParameter` (cause found, fix awaiting a run)
+## B-27 — DLSS evaluates fail with `FAIL_InvalidParameter` (closed: the slot table was reversed; verified in session 9)
 
 - **Step:** enable DLSS Super Resolution in the viewer.
 - **Symptom:** `DLSS failed, rendering at native resolution instead:
@@ -1359,3 +1359,92 @@ DLSS-G parameter type.
   again is one line away from being visible. A unit test pins the whole table and
   the pairs the two halves have to agree on.
 
+- **Closed in session 9 (2026-11-15).** The uploaded session log answers the
+  question the fix was written for, at every quality mode the viewer offered:
+
+  ```text
+  [  29.437] [DLSS] create: quality (PerfQualityValue 2), 2293x913 -> 3440x1369, …
+  [  29.813] [DLSS] first evaluate OK (2293x913 -> 3440x1369, quality)
+  [  43.168] [DLSS] create: balanced (PerfQualityValue 1), 1995x794 -> 3440x1369, …
+  [  43.329] [DLSS] first evaluate OK (1995x794 -> 3440x1369, balanced)
+  [  47.158] [DLSS] create: performance (PerfQualityValue 0), 1720x685 -> 3440x1369, …
+  [  47.547] [DLSS] first evaluate OK (1720x685 -> 3440x1369, performance)
+  [  67.889] [DLSS] create: ultra performance (PerfQualityValue 3), 1147x456 -> 3440x1369, …
+  [  68.062] [DLSS] first evaluate OK (1147x456 -> 3440x1369, ultra performance)
+  ```
+
+  No `could not find … parameter` line follows any of them, the parameter-map
+  matrix reports the pointer pair as `Set slot 1 / Get slot 9`, and the two
+  `FAIL_UnsupportedParameter` lines in the same run belong to a different bug —
+  "ultra quality", which is **B-28**. DLSS Super Resolution runs.
+
+## B-28 — DLSS "Ultra Quality" could never create, and three providers quietly mis-mapped a mode
+
+- **Step:** set Upscaling = DLSS Super Resolution and Upscaling quality = Ultra
+  Quality (session 9, 37.0 s and 40.0 s), or pick Native AA on XeSS.
+- **Symptom (DLSS):**
+
+  ```text
+  [DLSS] optimal settings unavailable (DLSSOptimalSettingsCallback answered 0x0,
+         which names no render size); using the viewer's 3440x1369
+  [DLSS] create: ultra quality (PerfQualityValue 4), 3440x1369 -> 3440x1369, …
+  DLSS unavailable, rendering at native resolution instead:
+  NVSDK_NGX_D3D12_CreateFeature(DLSS) failed (0xbad00010 FAIL_UnsupportedParameter)
+  ```
+
+  twice, then the viewer fell back to native resolution for the session.
+- **Cause, two of them in the same row of the settings table.**
+  1. `internal_factor(Dlss, UltraQuality)` answered `1.0`, so the viewer asked
+     for a 1.0× render at "ultra quality". That is not a DLSS mode: the
+     optimal-settings callback answers `0x0` (no render size) and the render
+     range collapses, which is the same range collapse that made B-23 fail.
+  2. `NVSDK_NGX_PerfQuality_Value` 4 (`UltraQuality`) is not accepted by the
+     installed core (`_nvngx.dll` 32.0.16.2114) at all — `CreateFeature` answers
+     `0xbad00010`. DLSS's native-resolution mode is **DLAA**, value 5.
+- **The same sweep found three more rows that were lying about themselves.**
+  - XeSS "Native AA" was folded into `XESS_QUALITY_SETTING_ULTRA_QUALITY` (104,
+    1.3×) at a 1.0× render. XeSS 3.0.2 has a real native-resolution mode:
+    `XESS_QUALITY_SETTING_AA` (106, 1.0×, `sdk/include/xess/xess.h:100`).
+  - XeSS Ultra Performance was advertised as *not existing* (XeSS 1.x had none)
+    and, if it was reached anyway, silently rendered at 2.0× — Performance's
+    ratio. XeSS 3.0.2 documents `XESS_QUALITY_SETTING_ULTRA_PERFORMANCE` (100,
+    3.0×).
+  - The FFX providers offered "Ultra Quality" (1.3×). `ffx_upscale.h:40-44` has
+    no such preset — the ladder is Native AA 1.0×, Quality 1.5×, Balanced 1.7×,
+    Performance 2.0×, Ultra Performance 3.0× — and `NativeAa` was offered for
+    FSR 3.1 only even though FSR 4 uses the same enum.
+- **The fix.** One table now answers all of it: `src/modes.rs` carries a row per
+  provider per mode — portable quality, the provider's own name for it ("DLAA",
+  "Native AA", "Ultra Quality"), the render ratio, and the vendor enum value
+  (NGX, FFX, XeSS). `modes::modes` is what the UI and `--diagnose` list,
+  `modes::internal_factor` is what sizes the render target, and
+  `modes::require` is what `DlssUpscaler::new` and `XessUpscaler::new` call —
+  a mode the table does not carry is an error that names the reason
+  (`… the NGX core rejects NVSDK_NGX_PerfQuality_Value 4 with 0xbad00010 …`),
+  never a fold into another mode. A saved mode the selected provider does not
+  offer degrades to the **nearest advertised ratio** (`modes::nearest_available`)
+  once, at the top of the frame, so the extent and the mode handed to the
+  provider always agree.
+- **The matrix this ships.**
+  - DLSS: DLAA (5), Quality (2), Balanced (1), Performance (0), Ultra
+    Performance (3). No Ultra Quality.
+  - FSR 3.1 / FSR 4: Native AA (0), Quality (1), Balanced (2), Performance (3),
+    Ultra Performance (4). No Ultra Quality.
+  - FSR 2: the same without Native AA (the enum value is a 3.1+ provider mode);
+    FSR 1: Quality/Balanced/Performance/Ultra Performance (EASU is spatial, a
+    1.0× dispatch would be a no-op).
+  - XeSS: Native AA (106), Ultra Quality (104), Quality (103), Balanced (102),
+    Performance (101), Ultra Performance (100).
+- **Verification.** The table itself is unit-tested (`src/modes.rs`:
+  `matrix_matches_the_provider_lists`, `every_mode_maps_to_its_documented_vendor_value`,
+  `factors_match_the_documented_ratios`,
+  `require_refuses_unadvertised_modes_with_a_reason`,
+  `unavailable_modes_degrade_to_the_nearest_advertised_ratio`), the settings
+  round-trip is covered in `src/view_settings.rs`, and `--diagnose` prints the
+  whole matrix with the vendor value per row so the next session can read it
+  straight out of the log.
+- **Still open:** whether DLAA, XeSS Native AA and XeSS Ultra Performance
+  *evaluate* on the user's machine is a hardware question the next session log
+  answers — every path already writes its first successful frame
+  (`[DLSS] first evaluate OK (…, DLAA)` /
+  `[XeSS] first execute OK (…, Native AA)`), so one run per mode settles it.

@@ -100,6 +100,40 @@ Constants, all read out of `nvsdk_ngx_defs.h` at `v310.9.16`:
    smaller output fails with `InvalidParameter` and a minimised window would
    otherwise spend the retry budget on a condition that fixes itself.
 
+### `PerfQualityValue`: which values this core accepts
+
+`NVSDK_NGX_PerfQuality_Value` declares six values. The installed core
+(`_nvngx.dll` 32.0.16.2114) acting on `nvngx_dlss.dll` 310.9.16 accepts five of
+them, measured in session 9 (`docs/blockers.md` B-27 closed, B-28):
+
+| Value | Name | The viewer's mode | Result on this core |
+| --- | --- | --- | --- |
+| 0 | `MaxPerf` | Performance, 2.0× | `CreateFeature` `0x1`, first evaluate OK at 1720×685 → 3440×1369 |
+| 1 | `Balanced` | Balanced, 1.7× | OK at 1995×794 → 3440×1369 |
+| 2 | `MaxQuality` | Quality, 1.5× | OK at 2293×913 → 3440×1369 |
+| 3 | `UltraPerformance` | Ultra Performance, 3.0× | OK at 1147×456 → 3440×1369 |
+| 4 | `UltraQuality` | *(not offered)* | `CreateFeature` → `0xbad00010 FAIL_UnsupportedParameter` |
+| 5 | `DLAA` | Native AA, 1.0× | the feature's native-resolution mode |
+
+Value 4 is why DLSS no longer offers "Ultra Quality". Its two failure lines are
+unmistakable and they appear together, because the viewer's own ratio for that
+row was also wrong:
+
+```text
+[DLSS] optimal settings unavailable (DLSSOptimalSettingsCallback answered 0x0,
+       which names no render size); using the viewer's 3440x1369
+[DLSS] create: ultra quality (PerfQualityValue 4), 3440x1369 -> 3440x1369, …
+NVSDK_NGX_D3D12_CreateFeature(DLSS) failed (0xbad00010 FAIL_UnsupportedParameter)
+```
+
+A 1.0× request is not a quality mode to NGX — the callback answers `0x0` and the
+render range collapses to the display extent, which is also why the
+`InWidth/InHeight == Width/Height` pair that guides a valid feature cannot be
+handed over "exactly as given". DLSS's 1.0× mode is DLAA, and that is what
+`upscale_quality=nativeaa` sends (`src/modes.rs`, single source of truth for the
+value written to `PerfQualityValue`, the name in the log and the ratio the world
+is rendered at).
+
 The parameter names, setter types and vtable order are not taken on trust. The
 NGX DLLs export the feature entry points but **no** parameter allocator, so the
 viewer owns the `NVSDK_NGX_Parameter` table (`src/dlss/params.rs`). That table is

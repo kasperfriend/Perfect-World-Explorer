@@ -1194,9 +1194,17 @@ effect_shaft=up\neffect_distance=125.5\nlogging_mask=7\nlogging_dir=C:\\pwe-logs
         assert_eq!(unknown.upscaling, crate::UpscaleMethod::Off);
         assert_eq!(unknown.upscale_quality, crate::UpscaleQuality::Quality);
         assert_eq!(unknown.frame_generation, crate::FrameGenMethod::Off);
-        // XeSS has no Ultra Performance mode: coerced to Quality.
+        // Each provider keeps the modes it advertises: XeSS has the full
+        // ladder (SDK 3.0.2), so Ultra Performance survives…
         let xess = ViewSettings::decode("upscaling=xess\nupscale_quality=ultraperformance\n");
-        assert_eq!(xess.upscale_quality, crate::UpscaleQuality::Quality);
+        assert_eq!(xess.upscale_quality, crate::UpscaleQuality::UltraPerformance);
+        // …and a mode the provider does not have degrades to the nearest ratio
+        // it does (DLSS has no Ultra Quality: 1.3x -> Quality's 1.5x).
+        let dlss = ViewSettings::decode("upscaling=dlss\nupscale_quality=ultraquality\n");
+        assert_eq!(dlss.upscale_quality, crate::UpscaleQuality::Quality);
+        // XeSS Native AA is a real XeSS mode (`XESS_QUALITY_SETTING_AA`).
+        let xess_aa = ViewSettings::decode("upscaling=xess\nupscale_quality=nativeaa\n");
+        assert_eq!(xess_aa.upscale_quality, crate::UpscaleQuality::NativeAa);
         // Cross-vendor XeSS frame generation is not exposed: coerced to Off.
         let cross = ViewSettings::decode("upscaling=fsr2\nframe_generation=xess\n");
         assert_eq!(cross.frame_generation, crate::FrameGenMethod::Off);
