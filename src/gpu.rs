@@ -965,8 +965,7 @@ fn build(
                 for py in 0..slot.h {
                     for px in 0..slot.w {
                         let x = (px as u32 * img.width() / slot.w as u32).min(img.width() - 1);
-                        let y =
-                            (py as u32 * img.height() / slot.h as u32).min(img.height() - 1);
+                        let y = (py as u32 * img.height() / slot.h as u32).min(img.height() - 1);
                         let o = ((oy + py) * ATLAS + ox + px) * 4;
                         atlas[o..o + 4].copy_from_slice(&img.get_pixel(x, y).0);
                     }
@@ -2752,7 +2751,11 @@ impl Renderer {
         // What a rebuild actually asked the GPU to do. With the layout keys in
         // place a crossing normally uploads nothing here; a line that keeps
         // reporting uploads is the one to look at.
-        let grass_atlas_state = if m.grass_atlas_changed { "re-uploaded" } else { "kept" };
+        let grass_atlas_state = if m.grass_atlas_changed {
+            "re-uploaded"
+        } else {
+            "kept"
+        };
         crate::diag!(
             TimingLoad,
             "world update: {} scenery pages kept, {} uploaded, grass atlas {}",
@@ -2809,10 +2812,12 @@ impl Renderer {
             });
         }
         if !vertices.is_empty() {
-            self.queue.write_buffer(&self.vertex, 0, bytemuck::cast_slice(vertices));
+            self.queue
+                .write_buffer(&self.vertex, 0, bytemuck::cast_slice(vertices));
         }
         if !indices.is_empty() {
-            self.queue.write_buffer(&self.index, 0, bytemuck::cast_slice(indices));
+            self.queue
+                .write_buffer(&self.index, 0, bytemuck::cast_slice(indices));
         }
     }
     fn draw_opaque(

@@ -1721,18 +1721,28 @@ mod tests {
             "the last owner is installed and its index moved down"
         );
         assert_eq!(manager.active(4), Some(false));
-        assert!(!manager.set_active(2, true), "a removed identity owns nothing");
+        assert!(
+            !manager.set_active(2, true),
+            "a removed identity owns nothing"
+        );
         assert!(!manager.set_attenuation(2, 0.5));
         assert!(!manager.set_attachment(2, None));
         // The removed slot is free again, and re-inserting it must not collide
         // with the owners that shifted down.
         manager.insert(request(2, true)).unwrap();
         for identity in 1..=4 {
-            assert!(manager.set_active(identity, false), "{identity} is installed");
+            assert!(
+                manager.set_active(identity, false),
+                "{identity} is installed"
+            );
             assert_eq!(manager.active(identity), Some(false));
         }
         manager.set_active(3, true);
-        assert_eq!(manager.active(3), Some(true), "each flag hits its own owner");
+        assert_eq!(
+            manager.active(3),
+            Some(true),
+            "each flag hits its own owner"
+        );
         assert_eq!(manager.active(1), Some(false));
     }
 
@@ -1939,7 +1949,9 @@ mod tests {
     #[test]
     fn an_active_owner_plays_its_root_and_the_quads_come_out() {
         let mut manager = Manager::with_reader(root("gfx/scene/torch.gfx", &torch_file()));
-        manager.insert(request_path(1, true, "gfx/scene/torch.gfx")).unwrap();
+        manager
+            .insert(request_path(1, true, "gfx/scene/torch.gfx"))
+            .unwrap();
         let mut publications = LightPublications::default();
         manager.update(16, &mut publications);
         let status = manager.status();
@@ -1984,14 +1996,22 @@ mod tests {
                 }
             }
         });
-        manager.insert(request_path(1, true, "gfx/scene/torch.gfx")).unwrap();
+        manager
+            .insert(request_path(1, true, "gfx/scene/torch.gfx"))
+            .unwrap();
         let mut publications = LightPublications::default();
         manager.update(16, &mut publications);
         assert_eq!(manager.status().emitters, 1, "the light half decoded");
         assert_eq!(manager.status().players, 1, "the graph was built");
-        assert_eq!(reads.get(), 1, "the root text is decoded once, not once per half");
+        assert_eq!(
+            reads.get(),
+            1,
+            "the root text is decoded once, not once per half"
+        );
         // A different owner is a different member and is read on its own.
-        manager.insert(request_path(2, true, "gfx/scene/torch.gfx")).unwrap();
+        manager
+            .insert(request_path(2, true, "gfx/scene/torch.gfx"))
+            .unwrap();
         manager.update(16, &mut publications);
         assert_eq!(reads.get(), 2);
     }
