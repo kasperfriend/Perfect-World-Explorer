@@ -841,7 +841,9 @@ impl DlssUpscaler {
             }
             let params = match attempt {
                 0 => &mut self.params,
-                _ => replacement.as_mut().expect("a map for every attempt after the first"),
+                _ => replacement
+                    .as_mut()
+                    .expect("a map for every attempt after the first"),
             };
             write_evaluate_parameters(params, slot, &evaluate, resources);
             result = unsafe {
