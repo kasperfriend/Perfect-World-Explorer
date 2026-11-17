@@ -251,6 +251,17 @@ impl HardwareTracer {
             ));
             return;
         }
+        // A freshly created command list is *open*. `Reset` on an open list
+        // returns E_FAIL (0x80004005), which is exactly what the first build hit:
+        // "command list Reset failed". Close it once here so every later Reset
+        // starts from the recorded state.
+        let hr = unsafe { (*(list4 as *mut win::ID3D12GraphicsCommandList)).Close() };
+        if !SUCCEEDED(hr) {
+            self.status = HardwareStatus::Failed(format!(
+                "the build command list could not be closed (HRESULT 0x{hr:08x})"
+            ));
+            return;
+        }
         self.list4 = list4;
         self.allocator = allocator;
         // 3. The one piece that cannot be produced in-tree.

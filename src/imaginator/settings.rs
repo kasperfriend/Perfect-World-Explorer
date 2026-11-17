@@ -123,14 +123,13 @@ impl Default for ImaginatorSettings {
             shadows: true,
             strength: 0.6,
             samples: 1,
-            // A traced image is the *lighting*, not detail, so a low scale costs
-            // nothing visible on shadows and reflections. It costs a lot in the
-            // shader: the GPU tracer walks the packed BVH in a compute loop, and
-            // on a world with millions of triangles a half-resolution trace is
-            // long enough to trip the Windows display-driver watchdog, which
-            // freezes the window. 25% of the frame keeps the first traced frame
-            // cheap; the page's slider goes to 100% for anyone who wants it.
-            trace_scale: 25,
+            // A traced image is the *lighting*, not detail, so a fraction of the
+            // frame costs nothing the eye can see on shadows and reflections.
+            // 25% was chosen when the traversal visited most of the tree per
+            // ray; it is front-to-back now, which is several times cheaper, so
+            // half resolution is affordable and the blocky upscale that 25%
+            // produced is gone.
+            trace_scale: 50,
             water_reflection_fill: false,
             exposure: 1.0,
         }

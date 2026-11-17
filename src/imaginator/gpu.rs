@@ -153,6 +153,12 @@ struct Material { albedo_specular: vec4<f32> };
 @group(0) @binding(2) var<storage, read> nodes: array<Node>;
 @group(0) @binding(3) var<storage, read> order: array<u32>;
 @group(0) @binding(4) var<storage, read> mats: array<Material>;
+// `rgb` is the light the rays found — reflected plus interreflected, in colour —
+// and `a` is the sun visibility for the surface, or negative when the primary ray
+// escaped so the raster sky stands. Reflection and indirect share the colour
+// channels because the composite adds both: they only had to be separate while
+// each was a single luminance, and storing luminance is exactly what made
+// reflections invisible and every lit surface flat white.
 @group(0) @binding(5) var out_tex: texture_storage_2d<rgba32float, write>;
 
 const TERM_REFLECTIONS: u32 = 1u;
@@ -253,14 +259,50 @@ fn closest(ro: vec3<f32>, rd: vec3<f32>, tmax: f32) -> Hit {
     if h.t < best.t { best = h; }
    }
   } else {
-   if sp + 2 <= 48 {
-    stack[sp] = n.info.x;
-    stack[sp + 1] = n.info.x + 1u;
-    sp = sp + 2;
+   // Push the farther child first so the nearer one is popped next: the sooner
+   // `best.t` tightens, the more of the tree the slab test rejects. Pushing in
+   // index order instead made every ray touch most of the 1.2M nodes.
+   let nearer = child_entry(nodes[n.info.x], ro, rd);
+   let farther = child_entry(nodes[n.info.x + 1u], ro, rd);
+   if nearer <= farther {
+    if sp + 2 <= 48 {
+     stack[sp] = n.info.x + 1u;
+     stack[sp + 1] = n.info.x;
+     sp = sp + 2;
+    }
+   } else {
+    if sp + 2 <= 48 {
+     stack[sp] = n.info.x;
+     stack[sp + 1] = n.info.x + 1u;
+     sp = sp + 2;
+    }
    }
   }
  }
  return best;
+}
+
+/// Distance along `rd` at which a ray enters `n`, or a large value when it misses.
+/// Only used to order two children, so an exact hit is not required.
+fn child_entry(n: Node, ro: vec3<f32>, rd: vec3<f32>) -> f32 {
+ var t0 = 0.0;
+ var t1 = 1e30;
+ for (var axis = 0u; axis < 3u; axis = axis + 1u) {
+  let d = rd[axis];
+  let o = ro[axis];
+  if abs(d) < 1e-20 {
+   if o < n.min[axis] || o > n.max[axis] { return 1e30; }
+   continue;
+  }
+  let invd = 1.0 / d;
+  var near = (n.min[axis] - o) * invd;
+  var far = (n.max[axis] - o) * invd;
+  if near > far { let tmp = near; near = far; far = tmp; }
+  t0 = max(t0, near);
+  t1 = min(t1, far);
+  if t0 > t1 { return 1e30; }
+ }
+ return t0;
 }
 
 fn occluded(ro: vec3<f32>, rd: vec3<f32>, tmax: f32) -> bool {
@@ -375,10 +417,9 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
  let tan_half = p.forward.w;
  let aspect = p.screen.x;
  var seed = pcg(id.x * 1973u + id.y * 9277u + p.config.y * 26699u);
- var reflection = 0.0;
- var indirect = 0.0;
+ var reflection = vec3<f32>(0.0);
+ var indirect = vec3<f32>(0.0);
  var visibility = 0.0;
- var distance = 0.0;
  var hits = 0.0;
  let samples = max(p.config.z, 1u);
  for (var s = 0u; s < samples; s = s + 1u) {
@@ -391,7 +432,6 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
   let hit = closest(ro, rd, p.screen.z);
   if hit.t >= p.screen.z { continue; }
   hits = hits + 1.0;
-  distance = distance + hit.t;
   let point = ro + rd * hit.t;
   var normal = normalize(hit.normal);
   let facing = dot(normal, rd) > 0.0;
@@ -420,7 +460,7 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
     dir = normalize(mb[0] * (r * cos(phi)) + mb[1] * (r * sin(phi)) + mb[2] * sqrt(max(1.0 - u1, 0.0)));
     let b = closest(origin, dir, p.screen.z);
     if b.t >= p.screen.z {
-     indirect = indirect + dot(weight, vec3<f32>(0.3333)) * dot(sky(dir.y), vec3<f32>(0.3333));
+     indirect = indirect + weight * sky(dir.y);
      break;
     }
     let bp = origin + dir * b.t;
@@ -433,7 +473,7 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
      bv = sun_visibility(bp, bn, &seed);
     }
     let incoming = p.sun_color.rgb * (bl * bv) + sky(bn.y);
-    indirect = indirect + dot(weight * incoming, vec3<f32>(0.3333));
+    indirect = indirect + weight * incoming;
     weight = weight * bm.rgb;
     if max(weight.r, max(weight.g, weight.b)) < 0.02 { break; }
     origin = bp + bn * 0.02;
@@ -447,16 +487,20 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
     let mirror = normalize(rd + normal * (2.0 * cos_i));
     let r = closest(point + normal * 0.02, mirror, p.screen.z);
     if r.t < p.screen.z {
-     reflection = reflection + dot(shade_hit(point + mirror * r.t, r.normal, r.material, mirror, &seed, terms), vec3<f32>(0.3333));
+     reflection = reflection + shade_hit(point + mirror * r.t, r.normal, r.material, mirror, &seed, terms) * material_of(r.material).a;
     } else {
-     reflection = reflection + dot(sky(mirror.y), vec3<f32>(0.3333));
+     reflection = reflection + sky(mirror.y);
     }
    }
   }
  }
  let inv = 1.0 / f32(samples);
+ let radiance = (reflection + indirect) * inv;
+ // `hits` counts the samples that hit something, so a partially-covered pixel
+ // keeps the sky behind it rather than claiming full shadow.
+ let shadow = select(-1.0, visibility / max(hits, 1.0), hits > 0.5);
  textureStore(out_tex, vec2<i32>(i32(id.x), i32(id.y)),
-  vec4<f32>(reflection * inv, indirect * inv, select(0.0, visibility * inv, hits > 0.0), select(-1.0, distance * inv, hits > 0.0)));
+  vec4<f32>(radiance, shadow));
 }
 "#;
 
@@ -520,23 +564,31 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
  let exposure = p.strength.y;
  let render_mode = p.flags.x;
  if render_mode == 1u {
-  // Diagnostic: the traced picture alone, in the same terms the blend uses.
-  let lit = (traced_s.g * 2.0 + traced_s.r) * exposure;
-  let shadowed = mix(0.35, 1.0, traced_s.b);
-  textureStore(out_tex, vec2<i32>(i32(id.x), i32(id.y)), vec4<f32>(vec3<f32>(lit * shadowed), 1.0));
+  // Diagnostic: the traced light alone, so the rays can be judged on their own.
+  // `rgb` is reflected + interreflected radiance and `a` is sun visibility.
+  let shadowed = vec3<f32>(mix(0.35, 1.0, clamp(traced_s.a, 0.0, 1.0)));
+  textureStore(out_tex, vec2<i32>(i32(id.x), i32(id.y)),
+   vec4<f32>(traced_s.rgb * shadowed * exposure, 1.0));
   return;
  }
- // `traced.a` is the view distance, negative when the primary ray escaped.
+ // `traced.a` is negative when the primary ray escaped: sky, left as drawn.
  if traced_s.a < 0.0 {
-  // Sky: the raster sky is the reference and is left exactly as drawn.
   textureStore(out_tex, vec2<i32>(i32(id.x), i32(id.y)), vec4<f32>(frame_s.rgb, frame_s.a));
   return;
  }
- // Shadows remove light the raster path drew unconditionally: there is no
- // shadow map in the core, so every surface already carries full sun.
- let illumination = mix(1.0, mix(0.30, 1.0, clamp(traced_s.b, 0.0, 1.0)), clamp(strength, 0.0, 1.0));
- let added = (traced_s.g + traced_s.r) * strength;
- let result = frame_s.rgb * illumination + vec3<f32>(added);
+ // Shadows remove light the raster path drew unconditionally: the core has no
+ // shadow map, so every surface already carries full sun. Scaling the frame by
+ // the traced visibility is what removes that sun where a ray finds occlusion.
+ //
+ // The floor is 0, not 0.3. Keeping 30% of the light in full shadow is why
+ // shadows read as flat grey blobs: a real shadow removes the sun and leaves
+ // only ambient, which the traced indirect term then puts back as colour.
+ let visibility = clamp(traced_s.a, 0.0, 1.0);
+ let illumination = mix(1.0, visibility, clamp(strength, 0.0, 1.0));
+ // The rays' own colour, added as colour. This is the reflected and
+ // interreflected light the raster path cannot produce.
+ let added = traced_s.rgb * strength;
+ let result = frame_s.rgb * illumination + added;
  textureStore(out_tex, vec2<i32>(i32(id.x), i32(id.y)), vec4<f32>(result, frame_s.a));
 }
 "#;

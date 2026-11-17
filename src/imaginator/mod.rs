@@ -18,9 +18,10 @@
 //!   tree by `tools/imaginator-shaders.sh`; when either is missing the module
 //!   says which, on its own page, and the software tracer keeps working.
 //!
-//! Both write the same four channels (reflection, indirect, sun visibility,
-//! view distance) and both are composited by the same pass, so switching
-//! between them changes the image, never the pipeline.
+//! Both write the same image: `rgb` is the light the rays found — reflected plus
+//! interreflected, in colour — and `a` is the sun visibility, negative where the
+//! primary ray escaped so the raster sky stands. One contract, one compositing
+//! pass, so switching tracers changes the image and never the pipeline.
 //!
 //! ## Separation from the core
 //!
@@ -69,6 +70,7 @@ pub mod tracer;
 use bvh::SharedScene;
 use composite::Composite;
 use gpu::GpuParams;
+use hardware::HardwareStatus;
 use math::V3;
 use settings::{ImaginatorSettings, Tracer as TracerKind};
 use std::path::{Path, PathBuf};
@@ -699,13 +701,18 @@ impl Imaginator {
         let (tw, th) = gpu::traced_extent(extent.0, extent.1, self.settings.trace_scale);
         match self.settings.tracer {
             TracerKind::Hardware => {
-                // The hardware tracer needs the accelerated build and the DXIL
-                // blob; without both, the module reports why and does nothing
-                // rather than draw an image it cannot produce.
+                // The *compute* tracer that runs here intersects rays against the
+                // packed BVH in storage buffers; it never binds the TLAS. So a
+                // successful acceleration-structure build is not a prerequisite,
+                // and requiring one was costing the whole tracer: on a large map
+                // the build stalls for seconds before the first frame and the
+                // module reported failure instead of tracing.
                 let Some(hardware) = self.hardware.as_ref() else {
                     return false;
                 };
-                if !hardware.status.available() {
+                // Only a probe that says the GPU cannot do this at all is fatal.
+                // A build failure is a note, not a veto.
+                if matches!(hardware.status, HardwareStatus::Untried) {
                     self.status = hardware.status.label();
                     return false;
                 }
@@ -716,14 +723,15 @@ impl Imaginator {
                 // this size that loop is long enough to look like a hang. Say so
                 // rather than let the module appear to be tracing with DXR.
                 let _ = (tw, th);
+                let base = hardware.status.label();
                 self.status = if hardware.dxil_present(&self.directory) {
-                    hardware.status.label()
+                    base
                 } else {
+                    // Honest wording: the compute tracer is what runs, and it
+                    // works without DXR, so this is a note about the path in use
+                    // rather than an error.
                     format!(
-                        "{} — but the RayQuery shader is not installed, so rays are \
-                         traced in software on the GPU (slow on this map); use the \
-                         CPU tracer for now",
-                        hardware.status.label()
+                        "{base} — rays traced by the compute shader (no RayQuery blob installed)"
                     )
                 };
             }

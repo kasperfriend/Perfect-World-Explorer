@@ -915,24 +915,31 @@ pub fn composite_pixel(
     trace_only: bool,
 ) -> [f32; 3] {
     if trace_only {
-        let lit = (traced[1] * 2.0 + traced[0]) * exposure;
-        let shadowed = lerp(0.35, 1.0, traced[2]);
-        return [lit * shadowed; 3];
+        let shadowed = lerp(0.35, 1.0, traced[3].clamp(0., 1.));
+        return [
+            traced[0] * shadowed * exposure,
+            traced[1] * shadowed * exposure,
+            traced[2] * shadowed * exposure,
+        ];
     }
     if traced[3] < 0.0 {
         // Sky: the tracer's primary ray escaped, so the raster sky stands.
         return frame_linear;
     }
-    let illumination = lerp(
-        1.0,
-        lerp(0.30, 1.0, traced[2].clamp(0., 1.)),
-        strength.clamp(0., 1.),
-    );
-    let added = (traced[1] + traced[0]) * strength;
+    // The frame carries full sun because the core has no shadow map; the traced
+    // visibility is what removes it. No floor: a shadow that keeps 30% of the
+    // sun reads as a grey blob rather than a shadow.
+    let visibility = traced[3].clamp(0., 1.);
+    let illumination = lerp(1.0, visibility, strength.clamp(0., 1.));
+    let added = [
+        traced[0] * strength,
+        traced[1] * strength,
+        traced[2] * strength,
+    ];
     [
-        frame_linear[0] * illumination + added,
-        frame_linear[1] * illumination + added,
-        frame_linear[2] * illumination + added,
+        frame_linear[0] * illumination + added[0],
+        frame_linear[1] * illumination + added[1],
+        frame_linear[2] * illumination + added[2],
     ]
 }
 
@@ -957,20 +964,30 @@ mod tests {
     }
 
     #[test]
-    fn a_shadowed_surface_keeps_some_light_and_loses_the_rest() {
+    fn a_shadowed_surface_loses_the_sun_and_keeps_its_colour() {
         let s = settings();
         let base = [0.5, 0.5, 0.5];
-        let shadowed = composite_pixel(base, [0., 0., 0., 10.], s.strength, 1., false);
-        let lit = composite_pixel(base, [0., 0., 1., 10.], s.strength, 1., false);
+        // `a` is sun visibility now; rgb is the light the rays found.
+        let shadowed = composite_pixel(base, [0., 0., 0., 0.], s.strength, 1., false);
+        let lit = composite_pixel(base, [0., 0., 0., 1.], s.strength, 1., false);
         assert!(
             shadowed[0] < lit[0],
             "a fully shadowed pixel must be darker than a lit one"
         );
+        // A shadow removes the sun, not the pixel's own colour. At the default
+        // strength of 0.6 a full shadow keeps 40% of the raster light; at 1.0 it
+        // keeps none, and the traced ambient is what fills it back in.
         assert!(
-            shadowed[0] > 0.1,
-            "a shadow must not be black: {}",
-            shadowed[0]
+            shadowed[0] < lit[0] * 0.5,
+            "a shadow must remove most of the light: {} vs {}",
+            shadowed[0],
+            lit[0]
         );
+        let full = composite_pixel(base, [0., 0., 0., 0.], 1.0, 1., false);
+        assert!(full[0] < 1e-6, "at strength 1 a full shadow is unlit");
+        // Traced ambient puts colour back into the shadow instead of grey.
+        let with_ambient = composite_pixel(base, [0.02, 0.05, 0.01, 0.], s.strength, 1., false);
+        assert!(with_ambient[1] > with_ambient[2] && with_ambient[1] > with_ambient[0]);
     }
 
     #[test]
@@ -992,16 +1009,18 @@ mod tests {
     }
 
     #[test]
-    fn indirect_and_reflections_both_add_light() {
+    fn traced_light_is_added_in_colour() {
         let s = settings();
         let base = [0.05, 0.05, 0.05];
-        let lit = composite_pixel(base, [0., 0., 1., 5.], s.strength, 1., false);
-        let reflected = composite_pixel(base, [1., 0., 1., 5.], s.strength, 1., false);
-        let bounced = composite_pixel(base, [0., 1., 1., 5.], s.strength, 1., false);
-        assert!(reflected[0] > lit[0]);
-        assert!(bounced[0] > lit[0]);
-        let both = composite_pixel(base, [1., 1., 1., 5.], s.strength, 1., false);
-        assert!(both[0] > reflected[0] && both[0] > bounced[0]);
+        let none = composite_pixel(base, [0., 0., 0., 1.], s.strength, 1., false);
+        // A red reflection brightens red only; this is what makes a reflection
+        // read as a reflection rather than as a uniform grey wash.
+        let red = composite_pixel(base, [0.8, 0., 0., 1.], s.strength, 1., false);
+        assert!(red[0] > none[0]);
+        assert!((red[1] - none[1]).abs() < 1e-6, "green must be untouched");
+        assert!((red[2] - none[2]).abs() < 1e-6, "blue must be untouched");
+        let green = composite_pixel(base, [0., 0.8, 0., 1.], s.strength, 1., false);
+        assert!(green[1] > red[1]);
     }
 
     #[test]
