@@ -1723,6 +1723,6 @@ fn main() {
         mean(&wind_frames[1])
     );
     println!("History-driven grass wind changes {changes} pixels, zero restores exact image");
-    grass.update(&device, grass_instances::Data::default());
+    grass.update(&device, &queue, grass_instances::Data::default());
     println!("Empty streaming update succeeded");
 }

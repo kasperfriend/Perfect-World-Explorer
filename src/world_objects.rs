@@ -206,7 +206,18 @@ impl Page {
             v.color[1] *= factor;
             v.color[3] *= factor;
         }
-        self.atlas.truncate(SIDE * height * 4);
+        // The streamer grows the atlas as textures are packed instead of
+        // zero-filling all 4096 rows up front, so make the final buffer exactly
+        // the extent the upload reads: `GpuPage::upload` copies `SIDE × height`
+        // texels and a short buffer would be an out-of-range upload. Shared-atlas
+        // pages own no pixels at all and keep the empty vector they assert on.
+        let extent = SIDE * height * 4;
+        if !self.atlas.is_empty() {
+            if self.atlas.len() < extent {
+                self.atlas.resize(extent, 0);
+            }
+            self.atlas.truncate(extent);
+        }
         self.atlas.shrink_to_fit();
         self.used_height = height;
         self.vertices.shrink_to_fit();
@@ -1493,6 +1504,63 @@ mod page_tests {
         assert_eq!(page.vertices[0].color[3], 0.5);
         assert_eq!(page.mips[6].len(), (SIDE / 128) * 2 * 4);
     }
+    /// The streamer grows a page atlas as its rectangles are packed instead of
+    /// allocating 4096 square up front, so a page arrives with a buffer that is
+    /// exactly as tall as the rows it used. `finish` must hand the upload a
+    /// buffer of exactly the extent it copies, and keep all seven mips valid.
+    #[test]
+    fn a_page_grown_to_its_used_rows_uploads_exactly_its_extent() {
+        let rows = SIDE / 8;
+        let page = Page {
+            shared_atlas: None,
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            atlas: vec![17; SIDE * rows * 4],
+            processed: 0,
+            used_height: rows,
+            mips: Vec::new(),
+            placements: Vec::new(),
+            bounds: Vec::new(),
+            page_min: [f32::INFINITY; 3],
+            page_max: [f32::NEG_INFINITY; 3],
+            page_has_sdr: false,
+        }
+        .finish();
+        assert_eq!(page.atlas.len(), SIDE * rows * 4);
+        assert_eq!(page.mips.len(), 7);
+        let (mut w, mut h) = (SIDE, rows);
+        for level in 0..7 {
+            assert_eq!(page.mips[level].len(), (w / 2) * (h / 2) * 4, "mip {level}");
+            w /= 2;
+            h /= 2;
+        }
+    }
+
+    /// A page whose packer reserved less than its reported height — the short
+    /// buffer an incremental grow can leave behind — is padded rather than read
+    /// past the end.
+    #[test]
+    fn a_short_page_atlas_is_padded_to_its_upload_extent() {
+        let rows = 256;
+        let page = Page {
+            shared_atlas: None,
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            atlas: vec![3; SIDE * 128 * 4],
+            processed: 0,
+            used_height: rows,
+            mips: Vec::new(),
+            placements: Vec::new(),
+            bounds: Vec::new(),
+            page_min: [f32::INFINITY; 3],
+            page_max: [f32::NEG_INFINITY; 3],
+            page_has_sdr: false,
+        }
+        .finish();
+        assert_eq!(page.atlas.len(), SIDE * rows * 4);
+        assert!(page.atlas[SIDE * 128 * 4..].iter().all(|&v| v == 0));
+    }
+
     /// A placement span as the builder writes them: touching, in order.
     fn span(start: u32, end: u32, order: u64, reflect: bool, refract: bool) -> PlacementRange {
         PlacementRange {

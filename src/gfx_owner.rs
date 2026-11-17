@@ -377,6 +377,21 @@ pub struct Manager {
     /// Each root's clock at the previous census report, so the next one can say
     /// whether it moved. Keyed by path: the census is about roots, not instances.
     census_clocks: std::collections::HashMap<String, f32>,
+    /// Owner index by identity.
+    ///
+    /// A world installs every effect record it maps, so `owners` holds a few
+    /// thousand entries and the per-frame flags (`set_active`, `set_attenuation`,
+    /// an attachment parent) arrive once per owner. Resolving each of them with a
+    /// linear scan made the update quadratic in the number of installed effects —
+    /// millions of identity comparisons every frame for flags that rarely change.
+    /// The map is rebuilt whenever an owner is removed, so an index can never go
+    /// stale; `set_*` still re-checks the identity it found.
+    index: std::collections::HashMap<u64, usize>,
+    /// Text of the root the loader admitted most recently, so building that
+    /// owner's animated half in the same update does not inflate, decode and
+    /// parse the same archive member a second time. Holds one root, never the
+    /// world's.
+    last_root: Option<(String, String)>,
 }
 
 /// How often the census repeats while the variable is set. Two seconds is long
@@ -541,6 +556,8 @@ impl Manager {
                 next: std::time::Instant::now() + CENSUS_INTERVAL,
             }),
             census_clocks: std::collections::HashMap::new(),
+            index: std::collections::HashMap::new(),
+            last_root: None,
         }
     }
 
@@ -585,11 +602,7 @@ impl Manager {
             }
             request.speed = 0.;
         }
-        if self
-            .owners
-            .iter()
-            .any(|owner| owner.request.identity == request.identity)
-        {
+        if self.index.contains_key(&request.identity) {
             return Err(format!("duplicate GFX owner identity {}", request.identity));
         }
         // The scene channel: the record exactly as the map asked for it. Paired
@@ -624,6 +637,8 @@ impl Manager {
         );
         let serial = self.next_serial;
         self.next_serial = self.next_serial.wrapping_add(1);
+        let identity = request.identity;
+        let index = self.owners.len();
         self.owners.push(Owner {
             serial,
             request,
@@ -633,7 +648,27 @@ impl Manager {
             player_failed: false,
             attenuation: 1.,
         });
+        self.index.insert(identity, index);
         Ok(())
+    }
+
+    /// Rebuild the identity index after owners were removed from the vector.
+    ///
+    /// Removal shifts every later index, so the map is rebuilt once per update
+    /// that removed something. Removals are rare (an authored lifetime ending, a
+    /// region unload); the per-frame flag traffic is not, which is why the map
+    /// exists in the first place.
+    fn reindex(&mut self) {
+        self.index.clear();
+        self.index.reserve(self.owners.len());
+        for (index, owner) in self.owners.iter().enumerate() {
+            self.index.insert(owner.request.identity, index);
+        }
+    }
+
+    fn position_of(&self, identity: u64) -> Option<usize> {
+        let index = *self.index.get(&identity)?;
+        (self.owners.get(index)?.request.identity == identity).then_some(index)
     }
 
     /// Set the manager-wide light-priority limit. Elements with a larger
@@ -658,17 +693,11 @@ impl Manager {
 
     /// Region/time visibility. Returns false when the identity is not owned.
     pub fn set_active(&mut self, identity: u64, active: bool) -> bool {
-        match self
-            .owners
-            .iter_mut()
-            .find(|o| o.request.identity == identity)
-        {
-            Some(owner) => {
-                owner.request.active = active;
-                true
-            }
-            None => false,
-        }
+        let Some(index) = self.position_of(identity) else {
+            return false;
+        };
+        self.owners[index].request.active = active;
+        true
     }
 
     /// Fade one owner's root to `fade` (0..1) without unloading it.
@@ -678,13 +707,10 @@ impl Manager {
     /// Returns false when the identity is not owned, so a stale producer can
     /// never dim somebody else's root.
     pub fn set_attenuation(&mut self, identity: u64, fade: f32) -> bool {
-        let Some(owner) = self
-            .owners
-            .iter_mut()
-            .find(|o| o.request.identity == identity)
-        else {
+        let Some(index) = self.position_of(identity) else {
             return false;
         };
+        let owner = &mut self.owners[index];
         let fade = if fade.is_finite() {
             fade.clamp(0., 1.)
         } else {
@@ -699,14 +725,10 @@ impl Manager {
     /// Called once per frame with the resolved hook matrix; returns false when
     /// the identity is not owned, so a stale hook can never keep publishing.
     pub fn set_attachment(&mut self, identity: u64, parent: Option<[f32; 16]>) -> bool {
-        let Some(owner) = self
-            .owners
-            .iter_mut()
-            .find(|o| o.request.identity == identity)
-        else {
+        let Some(index) = self.position_of(identity) else {
             return false;
         };
-        owner.request.attachment = parent;
+        self.owners[index].request.attachment = parent;
         true
     }
 
@@ -718,25 +740,21 @@ impl Manager {
     }
 
     pub fn active(&self, identity: u64) -> Option<bool> {
-        self.owners
-            .iter()
-            .find(|o| o.request.identity == identity)
-            .map(|o| o.request.active)
+        self.position_of(identity)
+            .map(|index| self.owners[index].request.active)
     }
 
     /// Destroy an owner before or after it published. Its pending publication
     /// membership is removed, so a light can never outlive its producer.
     pub fn remove(&mut self, identity: u64, publications: &mut LightPublications) -> bool {
-        let Some(index) = self
-            .owners
-            .iter()
-            .position(|o| o.request.identity == identity)
-        else {
+        let Some(index) = self.position_of(identity) else {
             return false;
         };
         self.unregister(&self.owners[index], publications);
         self.owners.remove(index);
         self.removed += 1;
+        // Every index past the removed one moved down by one.
+        self.reindex();
         true
     }
 
@@ -747,6 +765,7 @@ impl Manager {
         }
         self.removed += self.owners.len();
         self.owners.clear();
+        self.index.clear();
     }
 
     fn unregister(&self, owner: &Owner, publications: &mut LightPublications) {
@@ -779,22 +798,16 @@ impl Manager {
             }
         }
         for identity in finished {
-            if let Some(index) = self
-                .owners
-                .iter()
-                .position(|o| o.request.identity == identity)
-            {
+            if let Some(index) = self.position_of(identity) {
                 self.unregister(&self.owners[index], publications);
                 self.owners.remove(index);
                 self.removed += 1;
+                // An authored lifetime ended: the indices past it moved down.
+                self.reindex();
             }
         }
         for (identity, error) in failed {
-            if let Some(index) = self
-                .owners
-                .iter()
-                .position(|o| o.request.identity == identity)
-            {
+            if let Some(index) = self.position_of(identity) {
                 self.unregister(&self.owners[index], publications);
                 let origin = self.owners[index].request.origin.clone();
                 self.owners[index].state = State::Failed;
@@ -1055,18 +1068,33 @@ impl Manager {
         };
         let path = self.owners[index].request.path.clone();
         let origin = self.owners[index].request.origin.clone();
+        // The loader usually admitted this very root, and `load_one` kept its
+        // text. Reuse it instead of reading, inflating and decoding the same
+        // archive member again; the cache holds one root, so this cannot grow
+        // with the world.
+        let cached = self
+            .last_root
+            .as_ref()
+            .filter(|(cached, _)| *cached == path)
+            .map(|(_, text)| text.clone());
         let built = match &mut self.read {
-            Some(read) => read(&path).and_then(|text| {
-                let mut player = Self::player(&text, &path, read)?;
-                // Element 160 names models from the same archive. Resolving them
-                // needs a binary reader; without one the model elements keep
-                // counting and stay undrawn, as they were before.
-                if let Some(model_read) = &mut self.read_model {
-                    // Earlier `read` borrows are released by the block above.
-                    player.load_models(&path, model_read)?;
-                }
-                Ok(player)
-            }),
+            Some(read) => {
+                let text = match cached {
+                    Some(text) => Ok(text),
+                    None => read(&path),
+                };
+                text.and_then(|text| {
+                    let mut player = Self::player(&text, &path, read)?;
+                    // Element 160 names models from the same archive. Resolving them
+                    // needs a binary reader; without one the model elements keep
+                    // counting and stay undrawn, as they were before.
+                    if let Some(model_read) = &mut self.read_model {
+                        // Earlier `read` borrows are released by the block above.
+                        player.load_models(&path, model_read)?;
+                    }
+                    Ok(player)
+                })
+            }
             None => Err(format!("{path}: no GFX root reader attached")),
         };
         match built {
@@ -1218,6 +1246,12 @@ impl Manager {
                 return;
             }
         };
+        // Hand the text to the geometry half when it builds this owner's player,
+        // which usually happens in this same update. Without it the same archive
+        // member is inflated and GBK-decoded twice for every root the camera
+        // reaches — the per-frame hitch that looked like the world was still
+        // loading long after it had drawn.
+        self.last_root = Some((path.clone(), text.clone()));
         let (lights, light_error) = match Self::decode(&text) {
             Ok(emitters) => (emitters, None),
             // A container this reader cannot open is a *format gap*, not a root
@@ -1668,6 +1702,40 @@ mod tests {
         assert_eq!(manager.status().failed_owners, 0);
     }
 
+    /// Removing an owner shifts every later index, so the identity index has to
+    /// be rebuilt. Without it a flag for a surviving owner either misses (the
+    /// index points past the end) or lands on a different record, and the
+    /// identity re-check would then silently drop the frame's activation.
+    #[test]
+    fn removal_rebuilds_the_identity_index() {
+        let mut manager = Manager::new();
+        for identity in 1..=4 {
+            manager.insert(request(identity, true)).unwrap();
+        }
+        let mut publications = LightPublications::default();
+        manager.update(0, &mut publications);
+        let mut drained = LightPublications::default();
+        assert!(manager.remove(2, &mut drained));
+        assert!(
+            manager.set_active(4, false),
+            "the last owner is installed and its index moved down"
+        );
+        assert_eq!(manager.active(4), Some(false));
+        assert!(!manager.set_active(2, true), "a removed identity owns nothing");
+        assert!(!manager.set_attenuation(2, 0.5));
+        assert!(!manager.set_attachment(2, None));
+        // The removed slot is free again, and re-inserting it must not collide
+        // with the owners that shifted down.
+        manager.insert(request(2, true)).unwrap();
+        for identity in 1..=4 {
+            assert!(manager.set_active(identity, false), "{identity} is installed");
+            assert_eq!(manager.active(identity), Some(false));
+        }
+        manager.set_active(3, true);
+        assert_eq!(manager.active(3), Some(true), "each flag hits its own owner");
+        assert_eq!(manager.active(1), Some(false));
+    }
+
     #[test]
     fn missing_root_fails_explicitly_without_blocking_later_owners() {
         let text = light_file();
@@ -1871,9 +1939,7 @@ mod tests {
     #[test]
     fn an_active_owner_plays_its_root_and_the_quads_come_out() {
         let mut manager = Manager::with_reader(root("gfx/scene/torch.gfx", &torch_file()));
-        manager
-            .insert(request_path(1, true, "gfx/scene/torch.gfx"))
-            .unwrap();
+        manager.insert(request_path(1, true, "gfx/scene/torch.gfx")).unwrap();
         let mut publications = LightPublications::default();
         manager.update(16, &mut publications);
         let status = manager.status();
@@ -1897,6 +1963,37 @@ mod tests {
             quads.len(),
             "a forever keypoint draws the same quad every frame"
         );
+    }
+
+    /// A root has two halves — the light emitters and the animated graph — and
+    /// both are built from the same archive member. They are admitted on the
+    /// same update, so the second half must reuse the text the loader already
+    /// decoded instead of inflating the member again: the double read was a
+    /// per-frame stall while the queue drained.
+    #[test]
+    fn a_root_is_read_once_for_both_of_its_halves() {
+        let reads = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let mut manager = Manager::with_reader({
+            let reads = reads.clone();
+            move |requested: &str| {
+                if requested == "gfx/scene/torch.gfx" {
+                    reads.set(reads.get() + 1);
+                    Ok(torch_file())
+                } else {
+                    Err("missing GFX root".into())
+                }
+            }
+        });
+        manager.insert(request_path(1, true, "gfx/scene/torch.gfx")).unwrap();
+        let mut publications = LightPublications::default();
+        manager.update(16, &mut publications);
+        assert_eq!(manager.status().emitters, 1, "the light half decoded");
+        assert_eq!(manager.status().players, 1, "the graph was built");
+        assert_eq!(reads.get(), 1, "the root text is decoded once, not once per half");
+        // A different owner is a different member and is read on its own.
+        manager.insert(request_path(2, true, "gfx/scene/torch.gfx")).unwrap();
+        manager.update(16, &mut publications);
+        assert_eq!(reads.get(), 2);
     }
 
     /// The world hands an effect its scale through the GFX node, not through the

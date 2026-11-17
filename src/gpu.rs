@@ -292,8 +292,18 @@ struct MeshData {
     terrain_upload: Option<crate::terrain_gpu::TerrainUpload>,
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
+    /// Grass atlas pixels. Empty when [`Self::grass_atlas_changed`] is false:
+    /// the renderer still holds the identical 4096² atlas and its mip tiles.
     atlas: Vec<u8>,
     grass_mips: Vec<crate::grass_mips::Tile>,
+    /// Layout signature of the grass atlas this message describes.
+    grass_atlas_key: u64,
+    /// False when the streamer was told the atlas the renderer holds is already
+    /// this layout, so neither the pixels above nor the tiles are new.
+    grass_atlas_changed: bool,
+    /// Layout signature of each streamed scenery page, in page order. An
+    /// unchanged page is a page whose atlas and geometry the renderer can keep.
+    local_page_keys: Vec<u64>,
     grass: crate::grass_instances::Data,
     center: (isize, isize),
     tree_center: (f32, f32),
@@ -461,6 +471,78 @@ fn lod_levels(
     );
     (win, levels)
 }
+/// Bytes to allocate for a world geometry buffer holding `count` elements.
+///
+/// Rounded up to a power of two (and never below four bytes) so the buffers
+/// survive growth between block-window updates without being recreated when the
+/// window grows by a block.
+fn world_buffer_capacity(count: usize, element: usize) -> u64 {
+    (count.saturating_mul(element).next_power_of_two() as u64).max(4)
+}
+
+/// Grow a streamed scenery page's atlas to `rows` rows rather than allocating
+/// the full 4096² up front.
+///
+/// The streamer rebuilds every local page for each block-window update, and a
+/// page usually needs a few hundred of the 4096 rows. Allocating (and zeroing)
+/// 64 MiB per page per rebuild was the largest CPU-side cost of a crossing; the
+/// buffer now doubles as the packer descends and `Page::finish` makes its final
+/// extent exact.
+fn reserve_page_atlas_rows(page: &mut crate::world_objects::Page, rows: usize) {
+    // `Page` owns the atlas extent, so its own side and unit decide the bytes.
+    let side = crate::world_objects::SIDE;
+    let rows = rows.min(side);
+    let needed = side * rows * 4;
+    if page.atlas.len() >= needed {
+        return;
+    }
+    let floor = side * crate::texture_atlas::UNIT * 4;
+    let grown = (page.atlas.len().max(floor) * 2)
+        .max(needed)
+        .min(side * side * 4);
+    page.atlas.resize(grown, 0);
+}
+
+/// Signature of a finished local scenery page.
+///
+/// Everything a page draws is derived from its textures (which rectangle of the
+/// atlas each one owns) and from the frozen ornament placements. Both are in the
+/// key, so an equal key means the page the renderer already holds is the page
+/// this rebuild produced.
+fn local_page_key(page: &crate::world_objects::Page, textures: &[(String, u64)]) -> u64 {
+    let mut key = crate::texture_atlas::LayoutKey::new();
+    key.usize(textures.len());
+    for (texture, layout) in textures {
+        key.bytes(texture.as_bytes());
+        key.bytes(&layout.to_le_bytes());
+    }
+    key.usize(page.used_height);
+    key.usize(page.vertices.len());
+    key.usize(page.indices.len());
+    for placement in &page.placements {
+        key.usize(placement.start as usize);
+        key.usize(placement.end as usize);
+        key.usize(placement.export_id as usize);
+        key.usize(placement.order as usize);
+        key.byte(u8::from(placement.visibility.reflect));
+        key.byte(u8::from(placement.visibility.refract));
+    }
+    key.byte(u8::from(page.page_has_sdr));
+    for axis in 0..3 {
+        key.bytes(&page.page_min[axis].to_bits().to_le_bytes());
+        key.bytes(&page.page_max[axis].to_bits().to_le_bytes());
+    }
+    key.value()
+}
+
+/// Rebuild the drawn world around `(cx, cz)`.
+///
+/// `grass_atlas_hint` is the layout signature the renderer currently holds for
+/// its grass atlas. When this rebuild produces the same layout, the atlas pixels
+/// and their independent mip tiles are not rebuilt at all: a block-window update
+/// moves the camera by one block and almost always leaves the nearby grass
+/// materials identical, yet the atlas is 4096² RGBA with eight levels — the
+/// largest single upload in the streaming path.
 fn build(
     t: &mut Terrain,
     cx: f32,
@@ -468,6 +550,7 @@ fn build(
     detail: DetailSettings,
     residency: &mut crate::terrain_residency::Residency,
     vegetation_authored_mips: bool,
+    grass_atlas_hint: u64,
 ) -> Result<MeshData, String> {
     if vegetation_authored_mips {
         static WARN: std::sync::Once = std::sync::Once::new();
@@ -495,7 +578,6 @@ fn build(
     let by = (gy / TILE as f32).floor() as isize;
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
-    let mut atlas = vec![0u8; ATLAS * ATLAS * 4];
     // Recovered block residency, resolution levels and block-edge rule
     // (src/terrain_lod.rs). The client keeps a square window of blocks around
     // the camera's block (`0x77ecf0`), gives each one of three meshes by camera
@@ -608,8 +690,17 @@ fn build(
     let mut grass_builder = crate::grass_instances::Builder::default();
     let mut grass_sample = None;
     let mut grass_slots: HashMap<(String, u8), crate::texture_atlas::Slot> = HashMap::new();
-    let mut grass_authored: HashMap<(String, u8), Vec<image::RgbaImage>> = HashMap::new();
+    // Materials whose atlas rectangle keeps a native-size authored chain. Only
+    // membership matters here; the chain itself travels with the mip tiles, so
+    // storing it twice would copy every authored level on every rebuild.
+    let mut grass_authored: HashSet<(String, u8)> = HashSet::new();
     let mut grass_mips = Vec::new();
+    // Atlas rectangles in packing order, copied into the pixel buffer only once
+    // the layout signature says the renderer's copy is stale. A rebuild is
+    // dominated by the 4096² atlas, and almost every block-window update leaves
+    // it identical.
+    let mut grass_copies: Vec<(crate::texture_atlas::Slot, String, bool)> = Vec::new();
+    let mut grass_layout = crate::texture_atlas::LayoutKey::new();
     // Reserve at least one 128px slot for every distinct nearby material, so
     // a few large textures cannot starve all later grass types.
     let mut grass_pending = HashSet::new();
@@ -726,30 +817,12 @@ fn build(
                     };
                     slot
                 };
-                let ox = slot.x;
-                let oy = slot.y;
-                if authored.is_some() {
-                    let source = img.as_raw();
-                    for y in 0..img.height() as usize {
-                        let dst = ((oy + y) * ATLAS + ox) * 4;
-                        let src = y * img.width() as usize * 4;
-                        atlas[dst..dst + img.width() as usize * 4]
-                            .copy_from_slice(&source[src..src + img.width() as usize * 4]);
-                    }
-                } else {
-                    for py in 0..slot.h {
-                        for px in 0..slot.w {
-                            let x = (px as u32 * img.width() / slot.w as u32).min(img.width() - 1);
-                            let y =
-                                (py as u32 * img.height() / slot.h as u32).min(img.height() - 1);
-                            let o = ((oy + py) * ATLAS + ox + px) * 4;
-                            atlas[o..o + 4].copy_from_slice(&img.get_pixel(x, y).0);
-                        }
-                    }
-                }
+                grass_copies.push((slot, mesh.texture.clone(), authored.is_some()));
+                grass_layout.slot(&mesh.texture, slot);
+                grass_layout.usize(authored.as_ref().map_or(0, |chain| chain.len()));
                 if let Some(chain) = authored {
                     if !chain.is_empty() {
-                        grass_authored.insert(material_key.clone(), chain.clone());
+                        grass_authored.insert(material_key.clone());
                     }
                     grass_mips.push((slot, alpha_ref, Some(chain)));
                 } else {
@@ -760,7 +833,7 @@ fn build(
             };
             let ox = slot.x as f32 / ATLAS as f32;
             let oy = slot.y as f32 / ATLAS as f32;
-            let (scale_x, scale_y) = if grass_authored.contains_key(&material_key) {
+            let (scale_x, scale_y) = if grass_authored.contains(&material_key) {
                 (
                     img.width() as f32 / ATLAS as f32,
                     img.height() as f32 / ATLAS as f32,
@@ -862,6 +935,49 @@ fn build(
             }
         }
     }
+    // Materialise the grass atlas only when the renderer's copy is stale.
+    //
+    // The atlas is 4096² RGBA with eight levels and its tiles are independently
+    // filtered copies of the same rectangles. Both are a pure function of the
+    // layout that was just packed, so an unchanged layout means the pixels the
+    // GPU holds are still the ones this build would produce: skip the
+    // zero-fill, the pixel copies, the mip generation and — on the render
+    // thread — the upload.
+    let grass_atlas_key = grass_layout.value();
+    let grass_atlas_changed = grass_atlas_key != grass_atlas_hint;
+    let (atlas, grass_mips) = if grass_atlas_changed {
+        let mut atlas = vec![0u8; ATLAS * ATLAS * 4];
+        for (slot, texture, authored) in &grass_copies {
+            let Some(img) = t.grass.textures.get(texture) else {
+                continue;
+            };
+            let ox = slot.x;
+            let oy = slot.y;
+            if *authored {
+                let source = img.as_raw();
+                for y in 0..img.height() as usize {
+                    let dst = ((oy + y) * ATLAS + ox) * 4;
+                    let src = y * img.width() as usize * 4;
+                    atlas[dst..dst + img.width() as usize * 4]
+                        .copy_from_slice(&source[src..src + img.width() as usize * 4]);
+                }
+            } else {
+                for py in 0..slot.h {
+                    for px in 0..slot.w {
+                        let x = (px as u32 * img.width() / slot.w as u32).min(img.width() - 1);
+                        let y =
+                            (py as u32 * img.height() / slot.h as u32).min(img.height() - 1);
+                        let o = ((oy + py) * ATLAS + ox + px) * 4;
+                        atlas[o..o + 4].copy_from_slice(&img.get_pixel(x, y).0);
+                    }
+                }
+            }
+        }
+        let mips = crate::grass_mips::prepare_with_authored(&atlas, &grass_mips, ATLAS);
+        (atlas, mips)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let grass = grass_builder.finish();
     if grass_debug() {
         let (v, i, b) = grass.counts();
@@ -950,7 +1066,11 @@ fn build(
                     shared_atlas: None,
                     vertices: Vec::new(),
                     indices: Vec::new(),
-                    atlas: vec![0; ATLAS * ATLAS * 4],
+                    // Grown as rectangles are packed: a page usually uses a
+                    // fraction of the 4096 rows, and every block-window update
+                    // rebuilt these from scratch, so zero-filling all 64 MiB
+                    // per page per rebuild was pure memory traffic.
+                    atlas: Vec::new(),
                     processed: 0,
                     used_height: 0,
                     mips: Vec::new(),
@@ -964,6 +1084,7 @@ fn build(
             (i, slot)
         };
         pages[i].1.used_height = pages[i].1.used_height.max(slot.y + slot.h);
+        reserve_page_atlas_rows(&mut pages[i].1, slot.y + slot.h);
         let tex = t.objects.texture(key);
         for py in 0..slot.h {
             for px in 0..slot.w {
@@ -1059,11 +1180,31 @@ fn build(
             }
         }
     }
-    let local_pages = pages
-        .into_iter()
-        .map(|(_, page)| page.finish())
-        .filter(|p| !p.indices.is_empty())
-        .collect();
+    // One signature per page, in page order: the textures that feed its atlas
+    // rectangles (sorted, because the slot map is unordered) plus the geometry
+    // and submission metadata `Page::finish` froze. The renderer keeps a page
+    // whose signature it already uploaded and re-uploads only the rest, so a
+    // block-window update no longer re-sends every scenery atlas and buffer.
+    let mut page_textures: Vec<Vec<(String, u64)>> = Vec::new();
+    page_textures.resize_with(pages.len(), Vec::new);
+    for (key, (page_index, slot)) in &texture_slots {
+        let mut key_layout = crate::texture_atlas::LayoutKey::new();
+        key_layout.slot(key, *slot);
+        page_textures[*page_index].push((key.clone(), key_layout.value()));
+    }
+    for list in &mut page_textures {
+        list.sort();
+    }
+    let mut local_pages = Vec::with_capacity(pages.len());
+    let mut local_page_keys = Vec::with_capacity(pages.len());
+    for (index, (_, page)) in pages.into_iter().enumerate() {
+        let page = page.finish();
+        if page.indices.is_empty() {
+            continue;
+        }
+        local_page_keys.push(local_page_key(&page, &page_textures[index]));
+        local_pages.push(page);
+    }
     // Keep opaque indices separate so water can sample reflected/refracted scene passes.
     let water_start = indices.len() as u32;
     let mut water_batches: Vec<WaterBatch> = Vec::new();
@@ -1236,9 +1377,12 @@ fn build(
         terrain_upload,
         vertices,
         indices,
-        grass_mips: crate::grass_mips::prepare_with_authored(&atlas, &grass_mips, ATLAS),
+        grass_mips,
         grass,
         atlas,
+        grass_atlas_key,
+        grass_atlas_changed,
+        local_page_keys,
         center: (bx, by),
         tree_center: (cx, cz),
         detail,
@@ -1345,6 +1489,9 @@ struct Renderer {
     post: crate::post_gpu::PostGpu,
     object_start: u32,
     local_pages: Vec<crate::world_objects::GpuPage>,
+    /// Layout signature of each element of `local_pages`, so an update can keep
+    /// the pages whose content did not change instead of re-uploading them.
+    local_page_keys: Vec<u64>,
     world_pages: Vec<crate::world_objects::GpuPage>,
     /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
     world_draw_cmds: [crate::world_objects::WorldDrawList; crate::world_objects::WORLD_VIEWS],
@@ -1383,8 +1530,15 @@ struct Renderer {
     glow_requested_fade: Option<f32>,
     grass_wind_state: crate::grass_wind::GrassWind,
     atlas: wgpu::Texture,
+    /// Layout signature of the grass atlas currently uploaded to `atlas`.
+    grass_atlas_key: u64,
     vertex: wgpu::Buffer,
     index: wgpu::Buffer,
+    /// Bytes allocated in `vertex`/`index`. Updates write into the existing
+    /// buffers and only grow them, instead of destroying and recreating the
+    /// whole world's near geometry on every block-window update.
+    vertex_capacity: u64,
+    index_capacity: u64,
     count: u32,
     depth: wgpu::Texture,
     /// Object-motion attachment for the shared motion-vector pass: `rg` pixel
@@ -1927,18 +2081,34 @@ impl Renderer {
             multisample: Default::default(),
             multiview: None,
         });
-        let vertex = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&m.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+        // Sized once and kept: a block-window update rewrites the same geometry
+        // through `queue.write_buffer` and only reallocates when the mesh grows.
+        let vertex_capacity =
+            world_buffer_capacity(m.vertices.len(), std::mem::size_of::<Vertex>());
+        let vertex = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("near terrain vertices"),
+            size: vertex_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
-        let index = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&m.indices),
-            usage: wgpu::BufferUsages::INDEX,
+        if !m.vertices.is_empty() {
+            queue.write_buffer(&vertex, 0, bytemuck::cast_slice(&m.vertices));
+        }
+        let index_capacity = world_buffer_capacity(m.indices.len(), std::mem::size_of::<u32>());
+        let index = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("near terrain indices"),
+            size: index_capacity,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        if !m.indices.is_empty() {
+            queue.write_buffer(&index, 0, bytemuck::cast_slice(&m.indices));
+        }
         let count = m.indices.len() as u32;
-        crate::grass_mips::upload(&queue, &atlas, &m.atlas, &m.grass_mips, ATLAS);
+        if m.grass_atlas_changed {
+            crate::grass_mips::upload(&queue, &atlas, &m.atlas, &m.grass_mips, ATLAS);
+        }
+        let grass_atlas_key = m.grass_atlas_key;
         let grass = crate::grass_instances::Gpu::new(
             &device,
             format,
@@ -1950,6 +2120,7 @@ impl Renderer {
         let d = depth_tex;
         let (object_mv, object_mv_view) = object_mv_target(&device, w, h);
         let post = crate::post_gpu::PostGpu::new(&device, format, w, h);
+        let local_page_keys = m.local_page_keys;
         let local_pages = m
             .local_pages
             .into_iter()
@@ -2055,6 +2226,7 @@ impl Renderer {
             shore,
             object_start: m.object_start,
             local_pages,
+            local_page_keys,
             world_pages: Vec::new(),
             world_draw_cmds: std::array::from_fn(|_| {
                 crate::world_objects::WorldDrawList::default()
@@ -2080,8 +2252,11 @@ impl Renderer {
             // has to exist before the first frame.
             wind_last: Instant::now(),
             atlas,
+            grass_atlas_key,
             vertex,
+            vertex_capacity,
             index,
+            index_capacity,
             count,
             depth: d,
             object_mv,
@@ -2541,13 +2716,28 @@ impl Renderer {
             )?;
             upload.materials.release_gpu_source();
         }
-        self.grass.update(&self.device, m.grass);
-        self.local_pages.clear();
-        self.local_pages = m
-            .local_pages
-            .into_iter()
-            .map(|page| {
-                crate::world_objects::GpuPage::upload(
+        self.grass.update(&self.device, &self.queue, m.grass);
+        // A streamed scenery page is a deterministic function of the textures it
+        // packs and the ornaments it places, so most pages of a crossing are the
+        // pages the renderer already holds. Reusing them saves a 4096² atlas
+        // upload, eight mip uploads and the page's vertex and index buffers —
+        // the world-object half of the hitch at every block boundary.
+        let keys = std::mem::take(&mut m.local_page_keys);
+        let previous: Vec<crate::world_objects::GpuPage> = std::mem::take(&mut self.local_pages);
+        let mut reused: HashMap<u64, Vec<crate::world_objects::GpuPage>> = HashMap::new();
+        for (key, page) in self.local_page_keys.drain(..).zip(previous) {
+            reused.entry(key).or_default().push(page);
+        }
+        let mut local_pages = Vec::with_capacity(m.local_pages.len());
+        let mut kept_pages = 0usize;
+        for (page, &key) in m.local_pages.into_iter().zip(keys.iter()) {
+            let kept = reused.get_mut(&key).and_then(|pages| pages.pop());
+            local_pages.push(match kept {
+                Some(page) => {
+                    kept_pages += 1;
+                    page
+                }
+                None => crate::world_objects::GpuPage::upload(
                     &self.device,
                     &self.queue,
                     &self.layout,
@@ -2555,23 +2745,23 @@ impl Renderer {
                     &self.uniform,
                     &self.reflected_uniform,
                     page,
-                )
-            })
-            .collect();
-        self.vertex = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&m.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
+                ),
             });
-        self.index = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&m.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+        }
+        self.local_pages = local_pages;
+        // What a rebuild actually asked the GPU to do. With the layout keys in
+        // place a crossing normally uploads nothing here; a line that keeps
+        // reporting uploads is the one to look at.
+        let grass_atlas_state = if m.grass_atlas_changed { "re-uploaded" } else { "kept" };
+        crate::diag!(
+            TimingLoad,
+            "world update: {} scenery pages kept, {} uploaded, grass atlas {}",
+            kept_pages,
+            keys.len() - kept_pages,
+            grass_atlas_state
+        );
+        self.local_page_keys = keys;
+        self.write_world_buffers(&m.vertices, &m.indices);
         self.count = m.indices.len() as u32;
         self.center = m.center;
         self.tree_center = m.tree_center;
@@ -2582,8 +2772,48 @@ impl Renderer {
         self.object_start = m.object_start;
         self.water_start = m.water_start;
         self.water_batches = m.water_batches;
-        crate::grass_mips::upload(&self.queue, &self.atlas, &m.atlas, &m.grass_mips, ATLAS);
+        if m.grass_atlas_changed {
+            crate::grass_mips::upload(&self.queue, &self.atlas, &m.atlas, &m.grass_mips, ATLAS);
+            self.grass_atlas_key = m.grass_atlas_key;
+        }
         Ok(())
+    }
+
+    /// Upload the rebuilt near-world geometry, growing the two buffers only when
+    /// the new mesh is larger than what they hold.
+    ///
+    /// Every block-window update rewrites these buffers in full: the vertices and
+    /// indices are the same size to within a block, so recreating them meant a
+    /// fresh allocation plus a full upload of the world's near geometry for a
+    /// change of one block.
+    fn write_world_buffers(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        let vertex_bytes = std::mem::size_of_val(vertices) as u64;
+        let index_bytes = std::mem::size_of_val(indices) as u64;
+        if self.vertex_capacity < vertex_bytes {
+            self.vertex_capacity =
+                world_buffer_capacity(vertices.len(), std::mem::size_of::<Vertex>());
+            self.vertex = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("near terrain vertices"),
+                size: self.vertex_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if self.index_capacity < index_bytes {
+            self.index_capacity = world_buffer_capacity(indices.len(), std::mem::size_of::<u32>());
+            self.index = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("near terrain indices"),
+                size: self.index_capacity,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if !vertices.is_empty() {
+            self.queue.write_buffer(&self.vertex, 0, bytemuck::cast_slice(vertices));
+        }
+        if !indices.is_empty() {
+            self.queue.write_buffer(&self.index, 0, bytemuck::cast_slice(indices));
+        }
     }
     fn draw_opaque(
         &self,
@@ -4281,6 +4511,7 @@ pub fn run(
     let vegetation_authored_mips = settings.vegetation_authored_mips
         || std::env::var_os("PW_VEGETATION_AUTHORED_MIPS").is_some();
     let mut residency = crate::terrain_residency::Residency::default();
+    // Nothing is uploaded yet, so the first build always materialises the atlas.
     let m = build(
         &mut t,
         camera.pos.x,
@@ -4288,6 +4519,7 @@ pub fn run(
         settings.detail,
         &mut residency,
         vegetation_authored_mips,
+        0,
     )?;
     let mut renderer = Renderer::new(
         device,
@@ -4486,13 +4718,18 @@ pub fn run(
     // The expensive atlas and scene rebuild runs off the UI thread. At most one
     // request is in flight; once it completes, the latest camera position is used.
     let (width, height, spacing) = (t.width, t.height, t.grid_spacing);
-    let (request_tx, request_rx) = std::sync::mpsc::channel::<(f32, f32, DetailSettings)>();
+    // The request carries the grass-atlas signature the renderer holds. The
+    // worker is what decides whether the rebuilt atlas differs, and it can only
+    // know that from the renderer: the pixels and their mip tiles are the
+    // largest thing the streaming path uploads, and a camera crossing a block
+    // almost never changes them.
+    let (request_tx, request_rx) = std::sync::mpsc::channel::<(f32, f32, DetailSettings, u64)>();
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<MeshData, String>>(1);
     std::thread::Builder::new()
         .name("world-streaming".into())
         .spawn(move || {
             let mut residency = crate::terrain_residency::Residency::default();
-            while let Ok((x, z, detail)) = request_rx.recv() {
+            while let Ok((x, z, detail, grass_atlas_key)) = request_rx.recv() {
                 let started = Instant::now();
                 let result = build(
                     &mut t,
@@ -4501,6 +4738,7 @@ pub fn run(
                     detail,
                     &mut residency,
                     vegetation_authored_mips,
+                    grass_atlas_key,
                 );
                 eprintln!(
                     "Background terrain build at ({x:.1},{z:.1}) took {:.2}s",
@@ -5332,7 +5570,13 @@ pub fn run(
                         None => false,
                     };
                     if stale {
-                        if request_tx.send((camera.pos.x, camera.pos.z, settings.detail)).is_err() {
+                        let request = (
+                            camera.pos.x,
+                            camera.pos.z,
+                            settings.detail,
+                            renderer.grass_atlas_key,
+                        );
+                        if request_tx.send(request).is_err() {
                             eprintln!("World streaming worker exited");
                             target.exit();
                             return;
@@ -5425,6 +5669,7 @@ pub fn run(
                                 }
                                 renderer.local_pages.clear();
                                 renderer.local_pages.shrink_to_fit();
+                                renderer.local_page_keys.clear();
                                 renderer.world_done = true;
                                 let elapsed = world_started_at
                                     .take()
@@ -6619,6 +6864,7 @@ pub fn preview(
                     }
                     renderer.local_pages.clear();
                     renderer.local_pages.shrink_to_fit();
+                    renderer.local_page_keys.clear();
                     renderer.world_done = true;
                     break;
                 }
@@ -7080,5 +7326,94 @@ mod slider_mark_tests {
             let t = slider_mark_fraction(default, min, max, true);
             assert!(t.is_finite() && (0.0..=1.0).contains(&t), "{t}");
         }
+    }
+}
+
+#[cfg(test)]
+mod world_stream_tests {
+    use super::*;
+
+    fn page(used_height: usize, vertices: usize, indices: usize) -> crate::world_objects::Page {
+        crate::world_objects::Page {
+            shared_atlas: None,
+            vertices: (0..vertices)
+                .map(|i| Vertex {
+                    pos: [i as f32, 0., 0.],
+                    normal: [0., 1., 0.],
+                    uv: [0.; 2],
+                    color: [0.; 4],
+                    kind: 2.,
+                    diffuse: 0xffff_ffff,
+                    night_diffuse: 0xffff_ffff,
+                })
+                .collect(),
+            indices: (0..indices as u32).collect(),
+            atlas: vec![0; crate::world_objects::SIDE * used_height * 4],
+            processed: 0,
+            used_height,
+            mips: Vec::new(),
+            placements: Vec::new(),
+            bounds: Vec::new(),
+            page_min: [0.; 3],
+            page_max: [1.; 3],
+            page_has_sdr: false,
+        }
+    }
+
+    /// The renderer keeps a streamed scenery page only when its signature is
+    /// unchanged, so the signature must move with the page's textures, its
+    /// geometry size and its frozen submission metadata.
+    #[test]
+    fn a_page_signature_separates_layout_and_geometry() {
+        let slot = crate::texture_atlas::Slot {
+            x: 128,
+            y: 0,
+            w: 256,
+            h: 256,
+        };
+        let mut layout = crate::texture_atlas::LayoutKey::new();
+        layout.slot("textures/物件/石头.dds", slot);
+        let textures = vec![("textures/物件/石头.dds".to_string(), layout.value())];
+        let base = page(256, 4, 6);
+        let key = local_page_key(&base, &textures);
+        assert_eq!(key, local_page_key(&base, &textures), "stable for one page");
+
+        // A rectangle that moved, a second texture, another page height.
+        let moved = crate::texture_atlas::Slot { x: 0, ..slot };
+        let mut other_layout = crate::texture_atlas::LayoutKey::new();
+        other_layout.slot("textures/物件/石头.dds", moved);
+        let other = vec![("textures/物件/石头.dds".to_string(), other_layout.value())];
+        assert_ne!(key, local_page_key(&base, &other));
+        assert_ne!(key, local_page_key(&base, &textures[..0]));
+        assert_ne!(key, local_page_key(&page(512, 4, 6), &textures));
+        assert_ne!(key, local_page_key(&page(256, 5, 6), &textures));
+        assert_ne!(key, local_page_key(&page(256, 4, 7), &textures));
+
+        // Two textures swapped in packing order are two different pages.
+        let mut first = crate::texture_atlas::LayoutKey::new();
+        first.slot("a", slot);
+        let mut second = crate::texture_atlas::LayoutKey::new();
+        second.slot("b", moved);
+        let a = ("a".to_string(), first.value());
+        let b = ("b".to_string(), second.value());
+        let ab = vec![a.clone(), b.clone()];
+        let ba = vec![b, a];
+        assert_ne!(
+            local_page_key(&base, &ab),
+            local_page_key(&base, &ba),
+            "the signature covers the sorted texture list, so a page cannot be reused"
+        );
+    }
+
+    /// The geometry buffers are allocated to a power of two so a window that
+    /// grows by a block does not force a reallocation, and never below the
+    /// four-byte alignment `write_buffer` requires.
+    #[test]
+    fn world_buffers_are_sized_for_growth_and_alignment() {
+        assert_eq!(world_buffer_capacity(0, 32), 4);
+        assert_eq!(world_buffer_capacity(1, 32), 32);
+        assert_eq!(world_buffer_capacity(1000, 32), 32_768);
+        assert_eq!(world_buffer_capacity(32_769, 32), 2_097_152);
+        assert_eq!(world_buffer_capacity(1, 4), 4);
     }
 }
