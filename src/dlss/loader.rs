@@ -939,14 +939,20 @@ impl NgxCore {
                 super::diag(&format!(
                     "[NGX] parameter map: NGX's own, from {name} (written through its vtable)"
                 ));
-                return NgxParams::from_ngx(NgxMap::through_vtable(parameters, destroy));
+                let mut map = NgxMap::through_vtable(parameters, destroy);
+                // The declared slot is only a starting point: ask the map which
+                // overload it answers on and start the ladder there.
+                if let Some(slot) = map.measured_pointer_slot() {
+                    map.set_resource_set_slot(slot);
+                }
+                return NgxParams::from_ngx(map);
             }
             if self.set_u32.is_some() {
                 super::diag(&format!(
                     "[NGX] parameter map: NGX's own, from {name} (written through the exported \
                      NVSDK_NGX_Parameter_Set* helpers)"
                 ));
-                return NgxParams::from_ngx(NgxMap::new(
+                let mut map = NgxMap::new(
                     parameters,
                     destroy,
                     self.set_u32,
@@ -956,7 +962,11 @@ impl NgxCore {
                     self.set_void,
                     self.get_u32,
                     self.get_void,
-                ));
+                );
+                if let Some(slot) = map.measured_pointer_slot() {
+                    map.set_resource_set_slot(slot);
+                }
+                return NgxParams::from_ngx(map);
             }
             super::diag(&format!(
                 "[NGX] {name} returned a map the viewer cannot write to; ignoring it"

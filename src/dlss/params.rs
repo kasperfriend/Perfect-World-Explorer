@@ -424,6 +424,19 @@ impl NgxMap {
         }
     }
 
+    /// The `Set` slot the map's own pointer round-trip answers, when it
+    /// answers.
+    ///
+    /// A hint, not a verdict: it proves the object stores a pointer and which
+    /// overload echoes it back, but the *feature's* reader is a separate
+    /// implementation and only a real evaluate tests that one. Using it as the
+    /// ladder's first candidate costs nine calls once and skips an attempt that
+    /// is known to be pointless when the map agrees with the declared order.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn measured_pointer_slot(&self) -> Option<usize> {
+        unsafe { Self::probe_pointer_slots(self.object, std::ptr::null_mut()) }.map(|(set, _)| set)
+    }
+
     /// Which `Set` slot resource pointers go through.
     pub(crate) fn resource_set_slot(&self) -> usize {
         self.resource_set_slot
