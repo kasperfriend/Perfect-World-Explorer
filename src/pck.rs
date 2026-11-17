@@ -346,6 +346,66 @@ mod tests {
 
     use std::io::Write;
     #[test]
+    fn bounded_archive_batch_preserves_independent_ranges_and_decompression() {
+        let first = vec![37u8; 128 * 1024];
+        let second = b"a separate compressed entry".repeat(257);
+        let third: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&second).unwrap();
+        let packed_second = encoder.finish().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "pw-pck-batch-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let first_offset = 4096u32;
+        file.write_all(&vec![0; first_offset as usize]).unwrap();
+        file.write_all(&first).unwrap();
+        let second_offset = first_offset + first.len() as u32 + 512;
+        file.write_all(&vec![0; 512]).unwrap();
+        file.write_all(&packed_second).unwrap();
+        let third_offset = second_offset + packed_second.len() as u32 + 1024;
+        file.write_all(&vec![0; 1024]).unwrap();
+        file.write_all(&third).unwrap();
+        file.flush().unwrap();
+
+        let entries = [
+            Entry {
+                name: "first".into(),
+                offset: first_offset,
+                size: first.len() as u32,
+                compressed: first.len() as u32,
+            },
+            Entry {
+                name: "second".into(),
+                offset: second_offset,
+                size: second.len() as u32,
+                compressed: packed_second.len() as u32,
+            },
+            Entry {
+                name: "third".into(),
+                offset: third_offset,
+                size: third.len() as u32,
+                compressed: third.len() as u32,
+            },
+        ];
+        let references: Vec<_> = entries.iter().collect();
+        let decoded = read_entries_at(&file, &references).unwrap();
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(decoded, vec![first, second, third]);
+    }
+
+    #[test]
     fn bounded_streaming_decode_matches_the_original_member() {
         let expected = vec![37u8; 128 * 1024];
         let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
