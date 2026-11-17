@@ -116,14 +116,9 @@ fn u32le(b: &[u8], p: usize) -> Result<u32, String> {
 }
 fn at<R: Read + Seek>(f: &mut R, p: u64, n: usize) -> Result<Vec<u8>, String> {
     let mut b = vec![0; n];
-    // Small directory/header reads are cheaper through the regular file API.
-    // Larger archive payloads can use the optional DirectStorage system-memory
-    // queue when the user built against Microsoft's SDK and installed runtime.
-    // Every request retains the original positional-read fallback.
-    #[cfg(windows)]
-    if n >= 64 * 1024 && direct_storage::read_range(f, p, &mut b) {
-        return Ok(b);
-    }
+    // `R` can be a logical PCK/PKX reader as well as a plain `File`, so this
+    // generic helper must use the seek/read fallback. Large reads on a plain
+    // `File` use DirectStorage in `read_entry_at` / `read_entries_at` below.
     f.seek(SeekFrom::Start(p))
         .and_then(|_| f.read_exact(&mut b))
         .map_err(|e| e.to_string())?;
