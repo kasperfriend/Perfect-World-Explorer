@@ -171,8 +171,8 @@ impl PresentEncode {
     }
 
     fn create_bind_group(
-       device: &wgpu::Device, 
-       layout: &wgpu::BindGroupLayout, 
+            device: &wgpu::Device, 
+            layout: &wgpu::BindGroupLayout, 
         frame: &wgpu::Texture,
     ) -> wgpu::BindGroup {
         let source = frame.create_view(&wgpu::TextureViewDescriptor {
@@ -192,7 +192,7 @@ impl PresentEncode {
     /// Copy the encoded frame to the swapchain. Runs after the whole-frame
     /// display ramp (which writes into [`Self::view`]).
     pub fn present(&self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView) {
-         let mut encoder = device.create_command_encoder(&Default::default());
+            let mut encoder = device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("present encoded frame"),
