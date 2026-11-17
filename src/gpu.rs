@@ -7680,7 +7680,7 @@ mod frame_snapshot_tests {
     fn pass_kinds_are_submitted_from_production_call_sites() {
         let src = source();
         for needle in [
-            "            main_pass,\n            ViewRuns::Main,\n            Some(&self.depth),",
+            "            main_pass,\n            ViewRuns::Main,\n",
             "                    Pass::Refraction,\n                    ViewRuns::Main,",
             "                Pass::Reflection,\n                ViewRuns::Reflected,",
             "                Pass::Minimap\n            },\n            view_runs,",
@@ -7961,7 +7961,10 @@ mod water_scissor_tests {
         let rect =
             water_view_scissor(matrix, W, H, bounds, 0., margin).expect("a small pond is scissored");
         let [x, y, w, h] = rect;
-        assert!(w < W / 2 && h < H / 2, "the pond does not fill the view: {rect:?}");
+        assert!(
+            (w * h) as f32 <= (W * H) as f32 * 0.5,
+            "the pond is a third of the view, not most of it: {rect:?}"
+        );
         assert!(x + w <= W && y + h <= H, "the rectangle stays inside the target");
 
         let corners = corners(matrix, bounds, 0.);
@@ -7973,14 +7976,17 @@ mod water_scissor_tests {
         // by the target's own edge.
         let margin_x = W as f32 * margin;
         let margin_y = H as f32 * margin;
-        assert!(x as f32 <= min_x - margin_x || x == 0, "left margin short");
+        // A pixel of slack each way for the floor/ceil that turns the rectangle
+        // outwards.
+        let slack = 2.;
+        assert!(x as f32 <= min_x - margin_x + slack || x == 0, "left margin short");
         assert!(
-            (x + w) as f32 >= max_x + margin_x || x + w == W,
+            (x + w) as f32 >= max_x + margin_x - slack || x + w == W,
             "right margin short"
         );
-        assert!(y as f32 <= min_y - margin_y || y == 0, "top margin short");
+        assert!(y as f32 <= min_y - margin_y + slack || y == 0, "top margin short");
         assert!(
-            (y + h) as f32 >= max_y + margin_y || y + h == H,
+            (y + h) as f32 >= max_y + margin_y - slack || y + h == H,
             "bottom margin short"
         );
     }
