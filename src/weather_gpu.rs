@@ -679,8 +679,9 @@ impl WeatherGpu {
         // The previous frame this shader can re-evaluate. Before the first
         // main-view frame the current one stands in, which yields a zero own
         // motion rather than a jump.
-        let (prev_matrix, prev_camera, prev_right, prev_forward) =
-            self.prev_view.unwrap_or((unjittered_vp, camera, right, forward));
+        let (prev_matrix, prev_camera, prev_right, prev_forward) = self
+            .prev_view
+            .unwrap_or((unjittered_vp, camera, right, forward));
         let params = Params {
             matrix: matrix.to_cols_array_2d(),
             prev_matrix: prev_matrix.to_cols_array_2d(),
