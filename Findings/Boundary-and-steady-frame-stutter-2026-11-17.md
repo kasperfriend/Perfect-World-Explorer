@@ -246,3 +246,100 @@ range).
   above are about work removed from data no pass samples, and the counters that
   make them checkable (`TimingLoad`, `TimingFrame`) are the evidence a GPU run has
   to produce.
+
+## Third pass: the minimap, and the whole per-frame ledger (same day)
+
+### The minimap question, answered
+
+**With the minimap style on Original, no top-down render happens at all.** The
+only live minimap pass is behind `settings.show_minimap && settings.minimap_style
+== MapStyle::Realistic` in the redraw handler, and the HUD draws the client
+artwork (`surfaces/minimaps/world`) instead. The whole-world map texture is gated
+the same way (`world_map_style == Realistic`) and only re-rendered every two
+seconds while the world map is open. So Original is not paying for a hidden
+realistic pass.
+
+What *was* true, and is now fixed:
+
+* The realistic minimap re-rendered whenever the camera's **height** changed. Its
+  key carried `camera.pos.y.round()`, but `minimap_matrix(x, z, range)` never
+  reads height — the map is an orthographic window centred on the ground
+  position. Climbing, bobbing or pressing E re-rendered the entire top-down scene,
+  every frame, for an image that could not change. The key is now a typed
+  `MinimapKey` built from a ground position, so height has no way into it.
+* The key did **not** carry `minimap_range`, which *is* in the matrix: dragging
+  the range slider left the previous window on screen until the camera moved a
+  whole unit.
+
+The thing that feels like "the world drawn twice" is the water: a visible
+non-simple water plane costs a mirror **and** a refraction render of the scene, so
+one pond in view is three world renders per frame before the minimap adds a
+fourth. That is the ledger below.
+
+### The per-frame ledger
+
+World renders (each one is sky + near terrain + far terrain + far trees + grass +
+scenery pages + SDR replay, and, for the water views, clouds and weather):
+
+| # | pass | when | cost driver |
+|---|------|------|-------------|
+| 1 | main scene | every frame | pages, models, grass |
+| 2..n | water mirror + refraction | **two per visible non-simple water plane** | plane count × scene |
+| +1 | realistic minimap (320²) | camera ground position or range changed | scene, window only |
+| +1 | whole-world map (1024×1408) | world map open, Realistic, every 2 s | the entire world, unculled |
+
+Non-render passes per frame: object-motion clear, world models (+ effect-motion),
+add-ons, clouds, weather colour + weather motion, water `render_edge` per plane,
+shoreline waves in their own encoder and submit, post chain, egui, and the
+upscaler.
+
+CPU per frame: the stage timings in the `TimingFrame` line, plus the per-instance
+model loop and its per-mesh uniform writes, the alpha-order rebuild, the static
+light-grid rebuild when the camera crosses a 12-unit cell, two scoped threads for
+the terrain visibility walk, and the minimap's own matrix and run queueing.
+
+### Fixed in this pass
+
+1. The minimap key (above): height removed, range added.
+2. `copy_scene_to_refraction` and `copy_depth` ran every frame. The refraction copy
+   is read by the per-plane refraction renders and the water surface only, so it now
+   follows "a non-simple water plane is visible"; the depth copy is
+   `PostGpu::render`'s input alone, so it follows `use_post`. A land view no longer
+   pays a full-frame texture copy.
+3. `StaticGrid::update` compared the captured light corpus against every light on
+   the map *before* the cheap 12-unit cell test. Flying crosses a cell most frames,
+   so the comparison ran on exactly the frames where it was then thrown away. The
+   cheap tests now come first; a stationary camera still detects a replaced corpus,
+   which is what `replacing_static_corpus_invalidates_cells_without_camera_motion`
+   pins.
+4. `TimingFrame` now reports **world renders per frame** next to the stage
+   milliseconds. A frame that renders the world four times is bound on the GPU in a
+   way no CPU timing shows, and this is the number that says so.
+
+### Found, and deliberately not changed
+
+* **The water multiplicity.** A mirror is a mirror: skipping the reflection or the
+  refraction for a distant plane, capping the plane count, or scissoring the pass to
+  the water's screen rectangle all change pixels that exist today. The count is now
+  measured instead of guessed at, so a future report can decide.
+* `copy_scene_to_refraction` looks **redundant even when water is visible**: both
+  refraction branches clear the whole target (fog colour when the camera is above
+  the plane, sky + clear when it is below) before drawing, so the copy is
+  overwritten before anything samples it. It is kept because proving that needs one
+  A/B run on a GPU with water on screen, and a wrong call here is visible garbage.
+  The guard added above is the part that is safe.
+* The sky, far trees and grass are drawn in every `draw_opaque`, including the
+  top-down map and the mirror. Removing any of them changes pixels at the map's
+  edges or in the reflection.
+* The two scoped threads that walk the terrain visibility lists (`std::thread::scope`
+  in `render`) run per frame. At whole-world scale the far list is ~1k spans, so two
+  spawns (~10–30 µs each) are roughly the cost of doing the walk inline; which way
+  wins is a measurement, not a deduction, so it stays.
+* `wgpu::TextureView`s are created per frame (`scene_depth` and the water accessors'
+  views, ~8–12 objects). Caching them would tie the renderer to the target size for
+  a few microseconds a frame.
+* The shoreline pass submits its own command encoder. One submission per frame is
+  the whole cost.
+* Terrain mask atlas: `upload_masks` allocates a texture and calls
+  `device.poll(Maintain::Wait)` — but only when the mask window changes, which needs
+  `Original-game terrain cutoff` on. In the whole-world configuration it runs once.
