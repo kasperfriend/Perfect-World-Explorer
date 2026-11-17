@@ -141,9 +141,12 @@ fn main() {
                 depth_or_array_layers: 1,
             },
         );
-        let mut uniform = [0f32; 388];
+        // 392 f32: the camera uniform now ends with the `lod` lane.
+        let mut uniform = [0f32; 392];
         uniform[22] = flip;
         uniform[23] = disable;
+        // `lod`: no bias, and 1.0 leaves the atlas gradient scale untouched.
+        uniform[388..392].copy_from_slice(&[0., 1., 0., 0.]);
         let buffer = d.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(&uniform),

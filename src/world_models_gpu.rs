@@ -1353,6 +1353,11 @@ impl World {
         (ready, failed, self.slots.len() + self.assets.unloaded.len())
     }
     /// Opaque meshes first, then the retail alpha list in its insertion order.
+    ///
+    /// The blended effect sheets close the pass. Their motion is published by
+    /// `draw_effect_motion` afterwards, in a pass of its own, and belongs to the
+    /// main view alone: the mirror and refraction depth feeds the water, and the
+    /// motion vectors never read it.
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         for slot in &self.slots {
             if !slot.visible {
@@ -1371,6 +1376,26 @@ impl World {
         // with their own render-layer sort inside the draw object.
         if let Some(effects) = &self.effects {
             effects.draw(pass);
+        }
+    }
+
+    /// Publish the blended sheets' own motion into the object-motion attachment.
+    ///
+    /// Called in its own pass right after the colour pass of the main view — the
+    /// attachment it writes is not the scene colour — and before any other view
+    /// rewrites the frame block or the bucket order. Everything drawn after the
+    /// sheets (the water surface, the add-ons) therefore sees the depth buffer the
+    /// way the sheets found it: blended content that occludes nothing
+    /// (`docs/blockers.md` B-26).
+    pub fn draw_effect_motion<'a>(
+        &'a mut self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'a>,
+        current_vp: [[f32; 4]; 4],
+        extent: (u32, u32),
+    ) {
+        if let Some(effects) = self.effects.as_mut() {
+            effects.draw_motion(queue, pass, current_vp, extent);
         }
     }
     pub fn alpha_order(&self) -> Vec<(usize, usize)> {

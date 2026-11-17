@@ -23,6 +23,15 @@ egui-wgpu = { version = "0.27", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 rodio = { version = "0.17", default-features = false, features = ["mp3", "vorbis", "wav"] }
+# Direct FFI surface for the AMD FidelityFX integration in src/gpu.rs. Both
+# crates are already in Cargo.lock as transitive dependencies of wgpu, so no
+# new packages are introduced; versions are pinned to the locked ones.
+# `d3d12` is the low-level D3D12 wrapper (ComPtr + vtables); `wgpu-hal`
+# exposes the native handles of the wgpu device/textures via as_hal().
+d3d12 = "0.19.0"
+wgpu-hal = "0.19.5"
+winapi = { version = "0.3", features = ["std", "winbase", "libloaderapi", "windef", "minwindef", "d3d12", "unknwnbase", "dxgiformat", "dxgitype", "winerror", "dxgi", "dxgi1_2", "dxgi1_3", "dxgi1_4", "dxgi1_5", "dxgi1_6"] }
+raw-window-handle = "0.6"
 
 # Optimize the distributed viewer as a whole; keep debug/test profiles unchanged.
 [profile.release]

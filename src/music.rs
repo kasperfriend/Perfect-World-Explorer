@@ -141,31 +141,72 @@ fn contains(poly: &[[f32; 2]], x: f32, z: f32) -> bool {
     }
     inside
 }
-fn resolve(element: &Path, raw: &str) -> Option<PathBuf> {
-    resolve_under(element, raw, "music")
+#[derive(Default)]
+struct DirectoryIndex {
+    // Cache each directory's case-insensitive names once. Zone changes then
+    // never re-enumerate the same music folder on the render/update thread.
+    directories: HashMap<PathBuf, Option<HashMap<String, PathBuf>>>,
+    resolutions: HashMap<String, Option<PathBuf>>,
 }
-
+impl DirectoryIndex {
+    fn resolve_under(&mut self, root: &Path, raw: &str, prefix: &str) -> Option<PathBuf> {
+        let cache_key = format!(
+            "{}|{}",
+            prefix.to_ascii_lowercase(),
+            raw.to_ascii_lowercase()
+        );
+        if let Some(cached) = self.resolutions.get(&cache_key) {
+            return cached.clone();
+        }
+        let parts: Vec<_> = raw.split(['\\', '/']).filter(|s| !s.is_empty()).collect();
+        let result = if parts.is_empty()
+            || !parts[0].eq_ignore_ascii_case(prefix)
+            || parts.iter().any(|p| *p == ".." || *p == ".")
+        {
+            None
+        } else {
+            let mut path = root.to_path_buf();
+            let mut found = true;
+            for part in parts {
+                if !self.directories.contains_key(&path) {
+                    let entries = fs::read_dir(&path).ok().map(|entries| {
+                        entries
+                            .filter_map(Result::ok)
+                            .map(|entry| {
+                                (
+                                    entry.file_name().to_string_lossy().to_lowercase(),
+                                    entry.path(),
+                                )
+                            })
+                            .collect::<HashMap<_, _>>()
+                    });
+                    self.directories.insert(path.clone(), entries);
+                }
+                match self
+                    .directories
+                    .get(&path)
+                    .and_then(Option::as_ref)
+                    .and_then(|entries| entries.get(&part.to_lowercase()))
+                {
+                    Some(next) => path = next.clone(),
+                    None => {
+                        found = false;
+                        break;
+                    }
+                }
+            }
+            if found && path.is_file() {
+                Some(path)
+            } else {
+                None
+            }
+        };
+        self.resolutions.insert(cache_key, result.clone());
+        result
+    }
+}
 pub(crate) fn resolve_under(element: &Path, raw: &str, prefix: &str) -> Option<PathBuf> {
-    let parts: Vec<_> = raw.split(['\\', '/']).filter(|s| !s.is_empty()).collect();
-    if parts.is_empty()
-        || !parts[0].eq_ignore_ascii_case(prefix)
-        || parts.iter().any(|p| *p == ".." || *p == ".")
-    {
-        return None;
-    }
-    let mut path = element.to_path_buf();
-    for part in parts {
-        let next = fs::read_dir(&path)
-            .ok()?
-            .filter_map(Result::ok)
-            .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(part))?;
-        path = next.path();
-    }
-    if path.is_file() {
-        Some(path)
-    } else {
-        None
-    }
+    DirectoryIndex::default().resolve_under(element, raw, prefix)
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Track {
@@ -218,14 +259,19 @@ fn catalog(element: &Path) -> Result<HashMap<String, pck::Entry>, String> {
         .map(|e| (e.name.to_lowercase(), e))
         .collect())
 }
-fn resolve_track(element: &Path, packed: &HashMap<String, pck::Entry>, raw: &str) -> Option<Track> {
-    if let Some(path) = resolve(element, raw) {
+fn resolve_track_indexed(
+    element: &Path,
+    packed: &HashMap<String, pck::Entry>,
+    raw: &str,
+    loose: &mut DirectoryIndex,
+) -> Option<Track> {
+    if let Some(path) = loose.resolve_under(element, raw, "music") {
         return Some(Track::Loose(path));
     }
     // Client playlists may name MP3 while a distribution ships loose OGG.
     if raw.to_ascii_lowercase().ends_with(".mp3") {
         let alt = format!("{}.ogg", &raw[..raw.len() - 4]);
-        if let Some(path) = resolve(element, &alt) {
+        if let Some(path) = loose.resolve_under(element, &alt, "music") {
             return Some(Track::Loose(path));
         }
     }
@@ -252,6 +298,7 @@ pub struct MusicPlayer {
     zones: Option<Zones>,
     element: PathBuf,
     packed: HashMap<String, pck::Entry>,
+    loose_index: DirectoryIndex,
     zone_error: Option<String>,
     catalog_error: Option<String>,
     unresolved: Vec<String>,
@@ -291,6 +338,7 @@ impl MusicPlayer {
             zones: zones.ok(),
             element: element.to_path_buf(),
             packed,
+            loose_index: DirectoryIndex::default(),
             zone_error,
             catalog_error,
             unresolved: Vec::new(),
@@ -312,7 +360,7 @@ impl MusicPlayer {
                 self.status = s;
             }
         }
-        if self.last_check.elapsed() < std::time::Duration::from_millis(500)
+        if self.last_check.elapsed() < std::time::Duration::from_millis(100)
             && enabled == self.last_enabled
             && (volume - self.last_volume).abs() < 0.001
         {
@@ -337,7 +385,12 @@ impl MusicPlayer {
         self.unresolved.clear();
         if let Some(q) = zone.and_then(|i| self.zones.as_ref().map(|z| &z.zones[i])) {
             for path in &q.tracks {
-                match resolve_track(&self.element, &self.packed, path) {
+                match resolve_track_indexed(
+                    &self.element,
+                    &self.packed,
+                    path,
+                    &mut self.loose_index,
+                ) {
                     Some(track) => paths.push(track),
                     None => self.unresolved.push(path.clone()),
                 }
@@ -409,6 +462,7 @@ pub struct AmbiencePlayer {
     zones: Option<Zones>,
     zone_error: Option<String>,
     element: PathBuf,
+    loose_index: DirectoryIndex,
     last_zone: Option<usize>,
     last_night: bool,
     last_enabled: bool,
@@ -442,6 +496,7 @@ impl AmbiencePlayer {
             zones: zones.ok(),
             zone_error,
             element: element.to_path_buf(),
+            loose_index: DirectoryIndex::default(),
             last_zone: None,
             last_night: false,
             last_enabled: false,
@@ -461,7 +516,7 @@ impl AmbiencePlayer {
                 self.status = s;
             }
         }
-        if self.last_check.elapsed() < std::time::Duration::from_millis(500)
+        if self.last_check.elapsed() < std::time::Duration::from_millis(100)
             && enabled == self.last_enabled
             && night == self.last_night
             && (volume - self.last_volume).abs() < 0.001
@@ -493,8 +548,10 @@ impl AmbiencePlayer {
                 &q.ambience_day
             }
         });
-        let path =
-            raw.and_then(|p| resolve_under(&self.element.join("music"), p, "ambiencestereo"));
+        let path = raw.and_then(|p| {
+            self.loose_index
+                .resolve_under(&self.element.join("music"), p, "ambiencestereo")
+        });
         let paths = path.map(Track::Loose).into_iter().collect::<Vec<_>>();
         self.status = if !enabled {
             "Ambience off".into()
@@ -552,7 +609,13 @@ fn audio_worker(rx: std::sync::mpsc::Receiver<Request>, status: std::sync::mpsc:
     let mut retry_at = Instant::now();
     loop {
         match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(req) => {
+            Ok(mut req) => {
+                // Rapid flight can cross several precincts while a track is
+                // being opened/decoded. Collapse queued selections to the
+                // newest location so we never play a stale intermediate zone.
+                while let Ok(newer) = rx.try_recv() {
+                    req = newer;
+                }
                 let changed = req.zone != current
                     || req.enabled != enabled
                     || req.paths != paths
@@ -595,6 +658,29 @@ fn audio_worker(rx: std::sync::mpsc::Receiver<Request>, status: std::sync::mpsc:
             let track = path.read().and_then(|bytes| {
                 Decoder::new(BufReader::new(Cursor::new(bytes))).map_err(|e| e.to_string())
             });
+            let mut latest = None;
+            while let Ok(req) = rx.try_recv() {
+                latest = Some(req);
+            }
+            if let Some(req) = latest {
+                let changed = req.zone != current
+                    || req.enabled != enabled
+                    || req.paths != paths
+                    || req.repeat != repeat;
+                volume = req.volume.clamp(0., 1.);
+                enabled = req.enabled;
+                repeat = req.repeat;
+                if changed {
+                    if let Some(s) = sink.take() {
+                        s.stop();
+                    }
+                    paths = req.paths;
+                    current = req.zone;
+                    index = 0;
+                    retry_at = Instant::now();
+                    continue;
+                }
+            }
             match track {
                 Ok(source) => {
                     let s = match Sink::try_new(&output.as_ref().unwrap().1) {
@@ -662,6 +748,34 @@ mod tests {
         assert!(resolve_under(&root, "music/test.wav", "ambiencestereo").is_none());
     }
     #[test]
+    fn loose_track_lookup_is_case_insensitive_and_directory_cached() {
+        let root = std::env::temp_dir().join(format!("pw-music-index-{}", std::process::id()));
+        let folder = root.join("Music/Tracks");
+        fs::create_dir_all(&folder).unwrap();
+        let track = folder.join("Day.ogg");
+        fs::write(&track, b"fixture").unwrap();
+        let mut index = DirectoryIndex::default();
+        assert_eq!(
+            index.resolve_under(&root, "music/tracks/day.ogg", "music"),
+            Some(track.clone())
+        );
+        assert_eq!(
+            index.resolve_under(&root, "MUSIC/TRACKS/DAY.OGG", "music"),
+            Some(track)
+        );
+        assert_eq!(
+            index.directories.len(),
+            3,
+            "each directory is enumerated once"
+        );
+        assert_eq!(
+            index.resolutions.len(),
+            1,
+            "case-folded requests share cache keys"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn packed_music_prefers_exact_entry_then_ogg_fallback() {
         let mk = |name: &str| pck::Entry {
             name: name.into(),
@@ -673,11 +787,11 @@ mod tests {
         packed.insert("sfx/music/a.ogg".into(), mk("sfx/music/a.ogg"));
         let root = Path::new("nonexistent-test-client");
         assert!(
-            matches!(resolve_track(root, &packed, "Music/a.mp3"), Some(Track::Packed { entry, .. }) if entry.name.ends_with(".ogg"))
+            matches!(resolve_track_indexed(root, &packed, "Music/a.mp3", &mut DirectoryIndex::default()), Some(Track::Packed { entry, .. }) if entry.name.ends_with(".ogg"))
         );
         packed.insert("sfx/music/a.mp3".into(), mk("sfx/music/a.mp3"));
         assert!(
-            matches!(resolve_track(root, &packed, "Music/a.mp3"), Some(Track::Packed { entry, .. }) if entry.name.ends_with(".mp3"))
+            matches!(resolve_track_indexed(root, &packed, "Music/a.mp3", &mut DirectoryIndex::default()), Some(Track::Packed { entry, .. }) if entry.name.ends_with(".mp3"))
         );
     }
     #[cfg(not(windows))]

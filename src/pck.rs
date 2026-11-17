@@ -2,6 +2,9 @@
 //! Layout informed by GameForge's GPL-2.0-or-later Angelica importer.
 use flate2::Status;
 use flate2::{Decompress, FlushDecompress};
+#[cfg(windows)]
+#[path = "direct_storage.rs"]
+pub(crate) mod direct_storage;
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
@@ -15,6 +18,14 @@ fn u32le(b: &[u8], p: usize) -> Result<u32, String> {
 }
 fn at(f: &mut File, p: u64, n: usize) -> Result<Vec<u8>, String> {
     let mut b = vec![0; n];
+    // Small directory/header reads are cheaper through the regular file API.
+    // Larger archive payloads can use the optional DirectStorage system-memory
+    // queue when the user built against Microsoft's SDK and installed runtime.
+    // Every request retains the original positional-read fallback.
+    #[cfg(windows)]
+    if n >= 64 * 1024 && direct_storage::read_range(f, p, &mut b) {
+        return Ok(b);
+    }
     f.seek(SeekFrom::Start(p))
         .and_then(|_| f.read_exact(&mut b))
         .map_err(|e| e.to_string())?;
@@ -159,29 +170,91 @@ pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
     }    
 }
 
+/// Read a bounded set of entries from one archive. Large reads are queued
+/// together on DirectStorage when available; ordinary positioned I/O remains
+/// the correctness-preserving fallback for every failed batch.
+pub fn read_entries_at(
+    f: &File,
+    entries: &[&Entry],
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    let mut raw: Vec<Vec<u8>> = entries
+        .iter()
+        .map(|entry| vec![0u8; entry.compressed as usize])
+        .collect();
+    let mut direct_storage_done = vec![false; entries.len()];
+
+    #[cfg(windows)]
+    {
+        const DIRECT_STORAGE_MIN: usize = 64 * 1024;
+        const BATCH_CAPACITY: usize = 64;
+        let mut ranges = Vec::with_capacity(BATCH_CAPACITY);
+        let mut range_indices = Vec::with_capacity(BATCH_CAPACITY);
+        for (index, (entry, bytes)) in entries.iter().zip(raw.iter_mut()).enumerate() {
+            if bytes.len() < DIRECT_STORAGE_MIN {
+                continue;
+            }
+            ranges.push((entry.offset as u64, bytes.as_mut_slice()));
+            range_indices.push(index);
+            if ranges.len() == BATCH_CAPACITY {
+                if direct_storage::read_ranges(f, &mut ranges) {
+                    for &index in &range_indices {
+                        direct_storage_done[index] = true;
+                    }
+                }
+                ranges.clear();
+                range_indices.clear();
+            }
+        }
+        if !ranges.is_empty() && direct_storage::read_ranges(f, &mut ranges) {
+            for &index in &range_indices {
+                direct_storage_done[index] = true;
+            }
+        }
+    }
+
+    for ((entry, bytes), used_direct_storage) in
+        entries.iter().zip(raw.iter_mut()).zip(direct_storage_done)
+    {
+        if used_direct_storage {
+            continue;
+        }
+        let mut read = 0usize;
+        while read < bytes.len() {
+            let off = entry.offset as u64 + read as u64;
+            #[cfg(windows)]
+            let n = std::os::windows::fs::FileExt::seek_read(f, &mut bytes[read..], off)?;
+            #[cfg(unix)]
+            let n = std::os::unix::fs::FileExt::read_at(f, &mut bytes[read..], off)?;
+            if n == 0 {
+                return Err(format!("unexpected EOF in PCK entry {}", entry.name).into());
+            }
+            read += n;
+        }
+    }
+
+    entries
+        .iter()
+        .zip(raw)
+        .map(|(entry, bytes)| {
+            if entry.compressed < entry.size {
+                let out = inflate(&bytes, entry.size as usize)?;
+                if out.len() != entry.size as usize {
+                    return Err(
+                        format!("bad decompressed size: {} != {}", out.len(), entry.size).into(),
+                    );
+                }
+                Ok(out)
+            } else {
+                Ok(bytes)
+            }
+        })
+        .collect()
+}
+
 pub fn read_entry_at(f: &File, e: &Entry) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut raw = vec![0u8; e.compressed as usize];
-    let mut read = 0usize;
-    while read < raw.len() {
-        let off = e.offset as u64 + read as u64;
-        #[cfg(windows)]
-        let n = std::os::windows::fs::FileExt::seek_read(f, &mut raw[read..], off)?;
-        #[cfg(unix)]
-        let n = std::os::unix::fs::FileExt::read_at(f, &mut raw[read..], off)?;
-        if n == 0 {
-            return Err("unexpected EOF".into());
-        }
-        read += n;
-    }
-    if e.compressed < e.size {
-        let out = inflate(&raw, e.size as usize)?;
-        if out.len() != e.size as usize {
-            return Err(format!("bad decompressed size: {} != {}", out.len(), e.size).into());
-        }
-        Ok(out)
-    } else {
-        Ok(raw)
-    }
+    read_entries_at(f, &[e])?
+        .pop()
+        .ok_or_else(|| "empty PCK read batch".into())
 }
 
 /// Environment variable that turns a shipped-corpus skip into a failure.
@@ -281,6 +354,66 @@ mod tests {
     }
 
     use std::io::Write;
+    #[test]
+    fn bounded_archive_batch_preserves_independent_ranges_and_decompression() {
+        let first = vec![37u8; 128 * 1024];
+        let second = b"a separate compressed entry".repeat(257);
+        let third: Vec<u8> = (0..96 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(&second).unwrap();
+        let packed_second = encoder.finish().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "pw-pck-batch-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let first_offset = 4096u32;
+        file.write_all(&vec![0; first_offset as usize]).unwrap();
+        file.write_all(&first).unwrap();
+        let second_offset = first_offset + first.len() as u32 + 512;
+        file.write_all(&vec![0; 512]).unwrap();
+        file.write_all(&packed_second).unwrap();
+        let third_offset = second_offset + packed_second.len() as u32 + 1024;
+        file.write_all(&vec![0; 1024]).unwrap();
+        file.write_all(&third).unwrap();
+        file.flush().unwrap();
+
+        let entries = [
+            Entry {
+                name: "first".into(),
+                offset: first_offset,
+                size: first.len() as u32,
+                compressed: first.len() as u32,
+            },
+            Entry {
+                name: "second".into(),
+                offset: second_offset,
+                size: second.len() as u32,
+                compressed: packed_second.len() as u32,
+            },
+            Entry {
+                name: "third".into(),
+                offset: third_offset,
+                size: third.len() as u32,
+                compressed: third.len() as u32,
+            },
+        ];
+        let references: Vec<_> = entries.iter().collect();
+        let decoded = read_entries_at(&file, &references).unwrap();
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(decoded, vec![first, second, third]);
+    }
+
     #[test]
     fn bounded_streaming_decode_matches_the_original_member() {
         let expected = vec![37u8; 128 * 1024];

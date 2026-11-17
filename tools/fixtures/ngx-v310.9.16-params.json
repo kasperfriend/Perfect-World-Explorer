@@ -1,0 +1,846 @@
+{
+ "source": "NVIDIA/DLSS include/, tag v310.9.16",
+ "names": {
+  "NVSDK_NGX_DLSSG_Parameter_AsyncCreateEnabled": "DLSSG.AsyncCreateEnabled",
+  "NVSDK_NGX_DLSSG_Parameter_AutomodeOverrideReset": "DLSSG.AutomodeOverrideReset",
+  "NVSDK_NGX_DLSSG_Parameter_Backbuffer": "DLSSG.Backbuffer",
+  "NVSDK_NGX_DLSSG_Parameter_BackbufferFormat": "DLSSG.BackbufferFormat",
+  "NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID": "DLSSG.BackbufferFrameID",
+  "NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectBaseX": "DLSSG.BackbufferSubrectBaseX",
+  "NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectBaseY": "DLSSG.BackbufferSubrectBaseY",
+  "NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectHeight": "DLSSG.BackbufferSubrectHeight",
+  "NVSDK_NGX_DLSSG_Parameter_BackbufferSubrectWidth": "DLSSG.BackbufferSubrectWidth",
+  "NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionField": "DLSSG.BidirectionalDistortionField",
+  "NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionFieldSubrectBaseX": "DLSSG.BidirectionalDistortionFieldSubrectBaseX",
+  "NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionFieldSubrectBaseY": "DLSSG.BidirectionalDistortionFieldSubrectBaseY",
+  "NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionFieldSubrectHeight": "DLSSG.BidirectionalDistortionFieldSubrectHeight",
+  "NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionFieldSubrectWidth": "DLSSG.BidirectionalDistortionFieldSubrectWidth",
+  "NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionField_LowPrecision_Bias": "DLSSG.BidirectionalDistortionFieldLowPrecision.Bias",
+  "NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionField_LowPrecision_IsLowPrecision": "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision",
+  "NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionField_LowPrecision_Scale": "DLSSG.BidirectionalDistortionFieldLowPrecision.Scale",
+  "NVSDK_NGX_DLSSG_Parameter_CameraAspectRatio": "DLSSG.CameraAspectRatio",
+  "NVSDK_NGX_DLSSG_Parameter_CameraFOV": "DLSSG.CameraFOV",
+  "NVSDK_NGX_DLSSG_Parameter_CameraFar": "DLSSG.CameraFar",
+  "NVSDK_NGX_DLSSG_Parameter_CameraFwdX": "DLSSG.CameraFwdX",
+  "NVSDK_NGX_DLSSG_Parameter_CameraFwdY": "DLSSG.CameraFwdY",
+  "NVSDK_NGX_DLSSG_Parameter_CameraFwdZ": "DLSSG.CameraFwdZ",
+  "NVSDK_NGX_DLSSG_Parameter_CameraMotionIncluded": "DLSSG.CameraMotionIncluded",
+  "NVSDK_NGX_DLSSG_Parameter_CameraNear": "DLSSG.CameraNear",
+  "NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetX": "DLSSG.CameraPinholeOffsetX",
+  "NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetY": "DLSSG.CameraPinholeOffsetY",
+  "NVSDK_NGX_DLSSG_Parameter_CameraPosX": "DLSSG.CameraPosX",
+  "NVSDK_NGX_DLSSG_Parameter_CameraPosY": "DLSSG.CameraPosY",
+  "NVSDK_NGX_DLSSG_Parameter_CameraPosZ": "DLSSG.CameraPosZ",
+  "NVSDK_NGX_DLSSG_Parameter_CameraRightX": "DLSSG.CameraRightX",
+  "NVSDK_NGX_DLSSG_Parameter_CameraRightY": "DLSSG.CameraRightY",
+  "NVSDK_NGX_DLSSG_Parameter_CameraRightZ": "DLSSG.CameraRightZ",
+  "NVSDK_NGX_DLSSG_Parameter_CameraUpX": "DLSSG.CameraUpX",
+  "NVSDK_NGX_DLSSG_Parameter_CameraUpY": "DLSSG.CameraUpY",
+  "NVSDK_NGX_DLSSG_Parameter_CameraUpZ": "DLSSG.CameraUpZ",
+  "NVSDK_NGX_DLSSG_Parameter_CameraViewToClip": "DLSSG.CameraViewToClip",
+  "NVSDK_NGX_DLSSG_Parameter_ClipToCameraView": "DLSSG.ClipToCameraView",
+  "NVSDK_NGX_DLSSG_Parameter_ClipToLensClip": "DLSSG.ClipToLensClip",
+  "NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip": "DLSSG.ClipToPrevClip",
+  "NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR": "DLSSG.ColorBuffersHDR",
+  "NVSDK_NGX_DLSSG_Parameter_Depth": "DLSSG.Depth",
+  "NVSDK_NGX_DLSSG_Parameter_DepthInverted": "DLSSG.DepthInverted",
+  "NVSDK_NGX_DLSSG_Parameter_DepthSubrectBaseX": "DLSSG.DepthSubrectBaseX",
+  "NVSDK_NGX_DLSSG_Parameter_DepthSubrectBaseY": "DLSSG.DepthSubrectBaseY",
+  "NVSDK_NGX_DLSSG_Parameter_DepthSubrectHeight": "DLSSG.DepthSubrectHeight",
+  "NVSDK_NGX_DLSSG_Parameter_DepthSubrectWidth": "DLSSG.DepthSubrectWidth",
+  "NVSDK_NGX_DLSSG_Parameter_DynamicResolution": "DLSSG.DynamicResolution",
+  "NVSDK_NGX_DLSSG_Parameter_EstimateVRAMCallback": "DLSSG.EstimateVRAMCallback",
+  "NVSDK_NGX_DLSSG_Parameter_EvalFlags": "DLSSG.EvalFlags",
+  "NVSDK_NGX_DLSSG_Parameter_FullscreenMode": "DLSSG.FullscreenMode",
+  "NVSDK_NGX_DLSSG_Parameter_HUDLess": "DLSSG.HUDLess",
+  "NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectBaseX": "DLSSG.HUDLessSubrectBaseX",
+  "NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectBaseY": "DLSSG.HUDLessSubrectBaseY",
+  "NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectHeight": "DLSSG.HUDLessSubrectHeight",
+  "NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectWidth": "DLSSG.HUDLessSubrectWidth",
+  "NVSDK_NGX_DLSSG_Parameter_Height": "DLSSG.Height",
+  "NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectBaseX": "DLSSG.InputBackbufferSubrectBaseX",
+  "NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectBaseY": "DLSSG.InputBackbufferSubrectBaseY",
+  "NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectHeight": "DLSSG.InputBackbufferSubrectHeight",
+  "NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectWidth": "DLSSG.InputBackbufferSubrectWidth",
+  "NVSDK_NGX_DLSSG_Parameter_InternalHeight": "DLSSG.InternalHeight",
+  "NVSDK_NGX_DLSSG_Parameter_InternalWidth": "DLSSG.InternalWidth",
+  "NVSDK_NGX_DLSSG_Parameter_InvertXAxis": "DLSSG.InvertXAxis",
+  "NVSDK_NGX_DLSSG_Parameter_InvertYAxis": "DLSSG.InvertYAxis",
+  "NVSDK_NGX_DLSSG_Parameter_JitterOffsetX": "DLSSG.JitterOffsetX",
+  "NVSDK_NGX_DLSSG_Parameter_JitterOffsetY": "DLSSG.JitterOffsetY",
+  "NVSDK_NGX_DLSSG_Parameter_LinearizedDepth_NearFarPartition": "DLSSG.LinearizedDepth_NearFarPartition",
+  "NVSDK_NGX_DLSSG_Parameter_LinearizedDepth_Scale": "DLSSG.LinearizedDepth_Scale",
+  "NVSDK_NGX_DLSSG_Parameter_LiteCandidateBlendingEnabled": "DLSSG.LiteCandidateBlendingEnabled",
+  "NVSDK_NGX_DLSSG_Parameter_MVecs": "DLSSG.MVecs",
+  "NVSDK_NGX_DLSSG_Parameter_MVecsSubrectBaseX": "DLSSG.MVecsSubrectBaseX",
+  "NVSDK_NGX_DLSSG_Parameter_MVecsSubrectBaseY": "DLSSG.MVecsSubrectBaseY",
+  "NVSDK_NGX_DLSSG_Parameter_MVecsSubrectHeight": "DLSSG.MVecsSubrectHeight",
+  "NVSDK_NGX_DLSSG_Parameter_MVecsSubrectWidth": "DLSSG.MVecsSubrectWidth",
+  "NVSDK_NGX_DLSSG_Parameter_MenuDetectionEnabled": "DLSSG.MenuDetectionEnabled",
+  "NVSDK_NGX_DLSSG_Parameter_MinRelativeLinearDepthObjectSeparation": "DLSSG.MinRelativeLinearDepthObjectSeparation",
+  "NVSDK_NGX_DLSSG_Parameter_MultiFrameCount": "DLSSG.MultiFrameCount",
+  "NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax": "DLSSG.MultiFrameCountMax",
+  "NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex": "DLSSG.MultiFrameIndex",
+  "NVSDK_NGX_DLSSG_Parameter_MvecDilated": "DLSSG.MvecDilated",
+  "NVSDK_NGX_DLSSG_Parameter_MvecInvalidValue": "DLSSG.MvecInvalidValue",
+  "NVSDK_NGX_DLSSG_Parameter_MvecJittered": "DLSSG.MvecJittered",
+  "NVSDK_NGX_DLSSG_Parameter_MvecScaleX": "DLSSG.MvecScaleX",
+  "NVSDK_NGX_DLSSG_Parameter_MvecScaleY": "DLSSG.MvecScaleY",
+  "NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames": "DLSSG.NotRenderingGameFrames",
+  "NVSDK_NGX_DLSSG_Parameter_OrthoProjection": "DLSSG.OrthoProjection",
+  "NVSDK_NGX_DLSSG_Parameter_OutputDisableInterpolation": "DLSSG.OutputDisableInterpolation",
+  "NVSDK_NGX_DLSSG_Parameter_OutputInterpolated": "DLSSG.OutputInterpolated",
+  "NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectBaseX": "DLSSG.OutputInterpolatedSubrectBaseX",
+  "NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectBaseY": "DLSSG.OutputInterpolatedSubrectBaseY",
+  "NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectHeight": "DLSSG.OutputInterpolatedSubrectHeight",
+  "NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectWidth": "DLSSG.OutputInterpolatedSubrectWidth",
+  "NVSDK_NGX_DLSSG_Parameter_OutputReal": "DLSSG.OutputReal",
+  "NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectBaseX": "DLSSG.OutputRealSubrectBaseX",
+  "NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectBaseY": "DLSSG.OutputRealSubrectBaseY",
+  "NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectHeight": "DLSSG.OutputRealSubrectHeight",
+  "NVSDK_NGX_DLSSG_Parameter_OutputRealSubrectWidth": "DLSSG.OutputRealSubrectWidth",
+  "NVSDK_NGX_DLSSG_Parameter_PrevClipToClip": "DLSSG.PrevClipToClip",
+  "NVSDK_NGX_DLSSG_Parameter_Reset": "DLSSG.Reset",
+  "NVSDK_NGX_DLSSG_Parameter_ResourceAlwaysProvided_Flags": "DLSSG.ResourceAlwaysProvidedFlags",
+  "NVSDK_NGX_DLSSG_Parameter_ResourceNeverProvided_Flags": "DLSSG.ResourceNeverProvidedFlags",
+  "NVSDK_NGX_DLSSG_Parameter_TargetFrameRate": "DLSSG.TargetFrameRate",
+  "NVSDK_NGX_DLSSG_Parameter_UI": "DLSSG.UI",
+  "NVSDK_NGX_DLSSG_Parameter_UIAlpha": "DLSSG.UIAlpha",
+  "NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectBaseX": "DLSSG.UIAlphaSubrectBaseX",
+  "NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectBaseY": "DLSSG.UIAlphaSubrectBaseY",
+  "NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectHeight": "DLSSG.UIAlphaSubrectHeight",
+  "NVSDK_NGX_DLSSG_Parameter_UIAlphaSubrectWidth": "DLSSG.UIAlphaSubrectWidth",
+  "NVSDK_NGX_DLSSG_Parameter_UISubrectBaseX": "DLSSG.UISubrectBaseX",
+  "NVSDK_NGX_DLSSG_Parameter_UISubrectBaseY": "DLSSG.UISubrectBaseY",
+  "NVSDK_NGX_DLSSG_Parameter_UISubrectHeight": "DLSSG.UISubrectHeight",
+  "NVSDK_NGX_DLSSG_Parameter_UISubrectWidth": "DLSSG.UISubrectWidth",
+  "NVSDK_NGX_DLSSG_Parameter_UserDebugText": "DLSSG.UserDebugText",
+  "NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled": "DLSSG.UserInterfaceRecompositionEnabled",
+  "NVSDK_NGX_DLSSG_Parameter_Width": "DLSSG.Width",
+  "NVSDK_NGX_Parameter_Albedo": "Albedo",
+  "NVSDK_NGX_Parameter_AnimatedTextureMask": "AnimatedTextureMask",
+  "NVSDK_NGX_Parameter_BlendFactor": "BlendFactor",
+  "NVSDK_NGX_Parameter_BufferAllocCallback": "BufferAllocCallback",
+  "NVSDK_NGX_Parameter_Color": "Color",
+  "NVSDK_NGX_Parameter_Color_Format": "Color.Format",
+  "NVSDK_NGX_Parameter_Color_SizeInBytes": "Color.SizeInBytes",
+  "NVSDK_NGX_Parameter_CreationNodeMask": "CreationNodeMask",
+  "NVSDK_NGX_Parameter_DLSSGetStatsCallback": "DLSSGetStatsCallback",
+  "NVSDK_NGX_Parameter_DLSSMode": "DLSSMode",
+  "NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback": "DLSSOptimalSettingsCallback",
+  "NVSDK_NGX_Parameter_DLSS_CLIP_TO_PREV_CLIP_MATRIX": "ClipToPrevClipMatrix",
+  "NVSDK_NGX_Parameter_DLSS_Checkerboard_Jitter_Hack": "DLSS.Checkerboard.Jitter.Hack",
+  "NVSDK_NGX_Parameter_DLSS_DisocclusionMask": "DLSS.DisocclusionMask",
+  "NVSDK_NGX_Parameter_DLSS_DisocclusionMask_Subrect_Base_X": "DLSS.DisocclusionMask.Subrect.Base.X",
+  "NVSDK_NGX_Parameter_DLSS_DisocclusionMask_Subrect_Base_Y": "DLSS.DisocclusionMask.Subrect.Base.Y",
+  "NVSDK_NGX_Parameter_DLSS_Enable_Output_Subrects": "DLSS.Enable.Output.Subrects",
+  "NVSDK_NGX_Parameter_DLSS_Exposure_Scale": "DLSS.Exposure.Scale",
+  "NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags": "DLSS.Feature.Create.Flags",
+  "NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Height": "DLSS.Get.Dynamic.Max.Render.Height",
+  "NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Max_Render_Width": "DLSS.Get.Dynamic.Max.Render.Width",
+  "NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Height": "DLSS.Get.Dynamic.Min.Render.Height",
+  "NVSDK_NGX_Parameter_DLSS_Get_Dynamic_Min_Render_Width": "DLSS.Get.Dynamic.Min.Render.Width",
+  "NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced": "DLSS.Hint.Render.Preset.Balanced",
+  "NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA": "DLSS.Hint.Render.Preset.DLAA",
+  "NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance": "DLSS.Hint.Render.Preset.Performance",
+  "NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality": "DLSS.Hint.Render.Preset.Quality",
+  "NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance": "DLSS.Hint.Render.Preset.UltraPerformance",
+  "NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality": "DLSS.Hint.Render.Preset.UltraQuality",
+  "NVSDK_NGX_Parameter_DLSS_INV_VIEW_PROJECTION_MATRIX": "InvViewProjectionMatrix",
+  "NVSDK_NGX_Parameter_DLSS_Indicator_Invert_X_Axis": "DLSS.Indicator.Invert.X.Axis",
+  "NVSDK_NGX_Parameter_DLSS_Indicator_Invert_Y_Axis": "DLSS.Indicator.Invert.Y.Axis",
+  "NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_Mask": "DLSS.Input.Bias.Current.Color.Mask",
+  "NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_X": "DLSS.Input.Bias.Current.Color.Subrect.Base.X",
+  "NVSDK_NGX_Parameter_DLSS_Input_Bias_Current_Color_SubrectBase_Y": "DLSS.Input.Bias.Current.Color.Subrect.Base.Y",
+  "NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_X": "DLSS.Input.Color.Subrect.Base.X",
+  "NVSDK_NGX_Parameter_DLSS_Input_Color_Subrect_Base_Y": "DLSS.Input.Color.Subrect.Base.Y",
+  "NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_X": "DLSS.Input.Depth.Subrect.Base.X",
+  "NVSDK_NGX_Parameter_DLSS_Input_Depth_Subrect_Base_Y": "DLSS.Input.Depth.Subrect.Base.Y",
+  "NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_X": "DLSS.Input.MV.Subrect.Base.X",
+  "NVSDK_NGX_Parameter_DLSS_Input_MV_SubrectBase_Y": "DLSS.Input.MV.Subrect.Base.Y",
+  "NVSDK_NGX_Parameter_DLSS_Input_Translucency_SubrectBase_X": "DLSS.Input.Translucency.Subrect.Base.X",
+  "NVSDK_NGX_Parameter_DLSS_Input_Translucency_SubrectBase_Y": "DLSS.Input.Translucency.Subrect.Base.Y",
+  "NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_X": "DLSS.Output.Subrect.Base.X",
+  "NVSDK_NGX_Parameter_DLSS_Output_Subrect_Base_Y": "DLSS.Output.Subrect.Base.Y",
+  "NVSDK_NGX_Parameter_DLSS_Overlay_Debug_Layer": "DLSS.Overlay.Debug.Layer",
+  "NVSDK_NGX_Parameter_DLSS_Overlay_Full_Screen": "DLSS.Overlay.Full.Screen",
+  "NVSDK_NGX_Parameter_DLSS_Overlay_Jitter_Debug": "DLSS.Overlay.Jitter.Debug",
+  "NVSDK_NGX_Parameter_DLSS_Overlay_Show_Nans": "DLSS.Overlay.Show.Nans",
+  "NVSDK_NGX_Parameter_DLSS_Pre_Exposure": "DLSS.Pre.Exposure",
+  "NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height": "DLSS.Render.Subrect.Dimensions.Height",
+  "NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width": "DLSS.Render.Subrect.Dimensions.Width",
+  "NVSDK_NGX_Parameter_DLSS_ResponsivityMask": "DLSS.ResponsivityMask",
+  "NVSDK_NGX_Parameter_DLSS_ResponsivityMask_Subrect_Base_X": "DLSS.ResponsivityMask.Subrect.Base.X",
+  "NVSDK_NGX_Parameter_DLSS_ResponsivityMask_Subrect_Base_Y": "DLSS.ResponsivityMask.Subrect.Base.Y",
+  "NVSDK_NGX_Parameter_DLSS_TransparencyLayer": "DLSS.TransparencyLayer",
+  "NVSDK_NGX_Parameter_DLSS_TransparencyLayerMvecs": "DLSS.TransparencyLayerMvecs",
+  "NVSDK_NGX_Parameter_DLSS_TransparencyLayerMvecs_Subrect_Base_X": "DLSS.TransparencyLayerMvecs.Subrect.Base.X",
+  "NVSDK_NGX_Parameter_DLSS_TransparencyLayerMvecs_Subrect_Base_Y": "DLSS.TransparencyLayerMvecs.Subrect.Base.Y",
+  "NVSDK_NGX_Parameter_DLSS_TransparencyLayerOpacity": "DLSS.TransparencyLayerOpacity",
+  "NVSDK_NGX_Parameter_DLSS_TransparencyLayerOpacity_Subrect_Base_X": "DLSS.TransparencyLayerOpacity.Subrect.Base.X",
+  "NVSDK_NGX_Parameter_DLSS_TransparencyLayerOpacity_Subrect_Base_Y": "DLSS.TransparencyLayerOpacity.Subrect.Base.Y",
+  "NVSDK_NGX_Parameter_DLSS_TransparencyLayer_Subrect_Base_X": "DLSS.TransparencyLayer.Subrect.Base.X",
+  "NVSDK_NGX_Parameter_DLSS_TransparencyLayer_Subrect_Base_Y": "DLSS.TransparencyLayer.Subrect.Base.Y",
+  "NVSDK_NGX_Parameter_DeepResolve_Available": "DeepResolve.Available",
+  "NVSDK_NGX_Parameter_DeepResolve_FeatureInitResult": "DeepResolve.FeatureInitResult",
+  "NVSDK_NGX_Parameter_DeepResolve_MinDriverVersionMajor": "DeepResolve.MinDriverVersionMajor",
+  "NVSDK_NGX_Parameter_DeepResolve_MinDriverVersionMinor": "DeepResolve.MinDriverVersionMinor",
+  "NVSDK_NGX_Parameter_DeepResolve_NeedsUpdatedDriver": "DeepResolve.NeedsUpdatedDriver",
+  "NVSDK_NGX_Parameter_Denoise": "Denoise",
+  "NVSDK_NGX_Parameter_Depth": "Depth",
+  "NVSDK_NGX_Parameter_DepthHighRes": "DepthHighRes",
+  "NVSDK_NGX_Parameter_ExposureTexture": "ExposureTexture",
+  "NVSDK_NGX_Parameter_FI_Color1": "Color1",
+  "NVSDK_NGX_Parameter_FI_Color2": "Color2",
+  "NVSDK_NGX_Parameter_FI_Depth1": "Depth1",
+  "NVSDK_NGX_Parameter_FI_Depth2": "Depth2",
+  "NVSDK_NGX_Parameter_FI_Mode": "FIMode",
+  "NVSDK_NGX_Parameter_FI_MotionVectors1": "MotionVectors1",
+  "NVSDK_NGX_Parameter_FI_MotionVectors2": "MotionVectors2",
+  "NVSDK_NGX_Parameter_FI_OF_GridSize": "FIOFGridSize",
+  "NVSDK_NGX_Parameter_FI_OF_Preset": "FIOFPreset",
+  "NVSDK_NGX_Parameter_FI_Output1": "Output1",
+  "NVSDK_NGX_Parameter_FI_Output2": "Output2",
+  "NVSDK_NGX_Parameter_FI_Output3": "Output3",
+  "NVSDK_NGX_Parameter_Format": "Format",
+  "NVSDK_NGX_Parameter_FrameGeneration_Available": "FrameGeneration.Available",
+  "NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult": "FrameGeneration.FeatureInitResult",
+  "NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMajor": "FrameGeneration.MinDriverVersionMajor",
+  "NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMinor": "FrameGeneration.MinDriverVersionMinor",
+  "NVSDK_NGX_Parameter_FrameGeneration_NeedsUpdatedDriver": "FrameGeneration.NeedsUpdatedDriver",
+  "NVSDK_NGX_Parameter_FrameInterpolation_Available": "FrameInterpolation.Available",
+  "NVSDK_NGX_Parameter_FrameInterpolation_FeatureInitResult": "FrameInterpolation.FeatureInitResult",
+  "NVSDK_NGX_Parameter_FrameInterpolation_MinDriverVersionMajor": "FrameInterpolation.MinDriverVersionMajor",
+  "NVSDK_NGX_Parameter_FrameInterpolation_MinDriverVersionMinor": "FrameInterpolation.MinDriverVersionMinor",
+  "NVSDK_NGX_Parameter_FrameInterpolation_NeedsUpdatedDriver": "FrameInterpolation.NeedsUpdatedDriver",
+  "NVSDK_NGX_Parameter_FrameTimeDeltaInMsec": "FrameTimeDeltaInMsec",
+  "NVSDK_NGX_Parameter_FreeMemOnReleaseFeature": "FreeMemOnReleaseFeature",
+  "NVSDK_NGX_Parameter_GBuffer_Albedo": "GBuffer.Albedo",
+  "NVSDK_NGX_Parameter_GBuffer_Atrrib_10": "GBuffer.Attrib.10",
+  "NVSDK_NGX_Parameter_GBuffer_Atrrib_11": "GBuffer.Attrib.11",
+  "NVSDK_NGX_Parameter_GBuffer_Atrrib_12": "GBuffer.Attrib.12",
+  "NVSDK_NGX_Parameter_GBuffer_Atrrib_13": "GBuffer.Attrib.13",
+  "NVSDK_NGX_Parameter_GBuffer_Atrrib_14": "GBuffer.Attrib.14",
+  "NVSDK_NGX_Parameter_GBuffer_Atrrib_15": "GBuffer.Attrib.15",
+  "NVSDK_NGX_Parameter_GBuffer_Atrrib_8": "GBuffer.Attrib.8",
+  "NVSDK_NGX_Parameter_GBuffer_Atrrib_9": "GBuffer.Attrib.9",
+  "NVSDK_NGX_Parameter_GBuffer_DiffuseAlbedo": "GBuffer.DiffuseAlbedo",
+  "NVSDK_NGX_Parameter_GBuffer_DisocclusionMask": "GBuffer.DisocclusionMask",
+  "NVSDK_NGX_Parameter_GBuffer_IndirectAlbedo": "GBuffer.IndirectAlbedo",
+  "NVSDK_NGX_Parameter_GBuffer_MaterialId": "GBuffer.MaterialId",
+  "NVSDK_NGX_Parameter_GBuffer_Metallic": "GBuffer.Metallic",
+  "NVSDK_NGX_Parameter_GBuffer_Normals": "GBuffer.Normals",
+  "NVSDK_NGX_Parameter_GBuffer_Roughness": "GBuffer.Roughness",
+  "NVSDK_NGX_Parameter_GBuffer_ShadingModelId": "GBuffer.ShadingModelId",
+  "NVSDK_NGX_Parameter_GBuffer_Specular": "GBuffer.Specular",
+  "NVSDK_NGX_Parameter_GBuffer_SpecularAlbedo": "GBuffer.SpecularAlbedo",
+  "NVSDK_NGX_Parameter_GBuffer_SpecularMvec": "GBuffer.SpecularMvec",
+  "NVSDK_NGX_Parameter_GBuffer_Subsurface": "GBuffer.Subsurface",
+  "NVSDK_NGX_Parameter_Height": "Height",
+  "NVSDK_NGX_Parameter_Hint_UseFireflySwatter": "Hint.UseFireflySwatter",
+  "NVSDK_NGX_Parameter_ImageSignalProcessing_Available": "ImageSignalProcessing.Available",
+  "NVSDK_NGX_Parameter_ImageSignalProcessing_FeatureInitResult": "ImageSignalProcessing.FeatureInitResult",
+  "NVSDK_NGX_Parameter_ImageSignalProcessing_MinDriverVersionMajor": "ImageSignalProcessing.MinDriverVersionMajor",
+  "NVSDK_NGX_Parameter_ImageSignalProcessing_MinDriverVersionMinor": "ImageSignalProcessing.MinDriverVersionMinor",
+  "NVSDK_NGX_Parameter_ImageSignalProcessing_NeedsUpdatedDriver": "ImageSignalProcessing.NeedsUpdatedDriver",
+  "NVSDK_NGX_Parameter_ImageSignalProcessing_ScaleFactor": "ImageSignalProcessing.ScaleFactor",
+  "NVSDK_NGX_Parameter_ImageSuperResolution_Available": "ImageSuperResolution.Available",
+  "NVSDK_NGX_Parameter_ImageSuperResolution_FeatureInitResult": "ImageSuperResolution.FeatureInitResult",
+  "NVSDK_NGX_Parameter_ImageSuperResolution_MinDriverVersionMajor": "ImageSuperResolution.MinDriverVersionMajor",
+  "NVSDK_NGX_Parameter_ImageSuperResolution_MinDriverVersionMinor": "ImageSuperResolution.MinDriverVersionMinor",
+  "NVSDK_NGX_Parameter_ImageSuperResolution_NeedsUpdatedDriver": "ImageSuperResolution.NeedsUpdatedDriver",
+  "NVSDK_NGX_Parameter_ImageSuperResolution_ScaleFactor_2_1": "ImageSuperResolution.ScaleFactor.2.1",
+  "NVSDK_NGX_Parameter_ImageSuperResolution_ScaleFactor_3_1": "ImageSuperResolution.ScaleFactor.3.1",
+  "NVSDK_NGX_Parameter_ImageSuperResolution_ScaleFactor_3_2": "ImageSuperResolution.ScaleFactor.3.2",
+  "NVSDK_NGX_Parameter_ImageSuperResolution_ScaleFactor_4_3": "ImageSuperResolution.ScaleFactor.4.3",
+  "NVSDK_NGX_Parameter_InPainting_Available": "InPainting.Available",
+  "NVSDK_NGX_Parameter_InPainting_FeatureInitResult": "InPainting.FeatureInitResult",
+  "NVSDK_NGX_Parameter_InPainting_MinDriverVersionMajor": "InPainting.MinDriverVersionMajor",
+  "NVSDK_NGX_Parameter_InPainting_MinDriverVersionMinor": "InPainting.MinDriverVersionMinor",
+  "NVSDK_NGX_Parameter_InPainting_NeedsUpdatedDriver": "InPainting.NeedsUpdatedDriver",
+  "NVSDK_NGX_Parameter_Input1": "Input1",
+  "NVSDK_NGX_Parameter_Input1_Format": "Input1.Format",
+  "NVSDK_NGX_Parameter_Input1_SizeInBytes": "Input1.SizeInBytes",
+  "NVSDK_NGX_Parameter_Input2": "Input2",
+  "NVSDK_NGX_Parameter_Input2_Format": "Input2.Format",
+  "NVSDK_NGX_Parameter_Input2_SizeInBytes": "Input2.SizeInBytes",
+  "NVSDK_NGX_Parameter_IsDevSnippetBranch": "Snippet.IsDevBranch",
+  "NVSDK_NGX_Parameter_IsParticleMask": "IsParticleMask",
+  "NVSDK_NGX_Parameter_Jitter_Offset_X": "Jitter.Offset.X",
+  "NVSDK_NGX_Parameter_Jitter_Offset_Y": "Jitter.Offset.Y",
+  "NVSDK_NGX_Parameter_MV_Offset_X": "MV.Offset.X",
+  "NVSDK_NGX_Parameter_MV_Offset_Y": "MV.Offset.Y",
+  "NVSDK_NGX_Parameter_MV_Scale_X": "MV.Scale.X",
+  "NVSDK_NGX_Parameter_MV_Scale_Y": "MV.Scale.Y",
+  "NVSDK_NGX_Parameter_Model": "Model",
+  "NVSDK_NGX_Parameter_MotionVectors": "MotionVectors",
+  "NVSDK_NGX_Parameter_MotionVectors3D": "MotionVectors3D",
+  "NVSDK_NGX_Parameter_MotionVectorsReflection": "MotionVectorsReflection",
+  "NVSDK_NGX_Parameter_NumFrames": "NumFrames",
+  "NVSDK_NGX_Parameter_OptLevel": "Snippet.OptLevel",
+  "NVSDK_NGX_Parameter_OutHeight": "OutHeight",
+  "NVSDK_NGX_Parameter_OutRect_H": "OutRect.H",
+  "NVSDK_NGX_Parameter_OutRect_W": "OutRect.W",
+  "NVSDK_NGX_Parameter_OutRect_X": "OutRect.X",
+  "NVSDK_NGX_Parameter_OutRect_Y": "OutRect.Y",
+  "NVSDK_NGX_Parameter_OutWidth": "OutWidth",
+  "NVSDK_NGX_Parameter_Output": "Output",
+  "NVSDK_NGX_Parameter_OutputInterpolated": "DLSSG.OutputInterpolated",
+  "NVSDK_NGX_Parameter_OutputReal": "DLSSG.OutputReal",
+  "NVSDK_NGX_Parameter_Output_Format": "Output.Format",
+  "NVSDK_NGX_Parameter_Output_SizeInBytes": "Output.SizeInBytes",
+  "NVSDK_NGX_Parameter_PerfQualityValue": "PerfQualityValue",
+  "NVSDK_NGX_Parameter_Position_ViewSpace": "Position.ViewSpace",
+  "NVSDK_NGX_Parameter_RTXValue": "RTXValue",
+  "NVSDK_NGX_Parameter_RayTracingHitDistance": "RayTracingHitDistance",
+  "NVSDK_NGX_Parameter_Rect_H": "Rect.H",
+  "NVSDK_NGX_Parameter_Rect_W": "Rect.W",
+  "NVSDK_NGX_Parameter_Rect_X": "Rect.X",
+  "NVSDK_NGX_Parameter_Rect_Y": "Rect.Y",
+  "NVSDK_NGX_Parameter_Reset": "Reset",
+  "NVSDK_NGX_Parameter_ResourceAllocCallback": "ResourceAllocCallback",
+  "NVSDK_NGX_Parameter_ResourceReleaseCallback": "ResourceReleaseCallback",
+  "NVSDK_NGX_Parameter_Resource_Height": "ResourceHeight",
+  "NVSDK_NGX_Parameter_Resource_OutHeight": "ResourceOutHeight",
+  "NVSDK_NGX_Parameter_Resource_OutWidth": "ResourceOutWidth",
+  "NVSDK_NGX_Parameter_Resource_Width": "ResourceWidth",
+  "NVSDK_NGX_Parameter_Scale": "Scale",
+  "NVSDK_NGX_Parameter_Scratch": "Scratch",
+  "NVSDK_NGX_Parameter_Scratch_SizeInBytes": "Scratch.SizeInBytes",
+  "NVSDK_NGX_Parameter_Sharpness": "Sharpness",
+  "NVSDK_NGX_Parameter_SizeInBytes": "SizeInBytes",
+  "NVSDK_NGX_Parameter_SlowMotion_Available": "SlowMotion.Available",
+  "NVSDK_NGX_Parameter_SlowMotion_FeatureInitResult": "SlowMotion.FeatureInitResult",
+  "NVSDK_NGX_Parameter_SlowMotion_MinDriverVersionMajor": "SlowMotion.MinDriverVersionMajor",
+  "NVSDK_NGX_Parameter_SlowMotion_MinDriverVersionMinor": "SlowMotion.MinDriverVersionMinor",
+  "NVSDK_NGX_Parameter_SlowMotion_NeedsUpdatedDriver": "SlowMotion.NeedsUpdatedDriver",
+  "NVSDK_NGX_Parameter_SuperSampling_Available": "SuperSampling.Available",
+  "NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult": "SuperSampling.FeatureInitResult",
+  "NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor": "SuperSampling.MinDriverVersionMajor",
+  "NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor": "SuperSampling.MinDriverVersionMinor",
+  "NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver": "SuperSampling.NeedsUpdatedDriver",
+  "NVSDK_NGX_Parameter_SuperSampling_ScaleFactor": "SuperSampling.ScaleFactor",
+  "NVSDK_NGX_Parameter_Tex2DAllocCallback": "Tex2DAllocCallback",
+  "NVSDK_NGX_Parameter_TonemapperType": "TonemapperType",
+  "NVSDK_NGX_Parameter_TransparencyMask": "TransparencyMask",
+  "NVSDK_NGX_Parameter_VideoSuperResolution_Available": "VideoSuperResolution.Available",
+  "NVSDK_NGX_Parameter_VideoSuperResolution_FeatureInitResult": "VideoSuperResolution.FeatureInitResult",
+  "NVSDK_NGX_Parameter_VideoSuperResolution_MinDriverVersionMajor": "VideoSuperResolution.MinDriverVersionMajor",
+  "NVSDK_NGX_Parameter_VideoSuperResolution_MinDriverVersionMinor": "VideoSuperResolution.MinDriverVersionMinor",
+  "NVSDK_NGX_Parameter_VideoSuperResolution_NeedsUpdatedDriver": "VideoSuperResolution.NeedsUpdatedDriver",
+  "NVSDK_NGX_Parameter_VisibilityNodeMask": "VisibilityNodeMask",
+  "NVSDK_NGX_Parameter_Width": "Width"
+ },
+ "setters": {
+  "AnimatedTextureMask": [
+   "d3d12_resource"
+  ],
+  "Color": [
+   "d3d12_resource"
+  ],
+  "CreationNodeMask": [
+   "u32"
+  ],
+  "DLSS.Enable.Output.Subrects": [
+   "i32"
+  ],
+  "DLSS.Exposure.Scale": [
+   "f32"
+  ],
+  "DLSS.Feature.Create.Flags": [
+   "i32"
+  ],
+  "DLSS.Indicator.Invert.X.Axis": [
+   "i32"
+  ],
+  "DLSS.Indicator.Invert.Y.Axis": [
+   "i32"
+  ],
+  "DLSS.Input.Bias.Current.Color.Mask": [
+   "d3d12_resource"
+  ],
+  "DLSS.Input.Bias.Current.Color.Subrect.Base.X": [
+   "u32"
+  ],
+  "DLSS.Input.Bias.Current.Color.Subrect.Base.Y": [
+   "u32"
+  ],
+  "DLSS.Input.Color.Subrect.Base.X": [
+   "u32"
+  ],
+  "DLSS.Input.Color.Subrect.Base.Y": [
+   "u32"
+  ],
+  "DLSS.Input.Depth.Subrect.Base.X": [
+   "u32"
+  ],
+  "DLSS.Input.Depth.Subrect.Base.Y": [
+   "u32"
+  ],
+  "DLSS.Input.MV.Subrect.Base.X": [
+   "u32"
+  ],
+  "DLSS.Input.MV.Subrect.Base.Y": [
+   "u32"
+  ],
+  "DLSS.Input.Translucency.Subrect.Base.X": [
+   "u32"
+  ],
+  "DLSS.Input.Translucency.Subrect.Base.Y": [
+   "u32"
+  ],
+  "DLSS.Output.Subrect.Base.X": [
+   "u32"
+  ],
+  "DLSS.Output.Subrect.Base.Y": [
+   "u32"
+  ],
+  "DLSS.Pre.Exposure": [
+   "f32"
+  ],
+  "DLSS.Render.Subrect.Dimensions.Height": [
+   "u32"
+  ],
+  "DLSS.Render.Subrect.Dimensions.Width": [
+   "u32"
+  ],
+  "DLSSG.AutomodeOverrideReset": [
+   "u32"
+  ],
+  "DLSSG.Backbuffer": [
+   "d3d12_resource"
+  ],
+  "DLSSG.BackbufferFormat": [
+   "u32"
+  ],
+  "DLSSG.BidirectionalDistortionField": [
+   "d3d12_resource"
+  ],
+  "DLSSG.BidirectionalDistortionFieldLowPrecision.Bias": [
+   "f32"
+  ],
+  "DLSSG.BidirectionalDistortionFieldLowPrecision.IsLowPrecision": [
+   "u32"
+  ],
+  "DLSSG.BidirectionalDistortionFieldLowPrecision.Scale": [
+   "f32"
+  ],
+  "DLSSG.BidirectionalDistortionFieldSubrectBaseX": [
+   "u32"
+  ],
+  "DLSSG.BidirectionalDistortionFieldSubrectBaseY": [
+   "u32"
+  ],
+  "DLSSG.BidirectionalDistortionFieldSubrectHeight": [
+   "u32"
+  ],
+  "DLSSG.BidirectionalDistortionFieldSubrectWidth": [
+   "u32"
+  ],
+  "DLSSG.CameraAspectRatio": [
+   "f32"
+  ],
+  "DLSSG.CameraFOV": [
+   "f32"
+  ],
+  "DLSSG.CameraFar": [
+   "f32"
+  ],
+  "DLSSG.CameraFwdX": [
+   "f32"
+  ],
+  "DLSSG.CameraFwdY": [
+   "f32"
+  ],
+  "DLSSG.CameraFwdZ": [
+   "f32"
+  ],
+  "DLSSG.CameraMotionIncluded": [
+   "u32"
+  ],
+  "DLSSG.CameraNear": [
+   "f32"
+  ],
+  "DLSSG.CameraPinholeOffsetX": [
+   "f32"
+  ],
+  "DLSSG.CameraPinholeOffsetY": [
+   "f32"
+  ],
+  "DLSSG.CameraPosX": [
+   "f32"
+  ],
+  "DLSSG.CameraPosY": [
+   "f32"
+  ],
+  "DLSSG.CameraPosZ": [
+   "f32"
+  ],
+  "DLSSG.CameraRightX": [
+   "f32"
+  ],
+  "DLSSG.CameraRightY": [
+   "f32"
+  ],
+  "DLSSG.CameraRightZ": [
+   "f32"
+  ],
+  "DLSSG.CameraUpX": [
+   "f32"
+  ],
+  "DLSSG.CameraUpY": [
+   "f32"
+  ],
+  "DLSSG.CameraUpZ": [
+   "f32"
+  ],
+  "DLSSG.CameraViewToClip": [
+   "void_pointer"
+  ],
+  "DLSSG.ClipToCameraView": [
+   "void_pointer"
+  ],
+  "DLSSG.ClipToLensClip": [
+   "void_pointer"
+  ],
+  "DLSSG.ClipToPrevClip": [
+   "void_pointer"
+  ],
+  "DLSSG.ColorBuffersHDR": [
+   "u32"
+  ],
+  "DLSSG.Depth": [
+   "d3d12_resource"
+  ],
+  "DLSSG.DepthInverted": [
+   "u32"
+  ],
+  "DLSSG.DepthSubrectBaseX": [
+   "u32"
+  ],
+  "DLSSG.DepthSubrectBaseY": [
+   "u32"
+  ],
+  "DLSSG.DepthSubrectHeight": [
+   "u32"
+  ],
+  "DLSSG.DepthSubrectWidth": [
+   "u32"
+  ],
+  "DLSSG.DynamicResolution": [
+   "u32"
+  ],
+  "DLSSG.HUDLess": [
+   "d3d12_resource"
+  ],
+  "DLSSG.HUDLessSubrectBaseX": [
+   "u32"
+  ],
+  "DLSSG.HUDLessSubrectBaseY": [
+   "u32"
+  ],
+  "DLSSG.HUDLessSubrectHeight": [
+   "u32"
+  ],
+  "DLSSG.HUDLessSubrectWidth": [
+   "u32"
+  ],
+  "DLSSG.InputBackbufferSubrectBaseX": [
+   "u32"
+  ],
+  "DLSSG.InputBackbufferSubrectBaseY": [
+   "u32"
+  ],
+  "DLSSG.InputBackbufferSubrectHeight": [
+   "u32"
+  ],
+  "DLSSG.InputBackbufferSubrectWidth": [
+   "u32"
+  ],
+  "DLSSG.InternalHeight": [
+   "u32"
+  ],
+  "DLSSG.InternalWidth": [
+   "u32"
+  ],
+  "DLSSG.JitterOffsetX": [
+   "f32"
+  ],
+  "DLSSG.JitterOffsetY": [
+   "f32"
+  ],
+  "DLSSG.MVecs": [
+   "d3d12_resource"
+  ],
+  "DLSSG.MVecsSubrectBaseX": [
+   "u32"
+  ],
+  "DLSSG.MVecsSubrectBaseY": [
+   "u32"
+  ],
+  "DLSSG.MVecsSubrectHeight": [
+   "u32"
+  ],
+  "DLSSG.MVecsSubrectWidth": [
+   "u32"
+  ],
+  "DLSSG.MenuDetectionEnabled": [
+   "u32"
+  ],
+  "DLSSG.MinRelativeLinearDepthObjectSeparation": [
+   "f32"
+  ],
+  "DLSSG.MultiFrameCount": [
+   "u32"
+  ],
+  "DLSSG.MultiFrameIndex": [
+   "u32"
+  ],
+  "DLSSG.MvecDilated": [
+   "u32"
+  ],
+  "DLSSG.MvecInvalidValue": [
+   "f32"
+  ],
+  "DLSSG.MvecScaleX": [
+   "f32"
+  ],
+  "DLSSG.MvecScaleY": [
+   "f32"
+  ],
+  "DLSSG.NotRenderingGameFrames": [
+   "u32"
+  ],
+  "DLSSG.OrthoProjection": [
+   "u32"
+  ],
+  "DLSSG.OutputDisableInterpolation": [
+   "d3d12_resource"
+  ],
+  "DLSSG.OutputInterpolated": [
+   "d3d12_resource"
+  ],
+  "DLSSG.OutputInterpolatedSubrectBaseX": [
+   "u32"
+  ],
+  "DLSSG.OutputInterpolatedSubrectBaseY": [
+   "u32"
+  ],
+  "DLSSG.OutputInterpolatedSubrectHeight": [
+   "u32"
+  ],
+  "DLSSG.OutputInterpolatedSubrectWidth": [
+   "u32"
+  ],
+  "DLSSG.OutputReal": [
+   "d3d12_resource"
+  ],
+  "DLSSG.OutputRealSubrectBaseX": [
+   "u32"
+  ],
+  "DLSSG.OutputRealSubrectBaseY": [
+   "u32"
+  ],
+  "DLSSG.OutputRealSubrectHeight": [
+   "u32"
+  ],
+  "DLSSG.OutputRealSubrectWidth": [
+   "u32"
+  ],
+  "DLSSG.PrevClipToClip": [
+   "void_pointer"
+  ],
+  "DLSSG.Reset": [
+   "u32"
+  ],
+  "DLSSG.UI": [
+   "d3d12_resource"
+  ],
+  "DLSSG.UIAlpha": [
+   "d3d12_resource"
+  ],
+  "DLSSG.UIAlphaSubrectBaseX": [
+   "u32"
+  ],
+  "DLSSG.UIAlphaSubrectBaseY": [
+   "u32"
+  ],
+  "DLSSG.UIAlphaSubrectHeight": [
+   "u32"
+  ],
+  "DLSSG.UIAlphaSubrectWidth": [
+   "u32"
+  ],
+  "DLSSG.UISubrectBaseX": [
+   "u32"
+  ],
+  "DLSSG.UISubrectBaseY": [
+   "u32"
+  ],
+  "DLSSG.UISubrectHeight": [
+   "u32"
+  ],
+  "DLSSG.UISubrectWidth": [
+   "u32"
+  ],
+  "Denoise": [
+   "f32"
+  ],
+  "Depth": [
+   "d3d12_resource"
+  ],
+  "DepthHighRes": [
+   "d3d12_resource"
+  ],
+  "ExposureTexture": [
+   "d3d12_resource"
+  ],
+  "FrameTimeDeltaInMsec": [
+   "f32"
+  ],
+  "GBuffer.Albedo": [
+   "d3d12_resource"
+  ],
+  "GBuffer.Attrib.10": [
+   "d3d12_resource"
+  ],
+  "GBuffer.Attrib.11": [
+   "d3d12_resource"
+  ],
+  "GBuffer.Attrib.12": [
+   "d3d12_resource"
+  ],
+  "GBuffer.Attrib.13": [
+   "d3d12_resource"
+  ],
+  "GBuffer.Attrib.14": [
+   "d3d12_resource"
+  ],
+  "GBuffer.Attrib.15": [
+   "d3d12_resource"
+  ],
+  "GBuffer.Attrib.8": [
+   "d3d12_resource"
+  ],
+  "GBuffer.Attrib.9": [
+   "d3d12_resource"
+  ],
+  "GBuffer.MaterialId": [
+   "d3d12_resource"
+  ],
+  "GBuffer.Metallic": [
+   "d3d12_resource"
+  ],
+  "GBuffer.Normals": [
+   "d3d12_resource"
+  ],
+  "GBuffer.Roughness": [
+   "d3d12_resource"
+  ],
+  "GBuffer.ShadingModelId": [
+   "d3d12_resource"
+  ],
+  "GBuffer.Specular": [
+   "d3d12_resource"
+  ],
+  "GBuffer.Subsurface": [
+   "d3d12_resource"
+  ],
+  "Height": [
+   "u32"
+  ],
+  "IsParticleMask": [
+   "d3d12_resource"
+  ],
+  "Jitter.Offset.X": [
+   "f32"
+  ],
+  "Jitter.Offset.Y": [
+   "f32"
+  ],
+  "MV.Scale.X": [
+   "f32"
+  ],
+  "MV.Scale.Y": [
+   "f32"
+  ],
+  "MotionVectors": [
+   "d3d12_resource"
+  ],
+  "MotionVectors3D": [
+   "d3d12_resource"
+  ],
+  "MotionVectorsReflection": [
+   "d3d12_resource"
+  ],
+  "OutHeight": [
+   "u32"
+  ],
+  "OutWidth": [
+   "u32"
+  ],
+  "Output": [
+   "d3d12_resource"
+  ],
+  "PerfQualityValue": [
+   "i32"
+  ],
+  "Position.ViewSpace": [
+   "d3d12_resource"
+  ],
+  "RTXValue": [
+   "i32"
+  ],
+  "RayTracingHitDistance": [
+   "d3d12_resource"
+  ],
+  "Rect.H": [
+   "u32"
+  ],
+  "Rect.W": [
+   "u32"
+  ],
+  "Rect.X": [
+   "u32"
+  ],
+  "Rect.Y": [
+   "u32"
+  ],
+  "Reset": [
+   "i32"
+  ],
+  "Sharpness": [
+   "f32"
+  ],
+  "TonemapperType": [
+   "u32"
+  ],
+  "TransparencyMask": [
+   "d3d12_resource"
+  ],
+  "VisibilityNodeMask": [
+   "u32"
+  ],
+  "Width": [
+   "u32"
+  ]
+ },
+ "vtable": {
+  "SET_U64": 0,
+  "SET_F32": 1,
+  "SET_F64": 2,
+  "SET_U32": 3,
+  "SET_I32": 4,
+  "SET_D3D11": 5,
+  "SET_D3D12": 6,
+  "SET_VOID": 7,
+  "GET_U64": 8,
+  "GET_F32": 9,
+  "GET_F64": 10,
+  "GET_U32": 11,
+  "GET_I32": 12,
+  "GET_D3D11": 13,
+  "GET_D3D12": 14,
+  "GET_VOID": 15
+ }
+}
