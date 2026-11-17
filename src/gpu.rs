@@ -7017,6 +7017,9 @@ pub fn preview(
         &mut residency,
         false,
         0,
+        // The preview renders one frame of the local window; it never runs the
+        // whole-world preload, so the scenery half stays in the mesh.
+        false,
     )?;
     let (width, height) = (960u32, 720u32);
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
