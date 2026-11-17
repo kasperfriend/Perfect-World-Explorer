@@ -351,6 +351,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
+      - name: Prepare MSVC environment for SDK bridge builds
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "MSVC x64 tools not found" }
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path -LiteralPath $vcvars)) { throw "MSVC environment script not found: $vcvars" }
+          $capture = Join-Path $env:RUNNER_TEMP 'capture-msvc-env.cmd'
+          @"
+          @echo off
+          call "$vcvars" >nul
+          if errorlevel 1 exit /b %errorlevel%
+          set
+          "@ | Set-Content -LiteralPath $capture -Encoding ascii
+          $msvcEnvironment = & cmd.exe /d /c $capture
+          if ($LASTEXITCODE -ne 0) { throw "vcvars64.bat failed with exit $LASTEXITCODE" }
+          foreach ($name in @('PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCToolsInstallDir', 'WindowsSdkDir', 'WindowsSDKVersion', 'UniversalCRTSdkDir', 'UCRTVersion')) {
+            $entry = $msvcEnvironment | Where-Object { $_.StartsWith("$name=", [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+            if (-not $entry) { throw "MSVC environment did not define $name" }
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value $entry -Encoding utf8
+          }
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW32
@@ -397,20 +419,45 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
       - name: Build standalone viewer
-        shell: bash
+        shell: pwsh
         run: |
-          CARGO_TERM_COLOR=never cargo build --locked --release --target x86_64-pc-windows-msvc --bin perfect-world-explorer 2>&1 | tee /tmp/win-build.log
-          status=${PIPESTATUS[0]}
-          if [ "$status" -ne 0 ]; then
-            grep -E "(^error|: error)" /tmp/win-build.log | head -40 | while IFS= read -r line; do
-              echo "::error::$line"
-            done
-          fi
-          exit "$status"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "MSVC x64 tools not found" }
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path -LiteralPath $vcvars)) { throw "MSVC environment script not found: $vcvars" }
+          $buildScript = Join-Path $env:RUNNER_TEMP 'build-viewer.cmd'
+          @"
+          @echo off
+          call "$vcvars"
+          if errorlevel 1 exit /b %errorlevel%
+          where cl.exe
+          if errorlevel 1 exit /b %errorlevel%
+          set CARGO_TERM_COLOR=never
+          cargo build --locked --release --target x86_64-pc-windows-msvc --bin perfect-world-explorer
+          exit /b %errorlevel%
+          "@ | Set-Content -LiteralPath $buildScript -Encoding ascii
+          $log = Join-Path $env:RUNNER_TEMP 'win-build.log'
+          & cmd.exe /d /c $buildScript 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          if ($status -ne 0) {
+            Write-Host "::error::Windows viewer build failed (exit $status); diagnostic tail follows"
+            Get-Content -LiteralPath $log -Tail 100 | ForEach-Object { Write-Host "::error::$_" }
+          }
+          exit $status
       - name: Build audio corpus and scene diagnostics
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin audio-corpus-check --bin scene-sound-check
       - name: Test Windows audio decoding with synthetic fixtures
-        run: cargo test --locked --target x86_64-pc-windows-msvc --bin audio-corpus-check
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'windows-audio-tests.log'
+          cargo test --locked --target x86_64-pc-windows-msvc --bin audio-corpus-check 2>&1 | Tee-Object -FilePath $log
+          $status = $LASTEXITCODE
+          if ($status -ne 0) {
+            Write-Host "::error::Windows audio fixture tests failed (exit $status); diagnostic tail follows"
+            Get-Content -LiteralPath $log -Tail 100 | ForEach-Object { Write-Host "::error::$_" }
+          }
+          exit $status
       - name: Test world audio selection on Windows
         run: cargo test --locked --target x86_64-pc-windows-msvc --bin perfect-world-explorer world_audio::tests
       - name: Build the shipped survey tool
@@ -445,7 +492,15 @@ jobs:
             throw 'The artifact must contain only the Perfect World Explorer top-level folder.'
           }
           $package = Join-Path $uploaded 'Perfect World Explorer'
-          foreach ($relative in @('Perfect-World-Explorer.exe', 'Modules/Walker/module.ini', 'SHA256SUMS.txt')) {
+          foreach ($relative in @(
+            'Perfect-World-Explorer.exe',
+            'dstorage.dll',
+            'dstoragecore.dll',
+            'DirectStorage/LICENSE.txt',
+            'DirectStorage/NOTICES.txt',
+            'Modules/Walker/module.ini',
+            'SHA256SUMS.txt'
+          )) {
             if (-not (Test-Path -LiteralPath (Join-Path $package $relative) -PathType Leaf)) {
               throw "Uploaded artifact is missing: $relative"
             }

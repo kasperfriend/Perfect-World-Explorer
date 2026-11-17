@@ -120,9 +120,11 @@ The water render target details, simple-water lighting/fog, quality modes, wave 
 
 ```text
 Cargo.toml, Cargo.lock   Rust package and locked dependencies
+build.rs                 optional DirectStorage SDK bridge build
 src/                     viewer, parsers, GPU code and diagnostics
 Modules/                 installed module packages copied beside the executable
 tools/package-windows.ps1 shared PR/release portable-package builder
+tools/fetch-directstorage.ps1 downloads/extracts pinned DirectStorage preview
 tools/speedtree/         bridge source, probes and embedded helper
 tools/launcher-art.jpg   embedded launcher image
 Findings/                research, evidence, assessment and roadmap
@@ -134,6 +136,122 @@ LICENSE                  project license
 The project is marked **GPL-2.0-or-later**; see [LICENSE](LICENSE). BMD and terrain format research was informed by the GPL-2.0-or-later [GameForge static importer](https://github.com/shaddowdaniel/GameForge-3D-Studio-/blob/0a7fae8fcba0df7b0daa988db8696a0feaf49f7b/source/blender/io/angelica/formats/angelica_static.cc) and [terrain importer](https://github.com/shaddowdaniel/GameForge-3D-Studio-/blob/0a7fae8fcba0df7b0daa988db8696a0feaf49f7b/source/blender/io/angelica/formats/angelica_terrain.cc), copyright 2026 GameForge 3D Studio Authors. Leaf-card methods were informed by the GPL-2.0 [mt2-world-baker](https://github.com/moleh1307/mt2-world-baker); ECWLD layout research used the [RaGEZONE discussion](https://forum.ragezone.com/threads/map-editor.1252114/). Dependency licenses also apply.
 
 **Before public distribution**, verify that you have the rights to publish the launcher artwork and all included code/binaries, and review third-party dependencies and applicable game terms. The provenance and redistribution rights of `tools/launcher-art.jpg` have not been established in this package; replace it with artwork you have rights to if necessary. Do not redistribute the proprietary game client, its DLLs, archives, extracted assets, or derived caches. The `.gitignore` reduces accidental commits but is not a substitute for reviewing staged files.
+
+### Optional Windows DirectStorage archive reads
+
+Windows/MSVC builds can use Microsoft's DirectStorage **system-memory file
+queue** for large (64 KiB and up) PCK payload reads. Fetch the official 1.4
+public-preview package (currently pinned to preview 2) from a Visual Studio
+PowerShell in the repository root:
+
+```powershell
+.\tools\fetch-directstorage.ps1
+$env:DIRECTSTORAGE_SDK_DIR = "$PWD\sdk\DirectStorage\1.4.0-preview2-2606.904"
+cargo build --release
+cargo run --release
+```
+
+The viewer tries the executable directory first, then the SDK runtime directory
+selected at build time (or `DIRECTSTORAGE_RUNTIME_DIR` at runtime), then the
+system directory. No manual DLL copy is needed for a development build from this
+checkout. The portable packager still places the x64 runtime beside the EXE so
+the package is self-contained.
+
+The fetcher downloads the version-pinned `.nupkg` from NuGet, checks for the
+expected header, x64 runtime files and both package license files, then extracts
+the whole package under `sdk/DirectStorage/`. The build automatically uses that
+pinned directory; `DIRECTSTORAGE_SDK_DIR` only overrides it. The extracted
+package is intentionally not ignored so its contents can be included in a
+checkout/PR if the package's licenses have been reviewed. This repository
+includes the official preview 2 x64 runtime DLLs under `native/bin/x64/`;
+preserve `LICENSE.txt`, `LICENSE-CODE.txt` and `NOTICES.txt` when redistributing
+applicable package contents. The Windows portable packager includes the x64
+runtime beside the EXE, with license/notices, when both DLLs are available in
+the SDK; otherwise it warns and stages a viewer that uses standard file I/O. If no SDK is present,
+the build omits the bridge; if the runtime DLLs are absent or a request fails,
+normal file I/O remains the fallback.
+
+The bridge uses the DirectStorage runtime to issue large archive range reads
+into system memory. Independent loader threads use separate queues so reads can
+overlap without sharing completion/error state; each calling thread still waits
+for its own request. It does **not** make this client instantly load: scene
+parsing and GPU uploads remain, the PCK content still needs its normal CPU
+processing, and runtime availability is optional. GPU GDeflate acceleration is
+not applicable to the client's existing PCK encoding. No DirectStorage hardware
+benchmark has been run here; use the normal build unless you have the
+SDK/runtime and can measure on the target machine.
+
+### Whole-world scenery upload pacing
+
+Enabling **Render whole world** still requires the viewer to build the whole
+scene and create GPU buffers/textures; DirectStorage only accelerates eligible
+archive reads and cannot skip this work. Placement bounds are now computed by
+the background builder rather than rescanned during render-thread GPU page
+admission. Atlas pages grow only to their occupied rows, texture placement
+uses integer nearest-neighbor blits instead of per-pixel floating-point
+sampling, and small mip levels avoid repeatedly spawning worker teams. Geometry
+batches default to 2 million vertices (from 1 million) to reduce GPU buffer/page
+bookkeeping; `PW_WORLD_PAGE_VERTICES=1000000..8000000` tunes that tradeoff.
+Finished CPU pages are persisted under `cache/world-pages-v1/` (or beneath
+`PW_CACHE_DIR`) and reused on later runs, including with **All to VRAM** enabled.
+The cache is keyed from the world placements and source archive metadata, has
+per-page checksums, and is published atomically only after a complete build.
+It skips PCK indexing, model/texture reads and decoding, geometry/atlas/mip
+building, and command sorting on warm runs; GPU resources still have to be
+created and uploaded each process, so this is not an instant-render guarantee.
+The cache can take substantial disk space; it contains derived client data, is
+ignored by Git, and must not be distributed. Delete it with the viewer closed
+if you need to reclaim space or force a rebuild.
+While pages are ready, the renderer uploads them in bounded batches and reports
+the latest page-upload time while loading plus total enable-to-ready time when
+finished. The default per-frame upload budget is 40 ms (up to 64 pages, with
+one page always allowed); `PW_WORLD_UPLOAD_BUDGET_MS=1..250` trades frame
+responsiveness for faster preload completion. The viewer continues to show the
+existing local scenery until every whole-world page is uploaded, to avoid
+partial-scene visual gaps.
+There is no claim of instant rendering or a measured speedup without timing on
+the target machine.
+
+Additional changes in this path (separate from the existing DirectStorage
+archive-read batching) are:
+
+1. Persistent, checksummed finished-page caching, including when **All to VRAM**
+is enabled.
+2. A cheap warm-start cache identity from ordered placements and source archive
+metadata, rather than hashing multi-gigabyte archives at launch.
+3. Sequential streaming of cache records through one file instead of retaining
+serialized copies of the entire world in RAM.
+4. Bounded cache decoding with per-page integrity checks and invalid-cache
+fallback to a cold rebuild.
+5. Worker-side precomputation and persistence of world draw/cull metadata, so
+cache hits skip page-command reconstruction on the render thread.
+6. Worker-side placement bounds calculation, removing that scan from GPU page
+admission.
+7. Shared `Arc` ownership of the immutable ornament list across renderer and
+builder.
+8. Sorting compact ornament indices rather than cloning and sorting full
+placement records.
+9. Typed texture-content slot keys instead of allocating formatted strings.
+10. Lazy atlas-row allocation, avoiding zero-initializing unused rows.
+11. Exact row copies for same-size textures and integer nearest-neighbor
+resampling for resized textures.
+12. A pixel-work threshold for mip parallelism, avoiding repeated thread-team
+startup for small levels.
+13. Two-million-vertex default page batches (configurable up to eight million)
+to reduce page/buffer bookkeeping.
+14. A larger but bounded per-frame GPU upload batch, with an opt-in budget
+setting for users prioritizing preload completion.
+15. Throttled progress logging plus per-upload and total readiness timing, so
+loading diagnostics do not flood stderr.
+16. Precomputed normalized model archive keys, avoiding repeated lowercase and
+formatted-string allocations while loading successive placement batches.
+17. Reuse slices of the sorted ornament-index array instead of allocating a new
+index vector for each cold-build batch.
+
+The warm-start identity uses archive size and modification time rather than a
+full content hash to avoid a multi-gigabyte scan on every launch. If a client
+archive is replaced while preserving both metadata values, delete the derived
+world-page cache to force a rebuild.
 
 ### RAM-first lossless terrain cache
 

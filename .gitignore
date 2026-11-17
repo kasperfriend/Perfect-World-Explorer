@@ -7,6 +7,9 @@
 *.dds
 *.spt
 *.dll
+# The DirectStorage package marks native/bin DLLs as redistributable; its
+# LICENSE.txt and NOTICES.txt are retained alongside them in the SDK folder.
+!sdk/DirectStorage/**/native/bin/**/*.dll
 .DS_Store
 Thumbs.db
 .env

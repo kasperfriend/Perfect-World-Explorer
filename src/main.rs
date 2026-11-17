@@ -80,6 +80,8 @@ mod indirect_args;
 #[cfg(windows)]
 mod launcher_ui;
 mod light_consumers;
+#[cfg(any(windows, test))]
+mod loading_graph;
 mod material;
 mod model_asset;
 mod model_attachment;
@@ -158,6 +160,7 @@ mod windows_setup;
 mod world_models;
 mod world_models_gpu;
 mod world_objects;
+mod world_page_cache;
 struct Terrain {
     element: PathBuf,
     /// Cells per T2BK block edge (`world.trn2` header dword @20).
@@ -206,6 +209,34 @@ struct TileDecode<'a> {
 /// when the decode succeeded, the `grid * grid` arrays.
 type BlockPayload = (usize, Result<(Vec<f32>, Vec<[i8; 3]>), String>);
 
+#[derive(Default)]
+struct DecodeWindow {
+    next: usize,
+    next_expected: usize,
+    cancelled: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DecodeClaim {
+    Block(usize),
+    Wait,
+    Done,
+}
+
+impl DecodeWindow {
+    fn claim(&mut self, blocks: usize, window: usize) -> DecodeClaim {
+        if self.cancelled || self.next >= blocks {
+            return DecodeClaim::Done;
+        }
+        if self.next >= self.next_expected.saturating_add(window) {
+            return DecodeClaim::Wait;
+        }
+        let block = self.next;
+        self.next += 1;
+        DecodeClaim::Block(block)
+    }
+}
+
 /// Per-block scratch, owned by whoever decodes a block.
 ///
 /// Blocks are decoded on several threads (see `decode_blocks`), so each worker
@@ -241,8 +272,10 @@ fn decode_block_owned(
 /// One thread per core (capped) decodes independently; finished blocks are held
 /// in a map and pushed into `insert` only once every lower index has gone in,
 /// so the builder sees a bit-identical sequence to the old sequential loop.
-/// `insert` runs on the calling thread, which is why the builder needs no
-/// locking. `PW_TERRAIN_THREADS=1` restores the plain loop.
+/// Scheduling stays at most two worker waves ahead of the next insertion, which
+/// bounds decoded-but-not-yet-inserted memory if an early block is unusually
+/// slow. `insert` runs on the calling thread, so the builder needs no locking.
+/// `PW_TERRAIN_THREADS=1` restores the plain loop.
 fn decode_blocks<F>(tile: &TileDecode, threads: usize, mut insert: F) -> Result<(), String>
 where
     F: FnMut(usize, &[f32], &[[i8; 3]]) -> Result<(), String>,
@@ -258,52 +291,88 @@ where
         }
         return Ok(());
     }
-    let next = std::sync::atomic::AtomicUsize::new(0);
+    let worker_count = threads.min(tile.blocks);
+    // Keep only a small window of decoded blocks ahead of the next ordered
+    // insertion. Without this bound, a single slow early block lets every other
+    // worker decode the whole tile into the channel/pending map at once.
+    let window = worker_count.saturating_mul(2).max(worker_count);
+    let state = std::sync::Mutex::new(DecodeWindow {
+        next: 0,
+        next_expected: 0,
+        cancelled: false,
+    });
+    let wake = std::sync::Condvar::new();
     let (tx, rx) = std::sync::mpsc::channel::<BlockPayload>();
     std::thread::scope(|scope| -> Result<(), String> {
-        for _ in 0..threads.min(tile.blocks) {
+        for _ in 0..worker_count {
             let tx = tx.clone();
-            let next = &next;
+            let state = &state;
+            let wake = &wake;
             scope.spawn(move || {
                 let mut scratch = BlockScratch::default();
                 loop {
-                    let bi = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if bi >= tile.blocks {
-                        break;
-                    }
+                    let bi = {
+                        let mut scheduler = state.lock().unwrap();
+                        loop {
+                            match scheduler.claim(tile.blocks, window) {
+                                DecodeClaim::Block(bi) => break bi,
+                                DecodeClaim::Done => return,
+                                DecodeClaim::Wait => {
+                                    scheduler = wake.wait(scheduler).unwrap();
+                                }
+                            }
+                        }
+                    };
                     let decoded = decode_block_owned(tile, &mut scratch, bi);
                     let failed = decoded.is_err();
-                    if tx.send((bi, decoded)).is_err() || failed {
-                        break;
+                    if tx.send((bi, decoded)).is_err() {
+                        return;
+                    }
+                    if failed {
+                        let mut scheduler = state.lock().unwrap();
+                        scheduler.cancelled = true;
+                        wake.notify_all();
+                        return;
                     }
                 }
             });
         }
         drop(tx);
-        let mut next_expected = 0usize;
-        let mut pending = std::collections::BTreeMap::new();
-        while next_expected < tile.blocks {
-            let Ok((bi, decoded)) = rx.recv() else {
-                break;
-            };
-            match decoded {
-                Ok(pair) => {
-                    pending.insert(bi, pair);
-                }
-                Err(e) => return Err(e),
-            }
-            while let Some((heights, normals)) = pending.remove(&next_expected) {
-                insert(next_expected, &heights, &normals)?;
-                next_expected += 1;
-                if next_expected >= tile.blocks {
+        let result = (|| -> Result<(), String> {
+            let mut next_expected = 0usize;
+            let mut pending = std::collections::BTreeMap::new();
+            while next_expected < tile.blocks {
+                let Ok((bi, decoded)) = rx.recv() else {
                     break;
+                };
+                match decoded {
+                    Ok(pair) => {
+                        pending.insert(bi, pair);
+                    }
+                    Err(e) => return Err(e),
+                }
+                while let Some((heights, normals)) = pending.remove(&next_expected) {
+                    insert(next_expected, &heights, &normals)?;
+                    next_expected += 1;
+                    let mut scheduler = state.lock().unwrap();
+                    scheduler.next_expected = next_expected;
+                    wake.notify_one();
+                    if next_expected >= tile.blocks {
+                        break;
+                    }
                 }
             }
+            if next_expected < tile.blocks {
+                return Err(format!("{}: terrain decode stopped early", tile.name));
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            let mut scheduler = state.lock().unwrap();
+            scheduler.cancelled = true;
+            wake.notify_all();
         }
-        if next_expected < tile.blocks {
-            return Err(format!("{}: terrain decode stopped early", tile.name));
-        }
-        Ok(())
+        result
     })
 }
 
@@ -1026,6 +1095,20 @@ fn main() {
 
 #[cfg(test)]
 mod ram_export_tests {
+    #[test]
+    fn terrain_decode_window_bounds_work_ahead_and_releases_in_order() {
+        let mut window = super::DecodeWindow::default();
+        assert_eq!(window.claim(10, 3), super::DecodeClaim::Block(0));
+        assert_eq!(window.claim(10, 3), super::DecodeClaim::Block(1));
+        assert_eq!(window.claim(10, 3), super::DecodeClaim::Block(2));
+        assert_eq!(window.claim(10, 3), super::DecodeClaim::Wait);
+
+        window.next_expected = 2;
+        assert_eq!(window.claim(10, 3), super::DecodeClaim::Block(3));
+        window.cancelled = true;
+        assert_eq!(window.claim(10, 3), super::DecodeClaim::Done);
+    }
+
     #[test]
     fn streamed_png_preserves_decoded_rgb() {
         let path =

@@ -8,10 +8,20 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$OutputDirectory,
 
-    [string]$ArchivePath = ''
+    [string]$ArchivePath = '',
+
+    [string]$DirectStorageSdk = ''
 )
 
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($DirectStorageSdk)) {
+    if ($env:DIRECTSTORAGE_SDK_DIR) {
+        $DirectStorageSdk = $env:DIRECTSTORAGE_SDK_DIR
+    }
+    else {
+        $DirectStorageSdk = Join-Path $PSScriptRoot '..\sdk\DirectStorage\1.4.0-preview2-2606.904'
+    }
+}
 
 $executablePath = (Resolve-Path -LiteralPath $Executable).Path
 $modulesPath = (Resolve-Path -LiteralPath $Modules).Path
@@ -31,6 +41,32 @@ New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
 
 $shippedExecutable = Join-Path $packageRoot 'Perfect-World-Explorer.exe'
 Copy-Item -LiteralPath $executablePath -Destination $shippedExecutable
+
+# Ship the optional x64 DirectStorage runtime beside the executable, where
+# LoadLibraryExW's application-directory search can find it. If the SDK headers
+# are present but native/bin was omitted (for example, before the DLL ignore
+# rule was fixed), the viewer remains valid and falls back to ordinary I/O.
+$directStorageRuntime = Join-Path $DirectStorageSdk 'native/bin/x64'
+$dstorageDll = Join-Path $directStorageRuntime 'dstorage.dll'
+$dstorageCoreDll = Join-Path $directStorageRuntime 'dstoragecore.dll'
+if ((Test-Path -LiteralPath $dstorageDll -PathType Leaf) -and
+    (Test-Path -LiteralPath $dstorageCoreDll -PathType Leaf)) {
+    Copy-Item -LiteralPath $dstorageDll -Destination $packageRoot
+    Copy-Item -LiteralPath $dstorageCoreDll -Destination $packageRoot
+    $directStorageNotices = Join-Path $packageRoot 'DirectStorage'
+    New-Item -ItemType Directory -Force -Path $directStorageNotices | Out-Null
+    foreach ($notice in @('LICENSE.txt', 'NOTICES.txt')) {
+        $noticePath = Join-Path $DirectStorageSdk $notice
+        if (-not (Test-Path -LiteralPath $noticePath -PathType Leaf)) {
+            throw "DirectStorage runtime is present but its required notice is missing: $noticePath"
+        }
+        Copy-Item -LiteralPath $noticePath -Destination $directStorageNotices
+    }
+}
+else {
+    Write-Warning "DirectStorage runtime DLLs not found under $directStorageRuntime; package will use standard file I/O."
+}
+
 $shippedModules = Join-Path $packageRoot 'Modules'
 Copy-Item -LiteralPath $modulesPath -Destination $shippedModules -Recurse
 
@@ -39,11 +75,12 @@ if (-not (Test-Path -LiteralPath $walkerManifest -PathType Leaf)) {
     throw "Staging did not produce Modules/Walker/module.ini in $packageRoot"
 }
 
-# Keep checksums with the portable folder. No development/survey executables
-# are inputs to this script, so only the viewer and installed module packages
-# can enter the distribution.
-$files = @((Get-Item -LiteralPath $shippedExecutable)) +
-    @((Get-ChildItem -LiteralPath $shippedModules -Recurse -File | Sort-Object FullName))
+# Keep checksums with the portable folder, including optional DirectStorage
+# runtime binaries and their notices. No development/survey executables are
+# inputs to this script.
+$files = @(Get-ChildItem -LiteralPath $packageRoot -Recurse -File |
+    Where-Object { $_.FullName -ne (Join-Path $packageRoot 'SHA256SUMS.txt') } |
+    Sort-Object FullName)
 $checksumLines = @(
     foreach ($file in $files) {
         $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
