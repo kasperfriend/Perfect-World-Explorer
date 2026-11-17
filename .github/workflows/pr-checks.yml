@@ -417,6 +417,14 @@ jobs:
             Get-Content -LiteralPath $log -Tail 100 | ForEach-Object { Write-Host "::error::$_" }
           }
           exit $status
+      - name: Preserve Windows viewer build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-viewer-build-log
+          path: ${{ runner.temp }}/win-build.log
+          if-no-files-found: warn
+          retention-days: 3
       - name: Build audio corpus and scene diagnostics
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin audio-corpus-check --bin scene-sound-check
       - name: Test Windows audio decoding with synthetic fixtures
