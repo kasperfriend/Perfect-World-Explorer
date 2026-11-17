@@ -35,7 +35,7 @@ impl EcModel {
     /// SMD/base name alone is not a scene action. None means playback failed,
     /// not permission to pick the first action or reinterpret the namespace.
     pub fn scene_action(&self, requested: &str) -> Option<usize> {
-    let mut fallback = None;
+        let mut fallback = None;
         for (i, a) in self.actions.iter().enumerate() {
             if a.name == requested {
                 return Some(i);
@@ -163,7 +163,7 @@ fn gbk(bytes: &[u8]) -> Result<String, String> {
     }
 }
 pub fn normalize(path: &str) -> String {
-   let trimmed = path.trim();
+  let trimmed = path.trim();
     let mut out = String::with_capacity(trimmed.len());
     for seg in trimmed.split(['/', '\\']).filter(|s| !s.is_empty()) {
         if !out.is_empty() {
