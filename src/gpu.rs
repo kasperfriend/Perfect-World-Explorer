@@ -4701,6 +4701,8 @@ pub fn run(
         || std::env::var_os("PW_VEGETATION_AUTHORED_MIPS").is_some();
     let mut residency = crate::terrain_residency::Residency::default();
     // Nothing is uploaded yet, so the first build always materialises the atlas.
+    // The whole-world preload has not started either, so the local scenery is
+    // part of this first mesh (`skip_local_scenery: false`).
     let m = build(
         &mut t,
         camera.pos.x,
@@ -4709,6 +4711,7 @@ pub fn run(
         &mut residency,
         vegetation_authored_mips,
         0,
+        false,
     )?;
     let mut renderer = Renderer::new(
         device,
