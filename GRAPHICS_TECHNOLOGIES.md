@@ -366,7 +366,11 @@ truncated) saying so instead of vanishing.
 their SHA-256, that every symbol the loader resolves with `GetProcAddress` is
 really exported by the real DLL, that the FFI constants equal the vendored
 headers, and that the probe, the loaders, the packaging script and the ignore
-rules all name the same files. Run it after any SDK update.
+rules all name the same files. It also checks the quality-mode values in
+`src/modes.rs` — NGX's `PerfQualityValue`, the FFX upscaler's `qualityMode` and
+XeSS's `qualitySetting` — against their headers, because a wrong one there is a
+mode that renders at another mode's ratio rather than a compile error. It runs
+in CI on every pull request.
 
 See also: [README](README.md#upscaling-and-frame-generation-optional),
 [docs/blockers.md](docs/blockers.md), [docs/dx12-port-notes.md](docs/dx12-port-notes.md),

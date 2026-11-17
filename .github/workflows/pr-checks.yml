@@ -75,6 +75,15 @@ jobs:
           # compile error). Regenerate the table with
           # `tools/verify-ngx-params.py --headers DIR --dump-fixture F`.
           python3 tools/verify-ngx-params.py
+      - name: Verify the vendored SDK binaries and their FFI constants
+        run: |
+          # The quality enums now live in `src/modes.rs`: NGX's
+          # `PerfQualityValue`, the FFX upscaler's `qualityMode` and XeSS's
+          # `qualitySetting`. A wrong value there is not a compile error — it is
+          # a mode that renders at another mode's ratio, or one the driver
+          # refuses at CreateFeature — so the table is checked against the
+          # vendored headers (and the DLL exports, and the packaged layout).
+          python3 tools/verify-vendor-sdks.py
       - name: Test requirement status audits
         run: |
           python3 tools/test_phase1_ready.py

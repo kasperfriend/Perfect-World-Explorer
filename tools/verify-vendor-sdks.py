@@ -206,12 +206,40 @@ def dll_names_named_by_source(repo: Path) -> set[str]:
 
 HEADER_CONSTANTS = {
     # rust file -> {rust const name: (header path, header enum/define name)}
+    # The provider x quality table (`src/modes.rs`) owns every quality enum the
+    # viewer hands to a vendor: NGX's `PerfQualityValue`, the FFX upscaler's
+    # `qualityMode` and XeSS's `qualitySetting`. They are checked here because a
+    # wrong value is not a compile error — it is a mode that silently renders at
+    # another mode's ratio, or one the driver refuses at CreateFeature.
+    "src/modes.rs": {
+        "NGX_MAX_PERF": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_PerfQuality_Value_MaxPerf"),
+        "NGX_BALANCED": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_PerfQuality_Value_Balanced"),
+        "NGX_MAX_QUALITY": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_PerfQuality_Value_MaxQuality"),
+        "NGX_ULTRA_PERFORMANCE": (
+            "nvidia/nvsdk_ngx_defs.h",
+            "NVSDK_NGX_PerfQuality_Value_UltraPerformance",
+        ),
+        # `NVSDK_NGX_PerfQuality_Value_UltraQuality` (4) is deliberately absent
+        # from the table: the installed core answers CreateFeature with
+        # `0xbad00010` for it (docs/blockers.md B-28), so DLSS offers DLAA
+        # instead. Its DLAA value is checked below.
+        "NGX_DLAA": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_PerfQuality_Value_DLAA"),
+        "FFX_NATIVE_AA": ("upscalers/ffx_upscale.h", "FFX_UPSCALE_QUALITY_MODE_NATIVEAA"),
+        "FFX_QUALITY": ("upscalers/ffx_upscale.h", "FFX_UPSCALE_QUALITY_MODE_QUALITY"),
+        "FFX_BALANCED": ("upscalers/ffx_upscale.h", "FFX_UPSCALE_QUALITY_MODE_BALANCED"),
+        "FFX_PERFORMANCE": ("upscalers/ffx_upscale.h", "FFX_UPSCALE_QUALITY_MODE_PERFORMANCE"),
+        "FFX_ULTRA_PERFORMANCE": (
+            "upscalers/ffx_upscale.h",
+            "FFX_UPSCALE_QUALITY_MODE_ULTRA_PERFORMANCE",
+        ),
+        "XESS_ULTRA_PERFORMANCE": ("xess/xess.h", "XESS_QUALITY_SETTING_ULTRA_PERFORMANCE"),
+        "XESS_PERFORMANCE": ("xess/xess.h", "XESS_QUALITY_SETTING_PERFORMANCE"),
+        "XESS_BALANCED": ("xess/xess.h", "XESS_QUALITY_SETTING_BALANCED"),
+        "XESS_QUALITY": ("xess/xess.h", "XESS_QUALITY_SETTING_QUALITY"),
+        "XESS_ULTRA_QUALITY": ("xess/xess.h", "XESS_QUALITY_SETTING_ULTRA_QUALITY"),
+        "XESS_AA": ("xess/xess.h", "XESS_QUALITY_SETTING_AA"),
+    },
     "src/xess/imp.rs": {
-        "XESS_QUALITY_SETTING_ULTRA_PERFORMANCE": ("xess/xess.h", "XESS_QUALITY_SETTING_ULTRA_PERFORMANCE"),
-        "XESS_QUALITY_SETTING_PERFORMANCE": ("xess/xess.h", "XESS_QUALITY_SETTING_PERFORMANCE"),
-        "XESS_QUALITY_SETTING_BALANCED": ("xess/xess.h", "XESS_QUALITY_SETTING_BALANCED"),
-        "XESS_QUALITY_SETTING_QUALITY": ("xess/xess.h", "XESS_QUALITY_SETTING_QUALITY"),
-        "XESS_QUALITY_SETTING_ULTRA_QUALITY": ("xess/xess.h", "XESS_QUALITY_SETTING_ULTRA_QUALITY"),
         "XESS_INIT_FLAG_INVERTED_DEPTH": ("xess/xess.h", "XESS_INIT_FLAG_INVERTED_DEPTH"),
         "XESS_INIT_FLAG_LDR_INPUT_COLOR": ("xess/xess.h", "XESS_INIT_FLAG_LDR_INPUT_COLOR"),
         "XESS_LOGGING_LEVEL_INFO": ("xess/xess.h", "XESS_LOGGING_LEVEL_INFO"),
@@ -237,18 +265,8 @@ HEADER_CONSTANTS = {
         "XEFG_LOGGING_LEVEL_INFO": ("xess_fg/xefg_swapchain.h", "XEFG_SWAPCHAIN_LOGGING_LEVEL_INFO"),
     },
     "src/dlss/imp.rs": {
-        "NGX_QUALITY_MAX_PERF": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_PerfQuality_Value_MaxPerf"),
-        "NGX_QUALITY_BALANCED": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_PerfQuality_Value_Balanced"),
-        "NGX_QUALITY_MAX_QUALITY": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_PerfQuality_Value_MaxQuality"),
-        "NGX_QUALITY_ULTRA_PERFORMANCE": (
-            "nvidia/nvsdk_ngx_defs.h",
-            "NVSDK_NGX_PerfQuality_Value_UltraPerformance",
-        ),
-        "NGX_QUALITY_ULTRA_QUALITY": (
-            "nvidia/nvsdk_ngx_defs.h",
-            "NVSDK_NGX_PerfQuality_Value_UltraQuality",
-        ),
-        "NGX_QUALITY_DLAA": ("nvidia/nvsdk_ngx_defs.h", "NVSDK_NGX_PerfQuality_Value_DLAA"),
+        # The `PerfQualityValue` constants moved to `src/modes.rs`; what is left
+        # here is the create flag the DLSS path writes.
         "NGX_DLSS_FEATURE_DEPTH_INVERTED": (
             "nvidia/nvsdk_ngx_defs.h",
             "NVSDK_NGX_DLSS_Feature_Flags_DepthInverted",
