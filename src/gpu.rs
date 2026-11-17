@@ -4233,7 +4233,9 @@ async fn adapter(
                 // D3D12 itself allows 2 GiB; ask for whatever the adapter has.
                 required_limits: {
                     let adapter = a.limits();
-                    let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter);
+                    // `using_resolution` takes the limits by value.
+                    let mut limits =
+                        wgpu::Limits::downlevel_defaults().using_resolution(adapter.clone());
                     // `max_buffer_size` is `u64`, the binding size is `u32`.
                     limits.max_storage_buffer_binding_size = adapter
                         .max_storage_buffer_binding_size
