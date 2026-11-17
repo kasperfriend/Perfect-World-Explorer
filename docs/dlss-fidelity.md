@@ -185,9 +185,11 @@ DLSS but is not" looks like:
 The world is drawn below display resolution whenever an upscaler runs, so every
 world input must be sampled as if the screen were the display size. The bias is
 `log2(renderX / displayX) - 1` while a temporal upscaler is alive, the bare ratio
-for the resolution slider on its own, clamped to `-3..=0`, and exactly 0 at native
-or supersampled sizes (`src/render_scale.rs::set_mip_bias`, published once per
-frame from `src/gpu.rs`). At the reported 2293×960 render extent on a 3440×1440
+for the resolution slider on its own, clamped to `-3..=0`, exactly 0 when the
+world is drawn at or above the display size without a temporal upscaler, and the
+guide's `-1` for Native AA, which is the same feature at a 1.0x ratio
+(`src/render_scale.rs::set_mip_bias`, published once per frame from
+`src/gpu.rs`). At the reported 2293×960 render extent on a 3440×1440
 window that is **-1.585**, `exp2(bias) = 0.334`.
 
 It reaches the shaders through a `lod` lane in the camera uniform (bias,

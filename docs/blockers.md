@@ -1063,9 +1063,9 @@ DLSS-G parameter type.
   knows both extents, in `crate::render_scale::set_mip_bias`: the guide's
   `log2(renderX / displayX) - 1` while a temporal upscaler is alive (DLSS,
   FSR 2, XeSS, or FSR 1 through `fsr1_eligible`), the bare ratio for the
-  resolution slider on its own, clamped to `-3..=0`. Render sizes at or above
-  the display size (Native AA, 100 %, or the supersampling half of the slider)
-  take no bias at all, so those modes are bit-for-bit unchanged. At the reported
+  resolution slider on its own, clamped to `-3..=0`. Supersampled render sizes
+  take no bias, and neither does the slider alone at 100 %; Native AA keeps the
+  guide's `-1`, because DLAA is the same feature at a 1.0x ratio. At the reported
   2293x960 DLSS render extent on a 3440x1440 window the bias is -1.585, i.e.
   `exp2(bias) = 0.334`.
 - **Plumbing.** `Uniform` — the camera buffer every world pipeline binds — gains

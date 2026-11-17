@@ -50,10 +50,10 @@ static MIP_BIAS: AtomicU32 = AtomicU32::new(0);
 
 /// Record the bias for the current render/display extent pair.
 ///
-/// Render sizes at or above the display size (native, or the supersampling
-/// side of the slider) use no bias at all; anything else is clamped to
-/// `-3..=0` so a degenerate extent can never push a world atlas past its last
-/// mip.
+/// Supersampled render sizes use no bias at all, and neither does the slider on
+/// its own at 100 %. A temporal upscaler keeps the guide's `- 1` even at a 1.0x
+/// ratio, because that is what DLAA is. The result is clamped to `-3..=0` so a
+/// degenerate extent can never push a world atlas past its last mip.
 pub fn set_mip_bias(render: (u32, u32), display: (u32, u32), temporal: bool) {
     let bias = if render.0 == 0 || render.1 == 0 || display.0 == 0 || display.1 == 0 {
         0.
@@ -362,10 +362,16 @@ mod tests {
         // The resolution slider on its own only carries the ratio.
         set_mip_bias((1720, 720), (3440, 1440), false);
         assert!((mip_bias() + 1.).abs() < 1e-6, "{}", mip_bias());
-        // Native, and the supersampling side of the slider: no bias at all.
+        // Native AA is the same feature at a 1.0x ratio (DLAA), so the guide's
+        // -1 still applies; the slider alone at 100 % takes none.
         set_mip_bias((3440, 1440), (3440, 1440), true);
+        assert_eq!(mip_bias(), -1.);
+        set_mip_bias((3440, 1440), (3440, 1440), false);
         assert_eq!(mip_bias(), 0.);
+        // Supersampling is never biased, with or without an upscaler.
         set_mip_bias((6880, 2880), (3440, 1440), false);
+        assert_eq!(mip_bias(), 0.);
+        set_mip_bias((6880, 2880), (3440, 1440), true);
         assert_eq!(mip_bias(), 0.);
         assert_eq!(mip_gradient_scale(), 1.);
         // 1x1 from a full-size display would be log2(1/8192) - 1 = -14.
