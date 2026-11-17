@@ -303,6 +303,11 @@ case "${1:-test}" in
             "$REPO/src/imaginator/math.rs" "$REPO/src/imaginator/bvh.rs" "$REPO/src/imaginator/settings.rs" \
             "$REPO/src/imaginator/tracer.rs" "$REPO/src/imaginator/gpu.rs" "$REPO/src/imaginator/capture.rs" \
             "$REPO/src/imaginator/composite.rs" "$REPO/src/imaginator/mod.rs" \
-            "$REPO/tools/imaginator-check/module_root.rs" ;;
+            "$REPO/src/imaginator/hardware/mod.rs" "$REPO/src/imaginator/hardware/dx12.rs" \
+            "$REPO/src/imaginator/hardware/sys.rs" \
+            "$REPO/tools/imaginator-check/module_root.rs" "$REPO/tools/imaginator-check/root.rs" \
+            "$REPO/tools/imaginator-check/capture_root.rs" "$REPO/tools/imaginator-check/winapi.rs" \
+            "$REPO/tools/imaginator-check/d3d12.rs" "$REPO/tools/imaginator-check/wgpu.rs" \
+            "$REPO/tools/imaginator-check/egui.rs" "$REPO/tools/imaginator-check/bytemuck.rs" ;;
     *) echo "usage: $0 {setup|check|test|fmt}" >&2; exit 2 ;;
 esac
