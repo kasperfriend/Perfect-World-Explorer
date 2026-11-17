@@ -179,7 +179,7 @@ fn minimap_matrix(x: f32, z: f32, range: f32) -> Mat4 {
 /// left the map showing the previous window until the camera moved a whole unit.
 /// The preload state and the page count are in it because the pages are what the
 /// map draws: a page that arrives is a page the map has not shown yet.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MinimapKey {
     /// Ground position the orthographic window is centred on, in whole units.
     block: [i32; 2],
