@@ -1518,7 +1518,8 @@ mod tests {
             glam::Mat4::IDENTITY.to_cols_array_2d(),
         );
         assert_eq!(
-            [still[4], still[5]], [0x00, 0x3c],
+            [still[4], still[5]],
+            [0x00, 0x3c],
             "an opaque sheet must own the pixel, got {still:?}"
         );
         assert_eq!(
@@ -1526,10 +1527,7 @@ mod tests {
             [0; 6],
             "a sheet that has not moved carries no motion, got {still:?}"
         );
-        assert_eq!(
-            depth, 0.0,
-            "the motion pass must not record a surface, got depth {depth}"
-        );
+        assert_eq!(depth, 0.0, "the motion pass must not record a surface, got depth {depth}");
         // Frame two: the same sheet, and a camera that moved one world unit along
         // x. The vector is previous minus current in pixels, so it is non-zero and
         // the sheet still owns the pixel.
@@ -1540,7 +1538,8 @@ mod tests {
             glam::Mat4::from_translation(glam::Vec3::new(1., 0., 0.)).to_cols_array_2d(),
         );
         assert_eq!(
-            [moved[4], moved[5]], [0x00, 0x3c],
+            [moved[4], moved[5]],
+            [0x00, 0x3c],
             "a moved sheet still owns the pixel, got {moved:?}"
         );
         assert_ne!(
@@ -1548,10 +1547,7 @@ mod tests {
             [0; 4],
             "a sheet seen through a moved camera carries its own motion, got {moved:?}"
         );
-        assert_eq!(
-            depth, 0.0,
-            "the motion pass must not record a surface, got depth {depth}"
-        );
+        assert_eq!(depth, 0.0, "the motion pass must not record a surface, got depth {depth}");
         // Frame three: the same sheet at 20% opacity does not dominate the pixel,
         // so it claims nothing at all — no vector and no surface.
         let (faint, depth) = covered_motion(
@@ -1561,7 +1557,8 @@ mod tests {
             glam::Mat4::IDENTITY.to_cols_array_2d(),
         );
         assert_eq!(
-            faint, [0; 8],
+            faint,
+            [0; 8],
             "a sheet that does not dominate the pixel must leave it alone, got {faint:?}"
         );
         assert_eq!(depth, 0.0, "and must not record a surface either");
