@@ -55,6 +55,26 @@ pub const BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// The DXIL blob's location, relative to the module's own folder.
 pub const DXIL_FILE: &str = "imaginator/dxr_trace.cso";
 
+/// The shader's `Params` block in 32-bit floats: ten `float4`/`uint4` members,
+/// i.e. 160 bytes, which is `PARAMS_BYTES` below.
+pub const PARAMS_FLOATS: usize = 40;
+
+/// The shader's `Params` block: ten `float4`/`uint4` members, 160 bytes. It is
+/// declared in `tools/imaginator-shaders/dxr_trace.hlsl` and mirrored field for
+/// field by `imaginator::gpu::GpuParams`; the CBV the trace binds is sized from
+/// this, so the two cannot drift without a compile error here.
+pub const PARAMS_BYTES: usize = 160;
+
+/// `DXGI_FORMAT_R32G32B32A32_FLOAT`, the trace output's format. `winapi` spells
+/// this as an enum variant, which the offline shim types as a bare integer, so it
+/// is written numerically here where both agree.
+const R32G32B32A32_FLOAT: u32 = 2;
+
+/// `Buffer<float4>` strides for the per-triangle records (`tri_normals`) and the
+/// material table (`materials`).
+pub const NORMALS_STRIDE: usize = 16;
+pub const MATERIALS_STRIDE: usize = 16;
+
 /// Why the hardware tracer is not running, or what it is doing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HardwareStatus {
@@ -230,7 +250,11 @@ impl HardwareTracer {
             return;
         };
         let hr = unsafe {
-            sys::query_interface(self.device.as_ptr() as *mut c_void, &iid, &mut device5)
+            sys::query_interface(
+                self.device.as_ptr() as *mut c_void as *mut c_void,
+                &iid,
+                &mut device5,
+            )
         };
         if !SUCCEEDED(hr) || device5.is_null() {
             self.status = HardwareStatus::Unsupported(format!(
@@ -381,6 +405,281 @@ impl HardwareTracer {
     /// True once the trace pipeline exists.
     pub fn pipeline_ready(&self) -> bool {
         self.pipeline.is_some()
+    }
+
+    /// Run one hardware trace and hand back the four channels.
+    ///
+    /// The DXIL shader writes `rgba32float` into a UAV, so this traces into a
+    /// texture of its own, copies it into a `READBACK` buffer and returns the
+    /// pixels in the packed layout the composite stage already accepts from the
+    /// CPU tracer. Nothing here depends on `wgpu` exposing a resource: the
+    /// texture, the buffer and the views are all created on the raw device, which
+    /// is what keeps this path independent of what the frame's own renderer does.
+    ///
+    /// `params` is the shader's 160-byte `Params` block; `bindings` are the four
+    /// read-only buffers — the per-triangle records, the material table, and the
+    /// two the trace reads for its tree and ground masks — in the order the root
+    /// signature's SRV table declares them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn trace_frame(
+        &mut self,
+        dxil: &[u8],
+        tlas: sys::GpuAddress,
+        width: u32,
+        height: u32,
+        params: &[u8],
+        normals: &[u8],
+        materials: &[u8],
+    ) -> Result<Vec<f32>, String> {
+        self.ensure_pipeline(dxil)?;
+        if tlas == 0 {
+            return Err("no acceleration structure to trace against".into());
+        }
+        if params.len() != PARAMS_BYTES {
+            return Err(format!(
+                "the trace parameters are {} bytes; the shader's Params block is {PARAMS_BYTES}",
+                params.len()
+            ));
+        }
+        if width == 0 || height == 0 {
+            return Err("nothing to trace".into());
+        }
+        let Some(pipeline) = self.pipeline.as_ref() else {
+            return Err("the trace pipeline is missing".into());
+        };
+        let state = pipeline.state;
+
+        // 1. Every input lives in an upload buffer, and the output in a
+        //    `DEFAULT` texture with a `READBACK` staging copy. Sizes are exact so
+        //    the views can be written without a stride guess.
+        let params_buffer = self.upload_bytes(params, "imaginator trace params")?;
+        let normals_buffer = self.upload_bytes(normals, "imaginator trace normals")?;
+        let materials_buffer = self.upload_bytes(materials, "imaginator trace materials")?;
+        let output = self.create_output_texture(width, height)?;
+        let readback = self.create_buffer_on(
+            win::D3D12_HEAP_TYPE_READBACK,
+            (width as u64) * (height as u64) * 16,
+            "imaginator trace readback",
+        )?;
+
+        // 2. One shader-visible heap: a CBV, three SRVs (TLAS, normals,
+        //    materials) and a UAV, in that order, matching the root signature.
+        let heap = unsafe { sys::create_descriptor_heap(self.device.as_ptr() as *mut c_void, 5) }
+            .map_err(|why| why.to_string())?;
+        let (cpu_start, gpu_start) = unsafe { sys::heap_handles(heap) };
+        let increment =
+            unsafe { sys::descriptor_increment(self.device.as_ptr() as *mut c_void) } as usize;
+        let slot = |index: usize| cpu_start + index * increment;
+        // SAFETY: the heap has five slots and each write targets one of them; the
+        // resources are alive for the whole call.
+        unsafe {
+            sys::write_constant_buffer_view(
+                self.device.as_ptr() as *mut c_void,
+                sys::gpu_virtual_address(params_buffer.as_mut_ptr() as *mut c_void),
+                PARAMS_BYTES as u32,
+                slot(0),
+            );
+            // The TLAS is a `RaytracingAccelerationStructure` on t0. Its view is
+            // the structure's GPU address and nothing else — a buffer SRV over
+            // the same bytes is not the same thing and the traversal would find
+            // no geometry.
+            sys::write_tlas_srv(self.device.as_ptr() as *mut c_void, tlas, slot(1));
+            sys::write_buffer_srv(
+                self.device.as_ptr() as *mut c_void,
+                normals_buffer.as_mut_ptr() as *mut c_void,
+                0,
+                (normals.len() / NORMALS_STRIDE) as u32,
+                NORMALS_STRIDE as u32,
+                slot(2),
+            );
+            sys::write_buffer_srv(
+                self.device.as_ptr() as *mut c_void,
+                materials_buffer.as_mut_ptr() as *mut c_void,
+                0,
+                (materials.len() / MATERIALS_STRIDE) as u32,
+                MATERIALS_STRIDE as u32,
+                slot(3),
+            );
+            sys::write_buffer_uav(
+                self.device.as_ptr() as *mut c_void,
+                output.as_mut_ptr() as *mut c_void,
+                0,
+                width * height,
+                0,
+                slot(4),
+            );
+        }
+
+        // 3. Record and submit.
+        let list = self.list4 as *mut win::ID3D12GraphicsCommandList;
+        let hr = unsafe { (*list).Reset(self.allocator.as_mut_ptr(), std::ptr::null_mut()) };
+        if !SUCCEEDED(hr) {
+            unsafe { sys::release(heap) };
+            return Err(format!("command list Reset failed (HRESULT 0x{hr:08x})"));
+        }
+        unsafe {
+            (*list).SetPipelineState(state as *mut _);
+            let mut heap_pointer = heap as *mut win::ID3D12DescriptorHeap;
+            (*list).SetDescriptorHeaps(1, &mut heap_pointer);
+            // Root parameter 0 is the CBV, 1 the SRV table, 2 the UAV table.
+            // Root parameter 1 is the SRV table (t0..t2, at heap slots 1..3) and
+            // parameter 2 the UAV (slot 4).
+            sys::set_compute_root_descriptor_table(
+                list as *mut c_void,
+                1,
+                gpu_start + increment as u64,
+            );
+            sys::set_compute_root_descriptor_table(
+                list as *mut c_void,
+                2,
+                gpu_start + 4 * increment as u64,
+            );
+            (*list).Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
+            let to_copy = transition_barrier(
+                &output,
+                win::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                win::D3D12_RESOURCE_STATE_COPY_SOURCE,
+            );
+            (*list).ResourceBarrier(1, &to_copy);
+            // Texture to buffer: the destination is a placed footprint and the
+            // source is a subresource index. The row pitch is the tight width
+            // because the destination is a plain buffer, not a mip of a texture.
+            let footprint = sys::D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: sys::D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: R32G32B32A32_FLOAT,
+                    Width: width,
+                    Height: height,
+                    Depth: 1,
+                    RowPitch: width * 16,
+                },
+            };
+            let destination = sys::D3D12_TEXTURE_COPY_LOCATION {
+                pResource: readback.as_mut_ptr() as *mut c_void,
+                Type: sys::D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                PlacedFootprint: footprint,
+            };
+            let source = sys::D3D12_TEXTURE_COPY_LOCATION {
+                pResource: output.as_mut_ptr() as *mut c_void,
+                Type: sys::D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                PlacedFootprint: footprint,
+            };
+            // `sys` declares these two locations; `winapi` names the same layout,
+            // so they are passed through as the pointers the call takes.
+            let destination: *const win::D3D12_TEXTURE_COPY_LOCATION =
+                &destination as *const _ as *const win::D3D12_TEXTURE_COPY_LOCATION;
+            let source: *const win::D3D12_TEXTURE_COPY_LOCATION =
+                &source as *const _ as *const win::D3D12_TEXTURE_COPY_LOCATION;
+            // The whole texture, one subresource, no source box.
+            (*list).CopyTextureRegion(destination, 0, 0, 0, source, std::ptr::null());
+            let hr = (*list).Close();
+            if !SUCCEEDED(hr) {
+                sys::release(heap);
+                return Err(format!("command list Close failed (HRESULT 0x{hr:08x})"));
+            }
+        }
+        let lists: [*mut win::ID3D12CommandList; 1] = [list as *mut _];
+        unsafe { (*(self.queue.as_ptr())).ExecuteCommandLists(1, lists.as_ptr()) };
+        let waited = self.wait_for_build();
+        unsafe { sys::release(heap) };
+        waited?;
+        self.read_back(&readback, width, height)
+    }
+
+    /// A default-heap buffer holding `bytes`, written through a staging copy.
+    pub fn upload_bytes(&mut self, bytes: &[u8], label: &str) -> Result<Resource, String> {
+        self.upload(bytes.len().max(16) as u64, label, bytes)
+    }
+
+    /// The `rgba32float` texture the trace shader writes and the readback copies.
+    fn create_output_texture(&self, width: u32, height: u32) -> Result<Resource, String> {
+        self.create_texture(
+            width,
+            height,
+            // `DXGI_FORMAT_R32G32B32A32_FLOAT` is 2 in every DXGI header.
+            R32G32B32A32_FLOAT,
+            win::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            "imaginator trace output",
+        )
+    }
+
+    /// A 2-D resource on the default heap, for the trace output.
+    fn create_texture(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+        flags: u32,
+        label: &str,
+    ) -> Result<Resource, String> {
+        let heap = win::D3D12_HEAP_PROPERTIES {
+            Type: sys::D3D12_HEAP_TYPE_DEFAULT,
+            CPUPageProperty: sys::D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+            MemoryPoolPreference: sys::D3D12_MEMORY_POOL_UNKNOWN,
+            CreationNodeMask: 1,
+            VisibleNodeMask: 1,
+        };
+        // winapi's own description: a texture is a `D3D12_RESOURCE_DESC` with
+        // the 2-D dimension, and spelling it here avoids reinterpreting one
+        // struct as another.
+        let desc = win::D3D12_RESOURCE_DESC {
+            Dimension: win::D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Alignment: 0,
+            Width: width as u64,
+            Height: height,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: win::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+        };
+        let mut resource: *mut win::ID3D12Resource = std::ptr::null_mut();
+        // SAFETY: both descriptions outlive the call and the out-parameter is a
+        // live local of exactly the interface the IID names.
+        let hr = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                win::D3D12_HEAP_FLAG_NONE,
+                // The layouts are the same struct; `sys` declares it because a
+                // texture's description has a different shape from a buffer's.
+                &desc,
+                sys::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                std::ptr::null(),
+                &win::ID3D12Resource::uuidof(),
+                &mut resource as *mut _ as *mut *mut c_void,
+            )
+        };
+        if !SUCCEEDED(hr) || resource.is_null() {
+            return Err(format!(
+                "CreateCommittedResource({label}, {width}x{height}) failed (HRESULT 0x{hr:08x})"
+            ));
+        }
+        // SAFETY: the call handed back a new reference on a live resource.
+        Ok(unsafe { Resource::from_raw(resource) })
+    }
+
+    /// Copy the readback buffer's pixels into the packed channel order the
+    /// composite stage expects.
+    ///
+    /// The shader writes `rgba32float` with `r` = reflection, `g` = indirect,
+    /// `b` = sun visibility and `a` = view distance, which is already the layout
+    /// `upload_software` takes, so this is a straight read with the row pitch the
+    /// copy used.
+    fn read_back(&self, readback: &Resource, width: u32, height: u32) -> Result<Vec<f32>, String> {
+        let bytes = (width as usize) * (height as usize) * 16;
+        // SAFETY: `readback` is a READBACK-heap resource of exactly this size,
+        // written by the copy that finished before this is called.
+        let pointer = unsafe { sys::map(readback.as_mut_ptr() as *mut c_void, std::ptr::null()) }?;
+        let mut pixels = vec![0f32; bytes / 4];
+        unsafe {
+            std::ptr::copy_nonoverlapping(pointer as *const f32, pixels.as_mut_ptr(), pixels.len());
+            sys::unmap(readback.as_mut_ptr() as *mut c_void);
+        }
+        Ok(pixels)
     }
 
     fn build(&mut self, bvh: &Bvh) -> Result<Structures, String> {

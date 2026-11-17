@@ -94,15 +94,85 @@ pub mod um {
 
         pub const D3D12_HEAP_TYPE_DEFAULT: D3D12_HEAP_TYPE = 1;
         pub const D3D12_HEAP_TYPE_UPLOAD: D3D12_HEAP_TYPE = 2;
+        pub const D3D12_HEAP_TYPE_READBACK: D3D12_HEAP_TYPE = 3;
+
+        // --- the command list's pipeline and descriptor-heap calls -----------
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        pub struct D3D12_SUBRESOURCE_FOOTPRINT {
+            pub Format: u32,
+            pub Width: u32,
+            pub Height: u32,
+            pub Depth: u32,
+            pub RowPitch: u32,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        pub struct D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+            pub Offset: u64,
+            pub Footprint: D3D12_SUBRESOURCE_FOOTPRINT,
+        }
+
+        /// `D3D12_TEXTURE_COPY_LOCATION`, for `CopyTextureRegion`.
+        #[repr(C)]
+        pub struct D3D12_TEXTURE_COPY_LOCATION {
+            pub pResource: *mut c_void,
+            pub Type: u32,
+            pub PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        }
+
+        /// `D3D12_GPU_DESCRIPTOR_HANDLE`: a bare `UINT64` in the header.
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        pub struct D3D12_GPU_DESCRIPTOR_HANDLE {
+            pub ptr: u64,
+        }
+
+        /// `ID3D12DescriptorHeap`: only ever passed through to
+        /// `SetDescriptorHeaps`, so the shim needs the name and not the vtable.
+        #[repr(C)]
+        pub struct ID3D12DescriptorHeap {
+            pub lpVtbl: *mut c_void,
+        }
+
+        impl ID3D12GraphicsCommandList {
+            pub unsafe fn SetPipelineState(&self, _state: *mut crate::um::d3d12::ID3D12PipelineState) {}
+            pub unsafe fn SetDescriptorHeaps(
+                &self,
+                _count: u32,
+                _heaps: *const *mut ID3D12DescriptorHeap,
+            ) {
+            }
+            pub unsafe fn SetComputeRootDescriptorTable(&self, _root: u32, _base: u64) {}
+            pub unsafe fn Dispatch(&self, _x: u32, _y: u32, _z: u32) {}
+            /// Six arguments, as `d3d12.h` declares it: the two locations and the
+            /// destination x/y/z.
+            pub unsafe fn CopyTextureRegion(
+                &self,
+                _destination: *const D3D12_TEXTURE_COPY_LOCATION,
+                _dst_x: u32,
+                _dst_y: u32,
+                _dst_z: u32,
+                _source: *const D3D12_TEXTURE_COPY_LOCATION,
+                _source_box: *const c_void,
+            ) {
+            }
+        }
         pub const D3D12_CPU_PAGE_PROPERTY_UNKNOWN: D3D12_CPU_PAGE_PROPERTY = 0;
         pub const D3D12_MEMORY_POOL_UNKNOWN: D3D12_MEMORY_POOL = 0;
         pub const D3D12_HEAP_FLAG_NONE: u32 = 0;
         pub const D3D12_RESOURCE_DIMENSION_BUFFER: D3D12_RESOURCE_DIMENSION = 1;
         pub const D3D12_TEXTURE_LAYOUT_ROW_MAJOR: D3D12_TEXTURE_LAYOUT = 1;
+        pub const D3D12_RESOURCE_DIMENSION_TEXTURE2D: D3D12_RESOURCE_DIMENSION = 3;
+        /// `DXGI_FORMAT_R32G32B32A32_FLOAT`, the trace output's format.
+        pub const DXGI_FORMAT_R32G32B32A32_FLOAT: u32 = 2;
         pub const D3D12_RESOURCE_FLAG_NONE: D3D12_RESOURCE_FLAGS = 0;
         pub const D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS: D3D12_RESOURCE_FLAGS = 0x4;
         pub const D3D12_RESOURCE_STATE_COMMON: D3D12_RESOURCE_STATES = 0;
         pub const D3D12_RESOURCE_STATE_COPY_DEST: D3D12_RESOURCE_STATES = 0x400;
+        pub const D3D12_RESOURCE_STATE_UNORDERED_ACCESS: D3D12_RESOURCE_STATES = 0x8;
+        pub const D3D12_RESOURCE_STATE_COPY_SOURCE: D3D12_RESOURCE_STATES = 0x800;
         pub const D3D12_RESOURCE_BARRIER_TYPE_TRANSITION: D3D12_RESOURCE_BARRIER_TYPE = 0;
         pub const D3D12_RESOURCE_BARRIER_FLAG_NONE: D3D12_RESOURCE_BARRIER_FLAGS = 0;
         pub const D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES: u32 = 0xffff_ffff;

@@ -633,6 +633,85 @@ impl Imaginator {
         }
     }
 
+    /// Trace the frame on the GPU's ray-tracing hardware and publish the result.
+    ///
+    /// The DXIL shader reads the same packed geometry the compute tracer reads and
+    /// writes the same four channels, so the pixels it returns go straight to
+    /// `Composite::upload_software` — the path the CPU worker already fills — and
+    /// the composite stage cannot tell which tracer produced them.
+    ///
+    /// The acceleration structure and the pipeline are built on demand and kept;
+    /// only the parameters and the views are per frame.
+    fn trace_hardware(
+        &mut self,
+        hardware: &mut hardware::HardwareTracer,
+        extent: (u32, u32),
+        params: GpuParams,
+    ) -> Result<Vec<f32>, String> {
+        let (width, height) = extent;
+        if width == 0 || height == 0 {
+            return Err("the traced extent is empty".into());
+        }
+        let Some(bvh) = self.scene.bvh.as_ref() else {
+            return Err("this world has no captured geometry".into());
+        };
+        // The shader's `tri_normals` and `materials` tables: the normals and
+        // material index come from the same packing the compute tracer uses.
+        let (triangles, _, _, materials) = gpu::pack_scene(bvh, &self.scene.materials);
+        let normals: Vec<u8> = triangles
+            .iter()
+            .flat_map(|t| {
+                t.normal_material
+                    .iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect::<Vec<u8>>()
+            })
+            .collect();
+        let materials: Vec<u8> = materials
+            .iter()
+            .flat_map(|m| {
+                m.albedo_specular
+                    .iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect::<Vec<u8>>()
+            })
+            .collect();
+        // The top-level structure for the traversal. This build is the one place
+        // the hardware path can stall, so it happens before the dispatch and its
+        // failure is reported rather than swallowed.
+        let scene = self.scene.clone();
+        let tlas = hardware.ensure_built(&scene)?;
+        let blob = std::fs::read(self.directory.join(hardware::DXIL_FILE))
+            .map_err(|why| format!("the RayQuery shader is not installed: {why}"))?;
+        // The shader's Params block, field for field.
+        let mut block = [0f32; hardware::PARAMS_FLOATS];
+        for (target, source) in block.chunks_exact_mut(4).zip(
+            [
+                params.eye,
+                params.forward,
+                params.right,
+                params.up,
+                params.sun,
+                params.sun_color,
+                params.sky_up,
+                params.sky_horizon,
+            ]
+            .into_iter(),
+        ) {
+            target.copy_from_slice(&source);
+        }
+        // `config` and `screen` are integer/float mixtures; the shader reads them
+        // as `uint4` and `float4`, and this writes both as words.
+        for (index, value) in params.config.iter().enumerate() {
+            block[32 + index] = f32::from_bits(*value);
+        }
+        for (index, value) in params.screen.iter().enumerate() {
+            block[36 + index] = *value;
+        }
+        let bytes: Vec<u8> = block.iter().flat_map(|value| value.to_ne_bytes()).collect();
+        hardware.trace_frame(&blob, tlas, width, height, &bytes, &normals, &materials)
+    }
+
     /// The pack of channels the software worker finished, if any.
     pub fn take_software_result(&mut self) -> Option<(Vec<f32>, (u32, u32))> {
         let software = self.software.as_ref()?;
@@ -754,21 +833,18 @@ impl Imaginator {
                     self.status = hardware.status.label();
                     return false;
                 }
-                // Honesty about what "GPU" means here. The acceleration
-                // structures are built, but the shader that runs is the WGSL
-                // compute tracer: it walks the packed BVH in `nodes`/`order` as
-                // plain storage buffers and never binds the TLAS. On a world
-                // this size that loop is long enough to look like a hang. Say so
-                // rather than let the module appear to be tracing with DXR.
-                let _ = (tw, th);
                 let base = hardware.status.label();
-                self.status = if hardware.dxil_present(&self.directory) {
+                let has_blob = hardware.dxil_present(&self.directory);
+                let ready = hardware.pipeline_ready();
+                // The borrow of `self.hardware` ends here; the trace below needs
+                // it mutably and also needs `self` for the scene.
+                self.status = if has_blob {
                     // The blob is installed, so a native pipeline can be built
                     // from it. Whether one *has* been is the useful thing to
                     // report: a blob that dxc compiled for the wrong target is
                     // rejected at pipeline creation, and that must not look like
                     // a working RayQuery trace.
-                    if hardware.pipeline_ready() {
+                    if ready {
                         format!("{base} — RayQuery trace pipeline ready")
                     } else {
                         format!(
@@ -784,6 +860,30 @@ impl Imaginator {
                         "{base} — rays traced by the compute shader (no RayQuery blob installed)"
                     )
                 };
+                // Run it. A failure is reported, and the module keeps whatever it
+                // last drew rather than going blank.
+                if has_blob {
+                    // `trace_hardware` needs `self` for the scene and the
+                    // composite, so the hardware tracer is taken out and put back
+                    // rather than borrowed across it.
+                    let mut hardware = self.hardware.take();
+                    let trace = match hardware.as_mut() {
+                        Some(tracer) => self.trace_hardware(tracer, (tw, th), params),
+                        None => Err("no hardware tracer".to_string()),
+                    };
+                    self.hardware = hardware;
+                    match trace {
+                        Ok(pixels) => {
+                            if let Some(composite) = self.composite.as_mut() {
+                                composite.upload_software(&pixels, (tw, th), device, queue);
+                            }
+                        }
+                        Err(why) => {
+                            self.last_error = Some(why.clone());
+                            self.status = format!("hardware trace: {why}");
+                        }
+                    }
+                }
             }
             TracerKind::Software => {
                 // Start the next trace, then publish whatever the worker finished

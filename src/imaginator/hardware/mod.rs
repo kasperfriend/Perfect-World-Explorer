@@ -28,6 +28,14 @@ pub use dx12::*;
 #[cfg(not(windows))]
 pub use support::*;
 
+/// Where the compiled RayQuery shader lives inside the module's folder.
+#[cfg(not(windows))]
+pub const DXIL_FILE: &str = "imaginator/dxr_trace.cso";
+
+/// The shader's `Params` block in 32-bit floats: ten `float4`/`uint4` members.
+#[cfg(not(windows))]
+pub const PARAMS_FLOATS: usize = 40;
+
 #[cfg(not(windows))]
 pub mod support {
     use crate::imaginator::bvh::SharedScene;
@@ -95,6 +103,22 @@ pub mod support {
         /// No DXR here, so no pipeline is ever built from a blob.
         pub fn pipeline_ready(&self) -> bool {
             false
+        }
+
+        /// No DXR here, so there is nothing to dispatch. The signature mirrors
+        /// the Windows one so the module page compiles on both halves.
+        #[allow(clippy::too_many_arguments)]
+        pub fn trace_frame(
+            &mut self,
+            _dxil: &[u8],
+            _tlas: u64,
+            _width: u32,
+            _height: u32,
+            _params: &[u8],
+            _normals: &[u8],
+            _materials: &[u8],
+        ) -> Result<Vec<f32>, String> {
+            Err("this build has no D3D12 ray-tracing device".into())
         }
     }
 }

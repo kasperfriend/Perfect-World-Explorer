@@ -35,6 +35,12 @@ impl<T: Interface> ComPtr<T> {
     pub fn as_mut_ptr(&self) -> *mut T {
         self.0
     }
+    /// The real `d3d12::ComPtr` has this; the shim needs it too so the hardware
+    /// module can adopt a resource it created through the device.
+    pub unsafe fn from_raw(raw: *mut T) -> Self {
+        ComPtr(raw)
+    }
+
     pub fn is_null(&self) -> bool {
         self.0.is_null()
     }

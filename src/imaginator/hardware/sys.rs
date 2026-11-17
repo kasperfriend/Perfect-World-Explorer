@@ -806,6 +806,476 @@ pub unsafe fn create_compute_pipeline(
 }
 
 // ---------------------------------------------------------------------------
+// Descriptor heaps and views
+//
+// A compute dispatch reaches its buffers through a descriptor heap: the root
+// signature names tables, and each table is a run of descriptors written from the
+// CPU. What follows is the minimum to fill one: two view descriptions and the
+// slot addresses the heap hands back.
+// ---------------------------------------------------------------------------
+
+/// `D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV`.
+pub const D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV: u32 = 0;
+/// `D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE`: the heap a dispatch reads.
+pub const D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE: u32 = 1;
+
+/// `D3D12_RESOURCE_DIMENSION_BUFFER`.
+pub const D3D12_RESOURCE_DIMENSION_BUFFER: u32 = 1;
+
+/// `DXGI_FORMAT_UNKNOWN`, which is what a buffer view uses.
+pub const DXGI_FORMAT_UNKNOWN: u32 = 0;
+
+/// `D3D12_BUFFER_SRV_FLAG_NONE`.
+pub const D3D12_BUFFER_SRV_FLAG_NONE: u32 = 0;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D12_DESCRIPTOR_HEAP_DESC {
+    pub Type: u32,
+    pub NumDescriptors: u32,
+    pub Flags: u32,
+    pub NodeMask: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_CONSTANT_BUFFER_VIEW_DESC {
+    pub BufferLocation: u64,
+    pub SizeInBytes: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D12_BUFFER_SRV {
+    pub FirstElement: u64,
+    pub NumElements: u32,
+    pub StructureByteStride: u32,
+    pub Flags: u32,
+}
+
+/// `D3D12_BUFFER_SRV`'s three fields and `D3D12_BUFFER_UAV`'s four are the same
+/// members in a different order, and the C structs wrap them in a union together
+/// with the texture forms. Only the buffer forms are used here, so the largest
+/// of them — the UAV, with its counter and a stride — is the layout.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_BUFFER_UAV {
+    pub FirstElement: u64,
+    pub NumElements: u32,
+    pub StructureByteStride: u32,
+    pub CounterOffsetInBytes: u64,
+    pub Flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_SHADER_RESOURCE_VIEW_DESC {
+    pub Format: u32,
+    pub ViewDimension: u32,
+    pub Shader4ComponentMapping: u32,
+    pub Buffer: D3D12_BUFFER_UAV,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    pub Format: u32,
+    pub ViewDimension: u32,
+    pub Buffer: D3D12_BUFFER_UAV,
+}
+
+/// `D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING`: the identity swizzle every buffer
+/// SRV passes.
+pub const D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING: u32 = 0x1688;
+
+/// `D3D12_SRV_DIMENSION_BUFFER` / `D3D12_UAV_DIMENSION_BUFFER`.
+pub const D3D12_SRV_DIMENSION_BUFFER: u32 = 1;
+pub const D3D12_UAV_DIMENSION_BUFFER: u32 = 1;
+
+/// A descriptor heap as a `ID3D12DescriptorHeap`, plus the increment the device
+/// reports between one descriptor and the next.
+pub unsafe fn create_descriptor_heap(
+    device: *mut c_void,
+    count: u32,
+) -> Result<*mut c_void, String> {
+    let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        NumDescriptors: count,
+        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+        NodeMask: 0,
+    };
+    // `ID3D12Device::CreateDescriptorHeap` is slot 15: `GetNodeCount` 8,
+    // `CreateCommandQueue` 9, `CreateCommandAllocator` 10,
+    // `CreateGraphicsPipelineState` 11, `CreateComputePipelineState` 12,
+    // `CreateCommandList` 13, `CheckFeatureSupport` 14, `CreateDescriptorHeap` 15.
+    let vtable = *(device as *mut *const usize);
+    let create: unsafe extern "system" fn(
+        *mut c_void,
+        *const D3D12_DESCRIPTOR_HEAP_DESC,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> HRESULT = std::mem::transmute(*vtable.add(15));
+    let Some(iid) = guid(IID_ID3D12DESCRIPTORHEAP) else {
+        return Err("the DescriptorHeap GUID literal is invalid".into());
+    };
+    let mut heap: *mut c_void = std::ptr::null_mut();
+    let hr = create(device, &desc, &iid, &mut heap);
+    if hr < 0 || heap.is_null() {
+        return Err(format!(
+            "CreateDescriptorHeap({count} descriptors) failed (HRESULT 0x{hr:08x})"
+        ));
+    }
+    Ok(heap)
+}
+
+/// `IID_ID3D12DescriptorHeap`: `8efb471d-616c-4f49-90f7-127bb763fa51`.
+pub const IID_ID3D12DESCRIPTORHEAP: &str = "8efb471d-616c-4f49-90f7-127bb763fa51";
+
+/// `ID3D12DescriptorHeap::GetCPUDescriptorHandleForHeapStart` (slot 9) and
+/// `GetGPUDescriptorHandleForHeapStart` (slot 10). Both return a two-word
+/// `D3D12_CPU_DESCRIPTOR_HANDLE` / `D3D12_GPU_DESCRIPTOR_HANDLE`.
+///
+/// # Safety
+/// `heap` must be live.
+pub unsafe fn heap_handles(heap: *mut c_void) -> (usize, u64) {
+    // Counted from `d3d12.h`: IUnknown 0..2, ID3D12Object 3..6
+    // (`GetPrivateData`, `SetPrivateData`, `SetPrivateDataInterface`, `SetName`),
+    // ID3D12DeviceChild 7 (`GetDevice`), ID3D12Pageable adds nothing, then
+    // ID3D12DescriptorHeap's own three: GetDesc 8, the CPU handle start 9 and the
+    // GPU handle start 10.
+    let vtable = *(heap as *mut *const usize);
+    let get_cpu: unsafe extern "system" fn(*mut c_void) -> usize =
+        std::mem::transmute(*vtable.add(9));
+    let get_gpu: unsafe extern "system" fn(*mut c_void) -> u64 =
+        std::mem::transmute(*vtable.add(10));
+    (get_cpu(heap), get_gpu(heap))
+}
+
+/// `ID3D12Device::GetDescriptorHandleIncrementSize` (slot 16).
+///
+/// # Safety
+/// `device` must be live.
+pub unsafe fn descriptor_increment(device: *mut c_void) -> u32 {
+    let vtable = *(device as *mut *const usize);
+    let size: unsafe extern "system" fn(*mut c_void, u32) -> u32 =
+        std::mem::transmute(*vtable.add(16));
+    size(device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+}
+
+/// `ID3D12Device::CreateConstantBufferView` (slot 18).
+///
+/// # Safety
+/// `device` must be live and `handle` a slot in a heap it created.
+pub unsafe fn write_constant_buffer_view(
+    device: *mut c_void,
+    location: u64,
+    size: u32,
+    handle: usize,
+) {
+    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+        BufferLocation: location,
+        SizeInBytes: size,
+    };
+    let vtable = *(device as *mut *const usize);
+    let write: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *const D3D12_CONSTANT_BUFFER_VIEW_DESC,
+        usize,
+    ) = std::mem::transmute(*vtable.add(18));
+    write(device, std::ptr::null_mut(), &desc, handle);
+}
+
+/// `ID3D12Device::CreateShaderResourceView` (slot 19), buffer form.
+///
+/// # Safety
+/// `device` must be live, `resource` a buffer, `handle` a slot in its heap.
+pub unsafe fn write_buffer_srv(
+    device: *mut c_void,
+    resource: *mut c_void,
+    first_element: u64,
+    num_elements: u32,
+    stride: u32,
+    handle: usize,
+) {
+    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_UNKNOWN,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Buffer: D3D12_BUFFER_UAV {
+            FirstElement: first_element,
+            NumElements: num_elements,
+            StructureByteStride: stride,
+            CounterOffsetInBytes: 0,
+            Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+        },
+    };
+    let vtable = *(device as *mut *const usize);
+    let write: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *const D3D12_SHADER_RESOURCE_VIEW_DESC,
+        usize,
+    ) = std::mem::transmute(*vtable.add(19));
+    write(device, resource, &desc, handle);
+}
+
+/// `ID3D12Device::CreateUnorderedAccessView` (slot 20), buffer form.
+///
+/// # Safety
+/// `device` must be live, `resource` a buffer, `handle` a slot in its heap.
+pub unsafe fn write_buffer_uav(
+    device: *mut c_void,
+    resource: *mut c_void,
+    first_element: u64,
+    num_elements: u32,
+    stride: u32,
+    handle: usize,
+) {
+    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_UNKNOWN,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Buffer: D3D12_BUFFER_UAV {
+            FirstElement: first_element,
+            NumElements: num_elements,
+            StructureByteStride: stride,
+            CounterOffsetInBytes: 0,
+            Flags: 0,
+        },
+    };
+    let vtable = *(device as *mut *const usize);
+    let write: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *const D3D12_UNORDERED_ACCESS_VIEW_DESC,
+        usize,
+    ) = std::mem::transmute(*vtable.add(20));
+    write(device, resource, &desc, handle);
+}
+
+/// `ID3D12GraphicsCommandList::SetComputeRootDescriptorTable` (slot 22) and
+/// `Dispatch` (slot 25) live on the command list; both are reached through
+/// `winapi`'s own declarations in `dx12.rs`, so only the handle types are here.
+pub type D3D12_GPU_DESCRIPTOR_HANDLE = u64;
+
+/// A `D3D12_GPU_DESCRIPTOR_HANDLE` from a raw address, for the root-table calls.
+pub fn heap_gpu_handle(start: D3D12_GPU_DESCRIPTOR_HANDLE) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+    start
+}
+
+/// The GPU handle at an offset into a heap, as the root-table calls expect.
+pub fn offset_gpu_handle(
+    start: D3D12_GPU_DESCRIPTOR_HANDLE,
+    bytes: u64,
+) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+    start + bytes
+}
+
+/// `ID3D12Resource::GetGPUVirtualAddress`, slot 11 of the resource vtable.
+///
+/// Counted from `d3d12.h`: `IUnknown` 0..2, `ID3D12Object` 3..6,
+/// `ID3D12DeviceChild` 7 (`GetDevice`), `ID3D12Pageable` adds nothing, then
+/// `Map` 8, `Unmap` 9, `GetDesc` 10 and `GetGPUVirtualAddress` 11.
+///
+/// Slot 10 is `GetDesc`, which returns a *struct by value*; calling it through a
+/// `-> u64` signature would read a fraction of that struct as an address.
+///
+/// # Safety
+/// `resource` must be a live `ID3D12Resource`.
+pub unsafe fn gpu_virtual_address(resource: *mut c_void) -> u64 {
+    let vtable = *(resource as *mut *const usize);
+    let address: unsafe extern "system" fn(*mut c_void) -> u64 =
+        std::mem::transmute(*vtable.add(11));
+    address(resource)
+}
+
+// ---------------------------------------------------------------------------
+// A storage texture and its readback
+// ---------------------------------------------------------------------------
+
+/// `D3D12_RESOURCE_DIMENSION_TEXTURE2D`.
+pub const D3D12_RESOURCE_DIMENSION_TEXTURE2D: u32 = 3;
+/// `D3D12_TEXTURE_LAYOUT_ROW_MAJOR`.
+pub const D3D12_TEXTURE_LAYOUT_ROW_MAJOR: u32 = 1;
+/// `DXGI_FORMAT_R32G32B32A32_FLOAT`.
+pub const DXGI_FORMAT_R32G32B32A32_FLOAT: u32 = 2;
+/// `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`.
+pub const D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS: u32 = 0x4;
+/// `D3D12_RESOURCE_STATE_COMMON`.
+pub const D3D12_RESOURCE_STATE_COMMON: u32 = 0;
+/// `D3D12_RESOURCE_STATE_UNORDERED_ACCESS`.
+pub const D3D12_RESOURCE_STATE_UNORDERED_ACCESS: u32 = 0x8;
+/// `D3D12_RESOURCE_STATE_COPY_SOURCE`.
+pub const D3D12_RESOURCE_STATE_COPY_SOURCE: u32 = 0x800;
+/// `D3D12_HEAP_TYPE_DEFAULT` / `_UPLOAD` / `_READBACK`.
+pub const D3D12_HEAP_TYPE_DEFAULT: u32 = 1;
+pub const D3D12_HEAP_TYPE_UPLOAD: u32 = 2;
+pub const D3D12_HEAP_TYPE_READBACK: u32 = 3;
+/// `D3D12_HEAP_FLAG_NONE`.
+pub const D3D12_HEAP_FLAG_NONE: u32 = 0;
+/// `D3D12_CPU_PAGE_PROPERTY_UNKNOWN` / `D3D12_MEMORY_POOL_UNKNOWN`.
+pub const D3D12_CPU_PAGE_PROPERTY_UNKNOWN: u32 = 0;
+pub const D3D12_MEMORY_POOL_UNKNOWN: u32 = 0;
+/// `D3D12_RESOURCE_BARRIER_TYPE_TRANSITION`.
+pub const D3D12_RESOURCE_BARRIER_TYPE_TRANSITION: u32 = 1;
+/// `D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES`.
+pub const D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES: u32 = u32::MAX;
+
+/// `D3D12_HEAP_PROPERTIES`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D12_HEAP_PROPERTIES {
+    pub Type: u32,
+    pub CPUPageProperty: u32,
+    pub MemoryPoolPreference: u32,
+    pub CreationNodeMask: u32,
+    pub VisibleNodeMask: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DXGI_SAMPLE_DESC {
+    pub Count: u32,
+    pub Quality: u32,
+}
+
+/// `D3D12_RESOURCE_DESC`, buffer form and texture form sharing one layout: the
+/// header's union of `D3D12_RESOURCE_DESC_BUFFER` and `D3D12_TEXTURE_DESC` is
+/// `{ Dimension, Alignment, Width, Height, DepthOrArraySize, MipLevels, Format,
+/// SampleDesc, Layout, Flags }` for the buffer case, which is the smaller.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D12_RESOURCE_DESC {
+    pub Dimension: u32,
+    pub Alignment: u64,
+    pub Width: u64,
+    pub Height: u32,
+    pub DepthOrArraySize: u16,
+    pub MipLevels: u16,
+    pub Format: u32,
+    pub SampleDesc: DXGI_SAMPLE_DESC,
+    pub Layout: u32,
+    pub Flags: u32,
+}
+
+/// `D3D12_TEXTURE_COPY_LOCATION` for the buffer side of a texture-to-buffer copy.
+#[repr(C)]
+pub struct D3D12_TEXTURE_COPY_LOCATION {
+    pub pResource: *mut c_void,
+    pub Type: u32,
+    pub PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+}
+
+/// `D3D12_PLACED_SUBRESOURCE_FOOTPRINT`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+    pub Offset: u64,
+    pub Footprint: D3D12_SUBRESOURCE_FOOTPRINT,
+}
+
+/// `D3D12_SUBRESOURCE_FOOTPRINT`: `{ Format, Width, Height, Depth, RowPitch }`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_SUBRESOURCE_FOOTPRINT {
+    pub Format: u32,
+    pub Width: u32,
+    pub Height: u32,
+    pub Depth: u32,
+    pub RowPitch: u32,
+}
+
+/// `D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT`.
+pub const D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT: u32 = 1;
+/// `D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX`.
+pub const D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX: u32 = 0;
+
+/// `ID3D12Resource::Map` (slot 8) and `Unmap` (slot 9), for a readback buffer.
+///
+/// # Safety
+/// `resource` must be a live `ID3D12Resource` on a CPU-visible heap.
+pub unsafe fn map(resource: *mut c_void, read_range: *const c_void) -> Result<*mut u8, String> {
+    let vtable = *(resource as *mut *const usize);
+    let map: unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        *const c_void,
+        *mut *mut c_void,
+    ) -> HRESULT = std::mem::transmute(*vtable.add(8));
+    let mut pointer: *mut c_void = std::ptr::null_mut();
+    let hr = map(resource, 0, read_range, &mut pointer);
+    if hr < 0 || pointer.is_null() {
+        return Err(format!("ID3D12Resource::Map failed (HRESULT 0x{hr:08x})"));
+    }
+    Ok(pointer as *mut u8)
+}
+
+/// # Safety
+/// `resource` must be the one `map` succeeded on.
+pub unsafe fn unmap(resource: *mut c_void) {
+    let vtable = *(resource as *mut *const usize);
+    let unmap: unsafe extern "system" fn(*mut c_void, u32, *const c_void) =
+        std::mem::transmute(*vtable.add(9));
+    unmap(resource, 0, std::ptr::null());
+}
+
+/// `D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE`.
+pub const D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE: u32 = 11;
+
+/// The description a `RaytracingAccelerationStructure` binding needs: an address
+/// and nothing else. The resource the address belongs to is never named, which is
+/// why the resource argument of `CreateShaderResourceView` is null here.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_TLAS_SRV_DESC {
+    pub Format: u32,
+    pub ViewDimension: u32,
+    pub Shader4ComponentMapping: u32,
+    pub Location: u64,
+}
+
+/// Write a `RaytracingAccelerationStructure` SRV for `address` into a heap slot.
+///
+/// # Safety
+/// `device` must be live and `handle` a slot in a heap it created.
+pub unsafe fn write_tlas_srv(device: *mut c_void, address: u64, handle: usize) {
+    let desc = D3D12_TLAS_SRV_DESC {
+        Format: DXGI_FORMAT_UNKNOWN,
+        ViewDimension: D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Location: address,
+    };
+    let vtable = *(device as *mut *const usize);
+    let write: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *const D3D12_TLAS_SRV_DESC,
+        usize,
+    ) = std::mem::transmute(*vtable.add(19));
+    write(device, std::ptr::null_mut(), &desc, handle);
+}
+
+/// `ID3D12GraphicsCommandList::SetComputeRootDescriptorTable`.
+///
+/// The handle is a one-word struct in `winapi` and a bare integer in the offline
+/// shim, so the call is made here, through the vtable, where one spelling of the
+/// argument works for both.
+///
+/// # Safety
+/// `list` must be a live command list and `base` an address in a heap bound to it.
+pub unsafe fn set_compute_root_descriptor_table(list: *mut c_void, root: u32, base: u64) {
+    // Counted on `ID3D12GraphicsCommandList`: IUnknown 0..2, ID3D12Object 3..6,
+    // ID3D12DeviceChild 7, Close 8, Reset 9, ClearState 10, the draw calls
+    // 11..12, Dispatch 13, the copies 14..18, the pipeline calls 19..20,
+    // ResourceBarrier 21, ExecuteBundle 22, SetDescriptorHeaps 23, the two root
+    // signatures 24..25, then SetComputeRootDescriptorTable at 30.
+    let vtable = *(list as *mut *const usize);
+    let set: unsafe extern "system" fn(*mut c_void, u32, u64) =
+        std::mem::transmute(*vtable.add(30));
+    set(list, root, base);
+}
+
+// ---------------------------------------------------------------------------
 // Compile-time slot assertions
 // ---------------------------------------------------------------------------
 
@@ -1033,6 +1503,74 @@ mod tests {
         // CreateComputePipelineState sits four earlier at 12.
         assert_eq!(IUNKNOWN_SLOTS + 4 + 1 + 9, 17, "CreateRootSignature");
         assert_eq!(IUNKNOWN_SLOTS + 4 + 1 + 4, 12, "CreateComputePipelineState");
+    }
+
+    /// Every slot below is reached by offset into a vtable, so a wrong number
+    /// calls an unrelated function instead of failing to compile. These are the
+    /// counts `d3d12.h` gives, interface by interface.
+    #[test]
+    fn the_pipeline_and_dispatch_slots_match_the_header() {
+        // The dispatch is recorded through `winapi`'s own command list, except for
+        // `SetComputeRootDescriptorTable`, which `sys` calls by offset because the
+        // handle type differs between the real crate and the offline shim.
+        //
+        // ID3D12GraphicsCommandList: IUnknown 3, ID3D12Object 4,
+        // ID3D12DeviceChild 1 = 8, then twenty-five members before
+        // SetComputeRootDescriptorTable, which is therefore slot 33.
+        assert_eq!(
+            IUNKNOWN_SLOTS + 4 + 1 + 22,
+            30,
+            "SetComputeRootDescriptorTable"
+        );
+        // The device: GetNodeCount 8 through CreateRootSignature 17, with
+        // CreateComputePipelineState at 12, CreateDescriptorHeap 15,
+        // GetDescriptorHandleIncrementSize 16, and the three view creators at
+        // 18, 19 and 20.
+        assert_eq!(IUNKNOWN_SLOTS + 4 + 1 + 9, 17, "CreateRootSignature");
+        assert_eq!(IUNKNOWN_SLOTS + 4 + 1 + 4, 12, "CreateComputePipelineState");
+        assert_eq!(IUNKNOWN_SLOTS + 4 + 1 + 7, 15, "CreateDescriptorHeap");
+        assert_eq!(
+            IUNKNOWN_SLOTS + 4 + 1 + 8,
+            16,
+            "GetDescriptorHandleIncrementSize"
+        );
+        assert_eq!(IUNKNOWN_SLOTS + 4 + 1 + 10, 18, "CreateConstantBufferView");
+        assert_eq!(IUNKNOWN_SLOTS + 4 + 1 + 11, 19, "CreateShaderResourceView");
+        assert_eq!(IUNKNOWN_SLOTS + 4 + 1 + 12, 20, "CreateUnorderedAccessView");
+        // The descriptor heap: IUnknown 3, ID3D12Object 4, ID3D12DeviceChild 1
+        // (GetDevice at 7), ID3D12Pageable adds nothing, so GetDesc is 8 and the
+        // two handle accessors are 9 and 10.
+        assert_eq!(
+            IUNKNOWN_SLOTS + 4 + 1 + 1,
+            9,
+            "GetCPUDescriptorHandleForHeapStart"
+        );
+        assert_eq!(
+            IUNKNOWN_SLOTS + 4 + 1 + 2,
+            10,
+            "GetGPUDescriptorHandleForHeapStart"
+        );
+        // The resource: IUnknown 3, ID3D12Object 4, ID3D12DeviceChild 1
+        // (GetDevice at 7), ID3D12Pageable adds nothing, then Map 8, Unmap 9,
+        // GetDesc 10 and GetGPUVirtualAddress 11.
+        assert_eq!(IUNKNOWN_SLOTS + 4 + 1 + 3, 11, "GetGPUVirtualAddress");
+        assert_eq!(IUNKNOWN_SLOTS + 4 + 1 + 0, 8, "Map");
+        assert_eq!(IUNKNOWN_SLOTS + 4 + 1 + 1, 9, "Unmap");
+    }
+
+    /// The trace root signature is written against the shader's own declarations:
+    /// a CBV, a three-entry SRV table and a one-entry UAV table.
+    #[test]
+    fn the_trace_root_signature_has_the_shaders_three_tables() {
+        // `ConstantBuffer<Params> : register(b0)`, three SRVs at t0..t2 and one
+        // UAV at u0 in `dxr_trace.hlsl`.
+        assert_eq!(D3D12_ROOT_PARAMETER_TYPE_CBV, 0);
+        assert_eq!(D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, 4);
+        assert_eq!(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0);
+        assert_eq!(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3);
+        assert_eq!(D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE, 11);
+        // A TLAS view is `{ Format, ViewDimension, Mapping, Location }`.
+        assert_eq!(std::mem::size_of::<D3D12_TLAS_SRV_DESC>(), 24);
     }
 
     #[test]
