@@ -4025,7 +4025,7 @@ fn recreate_surface(
     cfg.format = surface_format;
     // Same rule as the first configure: keep the frame readable for the
     // Imaginator, but only ask for what the backend advertises.
-    if caps.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+    if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
         cfg.usage |= wgpu::TextureUsages::COPY_SRC;
     }
     if surface_format.is_srgb() {
@@ -4294,11 +4294,11 @@ pub fn run(
     // `get_default_config` asks for `RENDER_ATTACHMENT` alone. The Imaginator has
     // to *read* the finished frame, so add `COPY_SRC` — but only when the backend
     // actually advertises it, because `Surface::configure` rejects any usage
-    // missing from `caps.usage` outright. `TEXTURE_BINDING` is never requested:
+    // missing from `caps.usages` outright. `TEXTURE_BINDING` is never requested:
     // DX12 reports only `COLOR_TARGET | COPY_SRC | COPY_DST` for a surface, so
     // asking for it panics with "Requested usage is not supported" on the first
     // configure. The copy is what makes the frame readable without it.
-    if caps.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+    if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
         config.usage |= wgpu::TextureUsages::COPY_SRC;
     }
     if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
@@ -7164,12 +7164,12 @@ mod frame_snapshot_tests {
     /// The surface configuration may only ask for usages the backend reports.
     ///
     /// `Surface::configure` is not lenient about this: `wgpu-core` compares
-    /// `config.usage` against `caps.usage` and returns `UnsupportedUsage`, which
+    /// `config.usage` against `caps.usages` and returns `UnsupportedUsage`, which
     /// `configure` turns into the panic
     /// "Error in Surface::configure: Validation Error / Requested usage is not
     /// supported". That is a startup crash, not a degraded frame, so it is worth
     /// pinning from the source: every `usage` assignment on a surface config has
-    /// to be guarded by a `caps.usage.contains(...)` test for the same flag.
+    /// to be guarded by a `caps.usages.contains(...)` test for the same flag.
     ///
     /// DX12 is the backend that makes this concrete. It reports
     /// `COLOR_TARGET | COPY_SRC | COPY_DST` for a surface, so `COPY_SRC` (which
@@ -7193,9 +7193,9 @@ mod frame_snapshot_tests {
                 }
                 // The guard has to be in the same block, above the assignment.
                 assert!(
-                    block.contains("caps.usage.contains("),
+                    block.contains("caps.usages.contains("),
                     "{declaration}: `{line}` widens the surface usage without checking \
-                     `caps.usage`, so `Surface::configure` can panic with \
+                     `caps.usages`, so `Surface::configure` can panic with \
                      \"Requested usage is not supported\" (line {index})"
                 );
             }
