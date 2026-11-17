@@ -25,7 +25,6 @@ impl Interface for raw::ID3D12Fence {}
 #[repr(transparent)]
 pub struct ComPtr<T: Interface>(*mut T);
 
-
 impl<T: Interface> ComPtr<T> {
     pub fn null() -> Self {
         ComPtr(std::ptr::null_mut())

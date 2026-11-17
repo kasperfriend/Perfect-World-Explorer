@@ -232,7 +232,11 @@ pub mod um {
             pub unsafe fn Close(&self) -> HRESULT {
                 unsafe { ((*self.lpVtbl).Close)(self as *const _ as *mut _) }
             }
-            pub unsafe fn ResourceBarrier(&self, count: u32, barriers: *const D3D12_RESOURCE_BARRIER) {
+            pub unsafe fn ResourceBarrier(
+                &self,
+                count: u32,
+                barriers: *const D3D12_RESOURCE_BARRIER,
+            ) {
                 unsafe {
                     ((*self.lpVtbl).ResourceBarrier)(self as *const _ as *mut _, count, barriers)
                 }
@@ -262,7 +266,11 @@ pub mod um {
             pub lpVtbl: *mut D3D12_QUEUE_VTBL,
         }
         impl ID3D12CommandQueue {
-            pub unsafe fn ExecuteCommandLists(&self, count: u32, lists: *const *mut ID3D12CommandList) {
+            pub unsafe fn ExecuteCommandLists(
+                &self,
+                count: u32,
+                lists: *const *mut ID3D12CommandList,
+            ) {
                 unsafe {
                     ((*self.lpVtbl).ExecuteCommandLists)(self as *const _ as *mut _, count, lists)
                 }

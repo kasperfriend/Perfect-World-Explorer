@@ -21,9 +21,7 @@ unsafe impl Zeroable for u8 {}
 unsafe impl Zeroable for i32 {}
 
 pub fn bytes_of<T: Pod>(value: &T) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(value as *const T as *const u8, std::mem::size_of::<T>())
-    }
+    unsafe { std::slice::from_raw_parts(value as *const T as *const u8, std::mem::size_of::<T>()) }
 }
 
 pub fn cast_slice<A: Pod, B: Pod>(values: &[A]) -> &[B] {
@@ -33,6 +31,9 @@ pub fn cast_slice<A: Pod, B: Pod>(values: &[A]) -> &[B] {
         return &[];
     }
     unsafe {
-        std::slice::from_raw_parts(values.as_ptr() as *const B, bytes / std::mem::size_of::<B>())
+        std::slice::from_raw_parts(
+            values.as_ptr() as *const B,
+            bytes / std::mem::size_of::<B>(),
+        )
     }
 }

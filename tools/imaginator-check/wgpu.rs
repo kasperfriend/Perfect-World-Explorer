@@ -17,7 +17,10 @@ pub enum TextureFormat {
 }
 impl TextureFormat {
     pub fn is_srgb(self) -> bool {
-        matches!(self, TextureFormat::Rgba8UnormSrgb | TextureFormat::Bgra8UnormSrgb)
+        matches!(
+            self,
+            TextureFormat::Rgba8UnormSrgb | TextureFormat::Bgra8UnormSrgb
+        )
     }
     pub fn remove_srgb_suffix(self) -> Self {
         match self {
@@ -127,13 +130,35 @@ macro_rules! flags {
 }
 
 flags!(TextureUsages {
-    COPY_SRC, COPY_DST, TEXTURE_BINDING, STORAGE_BINDING, RENDER_ATTACHMENT
+    COPY_SRC,
+    COPY_DST,
+    TEXTURE_BINDING,
+    STORAGE_BINDING,
+    RENDER_ATTACHMENT
 });
 flags!(BufferUsages {
-    COPY_SRC, COPY_DST, UNIFORM, STORAGE, MAP_READ, MAP_WRITE, INDEX, VERTEX
+    COPY_SRC,
+    COPY_DST,
+    UNIFORM,
+    STORAGE,
+    MAP_READ,
+    MAP_WRITE,
+    INDEX,
+    VERTEX
 });
-flags!(ShaderStages { VERTEX, FRAGMENT, COMPUTE, VERTEX_FRAGMENT });
-flags!(ColorWrites { RED, GREEN, BLUE, ALPHA, ALL });
+flags!(ShaderStages {
+    VERTEX,
+    FRAGMENT,
+    COMPUTE,
+    VERTEX_FRAGMENT
+});
+flags!(ColorWrites {
+    RED,
+    GREEN,
+    BLUE,
+    ALPHA,
+    ALL
+});
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Color {

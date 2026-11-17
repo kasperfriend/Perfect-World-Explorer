@@ -4056,9 +4056,7 @@ fn window_hwnd(_window: &winit::window::Window) -> Result<*mut std::ffi::c_void,
 /// animated celestial disc curve. That is the light the raster path actually
 /// shades with, so a traced shadow lands where the raster highlight is.
 fn imaginator_environment(camera: &Camera) -> crate::imaginator::tracer::Environment {
-    let light = camera
-        .regional_light
-        .unwrap_or_else(neutral_regional_light);
+    let light = camera.regional_light.unwrap_or_else(neutral_regional_light);
     // With a region record, `toward_sun` is the authored EC-BSD direction, the
     // same vector the sky azimuth and the tree lighting read. Without one the
     // neutral fallback's `[0, -1, 0]` describes a light travelling down from
@@ -4066,7 +4064,11 @@ fn imaginator_environment(camera: &Camera) -> crate::imaginator::tracer::Environ
     // straight up — which is what that fallback stands for.
     let toward_sun = if camera.regional_light.is_some() {
         let v = glam::Vec3::from_array(light.toward_sun).normalize_or_zero();
-        if v.length_squared() > 0.5 { v } else { glam::Vec3::Y }
+        if v.length_squared() > 0.5 {
+            v
+        } else {
+            glam::Vec3::Y
+        }
     } else {
         glam::Vec3::Y
     };
@@ -4074,15 +4076,17 @@ fn imaginator_environment(camera: &Camera) -> crate::imaginator::tracer::Environ
     // The client's own ambient/diffuse triple is authored in the region record;
     // at night it is the same record scaled by the day weight, which is exactly
     // what every material shader in the viewer does with it.
-    let scale = |c: [f32; 3], k: f32| {
-        crate::imaginator::math::v3(c[0] * k, c[1] * k, c[2] * k)
-    };
+    let scale = |c: [f32; 3], k: f32| crate::imaginator::math::v3(c[0] * k, c[1] * k, c[2] * k);
     let sun = scale(light.diffuse, 0.35 + 0.65 * daylight);
     let ambient = scale(light.ambient, 0.35 + 0.65 * daylight);
     let fog = camera.active_fog();
     crate::imaginator::tracer::Environment {
         sun_direction: crate::imaginator::math::v3(toward_sun.x, toward_sun.y, toward_sun.z),
-        sun_color: if sun.length_squared() > 0. { sun } else { crate::imaginator::math::v3(0.9, 0.9, 0.9) },
+        sun_color: if sun.length_squared() > 0. {
+            sun
+        } else {
+            crate::imaginator::math::v3(0.9, 0.9, 0.9)
+        },
         // Sky ambient: the region's ambient is an omnidirectional term, so the
         // up hemisphere takes it whole and the horizon takes a little more,
         // which is what makes an open sky read brighter than a corner.
