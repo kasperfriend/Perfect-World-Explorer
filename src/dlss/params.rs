@@ -264,6 +264,15 @@ impl Owned {
         }
     }
 
+    /// Read one pointer key back through every candidate `Get` slot.
+    ///
+    /// Every pointer overload of the viewer's own table stores the same
+    /// `Value::Ptr`, so all three readers answer with the stored address — the
+    /// same shape the diagnostics print for NGX's map when that map behaves.
+    fn describe_pointer_gets(&self, name: &str) -> String {
+        pointer_get_report(self as *const Owned as *mut c_void, name)
+    }
+
     /// Drop every entry; NGX calls this between frames in some paths.
     pub(crate) fn reset(&mut self) {
         self.values.clear();
@@ -415,11 +424,6 @@ impl NgxMap {
         }
     }
 
-    /// Read a pointer key back through every candidate `Get` slot.
-    pub(crate) fn describe_pointer_gets(&self, name: &str) -> String {
-        pointer_get_report(self.object, name)
-    }
-
     /// Which `Set` slot resource pointers go through.
     pub(crate) fn resource_set_slot(&self) -> usize {
         self.resource_set_slot
@@ -535,9 +539,12 @@ impl NgxMap {
         CString::new(name).ok()
     }
 
-    /// Read one pointer key back through every candidate `Get` slot.
-    fn describe_pointer_gets(&self, name: &str) -> String {
-        pointer_get_report(self as *const Owned as *mut c_void, name)
+    /// Read a pointer key back through every candidate `Get` slot.
+    ///
+    /// The diagnostic half of the `Set` ladder: it says whether NGX's map still
+    /// holds the pointer that was just written, and through which reader.
+    pub(crate) fn describe_pointer_gets(&self, name: &str) -> String {
+        pointer_get_report(self.object, name)
     }
 
     fn set_u32(&mut self, name: &str, value: u32) {
