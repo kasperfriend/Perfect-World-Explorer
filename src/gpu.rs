@@ -4116,6 +4116,7 @@ fn receiving_model_frame_with(
         reverse_front: uniform.clip[2] != 0.,
         alpha_compare: 5,
         alpha_reference: 84. / 255.,
+        lod_bias: crate::render_scale::mip_bias(),
     }
 }
 fn receiving_model_frame(
