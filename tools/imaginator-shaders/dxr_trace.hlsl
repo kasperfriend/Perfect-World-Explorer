@@ -11,7 +11,7 @@
 // Bindings mirror `src/imaginator/gpu.rs`'s compute tracer:
 //   b0 cbuffer Params
 //   t0 TLAS (raytracing acceleration structure)
-//   t1 per-triangle record (xyz normal, w material index)
+//   t1 per-primitive record (xyz normal, w material index)
 //   t2 material table (rgb albedo, a specular)
 //   u0 output texture (rgba32float)
 //
@@ -57,13 +57,16 @@ float rnd(inout uint seed)
     return float(seed >> 8u) / 16777216.0;
 }
 
-float sky(float up)
+float3 sky(float up)
 {
-    return lerp(p.sky_horizon.rgb, p.sky_up.rgb, pow(saturate(up), 0.7));
+    // The weight is normally scalar, but DXC's implicit-truncation warning fires
+    // on the ambient/up pair unless the blend factor is a vector as well.
+    float t = pow(saturate(up), 0.7);
+    return lerp(p.sky_horizon.rgb, p.sky_up.rgb, float3(t, t, t));
 }
 
 // One cone-jittered shadow ray, traced by the hardware traversal units.
-float sun_visibility(float3 point, float3 normal, inout uint seed)
+float sun_visibility(float3 position, float3 normal, inout uint seed)
 {
     float3 sun = normalize(p.sun.xyz);
     float3 helper = abs(sun.x) > 0.7 ? float3(0, 1, 0) : float3(1, 0, 0);
@@ -73,7 +76,7 @@ float sun_visibility(float3 point, float3 normal, inout uint seed)
     float radius = 0.0105 * sqrt(rnd(seed));
     float3 dir = normalize(sun + (t * cos(angle) + b * sin(angle)) * radius);
     RayDesc ray;
-    ray.Origin = point + normal * 0.02 + sun * 0.02;
+    ray.Origin = position + normal * 0.02 + sun * 0.02;
     ray.Direction = dir;
     ray.TMin = 0.0;
     ray.TMax = p.screen.z;
@@ -87,7 +90,7 @@ struct Hit
 {
     float t;
     float3 normal;
-    uint triangle;
+    uint primitive;
     bool hit;
 };
 
@@ -108,14 +111,14 @@ Hit closest(float3 origin, float3 dir)
     Hit h;
     h.hit = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
     h.t = h.hit ? q.CommittedRayT() : p.screen.z;
-    h.triangle = h.hit ? q.CommittedPrimitiveIndex() : 0u;
-    h.normal = h.hit ? tri_normals[h.triangle].xyz : float3(0, 1, 0);
+    h.primitive = h.hit ? q.CommittedPrimitiveIndex() : 0u;
+    h.normal = h.hit ? tri_normals[h.primitive].xyz : float3(0, 1, 0);
     return h;
 }
 
-float4 material_of(uint triangle)
+float4 material_of(uint primitive)
 {
-    uint index = uint(tri_normals[triangle].w);
+    uint index = uint(tri_normals[primitive].w);
     return materials[index];
 }
 
@@ -127,14 +130,14 @@ float4 material_of(uint triangle)
 // which is what the CPU tracer does too: a reflection ray is followed for
 // `bounces` steps, losing energy at each surface, and the loop stops early once
 // the throughput is negligible. Same picture, no recursion.
-float3 surface_light(float3 point, float3 normal, uint terms, inout uint seed)
+float3 surface_light(float3 position, float3 normal, uint terms, inout uint seed)
 {
     float3 sun = normalize(p.sun.xyz);
     float lit = max(dot(normal, sun), 0.0);
     float vis = 1.0;
     if ((terms & TERM_SHADOWS) != 0u && lit > 0.0)
     {
-        vis = sun_visibility(point, normal, seed);
+        vis = sun_visibility(position, normal, seed);
     }
     if ((terms & TERM_LIGHTING) == 0u) { return float3(0, 0, 0); }
     return p.sun_color.rgb * (lit * vis) + sky(normal.y);
@@ -171,7 +174,7 @@ void cs(uint3 id : SV_DispatchThreadID)
         if (!hit.hit) { continue; }
         hits += 1.0;
         distance += hit.t;
-        float3 point = ro + rd * hit.t;
+        float3 position = ro + rd * hit.t;
         float3 normal = normalize(hit.normal);
         if (dot(normal, rd) > 0.0) { normal = -normal; }
         float3 sun = normalize(p.sun.xyz);
@@ -179,15 +182,15 @@ void cs(uint3 id : SV_DispatchThreadID)
         float vis = 1.0;
         if ((terms & TERM_SHADOWS) != 0u && lit > 0.0)
         {
-            vis = sun_visibility(point, normal, seed);
+            vis = sun_visibility(position, normal, seed);
         }
         visibility += vis;
-        float4 mat = material_of(hit.triangle);
+        float4 mat = material_of(hit.primitive);
         if ((terms & TERM_LIGHTING) != 0u)
         {
             // Cosine-weighted bounce walk; every step is one hardware ray.
             float3 weight = mat.rgb;
-            float3 origin = point + normal * 0.02;
+            float3 origin = position + normal * 0.02;
             float3 n = normal;
             for (uint bounce = 0; bounce < p.config.x; ++bounce)
             {
@@ -217,7 +220,7 @@ void cs(uint3 id : SV_DispatchThreadID)
                 }
                 float3 incoming = p.sun_color.rgb * (bl * bv) + sky(bn.y);
                 indirect += dot(weight * incoming, float3(0.3333, 0.3333, 0.3333));
-                weight *= material_of(h.triangle).rgb;
+                weight *= material_of(h.primitive).rgb;
                 if (max(weight.r, max(weight.g, weight.b)) < 0.02) { break; }
                 origin = bp + bn * 0.02;
                 n = bn;
@@ -231,7 +234,7 @@ void cs(uint3 id : SV_DispatchThreadID)
                 // A mirror chain, walked rather than recursed: each step loses
                 // the surface's specular and gathers its own light.
                 float3 mirror = normalize(rd + normal * (2.0 * cos_i));
-                float3 origin = point + normal * 0.02;
+                float3 origin = position + normal * 0.02;
                 float3 through = float3(1, 1, 1);
                 float3 gathered = float3(0, 0, 0);
                 uint max_steps = max(p.config.x, 1u);
@@ -246,7 +249,7 @@ void cs(uint3 id : SV_DispatchThreadID)
                     float3 hp = origin + mirror * h.t;
                     float3 hn = normalize(h.normal);
                     if (dot(hn, mirror) > 0.0) { hn = -hn; }
-                    float4 hm = material_of(h.triangle);
+                    float4 hm = material_of(h.primitive);
                     gathered += through * (hm.rgb * surface_light(hp, hn, terms, seed));
                     through *= hm.a;
                     if (max(through.r, max(through.g, through.b)) < 0.02) { break; }
