@@ -4097,6 +4097,40 @@ fn signal_handoff_first_frame(signaled: &mut bool) {
     crate::world_handoff::signal_ready();
 }
 
+/// Steps the old process must take as soon as a replacement world is ready.
+/// Winit 0.29 dispatches `AboutToWait` immediately before a blocking wait, so
+/// a bare `target.exit()` there can leave the old window visible until an
+/// unrelated message wakes the loop. `Poll` makes that wait non-blocking and
+/// hiding the window prevents a lingering frame behind the replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HandoffReadyExit {
+    hide_old_window: bool,
+    poll_before_exit: bool,
+    exit_event_loop: bool,
+}
+fn handoff_ready_exit_plan() -> HandoffReadyExit {
+    HandoffReadyExit {
+        hide_old_window: true,
+        poll_before_exit: true,
+        exit_event_loop: true,
+    }
+}
+fn close_old_window_after_handoff_ready<T: 'static>(
+    target: &winit::event_loop::EventLoopWindowTarget<T>,
+    window: &winit::window::Window,
+) {
+    let plan = handoff_ready_exit_plan();
+    if plan.hide_old_window {
+        window.set_visible(false);
+    }
+    if plan.poll_before_exit {
+        target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    }
+    if plan.exit_event_loop {
+        target.exit();
+    }
+}
+
 /// Launch a replacement process for another map. The old process remains the
 /// foreground owner and keeps its own files/focus state; the child only
 /// publishes progress, its HWND, and readiness after a usable frame.
@@ -6766,7 +6800,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 world_loading_active = false;
                                 handoff_files = None;
                                 keys.clear();
-                                target.exit();
+                                close_old_window_after_handoff_ready(target, &window);
                                 return;
                             }
                             Ok(crate::world_handoff::Message::Failed(reason)) => {
@@ -7527,5 +7561,25 @@ mod slider_mark_tests {
             let t = slider_mark_fraction(default, min, max, true);
             assert!(t.is_finite() && (0.0..=1.0).contains(&t), "{t}");
         }
+    }
+}
+
+#[cfg(test)]
+mod handoff_exit_tests {
+    use super::*;
+
+    #[test]
+    fn a_ready_handoff_never_leaves_the_old_window_waiting_to_close() {
+        let plan = handoff_ready_exit_plan();
+        assert!(plan.hide_old_window);
+        assert!(plan.poll_before_exit);
+        assert!(plan.exit_event_loop);
+
+        // Source-pin the Winit 0.29 workaround: `AboutToWait` is dispatched
+        // before a blocking GetMessageW, so exit() alone is not sufficient.
+        let src = include_str!("gpu.rs");
+        assert!(src.contains("window.set_visible(false);"));
+        assert!(src.contains("target.set_control_flow(winit::event_loop::ControlFlow::Poll);"));
+        assert!(src.contains("close_old_window_after_handoff_ready(target, &window);"));
     }
 }
