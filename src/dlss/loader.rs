@@ -1494,4 +1494,3 @@ fn device_hint() -> &'static str {
      DriverStore one); 0xbad00002 FAIL_PlatformError means another overlay, injector or \
      NGX consumer is in the process, or the driver was installed without the NGX component"
 }
-
