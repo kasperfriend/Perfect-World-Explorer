@@ -92,6 +92,10 @@ $walkerManifest = Join-Path $shippedModules 'Walker/module.ini'
 if (-not (Test-Path -LiteralPath $walkerManifest -PathType Leaf)) {
     throw "Staging did not produce Modules/Walker/module.ini in $packageRoot"
 }
+$imaginatorManifest = Join-Path $shippedModules 'Imaginator/module.ini'
+if (-not (Test-Path -LiteralPath $imaginatorManifest -PathType Leaf)) {
+    throw "Staging did not produce Modules/Imaginator/module.ini in $packageRoot"
+}
 if (-not (Test-Path -LiteralPath (Join-Path $packageRoot 'THIRD_PARTY_NOTICES.md') -PathType Leaf)) {
     throw "Staging did not produce THIRD_PARTY_NOTICES.md in $packageRoot"
 }
@@ -312,6 +316,7 @@ if (-not [string]::IsNullOrWhiteSpace($ArchivePath)) {
             'Perfect World Explorer/Perfect-World-Explorer.exe',
             'Perfect World Explorer/Modules/Walker/module.ini',
             'Perfect World Explorer/Modules/Populator/module.ini',
+            'Perfect World Explorer/Modules/Imaginator/module.ini',
             'Perfect World Explorer/SHA256SUMS.txt',
             'Perfect World Explorer/THIRD_PARTY_NOTICES.md'
         )) {

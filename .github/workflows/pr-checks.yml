@@ -517,6 +517,7 @@ jobs:
             'DirectStorage/LICENSE.txt',
             'DirectStorage/NOTICES.txt',
             'Modules/Walker/module.ini',
+            'Modules/Imaginator/module.ini',
             'SHA256SUMS.txt'
           )) {
             if (-not (Test-Path -LiteralPath (Join-Path $package $relative) -PathType Leaf)) {

@@ -272,6 +272,24 @@ mod tests {
         assert!(!populator.description.is_empty());
     }
 
+    /// The Imaginator ships as a package like the others: an unknown id would
+    /// still be listed but could never be enabled, so the manifest has to parse
+    /// and its id has to be the one the executable implements.
+    #[test]
+    fn shipped_imaginator_manifest_is_discoverable() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(MODULES_DIRECTORY);
+        let registry = Registry::discover(root);
+        assert!(registry.errors.is_empty(), "{:?}", registry.errors);
+        let imaginator = registry
+            .packages
+            .iter()
+            .find(|package| package.id == "imaginator")
+            .expect("Modules/Imaginator must be shipped");
+        assert_eq!(imaginator.name, "Imaginator");
+        assert!(!imaginator.description.is_empty());
+        assert!(imaginator.directory.join("module.ini").is_file());
+    }
+
     #[test]
     fn shipped_walker_manifest_is_discoverable() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(MODULES_DIRECTORY);

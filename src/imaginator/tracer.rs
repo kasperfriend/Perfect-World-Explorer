@@ -1,0 +1,817 @@
+//! The Imaginator's path tracer: one implementation, no engine types.
+//!
+//! This is the "software" tracer in the module's selector, and it is also the
+//! reference the hardware tracer is checked against. It is real ray tracing, not
+//! a screen-space approximation:
+//!
+//! * every pixel's primary ray is intersected against the module's own BVH of the
+//!   map's actual geometry (terrain, buildings, water, trees);
+//! * **shadows** come from a shadow ray towards the traced sun, tested with
+//!   `Bvh::any_hit`;
+//! * **lighting** is the sun term plus a cosine-weighted indirect term that
+//!   follows `light_bounces` further bounces through the same BVH;
+//! * **reflections** trace a real mirror ray and shade whatever it hits.
+//!
+//! Each of those three is a separate switch, and the outputs are kept as
+//! separate channels (`Frame::occlusion`, `Frame::reflection`, `Frame::indirect`)
+//! so the compositor can use them with the right sign: an occlusion factor
+//! *multiplies* the rendered frame (a shadow removes light that the raster path
+//! drew unconditionally, because the core has no shadow map at all), while
+//! reflections and indirect light *add* to it.
+
+use super::bvh::Hit;
+use super::math::{Ray, V3};
+use super::settings::{ImaginatorSettings, MAX_BOUNCES};
+
+/// Physically-shaped description of the light in the scene, provided by the core
+/// from the same values its own shaders use.
+#[derive(Clone, Copy, Debug)]
+pub struct Environment {
+    /// Direction *towards* the sun (unit).
+    pub sun_direction: V3,
+    /// Linear sun colour, already scaled by the region's daylight.
+    pub sun_color: V3,
+    /// Ambient sky colour seen by an up-facing surface.
+    pub sky_up: V3,
+    /// Ambient sky colour at the horizon.
+    pub sky_horizon: V3,
+    /// Colour of the ground hemisphere, for bounce lighting from below.
+    pub ground: V3,
+    /// Colour the traced image fades to when a ray escapes (fog).
+    pub fog: V3,
+    /// Distance beyond which nothing is traced and fog takes over.
+    pub fog_distance: f32,
+}
+
+impl Default for Environment {
+    fn default() -> Self {
+        Self {
+            sun_direction: V3::from_array([0.3, 0.8, 0.5]).normalize_or_zero(),
+            sun_color: V3::splat(0.9),
+            sky_up: V3::splat(0.25),
+            sky_horizon: V3::splat(0.35),
+            ground: V3::splat(0.08),
+            fog: V3::splat(0.4),
+            fog_distance: 20000.,
+        }
+    }
+}
+
+impl Environment {
+    /// Radiance arriving from a direction that hit nothing: a sky gradient with
+    /// a sun glow, blended into the fog colour with distance.
+    fn escape(&self, direction: V3, distance: f32) -> V3 {
+        let up = direction.y.clamp(-1., 1.);
+        let sky = if up >= 0. {
+            self.sky_horizon.lerp(self.sky_up, up.powf(0.6))
+        } else {
+            self.sky_horizon.lerp(self.ground, (-up).powf(0.5))
+        };
+        let cos_sun = direction.dot(self.sun_direction).max(0.);
+        // A broad glow plus a tight disc: enough for a reflected sun to read as
+        // the sun without a second light type.
+        let glow = cos_sun.powf(8.) * 0.35 + cos_sun.powf(900.) * 8.;
+        let radiance = sky + self.sun_color * glow;
+        if self.fog_distance.is_finite() && distance.is_finite() {
+            let f = 1. - (-distance / self.fog_distance.max(1.)).exp();
+            radiance.lerp(self.fog, f.clamp(0., 1.))
+        } else {
+            radiance
+        }
+    }
+}
+
+/// Camera for the tracer, independent of the engine's `Camera` so this file
+/// compiles on its own.
+#[derive(Clone, Copy, Debug)]
+pub struct TraceCamera {
+    pub position: V3,
+    /// Unit forward vector.
+    pub forward: V3,
+    /// Unit right vector (screen +X).
+    pub right: V3,
+    /// Unit up vector.
+    pub up: V3,
+    /// Vertical field of view in radians.
+    pub fov_y: f32,
+    pub near: f32,
+    pub far: f32,
+}
+
+impl TraceCamera {
+    /// Primary ray through a pixel, with a sub-pixel offset in `[-0.5, 0.5]`.
+    pub fn ray(&self, x: f32, y: f32, width: f32, height: f32) -> Ray {
+        let aspect = width / height.max(1.);
+        let tan_half = (self.fov_y * 0.5).tan();
+        let sx = (2. * (x + 0.5) / width - 1.) * tan_half * aspect;
+        let sy = (1. - 2. * (y + 0.5) / height) * tan_half;
+        Ray::new(self.position, self.forward + self.right * sx + self.up * sy)
+    }
+}
+
+/// Per-pixel traced channels. All colours are linear radiance.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Sample {
+    /// 1 = the traced sun reaches this point, 0 = fully shadowed.
+    pub occlusion: f32,
+    /// Sun + sky diffuse reaching the surface (before albedo).
+    pub direct: V3,
+    /// Indirect diffuse after `light_bounces` bounces (already albedo-weighted).
+    pub indirect: V3,
+    /// Specular reflection radiance.
+    pub reflection: V3,
+    /// The full traced picture for the diagnostic "traced image only" mode.
+    pub radiance: V3,
+    /// View distance, for the composite's fog consistency and for the depth
+    /// rejection of pixels the tracer never saw.
+    pub distance: f32,
+    /// 0 when the primary ray escaped, so the compositor leaves sky pixels
+    /// exactly as the core drew them.
+    pub hit: f32,
+}
+
+/// Deterministic per-pixel/per-sample RNG. Cheap, good enough for stratification
+/// and free of the `rand` dependency so this file stays standalone-testable.
+#[derive(Clone, Copy)]
+struct Rng(u32);
+
+impl Rng {
+    fn new(seed: u32) -> Self {
+        // A fixed odd constant; xorshift32 never reaches zero from nonzero.
+        Self(seed | 1)
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.0 = x;
+        x
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        (self.next_u32() >> 8) as f32 / (1u32 << 24) as f32
+    }
+
+    /// Cosine-weighted hemisphere sample around `normal` (Malley's method).
+    fn cosine_hemisphere(&mut self, normal: V3) -> V3 {
+        let u1 = self.next_f32();
+        let u2 = self.next_f32();
+        let r = u1.sqrt();
+        let phi = std::f32::consts::TAU * u2;
+        let (x, y) = (r * phi.cos(), r * phi.sin());
+        let z = (1. - u1).max(0.).sqrt();
+        let (t, b) = tangent_basis(normal);
+        (t * x + b * y + normal * z).normalize_or_zero()
+    }
+}
+
+/// Any orthonormal basis around `n`. The choice does not affect correctness but
+/// keeping it continuous avoids visible seams in the indirect term.
+fn tangent_basis(n: V3) -> (V3, V3) {
+    let helper = if n.x.abs() > 0.7 {
+        V3::from_array([0., 1., 0.])
+    } else {
+        V3::from_array([1., 0., 0.])
+    };
+    let t = n.cross(helper).normalize_or_zero();
+    (t, n.cross(t))
+}
+
+/// Offset used to keep a secondary ray off the surface it left, scaled to the
+/// hit distance so distant geometry does not need a huge bias.
+fn bias(t: f32) -> f32 {
+    (t * 2e-4).clamp(1e-4, 0.5)
+}
+
+/// One shading configuration, resolved once per frame.
+#[derive(Clone, Copy, Debug)]
+pub struct TraceOptions {
+    pub reflections: bool,
+    pub lighting: bool,
+    pub shadows: bool,
+    pub bounces: u32,
+    pub guard: u64,
+}
+
+impl TraceOptions {
+    pub fn from_settings(settings: &ImaginatorSettings) -> Self {
+        Self {
+            reflections: settings.reflections,
+            lighting: settings.lighting,
+            shadows: settings.shadows,
+            bounces: settings.light_bounces.min(MAX_BOUNCES),
+            // A cap on total ray launches so an adversarial scene cannot wedge
+            // the thread. Generous: a full-resolution frame at four bounces
+            // stays well inside it.
+            guard: 4_000_000_000,
+        }
+    }
+}
+
+/// The tracer's state: an immutable scene, the environment, and a scratch budget.
+pub struct Tracer {
+    scene: super::bvh::SharedScene,
+    pub environment: Environment,
+    /// Rays launched by the last traced frame, for the status line.
+    pub rays: std::sync::atomic::AtomicU64,
+}
+
+impl Tracer {
+    pub fn new(scene: super::bvh::SharedScene, environment: Environment) -> Self {
+        Self {
+            scene,
+            environment,
+            rays: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub fn set_scene(&mut self, scene: super::bvh::SharedScene) {
+        self.scene = scene;
+    }
+
+    pub fn scene(&self) -> &super::bvh::SharedScene {
+        &self.scene
+    }
+
+    /// Shade one primary ray.
+    fn shade(&self, ray: &Ray, options: &TraceOptions, rng: &mut Rng, rays: &mut u64) -> Sample {
+        let Some(bvh) = self.scene.bvh.as_ref() else {
+            return Sample::default();
+        };
+        *rays += 1;
+        let Some(hit) = bvh.closest_hit(ray, 0., self.scene_limit()) else {
+            // Nothing hit: the pixel is sky, and the compositor must not touch it.
+            return Sample::default();
+        };
+        let albedo = self.albedo(hit);
+        let normal = self.shading_normal(hit, ray);
+        let point = ray.at(hit.t);
+        let mut sample = Sample {
+            distance: hit.t,
+            hit: 1.,
+            ..Sample::default()
+        };
+
+        // --- direct light + shadows -------------------------------------------
+        let sun = self.environment.sun_direction;
+        let n_dot_l = normal.dot(sun).max(0.);
+        let mut visibility = 1.;
+        if options.shadows && n_dot_l > 0. {
+            visibility = self.sun_visibility(bvh, point, normal, hit.t, rng, rays);
+        }
+        sample.occlusion = if options.shadows {
+            // Overcast light means the sun term is small; the factor is still
+            // the honest one, so the composite darkens by exactly what the
+            // traced sun would have delivered.
+            visibility
+        } else {
+            1.
+        };
+        let sun_radiance = self.environment.sun_color * (n_dot_l * visibility);
+        let sky = self
+            .environment
+            .sky_horizon
+            .lerp(self.environment.sky_up, normal.y.max(0.).powf(0.7));
+        let direct = if options.lighting {
+            sun_radiance + sky
+        } else {
+            V3::ZERO
+        };
+        sample.direct = direct;
+
+        // --- indirect diffuse --------------------------------------------------
+        let mut indirect = V3::ZERO;
+        if options.lighting && options.bounces > 0 {
+            let mut weight = albedo;
+            let mut origin = point + normal * bias(hit.t);
+            let mut bounce = 0;
+            while bounce < options.bounces && *rays < options.guard {
+                let dir = rng.cosine_hemisphere(normal);
+                if dir.length_squared() == 0. {
+                    break;
+                }
+                let r = Ray::new(origin, dir);
+                *rays += 1;
+                match bvh.closest_hit(&r, 0., self.scene_limit()) {
+                    Some(h) => {
+                        let p = r.at(h.t);
+                        let n = self.shading_normal(h, &r);
+                        let a = self.albedo(h);
+                        let l = self.environment.sun_direction;
+                        let mut v = 1.;
+                        if options.shadows {
+                            let nl = n.dot(l).max(0.);
+                            if nl > 0. {
+                                v = self.sun_visibility(bvh, p, n, h.t, rng, rays);
+                            }
+                        }
+                        let sky2 = self
+                            .environment
+                            .sky_horizon
+                            .lerp(self.environment.sky_up, n.y.max(0.).powf(0.7));
+                        let incoming = self.environment.sun_color * (n.dot(l).max(0.) * v) + sky2;
+                        indirect += weight * incoming;
+                        weight = weight * a;
+                        origin = p + n * bias(h.t);
+                        bounce += 1;
+                    }
+                    None => {
+                        // Escaped: the sky closes the path.
+                        indirect += weight * self.environment.escape(dir, self.scene_limit());
+                        break;
+                    }
+                }
+                // Russian-roulette-free termination: the albedo product falls
+                // below visibility quickly in practice.
+                if weight.max_component() < 0.02 {
+                    break;
+                }
+            }
+        }
+        sample.indirect = indirect;
+
+        // --- specular reflection ------------------------------------------------
+        let mut reflection = V3::ZERO;
+        if options.reflections {
+            let view = ray.direction;
+            let cos_i = normal.dot(-view);
+            if cos_i > 0. {
+                let mirror = view + normal * (2. * cos_i);
+                let r = Ray::new(point + normal * bias(hit.t), mirror);
+                *rays += 1;
+                reflection = match bvh.closest_hit(&r, 0., self.scene_limit()) {
+                    Some(h) => {
+                        let p = r.at(h.t);
+                        let n = self.shading_normal(h, &r);
+                        let a = self.albedo(h);
+                        let l = self.environment.sun_direction;
+                        let vis = if options.shadows {
+                            let nl = n.dot(l).max(0.);
+                            if nl > 0. {
+                                let mut rng2 = Rng::new(0x9e37_79b9 ^ (h.t.to_bits()));
+                                self.sun_visibility(bvh, p, n, h.t, &mut rng2, rays)
+                            } else {
+                                0.
+                            }
+                        } else {
+                            1.
+                        };
+                        let sky2 = self
+                            .environment
+                            .sky_horizon
+                            .lerp(self.environment.sky_up, n.y.max(0.).powf(0.7));
+                        a * (self.environment.sun_color * (n.dot(l).max(0.) * vis) + sky2)
+                    }
+                    None => self.environment.escape(mirror, self.scene_limit()),
+                };
+            }
+        }
+        sample.reflection = reflection;
+
+        // Full traced picture for the diagnostic mode: what the eye sees.
+        // `direct` is already gated by the lighting switch, so a tracer with
+        // every term off produces exactly no light instead of leaking the sun
+        // it was told not to compute.
+        sample.radiance = albedo * direct + indirect + reflection * self.specular(hit);
+
+        sample
+    }
+
+    fn scene_limit(&self) -> f32 {
+        self.environment.fog_distance.max(1000.) * 2.0
+    }
+
+    fn shading_normal(&self, hit: Hit, ray: &Ray) -> V3 {
+        let mut n = hit.normal.normalize_or_zero();
+        if n.length_squared() == 0. {
+            return V3::from_array([0., 1., 0.]);
+        }
+        // Two-sided shading: world geometry is often single-sided and thin.
+        if n.dot(ray.direction) > 0. {
+            n = -n;
+        }
+        n
+    }
+
+    fn albedo(&self, hit: Hit) -> V3 {
+        self.scene
+            .materials
+            .get(hit.material as usize)
+            .map(|m| m.albedo)
+            .unwrap_or(V3::splat(0.5))
+    }
+
+    fn specular(&self, hit: Hit) -> f32 {
+        self.scene
+            .materials
+            .get(hit.material as usize)
+            .map(|m| m.specular)
+            .unwrap_or(0.)
+    }
+
+    /// One shadow ray, jittered inside a small cone so a soft edge appears even
+    /// with a single sample.
+    fn sun_visibility(
+        &self,
+        bvh: &super::bvh::Bvh,
+        point: V3,
+        normal: V3,
+        distance: f32,
+        rng: &mut Rng,
+        rays: &mut u64,
+    ) -> f32 {
+        let sun = self.environment.sun_direction;
+        let (t, b) = tangent_basis(sun);
+        // 0.6 degrees of sun radius, matching the disc the sky pass draws.
+        let spread = 0.0105;
+        let jitter = 0.85;
+        let angle = std::f32::consts::TAU * rng.next_f32();
+        let radius = spread * jitter * rng.next_f32().sqrt();
+        let dir = (sun + (t * angle.cos() + b * angle.sin()) * radius).normalize_or_zero();
+        if dir.length_squared() == 0. {
+            return 1.;
+        }
+        *rays += 1;
+        let origin = point + normal * bias(distance) + sun * bias(distance);
+        if bvh.any_hit(&Ray::new(origin, dir), 0., self.scene_limit()) {
+            0.
+        } else {
+            1.
+        }
+    }
+
+    /// Trace one frame into `out`, which must hold `width * height` samples.
+    /// Rows are split across `threads` closures; the caller supplies them so the
+    /// tracer itself owns no thread pool and stays testable.
+    pub fn trace_rows(
+        &self,
+        camera: &TraceCamera,
+        options: &TraceOptions,
+        width: u32,
+        height: u32,
+        samples: u32,
+        row_start: u32,
+        row_end: u32,
+        out: &mut [Sample],
+    ) {
+        let mut rays = 0u64;
+        let w = width as f32;
+        let h = height as f32;
+        for y in row_start..row_end.min(height) {
+            for x in 0..width {
+                let mut rng = Rng::new(
+                    x.wrapping_mul(0x9e37_79b9) ^ y.wrapping_mul(0x85eb_ca6b) ^ 0x1234_5678,
+                );
+                let mut acc = Sample::default();
+                for s in 0..samples.max(1) {
+                    let ox = if s == 0 { 0. } else { rng.next_f32() - 0.5 };
+                    let oy = if s == 0 { 0. } else { rng.next_f32() - 0.5 };
+                    let ray = camera.ray(x as f32 + ox, y as f32 + oy, w, h);
+                    let sample = self.shade(&ray, options, &mut rng, &mut rays);
+                    acc.occlusion += sample.occlusion;
+                    acc.direct += sample.direct;
+                    acc.indirect += sample.indirect;
+                    acc.reflection += sample.reflection;
+                    acc.radiance += sample.radiance;
+                    acc.distance += sample.distance;
+                    acc.hit += sample.hit;
+                }
+                let inv = 1. / samples.max(1) as f32;
+                out[(y * width + x) as usize] = Sample {
+                    occlusion: acc.occlusion * inv,
+                    direct: acc.direct * inv,
+                    indirect: acc.indirect * inv,
+                    reflection: acc.reflection * inv,
+                    radiance: acc.radiance * inv,
+                    distance: acc.distance * inv,
+                    hit: acc.hit * inv,
+                };
+            }
+        }
+        self.rays
+            .fetch_add(rays, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Convenience single-threaded trace, used by the tests and by the tiny
+    /// preview at the bottom of the module's page.
+    pub fn trace(
+        &self,
+        camera: &TraceCamera,
+        options: &TraceOptions,
+        width: u32,
+        height: u32,
+        samples: u32,
+    ) -> Vec<Sample> {
+        let mut out = vec![Sample::default(); (width * height) as usize];
+        self.trace_rows(camera, options, width, height, samples, 0, height, &mut out);
+        out
+    }
+
+    /// Trace into a row-major `Rgba32Float`-shaped buffer that the compositor
+    /// uploads: `r` = reflection, `g` = indirect, `b` = occlusion,
+    /// `a` = full radiance luminance (diagnostic mode) and the hit mask in the
+    /// sign of the distance. Keeping one upload for all channels halves the
+    /// texture count and the bandwidth.
+    pub fn pack(samples: &[Sample], out: &mut [f32]) {
+        for (i, s) in samples.iter().enumerate() {
+            let o = i * 4;
+            out[o] = s.reflection.x + s.reflection.y + s.reflection.z;
+            out[o + 1] = s.indirect.x + s.indirect.y + s.indirect.z;
+            out[o + 2] = s.occlusion;
+            out[o + 3] = if s.hit > 0.5 { s.distance } else { -1. };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::bvh::{Bvh, Material, Scene, Triangle};
+    use super::super::math::v3;
+    use super::*;
+
+    /// A floor at y = 0 and a wall at x = 4, both 20 units across, with a
+    /// ceiling at y = 8 so a reflection has somewhere to come from.
+    fn room() -> std::sync::Arc<Scene> {
+        let mut tris = Vec::new();
+        let quad = |a: V3, b: V3, c: V3, d: V3, n: V3, m: u16, tris: &mut Vec<Triangle>| {
+            tris.push(Triangle {
+                a,
+                b,
+                c,
+                normal: n,
+                material: m,
+            });
+            tris.push(Triangle {
+                a,
+                b: c,
+                c: d,
+                normal: n,
+                material: m,
+            });
+        };
+        let up = v3(0., 1., 0.);
+        // floor
+        quad(
+            v3(-20., 0., -20.),
+            v3(20., 0., -20.),
+            v3(20., 0., 20.),
+            v3(-20., 0., 20.),
+            up,
+            0,
+            &mut tris,
+        );
+        // ceiling
+        quad(
+            v3(-20., 8., -20.),
+            v3(20., 8., -20.),
+            v3(20., 8., 20.),
+            v3(-20., 8., 20.),
+            v3(0., -1., 0.),
+            0,
+            &mut tris,
+        );
+        // wall at x = 4
+        quad(
+            v3(4., 0., -20.),
+            v3(4., 8., -20.),
+            v3(4., 8., 20.),
+            v3(4., 0., 20.),
+            v3(-1., 0., 0.),
+            1,
+            &mut tris,
+        );
+        std::sync::Arc::new(Scene {
+            bvh: Some(Bvh::build(tris)),
+            materials: vec![
+                Material::new(V3::splat(0.6), 0.1),
+                Material::new(V3::splat(0.8), 0.5),
+            ],
+            stats: Default::default(),
+        })
+    }
+
+    fn camera() -> TraceCamera {
+        // Facing the wall at x = 4 from x = -10, so the centre ray travels 14
+        // units before it lands.
+        TraceCamera {
+            position: v3(-10., 2., 0.),
+            forward: v3(1., 0., 0.),
+            right: v3(0., 0., -1.),
+            up: v3(0., 1., 0.),
+            fov_y: 60f32.to_radians(),
+            near: 0.1,
+            far: 20000.,
+        }
+    }
+
+    /// Only the samples whose primary ray actually landed on geometry: the room
+    /// has an open side, so sky pixels are expected and are the compositor's
+    /// business, not the tracer's.
+    fn hits(v: &[Sample]) -> Vec<Sample> {
+        v.iter().copied().filter(|s| s.hit > 0.5).collect()
+    }
+
+    fn options() -> TraceOptions {
+        TraceOptions {
+            reflections: true,
+            lighting: true,
+            shadows: true,
+            bounces: 2,
+            guard: 4_000_000_000,
+        }
+    }
+
+    #[test]
+    fn a_primary_ray_lands_on_the_floor_and_is_lit() {
+        let scene = room();
+        let tracer = Tracer::new(scene, Environment::default());
+        let out = tracer.trace(&camera(), &options(), 16, 16, 1);
+        let hit = hits(&out);
+        assert_eq!(hit.len(), out.len(), "the room fills the view");
+        for s in &hit {
+            assert!(s.direct.length() > 0., "lit");
+            assert!((0. ..=1.).contains(&s.occlusion));
+            assert!(s.distance > 0.);
+        }
+        // The centre pixel looks straight ahead and must land on the wall.
+        let centre = out[8 * 16 + 8];
+        assert_eq!(centre.hit, 1.);
+        assert!((centre.distance - 14.).abs() < 1., "{}", centre.distance);
+    }
+
+    #[test]
+    fn a_sky_ray_reports_no_hit_so_the_compositor_leaves_it_alone() {
+        let scene = room();
+        let tracer = Tracer::new(scene, Environment::default());
+        let mut cam = camera();
+        cam.position = v3(0., 100., 0.);
+        cam.forward = v3(0., 1., 0.);
+        cam.up = v3(0., 0., 1.);
+        let out = tracer.trace(&cam, &options(), 4, 4, 1);
+        for s in &out {
+            assert_eq!(s.hit, 0.);
+            assert_eq!(s.radiance, V3::ZERO);
+        }
+    }
+
+    #[test]
+    fn disabling_shadows_removes_the_occlusion_term() {
+        let scene = room();
+        let tracer = Tracer::new(scene, Environment::default());
+        let lit = hits(&tracer.trace(&camera(), &options(), 8, 8, 1));
+        let mut no_shadow = options();
+        no_shadow.shadows = false;
+        let unshadowed = hits(&tracer.trace(&camera(), &no_shadow, 8, 8, 1));
+        assert!(
+            lit.iter().any(|s| s.occlusion < 0.9),
+            "the room shadows itself"
+        );
+        assert!(unshadowed.iter().all(|s| s.occlusion > 0.99));
+        assert!(!lit.is_empty() && !unshadowed.is_empty());
+    }
+
+    #[test]
+    fn each_term_can_be_switched_off_independently() {
+        let scene = room();
+        let tracer = Tracer::new(scene, Environment::default());
+        let mut o = options();
+        o.reflections = false;
+        let no_reflect = tracer.trace(&camera(), &o, 8, 8, 1);
+        assert!(no_reflect.iter().all(|s| s.reflection == V3::ZERO));
+        o = options();
+        o.lighting = false;
+        let no_light = tracer.trace(&camera(), &o, 8, 8, 1);
+        assert!(no_light.iter().all(|s| s.direct == V3::ZERO));
+        assert!(no_light.iter().all(|s| s.indirect == V3::ZERO));
+        assert!(
+            no_light.iter().any(|s| s.reflection.length() > 0.),
+            "reflections still work with diffuse lighting off"
+        );
+        o = options();
+        o.lighting = false;
+        o.reflections = false;
+        let nothing = tracer.trace(&camera(), &o, 8, 8, 1);
+        assert!(nothing.iter().all(|s| s.radiance == V3::ZERO));
+    }
+
+    #[test]
+    fn more_bounces_never_remove_light() {
+        let scene = room();
+        let tracer = Tracer::new(scene, Environment::default());
+        let mut o = options();
+        o.bounces = 0;
+        let none = tracer.trace(&camera(), &o, 8, 8, 1);
+        o.bounces = 4;
+        let many = tracer.trace(&camera(), &o, 8, 8, 1);
+        for (a, b) in hits(&none).iter().zip(hits(&many).iter()) {
+            assert!(b.indirect.length() + 1e-6 >= a.indirect.length());
+        }
+        assert!(hits(&many).iter().any(|s| s.indirect.length() > 0.001));
+    }
+
+    #[test]
+    fn the_shadow_term_matches_a_ray_cast_by_hand() {
+        // One floor triangle and a blocker directly under the sun above it:
+        // the floor point is in shadow only where the blocker sits.
+        let sun = v3(0., 1., 0.);
+        let tris = vec![
+            Triangle {
+                a: v3(-10., 0., -10.),
+                b: v3(10., 0., -10.),
+                c: v3(10., 0., 10.),
+                normal: sun,
+                material: 0,
+            },
+            Triangle {
+                a: v3(-10., 0., 10.),
+                b: v3(10., 0., 10.),
+                c: v3(-10., 0., -10.),
+                normal: sun,
+                material: 0,
+            },
+            // 2x2 blocker at y = 1 over x in [-1, 1], z in [-1, 1].
+            Triangle {
+                a: v3(-1., 1., -1.),
+                b: v3(1., 1., -1.),
+                c: v3(1., 1., 1.),
+                normal: sun,
+                material: 1,
+            },
+            Triangle {
+                a: v3(-1., 1., -1.),
+                b: v3(1., 1., 1.),
+                c: v3(-1., 1., 1.),
+                normal: sun,
+                material: 1,
+            },
+        ];
+        let scene = std::sync::Arc::new(Scene {
+            bvh: Some(Bvh::build(tris)),
+            materials: vec![
+                Material::new(V3::splat(0.5), 0.),
+                Material::new(V3::splat(0.5), 0.),
+            ],
+            stats: Default::default(),
+        });
+        let tracer = Tracer::new(
+            scene,
+            Environment {
+                sun_direction: sun,
+                ..Environment::default()
+            },
+        );
+        let bvh = tracer.scene().bvh.as_ref().unwrap();
+        let mut rng = Rng::new(7);
+        let mut rays = 0;
+        // Under the blocker: shadowed.
+        let under = tracer.sun_visibility(bvh, v3(0., 0., 0.), sun, 0., &mut rng, &mut rays);
+        assert_eq!(under, 0.);
+        // Well outside it: lit.
+        let outside = tracer.sun_visibility(bvh, v3(6., 0., 6.), sun, 0., &mut rng, &mut rays);
+        assert_eq!(outside, 1.);
+    }
+
+    #[test]
+    fn packing_carries_every_channel_including_the_hit_mask() {
+        let samples = vec![
+            Sample {
+                reflection: v3(1., 2., 3.),
+                indirect: v3(0.5, 0., 0.),
+                occlusion: 0.25,
+                distance: 12.,
+                hit: 1.,
+                ..Sample::default()
+            },
+            Sample::default(),
+        ];
+        let mut out = [0.0f32; 8];
+        Tracer::pack(&samples, &mut out);
+        assert_eq!(out[0], 6.);
+        assert_eq!(out[1], 0.5);
+        assert_eq!(out[2], 0.25);
+        assert_eq!(out[3], 12.);
+        assert_eq!(out[7], -1.);
+    }
+
+    #[test]
+    fn row_splitting_covers_every_pixel_exactly_once() {
+        let scene = room();
+        let tracer = Tracer::new(scene, Environment::default());
+        let mut out = vec![Sample::default(); 64];
+        tracer.trace_rows(&camera(), &options(), 8, 8, 1, 0, 4, &mut out);
+        tracer.trace_rows(&camera(), &options(), 8, 8, 1, 4, 8, &mut out);
+        // Every pixel in the left half of the lower rows is floor or wall.
+        assert!(out.iter().all(|s| s.hit > 0.5));
+        let _ = &out;
+    }
+
+    #[test]
+    fn the_environment_gets_brighter_towards_the_sun() {
+        let env = Environment::default();
+        let towards = env.escape(env.sun_direction, f32::INFINITY);
+        let away = env.escape(-env.sun_direction, f32::INFINITY);
+        assert!(towards.length() > away.length() * 2.);
+    }
+}

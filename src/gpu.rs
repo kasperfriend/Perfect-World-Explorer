@@ -4058,6 +4058,52 @@ fn window_hwnd(_window: &winit::window::Window) -> Result<*mut std::ffi::c_void,
     Err("frame generation requires a Win32 window".to_string())
 }
 
+/// The light the Imaginator's tracer sees, in the terms its own path tracer
+/// uses, taken from the same values this frame's shaders were given.
+///
+/// The sun *direction* is the authored material direction (the EC-BSD vector,
+/// the same one `receiving_model_frame` hands the model shader) — not the
+/// animated celestial disc curve. That is the light the raster path actually
+/// shades with, so a traced shadow lands where the raster highlight is.
+fn imaginator_environment(camera: &Camera) -> crate::imaginator::tracer::Environment {
+    let light = camera
+        .regional_light
+        .unwrap_or_else(neutral_regional_light);
+    // With a region record, `toward_sun` is the authored EC-BSD direction, the
+    // same vector the sky azimuth and the tree lighting read. Without one the
+    // neutral fallback's `[0, -1, 0]` describes a light travelling down from
+    // above rather than a point to trace towards, so the sun is taken to be
+    // straight up — which is what that fallback stands for.
+    let toward_sun = if camera.regional_light.is_some() {
+        let v = glam::Vec3::from_array(light.toward_sun).normalize_or_zero();
+        if v.length_squared() > 0.5 { v } else { glam::Vec3::Y }
+    } else {
+        glam::Vec3::Y
+    };
+    let daylight = crate::environment::daylight(camera.time_of_day);
+    // The client's own ambient/diffuse triple is authored in the region record;
+    // at night it is the same record scaled by the day weight, which is exactly
+    // what every material shader in the viewer does with it.
+    let scale = |c: [f32; 3], k: f32| {
+        crate::imaginator::math::v3(c[0] * k, c[1] * k, c[2] * k)
+    };
+    let sun = scale(light.diffuse, 0.35 + 0.65 * daylight);
+    let ambient = scale(light.ambient, 0.35 + 0.65 * daylight);
+    let fog = camera.active_fog();
+    crate::imaginator::tracer::Environment {
+        sun_direction: crate::imaginator::math::v3(toward_sun.x, toward_sun.y, toward_sun.z),
+        sun_color: if sun.length_squared() > 0. { sun } else { crate::imaginator::math::v3(0.9, 0.9, 0.9) },
+        // Sky ambient: the region's ambient is an omnidirectional term, so the
+        // up hemisphere takes it whole and the horizon takes a little more,
+        // which is what makes an open sky read brighter than a corner.
+        sky_up: ambient,
+        sky_horizon: ambient * 1.25,
+        ground: ambient * 0.25,
+        fog: crate::imaginator::math::v3(fog.color[0], fog.color[1], fog.color[2]),
+        fog_distance: if fog.enabled { fog.end.max(1.) } else { 20000. },
+    }
+}
+
 /// The neutral light a map gets when no environment record answers: full white
 /// ambient and diffuse from straight above, which is the every-material default
 /// the client's own shaders fall back to. Geometry — and therefore every effect
@@ -4246,6 +4292,11 @@ pub fn run(
         .get_default_config(&adapter, size.width.max(1), size.height.max(1))
         .ok_or("surface configuration unavailable")?;
     config.format = surface_format;
+    // The Imaginator reads the finished frame back through a sampled view and
+    // then writes it again, so the swapchain has to allow binding as well as
+    // rendering. `TEXTURE_BINDING` on a surface texture costs nothing and is the
+    // only extra usage any compositor in this file needs.
+    config.usage |= wgpu::TextureUsages::TEXTURE_BINDING;
     if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
         config.present_mode = wgpu::PresentMode::Mailbox;
     } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
@@ -4289,6 +4340,32 @@ pub fn run(
         &mut residency,
         vegetation_authored_mips,
     )?;
+    // The Imaginator's capture has to happen *here*: it is the last moment the
+    // host still owns the resident tree meshes (the GPU tree path clears them
+    // inside `Renderer::new`) and the streaming object set, and the module only
+    // wants a triangle soup it owns outright, so the borrow ends at this call.
+    //
+    // The module does not exist yet, so the settings decide whether it is worth
+    // the walk; a module that is off costs one settings read and nothing else.
+    let imaginator_scene = crate::imaginator::Imaginator::saved_active(&t.element).then(|| {
+        let grid = crate::navigation::MapSpace {
+            width: t.width,
+            height: t.height,
+            spacing: t.grid_spacing,
+            heights: t.heights.clone(),
+        };
+        crate::imaginator::capture::capture(
+            &crate::imaginator::capture::Sources {
+                map: &grid,
+                water: &t.water,
+                objects: &t.objects,
+                ornaments: &t.objects.ornaments,
+                scene: &t.scene,
+                trees: Some(&t.trees),
+            },
+            crate::imaginator::capture::CaptureBudget::default(),
+        )
+    });
     let mut renderer = Renderer::new(
         device,
         queue,
@@ -4455,6 +4532,21 @@ pub fn run(
         &t.scene,
         whole_ornaments.to_vec(),
     );
+    // Hand the module the capture taken above, its world identity and the light
+    // this frame's shaders run with, so its page and its tracer agree with what
+    // is on screen from the first frame.
+    renderer.modules.set_imaginator_world(
+        whole_element
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("the loaded world")
+            .to_string(),
+        imaginator_environment(&camera),
+    );
+    if let Some(scene) = imaginator_scene {
+        renderer.modules.adopt_imaginator_scene(scene);
+    }
+
     // Add-ons get read access to the world's effect catalogue the moment the
     // world has one: the same grouped index the World tab's census uses, so a
     // module can look up what the map ships without opening the archive
@@ -4520,6 +4612,11 @@ pub fn run(
         Some(window.scale_factor() as f32),
         None,
     );
+    // The Imaginator's own GPU objects: its composite pipelines and a hardware
+    // probe. Both are built here, once, because a device and the frame's format
+    // are exactly what they need; a module that is switched off never draws.
+    renderer.modules.imaginator().init(&renderer.device, format);
+    renderer.modules.imaginator().sync_worker();
     let mut egui_renderer = egui_wgpu::Renderer::new(&renderer.device, format, None, 1);
     let map_texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("live minimap"),
@@ -5749,6 +5846,59 @@ pub fn run(
                                 }
                             } else {
                                 render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                            }
+                            // The Imaginator composites here: the scene is
+                            // finished and upscaled, nothing has encoded for
+                            // presentation yet, and the UI, the display ramp and
+                            // frame generation have not read the frame. One
+                            // encoder, dispatched and blitted before the present
+                            // encode runs.
+                            let environment = imaginator_environment(&camera);
+                            renderer
+                                .modules
+                                .imaginator()
+                                .set_environment(environment);
+                            renderer.modules.imaginator().poll(&renderer.device, &renderer.queue);
+                            // Frame generation owns the composition image, so
+                            // its format and usage are the generator's business,
+                            // not this compositor's. Rather than guess, the traced
+                            // terms wait for a frame the viewer composes itself.
+                            if renderer.modules.imaginator_active() && fg_views.is_none() {
+                                let (fw, fh) = (config.width.max(1), config.height.max(1));
+                                let d = camera.direction();
+                                // The camera's view basis, then the same X flip
+                                // `Camera::projection_matrix` applies. Without
+                                // that flip the traced image would be mirrored
+                                // against the raster image it is composited onto:
+                                // reversing the client's left-handed world puts
+                                // world +X on the *left* of the screen, and a
+                                // ray through image-left has to agree.
+                                let view_right = d.cross(glam::Vec3::Y).normalize_or_zero();
+                                let up = view_right.cross(d).normalize_or_zero();
+                                let right = -view_right;
+                                let params = renderer.modules.imaginator().frame_params(
+                                    crate::imaginator::math::v3(camera.pos.x, camera.pos.y, camera.pos.z),
+                                    crate::imaginator::math::v3(d.x, d.y, d.z),
+                                    crate::imaginator::math::v3(right.x, right.y, right.z),
+                                    crate::imaginator::math::v3(up.x, up.y, up.z),
+                                    camera.lens().fov_y_radians,
+                                    (fw, fh),
+                                    camera.far,
+                                );
+                                let mut encoder = renderer
+                                    .device
+                                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                        label: Some("imaginator composite"),
+                                    });
+                                renderer.modules.imaginator().composite(
+                                    &renderer.device,
+                                    &renderer.queue,
+                                    &mut encoder,
+                                    scene_view,
+                                    (fw, fh),
+                                    params,
+                                );
+                                renderer.queue.submit(Some(encoder.finish()));
                             }
                             // When frame generation separates the UI from the scene,
                             // finish any gamma ramp / UNORM encode into `final_view`

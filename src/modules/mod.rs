@@ -8,6 +8,7 @@ mod package;
 mod populator;
 mod walker;
 
+use crate::imaginator::{capture, tracer, Imaginator};
 use crate::{model_draw_gpu, navigation::MapSpace, water::WaterArea};
 use glam::Vec3;
 use package::{Package, Registry};
@@ -32,6 +33,9 @@ pub struct Modules {
     walker: Walker,
     librarian: librarian::Librarian,
     populator: Populator,
+    /// The ray-tracing add-on. Owns its capture, its tracers and its settings;
+    /// the host only hands it the world, the camera and one frame-tail call.
+    imaginator: Imaginator,
     packages: Registry,
     selected: usize,
     /// The world's effect catalogue, handed over by the host when the GFX
@@ -48,6 +52,7 @@ impl Default for Modules {
             walker: Walker::default(),
             librarian: librarian::Librarian::new(PathBuf::new()),
             populator: Populator::default(),
+            imaginator: Imaginator::new(&PathBuf::new()),
             packages: Registry::discover(package::default_root()),
             selected: 0,
             effect_catalog: None,
@@ -68,8 +73,9 @@ impl Modules {
         let populator = Populator::new(element.clone(), map.clone());
         Self {
             walker: Walker::with_host(element.clone(), map, water, scene, ornaments),
-            librarian: librarian::Librarian::new(element),
+            librarian: librarian::Librarian::new(element.clone()),
             populator,
+            imaginator: Imaginator::new(&element),
             packages: Registry::discover(package::default_root()),
             selected: 0,
             effect_catalog: None,
@@ -95,6 +101,9 @@ impl Modules {
             "walker" => self.walker.is_active(),
             "populator" => self.populator.is_active(),
             "librarian" => self.librarian.active(),
+            // The Imaginator's enabled state *is* its tracer switch: a module
+            // whose every term is off draws nothing, so it reads as off.
+            "imaginator" => self.imaginator.active(),
             _ => false,
         }
     }
@@ -256,9 +265,18 @@ impl Modules {
                 .weak(),
         );
         ui.add_space(8.);
+        // The page is only open while it is the selected one, and a closed page
+        // stops the expensive preview readbacks even though the tracer keeps
+        // running.
+        if installed.id != "imaginator" {
+            self.imaginator.page_closed();
+        }
         match installed.id.as_str() {
             "walker" => self.walker_module_ui(ui, spawn, yaw),
             "populator" => self.populator_module_ui(ui, spawn),
+            "imaginator" => {
+                self.imaginator.ui(ui);
+            }
             "librarian" => {
                 let active = self.librarian.active();
                 if ui
@@ -485,6 +503,9 @@ impl Modules {
         // A module may ask the host for a one-shot camera move (the Populator's
         // "go to the nearest placement"). The Walker wins when it drives the
         // camera; otherwise the request is honoured for that frame.
+        // The tracer's worker follows the settings switch, not the frame loop, so
+        // flipping it on the page starts and stops the CPU thread at the click.
+        self.imaginator.sync_worker();
         let request = self.populator.take_camera_request();
         match self.walker.update(delta, input_enabled, keys, yaw, pitch) {
             Some(position) => Some(position),
@@ -520,6 +541,49 @@ impl Modules {
     /// which is what a world reload wants.
     pub fn set_effect_catalog(&mut self, catalog: crate::gfx_catalog::Catalog) {
         self.effect_catalog = Some(catalog);
+    }
+
+    /// Whether the Imaginator wants the frame tail this frame, so the host can
+    /// skip building the camera parameters and the encoder entirely.
+    pub fn imaginator_active(&self) -> bool {
+        self.imaginator.active()
+    }
+
+    /// The Imaginator's own state, for the frame loop's three calls: capture,
+    /// composite and housekeeping. The host never reaches inside it.
+    pub fn imaginator(&mut self) -> &mut Imaginator {
+        &mut self.imaginator
+    }
+
+    /// Tell the Imaginator which world is loaded and what its light looks like,
+    /// and ask it for a capture.
+    ///
+    /// The world's own geometry is handed over separately, by
+    /// [`Self::offer_imaginator_world`], because the host can only lend it while
+    /// it is not streaming.
+    pub fn set_imaginator_world(&mut self, label: String, environment: tracer::Environment) {
+        self.imaginator.set_world(label, environment);
+    }
+
+    /// Adopt a capture the host took before the module could ask for one.
+    pub fn adopt_imaginator_scene(&mut self, scene: crate::imaginator::bvh::SharedScene) {
+        self.imaginator.adopt_scene(scene);
+    }
+
+    /// Offer the loaded world to the Imaginator so it can take its capture.
+    ///
+    /// This is the *only* moment the module ever sees engine types, and it
+    /// copies what it needs: nothing here hands out a borrow that outlives the
+    /// call, so streaming, eviction and reloading carry on untouched. The host
+    /// calls it at load time, and again whenever it is willing to pay for a
+    /// fresh capture — the module asks through
+    /// [`Imaginator::wants_capture`](crate::imaginator::Imaginator::wants_capture).
+    pub fn offer_imaginator_world(&mut self, sources: &capture::Sources<'_>) {
+        if !self.imaginator.wants_capture() {
+            return;
+        }
+        self.imaginator
+            .capture_now(capture::CaptureBudget::default(), sources);
     }
 
     pub fn update_walker_audio(&mut self, enabled: bool, volume: f32) {
