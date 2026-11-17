@@ -160,6 +160,10 @@ struct Material { albedo_specular: vec4<f32> };
 // each was a single luminance, and storing luminance is exactly what made
 // reflections invisible and every lit surface flat white.
 @group(0) @binding(5) var out_tex: texture_storage_2d<rgba32float, write>;
+// Punctual lights from the world: `xyz` position, `w` range;
+// `rgb` colour, `w` unused.
+struct Light { position_range: vec4<f32>, colour: vec4<f32> };
+@group(0) @binding(6) var<storage, read> lights: array<Light>;
 
 const TERM_REFLECTIONS: u32 = 1u;
 const TERM_LIGHTING: u32 = 2u;
@@ -351,6 +355,27 @@ fn occluded(ro: vec3<f32>, rd: vec3<f32>, tmax: f32) -> bool {
  return false;
 }
 
+/// Light from one punctual source at `point` along `normal`, windowed to its
+/// range, and whether nothing blocks the way to it.
+fn lamp_at(light: Light, point: vec3<f32>, normal: vec3<f32>, seed: ptr<function, u32>, terms: u32) -> vec3<f32> {
+ let to_light = light.position_range.xyz - point;
+ let d2 = dot(to_light, to_light);
+ let r2 = light.position_range.w * light.position_range.w;
+ if d2 >= r2 || d2 <= 1e-8 { return vec3<f32>(0.0); }
+ let d = sqrt(d2);
+ let dir = to_light / d;
+ let cos = max(dot(normal, dir), 0.0);
+ if cos <= 0.0 { return vec3<f32>(0.0); }
+ if (terms & TERM_SHADOWS) != 0u {
+  let origin = point + normal * 0.02 + dir * 0.02;
+  if occluded(origin, dir, d * 0.999) { return vec3<f32>(0.0); }
+ }
+ // Same windowed inverse-square as the CPU tracer, so both agree.
+ let window = 1.0 - d2 / r2;
+ let falloff = window * window / (d2 + 1.0);
+ return light.colour.rgb * (cos * falloff);
+}
+
 fn material_of(index: u32) -> vec4<f32> {
  if index >= arrayLength(&mats) { return vec4<f32>(0.5, 0.5, 0.5, 0.0); }
  return mats[index].albedo_specular;
@@ -419,6 +444,7 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
  var seed = pcg(id.x * 1973u + id.y * 9277u + p.config.y * 26699u);
  var reflection = vec3<f32>(0.0);
  var indirect = vec3<f32>(0.0);
+ var lamp_light = vec3<f32>(0.0);
  var visibility = 0.0;
  var hits = 0.0;
  let samples = max(p.config.z, 1u);
@@ -444,6 +470,12 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
    vis = sun_visibility(point, normal, &seed);
   }
   visibility = visibility + vis;
+  // Lamps and fires, in colour, each shadowed by its own ray.
+  if (terms & TERM_LIGHTING) != 0u {
+   for (var li = 0u; li < arrayLength(&lights); li = li + 1u) {
+    lamp_light = lamp_light + mat.rgb * lamp_at(lights[li], point, normal, &seed, terms);
+   }
+  }
   if (terms & TERM_LIGHTING) != 0u {
    var weight = mat.rgb;
    var origin = point + normal * 0.02;
@@ -495,7 +527,7 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
   }
  }
  let inv = 1.0 / f32(samples);
- let radiance = (reflection + indirect) * inv;
+ let radiance = (reflection + indirect) * inv + lamp_light * inv;
  // `hits` counts the samples that hit something, so a partially-covered pixel
  // keeps the sky behind it rather than claiming full shadow.
  let shadow = select(-1.0, visibility / max(hits, 1.0), hits > 0.5);
@@ -823,7 +855,8 @@ mod tests {
         // filtering sampler the traced image was read through, and it is gone
         // because `rgba32float` is not filterable without an optional feature.
         let shaders: [(&str, &str, &[u32]); 2] = [
-            ("trace", TRACE, &[0, 1, 2, 3, 4, 5]),
+            // 6 is the punctual-light buffer.
+            ("trace", TRACE, &[0, 1, 2, 3, 4, 5, 6]),
             ("composite", COMPOSITE, &[0, 1, 3, 4]),
         ];
         for (name, src, bindings) in shaders {

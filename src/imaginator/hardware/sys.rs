@@ -285,11 +285,49 @@ pub struct ID3D12GraphicsCommandList4Vtbl {
         UINT,
         *const c_void,
     ),
+    pub BuildRaytracingAccelerationStructurePostbuildInfo: *const c_void,
+    pub CopyRaytracingAccelerationStructure: *const c_void,
+    /// Slot 75: binds the ray-tracing pipeline state object.
+    pub SetPipelineState1: unsafe extern "system" fn(*mut c_void, *mut c_void),
+    /// Slot 76: launches the shader that was bound with `SetPipelineState1`.
+    pub DispatchRays: unsafe extern "system" fn(*mut c_void, *const D3D12_DISPATCH_RAYS_DESC),
 }
 
 #[repr(C)]
 pub struct ID3D12GraphicsCommandList4 {
     pub lpVtbl: *mut ID3D12GraphicsCommandList4Vtbl,
+}
+
+/// `D3D12_DISPATCH_RAYS_DESC`: the three shader tables and the launch size.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_DISPATCH_RAYS_DESC {
+    pub RayGenerationShaderRecord: D3D12_GPU_VIRTUAL_ADDRESS_RANGE,
+    pub MissShaderTable: D3D12_SHADER_TABLE,
+    pub HitGroupTable: D3D12_SHADER_TABLE,
+    pub CallableShaderTable: D3D12_SHADER_TABLE,
+    pub Width: UINT,
+    pub Height: UINT,
+    pub Depth: UINT,
+}
+
+/// `D3D12_GPU_VIRTUAL_ADDRESS_RANGE` (a start and a length, no stride).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_GPU_VIRTUAL_ADDRESS_RANGE {
+    pub StartAddress: GpuAddress,
+    pub SizeInBytes: u64,
+}
+
+/// `D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE` as a *shader table*: unlike the
+/// vertex-buffer form above it carries a size as well, because the table's
+/// records are read by the traversal as a contiguous range.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct D3D12_SHADER_TABLE {
+    pub StartAddress: GpuAddress,
+    pub SizeInBytes: u64,
+    pub StrideInBytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -437,11 +475,14 @@ mod tests {
             std::mem::size_of::<ID3D12Device5Vtbl>(),
             (DEVICE5_PREBUILD_INFO_SLOT + 1) * std::mem::size_of::<usize>()
         );
-        // The declared list vtable stops on the build call (slot 72), one slot
-        // wider than the prefix suggests.
+        // The list vtable now runs through `DispatchRays` (slot 76) because the
+        // hardware tracer dispatches rays rather than only building structures.
         assert_eq!(
             std::mem::size_of::<ID3D12GraphicsCommandList4Vtbl>(),
-            (GCL4_BUILD_AS_SLOT + 1) * std::mem::size_of::<usize>()
+            GCL4_SLOTS * std::mem::size_of::<usize>()
         );
+        // `DispatchRays` is the last member the header declares, so the struct
+        // has to end exactly there.
+        assert_eq!(GCL4_SLOTS - 1, 76, "DispatchRays is slot 76 of 77");
     }
 }

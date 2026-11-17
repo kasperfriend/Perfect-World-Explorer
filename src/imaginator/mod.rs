@@ -269,16 +269,18 @@ impl Imaginator {
 
     /// Record the world's identity for the page, and ask for its geometry.
     ///
+    /// The geometry is always captured, even when the module starts switched off.
     /// The host offers the world exactly once — at load, while it still owns the
-    /// live terrain, the resident scenery and the tree meshes — so a module that
-    /// is switched off does not spend a map's worth of triangles on an image
-    /// nobody draws. Turning the tracer on later therefore takes effect on the
-    /// next map load, which is what the page says rather than pretending.
+    /// live terrain, the resident scenery and the tree meshes — so gating the
+    /// capture on `active()` meant a launch that started off could never trace:
+    /// switching the tracer on afterwards found an empty scene and the page had
+    /// to ask for a world reload. Capturing is a few hundred milliseconds against
+    /// a map load that already takes a minute, and it makes the switch work.
     pub fn set_world(&mut self, label: String, environment: tracer::Environment) {
         if self.map_label != label {
             self.map_label = label;
             self.capture_state = CaptureState::Requested;
-            self.want_capture = self.settings.active();
+            self.want_capture = true;
         }
         self.environment = environment;
     }
@@ -463,7 +465,7 @@ impl Imaginator {
             let running = running.clone();
             let frames = frames.clone();
             let scene = self.scene.clone();
-            let environment = self.environment;
+            let environment = self.environment.clone();
             std::thread::Builder::new()
                 .name("imaginator-software".into())
                 .spawn(move || {
@@ -584,7 +586,7 @@ impl Imaginator {
         let generation = self.requests;
         let request = TraceRequest {
             camera,
-            environment: self.environment,
+            environment: self.environment.clone(),
             options: tracer::TraceOptions::from_settings(settings),
             width: extent.0,
             height: extent.1,
@@ -644,7 +646,7 @@ impl Imaginator {
         extent: (u32, u32),
         scene_limit: f32,
     ) -> GpuParams {
-        let env = self.environment;
+        let env = self.environment.clone();
         let aspect = extent.0.max(1) as f32 / extent.1.max(1) as f32;
         gpu::params(
             eye,
@@ -662,6 +664,35 @@ impl Imaginator {
             &self.settings,
             scene_limit,
         )
+    }
+
+    /// The punctual lights a trace should read this frame, nearest first and
+    /// bounded by [`composite::MAX_LIGHTS`].
+    ///
+    /// A shader casts one shadow ray per entry, so the cap is what keeps a
+    /// lamp-lit street from costing more than the primary trace. Sorting by
+    /// distance from the eye is the cheapest sensible pick: the lights that
+    /// matter are the ones near what the camera is looking at.
+    fn gpu_lights(&self, eye: V3) -> Vec<composite::GpuLight> {
+        let mut sorted: Vec<&tracer::PointLight> = self.environment.lights.iter().collect();
+        sorted.sort_by(|a, b| {
+            let da = (a.position - eye).length_squared();
+            let db = (b.position - eye).length_squared();
+            da.total_cmp(&db)
+        });
+        sorted
+            .iter()
+            .take(composite::MAX_LIGHTS)
+            .map(|light| composite::GpuLight {
+                position_range: [
+                    light.position.x,
+                    light.position.y,
+                    light.position.z,
+                    light.range,
+                ],
+                colour: [light.colour.x, light.colour.y, light.colour.z, 1.],
+            })
+            .collect()
     }
 
     /// Composite one frame. Returns false when there was nothing to do.
@@ -751,9 +782,14 @@ impl Imaginator {
             }
             TracerKind::Off => return false,
         }
+        // The world's lamps, published once per frame for whichever tracer runs.
+        // Built before the mutable borrow: the list is a read of `self`.
+        let eye = V3::from_array([params.eye[0], params.eye[1], params.eye[2]]);
+        let lights = self.gpu_lights(eye);
         let Some(composite) = self.composite.as_mut() else {
             return false;
         };
+        composite.set_lights(queue, &lights);
         if composite.triangle_count() == 0 {
             self.status = "no geometry captured yet".into();
             return false;
@@ -1017,23 +1053,23 @@ impl Imaginator {
             .weak(),
         );
         ui.horizontal(|ui| {
-            // A capture walks the whole resident world, so the host takes it
-            // where it still owns the live terrain, the resident scenery and the
-            // tree meshes: at load time. There is no second window into that
-            // geometry later, so the button that used to say "recapture now"
-            // would only ever ask again for a moment that has passed; instead it
-            // says what actually brings new geometry in, and the status line
-            // says which world the triangles belong to.
+            // The geometry is captured while the map loads, whether or not the
+            // module is switched on, so switching the tracer on works on the
+            // world already loaded. The button therefore only reports what is in
+            // hand; there is nothing to reload for a first capture.
             if ui
-                .button("Reload the world to recapture")
+                .button("Captured geometry")
                 .on_hover_text(
-                    "The captured geometry is a snapshot taken while the map loads, because the \
-                     streaming object set and the tree meshes only exist then. Loading the map \
-                     again takes a fresh snapshot.",
+                    "The traced geometry is a snapshot taken while the map loads, because the \
+                     streaming object set and the tree meshes only exist then. It is captured \
+                     even while this module is off, so switching a tracer on needs no reload.",
                 )
                 .clicked()
             {
-                self.status = "the capture is taken when a map loads: reload the world".into();
+                self.status = format!(
+                    "{} triangles captured from {}",
+                    self.captured_triangles, self.map_label
+                );
             }
             if ui.button("Save settings").clicked() {
                 let _ = self.save();
@@ -1108,7 +1144,8 @@ impl Drop for Imaginator {
 
 #[cfg(test)]
 mod tests {
-    use super::row_bands;
+    use super::{row_bands, Imaginator};
+    use crate::imaginator::tracer;
 
     #[test]
     fn bands_cover_every_row_exactly_once() {
@@ -1168,6 +1205,26 @@ mod tests {
     }
 
     /// The geometry from the crash report: a 344-row trace split 16 ways.
+    /// Switching a tracer on must work on the world that is already loaded.
+    ///
+    /// Regression: the module started reporting `off` and capture was gated on
+    /// `active()`, so a launch that began switched off captured nothing at all —
+    /// the log said "0 triangles captured" and the page told the user to reload
+    /// the world.
+    #[test]
+    fn geometry_is_captured_even_though_the_module_starts_off() {
+        let mut module = Imaginator::new(std::path::Path::new("Modules"));
+        assert!(
+            !module.settings().active(),
+            "the module starts switched off"
+        );
+        module.set_world("world_1".into(), tracer::Environment::default());
+        assert!(
+            module.want_capture,
+            "the world's geometry has to be captured on the one chance we get"
+        );
+    }
+
     #[test]
     fn the_344_row_case_keeps_its_last_band() {
         let bands = row_bands(344, (344 + 15) / 16);

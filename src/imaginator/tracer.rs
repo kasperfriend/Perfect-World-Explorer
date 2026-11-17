@@ -25,7 +25,7 @@ use super::settings::{ImaginatorSettings, MAX_BOUNCES};
 
 /// Physically-shaped description of the light in the scene, provided by the core
 /// from the same values its own shaders use.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Environment {
     /// Direction *towards* the sun (unit).
     pub sun_direction: V3,
@@ -41,6 +41,10 @@ pub struct Environment {
     pub fog: V3,
     /// Distance beyond which nothing is traced and fog takes over.
     pub fog_distance: f32,
+    /// Punctual lights near the camera, as the world's own scene-light grid
+    /// reports them. Bounded by the host before it arrives here: a shadow ray
+    /// per light per sample makes the count the dominant cost.
+    pub lights: Vec<PointLight>,
 }
 
 impl Default for Environment {
@@ -53,6 +57,7 @@ impl Default for Environment {
             ground: V3::splat(0.08),
             fog: V3::splat(0.4),
             fog_distance: 20000.,
+            lights: Vec::new(),
         }
     }
 }
@@ -78,6 +83,51 @@ impl Environment {
         } else {
             radiance
         }
+    }
+}
+
+/// A punctual light from the world: a lamp, a fire, a lit window.
+///
+/// The client stores these per scene-light cell with a position, a range and a
+/// diffuse colour. They are the lights the raster path draws, so the tracer
+/// shadows and illuminates with the same ones, which is what makes a lamp's
+/// light and its shadow agree with the lamp the artist placed.
+#[derive(Clone, Copy, Debug)]
+pub struct PointLight {
+    pub position: V3,
+    /// Beyond this distance the light contributes nothing.
+    pub range: f32,
+    /// Linear RGB, scaled so a diffuse surface at `range * 0.25` reads like the
+    /// raster path's own lamp.
+    pub colour: V3,
+}
+
+impl PointLight {
+    /// How much light this source delivers at `point` along `normal`, and the
+    /// unit vector pointing at it. Zero outside the range.
+    ///
+    /// A smooth 1/d² falloff windowed to `range`, because a hard cutoff at the
+    /// range boundary shows as a visible sphere. This mirrors the client's
+    /// attenuation shape closely enough that the traced shadows land where the
+    /// raster lamp is painted.
+    pub fn irradiance(&self, point: V3, normal: V3) -> (V3, f32) {
+        let to_light = self.position - point;
+        let distance_squared = to_light.length_squared();
+        let range_squared = self.range * self.range;
+        if distance_squared >= range_squared || distance_squared <= 1e-8 {
+            return (V3::ZERO, 0.);
+        }
+        let distance = distance_squared.sqrt();
+        let direction = to_light / distance;
+        let cos = normal.dot(direction).max(0.);
+        if cos == 0. {
+            return (V3::ZERO, 0.);
+        }
+        // Windowed inverse-square: `(1 - d²/r²)²` reaches exactly zero at `range`
+        // with no discontinuity in the value, only in the gradient.
+        let window = 1. - distance_squared / range_squared;
+        let falloff = window * window / (distance_squared + 1.);
+        (self.colour * (cos * falloff), distance)
     }
 }
 
@@ -274,8 +324,32 @@ impl Tracer {
             .environment
             .sky_horizon
             .lerp(self.environment.sky_up, normal.y.max(0.).powf(0.7));
+        // --- punctual lights ---------------------------------------------------
+        // The world's lamps, fires and lit windows. Each gets one shadow ray, so
+        // the count is what the host bounds rather than the loop.
+        let mut lamps = V3::ZERO;
+        if options.lighting {
+            for light in &self.environment.lights {
+                let (radiance, distance) = light.irradiance(point, normal);
+                if radiance.max_component() <= 0. {
+                    continue;
+                }
+                if options.shadows {
+                    let to_light = (light.position - point) / distance.max(1e-6);
+                    let origin = point + normal * bias(hit.t) + to_light * bias(hit.t);
+                    *rays += 1;
+                    if bvh
+                        .closest_hit(&Ray::new(origin, to_light), 0., distance * 0.999)
+                        .is_some()
+                    {
+                        continue;
+                    }
+                }
+                lamps += albedo * radiance;
+            }
+        }
         let direct = if options.lighting {
-            sun_radiance + sky
+            sun_radiance + sky + lamps
         } else {
             V3::ZERO
         };
@@ -669,6 +743,94 @@ mod tests {
         let centre = out[8 * 16 + 8];
         assert_eq!(centre.hit, 1.);
         assert!((centre.distance - 14.).abs() < 1., "{}", centre.distance);
+    }
+
+    /// A lamp must light the surface it can see and lose to geometry between.
+    #[test]
+    fn a_point_light_lights_and_casts_a_shadow() {
+        let scene = room();
+        let camera = camera();
+        let options = options();
+        let bare = {
+            let mut env = Environment::default();
+            env.lights.clear();
+            Tracer::new(scene.clone(), env).trace(&camera, &options, 16, 16, 1)[8 * 16 + 8]
+        };
+        // Put a lamp just in front of the wall the centre pixel looks at, so it
+        // is inside its own range and facing the surface.
+        let lit = {
+            let mut env = Environment::default();
+            env.lights = vec![PointLight {
+                position: v3(0., 1.5, -1.),
+                range: 40.,
+                colour: v3(4., 3., 2.),
+            }];
+            Tracer::new(scene.clone(), env).trace(&camera, &options, 16, 16, 1)[8 * 16 + 8]
+        };
+        assert!(
+            lit.direct.length() > bare.direct.length() * 1.2,
+            "the lamp must add light: {:?} vs {:?}",
+            lit.direct,
+            bare.direct
+        );
+        // Warm lamp colour survives into the result rather than becoming grey.
+        assert!(lit.direct.x > lit.direct.z, "the lamp's colour is carried");
+
+        // Now put a blocker between the lamp and the wall: the light must go. The
+        // camera looks along +x and the lamp sits behind it, so a pane facing the
+        // wall, just in front of the lamp, cuts the path.
+        let mut tris = vec![
+            // The wall the centre ray lands on.
+            Triangle {
+                a: v3(4., -20., -20.),
+                b: v3(4., 20., -20.),
+                c: v3(4., 20., 20.),
+                normal: v3(-1., 0., 0.),
+                material: 0,
+            },
+            Triangle {
+                a: v3(4., -20., -20.),
+                b: v3(4., 20., 20.),
+                c: v3(4., -20., 20.),
+                normal: v3(-1., 0., 0.),
+                material: 0,
+            },
+            // The blocker, a tall pane at x = -0.5 between lamp and wall.
+            Triangle {
+                a: v3(-0.5, -20., -20.),
+                b: v3(-0.5, 20., -20.),
+                c: v3(-0.5, 20., 20.),
+                normal: v3(-1., 0., 0.),
+                material: 0,
+            },
+            Triangle {
+                a: v3(-0.5, -20., -20.),
+                b: v3(-0.5, 20., 20.),
+                c: v3(-0.5, -20., 20.),
+                normal: v3(-1., 0., 0.),
+                material: 0,
+            },
+        ];
+        tris.truncate(tris.len());
+        let blocked_scene = Scene {
+            bvh: Some(Bvh::build(tris)),
+            materials: vec![Material::new(V3::splat(0.6), 0.1)],
+            stats: Default::default(),
+        };
+        let mut env = Environment::default();
+        env.lights = vec![PointLight {
+            position: v3(0., 1.5, -1.),
+            range: 40.,
+            colour: v3(4., 3., 2.),
+        }];
+        let shadowed = Tracer::new(std::sync::Arc::new(blocked_scene), env)
+            .trace(&camera, &options, 16, 16, 1)[8 * 16 + 8];
+        assert!(
+            shadowed.direct.length() < lit.direct.length() * 0.95,
+            "geometry between the lamp and the surface must shadow it: {:?} vs {:?}",
+            shadowed.direct,
+            lit.direct
+        );
     }
 
     #[test]

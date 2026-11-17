@@ -103,6 +103,9 @@ pub struct Composite {
     /// A software result can arrive before the first `render`, and allocating the
     /// target then needs the frame's size, not the trace's.
     frame_extent: (u32, u32),
+    /// The punctual lights the trace shader reads, and how many are live.
+    lights: wgpu::Buffer,
+    light_count: u32,
 }
 
 impl Composite {
@@ -139,6 +142,7 @@ impl Composite {
                     },
                     count: None,
                 },
+                read_entry(6),
             ],
         });
         let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -212,6 +216,15 @@ impl Composite {
                 multiview: None,
             })
         };
+        // Room for `MAX_LIGHTS` puntual lights: position+range and colour, 32 bytes
+        // each. Allocated once at the maximum so a frame never has to reallocate
+        // mid-trace; `light_count` says how many are live.
+        let lights = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("imaginator lights"),
+            size: (MAX_LIGHTS as u64 * 32).max(32),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("imaginator sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -251,7 +264,27 @@ impl Composite {
             // Until a frame says otherwise, the trace's own size is the best
             // estimate of the frame; `render` corrects it on the first frame.
             frame_extent: (1, 1),
+            lights,
+            light_count: 0,
         }
+    }
+
+    /// Publish the punctual lights a trace may read.
+    ///
+    /// Called once per frame from the module, before the trace. The tail of the
+    /// buffer is zeroed rather than left stale, because the shader reads
+    /// `arrayLength` entries: a stale entry would be a light that no longer
+    /// exists, at a position that no longer has a lamp.
+    pub fn set_lights(&mut self, queue: &wgpu::Queue, lights: &[GpuLight]) {
+        let count = lights.len().min(MAX_LIGHTS);
+        let mut packed = [GpuLight::default(); MAX_LIGHTS];
+        packed[..count].copy_from_slice(&lights[..count]);
+        queue.write_buffer(&self.lights, 0, bytemuck::cast_slice(&packed));
+        self.light_count = count as u32;
+    }
+
+    pub fn light_count(&self) -> u32 {
+        self.light_count
     }
 
     pub fn frame_format(&self) -> wgpu::TextureFormat {
@@ -485,6 +518,12 @@ impl Composite {
                     wgpu::BindGroupEntry {
                         binding: 5,
                         resource: wgpu::BindingResource::TextureView(&target.traced_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        // The whole buffer: the shader bounds its loop with
+                        // `arrayLength`, and the tail is zeroed by `set_lights`.
+                        resource: self.lights.as_entire_binding(),
                     },
                 ],
             });
@@ -862,6 +901,25 @@ fn texture(
         view_formats: &[],
     })
 }
+
+/// How many punctual lights a trace may read. The shader loops over this array
+/// once per primary hit and casts a shadow ray per light, so the count is the
+/// dominant cost of a lamp-lit frame; the host publishes the nearest ones.
+pub const MAX_LIGHTS: usize = 32;
+
+/// One entry of the shader's `Light` struct: `xyz` position + `w` range, then
+/// `rgb` colour.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuLight {
+    pub position_range: [f32; 4],
+    pub colour: [f32; 4],
+}
+
+// SAFETY: `#[repr(C)]` over `f32` only, so every bit pattern is valid and the
+// layout matches the WGSL `struct Light`.
+unsafe impl bytemuck::Pod for GpuLight {}
+unsafe impl bytemuck::Zeroable for GpuLight {}
 
 fn upload<T: bytemuck::Pod>(
     device: &wgpu::Device,
