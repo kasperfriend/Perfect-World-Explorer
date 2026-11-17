@@ -355,6 +355,26 @@ jobs:
         with:
           msystem: MINGW32
           install: mingw-w64-i686-gcc
+      - name: Initialize MSVC x64 environment for subsequent steps
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "MSVC x64 tools not found" }
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path -LiteralPath $vcvars)) { throw "MSVC x64 developer environment not found: $vcvars" }
+          $command = "call `"$vcvars`" >nul && set"
+          $environment = & cmd.exe /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw "Could not initialize MSVC x64 environment" }
+          $allowed = @("PATH", "INCLUDE", "LIB", "LIBPATH", "VCToolsInstallDir", "VCINSTALLDIR", "VSINSTALLDIR", "VisualStudioVersion", "WindowsSdkDir", "WindowsSDKVersion", "UniversalCRTSdkDir", "UCRTVersion", "WindowsSDKLibVersion", "DevEnvDir", "VSCMD_VER", "VSCMD_ARG_TGT_ARCH", "VSCMD_ARG_HOST_ARCH")
+          foreach ($line in $environment) {
+            $separator = $line.IndexOf('=')
+            if ($separator -le 0) { continue }
+            $name = $line.Substring(0, $separator)
+            if ($allowed -contains $name) {
+              Add-Content -LiteralPath $env:GITHUB_ENV -Value ($name + '=' + $line.Substring($separator + 1))
+            }
+          }
       - name: Rebuild the embedded 32-bit SpeedTree bridge
         shell: msys2 {0}
         run: g++ -static -O2 -municode tools/speedtree/bake.cpp -o tools/speedtree/speedtree-bake.exe
