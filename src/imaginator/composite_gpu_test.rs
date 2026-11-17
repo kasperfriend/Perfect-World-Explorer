@@ -28,11 +28,29 @@ fn the_composite_changes_a_frame_on_a_real_device() {
         &wgpu::DeviceDescriptor {
             label: Some("Imaginator composite regression"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            // The frame's own device, not a downlevel one: the composite is
+            // built from `Rgba16Float` and `Rgba32Float` targets, and a
+            // downlevel limit set can reject exactly the storage formats the
+            // viewer uses, which would test something the user never runs.
+            required_limits: adapter.limits(),
         },
         None,
     ))
     .expect("a device to composite on");
+
+    // wgpu panics on an uncaptured error, and its own panic message is one line
+    // that a CI annotation truncates. Capture the reason instead, so a validation
+    // mistake names the binding and the format it disliked.
+    let captured: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    {
+        let captured = captured.clone();
+        device.on_uncaptured_error(Box::new(move |error| {
+            if let Ok(mut slot) = captured.lock() {
+                *slot = Some(format!("{error}"));
+            }
+        }));
+    }
 
     const W: u32 = 64;
     const H: u32 = 64;
@@ -127,6 +145,9 @@ fn the_composite_changes_a_frame_on_a_real_device() {
         )
         .expect("the composite must accept an sRGB frame and a packed trace");
     queue.submit(Some(encoder.finish()));
+    if let Some(why) = captured.lock().ok().and_then(|slot| slot.clone()) {
+        panic!("the composite submitted an invalid command: {why}");
+    }
 
     // Read the result back through a linear (non-sRGB) view, so the values
     // compared are the 8-bit ones actually written.

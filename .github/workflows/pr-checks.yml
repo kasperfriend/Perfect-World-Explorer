@@ -261,6 +261,8 @@ jobs:
           WGPU_BACKEND: vulkan
           XDG_RUNTIME_DIR: /tmp
           PW_IMAGINATOR_SYNTHETIC_GPU: "1"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           # The same software Vulkan driver the sRGB window test uses. This runs
           # the real COMPOSITE and BLIT shaders and reads the frame back, which is
@@ -270,8 +272,23 @@ jobs:
           cargo test --locked --bin perfect-world-explorer \
             imaginator::composite_gpu_test 2>&1 | tee "$log"
           if [ "${PIPESTATUS[0]}" -ne 0 ]; then
-            grep -E "panicked at|^test result:|assertion|^error" "$log" | head -20 \
-              | while IFS= read -r line; do echo "::error::$line"; done
+            # Annotations are truncated to one line each, and a wgpu validation
+            # panic puts its reason on the lines *after* "panicked at", so the
+            # context is posted as a PR comment as well.
+            grep -A6 -E "panicked at|^test result:|assertion" "$log" | head -60 \
+              | while IFS= read -r line; do [ -n "$line" ] && echo "::error::$line"; done
+            if [ -n "$PR_NUMBER" ]; then
+              body=$(grep -A12 -E "panicked at|assertion" "$log" | head -80)
+              [ -z "$body" ] && body=$(tail -60 "$log")
+              payload=$(python3 -c 'import json,os,sys;print(json.dumps({"body":"Imaginator composite device test failed:\n```\n"+os.environ["BODY"]+"\n```"}))' BODY="$body" 2>/dev/null || true)
+              if [ -n "$payload" ]; then
+                curl -s -X POST \
+                  -H "Authorization: Bearer $GITHUB_TOKEN" \
+                  -H "Content-Type: application/json" \
+                  -d "$payload" \
+                  "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" >/dev/null || true
+              fi
+            fi
             exit 1
           fi
       - name: Run Phase 1 production shader regressions
