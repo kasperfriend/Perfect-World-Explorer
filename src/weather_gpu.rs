@@ -807,8 +807,9 @@ mod tests {
             1,
             "coverage must publish the particle's own motion"
         );
+        let unjittered = "p.mv_matrix * vec4<f32>(world, 1.0)";
         assert_eq!(
-            SHADER.matches("p.mv_matrix * vec4<f32>(world, 1.0)").count(),
+            SHADER.matches(unjittered).count(),
             1,
             "the vector must come from the unjittered matrix, not the rendered one"
         );

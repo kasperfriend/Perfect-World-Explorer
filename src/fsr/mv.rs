@@ -301,8 +301,9 @@ mod tests {
     /// failure this binding exists to remove.
     #[test]
     fn the_attachment_overrides_the_reprojection_where_it_is_flagged() {
+        let read = "textureLoad(object_mv, clamped, 0)";
         assert_eq!(
-            MV_SHADER.matches("textureLoad(object_mv, clamped, 0)").count(),
+            MV_SHADER.matches(read).count(),
             1,
             "the pass must read the object-motion attachment"
         );
