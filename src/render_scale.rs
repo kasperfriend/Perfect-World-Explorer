@@ -16,8 +16,14 @@
 //! `scaled_extent` is deliberately separate from GPU objects so its bounds are
 //! unit-testable without an adapter.
 
+/// LOD bias for world-model atlas sampling. This branch has no temporal
+/// upscaler path, so keep the legacy zero-bias sampling behavior.
+pub fn mip_bias() -> f32 {
+    0.0
+}
+
 /// Scale a window extent by a percentage and clamp to device limits.
-///
+
 /// `percent` is the persisted 10–200 value (100 = native). Out-of-range inputs
 /// are clamped to 10–200 before use, and each dimension to
 /// `[1, max_dimension]` — a 200% scale on a large window can otherwise exceed
