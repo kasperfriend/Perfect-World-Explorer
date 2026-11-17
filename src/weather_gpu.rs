@@ -219,6 +219,25 @@ fn fogged(color: vec3<f32>, depth: f32) -> vec3<f32> {
     if alpha < 0.003 { discard; }
     return vec4<f32>(fogged(tex.rgb * i.color, i.view_depth), alpha);
 }
+// Depth-only coverage, drawn right after the colour pass into the same depth
+// buffer. Rain and snow never wrote depth, so the shared motion-vector pass
+// reprojected every flake as whatever lay behind it -- the far plane when the
+// fall was against the sky, which makes precipitation swing with the whole
+// parallax of the sky on a fast translation.
+//
+// A flake belongs to the pixel only where its own alpha dominates it, so the
+// threshold is the same effective alpha the colour pass blends (0.52 for rain,
+// 0.82 for snow). A thin streak keeps the background's motion, which is what it
+// looks like; a flake core carries its own distance. What remains uncorrected is
+// the particle's *own* velocity: this depth buffer can only reproduce camera
+// motion, so a falling flake is reprojected as if it stood still and its
+// interpolation smears along the fall line -- which is the streak direction.
+@fragment fn cover(i: Out) -> @location(0) vec4<f32> {
+    if abs(p.clip.y) > 0.5 && (i.world_y - p.clip.x) * p.clip.y < 0.0 { discard; }
+    let tex = textureSample(images, smp, i.uv, i32(i.kind));
+    if tex.a * select(0.52, 0.82, i.kind == 1u) < 0.5 { discard; }
+    return vec4<f32>(0.0);
+}
 "#;
 
 /// The client's snow BMP is grayscale on black without alpha. Convert the
@@ -290,6 +309,9 @@ fn weather_images(element: &Path) -> [image::RgbaImage; 2] {
 
 pub struct WeatherGpu {
     pipeline: wgpu::RenderPipeline,
+    /// Depth-only twin of `pipeline`: same particles, same effective-alpha test,
+    /// depth written and colour masked off.
+    cover_pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
     uniform: wgpu::Buffer,
     _texture: wgpu::Texture,
@@ -497,8 +519,43 @@ impl WeatherGpu {
             multisample: Default::default(),
             multiview: None,
         });
+        // The same particles again, writing depth and nothing else, so the
+        // motion-vector pass sees a flake instead of the far plane behind it.
+        let cover_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("world weather particle coverage"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: "vs",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: "cover",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::empty(),
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview: None,
+        });
         Self {
             pipeline,
+            cover_pipeline,
             bind,
             uniform,
             _texture: texture,
@@ -534,6 +591,7 @@ impl WeatherGpu {
         fog: crate::fog_matrix::Fog,
         clip: [f32; 4],
         selection: WeatherSelection,
+        coverage: bool,
     ) {
         if !selection.rain && !selection.snow {
             return;
@@ -587,14 +645,63 @@ impl WeatherGpu {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind, &[]);
         pass.draw(0..6, 0..480);
+        drop(pass);
+        if !coverage {
+            return;
+        }
+        // Depth-only coverage: the uniform and bind group still hold this
+        // view's particles, so the twin pass rasterises exactly the geometry
+        // the colour pass just blended.
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("world precipitation coverage"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.cover_pipeline);
+        pass.set_bind_group(0, &self.bind, &[]);
+        pass.draw(0..6, 0..480);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{pack_water_masks, profile_lanes, snow_luminance_mask};
+    use super::{pack_water_masks, profile_lanes, snow_luminance_mask, SHADER};
     use crate::client_weather::{RAIN, SNOW, SNOW_SPEED_SCALE};
     use crate::water::WaterArea;
+
+    /// Depth-only coverage is what lets the motion-vector pass see a flake at
+    /// all, so the module has to keep the entry point and the half-alpha rule
+    /// that decides which flakes own their pixel (the colour pass still blends
+    /// from 0.003).
+    #[test]
+    fn the_shader_carries_the_coverage_entry_point() {
+        assert_eq!(
+            SHADER.matches("@fragment fn cover(").count(),
+            1,
+            "precipitation needs exactly one coverage entry point"
+        );
+        assert_eq!(
+            SHADER.matches("< 0.5 { discard; }").count(),
+            1,
+            "coverage threshold is the half-alpha rule"
+        );
+    }
 
     #[test]
     fn the_shader_lanes_carry_the_two_constructors_stores() {

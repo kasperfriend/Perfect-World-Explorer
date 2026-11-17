@@ -1250,7 +1250,11 @@ impl World {
         (ready, failed, self.slots.len() + self.assets.unloaded.len())
     }
     /// Opaque meshes first, then the retail alpha list in its insertion order.
-    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+    ///
+    /// `coverage` records where the blended effect sheets were, in depth only,
+    /// for the motion-vector pass. It belongs to the main view alone: the mirror
+    /// and refraction depth feeds the water, and the motion vectors never read it.
+    pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, coverage: bool) {
         for slot in &self.slots {
             if let Some(draw) = &slot.draw {
                 draw.draw_opaque(pass);
@@ -1265,6 +1269,11 @@ impl World {
         // with their own render-layer sort inside the draw object.
         if let Some(effects) = &self.effects {
             effects.draw(pass);
+            if coverage {
+                // Same pass, immediately after the sheets were coloured, so the
+                // frame block and the bucket order still describe this view.
+                effects.draw_coverage(pass);
+            }
         }
     }
     pub fn alpha_order(&self) -> Vec<(usize, usize)> {

@@ -2771,7 +2771,7 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            models.draw(&mut pass);
+            models.draw(&mut pass, matches!(view, Pass::Main));
         }
     }
 
@@ -3159,6 +3159,9 @@ impl Renderer {
             camera.active_fog(),
             normal.clip,
             main_weather,
+            // Main view only: this depth is what the motion-vector pass and the
+            // upscalers read.
+            true,
         );
         self.water.copy_scene_to_refraction(&mut e);
         self.water.copy_depth(&mut e, &self.depth);
@@ -3445,6 +3448,9 @@ impl Renderer {
                     above_fog,
                     above.clip,
                     selected_weather,
+                    // The refraction view's depth feeds the water, not the
+                    // motion vectors.
+                    false,
                 );
                 // Ornamental EC models enter refraction only from underwater;
                 // the host player follows its own AABB gate in either view.
@@ -3564,6 +3570,8 @@ impl Renderer {
                 camera.active_fog(),
                 reflected.clip,
                 selected_weather,
+                // The mirror's depth feeds the water, not the motion vectors.
+                false,
             );
             let model_view = self.water.reflection_raw();
             self.draw_models(

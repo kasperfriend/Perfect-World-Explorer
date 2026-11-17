@@ -1102,44 +1102,69 @@ DLSS-G parameter type.
   terrain and foliage at a sub-native extent read sharper without shimmering,
   and that Native AA/100 % is pixel-identical to before the change.
 
-## B-25 — Alpha-blended world content has no depth, so its motion vectors are the background's (clouds under frame generation)
+## B-25 — Alpha-blended world content has no depth, so its motion vectors are the background's
 
 - **Step:** Frame generation on (FSR FG, DLSS-G or XeSS FG), or any temporal
-  upscaler, with fast camera movement over a map whose `world.cld` clouds are
-  visible.
-- **Symptom:** clouds slide, smear or double in the generated frames; the harder
-  the camera *translates*, the worse it gets. Pure rotation looks fine.
-- **Cause (code-verified).** `cloud_gpu` draws the world clouds with
-  `depth_write_enabled: false` (both the billboard path and the native triangle
-  path), and `sky_gpu` does the same. The depth clear is `0.0`, which in this
-  renderer's reversed-Z convention is the far plane. The shared motion-vector
-  pass (`src/fsr/mv.rs`) rebuilds each pixel's world position from that depth
-  buffer and reprojects it with the previous view-projection, so a cloud pixel is
-  reprojected as a point at infinity: exactly right for a rotation, wrong by the
-  cloud's whole parallax for a translation. Frame generation interpolates with
-  those vectors, so a moving camera warps the clouds at the sky's parallax while
-  the rendered frames put them at their own distance — the two alternate every
-  other frame, which is what reads as broken clouds.
-- **Fix (this change).** After the colour pass the cloud module records a
-  depth-only pass over the same geometry: a `cover` entry point in both WGSL
-  modules, a pipeline with `depth_write_enabled: true` and
-  `depth_compare: GreaterEqual` (reverse-Z: only a nearer cloud wins), colour
-  writes masked off. A pixel owns the cloud's depth only where the cloud's
-  *effective* alpha — the value the colour pass actually blends, `tex.a *
-  p.scene.y` for billboards and `tex.a * 0.6`/`* 1.0` for the triangle path — is
-  at least 0.5, so the semi-transparent rim stays background and keeps the
-  background's motion. The pass runs for the main view only: the refraction and
-  mirror views' depth feeds the water, not the motion vectors. Because it writes
-  into `renderer.depth`, the upscalers get the same correction — cloud pixels now
-  carry a real surface instead of the far plane.
-- **What it does not fix.** Rain/snow (`weather_gpu`), decals and most effect
-  cards also write no depth, so their motion vectors are still the background's.
-  They are high-frequency or short-lived, and the cloud layer is the case that
-  was visible; giving all alpha content depth is a renderer-wide decision (it
-  changes upscaler disocclusion everywhere), so it is recorded here instead of
-  being done blind.
-- **Verification.** A unit test keeps both cloud modules carrying the coverage
-  entry point and the 0.5 threshold, CI compiles those modules on lavapipe and
-  runs the shader regressions, and `docs/dlss-fidelity.md` §5 records the motion
-  vector contract this repairs. A hardware run has to show the cloud smear gone
-  at speed with frame generation on, and no new shimmer along the coverage edge.
+  upscaler, with fast camera movement: clouds, torch/portal/waterfall effect
+  sheets, or rain and snow in view.
+- **Symptom:** that content slides, smears or doubles in the generated frames, and
+  only when the camera *translates* — pure rotation looks fine.
+- **Cause (code-verified).** `cloud_gpu` (billboard and native triangle path),
+  `gfx_effect_gpu` (every quad slot) and `weather_gpu` all draw with
+  `depth_write_enabled: false`, and `sky_gpu` does the same. The depth clear is
+  `0.0`, which is the far plane in this renderer's reversed-Z convention. The
+  shared motion-vector pass (`src/fsr/mv.rs`) rebuilds each pixel's world position
+  from that depth buffer and reprojects it with the previous view-projection, so
+  every one of those pixels is reprojected as whatever surface is behind it — the
+  far plane over the sky, i.e. pure rotation. Frame generation interpolates with
+  exactly those vectors, so on a translating camera the generated frames put the
+  content at the wrong distance while the rendered frames put it at its own; the
+  two alternate every other frame. That is the visible bug.
+- **Fix.** A **depth-only coverage pass** per content class: the same geometry
+  again, with a `cover` fragment entry point, `depth_write_enabled: true`,
+  `depth_compare: GreaterEqual` (reverse-Z: only a nearer surface wins), colour
+  writes masked off. A pixel owns the content's depth only where the content's
+  *effective* alpha — the value the colour pass actually blends — is at least
+  `0.5`, so semi-transparent rims stay background and keep the background's
+  motion:
+  - **Clouds** (`cloud_gpu`): `tex.a * p.scene.y` for billboards,
+    `tex.a * 0.6`/`* 1.0` for the triangle path; own pass right after the colour
+    pass, `CloudGpu::draw(.., coverage)`.
+  - **Effect sheets** (`gfx_effect_gpu`): `clamp(tex.a * v.color.a, 0, 1)`; the
+    twin pipeline is a `PipelineKey::coverage` variant, created with the colour
+    pipeline and drawn by `Draw::draw_coverage` inside the same pass, after the
+    last bucket. Element-160 meshes are skipped: `WriteZ` already recorded their
+    depth in the colour pass.
+  - **Precipitation** (`weather_gpu`): `tex.a * 0.52` rain, `* 0.82` snow; own
+    pass after the colour pass, `WeatherGpu::draw(.., coverage)`.
+  Only the **main view** asks for coverage. The mirror and refraction depth feeds
+  the water and nothing reads it for motion, and writing there could only perturb
+  the reflection pass. Because the coverage writes into `renderer.depth`, the
+  upscalers (DLSS/FSR/XeSS) get the correction too, not just frame generation.
+- **Decals need nothing.** `gfx_decal_gpu` also writes no depth, but a decal is
+  coplanar with the surface it is painted on — the depth buffer already holds that
+  surface's depth at those pixels, so its motion vector is already the right one.
+  Only content that stands *in front of* the surface behind it loses its motion.
+- **What it does not fix.** The depth-based motion pass can only reproduce
+  **camera** motion, so content that also moves in world space is reprojected as
+  if it stood still: falling rain and snow smear along their fall line in the
+  interpolated frame, and animated effect sheets that translate (not just UV
+  scroll) ghost by their own motion. That residual is much smaller than the
+  parallax error it replaces — the smear follows the streak direction for rain,
+  and short dot trails for snow read as motion blur — and fixing it properly means
+  a second, per-object motion-vector writer, which this pass does not have.
+- **Ordering note.** Coverage runs immediately after each class's colour pass, so
+  a coverage write can depth-reject content blended *later* in the same frame
+  (a big glow sheet in front of the clouds can now stop the cloud behind it). In
+  the client's forward ordering that content was already composited in the wrong
+  order — clouds blended over effects drawn before them — so the readable result
+  is no worse, but it is a real order dependence to know about.
+- **Verification.** `coverage_records_depth_only_where_the_sheet_dominates` proves
+  the effect twin writes the sheet's own depth at full opacity and leaves the
+  cleared far plane at 20 % opacity (real device, real pipeline, depth read back
+  through `TextureAspect::DepthOnly`); `both_cloud_modules_carry_the_coverage_entry_point`
+  and `the_shader_carries_the_coverage_entry_point` (weather, effects) keep the
+  entry points and thresholds in the WGSL; CI compiles all three modules on
+  lavapipe. A hardware run still has to show: the smear gone at speed with frame
+  generation on, no new shimmer along the coverage edge, and whether the residual
+  own-motion ghosting of precipitation is objectionable.

@@ -107,6 +107,16 @@ struct PipelineKey {
     /// of the shipped 447 models author `1`, 131 author `0`, 201 predate the key.
     /// Without it a crystal cannot occlude the sheet drawn after it.
     write_depth: bool,
+    /// The depth-only twin used by the coverage pass, not by the colour pass.
+    ///
+    /// A blended sheet may not write depth while it is being coloured — the
+    /// next sheet in the same layer must still blend over it — but the motion
+    /// vector pass needs *some* surface there, and it can only get it from the
+    /// depth buffer. The twin rasterises the same vertices with the same discard
+    /// rule, writes depth and nothing else, and runs after the whole colour pass
+    /// (see `draw_coverage`). It is a pipeline key field rather than a separate
+    /// map so both variants share one cache and one creation path.
+    coverage: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -491,6 +501,7 @@ impl Draw {
                     destination: quad.destination_blend,
                     depth_test: quad.depth_test,
                     write_depth: quad.mesh.as_ref().is_some_and(|mesh| mesh.write_depth),
+                    coverage: false,
                 },
                 priority: quad.priority,
                 tile: quad.tile,
@@ -605,6 +616,20 @@ impl Draw {
                 let pipeline = self.pipeline(device, key.pipeline)?;
                 self.pipelines.insert(key.pipeline, pipeline);
             }
+            // The depth-only twin, for a sheet that may not write depth while it
+            // is being coloured. Only meaningful with a depth attachment; without
+            // one there is nowhere to record the coverage and the pass is a
+            // no-op rather than an error.
+            if self.depth.is_some() && !key.pipeline.write_depth {
+                let cover = PipelineKey {
+                    coverage: true,
+                    ..key.pipeline
+                };
+                if !self.pipelines.contains_key(&cover) {
+                    let pipeline = self.pipeline(device, cover)?;
+                    self.pipelines.insert(cover, pipeline);
+                }
+            }
             let loaded = self.textures.contains_key(&key.texture);
             let was_fallback = self.buckets.get(key).is_some_and(|b| b.bound_fallback);
             if !self.buckets.contains_key(key) {
@@ -680,6 +705,47 @@ impl Draw {
         }
     }
 
+    /// Record where this frame's blended sheets were, in depth only.
+    ///
+    /// The colour pass draws them with `depth_write_enabled: false` — a quad
+    /// slot has no Z-write in the client either — so the depth buffer keeps
+    /// whatever opaque surface lies behind them. The shared motion-vector pass
+    /// rebuilds motion from that buffer alone, so a torch glow, a portal sheet or
+    /// a waterfall in front of a distant wall was reprojected at the *wall's*
+    /// distance: the sheet slid against the world whenever the camera
+    /// translated, and frame generation, which interpolates with those vectors,
+    /// doubled it. Sheets are static in world space (they animate their UVs, not
+    /// their position), so a camera-only reprojection at the sheet's own depth is
+    /// the right motion for everything but the element-160 meshes, which already
+    /// write depth through `WriteZ`.
+    ///
+    /// Runs inside the same pass, after `draw`, so the uniform and the bucket
+    /// order are still this view's, and so nothing is drawn between the colour
+    /// and its coverage. Elements that already wrote depth in the colour pass are
+    /// skipped: their depth is already right.
+    pub fn draw_coverage<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        for (key, count) in &self.order {
+            if key.pipeline.write_depth {
+                continue;
+            }
+            let cover = PipelineKey {
+                coverage: true,
+                ..key.pipeline
+            };
+            let (Some(bucket), Some(pipeline)) =
+                (self.buckets.get(key), self.pipelines.get(&cover))
+            else {
+                // No depth attachment was configured for this drawer, so there
+                // is nothing to record the coverage into.
+                continue;
+            };
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bucket.binding, &[]);
+            pass.set_vertex_buffer(0, bucket.buffer.slice(..));
+            pass.draw(0..*count, 0..1);
+        }
+    }
+
     /// The texture binding one bucket draws with: the uniform frame block, the
     /// entry's texture view (the real map or the placeholder), and the
     /// per-slot sampler (`A3DGFXRenderSlot` WRAP for a tile, CLAMP otherwise).
@@ -746,14 +812,22 @@ impl Draw {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &self.shader,
-                    entry_point: "fs",
+                    entry_point: if key.coverage { "cover" } else { "fs" },
                     targets: &[Some(wgpu::ColorTargetState {
                         format: self.device_format,
-                        blend: Some(wgpu::BlendState {
-                            color: component,
-                            alpha: component,
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
+                        blend: if key.coverage {
+                            None
+                        } else {
+                            Some(wgpu::BlendState {
+                                color: component,
+                                alpha: component,
+                            })
+                        },
+                        write_mask: if key.coverage {
+                            wgpu::ColorWrites::empty()
+                        } else {
+                            wgpu::ColorWrites::ALL
+                        },
                     })],
                 }),
                 primitive: wgpu::PrimitiveState {
@@ -765,8 +839,10 @@ impl Draw {
                     format,
                     // Only a mesh whose element asks for `WriteZ` writes; a
                     // quad slot never does (A3DGFXRenderSlot has no Z-write
-                    // field) and a missing depth attachment suppresses it.
-                    depth_write_enabled: key.write_depth,
+                    // field) and a missing depth attachment suppresses it. The
+                    // coverage twin always writes: recording where the sheet was
+                    // is its whole purpose.
+                    depth_write_enabled: key.coverage || key.write_depth,
                     depth_compare: if key.depth_test {
                         compare
                     } else {
@@ -846,6 +922,14 @@ struct Output {
   rgb=mix(fog_rgb,rgb,keep);
  }
  return vec4<f32>(rgb,opacity);
+}
+// Depth-only coverage for the motion-vector pass: the same quad, the same clip
+// plane and the same effective opacity, with no colour written. A sheet claims
+// the pixel's depth only where it dominates what is drawn there.
+@fragment fn cover(v:Output)->@location(0) vec4<f32> {
+ if dot(vec4<f32>(v.world,1.),p.clip_plane)<0. {discard;}
+ if clamp(textureSample(image,image_sampler,v.uv).a*v.color.a,0.,1.)<0.5 {discard;}
+ return vec4<f32>(0.);
 }
 "#;
 
@@ -1107,6 +1191,164 @@ mod tests {
         drop(bytes);
         harness.readback.unmap();
         pixel
+    }
+
+    /// The coverage entry point is the only place the effect pass can tell the
+    /// motion-vector pass where its sheets were, so both halves of the rule —
+    /// the entry point and the opacity threshold — have to stay in the shader.
+    #[test]
+    fn the_shader_carries_the_coverage_entry_point() {
+        assert_eq!(
+            WGSL.matches("@fragment fn cover(").count(),
+            1,
+            "effect sheets need exactly one coverage entry point"
+        );
+        assert_eq!(
+            WGSL.matches("<0.5 {discard;}").count(),
+            1,
+            "coverage claims a pixel only where the sheet's opacity dominates it"
+        );
+    }
+
+    /// Depth the coverage pass recorded at pixel (0,0) of a 4x4 target whose
+    /// depth buffer was cleared to zero — the far plane in this renderer's
+    /// reversed-Z convention.
+    fn covered_depth(draw: &mut Draw, harness: &Harness, quads: &[EffectQuad]) -> f32 {
+        let png = grey_png();
+        let mut read = |_: &str| Ok(png.clone());
+        draw.update(
+            &harness.device,
+            &harness.queue,
+            quads,
+            glam::Mat4::IDENTITY.to_cols_array_2d(),
+            [0.; 4],
+            [0., 0., 0., 100.],
+            None,
+            &mut read,
+        )
+        .unwrap();
+        let size = wgpu::Extent3d {
+            width: 4,
+            height: 4,
+            depth_or_array_layers: 1,
+        };
+        let depth = harness.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("effect coverage depth"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = depth.create_view(&Default::default());
+        let colour = harness.target.create_view(&Default::default());
+        let readback = harness.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("effect coverage depth readback"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = harness.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("effect coverage test pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &colour,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            draw.draw(&mut pass);
+            draw.draw_coverage(&mut pass);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &depth,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::DepthOnly,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(4),
+                },
+            },
+            size,
+        );
+        harness.queue.submit(Some(encoder.finish()));
+        let slice = readback.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+        harness.device.poll(wgpu::Maintain::Wait);
+        receiver.recv().unwrap().unwrap();
+        let bytes = slice.get_mapped_range();
+        let value = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        drop(bytes);
+        readback.unmap();
+        value
+    }
+
+    /// A blended sheet may not write depth while it is coloured, so the coverage
+    /// pass is the only thing that can tell the motion-vector pass where it was.
+    /// It has to record the sheet's own depth where the sheet dominates the
+    /// pixel and leave the background's depth alone where it does not.
+    #[test]
+    fn coverage_records_depth_only_where_the_sheet_dominates() {
+        let Some(harness) = harness() else {
+            eprintln!("effect coverage test skipped: no WGPU adapter");
+            return;
+        };
+        let mut draw = Draw::new(
+            &harness.device,
+            &harness.queue,
+            wgpu::TextureFormat::Rgba8Unorm,
+            Some((
+                wgpu::TextureFormat::Depth32Float,
+                wgpu::CompareFunction::GreaterEqual,
+            )),
+        )
+        .unwrap();
+        // The unit projection puts the quad on the z = 0 plane, which is depth
+        // 0.5 in WebGPU's [0, 1] window space.
+        let dominant = covered_depth(
+            &mut draw,
+            &harness,
+            &[quad("a.png", 5, 6, 0, true, [1., 1., 1., 1.])],
+        );
+        assert!(
+            (dominant - 0.5).abs() < 0.01,
+            "an opaque sheet must own the pixel's depth, got {dominant}"
+        );
+        // The same sheet at 20% opacity: the pixel is the background's.
+        let faint = covered_depth(
+            &mut draw,
+            &harness,
+            &[quad("a.png", 5, 6, 0, true, [1., 1., 1., 0.2])],
+        );
+        assert_eq!(
+            faint, 0.0,
+            "a sheet that does not dominate the pixel must leave the depth alone"
+        );
     }
 
     #[test]
@@ -1693,6 +1935,7 @@ mod tests {
             destination,
             depth_test,
             write_depth: false,
+            coverage: false,
         };
         let mut sorted = vec![
             BucketKey {
@@ -1755,6 +1998,7 @@ mod tests {
             destination,
             depth_test,
             write_depth: false,
+            coverage: false,
         };
         let mut sorted = vec![
             BucketKey {
@@ -1816,12 +2060,14 @@ mod tests {
             destination: 2,
             depth_test: true,
             write_depth: true,
+            coverage: false,
         };
         let sheet = PipelineKey {
             source: 5,
             destination: 2,
             depth_test: true,
             write_depth: false,
+            coverage: false,
         };
         let mut sorted = vec![
             BucketKey {
