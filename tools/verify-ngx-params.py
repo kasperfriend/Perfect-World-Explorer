@@ -80,6 +80,35 @@ RUST_ITEM = re.compile(r"P_[A-Z0-9_]+")
 RUST_WRITE = re.compile(r"\.set_([a-z0-9_]+)\(\s*(P_[A-Z0-9_]+)")
 
 
+# The vtable order the *driver core* implements, which is what our slots have to
+# match. It is the reverse of the declaration in `nvsdk_ngx_params.h:55-73`, and
+# that is not a guess: a session wrote one real `ID3D12Resource *` and one
+# distinctive integer through *all eight* declared `Set` overloads and read them
+# back through every reader, and all sixteen slots fit this order and none fits
+# the declaration's (`docs/blockers.md` B-27). A vtable is an ABI, so addressing
+# the declaration's slot 6 (`Set(ID3D12Resource *)`) addresses `Set(float)` on
+# this core — which is how four evaluate resources were stored as numbers while
+# NGX kept reporting `could not find Color parameter`.
+MEASURED_SLOTS = {
+    "SET_VOID": 0,
+    "SET_D3D12": 1,
+    "SET_D3D11": 2,
+    "SET_I32": 3,
+    "SET_U32": 4,
+    "SET_F64": 5,
+    "SET_F32": 6,
+    "SET_U64": 7,
+    "GET_VOID": 8,
+    "GET_D3D12": 9,
+    "GET_D3D11": 10,
+    "GET_I32": 11,
+    "GET_U32": 12,
+    "GET_F64": 13,
+    "GET_F32": 14,
+    "GET_U64": 15,
+}
+
+
 def header_vtable(paths):
     """Slot index -> `Set`/`Get` of which value type, from nvsdk_ngx_params.h.
 
@@ -215,25 +244,38 @@ def main(argv=None):
             )
 
     slot_mismatch = []
+    reversed_note = 0
+    slots = {}
+    for path in args.source:
+        for kind, index in RUST_SLOT.findall(path.read_text()):
+            slots[kind] = int(index)
+    for kind, index in sorted(slots.items(), key=lambda kv: kv[1]):
+        measured = MEASURED_SLOTS.get(kind)
+        if measured is None:
+            slot_mismatch.append(f"SLOT_{kind} = {index}: no such overload on the core")
+        elif measured != index:
+            slot_mismatch.append(
+                f"SLOT_{kind} = {index}, but the measured core order puts {kind} "
+                f"at slot {measured} (docs/blockers.md B-27)"
+            )
+        elif vtable.get(kind) is not None and vtable[kind] != index:
+            # The header prints the reverse order; that is expected, and the
+            # measured one is what the code must use.
+            reversed_note += 1
     if vtable:
-        slots = {}
-        for path in args.source:
-            for kind, index in RUST_SLOT.findall(path.read_text()):
-                slots[kind] = int(index)
-        for kind, index in sorted(slots.items(), key=lambda kv: kv[1]):
-            expected = vtable.get(kind)
-            if expected is None:
-                slot_mismatch.append(f"SLOT_{kind} = {index}: the header declares no {kind} slot")
-            elif expected != index:
-                slot_mismatch.append(
-                    f"SLOT_{kind} = {index}, but nvsdk_ngx_params.h puts {kind} at slot {expected}"
-                )
+        missing = sorted(set(vtable) - set(MEASURED_SLOTS))
+        extra = sorted(set(MEASURED_SLOTS) - set(vtable))
+        for kind in missing:
+            slot_mismatch.append(f"the core has no measured slot for {kind}, but the header declares one")
+        for kind in extra:
+            slot_mismatch.append(f"measured slot {kind} has no counterpart in the header")
         print(
             f"vtable: {len(vtable)} virtual methods in the header, "
-            f"{len(slots)} slots used by params.rs"
+            f"{len(slots)} slots used by params.rs, "
+            f"{reversed_note} deliberately reversed vs the header"
         )
-        for line in slot_mismatch:
-            print(f"ERROR   {line}")
+    for line in slot_mismatch:
+        print(f"ERROR   {line}")
 
     used = {name for _, _, name, _ in writes}
     source = (
@@ -258,7 +300,8 @@ def main(argv=None):
     print(
         f"OK: every name exists in the headers, every setter type conforms "
         f"({len(writes)} writes)"
-        + (", every vtable slot matches the header order" if vtable else "")
+        + (", every vtable slot matches the measured core order" if vtable else "")
+        + f" ({len(slots)} slots checked against the measured core order)"
     )
     return None, 0
 

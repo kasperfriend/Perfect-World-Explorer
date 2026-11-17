@@ -104,19 +104,47 @@ The parameter names, setter types and vtable order are not taken on trust. The
 NGX DLLs export the feature entry points but **no** parameter allocator, so the
 viewer owns the `NVSDK_NGX_Parameter` table (`src/dlss/params.rs`). That table is
 an ABI: `NVSDK_NGX_Parameter` is an abstract C++ class in
-`nvsdk_ngx_params.h`, so the n-th declared virtual method *is* vtable slot n, and
-a call through the wrong slot writes the wrong type into NGX's map. The header's
-declaration order and the viewer's slots agree exactly —
+`nvsdk_ngx_params.h`, so the n-th virtual method *is* vtable slot n, and a call
+through the wrong slot writes the wrong type into NGX's map.
 
-| Slot | `nvsdk_ngx_params.h` | `params.rs` |
+The header's declaration order and the driver core's implementation are **not**
+the same order. `nvsdk_ngx_params.h:55-73` declares eight `Set` overloads
+(u64, float, double, uint, int, D3D11, D3D12, void*), eight `Get`s in the same
+order, then `Reset`; the driver core implements the reverse. That was measured
+on `_nvngx.dll` 32.0.16.2114 by writing one real `ID3D12Resource *` and one
+distinctive integer through all eight `Set` overloads and reading them back
+through every reader (`docs/blockers.md` B-27):
+
+| Slot | what this core implements there | `params.rs` |
 | --- | --- | --- |
-| 1 | `Set(const char *, float)` | `SLOT_SET_F32` |
-| 3 | `Set(const char *, unsigned int)` | `SLOT_SET_U32` |
-| 4 | `Set(const char *, int)` | `SLOT_SET_I32` |
-| 6 | `Set(const char *, ID3D12Resource *)` | `SLOT_SET_D3D12` |
-| 7 | `Set(const char *, void *)` | `SLOT_SET_VOID` |
-| 11 | `Get(const char *, unsigned int *)` | `SLOT_GET_U32` |
-| 15 | `Get(const char *, void **)` | `SLOT_GET_VOID` |
+| 0 | `Set(const char *, void *)` | `SLOT_SET_VOID` |
+| 1 | `Set(const char *, ID3D12Resource *)` | `SLOT_SET_D3D12` |
+| 2 | `Set(const char *, ID3D11Resource *)` | `SLOT_SET_D3D11` |
+| 3 | `Set(const char *, int)` | `SLOT_SET_I32` |
+| 4 | `Set(const char *, unsigned int)` | `SLOT_SET_U32` |
+| 5 | `Set(const char *, double)` | `SLOT_SET_F64` |
+| 6 | `Set(const char *, float)` | `SLOT_SET_F32` |
+| 7 | `Set(const char *, unsigned long long)` | `SLOT_SET_U64` |
+| 8 | `Get(const char *, void **)` | `SLOT_GET_VOID` |
+| 9 | `Get(const char *, ID3D12Resource **)` | `SLOT_GET_D3D12` |
+| 10 | `Get(const char *, ID3D11Resource **)` | `SLOT_GET_D3D11` |
+| 11 | `Get(const char *, int *)` | `SLOT_GET_I32` |
+| 12 | `Get(const char *, unsigned int *)` | `SLOT_GET_U32` |
+| 13 | `Get(const char *, double *)` | `SLOT_GET_F64` |
+| 14 | `Get(const char *, float *)` | `SLOT_GET_F32` |
+| 15 | `Get(const char *, unsigned long long *)` | `SLOT_GET_U64` |
+
+Addressing the declaration's order is what made every evaluate fail for three
+sessions: slot 6 is `Set(float)` here, so the four evaluate resources were
+stored as numbers, and slot 14 is `Get(float *)`, so the read-back only ever
+showed converted values. The map looked healthy throughout because the integer
+round-trip used `Set(int)`/`Get(int *)` — slots 3 and 11, a genuine pair, but a
+different pair from the one the declaration describes.
+
+`resource_slot_matrix` and `numeric_slot_matrix` in `src/dlss/imp.rs` re-measure
+both halves at runtime on the first frame and log the pair they found, so a core
+with a different order again is one log line away from being visible instead of
+a wrong write.
 
 To keep that hand-built table honest:
 
@@ -130,8 +158,11 @@ headers, every `NVSDK_NGX_Parameter_Set*(Parameters, <name>, …)` call in NVIDI
 create and evaluate helpers, the `NVSDK_NGX_Parameter` virtual-method order, and
 every `set_*(P_*)` in `src/dlss/imp.rs` / `src/dlss/fg.rs` / `src/dlss/params.rs`,
 then fails when a name does not exist, a setter type differs, or a slot index is
-not where the header puts it. Current result: **74 writes over 73 distinct names,
-0 unknown, 0 mistyped, all 7 slots in header order**, in CI (`PR checks and Windows build` → "Verify NGX parameter names and setter
+not where the **measured core order** puts it (the header's own position is
+reported as a cross-reference, and the tool states how many slots are
+deliberately reversed). Current result: **70 writes over 69 distinct names,
+0 unknown, 0 mistyped, all 16 slots in the measured core order**, in CI
+(`PR checks and Windows build` → "Verify NGX parameter names and setter
 types", offline from `tools/fixtures/ngx-v310.9.16-params.json`).
 
 That check is the reason `PerfQualityValue` is a `SetI` today: it found the one
