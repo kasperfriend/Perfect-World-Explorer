@@ -279,6 +279,11 @@ impl Owned {
         pointer_slot_matrix(self as *const Owned as *mut c_void, name, resource)
     }
 
+    /// The numeric half of the same measurement.
+    fn numeric_slot_matrix(&self) -> Vec<String> {
+        numeric_slot_matrix(self as *const Owned as *mut c_void)
+    }
+
     /// Read one pointer key back through every candidate `Get` slot.
     ///
     /// Every pointer overload of the viewer's own table stores the same
@@ -458,6 +463,61 @@ fn pointer_slot_matrix(
     (found, lines)
 }
 
+/// Write one distinctive integer through every declared `Set` overload and read
+/// it back through every declared reader.
+///
+/// The companion of [`pointer_slot_matrix`], and the cheaper half of the same
+/// question: it pins where the *numeric* readers sit on this core's vtable. A
+/// value that comes back unchanged names a reader; a value that comes back
+/// converted names the reader that converted it (`0x123456789abcdef0` as a
+/// `float` is `0x5a3a3ee6`, as a `double` it is `0x43a23456789abcde`), so one
+/// line per `Set` overload identifies the whole numeric half of the map
+/// (`docs/blockers.md` B-27).
+fn numeric_slot_matrix(object: *mut c_void) -> Vec<String> {
+    type SetU64 = unsafe extern "C" fn(*mut c_void, *const c_char, u64);
+    type Get64 = unsafe extern "C" fn(*mut c_void, *const c_char, *mut u64) -> u32;
+    const PROBE: u64 = 0x1234_5678_9abc_def0;
+    let Ok(key) = CString::new("NGX.Viewer.Probe.ULL") else {
+        return Vec::new();
+    };
+    const READERS: [(usize, &str); 8] = [
+        (8, "ull"),
+        (9, "f32"),
+        (10, "f64"),
+        (11, "ui"),
+        (12, "i32"),
+        (13, "d3d11"),
+        (14, "d3d12"),
+        (15, "void"),
+    ];
+    let mut lines = Vec::with_capacity(SLOT_SET_VOID + 1);
+    for set_slot in 0..=SLOT_SET_VOID {
+        let Some(set) = (unsafe { vtable_setter::<SetU64>(object, set_slot) }) else {
+            lines.push(format!("Set {set_slot}: no vtable entry"));
+            continue;
+        };
+        unsafe { set(object, key.as_ptr(), PROBE) };
+        let mut parts = Vec::with_capacity(READERS.len());
+        for (slot, label) in READERS {
+            let Some(get) = (unsafe { vtable_getter::<Get64>(object, slot) }) else {
+                continue;
+            };
+            let mut value = u64::MAX;
+            let result = unsafe { get(object, key.as_ptr(), &mut value) };
+            if result != NGX_SUCCESS {
+                continue;
+            }
+            if value == PROBE {
+                parts.push(format!("{label}{slot} exact"));
+            } else if value != u64::MAX {
+                parts.push(format!("{label}{slot} 0x{value:x}"));
+            }
+        }
+        lines.push(format!("Set {set_slot}: {}", parts.join(", ")));
+    }
+    lines
+}
+
 impl NgxMap {
     pub(crate) fn new(
         object: *mut c_void,
@@ -522,6 +582,12 @@ impl NgxMap {
         resource: *mut c_void,
     ) -> (Option<usize>, Vec<String>) {
         pointer_slot_matrix(self.object, name, resource)
+    }
+
+    /// The numeric half of the same measurement (see [`numeric_slot_matrix`]).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn numeric_slot_matrix(&self) -> Vec<String> {
+        numeric_slot_matrix(self.object)
     }
 
     /// The `Set` slot the map's own pointer round-trip answers, when it
@@ -870,6 +936,14 @@ impl NgxParams {
         match &self.kind {
             Kind::Owned(table) => table.resource_slot_matrix(name, resource),
             Kind::Ngx(map) => map.resource_slot_matrix(name, resource),
+        }
+    }
+
+    /// The numeric half of the same measurement (see [`numeric_slot_matrix`]).
+    pub(crate) fn numeric_slot_matrix(&self) -> Vec<String> {
+        match &self.kind {
+            Kind::Owned(table) => table.numeric_slot_matrix(),
+            Kind::Ngx(map) => map.numeric_slot_matrix(),
         }
     }
 

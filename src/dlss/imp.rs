@@ -837,6 +837,12 @@ impl DlssUpscaler {
         // address that comes back can be compared with it (`docs/blockers.md`
         // B-27).
         if self.frame_index == 0 {
+            // The numeric half first: it identifies where this core's readers
+            // sit, which is what the pointer half is then read against.
+            crate::dlss::diag("[DLSS] numeric slot matrix: 0x123456789abcdef0 through every Set");
+            for line in self.params.numeric_slot_matrix() {
+                crate::dlss::diag(&format!("[DLSS]   {line}"));
+            }
             let (found, lines) = self.params.resource_slot_matrix(P_COLOR, resources[0]);
             crate::dlss::diag(&format!(
                 "[DLSS] resource slot matrix: Color = 0x{:x}, {} declared Set overloads against 4 \
