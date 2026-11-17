@@ -6,7 +6,7 @@ use crate::scenery_visibility::{
 };
 use crate::Terrain;
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -169,6 +169,71 @@ fn minimap_matrix(x: f32, z: f32, range: f32) -> Mat4 {
     Mat4::orthographic_rh(range, -range, -range, range, 20000., 1.)
         * Mat4::look_to_rh(eye, Vec3::NEG_Y, Vec3::Z)
 }
+/// Screen-space rectangle a water plane's reflection or refraction render has to
+/// cover: the plane's own screen rectangle, grown by the largest distance the
+/// water surface samples away from itself.
+///
+/// Those two passes exist for exactly one reader — the water surface — and it
+/// reads them by screen-space UV displaced by `n.xz * edge * edge * strength`.
+/// `n.xz` is a unit-range bump normal and `edge` is in `0..1`, so the reflection
+/// is read at `screen ± 0.25 * |n.xz|` (`± 0.15 * |n.xz|` in the above-water
+/// refraction). Growing the plane's rectangle by `0.25 * |n.xz|max` therefore
+/// contains every texel the surface can possibly read; every other texel of a
+/// 3440x1369 view is shaded today and read by nobody. A pond a few hundred units
+/// across used to cost two full-resolution scene renders per frame.
+///
+/// `None` means "rasterise the whole target, exactly as before", and is answered
+/// whenever the rectangle cannot be trusted or would not pay: a corner of the
+/// plane at or behind the eye (a plane that runs past the camera has no finite
+/// screen rectangle), a rectangle that covers most of the target anyway, or a
+/// target too small to bother with.
+fn water_view_scissor(
+    matrix: Mat4,
+    w: u32,
+    h: u32,
+    bounds: [f32; 4],
+    height: f32,
+    margin: f32,
+) -> Option<[u32; 4]> {
+    // Above this share of the target the scissor saves almost nothing.
+    const COVER_LIMIT: f32 = 0.75;
+    let margin = margin.clamp(0., 0.5);
+    if w < 32 || h < 32 {
+        return None;
+    }
+    let [x0, x1, z0, z1] = bounds;
+    let mut min = [f32::INFINITY; 2];
+    let mut max = [f32::NEG_INFINITY; 2];
+    for (x, z) in [(x0, z0), (x0, z1), (x1, z0), (x1, z1)] {
+        let p = matrix * Vec4::new(x, height, z, 1.);
+        // At or behind the eye plane the projected point is not where that
+        // corner of the quad is drawn, so no finite rectangle contains the quad.
+        if !(p.w > 1e-4) || !p.x.is_finite() || !p.y.is_finite() {
+            return None;
+        }
+        for (axis, v) in [p.x / p.w, p.y / p.w].into_iter().enumerate() {
+            min[axis] = min[axis].min(v);
+            max[axis] = max[axis].max(v);
+        }
+    }
+    let (wf, hf) = (w as f32, h as f32);
+    // Clip space to pixels. Clip y points up, pixels point down.
+    let px0 = ((min[0] * 0.5 + 0.5 - margin) * wf).floor().clamp(0., wf);
+    let px1 = ((max[0] * 0.5 + 0.5 + margin) * wf).ceil().clamp(0., wf);
+    let py0 = ((0.5 - max[1] * 0.5 - margin) * hf).floor().clamp(0., hf);
+    let py1 = ((0.5 - min[1] * 0.5 + margin) * hf).ceil().clamp(0., hf);
+    if px1 <= px0 || py1 <= py0 {
+        // Off screen: `WaterBatch::visible` should have rejected the plane, and
+        // this function is not the place to decide that drawing nothing is right.
+        return None;
+    }
+    let (rw, rh) = ((px1 - px0) as u32, (py1 - py0) as u32);
+    if rw as f32 * rh as f32 >= wf * hf * COVER_LIMIT {
+        return None;
+    }
+    Some([px0 as u32, py0 as u32, rw.max(1), rh.max(1)])
+}
+
 /// Everything the top-down minimap's pixels can depend on.
 ///
 /// `minimap_matrix` builds the orthographic window from the camera's ground
@@ -364,15 +429,27 @@ struct FrameBudget {
     /// that renders the world five times is bound on the GPU in a way no CPU
     /// timing shows, so the line carries this count next to the milliseconds.
     passes: u64,
+    /// Water views whose attachment was scissored down to the region the surface
+    /// can read, and the mean fraction of the screen those rectangles cover.
+    /// Without this the saving is invisible: the passes still appear in the
+    /// worlds-rendered count, only their fill is gone.
+    scissored: u64,
+    scissor_cover: f64,
+    scissor_frames: u64,
 }
 
 impl FrameBudget {
-    fn add(&mut self, stage_ms: [f64; STAGE_COUNT], passes: u32) {
+    fn add(&mut self, stage_ms: [f64; STAGE_COUNT], passes: u32, scissored: u32, cover: f32) {
         for (total, ms) in self.stage_ms.iter_mut().zip(stage_ms) {
             *total += ms;
         }
         self.frames += 1;
         self.passes += u64::from(passes);
+        if scissored > 0 {
+            self.scissored += u64::from(scissored);
+            self.scissor_cover += f64::from(cover);
+            self.scissor_frames += 1;
+        }
         self.worst_ms = self.worst_ms.max(stage_ms.iter().sum::<f64>());
     }
 
@@ -395,9 +472,19 @@ impl FrameBudget {
             for (name, ms) in STAGE_NAMES.iter().zip(self.stage_ms) {
                 let _ = write!(stages, "; {name} {:.2} ms", ms / self.frames as f64);
             }
+            // Only mentioned when it happened, so the line stays the same shape
+            // for a view with no water in it.
+            let mut scissors = String::new();
+            if self.scissor_frames > 0 {
+                let _ = write!(
+                    scissors,
+                    ", water views scissored to {:.0}% of the screen",
+                    self.scissor_cover / self.scissor_frames as f64 * 100.
+                );
+            }
             crate::diag!(
                 TimingFrame,
-                "CPU frame {:.2} ms average, {:.2} ms worst, {:.1} frames/s, {:.1} world renders/frame, {pages} world pages{}",
+                "CPU frame {:.2} ms average, {:.2} ms worst, {:.1} frames/s, {:.1} world renders/frame{scissors}, {pages} world pages{}",
                 self.stage_ms.iter().sum::<f64>() / self.frames as f64,
                 self.worst_ms,
                 self.frames as f64 / elapsed,
@@ -409,6 +496,9 @@ impl FrameBudget {
         self.frames = 0;
         self.worst_ms = 0.;
         self.passes = 0;
+        self.scissored = 0;
+        self.scissor_cover = 0.;
+        self.scissor_frames = 0;
         self.since = Some(Instant::now());
     }
 }
@@ -1693,6 +1783,10 @@ struct Renderer {
     /// World renders this frame will submit: the main view plus a mirror and a
     /// refraction pass for every visible water plane.
     scene_passes: u32,
+    /// Water views this frame that were scissored, and their mean share of the
+    /// target. Reported once a second so the saving is visible in the log.
+    water_scissored: u32,
+    water_scissor_cover: f32,
     world_glow: crate::post_gpu::WorldGlow,
     celestial_visibility: crate::client_sun::Visibility,
     /// Raw `+0x80` disc-flag word from the default area, before the viewer's
@@ -2430,6 +2524,8 @@ impl Renderer {
             frame: FrameSnapshot::default(),
             frame_budget: FrameBudget::default(),
             scene_passes: 1,
+            water_scissored: 0,
+            water_scissor_cover: 0.,
             world_glow: crate::post_gpu::WorldGlow::default(),
             celestial_visibility: crate::client_sun::Visibility::default(),
             celestial_flags: 0x18,
@@ -3027,6 +3123,9 @@ impl Renderer {
         terrain_depth_source: Option<&wgpu::Texture>,
         clear_color: Option<wgpu::Color>,
         frustum: &[[f32; 4]; 6],
+        // The water's extra views are read only by the water surface, inside
+        // `water_view_scissor`'s rectangle. `None` draws the whole attachment.
+        scissor: Option<[u32; 4]>,
     ) {
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
@@ -3054,6 +3153,9 @@ impl Renderer {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+        if let Some([x, y, w, h]) = scissor {
+            p.set_scissor_rect(x, y, w, h);
+        }
         if clear_color.is_none() {
             self.sky.draw(&mut p, sky_reflected);
         }
@@ -3108,6 +3210,9 @@ impl Renderer {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+        if let Some([x, y, w, h]) = scissor {
+            p.set_scissor_rect(x, y, w, h);
+        }
         if !ui_test() && !skip_trees_test() {
             self.far_trees.draw(&mut p, reflected);
         }
@@ -3404,6 +3509,7 @@ impl Renderer {
         );
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
+        let frustum = crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array());
         let mut e = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -3425,7 +3531,9 @@ impl Renderer {
             view_runs,
             None,
             None,
-            &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+            &frustum,
+            // The map image is read as a whole, so there is nothing to scissor.
+            None,
         );
         {
             let mut pass = e.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3533,6 +3641,8 @@ impl Renderer {
         let mut stage_ms = [0f64; STAGE_COUNT];
         let mut lap_at = Instant::now();
         self.scene_passes = 1;
+        self.water_scissored = 0;
+        self.water_scissor_cover = 0.;
         // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
         // the same block walk the client runs before the level rule.
         // Both buffers are reused: this runs for every view of every frame.
@@ -3677,6 +3787,17 @@ impl Renderer {
                 occlusion_query_set: None,
             });
         }
+        // One frustum for the whole frame: the main scene, its models and both
+        // refraction passes all read the same matrix, and this used to be
+        // extracted from it three times per frame.
+        let frustum = crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array());
+        // The main depth is copied into the water's `terrain_depth` for the edge
+        // reconstruction, which only the water surface reads (and only when it is
+        // above the plane). No water plane on screen, no reader.
+        let water_edge_reads_terrain_depth = self
+            .water_batches
+            .iter()
+            .any(|b| !b.simple && b.visible(matrix));
         self.draw_opaque(
             &mut e,
             "main scene",
@@ -3687,9 +3808,14 @@ impl Renderer {
             false,
             main_pass,
             ViewRuns::Main,
-            Some(&self.depth),
+            if water_edge_reads_terrain_depth {
+                Some(&self.depth)
+            } else {
+                None
+            },
             None,
-            &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+            &frustum,
+            None,
         );
         let model_target = self.water.scene_raw();
         self.draw_models(
@@ -3700,7 +3826,7 @@ impl Renderer {
             camera,
             Pass::Main,
             true,
-            &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+            &frustum,
             unjittered_vp,
         );
         self.draw_addons(
@@ -3758,10 +3884,16 @@ impl Renderer {
         // full-frame texture copy every frame. The depth copy is the post chain's
         // input and only that (`sample_depth` is read by `PostGpu::render`
         // alone), so it follows `use_post`.
-        if self
-            .water_batches
-            .iter()
-            .any(|b| !b.simple && b.visible(matrix))
+        // With reflections on, every visible non-simple plane renders its own
+        // refraction target (clearing all of it) before its surface is drawn, so
+        // this copy can never be read: the only frame that needs it is one with
+        // reflections off, where no per-plane pass runs and the surface still
+        // samples the refraction by screen UV.
+        if !camera.water_reflections
+            && self
+                .water_batches
+                .iter()
+                .any(|b| !b.simple && b.visible(matrix))
         {
             self.water.copy_scene_to_refraction(&mut e);
         }
@@ -3897,6 +4029,10 @@ impl Renderer {
             self.end_frame(stage_ms, lap_at);
             return;
         }
+        // How far the water surface samples away from itself, in UV: the shader
+        // displaces by `n.xz * edge * edge * 0.25`, and `|n.xz|` is bounded by
+        // the loaded normal map. One pixel of slack covers the filter footprint.
+        let water_margin = (0.25 * self.water.normal_extent() + 0.01).clamp(0.02, 0.26);
         // One main pass, then a mirror and a refraction pass per non-simple plane
         // below. Nothing here is duplicated work to remove — a mirror is a mirror
         // — but the count is what decides how much world the frame rasterises, so
@@ -3925,6 +4061,17 @@ impl Renderer {
                 self.queue.submit(Some(e.finish()));
             }
             let plane = batch.height;
+            // Both refraction branches draw through the main matrix, and the
+            // water surface reads their output by screen UV displaced by at most
+            // a quarter. Everything outside this rectangle is shaded today and
+            // read by nobody.
+            let refraction_scissor =
+                water_view_scissor(matrix, w, h, batch.bounds, plane, water_margin);
+            if let Some([_, _, sw, sh]) = refraction_scissor {
+                self.water_scissored += 1;
+                self.water_scissor_cover +=
+                    (sw as f32 * sh as f32) / (w as f32 * h as f32);
+            }
             // A previous plane's reflection left its mirrored records in the
             // buffer; the refraction passes below draw through the main matrix.
             if batch_idx > 0 {
@@ -3990,7 +4137,8 @@ impl Renderer {
                         b: linear(fog[2]),
                         a: 1.,
                     }),
-                    &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+                    &frustum,
+                    refraction_scissor,
                 );
                 let model_view = self.water.refraction_raw();
                 self.draw_addons(
@@ -4043,7 +4191,8 @@ impl Renderer {
                     ViewRuns::Main,
                     None,
                     None,
-                    &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+                    &frustum,
+                    refraction_scissor,
                 );
                 if let Some(cloud) = &self.cloud {
                     cloud.draw(
@@ -4121,6 +4270,8 @@ impl Renderer {
             }
             let flip = Mat4::from_translation(Vec3::new(0., 2. * plane, 0.))
                 * Mat4::from_scale(Vec3::new(1., -1., 1.));
+            let reflected_frustum =
+                crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array());
             let reflected = Uniform {
                 matrix: (matrix * flip).to_cols_array_2d(),
                 direction: [direction.x, -direction.y, direction.z, daylight],
@@ -4173,7 +4324,10 @@ impl Renderer {
                 ViewRuns::Reflected,
                 None,
                 None,
-                &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
+                &reflected_frustum,
+                // The mirror is read at `screen ± 0.25` by the same surface, so
+                // the same rectangle applies through the mirrored matrix.
+                water_view_scissor(matrix * flip, w, h, batch.bounds, plane, water_margin),
             );
             if let Some(cloud) = &self.cloud {
                 cloud.draw(
@@ -4298,7 +4452,13 @@ impl Renderer {
         stage_ms[STAGE_REST] += lap_at.elapsed().as_secs_f64() * 1000.;
         let pages = self.world_pages.len();
         let passes = self.scene_passes;
-        self.frame_budget.add(stage_ms, passes);
+        let scissored = self.water_scissored;
+        let cover = if scissored > 0 {
+            self.water_scissor_cover / scissored as f32
+        } else {
+            0.
+        };
+        self.frame_budget.add(stage_ms, passes, scissored, cover);
         self.frame_budget.report(pages);
     }
 }
@@ -7714,8 +7874,8 @@ mod frame_budget_tests {
     #[test]
     fn a_second_of_frames_averages_per_stage_and_then_starts_over() {
         let mut budget = FrameBudget::default();
-        budget.add(sample(1., 3.), 1);
-        budget.add(sample(1., 5.), 3);
+        budget.add(sample(1., 3.), 1, 0, 0.);
+        budget.add(sample(1., 5.), 3, 2, 0.25);
         assert_eq!(budget.frames, 2);
         assert_eq!(budget.passes, 4);
         assert_eq!(budget.worst_ms, 6.);
@@ -7725,6 +7885,8 @@ mod frame_budget_tests {
         assert_eq!(budget.stage_ms, [0.; STAGE_COUNT]);
         assert_eq!(budget.worst_ms, 0.);
         assert_eq!(budget.passes, 0, "the renders per frame start over too");
+        assert_eq!(budget.scissored, 0);
+        assert_eq!(budget.scissor_frames, 0);
     }
 
     /// The minimap's key is the whole reason a top-down pass runs at all, so it
@@ -7759,5 +7921,122 @@ mod frame_budget_tests {
         assert!(budget.stage_ms[STAGE_MINIMAP] >= 4.);
         assert_eq!(budget.stage_ms[STAGE_MAIN], 0.);
         assert_eq!(budget.frames, 0, "the minimap is a stage, not a frame");
+    }
+}
+
+#[cfg(test)]
+mod water_scissor_tests {
+    use super::*;
+
+    const W: u32 = 3440;
+    const H: u32 = 1369;
+
+    /// A camera at `eye` looking along `direction`, with the frame's aspect.
+    fn camera(eye: Vec3, direction: Vec3) -> Mat4 {
+        Mat4::perspective_rh(60f32.to_radians(), W as f32 / H as f32, 0.1, 20000.)
+            * Mat4::look_to_rh(eye, direction, Vec3::Y)
+    }
+
+    /// The plane's four corners in pixels, without any margin.
+    fn corners(matrix: Mat4, bounds: [f32; 4], height: f32) -> [[f32; 2]; 4] {
+        let [x0, x1, z0, z1] = bounds;
+        [(x0, z0), (x0, z1), (x1, z0), (x1, z1)].map(|(x, z)| {
+            let p = matrix * Vec4::new(x, height, z, 1.);
+            let ndc = [p.x / p.w, p.y / p.w];
+            [
+                (ndc[0] * 0.5 + 0.5) * W as f32,
+                (0.5 - ndc[1] * 0.5) * H as f32,
+            ]
+        })
+    }
+
+    /// A pond ahead of and below the eye is scissored to its own rectangle, and
+    /// that rectangle leaves the margin the surface's displaced sampling needs on
+    /// every side.
+    #[test]
+    fn a_pond_ahead_keeps_the_margin_the_surface_samples_through() {
+        let matrix = camera(Vec3::new(0., 30., 0.), Vec3::new(0., -0.5, -0.866));
+        let bounds = [-40., 40., -160., -60.];
+        let margin = 0.12;
+        let rect =
+            water_view_scissor(matrix, W, H, bounds, 0., margin).expect("a small pond is scissored");
+        let [x, y, w, h] = rect;
+        assert!(w < W / 2 && h < H / 2, "the pond does not fill the view: {rect:?}");
+        assert!(x + w <= W && y + h <= H, "the rectangle stays inside the target");
+
+        let corners = corners(matrix, bounds, 0.);
+        let min_x = corners.iter().map(|c| c[0]).fold(f32::INFINITY, f32::min);
+        let max_x = corners.iter().map(|c| c[0]).fold(f32::NEG_INFINITY, f32::max);
+        let min_y = corners.iter().map(|c| c[1]).fold(f32::INFINITY, f32::min);
+        let max_y = corners.iter().map(|c| c[1]).fold(f32::NEG_INFINITY, f32::max);
+        // Every side must reach the sampling margin past the pond, or be clamped
+        // by the target's own edge.
+        let margin_x = W as f32 * margin;
+        let margin_y = H as f32 * margin;
+        assert!(x as f32 <= min_x - margin_x || x == 0, "left margin short");
+        assert!(
+            (x + w) as f32 >= max_x + margin_x || x + w == W,
+            "right margin short"
+        );
+        assert!(y as f32 <= min_y - margin_y || y == 0, "top margin short");
+        assert!(
+            (y + h) as f32 >= max_y + margin_y || y + h == H,
+            "bottom margin short"
+        );
+    }
+
+    /// A plane that runs past the camera has a corner behind the eye, where the
+    /// projection is meaningless, so the whole target is drawn as before.
+    #[test]
+    fn a_plane_running_past_the_eye_is_never_scissored() {
+        let matrix = camera(Vec3::new(0., 30., 0.), Vec3::new(0., -0.5, -0.866));
+        assert_eq!(
+            water_view_scissor(matrix, W, H, [-400., 400., -400., 400.], 0., 0.12),
+            None
+        );
+    }
+
+    /// When the plane covers the view there is nothing to save, and answering
+    /// `None` keeps the behaviour identical to drawing it all.
+    #[test]
+    fn a_plane_that_fills_the_view_is_left_alone() {
+        let matrix = camera(Vec3::new(0., 400., 0.), Vec3::new(0., -1., -0.0001));
+        assert_eq!(
+            water_view_scissor(matrix, W, H, [-5000., 5000., -5000., 5000.], 0., 0.12),
+            None
+        );
+    }
+
+    /// The measured normal-map bound is what makes the scissor worth having: with
+    /// the worst case a normal map could hold (a quarter of the target) the
+    /// rectangle is little better than the whole screen, and with the shipped
+    /// map's own bound it is most of the saving.
+    #[test]
+    fn the_measured_margin_is_what_buys_the_saving() {
+        let matrix = camera(Vec3::new(0., 60., 0.), Vec3::new(0., -0.6, -0.8));
+        let bounds = [-60., 60., -220., -80.];
+        let target = (W * H) as f32;
+        let cover = |margin: f32| {
+            let [_, _, w, h] = water_view_scissor(matrix, W, H, bounds, 0., margin)
+                .expect("the pond is scissored at either margin");
+            (w * h) as f32 / target
+        };
+        assert!(
+            cover(0.26) > cover(0.06) * 1.5,
+            "a tight bound must buy a much smaller rectangle: {} vs {}",
+            cover(0.26),
+            cover(0.06)
+        );
+    }
+
+    /// A plane that is off screen entirely is `WaterBatch::visible`'s decision,
+    /// not this function's: it draws the whole target rather than nothing.
+    #[test]
+    fn a_plane_behind_the_camera_falls_back_to_the_whole_target() {
+        let matrix = camera(Vec3::new(0., 30., 0.), Vec3::new(0., -0.5, -0.866));
+        assert_eq!(
+            water_view_scissor(matrix, W, H, [-40., 40., 60., 160.], 0., 0.12),
+            None
+        );
     }
 }

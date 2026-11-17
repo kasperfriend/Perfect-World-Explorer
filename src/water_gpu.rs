@@ -194,6 +194,32 @@ struct Targets {
     height: u32,
     bind: wgpu::BindGroup,
 }
+/// The largest `|x|` or `|z|` a decoded texel of the water normal map holds,
+/// where a decoded component is `texel * 2 - 1`.
+///
+/// The surface displaces its screen-space samples by `n.xz * edge * edge * 0.25`.
+/// `edge` is in `0..1`, so `|n.xz|` is the only unknown, and it is a property of
+/// the shipped map rather than of the frame: measuring it once at load is what
+/// lets a reflection or refraction render be scissored to the part of the screen
+/// the surface can actually read, instead of to a quarter of the screen on every
+/// side. Every mip level is scanned, and a filtered sample or the cross-frame
+/// blend of two of them is an average of these values, so neither can exceed it.
+fn normal_extent(frames: &[Vec<image::RgbaImage>]) -> f32 {
+    let mut extent: f32 = 0.;
+    for levels in frames {
+        for image in levels {
+            for px in image.pixels() {
+                // `n.xz` is the decoded red and blue channels.
+                for channel in [0, 2] {
+                    let decoded = px.0[channel] as f32 / 255. * 2. - 1.;
+                    extent = extent.max(decoded.abs());
+                }
+            }
+        }
+    }
+    extent.clamp(0., 1.)
+}
+
 pub struct WaterGpu {
     layout: wgpu::BindGroupLayout,
     uniform: wgpu::Buffer,
@@ -208,6 +234,10 @@ pub struct WaterGpu {
     edge_near: wgpu::RenderPipeline,
     edge_far: wgpu::RenderPipeline,
     format: wgpu::TextureFormat,
+    /// Largest `|x|` or `|z|` in the loaded normal map, decoded as the shader
+    /// decodes it. The scissor for the reflection and refraction renders is sized
+    /// from this instead of from the worst case a normal map could hold.
+    normal_extent: f32,
 }
 fn color(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> wgpu::Texture {
     let alternate = [format.remove_srgb_suffix()];
@@ -576,6 +606,7 @@ impl WaterGpu {
             edge_near,
             edge_far,
             format,
+            normal_extent: normal_extent(frames),
         }
     }
     fn targets(
@@ -690,6 +721,11 @@ impl WaterGpu {
             bind,
         }
     }
+    /// See [`normal_extent`]. Bounded to `0..1`.
+    pub fn normal_extent(&self) -> f32 {
+        self.normal_extent
+    }
+
     pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) {
         self.targets = Self::targets(
             device,
@@ -939,6 +975,25 @@ impl WaterGpu {
 #[cfg(test)]
 mod animation_tests {
     use super::{cell_base_uv, normal_offset_angle, normal_phase, refraction_fog_range};
+    /// The scissor that makes a reflection or refraction render cheap is sized
+    /// from this number, so it has to be the decoded-component maximum the shader
+    /// can actually sample: `texel * 2 - 1` of the red and blue channels, over
+    /// every frame and every mip.
+    #[test]
+    fn the_normal_extent_is_the_widest_component_the_shader_can_sample() {
+        use image::RgbaImage;
+        let flat = RgbaImage::from_pixel(4, 4, image::Rgba([128, 128, 128, 255]));
+        // 64 decodes to -0.498, and 128 to +0.004: the widest is the 64.
+        let mut tilted = flat.clone();
+        tilted.put_pixel(1, 1, image::Rgba([128, 128, 64, 255]));
+        assert!(super::normal_extent(&[vec![flat.clone()]]) < 0.01);
+        let extent = super::normal_extent(&[vec![flat.clone()], vec![tilted]]);
+        assert!((extent - 0.498).abs() < 1e-3, "got {extent}");
+        // A component at either end of the byte range is a full unit.
+        let extreme = RgbaImage::from_pixel(2, 2, image::Rgba([0, 128, 255, 255]));
+        assert!((super::normal_extent(&[vec![extreme]]) - 1.).abs() < 1e-6);
+    }
+
     #[test]
     fn client_refraction_fog_tracks_plane_and_region() {
         let a = refraction_fog_range(30., 20., 100.);
