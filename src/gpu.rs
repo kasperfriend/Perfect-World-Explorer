@@ -6807,6 +6807,7 @@ pub fn preview(
         DetailSettings::default(),
         &mut residency,
         false,
+        0,
     )?;
     let (width, height) = (960u32, 720u32);
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
