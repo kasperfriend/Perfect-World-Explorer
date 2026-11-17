@@ -6,6 +6,40 @@
 //! a request. The current client formats still require CPU-side
 //! parsing/decompression; this does not claim GPU decompression or instant startup.
 
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static FALLBACKS: AtomicU64 = AtomicU64::new(0);
+static BYTES_READ: AtomicU64 = AtomicU64::new(0);
+static ACTIVE_READS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ReadStats {
+    pub attempts: u64,
+    pub successes: u64,
+    pub fallbacks: u64,
+    pub bytes: u64,
+    pub active: usize,
+}
+
+/// A process-wide telemetry snapshot for the loading window. Only successfully
+/// completed DirectStorage reads contribute to bytes/throughput; failed
+/// attempts are counted separately because PCK falls back to ordinary I/O.
+pub(crate) fn read_stats() -> ReadStats {
+    ReadStats {
+        attempts: ATTEMPTS.load(Ordering::Relaxed),
+        successes: SUCCESSES.load(Ordering::Relaxed),
+        fallbacks: FALLBACKS.load(Ordering::Relaxed),
+        bytes: BYTES_READ.load(Ordering::Relaxed),
+        active: ACTIVE_READS.load(Ordering::Relaxed),
+    }
+}
+
+pub(crate) const fn compiled_in() -> bool {
+    cfg!(pwe_directstorage)
+}
+
 #[cfg(all(windows, pwe_directstorage))]
 mod enabled {
     use std::{fs::File, os::windows::io::AsRawHandle};
@@ -62,7 +96,20 @@ mod enabled {
 pub fn read_range(file: &std::fs::File, offset: u64, output: &mut [u8]) -> bool {
     #[cfg(pwe_directstorage)]
     {
-        enabled::read(file, offset, output)
+        if output.is_empty() {
+            return true;
+        }
+        ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+        ACTIVE_READS.fetch_add(1, Ordering::Relaxed);
+        let succeeded = enabled::read(file, offset, output);
+        ACTIVE_READS.fetch_sub(1, Ordering::Relaxed);
+        if succeeded {
+            SUCCESSES.fetch_add(1, Ordering::Relaxed);
+            BYTES_READ.fetch_add(output.len() as u64, Ordering::Relaxed);
+        } else {
+            FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        }
+        succeeded
     }
     #[cfg(not(pwe_directstorage))]
     {

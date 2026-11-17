@@ -4,7 +4,7 @@ use flate2::read::ZlibDecoder;
 use flate2::{Decompress, FlushDecompress};
 #[cfg(windows)]
 #[path = "direct_storage.rs"]
-mod direct_storage;
+pub(crate) mod direct_storage;
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},

@@ -292,6 +292,28 @@ pub fn loading_progress(message: String) {
         }
     }
 }
+fn directstorage_state(stats: crate::pck::direct_storage::ReadStats) -> String {
+    if !crate::pck::direct_storage::compiled_in() {
+        return "DirectStorage not built in; standard file I/O is in use".into();
+    }
+    if stats.successes > 0 {
+        return format!(
+            "Using DirectStorage in loading — ACTIVE ({} successful reads)",
+            stats.successes
+        );
+    }
+    if stats.fallbacks > 0 {
+        return format!(
+            "DirectStorage attempts fell back to standard I/O ({} so far)",
+            stats.fallbacks
+        );
+    }
+    if stats.active > 0 {
+        return format!("DirectStorage read in progress ({} active)", stats.active);
+    }
+    "DirectStorage ready; waiting for eligible archive reads (64 KiB+)".into()
+}
+
 pub struct LoadingWindow {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -318,45 +340,96 @@ impl LoadingWindow {
                 0x00c00000 | 0x10000000,
                 0x80000000u32 as i32,
                 0x80000000u32 as i32,
-                540,
-                160,
+                620,
+                230,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             );
-            let label = if hwnd.is_null() {
-                std::ptr::null_mut()
-            } else {
-                let h = control(
-                    hwnd,
-                    GetModuleHandleW(std::ptr::null()),
-                    "STATIC",
-                    "Loading the world...",
-                    0x50000000,
-                    24,
-                    22,
-                    480,
-                    25,
-                    0,
-                );
-                control(
-                    hwnd,
-                    GetModuleHandleW(std::ptr::null()),
-                    "STATIC",
-                    "First launch may take several minutes while trees are prepared.",
-                    0x50000000,
-                    24,
-                    55,
-                    480,
-                    25,
-                    0,
-                );
-                ShowWindow(hwnd, 5);
-                UpdateWindow(hwnd);
-                h
-            };
+            let (status_label, ds_state_label, ds_graph_label, ds_totals_label) =
+                if hwnd.is_null() {
+                    (
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                } else {
+                    let instance = GetModuleHandleW(std::ptr::null());
+                    let status = control(
+                        hwnd,
+                        instance,
+                        "STATIC",
+                        "Loading the world...",
+                        0x50000000,
+                        24,
+                        20,
+                        560,
+                        25,
+                        0,
+                    );
+                    control(
+                        hwnd,
+                        instance,
+                        "STATIC",
+                        "First launch may take several minutes while trees are prepared.",
+                        0x50000000,
+                        24,
+                        51,
+                        560,
+                        25,
+                        0,
+                    );
+                    let ds_state = control(
+                        hwnd,
+                        instance,
+                        "STATIC",
+                        "DirectStorage status is being checked...",
+                        0x50000000,
+                        24,
+                        87,
+                        560,
+                        25,
+                        0,
+                    );
+                    let ds_graph = control(
+                        hwnd,
+                        instance,
+                        "STATIC",
+                        "Read throughput (MiB/s): ······························",
+                        0x50000000,
+                        24,
+                        115,
+                        560,
+                        28,
+                        0,
+                    );
+                    let ds_totals = control(
+                        hwnd,
+                        instance,
+                        "STATIC",
+                        "DirectStorage: 0 reads / 0 MiB | attempts: 0 | fallback: 0 | active: 0",
+                        0x50000000,
+                        24,
+                        148,
+                        560,
+                        38,
+                        0,
+                    );
+                    ShowWindow(hwnd, 5);
+                    UpdateWindow(hwnd);
+                    (status, ds_state, ds_graph, ds_totals)
+                };
             let _ = ready_tx.send(());
+
+            let mut samples = std::collections::VecDeque::<f64>::with_capacity(32);
+            let mut previous_bytes = 0u64;
+            let mut last_sample = std::time::Instant::now();
+            let mut last_state = String::new();
+            let mut last_graph = String::new();
+            let mut last_totals = String::new();
+
             while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                 let mut msg: WinMessage = std::mem::zeroed();
                 while PeekMessageW(&mut msg, hwnd, 0, 0, 1) != 0 {
@@ -364,8 +437,52 @@ impl LoadingWindow {
                     DispatchMessageW(&msg);
                 }
                 while let Ok(text) = status_rx.try_recv() {
-                    if !label.is_null() {
-                        SetWindowTextW(label, wide(&text).as_ptr());
+                    if !status_label.is_null() {
+                        SetWindowTextW(status_label, wide(&text).as_ptr());
+                    }
+                }
+
+                let now = std::time::Instant::now();
+                let stats = crate::pck::direct_storage::read_stats();
+                let state = directstorage_state(stats);
+                if !ds_state_label.is_null() && state != last_state {
+                    SetWindowTextW(ds_state_label, wide(&state).as_ptr());
+                    last_state = state;
+                }
+                let totals = format!(
+                    "DirectStorage: {} reads / {:.2} MiB | attempts: {} | fallback: {} | active: {}",
+                    stats.successes,
+                    stats.bytes as f64 / (1024.0 * 1024.0),
+                    stats.attempts,
+                    stats.fallbacks,
+                    stats.active
+                );
+                if !ds_totals_label.is_null() && totals != last_totals {
+                    SetWindowTextW(ds_totals_label, wide(&totals).as_ptr());
+                    last_totals = totals;
+                }
+
+                if now.duration_since(last_sample) >= std::time::Duration::from_millis(500) {
+                    let elapsed = now.duration_since(last_sample).as_secs_f64();
+                    let current_rate = crate::loading_graph::mib_per_second(
+                        stats.bytes.saturating_sub(previous_bytes),
+                        elapsed,
+                    );
+                    previous_bytes = stats.bytes;
+                    last_sample = now;
+                    if samples.len() == 32 {
+                        samples.pop_front();
+                    }
+                    samples.push_back(current_rate);
+                    let peak = samples.iter().copied().fold(0.0f64, f64::max);
+                    let graph = format!(
+                        "MiB/s (last 16s; peak {:.1}): {}",
+                        peak,
+                        crate::loading_graph::sparkline(samples.make_contiguous())
+                    );
+                    if !ds_graph_label.is_null() && graph != last_graph {
+                        SetWindowTextW(ds_graph_label, wide(&graph).as_ptr());
+                        last_graph = graph;
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(40));
