@@ -56,6 +56,10 @@ pub(crate) struct Uniform {
     /// the native blend instead of inverting the lightmap-availability flag.
     fog_range: [f32; 4],
     fog_color: [f32; 4], // encoded client ARGB
+    /// `x`: LOD bias in mip levels for the mipmapped world atlases, `y`:
+    /// `exp2(x)`, the factor that folds the bias into a texture gradient (see
+    /// `crate::render_scale::mip_bias`). `z`/`w` unused.
+    lod: [f32; 4],
 }
 
 /// One lighting/playback snapshot per rendered frame. `render()` samples wall
@@ -133,6 +137,7 @@ impl FrameSnapshot {
         clip: [f32; 4],
         fog_range: [f32; 4],
         fog_color: [f32; 4],
+        lod: [f32; 4],
     ) -> Uniform {
         Uniform {
             matrix: matrix.to_cols_array_2d(),
@@ -150,6 +155,7 @@ impl FrameSnapshot {
             grass_history: self.grass_history,
             fog_range,
             fog_color,
+            lod,
         }
     }
     fn secondary(&self, pass: Pass) -> crate::scenery_visibility::SecondaryView {
@@ -1242,7 +1248,7 @@ fn build(
     })
 }
 const SHADER: &str = r#"
-struct Camera { matrix: mat4x4<f32>, direction: vec4<f32>, clip: vec4<f32>, bounds:vec4<f32>, tree_bounds:vec4<f32>, sun:vec4<f32>, light:vec4<f32>, region_ambient:vec4<f32>, region_diffuse:vec4<f32>, region_direction:vec4<f32>, grass_eye:vec4<f32>, grass_wind:vec4<f32>, grass_history:array<vec4<f32>,80>, fog_range:vec4<f32>, fog_color:vec4<f32> }; @group(0) @binding(0) var<uniform> camera:Camera;
+struct Camera { matrix: mat4x4<f32>, direction: vec4<f32>, clip: vec4<f32>, bounds:vec4<f32>, tree_bounds:vec4<f32>, sun:vec4<f32>, light:vec4<f32>, region_ambient:vec4<f32>, region_diffuse:vec4<f32>, region_direction:vec4<f32>, grass_eye:vec4<f32>, grass_wind:vec4<f32>, grass_history:array<vec4<f32>,80>, fog_range:vec4<f32>, fog_color:vec4<f32>, lod:vec4<f32> }; @group(0) @binding(0) var<uniform> camera:Camera;
 @group(0) @binding(1) var atlas:texture_2d<f32>; @group(0) @binding(2) var atlas_sampler:sampler;
 fn fogged(linear:vec3<f32>, reciprocal_w:f32)->vec3<f32> {
  if camera.fog_range.z<0.5 {return linear;}
@@ -1283,7 +1289,7 @@ fn bmd_baked_rgb(day:u32, night:u32, night_factor:f32)->vec3<u32> {
  if i.kind>4.5 { let d=normalize(camera.direction.xyz); let az=atan2(d.z,d.x); let el=asin(clamp(d.y,-1.,1.)); let rho=i.color.w; let q=vec3<f32>(cos(el)*i.normal.x-sin(el)*i.normal.z,i.normal.y,sin(el)*i.normal.x+cos(el)*i.normal.z); let a=az+rho;var v=vec3<f32>(cos(a)*q.x-sin(a)*q.y,sin(a)*q.x+cos(a)*q.y,q.z);if rho>1000. { v=i.normal; }pos+=vec3<f32>(v.x,v.z,v.y);norm=vec3<f32>(0.,1.,0.); }
  o.pos=camera.matrix*vec4<f32>(pos,1.);o.bmd_refraction=1.;if camera.clip.y<0. && i.kind>1.5 && i.kind<2.5 {o.bmd_refraction=bmd_refraction_transmittance(pos);}o.world=pos;o.normal=norm;o.uv=i.uv;o.color=i.color;o.kind=i.kind;o.diffuse=vec3<f32>(bmd_baked_rgb(i.diffuse,i.night_diffuse,1.-camera.direction.w))/255.;o.opacity=f32((i.diffuse>>24u)&255u)/255.;return o; }
 fn sdr_blend_band(kind:f32)->bool { return (kind>2.01 && kind<2.03)||(kind>2.11 && kind<2.13); }
-fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || (i.kind>1.5 && i.kind<2.05)) && camera.clip.w == 0. && (front == (camera.clip.z != 0.)) {discard;} if camera.clip.y != 0.0 && (i.world.y-camera.clip.x)*camera.clip.y < 0.0 {discard;} if i.kind>0.5 && i.kind<1.05 {return vec4<f32>(fogged(i.color.rgb,i.pos.w),1.);} if i.kind>1.05 && i.kind<1.25 {return vec4<f32>(bmd_pass_fog(clamp(i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.)),i.pos.w,i.bmd_refraction),1.);} let uv_dx=dpdx(i.uv);let uv_dy=dpdy(i.uv);var uv=i.uv; if i.kind>1.5 {let scale=vec2<f32>(i.color.z,select(i.color.z,i.color.w,i.kind<2.5));let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(uv_dx*dims),length(uv_dy*dims)),1.)),0.,7.);let border=0.5*exp2(mip);let half_pixel=min(vec2<f32>(border)/dims,scale*0.499);let sdr_v=select(0.,-0.5*camera.grass_wind.x,sdr_blend_band(i.kind));let local=fract((i.uv-i.color.xy)/scale+vec2<f32>(0.,sdr_v))*scale;uv=i.color.xy+clamp(local,half_pixel,scale-half_pixel);} let raw_tex=textureSampleGrad(atlas,atlas_sampler,uv,uv_dx,uv_dy);let encoded=raw_tex.rgb;let linear=select(encoded/12.92,pow((encoded+0.055)/1.055,vec3<f32>(2.4)),encoded>vec3<f32>(0.04045));let tex=vec4<f32>(linear,raw_tex.a);if !sdr_blend_band(i.kind) && ((i.kind>1.5 && i.kind<2.5) || i.kind>3.5) && tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9) {discard;} if i.kind>1.5 && i.kind<2.5 {let c=clamp(raw_tex.rgb*i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.));let rgb=select(c/12.92,pow((c+0.055)/1.055,vec3<f32>(2.4)),c>vec3<f32>(0.04045));return vec4<f32>(bmd_pass_fog(rgb,i.pos.w,i.bmd_refraction),select(1.,raw_tex.a*i.opacity,sdr_blend_band(i.kind)));} let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.pos.w),1.); }
+fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || (i.kind>1.5 && i.kind<2.05)) && camera.clip.w == 0. && (front == (camera.clip.z != 0.)) {discard;} if camera.clip.y != 0.0 && (i.world.y-camera.clip.x)*camera.clip.y < 0.0 {discard;} if i.kind>0.5 && i.kind<1.05 {return vec4<f32>(fogged(i.color.rgb,i.pos.w),1.);} if i.kind>1.05 && i.kind<1.25 {return vec4<f32>(bmd_pass_fog(clamp(i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.)),i.pos.w,i.bmd_refraction),1.);} let uv_dx=dpdx(i.uv);let uv_dy=dpdy(i.uv);var uv=i.uv; if i.kind>1.5 {let scale=vec2<f32>(i.color.z,select(i.color.z,i.color.w,i.kind<2.5));let dims=vec2<f32>(textureDimensions(atlas));let mip=clamp(log2(max(max(length(uv_dx*dims),length(uv_dy*dims)),1.)),0.,7.);let border=0.5*exp2(mip);let half_pixel=min(vec2<f32>(border)/dims,scale*0.499);let sdr_v=select(0.,-0.5*camera.grass_wind.x,sdr_blend_band(i.kind));let local=fract((i.uv-i.color.xy)/scale+vec2<f32>(0.,sdr_v))*scale;uv=i.color.xy+clamp(local,half_pixel,scale-half_pixel);} let raw_tex=textureSampleGrad(atlas,atlas_sampler,uv,uv_dx*camera.lod.y,uv_dy*camera.lod.y);let encoded=raw_tex.rgb;let linear=select(encoded/12.92,pow((encoded+0.055)/1.055,vec3<f32>(2.4)),encoded>vec3<f32>(0.04045));let tex=vec4<f32>(linear,raw_tex.a);if !sdr_blend_band(i.kind) && ((i.kind>1.5 && i.kind<2.5) || i.kind>3.5) && tex.a<select(0.5,i.color.w,i.kind>3.5 && i.kind<3.9) {discard;} if i.kind>1.5 && i.kind<2.5 {let c=clamp(raw_tex.rgb*i.diffuse*2.,vec3<f32>(0.),vec3<f32>(1.));let rgb=select(c/12.92,pow((c+0.055)/1.055,vec3<f32>(2.4)),c>vec3<f32>(0.04045));return vec4<f32>(bmd_pass_fog(rgb,i.pos.w,i.bmd_refraction),select(1.,raw_tex.a*i.opacity,sdr_blend_band(i.kind)));} let light=camera.light.x+camera.light.y*max(dot(normalize(i.normal),normalize(camera.sun.xyz)),0.);return vec4<f32>(fogged(tex.rgb*light*camera.light.zww,i.pos.w),1.); }
 @fragment fn fs(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
 @fragment fn fs_sdr(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if !sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
 "#;
@@ -1528,6 +1534,7 @@ impl Renderer {
                 grass_history: [[0.; 4]; 80],
                 fog_range: [0.; 4],
                 fog_color: [0.; 4],
+                lod: [0., 1., 0., 0.],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -1549,6 +1556,7 @@ impl Renderer {
                 grass_history: [[0.; 4]; 80],
                 fog_range: [0.; 4],
                 fog_color: [0.; 4],
+                lod: [0., 1., 0., 0.],
             }),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -2865,6 +2873,7 @@ impl Renderer {
             frame.clip,
             [0.; 4],
             [0.; 4],
+            [0., 1., 0., 0.],
         );
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
@@ -3039,6 +3048,15 @@ impl Renderer {
             frame.clip,
             frame.fog_range,
             frame.fog_color,
+            // The world atlases are mipmapped and the world is drawn below the
+            // display resolution whenever an upscaler runs; the bias is what
+            // keeps the mip choice tied to the display size.
+            [
+                crate::render_scale::mip_bias(),
+                crate::render_scale::mip_gradient_scale(),
+                0.,
+                0.,
+            ],
         );
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&normal));
@@ -3490,6 +3508,7 @@ impl Renderer {
                 grass_history: frame.grass_history,
                 fog_range: frame.fog_range,
                 fog_color: frame.fog_color,
+                lod: [0., 1., 0., 0.],
             };
             self.queue
                 .write_buffer(&self.reflected_uniform, 0, bytemuck::bytes_of(&reflected));
@@ -4641,6 +4660,17 @@ pub fn run(
                         world_extent.1,
                         config.width,
                         config.height,
+                    );
+                    // Mip bias for the world atlases (programming guide, "Mip
+                    // bias"): a temporal upscaler is given the guide's
+                    // `log2(render/display) - 1`, the resolution slider on its
+                    // own only the ratio. `world_extent` is the extent the world
+                    // is really drawn at, so a failed provider cannot leave a
+                    // stale bias behind.
+                    crate::render_scale::set_mip_bias(
+                        world_extent,
+                        (config.width, config.height),
+                        upscaler_running,
                     );
                     // A changed Frame generation or Latency setting clears
                     // the sticky failure of that feature, so the new choice

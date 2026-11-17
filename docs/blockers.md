@@ -1049,29 +1049,55 @@ DLSS-G parameter type.
   carries NGX's own `[NGX file …]` lines naming the refused parameter, which is
   the one thing this round could not obtain.
 
-## B-24 — No mip-map bias while an upscaler renders below display resolution (audit finding)
+## B-24 — No mip-map bias while an upscaler renders below display resolution (audit finding, fixed)
 
 - **Step:** Graphics tab, DLSS/XeSS/FSR at any quality below Native AA.
 - **Error:** none — a quality gap, not a failure. Guide §3.5: "When DLSS is
   active, the rendering engine must set the mip-map bias … to
   `log2(Render XResolution / Display XResolution) - 1.0 + epsilon`" so textures
   are sampled at *display* resolution rather than the lower render resolution.
-  The viewer applies no bias at all — `textureSample` everywhere, no
-  `textureSampleBias`, no LOD clamp — so anything mipmapped is sampled as if the
-  screen were the render resolution.
-- **Scope here is narrower than it sounds.** Almost every world texture is
-  created with `mip_level_count: 1` (26 sites), so there is no chain to bias;
-  exactly three atlases have eight mips (`src/gpu.rs:1562`,
-  `src/world_objects.rs:564`, `src/far_trees_gpu.rs:547`) and only those can
-  change. The world-pass sampling sites that would need a bias are in
-  `water_gpu` (9), `shore_gpu` (3), `model_receiver_gpu` (3), `cloud_gpu` (2) and
-  one each in `sky_gpu`, `simple_water_gpu`, `gfx_effect_gpu`, `gfx_decal_gpu`
-  and `weather_gpu`; `post_gpu`'s ten sites run at display resolution and need
-  none.
-- **Workaround:** the per-provider sharpening sliders (B-16, B-17) address the
-  perceived softness. Sharpening is not a substitute for correct LOD selection,
-  and it cannot recover detail that was never sampled.
-- **Status:** open, and documented rather than guessed at. Doing it properly
-  means a `mip_bias` uniform in each of those pipelines plus `textureSampleBias`
-  at each site — a cross-cutting change that cannot be compiled or run in this
-  environment, so it does not belong inside a DLSS-failure commit.
+  Before this fix the viewer applied no bias at all — `textureSample`
+  everywhere, no `textureSampleBias`, no LOD clamp — so anything mipmapped was
+  sampled as if the screen were the render resolution.
+- **Fix.** The bias is computed once per frame, where the frame loop already
+  knows both extents, in `crate::render_scale::set_mip_bias`: the guide's
+  `log2(renderX / displayX) - 1` while a temporal upscaler is alive (DLSS,
+  FSR 2, XeSS, or FSR 1 through `fsr1_eligible`), the bare ratio for the
+  resolution slider on its own, clamped to `-3..=0`. Render sizes at or above
+  the display size (Native AA, 100 %, or the supersampling half of the slider)
+  take no bias at all, so those modes are bit-for-bit unchanged. At the reported
+  2293x960 DLSS render extent on a 3440x1440 window the bias is -1.585, i.e.
+  `exp2(bias) = 0.334`.
+- **Plumbing.** `Uniform` — the camera buffer every world pipeline binds — gains
+  a fourth `lod` lane, `[bias, exp2(bias), 0, 0]`; the three WGSL `Camera`
+  mirrors (`src/gpu.rs`, `src/terrain_gpu.rs`, `src/far_trees_gpu.rs`) carry the
+  same member, and `model_receiver_gpu::Params` carries `lod.x` for the object
+  atlas. The minimap/full-map camera and the water-reflection camera write
+  `[0, 1, 0, 0]`: they are drawn into their own targets from the same atlases
+  and must keep the sharpest mips.
+- **Sites that now bias.** Only the textures that actually have a chain change,
+  and every one of them is a world-input atlas:
+  - `src/gpu.rs` — the world material atlas (8 mips). The pass supplies its own
+    gradient, so the bias is folded in as `uv_dx * camera.lod.y`.
+  - `src/terrain_gpu.rs` — the nine `textureSampleGrad` calls over the
+    BC/full/small layer arrays, whose chains are the full `side.ilog2() + 1`
+    levels. Folded in as `dx *= l.uv * camera.lod.y`, before the sample, because
+    the same gradient sets the minor-axis footprint.
+  - `src/far_trees_gpu.rs` — the tree atlas (8 mips). `dx`/`dy` are scaled
+    straight out of `dpdx`/`dpdy`, so the LOD the shader derives from them, the
+    half-texel clamp and the sample all agree.
+  - `src/model_receiver_gpu.rs` — the object atlas pages (8 mips). The three
+    `textureSample` calls become `textureSampleBias(…, p.lod.x)`.
+- **Deliberately not biased.** Every world texture created with
+  `mip_level_count: 1` — water, shore, clouds, sky backgrounds, effects, decals,
+  weather — has no chain to bias, so those pipelines are left alone rather than
+  sprinkled with no-op calls. `post_gpu` runs *after* the upscale at display
+  resolution and must not be biased. Explicit-LOD sites (`textureSampleLevel` in
+  `sky_gpu`, `grass_instances`, the terrain masks) already pick their level on
+  purpose and are untouched.
+- **Verification.** Unit tests in `src/render_scale.rs` pin the formula: the
+  guide value at the 2293x960/3440x1440 pair, the slider-only value, identity at
+  native and supersampled sizes, and the `-3` clamp. Provenance of the formula
+  is NVIDIA's own text, not a guess. What still needs hardware: that distant
+  terrain and foliage at a sub-native extent read sharper without shimmering,
+  and that Native AA/100 % is pixel-identical to before the change.

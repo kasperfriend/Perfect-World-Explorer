@@ -148,6 +148,7 @@ impl Frame {
             alpha: [if diffuse_alpha_only { 0. } else { 1. }, face_mode, 0., 0.],
             face_color,
             face_skin,
+            lod: [crate::render_scale::mip_bias(), 0., 0., 0.],
         };
         if bytemuck::cast_slice::<Params, f32>(std::slice::from_ref(&p))
             .iter()
