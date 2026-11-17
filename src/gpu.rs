@@ -351,8 +351,7 @@ impl FrameBudget {
         if elapsed < 1. {
             return;
         }
-        if self.frames > 0
-            && crate::diagnostics::enabled(crate::diagnostics::Channel::TimingFrame)
+        if self.frames > 0 && crate::diagnostics::enabled(crate::diagnostics::Channel::TimingFrame)
         {
             use std::fmt::Write;
             let mut stages = String::new();
