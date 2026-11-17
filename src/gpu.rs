@@ -4060,6 +4060,54 @@ fn window_hwnd(_window: &winit::window::Window) -> Result<*mut std::ffi::c_void,
 /// the same one `receiving_model_frame` hands the model shader) — not the
 /// animated celestial disc curve. That is the light the raster path actually
 /// shades with, so a traced shadow lands where the raster highlight is.
+/// The world's punctual lights near the camera, as the tracer wants them.
+///
+/// The scene-light grid holds every lamp in the map — nearly two thousand on a
+/// full map — and a tracer that cast a shadow ray per lamp per sample would
+/// spend all its time on lights nobody can see. The nearest `MAX_TRACED_LIGHTS`
+/// to the eye are handed over; that is also the cap the GPU buffer holds.
+fn imaginator_lights(
+    lights: &crate::scene_lights::SceneLights,
+    eye: glam::Vec3,
+) -> Vec<crate::imaginator::tracer::PointLight> {
+    /// Enough to light a street corner or a courtyard without making the
+    /// per-sample shadow ray loop dominate the trace.
+    const MAX_TRACED_LIGHTS: usize = 32;
+    let mut candidates: Vec<(f32, &crate::scene_lights::SceneLight)> = lights
+        .lights
+        .iter()
+        // A record with no range or no colour lights nothing.
+        .filter(|l| l.range > 0. && (l.diffuse[0] + l.diffuse[1] + l.diffuse[2]) > 0.)
+        .map(|l| {
+            let d = glam::Vec3::from_array(l.position).distance_squared(eye);
+            (d, l)
+        })
+        // Outside its own range a light contributes nothing, so a lamp across the
+        // map is not a candidate however bright it is.
+        .filter(|(d, l)| *d <= l.range * l.range)
+        .collect();
+    candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+    candidates
+        .into_iter()
+        .take(MAX_TRACED_LIGHTS)
+        .map(|(_, l)| {
+            // The client's diffuse is authored for its own tone mapping; the
+            // tracer works in linear radiance, so the colour is used as-is and
+            // scaled by the range, which is how a big lamp reads brighter.
+            let scale = 1.0;
+            crate::imaginator::tracer::PointLight {
+                position: crate::imaginator::math::v3(l.position[0], l.position[1], l.position[2]),
+                range: l.range,
+                colour: crate::imaginator::math::v3(
+                    l.diffuse[0] * scale,
+                    l.diffuse[1] * scale,
+                    l.diffuse[2] * scale,
+                ),
+            }
+        })
+        .collect()
+}
+
 fn imaginator_environment(camera: &Camera) -> crate::imaginator::tracer::Environment {
     let light = camera.regional_light.unwrap_or_else(neutral_regional_light);
     // With a region record, `toward_sun` is the authored EC-BSD direction, the
@@ -4100,7 +4148,21 @@ fn imaginator_environment(camera: &Camera) -> crate::imaginator::tracer::Environ
         ground: ambient * 0.25,
         fog: crate::imaginator::math::v3(fog.color[0], fog.color[1], fog.color[2]),
         fog_distance: if fog.enabled { fog.end.max(1.) } else { 20000. },
+        // Filled by `imaginator_environment_at`, which knows where the eye is;
+        // the sun and sky above need only the camera's region.
+        lights: Vec::new(),
     }
+}
+
+/// [`imaginator_environment`] plus the lamps near a point.
+fn imaginator_environment_at(
+    camera: &Camera,
+    lights: &crate::scene_lights::SceneLights,
+    eye: glam::Vec3,
+) -> crate::imaginator::tracer::Environment {
+    let mut environment = imaginator_environment(camera);
+    environment.lights = imaginator_lights(lights, eye);
+    environment
 }
 
 /// The neutral light a map gets when no environment record answers: full white
@@ -5895,7 +5957,12 @@ pub fn run(
                             // frame generation have not read the frame. One
                             // encoder, dispatched and blitted before the present
                             // encode runs.
-                            let environment = imaginator_environment(&camera);
+                            let eye = camera.pos;
+                            let environment = imaginator_environment_at(
+                                &camera,
+                                &renderer.model_lights,
+                                eye,
+                            );
                             renderer
                                 .modules
                                 .imaginator()
