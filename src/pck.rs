@@ -1,6 +1,6 @@
 //! Reader for the retail client's v2 PCK directory and entries.
 //! Layout informed by GameForge's GPL-2.0-or-later Angelica importer.
-use flate2::read::ZlibDecoder;
+use flate2::Status;
 use flate2::{Decompress, FlushDecompress};
 use std::{
     fs::File,
@@ -20,19 +20,32 @@ fn at(f: &mut File, p: u64, n: usize) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())?;
     Ok(b)
 }
-fn inflate(bytes: &[u8], expected: usize) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(expected);
-    ZlibDecoder::new(bytes)
-        .take((expected + 1) as u64)
-        .read_to_end(&mut out)
-        .map_err(|e| e.to_string())?;
-    if out.len() != expected {
-        return Err(format!(
-            "bad decompressed size: {} != {expected}",
-            out.len()
-        ));
-    }
+fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
+    thread_local! { static INFLATE_DECOMP: std::cell::RefCell<Decompress> = std::cell::RefCell::new(Decompress::new(true)); }
+INFLATE_DECOMP.with(|cell| {
+let mut decomp = cell.borrow_mut();
+decomp.reset(true);
+let mut out = Vec::with_capacity(expected);
+loop {
+let before = decomp.total_in() as usize;
+let st = decomp.decompress_vec(&raw[before..], &mut out, FlushDecompress::Finish).map_err(|e| e.to_string())?;
+if out.len() > expected {
+return Err(format!("bad decompressed size: {} != {expected}", out.len()));
+}
+if matches!(st, Status::StreamEnd) {
+break;
+}
+if before == decomp.total_in() as usize && out.len() == out.capacity() {
+out.reserve(64);
+} else if before == decomp.total_in() as usize && matches!(st, Status::BufError) {
+return Err("truncated zlib stream".into());
+}
+}
+if out.len() != expected {
+return Err(format!("bad decompressed size: {} != {expected}", out.len()));
+}
     Ok(out)
+})
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -132,20 +145,8 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
 pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
     if e.compressed < e.size {
         let compressed = at(f, e.offset as u64, e.compressed as usize)?;
-        let mut out = Vec::with_capacity(e.size as usize);
-        ZlibDecoder::new(compressed.as_slice())
-            .take(e.size as u64 + 1)
-            .read_to_end(&mut out)
-            .map_err(|err| err.to_string())?;
-        if out.len() != e.size as usize {
-            return Err(format!(
-                "bad decompressed size: {} != {}",
-                out.len(),
-                e.size
-            ));
-        }
-        Ok(out)
-    } else {
+    inflate(&compressed, e.size as usize)
+} else {
         at(f, e.offset as u64, e.compressed as usize)
     }
 }
