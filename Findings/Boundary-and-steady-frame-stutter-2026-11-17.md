@@ -343,3 +343,80 @@ the terrain visibility walk, and the minimap's own matrix and run queueing.
 * Terrain mask atlas: `upload_masks` allocates a texture and calls
   `device.poll(Maintain::Wait)` — but only when the mask window changes, which needs
   `Original-game terrain cutoff` on. In the whole-world configuration it runs once.
+
+## Fourth pass: the log, and what the frame is actually bound on (same day)
+
+The report came back with `TimingFrame`, `TimingLoad` and a session log, from the
+machine that reported the stutter: **3440x1369, XeSS frame generation x2, upscaler
+Off** — the world is rendered at native 4.7 Mpx. What the log says:
+
+| line | 5 world renders/frame | 3 world renders/frame |
+|---|---|---|
+| frames/s | 18.1 – 26.7 | 32.2 – 47.7 |
+| CPU frame | 32 – 48 ms | 14 – 27 ms |
+| main scene | 25.6 – 38.2 ms | 11.1 – 30.1 ms |
+| extra views | 4.6 – 7.5 ms | 0.9 – 5.5 ms |
+| visibility | 0.6 – 0.9 ms | 0.6 – 0.9 ms |
+| post | 1.1 – 1.8 ms | 1.1 – 1.8 ms |
+| minimap | 0.00 ms | 0.00 ms |
+
+`TimingLoad` in the same run: `0 scenery pages kept, 0 uploaded, grass atlas kept`
+on every line — the streaming work is gone, as intended, and the frame is not
+waiting on it.
+
+Two conclusions, both from the log rather than from argument:
+
+1. **The frame is GPU-bound.** The CPU stage that scales with the water's extra
+   renders is `main scene`, which does the same recording work whatever the water
+   count is. A stage that grows when *another* pass is added is the CPU waiting for
+   the GPU, not recording. Five renders/frame at 3440x1369 is the cost.
+2. **The water is the render count.** 5 = 1 main + 2 planes x (mirror +
+   refraction); 3 = 1 + 1 x 2. So the water's extra views are 4 of every 5 world
+   renders whenever two water heights are in view, and the log's own jump from
+   25 fps to 40 fps when one plane left is the measurement of what they cost.
+
+The minimap is 0.00 ms in every line, which also settles the suspicion from the
+third pass in the affirmative direction it deserved: it is measured, and it is
+nothing.
+
+### Removed this pass
+
+**The extra views are scissored to what the water surface can read.** Those two
+renders per plane exist for one reader, the surface, and it reads them by
+screen-space UV displaced by `n.xz * edge * edge * 0.25` (0.15 in the above-water
+refraction). `|n.xz|` is a property of the shipped normal map, so it is measured
+once at load (`normal_extent`, every frame and mip, decoded as the shader decodes
+it) rather than assumed to be one. The plane's own screen rectangle — from the
+`WaterBatch` bounds, which are the min/max of the very quads that were emitted —
+grown by that measured bound, contains every texel the surface can sample. That
+rectangle is set as a scissor on all three water passes. It falls back to the whole
+attachment whenever a corner sits at or behind the eye (a plane that runs past the
+camera has no finite rectangle), when it covers most of the target, or when the
+target is tiny. With the worst-case margin a quarter of the target is the floor;
+with a measured bound of, say, 0.4 the margin is 0.11 and a pond that covers a
+tenth of the screen costs about a fifth of it.
+
+* The scene->refraction copy now runs **only with reflections off**: with them on,
+  every visible non-simple plane clears and redraws that whole target before its
+  own surface is drawn, so the copy could never be sampled.
+* The main depth is copied into the water's `terrain_depth` only when a non-simple
+  plane (the only reader, and only when the eye is above it) is on screen.
+* One frustum extraction per frame instead of three.
+* `TimingFrame` reports `world renders/frame` and, when it applies,
+  `water views scissored to N% of the screen` — the saving is a fill-rate saving,
+  so it is invisible in the CPU milliseconds and has to be counted instead.
+
+### Not free, and therefore not taken
+
+* **The mirror and the refraction are both load-bearing above water.** The
+  surface mixes `refract_color * 0.95` with the reflection at a Fresnel weight of
+  at least 0.11 and reads the refraction's alpha as the edge mask, so removing
+  either changes pixels. The count is now measurable instead.
+* **Resolution.** Rendering 4.7 Mpx natively is the largest single cost in this
+  configuration, and the upscaler that would cut it is a setting the user owns
+  (`upscaling=Off` in the log). At XeSS Quality the renders would be ~2.0 Mpx.
+  Frame generation x2 also wants a higher base rate than 25 fps; the log's
+  `WARNING_TOO_FEW_FRAMES` entries are that pressure.
+* **Half-resolution water views** would quarter those four renders and is a real
+  option, but it softens reflections — a fidelity trade, so it waits for an
+  explicit request rather than being made the default.
