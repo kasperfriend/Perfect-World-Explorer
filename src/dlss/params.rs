@@ -146,6 +146,14 @@ const SLOT_GET_F64: usize = 13;
 const SLOT_GET_F32: usize = 14;
 const SLOT_GET_U64: usize = 15;
 
+/// The last `Set` overload, i.e. how many of them there are. `SLOT_SET_VOID`
+/// used to be the last one and is now the *first*, so nothing may walk
+/// `0..=SLOT_SET_VOID` any more — that walks a single slot.
+const SLOT_SET_LAST: usize = SLOT_SET_U64;
+/// The last `Get` overload, mirroring [`SLOT_SET_LAST`].
+#[cfg_attr(not(windows), allow(dead_code))]
+const SLOT_GET_LAST: usize = SLOT_GET_U64;
+
 /// The `Set` slots that can carry a resource pointer, in the order the
 /// declaration puts them.
 ///
@@ -442,8 +450,8 @@ fn pointer_slot_matrix(
     // answers through several — so the declared overload is preferred and only
     // then the first that works.
     let mut matches: Vec<usize> = Vec::with_capacity(3);
-    let mut lines = Vec::with_capacity(SLOT_SET_VOID + 1);
-    for set_slot in 0..=SLOT_SET_VOID {
+    let mut lines = Vec::with_capacity(SLOT_SET_LAST + 1);
+    for set_slot in 0..=SLOT_SET_LAST {
         let Some(set) = (unsafe { vtable_setter::<SetPtr>(object, set_slot) }) else {
             lines.push(format!("Set {set_slot}: no vtable entry"));
             continue;
@@ -512,8 +520,8 @@ fn numeric_slot_matrix(object: *mut c_void) -> Vec<String> {
         (SLOT_GET_F32, "f32"),
         (SLOT_GET_U64, "u64"),
     ];
-    let mut lines = Vec::with_capacity(SLOT_SET_VOID + 1);
-    for set_slot in 0..=SLOT_SET_VOID {
+    let mut lines = Vec::with_capacity(SLOT_SET_LAST + 1);
+    for set_slot in 0..=SLOT_SET_LAST {
         let Some(set) = (unsafe { vtable_setter::<SetU64>(object, set_slot) }) else {
             lines.push(format!("Set {set_slot}: no vtable entry"));
             continue;
@@ -1484,7 +1492,7 @@ mod resource_matrix_tests {
             Some(SLOT_SET_D3D12),
             "a table the viewer owns keeps a pointer through the declared slot"
         );
-        assert_eq!(lines.len(), SLOT_SET_VOID + 1, "one line per declared Set");
+        assert_eq!(lines.len(), SLOT_SET_LAST + 1, "one line per declared Set");
         let declared = &lines[SLOT_SET_D3D12];
         assert!(
             declared.contains("d3d12 keeps it"),
