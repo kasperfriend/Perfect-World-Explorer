@@ -494,7 +494,7 @@ fn emit_page(
     tx: &SyncSender<Message>,
     cache: &mut Option<crate::world_page_cache::Writer>,
     metadata: &mut Vec<WorldPageMeta>,
-    page: Page,
+    mut page: Page,
 ) -> bool {
     let write_error = cache
         .as_mut()
