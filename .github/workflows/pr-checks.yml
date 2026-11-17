@@ -364,6 +364,9 @@ jobs:
     name: RayQuery shader compiles (DXIL)
     runs-on: windows-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
       # `dxc` is the only compiler that can produce DXIL, and the hardware
@@ -400,15 +403,28 @@ jobs:
           "DXC_PATH=$($dxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
       - name: Compile the trace shader
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           New-Item -ItemType Directory -Force -Path "Modules\Imaginator\imaginator" | Out-Null
           $out = "Modules\Imaginator\imaginator\dxr_trace.cso"
           & $env:DXC_PATH -T cs_6_5 -E cs -HV 2018 -O3 -Zpc -all_resources_bound `
             -Fo $out "tools\imaginator-shaders\dxr_trace.hlsl"
           if ($LASTEXITCODE -ne 0) {
-            # Job logs are not always retrievable from the API, so the compiler's
-            # own words are also written where the artifact step can pick them up.
+            # Neither the job log nor artifacts are readable from every
+            # environment, but a pull-request comment is, so the compiler's own
+            # words are posted there. This is the only channel that reliably
+            # carries *why* the shader was rejected.
             $log | Set-Content -Path "dxc-errors.txt"
+            $body = ($log -join "`n")
+            if ($body.Length -gt 60000) { $body = $body.Substring(0, 60000) }
+            $payload = @{ body = "dxc rejected the RayQuery shader:`n``````n$body`n``````" } |
+              ConvertTo-Json -Depth 4
+            Invoke-RestMethod -Method Post `
+              -Uri "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/issues/$env:PR_NUMBER/comments" `
+              -Headers @{ Authorization = "Bearer $env:GITHUB_TOKEN" } `
+              -ContentType "application/json" -Body $payload
             throw "dxc failed with $LASTEXITCODE"
           }
           $size = (Get-Item $out).Length
