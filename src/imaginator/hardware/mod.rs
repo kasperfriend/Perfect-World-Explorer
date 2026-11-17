@@ -91,5 +91,10 @@ pub mod support {
         pub fn dxil_present(&self, _directory: &std::path::Path) -> bool {
             false
         }
+
+        /// No DXR here, so no pipeline is ever built from a blob.
+        pub fn pipeline_ready(&self) -> bool {
+            false
+        }
     }
 }

@@ -756,7 +756,19 @@ impl Imaginator {
                 let _ = (tw, th);
                 let base = hardware.status.label();
                 self.status = if hardware.dxil_present(&self.directory) {
-                    base
+                    // The blob is installed, so a native pipeline can be built
+                    // from it. Whether one *has* been is the useful thing to
+                    // report: a blob that dxc compiled for the wrong target is
+                    // rejected at pipeline creation, and that must not look like
+                    // a working RayQuery trace.
+                    if hardware.pipeline_ready() {
+                        format!("{base} — RayQuery trace pipeline ready")
+                    } else {
+                        format!(
+                            "{base} — RayQuery blob found; the trace pipeline is built on the \
+                             first frame"
+                        )
+                    }
                 } else {
                     // Honest wording: the compute tracer is what runs, and it
                     // works without DXR, so this is a note about the path in use
