@@ -198,7 +198,8 @@ impl Reader {
             .and_then(|_| d.file.read_exact(&mut packed))
             .map_err(|e| format!("terrain cache {}: {e}", d.path.display()))?;
         let cells = d.side * d.side;
-        let bytes = crate::pck::inflate(&packed, cells * 7).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut bytes = Vec::with_capacity(cells * 7);
+        ZlibDecoder::new(&packed[..]).read_to_end(&mut bytes).map_err(|e| e.to_string|())?;
         if bytes.len() != cells * 7 || <[u8; 32]>::from(Sha256::digest(&bytes)) != record.hash {
             return Err(format!(
                 "corrupt terrain cache block {id}; restart to rebuild cache"
