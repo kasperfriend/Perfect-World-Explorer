@@ -418,11 +418,7 @@ fn render(
                 ));
             };
             vertices.clear();
-            vertices.extend(mesh
-                .vertices
-                .iter()
-                .map(|v| model_vertex(t, cam, model, v))
-            );
+                vertices.extend(mesh.vertices.iter().map(|v| model_vertex(t, cam, model, v)));
             for face in mesh.indices.chunks_exact(3) {
                 let a = vertices[face[0] as usize];
                 let b = vertices[face[1] as usize];
