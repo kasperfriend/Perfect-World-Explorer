@@ -1176,7 +1176,7 @@ DLSS-G parameter type.
   | renderer | depth write | verdict |
   |---|---|---|
   | clouds (`cloud_gpu`) | no | **covered** — stands in front of terrain/sky |
-  | effect sheets (`gfx_effect_gpu`) | no | **covered** — stands in front of walls |
+  | effect sheets (`gfx_effect_gpu`) | no | **covered + object motion** — no depth, because a sheet must not occlude what is drawn after it (B-26) |
   | precipitation (`weather_gpu`) | no | **covered + object motion** |
   | decals (`gfx_decal_gpu`), shore band (`shore_gpu`), baked SDR blend (`gpu.rs`), alpha model meshes (`model_receiver_gpu`) | no | nothing to do — coplanar with, or a hair behind, the surface the depth buffer already holds at that pixel |
   | water surface, complex path (`water_gpu`) | **yes** | already has depth, so already has vectors |
@@ -1185,7 +1185,9 @@ DLSS-G parameter type.
   | reflection/refraction depth | — | not an input to any motion vector |
 
 - **What remains.** Two things. (1) *Attached* content — effect sheets, alpha model
-  meshes — still carries camera-only motion, so a sheet hanging off a moving
+  meshes — still carries camera-only motion (the sheet's published vector
+  reprojects its own world position, which is right for a sheet that stands still
+  in the world and short by the root's own speed for one that rides a walker), so a sheet hanging off a moving
   monster ghost at the monster's own speed. That is deliberately not "fixed" here:
   the model it is attached to is reprojected the same way, so the two agree, and
   giving the sheet its own vector while the model keeps a camera-only one would
@@ -1211,40 +1213,41 @@ DLSS-G parameter type.
   generation on, no new shimmer along the coverage edge, and whether the residual
   own-motion ghosting of precipitation is objectionable.
 
-## B-26 — An effect sheet's coverage depth occludes whatever is drawn after it
+## B-26 — An effect sheet's motion, without giving it a surface — fixed
 
 - **Step:** frame generation or any upscaler on, with an animated effect root whose
   sheets sit between the camera and something drawn later — the water surface, the
   player model, an add-on.
-- **Symptom:** a hole the shape of the sheet in the surface behind it. A torch
-  flame in front of a lake erases the water under the flame; a glow in front of the
-  host player erases the part of the body it covers.
-- **Cause.** B-25's coverage pass for `gfx_effect_gpu` writes each sheet's depth
-  into the scene depth buffer at the end of the receiving-model pass, so the
-  motion-vector pass can reconstruct the sheet's motion. Everything the renderer
-  draws *afterwards* depth-tests against that buffer, and a sheet nearer than the
-  water or the player rejects them.
-- **Why it was not simply dropped.** Without the depth write the sheet has no
-  motion vector again — the pre-B-25 ghosting — because the depth-based pass can
-  only see a surface that is in the depth buffer.
-- **The fix, when it lands.** Sheets are static in world space, so their vector is
-  a pure camera reprojection of their own interpolated world position, which the
-  effect shader already has. Publishing that through the `object_mv` attachment —
-  the same mechanism precipitation now uses — needs no depth write at all: the pass
-  targets the attachment, depth-tests but does not write, and the sheet stops
-  occluding anything. It is deferred rather than half-done because it needs the
-  frame's *previous* view-projection in the effect pass, which the effect module
-  does not receive today: it would have to be carried through
-  `world_models_gpu::update_pass` into `gfx_effect_gpu::update`, cached in the
-  renderer for the main view only (the mirror and refraction views rewrite the same
-  uniform), and added to the effect `Params` block. That is a coordinated change
-  across three files plus a new pass in `draw_models`, so it is recorded here with
-  the plan rather than attempted blind.
-- **Severity.** Bounded by the size of a sheet: the quads are small next to the
-  water and the player, and the artifact only appears where a sheet overlaps
-  something drawn later. It is visible on a still frame if you look, which is why
-  it is a blocker entry and not a note.
-- **Verification, when fixed.** The effect module's device test grows a case that
-  renders a sheet into a target with a depth attachment and asserts the depth is
-  untouched while the motion attachment carries a non-zero vector; a hardware run
-  shows a torch in front of water with no hole in it.
+- **Symptom (before the fix):** a hole the shape of the sheet in the surface behind
+  it. A torch flame in front of a lake erased the water under the flame; a glow in
+  front of the host player erased the part of the body it covered.
+- **Cause.** B-25's coverage pass wrote each sheet's depth into the scene depth
+  buffer at the end of the receiving-model pass, so the motion-vector pass could
+  reconstruct the sheet's motion. Everything drawn afterwards depth-tests against
+  that buffer, and a sheet nearer than the water or the player rejected them.
+- **The fix.** Sheets are static in world space, so their vector is a pure camera
+  reprojection of their own interpolated world position, which the vertex stage
+  already carries. The motion pass now targets the `object_mv` attachment, tests
+  depth and never writes it, and publishes that vector: `current + motion =
+  previous` in render pixels with y down, the convention the shared pass reads. The
+  sheet stops occluding anything, and the vector is the sheet's own rather than the
+  wall's behind it — which is what the depth write was there to buy, at the cost of
+  the hole.
+- **What it costs.** The upscalers lose the sheet's depth, because there is none:
+  their depth input at a sheet pixel is the background's again. The motion is
+  right, which is what frame generation interpolates with, and the depth of
+  translucent blended content was always the background's before B-25.
+- **Where it runs.** In `Renderer::draw_models`, immediately after the main view's
+  colour pass, before the add-ons, the water and the weather draw and before the
+  mirror or refraction view rewrites the frame block and the bucket order. The pass
+  needs the frame's unjittered view-projection, which `draw_models` now receives.
+- **The history.** `Draw::draw_motion` keeps the view-projection the previous
+  motion pass used and falls back to the current one on the first frame, so a load
+  or a cut publishes the zero motion of a still sheet instead of a jump.
+- **Verification.** `motion_publishes_the_sheets_own_vector_and_never_a_surface`
+  renders an opaque sheet, then the same sheet through a moved camera, then the
+  same sheet at 20% opacity, and asserts on the attachment's bytes: owned with a
+  zero vector, owned with a non-zero vector, unclaimed — and that the depth buffer
+  is byte-for-byte still the clear value in all three cases. On hardware: a torch
+  in front of water with no hole in it, and no sliding of the glow against the wall
+  behind it as the camera translates.

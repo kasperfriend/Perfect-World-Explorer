@@ -2752,6 +2752,9 @@ impl Renderer {
         view: Pass,
         advance: bool,
         frustum: &[[f32; 4]; 6],
+        // The unjittered view-projection, so a sheet's published motion is the
+        // camera's real motion and not the sub-pixel jitter of the frame.
+        unjittered_vp: Mat4,
     ) {
         // WaterEffect 0 (shipped default) hides EC models and home ornaments
         // in reflection/refraction (0x5b2015, 0x5b2336). RenderContext carries
@@ -2825,7 +2828,45 @@ impl Renderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            models.draw(&mut pass, matches!(view, Pass::Main));
+            models.draw(&mut pass);
+        }
+        // The sheets' own motion, in a pass of its own: their vector goes into the
+        // object-motion attachment, which the shared pass substitutes where a
+        // producer claims a pixel, and no depth is written. Published here, before
+        // any later view rewrites the frame block and the bucket order, and before
+        // the water and the add-ons are drawn, so nothing they draw is rejected
+        // behind a sheet (`docs/blockers.md` B-26).
+        if matches!(view, Pass::Main) {
+            if let Some(size) = self.object_mv.as_ref().map(|texture| texture.size()) {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("world effect sheet motion"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.object_mv_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    // Tested, never written: a sheet behind a wall claims nothing.
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                models.draw_effect_motion(
+                    &self.queue,
+                    &mut pass,
+                    unjittered_vp.to_cols_array_2d(),
+                    (size.width, size.height),
+                );
+            }
         }
     }
 
@@ -3212,6 +3253,7 @@ impl Renderer {
             Pass::Main,
             true,
             &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+            unjittered_vp,
         );
         self.draw_addons(
             &mut e,
@@ -3580,6 +3622,7 @@ impl Renderer {
                         Pass::Refraction,
                         false,
                         &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+                        unjittered_vp,
                     );
                 }
                 self.draw_addons(
@@ -3704,6 +3747,7 @@ impl Renderer {
                 Pass::Reflection,
                 false,
                 &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
+                unjittered_vp,
             );
             self.draw_addons(
                 &mut e,
