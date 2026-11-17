@@ -115,7 +115,9 @@ impl Heights {
         }
     }
     pub fn at(&self, index: usize) -> f32 {
-        if let Data::Memory(v) = &self.0.data { return v[index]; }
+        if let Data::Memory(v) = &self.0.data {
+            return v[index]; 
+        }
         self.reader().height(index)
     }
     pub fn stats(&self) -> Stats {
@@ -199,7 +201,9 @@ impl Reader {
             .map_err(|e| format!("terrain cache {}: {e}", d.path.display()))?;
         let cells = d.side * d.side;
         let mut bytes = Vec::with_capacity(cells * 7);
-        ZlibDecoder::new(&packed[..]).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        ZlibDecoder::new(&packed[..])
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
         if bytes.len() != cells * 7 || <[u8; 32]>::from(Sha256::digest(&bytes)) != record.hash {
             return Err(format!(
                 "corrupt terrain cache block {id}; restart to rebuild cache"
