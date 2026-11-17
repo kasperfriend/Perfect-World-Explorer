@@ -685,22 +685,81 @@ impl DlssUpscaler {
         let list = &mut self.ring.slot_mut(slot_index).list;
         list.resource_barrier(&barriers);
 
-        self.params.set_d3d12_resource(
-            P_COLOR,
-            self.natives.color.resource.as_mut_ptr() as *mut c_void,
-        );
-        self.params.set_d3d12_resource(
-            P_DEPTH,
-            self.natives.depth.resource.as_mut_ptr() as *mut c_void,
-        );
-        self.params.set_d3d12_resource(
-            P_MOTION_VECTORS,
-            self.natives.mv.resource.as_mut_ptr() as *mut c_void,
-        );
-        self.params.set_d3d12_resource(
-            P_OUTPUT,
-            self.natives.output.resource.as_mut_ptr() as *mut c_void,
-        );
+        // The four evaluate resources go in through a `Set` overload whose slot
+        // is *measured with the feature itself*, not taken from the header.
+        //
+        // `nvsdk_ngx_params.h` declares eight `Set` overloads and eight `Get`
+        // overloads — eight numeric ones, then `ID3D11Resource *`,
+        // `ID3D12Resource *`, `void *`. This core's integer entries behave
+        // exactly as declared (`SuperSampling.Available` reads back,
+        // `CreateFeature` takes `Width`/`Height`/`PerfQualityValue`), and its
+        // pointer entries do not: every evaluate was answered
+        //
+        //   [NGXDLAA::EvaluateFeature:788] error: could not find Color parameter
+        //   NVSDK_NGX_D3D12_EvaluateFeature(DLSS) failed (0xbad00005)
+        //
+        // which is what a pointer stored under the *wrong type tag* looks like
+        // from the outside — the feature's own `Get(…, ID3D12Resource **)` finds
+        // no such key. Which of the three pointer overloads this map's reader
+        // agrees with cannot be read off the declaration, so it is found by
+        // asking: write the same four pointers through the next candidate and
+        // evaluate again. A rejected evaluate validates before it records
+        // anything, so the command list carries no half-applied state between
+        // attempts, and the winning slot is remembered for the session.
+        let mut result = crate::dlss::params::NGX_FAIL;
+        let accepted = self.params.resource_set_slot();
+        let mut ladder = Vec::with_capacity(3);
+        ladder.push(accepted);
+        for slot in crate::dlss::params::RESOURCE_SET_SLOT_CANDIDATES {
+            if slot != accepted {
+                ladder.push(slot);
+            }
+        }
+        for slot in ladder {
+            self.params.set_d3d12_resource_with_slot(
+                slot,
+                P_COLOR,
+                self.natives.color.resource.as_mut_ptr() as *mut c_void,
+            );
+            self.params.set_d3d12_resource_with_slot(
+                slot,
+                P_DEPTH,
+                self.natives.depth.resource.as_mut_ptr() as *mut c_void,
+            );
+            self.params.set_d3d12_resource_with_slot(
+                slot,
+                P_MOTION_VECTORS,
+                self.natives.mv.resource.as_mut_ptr() as *mut c_void,
+            );
+            self.params.set_d3d12_resource_with_slot(
+                slot,
+                P_OUTPUT,
+                self.natives.output.resource.as_mut_ptr() as *mut c_void,
+            );
+            result = unsafe {
+                (self.api.evaluate_feature)(
+                    list.as_mut_ptr() as *mut c_void,
+                    self.handle,
+                    self.params.as_ptr(),
+                    std::ptr::null(),
+                )
+            };
+            if crate::dlss::succeeded(result) {
+                if slot != accepted {
+                    crate::dlss::diag(&format!(
+                        "[DLSS] resource parameters reach the feature through Set slot {slot}; \
+                         the declared slot {accepted} was rejected"
+                    ));
+                }
+                self.params.set_resource_set_slot(slot);
+                break;
+            }
+            crate::dlss::diag(&format!(
+                "[DLSS] evaluate rejected the resource parameters written through Set slot \
+                 {slot} ({})",
+                crate::dlss::result_name(result)
+            ));
+        }
         self.params.set_f32(P_JITTER_X, self.current_jitter.0);
         self.params.set_f32(P_JITTER_Y, self.current_jitter.1);
         self.params.set_i32(P_RESET, i32::from(self.reset_history));
@@ -756,15 +815,6 @@ impl DlssUpscaler {
         ] {
             self.params.set_u32(name, value);
         }
-
-        let result = unsafe {
-            (self.api.evaluate_feature)(
-                list.as_mut_ptr() as *mut c_void,
-                self.handle,
-                self.params.as_ptr(),
-                std::ptr::null(),
-            )
-        };
 
         let restore = [
             barrier(

@@ -1251,3 +1251,52 @@ DLSS-G parameter type.
   is byte-for-byte still the clear value in all three cases. On hardware: a torch
   in front of water with no hole in it, and no sliding of the glow against the wall
   behind it as the camera translates.
+
+## B-27 — DLSS evaluates fail with `FAIL_InvalidParameter` (open)
+
+- **Step:** enable DLSS Super Resolution in the viewer.
+- **Symptom:** `DLSS failed, rendering at native resolution instead:
+  NVSDK_NGX_D3D12_EvaluateFeature(DLSS) failed (0xbad00005 FAIL_InvalidParameter)`,
+  once per attempt, and `[upscaler] upscaling=DLSS Super Resolution is NOT
+  running, world rendered 3440x1369 (native)`.
+- **What works:** NGX initialises, `SuperSampling.Available` reads `1`,
+  `CreateFeature` answers `Success` with `FeatureInitResult Success`, and the four
+  resources are created at the sizes the feature was built for (colour
+  `B8G8R8A8_UNORM` 2293x913, depth `R32_FLOAT` 2293x913, motion vectors
+  `R16G16_FLOAT` 2293x913, output `B8G8R8A8_UNORM` 3440x1369).
+- **What NGX itself says** — its own log, dumped by this viewer on the first
+  failure:
+  `[NGXDLAA::EvaluateFeature:788] error: could not find Color parameter`.
+- **Cause.** The feature reads its four resources out of the
+  `NVSDK_NGX_Parameter` map with `Get(const char *, ID3D12Resource **)`. A pointer
+  written through a *different* `Set` overload is stored under a different type
+  tag, and that read then reports the key as missing — exactly the message above,
+  and exactly the `FAIL_InvalidParameter` the caller sees. `nvsdk_ngx_params.h`
+  declares the overload order (eight numeric `Set`s, then `ID3D11Resource *`,
+  `ID3D12Resource *`, `void *`), and this viewer addressed the resource ones by
+  that declaration. The integer half of that order demonstrably holds on this
+  core; the pointer half does not.
+- **The fix, as implemented.** The slot is *measured with the feature*, because
+  the feature is the only thing whose opinion matters: the four resources are
+  written through the declared slot and evaluated, and on
+  `FAIL_InvalidParameter` the same four pointers are written through the next
+  candidate slot and evaluated again (`src/dlss/imp.rs`, the ladder in `record`).
+  A rejected evaluate validates before it records anything, so the command list
+  carries no half-applied state between attempts. The winning slot is remembered
+  for the session, so the ladder is paid once, and each attempt logs one line:
+  `[DLSS] resource parameters reach the feature through Set slot N; the declared
+  slot M was rejected` or `[DLSS] evaluate rejected the resource parameters
+  written through Set slot N (…)`. The map also reports its own writability once
+  per session (`[NGX] parameter map: integer write round trip works / does not
+  work`, and which pointer slots a null probe round-trips).
+- **What a run has to settle.** Whether one of the three slots is accepted. If
+  the log shows `integer write round trip does not work`, the map itself is the
+  problem rather than the slot, and the next step is to stop evaluating through
+  the capability map (`NVSDK_NGX_D3D12_GetCapabilityParameters`) and use a map
+  from `NVSDK_NGX_D3D12_AllocateParameters` for `CreateFeature`/`EvaluateFeature`,
+  keeping the capability map only for `SuperSampling.Available` and the optimal
+  settings callback — the header documents the capability map as usable "in the
+  same ways" but recommends the allocator. If all three slots are rejected with
+  the integer round trip working, the ladder needs a fourth candidate (the
+  remainder of the vtable) and the NGX log dump will name the resource it could
+  not find.
