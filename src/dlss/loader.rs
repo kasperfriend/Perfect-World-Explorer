@@ -294,7 +294,8 @@ fn core(
     // process", which the three-second retry ladder in `src/gpu.rs` then
     // re-reported for the rest of the session.
     let _ = CORE.set(core);
-    CORE.get().ok_or_else(|| "NGX Core initialised but could not be stored".to_string())
+    CORE.get()
+        .ok_or_else(|| "NGX Core initialised but could not be stored".to_string())
 }
 
 /// What DLSS says it is willing to evaluate.
