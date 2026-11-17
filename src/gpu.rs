@@ -4225,7 +4225,21 @@ async fn adapter(
                     & (wgpu::Features::TEXTURE_COMPRESSION_BC
                         | wgpu::Features::MULTI_DRAW_INDIRECT
                         | wgpu::Features::INDIRECT_FIRST_INSTANCE),
-                required_limits: wgpu::Limits::downlevel_defaults().using_resolution(a.limits()),
+                // `downlevel_defaults()` caps a single storage binding at 128 MiB
+                // and `using_resolution` only raises the resolution-dependent
+                // limits, so a world whose triangle buffer is larger than that
+                // failed `create_bind_group` ("range 160000000 exceeds limit
+                // 134217728") and the hardware tracer silently drew nothing.
+                // D3D12 itself allows 2 GiB; ask for whatever the adapter has.
+                required_limits: {
+                    let adapter = a.limits();
+                    let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter);
+                    limits.max_storage_buffer_binding_size = adapter
+                        .max_storage_buffer_binding_size
+                        .min(adapter.max_buffer_size)
+                        .max(limits.max_storage_buffer_binding_size);
+                    limits
+                },
             },
             None,
         )
@@ -4629,8 +4643,19 @@ pub fn run(
     // are exactly what they need; a module that is switched off never draws.
     eprintln!("Imaginator: building GPU objects...");
     renderer.modules.imaginator().init(&renderer.device, format);
-    eprintln!("Imaginator: {}", renderer.modules.imaginator().status);
+    // `sync_worker` is what turns the saved settings into a running tracer and
+    // sets the status, so report after it: printing before made every launch
+    // say "not started" whatever the module was about to do.
     renderer.modules.imaginator().sync_worker();
+    eprintln!("Imaginator: {}", renderer.modules.imaginator().status);
+    // The captured world reaches the tracer through `poll`, so say up front what
+    // it will try to hand over: a buffer size the backend refuses used to show
+    // only as a picture that never changed.
+    eprintln!(
+        "Imaginator: {} triangles captured for tracing; storage binding limit {} MiB",
+        renderer.modules.imaginator().captured_triangles(),
+        (renderer.device.limits().max_storage_buffer_binding_size / (1 << 20)).max(0)
+    );
     let mut egui_renderer = egui_wgpu::Renderer::new(&renderer.device, format, None, 1);
     let map_texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("live minimap"),
