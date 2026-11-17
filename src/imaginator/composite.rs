@@ -74,6 +74,12 @@ struct Target {
     traced_view: wgpu::TextureView,
     intermediate_texture: wgpu::Texture,
     intermediate_view: wgpu::TextureView,
+    /// A frame-resolution copy of what the viewer drew, in the frame's own
+    /// format. The swapchain image itself cannot be bound as a texture — DX12
+    /// reports no `TEXTURE_BINDING` for a surface — so the composite pass loads
+    /// it into this attachment and the blit writes the result back into it.
+    scene_texture: wgpu::Texture,
+    scene_view: wgpu::TextureView,
     width: u32,
     height: u32,
 }
@@ -352,7 +358,11 @@ impl Composite {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        frame: &wgpu::TextureView,
+        // The swapchain image, when `frame_view` is that image's own view.
+        // `None` when `frame_view` already belongs to a texture the module may
+        // sample (the gamma / present-encode intermediates).
+        frame_texture: Option<&wgpu::Texture>,
+        frame_view: &wgpu::TextureView,
         extent: (u32, u32),
         settings: &ImaginatorSettings,
         params: GpuParams,
@@ -374,6 +384,40 @@ impl Composite {
             return Err("no scene has been captured yet".into());
         };
         let target = self.target.as_ref().ok_or("the traced target is gone")?;
+
+        // The swapchain image cannot be sampled: DX12 reports only
+        // `COLOR_TARGET | COPY_SRC | COPY_DST` for a surface, and asking for
+        // `TEXTURE_BINDING` makes `Surface::configure` fail outright. `COPY_SRC`
+        // is enough, so the frame is copied into a scratch texture that *can* be
+        // sampled, and the finished blit is written back to the frame itself.
+        if let Some(frame_texture) = frame_texture {
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: frame_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &target.scene_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        // A surface image needed the copy above; an intermediate is sampled where
+        // it lies.
+        let scene_input = if frame_texture.is_some() {
+            &target.scene_view
+        } else {
+            frame_view
+        };
 
         // A CPU trace has already filled the traced texture, so the dispatch is
         // skipped and the composite reads what was uploaded.
@@ -447,7 +491,7 @@ impl Composite {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(frame),
+                    resource: wgpu::BindingResource::TextureView(scene_input),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
@@ -483,11 +527,11 @@ impl Composite {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("imaginator blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: frame,
+                    view: frame_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // The composite already decided every pixel, including the
-                        // sky it copied through, so nothing needs preserving.
+                        // The blit covers every pixel, including the sky the
+                        // composite copied through, so nothing needs preserving.
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
@@ -581,6 +625,8 @@ impl Composite {
                 && target.height == traced_height
                 && target.intermediate_texture.width() == width
                 && target.intermediate_texture.height() == height
+                && target.scene_texture.width() == width
+                && target.scene_texture.height() == height
             {
                 return;
             }
@@ -605,6 +651,24 @@ impl Composite {
             wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
         );
         let intermediate_view = intermediate_texture.create_view(&Default::default());
+        let scene_texture = texture(
+            device,
+            "imaginator scene",
+            width,
+            height,
+            self.frame_format,
+            // Filled by `copy_texture_to_texture` from the swapchain image, then
+            // sampled by the composite pass.
+            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        // The frame's own sRGB view is what the composite used to sample, and
+        // that decode is what the blend assumes. Reproduce it here: an sRGB
+        // frame gets an sRGB view of the copy, so `textureLoad` still returns
+        // linear radiance.
+        let scene_view = scene_texture.create_view(&wgpu::TextureViewDescriptor {
+            format: Some(self.frame_format),
+            ..Default::default()
+        });
         self.traced_row_pitch = traced_width * 16;
         self.preview_fresh = false;
         self.target = Some(Target {
@@ -612,6 +676,8 @@ impl Composite {
             traced_view,
             intermediate_texture,
             intermediate_view,
+            scene_texture,
+            scene_view,
             width: traced_width,
             height: traced_height,
         });

@@ -4023,6 +4023,11 @@ fn recreate_surface(
         .get_default_config(adapter, config.width.max(1), config.height.max(1))
         .ok_or("surface configuration unavailable")?;
     cfg.format = surface_format;
+    // Same rule as the first configure: keep the frame readable for the
+    // Imaginator, but only ask for what the backend advertises.
+    if caps.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+        cfg.usage |= wgpu::TextureUsages::COPY_SRC;
+    }
     if surface_format.is_srgb() {
         cfg.view_formats.push(surface_format.remove_srgb_suffix());
     }
@@ -4286,11 +4291,16 @@ pub fn run(
         .get_default_config(&adapter, size.width.max(1), size.height.max(1))
         .ok_or("surface configuration unavailable")?;
     config.format = surface_format;
-    // The Imaginator reads the finished frame back through a sampled view and
-    // then writes it again, so the swapchain has to allow binding as well as
-    // rendering. `TEXTURE_BINDING` on a surface texture costs nothing and is the
-    // only extra usage any compositor in this file needs.
-    config.usage |= wgpu::TextureUsages::TEXTURE_BINDING;
+    // `get_default_config` asks for `RENDER_ATTACHMENT` alone. The Imaginator has
+    // to *read* the finished frame, so add `COPY_SRC` — but only when the backend
+    // actually advertises it, because `Surface::configure` rejects any usage
+    // missing from `caps.usage` outright. `TEXTURE_BINDING` is never requested:
+    // DX12 reports only `COLOR_TARGET | COPY_SRC | COPY_DST` for a surface, so
+    // asking for it panics with "Requested usage is not supported" on the first
+    // configure. The copy is what makes the frame readable without it.
+    if caps.usage.contains(wgpu::TextureUsages::COPY_SRC) {
+        config.usage |= wgpu::TextureUsages::COPY_SRC;
+    }
     if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
         config.present_mode = wgpu::PresentMode::Mailbox;
     } else if caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
@@ -5879,20 +5889,51 @@ pub fn run(
                                     (fw, fh),
                                     camera.far,
                                 );
-                                let mut encoder = renderer
-                                    .device
-                                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                        label: Some("imaginator composite"),
-                                    });
-                                renderer.modules.imaginator().composite(
-                                    &renderer.device,
-                                    &renderer.queue,
-                                    &mut encoder,
-                                    scene_view,
-                                    (fw, fh),
-                                    params,
-                                );
-                                renderer.queue.submit(Some(encoder.finish()));
+                                // `scene_view` is the composition target. In the
+                                // plain path that is the swapchain image itself,
+                                // which cannot be sampled: DX12 surfaces are
+                                // colour targets, copy source and copy dest with
+                                // no texture binding. That case hands over the
+                                // texture as well and the composite copies it
+                                // once before sampling. Frame generation and the
+                                // gamma / present-encode paths hand over an
+                                // intermediate the module may sample where it
+                                // lies, so no copy and no `COPY_SRC` is needed
+                                // there.
+                                //
+                                // `COPY_SRC` is what makes the copy legal, and it
+                                // is only in the surface configuration because the
+                                // block above added it when the backend offered
+                                // it. If this backend does not, compositing is
+                                // skipped and reported instead of submitting a
+                                // copy the validator would reject.
+                                let present_texture = if composed_view.is_none() {
+                                    frame.as_ref().map(|present| &present.texture)
+                                } else {
+                                    None
+                                };
+                                let surface_is_copyable = config
+                                    .usage
+                                    .contains(wgpu::TextureUsages::COPY_SRC);
+                                if composed_view.is_none() && !surface_is_copyable {
+                                    renderer.modules.imaginator().report_uncopyable_frame();
+                                } else {
+                                    let mut encoder = renderer.device.create_command_encoder(
+                                        &wgpu::CommandEncoderDescriptor {
+                                            label: Some("imaginator composite"),
+                                        },
+                                    );
+                                    renderer.modules.imaginator().composite(
+                                        &renderer.device,
+                                        &renderer.queue,
+                                        &mut encoder,
+                                        present_texture,
+                                        scene_view,
+                                        (fw, fh),
+                                        params,
+                                    );
+                                    renderer.queue.submit(Some(encoder.finish()));
+                                }
                             }
                             // When frame generation separates the UI from the scene,
                             // finish any gamma ramp / UNORM encode into `final_view`
@@ -7118,6 +7159,57 @@ mod frame_snapshot_tests {
             src.contains("GpuPage::world_view_slot(pass_kind)"),
             "whole-world pages must pick their command list from the pass"
         );
+    }
+
+    /// The surface configuration may only ask for usages the backend reports.
+    ///
+    /// `Surface::configure` is not lenient about this: `wgpu-core` compares
+    /// `config.usage` against `caps.usage` and returns `UnsupportedUsage`, which
+    /// `configure` turns into the panic
+    /// "Error in Surface::configure: Validation Error / Requested usage is not
+    /// supported". That is a startup crash, not a degraded frame, so it is worth
+    /// pinning from the source: every `usage` assignment on a surface config has
+    /// to be guarded by a `caps.usage.contains(...)` test for the same flag.
+    ///
+    /// DX12 is the backend that makes this concrete. It reports
+    /// `COLOR_TARGET | COPY_SRC | COPY_DST` for a surface, so `COPY_SRC` (which
+    /// the Imaginator's frame copy needs) is fine and `TEXTURE_BINDING` is not.
+    #[test]
+    fn surface_usage_is_only_ever_widened_by_what_the_backend_reports() {
+        let src = source();
+        for declaration in ["let mut config = surface", "let mut cfg = surface"] {
+            let start = src
+                .find(declaration)
+                .unwrap_or_else(|| panic!("missing surface configuration: {declaration}"));
+            let body = &src[start..];
+            let end = body.find("surface.configure").expect("configure is below");
+            let block = &body[..end];
+            for (index, line) in block.lines().enumerate() {
+                let line = line.trim();
+                let widens =
+                    line.starts_with("config.usage |=") || line.starts_with("cfg.usage |=");
+                if !widens {
+                    continue;
+                }
+                // The guard has to be in the same block, above the assignment.
+                assert!(
+                    block.contains("caps.usage.contains("),
+                    "{declaration}: `{line}` widens the surface usage without checking \
+                     `caps.usage`, so `Surface::configure` can panic with \
+                     \"Requested usage is not supported\" (line {index})"
+                );
+            }
+            // Comments explain why `TEXTURE_BINDING` is absent, so only the code
+            // lines are checked.
+            assert!(
+                !block
+                    .lines()
+                    .map(str::trim)
+                    .any(|line| !line.starts_with("//") && line.contains("TEXTURE_BINDING")),
+                "{declaration}: no backend that can present reports `TEXTURE_BINDING` for a \
+                 surface image; read the frame with a copy instead"
+            );
+        }
     }
 
     #[test]

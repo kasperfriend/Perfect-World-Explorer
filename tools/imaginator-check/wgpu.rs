@@ -475,6 +475,14 @@ impl CommandEncoder {
         _size: Extent3d,
     ) {
     }
+    /// `Encoder::copy_texture_to_texture` as 0.19.4 declares it.
+    pub fn copy_texture_to_texture(
+        &mut self,
+        _src: ImageCopyTexture<'_>,
+        _dst: ImageCopyTexture<'_>,
+        _size: Extent3d,
+    ) {
+    }
     pub fn finish(self) -> CommandBuffer {
         CommandBuffer
     }

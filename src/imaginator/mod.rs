@@ -311,6 +311,19 @@ impl Imaginator {
             .and_then(|composite| composite.unsupported_reason().map(str::to_string))
     }
 
+    /// Tell the module the visible frame cannot be read this frame.
+    ///
+    /// A swapchain image is only readable through a texture copy, which needs
+    /// `COPY_SRC` in the surface configuration. Every backend that offers DXR
+    /// also offers it, so in practice this never fires; it exists so that a
+    /// backend without it says "unavailable" on the module page instead of
+    /// submitting a copy the validation layer would reject.
+    pub fn report_uncopyable_frame(&mut self) {
+        self.status = "the swapchain image is not copyable on this backend \
+                       (no `COPY_SRC`), so the traced terms cannot be composited"
+            .into();
+    }
+
     /// Build the GPU objects. Called once, after the device exists.
     pub fn init(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
         if self.composite.is_none() {
@@ -597,7 +610,8 @@ impl Imaginator {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        frame: &wgpu::TextureView,
+        frame_texture: Option<&wgpu::Texture>,
+        frame_view: &wgpu::TextureView,
         extent: (u32, u32),
         params: GpuParams,
     ) -> bool {
@@ -657,7 +671,8 @@ impl Imaginator {
             device,
             queue,
             encoder,
-            frame,
+            frame_texture,
+            frame_view,
             extent,
             &self.settings,
             params,
