@@ -133,6 +133,16 @@ const POINTER_SET_SLOTS: [usize; 3] = [SLOT_SET_D3D12, SLOT_SET_D3D11, SLOT_SET_
 /// The `Get` slots that can read a resource pointer back, same order.
 const POINTER_GET_SLOTS: [usize; 3] = [SLOT_GET_D3D12, SLOT_GET_D3D11, SLOT_GET_VOID];
 
+/// The `Set` slots a resource pointer is tried through, in order: the
+/// declaration's `ID3D12Resource *` overload, then the D3D11 one, then `void *`.
+///
+/// A *runtime* list, not a guess: `DlssUpscaler::record` writes the four evaluate
+/// resources through each in turn until the feature accepts the evaluate, because
+/// the only authority on which overload its own reader agrees with is the feature
+/// itself (`docs/blockers.md` B-27).
+pub(crate) const RESOURCE_SET_SLOT_CANDIDATES: [usize; 3] =
+    [SLOT_SET_D3D12, SLOT_SET_D3D11, SLOT_SET_VOID];
+
 /// One `Set` overload of an `NVSDK_NGX_Parameter` the viewer does not own.
 ///
 /// `None` when the object or its vtable is missing, or when the slot is null —
