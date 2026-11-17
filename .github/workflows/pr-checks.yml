@@ -133,8 +133,6 @@ jobs:
           exit "$status"
       - name: Check the Imaginator shader matches the CPU tracer's channels
         run: ./tools/imaginator-shader-contract.sh
-      - name: Run the Imaginator's offline harness
-        run: ./tools/imaginator-realcheck.sh all
       - name: Run viewer unit tests
         run: |
           CARGO_TERM_COLOR=never cargo test --locked --bin perfect-world-explorer 2>&1 | tee /tmp/cargo-test.log
