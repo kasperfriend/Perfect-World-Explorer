@@ -176,22 +176,22 @@ impl Residency {
                     }
                 }
             }
-            }
-            vertices.reserve(total_v);
-            indices.reserve(total_i);
-            let mut spans = Vec::with_capacity(collected.len());
-            for &((x, y), block) in &collected {
-                let base = vertices.len() as u32;
-                let start = indices.len() as u32;
-                vertices.extend_from_slice(&block.vertices);
-                indices.extend(block.indices.iter().map(|i| base + *i));
-                spans.push(Span {
-                    block: (x, y),
-                    start,
-                    count: block.indices.len() as u32,
-                    bounds: block.bounds,
-                });
-            }
+        }
+        vertices.reserve(total_v);
+        indices.reserve(total_i);
+        let mut spans = Vec::with_capacity(collected.len());
+        for &((x, y), block) in &collected {
+            let base = vertices.len() as u32;
+            let start = indices.len() as u32;
+            vertices.extend_from_slice(&block.vertices);
+            indices.extend(block.indices.iter().map(|i| base + *i));
+            spans.push(Span {
+                block: (x, y),
+                start,
+                count: block.indices.len() as u32,
+                bounds: block.bounds,
+            });
+        }
 
         spans
     }
