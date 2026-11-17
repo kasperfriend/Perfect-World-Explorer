@@ -1289,23 +1289,11 @@ mod tests {
     /// in pixels, y down) with the y flip that makes it so.
     #[test]
     fn the_shader_carries_the_motion_entry_point() {
-        assert_eq!(
-            WGSL.matches("@fragment fn cover(").count(),
-            1,
-            "effect sheets need exactly one motion entry point"
-        );
-        assert_eq!(
-            WGSL.matches("<0.5 {discard;}").count(),
-            1,
-            "motion claims a pixel only where the sheet's opacity dominates it"
-        );
+        assert_eq!(WGSL.matches("@fragment fn cover(").count(), 1, "one entry");
+        assert_eq!(WGSL.matches("<0.5 {discard;}").count(), 1, "one gate");
         let motion =
             "let motion=(prev.xy/prev.w-cur.xy/cur.w)*vec2<f32>(0.5*p.mv_size.x,-0.5*p.mv_size.y);";
-        assert_eq!(
-            WGSL.matches(motion).count(),
-            1,
-            "sheet motion is previous minus current, in pixels, with y flipped"
-        );
+        assert_eq!(WGSL.matches(motion).count(), 1, "one convention");
     }
 
     /// The object-motion pixel and the depth at (0,0) of a 4x4 target after a
@@ -1517,17 +1505,10 @@ mod tests {
             &[quad("a.png", 5, 6, 0, true, [1., 1., 1., 1.])],
             glam::Mat4::IDENTITY.to_cols_array_2d(),
         );
-        assert_eq!(
-            [still[4], still[5]],
-            [0x00, 0x3c],
-            "an opaque sheet must own the pixel, got {still:?}"
-        );
-        assert_eq!(
-            [still[0], still[1], still[2], still[3], still[6], still[7]],
-            [0; 6],
-            "a sheet that has not moved carries no motion, got {still:?}"
-        );
-        assert_eq!(depth, 0.0, "the motion pass must not record a surface, got depth {depth}");
+        assert_eq!([still[4], still[5]], [0x00, 0x3c], "opaque sheet owns the pixel");
+        assert_eq!(&still[..4], &[0, 0, 0, 0][..], "still sheet carries no motion");
+        assert_eq!(&still[6..], &[0, 0][..], "and nothing in the padding");
+        assert_eq!(depth, 0.0, "the motion pass writes no depth");
         // Frame two: the same sheet, and a camera that moved one world unit along
         // x. The vector is previous minus current in pixels, so it is non-zero and
         // the sheet still owns the pixel.
@@ -1537,31 +1518,22 @@ mod tests {
             &[quad("a.png", 5, 6, 0, true, [1., 1., 1., 1.])],
             glam::Mat4::from_translation(glam::Vec3::new(1., 0., 0.)).to_cols_array_2d(),
         );
-        assert_eq!(
-            [moved[4], moved[5]],
-            [0x00, 0x3c],
-            "a moved sheet still owns the pixel, got {moved:?}"
+        assert_eq!([moved[4], moved[5]], [0x00, 0x3c], "moved sheet owns the pixel");
+        assert!(
+            moved[..4].iter().any(|byte| *byte != 0),
+            "a moved sheet carries its own motion, got {moved:?}"
         );
-        assert_ne!(
-            [moved[0], moved[1], moved[2], moved[3]],
-            [0; 4],
-            "a sheet seen through a moved camera carries its own motion, got {moved:?}"
-        );
-        assert_eq!(depth, 0.0, "the motion pass must not record a surface, got depth {depth}");
+        assert_eq!(depth, 0.0, "the motion pass writes no depth");
         // Frame three: the same sheet at 20% opacity does not dominate the pixel,
-        // so it claims nothing at all — no vector and no surface.
+        // so it claims nothing at all -- no vector and no surface.
         let (faint, depth) = covered_motion(
             &mut draw,
             &harness,
             &[quad("a.png", 5, 6, 0, true, [1., 1., 1., 0.2])],
             glam::Mat4::IDENTITY.to_cols_array_2d(),
         );
-        assert_eq!(
-            faint,
-            [0; 8],
-            "a sheet that does not dominate the pixel must leave it alone, got {faint:?}"
-        );
-        assert_eq!(depth, 0.0, "and must not record a surface either");
+        assert_eq!(faint, [0; 8], "faint sheet claims nothing");
+        assert_eq!(depth, 0.0, "and writes no depth either");
     }
 
     #[test]
