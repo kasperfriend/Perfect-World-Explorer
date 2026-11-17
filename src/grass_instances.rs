@@ -105,6 +105,8 @@ impl Builder {
     }
     pub fn finish(self) -> Data {
         let mut data = Data::default();
+        data.batches.reserve(self.groups.len());
+        data.instances.reserve(self.groups.values().map(|g| g.instances.len()).sum());
         for (_, g) in self.groups {
             if g.instances.is_empty() {
                 continue;
