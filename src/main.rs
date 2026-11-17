@@ -160,6 +160,7 @@ mod windows_setup;
 mod world_models;
 mod world_models_gpu;
 mod world_objects;
+mod world_page_cache;
 struct Terrain {
     element: PathBuf,
     /// Cells per T2BK block edge (`world.trn2` header dword @20).

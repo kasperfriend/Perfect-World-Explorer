@@ -18,6 +18,8 @@ mod texture_atlas;
 mod texture_resolution;
 #[path = "../world_objects.rs"]
 mod world_objects;
+#[path = "../world_page_cache.rs"]
+mod world_page_cache;
 mod gpu {
     #[repr(C)]
     #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -56,10 +58,14 @@ fn main() {
                     p.processed, p.shared_atlas
                 )
             }
+            world_objects::Message::CacheInvalid => {
+                println!("discarding invalid cached pages and rebuilding");
+            }
             world_objects::Message::Done {
                 processed,
                 skipped,
                 stats,
+                world_draw_cmds: _,
             } => {
                 println!(
                     "residency: decodes={} alias_hits={} alias_bytes_saved={} evictions={} evicted_bytes={} peak_resident_bytes={} resident_bytes={} pinned_over_budget={} budget_bytes={}",

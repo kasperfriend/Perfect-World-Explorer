@@ -949,6 +949,10 @@ fn build(
                     used_height: 0,
                     mips: Vec::new(),
                     placements: Vec::new(),
+                    bounds: Vec::new(),
+                    page_min: [f32::INFINITY; 3],
+                    page_max: [f32::NEG_INFINITY; 3],
+                    page_has_sdr: false,
                 },
             ));
             (i, slot)
@@ -4068,7 +4072,7 @@ pub fn run(
         map_space.clone(),
         water_areas.clone(),
         &t.scene,
-        whole_ornaments.clone(),
+        whole_ornaments.to_vec(),
     );
     // Add-ons get read access to the world's effect catalogue the moment the
     // world has one: the same grouped index the World tab's census uses, so a
@@ -4089,7 +4093,15 @@ pub fn run(
     let mut world_rx: Option<std::sync::mpsc::Receiver<crate::world_objects::Message>> = None;
     let mut world_cancel: Option<Arc<std::sync::atomic::AtomicBool>> = None;
     let mut world_enabled = false;
+    let mut world_started_at: Option<std::time::Instant> = None;
     let mut world_status = String::from("Off");
+    let mut world_last_log_at = std::time::Instant::now();
+    let mut world_last_logged_pages = 0usize;
+    let world_upload_budget_ms = std::env::var("PW_WORLD_UPLOAD_BUDGET_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| value.clamp(1, 250))
+        .unwrap_or(40);
     // The expensive atlas and scene rebuild runs off the UI thread. At most one
     // request is in flight; once it completes, the latest camera position is used.
     let (width, height, spacing) = (t.width, t.height, t.grid_spacing);
@@ -4437,18 +4449,25 @@ pub fn run(
                          let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
                             std::thread::Builder::new().name("whole-world-objects".into()).spawn(move ||crate::world_objects::build(root,ornaments,tx,c)).expect("world preload thread");
-                            world_rx=Some(rx);world_cancel=Some(cancel);world_status=String::from("Loading world objects...");
-                        } else {world_status=String::from("Off");}
+                            world_rx=Some(rx);world_cancel=Some(cancel);world_started_at=Some(std::time::Instant::now());world_last_log_at=std::time::Instant::now();world_last_logged_pages=0;world_status=String::from("Loading world objects...");
+                        } else {world_started_at=None;world_status=String::from("Off");}
                     }
                 if let Some(rx) = &world_rx {
-                    let upload_start = std::time::Instant::now();
+                    // Favor completing the explicitly requested whole-world
+                    // preload, but retain a frame-time ceiling so uploads cannot
+                    // monopolize the event loop indefinitely. Raise this via
+                    // PW_WORLD_UPLOAD_BUDGET_MS on machines willing to trade
+                    // frame pacing for faster scenery readiness.
+                    let upload_deadline = std::time::Instant::now()
+                        + std::time::Duration::from_millis(world_upload_budget_ms);
                     let mut uploaded_this_frame = 0usize;
-                    while uploaded_this_frame < 8
-                        && (uploaded_this_frame == 0 || upload_start.elapsed().as_millis() < 12)
+                    while uploaded_this_frame < 64
+                        && (uploaded_this_frame == 0 || std::time::Instant::now() < upload_deadline)
                     {
                         match rx.try_recv() {
                             Ok(crate::world_objects::Message::Page(page)) => {
                                 let processed = page.processed;
+                                let upload_started = std::time::Instant::now();
                                 let uploaded = crate::world_objects::GpuPage::upload_world(
                                     &renderer.device,
                                     &renderer.queue,
@@ -4459,42 +4478,64 @@ pub fn run(
                                     &renderer.world_pages,
                                     page,
                                 );
+                                let upload_ms = upload_started.elapsed().as_secs_f64() * 1000.0;
                                 renderer.world_pages.push(uploaded);
                                 uploaded_this_frame += 1;
                                 world_status = format!(
-                                    "Loading: {processed}/{} objects, {} GPU chunks",
+                                    "Loading: {processed}/{} objects, {} GPU chunks (latest upload {:.1} ms)",
                                     whole_ornaments.len(),
-                                    renderer.world_pages.len()
+                                    renderer.world_pages.len(),
+                                    upload_ms
                                 );
-                                eprintln!("{world_status}");
+                                if world_last_log_at.elapsed() >= std::time::Duration::from_secs(1)
+                                    || renderer.world_pages.len() >= world_last_logged_pages + 128
+                                {
+                                    eprintln!("{world_status}");
+                                    world_last_log_at = std::time::Instant::now();
+                                    world_last_logged_pages = renderer.world_pages.len();
+                                }
+                            }
+                            Ok(crate::world_objects::Message::CacheInvalid) => {
+                                renderer.world_pages.clear();
+                                renderer.world_draw_cmds = Default::default();
+                                world_status = String::from("World cache invalid; rebuilding pages...");
                             }
                             Ok(crate::world_objects::Message::Done {
                                 processed,
                                 skipped,
                                 stats,
+                                world_draw_cmds,
                             }) => {
-                                renderer.world_draw_cmds =
-                                    crate::world_objects::GpuPage::world_culled_commands(
-                                        &renderer.world_pages,
-                                    );
+                                renderer.world_draw_cmds = world_draw_cmds;
                                 for page in &mut renderer.world_pages {
                                     page.release_cpu_ranges();
                                 }
                                 renderer.local_pages.clear();
                                 renderer.local_pages.shrink_to_fit();
                                 renderer.world_done = true;
+                                let elapsed = world_started_at
+                                    .take()
+                                    .map(|started| started.elapsed().as_secs_f64());
+                                let load_detail = if stats.cache_hit {
+                                    format!("warm page cache, {} MiB atlas data", stats.atlas_bytes >> 20)
+                                } else {
+                                    format!("peak decoded-texture residency {} MiB / {} MiB, {} evictions",
+                                        stats.residency.peak_resident_bytes >> 20,
+                                        stats.residency.budget_bytes >> 20,
+                                        stats.residency.evictions)
+                                };
                                 world_status = format!(
-                                    "Loaded {processed} objects; {skipped} meshes use fallback texture; {} geometry chunks ({} pages); peak decoded-texture residency {} MiB / {} MiB, {} evictions",
+                                    "Loaded {processed} objects in {:.1}s{}; {skipped} meshes use fallback texture; {} geometry chunks ({} pages); {load_detail}",
+                                    elapsed.unwrap_or_default(),
+                                    if stats.cache_hit { " (warm page cache)" } else { "" },
                                     renderer.world_pages.len(),
                                     stats.pages,
-                                    stats.residency.peak_resident_bytes >> 20,
-                                    stats.residency.budget_bytes >> 20,
-                                    stats.residency.evictions,
                                 );
                                 eprintln!("{world_status}");
                                 break;
                             }
                             Ok(crate::world_objects::Message::Error(e)) => {
+                                world_started_at = None;
                                 world_status = format!("World load failed: {e}");
                                 eprintln!("{world_status}");
                                 break;
@@ -5011,10 +5052,14 @@ pub fn preview(
                     );
                     renderer.world_pages.push(uploaded);
                 }
+                crate::world_objects::Message::CacheInvalid => {
+                    renderer.world_pages.clear();
+                }
                 crate::world_objects::Message::Done {
                     processed,
                     skipped,
                     stats,
+                    world_draw_cmds,
                 } => {
                     eprintln!(
                         "Preview world preload: {processed} objects, {skipped} fallback meshes, {} pages, peak residency {} MiB / {} MiB budget, {} evictions",
@@ -5023,8 +5068,7 @@ pub fn preview(
                         stats.residency.budget_bytes >> 20,
                         stats.residency.evictions
                     );
-                    renderer.world_draw_cmds =
-                        crate::world_objects::GpuPage::world_culled_commands(&renderer.world_pages);
+                    renderer.world_draw_cmds = world_draw_cmds;
                     for page in &mut renderer.world_pages {
                         page.release_cpu_ranges();
                     }

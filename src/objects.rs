@@ -28,6 +28,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::File,
     path::Path,
+    sync::Arc,
 };
 pub struct Texture {
     pub width: usize,
@@ -230,7 +231,10 @@ pub struct UnresolvedTexture {
     pub detail: String,
 }
 pub struct Objects {
-    pub ornaments: Vec<Ornament>,
+    pub ornaments: Arc<[Ornament]>,
+    /// Normalized archive keys built once instead of formatting and lowercasing
+    /// the same placement path on every streamed batch.
+    model_names: Vec<String>,
     models: HashMap<String, bmd::Model>,
     cache: TextureCache,
     resolver: TextureResolver,
@@ -305,7 +309,7 @@ fn decode_texture_bytes(key: &str, data: &[u8]) -> Result<Texture, String> {
 }
 
 impl Objects {
-    pub fn open(element: &Path, ornaments: Vec<Ornament>) -> Result<Self, String> {
+    pub fn open<O: Into<Arc<[Ornament]>>>(element: &Path, ornaments: O) -> Result<Self, String> {
         let mut litfile = File::open(element.join("litmodels.pck")).map_err(|e| e.to_string())?;
         let mut texfile = File::open(element.join("building.pck")).map_err(|e| e.to_string())?;
         let litentries = pck::directory(&mut litfile)?
@@ -321,6 +325,11 @@ impl Objects {
         // but it is also unobservable in this corpus: the census found 0
         // texture names present in both archives and litmodels.pck contains
         // no texture members at all (28858/28858 are .bmd).
+        let ornaments = ornaments.into();
+        let model_names = ornaments
+            .iter()
+            .map(|ornament| format!("litmodels/world/{}", ornament.path.to_lowercase()))
+            .collect();
         let resolver = TextureResolver::new(
             vec![
                 MountedArchive {
@@ -336,6 +345,7 @@ impl Objects {
         );
         Ok(Self {
             ornaments,
+            model_names,
             models: HashMap::new(),
             cache: TextureCache::new(tex_budget_bytes()),
             resolver,
@@ -364,27 +374,25 @@ impl Objects {
     }
     /// Loads a small explicit batch for the independent world preload worker.
     pub fn load_ids(&mut self, ids: &[usize]) -> Result<(), String> {
-        let active: HashSet<String> = ids
-            .iter()
-            .map(|&i| format!("litmodels/world/{}", self.ornaments[i].path.to_lowercase()))
-            .collect();
-        self.models.retain(|name, _| active.contains(name));
+        let active: HashSet<&str> = ids.iter().map(|&i| self.model_names[i].as_str()).collect();
+        self.models.retain(|name, _| active.contains(name.as_str()));
         self.cache.begin_batch();
-        let mut missing_models: Vec<(String, &pck::Entry)> = Vec::new();
+        let mut missing_models: Vec<(usize, &pck::Entry)> = Vec::new();
         let mut seen_missing = HashSet::new();
         for &i in ids {
-            let name = format!("litmodels/world/{}", self.ornaments[i].path.to_lowercase());
-            if !self.models.contains_key(&name) && seen_missing.insert(name.clone()) {
+            let name = &self.model_names[i];
+            if !self.models.contains_key(name.as_str()) && seen_missing.insert(name.as_str()) {
                 let entry = self
                     .litentries
-                    .get(&name)
+                    .get(name.as_str())
                     .ok_or_else(|| format!("missing model {name}"))?;
-                missing_models.push((name, entry));
+                missing_models.push((i, entry));
             }
         }
 
         if !missing_models.is_empty() {
             let litfile = &self.litfile;
+            let model_names = &self.model_names;
             // Keep several archive ranges per worker so DirectStorage can
             // submit a real batch instead of paying one queue submit/wait per
             // model. Four workers still parse independent BMDs concurrently.
@@ -399,7 +407,7 @@ impl Objects {
             };
             let workers = workers.min(missing_models.len());
             let chunk_size = (missing_models.len() + workers - 1) / workers;
-            let parsed: Vec<Result<Vec<(String, bmd::Model)>, String>> = std::thread::scope(|s| {
+            let parsed: Vec<Result<Vec<(usize, bmd::Model)>, String>> = std::thread::scope(|s| {
                 let handles: Vec<_> = missing_models
                     .chunks(chunk_size)
                     .map(|chunk| {
@@ -410,10 +418,10 @@ impl Objects {
                                     batch.iter().map(|(_, entry)| *entry).collect();
                                 let data = pck::read_entries_at(litfile, &entries)
                                     .map_err(|e| e.to_string())?;
-                                for ((name, _), data) in batch.iter().zip(data) {
+                                for ((index, _), data) in batch.iter().zip(data) {
                                     let model = bmd::Model::parse(&data)
-                                        .map_err(|e| format!("{name}: {e}"))?;
-                                    out.push((name.clone(), model));
+                                        .map_err(|e| format!("{}: {e}", model_names[*index]))?;
+                                    out.push((*index, model));
                                 }
                             }
                             Ok(out)
@@ -423,8 +431,8 @@ impl Objects {
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             });
             for batch in parsed {
-                for (name, model) in batch? {
-                    self.models.insert(name, model);
+                for (index, model) in batch? {
+                    self.models.insert(self.model_names[index].clone(), model);
                 }
             }
         }
@@ -433,11 +441,11 @@ impl Objects {
         let mut seen_refs = HashSet::new();
         let mut unique_refs = Vec::new();
         for &i in ids {
-            let name = format!("litmodels/world/{}", self.ornaments[i].path.to_lowercase());
-            if !seen_models.insert(name.clone()) {
+            let name = self.model_names[i].as_str();
+            if !seen_models.insert(name) {
                 continue;
             }
-            for mesh in &self.models[&name].meshes {
+            for mesh in &self.models[name].meshes {
                 if seen_refs.insert(mesh.texture.clone()) {
                     unique_refs.push(mesh.texture.clone());
                 }

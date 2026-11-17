@@ -179,6 +179,78 @@ not applicable to the client's existing PCK encoding. No DirectStorage hardware
 benchmark has been run here; use the normal build unless you have the
 SDK/runtime and can measure on the target machine.
 
+### Whole-world scenery upload pacing
+
+Enabling **Render whole world** still requires the viewer to build the whole
+scene and create GPU buffers/textures; DirectStorage only accelerates eligible
+archive reads and cannot skip this work. Placement bounds are now computed by
+the background builder rather than rescanned during render-thread GPU page
+admission. Atlas pages grow only to their occupied rows, texture placement
+uses integer nearest-neighbor blits instead of per-pixel floating-point
+sampling, and small mip levels avoid repeatedly spawning worker teams. Geometry
+batches default to 2 million vertices (from 1 million) to reduce GPU buffer/page
+bookkeeping; `PW_WORLD_PAGE_VERTICES=1000000..8000000` tunes that tradeoff.
+Finished CPU pages are persisted under `cache/world-pages-v1/` (or beneath
+`PW_CACHE_DIR`) and reused on later runs, including with **All to VRAM** enabled.
+The cache is keyed from the world placements and source archive metadata, has
+per-page checksums, and is published atomically only after a complete build.
+It skips PCK indexing, model/texture reads and decoding, geometry/atlas/mip
+building, and command sorting on warm runs; GPU resources still have to be
+created and uploaded each process, so this is not an instant-render guarantee.
+The cache can take substantial disk space; it contains derived client data, is
+ignored by Git, and must not be distributed. Delete it with the viewer closed
+if you need to reclaim space or force a rebuild.
+While pages are ready, the renderer uploads them in bounded batches and reports
+the latest page-upload time while loading plus total enable-to-ready time when
+finished. The default per-frame upload budget is 40 ms (up to 64 pages, with
+one page always allowed); `PW_WORLD_UPLOAD_BUDGET_MS=1..250` trades frame
+responsiveness for faster preload completion. The viewer continues to show the
+existing local scenery until every whole-world page is uploaded, to avoid
+partial-scene visual gaps.
+There is no claim of instant rendering or a measured speedup without timing on
+the target machine.
+
+Additional changes in this path (separate from the existing DirectStorage
+archive-read batching) are:
+
+1. Persistent, checksummed finished-page caching, including when **All to VRAM**
+is enabled.
+2. A cheap warm-start cache identity from ordered placements and source archive
+metadata, rather than hashing multi-gigabyte archives at launch.
+3. Sequential streaming of cache records through one file instead of retaining
+serialized copies of the entire world in RAM.
+4. Bounded cache decoding with per-page integrity checks and invalid-cache
+fallback to a cold rebuild.
+5. Worker-side precomputation and persistence of world draw/cull metadata, so
+cache hits skip page-command reconstruction on the render thread.
+6. Worker-side placement bounds calculation, removing that scan from GPU page
+admission.
+7. Shared `Arc` ownership of the immutable ornament list across renderer and
+builder.
+8. Sorting compact ornament indices rather than cloning and sorting full
+placement records.
+9. Typed texture-content slot keys instead of allocating formatted strings.
+10. Lazy atlas-row allocation, avoiding zero-initializing unused rows.
+11. Exact row copies for same-size textures and integer nearest-neighbor
+resampling for resized textures.
+12. A pixel-work threshold for mip parallelism, avoiding repeated thread-team
+startup for small levels.
+13. Two-million-vertex default page batches (configurable up to eight million)
+to reduce page/buffer bookkeeping.
+14. A larger but bounded per-frame GPU upload batch, with an opt-in budget
+setting for users prioritizing preload completion.
+15. Throttled progress logging plus per-upload and total readiness timing, so
+loading diagnostics do not flood stderr.
+16. Precomputed normalized model archive keys, avoiding repeated lowercase and
+formatted-string allocations while loading successive placement batches.
+17. Reuse slices of the sorted ornament-index array instead of allocating a new
+index vector for each cold-build batch.
+
+The warm-start identity uses archive size and modification time rather than a
+full content hash to avoid a multi-gigabyte scan on every launch. If a client
+archive is replaced while preserving both metadata values, delete the derived
+world-page cache to force a rebuild.
+
 ### RAM-first lossless terrain cache
 
 The viewer now writes validated terrain heights/normals directly into
