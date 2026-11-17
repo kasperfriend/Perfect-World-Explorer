@@ -32,6 +32,9 @@ pub struct Frame {
     /// Zero disables alpha testing; 1..8 are the source D3DCMPFUNC values.
     pub alpha_compare: u32,
     pub alpha_reference: f32,
+    /// LOD bias for the mipmapped object atlas (see
+    /// `crate::render_scale::mip_bias`); `0` samples the sharpest mip.
+    pub lod_bias: f32,
 }
 impl Frame {
     fn params(
@@ -148,7 +151,7 @@ impl Frame {
             alpha: [if diffuse_alpha_only { 0. } else { 1. }, face_mode, 0., 0.],
             face_color,
             face_skin,
-            lod: [crate::render_scale::mip_bias(), 0., 0., 0.],
+            lod: [self.lod_bias, 0., 0., 0.],
         };
         if bytemuck::cast_slice::<Params, f32>(std::slice::from_ref(&p))
             .iter()

@@ -91,6 +91,10 @@ fn main() {
         1.,
     ]);
     uni.extend_from_slice(&[0.; 12]);
+    // Pad to the whole camera uniform and give it the `lod` lane: no bias, and
+    // a gradient scale of 1 keeps the LOD this check measures.
+    uni.resize(392, 0.);
+    uni[389] = 1.;
     let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
         contents: bytemuck::cast_slice(&uni),

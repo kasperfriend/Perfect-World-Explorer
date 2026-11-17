@@ -293,6 +293,7 @@ fn main() {
         reverse_front: false,
         alpha_compare: 0,
         alpha_reference: 84. / 255.,
+        lod_bias: 0.,
     };
     let sampler = device.create_sampler(&Default::default());
     let mut reads = 0;

@@ -221,6 +221,7 @@ fn effect_frame(
         reverse_front: false,
         alpha_compare: 5,
         alpha_reference: 84. / 255.,
+        lod_bias: 0.,
     }
 }
 

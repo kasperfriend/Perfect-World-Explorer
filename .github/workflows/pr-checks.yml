@@ -66,6 +66,15 @@ jobs:
         run: |
           cc -O0 tools/check-native-region-reference.c -o /tmp/native-region-reference
           /tmp/native-region-reference
+      - name: Verify NGX parameter names and setter types
+        run: |
+          # Every NVSDK_NGX parameter the DLSS / DLSS-G paths write, checked
+          # against the vendored table from NVIDIA/DLSS v310.9.16: the name must
+          # exist and the setter type must be the one NVIDIA's own create and
+          # evaluate helpers use (`SetI` vs `SetUI` is a silent refusal, not a
+          # compile error). Regenerate the table with
+          # `tools/verify-ngx-params.py --headers DIR --dump-fixture F`.
+          python3 tools/verify-ngx-params.py
       - name: Test requirement status audits
         run: |
           python3 tools/test_phase1_ready.py
