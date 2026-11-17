@@ -167,7 +167,7 @@ pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
         inflate(&compressed, e.size as usize)
     } else {
         at(f, e.offset as u64, e.compressed as usize)
-        }    
+    }    
 }
 
 /// Read a bounded set of entries from one archive. Large reads are queued
