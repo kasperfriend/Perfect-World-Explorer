@@ -642,6 +642,12 @@ impl WeatherGpu {
     /// particles fall through a camera-centred volume and the parsed water
     /// mask suppresses a submerged camera view. Native RNG/lifetimes and
     /// terrain collision remain outstanding.
+    ///
+    /// `object_mv` is where the coverage pass records each particle's own motion
+    /// vector for the shared motion-vector pass, unused when `coverage` is false;
+    /// `render_size` converts those vectors from NDC to pixels, and
+    /// `unjittered_vp` is the main view's jitter-free view-projection — a vector
+    /// says where the surface *was*, not where this frame sampled it.
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
@@ -649,12 +655,8 @@ impl WeatherGpu {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
-        /// Where the coverage pass records each particle's own motion vector, for
-        /// the shared motion-vector pass. Unused when `coverage` is false.
         object_mv: &wgpu::TextureView,
-        /// Render extent, for the NDC-to-pixel conversion of those vectors.
         render_size: (u32, u32),
-        /// The main view's *unjittered* view-projection, for the same vectors.
         unjittered_vp: Mat4,
         matrix: Mat4,
         camera: Vec3,
