@@ -163,7 +163,7 @@ fn gbk(bytes: &[u8]) -> Result<String, String> {
     }
 }
 pub fn normalize(path: &str) -> String {
-  let trimmed = path.trim();
+     let trimmed = path.trim();
     let mut out = String::with_capacity(trimmed.len());
     for seg in trimmed.split(['/', '\\']).filter(|s| !s.is_empty()) {
         if !out.is_empty() {
