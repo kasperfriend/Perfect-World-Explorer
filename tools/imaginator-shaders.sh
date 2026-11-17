@@ -20,7 +20,9 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 src="$root/tools/imaginator-shaders/dxr_trace.hlsl"
-out="$root/imaginator/dxr_trace.cso"
+# The module loads this exact path: `Modules/Imaginator/imaginator/dxr_trace.cso`
+# beside the executable, which is where the repository keeps it too.
+out="$root/Modules/Imaginator/imaginator/dxr_trace.cso"
 
 find_dxc() {
     if [[ -n "${DXC:-}" ]]; then printf '%s\n' "$DXC"; return 0; fi

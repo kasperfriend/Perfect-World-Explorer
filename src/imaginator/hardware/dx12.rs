@@ -52,8 +52,15 @@ pub const GEOMETRY_STRIDE: u64 = 36;
 /// is strictly worse than turning hardware tracing off and saying so.
 pub const BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The DXIL blob's location, relative to the module's own folder.
+/// The DXIL blob's location, relative to the module's own folder
+/// (`Modules/Imaginator`). `tools/imaginator-shaders.sh` writes exactly this
+/// path under `Modules/Imaginator/`, which is the copy the module loads.
 pub const DXIL_FILE: &str = "imaginator/dxr_trace.cso";
+
+/// The module's own folder, from the working directory. Spelled here rather than
+/// imported so this file type-checks on its own; `imaginator::DIRECTORY` is the
+/// same string.
+const MODULE_DIR: &str = "Modules/Imaginator";
 
 /// The shader's `Params` block in 32-bit floats: ten `float4`/`uint4` members,
 /// i.e. 160 bytes, which is `PARAMS_BYTES` below.
@@ -307,8 +314,10 @@ impl HardwareTracer {
         }
         self.list4 = list4;
         self.allocator = allocator;
-        // 3. The one piece that cannot be produced in-tree.
-        let note = match std::fs::read(DXIL_FILE) {
+        // 3. The one piece that cannot be produced in-tree. The probe has no
+        //    module folder yet — it runs before the module page has one — so this
+        //    only reports whether a blob exists where the module will look.
+        let note = match std::fs::read(Path::new(MODULE_DIR).join(DXIL_FILE)) {
             Ok(blob) if blob.len() > 4 => format!(
                 "DXR tier {} on ID3D12Device5; {DXIL_FILE} present ({} KiB), build runs on the first traced frame",
                 self.tier_label(),
