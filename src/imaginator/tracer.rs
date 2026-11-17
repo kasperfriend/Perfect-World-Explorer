@@ -442,9 +442,19 @@ impl Tracer {
         }
     }
 
-    /// Trace one frame into `out`, which must hold `width * height` samples.
-    /// Rows are split across `threads` closures; the caller supplies them so the
-    /// tracer itself owns no thread pool and stays testable.
+    /// Trace rows `row_start..row_end` of a `width * height` image into `out`.
+    ///
+    /// `out` holds **this row range only**: `(row_end - row_start) * width`
+    /// samples, indexed from zero. That is what makes row splitting cheap — a
+    /// worker hands each thread a slice the size of its own band instead of the
+    /// whole image. Indexing `out` with the image's absolute stride
+    /// (`y * width + x`) is what used to happen here, and it wrote past the end of
+    /// every slice but the first: with 16 threads on a 344-pixel-wide frame the
+    /// second thread's first write landed at index 73960 in a 73960-element
+    /// slice.
+    ///
+    /// The caller supplies the closures, so the tracer owns no thread pool and
+    /// stays testable.
     pub fn trace_rows(
         &self,
         camera: &TraceCamera,
@@ -459,7 +469,18 @@ impl Tracer {
         let mut rays = 0u64;
         let w = width as f32;
         let h = height as f32;
-        for y in row_start..row_end.min(height) {
+        let end = row_end.min(height);
+        debug_assert!(
+            row_start <= end,
+            "row range {row_start}..{row_end} is inverted for a {height}-row image"
+        );
+        // `out` starts at `row_start`, not at the top of the image.
+        debug_assert_eq!(
+            out.len(),
+            (end.saturating_sub(row_start)) as usize * width as usize,
+            "the buffer must cover exactly the traced rows ({row_start}..{end} of {width}x{height})"
+        );
+        for y in row_start..end {
             for x in 0..width {
                 let mut rng = Rng::new(
                     x.wrapping_mul(0x9e37_79b9) ^ y.wrapping_mul(0x85eb_ca6b) ^ 0x1234_5678,
@@ -479,7 +500,8 @@ impl Tracer {
                     acc.hit += sample.hit;
                 }
                 let inv = 1. / samples.max(1) as f32;
-                out[(y * width + x) as usize] = Sample {
+                // Row `y` of the image is row `y - row_start` of this buffer.
+                out[((y - row_start) * width + x) as usize] = Sample {
                     occlusion: acc.occlusion * inv,
                     direct: acc.direct * inv,
                     indirect: acc.indirect * inv,
@@ -799,12 +821,58 @@ mod tests {
     fn row_splitting_covers_every_pixel_exactly_once() {
         let scene = room();
         let tracer = Tracer::new(scene, Environment::default());
-        let mut out = vec![Sample::default(); 64];
-        tracer.trace_rows(&camera(), &options(), 8, 8, 1, 0, 4, &mut out);
-        tracer.trace_rows(&camera(), &options(), 8, 8, 1, 4, 8, &mut out);
-        // Every pixel in the left half of the lower rows is floor or wall.
-        assert!(out.iter().all(|s| s.hit > 0.5));
-        let _ = &out;
+        // The whole image, and the two halves traced the way the worker splits
+        // them: each call gets a buffer the size of its own band.
+        let whole = tracer.trace(&camera(), &options(), 8, 8, 1);
+        let mut halves = Vec::new();
+        for (start, end) in [(0u32, 4u32), (4, 8)] {
+            let mut band = vec![Sample::default(); ((end - start) * 8) as usize];
+            tracer.trace_rows(&camera(), &options(), 8, 8, 1, start, end, &mut band);
+            halves.push(band);
+        }
+        // Every pixel in the lower rows is floor or wall.
+        assert!(whole.iter().all(|s| s.hit > 0.5));
+        // Splitting the rows must reproduce the single-threaded image exactly.
+        for (index, band) in halves.iter().enumerate() {
+            let offset = index * 4 * 8;
+            for (pixel, sample) in band.iter().enumerate() {
+                assert_eq!(
+                    sample.hit,
+                    whole[offset + pixel].hit,
+                    "row splitting changed pixel {} of band {index}",
+                    pixel
+                );
+                assert_eq!(sample.distance, whole[offset + pixel].distance);
+            }
+        }
+    }
+
+    /// A band-sized buffer is indexed from its own first row.
+    ///
+    /// The worker hands each thread a slice the size of that thread's rows, so
+    /// `trace_rows` must address it with the *band's* stride. Addressing it with
+    /// the image's (`y * width + x`) indexes past the end of every band but the
+    /// first, which is what produced
+    /// "index out of bounds: the len is 73960 but the index is 73960".
+    #[test]
+    fn a_band_buffer_is_indexed_from_its_own_first_row() {
+        let scene = room();
+        let tracer = Tracer::new(scene, Environment::default());
+        let (width, height) = (16u32, 8u32);
+        // The last row on its own: the smallest legal buffer, four rows in from
+        // the top of the image.
+        let mut band = vec![Sample::default(); width as usize];
+        tracer.trace_rows(&camera(), &options(), width, height, 1, 7, 8, &mut band);
+        assert!(
+            band.iter().all(|s| s.hit > 0.5),
+            "the last row of the image was never written into its own band buffer"
+        );
+        // And it has to be the same image row the full trace produces.
+        let whole = tracer.trace(&camera(), &options(), width, height, 1);
+        let top_of_last_row = 7 * width as usize;
+        for (x, sample) in band.iter().enumerate() {
+            assert_eq!(sample.distance, whole[top_of_last_row + x].distance);
+        }
     }
 
     #[test]

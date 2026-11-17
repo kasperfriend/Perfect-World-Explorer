@@ -106,6 +106,29 @@ struct SoftwareState {
     running: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Split `height` rows into contiguous bands of at most `slice` rows.
+///
+/// The last band is whatever is left, so the bands cover the image exactly once.
+/// This replaces `samples.chunks_mut(slice * width)` as the way the worker hands
+/// out work: the chunk *sizes* were right — `chunks_mut` does yield a short final
+/// chunk covering the tail rows — but a chunk is not a band. `trace_rows`
+/// indexes its output from the first row of the range it was given, so a worker
+/// that passes chunk *k* together with rows `k*slice..` is describing a buffer
+/// that starts at row zero while handing over one that starts at row
+/// `k*slice`. The band has to be cut where the row range says it is, which is
+/// what this computes.
+fn row_bands(height: u32, slice: u32) -> Vec<(u32, u32)> {
+    let slice = slice.max(1);
+    let mut bands = Vec::new();
+    let mut row = 0;
+    while row < height {
+        let end = (row + slice).min(height);
+        bands.push((row, end));
+        row = end;
+    }
+    bands
+}
+
 struct TraceRequest {
     camera: tracer::TraceCamera,
     /// The frame's light. The sun moves with the region and the clock, so it
@@ -466,22 +489,38 @@ impl Imaginator {
                         let slice = (rows + threads - 1) / threads.max(1);
                         let tracer_ref = &tracer;
                         std::thread::scope(|s| {
-                            let mut chunks =
-                                samples.chunks_mut((slice as usize) * req.width as usize);
+                            // One slice per band, sized to that band's own rows.
+                            // `trace_rows` indexes `out` from the band's first row
+                            // (see its doc comment), so each task has to get a
+                            // buffer that starts where its band starts.
+                            //
+                            // The bands are built from the row loop rather than
+                            // from `chunks_mut`, because the last band is usually
+                            // shorter than `slice` and `chunks_mut` grows the tile
+                            // until that tail no longer fits — it then yields a
+                            // *final short chunk*, which the old loop silently
+                            // dropped, leaving the bottom rows of the image
+                            // untraced.
+                            let (width, height, s_) = (req.width, req.height, req.samples);
+                            let camera = req.camera;
+                            let options = req.options;
+                            let stride = width as usize;
                             let mut row = 0u32;
-                            while let Some(chunk) = chunks.next() {
-                                let camera = req.camera;
-                                let options = req.options;
-                                let _ = req.environment;
-                                let (width, height, s_) = (req.width, req.height, req.samples);
+                            // `split_at_mut` hands out one disjoint band at a
+                            // time, which is what lets every closure own its slice.
+                            let mut rest: &mut [tracer::Sample] = &mut samples;
+                            while row < height {
                                 let start = row;
                                 let end = (row + slice).min(height);
+                                let taken = (end - start) as usize * stride;
+                                let (band, tail) = rest.split_at_mut(taken);
+                                rest = tail;
                                 s.spawn(move || {
                                     tracer_ref.trace_rows(
-                                        &camera, &options, width, height, s_, start, end, chunk,
+                                        &camera, &options, width, height, s_, start, end, band,
                                     );
                                 });
-                                row += slice;
+                                row = end;
                             }
                         });
                         let mut packed = vec![0f32; samples.len() * 4];
@@ -1007,5 +1046,53 @@ impl Drop for Imaginator {
                 let _ = thread.join();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::row_bands;
+
+    #[test]
+    fn bands_cover_every_row_exactly_once() {
+        for height in [1u32, 7, 8, 9, 344, 345, 1000] {
+            for slice in [1u32, 2, 22, 100, 5000] {
+                let bands = row_bands(height, slice);
+                assert_eq!(bands.first().map(|b| b.0), Some(0), "{height}/{slice}");
+                assert_eq!(
+                    bands.last().map(|b| b.1),
+                    Some(height),
+                    "bands for {height} rows in slices of {slice} stop short of the image"
+                );
+                for window in bands.windows(2) {
+                    assert_eq!(
+                        window[0].1, window[1].0,
+                        "bands {height}/{slice} are not contiguous"
+                    );
+                }
+                for (start, end) in &bands {
+                    assert!(start < end, "empty band in {height}/{slice}");
+                    assert!(
+                        end - start <= slice.max(1),
+                        "band too tall in {height}/{slice}"
+                    );
+                }
+                let covered: u32 = bands.iter().map(|(s, e)| e - s).sum();
+                assert_eq!(covered, height, "{height}/{slice} covers {covered} rows");
+            }
+        }
+    }
+
+    /// The geometry from the crash report: a 344-row trace split 16 ways.
+    #[test]
+    fn the_344_row_case_keeps_its_last_band() {
+        let bands = row_bands(344, (344 + 15) / 16);
+        assert_eq!(bands.len(), 16);
+        assert_eq!(
+            bands[15],
+            (330, 344),
+            "the final 14 rows must still be traced"
+        );
+        assert_eq!(bands.iter().map(|(s, e)| e - s).sum::<u32>(), 344);
     }
 }
