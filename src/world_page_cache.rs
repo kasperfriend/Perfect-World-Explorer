@@ -342,7 +342,7 @@ impl Reader {
         let placement_count = checked_count(read_u64(file, &mut hash)?, MAX_CACHED_PLACEMENTS)?;
         let bounds_count = checked_count(read_u64(file, &mut hash)?, MAX_CACHED_PLACEMENTS)?;
         if !(128..=crate::world_objects::SIDE).contains(&used_height)
-            || mip_count != if shared == u64::MAX { 0 } else { 7 }
+            || mip_count != if shared == u64::MAX { 7 } else { 0 }
             || bounds_count != placement_count
         {
             return Err("invalid cached page dimensions".into());
