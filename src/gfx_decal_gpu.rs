@@ -274,7 +274,7 @@ impl Draw {
             }
             pass.set_bind_group(0, &quad.binding, &[]);
             pass.set_vertex_buffer(0, quad.vertices.slice(..));
-   pass.draw_indexed(0..6, 0, 0..1);
+           pass.draw_indexed(0..6, 0, 0..1);
         }
     }
 }
