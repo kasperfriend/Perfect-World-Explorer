@@ -53,12 +53,13 @@ impl Texture {
     }
 }
 fn content_hash(tex: &Texture) -> u64 {
-    let mut hasher = Sha256::new();
-    hasher.update((tex.width as u64).to_le_bytes());
-    hasher.update((tex.height as u64).to_le_bytes());
-    hasher.update(&tex.rgba);
-    let digest = hasher.finalize();
-    u64::from_le_bytes(digest[..8].try_into().unwrap())
+    let mut h: u64 = 0xcbf29ce484222325 ^ ((tex.width as u64) << 32) ^ (tex.height as u64);
+    for chunk in tex.rgba.chunks(8) {
+        let mut v = [0u8; 8];
+        v[..chunk.len()].copy_from_slice(chunk);
+        h = (h ^ u64::from_le_bytes(v)).wrapping_mul(0x100000001b3);
+    }
+    h
 }
 /// Measured residency counters (P3.08 acceptance: measured numbers, not
 /// estimates).
@@ -308,14 +309,16 @@ impl Objects {
     pub fn open(element: &Path, ornaments: Vec<Ornament>) -> Result<Self, String> {
         let mut litfile = File::open(element.join("litmodels.pck")).map_err(|e| e.to_string())?;
         let mut texfile = File::open(element.join("building.pck")).map_err(|e| e.to_string())?;
-        let litentries = pck::directory(&mut litfile)?
-            .into_iter()
-            .map(|e| (e.name.to_lowercase(), e))
-            .collect::<HashMap<_, _>>();
-        let texentries = pck::directory(&mut texfile)?
-            .into_iter()
-            .map(|e| (e.name.to_lowercase(), e))
-            .collect::<HashMap<_, _>>();
+        let litdir = pck::directory(&mut litfile)?;
+        let mut litentries = HashMap::with_capacity(litdir.len());
+        for e in litdir {
+            litentries.insert(e.name.to_lowercase(), e);
+        }
+        let texdir = pck::directory(&mut texfile)?;
+        let mut texentries = HashMap::with_capacity(texdir.len());
+        for e in texdir {
+            texentries.insert(e.name.to_lowercase(), e);
+        }
         // Mount order matches the open order above. The retail mount order
         // of the two packages is not recoverable from the executable alone,
         // but it is also unobservable in this corpus: the census found 0
