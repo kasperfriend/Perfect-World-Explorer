@@ -330,6 +330,19 @@ impl DlssUpscaler {
                 (NGX_QUALITY_ULTRA_PERFORMANCE, "ultra performance")
             }
         };
+        // §3.3.1 of the programming guide: "The minimum supported output
+        // resolution for DLSS is 32x32. Attempting to initialize DLSS with a
+        // smaller output resolution will fail with an Invalid Parameter error."
+        // A minimised or collapsed window lands exactly there, and a real
+        // failure there would spend the retry budget on a condition that fixes
+        // itself the moment the window is restored; `src/gpu.rs` also skips
+        // asking while the window is that small.
+        if display_extent.0 < 32 || display_extent.1 < 32 {
+            return Err(format!(
+                "DLSS needs at least a 32x32 output; the window is {}x{}",
+                display_extent.0, display_extent.1
+            ));
+        }
         let (raw_device, raw_queue) = raw_dx12(device)?;
         let device_ptr = raw_device.as_mut_ptr() as *mut c_void;
 
@@ -387,13 +400,21 @@ impl DlssUpscaler {
         params.set_u32(P_HEIGHT, render_extent.1.max(1));
         params.set_u32(P_OUT_WIDTH, display_extent.0.max(1));
         params.set_u32(P_OUT_HEIGHT, display_extent.1.max(1));
-        params.set_u32(P_PERF_QUALITY, quality_setting);
+        // `SetI`, exactly as `NGX_D3D12_CREATE_DLSS_EXT` writes it
+        // (`nvsdk_ngx_helpers_d3d.h`): `PerfQualityValue` is an int entry, and
+        // the integer overloads are separate vtable slots, so a `SetUI` leaves
+        // an entry NGX's own `GetI` may not see.
+        params.set_i32(P_PERF_QUALITY, quality_setting as i32);
         let flags = NGX_DLSS_FEATURE_MV_LOW_RES | NGX_DLSS_FEATURE_DEPTH_INVERTED;
         params.set_i32(P_CREATE_FLAGS, flags);
         params.set_u32(P_CREATION_NODE_MASK, 1);
         params.set_u32(P_VISIBILITY_NODE_MASK, 1);
         params.set_i32(P_OUTPUT_SUBRECTS, 0);
 
+        crate::dlss::diag(&format!(
+            "[DLSS] create: {quality_name} (PerfQualityValue {quality_setting}), {}x{} -> {}x{}, flags 0x{flags:02x}, node masks 1/1, output subrects off",
+            render_extent.0, render_extent.1, display_extent.0, display_extent.1
+        ));
         let mut ring = NativeCommandRing::new(&raw_device, "DLSS")?;
         let mut handle: *mut c_void = std::ptr::null_mut();
         // Creation is allowed to record its own work (kernels/uploads) on the

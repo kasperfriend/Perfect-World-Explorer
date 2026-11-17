@@ -87,6 +87,7 @@ use super::params::{NgxMap, NgxParams};
 use crate::xess::loader::load_sdk_dll;
 use std::ffi::{c_char, c_void, CStr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use winapi::shared::minwindef::HMODULE;
 
@@ -202,9 +203,29 @@ impl Default for NgxFeatureCommonInfo {
     }
 }
 
+/// How many NGX log lines have been forwarded into `session.log` this session.
+static NGX_LOG_LINES: AtomicUsize = AtomicUsize::new(0);
+
+/// Where forwarding stops. `MinimumLoggingLevel` is VERBOSE because that is the
+/// only level that names a refused parameter, but a refused `EvaluateFeature`
+/// repeats every frame and every forwarded line opens the session log — so the
+/// flood is bounded instead of being allowed to slow the render thread down.
+const NGX_LOG_LIMIT: usize = 4_000;
+
 /// NGX's own log lines, forwarded into `session.log`.
+///
+/// The callback may arrive on any thread (`nvsdk_ngx_defs.h`: "It must also be
+/// fully thread-safe and any number of threads may call into it concurrently"),
+/// which `diagnostics::session` is.
 unsafe extern "C" fn ngx_log(message: *const c_char, level: i32, feature: i32) {
     if message.is_null() {
+        return;
+    }
+    let count = NGX_LOG_LINES.fetch_add(1, Ordering::Relaxed);
+    if count >= NGX_LOG_LIMIT {
+        if count == NGX_LOG_LIMIT {
+            super::diag("[NGX] further NGX log lines are suppressed for this session");
+        }
         return;
     }
     let text = CStr::from_ptr(message).to_string_lossy();
@@ -250,7 +271,7 @@ pub(crate) struct NgxCore {
 unsafe impl Send for NgxCore {}
 unsafe impl Sync for NgxCore {}
 
-static CORE: OnceLock<Result<NgxCore, String>> = OnceLock::new();
+static CORE: OnceLock<NgxCore> = OnceLock::new();
 
 /// The process-wide NGX Core, initialised on first use.
 ///
@@ -263,10 +284,17 @@ fn core(
     snippet: Option<&Path>,
     device: *mut c_void,
 ) -> Result<&'static NgxCore, String> {
-    match CORE.get_or_init(|| NgxCore::create(sdk_dir, snippet, device)) {
-        Ok(core) => Ok(core),
-        Err(error) => Err(error.clone()),
+    if let Some(core) = CORE.get() {
+        return Ok(core);
     }
+    let core = NgxCore::create(sdk_dir, snippet, device)?;
+    // Only success is kept. Caching the failure made one bad moment — an SDK
+    // folder that was momentarily unreadable, a driver that answered while the
+    // feature DLL was still loading — into "DLSS can never work in this
+    // process", which the three-second retry ladder in `src/gpu.rs` then
+    // re-reported for the rest of the session.
+    let _ = CORE.set(core);
+    CORE.get().ok_or_else(|| "NGX Core initialised but could not be stored".to_string())
 }
 
 /// What DLSS says it is willing to evaluate.
@@ -363,6 +391,14 @@ impl NgxApi {
         let height = params
             .get_u32("OutHeight")
             .ok_or_else(|| "the callback wrote no OutHeight".to_string())?;
+        // Zero is what an unpopulated map reads back as, not a render size: a
+        // feature created at "0x0" would be clamped to 1x1 and refused by NGX
+        // for a reason three calls away from the real one.
+        if width == 0 || height == 0 {
+            return Err(format!(
+                "DLSSOptimalSettingsCallback answered {width}x{height}, which names no render size"
+            ));
+        }
         let min = match (
             params.get_u32("DLSS.Get.Dynamic.Min.Render.Width"),
             params.get_u32("DLSS.Get.Dynamic.Min.Render.Height"),
@@ -378,7 +414,7 @@ impl NgxApi {
             _ => None,
         };
         Ok(OptimalSettings {
-            render: (width.max(1), height.max(1)),
+            render: (width, height),
             min,
             max,
         })
@@ -809,9 +845,7 @@ impl NgxCore {
             available
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "n/a".into()),
-            init_result
-                .map(|value| format!("{} ({})", super::result_name(value), result_code(value)))
-                .unwrap_or_else(|| "n/a".into()),
+            init_result.map(super::result_name).unwrap_or_else(|| "n/a".into()),
         ));
     }
 
@@ -1458,7 +1492,3 @@ fn device_hint() -> &'static str {
      NGX consumer is in the process, or the driver was installed without the NGX component"
 }
 
-/// `0xbad00002` as hex, for the capability line.
-fn result_code(value: u32) -> String {
-    format!("0x{value:08x}")
-}

@@ -4581,8 +4581,14 @@ pub fn run(
                             dlss_upscaler = None;
                         }
                     }
+                    // Below 32x32 NGX refuses the feature outright (§3.3.1 of the
+                    // DLSS guide), and a minimised window is not a reason to
+                    // spend the retry budget or to record a failure the user
+                    // would then read in the Graphics tab.
+                    let dlss_window_big_enough = config.width >= 32 && config.height >= 32;
                     let want_dlss = settings.upscaling == crate::UpscaleMethod::Dlss
                         && !dlss_failed
+                        && dlss_window_big_enough
                         && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
                     if want_dlss && dlss_upscaler.is_none() {
                         match crate::dlss::DlssUpscaler::new(&renderer.device, &renderer.queue, &settings.upscale_sdk_dir, applied_extent, (config.width, config.height), format, settings.upscale_quality) {
@@ -5382,7 +5388,14 @@ pub fn run(
                                 }
                             } else if let Some(dlss) = dlss_upscaler.as_mut() {
                                 match dlss.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &unjittered_vp) {
-                                    Ok(()) => dlss.composite(&renderer.device, &renderer.queue, scene_view, settings.dlss_sharpness),
+                                    Ok(()) => {
+                                        // A frame that evaluated proves the feature
+                                        // works, so the transient-failure budget is
+                                        // replenished instead of staying spent for
+                                        // the rest of the session.
+                                        dlss_retries = 0;
+                                        dlss.composite(&renderer.device, &renderer.queue, scene_view, settings.dlss_sharpness);
+                                    }
                                     Err(error) => {
                                         crate::dlss::diag(&format!("DLSS failed, rendering at native resolution instead: {error}"));
                                         dlss_fail_reason = Some(error);

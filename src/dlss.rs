@@ -88,35 +88,55 @@ pub(crate) fn diag(line: &str) {
     crate::diagnostics::session(line);
 }
 
+/// `NVSDK_NGX_Result_Success`, which is `0x1` — not `0`.
+pub(crate) const NGX_RESULT_SUCCESS: u32 = 0x1;
+
+/// `NVSDK_NGX_Result_Fail`: every failing code is this value with a code in its
+/// low byte.
+pub(crate) const NGX_RESULT_FAIL: u32 = 0xbad0_0000;
+
 /// NGX reports success as `0x1`; every failure shares the `0xbad00000` mask.
 pub(crate) fn succeeded(result: u32) -> bool {
-    (result & 0xfff0_0000) != 0xbad0_0000
+    (result & 0xfff0_0000) != NGX_RESULT_FAIL
 }
 
 /// Human-readable name for an `NVSDK_NGX_Result`, for the session log.
 pub(crate) fn result_name(result: u32) -> String {
-    let base = result & 0xffff;
-    let name = match base {
-        0x0000 => "SUCCESS",
-        0x0001 => "FAIL_FeatureNotSupported",
-        0x0002 => "FAIL_PlatformError",
-        0x0003 => "FAIL_FeatureAlreadyExists",
-        0x0004 => "FAIL_FeatureNotFound",
-        0x0005 => "FAIL_InvalidParameter",
-        0x0006 => "FAIL_ScratchBufferTooSmall",
-        0x0007 => "FAIL_NotInitialized",
-        0x0008 => "FAIL_UnsupportedInputFormat",
-        0x0009 => "FAIL_RWFlagMissing",
-        0x000a => "FAIL_MissingInput",
-        0x000b => "FAIL_UnableToInitializeFeature",
-        0x000c => "FAIL_OutOfDate",
-        0x000d => "FAIL_OutOfGPUMemory",
-        0x000e => "FAIL_UnsupportedFormat",
-        0x000f => "FAIL_UnableToWriteToAppDataPath",
-        0x0010 => "FAIL_UnsupportedParameter",
-        0x0011 => "FAIL_Denied",
-        0x0012 => "FAIL_NotImplemented",
-        _ => "unknown",
+    // `NVSDK_NGX_Result_Success` is **`0x1`**, not zero, and every failure is
+    // `NVSDK_NGX_Result_Fail | code` (`nvsdk_ngx_defs.h:96-175`). Naming a
+    // result by its low half-word alone — which this function used to do —
+    // therefore labelled a *successful* `0x00000001` (feature created) as
+    // "FAIL_FeatureNotSupported" and `0xbad00000` itself as "SUCCESS". The
+    // first of those is how a created DLSS feature came to be reported as a
+    // failed initialisation, and it sent a whole round of diagnosis at a
+    // problem that did not exist.
+    let name = if result == NGX_RESULT_SUCCESS {
+        "Success"
+    } else if result & 0xffff_ff00 == NGX_RESULT_FAIL {
+        match result & 0xff {
+            0x00 => "FAIL_Fail",
+            0x01 => "FAIL_FeatureNotSupported",
+            0x02 => "FAIL_PlatformError",
+            0x03 => "FAIL_FeatureAlreadyExists",
+            0x04 => "FAIL_FeatureNotFound",
+            0x05 => "FAIL_InvalidParameter",
+            0x06 => "FAIL_ScratchBufferTooSmall",
+            0x07 => "FAIL_NotInitialized",
+            0x08 => "FAIL_UnsupportedInputFormat",
+            0x09 => "FAIL_RWFlagMissing",
+            0x0a => "FAIL_MissingInput",
+            0x0b => "FAIL_UnableToInitializeFeature",
+            0x0c => "FAIL_OutOfDate",
+            0x0d => "FAIL_OutOfGPUMemory",
+            0x0e => "FAIL_UnsupportedFormat",
+            0x0f => "FAIL_UnableToWriteToAppDataPath",
+            0x10 => "FAIL_UnsupportedParameter",
+            0x11 => "FAIL_Denied",
+            0x12 => "FAIL_NotImplemented",
+            _ => "FAIL_unknown",
+        }
+    } else {
+        "unknown"
     };
     format!("0x{result:08x} {name}")
 }
@@ -292,6 +312,33 @@ mod fg_stub {
         pub fn frames_presented(&self) -> u64 {
             0
         }
+    }
+}
+
+/// `NVSDK_NGX_Result` naming, pinned to the header's values.
+///
+/// This is where the mislabelling lived: `result_name` named results by their
+/// low half-word, so `0x00000001` — success — came out as
+/// `FAIL_FeatureNotSupported`, and a created DLSS feature was reported as a
+/// failed initialisation in every report that carried the line.
+#[cfg(test)]
+mod result_tests {
+    use super::{result_name, succeeded};
+
+    #[test]
+    fn success_is_not_a_failure_code() {
+        assert!(succeeded(0x1));
+        assert_eq!(result_name(0x1), "0x00000001 Success");
+    }
+
+    #[test]
+    fn failures_are_named_from_fail_or_code() {
+        assert!(!succeeded(0xbad0_0000));
+        assert!(!succeeded(0xbad0_0005));
+        assert!(!succeeded(0xbad0_000c));
+        assert_eq!(result_name(0xbad0_0000), "0xbad00000 FAIL_Fail");
+        assert_eq!(result_name(0xbad0_0005), "0xbad00005 FAIL_InvalidParameter");
+        assert_eq!(result_name(0xbad0_000c), "0xbad0000c FAIL_OutOfDate");
     }
 }
 

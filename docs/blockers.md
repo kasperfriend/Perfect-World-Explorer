@@ -986,9 +986,92 @@ no error either. So:
 | SDK / DLL age | current (B-22, "The version question") |
 | Handle validity / ordering | `CreateFeature` returns `0x1`; evaluate runs on a recording, non-copy list with the feature's node mask (B-21) |
 
+### The audit sweep that followed
+
+Every parameter **name** the DLSS path writes was diffed character-for-character
+against `nvsdk_ngx_defs.h` and `nvsdk_ngx_defs_dlssg.h` at `v310.9.16` — 75
+constants, all present — and every parameter **type** against the reference
+wrappers (`NGX_D3D12_CREATE_DLSS_EXT`, `NGX_D3D12_EVALUATE_DLSS_EXT`,
+`NGX_D3D12_CREATE_DLSSG`, `NGX_D3D12_EVALUATE_DLSSG`,
+`NGX_DLSS_GET_OPTIMAL_SETTINGS`). One type mismatch came out of it, plus five
+bugs in the failure handling around it:
+
+1. **`PerfQualityValue` was written with the `SetUI` overload.** The reference
+   writes it with `SetI`, and the two are different vtable slots (3 and 4), so
+   the entry NGX's own `GetI` reads was of the wrong kind.
+   `nvsdk_ngx_defs.h` defines `FAIL_InvalidParameter` as "parameters had an
+   incorrect value **or type**, or a required parameter was not provided", which
+   made this a live candidate for the very code being chased. It is `SetI` now.
+2. **`result_name` labelled success as failure.** It named results by their low
+   half-word, so `0x00000001` — `NVSDK_NGX_Result_Success` — printed as
+   `FAIL_FeatureNotSupported`, and `0xbad00000` (`Result_Fail`) printed as
+   `SUCCESS`. That single line is why §16 read a *created* feature as a failed
+   initialisation and sent a round of diagnosis the wrong way. Success is `0x1`
+   and failure is `Fail | code`; both are named from that now.
+3. **No 32x32 floor.** Guide §3.3.1: "The minimum supported output resolution
+   for DLSS is 32x32. Attempting to initialize DLSS with a smaller output
+   resolution will fail with an Invalid Parameter error." A minimised window hit
+   exactly that, spent the retry budget and left the red "DLSS is NOT running"
+   line in the Graphics tab. `DlssUpscaler::new` refuses with that reason and
+   `src/gpu.rs` does not ask at all below 32x32.
+4. **The retry budget was never replenished.** `dlss_retries < 3` gated the
+   three-second retry permanently, so three transient failures anywhere in a
+   session disabled DLSS until the settings changed. A frame that evaluates now
+   resets the counter.
+5. **A failed NGX init was cached for the life of the process**
+   (`OnceLock<Result<…>>`), turning one bad moment — an SDK folder that was
+   momentarily unreadable, a driver that answered while the feature DLL was
+   still loading — into "DLSS can never work in this process". Only success is
+   cached now.
+6. **VERBOSE NGX logging could flood `session.log`.** Every forwarded line opens
+   the log file, and a refused evaluate repeats every frame. Forwarding stops
+   after 4000 lines and says so.
+
+Checked and found **correct**, so a later report can skip them: the feature
+flags (`MVLowRes` set because the vectors are render-resolution and *not*
+dilated, `MVJittered` clear because the reprojection pass uses the unjittered
+matrices — guide §3.6.2; `DepthInverted` set because
+`Camera::projection_matrix` is genuinely reverse-Z, near→1); `MV.Scale.X/Y` =
+1.0 and never 0.0 (§3.6.3); motion vectors in render pixels, `previous -
+current`, `[0,0]` at the top left (§3.6.1); inputs transitioned to
+`NON_PIXEL_SHADER_RESOURCE` and the output created with
+`ALLOW_UNORDERED_ACCESS` (§3.4, and NGX restores states itself); LDR sRGB input
+with `IsHDR` clear (§3.1.2); the command-list requirements — open and recording,
+node mask 0 ≡ 1, non-copy queue (`nvsdk_ngx.h:508-513`); the three-slot native
+ring with its fence and bounded wait; the argument order of
+`NGX_DLSS_GET_OPTIMAL_SETTINGS` itself (`nvsdk_ngx_helpers.h:65-114`); and every
+DLSS-G parameter type.
+
 - **Status:** fixed in source; needs one hardware report. A working run shows
   `[DLSS] optimal settings: quality at 3440x1369 -> render 2293x912 (range …;
   the viewer asked 2293x913)`, then `[DLSS] first evaluate OK (… -> …)` and
   `[upscaler] DLSS (quality) … running …`. If it still fails, `session.log` now
   carries NGX's own `[NGX file …]` lines naming the refused parameter, which is
   the one thing this round could not obtain.
+
+## B-24 — No mip-map bias while an upscaler renders below display resolution (audit finding)
+
+- **Step:** Graphics tab, DLSS/XeSS/FSR at any quality below Native AA.
+- **Error:** none — a quality gap, not a failure. Guide §3.5: "When DLSS is
+  active, the rendering engine must set the mip-map bias … to
+  `log2(Render XResolution / Display XResolution) - 1.0 + epsilon`" so textures
+  are sampled at *display* resolution rather than the lower render resolution.
+  The viewer applies no bias at all — `textureSample` everywhere, no
+  `textureSampleBias`, no LOD clamp — so anything mipmapped is sampled as if the
+  screen were the render resolution.
+- **Scope here is narrower than it sounds.** Almost every world texture is
+  created with `mip_level_count: 1` (26 sites), so there is no chain to bias;
+  exactly three atlases have eight mips (`src/gpu.rs:1562`,
+  `src/world_objects.rs:564`, `src/far_trees_gpu.rs:547`) and only those can
+  change. The world-pass sampling sites that would need a bias are in
+  `water_gpu` (9), `shore_gpu` (3), `model_receiver_gpu` (3), `cloud_gpu` (2) and
+  one each in `sky_gpu`, `simple_water_gpu`, `gfx_effect_gpu`, `gfx_decal_gpu`
+  and `weather_gpu`; `post_gpu`'s ten sites run at display resolution and need
+  none.
+- **Workaround:** the per-provider sharpening sliders (B-16, B-17) address the
+  perceived softness. Sharpening is not a substitute for correct LOD selection,
+  and it cannot recover detail that was never sampled.
+- **Status:** open, and documented rather than guessed at. Doing it properly
+  means a `mip_bias` uniform in each of those pipelines plus `textureSampleBias`
+  at each site — a cross-cutting change that cannot be compiled or run in this
+  environment, so it does not belong inside a DLSS-failure commit.
