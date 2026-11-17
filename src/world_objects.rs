@@ -16,7 +16,7 @@ use std::{
         Arc,
     },
 };
-const SIDE: usize = 4096;
+pub const SIDE: usize = 4096;
 const MAX_VERTICES: usize = 1_000_000;
 
 /// One ornament's index range inside a page. The two EC-BSD flags decide
