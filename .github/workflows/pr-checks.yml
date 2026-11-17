@@ -360,6 +360,61 @@ jobs:
 
       # Formatting is cosmetic: run it after the compile, test and shader steps
       # so a whitespace diff can never hide a real failure behind it.
+  shader:
+    name: RayQuery shader compiles (DXIL)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # `dxc` is the only compiler that can produce DXIL, and the hardware
+      # tracer cannot run without a compiled blob. This job proves the shader
+      # builds for the target the pipeline asks for (cs_6_5) and leaves the blob
+      # as an artifact, so a release can ship one without a local toolchain.
+      - name: Find or install DXC
+        shell: pwsh
+        run: |
+          # The Windows runner already has one inside the Visual Studio install
+          # in recent images; the Vulkan SDK is the reliable fallback.
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\dxc.exe",
+            "${env:VULKAN_SDK}\Bin\dxc.exe",
+            "C:\VulkanSDK\*\Bin\dxc.exe"
+          )
+          foreach ($pattern in $candidates) {
+            $found = Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1
+            if ($found) {
+              Write-Host "dxc: $($found.FullName)"
+              "DXC_PATH=$($found.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+              exit 0
+            }
+          }
+          Write-Host "No dxc in the image; installing the Vulkan SDK."
+          $url = "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\vulkan-sdk.exe"
+          Start-Process -FilePath "$env:TEMP\vulkan-sdk.exe" -Wait -ArgumentList `
+            "--accept-licenses","--default-answer","--confirm-command","install","com.lunarg.vulkan.core","com.lunarg.vulkan.d3d12"
+          $dxc = Get-ChildItem -Path "C:\VulkanSDK\*\Bin\dxc.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $dxc) { throw "dxc.exe was not installed" }
+          "DXC_PATH=$($dxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Compile the trace shader
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "Modules\Imaginator\imaginator" | Out-Null
+          $out = "Modules\Imaginator\imaginator\dxr_trace.cso"
+          & $env:DXC_PATH -T cs_6_5 -E cs -HV 2018 -O3 -Zpc -all_resources_bound `
+            -Fo $out "tools\imaginator-shaders\dxr_trace.hlsl"
+          if ($LASTEXITCODE -ne 0) { throw "dxc failed with $LASTEXITCODE" }
+          $size = (Get-Item $out).Length
+          Write-Host "wrote $out ($size bytes)"
+          if ($size -lt 64) { throw "the blob is only $size bytes; dxc did not produce DXIL" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dxr-trace-dxil
+          path: Modules/Imaginator/imaginator/dxr_trace.cso
+          if-no-files-found: error
+
   windows:
     name: Windows executable (x64)
     runs-on: windows-latest
