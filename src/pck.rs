@@ -22,30 +22,32 @@ fn at(f: &mut File, p: u64, n: usize) -> Result<Vec<u8>, String> {
 }
 pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
     thread_local! { static INFLATE_DECOMP: std::cell::RefCell<Decompress> = std::cell::RefCell::new(Decompress::new(true)); }
-INFLATE_DECOMP.with(|cell| {
-let mut decomp = cell.borrow_mut();
-decomp.reset(true);
-let mut out = Vec::with_capacity(expected);
-loop {
-let before = decomp.total_in() as usize;
-let st = decomp.decompress_vec(&raw[before..], &mut out, FlushDecompress::Finish).map_err(|e| e.to_string())?;
-if out.len() > expected {
-return Err(format!("bad decompressed size: {} != {expected}", out.len()));
-}
-if matches!(st, Status::StreamEnd) {
-break;
-}
-if before == decomp.total_in() as usize && out.len() == out.capacity() {
-out.reserve(64);
-} else if before == decomp.total_in() as usize && matches!(st, Status::BufError) {
-return Err("truncated zlib stream".into());
-}
-}
-if out.len() != expected {
-return Err(format!("bad decompressed size: {} != {expected}", out.len()));
-}
-    Ok(out)
-})
+    INFLATE_DECOMP.with(|cell| {
+        let mut decomp = cell.borrow_mut();
+        decomp.reset(true);
+        let mut out = Vec::with_capacity(expected);
+        loop {
+            let before = decomp.total_in() as usize;
+            let st = decomp
+                .decompress_vec(&raw[before..], &mut out, FlushDecompress::Finish)
+                .map_err(|e| e.to_string())?;
+            if out.len() > expected {
+                return Err(format!("bad decompressed size: {} != {expected}", out.len()));
+            }
+            if matches!(st, Status::StreamEnd) {
+                break;
+            }
+            if before == decomp.total_in() as usize && out.len() == out.capacity() {
+                out.reserve(64);
+            } else if before == decomp.total_in() as usize && matches!(st, Status::BufError) {
+                return Err("truncated zlib stream".into());
+            }
+        }
+        if out.len() != expected {
+            return Err(format!("bad decompressed size: {} != {expected}", out.len()));
+        }
+        Ok(out)
+    })
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -145,10 +147,10 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
 pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
     if e.compressed < e.size {
         let compressed = at(f, e.offset as u64, e.compressed as usize)?;
-    inflate(&compressed, e.size as usize)
-} else {
+        inflate(&compressed, e.size as usize)
+    } else {
         at(f, e.offset as u64, e.compressed as usize)
-    }
+}    
 }
 
 pub fn read_entry_at(f: &File, e: &Entry) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
