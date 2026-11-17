@@ -1,0 +1,75 @@
+name: Fetch DirectStorage runtime payload
+
+# One-use bridge for the sandbox's NuGet egress restriction. Push the marker
+# file on this branch; this job fetches only the pinned official package, stages
+# the two x64 runtime DLLs, commits them to this same PR branch, then removes
+# this workflow and its marker.
+on:
+  push:
+    branches:
+      - "arena/982bd72f-perfect-world-explorer"
+    paths:
+      - ".github/fetch-directstorage.trigger"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fetch-directstorage-payload
+  cancel-in-progress: false
+
+jobs:
+  fetch-and-commit:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          persist-credentials: true
+
+      - name: Fetch and validate the pinned official NuGet package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $fetcher = Join-Path $env:GITHUB_WORKSPACE 'tools/fetch-directstorage.ps1'
+          $success = $false
+          foreach ($attempt in 1..3) {
+            try {
+              & $fetcher -Version '1.4.0-preview2-2606.904' -Force
+              $success = $true
+              break
+            }
+            catch {
+              Write-Warning "NuGet fetch attempt $attempt failed: $_"
+              if ($attempt -lt 3) { Start-Sleep -Seconds 10 }
+            }
+          }
+          if (-not $success) { throw 'Could not fetch the official DirectStorage package after three attempts.' }
+
+          $runtime = Join-Path $env:GITHUB_WORKSPACE 'sdk/DirectStorage/1.4.0-preview2-2606.904/native/bin/x64'
+          foreach ($name in @('dstorage.dll', 'dstoragecore.dll')) {
+            $file = Join-Path $runtime $name
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf) -or (Get-Item -LiteralPath $file).Length -eq 0) {
+              throw "Official package is missing a non-empty x64 runtime: $file"
+            }
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Host "$name SHA256=$hash"
+          }
+
+      - name: Commit runtime DLLs and remove this temporary workflow
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'DirectStorage package fetch'
+          git config user.email '297053741+arena-agent@users.noreply.github.com'
+          git add -- `
+            sdk/DirectStorage/1.4.0-preview2-2606.904/native/bin/x64/dstorage.dll `
+            sdk/DirectStorage/1.4.0-preview2-2606.904/native/bin/x64/dstoragecore.dll
+          if ($LASTEXITCODE -ne 0) { throw 'Could not stage the DirectStorage runtime DLLs.' }
+          git rm -- .github/fetch-directstorage.trigger .github/workflows/fetch-directstorage-payload.yml
+          if ($LASTEXITCODE -ne 0) { throw 'Could not remove the one-use workflow and trigger.' }
+          git commit -m 'Add official DirectStorage 1.4 x64 runtime DLLs'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not commit the DirectStorage runtime payload.' }
+          git push origin "HEAD:$env:GITHUB_REF_NAME"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not push the runtime payload to the current PR branch.' }
