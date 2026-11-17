@@ -115,6 +115,7 @@ impl Heights {
         }
     }
     pub fn at(&self, index: usize) -> f32 {
+        if let Data::Memory(v) = &self.0.data { return v[index]; }
         self.reader().height(index)
     }
     pub fn stats(&self) -> Stats {
@@ -153,6 +154,7 @@ impl Heights {
 }
 impl Normals {
     pub fn at(&self, index: usize) -> [i8; 3] {
+        if let Data::Memory(v) = &self.0.data { return v[index]; }
         Reader {
             store: Arc::clone(&self.0),
             current: None,
@@ -197,11 +199,7 @@ impl Reader {
             .and_then(|_| d.file.read_exact(&mut packed))
             .map_err(|e| format!("terrain cache {}: {e}", d.path.display()))?;
         let cells = d.side * d.side;
-        let mut bytes = Vec::with_capacity(cells * 7);
-        ZlibDecoder::new(packed.as_slice())
-            .take((cells * 7 + 1) as u64)
-            .read_to_end(&mut bytes)
-            .map_err(|e| format!("terrain cache block {id}: {e}; restart to rebuild cache"))?;
+        let bytes = crate::pck::inflate(&packed, cells * 7).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         if bytes.len() != cells * 7 || <[u8; 32]>::from(Sha256::digest(&bytes)) != record.hash {
             return Err(format!(
                 "corrupt terrain cache block {id}; restart to rebuild cache"
