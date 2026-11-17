@@ -31,13 +31,14 @@ pub fn install_recoverable_panic_hook() {
     PANIC_LOCATION_HOOK.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            if recovering_from_map_failure() {
-                RECOVERABLE_PANIC_LOCATION.with(|location| {
-                    *location.borrow_mut() = info
-                        .location()
-                        .map(|at| format!("{}:{}:{}", at.file(), at.line(), at.column()));
-                });
-            }
+            // The thread-local location belongs to the thread that panicked;
+            // capturing it unconditionally avoids races with another test or
+            // worker clearing the process-wide recoverable flag.
+            RECOVERABLE_PANIC_LOCATION.with(|location| {
+                *location.borrow_mut() = info
+                    .location()
+                    .map(|at| format!("{}:{}:{}", at.file(), at.line(), at.column()));
+            });
             previous(info);
         }));
     });

@@ -6304,26 +6304,29 @@ pub fn run(
                                             });
                                         return;
                                     }
-                                    if let Some(reason) = &world_change_error {
+                                    // Clone the message before the window closure: the
+                                    // Dismiss button needs a mutable borrow of the
+                                    // Option while the label is displayed.
+                                    if let Some(reason) = world_change_error.clone() {
                                         egui::Window::new("WORLD CHANGE FAILED")
                                             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.))
                                             .collapsible(false)
                                             .resizable(false)
                                             .show(ctx, |ui| {
-                                                ui.colored_label(egui::Color32::LIGHT_RED, reason);
+                                                ui.colored_label(egui::Color32::LIGHT_RED, reason.as_str());
                                                 ui.label("The viewer stayed on the current world and restored a safe saved setting.");
                                                 if ui.button("Dismiss").clicked() {
                                                     world_change_error = None;
                                                 }
                                             });
                                     }
-                                    if let Some(reason) = &world_change_notice {
+                                    if let Some(reason) = world_change_notice.clone() {
                                         egui::Window::new("WORLD LOAD WARNING")
                                             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.))
                                             .collapsible(false)
                                             .resizable(false)
                                             .show(ctx, |ui| {
-                                                ui.colored_label(egui::Color32::YELLOW, reason);
+                                                ui.colored_label(egui::Color32::YELLOW, reason.as_str());
                                                 ui.label("The viewer fell back to the main world.");
                                                 if ui.button("Dismiss").clicked() {
                                                     world_change_notice = None;
