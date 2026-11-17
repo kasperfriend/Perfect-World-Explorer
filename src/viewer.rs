@@ -31,7 +31,8 @@ struct Camera {
 fn camera_vertex(t: &Terrain, c: &Camera, x: usize, y: usize) -> Vertex {
     let dx = x as f32 - c.x;
     let dy = y as f32 - c.y;
-    let dz = t.heights.at(y * t.width + x) / t.grid_spacing - c.altitude;
+    let h = t.heights.at(y * t.width + x);
+    let dz = h / t.grid_spacing - c.altitude;
     let (s, co) = c.yaw.sin_cos();
     let right = dx * co - dy * s;
     let forward = dx * s + dy * co;
@@ -46,7 +47,7 @@ fn camera_vertex(t: &Terrain, c: &Camera, x: usize, y: usize) -> Vertex {
         z: forward * cp + dz * sp,
         wx: x as f32,
         wy: y as f32,
-        wh: t.heights.at(y * t.width + x),
+        wh: h,
         light: lighting,
         tu: 0.,
         tv: 0.,
@@ -81,6 +82,26 @@ fn clip_near(input: &[Vertex]) -> Vec<Vertex> {
     }
     out
 }
+fn clip_near_stack(v: [Vertex; 3]) -> ([Vertex; 4], usize) {
+    let mut out = [v[0]; 4];
+    let mut n = 0;
+    let mut a = v[2];
+    for b in v {
+        let ai = a.z >= NEAR;
+        let bi = b.z >= NEAR;
+        if ai != bi {
+            out[n] = lerp(a, b, (NEAR - a.z) / (b.z - a.z));
+            n += 1;
+        }
+        if bi {
+            out[n] = b;
+            n += 1;
+        }
+        a = b;
+    }
+    (out, n)
+}
+
 fn project(v: Vertex) -> Vertex {
     let f = 600.;
     Vertex {
@@ -169,11 +190,11 @@ fn clipped_triangle(
     color: u32,
     materials: &crate::material::Materials,
 ) {
-    let p = clip_near(&[a, b, c]);
-    if p.len() < 3 {
+    let (p, n) = clip_near_stack([a, b, c]);
+    if n < 3 {
         return;
     }
-    for i in 1..p.len() - 1 {
+    for i in 1..n - 1 {
         triangle(
             frame,
             depth,
@@ -212,22 +233,28 @@ fn draw(t: &Terrain, cam: &Camera, frame: &mut [u32], depth: &mut [f32]) {
     let endx = ((cam.x + FAR) as usize).min(t.width - 1);
     let endy = ((cam.y + FAR) as usize).min(t.height - 1);
     for y in (starty..endy).step_by(step) {
+        let yy = (y + step).min(t.height - 1);
+        let mut a = camera_vertex(t, cam, startx, y);
+        let mut c = camera_vertex(t, cam, startx, yy);
         for x in (startx..endx).step_by(step) {
             let xx = (x + step).min(t.width - 1);
-            let yy = (y + step).min(t.height - 1);
-            let a = camera_vertex(t, cam, x, y);
             let b = camera_vertex(t, cam, xx, y);
-            let c = camera_vertex(t, cam, x, yy);
             let d = camera_vertex(t, cam, xx, yy);
             if a.z < NEAR && b.z < NEAR && c.z < NEAR && d.z < NEAR {
+                a = b;
+                c = d;
                 continue;
             }
             if a.z > FAR && b.z > FAR && c.z > FAR && d.z > FAR {
+                a = b;
+                c = d;
                 continue;
             }
             let rgb = 0;
             clipped_triangle(frame, depth, a, b, c, rgb, &t.materials);
             clipped_triangle(frame, depth, b, d, c, rgb, &t.materials);
+            a = b;
+            c = d;
         }
     }
 }
@@ -378,6 +405,7 @@ fn render(
         t.scenery_residency.distance_culls
     );
     draw(t, cam, frame, depth);
+    let mut vertices = Vec::new();
     for id in ornament_ids {
         let Some(model) = t.objects.get(id) else {
             return Err(format!("missing resident scenery model {id}"));
@@ -389,11 +417,12 @@ fn render(
                     mesh.texture, id
                 ));
             };
-            let vertices: Vec<Vertex> = mesh
+            vertices.clear();
+            vertices.extend(mesh
                 .vertices
                 .iter()
                 .map(|v| model_vertex(t, cam, model, v))
-                .collect();
+            );
             for face in mesh.indices.chunks_exact(3) {
                 let a = vertices[face[0] as usize];
                 let b = vertices[face[1] as usize];
