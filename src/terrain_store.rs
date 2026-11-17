@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -154,7 +154,6 @@ impl Heights {
 }
 impl Normals {
     pub fn at(&self, index: usize) -> [i8; 3] {
-        if let Data::Memory(v) = &self.0.data { return v[index]; }
         Reader {
             store: Arc::clone(&self.0),
             current: None,
