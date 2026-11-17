@@ -148,12 +148,14 @@ PowerShell in the repository root:
 .\tools\fetch-directstorage.ps1
 $env:DIRECTSTORAGE_SDK_DIR = "$PWD\sdk\DirectStorage\1.4.0-preview2-2606.904"
 cargo build --release
-
-# For a local run, copy the preview runtime beside the compiled EXE.
-$runtime = Join-Path $env:DIRECTSTORAGE_SDK_DIR 'native\bin\x64'
-Copy-Item "$runtime\dstorage.dll" 'target\release\'
-Copy-Item "$runtime\dstoragecore.dll" 'target\release\'
+cargo run --release
 ```
+
+The viewer tries the executable directory first, then the SDK runtime directory
+selected at build time (or `DIRECTSTORAGE_RUNTIME_DIR` at runtime), then the
+system directory. No manual DLL copy is needed for a development build from this
+checkout. The portable packager still places the x64 runtime beside the EXE so
+the package is self-contained.
 
 The fetcher downloads the version-pinned `.nupkg` from NuGet, checks for the
 expected header, x64 runtime files and both package license files, then extracts

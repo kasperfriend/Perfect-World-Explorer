@@ -3,6 +3,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <dstorage.h>
+#include <string>
 
 using DStorageGetFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
 
@@ -11,16 +12,31 @@ SRWLOCK g_factory_lock = SRWLOCK_INIT;
 HMODULE g_runtime = nullptr;
 IDStorageFactory* g_factory = nullptr;
 bool g_factory_attempted = false;
+std::wstring g_sdk_runtime_directory;
 
 bool initialize_factory() {
     if (g_factory_attempted) return g_factory != nullptr;
     g_factory_attempted = true;
 
-    // The package runtime is optional. Failure leaves the caller on the normal
-    // ReadFile path; do not make it a hard startup dependency.
+    // Prefer the portable package's side-by-side runtime, then the pinned
+    // repository SDK runtime directory supplied by build.rs, then a system
+    // installation. Failure leaves the caller on normal file I/O.
     g_runtime = LoadLibraryExW(
-        L"dstorage.dll", nullptr,
-        LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+        L"dstorage.dll", nullptr, LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
+    if (!g_runtime && !g_sdk_runtime_directory.empty()) {
+        std::wstring runtime_path = g_sdk_runtime_directory;
+        if (runtime_path.back() != L'\\' && runtime_path.back() != L'/') {
+            runtime_path.push_back(L'\\');
+        }
+        runtime_path += L"dstorage.dll";
+        g_runtime = LoadLibraryExW(
+            runtime_path.c_str(), nullptr,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    }
+    if (!g_runtime) {
+        g_runtime = LoadLibraryExW(
+            L"dstorage.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
     if (!g_runtime) return false;
     auto getFactory = reinterpret_cast<DStorageGetFactoryFn>(
         GetProcAddress(g_runtime, "DStorageGetFactory"));
@@ -84,6 +100,13 @@ struct PweDStorageRange {
     unsigned int size;
     void* output;
 };
+
+extern "C" __declspec(dllexport) void __cdecl pwe_dstorage_set_runtime_dir(
+    const wchar_t* directory) {
+    AcquireSRWLockExclusive(&g_factory_lock);
+    if (!g_factory_attempted && directory) g_sdk_runtime_directory = directory;
+    ReleaseSRWLockExclusive(&g_factory_lock);
+}
 
 // Submit several independent ranges before waiting. The caller groups entries
 // from one archive, so one file open and one queue submit cover the whole batch.

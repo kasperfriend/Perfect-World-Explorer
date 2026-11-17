@@ -70,5 +70,9 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=pwe_directstorage_shim");
+    println!(
+        "cargo:rustc-env=PWE_DIRECTSTORAGE_RUNTIME_DIR={}",
+        sdk.join("native/bin/x64").display()
+    );
     println!("cargo:rustc-cfg=pwe_directstorage");
 }

@@ -42,7 +42,12 @@ pub(crate) const fn compiled_in() -> bool {
 
 #[cfg(all(windows, pwe_directstorage))]
 mod enabled {
-    use std::{fs::File, os::windows::io::AsRawHandle};
+    use std::{
+        fs::File,
+        os::windows::{ffi::OsStrExt, io::AsRawHandle},
+        path::PathBuf,
+        sync::Once,
+    };
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -62,6 +67,7 @@ mod enabled {
     }
 
     extern "C" {
+        fn pwe_dstorage_set_runtime_dir(directory: *const u16);
         fn pwe_dstorage_read_batch(
             path: *const u16,
             ranges: *const DirectStorageRange,
@@ -69,10 +75,27 @@ mod enabled {
         ) -> i32;
     }
 
+    fn configure_runtime_directory() {
+        static CONFIGURED: Once = Once::new();
+        CONFIGURED.call_once(|| {
+            let runtime_dir = std::env::var_os("DIRECTSTORAGE_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("DIRECTSTORAGE_SDK_DIR")
+                        .map(|sdk| PathBuf::from(sdk).join("native").join("bin").join("x64"))
+                })
+                .unwrap_or_else(|| PathBuf::from(env!("PWE_DIRECTSTORAGE_RUNTIME_DIR")));
+            let mut wide: Vec<u16> = runtime_dir.as_os_str().encode_wide().collect();
+            wide.push(0);
+            unsafe { pwe_dstorage_set_runtime_dir(wide.as_ptr()) };
+        });
+    }
+
     pub fn read_ranges(file: &File, ranges: &mut [(u64, &mut [u8])]) -> bool {
         if ranges.is_empty() || ranges.len() > 64 {
             return false;
         }
+        configure_runtime_directory();
         let mut descriptors = Vec::with_capacity(ranges.len());
         for (offset, output) in ranges.iter_mut() {
             let Ok(size) = u32::try_from(output.len()) else {
