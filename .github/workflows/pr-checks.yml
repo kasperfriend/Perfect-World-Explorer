@@ -262,16 +262,21 @@ jobs:
         run: |
           export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
           test -n "$VK_ICD_FILENAMES"
-          status=0
-          (set -o pipefail; cargo test --locked --bin perfect-world-explorer lighter_ -- --ignored \
-            --skip lighter_hardware_pixels --skip lighter_vulkan_interop_on_cpu --test-threads=1 --nocapture \
-            2>&1 | tee /tmp/lighter-pixels.log) || status=$?
-          if [ "$status" -ne 0 ]; then
-            tail -40 /tmp/lighter-pixels.log | while IFS= read -r line; do
-              if [ -n "$line" ]; then echo "::error::$line"; fi
-            done
-          fi
-          exit "$status"
+          for suite in lighter_software_pixels lighter_streamed_world_pixels; do
+            status=0
+            (set -o pipefail; cargo test --locked --bin perfect-world-explorer "$suite" -- --ignored --nocapture \
+              2>&1 | tee /tmp/lighter-pixels.log) || status=$?
+            if [ "$status" -ne 0 ]; then
+              # One multi-line annotation keeps the actual failure together and
+              # avoids GitHub's per-step cap on individual error annotations.
+              tail=$(tail -35 /tmp/lighter-pixels.log)
+              tail=${tail//%/%25}
+              tail=${tail//$'\r'/%0D}
+              tail=${tail//$'\n'/%0A}
+              printf '::error title=%s::%s\n' "$suite" "$tail"
+              exit "$status"
+            fi
+          done
       - name: Run Phase 1 production shader regressions
         env:
           WGPU_BACKEND: vulkan
