@@ -421,7 +421,10 @@ impl Package {
         let mut layout = Layout::single(size);
         let mut part1 = 0;
         if size == MAX_FILE_PACKAGE {
-            let mut name = path.file_stem().ok_or("package has no stem")?.to_os_string();
+            let mut name = path
+                .file_stem()
+                .ok_or("package has no stem")?
+                .to_os_string();
             name.push(".pkx");
             let pkx = path.with_file_name(name);
             if let Ok(file) = File::open(&pkx) {
@@ -769,7 +772,8 @@ pub fn read_entries_parts(
                 bytes.len() - read
             };
             #[cfg(windows)]
-            let n = std::os::windows::fs::FileExt::seek_read(file, &mut bytes[read..read + room], off)?;
+            let n =
+                std::os::windows::fs::FileExt::seek_read(file, &mut bytes[read..read + room], off)?;
             #[cfg(unix)]
             let n = std::os::unix::fs::FileExt::read_at(file, &mut bytes[read..read + room], off)?;
             if n == 0 {
@@ -1479,5 +1483,4 @@ mod tests {
         assert!(error.contains("split package"), "unexpected error: {error}");
         assert!(error.contains("missing"), "unexpected error: {error}");
     }
-
 }

@@ -354,7 +354,10 @@ impl Grass {
         // opened at all is reported once per group.
         let process_group = |&(index, group): &(usize, &[(usize, usize, usize)])| {
             let Some(name) = names.get(index) else {
-                note(&notes, format!("BSData {index}: no name in the EC-BSD table"));
+                note(
+                    &notes,
+                    format!("BSData {index}: no name in the EC-BSD table"),
+                );
                 return Ok(Vec::new());
             };
             let path = match water::resolve_case_insensitive(dir, name) {
@@ -457,7 +460,9 @@ impl Grass {
                 if raw != bytes || stored > bytes * 2 + 1024 {
                     note(
                         &notes,
-                        format!("area at {off}: record {rec} holds {raw} bytes for a {bytes}-byte mask"),
+                        format!(
+                            "area at {off}: record {rec} holds {raw} bytes for a {bytes}-byte mask"
+                        ),
                     );
                     continue;
                 }
@@ -466,7 +471,10 @@ impl Grass {
                     continue;
                 };
                 let Ok(output) = crate::pck::inflate(src, bytes) else {
-                    note(&notes, format!("area at {off}: record {rec} does not inflate"));
+                    note(
+                        &notes,
+                        format!("area at {off}: record {rec} does not inflate"),
+                    );
                     continue;
                 };
                 let count = output.iter().map(|byte| byte.count_ones() as usize).sum();

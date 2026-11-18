@@ -287,7 +287,11 @@ pub fn unbounded_textures() -> bool {
 }
 fn open_optional_archive(
     path: &Path,
-) -> (Option<pck::Package>, HashMap<String, pck::Entry>, Option<String>) {
+) -> (
+    Option<pck::Package>,
+    HashMap<String, pck::Entry>,
+    Option<String>,
+) {
     // A package cut at `MAX_FILE_PACKAGE` keeps the rest of itself in the `.pkx`
     // of the same stem; opening only the `.pck` rejected `litmodels.pck` outright
     // in the 1.5.2 client and left every scenery model unavailable.
@@ -541,7 +545,12 @@ impl Objects {
                                 for batch in chunk.chunks(16) {
                                     let entries: Vec<&pck::Entry> =
                                         batch.iter().map(|(_, _, entry)| entry).collect();
-                                    match pck::read_entries_parts(litfile.first_file(), litfile.second_file(), litfile.layout(), &entries) {
+                                    match pck::read_entries_parts(
+                                        litfile.first_file(),
+                                        litfile.second_file(),
+                                        litfile.layout(),
+                                        &entries,
+                                    ) {
                                         Ok(data) => {
                                             for ((index, name, _), data) in batch.iter().zip(data) {
                                                 let result = bmd::Model::parse(&data)
@@ -720,7 +729,12 @@ impl Objects {
                                                 .iter()
                                                 .map(|(_, entry)| entry)
                                                 .collect();
-                                            pck::read_entries_parts(file.first_file(), file.second_file(), file.layout(), &entries)
+                                            pck::read_entries_parts(
+                                                file.first_file(),
+                                                file.second_file(),
+                                                file.layout(),
+                                                &entries,
+                                            )
                                         };
                                         match read {
                                             Ok(bytes) => {
