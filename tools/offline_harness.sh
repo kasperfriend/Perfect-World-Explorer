@@ -911,7 +911,9 @@ fn main() {
         };
         for e in &entries {
             let ext = e.name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-            if !matches!(ext.as_str(), "gfx" | "gfx_err" | "sdr" | "ski" | "bon" | "mox" | "spt") {
+            if !matches!(ext.as_str(),
+                "gfx" | "gfx_err" | "sdr" | "ski" | "bon" | "mox" | "spt"
+                | "dds" | "tga" | "bmp" | "jpg") {
                 continue;
             }
             let payload = match pck::read_entry(&mut f, e) {
@@ -957,6 +959,46 @@ fn main() {
                         Err(format!("no __IdvSpt_ magic in {} bytes", payload.len()))
                     });
                 }
+                // Images are the largest group here (226 MB of DDS alone) and
+                // the offline toolchain has only a stub `image`, so the header
+                // is validated rather than the pixels. A truncated file still
+                // fails, which is the failure that actually happens.
+                "dds" => {
+                    let r = (|| -> Result<(), String> {
+                        if payload.len() < 128 { return Err(format!("{} bytes, header is 128", payload.len())); }
+                        if &payload[..4] != b"DDS " { return Err("no DDS magic".into()); }
+                        let hdr = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+                        if hdr != 124 { return Err(format!("DDS_HEADER size {hdr}, expected 124")); }
+                        let h = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+                        let w = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+                        if w == 0 || h == 0 || w > 8192 || h > 8192 {
+                            return Err(format!("implausible {w}x{h}"));
+                        }
+                        Ok(())
+                    })();
+                    t.record(&e.name, r);
+                }
+                "tga" => {
+                    // No magic: the type field at offset 2 is the only signal.
+                    let r = (|| -> Result<(), String> {
+                        if payload.len() < 19 { return Err(format!("{} bytes", payload.len())); }
+                        let kind = payload[2];
+                        if !matches!(kind, 0 | 1 | 2 | 3 | 9 | 10 | 11) {
+                            return Err(format!("TGA image type {kind}"));
+                        }
+                        Ok(())
+                    })();
+                    t.record(&e.name, r);
+                }
+                "bmp" => {
+                    t.record(&e.name, if payload.len() >= 26 && &payload[..2] == b"BM" { Ok(()) }
+                        else { Err(format!("{} bytes, not BM", payload.len())) });
+                }
+                "jpg" => {
+                    t.record(&e.name,
+                        if payload.len() >= 4 && payload[..2] == [0xff, 0xd8] { Ok(()) }
+                        else { Err(format!("{} bytes, not FFD8", payload.len())) });
+                }
                 _ => {}
             }
         }
@@ -973,10 +1015,16 @@ fn main() {
     // -- so a reader cannot parse it and that is the archive's content, not a
     // failure. It is reported above and excluded from the exit status; any
     // other failure fails the run.
+    // Likewise `interfaces/iconlist_guild.dds` in the 1.5.2 interfaces pack:
+    // 1158 entries, 0 overlapping spans, and this one member is x86 code with
+    // runs of '$' and three embedded, bogus "DDS " strings. 3020 of the 3021
+    // staged .dds members carry a valid header, so this is the archive's
+    // content, not a misread offset. Named here so it is not mistaken for one.
     let mut unexpected = 0u64;
     for (ext, t) in &tallies {
         for line in &t.first {
             if ext == "gfx" && line.contains("holds no fields, only \"MOXT\"") { continue; }
+            if ext == "dds" && line.contains("iconlist_guild.dds") { continue; }
             unexpected += 1;
         }
     }
