@@ -31,7 +31,7 @@ it does not set execution order.
 11. [x] **RT-06:** Carry authored PBR/material channels, sidedness, opacity and transmission. Distinguish baked vs. relit buildings, terrain and grass. Carry posed face/eye secondary stages and UV scrolling; validate day/night. See [the archive and pixel checks](material-fidelity.md).
 12. [x] **RT-07:** Match authored SpeedTree wind and grass fades; keep two-sided transmissive leaves in secondary rays independently of camera facing. Test noon dappled light. See [the ray and motion fixtures](vegetation.md).
 13. [x] **RT-08:** Build per-body water BLAS/AABBs and wet/dry shoreline geometry. Document shading-only and geometric normal layers, initialize submerged media (Step 17), and compare shoreline/reflections to native. Verified at fixture scope; see [water geometry, materials and remaining retail checks](water-fidelity.md).
-14. [ ] **RT-09:** Match native GFX order and animation, project decal boxes onto hits, document lens/screen distortions in `present.wgsl`, and derive ray-shadowed weather from authored clouds/rain/snow.
+14. [x] **RT-09:** Match native GFX order and animation, project decal boxes onto hits, document lens/screen distortions in `present.wgsl`, and derive ray-shadowed weather from authored clouds/rain/snow. See [fixture coverage and limitations](effects-weather.md).
 
 ### Phase 3 — Transport
 

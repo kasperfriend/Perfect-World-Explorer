@@ -173,8 +173,9 @@ surface. Opaque shadows stop at the first covered blocker; covered leaves transm
 a bounded, pigment-tinted fraction. Texture tiles have
 isolated, ray-footprint-filtered mips with alpha-weighted color; distant cutouts
 sample the fraction of passing texels using a fixed per-pixel pattern, not a
-new seed each frame. Blended sheets sort by distance, using authored
-layer/priority for coincident GFX cards; the two halves of a card blend once.
+new seed each frame. Ordinary sheets sort by distance; GFX preserves its
+authored draw bracket independently of distance, testing opaque and earlier
+GFX depth. The two halves of a card blend once.
 
 Point lights are indexed by their world-space influence, not a list of the 48
 nearest the camera. Static lights upload with the resident world, and a light
@@ -183,9 +184,9 @@ packets skip upload; unchanged geometry skips Vulkan BLAS/TLAS builds.
 
 Lighter is a different lighting model, not pixel-for-pixel retail emulation.
 Texture tiles and distant terrain are simplified. Vegetation uses sampled motion and independent secondary cards; see
-[vegetation motion and LOD scope](vegetation.md). Cloud detail, rain/snow,
-lens flares and some legacy effect/skin blend and no-depth-test modes are
-not reproduced.
+[vegetation motion and LOD scope](vegetation.md). Ground projections, cloud-shadow proxies and ray-lit view precipitation
+use shared authored inputs. See [world effects and weather](effects-weather.md)
+for remaining lens/Warp and blend-factor limits.
 The native whole-world BMD preload, temporal upscalers and frame generation
 are paused while Lighter renders. Existing saved choices for those features
 are unchanged; Lighter uses the separate bounded BMD region described above.
