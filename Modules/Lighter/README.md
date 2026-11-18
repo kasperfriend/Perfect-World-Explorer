@@ -155,6 +155,7 @@ code. They are not two different lighting models.
   bottoms show through because the underwater path is short, not because a
   shoreline mask reduces the interface reflection. The first water split is
   evaluated on both sides; later interfaces sample one lobe to bound ray counts.
+  See [per-body geometry and authored water materials](water-fidelity.md).
 
 This is still a bounded, low-sample renderer for legacy assets, not a reference
 path tracer. Lights retain authored colors/ranges rather than calibrated radiant
@@ -182,7 +183,7 @@ packets skip upload; unchanged geometry skips Vulkan BLAS/TLAS builds.
 
 Lighter is a different lighting model, not pixel-for-pixel retail emulation.
 Texture tiles and distant terrain are simplified. Vegetation uses sampled motion and independent secondary cards; see
-[vegetation motion and LOD scope](vegetation.md). Cloud detail, rain/snow, shoreline wave overlays,
+[vegetation motion and LOD scope](vegetation.md). Cloud detail, rain/snow,
 lens flares and some legacy effect/skin blend and no-depth-test modes are
 not reproduced.
 The native whole-world BMD preload, temporal upscalers and frame generation
