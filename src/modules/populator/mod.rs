@@ -2998,6 +2998,7 @@ impl Populator {
                     live.motion.observe(pose_signature(&meshes));
                     out.model(
                         "populator",
+                        live.spawn as u64,
                         live.asset.as_ref(),
                         &meshes,
                         |_| true,

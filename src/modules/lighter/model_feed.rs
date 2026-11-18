@@ -14,7 +14,7 @@ pub(crate) type Decode<'a> = dyn FnMut(&str) -> Result<(image::RgbaImage, bool),
 
 pub(crate) struct Moving<'a> {
     pub builder: Builder,
-    geometry: Mesh,
+    effects: Mesh,
     textures: &'a mut Textures,
     layer: u32,
 }
@@ -23,7 +23,7 @@ impl<'a> Moving<'a> {
     pub fn new(textures: &'a mut Textures) -> Self {
         Self {
             builder: Builder::default(),
-            geometry: Mesh::default(),
+            effects: Mesh::default(),
             textures,
             layer: 0,
         }
@@ -32,6 +32,7 @@ impl<'a> Moving<'a> {
     pub fn model(
         &mut self,
         namespace: &'static str,
+        owner: u64,
         asset: &ModelAsset,
         poses: &[PosedMesh],
         include_skin: impl Fn(usize) -> bool,
@@ -43,6 +44,7 @@ impl<'a> Moving<'a> {
             return Ok(());
         };
         let settings = asset.descriptor.render_settings();
+        let mut geometry = Mesh::default();
         for part in prepared.into_iter().filter(|part| include_skin(part.skin)) {
             let d = part.material.diffuse;
             let mut flags = if settings.destination_blend == 2 {
@@ -79,14 +81,14 @@ impl<'a> Moving<'a> {
             let id = self
                 .builder
                 .surface(Surface::new(texture, flags, 0.5, 0.).with_gloss(gloss));
-            let base = self.geometry.vertices.len() as u32;
-            self.geometry.vertices.extend(
+            let base = geometry.vertices.len() as u32;
+            geometry.vertices.extend(
                 part.vertices
                     .iter()
                     .map(|v| Vertex::new(v.position, v.normal, v.uv).tint(tint, tint)),
             );
             for i in part.indices.chunks_exact(3) {
-                self.geometry.tri(
+                geometry.tri(
                     [
                         base + u32::from(i[0]),
                         base + u32::from(i[1]),
@@ -96,7 +98,7 @@ impl<'a> Moving<'a> {
                 );
             }
         }
-        Ok(())
+        self.builder.posed_world_mesh(namespace, owner, &geometry)
     }
 
     pub fn effects(
@@ -153,12 +155,12 @@ impl<'a> Moving<'a> {
                     .builder
                     .surface(Surface::new(texture, flags, 0., 0.).with_gloss(gloss));
                 for tri in skin.vertices.chunks_exact(3) {
-                    let base = self.geometry.vertices.len() as u32;
-                    self.geometry.vertices.extend(
+                    let base = self.effects.vertices.len() as u32;
+                    self.effects.vertices.extend(
                         tri.iter()
                             .map(|v| Vertex::new(v.position, v.normal, v.uv).tint(color, color)),
                     );
-                    self.geometry.tri([base, base + 1, base + 2], id);
+                    self.effects.tri([base, base + 1, base + 2], id);
                 }
             } else {
                 self.card(
@@ -217,28 +219,35 @@ impl<'a> Moving<'a> {
             .textures
             .archive(namespace, name, Filter::Alpha, decode)?
             .map_or(0, |v| v.0);
-        let base = self.geometry.vertices.len() as u32;
+        let base = self.effects.vertices.len() as u32;
         let id = self
             .builder
             .surface(Surface::new(tex, flags | EMISSIVE, 0., 0.));
         for j in 0..4 {
             let color = rgba(color[j]);
-            self.geometry
+            self.effects
                 .vertices
                 .push(Vertex::new(positions[j], [0., 1., 0.], uv[j]).tint(color, color));
         }
         self.layer += 1;
         // Match the native effect pass's diagonal for authored corner colours.
-        self.geometry
+        self.effects
             .tri_layer([base, base + 1, base + 3], id, self.layer);
-        self.geometry
+        self.effects
             .tri_layer([base, base + 3, base + 2], id, self.layer);
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<Packet, String> {
-        self.builder.world_mesh(&self.geometry)?;
-        Ok(self.builder.finish())
+    pub(crate) fn finish_cached(mut self, cache: &mut AccelCache) -> Result<Packet, String> {
+        // The aggregate GFX batch may change its primitive count as particles
+        // are born and die. It cannot invalidate any resident actor BLAS.
+        self.builder.posed_world_mesh("gfx", 0, &self.effects)?;
+        Ok(self.builder.finish_cached(cache))
+    }
+
+    #[cfg(test)]
+    fn finish(self) -> Result<Packet, String> {
+        self.finish_cached(&mut AccelCache::default())
     }
 }
 

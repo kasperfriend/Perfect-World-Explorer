@@ -29,7 +29,8 @@ pub(super) struct Feed {
     terrain: [f32; 4],
     area_table: u32,
     near_bounds: [f32; 4],
-    far: Mesh,
+    far: Vec<(crate::terrain_residency::Span, Mesh)>,
+    accel: AccelCache,
     trees: Vec<Option<Tree>>,
     placements: Vec<crate::scene::Tree>,
     grass: HashMap<(Rect, Filter), Tile>,
@@ -115,15 +116,25 @@ impl Feed {
             // the live cutoff toggle can bring back distant geometry.
             &crate::terrain_gpu::world_mesh(t, 16)?
         };
-        result.far.vertices = far
-            .0
-            .iter()
-            .map(|v| {
-                let (pos, n) = v.position_normal();
-                Vertex::new(pos, n, [0.; 2])
-            })
-            .collect();
-        result.far.triangles = far.1.chunks_exact(3).map(|i| [i[0], i[1], i[2]]).collect();
+        for span in &far.2 {
+            let mut patch = Mesh::default();
+            let mut remap = HashMap::new();
+            for tri in
+                far.1[span.start as usize..(span.start + span.count) as usize].chunks_exact(3)
+            {
+                let tri = [tri[0], tri[1], tri[2]].map(|i| {
+                    *remap.entry(i).or_insert_with(|| {
+                        let id = patch.vertices.len() as u32;
+                        let (p, n) = far.0[i as usize].position_normal();
+                        patch.vertices.push(Vertex::new(p, n, [0.; 2]));
+                        id
+                    })
+                });
+                // The terrain material is the first surface in every packet.
+                patch.tri(tri, 0);
+            }
+            result.far.push((*span, patch));
+        }
         Ok(result)
     }
 
@@ -205,21 +216,38 @@ impl Feed {
             builder.light(light);
         }
         let terrain_id = builder.surface(Surface::new(0, TERRAIN, 0., 0.));
-        {
+        for block in &m.spans {
+            let (x, y) = block.block;
             let near = span(
                 &m.vertices,
-                &m.indices[..m.terrain_end as usize],
+                &m.indices[block.start as usize..(block.start + block.count) as usize],
                 terrain_id,
                 |_| u32::MAX,
             )?;
-            builder.world_mesh(&near)?;
-            if !m.detail.terrain_cutoff {
-                builder.world_mesh(&uncovered_far(
-                    &self.far,
-                    &near,
-                    self.near_bounds,
-                    terrain_id,
-                ))?;
+            builder.chunk(ChunkKey::NearTerrain(x, y), &near)?;
+        }
+        if !m.detail.terrain_cutoff {
+            let edges = near_edges(
+                self.near_bounds,
+                m.indices[..m.terrain_end as usize].iter().map(|&i| {
+                    let v = &m.vertices[i as usize];
+                    Vertex::new(v.pos, v.normal, v.uv)
+                }),
+            );
+            let [x0, x1, z0, z1] = self.near_bounds;
+            debug_assert_eq!(terrain_id, 0);
+            for (block, patch) in &self.far {
+                let [lo_x, _, lo_z, hi_x, _, hi_z] = block.bounds;
+                let (x, y) = block.block;
+                let key = ChunkKey::FarTerrain(x, y);
+                if hi_x < x0 || lo_x > x1 || hi_z < z0 || lo_z > z1 {
+                    builder.chunk(key, patch)?;
+                } else if !(lo_x >= x0 && hi_x <= x1 && lo_z >= z0 && hi_z <= z1) {
+                    builder.chunk(
+                        key,
+                        &stitch_patch(patch, &edges, self.near_bounds, terrain_id),
+                    )?;
+                }
             }
         }
         let water_mesh = water_mesh(m, &mut builder)?;
@@ -239,7 +267,7 @@ impl Feed {
                 .as_ref()
                 .map_err(Clone::clone)?
                 .append(&mut builder, &mut bank, storage)?;
-        Ok((builder.finish(), bank, coverage))
+        Ok((builder.finish_cached(&mut self.accel), bank, coverage))
     }
 
     fn vegetation(
@@ -494,11 +522,44 @@ fn span(
     })
 }
 
-/// Join the far grid to the actual near perimeter. Their XZ grids align at
-/// block boundaries, but a stride-16 far edge can pass above/below vertices of
-/// the native stride-four perimeter. Split the exterior triangle into a fan
-/// with those exact points on the shared edge, without reintroducing overlap.
-fn uncovered_far(far: &Mesh, near: &Mesh, [x0, x1, z0, z1]: [f32; 4], surface: u32) -> Mesh {
+type Perimeter = [Vec<(f32, Vertex)>; 4];
+
+fn near_edges([x0, x1, z0, z1]: [f32; 4], vertices: impl Iterator<Item = Vertex>) -> Perimeter {
+    let mut edges: Perimeter = std::array::from_fn(|_| Vec::new());
+    for v in vertices {
+        let [x, _, z] = v.pos;
+        for (edge, (on, distance)) in
+            edges
+                .iter_mut()
+                .zip([(x == x0, z), (x == x1, z), (z == z0, x), (z == z1, x)])
+        {
+            if on {
+                edge.push((distance, v));
+            }
+        }
+    }
+    for edge in &mut edges {
+        edge.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        edge.dedup_by(|a, b| a.0 == b.0);
+    }
+    edges
+}
+
+#[cfg(test)]
+fn uncovered_far(far: &Mesh, near: &Mesh, bounds: [f32; 4], surface: u32) -> Mesh {
+    let edges = near_edges(
+        bounds,
+        near.triangles
+            .iter()
+            .flatten()
+            .map(|&i| near.vertices[i as usize]),
+    );
+    stitch_patch(far, &edges, bounds, surface)
+}
+
+/// Split only the exterior patch edges that touch the native near perimeter.
+/// Vertices inserted along a stride-16 edge use the actual near heights.
+fn stitch_patch(far: &Mesh, edges: &Perimeter, [x0, x1, z0, z1]: [f32; 4], surface: u32) -> Mesh {
     let exterior: Vec<_> = far
         .triangles
         .iter()
@@ -512,23 +573,6 @@ fn uncovered_far(far: &Mesh, near: &Mesh, [x0, x1, z0, z1]: [f32; 4], surface: u
         .collect();
     if exterior.is_empty() {
         return Mesh::default();
-    }
-    let mut edges: [Vec<(f32, u32)>; 4] = std::array::from_fn(|_| Vec::new());
-    for &i in near.triangles.iter().flatten() {
-        let [x, _, z] = near.vertices[i as usize].pos;
-        for (edge, (on, distance)) in
-            edges
-                .iter_mut()
-                .zip([(x == x0, z), (x == x1, z), (z == z0, x), (z == z1, x)])
-        {
-            if on {
-                edge.push((distance, i));
-            }
-        }
-    }
-    for edge in &mut edges {
-        edge.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-        edge.dedup_by(|a, b| a.0 == b.0);
     }
     let mut out = Mesh {
         vertices: far.vertices.clone(),
@@ -563,7 +607,7 @@ fn uncovered_far(far: &Mesh, near: &Mesh, [x0, x1, z0, z1]: [f32; 4], surface: u
             for j in lo..hi {
                 let at = if a < b { j } else { (hi - 1) - (j - lo) };
                 let id = out.vertices.len() as u32;
-                out.vertices.push(near.vertices[edge[at].1 as usize]);
+                out.vertices.push(edge[at].1);
                 out.tri([previous, id, apex], surface);
                 previous = id;
             }
@@ -767,6 +811,7 @@ fn moving(
     modules: &mut crate::modules::Modules,
     textures: &mut Textures,
     matrix: Mat4,
+    cache: &mut AccelCache,
 ) -> Result<Packet, String> {
     let mut out = lighter::model_feed::Moving::new(textures);
     if let Some(models) = models {
@@ -777,13 +822,13 @@ fn moving(
         }
         let mut decode =
             |path: &str| read(path).and_then(|b| crate::model_texture_gpu::decode_for_rays(&b));
-        for (asset, poses) in geometry {
-            out.model("world", asset, poses, |_| true, &mut decode)?;
+        for (owner, asset, poses) in geometry {
+            out.model("world", owner, asset, poses, |_| true, &mut decode)?;
         }
         out.effects("world", effects, &mut decode)?;
     }
     modules.ray_inputs(matrix, &mut out)?;
-    out.finish()
+    out.finish_cached(cache)
 }
 
 impl super::Renderer {
@@ -865,6 +910,7 @@ impl super::Renderer {
                 &mut self.modules,
                 &mut world.textures,
                 matrix,
+                &mut self.lighter.moving_accel,
             )?;
             self.lighter.render(
                 &self.device,

@@ -1,10 +1,14 @@
 //! wgpu 0.19 exposes the Vulkan RT feature bits but does not expose BLAS/TLAS
 //! creation in wgpu-core. Keep that interop here, on the viewer's *same* device
 //! and queue. No CPU image readback and no second adapter.
-use super::scene::{Packet, DYNAMIC_BIT, VERTEX_WORDS};
+use super::scene::{Fingerprint, MeshKey, MeshRange, Packet, DYNAMIC_BIT, VERTEX_WORDS};
 use super::Frame;
 use ash::{extensions::khr, vk};
-use std::{ffi::CStr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::CStr,
+    sync::Arc,
+};
 use wgpu::hal::{api::Vulkan, vulkan::Device as HalDevice};
 
 pub const FEATURES: wgpu::Features =
@@ -290,6 +294,7 @@ impl Upload {
 struct Structure {
     storage: Buffer,
     handle: vk::AccelerationStructureKHR,
+    update_scratch: u64,
 }
 impl Structure {
     fn new(ctx: &Arc<Context>, bytes: u64, ty: vk::AccelerationStructureTypeKHR) -> R<Self> {
@@ -309,7 +314,11 @@ impl Structure {
             )
         }
         .map_err(vkerr("create acceleration structure"))?;
-        Ok(Self { storage, handle })
+        Ok(Self {
+            storage,
+            handle,
+            update_scratch: 0,
+        })
     }
 
     fn address(&self) -> u64 {
@@ -339,14 +348,21 @@ struct Build {
     geometry: vk::AccelerationStructureGeometryKHR,
     ty: vk::AccelerationStructureTypeKHR,
     count: u32,
+    allow_update: bool,
+    update: bool,
 }
 impl Build {
     fn info(&self) -> vk::AccelerationStructureBuildGeometryInfoKHRBuilder<'_> {
         vk::AccelerationStructureBuildGeometryInfoKHR::builder()
             .ty(self.ty)
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-            .flags(if self.ty == vk::AccelerationStructureTypeKHR::TOP_LEVEL {
-                vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD
+            .mode(if self.update {
+                vk::BuildAccelerationStructureModeKHR::UPDATE
+            } else {
+                vk::BuildAccelerationStructureModeKHR::BUILD
+            })
+            .flags(if self.allow_update {
+                vk::BuildAccelerationStructureFlagsKHR::ALLOW_UPDATE
+                    | vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD
             } else {
                 vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
             })
@@ -354,6 +370,12 @@ impl Build {
     }
 
     fn prepare(&self, ctx: &Arc<Context>, slot: &mut Option<Structure>) -> R<u64> {
+        if self.update {
+            return Ok(slot
+                .as_ref()
+                .expect("update uses the original AS")
+                .update_scratch);
+        }
         let sizes = unsafe {
             ctx.acceleration.get_acceleration_structure_build_sizes(
                 vk::AccelerationStructureBuildTypeKHR::DEVICE,
@@ -371,12 +393,18 @@ impl Build {
                 self.ty,
             )?);
         }
+        slot.as_mut().unwrap().update_scratch = sizes.update_scratch_size;
         Ok(sizes.build_scratch_size)
     }
 
     unsafe fn encode(&self, ctx: &Context, cmd: vk::CommandBuffer, dest: &Structure, scratch: u64) {
         let info = self
             .info()
+            .src_acceleration_structure(if self.update {
+                dest.handle
+            } else {
+                vk::AccelerationStructureKHR::null()
+            })
             .dst_acceleration_structure(dest.handle)
             .scratch_data(vk::DeviceOrHostAddressKHR {
                 device_address: scratch,
@@ -410,7 +438,7 @@ impl Build {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct TlasInstance {
     rows: [f32; 12],
     index_mask: u32,
@@ -615,6 +643,25 @@ impl Drop for Output {
     }
 }
 
+type ResidentKey = (u32, MeshKey);
+
+#[derive(Default)]
+struct ResidentBlas {
+    accel: Option<Structure>,
+    // Commit only after successful submission; a newly allocated AS is not
+    // yet a valid source for an update.
+    shape: Option<Fingerprint>,
+}
+
+struct AccelPlan {
+    live: HashSet<ResidentKey>,
+    blas: Vec<(ResidentKey, Fingerprint, Build)>,
+    members: Vec<ResidentKey>,
+    instance_data: Vec<TlasInstance>,
+    tlas: Option<Build>,
+    scratch_bytes: u64,
+}
+
 pub struct Renderer {
     core: Core,
     // Kept by the engine until device teardown; raw uses are not tracked by it.
@@ -622,9 +669,11 @@ pub struct Renderer {
     moving: Option<Upload>,
     textures: Option<Upload>,
     instances: Option<Upload>,
-    static_blas: Vec<Option<Structure>>,
-    dynamic_blas: Vec<Option<Structure>>,
+    blas: HashMap<ResidentKey, ResidentBlas>,
     tlas: Option<Structure>,
+    members: Vec<ResidentKey>,
+    instance_data: Vec<TlasInstance>,
+    last_moving_keys: Vec<MeshKey>,
     scratch: Option<Buffer>,
     frame: Buffer,
     output: Option<Output>,
@@ -632,8 +681,8 @@ pub struct Renderer {
     revision: Option<u64>,
     texture_len: usize,
     last_moving: Vec<u32>,
-    #[cfg(test)]
-    pub as_builds: [u64; 3],
+    pub(super) as_builds: [u64; 3],
+    pub(super) as_refits: [u64; 3],
 }
 
 impl Renderer {
@@ -652,9 +701,11 @@ impl Renderer {
             moving: None,
             textures: None,
             instances: None,
-            static_blas: Vec::new(),
-            dynamic_blas: Vec::new(),
+            blas: HashMap::new(),
             tlas: None,
+            members: Vec::new(),
+            instance_data: Vec::new(),
+            last_moving_keys: Vec::new(),
             scratch: None,
             frame,
             output: None,
@@ -662,50 +713,133 @@ impl Renderer {
             revision: None,
             texture_len: 0,
             last_moving: Vec::new(),
-            #[cfg(test)]
             as_builds: [0; 3],
+            as_refits: [0; 3],
         })
     }
 
-    fn blas(ctx: &Context, packet: &Packet, buffer: &Buffer) -> R<Vec<Build>> {
-        let base = buffer.address();
-        packet
-            .meshes
-            .iter()
-            .map(|m| {
-                let count = m.triangle.len() as u32;
-                if u64::from(count) > ctx.max_primitives {
-                    return Err("Lighter mesh exceeds Vulkan BLAS primitive limit".into());
-                }
-                let v = packet.words[0] + m.vertex.start * VERTEX_WORDS;
-                let i = packet.words[1] + m.triangle.start * 3;
-                let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::builder()
-                    .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                        device_address: base + 4 * u64::from(v),
-                    })
-                    .vertex_format(vk::Format::R32G32B32_SFLOAT)
-                    .vertex_stride(u64::from(VERTEX_WORDS) * 4)
-                    .max_vertex(m.vertex.len() as u32 - 1)
-                    .index_type(vk::IndexType::UINT32)
-                    .index_data(vk::DeviceOrHostAddressConstKHR {
-                        device_address: base + 4 * u64::from(i),
-                    })
-                    .build();
-                Ok(Build {
-                    count,
-                    ty: vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
-                    geometry: vk::AccelerationStructureGeometryKHR::builder()
-                        .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-                        .flags(if m.opaque {
-                            vk::GeometryFlagsKHR::OPAQUE
-                        } else {
-                            vk::GeometryFlagsKHR::NO_DUPLICATE_ANY_HIT_INVOCATION
-                        })
-                        .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
-                        .build(),
-                })
+    fn blas(ctx: &Context, packet: &Packet, m: &MeshRange, base: u64, update: bool) -> R<Build> {
+        let count = m.triangle.len() as u32;
+        if u64::from(count) > ctx.max_primitives {
+            return Err("Lighter mesh exceeds Vulkan BLAS primitive limit".into());
+        }
+        let v = packet.words[0] + m.vertex.start * VERTEX_WORDS;
+        let i = packet.words[1] + m.triangle.start * 3;
+        let triangles = vk::AccelerationStructureGeometryTrianglesDataKHR::builder()
+            .vertex_data(vk::DeviceOrHostAddressConstKHR {
+                device_address: base + 4 * u64::from(v),
             })
-            .collect()
+            .vertex_format(vk::Format::R32G32B32_SFLOAT)
+            .vertex_stride(u64::from(VERTEX_WORDS) * 4)
+            .max_vertex(m.vertex.len() as u32 - 1)
+            .index_type(vk::IndexType::UINT32)
+            .index_data(vk::DeviceOrHostAddressConstKHR {
+                device_address: base + 4 * u64::from(i),
+            })
+            .build();
+        Ok(Build {
+            count,
+            ty: vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+            // Opacity is per-instance metadata. Keep the same flags on every
+            // build/update so changing a material never discards geometry.
+            geometry: vk::AccelerationStructureGeometryKHR::builder()
+                .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+                .flags(vk::GeometryFlagsKHR::NO_DUPLICATE_ANY_HIT_INVOCATION)
+                .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
+                .build(),
+            allow_update: matches!(m.key, MeshKey::Posed(..)),
+            update,
+        })
+    }
+
+    fn prepare_accel(&mut self, world: &Packet, moving: &Packet) -> R<AccelPlan> {
+        let ctx = &self.core.ctx;
+        let mut plan = AccelPlan {
+            live: HashSet::new(),
+            blas: Vec::new(),
+            members: Vec::new(),
+            instance_data: Vec::new(),
+            tlas: None,
+            scratch_bytes: 0,
+        };
+        let mut instances = Vec::with_capacity(world.instances.len() + moving.instances.len());
+        for (packet, upload, bit) in [
+            (world, self.world.as_ref().unwrap(), 0),
+            (moving, self.moving.as_ref().unwrap(), DYNAMIC_BIT),
+        ] {
+            let base = upload.gpu.address();
+            for m in &packet.meshes {
+                let key = (bit, m.key);
+                if !plan.live.insert(key) {
+                    continue;
+                }
+                let resident = self.blas.entry(key).or_default();
+                if resident.shape != Some(m.shape) {
+                    let update = resident.shape.is_some();
+                    let build = Self::blas(ctx, packet, m, base, update)?;
+                    plan.scratch_bytes = plan
+                        .scratch_bytes
+                        .max(build.prepare(ctx, &mut resident.accel)?);
+                    plan.blas.push((key, m.shape, build));
+                }
+            }
+            for (id, i) in packet.instances.iter().enumerate() {
+                let m = &packet.meshes[i.mesh as usize];
+                let key = (bit, m.key);
+                instances.push((
+                    key,
+                    TlasInstance {
+                        rows: i.transform.rows(),
+                        index_mask: (id as u32 | bit) | (u32::from(m.mask) << 24),
+                        sbt_flags: if m.opaque {
+                            vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE.as_raw() << 24
+                        } else {
+                            0
+                        },
+                        address: self.blas[&key].accel.as_ref().unwrap().address(),
+                    },
+                ));
+            }
+        }
+        // Canonical order makes packet compaction/reordering a payload update
+        // rather than a change to TLAS topology. Custom indices still address
+        // the actual per-packet instance records in the shader.
+        instances.sort_by_key(|&(key, _)| key);
+        (plan.members, plan.instance_data) = instances.into_iter().unzip();
+        let rebuild = self.revision.is_none() || plan.members != self.members;
+        if rebuild || plan.instance_data != self.instance_data || !plan.blas.is_empty() {
+            if plan.instance_data.len() as u64 > ctx.max_instances {
+                return Err("Lighter scene exceeds Vulkan TLAS instance limit".into());
+            }
+            Upload::set(
+                &mut self.instances,
+                ctx,
+                bytemuck::cast_slice(&plan.instance_data),
+                BUILD_INPUT | ADDRESS,
+            )?;
+            let tlas = Build {
+                ty: vk::AccelerationStructureTypeKHR::TOP_LEVEL,
+                count: plan.instance_data.len() as u32,
+                geometry: vk::AccelerationStructureGeometryKHR::builder()
+                    .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+                    .geometry(vk::AccelerationStructureGeometryDataKHR {
+                        instances: vk::AccelerationStructureGeometryInstancesDataKHR::builder()
+                            .data(vk::DeviceOrHostAddressConstKHR {
+                                device_address: self.instances.as_ref().unwrap().gpu.address(),
+                            })
+                            .build(),
+                    })
+                    .build(),
+                allow_update: true,
+                update: !rebuild,
+            };
+            // Refresh the TLAS bounds after an in-place BLAS refit. Drivers
+            // need not trace against the new extents of the old address until
+            // the TLAS has also been updated. This is not a topology rebuild.
+            plan.scratch_bytes = plan.scratch_bytes.max(tlas.prepare(ctx, &mut self.tlas)?);
+            plan.tlas = Some(tlas);
+        }
+        Ok(plan)
     }
 
     pub(super) fn moving_unchanged(&self, moving: &Packet) -> bool {
@@ -798,18 +932,13 @@ impl Renderer {
         texels: &[u8],
         revision: u64,
     ) -> R<&wgpu::Buffer> {
-        let ctx = &self.core.ctx;
-        let d = &ctx.device;
-        let cmd = self.core.commands;
         // Raw submit and wgpu composition both run on the render thread on
         // the same VkQueue. `try_prepare_image` has observed the native fence.
         assert!(!self.submitted);
-        let output = self.output.as_ref().expect("prepare image before tracing");
-        let image = output.imported.as_ref().expect("initialized interop image");
-        assert_eq!(output.raw.size, image_size);
         let static_changed = self.revision != Some(revision);
         let textures_changed = static_changed || self.texture_len != texels.len();
         let input = STORAGE | BUILD_INPUT | ADDRESS;
+        let ctx = &self.core.ctx;
         if static_changed {
             Upload::set(&mut self.world, ctx, world.bytes(), input)?;
         }
@@ -817,85 +946,30 @@ impl Renderer {
             Upload::set(&mut self.textures, ctx, texels, STORAGE)?;
         }
         let moving_changed = self.last_moving != moving.words;
-        let geometry_changed = moving_changed && !moving.same_geometry(&self.last_moving);
+        let moving_keys_changed = !self
+            .last_moving_keys
+            .iter()
+            .copied()
+            .eq(moving.meshes.iter().map(|m| m.key));
         if moving_changed {
             Upload::set(&mut self.moving, ctx, moving.bytes(), input)?;
         }
+        let plan = if static_changed || moving_changed || moving_keys_changed {
+            Some(self.prepare_accel(world, moving)?)
+        } else {
+            None
+        };
+        let ctx = &self.core.ctx;
+        let d = &ctx.device;
+        let cmd = self.core.commands;
+        let output = self.output.as_ref().expect("prepare image before tracing");
+        let image = output.imported.as_ref().expect("initialized interop image");
+        assert_eq!(output.raw.size, image_size);
         let w = self.world.as_ref().unwrap();
         let m = self.moving.as_ref().unwrap();
         let textures = self.textures.as_ref().unwrap();
         self.frame.write(bytemuck::bytes_of(frame))?;
-        let world_build = if static_changed {
-            Self::blas(ctx, world, &w.gpu)?
-        } else {
-            Vec::new()
-        };
-        let moving_build = if geometry_changed {
-            Self::blas(ctx, moving, &m.gpu)?
-        } else {
-            Vec::new()
-        };
-        let mut scratch_bytes = 0;
-        if static_changed {
-            self.static_blas.resize_with(world_build.len(), || None);
-        }
-        if geometry_changed {
-            self.dynamic_blas.resize_with(moving_build.len(), || None);
-        }
-        for (build, dest) in world_build
-            .iter()
-            .zip(&mut self.static_blas)
-            .chain(moving_build.iter().zip(&mut self.dynamic_blas))
-        {
-            scratch_bytes = scratch_bytes.max(build.prepare(ctx, dest)?);
-        }
-        let tlas_build = if static_changed || geometry_changed {
-            let mut instance_data =
-                Vec::with_capacity(world.instances.len() + moving.instances.len());
-            for (packet, meshes, bit) in [
-                (world, &self.static_blas, 0),
-                (moving, &self.dynamic_blas, DYNAMIC_BIT),
-            ] {
-                for (id, i) in packet.instances.iter().enumerate() {
-                    instance_data.push(TlasInstance {
-                        rows: i.transform.rows(),
-                        index_mask: (id as u32 | bit)
-                            | (u32::from(packet.meshes[i.mesh as usize].mask) << 24),
-                        sbt_flags: 0,
-                        address: meshes[i.mesh as usize].as_ref().unwrap().address(),
-                    });
-                }
-            }
-            if instance_data.len() as u64 > ctx.max_instances {
-                return Err("Lighter scene exceeds Vulkan TLAS instance limit".into());
-            }
-            Upload::set(
-                &mut self.instances,
-                ctx,
-                bytemuck::cast_slice(&instance_data),
-                BUILD_INPUT | ADDRESS,
-            )?;
-            let instances = self.instances.as_ref().unwrap();
-            let build = Build {
-                ty: vk::AccelerationStructureTypeKHR::TOP_LEVEL,
-                count: instance_data.len() as u32,
-                geometry: vk::AccelerationStructureGeometryKHR::builder()
-                    .geometry_type(vk::GeometryTypeKHR::INSTANCES)
-                    .geometry(vk::AccelerationStructureGeometryDataKHR {
-                        instances: vk::AccelerationStructureGeometryInstancesDataKHR::builder()
-                            .data(vk::DeviceOrHostAddressConstKHR {
-                                device_address: instances.gpu.address(),
-                            })
-                            .build(),
-                    })
-                    .build(),
-            };
-            scratch_bytes = scratch_bytes.max(build.prepare(ctx, &mut self.tlas)?);
-            Some(build)
-        } else {
-            None
-        };
-        let scratch_bytes = scratch_bytes + ctx.scratch_align;
+        let scratch_bytes = plan.as_ref().map_or(0, |p| p.scratch_bytes) + ctx.scratch_align;
         if self.scratch.as_ref().is_none_or(|s| s.size < scratch_bytes) {
             self.scratch = Some(Buffer::new(ctx, scratch_bytes, STORAGE | ADDRESS, LOCAL)?);
         }
@@ -957,7 +1031,7 @@ impl Renderer {
             if moving_changed {
                 m.encode(cmd);
             }
-            if tlas_build.is_some() {
+            if plan.as_ref().is_some_and(|p| p.tlas.is_some()) {
                 self.instances.as_ref().unwrap().encode(cmd);
             }
             d.cmd_pipeline_barrier(
@@ -976,15 +1050,13 @@ impl Renderer {
                 &[],
                 &[],
             );
-            for (build, dest) in world_build
-                .iter()
-                .zip(&self.static_blas)
-                .chain(moving_build.iter().zip(&self.dynamic_blas))
-            {
-                build.encode(ctx, cmd, dest.as_ref().unwrap(), scratch);
-            }
-            if let Some(build) = &tlas_build {
-                build.encode(ctx, cmd, tlas, scratch);
+            if let Some(plan) = &plan {
+                for (key, _, build) in &plan.blas {
+                    build.encode(ctx, cmd, self.blas[key].accel.as_ref().unwrap(), scratch);
+                }
+                if let Some(build) = &plan.tlas {
+                    build.encode(ctx, cmd, tlas, scratch);
+                }
             }
             // The previous wgpu denoiser or compositor may still read this
             // buffer. Both execute on this VkQueue, in submission order.
@@ -1030,11 +1102,33 @@ impl Renderer {
         if moving_changed {
             self.last_moving.clone_from(&moving.words);
         }
-        #[cfg(test)]
-        {
-            self.as_builds[0] += world_build.len() as u64;
-            self.as_builds[1] += moving_build.len() as u64;
-            self.as_builds[2] += u64::from(tlas_build.is_some());
+        if moving_keys_changed {
+            self.last_moving_keys.clear();
+            self.last_moving_keys
+                .extend(moving.meshes.iter().map(|m| m.key));
+        }
+        if let Some(plan) = plan {
+            for (key, shape, build) in plan.blas {
+                self.blas.get_mut(&key).unwrap().shape = Some(shape);
+                let slot = usize::from(key.0 == DYNAMIC_BIT);
+                if build.update {
+                    self.as_refits[slot] += 1;
+                } else {
+                    self.as_builds[slot] += 1;
+                }
+            }
+            if let Some(build) = plan.tlas {
+                self.members = plan.members;
+                self.instance_data = plan.instance_data;
+                if build.update {
+                    self.as_refits[2] += 1;
+                } else {
+                    self.as_builds[2] += 1;
+                }
+            }
+            // The previous trace fence retired before this command buffer was
+            // recorded. Its evicted BLAS are no longer referenced by the TLAS.
+            self.blas.retain(|key, _| plan.live.contains(key));
         }
         self.revision = Some(revision);
         self.texture_len = texels.len();

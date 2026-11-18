@@ -431,6 +431,7 @@ pub struct Lighter {
     present: Option<Present>,
     post: Option<post::Post>,
     history: post::History,
+    pub(crate) moving_accel: scene::AccelCache,
     pub settings: Settings,
     armed: bool,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -456,6 +457,7 @@ impl Default for Lighter {
             present: None,
             post: None,
             history: post::History::default(),
+            moving_accel: Default::default(),
             settings: Settings::default(),
             armed: false,
             #[cfg(any(target_os = "windows", target_os = "linux"))]

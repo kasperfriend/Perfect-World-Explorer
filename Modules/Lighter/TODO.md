@@ -4,18 +4,47 @@ Lighter already traces camera, shadow, reflection, refraction and bounded indire
 
 Status: `[x]` means implemented and verified at the scope on that line; unchecked items remain open. Synthetic software Vulkan and physical GPU evidence must be reported separately.
 
-## Ordered implementation — Phase 0: performance first
+## Ordered implementation
 
-The scene, fidelity and transport sections below retain their original RT item
-numbers. They do not take priority over the numbered implementation workflow.
-Complete each performance step before working on the next one; the first
-coverage step after these five is RT-01b (Step 6).
+Complete and validate each numbered step before starting the next. The detailed
+RT checklist below retains its original IDs and earlier completed foundations;
+it does not set execution order.
 
-1. [ ] Remove live GPU completion waits, use later-frame callbacks with a bounded readback ring, and verify the viewer and explicit headless PNG. See [the caller audit and regressions](performance-waits.md).
-2. [ ] Cache static BLAS by stable chunk/geometry identity, refit posed BLAS in place, and dirty TLAS/software BVH only when their inputs change. Verify zero builds on camera-only movement in a static scene.
-3. [ ] Retain buffers, textures and bind groups across frames. Grow capacity geometrically and update in place. Verify no steady-state resource creation.
-4. [ ] Audit renderer/scene clones; borrow immutable data, share lifetimes with `Arc`, and use cached asset IDs. Check frame cost as chunk count grows.
-5. [ ] Default to 1 spp, 1 bounce and half ray resolution. Reproject and blend history with a camera-cut reset, upscale on presentation and keep higher quality opt-in.
+### Phase 0 — Performance
+
+1. [x] Remove live GPU completion waits in the world/RT paths, use later-frame callbacks with a three-slot readback ring, and verify a windowed run/resize and the explicit headless PNG. See [the caller audit and synthetic regression results](performance-waits.md).
+2. [ ] Cache BLAS by stable chunk and geometry identity; admit/evict with residency. Update posed positions in place and refit their BLAS. Dirty TLAS only for instance membership/transforms, and rebuild software BVH topology only when the set changes. Camera-only movement in a static scene must trigger zero rebuilds.
+3. [ ] Retain buffers, textures and bind groups across frames. Grow to `max(needed, capacity * 2)`, preserve contents when needed, and otherwise write in place. Log zero steady-state resource creation.
+4. [ ] Audit `gpu.rs`, `lighter/scenery.rs` and `lighter/host.rs` clones. Borrow read-only data, share lifetimes with `Arc`, and use cached asset IDs. Check frame time as chunk count grows.
+5. [ ] Default to 1 spp, 1 bounce and half ray resolution. Reproject and blend about 0.1 new / 0.9 history with a camera-movement reset; bilinear or edge-aware upscale in presentation. Higher quality is opt-in.
+
+### Phase 1 — Coverage
+
+6. [ ] **RT-01b:** Build a stable `ChunkId`/bounds/asset manifest from the loaded world. Warn on conservative placement bounds. Rank by distance, light paths and secondary-ray reach; budget/evict by rank and retain matching BLAS. Check joins and teleports for gaps or duplicates.
+7. [ ] **RT-02b:** Compare coarse/native heights on a grid (mean/max, fail beyond about 0.5 world units), and silhouettes at 1–3° grazing incidence. Distinguish cutoff from failed loads and save results on at least two real maps.
+8. [ ] **RT-03:** Verify posed world, Walker and Populator feeds and refits. Keep bone-relative attachments as child instances. First-person hiding affects only primary rays. Count unsupported morph/supple/muscle data per map and check a moving off-camera NPC shadow.
+9. [ ] **RT-04:** Count loaded/skipped/failed terrain, trees, buildings, water, models and effects, with missing-package, texture-fallback, unsupported and budget reasons. Include per-map captures and a fixture with saved expected counts.
+
+### Phase 2 — Client fidelity
+
+10. [ ] **RT-05:** Preserve authored mip counts and levels. Sample color as sRGB, coverage and data as linear; choose explicit LOD by footprint and 8×/16× grazing anisotropy. Report `mip_fallback` separately and test brick-wall shimmer.
+11. [ ] **RT-06:** Carry authored PBR/material channels, sidedness, opacity and transmission. Distinguish baked vs. relit buildings, terrain and grass. Carry posed face/eye secondary stages and UV scrolling; validate day/night.
+12. [ ] **RT-07:** Match authored SpeedTree wind and grass fades; keep two-sided transmissive leaves in secondary rays independently of camera facing. Test noon dappled light.
+13. [ ] **RT-08:** Build per-body water BLAS/AABBs and wet/dry shoreline geometry. Document shading-only and geometric normal layers, initialize submerged media (Step 17), and compare shoreline/reflections to native.
+14. [ ] **RT-09:** Match native GFX order and animation, project decal boxes onto hits, document lens/screen distortions in `present.wgsl`, and derive ray-shadowed weather from authored clouds/rain/snow.
+
+### Phase 3 — Transport
+
+15. [ ] **RT-10:** Honor static-light flags; sample finite sphere/disk emitters and accumulate shadow-ray transmission. Test tinted glass between emitter and receiver.
+16. [ ] **RT-11:** Add `bsdf.wgsl` with energy-conserving GGX/Lambert, colored metal/dielectric Fresnel, Snell/TIR and backface handling. Compare reflected to incident energy across angles.
+17. [ ] **RT-12:** Track air/water per segment, apply authored RGB Beer–Lambert absorption, and separate specular caustics. Match native exponential fog or document linear. Test submerged sky refraction and tint.
+18. [ ] **RT-13:** Importance-sample sky CDF and emissive triangles with power weighting and balance MIS. Reference mode uses full samples/bounces and no temporal reuse. Check analytic diffuse-box brightness.
+
+### Phase 4 — Production
+
+19. [ ] **RT-15:** Log GPU build/traversal/filter timestamps each second; use an 8 GB RTX 3080 default budget, low-priority eviction and 128 recent texture tiles with background page uploads. Use an independent build queue if supported, otherwise early submit with only necessary fencing. Document backend caps.
+20. [ ] **RT-16:** Classify post effects by dependency on the ray world; keep native minimap/full map. Place optional upscaling/frame generation before HDR post. Recover device/resources/current chunks after DeviceLost; test resize and backend switching.
+21. [ ] **RT-17:** Capture matching cameras on dense city, forest, open distance, water, cave/instance and effects-heavy real maps, in Native/Software/Hardware under day/night/rain. Save dated images, Step 9 counts, per-region mean pixel error, driver/GPU/settings. Keep synthetic regressions separate from performance evidence.
 
 ## P0 — Scene coverage and residency
 

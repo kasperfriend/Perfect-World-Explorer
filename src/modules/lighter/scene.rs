@@ -1,10 +1,14 @@
 //! Backend-neutral scene packet. Offsets in the header are *word* offsets.
 //! The same indexed positions build the Vulkan BLAS and feed the software
 //! intersector. Both backends shade the same triangle IDs and barycentrics.
-use super::bvh::{Bounds, Bvh, Item};
+use super::bvh::{Bounds, Bvh};
 use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3};
-use std::ops::Range;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::Range,
+};
 
 pub const TERRAIN: u32 = 1 << 0;
 pub const BAKED: u32 = 1 << 2;
@@ -224,11 +228,31 @@ impl Mesh {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ChunkKey {
+    NearTerrain(usize, usize),
+    FarTerrain(usize, usize),
+    Scenery(i32, i32),
+}
+
+pub type Fingerprint = [u8; 32];
+
+/// Unlike packet offsets, these identities survive repacking as a streaming
+/// window changes. An animated owner keeps its address as long as the index
+/// topology is identical; vertex changes alone do not change that identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MeshKey {
+    Static(Option<ChunkKey>, Fingerprint),
+    Posed(&'static str, u64, Fingerprint),
+}
+
 pub struct MeshRange {
     pub vertex: Range<u32>,
     pub triangle: Range<u32>,
     pub mask: u8,
     pub opaque: bool,
+    pub key: MeshKey,
+    pub shape: Fingerprint,
     bvh: (u32, u32),
     bounds: Bounds,
 }
@@ -255,8 +279,130 @@ pub struct Builder {
     material_map: std::collections::HashMap<Surface, u32>,
     meshes: Vec<MeshRange>,
     instances: Vec<Instance>,
-    bvh: Bvh,
     lights: Vec<Light>,
+}
+
+struct CachedMesh {
+    shape: Fingerprint,
+    tree: Bvh,
+}
+
+struct CachedTree<K> {
+    membership: Vec<K>,
+    bounds: Vec<Bounds>,
+    tree: Bvh,
+}
+impl<K> Default for CachedTree<K> {
+    fn default() -> Self {
+        Self {
+            membership: Vec::new(),
+            bounds: Vec::new(),
+            tree: Bvh::default(),
+        }
+    }
+}
+impl<K: PartialEq> CachedTree<K> {
+    fn update(&mut self, membership: Vec<K>, bounds: Vec<Bounds>) -> [u64; 2] {
+        if self.membership != membership {
+            self.tree = Bvh::from_bounds(&bounds);
+            self.membership = membership;
+            self.bounds = bounds;
+            [1, 0]
+        } else if self.bounds != bounds {
+            self.tree.refit(&bounds);
+            self.bounds = bounds;
+            [0, 1]
+        } else {
+            [0, 0]
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct AccelCache {
+    meshes: HashMap<MeshKey, CachedMesh>,
+    instances: CachedTree<MeshKey>,
+    lights: CachedTree<usize>,
+    /// Bottom/top-level topology builds and refits, respectively.
+    pub(crate) builds: [u64; 2],
+    pub(crate) refits: [u64; 2],
+}
+
+impl AccelCache {
+    fn pack(&mut self, builder: &mut Builder) -> (Bvh, (u32, u32), (u32, u32)) {
+        let mut bvh = Bvh::default();
+        let mut live = HashSet::with_capacity(builder.meshes.len());
+        for mesh in &mut builder.meshes {
+            live.insert(mesh.key);
+            let vertices = &builder.vertices[mesh.vertex.start as usize..mesh.vertex.end as usize];
+            let triangles =
+                &builder.triangles[mesh.triangle.start as usize..mesh.triangle.end as usize];
+            let bounds = || {
+                triangles
+                    .iter()
+                    .map(|tri| {
+                        tri.iter().fold(Bounds::EMPTY, |b, &v| {
+                            b.union(Bounds::point(Vec3::from_array(vertices[v as usize].pos)))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let entry = match self.meshes.entry(mesh.key) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    let entry = e.into_mut();
+                    if entry.shape != mesh.shape {
+                        entry.tree.refit(&bounds());
+                        entry.shape = mesh.shape;
+                        self.refits[0] += 1;
+                    }
+                    entry
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    self.builds[0] += 1;
+                    e.insert(CachedMesh {
+                        shape: mesh.shape,
+                        tree: Bvh::from_bounds(&bounds()),
+                    })
+                }
+            };
+            mesh.bvh = bvh.append(&entry.tree, |id| id + mesh.triangle.start);
+        }
+        self.meshes.retain(|key, _| live.contains(key));
+        // A packet reorder changes the payload IDs, not the tree membership.
+        let mut order: Vec<_> = (0..builder.instances.len()).collect();
+        order.sort_by_key(|&id| builder.meshes[builder.instances[id].mesh as usize].key);
+        let (keys, bounds) = order
+            .iter()
+            .map(|&id| {
+                let i = &builder.instances[id];
+                let mesh = &builder.meshes[i.mesh as usize];
+                (mesh.key, i.transform.bounds(mesh.bounds))
+            })
+            .unzip();
+        let [builds, refits] = self.instances.update(keys, bounds);
+        self.builds[1] += builds;
+        self.refits[1] += refits;
+        let scene = bvh.append(&self.instances.tree, |id| order[id as usize] as u32);
+        // A pulsing intensity doesn't move the light volumes or their nodes.
+        self.lights.update(
+            (0..builder.lights.len()).collect(),
+            builder
+                .lights
+                .iter()
+                .map(|l| {
+                    let [x, y, z, r] = l.position_range;
+                    let center = Vec3::new(x, y, z);
+                    let extent = Vec3::splat(r);
+                    Bounds {
+                        min: center - extent,
+                        max: center + extent,
+                    }
+                })
+                .collect(),
+        );
+        let light = bvh.append(&self.lights.tree, |id| id);
+        (bvh, scene, light)
+    }
 }
 
 /// Budget for one optional world-space mesh appended after required geometry.
@@ -275,7 +421,9 @@ impl MeshBudget {
         let t = mesh.triangles.len();
         let bytes = v * std::mem::size_of::<Vertex>()
             + t * (6 + 2 * super::bvh::NODE_WORDS as usize) * 4
-            + surfaces * std::mem::size_of::<Surface>();
+            + surfaces * std::mem::size_of::<Surface>()
+            // At most one new top-level entry per optional item.
+            + (INSTANCE_WORDS + 2 * super::bvh::NODE_WORDS + 1) as usize * 4;
         if v > self.vertices || t > self.triangles || bytes > self.bytes {
             return false;
         }
@@ -291,9 +439,14 @@ impl Builder {
     /// by `finish`. An optional extension must not overflow a binding when
     /// the ordinary resident scene fits on its own.
     pub fn optional_mesh_budget(&self, storage_bytes: usize) -> MeshBudget {
-        let instances = self.instances.len() + 1;
-        let bvh_words = self.bvh.nodes.len() * super::bvh::NODE_WORDS as usize
-            + self.bvh.items.len()
+        let instances = self.instances.len();
+        let nodes: usize = self
+            .meshes
+            .iter()
+            .map(|m| Bvh::node_count(m.triangle.len()))
+            .sum();
+        let bvh_words = nodes * super::bvh::NODE_WORDS as usize
+            + self.triangles.len()
             + (instances + self.lights.len()) * (2 * super::bvh::NODE_WORDS as usize + 1);
         let fixed = (HEADER_WORDS
             + self.vertices.len() * VERTEX_WORDS as usize
@@ -335,6 +488,14 @@ impl Builder {
     }
 
     pub fn mesh(&mut self, mesh: &Mesh) -> Result<Option<u32>, String> {
+        self.mesh_keyed(mesh, |_, shape| MeshKey::Static(None, shape))
+    }
+
+    fn mesh_keyed(
+        &mut self,
+        mesh: &Mesh,
+        key: impl FnOnce(Fingerprint, Fingerprint) -> MeshKey,
+    ) -> Result<Option<u32>, String> {
         if mesh.triangles.is_empty() {
             return Ok(None);
         }
@@ -361,9 +522,18 @@ impl Builder {
         let mut mask = 0;
         let first_mask = self.materials[mesh.surfaces[0] as usize].ray_mask();
         let mut opaque = true;
-        let mut items = Vec::with_capacity(mesh.triangles.len());
-        for (k, (&tri, &mat)) in mesh.triangles.iter().zip(&mesh.surfaces).enumerate() {
-            let mut tb = Bounds::EMPTY;
+        let mut topology = Sha256::new();
+        topology.update((mesh.vertices.len() as u32).to_le_bytes());
+        topology.update(bytemuck::cast_slice::<_, u8>(&mesh.triangles));
+        let topology: Fingerprint = topology.finalize().into();
+        let mut shape = Sha256::new();
+        shape.update(topology);
+        for v in &mesh.vertices {
+            shape.update(bytemuck::bytes_of(&v.pos));
+        }
+        let shape: Fingerprint = shape.finalize().into();
+        let key = key(topology, shape);
+        for (&tri, &mat) in mesh.triangles.iter().zip(&mesh.surfaces) {
             for i in tri {
                 let p = Vec3::from_array(
                     mesh.vertices
@@ -374,13 +544,8 @@ impl Builder {
                 if !p.is_finite() || p.abs().max_element() > 1.0e7 {
                     return Err("invalid ray mesh position".into());
                 }
-                tb = tb.union(Bounds::point(p));
+                bounds = bounds.union(Bounds::point(p));
             }
-            bounds = bounds.union(tb);
-            items.push(Item {
-                id: tri_start + k as u32,
-                bounds: tb,
-            });
             let material = self.materials[mat as usize];
             let bits = material.ray_mask();
             mask |= bits;
@@ -406,14 +571,15 @@ impl Builder {
                 ]
             }));
         self.vertices.extend_from_slice(&mesh.vertices);
-        let bvh = self.bvh.build(&mut items);
         let id = self.meshes.len() as u32;
         self.meshes.push(MeshRange {
             vertex: vertex_start..self.vertices.len() as u32,
             triangle: tri_start..self.triangles.len() as u32,
             mask,
             opaque,
-            bvh,
+            key,
+            shape,
+            bvh: (0, 0),
             bounds,
         });
         Ok(Some(id))
@@ -441,19 +607,33 @@ impl Builder {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Packet {
-        let mut items: Vec<_> = self
-            .instances
-            .iter()
-            .enumerate()
-            .map(|(i, inst)| Item {
-                id: i as u32,
-                bounds: inst
-                    .transform
-                    .bounds(self.meshes[inst.mesh as usize].bounds),
-            })
-            .collect();
-        let (root, end) = self.bvh.build(&mut items);
+    pub fn chunk(&mut self, key: ChunkKey, mesh: &Mesh) -> Result<(), String> {
+        if let Some(id) = self.mesh_keyed(mesh, |_, shape| MeshKey::Static(Some(key), shape))? {
+            self.place(id, Transform::IDENTITY)?;
+        }
+        Ok(())
+    }
+
+    pub fn posed_world_mesh(
+        &mut self,
+        namespace: &'static str,
+        id: u64,
+        mesh: &Mesh,
+    ) -> Result<(), String> {
+        if let Some(id) =
+            self.mesh_keyed(mesh, |topology, _| MeshKey::Posed(namespace, id, topology))?
+        {
+            self.place(id, Transform::IDENTITY)?;
+        }
+        Ok(())
+    }
+
+    pub fn finish(self) -> Packet {
+        self.finish_cached(&mut AccelCache::default())
+    }
+
+    pub(crate) fn finish_cached(mut self, cache: &mut AccelCache) -> Packet {
+        let (bvh, (root, end), (light_root, light_end)) = cache.pack(&mut self);
         let mut words = vec![0; HEADER_WORDS];
         fn append<T: Pod>(words: &mut Vec<u32>, field: usize, data: &[T]) {
             words[field] = words.len() as u32;
@@ -490,28 +670,8 @@ impl Builder {
         let flag_bits = self.instances.iter().fold(0, |bits, inst| {
             bits | u32::from(self.meshes[inst.mesh as usize].mask)
         });
-        // Geometry trees and light trees use identical node layouts. Keep an
-        // explicit split so Vulkan can reuse ASes even when light values pulse.
-        let mut light_items: Vec<_> = self
-            .lights
-            .iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let [x, y, z, r] = l.position_range;
-                let center = Vec3::new(x, y, z);
-                let extent = Vec3::splat(r);
-                Item {
-                    id: i as u32,
-                    bounds: Bounds {
-                        min: center - extent,
-                        max: center + extent,
-                    },
-                }
-            })
-            .collect();
-        let (light_root, light_end) = self.bvh.build(&mut light_items);
-        append(&mut words, 5, &self.bvh.nodes);
-        append(&mut words, 6, &self.bvh.items);
+        append(&mut words, 5, &bvh.nodes);
+        append(&mut words, 6, &bvh.items);
         words[7] = root;
         words[8] = end;
         append(&mut words, 9, &self.lights);
@@ -534,15 +694,6 @@ pub struct Packet {
 }
 
 impl Packet {
-    /// Geometry and per-instance metadata, excluding nodes of the CPU-built
-    /// BVHs and all lighting. These bytes exactly describe Vulkan AS input.
-    pub fn same_geometry(&self, previous: &[u32]) -> bool {
-        previous.len() >= HEADER_WORDS
-            && self.words[..5] == previous[..5]
-            && self.words[HEADER_WORDS..self.words[5] as usize]
-                == previous[HEADER_WORDS..previous[5] as usize]
-    }
-
     pub fn bytes(&self) -> &[u8] {
         bytemuck::cast_slice(&self.words)
     }

@@ -678,6 +678,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_gloss(&mut h);
     exercise_streamed_bmds(&mut h);
     exercise_terrain_seam(&mut h);
+    exercise_accel_reuse(&mut h);
 }
 
 fn assert_radiance(label: &str, pixel: ([u8; 4], f32), linear: [f32; 3]) {
@@ -1319,6 +1320,130 @@ fn exercise_streamed_bmds(h: &mut Harness) {
         mirror.0[2] > 8 && mirror.0[2] < 32 && mirror.1 == both.1,
         "reflect flag lost: {mirror:?}"
     );
+}
+
+/// Change one source at a time and require both correct visibility and the
+/// appropriate acceleration action. The same fixture exercises the live
+/// renderer code on Software, the CI CPU ray-query ICD and an opt-in GPU.
+fn exercise_accel_reuse(h: &mut Harness) {
+    fn card(b: &mut Builder, z: f32, x: f32, tint: [f32; 4]) -> Mesh {
+        let mut m = Mesh::default();
+        let mat = b.surface(Surface::new(0, 0, 0., 0.));
+        let tint = rgba(tint);
+        for (dx, y) in [(-1., 1.), (1., 1.), (-1., -1.), (1., -1.)] {
+            m.vertices
+                .push(Vertex::new([x + dx, y, z], [0., 0., 1.], [0.; 2]).tint(tint, tint));
+        }
+        m.tri([0, 2, 1], mat);
+        m.tri([1, 2, 3], mat);
+        m
+    }
+    let mut cache = AccelCache::default();
+    let mut world = |order: [usize; 2], tint: [f32; 4]| {
+        let mut b = Builder::default();
+        for i in order {
+            let m = if i == 0 {
+                card(&mut b, -8., 0., tint)
+            } else {
+                card(&mut b, -6., i as f32 * 10., [1.; 4])
+            };
+            b.chunk(ChunkKey::NearTerrain(i, 0), &m).unwrap();
+        }
+        b.finish_cached(&mut cache)
+    };
+    let red = [1., 0., 0., 1.];
+    let blue = [0., 0., 1., 1.];
+    let install = |h: &mut Harness, packet| h.ray.install(Ok((packet, Textures::default())));
+    h.ray.settings.lighting = false;
+    h.ray.settings.shadows = false;
+    h.ray.settings.reflections = false;
+    h.ray.settings.progressive = false;
+    h.ray.settings.denoiser = false;
+    h.ray.settings.resolution = 100;
+    h.ray.settings.samples = 1;
+    let empty = Builder::default().finish();
+    let view = test_frame(Vec3::ZERO, -Vec3::Z, 3);
+    let panning = test_frame(Vec3::X * 0.25, -Vec3::Z, 3);
+    install(h, world([0, 1], red));
+    let before = h.pixel(view, &empty);
+    assert!(before.0[0] > 245 && before.1 > 0.);
+    let builds = h.builds();
+    assert_eq!(h.pixel(panning, &empty), before);
+    assert_eq!(
+        h.builds(),
+        builds,
+        "panning rebuilt a static acceleration structure"
+    );
+
+    install(h, world([1, 0], blue));
+    let after = h.pixel(view, &empty);
+    assert!(after.0[2] > 245 && (after.1 - before.1).abs() < 1e-6);
+    assert_eq!(
+        h.builds(),
+        builds,
+        "reordering, offsets or tint rebuilt an AS"
+    );
+
+    install(h, world([2, 0], blue));
+    assert_eq!(h.pixel(view, &empty), after);
+    if h.ray.settings.mode == Mode::Hardware {
+        assert_eq!(h.builds(), [builds[0] + 1, builds[1], builds[2] + 1]);
+    }
+    install(h, world([1, 0], blue));
+    assert_eq!(h.pixel(view, &empty), after);
+    if h.ray.settings.mode == Mode::Hardware {
+        assert_eq!(
+            h.builds(),
+            [builds[0] + 2, builds[1], builds[2] + 2],
+            "evicted geometry wasn't readmitted"
+        );
+    }
+    assert_eq!(cache.builds, [4, 3]);
+    assert_eq!(cache.refits, [0, 0]);
+
+    let mut cache = AccelCache::default();
+    let mut pose = |x, blue: bool| {
+        let mut b = Builder::default();
+        let c = if blue {
+            [0., 1., 1., 1.]
+        } else {
+            [0., 1., 0., 1.]
+        };
+        let m = card(&mut b, -4., x, c);
+        b.posed_world_mesh("fixture", 16, &m).unwrap();
+        b.finish_cached(&mut cache)
+    };
+    let first = h.pixel(view, &pose(0., false));
+    assert!(
+        first.0[1] > 245
+            && first.0[2] < 5
+            && (first.1 - depth_at(view, -4. * Vec3::Z)).abs() < 1e-6
+    );
+    let builds = h.builds();
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let refits = h.ray.hardware.as_ref().map(|rt| rt.as_refits);
+    let tinted = h.pixel(view, &pose(0., true));
+    assert!(tinted.0[1] > 245 && tinted.0[2] > 245 && (first.1 - tinted.1).abs() < 1e-6);
+    assert_eq!(h.builds(), builds, "shading attributes rebuilt an AS");
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    assert_eq!(h.ray.hardware.as_ref().map(|rt| rt.as_refits), refits);
+    assert_eq!(
+        h.pixel(view, &pose(3., true)),
+        after,
+        "moved pose still occupies the old bounds"
+    );
+    assert_eq!(
+        h.builds(),
+        builds,
+        "position-only change rebuilt AS topology"
+    );
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    if let Some(rt) = &h.ray.hardware {
+        let [a, b, c] = refits.unwrap();
+        assert_eq!(rt.as_refits, [a, b + 1, c + 1]);
+    }
+    assert_eq!(cache.builds, [1, 1]);
+    assert_eq!(cache.refits, [1, 1]);
 }
 
 fn exercise_terrain_seam(h: &mut Harness) {

@@ -14,7 +14,7 @@ use crate::{
 };
 use glam::Vec3;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Weak},
 };
 
@@ -61,6 +61,8 @@ impl std::fmt::Display for Coverage {
 }
 
 struct Asset {
+    id: usize,
+    block: (i32, i32),
     mesh: Mesh,
     surfaces: Vec<(Surface, Option<usize>)>,
     tiles: Vec<(TileKey, Arc<Tile>)>,
@@ -92,7 +94,11 @@ impl Asset {
         let y = super::super::basis(model.up);
         let x = y.cross(z).normalize_or_zero();
         let position = Vec3::from_array(model.position);
+        // Group by stable 128 m world cells, not by camera or local/extra status.
+        let [x, _, z] = objects.ornaments[id].position;
         let mut asset = Self {
+            id,
+            block: ((x / 128.).floor() as i32, (z / 128.).floor() as i32),
             mesh: Mesh::default(),
             surfaces: Vec::new(),
             tiles: Vec::new(),
@@ -204,13 +210,12 @@ impl Asset {
         Ok((!asset.mesh.triangles.is_empty()).then_some(asset))
     }
 
-    fn pack(
+    fn materials(
         &self,
-        mesh: &mut Mesh,
         builder: &mut Builder,
         bank: &mut Textures,
         addresses: &mut HashMap<TileKey, u32>,
-    ) -> Result<(), String> {
+    ) -> Result<Vec<u32>, String> {
         let mut material_ids = Vec::with_capacity(self.surfaces.len());
         for &(mut surface, tile) in &self.surfaces {
             if let Some(i) = tile {
@@ -222,12 +227,15 @@ impl Asset {
             }
             material_ids.push(builder.surface(surface));
         }
+        Ok(material_ids)
+    }
+
+    fn pack(&self, mesh: &mut Mesh, material_ids: &[u32]) {
         let base = mesh.vertices.len() as u32;
         mesh.vertices.extend_from_slice(&self.mesh.vertices);
         for (&i, &surface) in self.mesh.triangles.iter().zip(&self.mesh.surfaces) {
             mesh.tri(i.map(|i| base + i), material_ids[surface as usize]);
         }
-        Ok(())
     }
 }
 
@@ -396,7 +404,7 @@ impl Snapshot {
         storage: usize,
     ) -> Result<Coverage, String> {
         let mut addresses = HashMap::new();
-        let mut local = Mesh::default();
+        let mut chunks = BTreeMap::<_, Vec<(&Asset, Vec<u32>)>>::new();
         let mut coverage = Coverage {
             local: self.local.len(),
             outside: self.outside,
@@ -404,14 +412,22 @@ impl Snapshot {
             unavailable: self.unavailable,
             ..Coverage::default()
         };
+        let mut geometry = builder.optional_mesh_budget(storage);
         for asset in &self.local {
-            asset.pack(&mut local, builder, bank, &mut addresses)?;
+            if !geometry.debit(&asset.mesh, asset.surfaces.len()) {
+                // Required geometry still goes through, but leave no allowance
+                // for optional assets if it has exhausted the budget.
+                geometry.bytes = 0;
+            }
+            let materials = asset.materials(builder, bank, &mut addresses)?;
+            chunks
+                .entry(asset.block)
+                .or_default()
+                .push((asset, materials));
             coverage.missing_textures += asset.missing;
         }
-        builder.world_mesh(&local)?;
-        drop(local);
         let mut budget = Budget {
-            geometry: builder.optional_mesh_budget(storage),
+            geometry,
             // Keep at least half the remaining bank for posed models/effects.
             texture_bytes: storage
                 .min(MAX_TEXTURE_BYTES)
@@ -419,17 +435,29 @@ impl Snapshot {
                 / 2,
             tiles: addresses.keys().copied().collect(),
         };
-        let mut extra = Mesh::default();
         for asset in &self.extra {
             if budget.admit(asset) {
-                asset.pack(&mut extra, builder, bank, &mut addresses)?;
+                let materials = asset.materials(builder, bank, &mut addresses)?;
+                chunks
+                    .entry(asset.block)
+                    .or_default()
+                    .push((asset, materials));
                 coverage.extra += 1;
                 coverage.missing_textures += asset.missing;
             } else {
                 coverage.deferred += 1;
             }
         }
-        builder.world_mesh(&extra)?;
+        for ((x, z), mut assets) in chunks {
+            // Reprioritizing or promoting a resident from extra to local
+            // doesn't change the order/indices inside an unchanged chunk.
+            assets.sort_unstable_by_key(|(a, _)| a.id);
+            let mut mesh = Mesh::default();
+            for (asset, materials) in assets {
+                asset.pack(&mut mesh, &materials);
+            }
+            builder.chunk(scene::ChunkKey::Scenery(x, z), &mesh)?;
+        }
         Ok(coverage)
     }
 }
@@ -478,6 +506,8 @@ mod tests {
             mesh.vertices = vec![Vertex::new([0.; 3], [0., 1., 0.], [0.; 2]); 3];
             mesh.tri([0, 1, 2], 0);
             Asset {
+                id: 0,
+                block: (0, 0),
                 mesh,
                 surfaces: vec![(Surface::new(0, 0, 0., 0.), Some(0))],
                 tiles: vec![((hash, Filter::Color), tile.clone())],

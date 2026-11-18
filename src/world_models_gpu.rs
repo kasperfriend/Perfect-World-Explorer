@@ -836,6 +836,7 @@ impl World {
     ) -> (
         impl Iterator<
                 Item = (
+                    u64,
                     &crate::model_asset::ModelAsset,
                     &[crate::model_asset::PosedMesh],
                 ),
@@ -852,7 +853,8 @@ impl World {
             .instances
             .iter()
             .zip(&self.slots)
-            .filter_map(move |(i, slot)| {
+            .enumerate()
+            .filter_map(move |(owner, (i, slot))| {
                 let p = i.placement.position;
                 if !cutoff_residency::contains(bounds, p)
                     || slot.failed
@@ -863,7 +865,7 @@ impl World {
                     return None;
                 }
                 let pose = slot.posed.as_ref()?.as_ref().ok()?;
-                Some((&assets[i.asset], pose.meshes.as_slice()))
+                Some((owner as u64, &assets[i.asset], pose.meshes.as_slice()))
             });
         (poses, &self.effect_quads, &self.ray_lights, &mut *self.read)
     }

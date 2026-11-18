@@ -35,3 +35,7 @@ cargo test --locked --bin perfect-world-explorer lighter_vulkan_interop_on_cpu -
 ```
 
 The ring test fills all three slots before consuming them, rejects an extra request, then reuses the slots and checks pixels from an unaligned BGRA target. The viewer test presents through the real winit event loop to a virtual X11 display and verifies later-frame world captures before and after a window resize. The explicit preview test opens the PNG and checks its dimensions and contents. The Vulkan suite checks deferred initialization/replacement and color/depth after resize in addition to the existing ray tests. These are synthetic correctness checks, not frame-rate, physical-GPU or real-map results.
+
+## Verification record
+
+2026-11-18 — [Linux PR checks](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44388766800/job/135100467892) passed the Step 1 suite at `ce9c9c3`. The virtual X11 viewer presented and saved a 160×96 world PNG and a 192×112 PNG after resize. The explicit headless Software path wrote a non-uniform 960×720 PNG. The ring, multi-batch mask upload, Software and CPU Vulkan ray-query pixel tests also passed. The same [PR run](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44388766800) built the standalone Windows x64 viewer and uploaded, re-downloaded and audited the portable package. No real client maps or physical GPU timing were used for these checks.

@@ -180,6 +180,7 @@ fn part_visibility(
 }
 
 struct RenderModel<'a> {
+    ray_owner: u64,
     part: ModelPart,
     asset: &'a ModelAsset,
     poses: &'a [PosedMesh],
@@ -208,11 +209,13 @@ fn render_models<'a>(
     let assembly = &character.assembly;
     let mut models = Vec::with_capacity(4 + assembly.weapons.len());
     models.push(RenderModel {
+        ray_owner: 0,
         part: ModelPart::Body,
         asset: &assembly.body,
         poses: &meshes.body,
     });
     models.push(RenderModel {
+        ray_owner: 1,
         part: ModelPart::Face,
         asset: &assembly.face,
         poses: &meshes.face,
@@ -222,8 +225,10 @@ fn render_models<'a>(
             .weapons
             .iter()
             .zip(&meshes.weapons)
-            .filter(|(_, posed)| !posed.is_empty())
-            .map(|(weapon, posed)| RenderModel {
+            .enumerate()
+            .filter(|(_, (_, posed))| !posed.is_empty())
+            .map(|(index, (weapon, posed))| RenderModel {
+                ray_owner: 4 + index as u64,
                 part: ModelPart::Weapon {
                     // HH_qiu is also a native right-hand hanger (Psychic
                     // soulspheres); only the explicit left hook is left-hand.
@@ -239,6 +244,7 @@ fn render_models<'a>(
             .as_ref()
             .ok_or("flight meshes have no asset")?;
         models.push(RenderModel {
+            ray_owner: 2,
             part: ModelPart::Flight,
             asset: &flight.asset,
             poses: &meshes.flight,
@@ -250,6 +256,7 @@ fn render_models<'a>(
             .as_ref()
             .ok_or("mount meshes have no asset")?;
         models.push(RenderModel {
+            ray_owner: 3,
             part: ModelPart::Mount,
             asset: &mount.asset,
             poses: &meshes.mount,
@@ -1127,6 +1134,7 @@ impl Walker {
             if !matches!(visible, PartVisibility::Hidden) {
                 out.model(
                     "walker",
+                    model.ray_owner,
                     model.asset,
                     model.poses,
                     |skin| !matches!(visible, PartVisibility::BodyWithoutHead) || skin != 1,
