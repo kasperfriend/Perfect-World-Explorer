@@ -29,9 +29,9 @@ CLASSES = {"city", "forest", "open_distance", "water", "cave_instance", "effects
 CONDITIONS = {"day": (12, "Clear"), "night": (0, "Clear"), "rain": (12, "Rain")}
 MATCH_KEYS = (
     "map", "eye", "yaw", "pitch", "image", "far", "fov_y", "hour", "weather",
-    "warmup_frames", "warmup_step_ms", "cutoff", "scenery_quality", "reflection",
-    "fog", "effects", "cloud_detail", "bloom", "lightmaps", "area_grass_lightmaps",
-    "adapter",
+    "warmup_frames", "warmup_step_ms", "animation_elapsed_ms", "cutoff", "scenery_quality",
+    "reflection", "fog", "effects", "cloud_detail", "bloom", "lightmaps", "area_grass_lightmaps",
+    "rain_at_eye", "weather_ticks", "adapter",
 )
 REGIONS = {
     "whole": (0, 0, 1, 1),
@@ -44,8 +44,8 @@ REGIONS = {
 
 def metadata(path):
     fields = dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
-    if fields.get("coverage_schema") != "2":
-        raise ValueError(f"{path}: expected matched capture schema 2")
+    if fields.get("coverage_schema") != "3":
+        raise ValueError(f"{path}: expected matched capture schema 3")
     return fields
 
 
@@ -56,8 +56,8 @@ def validate_match(baseline, candidate):
     # Native has no ray settings. Software and Hardware must use exactly the
     # same effective transport parameters, including ray resolution.
     if "Off" not in (baseline["mode"], candidate["mode"]):
-        strip_mode = lambda m: re.sub(r"mode: \w+, ", "", m["settings_effective"], count=1)
-        if strip_mode(baseline) != strip_mode(candidate):
+        a, b = (re.sub(r"mode: \w+, ", "", m["settings_effective"], count=1) for m in (baseline, candidate))
+        if a != b:
             raise ValueError("Software and Hardware have different effective settings")
 
 
@@ -96,8 +96,11 @@ def compare(a, b, custom=None):
 def capture_metadata(stem, mode, case, profile):
     meta = metadata(stem.with_suffix(".coverage.txt"))
     if (json.loads(meta["map"]) != case["map"] or meta["mode"].lower() != mode
-            or (float(meta["hour"]), meta["weather"].capitalize()) != CONDITIONS[case["condition"]]
+            or (float(meta["hour"]), meta["weather"]) != CONDITIONS[case["condition"]]
             or int(meta["warmup_frames"]) != case["warmup"]
+            or int(meta["warmup_step_ms"]) != 16
+            or int(meta["animation_elapsed_ms"]) != 16 * case["warmup"]
+            or (meta["rain_at_eye"] == "true") != (case["condition"] == "rain")
             or (meta["lightmaps"] == "true") != case["lightmaps"]):
         raise ValueError(f"{stem.name}: capture doesn't match the case")
     adapter = meta["adapter"]
@@ -136,6 +139,21 @@ def inventory_for(stem, case):
     return rows
 
 
+def gpu_stage_samples(path):
+    """Optional GPU counters, separate from synchronized wall time."""
+    samples = []
+    with path.open(encoding="utf-8", errors="replace") as log:
+        for line in log:
+            fields = line.strip().split()
+            if fields[:3] == ["Lighter", "gpu", "stage"] and len(fields) > 4:
+                sample = {"stage_source": fields[3].rstrip(":")}
+                for key, value in (token.split("=", 1) for token in fields[4:] if "=" in token):
+                    if value != "raw-vulkan":
+                        sample[key] = int(value) if key.endswith("_bytes") else float(value)
+                samples.append(sample)
+    return samples
+
+
 def run_case(case, args):
     name = case["id"]
     if not re.fullmatch(r"[a-z0-9-]+", name):
@@ -161,20 +179,31 @@ def run_case(case, args):
         cmd.append(str(stem.with_suffix(".png").resolve()))
         path = stem.with_suffix(".log")
         print(f"{name}: {mode}", flush=True)
-        with path.open("wb") as log:
-            proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout)
-        if proc.returncode != 0:
+        try:
+            with path.open("wb") as log:
+                proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout)
+            if proc.returncode != 0:
+                raise RuntimeError(f"viewer exited {proc.returncode}")
+        except (RuntimeError, subprocess.TimeoutExpired) as error:
             tail = "\n".join(path.read_text(errors="replace").splitlines()[-12:])
-            raise RuntimeError(f"{stem.name}: viewer exited {proc.returncode}\n{tail}")
+            raise RuntimeError(f"{stem.name}: {error}\n{tail}") from error
         meta, images[mode] = capture_metadata(stem, mode, case, profile)
         rows = inventory_for(stem, case) if mode != "off" else None
         timings = json.loads(meta.get("synchronized_capture_ms", "[]"))
+        if len(timings) != args.timed_frames or any(not math.isfinite(t) or t < 0 for t in timings):
+            raise ValueError(f"{stem.name}: invalid synchronized timing samples")
         durations = None if not timings else {
             "samples": timings,
             "p50": statistics.median(timings),
             "p95": sorted(timings)[math.ceil(0.95 * len(timings)) - 1],
         }
-        mode_results[mode] = {"files": stem.name, "meta": meta, "inventory": rows, "synchronized_capture_ms": durations}
+        mode_results[mode] = {
+            "files": stem.name,
+            "meta": meta,
+            "inventory": rows,
+            "synchronized_capture_ms": durations,
+            "gpu_stage_samples": gpu_stage_samples(path),
+        }
     comparisons = {}
     for first, second in combinations(PROFILES[profile], 2):
         validate_match(mode_results[first]["meta"], mode_results[second]["meta"])
@@ -201,8 +230,11 @@ def main():
     covered = {(cls, case["condition"]) for case in cases for cls in case["classes"]}
     missing = sorted({(cls, condition) for cls in CLASSES for condition in CONDITIONS} - covered)
     complete = not missing and args.profile == "physical"
-    if args.require_complete and not complete:
-        parser.error(f"physical matrix is incomplete: profile={args.profile}, missing cells={missing}")
+    if args.require_complete:
+        if not complete:
+            parser.error(f"physical matrix is incomplete: profile={args.profile}, missing cells={missing}")
+        if args.timed_frames < 3:
+            parser.error("complete physical runs need at least three --timed-frames per mode")
     args.output.mkdir(parents=True, exist_ok=True)
     if any(args.output.iterdir()):
         parser.error(f"use a fresh output directory: {args.output}")
@@ -210,27 +242,36 @@ def main():
               "profile": args.profile, "declared_physical_matrix_complete": complete, "missing_scene_conditions": missing,
               "metric": "mean absolute difference of encoded RGB8 pixel channels (lower is closer, not a pass threshold)",
               "cases": []}
-    try:
-        for case in cases:
+    report["errors"] = {}
+    prefix = "::notice::" if os.environ.get("GITHUB_ACTIONS") == "true" else ""
+    for case in cases:
+        try:
             result = run_case(case, args)
-            report["cases"].append(result)
-            software = result["captures"]["software"]
-            metrics = result["comparisons"]["off-vs-software"]
-            bmd = software["inventory"]["buildings"]
-            roots = software["inventory"]["effect_roots"]
-            summary = ", ".join(f"{key}:{r['mean_abs_rgb8']:.3f}" for key, r in metrics.items())
-            prefix = "::notice::" if os.environ.get("GITHUB_ACTIONS") == "true" else ""
-            print(f"{prefix}{case['id']} RGB8 MAE {summary}; ray BMD {bmd['loaded']}/{bmd['skipped']}/{bmd['failed']}; "
-                  f"GFX roots {roots['loaded']}/{roots['skipped']}/{roots['failed']}; "
-                  f"eye {software['meta']['eye']} yaw {software['meta']['yaw']} pitch {software['meta']['pitch']}", flush=True)
-            if len(report["cases"]) == 1:
-                print(f"{prefix}{software['meta']['adapter']}", flush=True)
-    except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired, KeyError) as error:
-        report["error"] = str(error)
-        raise SystemExit(str(error)) from error
-    finally:
-        report["declared_physical_matrix_complete"] = complete and "error" not in report
-        (args.output / "matrix.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        except (ValueError, RuntimeError, OSError, KeyError) as error:
+            report["errors"][case["id"]] = str(error)
+            print(f"{case['id']}: {error}", flush=True)
+            continue
+        report["cases"].append(result)
+        software = result["captures"]["software"]
+        metrics = result["comparisons"]["off-vs-software"]
+        bmd = software["inventory"]["buildings"]
+        roots = software["inventory"]["effect_roots"]
+        summary = ", ".join(f"{key}:{r['mean_abs_rgb8']:.3f}" for key, r in metrics.items())
+        timing = "; ".join(f"{mode} p50/p95 {t['p50']:.1f}/{t['p95']:.1f} ms"
+                           for mode, data in result["captures"].items()
+                           if (t := data["synchronized_capture_ms"]) is not None)
+        print(f"{prefix}{case['id']} RGB8 MAE {summary}; ray BMD {bmd['loaded']}/{bmd['skipped']}/{bmd['failed']}; "
+              f"GFX roots {roots['loaded']}/{roots['skipped']}/{roots['failed']}; "
+              f"eye {software['meta']['eye']} yaw {software['meta']['yaw']} pitch {software['meta']['pitch']}; "
+              f"{timing or 'no synchronized timing requested'}", flush=True)
+        if len(report["cases"]) == 1:
+            print(f"{prefix}{software['meta']['adapter']}", flush=True)
+    report["declared_physical_matrix_complete"] = complete and not report["errors"] and args.timed_frames >= 3
+    (args.output / "matrix.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if report["errors"]:
+        message = f"Failed capture cases: {', '.join(report['errors'])}; retained partial evidence in matrix.json"
+        print(f"{'::error::' if prefix else ''}{message}", flush=True)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

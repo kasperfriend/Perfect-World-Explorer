@@ -39,7 +39,8 @@ class CaptureMatrixTests(unittest.TestCase):
             image.save(path)
             sidecar = stem.with_suffix(".coverage.txt")
             sidecar.write_text(
-                'coverage_schema=2\nmap="a07"\nmode=Hardware\nhour=12\nweather=Clear\nwarmup_frames=12\nlightmaps=false\n'
+                'coverage_schema=3\nmap="a07"\nmode=Hardware\nhour=12\nweather=Clear\nwarmup_frames=12\nlightmaps=false\n'
+                'animation_elapsed_ms=192\nwarmup_step_ms=16\nrain_at_eye=false\n'
                 'image=9x9\nadapter=AdapterInfo { device_type: Cpu, backend: Vulkan }\n'
                 f'rgba8_sha256={hashlib.sha256(image.tobytes()).hexdigest()}\n', encoding="utf-8"
             )
@@ -53,6 +54,20 @@ class CaptureMatrixTests(unittest.TestCase):
             image.save(path)
             with self.assertRaisesRegex(ValueError, "RGBA8 hash disagrees"):
                 matrix.capture_metadata(stem, "hardware", case, "physical")
+
+    def test_gpu_stages_keep_gpu_time_separate_from_capture_wall_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "capture.log"
+            log.write_text(
+                "Lighter gpu stage Software: traversal_ms=10.200 filter_ms=1.900\n"
+                "Lighter gpu stage Vulkan: build_ms=1.100 traversal_ms=2.300 allocation_bytes=10 budget_bytes=100\n"
+                "Lighter gpu stage Hardware: traversal_ms=raw-vulkan filter_ms=0.500\n",
+                encoding="utf-8",
+            )
+            a, b, c = matrix.gpu_stage_samples(log)
+        self.assertEqual(a, {"stage_source": "Software", "traversal_ms": 10.2, "filter_ms": 1.9})
+        self.assertEqual(b["allocation_bytes"], 10)
+        self.assertEqual(c, {"stage_source": "Hardware", "filter_ms": 0.5})
 
 
 if __name__ == "__main__":

@@ -19,10 +19,20 @@ transient actor/particle state. The old window retires only after a usable
 present; failures are logged and a replacement does not recursively restart
 if its own device is lost. Ordinary surface loss/resize does not take this path.
 
-Validation: `b95089b` passed the fresh-device 960×720 Software preview after
-an explicit wgpu destroy/lost callback (including the admitted BMD), camera
-snapshot round-trip and wrong-map rejection, Software/Native dispatch in the
-streamed fixture, and Vulkan-query → Software → Vulkan-query with resized
-color and depth on Mesa 25.0.7. CI's Xvfb test additionally covers Software
-at 160×96, then Software/Native/Software at 192×112. This does not simulate a
-physical driver reset or validate third-party frame generation on a ray scene.
+Validation:
+
+- `b95089b` passed the fresh-device 960×720 Software preview after an explicit
+  wgpu destroy/lost callback (including the admitted BMD), camera snapshot
+  round-trip and wrong-map rejection, Software/Native dispatch in the streamed
+  fixture, and Vulkan-query → Software → Vulkan-query with resized color and
+  depth on Mesa 25.0.7.
+- [Linux CI on `ed2cb1e`](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44423387785)
+  passed the Xvfb test: Software at 160×96; Software/Native/Software at
+  192×112; then explicit device destruction and a fresh **replacement process**
+  that presented with the same fixture map, camera, hour and Lighter settings.
+  Failure to open the requested map or initialize its device cannot report
+  readiness through a main-world fallback. The test regenerates fixture
+  assets in the child; it is not a retail map-load stress test.
+
+Neither test injects a physical driver reset or validates vendor frame
+interpolation on ray scenes.

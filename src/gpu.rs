@@ -1875,6 +1875,9 @@ struct Renderer {
     water_batches: Vec<WaterBatch>,
     visible_water_batches: Vec<WaterBatch>,
     started: Instant,
+    // Audited headless runs advance only by the fixed logic step; water and
+    // preview wind must not depend on renderer speed when comparing modes.
+    capture_elapsed_ms: Option<u64>,
     wind_last: Instant,
     /// Snapshot computed once by `render()`; secondary views reuse it.
     frame: FrameSnapshot,
@@ -2673,6 +2676,7 @@ impl Renderer {
             water_batches: m.water_batches,
             visible_water_batches: Vec::new(),
             started: Instant::now(),
+            capture_elapsed_ms: None,
             frame: FrameSnapshot::default(),
             frame_budget: FrameBudget::default(),
             scene_passes: 1,
@@ -2846,8 +2850,13 @@ impl Renderer {
             self.world_glow.brightness_fade(),
             camera.bloom_opacity_fade,
         );
-        let elapsed = self.started.elapsed().as_secs_f32();
-        let elapsed64 = self.started.elapsed().as_secs_f64();
+        let elapsed64 = if let Some(ms) = &mut self.capture_elapsed_ms {
+            *ms += u64::from(camera.logic_delta_ms);
+            *ms as f64 / 1_000.
+        } else {
+            self.started.elapsed().as_secs_f64()
+        };
+        let elapsed = elapsed64 as f32;
         let direction = camera.direction();
         let daylight = crate::environment::daylight(camera.time_of_day);
         let angle = (camera.time_of_day - 6.0) * std::f32::consts::PI / 12.0;
@@ -8339,6 +8348,7 @@ fn preview_frame(
     let mut renderer = Renderer::new(
         device, queue, fmt, width, height, mesh, &mut t, false, lighter,
     )?;
+    renderer.capture_elapsed_ms = audit.map(|_| 0);
     if let Some(error) = renderer.lighter.error() {
         return Err(error.into());
     }
@@ -8531,15 +8541,16 @@ fn preview_frame(
             .map(|block| block.critters.len())
             .sum::<usize>();
         let mut meta = format!(
-            "coverage_schema=2\nmap={:?}\nmode={mode:?}\nrgba8_sha256={digest:x}\nimage={width}x{height}\n\
-             eye={:?}\nyaw={}\npitch={}\nfar={}\nfov_y={}\nhour={}\nweather={}\nwarmup_frames={warmup}\nwarmup_step_ms=16\n\
+            "coverage_schema=3\nmap={:?}\nmode={mode:?}\nrgba8_sha256={digest:x}\nimage={width}x{height}\n\
+             eye={:?}\nyaw={}\npitch={}\nfar={}\nfov_y={}\nhour={}\nweather={}\nwarmup_frames={warmup}\nwarmup_step_ms=16\nanimation_elapsed_ms={}\n\
              cutoff={}\nscenery_quality={}\nsettings={:?}\nsettings_effective={:?}\nadapter={info:?}\ncritters_authored_not_in_world_model_feed={critters}\n\
-             reflection={}\nfog={}\neffects={}\ncloud_detail={}\nbloom={}\nlightmaps={}\narea_grass_lightmaps={}\n",
+             reflection={}\nfog={}\neffects={}\ncloud_detail={}\nbloom={}\nlightmaps={}\narea_grass_lightmaps={}\nrain_at_eye={}\nweather_ticks={}\n",
             t.map.id, cam.pos.to_array(), cam.yaw, cam.pitch, cam.far, CAMERA_FOV_Y_RADIANS, cam.time_of_day,
-            cam.weather_override.token(), renderer.detail.terrain_cutoff,
+            cam.weather_override.token(), renderer.capture_elapsed_ms.unwrap_or_default(), renderer.detail.terrain_cutoff,
             renderer.detail.scenery_quality, renderer.lighter.settings, renderer.lighter.settings.effective(),
             cam.water_reflections, cam.atmospheric_fog, cam.world_effects, cam.cloud_detail,
             cam.bloom, cam.terrain_lightmaps, cam.area_grass_lightmaps,
+            renderer.frame.weather.rain && cam.underwater_depth <= 0., renderer.frame.weather_ticks,
         );
         if mode == LighterMode::Off {
             let effects = renderer

@@ -1189,6 +1189,7 @@ fn lighter_coverage_fixture_capture() {
     );
     let meta = std::fs::read_to_string(path.with_extension("coverage.txt")).unwrap();
     assert!(meta.contains("map=\"lighter-fixture\"\n") && meta.contains("warmup_frames=2\n"));
+    assert!(meta.contains("animation_elapsed_ms=32\n"));
     for field in [
         "mip_fallback",
         "mip_generated",

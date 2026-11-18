@@ -255,11 +255,12 @@ These are separate from missing textures. Masks contribute to generated counts.
 
 ## Capture geometry coverage
 
-Set `PW_PREVIEW_COVERAGE=1` with an explicit Software or Hardware headless
-preview. Explorer writes the PNG and its per-map `coverage.csv` and
-`coverage.txt` sidecars. A failed selected map is not silently replaced with
-`world`. [Coverage guide](scene-coverage.md) explains the row units, skip and
-failure reasons, fixture, and how to run this on a matching retail client.
+Set `PW_PREVIEW_COVERAGE=1` for a headless preview. Explorer writes the PNG and
+its `coverage.txt` sidecar; Software and Hardware also write ray inventory to
+`coverage.csv`. `PW_PREVIEW_LIGHTER=off` captures the matched Native baseline.
+A failed selected map is not silently replaced with `world`. The [coverage guide](scene-coverage.md)
+explains the inventory and [retail matrix](retail-matrix.md) explains the
+matched settings, regional comparisons and device gates.
 
 ## Verification
 

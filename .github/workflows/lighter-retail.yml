@@ -76,7 +76,7 @@ jobs:
           "$py" tools/lighter_capture_matrix.py \
             --profile cpu --manifest tools/fixtures/lighter-retail-scenes.json \
             --viewer target/debug/perfect-world-explorer --client "$RUNNER_TEMP/lighter-client" \
-            --output target/lighter-retail
+            --output target/lighter-retail --ray-resolution 25 --timed-frames 3
       - uses: actions/upload-artifact@v4
         if: always()
         with:

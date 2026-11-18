@@ -52,8 +52,7 @@
       "id": "a02-day",
       "map": "a02",
       "classes": [
-        "cave_instance",
-        "open_distance"
+        "cave_instance"
       ],
       "condition": "day",
       "camera": [
@@ -74,8 +73,7 @@
       "id": "a02-night",
       "map": "a02",
       "classes": [
-        "cave_instance",
-        "open_distance"
+        "cave_instance"
       ],
       "condition": "night",
       "camera": [
@@ -96,8 +94,7 @@
       "id": "a02-rain",
       "map": "a02",
       "classes": [
-        "cave_instance",
-        "open_distance"
+        "cave_instance"
       ],
       "condition": "rain",
       "camera": [
@@ -132,6 +129,9 @@
       "lightmaps": false,
       "min_loaded": {
         "water": 1
+      },
+      "authored_totals": {
+        "water": 1
       }
     },
     {
@@ -152,6 +152,9 @@
       "lightmaps": false,
       "min_loaded": {
         "water": 1
+      },
+      "authored_totals": {
+        "water": 1
       }
     },
     {
@@ -171,6 +174,9 @@
       "warmup": 12,
       "lightmaps": false,
       "min_loaded": {
+        "water": 1
+      },
+      "authored_totals": {
         "water": 1
       }
     }
