@@ -976,6 +976,14 @@ pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
         );
         assert_eq!(
             (
+                coverage.resident_chunks,
+                coverage.catalog_chunks,
+                coverage.estimated_bounds
+            ),
+            (local + extra, 1, 0)
+        );
+        assert_eq!(
+            (
                 coverage.missing_textures,
                 coverage.deferred,
                 coverage.unavailable
@@ -1010,6 +1018,78 @@ pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
         transmit_only,
         reflect_only,
     }
+}
+
+pub(crate) fn joined_bmd_packets(storage: usize) -> [Scene; 4] {
+    let root = FixtureRoot::new();
+    let facade = |x0, x1| {
+        let mut b = bmd_header([128., 0., -5.], 1);
+        bmd_quad(
+            &mut b,
+            [[x0, 1., 0.], [x1, 1., 0.], [x0, 5., 0.], [x1, 5., 0.]],
+            [0., 0., 1.],
+            "",
+        );
+        b
+    };
+    crate::pck::write_test_archive(
+        &root.0.join("litmodels.pck"),
+        &[
+            ("litmodels/a01/left.bmd", &facade(-4., 0.)),
+            ("litmodels/a01/right.bmd", &facade(0., 4.)),
+        ],
+    );
+    let ornaments = [(-1., "left.bmd"), (1., "right.bmd")]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (dx, path))| crate::scene::Ornament {
+            export_id: i as u32,
+            path: path.into(),
+            position: [128. + dx, 2., 0.],
+            ..ornament_record()
+        })
+        .collect::<Vec<_>>();
+    let mut objects = crate::objects::Objects::open(&root.0, ornaments).unwrap();
+    let mut stream = super::SceneryStream::default();
+    let mut cache = super::AccelCache::default();
+    let mut install = |local: &[usize], x, counts: (usize, usize, usize)| {
+        objects.load_ids(local).unwrap();
+        let snapshot = stream
+            .prepare(&mut objects, local, [x, 0.], 32., None, &[])
+            .unwrap();
+        let mut builder = super::Builder::default();
+        let mut bank = super::Textures::default();
+        let stats = snapshot.append(&mut builder, &mut bank, storage).unwrap();
+        assert_eq!((stats.local, stats.extra, stats.outside), counts);
+        assert_eq!((stats.catalog_chunks, stats.estimated_bounds), (2, 0));
+        let packet = builder.finish_cached(&mut cache);
+        assert_eq!(packet.triangles(), (counts.0 + counts.1) * 2);
+        assert_eq!(packet.instances.len(), stats.resident_chunks);
+        if stats.resident_chunks != 0 {
+            assert_eq!(
+                packet
+                    .meshes
+                    .iter()
+                    .map(|m| m.key)
+                    .map(|key| match key {
+                        super::MeshKey::Static(Some(chunk), _) => chunk,
+                        _ => panic!("missing chunk owner"),
+                    })
+                    .collect::<Vec<_>>(),
+                [
+                    super::ChunkKey::Scenery(0, 0),
+                    super::ChunkKey::Scenery(1, 0)
+                ]
+            );
+        }
+        (packet, bank)
+    };
+    [
+        install(&[0, 0], 127.5, (1, 1, 0)),
+        install(&[1], 128.5, (1, 1, 0)),
+        install(&[], -1600., (0, 0, 2)),
+        install(&[], 128., (0, 2, 0)),
+    ]
 }
 
 #[test]

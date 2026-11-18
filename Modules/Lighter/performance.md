@@ -74,3 +74,16 @@ checks. Times are milliseconds on that runner:
 The test keeps much of the larger scene off-screen. Cached packing grew with
 geometry count; the warmed frame changed much less at this fixed ray count.
 These are not map-specific before/after or physical-GPU results.
+
+## Interactive reprojection (Step 5)
+
+[2026-11-18 Linux run 44396201690](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44396201690/job/135126621971)
+passed on Software and CPU Vulkan ray queries. The tests check the 1 spp / one
+bounce / 50% defaults, the exponential 10% new-sample weight after ten samples,
+and unchanged current-frame depth. A four-pixel shader fixture shifts history
+by one texel, accepts two neighbors with matching guides, rejects a mismatched
+depth and rejects a viewport exit. Camera cuts reset history, including gradual
+drift beyond one ray pixel from the last reset. The lighting fixture also
+checks camera movement out of a penumbra, changes to an off-camera caster and
+light-only edits. The two ping-pong history buffers and both directions of
+postprocessor bindings are retained after warm-up. These are synthetic tests.

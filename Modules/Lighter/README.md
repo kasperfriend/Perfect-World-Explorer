@@ -59,23 +59,33 @@ installed manifests (the repository's `Modules` directory). Settings live in
 ### Static scenery residency
 
 Lighter consumes BMD meshes and source textures from the native archive
-resolver, not from the raster atlas. It retains the native local ornaments and
-also requests BMDs within **768 world units horizontally** of the installed
-terrain block center. Selection does not depend on camera direction. The
-original-game terrain cutoff still clips placement residency to the installed
-terrain window. Raster map views and the native renderer use their existing
-scenery selection.
+resolver, not from the raster atlas. The map's BMD manifest assigns each
+ornament a stable **128-world-unit owner cell**. Decoded vertices produce
+exact bounds even if they run into another cell; an undecoded placement starts
+with an estimated ±64-unit box and a warning. Very large or offset assets can
+extend past that estimate until first decoded. Terrain has separate near-block
+and far-patch keys with bounds from the heightfield.
 
-The extension admits no more than 512 candidates, nearest first, with separate
-16 MiB budgets for packed geometry (including conservative BVH overhead) and
-additional texture tiles. Available adapter storage can reduce it further; at
-insertion, no more than half of the remaining texture-bank room goes to the
-extension. Source data for unchanged resident BMDs is reused on the CPU. This
-is not whole-map residency or a guarantee against off-screen omissions: bounds
-are based on placement origins, not receiver/light reach or model bounds, and
-the static acceleration structures are still rebuilt for a new packet. The
-**Lighter** menu reports local and extended placements, range/cutoff exclusions,
-budget deferrals, unavailable models and missing texture references.
+Native local ornaments always have priority. Extra placements are ranked by
+distance to the installed block, distance to the local receiver region, and
+whether they overlap a static point-light path to that region. The secondary
+reach is **768 world units beyond the receiver region**, with a coarse corridor
+for each of up to 32 nearby static lights. The corridors are ranking hints,
+not visibility tests. Sun and runtime lights are not used for ranking.
+View direction and motion within one block do not change the rank. Terrain
+cutoff still checks placement anchors against the installed window. Raster
+map views and the native renderer use their existing scenery selection.
+
+The extension considers up to 512 ranked placements, with separate 16 MiB
+budgets for packed geometry (including conservative BVH overhead) and extra
+texture tiles. Available adapter storage can reduce it further; at insertion,
+no more than half of the remaining texture-bank room goes to the extension.
+Unchanged resident chunk geometry retains matching software trees and Vulkan
+BLAS across streams; evicted geometry does not accumulate in the cache. The
+**Lighter** menu shows catalog and resident chunks, estimated bounds, local
+and extended placements, range/cutoff exclusions, budget deferrals, unavailable
+models and missing texture references. A whole-map manifest does not mean
+that all of the geometry on the map is resident at once.
 
 For the remaining work across terrain, models, textures, vegetation, water,
 lighting and verification, see the [full ray-tracing checklist](TODO.md).

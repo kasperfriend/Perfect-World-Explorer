@@ -12,7 +12,9 @@ mod readback;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 #[cfg(test)]
-pub(crate) use lighter_host::tests::{stitched_terrain_scene, streamed_bmd_scenes};
+pub(crate) use lighter_host::tests::{
+    joined_bmd_packets, stitched_terrain_scene, streamed_bmd_scenes,
+};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -1517,7 +1519,14 @@ fn build(
             ((bx as f32 + 0.5) * TILE as f32 - t.width as f32 * 0.5) * t.grid_spacing,
             (t.height as f32 * 0.5 - (by as f32 + 0.5) * TILE as f32) * t.grid_spacing,
         ];
-        stream.prepare(&mut t.objects, &ornament_ids, center, resident_bounds)
+        stream.prepare(
+            &mut t.objects,
+            &ornament_ids,
+            center,
+            crate::scenery_visibility::ornament_distance(detail.scenery_quality),
+            resident_bounds,
+            &t.scene_lights.lights,
+        )
     });
     // Keep opaque indices separate so water can sample reflected/refracted scene passes.
     let water_start = indices.len() as u32;

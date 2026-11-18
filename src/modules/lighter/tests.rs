@@ -678,6 +678,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_temporal_animation(&mut h);
     exercise_gloss(&mut h);
     exercise_streamed_bmds(&mut h);
+    exercise_bmd_chunk_join(&mut h);
     exercise_terrain_seam(&mut h);
     exercise_accel_reuse(&mut h);
     exercise_resource_reuse(&mut h);
@@ -1667,6 +1668,41 @@ fn exercise_chunk_scaling(h: &mut Harness) {
             ""
         };
         eprintln!("{notice}Lighter {:?}, {count} chunks ({} triangles), {SIDE}x{SIDE}: median CPU pack {:.3} ms, synchronized frame {:.3} ms", h.ray.settings.mode, count * 32, pack_ms[2], frame_ms[4]);
+    }
+}
+
+fn exercise_bmd_chunk_join(h: &mut Harness) {
+    h.ray.settings.bounces = 0;
+    h.ray.settings.reflections = false;
+    h.ray.settings.shadows = false;
+    let empty = Builder::default().finish();
+    let scenes = crate::gpu::joined_bmd_packets(storage_limit(&h.device));
+    let mut first = None;
+    let mut previous_builds = h.builds();
+    for (i, scene) in scenes.into_iter().enumerate() {
+        h.ray.install(Ok(scene));
+        let row = [127.8, 128., 128.2].map(|x| {
+            let frame = test_frame(Vec3::new(x, 3., 0.), Vec3::NEG_Z, 9);
+            let p = h.pixel(frame, &empty);
+            if i == 2 {
+                assert_eq!(p.1, 0., "teleport left a BMD resident");
+            } else {
+                assert_eq!(p.0, [255; 4], "gap at BMD chunk join x={x}");
+                assert!((p.1 - depth_at(frame, Vec3::new(x, 3., -5.))).abs() < 1e-5);
+            }
+            p
+        });
+        match i {
+            0 => first = Some(row),
+            1 => assert_eq!(
+                h.builds(),
+                previous_builds,
+                "promotion rebuilt the same BMD chunks"
+            ),
+            2 => {}
+            _ => assert_eq!(Some(row), first, "return teleport changed the join"),
+        }
+        previous_builds = h.builds();
     }
 }
 

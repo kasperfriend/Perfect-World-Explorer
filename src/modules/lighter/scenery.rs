@@ -10,6 +10,7 @@ use crate::{
     },
     objects::{Objects, SdrUvAnim},
     scene::Ornament,
+    scene_lights::SceneLight,
     scenery_visibility::Visibility,
 };
 use glam::Vec3;
@@ -18,7 +19,10 @@ use std::{
     sync::{Arc, Weak},
 };
 
-const REACH: f32 = 768.;
+#[path = "scenery_manifest.rs"]
+mod manifest;
+use manifest::{ChunkId, Manifest, Query};
+
 const EXTRA_PLACEMENTS: usize = 512;
 const EXTRA_GEOMETRY_BYTES: usize = 16 << 20;
 const EXTRA_TEXTURE_BYTES: usize = 16 << 20;
@@ -28,6 +32,7 @@ type TileKey = (u64, Filter);
 #[derive(Default)]
 pub(in crate::gpu) struct SceneryStream {
     catalog: Option<Arc<[Ornament]>>,
+    manifest: Manifest,
     assets: HashMap<usize, Option<Arc<Asset>>>,
     tiles: HashMap<TileKey, Weak<Tile>>,
 }
@@ -38,6 +43,8 @@ pub(in crate::gpu) struct Snapshot {
     outside: usize,
     deferred: usize,
     unavailable: usize,
+    catalog_chunks: usize,
+    estimated_bounds: usize,
 }
 
 #[derive(Default, Clone, Copy, Debug)]
@@ -48,21 +55,25 @@ pub(in crate::gpu) struct Coverage {
     pub deferred: usize,
     pub unavailable: usize,
     pub missing_textures: usize,
+    pub catalog_chunks: usize,
+    pub resident_chunks: usize,
+    pub estimated_bounds: usize,
 }
 
 impl std::fmt::Display for Coverage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "BMD ray coverage: {} local + {} extended; {} out of range/cutoff, {} budget-limited, {} unavailable, {} missing texture references",
-            self.local, self.extra, self.outside, self.deferred, self.unavailable, self.missing_textures
+            "BMD ray coverage: {} local + {} extended in {}/{} chunks; {} out of range/cutoff, {} budget-limited, {} unavailable, {} missing texture references, {} estimated bounds",
+            self.local, self.extra, self.resident_chunks, self.catalog_chunks, self.outside, self.deferred, self.unavailable, self.missing_textures, self.estimated_bounds
         )
     }
 }
 
 struct Asset {
     id: usize,
-    block: (i32, i32),
+    block: ChunkId,
+    bounds: scene::Bounds,
     mesh: Mesh,
     surfaces: Vec<(Surface, Option<usize>)>,
     tiles: Vec<(TileKey, Arc<Tile>)>,
@@ -95,10 +106,10 @@ impl Asset {
         let x = y.cross(z).normalize_or_zero();
         let position = Vec3::from_array(model.position);
         // Group by stable 128 m world cells, not by camera or local/extra status.
-        let [px, _, pz] = objects.ornaments[id].position;
         let mut asset = Self {
             id,
-            block: ((px / 128.).floor() as i32, (pz / 128.).floor() as i32),
+            block: manifest::owner(objects.ornaments[id].position),
+            bounds: scene::Bounds::EMPTY,
             mesh: Mesh::default(),
             surfaces: Vec::new(),
             tiles: Vec::new(),
@@ -184,6 +195,7 @@ impl Asset {
                 if !p.is_finite() || p.abs().max_element() > 1.0e7 {
                     return Err("invalid baked world position".into());
                 }
+                asset.bounds = asset.bounds.union(scene::Bounds::point(p));
                 let n = (x * v.normal[0] + y * v.normal[1] + z * v.normal[2]).normalize_or_zero();
                 asset
                     .mesh
@@ -236,31 +248,6 @@ impl Asset {
     }
 }
 
-// Sort by horizontal distance to the *installed* stream block, never by view
-// direction. A stable ID breaks ties. Required native placements are never
-// replaced by or duplicated in the optional extension.
-fn select(
-    ornaments: &[Ornament],
-    local: &HashSet<usize>,
-    center: [f32; 2],
-    cutoff: Option<[f32; 4]>,
-) -> Vec<usize> {
-    let mut order: Vec<_> = ornaments
-        .iter()
-        .enumerate()
-        .filter_map(|(id, p)| {
-            let distance =
-                (p.position[0] - center[0]).powi(2) + (p.position[2] - center[1]).powi(2);
-            (distance <= REACH * REACH
-                && !local.contains(&id)
-                && crate::terrain_cutoff::contains(cutoff, p.position))
-            .then_some((distance, id))
-        })
-        .collect();
-    order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    order.into_iter().map(|(_, id)| id).collect()
-}
-
 struct Budget {
     geometry: MeshBudget,
     texture_bytes: usize,
@@ -290,7 +277,10 @@ impl SceneryStream {
             return asset;
         }
         match Asset::read(objects, id, &mut self.tiles) {
-            Ok(asset) => asset.map(Arc::new),
+            Ok(asset) => asset.map(|asset| {
+                self.manifest.learned_bounds(id, asset.bounds);
+                Arc::new(asset)
+            }),
             Err(error) => {
                 eprintln!(
                     "Lighter: BMD {:?} unavailable ({error})",
@@ -309,7 +299,9 @@ impl SceneryStream {
         objects: &mut Objects,
         local_ids: &[usize],
         center: [f32; 2],
+        local_reach: f32,
         cutoff: Option<[f32; 4]>,
+        lights: &[SceneLight],
     ) -> Result<Snapshot, String> {
         if !self
             .catalog
@@ -318,7 +310,8 @@ impl SceneryStream {
         {
             self.assets.clear();
             self.tiles.clear();
-            self.catalog = Some(objects.ornaments.clone());
+            self.manifest = Manifest::new(&objects.ornaments);
+            self.catalog = Some(Arc::clone(&objects.ornaments));
         }
         let mut ids = HashSet::with_capacity(local_ids.len());
         let mut next = HashMap::new();
@@ -335,8 +328,9 @@ impl SceneryStream {
                 next.insert(id, asset);
             }
         }
-        let mut order = select(&objects.ornaments, &ids, center, cutoff);
-        let outside = objects.ornaments.len() - ids.len() - order.len();
+        let query = Query::new(center, local_reach, cutoff, lights);
+        let mut order = self.manifest.select(&ids, &query);
+        let mut outside = objects.ornaments.len() - ids.len() - order.len();
         let mut deferred = order.len().saturating_sub(EXTRA_PLACEMENTS);
         order.truncate(EXTRA_PLACEMENTS);
         let mut budget = Budget {
@@ -369,6 +363,9 @@ impl SceneryStream {
             for &id in batch {
                 let asset = self.assets.remove(&id).expect("prepared BMD batch");
                 match asset {
+                    // A first decode can invalidate a placement estimate. Do
+                    // not publish geometry ranked out of the exact reach.
+                    Some(_) if !self.manifest.reachable(id, &query) => outside += 1,
                     Some(asset) if budget.admit(&asset) => {
                         extra.push(asset.clone());
                         next.insert(id, Some(asset));
@@ -389,6 +386,8 @@ impl SceneryStream {
             outside,
             deferred,
             unavailable,
+            catalog_chunks: self.manifest.chunks(),
+            estimated_bounds: self.manifest.estimated(),
         })
     }
 }
@@ -407,6 +406,8 @@ impl Snapshot {
             outside: self.outside,
             deferred: self.deferred,
             unavailable: self.unavailable,
+            catalog_chunks: self.catalog_chunks,
+            estimated_bounds: self.estimated_bounds,
             ..Coverage::default()
         };
         let mut geometry = builder.optional_mesh_budget(storage);
@@ -445,6 +446,7 @@ impl Snapshot {
                 coverage.deferred += 1;
             }
         }
+        coverage.resident_chunks = chunks.len();
         for ((x, z), mut assets) in chunks {
             // Reprioritizing or promoting a resident from extra to local
             // doesn't change the order/indices inside an unchanged chunk.
@@ -463,38 +465,6 @@ impl Snapshot {
 mod tests {
     use super::*;
 
-    fn ornament(x: f32, z: f32) -> Ornament {
-        Ornament {
-            export_id: 0,
-            offset: 0,
-            position: [x, 0., z],
-            direction: [0., 0., 1.],
-            up: [0., 1., 0.],
-            extra: 0,
-            path: String::new(),
-            map_id: "world".into(),
-        }
-    }
-
-    #[test]
-    fn selects_both_sides_in_order_without_duplicates_or_leaking_past_cutoff() {
-        let all = [
-            ornament(-160., 0.),
-            ornament(160., 0.),
-            ornament(0., 1.), // already local
-            ornament(0., REACH + 1.),
-            ornament(100., -10.),
-            ornament(f32::NAN, 0.),
-        ];
-        let local = HashSet::from([2]);
-        assert_eq!(select(&all, &local, [0.; 2], None), [4, 0, 1]);
-        assert_eq!(
-            select(&all, &local, [0.; 2], Some([-100., 200., -20., 20.])),
-            [4, 1]
-        );
-        assert!(select(&all, &local, [REACH * 2., 0.], None).is_empty());
-    }
-
     #[test]
     fn budget_rejects_whole_assets_without_charging_and_shares_tiles() {
         let tile = Arc::new(Tile::new([1, 1], 1, Filter::Color, |_, _| u32::MAX).unwrap());
@@ -505,6 +475,7 @@ mod tests {
             Asset {
                 id: 0,
                 block: (0, 0),
+                bounds: scene::Bounds::point(Vec3::ZERO),
                 mesh,
                 surfaces: vec![(Surface::new(0, 0, 0., 0.), Some(0))],
                 tiles: vec![((hash, Filter::Color), tile.clone())],

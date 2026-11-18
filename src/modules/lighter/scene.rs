@@ -1,7 +1,8 @@
 //! Backend-neutral scene packet. Offsets in the header are *word* offsets.
 //! The same indexed positions build the Vulkan BLAS and feed the software
 //! intersector. Both backends shade the same triangle IDs and barycentrics.
-use super::bvh::{Bounds, Bvh};
+pub(crate) use super::bvh::Bounds;
+use super::bvh::Bvh;
 use bytemuck::{Pod, Zeroable};
 use glam::{Vec2, Vec3};
 use sha2::{Digest, Sha256};
