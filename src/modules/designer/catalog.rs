@@ -1170,12 +1170,18 @@ mod tests {
     fn another_elements_revision_is_named_by_its_own_version() {
         // v29 is the RUS 1.4.2 revision; the reader must say so plainly
         // instead of printing a hex word or trying the v27 tables anyway.
-        let error = Catalog::parse_v27(&0x3000_001du32.to_le_bytes()).unwrap_err();
+        let error = match Catalog::parse_v27(&0x3000_001du32.to_le_bytes()) {
+            Ok(_) => panic!("a v29 file must not parse as v27"),
+            Err(error) => error,
+        };
         assert!(error.contains("v29"), "{error}");
         assert!(error.contains("not the v27 layout"), "{error}");
         // A file that is not an elements file at all is distinguished from a
         // different revision of one.
-        let error = Catalog::parse_v27(&0x2000_001bu32.to_le_bytes()).unwrap_err();
+        let error = match Catalog::parse_v27(&0x2000_001bu32.to_le_bytes()) {
+            Ok(_) => panic!("a foreign family word must not parse as v27"),
+            Err(error) => error,
+        };
         assert!(error.contains("not an elements file"), "{error}");
         assert!(unsupported_layout(ELEMENTS_V27).contains("supported"));
     }

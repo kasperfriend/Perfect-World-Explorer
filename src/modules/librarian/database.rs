@@ -280,7 +280,11 @@ mod tests {
         assert!(Database::parse_v27(&[]).is_err());
         // A neighbouring revision is refused with its own version number, so
         // the Librarian can say "v26" instead of "unexpected hex word".
-        let error = Database::parse_v27(&0x3000_001au32.to_le_bytes()).unwrap_err();
+        // `Database` has no `Debug`, so match rather than `unwrap_err()`.
+        let error = match Database::parse_v27(&0x3000_001au32.to_le_bytes()) {
+            Ok(_) => panic!("a v26 file must not parse as v27"),
+            Err(error) => error,
+        };
         assert!(error.contains("v26"), "{error}");
         assert!(error.contains("not the v27 layout"), "{error}");
         let mut data = 0x3000_001bu32.to_le_bytes().to_vec();
