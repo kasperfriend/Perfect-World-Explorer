@@ -321,3 +321,19 @@ Reproduce the allocation/correctness check without client assets:
 `cargo run --locked --bin terrain-memory-check` (small CI fixture), or add
 `-- --full-world` for a synthetic 4096×5632 grid. This measures the owned terrain
 cache allocations, not process RSS or physical integrated-GPU memory.
+
+### Imaginator DXR shader
+
+The separate `dxr-trace-dxil` Actions artifact contains `dxr_trace.dxil` and
+`dxr_trace.cso`: they are identical DXIL containers. The viewer loads the `.cso`
+from `Modules/Imaginator/imaginator/dxr_trace.cso` beside the executable. The
+portable viewer artifact also includes both files; manual releases publish
+`dxr_trace.dxil` as a separate release asset. To install it manually, copy it to
+that module folder and rename it `dxr_trace.cso`. A shader file alone does not
+prove that the DXR pipeline works on a particular GPU.
+
+Full traced output is experimental: the software path samples tree colours and
+alpha cutouts, but terrain and scenery materials are still approximate. The
+hardware path does not yet sample tree alpha and remains unverified on physical
+DXR hardware. The raster pipeline still executes even when its pixels are
+replaced; this is not yet a complete replacement renderer.

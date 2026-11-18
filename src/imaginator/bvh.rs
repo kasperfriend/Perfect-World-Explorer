@@ -93,10 +93,49 @@ pub struct Node {
 /// place, exactly like a two-children-plus-offset layout. Twelve bins per axis
 /// keeps the cost of a rebuild acceptable while the scene is streamed in.
 pub struct Bvh {
+    /// Sparse per-triangle texture data; non-textured geometry has no entry.
+    pub surfaces: Arc<std::collections::HashMap<u32, TexturedTriangle>>,
+    pub textures: Arc<Vec<Texture>>,
     pub nodes: Vec<Node>,
     /// Triangle indices, permuted so every leaf owns a contiguous range.
     pub order: Vec<u32>,
     pub triangles: Vec<Triangle>,
+}
+
+/// Texture-backed triangle attributes. UVs use the triangle's own vertex order.
+#[derive(Clone, Copy, Debug)]
+pub struct TexturedTriangle {
+    pub uv: [[f32; 2]; 3],
+    pub texture: u32,
+    /// Alpha test, in 0..255; `None` keeps an opaque surface.
+    pub alpha_cutoff: Option<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Texture {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl Texture {
+    /// Nearest level-zero sample with wrapping, matching the tree atlas UVs.
+    /// The original bytes are sRGB colours and linear opacity.
+    pub fn sample(&self, uv: [f32; 2]) -> Option<[u8; 4]> {
+        if self.width == 0 || self.height == 0 || !uv[0].is_finite() || !uv[1].is_finite() {
+            return None;
+        }
+        let u = uv[0].rem_euclid(1.0);
+        let v = uv[1].rem_euclid(1.0);
+        let x = ((u * self.width as f32) as u32).min(self.width - 1);
+        let y = ((v * self.height as f32) as u32).min(self.height - 1);
+        let offset =
+            ((y as usize).checked_mul(self.width as usize)? + x as usize).checked_mul(4)?;
+        self.rgba
+            .get(offset..offset.checked_add(4)?)?
+            .try_into()
+            .ok()
+    }
 }
 
 /// Depth bound for the traversal stack.
@@ -116,6 +155,8 @@ impl Bvh {
         let mut order: Vec<u32> = (0..count as u32).collect();
         if count == 0 {
             return Self {
+                surfaces: Arc::new(Default::default()),
+                textures: Arc::new(Vec::new()),
                 nodes: vec![Node {
                     bounds: Aabb::EMPTY,
                     left_first: 0,
@@ -210,9 +251,32 @@ impl Bvh {
             stack.push((left, start, mid));
         }
         Self {
+            surfaces: Arc::new(Default::default()),
+            textures: Arc::new(Vec::new()),
             nodes,
             order,
             triangles,
+        }
+    }
+
+    /// Returns the sampled texture and cutout state for a triangle hit.
+    pub fn surface_sample(&self, triangle: u32, bary: [f32; 2]) -> Option<([u8; 4], Option<u8>)> {
+        let surface = self.surfaces.get(&triangle)?;
+        let w = 1. - bary[0] - bary[1];
+        let uv = [
+            surface.uv[0][0] * w + surface.uv[1][0] * bary[0] + surface.uv[2][0] * bary[1],
+            surface.uv[0][1] * w + surface.uv[1][1] * bary[0] + surface.uv[2][1] * bary[1],
+        ];
+        Some((
+            self.textures.get(surface.texture as usize)?.sample(uv)?,
+            surface.alpha_cutoff,
+        ))
+    }
+
+    fn accepts_hit(&self, triangle: u32, bary: [f32; 2]) -> bool {
+        match self.surface_sample(triangle, bary) {
+            Some((rgba, Some(cutoff))) => rgba[3] > cutoff,
+            _ => true,
         }
     }
 
@@ -340,6 +404,9 @@ impl Bvh {
                     let slot = node.left_first as usize + k;
                     let tri = &self.triangles[self.order[slot] as usize];
                     if let Some((t, bary)) = tri.intersect(ray, tmin, best_t) {
+                        if !self.accepts_hit(self.order[slot], bary) {
+                            continue;
+                        }
                         best_t = t;
                         best = Some(Hit {
                             t,
@@ -408,8 +475,10 @@ impl Bvh {
                 for k in 0..node.count as usize {
                     let slot = node.left_first as usize + k;
                     let tri = &self.triangles[self.order[slot] as usize];
-                    if tri.intersect(ray, tmin, tmax).is_some() {
-                        return true;
+                    if let Some((_, bary)) = tri.intersect(ray, tmin, tmax) {
+                        if self.accepts_hit(self.order[slot], bary) {
+                            return true;
+                        }
                     }
                 }
             } else {
@@ -558,6 +627,54 @@ mod tests {
             material: 1,
         });
         Bvh::build(tris)
+    }
+
+    #[test]
+    fn transparent_texel_does_not_block_primary_or_shadow_ray() {
+        let tri = Triangle {
+            a: v3(0., 0., 0.),
+            b: v3(1., 0., 0.),
+            c: v3(0., 0., 1.),
+            normal: v3(0., 1., 0.),
+            material: 0,
+        };
+        let mut bvh = Bvh::build(vec![tri]);
+        bvh.textures = Arc::new(vec![Texture {
+            width: 2,
+            height: 1,
+            rgba: vec![20, 150, 30, 0, 20, 150, 30, 255],
+        }]);
+        bvh.surfaces = Arc::new(
+            [(
+                0,
+                TexturedTriangle {
+                    uv: [[0., 0.], [1., 0.], [0., 0.]],
+                    texture: 0,
+                    alpha_cutoff: Some(127),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let hole = Ray::new(v3(0.1, 1., 0.1), v3(0., -1., 0.));
+        let leaf = Ray::new(v3(0.7, 1., 0.1), v3(0., -1., 0.));
+        assert!(bvh.closest_hit(&hole, 0., 10.).is_none());
+        assert!(!bvh.any_hit(&hole, 0., 10.));
+        assert!(bvh.closest_hit(&leaf, 0., 10.).is_some());
+        assert!(bvh.any_hit(&leaf, 0., 10.));
+        // Continue past the cutout to an opaque surface, rather than treating
+        // a rejected hit as a miss of the whole ray.
+        let mut lower = tri;
+        lower.a.y -= 1.;
+        lower.b.y -= 1.;
+        lower.c.y -= 1.;
+        let mut stacked = Bvh::build(vec![tri, lower]);
+        stacked.surfaces = bvh.surfaces.clone();
+        stacked.textures = bvh.textures.clone();
+        let behind = stacked.closest_hit(&hole, 0., 10.).unwrap();
+        assert_eq!(behind.triangle, 1);
+        assert!(stacked.any_hit(&hole, 0., 10.));
+        assert!(!stacked.any_hit(&hole, 0., 1.5));
     }
 
     #[test]

@@ -19,9 +19,9 @@
 //!   `model.position + x*vx*scale + y*vy*scale + z*vz*scale`). Only models whose
 //!   `litmodels.pck` data is resident are captured, so the tracer's picture grows
 //!   as the scenery streams in, exactly like the world does.
-//! * **Vegetation** — every tree placement, as two crossed quads sized from the
-//!   tree type's own mesh bounds. A tree is mostly holes; giving it a canopy
-//!   volume is what makes its shadow read as shade instead of a lamp post.
+//! * **Vegetation** — branch, frond and leaf geometry from the resident tree
+//!   meshes, with their texture UVs and alpha cutouts for software traversal.
+//!   Hardware traversal currently uses opaque geometry and flat materials.
 //!
 //! The capture is bounded: `CaptureBudget` caps triangles and, optionally, the
 //! radius around the camera. A cut-out world is reported through
@@ -126,6 +126,8 @@ pub struct Sources<'a> {
 
 struct Builder {
     triangles: Vec<Triangle>,
+    surfaces: std::collections::HashMap<u32, super::bvh::TexturedTriangle>,
+    textures: Vec<super::bvh::Texture>,
     budget: CaptureBudget,
     clipped: bool,
     /// Ceiling for *this* producer, relative to the shared `budget`. Producers
@@ -178,6 +180,30 @@ impl Builder {
         });
     }
 
+    fn textured(
+        &mut self,
+        a: V3,
+        b: V3,
+        c: V3,
+        normal: V3,
+        uv: [[f32; 2]; 3],
+        texture: u32,
+        alpha_cutoff: Option<u8>,
+    ) {
+        let index = self.triangles.len();
+        self.push(a, b, c, normal, material::VEGETATION);
+        if self.triangles.len() != index {
+            self.surfaces.insert(
+                index as u32,
+                super::bvh::TexturedTriangle {
+                    uv,
+                    texture,
+                    alpha_cutoff,
+                },
+            );
+        }
+    }
+
     fn quad(&mut self, a: V3, b: V3, c: V3, d: V3, normal: V3, m: u16) {
         self.push(a, b, c, normal, m);
         self.push(a, c, d, normal, m);
@@ -189,6 +215,8 @@ impl Builder {
 pub fn capture(sources: &Sources<'_>, budget: CaptureBudget) -> Arc<Scene> {
     let mut b = Builder {
         triangles: Vec::new(),
+        surfaces: Default::default(),
+        textures: Vec::new(),
         budget,
         clipped: false,
         ceiling: None,
@@ -233,7 +261,9 @@ pub fn capture(sources: &Sources<'_>, budget: CaptureBudget) -> Arc<Scene> {
         nodes: 0,
         clipped: b.clipped,
     };
-    let bvh = Bvh::build(triangles);
+    let mut bvh = Bvh::build(triangles);
+    bvh.surfaces = Arc::new(b.surfaces);
+    bvh.textures = Arc::new(b.textures);
     let mut scene = Scene::with_builtin_materials();
     scene.stats = SceneStats {
         nodes: bvh.nodes.len(),
@@ -451,6 +481,7 @@ fn capture_trees(b: &mut Builder, trees: &Trees, scene: &WorldScene) {
     // Alpha-tested canopy cards are kept because the leaves *are* cards: that is
     // how SpeedTree represents foliage. What is captured is the real set of
     // them, in the real positions, not two invented ones.
+    let mut texture_ids = std::collections::HashMap::<usize, (u32, u32)>::new();
     for placement in &trees.placements {
         if !b.has_room() {
             b.clipped = true;
@@ -466,6 +497,23 @@ fn capture_trees(b: &mut Builder, trees: &Trees, scene: &WorldScene) {
         let Some(lod) = mesh.lods.first() else {
             continue;
         };
+        let (bark, composite) = *texture_ids
+            .entry(placement.tree_type as usize)
+            .or_insert_with(|| {
+                let bark = b.textures.len() as u32;
+                b.textures.push(super::bvh::Texture {
+                    width: mesh.bark.width(),
+                    height: mesh.bark.height(),
+                    rgba: mesh.bark.as_raw().to_vec(),
+                });
+                let composite = b.textures.len() as u32;
+                b.textures.push(super::bvh::Texture {
+                    width: mesh.composite.width(),
+                    height: mesh.composite.height(),
+                    rgba: mesh.composite.as_raw().to_vec(),
+                });
+                (bark, composite)
+            });
         // A placement is a position and nothing else: `scene::Tree` carries no
         // scale and no yaw, and `far_trees_gpu` instances each tree with just a
         // world position. Inventing a transform here - which the first draft of
@@ -478,7 +526,10 @@ fn capture_trees(b: &mut Builder, trees: &Trees, scene: &WorldScene) {
         let place = |p: &[f32; 3]| -> V3 { v3(base.x + p[0], base.y + p[2], base.z + p[1]) };
         let place_normal = |n: &[f32; 3]| -> V3 { v3(n[0], n[2], n[1]).normalize_or_zero() };
         // --- trunk and limbs -------------------------------------------------
-        for part in [&lod.branch, &lod.frond] {
+        for (part, texture, cutoff) in [
+            (&lod.branch, bark, None),
+            (&lod.frond, composite, Some(127)),
+        ] {
             for tri in part.indices.chunks_exact(3) {
                 let (Some(a), Some(bv), Some(c)) = (
                     part.vertices.get(tri[0] as usize),
@@ -488,12 +539,14 @@ fn capture_trees(b: &mut Builder, trees: &Trees, scene: &WorldScene) {
                     continue;
                 };
                 let normal = place_normal(&a.normal);
-                b.push(
+                b.textured(
                     place(&a.pos),
                     place(&bv.pos),
                     place(&c.pos),
                     normal,
-                    material::VEGETATION,
+                    [a.uv, bv.uv, c.uv],
+                    texture,
+                    cutoff,
                 );
             }
         }
@@ -513,8 +566,24 @@ fn capture_trees(b: &mut Builder, trees: &Trees, scene: &WorldScene) {
             };
             // Leaf corners are not guaranteed to be a parallelogram, so split
             // the quad explicitly rather than reusing the quad path.
-            b.push(c0, c1, c2, normal, material::VEGETATION);
-            b.push(c0, c2, c3, normal, material::VEGETATION);
+            b.textured(
+                c0,
+                c1,
+                c2,
+                normal,
+                [leaf.uv[0], leaf.uv[1], leaf.uv[2]],
+                composite,
+                Some(127),
+            );
+            b.textured(
+                c0,
+                c2,
+                c3,
+                normal,
+                [leaf.uv[0], leaf.uv[2], leaf.uv[3]],
+                composite,
+                Some(127),
+            );
         }
     }
 }
@@ -713,6 +782,8 @@ mod tests {
     fn slivers_and_non_finite_geometry_are_dropped() {
         let mut b = Builder {
             triangles: Vec::new(),
+            surfaces: Default::default(),
+            textures: Vec::new(),
             budget: CaptureBudget::default(),
             clipped: false,
             ceiling: None,
@@ -733,6 +804,8 @@ mod tests {
     fn the_budget_stops_the_capture_and_says_so() {
         let mut b = Builder {
             triangles: Vec::new(),
+            surfaces: Default::default(),
+            textures: Vec::new(),
             budget: CaptureBudget {
                 max_triangles: 2,
                 ..CaptureBudget::default()
@@ -751,6 +824,8 @@ mod tests {
     fn the_radius_rejects_far_geometry() {
         let b = Builder {
             triangles: Vec::new(),
+            surfaces: Default::default(),
+            textures: Vec::new(),
             budget: CaptureBudget {
                 radius: Some(10.),
                 center: [0., 0., 0.],
@@ -788,6 +863,8 @@ mod tests {
         // geometry from every later producer.
         let mut b = Builder {
             triangles: Vec::new(),
+            surfaces: Default::default(),
+            textures: Vec::new(),
             budget: CaptureBudget {
                 max_triangles: 2_000,
                 ..CaptureBudget::default()
@@ -926,6 +1003,8 @@ mod tests {
         };
         let mut b = Builder {
             triangles: Vec::new(),
+            surfaces: Default::default(),
+            textures: Vec::new(),
             budget: CaptureBudget::default(),
             clipped: false,
             ceiling: None,
@@ -941,6 +1020,8 @@ mod tests {
         };
         let mut b2 = Builder {
             triangles: Vec::new(),
+            surfaces: Default::default(),
+            textures: Vec::new(),
             budget: CaptureBudget::default(),
             clipped: false,
             ceiling: None,

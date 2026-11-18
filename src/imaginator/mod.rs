@@ -469,7 +469,11 @@ impl Imaginator {
                     .map(|bvh| bvh.triangles.clone())
                     .unwrap_or_default();
                 triangles.extend(pending);
-                let bvh = bvh::Bvh::build(triangles);
+                let mut bvh = bvh::Bvh::build(triangles);
+                if let Some(old) = current.bvh.as_ref() {
+                    bvh.surfaces = old.surfaces.clone();
+                    bvh.textures = old.textures.clone();
+                }
                 let mut stats = current.stats;
                 stats.triangles = bvh.triangles.len();
                 stats.scenery_triangles += count;

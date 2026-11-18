@@ -134,8 +134,22 @@ pub mod trees {
         pub rocking_clusters: usize,
     }
     /// Real: `src/trees.rs:42`.
+    pub struct RgbaImage;
+    impl RgbaImage {
+        pub fn width(&self) -> u32 {
+            0
+        }
+        pub fn height(&self) -> u32 {
+            0
+        }
+        pub fn as_raw(&self) -> &Vec<u8> {
+            unimplemented!()
+        }
+    }
     pub struct TreeMesh {
         pub lods: Vec<TreeLod>,
+        pub bark: RgbaImage,
+        pub composite: RgbaImage,
     }
     /// Real: `src/trees.rs:51`.
     pub struct Trees {

@@ -542,12 +542,20 @@ pub struct D3D12_ROOT_DESCRIPTOR_TABLE {
 
 /// `D3D12_ROOT_PARAMETER`: `{ Type, union, ShaderVisibility }`. The union's
 /// largest member is the descriptor table (a count plus a pointer), so the
-/// parameter is laid out as that plus padding.
+/// parameter uses an explicit union. A table's padding must never stand in for
+/// the CBV descriptor's register space: padding bytes are not initialized.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
+pub union D3D12_ROOT_PARAMETER_UNION {
+    pub Table: D3D12_ROOT_DESCRIPTOR_TABLE,
+    pub Descriptor: D3D12_ROOT_DESCRIPTOR,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct D3D12_ROOT_PARAMETER {
     pub ParameterType: u32,
-    pub Descriptor: D3D12_ROOT_DESCRIPTOR_TABLE,
+    pub Data: D3D12_ROOT_PARAMETER_UNION,
     pub ShaderVisibility: u32,
 }
 
@@ -651,25 +659,31 @@ pub unsafe fn create_trace_root_signature(device: *mut c_void) -> Result<*mut c_
     let parameters = [
         D3D12_ROOT_PARAMETER {
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
-            Descriptor: D3D12_ROOT_DESCRIPTOR_TABLE {
-                NumDescriptorRanges: 0,
-                pDescriptorRanges: std::ptr::null(),
+            Data: D3D12_ROOT_PARAMETER_UNION {
+                Descriptor: D3D12_ROOT_DESCRIPTOR {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                },
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         },
         D3D12_ROOT_PARAMETER {
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-            Descriptor: D3D12_ROOT_DESCRIPTOR_TABLE {
-                NumDescriptorRanges: 1,
-                pDescriptorRanges: srv.as_ptr(),
+            Data: D3D12_ROOT_PARAMETER_UNION {
+                Table: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: srv.as_ptr(),
+                },
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         },
         D3D12_ROOT_PARAMETER {
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-            Descriptor: D3D12_ROOT_DESCRIPTOR_TABLE {
-                NumDescriptorRanges: 1,
-                pDescriptorRanges: uav.as_ptr(),
+            Data: D3D12_ROOT_PARAMETER_UNION {
+                Table: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: uav.as_ptr(),
+                },
             },
             ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         },
@@ -870,9 +884,7 @@ pub unsafe fn create_compute_pipeline(
         },
         ..Default::default()
     };
-    // `ID3D12Device::CreateComputePipelineState` is slot 12, counted the same
-    // way: `GetNodeCount` 8, `CreateCommandQueue` 9, `CreateCommandAllocator` 10,
-    // `CreateGraphicsPipelineState` 11, `CreateComputePipelineState` 12.
+    // The header-derived base-device slot for CreateComputePipelineState is 11.
     let vtable = *(device as *mut *const usize);
     let create: unsafe extern "system" fn(
         *mut c_void,
@@ -1654,9 +1666,17 @@ mod tests {
     #[test]
     fn a_root_parameter_is_type_union_visibility() {
         use std::mem::size_of;
-        let parameter = D3D12_ROOT_PARAMETER::default();
-        // The union member the CBV parameter leaves zeroed must still be the
-        // table's size, not the smaller `D3D12_ROOT_DESCRIPTOR`.
+        let parameter = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+            Data: D3D12_ROOT_PARAMETER_UNION {
+                Descriptor: D3D12_ROOT_DESCRIPTOR {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                },
+            },
+            ShaderVisibility: 0,
+        };
+        // The union still occupies the table's size even for a CBV.
         assert_eq!(
             size_of::<D3D12_ROOT_DESCRIPTOR_TABLE>(),
             16,
@@ -1755,6 +1775,20 @@ mod tests {
             winapi::um::d3d12::D3D12_DESCRIPTOR_RANGE_TYPE_UAV
         );
         assert_eq!(D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE, 11);
+        let cbv = D3D12_ROOT_PARAMETER_UNION {
+            Descriptor: D3D12_ROOT_DESCRIPTOR {
+                ShaderRegister: 0,
+                RegisterSpace: 0,
+            },
+        };
+        unsafe {
+            assert_eq!(cbv.Descriptor.ShaderRegister, 0);
+            assert_eq!(cbv.Descriptor.RegisterSpace, 0);
+        }
+        assert_eq!(
+            std::mem::size_of::<D3D12_ROOT_PARAMETER>(),
+            std::mem::size_of::<winapi::um::d3d12::D3D12_ROOT_PARAMETER>()
+        );
         // A TLAS view is `{ Format, ViewDimension, Mapping, Location }`.
         assert_eq!(std::mem::size_of::<D3D12_TLAS_SRV_DESC>(), 24);
     }

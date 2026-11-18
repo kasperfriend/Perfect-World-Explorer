@@ -480,6 +480,7 @@ jobs:
           }
           $size = (Get-Item $out).Length
           Write-Host "wrote $out ($size bytes)"
+          Copy-Item -LiteralPath $out -Destination "Modules/Imaginator/imaginator/dxr_trace.dxil"
           if ($size -lt 64) { throw "the blob is only $size bytes; dxc did not produce DXIL" }
       - uses: actions/upload-artifact@v4
         if: always()
@@ -493,7 +494,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dxr-trace-dxil
-          path: Modules/Imaginator/imaginator/dxr_trace.cso
+          path: |
+            Modules/Imaginator/imaginator/dxr_trace.cso
+            Modules/Imaginator/imaginator/dxr_trace.dxil
           if-no-files-found: error
 
   windows:
@@ -691,6 +694,8 @@ jobs:
             'DirectStorage/NOTICES.txt',
             'Modules/Walker/module.ini',
             'Modules/Imaginator/module.ini',
+            'Modules/Imaginator/imaginator/dxr_trace.cso',
+            'Modules/Imaginator/imaginator/dxr_trace.dxil',
             'SHA256SUMS.txt'
           )) {
             if (-not (Test-Path -LiteralPath (Join-Path $package $relative) -PathType Leaf)) {

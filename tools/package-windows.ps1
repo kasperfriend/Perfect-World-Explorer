@@ -324,6 +324,15 @@ if (-not [string]::IsNullOrWhiteSpace($ArchivePath)) {
                 throw "Release archive is missing required entry: $required"
             }
         }
+        # When a compiled trace shader was supplied, verify it was actually
+        # copied into the release archive, not merely present before staging.
+        foreach ($name in @('dxr_trace.cso', 'dxr_trace.dxil')) {
+            $relative = "Modules/Imaginator/imaginator/$name"
+            if ((Test-Path -LiteralPath (Join-Path $modulesPath $relative) -PathType Leaf) -and
+                $entries -notcontains "Perfect World Explorer/$relative") {
+                throw "Release archive is missing supplied shader: $relative"
+            }
+        }
         if ($entries | Where-Object { $_ -match '(?i)bmd.*survey|survey.*bmd' }) {
             throw 'A BMD survey executable was unexpectedly included in the release archive.'
         }

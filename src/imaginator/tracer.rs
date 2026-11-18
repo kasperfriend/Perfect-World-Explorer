@@ -565,6 +565,23 @@ impl Tracer {
     }
 
     fn albedo(&self, hit: Hit) -> V3 {
+        if let Some((rgba, _)) = self
+            .scene
+            .bvh
+            .as_ref()
+            .and_then(|b| b.surface_sample(hit.triangle, hit.bary))
+        {
+            // Tree textures are sRGB; lighting works in linear radiance.
+            let linear = |c: u8| {
+                let c = c as f32 / 255.;
+                if c <= 0.04045 {
+                    c / 12.92
+                } else {
+                    ((c + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            return V3::from_array([linear(rgba[0]), linear(rgba[1]), linear(rgba[2])]);
+        }
         self.scene
             .materials
             .get(hit.material as usize)
