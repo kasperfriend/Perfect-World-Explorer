@@ -181,7 +181,7 @@ fn epsilon(t: f32) -> f32 {
 }
 fn next_surface(ray: Ray, purpose: u32) -> Surface {
     var r = ray;
-    // Hardware 0.19 exposes committed intersections, not any-hit callbacks.
+    // Both paths use committed geometric hits, with the same alpha rules.
     // Requery beyond cutout/rejected surfaces on both paths for the same rules.
     for (var attempt=0; attempt<64; attempt++) {
         if r.low >= r.high { break; }

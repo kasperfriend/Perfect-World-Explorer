@@ -47,6 +47,9 @@ pub fn supported(a: &wgpu::Adapter) -> bool {
 }
 
 pub fn shader(source: &str) -> Result<Vec<u32>, String> {
+    // Naga 0.19 emits undefined hit-field reads on a miss. Keep the guarded
+    // ray-query writer separate from wgpu's pinned shader compiler.
+    use naga_rt as naga;
     let module = naga::front::wgsl::parse_str(source).map_err(|e| e.emit_to_string(source))?;
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
@@ -60,6 +63,10 @@ pub fn shader(source: &str) -> Result<Vec<u32>, String> {
         &naga::back::spv::Options {
             lang_version: (1, 4),
             flags: naga::back::spv::WriterFlags::empty(),
+            bounds_check_policies: naga::proc::BoundsCheckPolicies {
+                buffer: naga::proc::BoundsCheckPolicy::ReadZeroSkipWrite,
+                ..Default::default()
+            },
             ..Default::default()
         },
         Some(&naga::back::spv::PipelineOptions {

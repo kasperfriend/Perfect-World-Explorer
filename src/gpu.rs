@@ -3680,8 +3680,8 @@ impl Renderer {
         // against a view that no longer exists.
         reset_history: bool,
     ) {
-        let frame = self.begin_frame(camera, w, h);
         if self.lighter.replaces_world() {
+            let frame = self.begin_frame(camera, w, h);
             return self.render_lighter(target, matrix, camera, &frame, w, h);
         }
         // Where this frame's CPU time goes, stage by stage. One line a second on
@@ -3706,6 +3706,7 @@ impl Renderer {
         // instead of one call per run.
         self.queue_main_runs();
         lap(STAGE_VISIBILITY, &mut stage_ms, &mut lap_at);
+        let frame = self.begin_frame(camera, w, h);
         self.weather.advance(camera.logic_delta_ms);
         let selected_weather = camera.regional_light.map_or(
             crate::client_weather::WeatherSelection::default(),

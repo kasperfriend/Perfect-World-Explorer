@@ -57,8 +57,9 @@ while Lighter renders. Existing saved choices for those features are unchanged.
 
 ## Verification
 
-The viewer tests validate both WGSL paths with the pinned Naga version and
-inspect the emitted Vulkan ray-query SPIR-V. The opt-in pixel tests trace a
+The viewer tests validate both WGSL paths and inspect the emitted Vulkan
+ray-query SPIR-V. The hardware path uses Naga 25 for safe hit queries after
+traversal without changing the viewer's wgpu version. The opt-in pixel tests trace a
 controlled scene, then read back the *composited* color and depth. They cover
 static and transformed moving geometry, cutout and blended surfaces, an
 out-of-view shadow caster, and reflection/refraction with visibility gates.

@@ -4,7 +4,8 @@ use scene::*;
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 #[test]
-fn pinned_naga_validates_both_paths_and_emits_native_ray_queries() {
+fn naga_validates_both_paths_and_emits_native_ray_queries() {
+    use naga_rt as naga;
     for src in [
         [BASE, SOFTWARE].concat(),
         include_str!("present.wgsl").into(),

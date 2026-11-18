@@ -5,13 +5,13 @@
 // the authored alpha reference and visibility and reissues only rejected rays.
 fn closest(ray: Ray) -> Hit {
     var query: ray_query;
-    rayQueryInitialize(&query, acceleration, RayDesc(1u, 255u, ray.low, ray.high, ray.origin, ray.dir));
+    rayQueryInitialize(&query, acceleration, RayDesc(RAY_FLAG_FORCE_OPAQUE, 255u, ray.low, ray.high, ray.origin, ray.dir));
     while rayQueryProceed(&query) {}
     let h = rayQueryGetCommittedIntersection(&query);
-    if h.kind != RAY_QUERY_INTERSECTION_NONE {
-        let m = (h.instance_custom_index & DYNAMIC) != 0u;
-        let inst = inst_addr(h.instance_custom_index);
-        return Hit(h.t,h.instance_custom_index,h.primitive_index+word(m,inst+7u),h.barycentrics);
+    if h.kind == RAY_QUERY_INTERSECTION_TRIANGLE {
+        let m = (h.instance_custom_data & DYNAMIC) != 0u;
+        let inst = inst_addr(h.instance_custom_data);
+        return Hit(h.t,h.instance_custom_data,h.primitive_index+word(m,inst+7u),h.barycentrics);
     }
     return Hit(ray.high,NIL,0u,vec2<f32>(0.));
 }
