@@ -238,7 +238,13 @@ void cs(uint3 id : SV_DispatchThreadID)
                 // the surface's specular and gathers its own light.
                 float3 mirror = normalize(rd + normal * (2.0 * cos_i));
                 float3 origin = position + normal * 0.02;
-                float3 through = float3(1, 1, 1);
+                // The chain starts at *this* surface, so its own reflectance is
+                // the first weight. Starting at 1.0 gave every surface a full
+                // mirror of the sky: flat terrain is `specular` 0.03 and added
+                // what a mirror would, and the composite added that on top of a
+                // frame that already carried the sky, so the ground went white.
+                // The rest of the chain already decays by `hm.a` per step.
+                float3 through = float3(mat.a, mat.a, mat.a);
                 float3 gathered = float3(0, 0, 0);
                 uint max_steps = max(p.config.x, 1u);
                 for (uint step = 0; step < max_steps; ++step)

@@ -67,6 +67,25 @@ impl Default for CaptureBudget {
     }
 }
 
+/// Triangles held back for the producers that run after the terrain.
+///
+/// The terrain walker can fill the whole budget on its own - an 88-tile world
+/// at stride 4 is millions of quads - and the budget used to be one shared
+/// counter, so it did. Every later producer then found `has_room()` false and
+/// returned immediately: water, buildings and trees were silently absent from
+/// the capture, which is why the traced picture had geometry on the ground and
+/// nothing standing on it. Reserving a share per producer means terrain is what
+/// gets thinned when the world is too big, and the things that make a picture
+/// readable survive.
+/// Fractions of `max_triangles`, not absolute counts, so the split scales with
+/// whatever budget the caller passes instead of assuming the 2.5M default.
+const RESERVE_SCENERY: f32 = 0.28;
+const RESERVE_TREES: f32 = 0.20;
+
+fn reserve(budget: &CaptureBudget, fraction: f32) -> usize {
+    ((budget.max_triangles as f32) * fraction) as usize
+}
+
 /// Everything the capture needs, borrowed from whatever already owns it.
 pub struct Sources<'a> {
     pub map: &'a MapSpace,
@@ -81,11 +100,19 @@ struct Builder {
     triangles: Vec<Triangle>,
     budget: CaptureBudget,
     clipped: bool,
+    /// Ceiling for *this* producer, relative to the shared `budget`. Producers
+    /// that must not be starved set this before they run and the shared
+    /// `max_triangles` still caps the total.
+    ceiling: Option<usize>,
 }
 
 impl Builder {
     fn has_room(&self) -> bool {
-        self.triangles.len() < self.budget.max_triangles
+        let total = self.triangles.len() < self.budget.max_triangles;
+        match self.ceiling {
+            Some(ceiling) => total && self.triangles.len() < ceiling,
+            None => total,
+        }
     }
 
     /// Distance test used by every producer. Returns `false` when the primitive
@@ -136,15 +163,29 @@ pub fn capture(sources: &Sources<'_>, budget: CaptureBudget) -> Arc<Scene> {
         triangles: Vec::new(),
         budget,
         clipped: false,
+        ceiling: None,
     };
-    capture_terrain(&mut b, sources.map);
+    // Order matters now that each producer has a reserved share. Water is a
+    // handful of quads and defines where the ground is, so it goes first and
+    // can never be squeezed out. Scenery (buildings, walls, props) and trees are
+    // what a frame is *read* by, so they get their reserves before the terrain
+    // walker is allowed to spend whatever is left.
     capture_water(&mut b, sources.water);
+    let after_water = b.triangles.len();
+    b.ceiling = Some(after_water + reserve(&b.budget.clone(), RESERVE_SCENERY));
     capture_scenery(&mut b, sources.objects, sources.ornaments);
+    let after_scenery = b.triangles.len();
+    b.ceiling = Some(after_scenery + reserve(&b.budget.clone(), RESERVE_TREES));
     if budget.trees {
         if let Some(trees) = sources.trees {
             capture_trees(&mut b, trees, sources.scene);
         }
     }
+    // Terrain takes the rest. It is the one producer that degrades gracefully:
+    // thinning it leaves a slightly coarser ground, while dropping buildings
+    // leaves holes in the picture.
+    b.ceiling = None;
+    capture_terrain(&mut b, sources.map);
     let triangles = std::mem::take(&mut b.triangles);
     let stats = SceneStats {
         triangles: triangles.len(),
@@ -374,6 +415,7 @@ mod tests {
             triangles: Vec::new(),
             budget: CaptureBudget::default(),
             clipped: false,
+            ceiling: None,
         };
         b.push(V3::ZERO, v3(1., 0., 0.), v3(2., 0., 0.), v3(0., 1., 0.), 0);
         b.push(
@@ -396,6 +438,7 @@ mod tests {
                 ..CaptureBudget::default()
             },
             clipped: false,
+            ceiling: None,
         };
         for _ in 0..5 {
             b.push(V3::ZERO, v3(1., 0., 0.), v3(0., 0., 1.), v3(0., 1., 0.), 0);
@@ -414,6 +457,7 @@ mod tests {
                 ..CaptureBudget::default()
             },
             clipped: false,
+            ceiling: None,
         };
         assert!(b.within(3., 3.));
         assert!(!b.within(20., 0.));
@@ -426,6 +470,137 @@ mod tests {
         assert_eq!(m[material::WATER as usize].specular, 0.85, "water mirrors");
         assert!(
             m[material::VEGETATION as usize].albedo.y > m[material::VEGETATION as usize].albedo.x
+        );
+    }
+
+    /// The terrain walker must not be able to spend the budget that water,
+    /// scenery and trees need.
+    ///
+    /// `capture` used to run terrain first against one shared counter, so on a
+    /// big world the terrain filled all 2.5M triangles and every later producer
+    /// found `has_room()` false and returned at once. The traced picture then
+    /// had ground and no buildings, no trees and no water, with `clipped` the
+    /// only hint - and the page showed "2500000 triangles" as if that were
+    /// complete. This pins the reserved-share order.
+    #[test]
+    fn a_full_terrain_budget_cannot_starve_water_scenery_or_trees() {
+        // Terrain that would happily consume the whole budget on its own, plus
+        // geometry from every later producer.
+        let mut b = Builder {
+            triangles: Vec::new(),
+            budget: CaptureBudget {
+                max_triangles: 2_000,
+                ..CaptureBudget::default()
+            },
+            clipped: false,
+            ceiling: None,
+        };
+        // Water first, as `capture` does: it must never be squeezed out.
+        b.quad(
+            V3::ZERO,
+            v3(1., 0., 0.),
+            v3(1., 0., 1.),
+            v3(0., 0., 1.),
+            v3(0., 1., 0.),
+            material::WATER,
+        );
+        let after_water = b.triangles.len();
+        b.ceiling = Some(after_water + reserve(&b.budget.clone(), RESERVE_SCENERY));
+        // Scenery pushes until its reserve is gone.
+        let mut scenery = 0;
+        while b.has_room() {
+            let before = b.triangles.len();
+            b.push(
+                V3::ZERO,
+                v3(1., 0., 0.),
+                v3(0., 0., 1.),
+                v3(0., 1., 0.),
+                material::SCENERY,
+            );
+            if b.triangles.len() == before {
+                break;
+            }
+            scenery += 1;
+        }
+        assert!(scenery > 0, "scenery got no room at all");
+        assert!(
+            b.triangles.len() < b.budget.max_triangles,
+            "scenery spent the whole budget"
+        );
+        let after_scenery = b.triangles.len();
+        b.ceiling = Some(after_scenery + reserve(&b.budget.clone(), RESERVE_TREES));
+        // Trees push until their reserve is gone.
+        let mut trees = 0;
+        while b.has_room() {
+            let before = b.triangles.len();
+            b.push(
+                V3::ZERO,
+                v3(1., 0., 0.),
+                v3(0., 0., 1.),
+                v3(0., 1., 0.),
+                material::VEGETATION,
+            );
+            if b.triangles.len() == before {
+                break;
+            }
+            trees += 1;
+        }
+        assert!(trees > 0, "trees got no room at all");
+        // Terrain now gets whatever is left - it is the producer that can be
+        // thinned, so it is the one that must yield.
+        b.ceiling = None;
+        let mut terrain = 0;
+        while b.has_room() {
+            let before = b.triangles.len();
+            b.push(
+                V3::ZERO,
+                v3(1., 0., 0.),
+                v3(0., 0., 1.),
+                v3(0., 1., 0.),
+                material::TERRAIN,
+            );
+            if b.triangles.len() == before {
+                break;
+            }
+            terrain += 1;
+        }
+        assert_eq!(
+            b.triangles.len(),
+            b.budget.max_triangles,
+            "terrain should take what is left"
+        );
+        // Every producer is represented in the final soup.
+        let has = |m: u16| b.triangles.iter().any(|t| t.material == m);
+        assert!(has(material::WATER), "water missing");
+        assert!(has(material::SCENERY), "scenery missing");
+        assert!(has(material::VEGETATION), "trees missing");
+        assert!(has(material::TERRAIN), "terrain missing");
+    }
+
+    /// Pins the producer order in `capture` itself.
+    ///
+    /// The reserve test above proves the ceiling works, but not that `capture`
+    /// applies it in the right order - and the original bug was purely order:
+    /// terrain ran first. Reading the function is the only way to assert the
+    /// sequence without constructing a whole world, and getting this wrong is
+    /// silent, so it is worth an explicit check.
+    #[test]
+    fn capture_runs_terrain_last_so_it_cannot_starve_the_rest() {
+        let source = include_str!("capture.rs");
+        let body = source
+            .split("pub fn capture(sources:")
+            .nth(1)
+            .expect("capture is defined");
+        let body = body.split("let triangles = std::mem::take").next().unwrap();
+        let water = body.find("capture_water(").expect("water is captured");
+        let scenery = body.find("capture_scenery(").expect("scenery is captured");
+        let trees = body.find("capture_trees(").expect("trees are captured");
+        let terrain = body.find("capture_terrain(").expect("terrain is captured");
+        assert!(water < scenery, "water must run before scenery");
+        assert!(scenery < trees, "scenery must run before trees");
+        assert!(
+            trees < terrain,
+            "terrain must run last: it is the producer that can be thinned"
         );
     }
 }

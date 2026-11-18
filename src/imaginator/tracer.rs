@@ -407,8 +407,16 @@ impl Tracer {
         sample.indirect = indirect;
 
         // --- specular reflection ------------------------------------------------
+        //
+        // Weighted by the surface's own `specular`. It was not: every surface
+        // added a full mirror reflection of the sky, so flat terrain - which is
+        // nearly lambertian, `specular` 0.03 - added a bright sky value on every
+        // pixel. Added again by the composite on top of a frame that already had
+        // the sky in it, that is what made the ground read as white. A dry slope
+        // reflects 3% of what a mirror would, and now says so.
+        let reflectivity = self.specular(hit);
         let mut reflection = V3::ZERO;
-        if options.reflections {
+        if options.reflections && reflectivity > 0. {
             let view = ray.direction;
             let cos_i = normal.dot(-view);
             if cos_i > 0. {
@@ -440,6 +448,7 @@ impl Tracer {
                     }
                     None => self.environment.escape(mirror, self.scene_limit()),
                 };
+                reflection = reflection * reflectivity;
             }
         }
         sample.reflection = reflection;

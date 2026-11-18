@@ -35,7 +35,18 @@ grep -q 'float3 reflection = float3(0.0, 0.0, 0.0);' "$SHADER" \
 grep -q 'float3 indirect = float3(0.0, 0.0, 0.0);' "$SHADER" \
   || fail "indirect must accumulate as float3"
 
-# 4. Shapes DXC refuses outright, which cost several CI rounds to discover.
+# 4. Both tracers must weight the mirror term by the surface's own reflectance.
+#    Neither did: flat terrain (`specular` 0.03) added a full mirror of the sky,
+#    and the composite added that on top of a frame that already carried the
+#    sky, so the ground rendered white. A sky reflection is now multiplied by
+#    how reflective the surface actually is, in both tracers.
+grep -q 'reflection = reflection \* reflectivity;' "$PACKER" \
+  || fail "the CPU tracer must weight its reflection by the surface's specular"
+if ! grep -q 'float3 through = float3(mat.a, mat.a, mat.a);' "$SHADER"; then
+  fail "the DXIL shader must start its mirror chain at the surface's own specular, not 1.0"
+fi
+
+# 5. Shapes DXC refuses outright, which cost several CI rounds to discover.
 if python3 - "$SHADER" <<'PY'
 import re, sys
 s = open(sys.argv[1]).read()

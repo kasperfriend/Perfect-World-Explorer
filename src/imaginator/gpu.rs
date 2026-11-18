@@ -513,7 +513,13 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
     bounces = bounces + 1u;
    }
   }
-  if (terms & TERM_REFLECTIONS) != 0u {
+  // Weighted by the surface's own reflectance (`material.a`), exactly as the
+  // CPU tracer now does. Unweighted, every surface added a full mirror of the
+  // sky: flat terrain at 3% reflectance added the same bright value a mirror
+  // would, and the composite added it on top of a frame that already carried
+  // the sky, which is what turned the ground white.
+  let reflectivity = mat.a;
+  if (terms & TERM_REFLECTIONS) != 0u && reflectivity > 0.0 {
    let cos_i = dot(normal, -rd);
    if cos_i > 0.0 {
     let mirror = normalize(rd + normal * (2.0 * cos_i));
@@ -524,6 +530,7 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
      reflection = reflection + sky(mirror.y);
     }
    }
+   reflection = reflection * reflectivity;
   }
  }
  let inv = 1.0 / f32(samples);
