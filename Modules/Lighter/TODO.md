@@ -13,7 +13,7 @@ it does not set execution order.
 ### Phase 0 — Performance
 
 1. [x] Remove live GPU completion waits in the world/RT paths, use later-frame callbacks with a three-slot readback ring, and verify a windowed run/resize and the explicit headless PNG. See [the caller audit and synthetic regression results](performance-waits.md).
-2. [ ] Cache BLAS by stable chunk and geometry identity; admit/evict with residency. Update posed positions in place and refit their BLAS. Dirty TLAS only for instance membership/transforms, and rebuild software BVH topology only when the set changes. Camera-only movement in a static scene must trigger zero rebuilds.
+2. [x] Cache BLAS by stable chunk and geometry identity; admit/evict with residency. Update posed positions in place and refit their BLAS. Dirty TLAS only for instance membership/transforms, and rebuild software BVH topology only when the set changes. Camera-only movement in a static scene must trigger zero rebuilds. See [the synthetic residency/refit results](performance.md#resident-acceleration-structures-step-2).
 3. [ ] Retain buffers, textures and bind groups across frames. Grow to `max(needed, capacity * 2)`, preserve contents when needed, and otherwise write in place. Log zero steady-state resource creation.
 4. [ ] Audit `gpu.rs`, `lighter/scenery.rs` and `lighter/host.rs` clones. Borrow read-only data, share lifetimes with `Arc`, and use cached asset IDs. Check frame time as chunk count grows.
 5. [ ] Default to 1 spp, 1 bounce and half ray resolution. Reproject and blend about 0.1 new / 0.9 history with a camera-movement reset; bilinear or edge-aware upscale in presentation. Higher quality is opt-in.

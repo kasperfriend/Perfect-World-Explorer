@@ -1,5 +1,7 @@
 //! Ray-resolution radiance processing, shared by software and Vulkan queries.
-use super::{binding, resource, textures::COLOR_SIDE, Frame, Mode, Storage, PIXELS};
+use super::{
+    binding, image_limit, textures::COLOR_SIDE, Bindings, Frame, Mode, Storage, PIXELS, PIXEL_BYTES,
+};
 
 pub(super) const SHADER: &str = include_str!("post.wgsl");
 // Match pixels.wgsl. These bits describe which animation inputs a ray used.
@@ -108,6 +110,9 @@ pub(super) struct Post {
     parameters: wgpu::Buffer,
     history: Option<Storage>,
     filtered: Option<Storage>,
+    accumulate_bind: Bindings<3>,
+    denoise_bind: Bindings<3>,
+    buffers_created: u64,
 }
 
 impl Post {
@@ -161,7 +166,17 @@ impl Post {
             parameters,
             history: None,
             filtered: None,
+            accumulate_bind: Bindings::default(),
+            denoise_bind: Bindings::default(),
+            buffers_created: 1,
         }
+    }
+
+    pub(super) fn allocation_counts(&self) -> (u64, u64) {
+        (
+            self.buffers_created,
+            self.accumulate_bind.created + self.denoise_bind.created,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -175,25 +190,30 @@ impl Post {
         history: Option<HistoryUse>,
         denoise: bool,
     ) -> &'a wgpu::Buffer {
-        let allocate = |slot: &mut Option<Storage>, label: &'static str, enabled: bool| {
-            if !enabled {
-                *slot = None;
-            } else if slot.as_ref().is_none_or(|b| b.0.size() != raw.size()) {
+        let needed = u64::from(extent[0]) * u64::from(extent[1]) * PIXEL_BYTES;
+        let allocate = |slot: &mut Option<Storage>, label: &'static str| {
+            if let Some(buffer) = slot {
+                buffer.ensure(device, label, needed, image_limit(device))
+            } else {
                 *slot = Some(Storage::new(
                     device,
                     label,
-                    raw.size(),
+                    needed,
                     wgpu::BufferUsages::empty(),
                 ));
+                true
             }
         };
-        allocate(
-            &mut self.history,
-            "Lighter accumulated image",
-            history.is_some(),
-        );
-        allocate(&mut self.filtered, "Lighter filtered image", denoise);
-        if !denoise && history.is_none() {
+        let progress = history.is_some();
+        if progress {
+            self.buffers_created +=
+                u64::from(allocate(&mut self.history, "Lighter accumulated image"));
+        }
+        if denoise {
+            self.buffers_created +=
+                u64::from(allocate(&mut self.filtered, "Lighter filtered image"));
+        }
+        if !denoise && !progress {
             return raw;
         }
         let history = history.map_or([0; 4], |h| [u32::from(h.reuse), h.changed_animations, 0, 0]);
@@ -201,45 +221,39 @@ impl Post {
         let dispatch = |encoder: &mut wgpu::CommandEncoder,
                         label: &str,
                         pipeline: &wgpu::ComputePipeline,
-                        input: &wgpu::Buffer,
-                        output: &wgpu::Buffer| {
-            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &self.layout,
-                entries: &[
-                    resource(0, &self.parameters),
-                    resource(1, input),
-                    resource(2, output),
-                ],
-            });
+                        bind: &wgpu::BindGroup| {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some(label),
                 timestamp_writes: None,
             });
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind, &[]);
+            pass.set_bind_group(0, bind, &[]);
             pass.dispatch_workgroups(extent[0].div_ceil(8), extent[1].div_ceil(8), 1);
         };
         let mut image = raw;
-        if let Some(history) = &self.history {
-            dispatch(
-                encoder,
-                "Lighter accumulate radiance",
-                &self.accumulate,
-                image,
-                &history.0,
+        if progress {
+            let history = &self.history.as_ref().unwrap().0;
+            let label = "Lighter accumulate radiance";
+            let bind = self.accumulate_bind.get(
+                device,
+                label,
+                &self.layout,
+                [&self.parameters, image, history],
             );
-            image = &history.0;
+            dispatch(encoder, label, &self.accumulate, bind);
+            image = history;
         }
-        if let Some(filtered) = &self.filtered {
-            dispatch(
-                encoder,
-                "Lighter filter radiance",
-                &self.denoise,
-                image,
-                &filtered.0,
+        if denoise {
+            let filtered = &self.filtered.as_ref().unwrap().0;
+            let label = "Lighter filter radiance";
+            let bind = self.denoise_bind.get(
+                device,
+                label,
+                &self.layout,
+                [&self.parameters, image, filtered],
             );
-            image = &filtered.0;
+            dispatch(encoder, label, &self.denoise, bind);
+            image = filtered;
         }
         image
     }

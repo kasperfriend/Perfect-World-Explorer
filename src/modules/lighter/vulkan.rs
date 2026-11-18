@@ -2,12 +2,15 @@
 //! creation in wgpu-core. Keep that interop here, on the viewer's *same* device
 //! and queue. No CPU image readback and no second adapter.
 use super::scene::{Fingerprint, MeshKey, MeshRange, Packet, DYNAMIC_BIT, VERTEX_WORDS};
-use super::Frame;
+use super::{grown_capacity, image_limit, storage_limit, Frame};
 use ash::{extensions::khr, vk};
 use std::{
     collections::{HashMap, HashSet},
     ffi::CStr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use wgpu::hal::{api::Vulkan, vulkan::Device as HalDevice};
 
@@ -96,6 +99,9 @@ struct Context {
     scratch_align: u64,
     max_primitives: u64,
     max_instances: u64,
+    storage_limit: u64,
+    buffers_created: AtomicU64,
+    structures_created: AtomicU64,
 }
 
 impl Context {
@@ -104,6 +110,7 @@ impl Context {
         if !device.features().contains(FEATURES) {
             return Err("Vulkan ray queries were not enabled on this device".into());
         }
+        let storage_limit = storage_limit(device) as u64;
         unsafe {
             device
                 .as_hal::<Vulkan, _, _>(|hal| {
@@ -128,6 +135,9 @@ impl Context {
                         .max(1),
                         max_primitives: p.max_primitive_count,
                         max_instances: p.max_instance_count,
+                        storage_limit,
+                        buffers_created: AtomicU64::new(0),
+                        structures_created: AtomicU64::new(0),
                         device,
                     }))
                 })
@@ -152,6 +162,7 @@ struct Buffer {
     memory: vk::DeviceMemory,
     size: u64,
     owns_handle: bool,
+    id: u64,
 }
 
 impl Buffer {
@@ -179,6 +190,7 @@ impl Buffer {
                 memory: vk::DeviceMemory::null(),
                 size,
                 owns_handle: true,
+                id: 0,
             };
             let req = d.get_buffer_memory_requirements(handle);
             let index = (0..ctx.memory.memory_type_count)
@@ -202,6 +214,7 @@ impl Buffer {
                 .map_err(vkerr("allocate buffer"))?;
             d.bind_buffer_memory(handle, buffer.memory, 0)
                 .map_err(vkerr("bind buffer"))?;
+            buffer.id = ctx.buffers_created.fetch_add(1, Ordering::Relaxed) + 1;
             Ok(buffer)
         }
     }
@@ -214,8 +227,8 @@ impl Buffer {
         }
     }
 
-    fn write(&self, data: &[u8]) -> R<()> {
-        assert!((data.len() as u64) <= self.size);
+    fn write(&self, offset: u64, data: &[u8]) -> R<()> {
+        assert!(offset + data.len() as u64 <= self.size);
         if data.is_empty() {
             return Ok(());
         }
@@ -224,7 +237,11 @@ impl Buffer {
             let ptr = d
                 .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
                 .map_err(vkerr("map upload"))?;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast(), data.len());
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                ptr.cast::<u8>().add(offset as usize),
+                data.len(),
+            );
             d.unmap_memory(self.memory);
         }
         Ok(())
@@ -248,6 +265,7 @@ struct Upload {
     gpu: Buffer,
     staging: Buffer,
     bytes: u64,
+    offset: u64,
 }
 impl Upload {
     fn set(
@@ -255,10 +273,18 @@ impl Upload {
         ctx: &Arc<Context>,
         data: &[u8],
         usage: vk::BufferUsageFlags,
+        retained_prefix: usize,
     ) -> R<()> {
         let needed = (data.len() as u64).max(16);
-        if slot.as_ref().is_none_or(|buffer| buffer.gpu.size < needed) {
-            let capacity = needed.next_power_of_two();
+        let old = slot.as_ref().map_or(0, |b| b.gpu.size);
+        let grew = old < needed;
+        if grew {
+            let limit = if usage.contains(STORAGE) {
+                ctx.storage_limit
+            } else {
+                u64::MAX
+            };
+            let capacity = grown_capacity(needed, old, limit);
             *slot = Some(Self {
                 gpu: Buffer::new(
                     ctx,
@@ -268,23 +294,31 @@ impl Upload {
                 )?,
                 staging: Buffer::new(ctx, capacity, vk::BufferUsageFlags::TRANSFER_SRC, HOST)?,
                 bytes: 0,
+                offset: 0,
             });
         }
         let buffer = slot.as_mut().unwrap();
         buffer.bytes = data.len() as u64;
-        buffer.staging.write(data)
+        buffer.offset = if grew || retained_prefix > data.len() {
+            0
+        } else {
+            retained_prefix as u64
+        };
+        buffer
+            .staging
+            .write(buffer.offset, &data[buffer.offset as usize..])
     }
 
     unsafe fn encode(&self, cmd: vk::CommandBuffer) {
-        if self.bytes > 0 {
+        if self.bytes > self.offset {
             self.gpu.ctx.device.cmd_copy_buffer(
                 cmd,
                 self.staging.handle,
                 self.gpu.handle,
                 &[vk::BufferCopy {
-                    src_offset: 0,
-                    dst_offset: 0,
-                    size: self.bytes,
+                    src_offset: self.offset,
+                    dst_offset: self.offset,
+                    size: self.bytes - self.offset,
                 }],
             );
         }
@@ -314,6 +348,7 @@ impl Structure {
             )
         }
         .map_err(vkerr("create acceleration structure"))?;
+        ctx.structures_created.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             storage,
             handle,
@@ -383,15 +418,10 @@ impl Build {
                 &[self.count],
             )
         };
-        if slot
-            .as_ref()
-            .is_none_or(|s| s.storage.size < sizes.acceleration_structure_size)
-        {
-            *slot = Some(Structure::new(
-                ctx,
-                sizes.acceleration_structure_size,
-                self.ty,
-            )?);
+        let capacity = slot.as_ref().map_or(0, |s| s.storage.size);
+        if capacity < sizes.acceleration_structure_size || slot.is_none() {
+            let capacity = grown_capacity(sizes.acceleration_structure_size, capacity, u64::MAX);
+            *slot = Some(Structure::new(ctx, capacity, self.ty)?);
         }
         slot.as_mut().unwrap().update_scratch = sizes.update_scratch_size;
         Ok(sizes.build_scratch_size)
@@ -681,6 +711,7 @@ pub struct Renderer {
     revision: Option<u64>,
     texture_len: usize,
     last_moving: Vec<u32>,
+    bound_ids: Option<[u64; 6]>,
     pub(super) as_builds: [u64; 3],
     pub(super) as_refits: [u64; 3],
 }
@@ -713,9 +744,18 @@ impl Renderer {
             revision: None,
             texture_len: 0,
             last_moving: Vec::new(),
+            bound_ids: None,
             as_builds: [0; 3],
             as_refits: [0; 3],
         })
+    }
+
+    pub(super) fn allocation_counts(&self) -> [u64; 3] {
+        [
+            self.core.ctx.buffers_created.load(Ordering::Relaxed),
+            1,
+            self.core.ctx.structures_created.load(Ordering::Relaxed),
+        ]
     }
 
     fn blas(ctx: &Context, packet: &Packet, m: &MeshRange, base: u64, update: bool) -> R<Build> {
@@ -816,6 +856,7 @@ impl Renderer {
                 ctx,
                 bytemuck::cast_slice(&plan.instance_data),
                 BUILD_INPUT | ADDRESS,
+                0,
             )?;
             let tlas = Build {
                 ty: vk::AccelerationStructureTypeKHR::TOP_LEVEL,
@@ -863,7 +904,8 @@ impl Renderer {
         }
         let ctx = &self.core.ctx;
         let d = &ctx.device;
-        if self.output.as_ref().is_none_or(|o| o.raw.size != size) {
+        let old_capacity = self.output.as_ref().map_or(0, |o| o.raw.size);
+        if old_capacity < size {
             // The native fence does not cover the wgpu denoiser/present read
             // submitted *after* it. Don't destroy the imported VkBuffer (or
             // its externally owned allocation) until wgpu has retired it.
@@ -872,9 +914,10 @@ impl Renderer {
             {
                 return Ok(false);
             }
+            let capacity = grown_capacity(size, old_capacity, image_limit(device) & !3);
             let raw = Buffer::new(
                 ctx,
-                size,
+                capacity,
                 STORAGE | vk::BufferUsageFlags::TRANSFER_DST,
                 LOCAL,
             )?;
@@ -883,7 +926,7 @@ impl Renderer {
             // its fence signals; this also works for device-local VRAM.
             self.core.begin_commands()?;
             unsafe {
-                d.cmd_fill_buffer(self.core.commands, raw.handle, 0, size, 0);
+                d.cmd_fill_buffer(self.core.commands, raw.handle, 0, capacity, 0);
                 d.cmd_pipeline_barrier(
                     self.core.commands,
                     vk::PipelineStageFlags::TRANSFER,
@@ -912,7 +955,7 @@ impl Renderer {
                     HalDevice::buffer_from_raw(output.raw.handle),
                     &wgpu::BufferDescriptor {
                         label: Some("Lighter ray-query image"),
-                        size,
+                        size: output.raw.size,
                         usage: wgpu::BufferUsages::STORAGE,
                         mapped_at_creation: false,
                     },
@@ -940,10 +983,11 @@ impl Renderer {
         let input = STORAGE | BUILD_INPUT | ADDRESS;
         let ctx = &self.core.ctx;
         if static_changed {
-            Upload::set(&mut self.world, ctx, world.bytes(), input)?;
+            Upload::set(&mut self.world, ctx, world.bytes(), input, 0)?;
         }
         if textures_changed {
-            Upload::set(&mut self.textures, ctx, texels, STORAGE)?;
+            let prefix = if static_changed { 0 } else { self.texture_len };
+            Upload::set(&mut self.textures, ctx, texels, STORAGE, prefix)?;
         }
         let moving_changed = self.last_moving != moving.words;
         let moving_keys_changed = !self
@@ -952,7 +996,7 @@ impl Renderer {
             .copied()
             .eq(moving.meshes.iter().map(|m| m.key));
         if moving_changed {
-            Upload::set(&mut self.moving, ctx, moving.bytes(), input)?;
+            Upload::set(&mut self.moving, ctx, moving.bytes(), input, 0)?;
         }
         let plan = if static_changed || moving_changed || moving_keys_changed {
             Some(self.prepare_accel(world, moving)?)
@@ -964,14 +1008,16 @@ impl Renderer {
         let cmd = self.core.commands;
         let output = self.output.as_ref().expect("prepare image before tracing");
         let image = output.imported.as_ref().expect("initialized interop image");
-        assert_eq!(output.raw.size, image_size);
+        assert!(output.raw.size >= image_size);
         let w = self.world.as_ref().unwrap();
         let m = self.moving.as_ref().unwrap();
         let textures = self.textures.as_ref().unwrap();
-        self.frame.write(bytemuck::bytes_of(frame))?;
+        self.frame.write(0, bytemuck::bytes_of(frame))?;
         let scratch_bytes = plan.as_ref().map_or(0, |p| p.scratch_bytes) + ctx.scratch_align;
         if self.scratch.as_ref().is_none_or(|s| s.size < scratch_bytes) {
-            self.scratch = Some(Buffer::new(ctx, scratch_bytes, STORAGE | ADDRESS, LOCAL)?);
+            let previous = self.scratch.as_ref().map_or(0, |b| b.size);
+            let capacity = grown_capacity(scratch_bytes, previous, u64::MAX);
+            self.scratch = Some(Buffer::new(ctx, capacity, STORAGE | ADDRESS, LOCAL)?);
         }
         let scratch = self
             .scratch
@@ -981,46 +1027,45 @@ impl Renderer {
             .div_ceil(ctx.scratch_align)
             * ctx.scratch_align;
         let tlas = self.tlas.as_ref().unwrap();
-        let inputs = [
-            (&self.frame, self.frame.size),
-            (&w.gpu, w.bytes),
-            (&m.gpu, m.bytes),
-            (&textures.gpu, textures.bytes),
-            (&output.raw, image_size),
-        ];
-        let infos = inputs.map(|(b, size)| vk::DescriptorBufferInfo {
-            buffer: b.handle,
-            offset: 0,
-            range: size,
-        });
-        let mut writes: Vec<_> = infos
-            .iter()
-            .enumerate()
-            .map(|(i, info)| {
-                vk::WriteDescriptorSet::builder()
-                    .dst_set(self.core.set)
-                    .dst_binding(i as u32)
-                    .descriptor_type(if i == 0 {
-                        vk::DescriptorType::UNIFORM_BUFFER
-                    } else {
-                        vk::DescriptorType::STORAGE_BUFFER
-                    })
-                    .buffer_info(std::slice::from_ref(info))
-                    .build()
-            })
-            .collect();
-        let mut acceleration = vk::WriteDescriptorSetAccelerationStructureKHR::builder()
-            .acceleration_structures(std::slice::from_ref(&tlas.handle));
-        let mut bind_tlas = vk::WriteDescriptorSet::builder()
-            .dst_set(self.core.set)
-            .dst_binding(5)
-            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-            .push_next(&mut acceleration)
-            .build();
-        bind_tlas.descriptor_count = 1;
-        writes.push(bind_tlas);
+        let inputs = [&self.frame, &w.gpu, &m.gpu, &textures.gpu, &output.raw];
+        let bound = std::array::from_fn(|i| inputs.get(i).map_or(tlas.storage.id, |b| b.id));
+        if self.bound_ids != Some(bound) {
+            let infos = inputs.map(|b| vk::DescriptorBufferInfo {
+                buffer: b.handle,
+                offset: 0,
+                range: b.size,
+            });
+            let mut acceleration = vk::WriteDescriptorSetAccelerationStructureKHR::builder()
+                .acceleration_structures(std::slice::from_ref(&tlas.handle));
+            let mut writes: [_; 6] = std::array::from_fn(|i| {
+                if i == 5 {
+                    vk::WriteDescriptorSet::default()
+                } else {
+                    vk::WriteDescriptorSet::builder()
+                        .dst_set(self.core.set)
+                        .dst_binding(i as u32)
+                        .descriptor_type(if i == 0 {
+                            vk::DescriptorType::UNIFORM_BUFFER
+                        } else {
+                            vk::DescriptorType::STORAGE_BUFFER
+                        })
+                        .buffer_info(std::slice::from_ref(&infos[i]))
+                        .build()
+                }
+            });
+            writes[5] = vk::WriteDescriptorSet::builder()
+                .dst_set(self.core.set)
+                .dst_binding(5)
+                .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                .push_next(&mut acceleration)
+                .build();
+            writes[5].descriptor_count = 1;
+            unsafe {
+                d.update_descriptor_sets(&writes, &[]);
+            }
+            self.bound_ids = Some(bound);
+        }
         unsafe {
-            d.update_descriptor_sets(&writes, &[]);
             self.core.begin_commands()?;
             if static_changed {
                 w.encode(cmd);

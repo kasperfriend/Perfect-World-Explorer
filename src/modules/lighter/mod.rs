@@ -14,6 +14,7 @@ mod vulkan;
 use bytemuck::{Pod, Zeroable};
 use scene::Packet;
 pub(crate) use settings::{Mode, Settings};
+use std::time::Instant;
 use textures::Textures;
 
 const PIXELS: &str = include_str!("pixels.wgsl");
@@ -77,8 +78,9 @@ struct Pixel {
     guide: [u32; 4],
 }
 const PIXEL_BYTES: u64 = std::mem::size_of::<Pixel>() as u64;
-// Keep trace + history + spatial scratch bounded at high output resolutions.
-const MAX_RAY_IMAGE_BYTES: u64 = 256 << 20;
+// Reserve a stable share even when a retained stage is toggled off. A
+// resolution increase in another stage must not consume its reservation.
+const MAX_IMAGE_BYTES: u64 = (256 << 20) / 3;
 
 pub const WATER_MIRROR: u32 = 8;
 pub const CULL_BUILDINGS: u32 = 16;
@@ -129,6 +131,54 @@ fn checked_pipeline<T>(device: &wgpu::Device, create: impl FnOnce() -> T) -> Res
     }
 }
 
+fn image_limit(device: &wgpu::Device) -> u64 {
+    (storage_limit(device) as u64).min(MAX_IMAGE_BYTES)
+}
+
+fn grown_capacity(needed: u64, current: u64, limit: u64) -> u64 {
+    debug_assert!(needed <= limit);
+    needed.max(current.saturating_mul(2).min(limit))
+}
+
+/// Bindings depend on actual resources, not pixels, scene revisions or the
+/// addresses of Rust wrappers that may be moved by their owner.
+struct Bindings<const N: usize> {
+    active: Option<([wgpu::Id<wgpu::Buffer>; N], wgpu::BindGroup)>,
+    created: u64,
+}
+impl<const N: usize> Default for Bindings<N> {
+    fn default() -> Self {
+        Self {
+            active: None,
+            created: 0,
+        }
+    }
+}
+impl<const N: usize> Bindings<N> {
+    fn get(
+        &mut self,
+        device: &wgpu::Device,
+        label: &str,
+        layout: &wgpu::BindGroupLayout,
+        buffers: [&wgpu::Buffer; N],
+    ) -> &wgpu::BindGroup {
+        let ids = buffers.map(wgpu::Buffer::global_id);
+        if self.active.as_ref().is_none_or(|(old, _)| *old != ids) {
+            let entries: [_; N] = std::array::from_fn(|i| resource(i as u32, buffers[i]));
+            self.active = Some((
+                ids,
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(label),
+                    layout,
+                    entries: &entries,
+                }),
+            ));
+            self.created += 1;
+        }
+        &self.active.as_ref().unwrap().1
+    }
+}
+
 struct Storage(wgpu::Buffer);
 impl Storage {
     fn new(
@@ -144,21 +194,48 @@ impl Storage {
             mapped_at_creation: false,
         }))
     }
+    fn ensure(
+        &mut self,
+        device: &wgpu::Device,
+        label: &'static str,
+        needed: u64,
+        limit: u64,
+    ) -> bool {
+        if self.0.size() >= needed {
+            return false;
+        }
+        *self = Self::new(
+            device,
+            label,
+            grown_capacity(needed, self.0.size(), limit),
+            self.0.usage(),
+        );
+        true
+    }
+
     fn upload(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         label: &'static str,
         data: &[u8],
-    ) {
-        let len = data.len() as u64;
-        if self.0.size() < len {
-            let size = len
-                .next_power_of_two()
-                .min(u64::from(device.limits().max_storage_buffer_binding_size));
-            *self = Self::new(device, label, size, wgpu::BufferUsages::COPY_DST);
+        retained_prefix: usize,
+    ) -> bool {
+        let grew = self.ensure(
+            device,
+            label,
+            data.len() as u64,
+            storage_limit(device) as u64,
+        );
+        let offset = if grew || retained_prefix > data.len() {
+            0
+        } else {
+            retained_prefix
+        };
+        if offset < data.len() {
+            queue.write_buffer(&self.0, offset as u64, &data[offset..]);
         }
-        queue.write_buffer(&self.0, 0, data);
+        grew
     }
 }
 
@@ -170,6 +247,8 @@ struct Software {
     moving: Storage,
     textures: Storage,
     output: Storage,
+    binds: Bindings<5>,
+    buffers_created: u64,
     revision: Option<u64>,
     texture_len: usize,
     last_moving: Vec<u32>,
@@ -230,6 +309,8 @@ impl Software {
                 PIXEL_BYTES,
                 wgpu::BufferUsages::empty(),
             ),
+            binds: Bindings::default(),
+            buffers_created: 5,
             revision: None,
             texture_len: 0,
             last_moving: Vec::new(),
@@ -248,24 +329,42 @@ impl Software {
         world: &World,
         moving: &Packet,
     ) -> &wgpu::Buffer {
-        if self.output.0.size() != bytes {
-            self.output = Storage::new(device, "Lighter image", bytes, wgpu::BufferUsages::empty());
-        }
+        self.buffers_created +=
+            u64::from(
+                self.output
+                    .ensure(device, "Lighter image", bytes, image_limit(device)),
+            );
         let new_world = self.revision != Some(world.revision);
         if new_world {
-            self.world
-                .upload(device, queue, "Lighter world", world.packet.bytes());
+            self.buffers_created += u64::from(self.world.upload(
+                device,
+                queue,
+                "Lighter world",
+                world.packet.bytes(),
+                0,
+            ));
             self.revision = Some(world.revision);
         }
         let texels = world.textures.bytes();
         if new_world || self.texture_len != texels.len() {
-            self.textures
-                .upload(device, queue, "Lighter texels", texels);
+            // The bank grows only by appending between world installs. A
+            // replacement still gets the original prefix from its CPU owner.
+            let prefix = if new_world { 0 } else { self.texture_len };
+            self.buffers_created +=
+                u64::from(
+                    self.textures
+                        .upload(device, queue, "Lighter texels", texels, prefix),
+                );
             self.texture_len = texels.len();
         }
         if self.last_moving != moving.words {
-            self.moving
-                .upload(device, queue, "Lighter moving geometry", moving.bytes());
+            self.buffers_created += u64::from(self.moving.upload(
+                device,
+                queue,
+                "Lighter moving geometry",
+                moving.bytes(),
+                0,
+            ));
             self.last_moving.clone_from(&moving.words);
             #[cfg(test)]
             {
@@ -273,23 +372,24 @@ impl Software {
             }
         }
         queue.write_buffer(&self.frame, 0, bytemuck::bytes_of(frame));
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Lighter ray data"),
-            layout: &self.layout,
-            entries: &[
-                resource(0, &self.frame),
-                resource(1, &self.world.0),
-                resource(2, &self.moving.0),
-                resource(3, &self.textures.0),
-                resource(4, &self.output.0),
+        let bind = self.binds.get(
+            device,
+            "Lighter ray data",
+            &self.layout,
+            [
+                &self.frame,
+                &self.world.0,
+                &self.moving.0,
+                &self.textures.0,
+                &self.output.0,
             ],
-        });
+        );
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Lighter primary and secondary rays (software)"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind, &[]);
+        pass.set_bind_group(0, bind, &[]);
         pass.dispatch_workgroups(frame.extent[0].div_ceil(8), frame.extent[1].div_ceil(8), 1);
         &self.output.0
     }
@@ -299,6 +399,7 @@ struct Present {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     extent: wgpu::Buffer,
+    binds: Bindings<2>,
 }
 impl Present {
     fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
@@ -363,12 +464,13 @@ impl Present {
             layout,
             pipeline,
             extent,
+            binds: Bindings::default(),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn draw(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -383,14 +485,15 @@ impl Present {
             0,
             bytemuck::bytes_of(&[extent, [u32::from(guided), 0, 0, 0]]),
         );
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Lighter composition"),
-            layout: &self.layout,
-            entries: &[resource(0, image), resource(1, &self.extent)],
-        });
+        let bind = self.binds.get(
+            device,
+            "Lighter composition",
+            &self.layout,
+            [image, &self.extent],
+        );
         let mut pass = output_pass(encoder, target, depth);
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind, &[]);
+        pass.set_bind_group(0, bind, &[]);
         pass.draw(0..3, 0..1);
     }
 }
@@ -431,6 +534,7 @@ pub struct Lighter {
     present: Option<Present>,
     post: Option<post::Post>,
     history: post::History,
+    allocation_sample: Option<(Instant, [u64; 3], u64)>,
     pub(crate) moving_accel: scene::AccelCache,
     pub settings: Settings,
     armed: bool,
@@ -457,6 +561,7 @@ impl Default for Lighter {
             present: None,
             post: None,
             history: post::History::default(),
+            allocation_sample: None,
             moving_accel: Default::default(),
             settings: Settings::default(),
             armed: false,
@@ -576,11 +681,51 @@ impl Lighter {
         self.status = None;
     }
 
+    fn allocation_counts(&self) -> [u64; 3] {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let [mut buffers, mut bindings, structures] = self
+            .hardware
+            .as_ref()
+            .map_or([0; 3], vulkan::Renderer::allocation_counts);
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        let [mut buffers, mut bindings, structures] = [0; 3];
+        if let Some(s) = &self.software {
+            buffers += s.buffers_created;
+            bindings += s.binds.created;
+        }
+        if let Some(p) = &self.present {
+            buffers += 1;
+            bindings += p.binds.created;
+        }
+        if let Some(p) = &self.post {
+            let (b, g) = p.allocation_counts();
+            buffers += b;
+            bindings += g;
+        }
+        [buffers, bindings, structures]
+    }
+
+    fn log_allocations(&mut self) {
+        if !crate::diagnostics::enabled(crate::diagnostics::Channel::TimingFrame) {
+            self.allocation_sample = None;
+            return;
+        }
+        let counts = self.allocation_counts();
+        let (since, old, frames) = self
+            .allocation_sample
+            .get_or_insert_with(|| (Instant::now(), [0; 3], 0));
+        *frames += 1;
+        if since.elapsed().as_secs_f64() >= 1. {
+            let [buffers, bindings, structures] = std::array::from_fn(|i| counts[i] - old[i]);
+            crate::diag!(TimingFrame, "Lighter GPU creations in {} rendered frames: {buffers} buffers, 0 textures, {bindings} bindings, {structures} acceleration structures", *frames);
+            *since = Instant::now();
+            *old = counts;
+            *frames = 0;
+        }
+    }
+
     fn ray_extent(&self, device: &wgpu::Device, w: u32, h: u32) -> Result<(u32, u32), String> {
-        let storage = storage_limit(device) as u64;
-        let image_count =
-            1 + u64::from(self.settings.denoiser) + u64::from(self.settings.progressive);
-        let pixel_limit = storage.min(MAX_RAY_IMAGE_BYTES / image_count) / PIXEL_BYTES;
+        let pixel_limit = image_limit(device) / PIXEL_BYTES;
         if pixel_limit == 0 {
             return Err("Lighter cannot allocate ray image".into());
         }
@@ -761,7 +906,7 @@ impl Lighter {
         } else {
             image
         };
-        self.present.as_ref().unwrap().draw(
+        self.present.as_mut().unwrap().draw(
             device,
             queue,
             encoder,
@@ -778,6 +923,7 @@ impl Lighter {
             eprintln!("Lighter: {message}");
         }
         self.status = Some(message);
+        self.log_allocations();
         Ok(true)
     }
 

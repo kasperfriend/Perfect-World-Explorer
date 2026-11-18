@@ -679,6 +679,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_streamed_bmds(&mut h);
     exercise_terrain_seam(&mut h);
     exercise_accel_reuse(&mut h);
+    exercise_resource_reuse(&mut h);
 }
 
 fn assert_radiance(label: &str, pixel: ([u8; 4], f32), linear: [f32; 3]) {
@@ -1450,6 +1451,54 @@ fn exercise_accel_reuse(h: &mut Harness) {
     );
     assert_eq!(cache.builds, [1, 1]);
     assert_eq!(cache.refits, [1, 1]);
+}
+
+#[test]
+fn resident_capacity_doubles_up_to_the_device_limit() {
+    assert_eq!(grown_capacity(24, 16, 500), 32);
+    assert_eq!(grown_capacity(42, 16, 500), 42);
+    assert_eq!(grown_capacity(280, 256, 300), 300);
+}
+
+fn exercise_resource_reuse(h: &mut Harness) {
+    let mut bank = Textures::default();
+    let tile = bank
+        .tile([2, 2], 2, textures::Filter::Color, |_, _| 0xff0099ff)
+        .unwrap();
+    let mut b = Builder::default();
+    let id = upright(&mut b, -4., [1.; 4], 0, tile);
+    put(&mut b, id);
+    h.ray.install(Ok((b.finish(), bank)));
+    h.ray.settings.progressive = true;
+    h.ray.settings.denoiser = true;
+    let empty = Builder::default().finish();
+    let before = h.pixel(test_frame(Vec3::ZERO, -Vec3::Z, 25), &empty);
+    assert!(before.0[0] > 245 && before.0[1] > 70 && before.0[2] < 5 && before.1 > 0.);
+    // Never lose earlier texture addresses/pixels when the bank appends.
+    h.ray
+        .world
+        .as_mut()
+        .unwrap()
+        .textures
+        .tile([256, 256], 256, textures::Filter::Color, |x, y| {
+            0xff000000 | (x + y)
+        })
+        .unwrap();
+    let resized = h.pixel(test_frame(Vec3::ZERO, -Vec3::Z, 27), &empty);
+    assert_eq!(before, resized);
+    let allocations = h.ray.allocation_counts();
+    for e in [27, 21, 25, 27] {
+        let frame = test_frame(Vec3::X * 0.1, -Vec3::Z, e);
+        let p = h.pixel(frame, &empty);
+        assert_eq!(p.0, before.0);
+        assert!((p.1 - before.1).abs() < 1.0e-6);
+        assert_eq!(
+            h.ray.allocation_counts(),
+            allocations,
+            "steady frame at {e}x{e} allocated resources"
+        );
+    }
+    eprintln!("Lighter: zero steady-frame buffer, texture, binding, and AS creations after image/texture growth");
 }
 
 fn exercise_terrain_seam(h: &mut Harness) {
