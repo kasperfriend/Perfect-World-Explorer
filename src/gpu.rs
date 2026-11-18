@@ -11,7 +11,7 @@ mod lighter_host;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 #[cfg(test)]
-pub(crate) use lighter_host::tests::streamed_bmd_scenes;
+pub(crate) use lighter_host::tests::{stitched_terrain_scene, streamed_bmd_scenes};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,

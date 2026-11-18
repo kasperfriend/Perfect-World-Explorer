@@ -648,6 +648,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_temporal_animation(&mut h);
     exercise_gloss(&mut h);
     exercise_streamed_bmds(&mut h);
+    exercise_terrain_seam(&mut h);
 }
 
 fn assert_radiance(label: &str, pixel: ([u8; 4], f32), linear: [f32; 3]) {
@@ -1289,6 +1290,28 @@ fn exercise_streamed_bmds(h: &mut Harness) {
         mirror.0[2] > 8 && mirror.0[2] < 32 && mirror.1 == both.1,
         "reflect flag lost: {mirror:?}"
     );
+}
+
+fn exercise_terrain_seam(h: &mut Harness) {
+    // Both paths use the viewer's seam builder. Without the fine points in
+    // the far triangle the first probe goes straight through the raised rim
+    // and hits the red surface on the wrong side.
+    h.ray.install(Ok((
+        crate::gpu::stitched_terrain_scene(),
+        Textures::default(),
+    )));
+    h.ray.settings.bounces = 0;
+    h.ray.settings.shadows = false;
+    let empty = Builder::default().finish();
+    for (x, dir, hit_x, color) in [
+        (20., -Vec3::X, 2.4, [0, 255, 0, 255]),
+        (-20., Vec3::X, -4.8, [255, 0, 0, 255]),
+    ] {
+        let frame = test_frame(Vec3::new(x, 2., 4.), dir, 3);
+        let (pixel, depth) = h.pixel(frame, &empty);
+        assert_eq!(pixel, color, "grazing ray crossed a terrain seam at x={x}");
+        assert!((depth - depth_at(frame, Vec3::new(hit_x, 2., 4.))).abs() < 1e-5);
+    }
 }
 
 #[test]

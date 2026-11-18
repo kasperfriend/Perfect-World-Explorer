@@ -205,14 +205,22 @@ impl Feed {
             builder.light(light);
         }
         let terrain_id = builder.surface(Surface::new(0, TERRAIN, 0., 0.));
-        builder.world_mesh(&span(
-            &m.vertices,
-            &m.indices[..m.terrain_end as usize],
-            terrain_id,
-            |_| u32::MAX,
-        )?)?;
-        if !m.detail.terrain_cutoff {
-            builder.world_mesh(&uncovered_far(&self.far, self.near_bounds, terrain_id))?;
+        {
+            let near = span(
+                &m.vertices,
+                &m.indices[..m.terrain_end as usize],
+                terrain_id,
+                |_| u32::MAX,
+            )?;
+            builder.world_mesh(&near)?;
+            if !m.detail.terrain_cutoff {
+                builder.world_mesh(&uncovered_far(
+                    &self.far,
+                    &near,
+                    self.near_bounds,
+                    terrain_id,
+                ))?;
+            }
         }
         let water_mesh = water_mesh(m, &mut builder)?;
         builder.world_mesh(&water_mesh)?;
@@ -486,8 +494,12 @@ fn span(
     })
 }
 
-fn uncovered_far(far: &Mesh, [x0, x1, z0, z1]: [f32; 4], surface: u32) -> Mesh {
-    let triangles: Vec<_> = far
+/// Join the far grid to the actual near perimeter. Their XZ grids align at
+/// block boundaries, but a stride-16 far edge can pass above/below vertices of
+/// the native stride-four perimeter. Split the exterior triangle into a fan
+/// with those exact points on the shared edge, without reintroducing overlap.
+fn uncovered_far(far: &Mesh, near: &Mesh, [x0, x1, z0, z1]: [f32; 4], surface: u32) -> Mesh {
+    let exterior: Vec<_> = far
         .triangles
         .iter()
         .copied()
@@ -498,15 +510,69 @@ fn uncovered_far(far: &Mesh, [x0, x1, z0, z1]: [f32; 4], surface: u32) -> Mesh {
             })
         })
         .collect();
-    if triangles.is_empty() {
+    if exterior.is_empty() {
         return Mesh::default();
     }
-    Mesh {
-        vertices: far.vertices.clone(),
-        surfaces: vec![surface; triangles.len()],
-        layers: vec![],
-        triangles,
+    let mut edges: [Vec<(f32, u32)>; 4] = std::array::from_fn(|_| Vec::new());
+    for &i in near.triangles.iter().flatten() {
+        let [x, _, z] = near.vertices[i as usize].pos;
+        for (edge, (on, distance)) in
+            edges
+                .iter_mut()
+                .zip([(x == x0, z), (x == x1, z), (z == z0, x), (z == z1, x)])
+        {
+            if on {
+                edge.push((distance, i));
+            }
+        }
     }
+    for edge in &mut edges {
+        edge.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        edge.dedup_by(|a, b| a.0 == b.0);
+    }
+    let mut out = Mesh {
+        vertices: far.vertices.clone(),
+        ..Mesh::default()
+    };
+    out.triangles.reserve(exterior.len());
+    out.surfaces.reserve(exterior.len());
+    'triangle: for tri in exterior {
+        for i in 0..3 {
+            let [start, end, apex] = [tri[i], tri[(i + 1) % 3], tri[(i + 2) % 3]];
+            let [ax, _, az] = far.vertices[start as usize].pos;
+            let [bx, _, bz] = far.vertices[end as usize].pos;
+            let (edge, a, b) = if ax == bx && ax == x0 {
+                (&edges[0], az, bz)
+            } else if ax == bx && ax == x1 {
+                (&edges[1], az, bz)
+            } else if az == bz && az == z0 {
+                (&edges[2], ax, bx)
+            } else if az == bz && az == z1 {
+                (&edges[3], ax, bx)
+            } else {
+                continue;
+            };
+            let lo = edge.partition_point(|p| p.0 <= a.min(b));
+            let hi = edge.partition_point(|p| p.0 < a.max(b));
+            if lo >= hi {
+                continue;
+            }
+            // A far cell is aligned to the near rectangle, so a far triangle
+            // outside it can have at most one edge adjacent to the near mesh.
+            let mut previous = start;
+            for j in lo..hi {
+                let at = if a < b { j } else { (hi - 1) - (j - lo) };
+                let id = out.vertices.len() as u32;
+                out.vertices.push(near.vertices[edge[at].1 as usize]);
+                out.tri([previous, id, apex], surface);
+                previous = id;
+            }
+            out.tri([previous, end, apex], surface);
+            continue 'triangle;
+        }
+        out.tri(tri, surface);
+    }
+    out
 }
 
 fn water_mesh(m: &MeshData, builder: &mut Builder) -> Result<Mesh, String> {

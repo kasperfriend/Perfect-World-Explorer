@@ -37,7 +37,9 @@ installed manifests (the repository's `Modules` directory). Settings live in
 ## What is traced
 
 - The resident terrain mesh and layer masks, plus a lower-detail mesh of the
-  native far heightfield when terrain cutoff is off.
+  native far heightfield when terrain cutoff is off. Lighter omits overlapping
+  far triangles and stitches the coarse exterior to the actual near boundary
+  vertices, including non-flat edges. Distant interiors remain simplified.
 - BMD buildings, SpeedTree geometry, instanced grass, posed world models,
   world effect sheets and posed effect meshes. Walker and Populator poses are
   included if active. Secondary rays can hit objects outside the camera
@@ -178,8 +180,9 @@ It also checks eviction and that Hardware RT on a CPU ICD fails without
 falling back to raster. Both ray pixel suites use the production archive and
 streaming code for the same cutout BMD beyond the native load distance: they
 check camera visibility, sun shadow, both water paths, independent water flags,
-reverse-Z depth, movement into the native region, eviction and reload. These
-are synthetic scenes, not real-map visual or physical GPU performance
+reverse-Z depth, movement into the native region, eviction and reload. They
+also check grazing rays from both sides of a stitched, non-flat terrain edge.
+These are synthetic scenes, not real-map visual or physical GPU performance
 certification. The first frame on software Vulkan may be slow while the driver
 compiles the shader.
 

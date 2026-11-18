@@ -214,21 +214,21 @@ fn placement(index: u32, path: &str, position: [f32; 3]) -> crate::scene::Effect
     }
 }
 
+fn ornament_record() -> crate::scene::Ornament {
+    crate::scene::Ornament {
+        export_id: 123,
+        offset: 0,
+        position: [0.; 3],
+        direction: [0., 0., 1.],
+        up: [0., 1., 0.],
+        extra: 0,
+        path: "lighter.bmd".into(),
+        map_id: "a01".into(),
+    }
+}
+
 fn ornament(element: &std::path::Path) -> crate::objects::Objects {
-    crate::objects::Objects::open(
-        element,
-        vec![crate::scene::Ornament {
-            export_id: 123,
-            offset: 0,
-            position: [0.; 3],
-            direction: [0., 0., 1.],
-            up: [0., 1., 0.],
-            extra: 0,
-            path: "lighter.bmd".into(),
-            map_id: "a01".into(),
-        }],
-    )
-    .unwrap()
+    crate::objects::Objects::open(element, vec![ornament_record()]).unwrap()
 }
 
 fn fixture(element: &std::path::Path) -> Terrain {
@@ -398,12 +398,122 @@ fn far_terrain_keeps_only_triangles_outside_the_resident_footprint() {
         surfaces: vec![],
         layers: vec![],
     };
-    let exterior = super::uncovered_far(&far, [-4., 0., 0., 4.], 7);
+    let exterior = super::uncovered_far(&far, &super::Mesh::default(), [-4., 0., 0., 4.], 7);
     assert_eq!(exterior.triangles, [[1, 2, 3]]);
     assert_eq!(exterior.surfaces, [7]);
-    assert!(super::uncovered_far(&far, [-4., 4., 0., 4.], 7)
-        .triangles
-        .is_empty());
+    assert!(
+        super::uncovered_far(&far, &super::Mesh::default(), [-4., 4., 0., 4.], 7)
+            .triangles
+            .is_empty()
+    );
+}
+
+fn seam_fixture(turns: usize) -> (super::Mesh, super::Mesh, [f32; 4]) {
+    // A four-cell perimeter with varying elevations between the stride-16
+    // lattice points. The vertex at z=6 is not used by the near mesh.
+    let vertex = |[mut x, y, mut z]: [f32; 3]| {
+        for _ in 0..turns {
+            (x, z) = (-z, x);
+        }
+        super::Vertex::new([x, y, z], [0., 1., 0.], [0.; 2])
+    };
+    let near = super::Mesh {
+        vertices: [
+            [0., 0., 0.],
+            [0., 5., 4.],
+            [0., -3., 8.],
+            [0., 7., 12.],
+            [0., 0., 16.],
+            [-16., 0., 8.],
+            [0., 199., 6.],
+        ]
+        .into_iter()
+        .map(vertex)
+        .collect(),
+        triangles: (0..4).map(|n| [n + 1, n, 5]).collect(),
+        surfaces: vec![0; 4],
+        layers: vec![],
+    };
+    let far = super::Mesh {
+        vertices: [[0., 0., 0.], [0., 0., 16.], [16., 0., 0.], [16., 0., 16.]]
+            .into_iter()
+            .map(vertex)
+            .collect(),
+        triangles: vec![[1, 3, 0], [3, 2, 0]],
+        surfaces: vec![0; 2],
+        layers: vec![],
+    };
+    let bounds = near.vertices.iter().fold(
+        [
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ],
+        |[xmin, xmax, zmin, zmax], v| {
+            [
+                xmin.min(v.pos[0]),
+                xmax.max(v.pos[0]),
+                zmin.min(v.pos[2]),
+                zmax.max(v.pos[2]),
+            ]
+        },
+    );
+    (near, far, bounds)
+}
+
+#[test]
+fn coarse_far_terrain_matches_the_nonflat_perimeter_in_all_directions() {
+    for turns in 0..4 {
+        let (near, far, bounds) = seam_fixture(turns);
+        let patched = super::uncovered_far(&far, &near, bounds, 7);
+        assert_eq!(patched.triangles.len(), 5);
+        assert_eq!(patched.vertices.len(), 7); // no unreferenced vertex copied
+        assert!(patched.surfaces.iter().all(|&id| id == 7));
+        for pair in near.vertices[..5].windows(2) {
+            let [a, b] = [pair[0].pos, pair[1].pos];
+            let mut uses = 0;
+            for tri in &patched.triangles {
+                let p = tri.map(|i| patched.vertices[i as usize].pos);
+                uses += (0..3).filter(|&i| p[i] == a && p[(i + 1) % 3] == b).count();
+            }
+            assert_eq!(
+                uses, 1,
+                "far seam does not share the exact near edge {a:?} → {b:?}"
+            );
+        }
+        // The fan changes height only, never the coverage of the coarse cell
+        // on the ground plane or the winding of an exterior triangle.
+        let twice_area = patched
+            .triangles
+            .iter()
+            .map(|tri| {
+                let [a, b, c] = tri.map(|i| Vec3::from_array(patched.vertices[i as usize].pos));
+                let y = (b - a).cross(c - a).y;
+                assert!(y > 0.);
+                y
+            })
+            .sum::<f32>();
+        assert_eq!(twice_area, 2. * 16. * 16.);
+    }
+}
+
+pub(crate) fn stitched_terrain_scene() -> super::Packet {
+    let (mut near, coarse, bounds) = seam_fixture(0);
+    let mut builder = super::Builder::default();
+    let material = builder.surface(super::Surface::new(0, 0, 0., 0.));
+    let mut far = super::uncovered_far(&coarse, &near, bounds, material);
+    near.surfaces.fill(material);
+    // Different colors let a grazing ray prove which side it hit first.
+    near.vertices
+        .iter_mut()
+        .for_each(|v| *v = v.tint(0xff0000ff, 0xff0000ff));
+    far.vertices
+        .iter_mut()
+        .for_each(|v| *v = v.tint(0xff00ff00, 0xff00ff00));
+    builder.world_mesh(&near).unwrap();
+    builder.world_mesh(&far).unwrap();
+    builder.finish()
 }
 
 #[test]
@@ -760,6 +870,10 @@ pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
     let root = FixtureRoot::new();
     let mut t = fixture(&root.0);
     t.grid_spacing = 16.; // one 512-unit block, flat ground under both paths
+    let scene = std::sync::Arc::get_mut(&mut t.scene).unwrap();
+    scene.width = TILE as f32 * t.grid_spacing;
+    scene.length = scene.width;
+    scene.block_size = scene.width;
     t.water[0].center = [152., 10., 5.];
     t.water[0].height = 10.;
     t.water[0].columns = 1;
@@ -771,7 +885,7 @@ pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
                 position: [160., 0., 0.],
                 path: "distant.bmd".into(),
                 extra,
-                ..ornament(&root.0).ornaments[0].clone()
+                ..ornament_record()
             }],
         )
         .unwrap()
@@ -784,19 +898,22 @@ pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
     assert!(crate::scenery_visibility::ornament_distance(detail.scenery_quality) < 160.);
     let mut stream = super::SceneryStream::default();
     let mut residency = Default::default();
+    let mut atlas = 0;
     let mut make = |t: &mut Terrain, x: f32| {
-        build(
+        let mesh = build(
             t,
             x,
             0.,
             detail,
             &mut residency,
             false,
-            0,
+            atlas,
             false,
             Some(&mut stream),
         )
-        .unwrap()
+        .unwrap();
+        atlas = mesh.grass_atlas_key;
+        mesh
     };
     let first = make(&mut t, 0.);
     assert!(
