@@ -287,9 +287,7 @@ impl Layout {
         }
         // n continuation files: the first n-1 are exactly MAX_FILE_PACKAGE.
         let middle = (self.continuations as u64 - 1).saturating_mul(MAX_FILE_PACKAGE);
-        self.part0
-            .saturating_add(middle)
-            .saturating_add(self.part1)
+        self.part0.saturating_add(middle).saturating_add(self.part1)
     }
 }
 
@@ -637,7 +635,10 @@ fn read_package_range(
         // Which opened file holds `cursor`, and how far into it.
         let mut index = 0usize;
         let mut local = cursor;
-        for (n, at) in (1..=layout.continuations).map(|n| continuation_base(n)).enumerate() {
+        for (n, at) in (1..=layout.continuations)
+            .map(|n| continuation_base(n))
+            .enumerate()
+        {
             if cursor >= at {
                 index = n + 1;
                 local = cursor - at;
@@ -1572,9 +1573,7 @@ mod tests {
         // through `write_all` of a buffer) fills the disk the tests run on.
         let mut middle = std::fs::File::create(&pkx).unwrap();
         middle.set_len(split).unwrap();
-        middle
-            .seek(SeekFrom::Start(split - 8))
-            .unwrap();
+        middle.seek(SeekFrom::Start(split - 8)).unwrap();
         middle.write_all(&payload[..8]).unwrap();
         drop(middle);
 
