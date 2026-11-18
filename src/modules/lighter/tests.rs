@@ -880,12 +880,22 @@ fn exercise_material_channels(h: &mut Harness) {
     assert_radiance(
         "unbaked BMD, authored ambient and emission",
         relit,
-        [0.30, 0., 0.],
+        [0.40, 0.20, 0.20],
     );
     assert_eq!(
         h.pixel(night, &empty),
         relit,
         "baked vertex tint leaked into relighting"
+    );
+    let sunlit = Frame {
+        sun: [0., 0.6, 0.8, 1.],
+        sun_color: [0.5; 4],
+        ..day
+    };
+    assert_radiance(
+        "BMD reflectance is independent of ambient and emission",
+        h.pixel(sunlit, &empty),
+        [0.60, 0.20, 0.20],
     );
     h.ray.settings.relight_baked = false;
 
@@ -940,6 +950,27 @@ fn exercise_material_channels(h: &mut Harness) {
         "night terrain pair",
         h.pixel(at(night, -0.5), &empty),
         [0., 0., srgb(0.7)],
+    );
+    let mut dusk = day;
+    dusk.material_time[0] = 0.5;
+    assert_radiance(
+        "terrain twilight uses terrain night factor, not the sun strength",
+        h.pixel(at(dusk, -0.5), &empty),
+        [srgb(0.25), 0., srgb(0.35)],
+    );
+    h.ray.settings.relight_baked = true;
+    assert_radiance(
+        "relit terrain ignores T2LM",
+        h.pixel(at(night, -0.5), &empty),
+        [0.4; 3],
+    );
+    h.ray.settings.relight_baked = false;
+    let mut no_maps = night;
+    no_maps.options[0] &= !BAKED_LIGHTMAPS;
+    assert_radiance(
+        "no lightmaps uses local lighting",
+        h.pixel(at(no_maps, -0.5), &empty),
+        [0.4; 3],
     );
     ground(h, TERRAIN, 1., 1.);
     assert_radiance(
@@ -1088,6 +1119,47 @@ fn exercise_material_channels(h: &mut Harness) {
             expected,
         );
     }
+    asset.face_shaders.clear();
+    asset.skins[0].data.materials[0].diffuse = [1., 0., 0., 0.5];
+    let pose = asset.bind_pose(Mat4::IDENTITY).unwrap();
+    let meshes = asset.meshes_from_pose(&pose).unwrap();
+    let mut bank = Textures::default();
+    let mut moving = super::model_feed::Moving::new(&mut bank);
+    moving
+        .model(
+            "walker",
+            1,
+            super::model_feed::Posed {
+                asset: &asset,
+                pose: &pose,
+                meshes: &meshes,
+                attached: false,
+            },
+            |_| true,
+            &mut |_| {
+                Ok((
+                    vec![image::RgbaImage::from_pixel(
+                        1,
+                        1,
+                        image::Rgba([255, 255, 255, 128]),
+                    )],
+                    true,
+                ))
+            },
+        )
+        .unwrap();
+    let packet = moving.finish_cached(&mut AccelCache::default()).unwrap();
+    let mut b = Builder::default();
+    let background = upright(&mut b, -5., [0., 0., 1., 1.], EMISSIVE, 0);
+    put(&mut b, background);
+    h.ray.install(Ok((b.finish(), bank)));
+    let pixel = h.pixel(frame, &packet);
+    assert_radiance(
+        "material and texture alpha transmit the background",
+        pixel,
+        [0.25, 0., 0.75],
+    );
+    assert!((pixel.1 - depth_at(frame, -5. * Vec3::Z)).abs() < 1e-6);
     eprintln!("Lighter: both authored bake endpoints, relighting, face stages, sidedness and normal map passed");
 }
 
@@ -1625,6 +1697,41 @@ fn exercise_gloss(h: &mut Harness) {
     assert!(
         means[1][0] > means[0][0] + 0.07 && means[0][1] > means[1][1] + 0.07,
         "increasing authored power did not concentrate the reflection: {means:?}"
+    );
+    let mut colored = Builder::default();
+    let mirror = quad_material(
+        &mut colored,
+        [
+            [-3., 3., -4.],
+            [3., 3., -4.],
+            [-3., -3., -4.],
+            [3., -3., -4.],
+        ],
+        [0., 0., 1.],
+        Surface::new(0, BAKED_COLOR_ONLY | BAKED, 0., 0.)
+            .with_gloss(Gloss::authored([1., 0., 0., 1.], 128.)),
+        rgba([0., 0., 0., 1.]),
+    );
+    put(&mut colored, mirror);
+    let white = quad(
+        &mut colored,
+        [
+            [-100., 100., 2.],
+            [100., 100., 2.],
+            [-100., -100., 2.],
+            [100., -100., 2.],
+        ],
+        [0., 0., 1.],
+        0,
+        EMISSIVE,
+        u32::MAX,
+    );
+    put(&mut colored, white);
+    h.ray.install(Ok((colored.finish(), bank)));
+    assert_radiance(
+        "colored specular on a neutral reflector",
+        h.pixel(frame, &empty),
+        [0.25, 0., 0.],
     );
     h.ray.settings.reflections = false;
     assert_radiance("reflections disabled", h.pixel(frame, &empty), [0.; 3]);

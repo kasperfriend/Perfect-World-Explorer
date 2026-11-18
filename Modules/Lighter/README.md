@@ -180,13 +180,45 @@ pulse doesn't rebuild the Vulkan acceleration structures. Unchanged moving
 packets skip upload; unchanged geometry skips Vulkan BLAS/TLAS builds.
 
 Lighter is a different lighting model, not pixel-for-pixel retail emulation.
-Texture tiles and distant terrain are simplified. Native terrain lightmaps,
-vegetation wind and camera-facing leaf behavior, cloud detail, rain/snow and
-shoreline wave overlays, lens flares and some legacy effect/skin blend and
-no-depth-test modes are not reproduced.
+Texture tiles and distant terrain are simplified. Vegetation wind and
+camera-facing leaf behavior, cloud detail, rain/snow, shoreline wave overlays,
+lens flares and some legacy effect/skin blend and no-depth-test modes are
+not reproduced.
 The native whole-world BMD preload, temporal upscalers and frame generation
 are paused while Lighter renders. Existing saved choices for those features
 are unchanged; Lighter uses the separate bounded BMD region described above.
+
+### Baked and relit materials
+
+Lighter keeps authored day/night appearance by default. Building vertex
+lighting uses the baked BMD colors (including the color-only and texture ×2
+stages), and the terrain and grass paths can use the matching map's T2LM
+pairs. A missing night map reuses day for terrain only. Grass needs both
+maps; it selects the area-center tile and clamps to its edge when the World
+setting is on. These are bounded ray lightmap copies (up to 64 px per tile,
+12 MiB total), not the full native lightmap atlas.
+
+**Relight baked scenery** uses the terrain/grass diffuse textures and BMD
+texture/material diffuse instead of the baked colors and lightmaps. Sun,
+local lights and indirect rays then shade that reflectance; they do not
+multiply an already-lit vertex color or lightmap. For headless comparisons
+use `PW_PREVIEW_HOUR=12` or `0` and `PW_PREVIEW_RELIGHT_BAKED=0` or `1`.
+
+SKI parts carry diffuse/ambient/emissive coefficients, colored specular and
+legacy power, sidedness and texture/material opacity. Authored face, brow,
+eye, mouth, moustache and body stages use the posed mesh's own texture paths;
+the eye/lip gloss stage is applied after local lighting. Body-mask alpha is
+not coverage. Optional BMD NRF references resolve through mounted `shaders.pck` or loose
+files. Lighter interprets their RGB as tangent normals when relighting;
+this interpretation is checked against a fixture, not reverse-engineered
+for all retail NRF encodings. They do not move the intersection geometry.
+Known `.sdr.` scale and scroll constants apply to both hit coverage and color.
+
+These are legacy material channels, not invented metallic/roughness maps.
+Authored power drives the pre-GGX glossy lobe. Transparent model sheets carry
+scalar transmittance from alpha; tinted shadow transmission and measured
+BSDF energy are separate transport work. Unsupported blend/depth modes do not
+become physically equivalent merely because their geometry is traced.
 
 ### Ray texture filtering
 

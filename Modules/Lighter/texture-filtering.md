@@ -39,5 +39,7 @@ of the surface hit without an sRGB transfer.
   timing result. There is no physical-GPU performance measurement here.
 
 The [retail rerun](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44408924284)
-uses the same pinned `a01`/`a02` inputs as Step 9, at 8×. It is supplementary
-coverage evidence, not a forest, water, or real-client grazing-wall test.
+was configured for the same pinned `a01`/`a02` inputs as Step 9, at 8×. It
+timed out during apt setup (exit 124), before the viewer built. There are no
+new retail captures or mip counters from this run. The Step 9 captures
+remain the baseline; a streamed retail grazing-wall test is still pending.

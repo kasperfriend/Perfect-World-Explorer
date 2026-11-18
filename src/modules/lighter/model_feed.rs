@@ -79,7 +79,19 @@ impl<'a> Moving<'a> {
         // not invent an inverse: leave that part in the evaluated world mesh.
         let parent = attached.then(|| Attachment::new(pose.model)).flatten();
         for part in prepared {
-            let d = part.material.diffuse;
+            // Match MTL_SCALED: the mesh override scales each coefficient,
+            // not just the directional term. Dedicated face stages get white.
+            let tint = argb_to_rgba(part.color)
+                .to_le_bytes()
+                .map(|b| f32::from(b) / 255.);
+            let scale = |c| {
+                if part.color == u32::MAX {
+                    c
+                } else {
+                    crate::model_material::scale_rgba(c, tint)
+                }
+            };
+            let d = scale(part.material.diffuse);
             let mut flags = if settings.destination_blend == 2 {
                 BLEND | ADDITIVE
             } else if settings.source_blend != 5 || settings.destination_blend != 6 || d[3] < 0.99 {
@@ -116,17 +128,18 @@ impl<'a> Moving<'a> {
             counts.texture_fallback +=
                 usize::from(loaded.is_none() && !part.texture_paths.is_empty());
             let (texture, alpha) = loaded.unwrap_or((0, false));
-            let tint = argb_to_rgba(part.color)
-                .to_le_bytes()
-                .map(|b| f32::from(b) / 255.);
-            let tint = rgba([tint[0], tint[1], tint[2], d[3]]);
-            let gloss = Gloss::authored(part.material.specular, part.material.power);
+            let tint = rgba([1., 1., 1., d[3]]);
+            let gloss = Gloss::authored(scale(part.material.specular), part.material.power);
             if alpha && flags & (BLEND | IGNORE_TEXTURE_ALPHA) == 0 {
                 flags |= CUTOUT;
             }
             let mut surface = Surface::new(texture, flags, 0.5, 0.)
                 .with_gloss(gloss)
-                .with_lighting(d, part.material.ambient, part.material.emissive);
+                .with_lighting(
+                    d,
+                    scale(part.material.ambient),
+                    scale(part.material.emissive),
+                );
             if let Some(stage) = part.face_shader {
                 let mut load_stage = |name, fallback| -> Result<u32, String> {
                     let loaded = self
@@ -243,11 +256,18 @@ impl<'a> Moving<'a> {
                 let mut flags = flags
                     | if skin.write_depth { WRITE_DEPTH } else { 0 }
                     | if skin.material.is_none() { EMISSIVE } else { 0 };
-                let d = skin.material.map_or([1.; 4], |m| m.diffuse);
-                let color = rgba(std::array::from_fn(|i| q.color[i] * d[i]));
-                let gloss = skin
-                    .material
-                    .map_or(Gloss::default(), |m| Gloss::authored(m.specular, m.power));
+                let scale = |c| crate::model_material::scale_rgba(c, q.color);
+                let (color, lighting, gloss) = skin.material.map_or_else(
+                    || (rgba(q.color), None, Gloss::default()),
+                    |m| {
+                        let diffuse = scale(m.diffuse);
+                        (
+                            rgba([1., 1., 1., diffuse[3]]),
+                            Some((diffuse, scale(m.ambient), scale(m.emissive))),
+                            Gloss::authored(scale(m.specular), m.power),
+                        )
+                    },
+                );
                 // Fully opaque standard-alpha, depth-writing GFX skins have
                 // the same visibility as a solid. Do not promote translucent
                 // or additive effects out of the ordered sheet queue.
@@ -261,9 +281,11 @@ impl<'a> Moving<'a> {
                 {
                     flags &= !(BLEND | WRITE_DEPTH);
                 }
-                let id = self
-                    .builder
-                    .surface(Surface::new(texture, flags, 0., 0.).with_gloss(gloss));
+                let mut surface = Surface::new(texture, flags, 0., 0.).with_gloss(gloss);
+                if let Some((diffuse, ambient, emission)) = lighting {
+                    surface = surface.with_lighting(diffuse, ambient, emission);
+                }
+                let id = self.builder.surface(surface);
                 for tri in skin.vertices.chunks_exact(3) {
                     let base = self.effects.vertices.len() as u32;
                     self.effects.vertices.extend(
@@ -406,9 +428,9 @@ mod tests {
                     .to_vec(),
                 write_depth: true,
                 material: Some(MeshMaterial {
-                    ambient: [0.; 4],
-                    diffuse: [1.; 4],
-                    emissive: [0.; 4],
+                    ambient: [0.5; 4],
+                    diffuse: [0.8, 1., 1., 1.],
+                    emissive: [0.125, 0., 0., 1.],
                     specular: [1.; 4],
                     power: 37.,
                 }),
@@ -432,6 +454,9 @@ mod tests {
         assert_eq!(solid[11], u32::from(MASK_SOLID | MASK_SHADOW));
         assert_eq!(f32::from_bits(solid[material + 3]), 0.25);
         assert_eq!(f32::from_bits(solid[material + 4]), 37.);
+        assert_eq!(solid[material + 10], rgba([0.5; 4]));
+        assert_eq!(solid[material + 20], rgba([0.8, 1., 1., 1.]));
+        assert_eq!(f32::from_bits(solid[material + 7]), 0.125);
         let alpha = pack(&quad, true);
         assert_eq!(alpha[11], u32::from(MASK_BLEND | MASK_SHADOW));
         quad.color[3] = 0.5;

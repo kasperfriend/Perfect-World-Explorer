@@ -102,7 +102,7 @@ impl Gloss {
     pub fn authored(specular: [f32; 4], power: f32) -> Self {
         let rgb = [specular[0], specular[1], specular[2]].map(|v| v.max(0.));
         let peak = rgb.into_iter().fold(0., f32::max);
-        let reflectance = rgb.iter().sum::<f32>() / 12.;
+        let reflectance = peak * 0.25;
         let [r, g, b] = rgb.map(|v| v / peak.max(1e-7));
         Self {
             reflectance: reflectance.min(0.35),

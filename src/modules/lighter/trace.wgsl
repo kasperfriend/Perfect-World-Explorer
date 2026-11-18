@@ -133,15 +133,13 @@ const AREA_TOP: u32 = 2u;
 const LINEAR_DATA: u32 = 4u;
 const ALPHA_IS_DATA: u32 = 8u;
 
+fn linear_texels(c: vec4<f32>) -> vec4<f32> {
+    return select(c/12.92,pow((c+0.055)/1.055,vec4<f32>(2.4)),c>vec4<f32>(0.04045));
+}
 fn sample_word(word_value: u32, fmt: u32) -> vec4<f32> {
     let c = rgba(word_value);
     if (fmt & LINEAR_DATA)!=0u { return c; }
     return vec4<f32>(linear(c.rgb)*select(c.a,1.,(fmt & ALPHA_IS_DATA)!=0u),c.a);
-}
-fn texel(base: u32, dims: vec2<i32>, p: vec2<i32>, edge: bool, fmt: u32) -> vec4<f32> {
-    var i = clamp(p, vec2<i32>(0), dims-1);
-    if !edge { i = (p % dims + dims) % dims; }
-    return sample_word(texels[base + u32(i.y*dims.x + i.x)],fmt);
 }
 fn level(addr: u32, uv: vec2<f32>, edge: bool, mip: u32, fmt: u32) -> vec4<f32> {
     let base = addr + texels[addr+4u+mip];
@@ -149,9 +147,31 @@ fn level(addr: u32, uv: vec2<f32>, edge: bool, mip: u32, fmt: u32) -> vec4<f32> 
     if all(dims==vec2<i32>(1)) { return sample_word(texels[base],fmt); }
     let xy = select(fract(uv),clamp(uv,vec2<f32>(0.),vec2<f32>(1.)),edge)*vec2<f32>(dims)-0.5;
     let p = vec2<i32>(floor(xy));
+    let q = p+1;
     let f = fract(xy);
-    return mix(mix(texel(base,dims,p,edge,fmt), texel(base,dims,p+vec2<i32>(1,0),edge,fmt), f.x),
-               mix(texel(base,dims,p+vec2<i32>(0,1),edge,fmt), texel(base,dims,p+vec2<i32>(1,1),edge,fmt), f.x), f.y);
+    // With the UV normalized above, the only wrapped addresses are -1
+    // and dims. Compute the four weights and addresses together, without
+    // four copies of the addressing/format branches at every sampler site.
+    let a = select(select(p,dims-1,p<vec2<i32>(0)),max(p,vec2<i32>(0)),edge);
+    let b = select(select(q,vec2<i32>(0),q>=dims),min(q,dims-1),edge);
+    let row = vec2<u32>(vec2<i32>(a.y,b.y))*u32(dims.x)+base;
+    let c0 = rgba(texels[row.x+u32(a.x)]);
+    let c1 = rgba(texels[row.x+u32(b.x)]);
+    let c2 = rgba(texels[row.y+u32(a.x)]);
+    let c3 = rgba(texels[row.y+u32(b.x)]);
+    let weights = vec4<f32>((1.-f.x)*(1.-f.y),f.x*(1.-f.y),(1.-f.x)*f.y,f.x*f.y);
+    let alpha = vec4<f32>(c0.a,c1.a,c2.a,c3.a);
+    var r = vec4<f32>(c0.r,c1.r,c2.r,c3.r);
+    var g = vec4<f32>(c0.g,c1.g,c2.g,c3.g);
+    var b_chan = vec4<f32>(c0.b,c1.b,c2.b,c3.b);
+    var rgb_weights = weights;
+    if (fmt & LINEAR_DATA)==0u {
+        r = linear_texels(r);
+        g = linear_texels(g);
+        b_chan = linear_texels(b_chan);
+        if (fmt & ALPHA_IS_DATA)==0u { rgb_weights *= alpha; }
+    }
+    return vec4<f32>(dot(r,rgb_weights),dot(g,rgb_weights),dot(b_chan,rgb_weights),dot(alpha,weights));
 }
 fn unassociate(c: vec4<f32>, fmt: u32) -> vec4<f32> {
     if (fmt & (LINEAR_DATA|ALPHA_IS_DATA))!=0u { return c; }
@@ -216,10 +236,13 @@ fn tap_average(addr: u32, uv: vec2<f32>, edge: bool, taps: Taps, fmt: u32,
     var sum = vec4<f32>(0.);
     for (var i=0u; i<taps.count; i++) {
         let p = uv+(f32(i)+0.5-0.5*f32(taps.count))*taps.step;
-        var c = level(addr,p,edge,mip,fmt);
-        if threshold_top && mip==0u { c.a = select(0.,1.,alpha_test(c.a,reference,flags)); }
-        if part>0. { c = mix(c,level(addr,p,edge,mip+1u,fmt),part); }
-        sum += c;
+        let levels = select(1u,2u,part>0.);
+        for (var l=0u; l<levels; l++) {
+            let j = mip+l;
+            var c = level(addr,p,edge,j,fmt);
+            if threshold_top && j==0u { c.a = select(0.,1.,alpha_test(c.a,reference,flags)); }
+            sum += c*select(1.-part,part,l!=0u);
+        }
     }
     return sum/f32(taps.count);
 }
@@ -244,20 +267,24 @@ fn bake_light(area: u32, uv: vec2<f32>, night: f32, grass: bool) -> vec4<f32> {
     if day_addr==0u || (grass && day_addr==night_addr) { return vec4<f32>(1.,1.,1.,0.); }
     // This is a legacy multiplier in encoded RGB, not albedo. A day-only
     // fallback copies the day address, but never claims to be a grass pair.
-    let day = level(day_addr, uv, true, 0u, LINEAR_DATA).rgb;
-    var dusk = day;
-    if day_addr!=night_addr { dusk = level(night_addr, uv, true, 0u, LINEAR_DATA).rgb; }
-    return vec4<f32>(2.*mix(day,dusk,clamp(night,0.,1.)),1.);
+    var rgb = vec3<f32>(0.);
+    let f = select(clamp(night,0.,1.),0.,day_addr==night_addr);
+    let first = select(0u,1u,f==1.);
+    let end = select(2u,1u,f==0.);
+    for (var i=first; i<end; i++) {
+        let day = i==0u;
+        rgb += select(f,1.-f,day)*level(select(night_addr,day_addr,day),uv,true,0u,LINEAR_DATA).rgb;
+    }
+    return vec4<f32>(2.*rgb,1.);
 }
-fn terrain_color(p: vec3<f32>, face: vec3<f32>, ray: Ray, t: f32) -> vec4<f32> {
+fn terrain_color(p: vec3<f32>, face: vec3<f32>, ray: Ray, t: f32, baked: vec4<f32>) -> vec3<f32> {
     let coord = terrain_coord(p.xz);
     let area = terrain_area(floor(coord));
     let start = texels[area];
     let count = texels[area+1u];
-    var baked = vec4<f32>(1.,1.,1.,0.);
-    if bake_enabled() { baked = bake_light(area,fract(coord),frame.material_time.x,false); }
     let width = footprint(ray,t);
-    var rgb = linear(vec3<f32>(0.30,0.33,0.24));
+    let fallback = vec3<f32>(0.30,0.33,0.24);
+    var rgb = select(linear(fallback),fallback,baked.a>0.);
     for (var j=0u; j<count; j++) {
         let at = start + j*5u;
         var gu = vec3<f32>(1.,0.,0.);
@@ -284,7 +311,7 @@ fn terrain_color(p: vec3<f32>, face: vec3<f32>, ray: Ray, t: f32) -> vec4<f32> {
         }
     }
     if baked.a>0. { rgb = linear(min(vec3<f32>(1.), rgb*baked.rgb)); }
-    return vec4<f32>(rgb,baked.a);
+    return rgb;
 }
 fn vertex_uv(m: bool, v: u32) -> vec2<f32> {
     return bitcast<vec2<f32>>(vec2<u32>(word(m,v+4u),word(m,v+5u)));
@@ -456,11 +483,23 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
     // Bad/sufficiently grazing interpolated normals must not face away from
     // the incident ray. They never decide which side of the triangle we enter.
     if dot(n,face)<1.e-4 || dot(n,ray.dir)>=0. { n = face; }
-    if (flags & TERRAIN)!=0u {
-        let ground = terrain_color(p,face,ray,hit.t);
-        flags |= select(0u,BAKED,ground.a>0.);
-        return Surface(n,face,uv,vec4<f32>(ground.rgb,1.),flags,0.,-1.,
-                       vec3<f32>(1.),vec3<f32>(1.),vec3<f32>(0.),vec4<f32>(0.));
+    let terrain = (flags & TERRAIN)!=0u;
+    let grass = (flags & GRASS_MATERIAL)!=0u;
+    let use_bake = (terrain || grass) && bake_enabled();
+    var baked = vec4<f32>(1.,1.,1.,0.);
+    if use_bake {
+        let coord = terrain_coord(p.xz);
+        var selected = floor(coord);
+        if grass && (frame.options.x & GRASS_AREA_LIGHTMAPS)!=0u {
+            selected = floor(terrain_coord(words2(m,inst+11u)));
+        }
+        baked = bake_light(terrain_area(selected),coord-selected,select(frame.material_time.x,1.-frame.sun.w,grass),grass);
+    }
+    if terrain {
+        let ground = terrain_color(p,face,ray,hit.t,baked);
+        flags |= select(0u,BAKED,baked.a>0.);
+        return Surface(n,face,uv,vec4<f32>(ground,1.),flags,0.,-1.,
+                       vec3<f32>(1.),ground,vec3<f32>(0.),vec4<f32>(0.));
     }
     let relight = (frame.options.x & RELIGHT_BAKED)!=0u;
     if relight { flags &= ~BAKED; }
@@ -471,15 +510,14 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
     var glaze = vec4<f32>(0.);
     // One filtering site for all four stages. Most surfaces only issue the
     // diffuse sample, with neither extra texture nor tangent-frame cost.
-    for (var stage=0u; stage<4u; stage++) {
-        var addr = 0u;
-        switch stage {
-            case 0u: { addr = word(m,mat); }
-            case 1u: { if (flags & BAKED)==0u { addr = word(m,mat+6u); } }
-            case 2u: { addr = word(m,mat+18u); }
-            default: { addr = word(m,mat+19u); }
-        }
-        if addr==0u { continue; }
+    let tiles = vec4<u32>(word(m,mat),select(word(m,mat+6u),0u,(flags & BAKED)!=0u),
+                          word(m,mat+18u),word(m,mat+19u));
+    let present = select(vec4<u32>(0u),vec4<u32>(1u,2u,4u,8u),tiles!=vec4<u32>(0u));
+    var stages = present.x | present.y | present.z | present.w;
+    while stages!=0u {
+        let stage = firstTrailingBit(stages);
+        stages &= stages-1u;
+        let addr = tiles[stage];
         let value = filtered_tile(addr,uv,edge,mesh_taps(addr,ray,hit,m,inst,v,scale));
         switch stage {
             case 0u: { tex = value; }
@@ -509,7 +547,8 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
             default: { albedo = linear(mix(base*skin,feature*tone,hi.a)); }
         }
     }
-    var color = albedo*linear(tint.rgb)*rgba(word(m,mat+20u)).rgb;
+    var base = albedo*linear(tint.rgb);
+    var color = base*rgba(word(m,mat+20u)).rgb;
     if (flags & EMISSIVE)!=0u { color = albedo*tint.rgb; }
     if (flags & BAKED)!=0u {
         let gain = select(2.,1.,(flags & BAKED_COLOR_ONLY)!=0u);
@@ -517,21 +556,17 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
     } else if relight && (word(m,mat+1u) & BAKED)!=0u {
         // Baked vertex light isn't a reflectance. BMDs use the actual material
         // diffuse coefficient and the texture, not the day/night vertex RGB.
-        color = tex.rgb*rgba(word(m,mat+20u)).rgb;
-    } else if (flags & GRASS_MATERIAL)!=0u && bake_enabled() {
-        let coord = terrain_coord(p.xz);
-        var selected = floor(coord);
-        if (frame.options.x & GRASS_AREA_LIGHTMAPS)!=0u {
-            selected = floor(terrain_coord(words2(m,inst+11u)));
-        }
-        let baked = bake_light(terrain_area(selected),coord-selected,1.-frame.sun.w,true);
-        color = linear(min(vec3<f32>(1.),encoded(color)*baked.rgb));
+        base = tex.rgb;
+        color = base*rgba(word(m,mat+20u)).rgb;
+    } else if grass && use_bake {
+        // For an incomplete area pair native grass displays the unlit base.
+        if baked.a>0. { color = linear(min(vec3<f32>(1.),encoded(color)*baked.rgb)); }
         flags |= BAKED;
     }
     var emission = vec3<f32>(0.);
-    if (flags & BAKED)==0u { emission = floats(m,mat+7u)*albedo; }
+    if (flags & BAKED)==0u { emission = floats(m,mat+7u)*base; }
     return Surface(n,face,uv,vec4<f32>(color,alpha),flags,bitcast<f32>(word(m,mat+3u)),bitcast<f32>(word(m,mat+4u)),
-                   rgba(word(m,mat+5u)).rgb,rgba(word(m,mat+10u)).rgb,emission,glaze);
+                   rgba(word(m,mat+5u)).rgb,base*rgba(word(m,mat+10u)).rgb,emission,glaze);
 }
 fn none(ray: Ray) -> Hit { return Hit(ray.high,NIL,0u,vec2<f32>(0.)); }
 fn trace(ray: Ray, q: Query) -> Hit {
@@ -686,8 +721,8 @@ fn sun_sample(seed: ptr<function,u32>) -> vec3<f32> {
     let delta = random(seed)*0.000011103284; // 1 - cos(0.27 deg)
     return around(frame.sun.xyz,1.-delta,sqrt(delta*(2.-delta)),random(seed)*6.2831853);
 }
-fn local_color(s: Surface, light: vec3<f32>) -> vec3<f32> {
-    let lit = s.color.rgb*light + s.emission;
+fn local_color(s: Surface, light: vec3<f32>, ambient: vec3<f32>) -> vec3<f32> {
+    let lit = s.color.rgb*light + ambient + s.emission;
     if s.glaze.a>0. { return linear(mix(encoded(lit),encoded(s.glaze.rgb),s.glaze.a)); }
     return lit;
 }
@@ -696,7 +731,7 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, seed: ptr<
     if (s.flags & EMISSIVE)!=0u { return albedo; }
     let lit = (frame.options.x & LIGHTING)!=0u;
     let baked = (s.flags & BAKED)!=0u;
-    if lit && baked { return local_color(s,vec3<f32>(1.)); }
+    if lit && baked { return local_color(s,vec3<f32>(1.),vec3<f32>(0.)); }
     var sun_pending = (!lit || !baked) && frame.sun.w>0.02 && frame.sun.y>0.;
     var sun = frame.sun.xyz;
     var cosine = 0.;
@@ -707,14 +742,16 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, seed: ptr<
     }
     let width = footprint(ray,t);
     var color = vec3<f32>(1.);
+    var ambient = vec3<f32>(0.);
     var energy = frame.sun_color.rgb*cosine;
     if !lit {
-        if !sun_pending || (frame.options.x & SHADOWS)==0u { return local_color(s,vec3<f32>(1.)); }
+        if !sun_pending || (frame.options.x & SHADOWS)==0u { return local_color(s,vec3<f32>(1.),vec3<f32>(0.)); }
         energy = vec3<f32>(0.45);
         color = vec3<f32>(0.55);
     } else if !baked {
         // Use the authored ambient only when no indirect ray replaces it.
-        color = select(vec3<f32>(0.),frame.ambient.rgb*s.ambient,terminal);
+        color = vec3<f32>(0.);
+        ambient = select(vec3<f32>(0.),frame.ambient.rgb*s.ambient,terminal);
     }
     var cursor = LightCursor(0u,world[12u],0u,0u);
     loop {
@@ -732,7 +769,7 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, seed: ptr<
         // can make shader compilation dominate the first frame.
         color += light.energy*visibility(p,s.face,light,width,ray);
     }
-    return local_color(s,color);
+    return local_color(s,color,ambient);
 }
 fn hemisphere(n: vec3<f32>, seed: ptr<function,u32>) -> vec3<f32> {
     let r = random(seed);
