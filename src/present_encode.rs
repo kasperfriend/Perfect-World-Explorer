@@ -171,8 +171,8 @@ impl PresentEncode {
     }
 
     fn create_bind_group(
-        device: &wgpu::Device, 
-        layout: &wgpu::BindGroupLayout, 
+           device: &wgpu::Device, 
+           layout: &wgpu::BindGroupLayout, 
         frame: &wgpu::Texture,
     ) -> wgpu::BindGroup {
         let source = frame.create_view(&wgpu::TextureViewDescriptor {
