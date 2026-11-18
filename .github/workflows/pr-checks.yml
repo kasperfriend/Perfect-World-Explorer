@@ -102,6 +102,13 @@ jobs:
           # both sides of a meridian, as pure arithmetic with no GPU and no assets.
           rustc --edition=2021 -O -o /tmp/phase5-sky-seam-check src/bin/phase5-sky-seam-check.rs
           /tmp/phase5-sky-seam-check
+      - name: Inspect dependency resolution on the working branch
+        if: github.ref == 'refs/heads/arena/69c8ea78-perfect-world-explorer'
+        run: |
+          cargo metadata --format-version 1 > /tmp/pwe-metadata.json
+          if ! git diff --quiet -- Cargo.lock; then
+            echo "::notice title=resolved-lock-diff::$(git diff --binary -- Cargo.lock | gzip -n | base64 -w0)"
+          fi
       - name: Check all binary targets
         run: |
           # Keep the plain command so a non-zero exit still fails the job, but
