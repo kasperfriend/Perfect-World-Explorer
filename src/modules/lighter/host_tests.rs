@@ -127,11 +127,14 @@ fn fixture(element: &std::path::Path) -> Terrain {
             )];
             29
         ],
-        water_simple_frames: vec![vec![image::RgbaImage::from_pixel(
-            1,
-            1,
-            image::Rgba([64, 170, 255, 255]),
-        )]],
+        water_simple_frames: vec![
+            vec![image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([64, 170, 255, 255]),
+            )];
+            30
+        ],
         trees: crate::trees::Trees {
             types: vec![Some(crate::trees::TreeMesh {
                 lods: vec![tree],
@@ -155,6 +158,24 @@ fn fixture(element: &std::path::Path) -> Terrain {
         cloud_surface: None,
         scenery_placements: None,
     }
+}
+
+#[test]
+fn far_terrain_keeps_only_triangles_outside_the_resident_footprint() {
+    let points = [[-4., 0., 0.], [0., 0., 0.], [0., 0., 4.], [4., 0., 4.]];
+    let far = super::Mesh {
+        vertices: points
+            .map(|p| super::Vertex::new(p, [0., 1., 0.], [0., 0.]))
+            .into(),
+        triangles: vec![[0, 1, 2], [1, 2, 3]],
+        surfaces: vec![],
+    };
+    let exterior = super::uncovered_far(&far, [-4., 0., 0., 4.], 7);
+    assert_eq!(exterior.triangles, [[1, 2, 3]]);
+    assert_eq!(exterior.surfaces, [7]);
+    assert!(super::uncovered_far(&far, [-4., 4., 0., 4.], 7)
+        .triangles
+        .is_empty());
 }
 
 #[test]

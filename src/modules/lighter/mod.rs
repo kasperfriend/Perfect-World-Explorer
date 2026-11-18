@@ -55,7 +55,6 @@ pub struct Frame {
     pub water: [f32; 4],
     pub water_color: [f32; 4],
     pub terrain: [f32; 4],
-    pub near_bounds: [f32; 4],
     pub extent: [u32; 4],
     pub options: [u32; 4],
     pub waves: [u32; 4],

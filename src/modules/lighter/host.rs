@@ -118,7 +118,6 @@ impl Feed {
             })
             .collect();
         result.far.triangles = far.1.chunks_exact(3).map(|i| [i[0], i[1], i[2]]).collect();
-        result.far.surfaces.resize(result.far.triangles.len(), 0);
         Ok(result)
     }
 
@@ -166,21 +165,10 @@ impl Feed {
             .as_ref()
             .ok_or("Lighter has no terrain materials")?
             .clone();
-        let mut builder = Builder::default();
-        let far_id = builder.surface(Surface::new(0, TERRAIN | FAR_TERRAIN, 0., 0.));
-        debug_assert_eq!(far_id, 0);
-        if !m.detail.terrain_cutoff {
-            builder.world_mesh(&self.far)?;
-        }
-        let terrain_id = builder.surface(Surface::new(0, TERRAIN, 0., 0.));
-        builder.world_mesh(&span(
-            &m.vertices,
-            &m.indices[..m.terrain_end as usize],
-            terrain_id,
-            |_| u32::MAX,
-        )?)?;
-        // The native bounds use the block window rather than the entire world.
-        // Reject far-mesh intersections under this surface for ALL ray kinds.
+        // The far grid's stride divides the resident block size. Omit its
+        // covered triangles before building either acceleration structure. A
+        // rejected far hit plus t bias could otherwise skip coplanar near
+        // terrain at the same distance and leave holes in flat ground.
         self.near_bounds = crate::terrain_cutoff::world_bounds(
             [
                 m.lod.window.x0,
@@ -193,6 +181,17 @@ impl Feed {
             self.terrain[1] as usize,
             self.terrain[2],
         );
+        let mut builder = Builder::default();
+        let terrain_id = builder.surface(Surface::new(0, TERRAIN, 0., 0.));
+        builder.world_mesh(&span(
+            &m.vertices,
+            &m.indices[..m.terrain_end as usize],
+            terrain_id,
+            |_| u32::MAX,
+        )?)?;
+        if !m.detail.terrain_cutoff {
+            builder.world_mesh(&uncovered_far(&self.far, self.near_bounds, terrain_id))?;
+        }
         let water_mesh = water_mesh(m, &mut builder)?;
         builder.world_mesh(&water_mesh)?;
         let extras = &m.indices[m.terrain_end as usize..m.water_start as usize];
@@ -385,7 +384,6 @@ impl Feed {
                 .extend(0.)
                 .to_array(),
             terrain: self.terrain,
-            near_bounds: self.near_bounds,
             extent: [0, 0, w, h],
             options: [
                 if camera.water_reflections {
@@ -455,6 +453,28 @@ fn span(
             .collect(),
         surfaces: vec![material; indices.len() / 3],
     })
+}
+
+fn uncovered_far(far: &Mesh, [x0, x1, z0, z1]: [f32; 4], surface: u32) -> Mesh {
+    let triangles: Vec<_> = far
+        .triangles
+        .iter()
+        .copied()
+        .filter(|tri| {
+            !tri.iter().all(|&index| {
+                let [x, _, z] = far.vertices[index as usize].pos;
+                x >= x0 && x <= x1 && z >= z0 && z <= z1
+            })
+        })
+        .collect();
+    if triangles.is_empty() {
+        return Mesh::default();
+    }
+    Mesh {
+        vertices: far.vertices.clone(),
+        surfaces: vec![surface; triangles.len()],
+        triangles,
+    }
 }
 
 fn water_mesh(m: &MeshData, builder: &mut Builder) -> Result<Mesh, String> {

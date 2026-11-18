@@ -2595,9 +2595,6 @@ impl Renderer {
             map_far_runs: Vec::new(),
         })
     }
-    /// Sample time and publish the frame's lighting/playback state exactly
-    /// once. Every secondary view reuses the returned snapshot with a zero
-    /// logic delta; no secondary submission calls this method.
     /// Explicit celestial state report: which disc is drawable and, when it is
     /// not, which native condition failed. Shown next to the sky settings so an
     /// unsupported state is visible instead of silently missing.
@@ -2698,6 +2695,9 @@ impl Renderer {
         }
         out
     }
+    /// Sample time and publish the frame's lighting/playback state exactly
+    /// once. Every secondary view reuses the returned snapshot with a zero
+    /// logic delta; no secondary submission calls this method.
     fn begin_frame(&mut self, camera: &Camera, w: u32, h: u32) -> FrameSnapshot {
         let now = Instant::now();
         let dt = now.duration_since(self.wind_last).as_secs_f32();

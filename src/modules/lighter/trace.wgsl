@@ -8,7 +8,6 @@ struct Frame {
     air: vec4<f32>, air_color: vec4<f32>,
     water: vec4<f32>, water_color: vec4<f32>,
     terrain: vec4<f32>, // width, height, spacing, mask grid
-    near_bounds: vec4<f32>, // x0,x1,z0,z1 of resident terrain
     extent: vec4<u32>, // ray image (xy), target (zw)
     options: vec4<u32>, // flags, bounces, spp, terrain area table
     waves: vec4<u32>, // first/next texture addresses, blend, phase angle
@@ -25,7 +24,6 @@ struct Frame {
 const NIL: u32 = 0xffffffffu;
 const DYNAMIC: u32 = 0x800000u;
 const TERRAIN: u32 = 1u;
-const FAR_TERRAIN: u32 = 2u;
 const BAKED: u32 = 4u;
 const CUTOUT: u32 = 8u;
 const BLEND: u32 = 16u;
@@ -140,8 +138,6 @@ fn surface(hit: Hit, ray: Ray, purpose: u32) -> Surface {
     let flags = word(dyn,mat+1u);
     let skip = Surface(Hit(hit.t,NIL,0u,vec2<f32>(0.)), vec3<f32>(0.), vec3<f32>(0.), vec2<f32>(0.), vec4<f32>(0.), flags, 0.);
     let p = ray.origin + ray.dir*hit.t;
-    let bounds = frame.near_bounds;
-    if (flags & FAR_TERRAIN)!=0u && p.x>=bounds.x && p.x<=bounds.y && p.z>=bounds.z && p.z<=bounds.w { return skip; }
     if (purpose==SHORE && (flags & TERRAIN)==0u)
         || (purpose==SHADOW && (flags & (BLEND|WATER))!=0u && (flags & WRITE_DEPTH)==0u)
         || (purpose==MIRROR && (flags & NO_REFLECT)!=0u)

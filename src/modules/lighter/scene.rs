@@ -7,7 +7,6 @@ use glam::{Vec2, Vec3};
 use std::ops::Range;
 
 pub const TERRAIN: u32 = 1 << 0;
-pub const FAR_TERRAIN: u32 = 1 << 1;
 pub const BAKED: u32 = 1 << 2;
 pub const CUTOUT: u32 = 1 << 3;
 pub const BLEND: u32 = 1 << 4;
