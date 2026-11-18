@@ -91,6 +91,7 @@ const REPORTED_ARCHIVES: &[&str] = &[
     "loddata.pck",
     "configs.pck",
     "shaders.pck",
+    "script.pck",
     "help.pck",
     "fonts.pck",
 ];
@@ -1171,13 +1172,20 @@ fn scan_archive(element: &Path, name: &str) -> ArchiveInfo {
         Ok(entries) => {
             info.entries = Some(entries.len());
             // `PackDLL::FillPackVersion` writes `<pack stem>\version.sw` into
-            // the pack it patches; retail packs never contain one, so this is
-            // normally absent and only names a repacked/modified client.
+            // the pack it patches. A patcher-written marker looks like that,
+            // but the shipped 1.5.2 `script.pck` carries a bare `version.sw`
+            // instead -- a two-entry pack whose whole content is that file --
+            // and matching only the prefixed name meant the one real marker
+            // staged here was never read. Both spellings name the same thing,
+            // so both are accepted.
             let stem = name.strip_suffix(".pck").unwrap_or(name);
-            let marker = format!("{stem}\\version.sw");
+            let prefixed = format!("{stem}\\version.sw");
             info.pack_version = entries
                 .iter()
-                .find(|entry| entry.name.eq_ignore_ascii_case(&marker))
+                .find(|entry| {
+                    entry.name.eq_ignore_ascii_case(&prefixed)
+                        || entry.name.eq_ignore_ascii_case("version.sw")
+                })
                 .and_then(|entry| crate::pck::read_entry(&mut file, entry).ok())
                 .map(|bytes| {
                     String::from_utf8_lossy(&bytes)
@@ -1489,6 +1497,46 @@ mod tests {
 
     /// Build a tiny client tree: a readable world, the three required packs, a
     /// PE32 executable, an `elements.data` header and a `tasks.data` header.
+    /// A multi-entry Angelica package: `12`-byte prefix, the payloads back to
+    /// back, then one 8-byte prefix and zlib stream per 276-byte record, then
+    /// the 280-byte trailer. Stored record order is entry order, because the
+    /// reader walks the run backwards from the trailer and then reverses it.
+    fn angelica_test_package(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x4dca23efu32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // patched below
+        out.extend_from_slice(&0x56a089b7u32.to_le_bytes());
+        let mut offsets = Vec::new();
+        for (_, payload) in entries {
+            offsets.push(out.len() as u32);
+            out.extend_from_slice(payload);
+        }
+        for (i, (name, payload)) in entries.iter().enumerate() {
+            let mut record = vec![0u8; 276];
+            record[..name.len()].copy_from_slice(name.as_bytes());
+            record[260..264].copy_from_slice(&offsets[i].to_le_bytes());
+            record[264..268].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            record[268..272].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&record).unwrap();
+            let stream = encoder.finish().unwrap();
+            out.extend_from_slice(&[0u8; 8]); // record prefix
+            out.extend_from_slice(&stream);
+        }
+        let mut header = vec![0u8; 280];
+        header[0..4].copy_from_slice(&0xa508bdc4u32.to_le_bytes());
+        header[4..8].copy_from_slice(&0x20002u32.to_le_bytes());
+        header[268..272].copy_from_slice(&0x853567c8u32.to_le_bytes());
+        header[272..276].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        header[276..280].copy_from_slice(&0x20002u32.to_le_bytes());
+        out.extend_from_slice(&header);
+        let total = out.len() as u32;
+        out[4..8].copy_from_slice(&total.to_le_bytes());
+        out
+    }
+
     fn synthetic_client(tag: &str, elements_version: u16, tasks_version: u32) -> PathBuf {
         let root = std::env::temp_dir().join(format!("pw-scan-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -1662,6 +1710,59 @@ mod tests {
             .summary_rows()
             .iter()
             .any(|(_, value)| value.contains("configs.pck")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `script.pck` is not a required pack, but a client that has one should
+    /// see it in the report: the module opens "every `*.pck` beside the
+    /// executable", and the 1.5.2 client ships this one next to `configs.pck`.
+    #[test]
+    fn the_script_pack_is_reported_when_the_client_ships_one() {
+        let root = synthetic_client("script-pack", 27, 75);
+        let element = root.join("element");
+        // A two-entry Angelica pack, the shape the shipped one has.
+        fs::write(
+            element.join("script.pck"),
+            angelica_test_package(&[("dir", b""), ("version.sw", b"0.525.0\r\n")]),
+        )
+        .unwrap();
+        let scan = scan(&root);
+        assert!(scan.loadable(), "{}", scan.report());
+        let script = scan
+            .archives
+            .iter()
+            .find(|archive| archive.name == "script.pck")
+            .expect("script.pck row");
+        assert_eq!(script.kind, ContainerKind::Angelica);
+        assert_eq!(script.entries, Some(2));
+        assert!(scan.report().contains("script.pck"), "{}", scan.report());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The shipped 1.5.2 `script.pck` holds a bare `version.sw`, not the
+    /// `<stem>\version.sw` a patcher writes. Matching only the prefixed name
+    /// meant the one real marker staged here was never read or printed.
+    #[test]
+    fn a_bare_version_sw_marker_is_read_like_a_prefixed_one() {
+        let root = synthetic_client("version-sw", 27, 75);
+        let element = root.join("element");
+        fs::write(
+            element.join("script.pck"),
+            angelica_test_package(&[("dir", b""), ("version.sw", b"0.525.0\r\n")]),
+        )
+        .unwrap();
+        let scan = scan(&root);
+        let script = scan
+            .archives
+            .iter()
+            .find(|archive| archive.name == "script.pck")
+            .expect("script.pck row");
+        assert_eq!(script.pack_version.as_deref(), Some("0.525.0"));
+        assert!(
+            scan.report().contains("version.sw 0.525.0"),
+            "{}",
+            scan.report()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
