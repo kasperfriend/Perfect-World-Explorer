@@ -229,6 +229,13 @@ pub struct Imaginator {
     directory: PathBuf,
     /// Captured world geometry, shared with the software worker.
     scene: SharedScene,
+    /// CPU-side DXR material and normal records, rebuilt only when the scene changes.
+    hardware_records: Option<(u64, Vec<u8>, Vec<u8>)>,
+    /// Base capture and pending streamed triangles for the current world load.
+    scenery_base: Option<SharedScene>,
+    scenery_pending: Vec<bvh::Triangle>,
+    scenery_build: Option<(std::sync::mpsc::Receiver<SharedScene>, usize)>,
+    scenery_limit_reported: bool,
     environment: tracer::Environment,
     composite: Option<Composite>,
     /// `None` until a device has been probed.
@@ -285,6 +292,11 @@ impl Imaginator {
             settings,
             directory,
             scene: Arc::new(bvh::Scene::empty()),
+            hardware_records: None,
+            scenery_base: None,
+            scenery_pending: Vec::new(),
+            scenery_build: None,
+            scenery_limit_reported: false,
             environment: tracer::Environment::default(),
             composite: None,
             hardware: None,
@@ -398,6 +410,82 @@ impl Imaginator {
         // Building happens on the render thread; the module's own timing is
         // load-time, and the status line reports the outcome.
         self.rebuild_hardware();
+    }
+
+    /// Queue a streamed page, even while tracing is switched off. `vertices`
+    /// and `indices` are world-space copies made before the renderer uploads it.
+    pub fn queue_scenery_page(&mut self, vertices: &[([f32; 3], [f32; 3])], indices: &[u32]) {
+        const MAX_TRIANGLES: usize = 2_500_000;
+        if self.scenery_base.is_none() {
+            self.scenery_base = Some(self.scene.clone());
+        }
+        let building = self.scenery_build.as_ref().map_or(0, |(_, n)| *n);
+        let available = MAX_TRIANGLES.saturating_sub(self.scene.triangle_count() + building);
+        let before = self.scenery_pending.len();
+        capture::append_page(&mut self.scenery_pending, vertices, indices, available);
+        if self.scenery_pending.len() == available
+            && indices.len() / 3 > self.scenery_pending.len() - before
+            && !self.scenery_limit_reported
+        {
+            self.scenery_limit_reported = true;
+            eprintln!("Imaginator: streamed scenery exceeds the triangle budget; later geometry is not traced");
+        }
+    }
+
+    /// Publish a completed worker build and, when requested, start the next one.
+    /// The expensive CPU BVH construction runs off the frame thread. DXR's own
+    /// acceleration structure build on publication is a separate GPU operation.
+    pub fn poll_scenery(&mut self, start_build: bool) {
+        if let Some((receiver, _)) = &self.scenery_build {
+            match receiver.try_recv() {
+                Ok(scene) => {
+                    self.scenery_build = None;
+                    self.set_scene(scene);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.scenery_build = None;
+                    self.last_error = Some("streamed scenery BVH worker failed".into());
+                    eprintln!("Imaginator: streamed scenery BVH worker failed");
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if start_build && self.scenery_build.is_none() && !self.scenery_pending.is_empty() {
+            let pending = std::mem::take(&mut self.scenery_pending);
+            let count = pending.len();
+            let current = self.scene.clone();
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let mut triangles = current
+                    .bvh
+                    .as_ref()
+                    .map(|bvh| bvh.triangles.clone())
+                    .unwrap_or_default();
+                triangles.extend(pending);
+                let bvh = bvh::Bvh::build(triangles);
+                let mut stats = current.stats;
+                stats.triangles = bvh.triangles.len();
+                stats.scenery_triangles += count;
+                stats.nodes = bvh.nodes.len();
+                let scene = bvh::Scene {
+                    bvh: Some(bvh),
+                    materials: current.materials.clone(),
+                    stats,
+                };
+                let _ = tx.send(Arc::new(scene));
+            });
+            self.scenery_build = Some((rx, count));
+        }
+    }
+
+    /// Discard an obsolete world stream, including any in-flight result.
+    pub fn reset_scenery_stream(&mut self) {
+        self.scenery_pending.clear();
+        self.scenery_build = None;
+        self.scenery_limit_reported = false;
+        if let Some(base) = self.scenery_base.take() {
+            self.set_scene(base);
+        }
     }
 
     pub fn captured_triangles(&self) -> usize {
@@ -850,30 +938,30 @@ impl Imaginator {
         if width == 0 || height == 0 {
             return Err("the traced extent is empty".into());
         }
-        let Some(bvh) = self.scene.bvh.as_ref() else {
-            return Err("this world has no captured geometry".into());
-        };
-        // The shader's `tri_normals` and `materials` tables: the normals and
-        // material index come from the same packing the compute tracer uses.
-        let (triangles, _, _, materials) = gpu::pack_scene(bvh, &self.scene.materials);
-        let normals: Vec<u8> = triangles
-            .iter()
-            .flat_map(|t| {
-                t.normal_material
-                    .iter()
-                    .flat_map(|value| value.to_ne_bytes())
-                    .collect::<Vec<u8>>()
-            })
-            .collect();
-        let materials: Vec<u8> = materials
-            .iter()
-            .flat_map(|m| {
-                m.albedo_specular
-                    .iter()
-                    .flat_map(|value| value.to_ne_bytes())
-                    .collect::<Vec<u8>>()
-            })
-            .collect();
+        if self
+            .hardware_records
+            .as_ref()
+            .is_none_or(|(generation, _, _)| *generation != self.generation)
+        {
+            let bvh = self
+                .scene
+                .bvh
+                .as_ref()
+                .ok_or("this world has no captured geometry")?;
+            let mut normals = Vec::with_capacity(bvh.triangles.len() * 16);
+            for t in &bvh.triangles {
+                for value in [t.normal.x, t.normal.y, t.normal.z, t.material as f32] {
+                    normals.extend_from_slice(&value.to_ne_bytes());
+                }
+            }
+            let mut materials = Vec::with_capacity(self.scene.materials.len() * 16);
+            for m in &self.scene.materials {
+                for value in [m.albedo.x, m.albedo.y, m.albedo.z, m.specular] {
+                    materials.extend_from_slice(&value.to_ne_bytes());
+                }
+            }
+            self.hardware_records = Some((self.generation, normals, materials));
+        }
         // The top-level structure for the traversal. This build is the one place
         // the hardware path can stall, so it happens before the dispatch and its
         // failure is reported rather than swallowed.
@@ -922,7 +1010,11 @@ impl Imaginator {
             block[36 + index] = *value;
         }
         let bytes: Vec<u8> = block.iter().flat_map(|value| value.to_ne_bytes()).collect();
-        hardware.trace_frame(&blob, tlas, width, height, &bytes, &normals, &materials)
+        let (_, normals, materials) = self
+            .hardware_records
+            .as_ref()
+            .expect("records were just built");
+        hardware.trace_frame(&blob, tlas, width, height, &bytes, normals, materials)
     }
 
     /// The pack of channels the software worker finished, if any.
@@ -1088,9 +1180,7 @@ impl Imaginator {
                     // Honest wording: the compute tracer is what runs, and it
                     // works without DXR, so this is a note about the path in use
                     // rather than an error.
-                    format!(
-                        "{base} — rays traced by the compute shader (no RayQuery blob installed)"
-                    )
+                    format!("{base} — CPU fallback (no RayQuery blob installed)")
                 };
                 // Run it. A failure is reported, and the module keeps whatever it
                 // last drew rather than going blank.
@@ -1120,6 +1210,8 @@ impl Imaginator {
                         Err(why) => {
                             self.last_error = Some(why.clone());
                             self.status = format!("hardware trace: {why}");
+                            self.skip_reason = Some(self.status.clone());
+                            return false;
                         }
                     }
                 } else {
@@ -1169,10 +1261,10 @@ impl Imaginator {
             self.skip_reason = Some(why.into());
             return false;
         }
-        let source = match self.settings.tracer {
-            TracerKind::Software => composite::TraceSource::Software,
-            _ => composite::TraceSource::Gpu,
-        };
+        // Both the CPU worker and the DXR readback upload traced pixels. Do
+        // not dispatch the compute BVH tracer over that upload: doing so hid
+        // every hardware RayQuery result behind a different tracer.
+        let source = composite::TraceSource::Software;
         match composite.render(
             device,
             queue,
@@ -1573,6 +1665,48 @@ impl Drop for Imaginator {
 mod tests {
     use super::{row_bands, Imaginator};
     use crate::imaginator::{settings, tracer};
+
+    fn streamed_page() -> (Vec<([f32; 3], [f32; 3])>, Vec<u32>) {
+        let n = [0., 1., 0.];
+        (
+            vec![([0., 0., 0.], n), ([1., 0., 0.], n), ([0., 0., 1.], n)],
+            vec![0, 1, 2],
+        )
+    }
+
+    #[test]
+    fn streamed_pages_build_off_thread_and_accumulate() {
+        let mut module = Imaginator::new(std::path::Path::new("."));
+        let (vertices, indices) = streamed_page();
+        module.queue_scenery_page(&vertices, &indices);
+        module.poll_scenery(true);
+        module.queue_scenery_page(&vertices, &indices);
+        // Join the worker result deterministically, without relying on timing.
+        let (rx, _) = module.scenery_build.take().unwrap();
+        module.set_scene(rx.recv().unwrap());
+        module.poll_scenery(true);
+        let (rx, _) = module.scenery_build.take().unwrap();
+        module.set_scene(rx.recv().unwrap());
+        assert_eq!(module.captured_triangles(), 2);
+        assert_eq!(module.scene.stats.scenery_triangles, 2);
+        assert_eq!(
+            module.scene.stats.nodes,
+            module.scene.bvh.as_ref().unwrap().nodes.len()
+        );
+    }
+
+    #[test]
+    fn resetting_stream_discards_inflight_result_and_restores_base() {
+        let mut module = Imaginator::new(std::path::Path::new("."));
+        let (vertices, indices) = streamed_page();
+        module.queue_scenery_page(&vertices, &indices);
+        module.poll_scenery(true);
+        module.reset_scenery_stream();
+        module.poll_scenery(true);
+        assert_eq!(module.captured_triangles(), 0);
+        assert!(module.scenery_build.is_none());
+        assert!(module.scenery_pending.is_empty());
+    }
 
     #[test]
     fn bands_cover_every_row_exactly_once() {

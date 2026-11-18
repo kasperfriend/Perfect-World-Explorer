@@ -109,6 +109,11 @@ fn reserve(budget: &CaptureBudget, fraction: f32) -> usize {
     ((budget.max_triangles as f32) * fraction) as usize
 }
 
+fn initial_terrain_ceiling(budget: &CaptureBudget, resident_scenery: usize) -> usize {
+    let future_scenery = reserve(budget, RESERVE_SCENERY).saturating_sub(resident_scenery);
+    budget.max_triangles.saturating_sub(future_scenery)
+}
+
 /// Everything the capture needs, borrowed from whatever already owns it.
 pub struct Sources<'a> {
     pub map: &'a MapSpace,
@@ -206,10 +211,13 @@ pub fn capture(sources: &Sources<'_>, budget: CaptureBudget) -> Arc<Scene> {
         }
     }
     let tree_triangles = b.triangles.len() - after_scenery;
-    // Terrain takes the rest. It is the one producer that degrades gracefully:
-    // thinning it leaves a slightly coarser ground, while dropping buildings
-    // leaves holes in the picture.
-    b.ceiling = None;
+    // The resident scenery may be empty during the initial capture. Preserve
+    // its unused allocation for pages that arrive later, rather than letting
+    // terrain exhaust the total budget before streaming begins.
+    b.ceiling = Some(initial_terrain_ceiling(
+        &b.budget,
+        after_scenery - after_water,
+    ));
     let before_terrain = b.triangles.len();
     capture_terrain(&mut b, sources.map);
     let terrain_triangles = b.triangles.len() - before_terrain;
@@ -511,6 +519,76 @@ fn capture_trees(b: &mut Builder, trees: &Trees, scene: &WorldScene) {
     }
 }
 
+/// Append one streamed scenery page to the traced soup.
+///
+/// The capture at load time cannot see the world's ornaments: they stream in
+/// afterwards, `Objects::get` is empty that early, and the reported capture line
+/// proves it - `scenery 0 (0 of 16037 ornaments had a resident model)`. Every
+/// ray therefore passed straight through every building and hit the ground
+/// behind it, which is exactly what "buildings are avoided by the tracer" and
+/// "a grey translucent sheet over the dungeon" mean.
+///
+/// A `world_objects::Page` already holds world-space vertices (position,
+/// normal, uv, kind) and triangle indices, so nothing has to be re-derived: the
+/// geometry the renderer is about to draw is the geometry the tracer needs.
+/// Called as each page arrives, so the traced world grows with the drawn one.
+///
+/// Returns the triangles added.
+#[allow(clippy::too_many_arguments)]
+/// `vertices` is `(position, normal)` per vertex, in world space, in the same
+/// order as the page's `indices`. Taking plain arrays rather than the renderer's
+/// `Vertex` keeps this file compilable in the module's own test harness, which
+/// has no access to `crate::gpu`.
+pub fn append_page(
+    triangles: &mut Vec<Triangle>,
+    vertices: &[([f32; 3], [f32; 3])],
+    indices: &[u32],
+    budget: usize,
+) -> usize {
+    let before = triangles.len();
+    for tri in indices.chunks_exact(3) {
+        if triangles.len() >= budget {
+            break;
+        }
+        let (Some(a), Some(b), Some(c)) = (
+            vertices.get(tri[0] as usize),
+            vertices.get(tri[1] as usize),
+            vertices.get(tri[2] as usize),
+        ) else {
+            continue;
+        };
+        let (pa, pb, pc) = (
+            V3::from_array(a.0),
+            V3::from_array(b.0),
+            V3::from_array(c.0),
+        );
+        // The authored normal, not a geometric one: a building that is smooth
+        // shaded in the raster frame has to be smooth shaded in the trace or the
+        // two disagree at every edge.
+        let normal = V3::from_array(a.1).normalize_or_zero();
+        let normal = if normal.length_squared() > 0. {
+            normal
+        } else {
+            (pb - pa).cross(pc - pa).normalize_or_zero()
+        };
+        if !pa.is_finite() || !pb.is_finite() || !pc.is_finite() || !normal.is_finite() {
+            continue;
+        }
+        // Same sliver rejection the capture uses.
+        if !((pb - pa).cross(pc - pa).length() > 1e-6) {
+            continue;
+        }
+        triangles.push(Triangle {
+            a: pa,
+            b: pb,
+            c: pc,
+            normal,
+            material: material::SCENERY,
+        });
+    }
+    triangles.len() - before
+}
+
 /// The material table the capture uses. Exposed so the tracer and the tests agree
 /// on the ordering.
 pub fn materials() -> Vec<Material> {
@@ -519,8 +597,98 @@ pub fn materials() -> Vec<Material> {
 }
 
 #[cfg(test)]
+mod streaming_tests {
+    use super::super::math::Ray;
+    use super::*;
+
+    /// A wall, as the streamed page would hand it over.
+    fn wall() -> (Vec<([f32; 3], [f32; 3])>, Vec<u32>) {
+        let n = [0., 1., 0.];
+        (
+            vec![
+                ([0., 0., 0.], n),
+                ([10., 0., 0.], n),
+                ([10., 0., 10.], n),
+                ([0., 0., 10.], n),
+            ],
+            vec![0, 1, 2, 0, 2, 3],
+        )
+    }
+
+    /// The bug this fixes: the load-time capture saw no ornaments, so every ray
+    /// through a building hit the ground behind it. Once a page arrives, a ray
+    /// aimed at the building must hit the building and not the ground.
+    #[test]
+    fn a_streamed_page_is_hit_by_a_ray_that_used_to_pass_through_it() {
+        let (verts, indices) = wall();
+        let mut tris = Vec::new();
+        let added = append_page(&mut tris, &verts, &indices, usize::MAX);
+        assert_eq!(added, 2, "both wall triangles must be taken");
+
+        let bvh = Bvh::build(tris);
+        // Straight down onto the wall from above it. Before the fix this ray
+        // missed the scene entirely and reached whatever was behind it.
+        let ray = Ray::new(v3(5., 20., 5.), v3(0., -1., 0.));
+        let hit = bvh
+            .closest_hit(&ray, 0., 1e9)
+            .expect("the wall must be hit");
+        assert!((hit.t - 20.).abs() < 1e-3, "t={} is not the wall", hit.t);
+        assert_eq!(hit.material, material::SCENERY);
+    }
+
+    /// A page is scenery, not water or terrain: the material decides how the
+    /// tracer shades it, and buildings must not pick up the water branch.
+    #[test]
+    fn a_streamed_page_is_tagged_as_scenery() {
+        let (verts, indices) = wall();
+        let mut tris = Vec::new();
+        append_page(&mut tris, &verts, &indices, usize::MAX);
+        assert!(tris.iter().all(|t| t.material == material::SCENERY));
+    }
+
+    /// The budget is a hard ceiling, not a suggestion: the software tracer has a
+    /// frame to keep. Geometry beyond it is dropped rather than allowed to grow
+    /// the scene without bound.
+    #[test]
+    fn the_budget_caps_what_a_page_can_add() {
+        let (verts, indices) = wall();
+        let mut tris = Vec::new();
+        let added = append_page(&mut tris, &verts, &indices, 1);
+        assert_eq!(added, 1);
+        assert_eq!(tris.len(), 1);
+    }
+
+    /// Streamed geometry has to survive a page with an out-of-range index or a
+    /// degenerate triangle: one bad page must not abort the load.
+    #[test]
+    fn a_damaged_page_is_skipped_not_fatal() {
+        let (mut verts, mut indices) = wall();
+        indices.extend_from_slice(&[0, 1, 99]); // out of range
+        indices.extend_from_slice(&[0, 0, 0]); // degenerate
+        verts.push(([f32::NAN, 0., 0.], [0., 0., 1.]));
+        indices.extend_from_slice(&[0, 1, (verts.len() - 1) as u32]); // non-finite
+        let mut tris = Vec::new();
+        let added = append_page(&mut tris, &verts, &indices, usize::MAX);
+        assert_eq!(added, 2, "only the two real wall triangles are usable");
+        assert!(tris.iter().all(|t| t.a.is_finite()));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terrain_leaves_unused_scenery_budget_for_streamed_pages() {
+        let budget = CaptureBudget {
+            max_triangles: 10_000,
+            ..CaptureBudget::default()
+        };
+        assert_eq!(initial_terrain_ceiling(&budget, 0), 7200);
+        assert_eq!(initial_terrain_ceiling(&budget, 1000), 8200);
+        assert_eq!(initial_terrain_ceiling(&budget, 2800), 10000);
+        assert_eq!(initial_terrain_ceiling(&budget, 4000), 10000);
+    }
 
     #[test]
     fn terrain_stride_covers_the_grid_without_gaps_or_overlaps() {

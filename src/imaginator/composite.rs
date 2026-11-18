@@ -752,21 +752,28 @@ impl Composite {
                 return;
             }
         }
-        let traced_texture = texture(
-            device,
-            "imaginator traced",
-            traced_width,
-            traced_height,
-            TRACED,
-            // `COPY_DST` is what `upload_software` writes through when the CPU
-            // tracer hands over a finished frame; without it every CPU trace
-            // was rejected by validation and the picture never changed.
-            wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC
-                | wgpu::TextureUsages::COPY_DST,
-        );
-        let traced_view = traced_texture.create_view(&Default::default());
+        // A frame resize (including the first real frame after an early upload)
+        // must not discard a trace that was already uploaded at the right size.
+        let (traced_texture, traced_view) = match self.target.take() {
+            Some(target) if target.width == traced_width && target.height == traced_height => {
+                (target.traced_texture, target.traced_view)
+            }
+            _ => {
+                let texture = texture(
+                    device,
+                    "imaginator traced",
+                    traced_width,
+                    traced_height,
+                    TRACED,
+                    wgpu::TextureUsages::STORAGE_BINDING
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::COPY_DST,
+                );
+                let view = texture.create_view(&Default::default());
+                (texture, view)
+            }
+        };
         let intermediate_texture = texture(
             device,
             "imaginator composite",

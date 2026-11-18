@@ -99,8 +99,8 @@ pub const PARAMS_FLOATS: usize = 40;
 
 /// The shader's `Params` block: ten `float4`/`uint4` members, 160 bytes. It is
 /// declared in `tools/imaginator-shaders/dxr_trace.hlsl` and mirrored field for
-/// field by `imaginator::gpu::GpuParams`; the CBV the trace binds is sized from
-/// this, so the two cannot drift without a compile error here.
+/// field by `imaginator::gpu::GpuParams`. The root CBV points at a GPU buffer
+/// containing these bytes.
 pub const PARAMS_BYTES: usize = 160;
 
 /// `DXGI_FORMAT_R32G32B32A32_FLOAT`, the trace output's format. `winapi` spells
@@ -173,6 +173,9 @@ pub struct HardwareTracer {
     /// The trace pipeline, built on the first frame that runs the hardware
     /// tracer and kept for the lifetime of the tracer.
     pipeline: Option<Pipeline>,
+    /// Immutable shader records for the current acceleration structure.
+    trace_normals: Option<Resource>,
+    trace_materials: Option<Resource>,
 }
 
 /// The compute pipeline that runs the DXIL trace shader.
@@ -215,6 +218,9 @@ impl HardwareTracer {
     /// lives at `imaginator/dxr_trace.cso` beneath it.
     pub fn dxil_present(&self, directory: &Path) -> bool {
         ray_query_blob(directory).is_some()
+            || module_candidates()
+                .into_iter()
+                .any(|candidate| ray_query_blob(&candidate).is_some())
     }
 
     /// Probe `device` for DXR and prepare the command list the builds record on.
@@ -235,6 +241,8 @@ impl HardwareTracer {
             status: HardwareStatus::Untried,
             built_triangles: 0,
             pipeline: None,
+            trace_normals: None,
+            trace_materials: None,
         };
         let Ok((raw_device, raw_queue)) = crate::fsr::raw_dx12(device) else {
             tracer.status = HardwareStatus::Unsupported(
@@ -411,6 +419,8 @@ impl HardwareTracer {
                 self.built_triangles = structures.triangles;
                 let address = structures.tlas_address;
                 self.structures = Some(structures);
+                self.trace_normals = None;
+                self.trace_materials = None;
                 self.built_for = Some(scene.clone());
                 Ok(address)
             }
@@ -521,22 +531,31 @@ impl HardwareTracer {
             return Err("the trace pipeline is missing".into());
         };
         let state = pipeline.state;
+        let root_signature = pipeline.root_signature;
 
         // 1. Every input lives in an upload buffer, and the output in a
         //    `DEFAULT` texture with a `READBACK` staging copy. Sizes are exact so
         //    the views can be written without a stride guess.
         let params_buffer = self.upload_bytes(params, "imaginator trace params")?;
-        let normals_buffer = self.upload_bytes(normals, "imaginator trace normals")?;
-        let materials_buffer = self.upload_bytes(materials, "imaginator trace materials")?;
+        if self.trace_normals.is_none() {
+            self.trace_normals = Some(self.upload_bytes(normals, "imaginator trace normals")?);
+        }
+        if self.trace_materials.is_none() {
+            self.trace_materials =
+                Some(self.upload_bytes(materials, "imaginator trace materials")?);
+        }
+        let normals_buffer = self.trace_normals.as_ref().expect("normals uploaded");
+        let materials_buffer = self.trace_materials.as_ref().expect("materials uploaded");
         let output = self.create_output_texture(width, height)?;
+        let row_pitch = trace_row_pitch(width);
         let readback = self.create_buffer_on(
             win::D3D12_HEAP_TYPE_READBACK,
-            (width as u64) * (height as u64) * 16,
+            row_pitch as u64 * height as u64,
             "imaginator trace readback",
         )?;
 
-        // 2. One shader-visible heap: a CBV, three SRVs (TLAS, normals,
-        //    materials) and a UAV, in that order, matching the root signature.
+        // 2. One shader-visible heap: an unused slot, three SRVs (TLAS,
+        //    normals, materials) and a UAV. The CBV is a root descriptor.
         let heap = unsafe { sys::create_descriptor_heap(self.device.as_ptr() as *mut c_void, 5) }
             .map_err(|why| why.to_string())?;
         let (cpu_start, gpu_start) = unsafe { sys::heap_handles(heap) };
@@ -546,12 +565,6 @@ impl HardwareTracer {
         // SAFETY: the heap has five slots and each write targets one of them; the
         // resources are alive for the whole call.
         unsafe {
-            sys::write_constant_buffer_view(
-                self.device.as_ptr() as *mut c_void,
-                sys::gpu_virtual_address(params_buffer.as_mut_ptr() as *mut c_void),
-                PARAMS_BYTES as u32,
-                slot(0),
-            );
             // The TLAS is a `RaytracingAccelerationStructure` on t0. Its view is
             // the structure's GPU address and nothing else — a buffer SRV over
             // the same bytes is not the same thing and the traversal would find
@@ -573,18 +586,22 @@ impl HardwareTracer {
                 MATERIALS_STRIDE as u32,
                 slot(3),
             );
-            sys::write_buffer_uav(
+            sys::write_texture_uav(
                 self.device.as_ptr() as *mut c_void,
                 output.as_mut_ptr() as *mut c_void,
-                0,
-                width * height,
-                0,
                 slot(4),
             );
         }
 
         // 3. Record and submit.
         let list = self.list4 as *mut win::ID3D12GraphicsCommandList;
+        let hr = unsafe { self.allocator.Reset() };
+        if !SUCCEEDED(hr) {
+            unsafe { sys::release(heap) };
+            return Err(format!(
+                "command allocator Reset failed (HRESULT 0x{hr:08x})"
+            ));
+        }
         let hr = unsafe { (*list).Reset(self.allocator.as_mut_ptr(), std::ptr::null_mut()) };
         if !SUCCEEDED(hr) {
             unsafe { sys::release(heap) };
@@ -592,6 +609,7 @@ impl HardwareTracer {
         }
         unsafe {
             (*list).SetPipelineState(state as *mut _);
+            (*list).SetComputeRootSignature(root_signature as *mut _);
             let mut heap_pointer = heap as *mut win::ID3D12DescriptorHeap;
             (*list).SetDescriptorHeaps(1, &mut heap_pointer);
             // Root parameter 0 is the CBV, 1 the SRV table, 2 the UAV table.
@@ -628,8 +646,8 @@ impl HardwareTracer {
             );
             (*list).ResourceBarrier(1, &to_copy);
             // Texture to buffer: the destination is a placed footprint and the
-            // source is a subresource index. The row pitch is the tight width
-            // because the destination is a plain buffer, not a mip of a texture.
+            // source is a subresource index. D3D12 requires a 256-byte-aligned
+            // row pitch even when the destination is a buffer.
             let footprint = sys::D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                 Offset: 0,
                 Footprint: sys::D3D12_SUBRESOURCE_FOOTPRINT {
@@ -637,7 +655,7 @@ impl HardwareTracer {
                     Width: width,
                     Height: height,
                     Depth: 1,
-                    RowPitch: width * 16,
+                    RowPitch: row_pitch,
                 },
             };
             let destination = sys::D3D12_TEXTURE_COPY_LOCATION {
@@ -720,7 +738,7 @@ impl HardwareTracer {
                 Count: 1,
                 Quality: 0,
             },
-            Layout: win::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Layout: win::D3D12_TEXTURE_LAYOUT_UNKNOWN,
             Flags: flags,
         };
         let mut resource: *mut win::ID3D12Resource = std::ptr::null_mut();
@@ -751,18 +769,21 @@ impl HardwareTracer {
     /// Copy the readback buffer's pixels into the packed channel order the
     /// composite stage expects.
     ///
-    /// The shader writes `rgba32float` with `r` = reflection, `g` = indirect,
-    /// `b` = sun visibility and `a` = view distance, which is already the layout
-    /// `upload_software` takes, so this is a straight read with the row pitch the
-    /// copy used.
+    /// Strip the D3D12 footprint's row padding and return tightly packed RGBA
+    /// pixels for the compositor.
     fn read_back(&self, readback: &Resource, width: u32, height: u32) -> Result<Vec<f32>, String> {
-        let bytes = (width as usize) * (height as usize) * 16;
-        // SAFETY: `readback` is a READBACK-heap resource of exactly this size,
-        // written by the copy that finished before this is called.
+        let row_bytes = width as usize * 16;
+        let row_pitch = trace_row_pitch(width) as usize;
         let pointer = unsafe { sys::map(readback.as_mut_ptr() as *mut c_void, std::ptr::null()) }?;
-        let mut pixels = vec![0f32; bytes / 4];
+        let mut pixels = vec![0f32; width as usize * height as usize * 4];
         unsafe {
-            std::ptr::copy_nonoverlapping(pointer as *const f32, pixels.as_mut_ptr(), pixels.len());
+            for y in 0..height as usize {
+                std::ptr::copy_nonoverlapping(
+                    (pointer as *const u8).add(y * row_pitch),
+                    (pixels.as_mut_ptr() as *mut u8).add(y * row_bytes),
+                    row_bytes,
+                );
+            }
             sys::unmap(readback.as_mut_ptr() as *mut c_void);
         }
         Ok(pixels)
@@ -816,12 +837,13 @@ impl HardwareTracer {
         let mut blas_inputs = blas_inputs;
         blas_inputs.Descs.pGeometryDescs = &geometry_desc;
         let blas_info = self.prebuild_info(&blas_inputs)?;
-        let blas = self.upload_raw(blas_info.ResultDataMaxSizeInBytes, "imaginator blas")?;
+        let blas =
+            self.create_as_buffer(blas_info.ResultDataMaxSizeInBytes, "imaginator blas", true)?;
         let scratch_size = blas_info
             .ScratchDataSizeInBytes
             .max(blas_info.UpdateScratchDataSizeInBytes)
             .max(1);
-        let scratch = self.upload_raw(scratch_size, "imaginator blas scratch")?;
+        let scratch = self.create_as_buffer(scratch_size, "imaginator blas scratch", false)?;
         let blas_desc = sys::D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
             DestAccelerationStructureData: blas.gpu_virtual_address(),
             Inputs: blas_inputs,
@@ -857,12 +879,19 @@ impl HardwareTracer {
             },
         };
         let tlas_info = self.prebuild_info(&tlas_inputs)?;
-        let tlas = self.upload_raw(tlas_info.ResultDataMaxSizeInBytes, "imaginator tlas")?;
+        let tlas =
+            self.create_as_buffer(tlas_info.ResultDataMaxSizeInBytes, "imaginator tlas", true)?;
+        let tlas_scratch_size = tlas_info
+            .ScratchDataSizeInBytes
+            .max(tlas_info.UpdateScratchDataSizeInBytes)
+            .max(1);
+        let tlas_scratch =
+            self.create_as_buffer(tlas_scratch_size, "imaginator tlas scratch", false)?;
         let tlas_desc = sys::D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
             DestAccelerationStructureData: tlas.gpu_virtual_address(),
             Inputs: tlas_inputs,
             SourceAccelerationStructureData: 0,
-            ScratchAccelerationStructureData: scratch.gpu_virtual_address(),
+            ScratchAccelerationStructureData: tlas_scratch.gpu_virtual_address(),
         };
         unsafe { self.record_and_wait(&tlas_desc)? };
         Ok(Structures {
@@ -920,6 +949,12 @@ impl HardwareTracer {
         // SAFETY: `list` is the module's own live command list and both resources
         // are buffers on the same device.
         unsafe {
+            let hr = self.allocator.Reset();
+            if !SUCCEEDED(hr) {
+                return Err(format!(
+                    "command allocator Reset failed (HRESULT 0x{hr:08x})"
+                ));
+            }
             let hr = (*list).Reset(self.allocator.as_mut_ptr(), std::ptr::null_mut());
             if !SUCCEEDED(hr) {
                 return Err(format!("command list Reset failed (HRESULT 0x{hr:08x})"));
@@ -956,14 +991,56 @@ impl HardwareTracer {
         self.create_buffer_on(win::D3D12_HEAP_TYPE_DEFAULT, bytes, label)
     }
 
-    /// A committed buffer on `heap_type`. Acceleration-structure buffers are
-    /// plain default-heap resources in `COMMON`; the build call is what gives
-    /// them meaning.
+    /// A committed ordinary buffer using the state required by its heap type.
     fn create_buffer_on(
         &self,
         heap_type: u32,
         bytes: u64,
         label: &str,
+    ) -> Result<Resource, String> {
+        let state = if heap_type == win::D3D12_HEAP_TYPE_UPLOAD {
+            win::D3D12_RESOURCE_STATE_GENERIC_READ
+        } else if heap_type == win::D3D12_HEAP_TYPE_READBACK {
+            win::D3D12_RESOURCE_STATE_COPY_DEST
+        } else {
+            win::D3D12_RESOURCE_STATE_COMMON
+        };
+        self.create_buffer_config(
+            heap_type,
+            bytes,
+            label,
+            win::D3D12_RESOURCE_FLAG_NONE,
+            state,
+        )
+    }
+
+    fn create_as_buffer(
+        &self,
+        bytes: u64,
+        label: &str,
+        acceleration_structure: bool,
+    ) -> Result<Resource, String> {
+        let state = if acceleration_structure {
+            0x400000
+        } else {
+            win::D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+        };
+        self.create_buffer_config(
+            win::D3D12_HEAP_TYPE_DEFAULT,
+            bytes,
+            label,
+            win::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            state,
+        )
+    }
+
+    fn create_buffer_config(
+        &self,
+        heap_type: u32,
+        bytes: u64,
+        label: &str,
+        flags: win::D3D12_RESOURCE_FLAGS,
+        state: win::D3D12_RESOURCE_STATES,
     ) -> Result<Resource, String> {
         let heap = win::D3D12_HEAP_PROPERTIES {
             Type: heap_type,
@@ -985,7 +1062,7 @@ impl HardwareTracer {
                 Quality: 0,
             },
             Layout: win::D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: win::D3D12_RESOURCE_FLAG_NONE,
+            Flags: flags,
         };
         let mut resource: *mut win::ID3D12Resource = std::ptr::null_mut();
         // SAFETY: `heap`/`desc` outlive the call, the IID is `ID3D12Resource`'s and
@@ -996,7 +1073,7 @@ impl HardwareTracer {
                 &heap,
                 win::D3D12_HEAP_FLAG_NONE,
                 &desc,
-                win::D3D12_RESOURCE_STATE_COMMON,
+                state,
                 std::ptr::null(),
                 &win::ID3D12Resource::uuidof(),
                 &mut resource as *mut _ as *mut *mut c_void,
@@ -1021,7 +1098,7 @@ impl HardwareTracer {
         }
         let device5 = self.device5 as *mut sys::ID3D12Device5;
         // SAFETY: `device5` is a live `ID3D12Device5`; the vtable field this
-        // reads is the one the compile-time assertion in `sys` pins to slot 68.
+        // reads is the one the compile-time assertion in `sys` pins to slot 63.
         let vtbl = unsafe { (*device5).lpVtbl.as_ref() }.ok_or("the Device5 vtable is gone")?;
         let mut info = sys::D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
         unsafe {
@@ -1047,11 +1124,23 @@ impl HardwareTracer {
         let list4 = self.list4 as *mut sys::ID3D12GraphicsCommandList4;
         let vtbl = (*list4).lpVtbl.as_ref().ok_or("the command list is gone")?;
         let base = self.list4 as *mut win::ID3D12GraphicsCommandList;
+        let hr = self.allocator.Reset();
+        if !SUCCEEDED(hr) {
+            return Err(format!(
+                "command allocator Reset failed (HRESULT 0x{hr:08x})"
+            ));
+        }
         let hr = (*base).Reset(self.allocator.as_mut_ptr(), std::ptr::null_mut());
         if !SUCCEEDED(hr) {
             return Err(format!("command list Reset failed (HRESULT 0x{hr:08x})"));
         }
         (vtbl.BuildRaytracingAccelerationStructure)(self.list4, desc, 0, std::ptr::null());
+        // Publish AS writes before subsequent builds or ray queries read them.
+        let mut barrier: win::D3D12_RESOURCE_BARRIER = std::mem::zeroed();
+        barrier.Type = win::D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.Flags = win::D3D12_RESOURCE_BARRIER_FLAG_NONE;
+        barrier.u.UAV_mut().pResource = std::ptr::null_mut();
+        (*base).ResourceBarrier(1, &barrier);
         let hr = (*base).Close();
         if !SUCCEEDED(hr) {
             return Err(format!("command list Close failed (HRESULT 0x{hr:08x})"));
@@ -1105,6 +1194,11 @@ impl HardwareTracer {
     pub const DXIL_PREPARE: &'static str = "tools/imaginator-shaders.sh compiles this to DXIL (shader model 6.5) with DXC; see dxr_trace.hlsl";
 }
 
+/// D3D12 texture-copy footprints require 256-byte row alignment.
+fn trace_row_pitch(width: u32) -> u32 {
+    (width * 16).div_ceil(256) * 256
+}
+
 /// A `D3D12_RESOURCE_BARRIER` transitioning a whole resource.
 fn transition_barrier(
     resource: &Resource,
@@ -1140,6 +1234,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn texture_readback_pitch_is_aligned() {
+        assert_eq!(trace_row_pitch(1), 256);
+        assert_eq!(trace_row_pitch(16), 256);
+        assert_eq!(trace_row_pitch(17), 512);
+    }
+
+    #[test]
     fn status_reports_each_distinct_reason() {
         assert!(!HardwareStatus::Untried.available());
         assert!(!HardwareStatus::Unsupported("no tier".into()).available());
@@ -1162,12 +1263,11 @@ mod tests {
 
     #[test]
     fn the_instance_record_is_the_size_the_driver_expects() {
-        // Transform (12 floats = 48) + InstanceID, contribution, flags (12) +
-        // 4 bytes of alignment padding before the 8-byte address + address (8).
+        // 48-byte transform + two packed bitfield words + 8-byte address.
         assert_eq!(
             std::mem::size_of::<sys::D3D12_RAYTRACING_INSTANCE_DESC>(),
-            80,
-            "D3D12_RAYTRACING_INSTANCE_DESC is 80 bytes, 16-byte aligned"
+            64,
+            "D3D12_RAYTRACING_INSTANCE_DESC is 64 bytes, 16-byte aligned"
         );
         assert_eq!(
             std::mem::align_of::<sys::D3D12_RAYTRACING_INSTANCE_DESC>(),

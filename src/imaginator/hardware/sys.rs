@@ -29,17 +29,9 @@
 //! call:
 //!
 //! ```text
-//! IUnknown              3 slots   (QueryInterface, AddRef, Release)
-//! ID3D12Object         +4  ->   7
-//! ID3D12DeviceChild    +1  ->   8
-//! ID3D12Pageable       +0  ->   8
-//! ID3D12Device        +40  ->  48
-//! ID3D12Device1        +3  ->  51
-//! ID3D12Device2        +1  ->  52
-//! ID3D12Device3        +3  ->  55
-//! ID3D12Device4        +7  ->  62
-//! ID3D12Device5  CreateLifetimeTracker 62 .. CreateStateObject 67,
-//!                GetRaytracingAccelerationStructurePrebuildInfo 68
+//! ID3D12Device5: CreateStateObject at slot 62,
+//! GetRaytracingAccelerationStructurePrebuildInfo at slot 63, followed by
+//! CheckDriverMatchingIdentifier at slot 64.
 //!
 //! ID3D12CommandList    +1  ->   9  (CommandList, from DeviceChild at 8)
 //! ID3D12GraphicsCommandList   +51 -> 60
@@ -87,24 +79,13 @@ pub struct D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
     pub StrideInBytes: u64,
 }
 
-// Slot indices, counted from the C++ vtable declarations in `d3d12.h` (the
-// `ID3D12Xxx : public ID3D12Yyy { virtual ... }` blocks, where each block lists
-// only its *own* members). The chain that matters:
-//
-//   IUnknown 3 | Object 4 | DeviceChild 1 | Device 40 | Device1 3 | Device2 1
-//   Device3 3 | Device4 6 | Device5 8            => 69 slots, 0..=68
-//
-// `CreateStateObject` is 67 and `GetRaytracingAccelerationStructurePrebuildInfo`
-// is 68 — the last member of the interface, which is why it is also the last
-// slot.
+// Slots counted from the C vtable in the public DirectX-Headers d3d12.h.
+// Alternative struct-return declarations are conditional, not extra slots.
 pub const IUNKNOWN_SLOTS: usize = 3;
-/// Slots of `ID3D12Device5` as `d3d12.h` declares it (0..=68).
-pub const DEVICE5_SLOTS: usize = 69;
-/// Slots of `ID3D12GraphicsCommandList4` (0..=76).
+pub const DEVICE5_SLOTS: usize = 65;
 pub const GCL4_SLOTS: usize = 77;
-
-pub const DEVICE5_CREATE_STATE_OBJECT_SLOT: usize = 67;
-pub const DEVICE5_PREBUILD_INFO_SLOT: usize = 68;
+pub const DEVICE5_CREATE_STATE_OBJECT_SLOT: usize = 62;
+pub const DEVICE5_PREBUILD_INFO_SLOT: usize = 63;
 pub const GCL4_BUILD_AS_SLOT: usize = 72;
 
 pub const IID_ID3D12DEVICE5: &str = "8b4f173b-2fea-4b80-8f58-4307191ab95d";
@@ -172,31 +153,25 @@ pub struct D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO {
     pub UpdateScratchDataSizeInBytes: u64,
 }
 
-// 16-byte aligned, so the 4 bytes between `Flags` and the AS address are tail
-// padding the struct already inserts. `Default` fills everything but that gap,
-// which is why the instance buffer is zeroed before the rows are written.
+/// Native bitfields packed into two 32-bit words. The GPU address of the
+/// descriptor array must be 16-byte aligned; the descriptor itself is 64 bytes.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default)]
 pub struct D3D12_RAYTRACING_INSTANCE_DESC {
     pub Transform: [f32; 12],
-    pub InstanceID: u32,
-    pub InstanceContributionToHitGroupIndex: u32,
-    pub Flags: u32,
+    pub InstanceIDAndMask: u32,
+    pub ContributionAndFlags: u32,
     pub AccelerationStructure: GpuAddress,
 }
 
 impl D3D12_RAYTRACING_INSTANCE_DESC {
-    /// Identity transform, opaque, no instance contribution.
     pub fn identity(acceleration_structure: GpuAddress) -> Self {
         Self {
-            Transform: [
-                1., 0., 0., 0., //
-                0., 1., 0., 0., //
-                0., 0., 1., 0.,
-            ],
-            InstanceID: 0,
-            InstanceContributionToHitGroupIndex: 0,
-            Flags: INSTANCE_FLAG_FORCE_OPAQUE,
+            Transform: [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.],
+            InstanceIDAndMask: 0xff << 24,
+            ContributionAndFlags: (INSTANCE_FLAG_FORCE_OPAQUE
+                | INSTANCE_FLAG_TRIANGLE_CULL_DISABLE)
+                << 24,
             AccelerationStructure: acceleration_structure,
         }
     }
@@ -219,8 +194,8 @@ pub const RAYTRACING_TIER_NOT_SUPPORTED: u32 = 0;
 pub const RAYTRACING_TIER_1_0: u32 = 10;
 pub const RAYTRACING_TIER_1_1: u32 = 11;
 pub const RAYTRACING_TIER_1_2: u32 = 12;
-pub const TYPE_BOTTOM_LEVEL: u32 = 0;
-pub const TYPE_TOP_LEVEL: u32 = 1;
+pub const TYPE_BOTTOM_LEVEL: u32 = 1;
+pub const TYPE_TOP_LEVEL: u32 = 0;
 pub const BUILD_FLAG_NONE: u32 = 0x00;
 pub const BUILD_FLAG_ALLOW_UPDATE: u32 = 0x01;
 pub const BUILD_FLAG_ALLOW_COMPACTION: u32 = 0x02;
@@ -230,8 +205,8 @@ pub const ELEMENTS_LAYOUT_ARRAY: u32 = 0;
 pub const GEOMETRY_TYPE_TRIANGLES: u32 = 0;
 pub const GEOMETRY_FLAG_OPAQUE: u32 = 0x01;
 pub const INSTANCE_FLAG_NONE: u32 = 0;
-pub const INSTANCE_FLAG_TRIANGLE_CULL_DISABLE: u32 = 0x02;
-pub const INSTANCE_FLAG_FORCE_OPAQUE: u32 = 0x01;
+pub const INSTANCE_FLAG_TRIANGLE_CULL_DISABLE: u32 = 0x01;
+pub const INSTANCE_FLAG_FORCE_OPAQUE: u32 = 0x04;
 pub const DXGI_FORMAT_R32G32B32_FLOAT: u32 = 6;
 pub const DXGI_FORMAT_R32_UINT: u32 = 42;
 
@@ -241,18 +216,17 @@ pub const DXGI_FORMAT_R32_UINT: u32 = 42;
 
 /// `ID3D12Device5`, addressing only `GetRaytracingAccelerationStructurePrebuildInfo`.
 ///
-/// The three typed `IUnknown` entries are followed by padding for slots 3..=67 so
-/// the one declaration that matters lands on slot 68, which the assertions below
-/// pin against the header's own member counts.
+/// The typed prefix ends at GetRaytracingAccelerationStructurePrebuildInfo
+/// (slot 63); the native interface has another method at slot 64.
 #[repr(C)]
 pub struct ID3D12Device5Vtbl {
     pub QueryInterface:
         unsafe extern "system" fn(*mut IUnknown, *const GUID, *mut *mut c_void) -> HRESULT,
     pub AddRef: unsafe extern "system" fn(*mut IUnknown) -> u32,
     pub Release: unsafe extern "system" fn(*mut IUnknown) -> u32,
-    /// Slots 3..=66: `ID3D12Object` through `EnumerateMetaCommandParameters`.
+    /// Slots 3..=61, through `CreateMetaCommand`.
     pub prefix: [usize; DEVICE5_CREATE_STATE_OBJECT_SLOT - IUNKNOWN_SLOTS],
-    /// Slot 67: build a ray-tracing state object from a DXIL library.
+    /// Slot 62: build a ray-tracing state object from a DXIL library.
     pub CreateStateObject: unsafe extern "system" fn(
         *mut c_void,
         *const D3D12_STATE_OBJECT_DESC,
@@ -537,10 +511,10 @@ pub const D3D12_PIPELINE_STATE_FLAG_NONE: u32 = 0;
 pub const D3D12_ROOT_SIGNATURE_FLAG_NONE: u32 = 0;
 
 /// `D3D12_ROOT_PARAMETER_TYPE_*` and `D3D12_DESCRIPTOR_RANGE_TYPE_*`.
-pub const D3D12_ROOT_PARAMETER_TYPE_CBV: u32 = 0;
-pub const D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: u32 = 4;
+pub const D3D12_ROOT_PARAMETER_TYPE_CBV: u32 = 2;
+pub const D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE: u32 = 0;
 pub const D3D12_DESCRIPTOR_RANGE_TYPE_SRV: u32 = 0;
-pub const D3D12_DESCRIPTOR_RANGE_TYPE_UAV: u32 = 3;
+pub const D3D12_DESCRIPTOR_RANGE_TYPE_UAV: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -622,8 +596,8 @@ unsafe fn D3D12SerializeRootSignature(
     -1
 }
 
-/// `IID_ID3D12RootSignature`: `c54a6b66-72df-4ee8-8be5-a946a1429914`.
-pub const IID_ID3D12ROOTSIGNATURE: &str = "c54a6b66-72df-4ee8-8be5-a946a1429914";
+/// `IID_ID3D12RootSignature`: `c54a6b66-72df-4ee8-8be5-a946a1429214`.
+pub const IID_ID3D12ROOTSIGNATURE: &str = "c54a6b66-72df-4ee8-8be5-a946a1429214";
 /// `IID_ID3D12PipelineState`: `765a30f3-f624-4c6f-a828-ace948622445`.
 pub const IID_ID3D12PIPELINESTATE: &str = "765a30f3-f624-4c6f-a828-ace948622445";
 
@@ -1041,11 +1015,10 @@ pub unsafe fn write_constant_buffer_view(
     let vtable = *(device as *mut *const usize);
     let write: unsafe extern "system" fn(
         *mut c_void,
-        *mut c_void,
         *const D3D12_CONSTANT_BUFFER_VIEW_DESC,
         usize,
     ) = std::mem::transmute(*vtable.add(DEVICE_CREATE_CONSTANT_BUFFER_VIEW));
-    write(device, std::ptr::null_mut(), &desc, handle);
+    write(device, &desc, handle);
 }
 
 /// `ID3D12Device::CreateShaderResourceView` (slot 19), buffer form.
@@ -1060,14 +1033,16 @@ pub unsafe fn write_buffer_srv(
     stride: u32,
     handle: usize,
 ) {
+    debug_assert_eq!(stride, 16);
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-        Format: DXGI_FORMAT_UNKNOWN,
+        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
         ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
         Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         Buffer: D3D12_BUFFER_UAV {
             FirstElement: first_element,
             NumElements: num_elements,
-            StructureByteStride: stride,
+            // HLSL Buffer<float4> is typed, not StructuredBuffer<float4>.
+            StructureByteStride: 0,
             CounterOffsetInBytes: 0,
             Flags: D3D12_BUFFER_SRV_FLAG_NONE,
         },
@@ -1109,10 +1084,29 @@ pub unsafe fn write_buffer_uav(
     let write: unsafe extern "system" fn(
         *mut c_void,
         *mut c_void,
+        *mut c_void,
         *const D3D12_UNORDERED_ACCESS_VIEW_DESC,
         usize,
     ) = std::mem::transmute(*vtable.add(DEVICE_CREATE_UNORDERED_ACCESS_VIEW));
-    write(device, resource, &desc, handle);
+    write(device, resource, std::ptr::null_mut(), &desc, handle);
+}
+
+/// Create the RWTexture2D<float4> view expected by the RayQuery shader.
+pub unsafe fn write_texture_uav(device: *mut c_void, resource: *mut c_void, handle: usize) {
+    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+        ViewDimension: 4,                    // D3D12_UAV_DIMENSION_TEXTURE2D
+        Buffer: D3D12_BUFFER_UAV::default(), // mip 0, plane 0
+    };
+    let vtable = *(device as *mut *const usize);
+    let write: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *mut c_void,
+        *const D3D12_UNORDERED_ACCESS_VIEW_DESC,
+        usize,
+    ) = std::mem::transmute(*vtable.add(DEVICE_CREATE_UNORDERED_ACCESS_VIEW));
+    write(device, resource, std::ptr::null_mut(), &desc, handle);
 }
 
 /// `ID3D12GraphicsCommandList::SetComputeRootDescriptorTable` (slot 22) and
@@ -1400,16 +1394,8 @@ const _: () = assert!(GCL_SET_COMPUTE_ROOT_CONSTANT_BUFFER_VIEW == 37);
 const _: () = assert!(GCL_SET_COMPUTE_ROOT_SHADER_RESOURCE_VIEW == 39);
 const _: () = assert!(GCL_SET_COMPUTE_ROOT_UNORDERED_ACCESS_VIEW == 41);
 
-const _: () = assert!(
-    DEVICE5_PREBUILD_INFO_SLOT + 1 == DEVICE5_SLOTS,
-    "Device5 ends at the prebuild-info call: 69 slots, index 68"
-);
-const _: () = assert!(
-    IUNKNOWN_SLOTS + 4 /* Object */ + 1 /* DeviceChild */ + 40 /* Device */
-        + 3 /* Device1 */ + 1 /* Device2 */ + 3 /* Device3 */ + 6 /* Device4 */
-        + 8 /* Device5 */ == DEVICE5_SLOTS,
-    "the Device chain's own-member counts must sum to 69 slots"
-);
+const _: () = assert!(DEVICE5_PREBUILD_INFO_SLOT == 63);
+const _: () = assert!(DEVICE5_SLOTS == 65);
 const _: () = assert!(
     IUNKNOWN_SLOTS + 69 == GCL4_BUILD_AS_SLOT,
     "ID3D12GraphicsCommandList4 prefix must place BuildRaytracing… on slot 72"
@@ -1496,6 +1482,8 @@ mod tests {
         assert_eq!(g.Data2, 0x2fea);
         assert_eq!(g.Data3, 0x4b80);
         assert_eq!(g.Data4, [0x8f, 0x58, 0x43, 0x07, 0x19, 0x1a, 0xb9, 0x5d]);
+        let root = guid(IID_ID3D12ROOTSIGNATURE).unwrap();
+        assert_eq!(root.Data4, [0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14]);
         assert!(guid("nope").is_none());
         assert!(guid("8b4f173b-2fea-4b80-8f58").is_none());
     }
@@ -1506,7 +1494,13 @@ mod tests {
             std::mem::size_of::<D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO>(),
             24
         );
-        assert_eq!(std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>(), 80);
+        assert_eq!(std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>(), 64);
+        let instance = D3D12_RAYTRACING_INSTANCE_DESC::identity(0x1234);
+        assert_eq!(instance.InstanceIDAndMask, 0xff000000);
+        assert_eq!(instance.ContributionAndFlags, 0x05000000);
+        assert_eq!(instance.AccelerationStructure, 0x1234);
+        assert_eq!(TYPE_TOP_LEVEL, 0);
+        assert_eq!(TYPE_BOTTOM_LEVEL, 1);
         assert_eq!(std::mem::align_of::<D3D12_RAYTRACING_INSTANCE_DESC>(), 16);
         // Triangle arm: transform address (8), two formats and two counts (16),
         // index address (8), vertex address + stride (16) = 48; plus the
@@ -1685,10 +1679,23 @@ mod tests {
     fn the_trace_root_signature_has_the_shaders_three_tables() {
         // `ConstantBuffer<Params> : register(b0)`, three SRVs at t0..t2 and one
         // UAV at u0 in `dxr_trace.hlsl`.
-        assert_eq!(D3D12_ROOT_PARAMETER_TYPE_CBV, 0);
-        assert_eq!(D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, 4);
+        assert_eq!(D3D12_ROOT_PARAMETER_TYPE_CBV, 2);
+        assert_eq!(D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE, 0);
         assert_eq!(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0);
-        assert_eq!(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3);
+        assert_eq!(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1);
+        // Compare against winapi's independently generated header constants.
+        assert_eq!(
+            D3D12_ROOT_PARAMETER_TYPE_CBV,
+            winapi::um::d3d12::D3D12_ROOT_PARAMETER_TYPE_CBV
+        );
+        assert_eq!(
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            winapi::um::d3d12::D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE
+        );
+        assert_eq!(
+            D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+            winapi::um::d3d12::D3D12_DESCRIPTOR_RANGE_TYPE_UAV
+        );
         assert_eq!(D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE, 11);
         // A TLAS view is `{ Format, ViewDimension, Mapping, Location }`.
         assert_eq!(std::mem::size_of::<D3D12_TLAS_SRV_DESC>(), 24);

@@ -4910,6 +4910,7 @@ pub fn run(
     let mut world_status = String::from("Off");
     let mut world_last_log_at = std::time::Instant::now();
     let mut world_last_logged_pages = 0usize;
+    let mut traced_geometry_at = std::time::Instant::now();
     let world_upload_budget_ms = std::env::var("PW_WORLD_UPLOAD_BUDGET_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -5863,6 +5864,7 @@ pub fn run(
                         world_enabled=want_world;
                         if let Some(c)=world_cancel.take(){c.store(true,std::sync::atomic::Ordering::Relaxed);}
                         world_rx=None;renderer.world_pages.clear();renderer.world_draw_cmds=Default::default();renderer.world_done=false;
+                        renderer.modules.imaginator().reset_scenery_stream();
                         if world_enabled {
                          let (tx, rx) = std::sync::mpsc::sync_channel(
                              if crate::objects::unbounded_textures() { 8 } else { 2 },
@@ -5888,6 +5890,12 @@ pub fn run(
                         match rx.try_recv() {
                             Ok(crate::world_objects::Message::Page(page)) => {
                                 let processed = page.processed;
+                                // Preserve streamed scenery even when tracing is
+                                // off: uploaded GPU pages cannot later be read
+                                // back to reconstruct the trace scene.
+                                let verts: Vec<([f32; 3], [f32; 3])> = page
+                                    .vertices.iter().map(|v| (v.pos, v.normal)).collect();
+                                renderer.modules.imaginator().queue_scenery_page(&verts, &page.indices);
                                 let upload_started = std::time::Instant::now();
                                 let uploaded = crate::world_objects::GpuPage::upload_world(
                                     &renderer.device,
@@ -5917,6 +5925,7 @@ pub fn run(
                                 }
                             }
                             Ok(crate::world_objects::Message::CacheInvalid) => {
+                                renderer.modules.imaginator().reset_scenery_stream();
                                 renderer.world_pages.clear();
                                 renderer.world_draw_cmds = Default::default();
                                 world_status = String::from("World cache invalid; rebuilding pages...");
@@ -5973,6 +5982,12 @@ pub fn run(
                             Err(_) => break,
                         }
                     }
+                    // Poll every frame, including after Done: a worker may
+                    // finish after the channel has delivered its final page.
+                    let due = traced_geometry_at.elapsed() >= std::time::Duration::from_millis(320);
+                    renderer.modules.imaginator().poll_scenery(due || renderer.world_done);
+                    if due { traced_geometry_at = std::time::Instant::now(); }
+
                 }
                     camera.far = if world_enabled {settings.far.max(32000.)} else {settings.far};
                     // Time pass: the client's own clock, replayed on wall-clock

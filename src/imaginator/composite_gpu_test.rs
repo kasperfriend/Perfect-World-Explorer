@@ -131,7 +131,7 @@ fn the_composite_changes_a_frame_on_a_real_device() {
     let traced_extent = gpu::traced_extent(W, H, settings.trace_scale);
     let mut packed = Vec::with_capacity((traced_extent.0 * traced_extent.1 * 4) as usize);
     for _ in 0..(traced_extent.0 * traced_extent.1) {
-        packed.extend_from_slice(&[0.05, 0.04, 0.03, 0.0]);
+        packed.extend_from_slice(&[0.25, 0.04, 0.03, 0.0]);
     }
     composite.upload_software(&packed, traced_extent, &device, &queue);
 
@@ -223,6 +223,13 @@ fn the_composite_changes_a_frame_on_a_real_device() {
         centre < 190,
         "the composite left the frame unchanged ({centre}); the shadowed trace \
              never reached the pixels"
+    );
+    // The first upload occurs before render sizes the full-resolution targets.
+    // A recreated/cleared traced texture still darkens the frame, so checking
+    // only "not a no-op" misses it. Require the uploaded red term as well.
+    assert!(
+        centre > 150,
+        "the uploaded trace was lost on target resize: {centre}"
     );
     assert!(
         centre > 0,
