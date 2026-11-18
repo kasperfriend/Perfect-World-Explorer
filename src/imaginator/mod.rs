@@ -705,18 +705,22 @@ impl Imaginator {
                         // bounce between two scales every frame).
                         if micros > 0 {
                             let ratio = micros as f64 / SOFTWARE_TARGET_MICROS as f64;
-                            let current = quality_slot.lock().map(|q| *q).unwrap_or(1.0);
-                            let next = if ratio > 1.15 {
-                                // Too slow: scale by the square root of the
-                                // overshoot, because cost grows with area.
-                                current * (ratio.sqrt() as f32).recip()
-                            } else if ratio < 0.70 {
-                                // Comfortably fast: creep back up.
-                                (current * 1.10).min(1.0)
-                            } else {
-                                current
-                            };
+                            // One lock for the whole read-modify-write. Taking it
+                            // twice - once to read through the guard and once to
+                            // write - is a self-deadlock on a non-reentrant mutex,
+                            // and the render thread reads this slot every frame.
                             if let Ok(mut slot) = quality_slot.lock() {
+                                let current = *slot;
+                                let next = if ratio > 1.15 {
+                                    // Too slow: scale by the square root of the
+                                    // overshoot, because cost grows with area.
+                                    current * (ratio.sqrt() as f32).recip()
+                                } else if ratio < 0.70 {
+                                    // Comfortably fast: creep back up.
+                                    (current * 1.10).min(1.0)
+                                } else {
+                                    current
+                                };
                                 *slot = next.clamp(0.10, 1.0);
                             }
                         }
