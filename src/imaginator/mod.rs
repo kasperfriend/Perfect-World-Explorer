@@ -144,6 +144,41 @@ struct SoftwareState {
 /// that the lighting follows the camera.
 const SOFTWARE_TARGET_MICROS: u128 = 16_000;
 
+/// The lowest fraction of the requested traced extent the software worker may
+/// fall back to.
+///
+/// 0.10 was chosen as a floor for the *time* problem and is too low for the
+/// *picture*: at 3440 wide it traces 344 pixels across, and a 10x upscale of a
+/// shadow edge is what "tiled low-resolution shadows" looks like. A traced image
+/// is lighting, so it tolerates being coarse - but not that coarse. 0.25 keeps
+/// shadows readable while still cutting the cost 16x against full resolution,
+/// and the worker reaches it only when a frame genuinely cannot fit the budget.
+const SOFTWARE_MIN_QUALITY: f32 = 0.25;
+
+/// Where the software worker's quality scale should move to, given what the last
+/// frame actually cost.
+///
+/// Split out of the worker so the policy can be tested against the same code
+/// that runs, rather than against a copy of it in a test that then drifts.
+fn next_quality(micros: u128, current: f32) -> f32 {
+    if micros == 0 {
+        return current.clamp(SOFTWARE_MIN_QUALITY, 1.0);
+    }
+    let ratio = micros as f64 / SOFTWARE_TARGET_MICROS as f64;
+    let next = if ratio > 1.15 {
+        // Too slow: scale by the square root of the overshoot, because cost
+        // grows with area.
+        current * (ratio.sqrt() as f32).recip()
+    } else if ratio < 0.70 {
+        // Comfortably fast: creep back up, so it does not bounce between two
+        // scales every frame.
+        (current * 1.10).min(1.0)
+    } else {
+        current
+    };
+    next.clamp(SOFTWARE_MIN_QUALITY, 1.0)
+}
+
 /// Split `height` rows into contiguous bands of at most `slice` rows.
 ///
 /// The last band is whatever is left, so the bands cover the image exactly once.
@@ -619,7 +654,7 @@ impl Imaginator {
                             let q = quality_slot.lock().map(|q| *q).unwrap_or(1.0);
                             // Clamp to the settings' own floor so the user's
                             // `trace_scale` still means something.
-                            q.clamp(0.10, 1.0)
+                            q.clamp(SOFTWARE_MIN_QUALITY, 1.0)
                         };
                         let trace_width = ((req.width as f32 * quality).round() as u32).max(16);
                         let trace_height = ((req.height as f32 * quality).round() as u32).max(9);
@@ -703,26 +738,12 @@ impl Imaginator {
                         // and asymmetric: backing off is quick (lag is visible
                         // immediately) while climbing is slow (so it does not
                         // bounce between two scales every frame).
-                        if micros > 0 {
-                            let ratio = micros as f64 / SOFTWARE_TARGET_MICROS as f64;
-                            // One lock for the whole read-modify-write. Taking it
-                            // twice - once to read through the guard and once to
-                            // write - is a self-deadlock on a non-reentrant mutex,
-                            // and the render thread reads this slot every frame.
-                            if let Ok(mut slot) = quality_slot.lock() {
-                                let current = *slot;
-                                let next = if ratio > 1.15 {
-                                    // Too slow: scale by the square root of the
-                                    // overshoot, because cost grows with area.
-                                    current * (ratio.sqrt() as f32).recip()
-                                } else if ratio < 0.70 {
-                                    // Comfortably fast: creep back up.
-                                    (current * 1.10).min(1.0)
-                                } else {
-                                    current
-                                };
-                                *slot = next.clamp(0.10, 1.0);
-                            }
+                        // One lock for the whole read-modify-write. Taking it
+                        // twice - once to read through the guard and once to
+                        // write - is a self-deadlock on a non-reentrant mutex,
+                        // and the render thread reads this slot every frame.
+                        if let Ok(mut slot) = quality_slot.lock() {
+                            *slot = next_quality(micros, *slot);
                         }
                         micros_slot.store(micros.min(u64::MAX as u128) as u64, Ordering::Relaxed);
                         let trace = TraceResult {
@@ -1755,25 +1776,12 @@ mod tests {
     /// lag, so the worker times itself and scales the traced extent.
     #[test]
     fn the_software_worker_scales_its_extent_to_its_time_budget() {
-        use super::SOFTWARE_TARGET_MICROS;
-        // The feedback runs on the measured cost, so check the decision it makes
-        // at the three interesting points.
-        let adjust = |micros: u128, current: f32| -> f32 {
-            let ratio = micros as f64 / SOFTWARE_TARGET_MICROS as f64;
-            let next = if ratio > 1.15 {
-                current * (ratio.sqrt() as f32).recip()
-            } else if ratio < 0.70 {
-                (current * 1.10).min(1.0)
-            } else {
-                current
-            };
-            next.clamp(0.10, 1.0)
-        };
+        use super::{next_quality as adjust, SOFTWARE_MIN_QUALITY, SOFTWARE_TARGET_MICROS};
         // A trace costing five seconds - the reported case - must move a long way
         // in one step, not creep.
         let after = adjust(5_000_000, 1.0);
         assert!(
-            after <= 0.10,
+            after <= SOFTWARE_MIN_QUALITY,
             "a 5 s frame should collapse the scale to the floor at once, got {after}"
         );
         // At the target it stays put.
@@ -1781,8 +1789,11 @@ mod tests {
         // Fast frames climb back, but never past 1.0.
         assert!(adjust(1_000, 0.5) > 0.5);
         assert_eq!(adjust(1_000, 1.0), 1.0);
-        // And the floor holds, so the image never degenerates to nothing.
-        assert_eq!(adjust(100_000_000, 1.0), 0.10);
+        // The floor holds, so the picture never degenerates into blocky tiles.
+        // A quarter of the requested resolution is the point below which a
+        // shadow edge upscales into visible tiles.
+        assert_eq!(adjust(100_000_000, 1.0), SOFTWARE_MIN_QUALITY);
+        assert_eq!(SOFTWARE_MIN_QUALITY, 0.25);
     }
 
     /// The composite must accept a traced image of *any* size.
