@@ -1,4 +1,6 @@
-use super::super::{adapter, build, read_target_pixels, Camera, DetailSettings, Renderer, TILE};
+use super::super::{
+    adapter, build, read_target_pixels, readback, Camera, DetailSettings, Renderer, TILE,
+};
 use crate::{
     modules::lighter::{Lighter, Mode, Settings},
     Terrain,
@@ -607,7 +609,8 @@ fn lighter_streamed_world_pixels() {
         format: Some(wgpu::TextureFormat::Rgba8Unorm),
         ..Default::default()
     });
-    let render_center = |r: &mut Renderer, c: &Camera| -> ([u8; 4], f32) {
+    let mut capture = readback::Ring::default();
+    let mut render_center = |r: &mut Renderer, c: &Camera| -> ([u8; 4], f32) {
         let rays = r.lighter.replaces_world();
         let native_before = r.native_opaque_draws.get();
         r.render(
@@ -632,7 +635,7 @@ fn lighter_streamed_world_pixels() {
                 "Off didn't submit the native world"
             );
         }
-        let bytes = read_target_pixels(r, &target, SIZE, SIZE).unwrap();
+        let bytes = read_target_pixels(r, &mut capture, &target).unwrap();
         let offset = (4 * (SIZE / 2 * SIZE + SIZE / 2)) as usize;
         let depth = r.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Lighter host depth readback"),
@@ -669,7 +672,9 @@ fn lighter_streamed_world_pixels() {
             .map_async(wgpu::MapMode::Read, move |result| {
                 let _ = tx.send(result);
             });
-        super::super::wait_for_gpu(&r.device, rx).unwrap().unwrap();
+        super::super::wait_for_capture_callback(&r.device, rx)
+            .unwrap()
+            .unwrap();
         let z = f32::from_le_bytes(
             depth.slice(..).get_mapped_range()[offset..offset + 4]
                 .try_into()
@@ -677,7 +682,7 @@ fn lighter_streamed_world_pixels() {
         );
         (bytes[offset..offset + 4].try_into().unwrap(), z)
     };
-    let at_center = |r: &mut Renderer, c: &Camera| {
+    let mut at_center = |r: &mut Renderer, c: &Camera| {
         let pixel = render_center(r, c);
         assert_eq!(r.lighter.error(), None);
         pixel
@@ -800,7 +805,7 @@ fn lighter_streamed_world_pixels() {
     camera.world_effects = false; // light production remains separate from sheets
     camera.pitch = -std::f32::consts::FRAC_PI_4;
     r.lighter.settings.lighting = true;
-    let probe = |r: &mut Renderer, c: &mut Camera, x: f32| {
+    let mut probe = |r: &mut Renderer, c: &mut Camera, x: f32| {
         c.pos = Vec3::new(x, 5., -6.);
         at_center(r, c)
     };
@@ -849,6 +854,41 @@ fn lighter_streamed_world_pixels() {
             "unsupported mode silently fell back"
         );
     }
+}
+
+#[test]
+#[ignore = "requires Vulkan for an actual headless world PNG"]
+fn lighter_headless_preview_png() {
+    let root = FixtureRoot::new();
+    let path = root.0.join("headless.png");
+    super::super::preview(
+        fixture(&root.0),
+        &path,
+        Some([-2.5, 5., 0., 0., -std::f32::consts::FRAC_PI_4]),
+    )
+    .unwrap();
+    assert_world_png(&path, (960, 720));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an X11 display (e.g. xvfb-run) and Vulkan"]
+fn lighter_live_viewer_frames() {
+    let root = FixtureRoot::new();
+    super::super::run_viewer(fixture(&root.0), Some(&root.0)).unwrap();
+    assert_world_png(&root.0.join("0.png"), (160, 96));
+    assert_world_png(&root.0.join("1.png"), (160, 96));
+}
+
+fn assert_world_png(path: &std::path::Path, extent: (u32, u32)) {
+    let image = image::open(path).unwrap().into_rgba8();
+    assert_eq!(image.dimensions(), extent);
+    let first = image.get_pixel(0, 0);
+    assert!(
+        image.pixels().any(|p| p != first && p.0[3] == 255),
+        "{} did not contain a rendered world",
+        path.display()
+    );
 }
 
 type Scene = (super::Packet, super::Textures);

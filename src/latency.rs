@@ -120,13 +120,13 @@ mod imp {
     impl LatencySession {
         /// Create the context on the wgpu device and enable low-latency mode.
         ///
+        /// The caller must first observe an idle device using a nonblocking
+        /// poll: Intel requires all GPU activity to have finished before
+        /// `xellSetSleepMode` is called. Do not wait on the redraw thread.
         /// `sdk_dir` is the folder the probe scanned (Settings → "Upscale SDK
         /// folder", `PW_UPSCALER_SDK_DIR`, or the `sdk` folder next to the
         /// executable / in the repository).
         pub fn new(device: &wgpu::Device, sdk_dir: &str) -> Result<Self, String> {
-            // Intel: "application must ensure any GPU activity is finished
-            // before xellSetSleepMode is called".
-            device.poll(wgpu::Maintain::Wait);
             let (raw_device, _queue) = crate::fsr::raw_dx12(device)?;
             let device_ptr = raw_device.as_mut_ptr() as *mut c_void;
             let xell = Xell::create(device_ptr, sdk_dir)?;

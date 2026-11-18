@@ -4,6 +4,19 @@ Lighter already traces camera, shadow, reflection, refraction and bounded indire
 
 Status: `[x]` means implemented and verified at the scope on that line; unchecked items remain open. Synthetic software Vulkan and physical GPU evidence must be reported separately.
 
+## Ordered implementation — Phase 0: performance first
+
+The scene, fidelity and transport sections below retain their original RT item
+numbers. They do not take priority over the numbered implementation workflow.
+Complete each performance step before working on the next one; the first
+coverage step after these five is RT-01b (Step 6).
+
+1. [ ] Remove live GPU completion waits, use later-frame callbacks with a bounded readback ring, and verify the viewer and explicit headless PNG. See [the caller audit and regressions](performance-waits.md).
+2. [ ] Cache static BLAS by stable chunk/geometry identity, refit posed BLAS in place, and dirty TLAS/software BVH only when their inputs change. Verify zero builds on camera-only movement in a static scene.
+3. [ ] Retain buffers, textures and bind groups across frames. Grow capacity geometrically and update in place. Verify no steady-state resource creation.
+4. [ ] Audit renderer/scene clones; borrow immutable data, share lifetimes with `Arc`, and use cached asset IDs. Check frame cost as chunk count grows.
+5. [ ] Default to 1 spp, 1 bounce and half ray resolution. Reproject and blend history with a camera-cut reset, upscale on presentation and keep higher quality opt-in.
+
 ## P0 — Scene coverage and residency
 
 - [x] **RT-01a: Extend static BMD residency beyond the native ornament load distance.** Both backends use the bounded, direction-independent extension and retain the native renderer's residency and map views. Archive-backed pixel tests cover cutouts, shadow, water reflection/refraction, visibility flags, eviction and reload. See [implementation and limits](README.md#static-scenery-residency).

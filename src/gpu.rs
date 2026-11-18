@@ -8,6 +8,7 @@ use crate::scenery_visibility::{
 use crate::Terrain;
 #[path = "modules/lighter/host.rs"]
 mod lighter_host;
+mod readback;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 #[cfg(test)]
@@ -15,12 +16,12 @@ pub(crate) use lighter_host::tests::{stitched_terrain_scene, streamed_bmd_scenes
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use wgpu::util::DeviceExt;
 use winit::{
     event::{DeviceEvent, ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::EventLoop,
+    event_loop::EventLoopBuilder,
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Fullscreen, WindowBuilder},
 };
@@ -5069,9 +5070,25 @@ async fn adapter(
     };
     Ok((a, d, q))
 }
+const GPU_RETRY_DELAY: Duration = Duration::from_millis(2);
+
 pub fn run(
+    t: Terrain,
+    #[cfg(windows)] loading: Option<crate::windows_setup::LoadingWindow>,
+) -> Result<(), String> {
+    run_viewer(
+        t,
+        #[cfg(windows)]
+        loading,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn run_viewer(
     mut t: Terrain,
     #[cfg(windows)] loading: Option<crate::windows_setup::LoadingWindow>,
+    #[cfg(test)] smoke_dir: Option<&std::path::Path>,
 ) -> Result<(), String> {
     let current_map = t.map.clone();
     let map_dir = t.map_dir.clone();
@@ -5101,12 +5118,27 @@ pub fn run(
     ));
     #[cfg(windows)]
     crate::windows_setup::loading_progress("Preparing GPU world and textures...".into());
-    let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
+    let mut event_loop = EventLoopBuilder::new();
+    #[cfg(all(test, target_os = "linux"))]
+    if smoke_dir.is_some() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        event_loop.with_x11().with_any_thread(true);
+    }
+    let event_loop = event_loop.build().map_err(|e| e.to_string())?;
+    let window_builder = WindowBuilder::new()
+        .with_title("Perfect World Explorer — WASD fly, E/Q altitude, arrows look, Shift speed")
+        .with_maximized(true)
+        .with_visible(false);
+    #[cfg(test)]
+    let window_builder = if smoke_dir.is_some() {
+        window_builder
+            .with_maximized(false)
+            .with_inner_size(winit::dpi::PhysicalSize::new(160, 96))
+    } else {
+        window_builder
+    };
     let window = Arc::new(
-        WindowBuilder::new()
-            .with_title("Perfect World Explorer — WASD fly, E/Q altitude, arrows look, Shift speed")
-            .with_maximized(true)
-            .with_visible(false)
+        window_builder
             .build(&event_loop)
             .map_err(|e| e.to_string())?,
     );
@@ -5114,6 +5146,19 @@ pub fn run(
         LighterSettings::load()
     } else {
         LighterSettings::default()
+    };
+    #[cfg(test)]
+    let lighter_settings = if smoke_dir.is_some() {
+        LighterSettings {
+            mode: LighterMode::Software,
+            lighting: false,
+            shadows: false,
+            denoiser: false,
+            progressive: false,
+            ..LighterSettings::default()
+        }
+    } else {
+        lighter_settings
     };
     let try_surface = |instance: &wgpu::Instance| {
         let surface = instance
@@ -5175,6 +5220,17 @@ pub fn run(
         .environments
         .atmosphere(camera.pos.to_array(), camera.time_of_day);
     let mut settings = ViewSettings::load_with_default_fog(t.environments.auto_fog_enabled());
+    #[cfg(test)]
+    if smoke_dir.is_some() {
+        camera.pos = Vec3::new(-2.5, 5., 0.);
+        camera.yaw = 0.;
+        camera.pitch = -std::f32::consts::FRAC_PI_4;
+        settings = ViewSettings::default();
+        settings.show_minimap = false;
+        settings.music_enabled = false;
+        settings.ambience_enabled = false;
+        settings.world_effects = false;
+    }
     // Facts for the Graphics-tab upscaler gating. The adapter is not moved
     // into the renderer, so it is still available here.
     let gpu_facts = crate::GpuFacts::from_parts(
@@ -5610,6 +5666,13 @@ pub fn run(
     let mut saved_settings = settings.clone();
     let mut last_settings_save = Instant::now();
     let mut last = Instant::now();
+    let mut gpu_retry_at = None;
+    let mut surface_needs_config = false;
+    let mut frame_capture = readback::ViewerCapture::default();
+    #[cfg(test)]
+    let mut smoke_frames = 0;
+    #[cfg(test)]
+    let smoke_deadline = Instant::now() + Duration::from_secs(120);
     let mut region_tick_ms = renderer.started.elapsed().as_millis() as u64;
     let mut last_minimap_key: Option<MinimapKey> = None;
     event_loop
@@ -5628,6 +5691,12 @@ pub fn run(
                     }
                 }
                 if let WindowEvent::KeyboardInput {ref event,..}=event {
+                    // F12 requests the next world image at the current render
+                    // extent (no UI). No readback is submitted by this event.
+                    if event.physical_key == PhysicalKey::Code(KeyCode::F12) && event.state == ElementState::Pressed && !event.repeat {
+                        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                        frame_capture.requested = Some(crate::diagnostics::default_log_dir().join("screenshots").join(format!("world-{}-{}.png", std::process::id(), time.as_millis())));
+                    }
                     // F8 marks the spot: the pose goes into session.log and into
                     // every channel that is on, so a report has a position and a
                     // time instead of a description of one.
@@ -5710,15 +5779,31 @@ pub fn run(
                 WindowEvent::Resized(s) if s.width > 0 && s.height > 0 => {
                     config.width = s.width;
                     config.height = s.height;
-                    if let Some(surface) = surface.as_ref() {
-                        surface.configure(&renderer.device, &config);
-                    }
+                    surface_needs_config = true;
                     // Scaled world targets are reallocated by the next redraw,
                     // which notices the new window extent (see below).
                     if let Some(gamma)=display_gamma.as_mut() {gamma.resize(&renderer.device,s.width,s.height);}
                     if let Some(encode)=present_encode.as_mut() {encode.resize(&renderer.device,s.width,s.height);}
                 }
                 WindowEvent::RedrawRequested => {
+                    let queue_idle = renderer.device.poll(wgpu::Maintain::Poll).is_queue_empty();
+                    frame_capture.collect();
+                    #[cfg(test)]
+                    if let Some(dir) = smoke_dir {
+                        assert!(Instant::now() < smoke_deadline, "viewer did not finish both asynchronous captures");
+                        if smoke_frames == 2 && (0..2).all(|i| image::open(dir.join(format!("{i}.png"))).is_ok()) {
+                            assert!(presented_once);
+                            assert!(renderer.lighter.error().is_none(), "{:?}", renderer.lighter.error());
+                            target.exit();
+                            return;
+                        }
+                    }
+                    // Keep the CPU adapter's queue bounded, without holding
+                    // the event loop until the previous present finishes.
+                    if software_adapter && !queue_idle {
+                        gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                        return;
+                    }
                     // Reflex pacing first: everything below belongs to the
                     // frame the CPU is only allowed to start now.
                     if let Some(pacer) = reflex.as_mut() {
@@ -5741,9 +5826,19 @@ pub fn run(
                     let wanted_present_mode = settings.latency.present_mode();
                     if config.present_mode != wanted_present_mode {
                         config.present_mode = wanted_present_mode;
+                        surface_needs_config = true;
+                    }
+                    if surface_needs_config {
                         if let Some(active_surface) = surface.as_ref() {
+                            // wgpu may synchronously drain outstanding work
+                            // inside configure. Defer rather than stall for it.
+                            if !queue_idle {
+                                gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                return;
+                            }
                             active_surface.configure(&renderer.device, &config);
                         }
+                        surface_needs_config = false;
                     }
                     // One place handles both a window resize and a Graphics-tab
                     // scale change: reallocate only when the scaled extent moves.
@@ -5893,6 +5988,16 @@ pub fn run(
                     } else {
                         slider_extent
                     };
+                    if ray_world && renderer.lighter.error().is_none() {
+                        match renderer.lighter.prepare_frame(&renderer.device, wanted_world.0, wanted_world.1) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                return;
+                            }
+                            Err(error) => renderer.lighter.fail_frame(error),
+                        }
+                    }
                     if wanted_world != world_extent {
                         world_extent = wanted_world;
                         resize_world_targets(&mut renderer, world_extent.0, world_extent.1);
@@ -6221,6 +6326,13 @@ pub fn run(
                         // swapchain is untouched, so nothing else changes.
                         latency = None;
                     } else if latency.is_none() {
+                        // XeLL's one-time initialization requires an idle
+                        // device. Stop feeding frames until a later poll says
+                        // it is idle, rather than waiting inside the SDK setup.
+                        if !renderer.device.poll(wgpu::Maintain::Poll).is_queue_empty() {
+                            gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                            return;
+                        }
                         match crate::latency::LatencySession::new(
                             &renderer.device,
                             &settings.upscale_sdk_dir,
@@ -6321,7 +6433,7 @@ pub fn run(
                     if active_keys.contains(&KeyCode::ArrowDown) {
                         camera.pitch = (camera.pitch - dt).max(-1.5)
                     }
-                    if streaming {
+                    if streaming && renderer.terrain_gpu.can_update_residency() {
                         match result_rx.try_recv() {
                             Ok(Ok(mesh)) => {
                                 if let Err(e) = renderer.update_mesh(mesh) {
@@ -6630,7 +6742,7 @@ pub fn run(
                         match active_surface.get_current_texture() {
                             Ok(frame) => Some(frame),
                             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                                active_surface.configure(&renderer.device, &config);
+                                surface_needs_config = true;
                                 None
                             }
                             Err(wgpu::SurfaceError::OutOfMemory) => {
@@ -6774,6 +6886,14 @@ pub fn run(
                                 world_extent.1,
                                 camera_jumped,
                             );
+                            #[cfg(test)]
+                            if let Some(dir) = smoke_dir {
+                                if smoke_frames < 2 {
+                                    frame_capture.requested = Some(dir.join(format!("{smoke_frames}.png")));
+                                    smoke_frames += 1;
+                                }
+                            }
+                            frame_capture.submit(&renderer.device, &renderer.queue, render_scale.texture());
                             if let Some(fsr) = fsr_upscaler.as_mut() {
                                 match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {
                                     Ok(()) => fsr.composite(&renderer.device, &renderer.queue, scene_view),
@@ -7578,18 +7698,6 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                             if let Some(pacer) = reflex.as_mut() {
                                 pacer.present();
                             }
-                            if software_adapter {
-                                if renderer.lighter.armed() {
-                                    let (send, recv) = std::sync::mpsc::channel();
-                                    renderer.queue.on_submitted_work_done(move || { let _ = send.send(()); });
-                                    if let Err(error) = wait_for_gpu(&renderer.device, recv) {
-                                        eprintln!("Lighter GPU completion: {error}");
-                                        target.exit();
-                                    }
-                                } else {
-                                    renderer.device.poll(wgpu::Maintain::Wait);
-                                }
-                            }
                         }
                 }
                 _ => {}
@@ -7680,81 +7788,69 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                         handoff_rx = Some(rx);
                     }
                 }
+                if let Some(at) = gpu_retry_at {
+                    if Instant::now() < at {
+                        // Don't spin through redraws while the GPU is busy;
+                        // ordinary input and close events still get dispatched.
+                        target.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(at));
+                        return;
+                    }
+                    gpu_retry_at = None;
+                    target.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                }
                 window.request_redraw();
             }
             _ => {}
         })
         .map_err(|e| e.to_string())
 }
-/// Wait for the actual completion callback. wgpu 0.19's blocking poll may
-/// retire work after a 5-second fence timeout; cold software Vulkan shader
-/// compilation can outlast that and make a readback race the GPU.
-pub(crate) fn wait_for_gpu<T>(
+/// Explicit blocking capture/test path only. wgpu 0.19's blocking poll can
+/// retire submissions after its 5-second fence timeout. Instead poll and wait
+/// for observed GPU completion (including cold software shader compilation).
+pub(crate) fn wait_for_capture<T>(
     device: &wgpu::Device,
-    completion: std::sync::mpsc::Receiver<T>,
+    mut check: impl FnMut() -> Result<Option<T>, String>,
 ) -> Result<T, String> {
-    use std::{sync::mpsc::RecvTimeoutError, time::Duration};
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         device.poll(wgpu::Maintain::Poll);
-        match completion.recv_timeout(Duration::from_millis(2)) {
-            Ok(result) => return Ok(result),
-            Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
-            Err(RecvTimeoutError::Timeout) => {
-                return Err("GPU work did not complete within 120 seconds".into())
-            }
-            Err(error) => return Err(error.to_string()),
+        if let Some(result) = check()? {
+            return Ok(result);
         }
+        if Instant::now() >= deadline {
+            return Err("GPU capture did not complete within 120 seconds".into());
+        }
+        std::thread::sleep(GPU_RETRY_DELAY);
     }
 }
 
-/// Read a rendered target back to CPU bytes, one `RGBA` word per pixel.
-///
-/// The preview path needs the pixels themselves to answer questions that a
-/// screenshot cannot: whether a pass changed anything, and by how much.
+#[cfg(test)]
+pub(crate) fn wait_for_capture_callback<T>(
+    device: &wgpu::Device,
+    completion: std::sync::mpsc::Receiver<T>,
+) -> Result<T, String> {
+    wait_for_capture(device, || match completion.try_recv() {
+        Ok(value) => Ok(Some(value)),
+        Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    })
+}
+
+/// Capture mode only. The live viewer never calls this wrapper; both paths
+/// use the same copy, mapping and row-padding handling.
 fn read_target_pixels(
     renderer: &Renderer,
+    ring: &mut readback::Ring<()>,
     target: &wgpu::Texture,
-    width: u32,
-    height: u32,
 ) -> Result<Vec<u8>, String> {
-    let row = width * 4;
-    let buffer = renderer.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback"),
-        size: (row as u64) * (height as u64),
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut e = renderer.device.create_command_encoder(&Default::default());
-    e.copy_texture_to_buffer(
-        wgpu::ImageCopyTexture {
-            texture: target,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::ImageCopyBuffer {
-            buffer: &buffer,
-            layout: wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(row),
-                rows_per_image: Some(height),
-            },
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    renderer.queue.submit(Some(e.finish()));
-    let (tx, rx) = std::sync::mpsc::channel();
-    buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    wait_for_gpu(&renderer.device, rx)?.map_err(|e| e.to_string())?;
-    let bytes = buffer.slice(..).get_mapped_range().to_vec();
-    Ok(bytes)
+    if !ring.submit(&renderer.device, &renderer.queue, target, ())? {
+        return Err("headless readback staging ring is busy".into());
+    }
+    wait_for_capture(&renderer.device, || {
+        ring.try_read()
+            .map(|(_, result)| result.map(|image| image.rgba))
+            .transpose()
+    })
 }
 
 /// Render one frame without a window. Useful for validation on headless systems.
@@ -7877,7 +7973,7 @@ pub fn preview(
         .environments
         .underwater(cam.pos.to_array(), cam.time_of_day);
     let mut residency = crate::terrain_residency::Residency::default();
-    let lighter = Lighter::new(lighter_settings, &adapter, &device);
+    let lighter = Lighter::new(lighter_settings, &adapter, &device).for_capture();
     let mut ray_scenery = lighter.armed().then(lighter_host::SceneryStream::default);
     let mesh = build(
         &mut t,
@@ -7986,6 +8082,7 @@ pub fn preview(
             &[]
         },
     });
+    let mut captures = readback::Ring::default();
     // An A/B of the world-effect pass, so "no effects" can be answered rather
     // than argued. The same camera and the same frame are rendered twice, the
     // only difference being the map's own effect roots, and the two images are
@@ -8034,10 +8131,10 @@ pub fn preview(
                 )
             })
             .unwrap_or_else(|| "no world".into());
-        let on = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();
+        let on = read_target_pixels(&renderer, &mut captures, &target).unwrap_or_default();
         cam.world_effects = false;
         draw(&mut renderer, &cam);
-        let off = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();
+        let off = read_target_pixels(&renderer, &mut captures, &target).unwrap_or_default();
         cam.world_effects = true;
         let differing = on
             .chunks_exact(4)
@@ -8074,15 +8171,8 @@ pub fn preview(
             false,
         );
     }
-    let bytes = read_target_pixels(&renderer, &target, width, height)?;
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut out = encoder.write_header().map_err(|e| e.to_string())?;
-    out.write_image_data(&bytes).map_err(|e| e.to_string())?;
-    out.finish().map_err(|e| e.to_string())?;
-    Ok(())
+    let bytes = read_target_pixels(&renderer, &mut captures, &target)?;
+    readback::png_rgba(path, width, height, &bytes)
 }
 
 #[cfg(test)]

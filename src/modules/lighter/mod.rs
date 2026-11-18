@@ -433,6 +433,8 @@ pub struct Lighter {
     history: post::History,
     pub settings: Settings,
     armed: bool,
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    capture: bool,
     adapter_supports_compute: bool,
     has_hardware_device: bool,
     native_backend: wgpu::Backend,
@@ -456,6 +458,8 @@ impl Default for Lighter {
             history: post::History::default(),
             settings: Settings::default(),
             armed: false,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            capture: false,
             adapter_supports_compute: false,
             has_hardware_device: false,
             native_backend: wgpu::Backend::Empty,
@@ -483,6 +487,18 @@ impl Lighter {
             has_hardware_device: !rt.is_empty() && device.features().contains(rt),
             ..Self::default()
         }
+    }
+
+    /// Explicit one-shot preview or test. Windowed Lighter always probes and
+    /// returns to the event loop instead of waiting for native commands.
+    pub(crate) fn for_capture(self) -> Self {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        return Self {
+            capture: true,
+            ..self
+        };
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        self
     }
 
     pub fn armed(&self) -> bool {
@@ -558,6 +574,63 @@ impl Lighter {
         self.status = None;
     }
 
+    fn ray_extent(&self, device: &wgpu::Device, w: u32, h: u32) -> Result<(u32, u32), String> {
+        let storage = storage_limit(device) as u64;
+        let image_count =
+            1 + u64::from(self.settings.denoiser) + u64::from(self.settings.progressive);
+        let pixel_limit = storage.min(MAX_RAY_IMAGE_BYTES / image_count) / PIXEL_BYTES;
+        if pixel_limit == 0 {
+            return Err("Lighter cannot allocate ray image".into());
+        }
+        let scaled = |n: u32| (n * self.settings.resolution / 100).max(1);
+        let mut rw = scaled(w);
+        let mut rh = scaled(h);
+        while u64::from(rw) * u64::from(rh) > pixel_limit {
+            let fit = (pixel_limit as f64 / (f64::from(rw) * f64::from(rh))).sqrt();
+            rw = ((f64::from(rw) * fit) as u32).max(1);
+            rh = ((f64::from(rh) * fit) as u32).max(1);
+        }
+        Ok((rw, rh))
+    }
+
+    /// Check before acquiring a swapchain image. False means retry on a later
+    /// redraw without evolving history, submitting stale pixels or reporting
+    /// backpressure as an RT failure.
+    pub(crate) fn prepare_frame(
+        &mut self,
+        device: &wgpu::Device,
+        w: u32,
+        h: u32,
+    ) -> Result<bool, String> {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if self.settings.mode == Mode::Hardware && self.unavailable().is_none() {
+            let (rw, rh) = self.ray_extent(device, w, h)?;
+            let bytes = u64::from(rw) * u64::from(rh) * PIXEL_BYTES;
+            if self.hardware.is_none() {
+                self.hardware = Some(vulkan::Renderer::new(
+                    device,
+                    &[PIXELS, BASE, HARDWARE].concat(),
+                )?);
+            }
+            let rt = self.hardware.as_mut().unwrap();
+            if self.capture {
+                crate::gpu::wait_for_capture(device, || {
+                    rt.try_prepare_image(device, bytes)
+                        .map(|ready| ready.then_some(true))
+                })
+            } else {
+                rt.try_prepare_image(device, bytes)
+            }
+        } else {
+            Ok(true)
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            let _ = (device, w, h);
+            Ok(true)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -569,9 +642,13 @@ impl Lighter {
         format: wgpu::TextureFormat,
         mut frame: Frame,
         moving: &Packet,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if let Some(reason) = self.unavailable() {
             return Err(reason.into());
+        }
+        let [_, _, w, h] = frame.extent;
+        if !self.prepare_frame(device, w, h)? {
+            return Ok(false);
         }
         let world = self
             .world
@@ -590,21 +667,7 @@ impl Lighter {
                 ));
             }
         }
-        let [_, _, w, h] = frame.extent;
-        let image_count =
-            1 + u64::from(self.settings.denoiser) + u64::from(self.settings.progressive);
-        let pixel_limit = storage.min(MAX_RAY_IMAGE_BYTES / image_count) / PIXEL_BYTES;
-        if pixel_limit == 0 {
-            return Err("Lighter cannot allocate ray image".into());
-        }
-        let scaled = |n: u32| (n * self.settings.resolution / 100).max(1);
-        let mut rw = scaled(w);
-        let mut rh = scaled(h);
-        while u64::from(rw) * u64::from(rh) > pixel_limit {
-            let fit = (pixel_limit as f64 / (f64::from(rw) * f64::from(rh))).sqrt();
-            rw = ((f64::from(rw) * fit) as u32).max(1);
-            rh = ((f64::from(rh) * fit) as u32).max(1);
-        }
+        let (rw, rh) = self.ray_extent(device, w, h)?;
         frame.extent = [rw, rh, w, h];
         frame.options[0] |= u32::from(self.settings.lighting)
             | u32::from(self.settings.shadows) << 1
@@ -657,14 +720,7 @@ impl Lighter {
             Mode::Hardware => {
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 {
-                    if self.hardware.is_none() {
-                        self.hardware = Some(vulkan::Renderer::new(
-                            device,
-                            &[PIXELS, BASE, HARDWARE].concat(),
-                        )?);
-                    }
                     self.hardware.as_mut().unwrap().trace(
-                        device,
                         &frame,
                         bytes,
                         &world.packet,
@@ -710,7 +766,7 @@ impl Lighter {
             eprintln!("Lighter: {message}");
         }
         self.status = Some(message);
-        Ok(())
+        Ok(true)
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {

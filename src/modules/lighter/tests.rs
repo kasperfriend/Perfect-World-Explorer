@@ -217,7 +217,8 @@ impl Harness {
             },
             &adapter,
             &device,
-        );
+        )
+        .for_capture();
         // Test-only: assert production rejects CPU Vulkan, then exercise the
         // *same* Vulkan descriptors, AS builds, submission and composition.
         if cpu_query {
@@ -263,8 +264,8 @@ impl Harness {
             mapped_at_creation: false,
         });
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        self.ray
-            .render(
+        let mut render = || {
+            self.ray.render(
                 &self.device,
                 &self.queue,
                 &mut encoder,
@@ -274,7 +275,15 @@ impl Harness {
                 frame,
                 moving,
             )
+        };
+        if !render().unwrap() {
+            // Tests on the live path emulate later redraws here, using the
+            // harness's wait rather than changing the renderer into capture mode.
+            crate::gpu::wait_for_capture(&self.device, || {
+                render().map(|ready| ready.then_some(()))
+            })
             .unwrap();
+        }
         for (i, (texture, aspect)) in [
             (&color, wgpu::TextureAspect::All),
             (&depth, wgpu::TextureAspect::DepthOnly),
@@ -306,7 +315,7 @@ impl Harness {
         read.map_async(wgpu::MapMode::Read, move |r| {
             let _ = send.send(r);
         });
-        crate::gpu::wait_for_gpu(&self.device, recv)
+        crate::gpu::wait_for_capture_callback(&self.device, recv)
             .unwrap()
             .unwrap();
         let data = read.get_mapped_range();
@@ -355,12 +364,32 @@ fn exercise(mode: Mode, cpu_query: bool) {
         put(&mut b, reject);
     }
     h.ray.install(Ok((b.finish(), bank.clone())));
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    if mode == Mode::Hardware {
+        h.ray.capture = false;
+        assert!(
+            !h.ray.prepare_frame(&h.device, 3, 3).unwrap(),
+            "initial image must defer"
+        );
+    }
     let (green, z) = h.pixel(frame, &empty);
     assert_eq!(green, [0, 255, 0, 255]);
     assert!(
         (z - depth_at(frame, Vec3::new(0., 0., -5.))).abs() < 1e-5,
         "{z}"
     );
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    if mode == Mode::Hardware {
+        assert!(
+            !h.ray.prepare_frame(&h.device, 5, 5).unwrap(),
+            "replacement image must defer"
+        );
+        let resized = test_frame(Vec3::ZERO, -Vec3::Z, 5);
+        let (pixel, depth) = h.pixel(resized, &empty);
+        assert_eq!(pixel, green);
+        assert!((depth - z).abs() < 1e-6);
+        h.ray.capture = true;
+    }
     let mut animated = Builder::default();
     let red = upright(&mut animated, 0., [1., 0., 0., 1.], 0, 0);
     animated

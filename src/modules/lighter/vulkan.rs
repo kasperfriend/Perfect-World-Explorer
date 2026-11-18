@@ -551,6 +551,39 @@ impl Core {
         }
         Ok(c)
     }
+
+    /// The caller has already observed the fence before reusing this pool.
+    fn begin_commands(&self) -> R<()> {
+        let d = &self.ctx.device;
+        unsafe {
+            d.reset_command_pool(self.pool, vk::CommandPoolResetFlags::empty())
+                .map_err(vkerr("reset commands"))?;
+            d.begin_command_buffer(
+                self.commands,
+                &vk::CommandBufferBeginInfo::builder()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .map_err(vkerr("begin commands"))
+        }
+    }
+
+    fn submit(&self) -> R<()> {
+        let d = &self.ctx.device;
+        unsafe {
+            d.end_command_buffer(self.commands)
+                .map_err(vkerr("end commands"))?;
+            d.reset_fences(&[self.fence])
+                .map_err(vkerr("reset fence"))?;
+            d.queue_submit(
+                self.ctx.queue,
+                &[vk::SubmitInfo::builder()
+                    .command_buffers(std::slice::from_ref(&self.commands))
+                    .build()],
+                self.fence,
+            )
+            .map_err(vkerr("submit ray commands"))
+        }
+    }
 }
 impl Drop for Core {
     fn drop(&mut self) {
@@ -568,8 +601,9 @@ impl Drop for Core {
 
 struct Output {
     // wgpu owns VkBuffer after import. We own its allocation. The interop
-    // path idles the queue before replacement/drop, and destroys the wgpu
-    // Buffer handle before freeing its memory. No maps or use after destroy.
+    // path observes completion of both queues of work (native and wgpu, on
+    // the same VkQueue) before replacement/drop. `destroy()` then releases
+    // the VkBuffer before we free the allocation; wgpu no longer uses it.
     imported: Option<wgpu::Buffer>,
     raw: Buffer,
 }
@@ -583,6 +617,7 @@ impl Drop for Output {
 
 pub struct Renderer {
     core: Core,
+    // Kept by the engine until device teardown; raw uses are not tracked by it.
     world: Option<Upload>,
     moving: Option<Upload>,
     textures: Option<Upload>,
@@ -677,9 +712,79 @@ impl Renderer {
         self.last_moving == moving.words
     }
 
+    /// Later-frame probe for the single command pool/fence/descriptor set and
+    /// mutable AS/upload resources. No CPU writes or resets while in flight.
+    pub(super) fn try_prepare_image(&mut self, device: &wgpu::Device, size: u64) -> R<bool> {
+        let ctx = &self.core.ctx;
+        let d = &ctx.device;
+        if self.submitted {
+            if !unsafe { d.get_fence_status(self.core.fence) }.map_err(vkerr("poll ray frame"))? {
+                return Ok(false);
+            }
+            self.submitted = false;
+        }
+        if self.output.as_ref().is_none_or(|o| o.raw.size != size) {
+            // The native fence does not cover the wgpu denoiser/present read
+            // submitted *after* it. Don't destroy the imported VkBuffer (or
+            // its externally owned allocation) until wgpu has retired it.
+            if self.output.as_ref().is_some_and(|o| o.imported.is_some())
+                && !device.poll(wgpu::Maintain::Poll).is_queue_empty()
+            {
+                return Ok(false);
+            }
+            let raw = Buffer::new(
+                ctx,
+                size,
+                STORAGE | vk::BufferUsageFlags::TRANSFER_DST,
+                LOCAL,
+            )?;
+            // wgpu's import contract requires initialized storage. Queue a
+            // cheap fill (not a redundant ray dispatch) and import only after
+            // its fence signals; this also works for device-local VRAM.
+            self.core.begin_commands()?;
+            unsafe {
+                d.cmd_fill_buffer(self.core.commands, raw.handle, 0, size, 0);
+                d.cmd_pipeline_barrier(
+                    self.core.commands,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier::builder()
+                        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                        .build()],
+                    &[],
+                    &[],
+                );
+            }
+            self.core.submit()?;
+            self.submitted = true;
+            self.output = Some(Output {
+                imported: None,
+                raw,
+            });
+            return Ok(false);
+        }
+        let output = self.output.as_mut().unwrap();
+        if output.imported.is_none() {
+            output.imported = Some(unsafe {
+                device.create_buffer_from_hal::<Vulkan>(
+                    HalDevice::buffer_from_raw(output.raw.handle),
+                    &wgpu::BufferDescriptor {
+                        label: Some("Lighter ray-query image"),
+                        size,
+                        usage: wgpu::BufferUsages::STORAGE,
+                        mapped_at_creation: false,
+                    },
+                )
+            });
+            output.raw.owns_handle = false;
+        }
+        Ok(true)
+    }
+
     pub fn trace(
         &mut self,
-        device: &wgpu::Device,
         frame: &Frame,
         image_size: u64,
         world: &Packet,
@@ -690,28 +795,12 @@ impl Renderer {
         let ctx = &self.core.ctx;
         let d = &ctx.device;
         let cmd = self.core.commands;
-        // This is called only by the viewer render thread, with no simultaneous
-        // wgpu queue calls. The raw submission precedes wgpu's compositor on
-        // the same VkQueue. Wait only before recycling mutable RT resources.
-        if self.submitted {
-            unsafe { d.wait_for_fences(&[self.core.fence], true, u64::MAX) }
-                .map_err(vkerr("wait for ray frame"))?;
-            self.submitted = false;
-        }
-        if self
-            .output
-            .as_ref()
-            .is_none_or(|o| o.raw.size != image_size)
-        {
-            if self.output.is_some() {
-                unsafe { d.queue_wait_idle(ctx.queue) }.map_err(vkerr("resize interop buffer"))?;
-            }
-            self.output = Some(Output {
-                imported: None,
-                raw: Buffer::new(ctx, image_size, STORAGE, LOCAL)?,
-            });
-        }
-        let output = self.output.as_mut().unwrap();
+        // Raw submit and wgpu composition both run on the render thread on
+        // the same VkQueue. `try_prepare_image` has observed the native fence.
+        assert!(!self.submitted);
+        let output = self.output.as_ref().expect("prepare image before tracing");
+        let image = output.imported.as_ref().expect("initialized interop image");
+        assert_eq!(output.raw.size, image_size);
         let static_changed = self.revision != Some(revision);
         let textures_changed = static_changed || self.texture_len != texels.len();
         let input = STORAGE | BUILD_INPUT | ADDRESS;
@@ -852,14 +941,7 @@ impl Renderer {
         writes.push(bind_tlas);
         unsafe {
             d.update_descriptor_sets(&writes, &[]);
-            d.reset_command_pool(self.core.pool, vk::CommandPoolResetFlags::empty())
-                .map_err(vkerr("reset commands"))?;
-            d.begin_command_buffer(
-                cmd,
-                &vk::CommandBufferBeginInfo::builder()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(vkerr("begin commands"))?;
+            self.core.begin_commands()?;
             if static_changed {
                 w.encode(cmd);
             }
@@ -936,34 +1018,9 @@ impl Renderer {
                 &[],
                 &[],
             );
-            d.end_command_buffer(cmd).map_err(vkerr("end commands"))?;
-            d.reset_fences(&[self.core.fence])
-                .map_err(vkerr("reset fence"))?;
-            d.queue_submit(
-                ctx.queue,
-                &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()],
-                self.core.fence,
-            )
-            .map_err(vkerr("submit ray queries"))?;
-            self.submitted = true;
-            if output.imported.is_none() {
-                // The producer has been queued, but wgpu's external buffer
-                // contract also requires initialized contents at import time.
-                d.wait_for_fences(&[self.core.fence], true, u64::MAX)
-                    .map_err(vkerr("initialize interop buffer"))?;
-                self.submitted = false;
-                output.imported = Some(device.create_buffer_from_hal::<Vulkan>(
-                    HalDevice::buffer_from_raw(output.raw.handle),
-                    &wgpu::BufferDescriptor {
-                        label: Some("Lighter ray-query image"),
-                        size: image_size,
-                        usage: wgpu::BufferUsages::STORAGE,
-                        mapped_at_creation: false,
-                    },
-                ));
-                output.raw.owns_handle = false;
-            }
         }
+        self.core.submit()?;
+        self.submitted = true;
         if moving_changed {
             self.last_moving.clone_from(&moving.words);
         }
@@ -975,14 +1032,15 @@ impl Renderer {
         }
         self.revision = Some(revision);
         self.texture_len = texels.len();
-        Ok(output.imported.as_ref().unwrap())
+        Ok(image)
     }
 }
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        // Includes both native work and wgpu's later compositor read. No raw
-        // resource here can outlive the owning wgpu device.
+        // Terminal teardown only, never on a mode switch or resize. There is
+        // no next redraw to retire raw work; drain both native and subsequent
+        // compositor reads before destroying the imported VkBuffer/allocation.
         unsafe {
             let _ = self.core.ctx.device.queue_wait_idle(self.core.ctx.queue);
         }

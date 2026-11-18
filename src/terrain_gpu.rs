@@ -37,6 +37,7 @@ pub struct TerrainGpu {
     resources: MaterialBindings,
     tex_map: Vec<u32>,
     mask_bytes: usize,
+    mask_upload: Option<std::sync::mpsc::Receiver<()>>,
     pub grass_light_layout: wgpu::BindGroupLayout,
     pub grass_light_bind: wgpu::BindGroup,
     /// One indirect record per visible run, for the near and the far mesh. The
@@ -536,7 +537,7 @@ impl TerrainGpu {
                 device.poll(wgpu::Maintain::Wait);
             }
         }
-        let masks = upload_masks(device, queue, m, &tex_map)?;
+        let masks = upload_masks(device, queue, m, &tex_map, MaskUpload::Startup)?;
         let (lighttex, light_side, light_per_row, light_per_page, light_pages, availability) =
             load_lightmaps(device, queue, t, m, mask_side)?;
         let settings = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -821,6 +822,7 @@ impl TerrainGpu {
             resources,
             tex_map,
             mask_bytes: masks.bytes,
+            mask_upload: None,
             grass_light_layout,
             grass_light_bind,
             near_args: run_args("terrain near run args"),
@@ -872,18 +874,40 @@ impl TerrainGpu {
         reflection: &wgpu::Buffer,
         upload: &TerrainUpload,
     ) -> Result<(), String> {
-        let masks = upload_masks(device, queue, &upload.materials, &self.tex_map)?;
+        let masks = upload_masks(
+            device,
+            queue,
+            &upload.materials,
+            &self.tex_map,
+            MaskUpload::Streaming,
+        )?;
+        let (sent, complete) = std::sync::mpsc::channel();
+        queue.on_submitted_work_done(move || {
+            let _ = sent.send(());
+        });
+        self.mask_upload = Some(complete);
         self.mask_bytes = masks.bytes;
         self.bind = self.resources.bind(device, normal, &masks);
         self.reflect_bind = self.resources.bind(device, reflection, &masks);
         self.far = upload.far.as_ref().map(|mesh| FarGpu::upload(device, mesh));
         self.last_near_runs.clear();
         self.last_far_runs.clear();
-        // Non-blocking poll lets wgpu retire old in-flight atlas/buffer
-        // references without stalling the CPU/GPU pipeline.
-        device.poll(wgpu::Maintain::Poll);
         Ok(())
     }
+
+    /// After the viewer's poll, allow at most one streamed mask atlas in flight.
+    /// Until then leave the new mesh in the worker's result channel; the current
+    /// bindings are valid and all draws follow the upload on the same queue.
+    pub fn can_update_residency(&mut self) -> bool {
+        if self.mask_upload.as_ref().is_some_and(|upload| {
+            matches!(upload.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
+        }) {
+            return false;
+        }
+        self.mask_upload = None;
+        true
+    }
+
     /// `runs` is the per-view visibility result (`block+0x74`): `None` draws the
     /// whole window mesh, `Some` submits only the ranges the view kept.
     /// Upload one indirect record per visible run for this view.
@@ -1036,11 +1060,17 @@ fn run_records(runs: &[(u32, u32)]) -> Vec<crate::indirect_args::DrawIndexedArgs
         .map(|&(start, count)| crate::indirect_args::record(start..start + count, 0..1))
         .collect()
 }
+enum MaskUpload {
+    Startup,
+    Streaming,
+}
+
 fn upload_masks(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     m: &crate::material::Materials,
     tex_map: &[u32],
+    mode: MaskUpload,
 ) -> Result<MaskResources, String> {
     let masks_count = m
         .areas
@@ -1120,9 +1150,10 @@ fn upload_masks(
             } else {
                 if layer_id / per_page != page_id {
                     upload_page(&page, page_id);
-                    // Prevent queued 16 MiB mask pages from accumulating
-                    // alongside decoded terrain images and lightmaps.
-                    if page_id % 2 == 1 {
+                    // The initial full upload can coexist with other large
+                    // decoded resources. Only startup throttles within an
+                    // atlas; live streaming bounds overlapping atlases instead.
+                    if matches!(mode, MaskUpload::Startup) && page_id % 2 == 1 {
                         queue.submit(std::iter::empty());
                         device.poll(wgpu::Maintain::Wait);
                     }
@@ -1156,7 +1187,9 @@ fn upload_masks(
     }
     upload_page(&page, page_id);
     queue.submit(std::iter::empty());
-    device.poll(wgpu::Maintain::Wait);
+    if matches!(mode, MaskUpload::Startup) {
+        device.poll(wgpu::Maintain::Wait);
+    }
     drop(page);
     let area_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("terrain areas"),
@@ -1679,11 +1712,11 @@ mod tests {
         .unwrap();
         device.push_error_scope(wgpu::ErrorFilter::Validation);
         let mut m = crate::material::cutoff_mask_fixture();
-        let full = upload_masks(&device, &queue, &m, &[0]).unwrap();
+        let full = upload_masks(&device, &queue, &m, &[0], MaskUpload::Startup).unwrap();
         assert_eq!(full.bytes, 32 * 1024 * 1024);
         drop(full);
         let near = m.take_window(Some([2, 3, 5, 6]));
-        let compact = upload_masks(&device, &queue, &near, &[0]).unwrap();
+        let compact = upload_masks(&device, &queue, &near, &[0], MaskUpload::Streaming).unwrap();
         assert_eq!(compact.bytes, 16 * 1024 * 1024);
         // Read actual GPU records: cold global IDs must be empty, not aliased
         // to a neighbouring area; retained layers must use compact mask slots.
@@ -1771,7 +1804,7 @@ mod tests {
         // A camera beyond the map has no layers but still needs a valid binding.
         let mut fixture = crate::material::cutoff_mask_fixture();
         let empty = fixture.take_window(Some([0, 0, 0, 0]));
-        let empty_gpu = upload_masks(&device, &queue, &empty, &[0]).unwrap();
+        let empty_gpu = upload_masks(&device, &queue, &empty, &[0], MaskUpload::Streaming).unwrap();
         assert!(empty_gpu.layer_buffer.size() >= std::mem::size_of::<Layer>() as u64);
         device.poll(wgpu::Maintain::Wait);
         assert!(pollster::block_on(device.pop_error_scope()).is_none());

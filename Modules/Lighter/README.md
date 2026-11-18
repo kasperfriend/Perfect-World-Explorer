@@ -161,6 +161,9 @@ are unchanged; Lighter uses the separate bounded BMD region described above.
 
 ## Verification
 
+See [GPU completion and readback](performance-waits.md) for the Phase 0 wait
+audit, F12 world captures, and the asynchronous window/resize regressions.
+
 The viewer tests validate both WGSL paths and inspect the emitted Vulkan
 ray-query SPIR-V. The hardware path uses Naga 26 to keep candidate and
 committed hits distinct without changing the viewer's wgpu version. Pixel tests

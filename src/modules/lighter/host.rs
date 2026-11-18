@@ -849,7 +849,7 @@ impl super::Renderer {
         );
         let post_color = use_post.then(|| self.post.scene_view());
         let scene_target = post_color.as_ref().unwrap_or(target);
-        let result = (|| -> Result<(), String> {
+        let result = (|| -> Result<bool, String> {
             let feed = self
                 .lighter_feed
                 .as_ref()
@@ -877,11 +877,15 @@ impl super::Renderer {
                 &moving,
             )
         })();
-        if let Err(error) = result {
-            self.lighter.fail_frame(error);
-            Lighter::clear(&mut encoder, target, &depth);
-            self.queue.submit(Some(encoder.finish()));
-            return;
+        match result {
+            Ok(true) => {}
+            Ok(false) => return, // Live preflight normally defers before acquiring a surface.
+            Err(error) => {
+                self.lighter.fail_frame(error);
+                Lighter::clear(&mut encoder, target, &depth);
+                self.queue.submit(Some(encoder.finish()));
+                return;
+            }
         }
         if use_post {
             self.water.copy_depth(&mut encoder, &self.depth);
