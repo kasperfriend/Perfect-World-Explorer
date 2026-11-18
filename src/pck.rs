@@ -726,7 +726,7 @@ pub fn read_entries_parts(
             ranges.push((entry.offset as u64, bytes.as_mut_slice()));
             range_indices.push(index);
             if ranges.len() == BATCH_CAPACITY {
-                if direct_storage::read_ranges(f, &mut ranges) {
+                if direct_storage::read_ranges(first, &mut ranges) {
                     for &index in &range_indices {
                         direct_storage_done[index] = true;
                     }
@@ -735,7 +735,7 @@ pub fn read_entries_parts(
                 range_indices.clear();
             }
         }
-        if !ranges.is_empty() && direct_storage::read_ranges(f, &mut ranges) {
+        if !ranges.is_empty() && direct_storage::read_ranges(first, &mut ranges) {
             for &index in &range_indices {
                 direct_storage_done[index] = true;
             }

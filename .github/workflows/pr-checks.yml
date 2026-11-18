@@ -461,6 +461,17 @@ jobs:
           if ($status -ne 0) {
             Write-Host "::error::Windows viewer build failed (exit $status); diagnostic tail follows"
             Get-Content -LiteralPath $log -Tail 100 | ForEach-Object { Write-Host "::error::$_" }
+            # A warning is not the reason the build failed, and the tail is full
+            # of them, so the errors are what has to survive into the annotation
+            # list. Ten is the most the annotation API accepts.
+            $errors = Get-Content -LiteralPath $log |
+              Select-String -Pattern '^error(\[|:)' |
+              Select-Object -First 10
+            if ($errors) {
+              foreach ($line in $errors) { Write-Host ("::error::" + $line.Line) }
+            } else {
+              Write-Host "::error::the build failed without an 'error' line; see the job log"
+            }
           }
           exit $status
       - name: Build audio corpus and scene diagnostics
