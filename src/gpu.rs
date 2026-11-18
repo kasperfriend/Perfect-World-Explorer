@@ -4425,35 +4425,29 @@ pub fn run(
     crate::gfx_player::set_shaft_mode(settings.effect_shaft);
     let vegetation_authored_mips = settings.vegetation_authored_mips
         || std::env::var_os("PW_VEGETATION_AUTHORED_MIPS").is_some();
-    let mut residency = crate::terrain_residency::Residency::default();
-    let m = build(
-        &mut t,
-        camera.pos.x,
-        camera.pos.z,
-        settings.detail,
-        &mut residency,
-        vegetation_authored_mips,
-    )?;
-    // The Imaginator's capture has to happen *here*: it is the last moment the
-    // host still owns the resident tree meshes (the GPU tree path clears them
-    // inside `Renderer::new`) and the streaming object set, and the module only
-    // wants a triangle soup it owns outright, so the borrow ends at this call.
+    // The Imaginator's capture has to run *before* `build`.
+    //
+    // `build` hands the resident tree meshes and placements to the GPU far-tree
+    // pass and then clears them (`t.trees.types`/`t.trees.placements`), because
+    // the streaming worker never reads those sources again. The capture used to
+    // sit *after* `build` with a comment claiming it ran before the clear, so it
+    // always saw zero tree placements: the traced world had ground and no
+    // foliage, no matter what the budget was. It has to be taken here, while the
+    // meshes still exist.
     //
     // The capture happens whether or not the module is currently switched on.
+    // It has to: this is the only moment the resident tree meshes and the
+    // streaming object set exist. Gating the walk on the *saved* tracer meant
+    // that a launch which started off — which is how it is meant to start —
+    // captured nothing, and switching a tracer on later found an empty world and
+    // asked for a reload, which reset the tracer to off again.
     //
-    // It has to: this is the last moment the resident tree meshes and the
-    // streaming object set exist, and the module can only trace geometry it
-    // captured here. Gating the walk on the *saved* tracer meant that with the
-    // module starting off — which is how it is meant to start — nothing was ever
-    // captured, and switching a tracer on later found an empty world and told
-    // the user to reload the map, which then reset the tracer to off again. The
-    // walk is one pass over resident geometry at load time; correctness is worth
-    // more than the second it costs.
+    // Ornament meshes are a live streaming set: only what is resident near the
+    // eye at load is captured, which is why the ornament count here is a small
+    // fraction of the world's 16037 placements. Terrain, water and every tree
+    // placement are captured in full.
     let imaginator_scene =
         crate::imaginator::Imaginator::wants_world_capture(&t.element).then(|| {
-            // Load-time and potentially a walk over every resident triangle, on the
-            // thread that has not drawn a frame yet. Say so, so a startup that hangs
-            // here is distinguishable from one that hangs later.
             eprintln!("Imaginator: capturing world geometry...");
             let grid = crate::navigation::MapSpace {
                 width: t.width,
@@ -4461,7 +4455,7 @@ pub fn run(
                 spacing: t.grid_spacing,
                 heights: t.heights.clone(),
             };
-            crate::imaginator::capture::capture(
+            let scene = crate::imaginator::capture::capture(
                 &crate::imaginator::capture::Sources {
                     map: &grid,
                     water: &t.water,
@@ -4471,8 +4465,24 @@ pub fn run(
                     trees: Some(&t.trees),
                 },
                 crate::imaginator::capture::CaptureBudget::default(),
-            )
+            );
+            eprintln!(
+                "Imaginator: captured {} triangles ({} tree placements, {} resident ornaments)",
+                scene.stats.triangles,
+                t.trees.placements.len(),
+                t.objects.ornaments.len()
+            );
+            scene
         });
+    let mut residency = crate::terrain_residency::Residency::default();
+    let m = build(
+        &mut t,
+        camera.pos.x,
+        camera.pos.z,
+        settings.detail,
+        &mut residency,
+        vegetation_authored_mips,
+    )?;
     if let Some(scene) = &imaginator_scene {
         eprintln!("Imaginator: captured {} triangles", scene.triangle_count());
     }

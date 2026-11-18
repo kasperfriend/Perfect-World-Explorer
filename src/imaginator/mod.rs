@@ -1815,4 +1815,39 @@ mod tests {
             "render must keep the software worker's own traced extent"
         );
     }
+
+    /// The world capture must run before `build` clears the tree placements.
+    ///
+    /// `build` hands the resident tree meshes to the GPU far-tree pass and then
+    /// clears `t.trees.types` and `t.trees.placements`, because the streaming
+    /// worker never reads them again. The capture sat *after* that call under a
+    /// comment claiming it came before, so it always saw zero tree placements
+    /// and the traced world had no foliage at all. Nothing else reported it: the
+    /// capture succeeded, the triangle count looked plausible, and only the
+    /// picture was wrong.
+    #[test]
+    fn the_capture_runs_before_the_trees_are_handed_to_the_gpu() {
+        let source = include_str!("../gpu.rs");
+        // File offsets are not execution order: the clear lives inside `build`,
+        // a different function defined earlier in the file. What matters is that
+        // the call to `build` comes after the capture in the *same* function.
+        let capture = source
+            .find("Imaginator: capturing world geometry")
+            .expect("the capture is announced");
+        let build = source.find("let m = build(").expect("build is called");
+        assert!(
+            capture < build,
+            "the capture must run before the call to build(), which clears the tree \
+             placements inside it"
+        );
+        // And the clear really is inside `build`, so that reasoning holds.
+        let build_body = &source[..build].rfind("fn build(").map(|_| &source[..build]);
+        if let Some(before_build_call) = build_body {
+            assert!(
+                before_build_call.contains("t.trees.placements.clear()"),
+                "the tree placements are expected to be cleared inside build(); if that moved, \
+                 this test's reasoning no longer covers it"
+            );
+        }
+    }
 }

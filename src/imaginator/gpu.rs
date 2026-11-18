@@ -584,7 +584,37 @@ fn trace_sample(uv: vec2<f32>) -> vec4<f32> {
  let c10 = textureLoad(traced, clamp(p + vec2<i32>(1, 0), lo, hi), 0);
  let c01 = textureLoad(traced, clamp(p + vec2<i32>(0, 1), lo, hi), 0);
  let c11 = textureLoad(traced, clamp(p + vec2<i32>(1, 1), lo, hi), 0);
- return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+ // `a` is not an ordinary channel: it is sun visibility *and* carries a sign
+ // that means "the primary ray escaped". Interpolating it directly mixes -1
+ // (sky) with 0..1 (hit), so a pixel on the silhouette between a building and
+ // the sky averages to a small negative number and is then treated as sky, or
+ // to a small positive one and treated as a fully-shadowed hit. That is an
+ // artifact that sits exactly on every object edge, and it looks like blocky
+ // shadow tiles. Reconstruct coverage and visibility separately, both of which
+ // interpolate honestly, and rebuild the sign from how much of the footprint
+ // actually hit geometry.
+ let w = vec4<f32>(f.x, f.y, 1.0 - f.x, 1.0 - f.y);
+ let a00 = c00.a;
+ let a10 = c10.a;
+ let a01 = c01.a;
+ let a11 = c11.a;
+ // Weights for the four taps, in the same order as the bilinear mix above.
+ let w00 = w.w * w.z;
+ let w10 = w.x * w.z;
+ let w01 = w.w * w.y;
+ let w11 = w.x * w.y;
+ // Coverage: how much of this footprint is geometry rather than sky.
+ let hit00 = select(0.0, 1.0, a00 >= 0.0);
+ let hit10 = select(0.0, 1.0, a10 >= 0.0);
+ let hit01 = select(0.0, 1.0, a01 >= 0.0);
+ let hit11 = select(0.0, 1.0, a11 >= 0.0);
+ let coverage = w00 * hit00 + w10 * hit10 + w01 * hit01 + w11 * hit11;
+ // Visibility, weighted by the geometry taps only so sky does not vote.
+ let visible = w00 * max(a00, 0.0) + w10 * max(a10, 0.0)
+             + w01 * max(a01, 0.0) + w11 * max(a11, 0.0);
+ let alpha = select(-1.0, visible / max(coverage, 1e-5), coverage > 0.5);
+ let rgb = mix(mix(c00.rgb, c10.rgb, f.x), mix(c01.rgb, c11.rgb, f.x), f.y);
+ return vec4<f32>(rgb, alpha);
 }
 
 
