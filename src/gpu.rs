@@ -3061,18 +3061,28 @@ impl Renderer {
         self.frame = snapshot;
         snapshot
     }
-    fn update_mesh(&mut self, mut m: MeshData) -> Result<(), String> {
-        if let Some(feed) = &mut self.lighter_feed {
-            feed.install(&mut self.lighter, &m, &self.device);
-        }
-        if let Some(mut upload) = m.terrain_upload.take() {
-            self.terrain_gpu.update_residency(
+    /// Advance any staged terrain upload. `pending` remains owned by the
+    /// viewer until the replacement mesh and all of its atlas pages are ready.
+    fn update_mesh(&mut self, pending: &mut Option<MeshData>) -> Result<bool, String> {
+        let Some(mesh) = pending.as_ref() else {
+            return Ok(false);
+        };
+        if let Some(upload) = &mesh.terrain_upload {
+            if !self.terrain_gpu.poll_residency(
                 &self.device,
                 &self.queue,
                 &self.uniform,
                 &self.reflected_uniform,
-                &upload,
-            )?;
+                upload,
+            )? {
+                return Ok(false);
+            }
+        }
+        let mut m = pending.take().unwrap();
+        if let Some(feed) = &mut self.lighter_feed {
+            feed.install(&mut self.lighter, &m, &self.device);
+        }
+        if let Some(mut upload) = m.terrain_upload.take() {
             upload.materials.release_gpu_source();
         }
         self.grass.update(&self.device, &self.queue, m.grass);
@@ -3140,7 +3150,7 @@ impl Renderer {
             crate::grass_mips::upload(&self.queue, &self.atlas, &m.atlas, &m.grass_mips, ATLAS);
             self.grass_atlas_key = m.grass_atlas_key;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Upload the rebuilt near-world geometry, growing the two buffers only when
@@ -5649,6 +5659,7 @@ fn run_viewer(
     let mut fullscreen_applied = false;
     let mut menu_page = MenuPage::Main;
     let mut streaming = false;
+    let mut pending_mesh = None;
     let mut keys = HashSet::new();
     let mut captured = false;
     // Winit sends Focused(true) when the visible window actually gains focus.
@@ -5671,6 +5682,8 @@ fn run_viewer(
     let mut frame_capture = readback::ViewerCapture::default();
     #[cfg(test)]
     let mut smoke_frames = 0;
+    #[cfg(test)]
+    let mut smoke_resize_requested = false;
     #[cfg(test)]
     let smoke_deadline = Instant::now() + Duration::from_secs(120);
     let mut region_tick_ms = renderer.started.elapsed().as_millis() as u64;
@@ -5832,7 +5845,14 @@ fn run_viewer(
                         if let Some(active_surface) = surface.as_ref() {
                             // wgpu may synchronously drain outstanding work
                             // inside configure. Defer rather than stall for it.
-                            if !queue_idle {
+                            let native_idle = match renderer.lighter.poll_hardware() {
+                                Ok(idle) => idle,
+                                Err(error) => {
+                                    renderer.lighter.fail_frame(error);
+                                    true
+                                }
+                            };
+                            if !queue_idle || !native_idle {
                                 gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
                                 return;
                             }
@@ -6433,25 +6453,27 @@ fn run_viewer(
                     if active_keys.contains(&KeyCode::ArrowDown) {
                         camera.pitch = (camera.pitch - dt).max(-1.5)
                     }
-                    if streaming && renderer.terrain_gpu.can_update_residency() {
-                        match result_rx.try_recv() {
-                            Ok(Ok(mesh)) => {
-                                if let Err(e) = renderer.update_mesh(mesh) {
-                                    eprintln!("Terrain residency upload failed: {e}");
+                    if streaming {
+                        if pending_mesh.is_none() {
+                            match result_rx.try_recv() {
+                                Ok(Ok(mesh)) => pending_mesh = Some(mesh),
+                                Ok(Err(e)) => {
+                                    eprintln!("Streaming error: {e}");
                                     target.exit(); return;
                                 }
-                                streaming = false;
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    eprintln!("World streaming worker exited");
+                                    target.exit(); return;
+                                }
                             }
-                            Ok(Err(e)) => {
-                                eprintln!("Streaming error: {e}");
-                                target.exit();
-                                return;
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                eprintln!("World streaming worker exited");
-                                target.exit();
-                                return;
+                        }
+                        match renderer.update_mesh(&mut pending_mesh) {
+                            Ok(true) => streaming = false,
+                            Ok(false) => {},
+                            Err(e) => {
+                                eprintln!("Terrain residency upload failed: {e}");
+                                target.exit(); return;
                             }
                         }
                     }
@@ -6888,7 +6910,7 @@ fn run_viewer(
                             );
                             #[cfg(test)]
                             if let Some(dir) = smoke_dir {
-                                if smoke_frames < 2 {
+                                if smoke_frames == 0 || smoke_frames == 1 && world_extent == (192, 112) {
                                     frame_capture.requested = Some(dir.join(format!("{smoke_frames}.png")));
                                     smoke_frames += 1;
                                 }
@@ -7683,6 +7705,11 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 }
                             } else if let Some(frame) = frame {
                                 frame.present();
+                                #[cfg(test)]
+                                if smoke_dir.is_some() && smoke_frames == 1 && !smoke_resize_requested {
+                                    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(192, 112));
+                                    smoke_resize_requested = true;
+                                }
                                 // The window now has a presentation history, so
                                 // frame generation may take the swapchain over.
                                 presented_once = true;

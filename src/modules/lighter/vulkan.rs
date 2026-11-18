@@ -714,15 +714,21 @@ impl Renderer {
 
     /// Later-frame probe for the single command pool/fence/descriptor set and
     /// mutable AS/upload resources. No CPU writes or resets while in flight.
+    pub(super) fn poll_frame(&mut self) -> R<bool> {
+        if self.submitted {
+            let ready = unsafe { self.core.ctx.device.get_fence_status(self.core.fence) }
+                .map_err(vkerr("poll ray frame"))?;
+            self.submitted = !ready;
+        }
+        Ok(!self.submitted)
+    }
+
     pub(super) fn try_prepare_image(&mut self, device: &wgpu::Device, size: u64) -> R<bool> {
+        if !self.poll_frame()? {
+            return Ok(false);
+        }
         let ctx = &self.core.ctx;
         let d = &ctx.device;
-        if self.submitted {
-            if !unsafe { d.get_fence_status(self.core.fence) }.map_err(vkerr("poll ray frame"))? {
-                return Ok(false);
-            }
-            self.submitted = false;
-        }
         if self.output.as_ref().is_none_or(|o| o.raw.size != size) {
             // The native fence does not cover the wgpu denoiser/present read
             // submitted *after* it. Don't destroy the imported VkBuffer (or

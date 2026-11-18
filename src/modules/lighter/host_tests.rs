@@ -732,7 +732,7 @@ fn lighter_streamed_world_pixels() {
         !streamed.local_pages.is_empty(),
         "fixture BMD did not reach the local page builder"
     );
-    r.update_mesh(streamed).unwrap();
+    assert!(r.update_mesh(&mut Some(streamed)).unwrap());
     let packet = &r.lighter.world.as_ref().unwrap().packet.words;
     assert!(
         packet[packet[3] as usize..packet[4] as usize]
@@ -835,8 +835,8 @@ fn lighter_streamed_world_pixels() {
 
     terrain.objects = crate::objects::Objects::open(&root.0, Vec::new()).unwrap();
     terrain.scenery_placements = None;
-    r.update_mesh(mesh(&mut terrain, r.grass_atlas_key))
-        .unwrap();
+    let evicted = mesh(&mut terrain, r.grass_atlas_key);
+    assert!(r.update_mesh(&mut Some(evicted)).unwrap());
     for (x, lit) in points.into_iter().zip(bright) {
         assert_eq!(
             probe(&mut r, &mut camera, x),
@@ -877,7 +877,7 @@ fn lighter_live_viewer_frames() {
     let root = FixtureRoot::new();
     super::super::run_viewer(fixture(&root.0), Some(&root.0)).unwrap();
     assert_world_png(&root.0.join("0.png"), (160, 96));
-    assert_world_png(&root.0.join("1.png"), (160, 96));
+    assert_world_png(&root.0.join("1.png"), (192, 112));
 }
 
 fn assert_world_png(path: &std::path::Path, extent: (u32, u32)) {

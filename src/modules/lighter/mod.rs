@@ -593,6 +593,16 @@ impl Lighter {
         Ok((rw, rh))
     }
 
+    /// Swapchain recreation may idle the native device, not just the wgpu
+    /// queue. A raw image fill is not visible to wgpu's lifetime tracker.
+    pub(crate) fn poll_hardware(&mut self) -> Result<bool, String> {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(rt) = &mut self.hardware {
+            return rt.poll_frame();
+        }
+        Ok(true)
+    }
+
     /// Check before acquiring a swapchain image. False means retry on a later
     /// redraw without evolving history, submitting stale pixels or reporting
     /// backpressure as an RT failure.
