@@ -98,6 +98,12 @@ unsafe impl bytemuck::Zeroable for GpuParams {}
 pub const TERM_REFLECTIONS: u32 = 1;
 pub const TERM_LIGHTING: u32 = 2;
 pub const TERM_SHADOWS: u32 = 4;
+/// Bit 8 of the term mask: let the traced reflection cover water pixels.
+///
+/// Off by default, because water already has the core's own screen reflection
+/// and replacing it changes the look of every river on the map. The module page
+/// has always offered this as a checkbox; it now reaches the shaders.
+pub const TERM_WATER_FILL: u32 = 8;
 
 impl GpuParams {
     pub fn mask(settings: &ImaginatorSettings) -> u32 {
@@ -110,6 +116,9 @@ impl GpuParams {
         }
         if settings.shadows {
             m |= TERM_SHADOWS;
+        }
+        if settings.water_reflection_fill {
+            m |= TERM_WATER_FILL;
         }
         m
     }
@@ -168,6 +177,9 @@ struct Light { position_range: vec4<f32>, colour: vec4<f32> };
 const TERM_REFLECTIONS: u32 = 1u;
 const TERM_LIGHTING: u32 = 2u;
 const TERM_SHADOWS: u32 = 4u;
+// Let the traced reflection cover water. Off by default: water already carries
+// the core's own screen reflection.
+const TERM_WATER_FILL: u32 = 8u;
 const PI: f32 = 3.14159265;
 
 // --- hashing RNG: the same generator shape as a PCG, in WGSL -----------------
@@ -522,7 +534,11 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
   // would, and the composite added it on top of a frame that already carried
   // the sky, which is what turned the ground white.
   let reflectivity = mat.a;
-  if (terms & TERM_REFLECTIONS) != 0u && reflectivity > 0.0 {
+  // Water's mirror is the core's own pass unless the user asked for the traced
+  // one, which is what the module page's switch says it does.
+  let water_hit = hit.material == 2u;
+  let water_ok = !water_hit || (terms & TERM_WATER_FILL) != 0u;
+  if (terms & TERM_REFLECTIONS) != 0u && water_ok && reflectivity > 0.0 {
    let cos_i = dot(normal, -rd);
    if cos_i > 0.0 {
     let mirror = normalize(rd + normal * (2.0 * cos_i));

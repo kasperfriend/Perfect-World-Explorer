@@ -4464,7 +4464,23 @@ pub fn run(
                     scene: &t.scene,
                     trees: Some(&t.trees),
                 },
-                crate::imaginator::capture::CaptureBudget::default(),
+                // Capture what can actually be seen, at a spacing that follows
+                // the ground.
+                //
+                // A whole-world capture at the coarse stride is two million
+                // triangles of ground with four-cell quads: expensive to trace,
+                // and - worse - a quad spans tens of metres, so it planes
+                // straight across a building's footprint. A ray from the camera
+                // then meets that sheet before the wall, and the building appears
+                // to be behind white glass. Capturing within a radius lets the
+                // terrain be captured at native spacing instead, where it follows
+                // the ground and stops occluding what stands on it, and it is
+                // several times cheaper to trace.
+                crate::imaginator::capture::CaptureBudget {
+                    radius: Some(crate::imaginator::capture::CAPTURE_RADIUS),
+                    center: [camera.pos.x, camera.pos.y, camera.pos.z],
+                    ..crate::imaginator::capture::CaptureBudget::default()
+                },
             );
             eprintln!(
                 "Imaginator: captured {} triangles ({} tree placements, {} resident ornaments)",

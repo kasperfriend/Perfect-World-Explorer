@@ -42,6 +42,11 @@ RWTexture2D<float4> out_tex : register(u0);
 static const uint TERM_REFLECTIONS = 1u;
 static const uint TERM_LIGHTING = 2u;
 static const uint TERM_SHADOWS = 4u;
+// Let the traced reflection cover water, which otherwise keeps the core's own
+// screen reflection. Matches the module page's switch and the WGSL fallback.
+static const uint TERM_WATER_FILL = 8u;
+// `bvh::material::WATER`.
+static const uint MATERIAL_WATER = 2u;
 
 // --- RNG (PCG, the same shape as the WGSL) --------------------------------
 uint pcg(uint v)
@@ -120,6 +125,12 @@ float4 material_of(uint primitive)
 {
     uint index = uint(tri_normals[primitive].w);
     return materials[index];
+}
+
+// The material *id* of a primitive, which is what `bvh::material::WATER` names.
+uint material_id_of(uint primitive)
+{
+    return uint(tri_normals[primitive].w);
 }
 
 // One surface's own light, with no further scattering.
@@ -233,7 +244,11 @@ void cs(uint3 id : SV_DispatchThreadID)
                 n = bn;
             }
         }
-        if ((terms & TERM_REFLECTIONS) != 0u)
+        // Water's mirror belongs to the core's water pass unless the user asked
+        // for the traced one.
+        bool water_ok = material_id_of(hit.primitive) != MATERIAL_WATER
+                        || (terms & TERM_WATER_FILL) != 0u;
+        if ((terms & TERM_REFLECTIONS) != 0u && water_ok)
         {
             float cos_i = dot(normal, -rd);
             if (cos_i > 0.0)

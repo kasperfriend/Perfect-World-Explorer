@@ -262,6 +262,15 @@ pub struct TraceOptions {
     pub shadows: bool,
     pub bounces: u32,
     pub guard: u64,
+    /// Water keeps the core's own screen reflection; when this is on the traced
+    /// reflection additionally covers water pixels.
+    ///
+    /// This was a checkbox in the module page that reached nothing: the field
+    /// existed on the settings, was serialised, was drawn, and no tracer ever
+    /// read it, so toggling it changed exactly nothing. It is honoured here by
+    /// suppressing the mirror term on water surfaces when it is off, which is
+    /// what the label has always claimed.
+    pub water_reflection_fill: bool,
 }
 
 impl TraceOptions {
@@ -275,6 +284,7 @@ impl TraceOptions {
             // the thread. Generous: a full-resolution frame at four bounces
             // stays well inside it.
             guard: 4_000_000_000,
+            water_reflection_fill: settings.water_reflection_fill,
         }
     }
 }
@@ -459,7 +469,15 @@ impl Tracer {
         // of why the software tracer took seconds per frame. Water (0.85) and
         // wet slopes stay well above it.
         const VISIBLE_REFLECTANCE: f32 = 0.08;
-        if options.reflections && reflectivity >= VISIBLE_REFLECTANCE {
+        // Water's mirror term is the one this switch is about; leave it to the
+        // core's own water reflection pass when the user has not asked for it.
+        // Water's mirror belongs to the core's water pass unless the user has
+        // asked for the traced one. `TERM_WATER_FILL` in the two GPU tracers is
+        // the same switch.
+        let water = hit.material == super::bvh::material::WATER;
+        let water_reflection_fill = options.water_reflection_fill;
+        let reflections_allowed = !water || water_reflection_fill;
+        if options.reflections && reflections_allowed && reflectivity >= VISIBLE_REFLECTANCE {
             let view = ray.direction;
             let cos_i = normal.dot(-view);
             if cos_i > 0. {
@@ -788,6 +806,7 @@ mod tests {
             shadows: true,
             bounces: 2,
             guard: 4_000_000_000,
+            water_reflection_fill: false,
         }
     }
 
@@ -1270,5 +1289,52 @@ mod tests {
             bright > dim * 1.5,
             "indirect must grow with the bounce surface's albedo (dim {dim}, bright {bright})"
         );
+    }
+
+    /// The water reflection switch has to change the trace.
+    ///
+    /// It was a checkbox on the module page: serialised, drawn, and read by no
+    /// tracer. Toggling it changed no pixel, which is indistinguishable from
+    /// "reflections are broken". This pins that it now does something.
+    #[test]
+    fn the_water_reflection_switch_changes_the_trace() {
+        use super::super::bvh::material;
+        let scene = {
+            let mut scene = Scene::empty();
+            scene.materials[material::WATER as usize] = Material::new(v3(0.02, 0.05, 0.06), 0.85);
+            let tris = vec![
+                Triangle {
+                    a: v3(-50., 0., -50.),
+                    b: v3(50., 0., -50.),
+                    c: v3(50., 0., 50.),
+                    normal: v3(0., 1., 0.),
+                    material: material::WATER,
+                },
+                Triangle {
+                    a: v3(-50., 0., -50.),
+                    b: v3(50., 0., 50.),
+                    c: v3(-50., 0., 50.),
+                    normal: v3(0., 1., 0.),
+                    material: material::WATER,
+                },
+            ];
+            let mut scene = scene;
+            scene.bvh = Some(Bvh::build(tris));
+            std::sync::Arc::new(scene)
+        };
+        let reflection_for = |fill: bool| {
+            let tracer = Tracer::new(scene.clone(), Environment::default());
+            let mut opts = options();
+            opts.water_reflection_fill = fill;
+            let out = tracer.trace(&camera(), &opts, 8, 8, 1);
+            out.iter().map(|s| s.reflection.length()).sum::<f32>()
+        };
+        let without = reflection_for(false);
+        let with = reflection_for(true);
+        assert_eq!(
+            without, 0.,
+            "water must keep the core's reflection when off"
+        );
+        assert!(with > 0., "water must get the traced reflection when on");
     }
 }

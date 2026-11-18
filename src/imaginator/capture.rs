@@ -43,6 +43,29 @@ use std::sync::Arc;
 /// a few hundred thousand triangles instead of tens of millions.
 pub const TERRAIN_STRIDE: usize = 4;
 
+/// Terrain stride used inside the capture radius.
+///
+/// The world-wide capture uses `TERRAIN_STRIDE` to make a whole map affordable,
+/// but a stride-4 quad spans four grid cells - tens of metres - and that coarse
+/// surface does not follow the ground under a building. It planes across the
+/// building's footprint, so a ray from the camera meets the terrain quad before
+/// it meets the wall and the building is hidden behind a smooth white sheet.
+/// That is what "buildings covered with a white layer, as if transparent" is.
+///
+/// Inside the radius that actually matters the terrain is captured at its native
+/// spacing instead, so the traced ground follows the real surface and stops
+/// occluding what stands on it.
+pub const TERRAIN_STRIDE_NEAR: usize = 1;
+
+/// How far from the frame's camera a radius-limited capture reaches, in world
+/// units.
+///
+/// Sized to cover what the camera can resolve through fog while leaving the
+/// capture small enough to trace at native terrain spacing. The client's own
+/// ornament draw distance is 120, so a radius well beyond that keeps every
+/// building the viewer can see.
+pub const CAPTURE_RADIUS: f32 = 1400.;
+
 #[derive(Clone, Copy, Debug)]
 pub struct CaptureBudget {
     pub max_triangles: usize,
@@ -228,7 +251,29 @@ fn capture_terrain(b: &mut Builder, map: &MapSpace) {
     if map.width < 2 || map.height < 2 {
         return;
     }
-    let stride = TERRAIN_STRIDE.max(1);
+    // A radius-limited capture can afford real spacing; the whole-world one
+    // cannot, and has to use the coarse stride that planes over buildings.
+    //
+    // The radius still has to be *payable*: native spacing across a 2800-unit
+    // disc is ~100k quads at a 7-unit grid, which is fine, but the same request
+    // on a fine grid would not be. `TERRAIN_STRIDE_NEAR` is therefore a floor,
+    // and the walker thickens it if the radius covers more cells than the budget
+    // can hold, so the capture degrades instead of silently clipping.
+    let mut stride = if b.budget.radius.is_some() {
+        TERRAIN_STRIDE_NEAR.max(1)
+    } else {
+        TERRAIN_STRIDE.max(1)
+    };
+    if let Some(radius) = b.budget.radius {
+        let cell = map.spacing.max(1e-3);
+        let across = ((radius * 2.) / cell).ceil().max(1.);
+        let cells = across * across;
+        // Two triangles per cell, a quarter of the budget for terrain.
+        let affordable = b.budget.max_triangles as f32 * 0.25 / 2.;
+        if cells > affordable {
+            stride = ((cells / affordable).sqrt().ceil() as usize).max(stride);
+        }
+    }
     let mut z = 0;
     while z + stride < map.height {
         let mut x = 0;

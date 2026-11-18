@@ -51,6 +51,15 @@ grep -q 'indirect += weight \* a \* incoming;' "$PACKER" \
 grep -q 'indirect += weight \* material_of(h.primitive).rgb \* incoming;' "$SHADER" \
   || fail "the DXIL shader must weight a bounce by the hit surface's albedo"
 
+# 5. The water switch has to reach every tracer. It was a checkbox that was
+#    serialised, drawn, and read by nothing - toggling it changed no pixel.
+grep -q 'TERM_WATER_FILL' "$SHADER" \
+  || fail "the DXIL shader must honour the water reflection switch"
+grep -q 'water_reflection_fill = options.water_reflection_fill;' "$PACKER" \
+  || fail "the CPU tracer must honour the water reflection switch"
+grep -q 'water_reflection_fill: settings.water_reflection_fill' "$PACKER" \
+  || fail "TraceOptions must carry the water switch from the settings"
+
 if ! grep -q 'float3 through = float3(mat.a, mat.a, mat.a);' "$SHADER"; then
   fail "the DXIL shader must start its mirror chain at the surface's own specular, not 1.0"
 fi
