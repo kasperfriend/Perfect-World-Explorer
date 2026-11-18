@@ -105,6 +105,46 @@ pub(crate) fn resolve_case_insensitive(
     Ok(result)
 }
 impl WaterArea {
+    /// Whether this area has a water surface at `(x, z)`.
+    ///
+    /// The authored mask is *not* the surface footprint. The client's
+    /// `A3DWaterArea::IsInWater` (`0x781c50`) threshold-tests a bilinearly
+    /// interpolated height, so a zero mask byte marks a shallow (or dry) cell
+    /// inside the area's bounding box, not a hole in the plane: the area still
+    /// draws across its whole `columns x rows` grid. Deriving the drawn surface
+    /// from `contains_xz` is what left ~21% of a 16x21 open-water area missing
+    /// (`export=2538 … wet=265 of 336`) in both the 1.3.6 and 1.5.2 runs.
+    ///
+    /// `contains_xz` keeps its job — "is this point inside the area's grid" —
+    /// and this adds the mask test on top for callers that need wet-vs-dry.
+    pub fn has_surface_xz(&self, x: f32, z: f32) -> bool {
+        if !self.is_over_xz(x, z) {
+            return false;
+        }
+        let col = ((x - (self.center[0] - self.columns as f32 * self.grid_size * 0.5))
+            / self.grid_size)
+            .floor() as isize;
+        let row = (((self.center[2] + self.rows as f32 * self.grid_size * 0.5) - z)
+            / self.grid_size)
+            .floor() as isize;
+        if col < 0 || row < 0 || col >= self.columns as isize || row >= self.rows as isize {
+            return false;
+        }
+        self.mask
+            .get(row as usize * self.columns + col as usize)
+            .is_none_or(|m| *m != 0)
+    }
+
+    /// Whether `(x, z)` falls inside this area's grid, mask ignored.
+    pub fn is_over_xz(&self, x: f32, z: f32) -> bool {
+        let half_x = self.columns as f32 * self.grid_size * 0.5;
+        let half_z = self.rows as f32 * self.grid_size * 0.5;
+        x.is_finite()
+            && z.is_finite()
+            && (x - self.center[0]).abs() < half_x
+            && (z - self.center[2]).abs() < half_z
+    }
+
     pub fn contains_xz(&self, x: f32, z: f32) -> bool {
         // 0x7807c6–0x780813 rejects the bounding box boundary before
         // 0x781c50 maps to and clamps the mask cell.

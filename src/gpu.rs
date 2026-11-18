@@ -1487,10 +1487,13 @@ fn build(
     // A3DTerrainWater.cpp:67-84, which this loader does not read yet.
     for a in &areas {
         let cells = a.mask.iter().filter(|&&m| m != 0).count();
+        // `wet` is the authored mask's non-zero count, which is a depth/shore
+        // signal; the drawn surface covers every cell, because the client draws
+        // the area's whole grid (`wet=265 of 336` is not 21% missing water).
         crate::diag!(
             RenderWater,
             "export={} colour=0x{:08x} simple={} height={:.3} grid={:.3} cells={}x{} \
-             wet={} of {} centre=({:.2},{:.2},{:.2}) shore_waves={}",
+             wet={} of {} (all drawn) centre=({:.2},{:.2},{:.2}) shore_waves={}",
             a.export_id,
             a.color,
             a.simple,
@@ -1531,9 +1534,13 @@ fn build(
         );
         for row in row0..row1 {
             for col in col0..col1 {
-                if a.mask[row * a.columns + col] & 1 == 0 {
-                    continue;
-                }
+                // Every cell of the area's grid is water. The authored mask is a
+                // depth/shore value, not a footprint: the client's
+                // `A3DWaterArea::IsInWater` (`0x781c50`) threshold-tests an
+                // interpolated height, so a zero byte is a shallow cell *inside*
+                // the surface, not a hole in it. Skipping zero cells here is what
+                // left ~21% of the 512 m x 672 m open-water area missing in both
+                // the 1.3.6 and 1.5.2 runs (`wet=265 of 336`).
                 let x = a.center[0] - hx + col as f32 * a.grid_size;
                 let z = a.center[2] + hz - row as f32 * a.grid_size;
                 let s = a.grid_size;

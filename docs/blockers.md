@@ -1694,11 +1694,28 @@ fifth of it missing.
 
 `contains_xz` reproduces the client's inside test, which is right for "is the
 camera under this surface". It is the wrong function to build the drawn surface
-from. The fix is to keep the mask as authored (it is depth/shoreline data) and
-draw the area's full `columns x rows` extent, thresholding per cell only where the
-client does.
+from.
 
-- **Status:** open. The mask values are read correctly (the byte distribution is
-  the same in both clients and the area's own `shore_waves=10` parses), so this is
-  a rendering decision, not a decoding bug. No sandbox path can render a frame to
-  confirm it, so it is documented rather than changed blind.
+`gpu.rs` built the water mesh by skipping every cell whose mask byte was zero:
+
+```rust
+if a.mask[row * a.columns + col] & 1 == 0 {
+    continue;
+}
+```
+
+That is the bug. The mask is depth/shore data; a zero cell is a shallow cell
+inside the surface, not a hole in it, so the surface has to cover the area's whole
+`columns x rows` grid. The cell is now emitted regardless of its mask byte, which
+restores the 71 missing cells of the open-water area in both clients. The log line
+keeps reporting the authored `wet` count and now says `(all drawn)`, so the number
+reads as the mask statistic it is instead of as a coverage fraction.
+
+`WaterArea::has_surface_xz` is added next to `contains_xz` for callers that do want
+wet-vs-dry: it keeps the inside test and adds the mask, so the two questions stay
+separate instead of one function answering both wrongly.
+
+- **Status:** fixed. The mask values were always read correctly (the byte
+  distribution matches between both clients and the area's own `shore_waves=10`
+  parses); the surface was being culled from them. Confirming the rendered result
+  still needs a frame, which no sandbox path here can draw.
