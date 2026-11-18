@@ -1758,3 +1758,50 @@ README: `tools/offline_harness.sh water` runs the 15 tests (including
 patch bytes.
 
 - **Status:** fixed and tested. The skipped-by-mask half of the same report is B-10.
+
+## B-12: the 1.8.4 client, and why no version would load
+
+Reported as "no version loads at all", with a modal reading
+
+    unexpected error while loading/rendering the selected map:
+    No fonts available until first call to `Context::run()`
+
+for 1.3.1, 1.3.6, 1.4.2 and 1.4.4, and
+
+    only ECWLD version 12 is supported
+
+for 1.8.4.
+
+**The font engine was a regression in this branch, not in the clients.**
+`extend_fonts` seeded itself from `ctx.fonts(|f| f.lock().fonts.definitions())`
+when no copy was stored, and the new interface font made that the first call,
+right after `Context::default()`. egui panics there — `ctx.fonts()` is only valid
+after a frame has run. The panic was raised inside `gpu::run`, so
+`recoverable_map_operation` wrapped it as a map failure and every version stopped
+on the same dialog. `extend_fonts` now seeds from `FontDefinitions::default()`,
+and the font is installed on the first frame that draws UI, where the pixels-per-
+point `set_fonts` keys its atlas by is also known.
+
+**The version gate named one number.** `Scene::parse` refused anything but 12.
+The ECWDFILEHEADER is 14 fixed fields plus 60 reserved bytes from v12 onward
+(`EC_WorldFile.h`), so versions at or above 12 share the layout and v12 logic;
+the per-block length check still rejects a file that does not add up. Below 12 is
+refused by number, naming both. A file that is not an ECWLD says so.
+
+**1.8.4 ships a three-file package.** The client writes at most
+`MAX_FILE_PACKAGE` (0x7fffff00) per file and then continues in `.pkx`, `.pkx1`,
+`.pkx2` … `element/building.pck` is 2,147,483,392 bytes, `building.pkx` is
+exactly `MAX_FILE_PACKAGE`, and `building.pkx1` holds the remainder — four pieces
+in total. The reader opened the first two, so every entry past the second split
+was unreadable. `Package` now opens continuations until the first short piece and
+reads every range through the ordered list.
+
+The size word is a `DWORD`, so that package's total (2 GiB + 4 GiB + remainder)
+cannot be stated and the word is it truncated. `safe_header` accepts the wrap
+only when every piece is open; the pieces are the evidence.
+
+- **Status:** the font panic, the gate and the three-file package are fixed and
+  pinned by tests. What is *not* established is whether 1.8.4's `world.ecwld`
+  is version 12; the file has not been read here. If it is, the gate now admits
+  it and any remaining failure will name the block, the offset and the count
+  instead of the version.
