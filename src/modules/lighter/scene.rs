@@ -17,7 +17,6 @@ pub const CLAMP_UV: u32 = 1 << 8;
 pub const NO_REFLECT: u32 = 1 << 9;
 pub const NO_REFRACT: u32 = 1 << 10;
 pub const SIMPLE_WATER: u32 = 1 << 11;
-pub const TWO_SIDED: u32 = 1 << 12;
 pub const CULL_BACK: u32 = 1 << 13;
 pub const WRITE_DEPTH: u32 = 1 << 14;
 pub const IGNORE_TEXTURE_ALPHA: u32 = 1 << 15;
@@ -29,7 +28,6 @@ pub const STRICT_ALPHA: u32 = 1 << 16;
 pub const MASK_SOLID: u8 = 1;
 pub const MASK_BLEND: u8 = 2;
 pub const MASK_SHADOW: u8 = 4;
-pub const MASK_SHORE: u8 = 8;
 pub const INSTANCE_WORDS: u32 = 11;
 const HEADER_WORDS: usize = 14;
 pub const VERTEX_WORDS: u32 = 8;
@@ -104,9 +102,6 @@ impl Surface {
         let mut mask = if blend { MASK_BLEND } else { MASK_SOLID };
         if self.flags & WRITE_DEPTH != 0 || (!blend && self.flags & WATER == 0) {
             mask |= MASK_SHADOW;
-        }
-        if self.flags & TERRAIN != 0 {
-            mask |= MASK_SHORE;
         }
         mask
     }

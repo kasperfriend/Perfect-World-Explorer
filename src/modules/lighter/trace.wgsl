@@ -34,7 +34,6 @@ const CLAMP_UV: u32 = 256u;
 const NO_REFLECT: u32 = 512u;
 const NO_REFRACT: u32 = 1024u;
 const SIMPLE_WATER: u32 = 2048u;
-const TWO_SIDED: u32 = 4096u;
 const CULL_BACK: u32 = 8192u;
 const WRITE_DEPTH: u32 = 16384u;
 const IGNORE_TEXTURE_ALPHA: u32 = 32768u;
@@ -42,7 +41,6 @@ const STRICT_ALPHA: u32 = 65536u;
 const SOLID_MASK: u32 = 1u;
 const BLEND_MASK: u32 = 2u;
 const SHADOW_MASK: u32 = 4u;
-const SHORE_MASK: u32 = 8u;
 const LIGHTING: u32 = 1u;
 const SHADOWS: u32 = 2u;
 const REFLECTIONS: u32 = 4u;
@@ -51,10 +49,10 @@ const CULL_BUILDINGS: u32 = 16u;
 const UNDERWATER: u32 = 32u;
 const VIEW: u32 = 0u;
 const SHADOW: u32 = 1u;
-const MIRROR: u32 = 2u;
-const TRANSMIT: u32 = 3u;
+const WATER_REFLECT: u32 = 2u;
+const WATER_TRANSMIT: u32 = 3u;
 const DIFFUSE: u32 = 4u;
-const SHORE: u32 = 5u;
+const SPECULAR: u32 = 5u;
 
 // The instance index (including the dynamic bit) maps directly from Vulkan's
 // 24-bit instanceCustomIndex. Primitive IDs refer to the packed index array.
@@ -64,7 +62,7 @@ struct Ray {
     width: f32, spread: f32, coverage: f32, pixel_seed: u32,
 }
 struct Surface {
-    n: vec3<f32>,
+    n: vec3<f32>, face: vec3<f32>, // shading and incident-facing geometric normals
     uv: vec2<f32>, color: vec4<f32>, flags: u32, reflectance: f32,
 }
 // Order is nonzero only while enumerating the narrow distance band of
@@ -94,6 +92,7 @@ fn rotate(v: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
 fn norm(v: vec3<f32>) -> vec3<f32> {
     return v * inverseSqrt(max(dot(v,v), 1.e-20));
 }
+fn strongest(v: vec3<f32>) -> f32 { return max(v.x,max(v.y,v.z)); }
 fn rgba(x: u32) -> vec4<f32> {
     return unpack4x8unorm(x);
 }
@@ -254,10 +253,9 @@ fn accepts(hit: Hit, ray: Ray, q: Query) -> bool {
     let flags = word(m,mat+1u);
     let blend = (flags & BLEND)!=0u;
     if (q.mask==SOLID_MASK && blend) || (q.mask==BLEND_MASK && !blend)
-        || (q.purpose==SHORE && (flags & TERRAIN)==0u)
         || (q.purpose==SHADOW && (flags & (BLEND|WATER))!=0u && (flags & WRITE_DEPTH)==0u)
-        || (q.purpose==MIRROR && (flags & NO_REFLECT)!=0u)
-        || (q.purpose==TRANSMIT && (flags & NO_REFRACT)!=0u) { return false; }
+        || (q.purpose==WATER_REFLECT && (flags & NO_REFLECT)!=0u)
+        || (q.purpose==WATER_TRANSMIT && (flags & NO_REFRACT)!=0u) { return false; }
     let cull = q.purpose==VIEW && (frame.options.x & CULL_BUILDINGS)!=0u && (flags & CULL_BACK)!=0u;
     if !cull && (flags & (CUTOUT|BLEND|WRITE_DEPTH))==0u { return true; }
     let inst = inst_addr(hit.instance);
@@ -310,15 +308,15 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
     let c = bitcast<f32>(word(m,inst+4u));
     let s = bitcast<f32>(word(m,inst+5u));
     let raw = rgba(word(m,v.x+3u)).xyz*w.x + rgba(word(m,v.y+3u)).xyz*w.y + rgba(word(m,v.z+3u)).xyz*w.z;
+    let gn = norm(geometric(m,inst,v));
+    let face = select(gn,-gn,dot(gn,ray.dir)>0.);
     var n = norm(rotate(raw*2.-1.,c,s));
-    if (flags & (WATER|TERRAIN|TWO_SIDED))!=0u {
-        if dot(n,ray.dir)>0. { n = -n; }
-    } else if (flags & EMISSIVE)==0u {
-        let gn = geometric(m,inst,v);
-        if (dot(n,gn)<0.) != (dot(gn,ray.dir)>0.) { n = -n; }
-    }
+    if dot(n,face)<0. { n = -n; }
+    // Bad/sufficiently grazing interpolated normals must not face away from
+    // the incident ray. They never decide which side of the triangle we enter.
+    if dot(n,face)<1.e-4 || dot(n,ray.dir)>=0. { n = face; }
     if (flags & TERRAIN)!=0u {
-        return Surface(n,uv,vec4<f32>(terrain_color(p,footprint(ray,hit.t)),1.),flags,0.);
+        return Surface(n,face,uv,vec4<f32>(terrain_color(p,footprint(ray,hit.t)),1.),flags,0.);
     }
     let addr = word(m,mat);
     let tex = tile_lod(addr,uv,(flags & CLAMP_UV)!=0u,tile_lod_for(addr,ray,hit,m,inst,v));
@@ -327,7 +325,7 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
     var color = vec4<f32>(linear(tex.rgb)*linear(tint.rgb),alpha);
     if (flags & EMISSIVE)!=0u { color = vec4<f32>(linear(tex.rgb)*tint.rgb,alpha); }
     if (flags & BAKED)!=0u { color = vec4<f32>(linear(min(tex.rgb*tint.rgb*2.,vec3<f32>(1.))),alpha); }
-    return Surface(n,uv,color,flags,bitcast<f32>(word(m,mat+3u)));
+    return Surface(n,face,uv,color,flags,bitcast<f32>(word(m,mat+3u)));
 }
 fn none(ray: Ray) -> Hit { return Hit(ray.high,NIL,0u,vec2<f32>(0.)); }
 fn trace(ray: Ray, q: Query) -> Hit {
@@ -335,17 +333,24 @@ fn trace(ray: Ray, q: Query) -> Hit {
     return intersect(ray,q);
 }
 fn bias(p: vec3<f32>) -> f32 {
-    let a = abs(p);
-    return max(0.0005,max(a.x,max(a.y,a.z))*4.77e-7);
+    return max(0.0005,strongest(abs(p))*4.77e-7);
 }
-fn secondary(p: vec3<f32>, d: vec3<f32>, ray: Ray, t: f32) -> Ray {
-    let offset = bias(p);
-    return Ray(p+d*offset,d,offset,frame.eye.w,footprint(ray,t),ray.spread,ray.coverage,ray.pixel_seed);
+fn offset_origin(p: vec3<f32>, d: vec3<f32>, face: vec3<f32>) -> vec3<f32> {
+    // Offset across the actual surface, not along a grazing ray or a bump
+    // normal. Don't also advance t-min and skip nearby geometry twice.
+    return p + face*select(-bias(p),bias(p),dot(d,face)>=0.);
 }
-fn visibility(p: vec3<f32>, d: vec3<f32>, t: f32, width: f32, source: Ray) -> f32 {
-    let offset = bias(p);
-    if (frame.options.x & SHADOWS)==0u || t<=2.*offset { return 1.; }
-    let r = Ray(p+d*offset,d,offset,t-offset,width,0.,source.coverage,source.pixel_seed);
+fn secondary(p: vec3<f32>, d: vec3<f32>, face: vec3<f32>, ray: Ray, t: f32) -> Ray {
+    return Ray(offset_origin(p,d,face),d,0.,frame.eye.w,footprint(ray,t),ray.spread,ray.coverage,ray.pixel_seed);
+}
+fn visibility(p: vec3<f32>, face: vec3<f32>, light: LightRay, width: f32, source: Ray) -> f32 {
+    if (frame.options.x & SHADOWS)==0u { return 1.; }
+    let origin = offset_origin(p,light.dir,face);
+    // Keep the shadow-ray endpoint at the light after offsetting the origin.
+    let to_light = light.dir*light.distance - (origin-p);
+    let distance = length(to_light);
+    if distance<=1.e-5 { return 1.; }
+    let r = Ray(origin,to_light/distance,0.,distance,width,0.,source.coverage,source.pixel_seed);
     return select(0.,1.,trace(r,Query(SHADOW,SHADOW_MASK,false,vec2<u32>(NIL))).instance==NIL);
 }
 fn band(t: f32) -> f32 {
@@ -377,7 +382,7 @@ fn sky_triple(d: vec3<f32>, layer: vec3<u32>) -> vec3<f32> {
     let skirt = mix(a,b,(1.-smoothstep(0.,0.12,abs(d.z)))*0.5);
     return mix(skirt,roof,smoothstep(-0.015,0.015,d.y));
 }
-fn environment(dir: vec3<f32>) -> vec3<f32> {
+fn environment(dir: vec3<f32>, seen_sun: bool) -> vec3<f32> {
     var sky = vec3<f32>(0.);
     if frame.sky0.x!=0u {
         var encoded = sky_triple(dir,frame.sky0.xyz);
@@ -392,13 +397,15 @@ fn environment(dir: vec3<f32>) -> vec3<f32> {
         let dome = mix(vec3<f32>(0.004,0.009,0.026),vec3<f32>(0.11,0.31,0.64),frame.sun.w);
         sky = mix(horizon,dome,h);
     }
-    let sun = smoothstep(0.9994,0.99985,dot(dir,frame.sun_disc.xyz))*frame.sun_disc.w;
+    // Diffuse paths already sample the analytic sun in direct(). The
+    // decorative disc is visible to the eye, in mirrors and through water.
+    let sun = select(0.,smoothstep(0.9994,0.99985,dot(dir,frame.sun_disc.xyz))*frame.sun_disc.w,seen_sun);
     let moon = smoothstep(0.9985,0.9992,dot(dir,frame.moon_disc.xyz))*frame.moon_disc.w;
     return sky + frame.sun_color.rgb*sun*2. + vec3<f32>(0.45,0.5,0.6)*moon;
 }
 struct LightRay { dir: vec3<f32>, distance: f32, energy: vec3<f32> }
 struct LightCursor { feed: u32, node: u32, item: u32, end_item: u32 }
-fn next_light(p: vec3<f32>, n: vec3<f32>, cursor: ptr<function,LightCursor>) -> LightRay {
+fn next_light(p: vec3<f32>, s: Surface, cursor: ptr<function,LightCursor>) -> LightRay {
     loop {
         let m = (*cursor).feed!=0u;
         if (*cursor).item<(*cursor).end_item {
@@ -408,8 +415,8 @@ fn next_light(p: vec3<f32>, n: vec3<f32>, cursor: ptr<function,LightCursor>) -> 
             let to = floats(m,a)-p;
             let r = bitcast<f32>(word(m,a+3u));
             let d2 = dot(to,to);
-            let cosine = dot(to,n);
-            if d2>=r*r || d2<=1.e-8 || cosine<=0. { continue; }
+            let cosine = dot(to,s.n);
+            if d2>=r*r || d2<=1.e-8 || cosine<=0. || dot(to,s.face)<=0. { continue; }
             let d = sqrt(d2);
             let falloff = 1.-d/r;
             return LightRay(to/d,d,floats(m,a+4u)*(cosine/d*falloff*falloff));
@@ -430,12 +437,12 @@ fn next_light(p: vec3<f32>, n: vec3<f32>, cursor: ptr<function,LightCursor>) -> 
     }
     return LightRay(vec3<f32>(0.),0.,vec3<f32>(0.));
 }
-fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32) -> vec3<f32> {
+fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool) -> vec3<f32> {
     let albedo = s.color.rgb;
     if (s.flags & EMISSIVE)!=0u { return albedo; }
     let lit = (frame.options.x & LIGHTING)!=0u;
     let baked = (s.flags & BAKED)!=0u;
-    let cosine = max(dot(s.n,frame.sun.xyz),0.);
+    let cosine = select(0.,max(dot(s.n,frame.sun.xyz),0.),dot(s.face,frame.sun.xyz)>0.);
     let sun_above = frame.sun.w>0.02 && frame.sun.y>0.;
     var sun_pending = !lit || !baked;
     let width = footprint(ray,t);
@@ -446,7 +453,8 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32) -> vec3<f32> {
         sun = vec3<f32>(0.45);
         color = vec3<f32>(0.55);
     } else if !baked {
-        color = frame.ambient.rgb;
+        // Use the authored ambient only when no indirect ray replaces it.
+        color = select(vec3<f32>(0.),frame.ambient.rgb,terminal);
     }
     var cursor = LightCursor(0u,world[12u],0u,0u);
     loop {
@@ -456,13 +464,13 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32) -> vec3<f32> {
             light = LightRay(frame.sun.xyz,select(0.,frame.eye.w,sun_above && cosine>0.),sun);
         } else {
             if !lit { break; }
-            light = next_light(p,s.n,&cursor);
+            light = next_light(p,s,&cursor);
             if light.distance<=0. { break; }
         }
         // One shadow traversal site for sun, static points and GFX points.
         // Drivers inline ray queries, so duplicating the call at each branch
         // can make shader compilation dominate the first frame.
-        color += light.energy*visibility(p,light.dir,light.distance,width,ray);
+        color += light.energy*visibility(p,s.face,light,width,ray);
     }
     return albedo*color;
 }
@@ -491,10 +499,34 @@ fn wave(s: Surface, direction: vec3<f32>) -> vec3<f32> {
     if dot(n,direction)>-0.01 { n = vec3<f32>(0.,select(1.,-1.,direction.y>0.),0.); }
     return n;
 }
-fn fog_amount(distance: f32, wet: bool) -> f32 {
+struct Optics { transmitted: vec3<f32>, fresnel: f32 }
+fn dielectric(d: vec3<f32>, n: vec3<f32>, eta: f32) -> Optics {
+    let cos_i = clamp(dot(-d,n),0.,1.);
+    let cos_t2 = 1.-eta*eta*(1.-cos_i*cos_i);
+    if cos_t2<=0. { return Optics(vec3<f32>(0.),1.); }
+    let cos_t = sqrt(cos_t2);
+    let rs = (eta*cos_i-cos_t)/(eta*cos_i+cos_t);
+    let rp = (cos_i-eta*cos_t)/(cos_i+eta*cos_t);
+    return Optics(norm(eta*d+(eta*cos_i-cos_t)*n),clamp(0.5*(rs*rs+rp*rp),0.,1.));
+}
+fn medium_color(wet: bool) -> vec3<f32> {
+    return select(frame.air_color.rgb,frame.water_color.rgb,wet);
+}
+fn transmittance(distance: f32, wet: bool) -> vec3<f32> {
     let fog = select(frame.air,frame.water,wet);
-    if fog.z<0.5 { return 0.; }
-    return clamp((distance-fog.x)/max(fog.y-fog.x,0.01),0.,1.);
+    if fog.z<0.5 { return vec3<f32>(1.); }
+    let span = max(fog.y-fog.x,0.01);
+    if !wet {
+        // Keep authored atmospheric distance fog (including the no-fog toggle).
+        return vec3<f32>(1.-clamp((distance-fog.x)/span,0.,1.));
+    }
+    // Homogeneous Beer–Lambert extinction along the segment. Interpret the
+    // authored fog span as 5% transmission in the clearest channel; the fog
+    // hue gives a bounded wavelength bias, not an extra tint at each crossing.
+    let hue = frame.water_color.rgb;
+    let peak = strongest(hue);
+    let density = 1.+0.5*select(vec3<f32>(0.),1.-hue/max(peak,1.e-5),peak>1.e-5);
+    return exp2(-4.321928*density*(distance/span));
 }
 fn world_depth(p: vec3<f32>) -> f32 {
     let clip = frame.vp*vec4<f32>(p,1.);
@@ -509,8 +541,9 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> vec4<f32> {
     var split = false;
     for (var branch=0u; branch<2u; branch++) {
         for (var segment=0u; segment<=frame.options.y; segment++) {
-            if path.depth>frame.options.y || max(path.weight.x,max(path.weight.y,path.weight.z))<0.002 { break; }
+            if strongest(path.weight)<0.002 { break; }
             let ray = path.ray;
+            let terminal = path.depth==frame.options.y;
             var solid = none(ray);
             var scan = ray;
             var mask = SOLID_MASK;
@@ -518,23 +551,16 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> vec4<f32> {
             var group_end = -1.;
             var s: Surface;
             var color = vec3<f32>(0.);
-            var edge = 1.;
             loop {
-                // Resolve solid visibility once. Find all eligible sheets in
-                // front of it, then (for water) query the real ground below.
-                // Use one traversal site for all three jobs.
+                // Resolve solid visibility once, then process sheets in front
+                // of it. Keep one traversal site for both kinds of hit.
                 let blending = mask==BLEND_MASK;
-                let has_weight = max(path.weight.x,max(path.weight.y,path.weight.z))>=0.002;
+                let has_weight = strongest(path.weight)>=0.002;
                 let ordered = blending && has_weight && group_end>=0.;
                 var r = scan;
                 if ordered { r.high = group_end; }
                 let query_mask = select(mask,0u,blending && !has_weight);
-                let purpose = select(path.purpose,SHORE,mask==SHORE_MASK);
-                var hit = trace(r,Query(purpose,query_mask,ordered,after));
-                if mask==SHORE_MASK {
-                    edge = clamp(hit.t/0.66,0.,1.);
-                    break;
-                }
+                var hit = trace(r,Query(path.purpose,query_mask,ordered,after));
                 if mask==SOLID_MASK {
                     solid = hit;
                     mask = BLEND_MASK;
@@ -558,17 +584,9 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> vec4<f32> {
                 }
                 s = surface(hit,ray);
                 let p = ray.origin+ray.dir*hit.t;
-                if (s.flags & WATER)!=0u {
-                    if ray.dir.y<=0. && path.depth<frame.options.y {
-                        let down = vec3<f32>(0.,-1.,0.);
-                        scan = Ray(p+down*0.001,down,0.001,0.66,0.,0.,ray.coverage,ray.pixel_seed);
-                        mask = SHORE_MASK;
-                        continue;
-                    }
-                    break;
-                }
+                if (s.flags & WATER)!=0u { break; }
                 color = vec3<f32>(0.);
-                if has_weight { color = direct(p,s,ray,hit.t); }
+                if has_weight { color = direct(p,s,ray,hit.t,terminal || sheet); }
                 if !sheet { break; }
                 // Coplanar cards blend in decreasing draw-layer order. The
                 // two triangles of a card share a key, so diagonals draw once.
@@ -576,76 +594,101 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> vec4<f32> {
                 if path.depth==0u && branch==0u && (s.flags & WRITE_DEPTH)!=0u && s.color.a>=0.5 {
                     depth = max(depth,world_depth(p));
                 }
-                let f = fog_amount(hit.t,path.wet);
+                let t = transmittance(hit.t,path.wet);
                 let additive = (s.flags & ADDITIVE)!=0u;
-                let mist = select(select(frame.air_color.rgb,frame.water_color.rgb,path.wet),vec3<f32>(0.),additive);
-                result += path.weight*s.color.a*mix(color,mist,f);
+                let mist = select(medium_color(path.wet),vec3<f32>(0.),additive);
+                result += path.weight*s.color.a*(color*t + mist*(1.-t));
                 if !additive { path.weight *= 1.-s.color.a; }
             }
             if solid.instance==NIL {
-                result += path.weight*select(environment(ray.dir),frame.water_color.rgb,path.wet);
+                // No exit surface was found within the streamed world.
+                if path.wet { result += path.weight*frame.water_color.rgb; }
+                else { result += path.weight*environment(ray.dir,path.purpose!=DIFFUSE); }
                 break;
             }
             let p = ray.origin + ray.dir*solid.t;
             if path.depth==0u && branch==0u { depth = max(depth,world_depth(p)); }
-            let fog = fog_amount(solid.t,path.wet);
-            result += path.weight*fog*select(frame.air_color.rgb,frame.water_color.rgb,path.wet);
-            path.weight *= 1.-fog;
-            if max(path.weight.x,max(path.weight.y,path.weight.z))<0.002 { break; }
+            let t = transmittance(solid.t,path.wet);
+            result += path.weight*(1.-t)*medium_color(path.wet);
+            path.weight *= t;
+            if strongest(path.weight)<0.002 { break; }
             if (s.flags & WATER)!=0u {
-                let n = wave(s,ray.dir);
-                let from_water = ray.dir.y > 0.;
-                let eta = select(1./1.333,1.333,from_water);
-                var t = refract(ray.dir,n,eta);
-                let r = norm(reflect(ray.dir,n));
-                // Intersection is with the actual flat cell, not its bump
-                // map. Keep transmitted/reflected rays on the right half-space.
-                if dot(t,t)>0. && t.y*ray.dir.y <= 0. { t = refract(ray.dir,vec3<f32>(0.,select(1.,-1.,from_water),0.),eta); }
-                let can_reflect = (frame.options.x & (REFLECTIONS|WATER_MIRROR))==(REFLECTIONS|WATER_MIRROR)
-                    && (s.flags & SIMPLE_WATER)==0u;
-                let f = select(0.,edge*(0.02+0.98*pow(1.-clamp(dot(-ray.dir,n),0.,1.),5.)),can_reflect);
-                let reflected = select(r,vec3<f32>(ray.dir.x,-ray.dir.y,ray.dir.z),r.y*ray.dir.y>=0.);
-                let water_tint = mix(vec3<f32>(0.74,0.92,0.94),max(s.color.rgb,vec3<f32>(0.2)),0.22);
-                if path.depth==frame.options.y {
+                if terminal {
                     result += path.weight*mix(frame.water_color.rgb,s.color.rgb,0.4);
                     break;
                 }
+                let from_water = s.face.y<0.;
+                let eta = select(1./1.333,1.333,from_water);
+                let n = wave(s,ray.dir);
+                var optics = dielectric(ray.dir,n,eta);
+                var reflected = norm(reflect(ray.dir,n));
+                // A normal map perturbs the interface but not the water cell.
+                // Use one consistent flat interface if either ray would be
+                // sent to the wrong side of that cell.
+                if dot(reflected,s.face)<=0. || (optics.fresnel<1. && dot(optics.transmitted,s.face)>=0.) {
+                    optics = dielectric(ray.dir,s.face,eta);
+                    reflected = norm(reflect(ray.dir,s.face));
+                }
+                let can_reflect = (frame.options.x & (REFLECTIONS|WATER_MIRROR))==(REFLECTIONS|WATER_MIRROR)
+                    && (s.flags & SIMPLE_WATER)==0u;
+                let f = optics.fresnel;
                 path.depth++;
-                if dot(t,t)<0.0001 {
+                if f>=1. {
                     if !can_reflect { result += path.weight*frame.water_color.rgb; break; }
-                    path.ray = secondary(p,reflected,ray,solid.t);
-                    path.purpose = MIRROR;
+                    path.ray = secondary(p,reflected,s.face,ray,solid.t);
+                    path.purpose = WATER_REFLECT;
+                    path.wet = from_water;
                     continue;
                 }
-                if f>0.001 && !split && branch==0u {
-                    pending = Path(secondary(p,reflected,ray,solid.t),path.weight*f,path.depth,MIRROR,path.wet);
-                    split = true;
-                    path.weight *= 1.-f;
-                } else if f>0.001 && random(seed)<f {
-                    path.ray = secondary(p,reflected,ray,solid.t);
-                    path.purpose = MIRROR;
-                    continue;
+                if can_reflect && f>0. {
+                    // Trace both first-water lobes without noise. At later
+                    // interfaces choose by Fresnel probability; that probability
+                    // accounts for the lobe weight, so don't multiply it twice.
+                    if !split && branch==0u {
+                        pending = Path(secondary(p,reflected,s.face,ray,solid.t),path.weight*f,path.depth,WATER_REFLECT,from_water);
+                        split = true;
+                        path.weight *= 1.-f;
+                    } else if random(seed)<f {
+                        path.ray = secondary(p,reflected,s.face,ray,solid.t);
+                        path.purpose = WATER_REFLECT;
+                        path.wet = from_water;
+                        continue;
+                    }
                 }
-                path.weight *= mix(vec3<f32>(1.),water_tint,edge);
+                // Radiance transport across a change in index of refraction.
+                // This factor cancels for a path that exits back into air.
+                path.weight *= eta*eta;
                 path.wet = !from_water;
-                path.ray = secondary(p,t,ray,solid.t);
-                path.purpose = TRANSMIT;
+                path.ray = secondary(p,optics.transmitted,s.face,ray,solid.t);
+                path.purpose = WATER_TRANSMIT;
                 continue;
             }
-            let is_mirror = (frame.options.x & REFLECTIONS)!=0u && s.reflectance>0.01;
-            let lit = (frame.options.x & LIGHTING)!=0u;
-            result += path.weight*color;
-            if path.depth==frame.options.y || (s.flags & EMISSIVE)!=0u || (!is_mirror && !lit) { break; }
+            let glossy = !terminal && (s.flags & EMISSIVE)==0u && (frame.options.x & REFLECTIONS)!=0u;
+            let specular = select(0.,s.reflectance,glossy);
+            let diffuse = 1.-specular;
+            // Partition the material response instead of adding a full-strength
+            // local diffuse response to a mirror. Cosine-weighted sampling
+            // cancels Lambert's cos/pi against its PDF; throughput is albedo.
+            result += path.weight*diffuse*color;
+            let bounce = !terminal && (s.flags & (EMISSIVE|BAKED))==0u && (frame.options.x & LIGHTING)!=0u;
+            let albedo = select(vec3<f32>(0.),s.color.rgb*diffuse,bounce);
+            let matte = strongest(albedo);
+            let total = specular + matte;
+            if total<=0. { break; }
             path.depth++;
-            if is_mirror {
-                let r = norm(reflect(ray.dir,s.n));
-                path.ray = secondary(p,r,ray,solid.t);
-                path.weight *= s.reflectance;
-                path.purpose = MIRROR;
+            if matte==0. || (specular>0. && random(seed)*total<specular) {
+                var d = norm(reflect(ray.dir,s.n));
+                if dot(d,s.face)<=0. { d = norm(reflect(ray.dir,s.face)); }
+                path.ray = secondary(p,d,s.face,ray,solid.t);
+                path.weight *= total;
+                path.purpose = SPECULAR;
             } else {
                 let d = hemisphere(s.n,seed);
-                path.ray = secondary(p,d,ray,solid.t);
-                path.weight *= s.color.rgb*0.28;
+                // Samples below the geometric face cannot carry radiance.
+                // Reject without resampling, which would change the PDF.
+                if dot(d,s.face)<=0. { break; }
+                path.ray = secondary(p,d,s.face,ray,solid.t);
+                path.weight *= (albedo/matte)*total;
                 path.purpose = DIFFUSE;
             }
         }
@@ -659,12 +702,14 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> vec4<f32> {
 fn render(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy>=frame.extent.xy) { return; }
     let pixel_seed = id.x + id.y*frame.extent.x + 1u;
-    var seed = pixel_seed;
     let spread = 2.*max(length(frame.inv_vp[0].xyz)/f32(frame.extent.x),
                         length(frame.inv_vp[1].xyz)/f32(frame.extent.y));
     var total = vec3<f32>(0.);
     var depth = 0.;
     for (var sample=0u; sample<frame.options.z; sample++) {
+        // Camera jitter and coverage of the next sample don't depend on how
+        // many random numbers the previous sample's paths consumed.
+        var seed = hash(pixel_seed ^ sample*0x9e3779b9u);
         let jitter = select(vec2<f32>(0.5),vec2<f32>(random(&seed),random(&seed)),frame.options.z>1u);
         let screen = (vec2<f32>(id.xy)+jitter)/vec2<f32>(frame.extent.xy);
         let ndc = screen*vec2<f32>(2.,-2.)+vec2<f32>(-1.,1.);

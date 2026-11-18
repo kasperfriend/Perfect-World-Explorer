@@ -87,7 +87,12 @@ fn light_influence_tree_limits_per_hit_work() {
 }
 
 fn test_frame(eye: Vec3, dir: Vec3, e: u32) -> Frame {
-    let vp = Mat4::perspective_rh(0.7, 1., 64., 1.) * Mat4::look_to_rh(eye, dir, Vec3::Y);
+    let up = if dir.normalize().y.abs() > 0.99 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let vp = Mat4::perspective_rh(0.7, 1., 64., 1.) * Mat4::look_to_rh(eye, dir, up);
     Frame {
         vp: vp.to_cols_array_2d(),
         inv_vp: vp.inverse().to_cols_array_2d(),
@@ -112,13 +117,22 @@ fn quad(
     flags: u32,
     tint: u32,
 ) -> u32 {
-    let id = b.surface(Surface::new(tex, flags, 0.5, 0.));
+    quad_material(b, positions, n, Surface::new(tex, flags, 0.5, 0.), tint)
+}
+fn quad_material(
+    b: &mut Builder,
+    positions: [[f32; 3]; 4],
+    n: [f32; 3],
+    material: Surface,
+    tint: u32,
+) -> u32 {
+    let id = b.surface(material);
     let mut mesh = Mesh::default();
     for (i, p) in positions.into_iter().enumerate() {
         mesh.vertices
             .push(Vertex::new(p, n, [(i % 2) as f32, (i / 2) as f32]).tint(tint, tint));
     }
-    if flags & BLEND != 0 {
+    if material.flags & BLEND != 0 {
         mesh.tri_layer([0, 2, 1], id, 1);
         mesh.tri_layer([1, 2, 3], id, 1);
     } else {
@@ -623,6 +637,202 @@ fn exercise(mode: Mode, cpu_query: bool) {
         let mean =
             layers.iter().map(|p| f32::from(p.0[i])).sum::<f32>() / (255. * layers.len() as f32);
         assert!((mean - expected).abs() < 0.055, "channel {i}: {mean}");
+    }
+    exercise_transport(&mut h);
+}
+
+fn assert_radiance(label: &str, pixel: ([u8; 4], f32), linear: [f32; 3]) {
+    let expected = linear.map(|v| (v.clamp(0., 1.) * 255.).round() as u8);
+    assert!(
+        pixel.0[..3]
+            .iter()
+            .zip(expected)
+            .all(|(&a, b)| a.abs_diff(b) <= 2),
+        "{label}: expected {expected:?}, got {pixel:?}"
+    );
+    assert!(pixel.1 > 0., "{label}: lost primary depth");
+}
+
+// Analytic cases use known radiance in a linear attachment, not an image
+// comparison or the native renderer as a lighting oracle.
+fn exercise_transport(h: &mut Harness) {
+    let mut bank = Textures::default();
+    let empty = Builder::default().finish();
+    let mut f = test_frame(Vec3::ZERO, -Vec3::Z, 1);
+    let sky = bank
+        .tile([1, 1], 1, textures::Filter::Color, |_, _| 0xffc0_a080)
+        .unwrap();
+    f.sky0 = [sky, sky, sky, 0];
+    f.sky_tint = [1.; 4];
+    f.ambient = [0.35; 4];
+    h.ray.settings.samples = 1;
+    h.ray.settings.shadows = false;
+    h.ray.settings.lighting = true;
+    h.ray.settings.reflections = true;
+    let linear = |byte: u8| ((f32::from(byte) / 255. + 0.055) / 1.055).powf(2.4);
+    let install_wall = |h: &mut Harness, flags, tint| {
+        let mut b = Builder::default();
+        let wall = upright(&mut b, -3., tint, flags, 0);
+        put(&mut b, wall);
+        h.ray.install(Ok((b.finish(), bank.clone())));
+    };
+    install_wall(h, 0, [1.; 4]);
+    h.ray.settings.bounces = 0;
+    let local = h.pixel(f, &empty);
+    assert_radiance("zero-bounce ambient", local, [0.35; 3]);
+    h.ray.settings.bounces = 1;
+    let sky_lit = h.pixel(f, &empty);
+    // A Lambertian white patch under a constant dome returns the dome's
+    // radiance; adding ambient or a fixed 0.28 bounce factor is not correct.
+    assert_radiance("Lambertian sky", sky_lit, [128, 160, 192].map(linear));
+    assert_eq!(local.1, sky_lit.1);
+
+    install_wall(h, BAKED, [0.25, 0.25, 0.25, 1.]);
+    let bounced = h.pixel(f, &empty);
+    h.ray.settings.bounces = 0;
+    let baked = h.pixel(f, &empty);
+    assert_radiance("baked color", baked, [linear(128); 3]);
+    assert_eq!(bounced, baked, "baked light received a second ambient term");
+
+    let mut b = Builder::default();
+    let receiver = quad_material(
+        &mut b,
+        [
+            [-1., 1., -3.],
+            [1., 1., -3.],
+            [-1., -1., -3.],
+            [1., -1., -3.],
+        ],
+        [0., 0., 1.],
+        Surface::new(0, 0, 0., 0.5),
+        rgba([0., 1., 0., 1.]),
+    );
+    put(&mut b, receiver);
+    // This plate is behind the camera. Its placement excludes it from the
+    // client's water pass, not reflections on other materials.
+    let emitter = upright(&mut b, 2., [1., 0., 0., 1.], EMISSIVE | NO_REFLECT, 0);
+    put(&mut b, emitter);
+    h.ray.install(Ok((b.finish(), bank.clone())));
+    h.ray.settings.lighting = false;
+    h.ray.settings.bounces = 1;
+    let mirror = h.pixel(f, &empty);
+    assert_radiance("half mirror, half matte", mirror, [0.5, 0.5, 0.]);
+    h.ray.settings.reflections = false;
+    assert_radiance("mirror disabled", h.pixel(f, &empty), [0., 1., 0.]);
+
+    let mut b = Builder::default();
+    let wall = quad(
+        &mut b,
+        [
+            [-1., 1., -3.],
+            [1., 1., -3.],
+            [-1., -1., -3.],
+            [1., -1., -3.],
+        ],
+        [1., 0., 0.1],
+        0,
+        0,
+        u32::MAX,
+    );
+    put(&mut b, wall);
+    h.ray.install(Ok((b.finish(), bank.clone())));
+    h.ray.settings.lighting = true;
+    h.ray.settings.bounces = 0;
+    f.ambient = [0.; 4];
+    let lamp = |z| {
+        let mut b = Builder::default();
+        b.light(Light {
+            position_range: [2., 0., z, 10.],
+            color: [1.; 4],
+        });
+        b.finish()
+    };
+    // With shadows OFF, an interpolated normal still cannot see a light on
+    // the far side of the actual triangle.
+    assert_radiance("rear light", h.pixel(f, &lamp(-4.)), [0.; 3]);
+    assert!(h.pixel(f, &lamp(-2.)).0[0] > 120, "front light was lost");
+
+    let mut b = Builder::default();
+    for (y, flags, tint) in [
+        (0., WATER, [1.; 4]),
+        (2.5, EMISSIVE, [0.5, 0., 0., 1.]),
+        (-2.5, EMISSIVE, [0., 1., 0., 1.]),
+    ] {
+        let plane = quad(
+            &mut b,
+            [
+                [-32., y, 32.],
+                [32., y, 32.],
+                [-32., y, -32.],
+                [32., y, -32.],
+            ],
+            [0., 1., 0.],
+            0,
+            flags,
+            rgba(tint),
+        );
+        put(&mut b, plane);
+    }
+    h.ray.install(Ok((b.finish(), bank.clone())));
+    h.ray.settings.lighting = false;
+    h.ray.settings.reflections = true;
+    h.ray.settings.bounces = 1;
+    let interface = |eye_y, dir, underwater| {
+        let mut f = test_frame(Vec3::Y * eye_y, dir, 1);
+        f.options[0] = WATER_MIRROR | if underwater { UNDERWATER } else { 0 };
+        f.water[2] = 0.; // Isolate the interface from volume extinction.
+        f
+    };
+    let ior = 1.333_f32;
+    let normal_fresnel = ((ior - 1.) / (ior + 1.)).powi(2);
+    assert_radiance(
+        "normally incident air-to-water",
+        h.pixel(interface(1.5, -Vec3::Y, false), &empty),
+        [
+            normal_fresnel * 128. / 255.,
+            (1. - normal_fresnel) / ior.powi(2),
+            0.,
+        ],
+    );
+    let incident_angle = 0.68_f32.acos();
+    let outgoing_angle = (ior * incident_angle.sin()).asin();
+    let minus = incident_angle - outgoing_angle;
+    let plus = incident_angle + outgoing_angle;
+    let f = 0.5 * ((minus.sin() / plus.sin()).powi(2) + (minus.tan() / plus.tan()).powi(2));
+    assert_radiance(
+        "water-to-air just below the critical angle",
+        h.pixel(
+            interface(
+                -1.5,
+                Vec3::new(0., incident_angle.cos(), -incident_angle.sin()),
+                true,
+            ),
+            &empty,
+        ),
+        [(1. - f) * ior.powi(2) * 128. / 255., f, 0.],
+    );
+    assert_radiance(
+        "total internal reflection",
+        h.pixel(interface(-1.5, Vec3::new(0., 0.48, -1.), true), &empty),
+        [0., 1., 0.],
+    );
+
+    h.ray.settings.bounces = 0;
+    let mut water = test_frame(Vec3::ZERO, -Vec3::Z, 1);
+    water.options[0] = UNDERWATER;
+    water.water = [0., 8., 1., 0.];
+    water.water_color = [0.2; 4];
+    for d in [2_f32, 4.] {
+        let mut b = Builder::default();
+        let white = upright(&mut b, -d, [1.; 4], EMISSIVE, 0);
+        put(&mut b, white);
+        h.ray.install(Ok((b.finish(), bank.clone())));
+        let value = 0.2 + 0.8 * 0.05_f32.powf(d / 8.);
+        assert_radiance(
+            "underwater path extinction",
+            h.pixel(water, &empty),
+            [value; 3],
+        );
     }
 }
 

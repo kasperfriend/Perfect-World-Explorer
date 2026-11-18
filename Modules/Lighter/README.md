@@ -17,9 +17,10 @@ ray-traced scene and its reverse-Z depth.
    BLAS/TLAS and dispatches native ray queries on the same device as the viewer.
    On Windows select Hardware and restart to use Vulkan instead of D3D12.
 3. Adjust ray resolution, samples and bounces. At zero bounces you still get
-   camera rays and optional shadow rays. Water transmission, mirror rays and
-   indirect lighting require at least one bounce. The separate **Water
-   reflections** switch on the World tab still gates water mirrors.
+   camera rays, local lighting and optional shadow rays. Water transmission,
+   mirror rays and indirect lighting require at least one bounce. The separate
+   **Water reflections** switch on the World tab still gates water mirrors.
+   Without a bounce, the authored ambient approximates indirect light.
 4. **Off** returns to the native world renderer. An unsupported or failed
    selected backend reports an error rather than silently drawing native or
    switching to the other ray backend.
@@ -39,13 +40,40 @@ installed manifests (the repository's `Modules` directory). Settings live in
   poses are included if active. Secondary rays can hit objects outside the
   camera frustum **within the streamed scene**.
 - Native water cells and their animated normal textures. Reflections and
-  refractions are new world-space rays. Water uses Fresnel blending, total
-  internal reflection, underwater fog/transmission and shallow-edge attenuation
-  from a terrain ray. The baked scenery placement flags gate water views.
+  refractions are new world-space rays. Snell refraction and unpolarized
+  dielectric Fresnel handle both sides of the interface, including total
+  internal reflection. The baked scenery placement flags gate water views.
 - The client's sky panorama and roof textures are sampled by ray direction.
   The sun, static scene point lights, and point lights published by GFX owners
   can all cast occlusion rays. Optional indirect rays contribute diffuse
   lighting. The native world passes do not composite on top.
+
+### Light transport and its limits
+
+This is genuine ray-traced visibility in both modes. Software intersects a
+compute BVH; Hardware uses Vulkan ray queries. The two modes share the shading
+code. They are not two different lighting models.
+
+- Diffuse bounces sample a cosine-weighted hemisphere. They carry linear albedo,
+  not a fixed brightness multiplier, and replace the ambient approximation on
+  that surface. Baked vertex lighting is not treated as diffuse albedo and
+  bounced again. Reflective materials share their energy between a matte lobe
+  and an ideal mirror lobe; they don't get full diffuse light plus a mirror.
+- The geometric face determines which side can receive shadows or emit a
+  secondary ray. Interpolated and water normal-map normals steer shading but do
+  not move the geometry or let light shine through a back face.
+- Underwater paths lose light exponentially with distance traveled. The
+  authored fog range and hue approximate extinction and in-scattering; shallow
+  bottoms show through because the underwater path is short, not because a
+  shoreline mask reduces the interface reflection. The first water split is
+  evaluated on both sides; later interfaces sample one lobe to bound ray counts.
+
+This is still a bounded, low-sample renderer for legacy assets, not a reference
+path tracer. The sun and point lights have hard visibility and retain authored
+colors/ranges rather than calibrated radiant intensities. The panoramas are not
+HDR light probes, reflectance is a scalar from the old material, air fog is
+linear, and water is an open height surface rather than a closed volume. There
+is no roughness-based specular model, caustic solver, or temporal denoiser.
 
 ### Coverage and work per frame
 
@@ -74,11 +102,13 @@ while Lighter renders. Existing saved choices for those features are unchanged.
 
 The viewer tests validate both WGSL paths and inspect the emitted Vulkan
 ray-query SPIR-V. The hardware path uses Naga 26 to keep candidate and
-committed hits distinct without changing the viewer's wgpu version. The pixel tests read
-back *composited* color and depth. The controlled scene covers stacked and
-coincident cutouts, minified coverage and small camera moves, blended sheets,
-local-light and sun shadows, and water reflection/refraction gates. It checks
-that identical packets and light-only updates don't rebuild acceleration
+committed hits distinct without changing the viewer's wgpu version. Pixel tests
+read back *composited* color and depth. They cover stacked and coincident
+cutouts, small camera moves, blended sheets, sun and point shadows, and water
+visibility gates. Analytic pixel cases check Lambertian sky lighting, baked
+colors, diffuse/mirror energy, back-face light rejection, Fresnel both above
+and below water, total internal reflection, and distance-based extinction.
+The tests verify that unchanged geometry does not rebuild acceleration
 structures. The viewer fixture switches between native and RT and checks
 actual native-pass submission, terrain, water cells, trees, authored sky, a
 streamed BMD, GFX texture/playback, and static and runtime point-light shadows.

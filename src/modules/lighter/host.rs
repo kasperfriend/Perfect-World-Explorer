@@ -303,7 +303,7 @@ impl Feed {
                 )?;
                 mesh.tri(
                     [tri[0] - low, tri[1] - low, tri[2] - low],
-                    builder.surface(Surface::new(texture, CUTOUT | TWO_SIDED, alpha, 0.)),
+                    builder.surface(Surface::new(texture, CUTOUT, alpha, 0.)),
                 );
             }
             if let Some(id) = builder.mesh(&mesh)? {
@@ -544,10 +544,7 @@ fn read_tree(
                 )?),
             };
             let (cutoff, flags) = reference.map_or((0., 0), |(r, strict)| {
-                (
-                    r,
-                    CUTOUT | TWO_SIDED | if strict { STRICT_ALPHA } else { 0 },
-                )
+                (r, CUTOUT | if strict { STRICT_ALPHA } else { 0 })
             });
             materials[i] = Surface::new(addr, flags, cutoff, 0.);
         }
