@@ -7,7 +7,7 @@ use scene::*;
 fn naga_validates_both_paths_and_emits_native_ray_queries() {
     use naga_rt as naga;
     for src in [
-        [PIXELS, BSDF, MEDIA, BASE, SOFTWARE].concat(),
+        [PIXELS, BSDF, MEDIA, REFERENCE, BASE, SOFTWARE].concat(),
         [PIXELS, include_str!("present.wgsl")].concat(),
         [PIXELS, post::SHADER].concat(),
     ] {
@@ -20,7 +20,7 @@ fn naga_validates_both_paths_and_emits_native_ray_queries() {
         .validate(&module)
         .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
     }
-    let shader = vulkan::shader(&[PIXELS, BSDF, MEDIA, BASE, HARDWARE].concat())
+    let shader = vulkan::shader(&[PIXELS, BSDF, MEDIA, REFERENCE, BASE, HARDWARE].concat())
         .expect("Vulkan ray-query WGSL to SPIR-V");
     assert_eq!(shader[0], 0x0723_0203);
     let mut opcodes = Vec::new();
@@ -684,6 +684,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_finite_emitters(&mut h);
     exercise_dielectric_and_metal(&mut h);
     exercise_media_segments(&mut h);
+    exercise_reference_lighting(&mut h);
     if mode == Mode::Software {
         exercise_bsdf_energy(&h);
     }
@@ -1161,6 +1162,118 @@ fn exercise_material_channels(h: &mut Harness) {
     );
     assert!((pixel.1 - depth_at(frame, -5. * Vec3::Z)).abs() < 1e-6);
     eprintln!("Lighter: both authored bake endpoints, relighting, face stages, sidedness and normal map passed");
+}
+
+fn exercise_reference_lighting(h: &mut Harness) {
+    let old = h.ray.settings;
+    h.ray.settings.reference = true;
+    let mut bank = Textures::default();
+    let tile = |bank: &mut Textures, rgb| {
+        bank.tile([1, 1], 1, textures::Filter::Color, |_, _| rgba(rgb))
+            .unwrap()
+    };
+    let bright = tile(&mut bank, [0.6, 0.45, 0.27, 1.]);
+    let dark = tile(&mut bank, [0.08, 0.09, 0.10, 1.]);
+    let black = tile(&mut bank, [0., 0., 0., 1.]);
+    let sky = sky::pack_cdf(&mut bank, [dark, dark, bright]).unwrap();
+    let black_cdf = sky::pack_cdf(&mut bank, [black; 3]).unwrap();
+    let alb = 0.6;
+    let material = Surface::new(0, 0, 0., 0.).with_lighting([alb, alb, alb, 1.], [1.; 4], [0.; 4]);
+    let mut b = Builder::default();
+    let floor = quad_material(
+        &mut b,
+        [
+            [-90., -4., 90.],
+            [90., -4., 90.],
+            [-90., -4., -90.],
+            [90., -4., -90.],
+        ],
+        [0., 1., 0.],
+        material,
+        u32::MAX,
+    );
+    put(&mut b, floor);
+    let empty = Builder::default().finish();
+    h.ray.install(Ok((b.finish(), bank.clone())));
+    let mut f = test_frame(Vec3::ZERO, -Vec3::Y, 24);
+    f.sky0 = [dark, dark, bright, 0];
+    f.sky_cdf = [sky, 0, 0, 0];
+    f.sky_tint = [1.; 4];
+    f.ambient = [0.8; 4];
+    let mean = |pixels: Vec<([u8; 4], f32)>| {
+        let n = pixels.len() as f32;
+        let sum: Vec3 = pixels
+            .into_iter()
+            .map(|(c, d)| {
+                assert!(d > 0.);
+                Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32)
+            })
+            .sum();
+        sum / (255. * n)
+    };
+    let sky_mean = mean(h.pixels(f, &empty));
+    let decode = |v: f32| textures::decode_srgb((v * 255.).round() / 255.);
+    let sky_expected = Vec3::from_array([0.6, 0.45, 0.27].map(decode)) * alb;
+    assert!(
+        sky_mean.abs_diff_eq(sky_expected, 0.008),
+        "sky MIS: {sky_mean:?} vs {sky_expected:?}"
+    );
+
+    // Every face emits a constant, textured Le and reflects the same diffuse
+    // albedo. Uniform radiance solves the closed-cube rendering equation:
+    // Lo = Le + rho * Lo. One wall belongs to the moving packet.
+    let material =
+        Surface::new(bright, 0, 0., 0.).with_lighting([alb; 4], [1.; 4], [0.45, 0.5, 0.65, 0.]);
+    let mut resident = Builder::default();
+    let mut moving = Builder::default();
+    for (i, n) in [
+        Vec3::X,
+        Vec3::NEG_X,
+        Vec3::Y,
+        Vec3::NEG_Y,
+        Vec3::Z,
+        Vec3::NEG_Z,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let builder = if i == 0 { &mut moving } else { &mut resident };
+        let u = if n.x.abs() > 0. { Vec3::Z } else { Vec3::X };
+        let v = n.cross(u);
+        let points = [(-1., -1.), (1., -1.), (-1., 1.), (1., 1.)]
+            .map(|(x, y)| (-n * 4. + u * (4. * x) + v * (4. * y)).to_array());
+        let wall = quad_material(builder, points, n.to_array(), material, u32::MAX);
+        put(builder, wall);
+    }
+    let pack = |b: Builder| b.finish_with_emitters(&mut AccelCache::default(), Some(&bank));
+    let resident = pack(resident);
+    let moving = pack(moving);
+    assert_eq!((resident.words[17], moving.words[17]), (10, 2));
+    assert!(
+        (f32::from_bits(resident.words[18]) / f32::from_bits(moving.words[18]) - 5.).abs() < 1e-5
+    );
+    h.ray.install(Ok((resident, bank)));
+    let mut f = test_frame(Vec3::ZERO, -Vec3::X, 24);
+    f.sky0 = [black, black, black, 0];
+    f.sky_tint = [1.; 4];
+    f.sky_cdf = [black_cdf, 0, 0, 0];
+    f.ambient = [0.8; 4];
+    let box_mean = mean(h.pixels(f, &moving));
+    let texel = Vec3::from_array([0.6, 0.45, 0.27].map(decode));
+    let emission = texel * Vec3::new(0.45, 0.5, 0.65);
+    let reflected = texel * alb;
+    let sum = Vec3::from_array(
+        reflected
+            .to_array()
+            .map(|rho| (1. - rho.powi(10)) / (1. - rho)),
+    );
+    let box_expected = emission * sum;
+    assert!(
+        box_mean.abs_diff_eq(box_expected, 0.015),
+        "diffuse box MIS: {box_mean:?} vs {box_expected:?}"
+    );
+    eprintln!("Lighter: sky MIS {sky_mean:?} vs {sky_expected:?}, diffuse-box MIS {box_mean:?} vs {box_expected:?}");
+    h.ray.settings = old;
 }
 
 fn exercise_media_segments(h: &mut Harness) {
@@ -2599,6 +2712,7 @@ fn exercise_streamed_bmds(h: &mut Harness) {
         anisotropy: 8,
         relight_baked: false,
         physical_bsdf: false,
+        reference: false,
     };
     let sample = |h: &mut Harness| {
         h.ray.settings.bounces = 0;

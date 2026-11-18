@@ -20,6 +20,7 @@ use textures::{suffix_segments, TexelPrefix, Textures};
 
 const PIXELS: &str = include_str!("pixels.wgsl");
 const BSDF: &str = include_str!("bsdf.wgsl");
+const REFERENCE: &str = include_str!("reference.wgsl");
 const MEDIA: &str = include_str!("media.wgsl");
 const BASE: &str = include_str!("trace.wgsl");
 const SOFTWARE: &str = include_str!("software.wgsl");
@@ -76,6 +77,7 @@ pub struct Frame {
     pub shore_offsets: [f32; 4],
     pub resident_bounds: [f32; 4], // x min/max, z min/max
     pub water_effects: [u32; 4],   // simple tile, initial body, wet-cell table, body count
+    pub sky_cdf: [u32; 4],         // current and next sky CDF offsets
 }
 
 // Matches Pixel in pixels.wgsl. Includes padding-free guide storage.
@@ -101,6 +103,7 @@ pub const BAKED_LIGHTMAPS: u32 = 512;
 pub const GRASS_AREA_LIGHTMAPS: u32 = 1024;
 const RELIGHT_BAKED: u32 = 2048;
 pub const CLOUD_DETAIL: u32 = 4096;
+const REFERENCE_MODE: u32 = 16384;
 const PHYSICAL_BSDF: u32 = 8192;
 
 pub(crate) fn storage_limit(device: &wgpu::Device) -> usize {
@@ -307,7 +310,11 @@ impl Software {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Lighter software BVH"),
-            source: wgpu::ShaderSource::Wgsl([PIXELS, BSDF, MEDIA, BASE, SOFTWARE].concat().into()),
+            source: wgpu::ShaderSource::Wgsl(
+                [PIXELS, BSDF, MEDIA, REFERENCE, BASE, SOFTWARE]
+                    .concat()
+                    .into(),
+            ),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Lighter compute ray tracer"),
@@ -781,7 +788,7 @@ impl Lighter {
         if pixel_limit == 0 {
             return Err("Lighter cannot allocate ray image".into());
         }
-        let scaled = |n: u32| (n * self.settings.resolution / 100).max(1);
+        let scaled = |n: u32| (n * self.settings.effective().resolution / 100).max(1);
         let mut rw = scaled(w);
         let mut rh = scaled(h);
         while u64::from(rw) * u64::from(rh) > pixel_limit {
@@ -818,7 +825,7 @@ impl Lighter {
             if self.hardware.is_none() {
                 self.hardware = Some(vulkan::Renderer::new(
                     device,
-                    &[PIXELS, BSDF, MEDIA, BASE, HARDWARE].concat(),
+                    &[PIXELS, BSDF, MEDIA, REFERENCE, BASE, HARDWARE].concat(),
                 )?);
             }
             let rt = self.hardware.as_mut().unwrap();
@@ -878,36 +885,42 @@ impl Lighter {
         }
         let (rw, rh) = self.ray_extent(device, w, h)?;
         frame.extent = [rw, rh, w, h];
-        frame.options[0] |= u32::from(self.settings.lighting)
-            | u32::from(self.settings.shadows) << 1
-            | u32::from(self.settings.reflections) << 2
-            | if self.settings.physical_bsdf {
+        let settings = self.settings.effective();
+        frame.options[0] |= u32::from(settings.lighting)
+            | u32::from(settings.shadows) << 1
+            | u32::from(settings.reflections) << 2
+            | if settings.physical_bsdf {
                 PHYSICAL_BSDF
             } else {
                 0
             }
-            | if self.settings.soft_sun { SOFT_SUN } else { 0 }
-            | if self.settings.relight_baked {
+            | if settings.reference {
+                REFERENCE_MODE
+            } else {
+                0
+            }
+            | if settings.soft_sun { SOFT_SUN } else { 0 }
+            | if settings.relight_baked {
                 RELIGHT_BAKED
             } else {
                 0
             }
-            | match self.settings.anisotropy {
+            | match settings.anisotropy {
                 16 => ANISO_WIDE,
                 1 => ANISO_ISOTROPIC,
                 _ => 0,
             };
-        frame.options[1] = self.settings.bounces;
-        frame.options[2] = self.settings.samples;
+        frame.options[1] = settings.bounces;
+        frame.options[2] = settings.samples;
         let bytes = u64::from(rw) * u64::from(rh) * PIXEL_BYTES;
         if self.present.is_none() {
             self.present = Some(checked_pipeline(device, || Present::new(device, format))?);
         }
-        if (self.settings.denoiser || self.settings.progressive) && self.post.is_none() {
+        if (settings.denoiser || settings.progressive) && self.post.is_none() {
             self.post = Some(checked_pipeline(device, || post::Post::new(device))?);
         }
-        let history = if self.settings.progressive {
-            let moving_unchanged = match self.settings.mode {
+        let history = if settings.progressive {
+            let moving_unchanged = match settings.mode {
                 Mode::Software => self
                     .software
                     .as_ref()
@@ -923,7 +936,7 @@ impl Lighter {
                 &mut frame,
                 world.revision,
                 world.textures.byte_len(),
-                self.settings.mode,
+                settings.mode,
                 moving_unchanged,
             ))
         } else {
@@ -931,7 +944,7 @@ impl Lighter {
             frame.sampling = [0; 4];
             None
         };
-        let image = match self.settings.mode {
+        let image = match settings.mode {
             Mode::Software => {
                 if self.software.is_none() {
                     self.software = Some(checked_pipeline(device, || Software::new(device))?);
@@ -968,7 +981,7 @@ impl Lighter {
                 image,
                 frame.extent,
                 history,
-                self.settings.denoiser,
+                settings.denoiser,
             )
         } else {
             image
@@ -1016,6 +1029,8 @@ impl Lighter {
             "Sample across the sun's angular disc. Local area emitters are sampled separately.",
         );
         ui.checkbox(&mut self.settings.reflections, "Ray-traced reflections");
+        ui.checkbox(&mut self.settings.reference, "Reference (32 spp, 8 bounces)")
+            .on_hover_text("Full resolution with sky and mesh light sampling, no history or denoising. Overrides lighting, relight and quality settings while enabled.");
         ui.checkbox(&mut self.settings.denoiser, "Edge-aware denoiser")
             .on_hover_text("Filter linear radiance using primary depth, normals and albedo. Never changes output depth.");
         ui.checkbox(&mut self.settings.physical_bsdf, "GGX / Lambert materials")

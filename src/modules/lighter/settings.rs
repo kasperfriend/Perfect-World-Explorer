@@ -47,6 +47,7 @@ pub struct Settings {
     pub anisotropy: u32,
     pub relight_baked: bool,
     pub physical_bsdf: bool,
+    pub reference: bool,
 }
 
 impl Default for Settings {
@@ -65,11 +66,33 @@ impl Default for Settings {
             anisotropy: 8,
             relight_baked: false,
             physical_bsdf: false,
+            reference: false,
         }
     }
 }
 
 impl Settings {
+    /// Reference transports only the current samples; interactive controls
+    /// remain persisted so disabling this preset restores them unchanged.
+    pub fn effective(self) -> Self {
+        if !self.reference {
+            return self;
+        }
+        Self {
+            lighting: true,
+            shadows: true,
+            reflections: true,
+            physical_bsdf: true,
+            relight_baked: true,
+            progressive: false,
+            denoiser: false,
+            bounces: 8,
+            samples: 32,
+            resolution: 100,
+            ..self
+        }
+    }
+
     fn decode(text: &str) -> Self {
         let mut settings = Self::default();
         for line in text.lines() {
@@ -98,6 +121,7 @@ impl Settings {
                 "bounces" => settings.bounces = number(settings.bounces, 0, 4),
                 "samples" => settings.samples = number(settings.samples, 1, 4),
                 "resolution" => settings.resolution = number(settings.resolution, 25, 100),
+                "reference" => settings.reference = toggle(settings.reference),
                 "physical_bsdf" => settings.physical_bsdf = toggle(settings.physical_bsdf),
                 "relight_baked" => settings.relight_baked = toggle(settings.relight_baked),
                 "anisotropy" => {
@@ -113,9 +137,9 @@ impl Settings {
 
     fn encode(self) -> String {
         format!(
-            "# Lighter settings\nmode={}\nlighting={}\nshadows={}\nsoft_sun={}\nreflections={}\ndenoiser={}\nprogressive={}\nbounces={}\nsamples={}\nresolution={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\n",
+            "# Lighter settings\nmode={}\nlighting={}\nshadows={}\nsoft_sun={}\nreflections={}\ndenoiser={}\nprogressive={}\nbounces={}\nsamples={}\nresolution={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\nreference={}\n",
             self.mode.token(), self.lighting, self.shadows, self.soft_sun, self.reflections, self.denoiser, self.progressive, self.bounces,
-            self.samples, self.resolution, self.anisotropy, self.relight_baked, self.physical_bsdf,
+            self.samples, self.resolution, self.anisotropy, self.relight_baked, self.physical_bsdf, self.reference,
         )
     }
 
@@ -173,5 +197,11 @@ mod tests {
         assert!(s.physical_bsdf);
         assert_eq!(Settings::decode(&s.encode()), s);
         assert_eq!(Settings::decode("mode=unknown"), Settings::default());
+        let reference = Settings::decode("reference=true");
+        assert_eq!(Settings::decode(&reference.encode()), reference);
+        let e = reference.effective();
+        assert_eq!([e.samples, e.bounces, e.resolution], [32, 8, 100]);
+        assert!(e.physical_bsdf && e.shadows && e.relight_baked);
+        assert!(!e.progressive && !e.denoiser && reference.progressive);
     }
 }

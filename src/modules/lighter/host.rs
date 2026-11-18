@@ -353,7 +353,7 @@ impl Feed {
                 .append(&mut builder, &mut bank, storage)?;
         inventory[Class::Buildings] = coverage.counts;
         Ok((
-            builder.finish_cached(&mut self.accel),
+            builder.finish_with_emitters(&mut self.accel, Some(&bank)),
             bank,
             inventory,
             coverage,
@@ -513,6 +513,7 @@ impl Feed {
             waves,
             sky0: self.sky.layers(f.sky_sets.0, f.sky_sets.2.to_bits()),
             sky1: self.sky.layers(f.sky_sets.1, 0),
+            sky_cdf: self.sky.distributions(f.sky_sets.0, f.sky_sets.1),
             sky_tint: Vec3::from_array(f.sky_tint).extend(0.).to_array(),
             sky_uv: [
                 f.sky_drift[0],

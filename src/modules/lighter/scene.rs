@@ -2,7 +2,7 @@
 //! The same indexed positions build the Vulkan BLAS and feed the software
 //! intersector. Both backends shade the same triangle IDs and barycentrics.
 pub(crate) use super::bvh::Bounds;
-use super::bvh::Bvh;
+use super::{bvh::Bvh, textures::Textures};
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec2, Vec3};
 use sha2::{Digest, Sha256};
@@ -52,7 +52,8 @@ pub const MASK_BLEND: u8 = 2;
 pub const MASK_SHADOW: u8 = 4;
 pub const MASK_GFX: u8 = 8;
 pub const INSTANCE_WORDS: u32 = 14;
-const HEADER_WORDS: usize = 16;
+const HEADER_WORDS: usize = 19;
+const MAX_EMITTERS: usize = 8192;
 pub const VERTEX_WORDS: u32 = 8;
 const MAX_ITEMS: usize = 8_000_000;
 pub const DYNAMIC_BIT: u32 = 1 << 23;
@@ -273,6 +274,29 @@ impl Surface {
         self
     }
 
+    fn emitter(self) -> bool {
+        self.flags
+            & (TERRAIN
+                | BAKED
+                | BLEND
+                | CUTOUT
+                | WRITE_DEPTH
+                | WATER
+                | GLASS
+                | PRIMARY_ONLY
+                | FOLIAGE
+                | TREE_MATERIAL
+                | GRASS_MATERIAL
+                | SHORE
+                | CLOUD
+                | OVERLAY
+                | PRECIPITATION)
+            == 0
+            && self.face_stage[0] == 0
+            && self.face_gloss == 0
+            && (self.flags & EMISSIVE != 0 || self.emission != [0; 3])
+    }
+
     fn ray_mask(self) -> u8 {
         let blend = self.flags & BLEND != 0;
         let mut mask = if !blend {
@@ -462,6 +486,7 @@ pub struct MeshRange {
     pub triangle: Range<u32>,
     pub mask: u8,
     pub opaque: bool,
+    emitters: Vec<u32>,
     pub key: MeshKey,
     pub shape: Fingerprint,
     bvh: (u32, u32),
@@ -723,6 +748,7 @@ impl Builder {
             + instances * INSTANCE_WORDS as usize
             + self.lights.len() * LIGHT_WORDS
             + self.projectors.len() * 22
+            + MAX_EMITTERS * 3
             + bvh_words)
             * 4;
         MeshBudget {
@@ -847,6 +873,7 @@ impl Builder {
         let mut mask = 0;
         let first_mask = self.materials[material_id(mesh.surfaces[0]).unwrap() as usize].ray_mask();
         let mut opaque = true;
+        let mut emitters = Vec::new();
         let mut topology = Sha256::new();
         topology.update((mesh.vertices.len() as u32).to_le_bytes());
         topology.update(bytemuck::cast_slice::<_, u8>(&mesh.triangles));
@@ -858,7 +885,7 @@ impl Builder {
         }
         let shape: Fingerprint = shape.finalize().into();
         let key = key(topology, shape);
-        for (&tri, &mat) in mesh.triangles.iter().zip(&mesh.surfaces) {
+        for (i, (&tri, &mat)) in mesh.triangles.iter().zip(&mesh.surfaces).enumerate() {
             for i in tri {
                 let p = Vec3::from_array(
                     mesh.vertices
@@ -872,6 +899,9 @@ impl Builder {
                 bounds = bounds.union(Bounds::point(p));
             }
             let material = self.materials[material_id(mat).unwrap() as usize];
+            if material.emitter() {
+                emitters.push(tri_start + i as u32);
+            }
             let bits = material.ray_mask();
             mask |= bits;
             opaque &= bits == first_mask
@@ -914,6 +944,7 @@ impl Builder {
             triangle: tri_start..self.triangles.len() as u32,
             mask,
             opaque,
+            emitters,
             key,
             shape,
             bvh: (0, 0),
@@ -1077,11 +1108,71 @@ impl Builder {
         Ok(())
     }
 
+    fn emitter_table(&self, textures: Option<&Textures>) -> (Vec<[u32; 3]>, f32) {
+        let mut result = Vec::new();
+        let mut total = 0.0f64;
+        let mut luminance = HashMap::new();
+        'placements: for (i, instance) in self.instances.iter().enumerate() {
+            let mesh = &self.meshes[instance.mesh as usize];
+            for &p in &mesh.emitters {
+                if result.len() == MAX_EMITTERS {
+                    break 'placements;
+                }
+                let transform = instance.transform;
+                let affine = instance
+                    .attachment
+                    .map(|a| self.attachments[a as usize].forward);
+                let [a, b, c] = self.triangles[p as usize]
+                    .map(|v| Vec3::from_array(self.vertices[(mesh.vertex.start + v) as usize].pos));
+                let area = if let Some(mat) = affine {
+                    (mat * (b - a)).cross(mat * (c - a)).length()
+                } else {
+                    (b - a).cross(c - a).length() * transform.scale.powi(2)
+                } * 0.5;
+                let id = self.material_layers[p as usize][0];
+                let emission = *luminance.entry(id).or_insert_with(|| {
+                    let surface = &self.materials[id as usize];
+                    let e = if surface.flags & EMISSIVE != 0 {
+                        Vec3::ONE
+                    } else {
+                        Vec3::from_array(surface.emission.map(f32::from_bits))
+                    };
+                    let tex = textures.map_or(Vec3::ONE, |t| t.emission_mean(surface.texture));
+                    // UVs and vertex tints generally differ within one tile.
+                    // Keep a nonzero floor; the exact value is sampled at hit.
+                    let sides = if surface.flags & SINGLE_SIDED != 0 {
+                        1.
+                    } else {
+                        2.
+                    };
+                    sides * e.dot(Vec3::new(0.2126, 0.7152, 0.0722) * tex.max(Vec3::splat(0.01)))
+                });
+                let power = f64::from(area) * f64::from(emission);
+                if !(power > 0. && power.is_finite()) {
+                    continue;
+                }
+                total += power;
+                result.push([i as u32, p, (total as f32).to_bits()]);
+            }
+        }
+        // Ascending instance/primitive keys allow O(log n) exact hit-PDF lookup.
+        (result, total as f32)
+    }
+
     pub fn finish(self) -> Packet {
         self.finish_cached(&mut AccelCache::default())
     }
 
-    pub(crate) fn finish_cached(mut self, cache: &mut AccelCache) -> Packet {
+    pub(crate) fn finish_cached(self, cache: &mut AccelCache) -> Packet {
+        self.finish_with_emitters(cache, None)
+    }
+
+    pub(crate) fn finish_with_emitters(
+        mut self,
+        cache: &mut AccelCache,
+        textures: Option<&Textures>,
+    ) -> Packet {
+        let (emitters, power) = self.emitter_table(textures);
         let (bvh, (root, end), (light_root, light_end)) = cache.pack(&mut self);
         let mut words = vec![0; HEADER_WORDS];
         fn append<T: Pod>(words: &mut Vec<u32>, field: usize, data: &[T]) {
@@ -1150,6 +1241,9 @@ impl Builder {
         }
         append(&mut words, 14, &self.projectors);
         words[15] = self.projectors.len() as u32;
+        append(&mut words, 16, &emitters);
+        words[17] = emitters.len() as u32;
+        words[18] = power.to_bits();
         Packet {
             words,
             meshes: self.meshes,

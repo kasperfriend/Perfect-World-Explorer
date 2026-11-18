@@ -20,6 +20,7 @@ struct Frame {
     shore_offsets: vec4<f32>,
     resident_bounds: vec4<f32>,
     water_effects: vec4<u32>,
+    sky_cdf: vec4<u32>,
 }
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage,read> world: array<u32>;
@@ -77,6 +78,7 @@ const GRASS_AREA_LIGHTMAPS: u32 = 1024u;
 const RELIGHT_BAKED: u32 = 2048u;
 const CLOUD_DETAIL: u32 = 4096u;
 const PHYSICAL_BSDF: u32 = 8192u;
+const REFERENCE_MODE: u32 = 16384u;
 const VIEW: u32 = 0u;
 const SHADOW: u32 = 1u;
 const WATER_REFLECT: u32 = 2u;
@@ -101,7 +103,7 @@ struct Surface {
 // coplanar sheets. A cursor excludes exactly the layers already composited,
 // not all geometry at that depth. NIL sorts after all real keys.
 struct Query { purpose: u32, mask: u32, ordered: bool, before: vec2<u32> }
-struct Path { ray: Ray, weight: vec3<f32>, depth: u32, purpose: u32, medium: u32 }
+struct Path { ray: Ray, weight: vec3<f32>, depth: u32, purpose: u32, medium: u32, previous: vec4<f32> }
 
 fn word(dynamic: bool, i: u32) -> u32 {
     if dynamic { return moving[i]; }
@@ -627,7 +629,11 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
         let stage = firstTrailingBit(stages);
         stages &= stages-1u;
         let addr = tiles[stage];
-        let value = filtered_tile(addr,uv,edge,mesh_taps(addr,ray,hit,m,inst,v,scale));
+        var taps = one_tap();
+        if stage!=0u || !reference() || !reference_emitter(word(m,mat+1u),word(m,mat+15u),word(m,mat+19u),floats(m,mat+7u)) {
+            taps = mesh_taps(addr,ray,hit,m,inst,v,scale);
+        }
+        let value = filtered_tile(addr,uv,edge,taps);
         switch stage {
             case 0u: { tex = value; }
             case 1u: {
@@ -711,8 +717,15 @@ fn visibility(p: vec3<f32>, face: vec3<f32>, light: LightRay, width: f32, source
     var r = Ray(origin,to_light/distance,0.,distance,width,0.,source.coverage,source.pixel_seed);
     var throughput = vec3<f32>(1.);
     var tail = dot(light.tail,light.tail)>0.;
+    let sample = light.purpose!=VIEW;
+    let q = Query(select(SHADOW,light.purpose,sample),select(SHADOW_MASK,SOLID_MASK,sample),false,vec2<u32>(NIL));
     for (var layer=0u; layer<17u; layer++) {
-        let hit = trace(r,Query(SHADOW,SHADOW_MASK,false,vec2<u32>(NIL)));
+        let hit = trace(r,q);
+        if sample {
+            // Delta interfaces aren't connected by a straight NEE ray. Their
+            // continuations get full weight once their direction has changed.
+            return vec3<f32>(select(0.,1.,hit.instance==NIL || (hit.instance==light.key.x && hit.primitive==light.key.y)));
+        }
         if hit.instance==NIL {
             if tail {
                 tail = false;
@@ -805,6 +818,12 @@ fn sky_triple(d: vec3<f32>, spread: f32, layer: vec3<u32>) -> vec3<f32> {
     }
     return mix(skirt,roof,roof_weight);
 }
+fn analytic_sky(dir: vec3<f32>) -> vec3<f32> {
+    let h = clamp(dir.y*1.5,0.,1.);
+    let horizon = mix(vec3<f32>(0.022,0.030,0.064),vec3<f32>(0.60,0.72,0.85),frame.sun.w);
+    let dome = mix(vec3<f32>(0.004,0.009,0.026),vec3<f32>(0.11,0.31,0.64),frame.sun.w);
+    return mix(horizon,dome,h);
+}
 fn environment(ray: Ray, seen_sun: bool) -> vec3<f32> {
     let dir = ray.dir;
     var sky = vec3<f32>(0.);
@@ -816,10 +835,7 @@ fn environment(ray: Ray, seen_sun: bool) -> vec3<f32> {
         }
         sky = linear(encoded(radiance)*clamp(frame.sky_tint.rgb,vec3<f32>(0.),vec3<f32>(1.)));
     } else {
-        let h = clamp(dir.y*1.5,0.,1.);
-        let horizon = mix(vec3<f32>(0.022,0.030,0.064),vec3<f32>(0.60,0.72,0.85),frame.sun.w);
-        let dome = mix(vec3<f32>(0.004,0.009,0.026),vec3<f32>(0.11,0.31,0.64),frame.sun.w);
-        sky = mix(horizon,dome,h);
+        sky = analytic_sky(dir);
     }
     // Diffuse paths already sample the analytic sun in direct(). The
     // decorative disc is visible to the eye, in mirrors and through water.
@@ -827,7 +843,10 @@ fn environment(ray: Ray, seen_sun: bool) -> vec3<f32> {
     let moon = smoothstep(0.9985,0.9992,dot(dir,frame.moon_disc.xyz))*frame.moon_disc.w;
     return sky + frame.sun_color.rgb*sun*2. + vec3<f32>(0.45,0.5,0.6)*moon;
 }
-struct LightRay { dir: vec3<f32>, distance: f32, energy: vec3<f32>, tail: vec3<f32> }
+struct LightRay {
+    dir: vec3<f32>, distance: f32, energy: vec3<f32>, tail: vec3<f32>,
+    purpose: u32, key: vec2<u32>,
+}
 struct LightCursor { feed: u32, node: u32, item: u32, end_item: u32 }
 fn next_light(p: vec3<f32>, s: Surface, cursor: ptr<function,LightCursor>, seed: ptr<function,u32>) -> LightRay {
     loop {
@@ -873,7 +892,7 @@ fn next_light(p: vec3<f32>, s: Surface, cursor: ptr<function,LightCursor>, seed:
             let cosine = dot(sample,s.n);
             if cosine<=0. || dot(sample,s.face)<=0. { continue; }
             let falloff = 1.-d/r;
-            return LightRay(sample,end,rgb*(cosine*falloff*falloff),vec3<f32>(0.));
+            return LightRay(sample,end,rgb*(cosine*falloff*falloff),vec3<f32>(0.),VIEW,vec2<u32>(NIL));
         }
         if (*cursor).node>=word(m,13u) {
             if m { break; }
@@ -889,7 +908,7 @@ fn next_light(p: vec3<f32>, s: Surface, cursor: ptr<function,LightCursor>, seed:
             (*cursor).end_item = (*cursor).item + word(m,at+8u);
         }
     }
-    return LightRay(vec3<f32>(0.),0.,vec3<f32>(0.),vec3<f32>(0.));
+    return LightRay(vec3<f32>(0.),0.,vec3<f32>(0.),vec3<f32>(0.),VIEW,vec2<u32>(NIL));
 }
 fn random(seed: ptr<function,u32>) -> f32 {
     let value = hash(*seed);
@@ -925,9 +944,9 @@ fn material_bsdf(s: Surface) -> Bsdf {
     let alpha = select(sqrt(2./(2.+max(s.power,0.))),s.pbr.y*s.pbr.y,authored);
     return Bsdf(albedo*(1.-metallic),select(vec3<f32>(0.),clamp(f0,vec3<f32>(0.),vec3<f32>(1.)),(frame.options.x & REFLECTIONS)!=0u),clamp(alpha,0.002,1.));
 }
-fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u32, seed: ptr<function,u32>) -> vec3<f32> {
+fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u32, purpose: u32, emission_weight: f32, seed: ptr<function,u32>) -> vec3<f32> {
     let albedo = s.color.rgb;
-    if (s.flags & EMISSIVE)!=0u { return albedo; }
+    if (s.flags & EMISSIVE)!=0u { return albedo*emission_weight; }
     let lit = (frame.options.x & LIGHTING)!=0u;
     let baked = (s.flags & BAKED)!=0u;
     if lit && baked { return local_color(s,vec3<f32>(1.),vec3<f32>(0.)); }
@@ -966,14 +985,41 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u3
     } else if !baked {
         // Use the authored ambient only when no indirect ray replaces it.
         color = vec3<f32>(0.);
-        ambient = select(vec3<f32>(0.),frame.ambient.rgb*s.ambient,terminal);
+        ambient = select(vec3<f32>(0.),frame.ambient.rgb*s.ambient,terminal && !reference());
     }
     var cursor = LightCursor(0u,world[12u],0u,0u);
+    var proposal = select(0u,2u,reference() && physical);
     loop {
         var light: LightRay;
         if sun_pending {
             sun_pending = false;
-            light = LightRay(sun,sun_leg,energy*sun_loss,sun_tail);
+            light = LightRay(sun,sun_leg,energy*sun_loss,sun_tail,VIEW,vec2<u32>(NIL));
+        } else if proposal!=0u {
+            let sky = proposal==2u;
+            proposal--;
+            var sample: EmissionSample;
+            if sky {
+                let d = sample_sky(seed);
+                sample = EmissionSample(d,frame.eye.w,sky_pdf(d),vec2<u32>(NIL),vec2<f32>(0.));
+            } else { sample = sample_emitter(p,seed); }
+            if sample.pdf<=0. || dot(s.face,sample.dir)<=0. { continue; }
+            let eval = bsdf_eval(b,s.n,-ray.dir,sample.dir);
+            let cosine = dot(s.n,sample.dir);
+            if cosine<=0. || eval.pdf<=0. { continue; }
+            var shadow = secondary(p,sample.dir,s.face,ray,t);
+            shadow.high = sample.t;
+            let next_purpose = select(DIFFUSE,purpose,purpose==WATER_REFLECT || purpose==WATER_TRANSMIT);
+            var radiance = vec3<f32>(0.);
+            if sky { radiance = reference_sky(sample.dir); }
+            else {
+                let f = word((sample.key.x & DYNAMIC)!=0u,1u+material_addr((sample.key.x & DYNAMIC)!=0u,sample.key.y));
+                if (next_purpose==WATER_REFLECT && (f & NO_REFLECT)!=0u)
+                    || (next_purpose==WATER_TRANSMIT && (f & NO_REFRACT)!=0u) { continue; }
+                radiance = sample_emission(Hit(sample.t,sample.key.x,sample.key.y,sample.bary));
+            }
+            let tr = media_to(shadow,sample.t,medium,sky).tr;
+            let mis = balance(sample.pdf,select(eval.pdf,0.,terminal));
+            light = LightRay(sample.dir,sample.t,eval.f*radiance*tr*(cosine*mis/sample.pdf),vec3<f32>(0.),next_purpose,sample.key);
         } else {
             if !lit { break; }
             light = next_light(p,s,&cursor,seed);
@@ -987,10 +1033,10 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u3
         // Drivers inline ray queries, so duplicating the call at each branch
         // can make shader compilation dominate the first frame.
         var response = vec3<f32>(1.);
-        if physical { response = BSDF_PI*bsdf_eval(b,s.n,-ray.dir,light.dir).f; }
+        if physical && light.purpose==VIEW { response = BSDF_PI*bsdf_eval(b,s.n,-ray.dir,light.dir).f; }
         color += response*light.energy*visibility(p,s.face,light,width,ray);
     }
-    if physical { return color+ambient+s.emission; }
+    if physical { return color+ambient+s.emission*emission_weight; }
     return local_color(s,color,ambient);
 }
 fn hemisphere(n: vec3<f32>, seed: ptr<function,u32>) -> vec3<f32> {
@@ -1094,12 +1140,13 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
     var layered = false;
     var start_medium = frame.water_effects.y;
     if start_medium==0u && (frame.options.x & UNDERWATER)!=0u { start_medium = OPEN_WATER; }
-    var path = Path(first,vec3<f32>(1.),0u,VIEW,start_medium);
+    var path = Path(first,vec3<f32>(1.),0u,VIEW,start_medium,vec4<f32>(0.));
     var pending = path;
     var split = false;
     for (var branch=0u; branch<2u; branch++) {
         for (var segment=0u; segment<=frame.options.y; segment++) {
-            if strongest(abs(path.weight))<0.002 { break; }
+            let minimum = select(0.002,1.e-12,reference());
+            if strongest(abs(path.weight))<minimum { break; }
             let ray = path.ray;
             let terminal = path.depth==frame.options.y;
             var solid = none(ray);
@@ -1117,7 +1164,7 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                 // Resolve solid visibility once, then process sheets in front
                 // of it. Keep one traversal site for both kinds of hit.
                 let gfx = mask==GFX_MASK;
-                let has_weight = strongest(abs(path.weight))>=0.002;
+                let has_weight = strongest(abs(path.weight))>=minimum;
                 let ordered = gfx || (mask==BLEND_MASK && has_weight && group_end>=0.);
                 var r = scan;
                 if gfx { r = ray; }
@@ -1165,7 +1212,13 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                 medium = media_to(ray,hit.t,path.medium,false);
                 if (s.flags & (WATER|GLASS))!=0u { break; }
                 color = vec3<f32>(0.);
-                if has_weight { color = direct(p,s,ray,hit.t,terminal || sheet,medium.body,seed); }
+                if has_weight {
+                    var mis = 1.;
+                    if !sheet && path.previous.w>0. && ((s.flags & EMISSIVE)!=0u || strongest(s.emission)>0.) {
+                        mis = balance(path.previous.w,emitter_pdf_at(hit,path.previous.xyz,p));
+                    }
+                    color = direct(p,s,ray,hit.t,terminal || sheet,medium.body,path.purpose,mis,seed);
+                }
                 if !sheet {
                     color = project_decals(s,p,ray,hit.t,color);
                     break;
@@ -1198,7 +1251,13 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                 if path.medium==OPEN_WATER { result += path.weight*frame.water_color.rgb; }
                 else {
                     let miss = media_to(ray,ray.high,path.medium,true);
-                    result += path.weight*(miss.inscatter+miss.tr*environment(ray,path.purpose!=DIFFUSE));
+                    var mis = 1.;
+                    var radiance = vec3<f32>(0.);
+                    if path.previous.w>0. {
+                        mis = balance(path.previous.w,sky_pdf(ray.dir));
+                        radiance = reference_sky(ray.dir);
+                    } else { radiance = environment(ray,path.purpose!=DIFFUSE); }
+                    result += path.weight*(miss.inscatter+miss.tr*mis*radiance);
                 }
                 break;
             }
@@ -1211,7 +1270,8 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
             result += path.weight*medium.inscatter;
             path.weight *= medium.tr;
             path.medium = medium.body;
-            if strongest(abs(path.weight))<0.002 { break; }
+            if strongest(abs(path.weight))<minimum { break; }
+            path.previous = vec4<f32>(0.);
             if (s.flags & (WATER|GLASS))!=0u {
                 let water = (s.flags & WATER)!=0u;
                 let body = select(s.body,OPEN_WATER,s.body==0u);
@@ -1264,7 +1324,7 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                 }
                 if can_reflect && f>0. {
                     if !split && branch==0u {
-                        pending = Path(secondary(p,reflected,s.face,ray,solid.t),path.weight*f,path.depth,reflect_purpose,reflect_medium);
+                        pending = Path(secondary(p,reflected,s.face,ray,solid.t),path.weight*f,path.depth,reflect_purpose,reflect_medium,vec4<f32>(0.));
                         split = true;
                         path.weight *= 1.-f;
                     } else if random(seed)<f {
@@ -1288,6 +1348,7 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                 if e.pdf<=0. || dot(e.dir,s.face)<=0. { break; }
                 path.ray = secondary(p,e.dir,s.face,ray,solid.t);
                 path.weight *= e.weight;
+                if reference() { path.previous = vec4<f32>(p,e.pdf); }
                 if path.purpose!=WATER_REFLECT && path.purpose!=WATER_TRANSMIT { path.purpose = DIFFUSE; }
                 path.depth++;
                 continue;

@@ -226,12 +226,16 @@ impl Tile {
     }
 }
 
-fn decode_srgb(c: f32) -> f32 {
+pub(super) fn decode_srgb(c: f32) -> f32 {
     if c <= 0.04045 {
         c / 12.92
     } else {
         ((c + 0.055) / 1.055).powf(2.4)
     }
+}
+fn decode_rgb(word: u32) -> glam::Vec3 {
+    let [r, g, b, _] = word.to_le_bytes();
+    glam::Vec3::from_array([r, g, b].map(|v| decode_srgb(v as f32 / 255.)))
 }
 fn encode_srgb(c: f32) -> f32 {
     if c <= 0.0031308 {
@@ -391,6 +395,47 @@ impl Textures {
 
     pub(super) fn remember_prefix(&self, previous: &mut TexelPrefix) {
         previous.clone_from(&self.prefix);
+    }
+
+    fn tile_words(&self, addr: u32) -> &[u32] {
+        let mut at = addr as usize;
+        for segment in &self.prefix {
+            if at < segment.len() {
+                return &segment[at..];
+            }
+            at -= segment.len();
+        }
+        &self.tail[at..]
+    }
+
+    // Proposal estimates, not the shader's filtered radiance. A different
+    // drift, texel filter or UV can only affect variance, not the PDF.
+    pub(super) fn sky_texel(&self, addr: u32, uv: [f32; 2], repeat: bool) -> glam::Vec3 {
+        let t = self.tile_words(addr);
+        let wrap = |x: f32| {
+            if repeat {
+                x.rem_euclid(1.)
+            } else {
+                x.clamp(0., 1.)
+            }
+        };
+        let x = ((wrap(uv[0]) * t[0] as f32) as usize).min(t[0] as usize - 1);
+        let y = ((wrap(uv[1]) * t[1] as f32) as usize).min(t[1] as usize - 1);
+        decode_rgb(t[t[4] as usize + y * t[0] as usize + x])
+    }
+
+    pub(super) fn emission_mean(&self, addr: u32) -> glam::Vec3 {
+        let t = self.tile_words(addr);
+        let level = t[2] - 1;
+        let count = ((t[0] >> level).max(1) * (t[1] >> level).max(1)) as usize;
+        let start = t[4 + level as usize] as usize;
+        // Some authored chains end before 1x1. Subsample their last mip.
+        let step = count.div_ceil(64);
+        let sum: glam::Vec3 = (0..count)
+            .step_by(step)
+            .map(|i| decode_rgb(t[start + i]))
+            .sum();
+        sum / count.div_ceil(step) as f32
     }
 
     pub fn write_words(&mut self, addr: usize, words: &[u32]) {

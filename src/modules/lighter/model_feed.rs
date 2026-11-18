@@ -453,7 +453,9 @@ impl<'a> Moving<'a> {
         // The aggregate GFX batch may change its primitive count as particles
         // are born and die. It cannot invalidate any resident actor BLAS.
         self.builder.posed_world_mesh("gfx", 0, &self.effects)?;
-        Ok(self.builder.finish_cached(cache))
+        Ok(self
+            .builder
+            .finish_with_emitters(cache, Some(self.textures)))
     }
 
     #[cfg(test)]
