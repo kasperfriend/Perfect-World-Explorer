@@ -884,3 +884,7 @@ impl super::Renderer {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "host_tests.rs"]
+mod tests;

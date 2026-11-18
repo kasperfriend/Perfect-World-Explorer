@@ -474,6 +474,44 @@ impl Materials {
     }
 }
 
+/// One solid green BC1 terrain layer, for headless viewer tests without a client.
+#[cfg(test)]
+pub(crate) fn single_layer_fixture(side: usize) -> Materials {
+    let mut source = vec![0; 136];
+    source[..4].copy_from_slice(b"DDS ");
+    for (offset, value) in [(4, 124u32), (12, 4), (16, 4), (76, 32), (80, 4)] {
+        source[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    source[84..88].copy_from_slice(b"DXT1");
+    source[128..130].copy_from_slice(&0x07e0u16.to_le_bytes());
+    Materials {
+        textures: vec![Texture {
+            w: 4,
+            h: 4,
+            source,
+            levels: Default::default(),
+        }],
+        // The terrain GPU's lightmap layout expects a 4x4 area group per subterrain.
+        areas: (0..16)
+            .map(|_| Area {
+                layers: vec![Layer {
+                    texture: 0,
+                    axis: 1,
+                    u: 1.,
+                    v: 1.,
+                    mask_size: 0,
+                    mask: Mask::raw(vec![]),
+                }],
+            })
+            .collect(),
+        areas_x: 4,
+        mask_grid: side / 4,
+        width: side,
+        height: side,
+        spacing: 1.,
+    }
+}
+
 /// Asset-free production-upload fixture: one base plus one distinct 256² mask
 /// per area, enough areas to cross an atlas page boundary.
 #[cfg(test)]

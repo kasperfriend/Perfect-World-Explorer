@@ -102,12 +102,6 @@ jobs:
           # both sides of a meridian, as pure arithmetic with no GPU and no assets.
           rustc --edition=2021 -O -o /tmp/phase5-sky-seam-check src/bin/phase5-sky-seam-check.rs
           /tmp/phase5-sky-seam-check
-      - name: Inspect dependency resolution on the working branch
-        if: github.ref == 'refs/heads/arena/69c8ea78-perfect-world-explorer'
-        run: |
-          cargo metadata --format-version 1 > /tmp/pwe-metadata.json
-          git diff -- Cargo.lock | while IFS= read -r line; do echo "::notice::$line"; done
-          git diff --exit-code -- Cargo.lock
       - name: Check all binary targets
         run: |
           # Keep the plain command so a non-zero exit still fails the job, but
@@ -260,6 +254,22 @@ jobs:
             tail -40 "$log" | while IFS= read -r line; do echo "::error::$line"; done
             exit 42
           fi
+      - name: Trace Lighter test scenes on software Vulkan
+        env:
+          WGPU_BACKEND: vulkan
+          XDG_RUNTIME_DIR: /tmp
+        run: |
+          export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
+          test -n "$VK_ICD_FILENAMES"
+          cargo test --locked --bin perfect-world-explorer lighter_ -- --ignored \
+            --skip lighter_hardware_pixels --skip lighter_vulkan_interop_on_cpu --test-threads=1 \
+            2>&1 | tee /tmp/lighter-pixels.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            grep -A4 -E 'panicked at|^error(\[|:)' /tmp/lighter-pixels.log | head -25 \
+              | while IFS= read -r line; do echo "::error::$line"; done
+          fi
+          exit "$status"
       - name: Run Phase 1 production shader regressions
         env:
           WGPU_BACKEND: vulkan
@@ -363,7 +373,6 @@ jobs:
           test -n "$VK_ICD_FILENAMES"
           cargo run --locked --bin terrain-view-gpu-check
           cargo test --locked --bin perfect-world-explorer cutoff_gpu_residency_repacking -- --ignored
-          cargo test --locked --bin perfect-world-explorer lighter_software_pixels -- --ignored
 
       # Formatting is cosmetic: run it after the compile, test and shader steps
       # so a whitespace diff can never hide a real failure behind it.

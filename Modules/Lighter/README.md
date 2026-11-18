@@ -67,6 +67,8 @@ out-of-view shadow caster, and reflection/refraction with visibility gates.
 ```sh
 # Headless software traversal. Point VK_ICD_FILENAMES at lavapipe for CPU Vulkan.
 cargo test --locked --bin perfect-world-explorer lighter_software_pixels -- --ignored
+# Real viewer geometry feeds and renderer dispatch on a small synthetic map.
+cargo test --locked --bin perfect-world-explorer lighter_streamed_world_pixels -- --ignored
 # Native ray queries. Requires Vulkan ray-query hardware; no emulation fallback.
 cargo test --locked --bin perfect-world-explorer lighter_hardware_pixels -- --ignored
 # Optional: only with a CPU ICD exposing KHR_ray_query. Exercises the Vulkan
