@@ -197,13 +197,17 @@ fn string(b: &[u8], p: &mut usize) -> Result<String, String> {
     if bad {
         return Err("invalid GBK scene string".into());
     }
-    Ok(s.replace('\\', "/"))
+    Ok(if s.contains('\\') {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    })
 }
 fn vec3(b: &[u8], p: usize) -> Result<[f32; 3], String> {
     Ok([f32at(b, p)?, f32at(b, p + 4)?, f32at(b, p + 8)?])
 }
 fn refs(b: &[u8], p: &mut usize, n: usize) -> Result<Vec<Reference>, String> {
-    let mut out = Vec::with_capacity(n);
+    let mut out = Vec::with_capacity(n.min(4096));
     for _ in 0..n {
         out.push(Reference {
             export_id: u32at(b, *p)?,
@@ -252,7 +256,7 @@ impl Scene {
         {
             return Err("invalid ECWLD block offsets".into());
         }
-        let mut boundaries = std::collections::HashMap::new();
+        let mut boundaries = std::collections::HashMap::with_capacity(offsets.len());
         for i in 0..count {
             boundaries.insert(
                 order[i],
@@ -298,7 +302,7 @@ impl Scene {
             ));
         }
         let mut blocks = Vec::with_capacity(count);
-        let mut coords = HashSet::new();
+        let mut coords = HashSet::with_capacity(offsets.len());
         for off in offsets {
             let end = boundaries[&off];
             let data = &b[off..end];
@@ -404,6 +408,27 @@ pub struct Ornament {
     pub up: [f32; 3],
     pub extra: u32,
     pub path: String,
+    /// Map namespace used by the retail scenery archive (`litmodels/a01/...`).
+    /// A folder name that is not a safe ID falls back to the legacy main-world
+    /// namespace rather than becoming part of an archive path.
+    pub map_id: String,
+}
+fn map_id_from_ecbsd_path(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("world")
+        .to_ascii_lowercase();
+    if !stem.is_empty()
+        && stem.len() <= 64
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        stem
+    } else {
+        "world".into()
+    }
 }
 impl Scene {
     /// Read placed lit-model references in the ECWLD's associated EC-BSD file.
@@ -413,6 +438,7 @@ impl Scene {
         if u32at(&b, 0)? != 0x42584f4d || u32at(&b, 4)? != 0x42534446 || u32at(&b, 8)? != 12 {
             return Err("unsupported EC-BSD header".into());
         }
+        let map_id = map_id_from_ecbsd_path(path);
         let mut seen = std::collections::HashMap::<u32, u32>::new();
         let mut result = Vec::new();
         for block in &self.blocks {
@@ -444,6 +470,7 @@ impl Scene {
                     up,
                     extra,
                     path,
+                    map_id: map_id.clone(),
                 });
             }
         }
@@ -453,6 +480,21 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scenery_map_namespace_comes_from_the_map_ecbsd_filename() {
+        assert_eq!(
+            map_id_from_ecbsd_path(Path::new("element/maps/a01/a01.ecbsd")),
+            "a01"
+        );
+        assert_eq!(
+            map_id_from_ecbsd_path(Path::new("element/maps/world/world.ecbsd")),
+            "world"
+        );
+        assert_eq!(
+            map_id_from_ecbsd_path(Path::new("element/maps/unsafe map/unsafe map.ecbsd")),
+            "world"
+        );
+    }
     fn effect_bytes() -> Vec<u8> {
         let mut b = vec![0; 60];
         // Corrected record layout, measured on the shipped world.ecwld: id at

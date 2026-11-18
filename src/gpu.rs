@@ -1209,8 +1209,9 @@ fn build(
         let materials = if t.terrain_material_window.is_none() {
             t.materials.take_window(mask_window)
         } else {
-            let dir = t.element.join("maps/world");
-            let trn = std::fs::read(dir.join("world.trn2")).map_err(|e| e.to_string())?;
+            let dir = t.map_dir.clone();
+            let trn = std::fs::read(crate::world_catalog::data_file(&dir, "trn2"))
+                .map_err(|e| e.to_string())?;
             crate::material::Materials::load_window(
                 &dir,
                 &trn,
@@ -4163,6 +4164,124 @@ fn imaginator_environment_at(
     let mut environment = imaginator_environment(camera);
     environment.lights = imaginator_lights(lights, eye);
     environment
+/// Normal viewer input needs a focused window and no blocking menu or
+/// non-interactive loading overlay. Kept pure so the focus policy is testable
+/// without a GPU, a window, or a running game client.
+fn normal_input_allowed(window_focused: bool, menu_open: bool, loading: bool) -> bool {
+    window_focused && !menu_open && !loading
+}
+
+/// Mouse-look additionally requires cursor capture.
+fn camera_motion_allowed(
+    window_focused: bool,
+    captured: bool,
+    menu_open: bool,
+    loading: bool,
+) -> bool {
+    normal_input_allowed(window_focused, menu_open, loading) && captured
+}
+
+/// Fall back to the ID when a catalog record has been removed mid-session.
+fn selected_map_label(catalog: &crate::world_catalog::Catalog, id: &str) -> String {
+    catalog
+        .maps
+        .iter()
+        .find(|map| map.id.eq_ignore_ascii_case(id))
+        .map(|map| map.display_name.clone())
+        .unwrap_or_else(|| "(metadata unavailable)".into())
+}
+
+/// A child signals readiness only after its visible window has presented a
+/// usable frame, not when its data structures merely exist in memory.
+fn signal_handoff_first_frame(signaled: &mut bool) {
+    if *signaled || !crate::world_handoff::is_handoff_child() {
+        return;
+    }
+    *signaled = true;
+    crate::world_handoff::publish_progress("First world frame is ready.");
+    crate::world_handoff::signal_ready();
+}
+
+/// Steps the old process must take as soon as a replacement world is ready.
+/// Winit 0.29 dispatches `AboutToWait` immediately before a blocking wait, so
+/// a bare `target.exit()` there can leave the old window visible until an
+/// unrelated message wakes the loop. `Poll` makes that wait non-blocking and
+/// hiding the window prevents a lingering frame behind the replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HandoffReadyExit {
+    hide_old_window: bool,
+    poll_before_exit: bool,
+    exit_event_loop: bool,
+}
+fn handoff_ready_exit_plan() -> HandoffReadyExit {
+    HandoffReadyExit {
+        hide_old_window: true,
+        poll_before_exit: true,
+        exit_event_loop: true,
+    }
+}
+fn close_old_window_after_handoff_ready<T: 'static>(
+    target: &winit::event_loop::EventLoopWindowTarget<T>,
+    window: &winit::window::Window,
+) {
+    let plan = handoff_ready_exit_plan();
+    if plan.hide_old_window {
+        window.set_visible(false);
+    }
+    if plan.poll_before_exit {
+        target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+    }
+    if plan.exit_event_loop {
+        target.exit();
+    }
+}
+
+/// Launch a replacement process for another map. The old process remains the
+/// foreground owner and keeps its own files/focus state; the child only
+/// publishes progress, its HWND, and readiness after a usable frame.
+fn spawn_world_handoff(
+    client_root: &std::path::Path,
+    map_id: &str,
+    focused: bool,
+) -> Result<
+    (
+        crate::world_handoff::Files,
+        std::sync::mpsc::Receiver<crate::world_handoff::Message>,
+    ),
+    String,
+> {
+    let validated = crate::world_catalog::validate_selection(map_id)?;
+    let id = validated.to_ascii_lowercase();
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find viewer executable: {e}"))?;
+    let files = crate::world_handoff::Files::new();
+    files.set_focused(focused);
+    let mut command = std::process::Command::new(exe);
+    command.arg(client_root).arg("--world").arg(&id);
+    files.configure(&mut command);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Do not flash a console window behind the GUI replacement.
+        command.creation_flags(0x08000000);
+    }
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            files.cleanup();
+            return Err(format!(
+                "could not launch the replacement world process: {error}"
+            ));
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Err(error) = files
+        .clone()
+        .watch(child, tx, crate::world_handoff::timeout())
+    {
+        files.cleanup();
+        return Err(error);
+    }
+    Ok((files, rx))
 }
 
 /// The neutral light a map gets when no environment record answers: full white
@@ -4327,6 +4446,32 @@ pub fn run(
     mut t: Terrain,
     #[cfg(windows)] loading: Option<crate::windows_setup::LoadingWindow>,
 ) -> Result<(), String> {
+    let current_map = t.map.clone();
+    let map_dir = t.map_dir.clone();
+    let client_root = t.client_root.clone();
+    let startup_notice = t.startup_notice.clone();
+    let mut catalog = crate::world_catalog::discover(&t.element);
+    // Only safe single-folder IDs can be persisted or passed to a replacement
+    // process. A raw directory name with spaces/slashes stays loadable as the
+    // current direct map, but is not offered as a selector option.
+    catalog
+        .maps
+        .retain(|map| crate::world_catalog::valid_world_id(&map.id));
+    if crate::world_catalog::valid_world_id(&current_map.id)
+        && !catalog
+            .maps
+            .iter()
+            .any(|map| map.id.eq_ignore_ascii_case(&current_map.id))
+    {
+        catalog.maps.push(current_map.clone());
+    }
+    if let Some(warning) = &catalog.warning {
+        eprintln!("World catalog: {warning}");
+    }
+    crate::world_handoff::publish_progress(&format!(
+        "Preparing {} ({}) GPU world...",
+        current_map.display_name, current_map.id
+    ));
     #[cfg(windows)]
     crate::windows_setup::loading_progress("Preparing GPU world and textures...".into());
     let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
@@ -4636,12 +4781,22 @@ pub fn run(
         } else {
             None
         };
-    let mut music = crate::music::MusicPlayer::new(&t.element);
-    let mut ambience = crate::music::AmbiencePlayer::new(&t.element);
+    let zones_path = crate::world_catalog::named_file(&map_dir, "precinct.clt");
+    let ui_zones = crate::music::Zones::open(&zones_path).ok();
+    let mut music = crate::music::MusicPlayer::new_for_map(&t.element, &zones_path);
+    let mut ambience = crate::music::AmbiencePlayer::new_for_map(&t.element, &zones_path);
     let mut world_audio = crate::world_audio::WorldAudio::new(&t.element, &t.scene);
     #[cfg(windows)]
     drop(loading);
     window.set_visible(true);
+    if crate::world_handoff::is_handoff_child() {
+        // The child publishes its HWND; only the old foreground process may
+        // activate it. This process must not call SetForegroundWindow itself.
+        if let Ok(hwnd) = window_hwnd(&window) {
+            crate::world_handoff::publish_window_handle(hwnd as usize);
+        }
+        crate::world_handoff::publish_progress("Preparing the first visible frame...");
+    }
     let water_areas = t.water.clone();
     let environments = t.environments.clone();
     let mut fog_transition =
@@ -4664,6 +4819,7 @@ pub fn run(
     let whole_ornaments = t.objects.ornaments.clone();
     renderer.modules = crate::modules::Modules::new(
         whole_element.clone(),
+        map_dir.clone(),
         map_space.clone(),
         water_areas.clone(),
         &t.scene,
@@ -4698,8 +4854,39 @@ pub fn run(
         let heights = map_space.clone();
         models.set_terrain(move |x: f32, z: f32| Some(heights.ground(x, z)));
     }
-    let destinations =
-        crate::navigation::destinations(&whole_element.join("maps/world/world_targets.txt"));
+    let destinations_path = crate::world_catalog::named_file(&map_dir, "world_targets.txt");
+    let destinations: Result<Vec<crate::navigation::Destination>, String> =
+        match crate::navigation::destinations_for_world(
+            &destinations_path,
+            &current_map.instance_ids,
+        ) {
+            Ok(mut list) => {
+                if list.is_empty() {
+                    if let Some(zones) = &ui_zones {
+                        let mut fallback_id = 90_000u32;
+                        for zone in &zones.zones {
+                            if let Some(position) = zone.center {
+                                list.push(crate::navigation::Destination {
+                                    id: fallback_id,
+                                    name: zone.name.clone(),
+                                    position,
+                                });
+                                fallback_id += 1;
+                            }
+                        }
+                    }
+                }
+                if list.is_empty() {
+                    list.push(crate::navigation::Destination {
+                        id: 0,
+                        name: format!("{} centre", current_map.display_name),
+                        position: [0., map_space.ground(0., 0.) + 30., 0.],
+                    });
+                }
+                Ok(list)
+            }
+            Err(error) => Err(error),
+        };
     let mut world_rx: Option<std::sync::mpsc::Receiver<crate::world_objects::Message>> = None;
     let mut world_cancel: Option<Arc<std::sync::atomic::AtomicBool>> = None;
     let mut world_enabled = false;
@@ -4795,11 +4982,34 @@ pub fn run(
         &map_view,
         wgpu::FilterMode::Linear,
     );
+    // The full-map render target follows the selected map's aspect. Prefer the
+    // `configs/instance.txt` region-grid hint when present (mainland 8x11,
+    // instances usually 1x1), then the loaded terrain dimensions; never reuse
+    // the mainland's 1024x1408 artwork for an instance coordinate space.
+    let terrain_aspect = (width as f32 / height.max(1) as f32).clamp(0.1, 10.);
+    let catalog_aspect =
+        (current_map.cols.max(1) as f32 / current_map.rows.max(1) as f32).clamp(0.1, 10.);
+    let map_aspect = if catalog_aspect.is_finite() {
+        catalog_aspect
+    } else {
+        terrain_aspect
+    };
+    let (full_map_width, full_map_height) = if map_aspect >= 1. {
+        (
+            1408u32,
+            ((1408f32 / map_aspect).round() as u32).clamp(256, 1408),
+        )
+    } else {
+        (
+            ((1408f32 * map_aspect).round() as u32).clamp(256, 1408),
+            1408u32,
+        )
+    };
     let full_map_texture = renderer.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("full-world overhead map"),
+        label: Some("selected-world overhead map"),
         size: wgpu::Extent3d {
-            width: 1024,
-            height: 1408,
+            width: full_map_width,
+            height: full_map_height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -4810,7 +5020,7 @@ pub fn run(
         view_formats: &[],
     });
     let full_map_view = full_map_texture.create_view(&Default::default());
-    let full_depth_tex = depth(&renderer.device, 1024, 1408);
+    let full_depth_tex = depth(&renderer.device, full_map_width, full_map_height);
     let full_map_depth = full_depth_tex.create_view(&Default::default());
     let full_map_id = egui_renderer.register_native_texture(
         &renderer.device,
@@ -4836,7 +5046,6 @@ pub fn run(
     let mut map_zoom = 1.0f32;
     let mut map_refresh = Instant::now() - std::time::Duration::from_secs(10);
     let mut teleport_query = String::new();
-    let ui_zones = crate::music::Zones::open(&whole_element.join("maps/world/precinct.clt")).ok();
     let mut last_zone: Option<usize> = None;
     let mut zone_initialized = false;
     let mut zone_check = Instant::now() - std::time::Duration::from_secs(1);
@@ -4847,6 +5056,18 @@ pub fn run(
     let mut streaming = false;
     let mut keys = HashSet::new();
     let mut captured = false;
+    // Winit sends Focused(true) when the visible window actually gains focus.
+    // Start conservatively so input cannot move the camera before that event.
+    let mut window_focused = false;
+    let mut world_loading_active = false;
+    let mut world_loading_status = String::from("Preparing the selected world...");
+    let mut world_change_notice = startup_notice;
+    let mut world_change_error: Option<String> = None;
+    let mut selected_world_ui = current_map.id.clone();
+    let map_zone = current_map.id.clone();
+    let mut handoff_files: Option<crate::world_handoff::Files> = None;
+    let mut handoff_rx: Option<std::sync::mpsc::Receiver<crate::world_handoff::Message>> = None;
+    let mut handoff_ready_signaled = false;
     let mut saved_settings = settings.clone();
     let mut last_settings_save = Instant::now();
     let mut last = Instant::now();
@@ -4855,8 +5076,12 @@ pub fn run(
     event_loop
         .run(move |event, target| match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => {
+                if world_loading_active && matches!(&event, WindowEvent::KeyboardInput { .. }) {
+                    keys.clear();
+                    return;
+                }
                 if let WindowEvent::KeyboardInput {ref event,..}=event {
-                    if event.physical_key == PhysicalKey::Code(KeyCode::Escape) && event.state == ElementState::Pressed && !event.repeat {
+                    if event.physical_key == PhysicalKey::Code(KeyCode::Escape) && event.state == ElementState::Pressed && !event.repeat && !world_loading_active {
                         menu_page=menu_page.escape();keys.clear();
                         if captured {let _=window.set_cursor_grab(CursorGrabMode::None);window.set_cursor_visible(true);captured=false;}
                         if input_debug() {eprintln!("Escape menu: {:?}",menu_page);}
@@ -4872,7 +5097,7 @@ pub fn run(
                     }
                 }
                 if let WindowEvent::KeyboardInput {ref event,..}=event {
-                    if event.physical_key==PhysicalKey::Code(KeyCode::KeyM) && event.state==ElementState::Pressed && !event.repeat && (menu_page!=MenuPage::Teleports) {
+                    if event.physical_key==PhysicalKey::Code(KeyCode::KeyM) && event.state==ElementState::Pressed && !event.repeat && !world_loading_active && (menu_page!=MenuPage::Teleports) {
                         menu_page=if menu_page==MenuPage::WorldMap {MenuPage::Closed} else {MenuPage::WorldMap};
                         keys.clear(); map_refresh=Instant::now()-std::time::Duration::from_secs(10);
                         if captured {let _=window.set_cursor_grab(CursorGrabMode::None);window.set_cursor_visible(true);captured=false;}
@@ -4882,14 +5107,18 @@ pub fn run(
                 // Track keys before the menu's early return. Walker hotkey
                 // rebinding runs while movement input is disabled, so discarding
                 // these events here leaves its capture on "Press a key" forever.
-                if let WindowEvent::KeyboardInput { ref event, .. } = event {
-                    if let PhysicalKey::Code(k) = event.physical_key {
-                        if event.state == ElementState::Pressed {
-                            keys.insert(k);
-                        } else {
-                            keys.remove(&k);
+                if window_focused && !world_loading_active {
+                    if let WindowEvent::KeyboardInput { ref event, .. } = event {
+                        if let PhysicalKey::Code(k) = event.physical_key {
+                            if event.state == ElementState::Pressed {
+                                keys.insert(k);
+                            } else {
+                                keys.remove(&k);
+                            }
                         }
                     }
+                } else {
+                    keys.clear();
                 }
                 // egui must receive focus changes even while the menu is closed;
                 // otherwise it believes the window is unfocused and ignores clicks.
@@ -4900,7 +5129,7 @@ pub fn run(
                 match event {
                 WindowEvent::CloseRequested => { if let Err(e)=settings.save(){eprintln!("Settings save: {e}");} target.exit(); },
                 WindowEvent::KeyboardInput { .. } => {}
-                WindowEvent::MouseWheel { delta, .. } if captured && !menu_page.is_open() => {
+                WindowEvent::MouseWheel { delta, .. } if normal_input_allowed(window_focused, menu_page.is_open(), world_loading_active) && captured => {
                     let steps = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y,
                         MouseScrollDelta::PixelDelta(position) => position.y as f32 / 120.0,
@@ -4911,7 +5140,7 @@ pub fn run(
                     state: ElementState::Pressed,
                     button: MouseButton::Left,
                     ..
-                } if !captured && !menu_page.is_open() => {
+                } if normal_input_allowed(window_focused, menu_page.is_open(), world_loading_active) && !captured => {
                     let result = window
                         .set_cursor_grab(CursorGrabMode::Locked)
                         .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
@@ -4925,11 +5154,19 @@ pub fn run(
                         eprintln!("Could not capture mouse: {:?}", result.err());
                     }
                 }
-                WindowEvent::Focused(false) if captured => {
-                    let _ = window.set_cursor_grab(CursorGrabMode::None);
-                    window.set_cursor_visible(true);
-                    captured = false;
+                WindowEvent::Focused(focused) => {
+                    window_focused = focused;
+                    // Clear on both gain and loss: a key released in another
+                    // application never sends us its KeyUp event.
                     keys.clear();
+                    if !focused {
+                        let _ = window.set_cursor_grab(CursorGrabMode::None);
+                        window.set_cursor_visible(true);
+                        captured = false;
+                    }
+                    if let Some(files) = &handoff_files {
+                        files.set_focused(focused);
+                    }
                 }
                 WindowEvent::Resized(s) if s.width > 0 && s.height > 0 => {
                     config.width = s.width;
@@ -5489,12 +5726,20 @@ pub fn run(
                     last = Instant::now();
                     // Add-ons get an optional camera-owner hook. `None` leaves
                     // the original free-flight controls completely untouched.
-                    let addon_camera = renderer.modules.update(dt, !menu_page.is_open(), &keys, camera.yaw, camera.pitch, camera.pos);
+                    let input_allowed = normal_input_allowed(
+                        window_focused,
+                        menu_page.is_open(),
+                        world_loading_active,
+                    );
+                    let empty_keys: HashSet<KeyCode> = HashSet::new();
+                    let active_keys: &HashSet<KeyCode> =
+                        if input_allowed { &keys } else { &empty_keys };
+                    let addon_camera = renderer.modules.update(dt, input_allowed, active_keys, camera.yaw, camera.pitch, camera.pos);
                     renderer.modules.update_walker_audio(settings.effects_enabled, settings.effects_volume);
-                    if let Some(position) = addon_camera {
-                        camera.pos = position;
-                    } else {
-                        let speed = if menu_page.is_open() { 0. } else if keys.contains(&KeyCode::ShiftLeft) {
+                    if input_allowed && addon_camera.is_some() {
+                        camera.pos = addon_camera.unwrap();
+                    } else if input_allowed {
+                        let speed = if active_keys.contains(&KeyCode::ShiftLeft) {
                             settings.camera_speed * settings.boost
                         } else {
                             settings.camera_speed
@@ -5502,35 +5747,35 @@ pub fn run(
                         let (s, c) = camera.yaw.sin_cos();
                         let f = Vec3::new(s, 0., -c);
                         let r = Vec3::new(-c, 0., -s);
-                        if keys.contains(&KeyCode::KeyW) {
+                        if active_keys.contains(&KeyCode::KeyW) {
                             camera.pos += f * speed * dt
                         }
-                        if keys.contains(&KeyCode::KeyS) {
+                        if active_keys.contains(&KeyCode::KeyS) {
                             camera.pos -= f * speed * dt
                         }
-                        if keys.contains(&KeyCode::KeyA) {
+                        if active_keys.contains(&KeyCode::KeyA) {
                             camera.pos -= r * speed * dt
                         }
-                        if keys.contains(&KeyCode::KeyD) {
+                        if active_keys.contains(&KeyCode::KeyD) {
                             camera.pos += r * speed * dt
                         }
-                        if keys.contains(&KeyCode::KeyE) || keys.contains(&KeyCode::Space) {
+                        if active_keys.contains(&KeyCode::KeyE) || active_keys.contains(&KeyCode::Space) {
                             camera.pos.y += speed * dt
                         }
-                        if keys.contains(&KeyCode::KeyQ) || keys.contains(&KeyCode::ControlLeft) {
+                        if active_keys.contains(&KeyCode::KeyQ) || active_keys.contains(&KeyCode::ControlLeft) {
                             camera.pos.y -= speed * dt
                         }
                     }
-                    if keys.contains(&KeyCode::ArrowLeft) {
+                    if active_keys.contains(&KeyCode::ArrowLeft) {
                         camera.yaw += dt
                     }
-                    if keys.contains(&KeyCode::ArrowRight) {
+                    if active_keys.contains(&KeyCode::ArrowRight) {
                         camera.yaw -= dt
                     }
-                    if keys.contains(&KeyCode::ArrowUp) {
+                    if active_keys.contains(&KeyCode::ArrowUp) {
                         camera.pitch = (camera.pitch + dt).min(1.5)
                     }
-                    if keys.contains(&KeyCode::ArrowDown) {
+                    if active_keys.contains(&KeyCode::ArrowDown) {
                         camera.pitch = (camera.pitch - dt).max(-1.5)
                     }
                     if streaming {
@@ -5684,8 +5929,17 @@ pub fn run(
                                         stats.residency.budget_bytes >> 20,
                                         stats.residency.evictions)
                                 };
+                                let unavailable = stats.unavailable_models.len();
+                                let unavailable_detail = if unavailable == 0 {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "; {unavailable} unavailable scenery models: {}",
+                                        stats.unavailable_examples.join("; ")
+                                    )
+                                };
                                 world_status = format!(
-                                    "Loaded {processed} objects in {:.1}s{}; {skipped} meshes use fallback texture; {} geometry chunks ({} pages); {load_detail}",
+                                    "Loaded {processed} objects in {:.1}s{}; {skipped} meshes use fallback texture; {} geometry chunks ({} pages); {load_detail}{unavailable_detail}",
                                     elapsed.unwrap_or_default(),
                                     if stats.cache_hit { " (warm page cache)" } else { "" },
                                     renderer.world_pages.len(),
@@ -5780,14 +6034,14 @@ pub fn run(
                     }
                     if menu_page==MenuPage::WorldMap && settings.world_map_style==MapStyle::Original && !original_map_requested {
                         original_map_requested=true;
-                        let root=whole_element.clone();let (tx,rx)=std::sync::mpsc::channel();
-                        std::thread::spawn(move || {let _=tx.send(crate::navigation::original_map(&root));});
+                        let root=whole_element.clone();let zone=map_zone.clone();let (tx,rx)=std::sync::mpsc::channel();
+                        std::thread::spawn(move || {let _=tx.send(crate::navigation::original_map_for_map(&root,&zone));});
                         original_map_rx=Some(rx);
                     }
                     if settings.minimap_style==MapStyle::Original && !original_minimap_requested {
                         original_minimap_requested=true;
-                        let root=whole_element.clone();let (tx,rx)=std::sync::mpsc::channel();
-                        std::thread::spawn(move || {let _=tx.send(crate::navigation::original_minimap(&root));});
+                        let root=whole_element.clone();let zone=map_zone.clone();let (tx,rx)=std::sync::mpsc::channel();
+                        std::thread::spawn(move || {let _=tx.send(crate::navigation::original_minimap_for_map(&root,&zone));});
                         original_minimap_rx=Some(rx);
                     }
                     if let Some(rx)=&original_map_rx {if let Ok(result)=rx.try_recv(){
@@ -6442,9 +6696,62 @@ pub fn run(
                                 || fg_failed
                                 || xess_fg_failed
                                 || dlss_fg_failed;
-                            if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
+                            if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
                                 let input=egui_state.take_egui_input(&window);
                                 let output=egui_ctx.run(input,|ctx| {
+                                    // A replacement-process handoff leaves this
+                                    // window alive but completely non-interactive.
+                                    // Recovery events are polled by the event loop,
+                                    // never by this overlay.
+                                    if world_loading_active {
+                                        egui::Area::new(egui::Id::new("world-handoff-loading"))
+                                            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.))
+                                            .interactable(false)
+                                            .show(ctx, |ui| {
+                                                egui::Frame::none()
+                                                    .fill(egui::Color32::from_black_alpha(225))
+                                                    .inner_margin(18.)
+                                                    .rounding(8.)
+                                                    .show(ui, |ui| {
+                                                        ui.set_min_width(360.);
+                                                        ui.heading("Changing world…");
+                                                        ui.add_space(8.);
+                                                        ui.label(&world_loading_status);
+                                                        ui.add_space(4.);
+                                                        ui.label(egui::RichText::new("This window will close when the new world is ready.").small().weak());
+                                                    });
+                                            });
+                                        return;
+                                    }
+                                    // Clone the message before the window closure: the
+                                    // Dismiss button needs a mutable borrow of the
+                                    // Option while the label is displayed.
+                                    if let Some(reason) = world_change_error.clone() {
+                                        egui::Window::new("WORLD CHANGE FAILED")
+                                            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.))
+                                            .collapsible(false)
+                                            .resizable(false)
+                                            .show(ctx, |ui| {
+                                                ui.colored_label(egui::Color32::LIGHT_RED, reason.as_str());
+                                                ui.label("The viewer stayed on the current world and restored a safe saved setting.");
+                                                if ui.button("Dismiss").clicked() {
+                                                    world_change_error = None;
+                                                }
+                                            });
+                                    }
+                                    if let Some(reason) = world_change_notice.clone() {
+                                        egui::Window::new("WORLD LOAD WARNING")
+                                            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.))
+                                            .collapsible(false)
+                                            .resizable(false)
+                                            .show(ctx, |ui| {
+                                                ui.colored_label(egui::Color32::YELLOW, reason.as_str());
+                                                ui.label("The viewer fell back to the main world.");
+                                                if ui.button("Dismiss").clicked() {
+                                                    world_change_notice = None;
+                                                }
+                                            });
+                                    }
                                     if menu_page==MenuPage::Main {
                                         egui::Window::new("PERFECT WORLD EXPLORER  |  ESC MENU")
                                             .default_pos(egui::pos2(16.,16.)).default_size(egui::vec2(380.,330.)).min_size(egui::vec2(280.,260.)).collapsible(false).resizable(true).vscroll(true)
@@ -6497,7 +6804,81 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     }
                                     if menu_page==MenuPage::Teleports {
                                         egui::Window::new("TELEPORT LIST  |  ESC to go back").default_pos(egui::pos2(16.,16.)).default_size(egui::vec2(540.,570.)).min_size(egui::vec2(340.,280.)).max_height(config.height as f32/window.scale_factor() as f32-35.).collapsible(false).resizable(true).show(ctx,|ui|{
-                                            ui.heading("Explore destinations");ui.label(egui::RichText::new("Locations and coordinates from the client’s world_targets.txt").small().weak());ui.add_space(6.);
+                                            ui.heading("Explore destinations");ui.label(egui::RichText::new("Locations and coordinates from the selected map").small().weak());ui.add_space(6.);
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Current world").strong());
+                                                ui.label(format!("{} [{}]", current_map.display_name, current_map.id));
+                                            });
+                                            let instance_ids = if current_map.instance_ids.is_empty() {
+                                                "none".to_string()
+                                            } else {
+                                                current_map
+                                                    .instance_ids
+                                                    .iter()
+                                                    .map(u32::to_string)
+                                                    .collect::<Vec<_>>()
+                                                    .join(", ")
+                                            };
+                                            ui.label(egui::RichText::new(format!(
+                                                "Region grid {}x{}  •  Instance IDs {instance_ids}",
+                                                current_map.cols, current_map.rows
+                                            )).small().weak());
+                                            if let Some(warning) = &catalog.warning {
+                                                ui.colored_label(egui::Color32::YELLOW, warning);
+                                            }
+                                            egui::ComboBox::from_id_source("selected-world")
+                                                .selected_text(format!("{} [{}]", selected_map_label(&catalog, &selected_world_ui), selected_world_ui))
+                                                .width(280.)
+                                                .show_ui(ui, |ui| {
+                                                    for map in &catalog.maps {
+                                                        ui.selectable_value(
+                                                            &mut selected_world_ui,
+                                                            map.id.clone(),
+                                                            format!("{} [{}]", map.display_name, map.id),
+                                                        );
+                                                    }
+                                                });
+                                            let change_requested = ui.button("Change world").clicked();
+                                            if change_requested {
+                                                if selected_world_ui.eq_ignore_ascii_case(&current_map.id) {
+                                                    world_change_error = Some(format!("{} is already the active world.", current_map.display_name));
+                                                } else {
+                                                    match spawn_world_handoff(&client_root, &selected_world_ui, window_focused) {
+                                                        Ok((files, rx)) => {
+                                                            settings.selected_world = selected_world_ui.to_ascii_lowercase();
+                                                            if let Err(error) = settings.save() {
+                                                                eprintln!("Settings save before world handoff: {error}");
+                                                            } else {
+                                                                saved_settings = settings.clone();
+                                                            }
+                                                            handoff_files = Some(files);
+                                                            handoff_rx = Some(rx);
+                                                            world_loading_active = true;
+                                                            world_change_error = None;
+                                                            world_change_notice = None;
+                                                            world_loading_status = format!("Starting {}...", selected_world_ui);
+                                                            menu_page = MenuPage::Closed;
+                                                            keys.clear();
+                                                            if captured {
+                                                                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                                                                window.set_cursor_visible(true);
+                                                                captured = false;
+                                                            }
+                                                        }
+                                                        Err(error) => {
+                                                            settings.selected_world = current_map.id.clone();
+                                                            if let Err(save_error) = settings.save() {
+                                                                eprintln!("Settings save after world handoff launch failure: {save_error}");
+                                                            } else {
+                                                                saved_settings = settings.clone();
+                                                            }
+                                                            selected_world_ui = current_map.id.clone();
+                                                            world_change_error = Some(error);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            ui.separator();
                                             ui.add(egui::TextEdit::singleline(&mut teleport_query).hint_text("Search locations or ID...").desired_width(f32::INFINITY));
                                             match &destinations {Ok(list)=>{
                                                 let q=teleport_query.trim().to_lowercase();let filtered=list.iter().filter(|p|q.is_empty() || p.name.to_lowercase().contains(&q) || p.id.to_string().contains(&q)).collect::<Vec<_>>();
@@ -6515,7 +6896,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         egui::Window::new("WORLD MAP  |  M or ESC to close").default_pos(egui::pos2(16.,16.)).default_size(egui::vec2((screen_w-32.).min(760.),(screen_h-32.).min(900.))).min_size(egui::vec2(330.,300.)).max_height(screen_h-35.).collapsible(false).resizable(true).show(ctx,|ui|{
                                             ui.label(egui::RichText::new("North: up  |  East: right  |  Mouse wheel: zoom").small().strong());
                                             if settings.world_map_style==MapStyle::Realistic && !renderer.world_done {ui.horizontal_wrapped(|ui|{ui.label(egui::RichText::new("Distant scenery: ").small().weak());if settings.detail.terrain_cutoff {ui.label("Scenery follows the resident window");}else if settings.whole_world {ui.label(egui::RichText::new(&world_status).small().weak());}else if ui.button("Load whole world scenery").clicked(){settings.whole_world=true;}});}
-                                            let remaining=(ui.available_height()-78.).max(100.);let visible_width=ui.available_width();let base_width=visible_width.min(remaining*8./11.).max(120.);let image_size=egui::vec2(base_width*map_zoom,base_width*map_zoom*11./8.);
+                                            let remaining=(ui.available_height()-78.).max(100.);let visible_width=ui.available_width();let base_width=visible_width.min(remaining*map_aspect).max(120.);let image_size=egui::vec2(base_width*map_zoom,base_width*map_zoom/map_aspect);
                                             let texture=if settings.world_map_style==MapStyle::Original {original_map_id.as_ref().map(|t|t.id())} else {Some(full_map_id)};
                                             let mut zoom_anchor=None;
                                             let scroll=egui::ScrollArea::both().max_height(remaining).auto_shrink([false,false]).show(ui,|ui|{
@@ -6744,6 +7125,9 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 // frame generation may take the swapchain over.
                                 presented_once = true;
                             }
+                            if presented_once {
+                                signal_handoff_first_frame(&mut handoff_ready_signaled);
+                            }
                             if let Some(session) = latency.as_mut() {
                                 session.present_end();
                             }
@@ -6761,14 +7145,90 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
             Event::DeviceEvent {
                 event: DeviceEvent::MouseMotion { delta },
                 ..
-            } if captured => {
+            } if camera_motion_allowed(window_focused, captured, menu_page.is_open(), world_loading_active) => {
                 if input_debug() {
                     eprintln!("Mouse motion: {:?}", delta);
                 }
                 camera.yaw -= delta.0 as f32 * settings.sensitivity;
                 camera.pitch = (camera.pitch - delta.1 as f32 * settings.sensitivity).clamp(-1.5, 1.5);
             }
-            Event::AboutToWait => window.request_redraw(),
+            Event::AboutToWait => {
+                // Handoff/recovery messages are polled outside egui, so the
+                // non-interactive loading overlay cannot swallow them.
+                if let Some(rx) = handoff_rx.take() {
+                    let mut keep_receiver = false;
+                    loop {
+                        match rx.try_recv() {
+                            Ok(crate::world_handoff::Message::Progress(status)) => {
+                                world_loading_status = status;
+                            }
+                            Ok(crate::world_handoff::Message::Ready { activated }) => {
+                                // The replacement is visible and has presented
+                                // a usable frame. Exit this old process without
+                                // forcing focus if the user Alt-Tabbed away.
+                                if !activated {
+                                    eprintln!("Replacement world is ready; leaving it visible without forced activation.");
+                                }
+                                // The replacement owns persistence now: it may
+                                // have fallen back to the main world after the
+                                // old process selected an instance. Saving the
+                                // old selection here would undo that recovery.
+                                world_loading_active = false;
+                                handoff_files = None;
+                                keys.clear();
+                                close_old_window_after_handoff_ready(target, &window);
+                                return;
+                            }
+                            Ok(crate::world_handoff::Message::Failed(reason)) => {
+                                settings.selected_world = "world".into();
+                                if let Err(error) = settings.save() {
+                                    eprintln!("Settings save after world handoff failure: {error}");
+                                } else {
+                                    saved_settings = settings.clone();
+                                }
+                                selected_world_ui = current_map.id.clone();
+                                world_change_error = Some(reason);
+                                world_change_notice = None;
+                                world_loading_active = false;
+                                if let Some(files) = handoff_files.take() {
+                                    files.cleanup();
+                                }
+                                menu_page = MenuPage::Main;
+                                keys.clear();
+                                break;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                keep_receiver = true;
+                                break;
+                            }
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                settings.selected_world = "world".into();
+                                if let Err(error) = settings.save() {
+                                    eprintln!("Settings save after world handoff failure: {error}");
+                                } else {
+                                    saved_settings = settings.clone();
+                                }
+                                selected_world_ui = current_map.id.clone();
+                                world_change_error = Some(
+                                    "The world handoff watcher stopped without a result.".into(),
+                                );
+                                world_change_notice = None;
+                                world_loading_active = false;
+                                if let Some(files) = handoff_files.take() {
+                                    files.cleanup();
+                                }
+                                menu_page = MenuPage::Main;
+                                keys.clear();
+                                break;
+                            }
+                        }
+                    }
+                    if keep_receiver {
+                        handoff_rx = Some(rx);
+                    }
+                }
+                window.request_redraw();
+            }
             _ => {}
         })
         .map_err(|e| e.to_string())
@@ -6985,11 +7445,17 @@ pub fn preview(
                     world_draw_cmds,
                 } => {
                     eprintln!(
-                        "Preview world preload: {processed} objects, {skipped} fallback meshes, {} pages, peak residency {} MiB / {} MiB budget, {} evictions",
+                        "Preview world preload: {processed} objects, {skipped} fallback meshes, {} pages, peak residency {} MiB / {} MiB budget, {} evictions, {} unavailable scenery models{}",
                         stats.pages,
                         stats.residency.peak_resident_bytes >> 20,
                         stats.residency.budget_bytes >> 20,
-                        stats.residency.evictions
+                        stats.residency.evictions,
+                        stats.unavailable_models.len(),
+                        if stats.unavailable_examples.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {}", stats.unavailable_examples.join("; "))
+                        }
                     );
                     renderer.world_draw_cmds = world_draw_cmds;
                     for page in &mut renderer.world_pages {
@@ -7171,6 +7637,19 @@ mod water_batch_tests {
             bounds,
         }
     }
+    #[test]
+    fn viewer_input_requires_focus_and_no_blocking_ui() {
+        assert!(normal_input_allowed(true, false, false));
+        assert!(!normal_input_allowed(false, false, false));
+        assert!(!normal_input_allowed(true, true, false));
+        assert!(!normal_input_allowed(true, false, true));
+        assert!(camera_motion_allowed(true, true, false, false));
+        assert!(!camera_motion_allowed(false, true, false, false));
+        assert!(!camera_motion_allowed(true, false, false, false));
+        assert!(!camera_motion_allowed(true, true, true, false));
+        assert!(!camera_motion_allowed(true, true, false, true));
+    }
+
     #[test]
     fn escape_navigates_menu_pages() {
         assert_eq!(MenuPage::Closed.escape(), MenuPage::Main);
@@ -7509,5 +7988,25 @@ mod slider_mark_tests {
             let t = slider_mark_fraction(default, min, max, true);
             assert!(t.is_finite() && (0.0..=1.0).contains(&t), "{t}");
         }
+    }
+}
+
+#[cfg(test)]
+mod handoff_exit_tests {
+    use super::*;
+
+    #[test]
+    fn a_ready_handoff_never_leaves_the_old_window_waiting_to_close() {
+        let plan = handoff_ready_exit_plan();
+        assert!(plan.hide_old_window);
+        assert!(plan.poll_before_exit);
+        assert!(plan.exit_event_loop);
+
+        // Source-pin the Winit 0.29 workaround: `AboutToWait` is dispatched
+        // before a blocking GetMessageW, so exit() alone is not sufficient.
+        let src = include_str!("gpu.rs");
+        assert!(src.contains("window.set_visible(false);"));
+        assert!(src.contains("target.set_control_flow(winit::event_loop::ControlFlow::Poll);"));
+        assert!(src.contains("close_old_window_after_handoff_ready(target, &window);"));
     }
 }

@@ -115,7 +115,11 @@ impl Heights {
         }
     }
     pub fn at(&self, index: usize) -> f32 {
-        self.reader().height(index)
+        match &self.0.data {
+            Data::Memory(v) => v[index],
+            Data::Resident(grid) => grid.heights[index],
+            Data::Disk(_) => self.reader().height(index),
+        }
     }
     pub fn stats(&self) -> Stats {
         match &self.0.data {
@@ -153,6 +157,9 @@ impl Heights {
 }
 impl Normals {
     pub fn at(&self, index: usize) -> [i8; 3] {
+        if let Data::Resident(grid) = &self.0.data {
+            return grid.normals[index];
+        }
         Reader {
             store: Arc::clone(&self.0),
             current: None,
@@ -198,7 +205,7 @@ impl Reader {
             .map_err(|e| format!("terrain cache {}: {e}", d.path.display()))?;
         let cells = d.side * d.side;
         let mut bytes = Vec::with_capacity(cells * 7);
-        ZlibDecoder::new(packed.as_slice())
+        ZlibDecoder::new(&packed[..])
             .take((cells * 7 + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|e| format!("terrain cache block {id}: {e}; restart to rebuild cache"))?;
@@ -655,6 +662,11 @@ pub fn source_identity(header: &[u8], dir: &Path, names: &[String]) -> Result<St
     hash.update(b"PWTSRC01");
     hash.update((header.len() as u64).to_le_bytes());
     hash.update(header);
+    // The same TRN2/T2BK corpus can be copied into two instance folders. Those
+    // are separate coordinate spaces, so their warm caches must not collide.
+    hash.update(b"PWTMAPDIR");
+    let map_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    hash.update(map_dir.to_string_lossy().as_bytes());
     for name in names {
         let bytes =
             fs::read(dir.join(format!("{name}.t2bk"))).map_err(|e| format!("{name}: {e}"))?;
@@ -961,6 +973,15 @@ mod tests {
         );
         assert_eq!(p.normals, n);
     }
+    #[test]
+    fn source_identity_separates_identical_bytes_in_different_map_folders() {
+        let a = Temp::new();
+        let b = Temp::new();
+        let first = source_identity(b"same-header", &a.0, &[]).unwrap();
+        let second = source_identity(b"same-header", &b.0, &[]).unwrap();
+        assert_ne!(first, second);
+    }
+
     #[test]
     fn paging_is_exact_across_edges_evictions_and_shared_views() {
         let dir = Temp::new();

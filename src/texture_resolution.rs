@@ -120,6 +120,161 @@ pub struct TextureResolver {
 pub fn normalize(name: &str) -> String {
     name.to_lowercase().replace('\\', "/")
 }
+
+/// Keep an EC-BSD-derived map ID safe to use as an archive namespace. A direct
+/// map folder may have a name that is loadable but not safe as a process ID or
+/// path component; those maps fall back to the legacy `litmodels/world/` lookup.
+fn safe_map_namespace(id: &str) -> Option<String> {
+    let id = normalize(id).trim_matches('/').to_string();
+    (!id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+    .then_some(id)
+}
+
+/// The world-relative part of a scenery model reference. EC-BSD records store
+/// `1/litmodel_N.bmd`, while archives may use `litmodels/world/...` or the
+/// retail `litmodels/<map-id>/...` partition. Traversal components are dropped
+/// before any archive key is constructed.
+fn litmodel_relative(path: &str) -> String {
+    let normalized = normalize(path);
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != "." && *part != "..")
+        .collect();
+    let relative = if parts.first() == Some(&"litmodels") {
+        if parts.get(1) == Some(&"world") || parts.len() > 2 {
+            parts[2.min(parts.len())..].join("/")
+        } else {
+            parts[1..].join("/")
+        }
+    } else if parts.first() == Some(&"world") {
+        parts[1..].join("/")
+    } else {
+        parts.join("/")
+    };
+    relative
+}
+
+/// Canonical in-memory key for an EC-BSD ornament path. Cache identity stays
+/// stable across the different archive layouts used by client packs.
+pub fn litmodel_key(path: &str) -> String {
+    format!("litmodels/world/{}", litmodel_relative(path))
+}
+
+fn litmodel_entry_candidates(canonical: &str) -> [String; 4] {
+    let relative = litmodel_relative(canonical);
+    [
+        canonical.to_string(),
+        format!("litmodels/{relative}"),
+        format!("world/{relative}"),
+        relative,
+    ]
+}
+
+/// Basename index for the final fallback. A basename is only usable when it is
+/// unique, so another map's same-named model is never selected by guess.
+pub fn litmodel_basename_index(entry_names: &[String]) -> HashMap<String, Vec<String>> {
+    let mut index: HashMap<String, Vec<String>> = HashMap::new();
+    for name in entry_names {
+        let basename = name.rsplit('/').next().unwrap_or(name).to_string();
+        index.entry(basename).or_default().push(name.clone());
+    }
+    index
+}
+
+fn map_namespace(key: &str) -> Option<&str> {
+    let rest = key.strip_prefix("litmodels/")?;
+    let id = rest.split('/').next()?;
+    if id.is_empty()
+        || id == "world"
+        || id.len() > 64
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    Some(id)
+}
+
+fn partition_for_another_map(entry_names: &[String], map_id: &str) -> bool {
+    entry_names
+        .iter()
+        .any(|key| map_namespace(key).is_some_and(|id| id != map_id))
+}
+
+/// Resolve a scenery BMD reference against the normalized archive index.
+/// A map-partitioned archive must resolve within the selected map namespace;
+/// otherwise A01/A11 models with identical relative paths can be mixed or the
+/// whole map can appear empty. For a non-partitioned archive the legacy
+/// `litmodels/world/` layout and its older alternate roots remain available.
+pub fn litmodel_entry_key(
+    path: &str,
+    map_id: &str,
+    entry_names: &[String],
+    by_basename: &HashMap<String, Vec<String>>,
+) -> Result<String, String> {
+    let has = |key: &str| entry_names.iter().any(|candidate| candidate == key);
+    let archive_path = normalize(path);
+    let canonical = litmodel_key(path);
+    let relative = litmodel_relative(&canonical);
+    let map_id = safe_map_namespace(map_id);
+
+    if let Some(map_id) = map_id.as_deref() {
+        if map_id != "world" {
+            let map_prefix = format!("litmodels/{map_id}/");
+            let scoped_candidate = format!("{map_prefix}{relative}");
+            if has(&scoped_candidate) {
+                return Ok(scoped_candidate);
+            }
+            if entry_names.iter().any(|key| key.starts_with(&map_prefix))
+                || partition_for_another_map(entry_names, map_id)
+            {
+                return Err(format!(
+                    "missing model {path} in map namespace {map_prefix}; refusing cross-map basename fallback"
+                ));
+            }
+        }
+    }
+
+    if has(&archive_path) {
+        return Ok(archive_path);
+    }
+    for candidate in litmodel_entry_candidates(&canonical) {
+        if has(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    let suffix = format!("/{relative}");
+    let suffix_matches: Vec<&String> = entry_names
+        .iter()
+        .filter(|key| key.ends_with(&suffix))
+        .collect();
+    match suffix_matches.as_slice() {
+        [only] => return Ok((*only).clone()),
+        matches if !matches.is_empty() => {
+            return Err(format!(
+                "no exact archive path for {path}; world-relative suffix {relative} is ambiguous ({} matches)",
+                matches.len()
+            ));
+        }
+        _ => {}
+    }
+    let basename = canonical.rsplit('/').next().unwrap_or(path).to_string();
+    match by_basename.get(&basename).map(Vec::as_slice) {
+        Some([only]) => Ok(only.clone()),
+        Some(matches) => Err(format!(
+            "no exact archive path for {path}; basename {basename} is ambiguous ({} matches)",
+            matches.len()
+        )),
+        None => Err(format!(
+            "missing model {path}; litmodels.pck has no member named {basename}"
+        )),
+    }
+}
 impl TextureResolver {
     pub fn new(mounts: Vec<MountedArchive>, disk_root: PathBuf) -> Self {
         Self {
@@ -288,6 +443,84 @@ pub fn file_exists(resolver_mounts: &[MountedArchive], disk_root: &Path, key: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn scenery_index(names: &[&str]) -> (Vec<String>, HashMap<String, Vec<String>>) {
+        let entry_names = names.iter().map(|name| normalize(name)).collect::<Vec<_>>();
+        let by_basename = litmodel_basename_index(&entry_names);
+        (entry_names, by_basename)
+    }
+    #[test]
+    fn map_scoped_litmodel_lookup_uses_the_selected_map_namespace() {
+        let (entry_names, by_basename) = scenery_index(&[
+            "litmodels/a01/1/litmodel_1399.bmd",
+            "litmodels/a11/1/litmodel_1399.bmd",
+        ]);
+        assert_eq!(
+            litmodel_entry_key(
+                "litmodels/world/1/litmodel_1399.bmd",
+                "a01",
+                &entry_names,
+                &by_basename
+            )
+            .unwrap(),
+            "litmodels/a01/1/litmodel_1399.bmd"
+        );
+    }
+    #[test]
+    fn a_missing_instance_model_is_not_borrowed_from_another_map() {
+        let (entry_names, by_basename) = scenery_index(&["litmodels/a11/1/litmodel_1399.bmd"]);
+        let error = litmodel_entry_key(
+            "litmodels/world/1/litmodel_1399.bmd",
+            "a01",
+            &entry_names,
+            &by_basename,
+        )
+        .unwrap_err();
+        assert!(error.contains("litmodels/a01/"));
+        assert!(error.contains("refusing cross-map basename fallback"));
+    }
+    #[test]
+    fn legacy_main_world_layout_still_resolves_exactly() {
+        let (entry_names, by_basename) = scenery_index(&["litmodels/world/1/litmodel_1399.bmd"]);
+        assert_eq!(
+            litmodel_entry_key(
+                "litmodels/world/1/litmodel_1399.bmd",
+                "world",
+                &entry_names,
+                &by_basename
+            )
+            .unwrap(),
+            "litmodels/world/1/litmodel_1399.bmd"
+        );
+    }
+    #[test]
+    fn ambiguous_world_relative_suffix_is_reported_instead_of_guessed() {
+        let (entry_names, by_basename) = scenery_index(&[
+            "litmodels/a01/1/litmodel_0.bmd",
+            "litmodels/a02/1/litmodel_0.bmd",
+        ]);
+        let error = litmodel_entry_key(
+            "litmodels/world/1/litmodel_0.bmd",
+            "world",
+            &entry_names,
+            &by_basename,
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguous"));
+    }
+    #[test]
+    fn an_unsafe_map_namespace_uses_the_legacy_lookup() {
+        let (entry_names, by_basename) = scenery_index(&["litmodels/world/1/litmodel_1399.bmd"]);
+        assert_eq!(
+            litmodel_entry_key(
+                "litmodels/world/1/litmodel_1399.bmd",
+                "../a01",
+                &entry_names,
+                &by_basename
+            )
+            .unwrap(),
+            "litmodels/world/1/litmodel_1399.bmd"
+        );
+    }
     fn mount(tag: &str, names: &[&str]) -> MountedArchive {
         MountedArchive {
             tag: tag.to_string(),

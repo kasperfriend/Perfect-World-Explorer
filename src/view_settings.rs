@@ -264,6 +264,9 @@ pub struct ViewSettings {
     pub logging_mask: u64,
     /// Where the log files go; empty means `<client root>/pwe-logs`.
     pub logging_dir: String,
+    /// Map folder selected in Escape → Teleport List → Change world. A missing,
+    /// unsafe or unknown ID falls back to the main world at startup.
+    pub selected_world: String,
 }
 impl Default for ViewSettings {
     fn default() -> Self {
@@ -350,6 +353,7 @@ impl Default for ViewSettings {
             // every session pays.
             logging_mask: 0,
             logging_dir: String::new(),
+            selected_world: String::from("world"),
         }
     }
 }
@@ -527,6 +531,14 @@ impl ViewSettings {
                     // rather than ignored: clearing the box must persist too.
                     s.logging_dir = v.to_string();
                 }
+                "selected_world" => {
+                    // Only a single-folder ID can be persisted or later passed
+                    // as `--world`. Do not let a settings file inject path
+                    // separators or process arguments.
+                    if crate::world_catalog::valid_world_id(v) {
+                        s.selected_world = v.to_ascii_lowercase();
+                    }
+                }
                 "world_effects" => flag!(s.world_effects),
                 "effect_distance" => {
                     if let Ok(metres) = v.parse::<f32>() {
@@ -587,7 +599,7 @@ impl ViewSettings {
             "radius={}\nterrain_cutoff={}\ntree_lod_scale={}\nscenery_quality={}\ncamera_speed={}\nboost={}\nsensitivity={}\nfar={}\ntime_of_day={}\ntime_pass_enabled={}\ntime_pass_speed={}\nall_to_vram={}\n",
             "whole_world={}\nwater_reflections={}\nworld_effects={}\natmospheric_fog={}\nbloom={}\nbloom_strength={}\nbloom_mode={}\nbloom_tint={}\nbloom_brightness_fade={}\nbloom_opacity_fade={}\nclient_gamma={}\ngamma_setting={}\n",
             "terrain_lightmaps={}\nmodel_backface_culling={}\nmusic_enabled={}\nmusic_volume={}\nambience_enabled={}\nsound_volume={}\neffects_enabled={}\neffects_volume={}\nfullscreen={}\nshow_zone_entry={}\n",
-            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nframe_multiplier={}\nfsr1_sharpness={}\nfsr3_sharpness={}\ndlss_sharpness={}\nxess_sharpness={}\nupscale_sdk_dir={}\nlatency={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\n"),
+            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nframe_multiplier={}\nfsr1_sharpness={}\nfsr3_sharpness={}\ndlss_sharpness={}\nxess_sharpness={}\nupscale_sdk_dir={}\nlatency={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\nselected_world={}\n"),
             self.detail.radius,self.detail.terrain_cutoff,self.detail.tree_lod_scale,self.detail.scenery_quality,self.camera_speed,self.boost,self.sensitivity,self.far,self.time_of_day,self.time_pass_enabled,self.time_pass_speed,self.all_to_vram,
             self.whole_world,self.water_reflections,self.world_effects,self.atmospheric_fog,self.bloom,self.bloom_strength,self.bloom_mode,self.bloom_tint,self.bloom_brightness_fade,self.bloom_opacity_fade,self.client_gamma,self.gamma_setting,
             self.terrain_lightmaps,self.model_backface_culling,self.music_enabled,self.music_volume,self.ambience_enabled,self.sound_volume,self.effects_enabled,self.effects_volume,self.fullscreen,self.show_zone_entry,
@@ -595,7 +607,7 @@ impl ViewSettings {
             self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.frame_multiplier.token(),self.fsr1_sharpness,self.fsr3_sharpness,self.dlss_sharpness,self.xess_sharpness,self.upscale_sdk_dir,self.latency.token(),
             self.world_map_style.label(),self.minimap_style.label(),
             self.minimap_shape.label(),
-            self.weather_override.token(),self.sky_override.token(),self.effect_shaft.token(),self.effect_distance,self.logging_mask,self.logging_dir)
+            self.weather_override.token(),self.sky_override.token(),self.effect_shaft.token(),self.effect_distance,self.logging_mask,self.logging_dir,self.selected_world)
     }
     /// The settings file: `viewer-settings.txt` beside the executable.
     ///
@@ -676,6 +688,23 @@ impl ViewSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_world_defaults_to_main_and_validates_persisted_ids() {
+        assert_eq!(ViewSettings::default().selected_world, "world");
+        let s = ViewSettings::decode("selected_world=A01");
+        assert_eq!(s.selected_world, "a01");
+        // Upscaling/frame-generation settings are still present and unchanged.
+        assert_eq!(s.upscaling, UpscaleMethod::Off);
+        assert_eq!(s.frame_generation, FrameGenMethod::Off);
+        assert_eq!(ViewSettings::decode(&s.encode()), s);
+        for unsafe_id in ["../world", "a01/maps", "a b", ""] {
+            assert_eq!(
+                ViewSettings::decode(&format!("selected_world={unsafe_id}")).selected_world,
+                "world"
+            );
+        }
+    }
+
     #[test]
     fn authored_sharpen_toggle_round_trips_without_changing_defaults() {
         assert!(!ViewSettings::default().sharpen);

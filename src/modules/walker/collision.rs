@@ -9,7 +9,11 @@
 //! permanent terrain/support pass remains independent of this object option.
 
 use super::physics::Ground;
-use crate::{bmd::CollisionBrush, pck, scene};
+use crate::{
+    bmd::CollisionBrush,
+    pck, scene,
+    texture_resolution::{litmodel_basename_index, litmodel_entry_key, litmodel_key, normalize},
+};
 use glam::{Vec2, Vec3};
 use std::{
     collections::{HashMap, HashSet},
@@ -841,33 +845,41 @@ fn model_decks(model: &crate::bmd::Model) -> Vec<PropDeck> {
     decks
 }
 
-fn building_worker(element: PathBuf, paths: Vec<String>, tx: SyncSender<BuildingMessage>) {
+fn building_worker(
+    element: PathBuf,
+    map_id: String,
+    paths: Vec<String>,
+    tx: SyncSender<BuildingMessage>,
+) {
     let result = (|| -> Result<(), String> {
         let mut file = File::open(element.join("litmodels.pck")).map_err(|e| e.to_string())?;
         let entries: HashMap<_, _> = pck::directory(&mut file)?
             .into_iter()
-            .map(|entry| (entry.name.to_lowercase(), entry))
+            .map(|entry| (normalize(&entry.name), entry))
             .collect();
+        let entry_names = entries.keys().cloned().collect::<Vec<_>>();
+        let by_basename = litmodel_basename_index(&entry_names);
         let mut failed = 0;
         for start in (0..paths.len()).step_by(32) {
             let end = (start + 32).min(paths.len());
             let mut brushes = Vec::new();
             let mut decks = Vec::new();
             for path in &paths[start..end] {
-                // Lit models live under `litmodels/world/`, but a few props ship
-                // under a shorter key. Trying the alternatives loads the ones the
-                // first form misses instead of losing their hulls and tops.
-                let key = format!("litmodels/world/{path}");
-                let entry = entries.get(&key).or_else(|| {
-                    [format!("litmodels/{path}"), path.clone()]
-                        .iter()
-                        .find_map(|alternative| entries.get(alternative))
-                });
-                let result = entry
-                    .ok_or_else(|| format!("missing model {key}"))
-                    .and_then(|entry| pck::read_entry(&mut file, entry))
+                // EC-BSD paths are relative; retail archives partition scenery
+                // under `litmodels/<map-id>/`, while older clients use the
+                // legacy `litmodels/world/` root. Resolve within the selected
+                // map first so another instance's same-named model is not used.
+                let canonical = litmodel_key(path);
+                let result = litmodel_entry_key(&canonical, &map_id, &entry_names, &by_basename)
+                    .and_then(|key| {
+                        let entry = entries
+                            .get(&key)
+                            .ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
+                        pck::read_entry(&mut file, entry)
+                    })
                     .and_then(|data| {
-                        crate::bmd::Model::parse(&data).map_err(|error| format!("{key}: {error}"))
+                        crate::bmd::Model::parse(&data)
+                            .map_err(|error| format!("{canonical}: {error}"))
                     });
                 match result {
                     Ok(model) => {
@@ -904,6 +916,7 @@ fn building_worker(element: PathBuf, paths: Vec<String>, tx: SyncSender<Building
 pub struct Collision {
     element: Option<PathBuf>,
     building_paths: Vec<String>,
+    building_map_id: String,
     receiver: Option<Receiver<BuildingMessage>>,
     world: CollisionWorld,
     tree_report: TreeReport,
@@ -918,6 +931,7 @@ impl Default for Collision {
         Self {
             element: None,
             building_paths: Vec::new(),
+            building_map_id: "world".into(),
             receiver: None,
             world: CollisionWorld::default(),
             tree_report: TreeReport::default(),
@@ -941,12 +955,17 @@ impl Collision {
         let mut seen = HashSet::new();
         let building_paths = ornaments
             .iter()
-            .map(|ornament| ornament.path.to_lowercase().replace('\\', "/"))
+            .map(|ornament| normalize(&ornament.path))
             .filter(|path| seen.insert(path.clone()))
             .collect();
+        let building_map_id = ornaments
+            .first()
+            .map(|ornament| ornament.map_id.clone())
+            .unwrap_or_else(|| "world".into());
         Self {
             element: Some(element),
             building_paths,
+            building_map_id,
             world,
             tree_report,
             ..Self::default()
@@ -966,9 +985,10 @@ impl Collision {
         };
         let (tx, rx) = mpsc::sync_channel(2);
         let paths = self.building_paths.clone();
+        let map_id = self.building_map_id.clone();
         if std::thread::Builder::new()
             .name("walker-object-collision".into())
-            .spawn(move || building_worker(element, paths, tx))
+            .spawn(move || building_worker(element, map_id, paths, tx))
             .is_ok()
         {
             self.receiver = Some(rx);
@@ -1153,6 +1173,110 @@ impl Collision {
 mod tests {
     use super::*;
     use crate::{bmd::BrushSide, modules::walker::physics};
+
+    const MASK: u32 = 0xa8937462;
+    const CHECK: u32 = 0x59374231;
+    fn put_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    /// A minimal uncompressed v2 PCK. Only its directory matters to the
+    /// scenery-path recovery test; payloads need not be valid BMDs when the
+    /// selected map namespace rejects a cross-map match.
+    fn write_pck(path: &std::path::Path, entries: &[(&str, &[u8])]) {
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, 0x4dca23ef);
+        put_u32(&mut bytes, 0);
+        put_u32(&mut bytes, 0x56a089b7);
+        let mut records = Vec::new();
+        for (name, payload) in entries {
+            records.push((bytes.len() as u32, *name, payload.len() as u32));
+            bytes.extend_from_slice(payload);
+        }
+        let directory_at = bytes.len() as u32;
+        for (offset, name, size) in records {
+            let mut record = vec![0u8; 276];
+            assert!(name.len() <= 260);
+            record[..name.len()].copy_from_slice(name.as_bytes());
+            record[260..264].copy_from_slice(&offset.to_le_bytes());
+            record[264..268].copy_from_slice(&size.to_le_bytes());
+            record[268..272].copy_from_slice(&size.to_le_bytes());
+            put_u32(&mut bytes, 276 ^ MASK);
+            put_u32(&mut bytes, 276 ^ MASK ^ CHECK);
+            bytes.extend_from_slice(&record);
+        }
+        let end = bytes.len() as u32 + 280;
+        let mut footer = vec![0u8; 280];
+        footer[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
+        footer[8..12].copy_from_slice(&(directory_at ^ MASK).to_le_bytes());
+        footer[268..272].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
+        footer[272..276].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+        footer[276..280].copy_from_slice(&0x20002u32.to_le_bytes());
+        bytes.extend_from_slice(&footer);
+        bytes[4..8].copy_from_slice(&end.to_le_bytes());
+        std::fs::write(path, &bytes).unwrap();
+    }
+    fn fixture_root(name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "pw-collision-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+    #[test]
+    fn scenery_collision_uses_the_selected_map_namespace() {
+        let names = vec![
+            "litmodels/a01/1/litmodel_1399.bmd".to_string(),
+            "litmodels/a11/1/litmodel_1399.bmd".to_string(),
+        ];
+        let by_basename = litmodel_basename_index(&names);
+        let canonical = litmodel_key("1/litmodel_1399.bmd");
+        assert_eq!(
+            litmodel_entry_key(&canonical, "a01", &names, &by_basename).unwrap(),
+            "litmodels/a01/1/litmodel_1399.bmd"
+        );
+        assert!(litmodel_entry_key(&canonical, "a02", &names, &by_basename)
+            .unwrap_err()
+            .contains("refusing cross-map basename fallback"));
+    }
+    #[test]
+    fn a_missing_map_scoped_collision_model_skips_only_that_prop() {
+        let root = fixture_root("missing-map-scoped");
+        write_pck(
+            &root.join("litmodels.pck"),
+            &[("litmodels/a11/1/litmodel_1399.bmd", b"unreadable")],
+        );
+        let (tx, rx) = mpsc::sync_channel(2);
+        building_worker(
+            root.clone(),
+            "a01".into(),
+            vec!["1/litmodel_1399.bmd".into()],
+            tx,
+        );
+        let mut batches = 0;
+        let mut failures = None;
+        for message in rx {
+            match message {
+                BuildingMessage::Batch { brushes, decks, .. } => {
+                    batches += 1;
+                    assert!(brushes.is_empty());
+                    assert!(decks.is_empty());
+                }
+                BuildingMessage::Done { failed } => {
+                    failures = Some(failed);
+                    break;
+                }
+                BuildingMessage::Fatal(error) => panic!("collision worker aborted: {error}"),
+            }
+        }
+        assert_eq!(batches, 1);
+        assert_eq!(failures, Some(1));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn box_brush(center: [f32; 3], extents: [f32; 3]) -> CollisionBrush {
         let sides = [
