@@ -536,10 +536,10 @@ mod tests {
         assert_eq!(solid[material + 20], rgba([0.8, 1., 1., 1.]));
         assert_eq!(f32::from_bits(solid[material + 7]), 0.125);
         let alpha = pack(&quad, true);
-        assert_eq!(alpha[11], u32::from(MASK_BLEND | MASK_SHADOW));
+        assert_eq!(alpha[11], u32::from(MASK_GFX | MASK_SHADOW));
         quad.color[3] = 0.5;
         let sheet = pack(&quad, false);
-        assert_eq!(sheet[11], u32::from(MASK_BLEND | MASK_SHADOW));
+        assert_eq!(sheet[11], u32::from(MASK_GFX | MASK_SHADOW));
         assert_ne!(sheet[sheet[3] as usize + 1] & WRITE_DEPTH, 0);
     }
 }
