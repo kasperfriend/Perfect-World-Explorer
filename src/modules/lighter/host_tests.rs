@@ -591,7 +591,7 @@ fn lighter_streamed_world_pixels() {
     );
 
     camera.pitch = 0.;
-    let mut solid = None;
+    let mut solid: Option<f32> = None;
     for mode in [Mode::Off, Mode::Software] {
         r.lighter.settings.mode = mode;
         camera.pos = Vec3::new(13., 3., 7.);

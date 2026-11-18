@@ -1,13 +1,16 @@
 // All intersections are evaluated by shader ALUs in this variant. No ray
 // query capability, raster G-buffer, depth pyramid or screen-space lookup.
-fn aabb(ray: Ray, lo: vec3<f32>, hi: vec3<f32>, limit: f32) -> bool {
+struct Slabs { origin: vec3<f32>, inv: vec3<f32>, parallel: vec3<bool>, low: f32 }
+fn setup_slabs(ray: Ray) -> Slabs {
     let parallel = abs(ray.dir)<vec3<f32>(1.e-12);
-    if any(parallel & ((ray.origin<lo) | (ray.origin>hi))) { return false; }
-    let inv = 1./select(ray.dir,vec3<f32>(1.),parallel);
-    let a = (lo-ray.origin)*inv;
-    let b = (hi-ray.origin)*inv;
-    let t0 = select(min(a,b),vec3<f32>(-1.e30),parallel);
-    let t1 = select(max(a,b),vec3<f32>(1.e30),parallel);
+    return Slabs(ray.origin,1./select(ray.dir,vec3<f32>(1.),parallel),parallel,ray.low);
+}
+fn aabb(ray: Slabs, lo: vec3<f32>, hi: vec3<f32>, limit: f32) -> bool {
+    if any(ray.parallel & ((ray.origin<lo) | (ray.origin>hi))) { return false; }
+    let a = (lo-ray.origin)*ray.inv;
+    let b = (hi-ray.origin)*ray.inv;
+    let t0 = select(min(a,b),vec3<f32>(-1.e30),ray.parallel);
+    let t1 = select(max(a,b),vec3<f32>(1.e30),ray.parallel);
     return max(max(t0.x,t0.y),max(t0.z,ray.low)) <= min(min(t1.x,t1.y),min(t1.z,limit));
 }
 // Project to the dominant ray plane before testing the three shared edges.
@@ -53,6 +56,7 @@ fn mesh_hit(m: bool, instance: u32, ray: Ray, old: Hit, q: Query) -> Hit {
     local.origin = rotate(ray.origin-t,c,-si)/s;
     local.dir = rotate(ray.dir,c,-si)/s;
     let shear = setup(local.dir);
+    let slabs = setup_slabs(local);
     let nodes = word(m,5u);
     let refs = word(m,6u);
     let end = word(m,inst+9u);
@@ -60,7 +64,7 @@ fn mesh_hit(m: bool, instance: u32, ray: Ray, old: Hit, q: Query) -> Hit {
     var i = word(m,inst+8u);
     while i<end {
         let n = nodes+i*9u;
-        if !aabb(local,floats(m,n),floats(m,n+3u),select(best.t,ray.high,q.ordered)) {
+        if !aabb(slabs,floats(m,n),floats(m,n+3u),select(best.t,ray.high,q.ordered)) {
             i = word(m,n+6u);
             continue;
         }
@@ -89,9 +93,10 @@ fn scene_hit(m: bool, ray: Ray, old: Hit, q: Query) -> Hit {
     var best = old;
     var i = word(m,7u);
     let end = word(m,8u);
+    let slabs = setup_slabs(ray);
     while i<end {
         let n = nodes+i*9u;
-        if !aabb(ray,floats(m,n),floats(m,n+3u),select(best.t,ray.high,q.ordered)) {
+        if !aabb(slabs,floats(m,n),floats(m,n+3u),select(best.t,ray.high,q.ordered)) {
             i = word(m,n+6u);
             continue;
         }
@@ -106,7 +111,10 @@ fn scene_hit(m: bool, ray: Ray, old: Hit, q: Query) -> Hit {
     return best;
 }
 fn intersect(ray: Ray, q: Query) -> Hit {
-    let static_hit = scene_hit(false,ray,none(ray),q);
-    if q.purpose==SHADOW && static_hit.instance!=NIL { return static_hit; }
-    return scene_hit(true,ray,static_hit,q);
+    var best = none(ray);
+    for (var feed=0u; feed<2u; feed++) {
+        best = scene_hit(feed!=0u,ray,best,q);
+        if q.purpose==SHADOW && best.instance!=NIL { break; }
+    }
+    return best;
 }
