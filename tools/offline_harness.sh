@@ -30,6 +30,14 @@
 #   tools/offline_harness.sh scene    run the real `src/scene.rs` reader over every
 #                                     ECWLD in a directory, so cross-version map
 #                                     coverage is measured rather than assumed
+#   tools/offline_harness.sh pck      read every entry of every `.pck` in a
+#                                     directory with the real `src/pck.rs`, so a
+#                                     reader change is checked against retail
+#                                     packs and not only synthetic ones
+#   tools/offline_harness.sh matrix   report every staged client side by side:
+#                                     executable, data versions, package versions,
+#                                     scenery and water, so cross-version coverage
+#                                     is one table instead of several probes
 # Everything lands in target/offline/, which .gitignore already excludes.
 #
 # The real `flate2`, `goblin` and a correct SHA-256 are built here from pinned
@@ -762,4 +770,192 @@ EOF
             "$OUT/scene/sweep.rs" -o "$OUT/scenesweep"
         shift || true
         exec "$OUT/scenesweep" "${1:-$REPO/google_drive/scenecorpus}" ;;
-    *) echo "usage: $0 {setup|check|test|fmt|client|water|gfx|music|material|scene}" >&2; exit 2 ;;esac
+    pck) toolchain; sysroot; deps
+        # Decode every entry of every pack in the directory. A directory listing
+        # alone would pass while a record walk silently desynchronised, so the
+        # check is that each entry decompresses to the length its record claims.
+        mkdir -p "$OUT/pck"
+        cat > "$OUT/pck/sweep.rs" <<EOF
+#[path = "$REPO/src/pck.rs"]
+pub mod pck;
+use std::path::Path;
+fn main() {
+    let dir = std::env::args().nth(1).expect("pck directory");
+    let mut files: Vec<_> = std::fs::read_dir(Path::new(&dir))
+        .expect("read directory").flatten().map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("pck"))
+        .collect();
+    files.sort();
+    let (mut good, mut bad) = (0u32, 0u32);
+    for path in files {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => { println!("FAIL {name}: {e}"); bad += 1; continue; }
+        };
+        match pck::directory(&mut file) {
+            Ok(entries) => {
+                let mut wrong = 0usize;
+                let mut first = String::new();
+                for e in &entries {
+                    match pck::read_entry(&mut file, e) {
+                        Ok(b) if b.len() == e.size as usize => {}
+                        Ok(b) => {
+                            wrong += 1;
+                            if first.is_empty() {
+                                first = format!("{} decoded to {} not {}", e.name, b.len(), e.size);
+                            }
+                        }
+                        Err(err) => {
+                            wrong += 1;
+                            if first.is_empty() { first = format!("{}: {err}", e.name); }
+                        }
+                    }
+                }
+                if wrong == 0 {
+                    good += 1;
+                    println!("ok   {name:<22} {} entries", entries.len());
+                } else {
+                    bad += 1;
+                    println!("FAIL {name:<22} {} entries, {wrong} unreadable ({first})", entries.len());
+                }
+            }
+            Err(error) => { bad += 1; println!("FAIL {name:<22} {error}"); }
+        }
+    }
+    println!("pck: {good} ok, {bad} failed");
+    if bad > 0 { std::process::exit(1); }
+}
+EOF
+        "$RUSTC" --crate-name pcksweep --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=2 -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            "$OUT/pck/sweep.rs" -o "$OUT/pcksweep"
+        shift || true
+        exec "$OUT/pcksweep" "${1:-$REPO/google_drive/packs}" ;;
+    matrix) toolchain; sysroot; deps; real_deps
+        # One row per staged client. Everything here is produced by the real
+        # readers; nothing is asserted about a version that is not present.
+        mkdir -p "$OUT/matrix"
+        cat > "$OUT/matrix/run.rs" <<EOF
+#[path = "$REPO/src/client_detect.rs"]
+pub mod client_detect;
+#[path = "$REPO/src/pck.rs"]
+pub mod pck;
+#[path = "$REPO/src/angelica_pck.rs"]
+pub mod angelica_pck;
+#[path = "$REPO/src/scene.rs"]
+pub mod scene;
+#[path = "$OUT/water/image.rs"]
+pub mod image;
+#[path = "$REPO/src/water.rs"]
+pub mod water;
+use std::path::Path;
+fn main() {
+    let root = std::env::args().nth(1).expect("clients dir");
+    let mut dirs: Vec<_> = std::fs::read_dir(&root).expect("read clients dir")
+        .flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    dirs.sort();
+    for dir in dirs {
+        println!("\n################ {} ################", dir.display());
+        let pick = if dir.join("element").is_dir() { dir.join("element") } else { dir.clone() };
+        let scan = client_detect::scan(&pick);
+        println!("element     : {}", scan.element.display());
+        println!("readable_map: {:?}", scan.readable_map);
+        println!("loadable    : {}", scan.loadable());
+        for e in &scan.errors { println!("ERROR       : {e}"); }
+        for n in &scan.notes { println!("NOTE        : {n}"); }
+        if let Some(exe) = &scan.executable {
+            println!("exe         : {} | pe32={} known={:?} filever={:?}",
+                exe.label(), exe.pe32, exe.known, exe.file_version);
+        }
+        println!("game_version: {}", scan.game_version());
+        println!("data_version: {}", scan.data_version_summary());
+        for a in &scan.archives {
+            println!("archive     : {:22} kind={:?} v={:?} entries={:?} problem={:?}",
+                a.name, a.kind, a.version, a.entries, a.problem);
+        }
+        for d in &scan.data_files {
+            println!("datafile    : {:22} version={:?} problem={:?}", d.name, d.version, d.problem);
+        }
+        for line in scenery(&pick) { println!("{line}"); }
+        for line in water_areas(&pick) { println!("{line}"); }
+    }
+}
+fn scenery(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root.join("maps")) else { return out };
+    let mut files: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+    files.sort();
+    for map in files.iter().filter(|p| p.is_dir()) {
+        let Ok(rd) = std::fs::read_dir(map) else { continue };
+        for f in rd.flatten() {
+            let p = f.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("ecwld") { continue; }
+            let data = match std::fs::read(&p) { Ok(d) => d, Err(_) => continue };
+            match scene::Scene::parse(&data) {
+                Ok(s) => {
+                    let mut n = [0usize; 10];
+                    for b in &s.blocks {
+                        n[0]+=b.trees.len(); n[1]+=b.water.len(); n[2]+=b.grass.len();
+                        n[3]+=b.ornaments.len(); n[4]+=b.boxes.len(); n[5]+=b.effects.len();
+                        n[6]+=b.models.len(); n[7]+=b.critters.len(); n[8]+=b.beziers.len();
+                        n[9]+=b.sounds.len();
+                    }
+                    out.push(format!("scene       : {:20} ok  blocks={} {}x{} types={}/{} trees={} water={} grass={} orn={} boxes={} fx={} models={} critters={} bez={} snd={}",
+                        p.file_name().unwrap().to_string_lossy(), s.blocks.len(), s.rows, s.cols,
+                        s.tree_types.len(), s.grass_types.len(),
+                        n[0],n[1],n[2],n[3],n[4],n[5],n[6],n[7],n[8],n[9]));
+                }
+                Err(e) => out.push(format!("scene       : {:20} FAILED {e}",
+                    p.file_name().unwrap().to_string_lossy())),
+            }
+        }
+    }
+    out
+}
+fn water_areas(root: &Path) -> Vec<String> {
+    // Water lives in `maps/<id>/<id>.ecbsd` (a manifest of `bsdata/*.dat`
+    // paths and per-ref record indices) and the areas themselves are inside
+    // those `.dat` files. `water::load` is the reader that already knows that
+    // shape, so drive it rather than re-deriving the framing here: an earlier
+    // version of this report treated the last dword of the `.ecbsd` as a record
+    // count and printed `records=0` for every map.
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(root.join("maps")) else { return out };
+    let mut dirs: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    dirs.sort();
+    for map in dirs {
+        let name = map.file_name().unwrap().to_string_lossy().to_string();
+        let wld = map.join(format!("{name}.ecwld"));
+        let Ok(data) = std::fs::read(&wld) else { continue };
+        let Ok(scene) = scene::Scene::parse(&data) else { continue };
+        let refs: usize = scene.blocks.iter().map(|b| b.water.len()).sum();
+        let unique = {
+            let mut set = std::collections::BTreeSet::new();
+            for b in &scene.blocks { for w in &b.water { set.insert((w.export_id, w.offset)); } }
+            set.len()
+        };
+        match water::load(&scene, &map) {
+            Ok(areas) => out.push(format!(
+                "water       : {:20} refs={} unique={} areas={}",
+                format!("{name}.ecbsd"), refs, unique, areas.len())),
+            Err(error) => out.push(format!(
+                "water       : {:20} refs={} unique={} FAILED {error}",
+                format!("{name}.ecbsd"), refs, unique)),
+        }
+    }
+    out
+}
+EOF
+        "$RUSTC" --crate-name matrix --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=2 -L "$OUT" \
+            --extern flate2="$OUT/libflate2.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern sha2="$OUT/libsha2.rlib" \
+            --extern goblin="$OUT/libgoblin.rlib" \
+            --extern image="$OUT/libimage_stub.rlib" \
+            "$OUT/matrix/run.rs" -o "$OUT/matrixrun"
+        shift || true
+        exec "$OUT/matrixrun" "${1:-$REPO/google_drive/clients}" ;;
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|gfx|music|material|scene|pck|matrix}" >&2; exit 2 ;;esac

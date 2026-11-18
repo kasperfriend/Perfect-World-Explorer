@@ -401,6 +401,11 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
     if count > 10000 {
         return Err("invalid BSData file count".into());
     }
+    // The name block starts at 0x4c with the *length* of the first name, not
+    // with the name: every entry is `u32 length` then `length` bytes of GBK
+    // path, and 0x4c is where the first of those dwords sits. The paths count
+    // comes from the header at +12, so the block ends after exactly that many
+    // strings and the water records begin there.
     let mut p = 0x4c;
     let mut files = Vec::with_capacity(count);
     for _ in 0..count {
