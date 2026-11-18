@@ -522,7 +522,7 @@ impl NgxCore {
             .filter(|helper| !same_file(helper, path))
             .and_then(|helper| load_module(helper, &[]).ok())
             .map(|(handle, _)| handle);
-        let mut core = Self {
+        let core = Self {
             _handle: handle,
             path: path.to_string_lossy().into_owned(),
             create_feature: unsafe { read_function(exports[1]) },

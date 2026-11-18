@@ -669,7 +669,16 @@ fn pe_version_strings(bytes: &[u8], pe: &goblin::pe::PE) -> (Option<String>, Opt
 ///    by that field.
 pub(crate) fn version_blob<'a>(bytes: &'a [u8], pe: &goblin::pe::PE) -> Option<&'a [u8]> {
     let optional = pe.header.optional_header.as_ref()?;
-    let resource_rva = optional.data_directories.resource_directory.virtual_address;
+    // goblin 0.8 exposes the data directories as `get_resource_table()`, not as
+    // named fields. The entry is `None` when a genuinely empty directory is
+    // present; a zero RVA is the "no resources" case either way.
+    // An absent directory and a present-but-empty one both mean "no version
+    // resource"; only the second is represented as `Some`, so match rather
+    // than `?` to keep them from being conflated with a truncated file.
+    let resource_rva = match optional.data_directories.get_resource_table() {
+        Some(directory) => directory.virtual_address,
+        None => return None,
+    };
     if resource_rva == 0 {
         return None;
     }

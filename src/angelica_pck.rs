@@ -181,7 +181,6 @@ mod tests {
         let dir_at = out.len();
         out.extend_from_slice(&[0u8; 8]); // 8-byte record prefix
         out.extend_from_slice(&stream);
-        let trailer = out.len();
         let mut header = vec![0u8; 280];
         header[0..4].copy_from_slice(&0xa508bdc4u32.to_le_bytes());
         header[4..8].copy_from_slice(&0x20002u32.to_le_bytes());

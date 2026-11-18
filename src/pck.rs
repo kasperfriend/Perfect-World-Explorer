@@ -170,6 +170,8 @@ pub fn read_entries_at(
         .iter()
         .map(|entry| vec![0u8; entry.compressed as usize])
         .collect();
+    // Written only by the DirectStorage path, which exists on Windows alone.
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut direct_storage_done = vec![false; entries.len()];
 
     #[cfg(windows)]

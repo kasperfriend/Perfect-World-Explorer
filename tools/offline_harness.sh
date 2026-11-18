@@ -17,29 +17,36 @@
 #   tools/offline_harness.sh check    type-check the closure (no test code)
 #   tools/offline_harness.sh test     build and run every #[cfg(test)] in it
 #   tools/offline_harness.sh fmt      rustfmt --check the modules CI formats
+#   tools/offline_harness.sh client   build+test the client_detect closure
+#                                     against the REAL goblin/flate2/sha2
 #
 # Everything lands in target/offline/, which .gitignore already excludes.
 #
-# Corrections to what this script used to claim (2026-11-18). The real flate2
-# *can* be built offline: clone flate2 1.0.35, miniz_oxide 0.8.4 (it lives in
-# the `miniz/miniz_oxide` subdirectory of that repository), crc32fast, adler2
-# and cfg-if, then build them in dependency order with
+# The real `flate2`, `goblin` and a correct SHA-256 are built here from pinned
+# sources with plain `rustc`; only `encoding_rs` is a stand-in (its default
+# build pulls multiversion/simdutf8/core_detect, and the GBK table generated
+# from Python's `gbk` codec covers every double-byte sequence the client's text
+# files use).
 #
-#   rustc --crate-type rlib -C opt-level=1 --sysroot <sysroot> \
-#         [--cfg 'feature="…"'] -L target/offline -o libcrate.rlib src/lib.rs
+# Earlier revisions of this script used stand-ins for `goblin` and `sha2` too,
+# and claimed flate2 could not be built offline. Both were wrong, and the
+# consequence was real: the `goblin` shim invented a `resource_directory` field
+# that goblin 0.8.2 does not have, so `cargo check --bins` in CI was the first
+# thing to notice. Build recipes worth remembering:
 #
-# (miniz_oxide needs `--cfg feature="with-alloc"`; flate2 needs
-# `--cfg feature="any_impl"` and `--cfg feature="rust_backend"` plus
-# `--cfg feature="miniz_oxide"`). The earlier E0463/E0460 failures came from
-# omitting `-L` for flate2's own dependencies, not from the sysroot. Once
-# target/offline/libflate2.rlib exists, pass
-# `--extern flate2=…/libflate2.rlib` and the real `crate::pck` is tested
-# instead of the stub.
+#   rustc --crate-type rlib -C opt-level=1 --sysroot <sysroot> -L <out> \
+#         [--cfg 'feature="…"'] -o libcrate.rlib <crate>/src/lib.rs
 #
-# What this still does not do: use the real encoding_rs, whose default build
-# pulls multiversion, simdutf8 and core_detect. The GBK decoder here is
-# generated from Python's `gbk` codec instead, which covers every double-byte
-# sequence the client's text files use.
+#   miniz_oxide  --cfg feature="with-alloc"      (it lives in miniz_oxide/ of
+#                                                 the miniz/miniz_oxide clone)
+#   flate2       --cfg feature="any_impl" --cfg feature="rust_backend"
+#                --cfg feature="miniz_oxide"
+#   scroll       --cfg feature="std" --cfg feature="derive"  (needs the
+#                proc-macro chain: unicode_ident, proc_macro2, quote, syn)
+#   goblin       --cfg feature="std"/"alloc"/"endian_fd"/"pe32"/"pe64"/"archive"
+#
+# `-L <out>` is required for a crate to find its own dependencies; the original
+# E0463/E0460 failures came from omitting it, not from the sysroot.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -107,6 +114,180 @@ with open(sys.argv[1], 'w') as f:
         f.write(",".join(line) + ",\n")
     f.write("];\n")
 PY
+}
+
+# The real `goblin`, `flate2` and `sha2`, built from source with rustc (there is
+# no Cargo here). Stand-ins are what let a `client_detect` type error through to
+# CI: the first version of the offline shim invented a `resource_directory`
+# field that goblin 0.8.2 does not have, and only `cargo check --bins` noticed.
+# Mirroring the real crates is therefore the point of this function.
+real_deps() {
+    if [ ! -d "$DEP/goblin" ]; then
+        mkdir -p "$DEP"
+        git clone -q --depth 1 --branch 0.8.2 https://github.com/m4b/goblin "$DEP/goblin"
+        git clone -q --depth 1 https://github.com/m4b/scroll "$DEP/scroll"
+        git clone -q --depth 1 https://github.com/rust-lang/log "$DEP/log"
+        git clone -q --depth 1 https://github.com/dtolnay/syn "$DEP/syn"
+        git clone -q --depth 1 https://github.com/dtolnay/quote "$DEP/quote"
+        git clone -q --depth 1 https://github.com/dtolnay/proc-macro2 "$DEP/proc_macro2"
+        git clone -q --depth 1 https://github.com/dtolnay/unicode-ident "$DEP/unicode_ident"
+    fi
+    # proc-macro chain, needed because goblin's `scroll` derives with them.
+    [ -f "$OUT/libunicode_ident.rlib" ] || "$RUSTC" --crate-type rlib \
+        --crate-name unicode_ident --edition 2021 --sysroot "$SYSROOT" -C opt-level=1 \
+        "$DEP/unicode_ident/src/lib.rs" -o "$OUT/libunicode_ident.rlib"
+    [ -f "$OUT/libproc_macro2.rlib" ] || "$RUSTC" --crate-type rlib \
+        --crate-name proc_macro2 --edition 2021 --sysroot "$SYSROOT" -C opt-level=1 \
+        --cfg 'feature="proc-macro"' --extern unicode_ident="$OUT/libunicode_ident.rlib" \
+        "$DEP/proc_macro2/src/lib.rs" -o "$OUT/libproc_macro2.rlib"
+    [ -f "$OUT/libquote.rlib" ] || "$RUSTC" --crate-type rlib \
+        --crate-name quote --edition 2021 --sysroot "$SYSROOT" -C opt-level=1 \
+        --cfg 'feature="proc-macro"' -L "$OUT" \
+        --extern proc_macro2="$OUT/libproc_macro2.rlib" \
+        "$DEP/quote/src/lib.rs" -o "$OUT/libquote.rlib"
+    [ -f "$OUT/libsyn.rlib" ] || "$RUSTC" --crate-type rlib \
+        --crate-name syn --edition 2021 --sysroot "$SYSROOT" -C opt-level=1 \
+        --cfg 'feature="derive"' --cfg 'feature="parsing"' --cfg 'feature="printing"' \
+        --cfg 'feature="clone-impls"' --cfg 'feature="proc-macro"' -L "$OUT" \
+        --extern proc_macro2="$OUT/libproc_macro2.rlib" --extern quote="$OUT/libquote.rlib" \
+        --extern unicode_ident="$OUT/libunicode_ident.rlib" \
+        "$DEP/syn/src/lib.rs" -o "$OUT/libsyn.rlib"
+    [ -f "$OUT/libscroll_derive.so" ] || "$RUSTC" --crate-type proc-macro \
+        --crate-name scroll_derive --edition 2021 --sysroot "$SYSROOT" -C opt-level=1 \
+        -L "$OUT" --extern proc_macro2="$OUT/libproc_macro2.rlib" \
+        --extern quote="$OUT/libquote.rlib" --extern syn="$OUT/libsyn.rlib" \
+        "$DEP/scroll/scroll_derive/src/lib.rs" -o "$OUT/libscroll_derive.so"
+    [ -f "$OUT/libscroll.rlib" ] || "$RUSTC" --crate-type rlib --crate-name scroll \
+        --edition 2021 --sysroot "$SYSROOT" -C opt-level=1 \
+        --cfg 'feature="std"' --cfg 'feature="derive"' -L "$OUT" \
+        --extern scroll_derive="$OUT/libscroll_derive.so" \
+        "$DEP/scroll/src/lib.rs" -o "$OUT/libscroll.rlib"
+    [ -f "$OUT/liblog.rlib" ] || "$RUSTC" --crate-type rlib --crate-name log \
+        --edition 2021 --sysroot "$SYSROOT" -C opt-level=1 --cfg 'feature="std"' \
+        "$DEP/log/src/lib.rs" -o "$OUT/liblog.rlib"
+    [ -f "$OUT/libgoblin.rlib" ] || "$RUSTC" --crate-type rlib --crate-name goblin \
+        --edition 2021 --sysroot "$SYSROOT" -C opt-level=1 \
+        --cfg 'feature="std"' --cfg 'feature="alloc"' --cfg 'feature="endian_fd"' \
+        --cfg 'feature="pe32"' --cfg 'feature="pe64"' --cfg 'feature="archive"' \
+        -L "$OUT" --extern scroll="$OUT/libscroll.rlib" --extern log="$OUT/liblog.rlib" \
+        "$DEP/goblin/src/lib.rs" -o "$OUT/libgoblin.rlib"
+    # `sha2` compresses through `digest`/`generic-array`, a lot of transitive
+    # surface for one known-answer test; the stand-in is a correct SHA-256
+    # instead (below), so `hash_reference` stays meaningful.
+    if [ ! -f "$OUT/libsha2.rlib" ]; then
+        cat > "$OUT/sha256_shim.rs" <<'EOF'
+//! `sha2`'s surface for `client_detect`, with a correct SHA-256 underneath, so
+//! the known-answer test is a real check. The shipped build links the crate.
+use std::fmt;
+
+pub trait Digest {
+    type Output: fmt::LowerHex;
+    fn digest(data: &[u8]) -> Self::Output;
+}
+
+pub struct Sha256;
+
+pub struct Output([u8; 32]);
+
+impl fmt::LowerHex for Output {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+const K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
+
+impl Digest for Sha256 {
+    type Output = Output;
+    fn digest(data: &[u8]) -> Output {
+        let mut state: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        let mut message = data.to_vec();
+        let bits = (data.len() as u64) * 8;
+        message.push(0x80);
+        while message.len() % 64 != 56 {
+            message.push(0);
+        }
+        message.extend_from_slice(&bits.to_be_bytes());
+        for block in message.chunks_exact(64) {
+            let mut w = [0u32; 64];
+            for i in 0..16 {
+                w[i] = u32::from_be_bytes([
+                    block[i * 4],
+                    block[i * 4 + 1],
+                    block[i * 4 + 2],
+                    block[i * 4 + 3],
+                ]);
+            }
+            for i in 16..64 {
+                let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+                let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+                w[i] = w[i - 16]
+                    .wrapping_add(s0)
+                    .wrapping_add(w[i - 7])
+                    .wrapping_add(s1);
+            }
+            let mut v = state;
+            for i in 0..64 {
+                let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+                let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
+                let t1 = v[7]
+                    .wrapping_add(s1)
+                    .wrapping_add(ch)
+                    .wrapping_add(K[i])
+                    .wrapping_add(w[i]);
+                let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+                let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+                let t2 = s0.wrapping_add(maj);
+                v[7] = v[6];
+                v[6] = v[5];
+                v[5] = v[4];
+                v[4] = v[3].wrapping_add(t1);
+                v[3] = v[2];
+                v[2] = v[1];
+                v[1] = v[0];
+                v[0] = t1.wrapping_add(t2);
+            }
+            for i in 0..8 {
+                state[i] = state[i].wrapping_add(v[i]);
+            }
+        }
+        let mut out = [0u8; 32];
+        for (i, word) in state.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        Output(out)
+    }
+}
+EOF
+        "$RUSTC" --crate-type rlib --crate-name sha2 --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 "$OUT/sha256_shim.rs" -o "$OUT/libsha2.rlib"
+    fi
+    # The client-detection closure: `client_detect` calls the real `pck` and
+    # `angelica_pck`, so this suite now tests them instead of a stub.
+    mkdir -p "$OUT/cd"
+    cat > "$OUT/cd/harness.rs" <<EOF
+#[path = "$REPO/src/client_detect.rs"]
+pub mod client_detect;
+#[path = "$REPO/src/pck.rs"]
+pub mod pck;
+#[path = "$REPO/src/angelica_pck.rs"]
+pub mod angelica_pck;
+EOF
 }
 
 deps() {
@@ -224,6 +405,7 @@ EOF
         "$RUSTC" --crate-type rlib --crate-name encoding_rs --edition 2021 --sysroot "$SYSROOT" \
             -C opt-level=1 "$OUT/gbk_shim.rs" -o "$OUT/libencoding_rs.rlib"
     fi
+    real_deps
     cat > "$OUT/pck_stub.rs" <<'EOF'
 //! Offline stand-in for `crate::pck`; see the note at the top of the script.
 use std::fs::File;
@@ -304,6 +486,16 @@ case "${1:-test}" in
             $EXT -C opt-level=1 "$OUT/lib.rs" -o "$OUT/gfxtest"
         shift || true
         (cd "$REPO" && exec "$OUT/gfxtest" "$@") ;;
+    client) toolchain; sysroot; deps
+        shift || true
+        "$RUSTC" --test --crate-name cdtest --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 -L "$OUT" \
+            --extern flate2="$OUT/libflate2.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern sha2="$OUT/libsha2.rlib" \
+            --extern goblin="$OUT/libgoblin.rlib" \
+            "$OUT/cd/harness.rs" -o "$OUT/cdtest"
+        (cd "$REPO" && exec "$OUT/cdtest" "$@") ;;
     fmt)   toolchain
         rustfmt --check --edition 2021 \
             "$REPO/src/gfx_player.rs" "$REPO/src/gfx_file.rs" "$REPO/src/gfx_decal.rs" \
@@ -311,5 +503,5 @@ case "${1:-test}" in
             "$REPO/src/gfx_light.rs" "$REPO/src/gfx_owner.rs" "$REPO/src/scene_lights.rs" \
             "$REPO/src/view_settings.rs" "$REPO/src/client_weather.rs" \
             "$REPO/src/sky_transition.rs" "$REPO/src/scene.rs" "$REPO/src/model_dds.rs" "$REPO/src/skin.rs" "$REPO/src/skeleton.rs" "$REPO/src/skeleton_pose.rs" "$REPO/src/skin_pose.rs" "$REPO/src/model_asset.rs" "$REPO/src/model_material.rs" ;;
-    *) echo "usage: $0 {setup|check|test|fmt}" >&2; exit 2 ;;
+    *) echo "usage: $0 {setup|check|test|fmt|client}" >&2; exit 2 ;;
 esac

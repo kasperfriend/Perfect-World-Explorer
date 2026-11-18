@@ -220,6 +220,34 @@ done.
   copied into this branch.
 - **Status:** resolved 2026-11-18 (both PRs closed unmerged; see the addendum).
 
+### Offline harness, corrected (2026-11-18)
+
+`tools/offline_harness.sh` used to stub `flate2` and link hand-written stand-ins
+for `goblin` and `sha2`, and claimed flate2 could not be built offline. Both
+were wrong, and the stand-in cost real time: its `goblin` exposed a
+`resource_directory` field that goblin 0.8.2 does not have
+(`pe/optional_header::DataDirectories` is a 16-slot array with
+`get_resource_table()` accessors), so the offline suite was green while
+`cargo check --locked --bins` failed on `E0609`. Fixes:
+
+- `tools/offline_harness.sh client` builds the **real** `goblin` 0.8.2, the
+  real `flate2` 1.0.35 and a correct SHA-256 from pinned sources with plain
+  `rustc` (the proc-macro chain `unicode_ident → proc_macro2 → quote → syn →
+  scroll_derive → scroll` is required by goblin's `scroll` dependency), and runs
+  the `client_detect` + `pck` + `angelica_pck` suite against them: 27 tests.
+  Only `encoding_rs` stays a stand-in, and the script says why.
+- The header comment now records the working build recipes and the fact that
+  the earlier `E0463`/`E0460` failures came from omitting `-L` for a crate's
+  own dependencies, not from the sysroot.
+- Two latent warnings that would have failed the Windows job under
+  `-D warnings` are gone: `unused_mut` on `src/dlss/loader.rs`'s NGX core and on
+  `src/pck.rs`'s DirectStorage bookkeeping (the latter is Windows-only, so it is
+  now `#[cfg_attr(not(windows), allow(unused_mut))]`), plus an unused `trailer`
+  local in `angelica_pck`'s test fixture.
+
+This is a tooling correction, not a client blocker: it is recorded here because
+"the offline suite is green" was used as evidence, and it was wrong.
+
 ### B-6 addendum (2026-11-18) — client-version scanning
 
 `src/client_detect.rs`, `src/main.rs`, `src/launcher_ui.rs` and
