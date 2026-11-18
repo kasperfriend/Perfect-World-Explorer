@@ -45,6 +45,7 @@ pub struct Settings {
     pub samples: u32,
     pub resolution: u32,
     pub anisotropy: u32,
+    pub relight_baked: bool,
 }
 
 impl Default for Settings {
@@ -61,6 +62,7 @@ impl Default for Settings {
             samples: 1,
             resolution: 50,
             anisotropy: 8,
+            relight_baked: false,
         }
     }
 }
@@ -94,6 +96,7 @@ impl Settings {
                 "bounces" => settings.bounces = number(settings.bounces, 0, 4),
                 "samples" => settings.samples = number(settings.samples, 1, 4),
                 "resolution" => settings.resolution = number(settings.resolution, 25, 100),
+                "relight_baked" => settings.relight_baked = toggle(settings.relight_baked),
                 "anisotropy" => {
                     if let Ok(n @ (1 | 8 | 16)) = value.parse::<u32>() {
                         settings.anisotropy = n;
@@ -107,9 +110,9 @@ impl Settings {
 
     fn encode(self) -> String {
         format!(
-            "# Lighter settings\nmode={}\nlighting={}\nshadows={}\nsoft_sun={}\nreflections={}\ndenoiser={}\nprogressive={}\nbounces={}\nsamples={}\nresolution={}\nanisotropy={}\n",
+            "# Lighter settings\nmode={}\nlighting={}\nshadows={}\nsoft_sun={}\nreflections={}\ndenoiser={}\nprogressive={}\nbounces={}\nsamples={}\nresolution={}\nanisotropy={}\nrelight_baked={}\n",
             self.mode.token(), self.lighting, self.shadows, self.soft_sun, self.reflections, self.denoiser, self.progressive, self.bounces,
-            self.samples, self.resolution, self.anisotropy,
+            self.samples, self.resolution, self.anisotropy, self.relight_baked,
         )
     }
 

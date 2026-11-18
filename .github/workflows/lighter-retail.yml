@@ -36,13 +36,11 @@ jobs:
       - name: Install Linux renderer dependencies
         run: |
           set -euo pipefail
-          missing=()
-          for package in libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxkbcommon-dev mesa-vulkan-drivers; do
-            if ! dpkg -s "$package" >/dev/null 2>&1; then missing+=("$package"); fi
-          done
-          if (( ${#missing[@]} == 0 )); then exit 0; fi
+          # The X11/Wayland loaders are dynamic; this headless path does not
+          # open a window. Avoid touching apt when the runner already has lvp.
+          if find /usr/share/vulkan/icd.d -name '*lvp*' -print -quit | grep -q .; then exit 0; fi
           install() {
-            timeout 120 sudo apt-get -o Acquire::Retries=1 install -y --no-install-recommends "${missing[@]}"
+            timeout 120 sudo apt-get -o Acquire::Retries=1 install -y --no-install-recommends mesa-vulkan-drivers
           }
           install || {
             timeout 180 sudo apt-get -o Acquire::Retries=1 update

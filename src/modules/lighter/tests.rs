@@ -686,6 +686,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_resource_reuse(&mut h);
     exercise_texture_prefix_replacement(&mut h);
     exercise_ray_texture_filter(&mut h);
+    exercise_material_channels(&mut h);
     exercise_chunk_scaling(&mut h);
     if mode == Mode::Software {
         exercise_reprojection_shader(&h);
@@ -817,6 +818,277 @@ fn exercise_ray_texture_filter(h: &mut Harness) {
     );
     h.ray.settings.anisotropy = 8;
     eprintln!("Lighter: brick contrast and red-channel pan range at 1×/8×/16×: {measures:?}");
+}
+
+fn exercise_material_channels(h: &mut Harness) {
+    use textures::Filter;
+    let empty = Builder::default().finish();
+    h.ray.settings.lighting = true;
+    h.ray.settings.shadows = false;
+    h.ray.settings.soft_sun = false;
+    h.ray.settings.reflections = false;
+    h.ray.settings.denoiser = false;
+    h.ray.settings.progressive = false;
+    h.ray.settings.relight_baked = false;
+    h.ray.settings.bounces = 0;
+    h.ray.settings.samples = 1;
+    h.ray.settings.resolution = 100;
+    let mut day = test_frame(Vec3::ZERO, -Vec3::Z, 3);
+    day.sun[3] = 1.;
+    day.sun_color = [0.; 4];
+    day.ambient = [0.4; 4];
+    let mut night = day;
+    night.sun[3] = 0.;
+    night.material_time[0] = 1.;
+    let srgb = |v: f32| ((v + 0.055) / 1.055).powf(2.4);
+    let mut b = Builder::default();
+    let mat = b.surface(
+        Surface::new(0, BAKED | BAKED_COLOR_ONLY, 0., 0.).with_lighting(
+            [0.5, 0., 0., 1.],
+            [0.5; 4],
+            [0.2, 0., 0., 1.],
+        ),
+    );
+    let mut mesh = Mesh::default();
+    for p in [
+        [-2., 2., -2.],
+        [2., 2., -2.],
+        [-2., -2., -2.],
+        [2., -2., -2.],
+    ] {
+        mesh.vertices.push(
+            Vertex::new(p, [0., 0., 1.], [0.; 2])
+                .tint(rgba([0.65, 0., 0., 1.]), rgba([0., 0., 0.28, 1.])),
+        );
+    }
+    mesh.tri([0, 2, 1], mat);
+    mesh.tri([1, 2, 3], mat);
+    b.world_mesh(&mesh).unwrap();
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    assert_radiance(
+        "day BMD vertex bake",
+        h.pixel(day, &empty),
+        [srgb(0.65), 0., 0.],
+    );
+    assert_radiance(
+        "night BMD vertex bake",
+        h.pixel(night, &empty),
+        [0., 0., srgb(0.28)],
+    );
+    h.ray.settings.relight_baked = true;
+    let relit = h.pixel(day, &empty);
+    assert_radiance(
+        "unbaked BMD, authored ambient and emission",
+        relit,
+        [0.30, 0., 0.],
+    );
+    assert_eq!(
+        h.pixel(night, &empty),
+        relit,
+        "baked vertex tint leaked into relighting"
+    );
+    h.ray.settings.relight_baked = false;
+
+    // Neighboring terrain areas. The grass straddles the join; its baked
+    // light uses the area center and clamps the world UV to that tile.
+    let mut bank = Textures::default();
+    let red = bank
+        .tile([1, 1], 1, Filter::Data, |_, _| rgba([0.25, 0., 0., 1.]))
+        .unwrap();
+    let blue = bank
+        .tile([1, 1], 1, Filter::Data, |_, _| rgba([0., 0., 0.35, 1.]))
+        .unwrap();
+    let green = bank
+        .tile([1, 1], 1, Filter::Data, |_, _| rgba([0., 0.5, 0., 1.]))
+        .unwrap();
+    let area = bank.reserve(8).unwrap();
+    let layer = bank.reserve(5).unwrap();
+    bank.write_words(
+        area,
+        &[layer as u32, 1, red, blue, layer as u32, 1, green, green],
+    );
+    bank.write_words(layer, &[0, 0, 1, 1.0f32.to_bits(), 1.0f32.to_bits()]);
+    for frame in [&mut day, &mut night] {
+        frame.options[0] = BAKED_LIGHTMAPS | GRASS_AREA_LIGHTMAPS;
+        frame.options[3] = area as u32;
+        frame.terrain = [8., 4., 1., 4.];
+    }
+    let ground = |h: &mut Harness, flags, x: f32, area: f32| {
+        let mut b = Builder::default();
+        let mesh = upright(&mut b, -1.5, [1.; 4], flags, 0);
+        b.place_grass(mesh, Transform::translation([x, 0., 0.]), [area, 0.])
+            .unwrap();
+        h.ray.install(Ok((b.finish(), bank.clone())));
+    };
+    ground(h, TERRAIN, -1., -1.);
+    // Rebuild the camera matrices as well as the origin.
+    let at = |frame: Frame, eye| {
+        let view = test_frame(Vec3::new(eye, 0., 0.), -Vec3::Z, 3);
+        Frame {
+            vp: view.vp,
+            inv_vp: view.inv_vp,
+            eye: view.eye,
+            ..frame
+        }
+    };
+    assert_radiance(
+        "day terrain pair",
+        h.pixel(at(day, -0.5), &empty),
+        [srgb(0.5), 0., 0.],
+    );
+    assert_radiance(
+        "night terrain pair",
+        h.pixel(at(night, -0.5), &empty),
+        [0., 0., srgb(0.7)],
+    );
+    ground(h, TERRAIN, 1., 1.);
+    assert_radiance(
+        "day-only terrain night fallback",
+        h.pixel(at(night, 0.5), &empty),
+        [0., 1., 0.],
+    );
+    ground(h, GRASS_MATERIAL, 1., -1.);
+    assert_radiance(
+        "grass area-center day",
+        h.pixel(at(day, 0.5), &empty),
+        [srgb(0.5), 0., 0.],
+    );
+    assert_radiance(
+        "grass area-center night",
+        h.pixel(at(night, 0.5), &empty),
+        [0., 0., srgb(0.7)],
+    );
+    ground(h, GRASS_MATERIAL, 1., 1.);
+    assert_radiance(
+        "grass never treats copied day as a night map",
+        h.pixel(at(night, 0.5), &empty),
+        [1.; 3],
+    );
+    h.ray.settings.relight_baked = true;
+    assert_radiance(
+        "relit grass omits baked light",
+        h.pixel(at(night, 0.5), &empty),
+        [0.4; 3],
+    );
+    h.ray.settings.relight_baked = false;
+
+    // Normal map steers the shading normal, not the ray-plane side/depth.
+    let mut bank = Textures::default();
+    let map = bank
+        .tile([1, 1], 1, Filter::Data, |_, _| rgba([0.8, 0.5, 0.9, 1.]))
+        .unwrap();
+    let mut frame = test_frame(Vec3::ZERO, -Vec3::Z, 3);
+    frame.ambient = [0.; 4];
+    frame.sun = [0.6, 0.2, (0.6f32).sqrt(), 1.];
+    frame.sun_color = [1.; 4];
+    let mut probes = Vec::new();
+    for normal_map in [0, map] {
+        let mut b = Builder::default();
+        let mut mat = Surface::new(0, SINGLE_SIDED, 0., 0.);
+        mat.normal_map = normal_map;
+        let mesh = quad_material(
+            &mut b,
+            [
+                [-1., 1., -2.],
+                [1., 1., -2.],
+                [-1., -1., -2.],
+                [1., -1., -2.],
+            ],
+            [0., 0., 1.],
+            mat,
+            u32::MAX,
+        );
+        put(&mut b, mesh);
+        h.ray.install(Ok((b.finish(), bank.clone())));
+        probes.push(h.pixel(frame, &empty));
+        assert_eq!(
+            h.pixel(test_frame(-4. * Vec3::Z, Vec3::Z, 3), &empty).1,
+            0.,
+            "single-sided material kept a back-facing hit"
+        );
+    }
+    assert!(
+        probes[1].0[0] > probes[0].0[0] + 30 && probes[1].1 == probes[0].1,
+        "NRF basis or side incorrect: {probes:?}"
+    );
+
+    // Real posed-skin producer, including its part-specific face overrides.
+    // The body alpha is color data; a transparent base is still opaque.
+    use crate::model_asset::FaceShader;
+    let (mut asset, _) = crate::model_draw_fixture::fixture();
+    asset.skins[0].data.materials[0].diffuse = [1.; 4];
+    let skin = &mut asset.skins[0].data.meshes[0];
+    skin.vertices = [[-2., 2., -3.], [2., 2., -3.], [0., -2., -3.]]
+        .into_iter()
+        .map(|position| crate::skin::Vertex {
+            position,
+            normal: [0., 0., 1.],
+            uv: [0.5; 2],
+            weights: [1., 0., 0., 0.],
+            joints: [0; 4],
+        })
+        .collect();
+    skin.indices = vec![0, 2, 1];
+    h.ray.settings.lighting = false;
+    for (stage, base_alpha, expected) in [
+        (FaceShader::Body { color: 0xffff0000 }, 0, [1.; 3]),
+        (FaceShader::Body { color: 0xffff0000 }, 255, [1., 0., 0.]),
+        (
+            FaceShader::Eye {
+                color: 0xff00ff00,
+                skin_color: 0xffff0000,
+                highlight: "iris".into(),
+            },
+            255,
+            [srgb(127. / 255.), srgb(128. / 255.), 0.],
+        ),
+        (
+            FaceShader::EyeBall {
+                color: 0xffff0000,
+                highlight: "iris".into(),
+            },
+            255,
+            [0., 0., 1.],
+        ),
+    ] {
+        asset.face_shaders.insert((0, 0), stage);
+        let pose = asset.bind_pose(Mat4::IDENTITY).unwrap();
+        let meshes = asset.meshes_from_pose(&pose).unwrap();
+        let mut bank = Textures::default();
+        let mut moving = super::model_feed::Moving::new(&mut bank);
+        moving
+            .model(
+                "walker",
+                1,
+                super::model_feed::Posed {
+                    asset: &asset,
+                    pose: &pose,
+                    meshes: &meshes,
+                    attached: false,
+                },
+                |_| true,
+                &mut |path| {
+                    let rgba = match path {
+                        "iris" => [255, 255, 255, 128],
+                        "textures/face/eyereflect.tga" => [0, 0, 255, 255],
+                        _ => [255, 255, 255, base_alpha],
+                    };
+                    Ok((
+                        vec![image::RgbaImage::from_pixel(1, 1, image::Rgba(rgba))],
+                        true,
+                    ))
+                },
+            )
+            .unwrap();
+        let packet = moving.finish_cached(&mut AccelCache::default()).unwrap();
+        h.ray.install(Ok((Builder::default().finish(), bank)));
+        assert_radiance(
+            "posed skin/eye/body stages",
+            h.pixel(frame, &packet),
+            expected,
+        );
+    }
+    eprintln!("Lighter: both authored bake endpoints, relighting, face stages, sidedness and normal map passed");
 }
 
 fn assert_radiance(label: &str, pixel: ([u8; 4], f32), linear: [f32; 3]) {
@@ -1255,7 +1527,18 @@ fn exercise_temporal_animation(h: &mut Harness) {
     );
 
     let mut b = Builder::default();
-    let sheet = upright(&mut b, -2., [1.; 4], BAKED | BLEND, scroll);
+    let sheet = quad_material(
+        &mut b,
+        [
+            [-1., 1., -2.],
+            [1., 1., -2.],
+            [-1., -1., -2.],
+            [1., -1., -2.],
+        ],
+        [0., 0., 1.],
+        Surface::new(scroll, BAKED | BLEND, 0., 0.).uv_transform([1.; 2], [0., -0.5]),
+        u32::MAX,
+    );
     put(&mut b, sheet);
     h.ray.install(Ok((b.finish(), bank)));
     let mut frame = test_frame(Vec3::ZERO, -Vec3::Z, 9);
@@ -1381,6 +1664,7 @@ fn exercise_streamed_bmds(h: &mut Harness) {
         progressive: false,
         soft_sun: false,
         anisotropy: 8,
+        relight_baked: false,
     };
     let sample = |h: &mut Harness| {
         h.ray.settings.bounces = 0;

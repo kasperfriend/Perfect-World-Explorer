@@ -12,10 +12,12 @@ pub const MASK_SIDE: u32 = 32;
 const AREA_MIPS: u32 = 1;
 const AREA_TOP: u32 = 2;
 const LINEAR_DATA: u32 = 4;
+const ALPHA_IS_DATA: u32 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Filter {
     Color,
+    ColorMask, // RGB is sRGB; alpha controls a shader stage, not coverage.
     Data,
     Alpha,
     // SpeedTree can author a fractional reference with a strict `>` test.
@@ -25,6 +27,14 @@ pub enum Filter {
 impl Filter {
     pub fn cutout(reference: f32, strict: bool) -> Self {
         Self::Cutout(reference.to_bits(), strict)
+    }
+
+    fn storage_flags(self) -> u32 {
+        match self {
+            Self::Data => LINEAR_DATA,
+            Self::ColorMask => ALPHA_IS_DATA,
+            _ => 0,
+        }
     }
 
     fn pixel(self, pixel: u32, tested_area: bool) -> u32 {
@@ -139,12 +149,7 @@ impl Tile {
         }
         let suffix = &levels[start..];
         let ([w, h], _) = suffix[0];
-        let mut words = vec![
-            w,
-            h,
-            suffix.len() as u32,
-            u32::from(filter == Filter::Data) * LINEAR_DATA,
-        ];
+        let mut words = vec![w, h, suffix.len() as u32, filter.storage_flags()];
         words.resize(4 + suffix.len(), 0);
         for (lod, (_, rgba)) in suffix.iter().enumerate() {
             words[4 + lod] = words.len() as u32;
@@ -183,18 +188,20 @@ impl Tile {
         let levels = level_count(dims);
         let cutout = matches!(filter, Filter::Cutout(..));
         let reduced = dims != size;
-        let data = filter == Filter::Data;
+        let storage_flags = filter.storage_flags();
         // [width, height, levels, flags, level-relative offsets..., texels...]
         // Generated cutout mips store tested area. An authored chain never
         // reaches this branch unless no useful authored level fits.
-        let mut flags = u32::from(data) * LINEAR_DATA;
+        let mut flags = storage_flags;
         if cutout {
             flags |= AREA_MIPS | (u32::from(reduced) * AREA_TOP);
         }
         let mut words = vec![dims[0], dims[1], levels, flags];
         words.resize(4 + levels as usize, 0);
         let mut src = dims;
-        let mut pixels = resample(size, dims, data, |x, y| filter.pixel(pixel(x, y), reduced));
+        let mut pixels = resample(size, dims, storage_flags, |x, y| {
+            filter.pixel(pixel(x, y), reduced)
+        });
         for level in 0..levels as usize {
             words[4 + level] = words.len() as u32;
             words.extend_from_slice(&pixels);
@@ -202,7 +209,7 @@ impl Tile {
                 break;
             }
             let dst = extent_at(src, 1);
-            pixels = resample(src, dst, data, |x, y| {
+            pixels = resample(src, dst, storage_flags, |x, y| {
                 let p = pixels[(y as usize * src[0] as usize) + x as usize];
                 if cutout && level == 0 && !reduced {
                     filter.pixel(p, true)
@@ -240,9 +247,11 @@ fn encode_srgb(c: f32) -> f32 {
 fn resample(
     [w, h]: [u32; 2],
     [sw, sh]: [u32; 2],
-    data: bool,
+    flags: u32,
     mut pixel: impl FnMut(u32, u32) -> u32,
 ) -> Vec<u32> {
+    let data = flags & LINEAR_DATA != 0;
+    let associate = flags & (LINEAR_DATA | ALPHA_IS_DATA) == 0;
     let [w, h, sw, sh] = [w, h, sw, sh].map(u64::from);
     let mut out = Vec::with_capacity((sw * sh) as usize);
     if w == sw && h == sh {
@@ -272,7 +281,7 @@ fn resample(
                         sum[i] += if data {
                             f32::from(c[i]) / 255.
                         } else {
-                            lut[c[i] as usize] * a
+                            lut[c[i] as usize] * if associate { a } else { 1. }
                         } * weight;
                     }
                 }
@@ -281,8 +290,8 @@ fn resample(
             for value in &mut sum[..3] {
                 *value = if data {
                     *value / area
-                } else if a > 0. {
-                    encode_srgb(*value / a)
+                } else if !associate || a > 0. {
+                    encode_srgb(*value / if associate { a } else { area })
                 } else {
                     0.
                 };
@@ -451,7 +460,11 @@ impl Textures {
                 self.images(
                     &images,
                     COLOR_SIDE,
-                    if has_alpha { filter } else { Filter::Color },
+                    if has_alpha || filter == Filter::Data {
+                        filter
+                    } else {
+                        Filter::Color
+                    },
                 )?,
                 has_alpha,
             )),
@@ -540,6 +553,20 @@ mod tests {
         assert_eq!(view.mips.fallback, 2);
         assert_eq!(view.missing, 0);
         assert_eq!(bank.mips.fallback, 1);
+    }
+
+    #[test]
+    fn body_color_alpha_is_data_not_transparent_color() {
+        let src = |x, _| {
+            u32::from_le_bytes(if x == 0 {
+                [255, 0, 0, 0]
+            } else {
+                [0, 0, 255, 255]
+            })
+        };
+        let tile = Tile::new([2, 1], 2, Filter::ColorMask, src).unwrap();
+        assert_eq!(tile.0[3], ALPHA_IS_DATA);
+        assert_eq!(tile.0[8].to_le_bytes(), [188, 0, 188, 128]);
     }
 
     #[test]

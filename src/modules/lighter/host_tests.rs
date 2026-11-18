@@ -44,6 +44,14 @@ impl FixtureRoot {
             &root.0.join("building.pck"),
             &[("building/lighter_wall.tga", &wall)],
         );
+        let normals = encode(
+            &image::RgbaImage::from_pixel(1, 1, image::Rgba([128, 128, 255, 255])),
+            image::ImageFormat::Tga,
+        );
+        crate::pck::write_test_archive(
+            &root.0.join("shaders.pck"),
+            &[("shaders/textures/nrf/lighter_wall.tga", &normals)],
+        );
         let bmd = bmd_fixture();
         let mut distant = bmd_header([160., 0., 0.], 1);
         bmd_quad(
@@ -386,6 +394,71 @@ fn fixture(element: &std::path::Path) -> Terrain {
         },
         cloud_surface: None,
         scenery_placements: None,
+    }
+}
+
+#[test]
+fn ray_lightmaps_keep_day_only_and_distinct_night_bindings() {
+    use crate::modules::lighter::textures::Textures;
+    let root = FixtureRoot::new();
+    let t = fixture(&root.0);
+    let material = crate::material::single_layer_fixture(TILE);
+    let write = |ext: &str, color: u16| {
+        let mut dds = vec![0; 128];
+        dds[..4].copy_from_slice(b"DDS ");
+        for (o, v) in [
+            (4, 124u32),
+            (8, 0x81007),
+            (12, 256),
+            (16, 256),
+            (20, 32768),
+            (76, 32),
+            (80, 4),
+            (108, 0x1000),
+        ] {
+            dds[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        dds[84..88].copy_from_slice(b"DXT1");
+        let [lo, hi] = color.to_le_bytes();
+        dds.extend([lo, hi, 0, 0, 0, 0, 0, 0].repeat(4096));
+        let mut lm = vec![0; 88];
+        for (o, v) in [0x54324c4d, 2u32, 16, 256, 1, dds.len() as u32]
+            .into_iter()
+            .enumerate()
+        {
+            lm[o * 4..o * 4 + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for i in 0..16 {
+            let o = 24 + 4 * i;
+            lm[o..o + 4].copy_from_slice(&((88 + (15 - i) * dds.len()) as u32).to_le_bytes());
+            lm.extend_from_slice(&dds);
+        }
+        std::fs::write(root.0.join(format!("fixture.{ext}")), lm).unwrap();
+    };
+    let mut bank = Textures::default();
+    assert!(super::lightmaps::load(&t, &material, &mut bank)
+        .unwrap()
+        .is_empty());
+    write("t2lm", 0xf800);
+    let offsets = super::lightmaps::load(&t, &material, &mut bank).unwrap();
+    assert_eq!(offsets.len(), 16);
+    assert!(offsets.iter().all(|&[d, n]| d != 0 && d == n));
+    write("t2lm1", 0x001f);
+    let mut bank = Textures::default();
+    let offsets = super::lightmaps::load(&t, &material, &mut bank).unwrap();
+    assert!(offsets.iter().all(|&[d, n]| d != 0 && n > d));
+    let words: Vec<u32> = bank
+        .byte_segments()
+        .flat_map(bytemuck::cast_slice::<u8, u32>)
+        .copied()
+        .collect();
+    for (addr, rgba) in [
+        (offsets[0][0], [255, 0, 0, 255]),
+        (offsets[0][1], [0, 0, 255, 255]),
+    ] {
+        let i = addr as usize;
+        assert_eq!(&words[i..i + 2], &[64, 64]);
+        assert_eq!(words[i + words[i + 4] as usize].to_le_bytes(), rgba);
     }
 }
 
@@ -857,8 +930,9 @@ fn lighter_streamed_world_pixels() {
     let packet = &r.lighter.world.as_ref().unwrap().packet.words;
     assert!(
         packet[packet[3] as usize..packet[4] as usize]
-            .chunks_exact(5)
+            .chunks_exact(super::SURFACE_WORDS)
             .any(|m| m[1] & super::BAKED != 0
+                && m[6] != 0 // optional NRF came through the archive-mounted material feed
                 && f32::from_bits(m[4]) == 96.
                 && (f32::from_bits(m[3]) - 0.15).abs() < 1.0e-6),
         "BMD specular material lost in streaming"

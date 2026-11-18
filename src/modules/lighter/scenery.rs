@@ -16,7 +16,7 @@ use crate::{
 };
 use glam::Vec3;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{hash_map::Entry, BTreeMap, HashMap, HashSet},
     sync::{Arc, Weak},
 };
 
@@ -92,7 +92,7 @@ struct Asset {
     block: ChunkId,
     bounds: scene::Bounds,
     mesh: Mesh,
-    surfaces: Vec<(Surface, Option<usize>)>,
+    surfaces: Vec<(Surface, Option<usize>, Option<usize>)>,
     tiles: Vec<(TileKey, Arc<Tile>)>,
     missing: usize,
 }
@@ -141,71 +141,46 @@ impl Asset {
                 part.material.as_ref().is_some_and(|m| m.two_sided),
             )?;
             let mut flags = scene::BAKED | visibility;
-            let tile = if state.stage == Stage::Modulate2x {
-                let scroll = SdrUvAnim::from_texture_path(&part.texture)
-                    .is_some_and(|a| a.tc_scroll[1] < 0.);
-                flags |= if scroll { scene::BLEND } else { scene::CUTOUT };
-                if !scroll && state.cull == Cull::BackFace {
+            let anim = SdrUvAnim::from_texture_path(&part.texture);
+            let mut albedo = None;
+            let mut normal = None;
+            if state.stage == Stage::Modulate2x {
+                let blend = anim.is_some_and(|a| a.tc_scroll[1] < 0.);
+                flags |= if blend { scene::BLEND } else { scene::CUTOUT };
+                if !blend && state.cull == Cull::BackFace {
                     flags |= scene::CULL_BACK;
                 }
-                let filter = if scroll {
+                let filter = if blend {
                     Filter::Alpha
                 } else {
                     Filter::cutout(0.5, false)
                 };
-                match objects.texture_with_key(&part.texture) {
-                    Some((hash, tex)) => {
-                        let key = (hash, filter);
-                        let index = if let Some(&index) = local_tiles.get(&key) {
-                            index
-                        } else {
-                            let tile = if let Some(tile) = tiles.get(&key).and_then(Weak::upgrade) {
-                                tile
-                            } else {
-                                let chain = tex.ray_dds.as_deref().and_then(|raw| {
-                                    crate::model_texture_gpu::decode_for_rays(raw).ok()
-                                });
-                                let tile = Arc::new(match chain {
-                                    Some((images, _)) => Tile::images(&images, COLOR_SIDE, filter)?,
-                                    None => Tile::levels(
-                                        [(
-                                            [tex.width as u32, tex.height as u32],
-                                            tex.rgba.as_slice(),
-                                        )],
-                                        COLOR_SIDE,
-                                        filter,
-                                    )?,
-                                });
-                                tiles.insert(key, Arc::downgrade(&tile));
-                                tile
-                            };
-                            let index = asset.tiles.len();
-                            asset.tiles.push((key, tile));
-                            local_tiles.insert(key, index);
-                            index
-                        };
-                        Some(index)
-                    }
-                    None => {
-                        // Preserve the existing white fallback, but count it.
-                        asset.missing += 1;
-                        None
-                    }
+                if let Some((hash, tex)) = objects.texture_with_key(&part.texture) {
+                    albedo = Some(asset.add_tile(hash, tex, filter, &mut local_tiles, tiles)?);
+                } else {
+                    asset.missing += 1;
+                }
+                if let Some((hash, tex)) = objects.ray_normal_with_key(&part.texture) {
+                    normal =
+                        Some(asset.add_tile(hash, tex, Filter::Data, &mut local_tiles, tiles)?);
                 }
             } else {
+                flags |= scene::BAKED_COLOR_ONLY;
                 if state.cull == Cull::BackFace {
                     flags |= scene::CULL_BACK;
                 }
-                None
-            };
-            let gloss = part
-                .material
-                .as_ref()
-                .map_or_else(Gloss::default, |m| Gloss::authored(m.specular, m.power));
+            }
+            let mut surface = Surface::new(0, flags, 0.5, 0.);
+            if let Some(m) = &part.material {
+                surface = surface
+                    .with_gloss(Gloss::authored(m.specular, m.power))
+                    .with_lighting(m.diffuse, m.ambient, m.emissive);
+            }
+            if let Some(a) = anim {
+                surface = surface.uv_transform(a.tc_scale, a.tc_scroll);
+            }
             let mat = asset.surfaces.len() as u32;
-            asset
-                .surfaces
-                .push((Surface::new(0, flags, 0.5, 0.).with_gloss(gloss), tile));
+            asset.surfaces.push((surface, albedo, normal));
             let base = asset.mesh.vertices.len() as u32;
             for v in &part.vertices {
                 let p = position
@@ -239,6 +214,42 @@ impl Asset {
         Ok((!asset.mesh.triangles.is_empty()).then_some(asset))
     }
 
+    fn add_tile(
+        &mut self,
+        hash: u64,
+        tex: &crate::objects::Texture,
+        filter: Filter,
+        local: &mut HashMap<(u64, Filter), usize>,
+        tiles: &mut HashMap<(u64, Filter), Weak<Tile>>,
+    ) -> Result<usize, String> {
+        let key = (hash, filter);
+        if let Some(&i) = local.get(&key) {
+            return Ok(i);
+        }
+        let tile = if let Some(tile) = tiles.get(&key).and_then(Weak::upgrade) {
+            tile
+        } else {
+            let chain = tex
+                .ray_dds
+                .as_deref()
+                .and_then(|raw| crate::model_texture_gpu::decode_for_rays(raw).ok());
+            let tile = Arc::new(match chain {
+                Some((images, _)) => Tile::images(&images, COLOR_SIDE, filter)?,
+                None => Tile::levels(
+                    [([tex.width as u32, tex.height as u32], tex.rgba.as_slice())],
+                    COLOR_SIDE,
+                    filter,
+                )?,
+            });
+            tiles.insert(key, Arc::downgrade(&tile));
+            tile
+        };
+        let index = self.tiles.len();
+        self.tiles.push((key, tile));
+        local.insert(key, index);
+        Ok(index)
+    }
+
     fn materials(
         &self,
         builder: &mut Builder,
@@ -246,13 +257,18 @@ impl Asset {
         addresses: &mut HashMap<TileKey, u32>,
     ) -> Result<Vec<u32>, String> {
         let mut material_ids = Vec::with_capacity(self.surfaces.len());
-        for &(mut surface, tile) in &self.surfaces {
-            if let Some(i) = tile {
-                let (key, tile) = &self.tiles[i];
-                surface.texture = match addresses.entry(*key) {
-                    std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                    std::collections::hash_map::Entry::Vacant(e) => *e.insert(bank.insert(tile)?),
-                };
+        for &(mut surface, albedo, normal) in &self.surfaces {
+            for (id, dest) in [
+                (albedo, &mut surface.texture),
+                (normal, &mut surface.normal_map),
+            ] {
+                if let Some(index) = id {
+                    let (key, tile) = &self.tiles[index];
+                    *dest = match addresses.entry(*key) {
+                        Entry::Occupied(e) => *e.get(),
+                        Entry::Vacant(e) => *e.insert(bank.insert(tile)?),
+                    };
+                }
             }
             material_ids.push(builder.surface(surface));
         }
@@ -513,7 +529,7 @@ mod tests {
                 block: (0, 0),
                 bounds: scene::Bounds::point(Vec3::ZERO),
                 mesh,
-                surfaces: vec![(Surface::new(0, 0, 0., 0.), Some(0))],
+                surfaces: vec![(Surface::new(0, 0, 0., 0.), Some(0), None)],
                 tiles: vec![((hash, Filter::Color), tile.clone())],
                 missing: 0,
             }

@@ -28,6 +28,10 @@ pub const IGNORE_TEXTURE_ALPHA: u32 = 1 << 15;
 pub const STRICT_ALPHA: u32 = 1 << 16;
 /// The local first-person head is still visible to shadow and bounce rays.
 pub const HIDE_PRIMARY: u32 = 1 << 17;
+pub const SINGLE_SIDED: u32 = 1 << 18;
+pub const GRASS_MATERIAL: u32 = 1 << 19;
+pub const UV_TRANSFORM: u32 = 1 << 20;
+pub const BAKED_COLOR_ONLY: u32 = 1 << 21;
 
 // These bits also occupy the upper eight bits of a Vulkan TLAS instance.
 // A mixed mesh can participate in several queries; its individual triangles
@@ -35,7 +39,7 @@ pub const HIDE_PRIMARY: u32 = 1 << 17;
 pub const MASK_SOLID: u8 = 1;
 pub const MASK_BLEND: u8 = 2;
 pub const MASK_SHADOW: u8 = 4;
-pub const INSTANCE_WORDS: u32 = 11;
+pub const INSTANCE_WORDS: u32 = 13;
 const HEADER_WORDS: usize = 14;
 pub const VERTEX_WORDS: u32 = 8;
 const MAX_ITEMS: usize = 8_000_000;
@@ -91,14 +95,18 @@ pub fn argb_to_rgba(v: u32) -> u32 {
 pub struct Gloss {
     reflectance: f32,
     power: f32,
+    tint: u32,
 }
 
 impl Gloss {
     pub fn authored(specular: [f32; 4], power: f32) -> Self {
-        // Keep Lighter's existing scalar reflectance budget for model skins.
-        let reflectance = specular[..3].iter().map(|v| v.max(0.)).sum::<f32>() / 12.;
+        let rgb = [specular[0], specular[1], specular[2]].map(|v| v.max(0.));
+        let peak = rgb.into_iter().fold(0., f32::max);
+        let reflectance = rgb.iter().sum::<f32>() / 12.;
+        let [r, g, b] = rgb.map(|v| v / peak.max(1e-7));
         Self {
             reflectance: reflectance.min(0.35),
+            tint: rgba([r, g, b, 1.]),
             power: if power.is_finite() {
                 power.clamp(0., 128.)
             } else {
@@ -120,7 +128,18 @@ pub struct Surface {
     cutoff: u32,
     reflectance: u32,
     power: u32,
+    specular_tint: u32,
+    pub normal_map: u32,
+    emission: [u32; 3],
+    ambient: u32,
+    uv_scale: [u32; 2],
+    uv_scroll: [u32; 2],
+    face_stage: [u32; 4], // mode, feature and skin colors, highlight tile
+    face_gloss: u32,
+    diffuse: u32,
 }
+pub const SURFACE_WORDS: usize = std::mem::size_of::<Surface>() / 4;
+const _: () = assert!(SURFACE_WORDS == 21);
 
 impl Surface {
     pub fn new(texture: u32, flags: u32, cutoff: f32, reflectance: f32) -> Self {
@@ -130,6 +149,15 @@ impl Surface {
             cutoff: cutoff.clamp(0., 1.).to_bits(),
             reflectance: reflectance.clamp(0., 1.).to_bits(),
             power: (-1.0f32).to_bits(), // ideal mirror when no authored lobe
+            specular_tint: u32::MAX,
+            normal_map: 0,
+            emission: [0; 3],
+            ambient: u32::MAX,
+            uv_scale: [1.0f32.to_bits(); 2],
+            uv_scroll: [0; 2],
+            face_stage: [0; 4],
+            face_gloss: 0,
+            diffuse: u32::MAX,
         }
     }
 
@@ -137,7 +165,42 @@ impl Surface {
         if gloss.reflective() {
             self.reflectance = gloss.reflectance.to_bits();
             self.power = gloss.power.to_bits();
+            self.specular_tint = gloss.tint;
         }
+        self
+    }
+
+    pub fn with_lighting(
+        mut self,
+        diffuse: [f32; 4],
+        ambient: [f32; 4],
+        emission: [f32; 4],
+    ) -> Self {
+        self.diffuse = rgba(diffuse);
+        self.ambient = rgba(ambient);
+        self.emission = [emission[0], emission[1], emission[2]].map(|v| v.max(0.).to_bits());
+        self
+    }
+
+    pub fn uv_transform(mut self, scale: [f32; 2], velocity: [f32; 2]) -> Self {
+        if scale != [1.; 2] || velocity != [0.; 2] {
+            self.flags |= UV_TRANSFORM;
+            self.uv_scale = scale.map(f32::to_bits);
+            self.uv_scroll = velocity.map(f32::to_bits);
+        }
+        self
+    }
+
+    pub fn face_stage(
+        mut self,
+        mode: u32,
+        tone: u32,
+        skin: u32,
+        highlight: u32,
+        gloss: u32,
+    ) -> Self {
+        self.face_stage = [mode, argb_to_rgba(tone), argb_to_rgba(skin), highlight];
+        self.face_gloss = gloss;
         self
     }
 
@@ -330,6 +393,7 @@ pub struct Instance {
     pub mesh: u32,
     transform: Transform,
     attachment: Option<u32>,
+    grass_area: [f32; 2],
 }
 
 #[repr(C)]
@@ -525,7 +589,7 @@ impl Builder {
         let fixed = (HEADER_WORDS
             + self.vertices.len() * VERTEX_WORDS as usize
             + self.triangles.len() * 5
-            + self.materials.len() * 5
+            + self.materials.len() * SURFACE_WORDS
             + instances * INSTANCE_WORDS as usize
             + self.lights.len() * 8
             + bvh_words)
@@ -644,7 +708,8 @@ impl Builder {
                         | NO_REFRACT
                         | CULL_BACK
                         | WRITE_DEPTH
-                        | HIDE_PRIMARY)
+                        | HIDE_PRIMARY
+                        | SINGLE_SIDED)
                     == 0;
         }
         // Don't leave partial ranges behind if validation rejected this draw.
@@ -693,7 +758,19 @@ impl Builder {
             mesh,
             transform,
             attachment: None,
+            grass_area: [0.; 2],
         });
+        Ok(())
+    }
+
+    pub fn place_grass(
+        &mut self,
+        mesh: u32,
+        transform: Transform,
+        area: [f32; 2],
+    ) -> Result<(), String> {
+        self.place(mesh, transform)?;
+        self.instances.last_mut().unwrap().grass_area = area;
         Ok(())
     }
 
@@ -813,6 +890,8 @@ impl Builder {
                     mesh.bvh.0,
                     mesh.bvh.1,
                     mesh.mask.into(),
+                    inst.grass_area[0].to_bits(),
+                    inst.grass_area[1].to_bits(),
                 ];
                 words
             })

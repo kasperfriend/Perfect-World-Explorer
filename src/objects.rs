@@ -250,11 +250,14 @@ pub struct Objects {
     models: HashMap<String, bmd::Model>,
     cache: TextureCache,
     keep_ray_dds: bool,
+    ray_normals: HashMap<String, String>,
     resolver: TextureResolver,
     /// Scenery archives are optional: an instance map can still show terrain,
     /// water, trees and the models it does have when one package is absent.
     litfile: Option<File>,
     texfile: Option<File>,
+    shaders: Option<File>,
+    shader_entries: HashMap<String, pck::Entry>,
     lit_archive_error: Option<String>,
     lit_archive_entries: usize,
     litmodel_map_id: String,
@@ -342,6 +345,8 @@ fn tex_budget_bytes() -> usize {
         .unwrap_or(DEFAULT_TEX_BUDGET_MIB)
         << 20
 }
+const ARCHIVE_NAMES: [&str; 3] = ["litmodels.pck", "building.pck", "shaders.pck"];
+
 enum PendingTexture {
     Archive {
         mount: usize,
@@ -379,7 +384,33 @@ impl Objects {
     /// distinct authored mip chains even when level zero is identical.
     #[allow(dead_code)] // standalone native survey binaries never set this
     pub fn retain_ray_dds(&mut self) {
+        if self.keep_ray_dds {
+            return;
+        }
         self.keep_ray_dds = true;
+        let path = self.resolver.disk_root().join("shaders.pck");
+        if path.is_file() {
+            let (file, entries, _) = open_optional_archive(&path);
+            if file.is_some() {
+                self.resolver.mount(MountedArchive {
+                    tag: "shaders".into(),
+                    index: entries.keys().cloned().collect(),
+                });
+                self.shaders = file;
+                self.shader_entries = entries;
+            }
+        }
+    }
+
+    fn archives(&self) -> [Option<&File>; 3] {
+        [
+            self.litfile.as_ref(),
+            self.texfile.as_ref(),
+            self.shaders.as_ref(),
+        ]
+    }
+    fn entries(&self) -> [&HashMap<String, pck::Entry>; 3] {
+        [&self.litentries, &self.texentries, &self.shader_entries]
     }
 
     pub fn open<O: Into<Arc<[Ornament]>>>(element: &Path, ornaments: O) -> Result<Self, String> {
@@ -429,9 +460,12 @@ impl Objects {
             models: HashMap::new(),
             cache: TextureCache::new(tex_budget_bytes()),
             keep_ray_dds: false,
+            ray_normals: HashMap::new(),
             resolver,
             litfile,
             texfile,
+            shaders: None,
+            shader_entries: HashMap::new(),
             lit_archive_error,
             lit_archive_entries,
             litmodel_map_id,
@@ -640,22 +674,27 @@ impl Objects {
                     pending.push(job);
                 }
             }
-            // Derived normal-map reference (A3DLitMesh::LoadTexture step
-            // 4). The client tolerates every failure here (a missing file
-            // inside A3DTexture::Load returns TRUE), and this renderer
-            // has no normal-map consumer, so the derivation is resolved
-            // and counted but never decoded.
+            // The native survey still counts the tolerant NRF lookup. A ray
+            // scene may also need the actual normal pixels when relighting.
             if let Some((nrf, used_default)) = self.resolver.resolve_nrf(&raw) {
-                if matches!(nrf, Resolution::Missing { .. }) {
-                    self.register(
+                match nrf {
+                    Resolution::Missing { .. } => self.register(
                         &raw,
-                        if used_default {
-                            "nrf-default-missing"
-                        } else {
-                            "nrf-derived-missing"
-                        },
+                        if used_default { "nrf-default-missing" } else { "nrf-derived-missing" },
                         "derived normal-map reference resolves nowhere; client tolerates (A3DTexture::Load returns TRUE on open failure, 0x78a440)",
-                    );
+                    ),
+                    Resolution::Archive { mount, key } if self.keep_ray_dds => {
+                        self.ray_normals.insert(normalize(&raw), key.clone());
+                        if self.cache.contains(&key) { self.cache.touch(&key); }
+                        else if queued_keys.insert(key.clone()) { pending.push(PendingTexture::Archive { mount, key }); }
+                    }
+                    Resolution::Disk { path } if self.keep_ray_dds => {
+                        let key = normalize(&format!("@nrf/{}", path.display()));
+                        self.ray_normals.insert(normalize(&raw), key.clone());
+                        if self.cache.contains(&key) { self.cache.touch(&key); }
+                        else if queued_keys.insert(key.clone()) { pending.push(PendingTexture::Disk { key, path }); }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -677,11 +716,11 @@ impl Objects {
             for job in pending {
                 match job {
                     PendingTexture::Archive { mount, key } => {
-                        let entry = if mount == 0 {
-                            self.litentries.get(&key).cloned()
-                        } else {
-                            self.texentries.get(&key).cloned()
-                        };
+                        let entry = self
+                            .entries()
+                            .get(mount)
+                            .and_then(|map| map.get(&key))
+                            .cloned();
                         let entry =
                             entry.ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
                         jobs.push(ResolvedJob::Archive { key, mount, entry });
@@ -704,8 +743,7 @@ impl Objects {
             let workers = workers.min(jobs.len());
             let chunk_size = (jobs.len() + workers - 1) / workers;
             let decoded: Vec<Vec<(String, Result<Texture, String>)>> = {
-                let litfile = self.litfile.as_ref();
-                let texfile = self.texfile.as_ref();
+                let archives = self.archives();
                 let keep_ray_dds = self.keep_ray_dds;
                 std::thread::scope(|s| {
                     let handles: Vec<_> = jobs
@@ -714,32 +752,26 @@ impl Objects {
                             s.spawn(move || {
                                 let mut out = Vec::with_capacity(chunk.len());
                                 for jobs_batch in chunk.chunks(16) {
-                                    let mut lit_jobs: Vec<(String, pck::Entry)> = Vec::new();
-                                    let mut tex_jobs: Vec<(String, pck::Entry)> = Vec::new();
+                                    let mut archive_jobs: [Vec<(String, pck::Entry)>; 3] =
+                                        std::array::from_fn(|_| Vec::new());
                                     for job in jobs_batch {
                                         if let ResolvedJob::Archive { key, mount, entry } = job {
-                                            let file = if *mount == 0 { litfile } else { texfile };
-                                            if file.is_none() {
-                                                let archive = if *mount == 0 {
-                                                    "litmodels.pck"
-                                                } else {
-                                                    "building.pck"
-                                                };
+                                            if archives[*mount].is_some() {
+                                                archive_jobs[*mount]
+                                                    .push((key.clone(), entry.clone()));
+                                            } else {
                                                 out.push((
                                                     key.clone(),
                                                     Err(format!(
-                                                        "scenery archive {archive} unavailable"
+                                                        "scenery archive {} unavailable",
+                                                        ARCHIVE_NAMES[*mount]
                                                     )),
                                                 ));
-                                            } else if *mount == 0 {
-                                                lit_jobs.push((key.clone(), entry.clone()));
-                                            } else {
-                                                tex_jobs.push((key.clone(), entry.clone()));
                                             }
                                         }
                                     }
                                     for (file, archive_jobs) in
-                                        [(litfile, lit_jobs), (texfile, tex_jobs)]
+                                        archives.into_iter().zip(archive_jobs)
                                     {
                                         let Some(file) = file else { continue };
                                         if archive_jobs.is_empty() {
@@ -922,17 +954,8 @@ impl Objects {
                 None
             }
             Resolution::Archive { mount, key } => {
-                let archive = if mount == 0 {
-                    "litmodels.pck"
-                } else {
-                    "building.pck"
-                };
-                let available = if mount == 0 {
-                    self.litfile.is_some()
-                } else {
-                    self.texfile.is_some()
-                };
-                if !available {
+                let archive = ARCHIVE_NAMES[mount];
+                if self.archives()[mount].is_none() {
                     self.register(
                         raw,
                         "texture-load-failed",
@@ -956,29 +979,14 @@ impl Objects {
         }
     }
     fn load_from_archive(&mut self, mount: usize, key: &str) -> Result<(), String> {
-        let data = if mount == 0 {
-            let entry = self
-                .litentries
-                .get(key)
-                .cloned()
-                .ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
-            let file = self
-                .litfile
-                .as_mut()
-                .ok_or_else(|| "litmodels.pck unavailable".to_string())?;
-            pck::read_entry(file, &entry)?
-        } else {
-            let entry = self
-                .texentries
-                .get(key)
-                .cloned()
-                .ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
-            let file = self
-                .texfile
-                .as_mut()
-                .ok_or_else(|| "building.pck unavailable".to_string())?;
-            pck::read_entry(file, &entry)?
-        };
+        let entry = self.entries()[mount]
+            .get(key)
+            .cloned()
+            .ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
+        let file = [&mut self.litfile, &mut self.texfile, &mut self.shaders][mount]
+            .as_mut()
+            .ok_or_else(|| format!("{} unavailable", ARCHIVE_NAMES[mount]))?;
+        let data = pck::read_entry(file, &entry)?;
         self.decode_and_store(key, data)
     }
     fn decode_and_store(&mut self, key: &str, data: Vec<u8>) -> Result<(), String> {
@@ -1031,6 +1039,11 @@ impl Objects {
     }
     pub fn texture_with_key(&self, path: &str) -> Option<(u64, &Texture)> {
         self.cache.get_with_key(&normalize(path))
+    }
+    #[allow(dead_code)] // standalone archive surveys do not shade materials
+    pub(crate) fn ray_normal_with_key(&self, base: &str) -> Option<(u64, &Texture)> {
+        self.cache
+            .get_with_key(self.ray_normals.get(&normalize(base))?)
     }
     /// Content key of a resolved texture, for cross-name deduplication in
     /// downstream packers. `None` when the reference did not resolve to

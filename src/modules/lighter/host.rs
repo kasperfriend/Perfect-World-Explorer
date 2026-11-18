@@ -14,6 +14,8 @@ use crate::{material::Materials, world_models_gpu, Terrain};
 use glam::{Mat4, Vec3};
 use std::{collections::HashMap, sync::Arc};
 
+#[path = "lightmaps.rs"]
+mod lightmaps;
 #[path = "scenery.rs"]
 mod scenery;
 #[path = "terrain_fidelity.rs"]
@@ -27,6 +29,7 @@ pub(super) struct Feed {
     // streamed scene; eviction doesn't leave stale material addresses.
     base: Textures,
     terrain_ids: Vec<u32>,
+    lightmaps: Vec<[u32; 2]>,
     static_lights: Vec<Light>,
     mask_bank: Option<Textures>,
     terrain: [f32; 4],
@@ -91,6 +94,9 @@ impl Feed {
                     Filter::Color,
                 )?)?,
             );
+        }
+        if std::env::var_os("PW_TEST_NO_LIGHTMAPS").is_none() {
+            result.lightmaps = lightmaps::load(t, &upload.materials, &mut result.base)?;
         }
         result.sky = match lighter::sky::Sky::load(&t.element, &mut result.base) {
             Ok(sky) => sky,
@@ -168,12 +174,13 @@ impl Feed {
 
     fn terrain_masks(&mut self, material: &Materials) -> Result<(), String> {
         let mut textures = self.base.fork_prefix();
-        let table = textures.reserve(material.areas.len() * 2)?;
+        let table = textures.reserve(material.areas.len() * 4)?;
         for (area, record) in material.areas.iter().enumerate() {
             let offset = textures.reserve(record.layers.len() * 5)?;
+            let [day, night] = self.lightmaps.get(area).copied().unwrap_or_default();
             textures.write_words(
-                table + area * 2,
-                &[offset as u32, record.layers.len() as u32],
+                table + area * 4,
+                &[offset as u32, record.layers.len() as u32, day, night],
             );
             for (k, l) in record.layers.iter().enumerate() {
                 let color = *self
@@ -446,12 +453,12 @@ impl Feed {
                 };
                 mesh.tri(
                     [tri[0] - low, tri[1] - low, tri[2] - low],
-                    builder.surface(Surface::new(texture, CUTOUT, alpha, 0.)),
+                    builder.surface(Surface::new(texture, CUTOUT | GRASS_MATERIAL, alpha, 0.)),
                 );
             }
             if let Some(id) = builder.mesh(&mesh)? {
                 for v in &instances[batch.instances.start as usize..batch.instances.end as usize] {
-                    builder.place(
+                    builder.place_grass(
                         id,
                         Transform {
                             position: [v[0], v[1], v[2]],
@@ -459,6 +466,7 @@ impl Feed {
                             cos: v[4],
                             sin: -v[5],
                         },
+                        [v[8], v[9]],
                     )?;
                     grass.loaded += 1;
                 }
@@ -549,6 +557,14 @@ impl Feed {
                     lighter::UNDERWATER
                 } else {
                     0
+                } | if camera.terrain_lightmaps {
+                    lighter::BAKED_LIGHTMAPS
+                } else {
+                    0
+                } | if camera.area_grass_lightmaps {
+                    lighter::GRASS_AREA_LIGHTMAPS
+                } else {
+                    0
                 },
                 0,
                 0,
@@ -567,6 +583,7 @@ impl Feed {
             sun_disc: disc(f.sky_sun),
             moon_disc: disc(f.sky_moon),
             sampling: [0; 4],
+            material_time: [f.fog_range[3], 0., 0., 0.],
         }
     }
 }

@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     gfx_player::EffectQuad,
-    model_asset::{ModelAsset, PosedMesh},
+    model_asset::{FaceShader, ModelAsset, PosedMesh},
     skeleton_pose::{self, Pose},
 };
 
@@ -87,12 +87,20 @@ impl<'a> Moving<'a> {
             } else {
                 0
             };
+            if !part.material.two_sided {
+                flags |= SINGLE_SIDED;
+            }
             if !primary_visible(part.skin) {
                 flags |= HIDE_PRIMARY;
             }
-            let filter = if part.diffuse_alpha_only {
+            let body = matches!(part.face_shader, Some(FaceShader::Body { .. }));
+            let filter = if body || part.diffuse_alpha_only {
                 flags |= IGNORE_TEXTURE_ALPHA;
-                Filter::Color
+                if body {
+                    Filter::ColorMask
+                } else {
+                    Filter::Color
+                }
             } else if flags & BLEND != 0 {
                 Filter::Alpha
             } else {
@@ -111,14 +119,52 @@ impl<'a> Moving<'a> {
             let tint = argb_to_rgba(part.color)
                 .to_le_bytes()
                 .map(|b| f32::from(b) / 255.);
-            let tint = rgba([tint[0] * d[0], tint[1] * d[1], tint[2] * d[2], d[3]]);
+            let tint = rgba([tint[0], tint[1], tint[2], d[3]]);
             let gloss = Gloss::authored(part.material.specular, part.material.power);
             if alpha && flags & (BLEND | IGNORE_TEXTURE_ALPHA) == 0 {
                 flags |= CUTOUT;
             }
-            let id = self
-                .builder
-                .surface(Surface::new(texture, flags, 0.5, 0.).with_gloss(gloss));
+            let mut surface = Surface::new(texture, flags, 0.5, 0.)
+                .with_gloss(gloss)
+                .with_lighting(d, part.material.ambient, part.material.emissive);
+            if let Some(stage) = part.face_shader {
+                let mut load_stage = |name, fallback| -> Result<u32, String> {
+                    let loaded = self
+                        .textures
+                        .archive(namespace, name, Filter::Alpha, decode)?;
+                    counts.texture_fallback += usize::from(loaded.is_none());
+                    Ok(loaded.map_or(fallback, |(addr, _)| addr))
+                };
+                let hi = if let Some(name) = stage.highlight() {
+                    load_stage(name, 0)?
+                } else {
+                    0
+                };
+                let gloss = if let Some(name) = stage.gloss() {
+                    load_stage(name, 0)?
+                } else {
+                    0
+                };
+                let (mode, tone, skin) = match stage {
+                    FaceShader::Face { color } => (1, *color, 0),
+                    FaceShader::Body { color } => (2, *color, 0),
+                    FaceShader::EyeBall { color, .. } => (3, *color, 0),
+                    FaceShader::Brow {
+                        color, skin_color, ..
+                    }
+                    | FaceShader::Eye {
+                        color, skin_color, ..
+                    }
+                    | FaceShader::Mouth {
+                        color, skin_color, ..
+                    }
+                    | FaceShader::Moustache {
+                        color, skin_color, ..
+                    } => (4, *color, *skin_color),
+                };
+                surface = surface.face_stage(mode, tone, skin, hi, gloss);
+            }
+            let id = self.builder.surface(surface);
             let source = &asset.skins[part.skin].data.meshes[part.mesh];
             if let Some(placement) = source
                 .rigid_bone

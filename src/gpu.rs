@@ -7993,6 +7993,13 @@ fn preview_frame(
         mode,
         ..LighterSettings::default()
     };
+    if let Ok(value) = std::env::var("PW_PREVIEW_RELIGHT_BAKED") {
+        lighter_settings.relight_baked = match value.as_str() {
+            "0" => false,
+            "1" => true,
+            _ => return Err("PW_PREVIEW_RELIGHT_BAKED must be 0 or 1".into()),
+        };
+    }
     if let Ok(value) = std::env::var("PW_PREVIEW_ANISOTROPY") {
         lighter_settings.anisotropy = value
             .parse::<u32>()
@@ -8115,6 +8122,9 @@ fn preview_frame(
             cam.time_of_day = h.clamp(0., 24.);
         }
     }
+    cam.terrain_day_night = crate::terrain_shading::viewer_day_night_factor(
+        crate::environment::daylight(cam.time_of_day),
+    );
     cam.underwater_fog = t
         .environments
         .underwater(cam.pos.to_array(), cam.time_of_day);

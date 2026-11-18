@@ -69,6 +69,7 @@ pub struct Frame {
     pub sun_disc: [f32; 4],
     pub moon_disc: [f32; 4],
     pub sampling: [u32; 4],
+    pub material_time: [f32; 4], // terrain night weight, reserved
 }
 
 // Matches Pixel in pixels.wgsl. Includes padding-free guide storage.
@@ -90,6 +91,9 @@ pub const UNDERWATER: u32 = 32;
 const SOFT_SUN: u32 = 64;
 const ANISO_WIDE: u32 = 128;
 const ANISO_ISOTROPIC: u32 = 256;
+pub const BAKED_LIGHTMAPS: u32 = 512;
+pub const GRASS_AREA_LIGHTMAPS: u32 = 1024;
+const RELIGHT_BAKED: u32 = 2048;
 
 pub(crate) fn storage_limit(device: &wgpu::Device) -> usize {
     let limits = device.limits();
@@ -870,6 +874,11 @@ impl Lighter {
             | u32::from(self.settings.shadows) << 1
             | u32::from(self.settings.reflections) << 2
             | if self.settings.soft_sun { SOFT_SUN } else { 0 }
+            | if self.settings.relight_baked {
+                RELIGHT_BAKED
+            } else {
+                0
+            }
             | match self.settings.anisotropy {
                 16 => ANISO_WIDE,
                 1 => ANISO_ISOTROPIC,
@@ -1015,6 +1024,8 @@ impl Lighter {
             })
             .response
             .on_hover_text("1× uses isotropic trilinear filtering. 8× and 16× retain more detail along grazing surfaces.");
+        ui.checkbox(&mut self.settings.relight_baked, "Relight baked scenery")
+            .on_hover_text("Use authored reflectance rather than baked building vertex light or terrain/grass lightmaps. Ray lighting replaces the bake; the two are not multiplied together.");
         if self.settings != old {
             self.reset_history();
             self.persistence_error = self.settings.save().err();
