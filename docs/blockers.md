@@ -218,7 +218,7 @@ done.
   and does not pretend its vendor SDKs either — this is the SDK-integration
   follow-up to #37, not a duplicate of it. Nothing from #38 or #37 was
   copied into this branch.
-- **Status:** open (PRs must be rebased/merged in order by the maintainer).
+- **Status:** resolved 2026-11-18 (both PRs closed unmerged; see the addendum).
 
 ### B-6 addendum (2026-11-18) — client-version scanning
 
@@ -227,13 +227,19 @@ done.
 `(elements.data, tasks.data)` data-version pair, every `.pck` container version).
 PR **#38** touches `src/client_detect.rs`, `README.md`,
 `Findings/Unsupported-client-paths.md`, `src/main.rs` and
-`src/windows_setup.rs` as well, so the overlap is now five files rather than
-four. All of it is non-algorithmic: #38 edits the Teleport-List/world-selection
-text and its own README section, while this work edits the "Client version
-scanning" section, the data rows of the launcher card and the `--diagnose-client`
-printer. `src/modules/librarian/{elements,database,mod}.rs`,
+`src/windows_setup.rs` as well, so while it was open the overlap was five files
+rather than four. All of it is non-algorithmic: #38 edits the
+Teleport-List/world-selection text and its own README section, while this work
+edits the "Client version scanning" section, the data rows of the launcher card
+and the `--diagnose-client` printer.
+`src/modules/librarian/{elements,database,mod}.rs`,
 `src/modules/designer/catalog.rs` and `src/bin/client-check.rs` are not touched
 by #38.
+
+**Re-checked 2026-11-18:** **#37 and #38 are both closed without being merged**
+(`mergedAt: null`). B-6 is therefore resolved for this branch — nothing is left
+to rebase against, and none of their code is present here. If either is
+reopened, the overlap above is what to expect again.
 
 ## B-7 — Frame pacing / UI input rate (Phase 4.21)
 
