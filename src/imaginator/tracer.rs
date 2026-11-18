@@ -416,7 +416,15 @@ impl Tracer {
         // reflects 3% of what a mirror would, and now says so.
         let reflectivity = self.specular(hit);
         let mut reflection = V3::ZERO;
-        if options.reflections && reflectivity > 0. {
+        // Below this, the mirror term cannot be seen: it adds a few percent of
+        // the sky to a pixel that already has the sky in the frame. Terrain is
+        // 0.03 and vegetation 0.01, so on a world-sized capture almost every
+        // pixel was paying a *full BVH traversal* - the single most expensive
+        // thing in this loop - to add light nobody can see. That is a large part
+        // of why the software tracer took seconds per frame. Water (0.85) and
+        // wet slopes stay well above it.
+        const VISIBLE_REFLECTANCE: f32 = 0.08;
+        if options.reflections && reflectivity >= VISIBLE_REFLECTANCE {
             let view = ray.direction;
             let cos_i = normal.dot(-view);
             if cos_i > 0. {
@@ -462,8 +470,20 @@ impl Tracer {
         sample
     }
 
+    /// How far a ray is allowed to travel before it is treated as having
+    /// escaped.
+    ///
+    /// This used to be twice the fog distance, which on a clear day with a far
+    /// fog is the whole world: every shadow and bounce ray then walked the
+    /// entire capture. Past the fog distance nothing survives to the eye - the
+    /// fog term has already faded it to the fog colour - so tracing a hit out
+    /// there is pure cost. One fog distance is the honest limit, with a floor so
+    /// a short fog range does not cut visible geometry.
     fn scene_limit(&self) -> f32 {
-        self.environment.fog_distance.max(1000.) * 2.0
+        let fog = self.environment.fog_distance.max(1000.);
+        // Raster fog is exponential, so at 1.5x the "end" distance a surface is
+        // already within a couple of percent of the fog colour.
+        (fog * 1.5).clamp(1000., 20000.)
     }
 
     fn shading_normal(&self, hit: Hit, ray: &Ray) -> V3 {

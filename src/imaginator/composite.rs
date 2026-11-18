@@ -336,12 +336,27 @@ impl Composite {
             self.ensure_target(device, extent.0, extent.1, frame.0, frame.1);
         }
         let Some(target) = &self.target else { return };
-        // A result whose extent no longer matches the target is stale (the window
-        // was resized between the request and the answer). Dropping it is right:
-        // the next frame asks for the new size.
+        // The traced texture has to be exactly the size of the result it holds.
+        //
+        // This used to *drop* any result whose extent differed from the target,
+        // on the assumption that a mismatch meant the window had been resized
+        // and the next frame would ask again. That is no longer true, and the
+        // assumption is what would have made the software tracer's adaptive
+        // scale produce no picture at all: the worker picks its own extent from
+        // its time budget, so a size change is normal and the result is the
+        // freshest thing available. Resizing to it keeps the sample aligned with
+        // the composite's UV mapping - the composite maps the traced image across
+        // the whole frame by `uv`, so any traced size upscales correctly, which
+        // is exactly what made a variable extent safe to adopt.
         if (target.width, target.height) != extent {
-            return;
+            let frame = self.frame_extent;
+            self.ensure_target(device, extent.0, extent.1, frame.0, frame.1);
+            let Some(resized) = &self.target else { return };
+            if (resized.width, resized.height) != extent {
+                return;
+            }
         }
+        let Some(target) = &self.target else { return };
         if packed.len() < (extent.0 as usize * extent.1 as usize * 4) {
             return;
         }
@@ -461,7 +476,21 @@ impl Composite {
         if width == 0 || height == 0 {
             return Err("the frame has no extent".into());
         }
-        let (tw, th) = gpu::traced_extent(width, height, settings.trace_scale);
+        // The traced extent depends on who produced it. The GPU path traces
+        // exactly `trace_scale` of the frame, so the target is sized from the
+        // settings. The software worker measures itself and picks its own extent
+        // to fit a frame-time budget, so *it* owns the traced size: resizing the
+        // target back to `trace_scale` every frame would discard the adaptive
+        // result that `upload_software` just wrote. Keep whatever is there and
+        // only allocate when nothing has been yet.
+        let (tw, th) = match source {
+            TraceSource::Software => self
+                .target
+                .as_ref()
+                .map(|t| (t.width, t.height))
+                .unwrap_or_else(|| gpu::traced_extent(width, height, settings.trace_scale)),
+            _ => gpu::traced_extent(width, height, settings.trace_scale),
+        };
         self.frame_extent = (width, height);
         self.ensure_target(device, tw, th, width, height);
         let Some(buffers) = self.scene.as_ref() else {

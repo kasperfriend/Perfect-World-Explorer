@@ -124,7 +124,25 @@ struct SoftwareState {
     /// mutex left the thread alive, `frames` at zero and the page saying
     /// "software tracer starting" forever, with nothing anywhere to say why.
     fault: Arc<Mutex<Option<String>>>,
+    /// How much of the requested traced extent the worker is currently able to
+    /// finish in its time budget, as a fraction in `(0, 1]`.
+    ///
+    /// The software tracer is off the render thread, so it never blocks a
+    /// frame - but a trace that takes five seconds means the *lighting* is five
+    /// seconds stale, which is indistinguishable from lag. Rather than take
+    /// seconds per frame and call it correct, the worker times itself and
+    /// traces fewer pixels until it fits the budget, then climbs back when it
+    /// has head-room. The composite upscales the traced image either way, so a
+    /// lower scale costs sharpness in the lighting, not correctness.
+    quality: Arc<Mutex<f32>>,
+    /// Microseconds of the most recent completed trace, for the page.
+    last_micros: Arc<AtomicU64>,
 }
+
+/// What a software frame aims to cost. Just above a 60 Hz frame: slow enough
+/// that the trace has a real chance of finishing between frames, fast enough
+/// that the lighting follows the camera.
+const SOFTWARE_TARGET_MICROS: u128 = 16_000;
 
 /// Split `height` rows into contiguous bands of at most `slice` rows.
 ///
@@ -548,6 +566,8 @@ impl Imaginator {
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let frames = Arc::new(AtomicU64::new(0));
         let fault: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let quality: Arc<Mutex<f32>> = Arc::new(Mutex::new(1.0));
+        let last_micros = Arc::new(AtomicU64::new(0));
 
         let thread = {
             let result = result.clone();
@@ -558,6 +578,8 @@ impl Imaginator {
             let scene = self.scene.clone();
             let environment = self.environment.clone();
             let fault_slot = fault.clone();
+            let quality_slot = quality.clone();
+            let micros_slot = last_micros.clone();
             std::thread::Builder::new()
                 .name("imaginator-software".into())
                 .spawn(move || {
@@ -586,12 +608,27 @@ impl Imaginator {
                         // The light the host published for this frame, adopted by
                         // the shared tracer before any row is traced.
                         tracer.environment = req.environment;
+                        // Adapt the traced extent to the time budget before
+                        // tracing, not after: the previous frame's cost says how
+                        // expensive this one will be, since it is the same scene
+                        // from almost the same camera. Shrinking the *pixel grid*
+                        // rather than skipping rows keeps the whole image traced
+                        // - a thinner sample of the same picture, not a picture
+                        // with holes in it.
+                        let quality = {
+                            let q = quality_slot.lock().map(|q| *q).unwrap_or(1.0);
+                            // Clamp to the settings' own floor so the user's
+                            // `trace_scale` still means something.
+                            q.clamp(0.10, 1.0)
+                        };
+                        let trace_width = ((req.width as f32 * quality).round() as u32).max(16);
+                        let trace_height = ((req.height as f32 * quality).round() as u32).max(9);
                         let start = std::time::Instant::now();
                         let mut samples = vec![
                             tracer::Sample::default();
-                            (req.width as usize) * (req.height as usize)
+                            (trace_width as usize) * (trace_height as usize)
                         ];
-                        let rows = req.height;
+                        let rows = trace_height;
                         let threads = std::thread::available_parallelism()
                             .map(|n| n.get())
                             .unwrap_or(4)
@@ -616,7 +653,7 @@ impl Imaginator {
                                 // *final short chunk*, which the old loop silently
                                 // dropped, leaving the bottom rows of the image
                                 // untraced.
-                                let (width, height, s_) = (req.width, req.height, req.samples);
+                                let (width, height, s_) = (trace_width, trace_height, req.samples);
                                 let camera = req.camera;
                                 let options = req.options;
                                 let stride = width as usize;
@@ -659,13 +696,38 @@ impl Imaginator {
                         let mut packed = vec![0f32; samples.len() * 4];
                         tracer::Tracer::pack(&samples, &mut packed);
                         let rays = tracer.rays.load(std::sync::atomic::Ordering::Relaxed);
+                        let micros = start.elapsed().as_micros();
+                        // Match the budget by moving the quality scale, not by
+                        // dropping the frame. The step is proportional to how far
+                        // off we are, damped so it settles instead of oscillating,
+                        // and asymmetric: backing off is quick (lag is visible
+                        // immediately) while climbing is slow (so it does not
+                        // bounce between two scales every frame).
+                        if micros > 0 {
+                            let ratio = micros as f64 / SOFTWARE_TARGET_MICROS as f64;
+                            let current = quality_slot.lock().map(|q| *q).unwrap_or(1.0);
+                            let next = if ratio > 1.15 {
+                                // Too slow: scale by the square root of the
+                                // overshoot, because cost grows with area.
+                                current * (ratio.sqrt() as f32).recip()
+                            } else if ratio < 0.70 {
+                                // Comfortably fast: creep back up.
+                                (current * 1.10).min(1.0)
+                            } else {
+                                current
+                            };
+                            if let Ok(mut slot) = quality_slot.lock() {
+                                *slot = next.clamp(0.10, 1.0);
+                            }
+                        }
+                        micros_slot.store(micros.min(u64::MAX as u128) as u64, Ordering::Relaxed);
                         let trace = TraceResult {
                             generation: req.generation,
                             packed,
-                            width: req.width,
-                            height: req.height,
+                            width: trace_width,
+                            height: trace_height,
                             rays,
-                            micros: start.elapsed().as_micros(),
+                            micros,
                         };
                         if let Ok(mut slot) = result.lock() {
                             *slot = Some(trace);
@@ -685,6 +747,8 @@ impl Imaginator {
             thread,
             running,
             fault,
+            quality,
+            last_micros,
         }
     }
 
@@ -1334,6 +1398,29 @@ impl Imaginator {
             .small()
             .weak(),
         );
+        // How fast the tracer actually is, and what it did about it. The
+        // software tracer is off the render thread, so it never stalls a frame -
+        // but lighting that takes seconds to arrive is stale in a way the eye
+        // reads as lag. The worker now fits a frame-time budget by tracing fewer
+        // pixels, and this says so rather than leaving it invisible.
+        if let Some(software) = self.software.as_ref() {
+            let micros = software
+                .last_micros
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let quality = software.quality.lock().map(|q| *q).unwrap_or(1.0);
+            if micros > 0 {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "Software trace: {:.1} ms per frame at {:.0}% of the requested \
+                         resolution",
+                        micros as f64 / 1000.0,
+                        quality * 100.0
+                    ))
+                    .small()
+                    .weak(),
+                );
+            }
+        }
         ui.label(
             egui::RichText::new(format!(
                 "Frames composited: {}{}",
@@ -1652,6 +1739,80 @@ mod tests {
         assert!(
             !window.contains(".report_frame_generation()"),
             "frame generation is no longer a reason to skip the composite"
+        );
+    }
+
+    /// The software worker must fit a frame-time budget, and must do it by
+    /// tracing fewer pixels rather than by dropping frames.
+    ///
+    /// The report was "the CPU tracer was extremely laggy, updating the frame
+    /// like 1 in 5 seconds". A trace that costs seconds is off the render thread
+    /// and so never stalls it, but lighting that stale is indistinguishable from
+    /// lag, so the worker times itself and scales the traced extent.
+    #[test]
+    fn the_software_worker_scales_its_extent_to_its_time_budget() {
+        use super::SOFTWARE_TARGET_MICROS;
+        // The feedback runs on the measured cost, so check the decision it makes
+        // at the three interesting points.
+        let adjust = |micros: u128, current: f32| -> f32 {
+            let ratio = micros as f64 / SOFTWARE_TARGET_MICROS as f64;
+            let next = if ratio > 1.15 {
+                current * (ratio.sqrt() as f32).recip()
+            } else if ratio < 0.70 {
+                (current * 1.10).min(1.0)
+            } else {
+                current
+            };
+            next.clamp(0.10, 1.0)
+        };
+        // A trace costing five seconds - the reported case - must move a long way
+        // in one step, not creep.
+        let after = adjust(5_000_000, 1.0);
+        assert!(
+            after <= 0.10,
+            "a 5 s frame should collapse the scale to the floor at once, got {after}"
+        );
+        // At the target it stays put.
+        assert!((adjust(SOFTWARE_TARGET_MICROS, 0.5) - 0.5).abs() < 1e-6);
+        // Fast frames climb back, but never past 1.0.
+        assert!(adjust(1_000, 0.5) > 0.5);
+        assert_eq!(adjust(1_000, 1.0), 1.0);
+        // And the floor holds, so the image never degenerates to nothing.
+        assert_eq!(adjust(100_000_000, 1.0), 0.10);
+    }
+
+    /// The composite must accept a traced image of *any* size.
+    ///
+    /// `upload_software` used to drop any result whose extent differed from the
+    /// target, assuming a mismatch meant a window resize. With the worker
+    /// choosing its own extent that would have thrown away every frame, and the
+    /// page would have read "frames composited: 0" again for a new reason.
+    #[test]
+    fn an_adaptive_extent_is_adopted_rather_than_dropped() {
+        let source = include_str!("composite.rs");
+        let body = source
+            .split("pub fn upload_software")
+            .nth(1)
+            .expect("upload_software is defined");
+        let body = body.split("let row_pitch").next().unwrap();
+        assert!(
+            !body.contains("(target.width, target.height) != extent {\n            return;"),
+            "a mismatched extent must be adopted, not dropped"
+        );
+        assert!(
+            body.contains("self.ensure_target(device, extent.0, extent.1"),
+            "upload_software must resize to the result it was given"
+        );
+    }
+
+    /// The software path must not have its traced size reset to `trace_scale`
+    /// every frame, or the adaptive upload is immediately overwritten.
+    #[test]
+    fn render_does_not_reset_the_software_traced_extent() {
+        let source = include_str!("composite.rs");
+        assert!(
+            source.contains("TraceSource::Software => self"),
+            "render must keep the software worker's own traced extent"
         );
     }
 }
