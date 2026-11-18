@@ -169,11 +169,14 @@ pub fn normalize(path: &str) -> String {
         if !out.is_empty() {
             out.push('/');
         }
-        for c in seg.chars() {
-            out.extend(c.to_lowercase());
-        }
+        out.push_str(seg);
     }
-    out
+    if out.is_ascii() {
+        out.make_ascii_lowercase();
+        out
+    } else {
+        out.to_lowercase()
+    }
 }
 pub fn parse_ecm(bytes: &[u8]) -> Result<EcModel, String> {
     let text = gbk(bytes)?;

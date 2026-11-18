@@ -10,11 +10,12 @@ pub enum UploadMode {
     Decoded,
 }
 
-fn decode_mip(
+fn append_mip(
     bytes: &[u8],
     format: Format,
     mip: &crate::model_dds::Mip<'_>,
-) -> Result<Vec<u8>, String> {
+    rgba: &mut Vec<u8>,
+) -> Result<(), String> {
     // image's block decoder expects dimensions divisible by four. Decode the
     // complete stored blocks, then crop; tiny authored mips are not discarded.
     // An uncompressed surface needs no decoder: the archive stores exactly the
@@ -22,7 +23,6 @@ fn decode_mip(
     // Round-tripping it through the block decoder's synthetic header is what
     // used to fail, and a failure here becomes the draw's white placeholder.
     if let Format::Uncompressed(layout) = format {
-        let mut rgba = Vec::with_capacity((mip.width * mip.height * 4) as usize);
         if layout.bits == 16 {
             // RGB565: five or six bits per channel, expanded by replicating the
             // high bits into the low ones so full scale is 255 rather than 248.
@@ -48,11 +48,12 @@ fn decode_mip(
                 rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], a]);
             }
         }
-        return Ok(rgba);
+        return Ok(());
     }
     let width = (mip.width + 3) / 4 * 4;
     let height = (mip.height + 3) / 4 * 4;
-    let mut single = bytes[..128].to_vec();
+    let mut single = Vec::with_capacity(128 + mip.bytes.len());
+    single.extend_from_slice(&bytes[..128]);
     for (offset, value) in [
         (12, height),
         (16, width),
@@ -64,7 +65,7 @@ fn decode_mip(
     single.extend_from_slice(mip.bytes);
     let mut image = image::load_from_memory_with_format(&single, image::ImageFormat::Dds)
         .map_err(|e| format!("model DDS mip decode: {e}"))?
-        .to_rgba8();
+        .into_rgba8();
     // Some image decoder versions expose DXT1 as RGB, losing its one-bit alpha.
     // Restore that authored BC1 mode even when the decoded image is RGB-only.
     if format == Format::Dxt1 {
@@ -85,11 +86,18 @@ fn decode_mip(
             }
         }
     }
-    Ok(
-        image::imageops::crop_imm(&image, 0, 0, mip.width, mip.height)
-            .to_image()
-            .into_raw(),
-    )
+    let pixels = image.as_raw();
+    if width == mip.width {
+        rgba.extend_from_slice(&pixels[..width as usize * mip.height as usize * 4]);
+    } else {
+        for row in pixels
+            .chunks_exact(width as usize * 4)
+            .take(mip.height as usize)
+        {
+            rgba.extend_from_slice(&row[..mip.width as usize * 4]);
+        }
+    }
+    Ok(())
 }
 
 fn decode_rgba(bytes: &[u8]) -> Result<(image::RgbaImage, bool), String> {
@@ -104,7 +112,7 @@ fn decode_rgba(bytes: &[u8]) -> Result<(image::RgbaImage, bool), String> {
         }
     };
     let alpha_texture = image.color().has_alpha();
-    Ok((image.to_rgba8(), alpha_texture))
+    Ok((image.into_rgba8(), alpha_texture))
 }
 
 fn upload_image(
@@ -212,7 +220,7 @@ fn upload_dds(
             .sum();
         let mut out = Vec::with_capacity(total);
         for m in &d.mips {
-            out.extend_from_slice(&decode_mip(bytes, d.format, m)?);
+            append_mip(bytes, d.format, m, &mut out)?;
         }
         decoded = out;
         &decoded
@@ -287,7 +295,8 @@ mod tests {
         bytes[84..88].copy_from_slice(b"DXT1");
         bytes.extend_from_slice(&[0, 0, 0, 248, 255, 255, 255, 255]);
         let d = Dds::parse(&bytes).unwrap();
-        let rgba = decode_mip(&bytes, d.format, &d.mips[0]).unwrap();
+        let mut rgba = Vec::new();
+        append_mip(&bytes, d.format, &d.mips[0], &mut rgba).unwrap();
         assert_eq!(rgba.len(), 4);
         assert_eq!(rgba[3], 0);
     }

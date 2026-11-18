@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -115,10 +115,11 @@ impl Heights {
         }
     }
     pub fn at(&self, index: usize) -> f32 {
-        if let Data::Memory(v) = &self.0.data {
-            return v[index]; 
+        match &self.0.data {
+            Data::Memory(v) => v[index],
+            Data::Resident(grid) => grid.heights[index],
+            Data::Disk(_) => self.reader().height(index),
         }
-        self.reader().height(index)
     }
     pub fn stats(&self) -> Stats {
         match &self.0.data {
@@ -156,6 +157,9 @@ impl Heights {
 }
 impl Normals {
     pub fn at(&self, index: usize) -> [i8; 3] {
+        if let Data::Resident(grid) = &self.0.data {
+            return grid.normals[index];
+        }
         Reader {
             store: Arc::clone(&self.0),
             current: None,
@@ -202,8 +206,9 @@ impl Reader {
         let cells = d.side * d.side;
         let mut bytes = Vec::with_capacity(cells * 7);
         ZlibDecoder::new(&packed[..])
+            .take((cells * 7 + 1) as u64)
             .read_to_end(&mut bytes)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("terrain cache block {id}: {e}; restart to rebuild cache"))?;
         if bytes.len() != cells * 7 || <[u8; 32]>::from(Sha256::digest(&bytes)) != record.hash {
             return Err(format!(
                 "corrupt terrain cache block {id}; restart to rebuild cache"

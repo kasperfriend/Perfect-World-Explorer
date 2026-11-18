@@ -26,7 +26,6 @@ use crate::{
         Resolution, TextureResolver,
     },
 };
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -352,7 +351,7 @@ fn decode_texture_bytes(key: &str, data: &[u8]) -> Result<Texture, String> {
     };
     match decoded {
         Ok(img) => {
-            let img = img.to_rgba8();
+            let img = img.into_rgba8();
             let (w, h) = img.dimensions();
             Ok(Texture {
                 width: w as usize,

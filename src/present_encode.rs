@@ -138,6 +138,9 @@ impl PresentEncode {
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, w: u32, h: u32) {
+        if (self.width, self.height) == (w.max(1), h.max(1)) {
+            return;
+        }
         self.width = w.max(1);
         self.height = h.max(1);
         self.frame = Self::texture(device, self.width, self.height);
@@ -171,8 +174,8 @@ impl PresentEncode {
     }
 
     fn create_bind_group(
-           device: &wgpu::Device, 
-           layout: &wgpu::BindGroupLayout, 
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
         frame: &wgpu::Texture,
     ) -> wgpu::BindGroup {
         let source = frame.create_view(&wgpu::TextureViewDescriptor {

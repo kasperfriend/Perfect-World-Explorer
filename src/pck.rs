@@ -36,32 +36,21 @@ pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
     INFLATE_DECOMP.with(|cell| {
         let mut decomp = cell.borrow_mut();
         decomp.reset(true);
-        let mut out = Vec::with_capacity(expected);
-        loop {
-            let before = decomp.total_in() as usize;
-            let st = decomp
-                .decompress_vec(&raw[before..], &mut out, FlushDecompress::Finish)
-                .map_err(|e| e.to_string())?;
-            if out.len() > expected {
-                return Err(format!(
-                    "bad decompressed size: {} != {expected}",
-                    out.len()
-                ));
-            }
-            if matches!(st, Status::StreamEnd) {
-                break;
-            }
-            if before == decomp.total_in() as usize && out.len() == out.capacity() {
-                out.reserve(64);
-            } else if before == decomp.total_in() as usize && matches!(st, Status::BufError) {
-                return Err("truncated zlib stream".into());
-            }
-        }
+        // One spare byte distinguishes an overlong payload from an exact fit,
+        // including the empty-stream case. Never grow beyond the declared bound.
+        let cap = expected.checked_add(1).ok_or("zlib size overflow")?;
+        let mut out = Vec::with_capacity(cap);
+        let status = decomp
+            .decompress_vec(raw, &mut out, FlushDecompress::Finish)
+            .map_err(|e| e.to_string())?;
         if out.len() != expected {
             return Err(format!(
                 "bad decompressed size: {} != {expected}",
                 out.len()
             ));
+        }
+        if status != Status::StreamEnd {
+            return Err("truncated zlib stream".into());
         }
         Ok(out)
     })
@@ -167,7 +156,7 @@ pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
         inflate(&compressed, e.size as usize)
     } else {
         at(f, e.offset as u64, e.compressed as usize)
-     }    
+    }
 }
 
 /// Read a bounded set of entries from one archive. Large reads are queued
@@ -237,13 +226,7 @@ pub fn read_entries_at(
         .zip(raw)
         .map(|(entry, bytes)| {
             if entry.compressed < entry.size {
-                let out = inflate(&bytes, entry.size as usize)?;
-                if out.len() != entry.size as usize {
-                    return Err(
-                        format!("bad decompressed size: {} != {}", out.len(), entry.size).into(),
-                    );
-                }
-                Ok(out)
+                inflate(&bytes, entry.size as usize).map_err(Into::into)
             } else {
                 Ok(bytes)
             }
@@ -354,6 +337,21 @@ mod tests {
     }
 
     use std::io::Write;
+    #[test]
+    fn bounded_inflate_resets_after_bad_streams() {
+        for input in [Vec::new(), vec![42; 128 * 1024]] {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(&input).unwrap();
+            let raw = encoder.finish().unwrap();
+            assert!(inflate(&raw[..raw.len() - 1], input.len()).is_err());
+            assert!(inflate(&raw, input.len() + 1).is_err());
+            if !input.is_empty() {
+                assert!(inflate(&raw, 1).is_err());
+            }
+            assert_eq!(inflate(&raw, input.len()).unwrap(), input);
+        }
+    }
     #[test]
     fn bounded_archive_batch_preserves_independent_ranges_and_decompression() {
         let first = vec![37u8; 128 * 1024];

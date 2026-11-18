@@ -265,7 +265,7 @@ impl Draw {
 
     pub fn draw_quads<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         if self.quads.is_empty() {
-            return; 
+            return;
         }
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint16);
         let mut last_key = None;

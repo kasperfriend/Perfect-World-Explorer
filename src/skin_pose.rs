@@ -70,15 +70,13 @@ pub fn deform_rigid(
         return Err("nonfinite skin matrix");
     }
     let p = matrix.transform_point3(Vec3::from_array(position));
-    let n = matrix
-        .transform_vector3(Vec3::from_array(normal))
-        .normalize_or_zero();
+    let n = matrix.transform_vector3(Vec3::from_array(normal));
     if !p.is_finite() || !n.is_finite() {
         return Err("nonfinite deformed vertex");
     }
     Ok(PosedVertex {
         position: p.to_array(),
-        normal: n.to_array(),
+        normal: n.normalize_or_zero().to_array(),
     })
 }
 

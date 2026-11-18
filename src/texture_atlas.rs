@@ -11,13 +11,14 @@ pub struct Slot {
     pub h: usize,
 }
 pub struct Atlas {
-    used: [[bool; GRID]; GRID],
+    used: [u32; GRID],
     free: usize,
 }
+const _: () = assert!(GRID == u32::BITS as usize);
 impl Atlas {
     pub fn new() -> Self {
         Self {
-            used: [[false; GRID]; GRID],
+            used: [0; GRID],
             free: GRID * GRID,
         }
     }
@@ -30,27 +31,35 @@ impl Atlas {
         reserve: usize,
         allow_reduce: bool,
     ) -> Option<Slot> {
-        let mut w = width.max(1).next_power_of_two().clamp(UNIT, SIDE) / UNIT;
-        let mut h = height.max(1).next_power_of_two().clamp(UNIT, SIDE) / UNIT;
+        let mut w = width.clamp(UNIT, SIDE).next_power_of_two() / UNIT;
+        let mut h = height.clamp(UNIT, SIDE).next_power_of_two() / UNIT;
         loop {
-            if self.free >= w * h + reserve {
+            if w * h <= self.free.saturating_sub(reserve) {
                 for y in 0..=GRID - h {
-                    for x in 0..=GRID - w {
-                        if (y..y + h).all(|yy| (x..x + w).all(|xx| !self.used[yy][xx])) {
-                            for row in &mut self.used[y..y + h] {
-                                for item in &mut row[x..x + w] {
-                                    *item = true;
-                                }
-                            }
-                            self.free -= w * h;
-                            return Some(Slot {
-                                x: x * UNIT,
-                                y: y * UNIT,
-                                w: w * UNIT,
-                                h: h * UNIT,
-                            });
-                        }
+                    // A set bit is free across every row of this rectangle.
+                    let mut starts = !self.used[y..y + h].iter().fold(0, |a, &b| a | b);
+                    // Widths are powers of two: each intersection doubles the
+                    // contiguous run length represented by each surviving bit.
+                    let mut run = 1;
+                    while run < w && starts != 0 {
+                        starts &= starts >> run;
+                        run *= 2;
                     }
+                    if starts == 0 {
+                        continue;
+                    }
+                    let x = starts.trailing_zeros() as usize;
+                    let mask = (u32::MAX >> (GRID - w)) << x;
+                    for row in &mut self.used[y..y + h] {
+                        *row |= mask;
+                    }
+                    self.free -= w * h;
+                    return Some(Slot {
+                        x: x * UNIT,
+                        y: y * UNIT,
+                        w: w * UNIT,
+                        h: h * UNIT,
+                    });
                 }
             }
             if !allow_reduce || (w == 1 && h == 1) {
