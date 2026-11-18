@@ -619,18 +619,9 @@ fn exercise(mode: Mode, cpu_query: bool) {
     h.ray.settings.samples = 4;
     let layers = h.pixels(sample(0.), &empty);
     for (i, expected) in [0.50, 0.25, 0.25].into_iter().enumerate() {
-        let mean = layers
-            .iter()
-            .map(|p| {
-                let encoded = f32::from(p.0[i]) / 255.;
-                if encoded <= 0.04045 {
-                    encoded / 12.92
-                } else {
-                    ((encoded + 0.055) / 1.055).powf(2.4)
-                }
-            })
-            .sum::<f32>()
-            / layers.len() as f32;
+        // The harness uses Rgba8Unorm, so this readback is already linear.
+        let mean =
+            layers.iter().map(|p| f32::from(p.0[i])).sum::<f32>() / (255. * layers.len() as f32);
         assert!((mean - expected).abs() < 0.055, "channel {i}: {mean}");
     }
 }
