@@ -13,6 +13,7 @@ the file and produced these counts*, not *the game rendered it*.
 ```
 tools/offline_harness.sh matrix    # one row per staged client
 tools/offline_harness.sh pck       # every entry of every pack, decoded
+tools/offline_harness.sh content   # the files inside them, by owning reader
 tools/offline_harness.sh scene     # every .ecwld
 tools/offline_harness.sh gfx       # GFX containers (file, decal, light) + tests
 ```
@@ -90,6 +91,56 @@ all: its two entries are a zero-length `dir` and a bare `version.sw` holding
 `script.pck  Angelica pack v0x20002 · 2 entries · version.sw 0.525.0`. The
 lookup matches the bare name as well as the `<stem>\version.sw` a patcher
 writes, because this one uses the bare spelling.
+
+## Package inventory
+
+Fourteen staged packages, every entry decoded and checked against the length its
+record declares — 11 864 entries, 0 failures:
+
+| pack | container | entries | bytes out |
+|---|---|---|---|
+| `gfx.pck` (1.3.1) | retail v2 | 3765 | 51 972 120 |
+| `gfx.pck` (1.3.6) | retail v2 | 3499 | 46 496 028 |
+| `surfaces.pck` | retail v2 | 2285 | 127 318 710 |
+| `interfaces.pck` | retail v2 | 1158 | 7 536 348 |
+| `trees.pck` | retail v2 | 325 | 48 643 974 |
+| `shaders.pck` | Angelica | 371 | 15 865 920 |
+| `configs.pck` (older) | retail v2 | 106 | 11 347 918 |
+| `grasses.pck` | Angelica | 103 | 4 014 681 |
+| `configs.pck` (1.4.4) | retail v2 | 92 | 6 909 162 |
+| `configs.pck` (1.3.6) | retail v2 | 66 | 3 160 870 |
+| `configs.pck` (1.5.2) | retail v2 | 58 | 2 179 038 |
+| `script.pck` (small) | retail v2 | 32 | 51 717 |
+| `fonts.pck` | retail v2 | 2 | 8 242 268 |
+| `script.pck` (1.5.2) | Angelica | 2 | 9 |
+
+Note `grasses.pck` is in the Angelica container while `trees.pck` beside it is a
+retail v2 pack — the container is a property of the pack, not of the client
+version or the content type.
+
+## Reading the files inside
+
+A directory that parses proves nothing about its members, so the `content` mode
+runs the owning reader over each one. Over the same corpus: **4 297 members
+read, 2 failed**.
+
+| extension | count | check |
+|---|---|---|
+| `gfx` | 3946 | `gfx_file::parse` after a GBK decode |
+| `spt` | 100 | `__IdvSpt_0` magic at offset 8 (no parser: SpeedTree source) |
+| `bon`, `ski` | 148 | length; containers with no leaf parser here |
+| `sdr` | 60 | shader text |
+| `mox` | 44 | `MOXBFRAME:` magic — **no reader in this project** |
+
+The 2 failures are the same authored stub in both `gfx.pck` builds:
+`gfx/人物/技能/羽芒/翼击击中.gfx` is four bytes, `MOXT`. The archive really does
+ship that, so it is named and excluded from the exit status.
+
+What this does *not* cover, stated plainly: `.dds`/`.tga`/`.jpg`/`.bmp` (3 950
+images, 288 MB) go through `image`-side code that the offline toolchain has no
+copy of, so they are counted in the inventory but not decoded here.
+`.ttf`, `.xls`, `.lua`, `.txt`, `.ini` and the rest are opaque blobs to this
+project.
 
 ## Scenery
 
