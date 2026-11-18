@@ -59,8 +59,10 @@ installed manifests (the repository's `Modules` directory). Settings live in
   The sun, static scene point lights, and point lights published by GFX owners
   can all cast occlusion rays. Sun shadows sample a disc with an angular radius
   of 0.27°, producing penumbras that widen with blocker distance. Disabling
-  **Soft sun shadows** restores a single directional shadow ray. Point lights
-  still have sharp shadows. The native world passes do not composite on top.
+  **Soft sun shadows** restores a single directional sun shadow ray. Local
+  emitters sample finite shapes, and explicit thin glass tints visibility.
+  See [direct lighting](direct-light.md). The native world passes do not
+  composite on top.
 
 Morph, supple and muscle skin records are not decoded. The Lighter settings
 show separate per-feed counts for unsupported SKI types **encountered** on

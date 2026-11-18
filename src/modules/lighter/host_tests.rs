@@ -1045,10 +1045,18 @@ fn lighter_streamed_world_pixels() {
     let evicted = mesh(&mut terrain, r.grass_atlas_key);
     assert!(r.update_mesh(&mut Some(evicted)).unwrap());
     for (x, lit) in points.into_iter().zip(bright) {
-        assert_eq!(
-            probe(&mut r, &mut camera, x),
-            lit,
-            "stale shadow after BMD eviction"
+        let unoccluded = probe(&mut r, &mut camera, x);
+        // The no-shadow baseline samples the emitter center. Once the caster
+        // is gone, a finite sample can still differ by a few encoded levels
+        // due to its incidence angle; it cannot retain the previous umbra.
+        assert_eq!(unoccluded.1, lit.1);
+        assert!(
+            unoccluded
+                .0
+                .into_iter()
+                .zip(lit.0)
+                .all(|(a, b)| a.abs_diff(b) <= 3),
+            "stale shadow after BMD eviction: {unoccluded:?} vs {lit:?}"
         );
     }
     if cpu_adapter {
