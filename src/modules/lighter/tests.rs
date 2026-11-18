@@ -194,7 +194,8 @@ impl Harness {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("Lighter test device"),
-                required_features: features,
+                required_features: features
+                    | (adapter.features() & wgpu::Features::TIMESTAMP_QUERY),
                 required_limits: wgpu::Limits::downlevel_defaults(),
             },
             None,
@@ -295,6 +296,7 @@ impl Harness {
             );
         }
         self.queue.submit(Some(encoder.finish()));
+        self.ray.profile_submitted();
         let read = copy.slice(..);
         let (send, recv) = std::sync::mpsc::channel();
         read.map_async(wgpu::MapMode::Read, move |r| {
@@ -303,6 +305,7 @@ impl Harness {
         crate::gpu::wait_for_capture_callback(&self.device, recv)
             .unwrap()
             .unwrap();
+        self.ray.profile_collect(&self.queue);
         let data = read.get_mapped_range();
         (0..e)
             .flat_map(|y| (0..e).map(move |x| (y * row + x * 4) as usize))
@@ -685,6 +688,9 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_dielectric_and_metal(&mut h);
     exercise_media_segments(&mut h);
     exercise_reference_lighting(&mut h);
+    if let Some(t) = &h.ray.timings {
+        assert!(t.collected > 0);
+    }
     if mode == Mode::Software {
         exercise_bsdf_energy(&h);
     }

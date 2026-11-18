@@ -976,6 +976,7 @@ impl super::Renderer {
             self.water.copy_depth(&mut encoder, &self.depth);
         }
         self.queue.submit(Some(encoder.finish()));
+        self.lighter.profile_submitted();
         if use_post {
             self.post.render(
                 &self.device,

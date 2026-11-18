@@ -5,6 +5,7 @@ mod bvh;
 pub(crate) mod coverage;
 pub(crate) mod model_feed;
 mod post;
+mod profile;
 pub(crate) mod scene;
 mod settings;
 pub(crate) mod sky;
@@ -16,7 +17,7 @@ use bytemuck::{Pod, Zeroable};
 use scene::Packet;
 pub(crate) use settings::{Mode, Settings};
 use std::time::Instant;
-use textures::{suffix_segments, TexelPrefix, Textures};
+use textures::{suffix_segments, upload_pages, TexelPrefix, Textures};
 
 const PIXELS: &str = include_str!("pixels.wgsl");
 const BSDF: &str = include_str!("bsdf.wgsl");
@@ -91,6 +92,7 @@ const PIXEL_BYTES: u64 = std::mem::size_of::<Pixel>() as u64;
 // Reserve a stable share even when a retained stage is toggled off. A
 // resolution increase in another stage must not consume its reservation.
 // Trace, two reprojection histories, and spatial filter.
+pub(super) const RAY_ALLOCATION_BUDGET: u64 = 8 << 30;
 const MAX_IMAGE_BYTES: u64 = (256 << 20) / 4;
 
 pub const WATER_MIRROR: u32 = 8;
@@ -395,7 +397,7 @@ impl Software {
             } else {
                 self.texture_len
             };
-            for (offset, part) in suffix_segments(texels.byte_segments(), prefix) {
+            for (offset, part) in upload_pages(texels.byte_segments(), prefix) {
                 queue.write_buffer(&self.textures.0, offset as u64, part);
             }
             self.buffers_created += u64::from(grew);
@@ -581,6 +583,7 @@ pub struct Lighter {
     present: Option<Present>,
     post: Option<post::Post>,
     history: post::History,
+    timings: Option<profile::Timings>,
     allocation_sample: Option<(Instant, [u64; 3], u64)>,
     pub(crate) moving_accel: scene::AccelCache,
     pub settings: Settings,
@@ -611,6 +614,7 @@ impl Default for Lighter {
             present: None,
             post: None,
             history: post::History::default(),
+            timings: None,
             allocation_sample: None,
             moving_accel: Default::default(),
             settings: Settings::default(),
@@ -639,6 +643,9 @@ impl Lighter {
         let rt = device_features(adapter, settings.mode);
         Self {
             armed: settings.mode != Mode::Off,
+            timings: (settings.mode != Mode::Off)
+                .then(|| profile::Timings::new(device))
+                .flatten(),
             settings,
             native_backend: adapter.get_info().backend,
             adapter_supports_compute: adapter.get_downlevel_capabilities().flags.contains(
@@ -725,6 +732,18 @@ impl Lighter {
         depth: &wgpu::TextureView,
     ) {
         drop(output_pass(encoder, target, depth));
+    }
+
+    pub(crate) fn profile_submitted(&mut self) {
+        if let Some(timings) = &mut self.timings {
+            timings.submitted();
+        }
+    }
+
+    pub(crate) fn profile_collect(&mut self, queue: &wgpu::Queue) {
+        if let Some(timings) = &mut self.timings {
+            timings.collect(queue);
+        }
     }
 
     pub(crate) fn reset_history(&mut self) {
@@ -944,15 +963,27 @@ impl Lighter {
             frame.sampling = [0; 4];
             None
         };
+        if let Some(t) = &mut self.timings {
+            t.collect(queue);
+        }
+        let timed = self.timings.as_mut().filter(|t| t.due());
         let image = match settings.mode {
             Mode::Software => {
                 if self.software.is_none() {
                     self.software = Some(checked_pipeline(device, || Software::new(device))?);
                 }
-                self.software
+                if let Some(t) = &timed {
+                    t.stamp(encoder, 0);
+                }
+                let image = self
+                    .software
                     .as_mut()
                     .unwrap()
-                    .trace(device, queue, encoder, &frame, bytes, world, moving)
+                    .trace(device, queue, encoder, &frame, bytes, world, moving);
+                if let Some(t) = &timed {
+                    t.stamp(encoder, 1);
+                }
+                image
             }
             Mode::Hardware => {
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -973,6 +1004,14 @@ impl Lighter {
             }
             Mode::Off => return Err("Lighter render requested while off".into()),
         };
+        if let Some(t) = &timed {
+            if settings.mode == Mode::Hardware {
+                t.stamp(encoder, 0);
+                t.stamp(encoder, 1);
+            }
+            t.stamp(encoder, 2);
+        }
+        let filtered = settings.denoiser || history.is_some();
         let image = if let Some(post) = &mut self.post {
             post.process(
                 device,
@@ -986,6 +1025,10 @@ impl Lighter {
         } else {
             image
         };
+        if let Some(t) = timed {
+            t.stamp(encoder, 3);
+            t.record(encoder, settings.mode, filtered);
+        }
         self.present.as_mut().unwrap().draw(
             device,
             queue,

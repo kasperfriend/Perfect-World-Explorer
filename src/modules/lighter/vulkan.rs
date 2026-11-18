@@ -3,7 +3,8 @@
 //! and queue. No CPU image readback and no second adapter.
 use super::scene::{Fingerprint, MeshKey, MeshRange, Packet, DYNAMIC_BIT, VERTEX_WORDS};
 use super::{
-    grown_capacity, image_limit, storage_limit, suffix_segments, Frame, TexelPrefix, Textures,
+    grown_capacity, image_limit, profile::INTERVAL, storage_limit, suffix_segments,
+    textures::UPLOAD_PAGE_BYTES, Frame, TexelPrefix, Textures, RAY_ALLOCATION_BUDGET,
 };
 use ash::{extensions::khr, vk};
 use std::{
@@ -13,6 +14,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
+    time::Instant,
 };
 use wgpu::hal::{api::Vulkan, vulkan::Device as HalDevice};
 
@@ -102,8 +104,39 @@ struct Context {
     max_primitives: u64,
     max_instances: u64,
     storage_limit: u64,
+    budget: AllocationBudget,
+    timestamp_period: f32,
+    timestamp_bits: u32,
     buffers_created: AtomicU64,
     structures_created: AtomicU64,
+}
+
+struct AllocationBudget {
+    limit: u64,
+    held: AtomicU64,
+}
+impl AllocationBudget {
+    fn reserve(&self, size: u64) -> R<()> {
+        self.held
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+                used.checked_add(size).filter(|&new| new <= self.limit)
+            })
+            .map_err(|_| {
+                format!(
+                    "Lighter Vulkan memory budget ({} MiB) exhausted; reduce scenery or resolution",
+                    self.limit >> 20
+                )
+            })?;
+        Ok(())
+    }
+    fn release(&self, size: u64) {
+        self.held.fetch_sub(size, Ordering::Relaxed);
+    }
+}
+
+fn timestamp_ms(start: u64, end: u64, valid_bits: u32, period: f32) -> f64 {
+    let mask = u64::MAX >> (64 - valid_bits.clamp(1, 64));
+    (end.wrapping_sub(start) & mask) as f64 * f64::from(period) / 1.0e6
 }
 
 impl Context {
@@ -125,12 +158,32 @@ impl Context {
                         physical,
                         &mut vk::PhysicalDeviceProperties2::builder().push_next(&mut p),
                     );
+                    let memory = instance.get_physical_device_memory_properties(physical);
+                    let local = memory.memory_heaps[..memory.memory_heap_count as usize]
+                        .iter()
+                        .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                        .map(|h| h.size)
+                        .max()
+                        .unwrap_or(RAY_ALLOCATION_BUDGET);
+                    let family = hal.queue_family_index();
+                    let queues = instance.get_physical_device_queue_family_properties(physical);
+                    let timestamp_bits = queues[family as usize].timestamp_valid_bits;
+                    let timestamp_period = instance
+                        .get_physical_device_properties(physical)
+                        .limits
+                        .timestamp_period;
                     Ok(Arc::new(Self {
                         queue: hal.raw_queue(),
-                        family: hal.queue_family_index(),
+                        family,
                         acceleration: khr::AccelerationStructure::new(instance, &device),
                         addresses: khr::BufferDeviceAddress::new(instance, &device),
-                        memory: instance.get_physical_device_memory_properties(physical),
+                        memory,
+                        budget: AllocationBudget {
+                            limit: local.min(RAY_ALLOCATION_BUDGET),
+                            held: AtomicU64::new(0),
+                        },
+                        timestamp_bits,
+                        timestamp_period,
                         scratch_align: u64::from(
                             p.min_acceleration_structure_scratch_offset_alignment,
                         )
@@ -162,6 +215,7 @@ struct Buffer {
     ctx: Arc<Context>,
     handle: vk::Buffer,
     memory: vk::DeviceMemory,
+    charged: u64,
     size: u64,
     owns_handle: bool,
     id: u64,
@@ -190,6 +244,7 @@ impl Buffer {
                 ctx: ctx.clone(),
                 handle,
                 memory: vk::DeviceMemory::null(),
+                charged: 0,
                 size,
                 owns_handle: true,
                 id: 0,
@@ -211,6 +266,8 @@ impl Buffer {
             if usage.contains(ADDRESS) {
                 info = info.push_next(&mut address);
             }
+            ctx.budget.reserve(req.size)?;
+            buffer.charged = req.size;
             buffer.memory = d
                 .allocate_memory(&info, None)
                 .map_err(vkerr("allocate buffer"))?;
@@ -267,6 +324,7 @@ impl Drop for Buffer {
                 self.ctx.device.free_memory(self.memory, None);
             }
         }
+        self.ctx.budget.release(self.charged);
     }
 }
 
@@ -332,15 +390,21 @@ impl Upload {
 
     unsafe fn encode(&self, cmd: vk::CommandBuffer) {
         if self.bytes > self.offset {
+            // A replaced bank publishes only after its pages and geometry
+            // have arrived in queue order. No render-thread device wait.
+            let regions: Vec<_> = (self.offset..self.bytes)
+                .step_by(UPLOAD_PAGE_BYTES)
+                .map(|offset| vk::BufferCopy {
+                    src_offset: offset,
+                    dst_offset: offset,
+                    size: (self.bytes - offset).min(UPLOAD_PAGE_BYTES as u64),
+                })
+                .collect();
             self.gpu.ctx.device.cmd_copy_buffer(
                 cmd,
                 self.staging.handle,
                 self.gpu.handle,
-                &[vk::BufferCopy {
-                    src_offset: self.offset,
-                    dst_offset: self.offset,
-                    size: self.bytes - self.offset,
-                }],
+                &regions,
             );
         }
     }
@@ -507,6 +571,7 @@ struct Core {
     set: vk::DescriptorSet,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    query: vk::QueryPool,
 }
 
 impl Core {
@@ -521,6 +586,7 @@ impl Core {
             set: vk::DescriptorSet::null(),
             layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
+            query: vk::QueryPool::null(),
         };
         let d = &c.ctx.device;
         unsafe {
@@ -628,6 +694,19 @@ impl Core {
                 }
             };
         }
+        if c.ctx.timestamp_bits > 0 {
+            // Profiling is optional; inability to create a query pool does not
+            // make an otherwise suitable RT device unavailable.
+            c.query = unsafe {
+                c.ctx.device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::builder()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(4),
+                    None,
+                )
+            }
+            .unwrap_or_default();
+        }
         Ok(c)
     }
 
@@ -668,6 +747,7 @@ impl Drop for Core {
     fn drop(&mut self) {
         unsafe {
             let d = &self.ctx.device;
+            d.destroy_query_pool(self.query, None);
             d.destroy_pipeline(self.pipeline, None);
             d.destroy_pipeline_layout(self.layout, None);
             d.destroy_descriptor_pool(self.descriptors, None);
@@ -729,6 +809,8 @@ pub struct Renderer {
     frame: Buffer,
     output: Option<Output>,
     submitted: bool,
+    timing_pending: Option<bool>,
+    last_timing: Option<Instant>,
     revision: Option<u64>,
     texture_len: usize,
     texture_prefix: TexelPrefix,
@@ -763,6 +845,8 @@ impl Renderer {
             frame,
             output: None,
             submitted: false,
+            timing_pending: None,
+            last_timing: None,
             revision: None,
             texture_len: 0,
             texture_prefix: TexelPrefix::default(),
@@ -825,6 +909,13 @@ impl Renderer {
             tlas: None,
             scratch_bytes: 0,
         };
+        plan.live.extend(world.meshes.iter().map(|m| (0, m.key)));
+        plan.live
+            .extend(moving.meshes.iter().map(|m| (DYNAMIC_BIT, m.key)));
+        // The previous fence retired. Evict departed chunks before growing
+        // storage for their replacements, rather than peaking at both sets.
+        self.blas.retain(|key, _| plan.live.contains(key));
+        let mut packed = HashSet::new();
         let mut instances = Vec::with_capacity(world.instances.len() + moving.instances.len());
         for (packet, upload, bit) in [
             (world, self.world.as_ref().unwrap(), 0),
@@ -833,7 +924,7 @@ impl Renderer {
             let base = upload.gpu.address();
             for m in &packet.meshes {
                 let key = (bit, m.key);
-                if !plan.live.insert(key) {
+                if !packed.insert(key) {
                     continue;
                 }
                 let resident = self.blas.entry(key).or_default();
@@ -917,6 +1008,34 @@ impl Renderer {
             let ready = unsafe { self.core.ctx.device.get_fence_status(self.core.fence) }
                 .map_err(vkerr("poll ray frame"))?;
             self.submitted = !ready;
+            if ready {
+                if let Some(built) = self.timing_pending.take() {
+                    let ctx = &self.core.ctx;
+                    let mut ticks = [0u64; 4];
+                    let result = unsafe {
+                        ctx.device.get_query_pool_results(
+                            self.core.query,
+                            0,
+                            4,
+                            &mut ticks,
+                            vk::QueryResultFlags::TYPE_64,
+                        )
+                    };
+                    if result.is_ok() {
+                        let duration = |i: usize| {
+                            timestamp_ms(
+                                ticks[i],
+                                ticks[i + 1],
+                                ctx.timestamp_bits,
+                                ctx.timestamp_period,
+                            )
+                        };
+                        let build = if built { duration(0) } else { 0. };
+                        let bytes = ctx.budget.held.load(Ordering::Relaxed);
+                        eprintln!("Lighter gpu stage Vulkan: build_ms={build:.3} traversal_ms={:.3} allocation_bytes={bytes} budget_bytes={}",duration(2),ctx.budget.limit);
+                    }
+                }
+            }
         }
         Ok(!self.submitted)
     }
@@ -1099,8 +1218,16 @@ impl Renderer {
             }
             self.bound_ids = Some(bound);
         }
+        let timing = self.core.query != vk::QueryPool::null()
+            && self.last_timing.is_none_or(|t| t.elapsed() >= INTERVAL);
+        let built = plan
+            .as_ref()
+            .is_some_and(|p| !p.blas.is_empty() || p.tlas.is_some());
         unsafe {
             self.core.begin_commands()?;
+            if timing {
+                d.cmd_reset_query_pool(cmd, self.core.query, 0, 4);
+            }
             if static_changed {
                 w.encode(cmd);
             }
@@ -1129,6 +1256,10 @@ impl Renderer {
                 &[],
                 &[],
             );
+            let build_stage = vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR;
+            if timing {
+                d.cmd_write_timestamp(cmd, build_stage, self.core.query, 0);
+            }
             if let Some(plan) = &plan {
                 for (key, _, build) in &plan.blas {
                     build.encode(ctx, cmd, self.blas[key].accel.as_ref().unwrap(), scratch);
@@ -1136,6 +1267,9 @@ impl Renderer {
                 if let Some(build) = &plan.tlas {
                     build.encode(ctx, cmd, tlas, scratch);
                 }
+            }
+            if timing {
+                d.cmd_write_timestamp(cmd, build_stage, self.core.query, 1);
             }
             // The previous wgpu denoiser or compositor may still read this
             // buffer. Both execute on this VkQueue, in submission order.
@@ -1148,6 +1282,14 @@ impl Renderer {
                 &[],
                 &[],
             );
+            if timing {
+                d.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    self.core.query,
+                    2,
+                );
+            }
             d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.core.pipeline);
             d.cmd_bind_descriptor_sets(
                 cmd,
@@ -1163,6 +1305,14 @@ impl Renderer {
                 frame.extent[1].div_ceil(8),
                 1,
             );
+            if timing {
+                d.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    self.core.query,
+                    3,
+                );
+            }
             d.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1178,6 +1328,10 @@ impl Renderer {
         }
         self.core.submit()?;
         self.submitted = true;
+        if timing {
+            self.last_timing = Some(Instant::now());
+            self.timing_pending = Some(built);
+        }
         if moving_changed {
             self.last_moving.clone_from(&moving.words);
         }
@@ -1205,9 +1359,6 @@ impl Renderer {
                     self.as_builds[2] += 1;
                 }
             }
-            // The previous trace fence retired before this command buffer was
-            // recorded. Its evicted BLAS are no longer referenced by the TLAS.
-            self.blas.retain(|key, _| plan.live.contains(key));
         }
         self.revision = Some(revision);
         self.texture_len = texels.byte_len();
@@ -1226,5 +1377,27 @@ impl Drop for Renderer {
         unsafe {
             let _ = self.core.ctx.device.queue_wait_idle(self.core.ctx.queue);
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn budget_releases_evictions_and_rejects_transient_overrun() {
+        let budget = AllocationBudget {
+            limit: 512,
+            held: AtomicU64::new(0),
+        };
+        budget.reserve(384).unwrap();
+        assert!(budget.reserve(256).is_err());
+        assert_eq!(budget.held.load(Ordering::Relaxed), 384);
+        budget.release(384);
+        budget.reserve(512).unwrap();
+        assert_eq!(budget.held.load(Ordering::Relaxed), 512);
+    }
+    #[test]
+    fn queue_timestamps_wrap_at_valid_bits() {
+        assert_eq!(timestamp_ms(250, 4, 8, 100_000.), 1.);
     }
 }

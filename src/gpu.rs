@@ -5154,6 +5154,12 @@ async fn adapter(
         limits.max_storage_buffer_binding_size =
             a.limits().max_storage_buffer_binding_size.min(256 << 20);
     }
+    let timestamps = if lighter != LighterMode::Off {
+        a.features() & wgpu::Features::TIMESTAMP_QUERY
+    } else {
+        wgpu::Features::empty()
+    };
+    let native = native | timestamps;
     let request = |required_features| wgpu::DeviceDescriptor {
         label: None,
         required_features,

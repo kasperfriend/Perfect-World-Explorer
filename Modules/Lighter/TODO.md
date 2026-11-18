@@ -42,7 +42,7 @@ it does not set execution order.
 
 ### Phase 4 — Production
 
-19. [ ] **RT-15:** Log GPU build/traversal/filter timestamps each second; use an 8 GB RTX 3080 default budget, low-priority eviction and 128 recent texture tiles with background page uploads. Use an independent build queue if supported, otherwise early submit with only necessary fencing. Document backend caps.
+19. [x] **RT-15:** Log GPU build/traversal/filter timestamps each second; use an 8 GB RTX 3080 default budget, low-priority eviction and 128 recent texture tiles with background page uploads. Use an independent build queue if supported, otherwise early submit with only necessary fencing. Document backend caps. See [timings, queue and memory limits](gpu-budget.md).
 20. [ ] **RT-16:** Classify post effects by dependency on the ray world; keep native minimap/full map. Place optional upscaling/frame generation before HDR post. Recover device/resources/current chunks after DeviceLost; test resize and backend switching.
 21. [ ] **RT-17:** Capture matching cameras on dense city, forest, open distance, water, cave/instance and effects-heavy real maps, in Native/Software/Hardware under day/night/rain. Save dated images, Step 9 counts, per-region mean pixel error, driver/GPU/settings. Keep synthetic regressions separate from performance evidence.
 

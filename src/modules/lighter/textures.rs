@@ -324,6 +324,20 @@ pub(super) fn suffix_segments<'a>(
 }
 
 type Archive = HashMap<Filter, HashMap<String, Option<(u32, bool)>>>;
+pub(super) const UPLOAD_PAGE_BYTES: usize = 4 << 20;
+
+pub(super) fn upload_pages<'a>(
+    segments: impl IntoIterator<Item = &'a [u8]>,
+    retained: usize,
+) -> impl Iterator<Item = (usize, &'a [u8])> {
+    suffix_segments(segments, retained).flat_map(|(offset, segment)| {
+        segment
+            .chunks(UPLOAD_PAGE_BYTES)
+            .enumerate()
+            .map(move |(i, page)| (offset + i * UPLOAD_PAGE_BYTES, page))
+    })
+}
+
 pub(super) type TexelPrefix = Vec<Arc<Vec<u32>>>;
 
 #[cfg_attr(test, derive(Clone))]
@@ -653,4 +667,18 @@ mod tests {
         assert_eq!(tile[6], 0x8000_0000);
         assert_eq!(tile[9].to_le_bytes(), [0, 156, 0, 255]);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn upload_pages_preserve_suffix_offsets() {
+    let prefix = [0; 32];
+    let trailing = vec![1; UPLOAD_PAGE_BYTES + 64];
+    let parts: Vec<_> = upload_pages([&prefix[..], &trailing], 32 + 16)
+        .map(|(offset, data)| (offset, data.len()))
+        .collect();
+    assert_eq!(
+        parts,
+        [(48, UPLOAD_PAGE_BYTES), (48 + UPLOAD_PAGE_BYTES, 48)]
+    );
 }

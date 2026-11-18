@@ -16,7 +16,7 @@ use crate::{
 };
 use glam::Vec3;
 use std::{
-    collections::{hash_map::Entry, BTreeMap, HashMap, HashSet},
+    collections::{hash_map::Entry, BTreeMap, HashMap, HashSet, VecDeque},
     sync::{Arc, Weak},
 };
 
@@ -28,6 +28,7 @@ const EXTRA_PLACEMENTS: usize = 512;
 const EXTRA_GEOMETRY_BYTES: usize = 16 << 20;
 const EXTRA_TEXTURE_BYTES: usize = 16 << 20;
 const DECODE_BATCH: usize = 16;
+const RECENT_TILES: usize = 128;
 type TileKey = (u64, Filter);
 
 #[derive(Default)]
@@ -36,7 +37,24 @@ pub(in crate::gpu) struct SceneryStream {
     manifest: Manifest,
     assets: HashMap<usize, Result<Arc<Asset>, Omission>>,
     tiles: HashMap<TileKey, Weak<Tile>>,
+    recent: RecentTiles,
     pub(super) grass_tiles: HashMap<String, Arc<Tile>>,
+}
+
+/// Strong references for recently used pages, separate from the live set.
+/// Retired assets can be decoded again without decoding their shared DDS.
+#[derive(Default)]
+struct RecentTiles(VecDeque<(TileKey, Arc<Tile>)>);
+impl RecentTiles {
+    fn touch(&mut self, key: TileKey, tile: &Arc<Tile>) {
+        if let Some(i) = self.0.iter().position(|(k, _)| *k == key) {
+            self.0.remove(i);
+        }
+        self.0.push_back((key, tile.clone()));
+        if self.0.len() > RECENT_TILES {
+            self.0.pop_front();
+        }
+    }
 }
 
 pub(in crate::gpu) struct Snapshot {
@@ -355,6 +373,7 @@ impl SceneryStream {
         {
             self.assets.clear();
             self.tiles.clear();
+            self.recent.0.clear();
             self.manifest = Manifest::new(&objects.ornaments);
             self.catalog = Some(Arc::clone(&objects.ornaments));
         }
@@ -431,6 +450,13 @@ impl SceneryStream {
                         next.insert(id, Err(reason));
                     }
                 }
+            }
+        }
+        // Touch low rank first and local last so cache pressure preserves
+        // the same priorities used for optional placement admission.
+        for asset in extra.iter().rev().chain(local.iter()) {
+            for (key, tile) in &asset.tiles {
+                self.recent.touch(*key, tile);
             }
         }
         self.assets = next;
@@ -516,6 +542,25 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_page_history_is_bounded_and_reuses_recent_tiles() {
+        let make = || Arc::new(Tile::new([1, 1], 1, Filter::Color, |_, _| u32::MAX).unwrap());
+        let mut recent = RecentTiles::default();
+        let old = make();
+        let expired = Arc::downgrade(&old);
+        recent.touch((0, Filter::Color), &old);
+        drop(old);
+        for key in 1..RECENT_TILES as u64 {
+            recent.touch((key, Filter::Color), &make());
+        }
+        let kept = expired.upgrade().unwrap();
+        recent.touch((0, Filter::Color), &kept);
+        recent.touch((128, Filter::Color), &make());
+        assert_eq!(recent.0.len(), RECENT_TILES);
+        assert_eq!(recent.0.front().unwrap().0 .0, 2);
+        assert!(Arc::ptr_eq(&recent.0[RECENT_TILES - 2].1, &kept));
+    }
 
     #[test]
     fn budget_rejects_whole_assets_without_charging_and_shares_tiles() {

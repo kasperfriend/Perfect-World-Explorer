@@ -259,6 +259,8 @@ jobs:
       - name: Trace Lighter test scenes on software Vulkan
         env:
           WGPU_BACKEND: vulkan
+          # Bound the cold JIT and exercise the same CPU path as retail captures.
+          GALLIVM_PERF: nopt
           XDG_RUNTIME_DIR: /tmp
           PW_SMALL_TREE_ATLAS: "1"
           CARGO_TERM_COLOR: never
@@ -283,6 +285,8 @@ jobs:
       - name: Exercise nonblocking viewer and explicit headless capture
         env:
           WGPU_BACKEND: vulkan
+          # Bound the cold JIT and exercise the same CPU path as retail captures.
+          GALLIVM_PERF: nopt
           XDG_RUNTIME_DIR: /tmp
           PW_SMALL_TREE_ATLAS: "1"
           PW_UI_TEST: "1"
@@ -310,6 +314,8 @@ jobs:
       - name: Check saved Lighter inventory and matching PNG
         env:
           WGPU_BACKEND: vulkan
+          # Bound the cold JIT and exercise the same CPU path as retail captures.
+          GALLIVM_PERF: nopt
           XDG_RUNTIME_DIR: /tmp
           PW_SMALL_TREE_ATLAS: "1"
           PW_SAVE_LIGHTER_COVERAGE: target/lighter-coverage-fixture
