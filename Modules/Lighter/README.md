@@ -190,9 +190,10 @@ Texture tiles and distant terrain are simplified. Vegetation uses sampled motion
 [vegetation motion and LOD scope](vegetation.md). Ground projections, cloud-shadow proxies and ray-lit view precipitation
 use shared authored inputs. See [world effects and weather](effects-weather.md)
 for remaining lens/Warp and blend-factor limits.
-The native whole-world BMD preload, temporal upscalers and frame generation
-are paused while Lighter renders. Existing saved choices for those features
-are unchanged; Lighter uses the separate bounded BMD region described above.
+The native whole-world BMD preload, external upscalers and frame generation
+are paused while Lighter renders. Existing saved choices are unchanged;
+Lighter resolves its own ray image before scene post and uses the separate
+bounded BMD region described above. See [presentation and device recovery](presentation.md).
 
 ### Baked and relit materials
 
