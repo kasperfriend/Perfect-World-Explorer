@@ -5992,19 +5992,25 @@ pub fn run(
                             // its format and usage are the generator's business,
                             // not this compositor's. Rather than guess, the traced
                             // terms wait for a frame the viewer composes itself.
-                            // Frame generation means this frame is composed by the
-                            // generator, so the Imaginator cannot write to it. That
-                            // used to be a silent skip: the module said it was
-                            // running and the picture never changed. Say so instead,
-                            // and keep tracing so the terms are ready the moment the
-                            // generator is switched off.
-                            if renderer.modules.imaginator_active() && fg_views.is_some() {
-                                renderer
-                                    .modules
-                                    .imaginator()
-                                    .report_frame_generation();
-                            }
-                            if renderer.modules.imaginator_active() && fg_views.is_none() {
+                            // Frame generation used to disable the module outright:
+                            // `fg_views.is_some()` skipped the composite on every
+                            // frame, which is why the page read "frames composited:
+                            // 0" forever with XeSS Frame Generation on by default.
+                            //
+                            // That was wrong. The generator's composition texture
+                            // is created with `surface_format` (`xess/fg.rs`,
+                            // `NativeTexture2D::create(... surface_format ...)`), so
+                            // it is the same sRGB target the module composites into
+                            // in the plain path and accepts the identical passes. It
+                            // is also where the frame is built, and the UI pass runs
+                            // *after* this point with `Load`, so compositing here
+                            // leaves the HUD on top. What the module must not do is
+                            // treat the generator's texture as something it can bind
+                            // for reading, which is exactly what passing
+                            // `composed_view` as the scene view avoids: the
+                            // generator's own copy of the scene is not available, so
+                            // the module copies the current contents instead.
+                            if renderer.modules.imaginator_active() {
                                 let (fw, fh) = (config.width.max(1), config.height.max(1));
                                 let d = camera.direction();
                                 // The camera's view basis, then the same X flip
@@ -6044,15 +6050,32 @@ pub fn run(
                                 // it. If this backend does not, compositing is
                                 // skipped and reported instead of submitting a
                                 // copy the validator would reject.
+                                // `frame` is the swapchain image, which only
+                                // exists when no generator owns presentation. With
+                                // frame generation there is no swapchain texture to
+                                // copy, so the composite sources `scene_view` (the
+                                // composition image) directly and blends over it:
+                                // the traced terms still reach the pixels.
                                 let present_texture = if composed_view.is_none() {
                                     frame.as_ref().map(|present| &present.texture)
                                 } else {
                                     None
                                 };
+                                // A copy is only needed when a *texture* is handed
+                                // over (the plain swapchain path). When the module
+                                // samples `scene_view` where it lies - a gamma or
+                                // present-encode intermediate, and now the frame
+                                // generator's composition too - there is nothing to
+                                // copy and `COPY_SRC` is irrelevant. Testing the
+                                // surface capability regardless is what made the
+                                // composite look impossible under frame generation.
                                 let surface_is_copyable = config
                                     .usage
                                     .contains(wgpu::TextureUsages::COPY_SRC);
-                                if composed_view.is_none() && !surface_is_copyable {
+                                let copyable = composed_view.is_some()
+                                    || present_texture.is_none()
+                                    || surface_is_copyable;
+                                if !copyable {
                                     renderer.modules.imaginator().report_uncopyable_frame();
                                 } else {
                                     let mut encoder = renderer.device.create_command_encoder(

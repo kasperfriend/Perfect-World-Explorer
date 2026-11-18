@@ -413,19 +413,6 @@ impl Imaginator {
         }
     }
 
-    /// Tell the module the frame is composed by a frame generator this frame.
-    ///
-    /// Not an error: it is the one case the compositor has to skip, because the
-    /// generator owns the composition image and the module cannot write to it.
-    /// Reporting it is what stops that from looking like a broken tracer.
-    pub fn report_frame_generation(&mut self) {
-        let why = "frame generation is composing this frame, so the traced terms are not \
-                   applied; turn frame generation off to see them (tracing keeps running)";
-        if self.status != why {
-            self.status = why.to_string();
-        }
-    }
-
     /// Build the GPU objects. Called once, after the device exists.
     pub fn init(&mut self, device: &wgpu::Device, format: wgpu::TextureFormat) {
         // `wgpu` panics on an uncaptured error by default. A validation mistake
@@ -1637,6 +1624,34 @@ mod tests {
                 || head.contains("ui.add_enabled(true,"),
             "the hardware tracer must stay selectable, or the RT-core path is unreachable \
              whenever the probe is unhappy"
+        );
+    }
+
+    /// Frame generation must not switch the tracer off.
+    ///
+    /// The composite was gated on `fg_views.is_none()`, so with XeSS Frame
+    /// Generation on - which is a saved setting, and was on - the module was
+    /// skipped on every single frame. The page read "frames composited: 0" for
+    /// both tracers and nothing said why. The generator's composition texture is
+    /// built with the surface format, so it is the same sRGB target the module
+    /// writes in the plain path; there was never a reason to refuse it.
+    #[test]
+    fn frame_generation_does_not_disable_the_composite() {
+        let source = include_str!("../gpu.rs");
+        // The composite call site is the block that creates the "imaginator
+        // composite" encoder.
+        let site = source
+            .split("label: Some(\"imaginator composite\")")
+            .next()
+            .unwrap_or("");
+        let window = &site[site.len().saturating_sub(6000)..];
+        assert!(
+            !window.contains("imaginator_active() && fg_views.is_none()"),
+            "the composite must not be gated on frame generation being absent"
+        );
+        assert!(
+            !window.contains(".report_frame_generation()"),
+            "frame generation is no longer a reason to skip the composite"
         );
     }
 }
