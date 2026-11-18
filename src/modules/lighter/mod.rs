@@ -20,6 +20,7 @@ use textures::{suffix_segments, TexelPrefix, Textures};
 
 const PIXELS: &str = include_str!("pixels.wgsl");
 const BSDF: &str = include_str!("bsdf.wgsl");
+const MEDIA: &str = include_str!("media.wgsl");
 const BASE: &str = include_str!("trace.wgsl");
 const SOFTWARE: &str = include_str!("software.wgsl");
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -74,7 +75,7 @@ pub struct Frame {
     pub grass_history: [[f32; 4]; scene::GRASS_WIND_SLOTS],
     pub shore_offsets: [f32; 4],
     pub resident_bounds: [f32; 4], // x min/max, z min/max
-    pub water_effects: [u32; 4],   // simple-water tile, start body id (nonzero), reserved
+    pub water_effects: [u32; 4],   // simple tile, initial body, wet-cell table, body count
 }
 
 // Matches Pixel in pixels.wgsl. Includes padding-free guide storage.
@@ -306,7 +307,7 @@ impl Software {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Lighter software BVH"),
-            source: wgpu::ShaderSource::Wgsl([PIXELS, BSDF, BASE, SOFTWARE].concat().into()),
+            source: wgpu::ShaderSource::Wgsl([PIXELS, BSDF, MEDIA, BASE, SOFTWARE].concat().into()),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Lighter compute ray tracer"),
@@ -817,7 +818,7 @@ impl Lighter {
             if self.hardware.is_none() {
                 self.hardware = Some(vulkan::Renderer::new(
                     device,
-                    &[PIXELS, BSDF, BASE, HARDWARE].concat(),
+                    &[PIXELS, BSDF, MEDIA, BASE, HARDWARE].concat(),
                 )?);
             }
             let rt = self.hardware.as_mut().unwrap();

@@ -8,6 +8,7 @@ use crate::modules::lighter::{
 use glam::Vec3;
 
 struct WetBody {
+    export: u32,
     center: [f32; 3],
     height: f32,
     cols: usize,
@@ -31,6 +32,7 @@ impl WetBody {
             })
             .collect();
         Self {
+            export: a.export_id,
             center: a.center,
             height: a.height,
             cols: a.columns,
@@ -38,6 +40,27 @@ impl WetBody {
             grid: a.grid_size,
             wet,
         }
+    }
+
+    fn pack(&self, bank: &mut Textures, at: usize) -> Result<(), String> {
+        let mask = bank.reserve(self.wet.len())?;
+        bank.write_words(mask, &self.wet);
+        let x0 = self.center[0] - 0.5 * self.cols as f32 * self.grid;
+        let z0 = self.center[2] + 0.5 * self.rows as f32 * self.grid;
+        bank.write_words(
+            at,
+            &[
+                x0.to_bits(),
+                z0.to_bits(),
+                self.grid.to_bits(),
+                self.height.to_bits(),
+                self.cols as u32,
+                self.rows as u32,
+                mask as u32,
+                0,
+            ],
+        );
+        Ok(())
     }
 
     fn contains(&self, eye: Vec3) -> bool {
@@ -50,13 +73,18 @@ impl WetBody {
 #[derive(Default)]
 pub(super) struct Water {
     bodies: Vec<WetBody>,
+    table: u32,
     simple: Vec<u32>,
     shore: Option<(Mesh, Surface)>,
 }
 
 impl Water {
     pub(super) fn load(t: &Terrain, tex: &mut Textures) -> Result<Self, String> {
-        let bodies = t.water.iter().map(WetBody::new).collect();
+        let bodies: Vec<_> = t.water.iter().map(WetBody::new).collect();
+        let table = tex.reserve(bodies.len() * 8)?;
+        for (i, body) in bodies.iter().enumerate() {
+            body.pack(tex, table + i * 8)?;
+        }
         let mut simple = Vec::new();
         if t.water.iter().any(|a| a.simple) {
             for frame in &t.water_simple_frames {
@@ -106,6 +134,7 @@ impl Water {
         };
         Ok(Self {
             bodies,
+            table: table as u32,
             simple,
             shore,
         })
@@ -125,12 +154,15 @@ impl Water {
 
     pub(super) fn append(&self, m: &MeshData, b: &mut Builder) -> Result<(), String> {
         for &(export, lo, hi, simple) in &m.ray_water {
-            let surface = b.surface(Surface::new(
-                0,
-                WATER | if simple { SIMPLE_WATER } else { 0 },
-                0.,
-                0.,
-            ));
+            let id = self
+                .bodies
+                .iter()
+                .position(|b| b.export == export)
+                .ok_or_else(|| format!("missing Lighter medium for water export {export}"))?;
+            let surface = b.surface(
+                Surface::new(0, WATER | if simple { SIMPLE_WATER } else { 0 }, 0., 0.)
+                    .with_water_body(id as u32 + 1),
+            );
             let mesh = span(
                 &m.vertices,
                 &m.indices[lo as usize..hi as usize],
@@ -144,6 +176,10 @@ impl Water {
             b.chunk_mapped(ChunkKey::ShoreWaves, mesh, &[id])?;
         }
         Ok(())
+    }
+
+    pub(super) fn table(&self) -> [u32; 2] {
+        [self.table, self.bodies.len() as u32]
     }
 
     pub(super) fn simple_frame(&self, seconds: f64) -> u32 {

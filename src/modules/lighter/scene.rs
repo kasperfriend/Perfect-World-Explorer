@@ -162,9 +162,10 @@ pub struct Surface {
     blend: u32,      // D3D source and destination factors (0: default ray alpha)
     glass: [u32; 2], // linear transmission tint, signed IOR (negative: solid)
     pbr: [u32; 2],   // metallic, perceptual roughness (-1: convert legacy gloss)
+    water_body: u32,
 }
 pub const SURFACE_WORDS: usize = std::mem::size_of::<Surface>() / 4;
-const _: () = assert!(SURFACE_WORDS == 26);
+const _: () = assert!(SURFACE_WORDS == 27);
 
 impl Surface {
     pub fn new(texture: u32, flags: u32, cutoff: f32, reflectance: f32) -> Self {
@@ -185,6 +186,7 @@ impl Surface {
             diffuse: u32::MAX,
             blend: 0,
             glass: [0; 2],
+            water_body: 0,
             pbr: [0, (-1.0f32).to_bits()],
         }
     }
@@ -263,6 +265,11 @@ impl Surface {
                 roughness.clamp(0.04, 1.).to_bits(),
             ];
         }
+        self
+    }
+
+    pub fn with_water_body(mut self, body: u32) -> Self {
+        self.water_body = body;
         self
     }
 

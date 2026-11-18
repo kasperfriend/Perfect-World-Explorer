@@ -453,6 +453,7 @@ impl Feed {
         };
         let cutoff = self.cutoff.then_some(self.near_bounds);
         let current_body = self.water.at(camera.pos, cutoff);
+        let [water_table, body_count] = self.water.table();
         lighter::Frame {
             vp: matrix.to_cols_array_2d(),
             inv_vp: matrix.inverse().to_cols_array_2d(),
@@ -531,7 +532,12 @@ impl Feed {
             grass_history: f.grass_history,
             shore_offsets: self.water.shore_offsets(f.elapsed),
             resident_bounds: cutoff.unwrap_or([-1.0e9, 1.0e9, -1.0e9, 1.0e9]),
-            water_effects: [self.water.simple_frame(f.elapsed64), current_body, 0, 0],
+            water_effects: [
+                self.water.simple_frame(f.elapsed64),
+                current_body,
+                water_table,
+                body_count,
+            ],
         }
     }
 }

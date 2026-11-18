@@ -7,7 +7,7 @@ use scene::*;
 fn naga_validates_both_paths_and_emits_native_ray_queries() {
     use naga_rt as naga;
     for src in [
-        [PIXELS, BSDF, BASE, SOFTWARE].concat(),
+        [PIXELS, BSDF, MEDIA, BASE, SOFTWARE].concat(),
         [PIXELS, include_str!("present.wgsl")].concat(),
         [PIXELS, post::SHADER].concat(),
     ] {
@@ -20,7 +20,7 @@ fn naga_validates_both_paths_and_emits_native_ray_queries() {
         .validate(&module)
         .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
     }
-    let shader = vulkan::shader(&[PIXELS, BSDF, BASE, HARDWARE].concat())
+    let shader = vulkan::shader(&[PIXELS, BSDF, MEDIA, BASE, HARDWARE].concat())
         .expect("Vulkan ray-query WGSL to SPIR-V");
     assert_eq!(shader[0], 0x0723_0203);
     let mut opcodes = Vec::new();
@@ -683,6 +683,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_effect_placement(&mut h);
     exercise_finite_emitters(&mut h);
     exercise_dielectric_and_metal(&mut h);
+    exercise_media_segments(&mut h);
     if mode == Mode::Software {
         exercise_bsdf_energy(&h);
     }
@@ -1160,6 +1161,149 @@ fn exercise_material_channels(h: &mut Harness) {
     );
     assert!((pixel.1 - depth_at(frame, -5. * Vec3::Z)).abs() < 1e-6);
     eprintln!("Lighter: both authored bake endpoints, relighting, face stages, sidedness and normal map passed");
+}
+
+fn exercise_media_segments(h: &mut Harness) {
+    let mut bank = Textures::default();
+    let sky = bank
+        .tile([1, 1], 1, textures::Filter::Color, |_, _| {
+            rgba([0., 0., 0.5, 1.])
+        })
+        .unwrap();
+    let body = bank.reserve(8).unwrap();
+    let mask = bank.reserve(1).unwrap();
+    bank.write_words(mask, &[1]); // west cell wet, east cell dry
+    bank.write_words(
+        body,
+        &[
+            (-2.0f32).to_bits(),
+            1.0f32.to_bits(),
+            2.0f32.to_bits(),
+            0,
+            2,
+            1,
+            mask as u32,
+            0,
+        ],
+    );
+    let mut b = Builder::default();
+    let top = quad_material(
+        &mut b,
+        [[-2., 0., 1.], [0., 0., 1.], [-2., 0., -1.], [0., 0., -1.]],
+        [0., 1., 0.],
+        Surface::new(0, WATER, 0., 0.).with_water_body(1),
+        u32::MAX,
+    );
+    put(&mut b, top);
+    let wall = quad(
+        &mut b,
+        [[1., 0., -1.], [1., 0., 1.], [1., -3., -1.], [1., -3., 1.]],
+        [-1., 0., 0.],
+        0,
+        EMISSIVE,
+        u32::MAX,
+    );
+    put(&mut b, wall);
+    let bottom = quad(
+        &mut b,
+        [
+            [-2., -4., 1.],
+            [0., -4., 1.],
+            [-2., -4., -1.],
+            [0., -4., -1.],
+        ],
+        [0., 1., 0.],
+        0,
+        0,
+        u32::MAX,
+    );
+    put(&mut b, bottom);
+    h.ray.install(Ok((b.finish(), bank)));
+    h.ray.settings.lighting = false;
+    h.ray.settings.shadows = false;
+    h.ray.settings.reflections = false;
+    h.ray.settings.bounces = 1;
+    let empty = Builder::default().finish();
+    let eye = Vec3::new(-1.5, -2., 0.);
+    let mut f = test_frame(eye, Vec3::X, 3);
+    f.water_effects = [0, 1, body as u32, 1];
+    f.resident_bounds = [-200., 200., -200., 200.];
+    f.water = [0., 12., 1., 0.];
+    let hue = Vec3::from_slice(&f.water_color);
+    let tr = |dist: f32| {
+        let density = Vec3::ONE + (Vec3::ONE - hue / hue.max_element()) * 0.5;
+        (density * (-4.321928 * dist / 12.))
+            .to_array()
+            .map(f32::exp2)
+    };
+    let wet = Vec3::from_array(tr(1.5));
+    f.air = [0., 4., 1., 0.];
+    f.air_color = [0.12, 0.20, 0.24, 0.];
+    let air = Vec3::splat(0.75) + Vec3::from_slice(&f.air_color) * 0.25;
+    let expected = hue * (Vec3::ONE - wet) + wet * air;
+    let p = h.pixel(f, &empty);
+    assert_radiance(
+        "water footprint exits into a dry cell, then air fog",
+        p,
+        expected.to_array(),
+    );
+    assert!((p.1 - depth_at(f, Vec3::new(1., -2., 0.))).abs() < 1e-5);
+
+    let view = |dir| {
+        let mut view = test_frame(eye, dir, 3);
+        view.water_effects = f.water_effects;
+        view.resident_bounds = f.resident_bounds;
+        view.water = f.water;
+        view
+    };
+    let mut up = view(Vec3::Y);
+    up.sky0 = [sky, sky, sky, 0];
+    up.sky_tint = [1.; 4];
+    let t = Vec3::from_array(tr(2.));
+    let expected = hue * (Vec3::ONE - t) + t * Vec3::Z * (0.2158605 * 1.333f32.powi(2));
+    let p = h.pixel(up, &empty);
+    assert_radiance(
+        "submerged sky through typed water exit",
+        p,
+        expected.to_array(),
+    );
+    assert!((p.1 - depth_at(up, Vec3::new(eye.x, 0., 0.))).abs() < 1e-5);
+
+    let mut down = view(-Vec3::Y);
+    down.sun = [0., 1., 0., 1.];
+    down.ambient = [0.; 4];
+    down.sun_color = [0.75; 4];
+    h.ray.settings.lighting = true;
+    h.ray.settings.shadows = true;
+    h.ray.settings.soft_sun = false;
+    h.ray.settings.bounces = 0;
+    let fresnel = ((1.333f32 - 1.) / (1.333 + 1.)).powi(2);
+    let fog = hue * (Vec3::ONE - t);
+    let expected = fog + t * Vec3::from_array(tr(4.)) * (0.75 * (1. - fresnel));
+    let lit = h.pixel(down, &empty);
+    assert_radiance(
+        "flat-interface caustic link attenuates the sun leg separately",
+        lit,
+        expected.to_array(),
+    );
+    let mut blocker = Builder::default();
+    let slab = quad(
+        &mut blocker,
+        [[-2., 1., 1.], [0., 1., 1.], [-2., 1., -1.], [0., 1., -1.]],
+        [0., 1., 0.],
+        0,
+        0,
+        u32::MAX,
+    );
+    put(&mut blocker, slab);
+    let occluded = h.pixel(down, &blocker.finish());
+    assert_radiance(
+        "an above-water blocker still occludes a submerged receiver",
+        occluded,
+        fog.to_array(),
+    );
+    assert_eq!(lit.1, occluded.1);
+    eprintln!("Lighter: wet-to-dry extinction, submerged sky and two-leg sun connection passed");
 }
 
 fn exercise_dielectric_and_metal(h: &mut Harness) {
