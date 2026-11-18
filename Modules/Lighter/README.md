@@ -162,8 +162,9 @@ code. They are not two different lighting models.
 This is still a bounded, low-sample renderer for legacy assets, not a reference
 path tracer. Lights retain authored colors/ranges rather than calibrated radiant
 intensities. Panoramas are not HDR light probes. Gloss is a normalized
-power-cosine approximation with scalar reflectance, not a full microfacet BRDF
-with independently sampled analytic highlights. Air fog is linear, and water
+power-cosine approximation with scalar reflectance, unless **GGX / Lambert materials** is enabled. That option uses one
+energy-bounded microfacet/diffuse model for direct and bounced light; see
+[scattering and explicit glass](bsdf.md). Air fog is linear, and water
 is an open height surface rather than a closed volume. There is no caustic
 solver.
 
