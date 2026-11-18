@@ -3680,33 +3680,37 @@ impl Renderer {
         // against a view that no longer exists.
         reset_history: bool,
     ) {
-        if self.lighter.replaces_world() {
-            let frame = self.begin_frame(camera, w, h);
-            return self.render_lighter(target, matrix, camera, &frame, w, h);
-        }
+        let ray_world = self.lighter.replaces_world();
         // Where this frame's CPU time goes, stage by stage. One line a second on
         // the `TimingFrame` channel; see `FrameBudget`.
         let mut stage_ms = [0f64; STAGE_COUNT];
         let mut lap_at = Instant::now();
-        self.scene_passes = 1;
-        self.water_scissored = 0;
-        self.water_scissor_cover = 0.;
-        // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
-        // the same block walk the client runs before the level rule.
-        // Both buffers are reused: this runs for every view of every frame.
-        let spans = &self.spans;
-        let terrain_runs = &mut self.terrain_runs;
-        let terrain_gpu = &self.terrain_gpu;
-        let far_terrain_runs = &mut self.far_terrain_runs;
-        std::thread::scope(|s| {
-            s.spawn(|| crate::terrain_residency::visible_runs_into(spans, matrix, terrain_runs));
-            s.spawn(|| terrain_gpu.visible_far_runs_into(matrix, far_terrain_runs));
-        });
-        // One indirect record per run, so the terrain itself is one call per mesh
-        // instead of one call per run.
-        self.queue_main_runs();
-        lap(STAGE_VISIBILITY, &mut stage_ms, &mut lap_at);
+        if !ray_world {
+            self.scene_passes = 1;
+            self.water_scissored = 0;
+            self.water_scissor_cover = 0.;
+            // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
+            // the same block walk the client runs before the level rule.
+            // Both buffers are reused: this runs for every view of every frame.
+            let spans = &self.spans;
+            let terrain_runs = &mut self.terrain_runs;
+            let terrain_gpu = &self.terrain_gpu;
+            let far_terrain_runs = &mut self.far_terrain_runs;
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    crate::terrain_residency::visible_runs_into(spans, matrix, terrain_runs)
+                });
+                s.spawn(|| terrain_gpu.visible_far_runs_into(matrix, far_terrain_runs));
+            });
+            // One indirect record per run, so the terrain itself is one call per mesh
+            // instead of one call per run.
+            self.queue_main_runs();
+            lap(STAGE_VISIBILITY, &mut stage_ms, &mut lap_at);
+        }
         let frame = self.begin_frame(camera, w, h);
+        if ray_world {
+            return self.render_lighter(target, matrix, camera, &frame, w, h);
+        }
         self.weather.advance(camera.logic_delta_ms);
         let selected_weather = camera.regional_light.map_or(
             crate::client_weather::WeatherSelection::default(),

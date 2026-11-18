@@ -5,9 +5,39 @@ use crate::{
 };
 use glam::Vec3;
 
-fn fixture() -> Terrain {
-    let element =
-        std::env::temp_dir().join(format!("pwe-lighter-no-client-{}", std::process::id()));
+const SKY: [u8; 4] = [25, 75, 175, 255];
+
+struct FixtureRoot(std::path::PathBuf);
+impl FixtureRoot {
+    fn new() -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("pwe-lighter-test-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let root = Self(dir);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(1, 1, image::Rgba(SKY))
+            .write_to(&mut bytes, image::ImageFormat::Bmp)
+            .unwrap();
+        let keys = crate::sky_gpu::SKY_DEFAULTS.map(crate::sky_gpu::sky_pack_key);
+        let entries = keys
+            .each_ref()
+            .map(|key| (key.as_str(), bytes.get_ref().as_slice()));
+        crate::pck::write_test_archive(&root.0.join("textures.pck"), &entries);
+        root
+    }
+}
+impl Drop for FixtureRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn fixture(element: &std::path::Path) -> Terrain {
+    let element = element.to_path_buf();
     let side = TILE as f32;
     let mut elevation = crate::terrain_store::Builder::new_resident(TILE, TILE, TILE).unwrap();
     elevation
@@ -133,12 +163,15 @@ fn lighter_streamed_world_pixels() {
     // Use the real viewer upload/build and replacement dispatch, not a Packet
     // assembled in the test. A native dry cell, wet cell and SpeedTree instance
     // must reach the ray scene, and mesh streaming must invalidate it.
-    let mut terrain = fixture();
+    let root = FixtureRoot::new();
+    let mut terrain = fixture(&root.0);
     let mut camera = Camera::new(&terrain);
     camera.pos = Vec3::new(-2.5, 5., 0.);
     camera.yaw = 0.;
     camera.pitch = -std::f32::consts::FRAC_PI_4;
     camera.far = 40.;
+    camera.time_of_day = 12.;
+    camera.celestial_discs = false;
     camera.atmospheric_fog = false;
     camera.water_reflections = false;
     camera.terrain_lightmaps = false;
@@ -243,6 +276,14 @@ fn lighter_streamed_world_pixels() {
         at_center(&mut r, &camera),
         [255, 0, 0, 255],
         "tree geometry missing from the ray scene"
+    );
+
+    camera.pos.x = 0.;
+    camera.pitch = 0.6;
+    let sky = at_center(&mut r, &camera);
+    assert!(
+        sky.into_iter().zip(SKY).all(|(a, b)| a.abs_diff(b) <= 1),
+        "authored sky not sampled on misses: {sky:?}"
     );
 
     terrain.water.clear();

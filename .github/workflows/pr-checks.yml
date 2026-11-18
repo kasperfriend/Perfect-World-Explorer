@@ -102,13 +102,6 @@ jobs:
           # both sides of a meridian, as pure arithmetic with no GPU and no assets.
           rustc --edition=2021 -O -o /tmp/phase5-sky-seam-check src/bin/phase5-sky-seam-check.rs
           /tmp/phase5-sky-seam-check
-      - name: Inspect dependency resolution on the working branch
-        if: github.ref == 'refs/heads/arena/69c8ea78-perfect-world-explorer'
-        run: |
-          cargo metadata --format-version 1 > /tmp/pwe-metadata.json
-          if ! git diff --quiet -- Cargo.lock; then
-            echo "::notice title=resolved-lock-diff::$(git diff --binary -- Cargo.lock | gzip -n | base64 -w0)"
-          fi
       - name: Check all binary targets
         run: |
           # Keep the plain command so a non-zero exit still fails the job, but
@@ -268,10 +261,10 @@ jobs:
         run: |
           export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
           test -n "$VK_ICD_FILENAMES"
-          cargo test --locked --bin perfect-world-explorer lighter_ -- --ignored \
+          status=0
+          (set -o pipefail; cargo test --locked --bin perfect-world-explorer lighter_ -- --ignored \
             --skip lighter_hardware_pixels --skip lighter_vulkan_interop_on_cpu --test-threads=1 \
-            2>&1 | tee /tmp/lighter-pixels.log
-          status=${PIPESTATUS[0]}
+            2>&1 | tee /tmp/lighter-pixels.log) || status=$?
           if [ "$status" -ne 0 ]; then
             grep -A4 -E 'panicked at|^error(\[|:)' /tmp/lighter-pixels.log | head -25 \
               | while IFS= read -r line; do echo "::error::$line"; done
