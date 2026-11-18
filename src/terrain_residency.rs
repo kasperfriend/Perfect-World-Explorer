@@ -164,40 +164,35 @@ impl Residency {
         indices: &mut Vec<u32>,
     ) -> Vec<Span> {
         // One exact allocation, not geometric growth of a second near mesh.
-        let (mut vertex_count, mut index_count) = (0, 0);
+        let mut collected = Vec::with_capacity(window.blocks().min(self.blocks.len()));
+        let (mut total_v, mut total_i) = (0, 0);
         for y in window.y0..window.y1 {
             for x in window.x0..window.x1 {
                 if let Some(block) = self.blocks.get(&(x, y)) {
                     if !block.indices.is_empty() {
-                        vertex_count += block.vertices.len();
-                        index_count += block.indices.len();
+                        total_v += block.vertices.len();
+                        total_i += block.indices.len();
+                        collected.push(((x, y), block));
                     }
                 }
             }
         }
-        vertices.reserve_exact(vertex_count);
-        indices.reserve_exact(index_count);
-        let mut spans = Vec::with_capacity(window.blocks());
-        for y in window.y0..window.y1 {
-            for x in window.x0..window.x1 {
-                let Some(block) = self.blocks.get(&(x, y)) else {
-                    continue;
-                };
-                if block.indices.is_empty() {
-                    continue;
-                }
-                let base = vertices.len() as u32;
-                let start = indices.len() as u32;
-                vertices.extend_from_slice(&block.vertices);
-                indices.extend(block.indices.iter().map(|i| base + *i));
-                spans.push(Span {
-                    block: (x, y),
-                    start,
-                    count: block.indices.len() as u32,
-                    bounds: block.bounds,
-                });
-            }
+        vertices.reserve_exact(total_v);
+        indices.reserve_exact(total_i);
+        let mut spans = Vec::with_capacity(collected.len());
+        for ((x, y), block) in collected {
+            let base = vertices.len() as u32;
+            let start = indices.len() as u32;
+            vertices.extend_from_slice(&block.vertices);
+            indices.extend(block.indices.iter().map(|i| base + *i));
+            spans.push(Span {
+                block: (x, y),
+                start,
+                count: block.indices.len() as u32,
+                bounds: block.bounds,
+            });
         }
+
         spans
     }
 }
@@ -207,16 +202,23 @@ impl Residency {
 /// fall outside the same clip plane, so nothing that could be on screen is
 /// dropped.
 pub fn in_frustum(matrix: Mat4, bounds: [f32; 6]) -> bool {
+    intersects(&planes(matrix), bounds)
+}
+
+fn planes(matrix: Mat4) -> [[f32; 4]; 6] {
     let m = matrix.to_cols_array();
-    let planes = [
+    [
         [m[3] + m[0], m[7] + m[4], m[11] + m[8], m[15] + m[12]],
         [m[3] - m[0], m[7] - m[4], m[11] - m[8], m[15] - m[12]],
         [m[3] + m[1], m[7] + m[5], m[11] + m[9], m[15] + m[13]],
         [m[3] - m[1], m[7] - m[5], m[11] - m[9], m[15] - m[13]],
         [m[2], m[6], m[10], m[14]],
         [m[3] - m[2], m[7] - m[6], m[11] - m[10], m[15] - m[14]],
-    ];
-    for [a, b, c, d] in planes {
+    ]
+}
+
+fn intersects(planes: &[[f32; 4]; 6], bounds: [f32; 6]) -> bool {
+    for &[a, b, c, d] in planes {
         let px = if a >= 0.0 { bounds[3] } else { bounds[0] };
         let py = if b >= 0.0 { bounds[4] } else { bounds[1] };
         let pz = if c >= 0.0 { bounds[5] } else { bounds[2] };
@@ -243,8 +245,10 @@ pub fn visible_runs(spans: &[Span], matrix: Mat4) -> Vec<(u32, u32)> {
 /// emptied first and refilled in span order.
 pub fn visible_runs_into(spans: &[Span], matrix: Mat4, runs: &mut Vec<(u32, u32)>) {
     runs.clear();
+    runs.reserve(spans.len().min(256));
+    let planes = planes(matrix);
     for span in spans {
-        if span.count == 0 || !in_frustum(matrix, span.bounds) {
+        if span.count == 0 || !intersects(&planes, span.bounds) {
             continue;
         }
         match runs.last_mut() {
@@ -258,9 +262,10 @@ pub fn visible_runs_into(spans: &[Span], matrix: Mat4, runs: &mut Vec<(u32, u32)
 /// `visible_runs`; this stays as the standalone census.
 #[allow(dead_code)]
 pub fn visible_blocks(spans: &[Span], matrix: Mat4) -> usize {
+    let planes = planes(matrix);
     spans
         .iter()
-        .filter(|s| s.count != 0 && in_frustum(matrix, s.bounds))
+        .filter(|s| s.count != 0 && intersects(&planes, s.bounds))
         .count()
 }
 

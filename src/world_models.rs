@@ -33,6 +33,7 @@ impl Assets {
         };
         let mut cache: HashMap<String, Option<usize>> = HashMap::new();
         let mut tracks = crate::model_asset::TrackCache::default();
+        result.instances.reserve(placements.len());
         for placement in placements {
             let path = ecmodel::normalize(&placement.path);
             let asset = if let Some(index) = cache.get(&path) {
@@ -75,8 +76,9 @@ impl Assets {
         }
         let mut file =
             File::open(element.join("models.pck")).map_err(|e| format!("models.pck: {e}"))?;
-        let mut entries = HashMap::new();
-        for entry in crate::pck::directory(&mut file)? {
+        let dir = crate::pck::directory(&mut file)?;
+        let mut entries = HashMap::with_capacity(dir.len());
+        for entry in dir {
             let name = ecmodel::normalize(&entry.name);
             if entries.insert(name.clone(), entry).is_some() {
                 return Err(format!("duplicate normalized models.pck entry: {name}"));

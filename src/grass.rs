@@ -3,11 +3,9 @@
 #[path = "grass_random.rs"]
 pub mod random;
 use crate::{pck, scene, water};
-use flate2::read::ZlibDecoder;
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
-    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -68,14 +66,7 @@ impl Area {
         typ: &scene::GrassType,
     ) -> Result<random::PlacementIter<'static>, String> {
         let size = self.width * self.height / 8;
-        let mut bits = Vec::with_capacity(size);
-        ZlibDecoder::new(self.active.packed.as_slice())
-            .take((size + 1) as u64)
-            .read_to_end(&mut bits)
-            .map_err(|e| e.to_string())?;
-        if bits.len() != size {
-            return Err("bad grass bitmap length".into());
-        }
+        let bits = crate::pck::inflate(&self.active.packed, size)?;
         Ok(random::PlacementIter::owned(
             self.width,
             self.height,
@@ -407,12 +398,7 @@ impl Grass {
                 let src = data
                     .get(start + 8..start + 8 + stored)
                     .ok_or_else(|| "short grass compressed bitmap".to_string())?;
-                let mut output = Vec::with_capacity(bytes);
-                let mut dec = ZlibDecoder::new(src).take((bytes + 1) as u64);
-                dec.read_to_end(&mut output).map_err(|e| e.to_string())?;
-                if output.len() != bytes {
-                    return Err("bad grass bitmap length".to_string());
-                }
+                let output = crate::pck::inflate(src, bytes)?;
                 let count = output.iter().map(|byte| byte.count_ones() as usize).sum();
                 let active = ActiveMask {
                     packed: src.to_vec(),
@@ -566,7 +552,7 @@ impl Grass {
                     if let Some(entry) = entry {
                         if let Ok(bytes) = pck::read_entry(&mut archive, entry) {
                             if let Ok(img) = image::load_from_memory(&bytes) {
-                                textures.insert(mesh.texture.clone(), img.to_rgba8());
+                                textures.insert(mesh.texture.clone(), img.into_rgba8());
                                 match crate::vegetation_textures::authored_lower_mips(&bytes) {
                                     Ok(mips) => {
                                         texture_mips.insert(mesh.texture.clone(), mips);

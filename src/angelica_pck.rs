@@ -29,6 +29,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
 const WINDOWS: [usize; 3] = [1 << 16, 1 << 19, 1 << 22];
+const MIN_COMPRESSED_RECORD: usize = 8;
 
 fn u32le(b: &[u8], p: usize) -> Result<u32, String> {
     Ok(u32::from_le_bytes(
@@ -43,30 +44,39 @@ fn u32le(b: &[u8], p: usize) -> Result<u32, String> {
 /// Mirrors `_stream_ending_at`: scan backwards for a zlib header (CM=8,
 /// window <= 7) and accept the first stream that consumes exactly the bytes up
 /// to `end` and produces one record.
-fn record_ending_at(blob: &[u8], end: usize) -> Result<([u8; 276], usize), String> {
+fn record_ending_at(
+    blob: &[u8],
+    end: usize,
+    decomp: &mut Decompress,
+) -> Result<([u8; 276], usize), String> {
     let mut out = [0u8; 276];
-    let mut decoder = Decompress::new(true);
+    let mut searched_low = end.saturating_sub(MIN_COMPRESSED_RECORD).min(blob.len());
     for span in WINDOWS {
         let low = end.saturating_sub(span);
-        let mut start = end;
+        let mut start = searched_low;
         while start > low {
             start -= 1;
-            let header = blob[start];
-            if header & 0x0F != 8 || header >> 4 > 7 {
+            let raw = &blob[start..end];
+            if !(raw.len() >= 2
+                && (raw[0] & 0x0f) == 8
+                && (raw[0] >> 4) <= 7
+                && (raw[1] & 0x20) == 0
+                && ((u16::from(raw[0]) << 8) | u16::from(raw[1])) % 31 == 0)
+            {
                 continue;
             }
-            let input = &blob[start..end];
-            decoder.reset(true);
-            let Ok(status) = decoder.decompress(input, &mut out, FlushDecompress::Finish) else {
+            decomp.reset(true);
+            let Ok(status) = decomp.decompress(raw, &mut out, FlushDecompress::Finish) else {
                 continue;
             };
             if status == flate2::Status::StreamEnd
-                && decoder.total_out() == 276
-                && decoder.total_in() == (end - start) as u64
+                && decomp.total_out() == 276
+                && decomp.total_in() == (end - start) as u64
             {
                 return Ok((out, start));
             }
         }
+        searched_low = low;
     }
     Err("no Angelica record ends at the expected offset".into())
 }
@@ -110,8 +120,9 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     }
     let mut pos = trailer;
     let mut reversed = Vec::with_capacity(count);
+    let mut decomp = Decompress::new(true);
     for _ in 0..count {
-        let (record, start) = record_ending_at(&blob, pos)?;
+        let (record, start) = record_ending_at(&blob, pos, &mut decomp)?;
         let zero = record[..260].iter().position(|&x| x == 0).unwrap_or(260);
         let (decoded, _, _) = encoding_rs::GBK.decode(&record[..zero]);
         let name = decoded.replace('\\', "/");

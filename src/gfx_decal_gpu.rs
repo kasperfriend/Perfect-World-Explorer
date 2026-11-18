@@ -251,7 +251,7 @@ impl Draw {
                     "GFX decal texture/state changed without rebuilding GPU resources".into(),
                 );
             }
-            let vertices = quad.vertices.iter().map(Vertex::from).collect::<Vec<_>>();
+            let vertices: [Vertex; 4] = std::array::from_fn(|i| Vertex::from(&quad.vertices[i]));
             if bytemuck::cast_slice::<Vertex, f32>(&vertices)
                 .iter()
                 .any(|value| !value.is_finite())
@@ -264,11 +264,18 @@ impl Draw {
     }
 
     pub fn draw_quads<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
+        if self.quads.is_empty() {
+            return;
+        }
+        pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint16);
+        let mut last_key = None;
         for quad in &self.quads {
-            pass.set_pipeline(&self.pipelines[&quad.key]);
+            if last_key != Some(quad.key) {
+                pass.set_pipeline(&self.pipelines[&quad.key]);
+                last_key = Some(quad.key);
+            }
             pass.set_bind_group(0, &quad.binding, &[]);
             pass.set_vertex_buffer(0, quad.vertices.slice(..));
-            pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint16);
             pass.draw_indexed(0..6, 0, 0..1);
         }
     }

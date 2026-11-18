@@ -115,7 +115,11 @@ impl Heights {
         }
     }
     pub fn at(&self, index: usize) -> f32 {
-        self.reader().height(index)
+        match &self.0.data {
+            Data::Memory(v) => v[index],
+            Data::Resident(grid) => grid.heights[index],
+            Data::Disk(_) => self.reader().height(index),
+        }
     }
     pub fn stats(&self) -> Stats {
         match &self.0.data {
@@ -153,6 +157,9 @@ impl Heights {
 }
 impl Normals {
     pub fn at(&self, index: usize) -> [i8; 3] {
+        if let Data::Resident(grid) = &self.0.data {
+            return grid.normals[index];
+        }
         Reader {
             store: Arc::clone(&self.0),
             current: None,
@@ -198,7 +205,7 @@ impl Reader {
             .map_err(|e| format!("terrain cache {}: {e}", d.path.display()))?;
         let cells = d.side * d.side;
         let mut bytes = Vec::with_capacity(cells * 7);
-        ZlibDecoder::new(packed.as_slice())
+        ZlibDecoder::new(&packed[..])
             .take((cells * 7 + 1) as u64)
             .read_to_end(&mut bytes)
             .map_err(|e| format!("terrain cache block {id}: {e}; restart to rebuild cache"))?;
