@@ -93,7 +93,7 @@ impl Settings {
         }
     }
 
-    fn decode(text: &str) -> Self {
+    pub(crate) fn decode(text: &str) -> Self {
         let mut settings = Self::default();
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
@@ -135,7 +135,7 @@ impl Settings {
         settings
     }
 
-    fn encode(self) -> String {
+    pub(crate) fn encode(self) -> String {
         format!(
             "# Lighter settings\nmode={}\nlighting={}\nshadows={}\nsoft_sun={}\nreflections={}\ndenoiser={}\nprogressive={}\nbounces={}\nsamples={}\nresolution={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\nreference={}\n",
             self.mode.token(), self.lighting, self.shadows, self.soft_sun, self.reflections, self.denoiser, self.progressive, self.bounces,

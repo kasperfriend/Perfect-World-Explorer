@@ -694,10 +694,45 @@ fn exercise(mode: Mode, cpu_query: bool) {
     if mode == Mode::Software {
         exercise_bsdf_energy(&h);
     }
+    if mode == Mode::Hardware {
+        exercise_backend_switch(&mut h);
+    }
     exercise_chunk_scaling(&mut h);
     if mode == Mode::Software {
         exercise_reprojection_shader(&h);
     }
+}
+
+fn exercise_backend_switch(h: &mut Harness) {
+    let saved = h.ray.settings;
+    h.ray.settings.lighting = false;
+    h.ray.settings.denoiser = false;
+    h.ray.settings.progressive = false;
+    h.ray.settings.bounces = 0;
+    h.ray.settings.samples = 1;
+    h.ray.settings.resolution = 100;
+    let mut b = Builder::default();
+    let red = upright(&mut b, -4., [1., 0., 0., 1.], EMISSIVE, 0);
+    put(&mut b, red);
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let moving = Builder::default().finish();
+    let frame = test_frame(Vec3::ZERO, Vec3::NEG_Z, 3);
+    let original = h.pixel(frame, &moving);
+    assert_eq!(original.0, [255, 0, 0, 255]);
+    h.ray.settings.mode = Mode::Software;
+    h.ray.reset_history();
+    // Resize while the Software target owns presentation. Switch back to
+    // the retained RT backend at the enlarged extent, with its own image.
+    let larger = test_frame(Vec3::ZERO, Vec3::NEG_Z, 21);
+    let software = h.pixel(larger, &moving);
+    h.ray.settings.mode = Mode::Hardware;
+    h.ray.reset_history();
+    let hardware = h.pixel(larger, &moving);
+    assert_eq!(software.0, original.0);
+    assert_eq!(hardware.0, original.0);
+    assert!((hardware.1 - software.1).abs() < 1.0e-6);
+    h.ray.settings = saved;
+    eprintln!("Lighter: Hardware / Software / Hardware resize kept color and reverse-Z");
 }
 
 fn exercise_ray_texture_filter(h: &mut Harness) {

@@ -11,6 +11,7 @@ use crate::Terrain;
 #[path = "modules/lighter/host.rs"]
 mod lighter_host;
 mod readback;
+mod recovery;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 #[cfg(test)]
@@ -4968,6 +4969,7 @@ fn spawn_world_handoff(
     client_root: &std::path::Path,
     map_id: &str,
     focused: bool,
+    recovery: Option<&recovery::Snapshot>,
 ) -> Result<
     (
         crate::world_handoff::Files,
@@ -4983,6 +4985,7 @@ fn spawn_world_handoff(
     let mut command = std::process::Command::new(exe);
     command.arg(client_root).arg("--world").arg(&id);
     files.configure(&mut command);
+    recovery::Snapshot::configure(&mut command, recovery);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -5201,6 +5204,7 @@ fn run_viewer(
     let map_dir = t.map_dir.clone();
     let client_root = t.client_root.clone();
     let startup_notice = t.startup_notice.clone();
+    let restoring = recovery::Snapshot::from_child(&current_map.id)?;
     let mut catalog = crate::world_catalog::discover(&t.element);
     // Only safe single-folder IDs can be persisted or passed to a replacement
     // process. A raw directory name with spaces/slashes stays loadable as the
@@ -5249,7 +5253,9 @@ fn run_viewer(
             .build(&event_loop)
             .map_err(|e| e.to_string())?,
     );
-    let lighter_settings = if crate::modules::lighter_installed() {
+    let lighter_settings = if let Some(snapshot) = &restoring {
+        snapshot.lighter
+    } else if crate::modules::lighter_installed() {
         LighterSettings::load()
     } else {
         LighterSettings::default()
@@ -5287,6 +5293,9 @@ fn run_viewer(
         }
         Err(error) => return Err(error),
     };
+    let gpu_loss = recovery::Loss::default();
+    let wake = window.clone();
+    gpu_loss.register(&device, move || wake.request_redraw());
     let software_adapter = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
     window.set_title(&format!(
         "Perfect World Explorer — {} — click mouse to look, Esc menu, WASD fly",
@@ -5320,6 +5329,13 @@ fn run_viewer(
     }
     surface.configure(&device, &config);
     let mut camera = Camera::new(&t);
+    if let Some(snapshot) = &restoring {
+        let [x, y, z, yaw, pitch, hour] = snapshot.view;
+        camera.pos = Vec3::new(x, y, z);
+        camera.yaw = yaw;
+        camera.pitch = pitch;
+        camera.time_of_day = hour;
+    }
     camera.underwater_fog = t
         .environments
         .underwater(camera.pos.to_array(), camera.time_of_day);
@@ -5327,6 +5343,9 @@ fn run_viewer(
         .environments
         .atmosphere(camera.pos.to_array(), camera.time_of_day);
     let mut settings = ViewSettings::load_with_default_fog(t.environments.auto_fog_enabled());
+    if restoring.is_some() {
+        settings.time_of_day = camera.time_of_day;
+    }
     #[cfg(test)]
     if smoke_dir.is_some() {
         camera.pos = Vec3::new(-2.5, 5., 0.);
@@ -5771,6 +5790,7 @@ fn run_viewer(
     let mut handoff_files: Option<crate::world_handoff::Files> = None;
     let mut handoff_rx: Option<std::sync::mpsc::Receiver<crate::world_handoff::Message>> = None;
     let mut handoff_ready_signaled = false;
+    let mut gpu_recovering = false;
     let mut saved_settings = settings.clone();
     let mut last_settings_save = Instant::now();
     let mut last = Instant::now();
@@ -5782,7 +5802,7 @@ fn run_viewer(
     #[cfg(test)]
     let mut smoke_resize_requested = false;
     #[cfg(test)]
-    let smoke_deadline = Instant::now() + Duration::from_secs(120);
+    let smoke_deadline = Instant::now() + Duration::from_secs(185);
     let mut region_tick_ms = renderer.started.elapsed().as_millis() as u64;
     let mut last_minimap_key: Option<MinimapKey> = None;
     event_loop
@@ -5896,12 +5916,15 @@ fn run_viewer(
                     if let Some(encode)=present_encode.as_mut() {encode.resize(&renderer.device,s.width,s.height);}
                 }
                 WindowEvent::RedrawRequested => {
+                    if gpu_recovering || gpu_loss.pending() { return; }
+                    gpu_loss.guard_frame(|| {
                     let queue_idle = renderer.device.poll(wgpu::Maintain::Poll).is_queue_empty();
+                    if gpu_loss.pending() { return; }
                     frame_capture.collect();
                     #[cfg(test)]
                     if let Some(dir) = smoke_dir {
-                        assert!(Instant::now() < smoke_deadline, "viewer did not finish both asynchronous captures");
-                        if smoke_frames == 2 && (0..2).all(|i| image::open(dir.join(format!("{i}.png"))).is_ok()) {
+                        assert!(Instant::now() < smoke_deadline, "viewer did not finish the resize/mode-switch captures");
+                        if smoke_frames == 4 && (0..4).all(|i| image::open(dir.join(format!("{i}.png"))).is_ok()) {
                             assert!(presented_once);
                             assert!(renderer.lighter.error().is_none(), "{:?}", renderer.lighter.error());
                             target.exit();
@@ -5945,7 +5968,9 @@ fn run_viewer(
                             let native_idle = match renderer.lighter.poll_hardware() {
                                 Ok(idle) => idle,
                                 Err(error) => {
+                                    let lost = recovery::lost_error(&error);
                                     renderer.lighter.fail_frame(error);
+                                    if lost { return; }
                                     true
                                 }
                             };
@@ -5963,7 +5988,7 @@ fn run_viewer(
                     settings.upscale_quality =
                         crate::nearest_available(settings.upscaling, settings.upscale_quality);
                     let ray_world = renderer.lighter.replaces_world();
-                    let extent_upscaling = if ray_world && settings.upscaling != crate::UpscaleMethod::Fsr1 {
+                    let extent_upscaling = if ray_world {
                         crate::UpscaleMethod::Off
                     } else { settings.upscaling };
                     let wanted_extent = crate::render_extent(slider_extent, (config.width, config.height), max_texture_dimension, extent_upscaling, settings.upscale_quality, &gpu_facts, &sdk_report);
@@ -6090,7 +6115,7 @@ fn run_viewer(
                     let upscaler_running = fsr_upscaler.is_some()
                         || xess_upscaler.is_some()
                         || dlss_upscaler.is_some()
-                        || (settings.upscaling == crate::UpscaleMethod::Fsr1
+                        || (extent_upscaling == crate::UpscaleMethod::Fsr1
                             && crate::fsr1_eligible(applied_extent, (config.width, config.height)));
                     // DLSS evaluates at the render size NGX's optimal settings
                     // returned, which is not necessarily the settings table's
@@ -6100,7 +6125,9 @@ fn run_viewer(
                         .as_ref()
                         .map(|dlss| dlss.render_extent())
                         .unwrap_or(applied_extent);
-                    let wanted_world = if upscaler_running {
+                    let wanted_world = if ray_world {
+                        (config.width.min(max_texture_dimension),config.height.min(max_texture_dimension))
+                    } else if upscaler_running {
                         live_extent
                     } else {
                         slider_extent
@@ -6112,7 +6139,11 @@ fn run_viewer(
                                 gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
                                 return;
                             }
-                            Err(error) => renderer.lighter.fail_frame(error),
+                            Err(error) => {
+                                let lost = recovery::lost_error(&error);
+                                renderer.lighter.fail_frame(error);
+                                if lost { return; }
+                            }
                         }
                     }
                     if wanted_world != world_extent {
@@ -7005,9 +7036,17 @@ fn run_viewer(
                                 world_extent.1,
                                 camera_jumped,
                             );
+                            if gpu_loss.pending() || renderer.lighter.error().is_some_and(recovery::lost_error) { return; }
+                            if restoring.is_some() && !presented_once {
+                                if let Some(error) = renderer.lighter.error() {
+                                    crate::world_handoff::publish_failure(error);
+                                    target.exit();
+                                    return;
+                                }
+                            }
                             #[cfg(test)]
                             if let Some(dir) = smoke_dir {
-                                if smoke_frames == 0 || smoke_frames == 1 && world_extent == (192, 112) {
+                                if smoke_frames == 0 || (1..4).contains(&smoke_frames) && world_extent == (192, 112) {
                                     frame_capture.requested = Some(dir.join(format!("{smoke_frames}.png")));
                                     smoke_frames += 1;
                                 }
@@ -7021,7 +7060,7 @@ fn run_viewer(
                                         fsr_fail_reason = Some(error);
                                         fsr_upscaler = None;
                                         fsr_failed = true;
-                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, extent_upscaling, settings.fsr1_sharpness);
                                     }
                                 }
                             } else if let Some(xess) = xess_upscaler.as_mut() {
@@ -7032,7 +7071,7 @@ fn run_viewer(
                                         xess_fail_reason = Some(error);
                                         xess_upscaler = None;
                                         xess_failed = true;
-                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, extent_upscaling, settings.fsr1_sharpness);
                                     }
                                 }
                             } else if let Some(dlss) = dlss_upscaler.as_mut() {
@@ -7050,11 +7089,11 @@ fn run_viewer(
                                         dlss_fail_reason = Some(error);
                                         dlss_upscaler = None;
                                         dlss_failed = true;
-                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, extent_upscaling, settings.fsr1_sharpness);
                                     }
                                 }
                             } else {
-                                render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                render_scale.blit(&renderer.device, &renderer.queue, scene_view, extent_upscaling, settings.fsr1_sharpness);
                             }
                             // When frame generation separates the UI from the scene,
                             // finish any gamma ramp / UNORM encode into `final_view`
@@ -7515,7 +7554,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                 if selected_world_ui.eq_ignore_ascii_case(&current_map.id) {
                                                     world_change_error = Some(format!("{} is already the active world.", current_map.display_name));
                                                 } else {
-                                                    match spawn_world_handoff(&client_root, &selected_world_ui, window_focused) {
+                                                    match spawn_world_handoff(&client_root, &selected_world_ui, window_focused, None) {
                                                         Ok((files, rx)) => {
                                                             settings.selected_world = selected_world_ui.to_ascii_lowercase();
                                                             if let Err(error) = settings.save() {
@@ -7807,6 +7846,18 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(192, 112));
                                     smoke_resize_requested = true;
                                 }
+                                #[cfg(test)]
+                                if smoke_dir.is_some() {
+                                    let mode = match smoke_frames {
+                                        2 => Some(LighterMode::Off),
+                                        3 => Some(LighterMode::Software),
+                                        _ => None,
+                                    };
+                                    if let Some(mode) = mode {
+                                        renderer.lighter.settings.mode = mode;
+                                        renderer.lighter.reset_history();
+                                    }
+                                }
                                 // The window now has a presentation history, so
                                 // frame generation may take the swapchain over.
                                 presented_once = true;
@@ -7823,6 +7874,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 pacer.present();
                             }
                         }
+                    });
                 }
                 _ => {}
             }
@@ -7838,6 +7890,35 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                 camera.pitch = (camera.pitch - delta.1 as f32 * settings.sensitivity).clamp(-1.5, 1.5);
             }
             Event::AboutToWait => {
+                if !gpu_recovering {
+                    let reason = gpu_loss.take().or_else(|| renderer.lighter.error().filter(|m| recovery::lost_error(m)).map(str::to_owned));
+                    if let Some(reason) = reason {
+                        eprintln!("Graphics device lost: {reason}");
+                        if restoring.is_some() {
+                            crate::world_handoff::publish_failure("The replacement graphics device was also lost.");
+                            target.exit();
+                            return;
+                        }
+                        gpu_recovering = true;
+                        world_loading_active = true;
+                        captured = false;
+                        keys.clear();
+                        let _ = window.set_cursor_grab(CursorGrabMode::None);
+                        window.set_cursor_visible(true);
+                        window.set_title("Perfect World Explorer — restoring graphics device…");
+                        if handoff_rx.is_none() {
+                            let snapshot = recovery::Snapshot {
+                                map: current_map.id.clone(),
+                                view: [camera.pos.x,camera.pos.y,camera.pos.z,camera.yaw,camera.pitch,camera.time_of_day],
+                                lighter: renderer.lighter.settings,
+                            };
+                            match spawn_world_handoff(&client_root,&snapshot.map,window_focused,Some(&snapshot)) {
+                                Ok((files,rx)) => { handoff_files = Some(files); handoff_rx = Some(rx); }
+                                Err(error) => { eprintln!("Graphics recovery could not start: {error}"); target.exit(); return; }
+                            }
+                        }
+                    }
+                }
                 // Handoff/recovery messages are polled outside egui, so the
                 // non-interactive loading overlay cannot swallow them.
                 if let Some(rx) = handoff_rx.take() {
@@ -7865,6 +7946,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 return;
                             }
                             Ok(crate::world_handoff::Message::Failed(reason)) => {
+                                if gpu_recovering { eprintln!("Graphics recovery failed: {reason}"); target.exit(); return; }
                                 settings.selected_world = "world".into();
                                 if let Err(error) = settings.save() {
                                     eprintln!("Settings save after world handoff failure: {error}");
@@ -7887,6 +7969,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 break;
                             }
                             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                if gpu_recovering { eprintln!("Graphics recovery watcher disconnected"); target.exit(); return; }
                                 settings.selected_world = "world".into();
                                 if let Err(error) = settings.save() {
                                     eprintln!("Settings save after world handoff failure: {error}");
@@ -7911,6 +7994,10 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                     if keep_receiver {
                         handoff_rx = Some(rx);
                     }
+                }
+                if gpu_recovering {
+                    target.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(Instant::now()+Duration::from_millis(100)));
+                    return;
                 }
                 if let Some(at) = gpu_retry_at {
                     if Instant::now() < at {

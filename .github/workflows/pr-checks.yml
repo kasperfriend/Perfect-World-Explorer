@@ -296,7 +296,7 @@ jobs:
           export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
           test -n "$VK_ICD_FILENAMES"
           export XDG_CONFIG_HOME="$(mktemp -d)"
-          for suite in live_readback_ring_pixels cutoff_gpu_residency_repacking lighter_headless_preview_png lighter_live_viewer_frames; do
+          for suite in live_readback_ring_pixels cutoff_gpu_residency_repacking lighter_headless_preview_png lighter_device_recovery_fixture lighter_live_viewer_frames; do
             runner=()
             if [ "$suite" = lighter_live_viewer_frames ]; then runner=(xvfb-run -a); fi
             status=0

@@ -966,7 +966,11 @@ impl super::Renderer {
             Ok(true) => {}
             Ok(false) => return, // Live preflight normally defers before acquiring a surface.
             Err(error) => {
+                let lost = super::recovery::lost_error(&error);
                 self.lighter.fail_frame(error);
+                if lost {
+                    return;
+                }
                 Lighter::clear(&mut encoder, target, &depth);
                 self.queue.submit(Some(encoder.finish()));
                 return;

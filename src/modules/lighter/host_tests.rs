@@ -1222,7 +1222,35 @@ fn lighter_live_viewer_frames() {
     let root = FixtureRoot::new();
     super::super::run_viewer(fixture(&root.0), Some(&root.0)).unwrap();
     assert_world_png(&root.0.join("0.png"), (160, 96));
-    assert_world_png(&root.0.join("1.png"), (192, 112));
+    for i in 1..4 {
+        assert_world_png(&root.0.join(format!("{i}.png")), (192, 112));
+    }
+}
+
+#[test]
+#[ignore = "requires Vulkan for a destroyed/fresh device with streamed assets"]
+fn lighter_device_recovery_fixture() {
+    // Inject wgpu's explicit destroy/lost callback, not a physical driver
+    // reset. Rebuild the same streamed window on a completely fresh device.
+    let root = FixtureRoot::new();
+    let position = [-2.5, 5., 0., 0., -std::f32::consts::FRAC_PI_4];
+    let instance = super::super::make_instance(Mode::Software);
+    let (_, device, queue) = pollster::block_on(adapter(&instance, None, Mode::Software)).unwrap();
+    let loss = super::super::recovery::Loss::default();
+    loss.register(&device, || {});
+    queue.submit([]);
+    device.destroy();
+    super::super::wait_for_capture(&device, || Ok(loss.take())).unwrap();
+    drop((queue, device, instance));
+    let path = root.0.join("rebuilt.png");
+    let mut terrain = fixture(&root.0);
+    terrain.objects = crate::objects::Objects::open(&root.0, vec![ornament_record()]).unwrap();
+    super::super::preview_frame(terrain, &path, Some(position), Mode::Software, Some(0)).unwrap();
+    assert_world_png(&path, (960, 720));
+    let meta = std::fs::read_to_string(path.with_extension("coverage.txt")).unwrap();
+    assert!(meta.contains("map=\"lighter-fixture\""));
+    let inventory = std::fs::read_to_string(path.with_extension("coverage.csv")).unwrap();
+    assert!(inventory.lines().any(|l| l.starts_with("buildings,1,")));
 }
 
 fn assert_world_png(path: &std::path::Path, extent: (u32, u32)) {
