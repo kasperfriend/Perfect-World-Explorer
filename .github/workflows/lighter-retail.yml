@@ -60,15 +60,31 @@ jobs:
             stem="target/lighter-retail/${map}-software"
             if ! target/debug/perfect-world-explorer "$RUNNER_TEMP/lighter-client" \
                 --world "$map" --gpu-preview "$stem.png" >"$stem.log" 2>&1; then
-              tail -25 "$stem.log" | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+              tail -8 "$stem.log" | tac | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
               exit 1
             fi
             test -s "$stem.png"
             grep -Fx "map=\"$map\"" "$stem.coverage.txt"
-            for row in near_terrain buildings effect_roots; do
-              grep "^$row," "$stem.coverage.csv"
-            done
+            # These totals are independent of the culling/ranking choices at
+            # the camera; both live and omitted owners have to be accounted for.
+            case "$map" in
+              a01) bmd=328; effects=304 ;;
+              a02) bmd=32; effects=42 ;;
+            esac
+            if ! awk -F, -v bmd="$bmd" -v effects="$effects" '
+              $1=="near_terrain" { terrain=$2 }
+              $1=="buildings" { placed=$2+$3+$4 }
+              $1=="effect_roots" { roots=$2+$3+$4 }
+              END { exit !(terrain>0 && placed==bmd && roots==effects) }
+            ' "$stem.coverage.csv"; then
+              grep -E '^(near_terrain|buildings|effect_roots),' "$stem.coverage.csv" |
+                while IFS= read -r line; do printf '::error::%s %s\n' "$map" "$line"; done
+              exit 1
+            fi
             echo "::notice::$map $(grep '^rgba8_sha256=' "$stem.coverage.txt")"
+            for row in near_terrain buildings effect_roots effect_draws; do
+              echo "::notice::$map $(grep "^$row," "$stem.coverage.csv")"
+            done
             {
               echo "### $map — Software / lavapipe"
               echo '```'
