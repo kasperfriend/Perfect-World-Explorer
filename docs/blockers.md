@@ -1719,3 +1719,42 @@ separate instead of one function answering both wrongly.
   distribution matches between both clients and the area's own `shore_waves=10`
   parses); the surface was being culled from them. Confirming the rendered result
   still needs a frame, which no sandbox path here can draw.
+
+## B-11: water records declare an area count they do not have
+
+The "water is broken in chunks" report (1.3.1, 1.4.4, 1.5.2) read as a geometry
+problem for two rounds. It is not. The walk over a water record read the word
+after the version as the number of areas in the run and then decoded that many.
+
+Every water record in the retail 1.3.1 patches that decodes at all holds exactly
+**one** area, and declares a different number:
+
+| record | declares | actually holds |
+| --- | --- | --- |
+| `bsdata/21.dat` record 0 | 3 | 1 |
+| `bsdata/4.dat` record 1 | 3 | 1 |
+| `bsdata/36.dat` record 9 | 6 | 1 |
+| `bsdata/36.dat` record 10 | 8 | 1 |
+
+In each case the single area's shoreline arrays end on the record's last byte, so
+the area was decoded correctly and then thrown away: the second iteration walked
+into the bytes past the end, failed with "truncated water data", and the whole
+record's result was discarded with it. Modelled over the real patches, the old
+walk decoded **0** areas and the new one decodes **11**.
+
+`decode_areas` now bounds itself by the payload and ignores the word. It stops
+when the bytes are exhausted, and a declared count of zero no longer suppresses a
+record that has content.
+
+The 1.5.2 log independently rules out the mask, which was the previous theory:
+its build already drew every cell of the one area it had, and the report was made
+against that build.
+
+The rest of the loader is now reference-local, so a missing `.dat`, a bad header,
+an out-of-range index or a bad record table each cost their own references and are
+named on the `SceneWater` channel. Before, one bad index aborted the map's water.
+README: `tools/offline_harness.sh water` runs the 15 tests (including
+`a_lying_area_count_does_not_discard_the_area_that_decodes`) against the real
+patch bytes.
+
+- **Status:** fixed and tested. The skipped-by-mask half of the same report is B-10.
