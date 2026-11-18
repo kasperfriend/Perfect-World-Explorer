@@ -1102,9 +1102,7 @@ fn split_continuation(element: &Path, name: &str) -> Option<PathBuf> {
     let size = fs::metadata(&pck).ok()?.len();
     let mut prefix = [0u8; 12];
     fs::File::open(&pck).ok()?.read_exact(&mut prefix).ok()?;
-    if prefix[0..4] != 0x4dca23efu32.to_le_bytes()
-        || prefix[8..12] != 0x56a089b7u32.to_le_bytes()
-    {
+    if prefix[0..4] != 0x4dca23efu32.to_le_bytes() || prefix[8..12] != 0x56a089b7u32.to_le_bytes() {
         return None;
     }
     let declared = u32::from_le_bytes(prefix[4..8].try_into().ok()?) as u64;
@@ -1150,7 +1148,6 @@ fn scan_archive(element: &Path, name: &str) -> ArchiveInfo {
             Ok(entries) => (ContainerKind::Angelica, Ok(entries)),
             Err(angelica_error) => (
                 ContainerKind::Unknown,
-                Err(format!("{pck_error}; {angelica_error}")),
                 Err(match continuation {
                     Some(pkx) => format!(
                         "{pck_error}; {angelica_error} · the other half is in {}",
