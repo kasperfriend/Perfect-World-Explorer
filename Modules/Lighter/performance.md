@@ -87,3 +87,19 @@ drift beyond one ray pixel from the last reset. The lighting fixture also
 checks camera movement out of a penumbra, changes to an off-camera caster and
 light-only edits. The two ping-pong history buffers and both directions of
 postprocessor bindings are retained after warm-up. These are synthetic tests.
+
+## Ranked scenery manifest (Step 6)
+
+[2026-11-18 Linux run 44397497506](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44397497506/job/135131211562)
+passed Software, CPU Vulkan and the streamed-viewer tests. `scenery_manifest`
+unit tests check required-placement deduplication, cutoff, receiver distance,
+static-light ranking, and learned bounds crossing owner cells after teleports.
+The archive-backed join fixture puts one facade on each side of x=128. It
+checks the exact join and both sides for color and depth, asserts four total
+triangles and two stable owner IDs, and verifies local/extra promotion does
+not rebuild the same BLAS. A teleport evicts both, and the return restores the
+same pixels. The fixture covers synthetic assets, not full retail map captures.
+
+Steps 5 and 6 also passed the Windows standalone build and portable upload,
+re-download and layout audit in those same runs. This packaging verification
+is not a Windows ray-rendering or performance test.

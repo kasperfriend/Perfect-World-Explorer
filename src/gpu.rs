@@ -13,7 +13,7 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 #[cfg(test)]
 pub(crate) use lighter_host::tests::{
-    joined_bmd_packets, stitched_terrain_scene, streamed_bmd_scenes,
+    fine_far_terrain_scene, joined_bmd_packets, stitched_terrain_scene, streamed_bmd_scenes,
 };
 use std::{
     collections::{HashMap, HashSet},

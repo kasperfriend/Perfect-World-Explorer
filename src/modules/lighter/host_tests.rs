@@ -504,6 +504,37 @@ fn coarse_far_terrain_matches_the_nonflat_perimeter_in_all_directions() {
     }
 }
 
+#[test]
+fn fine_far_grid_snaps_to_a_coarser_native_edge() {
+    let mesh = |points: &[[f32; 3]], triangles: Vec<[u32; 3]>| super::Mesh {
+        vertices: points
+            .iter()
+            .map(|&p| super::Vertex::new(p, [0., 1., 0.], [0.; 2]))
+            .collect(),
+        triangles,
+        ..Default::default()
+    };
+    let near = mesh(
+        &[[0., 1., 0.], [0., 5., 4.], [-4., 0., 2.]],
+        vec![[0, 1, 2]],
+    );
+    let far = mesh(
+        &[[0., 1., 0.], [0., 99., 2.], [0., 5., 4.], [4., 0., 2.]],
+        vec![[0, 1, 3], [1, 2, 3]],
+    );
+    let stitched = super::uncovered_far(&far, &near, [-4., 0., 0., 4.], 0);
+    assert_eq!(stitched.triangles.len(), 2);
+    assert_eq!(
+        stitched
+            .vertices
+            .iter()
+            .find(|v| v.pos[0] == 0. && v.pos[2] == 2.)
+            .unwrap()
+            .pos,
+        [0., 3., 2.]
+    );
+}
+
 pub(crate) fn stitched_terrain_scene() -> super::Packet {
     let (mut near, coarse, bounds) = seam_fixture(0);
     let mut builder = super::Builder::default();
@@ -519,6 +550,49 @@ pub(crate) fn stitched_terrain_scene() -> super::Packet {
         .for_each(|v| *v = v.tint(0xff00ff00, 0xff00ff00));
     builder.world_mesh(&near).unwrap();
     builder.world_mesh(&far).unwrap();
+    builder.finish()
+}
+
+pub(crate) fn fine_far_terrain_scene() -> super::Packet {
+    let make = |points: &[[f32; 3]], triangles: &[[u32; 3]], tint| super::Mesh {
+        vertices: points
+            .iter()
+            .map(|&p| super::Vertex::new(p, [0., 1., 0.], [0.; 2]).tint(tint, tint))
+            .collect(),
+        triangles: triangles.to_vec(),
+        surfaces: vec![0; triangles.len()],
+        layers: Vec::new(),
+    };
+    let near = make(
+        &[[-4., 1., 0.], [0., 1., 0.], [-4., 1., 4.], [0., 1., 4.]],
+        &[[0, 2, 1], [1, 2, 3]],
+        0xff0000ff,
+    );
+    let fine = make(
+        &[
+            [0., 1., 0.],
+            [4., 1., 0.],
+            [0., 99., 2.],
+            [4., 1., 2.],
+            [0., 1., 4.],
+            [4., 1., 4.],
+        ],
+        &[[0, 2, 1], [1, 2, 3], [2, 4, 3], [3, 4, 5]],
+        0xffff0000,
+    );
+    let mut far = super::uncovered_far(&fine, &near, [-4., 0., 0., 4.], 0);
+    // Same edge positions; keep the two halves visibly identifiable.
+    for v in &mut far.vertices {
+        *v = v.tint(0xffff0000, 0xffff0000);
+    }
+    let mut builder = super::Builder::default();
+    builder.surface(super::Surface::new(0, 0, 0., 0.));
+    builder
+        .chunk(super::ChunkKey::NearTerrain(0, 0), &near)
+        .unwrap();
+    builder
+        .chunk(super::ChunkKey::FarTerrain(1, 0), &far)
+        .unwrap();
     builder.finish()
 }
 

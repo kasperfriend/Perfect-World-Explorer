@@ -1820,6 +1820,27 @@ fn exercise_terrain_seam(h: &mut Harness) {
         assert_eq!(pixel, color, "grazing ray crossed a terrain seam at x={x}");
         assert!((depth - depth_at(frame, Vec3::new(hit_x, 2., 4.))).abs() < 1e-5);
     }
+    h.ray.install(Ok((
+        crate::gpu::fine_far_terrain_scene(),
+        Textures::default(),
+    )));
+    for x in [-0.125, 0., 0.125] {
+        let frame = test_frame(Vec3::new(x, 5., 2.), -Vec3::Y, 3);
+        let (color, depth) = h.pixel(frame, &empty);
+        let red = [255, 0, 0, 255];
+        let blue = [0, 0, 255, 255];
+        assert!(
+            if x < 0. {
+                color == red
+            } else if x > 0. {
+                color == blue
+            } else {
+                color == red || color == blue
+            },
+            "gap at the finer far grid join x={x}: {color:?}"
+        );
+        assert!((depth - depth_at(frame, Vec3::new(x, 1., 2.))).abs() < 1e-5);
+    }
 }
 
 #[test]

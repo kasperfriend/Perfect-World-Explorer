@@ -88,6 +88,7 @@ jobs:
         run: |
           python3 tools/test_phase1_ready.py
           python3 tools/test_eight_phase_status.py
+          python3 tools/test_lighter_terrain_audit.py
           python3 tools/check-eight-phase-status.py
           python3 tools/audit-static-model-gpu-programs.py
           rustc --edition=2021 --test src/scenery_visibility.rs -o /tmp/scenery-visibility-tests

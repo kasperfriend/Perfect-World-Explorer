@@ -15,6 +15,8 @@ use std::collections::HashMap;
 
 #[path = "scenery.rs"]
 mod scenery;
+#[path = "terrain_fidelity.rs"]
+mod terrain_fidelity;
 pub(super) use scenery::{SceneryStream, Snapshot as ScenerySnapshot};
 
 #[derive(Default)]
@@ -101,20 +103,31 @@ impl Feed {
                 .push(Some(read_tree(tree, &mut result.base, authored_mips)?));
         }
         result.base.seal();
-        // The mainland's native stride-four far mesh is ~2.9M triangles.
-        // Use a coarse mesh of the SAME heightfield so the whole world is
-        // present without duplicating that massive buffer on every stream.
-        // Keep native far geometry on small maps to avoid unnecessary LOD loss.
-        let far = if let Some(far) = upload
-            .far
-            .as_ref()
-            .filter(|(_, indices, _)| indices.len() <= 600_000)
-        {
+        // Audit small maps before borrowing the raster far grid. A narrow
+        // ridge or cliff can be completely missed by stride four. Keep the
+        // existing budget, including stride 16 on larger maps.
+        let plan = {
+            let mut reader = t.heights.reader();
+            terrain_fidelity::choose(t.width, t.height, |x, y| {
+                reader.cell(y * t.width + x).map(|p| p.0)
+            })
+            .map_err(|error| format!("Lighter far terrain height load failed: {error}"))?
+        };
+        match plan.max_sample_error {
+            Some(error) if error > terrain_fidelity::GRID_TOLERANCE => eprintln!(
+                "Lighter: far terrain stride {} exceeds the {:.2}-unit height tolerance (measured {error:.3}); finer grid would exceed its budget",
+                plan.step, terrain_fidelity::GRID_TOLERANCE,
+            ),
+            Some(error) => crate::diag!(TimingLoad, "Lighter far terrain stride {}: measured max height error {error:.3}", plan.step),
+            None => eprintln!("Lighter: far terrain uses stride {} to fit large maps; height tolerance is unverified", plan.step),
+        }
+        let far = if let Some(far) = upload.far.as_ref().filter(|_| plan.step == 4) {
             far
         } else {
             // Also prepare this for a session starting with cutoff enabled:
             // the live cutoff toggle can bring back distant geometry.
-            &crate::terrain_gpu::world_mesh(t, 16)?
+            &crate::terrain_gpu::world_mesh(t, plan.step)
+                .map_err(|error| format!("Lighter far terrain mesh load failed: {error}"))?
         };
         for span in &far.2 {
             let mut patch = Mesh::default();
@@ -227,7 +240,14 @@ impl Feed {
             )?;
             builder.chunk(ChunkKey::NearTerrain(x, y), &near)?;
         }
-        if !m.detail.terrain_cutoff {
+        if m.detail.terrain_cutoff {
+            crate::diag!(
+                TimingLoad,
+                "Lighter terrain cutoff: {} resident blocks; {} far patches intentionally omitted",
+                m.spans.len(),
+                self.far.len()
+            );
+        } else {
             let edges = near_edges(
                 self.near_bounds,
                 m.indices[..m.terrain_end as usize].iter().map(|&i| {
@@ -554,9 +574,39 @@ fn uncovered_far(far: &Mesh, near: &Mesh, bounds: [f32; 4], surface: u32) -> Mes
     stitch_patch(far, &edges, bounds, surface)
 }
 
+/// If the far grid is finer than the installed native LOD, snap each
+/// shared far point to the native edge segment, not just its endpoints.
+fn match_near_perimeter(mut v: Vertex, edges: &Perimeter, [x0, x1, z0, z1]: [f32; 4]) -> Vertex {
+    let [x, _, z] = v.pos;
+    for (edge, (on, along)) in
+        edges
+            .iter()
+            .zip([(x == x0, z), (x == x1, z), (z == z0, x), (z == z1, x)])
+    {
+        if !on {
+            continue;
+        }
+        let index = edge.partition_point(|p| p.0 < along);
+        let Some(&(right, b)) = edge.get(index) else {
+            continue;
+        };
+        if right == along {
+            return b;
+        }
+        if index > 0 {
+            let (left, a) = edge[index - 1];
+            let fraction = (along - left) / (right - left);
+            v.pos[1] = a.pos[1] + fraction * (b.pos[1] - a.pos[1]);
+            return v;
+        }
+    }
+    v
+}
+
 /// Split only the exterior patch edges that touch the native near perimeter.
-/// Vertices inserted along a stride-16 edge use the actual near heights.
-fn stitch_patch(far: &Mesh, edges: &Perimeter, [x0, x1, z0, z1]: [f32; 4], surface: u32) -> Mesh {
+/// Vertices inserted along a coarser edge use the actual near heights.
+fn stitch_patch(far: &Mesh, edges: &Perimeter, bounds: [f32; 4], surface: u32) -> Mesh {
+    let [x0, x1, z0, z1] = bounds;
     // Pack only referenced exterior vertices. Far patches partly covered by
     // the near window used to copy the entire vertex list before clipping.
     let mut out = Mesh::default();
@@ -572,7 +622,11 @@ fn stitch_patch(far: &Mesh, edges: &Perimeter, [x0, x1, z0, z1]: [f32; 4], surfa
             let id = &mut remap[index as usize];
             if *id == u32::MAX {
                 *id = out.vertices.len() as u32;
-                out.vertices.push(far.vertices[index as usize]);
+                out.vertices.push(match_near_perimeter(
+                    far.vertices[index as usize],
+                    edges,
+                    bounds,
+                ));
             }
             *id
         });
