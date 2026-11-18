@@ -2,6 +2,9 @@
 #[allow(dead_code)]
 #[path = "../dxt.rs"]
 mod dxt;
+#[allow(dead_code)]
+#[path = "../angelica_pck.rs"]
+mod angelica_pck;
 #[path = "../grass.rs"]
 mod grass;
 #[path = "../model_dds.rs"]
