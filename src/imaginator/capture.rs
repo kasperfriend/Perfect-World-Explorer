@@ -319,18 +319,47 @@ fn capture_water(b: &mut Builder, areas: &[WaterArea]) {
         let x1 = area.center[0] + half_x;
         let z0 = area.center[2] - half_z;
         let z1 = area.center[2] + half_z;
-        // One quad per mask-covered cell run would be exact; a bounding quad is
-        // not, but a water *plane* is: the mask decides where the client draws
-        // it, not where water physically is. Covering the whole footprint keeps
-        // the mirror continuous, which is what a reflection needs.
-        b.quad(
-            v3(x0, y, z0),
-            v3(x1, y, z0),
-            v3(x1, y, z1),
-            v3(x0, y, z1),
-            v3(0., -1., 0.),
-            material::WATER,
-        );
+        // One quad per *mask-covered* cell, not one bounding quad over the whole
+        // area.
+        //
+        // The mask is what decides where the client actually draws water, and a
+        // bounding box covers the dry ground inside a lake's footprint too. A
+        // traced reflection then appears over land, and - because a ray from the
+        // camera meets that plane before anything under it - water also
+        // occludes whatever is really there. The comment above used to argue
+        // that a "water plane" is a bounding quad; it is not, and the artifact
+        // is visible.
+        //
+        // An area with no mask at all is still drawn as its full footprint,
+        // which is what the client does in that case.
+        let cells_x = area.columns.max(1);
+        let cells_z = area.rows.max(1);
+        let step_x = (half_x * 2.) / cells_x as f32;
+        let step_z = (half_z * 2.) / cells_z as f32;
+        let masked = area.mask.len() >= cells_x * cells_z;
+        for cz in 0..cells_z {
+            for cx in 0..cells_x {
+                if !b.has_room() {
+                    b.clipped = true;
+                    return;
+                }
+                if masked && area.mask[cz * cells_x + cx] == 0 {
+                    continue;
+                }
+                let cx0 = x0 + cx as f32 * step_x;
+                let cz0 = z0 + cz as f32 * step_z;
+                let cx1 = cx0 + step_x;
+                let cz1 = cz0 + step_z;
+                b.quad(
+                    v3(cx0, y, cz0),
+                    v3(cx1, y, cz0),
+                    v3(cx1, y, cz1),
+                    v3(cx0, y, cz1),
+                    v3(0., -1., 0.),
+                    material::WATER,
+                );
+            }
+        }
     }
 }
 
@@ -704,6 +733,55 @@ mod tests {
         assert!(
             trees < terrain,
             "terrain must run last: it is the producer that can be thinned"
+        );
+    }
+
+    /// Water must cover only the cells its mask marks, not its bounding box.
+    ///
+    /// A bounding quad put water over the dry ground inside a lake's footprint,
+    /// so a traced reflection appeared on land and the plane occluded whatever
+    /// was really there - one of the causes of "buildings look transparent".
+    #[test]
+    fn a_masked_water_area_only_covers_its_masked_cells() {
+        let area = WaterArea {
+            export_id: 0,
+            color: 0,
+            simple: false,
+            height: 0.,
+            grid_size: 10.,
+            columns: 2,
+            rows: 2,
+            center: [0., 0., 0.],
+            // Only the north-west cell is water.
+            mask: vec![1, 0, 0, 0],
+            shore_waves: Vec::new(),
+        };
+        let mut b = Builder {
+            triangles: Vec::new(),
+            budget: CaptureBudget::default(),
+            clipped: false,
+            ceiling: None,
+        };
+        capture_water(&mut b, std::slice::from_ref(&area));
+        // One cell, two triangles - not four cells and eight triangles.
+        assert_eq!(b.triangles.len(), 2, "only the masked cell should be water");
+
+        // With no mask at all the whole footprint is water, as the client does.
+        let bare = WaterArea {
+            mask: Vec::new(),
+            ..area
+        };
+        let mut b2 = Builder {
+            triangles: Vec::new(),
+            budget: CaptureBudget::default(),
+            clipped: false,
+            ceiling: None,
+        };
+        capture_water(&mut b2, std::slice::from_ref(&bare));
+        assert_eq!(
+            b2.triangles.len(),
+            8,
+            "an unmasked area is its full footprint"
         );
     }
 }

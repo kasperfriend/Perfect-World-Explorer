@@ -46,6 +46,9 @@ pub mod navigation {
 }
 
 pub mod water {
+    pub struct ShoreWave {
+        pub phase: f32,
+    }
     pub struct WaterArea {
         pub export_id: u32,
         pub color: u32,
@@ -56,6 +59,8 @@ pub mod water {
         pub rows: usize,
         pub center: [f32; 3],
         pub mask: Vec<u8>,
+        /// Real: `src/water.rs:38`.
+        pub shore_waves: Vec<ShoreWave>,
     }
 }
 
