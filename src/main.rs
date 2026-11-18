@@ -3733,12 +3733,20 @@ fn main() {
         && args
             .get(2)
             .is_some_and(|arg| arg == "--gpu-preview" || arg == "--gpu-preview-at");
-    let loaded = if audit {
+    // A device recovery is also pinned to the previous map. Do not publish
+    // readiness for the usual main-world fallback, even if GPU init fails.
+    let device_recovery = gpu::is_device_recovery_child();
+    let loaded = if audit || device_recovery {
         world_load::recoverable_map_operation(|| load_terrain(&preferred_world, None))
             .and_then(|result| result)
             .map(|terrain| (terrain, None))
             .map_err(|error| {
-                format!("Coverage capture for {preferred_world} failed before rendering: {error}")
+                let operation = if device_recovery {
+                    "Graphics recovery"
+                } else {
+                    "Coverage capture"
+                };
+                format!("{operation} for {preferred_world} failed before rendering: {error}")
             })
     } else {
         world_load::load_with_main_world_fallback_notified(&preferred_world, load_terrain)
@@ -3814,8 +3822,9 @@ fn main() {
     })
     .and_then(|result| result);
     if let Err(error) = run_result {
-        if world_load::post_load_failure_decision(&preferred_world, viewer_mode)
-            == world_load::PostLoadDecision::RestartMainWorld
+        if !device_recovery
+            && world_load::post_load_failure_decision(&preferred_world, viewer_mode)
+                == world_load::PostLoadDecision::RestartMainWorld
         {
             saved.selected_world = "world".into();
             if let Err(save_error) = saved.save() {

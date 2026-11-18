@@ -9,6 +9,10 @@ use std::{
 const VIEW_ENV: &str = "PW_GPU_RECOVERY_VIEW";
 const LIGHTER_ENV: &str = "PW_GPU_RECOVERY_LIGHTER";
 
+pub(super) fn is_child() -> bool {
+    crate::world_handoff::is_handoff_child() && std::env::var_os(VIEW_ENV).is_some()
+}
+
 #[derive(Clone, Default)]
 pub(super) struct Loss(Arc<Mutex<Option<String>>>);
 impl Loss {

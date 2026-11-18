@@ -1225,6 +1225,27 @@ fn lighter_live_viewer_frames() {
     for i in 1..4 {
         assert_world_png(&root.0.join(format!("{i}.png")), (192, 112));
     }
+    let child_pid: u32 = std::fs::read_to_string(root.0.join("restored-present"))
+        .expect("replacement did not present")
+        .parse()
+        .unwrap();
+    assert_ne!(child_pid, std::process::id());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "entrypoint for the Xvfb recovery subprocess"]
+fn lighter_live_recovery_child() {
+    let Some(dir) = std::env::var_os("PW_TEST_LIGHTER_RECOVERY_DIR") else {
+        return;
+    };
+    assert!(super::super::is_device_recovery_child());
+    let root = FixtureRoot::new();
+    if let Err(error) = super::super::run_viewer(fixture(&root.0), Some(std::path::Path::new(&dir)))
+    {
+        crate::world_handoff::publish_failure(&error);
+        panic!("replacement viewer: {error}");
+    }
 }
 
 #[test]

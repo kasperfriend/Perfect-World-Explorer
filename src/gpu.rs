@@ -4970,6 +4970,7 @@ fn spawn_world_handoff(
     map_id: &str,
     focused: bool,
     recovery: Option<&recovery::Snapshot>,
+    #[cfg(test)] smoke_dir: Option<&std::path::Path>,
 ) -> Result<
     (
         crate::world_handoff::Files,
@@ -4983,6 +4984,22 @@ fn spawn_world_handoff(
     let files = crate::world_handoff::Files::new();
     files.set_focused(focused);
     let mut command = std::process::Command::new(exe);
+    #[cfg(test)]
+    if let Some(dir) = smoke_dir {
+        // The test binary regenerates the synthetic Terrain in a separate
+        // process. It still exercises the production snapshot and watcher.
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "gpu::lighter_host::tests::lighter_live_recovery_child",
+                "--nocapture",
+            ])
+            .env("PW_TEST_LIGHTER_RECOVERY_DIR", dir);
+    } else {
+        command.arg(client_root).arg("--world").arg(&id);
+    }
+    #[cfg(not(test))]
     command.arg(client_root).arg("--world").arg(&id);
     files.configure(&mut command);
     recovery::Snapshot::configure(&mut command, recovery);
@@ -5182,6 +5199,10 @@ async fn adapter(
 }
 const GPU_RETRY_DELAY: Duration = Duration::from_millis(2);
 
+pub(crate) fn is_device_recovery_child() -> bool {
+    recovery::is_child()
+}
+
 pub fn run(
     t: Terrain,
     #[cfg(windows)] loading: Option<crate::windows_setup::LoadingWindow>,
@@ -5261,7 +5282,7 @@ fn run_viewer(
         LighterSettings::default()
     };
     #[cfg(test)]
-    let lighter_settings = if smoke_dir.is_some() {
+    let lighter_settings = if smoke_dir.is_some() && restoring.is_none() {
         LighterSettings {
             mode: LighterMode::Software,
             lighting: false,
@@ -5348,10 +5369,14 @@ fn run_viewer(
     }
     #[cfg(test)]
     if smoke_dir.is_some() {
-        camera.pos = Vec3::new(-2.5, 5., 0.);
-        camera.yaw = 0.;
-        camera.pitch = -std::f32::consts::FRAC_PI_4;
+        if restoring.is_none() {
+            camera.pos = Vec3::new(-2.5, 5., 0.);
+            camera.yaw = 0.;
+            camera.pitch = -std::f32::consts::FRAC_PI_4;
+        }
         settings = ViewSettings::default();
+        settings.time_of_day = camera.time_of_day;
+        settings.time_pass_enabled = false;
         settings.show_minimap = false;
         settings.music_enabled = false;
         settings.ambience_enabled = false;
@@ -5796,6 +5821,7 @@ fn run_viewer(
     let mut last = Instant::now();
     let mut gpu_retry_at = None;
     let mut surface_needs_config = false;
+    let mut display_extent = (config.width, config.height);
     let mut frame_capture = readback::ViewerCapture::default();
     #[cfg(test)]
     let mut smoke_frames = 0;
@@ -5910,10 +5936,8 @@ fn run_viewer(
                     config.width = s.width;
                     config.height = s.height;
                     surface_needs_config = true;
-                    // Scaled world targets are reallocated by the next redraw,
-                    // which notices the new window extent (see below).
-                    if let Some(gamma)=display_gamma.as_mut() {gamma.resize(&renderer.device,s.width,s.height);}
-                    if let Some(encode)=present_encode.as_mut() {encode.resize(&renderer.device,s.width,s.height);}
+                    // Defer even the display targets to the guarded redraw.
+                    // A resize event can arrive on an already-lost device.
                 }
                 WindowEvent::RedrawRequested => {
                     if gpu_recovering || gpu_loss.pending() { return; }
@@ -5924,10 +5948,20 @@ fn run_viewer(
                     #[cfg(test)]
                     if let Some(dir) = smoke_dir {
                         assert!(Instant::now() < smoke_deadline, "viewer did not finish the resize/mode-switch captures");
-                        if smoke_frames == 4 && (0..4).all(|i| image::open(dir.join(format!("{i}.png"))).is_ok()) {
+                        if restoring.is_none() && smoke_frames == 4 && (0..4).all(|i| image::open(dir.join(format!("{i}.png"))).is_ok()) {
                             assert!(presented_once);
                             assert!(renderer.lighter.error().is_none(), "{:?}", renderer.lighter.error());
-                            target.exit();
+                            if !queue_idle {
+                                gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                return;
+                            }
+                            // Distinct from both the startup camera and saved
+                            // defaults so a child ignoring the snapshot fails.
+                            camera.time_of_day = 7.5;
+                            renderer.lighter.settings.resolution = 61;
+                            renderer.device.destroy();
+                            renderer.device.poll(wgpu::Maintain::Poll);
+                            assert!(gpu_loss.pending(), "explicit destroy missed device-loss callback");
                             return;
                         }
                     }
@@ -5981,6 +6015,11 @@ fn run_viewer(
                             active_surface.configure(&renderer.device, &config);
                         }
                         surface_needs_config = false;
+                    }
+                    if display_extent != (config.width, config.height) {
+                        display_extent = (config.width, config.height);
+                        if let Some(gamma) = display_gamma.as_mut() { gamma.resize(&renderer.device, config.width, config.height); }
+                        if let Some(encode) = present_encode.as_mut() { encode.resize(&renderer.device, config.width, config.height); }
                     }
                     // One place handles both a window resize and a Graphics-tab
                     // scale change: reallocate only when the scaled extent moves.
@@ -7045,7 +7084,7 @@ fn run_viewer(
                                 }
                             }
                             #[cfg(test)]
-                            if let Some(dir) = smoke_dir {
+                            if let Some(dir) = smoke_dir.filter(|_| restoring.is_none()) {
                                 if smoke_frames == 0 || (1..4).contains(&smoke_frames) && world_extent == (192, 112) {
                                     frame_capture.requested = Some(dir.join(format!("{smoke_frames}.png")));
                                     smoke_frames += 1;
@@ -7554,7 +7593,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                 if selected_world_ui.eq_ignore_ascii_case(&current_map.id) {
                                                     world_change_error = Some(format!("{} is already the active world.", current_map.display_name));
                                                 } else {
-                                                    match spawn_world_handoff(&client_root, &selected_world_ui, window_focused, None) {
+                                                    match spawn_world_handoff(&client_root, &selected_world_ui, window_focused, None, #[cfg(test)] None) {
                                                         Ok((files, rx)) => {
                                                             settings.selected_world = selected_world_ui.to_ascii_lowercase();
                                                             if let Err(error) = settings.save() {
@@ -7863,7 +7902,21 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 presented_once = true;
                             }
                             if presented_once {
+                                #[cfg(test)]
+                                if let (Some(dir), Some(snapshot)) = (smoke_dir, restoring.as_ref()) {
+                                    assert_eq!(snapshot.view[5], 7.5);
+                                    assert_eq!(snapshot.lighter.resolution, 61);
+                                    assert_eq!(snapshot.lighter.mode, LighterMode::Software);
+                                    assert_eq!(snapshot.view, [camera.pos.x, camera.pos.y, camera.pos.z, camera.yaw, camera.pitch, camera.time_of_day]);
+                                    assert_eq!(snapshot.lighter, renderer.lighter.settings);
+                                    std::fs::write(dir.join("restored-present"), std::process::id().to_string()).unwrap();
+                                }
                                 signal_handoff_first_frame(&mut handoff_ready_signaled);
+                                #[cfg(test)]
+                                if smoke_dir.is_some() && restoring.is_some() {
+                                    target.exit();
+                                    return;
+                                }
                             }
                             if let Some(session) = latency.as_mut() {
                                 session.present_end();
@@ -7912,7 +7965,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 view: [camera.pos.x,camera.pos.y,camera.pos.z,camera.yaw,camera.pitch,camera.time_of_day],
                                 lighter: renderer.lighter.settings,
                             };
-                            match spawn_world_handoff(&client_root,&snapshot.map,window_focused,Some(&snapshot)) {
+                            match spawn_world_handoff(&client_root,&snapshot.map,window_focused,Some(&snapshot), #[cfg(test)] smoke_dir) {
                                 Ok((files,rx)) => { handoff_files = Some(files); handoff_rx = Some(rx); }
                                 Err(error) => { eprintln!("Graphics recovery could not start: {error}"); target.exit(); return; }
                             }
