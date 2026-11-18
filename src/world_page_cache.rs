@@ -14,7 +14,7 @@ use std::{
 
 const CACHE_MAGIC: &[u8; 8] = b"PWWPAGE1";
 const PAGE_MAGIC: &[u8; 8] = b"PWWPG001";
-const FORMAT: u64 = 1;
+const FORMAT: u64 = 2;
 const MAX_CACHED_PAGES: usize = 100_000;
 const MAX_CACHED_VERTICES: usize = 16_000_000;
 const MAX_CACHED_INDICES: usize = 100_000_000;
@@ -74,6 +74,8 @@ pub(crate) fn identity(
         hash.update(item.extra.to_le_bytes());
         hash.update((item.path.len() as u64).to_le_bytes());
         hash.update(item.path.as_bytes());
+        hash.update((item.map_id.len() as u64).to_le_bytes());
+        hash.update(item.map_id.as_bytes());
         for value in item
             .position
             .into_iter()

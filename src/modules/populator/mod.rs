@@ -1396,9 +1396,15 @@ fn city_zone_target_name(name: &str) -> bool {
     name.contains("city") || name.contains("district")
 }
 
-fn load_live_world_city_zones(element: &Path) -> Result<Vec<CityZone>, String> {
-    let path = element.join("maps/world/world_targets.txt");
-    let destinations = crate::navigation::destinations(&path)
+fn load_live_world_city_zones(map_dir: &Path) -> Result<Vec<CityZone>, String> {
+    if !map_dir
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("world"))
+    {
+        return Err("Live World city crowds are authored for the main world only".into());
+    }
+    let path = map_dir.join("world_targets.txt");
+    let destinations = crate::navigation::destinations_for_world(&path, &[1])
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let zones: Vec<CityZone> = destinations
         .into_iter()
@@ -1909,6 +1915,8 @@ struct StreamCache {
 
 pub struct Populator {
     element: PathBuf,
+    /// Directory of the selected client map; city targets are map-specific.
+    map_dir: PathBuf,
     /// The host world. `None` only for the registry's inert default instance.
     map: Option<MapSpace>,
     settings: Settings,
@@ -1981,6 +1989,7 @@ impl Default for Populator {
     fn default() -> Self {
         Self {
             element: PathBuf::new(),
+            map_dir: PathBuf::new(),
             map: None,
             settings: Settings::default(),
             active: false,
@@ -2027,13 +2036,14 @@ impl Default for Populator {
 }
 
 impl Populator {
-    pub fn new(element: PathBuf, map: MapSpace) -> Self {
-        let (city_zones, city_zone_error) = match load_live_world_city_zones(&element) {
+    pub fn new(element: PathBuf, map: MapSpace, map_dir: PathBuf) -> Self {
+        let (city_zones, city_zone_error) = match load_live_world_city_zones(&map_dir) {
             Ok(zones) => (zones, None),
             Err(error) => (Vec::new(), Some(error)),
         };
         Self {
             element,
+            map_dir,
             map: Some(map),
             city_zones,
             city_zone_error,
@@ -2095,7 +2105,10 @@ impl Populator {
 
     pub fn live_world_zone_status(&self) -> String {
         if let Some(error) = &self.city_zone_error {
-            return format!("City target data unavailable: {error}");
+            return format!(
+                "City target data unavailable for {}: {error}",
+                self.map_dir.display()
+            );
         }
         let choices = self
             .live_world_templates

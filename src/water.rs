@@ -1,7 +1,29 @@
-//! Client EC-BSD water references and A3DWaterArea v0x10003000 grids.
+//! Client EC-BSD water references and A3DWaterArea v0x10002000/0x10003000 grids.
 //! Record layout derived from the supplied elementclient.exe at 0x780d30 and 0x781760.
 use crate::scene::Scene;
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
+
+/// Instance maps name their EC-BSD after the map folder (`a01.ecbsd`), while
+/// the main world and stand-alone fixtures keep `world.ecbsd`. This local
+/// resolver keeps standalone diagnostic binaries independent of the viewer's
+/// world catalog module.
+fn ecbsd_path(dir: &Path) -> PathBuf {
+    let stem = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("world");
+    let named = dir.join(format!("{stem}.ecbsd"));
+    if named.is_file() {
+        named
+    } else {
+        dir.join("world.ecbsd")
+    }
+}
+
 /// Authored shoreline control points and per-vertex day/night ARGB colors.
 /// Version 0x10003000 serialization is read by client routine 0x782680.
 #[derive(Debug, Clone)]
@@ -109,14 +131,20 @@ impl WaterArea {
             .is_some_and(|m| *m != 0)
     }
     pub fn parse(b: &[u8], p: usize, export_id: u32) -> Result<Self, String> {
-        if u(b, p)? != 0x10003000 {
-            return Err("unsupported A3DWaterArea version".into());
+        let version = u(b, p)?;
+        if !matches!(version, 0x10002000 | 0x10003000) {
+            return Err(format!("unsupported A3DWaterArea version {version:#x}"));
         }
         let color = u(b, p + 8)?;
-        let simple = *b
-            .get(p.checked_add(44).ok_or("offset overflow")?)
-            .ok_or("truncated water flag")?
-            != 0;
+        // The older v2 area has no simple-water flag byte: its mask begins
+        // immediately after the centre vector. v3 inserts the flag at +44.
+        let simple = if version == 0x10003000 {
+            *b.get(p.checked_add(44).ok_or("offset overflow")?)
+                .ok_or("truncated water flag")?
+                != 0
+        } else {
+            false
+        };
         let height = f(b, p + 12)?;
         let columns = u(b, p + 20)? as usize;
         let rows = u(b, p + 24)? as usize;
@@ -132,7 +160,8 @@ impl WaterArea {
             return Err("invalid water grid".into());
         }
         let n = columns.checked_mul(rows).ok_or("grid overflow")?;
-        let start = p.checked_add(45).ok_or("offset overflow")?;
+        let mask_offset = if version == 0x10003000 { 45 } else { 44 };
+        let start = p.checked_add(mask_offset).ok_or("offset overflow")?;
         let mask = b
             .get(start..start.checked_add(n).ok_or("overflow")?)
             .ok_or("truncated water cell mask")?
@@ -236,7 +265,7 @@ fn parse_shore_waves(b: &[u8], offset: usize) -> Result<Vec<ShoreWave>, String> 
     Ok(shore_waves)
 }
 pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
-    let b = fs::read(dir.join("world.ecbsd")).map_err(|e| e.to_string())?;
+    let b = fs::read(ecbsd_path(dir)).map_err(|e| e.to_string())?;
     if u(&b, 0)? != 0x42584f4d || u(&b, 4)? != 0x42534446 || u(&b, 8)? != 12 {
         return Err("unsupported EC-BSD header".into());
     }
@@ -473,6 +502,33 @@ mod tests {
         assert_eq!(area.shore_waves[0].day_colors[0], 0xff647f94);
         assert_eq!(area.shore_waves[0].night_colors[0], 0xff235175);
     }
+    #[test]
+    fn parses_legacy_v2_water_without_simple_flag() {
+        // Instance v2 records are a 44-byte header followed immediately by the
+        // cell mask; there is no simple-water flag at +44.
+        let mut b = vec![0; 44 + 4 + 4];
+        for (p, v) in [
+            (0, 0x10002000u32),
+            (8, 0xff123456),
+            (12, 216f32.to_bits()),
+            (20, 2),
+            (24, 2),
+            (28, 32f32.to_bits()),
+            (32, (-32f32).to_bits()),
+            (36, 216f32.to_bits()),
+            (40, 32f32.to_bits()),
+        ] {
+            b[p..p + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        b[44..48].copy_from_slice(&[1, 0, 0, 1]);
+        let area = WaterArea::parse(&b, 0, 19).unwrap();
+        assert_eq!(area.mask, [1, 0, 0, 1]);
+        assert!(!area.simple);
+        assert_eq!(area.columns, 2);
+        assert_eq!(area.center, [-32., 216., 32.]);
+        assert!(area.shore_waves.is_empty());
+    }
+
     #[test]
     fn parses_simple_water() {
         let mut b = vec![0; 53];
