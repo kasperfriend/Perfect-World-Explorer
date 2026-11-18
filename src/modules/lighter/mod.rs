@@ -85,6 +85,11 @@ pub const CULL_BUILDINGS: u32 = 16;
 pub const UNDERWATER: u32 = 32;
 const SOFT_SUN: u32 = 64;
 
+pub(crate) fn storage_limit(device: &wgpu::Device) -> usize {
+    let limits = device.limits();
+    u64::from(limits.max_storage_buffer_binding_size).min(limits.max_buffer_size) as usize
+}
+
 pub struct World {
     pub packet: Packet,
     pub textures: Textures,
@@ -437,6 +442,7 @@ pub struct Lighter {
     frame_error: Option<String>,
     persistence_error: Option<String>,
     status: Option<String>,
+    pub(crate) scenery_coverage: Option<String>,
 }
 
 impl Default for Lighter {
@@ -459,6 +465,7 @@ impl Default for Lighter {
             frame_error: None,
             persistence_error: None,
             status: None,
+            scenery_coverage: None,
         }
     }
 }
@@ -570,8 +577,7 @@ impl Lighter {
             .world
             .as_ref()
             .ok_or("Lighter has no resident ray scene")?;
-        let limits = device.limits();
-        let storage = u64::from(limits.max_storage_buffer_binding_size).min(limits.max_buffer_size);
+        let storage = storage_limit(device) as u64;
         for (label, len) in [
             ("resident world", world.packet.bytes().len()),
             ("moving geometry", moving.bytes().len()),
@@ -767,9 +773,14 @@ impl Lighter {
         } else {
             ui.label("Preparing the first ray-traced frame…");
         }
+        if self.replaces_world() {
+            if let Some(coverage) = &self.scenery_coverage {
+                ui.label(coverage);
+            }
+        }
         ui.separator();
         ui.label("Lighter traces the streamed main world, including water, vegetation, buildings and animated world effects. It uses its own ray lighting and samples the client's sky textures. Map views and UI are unchanged.");
-        ui.label("Hardware mode uses Vulkan, not DirectX 12. The whole-world scenery preload and temporal upscaling/frame generation are suspended while Lighter is active. See Modules/Lighter/README.md for compatibility notes.");
+        ui.label("Hardware mode uses Vulkan, not DirectX 12. The native whole-world preload is suspended; Lighter has its own bounded BMD residency. Temporal upscaling/frame generation are also suspended. See Modules/Lighter/README.md for compatibility notes.");
     }
 }
 

@@ -38,10 +38,11 @@ installed manifests (the repository's `Modules` directory). Settings live in
 
 - The resident terrain mesh and layer masks, plus a lower-detail mesh of the
   native far heightfield when terrain cutoff is off.
-- Streamed BMD buildings, SpeedTree geometry, instanced grass, posed world
-  models, world effect sheets and posed effect meshes. Walker and Populator
-  poses are included if active. Secondary rays can hit objects outside the
-  camera frustum **within the streamed scene**.
+- BMD buildings, SpeedTree geometry, instanced grass, posed world models,
+  world effect sheets and posed effect meshes. Walker and Populator poses are
+  included if active. Secondary rays can hit objects outside the camera
+  frustum **within the resident scene**. BMDs can also be resident beyond the
+  native ornament load distance (see below).
 - Native water cells and their animated normal textures. Reflections and
   refractions are new world-space rays. Snell refraction and unpolarized
   dielectric Fresnel handle both sides of the interface, including total
@@ -52,6 +53,30 @@ installed manifests (the repository's `Modules` directory). Settings live in
   of 0.27°, producing penumbras that widen with blocker distance. Disabling
   **Soft sun shadows** restores a single directional shadow ray. Point lights
   still have sharp shadows. The native world passes do not composite on top.
+
+### Static scenery residency
+
+Lighter consumes BMD meshes and source textures from the native archive
+resolver, not from the raster atlas. It retains the native local ornaments and
+also requests BMDs within **768 world units horizontally** of the installed
+terrain block center. Selection does not depend on camera direction. The
+original-game terrain cutoff still clips placement residency to the installed
+terrain window. Raster map views and the native renderer use their existing
+scenery selection.
+
+The extension admits no more than 512 candidates, nearest first, with separate
+16 MiB budgets for packed geometry (including conservative BVH overhead) and
+additional texture tiles. Available adapter storage can reduce it further; at
+insertion, no more than half of the remaining texture-bank room goes to the
+extension. Source data for unchanged resident BMDs is reused on the CPU. This
+is not whole-map residency or a guarantee against off-screen omissions: bounds
+are based on placement origins, not receiver/light reach or model bounds, and
+the static acceleration structures are still rebuilt for a new packet. The
+**Lighter** menu reports local and extended placements, range/cutoff exclusions,
+budget deferrals, unavailable models and missing texture references.
+
+For the remaining work across terrain, models, textures, vegetation, water,
+lighting and verification, see the [full ray-tracing checklist](TODO.md).
 
 ### Denoising and convergence
 
@@ -128,8 +153,9 @@ Texture tiles and distant terrain are simplified. Native terrain lightmaps,
 vegetation wind and camera-facing leaf behavior, cloud detail, rain/snow and
 shoreline wave overlays, lens flares and some legacy effect/skin blend and
 no-depth-test modes are not reproduced.
-The whole-world BMD preload, temporal upscalers and frame generation are paused
-while Lighter renders. Existing saved choices for those features are unchanged.
+The native whole-world BMD preload, temporal upscalers and frame generation
+are paused while Lighter renders. Existing saved choices for those features
+are unchanged; Lighter uses the separate bounded BMD region described above.
 
 ## Verification
 
@@ -149,9 +175,13 @@ structures. The viewer fixture switches between native and RT and checks
 actual native-pass submission, terrain, water cells, trees, authored sky, a
 streamed BMD, GFX texture/playback, and static and runtime point-light shadows.
 It also checks eviction and that Hardware RT on a CPU ICD fails without
-falling back to raster. These are synthetic scenes, not real-map visual or
-physical GPU performance certification. The first frame on software Vulkan
-may be slow while the driver compiles the shader.
+falling back to raster. Both ray pixel suites use the production archive and
+streaming code for the same cutout BMD beyond the native load distance: they
+check camera visibility, sun shadow, both water paths, independent water flags,
+reverse-Z depth, movement into the native region, eviction and reload. These
+are synthetic scenes, not real-map visual or physical GPU performance
+certification. The first frame on software Vulkan may be slow while the driver
+compiles the shader.
 
 ```sh
 # Headless software traversal. Point VK_ICD_FILENAMES at lavapipe for CPU Vulkan.

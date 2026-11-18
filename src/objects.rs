@@ -441,6 +441,22 @@ impl Objects {
         self.load_ids(&ids)?;
         Ok(ids)
     }
+    /// Visit a small ray-only batch without replacing the native region's
+    /// parsed models. Resolution, failures and the bounded decoded texture
+    /// cache are still shared. The visitor must consume the batch's textures
+    /// before the next load (only the current load's textures are pinned).
+    #[allow(dead_code)] // This file is also compiled into scenery audit binaries.
+    pub(crate) fn with_supplemental_ids<T>(
+        &mut self,
+        ids: &[usize],
+        visit: impl FnOnce(&Self) -> T,
+    ) -> Result<T, String> {
+        let main = std::mem::take(&mut self.models);
+        let result = self.load_ids(ids).map(|()| visit(self));
+        self.models = main;
+        result
+    }
+
     /// Loads a small explicit batch for the independent world preload worker.
     pub fn load_ids(&mut self, ids: &[usize]) -> Result<(), String> {
         let mut active = HashSet::with_capacity(ids.len());

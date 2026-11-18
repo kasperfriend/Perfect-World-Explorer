@@ -259,7 +259,57 @@ pub struct Builder {
     lights: Vec<Light>,
 }
 
+/// Budget for one optional world-space mesh appended after required geometry.
+/// Surfaces are charged before interning; nodes are charged at most two per
+/// item, so this bounds rather than guesses the final storage binding size.
+#[derive(Clone, Copy)]
+pub(crate) struct MeshBudget {
+    pub vertices: usize,
+    pub triangles: usize,
+    pub bytes: usize,
+}
+
+impl MeshBudget {
+    pub fn debit(&mut self, mesh: &Mesh, surfaces: usize) -> bool {
+        let v = mesh.vertices.len();
+        let t = mesh.triangles.len();
+        let bytes = v * std::mem::size_of::<Vertex>()
+            + t * (6 + 2 * super::bvh::NODE_WORDS as usize) * 4
+            + surfaces * std::mem::size_of::<Surface>();
+        if v > self.vertices || t > self.triangles || bytes > self.bytes {
+            return false;
+        }
+        self.vertices -= v;
+        self.triangles -= t;
+        self.bytes -= bytes;
+        true
+    }
+}
+
 impl Builder {
+    /// Reserve space for the static TLAS and light BVH, which are only appended
+    /// by `finish`. An optional extension must not overflow a binding when
+    /// the ordinary resident scene fits on its own.
+    pub fn optional_mesh_budget(&self, storage_bytes: usize) -> MeshBudget {
+        let instances = self.instances.len() + 1;
+        let bvh_words = self.bvh.nodes.len() * super::bvh::NODE_WORDS as usize
+            + self.bvh.items.len()
+            + (instances + self.lights.len()) * (2 * super::bvh::NODE_WORDS as usize + 1);
+        let fixed = (HEADER_WORDS
+            + self.vertices.len() * VERTEX_WORDS as usize
+            + self.triangles.len() * 5
+            + self.materials.len() * 5
+            + instances * INSTANCE_WORDS as usize
+            + self.lights.len() * 8
+            + bvh_words)
+            * 4;
+        MeshBudget {
+            vertices: MAX_ITEMS.saturating_sub(self.vertices.len()),
+            triangles: MAX_ITEMS.saturating_sub(self.triangles.len()),
+            bytes: storage_bytes.saturating_sub(fixed),
+        }
+    }
+
     pub fn light(&mut self, light: Light) {
         let [x, y, z, r] = light.position_range;
         if r > 0.

@@ -10,6 +10,8 @@ use crate::Terrain;
 mod lighter_host;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
+#[cfg(test)]
+pub(crate) use lighter_host::tests::streamed_bmd_scenes;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -544,8 +546,8 @@ struct MeshData {
     water_start: u32,
     water_batches: Vec<WaterBatch>,
     local_pages: Vec<crate::world_objects::Page>,
-    /// Lighter-only specular metadata parallel to local pages/placement ranges.
-    local_gloss: Vec<Vec<crate::modules::lighter::scene::Gloss>>,
+    /// Optional ray feed prepared on the same loader as the native pages.
+    ray_scenery: Option<Result<lighter_host::ScenerySnapshot, String>>,
     /// True when this build left the locally streamed scenery out because the
     /// whole-world preload owns it. The renderer compares it against the state
     /// it is drawing with, the same way `lod` is compared, so a crossing into
@@ -794,6 +796,7 @@ fn build(
     // between a crossing that rebuilds a terrain mesh and one that also uploads
     // tens of megabytes of unused atlas.
     skip_local_scenery: bool,
+    ray_scenery: Option<&mut lighter_host::SceneryStream>,
 ) -> Result<MeshData, String> {
     if vegetation_authored_mips {
         static WARN: std::sync::Once = std::sync::Once::new();
@@ -1390,8 +1393,7 @@ fn build(
         requested.len(),
         pages.len()
     );
-    let mut page_gloss = vec![Vec::new(); pages.len()];
-    for id in ornament_ids {
+    for &id in &ornament_ids {
         let Some(model) = t.objects.get(id) else {
             continue;
         };
@@ -1461,13 +1463,6 @@ fn build(
                     order: 0,
                     visibility,
                 });
-                page_gloss[page_id].push(
-                    mesh.material
-                        .as_ref()
-                        .map_or_else(crate::modules::lighter::scene::Gloss::default, |m| {
-                            crate::modules::lighter::scene::Gloss::authored(m.specular, m.power)
-                        }),
-                );
             }
         }
     }
@@ -1488,16 +1483,24 @@ fn build(
     }
     let mut local_pages = Vec::with_capacity(pages.len());
     let mut local_page_keys = Vec::with_capacity(pages.len());
-    let mut local_gloss = Vec::with_capacity(pages.len());
-    for (index, ((_, page), gloss)) in pages.into_iter().zip(page_gloss).enumerate() {
+    for (index, (_, page)) in pages.into_iter().enumerate() {
         let page = page.finish();
         if page.indices.is_empty() {
             continue;
         }
         local_page_keys.push(local_page_key(&page, &page_textures[index]));
         local_pages.push(page);
-        local_gloss.push(gloss);
     }
+    // Snap the independent ray region to the same block that drives stream
+    // requests. Rotating or moving within an unchanged block cannot change it.
+    let ray_scenery = ray_scenery.map(|stream| {
+        let block = TILE as f32 * t.grid_spacing;
+        let center = [
+            cx + (0.5 - (gx / TILE as f32).rem_euclid(1.)) * block,
+            cz - (0.5 - (gy / TILE as f32).rem_euclid(1.)) * block,
+        ];
+        stream.prepare(&mut t.objects, &ornament_ids, center, resident_bounds)
+    });
     // Keep opaque indices separate so water can sample reflected/refracted scene passes.
     let water_start = indices.len() as u32;
     let mut water_batches: Vec<WaterBatch> = Vec::new();
@@ -1687,7 +1690,7 @@ fn build(
         water_start,
         water_batches,
         local_pages,
-        local_gloss,
+        ray_scenery,
         local_scenery_skipped: skip_local_scenery,
     })
 }
@@ -2031,7 +2034,7 @@ impl Renderer {
         let lighter_feed = if lighter.armed() {
             match lighter_host::Feed::new(t, &m, vegetation_authored_mips) {
                 Ok(mut feed) => {
-                    lighter.install(feed.snapshot(&m));
+                    feed.install(&mut lighter, &m, &device);
                     Some(feed)
                 }
                 Err(error) => {
@@ -3052,7 +3055,7 @@ impl Renderer {
     }
     fn update_mesh(&mut self, mut m: MeshData) -> Result<(), String> {
         if let Some(feed) = &mut self.lighter_feed {
-            self.lighter.install(feed.snapshot(&m));
+            feed.install(&mut self.lighter, &m, &self.device);
         }
         if let Some(mut upload) = m.terrain_upload.take() {
             self.terrain_gpu.update_residency(
@@ -5184,6 +5187,8 @@ pub fn run(
     // Nothing is uploaded yet, so the first build always materialises the atlas.
     // The whole-world preload has not started either, so the local scenery is
     // part of this first mesh (`skip_local_scenery: false`).
+    let lighter = Lighter::new(lighter_settings, &adapter, &device);
+    let mut ray_scenery = lighter.armed().then(lighter_host::SceneryStream::default);
     let m = build(
         &mut t,
         camera.pos.x,
@@ -5193,8 +5198,8 @@ pub fn run(
         vegetation_authored_mips,
         0,
         false,
+        ray_scenery.as_mut(),
     )?;
-    let lighter = Lighter::new(lighter_settings, &adapter, &device);
     let mut renderer = Renderer::new(
         device,
         queue,
@@ -5460,6 +5465,7 @@ pub fn run(
                     vegetation_authored_mips,
                     grass_atlas_key,
                     skip_local_scenery,
+                    ray_scenery.as_mut(),
                 );
                 crate::diag!(
                     TimingLoad,
@@ -6403,7 +6409,7 @@ pub fn run(
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
                             std::thread::Builder::new().name("whole-world-objects".into()).spawn(move ||crate::world_objects::build(root,ornaments,tx,c)).expect("world preload thread");
                             world_rx=Some(rx);world_cancel=Some(cancel);world_started_at=Some(std::time::Instant::now());world_last_log_at=std::time::Instant::now();world_last_logged_pages=0;world_status=String::from("Loading world objects...");
-                        } else {world_started_at=None;world_status=String::from(if ray_world { "Paused by Lighter (streamed scenery only)" } else { "Off" });}
+                        } else {world_started_at=None;world_status=String::from(if ray_world { "Paused by Lighter (separate ray residency)" } else { "Off" });}
                     }
                 if let Some(rx) = &world_rx {
                     // Favor completing the explicitly requested whole-world
@@ -7860,6 +7866,8 @@ pub fn preview(
         .environments
         .underwater(cam.pos.to_array(), cam.time_of_day);
     let mut residency = crate::terrain_residency::Residency::default();
+    let lighter = Lighter::new(lighter_settings, &adapter, &device);
+    let mut ray_scenery = lighter.armed().then(lighter_host::SceneryStream::default);
     let mesh = build(
         &mut t,
         cam.pos.x,
@@ -7871,10 +7879,10 @@ pub fn preview(
         // The preview renders one frame of the local window; it never runs the
         // whole-world preload, so the scenery half stays in the mesh.
         false,
+        ray_scenery.as_mut(),
     )?;
     let (width, height) = (960u32, 720u32);
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let lighter = Lighter::new(lighter_settings, &adapter, &device);
     let mut renderer = Renderer::new(
         device, queue, fmt, width, height, mesh, &mut t, false, lighter,
     )?;

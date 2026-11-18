@@ -13,6 +13,10 @@ use crate::{material::Materials, world_models_gpu, Terrain};
 use glam::{Mat4, Vec3};
 use std::collections::HashMap;
 
+#[path = "scenery.rs"]
+mod scenery;
+pub(super) use scenery::{SceneryStream, Snapshot as ScenerySnapshot};
+
 #[derive(Default)]
 pub(super) struct Feed {
     // Textures that survive every streaming update. Terrain masks/tiles and
@@ -158,7 +162,20 @@ impl Feed {
         Ok(())
     }
 
-    pub(super) fn snapshot(&mut self, m: &MeshData) -> Result<(Packet, Textures), String> {
+    pub(super) fn install(&mut self, ray: &mut Lighter, m: &MeshData, device: &wgpu::Device) {
+        let result = self.snapshot(m, lighter::storage_limit(device));
+        ray.scenery_coverage = result
+            .as_ref()
+            .ok()
+            .map(|(_, _, coverage)| coverage.to_string());
+        ray.install(result.map(|(packet, bank, _)| (packet, bank)));
+    }
+
+    fn snapshot(
+        &mut self,
+        m: &MeshData,
+        storage: usize,
+    ) -> Result<(Packet, Textures, scenery::Coverage), String> {
         if let Some(upload) = &m.terrain_upload {
             self.terrain_masks(&upload.materials)?;
         }
@@ -204,12 +221,17 @@ impl Feed {
             let id = builder.surface(Surface::new(0, 0, 0., 0.));
             builder.world_mesh(&span(&m.vertices, extras, id, |v| rgba(v.color))?)?;
         }
-        debug_assert_eq!(m.local_pages.len(), m.local_gloss.len());
-        for (page, gloss) in m.local_pages.iter().zip(&m.local_gloss) {
-            building(&mut builder, &mut bank, page, gloss)?;
-        }
         self.vegetation(m, &mut builder, &mut bank)?;
-        Ok((builder.finish(), bank))
+        let scenery = m
+            .ray_scenery
+            .as_ref()
+            .ok_or("Lighter BMD stream is unavailable")?;
+        let coverage =
+            scenery
+                .as_ref()
+                .map_err(Clone::clone)?
+                .append(&mut builder, &mut bank, storage)?;
+        Ok((builder.finish(), bank, coverage))
     }
 
     fn vegetation(
@@ -662,83 +684,6 @@ fn atlas_uv(v: &WorldVertex, sy: f32) -> [f32; 2] {
     ]
 }
 
-fn building(
-    builder: &mut Builder,
-    textures: &mut Textures,
-    page: &crate::world_objects::Page,
-    gloss: &[Gloss],
-) -> Result<(), String> {
-    let mut mesh = Mesh::default();
-    mesh.vertices = page
-        .vertices
-        .iter()
-        .map(|v| {
-            Vertex::new(v.pos, v.normal, atlas_uv(v, v.color[3]))
-                .tint(argb_to_rgba(v.diffuse), argb_to_rgba(v.night_diffuse))
-        })
-        .collect();
-    let mut tiles = HashMap::new();
-    let mut ids = HashMap::new();
-    let mut append = |index: &[u32], visibility: u32, gloss: Gloss| -> Result<(), String> {
-        for tri in index.chunks_exact(3) {
-            let v = &page.vertices[tri[0] as usize];
-            let is_sdr = (v.kind > 2.01 && v.kind < 2.03) || (v.kind > 2.11 && v.kind < 2.13);
-            let mut flags = BAKED | visibility;
-            let tex = if (1.5..2.5).contains(&v.kind) {
-                let rect = Rect::new(
-                    v.color,
-                    v.color[3],
-                    crate::world_objects::SIDE,
-                    page.used_height,
-                )?;
-                flags |= if is_sdr { BLEND } else { CUTOUT };
-                atlas_texture(
-                    &mut ids,
-                    &mut tiles,
-                    textures,
-                    rect,
-                    crate::world_objects::SIDE,
-                    &page.atlas,
-                    if is_sdr {
-                        Filter::Alpha
-                    } else {
-                        Filter::cutout(0.5, false)
-                    },
-                )?
-            } else {
-                0
-            };
-            if (v.kind > 1.05 && v.kind < 1.15) || (v.kind > 1.5 && v.kind < 2.05 && !is_sdr) {
-                flags |= CULL_BACK;
-            }
-            let id = builder.surface(Surface::new(tex, flags, 0.5, 0.).with_gloss(gloss));
-            mesh.tri([tri[0], tri[1], tri[2]], id);
-        }
-        Ok(())
-    };
-    if page.placements.is_empty() {
-        append(&page.indices, 0, Gloss::default())?;
-    }
-    debug_assert_eq!(page.placements.len(), gloss.len());
-    for (range, &gloss) in page.placements.iter().zip(gloss) {
-        let flags = if range.visibility.reflect {
-            0
-        } else {
-            NO_REFLECT
-        } | if range.visibility.refract {
-            0
-        } else {
-            NO_REFRACT
-        };
-        append(
-            &page.indices[range.start as usize..range.end as usize],
-            flags,
-            gloss,
-        )?;
-    }
-    builder.world_mesh(&mesh)
-}
-
 fn point_light(p: [f32; 3], radius: f32, color: [f32; 4], intensity: f32) -> Light {
     Light {
         position_range: [p[0], p[1], p[2], radius],
@@ -902,4 +847,4 @@ impl super::Renderer {
 
 #[cfg(test)]
 #[path = "host_tests.rs"]
-mod tests;
+pub(super) mod tests;

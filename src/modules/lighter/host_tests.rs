@@ -43,9 +43,24 @@ impl FixtureRoot {
             &[("building/lighter_wall.tga", &wall)],
         );
         let bmd = bmd_fixture();
+        let mut distant = bmd_header([160., 0., 0.], 1);
+        bmd_quad(
+            &mut distant,
+            [
+                [0., 0.25, -10.],
+                [0., 0.25, 10.],
+                [0., 20., -10.],
+                [0., 20., 10.],
+            ],
+            [-1., 0., 0.],
+            "building/lighter_wall.tga",
+        );
         crate::pck::write_test_archive(
             &root.0.join("litmodels.pck"),
-            &[("litmodels/a01/lighter.bmd", &bmd)],
+            &[
+                ("litmodels/a01/lighter.bmd", &bmd),
+                ("litmodels/a01/distant.bmd", &distant),
+            ],
         );
         let sprite = gfx_header() + SPRITE;
         let light = gfx_header() + LIGHT;
@@ -76,63 +91,72 @@ fn encode(image: &image::RgbaImage, format: image::ImageFormat) -> Vec<u8> {
     bytes.into_inner()
 }
 
-// A v5 BMD: one perforated blue facade and two off-axis opaque shadow casters.
-// It goes through Objects::load_ids, the local page builder and the atlas.
-fn bmd_fixture() -> Vec<u8> {
+fn bmd_header(position: [f32; 3], meshes: u32) -> Vec<u8> {
     let mut b = b"MOXB".to_vec();
     b.extend_from_slice(&0x1000_0002u32.to_le_bytes());
-    for v in [1f32, 1., 1., 0., 0., 1., 0., 1., 0., 0., 0., 0.] {
+    for v in [1f32, 1., 1., 0., 0., 1., 0., 1., 0.]
+        .into_iter()
+        .chain(position)
+    {
         b.extend_from_slice(&v.to_le_bytes());
     }
-    b.extend_from_slice(&3u32.to_le_bytes());
-    let quad = |b: &mut Vec<u8>, positions: [[f32; 3]; 4], n: [f32; 3], texture: &str| {
-        b.extend_from_slice(&0x1000_0005u32.to_le_bytes());
-        b.extend_from_slice(&[0; 64]); // mesh name
-        b.extend_from_slice(texture.as_bytes());
-        b.resize(b.len() + 256 - texture.len(), 0);
-        b.extend_from_slice(&4u32.to_le_bytes());
-        b.extend_from_slice(&2u32.to_le_bytes());
-        for (p, uv) in positions
-            .into_iter()
-            .zip([[0f32, 1.], [1., 1.], [0., 0.], [1., 0.]])
-        {
-            for v in p {
-                b.extend_from_slice(&v.to_le_bytes());
-            }
-            b.extend_from_slice(&u32::MAX.to_le_bytes());
-            for v in uv {
-                b.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        for i in [0u16, 1, 2, 2, 1, 3] {
-            b.extend_from_slice(&i.to_le_bytes());
-        }
-        for _ in 0..4 {
-            for v in n {
-                b.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        b.extend_from_slice(&[255; 32]); // day/night vertex colors
-        b.extend_from_slice(&[0; 48]);
-        b.extend_from_slice(b"fixture\0");
-        b.extend_from_slice(&[0; 48]);
-        for v in if texture.is_empty() {
-            [0f32; 5]
-        } else {
-            [0.8f32, 0.6, 0.4, 1., 96.]
-        } {
+    b.extend_from_slice(&meshes.to_le_bytes());
+    b
+}
+
+fn bmd_quad(b: &mut Vec<u8>, positions: [[f32; 3]; 4], n: [f32; 3], texture: &str) {
+    b.extend_from_slice(&0x1000_0005u32.to_le_bytes());
+    b.extend_from_slice(&[0; 64]); // mesh name
+    b.extend_from_slice(texture.as_bytes());
+    b.resize(b.len() + 256 - texture.len(), 0);
+    b.extend_from_slice(&4u32.to_le_bytes());
+    b.extend_from_slice(&2u32.to_le_bytes());
+    for (p, uv) in positions
+        .into_iter()
+        .zip([[0f32, 1.], [1., 1.], [0., 0.], [1., 0.]])
+    {
+        for v in p {
             b.extend_from_slice(&v.to_le_bytes());
         }
-        b.push(1); // material is two-sided
-    };
-    quad(
+        b.extend_from_slice(&u32::MAX.to_le_bytes());
+        for v in uv {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    for i in [0u16, 1, 2, 2, 1, 3] {
+        b.extend_from_slice(&i.to_le_bytes());
+    }
+    for _ in 0..4 {
+        for v in n {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    b.extend_from_slice(&[255; 32]); // day/night vertex colors
+    b.extend_from_slice(&[0; 48]);
+    b.extend_from_slice(b"fixture\0");
+    b.extend_from_slice(&[0; 48]);
+    for v in if texture.is_empty() {
+        [0f32; 5]
+    } else {
+        [0.8f32, 0.6, 0.4, 1., 96.]
+    } {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b.push(1); // material is two-sided
+}
+
+// A v5 BMD: one perforated blue facade and two off-axis opaque shadow casters.
+// It goes through Objects::load_ids and both the native page and ray feeds.
+fn bmd_fixture() -> Vec<u8> {
+    let mut b = bmd_header([0.; 3], 3);
+    bmd_quad(
         &mut b,
         [[10., 1., 0.], [14., 1., 0.], [10., 5., 0.], [14., 5., 0.]],
         [0., 0., 1.],
         "building/lighter_wall.tga",
     );
     for x in [2., -11.] {
-        quad(
+        bmd_quad(
             &mut b,
             [
                 [x, 0.5, -12.],
@@ -406,6 +430,7 @@ fn lighter_streamed_world_pixels() {
     camera.logic_delta_ms = 16;
     let detail = DetailSettings::default();
     let mut residency = Default::default();
+    let mut ray_scenery = super::SceneryStream::default();
     let mut mesh = |terrain: &mut Terrain, atlas| {
         build(
             terrain,
@@ -416,6 +441,7 @@ fn lighter_streamed_world_pixels() {
             false,
             atlas,
             false,
+            Some(&mut ray_scenery),
         )
         .unwrap()
     };
@@ -712,5 +738,115 @@ fn lighter_streamed_world_pixels() {
             ([0, 0, 0, 255], 0.),
             "unsupported mode silently fell back"
         );
+    }
+}
+
+type Scene = (super::Packet, super::Textures);
+
+pub(crate) struct StreamedBmdScenes {
+    pub terrain: [f32; 4],
+    pub area_table: u32,
+    pub extended: Scene,
+    pub local: Scene,
+    pub evicted: Scene,
+    pub restored: Scene,
+    pub transmit_only: Scene,
+    pub reflect_only: Scene,
+}
+
+/// Real asset resolver, world loader and ray feed; shared by the software,
+/// Vulkan CPU interop and opt-in physical hardware pixel suites.
+pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
+    let root = FixtureRoot::new();
+    let mut t = fixture(&root.0);
+    t.grid_spacing = 16.; // one 512-unit block, flat ground under both paths
+    t.water[0].center = [152., 10., 5.];
+    t.water[0].height = 10.;
+    t.water[0].columns = 1;
+    t.water[0].mask.truncate(1);
+    let source = |extra| {
+        crate::objects::Objects::open(
+            &root.0,
+            vec![crate::scene::Ornament {
+                position: [160., 0., 0.],
+                path: "distant.bmd".into(),
+                extra,
+                ..ornament(&root.0).ornaments[0].clone()
+            }],
+        )
+        .unwrap()
+    };
+    t.objects = source(0x0101);
+    let detail = DetailSettings {
+        scenery_quality: 2,
+        ..Default::default()
+    };
+    assert!(crate::scenery_visibility::ornament_distance(detail.scenery_quality) < 160.);
+    let mut stream = super::SceneryStream::default();
+    let mut residency = Default::default();
+    let mut make = |t: &mut Terrain, x: f32| {
+        build(
+            t,
+            x,
+            0.,
+            detail,
+            &mut residency,
+            false,
+            0,
+            false,
+            Some(&mut stream),
+        )
+        .unwrap()
+    };
+    let first = make(&mut t, 0.);
+    assert!(
+        first.local_pages.is_empty(),
+        "native renderer must not load this distant BMD"
+    );
+    let mut feed = super::Feed::new(&t, &first, false).unwrap();
+    let install = |feed: &mut super::Feed,
+                   mesh: &super::MeshData,
+                   (local, extra, outside): (usize, usize, usize)| {
+        let (packet, textures, coverage) = feed.snapshot(mesh, storage).unwrap();
+        assert_eq!(
+            (coverage.local, coverage.extra, coverage.outside),
+            (local, extra, outside),
+            "{coverage}"
+        );
+        assert_eq!(
+            (
+                coverage.missing_textures,
+                coverage.deferred,
+                coverage.unavailable
+            ),
+            (0, 0, 0),
+            "{coverage}"
+        );
+        (packet, textures)
+    };
+    let extended = install(&mut feed, &first, (0, 1, 0));
+    // Required terrain and vegetation can already occupy the binding. The
+    // optional asset must be deferred, not leave a partially packed mesh.
+    let (limited, _, stats) = feed.snapshot(&first, extended.0.bytes().len() - 1).unwrap();
+    assert_eq!((stats.extra, stats.deferred), (0, 1));
+    assert_eq!(extended.0.triangles(), limited.triangles() + 2);
+    let local_mesh = make(&mut t, 160.);
+    assert!(!local_mesh.local_pages.is_empty());
+    let local = install(&mut feed, &local_mesh, (1, 0, 0));
+    let evicted = install(&mut feed, &make(&mut t, -1200.), (0, 0, 1));
+    let restored = install(&mut feed, &make(&mut t, 0.), (0, 1, 0));
+    t.objects = source(0x0100);
+    let transmit_only = install(&mut feed, &make(&mut t, 0.), (0, 1, 0));
+    t.objects = source(0x0001);
+    let reflect_only = install(&mut feed, &make(&mut t, 0.), (0, 1, 0));
+    StreamedBmdScenes {
+        terrain: feed.terrain,
+        area_table: feed.area_table,
+        extended,
+        local,
+        evicted,
+        restored,
+        transmit_only,
+        reflect_only,
     }
 }

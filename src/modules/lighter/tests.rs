@@ -647,6 +647,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_sun_and_history(&mut h);
     exercise_temporal_animation(&mut h);
     exercise_gloss(&mut h);
+    exercise_streamed_bmds(&mut h);
 }
 
 fn assert_radiance(label: &str, pixel: ([u8; 4], f32), linear: [f32; 3]) {
@@ -1178,6 +1179,115 @@ fn exercise_gloss(h: &mut Harness) {
     eprintln!(
         "Lighter: reflected red/green, power 2 {:?}, power 128 {:?}",
         means[0], means[1]
+    );
+}
+
+fn exercise_streamed_bmds(h: &mut Harness) {
+    let scenes = crate::gpu::streamed_bmd_scenes(storage_limit(&h.device));
+    let frame = |pos, dir| {
+        let mut f = test_frame(pos, dir, 9);
+        f.terrain = scenes.terrain;
+        f.options[3] = scenes.area_table;
+        f.water = [0.; 4];
+        f.water_color = [0.; 4];
+        f
+    };
+    let primary = frame(Vec3::new(112., 9., 5.), Vec3::X);
+    let hole = frame(Vec3::new(112., 9., -5.), Vec3::X);
+    let mut shadow = frame(Vec3::new(3., 5., 5.), -Vec3::Y);
+    shadow.eye[3] = 256.; // sunlight can travel past the raster load radius
+    shadow.sun = Vec3::new(1., 0.06, 0.).normalize().extend(1.).to_array();
+    let mut water = frame(Vec3::new(146., 13., 5.), Vec3::new(1., -0.5, 0.));
+    water.options[0] = WATER_MIRROR;
+    let empty = Builder::default().finish();
+    h.ray.settings = Settings {
+        mode: h.ray.settings.mode,
+        lighting: false,
+        shadows: false,
+        reflections: false,
+        bounces: 0,
+        samples: 1,
+        resolution: 100,
+        denoiser: false,
+        progressive: false,
+        soft_sun: false,
+    };
+    let sample = |h: &mut Harness| {
+        h.ray.settings.bounces = 0;
+        h.ray.settings.reflections = false;
+        h.ray.settings.shadows = false;
+        let front = h.pixel(primary, &empty);
+        let perforation = h.pixel(hole, &empty);
+        h.ray.settings.shadows = true;
+        let shaded = h.pixel(shadow, &empty);
+        h.ray.settings.shadows = false;
+        h.ray.settings.bounces = 1;
+        let transmitted = h.pixel(water, &empty);
+        h.ray.settings.reflections = true;
+        let both = h.pixel(water, &empty);
+        (front, perforation, shaded, transmitted, both)
+    };
+    h.ray.install(Ok(scenes.extended));
+    let reference = sample(h);
+    let (front, perforation, shaded, transmitted, both) = reference;
+    assert_eq!(
+        front.0,
+        [0, 0, 255, 255],
+        "no baked facade past the native range"
+    );
+    assert!((front.1 - depth_at(primary, Vec3::new(160., 9., 5.))).abs() < 1e-6);
+    assert_eq!(perforation.1, 0., "distant BMD lost its alpha hole");
+    assert!(
+        shaded.0[1] < 150 && shaded.1 > 0.,
+        "off-axis sun shadow missing: {shaded:?}"
+    );
+    assert!(
+        transmitted.0[2] > 130 && transmitted.1 > 0.,
+        "refraction missed the extended asset: {transmitted:?}"
+    );
+    assert!(
+        both.0[2] > transmitted.0[2] && both.1 == transmitted.1,
+        "mirror branch missing: {both:?}, {transmitted:?}"
+    );
+
+    h.ray.install(Ok(scenes.local));
+    assert_eq!(
+        sample(h),
+        reference,
+        "a BMD changed when the native region caught up"
+    );
+    h.ray.install(Ok(scenes.evicted));
+    let (gone, _, lit, bottom, _) = sample(h);
+    assert_eq!(gone.1, 0., "evicted BMD still wrote depth");
+    assert!(
+        lit.0[1] > shaded.0[1] + 100 && lit.1 == shaded.1,
+        "evicted BMD still cast a shadow: {lit:?}"
+    );
+    assert!(
+        bottom.0[2] < 5 && bottom.1 == transmitted.1,
+        "evicted BMD still visible through water: {bottom:?}"
+    );
+    h.ray.install(Ok(scenes.restored));
+    assert_eq!(
+        sample(h),
+        reference,
+        "returning to the stream region failed to reload the BMD"
+    );
+
+    h.ray.install(Ok(scenes.transmit_only));
+    let (view, _, shade, refract, no_mirror) = sample(h);
+    assert_eq!((view, shade, refract), (front, shaded, transmitted));
+    assert!(
+        no_mirror.0[2] + 6 < both.0[2] && no_mirror.1 == both.1,
+        "reflect flag ignored: {no_mirror:?}, {both:?}"
+    );
+    h.ray.install(Ok(scenes.reflect_only));
+    let (view, _, shade, no_refract, mirror) = sample(h);
+    assert_eq!((view, shade), (front, shaded));
+    assert_eq!(no_refract, bottom, "refract flag ignored");
+    assert!(
+        mirror.0[2] > 8 && mirror.0[2] < 32 && mirror.1 == both.1,
+        "reflect flag lost: {mirror:?}"
     );
 }
 

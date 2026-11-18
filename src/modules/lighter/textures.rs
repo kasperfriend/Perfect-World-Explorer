@@ -44,6 +44,10 @@ impl Filter {
 pub struct Tile(Vec<u32>);
 
 impl Tile {
+    pub fn bytes(&self) -> usize {
+        self.0.len() * std::mem::size_of::<u32>()
+    }
+
     pub fn new(
         size: [u32; 2],
         limit: u32,
