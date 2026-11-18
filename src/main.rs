@@ -209,6 +209,17 @@ struct Terrain {
     grass: grass::Grass,
     /// Parsed native world cloud grid, if this map ships `world.cld` loose.
     cloud_surface: Option<std::sync::Arc<cloud_surface::CloudSurface>>,
+    /// The ten-class scenery placement list, built once from the map's own
+    /// blocks and ornament rows.
+    ///
+    /// It used to be rebuilt for every block-window crossing: a hash map over
+    /// every ornament, then one placement per tree, water cell and ornament in
+    /// the whole scene — tens of thousands of entries, world-sized work repeated
+    /// for a camera move of one block. Nothing in it depends on the camera, the
+    /// window or the detail settings, so it is built once and shared (`Arc`
+    /// because `build` needs it while other fields of `Terrain` are borrowed
+    /// mutably, and the streaming worker owns `Terrain`).
+    scenery_placements: Option<std::sync::Arc<Vec<scenery_visibility::Placement>>>,
 }
 
 /// Everything one tile needs to decode its blocks: the tile's own bytes plus the
@@ -979,6 +990,7 @@ fn terrain(
         scene_lights: std::sync::Arc::new(scene_lights),
         scene: std::sync::Arc::new(world_scene),
         scenery_residency: scenery_visibility::RegionResidency::default(),
+        scenery_placements: None,
         terrain_material_window: None,
         element: element.to_path_buf(),
         client_root,

@@ -162,11 +162,15 @@ mod scale_y_tests {
 pub struct Gpu {
     pipeline: wgpu::RenderPipeline,
     vertices: wgpu::Buffer,
+    vertex_capacity: u64,
     indices: wgpu::Buffer,
+    index_capacity: u64,
     instances: wgpu::Buffer,
+    instance_capacity: u64,
     batches: Vec<Batch>,
     /// One indirect record per batch, so the whole grass field is one call.
     args: wgpu::Buffer,
+    args_capacity: u64,
     /// Set when the adapter has `MULTI_DRAW_INDIRECT` + `INDIRECT_FIRST_INSTANCE`.
     multi_draw: bool,
 }
@@ -321,10 +325,14 @@ impl Gpu {
         let (vertices, indices, instances, args, batches) = Self::buffers(device, data);
         Self {
             pipeline,
+            vertex_capacity: vertices.size(),
             vertices,
+            index_capacity: indices.size(),
             indices,
+            instance_capacity: instances.size(),
             instances,
             batches,
+            args_capacity: args.size(),
             args,
             multi_draw: crate::indirect_args::multi_draw(device)
                 && crate::indirect_args::base_instance(device),
@@ -340,7 +348,7 @@ impl Gpu {
     }
     fn buffers(
         device: &wgpu::Device,
-        mut data: Data,
+        data: Data,
     ) -> (
         wgpu::Buffer,
         wgpu::Buffer,
@@ -348,6 +356,135 @@ impl Gpu {
         wgpu::Buffer,
         Vec<Batch>,
     ) {
+        let data = Self::padded(data);
+        let buffer = |label, contents: &[u8], usage| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents,
+                usage,
+            })
+        };
+        // `COPY_DST` from the start: `update` rewrites these buffers in place
+        // whenever the field fits, which is what stops a block crossing from
+        // destroying and recreating them.
+        (
+            buffer(
+                "grass mesh vertices",
+                bytemuck::cast_slice(&data.vertices),
+                wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            ),
+            buffer(
+                "grass mesh indices",
+                bytemuck::cast_slice(&data.indices),
+                wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            ),
+            buffer(
+                "grass placement instances",
+                bytemuck::cast_slice(&data.instances),
+                wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            ),
+            Self::args_buffer(device, &data.batches),
+            data.batches,
+        )
+    }
+    /// One indirect record per batch, in the order `draw` submits them.
+    fn args_data(batches: &[Batch]) -> Vec<DrawIndexedArgs> {
+        let mut args: Vec<DrawIndexedArgs> = batches
+            .iter()
+            .map(|batch| record(batch.indices.clone(), batch.instances.clone()))
+            .collect();
+        if args.is_empty() {
+            args.push(record(0..0, 0..0));
+        }
+        args
+    }
+    /// One record per batch; the ranges never change until the next update, so
+    /// this is rebuilt with the rest of the grass buffers and never per frame.
+    fn args_buffer(device: &wgpu::Device, batches: &[Batch]) -> wgpu::Buffer {
+        let args = Self::args_data(batches);
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("grass draw args"),
+            contents: bytemuck::cast_slice(&args),
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+        })
+    }
+    /// Replace the grass field with a rebuilt one.
+    ///
+    /// Every block-window update rebuilds the whole field, but its four buffers
+    /// barely change size, so they are written through `queue.write_buffer` and
+    /// only reallocated when the field grows past its capacity. Recreating them
+    /// meant a fresh allocation and a full copy of every placement — the largest
+    /// buffer in the streaming path — for a crossing of one block.
+    pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, data: Data) {
+        let data = Self::padded(data);
+        self.batches = data.batches;
+        Self::upload(
+            device,
+            queue,
+            &mut self.vertices,
+            &mut self.vertex_capacity,
+            "grass mesh vertices",
+            bytemuck::cast_slice(&data.vertices),
+            wgpu::BufferUsages::VERTEX,
+        );
+        Self::upload(
+            device,
+            queue,
+            &mut self.indices,
+            &mut self.index_capacity,
+            "grass mesh indices",
+            bytemuck::cast_slice(&data.indices),
+            wgpu::BufferUsages::INDEX,
+        );
+        Self::upload(
+            device,
+            queue,
+            &mut self.instances,
+            &mut self.instance_capacity,
+            "grass placement instances",
+            bytemuck::cast_slice(&data.instances),
+            wgpu::BufferUsages::VERTEX,
+        );
+        let args = Self::args_data(&self.batches);
+        Self::upload(
+            device,
+            queue,
+            &mut self.args,
+            &mut self.args_capacity,
+            "grass draw args",
+            bytemuck::cast_slice(&args),
+            wgpu::BufferUsages::INDIRECT,
+        );
+    }
+    /// Write one buffer, growing it to the next power of two only if it no
+    /// longer holds the data.
+    fn upload(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        buffer: &mut wgpu::Buffer,
+        capacity: &mut u64,
+        label: &str,
+        contents: &[u8],
+        usage: wgpu::BufferUsages,
+    ) {
+        let needed = (contents.len() as u64).next_power_of_two().max(4);
+        if *capacity < needed {
+            *buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: needed,
+                usage: usage | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            *capacity = needed;
+        }
+        if !contents.is_empty() {
+            queue.write_buffer(buffer, 0, contents);
+        }
+    }
+    /// Pad an empty field the way the draw path expects: one degenerate mesh
+    /// vertex, one index and one instance, so a map without grass still binds
+    /// valid buffers.
+    fn padded(mut data: Data) -> Data {
         if data.vertices.is_empty() {
             data.vertices.push(bytemuck::Zeroable::zeroed());
         }
@@ -357,56 +494,7 @@ impl Gpu {
         if data.instances.is_empty() {
             data.instances.push([0.; 12]);
         }
-        let buffer = |label, contents: &[u8], usage| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents,
-                usage,
-            })
-        };
-        (
-            buffer(
-                "grass mesh vertices",
-                bytemuck::cast_slice(&data.vertices),
-                wgpu::BufferUsages::VERTEX,
-            ),
-            buffer(
-                "grass mesh indices",
-                bytemuck::cast_slice(&data.indices),
-                wgpu::BufferUsages::INDEX,
-            ),
-            buffer(
-                "grass placement instances",
-                bytemuck::cast_slice(&data.instances),
-                wgpu::BufferUsages::VERTEX,
-            ),
-            Self::args_buffer(device, &data.batches),
-            data.batches,
-        )
-    }
-    /// One record per batch; the ranges never change until the next update, so
-    /// this is rebuilt with the rest of the grass buffers and never per frame.
-    fn args_buffer(device: &wgpu::Device, batches: &[Batch]) -> wgpu::Buffer {
-        let mut args: Vec<DrawIndexedArgs> = batches
-            .iter()
-            .map(|batch| record(batch.indices.clone(), batch.instances.clone()))
-            .collect();
-        if args.is_empty() {
-            args.push(record(0..0, 0..0));
-        }
-        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("grass draw args"),
-            contents: bytemuck::cast_slice(&args),
-            usage: wgpu::BufferUsages::INDIRECT,
-        })
-    }
-    pub fn update(&mut self, device: &wgpu::Device, data: Data) {
-        let (v, i, n, a, b) = Self::buffers(device, data);
-        self.vertices = v;
-        self.indices = i;
-        self.instances = n;
-        self.args = a;
-        self.batches = b;
+        data
     }
     pub fn draw<'a>(
         &'a self,

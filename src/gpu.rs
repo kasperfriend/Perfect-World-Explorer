@@ -6,7 +6,7 @@ use crate::scenery_visibility::{
 };
 use crate::Terrain;
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4};
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -169,6 +169,102 @@ fn minimap_matrix(x: f32, z: f32, range: f32) -> Mat4 {
     Mat4::orthographic_rh(range, -range, -range, range, 20000., 1.)
         * Mat4::look_to_rh(eye, Vec3::NEG_Y, Vec3::Z)
 }
+/// Screen-space rectangle a water plane's reflection or refraction render has to
+/// cover: the plane's own screen rectangle, grown by the largest distance the
+/// water surface samples away from itself.
+///
+/// Those two passes exist for exactly one reader — the water surface — and it
+/// reads them by screen-space UV displaced by `n.xz * edge * edge * strength`.
+/// `n.xz` is a unit-range bump normal and `edge` is in `0..1`, so the reflection
+/// is read at `screen ± 0.25 * |n.xz|` (`± 0.15 * |n.xz|` in the above-water
+/// refraction). Growing the plane's rectangle by `0.25 * |n.xz|max` therefore
+/// contains every texel the surface can possibly read; every other texel of a
+/// 3440x1369 view is shaded today and read by nobody. A pond a few hundred units
+/// across used to cost two full-resolution scene renders per frame.
+///
+/// `None` means "rasterise the whole target, exactly as before", and is answered
+/// whenever the rectangle cannot be trusted or would not pay: a corner of the
+/// plane at or behind the eye (a plane that runs past the camera has no finite
+/// screen rectangle), a rectangle that covers most of the target anyway, or a
+/// target too small to bother with.
+fn water_view_scissor(
+    matrix: Mat4,
+    w: u32,
+    h: u32,
+    bounds: [f32; 4],
+    height: f32,
+    margin: f32,
+) -> Option<[u32; 4]> {
+    // Above this share of the target the scissor saves almost nothing.
+    const COVER_LIMIT: f32 = 0.75;
+    let margin = margin.clamp(0., 0.5);
+    if w < 32 || h < 32 {
+        return None;
+    }
+    let [x0, x1, z0, z1] = bounds;
+    let mut min = [f32::INFINITY; 2];
+    let mut max = [f32::NEG_INFINITY; 2];
+    for (x, z) in [(x0, z0), (x0, z1), (x1, z0), (x1, z1)] {
+        let p = matrix * Vec4::new(x, height, z, 1.);
+        // At or behind the eye plane the projected point is not where that
+        // corner of the quad is drawn, so no finite rectangle contains the quad.
+        if !(p.w > 1e-4) || !p.x.is_finite() || !p.y.is_finite() {
+            return None;
+        }
+        for (axis, v) in [p.x / p.w, p.y / p.w].into_iter().enumerate() {
+            min[axis] = min[axis].min(v);
+            max[axis] = max[axis].max(v);
+        }
+    }
+    let (wf, hf) = (w as f32, h as f32);
+    // Clip space to pixels. Clip y points up, pixels point down.
+    let px0 = ((min[0] * 0.5 + 0.5 - margin) * wf).floor().clamp(0., wf);
+    let px1 = ((max[0] * 0.5 + 0.5 + margin) * wf).ceil().clamp(0., wf);
+    let py0 = ((0.5 - max[1] * 0.5 - margin) * hf).floor().clamp(0., hf);
+    let py1 = ((0.5 - min[1] * 0.5 + margin) * hf).ceil().clamp(0., hf);
+    if px1 <= px0 || py1 <= py0 {
+        // Off screen: `WaterBatch::visible` should have rejected the plane, and
+        // this function is not the place to decide that drawing nothing is right.
+        return None;
+    }
+    let (rw, rh) = ((px1 - px0) as u32, (py1 - py0) as u32);
+    if rw as f32 * rh as f32 >= wf * hf * COVER_LIMIT {
+        return None;
+    }
+    Some([px0 as u32, py0 as u32, rw.max(1), rh.max(1)])
+}
+
+/// Everything the top-down minimap's pixels can depend on.
+///
+/// `minimap_matrix` builds the orthographic window from the camera's ground
+/// position and the range alone, so the camera's *height* is deliberately not
+/// part of this key: climbing used to re-render the whole top-down scene once per
+/// frame for an image that could not have changed. The range is part of it
+/// because it is in the matrix — without it, dragging the minimap-range slider
+/// left the map showing the previous window until the camera moved a whole unit.
+/// The preload state and the page count are in it because the pages are what the
+/// map draws: a page that arrives is a page the map has not shown yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MinimapKey {
+    /// Ground position the orthographic window is centred on, in whole units.
+    block: [i32; 2],
+    /// Half-width of that window, as bits: the matrix reads it.
+    range: u32,
+    world_done: bool,
+    pages: usize,
+}
+
+impl MinimapKey {
+    fn new(x: f32, z: f32, range: f32, world_done: bool, pages: usize) -> Self {
+        Self {
+            block: [x.round() as i32, z.round() as i32],
+            range: range.to_bits(),
+            world_done,
+            pages,
+        }
+    }
+}
+
 /// Keep the world-map point under the cursor fixed when its image is scaled.
 fn anchored_zoom_offset(offset: egui::Vec2, cursor_in_image: egui::Vec2, ratio: f32) -> egui::Vec2 {
     (offset + cursor_in_image * (ratio - 1.)).max(egui::Vec2::ZERO)
@@ -288,12 +384,141 @@ struct LodState {
     window: crate::terrain_lod::Window,
     levels: Vec<u8>,
 }
+/// Stages a [`FrameBudget`] sample is split into, in the order the line prints
+/// them.
+const STAGE_COUNT: usize = 6;
+const STAGE_VISIBILITY: usize = 0;
+const STAGE_MAIN: usize = 1;
+const STAGE_EXTRA_VIEWS: usize = 2;
+const STAGE_POST: usize = 3;
+const STAGE_MINIMAP: usize = 4;
+const STAGE_REST: usize = 5;
+const STAGE_NAMES: [&str; STAGE_COUNT] = [
+    "visibility",
+    "main scene",
+    "extra views",
+    "post",
+    "minimap",
+    "rest",
+];
+
+/// Fold elapsed time into one stage and move the cursor.
+fn lap(stage: usize, stage_ms: &mut [f64; STAGE_COUNT], at: &mut Instant) {
+    let now = Instant::now();
+    stage_ms[stage] += now.duration_since(*at).as_secs_f64() * 1000.;
+    *at = now;
+}
+
+/// One second of frame CPU samples, split by the stage that spent them.
+///
+/// A world that is fully resident should read a cheap frame, and when it does
+/// not this is the line that says which stage grew: a frame that spends its time
+/// in "extra views" is paying for the water's mirror and refraction, one that
+/// spends it in "main scene" is paying for the pages and the models, and one that
+/// reads a few milliseconds here while the frame rate stays low is bound on the
+/// GPU instead, which is a different fix. The numbers are CPU-side command
+/// recording; they are reported with the page count so two runs can be compared.
+#[derive(Default)]
+struct FrameBudget {
+    stage_ms: [f64; STAGE_COUNT],
+    frames: u32,
+    since: Option<Instant>,
+    worst_ms: f64,
+    /// World renders submitted since the last report: the main view, the water's
+    /// mirror and refraction per visible plane, and the top-down map. A frame
+    /// that renders the world five times is bound on the GPU in a way no CPU
+    /// timing shows, so the line carries this count next to the milliseconds.
+    passes: u64,
+    /// Water views whose attachment was scissored down to the region the surface
+    /// can read, and the mean fraction of the screen those rectangles cover.
+    /// Without this the saving is invisible: the passes still appear in the
+    /// worlds-rendered count, only their fill is gone.
+    scissored: u64,
+    scissor_cover: f64,
+    scissor_frames: u64,
+}
+
+impl FrameBudget {
+    fn add(&mut self, stage_ms: [f64; STAGE_COUNT], passes: u32, scissored: u32, cover: f32) {
+        for (total, ms) in self.stage_ms.iter_mut().zip(stage_ms) {
+            *total += ms;
+        }
+        self.frames += 1;
+        self.passes += u64::from(passes);
+        if scissored > 0 {
+            self.scissored += u64::from(scissored);
+            self.scissor_cover += f64::from(cover);
+            self.scissor_frames += 1;
+        }
+        self.worst_ms = self.worst_ms.max(stage_ms.iter().sum::<f64>());
+    }
+
+    /// Fold in a stage measured outside `render` (the minimap's own pass).
+    fn note(&mut self, stage: usize, started: Instant) {
+        self.stage_ms[stage] += started.elapsed().as_secs_f64() * 1000.;
+    }
+
+    /// Emit and reset once a second.
+    fn report(&mut self, pages: usize) {
+        let since = *self.since.get_or_insert_with(Instant::now);
+        let elapsed = since.elapsed().as_secs_f64();
+        if elapsed < 1. {
+            return;
+        }
+        if self.frames > 0 && crate::diagnostics::enabled(crate::diagnostics::Channel::TimingFrame)
+        {
+            use std::fmt::Write;
+            let mut stages = String::new();
+            for (name, ms) in STAGE_NAMES.iter().zip(self.stage_ms) {
+                let _ = write!(stages, "; {name} {:.2} ms", ms / self.frames as f64);
+            }
+            // Only mentioned when it happened, so the line stays the same shape
+            // for a view with no water in it.
+            let mut scissors = String::new();
+            if self.scissor_frames > 0 {
+                let _ = write!(
+                    scissors,
+                    ", water views scissored to {:.0}% of the screen",
+                    self.scissor_cover / self.scissor_frames as f64 * 100.
+                );
+            }
+            crate::diag!(
+                TimingFrame,
+                "CPU frame {:.2} ms average, {:.2} ms worst, {:.1} frames/s, {:.1} world renders/frame{scissors}, {pages} world pages{}",
+                self.stage_ms.iter().sum::<f64>() / self.frames as f64,
+                self.worst_ms,
+                self.frames as f64 / elapsed,
+                self.passes as f64 / self.frames as f64,
+                stages
+            );
+        }
+        self.stage_ms = [0.; STAGE_COUNT];
+        self.frames = 0;
+        self.worst_ms = 0.;
+        self.passes = 0;
+        self.scissored = 0;
+        self.scissor_cover = 0.;
+        self.scissor_frames = 0;
+        self.since = Some(Instant::now());
+    }
+}
+
 struct MeshData {
     terrain_upload: Option<crate::terrain_gpu::TerrainUpload>,
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
+    /// Grass atlas pixels. Empty when [`Self::grass_atlas_changed`] is false:
+    /// the renderer still holds the identical 4096² atlas and its mip tiles.
     atlas: Vec<u8>,
     grass_mips: Vec<crate::grass_mips::Tile>,
+    /// Layout signature of the grass atlas this message describes.
+    grass_atlas_key: u64,
+    /// False when the streamer was told the atlas the renderer holds is already
+    /// this layout, so neither the pixels above nor the tiles are new.
+    grass_atlas_changed: bool,
+    /// Layout signature of each streamed scenery page, in page order. An
+    /// unchanged page is a page whose atlas and geometry the renderer can keep.
+    local_page_keys: Vec<u64>,
     grass: crate::grass_instances::Data,
     center: (isize, isize),
     tree_center: (f32, f32),
@@ -306,6 +531,12 @@ struct MeshData {
     water_start: u32,
     water_batches: Vec<WaterBatch>,
     local_pages: Vec<crate::world_objects::Page>,
+    /// True when this build left the locally streamed scenery out because the
+    /// whole-world preload owns it. The renderer compares it against the state
+    /// it is drawing with, the same way `lod` is compared, so a crossing into
+    /// or out of the whole-world mode rebuilds instead of drawing the wrong
+    /// half of the world.
+    local_scenery_skipped: bool,
 }
 /// Which view's indirect terrain records the next submit draws. The records
 /// live in one buffer, so every pass re-queues the view it draws through: the
@@ -461,6 +692,78 @@ fn lod_levels(
     );
     (win, levels)
 }
+/// Bytes to allocate for a world geometry buffer holding `count` elements.
+///
+/// Rounded up to a power of two (and never below four bytes) so the buffers
+/// survive growth between block-window updates without being recreated when the
+/// window grows by a block.
+fn world_buffer_capacity(count: usize, element: usize) -> u64 {
+    (count.saturating_mul(element).next_power_of_two() as u64).max(4)
+}
+
+/// Grow a streamed scenery page's atlas to `rows` rows rather than allocating
+/// the full 4096² up front.
+///
+/// The streamer rebuilds every local page for each block-window update, and a
+/// page usually needs a few hundred of the 4096 rows. Allocating (and zeroing)
+/// 64 MiB per page per rebuild was the largest CPU-side cost of a crossing; the
+/// buffer now doubles as the packer descends and `Page::finish` makes its final
+/// extent exact.
+fn reserve_page_atlas_rows(page: &mut crate::world_objects::Page, rows: usize) {
+    // `Page` owns the atlas extent, so its own side and unit decide the bytes.
+    let side = crate::world_objects::SIDE;
+    let rows = rows.min(side);
+    let needed = side * rows * 4;
+    if page.atlas.len() >= needed {
+        return;
+    }
+    let floor = side * crate::texture_atlas::UNIT * 4;
+    let grown = (page.atlas.len().max(floor) * 2)
+        .max(needed)
+        .min(side * side * 4);
+    page.atlas.resize(grown, 0);
+}
+
+/// Signature of a finished local scenery page.
+///
+/// Everything a page draws is derived from its textures (which rectangle of the
+/// atlas each one owns) and from the frozen ornament placements. Both are in the
+/// key, so an equal key means the page the renderer already holds is the page
+/// this rebuild produced.
+fn local_page_key(page: &crate::world_objects::Page, textures: &[(String, u64)]) -> u64 {
+    let mut key = crate::texture_atlas::LayoutKey::new();
+    key.usize(textures.len());
+    for (texture, layout) in textures {
+        key.bytes(texture.as_bytes());
+        key.bytes(&layout.to_le_bytes());
+    }
+    key.usize(page.used_height);
+    key.usize(page.vertices.len());
+    key.usize(page.indices.len());
+    for placement in &page.placements {
+        key.usize(placement.start as usize);
+        key.usize(placement.end as usize);
+        key.usize(placement.export_id as usize);
+        key.usize(placement.order as usize);
+        key.byte(u8::from(placement.visibility.reflect));
+        key.byte(u8::from(placement.visibility.refract));
+    }
+    key.byte(u8::from(page.page_has_sdr));
+    for axis in 0..3 {
+        key.bytes(&page.page_min[axis].to_bits().to_le_bytes());
+        key.bytes(&page.page_max[axis].to_bits().to_le_bytes());
+    }
+    key.value()
+}
+
+/// Rebuild the drawn world around `(cx, cz)`.
+///
+/// `grass_atlas_hint` is the layout signature the renderer currently holds for
+/// its grass atlas. When this rebuild produces the same layout, the atlas pixels
+/// and their independent mip tiles are not rebuilt at all: a block-window update
+/// moves the camera by one block and almost always leaves the nearby grass
+/// materials identical, yet the atlas is 4096² RGBA with eight levels — the
+/// largest single upload in the streaming path.
 fn build(
     t: &mut Terrain,
     cx: f32,
@@ -468,6 +771,14 @@ fn build(
     detail: DetailSettings,
     residency: &mut crate::terrain_residency::Residency,
     vegetation_authored_mips: bool,
+    grass_atlas_hint: u64,
+    // The whole-world preload has finished and owns the scenery: the renderer
+    // draws its pages and ends the local index range at `object_start`, so the
+    // ornaments this function would otherwise select, pack into 4096² atlases
+    // and upload are pixels nothing samples. Skipping them is the difference
+    // between a crossing that rebuilds a terrain mesh and one that also uploads
+    // tens of megabytes of unused atlas.
+    skip_local_scenery: bool,
 ) -> Result<MeshData, String> {
     if vegetation_authored_mips {
         static WARN: std::sync::Once = std::sync::Once::new();
@@ -495,7 +806,6 @@ fn build(
     let by = (gy / TILE as f32).floor() as isize;
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
-    let mut atlas = vec![0u8; ATLAS * ATLAS * 4];
     // Recovered block residency, resolution levels and block-edge rule
     // (src/terrain_lod.rs). The client keeps a square window of blocks around
     // the camera's block (`0x77ecf0`), gives each one of three meshes by camera
@@ -590,7 +900,12 @@ fn build(
         },
     )?;
     let spans = residency.append(&win, &mut vertices, &mut indices);
-    eprintln!(
+    // A channel line, not `eprintln!`: this runs on every block-window crossing,
+    // and a synchronous console write per crossing costs more than the append it
+    // reports. `TimingLoad` writes it to the log file when the Logging tab has
+    // that channel on.
+    crate::diag!(
+        TimingLoad,
         "Terrain residency: {} blocks resident ({} entered, {} evicted, {} re-meshed), \
          {} triangles; {} blocks submitted",
         census.resident,
@@ -608,8 +923,17 @@ fn build(
     let mut grass_builder = crate::grass_instances::Builder::default();
     let mut grass_sample = None;
     let mut grass_slots: HashMap<(String, u8), crate::texture_atlas::Slot> = HashMap::new();
-    let mut grass_authored: HashMap<(String, u8), Vec<image::RgbaImage>> = HashMap::new();
+    // Materials whose atlas rectangle keeps a native-size authored chain. Only
+    // membership matters here; the chain itself travels with the mip tiles, so
+    // storing it twice would copy every authored level on every rebuild.
+    let mut grass_authored: HashSet<(String, u8)> = HashSet::new();
     let mut grass_mips = Vec::new();
+    // Atlas rectangles in packing order, copied into the pixel buffer only once
+    // the layout signature says the renderer's copy is stale. A rebuild is
+    // dominated by the 4096² atlas, and almost every block-window update leaves
+    // it identical.
+    let mut grass_copies: Vec<(crate::texture_atlas::Slot, String, bool)> = Vec::new();
+    let mut grass_layout = crate::texture_atlas::LayoutKey::new();
     // Reserve at least one 128px slot for every distinct nearby material, so
     // a few large textures cannot starve all later grass types.
     let mut grass_pending = HashSet::new();
@@ -726,30 +1050,12 @@ fn build(
                     };
                     slot
                 };
-                let ox = slot.x;
-                let oy = slot.y;
-                if authored.is_some() {
-                    let source = img.as_raw();
-                    for y in 0..img.height() as usize {
-                        let dst = ((oy + y) * ATLAS + ox) * 4;
-                        let src = y * img.width() as usize * 4;
-                        atlas[dst..dst + img.width() as usize * 4]
-                            .copy_from_slice(&source[src..src + img.width() as usize * 4]);
-                    }
-                } else {
-                    for py in 0..slot.h {
-                        for px in 0..slot.w {
-                            let x = (px as u32 * img.width() / slot.w as u32).min(img.width() - 1);
-                            let y =
-                                (py as u32 * img.height() / slot.h as u32).min(img.height() - 1);
-                            let o = ((oy + py) * ATLAS + ox + px) * 4;
-                            atlas[o..o + 4].copy_from_slice(&img.get_pixel(x, y).0);
-                        }
-                    }
-                }
+                grass_copies.push((slot, mesh.texture.clone(), authored.is_some()));
+                grass_layout.slot(&mesh.texture, slot);
+                grass_layout.usize(authored.as_ref().map_or(0, |chain| chain.len()));
                 if let Some(chain) = authored {
                     if !chain.is_empty() {
-                        grass_authored.insert(material_key.clone(), chain.clone());
+                        grass_authored.insert(material_key.clone());
                     }
                     grass_mips.push((slot, alpha_ref, Some(chain)));
                 } else {
@@ -760,7 +1066,7 @@ fn build(
             };
             let ox = slot.x as f32 / ATLAS as f32;
             let oy = slot.y as f32 / ATLAS as f32;
-            let (scale_x, scale_y) = if grass_authored.contains_key(&material_key) {
+            let (scale_x, scale_y) = if grass_authored.contains(&material_key) {
                 (
                     img.width() as f32 / ATLAS as f32,
                     img.height() as f32 / ATLAS as f32,
@@ -862,6 +1168,48 @@ fn build(
             }
         }
     }
+    // Materialise the grass atlas only when the renderer's copy is stale.
+    //
+    // The atlas is 4096² RGBA with eight levels and its tiles are independently
+    // filtered copies of the same rectangles. Both are a pure function of the
+    // layout that was just packed, so an unchanged layout means the pixels the
+    // GPU holds are still the ones this build would produce: skip the
+    // zero-fill, the pixel copies, the mip generation and — on the render
+    // thread — the upload.
+    let grass_atlas_key = grass_layout.value();
+    let grass_atlas_changed = grass_atlas_key != grass_atlas_hint;
+    let (atlas, grass_mips) = if grass_atlas_changed {
+        let mut atlas = vec![0u8; ATLAS * ATLAS * 4];
+        for (slot, texture, authored) in &grass_copies {
+            let Some(img) = t.grass.textures.get(texture) else {
+                continue;
+            };
+            let ox = slot.x;
+            let oy = slot.y;
+            if *authored {
+                let source = img.as_raw();
+                for y in 0..img.height() as usize {
+                    let dst = ((oy + y) * ATLAS + ox) * 4;
+                    let src = y * img.width() as usize * 4;
+                    atlas[dst..dst + img.width() as usize * 4]
+                        .copy_from_slice(&source[src..src + img.width() as usize * 4]);
+                }
+            } else {
+                for py in 0..slot.h {
+                    for px in 0..slot.w {
+                        let x = (px as u32 * img.width() / slot.w as u32).min(img.width() - 1);
+                        let y = (py as u32 * img.height() / slot.h as u32).min(img.height() - 1);
+                        let o = ((oy + py) * ATLAS + ox + px) * 4;
+                        atlas[o..o + 4].copy_from_slice(&img.get_pixel(x, y).0);
+                    }
+                }
+            }
+        }
+        let mips = crate::grass_mips::prepare_with_authored(&atlas, &grass_mips, ATLAS);
+        (atlas, mips)
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let grass = grass_builder.finish();
     if grass_debug() {
         let (v, i, b) = grass.counts();
@@ -872,14 +1220,41 @@ fn build(
     // Only the ornament class maps to Objects::load_ids indices; the other
     // nine classes use disjoint synthetic indices for the resident-bit set.
     let object_start = indices.len() as u32;
-    let scenery_placements = ten_class_placements(t);
     let scenery_margin = 0.5 * t.scene.block_size.max(0.);
-    let nearby = t.scenery_residency.select(
-        &scenery_placements,
-        [cx, cz],
-        detail.scenery_quality,
-        scenery_margin,
-    );
+    // While the whole-world preload owns the scenery, no ornament is selected:
+    // every list below is built from `nearby`, so an empty one turns the whole
+    // block (residency bits, texture packing, page atlases, ornament geometry)
+    // into no work at all and the mesh stays terrain-only. The residency bits
+    // are what the local draw reads; nothing else consumes them, and the
+    // whole-world pages were selected from the map's own records.
+    let nearby = if skip_local_scenery {
+        Vec::new()
+    } else {
+        // Built once for the map and kept: the list covers the whole scene, and
+        // the camera cannot change any entry in it. Cloning the `Arc` out of the
+        // field keeps the field free for the store below, which a borrow of it
+        // would not.
+        let scenery_placements = match t.scenery_placements.clone() {
+            Some(list) => list,
+            None => {
+                let list = std::sync::Arc::new(ten_class_placements(t));
+                t.scenery_placements = Some(list.clone());
+                crate::diag!(
+                    TimingLoad,
+                    "scenery placements built once: {} entries over {} blocks",
+                    list.len(),
+                    t.scene.blocks.len()
+                );
+                list
+            }
+        };
+        t.scenery_residency.select(
+            &scenery_placements,
+            [cx, cz],
+            detail.scenery_quality,
+            scenery_margin,
+        )
+    };
     let ornament_count = t.objects.ornaments.len();
     let ornament_ids: Vec<usize> = nearby
         .iter()
@@ -891,18 +1266,26 @@ fn build(
         .collect();
     t.objects.load_ids(&ornament_ids)?;
     let tree_lod_scale = lod_scale(detail.scenery_quality, Class::Trees);
-    eprintln!(
-        "Scenery residency: quality {} ({} native classes, tree LOD {:.3}, ornament distance {:.1}), {} resident, {} ornaments retained, {} loads, {} evictions, {} distance culls",
-        detail.scenery_quality,
-        Class::ALL.len(),
-        tree_lod_scale,
-        crate::scenery_visibility::ornament_distance(detail.scenery_quality),
-        nearby.len(),
-        ornament_ids.len(),
-        t.scenery_residency.loads,
-        t.scenery_residency.evictions,
-        t.scenery_residency.distance_culls
-    );
+    if skip_local_scenery {
+        crate::diag!(
+            TimingLoad,
+            "Scenery residency: whole-world preload owns the scenery; no local ornaments selected"
+        );
+    } else {
+        crate::diag!(
+            TimingLoad,
+            "Scenery residency: quality {} ({} native classes, tree LOD {:.3}, ornament distance {:.1}), {} resident, {} ornaments retained, {} loads, {} evictions, {} distance culls",
+            detail.scenery_quality,
+            Class::ALL.len(),
+            tree_lod_scale,
+            crate::scenery_visibility::ornament_distance(detail.scenery_quality),
+            nearby.len(),
+            ornament_ids.len(),
+            t.scenery_residency.loads,
+            t.scenery_residency.evictions,
+            t.scenery_residency.distance_culls
+        );
+    }
     // Sort largest rectangles first, then use as many atlas pages as needed.
     // Unlike the legacy 128px atlas, local BMDs keep their source dimensions.
     let mut requested: HashMap<String, (usize, usize)> = HashMap::new();
@@ -950,7 +1333,11 @@ fn build(
                     shared_atlas: None,
                     vertices: Vec::new(),
                     indices: Vec::new(),
-                    atlas: vec![0; ATLAS * ATLAS * 4],
+                    // Grown as rectangles are packed: a page usually uses a
+                    // fraction of the 4096 rows, and every block-window update
+                    // rebuilt these from scratch, so zero-filling all 64 MiB
+                    // per page per rebuild was pure memory traffic.
+                    atlas: Vec::new(),
                     processed: 0,
                     used_height: 0,
                     mips: Vec::new(),
@@ -964,6 +1351,7 @@ fn build(
             (i, slot)
         };
         pages[i].1.used_height = pages[i].1.used_height.max(slot.y + slot.h);
+        reserve_page_atlas_rows(&mut pages[i].1, slot.y + slot.h);
         let tex = t.objects.texture(key);
         for py in 0..slot.h {
             for px in 0..slot.w {
@@ -981,7 +1369,8 @@ fn build(
         }
         texture_slots.insert(key.clone(), (i, slot));
     }
-    eprintln!(
+    crate::diag!(
+        TimingLoad,
         "Local scenery: {} source-resolution textures in {} GPU pages",
         requested.len(),
         pages.len()
@@ -1059,11 +1448,31 @@ fn build(
             }
         }
     }
-    let local_pages = pages
-        .into_iter()
-        .map(|(_, page)| page.finish())
-        .filter(|p| !p.indices.is_empty())
-        .collect();
+    // One signature per page, in page order: the textures that feed its atlas
+    // rectangles (sorted, because the slot map is unordered) plus the geometry
+    // and submission metadata `Page::finish` froze. The renderer keeps a page
+    // whose signature it already uploaded and re-uploads only the rest, so a
+    // block-window update no longer re-sends every scenery atlas and buffer.
+    let mut page_textures: Vec<Vec<(String, u64)>> = Vec::new();
+    page_textures.resize_with(pages.len(), Vec::new);
+    for (key, (page_index, slot)) in &texture_slots {
+        let mut key_layout = crate::texture_atlas::LayoutKey::new();
+        key_layout.slot(key, *slot);
+        page_textures[*page_index].push((key.clone(), key_layout.value()));
+    }
+    for list in &mut page_textures {
+        list.sort();
+    }
+    let mut local_pages = Vec::with_capacity(pages.len());
+    let mut local_page_keys = Vec::with_capacity(pages.len());
+    for (index, (_, page)) in pages.into_iter().enumerate() {
+        let page = page.finish();
+        if page.indices.is_empty() {
+            continue;
+        }
+        local_page_keys.push(local_page_key(&page, &page_textures[index]));
+        local_pages.push(page);
+    }
     // Keep opaque indices separate so water can sample reflected/refracted scene passes.
     let water_start = indices.len() as u32;
     let mut water_batches: Vec<WaterBatch> = Vec::new();
@@ -1237,9 +1646,12 @@ fn build(
         terrain_upload,
         vertices,
         indices,
-        grass_mips: crate::grass_mips::prepare_with_authored(&atlas, &grass_mips, ATLAS),
+        grass_mips,
         grass,
         atlas,
+        grass_atlas_key,
+        grass_atlas_changed,
+        local_page_keys,
         center: (bx, by),
         tree_center: (cx, cz),
         detail,
@@ -1250,6 +1662,7 @@ fn build(
         water_start,
         water_batches,
         local_pages,
+        local_scenery_skipped: skip_local_scenery,
     })
 }
 const SHADER: &str = r#"
@@ -1346,10 +1759,17 @@ struct Renderer {
     post: crate::post_gpu::PostGpu,
     object_start: u32,
     local_pages: Vec<crate::world_objects::GpuPage>,
+    /// Layout signature of each element of `local_pages`, so an update can keep
+    /// the pages whose content did not change instead of re-uploading them.
+    local_page_keys: Vec<u64>,
     world_pages: Vec<crate::world_objects::GpuPage>,
     /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
     world_draw_cmds: [crate::world_objects::WorldDrawList; crate::world_objects::WORLD_VIEWS],
     world_done: bool,
+    /// The scenery half of the drawn mesh was left out because the whole-world
+    /// preload owns it. Unlike `world_done` this describes the *mesh*, so the
+    /// streamer and the renderer can agree on what a rebuild should contain.
+    local_scenery_skipped: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     water_start: u32,
@@ -1359,6 +1779,15 @@ struct Renderer {
     wind_last: Instant,
     /// Snapshot computed once by `render()`; secondary views reuse it.
     frame: FrameSnapshot,
+    /// This second's frame CPU samples, reported on the `TimingFrame` channel.
+    frame_budget: FrameBudget,
+    /// World renders this frame will submit: the main view plus a mirror and a
+    /// refraction pass for every visible water plane.
+    scene_passes: u32,
+    /// Water views this frame that were scissored, and their mean share of the
+    /// target. Reported once a second so the saving is visible in the log.
+    water_scissored: u32,
+    water_scissor_cover: f32,
     world_glow: crate::post_gpu::WorldGlow,
     celestial_visibility: crate::client_sun::Visibility,
     /// Raw `+0x80` disc-flag word from the default area, before the viewer's
@@ -1384,8 +1813,15 @@ struct Renderer {
     glow_requested_fade: Option<f32>,
     grass_wind_state: crate::grass_wind::GrassWind,
     atlas: wgpu::Texture,
+    /// Layout signature of the grass atlas currently uploaded to `atlas`.
+    grass_atlas_key: u64,
     vertex: wgpu::Buffer,
     index: wgpu::Buffer,
+    /// Bytes allocated in `vertex`/`index`. Updates write into the existing
+    /// buffers and only grow them, instead of destroying and recreating the
+    /// whole world's near geometry on every block-window update.
+    vertex_capacity: u64,
+    index_capacity: u64,
     count: u32,
     depth: wgpu::Texture,
     /// Object-motion attachment for the shared motion-vector pass: `rg` pixel
@@ -1928,18 +2364,34 @@ impl Renderer {
             multisample: Default::default(),
             multiview: None,
         });
-        let vertex = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&m.vertices),
-            usage: wgpu::BufferUsages::VERTEX,
+        // Sized once and kept: a block-window update rewrites the same geometry
+        // through `queue.write_buffer` and only reallocates when the mesh grows.
+        let vertex_capacity =
+            world_buffer_capacity(m.vertices.len(), std::mem::size_of::<Vertex>());
+        let vertex = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("near terrain vertices"),
+            size: vertex_capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
-        let index = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: None,
-            contents: bytemuck::cast_slice(&m.indices),
-            usage: wgpu::BufferUsages::INDEX,
+        if !m.vertices.is_empty() {
+            queue.write_buffer(&vertex, 0, bytemuck::cast_slice(&m.vertices));
+        }
+        let index_capacity = world_buffer_capacity(m.indices.len(), std::mem::size_of::<u32>());
+        let index = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("near terrain indices"),
+            size: index_capacity,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+        if !m.indices.is_empty() {
+            queue.write_buffer(&index, 0, bytemuck::cast_slice(&m.indices));
+        }
         let count = m.indices.len() as u32;
-        crate::grass_mips::upload(&queue, &atlas, &m.atlas, &m.grass_mips, ATLAS);
+        if m.grass_atlas_changed {
+            crate::grass_mips::upload(&queue, &atlas, &m.atlas, &m.grass_mips, ATLAS);
+        }
+        let grass_atlas_key = m.grass_atlas_key;
         let grass = crate::grass_instances::Gpu::new(
             &device,
             format,
@@ -1951,6 +2403,7 @@ impl Renderer {
         let d = depth_tex;
         let (object_mv, object_mv_view) = object_mv_target(&device, w, h);
         let post = crate::post_gpu::PostGpu::new(&device, format, w, h);
+        let local_page_keys = m.local_page_keys;
         let local_pages = m
             .local_pages
             .into_iter()
@@ -2056,11 +2509,13 @@ impl Renderer {
             shore,
             object_start: m.object_start,
             local_pages,
+            local_page_keys,
             world_pages: Vec::new(),
             world_draw_cmds: std::array::from_fn(|_| {
                 crate::world_objects::WorldDrawList::default()
             }),
             world_done: false,
+            local_scenery_skipped: m.local_scenery_skipped,
             layout,
             sampler,
             water_start: m.water_start,
@@ -2068,6 +2523,10 @@ impl Renderer {
             visible_water_batches: Vec::new(),
             started: Instant::now(),
             frame: FrameSnapshot::default(),
+            frame_budget: FrameBudget::default(),
+            scene_passes: 1,
+            water_scissored: 0,
+            water_scissor_cover: 0.,
             world_glow: crate::post_gpu::WorldGlow::default(),
             celestial_visibility: crate::client_sun::Visibility::default(),
             celestial_flags: 0x18,
@@ -2081,8 +2540,11 @@ impl Renderer {
             // has to exist before the first frame.
             wind_last: Instant::now(),
             atlas,
+            grass_atlas_key,
             vertex,
+            vertex_capacity,
             index,
+            index_capacity,
             count,
             depth: d,
             object_mv,
@@ -2542,13 +3004,28 @@ impl Renderer {
             )?;
             upload.materials.release_gpu_source();
         }
-        self.grass.update(&self.device, m.grass);
-        self.local_pages.clear();
-        self.local_pages = m
-            .local_pages
-            .into_iter()
-            .map(|page| {
-                crate::world_objects::GpuPage::upload(
+        self.grass.update(&self.device, &self.queue, m.grass);
+        // A streamed scenery page is a deterministic function of the textures it
+        // packs and the ornaments it places, so most pages of a crossing are the
+        // pages the renderer already holds. Reusing them saves a 4096² atlas
+        // upload, eight mip uploads and the page's vertex and index buffers —
+        // the world-object half of the hitch at every block boundary.
+        let keys = std::mem::take(&mut m.local_page_keys);
+        let previous: Vec<crate::world_objects::GpuPage> = std::mem::take(&mut self.local_pages);
+        let mut reused: HashMap<u64, Vec<crate::world_objects::GpuPage>> = HashMap::new();
+        for (key, page) in self.local_page_keys.drain(..).zip(previous) {
+            reused.entry(key).or_default().push(page);
+        }
+        let mut local_pages = Vec::with_capacity(m.local_pages.len());
+        let mut kept_pages = 0usize;
+        for (page, &key) in m.local_pages.into_iter().zip(keys.iter()) {
+            let kept = reused.get_mut(&key).and_then(|pages| pages.pop());
+            local_pages.push(match kept {
+                Some(page) => {
+                    kept_pages += 1;
+                    page
+                }
+                None => crate::world_objects::GpuPage::upload(
                     &self.device,
                     &self.queue,
                     &self.layout,
@@ -2556,35 +3033,82 @@ impl Renderer {
                     &self.uniform,
                     &self.reflected_uniform,
                     page,
-                )
-            })
-            .collect();
-        self.vertex = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&m.vertices),
-                usage: wgpu::BufferUsages::VERTEX,
+                ),
             });
-        self.index = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&m.indices),
-                usage: wgpu::BufferUsages::INDEX,
-            });
+        }
+        self.local_pages = local_pages;
+        // What a rebuild actually asked the GPU to do. With the layout keys in
+        // place a crossing normally uploads nothing here; a line that keeps
+        // reporting uploads is the one to look at.
+        let grass_atlas_state = if m.grass_atlas_changed {
+            "re-uploaded"
+        } else {
+            "kept"
+        };
+        crate::diag!(
+            TimingLoad,
+            "world update: {} scenery pages kept, {} uploaded, grass atlas {}",
+            kept_pages,
+            keys.len() - kept_pages,
+            grass_atlas_state
+        );
+        self.local_page_keys = keys;
+        self.write_world_buffers(&m.vertices, &m.indices);
         self.count = m.indices.len() as u32;
         self.center = m.center;
         self.tree_center = m.tree_center;
         self.detail = m.detail;
         self.lod = m.lod;
+        self.local_scenery_skipped = m.local_scenery_skipped;
         self.spans = m.spans;
         self.terrain_end = m.terrain_end;
         self.object_start = m.object_start;
         self.water_start = m.water_start;
         self.water_batches = m.water_batches;
-        crate::grass_mips::upload(&self.queue, &self.atlas, &m.atlas, &m.grass_mips, ATLAS);
+        if m.grass_atlas_changed {
+            crate::grass_mips::upload(&self.queue, &self.atlas, &m.atlas, &m.grass_mips, ATLAS);
+            self.grass_atlas_key = m.grass_atlas_key;
+        }
         Ok(())
+    }
+
+    /// Upload the rebuilt near-world geometry, growing the two buffers only when
+    /// the new mesh is larger than what they hold.
+    ///
+    /// Every block-window update rewrites these buffers in full: the vertices and
+    /// indices are the same size to within a block, so recreating them meant a
+    /// fresh allocation plus a full upload of the world's near geometry for a
+    /// change of one block.
+    fn write_world_buffers(&mut self, vertices: &[Vertex], indices: &[u32]) {
+        let vertex_bytes = std::mem::size_of_val(vertices) as u64;
+        let index_bytes = std::mem::size_of_val(indices) as u64;
+        if self.vertex_capacity < vertex_bytes {
+            self.vertex_capacity =
+                world_buffer_capacity(vertices.len(), std::mem::size_of::<Vertex>());
+            self.vertex = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("near terrain vertices"),
+                size: self.vertex_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if self.index_capacity < index_bytes {
+            self.index_capacity = world_buffer_capacity(indices.len(), std::mem::size_of::<u32>());
+            self.index = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("near terrain indices"),
+                size: self.index_capacity,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if !vertices.is_empty() {
+            self.queue
+                .write_buffer(&self.vertex, 0, bytemuck::cast_slice(vertices));
+        }
+        if !indices.is_empty() {
+            self.queue
+                .write_buffer(&self.index, 0, bytemuck::cast_slice(indices));
+        }
     }
     fn draw_opaque(
         &self,
@@ -2600,6 +3124,9 @@ impl Renderer {
         terrain_depth_source: Option<&wgpu::Texture>,
         clear_color: Option<wgpu::Color>,
         frustum: &[[f32; 4]; 6],
+        // The water's extra views are read only by the water surface, inside
+        // `water_view_scissor`'s rectangle. `None` draws the whole attachment.
+        scissor: Option<[u32; 4]>,
     ) {
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
@@ -2627,6 +3154,9 @@ impl Renderer {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+        if let Some([x, y, w, h]) = scissor {
+            p.set_scissor_rect(x, y, w, h);
+        }
         if clear_color.is_none() {
             self.sky.draw(&mut p, sky_reflected);
         }
@@ -2681,6 +3211,9 @@ impl Renderer {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
+        if let Some([x, y, w, h]) = scissor {
+            p.set_scissor_rect(x, y, w, h);
+        }
         if !ui_test() && !skip_trees_test() {
             self.far_trees.draw(&mut p, reflected);
         }
@@ -2943,6 +3476,7 @@ impl Renderer {
         range: f32,
         full_world: bool,
     ) {
+        let started = Instant::now();
         let matrix = if full_world {
             let w = self.world_width as f32 * self.world_spacing;
             let h = self.world_height as f32 * self.world_spacing;
@@ -2976,6 +3510,7 @@ impl Renderer {
         );
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
+        let frustum = crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array());
         let mut e = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2997,7 +3532,9 @@ impl Renderer {
             view_runs,
             None,
             None,
-            &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+            &frustum,
+            // The map image is read as a whole, so there is nothing to scissor.
+            None,
         );
         {
             let mut pass = e.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3028,6 +3565,16 @@ impl Renderer {
             pass.draw_indexed(self.water_start..self.count, 0, 0..1);
         }
         self.queue.submit(Some(e.finish()));
+        // The map's records above overwrote the shared argument buffer, so put
+        // the main view's back before the next submit reads it. `prepare_runs`
+        // compares against the last list it uploaded, and without this every
+        // frame that also drew the minimap re-uploaded the main view's records
+        // on the next frame for no reason.
+        if !full_world {
+            self.queue_main_runs();
+        }
+        self.frame_budget.note(STAGE_MINIMAP, started);
+        self.frame_budget.passes += 1;
     }
     /// Re-queues the main view's indirect terrain records for the next submit.
     /// Every pass drawn through the main matrix (`Main`, `Fog` and both
@@ -3090,6 +3637,13 @@ impl Renderer {
         // against a view that no longer exists.
         reset_history: bool,
     ) {
+        // Where this frame's CPU time goes, stage by stage. One line a second on
+        // the `TimingFrame` channel; see `FrameBudget`.
+        let mut stage_ms = [0f64; STAGE_COUNT];
+        let mut lap_at = Instant::now();
+        self.scene_passes = 1;
+        self.water_scissored = 0;
+        self.water_scissor_cover = 0.;
         // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
         // the same block walk the client runs before the level rule.
         // Both buffers are reused: this runs for every view of every frame.
@@ -3104,6 +3658,7 @@ impl Renderer {
         // One indirect record per run, so the terrain itself is one call per mesh
         // instead of one call per run.
         self.queue_main_runs();
+        lap(STAGE_VISIBILITY, &mut stage_ms, &mut lap_at);
         let frame = self.begin_frame(camera, w, h);
         self.weather.advance(camera.logic_delta_ms);
         let selected_weather = camera.regional_light.map_or(
@@ -3233,6 +3788,17 @@ impl Renderer {
                 occlusion_query_set: None,
             });
         }
+        // One frustum for the whole frame: the main scene, its models and both
+        // refraction passes all read the same matrix, and this used to be
+        // extracted from it three times per frame.
+        let frustum = crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array());
+        // The main depth is copied into the water's `terrain_depth` for the edge
+        // reconstruction, which only the water surface reads (and only when it is
+        // above the plane). No water plane on screen, no reader.
+        let water_edge_reads_terrain_depth = self
+            .water_batches
+            .iter()
+            .any(|b| !b.simple && b.visible(matrix));
         self.draw_opaque(
             &mut e,
             "main scene",
@@ -3243,9 +3809,14 @@ impl Renderer {
             false,
             main_pass,
             ViewRuns::Main,
-            Some(&self.depth),
+            if water_edge_reads_terrain_depth {
+                Some(&self.depth)
+            } else {
+                None
+            },
             None,
-            &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+            &frustum,
+            None,
         );
         let model_target = self.water.scene_raw();
         self.draw_models(
@@ -3256,7 +3827,7 @@ impl Renderer {
             camera,
             Pass::Main,
             true,
-            &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+            &frustum,
             unjittered_vp,
         );
         self.draw_addons(
@@ -3306,10 +3877,33 @@ impl Renderer {
             true,
             reset_history,
         );
-        self.water.copy_scene_to_refraction(&mut e);
-        self.water.copy_depth(&mut e, &self.depth);
+        // Two full-resolution copies that only the water and the post chain can
+        // read, so neither runs when nothing reads it: the refraction copy feeds
+        // the per-plane refraction renders and the water surface's own sampling,
+        // and both of those exist only for a visible non-simple water plane. A
+        // land view — or any view with the water off screen — used to pay for a
+        // full-frame texture copy every frame. The depth copy is the post chain's
+        // input and only that (`sample_depth` is read by `PostGpu::render`
+        // alone), so it follows `use_post`.
+        // With reflections on, every visible non-simple plane renders its own
+        // refraction target (clearing all of it) before its surface is drawn, so
+        // this copy can never be read: the only frame that needs it is one with
+        // reflections off, where no per-plane pass runs and the surface still
+        // samples the refraction by screen UV.
+        if !camera.water_reflections
+            && self
+                .water_batches
+                .iter()
+                .any(|b| !b.simple && b.visible(matrix))
+        {
+            self.water.copy_scene_to_refraction(&mut e);
+        }
+        if use_post {
+            self.water.copy_depth(&mut e, &self.depth);
+        }
         self.water.blit(&mut e, scene_target);
         self.queue.submit(Some(e.finish()));
+        lap(STAGE_MAIN, &mut stage_ms, &mut lap_at);
         // Diagnostic mode for exercising window/input UI on memory-limited software GPUs.
         if ui_test() {
             if use_post {
@@ -3337,6 +3931,7 @@ impl Renderer {
                     camera.gamma_setting,
                 );
             }
+            self.end_frame(stage_ms, lap_at);
             return;
         }
 
@@ -3389,6 +3984,7 @@ impl Renderer {
                 );
             }
             self.queue.submit(Some(e.finish()));
+            lap(STAGE_EXTRA_VIEWS, &mut stage_ms, &mut lap_at);
             if let Some(shore) = &self.shore {
                 shore.draw(
                     &self.device,
@@ -3430,8 +4026,19 @@ impl Renderer {
                 );
             }
             self.visible_water_batches = visible;
+            lap(STAGE_POST, &mut stage_ms, &mut lap_at);
+            self.end_frame(stage_ms, lap_at);
             return;
         }
+        // How far the water surface samples away from itself, in UV: the shader
+        // displaces by `n.xz * edge * edge * 0.25`, and `|n.xz|` is bounded by
+        // the loaded normal map. One pixel of slack covers the filter footprint.
+        let water_margin = (0.25 * self.water.normal_extent() + 0.01).clamp(0.02, 0.26);
+        // One main pass, then a mirror and a refraction pass per non-simple plane
+        // below. Nothing here is duplicated work to remove — a mirror is a mirror
+        // — but the count is what decides how much world the frame rasterises, so
+        // it goes into the `TimingFrame` line rather than staying invisible.
+        self.scene_passes = 1 + 2 * visible.iter().filter(|b| !b.simple).count() as u32;
         let mut simple_encoder: Option<wgpu::CommandEncoder> = None;
         for (batch_idx, batch) in visible.iter().enumerate() {
             if batch.simple {
@@ -3455,6 +4062,16 @@ impl Renderer {
                 self.queue.submit(Some(e.finish()));
             }
             let plane = batch.height;
+            // Both refraction branches draw through the main matrix, and the
+            // water surface reads their output by screen UV displaced by at most
+            // a quarter. Everything outside this rectangle is shaded today and
+            // read by nobody.
+            let refraction_scissor =
+                water_view_scissor(matrix, w, h, batch.bounds, plane, water_margin);
+            if let Some([_, _, sw, sh]) = refraction_scissor {
+                self.water_scissored += 1;
+                self.water_scissor_cover += (sw as f32 * sh as f32) / (w as f32 * h as f32);
+            }
             // A previous plane's reflection left its mirrored records in the
             // buffer; the refraction passes below draw through the main matrix.
             if batch_idx > 0 {
@@ -3520,7 +4137,8 @@ impl Renderer {
                         b: linear(fog[2]),
                         a: 1.,
                     }),
-                    &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+                    &frustum,
+                    refraction_scissor,
                 );
                 let model_view = self.water.refraction_raw();
                 self.draw_addons(
@@ -3573,7 +4191,8 @@ impl Renderer {
                     ViewRuns::Main,
                     None,
                     None,
-                    &crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array()),
+                    &frustum,
+                    refraction_scissor,
                 );
                 if let Some(cloud) = &self.cloud {
                     cloud.draw(
@@ -3651,6 +4270,8 @@ impl Renderer {
             }
             let flip = Mat4::from_translation(Vec3::new(0., 2. * plane, 0.))
                 * Mat4::from_scale(Vec3::new(1., -1., 1.));
+            let reflected_frustum =
+                crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array());
             let reflected = Uniform {
                 matrix: (matrix * flip).to_cols_array_2d(),
                 direction: [direction.x, -direction.y, direction.z, daylight],
@@ -3703,7 +4324,10 @@ impl Renderer {
                 ViewRuns::Reflected,
                 None,
                 None,
-                &crate::world_objects::frustum_planes_from_matrix((matrix * flip).to_cols_array()),
+                &reflected_frustum,
+                // The mirror is read at `screen ± 0.25` by the same surface, so
+                // the same rectangle applies through the mirrored matrix.
+                water_view_scissor(matrix * flip, w, h, batch.bounds, plane, water_margin),
             );
             if let Some(cloud) = &self.cloud {
                 cloud.draw(
@@ -3776,6 +4400,7 @@ impl Renderer {
             self.queue.submit(Some(e.finish()));
         }
         self.visible_water_batches = visible;
+        lap(STAGE_EXTRA_VIEWS, &mut stage_ms, &mut lap_at);
         if let Some(shore) = &self.shore {
             shore.draw(
                 &self.device,
@@ -3816,6 +4441,25 @@ impl Renderer {
                 camera.gamma_setting,
             );
         }
+        lap(STAGE_POST, &mut stage_ms, &mut lap_at);
+        self.end_frame(stage_ms, lap_at);
+    }
+
+    /// Close one frame's stage samples: whatever the last stage did not claim is
+    /// "rest" (the encoder finish, the present-side work and the branches this
+    /// frame skipped), then the budget decides whether a second has passed.
+    fn end_frame(&mut self, mut stage_ms: [f64; STAGE_COUNT], lap_at: Instant) {
+        stage_ms[STAGE_REST] += lap_at.elapsed().as_secs_f64() * 1000.;
+        let pages = self.world_pages.len();
+        let passes = self.scene_passes;
+        let scissored = self.water_scissored;
+        let cover = if scissored > 0 {
+            self.water_scissor_cover / scissored as f32
+        } else {
+            0.
+        };
+        self.frame_budget.add(stage_ms, passes, scissored, cover);
+        self.frame_budget.report(pages);
     }
 }
 fn water_depth(areas: &[crate::water::WaterArea], pos: Vec3) -> f32 {
@@ -4428,6 +5072,9 @@ pub fn run(
     let vegetation_authored_mips = settings.vegetation_authored_mips
         || std::env::var_os("PW_VEGETATION_AUTHORED_MIPS").is_some();
     let mut residency = crate::terrain_residency::Residency::default();
+    // Nothing is uploaded yet, so the first build always materialises the atlas.
+    // The whole-world preload has not started either, so the local scenery is
+    // part of this first mesh (`skip_local_scenery: false`).
     let m = build(
         &mut t,
         camera.pos.x,
@@ -4435,6 +5082,8 @@ pub fn run(
         settings.detail,
         &mut residency,
         vegetation_authored_mips,
+        0,
+        false,
     )?;
     let mut renderer = Renderer::new(
         device,
@@ -4675,13 +5324,21 @@ pub fn run(
     // The expensive atlas and scene rebuild runs off the UI thread. At most one
     // request is in flight; once it completes, the latest camera position is used.
     let (width, height, spacing) = (t.width, t.height, t.grid_spacing);
-    let (request_tx, request_rx) = std::sync::mpsc::channel::<(f32, f32, DetailSettings)>();
+    // The request carries the grass-atlas signature the renderer holds. The
+    // worker is what decides whether the rebuilt atlas differs, and it can only
+    // know that from the renderer: the pixels and their mip tiles are the
+    // largest thing the streaming path uploads, and a camera crossing a block
+    // almost never changes them.
+    // The last element says whether the whole-world preload owns the scenery, so
+    // the worker can leave the local half of the mesh out (see `build`).
+    let (request_tx, request_rx) =
+        std::sync::mpsc::channel::<(f32, f32, DetailSettings, u64, bool)>();
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<MeshData, String>>(1);
     std::thread::Builder::new()
         .name("world-streaming".into())
         .spawn(move || {
             let mut residency = crate::terrain_residency::Residency::default();
-            while let Ok((x, z, detail)) = request_rx.recv() {
+            while let Ok((x, z, detail, grass_atlas_key, skip_local_scenery)) = request_rx.recv() {
                 let started = Instant::now();
                 let result = build(
                     &mut t,
@@ -4690,8 +5347,11 @@ pub fn run(
                     detail,
                     &mut residency,
                     vegetation_authored_mips,
+                    grass_atlas_key,
+                    skip_local_scenery,
                 );
-                eprintln!(
+                crate::diag!(
+                    TimingLoad,
                     "Background terrain build at ({x:.1},{z:.1}) took {:.2}s",
                     started.elapsed().as_secs_f32()
                 );
@@ -4827,7 +5487,7 @@ pub fn run(
     let mut last_settings_save = Instant::now();
     let mut last = Instant::now();
     let mut region_tick_ms = renderer.started.elapsed().as_millis() as u64;
-    let mut last_minimap_key: Option<([i32; 3], bool, usize)> = None;
+    let mut last_minimap_key: Option<MinimapKey> = None;
     event_loop
         .run(move |event, target| match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => {
@@ -5574,12 +6234,30 @@ pub fn run(
                             levels,
                         })
                     };
+                    // The whole-world preload draws the scenery, so the local
+                    // half of the mesh is dead weight while it holds: skip it in
+                    // the build instead of packing and uploading ornament
+                    // atlases nothing samples. Crossing into or out of that
+                    // state changes what the mesh should contain, so it is part
+                    // of the staleness test and not just of the request.
+                    let skip_local_scenery = renderer.world_done;
                     let stale = match &aim {
-                        Some(aim) => aim != &renderer.lod || renderer.detail != settings.detail,
+                        Some(aim) => {
+                            aim != &renderer.lod
+                                || renderer.detail != settings.detail
+                                || renderer.local_scenery_skipped != skip_local_scenery
+                        }
                         None => false,
                     };
                     if stale {
-                        if request_tx.send((camera.pos.x, camera.pos.z, settings.detail)).is_err() {
+                        let request = (
+                            camera.pos.x,
+                            camera.pos.z,
+                            settings.detail,
+                            renderer.grass_atlas_key,
+                            skip_local_scenery,
+                        );
+                        if request_tx.send(request).is_err() {
                             eprintln!("World streaming worker exited");
                             target.exit();
                             return;
@@ -5672,6 +6350,7 @@ pub fn run(
                                 }
                                 renderer.local_pages.clear();
                                 renderer.local_pages.shrink_to_fit();
+                                renderer.local_page_keys.clear();
                                 renderer.world_done = true;
                                 let elapsed = world_started_at
                                     .take()
@@ -6131,14 +6810,12 @@ pub fn run(
                             // overhead pass is skipped rather than rendered and
                             // hidden.
                             if settings.show_minimap && settings.minimap_style==MapStyle::Realistic {
-                              let minimap_key = (
-                                 [
-                                 camera.pos.x.round() as i32,
-                                 camera.pos.y.round() as i32,
-                                 camera.pos.z.round() as i32,
-                                 ],
-                              renderer.world_done,
-                              renderer.world_pages.len(),
+                              let minimap_key = MinimapKey::new(
+                                  camera.pos.x,
+                                  camera.pos.z,
+                                  settings.minimap_range,
+                                  renderer.world_done,
+                                  renderer.world_pages.len(),
                               );
                               if last_minimap_key != Some(minimap_key) {
                                   renderer.render_minimap(&map_view,&map_depth,&camera,settings.minimap_range,false);
@@ -7024,6 +7701,10 @@ pub fn preview(
         DetailSettings::default(),
         &mut residency,
         false,
+        0,
+        // The preview renders one frame of the local window; it never runs the
+        // whole-world preload, so the scenery half stays in the mesh.
+        false,
     )?;
     let (width, height) = (960u32, 720u32);
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -7087,6 +7768,7 @@ pub fn preview(
                     }
                     renderer.local_pages.clear();
                     renderer.local_pages.shrink_to_fit();
+                    renderer.local_page_keys.clear();
                     renderer.world_done = true;
                     break;
                 }
@@ -7478,7 +8160,7 @@ mod frame_snapshot_tests {
     fn pass_kinds_are_submitted_from_production_call_sites() {
         let src = source();
         for needle in [
-            "            main_pass,\n            ViewRuns::Main,\n            Some(&self.depth),",
+            "            main_pass,\n            ViewRuns::Main,\n",
             "                    Pass::Refraction,\n                    ViewRuns::Main,",
             "                Pass::Reflection,\n                ViewRuns::Reflected,",
             "                Pass::Minimap\n            },\n            view_runs,",
@@ -7561,6 +8243,302 @@ mod slider_mark_tests {
             let t = slider_mark_fraction(default, min, max, true);
             assert!(t.is_finite() && (0.0..=1.0).contains(&t), "{t}");
         }
+    }
+}
+
+#[cfg(test)]
+mod world_stream_tests {
+    use super::*;
+
+    fn page(used_height: usize, vertices: usize, indices: usize) -> crate::world_objects::Page {
+        crate::world_objects::Page {
+            shared_atlas: None,
+            vertices: (0..vertices)
+                .map(|i| Vertex {
+                    pos: [i as f32, 0., 0.],
+                    normal: [0., 1., 0.],
+                    uv: [0.; 2],
+                    color: [0.; 4],
+                    kind: 2.,
+                    diffuse: 0xffff_ffff,
+                    night_diffuse: 0xffff_ffff,
+                })
+                .collect(),
+            indices: (0..indices as u32).collect(),
+            atlas: vec![0; crate::world_objects::SIDE * used_height * 4],
+            processed: 0,
+            used_height,
+            mips: Vec::new(),
+            placements: Vec::new(),
+            bounds: Vec::new(),
+            page_min: [0.; 3],
+            page_max: [1.; 3],
+            page_has_sdr: false,
+        }
+    }
+
+    /// The renderer keeps a streamed scenery page only when its signature is
+    /// unchanged, so the signature must move with the page's textures, its
+    /// geometry size and its frozen submission metadata.
+    #[test]
+    fn a_page_signature_separates_layout_and_geometry() {
+        let slot = crate::texture_atlas::Slot {
+            x: 128,
+            y: 0,
+            w: 256,
+            h: 256,
+        };
+        let mut layout = crate::texture_atlas::LayoutKey::new();
+        layout.slot("textures/物件/石头.dds", slot);
+        let textures = vec![("textures/物件/石头.dds".to_string(), layout.value())];
+        let base = page(256, 4, 6);
+        let key = local_page_key(&base, &textures);
+        assert_eq!(key, local_page_key(&base, &textures), "stable for one page");
+
+        // A rectangle that moved, a second texture, another page height.
+        let moved = crate::texture_atlas::Slot { x: 0, ..slot };
+        let mut other_layout = crate::texture_atlas::LayoutKey::new();
+        other_layout.slot("textures/物件/石头.dds", moved);
+        let other = vec![("textures/物件/石头.dds".to_string(), other_layout.value())];
+        assert_ne!(key, local_page_key(&base, &other));
+        assert_ne!(key, local_page_key(&base, &textures[..0]));
+        assert_ne!(key, local_page_key(&page(512, 4, 6), &textures));
+        assert_ne!(key, local_page_key(&page(256, 5, 6), &textures));
+        assert_ne!(key, local_page_key(&page(256, 4, 7), &textures));
+
+        // Two textures swapped in packing order are two different pages.
+        let mut first = crate::texture_atlas::LayoutKey::new();
+        first.slot("a", slot);
+        let mut second = crate::texture_atlas::LayoutKey::new();
+        second.slot("b", moved);
+        let a = ("a".to_string(), first.value());
+        let b = ("b".to_string(), second.value());
+        let ab = vec![a.clone(), b.clone()];
+        let ba = vec![b, a];
+        assert_ne!(
+            local_page_key(&base, &ab),
+            local_page_key(&base, &ba),
+            "the signature covers the sorted texture list, so a page cannot be reused"
+        );
+    }
+
+    /// The geometry buffers are allocated to a power of two so a window that
+    /// grows by a block does not force a reallocation, and never below the
+    /// four-byte alignment `write_buffer` requires.
+    #[test]
+    fn world_buffers_are_sized_for_growth_and_alignment() {
+        assert_eq!(world_buffer_capacity(0, 32), 4);
+        assert_eq!(world_buffer_capacity(1, 32), 32);
+        assert_eq!(world_buffer_capacity(1000, 32), 32_768);
+        assert_eq!(world_buffer_capacity(32_769, 32), 2_097_152);
+        assert_eq!(world_buffer_capacity(1, 4), 4);
+    }
+}
+
+/// The per-second `TimingFrame` line is only worth having if the average it
+/// prints is the average of the frames it saw and if a quiet second is dropped
+/// from the next one. A budget that kept accumulating after a report would make
+/// every later average drift upward, and one that divided by a stale frame count
+/// would understate a hitch.
+mod frame_budget_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn sample(visibility: f64, main: f64) -> [f64; STAGE_COUNT] {
+        let mut sample = [0.; STAGE_COUNT];
+        sample[STAGE_VISIBILITY] = visibility;
+        sample[STAGE_MAIN] = main;
+        sample
+    }
+
+    #[test]
+    fn a_second_of_frames_averages_per_stage_and_then_starts_over() {
+        let mut budget = FrameBudget::default();
+        budget.add(sample(1., 3.), 1, 0, 0.);
+        budget.add(sample(1., 5.), 3, 2, 0.25);
+        assert_eq!(budget.frames, 2);
+        assert_eq!(budget.passes, 4);
+        assert_eq!(budget.worst_ms, 6.);
+        budget.since = Some(Instant::now() - Duration::from_secs(2));
+        budget.report(0);
+        assert_eq!(budget.frames, 0, "a reported second is not counted twice");
+        assert_eq!(budget.stage_ms, [0.; STAGE_COUNT]);
+        assert_eq!(budget.worst_ms, 0.);
+        assert_eq!(budget.passes, 0, "the renders per frame start over too");
+        assert_eq!(budget.scissored, 0);
+        assert_eq!(budget.scissor_frames, 0);
+    }
+
+    /// The minimap's key is the whole reason a top-down pass runs at all, so it
+    /// has to name exactly what the image depends on. The map matrix is built from
+    /// the ground position and the range, so height must not be in the key (a
+    /// climbing camera used to re-render the world once per frame for nothing) and
+    /// the range must be (dragging the slider used to leave the old window on
+    /// screen until the camera moved a whole unit).
+    #[test]
+    fn the_minimap_key_names_what_the_top_down_image_depends_on() {
+        let base = MinimapKey::new(10., -20., 256., false, 7);
+        // The key is built from a ground position, so a camera a kilometre up
+        // makes the same key as one on the floor: height has no way in.
+        assert_eq!(
+            base,
+            MinimapKey::new(10., -20., 256., false, 7),
+            "the same ground position is the same map, whatever the height"
+        );
+        // A different ground position, a different range, a page that arrived or
+        // the preload finishing are all new pixels.
+        assert_ne!(base, MinimapKey::new(11., -20., 256., false, 7));
+        assert_ne!(base, MinimapKey::new(10., -19., 256., false, 7));
+        assert_ne!(base, MinimapKey::new(10., -20., 300., false, 7));
+        assert_ne!(base, MinimapKey::new(10., -20., 256., true, 7));
+        assert_ne!(base, MinimapKey::new(10., -20., 256., false, 8));
+    }
+
+    #[test]
+    fn a_stage_measured_outside_render_lands_in_its_own_column() {
+        let mut budget = FrameBudget::default();
+        budget.note(STAGE_MINIMAP, Instant::now() - Duration::from_millis(4));
+        assert!(budget.stage_ms[STAGE_MINIMAP] >= 4.);
+        assert_eq!(budget.stage_ms[STAGE_MAIN], 0.);
+        assert_eq!(budget.frames, 0, "the minimap is a stage, not a frame");
+    }
+}
+
+#[cfg(test)]
+mod water_scissor_tests {
+    use super::*;
+
+    const W: u32 = 3440;
+    const H: u32 = 1369;
+
+    /// A camera at `eye` looking along `direction`, with the frame's aspect.
+    fn camera(eye: Vec3, direction: Vec3) -> Mat4 {
+        Mat4::perspective_rh(60f32.to_radians(), W as f32 / H as f32, 0.1, 20000.)
+            * Mat4::look_to_rh(eye, direction, Vec3::Y)
+    }
+
+    /// The plane's four corners in pixels, without any margin.
+    fn corners(matrix: Mat4, bounds: [f32; 4], height: f32) -> [[f32; 2]; 4] {
+        let [x0, x1, z0, z1] = bounds;
+        [(x0, z0), (x0, z1), (x1, z0), (x1, z1)].map(|(x, z)| {
+            let p = matrix * Vec4::new(x, height, z, 1.);
+            let ndc = [p.x / p.w, p.y / p.w];
+            [
+                (ndc[0] * 0.5 + 0.5) * W as f32,
+                (0.5 - ndc[1] * 0.5) * H as f32,
+            ]
+        })
+    }
+
+    /// A pond ahead of and below the eye is scissored to its own rectangle, and
+    /// that rectangle leaves the margin the surface's displaced sampling needs on
+    /// every side.
+    #[test]
+    fn a_pond_ahead_keeps_the_margin_the_surface_samples_through() {
+        let matrix = camera(Vec3::new(0., 30., 0.), Vec3::new(0., -0.5, -0.866));
+        let bounds = [-40., 40., -160., -60.];
+        let margin = 0.12;
+        let rect = water_view_scissor(matrix, W, H, bounds, 0., margin)
+            .expect("a small pond is scissored");
+        let [x, y, w, h] = rect;
+        assert!(
+            (w * h) as f32 <= (W * H) as f32 * 0.5,
+            "the pond is a third of the view, not most of it: {rect:?}"
+        );
+        assert!(
+            x + w <= W && y + h <= H,
+            "the rectangle stays inside the target"
+        );
+
+        let corners = corners(matrix, bounds, 0.);
+        let min_x = corners.iter().map(|c| c[0]).fold(f32::INFINITY, f32::min);
+        let max_x = corners
+            .iter()
+            .map(|c| c[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let min_y = corners.iter().map(|c| c[1]).fold(f32::INFINITY, f32::min);
+        let max_y = corners
+            .iter()
+            .map(|c| c[1])
+            .fold(f32::NEG_INFINITY, f32::max);
+        // Every side must reach the sampling margin past the pond, or be clamped
+        // by the target's own edge.
+        let margin_x = W as f32 * margin;
+        let margin_y = H as f32 * margin;
+        // A pixel of slack each way for the floor/ceil that turns the rectangle
+        // outwards.
+        let slack = 2.;
+        assert!(
+            x as f32 <= min_x - margin_x + slack || x == 0,
+            "left margin short"
+        );
+        assert!(
+            (x + w) as f32 >= max_x + margin_x - slack || x + w == W,
+            "right margin short"
+        );
+        assert!(
+            y as f32 <= min_y - margin_y + slack || y == 0,
+            "top margin short"
+        );
+        assert!(
+            (y + h) as f32 >= max_y + margin_y - slack || y + h == H,
+            "bottom margin short"
+        );
+    }
+
+    /// A plane that runs past the camera has a corner behind the eye, where the
+    /// projection is meaningless, so the whole target is drawn as before.
+    #[test]
+    fn a_plane_running_past_the_eye_is_never_scissored() {
+        let matrix = camera(Vec3::new(0., 30., 0.), Vec3::new(0., -0.5, -0.866));
+        assert_eq!(
+            water_view_scissor(matrix, W, H, [-400., 400., -400., 400.], 0., 0.12),
+            None
+        );
+    }
+
+    /// When the plane covers the view there is nothing to save, and answering
+    /// `None` keeps the behaviour identical to drawing it all.
+    #[test]
+    fn a_plane_that_fills_the_view_is_left_alone() {
+        let matrix = camera(Vec3::new(0., 400., 0.), Vec3::new(0., -1., -0.0001));
+        assert_eq!(
+            water_view_scissor(matrix, W, H, [-5000., 5000., -5000., 5000.], 0., 0.12),
+            None
+        );
+    }
+
+    /// The measured normal-map bound is what makes the scissor worth having: with
+    /// the worst case a normal map could hold (a quarter of the target) the
+    /// rectangle is little better than the whole screen, and with the shipped
+    /// map's own bound it is most of the saving.
+    #[test]
+    fn the_measured_margin_is_what_buys_the_saving() {
+        let matrix = camera(Vec3::new(0., 60., 0.), Vec3::new(0., -0.6, -0.8));
+        let bounds = [-60., 60., -220., -80.];
+        let target = (W * H) as f32;
+        let cover = |margin: f32| {
+            let [_, _, w, h] = water_view_scissor(matrix, W, H, bounds, 0., margin)
+                .expect("the pond is scissored at either margin");
+            (w * h) as f32 / target
+        };
+        assert!(
+            cover(0.26) > cover(0.06) * 1.5,
+            "a tight bound must buy a much smaller rectangle: {} vs {}",
+            cover(0.26),
+            cover(0.06)
+        );
+    }
+
+    /// A plane that is off screen entirely is `WaterBatch::visible`'s decision,
+    /// not this function's: it draws the whole target rather than nothing.
+    #[test]
+    fn a_plane_behind_the_camera_falls_back_to_the_whole_target() {
+        let matrix = camera(Vec3::new(0., 30., 0.), Vec3::new(0., -0.5, -0.866));
+        assert_eq!(
+            water_view_scissor(matrix, W, H, [-40., 40., 60., 160.], 0., 0.12),
+            None
+        );
     }
 }
 
