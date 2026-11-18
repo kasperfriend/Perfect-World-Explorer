@@ -23,11 +23,19 @@ fn naga_validates_both_paths_and_emits_native_ray_queries() {
         vulkan::shader(&[BASE, HARDWARE].concat()).expect("Vulkan ray-query WGSL to SPIR-V");
     assert_eq!(shader[0], 0x0723_0203);
     let mut opcodes = Vec::new();
+    let mut intersection_kinds = std::collections::BTreeSet::new();
     let mut at = 5;
     while at < shader.len() {
-        opcodes.push(shader[at] & 0xffff);
+        let op = shader[at] & 0xffff;
+        opcodes.push(op);
+        if op == 4479 {
+            // OpRayQueryGetIntersectionTypeKHR takes the intersection selector
+            // last. Naga 25 reused the first helper for both kinds of getter.
+            intersection_kinds.insert(shader[at + 4]);
+        }
         at += (shader[at] >> 16) as usize;
     }
+    assert_eq!(intersection_kinds.len(), 2, "missing a ray hit getter");
     // SPV_KHR_ray_query: initialize, proceed and explicit alpha-tested confirm.
     assert!([4473, 4476, 4477]
         .into_iter()
@@ -558,7 +566,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     put(&mut foliage, leaf);
     put(&mut foliage, background);
     h.ray.settings.bounces = 0;
-    h.ray.install(Ok((foliage.finish(), bank)));
+    h.ray.install(Ok((foliage.finish(), bank.clone())));
     let sample = |x| test_frame(Vec3::new(x, 0., 0.), -Vec3::Z, 31);
     let far = h.pixels(sample(0.), &empty);
     let red = far.iter().filter(|p| p.0 == [255, 0, 0, 255]).count();
@@ -586,6 +594,45 @@ fn exercise(mode: Mode, cpu_query: bool) {
             .all(|(a, b)| a.0 == b.0 && (a.1 - b.1).abs() < 1e-6),
         "minified foliage changed under subpixel motion"
     );
+
+    // Two 50% sheets should leave about 25% of the ground visible, not 50%
+    // (correlated masks) or 0% (complementary masks at low sample counts).
+    let blue_texture = bank
+        .tile([2, 1], 1, textures::Filter::cutout(0.5, false), |x, _| {
+            if x == 0 {
+                0xffff_0000
+            } else {
+                0
+            }
+        })
+        .unwrap();
+    let mut stacked = Builder::default();
+    for (z, tint, flags, tex) in [
+        (-2., [1.; 4], CUTOUT, texture),
+        (-2.2, [1.; 4], CUTOUT, blue_texture),
+        (-2.4, [0., 1., 0., 1.], 0, 0),
+    ] {
+        let mesh = upright(&mut stacked, z, tint, flags, tex);
+        put(&mut stacked, mesh);
+    }
+    h.ray.install(Ok((stacked.finish(), bank)));
+    h.ray.settings.samples = 4;
+    let layers = h.pixels(sample(0.), &empty);
+    for (i, expected) in [0.50, 0.25, 0.25].into_iter().enumerate() {
+        let mean = layers
+            .iter()
+            .map(|p| {
+                let encoded = f32::from(p.0[i]) / 255.;
+                if encoded <= 0.04045 {
+                    encoded / 12.92
+                } else {
+                    ((encoded + 0.055) / 1.055).powf(2.4)
+                }
+            })
+            .sum::<f32>()
+            / layers.len() as f32;
+        assert!((mean - expected).abs() < 0.055, "channel {i}: {mean}");
+    }
 }
 
 #[test]

@@ -22,11 +22,12 @@ egui-winit = { version = "0.27", default-features = false, features = ["x11", "c
 egui-wgpu = { version = "0.27", default-features = false }
 
 # Lighter imports a buffer through wgpu 0.19's Vulkan HAL, so ash must match.
-# Use a separate Naga for ray queries: 0.19's SPIR-V writer reads hit-only
-# fields even after a miss (gfx-rs/wgpu#6752). The viewer keeps wgpu 0.19.
+# Use a separate Naga for guarded ray-query getters and to keep candidate
+# and committed intersections distinct in SPIR-V (gfx-rs/wgpu#6752, #7497).
+# The viewer keeps wgpu 0.19.
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
 ash = "0.37.3"
-naga-rt = { package = "naga", version = "25.0.1", features = ["wgsl-in", "spv-out"] }
+naga-rt = { package = "naga", version = "26.0.0", features = ["wgsl-in", "spv-out", "termcolor"] }
 
 [target.'cfg(windows)'.dependencies]
 rodio = { version = "0.17", default-features = false, features = ["mp3", "vorbis", "wav"] }

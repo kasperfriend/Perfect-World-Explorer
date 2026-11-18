@@ -73,8 +73,8 @@ while Lighter renders. Existing saved choices for those features are unchanged.
 ## Verification
 
 The viewer tests validate both WGSL paths and inspect the emitted Vulkan
-ray-query SPIR-V. The hardware path uses Naga 25 for safe hit queries after
-traversal without changing the viewer's wgpu version. The pixel tests read
+ray-query SPIR-V. The hardware path uses Naga 26 to keep candidate and
+committed hits distinct without changing the viewer's wgpu version. The pixel tests read
 back *composited* color and depth. The controlled scene covers stacked and
 coincident cutouts, minified coverage and small camera moves, blended sheets,
 local-light and sun shadows, and water reflection/refraction gates. It checks

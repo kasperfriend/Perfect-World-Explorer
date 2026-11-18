@@ -61,7 +61,7 @@ const SHORE: u32 = 5u;
 struct Hit { t: f32, instance: u32, primitive: u32, bary: vec2<f32> }
 struct Ray {
     origin: vec3<f32>, dir: vec3<f32>, low: f32, high: f32,
-    width: f32, spread: f32, coverage: f32,
+    width: f32, spread: f32, coverage: f32, pixel_seed: u32,
 }
 struct Surface {
     n: vec3<f32>,
@@ -241,11 +241,10 @@ fn coverage_sample(ray: Ray, m: bool, inst: u32, v: vec3<u32>) -> f32 {
     let p = floats(m,inst) + rotate(floats(m,v.x),bitcast<f32>(word(m,inst+4u)),bitcast<f32>(word(m,inst+5u)))*bitcast<f32>(word(m,inst+3u));
     let key = bitcast<u32>(i32(round(dot(n,p)*64.)));
     let shape = bitcast<vec3<u32>>(vec3<i32>(round(n*16.)));
-    let salt = hash(key ^ shape.x*0x9e3779b9u ^ shape.y*0x85ebca6bu ^ shape.z*0xc2b2ae35u);
-    let count = frame.options.z;
-    let stratum = (u32(ray.coverage*f32(count)) + (salt >> 24u)) % count;
-    let u = hash(bitcast<u32>(ray.coverage) ^ salt) & 0xffffffu;
-    return (f32(stratum)+f32(u)/16777216.)/f32(count);
+    let salt = hash(key ^ shape.x*0x9e3779b9u ^ shape.y*0x85ebca6bu ^ shape.z*0xc2b2ae35u ^ ray.pixel_seed);
+    // Rotate the strata independently per pixel and plane, not per frame.
+    // A fixed plane-only rotation would correlate every pixel at low SPP.
+    return fract(ray.coverage + f32(salt & 0xffffffu)/16777216.);
 }
 // Called before committing the hit. No albedo, lighting, normals, or depth
 // writes for a rejected candidate; an alpha hole never advances ray.low.
@@ -341,12 +340,12 @@ fn bias(p: vec3<f32>) -> f32 {
 }
 fn secondary(p: vec3<f32>, d: vec3<f32>, ray: Ray, t: f32) -> Ray {
     let offset = bias(p);
-    return Ray(p+d*offset,d,offset,frame.eye.w,footprint(ray,t),ray.spread,ray.coverage);
+    return Ray(p+d*offset,d,offset,frame.eye.w,footprint(ray,t),ray.spread,ray.coverage,ray.pixel_seed);
 }
-fn visibility(p: vec3<f32>, d: vec3<f32>, t: f32, width: f32, coverage: f32) -> f32 {
+fn visibility(p: vec3<f32>, d: vec3<f32>, t: f32, width: f32, source: Ray) -> f32 {
     let offset = bias(p);
     if (frame.options.x & SHADOWS)==0u || t<=2.*offset { return 1.; }
-    let r = Ray(p+d*offset,d,offset,t-offset,width,0.,coverage);
+    let r = Ray(p+d*offset,d,offset,t-offset,width,0.,source.coverage,source.pixel_seed);
     return select(0.,1.,trace(r,Query(SHADOW,SHADOW_MASK,false,vec2<u32>(NIL))).instance==NIL);
 }
 fn band(t: f32) -> f32 {
@@ -463,7 +462,7 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32) -> vec3<f32> {
         // One shadow traversal site for sun, static points and GFX points.
         // Drivers inline ray queries, so duplicating the call at each branch
         // can make shader compilation dominate the first frame.
-        color += light.energy*visibility(p,light.dir,light.distance,width,ray.coverage);
+        color += light.energy*visibility(p,light.dir,light.distance,width,ray);
     }
     return albedo*color;
 }
@@ -562,7 +561,7 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> vec4<f32> {
                 if (s.flags & WATER)!=0u {
                     if ray.dir.y<=0. && path.depth<frame.options.y {
                         let down = vec3<f32>(0.,-1.,0.);
-                        scan = Ray(p+down*0.001,down,0.001,0.66,0.,0.,ray.coverage);
+                        scan = Ray(p+down*0.001,down,0.001,0.66,0.,0.,ray.coverage,ray.pixel_seed);
                         mask = SHORE_MASK;
                         continue;
                     }
@@ -659,7 +658,8 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> vec4<f32> {
 @compute @workgroup_size(8,8)
 fn render(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy>=frame.extent.xy) { return; }
-    var seed = id.x + id.y*frame.extent.x + 1u;
+    let pixel_seed = id.x + id.y*frame.extent.x + 1u;
+    var seed = pixel_seed;
     let spread = 2.*max(length(frame.inv_vp[0].xyz)/f32(frame.extent.x),
                         length(frame.inv_vp[1].xyz)/f32(frame.extent.y));
     var total = vec3<f32>(0.);
@@ -673,7 +673,7 @@ fn render(@builtin(global_invocation_id) id: vec3<u32>) {
         let near = near4.xyz/near4.w-frame.eye.xyz;
         let far = far4.xyz/far4.w-frame.eye.xyz;
         let coverage = (f32(sample)+random(&seed))/f32(frame.options.z);
-        let out = transport(Ray(frame.eye.xyz,norm(near),length(near),length(far),0.,spread,coverage),&seed);
+        let out = transport(Ray(frame.eye.xyz,norm(near),length(near),length(far),0.,spread,coverage,pixel_seed),&seed);
         total += out.rgb;
         // Reverse Z: take the nearest of the samples for consumers of depth.
         depth = max(depth,out.w);
