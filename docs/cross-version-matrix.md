@@ -30,6 +30,8 @@ the same readers the application uses — no probe code is duplicated.
 | `tasks.data` | v55 | v56 | v75 | v105 | v121 |
 | `gfx.pck` | 3765 entries | 3499 entries | — | — | — |
 | `configs.pck` | — | 66 entries | — | 92 entries | 89 entries |
+| `shaders.pck` | — | — | — | — | 371 entries |
+| `script.pck` | — | — | — | — | 2 entries |
 | `.ecwld` scenery | — | — | — | a37 ✓ | a07 ✓ |
 | water areas | — | — | — | a37: 3 | a07: 1 |
 
@@ -51,6 +53,36 @@ All three container revisions the client dispatches on are read:
 `0x00020003` was refused outright before this work (`unsupported PCK version
 00020003`). Verified end to end: `gfx.pck` from 1.3.6 parses to 3499 entries and
 **all 3499** decode to the length their record claims.
+
+### Two containers, told apart by the guard pair
+
+A `.pck` is not always this package. `configs.pck` and `shaders.pck` ship in a
+second Angelica container that shares the 12-byte prefix
+(`0x4dca23ef`, size, `0x56a089b7`) and the 280-byte trailer, but differs in two
+ways that matter to a reader:
+
+| | retail v2 (guard `0xfdfdfeee`/`0xf00dbeef`) | Angelica (guard `0xa508bdc4`/`0x853567c8`) |
+|---|---|---|
+| directory | a forward table at `dwEntryOffset ^ 0xa8937462` | a run of zlib records walked *backwards* from the trailer |
+| record | length-prefixed, masked, optional zlib | 8-byte prefix then a zlib stream of one 276-byte record |
+
+The guard pair is therefore not a spare key: reading `dwEntryOffset ^ MASK` on
+the `0xa508bdc4` pair gives an offset **past EOF** on both packs staged here
+(`script.pck` `0x8950c58f` vs 44 330 bytes; `shaders.pck` `0x892d59dd` vs
+8 225 973 bytes), while on the `0xfdfdfeee` pair it lands inside the file. Each
+reader keeps to its own container; teaching `src/pck.rs` to accept both guard
+pairs would have it seek past the end of the config packs.
+
+Measured, in every case all entries decoding to their declared length:
+
+| pack | container | entries |
+|---|---|---|
+| `gfx.pck` (1.3.1) | retail v2 | 3765 |
+| `gfx.pck` (1.3.6) | retail v2 | 3499 |
+| `configs.pck` (1.4.4) | retail v2 | 92 |
+| `configs.pck` (older, 1.69 MB) | retail v2 | 106 |
+| `shaders.pck` (8.23 MB) | Angelica | 371 |
+| `script.pck` (1.5.2) | Angelica | 2 |
 
 ## Scenery
 
