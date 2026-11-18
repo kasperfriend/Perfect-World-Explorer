@@ -31,3 +31,17 @@ Scope: at most 8,192 registered triangles per packet; unregistered emitters
 still contribute through a hit. Legacy ordered layers are not a participating
 medium or part of the MIS visibility model. This is a bounded offline-quality
 integrator, not a ground truth for all client blend/fog/weather behavior.
+
+## Validation (2026-11-18)
+
+`0787fd4`, Software and CPU Vulkan (Mesa 25.0.7), 24×24 pixels at 32 spp:
+
+| Linear mean RGB | Analytic | Both backends |
+| --- | --- | --- |
+| Matte floor under bright dome/dim skirt | .191128 / .102865 / .035707 | .191565 / .103050 / .035750 |
+| Closed matte emissive cube | .177217 / .095549 / .040115 | .177070 / .094513 / .039216 |
+
+The cube has ten resident and two moving triangles. Its expected mean is
+`Le * (1 - rho^10) / (1 - rho)` channel by channel, including the final
+next-event sample. The test sets high legacy ambient which the preset must
+ignore. Nineteen Lighter units and the streamed-world regression also passed.

@@ -38,7 +38,7 @@ it does not set execution order.
 15. [x] **RT-10:** Honor static-light flags; sample finite sphere/disk emitters and accumulate shadow-ray transmission. Test tinted glass between emitter and receiver. See [the finite-light and transmission fixtures](direct-light.md).
 16. [x] **RT-11:** Add `bsdf.wgsl` with energy-conserving GGX/Lambert, colored metal/dielectric Fresnel, Snell/TIR and backface handling. Compare reflected to incident energy across angles. See [the GGX furnace and interface tests](bsdf.md).
 17. [x] **RT-12:** Track air/water per segment, apply authored RGB Beer–Lambert absorption, and separate specular caustics. Match native exponential fog or document linear. Test submerged sky refraction and tint. See [segmented media and the flat-interface sun check](media.md).
-18. [ ] **RT-13:** Importance-sample sky CDF and emissive triangles with power weighting and balance MIS. Reference mode uses full samples/bounces and no temporal reuse. Check analytic diffuse-box brightness.
+18. [x] **RT-13:** Importance-sample sky CDF and emissive triangles with power weighting and balance MIS. Reference mode uses full samples/bounces and no temporal reuse. Check analytic diffuse-box brightness. See [the estimator and measured error](reference.md).
 
 ### Phase 4 — Production
 
