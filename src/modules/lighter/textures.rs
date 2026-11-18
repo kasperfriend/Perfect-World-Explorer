@@ -372,7 +372,7 @@ impl Textures {
         (self.prefix_words + self.tail.len()) * 4
     }
 
-    pub(super) fn byte_segments(&self) -> impl Iterator<Item = &[u8]> {
+    pub(crate) fn byte_segments(&self) -> impl Iterator<Item = &[u8]> {
         self.prefix
             .iter()
             .map(|p| p.as_slice())
