@@ -1267,7 +1267,21 @@ fn quaternion(key: &str, value: &str) -> Result<Quat, String> {
 pub fn parse(source: &str) -> Result<Root, String> {
     let fields = tokenize(source);
     if fields.is_empty() {
-        return Err("GFX container is empty".into());
+        // Three different things reach this: a zero-length file, a truncated
+        // header, and the authored stub both retail `gfx.pck` builds ship for
+        // `gfx/人物/技能/羽芒/翼击击中.gfx` -- four bytes, `MOXT`, the first
+        // four characters of `MOXTVersion` and then nothing. Naming the text
+        // keeps that stub from looking like a reader failure, which is how it
+        // was being reported.
+        let shown: String = source.trim().chars().take(16).collect();
+        return Err(if shown.is_empty() {
+            "GFX container is empty".into()
+        } else {
+            format!(
+                "GFX container holds no fields, only {shown:?} ({} bytes)",
+                source.trim().len()
+            )
+        });
     }
     if fields[0].0 != "MOXTVersion" {
         return Err(format!(
@@ -3563,6 +3577,30 @@ mod tests {
             lookup.flag("IsSurface", false).is_err(),
             "a strict flag rejects 2"
         );
+    }
+
+    /// Both retail `gfx.pck` builds ship one authored stub:
+    /// `gfx/人物/技能/羽芒/翼击击中.gfx` is four bytes, `MOXT`. Reporting it
+    /// with the same words as a zero-length file made the only genuinely
+    /// unusual entry in 3765 look like a reader failure, so the message now
+    /// quotes what it did find.
+    #[test]
+    fn a_container_with_no_fields_names_what_it_found_instead() {
+        let empty = parse("").unwrap_err();
+        assert_eq!(empty, "GFX container is empty");
+
+        for stub in ["MOXT", "MOXTVersio"] {
+            let error = parse(stub).unwrap_err();
+            assert!(
+                error.contains(stub),
+                "the message should quote {stub:?}, got {error:?}"
+            );
+            assert!(
+                error.contains(&format!("{} bytes", stub.len())),
+                "and its length, got {error:?}"
+            );
+            assert_ne!(error, empty, "a stub is not the same as an empty file");
+        }
     }
 
     #[test]
