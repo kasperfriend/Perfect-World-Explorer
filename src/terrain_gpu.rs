@@ -1765,7 +1765,7 @@ mod tests {
         assert_eq!(full.bytes, 32 * 1024 * 1024);
         drop(full);
         let near = m.take_window(Some([2, 3, 5, 6]));
-        let stream = |materials| {
+        let stream = |materials: &crate::material::Materials| {
             let mut upload = MaskUpload::new(&device, materials, &[0]).unwrap();
             assert!(!upload.advance(&queue, materials).unwrap());
             assert!(upload.next_page <= MASK_BATCH_PAGES);
