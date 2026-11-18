@@ -27,7 +27,7 @@ it does not set execution order.
 
 ### Phase 2 — Client fidelity
 
-10. [ ] **RT-05:** Preserve authored mip counts and levels. Sample color as sRGB, coverage and data as linear; choose explicit LOD by footprint and 8×/16× grazing anisotropy. Report `mip_fallback` separately and test brick-wall shimmer.
+10. [x] **RT-05:** Preserve authored mip counts and levels. Sample color as sRGB, coverage and data as linear; choose explicit LOD by footprint and 8×/16× grazing anisotropy. Report `mip_fallback` separately and test brick-wall shimmer. See [the mip and grazing-pan checks](texture-filtering.md).
 11. [ ] **RT-06:** Carry authored PBR/material channels, sidedness, opacity and transmission. Distinguish baked vs. relit buildings, terrain and grass. Carry posed face/eye secondary stages and UV scrolling; validate day/night.
 12. [ ] **RT-07:** Match authored SpeedTree wind and grass fades; keep two-sided transmissive leaves in secondary rays independently of camera facing. Test noon dappled light.
 13. [ ] **RT-08:** Build per-body water BLAS/AABBs and wet/dry shoreline geometry. Document shading-only and geometric normal layers, initialize submerged media (Step 17), and compare shoreline/reflections to native.
