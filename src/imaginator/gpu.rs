@@ -679,6 +679,13 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
  let illumination = mix(1.0, visibility, clamp(strength, 0.0, 1.0));
  // The rays' own colour, added as colour. This is the reflected and
  // interreflected light the raster path cannot produce.
+ //
+ // NOTE: this term is not fogged, and cannot be yet. The traced channels carry
+ // rgb radiance and alpha visibility only - there is no view-distance channel -
+ // and the raster frame this blends into *has* been fogged. So a distant
+ // hillside receives full traced light on top of already-fogged pixels, which
+ // brightens the horizon with distance. Fixing it means adding a distance
+ // channel to `pack`, the WGSL and the DXIL shader together, not a fade here.
  let added = traced_s.rgb * strength;
  let result = frame_s.rgb * illumination + added;
  textureStore(out_tex, vec2<i32>(i32(id.x), i32(id.y)), vec4<f32>(result, frame_s.a));
@@ -782,6 +789,7 @@ pub fn params(
     bounces: u32,
     settings: &ImaginatorSettings,
     scene_limit: f32,
+    fog_distance: f32,
 ) -> GpuParams {
     GpuParams {
         eye: [eye.x, eye.y, eye.z, 0.],
@@ -798,7 +806,13 @@ pub fn params(
             settings.samples.max(1),
             GpuParams::mask(settings),
         ],
-        screen: [aspect, height, scene_limit, 0.],
+        // `w` carries the fog distance so the composite can fade the traced
+        // lighting the way the raster frame is already faded. The traced
+        // channels carry scene radiance, but the frame they blend into has
+        // already been fogged: adding unfogged light to fogged pixels makes
+        // distant terrain brighter than near terrain, which is a washed-out
+        // horizon that gets worse with distance.
+        screen: [aspect, height, scene_limit, fog_distance],
     }
 }
 
@@ -897,12 +911,15 @@ mod tests {
             2,
             &s,
             20000.,
+            8000.,
         );
         assert_eq!(p.eye, [1., 2., 3., 0.]);
         assert!((p.forward[3] - 35f32.to_radians().tan()).abs() < 1e-6);
         assert_eq!(p.config[0], 2);
         assert_eq!(p.config[3], 7);
         assert!((p.screen[0] - 16. / 9.).abs() < 1e-6);
+        // The fog distance the composite fades the traced term with.
+        assert!((p.screen[3] - 8000.).abs() < 1e-6);
     }
 
     /// The WGSL has to parse. `naga` is not a dependency of the crate, so this

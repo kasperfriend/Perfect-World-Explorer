@@ -962,6 +962,7 @@ impl Imaginator {
             self.settings.light_bounces,
             &self.settings,
             scene_limit,
+            env.fog_distance.max(1.),
         )
     }
 
