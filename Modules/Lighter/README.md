@@ -89,19 +89,25 @@ lighting and verification, see the [full ray-tracing checklist](TODO.md).
   their neighbors. Sky, emissive and water pixels bypass the spatial filter.
   Depth always comes from the closest current camera sample, never from a
   neighboring pixel or an older frame.
-- Progressive sampling varies the light transport sequence while keeping the
-  camera and cutout pattern stable. It averages unfiltered radiance for up to
-  32 frames, then uses a fixed 1/32 weight for new samples. There is no
-  reprojection: changed view/projection, resolution, backend, lighting or scene
-  data discards history, including off-camera poses and moving lights. Water
-  normals and scrolling textures reset pixels whose rays used them when those
-  inputs change. Roof drift is allowed up to a quarter texel before resetting
-  roof-dependent history; the texture itself keeps animating every frame.
+- The interactive defaults are one sample, one secondary bounce and 50%
+  ray resolution per axis. Progressive sampling varies the light transport
+  sequence without jittering the single-sample depth or cutout pattern.
+  It averages the first ten compatible samples, then uses 10% new radiance
+  and 90% history. Tiny single-sample view changes reproject the primary
+  hit into the previous view; depth, normal and albedo must agree. Sky,
+  water and blended or mixed pixels do not reproject through view changes.
+  Movement of more than one ray pixel from the last reset's frustum (or a
+  material change to near/far depth), changed resolution, backend, lighting,
+  off-camera poses or moving lights reset history. Water-wave and scrolling
+  inputs invalidate only pixels whose paths used them. Roof drift is allowed
+  up to a quarter texel before resetting roof-dependent history.
 - On a moving view or with animated poses/lights, the spatial filter still
   works, but there may be little usable history. Raising samples per pixel can
   help at a higher ray cost. The requested ray resolution is an upper bound:
   at large sizes it can be reduced to stay within adapter storage limits and
-  a 256 MiB budget for active ray, history and filter images.
+  a 256 MiB budget shared by the trace image, two alternating history images
+  and the spatial filter output. Composition uses guide-aware bilinear color
+  (ordinary bilinear with the filter disabled) and nearest current depth.
 
 ### Light transport and its limits
 
@@ -163,6 +169,8 @@ are unchanged; Lighter uses the separate bounded BMD region described above.
 
 See [GPU completion and readback](performance-waits.md) for the Phase 0 wait
 audit, F12 world captures, and the asynchronous window/resize regressions.
+See [residency and performance checks](performance.md) for acceleration and
+resource reuse, the streaming copy audit, and the synthetic timing sweep.
 
 The viewer tests validate both WGSL paths and inspect the emitted Vulkan
 ray-query SPIR-V. The hardware path uses Naga 26 to keep candidate and

@@ -80,7 +80,8 @@ struct Pixel {
 const PIXEL_BYTES: u64 = std::mem::size_of::<Pixel>() as u64;
 // Reserve a stable share even when a retained stage is toggled off. A
 // resolution increase in another stage must not consume its reservation.
-const MAX_IMAGE_BYTES: u64 = (256 << 20) / 3;
+// Trace, two reprojection histories, and spatial filter.
+const MAX_IMAGE_BYTES: u64 = (256 << 20) / 4;
 
 pub const WATER_MIRROR: u32 = 8;
 pub const CULL_BUILDINGS: u32 = 16;
@@ -142,19 +143,21 @@ fn grown_capacity(needed: u64, current: u64, limit: u64) -> u64 {
 
 /// Bindings depend on actual resources, not pixels, scene revisions or the
 /// addresses of Rust wrappers that may be moved by their owner.
-struct Bindings<const N: usize> {
-    active: Option<([wgpu::Id<wgpu::Buffer>; N], wgpu::BindGroup)>,
+struct Bindings<const N: usize, const CAP: usize = 1> {
+    active: [Option<([wgpu::Id<wgpu::Buffer>; N], wgpu::BindGroup)>; CAP],
     created: u64,
+    replace: usize,
 }
-impl<const N: usize> Default for Bindings<N> {
+impl<const N: usize, const CAP: usize> Default for Bindings<N, CAP> {
     fn default() -> Self {
         Self {
-            active: None,
+            active: std::array::from_fn(|_| None),
             created: 0,
+            replace: 0,
         }
     }
 }
-impl<const N: usize> Bindings<N> {
+impl<const N: usize, const CAP: usize> Bindings<N, CAP> {
     fn get(
         &mut self,
         device: &wgpu::Device,
@@ -163,19 +166,26 @@ impl<const N: usize> Bindings<N> {
         buffers: [&wgpu::Buffer; N],
     ) -> &wgpu::BindGroup {
         let ids = buffers.map(wgpu::Buffer::global_id);
-        if self.active.as_ref().is_none_or(|(old, _)| *old != ids) {
-            let entries: [_; N] = std::array::from_fn(|i| resource(i as u32, buffers[i]));
-            self.active = Some((
-                ids,
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(label),
-                    layout,
-                    entries: &entries,
-                }),
-            ));
-            self.created += 1;
-        }
-        &self.active.as_ref().unwrap().1
+        let slot = self
+            .active
+            .iter()
+            .position(|entry| entry.as_ref().is_some_and(|(old, _)| *old == ids))
+            .unwrap_or_else(|| {
+                let i = self.replace;
+                self.replace = (i + 1) % CAP;
+                let entries: [_; N] = std::array::from_fn(|i| resource(i as u32, buffers[i]));
+                self.active[i] = Some((
+                    ids,
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(label),
+                        layout,
+                        entries: &entries,
+                    }),
+                ));
+                self.created += 1;
+                i
+            });
+        &self.active[slot].as_ref().unwrap().1
     }
 }
 
@@ -414,7 +424,7 @@ struct Present {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     extent: wgpu::Buffer,
-    binds: Bindings<2>,
+    binds: Bindings<2, 2>,
 }
 impl Present {
     fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
@@ -967,7 +977,7 @@ impl Lighter {
         ui.checkbox(&mut self.settings.denoiser, "Edge-aware denoiser")
             .on_hover_text("Filter linear radiance using primary depth, normals and albedo. Never changes output depth.");
         ui.checkbox(&mut self.settings.progressive, "Progressive sampling while still")
-            .on_hover_text("Accumulate new lighting samples while the camera and scene are stable. Movement or changed lighting discards incompatible history.");
+            .on_hover_text("Reuse lighting samples in stable scenes. Reproject tiny view changes; camera movement, changed lighting or incompatible surfaces discard history.");
         ui.add(egui::Slider::new(&mut self.settings.bounces,0..=4).text("Secondary bounces"))
             .on_hover_text("0 traces primary visibility and direct shadows only. Reflection and water transmission need at least one bounce.");
         ui.add(egui::Slider::new(&mut self.settings.samples, 1..=4).text("Samples per pixel"));

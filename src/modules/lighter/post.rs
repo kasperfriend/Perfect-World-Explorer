@@ -2,6 +2,7 @@
 use super::{
     binding, image_limit, textures::COLOR_SIDE, Bindings, Frame, Mode, Storage, PIXELS, PIXEL_BYTES,
 };
+use glam::{Mat4, Vec4};
 
 pub(super) const SHADER: &str = include_str!("post.wgsl");
 // Match pixels.wgsl. These bits describe which animation inputs a ray used.
@@ -10,12 +11,49 @@ const ANIM_SCROLL: u32 = 64;
 const ANIM_SKY: u32 = 128;
 
 pub(super) struct HistoryUse {
-    reuse: bool,
-    changed_animations: u32,
+    pub(super) reuse: bool,
+    pub(super) changed_animations: u32,
+    pub(super) previous_from_current: Option<Mat4>,
+}
+
+#[repr(C)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+struct Params {
+    extent: [u32; 4],
+    history: [u32; 4],
+    previous_from_current: [[f32; 4]; 4],
+}
+
+/// Keep reprojection local to roughly one ray pixel, even after many tiny
+/// changes. Project the current clip volume into the view at the last reset.
+/// Looking at the full frustum (including near Z) also catches zoom changes.
+fn camera_continuous(anchor_from_current: Mat4, [width, height, ..]: [u32; 4]) -> bool {
+    for z in [0., 1.] {
+        for y in [-1., 1.] {
+            for x in [-1., 1.] {
+                let p = anchor_from_current * Vec4::new(x, y, z, 1.);
+                if p.w <= 0. || !p.is_finite() {
+                    return false;
+                }
+                let p = p / p.w;
+                if (p.x - x).abs() * width as f32 * 0.5 > 1.
+                    || (p.y - y).abs() * height as f32 * 0.5 > 1.
+                    || (p.z - z).abs() > 0.02
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 struct Stamp {
     stable: Frame,
+    vp: Mat4,
+    inv_vp: Mat4,
+    eye: [f32; 3],
+    camera_anchor: Mat4,
     revision: u64,
     texture_len: usize,
     mode: Mode,
@@ -43,16 +81,25 @@ impl History {
         mode: Mode,
         moving_unchanged: bool,
     ) -> HistoryUse {
-        // No reprojection: match view, projection, extent, static scene,
-        // moving geometry AND lights, options and lighting exactly. A mover
-        // can change another pixel's shadow or reflection without moving it.
+        // A mover can change another pixel's shadow/reflection without
+        // moving it. Only reproject in the same lighting and scene snapshot.
         let mut stable = *frame;
+        stable.vp = [[0.; 4]; 4];
+        stable.inv_vp = [[0.; 4]; 4];
+        stable.eye[..3].fill(0.);
         stable.waves = [0; 4];
         stable.air[3] = 0.;
         stable.sky_uv[..2].fill(0.);
         stable.sampling = [0; 4];
+        let vp = Mat4::from_cols_array_2d(&frame.vp);
+        let inv_vp = Mat4::from_cols_array_2d(&frame.inv_vp);
+        let eye = [frame.eye[0], frame.eye[1], frame.eye[2]];
         let mut stamp = Stamp {
             stable,
+            vp,
+            inv_vp,
+            eye,
+            camera_anchor: vp,
             revision,
             texture_len,
             mode,
@@ -61,6 +108,7 @@ impl History {
             sky_anchor: [frame.sky_uv[0], frame.sky_uv[1]],
         };
         let mut changed_animations = 0;
+        let mut previous_from_current = None;
         let reuse = moving_unchanged
             && self.previous.as_ref().is_some_and(|old| {
                 if old.revision != revision
@@ -70,6 +118,17 @@ impl History {
                 {
                     return false;
                 }
+                if old.vp != vp || old.inv_vp != inv_vp || old.eye != eye {
+                    // Multi-sample primary depth can come from a jittered hit,
+                    // not the center used by reprojection. Reset for motion.
+                    if frame.options[2] != 1
+                        || !camera_continuous(old.camera_anchor * inv_vp, frame.extent)
+                    {
+                        return false;
+                    }
+                    previous_from_current = Some(old.vp * inv_vp);
+                }
+                stamp.camera_anchor = old.camera_anchor;
                 if old.waves != stamp.waves {
                     changed_animations |= ANIM_WAVES;
                 }
@@ -99,6 +158,7 @@ impl History {
         HistoryUse {
             reuse,
             changed_animations,
+            previous_from_current,
         }
     }
 }
@@ -108,10 +168,11 @@ pub(super) struct Post {
     accumulate: wgpu::ComputePipeline,
     denoise: wgpu::ComputePipeline,
     parameters: wgpu::Buffer,
-    history: Option<Storage>,
+    history: [Option<Storage>; 2],
     filtered: Option<Storage>,
-    accumulate_bind: Bindings<3>,
-    denoise_bind: Bindings<3>,
+    history_write: usize,
+    accumulate_bind: Bindings<4, 2>,
+    denoise_bind: Bindings<4, 2>,
     buffers_created: u64,
 }
 
@@ -131,6 +192,11 @@ impl Post {
                     2,
                     stage,
                     wgpu::BufferBindingType::Storage { read_only: false },
+                ),
+                binding(
+                    3,
+                    stage,
+                    wgpu::BufferBindingType::Storage { read_only: true },
                 ),
             ],
         });
@@ -155,7 +221,7 @@ impl Post {
         let denoise = pipeline("Lighter edge-aware denoiser", "denoise");
         let parameters = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Lighter radiance processing parameters"),
-            size: 32,
+            size: std::mem::size_of::<Params>() as u64,
             mapped_at_creation: false,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -164,8 +230,9 @@ impl Post {
             accumulate,
             denoise,
             parameters,
-            history: None,
+            history: [None, None],
             filtered: None,
+            history_write: 0,
             accumulate_bind: Bindings::default(),
             denoise_bind: Bindings::default(),
             buffers_created: 1,
@@ -199,15 +266,23 @@ impl Post {
                     device,
                     label,
                     needed,
-                    wgpu::BufferUsages::empty(),
+                    if cfg!(test) {
+                        wgpu::BufferUsages::COPY_SRC
+                    } else {
+                        wgpu::BufferUsages::empty()
+                    },
                 ));
                 true
             }
         };
         let progress = history.is_some();
+        let mut fresh = false;
         if progress {
-            self.buffers_created +=
-                u64::from(allocate(&mut self.history, "Lighter accumulated image"));
+            for slot in &mut self.history {
+                let changed = allocate(slot, "Lighter accumulated image");
+                fresh |= changed;
+                self.buffers_created += u64::from(changed);
+            }
         }
         if denoise {
             self.buffers_created +=
@@ -216,8 +291,23 @@ impl Post {
         if !denoise && !progress {
             return raw;
         }
-        let history = history.map_or([0; 4], |h| [u32::from(h.reuse), h.changed_animations, 0, 0]);
-        queue.write_buffer(&self.parameters, 0, bytemuck::bytes_of(&[extent, history]));
+        let mut params = Params {
+            extent,
+            history: [0; 4],
+            previous_from_current: Mat4::IDENTITY.to_cols_array_2d(),
+        };
+        if let Some(h) = history {
+            params.history = [
+                u32::from(h.reuse && !fresh),
+                h.changed_animations,
+                u32::from(h.previous_from_current.is_some()),
+                0,
+            ];
+            if let Some(transform) = h.previous_from_current {
+                params.previous_from_current = transform.to_cols_array_2d();
+            }
+        }
+        queue.write_buffer(&self.parameters, 0, bytemuck::bytes_of(&params));
         let dispatch = |encoder: &mut wgpu::CommandEncoder,
                         label: &str,
                         pipeline: &wgpu::ComputePipeline,
@@ -232,16 +322,18 @@ impl Post {
         };
         let mut image = raw;
         if progress {
-            let history = &self.history.as_ref().unwrap().0;
+            let next = &self.history[self.history_write].as_ref().unwrap().0;
+            let previous = &self.history[self.history_write ^ 1].as_ref().unwrap().0;
+            self.history_write ^= 1;
             let label = "Lighter accumulate radiance";
             let bind = self.accumulate_bind.get(
                 device,
                 label,
                 &self.layout,
-                [&self.parameters, image, history],
+                [&self.parameters, image, next, previous],
             );
             dispatch(encoder, label, &self.accumulate, bind);
-            image = history;
+            image = next;
         }
         if denoise {
             let filtered = &self.filtered.as_ref().unwrap().0;
@@ -250,7 +342,7 @@ impl Post {
                 device,
                 label,
                 &self.layout,
-                [&self.parameters, image, filtered],
+                [&self.parameters, image, filtered, image],
             );
             dispatch(encoder, label, &self.denoise, bind);
             image = filtered;
@@ -263,6 +355,37 @@ impl Post {
 mod tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    #[test]
+    fn camera_reprojects_subpixel_drift_but_resets_relative_to_last_cut() {
+        let mut history = History::default();
+        let mut frame = Frame {
+            vp: Mat4::IDENTITY.to_cols_array_2d(),
+            inv_vp: Mat4::IDENTITY.to_cols_array_2d(),
+            extent: [100, 100, 200, 200],
+            options: [0, 1, 1, 0],
+            ..Frame::zeroed()
+        };
+        let step = |h: &mut History, f: &mut Frame| h.prepare(f, 1, 8, Mode::Software, true);
+        assert!(!step(&mut history, &mut frame).reuse);
+        let set_view = |frame: &mut Frame, translation| {
+            let vp = Mat4::from_translation(glam::Vec3::new(translation, 0., 0.));
+            frame.vp = vp.to_cols_array_2d();
+            frame.inv_vp = vp.inverse().to_cols_array_2d();
+        };
+        set_view(&mut frame, 0.014);
+        let sample = step(&mut history, &mut frame);
+        assert!(sample.reuse);
+        assert!((sample.previous_from_current.unwrap().w_axis.x + 0.014).abs() < 1e-7);
+        set_view(&mut frame, 0.028);
+        assert!(!step(&mut history, &mut frame).reuse);
+        let parked = step(&mut history, &mut frame);
+        assert!(parked.reuse && parked.previous_from_current.is_none());
+        frame.options[2] = 2;
+        assert!(!step(&mut history, &mut frame).reuse);
+        set_view(&mut frame, 0.029);
+        assert!(!step(&mut history, &mut frame).reuse);
+    }
 
     #[test]
     fn history_is_sensitive_to_scene_state_but_tracks_continuous_inputs_separately() {

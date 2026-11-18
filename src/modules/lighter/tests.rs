@@ -683,6 +683,9 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_resource_reuse(&mut h);
     exercise_texture_prefix_replacement(&mut h);
     exercise_chunk_scaling(&mut h);
+    if mode == Mode::Software {
+        exercise_reprojection_shader(&h);
+    }
 }
 
 fn assert_radiance(label: &str, pixel: ([u8; 4], f32), linear: [f32; 3]) {
@@ -1015,16 +1018,17 @@ fn exercise_sun_and_history(h: &mut Harness) {
     assert_eq!(smooth[center - 5].0[0], 0);
     assert!(smooth[center + 5].0[0].abs_diff(full) <= 1);
 
-    // Same transport seeds, independently sampled versus reused. The latter
-    // must equal the mean, not just render the same seed for every frame.
+    // Compare the history to independent draws of the same transport seeds.
+    // Build the expected EMA on the CPU (linear target, with 8-bit rounding).
     const FRAMES: u32 = 12;
     h.ray.settings.denoiser = false;
     h.ray.settings.progressive = true;
-    let mut sum = vec![0u32; SIDE * SIDE];
-    for _ in 0..FRAMES {
+    let mut expected = vec![0.; SIDE * SIDE];
+    for i in 1..=FRAMES {
+        let new_weight = 1. / i.min(10) as f32;
         h.ray.reset_history();
-        for (s, pixel) in sum.iter_mut().zip(h.pixels(frame, &empty)) {
-            *s += u32::from(pixel.0[0]);
+        for (value, pixel) in expected.iter_mut().zip(h.pixels(frame, &empty)) {
+            *value = *value * (1. - new_weight) + f32::from(pixel.0[0]) * new_weight;
         }
     }
     h.ray.history = post::History::default();
@@ -1032,8 +1036,7 @@ fn exercise_sun_and_history(h: &mut Harness) {
     for _ in 0..FRAMES {
         converged = h.pixels(frame, &empty);
     }
-    for ((actual, &sum), reference) in converged.iter().zip(&sum).zip(&grain) {
-        let expected = sum as f32 / FRAMES as f32;
+    for ((actual, expected), reference) in converged.iter().zip(expected).zip(&grain) {
         assert!((f32::from(actual.0[0]) - expected).abs() <= 1.5);
         assert_eq!(actual.1, reference.1, "history changed primary depth");
     }
@@ -1487,8 +1490,11 @@ fn exercise_resource_reuse(h: &mut Harness) {
             0xff000000 | (x + y)
         })
         .unwrap();
-    let resized = h.pixel(test_frame(Vec3::ZERO, -Vec3::Z, 27), &empty);
-    assert_eq!(before, resized);
+    let resized = test_frame(Vec3::ZERO, -Vec3::Z, 27);
+    // Both directions of the retained history/filter bindings must be warm.
+    for _ in 0..2 {
+        assert_eq!(before, h.pixel(resized, &empty));
+    }
     let allocations = h.ray.allocation_counts();
     for e in [27, 21, 25, 27] {
         let frame = test_frame(Vec3::X * 0.1, -Vec3::Z, e);
@@ -1662,6 +1668,100 @@ fn exercise_chunk_scaling(h: &mut Harness) {
         };
         eprintln!("{notice}Lighter {:?}, {count} chunks ({} triangles), {SIDE}x{SIDE}: median CPU pack {:.3} ms, synchronized frame {:.3} ms", h.ray.settings.mode, count * 32, pack_ms[2], frame_ms[4]);
     }
+}
+
+fn exercise_reprojection_shader(h: &Harness) {
+    use wgpu::util::DeviceExt;
+
+    const EXTENT: [u32; 4] = [4, 1, 4, 1];
+    let old: [Pixel; 4] = std::array::from_fn(|i| Pixel {
+        radiance: [0.2 * (i + 1) as f32, 0., 0., 0.25],
+        // The third history sample came from a different surface in depth.
+        guide: [(if i == 2 { 8.0_f32 } else { 1. }).to_bits(), 0, 0, 0],
+    });
+    let current = [Pixel {
+        radiance: [0., 1., 0., 0.4],
+        guide: [1.0_f32.to_bits(), 0, 0, 0],
+    }; 4];
+    let upload = |pixels: &[Pixel]| {
+        h.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Reprojection test pixels"),
+                contents: bytemuck::cast_slice(pixels),
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+    };
+    let old = upload(&old);
+    let current = upload(&current);
+    let mut post = post::Post::new(&h.device);
+    for i in 0..12 {
+        let mut encoder = h.device.create_command_encoder(&Default::default());
+        post.process(
+            &h.device,
+            &h.queue,
+            &mut encoder,
+            &old,
+            EXTENT,
+            Some(post::HistoryUse {
+                reuse: i > 0,
+                changed_animations: 0,
+                previous_from_current: None,
+            }),
+            false,
+        );
+        h.queue.submit(Some(encoder.finish()));
+    }
+    let copy = h.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Reprojection test readback"),
+        size: PIXEL_BYTES * 4,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let allocation_counts = post.allocation_counts();
+    let mut encoder = h.device.create_command_encoder(&Default::default());
+    let resolved = post.process(
+        &h.device,
+        &h.queue,
+        &mut encoder,
+        &current,
+        EXTENT,
+        Some(post::HistoryUse {
+            reuse: true,
+            changed_animations: 0,
+            previous_from_current: Some(Mat4::from_translation(Vec3::new(0.5, 0., -0.15))),
+        }),
+        false,
+    );
+    encoder.copy_buffer_to_buffer(resolved, 0, &copy, 0, PIXEL_BYTES * 4);
+    h.queue.submit(Some(encoder.finish()));
+    let slice = copy.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    crate::gpu::wait_for_capture_callback(&h.device, rx)
+        .unwrap()
+        .unwrap();
+    let data = slice.get_mapped_range();
+    let pixels: &[Pixel] = bytemuck::cast_slice(&data);
+    for (pixel, expected) in pixels.iter().zip([
+        [0.36, 0.1, 0., 0.4],
+        [0., 1., 0., 0.4],
+        [0.72, 0.1, 0., 0.4],
+        [0., 1., 0., 0.4],
+    ]) {
+        assert!(
+            pixel
+                .radiance
+                .into_iter()
+                .zip(expected)
+                .all(|(a, b)| (a - b).abs() < 1e-6),
+            "reprojected RGBA {:?} != {expected:?}",
+            pixel.radiance
+        );
+    }
+    // New input binding can be created; the two history buffers stay resident.
+    assert_eq!(allocation_counts.0, post.allocation_counts().0);
 }
 
 fn exercise_terrain_seam(h: &mut Harness) {

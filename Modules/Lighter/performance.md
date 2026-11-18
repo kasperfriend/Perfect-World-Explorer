@@ -33,8 +33,9 @@ collection of separate GPU image objects.
 `TimingFrame` reports the same counters about once per second in the viewer.
 They exclude the swapchain, host post/UI targets, and driver/wgpu internals
 such as queue-write staging. Growth may allocate; the 256 MiB pixel storage
-budget is split into three retained trace/history/filter capacities. This
-verified reuse, not a performance gain or a physical-GPU run.
+budget was split into three retained trace/history/filter capacities in this
+run. Reprojection adds a second history buffer within the same total budget.
+The run verified reuse, not a performance gain or a physical-GPU run.
 
 ## Streaming copy audit (Step 4)
 
@@ -60,5 +61,16 @@ verified reuse, not a performance gain or a physical-GPU run.
 frame time (9 warmed draws, fixed targets, no readback within the timings).
 The suite checks color/depth and warmed creation counters at each size. A
 second test replaces a same-size texel segment and appends within existing
-capacity on both tracers. CI results pending; this is a synthetic scaling
-probe, not a map-specific before/after benchmark.
+capacity on both tracers. [2026-11-18 Linux run 44395084914](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44395084914/job/135122736000)
+passed both ray suites, the streamed viewer, terrain, and production shader
+checks. Times are milliseconds on that runner:
+
+| Chunks | Triangles | Software pack | Software frame | CPU Vulkan pack | CPU Vulkan frame |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 16 | 512 | 0.421 | 1.274 | 0.406 | 1.004 |
+| 64 | 2,048 | 1.653 | 1.384 | 1.578 | 1.147 |
+| 256 | 8,192 | 6.661 | 1.434 | 6.305 | 1.065 |
+
+The test keeps much of the larger scene off-screen. Cached packing grew with
+geometry count; the warmed frame changed much less at this fixed ray count.
+These are not map-specific before/after or physical-GPU results.
