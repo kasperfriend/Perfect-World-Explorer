@@ -127,6 +127,38 @@ impl Builder {
     }
 }
 impl Data {
+    /// Visit actual instanced mesh triangles in draw order. Return false from
+    /// the visitor to stop; callers can impose their own geometry budget.
+    pub(crate) fn visit_triangles(
+        &self,
+        mut visit: impl FnMut([GrassVertex; 3], [f32; 12]) -> bool,
+    ) {
+        for batch in &self.batches {
+            for instance in batch.instances.clone() {
+                let Some(&transform) = self.instances.get(instance as usize) else {
+                    continue;
+                };
+                let start = batch.indices.start as usize;
+                let end = (batch.indices.end as usize).min(self.indices.len());
+                if start > end {
+                    continue;
+                }
+                for tri in self.indices[start..end].chunks_exact(3) {
+                    let (Some(&a), Some(&b), Some(&c)) = (
+                        self.vertices.get(tri[0] as usize),
+                        self.vertices.get(tri[1] as usize),
+                        self.vertices.get(tri[2] as usize),
+                    ) else {
+                        continue;
+                    };
+                    if !visit([a, b, c], transform) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn counts(&self) -> (usize, usize, usize) {
         (
             self.vertices.len(),
@@ -549,6 +581,33 @@ mod tests {
         assert_eq!(&d.instances[0][8..10], &[100., -50.]);
         assert_eq!(&d.instances[1][8..10], &[3., 5.]);
     }
+    #[test]
+    fn trace_visitor_preserves_mesh_instance_and_can_stop() {
+        let vertex = Vertex {
+            pos: [1., 2., 3.],
+            normal: [0., 1., 0.],
+            uv: [0.2, 0.3],
+            color: [0., 0., 0.5, 0.3],
+            kind: 3.75,
+            diffuse: 0,
+            night_diffuse: 0,
+        };
+        let mut builder = Builder::default();
+        builder.mesh_with_scale_y((0, 0), vec![vertex; 3], vec![0, 1, 2], 0.25);
+        builder.instance_oriented((0, 0), [4., 5., 6.], 2., 0., 0.);
+        builder.instance_oriented((0, 0), [7., 8., 9.], 3., 0., 0.);
+        let data = builder.finish();
+        let mut count = 0;
+        data.visit_triangles(|v, transform| {
+            count += 1;
+            assert_eq!(v[0].vertex.pos, [1., 2., 3.]);
+            assert_eq!(v[0].scale_y, 0.25);
+            assert_eq!(&transform[..4], &[4., 5., 6., 2.]);
+            false
+        });
+        assert_eq!(count, 1);
+    }
+
     #[test]
     fn stores_mesh_once_for_many_instances() {
         let mut b = Builder::default();

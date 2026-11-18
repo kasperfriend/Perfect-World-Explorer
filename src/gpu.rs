@@ -4651,7 +4651,7 @@ pub fn run(
     // eye at load is captured, which is why the ornament count here is a small
     // fraction of the world's 16037 placements. Terrain, water and every tree
     // placement are captured in full.
-    let imaginator_scene =
+    let mut imaginator_scene =
         crate::imaginator::Imaginator::wants_world_capture(&t.element).then(|| {
             eprintln!("Imaginator: capturing world geometry...");
             let grid = crate::navigation::MapSpace {
@@ -4763,6 +4763,122 @@ pub fn run(
         &mut residency,
         vegetation_authored_mips,
     )?;
+    // Capture the same static instanced grass geometry/atlas the renderer just
+    // built, before GPU upload consumes it. Keep a bounded share so streamed
+    // buildings still have room. Wind animation and subsequent residency rebuilds
+    // are not yet reflected in this snapshot.
+    if let Some(scene) = imaginator_scene.as_mut().and_then(std::sync::Arc::get_mut) {
+        if let Some(old) = scene.bvh.take() {
+            let mut triangles = old.triangles;
+            let mut surfaces = (*old.surfaces).clone();
+            let mut textures = (*old.textures).clone();
+            let start = triangles.len();
+            let ceiling = (start + 100_000).min(1_800_000);
+            let texture_id = textures.len() as u32;
+            let mut clipped = false;
+            m.grass.visit_triangles(|vertices, instance| {
+                if triangles.len() >= ceiling {
+                    clipped = true;
+                    return false;
+                }
+                let place = |v: &crate::grass_instances::GrassVertex| {
+                    let p = v.vertex.pos;
+                    let x = p[0] * instance[4] + p[2] * instance[5];
+                    let z = -p[0] * instance[5] + p[2] * instance[4];
+                    crate::imaginator::math::v3(
+                        x * instance[3] + instance[0],
+                        p[1] * instance[3] + instance[1],
+                        z * instance[3] + instance[2],
+                    )
+                };
+                let (a, b, c) = (
+                    place(&vertices[0]),
+                    place(&vertices[1]),
+                    place(&vertices[2]),
+                );
+                let n = vertices[0].vertex.normal;
+                let normal = crate::imaginator::math::v3(
+                    n[0] * instance[4] + n[2] * instance[5],
+                    n[1],
+                    -n[0] * instance[5] + n[2] * instance[4],
+                )
+                .normalize_or_zero();
+                let rect = [
+                    vertices[0].vertex.color[0],
+                    vertices[0].vertex.color[1],
+                    vertices[0].vertex.color[2],
+                    vertices[0].scale_y,
+                ];
+                if !a.is_finite()
+                    || !b.is_finite()
+                    || !c.is_finite()
+                    || !normal.is_finite()
+                    || (b - a).cross(c - a).length() <= 1e-6
+                    || rect[2] <= 0.
+                    || rect[3] <= 0.
+                {
+                    return true;
+                }
+                let uv = vertices.map(|v| {
+                    [
+                        (v.vertex.uv[0] - rect[0]) / rect[2],
+                        (v.vertex.uv[1] - rect[1]) / rect[3],
+                    ]
+                });
+                let index = triangles.len() as u32;
+                triangles.push(crate::imaginator::bvh::Triangle {
+                    a,
+                    b,
+                    c,
+                    normal,
+                    material: crate::imaginator::bvh::material::VEGETATION,
+                });
+                surfaces.insert(
+                    index,
+                    crate::imaginator::bvh::TexturedTriangle {
+                        uv,
+                        texture: texture_id,
+                        atlas_rect: Some(rect),
+                        alpha_cutoff: Some(
+                            (vertices[0].vertex.color[3].clamp(0., 1.) * 255.).round() as u8,
+                        ),
+                    },
+                );
+                true
+            });
+            let count = triangles.len() - start;
+            if count > 0 {
+                textures.push(std::sync::Arc::new(crate::imaginator::bvh::Texture {
+                    width: ATLAS as u32,
+                    height: ATLAS as u32,
+                    rgba: m.atlas.clone(),
+                }));
+                let mut bvh = crate::imaginator::bvh::Bvh::build(triangles);
+                bvh.surfaces = std::sync::Arc::new(surfaces);
+                bvh.textures = std::sync::Arc::new(textures);
+                bvh.terrain_albedo = old.terrain_albedo;
+                scene.stats.nodes = bvh.nodes.len();
+                scene.stats.triangles = bvh.triangles.len();
+                scene.stats.clipped |= clipped;
+                scene.bvh = Some(bvh);
+                eprintln!(
+                    "Imaginator: captured {count} static grass triangles{}",
+                    if clipped {
+                        " (grass budget reached)"
+                    } else {
+                        ""
+                    }
+                );
+            } else {
+                scene.stats.clipped |= clipped;
+                let mut bvh = crate::imaginator::bvh::Bvh::build(triangles);
+                bvh.surfaces = std::sync::Arc::new(surfaces);
+                bvh.textures = std::sync::Arc::new(textures);
+                bvh.terrain_albedo = old.terrain_albedo;
+                scene.bvh = Some(bvh);
+            }
+        }
+    }
     if let Some(scene) = &imaginator_scene {
         eprintln!("Imaginator: captured {} triangles", scene.triangle_count());
     }

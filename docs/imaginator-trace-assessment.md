@@ -11,8 +11,10 @@ This describes the implementation, not a claim of full world parity.
 * The captured scene is incomplete: terrain is captured around the initial camera
   with a triangle budget; scenery arrives in pages, also under that budget;
   terrain colour is a bounded baked preview; trees are static capture. Skinned
-  actors, grass, clouds, weather and effect geometry are not captured. Streamed
-  texture atlases have a 256 MiB limit; a missing atlas falls back to flat colour.
+  actors, clouds, weather and effect geometry are not captured. Initial resident
+  grass is captured as static textured triangles under a 100,000-triangle cap;
+  its wind and later residency changes are not captured. Streamed texture atlases
+  have a 256 MiB limit; a missing atlas falls back to flat colour.
 * CPU ray traversal uses foliage and captured scenery alpha cutouts. DXR builds
   opaque geometry and uses constant per-triangle material colours, so foliage
   cutouts and per-hit texture detail are not represented. Both paths are ray
