@@ -4,7 +4,8 @@ name: Lighter retail coverage
 # for maps and packages; never cache or upload client asset bytes.
 on:
   workflow_dispatch:
-  pull_request:
+  push:
+    branches: [arena/69c8ea78-perfect-world-explorer]
     paths:
       - '.github/workflows/lighter-retail.yml'
 
@@ -36,6 +37,9 @@ jobs:
               exit 1
             fi
           done < tools/fixtures/lighter-retail-inputs.txt
+          # Both records have the same pinned 32-byte empty cloud header.
+          cp "$RUNNER_TEMP/lighter-client/element/maps/a01/a01.cld" \
+            "$RUNNER_TEMP/lighter-client/element/maps/a07/a07.cld"
       - name: Select the CPU Vulkan driver
         run: |
           set -euo pipefail
