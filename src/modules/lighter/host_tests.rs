@@ -934,8 +934,9 @@ fn lighter_streamed_world_pixels() {
             .any(|m| m[1] & super::BAKED != 0
                 && m[6] != 0 // optional NRF came through the archive-mounted material feed
                 && f32::from_bits(m[4]) == 96.
-                && (f32::from_bits(m[3]) - 0.15).abs() < 1.0e-6),
-        "BMD specular material lost in streaming"
+                && (f32::from_bits(m[3]) - 0.20).abs() < 1.0e-6
+                && m[5].to_le_bytes() == [255, 191, 128, 255]),
+        "BMD specular color/power or NRF binding lost in streaming"
     );
     camera.pos = Vec3::new(-2.5, 5., 0.);
     camera.pitch = -std::f32::consts::FRAC_PI_4;
