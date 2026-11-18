@@ -4243,7 +4243,7 @@ mod tests {
         skin.meshes[0].indices = vec![0, 2, 1, 1, 2, 3];
         let mut npc = Live {
             spawn: 56,
-            position: Vec3::new(4., 0., -5.),
+            position: Vec3::new(4., 35. / 24., -5.),
             yaw: 0.,
             asset: Rc::new(asset),
             action: Some(0),

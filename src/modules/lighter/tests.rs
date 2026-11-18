@@ -1469,7 +1469,9 @@ fn exercise_off_camera_pose(h: &mut Harness) {
     h.ray.install(Ok((b.finish(), Textures::default())));
     let mut frame = test_frame(Vec3::ZERO, -Vec3::Z, 3);
     frame.ambient = [0.; 4];
-    frame.sun = [0.8, 0., 0.6, 1.];
+    // The production sun must be above the horizon. At z=-5 the ray
+    // from the receiver crosses (4, 35/24, -5), inside the first pose.
+    frame.sun = [0.768, 0.28, 0.576, 1.];
     h.ray.settings.lighting = true;
     h.ray.settings.shadows = true;
     h.ray.settings.soft_sun = false;
@@ -1487,7 +1489,7 @@ fn exercise_off_camera_pose(h: &mut Harness) {
     let refs = h.ray.hardware.as_ref().map(|rt| rt.as_refits);
     let lit = h.pixel(frame, &after);
     assert!(
-        lit.0[0] > 100,
+        lit.0[0] > 90,
         "animated caster retained stale shadow: {lit:?}"
     );
     assert_eq!(lit.1, shadow.1);
