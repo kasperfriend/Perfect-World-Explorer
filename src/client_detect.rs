@@ -995,31 +995,40 @@ fn describe_data_file(name: &str, bytes: &[u8], info: &mut DataFileInfo) {
                 info.problem = Some("truncated header".into());
             }
         }
+        // The guard only asks for the words at 0 and 8, but the detail also
+        // reads 4 (and 10 for `task_npc`). Defaulting those to 0 meant a
+        // truncated file reported `timestamp 0x00000000` -- and, for
+        // `task_npc`, `0 records` -- which reads as a measurement rather than
+        // as the absence of one.
         "dyn_tasks.data" => {
-            if let (Some(size), Some(version)) = (u32_at(bytes, 0), u16_at(bytes, 8)) {
-                info.raw = Some(version as u32);
-                info.version = Some(format!("v{version}"));
-                info.detail = Some(format!(
-                    "declared size {size}, timestamp 0x{:08x} · {} bytes",
-                    u32_at(bytes, 4).unwrap_or(0),
-                    bytes.len()
-                ));
-            } else {
-                info.problem = Some("truncated header".into());
+            match (u32_at(bytes, 0), u16_at(bytes, 8), u32_at(bytes, 4)) {
+                (Some(size), Some(version), Some(timestamp)) => {
+                    info.raw = Some(version as u32);
+                    info.version = Some(format!("v{version}"));
+                    info.detail = Some(format!(
+                        "declared size {size}, timestamp 0x{timestamp:08x} · {} bytes",
+                        bytes.len()
+                    ));
+                }
+                _ => info.problem = Some("truncated header".into()),
             }
         }
         "task_npc.data" => {
-            if let (Some(size), Some(version)) = (u32_at(bytes, 0), u16_at(bytes, 8)) {
-                info.raw = Some(version as u32);
-                info.version = Some(format!("v{version}"));
-                info.detail = Some(format!(
-                    "declared size {size}, timestamp 0x{:08x}, {} records · {} bytes",
-                    u32_at(bytes, 4).unwrap_or(0),
-                    u16_at(bytes, 10).unwrap_or(0),
-                    bytes.len()
-                ));
-            } else {
-                info.problem = Some("truncated header".into());
+            match (
+                u32_at(bytes, 0),
+                u16_at(bytes, 8),
+                u32_at(bytes, 4),
+                u16_at(bytes, 10),
+            ) {
+                (Some(size), Some(version), Some(timestamp), Some(records)) => {
+                    info.raw = Some(version as u32);
+                    info.version = Some(format!("v{version}"));
+                    info.detail = Some(format!(
+                        "declared size {size}, timestamp 0x{timestamp:08x}, {records} records · {} bytes",
+                        bytes.len()
+                    ));
+                }
+                _ => info.problem = Some("truncated header".into()),
             }
         }
         "aipolicy.data" => {
@@ -1691,6 +1700,95 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("2019-05-03 15:33:11"));
+    }
+
+    /// `task_npc.data` prints the record count at offset 10 but its guard only
+    /// required the words at 0 and 8, which are satisfied by ten bytes. A file
+    /// cut off at ten or eleven bytes therefore reported `0 records` -- a
+    /// measurement it had not made, and one that reads as "this client ships no
+    /// NPC tasks" rather than "this header is short".
+    #[test]
+    fn a_task_npc_header_missing_its_record_count_is_truncated() {
+        // `describe_data_file` fills a struct rather than resetting it, so each
+        // case starts from a fresh one the way `scan_data_files` does.
+        fn describe(bytes: &[u8]) -> DataFileInfo {
+            let mut info = DataFileInfo {
+                name: "task_npc.data".into(),
+                path: None,
+                header: None,
+                raw: None,
+                version: None,
+                detail: None,
+                problem: None,
+            };
+            describe_data_file("task_npc.data", bytes, &mut info);
+            info
+        }
+        let mut header = 4096u32.to_le_bytes().to_vec(); // declared size
+        header.extend_from_slice(&0x0000_abcd_u32.to_le_bytes()); // timestamp at 4
+        header.extend_from_slice(&9u16.to_le_bytes()); // version at 8
+
+        for short in [header.clone(), [header.clone(), vec![0u8]].concat()] {
+            assert!(short.len() < 12, "the count at 10 is what is missing");
+            let info = describe(&short);
+            assert_eq!(
+                info.problem.as_deref(),
+                Some("truncated header"),
+                "{} bytes cannot carry the count the detail line prints",
+                short.len()
+            );
+            assert_eq!(info.detail, None, "no detail is better than a wrong one");
+        }
+
+        // With both count bytes the same header is real and reports them.
+        let mut whole = header.clone();
+        whole.extend_from_slice(&42u16.to_le_bytes());
+        let info = describe(&whole);
+        assert_eq!(info.problem, None);
+        let detail = info.detail.as_deref().unwrap();
+        assert!(detail.contains("0x0000abcd"), "got {detail}");
+        assert!(detail.contains("42 records"), "got {detail}");
+    }
+
+    /// `dyn_tasks.data` reads its timestamp at offset 4, which the guard at 8
+    /// already guarantees, so this one could not report a fabricated zero --
+    /// the test pins that rather than claiming a fix.
+    #[test]
+    fn a_dyn_tasks_header_is_guarded_past_its_timestamp() {
+        for len in [0usize, 4, 8, 9] {
+            let mut info = DataFileInfo {
+                name: "dyn_tasks.data".into(),
+                path: None,
+                header: None,
+                raw: None,
+                version: None,
+                detail: None,
+                problem: None,
+            };
+            let mut bytes = vec![0u8; len];
+            bytes[..len.min(4)].copy_from_slice(&[1, 2, 3, 4][..len.min(4)]);
+            describe_data_file("dyn_tasks.data", &bytes, &mut info);
+            assert_eq!(
+                info.problem.as_deref(),
+                Some("truncated header"),
+                "{len} bytes cannot carry the version word at 8"
+            );
+        }
+        let mut info = DataFileInfo {
+            name: "dyn_tasks.data".into(),
+            path: None,
+            header: None,
+            raw: None,
+            version: None,
+            detail: None,
+            problem: None,
+        };
+        let mut bytes = 4096u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&0x1234_5678u32.to_le_bytes());
+        bytes.extend_from_slice(&7u16.to_le_bytes());
+        describe_data_file("dyn_tasks.data", &bytes, &mut info);
+        assert_eq!(info.problem, None);
+        assert!(info.detail.as_deref().unwrap().contains("0x12345678"));
     }
 
     /// A `VS_VERSIONINFO` blob with one `StringFileInfo / 040904b0 / String`
