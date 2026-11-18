@@ -239,6 +239,10 @@ pub struct Imaginator {
     /// Base capture and pending streamed triangles for the current world load.
     scenery_base: Option<SharedScene>,
     scenery_pending: Vec<bvh::Triangle>,
+    scenery_surfaces: std::collections::HashMap<u32, bvh::TexturedTriangle>,
+    scenery_textures: Vec<Arc<bvh::Texture>>,
+    scenery_atlases: Vec<Option<Arc<bvh::Texture>>>,
+    scenery_atlas_bytes: usize,
     scenery_build: Option<(std::sync::mpsc::Receiver<SharedScene>, usize)>,
     scenery_limit_reported: bool,
     environment: tracer::Environment,
@@ -344,6 +348,10 @@ impl Imaginator {
             logged_dxil: None,
             scenery_base: None,
             scenery_pending: Vec::new(),
+            scenery_surfaces: Default::default(),
+            scenery_textures: Vec::new(),
+            scenery_atlases: Vec::new(),
+            scenery_atlas_bytes: 0,
             scenery_build: None,
             scenery_limit_reported: false,
             environment: tracer::Environment::default(),
@@ -481,6 +489,65 @@ impl Imaginator {
         }
     }
 
+    /// Preserve the streamed page's atlas and UVs before GPU upload consumes it.
+    /// Shared pages refer to the earlier source page, just like the renderer.
+    pub fn queue_textured_scenery_page(
+        &mut self,
+        vertices: &[capture::SceneryVertex],
+        indices: &[u32],
+        shared_atlas: Option<usize>,
+        atlas: &[u8],
+        width: usize,
+        height: usize,
+    ) {
+        const MAX_TRIANGLES: usize = 2_500_000;
+        const MAX_ATLAS_BYTES: usize = 256 * 1024 * 1024;
+        if self.scenery_base.is_none() {
+            self.scenery_base = Some(self.scene.clone());
+        }
+        let image = if let Some(source) = shared_atlas {
+            self.scenery_atlases.get(source).and_then(|t| t.clone())
+        } else if width > 0
+            && height > 0
+            && width.checked_mul(height).and_then(|n| n.checked_mul(4)) == Some(atlas.len())
+            && self.scenery_atlas_bytes.saturating_add(atlas.len()) <= MAX_ATLAS_BYTES
+        {
+            self.scenery_atlas_bytes += atlas.len();
+            Some(Arc::new(bvh::Texture {
+                width: width as u32,
+                height: height as u32,
+                rgba: atlas.to_vec(),
+            }))
+        } else {
+            eprintln!("Imaginator: streamed atlas unavailable or exceeds 256 MiB texture budget; those building materials stay flat");
+            None
+        };
+        self.scenery_atlases.push(image.clone());
+        let texture = image.map(|image| {
+            let id = self.scenery_textures.len() as u32;
+            self.scenery_textures.push(image);
+            id
+        });
+        let building = self.scenery_build.as_ref().map_or(0, |(_, n)| *n);
+        let available = MAX_TRIANGLES.saturating_sub(self.scene.triangle_count() + building);
+        let before = self.scenery_pending.len();
+        capture::append_textured_page(
+            &mut self.scenery_pending,
+            &mut self.scenery_surfaces,
+            vertices,
+            indices,
+            available,
+            texture,
+        );
+        if self.scenery_pending.len() == available
+            && indices.len() / 3 > self.scenery_pending.len() - before
+            && !self.scenery_limit_reported
+        {
+            self.scenery_limit_reported = true;
+            eprintln!("Imaginator: streamed scenery exceeds the triangle budget; later geometry is not traced");
+        }
+    }
+
     /// Publish a completed worker build and, when requested, start the next one.
     /// The expensive CPU BVH construction runs off the frame thread. DXR's own
     /// acceleration structure build on publication is a separate GPU operation.
@@ -501,6 +568,8 @@ impl Imaginator {
         }
         if start_build && self.scenery_build.is_none() && !self.scenery_pending.is_empty() {
             let pending = std::mem::take(&mut self.scenery_pending);
+            let pending_surfaces = std::mem::take(&mut self.scenery_surfaces);
+            let pending_textures = std::mem::take(&mut self.scenery_textures);
             let count = pending.len();
             let current = self.scene.clone();
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -510,12 +579,25 @@ impl Imaginator {
                     .as_ref()
                     .map(|bvh| bvh.triangles.clone())
                     .unwrap_or_default();
+                let triangle_base = triangles.len() as u32;
                 triangles.extend(pending);
                 let mut bvh = bvh::Bvh::build(triangles);
                 if let Some(old) = current.bvh.as_ref() {
                     bvh.surfaces = old.surfaces.clone();
                     bvh.textures = old.textures.clone();
                     bvh.terrain_albedo = old.terrain_albedo.clone();
+                }
+                if !pending_surfaces.is_empty() {
+                    let mut textures = (*bvh.textures).clone();
+                    let texture_base = textures.len() as u32;
+                    textures.extend(pending_textures);
+                    let mut surfaces = (*bvh.surfaces).clone();
+                    for (index, mut surface) in pending_surfaces {
+                        surface.texture += texture_base;
+                        surfaces.insert(triangle_base + index, surface);
+                    }
+                    bvh.textures = Arc::new(textures);
+                    bvh.surfaces = Arc::new(surfaces);
                 }
                 let mut stats = current.stats;
                 stats.triangles = bvh.triangles.len();
@@ -535,6 +617,10 @@ impl Imaginator {
     /// Discard an obsolete world stream, including any in-flight result.
     pub fn reset_scenery_stream(&mut self) {
         self.scenery_pending.clear();
+        self.scenery_surfaces.clear();
+        self.scenery_textures.clear();
+        self.scenery_atlases.clear();
+        self.scenery_atlas_bytes = 0;
         self.scenery_build = None;
         self.scenery_limit_reported = false;
         if let Some(base) = self.scenery_base.take() {
@@ -1537,7 +1623,7 @@ impl Imaginator {
             }
         });
         if self.settings.output == settings::Output::TraceOnly {
-            ui.label("Experimental full trace: software samples tree cutouts, resident building textures and approximate terrain colour. DXR textures are sampled per triangle; streamed building textures, DXR cutouts and effect geometry remain unsupported. Raster rendering still runs before this view.");
+            ui.label("Experimental full trace: software samples tree cutouts, building textures and approximate terrain colour. DXR textures are sampled per triangle; DXR cutouts and effect geometry remain unsupported. Raster rendering still runs before this view.");
             changed |= ui
                 .add(
                     egui::Slider::new(&mut self.settings.exposure, 0.05..=8.0)
@@ -1777,6 +1863,51 @@ mod tests {
             module.scene.stats.nodes,
             module.scene.bvh.as_ref().unwrap().nodes.len()
         );
+    }
+
+    #[test]
+    fn streamed_atlas_and_shared_page_survive_bvh_rebuilds() {
+        use super::capture::SceneryVertex;
+        use super::math::{v3, Ray};
+        let mut module = Imaginator::new(std::path::Path::new("."));
+        // The right half of a 4x1 atlas is the mesh slot; UVs wrap inside it.
+        let atlas = [255, 0, 0, 255, 255, 0, 0, 255, 0, 255, 0, 0, 0, 0, 255, 255];
+        let vertex = |position, uv| SceneryVertex {
+            position,
+            normal: [0., 1., 0.],
+            uv,
+            rect: [0.5, 0., 0.5, 1.],
+            kind: 2.,
+        };
+        let verts = [
+            vertex([0., 0., 0.], [0.5, 0.]),
+            vertex([1., 0., 0.], [1.0, 0.]),
+            vertex([0., 0., 1.], [0.5, 0.]),
+        ];
+        module.queue_textured_scenery_page(&verts, &[0, 1, 2], None, &atlas, 4, 1);
+        module.poll_scenery(true);
+        module.queue_textured_scenery_page(&verts, &[0, 1, 2], Some(0), &[], 4, 1);
+        let (rx, _) = module.scenery_build.take().unwrap();
+        module.set_scene(rx.recv().unwrap());
+        module.poll_scenery(true);
+        let (rx, _) = module.scenery_build.take().unwrap();
+        module.set_scene(rx.recv().unwrap());
+        let bvh = module.scene.bvh.as_ref().unwrap();
+        assert_eq!(bvh.surfaces.len(), 2);
+        assert!(std::sync::Arc::ptr_eq(&bvh.textures[0], &bvh.textures[1]));
+        assert!(bvh
+            .closest_hit(&Ray::new(v3(0.1, 1., 0.1), v3(0., -1., 0.)), 0., 10.)
+            .is_none());
+        let hit = bvh
+            .closest_hit(&Ray::new(v3(0.7, 1., 0.1), v3(0., -1., 0.)), 0., 10.)
+            .unwrap();
+        assert_eq!(
+            bvh.surface_sample(hit.triangle, hit.bary).unwrap().0,
+            [0, 0, 255, 255]
+        );
+        module.reset_scenery_stream();
+        assert!(module.scenery_atlases.is_empty());
+        assert_eq!(module.captured_triangles(), 0);
     }
 
     #[test]

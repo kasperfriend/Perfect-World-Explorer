@@ -5947,9 +5947,14 @@ pub fn run(
                                 // Preserve streamed scenery even when tracing is
                                 // off: uploaded GPU pages cannot later be read
                                 // back to reconstruct the trace scene.
-                                let verts: Vec<([f32; 3], [f32; 3])> = page
-                                    .vertices.iter().map(|v| (v.pos, v.normal)).collect();
-                                renderer.modules.imaginator().queue_scenery_page(&verts, &page.indices);
+                                let verts: Vec<crate::imaginator::capture::SceneryVertex> = page
+                                    .vertices.iter().map(|v| crate::imaginator::capture::SceneryVertex {
+                                        position: v.pos, normal: v.normal, uv: v.uv, rect: v.color, kind: v.kind,
+                                    }).collect();
+                                renderer.modules.imaginator().queue_textured_scenery_page(
+                                    &verts, &page.indices, page.shared_atlas, &page.atlas,
+                                    crate::world_objects::SIDE, page.used_height,
+                                );
                                 let upload_started = std::time::Instant::now();
                                 let uploaded = crate::world_objects::GpuPage::upload_world(
                                     &renderer.device,

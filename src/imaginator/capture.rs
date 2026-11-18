@@ -127,7 +127,7 @@ pub struct Sources<'a> {
 struct Builder {
     triangles: Vec<Triangle>,
     surfaces: std::collections::HashMap<u32, super::bvh::TexturedTriangle>,
-    textures: Vec<super::bvh::Texture>,
+    textures: Vec<Arc<super::bvh::Texture>>,
     budget: CaptureBudget,
     clipped: bool,
     /// Ceiling for *this* producer, relative to the shared `budget`. Producers
@@ -199,6 +199,7 @@ impl Builder {
                 super::bvh::TexturedTriangle {
                     uv,
                     texture,
+                    atlas_rect: None,
                     alpha_cutoff,
                 },
             );
@@ -448,11 +449,11 @@ fn capture_scenery(b: &mut Builder, objects: &Objects, ornaments: &[Ornament]) -
                     && image.rgba.len() == image.width * image.height * 4
                 {
                     let id = b.textures.len() as u32;
-                    b.textures.push(super::bvh::Texture {
+                    b.textures.push(Arc::new(super::bvh::Texture {
                         width: image.width as u32,
                         height: image.height as u32,
                         rgba: image.rgba.clone(),
-                    });
+                    }));
                     texture_ids.insert(mesh.texture.clone(), id);
                     Some(id)
                 } else {
@@ -537,17 +538,17 @@ fn capture_trees(b: &mut Builder, trees: &Trees, scene: &WorldScene) {
             .entry(placement.tree_type as usize)
             .or_insert_with(|| {
                 let bark = b.textures.len() as u32;
-                b.textures.push(super::bvh::Texture {
+                b.textures.push(Arc::new(super::bvh::Texture {
                     width: mesh.bark.width(),
                     height: mesh.bark.height(),
                     rgba: mesh.bark.as_raw().to_vec(),
-                });
+                }));
                 let composite = b.textures.len() as u32;
-                b.textures.push(super::bvh::Texture {
+                b.textures.push(Arc::new(super::bvh::Texture {
                     width: mesh.composite.width(),
                     height: mesh.composite.height(),
                     rgba: mesh.composite.as_raw().to_vec(),
-                });
+                }));
                 (bark, composite)
             });
         // A placement is a position and nothing else: `scene::Tree` carries no
@@ -697,6 +698,78 @@ pub fn append_page(
     triangles.len() - before
 }
 
+/// Streamed renderer vertex fields needed to reconstruct a textured triangle.
+#[derive(Clone, Copy, Debug)]
+pub struct SceneryVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+    pub rect: [f32; 4],
+    pub kind: f32,
+}
+
+/// Append validated page geometry and preserve its atlas coordinates. Surface
+/// keys are relative to `triangles` and texture IDs are local to the pending batch.
+pub fn append_textured_page(
+    triangles: &mut Vec<Triangle>,
+    surfaces: &mut std::collections::HashMap<u32, super::bvh::TexturedTriangle>,
+    vertices: &[SceneryVertex],
+    indices: &[u32],
+    budget: usize,
+    texture: Option<u32>,
+) -> usize {
+    let before = triangles.len();
+    for ids in indices.chunks_exact(3) {
+        if triangles.len() >= budget {
+            break;
+        }
+        let (Some(a), Some(b), Some(c)) = (
+            vertices.get(ids[0] as usize),
+            vertices.get(ids[1] as usize),
+            vertices.get(ids[2] as usize),
+        ) else {
+            continue;
+        };
+        let points = [
+            (a.position, a.normal),
+            (b.position, b.normal),
+            (c.position, c.normal),
+        ];
+        let index = triangles.len();
+        append_page(triangles, &points, &[0, 1, 2], budget);
+        if triangles.len() == index {
+            continue;
+        }
+        let Some(texture) = texture else { continue };
+        let rect = a.rect;
+        if !(a.kind > 1.5 && a.kind < 2.5)
+            || !rect.iter().all(|v| v.is_finite())
+            || rect[2] <= 0.
+            || rect[3] <= 0.
+        {
+            continue;
+        }
+        let local =
+            |v: &SceneryVertex| [(v.uv[0] - rect[0]) / rect[2], (v.uv[1] - rect[1]) / rect[3]];
+        let uv = [local(a), local(b), local(c)];
+        if !uv.iter().flatten().all(|v| v.is_finite()) {
+            continue;
+        }
+        // SDR curtains are blended in the raster path, not alpha-tested.
+        let sdr = (a.kind > 2.01 && a.kind < 2.03) || (a.kind > 2.11 && a.kind < 2.13);
+        surfaces.insert(
+            index as u32,
+            super::bvh::TexturedTriangle {
+                uv,
+                texture,
+                atlas_rect: Some(rect),
+                alpha_cutoff: if sdr { None } else { Some(127) },
+            },
+        );
+    }
+    triangles.len() - before
+}
+
 /// The material table the capture uses. Exposed so the tracer and the tests agree
 /// on the ordering.
 pub fn materials() -> Vec<Material> {
@@ -822,11 +895,11 @@ mod tests {
         let mut builder = Builder {
             triangles: Vec::new(),
             surfaces: Default::default(),
-            textures: vec![super::super::bvh::Texture {
+            textures: vec![Arc::new(super::super::bvh::Texture {
                 width: 2,
                 height: 1,
                 rgba: vec![255, 0, 0, 0, 0, 255, 0, 255],
-            }],
+            })],
             budget: CaptureBudget::default(),
             clipped: false,
             ceiling: None,

@@ -95,7 +95,7 @@ pub struct Node {
 pub struct Bvh {
     /// Sparse per-triangle texture data; non-textured geometry has no entry.
     pub surfaces: Arc<std::collections::HashMap<u32, TexturedTriangle>>,
-    pub textures: Arc<Vec<Texture>>,
+    pub textures: Arc<Vec<Arc<Texture>>>,
     /// Bounded, world-aligned terrain albedo preview (software tracer only).
     pub terrain_albedo: Option<Arc<TerrainAlbedo>>,
     pub nodes: Vec<Node>,
@@ -145,6 +145,8 @@ impl TerrainAlbedo {
 pub struct TexturedTriangle {
     pub uv: [[f32; 2]; 3],
     pub texture: u32,
+    /// Optional atlas rectangle: origin and scale, with wrapping inside the slot.
+    pub atlas_rect: Option<[f32; 4]>,
     /// Alpha test, in 0..255; `None` keeps an opaque surface.
     pub alpha_cutoff: Option<u8>,
 }
@@ -315,10 +317,16 @@ impl Bvh {
         }
         let surface = self.surfaces.get(&triangle)?;
         let w = 1. - bary[0] - bary[1];
-        let uv = [
+        let mut uv = [
             surface.uv[0][0] * w + surface.uv[1][0] * bary[0] + surface.uv[2][0] * bary[1],
             surface.uv[0][1] * w + surface.uv[1][1] * bary[0] + surface.uv[2][1] * bary[1],
         ];
+        if let Some(rect) = surface.atlas_rect {
+            uv = [
+                rect[0] + uv[0].rem_euclid(1.) * rect[2],
+                rect[1] + uv[1].rem_euclid(1.) * rect[3],
+            ];
+        }
         Some((
             self.textures.get(surface.texture as usize)?.sample(uv)?,
             surface.alpha_cutoff,
@@ -707,17 +715,18 @@ mod tests {
             material: 0,
         };
         let mut bvh = Bvh::build(vec![tri]);
-        bvh.textures = Arc::new(vec![Texture {
+        bvh.textures = Arc::new(vec![Arc::new(Texture {
             width: 2,
             height: 1,
             rgba: vec![20, 150, 30, 0, 20, 150, 30, 255],
-        }]);
+        })]);
         bvh.surfaces = Arc::new(
             [(
                 0,
                 TexturedTriangle {
                     uv: [[0., 0.], [1., 0.], [0., 0.]],
                     texture: 0,
+                    atlas_rect: None,
                     alpha_cutoff: Some(127),
                 },
             )]
