@@ -1623,7 +1623,7 @@ impl Imaginator {
             }
         });
         if self.settings.output == settings::Output::TraceOnly {
-            ui.label("Experimental full trace: software samples tree cutouts, building textures and approximate terrain colour. DXR textures are sampled per triangle; DXR cutouts and effect geometry remain unsupported. Raster rendering still runs before this view.");
+            ui.label("Experimental full trace: software samples tree cutouts, building textures and approximate terrain colour. DXR textures are sampled per triangle; DXR cutouts and effect geometry remain unsupported. World raster and temporal upscaling are disabled in this view.");
             changed |= ui
                 .add(
                     egui::Slider::new(&mut self.settings.exposure, 0.05..=8.0)
@@ -1950,6 +1950,56 @@ mod tests {
                 let covered: u32 = bands.iter().map(|(s, e)| e - s).sum();
                 assert_eq!(covered, height, "{height}/{slice} covers {covered} rows");
             }
+        }
+    }
+
+    #[test]
+    fn full_trace_skips_world_raster_and_temporal_providers() {
+        let source = include_str!("../gpu.rs");
+        let advance = source
+            .split("fn advance_trace_frame(")
+            .nth(1)
+            .unwrap()
+            .split("    fn render(")
+            .next()
+            .unwrap();
+        assert!(advance.contains("models.update_pass("));
+        assert!(!advance.contains("draw_opaque("));
+        assert!(!advance.contains("models.draw("));
+        let main = source
+            .split(
+                "if full_trace {
+                                renderer.advance_trace_frame",
+            )
+            .nth(1)
+            .unwrap();
+        let raster = main
+            .split("// The Imaginator composites here:")
+            .next()
+            .unwrap();
+        assert!(raster.contains(
+            "} else {
+                            renderer.render("
+        ));
+        for declaration in [
+            "let want_fsr =",
+            "let want_xess =",
+            "let want_dlss =",
+            "let want_fg =",
+            "let want_xess_fg =",
+            "let want_dlss_fg =",
+        ] {
+            let clause = source
+                .split(declaration)
+                .nth(1)
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap();
+            assert!(
+                clause.contains("!full_trace"),
+                "{declaration} must not run without traced depth and motion"
+            );
         }
     }
 

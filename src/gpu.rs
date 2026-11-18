@@ -3066,6 +3066,39 @@ impl Renderer {
             Some(&self.reflected_far_runs),
         );
     }
+    /// Advance the same world clocks and effect-light publications as the main
+    /// view, without submitting any world raster draw calls. The trace scene is
+    /// maintained separately by Imaginator's capture/streaming pipeline.
+    fn advance_trace_frame(&mut self, camera: &Camera, w: u32, h: u32) {
+        let matrix = camera.matrix(w, h, camera.far);
+        let snapshot = self.begin_frame(camera, w, h);
+        self.weather.advance(camera.logic_delta_ms);
+        let direction = snapshot.direction;
+        let uniform = snapshot.uniform(
+            matrix,
+            [direction.x, direction.y, direction.z, snapshot.daylight],
+            snapshot.clip,
+            snapshot.fog_range,
+            snapshot.fog_color,
+            [crate::render_scale::mip_bias(), crate::render_scale::mip_gradient_scale(), 0., 0.],
+        );
+        let radius = self.detail.radius.max(1) as f32 * self.model_scene.block_size.max(1.);
+        if let Some(light) = camera.regional_light { self.retained_regional_light = Some(light); }
+        let light = camera.regional_light.or(self.retained_regional_light);
+        let resident = self.resident_bounds();
+        if let Some(models) = &mut self.models {
+            models.set_view_center(camera.pos.x, camera.pos.z, radius);
+            models.set_resident_bounds(resident);
+            models.set_effects_enabled(camera.world_effects);
+            models.set_effect_distance(camera.effect_distance);
+            models.set_frustum(Some(crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array())));
+            models.set_keep_unbounded(crate::objects::unbounded_textures());
+            models.update_pass(&self.device, &self.queue, receiving_model_frame(&uniform, camera, light),
+                camera.pos.to_array(), &self.model_lights,
+                crate::environment::night_factor(camera.time_of_day), camera.logic_delta_ms, true);
+        }
+    }
+
     fn render(
         &mut self,
         target: &wgpu::TextureView,
@@ -5287,6 +5320,9 @@ pub fn run(
                     // Recreate the FSR context lazily; a pure window resize
                     // can move the display extent even when the render
                     // extent holds.
+                    let full_trace = renderer.modules.imaginator_active()
+                        && renderer.modules.imaginator().settings().output
+                            == crate::imaginator::settings::Output::TraceOnly;
                     let want_fsr_version = settings.upscaling.ffx_major().unwrap_or(0);
                     if let Some(fsr) = fsr_upscaler.as_ref() {
                         if fsr.render_extent() != applied_extent
@@ -5297,6 +5333,7 @@ pub fn run(
                         }
                     }
                     let want_fsr = settings.upscaling.is_ffx_fsr()
+                        && !full_trace
                         && !fsr_failed
                         && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
                     if want_fsr && fsr_upscaler.is_none() {
@@ -5340,6 +5377,7 @@ pub fn run(
                         dlss_fail_reason = None;
                     }
                     let want_xess = settings.upscaling == crate::UpscaleMethod::Xess
+                        && !full_trace
                         && !xess_failed
                         && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
                     if want_xess && xess_upscaler.is_none() {
@@ -5377,6 +5415,7 @@ pub fn run(
                     // would then read in the Graphics tab.
                     let dlss_window_big_enough = config.width >= 32 && config.height >= 32;
                     let want_dlss = settings.upscaling == crate::UpscaleMethod::Dlss
+                        && !full_trace
                         && !dlss_failed
                         && dlss_window_big_enough
                         && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
@@ -5500,6 +5539,7 @@ pub fn run(
                     // Frame generation transitions (enable / disable / extent
                     // change). Runs before any surface access this frame.
                     let want_fg = settings.frame_generation == crate::FrameGenMethod::Fsr
+                        && !full_trace
                         && presented_once
                         && !fg_failed
                         && crate::support_framegen(
@@ -5527,6 +5567,7 @@ pub fn run(
                     // XeSS Frame Generation transitions (enable / disable /
                     // extent change). Same one-swapchain-per-hwnd rule.
                     let want_xess_fg = settings.frame_generation == crate::FrameGenMethod::Xess
+                        && !full_trace
                         && presented_once
                         && !xess_fg_failed
                         && crate::support_framegen(
@@ -5598,6 +5639,7 @@ pub fn run(
                     // the other two: the wgpu surface is dropped first.
                     let want_dlss_fg = settings.frame_generation
                         == crate::FrameGenMethod::Dlss
+                        && !full_trace
                         && presented_once
                         && !dlss_fg_failed
                         && crate::support_framegen(
@@ -6289,6 +6331,9 @@ pub fn run(
                                 .or_else(|| xess_upscaler.as_ref().map(|xess| xess.jitter()))
                                 .or_else(|| dlss_upscaler.as_ref().map(|dlss| dlss.jitter()))
                                 .unwrap_or((0.0, 0.0));
+                            if full_trace {
+                                renderer.advance_trace_frame(&camera, config.width, config.height);
+                            } else {
                             renderer.render(
                                 &world_view,
                                 &world_raw_view,
@@ -6340,6 +6385,7 @@ pub fn run(
                                 }
                             } else {
                                 render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                            }
                             }
                             // The Imaginator composites here: the scene is
                             // finished and upscaled, nothing has encoded for
