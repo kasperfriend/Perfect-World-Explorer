@@ -499,10 +499,6 @@ pub mod gfx_decal;
 pub mod gfx_file;
 #[path = "$REPO/src/gfx_light.rs"]
 pub mod gfx_light;
-#[path = "$REPO/src/gfx_owner.rs"]
-pub mod gfx_owner;
-#[path = "$REPO/src/gfx_player.rs"]
-pub mod gfx_player;
 #[path = "$REPO/src/model_material.rs"]
 pub mod model_material;
 #[path = "$REPO/src/skeleton_pose.rs"]
@@ -523,10 +519,20 @@ pub mod scene;
 pub mod scene_lights;
 #[path = "$REPO/src/sky_transition.rs"]
 pub mod sky_transition;
-#[path = "$REPO/src/view_settings.rs"]
-pub mod view_settings;
+// \`gfx_owner\` and \`client_weather\` reach for \`crate::diag_keyed!\` and
+// \`crate::diagnostics\`, and the macro is exported from the crate root, so the
+// real module has to be in the set -- without it \`check\` failed with 44
+// "could not find \`diag_keyed\` in the crate root" errors and could not be used.
+#[path = "$REPO/src/model_playback.rs"]
+pub mod model_playback;
+#[path = "$REPO/src/world_catalog.rs"]
+pub mod world_catalog;
 #[path = "$OUT/pck_stub.rs"]
 pub mod pck;
+// \`client_detect\` dispatches to the Angelica reader for the config and shader
+// packs, so the harness needs it or the whole set fails to type-check.
+#[path = "$REPO/src/angelica_pck.rs"]
+pub mod angelica_pck;
 EOF
 }
 
@@ -534,9 +540,16 @@ EXT="--extern glam=$OUT/libglam.rlib --extern encoding_rs=$OUT/libencoding_rs.rl
 
 case "${1:-test}" in
     setup) toolchain; sysroot; deps; echo "harness ready in $OUT" ;;
-    check) toolchain; sysroot; deps
+    check) toolchain; sysroot; deps; real_deps
+        # Type-check the modules that only need the dependencies this offline
+        # toolchain has. `gfx_player`, `gfx_owner`, `view_settings` and
+        # `diagnostics` are left out because they reach for `egui` and the fps
+        # settings types the gui crate defines; pulling them in made this mode
+        # report 44 resolution errors that were never about the code, so it
+        # could not be used to check anything. Their own suites cover them.
         "$RUSTC" --crate-type lib --crate-name harness --edition 2021 --sysroot "$SYSROOT" \
-            $EXT -C opt-level=0 "$OUT/lib.rs" -o "$OUT/libharness.rlib"
+            $EXT -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
+            -C opt-level=0 "$OUT/lib.rs" -o "$OUT/libharness.rlib"
         echo "type-check clean" ;;
     test)  toolchain; sysroot; deps
         "$RUSTC" --test --crate-name harness --edition 2021 --sysroot "$SYSROOT" \

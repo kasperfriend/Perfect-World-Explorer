@@ -1000,19 +1000,17 @@ fn describe_data_file(name: &str, bytes: &[u8], info: &mut DataFileInfo) {
         // truncated file reported `timestamp 0x00000000` -- and, for
         // `task_npc`, `0 records` -- which reads as a measurement rather than
         // as the absence of one.
-        "dyn_tasks.data" => {
-            match (u32_at(bytes, 0), u16_at(bytes, 8), u32_at(bytes, 4)) {
-                (Some(size), Some(version), Some(timestamp)) => {
-                    info.raw = Some(version as u32);
-                    info.version = Some(format!("v{version}"));
-                    info.detail = Some(format!(
-                        "declared size {size}, timestamp 0x{timestamp:08x} · {} bytes",
-                        bytes.len()
-                    ));
-                }
-                _ => info.problem = Some("truncated header".into()),
+        "dyn_tasks.data" => match (u32_at(bytes, 0), u16_at(bytes, 8), u32_at(bytes, 4)) {
+            (Some(size), Some(version), Some(timestamp)) => {
+                info.raw = Some(version as u32);
+                info.version = Some(format!("v{version}"));
+                info.detail = Some(format!(
+                    "declared size {size}, timestamp 0x{timestamp:08x} · {} bytes",
+                    bytes.len()
+                ));
             }
-        }
+            _ => info.problem = Some("truncated header".into()),
+        },
         "task_npc.data" => {
             match (
                 u32_at(bytes, 0),
