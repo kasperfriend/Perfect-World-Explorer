@@ -4164,6 +4164,8 @@ fn imaginator_environment_at(
     let mut environment = imaginator_environment(camera);
     environment.lights = imaginator_lights(lights, eye);
     environment
+}
+
 /// Normal viewer input needs a focused window and no blocking menu or
 /// non-interactive loading overlay. Kept pure so the focus policy is testable
 /// without a GPU, a window, or a running game client.

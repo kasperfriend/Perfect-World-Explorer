@@ -3603,6 +3603,8 @@ extern "system" {
 extern "C" {
     fn _open_osfhandle(osfhandle: isize, flags: i32) -> i32;
     fn _dup2(old: i32, new: i32) -> i32;
+}
+
 fn log_model_load(key: &str, line: &str) {
     diagnostics::emit_keyed(diagnostics::Channel::ModelLoads, key, 0, line);
 }
@@ -3626,7 +3628,8 @@ fn main() {
             windows_setup::show_error(&format!(
                 "Perfect World Explorer encountered an unexpected error:\n{info}"
             ))
-        }    }));
+        }
+    }));
     world_load::install_recoverable_panic_hook();
     #[allow(unused_mut)]
     let mut args: Vec<_> = env::args_os().collect();
