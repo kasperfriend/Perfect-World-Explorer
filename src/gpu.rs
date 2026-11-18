@@ -6471,7 +6471,9 @@ pub fn run(
                                 let surface_is_copyable = config
                                     .usage
                                     .contains(wgpu::TextureUsages::COPY_SRC);
-                                let copyable = composed_view.is_some()
+                                let trace_only = renderer.modules.imaginator().settings().output
+                                    == crate::imaginator::settings::Output::TraceOnly;
+                                let copyable = trace_only || composed_view.is_some()
                                     || present_texture.is_none()
                                     || surface_is_copyable;
                                 if !copyable {
@@ -6491,6 +6493,21 @@ pub fn run(
                                         (fw, fh),
                                         params,
                                     );
+                                    if !composited && trace_only {
+                                        // Never silently show the raster frame as a
+                                        // successful full trace while it starts or fails.
+                                        let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                            label: Some("imaginator waiting for full trace"),
+                                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                                view: scene_view,
+                                                resolve_target: None,
+                                                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                                            })],
+                                            depth_stencil_attachment: None,
+                                            timestamp_writes: None,
+                                            occlusion_query_set: None,
+                                        });
+                                    }
                                     renderer.queue.submit(Some(encoder.finish()));
                                     if !composited {
                                         // Every gate that refuses a frame records why;

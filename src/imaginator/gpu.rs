@@ -655,7 +655,6 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
  let frame_dims = vec2<f32>(f32(dims.x), f32(dims.y));
  let uv = (vec2<f32>(f32(id.x) + 0.5, f32(id.y) + 0.5)) / frame_dims;
  let traced_s = trace_sample(uv);
- let frame_s = textureLoad(frame, vec2<i32>(i32(id.x), i32(id.y)), 0);
  let strength = p.strength.x;
  let exposure = p.strength.y;
  let render_mode = p.flags.x;
@@ -666,6 +665,7 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
    vec4<f32>(traced_s.rgb * exposure, 1.0));
   return;
  }
+ let frame_s = textureLoad(frame, vec2<i32>(i32(id.x), i32(id.y)), 0);
  // `traced.a` is negative when the primary ray escaped: sky, left as drawn.
  if traced_s.a < 0.0 {
   textureStore(out_tex, vec2<i32>(i32(id.x), i32(id.y)), vec4<f32>(frame_s.rgb, frame_s.a));

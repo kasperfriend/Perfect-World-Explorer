@@ -503,30 +503,32 @@ impl Composite {
         // `TEXTURE_BINDING` makes `Surface::configure` fail outright. `COPY_SRC`
         // is enough, so the frame is copied into a scratch texture that *can* be
         // sampled, and the finished blit is written back to the frame itself.
-        if let Some(frame_texture) = frame_texture {
-            encoder.copy_texture_to_texture(
-                wgpu::ImageCopyTexture {
-                    texture: frame_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::ImageCopyTexture {
-                    texture: &target.scene_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
+        if settings.output != Output::TraceOnly {
+            if let Some(frame_texture) = frame_texture {
+                encoder.copy_texture_to_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: frame_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyTexture {
+                        texture: &target.scene_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
         }
-        // A surface image needed the copy above; an intermediate is sampled where
-        // it lies.
-        let scene_input = if frame_texture.is_some() {
+        // Trace-only never reads the raster image; bind the independent scratch
+        // view even when presenting to a non-sampleable swapchain image.
+        let scene_input = if settings.output == Output::TraceOnly || frame_texture.is_some() {
             &target.scene_view
         } else {
             frame_view

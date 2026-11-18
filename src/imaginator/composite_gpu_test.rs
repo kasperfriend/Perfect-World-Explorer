@@ -311,4 +311,44 @@ fn the_composite_changes_a_frame_on_a_real_device() {
         g > r && r > b && g < 200,
         "full trace did not replace white raster: {r}, {g}, {b}"
     );
+    drop(pixels);
+    readback.unmap();
+
+    // A trace-only frame must not copy or sample the raster destination. This
+    // target deliberately lacks COPY_SRC and TEXTURE_BINDING, like a restricted
+    // surface; either operation would trigger a validation error.
+    let restricted = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("trace-only target without copy source"),
+        size: wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let restricted_view = restricted.create_view(&Default::default());
+    let mut encoder = device.create_command_encoder(&Default::default());
+    composite
+        .render(
+            &device,
+            &queue,
+            &mut encoder,
+            Some(&restricted),
+            &restricted_view,
+            (W, H),
+            &full,
+            params,
+            TraceSource::Software,
+        )
+        .expect("trace-only restricted target");
+    queue.submit(Some(encoder.finish()));
+    device.poll(wgpu::Maintain::Wait);
+    if let Some(why) = captured.lock().ok().and_then(|slot| slot.clone()) {
+        panic!("trace-only touched the restricted raster target: {why}");
+    }
 }
