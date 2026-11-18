@@ -38,11 +38,17 @@ installed manifests (the repository's `Modules` directory). Settings live in
 
 - The resident terrain mesh and layer masks, plus a lower-detail mesh of the
   native far heightfield when terrain cutoff is off. Lighter omits overlapping
-  far triangles and stitches the coarse exterior to the actual near boundary
-  vertices, including non-flat edges. Distant interiors remain simplified.
+  far triangles and stitches to the installed near boundary in either LOD
+  direction. On small maps, the ray feed refines to stride 2 or 1 if needed
+  within the budget. Large maps keep a coarser stride-16 grid, whose fidelity
+  is not guaranteed. See the [S38/S40 height and grazing-view audit](terrain-fidelity-2026-11-18.md).
 - BMD buildings, SpeedTree geometry, instanced grass, posed world models,
   world effect sheets and posed effect meshes. Walker and Populator poses are
-  included if active. Secondary rays can hit objects outside the camera
+  included if active. Rigid SKI parts follow their bone or hook as instances;
+  a rigid attachment moving with its parent keeps the same BLAS. Walker's
+  first-person head/face mask applies to camera rays, not shadow or bounce
+  rays. Authored visibility (e.g. hiding a weapon while riding) still applies.
+  Secondary rays can hit objects outside the camera
   frustum **within the resident scene**. BMDs can also be resident beyond the
   native ornament load distance (see below).
 - Native water cells and their animated normal textures. Reflections and
@@ -55,6 +61,13 @@ installed manifests (the repository's `Modules` directory). Settings live in
   of 0.27°, producing penumbras that widen with blocker distance. Disabling
   **Soft sun shadows** restores a single directional shadow ray. Point lights
   still have sharp shadows. The native world passes do not composite on top.
+
+Morph, supple and muscle skin records are not decoded. The Lighter settings
+show separate per-feed counts for unsupported SKI types **encountered** on
+the current map, deduplicated by path within each feed. Missing packages
+and skins never inspected cannot be inferred from these counts. Animated GFX
+still uses the shared effect-sheet feed; its placement is evaluated by the
+native owner/hook player, not by the rigid SKI instance path.
 
 ### Static scenery residency
 

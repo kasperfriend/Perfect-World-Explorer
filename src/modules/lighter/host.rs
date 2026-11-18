@@ -871,8 +871,19 @@ fn moving(
         }
         let mut decode =
             |path: &str| read(path).and_then(|b| crate::model_texture_gpu::decode_for_rays(&b));
-        for (owner, asset, poses) in geometry {
-            out.model("world", owner, asset, poses, |_| true, &mut decode)?;
+        for (owner, asset, pose, meshes) in geometry {
+            out.model(
+                "world",
+                owner,
+                lighter::model_feed::Posed {
+                    asset,
+                    pose,
+                    meshes,
+                    attached: false,
+                },
+                |_| true,
+                &mut decode,
+            )?;
         }
         out.effects("world", effects, &mut decode)?;
     }
@@ -933,6 +944,12 @@ impl super::Renderer {
                 camera.logic_delta_ms,
             );
         }
+        let [walker, populator] = self.modules.ray_skin_omissions();
+        let world = self.models.as_ref().map_or_else(
+            Default::default,
+            world_models_gpu::World::ray_skin_omissions,
+        );
+        self.lighter.skin_omissions = [world, walker, populator];
         // Underwater fog/transmission are evaluated along Lighter's actual
         // paths. Don't re-tint those pixels with the raster underwater pass.
         let use_post = crate::view_settings::post_required(

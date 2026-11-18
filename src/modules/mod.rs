@@ -9,6 +9,9 @@ mod package;
 mod populator;
 mod walker;
 
+#[cfg(test)]
+pub(crate) use populator::off_camera_npc_packets;
+
 use crate::{model_draw_gpu, navigation::MapSpace, water::WaterArea};
 use glam::Vec3;
 use package::{Package, Registry};
@@ -557,6 +560,13 @@ impl Modules {
 
     pub fn walker_audio_diagnostic(&self) -> Option<String> {
         self.walker.audio_diagnostic()
+    }
+
+    pub(crate) fn ray_skin_omissions(&self) -> [crate::skin::SkinOmissions; 2] {
+        [
+            self.walker.ray_skin_omissions(),
+            self.populator.ray_skin_omissions(),
+        ]
     }
 
     /// The host calls this only when the Walker add-on itself is visible in the

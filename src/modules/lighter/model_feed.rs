@@ -8,9 +8,19 @@ use super::{
 use crate::{
     gfx_player::EffectQuad,
     model_asset::{ModelAsset, PosedMesh},
+    skeleton_pose::{self, Pose},
 };
 
 pub(crate) type Decode<'a> = dyn FnMut(&str) -> Result<(image::RgbaImage, bool), String> + 'a;
+
+pub(crate) struct Posed<'a> {
+    pub asset: &'a ModelAsset,
+    pub pose: &'a Pose,
+    pub meshes: &'a [PosedMesh],
+    /// This model's frame follows a parent (face, hanger, flight attachment,
+    /// or mounted rider). Keep even its weighted skin in that child frame.
+    pub attached: bool,
+}
 
 pub(crate) struct Moving<'a> {
     pub builder: Builder,
@@ -33,19 +43,27 @@ impl<'a> Moving<'a> {
         &mut self,
         namespace: &'static str,
         owner: u64,
-        asset: &ModelAsset,
-        poses: &[PosedMesh],
-        include_skin: impl Fn(usize) -> bool,
+        model: Posed<'_>,
+        primary_visible: impl Fn(usize) -> bool,
         decode: &mut Decode<'_>,
     ) -> Result<(), String> {
         // Use the normal renderer's actual topology/pose/texture resolver.
         // A broken rig isn't a reason to drop the rest of this scene.
-        let Ok(prepared) = crate::model_draw::prepare(asset, poses) else {
+        let Posed {
+            asset,
+            pose,
+            meshes,
+            attached,
+        } = model;
+        let Ok(prepared) = crate::model_draw::prepare(asset, meshes) else {
             return Ok(());
         };
         let settings = asset.descriptor.render_settings();
         let mut geometry = Mesh::default();
-        for part in prepared.into_iter().filter(|part| include_skin(part.skin)) {
+        // An authored zero-scale/singular bone can collapse its skin. Do
+        // not invent an inverse: leave that part in the evaluated world mesh.
+        let parent = attached.then(|| Attachment::new(pose.model)).flatten();
+        for part in prepared {
             let d = part.material.diffuse;
             let mut flags = if settings.destination_blend == 2 {
                 BLEND | ADDITIVE
@@ -54,6 +72,9 @@ impl<'a> Moving<'a> {
             } else {
                 0
             };
+            if !primary_visible(part.skin) {
+                flags |= HIDE_PRIMARY;
+            }
             let filter = if part.diffuse_alpha_only {
                 flags |= IGNORE_TEXTURE_ALPHA;
                 Filter::Color
@@ -81,24 +102,41 @@ impl<'a> Moving<'a> {
             let id = self
                 .builder
                 .surface(Surface::new(texture, flags, 0.5, 0.).with_gloss(gloss));
-            let base = geometry.vertices.len() as u32;
-            geometry.vertices.extend(
-                part.vertices
-                    .iter()
-                    .map(|v| Vertex::new(v.position, v.normal, v.uv).tint(tint, tint)),
-            );
-            for i in part.indices.chunks_exact(3) {
-                geometry.tri(
-                    [
-                        base + u32::from(i[0]),
-                        base + u32::from(i[1]),
-                        base + u32::from(i[2]),
-                    ],
-                    id,
+            let source = &asset.skins[part.skin].data.meshes[part.mesh];
+            if let Some(placement) = source
+                .rigid_bone
+                .and_then(|bone| skeleton_pose::rigid_matrix(pose, bone).ok())
+                .and_then(Attachment::new)
+            {
+                // Rigid SKI vertices already live in the direct blend-matrix
+                // bind space. A moving hook changes the TLAS, not this BLAS.
+                let mut child = Mesh::default();
+                child.vertices.extend(
+                    source
+                        .vertices
+                        .iter()
+                        .map(|v| Vertex::new(v.position, v.normal, v.uv).tint(tint, tint)),
                 );
+                append_triangles(&mut child, &part.indices, 0, id);
+                self.builder.rigid_part(
+                    namespace,
+                    owner,
+                    (part.skin, part.mesh),
+                    &child,
+                    placement,
+                )?;
+                continue;
             }
+            let base = geometry.vertices.len() as u32;
+            geometry.vertices.extend(part.vertices.iter().map(|v| {
+                let (p, n) = parent.map_or((v.position, v.normal), |a| {
+                    (a.local_point(v.position), a.local_vector(v.normal))
+                });
+                Vertex::new(p, n, v.uv).tint(tint, tint)
+            }));
+            append_triangles(&mut geometry, &part.indices, base, id);
         }
-        self.builder.posed_world_mesh(namespace, owner, &geometry)
+        self.builder.posed_mesh(namespace, owner, &geometry, parent)
     }
 
     pub fn effects(
@@ -248,6 +286,19 @@ impl<'a> Moving<'a> {
     #[cfg(test)]
     fn finish(self) -> Result<Packet, String> {
         self.finish_cached(&mut AccelCache::default())
+    }
+}
+
+fn append_triangles(geometry: &mut Mesh, indices: &[u16], base: u32, surface: u32) {
+    for i in indices.chunks_exact(3) {
+        geometry.tri(
+            [
+                base + u32::from(i[0]),
+                base + u32::from(i[1]),
+                base + u32::from(i[2]),
+            ],
+            surface,
+        );
     }
 }
 

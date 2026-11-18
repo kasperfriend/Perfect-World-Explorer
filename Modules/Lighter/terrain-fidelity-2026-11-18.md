@@ -47,7 +47,9 @@ The native raster renderer's LOD choices are unchanged.
 A refined far grid can be finer than the installed near LOD. Far boundary
 vertices are snapped to the native perimeter segment in that case. The
 reverse case still inserts actual native perimeter points into coarse far
-triangles. Synthetic seam fixtures check both directions; the real-map
+triangles. [Linux CI run 44399006844](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44399006844/job/135136594065)
+passed the production Software and CPU Vulkan pixel/depth seam fixtures in
+both directions and the synthetic streamed viewer. The real-map
 numbers above exclude stitching and do not establish live seam parity.
 
 ## Reproduce

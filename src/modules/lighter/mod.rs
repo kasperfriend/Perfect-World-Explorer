@@ -575,6 +575,7 @@ pub struct Lighter {
     persistence_error: Option<String>,
     status: Option<String>,
     pub(crate) scenery_coverage: Option<String>,
+    pub(crate) skin_omissions: [crate::skin::SkinOmissions; 3],
 }
 
 impl Default for Lighter {
@@ -602,6 +603,7 @@ impl Default for Lighter {
             persistence_error: None,
             status: None,
             scenery_coverage: None,
+            skin_omissions: Default::default(),
         }
     }
 }
@@ -1015,6 +1017,16 @@ impl Lighter {
         if self.replaces_world() {
             if let Some(coverage) = &self.scenery_coverage {
                 ui.label(coverage);
+            }
+            for (source, counts) in ["World", "Walker", "Populator"]
+                .iter()
+                .zip(self.skin_omissions)
+            {
+                if counts.files != 0 {
+                    ui.label(format!(
+                        "{source} unsupported skin records (seen): {counts}"
+                    ));
+                }
             }
         }
         ui.separator();

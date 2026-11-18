@@ -852,7 +852,7 @@ impl Renderer {
                 instances.push((
                     key,
                     TlasInstance {
-                        rows: i.transform.rows(),
+                        rows: packet.placement_rows(i),
                         index_mask: (id as u32 | bit) | (u32::from(m.mask) << 24),
                         sbt_flags: if m.opaque {
                             vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE.as_raw() << 24

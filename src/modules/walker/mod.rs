@@ -1100,6 +1100,12 @@ impl Walker {
         }
     }
 
+    pub(super) fn ray_skin_omissions(&self) -> crate::skin::SkinOmissions {
+        self.assets
+            .as_ref()
+            .map_or_else(Default::default, |assets| assets.skin_omissions.totals())
+    }
+
     pub(super) fn ray_inputs(
         &mut self,
         matrix: Mat4,
@@ -1125,22 +1131,54 @@ impl Walker {
                 .read(path)
                 .and_then(|b| crate::model_texture_gpu::decode_for_rays(&b))
         };
+        let character_pose = &character.posed.pose;
         for model in render_models(character, &character.posed.meshes)? {
-            let visible = part_visibility(
-                &model.part,
-                self.settings.first_person,
-                character.soulsphere_hidden(),
-            );
-            if !matches!(visible, PartVisibility::Hidden) {
-                out.model(
-                    "walker",
-                    model.ray_owner,
-                    model.asset,
-                    model.poses,
-                    |skin| !matches!(visible, PartVisibility::BodyWithoutHead) || skin != 1,
-                    &mut decode,
-                )?;
+            if matches!(
+                part_visibility(&model.part, false, character.soulsphere_hidden()),
+                PartVisibility::Hidden
+            ) {
+                // Authored travel/weapon visibility is not a first-person mask.
+                continue;
             }
+            let primary = part_visibility(&model.part, self.settings.first_person, false);
+            let (pose, attached) = match model.part {
+                ModelPart::Body => (&character_pose.body, character_pose.mount.is_some()),
+                ModelPart::Face => (&character_pose.face, true),
+                ModelPart::Flight => (
+                    character_pose
+                        .flight
+                        .as_ref()
+                        .ok_or("flight has no hook pose")?,
+                    true,
+                ),
+                ModelPart::Mount => (
+                    character_pose.mount.as_ref().ok_or("mount has no pose")?,
+                    false,
+                ),
+                ModelPart::Weapon { .. } => (
+                    character_pose
+                        .weapons
+                        .get(model.ray_owner as usize - 4)
+                        .ok_or("weapon has no hook pose")?,
+                    true,
+                ),
+            };
+            out.model(
+                "walker",
+                model.ray_owner,
+                super::lighter::model_feed::Posed {
+                    asset: model.asset,
+                    pose,
+                    meshes: model.poses,
+                    attached,
+                },
+                |skin| match primary {
+                    PartVisibility::All => true,
+                    PartVisibility::BodyWithoutHead => skin != 1,
+                    PartVisibility::Hidden => false,
+                },
+                &mut decode,
+            )?;
         }
         let decals = character
             .gfx

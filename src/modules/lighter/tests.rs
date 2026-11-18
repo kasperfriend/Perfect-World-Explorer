@@ -681,6 +681,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_bmd_chunk_join(&mut h);
     exercise_terrain_seam(&mut h);
     exercise_accel_reuse(&mut h);
+    exercise_off_camera_pose(&mut h);
+    exercise_rigid_hanger(&mut h);
     exercise_resource_reuse(&mut h);
     exercise_texture_prefix_replacement(&mut h);
     exercise_chunk_scaling(&mut h);
@@ -1458,6 +1460,159 @@ fn exercise_accel_reuse(h: &mut Harness) {
     );
     assert_eq!(cache.builds, [1, 1]);
     assert_eq!(cache.refits, [1, 1]);
+}
+
+fn exercise_off_camera_pose(h: &mut Harness) {
+    let mut b = Builder::default();
+    let receive = upright(&mut b, -8., [1.; 4], 0, 0);
+    put(&mut b, receive);
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let mut frame = test_frame(Vec3::ZERO, -Vec3::Z, 3);
+    frame.ambient = [0.; 4];
+    frame.sun = [0.8, 0., 0.6, 1.];
+    h.ray.settings.lighting = true;
+    h.ray.settings.shadows = true;
+    h.ray.settings.soft_sun = false;
+    h.ray.settings.bounces = 0;
+    let [before, after] =
+        crate::modules::off_camera_npc_packets(Mat4::from_cols_array_2d(&frame.vp));
+    let shadow = h.pixel(frame, &before);
+    assert_eq!(
+        shadow.0,
+        [0, 0, 0, 255],
+        "off-screen animated NPC did not cast a shadow"
+    );
+    let builds = h.builds();
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let refs = h.ray.hardware.as_ref().map(|rt| rt.as_refits);
+    let lit = h.pixel(frame, &after);
+    assert!(
+        lit.0[0] > 100,
+        "animated caster retained stale shadow: {lit:?}"
+    );
+    assert_eq!(lit.1, shadow.1);
+    assert!((lit.1 - depth_at(frame, -8. * Vec3::Z)).abs() < 1e-6);
+    assert_eq!(h.builds(), builds);
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    if let Some(rt) = &h.ray.hardware {
+        let [a, b, c] = refs.unwrap();
+        assert_eq!(rt.as_refits, [a, b + 1, c + 1]);
+    }
+}
+
+fn exercise_rigid_hanger(h: &mut Harness) {
+    let mut builder = Builder::default();
+    let mirror_surface = builder.surface(Surface::new(0, 0, 0., 1.));
+    let mut mirror = Mesh::default();
+    mirror.vertices = [
+        [-5., 5., -8.],
+        [5., 5., -8.],
+        [-5., -5., -8.],
+        [5., -5., -8.],
+    ]
+    .map(|p| Vertex::new(p, [0., 0., 1.], [0.; 2]))
+    .to_vec();
+    mirror.tri([0, 2, 1], mirror_surface);
+    mirror.tri([1, 2, 3], mirror_surface);
+    builder.world_mesh(&mirror).unwrap();
+    h.ray.install(Ok((builder.finish(), Textures::default())));
+    h.ray.settings.lighting = false;
+    h.ray.settings.shadows = false;
+    h.ray.settings.reflections = true;
+    h.ray.settings.bounces = 0;
+
+    let (mut child, _) = crate::model_draw_fixture::fixture();
+    let skin = &mut child.skins[0].data;
+    skin.materials[0].diffuse = [1., 0., 0., 1.];
+    let mesh = &mut skin.meshes[0];
+    mesh.rigid_bone = Some(0); // direct virtual/model slot
+    mesh.vertices = [[-1., 1., 0.], [1., 1., 0.], [-1., -1., 0.], [1., -1., 0.]]
+        .into_iter()
+        .map(|position| crate::skin::Vertex {
+            position,
+            normal: [0., 0., 1.],
+            uv: [0.; 2],
+            weights: [1., 0., 0., 0.],
+            joints: [0; 4],
+        })
+        .collect();
+    mesh.indices = vec![0, 2, 1, 1, 2, 3];
+    let (mut parent, _) = crate::model_draw_fixture::fixture();
+    let local = Mat4::from_translation(Vec3::NEG_Z * 4.)
+        * Mat4::from_rotation_x(0.55)
+        * Mat4::from_scale(Vec3::new(1.3, 0.8, 1.));
+    parent.skeleton.hooks.push(crate::skeleton::Hook {
+        name: "head".into(),
+        kind: 0,
+        bone: -1,
+        matrix: local.to_cols_array(),
+    });
+    let mut textures = Textures::default();
+    let mut cache = AccelCache::default();
+    let mut make = |x: f32, hide: bool| {
+        let pose = parent
+            .bind_pose(Mat4::from_translation(Vec3::X * x))
+            .unwrap();
+        let child_pose = child
+            .bind_pose(parent.hook_matrix(&pose, "head").unwrap())
+            .unwrap();
+        let meshes = child.meshes_from_pose(&child_pose).unwrap();
+        let mut out = super::model_feed::Moving::new(&mut textures);
+        out.model(
+            "walker",
+            1,
+            super::model_feed::Posed {
+                asset: &child,
+                pose: &child_pose,
+                meshes: &meshes,
+                attached: true,
+            },
+            |_| !hide,
+            &mut |_| Err("fixture white fallback".into()),
+        )
+        .unwrap();
+        let packet = out.finish_cached(&mut cache).unwrap();
+        assert!(matches!(
+            packet.meshes[0].key,
+            MeshKey::RigidPart("walker", 1, 0, 0, _)
+        ));
+        packet
+    };
+    let frame = test_frame(Vec3::ZERO, Vec3::NEG_Z, 3);
+    let red = [255, 0, 0, 255];
+    let visible = make(0., false);
+    let (front, depth) = h.pixel(frame, &visible);
+    assert_eq!(front, red);
+    assert!((depth - depth_at(frame, -4. * Vec3::Z)).abs() < 1e-6);
+    let builds = h.builds();
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    let refs = h.ray.hardware.as_ref().map(|rt| rt.as_refits);
+    let hidden = make(0., true);
+    assert_eq!(visible.meshes[0].shape, hidden.meshes[0].shape);
+    let (behind, depth) = h.pixel(frame, &hidden);
+    assert_eq!(behind, [255; 4]);
+    assert!((depth - depth_at(frame, -8. * Vec3::Z)).abs() < 1e-6);
+    assert_eq!(h.builds(), builds);
+    h.ray.settings.bounces = 1;
+    let reflection = h.pixel(frame, &hidden);
+    assert_eq!(
+        reflection,
+        (red, depth),
+        "first-person head missing from reflection"
+    );
+    let moved = make(3., true);
+    assert_eq!(moved.meshes[0].shape, hidden.meshes[0].shape);
+    let miss = h.pixel(frame, &moved);
+    assert_ne!(miss.0, red, "rigid child did not follow the hook");
+    assert_eq!(miss.1, depth);
+    assert_eq!(h.builds(), builds);
+    assert_eq!(cache.builds, [1, 1]);
+    assert_eq!(cache.refits, [0, 1]);
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    if let Some(rt) = &h.ray.hardware {
+        let [a, b, c] = refs.unwrap();
+        assert_eq!(rt.as_refits, [a, b, c + 2]);
+    }
 }
 
 #[test]

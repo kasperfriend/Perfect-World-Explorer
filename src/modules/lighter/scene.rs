@@ -4,7 +4,7 @@
 pub(crate) use super::bvh::Bounds;
 use super::bvh::Bvh;
 use bytemuck::{Pod, Zeroable};
-use glam::{Vec2, Vec3};
+use glam::{Mat3, Mat4, Vec2, Vec3};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -26,6 +26,8 @@ pub const CULL_BACK: u32 = 1 << 13;
 pub const WRITE_DEPTH: u32 = 1 << 14;
 pub const IGNORE_TEXTURE_ALPHA: u32 = 1 << 15;
 pub const STRICT_ALPHA: u32 = 1 << 16;
+/// The local first-person head is still visible to shadow and bounce rays.
+pub const HIDE_PRIMARY: u32 = 1 << 17;
 
 // These bits also occupy the upper eight bits of a Vulkan TLAS instance.
 // A mixed mesh can participate in several queries; its individual triangles
@@ -202,6 +204,70 @@ impl Transform {
     }
 }
 
+/// Optional general affine placement for a bone/hook relative child. Most
+/// instances (important for grass) keep the old six-word scale/yaw transform.
+#[derive(Clone, Copy)]
+pub(super) struct Attachment {
+    position: Vec3,
+    forward: Mat3,
+    inverse: Mat3,
+}
+
+impl Attachment {
+    pub(super) fn new(matrix: Mat4) -> Option<Self> {
+        let forward = Mat3::from_mat4(matrix);
+        if !matrix.is_finite()
+            || [
+                matrix.x_axis.w,
+                matrix.y_axis.w,
+                matrix.z_axis.w,
+                matrix.w_axis.w,
+            ] != [0., 0., 0., 1.]
+            || forward.determinant().abs() < 1e-12
+        {
+            return None;
+        }
+        let inverse = forward.inverse();
+        inverse.is_finite().then_some(Self {
+            position: matrix.w_axis.truncate(),
+            forward,
+            inverse,
+        })
+    }
+
+    pub(super) fn local_point(self, p: [f32; 3]) -> [f32; 3] {
+        (self.inverse * (Vec3::from_array(p) - self.position)).to_array()
+    }
+
+    pub(super) fn local_vector(self, n: [f32; 3]) -> [f32; 3] {
+        (self.inverse * Vec3::from_array(n)).to_array()
+    }
+
+    fn bounds(self, b: Bounds) -> Bounds {
+        let center = self.forward * ((b.min + b.max) * 0.5) + self.position;
+        let half = (b.max - b.min) * 0.5;
+        let radius = self.forward.x_axis.abs() * half.x
+            + self.forward.y_axis.abs() * half.y
+            + self.forward.z_axis.abs() * half.z;
+        // These arithmetic bounds should conservatively enclose all raster
+        // endpoints, including rounding for large translations.
+        let pad = (center.abs() + radius).max(Vec3::ONE) * (4. * f32::EPSILON);
+        Bounds {
+            min: center - radius - pad,
+            max: center + radius + pad,
+        }
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    fn rows(self) -> [f32; 12] {
+        let a = self.forward.transpose();
+        std::array::from_fn(|i| match (i / 4, i % 4) {
+            (row, 3) => self.position[row],
+            (row, col) => a.col(row)[col],
+        })
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct Mesh {
     pub vertices: Vec<Vertex>,
@@ -245,6 +311,7 @@ pub type Fingerprint = [u8; 32];
 pub enum MeshKey {
     Static(Option<ChunkKey>, Fingerprint),
     Posed(&'static str, u64, Fingerprint),
+    RigidPart(&'static str, u64, usize, usize, Fingerprint),
 }
 
 pub struct MeshRange {
@@ -261,7 +328,8 @@ pub struct MeshRange {
 #[derive(Clone, Copy)]
 pub struct Instance {
     pub mesh: u32,
-    pub transform: Transform,
+    transform: Transform,
+    attachment: Option<u32>,
 }
 
 #[repr(C)]
@@ -280,6 +348,7 @@ pub struct Builder {
     material_map: std::collections::HashMap<Surface, u32>,
     meshes: Vec<MeshRange>,
     instances: Vec<Instance>,
+    attachments: Vec<Attachment>,
     lights: Vec<Light>,
 }
 
@@ -377,7 +446,11 @@ impl AccelCache {
             .map(|&id| {
                 let i = &builder.instances[id];
                 let mesh = &builder.meshes[i.mesh as usize];
-                (mesh.key, i.transform.bounds(mesh.bounds))
+                let bounds = i.attachment.map_or_else(
+                    || i.transform.bounds(mesh.bounds),
+                    |a| builder.attachments[a as usize].bounds(mesh.bounds),
+                );
+                (mesh.key, bounds)
             })
             .unzip();
         let [builds, refits] = self.instances.update(keys, bounds);
@@ -565,7 +638,13 @@ impl Builder {
             mask |= bits;
             opaque &= bits == first_mask
                 && material.flags
-                    & (CUTOUT | BLEND | NO_REFLECT | NO_REFRACT | CULL_BACK | WRITE_DEPTH)
+                    & (CUTOUT
+                        | BLEND
+                        | NO_REFLECT
+                        | NO_REFRACT
+                        | CULL_BACK
+                        | WRITE_DEPTH
+                        | HIDE_PRIMARY)
                     == 0;
         }
         // Don't leave partial ranges behind if validation rejected this draw.
@@ -610,7 +689,11 @@ impl Builder {
         {
             return Err("invalid or excessive Lighter instance transforms".into());
         }
-        self.instances.push(Instance { mesh, transform });
+        self.instances.push(Instance {
+            mesh,
+            transform,
+            attachment: None,
+        });
         Ok(())
     }
 
@@ -636,10 +719,50 @@ impl Builder {
         id: u64,
         mesh: &Mesh,
     ) -> Result<(), String> {
+        self.posed_mesh(namespace, id, mesh, None)
+    }
+
+    pub(super) fn posed_mesh(
+        &mut self,
+        namespace: &'static str,
+        owner: u64,
+        mesh: &Mesh,
+        placement: Option<Attachment>,
+    ) -> Result<(), String> {
         if let Some(id) = self.mesh_keyed(mesh, Some, |topology, _| {
-            MeshKey::Posed(namespace, id, topology)
+            MeshKey::Posed(namespace, owner, topology)
         })? {
-            self.place(id, Transform::IDENTITY)?;
+            self.place_model(id, placement)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn rigid_part(
+        &mut self,
+        namespace: &'static str,
+        owner: u64,
+        part: (usize, usize),
+        mesh: &Mesh,
+        placement: Attachment,
+    ) -> Result<(), String> {
+        if let Some(id) = self.mesh_keyed(mesh, Some, |_, shape| {
+            MeshKey::RigidPart(namespace, owner, part.0, part.1, shape)
+        })? {
+            self.place_model(id, Some(placement))?;
+        }
+        Ok(())
+    }
+
+    fn place_model(&mut self, mesh: u32, placement: Option<Attachment>) -> Result<(), String> {
+        self.place(
+            mesh,
+            placement.map_or(Transform::IDENTITY, |a| {
+                Transform::translation(a.position.to_array())
+            }),
+        )?;
+        if let Some(a) = placement {
+            self.instances.last_mut().unwrap().attachment = Some(self.attachments.len() as u32);
+            self.attachments.push(a);
         }
         Ok(())
     }
@@ -659,6 +782,13 @@ impl Builder {
         append(&mut words, 1, &self.triangles);
         append(&mut words, 2, &self.material_layers);
         append(&mut words, 3, &self.materials);
+        // Affine basis data is indirect and only present for attached parts.
+        // A zero scale (invalid for ordinary instances) selects it in WGSL.
+        let attachment_start = (words.len()
+            + self.instances.len() * INSTANCE_WORDS as usize
+            + bvh.nodes.len() * super::bvh::NODE_WORDS as usize
+            + bvh.items.len()
+            + self.lights.len() * 8) as u32;
         let gpu_instances: Vec<_> = self
             .instances
             .iter()
@@ -670,8 +800,13 @@ impl Builder {
                     x,
                     y,
                     z,
-                    t.scale.to_bits(),
-                    t.cos.to_bits(),
+                    if inst.attachment.is_some() {
+                        0
+                    } else {
+                        t.scale.to_bits()
+                    },
+                    inst.attachment
+                        .map_or(t.cos.to_bits(), |i| attachment_start + i * 18),
                     t.sin.to_bits(),
                     mesh.vertex.start,
                     mesh.triangle.start,
@@ -695,10 +830,17 @@ impl Builder {
         words[11] = flag_bits;
         words[12] = light_root;
         words[13] = light_end;
+        debug_assert_eq!(words.len(), attachment_start as usize);
+        for a in &self.attachments {
+            words.extend(a.forward.to_cols_array().map(f32::to_bits));
+            words.extend(a.inverse.to_cols_array().map(f32::to_bits));
+        }
         Packet {
             words,
             meshes: self.meshes,
             instances: self.instances,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            attachments: self.attachments,
             triangle_count: self.triangles.len(),
         }
     }
@@ -708,10 +850,20 @@ pub struct Packet {
     pub words: Vec<u32>,
     pub meshes: Vec<MeshRange>,
     pub instances: Vec<Instance>,
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    attachments: Vec<Attachment>,
     triangle_count: usize,
 }
 
 impl Packet {
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    pub(super) fn placement_rows(&self, instance: &Instance) -> [f32; 12] {
+        instance.attachment.map_or_else(
+            || instance.transform.rows(),
+            |a| self.attachments[a as usize].rows(),
+        )
+    }
+
     pub fn bytes(&self) -> &[u8] {
         bytemuck::cast_slice(&self.words)
     }

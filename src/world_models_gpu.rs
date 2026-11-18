@@ -828,6 +828,11 @@ impl World {
         }
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn ray_skin_omissions(&self) -> crate::skin::SkinOmissions {
+        self.assets.skin_omissions.totals()
+    }
+
     // Source data, not the current raster queue. In particular don't discard
     // poses outside the camera frustum: a reflected or shadow ray can see them.
     #[allow(dead_code, clippy::type_complexity)]
@@ -838,6 +843,7 @@ impl World {
                 Item = (
                     u64,
                     &crate::model_asset::ModelAsset,
+                    &crate::skeleton_pose::Pose,
                     &[crate::model_asset::PosedMesh],
                 ),
             > + '_,
@@ -865,7 +871,12 @@ impl World {
                     return None;
                 }
                 let pose = slot.posed.as_ref()?.as_ref().ok()?;
-                Some((owner as u64, &assets[i.asset], pose.meshes.as_slice()))
+                Some((
+                    owner as u64,
+                    &assets[i.asset],
+                    &pose.pose,
+                    pose.meshes.as_slice(),
+                ))
             });
         (poses, &self.effect_quads, &self.ray_lights, &mut *self.read)
     }

@@ -40,6 +40,7 @@ const CULL_BACK: u32 = 8192u;
 const WRITE_DEPTH: u32 = 16384u;
 const IGNORE_TEXTURE_ALPHA: u32 = 32768u;
 const STRICT_ALPHA: u32 = 65536u;
+const HIDE_PRIMARY: u32 = 131072u;
 const SOLID_MASK: u32 = 1u;
 const BLEND_MASK: u32 = 2u;
 const SHADOW_MASK: u32 = 4u;
@@ -92,6 +93,17 @@ fn vertex_addresses(dynamic: bool, instance_addr: u32, primitive: u32) -> vec3<u
 fn rotate(v: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
     return vec3<f32>(c*v.x-s*v.z, v.y, s*v.x+c*v.z);
 }
+// Usual scale/yaw instances do not pay for a full matrix in their record.
+// A zero scale points to forward and inverse column-major affine bases.
+fn instance_basis(m: bool, at: u32) -> mat3x3<f32> {
+    return mat3x3<f32>(floats(m,at),floats(m,at+3u),floats(m,at+6u));
+}
+fn instance_vector(m: bool, inst: u32, v: vec3<f32>) -> vec3<f32> {
+    let scale = bitcast<f32>(word(m,inst+3u));
+    let at = word(m,inst+4u);
+    if scale==0. { return instance_basis(m,at)*v; }
+    return rotate(v,bitcast<f32>(at),bitcast<f32>(word(m,inst+5u)))*scale;
+}
 fn norm(v: vec3<f32>) -> vec3<f32> {
     return v * inverseSqrt(max(dot(v,v), 1.e-20));
 }
@@ -129,8 +141,18 @@ fn tile_lod_for(addr: u32, ray: Ray, hit: Hit, m: bool, inst: u32, v: vec3<u32>)
     let last = texels[addr+2u]-1u;
     if last==0u { return 0.; }
     let a = floats(m,v.x);
-    let e = floats(m,v.y)-a;
-    let f = floats(m,v.z)-a;
+    var e = floats(m,v.y)-a;
+    var f = floats(m,v.z)-a;
+    var dir = ray.dir;
+    var scale = bitcast<f32>(word(m,inst+3u));
+    if scale==0. {
+        let basis = instance_basis(m,word(m,inst+4u));
+        e = basis*e;
+        f = basis*f;
+        scale = 1.;
+    } else {
+        dir = rotate(dir,bitcast<f32>(word(m,inst+4u)),-bitcast<f32>(word(m,inst+5u)));
+    }
     let n = cross(e,f);
     let n2 = dot(n,n);
     if n2<1.e-20 { return 0.; }
@@ -141,10 +163,7 @@ fn tile_lod_for(addr: u32, ray: Ray, hit: Hit, m: bool, inst: u32, v: vec3<u32>)
     let grad1 = cross(n,e);
     let grad_u = length(du.x*grad0+dv.x*grad1)*f32(texels[addr]);
     let grad_v = length(du.y*grad0+dv.y*grad1)*f32(texels[addr+1u]);
-    let c = bitcast<f32>(word(m,inst+4u));
-    let s = bitcast<f32>(word(m,inst+5u));
-    let grazing = max(0.15,abs(dot(n*inverseSqrt(n2),rotate(ray.dir,c,-s))));
-    let scale = bitcast<f32>(word(m,inst+3u));
+    let grazing = max(0.15,abs(dot(n*inverseSqrt(n2),dir)));
     let rho = footprint(ray,hit.t)*max(grad_u,grad_v)/(grazing*scale*n2);
     return clamp(log2(max(rho,1.)),0.,f32(last));
 }
@@ -220,9 +239,14 @@ fn tint_of(m: bool, v: vec3<u32>, w: vec3<f32>) -> vec4<f32> {
 }
 fn geometric(m: bool, inst: u32, v: vec3<u32>) -> vec3<f32> {
     let a = floats(m,v.x);
-    let c = bitcast<f32>(word(m,inst+4u));
-    let s = bitcast<f32>(word(m,inst+5u));
-    return rotate(cross(floats(m,v.y)-a,floats(m,v.z)-a),c,s);
+    let e = floats(m,v.y)-a;
+    let f = floats(m,v.z)-a;
+    let at = word(m,inst+4u);
+    if word(m,inst+3u)==0u {
+        let basis = instance_basis(m,at);
+        return cross(basis*e,basis*f);
+    }
+    return rotate(cross(e,f),bitcast<f32>(at),bitcast<f32>(word(m,inst+5u)));
 }
 fn alpha_test(a: f32, reference: f32, flags: u32) -> bool {
     // Allow for the one-ULP difference between CPU normalization of a byte
@@ -245,7 +269,7 @@ fn coverage_sample(ray: Ray, m: bool, inst: u32, v: vec3<u32>) -> f32 {
     var axis = select(1u,0u,a.x>=a.y);
     if a.z>a[axis] { axis = 2u; }
     n *= select(1.,-1.,n[axis]<0.);
-    let p = floats(m,inst) + rotate(floats(m,v.x),bitcast<f32>(word(m,inst+4u)),bitcast<f32>(word(m,inst+5u)))*bitcast<f32>(word(m,inst+3u));
+    let p = floats(m,inst) + instance_vector(m,inst,floats(m,v.x));
     let key = bitcast<u32>(i32(round(dot(n,p)*64.)));
     let shape = bitcast<vec3<u32>>(vec3<i32>(round(n*16.)));
     let salt = hash(key ^ (shape.x*0x9e3779b9u) ^ (shape.y*0x85ebca6bu) ^ (shape.z*0xc2b2ae35u) ^ ray.pixel_seed);
@@ -261,6 +285,7 @@ fn accepts(hit: Hit, ray: Ray, q: Query) -> bool {
     let flags = word(m,mat+1u);
     let blend = (flags & BLEND)!=0u;
     if (q.mask==SOLID_MASK && blend) || (q.mask==BLEND_MASK && !blend)
+        || (q.purpose==VIEW && (flags & HIDE_PRIMARY)!=0u)
         || (q.purpose==SHADOW && (flags & (BLEND|WATER))!=0u && (flags & WRITE_DEPTH)==0u)
         || (q.purpose==WATER_REFLECT && (flags & NO_REFLECT)!=0u)
         || (q.purpose==WATER_TRANSMIT && (flags & NO_REFRACT)!=0u) { return false; }
@@ -313,12 +338,15 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
     let p = ray.origin + ray.dir*hit.t;
     let w = weights_of(hit);
     let uv = surface_uv(m,v,w,flags);
-    let c = bitcast<f32>(word(m,inst+4u));
-    let s = bitcast<f32>(word(m,inst+5u));
     let raw = rgba(word(m,v.x+3u)).xyz*w.x + rgba(word(m,v.y+3u)).xyz*w.y + rgba(word(m,v.z+3u)).xyz*w.z;
     let gn = norm(geometric(m,inst,v));
     let face = select(gn,-gn,dot(gn,ray.dir)>0.);
-    var n = norm(rotate(raw*2.-1.,c,s));
+    // Match the native skin stage: transform posed normals as vectors, then
+    // align to the actual affine triangle plane on back/grazing faces.
+    let at = word(m,inst+4u);
+    var n = raw*2.-1.;
+    if word(m,inst+3u)==0u { n = norm(instance_basis(m,at)*n); }
+    else { n = norm(rotate(n,bitcast<f32>(at),bitcast<f32>(word(m,inst+5u)))); }
     if dot(n,face)<0. { n = -n; }
     // Bad/sufficiently grazing interpolated normals must not face away from
     // the incident ray. They never decide which side of the triangle we enter.

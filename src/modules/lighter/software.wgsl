@@ -50,11 +50,18 @@ fn mesh_hit(m: bool, instance: u32, ray: Ray, old: Hit, q: Query) -> Hit {
     if (word(m,inst+10u) & q.mask)==0u { return old; }
     let t = floats(m,inst);
     let s = bitcast<f32>(word(m,inst+3u));
-    let c = bitcast<f32>(word(m,inst+4u));
-    let si = bitcast<f32>(word(m,inst+5u));
+    let at = word(m,inst+4u);
     var local = ray;
-    local.origin = rotate(ray.origin-t,c,-si)/s;
-    local.dir = rotate(ray.dir,c,-si)/s;
+    if s==0. {
+        let inverse = instance_basis(m,at+9u);
+        local.origin = inverse*(ray.origin-t);
+        local.dir = inverse*ray.dir;
+    } else {
+        let c = bitcast<f32>(at);
+        let si = bitcast<f32>(word(m,inst+5u));
+        local.origin = rotate(ray.origin-t,c,-si)/s;
+        local.dir = rotate(ray.dir,c,-si)/s;
+    }
     let shear = setup(local.dir);
     let slabs = setup_slabs(local);
     let nodes = word(m,5u);

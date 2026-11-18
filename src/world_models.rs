@@ -17,6 +17,7 @@ pub struct Assets {
     pub instances: Vec<Instance>,
     pub failures: Vec<String>,
     pub unloaded: Vec<SceneModel>,
+    pub skin_omissions: crate::skin::UnsupportedSkins,
 }
 impl Assets {
     /// Failed dependencies remain visible as named failures, not substituted
@@ -25,12 +26,7 @@ impl Assets {
         placements: Vec<SceneModel>,
         mut read: impl FnMut(&str) -> Result<Vec<u8>, String>,
     ) -> Self {
-        let mut result = Self {
-            assets: vec![],
-            instances: vec![],
-            failures: vec![],
-            unloaded: vec![],
-        };
+        let mut result = Self::default();
         let mut cache: HashMap<String, Option<usize>> = HashMap::new();
         let mut tracks = crate::model_asset::TrackCache::default();
         result.instances.reserve(placements.len());
@@ -39,7 +35,12 @@ impl Assets {
             let asset = if let Some(index) = cache.get(&path) {
                 *index
             } else {
-                let index = match ModelAsset::load_cached(&path, &mut read, &mut tracks) {
+                let mut read_skin = |dependency: &str| {
+                    let bytes = read(dependency)?;
+                    result.skin_omissions.observe(dependency, &bytes);
+                    Ok(bytes)
+                };
+                let index = match ModelAsset::load_cached(&path, &mut read_skin, &mut tracks) {
                     Ok(asset) => {
                         let index = result.assets.len();
                         result.assets.push(asset);
