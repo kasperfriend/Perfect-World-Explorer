@@ -102,15 +102,31 @@ pub mod objects {
 pub mod trees {
     pub struct Vert {
         pub pos: [f32; 3],
+        pub normal: [f32; 3],
+        pub uv: [f32; 2],
     }
     pub struct Part {
         pub vertices: Vec<Vert>,
         pub indices: Vec<u32>,
     }
+    /// Real: `src/trees.rs:20`.
+    pub struct Leaf {
+        pub center: [f32; 3],
+        pub normal: Option<[f32; 3]>,
+        pub rho: f32,
+        pub corners: [[f32; 3]; 4],
+        pub uv: [[f32; 2]; 4],
+        pub cluster: u32,
+    }
     /// Real: `src/trees.rs:30`.
     pub struct TreeLod {
         pub branch: Part,
         pub frond: Part,
+        pub branch_alpha_ref: Option<f32>,
+        pub frond_alpha_ref: Option<f32>,
+        pub leaves: Vec<Leaf>,
+        pub rocking: Vec<[f32; 3]>,
+        pub rocking_clusters: usize,
     }
     /// Real: `src/trees.rs:42`.
     pub struct TreeMesh {

@@ -42,6 +42,15 @@ grep -q 'float3 indirect = float3(0.0, 0.0, 0.0);' "$SHADER" \
 #    how reflective the surface actually is, in both tracers.
 grep -q 'reflection = reflection \* reflectivity;' "$PACKER" \
   || fail "the CPU tracer must weight its reflection by the surface's specular"
+# Both tracers must weight a bounce by the albedo of the surface it lands on.
+# Omitting it treats every bounce surface as a perfect white reflector and
+# over-brightens by 1/albedo - terrain at 0.22 came out 4.5x too bright, which
+# is the white ground.
+grep -q 'indirect += weight \* a \* incoming;' "$PACKER" \
+  || fail "the CPU tracer must weight a bounce by the hit surface's albedo"
+grep -q 'indirect += weight \* material_of(h.primitive).rgb \* incoming;' "$SHADER" \
+  || fail "the DXIL shader must weight a bounce by the hit surface's albedo"
+
 if ! grep -q 'float3 through = float3(mat.a, mat.a, mat.a);' "$SHADER"; then
   fail "the DXIL shader must start its mirror chain at the surface's own specular, not 1.0"
 fi

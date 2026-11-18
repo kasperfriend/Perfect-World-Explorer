@@ -63,6 +63,25 @@ impl Default for Environment {
 }
 
 impl Environment {
+    /// The sky gradient alone, without the sun disc.
+    ///
+    /// Diffuse interreflection integrates a whole hemisphere with one sample per
+    /// bounce, so a path that lands on a small, very bright source becomes a
+    /// firefly instead of light: one white pixel with nothing to average it
+    /// against. The disc exists so a *mirror* shows the sun; a diffuse bounce
+    /// wants the sky.
+    fn sky_only(&self, direction: V3) -> V3 {
+        let up = direction.y.clamp(-1., 1.);
+        let sky = if up >= 0. {
+            self.sky_horizon.lerp(self.sky_up, up.powf(0.6))
+        } else {
+            self.sky_horizon.lerp(self.ground, (-up).powf(0.5))
+        };
+        let cos_sun = direction.dot(self.sun_direction).max(0.);
+        // A wide, low-amplitude glow only - no disc.
+        sky + self.sun_color * (cos_sun.powf(8.) * 0.35)
+    }
+
     /// Radiance arriving from a direction that hit nothing: a sky gradient with
     /// a sun glow, blended into the fog colour with distance.
     fn escape(&self, direction: V3, distance: f32) -> V3 {
@@ -386,14 +405,30 @@ impl Tracer {
                             .sky_horizon
                             .lerp(self.environment.sky_up, n.y.max(0.).powf(0.7));
                         let incoming = self.environment.sun_color * (n.dot(l).max(0.) * v) + sky2;
-                        indirect += weight * incoming;
+                        // The *hit* surface's albedo is what turns the light
+                        // arriving there into light leaving it. Without it this
+                        // adds the full incoming irradiance as though every
+                        // bounce surface were a perfect white reflector, which
+                        // over-brightens by 1/albedo: terrain is 0.22, so its
+                        // indirect term was 4.5x too strong. Added to a frame
+                        // that already had the sky and the sun in it, that is
+                        // what made the ground read as white.
+                        indirect += weight * a * incoming;
                         weight = weight * a;
                         origin = p + n * bias(h.t);
                         bounce += 1;
                     }
                     None => {
-                        // Escaped: the sky closes the path.
-                        indirect += weight * self.environment.escape(dir, self.scene_limit());
+                        // Escaped: the sky closes the path. The sun disc in
+                        // `escape` is deliberately intense so a *reflection* of
+                        // the sun reads as the sun - but a single indirect sample
+                        // that happens to land inside an 8x disc becomes an
+                        // isolated white pixel. At one or two samples there is no
+                        // averaging to hide it, which is the white speckle over
+                        // the whole frame. The sky component is what diffuse
+                        // interreflection should carry; the disc belongs to
+                        // specular reflection only.
+                        indirect += weight * self.environment.sky_only(dir);
                         break;
                     }
                 }
@@ -1145,5 +1180,95 @@ mod tests {
         );
         assert!(covered > 0, "the banded trace produced no hits at all");
         assert_eq!(samples.len(), (width as usize) * (height as usize));
+    }
+
+    /// Indirect light must scale with the albedo of the surface it bounces off.
+    ///
+    /// The estimator added the incoming irradiance without multiplying by the
+    /// hit surface's albedo, which is the same as assuming every bounce surface
+    /// is a perfect white reflector. The error is 1/albedo: terrain is 0.22, so
+    /// its interreflected term was 4.5x too bright. On top of a raster frame
+    /// that already contained the sky and the sun, that is what made the ground
+    /// render as white. Only a numeric check catches this - the code reads fine.
+    #[test]
+    fn indirect_light_is_weighted_by_the_surface_it_bounces_off() {
+        use super::super::bvh::material;
+        // The floor the camera looks at keeps a *fixed* albedo; only the surface
+        // the bounce lands on changes. That is what isolates the bug: with the
+        // missing factor, `indirect` scales with the primary albedo alone and is
+        // completely blind to how bright the bounce surface is.
+        // A closed box: the camera looks down at a fixed-albedo floor and every
+        // cosine-hemisphere bounce lands on the ceiling, whose albedo is the only
+        // thing that varies. An open scene would have most bounces escape to the
+        // sky and the test would measure nothing, which is exactly what the first
+        // attempt at this test did.
+        let scene_with_ceiling = |ceiling_albedo: f32| {
+            let mut scene = Scene::empty();
+            scene.materials[material::TERRAIN as usize] = Material::new(v3(0.5, 0.5, 0.5), 0.);
+            scene.materials[material::SCENERY as usize] =
+                Material::new(v3(ceiling_albedo, ceiling_albedo, ceiling_albedo), 0.);
+            let mut tris = Vec::new();
+            let h = 6.;
+            let quad = |a: V3, b: V3, c: V3, d: V3, n: V3, m: u16, t: &mut Vec<Triangle>| {
+                t.push(Triangle {
+                    a,
+                    b,
+                    c,
+                    normal: n,
+                    material: m,
+                });
+                t.push(Triangle {
+                    a,
+                    b: c,
+                    c: d,
+                    normal: n,
+                    material: m,
+                });
+            };
+            let s = 40.;
+            // Floor (fixed) and ceiling (varying).
+            quad(
+                v3(-s, 0., -s),
+                v3(s, 0., -s),
+                v3(s, 0., s),
+                v3(-s, 0., s),
+                v3(0., 1., 0.),
+                material::TERRAIN,
+                &mut tris,
+            );
+            quad(
+                v3(-s, h, -s),
+                v3(-s, h, s),
+                v3(s, h, s),
+                v3(s, h, -s),
+                v3(0., -1., 0.),
+                material::SCENERY,
+                &mut tris,
+            );
+            scene.bvh = Some(Bvh::build(tris));
+            std::sync::Arc::new(scene)
+        };
+        let sample = |ceiling_albedo: f32| {
+            let tracer = Tracer::new(scene_with_ceiling(ceiling_albedo), Environment::default());
+            // Exactly one bounce. With two, the ceiling's albedo still reaches
+            // `indirect` through the *second* term even when the first term
+            // forgets it, so the averages nearly cancel and the test cannot tell
+            // the two behaviours apart. One bounce is the case where the missing
+            // factor is the only thing that could make the result depend on the
+            // ceiling.
+            let mut opts = options();
+            opts.bounces = 1;
+            let out = tracer.trace(&camera(), &opts, 8, 8, 1);
+            let lit: Vec<&Sample> = out.iter().filter(|s| s.hit > 0.5).collect();
+            assert!(!lit.is_empty(), "the floor fills the view");
+            lit.iter().map(|s| s.indirect.length()).sum::<f32>() / lit.len() as f32
+        };
+        let dim = sample(0.05);
+        let bright = sample(0.5);
+        assert!(dim > 0., "dim surfaces still receive indirect light");
+        assert!(
+            bright > dim * 1.5,
+            "indirect must grow with the bounce surface's albedo (dim {dim}, bright {bright})"
+        );
     }
 }

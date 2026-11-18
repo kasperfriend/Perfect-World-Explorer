@@ -222,7 +222,11 @@ void cs(uint3 id : SV_DispatchThreadID)
                     bv = sun_visibility(bp, bn, seed);
                 }
                 float3 incoming = p.sun_color.rgb * (bl * bv) + sky(bn.y);
-                indirect += weight * incoming;
+                // The hit surface's albedo converts arriving light into leaving
+                // light. Omitting it makes every bounce surface a perfect white
+                // reflector and over-brightens by 1/albedo: terrain is 0.22, so
+                // its indirect term came out 4.5x too strong.
+                indirect += weight * material_of(h.primitive).rgb * incoming;
                 weight *= material_of(h.primitive).rgb;
                 if (max(weight.r, max(weight.g, weight.b)) < 0.02) { break; }
                 origin = bp + bn * 0.02;

@@ -336,23 +336,21 @@ fn capture_scenery(b: &mut Builder, objects: &Objects, ornaments: &[Ornament]) {
 }
 
 fn capture_trees(b: &mut Builder, trees: &Trees, scene: &WorldScene) {
-    // Type id → (height, canopy radius) from the type's own highest LOD, so a
-    // big tree casts a big shadow and a sapling does not cast a forest's.
-    let mut shapes: Vec<Option<(f32, f32)>> = Vec::with_capacity(trees.types.len());
-    for tree in &trees.types {
-        shapes.push(tree.as_ref().map(|mesh| {
-            let mut height = 5.0f32;
-            let mut radius = 1.5f32;
-            if let Some(lod) = mesh.lods.first() {
-                for v in lod.branch.vertices.iter().chain(lod.frond.vertices.iter()) {
-                    height = height.max(v.pos[2]);
-                    radius = radius.max(v.pos[0].abs().max(v.pos[1].abs()));
-                }
-            }
-            (height, radius.max(height * 0.18))
-        }));
-    }
     let _ = scene;
+    // The tree's own transform: SpeedTree geometry is authored in tree space
+    // (z up, origin at the stump), so a placement only needs scale and yaw.
+    //
+    // This used to emit two crossed quads per tree from the type's bounding box
+    // - a billboard, not a tree. It was cheap and it made the traced world show
+    // *something* where the foliage is, but what it showed was four flat planes
+    // in a cross, which is precisely what a crossed billboard is. The real
+    // geometry was available the whole time: `TreeLod` carries a branch `Part`
+    // (trunk and limbs) and per-leaf quads with their own corners. Both are
+    // captured now, and a tree is a tree.
+    //
+    // Alpha-tested canopy cards are kept because the leaves *are* cards: that is
+    // how SpeedTree represents foliage. What is captured is the real set of
+    // them, in the real positions, not two invented ones.
     for placement in &trees.placements {
         if !b.has_room() {
             b.clipped = true;
@@ -361,20 +359,62 @@ fn capture_trees(b: &mut Builder, trees: &Trees, scene: &WorldScene) {
         if !b.within(placement.position[0], placement.position[2]) {
             continue;
         }
-        let Some(Some((height, radius))) = shapes.get(placement.tree_type as usize) else {
+        let Some(Some(mesh)) = trees.types.get(placement.tree_type as usize) else {
             continue;
         };
+        // The best LOD is index 0; the cache stores them highest-detail first.
+        let Some(lod) = mesh.lods.first() else {
+            continue;
+        };
+        // A placement is a position and nothing else: `scene::Tree` carries no
+        // scale and no yaw, and `far_trees_gpu` instances each tree with just a
+        // world position. Inventing a transform here - which the first draft of
+        // this function did, reading fields that do not exist - would put the
+        // traced foliage somewhere the drawn foliage is not.
+        //
+        // Cache geometry is authored z-up with the stump at the origin; world is
+        // y-up. That is the whole of the transform.
         let base = V3::from_array(placement.position);
-        // Two crossed canopy cards, from 30% up the trunk to the crown.
-        let low = base.y + height * 0.30;
-        let high = base.y + height;
-        let r = *radius;
-        for (dx, dz) in [(r, 0.), (0., r)] {
-            let a = v3(base.x - dx, low, base.z - dz);
-            let bb = v3(base.x + dx, low, base.z + dz);
-            let c = v3(base.x + dx, high, base.z + dz);
-            let d = v3(base.x - dx, high, base.z - dz);
-            b.quad(a, bb, c, d, v3(0., 1., 0.), material::VEGETATION);
+        let place = |p: &[f32; 3]| -> V3 { v3(base.x + p[0], base.y + p[2], base.z + p[1]) };
+        let place_normal = |n: &[f32; 3]| -> V3 { v3(n[0], n[2], n[1]).normalize_or_zero() };
+        // --- trunk and limbs -------------------------------------------------
+        for part in [&lod.branch, &lod.frond] {
+            for tri in part.indices.chunks_exact(3) {
+                let (Some(a), Some(bv), Some(c)) = (
+                    part.vertices.get(tri[0] as usize),
+                    part.vertices.get(tri[1] as usize),
+                    part.vertices.get(tri[2] as usize),
+                ) else {
+                    continue;
+                };
+                let normal = place_normal(&a.normal);
+                b.push(
+                    place(&a.pos),
+                    place(&bv.pos),
+                    place(&c.pos),
+                    normal,
+                    material::VEGETATION,
+                );
+            }
+        }
+        // --- leaves ----------------------------------------------------------
+        // One quad per leaf, from the corners the client itself draws. These are
+        // the cards that make a canopy: many small ones, angled, not two large
+        // ones.
+        for leaf in &lod.leaves {
+            let c0 = place(&leaf.corners[0]);
+            let c1 = place(&leaf.corners[1]);
+            let c2 = place(&leaf.corners[2]);
+            let c3 = place(&leaf.corners[3]);
+            // The authored leaf normal when present, else the card's own.
+            let normal = match leaf.normal {
+                Some(n) => place_normal(&n),
+                None => (c1 - c0).cross(c2 - c0).normalize_or_zero(),
+            };
+            // Leaf corners are not guaranteed to be a parallelogram, so split
+            // the quad explicitly rather than reusing the quad path.
+            b.push(c0, c1, c2, normal, material::VEGETATION);
+            b.push(c0, c2, c3, normal, material::VEGETATION);
         }
     }
 }

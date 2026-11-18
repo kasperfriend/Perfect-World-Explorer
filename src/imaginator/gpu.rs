@@ -505,7 +505,10 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
      bv = sun_visibility(bp, bn, &seed);
     }
     let incoming = p.sun_color.rgb * (bl * bv) + sky(bn.y);
-    indirect = indirect + weight * incoming;
+    // Weighted by the hit surface's albedo too. Omitting it treats every bounce
+    // surface as a perfect white reflector, over-brightening by 1/albedo -
+    // terrain at 0.22 came out 4.5x too bright, which is the white ground.
+    indirect = indirect + weight * bm.rgb * incoming;
     weight = weight * bm.rgb;
     if max(weight.r, max(weight.g, weight.b)) < 0.02 { break; }
     origin = bp + bn * 0.02;
