@@ -94,8 +94,8 @@ writes, because this one uses the bare spelling.
 
 ## Package inventory
 
-Fourteen staged packages, every entry decoded and checked against the length its
-record declares — 11 864 entries, 0 failures:
+Fifteen staged packages, every entry decoded and checked against the length its
+record declares — 12 751 entries, 0 failures:
 
 | pack | container | entries | bytes out |
 |---|---|---|---|
@@ -111,6 +111,7 @@ record declares — 11 864 entries, 0 failures:
 | `configs.pck` (1.3.6) | retail v2 | 66 | 3 160 870 |
 | `configs.pck` (1.5.2) | retail v2 | 58 | 2 179 038 |
 | `script.pck` (small) | retail v2 | 32 | 51 717 |
+| `textures.pck` | retail v2 | 887 | — |
 | `fonts.pck` | retail v2 | 2 | 8 242 268 |
 | `script.pck` (1.5.2) | Angelica | 2 | 9 |
 
@@ -121,17 +122,17 @@ version or the content type.
 ## Reading the files inside
 
 A directory that parses proves nothing about its members, so the `content` mode
-runs the owning reader over each one. Over the same corpus: **4 297 members
-read, 2 failed**.
+runs the owning reader over each one. Over the same corpus: **9 188 members
+read, 3 failed**.
 
 | extension | count | check |
 |---|---|---|
-| `gfx` | 3946 | `gfx_file::parse` after a GBK decode |
+| `gfx` | 3944 | `gfx_file::parse` after a GBK decode |
 | `spt` | 100 | `__IdvSpt_0` magic at offset 8 (no parser: SpeedTree source) |
 | `bon`, `ski` | 148 | length; containers with no leaf parser here |
 | `sdr` | 60 | shader text |
 | `mox` | 44 | `MOXBFRAME:` magic — **no reader in this project** |
-| `dds`,`tga`,`bmp`,`jpg` | 3951 | magic and header, not pixels |
+| `dds`,`tga`,`bmp`,`jpg` | 4891 | magic and header, not pixels |
 
 Images are checked by header rather than by pixel: the offline toolchain has
 only a stub `image`, but DDS carries a magic and a 124-byte header, TGA a type
@@ -139,10 +140,10 @@ field, BMP and JPEG their own magics, which is enough to catch truncation.
 
 | extension | count | result |
 |---|---|---|
-| `dds` | 3021 | 3020 valid; **1 is machine code** (below) |
-| `tga` | 691 | all valid |
-| `bmp` | 213 | all valid |
-| `jpg` | 26 | all valid |
+| `dds` | 3604 | 3603 valid; **1 is machine code** (below) |
+| `tga` | 856 | all valid |
+| `bmp` | 404 | all valid |
+| `jpg` | 27 | all valid |
 
 Three members across the corpus are named exceptions rather than reader faults,
 and are excluded from the exit status:
