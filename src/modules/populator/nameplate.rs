@@ -294,15 +294,8 @@ pub fn install_client_cjk(ctx: &egui::Context, element: &Path) {
         fonts
             .font_data
             .insert(KEY.into(), egui::FontData::from_owned(file.bytes));
-        for family in [
-            egui::FontFamily::Proportional,
-            egui::FontFamily::Monospace,
-        ] {
-            fonts
-                .families
-                .entry(family)
-                .or_default()
-                .push(KEY.into());
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push(KEY.into());
         }
     });
 }

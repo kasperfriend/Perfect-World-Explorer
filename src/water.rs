@@ -226,7 +226,10 @@ impl WaterArea {
         let (shore_waves, next) = match parse_shore_waves(b, wave_start) {
             Ok((waves, next)) => (waves, next),
             Err(error) => {
-                crate::diag!(SceneWater, "water {export_id}: shoreline data unavailable: {error}");
+                crate::diag!(
+                    SceneWater,
+                    "water {export_id}: shoreline data unavailable: {error}"
+                );
                 (Vec::new(), b.len())
             }
         };
@@ -479,7 +482,11 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
             let resolved = match resolve_case_insensitive(dir, path) {
                 Ok(path) => path,
                 Err(error) => {
-                    crate::diag!(SceneWater, "water {}: BSData {index} unavailable: {error}", r.export_id);
+                    crate::diag!(
+                        SceneWater,
+                        "water {}: BSData {index} unavailable: {error}",
+                        r.export_id
+                    );
                     loaded_index = Some(index);
                     loaded.clear();
                     continue;
@@ -489,7 +496,11 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
             match fs::read(resolved) {
                 Ok(bytes) => loaded = bytes,
                 Err(error) => {
-                    crate::diag!(SceneWater, "water {}: BSData {index} unavailable: {error}", r.export_id);
+                    crate::diag!(
+                        SceneWater,
+                        "water {}: BSData {index} unavailable: {error}",
+                        r.export_id
+                    );
                     loaded_index = Some(index);
                     continue;
                 }
