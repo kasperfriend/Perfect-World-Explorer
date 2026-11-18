@@ -5422,8 +5422,9 @@ pub fn run(
     // the client's own font each such glyph is a tofu box: `Entering` over a
     // Chinese-named area read `Entering _ _ _`, three boxes for three
     // characters. Nameplates installed a CJK face for their own labels only,
-    // which is why overhead names were fine and the banner was not.
-    crate::modules::install_client_cjk(&egui_ctx, &element_dir);
+    // which is why overhead names were fine and the banner was not. The face is
+    // registered on the first frame -- see `ui_fonts_installed` below.
+    let mut ui_fonts_installed = false;
     let mut egui_state = egui_winit::State::new(
         egui_ctx.clone(),
         egui::ViewportId::ROOT,
@@ -7091,6 +7092,18 @@ pub fn run(
                                 || xess_fg_failed
                                 || dlss_fg_failed;
                             if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
+                                // The interface font is installed here, on the
+                                // first frame, and not next to
+                                // `Context::default()`: `ctx.set_fonts` keys its
+                                // font atlas by pixels-per-point, which is only
+                                // known once a frame supplies it, and
+                                // `ctx.fonts()` panics until then. Doing it at
+                                // the first `run` is both valid and correctly
+                                // scaled, and costs one frame of Latin faces.
+                                if !ui_fonts_installed {
+                                    crate::modules::install_client_cjk(&egui_ctx, &element_dir);
+                                    ui_fonts_installed = true;
+                                }
                                 let input=egui_state.take_egui_input(&window);
                                 let output=egui_ctx.run(input,|ctx| {
                                     // A replacement-process handoff leaves this

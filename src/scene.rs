@@ -223,8 +223,25 @@ impl Scene {
         Self::parse(&b)
     }
     pub fn parse(b: &[u8]) -> Result<Self, String> {
-        if u32at(b, 0)? != 0x45435744 || u32at(b, 4)? != 12 {
-            return Err("only ECWLD version 12 is supported".into());
+        let version = match (u32at(b, 0), u32at(b, 4)) {
+            (Ok(0x45435744), Ok(version)) => version,
+            (Ok(identity), _) => {
+                return Err(format!(
+                    "this is not a world file: it starts with {identity:#010x}, not the ECWLD id"
+                ))
+            }
+            _ => return Err("the world file is shorter than its header".into()),
+        };
+        // The header grew by fields up to v12 and has not changed since, so
+        // anything at or above it parses with the same layout, and `p !=
+        // data.len()` below still catches a block list that does not add up.
+        // 1.5.2 and 1.8.4 both write 12; a gate that named one exact number
+        // read "only ECWLD version 12 is supported" for a later client that
+        // changed it.
+        if version < 12 {
+            return Err(format!(
+                "this world file is ECWLD version {version}; this build reads version 12 and later"
+            ));
         }
         let width = f32at(b, 8)?;
         let length = f32at(b, 12)?;
@@ -640,6 +657,28 @@ mod tests {
     #[test]
     fn rejects_bad_header() {
         assert!(Scene::parse(&[0; 116]).is_err());
+    }
+    #[test]
+    fn the_version_gate_says_which_version_it_saw() {
+        // 1.8.4 was refused with the bare sentence "only ECWLD version 12 is
+        // supported", which does not say what the file held or what the build
+        // wanted. The gate now names both, and anything at or above 12 is
+        // attempted rather than refused by number.
+        let mut b = vec![0u8; 116];
+        b[0..4].copy_from_slice(&0x45435744u32.to_le_bytes());
+        b[4..8].copy_from_slice(&13u32.to_le_bytes());
+        let newer = Scene::parse(&b).unwrap_err();
+        assert!(!newer.contains("only ECWLD"), "{newer}");
+        assert!(!newer.contains("version 13"), "13 is attempted: {newer}");
+
+        b[4..8].copy_from_slice(&7u32.to_le_bytes());
+        let older = Scene::parse(&b).unwrap_err();
+        assert!(older.contains("version 7"), "{older}");
+        assert!(older.contains("version 12"), "{older}");
+
+        b[0..4].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
+        let not_a_world = Scene::parse(&b).unwrap_err();
+        assert!(not_a_world.contains("not a world file"), "{not_a_world}");
     }
     #[test]
     fn rejects_short_string() {
