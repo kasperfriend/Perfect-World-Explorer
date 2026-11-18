@@ -48,7 +48,7 @@ grep -q 'reflection = reflection \* reflectivity;' "$PACKER" \
 # is the white ground.
 grep -q 'indirect += weight \* a \* incoming;' "$PACKER" \
   || fail "the CPU tracer must weight a bounce by the hit surface's albedo"
-grep -q 'indirect += weight \* material_of(h.primitive).rgb \* incoming;' "$SHADER" \
+grep -q 'indirect += weight \* material_of(h.primitive, h.bary).rgb \* incoming;' "$SHADER" \
   || fail "the DXIL shader must weight a bounce by the hit surface's albedo"
 
 # 5. The water switch has to reach every tracer. It was a checkbox that was

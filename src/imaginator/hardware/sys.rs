@@ -169,9 +169,7 @@ impl D3D12_RAYTRACING_INSTANCE_DESC {
         Self {
             Transform: [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.],
             InstanceIDAndMask: 0xff << 24,
-            ContributionAndFlags: (INSTANCE_FLAG_FORCE_OPAQUE
-                | INSTANCE_FLAG_TRIANGLE_CULL_DISABLE)
-                << 24,
+            ContributionAndFlags: INSTANCE_FLAG_TRIANGLE_CULL_DISABLE << 24,
             AccelerationStructure: acceleration_structure,
         }
     }
@@ -631,10 +629,10 @@ unsafe fn blob_text(blob: *mut ID3DBlob) -> String {
 ///
 /// The shader declares `ConstantBuffer<Params> : register(b0)`, a
 /// `RaytracingAccelerationStructure` on `t0`, two `Buffer<float4>` on `t1` and
-/// `t2`, and `RWTexture2D<float4>` on `u0`, so the signature is:
+/// `t2`, a `Buffer<uint>` on `t3`, and `RWTexture2D<float4>` on `u0`, so the signature is:
 ///
 /// * parameter 0 — a CBV at `b0`, the shader's `Params` block (ten vec4s);
-/// * parameter 1 — a descriptor table of three SRVs covering `t0..t2`;
+/// * parameter 1 — a descriptor table of four SRVs covering `t0..t3`;
 /// * parameter 2 — a descriptor table of one UAV at `u0`.
 ///
 /// Returns the signature, or the serialiser's own complaint.
@@ -644,7 +642,7 @@ unsafe fn blob_text(blob: *mut ID3DBlob) -> String {
 pub unsafe fn create_trace_root_signature(device: *mut c_void) -> Result<*mut c_void, String> {
     let srv = [D3D12_DESCRIPTOR_RANGE {
         RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-        NumDescriptors: 3,
+        NumDescriptors: 4,
         BaseShaderRegister: 0,
         RegisterSpace: 0,
         OffsetInDescriptorsFromTableStart: 0,
@@ -1127,6 +1125,37 @@ pub unsafe fn write_buffer_srv(
     write(device, resource, &desc, handle);
 }
 
+/// Typed R32_UINT buffer SRV used for packed UV, atlas and texel data.
+/// # Safety
+/// `device`, `resource`, and the descriptor handle must remain live.
+pub unsafe fn write_uint_buffer_srv(
+    device: *mut c_void,
+    resource: *mut c_void,
+    num_elements: u32,
+    handle: usize,
+) {
+    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: 42, // DXGI_FORMAT_R32_UINT
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Buffer: D3D12_BUFFER_UAV {
+            FirstElement: 0,
+            NumElements: num_elements,
+            StructureByteStride: 0,
+            CounterOffsetInBytes: 0,
+            Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+        },
+    };
+    let vtable = *(device as *mut *const usize);
+    let write: unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *const D3D12_SHADER_RESOURCE_VIEW_DESC,
+        usize,
+    ) = std::mem::transmute(*vtable.add(DEVICE_CREATE_SHADER_RESOURCE_VIEW));
+    write(device, resource, &desc, handle);
+}
+
 /// `ID3D12Device::CreateUnorderedAccessView` (slot 20), buffer form.
 ///
 /// # Safety
@@ -1567,7 +1596,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>(), 64);
         let instance = D3D12_RAYTRACING_INSTANCE_DESC::identity(0x1234);
         assert_eq!(instance.InstanceIDAndMask, 0xff000000);
-        assert_eq!(instance.ContributionAndFlags, 0x05000000);
+        assert_eq!(instance.ContributionAndFlags, 0x01000000);
         assert_eq!(instance.AccelerationStructure, 0x1234);
         assert_eq!(TYPE_TOP_LEVEL, 0);
         assert_eq!(TYPE_BOTTOM_LEVEL, 1);

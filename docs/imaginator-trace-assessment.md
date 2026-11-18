@@ -15,10 +15,11 @@ This describes the implementation, not a claim of full world parity.
   grass is captured as static textured triangles under a 100,000-triangle cap;
   its wind and later residency changes are not captured. Streamed texture atlases
   have a 256 MiB limit; a missing atlas falls back to flat colour.
-* CPU ray traversal uses foliage and captured scenery alpha cutouts. DXR builds
-  opaque geometry and uses constant per-triangle material colours, so foliage
-  cutouts and per-hit texture detail are not represented. Both paths are ray
-  tracing, but neither currently reproduces the entire existing world.
+* CPU ray traversal uses foliage and captured scenery alpha cutouts. DXR now
+  packs captured texture/UV data and evaluates non-opaque triangle candidates,
+  including shadow rays, using per-hit barycentrics. This DXR path has not been
+  verified on physical hardware. Terrain still uses per-triangle preview colours.
+  Both paths cast rays, but neither reproduces the entire existing world.
 * The traced image is bilinearly scaled by the compositor. FSR/XeSS/DLSS temporal
   upscalers and their frame generators were gated because their existing inputs
   are raster depth and motion; those buffers are stale when the world raster is

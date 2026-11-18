@@ -159,6 +159,7 @@ pub mod support {
             _params: &[u8],
             _normals: &[u8],
             _materials: &[u8],
+            _surfaces: &[u8],
         ) -> Result<Vec<f32>, String> {
             Err("this build has no D3D12 ray-tracing device".into())
         }

@@ -39,6 +39,7 @@ ConstantBuffer<Params> p : register(b0);
 RaytracingAccelerationStructure scene : register(t0);
 Buffer<float4> tri_normals : register(t1);   // xyz normal, w material index
 Buffer<float4> materials : register(t2);     // rgb albedo, a specular
+Buffer<uint> surface_data : register(t3);       // UVs, atlas metadata, RGBA8 pixels
 RWTexture2D<float4> out_tex : register(u0);
 
 static const uint TERM_REFLECTIONS = 1u;
@@ -73,6 +74,43 @@ float3 sky(float up)
     return lerp(p.sky_horizon.rgb, p.sky_up.rgb, float3(t, t, t));
 }
 
+// The CPU packs primitive UVs and atlas slots, then texture descriptors and
+// RGBA8 texels in one R32_UINT buffer. Untextured primitives use UINT_MAX.
+bool texture_sample(uint primitive, float2 bary, out float4 rgba, out uint cutoff)
+{
+    rgba = float4(1, 1, 1, 1);
+    cutoff = 0xffffffffu;
+    if (primitive >= surface_data[0]) { return false; }
+    uint base = 4u + primitive * 12u;
+    uint texture_id = surface_data[base + 10u];
+    if (texture_id == 0xffffffffu || texture_id >= surface_data[1]) { return false; }
+    uint desc = surface_data[2] + texture_id * 4u;
+    uint offset = surface_data[desc];
+    uint width = surface_data[desc + 1u];
+    uint height = surface_data[desc + 2u];
+    if (width == 0u || height == 0u) { return false; }
+    float2 uv0 = asfloat(uint2(surface_data[base], surface_data[base + 1u]));
+    float2 uv1 = asfloat(uint2(surface_data[base + 2u], surface_data[base + 3u]));
+    float2 uv2 = asfloat(uint2(surface_data[base + 4u], surface_data[base + 5u]));
+    float2 uv = uv0 * (1.0 - bary.x - bary.y) + uv1 * bary.x + uv2 * bary.y;
+    float2 origin = asfloat(uint2(surface_data[base + 6u], surface_data[base + 7u]));
+    float2 scale = asfloat(uint2(surface_data[base + 8u], surface_data[base + 9u]));
+    uv = frac(origin + frac(uv) * scale);
+    uint2 xy = min(uint2(uv * float2(width, height)), uint2(width - 1u, height - 1u));
+    uint pixel = surface_data[offset + xy.y * width + xy.x];
+    rgba = float4(pixel & 255u, (pixel >> 8u) & 255u, (pixel >> 16u) & 255u, (pixel >> 24u) & 255u) / 255.0;
+    cutoff = surface_data[base + 11u];
+    return true;
+}
+
+bool accepts_candidate(uint primitive, float2 bary)
+{
+    float4 rgba;
+    uint cutoff;
+    if (!texture_sample(primitive, bary, rgba, cutoff) || cutoff == 0xffffffffu) { return true; }
+    return rgba.a * 255.0 > float(cutoff);
+}
+
 // One cone-jittered shadow ray, traced by the hardware traversal units.
 float sun_visibility(float3 position, float3 normal, inout uint seed)
 {
@@ -90,7 +128,11 @@ float sun_visibility(float3 position, float3 normal, inout uint seed)
     ray.TMax = p.screen.z;
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
     q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
-    q.Proceed();
+    while (q.Proceed())
+    {
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && accepts_candidate(q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics()))
+            q.CommitNonOpaqueTriangleHit();
+    }
     return q.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
 }
 
@@ -118,7 +160,11 @@ float3 point_lighting(float3 position, float3 normal, uint terms)
             ray.TMax = max(d * 0.999 - 0.02, 0.0);
             RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
             q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
-            q.Proceed();
+            while (q.Proceed())
+            {
+                if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && accepts_candidate(q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics()))
+                    q.CommitNonOpaqueTriangleHit();
+            }
             if (q.CommittedStatus() != COMMITTED_NOTHING) { continue; }
         }
         float window = 1.0 - d2 / r2;
@@ -133,6 +179,7 @@ struct Hit
     float t;
     float3 normal;
     uint primitive;
+    float2 bary;
     bool hit;
 };
 
@@ -148,20 +195,36 @@ Hit closest(float3 origin, float3 dir)
     ray.TMax = p.screen.z;
     RayQuery<RAY_FLAG_NONE> q;
     q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
-    q.Proceed();
+    while (q.Proceed())
+    {
+        if (q.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE && accepts_candidate(q.CandidatePrimitiveIndex(), q.CandidateTriangleBarycentrics()))
+            q.CommitNonOpaqueTriangleHit();
+    }
 
     Hit h;
     h.hit = q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
     h.t = h.hit ? q.CommittedRayT() : p.screen.z;
     h.primitive = h.hit ? q.CommittedPrimitiveIndex() : 0u;
     h.normal = h.hit ? tri_normals[h.primitive].xyz : float3(0, 1, 0);
+    h.bary = float2(0, 0);
+    if (h.hit) { h.bary = q.CommittedTriangleBarycentrics(); }
     return h;
 }
 
-float4 material_of(uint primitive)
+float4 material_of(uint primitive, float2 bary)
 {
     uint index = uint(tri_normals[primitive].w);
-    return materials[index];
+    float4 mat = materials[index];
+    float4 rgba;
+    uint cutoff;
+    if (texture_sample(primitive, bary, rgba, cutoff))
+    {
+        float3 c = rgba.rgb;
+        mat.rgb = float3(c.r <= 0.04045 ? c.r / 12.92 : pow((c.r + 0.055) / 1.055, 2.4),
+                         c.g <= 0.04045 ? c.g / 12.92 : pow((c.g + 0.055) / 1.055, 2.4),
+                         c.b <= 0.04045 ? c.b / 12.92 : pow((c.b + 0.055) / 1.055, 2.4));
+    }
+    return mat;
 }
 
 // The material *id* of a primitive, which is what `bvh::material::WATER` names.
@@ -242,7 +305,7 @@ void cs(uint3 id : SV_DispatchThreadID)
             vis = sun_visibility(position, normal, seed);
         }
         visibility += vis;
-        float4 mat = material_of(hit.primitive);
+        float4 mat = material_of(hit.primitive, hit.bary);
         if ((terms & TERM_LIGHTING) != 0u)
         {
             lamps += mat.rgb * point_lighting(position, normal, terms);
@@ -285,8 +348,8 @@ void cs(uint3 id : SV_DispatchThreadID)
                 // light. Omitting it makes every bounce surface a perfect white
                 // reflector and over-brightens by 1/albedo: terrain is 0.22, so
                 // its indirect term came out 4.5x too strong.
-                indirect += weight * material_of(h.primitive).rgb * incoming;
-                weight *= material_of(h.primitive).rgb;
+                indirect += weight * material_of(h.primitive, h.bary).rgb * incoming;
+                weight *= material_of(h.primitive, h.bary).rgb;
                 if (max(weight.r, max(weight.g, weight.b)) < 0.02) { break; }
                 origin = bp + bn * 0.02;
                 n = bn;
@@ -325,7 +388,7 @@ void cs(uint3 id : SV_DispatchThreadID)
                     float3 hp = origin + mirror * h.t;
                     float3 hn = normalize(h.normal);
                     if (dot(hn, mirror) > 0.0) { hn = -hn; }
-                    float4 hm = material_of(h.primitive);
+                    float4 hm = material_of(h.primitive, h.bary);
                     gathered += through * (hm.rgb * surface_light(hp, hn, terms, seed));
                     through *= hm.a;
                     if (max(through.r, max(through.g, through.b)) < 0.02) { break; }

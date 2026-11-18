@@ -232,7 +232,7 @@ pub struct Imaginator {
     /// Captured world geometry, shared with the software worker.
     scene: SharedScene,
     /// CPU-side DXR material and normal records, rebuilt only when the scene changes.
-    hardware_records: Option<(u64, Vec<u8>, Vec<u8>)>,
+    hardware_records: Option<(u64, Vec<u8>, Vec<u8>, Vec<u8>)>,
     /// The mode of the trace currently in the composite target.
     trace_output: Option<settings::Output>,
     logged_dxil: Option<u64>,
@@ -293,9 +293,9 @@ enum CaptureState {
     Done,
 }
 
-/// DXR currently uses one constant material per primitive. Bake the bounded
-/// captured textures at triangle centroids; foliage cutouts and detailed textures
-/// still require a separate GPU texture/any-hit implementation.
+/// Pack material records. Terrain has a bounded world-aligned preview and is
+/// still approximated at triangle centroids; per-hit texture surfaces override
+/// these material colours in the DXR shader.
 fn pack_hardware_materials(bvh: &bvh::Bvh, source: &[bvh::Material]) -> (Vec<u8>, Vec<u8>) {
     let mut normals = Vec::with_capacity(bvh.triangles.len() * 16);
     let mut materials = Vec::with_capacity(source.len() * 16);
@@ -333,6 +333,92 @@ fn pack_hardware_materials(bvh: &bvh::Bvh, source: &[bvh::Material]) -> (Vec<u8>
         }
     }
     (normals, materials)
+}
+
+/// Typed R32_UINT buffer: four header words, twelve words per primitive,
+/// four per texture and tightly packed RGBA8 pixels. Shared atlases are emitted
+/// once even when several streamed pages refer to the same Arc.
+fn pack_hardware_surfaces(bvh: &bvh::Bvh) -> Result<Vec<u8>, String> {
+    let primitive_count = bvh.triangles.len();
+    let dir = 4usize
+        .checked_add(
+            primitive_count
+                .checked_mul(12)
+                .ok_or("surface size overflow")?,
+        )
+        .ok_or("surface size overflow")?;
+    let header_words = dir
+        .checked_add(
+            bvh.textures
+                .len()
+                .checked_mul(4)
+                .ok_or("texture table overflow")?,
+        )
+        .ok_or("texture table overflow")?;
+    if header_words > u32::MAX as usize {
+        return Err("hardware surface table too large".into());
+    }
+    let mut words = vec![0u32; header_words];
+    words[0] = primitive_count as u32;
+    words[1] = bvh.textures.len() as u32;
+    words[2] = dir as u32;
+    for i in 0..primitive_count {
+        words[4 + i * 12 + 10] = u32::MAX;
+    }
+    for (&index, surface) in bvh.surfaces.iter() {
+        if index as usize >= primitive_count || surface.texture as usize >= bvh.textures.len() {
+            continue;
+        }
+        let base = 4 + index as usize * 12;
+        for (i, v) in surface.uv.iter().flatten().enumerate() {
+            words[base + i] = v.to_bits();
+        }
+        for (i, v) in surface
+            .atlas_rect
+            .unwrap_or([0., 0., 1., 1.])
+            .iter()
+            .enumerate()
+        {
+            words[base + 6 + i] = v.to_bits();
+        }
+        words[base + 10] = surface.texture;
+        words[base + 11] = surface.alpha_cutoff.map_or(u32::MAX, u32::from);
+    }
+    let mut offsets = std::collections::HashMap::<usize, u32>::new();
+    for (i, texture) in bvh.textures.iter().enumerate() {
+        let expected = (texture.width as usize)
+            .checked_mul(texture.height as usize)
+            .and_then(|v| v.checked_mul(4))
+            .ok_or("texture size overflow")?;
+        if expected == 0 || expected != texture.rgba.len() {
+            continue;
+        }
+        let key = Arc::as_ptr(texture) as usize;
+        let offset = if let Some(offset) = offsets.get(&key) {
+            *offset
+        } else {
+            let end = words
+                .len()
+                .checked_add(expected / 4)
+                .ok_or("texture payload overflow")?;
+            if end > u32::MAX as usize {
+                return Err("hardware texture data exceeds 32-bit addressing".into());
+            }
+            let offset = words.len() as u32;
+            words.extend(
+                texture
+                    .rgba
+                    .chunks_exact(4)
+                    .map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]])),
+            );
+            offsets.insert(key, offset);
+            offset
+        };
+        words[dir + i * 4] = offset;
+        words[dir + i * 4 + 1] = texture.width;
+        words[dir + i * 4 + 2] = texture.height;
+    }
+    Ok(words.into_iter().flat_map(u32::to_le_bytes).collect())
 }
 
 impl Imaginator {
@@ -1087,7 +1173,7 @@ impl Imaginator {
         if self
             .hardware_records
             .as_ref()
-            .is_none_or(|(generation, _, _)| *generation != self.generation)
+            .is_none_or(|(generation, _, _, _)| *generation != self.generation)
         {
             let bvh = self
                 .scene
@@ -1095,7 +1181,8 @@ impl Imaginator {
                 .as_ref()
                 .ok_or("this world has no captured geometry")?;
             let (normals, materials) = pack_hardware_materials(bvh, &self.scene.materials);
-            self.hardware_records = Some((self.generation, normals, materials));
+            let surfaces = pack_hardware_surfaces(bvh)?;
+            self.hardware_records = Some((self.generation, normals, materials, surfaces));
         }
         // The top-level structure for the traversal. This build is the one place
         // the hardware path can stall, so it happens before the dispatch and its
@@ -1164,12 +1251,14 @@ impl Imaginator {
             block[start + 4..start + 8].copy_from_slice(&light.colour);
         }
         let bytes: Vec<u8> = block.iter().flat_map(|value| value.to_ne_bytes()).collect();
-        let (_, normals, materials) = self
+        let (_, normals, materials, surfaces) = self
             .hardware_records
             .as_ref()
             .expect("records were just built");
         hardware
-            .trace_frame(&blob, tlas, width, height, &bytes, normals, materials)
+            .trace_frame(
+                &blob, tlas, width, height, &bytes, normals, materials, surfaces,
+            )
             .map_err(|why| format!("{why} (DXIL FNV64 {blob_hash:016x}, {} bytes)", blob.len()))
     }
 
@@ -1623,7 +1712,7 @@ impl Imaginator {
             }
         });
         if self.settings.output == settings::Output::TraceOnly {
-            ui.label("Experimental full trace: software samples tree cutouts, building textures and approximate terrain colour. DXR textures are sampled per triangle; DXR cutouts and effect geometry remain unsupported. World raster and temporal upscaling are disabled in this view.");
+            ui.label("Experimental full trace: captured trees, grass and buildings use texture cutouts; terrain colour remains approximate. DXR texture traversal is runtime-unverified; animated objects and effect geometry remain unsupported. World raster and temporal upscaling are disabled in this view.");
             changed |= ui
                 .add(
                     egui::Slider::new(&mut self.settings.exposure, 0.05..=8.0)
@@ -2001,6 +2090,52 @@ mod tests {
                 "{declaration} must not run without traced depth and motion"
             );
         }
+    }
+
+    #[test]
+    fn hardware_surface_buffer_preserves_uv_cutoff_and_deduplicates_atlases() {
+        use super::{bvh, math::v3, pack_hardware_surfaces};
+        use std::sync::Arc;
+        let tri = bvh::Triangle {
+            a: v3(0., 0., 0.),
+            b: v3(1., 0., 0.),
+            c: v3(0., 0., 1.),
+            normal: v3(0., 1., 0.),
+            material: bvh::material::VEGETATION,
+        };
+        let mut tree = bvh::Bvh::build(vec![tri, tri]);
+        let tex = Arc::new(bvh::Texture {
+            width: 2,
+            height: 1,
+            rgba: vec![1, 2, 3, 0, 5, 6, 7, 255],
+        });
+        tree.textures = Arc::new(vec![tex.clone(), tex]);
+        tree.surfaces = Arc::new(
+            [(
+                0,
+                bvh::TexturedTriangle {
+                    uv: [[0., 0.], [2., 0.], [0., 1.]],
+                    texture: 1,
+                    atlas_rect: Some([0.5, 0., 0.5, 1.]),
+                    alpha_cutoff: Some(127),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let data = pack_hardware_surfaces(&tree).unwrap();
+        let word = |i: usize| u32::from_le_bytes(data[4 * i..4 * i + 4].try_into().unwrap());
+        assert_eq!(word(0), 2);
+        assert_eq!(word(1), 2);
+        assert_eq!(word(2), 28);
+        assert_eq!(word(14), 1);
+        assert_eq!(word(15), 127);
+        assert_eq!(word(26), u32::MAX);
+        assert_eq!(word(28), word(32));
+        assert_eq!(word(29), 2);
+        assert_eq!(word(word(28) as usize), 0x00030201);
+        assert_eq!(word(word(28) as usize + 1), 0xff070605);
+        assert_eq!(data.len(), (36 + 2) * 4);
     }
 
     #[test]

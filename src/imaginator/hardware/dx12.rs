@@ -170,6 +170,7 @@ pub struct HardwareTracer {
     /// Immutable shader records for the current acceleration structure.
     trace_normals: Option<Resource>,
     trace_materials: Option<Resource>,
+    trace_surfaces: Option<Resource>,
 }
 
 /// The compute pipeline that runs the DXIL trace shader.
@@ -237,6 +238,7 @@ impl HardwareTracer {
             pipeline: None,
             trace_normals: None,
             trace_materials: None,
+            trace_surfaces: None,
         };
         let Ok((raw_device, raw_queue)) = crate::fsr::raw_dx12(device) else {
             tracer.status = HardwareStatus::Unsupported(
@@ -435,6 +437,7 @@ impl HardwareTracer {
                 self.structures = Some(structures);
                 self.trace_normals = None;
                 self.trace_materials = None;
+                self.trace_surfaces = None;
                 self.built_for = Some(scene.clone());
                 Ok(address)
             }
@@ -527,6 +530,7 @@ impl HardwareTracer {
         params: &[u8],
         normals: &[u8],
         materials: &[u8],
+        surfaces: &[u8],
     ) -> Result<Vec<f32>, String> {
         self.ensure_pipeline(dxil)?;
         if tlas == 0 {
@@ -558,6 +562,11 @@ impl HardwareTracer {
             self.trace_materials =
                 Some(self.upload_bytes(materials, "imaginator trace materials")?);
         }
+        if self.trace_surfaces.is_none() {
+            self.trace_surfaces =
+                Some(self.upload_bytes(surfaces, "imaginator texture and UV data")?);
+        }
+        let surfaces_buffer = self.trace_surfaces.as_ref().expect("surfaces uploaded");
         let normals_buffer = self.trace_normals.as_ref().expect("normals uploaded");
         let materials_buffer = self.trace_materials.as_ref().expect("materials uploaded");
         let output = self.create_output_texture(width, height)?;
@@ -568,15 +577,15 @@ impl HardwareTracer {
             "imaginator trace readback",
         )?;
 
-        // 2. One shader-visible heap: an unused slot, three SRVs (TLAS,
-        //    normals, materials) and a UAV. The CBV is a root descriptor.
-        let heap = unsafe { sys::create_descriptor_heap(self.device.as_ptr() as *mut c_void, 5) }
+        // 2. One shader-visible heap: an unused slot, four SRVs (TLAS,
+        //    normals, materials, texture data) and a UAV. The CBV is a root descriptor.
+        let heap = unsafe { sys::create_descriptor_heap(self.device.as_ptr() as *mut c_void, 6) }
             .map_err(|why| why.to_string())?;
         let (cpu_start, gpu_start) = unsafe { sys::heap_handles(heap) };
         let increment =
             unsafe { sys::descriptor_increment(self.device.as_ptr() as *mut c_void) } as usize;
         let slot = |index: usize| cpu_start + index * increment;
-        // SAFETY: the heap has five slots and each write targets one of them; the
+        // SAFETY: the heap has six slots and each write targets one of them; the
         // resources are alive for the whole call.
         unsafe {
             // The TLAS is a `RaytracingAccelerationStructure` on t0. Its view is
@@ -600,10 +609,16 @@ impl HardwareTracer {
                 MATERIALS_STRIDE as u32,
                 slot(3),
             );
+            sys::write_uint_buffer_srv(
+                self.device.as_ptr() as *mut c_void,
+                surfaces_buffer.as_mut_ptr() as *mut c_void,
+                (surfaces.len() / 4) as u32,
+                slot(4),
+            );
             sys::write_texture_uav(
                 self.device.as_ptr() as *mut c_void,
                 output.as_mut_ptr() as *mut c_void,
-                slot(4),
+                slot(5),
             );
         }
 
@@ -640,8 +655,8 @@ impl HardwareTracer {
                 0,
                 sys::gpu_virtual_address(params_buffer.as_mut_ptr() as *mut c_void),
             );
-            // Root parameter 1 is the SRV table (t0..t2, at heap slots 1..3) and
-            // parameter 2 the UAV (slot 4).
+            // Root parameter 1 is the SRV table (t0..t3, at heap slots 1..4) and
+            // parameter 2 the UAV (slot 5).
             sys::set_compute_root_descriptor_table(
                 list as *mut c_void,
                 1,
@@ -650,7 +665,7 @@ impl HardwareTracer {
             sys::set_compute_root_descriptor_table(
                 list as *mut c_void,
                 2,
-                gpu_start + 4 * increment as u64,
+                gpu_start + 5 * increment as u64,
             );
             (*list).Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
             let to_copy = transition_barrier(
@@ -834,7 +849,7 @@ impl HardwareTracer {
         // the buffer's GPU address.
         let geometry_desc = sys::D3D12_RAYTRACING_GEOMETRY_DESC {
             Type: sys::GEOMETRY_TYPE_TRIANGLES,
-            Flags: sys::GEOMETRY_FLAG_OPAQUE,
+            Flags: 0, // non-opaque candidates must be alpha-tested by RayQuery
             Triangles: sys::D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
                 Transform3x4: 0,
                 IndexFormat: DXGI_FORMAT_UNKNOWN,
@@ -865,7 +880,7 @@ impl HardwareTracer {
             ScratchAccelerationStructureData: scratch.gpu_virtual_address(),
         };
         unsafe { self.record_and_wait(&blas_desc)? };
-        // 2. One opaque instance over that BLAS.
+        // 2. One non-opaque instance; RayQuery evaluates texture cutouts.
         let instance = sys::D3D12_RAYTRACING_INSTANCE_DESC::identity(blas.gpu_virtual_address());
         let mut instance_bytes =
             vec![0u8; std::mem::size_of::<sys::D3D12_RAYTRACING_INSTANCE_DESC>()];
