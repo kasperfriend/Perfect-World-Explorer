@@ -1,0 +1,64 @@
+[
+  {
+    "map": "a01",
+    "ecwld_version": 12,
+    "ecbsd_version": 12,
+    "ecwld_sha256": "a881846a13fc9cac2bc51f62b9954d2db618d6831bea1e6e241748e67f3f3c0e",
+    "ecbsd_sha256": "f444a02b03d35056952ca1b12209c708969675d4671c29733b7598930e21f074",
+    "status": "scene_catalog_only",
+    "blocks": 256,
+    "tree_types": 0,
+    "grass_types": 0,
+    "placements": {
+      "trees": 0,
+      "effects": 304,
+      "models": 0,
+      "critters": 0
+    },
+    "unique_refs": {
+      "water": 0,
+      "ornaments": 328,
+      "grass": 0,
+      "critters": 0
+    }
+  },
+  {
+    "map": "a02",
+    "ecwld_version": 12,
+    "ecbsd_version": 12,
+    "ecwld_sha256": "e1e5130d1f5b2c095f9538cb5e0c4080c99a8a1afb5869570661603d20a7abcc",
+    "ecbsd_sha256": "e14ed4220e97e5674308092dcaafbfc9b247bbb58c0daf831143458de38a396d",
+    "status": "scene_catalog_only",
+    "blocks": 256,
+    "tree_types": 0,
+    "grass_types": 0,
+    "placements": {
+      "trees": 0,
+      "effects": 42,
+      "models": 0,
+      "critters": 0
+    },
+    "unique_refs": {
+      "water": 0,
+      "ornaments": 32,
+      "grass": 0,
+      "critters": 0
+    }
+  },
+  {
+    "map": "s38",
+    "ecwld_version": 14,
+    "ecbsd_version": 15,
+    "ecwld_sha256": "62ab3ed5140034ec9ca1d3619cf04790eaa7d66caf7a7d2c0ee08c0d9466336c",
+    "ecbsd_sha256": "6ce8b6e8ab04ebbd4911c7f1f6f556b3a4a39d2a7782c4521b9b9cdfa9cbe4d7",
+    "status": "unsupported_version"
+  },
+  {
+    "map": "s40",
+    "ecwld_version": 14,
+    "ecbsd_version": 15,
+    "ecwld_sha256": "96e74f4720c37f98b48683446f986d4a494cfc4e18f81145a80e1c83ab543954",
+    "ecbsd_sha256": "3ef13e76cf4b901cf43d8caa2de16ddad407081090cbda593d09fa0f0f11af68",
+    "status": "unsupported_version"
+  }
+]

@@ -1,0 +1,85 @@
+name: Lighter retail coverage
+
+# Optional evidence, not a required PR check. Use the same public client tree
+# for maps and packages; never cache or upload client asset bytes.
+on:
+  workflow_dispatch:
+  # Bootstrap the run while this workflow is under review.
+  push:
+    paths: ['.github/workflows/lighter-retail.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    name: Capture a01 and a02 (Software RT on CPU Vulkan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch matching map files and packages
+        run: |
+          set -euo pipefail
+          while read -r id sha file; do
+            [[ -n "$id" && "$id" != \#* ]] || continue
+            path="${RUNNER_TEMP}/lighter-client/element/$file"
+            mkdir -p "$(dirname "$path")"
+            curl -fsSL --retry 2 --max-time 240 -o "$path" \
+              "https://drive.usercontent.google.com/download?id=$id&export=download&confirm=t" || {
+                echo "::error::Could not fetch $file from the public client tree"; exit 1;
+              }
+            if ! printf '%s  %s\n' "$sha" "$path" | sha256sum -c -; then
+              echo "::error::Unexpected bytes for $file; refusing mismatched client inputs"
+              exit 1
+            fi
+          done < tools/fixtures/lighter-retail-inputs.txt
+      - name: Install Linux renderer dependencies
+        run: |
+          sudo apt-get update -o Acquire::Retries=2
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxkbcommon-dev mesa-vulkan-drivers
+      - name: Build viewer
+        run: cargo build --locked --bin perfect-world-explorer
+      - name: Render and inventory both maps
+        env:
+          XDG_RUNTIME_DIR: ${{ runner.temp }}
+          PW_CACHE_DIR: ${{ runner.temp }}/lighter-cache
+          WGPU_BACKEND: vulkan
+          PW_PREVIEW_LIGHTER: software
+          PW_PREVIEW_COVERAGE: '1'
+          PW_PREVIEW_WARMUP: '24'
+        run: |
+          set -euo pipefail
+          mkdir -p target/lighter-retail
+          export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name '*lvp*' -print -quit)"
+          test -n "$VK_ICD_FILENAMES"
+          for map in a01 a02; do
+            stem="target/lighter-retail/${map}-software"
+            if ! target/debug/perfect-world-explorer "$RUNNER_TEMP/lighter-client" \
+                --world "$map" --gpu-preview "$stem.png" >"$stem.log" 2>&1; then
+              tail -25 "$stem.log" | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
+              exit 1
+            fi
+            test -s "$stem.png"
+            grep -Fx "map=\"$map\"" "$stem.coverage.txt"
+            for row in near_terrain buildings effect_roots; do
+              grep "^$row," "$stem.coverage.csv"
+            done
+            echo "::notice::$map $(grep '^rgba8_sha256=' "$stem.coverage.txt")"
+            {
+              echo "### $map — Software / lavapipe"
+              echo '```'
+              cat "$stem.coverage.txt" "$stem.coverage.csv"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lighter-retail-coverage
+          path: |
+            target/lighter-retail/*.png
+            target/lighter-retail/*.coverage.*
+          if-no-files-found: error

@@ -188,6 +188,14 @@ The native whole-world BMD preload, temporal upscalers and frame generation
 are paused while Lighter renders. Existing saved choices for those features
 are unchanged; Lighter uses the separate bounded BMD region described above.
 
+## Capture geometry coverage
+
+Set `PW_PREVIEW_COVERAGE=1` with an explicit Software or Hardware headless
+preview. Explorer writes the PNG and its per-map `coverage.csv` and
+`coverage.txt` sidecars. A failed selected map is not silently replaced with
+`world`. [Coverage guide](scene-coverage.md) explains the row units, skip and
+failure reasons, fixture, and how to run this on a matching retail client.
+
 ## Verification
 
 See [GPU completion and readback](performance-waits.md) for the Phase 0 wait

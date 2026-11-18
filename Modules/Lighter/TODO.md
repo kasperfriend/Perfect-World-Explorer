@@ -22,7 +22,7 @@ it does not set execution order.
 
 6. [x] **RT-01b:** Build a stable `ChunkId`/bounds/asset manifest from the loaded world. Warn on conservative placement bounds. Rank by distance, light paths and secondary-ray reach; budget/evict by rank and retain matching BLAS. Check joins and teleports for gaps or duplicates. See [the manifest tests](performance.md#ranked-scenery-manifest-step-6).
 7. [x] **RT-02b:** Compare coarse/native heights on a grid (mean/max, fail beyond about 0.5 world units), and silhouettes at 1–3° grazing incidence. Distinguish cutoff from failed loads and save results on at least two real maps. Verified for standalone heightfields and synthetic live seam geometry. See [S38/S40 results and remaining viewer checks](terrain-fidelity-2026-11-18.md).
-8. [ ] **RT-03:** Verify posed world, Walker and Populator feeds and refits. Keep bone-relative attachments as child instances. First-person hiding affects only primary rays. Count unsupported morph/supple/muscle data per map and check a moving off-camera NPC shadow.
+8. [x] **RT-03:** Use native poses and bone-relative child instances; first-person hiding applies only to primary rays. Software and CPU Vulkan verified hook movement, TLAS/BLAS updates and an off-camera NPC shadow. Count unsupported payloads in SKI files seen by each feed. See [fixture evidence and retail census limits](scene-coverage.md).
 9. [ ] **RT-04:** Count loaded/skipped/failed terrain, trees, buildings, water, models and effects, with missing-package, texture-fallback, unsupported and budget reasons. Include per-map captures and a fixture with saved expected counts.
 
 ### Phase 2 — Client fidelity
