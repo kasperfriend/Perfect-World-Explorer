@@ -13,7 +13,43 @@ use client_region_stream::{Change, Window};
 mod client_region_shade;
 pub use client_region_shade::frame_ms;
 use client_region_shade::{inverse_time, seconds, unpack_rgb, Channel};
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+};
+
+/// Instance maps name their EC-BSD after the map folder (`a01.ecbsd`), while
+/// the main world and stand-alone fixtures keep `world.ecbsd`. This local
+/// resolver keeps standalone diagnostic binaries independent of the viewer's
+/// world catalog module.
+fn ecbsd_path(dir: &Path) -> PathBuf {
+    let stem = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("world");
+    let named = dir.join(format!("{stem}.ecbsd"));
+    if named.is_file() {
+        named
+    } else {
+        dir.join("world.ecbsd")
+    }
+}
+
+/// Folder owning the shared archives. `dir` is normally `element/maps/<id>`;
+/// a direct map directory argument has the archive root as its parent.
+fn element_root(dir: &Path) -> PathBuf {
+    dir.parent()
+        .map(|parent| {
+            if parent.file_name() == Some(std::ffi::OsStr::new("maps")) {
+                parent.parent().unwrap_or(parent)
+            } else {
+                parent
+            }
+        })
+        .unwrap_or(dir)
+        .to_path_buf()
+}
 
 /// Client world day weight (1 = day, 0 = night).
 /// `4b60e0` produces the complementary night factor at object +0x70;
@@ -527,7 +563,7 @@ impl BoxArea {
 }
 impl Environments {
     pub fn load(scene: &Scene, dir: &Path) -> Result<Self, String> {
-        let b = fs::read(dir.join("world.ecbsd")).map_err(|e| e.to_string())?;
+        let b = fs::read(ecbsd_path(dir)).map_err(|e| e.to_string())?;
         let mut refs = BTreeMap::new();
         for block in &scene.blocks {
             for r in &block.boxes {
@@ -559,7 +595,8 @@ impl Environments {
         // AutoFamily fog is a scene-level fallback only. EC-BSD area fog stays
         // authoritative whenever an area is selected.
         let auto_fog = (|| -> Result<crate::sky_config::AutoFogConfig, String> {
-            let mut file = fs::File::open(dir.join("configs.pck")).map_err(|e| e.to_string())?;
+            let mut file =
+                fs::File::open(element_root(dir).join("configs.pck")).map_err(|e| e.to_string())?;
             // `configs.pck` is an Angelica File Package, not the retail v2 PCK
             // `textures.pck` uses. The retail reader rejects its guard, which
             // silently disabled the AutoFamily fog fallback.

@@ -1,7 +1,7 @@
 //! Automatic first-run setup for the 64-bit Windows viewer.
 //! The embedded PE32 bridge is required because the client's SpeedTree DLL is 32-bit.
 use std::{
-    ffi::{c_void, OsString},
+    ffi::{c_void, OsStr, OsString},
     fs::{self, OpenOptions},
     hash::{Hash, Hasher},
     io::Write,
@@ -110,16 +110,60 @@ pub fn choose_client(owner: Hwnd, initial: Option<&Path>) -> Result<Option<PathB
         result
     }
 }
-fn cache_key(element: &Path) -> Result<u64, String> {
+/// Case-insensitive file lookup for extracted client folders.
+fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    let exact = dir.join(name);
+    if exact.is_file() {
+        return Some(exact);
+    }
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))
+        .map(|e| e.path())
+}
+
+/// Default scene for callers that do not have a selected map. Prefer the
+/// canonical main world; a client shipping only instance maps still works.
+fn default_scene_file(element: &Path) -> PathBuf {
+    let maps = element.join("maps");
+    let main_world = maps.join("world");
+    if let Some(path) = find_file(&main_world, "world.ecwld") {
+        return path;
+    }
+    let mut dirs = fs::read_dir(&maps)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect::<Vec<_>>();
+    dirs.sort();
+    for dir in dirs {
+        let id = dir.file_name().and_then(OsStr::to_str).unwrap_or("world");
+        if let Some(path) =
+            find_file(&dir, &format!("{id}.ecwld")).or_else(|| find_file(&dir, "world.ecwld"))
+        {
+            return path;
+        }
+    }
+    element.join("maps/world/world.ecwld")
+}
+
+/// Cache identity includes the selected scene and its authored tree table
+/// size, not just the owning `element` folder and the main world's ECWLD.
+fn cache_key(element: &Path, scene_path: &Path, tree_type_count: usize) -> Result<u64, String> {
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    "PWTREE08-per-lod-leaf-corners-native-alpha-refs-v1".hash(&mut h);
+    "PWTREE09-selected-scene-variable-tree-count-v1".hash(&mut h);
     fs::canonicalize(element)
         .unwrap_or_else(|_| element.to_path_buf())
         .hash(&mut h);
-    for path in [
-        element.join("trees.pck"),
-        element.join("maps/world/world.ecwld"),
-    ] {
+    fs::canonicalize(scene_path)
+        .unwrap_or_else(|_| scene_path.to_path_buf())
+        .hash(&mut h);
+    tree_type_count.hash(&mut h);
+    for path in [element.join("trees.pck"), scene_path.to_path_buf()] {
         let m = fs::metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         m.len().hash(&mut h);
         if let Ok(time) = m.modified() {
@@ -132,19 +176,44 @@ fn cache_key(element: &Path) -> Result<u64, String> {
     BRIDGE.hash(&mut h);
     Ok(h.finish())
 }
-fn ready(dir: &Path) -> bool {
-    dir.join("ready").is_file() && (0..59).all(|i| dir.join(format!("tree-{i:03}.pwt")).is_file())
+
+/// A map with no tree types needs only its ready marker; other maps need one
+/// PWT per authored tree type. The legacy three-argument bridge expects 59.
+fn ready(dir: &Path, tree_type_count: usize) -> bool {
+    dir.join("ready").is_file()
+        && (0..tree_type_count).all(|i| dir.join(format!("tree-{i:03}.pwt")).is_file())
 }
+
 pub fn prepare_trees(element: &Path) -> Result<PathBuf, String> {
+    let scene_path = default_scene_file(element);
+    let scene = crate::scene::Scene::load(&scene_path)?;
+    prepare_trees_for_scene(element, &scene_path, scene.tree_types.len())
+}
+
+/// Prepare the tree cache from the selected map's ECWLD. Different maps
+/// reference different tree types, and some ship none at all. The embedded
+/// bridge is called first with an explicit count; an older checked-in
+/// three-argument bridge is supported by writing a padded 59-source table.
+pub fn prepare_trees_for_scene(
+    element: &Path,
+    scene_path: &Path,
+    tree_type_count: usize,
+) -> Result<PathBuf, String> {
+    if tree_type_count > 10000 {
+        return Err(format!(
+            "{scene_path} declares {tree_type_count} tree types; the SpeedTree bridge supports at most 10000",
+            scene_path = scene_path.display()
+        ));
+    }
     let base = std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .ok_or("LOCALAPPDATA is not set")?
         .join("PerfectWorldViewer")
         .join("tree-cache");
     fs::create_dir_all(&base).map_err(|e| format!("Cannot create tree cache: {e}"))?;
-    let key = cache_key(element)?;
-    let final_dir = base.join(format!("pwt08-{key:016x}"));
-    if ready(&final_dir) {
+    let key = cache_key(element, scene_path, tree_type_count)?;
+    let final_dir = base.join(format!("pwt09-{key:016x}"));
+    if ready(&final_dir, tree_type_count) {
         eprintln!("Using prepared SpeedTree cache {}", final_dir.display());
         let report = final_dir.join("tree-alpha-refs.csv");
         if report.is_file() {
@@ -171,36 +240,84 @@ pub fn prepare_trees(element: &Path) -> Result<PathBuf, String> {
     let result = (|| -> Result<(), String> {
         let data = work.join("data");
         eprintln!("First launch: extracting trees and preparing them with the SpeedTreeRT.dll from your client. This may take a few minutes.");
-        crate::tree_source::extract(element, &data)?;
-        let helper = work.join("speedtree-bridge.exe");
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&helper)
+        loading_progress(format!(
+            "Preparing SpeedTree sources for {}...",
+            scene_path.display()
+        ));
+        // Keep a padded 59-type source table so the legacy checked-in bridge
+        // still works when the selected map authors fewer types. Extra PWTs are
+        // harmless: `Trees::open` reads only the scene's authored table.
+        let source_count = if tree_type_count == 0 {
+            0
+        } else {
+            tree_type_count.max(59)
+        };
+        crate::tree_source::extract_for_scene(element, scene_path, &data, source_count)?;
+        if tree_type_count == 0 {
+            fs::write(
+                data.join("tree-alpha-refs.csv"),
+                b"tree_id,lod,alpha_branch,alpha_frond\n",
+            )
             .map_err(|e| e.to_string())?;
-        f.write_all(BRIDGE).map_err(|e| e.to_string())?;
-        drop(f);
-        let out = Command::new(&helper)
-            .arg(element.join("speedtreert.dll"))
-            .arg(&data)
-            .creation_flags(0x08000000)
-            .output()
-            .map_err(|e| format!("Unable to launch 32-bit SpeedTree bridge: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "SpeedTree preparation failed ({})\n{}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            ));
-        }
-        for i in 0..59 {
-            if !data.join(format!("tree-{i:03}.pwt")).is_file() {
-                return Err(format!("SpeedTree type {i} did not generate"));
+        } else {
+            let helper = work.join("speedtree-bridge.exe");
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&helper)
+                .map_err(|e| e.to_string())?;
+            f.write_all(BRIDGE).map_err(|e| e.to_string())?;
+            drop(f);
+            let bridge_error = |out: &std::process::Output| {
+                format!(
+                    "SpeedTree preparation failed ({})\n{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            };
+            let variable = Command::new(&helper)
+                .arg(element.join("speedtreert.dll"))
+                .arg(&data)
+                .arg(tree_type_count.to_string())
+                .creation_flags(0x08000000)
+                .output()
+                .map_err(|e| format!("Unable to launch 32-bit SpeedTree bridge: {e}"))?;
+            let mut expected_count = tree_type_count;
+            if !variable.status.success() {
+                // The legacy bridge rejects a fourth argument. It can still
+                // bake a padded 59-type table for maps with at most 59 types.
+                if tree_type_count > 59 {
+                    return Err(format!(
+                        "{}\nThis map has {} tree types; rebuild tools/speedtree/speedtree-bake.exe from bake.cpp.",
+                        bridge_error(&variable),
+                        tree_type_count
+                    ));
+                }
+                eprintln!("Variable-count SpeedTree bridge unavailable; using the legacy 59-type protocol.");
+                let legacy = Command::new(&helper)
+                    .arg(element.join("speedtreert.dll"))
+                    .arg(&data)
+                    .creation_flags(0x08000000)
+                    .output()
+                    .map_err(|e| format!("Unable to launch 32-bit SpeedTree bridge: {e}"))?;
+                if !legacy.status.success() {
+                    return Err(format!(
+                        "{}\nLegacy bridge: {}",
+                        bridge_error(&variable),
+                        bridge_error(&legacy)
+                    ));
+                }
+                expected_count = source_count;
+            }
+            for i in 0..expected_count {
+                if !data.join(format!("tree-{i:03}.pwt")).is_file() {
+                    return Err(format!("SpeedTree type {i} did not generate"));
+                }
             }
         }
         // The viewer reads source textures directly from the client's PCK. Do not
         // retain duplicate extracted SPT/DDS files or placement spreadsheets.
-        for i in 0..59 {
+        for i in 0..source_count {
             for ext in ["spt", "dds"] {
                 fs::remove_file(data.join(format!("tree-{i:03}.{ext}")))
                     .map_err(|e| format!("Cannot clean temporary tree source: {e}"))?;
@@ -210,11 +327,12 @@ pub fn prepare_trees(element: &Path) -> Result<PathBuf, String> {
             fs::remove_file(data.join(name))
                 .map_err(|e| format!("Cannot clean temporary manifest: {e}"))?;
         }
-        fs::write(data.join("ready"), b"PWTREE08\n").map_err(|e| e.to_string())?;
+        fs::write(data.join("ready"), b"PWTREE09\n").map_err(|e| e.to_string())?;
+        loading_progress("SpeedTree cache ready; loading the selected world...".into());
         match fs::rename(&data, &final_dir) {
             Ok(()) => {}
             Err(e) => {
-                if !ready(&final_dir) {
+                if !ready(&final_dir, tree_type_count) {
                     return Err(format!("Cannot publish tree cache: {e}"));
                 }
             }
@@ -284,6 +402,13 @@ static LOADING_SENDER: std::sync::OnceLock<
     std::sync::Mutex<Option<std::sync::mpsc::Sender<String>>>,
 > = std::sync::OnceLock::new();
 pub fn loading_progress(message: String) {
+    // A replacement-process child publishes the same progress for the old
+    // window's non-interactive overlay. This writes the handoff status file
+    // directly so the standalone Windows tree-setup diagnostic remains a
+    // self-contained binary. No-op outside a world handoff.
+    if let Some(path) = std::env::var_os("PWE_WORLD_HANDOFF_STATUS_FILE") {
+        let _ = std::fs::write(std::path::PathBuf::from(path), message.as_bytes());
+    }
     if let Some(lock) = LOADING_SENDER.get() {
         if let Ok(guard) = lock.lock() {
             if let Some(tx) = guard.as_ref() {

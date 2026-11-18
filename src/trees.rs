@@ -217,6 +217,14 @@ impl Trees {
             .iter()
             .flat_map(|b| b.trees.iter().cloned())
             .collect();
+        // Some instance maps ship no SpeedTree table at all. Do not require the
+        // 32-bit DLL, trees.pck or a baked cache for an empty type table.
+        if scene.tree_types.is_empty() {
+            return Ok(Self {
+                types: Vec::new(),
+                placements,
+            });
+        }
         let mut types: Vec<Option<TreeMesh>> = (0..scene.tree_types.len()).map(|_| None).collect();
         if !cache.is_dir() {
             eprintln!(

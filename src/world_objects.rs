@@ -333,13 +333,19 @@ impl Page {
 }
 /// Measured residency and resolution outcome of one whole-world preload
 /// (P3.08: measured numbers, not estimates).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct DoneStats {
     pub residency: crate::objects::ResidencyStats,
     pub resolver: crate::texture_resolution::ResolverStats,
     /// Register rows recorded for references that resolved nowhere or were
     /// rejected by name (.sdr. shader registry, decode failures, missing).
     pub unresolved_rows: usize,
+    /// Distinct BMD assets that could not be opened or parsed. Placements
+    /// using them produce no geometry and are reported, not fatal.
+    pub unavailable_models: Vec<String>,
+    /// A few direct lookup/parse causes, so an all-empty world can be
+    /// diagnosed without relying on the process log.
+    pub unavailable_examples: Vec<String>,
     /// Pages emitted by this preload.
     pub pages: usize,
     pub atlas_pages: usize,
@@ -597,6 +603,8 @@ fn run(
                         residency: Default::default(),
                         resolver: Default::default(),
                         unresolved_rows: 0,
+                        unavailable_models: Vec::new(),
+                        unavailable_examples: Vec::new(),
                         pages: reader.page_count(),
                         atlas_pages: reader.atlas_pages,
                         atlas_bytes: reader.atlas_bytes,
@@ -814,6 +822,8 @@ fn run(
             residency: objects.residency(),
             resolver: objects.resolver_stats(),
             unresolved_rows: objects.unresolved().len(),
+            unavailable_models: objects.unavailable_models(),
+            unavailable_examples: objects.unavailable_examples().to_vec(),
             pages,
             atlas_pages,
             atlas_bytes,

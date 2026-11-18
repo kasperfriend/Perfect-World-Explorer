@@ -162,6 +162,9 @@ mod water_gpu;
 mod weather_gpu;
 #[cfg(windows)]
 mod windows_setup;
+mod world_catalog;
+mod world_handoff;
+mod world_load;
 mod world_models;
 mod world_models_gpu;
 mod world_objects;
@@ -169,6 +172,15 @@ mod world_page_cache;
 mod xess;
 struct Terrain {
     element: PathBuf,
+    /// Client root used to launch a replacement process for another map.
+    client_root: PathBuf,
+    /// Selected `element/maps/<id>` folder (or a direct map directory).
+    map_dir: PathBuf,
+    /// Catalog metadata for the selected map, including its instance IDs and
+    /// authored region-grid hint.
+    map: world_catalog::WorldMap,
+    /// Recoverable notice from a failed selected-map load that fell back here.
+    startup_notice: Option<String>,
     /// Cells per T2BK block edge (`world.trn2` header dword @20).
     grid: usize,
     width: usize,
@@ -561,17 +573,31 @@ fn decode_block(tile: &TileDecode, scratch: &mut BlockScratch, bi: usize) -> Res
 /// the fully decoded terrain grid (no disk paging, no block decode) instead of
 /// the paged cache, which is much faster at load and while flying and uses the
 /// whole grid in RAM.
-fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
-    let dir = if root.join("element/maps/world/world.trn2").is_file() {
-        root.join("element/maps/world")
-    } else if root.join("maps/world/world.trn2").is_file() {
-        root.join("maps/world")
-    } else if root.join("world.trn2").is_file() {
-        root.to_path_buf()
-    } else {
-        return Err("expected client root, element folder, or maps/world directory".into());
-    };
-    let t = fs::read(dir.join("world.trn2")).map_err(|e| e.to_string())?;
+fn terrain(
+    root: &Path,
+    all_to_vram: bool,
+    preferred: Option<&str>,
+    startup_notice: Option<String>,
+) -> Result<Terrain, String> {
+    if let Some(id) = preferred {
+        world_catalog::validate_selection(id)?;
+    }
+    let map = world_catalog::resolve(root, preferred)?;
+    let dir = map.dir.clone();
+    let element = map.element.as_path();
+    let client_root = world_catalog::client_root(root);
+    eprintln!(
+        "Loading map {} ({}) from {}",
+        map.display_name,
+        map.id,
+        dir.display()
+    );
+    if let Some(warning) = world_catalog::discover(element).warning {
+        eprintln!("World catalog: {warning}");
+    }
+    world_handoff::publish_progress(&format!("Loading {} ({})...", map.display_name, map.id));
+    let terrain_path = world_catalog::data_file(&dir, "trn2");
+    let t = fs::read(&terrain_path).map_err(|e| format!("{}: {e}", terrain_path.display()))?;
     if u32at(&t, 0)? != 0x54524e32 || u32at(&t, 4)? > 1 {
         return Err("unsupported TRN2".into());
     }
@@ -605,6 +631,9 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
     }
     let w = cols.checked_mul(grid).ok_or("size overflow")?;
     let h = rows.checked_mul(grid).ok_or("size overflow")?;
+    if w < 2 || h < 2 {
+        return Err("map terrain dimensions are too small".into());
+    }
     if w * h > 100_000_000 {
         return Err("terrain too large".into());
     }
@@ -724,10 +753,13 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
         (None, Some(pages)) => pages.finish(terrain_store::budget())?,
         (None, None) => return Err("terrain cache was not built".into()),
     };
-    let world_scene = scene::Scene::load(&dir.join("world.ecwld"))?;
-    let cloud_surface = match fs::read(dir.join("world.cld")) {
+    let scene_path = world_catalog::data_file(&dir, "ecwld");
+    let world_scene = scene::Scene::load(&scene_path)?;
+    let cloud_path = world_catalog::data_file(&dir, "cld");
+    let cloud_surface = match fs::read(&cloud_path) {
         Ok(bytes) => {
-            let cloud = cloud_surface::parse(&bytes).map_err(|e| format!("world.cld: {e}"))?;
+            let cloud = cloud_surface::parse(&bytes)
+                .map_err(|e| format!("{}: {e}", cloud_path.display()))?;
             let (cell_count, vertex_count, group_count, index_count) =
                 cloud.cells.iter().flatten().fold(
                     (0usize, 0usize, 0usize, 0usize),
@@ -744,17 +776,20 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
             Some(std::sync::Arc::new(cloud))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("world.cld unavailable; native cloud surface omitted");
+            eprintln!(
+                "{} unavailable; native cloud surface omitted",
+                cloud_path.display()
+            );
             None
         }
-        Err(e) => return Err(format!("world.cld: {e}")),
+        Err(e) => return Err(format!("{}: {e}", cloud_path.display())),
     };
     if (world_scene.width - w as f32 * grid_spacing).abs() > 0.1
         || (world_scene.length - h as f32 * grid_spacing).abs() > 0.1
     {
         return Err("ECWLD and TRN2 world dimensions differ".into());
     }
-    let ornaments = world_scene.load_ornaments(&dir.join("world.ecbsd"))?;
+    let ornaments = world_scene.load_ornaments(&world_catalog::ecbsd_path(&dir))?;
     eprintln!(
         "Loaded {} unique world ornament placements; nearby BMD meshes will stream during flight",
         ornaments.len()
@@ -765,10 +800,8 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
     eprintln!("Loading world terrain textures and masks...");
     #[cfg(windows)]
     windows_setup::loading_progress("Loading terrain materials and masks...".into());
-    let element = dir
-        .parent()
-        .and_then(Path::parent)
-        .ok_or("invalid world path")?;
+    // Shared PCK archives stay rooted at the owning `element` folder, while
+    // terrain, scene and object data come from the selected map directory.
     let placements: Vec<_> = world_scene
         .blocks
         .iter()
@@ -783,7 +816,11 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
     } else {
         #[cfg(windows)]
         {
-            windows_setup::prepare_trees(element)?
+            windows_setup::prepare_trees_for_scene(
+                element,
+                &scene_path,
+                world_scene.tree_types.len(),
+            )?
         }
         #[cfg(not(windows))]
         {
@@ -917,7 +954,10 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
     // Ordinary world-model receivers query these actual client records.
     // Do not also add them to static baked BMDs or terrain: those surfaces
     // use their separately traced baked-light paths.
-    let scene_lights = match scene_lights::SceneLights::load(&dir.join("scenelights.dat")) {
+    let scene_lights = match scene_lights::SceneLights::load(&world_catalog::named_file(
+        &dir,
+        "scenelights.dat",
+    )) {
         Ok(lights) => {
             eprintln!(
                 "Loaded {} client scene lights (static query only)",
@@ -939,6 +979,10 @@ fn terrain(root: &Path, all_to_vram: bool) -> Result<Terrain, String> {
         scenery_placements: None,
         terrain_material_window: None,
         element: element.to_path_buf(),
+        client_root,
+        map_dir: dir,
+        map,
+        startup_notice,
         grass,
         water_normals,
         water_simple_frames,
@@ -3504,15 +3548,46 @@ fn diagnose_framegen(args: &[String]) -> i32 {
 
 mod viewer;
 
+fn log_model_load(key: &str, line: &str) {
+    diagnostics::emit_keyed(diagnostics::Channel::ModelLoads, key, 0, line);
+}
+
 fn main() {
     #[cfg(windows)]
     std::panic::set_hook(Box::new(|info| {
-        windows_setup::show_error(&format!(
-            "Perfect World Explorer encountered an unexpected error:\n{info}"
-        ))
+        // A recoverable map panic is retried on the main world by
+        // `world_load`; a modal error here would block the fallback.
+        if !world_load::recovering_from_map_failure() {
+            windows_setup::show_error(&format!(
+                "Perfect World Explorer encountered an unexpected error:\n{info}"
+            ))
+        }
     }));
+    world_load::install_recoverable_panic_hook();
     #[allow(unused_mut)]
     let mut args: Vec<_> = env::args_os().collect();
+    // `--world <id>` is an explicit startup override from a replacement-process
+    // handoff. Validate it before any path or process argument is constructed.
+    let mut requested_world: Option<String> = None;
+    let mut index = 1usize;
+    while index < args.len() {
+        if args[index].to_string_lossy() == "--world" {
+            if index + 1 >= args.len() {
+                eprintln!("Error: --world requires a map ID");
+                std::process::exit(2);
+            }
+            requested_world = Some(args[index + 1].to_string_lossy().into_owned());
+            args.drain(index..index + 2);
+        } else {
+            index += 1;
+        }
+    }
+    if let Some(id) = requested_world.as_deref() {
+        if let Err(error) = world_catalog::validate_selection(id) {
+            eprintln!("Error: {error}");
+            std::process::exit(2);
+        }
+    }
     if args.len() >= 2 {
         let flag = args[1].to_string_lossy().into_owned();
         if flag == "--diagnose-upscale" || flag == "--diagnose-framegen" {
@@ -3541,14 +3616,49 @@ fn main() {
     }
     if args.len() < 2 || (args.len() > 4 && args.len() != 9) {
         eprintln!(
-            "Usage: perfect-world-explorer <client-root> [terrain-output.png | --preview-3d output.png]"
+            "Usage: perfect-world-explorer <client-root> [--world <map-id>] [terrain-output.png | --preview-3d output.png]"
         );
         std::process::exit(2)
     }
     let path = PathBuf::from(&args[1]);
+    // A direct map directory still belongs to the containing client; logs must
+    // resolve against that root rather than nesting inside the map folder.
+    let client_root = world_catalog::client_root(&path);
+    diagnostics::set_client_root(&client_root);
     // Publish the saved residency choice before anything opens a cache: the
     // terrain store and the decoded-texture caches both read it.
     let mut saved = view_settings::ViewSettings::load();
+    // A direct map-directory CLI argument overrides the persisted selection;
+    // an explicit `--world` from a replacement process overrides both. A raw
+    // folder name that is not a safe ID is still loadable directly, but cannot
+    // be persisted or passed to a replacement process.
+    let direct_map = if requested_world.is_none() {
+        world_catalog::readable_map_id(&path)
+    } else {
+        None
+    };
+    let direct_override = direct_map
+        .as_deref()
+        .filter(|id| world_catalog::valid_world_id(id));
+    if let Some(id) = requested_world.as_deref().or(direct_override) {
+        saved.selected_world = id.to_ascii_lowercase();
+        if let Err(error) = saved.save() {
+            eprintln!("Settings save: {error}");
+        }
+    }
+    let direct_without_safe_id = direct_map.is_some() && direct_override.is_none();
+    let selected_world = match world_catalog::validate_selection(&saved.selected_world) {
+        Ok(id) => id.to_ascii_lowercase(),
+        Err(error) => {
+            eprintln!(
+                "Invalid persisted map {}: {error}; using world",
+                saved.selected_world
+            );
+            saved.selected_world = "world".into();
+            let _ = saved.save();
+            "world".into()
+        }
+    };
     // Live logging goes before everything else, so the first load can already be
     // logged: the folder defaults to the explorer's own `pwe-logs`, next to the
     // executable rather than inside the client install, the mask is whatever the
@@ -3556,7 +3666,6 @@ fn main() {
     // The client root comes first: it is what "do not write the logs in there"
     // is measured against, both for the default and for a folder the settings
     // file still remembers from a build that wrote next to the game.
-    diagnostics::set_client_root(&path);
     diagnostics::set_default_dir(diagnostics::default_log_dir());
     if !saved.logging_dir.trim().is_empty()
         && diagnostics::inside_client(std::path::Path::new(saved.logging_dir.trim()))
@@ -3570,59 +3679,189 @@ fn main() {
     // — the effect preview — can say which builder drew a card.
     diagnostics::apply_env();
     diagnostics::set_session(format!(
-        "client root {} | explorer {} | version {} | mask {:#018x}",
-        path.display(),
+        "client root {} | explorer {} | version {} | world {} | mask {:#018x}",
+        client_root.display(),
         diagnostics::explorer_root().display(),
         env!("CARGO_PKG_VERSION"),
+        selected_world,
         saved.logging_mask
     ));
+    objects::set_model_load_logger(log_model_load);
     objects::set_unbounded_textures(saved.all_to_vram);
+    let all_to_vram = saved.all_to_vram;
+    let viewer_mode = args.len() == 2;
+    // The old process's non-interactive overlay is the only loading UI for a
+    // handoff child. Create the standalone loading window once, before terrain
+    // fallback, so a second attempt never opens another Win32 window.
     #[cfg(windows)]
-    let loading = windows_setup::LoadingWindow::start();
-    let loaded = terrain(&path, saved.all_to_vram);
-    let result = loaded.and_then(|mut t| match args.len() {
-        #[cfg(windows)]
-        2 => gpu::run(t, Some(loading)),
-        #[cfg(not(windows))]
-        2 => gpu::run(t),
-        3 => export_png(&t, Path::new(&args[2])),
-        4 if args[2] == "--preview-3d" => viewer::preview(&mut t, Path::new(&args[3])),
-        4 if args[2] == "--gpu-preview" => gpu::preview(t, Path::new(&args[3]), None),
-        9 if args[2] == "--gpu-preview-at" => {
-            let mut coords = [0f32; 5];
-            for i in 0..5 {
-                coords[i] = args[3 + i]
-                    .to_string_lossy()
-                    .parse::<f32>()
-                    .map_err(|_| "invalid camera number")?;
+    let loading = if world_handoff::is_handoff_child() {
+        None
+    } else {
+        Some(windows_setup::LoadingWindow::start())
+    };
+    // Loading terrain is the only operation that can be retried in-process.
+    // PR #40 showed that retrying `gpu::run` after a visible window has been
+    // created fails with "EventLoop can't be recreated"; a post-load failure
+    // therefore restarts a fresh process on the main world.
+    let mut preferred_world = selected_world.clone();
+    let load_terrain = |world_id: &str, notice: Option<String>| -> Result<Terrain, String> {
+        let fallback = notice.is_some();
+        let progress = if fallback {
+            "Selected map failed; preparing the main world...".to_string()
+        } else {
+            format!("Loading world {world_id}...")
+        };
+        world_handoff::publish_progress(&progress);
+        // An unsafe direct folder name is resolved from the path itself on the
+        // first attempt; the fallback retry uses the owning client root and the
+        // safe main-world ID, so a broken instance can still return to `world`.
+        let preferred = if direct_without_safe_id && !fallback {
+            None
+        } else {
+            Some(world_id)
+        };
+        let load_root = if fallback {
+            client_root.as_path()
+        } else {
+            path.as_path()
+        };
+        terrain(load_root, all_to_vram, preferred, notice)
+    };
+    let (t, fallback_notice) =
+        match world_load::load_with_main_world_fallback_notified(&preferred_world, load_terrain) {
+            Ok((loaded, notice)) => (loaded, notice),
+            Err(error) => {
+                // A replacement child must report failure before showing its
+                // own error; otherwise the old window would wait for a
+                // readiness signal that will never arrive.
+                world_handoff::publish_failure(&error);
+                eprintln!("Error: {error}");
+                #[cfg(windows)]
+                if !world_handoff::is_handoff_child() {
+                    windows_setup::show_error(&error);
+                }
+                std::process::exit(1);
             }
-            gpu::preview(t, Path::new(&args[8]), Some(coords))
+        };
+    if let Some(notice) = fallback_notice.as_deref() {
+        preferred_world = "world".into();
+        saved.selected_world = "world".into();
+        if let Err(error) = saved.save() {
+            eprintln!("Could not persist main-world fallback: {error}");
         }
-        9 if args[2] == "--preview-at" => {
-            let mut coords = [0f32; 5];
-            for i in 0..5 {
-                coords[i] = args[3 + i]
-                    .to_string_lossy()
-                    .parse::<f32>()
-                    .map_err(|_| "invalid camera number")?;
-            }
-            viewer::preview_at(
-                &mut t,
-                Path::new(&args[8]),
-                coords[0],
-                coords[1],
-                coords[2],
-                coords[3],
-                coords[4],
-            )
-        }
-        _ => Err("invalid arguments".into()),
-    });
-    if let Err(e) = result {
-        eprintln!("Error: {e}");
+        eprintln!("{notice}");
         #[cfg(windows)]
-        windows_setup::show_error(&e);
-        std::process::exit(1)
+        if !world_handoff::is_handoff_child() {
+            windows_setup::show_error(notice);
+        }
+        world_handoff::publish_progress("Selected map failed; preparing the main world...");
+    }
+    let run_result = world_load::recoverable_map_operation(move || {
+        let mut t = t;
+        match args.len() {
+            #[cfg(windows)]
+            2 => gpu::run(t, loading),
+            #[cfg(not(windows))]
+            2 => gpu::run(t),
+            3 => export_png(&t, Path::new(&args[2])),
+            4 if args[2] == "--preview-3d" => viewer::preview(&mut t, Path::new(&args[3])),
+            4 if args[2] == "--gpu-preview" => gpu::preview(t, Path::new(&args[3]), None),
+            9 if args[2] == "--gpu-preview-at" => {
+                let mut coords = [0f32; 5];
+                for i in 0..5 {
+                    coords[i] = args[3 + i]
+                        .to_string_lossy()
+                        .parse::<f32>()
+                        .map_err(|_| "invalid camera number")?;
+                }
+                gpu::preview(t, Path::new(&args[8]), Some(coords))
+            }
+            9 if args[2] == "--preview-at" => {
+                let mut coords = [0f32; 5];
+                for i in 0..5 {
+                    coords[i] = args[3 + i]
+                        .to_string_lossy()
+                        .parse::<f32>()
+                        .map_err(|_| "invalid camera number")?;
+                }
+                viewer::preview_at(
+                    &mut t,
+                    Path::new(&args[8]),
+                    coords[0],
+                    coords[1],
+                    coords[2],
+                    coords[3],
+                    coords[4],
+                )
+            }
+            _ => Err("invalid arguments".into()),
+        }
+    })
+    .and_then(|result| result);
+    if let Err(error) = run_result {
+        if world_load::post_load_failure_decision(&preferred_world, viewer_mode)
+            == world_load::PostLoadDecision::RestartMainWorld
+        {
+            saved.selected_world = "world".into();
+            if let Err(save_error) = saved.save() {
+                eprintln!("Could not persist main-world fallback: {save_error}");
+            }
+            let notice = format!(
+                "Map {} failed after loading. The explorer is restarting in the main world.\n\n{error}",
+                preferred_world
+            );
+            eprintln!("{notice}");
+            let restarted = env::current_exe()
+                .map_err(|e| e.to_string())
+                .and_then(|exe| {
+                    let mut command = std::process::Command::new(exe);
+                    command.arg(&client_root).arg("--world").arg("world");
+                    world_handoff::clear_child_environment(&mut command);
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        // Do not flash a console window behind the GUI restart.
+                        command.creation_flags(0x08000000);
+                    }
+                    command
+                        .spawn()
+                        .map(|_| ())
+                        .map_err(|restart_error| restart_error.to_string())
+                });
+            match restarted {
+                Ok(()) => {
+                    // Publish after the fresh process exists. The parent sees a
+                    // progress notice and readiness, so it exits its overlay
+                    // instead of leaving a second window with a failure dialog.
+                    // The restart deliberately inherits no handoff files.
+                    world_handoff::publish_progress(&notice);
+                    world_handoff::signal_ready();
+                    #[cfg(windows)]
+                    if !world_handoff::is_handoff_child() {
+                        windows_setup::show_error(&notice);
+                    }
+                    return;
+                }
+                Err(restart_error) => {
+                    let fatal =
+                        format!("{notice}\n\nCould not restart the explorer: {restart_error}");
+                    world_handoff::publish_failure(&fatal);
+                    eprintln!("Error: {fatal}");
+                    #[cfg(windows)]
+                    if !world_handoff::is_handoff_child() {
+                        windows_setup::show_error(&fatal);
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        world_handoff::publish_failure(&error);
+        eprintln!("Error: {error}");
+        #[cfg(windows)]
+        if !world_handoff::is_handoff_child() {
+            windows_setup::show_error(&error);
+        }
+        std::process::exit(1);
     }
 }
 

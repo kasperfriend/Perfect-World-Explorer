@@ -18,10 +18,32 @@ pub fn extract(root: &Path, out: &Path) -> Result<(), String> {
     } else {
         root.to_path_buf()
     };
+    extract_for_scene(&element, &element.join("maps/world/world.ecwld"), out, 59)
+}
+
+/// Extract the tree assets referenced by one selected map's ECWLD.
+///
+/// `source_count` may exceed the authored table: the legacy checked-in bridge
+/// always loops 59 types, so instance maps with fewer types are padded with
+/// repeated source files. `Trees::open` reads only the scene's authored types.
+pub fn extract_for_scene(
+    element: &Path,
+    scene_path: &Path,
+    out: &Path,
+    source_count: usize,
+) -> Result<(), String> {
     if out.exists() {
         return Err("output path already exists; choose a new directory".into());
     }
-    let scene = scene::Scene::load(&element.join("maps/world/world.ecwld"))?;
+    if source_count > 10000 {
+        return Err("tree source count exceeds the SpeedTree bridge limit".into());
+    }
+    let scene = scene::Scene::load(scene_path)?;
+    if source_count > 0 && scene.tree_types.is_empty() {
+        return Err(
+            "scene declares no tree types but a non-zero bridge source count was requested".into(),
+        );
+    }
     let mut pkg = File::open(element.join("trees.pck")).map_err(|e| e.to_string())?;
     let entries: HashMap<_, _> = pck::directory(&mut pkg)?
         .into_iter()
@@ -43,7 +65,8 @@ pub fn extract(root: &Path, out: &Path) -> Result<(), String> {
         "type_id\tspt_file\tcomposite_file\tclient_spt_path\tclient_composite_path"
     )
     .map_err(|e| e.to_string())?;
-    for (i, t) in scene.tree_types.iter().enumerate() {
+    for i in 0..source_count {
+        let t = &scene.tree_types[i % scene.tree_types.len()];
         let spt = format!("tree-{i:03}.spt");
         let dds = format!("tree-{i:03}.dds");
         for (name, dst) in [(&t.tree, &spt), (&t.composite, &dds)] {
@@ -82,7 +105,7 @@ pub fn extract(root: &Path, out: &Path) -> Result<(), String> {
     manifest.flush().map_err(|e| e.to_string())?;
     placements.flush().map_err(|e| e.to_string())?;
     println!(
-        "Extracted {} SpeedTree sources, composite maps and {count} world placements",
+        "Extracted {source_count} SpeedTree sources and composite maps from {} authored types and {count} world placements",
         scene.tree_types.len()
     );
     Ok(())

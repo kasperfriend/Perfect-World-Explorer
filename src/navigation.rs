@@ -1,6 +1,6 @@
 //! Main-world map coordinates and destinations from the client.
 use crate::pck;
-use std::{fs, path::Path};
+use std::{collections::HashMap, fs, path::Path};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Destination {
     pub id: u32,
@@ -8,7 +8,22 @@ pub struct Destination {
     pub position: [f32; 3],
 }
 pub fn destinations(path: &Path) -> Result<Vec<Destination>, String> {
-    let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    destinations_for_world(path, &[1])
+}
+
+/// Read destinations authored for one map. `world_ids` are the instance IDs
+/// from `configs/instance.txt`; an empty slice means all authored rows. The old
+/// hard-coded `fields[2] == "1"` filter only found main-world targets and made
+/// an instance map's own destination list invisible.
+pub fn destinations_for_world(path: &Path, world_ids: &[u32]) -> Result<Vec<Destination>, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        // Many instance maps have no authored teleport table. Absence means an
+        // empty list; callers can provide a safe local fallback without turning
+        // this optional file into a map/UI error.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
     if bytes.len() % 2 != 0 {
         return Err("odd UTF-16 destination file".into());
     }
@@ -17,9 +32,9 @@ pub fn destinations(path: &Path) -> Result<Vec<Destination>, String> {
         .map(|x| u16::from_le_bytes([x[0], x[1]]))
         .collect::<Vec<_>>();
     let text = String::from_utf16(&words).map_err(|e| e.to_string())?;
-    parse_destinations(text.trim_start_matches('\u{feff}'))
+    parse_destinations(text.trim_start_matches('\u{feff}'), world_ids)
 }
-fn parse_destinations(text: &str) -> Result<Vec<Destination>, String> {
+fn parse_destinations(text: &str, world_ids: &[u32]) -> Result<Vec<Destination>, String> {
     let mut result = Vec::new();
     for (number, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -46,8 +61,10 @@ fn parse_destinations(text: &str) -> Result<Vec<Destination>, String> {
         if name.is_empty() || coords.len() != 3 || coords.iter().any(|v| !v.is_finite()) {
             return Err(format!("invalid destination at {}", number + 1));
         }
-        // Only main world targets; do not silently teleport into another map.
-        if fields[2] == "1" {
+        // Teleport only within the loaded world/instance: do not silently send
+        // the camera to coordinates authored for a different coordinate space.
+        let world_id = fields[2].parse::<u32>().unwrap_or(0);
+        if world_ids.is_empty() || world_ids.contains(&world_id) {
             result.push(Destination {
                 id,
                 name,
@@ -140,17 +157,38 @@ fn compose(
     side: u32,
     name: impl Fn(u32, u32) -> String,
 ) -> Result<image::RgbaImage, String> {
+    compose_optional(element, rows, cols, side, |row, col| Some(name(row, col)))
+}
+
+/// Instance minimap folders can be sparse (for example `a32` ships 44 of a
+/// 6x8 grid), so a missing tile stays transparent instead of rejecting the
+/// entire zone's artwork.
+fn compose_optional(
+    element: &Path,
+    rows: u32,
+    cols: u32,
+    side: u32,
+    name: impl Fn(u32, u32) -> Option<String>,
+) -> Result<image::RgbaImage, String> {
     let path = element.join("surfaces.pck");
     let mut f = fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let entries = pck::directory(&mut f)?;
+    let by_name: HashMap<String, usize> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.name.to_ascii_lowercase().replace('\\', "/"), i))
+        .collect();
     let mut map = image::RgbaImage::new(cols * side, rows * side);
     for row in 0..rows {
         for col in 0..cols {
-            let tile_name = name(row, col);
-            let entry = entries
-                .iter()
-                .find(|e| e.name.eq_ignore_ascii_case(&tile_name))
+            let Some(tile_name) = name(row, col) else {
+                continue;
+            };
+            let index = by_name
+                .get(&tile_name.to_ascii_lowercase())
+                .copied()
                 .ok_or_else(|| format!("missing map tile {tile_name}"))?;
+            let entry = &entries[index];
             let data = pck::read_entry(&mut f, entry)?;
             let tile = image::load_from_memory_with_format(&data, image::ImageFormat::Dds)
                 .map_err(|e| format!("{tile_name}: {e}"))?
@@ -183,6 +221,60 @@ pub fn original_map(element: &Path) -> Result<image::RgbaImage, String> {
 pub fn original_minimap(element: &Path) -> Result<image::RgbaImage, String> {
     compose(element, MINIMAP_ROWS, MINIMAP_COLS, 256, |row, col| {
         minimap_tile_name(WORLD_MINIMAP_ZONE, row, col)
+    })
+}
+
+/// The retail full-world map tiles belong to the main world only. An instance
+/// map can still use the live overhead render; do not show the mainland artwork
+/// under a different coordinate space.
+pub fn original_map_for_map(element: &Path, zone: &str) -> Result<image::RgbaImage, String> {
+    if !zone.eq_ignore_ascii_case(WORLD_MINIMAP_ZONE) {
+        return Err(format!(
+            "surfaces/maps is the main world's artwork; use the Realistic style for {zone}"
+        ));
+    }
+    original_map(element)
+}
+
+/// Find the native minimap tiles for the selected map. Instance folders use
+/// `surfaces/minimaps/<zone>/RRCC.dds`, with zone-specific (and sometimes
+/// sparse) grids; the main world keeps its verified 22x16 crop.
+pub fn original_minimap_for_map(element: &Path, zone: &str) -> Result<image::RgbaImage, String> {
+    if zone.eq_ignore_ascii_case(WORLD_MINIMAP_ZONE) {
+        return original_minimap(element);
+    }
+    let path = element.join("surfaces.pck");
+    let mut f = fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let entries = pck::directory(&mut f)?;
+    let prefix = format!("surfaces/minimaps/{}/", zone.to_ascii_lowercase());
+    let mut tiles = HashMap::new();
+    let mut rows = 0;
+    let mut cols = 0;
+    for entry in &entries {
+        let name = entry.name.to_ascii_lowercase().replace('\\', "/");
+        let Some(file) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(stem) = file.strip_suffix(".dds") else {
+            continue;
+        };
+        if stem.len() != 4 || !stem.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let row = stem[..2].parse::<u32>().unwrap_or(0);
+        let col = stem[2..].parse::<u32>().unwrap_or(0);
+        if row >= 64 || col >= 64 {
+            continue;
+        }
+        tiles.insert((row, col), name);
+        rows = rows.max(row + 1);
+        cols = cols.max(col + 1);
+    }
+    if tiles.is_empty() {
+        return Err(format!("no native minimap tiles for {zone}"));
+    }
+    compose_optional(element, rows, cols, 256, |row, col| {
+        tiles.get(&(row, col)).cloned()
     })
 }
 
@@ -221,10 +313,29 @@ mod tests {
     }
     #[test]
     fn client_targets() {
-        let d=parse_destinations("3801\t\"Archosaur, North District\"\t1\t\"1470.490,219.608,1180.864\"\t23\n1\t\"Other\"\t2\t\"1,2,3\"\t0").unwrap();
+        let d=parse_destinations("3801\t\"Archosaur, North District\"\t1\t\"1470.490,219.608,1180.864\"\t23\n1\t\"Other\"\t2\t\"1,2,3\"\t0", &[1]).unwrap();
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].position, [1470.490, 219.608, 1180.864]);
+        let other = parse_destinations(
+            "3801\t\"Archosaur\"\t1\t\"1,2,3\"\t23\n9001\t\"Instance\"\t101\t\"4,5,6\"\t0",
+            &[101],
+        )
+        .unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].name, "Instance");
     }
+    #[test]
+    fn missing_map_targets_are_an_empty_optional_list() {
+        let root = std::env::temp_dir().join(format!("pw-no-map-targets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("world_targets.txt");
+        assert!(destinations_for_world(&path, &[101]).unwrap().is_empty());
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(destinations_for_world(&path, &[101]).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn orientation_roundtrip_and_terrain() {
         let m = MapSpace {
