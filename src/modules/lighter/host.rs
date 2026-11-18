@@ -7,12 +7,12 @@ use crate::modules::lighter::{
     self,
     coverage::{Class, Counts, Inventory},
     scene::*,
-    textures::{Filter, Textures, Tile, COLOR_SIDE, MASK_SIDE},
+    textures::{chain_bytes, Filter, Textures, Tile, COLOR_SIDE, MASK_SIDE},
     Lighter,
 };
 use crate::{material::Materials, world_models_gpu, Terrain};
 use glam::{Mat4, Vec3};
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 #[path = "scenery.rs"]
 mod scenery;
@@ -37,7 +37,6 @@ pub(super) struct Feed {
     trees: Vec<Option<Tree>>,
     tree_archive_missing: bool,
     placements: Vec<crate::scene::Tree>,
-    grass: HashMap<(Rect, Filter), Tile>,
     waves: Vec<u32>,
     sky: lighter::sky::Sky,
     authored_mips: bool,
@@ -70,14 +69,28 @@ impl Feed {
             t.grid_spacing,
             upload.materials.mask_grid as f32,
         ];
+        // Reserve most of the bank for masks, streamed objects and effects.
+        // All terrain colour sources get the same deterministic ceiling;
+        // choose a resident authored mip rather than resampling level zero.
+        let mut terrain_limit = COLOR_SIDE;
+        while terrain_limit > 1
+            && upload.materials.textures.iter().fold(0usize, |sum, t| {
+                sum.saturating_add(chain_bytes([t.w as u32, t.h as u32], terrain_limit))
+            }) > 48 * 1024 * 1024
+        {
+            terrain_limit /= 2;
+        }
         for texture in &upload.materials.textures {
             let decoded = texture.decode()?;
-            let top = decoded.first().ok_or("empty terrain color DDS")?;
-            result.terrain_ids.push(result.base.rgba(
-                [top.width, top.height],
-                &top.rgba,
-                Filter::Color,
-            )?);
+            result.terrain_ids.push(
+                result.base.insert(&Tile::levels(
+                    decoded
+                        .iter()
+                        .map(|i| ([i.width, i.height], i.rgba.as_slice())),
+                    terrain_limit,
+                    Filter::Color,
+                )?)?,
+            );
         }
         result.sky = match lighter::sky::Sky::load(&t.element, &mut result.base) {
             Ok(sky) => sky,
@@ -87,12 +100,10 @@ impl Feed {
             }
         };
         for frame in &t.water_normals {
-            if let Some(image) = frame.first() {
-                result.waves.push(result.base.rgba(
-                    [image.width(), image.height()],
-                    image.as_raw(),
-                    Filter::Color,
-                )?);
+            if !frame.is_empty() {
+                result
+                    .waves
+                    .push(result.base.images(frame, 128, Filter::Data)?);
             }
         }
         result.tree_archive_missing = !t.element.join("trees.pck").is_file();
@@ -174,7 +185,7 @@ impl Feed {
                 } else {
                     let bytes = l.mask.decode(l.mask_size)?;
                     let side = l.mask_size as u32;
-                    textures.tile([side, side], MASK_SIDE, Filter::Color, |x, y| {
+                    textures.tile([side, side], MASK_SIDE, Filter::Data, |x, y| {
                         u32::from(bytes[(y * side + x) as usize]) * 0x01010101
                     })?
                 };
@@ -399,9 +410,6 @@ impl Feed {
                 }
             }
         }
-        if m.grass_atlas_changed {
-            self.grass.clear();
-        }
         let mut grass_ids = HashMap::new();
         let (vertices, indices, instances, batches) = m.grass.geometry();
         let grass = &mut inventory[Class::Grass];
@@ -418,21 +426,24 @@ impl Feed {
             }
             for tri in indices.chunks_exact(3) {
                 let g = &vertices[tri[0] as usize];
-                let rect = Rect::new(g.vertex.color, g.scale_y, super::ATLAS, super::ATLAS)?;
+                let [x, y, _, authored_alpha] = g.vertex.color;
+                let at = [x, y].map(|p| (p * super::ATLAS as f32).round() as usize);
                 let alpha = if self.authored_mips {
-                    g.vertex.color[3]
+                    authored_alpha
                 } else {
                     84. / 255.
                 };
-                let texture = atlas_texture(
-                    &mut grass_ids,
-                    &mut self.grass,
-                    textures,
-                    rect,
-                    super::ATLAS,
-                    &m.atlas,
-                    Filter::cutout(alpha, false),
-                )?;
+                let texture = if let Some(&id) = grass_ids.get(&at) {
+                    id
+                } else {
+                    let source = m
+                        .ray_grass
+                        .get(&at)
+                        .ok_or("missing ray grass material source")?;
+                    let id = textures.insert(source)?;
+                    grass_ids.insert(at, id);
+                    id
+                };
                 mesh.tri(
                     [tri[0] - low, tri[1] - low, tri[2] - low],
                     builder.surface(Surface::new(texture, CUTOUT, alpha, 0.)),
@@ -770,17 +781,17 @@ fn read_tree(
         ];
         let mut materials = [Surface::new(0, 0, 0., 0.); 3];
         for (i, reference) in thresholds.into_iter().enumerate() {
-            let image = if i == 0 {
-                &source.bark
+            let (image, mips) = if i == 0 {
+                (&source.bark, &source.bark_mips)
             } else {
-                &source.composite
+                (&source.composite, &source.composite_mips)
             };
             let mode = reference.map_or(Filter::Color, |(r, strict)| Filter::cutout(r, strict));
             let addr = match tiles.entry((i == 0, mode)) {
                 std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                std::collections::hash_map::Entry::Vacant(e) => *e.insert(textures.rgba(
-                    [image.width(), image.height()],
-                    image.as_raw(),
+                std::collections::hash_map::Entry::Vacant(e) => *e.insert(textures.images(
+                    std::iter::once(image).chain(mips),
+                    COLOR_SIDE,
                     mode,
                 )?),
             };
@@ -835,65 +846,40 @@ fn read_tree(
     Ok(Tree { lods, height })
 }
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
-struct Rect {
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-}
-impl Rect {
-    fn new(color: [f32; 4], sy: f32, width: usize, height: usize) -> Result<Self, String> {
-        let r = Self {
-            x: (color[0] * width as f32).round() as usize,
-            y: (color[1] * height as f32).round() as usize,
-            w: (color[2] * width as f32).round() as usize,
-            h: (sy * height as f32).round() as usize,
-        };
-        if r.w == 0
-            || r.h == 0
-            || r.x.saturating_add(r.w) > width
-            || r.y.saturating_add(r.h) > height
-        {
-            return Err("Lighter material tile outside native atlas".into());
-        }
-        Ok(r)
-    }
-}
-fn atlas_texture(
-    ids: &mut HashMap<(Rect, Filter), u32>,
-    cache: &mut HashMap<(Rect, Filter), Tile>,
-    bank: &mut Textures,
-    rect: Rect,
-    width: usize,
-    bytes: &[u8],
-    filter: Filter,
-) -> Result<u32, String> {
-    let key = (rect, filter);
-    if let Some(&id) = ids.get(&key) {
-        return Ok(id);
-    }
-    let tile = match cache.entry(key) {
-        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-        std::collections::hash_map::Entry::Vacant(e) => {
-            if ((rect.y + rect.h - 1) * width + rect.x + rect.w) > bytes.len() / 4 {
-                return Err("Lighter atlas source not present for streamed tile".into());
-            }
-            e.insert(Tile::new(
-                [rect.w as u32, rect.h as u32],
+pub(super) type GrassTiles = HashMap<[usize; 2], Arc<Tile>>;
+
+/// The atlas rectangle labels a native grass material, not its ray source.
+/// Use the original rectangular image and mips even if native packed/resized
+/// it. Streamer owns the small cache so packing never runs on the draw thread.
+pub(super) fn grass_tiles(
+    stream: &mut SceneryStream,
+    grass: &crate::grass::Grass,
+    rects: &[(crate::texture_atlas::Slot, &str, bool)],
+) -> Result<GrassTiles, String> {
+    let mut current = HashMap::new();
+    let mut output = GrassTiles::new();
+    for &(slot, path, _) in rects {
+        let tile = if let Some(tile) = stream.grass_tiles.remove(path) {
+            tile
+        } else {
+            let image = grass
+                .textures
+                .get(path)
+                .ok_or("missing source grass image")?;
+            let mips = grass.texture_mips.get(path).map_or(&[][..], Vec::as_slice);
+            Arc::new(Tile::images(
+                std::iter::once(image).chain(mips),
                 COLOR_SIDE,
-                filter,
-                |x, y| {
-                    let p = ((rect.y + y as usize) * width + rect.x + x as usize) * 4;
-                    u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap())
-                },
+                Filter::cutout(84. / 255., false),
             )?)
-        }
-    };
-    let id = bank.insert(tile)?;
-    ids.insert(key, id);
-    Ok(id)
+        };
+        output.insert([slot.x, slot.y], Arc::clone(&tile));
+        current.insert(path.to_owned(), tile);
+    }
+    stream.grass_tiles = current;
+    Ok(output)
 }
+
 fn atlas_uv(v: &WorldVertex, sy: f32) -> [f32; 2] {
     [
         (v.uv[0] - v.color[0]) / v.color[2].max(0.000001),

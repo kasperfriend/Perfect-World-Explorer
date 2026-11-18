@@ -1,6 +1,6 @@
 //! The same sky triples as the native renderer, sampled by world-space miss
 //! directions (including reflected rays). No raster sky capture is needed.
-use super::textures::{Filter, Textures};
+use super::textures::{Filter, Textures, COLOR_SIDE};
 use std::{collections::HashMap, fs::File, path::Path};
 
 #[derive(Default)]
@@ -30,14 +30,9 @@ impl Sky {
                 .get(&key)
                 .ok_or_else(|| format!("missing sky tile {key}"))?;
             let bytes = crate::pck::read_entry(&mut file, entry)?;
-            let image = image::load_from_memory(&bytes)
-                .map_err(|e| format!("{key}: {e}"))?
-                .to_rgba8();
-            let offset = bank.rgba(
-                [image.width(), image.height()],
-                image.as_raw(),
-                Filter::Color,
-            )?;
+            let (images, _) = crate::model_texture_gpu::decode_for_rays(&bytes)
+                .map_err(|e| format!("{key}: {e}"))?;
+            let offset = bank.images(&images, COLOR_SIDE, Filter::Color)?;
             offsets.insert(key, offset);
             Ok(offset)
         };

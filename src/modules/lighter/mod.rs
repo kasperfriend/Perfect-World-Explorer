@@ -88,6 +88,8 @@ pub const WATER_MIRROR: u32 = 8;
 pub const CULL_BUILDINGS: u32 = 16;
 pub const UNDERWATER: u32 = 32;
 const SOFT_SUN: u32 = 64;
+const ANISO_WIDE: u32 = 128;
+const ANISO_ISOTROPIC: u32 = 256;
 
 pub(crate) fn storage_limit(device: &wgpu::Device) -> usize {
     let limits = device.limits();
@@ -683,6 +685,12 @@ impl Lighter {
         }
     }
 
+    pub fn texture_mips(&self) -> textures::MipStats {
+        self.world
+            .as_ref()
+            .map_or_else(Default::default, |w| w.textures.mips)
+    }
+
     pub fn error(&self) -> Option<&str> {
         if !self.replaces_world() {
             return None;
@@ -861,7 +869,12 @@ impl Lighter {
         frame.options[0] |= u32::from(self.settings.lighting)
             | u32::from(self.settings.shadows) << 1
             | u32::from(self.settings.reflections) << 2
-            | if self.settings.soft_sun { SOFT_SUN } else { 0 };
+            | if self.settings.soft_sun { SOFT_SUN } else { 0 }
+            | match self.settings.anisotropy {
+                16 => ANISO_WIDE,
+                1 => ANISO_ISOTROPIC,
+                _ => 0,
+            };
         frame.options[1] = self.settings.bounces;
         frame.options[2] = self.settings.samples;
         let bytes = u64::from(rw) * u64::from(rh) * PIXEL_BYTES;
@@ -949,8 +962,8 @@ impl Lighter {
             depth,
         );
         self.frame_error = None;
-        let message = format!("{} active · {rw}×{rh} rays · {} unique resident / {} moving triangles · {} instances · {} unavailable texture(s)",
-            self.settings.mode.label(),world.packet.triangles(),moving.triangles(),world.packet.instances.len(),world.textures.missing);
+        let message = format!("{} active · {rw}×{rh} rays · {} unique resident / {} moving triangles · {} instances · {} unavailable texture(s) · mip_fallback {} ({} reduced)",
+            self.settings.mode.label(),world.packet.triangles(),moving.triangles(),world.packet.instances.len(),world.textures.missing,world.textures.mips.fallback,world.textures.mips.reduced);
         if self.status.is_none() {
             eprintln!("Lighter: {message}");
         }
@@ -993,6 +1006,15 @@ impl Lighter {
                 .text("Ray resolution")
                 .suffix("%"),
         );
+        egui::ComboBox::from_label("Ray texture anisotropy")
+            .selected_text(format!("{}×", self.settings.anisotropy))
+            .show_ui(ui, |ui| {
+                for n in [1, 8, 16] {
+                    ui.selectable_value(&mut self.settings.anisotropy, n, format!("{n}×"));
+                }
+            })
+            .response
+            .on_hover_text("1× uses isotropic trilinear filtering. 8× and 16× retain more detail along grazing surfaces.");
         if self.settings != old {
             self.reset_history();
             self.persistence_error = self.settings.save().err();

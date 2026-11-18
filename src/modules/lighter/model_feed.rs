@@ -12,7 +12,7 @@ use crate::{
     skeleton_pose::{self, Pose},
 };
 
-pub(crate) type Decode<'a> = dyn FnMut(&str) -> Result<(image::RgbaImage, bool), String> + 'a;
+pub(crate) type Decode<'a> = dyn FnMut(&str) -> Result<(Vec<image::RgbaImage>, bool), String> + 'a;
 
 pub(crate) struct Posed<'a> {
     pub asset: &'a ModelAsset,
@@ -374,7 +374,7 @@ mod tests {
             moving
                 .effects("fixture", std::slice::from_ref(q), &mut |_| {
                     Ok((
-                        image::RgbaImage::from_pixel(1, 1, image::Rgba([255; 4])),
+                        vec![image::RgbaImage::from_pixel(1, 1, image::Rgba([255; 4]))],
                         has_alpha,
                     ))
                 })

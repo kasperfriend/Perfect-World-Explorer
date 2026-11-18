@@ -36,6 +36,8 @@ pub struct Texture {
     pub width: usize,
     pub height: usize,
     pub rgba: Vec<u8>,
+    /// Retained only for the ray-enabled streamed world, not native preload.
+    pub ray_dds: Option<Vec<u8>>,
 }
 impl Texture {
     pub fn sample(&self, u: f32, v: f32) -> [f32; 3] {
@@ -57,10 +59,12 @@ impl Texture {
 }
 fn content_hash(tex: &Texture) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325 ^ ((tex.width as u64) << 32) ^ (tex.height as u64);
-    for chunk in tex.rgba.chunks(8) {
-        let mut v = [0u8; 8];
-        v[..chunk.len()].copy_from_slice(chunk);
-        h = (h ^ u64::from_le_bytes(v)).wrapping_mul(0x100000001b3);
+    for data in std::iter::once(&tex.rgba).chain(tex.ray_dds.iter()) {
+        for chunk in data.chunks(8) {
+            let mut v = [0u8; 8];
+            v[..chunk.len()].copy_from_slice(chunk);
+            h = (h ^ u64::from_le_bytes(v)).wrapping_mul(0x100000001b3);
+        }
     }
     h
 }
@@ -161,7 +165,9 @@ impl TextureCache {
     /// recorded (deduplication). Evicts unpinned LRU entries afterwards
     /// until the byte budget holds again.
     pub fn store(&mut self, name: String, tex: Texture) {
-        let bytes = tex.rgba.len() + tex.width * tex.height / 1024;
+        let bytes = tex.rgba.len()
+            + tex.ray_dds.as_ref().map_or(0, Vec::len)
+            + tex.width * tex.height / 1024;
         let hash = content_hash(&tex);
         if self.by_hash.contains_key(&hash) {
             self.aliases.entry(hash).or_default().push(name.clone());
@@ -243,6 +249,7 @@ pub struct Objects {
     model_names: Vec<String>,
     models: HashMap<String, bmd::Model>,
     cache: TextureCache,
+    keep_ray_dds: bool,
     resolver: TextureResolver,
     /// Scenery archives are optional: an instance map can still show terrain,
     /// water, trees and the models it does have when one package is absent.
@@ -346,11 +353,11 @@ enum PendingTexture {
     },
 }
 
-fn decode_texture_bytes(key: &str, data: &[u8]) -> Result<Texture, String> {
+fn decode_texture_bytes(key: &str, data: Vec<u8>, keep_ray_dds: bool) -> Result<Texture, String> {
     let decoded = if key.ends_with(".tga") {
-        image::load_from_memory_with_format(data, image::ImageFormat::Tga)
+        image::load_from_memory_with_format(&data, image::ImageFormat::Tga)
     } else {
-        image::load_from_memory(data)
+        image::load_from_memory(&data)
     };
     match decoded {
         Ok(img) => {
@@ -360,6 +367,7 @@ fn decode_texture_bytes(key: &str, data: &[u8]) -> Result<Texture, String> {
                 width: w as usize,
                 height: h as usize,
                 rgba: img.into_raw(),
+                ray_dds: (keep_ray_dds && data.starts_with(b"DDS ")).then_some(data),
             })
         }
         Err(err) => Err(err.to_string()),
@@ -367,6 +375,13 @@ fn decode_texture_bytes(key: &str, data: &[u8]) -> Result<Texture, String> {
 }
 
 impl Objects {
+    /// Set before the first streaming batch so decoded aliases can retain
+    /// distinct authored mip chains even when level zero is identical.
+    #[allow(dead_code)] // standalone native survey binaries never set this
+    pub fn retain_ray_dds(&mut self) {
+        self.keep_ray_dds = true;
+    }
+
     pub fn open<O: Into<Arc<[Ornament]>>>(element: &Path, ornaments: O) -> Result<Self, String> {
         let ornaments = ornaments.into();
         let litmodel_map_id = ornaments
@@ -413,6 +428,7 @@ impl Objects {
             model_names,
             models: HashMap::new(),
             cache: TextureCache::new(tex_budget_bytes()),
+            keep_ray_dds: false,
             resolver,
             litfile,
             texfile,
@@ -690,6 +706,7 @@ impl Objects {
             let decoded: Vec<Vec<(String, Result<Texture, String>)>> = {
                 let litfile = self.litfile.as_ref();
                 let texfile = self.texfile.as_ref();
+                let keep_ray_dds = self.keep_ray_dds;
                 std::thread::scope(|s| {
                     let handles: Vec<_> = jobs
                         .chunks(chunk_size)
@@ -742,7 +759,11 @@ impl Objects {
                                                 {
                                                     out.push((
                                                         key.clone(),
-                                                        decode_texture_bytes(&key, &data),
+                                                        decode_texture_bytes(
+                                                            &key,
+                                                            data,
+                                                            keep_ray_dds,
+                                                        ),
                                                     ));
                                                 }
                                             }
@@ -768,7 +789,9 @@ impl Objects {
                                                         path.display()
                                                     )
                                                 })
-                                                .and_then(|data| decode_texture_bytes(key, &data));
+                                                .and_then(|data| {
+                                                    decode_texture_bytes(key, data, keep_ray_dds)
+                                                });
                                             out.push((key.clone(), result));
                                         }
                                     }
@@ -820,7 +843,7 @@ impl Objects {
             Some(PendingTexture::Disk { key, path }) => {
                 let data = std::fs::read(&path)
                     .map_err(|e| format!("disk texture {}: {e}", path.display()))?;
-                self.decode_and_store(&key, &data)
+                self.decode_and_store(&key, data)
             }
         }
     }
@@ -956,10 +979,10 @@ impl Objects {
                 .ok_or_else(|| "building.pck unavailable".to_string())?;
             pck::read_entry(file, &entry)?
         };
-        self.decode_and_store(key, &data)
+        self.decode_and_store(key, data)
     }
-    fn decode_and_store(&mut self, key: &str, data: &[u8]) -> Result<(), String> {
-        match decode_texture_bytes(key, data) {
+    fn decode_and_store(&mut self, key: &str, data: Vec<u8>) -> Result<(), String> {
+        match decode_texture_bytes(key, data, self.keep_ray_dds) {
             Ok(tex) => {
                 self.cache.store(key.to_string(), tex);
                 Ok(())
@@ -1165,8 +1188,23 @@ mod tests {
             width: side,
             height: side,
             rgba: vec![fill; side * side * 4],
+            ray_dds: None,
         }
     }
+    #[test]
+    fn ray_cache_does_not_alias_identical_tops_with_distinct_authored_chains() {
+        let mut a = tex(7, 4);
+        let mut b = tex(7, 4);
+        a.ray_dds = Some(vec![0; 8]);
+        b.ray_dds = Some(vec![1; 8]);
+        let mut cache = TextureCache::new(1 << 20);
+        cache.begin_batch();
+        cache.store("a.dds".into(), a);
+        cache.store("b.dds".into(), b);
+        assert_ne!(cache.key("a.dds"), cache.key("b.dds"));
+        assert_eq!(cache.stats.resident_bytes, 2 * (4 * 4 * 4 + 8));
+    }
+
     #[test]
     fn dedup_stores_identical_content_once_under_alias_names() {
         let mut cache = TextureCache::new(64 << 20);

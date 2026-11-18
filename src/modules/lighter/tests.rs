@@ -685,10 +685,138 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_rigid_hanger(&mut h);
     exercise_resource_reuse(&mut h);
     exercise_texture_prefix_replacement(&mut h);
+    exercise_ray_texture_filter(&mut h);
     exercise_chunk_scaling(&mut h);
     if mode == Mode::Software {
         exercise_reprojection_shader(&h);
     }
+}
+
+fn exercise_ray_texture_filter(h: &mut Harness) {
+    use textures::Filter;
+    h.ray.settings.lighting = false;
+    h.ray.settings.shadows = false;
+    h.ray.settings.reflections = false;
+    h.ray.settings.denoiser = false;
+    h.ray.settings.progressive = false;
+    h.ray.settings.bounces = 0;
+    h.ray.settings.samples = 1;
+    h.ray.settings.resolution = 100;
+    let empty = Builder::default().finish();
+    const SIDE: u32 = 33;
+
+    // Half black / half white at level zero must interpolate to 0.5 linear,
+    // not decode a prefiltered encoded 0.5 to 0.214.
+    let mut bank = Textures::default();
+    let ramp = bank
+        .tile([2, 1], 2, Filter::Color, |x, _| {
+            if x == 0 {
+                0xff00_0000
+            } else {
+                u32::MAX
+            }
+        })
+        .unwrap();
+    let mut b = Builder::default();
+    let quad = upright(&mut b, -3., [1.; 4], 0, ramp);
+    put(&mut b, quad);
+    h.ray.install(Ok((b.finish(), bank)));
+    assert_radiance(
+        "linear-light bilinear",
+        h.pixel(test_frame(Vec3::ZERO, -Vec3::Z, SIDE), &empty),
+        [0.5; 3],
+    );
+
+    // Leave the deliberately green authored lower mip distinct from the red
+    // top when a real ray minifies the wall. There is no generated third mip.
+    let mut bank = Textures::default();
+    let tile = textures::Tile::levels(
+        [
+            ([64, 32], &[255, 0, 0, 255].repeat(64 * 32)[..]),
+            ([32, 16], &[0, 255, 0, 255].repeat(32 * 16)[..]),
+        ],
+        64,
+        Filter::Color,
+    )
+    .unwrap();
+    let addr = bank.insert(&tile).unwrap();
+    let mut b = Builder::default();
+    let quad = upright(&mut b, -10., [1.; 4], 0, addr);
+    put(&mut b, quad);
+    h.ray.install(Ok((b.finish(), bank)));
+    assert_radiance(
+        "authored mip",
+        h.pixel(test_frame(Vec3::ZERO, -Vec3::Z, SIDE), &empty),
+        [0., 1., 0.],
+    );
+
+    // A repeating brick wall at 3.6 degrees from tangent. Measure jitter
+    // along the wide footprint axis and horizontal mortar detail across it.
+    // All probes hit the wall (depth check), so sky cannot inflate contrast.
+    let mut bank = Textures::default();
+    let brick = bank
+        .tile([128, 128], 128, Filter::Color, |x, y| {
+            let mortar = y % 32 < 8 || (x + ((y / 32) & 1) * 8) % 16 < 2;
+            u32::from_le_bytes(if mortar {
+                [40, 44, 48, 255]
+            } else {
+                [220, 72, 32, 255]
+            })
+        })
+        .unwrap();
+    let mut b = Builder::default();
+    let material = b.surface(Surface::new(brick, 0, 0., 0.));
+    let mut mesh = Mesh::default();
+    for [x, y] in [[-20., 4.], [20., 4.], [-20., -4.], [20., -4.]] {
+        mesh.vertices.push(Vertex::new(
+            [x, y, -4.],
+            [0., 0., 1.],
+            [x * 0.125, y * 0.0625],
+        ));
+    }
+    mesh.tri([0, 2, 1], material);
+    mesh.tri([1, 2, 3], material);
+    b.world_mesh(&mesh).unwrap();
+    h.ray.install(Ok((b.finish(), bank)));
+    let mut measures = Vec::new();
+    for anisotropy in [1, 8, 16] {
+        h.ray.settings.anisotropy = anisotropy;
+        let sweep = |h: &mut Harness, y| -> [u8; 8] {
+            std::array::from_fn(|i| {
+                let x = i as f32 / 16.;
+                let eye = Vec3::new(x - 16., y, -3.);
+                let frame = test_frame(eye, Vec3::new(16., 0., -1.), SIDE);
+                let (c, depth) = h.pixel(frame, &empty);
+                assert!(
+                    (depth - depth_at(frame, Vec3::new(x, y, -4.))).abs() < 2e-6,
+                    "missed the brick wall"
+                );
+                c[0]
+            })
+        };
+        let fill = sweep(h, 2.5);
+        let mortar = sweep(h, 0.5);
+        let contrast = fill.iter().map(|&x| f32::from(x)).sum::<f32>() / 8.
+            - mortar.iter().map(|&x| f32::from(x)).sum::<f32>() / 8.;
+        let shimmer = fill.iter().max().unwrap() - fill.iter().min().unwrap();
+        measures.push((contrast, shimmer));
+    }
+    assert!(
+        measures[0].0.abs() < 5.,
+        "isotropic reference was not minified: {measures:?}"
+    );
+    for (contrast, shimmer) in &measures[1..] {
+        assert!(
+            *contrast > 35. && *shimmer < 14,
+            "grazing brick wall lost detail or shimmered: {measures:?}"
+        );
+    }
+    assert!(
+        measures[2].0 >= measures[1].0,
+        "16× removed cross-axis detail: {measures:?}"
+    );
+    h.ray.settings.anisotropy = 8;
+    eprintln!("Lighter: brick contrast and red-channel pan range at 1×/8×/16×: {measures:?}");
 }
 
 fn assert_radiance(label: &str, pixel: ([u8; 4], f32), linear: [f32; 3]) {
@@ -1252,6 +1380,7 @@ fn exercise_streamed_bmds(h: &mut Harness) {
         denoiser: false,
         progressive: false,
         soft_sun: false,
+        anisotropy: 8,
     };
     let sample = |h: &mut Harness| {
         h.ray.settings.bounces = 0;

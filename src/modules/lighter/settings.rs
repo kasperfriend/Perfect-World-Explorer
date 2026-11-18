@@ -44,6 +44,7 @@ pub struct Settings {
     pub bounces: u32,
     pub samples: u32,
     pub resolution: u32,
+    pub anisotropy: u32,
 }
 
 impl Default for Settings {
@@ -59,6 +60,7 @@ impl Default for Settings {
             bounces: 1,
             samples: 1,
             resolution: 50,
+            anisotropy: 8,
         }
     }
 }
@@ -92,6 +94,11 @@ impl Settings {
                 "bounces" => settings.bounces = number(settings.bounces, 0, 4),
                 "samples" => settings.samples = number(settings.samples, 1, 4),
                 "resolution" => settings.resolution = number(settings.resolution, 25, 100),
+                "anisotropy" => {
+                    if let Ok(n @ (1 | 8 | 16)) = value.parse::<u32>() {
+                        settings.anisotropy = n;
+                    }
+                }
                 _ => {}
             }
         }
@@ -100,9 +107,9 @@ impl Settings {
 
     fn encode(self) -> String {
         format!(
-            "# Lighter settings\nmode={}\nlighting={}\nshadows={}\nsoft_sun={}\nreflections={}\ndenoiser={}\nprogressive={}\nbounces={}\nsamples={}\nresolution={}\n",
+            "# Lighter settings\nmode={}\nlighting={}\nshadows={}\nsoft_sun={}\nreflections={}\ndenoiser={}\nprogressive={}\nbounces={}\nsamples={}\nresolution={}\nanisotropy={}\n",
             self.mode.token(), self.lighting, self.shadows, self.soft_sun, self.reflections, self.denoiser, self.progressive, self.bounces,
-            self.samples, self.resolution,
+            self.samples, self.resolution, self.anisotropy,
         )
     }
 
@@ -147,12 +154,14 @@ mod tests {
         );
         assert!(defaults.progressive && defaults.denoiser);
         let s = Settings::decode(
-            "mode=hardware\nbounces=99\nshadows=false\nsoft_sun=false\ndenoiser=false\nprogressive=false\nsamples=0\nresolution=bad",
+            "mode=hardware\nbounces=99\nshadows=false\nsoft_sun=false\ndenoiser=false\nprogressive=false\nsamples=0\nresolution=bad\nanisotropy=16",
         );
         assert_eq!(s.mode, Mode::Hardware);
         assert_eq!(s.bounces, 4);
         assert_eq!(s.samples, 1);
         assert_eq!(s.resolution, 50);
+        assert_eq!(s.anisotropy, 16);
+        assert_eq!(Settings::decode("anisotropy=12").anisotropy, 8);
         assert!(!s.shadows && s.lighting && s.reflections);
         assert!(!s.denoiser && !s.progressive && !s.soft_sun);
         assert_eq!(Settings::decode(&s.encode()), s);

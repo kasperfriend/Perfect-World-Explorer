@@ -115,21 +115,35 @@ fn decode_rgba(bytes: &[u8]) -> Result<(image::RgbaImage, bool), String> {
     Ok((image.into_rgba8(), alpha_texture))
 }
 
-/// Top-level RGBA for alternate renderers that need texels instead of a GPU
-/// texture. Share the DDS decoder (including BC1's one-bit transparency).
+/// Decode the authored mip count for alternate material samplers. Non-DDS
+/// images supply a single base level; the ray texture bank can filter a tail.
 #[allow(dead_code)]
-pub(crate) fn decode_for_rays(bytes: &[u8]) -> Result<(image::RgbaImage, bool), String> {
+pub(crate) fn decode_for_rays(bytes: &[u8]) -> Result<(Vec<image::RgbaImage>, bool), String> {
     if !bytes.starts_with(b"DDS ") {
-        return decode_rgba(bytes);
+        return decode_rgba(bytes).map(|(image, alpha)| (vec![image], alpha));
     }
-    let dds = Dds::parse(bytes)?;
-    let mip = dds.mips.first().ok_or("empty model DDS")?;
-    let mut rgba = Vec::new();
-    append_mip(bytes, dds.format, mip, &mut rgba)?;
-    let has_alpha = dds.format.alpha_texture() || rgba.chunks_exact(4).any(|pixel| pixel[3] < 255);
-    let image = image::RgbaImage::from_raw(mip.width, mip.height, rgba)
-        .ok_or("invalid decoded model texture extent")?;
-    Ok((image, has_alpha))
+    // If the lower chain is invalid but the base is readable, its eventual
+    // generated mip tail is a mip fallback rather than a missing texture.
+    let dds = match Dds::parse(bytes) {
+        Ok(dds) => dds,
+        Err(error) => {
+            return decode_rgba(bytes)
+                .map(|(image, alpha)| (vec![image], alpha))
+                .map_err(|_| error)
+        }
+    };
+    let mut images = Vec::with_capacity(dds.mips.len());
+    let mut has_alpha = dds.format.alpha_texture();
+    for mip in &dds.mips {
+        let mut rgba = Vec::new();
+        append_mip(bytes, dds.format, mip, &mut rgba)?;
+        has_alpha |= rgba.chunks_exact(4).any(|pixel| pixel[3] < 255);
+        images.push(
+            image::RgbaImage::from_raw(mip.width, mip.height, rgba)
+                .ok_or("invalid decoded model texture extent")?,
+        );
+    }
+    Ok((images, has_alpha))
 }
 
 fn upload_image(
@@ -291,6 +305,35 @@ mod tests {
         let (image, alpha) = decode_rgba(&tga(24, &[3, 2, 1])).unwrap();
         assert!(!alpha);
         assert_eq!(image.into_raw(), [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn ray_decode_keeps_a_distinct_authored_bc1_mip() {
+        let mut bytes = vec![0; 128];
+        bytes[..4].copy_from_slice(b"DDS ");
+        for (o, v) in [
+            (4, 124u32),
+            (8, 0xa1007),
+            (12, 2),
+            (16, 4),
+            (20, 8),
+            (28, 2),
+            (76, 32),
+            (80, 4),
+            (108, 0x401008),
+        ] {
+            bytes[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        bytes[84..88].copy_from_slice(b"DXT1");
+        bytes.extend_from_slice(&[0, 248, 0, 0, 0, 0, 0, 0]); // red 4×2
+        bytes.extend_from_slice(&[224, 7, 0, 0, 0, 0, 0, 0]); // green 2×1
+        let (levels, alpha) = decode_for_rays(&bytes).unwrap();
+        assert!(!alpha);
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0].dimensions(), (4, 2));
+        assert_eq!(levels[1].dimensions(), (2, 1));
+        assert_eq!(levels[0].get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(levels[1].get_pixel(1, 0).0, [0, 255, 0, 255]);
     }
 
     #[test]

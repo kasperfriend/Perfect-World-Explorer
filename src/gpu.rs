@@ -554,6 +554,7 @@ struct MeshData {
     local_pages: Vec<crate::world_objects::Page>,
     /// Optional ray feed prepared on the same loader as the native pages.
     ray_scenery: Option<Result<lighter_host::ScenerySnapshot, String>>,
+    ray_grass: lighter_host::GrassTiles,
     /// True when this build left the locally streamed scenery out because the
     /// whole-world preload owns it. The renderer compares it against the state
     /// it is drawing with, the same way `lod` is compared, so a crossing into
@@ -812,8 +813,11 @@ fn build(
     // between a crossing that rebuilds a terrain mesh and one that also uploads
     // tens of megabytes of unused atlas.
     skip_local_scenery: bool,
-    ray_scenery: Option<&mut lighter_host::SceneryStream>,
+    mut ray_scenery: Option<&mut lighter_host::SceneryStream>,
 ) -> Result<MeshData, String> {
+    if ray_scenery.is_some() {
+        t.objects.retain_ray_dds();
+    }
     if vegetation_authored_mips {
         static WARN: std::sync::Once = std::sync::Once::new();
         WARN.call_once(|| {
@@ -1242,6 +1246,10 @@ fn build(
         (atlas, mips)
     } else {
         (Vec::new(), Vec::new())
+    };
+    let ray_grass = match ray_scenery.as_deref_mut() {
+        Some(stream) => lighter_host::grass_tiles(stream, &t.grass, &grass_copies)?,
+        None => lighter_host::GrassTiles::default(),
     };
     let grass = grass_builder.finish();
     if grass_debug() {
@@ -1733,6 +1741,7 @@ fn build(
         water_coverage,
         local_pages,
         ray_scenery,
+        ray_grass,
         local_scenery_skipped: skip_local_scenery,
     })
 }
@@ -7984,6 +7993,13 @@ fn preview_frame(
         mode,
         ..LighterSettings::default()
     };
+    if let Ok(value) = std::env::var("PW_PREVIEW_ANISOTROPY") {
+        lighter_settings.anisotropy = value
+            .parse::<u32>()
+            .ok()
+            .filter(|n| matches!(n, 1 | 8 | 16))
+            .ok_or("PW_PREVIEW_ANISOTROPY must be 1, 8 or 16")?;
+    }
     if audit.is_some() {
         if mode == LighterMode::Off {
             return Err("PW_PREVIEW_COVERAGE requires software or hardware Lighter".into());
@@ -8329,6 +8345,13 @@ fn preview_frame(
         {
             writeln!(meta, "unsupported_ski_{name}={count}").unwrap();
         }
+        let mips = renderer.lighter.texture_mips();
+        writeln!(
+            meta,
+            "mip_fallback={}\nmip_generated={}\nmip_reduced={}\nmip_authored_levels={}",
+            mips.fallback, mips.generated, mips.reduced, mips.authored_levels
+        )
+        .unwrap();
         if let Some(bmd) = &renderer.lighter.scenery_coverage {
             writeln!(meta, "{bmd}").unwrap();
         }

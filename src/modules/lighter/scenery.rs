@@ -36,6 +36,7 @@ pub(in crate::gpu) struct SceneryStream {
     manifest: Manifest,
     assets: HashMap<usize, Result<Arc<Asset>, Omission>>,
     tiles: HashMap<TileKey, Weak<Tile>>,
+    pub(super) grass_tiles: HashMap<String, Arc<Tile>>,
 }
 
 pub(in crate::gpu) struct Snapshot {
@@ -161,15 +162,20 @@ impl Asset {
                             let tile = if let Some(tile) = tiles.get(&key).and_then(Weak::upgrade) {
                                 tile
                             } else {
-                                let tile = Arc::new(Tile::new(
-                                    [tex.width as u32, tex.height as u32],
-                                    COLOR_SIDE,
-                                    filter,
-                                    |x, y| {
-                                        let p = (y as usize * tex.width + x as usize) * 4;
-                                        u32::from_le_bytes(tex.rgba[p..p + 4].try_into().unwrap())
-                                    },
-                                )?);
+                                let chain = tex.ray_dds.as_deref().and_then(|raw| {
+                                    crate::model_texture_gpu::decode_for_rays(raw).ok()
+                                });
+                                let tile = Arc::new(match chain {
+                                    Some((images, _)) => Tile::images(&images, COLOR_SIDE, filter)?,
+                                    None => Tile::levels(
+                                        [(
+                                            [tex.width as u32, tex.height as u32],
+                                            tex.rgba.as_slice(),
+                                        )],
+                                        COLOR_SIDE,
+                                        filter,
+                                    )?,
+                                });
                                 tiles.insert(key, Arc::downgrade(&tile));
                                 tile
                             };
@@ -325,6 +331,7 @@ impl SceneryStream {
         cutoff: Option<[f32; 4]>,
         lights: &[SceneLight],
     ) -> Result<Snapshot, String> {
+        objects.retain_ray_dds();
         if !self
             .catalog
             .as_ref()
