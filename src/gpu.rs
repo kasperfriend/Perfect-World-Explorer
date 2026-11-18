@@ -5383,6 +5383,9 @@ pub fn run(
     // almost never changes them.
     // The last element says whether the whole-world preload owns the scenery, so
     // the worker can leave the local half of the mesh out (see `build`).
+    // Taken before `t` is moved into the streaming thread below, so the UI can
+    // still find the client's fonts.
+    let element_dir = t.element.clone();
     let (request_tx, request_rx) =
         std::sync::mpsc::channel::<(f32, f32, DetailSettings, u64, bool)>();
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<MeshData, String>>(1);
@@ -5420,7 +5423,7 @@ pub fn run(
     // Chinese-named area read `Entering _ _ _`, three boxes for three
     // characters. Nameplates installed a CJK face for their own labels only,
     // which is why overhead names were fine and the banner was not.
-    crate::modules::install_client_cjk(&egui_ctx, &t.element);
+    crate::modules::install_client_cjk(&egui_ctx, &element_dir);
     let mut egui_state = egui_winit::State::new(
         egui_ctx.clone(),
         egui::ViewportId::ROOT,
