@@ -334,10 +334,23 @@ fn read_entry_table(
         let (decoded, _, _) = encoding_rs::GBK.decode(&data[..zero]);
         let name = decoded.replace('\\', "/");
         // `dwOffset` is `DWORD` in the older revisions and `UINT64` in
-        // `0x00020003`; the client copies it into a `FILEENTRY` whose field is
-        // only a `DWORD`, so it truncates there too.
+        // `0x00020003`. The client copies it into a `FILEENTRY` whose field is
+        // only a `DWORD`, so it truncates — but truncating here would turn a
+        // far-away entry into a near one and read the wrong bytes out of a
+        // perfectly good payload. Only an archive past 4 GiB can carry such an
+        // offset, and none does (`MAX_FILE_PACKAGE` is 2 GiB), so the honest
+        // answer is to name the entry and refuse it.
         let offset = if rev.offset_width == 8 {
-            u64::from_le_bytes(data[rev.offset_at..rev.offset_at + 8].try_into().unwrap()) as u32
+            let wide =
+                u64::from_le_bytes(data[rev.offset_at..rev.offset_at + 8].try_into().unwrap());
+            match u32::try_from(wide) {
+                Ok(offset) => offset,
+                Err(_) => {
+                    return Err(format!(
+                        "entry {name} starts at {wide}, past the 4 GiB an entry offset can address"
+                    ))
+                }
+            }
         } else {
             u32le(data, rev.offset_at)?
         };
@@ -357,6 +370,18 @@ fn read_entry_table(
             compressed,
         });
         cursor += 8 + len;
+    }
+    // The client seeks to the table and reads exactly `count` records; it never
+    // looks at what follows. Bytes left over after the last record therefore
+    // mean the framing was misread — a wrong count, length or encryption flag —
+    // and the entries that came out are not necessarily the archive's. The
+    // shipped packs end exactly on the last record, so this costs no coverage
+    // and turns a silently wrong directory into a refusal.
+    if cursor != table.len() {
+        return Err(format!(
+            "{} trailing bytes after the last of {count} entry records",
+            table.len() - cursor
+        ));
     }
     Ok(result)
 }
@@ -763,6 +788,66 @@ mod tests {
         path
     }
 
+    /// `0x00020003` widens `dwOffset` to 64 bits, but `Entry` and the client's
+    /// own `FILEENTRY` hold 32. Truncating would fold a far entry onto a near
+    /// one and read the wrong bytes — a silent corruption of a perfectly good
+    /// payload. An archive that can hold such an offset is past 4 GiB, which no
+    /// shipped pack reaches, so the entry is named and refused instead.
+    #[test]
+    fn an_entry_offset_past_four_gibibytes_is_refused_not_truncated() {
+        let mut bytes = package(0x0002_0003, &[("far.bin", b"payload")], false);
+        // The entry table starts where the trailer's `dwEntryOffset` says, after
+        // the mask is removed; the record itself begins 8 bytes later (the
+        // masked length and check word).
+        let header_at = bytes.len() - 280 - 8;
+        let table =
+            u32::from_le_bytes(bytes[header_at + 8..header_at + 12].try_into().unwrap()) ^ MASK;
+        let record_start = table as usize + 8;
+        // Rewrite the record's 64-bit dwOffset to 2^32, which truncates to 0 —
+        // the *start of the package* — if the reader is careless.
+        bytes[record_start + 264..record_start + 272].copy_from_slice(&(1u64 << 32).to_le_bytes());
+        let path = write_temp(&bytes, "far");
+        let mut file = std::fs::File::open(&path).unwrap();
+        let error = directory(&mut file).unwrap_err();
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            error.contains("past the 4 GiB"),
+            "must name the offset rather than truncate it: {error}"
+        );
+    }
+
+    /// The client reads exactly `count` records and never looks at what
+    /// follows, so leftover bytes mean the framing was misread (a wrong count,
+    /// length or encryption flag) and the entries that came out are not
+    /// necessarily the archive's. Every shipped pack ends exactly on its last
+    /// record, so refusing the mismatch costs no coverage.
+    #[test]
+    fn trailing_bytes_after_the_last_entry_record_are_a_framing_error() {
+        let good = package(0x0002_0003, &[("a.txt", b"one")], false);
+        let path = write_temp(&good, "exact");
+        let mut file = std::fs::File::open(&path).unwrap();
+        let entries = directory(&mut file).unwrap();
+        assert_eq!(entries.len(), 1, "the exact package must still read");
+        drop(file);
+        std::fs::remove_file(&path).unwrap();
+
+        // Declare one more record than exists: the walk runs off the end of the
+        // table and has to say so rather than returning a short list.
+        let mut fewer = package(0x0002_0003, &[("a.txt", b"one")], false);
+        let count_at = fewer.len() - 8;
+        fewer[count_at..count_at + 4].copy_from_slice(&2u32.to_le_bytes());
+        let path = write_temp(&fewer, "shorttable");
+        let mut file = std::fs::File::open(&path).unwrap();
+        let error = directory(&mut file).unwrap_err();
+        drop(file);
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            error.contains("entry table") || error.contains("trailing"),
+            "a count past the table must be refused: {error}"
+        );
+    }
+
     /// The field offsets in [`REVISIONS`] are taken from the engine's structs,
     /// and every one of them was wrong in the first draft of this reader: the
     /// trailer's `dwFlags` and `szDescription` shift by eight bytes in
@@ -931,7 +1016,7 @@ mod tests {
         let declared = bytes.len() as u32 + 4096;
         bytes[4..8].copy_from_slice(&declared.to_le_bytes());
         let path = write_temp(&bytes, "split");
-        let mut file = std::fs::File::open(&path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
         safe_header(
             &bytes[..12],
             bytes.len() as u64,

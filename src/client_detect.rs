@@ -1189,16 +1189,40 @@ fn scan_archive(element: &Path, name: &str) -> ArchiveInfo {
 /// The container version word from the trailer. Read directly so a pack whose
 /// directory fails still reports its format version.
 fn container_version(path: &Path, kind: ContainerKind) -> Option<u32> {
-    let mut file = fs::File::open(path).ok()?;
     use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
     let size = file.seek(SeekFrom::End(0)).ok()?;
     if size < 280 {
         return None;
     }
-    file.seek(SeekFrom::Start(size - 4)).ok()?;
+    // The version word is the last four bytes of the *trailer*, and the trailer
+    // ends where the prefix says it does, not necessarily at the end of the
+    // file: a split package's `.pck` half is shorter than its declared size,
+    // and a repacked archive can carry bytes past the trailer. Reading from
+    // `size - 4` reports whatever happens to be last as a version.
+    let mut prefix = [0u8; 12];
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.read_exact(&mut prefix).ok()?;
+    let declared = u64::from(u32::from_le_bytes(prefix[4..8].try_into().ok()?));
+    let end = match kind {
+        ContainerKind::Pck if prefix[0..4] == 0x4dca23efu32.to_le_bytes() => {
+            if declared >= 292 && declared <= size {
+                declared
+            } else {
+                size
+            }
+        }
+        // The Angelica trailer is anchored to the end of the file
+        // (`angelica_pck::directory` reads it from `file_len - 280`), so a
+        // declared size that disagrees with the file is not usable there.
+        _ => size,
+    };
+    if end < 4 {
+        return None;
+    }
+    file.seek(SeekFrom::Start(end - 4)).ok()?;
     let mut word = [0u8; 4];
     file.read_exact(&mut word).ok()?;
-    let _ = kind;
     Some(u32::from_le_bytes(word))
 }
 
@@ -1372,6 +1396,47 @@ mod tests {
     /// single file, and "unsupported PCK version" or "bad package end offset"
     /// for a pack that is merely continued elsewhere is a fault the operator
     /// cannot act on.
+    /// The version word is the last four bytes of the *trailer*, and the trailer
+    /// ends where the prefix says it does. Reading from `size - 4` reports
+    /// whatever happens to be last — for a split package's `.pck` half that is
+    /// payload, and for a repacked archive it is trailing junk — as a version.
+    #[test]
+    fn the_container_version_comes_from_the_declared_trailer_not_the_file_end() {
+        let root = std::env::temp_dir().join(format!("pw-ver-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        // A minimal 0x00020002 trailer with the version word in place…
+        let mut pack = vec![0u8; 12];
+        pack[0..4].copy_from_slice(&0x4dca23efu32.to_le_bytes());
+        pack[8..12].copy_from_slice(&0x56a089b7u32.to_le_bytes());
+        let mut trailer = vec![0u8; 280];
+        trailer[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
+        trailer[268..272].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
+        trailer[276..280].copy_from_slice(&0x0002_0002u32.to_le_bytes());
+        pack.extend_from_slice(&trailer);
+        let declared = pack.len() as u32;
+        pack[4..8].copy_from_slice(&declared.to_le_bytes());
+        let path = root.join("exact.pck");
+        fs::write(&path, &pack).unwrap();
+        assert_eq!(
+            container_version(&path, ContainerKind::Pck),
+            Some(0x0002_0002)
+        );
+
+        // …and the same pack with four bytes of junk appended after it. The
+        // prefix still declares the true end, so the version must not move.
+        let mut padded = pack.clone();
+        padded.extend_from_slice(&0xdead_beefu32.to_le_bytes());
+        let path = root.join("padded.pck");
+        fs::write(&path, &padded).unwrap();
+        assert_eq!(
+            container_version(&path, ContainerKind::Pck),
+            Some(0x0002_0002),
+            "trailing bytes must not become the reported version"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn a_split_pack_names_the_pkx_that_holds_its_other_half() {
         let root = std::env::temp_dir().join(format!("pw-split-{}", std::process::id()));
