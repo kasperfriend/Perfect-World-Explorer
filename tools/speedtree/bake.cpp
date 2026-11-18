@@ -42,14 +42,20 @@ static bool bake(Api&a,const wchar_t*src,const wchar_t*dst,unsigned tree_id){FIL
  w.u((uint32_t)clusters.size());w.u(64);for(unsigned k=0;k<clusters.size();k++){float rho=clusters[k].rho;for(int j=0;j<4;j++)for(unsigned frame=0;frame<64;frame++){unsigned off=k*16+j*4;float X=motion[frame][off],Y=motion[frame][off+1],Z=motion[frame][off+2];if(rho>1000.f){w.f(X);w.f(Y);w.f(Z);}else{float c=cosf(rho),sn=sinf(rho);w.f(c*X+sn*Y);w.f(-sn*X+c*Y);w.f(Z);}}}a.rock(instance,false);
  printf("LOD %.2f branch %d frond %d leaves %d count %u; card error %.5f\n",level,g.branches.lod,g.fronds.lod,l.lod,l.count,maxerr);}FILE*out=_wfopen(dst,L"wb");if(!out)throw "cannot create cache file";bool saved=fwrite(w.b.data(),1,w.b.size(),out)==w.b.size();if(fclose(out)||!saved)throw "cannot write cache";ok=true;}catch(const char* e){fwprintf(stderr,L"failed %ls: ",src);fprintf(stderr,"%s\n",e?e:"runtime error");}a.dtor(instance);a.free(instance);return ok;}
 int wmain(int argc,wchar_t**argv){
- if(argc!=3){fwprintf(stderr,L"usage: speedtree-bake.exe <client SpeedTreeRT.dll> <tree-source directory>\n");return 2;}
+ if(argc!=3&&argc!=4){fwprintf(stderr,L"usage: speedtree-bake.exe <client SpeedTreeRT.dll> <tree-source directory> [tree-type count]\n");return 2;}
+ unsigned long tree_count=59;
+ if(argc==4){
+  wchar_t* count_end=nullptr;
+  tree_count=wcstoul(argv[3],&count_end,10);
+  if(!count_end||count_end==argv[3]||*count_end||tree_count>10000){fwprintf(stderr,L"invalid tree-type count\n");return 2;}
+ }
  std::wstring report_path=std::wstring(argv[2])+L"/tree-alpha-refs.csv";
  alpha_report=_wfopen(report_path.c_str(),L"wb");
  if(!alpha_report){fwprintf(stderr,L"cannot create %ls\n",report_path.c_str());return 2;}
  fprintf(alpha_report,"tree_id,lod,alpha_branch,alpha_frond\n");
  Api a=open_api(argv[1]);
  int failures=0;
- for(unsigned i=0;i<59;i++){
+ for(unsigned i=0;i<tree_count;i++){
   wchar_t name[64];
   swprintf(name,64,L"tree-%03u.spt",i);
   std::wstring src=std::wstring(argv[2])+L"/"+name;

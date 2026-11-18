@@ -84,6 +84,15 @@ fn main() {
                     "Unique GPU atlases: {}, exact bytes including mips: {}",
                     stats.atlas_pages, stats.atlas_bytes
                 );
+                println!(
+                    "unavailable scenery models: {}{}",
+                    stats.unavailable_models.len(),
+                    if stats.unavailable_examples.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {}", stats.unavailable_examples.join("; "))
+                    }
+                );
                 println!("Done {processed}/{count}, {pages} pages, {verts} vertices, {tris} triangles, {skipped} missing-texture meshes; atlas base {:.1} MiB, with mips ~{:.1} MiB",atlas_bytes as f64/1048576.,atlas_bytes as f64/1048576.*(1.-1./65536.)/0.75);
                 return;
             }
