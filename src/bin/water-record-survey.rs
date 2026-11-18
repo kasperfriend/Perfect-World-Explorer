@@ -1,5 +1,14 @@
 //! Survey real ECWLD/ECBSD water and authored shoreline records.
 #![allow(dead_code)]
+// `water.rs`, `far_trees_gpu.rs` and the grass loader report through
+// `crate::diag!`; a `#[path]` module set is its own crate root, so the stub
+// supplies it. See `support/diag_stub.rs`.
+#[macro_use]
+#[path = "support/diag_stub.rs"]
+mod diag_stub;
+#[allow(unused_imports)]
+pub use diag_stub::diagnostics;
+
 #[path = "../pck.rs"]
 mod pck;
 #[path = "../scene.rs"]

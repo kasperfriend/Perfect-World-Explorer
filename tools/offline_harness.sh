@@ -572,7 +572,33 @@ case "${1:-test}" in
         # path does not touch `image`, so a small shim stands in for it.
         real_deps
         mkdir -p "$OUT/water"
+        # The reader reports its per-record failures through `crate::diag!`, so
+        # the shim has to carry it: a stub that dropped the lines would make the
+        # harness disagree with the viewer about which records load. It goes in
+        # its own quoted heredoc, because the macro's `$` is not shell input and
+        # the outer heredoc is unquoted.
+        cat > "$OUT/water/diag_shim.rs" <<'EOF'
+pub mod diagnostics {
+    #[allow(dead_code)]
+    #[derive(Clone, Copy)]
+    pub enum Channel {
+        SceneWater,
+    }
+    pub fn enabled(_channel: Channel) -> bool {
+        false
+    }
+    pub fn emit(_channel: Channel, _line: String) {}
+}
+#[macro_export]
+macro_rules! diag {
+    ($channel:ident, $($arg:tt)*) => {{ let _ = format!($($arg)*); }};
+}
+EOF
         cat > "$OUT/water/lib.rs" <<EOF
+#[path = "$OUT/water/diag_shim.rs"]
+#[macro_use]
+mod diag_shim;
+pub use diag_shim::diagnostics;
 pub mod scene {
     pub struct WaterRef { pub export_id: u32, pub offset: u32 }
     pub struct Block { pub water: Vec<WaterRef> }

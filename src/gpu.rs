@@ -1485,6 +1485,21 @@ fn build(
     // (`src/water.rs`), so a fall cannot be one of these: an empty list around
     // the fall proves the surface is the static-mesh water of
     // A3DTerrainWater.cpp:67-84, which this loader does not read yet.
+    // A map can reference thousands of water records and still hand the
+    // renderer a handful of areas if the reader drops them (the 1.3.1 world
+    // references 9,204 references over 72 patches). One line per rebuild says
+    // what arrived, so "the water is missing" is answerable from the log rather
+    // than from the picture.
+    crate::diag!(
+        SceneWater,
+        "{} water areas, {} cells, {} of them wet",
+        areas.len(),
+        areas.iter().map(|a| a.mask.len()).sum::<usize>(),
+        areas
+            .iter()
+            .map(|a| a.mask.iter().filter(|&&m| m != 0).count())
+            .sum::<usize>()
+    );
     for a in &areas {
         let cells = a.mask.iter().filter(|&&m| m != 0).count();
         // `wet` is the authored mask's non-zero count, which is a depth/shore
@@ -2176,6 +2191,22 @@ impl Renderer {
             &uniform,
             &reflected_uniform,
             vegetation_authored_mips,
+        );
+        // The forest is built once, and a type it could not build takes every
+        // one of its placements with it, so what it produced belongs in a log
+        // channel rather than only on stderr: "the trees only appear when I am
+        // close" is answerable from this line alone. The 1.4.4 report is the
+        // case that motivated it.
+        let (tree_instances, tree_bytes) = far_trees.residency_stats();
+        crate::diag!(
+            TimingLoad,
+            "Tree LOD forest: {} placements across {} batches, {} types built of {} \
+             authored ({} KiB instance buffer)",
+            tree_instances,
+            far_trees.batch_count(),
+            far_trees.group_count(),
+            t.scene.tree_types.len(),
+            tree_bytes / 1024
         );
         // Immutable tree meshes/motion samples and water frames now live on
         // the GPU. The streaming worker never reads these sources again.
@@ -5383,6 +5414,13 @@ pub fn run(
         })
         .map_err(|e| format!("cannot start world streaming thread: {e}"))?;
     let egui_ctx = egui::Context::default();
+    // The interface is drawn with egui's built-in Latin faces, and a zone name,
+    // an item name or a message straight out of the client is Chinese. Without
+    // the client's own font each such glyph is a tofu box: `Entering` over a
+    // Chinese-named area read `Entering _ _ _`, three boxes for three
+    // characters. Nameplates installed a CJK face for their own labels only,
+    // which is why overhead names were fine and the banner was not.
+    crate::modules::install_client_cjk(&egui_ctx, &t.element);
     let mut egui_state = egui_winit::State::new(
         egui_ctx.clone(),
         egui::ViewportId::ROOT,
@@ -6261,7 +6299,16 @@ pub fn run(
                     // atlases nothing samples. Crossing into or out of that
                     // state changes what the mesh should contain, so it is part
                     // of the staleness test and not just of the request.
-                    let skip_local_scenery = renderer.world_done;
+                    // The preload takes the scenery over only once it has
+                    // pages to draw. `world_done` is raised on the worker's
+                    // `Done` message, which can arrive with zero pages — a
+                    // client whose ornament models this build cannot resolve
+                    // produces exactly that. Keying the hand-over on it alone
+                    // released every local page while the whole-world path had
+                    // nothing to put in their place, which is the 1.5.2 report
+                    // of a world with no buildings at all.
+                    let skip_local_scenery =
+                        renderer.world_done && !renderer.world_pages.is_empty();
                     let stale = match &aim {
                         Some(aim) => {
                             aim != &renderer.lod
@@ -6365,6 +6412,28 @@ pub fn run(
                                 stats,
                                 world_draw_cmds,
                             }) => {
+                                // A preload that finished with nothing to draw
+                                // has not taken the scenery over. Leaving
+                                // `world_done` set made the renderer skip every
+                                // local page for the rest of the session while
+                                // the whole-world path drew an empty list, and
+                                // said so only on stderr — the 1.5.2 report of
+                                // a world with no buildings is that state. The
+                                // local pages have to survive this branch, so
+                                // the check runs before they are released.
+                                if renderer.world_pages.is_empty() {
+                                    renderer.world_done = false;
+                                    renderer.world_draw_cmds = Default::default();
+                                    world_rx = None;
+                                    world_cancel = None;
+                                    world_started_at = None;
+                                    world_status = format!(
+                                        "World preload built no pages; local scenery kept ({processed} objects processed, {skipped} without a usable mesh)"
+                                    );
+                                    crate::diag!(TimingLoad, "{world_status}");
+                                    eprintln!("{world_status}");
+                                    break;
+                                }
                                 renderer.world_draw_cmds = world_draw_cmds;
                                 for page in &mut renderer.world_pages {
                                     page.release_cpu_ranges();

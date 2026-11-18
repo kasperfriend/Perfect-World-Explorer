@@ -6,6 +6,12 @@ mod designer;
 mod librarian;
 mod package;
 mod populator;
+
+/// Register the client's CJK font on the shared egui context so HUD strings the
+/// client authored in Chinese render instead of drawing one tofu box per glyph.
+pub fn install_client_cjk(ctx: &egui::Context, element: &std::path::Path) {
+    populator::install_client_cjk(ctx, element);
+}
 mod walker;
 
 use crate::{model_draw_gpu, navigation::MapSpace, water::WaterArea};

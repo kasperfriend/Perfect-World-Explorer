@@ -182,9 +182,10 @@ impl WaterArea {
     /// Decode one area from the offset of its first field (`color`), returning
     /// the area plus the offset of the next field in the run.
     ///
-    /// A run of areas shares one `version, count` header, so only the first
-    /// area's fields follow the version word; the rest follow the previous
-    /// area's shoreline arrays directly. Every field offset here is therefore
+    /// A run of areas shares one `version` word, so only the first area's
+    /// fields follow it; the rest follow the previous area's shoreline arrays
+    /// directly. The word after the version is not the number of areas (see
+    /// `decode_areas`). Every field offset here is therefore
     /// relative to the fields, not to the version word: `color` is at +0,
     /// `height` at +4, the flag at +36 and the cell mask at +37 for v3 and +36
     /// for v2.
@@ -225,7 +226,7 @@ impl WaterArea {
         let (shore_waves, next) = match parse_shore_waves(b, wave_start) {
             Ok((waves, next)) => (waves, next),
             Err(error) => {
-                eprintln!("water {export_id}: shoreline data unavailable: {error}");
+                crate::diag!(SceneWater, "water {export_id}: shoreline data unavailable: {error}");
                 (Vec::new(), b.len())
             }
         };
@@ -302,11 +303,21 @@ fn find_version_word(b: &[u8], from: usize) -> Option<usize> {
 
 /// Walk the `version, count, area…` list a record payload holds.
 ///
-/// The version word opens a run of `count` areas. Records carry trailing
-/// padding, so the walk stops at the first word that cannot open an area
-/// instead of insisting on an exact fit, and a run that turns out to be
-/// impossible is skipped rather than aborting the record: one stale area must
-/// not cost the map its water.
+/// The version word opens a run of areas, and the word after it is **not** how
+/// many areas follow. Every water record in the retail 1.3.1 world that decodes
+/// at all holds exactly one area and declares 3, 8, 6 or 4: `21.dat` record 0
+/// declares 3, `4.dat` record 1 declares 3 and `36.dat` record 9 declares 6,
+/// and in all three cases the area's shoreline arrays end exactly on the last
+/// byte of the record. The declared number counts something else (the client's
+/// `A3DWaterArea` list capacity, not its length), so the walk is bounded by the
+/// payload and a second area only exists if one really parses there.
+///
+/// This reader used to trust that word. A record declaring 3 held one area, the
+/// second area failed on the bytes that follow, and the failure threw away the
+/// area that *had* decoded — so nearly every record contributed no water at all
+/// and only the handful whose declared count happened to be 1 survived. That is
+/// what "water is broken in chunks" is: the surface is missing wherever a
+/// record's count lied, not chopped by geometry.
 fn decode_areas(b: &[u8], export_id: u32) -> Result<Vec<WaterArea>, String> {
     let mut areas = Vec::new();
     let mut p = 0usize;
@@ -315,39 +326,27 @@ fn decode_areas(b: &[u8], export_id: u32) -> Result<Vec<WaterArea>, String> {
         if !WATER_VERSIONS.contains(&version) {
             break;
         }
-        let count = u(b, p + 4)? as usize;
-        if count == 0 || count > 4096 {
-            break;
-        }
-        // The version and count words open the run, so the first area's fields
-        // follow them and every later area's fields follow the previous area's
-        // shoreline arrays.
+        // The version word opens the run, so the first area's fields follow it
+        // and every later area's fields follow the previous area's shoreline
+        // arrays. Stop when the payload runs out or a word that cannot open an
+        // area arrives; the declared count is not a bound.
         let mut cursor = p + 8;
-        let mut run = Vec::with_capacity(count);
-        let mut next = None;
-        for _ in 0..count {
+        let mut parsed = 0usize;
+        loop {
             match WaterArea::parse_fields(b, cursor, export_id, version) {
-                Ok((area, end)) => {
+                Ok((area, end)) if end > cursor => {
                     cursor = end;
-                    run.push(area);
+                    areas.push(area);
+                    parsed += 1;
                 }
-                Err(error) => {
-                    eprintln!("water {export_id}: area {version:#x} skipped: {error}");
-                    next = None;
-                    break;
-                }
+                _ => break,
             }
-            next = Some(cursor);
         }
-        match next {
-            Some(end) => {
-                areas.append(&mut run);
-                p = end;
-            }
-            // A run that failed resumes after the two header words, so a
-            // later real run can still be found.
-            None => p += 4,
-        }
+        // Nothing opened here, so this was not a run after all: resume one word
+        // later instead of stopping, so a real run further in is still found.
+        p = if parsed > 0 { cursor } else { p + 4 };
+        // A parsed run is followed by padding or the next run's version word;
+        // either way the outer walk decides.
     }
     if areas.is_empty() {
         return Err(format!(
@@ -470,51 +469,102 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
     records.sort_by_key(|r| r.0);
     for (index, order, r) in records {
         let off = r.offset as usize;
-        let record = u(&b, off + 4)? as usize;
-        let path = files
-            .get(index)
-            .ok_or("water subterrain index out of bounds")?;
+        let (Ok(record), Some(path)) = (u(&b, off + 4), files.get(index)) else {
+            continue;
+        };
+        let record = record as usize;
         if loaded_index != Some(index) {
-            let path = resolve_case_insensitive(dir, path)?;
+            // A patch this map references but the client does not ship costs
+            // its own references, not the world's whole water supply.
+            let resolved = match resolve_case_insensitive(dir, path) {
+                Ok(path) => path,
+                Err(error) => {
+                    crate::diag!(SceneWater, "water {}: BSData {index} unavailable: {error}", r.export_id);
+                    loaded_index = Some(index);
+                    loaded.clear();
+                    continue;
+                }
+            };
             drop(std::mem::take(&mut loaded));
-            loaded = fs::read(path).map_err(|e| e.to_string())?;
+            match fs::read(resolved) {
+                Ok(bytes) => loaded = bytes,
+                Err(error) => {
+                    crate::diag!(SceneWater, "water {}: BSData {index} unavailable: {error}", r.export_id);
+                    loaded_index = Some(index);
+                    continue;
+                }
+            }
             loaded_index = Some(index);
         }
         let data = &loaded;
-        if u(data, 0)? != 0x42584f4d || u(data, 4)? != 2 {
-            eprintln!(
+        let (Ok(magic), Ok(version)) = (u(data, 0), u(data, 4)) else {
+            continue;
+        };
+        if magic != 0x42584f4d || version != 2 {
+            crate::diag!(
+                SceneWater,
                 "water {}: BSData {index} has an unexpected header",
                 r.export_id
             );
             continue;
         }
-        let tail = data.len().checked_sub(4).ok_or("short BSData")?;
-        let entries = u(data, tail)? as usize;
-        let table = tail
-            .checked_sub(entries.checked_mul(4).ok_or("table overflow")?)
-            .ok_or("bad BSData table")?;
+        let Some(tail) = data.len().checked_sub(4) else {
+            continue;
+        };
+        let Ok(entries) = u(data, tail) else {
+            continue;
+        };
+        let entries = entries as usize;
+        let Some(table) = entries
+            .checked_mul(4)
+            .and_then(|bytes| tail.checked_sub(bytes))
+        else {
+            continue;
+        };
+        // Every bound below costs this reference only. `load` returning an
+        // error means "this map has no water" to the caller, so one stale index
+        // must never reach it: 1.3.1's world references 111 records across 72
+        // patches, and a single out-of-range index took the whole surface away.
         if record >= entries {
-            return Err("water record index out of bounds".into());
+            crate::diag!(
+                SceneWater,
+                "water {}: BSData {index} record {record} past {entries} entries",
+                r.export_id
+            );
+            continue;
         }
-        let rec = u(data, table + record * 4)? as usize;
+        let Ok(rec) = u(data, table + record * 4) else {
+            continue;
+        };
+        let rec = rec as usize;
         let mut end = table;
         for i in 0..entries {
-            let other = u(data, table + i * 4)? as usize;
+            let Ok(other) = u(data, table + i * 4) else {
+                continue;
+            };
+            let other = other as usize;
             if other > rec && other < end {
                 end = other;
             }
         }
         if rec >= end {
-            return Err("invalid water record boundary".into());
+            crate::diag!(
+                SceneWater,
+                "water {}: BSData {index} record {record} has no boundary",
+                r.export_id
+            );
+            continue;
         }
         // One unreadable record costs its own areas, not the whole world: the
         // caller treats a `load` error as "this map has no water", which drops
         // every other area on the map with it.
         match parse_record(&data[rec..end], r.export_id) {
             Ok(batch) => areas.extend(batch.into_iter().map(|area| (order, area))),
-            Err(error) => eprintln!(
+            Err(error) => crate::diag!(
+                SceneWater,
                 "water {}: BSData {} record {record} skipped: {error}",
-                r.export_id, index
+                r.export_id,
+                index
             ),
         }
     }
@@ -823,6 +873,30 @@ mod tests {
         assert_eq!(areas.len(), 2);
         assert_eq!(areas[1].columns, 2);
         assert_eq!(areas[1].center, [32., 1., 0.]);
+    }
+
+    /// The word after the version is not a count, and believing it cost nearly
+    /// every water area in the shipped world.
+    ///
+    /// Every record in the retail 1.3.1 patches that decodes at all holds
+    /// exactly one area and declares 3, 8, 6 or 4 (`21.dat` record 0 declares
+    /// 3, `4.dat` record 1 declares 3, `36.dat` record 9 declares 6), and the
+    /// area's shoreline arrays end exactly on the record's last byte. The old
+    /// walk read the declared number, failed on the bytes that follow the one
+    /// real area, and threw that area away with it — 0 of 11 record-payload
+    /// areas survived in the sample the fix was measured on.
+    #[test]
+    fn a_lying_area_count_does_not_discard_the_area_that_decodes() {
+        let payload = v3_payload(3, 2, [64., 30., -64.]);
+        let mut b = payload[..8].to_vec();
+        // Claim four areas where the payload holds exactly one.
+        b[4..8].copy_from_slice(&4u32.to_le_bytes());
+        b.extend_from_slice(&payload[8..]);
+        let areas = decode_areas(&b, 11).unwrap();
+        assert_eq!(areas.len(), 1);
+        assert_eq!(areas[0].center, [64., 30., -64.]);
+        assert_eq!(areas[0].columns, 3);
+        assert_eq!(areas[0].mask.len(), 6);
     }
 
     #[test]

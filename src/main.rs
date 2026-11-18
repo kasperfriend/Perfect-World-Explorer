@@ -3961,9 +3961,12 @@ fn main() {
         };
     if let Some(notice) = fallback_notice.as_deref() {
         preferred_world = "world".into();
-        saved.selected_world = "world".into();
+        // The fallback is a recovery, not a choice: `selected_world` stays the
+        // map the user picked, so the next launch tries it again. Overwriting it
+        // here made one bad load permanent — a client whose map failed once then
+        // opened on the mainland forever, with no way back but the map list.
         if let Err(error) = saved.save() {
-            eprintln!("Could not persist main-world fallback: {error}");
+            eprintln!("Could not persist the recovered main-world session: {error}");
         }
         eprintln!("{notice}");
         #[cfg(windows)]
@@ -4018,9 +4021,11 @@ fn main() {
         if world_load::post_load_failure_decision(&preferred_world, viewer_mode)
             == world_load::PostLoadDecision::RestartMainWorld
         {
-            saved.selected_world = "world".into();
+            // Same rule as the terrain fallback above: restart on the main
+            // world, but leave `selected_world` alone so the map the user chose
+            // is tried again on the next launch instead of being forgotten.
             if let Err(save_error) = saved.save() {
-                eprintln!("Could not persist main-world fallback: {save_error}");
+                eprintln!("Could not persist the recovered main-world session: {save_error}");
             }
             let notice = format!(
                 "Map {} failed after loading. The explorer is restarting in the main world.\n\n{error}",
