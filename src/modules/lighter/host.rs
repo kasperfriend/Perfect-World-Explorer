@@ -6,7 +6,7 @@ use super::{Camera, FrameSnapshot, MeshData, Vertex as WorldVertex};
 use crate::modules::lighter::{
     self,
     scene::*,
-    textures::{Textures, COLOR_SIDE, MASK_SIDE},
+    textures::{Filter, Textures, Tile, COLOR_SIDE, MASK_SIDE},
     Lighter,
 };
 use crate::{material::Materials, world_models_gpu, Terrain};
@@ -20,6 +20,7 @@ pub(super) struct Feed {
     // streamed scene; eviction doesn't leave stale material addresses.
     base: Textures,
     terrain_ids: Vec<u32>,
+    static_lights: Vec<Light>,
     mask_bank: Option<Textures>,
     terrain: [f32; 4],
     area_table: u32,
@@ -27,7 +28,7 @@ pub(super) struct Feed {
     far: Mesh,
     trees: Vec<Option<Tree>>,
     placements: Vec<crate::scene::Tree>,
-    grass: HashMap<Rect, Tile>,
+    grass: HashMap<(Rect, Filter), Tile>,
     waves: Vec<u32>,
     sky: lighter::sky::Sky,
     authored_mips: bool,
@@ -43,6 +44,12 @@ impl Feed {
         let mut result = Self {
             placements: t.trees.placements.clone(),
             authored_mips,
+            static_lights: t
+                .scene_lights
+                .lights
+                .iter()
+                .map(|l| point_light(l.position, l.range, l.diffuse, 1.))
+                .collect(),
             ..Self::default()
         };
         let upload = m
@@ -58,9 +65,11 @@ impl Feed {
         for texture in &upload.materials.textures {
             let decoded = texture.decode()?;
             let top = decoded.first().ok_or("empty terrain color DDS")?;
-            result
-                .terrain_ids
-                .push(result.base.rgba([top.width, top.height], &top.rgba)?);
+            result.terrain_ids.push(result.base.rgba(
+                [top.width, top.height],
+                &top.rgba,
+                Filter::Color,
+            )?);
         }
         result.sky = match lighter::sky::Sky::load(&t.element, &mut result.base) {
             Ok(sky) => sky,
@@ -71,11 +80,11 @@ impl Feed {
         };
         for frame in &t.water_normals {
             if let Some(image) = frame.first() {
-                result.waves.push(
-                    result
-                        .base
-                        .rgba([image.width(), image.height()], image.as_raw())?,
-                );
+                result.waves.push(result.base.rgba(
+                    [image.width(), image.height()],
+                    image.as_raw(),
+                    Filter::Color,
+                )?);
             }
         }
         for tree in &t.trees.types {
@@ -83,16 +92,9 @@ impl Feed {
                 result.trees.push(None);
                 continue;
             };
-            let bark = result
-                .base
-                .rgba([tree.bark.width(), tree.bark.height()], tree.bark.as_raw())?;
-            let leaves = result.base.rgba(
-                [tree.composite.width(), tree.composite.height()],
-                tree.composite.as_raw(),
-            )?;
             result
                 .trees
-                .push(Some(read_tree(tree, bark, leaves, authored_mips)));
+                .push(Some(read_tree(tree, &mut result.base, authored_mips)?));
         }
         // The mainland's native stride-four far mesh is ~2.9M triangles.
         // Use a coarse mesh of the SAME heightfield so the whole world is
@@ -138,7 +140,7 @@ impl Feed {
                 } else {
                     let bytes = l.mask.decode(l.mask_size)?;
                     let side = l.mask_size as u32;
-                    textures.tile([side, side], MASK_SIDE, |x, y| {
+                    textures.tile([side, side], MASK_SIDE, Filter::Color, |x, y| {
                         u32::from(bytes[(y * side + x) as usize]) * 0x01010101
                     })?
                 };
@@ -182,6 +184,9 @@ impl Feed {
             self.terrain[2],
         );
         let mut builder = Builder::default();
+        for &light in &self.static_lights {
+            builder.light(light);
+        }
         let terrain_id = builder.surface(Surface::new(0, TERRAIN, 0., 0.));
         builder.world_mesh(&span(
             &m.vertices,
@@ -282,6 +287,11 @@ impl Feed {
             for tri in indices.chunks_exact(3) {
                 let g = &vertices[tri[0] as usize];
                 let rect = Rect::new(g.vertex.color, g.scale_y, super::ATLAS, super::ATLAS)?;
+                let alpha = if self.authored_mips {
+                    g.vertex.color[3]
+                } else {
+                    84. / 255.
+                };
                 let texture = atlas_texture(
                     &mut grass_ids,
                     &mut self.grass,
@@ -289,12 +299,8 @@ impl Feed {
                     rect,
                     super::ATLAS,
                     &m.atlas,
+                    Filter::cutout(alpha, false),
                 )?;
-                let alpha = if self.authored_mips {
-                    g.vertex.color[3]
-                } else {
-                    84. / 255.
-                };
                 mesh.tri(
                     [tri[0] - low, tri[1] - low, tri[2] - low],
                     builder.surface(Surface::new(texture, CUTOUT | TWO_SIDED, alpha, 0.)),
@@ -452,6 +458,7 @@ fn span(
             .map(|i| [i[0] - min, i[1] - min, i[2] - min])
             .collect(),
         surfaces: vec![material; indices.len() / 3],
+        layers: vec![],
     })
 }
 
@@ -473,6 +480,7 @@ fn uncovered_far(far: &Mesh, [x0, x1, z0, z1]: [f32; 4], surface: u32) -> Mesh {
     Mesh {
         vertices: far.vertices.clone(),
         surfaces: vec![surface; triangles.len()],
+        layers: vec![],
         triangles,
     }
 }
@@ -491,82 +499,102 @@ fn water_mesh(m: &MeshData, builder: &mut Builder) -> Result<Mesh, String> {
     Ok(water)
 }
 
-fn read_tree(source: &crate::trees::TreeMesh, bark: u32, leaves: u32, authored: bool) -> Tree {
+fn read_tree(
+    source: &crate::trees::TreeMesh,
+    textures: &mut Textures,
+    authored: bool,
+) -> Result<Tree, String> {
     let xyz = |p: [f32; 3]| [p[0], p[2], p[1]];
-    let alpha = |value: Option<f32>, default: f32| {
+    let alpha = |value: Option<f32>, default: Option<f32>| {
         if authored {
-            value.filter(|v| *v >= 0.).map_or(default, |v| v / 255.)
+            value
+                .filter(|v| *v >= 0.)
+                .map_or(default.map(|r| (r, false)), |v| Some((v / 255., true)))
         } else {
-            default
+            default.map(|r| (r, false))
         }
     };
     let mut height = 5f32;
-    let lods = source
-        .lods
-        .iter()
-        .map(|lod| {
-            let thresholds = [
-                alpha(lod.branch_alpha_ref, 0.),
-                alpha(lod.frond_alpha_ref, 0.5),
-                if authored { 84. / 255. } else { 0.5 },
-            ];
-            let materials = std::array::from_fn(|i| {
-                Surface::new(
-                    if i == 0 { bark } else { leaves },
-                    if thresholds[i] > 0. {
-                        CUTOUT | TWO_SIDED
-                    } else {
-                        0
-                    },
-                    thresholds[i],
-                    0.,
+    let mut tiles = HashMap::new();
+    let mut lods = Vec::with_capacity(source.lods.len());
+    for lod in &source.lods {
+        let thresholds = [
+            alpha(lod.branch_alpha_ref, None),
+            alpha(lod.frond_alpha_ref, Some(0.5)),
+            if authored {
+                Some((84. / 255., true))
+            } else {
+                Some((0.5, false))
+            },
+        ];
+        let mut materials = [Surface::new(0, 0, 0., 0.); 3];
+        for (i, reference) in thresholds.into_iter().enumerate() {
+            let image = if i == 0 {
+                &source.bark
+            } else {
+                &source.composite
+            };
+            let mode = reference.map_or(Filter::Color, |(r, strict)| Filter::cutout(r, strict));
+            let addr = match tiles.entry((i == 0, mode)) {
+                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+                std::collections::hash_map::Entry::Vacant(e) => *e.insert(textures.rgba(
+                    [image.width(), image.height()],
+                    image.as_raw(),
+                    mode,
+                )?),
+            };
+            let (cutoff, flags) = reference.map_or((0., 0), |(r, strict)| {
+                (
+                    r,
+                    CUTOUT | TWO_SIDED | if strict { STRICT_ALPHA } else { 0 },
                 )
             });
-            let mut mesh = Mesh::default();
-            for (i, part) in [&lod.branch, &lod.frond].into_iter().enumerate() {
+            materials[i] = Surface::new(addr, flags, cutoff, 0.);
+        }
+        let mut mesh = Mesh::default();
+        for (i, part) in [&lod.branch, &lod.frond].into_iter().enumerate() {
+            let base = mesh.vertices.len() as u32;
+            mesh.vertices.extend(part.vertices.iter().map(|v| {
+                height = height.max(v.pos[2]);
+                Vertex::new(xyz(v.pos), xyz(v.normal), v.uv)
+            }));
+            for tri in part.indices.chunks_exact(3) {
+                mesh.tri([base + tri[0], base + tri[1], base + tri[2]], i as u32);
+            }
+        }
+        for leaf in &lod.leaves {
+            height = height.max(leaf.center[2]);
+            let center = Vec3::from_array(xyz(leaf.center));
+            // Real SpeedTree leaf geometry/UVs. Camera-only billboards would
+            // disappear edge-on to secondary rays; put the same cards in two
+            // orthogonal orientations. Fixed oriented leaves keep their own.
+            let orientations: &[f32] = if leaf.rho > 1000. {
+                &[0.]
+            } else {
+                &[0., std::f32::consts::FRAC_PI_2]
+            };
+            for az in orientations {
                 let base = mesh.vertices.len() as u32;
-                mesh.vertices.extend(part.vertices.iter().map(|v| {
-                    height = height.max(v.pos[2]);
-                    Vertex::new(xyz(v.pos), xyz(v.normal), v.uv)
-                }));
-                for tri in part.indices.chunks_exact(3) {
-                    mesh.tri([base + tri[0], base + tri[1], base + tri[2]], i as u32);
+                let (s, c) = (az + leaf.rho).sin_cos();
+                for (j, [x, y, z]) in leaf.corners.into_iter().enumerate() {
+                    let v = if leaf.rho > 1000. {
+                        xyz([x, y, z])
+                    } else {
+                        [c * x - s * y, z, s * x + c * y]
+                    };
+                    mesh.vertices.push(Vertex::new(
+                        (center + Vec3::from_array(v)).to_array(),
+                        leaf.normal.map_or([0., 1., 0.], xyz),
+                        leaf.uv[j],
+                    ));
                 }
+                mesh.tri([base, base + 1, base + 2], 2);
+                mesh.tri([base + 2, base + 1, base + 3], 2);
             }
-            for leaf in &lod.leaves {
-                height = height.max(leaf.center[2]);
-                let center = Vec3::from_array(xyz(leaf.center));
-                // Real SpeedTree leaf geometry/UVs. Camera-only billboards would
-                // disappear edge-on to secondary rays; put the same cards in two
-                // orthogonal orientations. Fixed oriented leaves keep their own.
-                let orientations: &[f32] = if leaf.rho > 1000. {
-                    &[0.]
-                } else {
-                    &[0., std::f32::consts::FRAC_PI_2]
-                };
-                for az in orientations {
-                    let base = mesh.vertices.len() as u32;
-                    let (s, c) = (az + leaf.rho).sin_cos();
-                    for (j, [x, y, z]) in leaf.corners.into_iter().enumerate() {
-                        let v = if leaf.rho > 1000. {
-                            xyz([x, y, z])
-                        } else {
-                            [c * x - s * y, z, s * x + c * y]
-                        };
-                        mesh.vertices.push(Vertex::new(
-                            (center + Vec3::from_array(v)).to_array(),
-                            leaf.normal.map_or([0., 1., 0.], xyz),
-                            leaf.uv[j],
-                        ));
-                    }
-                    mesh.tri([base, base + 1, base + 2], 2);
-                    mesh.tri([base + 2, base + 1, base + 3], 2);
-                }
-            }
-            (mesh, materials)
-        })
-        .collect();
-    Tree { lods, height }
+        }
+        lods.push((mesh, materials));
+    }
+    Ok(Tree { lods, height })
 }
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
@@ -594,47 +622,39 @@ impl Rect {
         Ok(r)
     }
 }
-struct Tile {
-    w: usize,
-    h: usize,
-    data: Vec<u32>,
-}
 fn atlas_texture(
-    ids: &mut HashMap<Rect, u32>,
-    cache: &mut HashMap<Rect, Tile>,
+    ids: &mut HashMap<(Rect, Filter), u32>,
+    cache: &mut HashMap<(Rect, Filter), Tile>,
     bank: &mut Textures,
     rect: Rect,
     width: usize,
     bytes: &[u8],
+    filter: Filter,
 ) -> Result<u32, String> {
-    if let Some(&id) = ids.get(&rect) {
+    let key = (rect, filter);
+    if let Some(&id) = ids.get(&key) {
         return Ok(id);
     }
-    let tile = match cache.entry(rect) {
+    let tile = match cache.entry(key) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(e) => {
-            let w = rect.w.min(COLOR_SIDE as usize);
-            let h = rect.h.min(COLOR_SIDE as usize);
-            let mut data = Vec::with_capacity(w * h);
-            for y in 0..h {
-                for x in 0..w {
-                    let py = rect.y + ((2 * y + 1) * rect.h / (2 * h)).min(rect.h - 1);
-                    let px = rect.x + ((2 * x + 1) * rect.w / (2 * w)).min(rect.w - 1);
-                    let p = (py * width + px) * 4;
-                    let value = bytes
-                        .get(p..p + 4)
-                        .ok_or("Lighter atlas source not present for streamed tile")?;
-                    data.push(u32::from_le_bytes(value.try_into().unwrap()));
-                }
+            if ((rect.y + rect.h - 1) * width + rect.x + rect.w) > bytes.len() / 4 {
+                return Err("Lighter atlas source not present for streamed tile".into());
             }
-            e.insert(Tile { w, h, data })
+            e.insert(Tile::new(
+                [rect.w as u32, rect.h as u32],
+                COLOR_SIDE,
+                filter,
+                |x, y| {
+                    let p = ((rect.y + y as usize) * width + rect.x + x as usize) * 4;
+                    u32::from_le_bytes(bytes[p..p + 4].try_into().unwrap())
+                },
+            )?)
         }
     };
-    let offset = bank.reserve(tile.data.len() + 2)?;
-    bank.words[offset..offset + 2].copy_from_slice(&[tile.w as u32, tile.h as u32]);
-    bank.words[offset + 2..offset + 2 + tile.data.len()].copy_from_slice(&tile.data);
-    ids.insert(rect, offset as u32);
-    Ok(offset as u32)
+    let id = bank.insert(tile)?;
+    ids.insert(key, id);
+    Ok(id)
 }
 fn atlas_uv(v: &WorldVertex, sy: f32) -> [f32; 2] {
     [
@@ -679,6 +699,11 @@ fn building(
                     rect,
                     crate::world_objects::SIDE,
                     &page.atlas,
+                    if is_sdr {
+                        Filter::Alpha
+                    } else {
+                        Filter::cutout(0.5, false)
+                    },
                 )?
             } else {
                 0
@@ -712,37 +737,31 @@ fn building(
     builder.world_mesh(&mesh)
 }
 
+fn point_light(p: [f32; 3], radius: f32, color: [f32; 4], intensity: f32) -> Light {
+    Light {
+        position_range: [p[0], p[1], p[2], radius],
+        color: [
+            srgb(color[0]) * intensity,
+            srgb(color[1]) * intensity,
+            srgb(color[2]) * intensity,
+            1.,
+        ],
+    }
+}
+
 fn moving(
     models: Option<&mut world_models_gpu::World>,
-    lights: &crate::scene_lights::SceneLights,
     modules: &mut crate::modules::Modules,
     textures: &mut Textures,
-    camera: &Camera,
     matrix: Mat4,
 ) -> Result<Packet, String> {
     let mut out = lighter::model_feed::Moving::new(textures);
-    let mut light: Vec<_> = lights
-        .lights
-        .iter()
-        .map(|l| {
-            (
-                l.position,
-                l.range,
-                [l.diffuse[0], l.diffuse[1], l.diffuse[2]],
-                1.,
-            )
-        })
-        .collect();
     if let Some(models) = models {
         let (geometry, effects, dynamic, read) = models.ray_sources();
-        light.extend(dynamic.iter().map(|l| {
-            (
-                l.position,
-                l.radius,
-                [l.color[0], l.color[1], l.color[2]],
-                l.color[3],
-            )
-        }));
+        for l in dynamic {
+            out.builder
+                .light(point_light(l.position, l.radius, l.color, l.color[3]));
+        }
         let mut decode =
             |path: &str| read(path).and_then(|b| crate::model_texture_gpu::decode_for_rays(&b));
         for (asset, poses) in geometry {
@@ -751,31 +770,6 @@ fn moving(
         out.effects("world", effects, &mut decode)?;
     }
     modules.ray_inputs(matrix, &mut out)?;
-    let range = |p: &[f32; 3], r: f32| camera.pos.distance(Vec3::from_array(*p)) - r;
-    light.retain(|(p, r, c, a)| {
-        *r > 0.
-            && *a > 0.
-            && Vec3::from_array(*p).is_finite()
-            && Vec3::from_array(*c).is_finite()
-            && r.is_finite()
-            && a.is_finite()
-            && range(p, *r) < camera.far
-    });
-    let n = light.len().min(48);
-    if light.len() > n {
-        light.select_nth_unstable_by(n, |a, b| range(&a.0, a.1).total_cmp(&range(&b.0, b.1)));
-    }
-    out.builder
-        .lights
-        .extend(light.into_iter().take(n).map(|(p, r, c, alpha)| Light {
-            position_range: [p[0], p[1], p[2], r],
-            color: [
-                srgb(c[0]) * alpha,
-                srgb(c[1]) * alpha,
-                srgb(c[2]) * alpha,
-                1.,
-            ],
-        }));
     out.finish()
 }
 
@@ -854,10 +848,8 @@ impl super::Renderer {
                 .ok_or("Lighter has no resident geometry")?;
             let moving = moving(
                 self.models.as_mut(),
-                &self.model_lights,
                 &mut self.modules,
                 &mut world.textures,
-                camera,
                 matrix,
             )?;
             self.lighter.render(

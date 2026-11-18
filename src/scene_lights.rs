@@ -125,6 +125,10 @@ impl LightPublications {
     pub fn unregister(&mut self, identity: u64) {
         self.entries.retain(|(id, _)| *id != identity);
     }
+    pub(crate) fn consume(&mut self, output: &mut Vec<DynamicLight>) {
+        output.clear();
+        output.extend(self.entries.drain(..).map(|(_, light)| light));
+    }
     pub fn consume_into(&mut self, grid: &mut StaticGrid) {
         let lights: Vec<_> = self.entries.drain(..).map(|(_, light)| light).collect();
         grid.update_dynamic(&lights);

@@ -121,6 +121,7 @@ pub struct World {
     format: wgpu::TextureFormat,
     grid: StaticGrid,
     publications: LightPublications,
+    ray_lights: Vec<DynamicLight>,
     owners: gfx_owner::Manager,
     /// The map's height grid, when the renderer installed one. It is the only
     /// terrain the effect pass can see, and it is what lets a `MatchGrnd` decal
@@ -241,6 +242,7 @@ impl World {
             format: format.remove_srgb_suffix(),
             grid: StaticGrid::default(),
             publications: LightPublications::default(),
+            ray_lights: Vec::new(),
             owners: gfx_owner::Manager::new(),
             terrain: None,
             producers: Vec::new(),
@@ -816,8 +818,14 @@ impl World {
         self.apply_activation(night, delta_ms, center);
         self.owners.update(delta_ms, &mut self.publications);
         self.update_effects(device, queue, frame, delta_ms, upload);
-        self.grid.update(lights, center);
-        self.publications.consume_into(&mut self.grid);
+        if upload {
+            self.grid.update(lights, center);
+            self.publications.consume_into(&mut self.grid);
+        } else {
+            // Lighter has its own influence-volume BVH, rather than the
+            // camera-centred native receiving-model cell grid.
+            self.publications.consume(&mut self.ray_lights);
+        }
     }
 
     // Source data, not the current raster queue. In particular don't discard
@@ -857,12 +865,7 @@ impl World {
                 let pose = slot.posed.as_ref()?.as_ref().ok()?;
                 Some((&assets[i.asset], pose.meshes.as_slice()))
             });
-        (
-            poses,
-            &self.effect_quads,
-            self.grid.dynamic_lights(),
-            &mut *self.read,
-        )
+        (poses, &self.effect_quads, &self.ray_lights, &mut *self.read)
     }
 
     /// Install the surface query the effect pass needs to drape a

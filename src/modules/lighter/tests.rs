@@ -28,8 +28,10 @@ fn naga_validates_both_paths_and_emits_native_ray_queries() {
         opcodes.push(shader[at] & 0xffff);
         at += (shader[at] >> 16) as usize;
     }
-    // SPV_KHR_ray_query: OpRayQueryInitializeKHR and OpRayQueryProceedKHR.
-    assert!(opcodes.contains(&4473) && opcodes.contains(&4477));
+    // SPV_KHR_ray_query: initialize, proceed and explicit alpha-tested confirm.
+    assert!([4473, 4476, 4477]
+        .into_iter()
+        .all(|op| opcodes.contains(&op)));
 }
 
 #[test]
@@ -75,8 +77,13 @@ fn quad(
         mesh.vertices
             .push(Vertex::new(p, n, [(i % 2) as f32, (i / 2) as f32]).tint(tint, tint));
     }
-    mesh.tri([0, 2, 1], id);
-    mesh.tri([1, 2, 3], id);
+    if flags & BLEND != 0 {
+        mesh.tri_layer([0, 2, 1], id, 1);
+        mesh.tri_layer([1, 2, 3], id, 1);
+    } else {
+        mesh.tri([0, 2, 1], id);
+        mesh.tri([1, 2, 3], id);
+    }
     b.mesh(&mesh).unwrap().unwrap()
 }
 fn upright(b: &mut Builder, z: f32, rgb: [f32; 4], flags: u32, texture: u32) -> u32 {
@@ -161,6 +168,11 @@ impl Harness {
     }
 
     fn pixel(&mut self, frame: Frame, moving: &Packet) -> ([u8; 4], f32) {
+        let e = frame.extent[2] as usize;
+        self.pixels(frame, moving)[e / 2 * e + e / 2]
+    }
+
+    fn pixels(&mut self, frame: Frame, moving: &Packet) -> Vec<([u8; 4], f32)> {
         let e = frame.extent[2];
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let extent = wgpu::Extent3d {
@@ -182,7 +194,8 @@ impl Harness {
         };
         let color = new_target(format);
         let depth = new_target(wgpu::TextureFormat::Depth32Float);
-        let row = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let row = (4 * e).div_ceil(align) * align;
         let stride = row * e;
         let copy = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -238,26 +251,50 @@ impl Harness {
             .unwrap()
             .unwrap();
         let data = read.get_mapped_range();
-        let index = ((e / 2) * row + (e / 2) * 4) as usize;
-        let z = index + stride as usize;
-        (
-            data[index..index + 4].try_into().unwrap(),
-            f32::from_le_bytes(data[z..z + 4].try_into().unwrap()),
-        )
+        (0..e)
+            .flat_map(|y| (0..e).map(move |x| (y * row + x * 4) as usize))
+            .map(|i| {
+                let z = i + stride as usize;
+                (
+                    data[i..i + 4].try_into().unwrap(),
+                    f32::from_le_bytes(data[z..z + 4].try_into().unwrap()),
+                )
+            })
+            .collect()
+    }
+
+    fn builds(&self) -> [u64; 3] {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let Some(h) = &self.ray.hardware {
+            return h.as_builds;
+        }
+        [0; 3]
     }
 }
 
 fn exercise(mode: Mode, cpu_query: bool) {
     let mut h = Harness::new(mode, cpu_query);
     let mut bank = Textures::default();
-    let hole = bank.tile([1, 1], 1, |_, _| 0x00ff_ffff).unwrap();
+    let hole = bank
+        .tile([1, 1], 1, textures::Filter::cutout(0.5, false), |_, _| {
+            0x00ff_ffff
+        })
+        .unwrap();
     let frame = test_frame(Vec3::ZERO, -Vec3::Z, 3);
     let empty = Builder::default().finish();
     let mut b = Builder::default();
     let green = upright(&mut b, -5., [0., 1., 0., 1.], 0, 0);
     put(&mut b, green);
-    let reject = upright(&mut b, -2., [0., 0., 1., 1.], CUTOUT, hole);
-    put(&mut b, reject);
+    // More masks than the old retry budget, plus one exactly coincident and
+    // one less than a millimetre ahead of the real wall. A rejected primitive
+    // does not consume an iteration or hide its eligible neighbor.
+    for z in (0..80)
+        .map(|i| -1.1 - i as f32 * 0.045)
+        .chain([-4.9995, -5.])
+    {
+        let reject = upright(&mut b, z, [0., 0., 1., 1.], CUTOUT, hole);
+        put(&mut b, reject);
+    }
     h.ray.install(Ok((b.finish(), bank.clone())));
     let (green, z) = h.pixel(frame, &empty);
     assert_eq!(green, [0, 255, 0, 255]);
@@ -297,6 +334,78 @@ fn exercise(mode: Mode, cpu_query: bool) {
         (z - depth_at(frame, Vec3::new(0., 0., -5.))).abs() < 1e-5,
         "a read-only effect overwrote the depth: {z}"
     );
+
+    let mut effects = Builder::default();
+    let red = upright(&mut effects, -3., [1., 0., 0., 0.25], BLEND | EMISSIVE, 0);
+    let blue = upright(&mut effects, -3., [0., 0., 1., 0.25], BLEND | EMISSIVE, 0);
+    put(&mut effects, red);
+    put(&mut effects, blue);
+    let coplanar = effects.finish();
+    let center = h.pixel(frame, &coplanar);
+    assert_eq!(
+        center.0,
+        [48, 143, 64, 255],
+        "distinct coincident cards (two triangles each)"
+    );
+    let builds = h.builds();
+    let uploads = h.ray.software.as_ref().map(|s| s.moving_uploads);
+    for x in [0., 0.001, -0.001, 0.] {
+        let moved = test_frame(Vec3::new(x, 0., 0.), -Vec3::Z, 3);
+        let actual = h.pixel(moved, &coplanar);
+        assert_eq!(actual.0, center.0, "coverage/order at x={x}");
+        assert!((actual.1 - center.1).abs() < 1e-6);
+    }
+    assert_eq!(h.builds(), builds, "still geometry rebuilt ASes");
+    assert_eq!(
+        h.ray.software.as_ref().map(|s| s.moving_uploads),
+        uploads,
+        "still geometry re-uploaded"
+    );
+
+    let local_light = |color: [f32; 4], masked| {
+        let mut b = Builder::default();
+        b.light(Light {
+            position_range: [6., 0., -2., 12.],
+            color,
+        });
+        // The tested light must not be pruned just because decorative lights
+        // elsewhere in world space also exist in the same packet.
+        for i in 0..70 {
+            b.light(Light {
+                position_range: [100. + i as f32 * 16., 0., 0., 3.],
+                color: [1.; 4],
+            });
+        }
+        let block = upright(
+            &mut b,
+            0.,
+            [1.; 4],
+            if masked { CUTOUT } else { 0 },
+            if masked { hole } else { 0 },
+        );
+        b.place(block, Transform::translation([3., 0., -3.5]))
+            .unwrap();
+        b.finish()
+    };
+    h.ray.settings.lighting = true;
+    let bright = h.pixel(frame, &local_light([3.; 4], false));
+    let builds = h.builds();
+    let dim = h.pixel(frame, &local_light([0.5; 4], false));
+    assert!(
+        bright.0[1] > dim.0[1] + 30 && bright.1 == dim.1,
+        "{bright:?} {dim:?}"
+    );
+    assert_eq!(h.builds(), builds, "changing light values rebuilt ASes");
+    h.ray.settings.shadows = true;
+    let dark = h.pixel(frame, &local_light([3.; 4], false));
+    let through = h.pixel(frame, &local_light([3.; 4], true));
+    assert!(
+        dark.0[1] + 30 < bright.0[1] && dark.1 == bright.1,
+        "{dark:?} {bright:?}"
+    );
+    assert_eq!(through, bright, "alpha hole cast a solid point shadow");
+    h.ray.settings.shadows = false;
+    h.ray.settings.lighting = false;
 
     // Off-camera blocker in the sun ray (but not in the camera ray). The
     // caster's presence cannot be inferred from primary colour or depth.
@@ -396,6 +505,50 @@ fn exercise(mode: Mode, cpu_query: bool) {
     assert!(
         hidden.0[0] + 40 < reflected.0[0],
         "{hidden:?} {reflected:?}"
+    );
+
+    let mut foliage = Builder::default();
+    let texture = bank
+        .tile([8, 8], 1, textures::Filter::cutout(0.5, false), |x, y| {
+            if (x + y) % 2 == 0 {
+                0xff00_00ff
+            } else {
+                0x00ff_0000
+            }
+        })
+        .unwrap();
+    let leaf = upright(&mut foliage, -2., [1.; 4], CUTOUT, texture);
+    let background = upright(&mut foliage, -2.001, [0., 1., 0., 1.], 0, 0);
+    put(&mut foliage, leaf);
+    put(&mut foliage, background);
+    h.ray.settings.bounces = 0;
+    h.ray.install(Ok((foliage.finish(), bank)));
+    let sample = |x| test_frame(Vec3::new(x, 0., 0.), -Vec3::Z, 31);
+    let far = h.pixels(sample(0.), &empty);
+    let red = far.iter().filter(|p| p.0 == [255, 0, 0, 255]).count();
+    let green = far.iter().filter(|p| p.0 == [0, 255, 0, 255]).count();
+    assert_eq!(
+        red + green,
+        far.len(),
+        "transparent RGB fringe or missing depth"
+    );
+    assert!(
+        (420..=540).contains(&red),
+        "checkerboard 50% coverage became {red}/{}",
+        far.len()
+    );
+    assert_eq!(
+        h.pixels(sample(0.), &empty),
+        far,
+        "cutout pattern changed on a still frame"
+    );
+    let moved = h.pixels(sample(0.004), &empty);
+    assert!(
+        moved
+            .iter()
+            .zip(&far)
+            .all(|(a, b)| a.0 == b.0 && (a.1 - b.1).abs() < 1e-6),
+        "minified foliage changed under subpixel motion"
     );
 }
 

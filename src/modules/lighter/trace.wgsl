@@ -37,6 +37,12 @@ const SIMPLE_WATER: u32 = 2048u;
 const TWO_SIDED: u32 = 4096u;
 const CULL_BACK: u32 = 8192u;
 const WRITE_DEPTH: u32 = 16384u;
+const IGNORE_TEXTURE_ALPHA: u32 = 32768u;
+const STRICT_ALPHA: u32 = 65536u;
+const SOLID_MASK: u32 = 1u;
+const BLEND_MASK: u32 = 2u;
+const SHADOW_MASK: u32 = 4u;
+const SHORE_MASK: u32 = 8u;
 const LIGHTING: u32 = 1u;
 const SHADOWS: u32 = 2u;
 const REFLECTIONS: u32 = 4u;
@@ -53,12 +59,18 @@ const SHORE: u32 = 5u;
 // The instance index (including the dynamic bit) maps directly from Vulkan's
 // 24-bit instanceCustomIndex. Primitive IDs refer to the packed index array.
 struct Hit { t: f32, instance: u32, primitive: u32, bary: vec2<f32> }
-struct Ray { origin: vec3<f32>, dir: vec3<f32>, low: f32, high: f32 }
+struct Ray {
+    origin: vec3<f32>, dir: vec3<f32>, low: f32, high: f32,
+    width: f32, spread: f32, coverage: f32,
+}
 struct Surface {
-    hit: Hit,
-    n: vec3<f32>, geometric: vec3<f32>,
+    n: vec3<f32>,
     uv: vec2<f32>, color: vec4<f32>, flags: u32, reflectance: f32,
 }
+// Order is nonzero only while enumerating the narrow distance band of
+// coplanar sheets. A cursor excludes exactly the layers already composited,
+// not all geometry at that depth. NIL sorts after all real keys.
+struct Query { purpose: u32, mask: u32, ordered: bool, before: vec2<u32> }
 struct Path { ray: Ray, weight: vec3<f32>, depth: u32, purpose: u32, wet: bool }
 
 fn word(dynamic: bool, i: u32) -> u32 {
@@ -69,7 +81,7 @@ fn floats(dynamic: bool, i: u32) -> vec3<f32> {
     return bitcast<vec3<f32>>(vec3<u32>(word(dynamic,i),word(dynamic,i+1u),word(dynamic,i+2u)));
 }
 fn inst_addr(instance: u32) -> u32 {
-    return word((instance & DYNAMIC) != 0u, 4u) + (instance & (DYNAMIC-1u)) * 10u;
+    return word((instance & DYNAMIC) != 0u, 4u) + (instance & (DYNAMIC-1u)) * 11u;
 }
 fn vertex_addresses(dynamic: bool, instance_addr: u32, primitive: u32) -> vec3<u32> {
     let first = word(dynamic,0u) + word(dynamic,instance_addr+6u)*8u;
@@ -88,20 +100,54 @@ fn rgba(x: u32) -> vec4<f32> {
 fn linear(c: vec3<f32>) -> vec3<f32> {
     return select(c/12.92, pow((max(c,vec3<f32>(0.))+0.055)/1.055, vec3<f32>(2.4)), c>vec3<f32>(0.04045));
 }
-fn texel(addr: u32, dims: vec2<i32>, p: vec2<i32>, edge: bool) -> vec4<f32> {
-    var i = (p % dims + dims) % dims;
-    if edge { i = clamp(p, vec2<i32>(0), dims-1); }
-    return rgba(texels[addr + 2u + u32(i.y*dims.x + i.x)]);
+fn texel(base: u32, dims: vec2<i32>, p: vec2<i32>, edge: bool) -> vec4<f32> {
+    var i = clamp(p, vec2<i32>(0), dims-1);
+    if !edge { i = (p % dims + dims) % dims; }
+    return rgba(texels[base + u32(i.y*dims.x + i.x)]);
 }
-fn tile(addr: u32, uv: vec2<f32>, edge: bool) -> vec4<f32> {
-    let dims = vec2<i32>(i32(texels[addr]),i32(texels[addr+1u]));
+fn level(addr: u32, uv: vec2<f32>, edge: bool, mip: u32) -> vec4<f32> {
+    let base = addr + texels[addr+4u+mip];
+    let dims = vec2<i32>(max(vec2<u32>(1u),vec2<u32>(texels[addr],texels[addr+1u])>>vec2<u32>(mip)));
+    if all(dims==vec2<i32>(1)) { return rgba(texels[base]); }
     let xy = select(fract(uv),clamp(uv,vec2<f32>(0.),vec2<f32>(1.)),edge)*vec2<f32>(dims)-0.5;
     let p = vec2<i32>(floor(xy));
     let f = fract(xy);
-    return mix(mix(texel(addr,dims,p,edge), texel(addr,dims,p+vec2<i32>(1,0),edge), f.x),
-               mix(texel(addr,dims,p+vec2<i32>(0,1),edge), texel(addr,dims,p+vec2<i32>(1,1),edge), f.x), f.y);
+    return mix(mix(texel(base,dims,p,edge), texel(base,dims,p+vec2<i32>(1,0),edge), f.x),
+               mix(texel(base,dims,p+vec2<i32>(0,1),edge), texel(base,dims,p+vec2<i32>(1,1),edge), f.x), f.y);
 }
-fn terrain_color(p: vec3<f32>) -> vec3<f32> {
+fn tile_lod(addr: u32, uv: vec2<f32>, edge: bool, lod: f32) -> vec4<f32> {
+    let mip = u32(lod);
+    var c = level(addr,uv,edge,mip);
+    let fraction = fract(lod);
+    if fraction>0. { c = mix(c,level(addr,uv,edge,mip+1u),fraction); }
+    return vec4<f32>(c.rgb/max(c.a,1./255.),c.a);
+}
+fn footprint(ray: Ray, t: f32) -> f32 { return ray.width+ray.spread*t; }
+fn tile_lod_for(addr: u32, ray: Ray, hit: Hit, m: bool, inst: u32, v: vec3<u32>) -> f32 {
+    let last = texels[addr+2u]-1u;
+    if last==0u { return 0.; }
+    let a = floats(m,v.x);
+    let e = floats(m,v.y)-a;
+    let f = floats(m,v.z)-a;
+    let n = cross(e,f);
+    let n2 = dot(n,n);
+    if n2<1.e-20 { return 0.; }
+    let u = vertex_uv(m,v.x);
+    let du = vertex_uv(m,v.y)-u;
+    let dv = vertex_uv(m,v.z)-u;
+    let grad0 = cross(f,n);
+    let grad1 = cross(n,e);
+    let grad_u = length(du.x*grad0+dv.x*grad1)*f32(texels[addr]);
+    let grad_v = length(du.y*grad0+dv.y*grad1)*f32(texels[addr+1u]);
+    let c = bitcast<f32>(word(m,inst+4u));
+    let s = bitcast<f32>(word(m,inst+5u));
+    let grazing = max(0.15,abs(dot(n*inverseSqrt(n2),rotate(ray.dir,c,-s))));
+    let scale = bitcast<f32>(word(m,inst+3u));
+    let rho = footprint(ray,hit.t)*max(grad_u,grad_v)/(grazing*scale*n2);
+    return clamp(log2(max(rho,1.)),0.,f32(last));
+}
+fn tile(addr: u32, uv: vec2<f32>, edge: bool) -> vec4<f32> { return tile_lod(addr,uv,edge,0.); }
+fn terrain_color(p: vec3<f32>, radius: f32) -> vec3<f32> {
     let coord = clamp(vec2<f32>(p.x,-p.z)/frame.terrain.z + frame.terrain.xy*0.5,
                       vec2<f32>(0.),frame.terrain.xy-vec2<f32>(1.))/frame.terrain.w;
     let xy = vec2<u32>(floor(coord));
@@ -118,7 +164,10 @@ fn terrain_color(p: vec3<f32>) -> vec3<f32> {
             default: {}
         }
         let scale = bitcast<vec2<f32>>(vec2<u32>(texels[at+3u],texels[at+4u]));
-        let c = tile(texels[at],uv*scale,false).rgb;
+        let addr = texels[at];
+        let rho = vec2<f32>(f32(texels[addr]),f32(texels[addr+1u]))*abs(scale)*radius;
+        let lod = clamp(log2(max(1.,max(rho.x,rho.y))),0.,f32(texels[addr+2u]-1u));
+        let c = tile_lod(addr,uv*scale,false,lod).rgb;
         if j==0u { rgb = c; }
         else { rgb = mix(rgb,c,tile(texels[at+1u],fract(coord),true).r); }
     }
@@ -130,69 +179,154 @@ fn vertex_uv(m: bool, v: u32) -> vec2<f32> {
 fn vertex_tint(m: bool, v: u32) -> vec4<f32> {
     return mix(rgba(word(m,v+7u)),rgba(word(m,v+6u)),frame.sun.w);
 }
-fn surface(hit: Hit, ray: Ray, purpose: u32) -> Surface {
-    let dyn = (hit.instance & DYNAMIC) != 0u;
-    let inst = inst_addr(hit.instance);
-    let v = vertex_addresses(dyn,inst,hit.primitive);
-    let mat = word(dyn,3u) + 4u*word(dyn,word(dyn,2u)+hit.primitive);
-    let flags = word(dyn,mat+1u);
-    let skip = Surface(Hit(hit.t,NIL,0u,vec2<f32>(0.)), vec3<f32>(0.), vec3<f32>(0.), vec2<f32>(0.), vec4<f32>(0.), flags, 0.);
-    let p = ray.origin + ray.dir*hit.t;
-    if (purpose==SHORE && (flags & TERRAIN)==0u)
-        || (purpose==SHADOW && (flags & (BLEND|WATER))!=0u && (flags & WRITE_DEPTH)==0u)
-        || (purpose==MIRROR && (flags & NO_REFLECT)!=0u)
-        || (purpose==TRANSMIT && (flags & NO_REFRACT)!=0u) { return skip; }
-    let weights = vec3<f32>(1.-hit.bary.x-hit.bary.y,hit.bary);
-    var uv = vertex_uv(dyn,v.x)*weights.x + vertex_uv(dyn,v.y)*weights.y + vertex_uv(dyn,v.z)*weights.z;
-    let c = bitcast<f32>(word(dyn,inst+4u));
-    let s = bitcast<f32>(word(dyn,inst+5u));
-    let a = floats(dyn,v.x);
-    let gn = norm(rotate(cross(floats(dyn,v.y)-a,floats(dyn,v.z)-a),c,s));
-    if purpose==VIEW && (frame.options.x & CULL_BUILDINGS)!=0u && (flags & CULL_BACK)!=0u && dot(gn,ray.dir)>=0. { return skip; }
-    let raw_normal = rgba(word(dyn,v.x+3u)).xyz*weights.x + rgba(word(dyn,v.y+3u)).xyz*weights.y + rgba(word(dyn,v.z+3u)).xyz*weights.z;
-    var n = norm(rotate(raw_normal*2.-1.,c,s));
-    if dot(n,gn)<0. && (flags & (WATER|TERRAIN))==0u { n = -n; }
-    if dot(gn,ray.dir)>0. { n = -n; }
-    // Grass/frond quads are intentionally two-sided.
-    if (flags & TWO_SIDED)!=0u && dot(n,ray.dir)>0. { n = -n; }
-    if (flags & TERRAIN)!=0u {
-        var albedo = vec3<f32>(1.);
-        if purpose!=SHADOW && purpose!=SHORE { albedo = terrain_color(p); }
-        return Surface(hit,n,gn,uv,vec4<f32>(albedo,1.),flags,0.);
+fn material_addr(m: bool, primitive: u32) -> u32 {
+    return word(m,3u) + 4u*word(m,word(m,2u)+2u*primitive);
+}
+fn layer_key(hit: Hit) -> vec2<u32> {
+    let m = (hit.instance & DYNAMIC)!=0u;
+    return vec2<u32>(hit.instance,word(m,word(m,2u)+2u*hit.primitive+1u));
+}
+fn key_less(a: vec2<u32>, b: vec2<u32>) -> bool {
+    return a.x<b.x || (a.x==b.x && a.y<b.y);
+}
+fn closer(hit: Hit, best: Hit, q: Query) -> bool {
+    if q.ordered {
+        let key = layer_key(hit);
+        if !key_less(key,q.before) { return false; }
+        if best.instance==NIL { return true; }
+        let other = layer_key(best);
+        return key_less(other,key) || (all(key==other) && hit.primitive<best.primitive);
     }
+    return hit.t<best.t || (hit.t==best.t && (hit.instance<best.instance ||
+           (hit.instance==best.instance && hit.primitive<best.primitive)));
+}
+fn weights_of(hit: Hit) -> vec3<f32> {
+    return vec3<f32>(1.-hit.bary.x-hit.bary.y,hit.bary);
+}
+fn surface_uv(m: bool, v: vec3<u32>, w: vec3<f32>, flags: u32) -> vec2<f32> {
+    var uv = vertex_uv(m,v.x)*w.x + vertex_uv(m,v.y)*w.y + vertex_uv(m,v.z)*w.z;
     if (flags & (BLEND|BAKED))==(BLEND|BAKED) { uv.y -= 0.5*frame.air.w; }
-    let tex = tile(word(dyn,mat),uv,(flags & CLAMP_UV)!=0u);
-    if (flags & CUTOUT)!=0u && tex.a<bitcast<f32>(word(dyn,mat+2u)) { return skip; }
-    let tint = vertex_tint(dyn,v.x)*weights.x + vertex_tint(dyn,v.y)*weights.y + vertex_tint(dyn,v.z)*weights.z;
-    var color = vec4<f32>(linear(tex.rgb)*linear(tint.rgb),tex.a*tint.a);
-    if (flags & EMISSIVE)!=0u { color = vec4<f32>(linear(tex.rgb)*tint.rgb,color.a); }
-    if (flags & BAKED)!=0u { color = vec4<f32>(linear(min(tex.rgb*tint.rgb*2.,vec3<f32>(1.))),color.a); }
-    if (flags & BLEND)!=0u && color.a<0.003 { return skip; }
-    if purpose==SHADOW && (flags & WRITE_DEPTH)!=0u && color.a<0.5 { return skip; }
-    return Surface(hit,n,gn,uv,color,flags,bitcast<f32>(word(dyn,mat+3u)));
+    return uv;
 }
-fn epsilon(t: f32) -> f32 {
-    // Enough ULPs to cross a rejected hit at the far end of a world ray.
-    return max(0.002, abs(t)*0.00000048);
+fn tint_of(m: bool, v: vec3<u32>, w: vec3<f32>) -> vec4<f32> {
+    return vertex_tint(m,v.x)*w.x + vertex_tint(m,v.y)*w.y + vertex_tint(m,v.z)*w.z;
 }
-fn next_surface(ray: Ray, purpose: u32) -> Surface {
-    var r = ray;
-    // Both paths use committed geometric hits, with the same alpha rules.
-    // Requery beyond cutout/rejected surfaces on both paths for the same rules.
-    for (var attempt=0; attempt<64; attempt++) {
-        if r.low >= r.high { break; }
-        let hit = closest(r);
-        if hit.instance==NIL { break; }
-        let sample = surface(hit,r,purpose);
-        if sample.hit.instance!=NIL { return sample; }
-        r.low = hit.t + epsilon(hit.t);
+fn geometric(m: bool, inst: u32, v: vec3<u32>) -> vec3<f32> {
+    let a = floats(m,v.x);
+    let c = bitcast<f32>(word(m,inst+4u));
+    let s = bitcast<f32>(word(m,inst+5u));
+    return rotate(cross(floats(m,v.y)-a,floats(m,v.z)-a),c,s);
+}
+// Called before committing the hit. No albedo, lighting, normals, or depth
+// writes for a rejected candidate; an alpha hole never advances ray.low.
+fn accepts(hit: Hit, ray: Ray, q: Query) -> bool {
+    let m = (hit.instance & DYNAMIC)!=0u;
+    let mat = material_addr(m,hit.primitive);
+    let flags = word(m,mat+1u);
+    let blend = (flags & BLEND)!=0u;
+    if (q.mask==SOLID_MASK && blend) || (q.mask==BLEND_MASK && !blend)
+        || (q.purpose==SHORE && (flags & TERRAIN)==0u)
+        || (q.purpose==SHADOW && (flags & (BLEND|WATER))!=0u && (flags & WRITE_DEPTH)==0u)
+        || (q.purpose==MIRROR && (flags & NO_REFLECT)!=0u)
+        || (q.purpose==TRANSMIT && (flags & NO_REFRACT)!=0u) { return false; }
+    let cull = q.purpose==VIEW && (frame.options.x & CULL_BUILDINGS)!=0u && (flags & CULL_BACK)!=0u;
+    if !cull && (flags & (CUTOUT|BLEND|WRITE_DEPTH))==0u { return true; }
+    let inst = inst_addr(hit.instance);
+    let v = vertex_addresses(m,inst,hit.primitive);
+    if cull && dot(geometric(m,inst,v),ray.dir)>=0. { return false; }
+    if (flags & (CUTOUT|BLEND|WRITE_DEPTH))==0u { return true; }
+    let w = weights_of(hit);
+    var a = 1.;
+    if (flags & IGNORE_TEXTURE_ALPHA)==0u {
+        let addr = word(m,mat);
+        let uv = surface_uv(m,v,w,flags);
+        let edge = (flags & CLAMP_UV)!=0u;
+        let lod = tile_lod_for(addr,ray,hit,m,inst,v);
+        let mip = u32(lod);
+        let fraction = fract(lod);
+        a = level(addr,uv,edge,mip).a;
+        if (flags & CUTOUT)!=0u && (texels[addr+3u] & 1u)!=0u {
+            if mip==0u && (texels[addr+3u] & 2u)==0u {
+                let cut = bitcast<f32>(word(m,mat+2u));
+                a = select(0.,1.,a>cut || (a==cut && (flags & STRICT_ALPHA)==0u));
+            }
+            if fraction>0. { a = mix(a,level(addr,uv,edge,mip+1u).a,fraction); }
+            // Fixed per-pixel/per-sample stratification, never seeded by time.
+            if a<=ray.coverage { return false; }
+            a = 1.;
+        } else {
+            if fraction>0. { a = mix(a,level(addr,uv,edge,mip+1u).a,fraction); }
+            if (flags & CUTOUT)!=0u {
+                let cut = bitcast<f32>(word(m,mat+2u));
+                if a<cut || ((flags & STRICT_ALPHA)!=0u && a==cut) { return false; }
+            }
+        }
     }
-    return Surface(Hit(ray.high,NIL,0u,vec2<f32>(0.)),vec3<f32>(0.),vec3<f32>(0.),vec2<f32>(0.),vec4<f32>(0.),0u,0.);
+    if blend || (q.purpose==SHADOW && (flags & WRITE_DEPTH)!=0u) {
+        a *= tint_of(m,v,w).a;
+        if blend && a<=0. { return false; }
+        if q.purpose==SHADOW && a<0.5 { return false; }
+    }
+    return true;
 }
-fn visibility(p: vec3<f32>, d: vec3<f32>, t: f32) -> f32 {
-    if (frame.options.x & SHADOWS)==0u || t<=0.02 { return 1.; }
-    let r = Ray(p+d*0.012,d,0.001,t-0.012);
-    return select(0.,1.,next_surface(r,SHADOW).hit.instance==NIL);
+fn surface(hit: Hit, ray: Ray) -> Surface {
+    let m = (hit.instance & DYNAMIC)!=0u;
+    let inst = inst_addr(hit.instance);
+    let v = vertex_addresses(m,inst,hit.primitive);
+    let mat = material_addr(m,hit.primitive);
+    let flags = word(m,mat+1u);
+    let p = ray.origin + ray.dir*hit.t;
+    let w = weights_of(hit);
+    let uv = surface_uv(m,v,w,flags);
+    let c = bitcast<f32>(word(m,inst+4u));
+    let s = bitcast<f32>(word(m,inst+5u));
+    let raw = rgba(word(m,v.x+3u)).xyz*w.x + rgba(word(m,v.y+3u)).xyz*w.y + rgba(word(m,v.z+3u)).xyz*w.z;
+    var n = norm(rotate(raw*2.-1.,c,s));
+    if (flags & (WATER|TERRAIN|TWO_SIDED))!=0u {
+        if dot(n,ray.dir)>0. { n = -n; }
+    } else if (flags & EMISSIVE)==0u {
+        let gn = geometric(m,inst,v);
+        if (dot(n,gn)<0.) != (dot(gn,ray.dir)>0.) { n = -n; }
+    }
+    if (flags & TERRAIN)!=0u {
+        return Surface(n,uv,vec4<f32>(terrain_color(p,footprint(ray,hit.t)),1.),flags,0.);
+    }
+    let addr = word(m,mat);
+    let tex = tile_lod(addr,uv,(flags & CLAMP_UV)!=0u,tile_lod_for(addr,ray,hit,m,inst,v));
+    let tint = tint_of(m,v,w);
+    let alpha = select(tex.a,1.,(flags & IGNORE_TEXTURE_ALPHA)!=0u)*tint.a;
+    var color = vec4<f32>(linear(tex.rgb)*linear(tint.rgb),alpha);
+    if (flags & EMISSIVE)!=0u { color = vec4<f32>(linear(tex.rgb)*tint.rgb,alpha); }
+    if (flags & BAKED)!=0u { color = vec4<f32>(linear(min(tex.rgb*tint.rgb*2.,vec3<f32>(1.))),alpha); }
+    return Surface(n,uv,color,flags,bitcast<f32>(word(m,mat+3u)));
+}
+fn none(ray: Ray) -> Hit { return Hit(ray.high,NIL,0u,vec2<f32>(0.)); }
+fn trace(ray: Ray, q: Query) -> Hit {
+    if ray.low>ray.high || ((world[11u]|moving[11u]) & q.mask)==0u { return none(ray); }
+    return intersect(ray,q);
+}
+fn bias(p: vec3<f32>) -> f32 {
+    let a = abs(p);
+    return max(0.0005,max(a.x,max(a.y,a.z))*4.77e-7);
+}
+fn secondary(p: vec3<f32>, d: vec3<f32>, ray: Ray, t: f32) -> Ray {
+    let offset = bias(p);
+    return Ray(p+d*offset,d,offset,frame.eye.w,footprint(ray,t),ray.spread,ray.coverage);
+}
+fn visibility(p: vec3<f32>, d: vec3<f32>, t: f32, width: f32, coverage: f32) -> f32 {
+    let offset = bias(p);
+    if (frame.options.x & SHADOWS)==0u || t<=2.*offset { return 1.; }
+    let r = Ray(p+d*offset,d,offset,t-offset,width,0.,coverage);
+    return select(0.,1.,trace(r,Query(SHADOW,SHADOW_MASK,false,vec2<u32>(NIL))).instance==NIL);
+}
+fn band(t: f32) -> f32 {
+    // Group only floating-point ties, not surfaces separated by a ray bias.
+    return max(0.000001,abs(t)*0.000002);
+}
+fn advance(t: f32) -> f32 {
+    // All ray distances here are positive. Keep the inclusive end of the band
+    // from being visited twice, without leaving a gap before the next one.
+    return bitcast<f32>(bitcast<u32>(t)+1u);
 }
 fn sky_triple(d: vec3<f32>, layer: vec3<u32>) -> vec3<f32> {
     // Native camera-centred roof cap and panorama skirt mapping, fed with
@@ -233,35 +367,57 @@ fn environment(dir: vec3<f32>) -> vec3<f32> {
     let moon = smoothstep(0.9985,0.9992,dot(dir,frame.moon_disc.xyz))*frame.moon_disc.w;
     return sky + frame.sun_color.rgb*sun*2. + vec3<f32>(0.45,0.5,0.6)*moon;
 }
-fn direct(p: vec3<f32>, s: Surface) -> vec3<f32> {
-    let albedo = s.color.rgb;
-    if (s.flags & EMISSIVE)!=0u { return albedo; }
-    let cosine = max(dot(s.n,frame.sun.xyz),0.);
-    var sun_vis = 1.;
-    if cosine>0. && frame.sun.w>0.02 && frame.sun.y>0. {
-        sun_vis = visibility(p,frame.sun.xyz,frame.eye.w);
-    }
-    let lit = (frame.options.x & LIGHTING)!=0u;
-    var color = albedo*(0.55+0.45*sun_vis);
-    if !lit { return color; }
-    if (s.flags & BAKED)==0u {
-        color = albedo*(frame.ambient.rgb + frame.sun_color.rgb*cosine*sun_vis);
-    }
-    for (var i=0u; i<moving[10u]; i++) {
-        let a = moving[9u] + i*8u;
-        let to = floats(true,a)-p;
-        let r = bitcast<f32>(moving[a+3u]);
-        let dist = length(to);
-        if dist<r && dist>0.014 {
-            let wi = to/dist;
-            let lambert = max(dot(wi,s.n),0.);
-            if lambert>0. {
-                let falloff = 1.-dist/r;
-                color += albedo*floats(true,a+4u)*(lambert*falloff*falloff*visibility(p,wi,dist));
+fn point_lighting(m: bool, p: vec3<f32>, n: vec3<f32>, width: f32, coverage: f32) -> vec3<f32> {
+    var color = vec3<f32>(0.);
+    let nodes = word(m,5u);
+    let refs = word(m,6u);
+    let start = word(m,9u);
+    let end = word(m,13u);
+    var i = word(m,12u);
+    while i<end {
+        let at = nodes+i*9u;
+        if any(p<floats(m,at)) || any(p>floats(m,at+3u)) {
+            i = word(m,at+6u);
+            continue;
+        }
+        let first = word(m,at+7u);
+        let count = word(m,at+8u);
+        for (var j=0u; j<count; j++) {
+            let a = start + 8u*word(m,refs+first+j);
+            let to = floats(m,a)-p;
+            let r = bitcast<f32>(word(m,a+3u));
+            let d2 = dot(to,to);
+            let cosine = dot(to,n);
+            if d2<r*r && d2>1.e-8 && cosine>0. {
+                let distance = sqrt(d2);
+                let wi = to/distance;
+                let falloff = 1.-distance/r;
+                color += floats(m,a+4u)*(cosine/distance*falloff*falloff*visibility(p,wi,distance,width,coverage));
             }
         }
+        i++;
     }
     return color;
+}
+fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32) -> vec3<f32> {
+    let albedo = s.color.rgb;
+    if (s.flags & EMISSIVE)!=0u { return albedo; }
+    let width = footprint(ray,t);
+    let cosine = max(dot(s.n,frame.sun.xyz),0.);
+    let lit = (frame.options.x & LIGHTING)!=0u;
+    let baked = (s.flags & BAKED)!=0u;
+    var sun_vis = 1.;
+    if (!lit || !baked) && cosine>0. && frame.sun.w>0.02 && frame.sun.y>0. {
+        sun_vis = visibility(p,frame.sun.xyz,frame.eye.w,width,ray.coverage);
+    }
+    if !lit { return albedo*(0.55+0.45*sun_vis); }
+    var irradiance = vec3<f32>(1.);
+    if !baked { irradiance = frame.ambient.rgb + frame.sun_color.rgb*cosine*sun_vis; }
+    // Static and runtime influence volumes use the same tree layout.
+    for (var feed=0u; feed<2u; feed++) {
+        irradiance += point_lighting(feed!=0u,p,s.n,width,ray.coverage);
+    }
+    return albedo*irradiance;
 }
 fn random(seed: ptr<function,u32>) -> f32 {
     *seed = *seed*747796405u + 2891336453u;
@@ -308,34 +464,57 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> vec4<f32> {
     for (var branch=0u; branch<2u; branch++) {
         for (var segment=0u; segment<=frame.options.y; segment++) {
             if path.depth>frame.options.y || max(path.weight.x,max(path.weight.y,path.weight.z))<0.002 { break; }
-            var ray = path.ray;
-            var s = next_surface(ray,path.purpose);
-            // Sheets and ribbons composite in ray-distance order. They don't
-            // take a bounce or cast the shadow of an opaque rectangle.
-            for (var sheet=0u; sheet<24u; sheet++) {
-                if s.hit.instance==NIL || (s.flags & BLEND)==0u { break; }
-                let f = fog_amount(s.hit.t,path.wet);
-                let point = ray.origin+ray.dir*s.hit.t;
+            let ray = path.ray;
+            let solid = trace(ray,Query(path.purpose,SOLID_MASK,false,vec2<u32>(NIL)));
+            // Resolve opaque visibility once. Sheets cannot replace the solid
+            // result when a layer is rejected or the ray has no more sheets.
+            var sheet_ray = ray;
+            if solid.instance!=NIL { sheet_ray.high = min(ray.high,solid.t+band(solid.t)); }
+            var after = vec2<u32>(NIL);
+            var group_end = -1.;
+            loop {
+                if max(path.weight.x,max(path.weight.y,path.weight.z))<0.002 { break; }
+                // All covered surfaces at nearly the same distance form a
+                // band, in decreasing draw-layer order (over-composition in
+                // front-to-back form). If a ray lands on a card diagonal its
+                // two triangles share a layer key, so it is painted once.
+                var r = sheet_ray;
+                let ordered = group_end>=0.;
+                if ordered { r.high = group_end; }
+                let hit = trace(r,Query(path.purpose,BLEND_MASK,ordered,after));
+                if hit.instance==NIL {
+                    if !ordered { break; }
+                    sheet_ray.low = advance(group_end);
+                    group_end = -1.;
+                    after = vec2<u32>(NIL);
+                    continue;
+                }
+                if !ordered {
+                    group_end = min(hit.t+band(hit.t),sheet_ray.high);
+                    sheet_ray.low = max(sheet_ray.low,hit.t-band(hit.t));
+                    continue;
+                }
+                after = layer_key(hit);
+                let s = surface(hit,ray);
+                let f = fog_amount(hit.t,path.wet);
+                let point = ray.origin+ray.dir*hit.t;
                 if path.depth==0u && branch==0u && (s.flags & WRITE_DEPTH)!=0u && s.color.a>=0.5 {
                     depth = max(depth,world_depth(point));
                 }
-                let src = direct(point,s);
+                let src = direct(point,s,ray,hit.t);
                 let additive = (s.flags & ADDITIVE)!=0u;
                 let mist = select(select(frame.air_color.rgb,frame.water_color.rgb,path.wet),vec3<f32>(0.),additive);
                 result += path.weight*s.color.a*mix(src,mist,f);
                 if !additive { path.weight *= 1.-s.color.a; }
-                ray.low = s.hit.t+epsilon(s.hit.t);
-                s = next_surface(ray,path.purpose);
             }
-            if s.hit.instance==NIL {
+            if solid.instance==NIL {
                 result += path.weight*select(environment(ray.dir),frame.water_color.rgb,path.wet);
                 break;
             }
-            let p = ray.origin + ray.dir*s.hit.t;
-            if path.depth==0u && branch==0u {
-                depth = max(depth,world_depth(p));
-            }
-            let fog = fog_amount(s.hit.t,path.wet);
+            let s = surface(solid,ray);
+            let p = ray.origin + ray.dir*solid.t;
+            if path.depth==0u && branch==0u { depth = max(depth,world_depth(p)); }
+            let fog = fog_amount(solid.t,path.wet);
             result += path.weight*fog*select(frame.air_color.rgb,frame.water_color.rgb,path.wet);
             path.weight *= 1.-fog;
             if (s.flags & WATER)!=0u {
@@ -354,8 +533,8 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> vec4<f32> {
                     // Test the depth to the actual terrain under this wet cell
                     // (not a screen-depth sample and not the nearest props).
                     let down = vec3<f32>(0.,-1.,0.);
-                    let ground = next_surface(Ray(p+down*0.001,down,0.001,0.66),SHORE);
-                    edge = clamp(ground.hit.t/0.66,0.,1.);
+                    let ground = trace(Ray(p+down*0.001,down,0.001,0.66,0.,0.,ray.coverage),Query(SHORE,SHORE_MASK,false,vec2<u32>(NIL)));
+                    edge = clamp(ground.t/0.66,0.,1.);
                 }
                 let f = select(0.,edge*(0.02+0.98*pow(1.-clamp(dot(-ray.dir,n),0.,1.),5.)),can_reflect);
                 let reflected = select(r,vec3<f32>(ray.dir.x,-ray.dir.y,ray.dir.z),r.y*ray.dir.y>=0.);
@@ -367,39 +546,39 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> vec4<f32> {
                 path.depth++;
                 if dot(t,t)<0.0001 {
                     if !can_reflect { result += path.weight*frame.water_color.rgb; break; }
-                    path.ray = Ray(p+reflected*0.016,reflected,0.001,frame.eye.w);
+                    path.ray = secondary(p,reflected,ray,solid.t);
                     path.purpose = MIRROR;
                     continue;
                 }
                 if f>0.001 && !split && branch==0u {
-                    pending = Path(Ray(p+reflected*0.016,reflected,0.001,frame.eye.w),path.weight*f,path.depth,MIRROR,path.wet);
+                    pending = Path(secondary(p,reflected,ray,solid.t),path.weight*f,path.depth,MIRROR,path.wet);
                     split = true;
                     path.weight *= 1.-f;
                 } else if f>0.001 && random(seed)<f {
-                    path.ray = Ray(p+reflected*0.016,reflected,0.001,frame.eye.w);
+                    path.ray = secondary(p,reflected,ray,solid.t);
                     path.purpose = MIRROR;
                     continue;
                 }
                 path.weight *= mix(vec3<f32>(1.),water_tint,edge);
                 path.wet = !from_water;
-                path.ray = Ray(p+t*0.016,t,0.001,frame.eye.w);
+                path.ray = secondary(p,t,ray,solid.t);
                 path.purpose = TRANSMIT;
                 continue;
             }
             let is_mirror = (frame.options.x & REFLECTIONS)!=0u && s.reflectance>0.01;
             let lit = (frame.options.x & LIGHTING)!=0u;
-            let c = direct(p,s);
+            let c = direct(p,s,ray,solid.t);
             result += path.weight*c;
             if path.depth==frame.options.y || (s.flags & EMISSIVE)!=0u || (!is_mirror && !lit) { break; }
             path.depth++;
             if is_mirror {
                 let r = norm(reflect(ray.dir,s.n));
-                path.ray = Ray(p+r*0.016,r,0.001,frame.eye.w);
+                path.ray = secondary(p,r,ray,solid.t);
                 path.weight *= s.reflectance;
                 path.purpose = MIRROR;
             } else {
                 let d = hemisphere(s.n,seed);
-                path.ray = Ray(p+d*0.016,d,0.001,frame.eye.w);
+                path.ray = secondary(p,d,ray,solid.t);
                 path.weight *= s.color.rgb*0.28;
                 path.purpose = DIFFUSE;
             }
@@ -414,6 +593,8 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> vec4<f32> {
 fn render(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy>=frame.extent.xy) { return; }
     var seed = id.x + id.y*frame.extent.x + 1u;
+    let spread = 2.*max(length(frame.inv_vp[0].xyz)/f32(frame.extent.x),
+                        length(frame.inv_vp[1].xyz)/f32(frame.extent.y));
     var total = vec3<f32>(0.);
     var depth = 0.;
     for (var sample=0u; sample<frame.options.z; sample++) {
@@ -424,7 +605,8 @@ fn render(@builtin(global_invocation_id) id: vec3<u32>) {
         let far4 = frame.inv_vp*vec4<f32>(ndc,0.,1.);
         let near = near4.xyz/near4.w-frame.eye.xyz;
         let far = far4.xyz/far4.w-frame.eye.xyz;
-        let out = transport(Ray(frame.eye.xyz,norm(near),length(near),length(far)),&seed);
+        let coverage = (f32(sample)+random(&seed))/f32(frame.options.z);
+        let out = transport(Ray(frame.eye.xyz,norm(near),length(near),length(far),0.,spread,coverage),&seed);
         total += out.rgb;
         // Reverse Z: take the nearest of the samples for consumers of depth.
         depth = max(depth,out.w);

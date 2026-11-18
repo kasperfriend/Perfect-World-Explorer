@@ -1,17 +1,31 @@
 @group(0) @binding(5) var acceleration: acceleration_structure;
 
-// Vulkan VK_KHR_ray_query traversal over a real TLAS backed by triangle BLASes.
-// Force opaque to commit the nearest *geometric* hit; shared code then tests
-// the authored alpha reference and visibility and reissues only rejected rays.
-fn closest(ray: Ray) -> Hit {
+fn triangle_hit(h: RayIntersection) -> Hit {
+    let m = (h.instance_custom_data & DYNAMIC) != 0u;
+    let inst = inst_addr(h.instance_custom_data);
+    return Hit(h.t,h.instance_custom_data,h.primitive_index+word(m,inst+7u),h.barycentrics);
+}
+
+// Homogeneous, unconditional BLASes can commit in hardware. Nonopaque
+// candidates (including cutouts) are confirmed only after coverage testing.
+// Do not confirm ordered blend hits: committing one would hide its peers at t.
+fn intersect(ray: Ray, q: Query) -> Hit {
+    let flags = select(0u,RAY_FLAG_TERMINATE_ON_FIRST_HIT,q.purpose==SHADOW);
     var query: ray_query;
-    rayQueryInitialize(&query, acceleration, RayDesc(RAY_FLAG_FORCE_OPAQUE, 255u, ray.low, ray.high, ray.origin, ray.dir));
-    while rayQueryProceed(&query) {}
-    let h = rayQueryGetCommittedIntersection(&query);
-    if h.kind == RAY_QUERY_INTERSECTION_TRIANGLE {
-        let m = (h.instance_custom_data & DYNAMIC) != 0u;
-        let inst = inst_addr(h.instance_custom_data);
-        return Hit(h.t,h.instance_custom_data,h.primitive_index+word(m,inst+7u),h.barycentrics);
+    rayQueryInitialize(&query, acceleration, RayDesc(flags, q.mask, ray.low, ray.high, ray.origin, ray.dir));
+    var best = none(ray);
+    while rayQueryProceed(&query) {
+        let h = rayQueryGetCandidateIntersection(&query);
+        if h.kind==RAY_QUERY_INTERSECTION_TRIANGLE {
+            let hit = triangle_hit(h);
+            if (!q.ordered || closer(hit,best,q)) && accepts(hit,ray,q) {
+                if q.ordered { best = hit; }
+                else { rayQueryConfirmIntersection(&query); }
+            }
+        }
     }
-    return Hit(ray.high,NIL,0u,vec2<f32>(0.));
+    if q.ordered { return best; }
+    let h = rayQueryGetCommittedIntersection(&query);
+    if h.kind==RAY_QUERY_INTERSECTION_TRIANGLE { return triangle_hit(h); }
+    return best;
 }

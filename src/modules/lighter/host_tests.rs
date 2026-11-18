@@ -169,6 +169,7 @@ fn far_terrain_keeps_only_triangles_outside_the_resident_footprint() {
             .into(),
         triangles: vec![[0, 1, 2], [1, 2, 3]],
         surfaces: vec![],
+        layers: vec![],
     };
     let exterior = super::uncovered_far(&far, [-4., 0., 0., 4.], 7);
     assert_eq!(exterior.triangles, [[1, 2, 3]]);

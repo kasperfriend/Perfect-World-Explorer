@@ -1,7 +1,10 @@
 //! Feed posed meshes and effect cards into the same moving ray scene. Each
 //! module keeps its native archive lookup and animation ownership. No draw
 //! queues, framebuffer data, or main-view frustum are needed here.
-use super::{scene::*, textures::Textures};
+use super::{
+    scene::*,
+    textures::{Filter, Textures},
+};
 use crate::{
     gfx_player::EffectQuad,
     model_asset::{ModelAsset, PosedMesh},
@@ -13,6 +16,7 @@ pub(crate) struct Moving<'a> {
     pub builder: Builder,
     geometry: Mesh,
     textures: &'a mut Textures,
+    layer: u32,
 }
 
 impl<'a> Moving<'a> {
@@ -21,6 +25,7 @@ impl<'a> Moving<'a> {
             builder: Builder::default(),
             geometry: Mesh::default(),
             textures,
+            layer: 0,
         }
     }
 
@@ -39,9 +44,25 @@ impl<'a> Moving<'a> {
         };
         let settings = asset.descriptor.render_settings();
         for part in prepared.into_iter().filter(|part| include_skin(part.skin)) {
+            let d = part.material.diffuse;
+            let mut flags = if settings.destination_blend == 2 {
+                BLEND | ADDITIVE
+            } else if settings.source_blend != 5 || settings.destination_blend != 6 || d[3] < 0.99 {
+                BLEND
+            } else {
+                0
+            };
+            let filter = if part.diffuse_alpha_only {
+                flags |= IGNORE_TEXTURE_ALPHA;
+                Filter::Color
+            } else if flags & BLEND != 0 {
+                Filter::Alpha
+            } else {
+                Filter::cutout(0.5, false)
+            };
             let mut loaded = None;
             for path in &part.texture_paths {
-                loaded = self.textures.archive(namespace, path, decode)?;
+                loaded = self.textures.archive(namespace, path, filter, decode)?;
                 if loaded.is_some() {
                     break;
                 }
@@ -50,18 +71,11 @@ impl<'a> Moving<'a> {
             let tint = argb_to_rgba(part.color)
                 .to_le_bytes()
                 .map(|b| f32::from(b) / 255.);
-            let d = part.material.diffuse;
             let tint = rgba([tint[0] * d[0], tint[1] * d[1], tint[2] * d[2], d[3]]);
             let reflect = part.material.specular[..3].iter().sum::<f32>() / 12.;
-            let flags = if settings.destination_blend == 2 {
-                BLEND | ADDITIVE
-            } else if settings.source_blend != 5 || settings.destination_blend != 6 || d[3] < 0.99 {
-                BLEND
-            } else if alpha && !part.diffuse_alpha_only {
-                CUTOUT
-            } else {
-                0
-            };
+            if alpha && flags & (BLEND | IGNORE_TEXTURE_ALPHA) == 0 {
+                flags |= CUTOUT;
+            }
             let id = self
                 .builder
                 .surface(Surface::new(texture, flags, 0.5, reflect.min(0.35)));
@@ -91,7 +105,17 @@ impl<'a> Moving<'a> {
         quads: &[EffectQuad],
         decode: &mut Decode<'_>,
     ) -> Result<(), String> {
-        for q in quads {
+        // Match the native RenderLayer/priority ordering within a depth tie.
+        // Stable sort: quads from one effect can share material and priority.
+        let mut sorted: Vec<_> = quads.iter().collect();
+        sorted.sort_by_key(|q| {
+            (
+                q.layer,
+                !q.mesh.as_ref().is_some_and(|m| m.write_depth),
+                q.priority,
+            )
+        });
+        for q in sorted {
             let flags = BLEND
                 | if q.destination_blend == 2 {
                     ADDITIVE
@@ -102,7 +126,7 @@ impl<'a> Moving<'a> {
             if let Some(skin) = &q.mesh {
                 let texture = self
                     .textures
-                    .archive(namespace, &skin.texture, decode)?
+                    .archive(namespace, &skin.texture, Filter::Alpha, decode)?
                     .map_or(0, |v| v.0);
                 let flags = flags
                     | if skin.write_depth { WRITE_DEPTH } else { 0 }
@@ -173,7 +197,7 @@ impl<'a> Moving<'a> {
     ) -> Result<(), String> {
         let tex = self
             .textures
-            .archive(namespace, name, decode)?
+            .archive(namespace, name, Filter::Alpha, decode)?
             .map_or(0, |v| v.0);
         let base = self.geometry.vertices.len() as u32;
         let id = self
@@ -185,8 +209,12 @@ impl<'a> Moving<'a> {
                 .vertices
                 .push(Vertex::new(positions[j], [0., 1., 0.], uv[j]).tint(color, color));
         }
-        self.geometry.tri([base, base + 1, base + 2], id);
-        self.geometry.tri([base + 2, base + 1, base + 3], id);
+        self.layer += 1;
+        // Match the native effect pass's diagonal for authored corner colours.
+        self.geometry
+            .tri_layer([base, base + 1, base + 3], id, self.layer);
+        self.geometry
+            .tri_layer([base, base + 3, base + 2], id, self.layer);
         Ok(())
     }
 

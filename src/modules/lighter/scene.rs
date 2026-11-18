@@ -20,8 +20,18 @@ pub const SIMPLE_WATER: u32 = 1 << 11;
 pub const TWO_SIDED: u32 = 1 << 12;
 pub const CULL_BACK: u32 = 1 << 13;
 pub const WRITE_DEPTH: u32 = 1 << 14;
+pub const IGNORE_TEXTURE_ALPHA: u32 = 1 << 15;
+pub const STRICT_ALPHA: u32 = 1 << 16;
 
-const HEADER_WORDS: usize = 12;
+// These bits also occupy the upper eight bits of a Vulkan TLAS instance.
+// A mixed mesh can participate in several queries; its individual triangles
+// are then tested by the shared coverage predicate.
+pub const MASK_SOLID: u8 = 1;
+pub const MASK_BLEND: u8 = 2;
+pub const MASK_SHADOW: u8 = 4;
+pub const MASK_SHORE: u8 = 8;
+pub const INSTANCE_WORDS: u32 = 11;
+const HEADER_WORDS: usize = 14;
 pub const VERTEX_WORDS: u32 = 8;
 const MAX_ITEMS: usize = 8_000_000;
 pub const DYNAMIC_BIT: u32 = 1 << 23;
@@ -88,6 +98,18 @@ impl Surface {
             reflectance: reflectance.clamp(0., 1.).to_bits(),
         }
     }
+
+    fn ray_mask(self) -> u8 {
+        let blend = self.flags & BLEND != 0;
+        let mut mask = if blend { MASK_BLEND } else { MASK_SOLID };
+        if self.flags & WRITE_DEPTH != 0 || (!blend && self.flags & WATER == 0) {
+            mask |= MASK_SHADOW;
+        }
+        if self.flags & TERRAIN != 0 {
+            mask |= MASK_SHORE;
+        }
+        mask
+    }
 }
 
 /// Uniform scale and a Y rotation, as used by the client's grass instances.
@@ -148,18 +170,33 @@ pub struct Mesh {
     pub vertices: Vec<Vertex>,
     pub triangles: Vec<[u32; 3]>,
     pub surfaces: Vec<u32>,
+    // Zero denotes an ungrouped triangle; a nonzero ID identifies the two
+    // halves of one sheet or a coplanar triangulated draw on the same plane.
+    pub layers: Vec<u32>,
 }
 
 impl Mesh {
     pub fn tri(&mut self, indices: [u32; 3], surface: u32) {
+        if !self.layers.is_empty() {
+            self.layers.push(0);
+        }
         self.triangles.push(indices);
         self.surfaces.push(surface);
+    }
+
+    pub fn tri_layer(&mut self, indices: [u32; 3], surface: u32, layer: u32) {
+        self.layers.resize(self.triangles.len(), 0);
+        self.tri(indices, surface);
+        self.layers.resize(self.triangles.len(), 0);
+        self.layers[self.triangles.len() - 1] = layer;
     }
 }
 
 pub struct MeshRange {
     pub vertex: Range<u32>,
     pub triangle: Range<u32>,
+    pub mask: u8,
+    pub opaque: bool,
     bvh: (u32, u32),
     bounds: Bounds,
 }
@@ -181,16 +218,32 @@ pub struct Light {
 pub struct Builder {
     vertices: Vec<Vertex>,
     triangles: Vec<[u32; 3]>,
-    material_ids: Vec<u32>,
+    material_layers: Vec<[u32; 2]>,
     materials: Vec<Surface>,
     material_map: std::collections::HashMap<Surface, u32>,
     meshes: Vec<MeshRange>,
     instances: Vec<Instance>,
     bvh: Bvh,
-    pub lights: Vec<Light>,
+    lights: Vec<Light>,
 }
 
 impl Builder {
+    pub fn light(&mut self, light: Light) {
+        let [x, y, z, r] = light.position_range;
+        if r > 0.
+            && r <= 1.0e7
+            && Vec3::new(x, y, z).abs().max_element() <= 1.0e7
+            && light
+                .position_range
+                .iter()
+                .chain(&light.color)
+                .all(|v| v.is_finite())
+            && light.color[..3].iter().any(|&v| v > 0.)
+        {
+            self.lights.push(light);
+        }
+    }
+
     pub fn surface(&mut self, surface: Surface) -> u32 {
         *self.material_map.entry(surface).or_insert_with(|| {
             let id = self.materials.len() as u32;
@@ -204,6 +257,7 @@ impl Builder {
             return Ok(None);
         }
         if mesh.triangles.len() != mesh.surfaces.len()
+            || (!mesh.layers.is_empty() && mesh.layers.len() != mesh.triangles.len())
             || mesh
                 .surfaces
                 .iter()
@@ -222,6 +276,9 @@ impl Builder {
         let vertex_start = self.vertices.len() as u32;
         let tri_start = self.triangles.len() as u32;
         let mut bounds = Bounds::EMPTY;
+        let mut mask = 0;
+        let first_mask = self.materials[mesh.surfaces[0] as usize].ray_mask();
+        let mut opaque = true;
         let mut items = Vec::with_capacity(mesh.triangles.len());
         for (k, (&tri, &mat)) in mesh.triangles.iter().zip(&mesh.surfaces).enumerate() {
             let mut tb = Bounds::EMPTY;
@@ -242,15 +299,38 @@ impl Builder {
                 id: tri_start + k as u32,
                 bounds: tb,
             });
-            self.triangles.push(tri);
-            self.material_ids.push(mat);
+            let material = self.materials[mat as usize];
+            let bits = material.ray_mask();
+            mask |= bits;
+            opaque &= bits == first_mask
+                && material.flags
+                    & (CUTOUT | BLEND | NO_REFLECT | NO_REFRACT | CULL_BACK | WRITE_DEPTH)
+                    == 0;
         }
+        // Don't leave partial ranges behind if validation rejected this draw.
+        self.triangles.extend_from_slice(&mesh.triangles);
+        self.material_layers
+            .extend(mesh.surfaces.iter().enumerate().map(|(i, &material)| {
+                // Reserve zero for the ungrouped case. Tagged draws sort by their
+                // encounter-order tag, untagged triangles by their own order.
+                let layer = mesh.layers.get(i).copied().unwrap_or(0);
+                [
+                    material,
+                    if layer == 0 {
+                        (i as u32 + 1) << 1
+                    } else {
+                        layer << 1 | 1
+                    },
+                ]
+            }));
         self.vertices.extend_from_slice(&mesh.vertices);
         let bvh = self.bvh.build(&mut items);
         let id = self.meshes.len() as u32;
         self.meshes.push(MeshRange {
             vertex: vertex_start..self.vertices.len() as u32,
             triangle: tri_start..self.triangles.len() as u32,
+            mask,
+            opaque,
             bvh,
             bounds,
         });
@@ -264,6 +344,7 @@ impl Builder {
             || !transform.scale.is_finite()
             || transform.scale <= 0.
             || !Vec2::new(transform.cos, transform.sin).is_finite()
+            || (Vec2::new(transform.cos, transform.sin).length_squared() - 1.).abs() > 0.001
         {
             return Err("invalid or excessive Lighter instance transforms".into());
         }
@@ -298,7 +379,7 @@ impl Builder {
         }
         append(&mut words, 0, &self.vertices);
         append(&mut words, 1, &self.triangles);
-        append(&mut words, 2, &self.material_ids);
+        append(&mut words, 2, &self.material_layers);
         append(&mut words, 3, &self.materials);
         let gpu_instances: Vec<_> = self
             .instances
@@ -307,7 +388,7 @@ impl Builder {
                 let t = inst.transform;
                 let mesh = &self.meshes[inst.mesh as usize];
                 let [x, y, z] = t.position.map(f32::to_bits);
-                [
+                let words: [u32; INSTANCE_WORDS as usize] = [
                     x,
                     y,
                     z,
@@ -318,16 +399,44 @@ impl Builder {
                     mesh.triangle.start,
                     mesh.bvh.0,
                     mesh.bvh.1,
-                ]
+                    mesh.mask.into(),
+                ];
+                words
             })
             .collect();
         append(&mut words, 4, &gpu_instances);
+        let flag_bits = self.instances.iter().fold(0, |bits, inst| {
+            bits | u32::from(self.meshes[inst.mesh as usize].mask)
+        });
+        // Geometry trees and light trees use identical node layouts. Keep an
+        // explicit split so Vulkan can reuse ASes even when light values pulse.
+        let mut light_items: Vec<_> = self
+            .lights
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let [x, y, z, r] = l.position_range;
+                let center = Vec3::new(x, y, z);
+                let extent = Vec3::splat(r);
+                Item {
+                    id: i as u32,
+                    bounds: Bounds {
+                        min: center - extent,
+                        max: center + extent,
+                    },
+                }
+            })
+            .collect();
+        let (light_root, light_end) = self.bvh.build(&mut light_items);
         append(&mut words, 5, &self.bvh.nodes);
         append(&mut words, 6, &self.bvh.items);
         words[7] = root;
         words[8] = end;
         append(&mut words, 9, &self.lights);
         words[10] = self.lights.len() as u32;
+        words[11] = flag_bits;
+        words[12] = light_root;
+        words[13] = light_end;
         Packet {
             words,
             meshes: self.meshes,
@@ -343,6 +452,15 @@ pub struct Packet {
 }
 
 impl Packet {
+    /// Geometry and per-instance metadata, excluding nodes of the CPU-built
+    /// BVHs and all lighting. These bytes exactly describe Vulkan AS input.
+    pub fn same_geometry(&self, previous: &[u32]) -> bool {
+        previous.len() >= HEADER_WORDS
+            && self.words[..5] == previous[..5]
+            && self.words[HEADER_WORDS..self.words[5] as usize]
+                == previous[HEADER_WORDS..previous[5] as usize]
+    }
+
     pub fn bytes(&self) -> &[u8] {
         bytemuck::cast_slice(&self.words)
     }

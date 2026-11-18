@@ -596,6 +596,9 @@ pub struct Renderer {
     submitted: bool,
     revision: Option<u64>,
     texture_len: usize,
+    last_moving: Vec<u32>,
+    #[cfg(test)]
+    pub as_builds: [u64; 3],
 }
 
 impl Renderer {
@@ -623,6 +626,9 @@ impl Renderer {
             submitted: false,
             revision: None,
             texture_len: 0,
+            last_moving: Vec::new(),
+            #[cfg(test)]
+            as_builds: [0; 3],
         })
     }
 
@@ -655,7 +661,11 @@ impl Renderer {
                     ty: vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
                     geometry: vk::AccelerationStructureGeometryKHR::builder()
                         .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-                        .flags(vk::GeometryFlagsKHR::OPAQUE)
+                        .flags(if m.opaque {
+                            vk::GeometryFlagsKHR::OPAQUE
+                        } else {
+                            vk::GeometryFlagsKHR::NO_DUPLICATE_ANY_HIT_INVOCATION
+                        })
                         .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
                         .build(),
                 })
@@ -707,7 +717,11 @@ impl Renderer {
         if textures_changed {
             Upload::set(&mut self.textures, ctx, texels, STORAGE)?;
         }
-        Upload::set(&mut self.moving, ctx, moving.bytes(), input)?;
+        let moving_changed = self.last_moving != moving.words;
+        let geometry_changed = moving_changed && !moving.same_geometry(&self.last_moving);
+        if moving_changed {
+            Upload::set(&mut self.moving, ctx, moving.bytes(), input)?;
+        }
         let w = self.world.as_ref().unwrap();
         let m = self.moving.as_ref().unwrap();
         let textures = self.textures.as_ref().unwrap();
@@ -717,12 +731,18 @@ impl Renderer {
         } else {
             Vec::new()
         };
-        let moving_build = Self::blas(ctx, moving, &m.gpu)?;
+        let moving_build = if geometry_changed {
+            Self::blas(ctx, moving, &m.gpu)?
+        } else {
+            Vec::new()
+        };
         let mut scratch_bytes = 0;
         if static_changed {
             self.static_blas.resize_with(world_build.len(), || None);
         }
-        self.dynamic_blas.resize_with(moving_build.len(), || None);
+        if geometry_changed {
+            self.dynamic_blas.resize_with(moving_build.len(), || None);
+        }
         for (build, dest) in world_build
             .iter()
             .zip(&mut self.static_blas)
@@ -730,46 +750,53 @@ impl Renderer {
         {
             scratch_bytes = scratch_bytes.max(build.prepare(ctx, dest)?);
         }
-        let mut instance_data = Vec::with_capacity(world.instances.len() + moving.instances.len());
-        for (packet, meshes, bit) in [
-            (world, &self.static_blas, 0),
-            (moving, &self.dynamic_blas, DYNAMIC_BIT),
-        ] {
-            for (id, i) in packet.instances.iter().enumerate() {
-                instance_data.push(TlasInstance {
-                    rows: i.transform.rows(),
-                    index_mask: (id as u32 | bit) | 0xff00_0000,
-                    sbt_flags: 0,
-                    address: meshes[i.mesh as usize].as_ref().unwrap().address(),
-                });
+        let tlas_build = if static_changed || geometry_changed {
+            let mut instance_data =
+                Vec::with_capacity(world.instances.len() + moving.instances.len());
+            for (packet, meshes, bit) in [
+                (world, &self.static_blas, 0),
+                (moving, &self.dynamic_blas, DYNAMIC_BIT),
+            ] {
+                for (id, i) in packet.instances.iter().enumerate() {
+                    instance_data.push(TlasInstance {
+                        rows: i.transform.rows(),
+                        index_mask: (id as u32 | bit)
+                            | (u32::from(packet.meshes[i.mesh as usize].mask) << 24),
+                        sbt_flags: 0,
+                        address: meshes[i.mesh as usize].as_ref().unwrap().address(),
+                    });
+                }
             }
-        }
-        if instance_data.len() as u64 > ctx.max_instances {
-            return Err("Lighter scene exceeds Vulkan TLAS instance limit".into());
-        }
-        Upload::set(
-            &mut self.instances,
-            ctx,
-            bytemuck::cast_slice(&instance_data),
-            BUILD_INPUT | ADDRESS,
-        )?;
-        let instances = self.instances.as_ref().unwrap();
-        let tlas_build = Build {
-            ty: vk::AccelerationStructureTypeKHR::TOP_LEVEL,
-            count: instance_data.len() as u32,
-            geometry: vk::AccelerationStructureGeometryKHR::builder()
-                .geometry_type(vk::GeometryTypeKHR::INSTANCES)
-                .geometry(vk::AccelerationStructureGeometryDataKHR {
-                    instances: vk::AccelerationStructureGeometryInstancesDataKHR::builder()
-                        .data(vk::DeviceOrHostAddressConstKHR {
-                            device_address: instances.gpu.address(),
-                        })
-                        .build(),
-                })
-                .build(),
+            if instance_data.len() as u64 > ctx.max_instances {
+                return Err("Lighter scene exceeds Vulkan TLAS instance limit".into());
+            }
+            Upload::set(
+                &mut self.instances,
+                ctx,
+                bytemuck::cast_slice(&instance_data),
+                BUILD_INPUT | ADDRESS,
+            )?;
+            let instances = self.instances.as_ref().unwrap();
+            let build = Build {
+                ty: vk::AccelerationStructureTypeKHR::TOP_LEVEL,
+                count: instance_data.len() as u32,
+                geometry: vk::AccelerationStructureGeometryKHR::builder()
+                    .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+                    .geometry(vk::AccelerationStructureGeometryDataKHR {
+                        instances: vk::AccelerationStructureGeometryInstancesDataKHR::builder()
+                            .data(vk::DeviceOrHostAddressConstKHR {
+                                device_address: instances.gpu.address(),
+                            })
+                            .build(),
+                    })
+                    .build(),
+            };
+            scratch_bytes = scratch_bytes.max(build.prepare(ctx, &mut self.tlas)?);
+            Some(build)
+        } else {
+            None
         };
-        scratch_bytes =
-            scratch_bytes.max(tlas_build.prepare(ctx, &mut self.tlas)?) + ctx.scratch_align;
+        let scratch_bytes = scratch_bytes + ctx.scratch_align;
         if self.scratch.as_ref().is_none_or(|s| s.size < scratch_bytes) {
             self.scratch = Some(Buffer::new(ctx, scratch_bytes, STORAGE | ADDRESS, LOCAL)?);
         }
@@ -835,8 +862,12 @@ impl Renderer {
             if textures_changed {
                 textures.encode(cmd);
             }
-            m.encode(cmd);
-            instances.encode(cmd);
+            if moving_changed {
+                m.encode(cmd);
+            }
+            if tlas_build.is_some() {
+                self.instances.as_ref().unwrap().encode(cmd);
+            }
             d.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::TRANSFER,
@@ -860,7 +891,9 @@ impl Renderer {
             {
                 build.encode(ctx, cmd, dest.as_ref().unwrap(), scratch);
             }
-            tlas_build.encode(ctx, cmd, tlas, scratch);
+            if let Some(build) = &tlas_build {
+                build.encode(ctx, cmd, tlas, scratch);
+            }
             // wgpu's previous fragment pass may still be reading this buffer.
             d.cmd_pipeline_barrier(
                 cmd,
@@ -925,6 +958,15 @@ impl Renderer {
                 ));
                 output.raw.owns_handle = false;
             }
+        }
+        if moving_changed {
+            self.last_moving.clone_from(&moving.words);
+        }
+        #[cfg(test)]
+        {
+            self.as_builds[0] += world_build.len() as u64;
+            self.as_builds[1] += moving_build.len() as u64;
+            self.as_builds[2] += u64::from(tlas_build.is_some());
         }
         self.revision = Some(revision);
         self.texture_len = texels.len();

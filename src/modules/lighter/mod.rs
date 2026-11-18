@@ -152,6 +152,9 @@ struct Software {
     output: Storage,
     revision: Option<u64>,
     texture_len: usize,
+    last_moving: Vec<u32>,
+    #[cfg(test)]
+    moving_uploads: u64,
 }
 
 impl Software {
@@ -204,6 +207,9 @@ impl Software {
             output: Storage::new(device, "Lighter image", 16, wgpu::BufferUsages::empty()),
             revision: None,
             texture_len: 0,
+            last_moving: Vec::new(),
+            #[cfg(test)]
+            moving_uploads: 0,
         }
     }
 
@@ -232,8 +238,15 @@ impl Software {
                 .upload(device, queue, "Lighter texels", texels);
             self.texture_len = texels.len();
         }
-        self.moving
-            .upload(device, queue, "Lighter moving geometry", moving.bytes());
+        if self.last_moving != moving.words {
+            self.moving
+                .upload(device, queue, "Lighter moving geometry", moving.bytes());
+            self.last_moving.clone_from(&moving.words);
+            #[cfg(test)]
+            {
+                self.moving_uploads += 1;
+            }
+        }
         queue.write_buffer(&self.frame, 0, bytemuck::bytes_of(frame));
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Lighter ray data"),
