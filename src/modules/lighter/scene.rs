@@ -32,6 +32,10 @@ pub const SINGLE_SIDED: u32 = 1 << 18;
 pub const GRASS_MATERIAL: u32 = 1 << 19;
 pub const UV_TRANSFORM: u32 = 1 << 20;
 pub const BAKED_COLOR_ONLY: u32 = 1 << 21;
+pub const FOLIAGE: u32 = 1 << 22;
+pub const PRIMARY_ONLY: u32 = 1 << 23;
+pub const TREE_MATERIAL: u32 = 1 << 24;
+pub const GRASS_WIND_SLOTS: usize = 80;
 
 // These bits also occupy the upper eight bits of a Vulkan TLAS instance.
 // A mixed mesh can participate in several queries; its individual triangles
@@ -39,7 +43,7 @@ pub const BAKED_COLOR_ONLY: u32 = 1 << 21;
 pub const MASK_SOLID: u8 = 1;
 pub const MASK_BLEND: u8 = 2;
 pub const MASK_SHADOW: u8 = 4;
-pub const INSTANCE_WORDS: u32 = 13;
+pub const INSTANCE_WORDS: u32 = 14;
 const HEADER_WORDS: usize = 14;
 pub const VERTEX_WORDS: u32 = 8;
 const MAX_ITEMS: usize = 8_000_000;
@@ -71,6 +75,16 @@ impl Vertex {
             day: u32::MAX,
             night: u32::MAX,
         }
+    }
+
+    /// Grass has no vertex tint. Keep the native range and per-vertex
+    /// bend weight in the otherwise unused color lanes.
+    pub(crate) fn grass(self, sight: u32, weight: u32) -> Self {
+        self.tint(sight, weight)
+    }
+
+    pub(crate) fn grass_weight(self) -> f32 {
+        f32::from_bits(self.night)
     }
 
     pub fn tint(mut self, day: u32, night: u32) -> Self {
@@ -207,7 +221,9 @@ impl Surface {
     fn ray_mask(self) -> u8 {
         let blend = self.flags & BLEND != 0;
         let mut mask = if blend { MASK_BLEND } else { MASK_SOLID };
-        if self.flags & WRITE_DEPTH != 0 || (!blend && self.flags & WATER == 0) {
+        if self.flags & PRIMARY_ONLY == 0
+            && (self.flags & WRITE_DEPTH != 0 || (!blend && self.flags & WATER == 0))
+        {
             mask |= MASK_SHADOW;
         }
         mask
@@ -393,7 +409,7 @@ pub struct Instance {
     pub mesh: u32,
     transform: Transform,
     attachment: Option<u32>,
-    grass_area: [f32; 2],
+    aux: [u32; 3], // grass area x/z and wind slot, or tree LOD fade and side
 }
 
 #[repr(C)]
@@ -709,7 +725,10 @@ impl Builder {
                         | CULL_BACK
                         | WRITE_DEPTH
                         | HIDE_PRIMARY
-                        | SINGLE_SIDED)
+                        | SINGLE_SIDED
+                        | FOLIAGE
+                        | PRIMARY_ONLY
+                        | TREE_MATERIAL)
                     == 0;
         }
         // Don't leave partial ranges behind if validation rejected this draw.
@@ -758,7 +777,7 @@ impl Builder {
             mesh,
             transform,
             attachment: None,
-            grass_area: [0.; 2],
+            aux: [0, 0, GRASS_WIND_SLOTS as u32],
         });
         Ok(())
     }
@@ -769,8 +788,30 @@ impl Builder {
         transform: Transform,
         area: [f32; 2],
     ) -> Result<(), String> {
+        self.place_grass_wind(mesh, transform, area, GRASS_WIND_SLOTS as u32)
+    }
+
+    pub(crate) fn place_grass_wind(
+        &mut self,
+        mesh: u32,
+        transform: Transform,
+        area: [f32; 2],
+        slot: u32,
+    ) -> Result<(), String> {
         self.place(mesh, transform)?;
-        self.instances.last_mut().unwrap().grass_area = area;
+        self.instances.last_mut().unwrap().aux = [area[0].to_bits(), area[1].to_bits(), slot];
+        Ok(())
+    }
+
+    pub(crate) fn place_tree(
+        &mut self,
+        mesh: u32,
+        position: [f32; 3],
+        fraction: f32,
+        side: u32,
+    ) -> Result<(), String> {
+        self.place(mesh, Transform::translation(position))?;
+        self.instances.last_mut().unwrap().aux[0..2].copy_from_slice(&[fraction.to_bits(), side]);
         Ok(())
     }
 
@@ -788,6 +829,22 @@ impl Builder {
             self.place(id, Transform::IDENTITY)?;
         }
         Ok(())
+    }
+
+    /// A shared deforming mesh (e.g. all foliage of one SpeedTree type/LOD).
+    /// Retain index topology and update positions independently of instances.
+    pub(crate) fn posed_template(
+        &mut self,
+        namespace: &'static str,
+        owner: u64,
+        mesh: &Mesh,
+        materials: &[u32],
+    ) -> Result<Option<u32>, String> {
+        self.mesh_keyed(
+            mesh,
+            |id| materials.get(id as usize).copied(),
+            |topology, _| MeshKey::Posed(namespace, owner, topology),
+        )
     }
 
     pub fn posed_world_mesh(
@@ -890,8 +947,9 @@ impl Builder {
                     mesh.bvh.0,
                     mesh.bvh.1,
                     mesh.mask.into(),
-                    inst.grass_area[0].to_bits(),
-                    inst.grass_area[1].to_bits(),
+                    inst.aux[0],
+                    inst.aux[1],
+                    inst.aux[2],
                 ];
                 words
             })

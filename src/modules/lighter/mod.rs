@@ -69,7 +69,8 @@ pub struct Frame {
     pub sun_disc: [f32; 4],
     pub moon_disc: [f32; 4],
     pub sampling: [u32; 4],
-    pub material_time: [f32; 4], // terrain night weight, reserved
+    pub material_time: [f32; 4], // terrain night weight, grass fade enable, reserved
+    pub grass_history: [[f32; 4]; scene::GRASS_WIND_SLOTS],
 }
 
 // Matches Pixel in pixels.wgsl. Includes padding-free guide storage.

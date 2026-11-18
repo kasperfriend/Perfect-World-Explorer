@@ -687,6 +687,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_texture_prefix_replacement(&mut h);
     exercise_ray_texture_filter(&mut h);
     exercise_material_channels(&mut h);
+    exercise_vegetation(&mut h);
     exercise_chunk_scaling(&mut h);
     if mode == Mode::Software {
         exercise_reprojection_shader(&h);
@@ -1161,6 +1162,143 @@ fn exercise_material_channels(h: &mut Harness) {
     );
     assert!((pixel.1 - depth_at(frame, -5. * Vec3::Z)).abs() < 1e-6);
     eprintln!("Lighter: both authored bake endpoints, relighting, face stages, sidedness and normal map passed");
+}
+
+fn exercise_vegetation(h: &mut Harness) {
+    let empty = Builder::default().finish();
+    h.ray.settings.lighting = true;
+    h.ray.settings.shadows = true;
+    h.ray.settings.soft_sun = false;
+    h.ray.settings.reflections = false;
+    h.ray.settings.denoiser = false;
+    h.ray.settings.progressive = false;
+    h.ray.settings.bounces = 0;
+    h.ray.settings.samples = 1;
+    h.ray.settings.resolution = 100;
+    let mut bank = Textures::default();
+    let tile = bank
+        .tile([2, 1], 2, textures::Filter::cutout(0.5, false), |x, _| {
+            if x == 0 {
+                rgba([0., 1., 0., 1.])
+            } else {
+                0
+            }
+        })
+        .unwrap();
+    let ground = |y, extent: f32| {
+        [
+            [-extent, y, -extent],
+            [extent, y, -extent],
+            [-extent, y, extent],
+            [extent, y, extent],
+        ]
+    };
+    let mut b = Builder::default();
+    let floor = quad(&mut b, ground(0., 4.), [0., 1., 0.], 0, 0, u32::MAX);
+    put(&mut b, floor);
+    // The noon rays see a leaf's secondary shape from below. Its view card,
+    // even though opaque and closer to the receiver, must never cast a shadow.
+    let view_card = quad(
+        &mut b,
+        ground(1.7, 4.),
+        [0., 1., 0.],
+        0,
+        PRIMARY_ONLY,
+        u32::MAX,
+    );
+    put(&mut b, view_card);
+    let leaf = quad(
+        &mut b,
+        ground(2., 1.),
+        [0., 1., 0.],
+        tile,
+        FOLIAGE | CUTOUT | HIDE_PRIMARY,
+        u32::MAX,
+    );
+    put(&mut b, leaf);
+    h.ray.install(Ok((b.finish(), bank)));
+    for offset in [0., 0.16] {
+        for (x, expected) in [(-0.55, [0.12, 0.62, 0.12]), (0.55, [1.; 3])] {
+            let eye = Vec3::new(x, 1.5, offset);
+            let target = Vec3::new(x, 0., 0.);
+            let mut frame = test_frame(eye, target - eye, 3);
+            frame.sun = [0., 1., 0., 1.];
+            frame.sun_color = [1.; 4];
+            frame.ambient = [0.; 4];
+            assert_radiance(
+                "dappled noon with a two-sided leaf",
+                h.pixel(frame, &empty),
+                expected,
+            );
+        }
+    }
+
+    // A native LOD dissolve is complementary even at exactly coincident
+    // depth. Eight pixels use each side of the 4x4 matrix at half transition.
+    let mut b = Builder::default();
+    for (side, color) in [(1, [1., 0., 0., 1.]), (2, [0., 1., 0., 1.])] {
+        let mesh = upright(&mut b, -3., color, TREE_MATERIAL | EMISSIVE, 0);
+        b.place_tree(mesh, [0.; 3], 0.5, side).unwrap();
+    }
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let frame = test_frame(Vec3::ZERO, -Vec3::Z, 4);
+    let p = h.pixels(frame, &empty);
+    let red = p.iter().filter(|p| p.0 == [255, 0, 0, 255]).count();
+    let green = p.iter().filter(|p| p.0 == [0, 255, 0, 255]).count();
+    assert_eq!((red, green), (8, 8));
+    assert!(p
+        .iter()
+        .all(|p| (p.1 - depth_at(frame, -3. * Vec3::Z)).abs() < 1e-5));
+
+    // Fade is evaluated at the original vertices, not the hit or the bent
+    // tip. Lower the authored texture alpha so the fade changes coverage.
+    let mut bank = Textures::default();
+    let tile = bank
+        .tile([1, 1], 1, textures::Filter::cutout(0.3, true), |_, _| {
+            rgba([1., 0., 0., 0.5])
+        })
+        .unwrap();
+    let mut b = Builder::default();
+    let material = b.surface(Surface::new(
+        tile,
+        GRASS_MATERIAL | CUTOUT | STRICT_ALPHA,
+        0.3,
+        0.,
+    ));
+    let mut grass = Mesh::default();
+    for p in [
+        [-1., 1., -2.],
+        [1., 1., -2.],
+        [-1., -1., -2.],
+        [1., -1., -2.],
+    ] {
+        grass
+            .vertices
+            .push(Vertex::new(p, [0., 0., 1.], [0.5; 2]).grass(3.0f32.to_bits(), 0));
+    }
+    grass.tri([0, 2, 1], material);
+    grass.tri([1, 2, 3], material);
+    b.world_mesh(&grass).unwrap();
+    h.ray.install(Ok((b.finish(), bank)));
+    h.ray.settings.lighting = false;
+    h.ray.settings.shadows = false;
+    let mut frame = test_frame(Vec3::ZERO, -Vec3::Z, 3);
+    assert_radiance("grass without fade", h.pixel(frame, &empty), [1., 0., 0.]);
+    frame.material_time[1] = 1.;
+    assert_eq!(
+        h.pixel(frame, &empty).1,
+        0.,
+        "authored range and vertex fade did not reject grass"
+    );
+    // Move only 0.95 units: the 1-unit near clip must not clip this blade.
+    let mut near = test_frame(-0.95 * Vec3::Z, -Vec3::Z, 3);
+    near.material_time[1] = 1.;
+    assert_radiance(
+        "grass inside the authored fade",
+        h.pixel(near, &empty),
+        [1., 0., 0.],
+    );
+    eprintln!("Lighter: tinted leaf shadow, matched LOD dissolve, and grass distance fade passed");
 }
 
 fn assert_radiance(label: &str, pixel: ([u8; 4], f32), linear: [f32; 3]) {

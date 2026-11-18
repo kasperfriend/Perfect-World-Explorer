@@ -15,7 +15,8 @@ struct Frame {
     sky_tint: vec4<f32>, sky_uv: vec4<f32>,
     sun_disc: vec4<f32>, moon_disc: vec4<f32>,
     sampling: vec4<u32>, // transport sequence (x); camera rays keep fixed strata
-    material_time: vec4<f32>, // terrain night blend, reserved
+    material_time: vec4<f32>, // terrain night blend, grass fade enable, reserved
+    grass_history: array<vec4<f32>,80>,
 }
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage,read> world: array<u32>;
@@ -46,6 +47,9 @@ const SINGLE_SIDED: u32 = 262144u;
 const GRASS_MATERIAL: u32 = 524288u;
 const UV_TRANSFORM: u32 = 1048576u;
 const BAKED_COLOR_ONLY: u32 = 2097152u;
+const FOLIAGE: u32 = 4194304u;
+const PRIMARY_ONLY: u32 = 8388608u;
+const TREE_MATERIAL: u32 = 16777216u;
 const SOLID_MASK: u32 = 1u;
 const BLEND_MASK: u32 = 2u;
 const SHADOW_MASK: u32 = 4u;
@@ -94,7 +98,7 @@ fn floats(dynamic: bool, i: u32) -> vec3<f32> {
     return bitcast<vec3<f32>>(vec3<u32>(word(dynamic,i),word(dynamic,i+1u),word(dynamic,i+2u)));
 }
 fn inst_addr(instance: u32) -> u32 {
-    return word((instance & DYNAMIC) != 0u, 4u) + (instance & (DYNAMIC-1u)) * 13u;
+    return word((instance & DYNAMIC) != 0u, 4u) + (instance & (DYNAMIC-1u)) * 14u;
 }
 fn vertex_addresses(dynamic: bool, instance_addr: u32, primitive: u32) -> vec3<u32> {
     let first = word(dynamic,0u) + word(dynamic,instance_addr+6u)*8u;
@@ -399,6 +403,35 @@ fn coverage_sample(ray: Ray, m: bool, inst: u32, v: vec3<u32>) -> f32 {
     // A fixed plane-only rotation would correlate every pixel at low SPP.
     return fract(ray.coverage + f32(salt & 0xffffffu)/16777216.);
 }
+fn tree_lod_visible(m: bool, inst: u32, pixel: u32) -> bool {
+    let side = word(m,inst+12u);
+    if side==0u { return true; }
+    // Same complementary four-by-four thresholds as native tree LODs.
+    let x = (pixel-1u)%frame.extent.x%4u;
+    let y = (pixel-1u)/frame.extent.x%4u;
+    let b = (((x&1u)^(y&1u))*8u) + (y&1u)*4u + (((x>>1u)^(y>>1u))*2u) + (y>>1u);
+    let d = (f32(b)+0.5)/16.;
+    let has_far = d<bitcast<f32>(word(m,inst+11u));
+    return has_far==(side==2u);
+}
+fn grass_fade(m: bool, inst: u32, v: vec3<u32>, w: vec3<f32>) -> f32 {
+    let sight = bitcast<f32>(word(m,v.x+6u));
+    if !(sight>0. && sight<10000.) { return 1.; }
+    let slot = word(m,inst+13u);
+    var wind = vec3<f32>(0.);
+    if slot<80u { wind = frame.grass_history[slot].xyz; }
+    var fade = 0.;
+    let from_eye = floats(m,inst)-frame.eye.xyz;
+    // Native calculates the fade at *unbent* vertices and interpolates it.
+    for (var j=0u; j<3u; j++) {
+        let vertex = v[j];
+        let weight = bitcast<f32>(word(m,vertex+7u));
+        var d = from_eye + instance_vector(m,inst,floats(m,vertex));
+        if weight>=0. && weight<100. { d -= wind*weight; }
+        fade += w[j]*max(1.-dot(d,d)/(sight*sight),0.);
+    }
+    return fade;
+}
 // Called before committing the hit. No albedo, lighting, normals, or depth
 // writes for a rejected candidate; an alpha hole never advances ray.low.
 fn accepts(hit: Hit, ray: Ray, q: Query) -> bool {
@@ -408,13 +441,15 @@ fn accepts(hit: Hit, ray: Ray, q: Query) -> bool {
     let blend = (flags & BLEND)!=0u;
     if (q.mask==SOLID_MASK && blend) || (q.mask==BLEND_MASK && !blend)
         || (q.purpose==VIEW && (flags & HIDE_PRIMARY)!=0u)
+        || (q.purpose!=VIEW && (flags & PRIMARY_ONLY)!=0u)
         || (q.purpose==SHADOW && (flags & (BLEND|WATER))!=0u && (flags & WRITE_DEPTH)==0u)
         || (q.purpose==WATER_REFLECT && (flags & NO_REFLECT)!=0u)
         || (q.purpose==WATER_TRANSMIT && (flags & NO_REFRACT)!=0u) { return false; }
     let cull = (flags & SINGLE_SIDED)!=0u ||
         (q.purpose==VIEW && (frame.options.x & CULL_BUILDINGS)!=0u && (flags & CULL_BACK)!=0u);
-    if !cull && (flags & (CUTOUT|BLEND|WRITE_DEPTH))==0u { return true; }
     let inst = inst_addr(hit.instance);
+    if (flags & TREE_MATERIAL)!=0u && !tree_lod_visible(m,inst,ray.pixel_seed) { return false; }
+    if !cull && (flags & (CUTOUT|BLEND|WRITE_DEPTH))==0u { return true; }
     let v = vertex_addresses(m,inst,hit.primitive);
     if cull && dot(geometric(m,inst,v),ray.dir)>=0. { return false; }
     if (flags & (CUTOUT|BLEND|WRITE_DEPTH))==0u { return true; }
@@ -427,7 +462,13 @@ fn accepts(hit: Hit, ray: Ray, q: Query) -> bool {
         let tile_flags = texels[addr+3u];
         let cutout = (flags & CUTOUT)!=0u;
         let area = cutout && (tile_flags & AREA_MIPS)!=0u;
-        let cut = bitcast<f32>(word(m,mat+2u));
+        let native_cut = bitcast<f32>(word(m,mat+2u));
+        var cut = native_cut;
+        if (flags & GRASS_MATERIAL)!=0u && q.purpose==VIEW && frame.material_time.y>0.5 {
+            let fade = grass_fade(m,inst,v,w);
+            if fade<=native_cut { return false; }
+            cut = native_cut/fade;
+        }
         let taps = mesh_taps(addr,ray,hit,m,inst,v,words2(m,mat+11u));
         // Only alpha is inspected here. Skip the RGB transfer function on
         // rejected candidates, regardless of the material colour space.
@@ -529,7 +570,8 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
             default: { glaze = value; }
         }
     }
-    let tint = tint_of(m,v,w);
+    var tint = vec4<f32>(1.);
+    if !grass { tint = tint_of(m,v,w); }
     let alpha = select(tex.a,1.,(flags & IGNORE_TEXTURE_ALPHA)!=0u)*tint.a;
     var albedo = tex.rgb;
     let mode = word(m,mat+15u);
@@ -584,15 +626,36 @@ fn offset_origin(p: vec3<f32>, d: vec3<f32>, face: vec3<f32>) -> vec3<f32> {
 fn secondary(p: vec3<f32>, d: vec3<f32>, face: vec3<f32>, ray: Ray, t: f32) -> Ray {
     return Ray(offset_origin(p,d,face),d,0.,frame.eye.w,footprint(ray,t),ray.spread,ray.coverage,ray.pixel_seed);
 }
-fn visibility(p: vec3<f32>, face: vec3<f32>, light: LightRay, width: f32, source: Ray) -> f32 {
-    if (frame.options.x & SHADOWS)==0u { return 1.; }
+// Unsupplied by SpeedTree: a conservative thin-leaf RGB transmission
+// approximation tied to the authored leaf pigment, never the cutout alpha.
+fn leaf_transmission(albedo: vec3<f32>) -> vec3<f32> {
+    return 0.12+0.5*clamp(albedo,vec3<f32>(0.),vec3<f32>(1.));
+}
+fn visibility(p: vec3<f32>, face: vec3<f32>, light: LightRay, width: f32, source: Ray) -> vec3<f32> {
+    if (frame.options.x & SHADOWS)==0u { return vec3<f32>(1.); }
     let origin = offset_origin(p,light.dir,face);
-    // Keep the shadow-ray endpoint at the light after offsetting the origin.
     let to_light = light.dir*light.distance - (origin-p);
     let distance = length(to_light);
-    if distance<=1.e-5 { return 1.; }
-    let r = Ray(origin,to_light/distance,0.,distance,width,0.,source.coverage,source.pixel_seed);
-    return select(0.,1.,trace(r,Query(SHADOW,SHADOW_MASK,false,vec2<u32>(NIL))).instance==NIL);
+    if distance<=1.e-5 { return vec3<f32>(1.); }
+    var r = Ray(origin,to_light/distance,0.,distance,width,0.,source.coverage,source.pixel_seed);
+    var throughput = vec3<f32>(1.);
+    for (var layer=0u; layer<16u; layer++) {
+        let hit = trace(r,Query(SHADOW,SHADOW_MASK,false,vec2<u32>(NIL)));
+        if hit.instance==NIL { return throughput; }
+        let m = (hit.instance & DYNAMIC)!=0u;
+        let mat = material_addr(m,hit.primitive);
+        let flags = word(m,mat+1u);
+        if (flags & FOLIAGE)==0u { return vec3<f32>(0.); }
+        let inst = inst_addr(hit.instance);
+        let v = vertex_addresses(m,inst,hit.primitive);
+        let uv = surface_uv(m,v,weights_of(hit),mat,flags);
+        let addr = word(m,mat);
+        let albedo = filtered_tile(addr,uv,false,mesh_taps(addr,r,hit,m,inst,v,vec2<f32>(1.))).rgb;
+        throughput *= leaf_transmission(albedo);
+        if strongest(throughput)<0.002 { break; }
+        r.low = advance(hit.t);
+    }
+    return vec3<f32>(0.);
 }
 fn band(t: f32) -> f32 {
     // Group only floating-point ties, not surfaces separated by a ray bias.
@@ -979,7 +1042,9 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
             let glossy = !terminal && (s.flags & EMISSIVE)==0u && (frame.options.x & REFLECTIONS)!=0u;
             let specular = select(0.,s.reflectance,glossy);
             let specular_rgb = specular*s.specular;
-            let diffuse = vec3<f32>(1.)-specular_rgb;
+            let thin_leaf = !terminal && (s.flags & FOLIAGE)!=0u;
+            let transmission = select(vec3<f32>(0.),leaf_transmission(s.color.rgb),thin_leaf);
+            let diffuse = vec3<f32>(1.)-specular_rgb-transmission;
             // Partition the material response instead of adding a full-strength
             // local diffuse response to a mirror. Cosine-weighted sampling
             // cancels Lambert's cos/pi against its PDF; throughput is albedo.
@@ -987,10 +1052,18 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
             let bounce = !terminal && (s.flags & (EMISSIVE|BAKED))==0u && (frame.options.x & LIGHTING)!=0u;
             let albedo = select(vec3<f32>(0.),s.color.rgb*diffuse,bounce);
             let matte = strongest(albedo);
-            let total = specular + matte;
+            let transmitted = strongest(transmission);
+            let total = specular + matte + transmitted;
             if total<=0. { break; }
             path.depth++;
-            if matte==0. || (specular>0. && random(seed)*total<specular) {
+            // Forward thin-surface transport is independent of leaf winding.
+            if transmitted>0. && random(seed)*total<transmitted {
+                path.ray = secondary(p,ray.dir,s.face,ray,solid.t);
+                path.weight *= transmission*(total/transmitted);
+                path.purpose = select(path.purpose,DIFFUSE,path.purpose==VIEW);
+                continue;
+            }
+            if matte==0. || (specular>0. && random(seed)*(specular+matte)<specular) {
                 var d = norm(reflect(ray.dir,s.n));
                 if dot(d,s.face)<=0. { d = norm(reflect(ray.dir,s.face)); }
                 if s.power>=0. {

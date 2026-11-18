@@ -20,7 +20,10 @@ mod lightmaps;
 mod scenery;
 #[path = "terrain_fidelity.rs"]
 mod terrain_fidelity;
+#[path = "vegetation.rs"]
+mod vegetation;
 pub(super) use scenery::{SceneryStream, Snapshot as ScenerySnapshot};
+use vegetation::{read_tree, Tree};
 
 #[derive(Default)]
 pub(super) struct Feed {
@@ -40,14 +43,12 @@ pub(super) struct Feed {
     trees: Vec<Option<Tree>>,
     tree_archive_missing: bool,
     placements: Vec<crate::scene::Tree>,
+    forest: Vec<(usize, [f32; 3])>,
+    tree_scale: f32,
+    grass: vegetation::Grass,
     waves: Vec<u32>,
     sky: lighter::sky::Sky,
     authored_mips: bool,
-}
-
-struct Tree {
-    lods: Vec<(Mesh, [Surface; 3])>,
-    height: f32,
 }
 
 impl Feed {
@@ -322,7 +323,7 @@ impl Feed {
             let id = builder.surface(Surface::new(0, 0, 0., 0.));
             builder.world_mesh(&span(&m.vertices, extras, id, |v| rgba(v.color))?)?;
         }
-        self.vegetation(m, &mut builder, &mut bank, &mut inventory)?;
+        self.vegetation(m, &mut bank, &mut inventory)?;
         let scenery = m
             .ray_scenery
             .as_ref()
@@ -344,16 +345,19 @@ impl Feed {
     fn vegetation(
         &mut self,
         m: &MeshData,
-        builder: &mut Builder,
         textures: &mut Textures,
         inventory: &mut Inventory,
     ) -> Result<(), String> {
+        self.forest.clear();
+        self.tree_scale = m.detail.tree_lod_scale
+            * crate::scenery_visibility::lod_scale(
+                m.detail.scenery_quality,
+                crate::scenery_visibility::Class::Trees,
+            );
         let trees = &mut inventory[Class::Trees];
         if super::skip_trees_test() || super::ui_test() {
             trees.disabled = self.placements.len();
         } else {
-            let mut ids = HashMap::<(usize, usize), Option<u32>>::new();
-            let [cx, cz] = [m.tree_center.0, m.tree_center.1];
             let cutoff = m.detail.terrain_cutoff.then_some(self.near_bounds);
             for placement in &self.placements {
                 if !placement.position.iter().all(|x| x.is_finite()) {
@@ -364,115 +368,16 @@ impl Feed {
                     trees.cutoff += 1;
                     continue;
                 }
-                let type_id = placement.tree_type as usize;
-                let Some(tree) = self.trees.get(type_id) else {
-                    trees.invalid += 1;
-                    continue;
-                };
-                let Some(tree) = tree else {
-                    if self.tree_archive_missing {
-                        trees.package += 1;
-                    } else {
-                        trees.unavailable += 1;
-                    }
-                    continue;
-                };
-                let Some(distance) = crate::tree_lod::client_distance(
-                    placement.position,
-                    [cx, placement.position[1], cz],
-                ) else {
-                    trees.invalid += 1;
-                    continue;
-                };
-                let selection = crate::tree_lod::select(
-                    distance,
-                    tree.height,
-                    m.detail.tree_lod_scale
-                        * crate::scenery_visibility::lod_scale(
-                            m.detail.scenery_quality,
-                            crate::scenery_visibility::Class::Trees,
-                        ),
-                );
-                let level = selection
-                    .secondary
-                    .filter(|_| selection.fraction >= 0.5)
-                    .unwrap_or(selection.primary);
-                let id = if let Some(id) = ids.get(&(type_id, level)) {
-                    *id
-                } else {
-                    let Some((source, materials)) = tree.lods.get(level) else {
-                        trees.invalid += 1;
-                        continue;
-                    };
-                    let map = materials.map(|m| builder.surface(m));
-                    let id = builder.mesh_mapped(source, &map)?;
-                    ids.insert((type_id, level), id);
-                    id
-                };
-                if let Some(id) = id {
-                    builder.place(id, Transform::translation(placement.position))?;
-                    trees.loaded += 1;
-                } else {
-                    trees.empty += 1;
+                let id = placement.tree_type as usize;
+                match self.trees.get(id) {
+                    Some(Some(_)) => self.forest.push((id, placement.position)),
+                    Some(None) if self.tree_archive_missing => trees.package += 1,
+                    Some(None) => trees.unavailable += 1,
+                    None => trees.invalid += 1,
                 }
             }
         }
-        let mut grass_ids = HashMap::new();
-        let (vertices, indices, instances, batches) = m.grass.geometry();
-        let grass = &mut inventory[Class::Grass];
-        for batch in batches {
-            let indices = &indices[batch.indices.start as usize..batch.indices.end as usize];
-            let Some((&low, &high)) = indices.iter().min().zip(indices.iter().max()) else {
-                continue;
-            };
-            let mut mesh = Mesh::default();
-            for g in &vertices[low as usize..=high as usize] {
-                let v = &g.vertex;
-                mesh.vertices
-                    .push(Vertex::new(v.pos, v.normal, atlas_uv(v, g.scale_y)));
-            }
-            for tri in indices.chunks_exact(3) {
-                let g = &vertices[tri[0] as usize];
-                let [x, y, _, authored_alpha] = g.vertex.color;
-                let at = [x, y].map(|p| (p * super::ATLAS as f32).round() as usize);
-                let alpha = if self.authored_mips {
-                    authored_alpha
-                } else {
-                    84. / 255.
-                };
-                let texture = if let Some(&id) = grass_ids.get(&at) {
-                    id
-                } else {
-                    let source = m
-                        .ray_grass
-                        .get(&at)
-                        .ok_or("missing ray grass material source")?;
-                    let id = textures.insert(source)?;
-                    grass_ids.insert(at, id);
-                    id
-                };
-                mesh.tri(
-                    [tri[0] - low, tri[1] - low, tri[2] - low],
-                    builder.surface(Surface::new(texture, CUTOUT | GRASS_MATERIAL, alpha, 0.)),
-                );
-            }
-            if let Some(id) = builder.mesh(&mesh)? {
-                for v in &instances[batch.instances.start as usize..batch.instances.end as usize] {
-                    builder.place_grass(
-                        id,
-                        Transform {
-                            position: [v[0], v[1], v[2]],
-                            scale: v[3],
-                            cos: v[4],
-                            sin: -v[5],
-                        },
-                        [v[8], v[9]],
-                    )?;
-                    grass.loaded += 1;
-                }
-            }
-        }
-        grass.empty = instances.len().saturating_sub(grass.loaded);
+        self.grass = vegetation::Grass::prepare(m, textures, self.authored_mips)?;
         Ok(())
     }
 
@@ -583,7 +488,8 @@ impl Feed {
             sun_disc: disc(f.sky_sun),
             moon_disc: disc(f.sky_moon),
             sampling: [0; 4],
-            material_time: [f.fog_range[3], 0., 0., 0.],
+            material_time: [f.fog_range[3], f.grass_eye[3], 0., 0.],
+            grass_history: f.grass_history,
         }
     }
 }
@@ -768,101 +674,6 @@ fn water_mesh(m: &MeshData, builder: &mut Builder) -> Result<Mesh, String> {
     Ok(water)
 }
 
-fn read_tree(
-    source: &crate::trees::TreeMesh,
-    textures: &mut Textures,
-    authored: bool,
-) -> Result<Tree, String> {
-    let xyz = |p: [f32; 3]| [p[0], p[2], p[1]];
-    let alpha = |value: Option<f32>, default: Option<f32>| {
-        if authored {
-            value
-                .filter(|v| *v >= 0.)
-                .map_or(default.map(|r| (r, false)), |v| Some((v / 255., true)))
-        } else {
-            default.map(|r| (r, false))
-        }
-    };
-    let mut height = 5f32;
-    let mut tiles = HashMap::new();
-    let mut lods = Vec::with_capacity(source.lods.len());
-    for lod in &source.lods {
-        let thresholds = [
-            alpha(lod.branch_alpha_ref, None),
-            alpha(lod.frond_alpha_ref, Some(0.5)),
-            if authored {
-                Some((84. / 255., true))
-            } else {
-                Some((0.5, false))
-            },
-        ];
-        let mut materials = [Surface::new(0, 0, 0., 0.); 3];
-        for (i, reference) in thresholds.into_iter().enumerate() {
-            let (image, mips) = if i == 0 {
-                (&source.bark, &source.bark_mips)
-            } else {
-                (&source.composite, &source.composite_mips)
-            };
-            let mode = reference.map_or(Filter::Color, |(r, strict)| Filter::cutout(r, strict));
-            let addr = match tiles.entry((i == 0, mode)) {
-                std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                std::collections::hash_map::Entry::Vacant(e) => *e.insert(textures.images(
-                    std::iter::once(image).chain(mips),
-                    COLOR_SIDE,
-                    mode,
-                )?),
-            };
-            let (cutoff, flags) = reference.map_or((0., 0), |(r, strict)| {
-                (r, CUTOUT | if strict { STRICT_ALPHA } else { 0 })
-            });
-            materials[i] = Surface::new(addr, flags, cutoff, 0.);
-        }
-        let mut mesh = Mesh::default();
-        for (i, part) in [&lod.branch, &lod.frond].into_iter().enumerate() {
-            let base = mesh.vertices.len() as u32;
-            mesh.vertices.extend(part.vertices.iter().map(|v| {
-                height = height.max(v.pos[2]);
-                Vertex::new(xyz(v.pos), xyz(v.normal), v.uv)
-            }));
-            for tri in part.indices.chunks_exact(3) {
-                mesh.tri([base + tri[0], base + tri[1], base + tri[2]], i as u32);
-            }
-        }
-        for leaf in &lod.leaves {
-            height = height.max(leaf.center[2]);
-            let center = Vec3::from_array(xyz(leaf.center));
-            // Real SpeedTree leaf geometry/UVs. Camera-only billboards would
-            // disappear edge-on to secondary rays; put the same cards in two
-            // orthogonal orientations. Fixed oriented leaves keep their own.
-            let orientations: &[f32] = if leaf.rho > 1000. {
-                &[0.]
-            } else {
-                &[0., std::f32::consts::FRAC_PI_2]
-            };
-            for az in orientations {
-                let base = mesh.vertices.len() as u32;
-                let (s, c) = (az + leaf.rho).sin_cos();
-                for (j, [x, y, z]) in leaf.corners.into_iter().enumerate() {
-                    let v = if leaf.rho > 1000. {
-                        xyz([x, y, z])
-                    } else {
-                        [c * x - s * y, z, s * x + c * y]
-                    };
-                    mesh.vertices.push(Vertex::new(
-                        (center + Vec3::from_array(v)).to_array(),
-                        leaf.normal.map_or([0., 1., 0.], xyz),
-                        leaf.uv[j],
-                    ));
-                }
-                mesh.tri([base, base + 1, base + 2], 2);
-                mesh.tri([base + 2, base + 1, base + 3], 2);
-            }
-        }
-        lods.push((mesh, materials));
-    }
-    Ok(Tree { lods, height })
-}
-
 pub(super) type GrassTiles = HashMap<[usize; 2], Arc<Tile>>;
 
 /// The atlas rectangle labels a native grass material, not its ray source.
@@ -887,7 +698,7 @@ pub(super) fn grass_tiles(
             Arc::new(Tile::images(
                 std::iter::once(image).chain(mips),
                 COLOR_SIDE,
-                Filter::cutout(84. / 255., false),
+                Filter::cutout(84. / 255., true),
             )?)
         };
         output.insert([slot.x, slot.y], Arc::clone(&tile));
@@ -917,6 +728,9 @@ fn point_light(p: [f32; 3], radius: f32, color: [f32; 4], intensity: f32) -> Lig
 }
 
 fn moving(
+    feed: &Feed,
+    frame: &FrameSnapshot,
+    storage: usize,
     models: Option<&mut world_models_gpu::World>,
     modules: &mut crate::modules::Modules,
     textures: &mut Textures,
@@ -957,6 +771,22 @@ fn moving(
         out.effects("world", effects, &mut decode)?;
     }
     modules.ray_inputs(matrix, &mut out)?;
+    let mut budget = out.builder.optional_mesh_budget(storage);
+    vegetation::forest(
+        &feed.trees,
+        &feed.forest,
+        feed.tree_scale,
+        frame,
+        &mut out.builder,
+        &mut out.coverage[Class::Trees],
+        &mut budget,
+    )?;
+    feed.grass.append(
+        frame,
+        &mut out.builder,
+        &mut out.coverage[Class::Grass],
+        &mut budget,
+    )?;
     let coverage = out.coverage;
     Ok((out.finish_cached(cache)?, coverage))
 }
@@ -1057,13 +887,16 @@ impl super::Renderer {
                 .lighter_feed
                 .as_ref()
                 .ok_or("Lighter scene feed is unavailable")?;
-            let frame = feed.frame(matrix, camera, frame, w, h);
+            let lights = feed.frame(matrix, camera, frame, w, h);
             let world = self
                 .lighter
                 .world
                 .as_mut()
                 .ok_or("Lighter has no resident geometry")?;
             let (moving, coverage) = moving(
+                feed,
+                frame,
+                lighter::storage_limit(&self.device),
                 self.models.as_mut(),
                 &mut self.modules,
                 &mut world.textures,
@@ -1078,7 +911,7 @@ impl super::Renderer {
                 scene_target,
                 &depth,
                 self.scene_format,
-                frame,
+                lights,
                 &moving,
             )?;
             if rendered {

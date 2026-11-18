@@ -10,9 +10,8 @@ fn triangle_hit(h: RayIntersection) -> Hit {
 // candidates (including cutouts) are confirmed only after coverage testing.
 // Do not confirm ordered blend hits: committing one would hide its peers at t.
 fn intersect(ray: Ray, q: Query) -> Hit {
-    let flags = select(0u,RAY_FLAG_TERMINATE_ON_FIRST_HIT,q.purpose==SHADOW);
     var query: ray_query;
-    rayQueryInitialize(&query, acceleration, RayDesc(flags, q.mask, ray.low, ray.high, ray.origin, ray.dir));
+    rayQueryInitialize(&query, acceleration, RayDesc(0u, q.mask, ray.low, ray.high, ray.origin, ray.dir));
     var best = none(ray);
     while rayQueryProceed(&query) {
         let h = rayQueryGetCandidateIntersection(&query);
