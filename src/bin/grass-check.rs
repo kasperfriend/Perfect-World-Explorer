@@ -1,10 +1,10 @@
 //! Validate real client grass masks and MOXB meshes without opening a window.
 #[allow(dead_code)]
-#[path = "../dxt.rs"]
-mod dxt;
-#[allow(dead_code)]
 #[path = "../angelica_pck.rs"]
 mod angelica_pck;
+#[allow(dead_code)]
+#[path = "../dxt.rs"]
+mod dxt;
 #[path = "../grass.rs"]
 mod grass;
 #[path = "../model_dds.rs"]

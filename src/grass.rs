@@ -562,7 +562,10 @@ impl Grass {
         let mut archive = match File::open(element.join("grasses.pck")) {
             Ok(file) => file,
             Err(error) => {
-                eprintln!("grass geometry unavailable ({}): {error}", element.display());
+                eprintln!(
+                    "grass geometry unavailable ({}): {error}",
+                    element.display()
+                );
                 return Ok(Self {
                     areas,
                     types: scene.grass_types.clone(),
