@@ -778,6 +778,8 @@ EOF
         cat > "$OUT/pck/sweep.rs" <<EOF
 #[path = "$REPO/src/pck.rs"]
 pub mod pck;
+#[path = "$REPO/src/angelica_pck.rs"]
+pub mod angelica_pck;
 use std::path::Path;
 fn main() {
     let dir = std::env::args().nth(1).expect("pck directory");
@@ -793,12 +795,26 @@ fn main() {
             Ok(f) => f,
             Err(e) => { println!("FAIL {name}: {e}"); bad += 1; continue; }
         };
-        match pck::directory(&mut file) {
+        // Two containers share the v2 prefix and the flag byte, and the client
+        // tells them apart by their guard pair: the older \`0xa508bdc4\` /
+        // \`0x853567c8\` Angelica packs and the newer \`0xfdfdfeee\` / \`0xf00dbeef\`
+        // ones. Try both, the way \`client_detect::scan_archive\` does, so a pack
+        // the Angelica reader handles is not reported as a failure here.
+        let (source, entries) = match pck::directory(&mut file) {
+            Ok(entries) => ("pck", Ok(entries)),
+            Err(error) => ("angelica", angelica_pck::directory(&mut file).map_err(|inner| {
+                format!("{error}; {inner}")
+            })),
+        };
+        match entries {
             Ok(entries) => {
                 let mut wrong = 0usize;
                 let mut first = String::new();
                 for e in &entries {
-                    match pck::read_entry(&mut file, e) {
+                    // Both containers carry absolute entry offsets in the same
+                    // Entry shape, so one reader serves them.
+                    let read = pck::read_entry(&mut file, e);
+                    match read {
                         Ok(b) if b.len() == e.size as usize => {}
                         Ok(b) => {
                             wrong += 1;
@@ -814,7 +830,7 @@ fn main() {
                 }
                 if wrong == 0 {
                     good += 1;
-                    println!("ok   {name:<22} {} entries", entries.len());
+                    println!("ok   {name:<22} {} entries ({source})", entries.len());
                 } else {
                     bad += 1;
                     println!("FAIL {name:<22} {} entries, {wrong} unreadable ({first})", entries.len());
@@ -915,12 +931,12 @@ fn scenery(root: &Path) -> Vec<String> {
     out
 }
 fn water_areas(root: &Path) -> Vec<String> {
-    // Water lives in `maps/<id>/<id>.ecbsd` (a manifest of `bsdata/*.dat`
+    // Water lives in \`maps/<id>/<id>.ecbsd\` (a manifest of \`bsdata/*.dat\`
     // paths and per-ref record indices) and the areas themselves are inside
-    // those `.dat` files. `water::load` is the reader that already knows that
+    // those \`.dat\` files. \`water::load\` is the reader that already knows that
     // shape, so drive it rather than re-deriving the framing here: an earlier
-    // version of this report treated the last dword of the `.ecbsd` as a record
-    // count and printed `records=0` for every map.
+    // version of this report treated the last dword of the \`.ecbsd\` as a record
+    // count and printed \`records=0\` for every map.
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(root.join("maps")) else { return out };
     let mut dirs: Vec<_> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
