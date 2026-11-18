@@ -15,7 +15,7 @@ struct Frame {
     sky_tint: vec4<f32>, sky_uv: vec4<f32>,
     sun_disc: vec4<f32>, moon_disc: vec4<f32>,
     sampling: vec4<u32>, // transport sequence (x); camera rays keep fixed strata
-    material_time: vec4<f32>, // terrain night blend, grass fade enable, reserved
+    material_time: vec4<f32>, // terrain night blend, grass fade, static light night factor, reserved
     grass_history: array<vec4<f32>,80>,
     shore_offsets: vec4<f32>,
     resident_bounds: vec4<f32>,
@@ -58,6 +58,7 @@ const OVERLAY: u32 = 67108864u;
 const CLOUD: u32 = 134217728u;
 const PRECIPITATION: u32 = 268435456u;
 const ORDERED_GFX: u32 = 536870912u;
+const GLASS: u32 = 1073741824u;
 const SOLID_MASK: u32 = 1u;
 const BLEND_MASK: u32 = 2u;
 const SHADOW_MASK: u32 = 4u;
@@ -335,7 +336,7 @@ fn vertex_tint(m: bool, v: u32) -> vec4<f32> {
 }
 fn material_addr(m: bool, primitive: u32) -> u32 {
     // Same word order as scene::Surface.
-    return word(m,3u) + 22u*word(m,word(m,2u)+2u*primitive);
+    return word(m,3u) + 24u*word(m,word(m,2u)+2u*primitive);
 }
 fn layer_key(hit: Hit) -> vec2<u32> {
     let m = (hit.instance & DYNAMIC)!=0u;
@@ -710,14 +711,24 @@ fn visibility(p: vec3<f32>, face: vec3<f32>, light: LightRay, width: f32, source
         let m = (hit.instance & DYNAMIC)!=0u;
         let mat = material_addr(m,hit.primitive);
         let flags = word(m,mat+1u);
-        if (flags & (FOLIAGE|CLOUD))==0u { return vec3<f32>(0.); }
+        if (flags & (FOLIAGE|CLOUD|GLASS))==0u { return vec3<f32>(0.); }
         let inst = inst_addr(hit.instance);
         let v = vertex_addresses(m,inst,hit.primitive);
-        let uv = surface_uv(m,v,weights_of(hit),mat,flags);
-        let addr = word(m,mat);
-        let sample = filtered_tile(addr,uv,(flags & CLAMP_UV)!=0u,mesh_taps(addr,r,hit,m,inst,v,vec2<f32>(1.)));
-        let tint = select(leaf_transmission(sample.rgb),vec3<f32>(1.-0.72*sample.a*tint_of(m,v,weights_of(hit)).a),(flags & CLOUD)!=0u);
-        throughput *= tint;
+        if (flags & GLASS)!=0u {
+            // A straight connection through a thin, parallel-sided pane.
+            // The two-interface Fresnel loss includes internal reflections;
+            // refracted light connections through thick solids are separate.
+            let gn = norm(geometric(m,inst,v));
+            let local_n = select(gn,-gn,dot(gn,r.dir)>0.);
+            let optics = dielectric(r.dir,local_n,1./bitcast<f32>(word(m,mat+23u)));
+            throughput *= rgba(word(m,mat+22u)).rgb*((1.-optics.fresnel)/(1.+optics.fresnel));
+        } else {
+            let w = weights_of(hit);
+            let uv = surface_uv(m,v,w,mat,flags);
+            let addr = word(m,mat);
+            let sample = filtered_tile(addr,uv,(flags & CLAMP_UV)!=0u,mesh_taps(addr,r,hit,m,inst,v,vec2<f32>(1.)));
+            throughput *= select(leaf_transmission(sample.rgb),vec3<f32>(1.-0.72*sample.a*tint_of(m,v,w).a),(flags & CLOUD)!=0u);
+        }
         if strongest(throughput)<0.002 { break; }
         r.low = advance(hit.t);
     }
@@ -801,21 +812,51 @@ fn environment(ray: Ray, seen_sun: bool) -> vec3<f32> {
 }
 struct LightRay { dir: vec3<f32>, distance: f32, energy: vec3<f32> }
 struct LightCursor { feed: u32, node: u32, item: u32, end_item: u32 }
-fn next_light(p: vec3<f32>, s: Surface, cursor: ptr<function,LightCursor>) -> LightRay {
+fn next_light(p: vec3<f32>, s: Surface, cursor: ptr<function,LightCursor>, seed: ptr<function,u32>) -> LightRay {
     loop {
         let m = (*cursor).feed!=0u;
         if (*cursor).item<(*cursor).end_item {
             let index = word(m,word(m,6u)+(*cursor).item);
-            let a = word(m,9u) + index*8u;
+            let a = word(m,9u) + index*12u;
             (*cursor).item++;
             let to = floats(m,a)-p;
             let r = bitcast<f32>(word(m,a+3u));
             let d2 = dot(to,to);
-            let cosine = dot(to,s.n);
-            if d2>=r*r || d2<=1.e-8 || cosine<=0. || dot(to,s.face)<=0. { continue; }
+            if d2>=r*r || d2<=1.e-8 { continue; }
+            var rgb = floats(m,a+4u);
+            if (word(m,a+10u) & 1u)!=0u {
+                if frame.material_time.z<=0. { continue; }
+                // The client scales its encoded diffuse before the color stage.
+                rgb = linear(clamp(rgb*frame.material_time.z,vec3<f32>(0.),vec3<f32>(1.)));
+            }
             let d = sqrt(d2);
+            var sample = to/d;
+            var end = d;
+            let kind = word(m,a+8u);
+            if (frame.options.x & SHADOWS)!=0u && kind!=0u {
+                let radius = min(bitcast<f32>(word(m,a+9u)),d*0.99);
+                let u = random(seed);
+                let phi = random(seed)*6.2831853;
+                if kind==1u {
+                    // Uniform solid-angle cone subtended by the sphere. The
+                    // endpoint is its near surface, not the emitter center.
+                    let t2 = radius*radius/d2;
+                    let delta = u*t2/(1.+sqrt(1.-t2));
+                    let sin2 = delta*(2.-delta);
+                    sample = around(sample,1.-delta,sqrt(sin2),phi);
+                    end = d*(1.-delta)-sqrt(max(0.,radius*radius-d2*sin2));
+                } else {
+                    // Authored direction is unavailable for runtime lights;
+                    // use a finite, receiver-facing disk of equivalent size.
+                    let delta = around(sample,0.,1.,phi)*(radius*sqrt(u));
+                    end = length(to+delta);
+                    sample = (to+delta)/end;
+                }
+            }
+            let cosine = dot(sample,s.n);
+            if cosine<=0. || dot(sample,s.face)<=0. { continue; }
             let falloff = 1.-d/r;
-            return LightRay(to/d,d,floats(m,a+4u)*(cosine/d*falloff*falloff));
+            return LightRay(sample,end,rgb*(cosine*falloff*falloff));
         }
         if (*cursor).node>=word(m,13u) {
             if m { break; }
@@ -893,7 +934,7 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, seed: ptr<
             light = LightRay(sun,frame.eye.w,energy);
         } else {
             if !lit { break; }
-            light = next_light(p,s,&cursor);
+            light = next_light(p,s,&cursor,seed);
             if light.distance<=0. { break; }
         }
         // One shadow traversal site for sun, static points and GFX points.

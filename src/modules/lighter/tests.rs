@@ -58,10 +58,7 @@ fn packet_rejects_bad_indices_and_materials() {
 fn light_influence_tree_limits_per_hit_work() {
     let mut b = Builder::default();
     for i in 0..1024 {
-        b.light(Light {
-            position_range: [i as f32 * 8., 0., 0., 2.],
-            color: [1.; 4],
-        });
+        b.light(Light::point([i as f32 * 8., 0., 0., 2.], [1.; 4]));
     }
     let packet = b.finish();
     let w = &packet.words;
@@ -456,17 +453,11 @@ fn exercise(mode: Mode, cpu_query: bool) {
 
     let local_light = |color: [f32; 4], masked| {
         let mut b = Builder::default();
-        b.light(Light {
-            position_range: [6., 0., -2., 12.],
-            color,
-        });
+        b.light(Light::point([6., 0., -2., 12.], color));
         // The tested light must not be pruned just because decorative lights
         // elsewhere in world space also exist in the same packet.
         for i in 0..70 {
-            b.light(Light {
-                position_range: [100. + i as f32 * 16., 0., 0., 3.],
-                color: [1.; 4],
-            });
+            b.light(Light::point([100. + i as f32 * 16., 0., 0., 3.], [1.; 4]));
         }
         let block = upright(
             &mut b,
@@ -690,6 +681,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_vegetation(&mut h);
     exercise_water_art(&mut h);
     exercise_effect_placement(&mut h);
+    exercise_finite_emitters(&mut h);
     exercise_chunk_scaling(&mut h);
     if mode == Mode::Software {
         exercise_reprojection_shader(&h);
@@ -1166,6 +1158,126 @@ fn exercise_material_channels(h: &mut Harness) {
     eprintln!("Lighter: both authored bake endpoints, relighting, face stages, sidedness and normal map passed");
 }
 
+fn exercise_finite_emitters(h: &mut Harness) {
+    h.ray.settings.lighting = true;
+    h.ray.settings.shadows = true;
+    h.ray.settings.bounces = 0;
+    h.ray.settings.progressive = false;
+    let mut world = Builder::default();
+    let receiver = upright(&mut world, -6., [1.; 4], 0, 0);
+    put(&mut world, receiver);
+    h.ray.install(Ok((world.finish(), Textures::default())));
+    let mut frame = test_frame(Vec3::ZERO, -Vec3::Z, 3);
+    frame.ambient = [0.; 4];
+    let impact = [4., 0., -2., 10.];
+    let point = Light::point(impact, [1.; 4]);
+    let pane = |x: f32, z, tint| {
+        (
+            [
+                [x - 0.8, 1., z],
+                [x + 0.8, 1., z],
+                [x - 0.8, -1., z],
+                [x + 0.8, -1., z],
+            ],
+            tint,
+        )
+    };
+    let fixture = |lamp, panes: &[([[f32; 3]; 4], [f32; 3])]| {
+        let mut b = Builder::default();
+        b.light(lamp);
+        for &(pos, tint) in panes {
+            let obj = quad_material(
+                &mut b,
+                pos,
+                [0., 0., 1.],
+                Surface::new(0, 0, 0., 0.).with_glass(tint, 1.5),
+                u32::MAX,
+            );
+            put(&mut b, obj);
+        }
+        b.finish()
+    };
+    let cosine = std::f32::consts::FRAC_1_SQRT_2;
+    let energy = cosine * (1. - (32.0f32).sqrt() / 10.).powi(2);
+    let open = h.pixel(frame, &fixture(point, &[]));
+    assert_radiance("point baseline", open, [energy; 3]);
+    let ri = 1.0 / 1.5;
+    let ct = (1. - ri * ri * (1. - cosine * cosine)).sqrt();
+    let fr = 0.5
+        * (((ri * cosine - ct) / (ri * cosine + ct)).powi(2)
+            + ((cosine - ri * ct) / (cosine + ri * ct)).powi(2));
+    let tx = (1. - fr) / (1. + fr);
+    let p = h.pixel(
+        frame,
+        &fixture(
+            point,
+            &[
+                pane(2., -4., [1., 0.5, 0.25]),
+                pane(3., -3., [0.25, 1., 0.5]),
+                pane(5., -1., [0.; 3]),
+            ],
+        ),
+    );
+    assert_radiance(
+        "two tinted pane shadows, with blocker beyond emitter",
+        p,
+        [0.25, 0.5, 0.125].map(|x| x * energy * tx * tx),
+    );
+    assert_eq!(open.1, p.1);
+    let conditional = fixture(point.night_rgb([1.; 4]), &[]);
+    assert_radiance(
+        "night-flag light by day",
+        h.pixel(frame, &conditional),
+        [0.; 3],
+    );
+    frame.material_time[2] = 1.;
+    assert_eq!(h.pixel(frame, &conditional), open);
+    frame.material_time[2] = 0.5;
+    assert_radiance(
+        "night weight applied in encoded RGB",
+        h.pixel(frame, &conditional),
+        [0.21404114 * energy; 3],
+    );
+
+    // Boundary of an off-axis blocker. For the two finite shapes at least
+    // some samples go around the edge that fully covers the point emitter.
+    let edge = |light| {
+        let mut b = Builder::default();
+        b.light(light);
+        let block = quad(
+            &mut b,
+            [
+                [1.67, 5., -4.],
+                [3., 5., -4.],
+                [1.67, -5., -4.],
+                [3., -5., -4.],
+            ],
+            [0., 0., 1.],
+            0,
+            0,
+            u32::MAX,
+        );
+        put(&mut b, block);
+        b.finish()
+    };
+    frame.extent = [0, 0, 31, 31];
+    let open = h.pixels(frame, &fixture(point, &[]));
+    let hard = h.pixels(frame, &edge(point));
+    for lamp in [point.sphere(1.3), point.disk(1.3)] {
+        let soft = h.pixels(frame, &edge(lamp));
+        assert!(
+            soft.iter()
+                .zip(&hard)
+                .zip(&open)
+                .filter(|((s, h), o)| h.0[0] == 0 && o.0[0] > 40 && s.0[0] > 15)
+                .count()
+                > 4,
+            "finite emitter did not illuminate part of the point umbra"
+        );
+    }
+    eprintln!("Lighter: finite sphere/disk penumbra, static night flag and two-pane colored shadow passed");
+}
+
 fn exercise_effect_placement(h: &mut Harness) {
     let empty = Builder::default().finish();
     h.ray.settings.lighting = false;
@@ -1639,10 +1751,7 @@ fn exercise_transport(h: &mut Harness) {
     f.ambient = [0.; 4];
     let lamp = |z| {
         let mut b = Builder::default();
-        b.light(Light {
-            position_range: [2., 0., z, 10.],
-            color: [1.; 4],
-        });
+        b.light(Light::point([2., 0., z, 10.], [1.; 4]));
         b.finish()
     };
     // With shadows OFF, an interpolated normal still cannot see a light on
@@ -1920,10 +2029,7 @@ fn exercise_sun_and_history(h: &mut Harness) {
     frame.sun = [0.; 4];
     let lamp = |color| {
         let mut b = Builder::default();
-        b.light(Light {
-            position_range: [0., 0., -2., 10.],
-            color,
-        });
+        b.light(Light::point([0., 0., -2., 10.], color));
         b.finish()
     };
     let red = lamp([1., 0., 0., 1.]);

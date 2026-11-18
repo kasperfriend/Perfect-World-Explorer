@@ -69,7 +69,7 @@ pub struct Frame {
     pub sun_disc: [f32; 4],
     pub moon_disc: [f32; 4],
     pub sampling: [u32; 4],
-    pub material_time: [f32; 4], // terrain night weight, grass fade enable, reserved
+    pub material_time: [f32; 4], // terrain night weight, grass fade, static light night factor, reserved
     pub grass_history: [[f32; 4]; scene::GRASS_WIND_SLOTS],
     pub shore_offsets: [f32; 4],
     pub resident_bounds: [f32; 4], // x min/max, z min/max

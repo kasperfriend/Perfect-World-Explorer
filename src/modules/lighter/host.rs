@@ -66,7 +66,15 @@ impl Feed {
                 .scene_lights
                 .lights
                 .iter()
-                .map(|l| point_light(l.position, l.range, l.diffuse, 1.))
+                .map(|l| {
+                    let lamp = point_light(l.position, l.range, l.diffuse, 1.)
+                        .sphere((l.range * 0.04).clamp(0.05, 1.5));
+                    if l.flags & 1 != 0 {
+                        lamp.night_rgb(l.diffuse)
+                    } else {
+                        lamp
+                    }
+                })
                 .collect(),
             ..Self::default()
         };
@@ -514,7 +522,12 @@ impl Feed {
             sun_disc: disc(f.sky_sun),
             moon_disc: disc(f.sky_moon),
             sampling: [0; 4],
-            material_time: [f.fog_range[3], f.grass_eye[3], 0., 0.],
+            material_time: [
+                f.fog_range[3],
+                f.grass_eye[3],
+                crate::environment::night_factor(camera.time_of_day),
+                0.,
+            ],
             grass_history: f.grass_history,
             shore_offsets: self.water.shore_offsets(f.elapsed),
             resident_bounds: cutoff.unwrap_or([-1.0e9, 1.0e9, -1.0e9, 1.0e9]),
@@ -731,15 +744,15 @@ fn atlas_uv(v: &WorldVertex, sy: f32) -> [f32; 2] {
 }
 
 fn point_light(p: [f32; 3], radius: f32, color: [f32; 4], intensity: f32) -> Light {
-    Light {
-        position_range: [p[0], p[1], p[2], radius],
-        color: [
+    Light::point(
+        [p[0], p[1], p[2], radius],
+        [
             srgb(color[0]) * intensity,
             srgb(color[1]) * intensity,
             srgb(color[2]) * intensity,
             1.,
         ],
-    }
+    )
 }
 
 fn moving(
@@ -759,8 +772,10 @@ fn moving(
     if let Some(models) = models {
         let (geometry, effects, dynamic, read) = models.ray_sources();
         for l in dynamic {
-            out.builder
-                .light(point_light(l.position, l.radius, l.color, l.color[3]));
+            out.builder.light(
+                point_light(l.position, l.radius, l.color, l.color[3])
+                    .disk((l.radius * 0.04).clamp(0.05, 1.5)),
+            );
         }
         let mut decode =
             |path: &str| read(path).and_then(|b| crate::model_texture_gpu::decode_for_rays(&b));

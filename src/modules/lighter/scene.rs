@@ -40,6 +40,8 @@ pub const OVERLAY: u32 = 1 << 26;
 pub const CLOUD: u32 = 1 << 27;
 pub const PRECIPITATION: u32 = 1 << 28;
 pub const ORDERED_GFX: u32 = 1 << 29;
+/// Explicit optical material, never inferred from a legacy blend mode.
+pub const GLASS: u32 = 1 << 30;
 pub const GRASS_WIND_SLOTS: usize = 80;
 
 // These bits also occupy the upper eight bits of a Vulkan TLAS instance.
@@ -157,10 +159,11 @@ pub struct Surface {
     face_stage: [u32; 4], // mode, feature and skin colors, highlight tile
     face_gloss: u32,
     diffuse: u32,
-    blend: u32, // D3D source and destination factors (0: default ray alpha)
+    blend: u32,      // D3D source and destination factors (0: default ray alpha)
+    glass: [u32; 2], // linear thin transmission tint, index of refraction
 }
 pub const SURFACE_WORDS: usize = std::mem::size_of::<Surface>() / 4;
-const _: () = assert!(SURFACE_WORDS == 22);
+const _: () = assert!(SURFACE_WORDS == 24);
 
 impl Surface {
     pub fn new(texture: u32, flags: u32, cutoff: f32, reflectance: f32) -> Self {
@@ -180,6 +183,7 @@ impl Surface {
             face_gloss: 0,
             diffuse: u32::MAX,
             blend: 0,
+            glass: [0; 2],
         }
     }
 
@@ -228,6 +232,15 @@ impl Surface {
 
     pub(crate) fn with_blend(mut self, blend: u32) -> Self {
         self.blend = blend;
+        self
+    }
+
+    pub fn with_glass(mut self, transmittance: [f32; 3], ior: f32) -> Self {
+        self.flags = (self.flags | GLASS) & !(BLEND | ORDERED_GFX | ADDITIVE);
+        self.glass = [
+            rgba([transmittance[0], transmittance[1], transmittance[2], 1.]),
+            ior.clamp(1.001, 3.).to_bits(),
+        ];
         self
     }
 
@@ -438,7 +451,40 @@ pub struct Instance {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Light {
     pub position_range: [f32; 4],
-    pub color: [f32; 4],
+    color: [f32; 4], // linear unless the native night flag scales encoded RGB
+    shape: [u32; 4], // kind (0 point, 1 sphere, 2 disk), radius, flags, reserved
+}
+const LIGHT_WORDS: usize = std::mem::size_of::<Light>() / 4;
+const _: () = assert!(LIGHT_WORDS == 12);
+
+impl Light {
+    pub fn point(position_range: [f32; 4], color: [f32; 4]) -> Self {
+        Self {
+            position_range,
+            color,
+            shape: [0; 4],
+        }
+    }
+
+    pub fn sphere(mut self, radius: f32) -> Self {
+        self.set_shape(1, radius);
+        self
+    }
+    pub fn disk(mut self, radius: f32) -> Self {
+        self.set_shape(2, radius);
+        self
+    }
+    fn set_shape(&mut self, kind: u32, radius: f32) {
+        if radius.is_finite() && radius > 0. && self.position_range[3] > 0. {
+            self.shape[0] = kind;
+            self.shape[1] = radius.min(self.position_range[3] * 0.5).to_bits();
+        }
+    }
+    pub fn night_rgb(mut self, rgb_encoded: [f32; 4]) -> Self {
+        self.color = rgb_encoded;
+        self.shape[2] |= 1;
+        self
+    }
 }
 
 // Affine inverse of a draped cell's XZ footprint and its bounded vertical
@@ -646,7 +692,7 @@ impl Builder {
             + self.triangles.len() * 5
             + self.materials.len() * SURFACE_WORDS
             + instances * INSTANCE_WORDS as usize
-            + self.lights.len() * 8
+            + self.lights.len() * LIGHT_WORDS
             + self.projectors.len() * 22
             + bvh_words)
             * 4;
@@ -1023,7 +1069,7 @@ impl Builder {
             + self.instances.len() * INSTANCE_WORDS as usize
             + bvh.nodes.len() * super::bvh::NODE_WORDS as usize
             + bvh.items.len()
-            + self.lights.len() * 8) as u32;
+            + self.lights.len() * LIGHT_WORDS) as u32;
         let gpu_instances: Vec<_> = self
             .instances
             .iter()
