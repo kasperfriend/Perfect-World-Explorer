@@ -401,7 +401,11 @@ fn far_terrain_keeps_only_triangles_outside_the_resident_footprint() {
         layers: vec![],
     };
     let exterior = super::uncovered_far(&far, &super::Mesh::default(), [-4., 0., 0., 4.], 7);
-    assert_eq!(exterior.triangles, [[1, 2, 3]]);
+    assert_eq!(exterior.triangles, [[0, 1, 2]]);
+    assert_eq!(
+        exterior.vertices.iter().map(|v| v.pos).collect::<Vec<_>>(),
+        points[1..]
+    );
     assert_eq!(exterior.surfaces, [7]);
     assert!(
         super::uncovered_far(&far, &super::Mesh::default(), [-4., 4., 0., 4.], 7)
@@ -960,7 +964,7 @@ pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
         first.local_pages.is_empty(),
         "native renderer must not load this distant BMD"
     );
-    let mut feed = super::Feed::new(&t, &first, false).unwrap();
+    let mut feed = super::Feed::new(&mut t, &first, false).unwrap();
     let install = |feed: &mut super::Feed,
                    mesh: &super::MeshData,
                    (local, extra, outside): (usize, usize, usize)| {

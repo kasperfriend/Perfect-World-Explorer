@@ -488,12 +488,25 @@ impl Builder {
     }
 
     pub fn mesh(&mut self, mesh: &Mesh) -> Result<Option<u32>, String> {
-        self.mesh_keyed(mesh, |_, shape| MeshKey::Static(None, shape))
+        self.mesh_keyed(mesh, Some, |_, shape| MeshKey::Static(None, shape))
+    }
+
+    pub(crate) fn mesh_mapped(
+        &mut self,
+        mesh: &Mesh,
+        materials: &[u32],
+    ) -> Result<Option<u32>, String> {
+        self.mesh_keyed(
+            mesh,
+            |id| materials.get(id as usize).copied(),
+            |_, shape| MeshKey::Static(None, shape),
+        )
     }
 
     fn mesh_keyed(
         &mut self,
         mesh: &Mesh,
+        material_id: impl Fn(u32) -> Option<u32>,
         key: impl FnOnce(Fingerprint, Fingerprint) -> MeshKey,
     ) -> Result<Option<u32>, String> {
         if mesh.triangles.is_empty() {
@@ -504,7 +517,7 @@ impl Builder {
             || mesh
                 .surfaces
                 .iter()
-                .any(|&id| id as usize >= self.materials.len())
+                .any(|&id| material_id(id).is_none_or(|id| id as usize >= self.materials.len()))
         {
             return Err("invalid Lighter material assignments".into());
         }
@@ -520,7 +533,7 @@ impl Builder {
         let tri_start = self.triangles.len() as u32;
         let mut bounds = Bounds::EMPTY;
         let mut mask = 0;
-        let first_mask = self.materials[mesh.surfaces[0] as usize].ray_mask();
+        let first_mask = self.materials[material_id(mesh.surfaces[0]).unwrap() as usize].ray_mask();
         let mut opaque = true;
         let mut topology = Sha256::new();
         topology.update((mesh.vertices.len() as u32).to_le_bytes());
@@ -546,7 +559,7 @@ impl Builder {
                 }
                 bounds = bounds.union(Bounds::point(p));
             }
-            let material = self.materials[mat as usize];
+            let material = self.materials[material_id(mat).unwrap() as usize];
             let bits = material.ray_mask();
             mask |= bits;
             opaque &= bits == first_mask
@@ -562,7 +575,7 @@ impl Builder {
                 // encounter-order tag, untagged triangles by their own order.
                 let layer = mesh.layers.get(i).copied().unwrap_or(0);
                 [
-                    material,
+                    material_id(material).unwrap(),
                     if layer == 0 {
                         (i as u32 + 1) << 1
                     } else {
@@ -608,7 +621,9 @@ impl Builder {
     }
 
     pub fn chunk(&mut self, key: ChunkKey, mesh: &Mesh) -> Result<(), String> {
-        if let Some(id) = self.mesh_keyed(mesh, |_, shape| MeshKey::Static(Some(key), shape))? {
+        if let Some(id) =
+            self.mesh_keyed(mesh, Some, |_, shape| MeshKey::Static(Some(key), shape))?
+        {
             self.place(id, Transform::IDENTITY)?;
         }
         Ok(())
@@ -620,9 +635,9 @@ impl Builder {
         id: u64,
         mesh: &Mesh,
     ) -> Result<(), String> {
-        if let Some(id) =
-            self.mesh_keyed(mesh, |topology, _| MeshKey::Posed(namespace, id, topology))?
-        {
+        if let Some(id) = self.mesh_keyed(mesh, Some, |topology, _| {
+            MeshKey::Posed(namespace, id, topology)
+        })? {
             self.place(id, Transform::IDENTITY)?;
         }
         Ok(())
@@ -683,6 +698,7 @@ impl Builder {
             words,
             meshes: self.meshes,
             instances: self.instances,
+            triangle_count: self.triangles.len(),
         }
     }
 }
@@ -691,6 +707,7 @@ pub struct Packet {
     pub words: Vec<u32>,
     pub meshes: Vec<MeshRange>,
     pub instances: Vec<Instance>,
+    triangle_count: usize,
 }
 
 impl Packet {
@@ -699,6 +716,6 @@ impl Packet {
     }
 
     pub fn triangles(&self) -> usize {
-        self.meshes.iter().map(|m| m.triangle.len()).sum()
+        self.triangle_count
     }
 }

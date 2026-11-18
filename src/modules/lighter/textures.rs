@@ -1,7 +1,7 @@
 //! Isolated mip chains in a shared storage buffer (no descriptor indexing).
 //! RGB is premultiplied before filtering so transparent texels cannot bleed
 //! black or arbitrary RGB into the visible edges of cutouts and effect cards.
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 pub const MAX_TEXTURE_BYTES: usize = 128 * 1024 * 1024;
 pub const COLOR_SIDE: u32 = 128;
@@ -137,11 +137,30 @@ fn resample(
     out
 }
 
-type Archive = HashMap<(String, Filter), Option<(u32, bool)>>;
+/// Views into a single logical array, skipping an already valid GPU prefix.
+pub(super) fn suffix_segments<'a>(
+    segments: impl IntoIterator<Item = &'a [u8]>,
+    start: usize,
+) -> impl Iterator<Item = (usize, &'a [u8])> {
+    let mut offset = 0;
+    segments.into_iter().filter_map(move |part| {
+        let base = offset;
+        offset += part.len();
+        let skip = start.saturating_sub(base);
+        (skip < part.len()).then(|| (base + skip, &part[skip..]))
+    })
+}
 
-#[derive(Clone)]
+type Archive = HashMap<Filter, HashMap<String, Option<(u32, bool)>>>;
+pub(super) type TexelPrefix = Vec<Arc<Vec<u32>>>;
+
+#[cfg_attr(test, derive(Clone))]
 pub struct Textures {
-    pub words: Vec<u32>,
+    // Base colour/sky/vegetation and mask tables are sealed independently.
+    // Streaming and animation append only to the private, writable suffix.
+    prefix: TexelPrefix,
+    prefix_words: usize,
+    tail: Vec<u32>,
     archive: HashMap<&'static str, Archive>,
     pub missing: usize,
 }
@@ -149,7 +168,9 @@ pub struct Textures {
 impl Default for Textures {
     fn default() -> Self {
         Self {
-            words: vec![1, 1, 1, 0, 5, u32::MAX],
+            prefix: Vec::new(),
+            prefix_words: 0,
+            tail: vec![1, 1, 1, 0, 5, u32::MAX],
             archive: HashMap::new(),
             missing: 0,
         }
@@ -157,24 +178,71 @@ impl Default for Textures {
 }
 
 impl Textures {
-    pub fn bytes(&self) -> &[u8] {
-        bytemuck::cast_slice(&self.words)
+    pub fn seal(&mut self) {
+        if !self.tail.is_empty() {
+            self.prefix_words += self.tail.len();
+            // Wrap the owned Vec rather than allocating/copying a new slice.
+            self.prefix.push(Arc::new(std::mem::take(&mut self.tail)));
+        }
+    }
+
+    pub fn fork_prefix(&self) -> Self {
+        assert!(self.tail.is_empty() && self.archive.is_empty());
+        Self {
+            prefix: self.prefix.clone(),
+            prefix_words: self.prefix_words,
+            tail: Vec::new(),
+            archive: HashMap::new(),
+            missing: self.missing,
+        }
+    }
+
+    pub fn byte_len(&self) -> usize {
+        (self.prefix_words + self.tail.len()) * 4
+    }
+
+    pub(super) fn byte_segments(&self) -> impl Iterator<Item = &[u8]> {
+        self.prefix
+            .iter()
+            .map(|p| p.as_slice())
+            .chain(std::iter::once(self.tail.as_slice()))
+            .map(bytemuck::cast_slice)
+    }
+
+    pub(super) fn shared_bytes(&self, previous: &TexelPrefix) -> usize {
+        self.prefix
+            .iter()
+            .zip(previous)
+            .take_while(|(a, b)| Arc::ptr_eq(a, b))
+            .map(|(a, _)| a.len() * 4)
+            .sum()
+    }
+
+    pub(super) fn remember_prefix(&self, previous: &mut TexelPrefix) {
+        previous.clone_from(&self.prefix);
+    }
+
+    pub fn write_words(&mut self, addr: usize, words: &[u32]) {
+        let i = addr
+            .checked_sub(self.prefix_words)
+            .expect("sealed texels are immutable");
+        self.tail[i..i + words.len()].copy_from_slice(words);
     }
 
     pub fn reserve(&mut self, len: usize) -> Result<usize, String> {
-        let addr = self.words.len();
+        let addr = self.prefix_words + self.tail.len();
         if addr.saturating_add(len) > MAX_TEXTURE_BYTES / 4 {
             return Err(
                 "Lighter texture budget exceeded (128 MiB); reduce scenery residency".into(),
             );
         }
-        self.words.resize(addr + len, 0);
+        self.tail.resize(self.tail.len() + len, 0);
         Ok(addr)
     }
 
     pub fn insert(&mut self, tile: &Tile) -> Result<u32, String> {
         let addr = self.reserve(tile.0.len())?;
-        self.words[addr..].copy_from_slice(&tile.0);
+        self.write_words(addr, &tile.0);
         Ok(addr as u32)
     }
 
@@ -209,8 +277,12 @@ impl Textures {
         if name.is_empty() {
             return Ok(Some((0, false)));
         }
-        let key = (name.into(), filter);
-        if let Some(v) = self.archive.get(namespace).and_then(|a| a.get(&key)) {
+        if let Some(v) = self
+            .archive
+            .get(namespace)
+            .and_then(|a| a.get(&filter))
+            .and_then(|a| a.get(name))
+        {
             return Ok(*v);
         }
         let value = match decode(name) {
@@ -233,7 +305,9 @@ impl Textures {
         self.archive
             .entry(namespace)
             .or_default()
-            .insert(key, value);
+            .entry(filter)
+            .or_default()
+            .insert(name.into(), value);
         Ok(value)
     }
 }
@@ -241,6 +315,33 @@ impl Textures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_snapshot_shares_the_immutable_prefix_and_preserves_word_offsets() {
+        let mut base = Textures::default();
+        base.seal();
+        let mut masks = base.fork_prefix();
+        let idx = masks.reserve(2).unwrap();
+        assert_eq!(idx, 6);
+        masks.write_words(idx, &[123, 456]);
+        masks.seal();
+        let mut live = masks.fork_prefix();
+        let mut prev = TexelPrefix::default();
+        masks.remember_prefix(&mut prev);
+        assert_eq!(live.shared_bytes(&prev), 32);
+        let start = live.reserve(1).unwrap();
+        live.write_words(start, &[789]);
+        assert_eq!(start, 8);
+        assert_eq!(live.byte_len(), 36);
+        let last: Vec<_> = live
+            .byte_segments()
+            .flat_map(|p| bytemuck::cast_slice::<u8, u32>(p))
+            .skip(6)
+            .copied()
+            .collect();
+        assert_eq!(last, [123, 456, 789]);
+        assert_eq!(masks.byte_len(), 32);
+    }
 
     #[test]
     fn reduced_cutout_stores_area_and_cannot_inherit_hidden_rgb() {

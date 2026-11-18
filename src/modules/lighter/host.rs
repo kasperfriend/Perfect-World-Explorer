@@ -45,9 +45,8 @@ struct Tree {
 }
 
 impl Feed {
-    pub(super) fn new(t: &Terrain, m: &MeshData, authored_mips: bool) -> Result<Self, String> {
+    pub(super) fn new(t: &mut Terrain, m: &MeshData, authored_mips: bool) -> Result<Self, String> {
         let mut result = Self {
-            placements: t.trees.placements.clone(),
             authored_mips,
             static_lights: t
                 .scene_lights
@@ -101,6 +100,7 @@ impl Feed {
                 .trees
                 .push(Some(read_tree(tree, &mut result.base, authored_mips)?));
         }
+        result.base.seal();
         // The mainland's native stride-four far mesh is ~2.9M triangles.
         // Use a coarse mesh of the SAME heightfield so the whole world is
         // present without duplicating that massive buffer on every stream.
@@ -135,16 +135,19 @@ impl Feed {
             }
             result.far.push((*span, patch));
         }
+        result.placements = std::mem::take(&mut t.trees.placements);
         Ok(result)
     }
 
     fn terrain_masks(&mut self, material: &Materials) -> Result<(), String> {
-        let mut textures = self.base.clone();
+        let mut textures = self.base.fork_prefix();
         let table = textures.reserve(material.areas.len() * 2)?;
         for (area, record) in material.areas.iter().enumerate() {
             let offset = textures.reserve(record.layers.len() * 5)?;
-            textures.words[table + area * 2] = offset as u32;
-            textures.words[table + area * 2 + 1] = record.layers.len() as u32;
+            textures.write_words(
+                table + area * 2,
+                &[offset as u32, record.layers.len() as u32],
+            );
             for (k, l) in record.layers.iter().enumerate() {
                 let color = *self
                     .terrain_ids
@@ -159,16 +162,14 @@ impl Feed {
                         u32::from(bytes[(y * side + x) as usize]) * 0x01010101
                     })?
                 };
-                textures.words[offset + k * 5..offset + k * 5 + 5].copy_from_slice(&[
-                    color,
-                    mask,
-                    u32::from(l.axis),
-                    l.u.to_bits(),
-                    l.v.to_bits(),
-                ]);
+                textures.write_words(
+                    offset + k * 5,
+                    &[color, mask, u32::from(l.axis), l.u.to_bits(), l.v.to_bits()],
+                );
             }
         }
         self.area_table = table as u32;
+        textures.seal();
         self.mask_bank = Some(textures);
         Ok(())
     }
@@ -194,7 +195,7 @@ impl Feed {
             .mask_bank
             .as_ref()
             .ok_or("Lighter has no terrain materials")?
-            .clone();
+            .fork_prefix();
         // The far grid's stride divides the resident block size. Omit its
         // covered triangles before building either acceleration structure. A
         // rejected far hit plus t bias could otherwise skip coplanar near
@@ -313,12 +314,8 @@ impl Feed {
                     let Some((source, materials)) = tree.lods.get(level) else {
                         continue;
                     };
-                    let mut mesh = source.clone();
                     let map = materials.map(|m| builder.surface(m));
-                    for a in &mut mesh.surfaces {
-                        *a = map[*a as usize];
-                    }
-                    let id = builder.mesh(&mesh)?;
+                    let id = builder.mesh_mapped(source, &map)?;
                     ids.insert((type_id, level), id);
                     id
                 };
@@ -560,31 +557,29 @@ fn uncovered_far(far: &Mesh, near: &Mesh, bounds: [f32; 4], surface: u32) -> Mes
 /// Split only the exterior patch edges that touch the native near perimeter.
 /// Vertices inserted along a stride-16 edge use the actual near heights.
 fn stitch_patch(far: &Mesh, edges: &Perimeter, [x0, x1, z0, z1]: [f32; 4], surface: u32) -> Mesh {
-    let exterior: Vec<_> = far
-        .triangles
-        .iter()
-        .copied()
-        .filter(|tri| {
-            !tri.iter().all(|&index| {
-                let [x, _, z] = far.vertices[index as usize].pos;
-                x >= x0 && x <= x1 && z >= z0 && z <= z1
-            })
-        })
-        .collect();
-    if exterior.is_empty() {
-        return Mesh::default();
-    }
-    let mut out = Mesh {
-        vertices: far.vertices.clone(),
-        ..Mesh::default()
-    };
-    out.triangles.reserve(exterior.len());
-    out.surfaces.reserve(exterior.len());
-    'triangle: for tri in exterior {
+    // Pack only referenced exterior vertices. Far patches partly covered by
+    // the near window used to copy the entire vertex list before clipping.
+    let mut out = Mesh::default();
+    let mut remap = vec![u32::MAX; far.vertices.len()];
+    'triangle: for &tri in &far.triangles {
+        if tri.iter().all(|&index| {
+            let [x, _, z] = far.vertices[index as usize].pos;
+            x >= x0 && x <= x1 && z >= z0 && z <= z1
+        }) {
+            continue;
+        }
+        let local = tri.map(|index| {
+            let id = &mut remap[index as usize];
+            if *id == u32::MAX {
+                *id = out.vertices.len() as u32;
+                out.vertices.push(far.vertices[index as usize]);
+            }
+            *id
+        });
         for i in 0..3 {
-            let [start, end, apex] = [tri[i], tri[(i + 1) % 3], tri[(i + 2) % 3]];
-            let [ax, _, az] = far.vertices[start as usize].pos;
-            let [bx, _, bz] = far.vertices[end as usize].pos;
+            let [start, end, apex] = [local[i], local[(i + 1) % 3], local[(i + 2) % 3]];
+            let [ax, _, az] = out.vertices[start as usize].pos;
+            let [bx, _, bz] = out.vertices[end as usize].pos;
             let (edge, a, b) = if ax == bx && ax == x0 {
                 (&edges[0], az, bz)
             } else if ax == bx && ax == x1 {
@@ -614,7 +609,7 @@ fn stitch_patch(far: &Mesh, edges: &Perimeter, [x0, x1, z0, z1]: [f32; 4], surfa
             out.tri([previous, end, apex], surface);
             continue 'triangle;
         }
-        out.tri(tri, surface);
+        out.tri(local, surface);
     }
     out
 }

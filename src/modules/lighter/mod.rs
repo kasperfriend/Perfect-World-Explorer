@@ -15,7 +15,7 @@ use bytemuck::{Pod, Zeroable};
 use scene::Packet;
 pub(crate) use settings::{Mode, Settings};
 use std::time::Instant;
-use textures::Textures;
+use textures::{suffix_segments, TexelPrefix, Textures};
 
 const PIXELS: &str = include_str!("pixels.wgsl");
 const BASE: &str = include_str!("trace.wgsl");
@@ -251,6 +251,7 @@ struct Software {
     buffers_created: u64,
     revision: Option<u64>,
     texture_len: usize,
+    texture_prefix: TexelPrefix,
     last_moving: Vec<u32>,
     #[cfg(test)]
     moving_uploads: u64,
@@ -313,6 +314,7 @@ impl Software {
             buffers_created: 5,
             revision: None,
             texture_len: 0,
+            texture_prefix: TexelPrefix::default(),
             last_moving: Vec::new(),
             #[cfg(test)]
             moving_uploads: 0,
@@ -345,17 +347,30 @@ impl Software {
             ));
             self.revision = Some(world.revision);
         }
-        let texels = world.textures.bytes();
-        if new_world || self.texture_len != texels.len() {
-            // The bank grows only by appending between world installs. A
-            // replacement still gets the original prefix from its CPU owner.
-            let prefix = if new_world { 0 } else { self.texture_len };
-            self.buffers_created +=
-                u64::from(
-                    self.textures
-                        .upload(device, queue, "Lighter texels", texels, prefix),
-                );
-            self.texture_len = texels.len();
+        let texels = &world.textures;
+        let len = texels.byte_len();
+        if new_world || self.texture_len != len {
+            let grew = self.textures.ensure(
+                device,
+                "Lighter texels",
+                len as u64,
+                storage_limit(device) as u64,
+            );
+            let prefix = if grew {
+                0
+            } else if new_world {
+                texels.shared_bytes(&self.texture_prefix)
+            } else {
+                self.texture_len
+            };
+            for (offset, part) in suffix_segments(texels.byte_segments(), prefix) {
+                queue.write_buffer(&self.textures.0, offset as u64, part);
+            }
+            self.buffers_created += u64::from(grew);
+            self.texture_len = len;
+            if new_world {
+                texels.remember_prefix(&mut self.texture_prefix);
+            }
         }
         if self.last_moving != moving.words {
             self.buffers_created += u64::from(self.moving.upload(
@@ -815,7 +830,7 @@ impl Lighter {
         for (label, len) in [
             ("resident world", world.packet.bytes().len()),
             ("moving geometry", moving.bytes().len()),
-            ("textures", world.textures.bytes().len()),
+            ("textures", world.textures.byte_len()),
         ] {
             if len as u64 > storage {
                 return Err(format!(
@@ -855,7 +870,7 @@ impl Lighter {
             Some(self.history.prepare(
                 &mut frame,
                 world.revision,
-                world.textures.bytes().len(),
+                world.textures.byte_len(),
                 self.settings.mode,
                 moving_unchanged,
             ))
@@ -882,7 +897,7 @@ impl Lighter {
                         bytes,
                         &world.packet,
                         moving,
-                        world.textures.bytes(),
+                        &world.textures,
                         world.revision,
                     )?
                 }

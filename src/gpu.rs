@@ -758,7 +758,7 @@ fn reserve_page_atlas_rows(page: &mut crate::world_objects::Page, rows: usize) {
 /// atlas each one owns) and from the frozen ornament placements. Both are in the
 /// key, so an equal key means the page the renderer already holds is the page
 /// this rebuild produced.
-fn local_page_key(page: &crate::world_objects::Page, textures: &[(String, u64)]) -> u64 {
+fn local_page_key(page: &crate::world_objects::Page, textures: &[(&str, u64)]) -> u64 {
     let mut key = crate::texture_atlas::LayoutKey::new();
     key.usize(textures.len());
     for (texture, layout) in textures {
@@ -866,10 +866,6 @@ fn build(
             t.grid_spacing,
         )
     });
-    let lod_state = LodState {
-        window: win,
-        levels: levels.levels.clone(),
-    };
     // The loader stores `grid` cells per block and drops each block's last row
     // and column (the neighbour re-supplies them), so a block's offset-`TILE`
     // vertex clamps to the last stored cell at the world border.
@@ -949,17 +945,17 @@ fn build(
     // radius are provisional until the game's randomization and fade are ported.
     let mut grass_builder = crate::grass_instances::Builder::default();
     let mut grass_sample = None;
-    let mut grass_slots: HashMap<(String, u8), crate::texture_atlas::Slot> = HashMap::new();
+    let mut grass_slots: HashMap<(&str, u8), crate::texture_atlas::Slot> = HashMap::new();
     // Materials whose atlas rectangle keeps a native-size authored chain. Only
     // membership matters here; the chain itself travels with the mip tiles, so
     // storing it twice would copy every authored level on every rebuild.
-    let mut grass_authored: HashSet<(String, u8)> = HashSet::new();
+    let mut grass_authored: HashSet<(&str, u8)> = HashSet::new();
     let mut grass_mips = Vec::new();
     // Atlas rectangles in packing order, copied into the pixel buffer only once
     // the layout signature says the renderer's copy is stale. A rebuild is
     // dominated by the 4096² atlas, and almost every block-window update leaves
     // it identical.
-    let mut grass_copies: Vec<(crate::texture_atlas::Slot, String, bool)> = Vec::new();
+    let mut grass_copies: Vec<(crate::texture_atlas::Slot, &str, bool)> = Vec::new();
     let mut grass_layout = crate::texture_atlas::LayoutKey::new();
     // Reserve at least one 128px slot for every distinct nearby material, so
     // a few large textures cannot starve all later grass types.
@@ -976,7 +972,7 @@ fn build(
             let alpha = 84u8;
             for mesh in &model.meshes {
                 if t.grass.textures.contains_key(&mesh.texture) {
-                    grass_pending.insert((mesh.texture.clone(), alpha));
+                    grass_pending.insert((mesh.texture.as_str(), alpha));
                 }
             }
         }
@@ -1018,7 +1014,7 @@ fn build(
                 continue;
             };
             let alpha_ref = 84u8;
-            let material_key = (mesh.texture.clone(), alpha_ref);
+            let material_key = (mesh.texture.as_str(), alpha_ref);
             let slot = if let Some(&slot) = grass_slots.get(&material_key) {
                 slot
             } else {
@@ -1077,18 +1073,18 @@ fn build(
                     };
                     slot
                 };
-                grass_copies.push((slot, mesh.texture.clone(), authored.is_some()));
+                grass_copies.push((slot, mesh.texture.as_str(), authored.is_some()));
                 grass_layout.slot(&mesh.texture, slot);
                 grass_layout.usize(authored.as_ref().map_or(0, |chain| chain.len()));
                 if let Some(chain) = authored {
                     if !chain.is_empty() {
-                        grass_authored.insert(material_key.clone());
+                        grass_authored.insert(material_key);
                     }
                     grass_mips.push((slot, alpha_ref, Some(chain)));
                 } else {
                     grass_mips.push((slot, alpha_ref, None));
                 }
-                grass_slots.insert(material_key.clone(), slot);
+                grass_slots.insert(material_key, slot);
                 slot
             };
             let ox = slot.x as f32 / ATLAS as f32;
@@ -1130,7 +1126,12 @@ fn build(
                             .to_bits(),
                     })
                     .collect();
-                grass_builder.mesh_with_scale_y(key, mesh_vertices, mesh.indices.clone(), scale_y);
+                grass_builder.mesh_with_scale_y(
+                    key,
+                    mesh_vertices,
+                    mesh.indices.as_slice(),
+                    scale_y,
+                );
             }
             for placement in area.placements(typ)? {
                 let x = area.center[0] - half_x
@@ -1208,7 +1209,7 @@ fn build(
     let (atlas, grass_mips) = if grass_atlas_changed {
         let mut atlas = vec![0u8; ATLAS * ATLAS * 4];
         for (slot, texture, authored) in &grass_copies {
-            let Some(img) = t.grass.textures.get(texture) else {
+            let Some(img) = t.grass.textures.get(*texture) else {
                 continue;
             };
             let ox = slot.x;
@@ -1315,33 +1316,43 @@ fn build(
     }
     // Sort largest rectangles first, then use as many atlas pages as needed.
     // Unlike the legacy 128px atlas, local BMDs keep their source dimensions.
-    let mut requested: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut texture_names = HashMap::<&str, String>::new();
     for &id in &ornament_ids {
         if let Some(model) = t.objects.get(id) {
             for mesh in &model.meshes {
-                let key = mesh.texture.to_lowercase();
-                // A reference the client resolves nowhere is an explicit
-                // registered row (texture_resolution), not a skipped mesh: give
-                // it a 1x1 white atlas slot and draw the actual geometry.
-                let dims = t
-                    .objects
-                    .texture(&key)
-                    .map(|tex| (tex.width, tex.height))
-                    .unwrap_or((1, 1));
-                requested.insert(key, dims);
+                texture_names
+                    .entry(&mesh.texture)
+                    .or_insert_with(|| mesh.texture.to_lowercase());
             }
         }
     }
-    let mut requested: Vec<_> = requested.into_iter().collect();
-    requested.sort_by_key(|(_, (w, h))| {
-        std::cmp::Reverse(w.next_power_of_two().max(TEX) * h.next_power_of_two().max(TEX))
+    let mut requested: Vec<_> = texture_names.values().map(String::as_str).collect();
+    requested.sort_unstable();
+    requested.dedup();
+    let mut requested: Vec<_> = requested
+        .into_iter()
+        .map(|key| {
+            // Keep unresolved references as a white slot without skipping geometry.
+            let tex = t.objects.texture(key);
+            (
+                key,
+                tex.map(|tex| (tex.width, tex.height)).unwrap_or((1, 1)),
+                tex,
+            )
+        })
+        .collect();
+    requested.sort_by_key(|(key, (w, h), _)| {
+        (
+            std::cmp::Reverse(w.next_power_of_two().max(TEX) * h.next_power_of_two().max(TEX)),
+            *key,
+        )
     });
-    let mut texture_slots: HashMap<String, (usize, crate::texture_atlas::Slot)> = HashMap::new();
+    let mut texture_slots: HashMap<&str, (usize, crate::texture_atlas::Slot)> = HashMap::new();
     let mut pages: Vec<(crate::texture_atlas::Atlas, crate::world_objects::Page)> = Vec::new();
-    for (key, (w, h)) in &requested {
+    for &(key, (w, h), tex) in &requested {
         let mut chosen = None;
         for (i, (packing, _)) in pages.iter_mut().enumerate() {
-            if let Some(slot) = packing.allocate(*w, *h, 0, false) {
+            if let Some(slot) = packing.allocate(w, h, 0, false) {
                 chosen = Some((i, slot));
                 break;
             }
@@ -1351,7 +1362,7 @@ fn build(
         } else {
             let mut packing = crate::texture_atlas::Atlas::new();
             let slot = packing
-                .allocate(*w, *h, 0, false)
+                .allocate(w, h, 0, false)
                 .ok_or("local scenery texture exceeds maximum atlas size")?;
             let i = pages.len();
             pages.push((
@@ -1379,7 +1390,6 @@ fn build(
         };
         pages[i].1.used_height = pages[i].1.used_height.max(slot.y + slot.h);
         reserve_page_atlas_rows(&mut pages[i].1, slot.y + slot.h);
-        let tex = t.objects.texture(key);
         for py in 0..slot.h {
             for px in 0..slot.w {
                 let sample = if let Some(tex) = tex {
@@ -1394,7 +1404,7 @@ fn build(
                 pages[i].1.atlas[o..o + 4].copy_from_slice(&sample);
             }
         }
-        texture_slots.insert(key.clone(), (i, slot));
+        texture_slots.insert(key, (i, slot));
     }
     crate::diag!(
         TimingLoad,
@@ -1414,8 +1424,8 @@ fn build(
         let y = basis(model.up);
         let x = y.cross(z).normalize_or_zero();
         for mesh in &model.meshes {
-            let key = mesh.texture.to_lowercase();
-            let Some((page_id, slot)) = texture_slots.get(&key).copied() else {
+            let key = texture_names[mesh.texture.as_str()].as_str();
+            let Some((page_id, slot)) = texture_slots.get(key).copied() else {
                 continue;
             };
             // v5 stores the client's no-cull flag in the material; the draw
@@ -1480,12 +1490,12 @@ fn build(
     // and submission metadata `Page::finish` froze. The renderer keeps a page
     // whose signature it already uploaded and re-uploads only the rest, so a
     // block-window update no longer re-sends every scenery atlas and buffer.
-    let mut page_textures: Vec<Vec<(String, u64)>> = Vec::new();
+    let mut page_textures: Vec<Vec<(&str, u64)>> = Vec::new();
     page_textures.resize_with(pages.len(), Vec::new);
     for (key, (page_index, slot)) in &texture_slots {
         let mut key_layout = crate::texture_atlas::LayoutKey::new();
         key_layout.slot(key, *slot);
-        page_textures[*page_index].push((key.clone(), key_layout.value()));
+        page_textures[*page_index].push((*key, key_layout.value()));
     }
     for list in &mut page_textures {
         list.sort();
@@ -1654,11 +1664,11 @@ fn build(
         let materials = if t.terrain_material_window.is_none() {
             t.materials.take_window(mask_window)
         } else {
-            let dir = t.map_dir.clone();
-            let trn = std::fs::read(crate::world_catalog::data_file(&dir, "trn2"))
+            let dir = t.map_dir.as_path();
+            let trn = std::fs::read(crate::world_catalog::data_file(dir, "trn2"))
                 .map_err(|e| e.to_string())?;
             crate::material::Materials::load_window(
-                &dir,
+                dir,
                 &trn,
                 &t.subterrain_names,
                 t.width,
@@ -1691,7 +1701,10 @@ fn build(
         center: (bx, by),
         tree_center: (cx, cz),
         detail,
-        lod: lod_state,
+        lod: LodState {
+            window: win,
+            levels: levels.levels,
+        },
         spans,
         terrain_end,
         object_start,
@@ -2039,20 +2052,6 @@ impl Renderer {
         vegetation_authored_mips: bool,
         mut lighter: Lighter,
     ) -> Result<Self, String> {
-        let lighter_feed = if lighter.armed() {
-            match lighter_host::Feed::new(t, &m, vegetation_authored_mips) {
-                Ok(mut feed) => {
-                    feed.install(&mut lighter, &m, &device);
-                    Some(feed)
-                }
-                Err(error) => {
-                    lighter.install(Err(error));
-                    None
-                }
-            }
-        } else {
-            None
-        };
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),
             contents: bytemuck::bytes_of(&Uniform {
@@ -2228,6 +2227,22 @@ impl Renderer {
             &reflected_uniform,
             vegetation_authored_mips,
         );
+        // Both paths consume the same loaded sources. The native path has
+        // finished borrowing them; transfer the placement list to Lighter.
+        let lighter_feed = if lighter.armed() {
+            match lighter_host::Feed::new(t, &m, vegetation_authored_mips) {
+                Ok(mut feed) => {
+                    feed.install(&mut lighter, &m, &device);
+                    Some(feed)
+                }
+                Err(error) => {
+                    lighter.install(Err(error));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // Immutable tree meshes/motion samples and water frames now live on
         // the GPU. The streaming worker never reads these sources again.
         t.trees.types.clear();
@@ -5449,7 +5464,7 @@ fn run_viewer(
         map_space.clone(),
         water_areas.clone(),
         &t.scene,
-        whole_ornaments.to_vec(),
+        &whole_ornaments,
     );
     // Add-ons get read access to the world's effect catalogue the moment the
     // world has one: the same grouped index the World tab's census uses, so a
@@ -8561,7 +8576,7 @@ mod world_stream_tests {
         };
         let mut layout = crate::texture_atlas::LayoutKey::new();
         layout.slot("textures/物件/石头.dds", slot);
-        let textures = vec![("textures/物件/石头.dds".to_string(), layout.value())];
+        let textures = vec![("textures/物件/石头.dds", layout.value())];
         let base = page(256, 4, 6);
         let key = local_page_key(&base, &textures);
         assert_eq!(key, local_page_key(&base, &textures), "stable for one page");
@@ -8570,7 +8585,7 @@ mod world_stream_tests {
         let moved = crate::texture_atlas::Slot { x: 0, ..slot };
         let mut other_layout = crate::texture_atlas::LayoutKey::new();
         other_layout.slot("textures/物件/石头.dds", moved);
-        let other = vec![("textures/物件/石头.dds".to_string(), other_layout.value())];
+        let other = vec![("textures/物件/石头.dds", other_layout.value())];
         assert_ne!(key, local_page_key(&base, &other));
         assert_ne!(key, local_page_key(&base, &textures[..0]));
         assert_ne!(key, local_page_key(&page(512, 4, 6), &textures));
@@ -8582,9 +8597,9 @@ mod world_stream_tests {
         first.slot("a", slot);
         let mut second = crate::texture_atlas::LayoutKey::new();
         second.slot("b", moved);
-        let a = ("a".to_string(), first.value());
-        let b = ("b".to_string(), second.value());
-        let ab = vec![a.clone(), b.clone()];
+        let a = ("a", first.value());
+        let b = ("b", second.value());
+        let ab = vec![a, b];
         let ba = vec![b, a];
         assert_ne!(
             local_page_key(&base, &ab),

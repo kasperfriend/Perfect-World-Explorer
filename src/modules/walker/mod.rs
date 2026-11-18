@@ -372,10 +372,10 @@ impl Walker {
         map: MapSpace,
         water: Vec<WaterArea>,
         scene: &crate::scene::Scene,
-        ornaments: Vec<crate::scene::Ornament>,
+        ornaments: &[crate::scene::Ornament],
     ) -> Self {
         let audio = audio::CharacterAudio::new(&element);
-        let collision = collision::Collision::new(element.clone(), scene, &ornaments);
+        let collision = collision::Collision::new(element.clone(), scene, ornaments);
         Self {
             gallery: gallery::Gallery::new(element.clone()),
             element: Some(element),

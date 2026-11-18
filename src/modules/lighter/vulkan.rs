@@ -2,7 +2,9 @@
 //! creation in wgpu-core. Keep that interop here, on the viewer's *same* device
 //! and queue. No CPU image readback and no second adapter.
 use super::scene::{Fingerprint, MeshKey, MeshRange, Packet, DYNAMIC_BIT, VERTEX_WORDS};
-use super::{grown_capacity, image_limit, storage_limit, Frame};
+use super::{
+    grown_capacity, image_limit, storage_limit, suffix_segments, Frame, TexelPrefix, Textures,
+};
 use ash::{extensions::khr, vk};
 use std::{
     collections::{HashMap, HashSet},
@@ -228,8 +230,12 @@ impl Buffer {
     }
 
     fn write(&self, offset: u64, data: &[u8]) -> R<()> {
-        assert!(offset + data.len() as u64 <= self.size);
-        if data.is_empty() {
+        self.write_segments((!data.is_empty()).then_some((offset as usize, data)))
+    }
+
+    fn write_segments<'a>(&self, parts: impl IntoIterator<Item = (usize, &'a [u8])>) -> R<()> {
+        let mut parts = parts.into_iter().peekable();
+        if parts.peek().is_none() {
             return Ok(());
         }
         unsafe {
@@ -237,11 +243,14 @@ impl Buffer {
             let ptr = d
                 .map_memory(self.memory, 0, self.size, vk::MemoryMapFlags::empty())
                 .map_err(vkerr("map upload"))?;
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                ptr.cast::<u8>().add(offset as usize),
-                data.len(),
-            );
+            for (offset, data) in parts {
+                assert!(offset as u64 + data.len() as u64 <= self.size);
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    ptr.cast::<u8>().add(offset),
+                    data.len(),
+                );
+            }
             d.unmap_memory(self.memory);
         }
         Ok(())
@@ -275,7 +284,18 @@ impl Upload {
         usage: vk::BufferUsageFlags,
         retained_prefix: usize,
     ) -> R<()> {
-        let needed = (data.len() as u64).max(16);
+        Self::set_segments(slot, ctx, [data], data.len(), usage, retained_prefix)
+    }
+
+    fn set_segments<'a>(
+        slot: &mut Option<Self>,
+        ctx: &Arc<Context>,
+        segments: impl IntoIterator<Item = &'a [u8]>,
+        bytes: usize,
+        usage: vk::BufferUsageFlags,
+        retained_prefix: usize,
+    ) -> R<()> {
+        let needed = (bytes as u64).max(16);
         let old = slot.as_ref().map_or(0, |b| b.gpu.size);
         let grew = old < needed;
         if grew {
@@ -298,15 +318,16 @@ impl Upload {
             });
         }
         let buffer = slot.as_mut().unwrap();
-        buffer.bytes = data.len() as u64;
-        buffer.offset = if grew || retained_prefix > data.len() {
+        buffer.bytes = bytes as u64;
+        let prefix = if grew || retained_prefix > bytes {
             0
         } else {
-            retained_prefix as u64
+            retained_prefix
         };
+        buffer.offset = prefix as u64;
         buffer
             .staging
-            .write(buffer.offset, &data[buffer.offset as usize..])
+            .write_segments(suffix_segments(segments, prefix))
     }
 
     unsafe fn encode(&self, cmd: vk::CommandBuffer) {
@@ -710,6 +731,7 @@ pub struct Renderer {
     submitted: bool,
     revision: Option<u64>,
     texture_len: usize,
+    texture_prefix: TexelPrefix,
     last_moving: Vec<u32>,
     bound_ids: Option<[u64; 6]>,
     pub(super) as_builds: [u64; 3],
@@ -743,6 +765,7 @@ impl Renderer {
             submitted: false,
             revision: None,
             texture_len: 0,
+            texture_prefix: TexelPrefix::default(),
             last_moving: Vec::new(),
             bound_ids: None,
             as_builds: [0; 3],
@@ -972,22 +995,33 @@ impl Renderer {
         image_size: u64,
         world: &Packet,
         moving: &Packet,
-        texels: &[u8],
+        texels: &Textures,
         revision: u64,
     ) -> R<&wgpu::Buffer> {
         // Raw submit and wgpu composition both run on the render thread on
         // the same VkQueue. `try_prepare_image` has observed the native fence.
         assert!(!self.submitted);
         let static_changed = self.revision != Some(revision);
-        let textures_changed = static_changed || self.texture_len != texels.len();
+        let textures_changed = static_changed || self.texture_len != texels.byte_len();
         let input = STORAGE | BUILD_INPUT | ADDRESS;
         let ctx = &self.core.ctx;
         if static_changed {
             Upload::set(&mut self.world, ctx, world.bytes(), input, 0)?;
         }
         if textures_changed {
-            let prefix = if static_changed { 0 } else { self.texture_len };
-            Upload::set(&mut self.textures, ctx, texels, STORAGE, prefix)?;
+            let prefix = if static_changed {
+                texels.shared_bytes(&self.texture_prefix)
+            } else {
+                self.texture_len
+            };
+            Upload::set_segments(
+                &mut self.textures,
+                ctx,
+                texels.byte_segments(),
+                texels.byte_len(),
+                STORAGE,
+                prefix,
+            )?;
         }
         let moving_changed = self.last_moving != moving.words;
         let moving_keys_changed = !self
@@ -1176,7 +1210,10 @@ impl Renderer {
             self.blas.retain(|key, _| plan.live.contains(key));
         }
         self.revision = Some(revision);
-        self.texture_len = texels.len();
+        self.texture_len = texels.byte_len();
+        if static_changed {
+            texels.remember_prefix(&mut self.texture_prefix);
+        }
         Ok(image)
     }
 }

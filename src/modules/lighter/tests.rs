@@ -240,20 +240,8 @@ impl Harness {
             height: e,
             depth_or_array_layers: 1,
         };
-        let new_target = |format| {
-            self.device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: extent,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            })
-        };
-        let color = new_target(format);
-        let depth = new_target(wgpu::TextureFormat::Depth32Float);
+        let color = self.target(format, extent);
+        let depth = self.target(wgpu::TextureFormat::Depth32Float, extent);
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let row = (4 * e).div_ceil(align) * align;
         let stride = row * e;
@@ -329,6 +317,19 @@ impl Harness {
                 )
             })
             .collect()
+    }
+
+    fn target(&self, format: wgpu::TextureFormat, size: wgpu::Extent3d) -> wgpu::Texture {
+        self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
     }
 
     fn builds(&self) -> [u64; 3] {
@@ -680,6 +681,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_terrain_seam(&mut h);
     exercise_accel_reuse(&mut h);
     exercise_resource_reuse(&mut h);
+    exercise_texture_prefix_replacement(&mut h);
+    exercise_chunk_scaling(&mut h);
 }
 
 fn assert_radiance(label: &str, pixel: ([u8; 4], f32), linear: [f32; 3]) {
@@ -1499,6 +1502,166 @@ fn exercise_resource_reuse(h: &mut Harness) {
         );
     }
     eprintln!("Lighter: zero steady-frame buffer, texture, binding, and AS creations after image/texture growth");
+}
+
+fn exercise_texture_prefix_replacement(h: &mut Harness) {
+    let mut base = Textures::default();
+    let red = base
+        .tile([1, 1], 1, textures::Filter::Color, |_, _| 0xff0000ff)
+        .unwrap();
+    base.seal();
+    let mut previous = base.fork_prefix();
+    let green = previous
+        .tile([1, 1], 1, textures::Filter::Color, |_, _| 0xff00ff00)
+        .unwrap();
+    previous.seal();
+    let empty = Builder::default().finish();
+    h.ray.install(Ok((Builder::default().finish(), previous)));
+    let mut sky = test_frame(Vec3::ZERO, Vec3::Y, 9);
+    sky.sky_tint = [1.; 4];
+    let probe = |h: &mut Harness, addr| {
+        let mut frame = sky;
+        frame.sky0 = [addr, addr, addr, 0];
+        h.pixel(frame, &empty)
+    };
+    assert_eq!(probe(h, red), ([255, 0, 0, 255], 0.));
+    assert_eq!(probe(h, green), ([0, 255, 0, 255], 0.));
+    let mut replacement = base.fork_prefix();
+    let blue = replacement
+        .tile([1, 1], 1, textures::Filter::Color, |_, _| 0xffff0000)
+        .unwrap();
+    assert_eq!(
+        green, blue,
+        "exercise a same-size replacement at the old offset"
+    );
+    replacement.seal();
+    h.ray
+        .install(Ok((Builder::default().finish(), replacement)));
+    assert_eq!(probe(h, red), ([255, 0, 0, 255], 0.));
+    assert_eq!(probe(h, blue), ([0, 0, 255, 255], 0.));
+    let allocations = h.ray.allocation_counts();
+    let yellow = h
+        .ray
+        .world
+        .as_mut()
+        .unwrap()
+        .textures
+        .tile([1, 1], 1, textures::Filter::Color, |_, _| 0xff00ffff)
+        .unwrap();
+    assert_eq!(
+        probe(h, yellow),
+        ([255, 255, 0, 255], 0.),
+        "appended texels must reach the GPU"
+    );
+    assert_eq!(probe(h, red), ([255, 0, 0, 255], 0.));
+    assert_eq!(
+        h.ray.allocation_counts(),
+        allocations,
+        "the append fit in retained capacity"
+    );
+}
+
+/// Synthetic chunk-count sweep, not a physical GPU performance threshold.
+/// Use the same target/viewport and no per-frame pixel readback in the timings.
+fn exercise_chunk_scaling(h: &mut Harness) {
+    const SIDE: u32 = 96;
+    let extent = wgpu::Extent3d {
+        width: SIDE,
+        height: SIDE,
+        depth_or_array_layers: 1,
+    };
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let color = h.target(format, extent).create_view(&Default::default());
+    let depth = h
+        .target(wgpu::TextureFormat::Depth32Float, extent)
+        .create_view(&Default::default());
+    h.ray.settings.samples = 1;
+    h.ray.settings.lighting = false;
+    h.ray.settings.bounces = 0;
+    h.ray.settings.denoiser = false;
+    h.ray.settings.progressive = false;
+    let empty = Builder::default().finish();
+    let mut accel = AccelCache::default();
+    let mut base = Textures::default();
+    let tile = base
+        .tile([128, 128], 128, textures::Filter::Color, |_, _| 0xff00ff00)
+        .unwrap();
+    base.seal();
+    let frame = test_frame(Vec3::ZERO, -Vec3::Z, SIDE);
+    let meshes: Vec<_> = (0..256)
+        .map(|i| {
+            let mut mesh = Mesh::default();
+            for x in 0..4 {
+                for y in 0..4 {
+                    let x = (i % 16) as f32 * 2. + x as f32 * 0.5 - 0.75;
+                    let y = (i / 16) as f32 * 2. + y as f32 * 0.5 - 0.75;
+                    let n = mesh.vertices.len() as u32;
+                    mesh.vertices.extend(
+                        [
+                            [x, y, -4.],
+                            [x + 0.5, y, -4.],
+                            [x, y + 0.5, -4.],
+                            [x + 0.5, y + 0.5, -4.],
+                        ]
+                        .map(|p| Vertex::new(p, [0., 0., 1.], [0.; 2])),
+                    );
+                    mesh.tri([n, n + 1, n + 2], 0);
+                    mesh.tri([n + 1, n + 3, n + 2], 0);
+                }
+            }
+            mesh
+        })
+        .collect();
+    for count in [16, 64, 256] {
+        let mut pack_ms = Vec::new();
+        for _ in 0..5 {
+            let start = Instant::now();
+            let mut builder = Builder::default();
+            builder.surface(Surface::new(tile, 0, 0., 0.));
+            for (i, mesh) in meshes[..count].iter().enumerate() {
+                builder.chunk(ChunkKey::Scenery(i as i32, 0), mesh).unwrap();
+            }
+            let packet = builder.finish_cached(&mut accel);
+            let bank = base.fork_prefix();
+            pack_ms.push(start.elapsed().as_secs_f64() * 1000.);
+            h.ray.install(Ok((packet, bank)));
+        }
+        let pixel = h.pixel(frame, &empty);
+        assert_eq!(pixel.0, [0, 255, 0, 255]);
+        assert!((pixel.1 - depth_at(frame, Vec3::NEG_Z * 4.)).abs() < 1e-5);
+        let before = h.ray.allocation_counts();
+        let mut frame_ms = Vec::new();
+        for _ in 0..9 {
+            let start = Instant::now();
+            let mut encoder = h.device.create_command_encoder(&Default::default());
+            assert!(h
+                .ray
+                .render(
+                    &h.device,
+                    &h.queue,
+                    &mut encoder,
+                    &color,
+                    &depth,
+                    format,
+                    frame,
+                    &empty
+                )
+                .unwrap());
+            let submitted = h.queue.submit(Some(encoder.finish()));
+            h.device
+                .poll(wgpu::Maintain::WaitForSubmissionIndex(submitted));
+            frame_ms.push(start.elapsed().as_secs_f64() * 1000.);
+        }
+        assert_eq!(before, h.ray.allocation_counts());
+        pack_ms.sort_unstable_by(f64::total_cmp);
+        frame_ms.sort_unstable_by(f64::total_cmp);
+        let notice = if std::env::var_os("GITHUB_ACTIONS").is_some() {
+            "::notice::"
+        } else {
+            ""
+        };
+        eprintln!("{notice}Lighter {:?}, {count} chunks ({} triangles), {SIDE}x{SIDE}: median CPU pack {:.3} ms, synchronized frame {:.3} ms", h.ray.settings.mode, count * 32, pack_ms[2], frame_ms[4]);
+    }
 }
 
 fn exercise_terrain_seam(h: &mut Harness) {

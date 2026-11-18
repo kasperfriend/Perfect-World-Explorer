@@ -142,8 +142,11 @@ impl TextureCache {
         self.by_name.get(name).copied()
     }
     pub fn get(&self, name: &str) -> Option<&Texture> {
-        let hash = self.by_name.get(name)?;
-        Some(&self.by_hash.get(hash)?.tex)
+        self.get_with_key(name).map(|(_, tex)| tex)
+    }
+    fn get_with_key(&self, name: &str) -> Option<(u64, &Texture)> {
+        let hash = self.key(name)?;
+        Some((hash, &self.by_hash.get(&hash)?.tex))
     }
     /// Marks a reference as used by the current batch (pins its content).
     pub fn touch(&mut self, name: &str) {
@@ -979,8 +982,7 @@ impl Objects {
         });
     }
     pub fn get(&self, idx: usize) -> Option<&bmd::Model> {
-        self.models
-            .get(&litmodel_key(&self.ornaments.get(idx)?.path))
+        self.models.get(self.model_names.get(idx)?)
     }
     /// Distinct BMDs that could not be resolved or parsed for this map.
     pub fn unavailable_model_count(&self) -> usize {
@@ -998,6 +1000,9 @@ impl Objects {
     }
     pub fn texture(&self, path: &str) -> Option<&Texture> {
         self.cache.get(&normalize(path))
+    }
+    pub fn texture_with_key(&self, path: &str) -> Option<(u64, &Texture)> {
+        self.cache.get_with_key(&normalize(path))
     }
     /// Content key of a resolved texture, for cross-name deduplication in
     /// downstream packers. `None` when the reference did not resolve to

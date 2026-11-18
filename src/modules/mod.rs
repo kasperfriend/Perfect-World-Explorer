@@ -70,7 +70,7 @@ impl Modules {
         map: MapSpace,
         water: Vec<WaterArea>,
         scene: &crate::scene::Scene,
-        ornaments: Vec<crate::scene::Ornament>,
+        ornaments: &[crate::scene::Ornament],
     ) -> Self {
         // The add-ons each own their state; the host only clones the two
         // handles they need (client root and the loaded world space).

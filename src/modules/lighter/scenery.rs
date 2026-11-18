@@ -127,10 +127,7 @@ impl Asset {
                 } else {
                     Filter::cutout(0.5, false)
                 };
-                match objects
-                    .texture_key(&part.texture)
-                    .zip(objects.texture(&part.texture))
-                {
+                match objects.texture_with_key(&part.texture) {
                     Some((hash, tex)) => {
                         let key = (hash, filter);
                         let index = if let Some(&index) = local_tiles.get(&key) {
@@ -431,7 +428,7 @@ impl Snapshot {
             // Keep at least half the remaining bank for posed models/effects.
             texture_bytes: storage
                 .min(MAX_TEXTURE_BYTES)
-                .saturating_sub(bank.bytes().len())
+                .saturating_sub(bank.byte_len())
                 / 2,
             tiles: addresses.keys().copied().collect(),
         };
