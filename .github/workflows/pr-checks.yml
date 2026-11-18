@@ -196,14 +196,14 @@ jobs:
           # Same flaky mirror as the build dependencies above: retry the install
           # instead of failing the three Vulkan checks behind it, and print apt's
           # own diagnosis as annotations if every attempt fails.
-          if dpkg -s mesa-vulkan-drivers xvfb xauth >/dev/null 2>&1; then
-            echo "mesa-vulkan-drivers, xvfb and xauth already installed"
+          if dpkg -s mesa-vulkan-drivers xvfb xauth libxkbcommon-x11-0 >/dev/null 2>&1; then
+            echo "Software Vulkan and X11 test dependencies already installed"
             exit 0
           fi
           status=1
           for attempt in 1 2 3; do
             if timeout 240 sudo apt-get install -y --no-install-recommends \
-              mesa-vulkan-drivers xvfb xauth 2>&1 | tee /tmp/vulkan-apt.log; then
+              mesa-vulkan-drivers xvfb xauth libxkbcommon-x11-0 2>&1 | tee /tmp/vulkan-apt.log; then
               status=0
               break
             fi
