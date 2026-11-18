@@ -54,9 +54,14 @@ const FOLIAGE: u32 = 4194304u;
 const PRIMARY_ONLY: u32 = 8388608u;
 const TREE_MATERIAL: u32 = 16777216u;
 const SHORE: u32 = 33554432u;
+const OVERLAY: u32 = 67108864u;
+const CLOUD: u32 = 134217728u;
+const PRECIPITATION: u32 = 268435456u;
+const ORDERED_GFX: u32 = 536870912u;
 const SOLID_MASK: u32 = 1u;
 const BLEND_MASK: u32 = 2u;
 const SHADOW_MASK: u32 = 4u;
+const GFX_MASK: u32 = 8u;
 const LIGHTING: u32 = 1u;
 const SHADOWS: u32 = 2u;
 const REFLECTIONS: u32 = 4u;
@@ -69,6 +74,7 @@ const ANISO_ISOTROPIC: u32 = 256u;
 const BAKED_LIGHTMAPS: u32 = 512u;
 const GRASS_AREA_LIGHTMAPS: u32 = 1024u;
 const RELIGHT_BAKED: u32 = 2048u;
+const CLOUD_DETAIL: u32 = 4096u;
 const VIEW: u32 = 0u;
 const SHADOW: u32 = 1u;
 const WATER_REFLECT: u32 = 2u;
@@ -86,7 +92,7 @@ struct Ray {
 struct Surface {
     n: vec3<f32>, face: vec3<f32>, // shading and incident-facing geometric normals
     uv: vec2<f32>, color: vec4<f32>, flags: u32, reflectance: f32, power: f32,
-    specular: vec3<f32>, ambient: vec3<f32>, emission: vec3<f32>, glaze: vec4<f32>,
+    specular: vec3<f32>, ambient: vec3<f32>, emission: vec3<f32>, glaze: vec4<f32>, blend: u32,
 }
 // Order is nonzero only while enumerating the narrow distance band of
 // coplanar sheets. A cursor excludes exactly the layers already composited,
@@ -329,7 +335,7 @@ fn vertex_tint(m: bool, v: u32) -> vec4<f32> {
 }
 fn material_addr(m: bool, primitive: u32) -> u32 {
     // Same word order as scene::Surface.
-    return word(m,3u) + 21u*word(m,word(m,2u)+2u*primitive);
+    return word(m,3u) + 22u*word(m,word(m,2u)+2u*primitive);
 }
 fn layer_key(hit: Hit) -> vec2<u32> {
     let m = (hit.instance & DYNAMIC)!=0u;
@@ -341,10 +347,14 @@ fn key_less(a: vec2<u32>, b: vec2<u32>) -> bool {
 fn closer(hit: Hit, best: Hit, q: Query) -> bool {
     if q.ordered {
         let key = layer_key(hit);
-        if !key_less(key,q.before) { return false; }
+        // GFX follows the native forward draw order (including write-Z).
+        // Other blend sheets reverse only the current coplanar band.
+        let forward = q.mask==GFX_MASK;
+        if !select(key_less(key,q.before),key_less(q.before,key),forward) { return false; }
         if best.instance==NIL { return true; }
         let other = layer_key(best);
-        return key_less(other,key) || (all(key==other) && hit.primitive<best.primitive);
+        return select(key_less(other,key),key_less(key,other),forward)
+            || (all(key==other) && (hit.t<best.t || (hit.t==best.t && hit.primitive<best.primitive)));
     }
     return hit.t<best.t || (hit.t==best.t && (hit.instance<best.instance ||
            (hit.instance==best.instance && hit.primitive<best.primitive)));
@@ -443,10 +453,12 @@ fn accepts(hit: Hit, ray: Ray, q: Query) -> bool {
     let mat = material_addr(m,hit.primitive);
     let flags = word(m,mat+1u);
     let blend = (flags & BLEND)!=0u;
-    if (q.mask==SOLID_MASK && blend) || (q.mask==BLEND_MASK && !blend)
+    let gfx = (flags & ORDERED_GFX)!=0u;
+    if (q.mask==GFX_MASK && !gfx) || (q.mask==SOLID_MASK && blend) || (q.mask==BLEND_MASK && (!blend || gfx))
+        || ((flags & CLOUD)!=0u && (frame.options.x & CLOUD_DETAIL)==0u)
         || (q.purpose==VIEW && (flags & HIDE_PRIMARY)!=0u)
         || (q.purpose!=VIEW && (flags & PRIMARY_ONLY)!=0u)
-        || (q.purpose==SHADOW && (flags & (BLEND|WATER))!=0u && (flags & WRITE_DEPTH)==0u)
+        || (q.purpose==SHADOW && (flags & (BLEND|WATER))!=0u && (flags & (WRITE_DEPTH|CLOUD))==0u)
         || (q.purpose==WATER_REFLECT && (flags & NO_REFLECT)!=0u)
         || (q.purpose==WATER_TRANSMIT && (flags & NO_REFRACT)!=0u) { return false; }
     let cull = (flags & SINGLE_SIDED)!=0u ||
@@ -490,7 +502,7 @@ fn accepts(hit: Hit, ray: Ray, q: Query) -> bool {
     }
     if blend || (q.purpose==SHADOW && (flags & WRITE_DEPTH)!=0u) {
         a *= tint_of(m,v,w).a;
-        if blend && a<=0. { return false; }
+        if blend && a<=0. && word(m,mat+21u)==0u { return false; }
         if q.purpose==SHADOW && a<0.5 { return false; }
     }
     return true;
@@ -575,7 +587,7 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
             let addr = frame.water_effects.x;
             art = simple_water_art(uv,mesh_taps(addr,ray,hit,m,inst,v,vec2<f32>(2.5)),bitcast<f32>(frame.waves.w),addr);
         }
-        return Surface(n,face,uv,art,flags,0.,-1.,vec3<f32>(0.),vec3<f32>(0.),vec3<f32>(0.),vec4<f32>(0.));
+        return Surface(n,face,uv,art,flags,0.,-1.,vec3<f32>(0.),vec3<f32>(0.),vec3<f32>(0.),vec4<f32>(0.),0u);
     }
     let terrain = (flags & TERRAIN)!=0u;
     let grass = (flags & GRASS_MATERIAL)!=0u;
@@ -593,7 +605,7 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
         let ground = terrain_color(p,face,ray,hit.t,baked);
         flags |= select(0u,BAKED,baked.a>0.);
         return Surface(n,face,uv,vec4<f32>(ground,1.),flags,0.,-1.,
-                       vec3<f32>(1.),ground,vec3<f32>(0.),vec4<f32>(0.));
+                       vec3<f32>(1.),ground,vec3<f32>(0.),vec4<f32>(0.),0u);
     }
     let relight = (frame.options.x & RELIGHT_BAKED)!=0u;
     if relight { flags &= ~BAKED; }
@@ -661,7 +673,7 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
     var emission = vec3<f32>(0.);
     if (flags & BAKED)==0u { emission = floats(m,mat+7u)*base; }
     return Surface(n,face,uv,vec4<f32>(color,alpha),flags,bitcast<f32>(word(m,mat+3u)),bitcast<f32>(word(m,mat+4u)),
-                   rgba(word(m,mat+5u)).rgb,base*rgba(word(m,mat+10u)).rgb,emission,glaze);
+                   rgba(word(m,mat+5u)).rgb,base*rgba(word(m,mat+10u)).rgb,emission,glaze,word(m,mat+21u));
 }
 fn none(ray: Ray) -> Hit { return Hit(ray.high,NIL,0u,vec2<f32>(0.)); }
 fn trace(ray: Ray, q: Query) -> Hit {
@@ -698,13 +710,14 @@ fn visibility(p: vec3<f32>, face: vec3<f32>, light: LightRay, width: f32, source
         let m = (hit.instance & DYNAMIC)!=0u;
         let mat = material_addr(m,hit.primitive);
         let flags = word(m,mat+1u);
-        if (flags & FOLIAGE)==0u { return vec3<f32>(0.); }
+        if (flags & (FOLIAGE|CLOUD))==0u { return vec3<f32>(0.); }
         let inst = inst_addr(hit.instance);
         let v = vertex_addresses(m,inst,hit.primitive);
         let uv = surface_uv(m,v,weights_of(hit),mat,flags);
         let addr = word(m,mat);
-        let albedo = filtered_tile(addr,uv,false,mesh_taps(addr,r,hit,m,inst,v,vec2<f32>(1.))).rgb;
-        throughput *= leaf_transmission(albedo);
+        let sample = filtered_tile(addr,uv,(flags & CLAMP_UV)!=0u,mesh_taps(addr,r,hit,m,inst,v,vec2<f32>(1.)));
+        let tint = select(leaf_transmission(sample.rgb),vec3<f32>(1.-0.72*sample.a*tint_of(m,v,weights_of(hit)).a),(flags & CLOUD)!=0u);
+        throughput *= tint;
         if strongest(throughput)<0.002 { break; }
         r.low = advance(hit.t);
     }
@@ -854,6 +867,9 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, seed: ptr<
     if sun_pending {
         sun = sun_sample(seed);
         cosine = select(0.,max(dot(s.n,sun),0.),sun.y>0. && dot(s.face,sun)>0.);
+        // View-oriented particles approximate small, direction-independent
+        // scatterers; the world shadow ray still decides their sun exposure.
+        if (s.flags & PRECIPITATION)!=0u { cosine = select(0.,1.,sun.y>0.); }
         sun_pending = cosine>0.;
     }
     let width = footprint(ray,t);
@@ -952,6 +968,64 @@ fn primary_guide(clip: vec4<f32>, s: Surface) -> vec4<u32> {
     return vec4<u32>(bitcast<u32>(clip.w),pack4x8snorm(vec4<f32>(s.n,0.)),
         pack4x8unorm(vec4<f32>(sqrt(clamp(s.color.rgb,vec3<f32>(0.),vec3<f32>(1.))),0.)),kind);
 }
+// Legacy blend pairs that are affine in the destination radiance. Apply
+// the factors in Lighter's linear HDR space, not on gamma-encoded UNORM.
+struct BlendOp { source: vec3<f32>, carried: vec3<f32> }
+fn blend_factor(code: u32, c: vec4<f32>) -> vec3<f32> {
+    switch code {
+        case 1u: { return vec3<f32>(0.); }
+        case 2u: { return vec3<f32>(1.); }
+        case 3u: { return clamp(c.rgb,vec3<f32>(0.),vec3<f32>(1.)); }
+        case 4u: { return 1.-clamp(c.rgb,vec3<f32>(0.),vec3<f32>(1.)); }
+        case 5u: { return vec3<f32>(c.a); }
+        default: { return vec3<f32>(1.-c.a); }
+    }
+}
+fn blend_op(code: u32, flags: u32, c: vec4<f32>) -> BlendOp {
+    if code==0u {
+        return BlendOp(c.rgb*c.a,vec3<f32>(select(1.-c.a,1.,(flags & ADDITIVE)!=0u)));
+    }
+    let src = code & 15u;
+    let dst = blend_factor(code>>4u,c);
+    if src==9u { return BlendOp(vec3<f32>(0.),dst+c.rgb); }
+    if src==10u { return BlendOp(c.rgb,dst-c.rgb); }
+    return BlendOp(c.rgb*blend_factor(src,c),dst);
+}
+fn project_decals(s: Surface, p: vec3<f32>, ray: Ray, t: f32, original: vec3<f32>) -> vec3<f32> {
+    if (s.flags & TERRAIN)==0u || s.face.y<0.15 { return original; }
+    var color = original;
+    for (var i=0u; i<moving[15u]; i++) {
+        let at = moving[14u]+22u*i;
+        let height = words2(true,at+6u);
+        if p.y<height.x || p.y>height.y { continue; }
+        let rel = p.xz-words2(true,at);
+        let u = words2(true,at+2u);
+        let v = words2(true,at+4u);
+        let x = dot(u,rel);
+        let y = dot(v,rel);
+        // Half-open cells cannot double-apply one authored drape along seams.
+        if x<0. || y<0. || x>=1. || y>=1. { continue; }
+        let upper = x>=y;
+        let a = select(2u,1u,upper);
+        let b = 3u;
+        let w = vec3<f32>(1.-max(x,y),abs(x-y),min(x,y));
+        let u0 = words2(true,at+8u);
+        let u1 = words2(true,at+8u+2u*a);
+        let u2 = words2(true,at+8u+2u*b);
+        let uv = u0*w.x+u1*w.y+u2*w.z;
+        let tint = rgba(moving[at+16u])*w.x+rgba(moving[at+16u+a])*w.y+rgba(moving[at+16u+b])*w.z;
+        let tile = moving[at+20u];
+        let du = select(u2-u1,u1-u0,upper);
+        let dv = select(u1-u0,u2-u1,upper);
+        let gu = vec3<f32>(u.x*du.x+v.x*dv.x,0.,u.y*du.x+v.y*dv.x);
+        let gv = vec3<f32>(u.x*du.y+v.x*dv.y,0.,u.y*du.y+v.y*dv.y);
+        let code = moving[at+21u];
+        let tex = filtered_tile(tile,uv,(code & CLAMP_UV)!=0u,footprint_taps(tile,ray.dir,s.face,gu,gv,footprint(ray,t)));
+        let blend = blend_op(code & 255u,0u,tex*tint);
+        color = blend.source+blend.carried*color;
+    }
+    return color;
+}
 fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
     var result = vec3<f32>(0.);
     var depth = 0.;
@@ -963,7 +1037,7 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
     var split = false;
     for (var branch=0u; branch<2u; branch++) {
         for (var segment=0u; segment<=frame.options.y; segment++) {
-            if strongest(path.weight)<0.002 { break; }
+            if strongest(abs(path.weight))<0.002 { break; }
             let ray = path.ray;
             let terminal = path.depth==frame.options.y;
             var solid = none(ray);
@@ -971,26 +1045,39 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
             var mask = SOLID_MASK;
             var after = vec2<u32>(NIL);
             var group_end = -1.;
+            var gfx_depth = ray.high;
+            var gfx_color = vec3<f32>(0.);
+            var gfx_weight = vec3<f32>(1.);
             var s: Surface;
             var color = vec3<f32>(0.);
             loop {
                 // Resolve solid visibility once, then process sheets in front
                 // of it. Keep one traversal site for both kinds of hit.
-                let blending = mask==BLEND_MASK;
-                let has_weight = strongest(path.weight)>=0.002;
-                let ordered = blending && has_weight && group_end>=0.;
+                let gfx = mask==GFX_MASK;
+                let has_weight = strongest(abs(path.weight))>=0.002;
+                let ordered = gfx || (mask==BLEND_MASK && has_weight && group_end>=0.);
                 var r = scan;
-                if ordered { r.high = group_end; }
-                let query_mask = select(mask,0u,blending && !has_weight);
+                if gfx { r = ray; }
+                else if ordered { r.high = group_end; }
+                let query_mask = select(mask,0u,mask==BLEND_MASK && !has_weight);
                 var hit = trace(r,Query(path.purpose,query_mask,ordered,after));
                 if mask==SOLID_MASK {
                     solid = hit;
-                    mask = BLEND_MASK;
+                    mask = GFX_MASK;
+                    after = vec2<u32>(0u);
                     if hit.instance!=NIL { scan.high = min(ray.high,hit.t+band(hit.t)); }
+                    gfx_depth = scan.high;
                     continue;
                 }
                 let sheet = hit.instance!=NIL;
                 if !sheet {
+                    if gfx {
+                        result += path.weight*gfx_color;
+                        path.weight *= gfx_weight;
+                        mask = BLEND_MASK;
+                        after = vec2<u32>(NIL);
+                        continue;
+                    }
                     if ordered {
                         scan.low = advance(group_end);
                         group_end = -1.;
@@ -1004,12 +1091,21 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                     scan.low = max(scan.low,hit.t-band(hit.t));
                     continue;
                 }
+                if gfx {
+                    after = layer_key(hit);
+                    let m = (hit.instance & DYNAMIC)!=0u;
+                    let flags = word(m,material_addr(m,hit.primitive)+1u);
+                    if (flags & OVERLAY)==0u && hit.t>gfx_depth { continue; }
+                }
                 s = surface(hit,ray);
                 let p = ray.origin+ray.dir*hit.t;
                 if (s.flags & WATER)!=0u { break; }
                 color = vec3<f32>(0.);
                 if has_weight { color = direct(p,s,ray,hit.t,terminal || sheet,seed); }
-                if !sheet { break; }
+                if !sheet {
+                    color = project_decals(s,p,ray,hit.t,color);
+                    break;
+                }
                 // Coplanar cards blend in decreasing draw-layer order. The
                 // two triangles of a card share a key, so diagonals draw once.
                 after = layer_key(hit);
@@ -1019,11 +1115,18 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                         depth = max(depth,world_depth(p));
                     }
                 }
-                let t = transmittance(hit.t,path.wet);
-                let additive = (s.flags & ADDITIVE)!=0u;
+                let t = select(transmittance(hit.t,path.wet),vec3<f32>(1.),(s.flags & OVERLAY)!=0u);
+                let additive = (s.flags & ADDITIVE)!=0u || s.blend>>4u==2u;
                 let mist = select(medium_color(path.wet),vec3<f32>(0.),additive);
-                result += path.weight*s.color.a*(color*t + mist*(1.-t));
-                if !additive { path.weight *= 1.-s.color.a; }
+                let blend = blend_op(s.blend,s.flags,vec4<f32>(color*t + mist*(1.-t),s.color.a));
+                if gfx {
+                    gfx_color = blend.source + blend.carried*gfx_color;
+                    gfx_weight *= blend.carried;
+                    if (s.flags & WRITE_DEPTH)!=0u && s.color.a>=0.5 { gfx_depth = min(gfx_depth,hit.t); }
+                } else {
+                    result += path.weight*blend.source;
+                    path.weight *= blend.carried;
+                }
             }
             if solid.instance==NIL {
                 // No exit surface was found within the streamed world.
@@ -1040,7 +1143,7 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
             let t = transmittance(solid.t,path.wet);
             result += path.weight*(1.-t)*medium_color(path.wet);
             path.weight *= t;
-            if strongest(path.weight)<0.002 { break; }
+            if strongest(abs(path.weight))<0.002 { break; }
             if (s.flags & WATER)!=0u {
                 // Alternate fixed-function water is a colored alpha layer over
                 // the bottom, not a normal-mapped specular interface.

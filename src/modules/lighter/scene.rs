@@ -36,6 +36,10 @@ pub const FOLIAGE: u32 = 1 << 22;
 pub const PRIMARY_ONLY: u32 = 1 << 23;
 pub const TREE_MATERIAL: u32 = 1 << 24;
 pub const SHORE: u32 = 1 << 25;
+pub const OVERLAY: u32 = 1 << 26;
+pub const CLOUD: u32 = 1 << 27;
+pub const PRECIPITATION: u32 = 1 << 28;
+pub const ORDERED_GFX: u32 = 1 << 29;
 pub const GRASS_WIND_SLOTS: usize = 80;
 
 // These bits also occupy the upper eight bits of a Vulkan TLAS instance.
@@ -44,8 +48,9 @@ pub const GRASS_WIND_SLOTS: usize = 80;
 pub const MASK_SOLID: u8 = 1;
 pub const MASK_BLEND: u8 = 2;
 pub const MASK_SHADOW: u8 = 4;
+pub const MASK_GFX: u8 = 8;
 pub const INSTANCE_WORDS: u32 = 14;
-const HEADER_WORDS: usize = 14;
+const HEADER_WORDS: usize = 16;
 pub const VERTEX_WORDS: u32 = 8;
 const MAX_ITEMS: usize = 8_000_000;
 pub const DYNAMIC_BIT: u32 = 1 << 23;
@@ -152,9 +157,10 @@ pub struct Surface {
     face_stage: [u32; 4], // mode, feature and skin colors, highlight tile
     face_gloss: u32,
     diffuse: u32,
+    blend: u32, // D3D source and destination factors (0: default ray alpha)
 }
 pub const SURFACE_WORDS: usize = std::mem::size_of::<Surface>() / 4;
-const _: () = assert!(SURFACE_WORDS == 21);
+const _: () = assert!(SURFACE_WORDS == 22);
 
 impl Surface {
     pub fn new(texture: u32, flags: u32, cutoff: f32, reflectance: f32) -> Self {
@@ -173,6 +179,7 @@ impl Surface {
             face_stage: [0; 4],
             face_gloss: 0,
             diffuse: u32::MAX,
+            blend: 0,
         }
     }
 
@@ -219,11 +226,22 @@ impl Surface {
         self
     }
 
+    pub(crate) fn with_blend(mut self, blend: u32) -> Self {
+        self.blend = blend;
+        self
+    }
+
     fn ray_mask(self) -> u8 {
         let blend = self.flags & BLEND != 0;
-        let mut mask = if blend { MASK_BLEND } else { MASK_SOLID };
+        let mut mask = if !blend {
+            MASK_SOLID
+        } else if self.flags & ORDERED_GFX != 0 {
+            MASK_GFX
+        } else {
+            MASK_BLEND
+        };
         if self.flags & PRIMARY_ONLY == 0
-            && (self.flags & WRITE_DEPTH != 0 || (!blend && self.flags & WATER == 0))
+            && (self.flags & (WRITE_DEPTH | CLOUD) != 0 || (!blend && self.flags & WATER == 0))
         {
             mask |= MASK_SHADOW;
         }
@@ -382,6 +400,7 @@ pub enum ChunkKey {
     Scenery(i32, i32),
     Water(u32),
     ShoreWaves,
+    Clouds,
 }
 
 pub type Fingerprint = [u8; 32];
@@ -422,6 +441,22 @@ pub struct Light {
     pub color: [f32; 4],
 }
 
+// Affine inverse of a draped cell's XZ footprint and its bounded vertical
+// projection range. The four corner UVs/colors use native triangulation.
+#[derive(Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct Projector {
+    xz: [f32; 2],
+    row_u: [f32; 2],
+    row_v: [f32; 2],
+    height: [f32; 2],
+    uv: [[f32; 2]; 4],
+    tint: [u32; 4],
+    texture: u32,
+    blend: u32, // factors in low bytes, CLAMP_UV bit for tiling
+}
+const _: () = assert!(std::mem::size_of::<Projector>() == 22 * 4);
+
 #[derive(Default)]
 pub struct Builder {
     vertices: Vec<Vertex>,
@@ -433,6 +468,7 @@ pub struct Builder {
     instances: Vec<Instance>,
     attachments: Vec<Attachment>,
     lights: Vec<Light>,
+    projectors: Vec<Projector>,
 }
 
 struct CachedMesh {
@@ -611,6 +647,7 @@ impl Builder {
             + self.materials.len() * SURFACE_WORDS
             + instances * INSTANCE_WORDS as usize
             + self.lights.len() * 8
+            + self.projectors.len() * 22
             + bvh_words)
             * 4;
         MeshBudget {
@@ -618,6 +655,49 @@ impl Builder {
             triangles: MAX_ITEMS.saturating_sub(self.triangles.len()),
             bytes: storage_bytes.saturating_sub(fixed),
         }
+    }
+
+    // Admission errors are counted rather than replacing a drape with a
+    // floating card. A bounded list keeps per-hit cost predictable.
+    pub(crate) fn project_decal(
+        &mut self,
+        p: [[f32; 3]; 4],
+        uv: [[f32; 2]; 4],
+        tint: [u32; 4],
+        texture: u32,
+        blend: u32,
+    ) -> Result<(), bool> {
+        if self.projectors.len() >= 128 {
+            return Err(true);
+        }
+        if !p
+            .iter()
+            .flatten()
+            .chain(uv.iter().flatten())
+            .all(|v| v.is_finite())
+        {
+            return Err(false);
+        }
+        let xz = [p[0][0], p[0][2]];
+        let a = [p[1][0] - xz[0], p[1][2] - xz[1]];
+        let b = [p[2][0] - xz[0], p[2][2] - xz[1]];
+        let d = a[0] * b[1] - a[1] * b[0];
+        if d.abs() < 1e-7 {
+            return Err(false);
+        }
+        let ymin = p.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
+        let ymax = p.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max);
+        self.projectors.push(Projector {
+            xz,
+            row_u: [b[1] / d, -b[0] / d],
+            row_v: [-a[1] / d, a[0] / d],
+            height: [ymin - 0.75, ymax + 0.25],
+            uv,
+            tint,
+            texture,
+            blend,
+        });
+        Ok(())
     }
 
     pub fn light(&mut self, light: Light) {
@@ -731,7 +811,9 @@ impl Builder {
                         | SINGLE_SIDED
                         | FOLIAGE
                         | PRIMARY_ONLY
-                        | TREE_MATERIAL)
+                        | TREE_MATERIAL
+                        | OVERLAY
+                        | CLOUD)
                     == 0;
         }
         // Don't leave partial ranges behind if validation rejected this draw.
@@ -991,6 +1073,8 @@ impl Builder {
             words.extend(a.forward.to_cols_array().map(f32::to_bits));
             words.extend(a.inverse.to_cols_array().map(f32::to_bits));
         }
+        append(&mut words, 14, &self.projectors);
+        words[15] = self.projectors.len() as u32;
         Packet {
             words,
             meshes: self.meshes,

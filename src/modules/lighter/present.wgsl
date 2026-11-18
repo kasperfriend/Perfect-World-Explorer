@@ -1,3 +1,9 @@
+// Presentation consumes the finished ray image and current reverse-Z depth.
+// Lens flares, HUD glow and GFX Warp would be display-space operations here or
+// in native post, not glass BSDFs. Warp:1 remains explicitly unsupported:
+// its authored normalmap card is withheld from world, shadow and refraction
+// geometry; no fake opacity or color is inserted into the ray world.
+
 struct Present { extent: vec4<u32>, options: vec4<u32> }
 @group(0) @binding(0) var<storage,read> pixels: array<Pixel>;
 @group(0) @binding(1) var<uniform> present: Present;

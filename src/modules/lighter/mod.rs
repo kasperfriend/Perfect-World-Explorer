@@ -98,6 +98,7 @@ const ANISO_ISOTROPIC: u32 = 256;
 pub const BAKED_LIGHTMAPS: u32 = 512;
 pub const GRASS_AREA_LIGHTMAPS: u32 = 1024;
 const RELIGHT_BAKED: u32 = 2048;
+pub const CLOUD_DETAIL: u32 = 4096;
 
 pub(crate) fn storage_limit(device: &wgpu::Device) -> usize {
     let limits = device.limits();

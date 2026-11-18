@@ -24,6 +24,8 @@ mod terrain_fidelity;
 mod vegetation;
 #[path = "water_feed.rs"]
 mod water_feed;
+#[path = "weather.rs"]
+mod weather;
 pub(super) use scenery::{SceneryStream, Snapshot as ScenerySnapshot};
 use vegetation::{read_tree, Tree};
 
@@ -51,6 +53,7 @@ pub(super) struct Feed {
     grass: vegetation::Grass,
     waves: Vec<u32>,
     water: water_feed::Water,
+    weather: weather::Weather,
     sky: lighter::sky::Sky,
     authored_mips: bool,
 }
@@ -118,6 +121,7 @@ impl Feed {
             }
         }
         result.water = water_feed::Water::load(t, &mut result.base)?;
+        result.weather = weather::Weather::load(t, &mut result.base)?;
         result.tree_archive_missing = !t.element.join("trees.pck").is_file();
         for tree in &t.trees.types {
             let Some(tree) = tree else {
@@ -322,6 +326,7 @@ impl Feed {
             }
         }
         self.water.append(m, &mut builder)?;
+        self.weather.clouds(&mut builder)?;
         inventory[Class::Water] = m.water_coverage;
         let extras = &m.indices[m.terrain_end as usize..m.water_start as usize];
         if !extras.is_empty() {
@@ -477,6 +482,10 @@ impl Feed {
                     0
                 } | if current_body != 0 {
                     lighter::UNDERWATER
+                } else {
+                    0
+                } | if camera.cloud_detail {
+                    lighter::CLOUD_DETAIL
                 } else {
                     0
                 } | if camera.terrain_lightmaps {
@@ -736,6 +745,7 @@ fn point_light(p: [f32; 3], radius: f32, color: [f32; 4], intensity: f32) -> Lig
 fn moving(
     feed: &Feed,
     frame: &FrameSnapshot,
+    camera: &Camera,
     storage: usize,
     models: Option<&mut world_models_gpu::World>,
     modules: &mut crate::modules::Modules,
@@ -793,6 +803,10 @@ fn moving(
         &mut out.coverage[Class::Grass],
         &mut budget,
     )?;
+    if camera.underwater_depth <= 0. {
+        feed.weather
+            .precipitation(camera.pos, camera.yaw, frame, &mut out.builder, &mut budget)?;
+    }
     let coverage = out.coverage;
     Ok((out.finish_cached(cache)?, coverage))
 }
@@ -902,6 +916,7 @@ impl super::Renderer {
             let (moving, coverage) = moving(
                 feed,
                 frame,
+                camera,
                 lighter::storage_limit(&self.device),
                 self.models.as_mut(),
                 &mut self.modules,

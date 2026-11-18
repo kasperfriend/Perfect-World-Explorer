@@ -1117,6 +1117,7 @@ mod tests {
             normal: [0., 1., 0.],
         };
         let quad = crate::gfx_player::EffectQuad {
+            ray_placement: Default::default(),
             texture: "a.png".into(),
             source_blend: 5,
             destination_blend: 2,

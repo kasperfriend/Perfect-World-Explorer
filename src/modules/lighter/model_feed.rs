@@ -142,9 +142,7 @@ impl<'a> Moving<'a> {
                 );
             if let Some(stage) = part.face_shader {
                 let mut load_stage = |name, fallback| -> Result<u32, String> {
-                    let loaded = self
-                        .textures
-                        .archive(namespace, name, Filter::Alpha, decode)?;
+                    let loaded = self.textures.archive(namespace, name, filter, decode)?;
                     counts.texture_fallback += usize::from(loaded.is_none());
                     Ok(loaded.map_or(fallback, |(addr, _)| addr))
                 };
@@ -218,43 +216,105 @@ impl<'a> Moving<'a> {
         Ok(())
     }
 
+    fn blend(&mut self, src: u32, dst: u32) -> Option<u32> {
+        // HDR front-to-back compositing can preserve expressions A+B*dst.
+        // Destination alpha and nonlinear destination-color factors need a
+        // separate encoded framebuffer pass: report them, don't substitute 5/6.
+        if matches!(src, 1..=6 | 9 | 10) && matches!(dst, 1..=6) {
+            Some(src | (dst << 4))
+        } else {
+            self.coverage[Class::EffectDraws].unsupported += 1;
+            None
+        }
+    }
+
     pub fn effects(
         &mut self,
         namespace: &'static str,
         quads: &[EffectQuad],
         decode: &mut Decode<'_>,
     ) -> Result<(), String> {
-        // Match the native RenderLayer/priority ordering within a depth tie.
-        // Stable sort: quads from one effect can share material and priority.
+        // Same priority bracket as the native effect slot manager. Stable
+        // sort also preserves draw order within its equal-state buckets.
         let mut sorted: Vec<_> = quads.iter().collect();
         sorted.sort_by_key(|q| {
+            let (texture, write) = q
+                .mesh
+                .as_ref()
+                .map_or((&q.texture, false), |m| (&m.texture, m.write_depth));
             (
                 q.layer,
-                !q.mesh.as_ref().is_some_and(|m| m.write_depth),
+                !write,
                 q.priority,
+                !q.depth_test,
+                q.source_blend,
+                q.destination_blend,
+                texture,
+                q.tile,
             )
         });
         for q in sorted {
+            let Some(blend) = self.blend(q.source_blend, q.destination_blend) else {
+                continue;
+            };
             let flags = BLEND
-                | if q.destination_blend == 2 {
-                    ADDITIVE
+                | ORDERED_GFX
+                | if q.tile { 0 } else { CLAMP_UV }
+                | if !q.depth_test {
+                    OVERLAY | PRIMARY_ONLY
                 } else {
                     0
                 }
-                | if q.tile { 0 } else { CLAMP_UV };
+                | if q.ray_placement == crate::gfx_player::RayPlacement::Screen {
+                    PRIMARY_ONLY
+                } else {
+                    0
+                };
+            let filter = if q.source_blend == 5 {
+                Filter::Alpha
+            } else {
+                Filter::ColorMask
+            };
+            if q.ray_placement == crate::gfx_player::RayPlacement::Ground && q.depth_test {
+                let loaded = self
+                    .textures
+                    .archive(namespace, &q.texture, filter, decode)?;
+                let id = loaded.map_or(0, |v| v.0);
+                let c = self.builder.project_decal(
+                    q.positions,
+                    q.uv,
+                    q.vertex_colors.unwrap_or([q.color; 4]).map(rgba),
+                    id,
+                    blend | (flags & CLAMP_UV),
+                );
+                let row = &mut self.coverage[Class::EffectDraws];
+                match c {
+                    Ok(()) => {
+                        row.loaded += 1;
+                        row.texture_fallback += usize::from(loaded.is_none());
+                    }
+                    Err(true) => row.budget += 1,
+                    Err(false) => row.invalid += 1,
+                }
+                continue;
+            }
             if let Some(skin) = &q.mesh {
                 if skin.vertices.len() < 3 {
                     self.coverage[Class::EffectDraws].empty += 1;
                     continue;
                 }
-                let loaded =
-                    self.textures
-                        .archive(namespace, &skin.texture, Filter::Alpha, decode)?;
+                let loaded = self
+                    .textures
+                    .archive(namespace, &skin.texture, filter, decode)?;
                 self.coverage[Class::EffectDraws].texture_fallback += usize::from(loaded.is_none());
                 self.coverage[Class::EffectDraws].loaded += 1;
                 let (texture, has_alpha) = loaded.unwrap_or((0, true));
                 let mut flags = flags
-                    | if skin.write_depth { WRITE_DEPTH } else { 0 }
+                    | if skin.write_depth && q.depth_test {
+                        WRITE_DEPTH
+                    } else {
+                        0
+                    }
                     | if skin.material.is_none() { EMISSIVE } else { 0 };
                 let scale = |c| crate::model_material::scale_rgba(c, q.color);
                 let (color, lighting, gloss) = skin.material.map_or_else(
@@ -279,26 +339,32 @@ impl<'a> Moving<'a> {
                     && q.source_blend == 5
                     && q.destination_blend == 6
                 {
-                    flags &= !(BLEND | WRITE_DEPTH);
+                    flags &= !(BLEND | WRITE_DEPTH | ORDERED_GFX);
                 }
-                let mut surface = Surface::new(texture, flags, 0., 0.).with_gloss(gloss);
+                let mut surface = Surface::new(texture, flags, 0., 0.)
+                    .with_gloss(gloss)
+                    .with_blend(blend);
                 if let Some((diffuse, ambient, emission)) = lighting {
                     surface = surface.with_lighting(diffuse, ambient, emission);
                 }
                 let id = self.builder.surface(surface);
+                self.layer += 1;
                 for tri in skin.vertices.chunks_exact(3) {
                     let base = self.effects.vertices.len() as u32;
                     self.effects.vertices.extend(
                         tri.iter()
                             .map(|v| Vertex::new(v.position, v.normal, v.uv).tint(color, color)),
                     );
-                    self.effects.tri([base, base + 1, base + 2], id);
+                    self.effects
+                        .tri_layer([base, base + 1, base + 2], id, self.layer);
                 }
             } else {
                 self.card(
                     namespace,
                     &q.texture,
                     flags,
+                    blend,
+                    filter,
                     q.positions,
                     q.uv,
                     q.vertex_colors.unwrap_or([q.color; 4]),
@@ -316,17 +382,28 @@ impl<'a> Moving<'a> {
         decode: &mut Decode<'_>,
     ) -> Result<(), String> {
         for q in decals {
+            let Some(blend) = self.blend(q.source_blend, q.destination_blend) else {
+                continue;
+            };
             let flags = BLEND
+                | ORDERED_GFX
                 | CLAMP_UV
-                | if q.destination_blend == 2 {
-                    ADDITIVE
-                } else {
+                | if q.depth_test {
                     0
+                } else {
+                    OVERLAY | PRIMARY_ONLY
                 };
+            let filter = if q.source_blend == 5 {
+                Filter::Alpha
+            } else {
+                Filter::ColorMask
+            };
             self.card(
                 namespace,
                 &q.texture,
                 flags,
+                blend,
+                filter,
                 q.vertices.each_ref().map(|v| v.position),
                 q.vertices.each_ref().map(|v| v.uv),
                 q.vertices.each_ref().map(|v| v.color),
@@ -342,21 +419,21 @@ impl<'a> Moving<'a> {
         namespace: &'static str,
         name: &str,
         flags: u32,
+        blend: u32,
+        filter: Filter,
         positions: [[f32; 3]; 4],
         uv: [[f32; 2]; 4],
         color: [[f32; 4]; 4],
         decode: &mut Decode<'_>,
     ) -> Result<(), String> {
-        let loaded = self
-            .textures
-            .archive(namespace, name, Filter::Alpha, decode)?;
+        let loaded = self.textures.archive(namespace, name, filter, decode)?;
         self.coverage[Class::EffectDraws].texture_fallback += usize::from(loaded.is_none());
         self.coverage[Class::EffectDraws].loaded += 1;
         let tex = loaded.map_or(0, |v| v.0);
         let base = self.effects.vertices.len() as u32;
         let id = self
             .builder
-            .surface(Surface::new(tex, flags | EMISSIVE, 0., 0.));
+            .surface(Surface::new(tex, flags | EMISSIVE, 0., 0.).with_blend(blend));
         for j in 0..4 {
             let color = rgba(color[j]);
             self.effects
@@ -406,6 +483,7 @@ mod tests {
     #[test]
     fn opaque_gfx_skins_keep_authored_power_without_promoting_sheets() {
         let mut quad = EffectQuad {
+            ray_placement: Default::default(),
             texture: String::new(),
             source_blend: 5,
             destination_blend: 6,

@@ -1042,6 +1042,7 @@ mod tests {
         color: [f32; 4],
     ) -> EffectQuad {
         EffectQuad {
+            ray_placement: Default::default(),
             texture: texture.into(),
             source_blend: source,
             destination_blend: destination,
@@ -1066,6 +1067,7 @@ mod tests {
             normal,
         };
         EffectQuad {
+            ray_placement: Default::default(),
             texture: "a.png".into(),
             source_blend: 5,
             destination_blend: 2,

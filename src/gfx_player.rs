@@ -127,9 +127,20 @@ pub const MAX_SEGMENTS: usize = 512;
 /// quad instead of drawing an invisible one.
 const ALPHA_CUTOFF: f32 = 5. / 255.;
 
+/// How the ray feed should interpret the native output. Native still draws
+/// the exact same emitted vertices (including the ground drape lift).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RayPlacement {
+    #[default]
+    World,
+    Screen,
+    Ground,
+}
+
 /// One textured, blended quad in world space, ready for the effect pass.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectQuad {
+    pub ray_placement: RayPlacement,
     /// Archive path (`gfx/textures/...`), already normalized.
     pub texture: String,
     /// D3D8 `D3DBLEND` values, exactly as authored.
@@ -3741,6 +3752,11 @@ fn push_quad(
     // and the UV channel are wired at this one funnel instead of in each class.
     log_card(context, texture, positions, uv, color, out.len());
     out.push(EffectQuad {
+        ray_placement: if context.id == 101 {
+            RayPlacement::Screen
+        } else {
+            RayPlacement::World
+        },
         texture: texture.to_string(),
         source_blend: context.common.source_blend,
         destination_blend: context.common.destination_blend,
@@ -4471,7 +4487,11 @@ fn drape_sprite(
                 positions[slot] = position;
                 uvs[slot] = corner_uv;
             }
+            let start = out.len();
             push_quad(out, context, texture, positions, uvs, color);
+            for quad in &mut out[start..] {
+                quad.ray_placement = RayPlacement::Ground;
+            }
         }
     }
     crate::diag_keyed!(
@@ -4872,6 +4892,7 @@ fn emit_model(
             continue;
         }
         out.push(EffectQuad {
+            ray_placement: RayPlacement::World,
             texture: mesh.texture.clone(),
             source_blend: context.common.source_blend,
             destination_blend: context.common.destination_blend,

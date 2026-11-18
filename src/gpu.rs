@@ -110,6 +110,8 @@ struct FrameSnapshot {
     sky_moon: [f32; 4],
     time_advances: u32,
     light_publications: u32,
+    weather: crate::client_weather::WeatherSelection,
+    weather_ticks: u32,
 }
 impl Default for FrameSnapshot {
     fn default() -> Self {
@@ -146,6 +148,8 @@ impl Default for FrameSnapshot {
             sky_moon: [0.; 4],
             time_advances: 0,
             light_publications: 0,
+            weather: Default::default(),
+            weather_ticks: 0,
         }
     }
 }
@@ -3142,6 +3146,8 @@ impl Renderer {
             sky_moon: frame.moon,
             time_advances: 1,
             light_publications: 1,
+            weather: Default::default(),
+            weather_ticks: 0,
         };
         self.frame = snapshot;
         snapshot
@@ -3833,22 +3839,22 @@ impl Renderer {
             self.queue_main_runs();
             lap(STAGE_VISIBILITY, &mut stage_ms, &mut lap_at);
         }
-        let frame = self.begin_frame(camera, w, h);
+        let mut frame = self.begin_frame(camera, w, h);
+        self.weather.advance(camera.logic_delta_ms);
+        let selected_weather = camera.regional_light.map_or(
+            crate::client_weather::WeatherSelection::default(),
+            |light| light.weather_selection(),
+        );
+        // Both ray and raster share the authored flag selection and 33ms tick.
+        let selected_weather = camera.weather_override.apply(selected_weather);
+        frame.weather = selected_weather;
+        frame.weather_ticks = self.weather.wrapped_ticks();
         if ray_world {
             if reset_history {
                 self.lighter.reset_history();
             }
             return self.render_lighter(target, matrix, camera, &frame, w, h);
         }
-        self.weather.advance(camera.logic_delta_ms);
-        let selected_weather = camera.regional_light.map_or(
-            crate::client_weather::WeatherSelection::default(),
-            |light| light.weather_selection(),
-        );
-        // The World tab's override replaces the area's own flag bits before any
-        // view consumes them, so the main, reflection and above-water passes all
-        // see one selection. `Auto` is the client's `0x421520` answer.
-        let selected_weather = camera.weather_override.apply(selected_weather);
         let main_weather = if camera.underwater_depth > 0.0 {
             crate::client_weather::WeatherSelection::default()
         } else {
@@ -8122,6 +8128,10 @@ fn preview_frame(
         .clamp(0., 4.);
     if std::env::var_os("PW_PREVIEW_NO_REFLECTION").is_some() {
         cam.water_reflections = false;
+    }
+    if let Ok(weather) = std::env::var("PW_PREVIEW_WEATHER") {
+        cam.weather_override = crate::client_weather::WeatherOverride::parse(&weather)
+            .ok_or("PW_PREVIEW_WEATHER must be Auto, Clear, Rain or Snow")?;
     }
     if let Ok(hour) = std::env::var("PW_PREVIEW_HOUR") {
         if let Ok(h) = hour.parse::<f32>() {

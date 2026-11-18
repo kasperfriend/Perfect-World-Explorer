@@ -304,7 +304,7 @@ fn snow_luminance_mask(mut pixels: image::RgbaImage) -> image::RgbaImage {
     pixels
 }
 
-fn weather_images(element: &Path) -> [image::RgbaImage; 2] {
+pub(crate) fn weather_images(element: &Path) -> [image::RgbaImage; 2] {
     const SIZE: u32 = 64;
     let mut file = File::open(element.join("textures.pck")).ok();
     let entries = file
@@ -641,6 +641,11 @@ impl WeatherGpu {
         }
     }
 
+    /// Shared phase for the Native and Lighter views.
+    pub(crate) fn wrapped_ticks(&self) -> u32 {
+        self.ticks % 1_000_000
+    }
+
     /// Advance the native fixed-step weather clock exactly once per world frame.
     pub fn advance(&mut self, delta_ms: u32) {
         self.last_dt = (delta_ms as f32 / 1000.).max(0.);
@@ -714,7 +719,7 @@ impl WeatherGpu {
             fog_color: fog.color4(),
             clip,
             clock_weather: [
-                (self.ticks % 1_000_000) as f32,
+                self.wrapped_ticks() as f32,
                 self.water_area_count as f32,
                 selection.rain as u8 as f32,
                 selection.snow as u8 as f32,

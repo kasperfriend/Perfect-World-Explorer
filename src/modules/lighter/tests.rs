@@ -689,6 +689,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_material_channels(&mut h);
     exercise_vegetation(&mut h);
     exercise_water_art(&mut h);
+    exercise_effect_placement(&mut h);
     exercise_chunk_scaling(&mut h);
     if mode == Mode::Software {
         exercise_reprojection_shader(&h);
@@ -1163,6 +1164,143 @@ fn exercise_material_channels(h: &mut Harness) {
     );
     assert!((pixel.1 - depth_at(frame, -5. * Vec3::Z)).abs() < 1e-6);
     eprintln!("Lighter: both authored bake endpoints, relighting, face stages, sidedness and normal map passed");
+}
+
+fn exercise_effect_placement(h: &mut Harness) {
+    let empty = Builder::default().finish();
+    h.ray.settings.lighting = false;
+    h.ray.settings.shadows = false;
+    h.ray.settings.bounces = 0;
+    let mut b = Builder::default();
+    let floor = upright(&mut b, -3., [0., 0., 1., 1.], EMISSIVE, 0);
+    put(&mut b, floor);
+    for (z, tint, blend) in [
+        (-5., [1., 0., 0., 0.5], 2 | 6 << 4),
+        (-7., [0., 1., 0., 0.25], 5 | 6 << 4),
+    ] {
+        let positions = [[-1., 1., z], [1., 1., z], [-1., -1., z], [1., -1., z]];
+        let m = Surface::new(
+            0,
+            EMISSIVE | BLEND | ORDERED_GFX | OVERLAY | PRIMARY_ONLY,
+            0.,
+            0.,
+        )
+        .with_blend(blend);
+        let layer = quad_material(&mut b, positions, [0., 0., 1.], m, rgba(tint));
+        put(&mut b, layer);
+    }
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let f = test_frame(Vec3::ZERO, -Vec3::Z, 3);
+    let p = h.pixel(f, &empty);
+    assert_radiance(
+        "no-Z GFX layers follow draw order, not distance or opaque depth",
+        p,
+        [0.75, 0.25, 0.375],
+    );
+    assert!((p.1 - depth_at(f, -3. * Vec3::Z)).abs() < 1e-5);
+
+    let mut b = Builder::default();
+    let floor = upright(&mut b, -8., [0., 0., 1., 1.], EMISSIVE, 0);
+    put(&mut b, floor);
+    let mut effects = Builder::default();
+    let mut batch = Mesh::default();
+    for (i, (z, tint, depth)) in [
+        (-3., [1., 0., 0., 0.5], false),
+        (-6., [0., 1., 0., 0.5], false),
+        (-4., [1., 1., 1., 0.5], true),
+        (-5., [0., 0., 0., 1.], false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let flags = EMISSIVE | BLEND | ORDERED_GFX | if depth { WRITE_DEPTH } else { 0 };
+        let mat = effects.surface(Surface::new(0, flags, 0., 0.).with_blend(5 | 6 << 4));
+        let start = batch.vertices.len() as u32;
+        batch.vertices.extend(
+            [[-1., 1., z], [1., 1., z], [-1., -1., z], [1., -1., z]]
+                .map(|p| Vertex::new(p, [0., 0., 1.], [0.; 2]).tint(rgba(tint), rgba(tint))),
+        );
+        batch.tri_layer([start, start + 1, start + 3], mat, i as u32 + 1);
+        batch.tri_layer([start, start + 3, start + 2], mat, i as u32 + 1);
+    }
+    effects.world_mesh(&batch).unwrap();
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let p = h.pixel(f, &effects.finish());
+    assert_radiance(
+        "depth-tested GFX keeps layer order and a later sheet fails write-Z",
+        p,
+        [0.625, 0.75, 0.625],
+    );
+    assert!((p.1 - depth_at(f, -4. * Vec3::Z)).abs() < 1e-5);
+
+    let ground = |y| [[-2., y, 2.], [2., y, 2.], [-2., y, -2.], [2., y, -2.]];
+    let mut b = Builder::default();
+    let floor = quad(&mut b, ground(0.), [0., 1., 0.], 0, TERRAIN, u32::MAX);
+    put(&mut b, floor);
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let mut decals = Builder::default();
+    let projector = |y| [[-1., y, 1.], [1., y, 1.], [-1., y, -1.], [1., y, -1.]];
+    decals
+        .project_decal(
+            projector(0.2),
+            [[0.5; 2]; 4],
+            [rgba([1., 0., 0., 1.]); 4],
+            0,
+            5 | 6 << 4 | CLAMP_UV,
+        )
+        .unwrap();
+    decals
+        .project_decal(
+            projector(4.2),
+            [[0.5; 2]; 4],
+            [rgba([0., 1., 0., 1.]); 4],
+            0,
+            5 | 6 << 4,
+        )
+        .unwrap();
+    let projected = decals.finish();
+    let mut f = test_frame(3. * Vec3::Y, -Vec3::Y, 3);
+    f.terrain = [16., 16., 1., 16.];
+    let p = h.pixel(f, &projected);
+    assert_radiance(
+        "projected only onto the hit inside the decal box",
+        p,
+        [1., 0., 0.],
+    );
+    assert!((p.1 - depth_at(f, Vec3::ZERO)).abs() < 1e-5);
+
+    let mut b = Builder::default();
+    let floor = quad(&mut b, ground(0.), [0., 1., 0.], 0, 0, u32::MAX);
+    put(&mut b, floor);
+    let cloud = quad(
+        &mut b,
+        ground(4.),
+        [0., 1., 0.],
+        0,
+        CLOUD | BLEND | EMISSIVE,
+        rgba([1., 1., 1., 0.5]),
+    );
+    put(&mut b, cloud);
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    h.ray.settings.lighting = true;
+    h.ray.settings.shadows = true;
+    h.ray.settings.soft_sun = false;
+    f.sun = [0., 1., 0., 1.];
+    f.ambient = [0.; 4];
+    f.sun_color = [1.; 4];
+    f.options[0] = CLOUD_DETAIL;
+    assert_radiance(
+        "authored cloud opacity transmits only part of noon sun",
+        h.pixel(f, &empty),
+        [1. - 0.72 * (128. / 255.); 3],
+    );
+    f.options[0] = 0;
+    assert_radiance(
+        "cloud detail gate includes its shadow",
+        h.pixel(f, &empty),
+        [1.; 3],
+    );
+    eprintln!("Lighter: no-depth GFX order, bounded decal projection and cloud shadow passed");
 }
 
 fn exercise_water_art(h: &mut Harness) {
