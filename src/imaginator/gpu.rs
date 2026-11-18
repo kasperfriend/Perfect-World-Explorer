@@ -382,9 +382,13 @@ fn lamp_at(light: Light, point: vec3<f32>, normal: vec3<f32>, seed: ptr<function
   let origin = point + normal * 0.02 + dir * 0.02;
   if occluded(origin, dir, d * 0.999) { return vec3<f32>(0.0); }
  }
- // Same windowed inverse-square as the CPU tracer, so both agree.
+ // Same windowed inverse-square as the CPU tracer, so both agree. The
+ // `reference` factor normalises it to a quarter of the light's own range,
+ // without which a 0..1 client colour is ~0.01 at ten units and every lamp
+ // traces to nothing.
  let window = 1.0 - d2 / r2;
- let falloff = window * window / (d2 + 1.0);
+ let reference = r2 * 0.0625;
+ let falloff = window * window * reference / (d2 + 1.0);
  return light.colour.rgb * (cos * falloff);
 }
 

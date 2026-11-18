@@ -194,9 +194,10 @@ pub fn capture(sources: &Sources<'_>, budget: CaptureBudget) -> Arc<Scene> {
     // what a frame is *read* by, so they get their reserves before the terrain
     // walker is allowed to spend whatever is left.
     capture_water(&mut b, sources.water);
+    let water_triangles = b.triangles.len();
     let after_water = b.triangles.len();
     b.ceiling = Some(after_water + reserve(&b.budget.clone(), RESERVE_SCENERY));
-    capture_scenery(&mut b, sources.objects, sources.ornaments);
+    let ornaments_captured = capture_scenery(&mut b, sources.objects, sources.ornaments);
     let after_scenery = b.triangles.len();
     b.ceiling = Some(after_scenery + reserve(&b.budget.clone(), RESERVE_TREES));
     if budget.trees {
@@ -204,14 +205,22 @@ pub fn capture(sources: &Sources<'_>, budget: CaptureBudget) -> Arc<Scene> {
             capture_trees(&mut b, trees, sources.scene);
         }
     }
+    let tree_triangles = b.triangles.len() - after_scenery;
     // Terrain takes the rest. It is the one producer that degrades gracefully:
     // thinning it leaves a slightly coarser ground, while dropping buildings
     // leaves holes in the picture.
     b.ceiling = None;
+    let before_terrain = b.triangles.len();
     capture_terrain(&mut b, sources.map);
+    let terrain_triangles = b.triangles.len() - before_terrain;
     let triangles = std::mem::take(&mut b.triangles);
     let stats = SceneStats {
         triangles: triangles.len(),
+        terrain_triangles,
+        scenery_triangles: after_scenery - water_triangles,
+        tree_triangles,
+        water_triangles,
+        ornaments_captured,
         materials: material::COUNT as usize,
         nodes: 0,
         clipped: b.clipped,
@@ -335,11 +344,18 @@ fn basis(v: [f32; 3]) -> V3 {
     }
 }
 
-fn capture_scenery(b: &mut Builder, objects: &Objects, ornaments: &[Ornament]) {
+/// Returns how many ornaments a model was actually placed for.
+///
+/// An ornament whose BMD is not resident is skipped, and that count is the only
+/// honest answer to "how much scenery did the capture see". Reporting the number
+/// of placements in the map instead is what made the log claim the whole world
+/// had been traced.
+fn capture_scenery(b: &mut Builder, objects: &Objects, ornaments: &[Ornament]) -> usize {
+    let mut captured = 0;
     for (index, ornament) in ornaments.iter().enumerate() {
         if !b.has_room() {
             b.clipped = true;
-            return;
+            return captured;
         }
         if !b.within(ornament.position[0], ornament.position[2]) {
             continue;
@@ -348,6 +364,7 @@ fn capture_scenery(b: &mut Builder, objects: &Objects, ornaments: &[Ornament]) {
             // Not resident: the tracer's picture grows as this streams in.
             continue;
         };
+        captured += 1;
         let base = V3::from_array(model.position);
         let y_axis = basis(model.up);
         let z_axis = basis(model.direction);
@@ -378,6 +395,7 @@ fn capture_scenery(b: &mut Builder, objects: &Objects, ornaments: &[Ornament]) {
             }
         }
     }
+    captured
 }
 
 fn capture_trees(b: &mut Builder, trees: &Trees, scene: &WorldScene) {

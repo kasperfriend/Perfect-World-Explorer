@@ -4092,9 +4092,12 @@ fn imaginator_lights(
         .into_iter()
         .take(MAX_TRACED_LIGHTS)
         .map(|(_, l)| {
-            // The client's diffuse is authored for its own tone mapping; the
-            // tracer works in linear radiance, so the colour is used as-is and
-            // scaled by the range, which is how a big lamp reads brighter.
+            // The client's diffuse is used as-is: `PointLight::irradiance`
+            // normalises its own inverse-square to a quarter of the light's
+            // range, so the colour means radiance at that distance and is in the
+            // same units as the sun and sky terms. This used to say "scaled by
+            // the range" while the code was `let scale = 1.0;` - a comment that
+            // described a fix nobody had made.
             let scale = 1.0;
             crate::imaginator::tracer::PointLight {
                 position: crate::imaginator::math::v3(l.position[0], l.position[1], l.position[2]),
@@ -4629,11 +4632,22 @@ pub fn run(
                     ..crate::imaginator::capture::CaptureBudget::default()
                 },
             );
+            // Say what was *captured*, not what is in the map. The old line
+            // printed the number of ornament placements and called it "resident
+            // ornaments", which reads as though the whole world had been traced;
+            // `capture_scenery` skips every model that is not resident yet, and
+            // on a streaming world that is most of them. A reader trying to
+            // explain a half-empty picture was being told the picture was full.
             eprintln!(
-                "Imaginator: captured {} triangles ({} tree placements, {} resident ornaments)",
+                "Imaginator: captured {} triangles — terrain {}, scenery {} ({} of {} ornaments \
+                 had a resident model), trees {}, water {}",
                 scene.stats.triangles,
-                t.trees.placements.len(),
-                t.objects.ornaments.len()
+                scene.stats.terrain_triangles,
+                scene.stats.scenery_triangles,
+                scene.stats.ornaments_captured,
+                t.objects.ornaments.len(),
+                scene.stats.tree_triangles,
+                scene.stats.water_triangles
             );
             scene
         });

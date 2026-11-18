@@ -459,6 +459,19 @@ pub struct Scene {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SceneStats {
     pub triangles: usize,
+    /// Per-producer breakdown of what actually made it into the soup.
+    ///
+    /// The load-time log used to print `t.objects.ornaments.len()` and call it
+    /// "resident ornaments" - the number of placements in the map, not the
+    /// number that were loaded and captured. It read as though the whole world
+    /// had been traced when `capture_scenery` had in fact skipped every model
+    /// that was not resident yet. These counts are the honest ones.
+    pub terrain_triangles: usize,
+    pub scenery_triangles: usize,
+    pub tree_triangles: usize,
+    pub water_triangles: usize,
+    /// Ornaments a model was actually placed for, not placements in the map.
+    pub ornaments_captured: usize,
     pub materials: usize,
     pub nodes: usize,
     /// True when the capture clipped geometry (block window or distance), which

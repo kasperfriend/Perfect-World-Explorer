@@ -144,8 +144,17 @@ impl PointLight {
         }
         // Windowed inverse-square: `(1 - d²/r²)²` reaches exactly zero at `range`
         // with no discontinuity in the value, only in the gradient.
+        //
+        // The inverse-square is normalised so a light reads at a sensible
+        // strength at a sensible distance. Without that, a client colour in
+        // 0..1 divided by `d²` is ~0.01 at ten units - invisible next to a sun
+        // of ~1 - so every lamp, fire and lit window traced to nothing. The
+        // reference distance is a quarter of the light's own range, which is
+        // where a lamp is expected to matter, so `colour` now means "radiance
+        // at a quarter range" and the units match the sun and sky terms.
         let window = 1. - distance_squared / range_squared;
-        let falloff = window * window / (distance_squared + 1.);
+        let reference = range_squared * 0.0625;
+        let falloff = window * window * reference / (distance_squared + 1.);
         (self.colour * (cos * falloff), distance)
     }
 }
@@ -1336,5 +1345,38 @@ mod tests {
             "water must keep the core's reflection when off"
         );
         assert!(with > 0., "water must get the traced reflection when on");
+    }
+
+    /// A lamp has to deliver visible light at the range it is authored for.
+    ///
+    /// The falloff was a raw `1/d²`, so a client colour in 0..1 came out around
+    /// 0.01 at ten units - nothing beside a sun of roughly 1. Every lamp, fire
+    /// and lit window in the map traced to essentially zero, which is why
+    /// point lights were reported as invisible. The inverse-square is now
+    /// normalised to a quarter of the light's own range.
+    #[test]
+    fn a_lamp_is_visible_at_the_distance_it_matters() {
+        let light = PointLight {
+            position: v3(0., 0., 0.),
+            range: 40.,
+            colour: v3(1., 1., 1.),
+        };
+        // A surface ten units away, facing the lamp.
+        let (radiance, distance) = light.irradiance(v3(10., 0., 0.), v3(-1., 0., 0.));
+        assert!((distance - 10.).abs() < 1e-4);
+        assert!(
+            radiance.x > 0.15,
+            "a lamp at 10 units should be a visible fraction of a sun, got {}",
+            radiance.x
+        );
+        // It still falls off with distance.
+        let (farther, _) = light.irradiance(v3(20., 0., 0.), v3(-1., 0., 0.));
+        assert!(farther.x < radiance.x, "falloff must still fall off");
+        // And it is exactly zero outside its range, with no shell artifact.
+        let (outside, _) = light.irradiance(v3(45., 0., 0.), v3(-1., 0., 0.));
+        assert_eq!(outside.x, 0.);
+        // A surface facing away receives nothing.
+        let (behind, _) = light.irradiance(v3(10., 0., 0.), v3(1., 0., 0.));
+        assert_eq!(behind.x, 0.);
     }
 }
