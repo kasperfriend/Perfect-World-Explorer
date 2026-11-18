@@ -1089,6 +1089,34 @@ fn format_unix_timestamp(seconds: i64) -> String {
 
 /// Open one archive just far enough to name its container, version and entry
 /// count. Errors are recorded on the row, never dropped.
+/// The `.pkx` that carries the rest of a split package, when one sits beside
+/// the `.pck`.
+///
+/// The 1.5.2 client ships `models.pck` at exactly `MAX_FILE_PACKAGE`
+/// (`0x7fffff00`) next to `models.pkx`, and reads the pair as one archive.
+/// Only a `.pck` that reaches that limit can have a continuation, so a stray
+/// `.pkx` beside a small pack is not treated as one.
+fn split_continuation(element: &Path, name: &str) -> Option<PathBuf> {
+    use std::io::Read;
+    let pck = find_file(element, name)?;
+    let size = fs::metadata(&pck).ok()?.len();
+    let mut prefix = [0u8; 12];
+    fs::File::open(&pck).ok()?.read_exact(&mut prefix).ok()?;
+    if prefix[0..4] != 0x4dca23efu32.to_le_bytes()
+        || prefix[8..12] != 0x56a089b7u32.to_le_bytes()
+    {
+        return None;
+    }
+    let declared = u32::from_le_bytes(prefix[4..8].try_into().ok()?) as u64;
+    // The continuation is only the explanation when the package claims to be
+    // larger than the half on disk; a pack that fits needs no `.pkx`.
+    if declared <= size {
+        return None;
+    }
+    let stem = name.strip_suffix(".pck")?;
+    find_file(element, &format!("{stem}.pkx"))
+}
+
 fn scan_archive(element: &Path, name: &str) -> ArchiveInfo {
     let mut info = ArchiveInfo {
         name: name.into(),
@@ -1109,6 +1137,12 @@ fn scan_archive(element: &Path, name: &str) -> ArchiveInfo {
             return info;
         }
     };
+    // A `.pck` at `MAX_FILE_PACKAGE` is one half of a split archive; the rest
+    // is in the `.pkx` of the same stem. `src/pck.rs` is handed a single open
+    // file and cannot follow the continuation, so the split is named here with
+    // the file that holds the other half instead of being reported as a
+    // truncated package.
+    let continuation = split_continuation(element, name);
     // Retail v2 PCK first, then the Angelica trailer the config packs use.
     let (kind, directory) = match crate::pck::directory(&mut file) {
         Ok(entries) => (ContainerKind::Pck, Ok(entries)),
@@ -1117,6 +1151,13 @@ fn scan_archive(element: &Path, name: &str) -> ArchiveInfo {
             Err(angelica_error) => (
                 ContainerKind::Unknown,
                 Err(format!("{pck_error}; {angelica_error}")),
+                Err(match continuation {
+                    Some(pkx) => format!(
+                        "{pck_error}; {angelica_error} · the other half is in {}",
+                        pkx.display()
+                    ),
+                    None => format!("{pck_error}; {angelica_error}"),
+                }),
             ),
         },
     };
@@ -1327,6 +1368,39 @@ mod tests {
         // `gshop.data` header stamp from the 1.4.2 client (0x5ccc5f37).
         assert_eq!(format_unix_timestamp(0x5ccc_5f37), "2019-05-03 15:33:11");
         assert_eq!(format_unix_timestamp(0), "1970-01-01 00:00:00");
+    }
+
+    /// A `.pck` at `MAX_FILE_PACKAGE` is one half of a split archive. The scan
+    /// has to say where the other half is: its directory reader is handed a
+    /// single file, and "unsupported PCK version" or "bad package end offset"
+    /// for a pack that is merely continued elsewhere is a fault the operator
+    /// cannot act on.
+    #[test]
+    fn a_split_pack_names_the_pkx_that_holds_its_other_half() {
+        let root = std::env::temp_dir().join(format!("pw-split-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        // A prefix whose declared size is past the file, which is what the
+        // first half of a split archive looks like.
+        let mut pck = vec![0u8; 4096];
+        pck[0..4].copy_from_slice(&0x4dca23efu32.to_le_bytes());
+        pck[4..8].copy_from_slice(&0x7fff_ff00u32.to_le_bytes());
+        pck[8..12].copy_from_slice(&0x56a089b7u32.to_le_bytes());
+        fs::write(root.join("models.pck"), &pck).unwrap();
+        assert_eq!(
+            split_continuation(&root, "models.pck"),
+            None,
+            "a pack with no .pkx beside it has no continuation"
+        );
+        fs::write(root.join("models.pkx"), []).unwrap();
+        assert_eq!(
+            split_continuation(&root, "models.pck"),
+            Some(root.join("models.pkx"))
+        );
+        // A small pack never has one, whatever sits next to it.
+        fs::write(root.join("gfx.pck"), &pck[..2048]).unwrap();
+        assert_eq!(split_continuation(&root, "gfx.pck"), None);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -27,6 +27,9 @@
 #                                     the teleport fallback points)
 #   tools/offline_harness.sh material build+test the terrain material set and the
 #                                     missing-texture placeholder the client paints#
+#   tools/offline_harness.sh scene    run the real `src/scene.rs` reader over every
+#                                     ECWLD in a directory, so cross-version map
+#                                     coverage is measured rather than assumed
 # Everything lands in target/offline/, which .gitignore already excludes.
 #
 # The real `flate2`, `goblin` and a correct SHA-256 are built here from pinned
@@ -707,3 +710,56 @@ EOF
             "$REPO/src/view_settings.rs" "$REPO/src/client_weather.rs" \
             "$REPO/src/sky_transition.rs" "$REPO/src/scene.rs" "$REPO/src/model_dds.rs" "$REPO/src/skin.rs" "$REPO/src/skeleton.rs" "$REPO/src/skeleton_pose.rs" "$REPO/src/skin_pose.rs" "$REPO/src/model_asset.rs" "$REPO/src/model_material.rs" ;;
     *) echo "usage: $0 {setup|check|test|fmt|client|water|gfx|music|material}" >&2; exit 2 ;;esac
+    scene) toolchain; sysroot; deps
+        # Sweep real `.ecwld` files with the real reader. Map files are the only
+        # scenery input, and the body layouts they carry differ by client
+        # version, so a directory of them is the honest test corpus.
+        mkdir -p "$OUT/scene"
+        cat > "$OUT/scene/sweep.rs" <<EOF
+#[path = "$REPO/src/scene.rs"]
+pub mod scene;
+use std::path::Path;
+fn main() {
+    let dir = std::env::args().nth(1).expect("ecwld directory");
+    let mut files: Vec<_> = std::fs::read_dir(Path::new(&dir))
+        .expect("read directory").flatten().map(|e| e.path()).collect();
+    files.sort();
+    let (mut ok, mut failed) = (0u32, 0u32);
+    for p in files {
+        if p.extension().and_then(|e| e.to_str()) != Some("ecwld") { continue; }
+        let data = std::fs::read(&p).expect("read ecwld");
+        let version = data.get(4..8)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .unwrap_or(0);
+        match scene::Scene::parse(&data) {
+            Ok(s) => {
+                ok += 1;
+                let mut n = [0usize; 10];
+                for b in &s.blocks {
+                    n[0]+=b.trees.len(); n[1]+=b.water.len(); n[2]+=b.grass.len();
+                    n[3]+=b.ornaments.len(); n[4]+=b.boxes.len(); n[5]+=b.effects.len();
+                    n[6]+=b.models.len(); n[7]+=b.critters.len(); n[8]+=b.beziers.len();
+                    n[9]+=b.sounds.len();
+                }
+                println!("ok   {:24} v{:<3} blocks={:<6} {}x{} bs={:.0} types={}/{} trees={} water={} grass={} orn={} boxes={} fx={} models={} critters={} bez={} snd={}",
+                    p.file_name().unwrap().to_string_lossy(), version, s.blocks.len(),
+                    s.rows, s.cols, s.block_size, s.tree_types.len(), s.grass_types.len(),
+                    n[0],n[1],n[2],n[3],n[4],n[5],n[6],n[7],n[8],n[9]);
+            }
+            Err(error) => {
+                failed += 1;
+                println!("FAIL {:24} v{:<3} {error}",
+                    p.file_name().unwrap().to_string_lossy(), version);
+            }
+        }
+    }
+    println!("ecwld: {ok} ok, {failed} failed");
+    if failed > 0 { std::process::exit(1); }
+}
+EOF
+        "$RUSTC" --crate-name scenesweep --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=2 -L "$OUT" --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            "$OUT/scene/sweep.rs" -o "$OUT/scenesweep"
+        shift || true
+        exec "$OUT/scenesweep" "${1:-$REPO/google_drive/scenecorpus}" ;;
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|gfx|music|material|scene}" >&2; exit 2 ;;esac
