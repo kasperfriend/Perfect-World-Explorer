@@ -33,12 +33,15 @@ impl FixtureRoot {
             image::ImageFormat::Tga,
         );
         let keys = crate::sky_gpu::SKY_DEFAULTS.map(crate::sky_gpu::sky_pack_key);
-        let mut entries: Vec<_> = keys
+        let entries: Vec<_> = keys
             .iter()
             .map(|key| (key.as_str(), sky.as_slice()))
             .collect();
-        entries.push(("textures/lighter_wall.tga", &wall));
         crate::pck::write_test_archive(&root.0.join("textures.pck"), &entries);
+        crate::pck::write_test_archive(
+            &root.0.join("building.pck"),
+            &[("building/lighter_wall.tga", &wall)],
+        );
         let bmd = bmd_fixture();
         crate::pck::write_test_archive(
             &root.0.join("litmodels.pck"),
@@ -119,7 +122,7 @@ fn bmd_fixture() -> Vec<u8> {
         &mut b,
         [[10., 1., 0.], [14., 1., 0.], [10., 5., 0.], [14., 5., 0.]],
         [0., 0., 1.],
-        "textures/lighter_wall.tga",
+        "building/lighter_wall.tga",
     );
     for x in [2., -11.] {
         quad(
