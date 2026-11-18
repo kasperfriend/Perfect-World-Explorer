@@ -122,7 +122,7 @@ version or the content type.
 ## Reading the files inside
 
 A directory that parses proves nothing about its members, so the `content` mode
-runs the owning reader over each one. Over the same corpus: **9 188 members
+runs the owning reader over each one. Over the same corpus: **9 190 members
 read, 3 failed**.
 
 | extension | count | check |
@@ -133,6 +133,7 @@ read, 3 failed**.
 | `sdr` | 60 | shader text |
 | `mox` | 44 | `MOXBFRAME:` magic — **no reader in this project** |
 | `dds`,`tga`,`bmp`,`jpg` | 4891 | magic and header, not pixels |
+| `ttf` | 2 | sfnt magic (`00 01 00 00`), not glyphs |
 
 Images are checked by header rather than by pixel: the offline toolchain has
 only a stub `image`, but DDS carries a magic and a 124-byte header, TGA a type
@@ -158,8 +159,12 @@ and are excluded from the exit status:
   archive's content, not a misread offset.
 
 What this still does *not* cover: none of these payloads are decoded to pixels
-offline. `.ttf`, `.xls`, `.lua`, `.txt`, `.ini` and the remaining extensions are
-opaque blobs to this project and are counted in the inventory only.
+offline. `.xls`, `.lua`, `.txt`, `.ini`, `.dtf`/`.stf`/`.htf` (interface
+descriptors), `.sgc`/`.scc` (script) and the remaining extensions are opaque
+blobs to this project and are counted in the inventory only.
+
+Robustness over the four largest packs (mutation of the trailer and record run,
+never the payload): 1 000 rounds, 130 accepted, 870 refused, **0 panics**.
 
 ## Scenery
 
