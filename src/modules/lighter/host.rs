@@ -22,6 +22,8 @@ mod scenery;
 mod terrain_fidelity;
 #[path = "vegetation.rs"]
 mod vegetation;
+#[path = "water_feed.rs"]
+mod water_feed;
 pub(super) use scenery::{SceneryStream, Snapshot as ScenerySnapshot};
 use vegetation::{read_tree, Tree};
 
@@ -38,6 +40,7 @@ pub(super) struct Feed {
     terrain: [f32; 4],
     area_table: u32,
     near_bounds: [f32; 4],
+    cutoff: bool,
     far: Vec<(crate::terrain_residency::Span, Mesh)>,
     accel: AccelCache,
     trees: Vec<Option<Tree>>,
@@ -47,6 +50,7 @@ pub(super) struct Feed {
     tree_scale: f32,
     grass: vegetation::Grass,
     waves: Vec<u32>,
+    water: water_feed::Water,
     sky: lighter::sky::Sky,
     authored_mips: bool,
 }
@@ -113,6 +117,7 @@ impl Feed {
                     .push(result.base.images(frame, 128, Filter::Data)?);
             }
         }
+        result.water = water_feed::Water::load(t, &mut result.base)?;
         result.tree_archive_missing = !t.element.join("trees.pck").is_file();
         for tree in &t.trees.types {
             let Some(tree) = tree else {
@@ -255,6 +260,7 @@ impl Feed {
         for &light in &self.static_lights {
             builder.light(light);
         }
+        self.cutoff = m.detail.terrain_cutoff;
         let mut inventory = Inventory::default();
         let terrain_id = builder.surface(Surface::new(0, TERRAIN, 0., 0.));
         for block in &m.spans {
@@ -315,8 +321,7 @@ impl Feed {
                 }
             }
         }
-        let water_mesh = water_mesh(m, &mut builder)?;
-        builder.world_mesh(&water_mesh)?;
+        self.water.append(m, &mut builder)?;
         inventory[Class::Water] = m.water_coverage;
         let extras = &m.indices[m.terrain_end as usize..m.water_start as usize];
         if !extras.is_empty() {
@@ -400,15 +405,25 @@ impl Feed {
             .regional_light
             .map_or([0.68; 3], |l| l.diffuse.map(srgb));
         let phase = crate::water_gpu::normal_phase(f.elapsed64);
+        let wave_angle = crate::water_gpu::normal_offset_angle(f.elapsed64).to_bits();
         let waves = if self.waves.is_empty() {
-            [0; 4]
+            [
+                0,
+                0,
+                0,
+                if self.water.simple_frame(f.elapsed64) != 0 {
+                    wave_angle
+                } else {
+                    0
+                },
+            ]
         } else {
             let frame = phase.floor() as usize % self.waves.len();
             [
                 self.waves[frame],
                 self.waves[(frame + 1) % self.waves.len()],
                 phase.fract().to_bits(),
-                crate::water_gpu::normal_offset_angle(f.elapsed64).to_bits(),
+                wave_angle,
             ]
         };
         let disc = |p: [f32; 4]| {
@@ -423,6 +438,8 @@ impl Feed {
         } else {
             [air.start, air.end, 1., 0.]
         };
+        let cutoff = self.cutoff.then_some(self.near_bounds);
+        let current_body = self.water.at(camera.pos, cutoff);
         lighter::Frame {
             vp: matrix.to_cols_array_2d(),
             inv_vp: matrix.inverse().to_cols_array_2d(),
@@ -458,7 +475,7 @@ impl Feed {
                     lighter::CULL_BUILDINGS
                 } else {
                     0
-                } | if camera.underwater_depth > 0. {
+                } | if current_body != 0 {
                     lighter::UNDERWATER
                 } else {
                     0
@@ -490,6 +507,9 @@ impl Feed {
             sampling: [0; 4],
             material_time: [f.fog_range[3], f.grass_eye[3], 0., 0.],
             grass_history: f.grass_history,
+            shore_offsets: self.water.shore_offsets(f.elapsed),
+            resident_bounds: cutoff.unwrap_or([-1.0e9, 1.0e9, -1.0e9, 1.0e9]),
+            water_effects: [self.water.simple_frame(f.elapsed64), current_body, 0, 0],
         }
     }
 }
@@ -658,20 +678,6 @@ fn stitch_patch(far: &Mesh, edges: &Perimeter, bounds: [f32; 4], surface: u32) -
         out.tri(local, surface);
     }
     out
-}
-
-fn water_mesh(m: &MeshData, builder: &mut Builder) -> Result<Mesh, String> {
-    let mut water = span(&m.vertices, &m.indices[m.water_start as usize..], 0, |v| {
-        rgba(v.color)
-    })?;
-    for batch in &m.water_batches {
-        let flags = WATER | if batch.simple { SIMPLE_WATER } else { 0 };
-        let id = builder.surface(Surface::new(0, flags, 0., 0.));
-        water.surfaces[((batch.start - m.water_start) / 3) as usize
-            ..((batch.end - m.water_start) / 3) as usize]
-            .fill(id);
-    }
-    Ok(water)
 }
 
 pub(super) type GrassTiles = HashMap<[usize; 2], Arc<Tile>>;

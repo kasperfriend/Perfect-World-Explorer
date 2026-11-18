@@ -550,6 +550,7 @@ struct MeshData {
     object_start: u32,
     water_start: u32,
     water_batches: Vec<WaterBatch>,
+    ray_water: Vec<(u32, u32, u32, bool)>, // export id, first/end indices, simple style
     water_coverage: RayCounts,
     local_pages: Vec<crate::world_objects::Page>,
     /// Optional ray feed prepared on the same loader as the native pages.
@@ -1542,6 +1543,7 @@ fn build(
     // Keep opaque indices separate so water can sample reflected/refracted scene passes.
     let water_start = indices.len() as u32;
     let mut water_batches: Vec<WaterBatch> = Vec::new();
+    let mut ray_water = Vec::new();
     let mut water_coverage = RayCounts::default();
     let mut areas: Vec<_> = t.water.iter().collect();
     areas.sort_by(|a, b| a.height.total_cmp(&b.height));
@@ -1656,6 +1658,9 @@ fn build(
             }
         } else {
             water_coverage.loaded += 1;
+            if ray_scenery.is_some() {
+                ray_water.push((a.export_id, start, end, a.simple));
+            }
             if let Some(last) = water_batches.last_mut().filter(|last| {
                 last.height == a.height && last.simple == a.simple && last.end == start
             }) {
@@ -1738,6 +1743,7 @@ fn build(
         object_start,
         water_start,
         water_batches,
+        ray_water,
         water_coverage,
         local_pages,
         ray_scenery,

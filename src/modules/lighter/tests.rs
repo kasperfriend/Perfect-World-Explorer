@@ -688,6 +688,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_ray_texture_filter(&mut h);
     exercise_material_channels(&mut h);
     exercise_vegetation(&mut h);
+    exercise_water_art(&mut h);
     exercise_chunk_scaling(&mut h);
     if mode == Mode::Software {
         exercise_reprojection_shader(&h);
@@ -1162,6 +1163,105 @@ fn exercise_material_channels(h: &mut Harness) {
     );
     assert!((pixel.1 - depth_at(frame, -5. * Vec3::Z)).abs() < 1e-6);
     eprintln!("Lighter: both authored bake endpoints, relighting, face stages, sidedness and normal map passed");
+}
+
+fn exercise_water_art(h: &mut Harness) {
+    let empty = Builder::default().finish();
+    h.ray.settings.lighting = false;
+    h.ray.settings.shadows = false;
+    h.ray.settings.reflections = true;
+    h.ray.settings.bounces = 0;
+    let ground = |y| [[-2., y, 2.], [2., y, 2.], [-2., y, -2.], [2., y, -2.]];
+    let mut bank = Textures::default();
+    let wave = bank
+        .tile([1, 1], 1, textures::Filter::ColorMask, |_, _| {
+            rgba([0., 0., 1., 0.25])
+        })
+        .unwrap();
+    let mut b = Builder::default();
+    let floor = quad(
+        &mut b,
+        ground(-2.),
+        [0., 1., 0.],
+        0,
+        EMISSIVE,
+        rgba([1., 0., 0., 1.]),
+    );
+    put(&mut b, floor);
+    let water = quad(
+        &mut b,
+        ground(0.),
+        [0., 1., 0.],
+        0,
+        WATER | SIMPLE_WATER,
+        u32::MAX,
+    );
+    b.place(water, Transform::translation([-3., 0., 0.]))
+        .unwrap();
+    let shore = quad(
+        &mut b,
+        ground(0.2),
+        [0., 1., 0.],
+        wave,
+        SHORE | BLEND | EMISSIVE | PRIMARY_ONLY | IGNORE_TEXTURE_ALPHA,
+        u32::MAX,
+    );
+    put(&mut b, shore);
+    // This equal-height body is a separate instance and is not water in the dry gap.
+    b.place(water, Transform::translation([7., 0., 0.]))
+        .unwrap();
+    h.ray.install(Ok((b.finish(), bank)));
+    let at = |x| {
+        let mut f = test_frame(Vec3::new(x, 3., 0.), -Vec3::Y, 3);
+        f.resident_bounds = [-20., 20., -20., 20.];
+        f.options[0] = WATER_MIRROR;
+        f.water_effects[0] = wave;
+        f
+    };
+    let linear = |x: f32| {
+        if x <= 0.04045 {
+            x / 12.92
+        } else {
+            ((x + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let alpha = 64. / 255.;
+    let expected = [37. / 255., 79. / 255., 85. / 255.]
+        .into_iter()
+        .zip([0., 0., 1.])
+        .map(|(a, b)| linear(a * (1. - alpha) + b * alpha))
+        .collect::<Vec<_>>();
+    for x in [-3., 7.] {
+        let f = at(x);
+        let p = h.pixel(f, &empty);
+        assert_radiance(
+            "native simple-water alpha/color stage",
+            p,
+            expected.as_slice().try_into().unwrap(),
+        );
+        assert!((p.1 - depth_at(f, Vec3::new(x, 0., 0.))).abs() < 1e-5);
+    }
+    let mut f = at(0.);
+    let expected_alpha =
+        ((0.5 * alpha * (1. - alpha) + alpha * alpha) * (1. - alpha) + alpha * alpha) * 0.6;
+    let p = h.pixel(f, &empty);
+    assert_radiance(
+        "native shoreline three-stage wave over dry bed",
+        p,
+        [1. - expected_alpha, 0., expected_alpha],
+    );
+    let depth = depth_at(f, -2. * Vec3::Y);
+    assert!(
+        (p.1 - depth).abs() < 1e-5,
+        "a shoreline overlay wrote water depth in the dry gap"
+    );
+    f.resident_bounds = [0.5, 20., -20., 20.];
+    assert_radiance(
+        "shoreline clipped without clipping the bed",
+        h.pixel(f, &empty),
+        [1., 0., 0.],
+    );
+    eprintln!("Lighter: distinct water bodies, dry gap, alternate-water stages and shoreline overlay passed");
 }
 
 fn exercise_vegetation(h: &mut Harness) {

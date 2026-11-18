@@ -17,6 +17,9 @@ struct Frame {
     sampling: vec4<u32>, // transport sequence (x); camera rays keep fixed strata
     material_time: vec4<f32>, // terrain night blend, grass fade enable, reserved
     grass_history: array<vec4<f32>,80>,
+    shore_offsets: vec4<f32>,
+    resident_bounds: vec4<f32>,
+    water_effects: vec4<u32>,
 }
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage,read> world: array<u32>;
@@ -50,6 +53,7 @@ const BAKED_COLOR_ONLY: u32 = 2097152u;
 const FOLIAGE: u32 = 4194304u;
 const PRIMARY_ONLY: u32 = 8388608u;
 const TREE_MATERIAL: u32 = 16777216u;
+const SHORE: u32 = 33554432u;
 const SOLID_MASK: u32 = 1u;
 const BLEND_MASK: u32 = 2u;
 const SHADOW_MASK: u32 = 4u;
@@ -447,6 +451,11 @@ fn accepts(hit: Hit, ray: Ray, q: Query) -> bool {
         || (q.purpose==WATER_TRANSMIT && (flags & NO_REFRACT)!=0u) { return false; }
     let cull = (flags & SINGLE_SIDED)!=0u ||
         (q.purpose==VIEW && (frame.options.x & CULL_BUILDINGS)!=0u && (flags & CULL_BACK)!=0u);
+    if (flags & SHORE)!=0u {
+        let xz = (ray.origin+ray.dir*hit.t).xz;
+        let bounds = frame.resident_bounds;
+        if any(xz<bounds.xz) || any(xz>=bounds.yw) { return false; }
+    }
     let inst = inst_addr(hit.instance);
     if (flags & TREE_MATERIAL)!=0u && !tree_lod_visible(m,inst,ray.pixel_seed) { return false; }
     if !cull && (flags & (CUTOUT|BLEND|WRITE_DEPTH))==0u { return true; }
@@ -502,6 +511,38 @@ fn tangent_normal(m: bool, inst: u32, v: vec3<u32>, scale: vec2<f32>, n: vec3<f3
     let orientation = select(-1.,1.,dot(bitangent,handed*(f*du.x-e*dv.x))>=0.);
     return norm(tangent*sample.x+bitangent*(orientation*sample.y)+n*sample.z);
 }
+fn shore_vertex(m: bool, v: u32) -> vec4<f32> {
+    let day = rgba(word(m,v+6u));
+    let night = rgba(word(m,v+7u));
+    let n = floor(clamp(1.-frame.sun.w,0.,1.)*255.);
+    let color = floor((day.rgb*(255.-n)+night.rgb*n)*(255./256.))/255.;
+    // Shore mesh vertices are already in world space. Fade in the vertex
+    // stage's xz plane (not at the intersection or in 3D).
+    let d = floats(m,v).xz-frame.eye.xz;
+    return vec4<f32>(color,day.a*max(1.-dot(d,d)/(400.*400.),0.));
+}
+fn shore_art(addr: u32, uv: vec2<f32>, taps: Taps, tint: vec4<f32>) -> vec4<f32> {
+    dependencies |= ANIM_WAVES;
+    // Recovered encoded texture-stage combiner. Authored shore strips are
+    // overlaid; they aren't water boundaries for reflected/transmitted rays.
+    var rgba_encoded = vec4<f32>(0.);
+    for (var stage=0u; stage<3u; stage++) {
+        let scale = select(1.,0.5,stage==0u);
+        let shift = vec2<f32>(select(0.,0.5,stage==1u),frame.shore_offsets[2u-stage]);
+        let t = filtered_tile(addr,uv*scale+shift,false,
+            Taps(taps.step*scale,max(0.,taps.lod+log2(scale)),taps.count));
+        let c = vec4<f32>(encoded(t.rgb),t.a);
+        rgba_encoded = select(mix(rgba_encoded,c,c.a),c*vec4<f32>(1.,1.,1.,0.5),stage==0u);
+    }
+    return vec4<f32>(linear(min(tint.rgb*rgba_encoded.rgb*2.,vec3<f32>(1.))),
+                     tint.a*rgba_encoded.a*0.6);
+}
+fn simple_water_art(uv: vec2<f32>, taps: Taps, angle: f32, addr: u32) -> vec4<f32> {
+    dependencies |= ANIM_WAVES;
+    let t = filtered_tile(addr,uv*2.5+0.0125*vec2<f32>(cos(angle),sin(angle)),false,taps);
+    let color = mix(vec3<f32>(37.,79.,85.)/255.,encoded(t.rgb),t.a);
+    return vec4<f32>(linear(color),min(t.a+160./255.,1.));
+}
 fn surface(hit: Hit, ray: Ray) -> Surface {
     let m = (hit.instance & DYNAMIC)!=0u;
     let inst = inst_addr(hit.instance);
@@ -524,6 +565,18 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
     // Bad/sufficiently grazing interpolated normals must not face away from
     // the incident ray. They never decide which side of the triangle we enter.
     if dot(n,face)<1.e-4 || dot(n,ray.dir)>=0. { n = face; }
+    if (flags & (SIMPLE_WATER|SHORE))!=0u {
+        var art = vec4<f32>(linear(tint_of(m,v,w).rgb),1.);
+        if (flags & SHORE)!=0u {
+            let addr = word(m,mat);
+            let tint = shore_vertex(m,v.x)*w.x+shore_vertex(m,v.y)*w.y+shore_vertex(m,v.z)*w.z;
+            art = shore_art(addr,uv,mesh_taps(addr,ray,hit,m,inst,v,vec2<f32>(1.)),tint);
+        } else if frame.water_effects.x!=0u {
+            let addr = frame.water_effects.x;
+            art = simple_water_art(uv,mesh_taps(addr,ray,hit,m,inst,v,vec2<f32>(2.5)),bitcast<f32>(frame.waves.w),addr);
+        }
+        return Surface(n,face,uv,art,flags,0.,-1.,vec3<f32>(0.),vec3<f32>(0.),vec3<f32>(0.),vec4<f32>(0.));
+    }
     let terrain = (flags & TERRAIN)!=0u;
     let grass = (flags & GRASS_MATERIAL)!=0u;
     let use_bake = (terrain || grass) && bake_enabled();
@@ -989,6 +1042,19 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
             path.weight *= t;
             if strongest(path.weight)<0.002 { break; }
             if (s.flags & WATER)!=0u {
+                // Alternate fixed-function water is a colored alpha layer over
+                // the bottom, not a normal-mapped specular interface.
+                let simple = (s.flags & SIMPLE_WATER)!=0u && frame.water_effects.x!=0u;
+                if simple {
+                    result += path.weight*s.color.rgb*select(s.color.a,1.,terminal);
+                    path.weight *= 1.-s.color.a;
+                    if terminal || strongest(path.weight)<0.002 { break; }
+                    path.ray = secondary(p,ray.dir,s.face,ray,solid.t);
+                    path.wet = s.face.y>=0.;
+                    path.purpose = WATER_TRANSMIT;
+                    path.depth++;
+                    continue;
+                }
                 if terminal {
                     result += path.weight*mix(frame.water_color.rgb,s.color.rgb,0.4);
                     break;
@@ -1079,7 +1145,7 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                 }
                 path.ray = secondary(p,d,s.face,ray,solid.t);
                 path.weight *= s.specular*total;
-                path.purpose = SPECULAR;
+                if path.purpose!=WATER_REFLECT && path.purpose!=WATER_TRANSMIT { path.purpose = SPECULAR; }
             } else {
                 let d = hemisphere(s.n,seed);
                 // Samples below the geometric face cannot carry radiance.
@@ -1087,7 +1153,7 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                 if dot(d,s.face)<=0. { break; }
                 path.ray = secondary(p,d,s.face,ray,solid.t);
                 path.weight *= (albedo/matte)*total;
-                path.purpose = DIFFUSE;
+                if path.purpose!=WATER_REFLECT && path.purpose!=WATER_TRANSMIT { path.purpose = DIFFUSE; }
             }
         }
         if !split { break; }

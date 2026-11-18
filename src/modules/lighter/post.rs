@@ -58,6 +58,7 @@ struct Stamp {
     texture_len: usize,
     mode: Mode,
     waves: [u32; 4],
+    water_art: [u32; 4],
     scroll: u32,
     sky_anchor: [f32; 2],
 }
@@ -88,6 +89,8 @@ impl History {
         stable.inv_vp = [[0.; 4]; 4];
         stable.eye[..3].fill(0.);
         stable.waves = [0; 4];
+        stable.water_effects[0] = 0;
+        stable.shore_offsets = [0.; 4];
         stable.air[3] = 0.;
         stable.sky_uv[..2].fill(0.);
         stable.sampling = [0; 4];
@@ -104,6 +107,12 @@ impl History {
             texture_len,
             mode,
             waves: frame.waves,
+            water_art: [
+                frame.water_effects[0],
+                frame.shore_offsets[0].to_bits(),
+                frame.shore_offsets[1].to_bits(),
+                frame.shore_offsets[2].to_bits(),
+            ],
             scroll: frame.air[3].to_bits(),
             sky_anchor: [frame.sky_uv[0], frame.sky_uv[1]],
         };
@@ -129,7 +138,7 @@ impl History {
                     previous_from_current = Some(old.vp * inv_vp);
                 }
                 stamp.camera_anchor = old.camera_anchor;
-                if old.waves != stamp.waves {
+                if old.waves != stamp.waves || old.water_art != stamp.water_art {
                     changed_animations |= ANIM_WAVES;
                 }
                 if old.scroll != stamp.scroll {

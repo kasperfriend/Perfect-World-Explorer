@@ -35,6 +35,7 @@ pub const BAKED_COLOR_ONLY: u32 = 1 << 21;
 pub const FOLIAGE: u32 = 1 << 22;
 pub const PRIMARY_ONLY: u32 = 1 << 23;
 pub const TREE_MATERIAL: u32 = 1 << 24;
+pub const SHORE: u32 = 1 << 25;
 pub const GRASS_WIND_SLOTS: usize = 80;
 
 // These bits also occupy the upper eight bits of a Vulkan TLAS instance.
@@ -379,6 +380,8 @@ pub enum ChunkKey {
     NearTerrain(usize, usize),
     FarTerrain(usize, usize),
     Scenery(i32, i32),
+    Water(u32),
+    ShoreWaves,
 }
 
 pub type Fingerprint = [u8; 32];
@@ -826,6 +829,22 @@ impl Builder {
         if let Some(id) =
             self.mesh_keyed(mesh, Some, |_, shape| MeshKey::Static(Some(key), shape))?
         {
+            self.place(id, Transform::IDENTITY)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn chunk_mapped(
+        &mut self,
+        key: ChunkKey,
+        mesh: &Mesh,
+        materials: &[u32],
+    ) -> Result<(), String> {
+        if let Some(id) = self.mesh_keyed(
+            mesh,
+            |i| materials.get(i as usize).copied(),
+            |_, shape| MeshKey::Static(Some(key), shape),
+        )? {
             self.place(id, Transform::IDENTITY)?;
         }
         Ok(())

@@ -194,6 +194,7 @@ jobs:
           cargo run --locked --bin terrain-memory-check -- --full-world
       - name: Install software Vulkan and virtual X11 for renderer checks
         run: |
+          set -o pipefail
           # Same flaky mirror as the build dependencies above: retry the install
           # instead of failing the three Vulkan checks behind it, and print apt's
           # own diagnosis as annotations if every attempt fails.
