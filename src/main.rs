@@ -29,6 +29,10 @@ mod angelica_pck;
 mod animation;
 mod bmd;
 mod bmd_baked;
+// The folder scan is filesystem + byte reading only, so `--diagnose-client`
+// works on any host with a client staged. It does read `pck`/`angelica_pck`,
+// and those are Windows-only in this binary, so the module follows them; the
+// `client-check` binary is the cross-platform form of the same report.
 #[cfg(windows)]
 mod client_detect;
 mod client_sun;
@@ -3277,6 +3281,10 @@ fn parse_diagnose_args(args: &[String]) -> Result<DiagnoseArgs, i32> {
 ///
 /// Exit status: `0` loadable (unknown versions are reported, not refused),
 /// `1` missing world/required archive, `2` bad usage.
+///
+/// Windows-only because it shares `pck`/`angelica_pck` with the viewer; the
+/// `client-check` binary prints exactly the same report on any host.
+#[cfg(windows)]
 fn diagnose_client(args: &[String]) -> i32 {
     let mut json = false;
     let mut path: Option<&str> = None;
@@ -3317,6 +3325,7 @@ fn diagnose_client(args: &[String]) -> i32 {
 
 /// The same flat JSON object `client-check --json` prints, hand-written because
 /// the crate has no serializer.
+#[cfg(windows)]
 fn print_client_scan_json(scan: &client_detect::Scan) {
     fn quote(text: &str) -> String {
         let mut out = String::with_capacity(text.len() + 2);
@@ -3756,11 +3765,24 @@ fn main() {
     if args.len() >= 2 {
         let flag = args[1].to_string_lossy().into_owned();
         if flag == "--diagnose-client" {
-            let rest: Vec<String> = args[2..]
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect();
-            std::process::exit(diagnose_client(&rest));
+            #[cfg(windows)]
+            {
+                let rest: Vec<String> = args[2..]
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                std::process::exit(diagnose_client(&rest));
+            }
+            // The scan itself needs no Windows API; it shares the archive
+            // readers with the viewer, which are Windows-only in this binary.
+            #[cfg(not(windows))]
+            {
+                eprintln!(
+                    "--diagnose-client is built into the Windows viewer; on this host run \
+                     `cargo run --bin client-check -- <folder>` for the same report"
+                );
+                std::process::exit(2);
+            }
         }
         if flag == "--diagnose-upscale" || flag == "--diagnose-framegen" {
             let rest: Vec<String> = args[2..]
