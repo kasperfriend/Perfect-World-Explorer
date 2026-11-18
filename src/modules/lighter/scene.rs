@@ -160,10 +160,11 @@ pub struct Surface {
     face_gloss: u32,
     diffuse: u32,
     blend: u32,      // D3D source and destination factors (0: default ray alpha)
-    glass: [u32; 2], // linear thin transmission tint, index of refraction
+    glass: [u32; 2], // linear transmission tint, signed IOR (negative: solid)
+    pbr: [u32; 2],   // metallic, perceptual roughness (-1: convert legacy gloss)
 }
 pub const SURFACE_WORDS: usize = std::mem::size_of::<Surface>() / 4;
-const _: () = assert!(SURFACE_WORDS == 24);
+const _: () = assert!(SURFACE_WORDS == 26);
 
 impl Surface {
     pub fn new(texture: u32, flags: u32, cutoff: f32, reflectance: f32) -> Self {
@@ -184,6 +185,7 @@ impl Surface {
             diffuse: u32::MAX,
             blend: 0,
             glass: [0; 2],
+            pbr: [0, (-1.0f32).to_bits()],
         }
     }
 
@@ -239,8 +241,28 @@ impl Surface {
         self.flags = (self.flags | GLASS) & !(BLEND | ORDERED_GFX | ADDITIVE);
         self.glass = [
             rgba([transmittance[0], transmittance[1], transmittance[2], 1.]),
-            ior.clamp(1.001, 3.).to_bits(),
+            if ior.is_finite() {
+                ior.clamp(1.001, 3.).to_bits()
+            } else {
+                1.5f32.to_bits()
+            },
         ];
+        self
+    }
+
+    pub fn with_solid_glass(self, transmittance: [f32; 3], ior: f32) -> Self {
+        let mut material = self.with_glass(transmittance, ior);
+        material.glass[1] |= 1 << 31;
+        material
+    }
+
+    pub fn with_pbr(mut self, metallic: f32, roughness: f32) -> Self {
+        if metallic.is_finite() && roughness.is_finite() {
+            self.pbr = [
+                metallic.clamp(0., 1.).to_bits(),
+                roughness.clamp(0.04, 1.).to_bits(),
+            ];
+        }
         self
     }
 

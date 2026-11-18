@@ -7,7 +7,7 @@ use scene::*;
 fn naga_validates_both_paths_and_emits_native_ray_queries() {
     use naga_rt as naga;
     for src in [
-        [PIXELS, BASE, SOFTWARE].concat(),
+        [PIXELS, BSDF, BASE, SOFTWARE].concat(),
         [PIXELS, include_str!("present.wgsl")].concat(),
         [PIXELS, post::SHADER].concat(),
     ] {
@@ -20,7 +20,7 @@ fn naga_validates_both_paths_and_emits_native_ray_queries() {
         .validate(&module)
         .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
     }
-    let shader = vulkan::shader(&[PIXELS, BASE, HARDWARE].concat())
+    let shader = vulkan::shader(&[PIXELS, BSDF, BASE, HARDWARE].concat())
         .expect("Vulkan ray-query WGSL to SPIR-V");
     assert_eq!(shader[0], 0x0723_0203);
     let mut opcodes = Vec::new();
@@ -682,6 +682,10 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_water_art(&mut h);
     exercise_effect_placement(&mut h);
     exercise_finite_emitters(&mut h);
+    exercise_dielectric_and_metal(&mut h);
+    if mode == Mode::Software {
+        exercise_bsdf_energy(&h);
+    }
     exercise_chunk_scaling(&mut h);
     if mode == Mode::Software {
         exercise_reprojection_shader(&h);
@@ -1156,6 +1160,202 @@ fn exercise_material_channels(h: &mut Harness) {
     );
     assert!((pixel.1 - depth_at(frame, -5. * Vec3::Z)).abs() < 1e-6);
     eprintln!("Lighter: both authored bake endpoints, relighting, face stages, sidedness and normal map passed");
+}
+
+fn exercise_dielectric_and_metal(h: &mut Harness) {
+    h.ray.settings.bounces = 2;
+    h.ray.settings.samples = 1;
+    h.ray.settings.physical_bsdf = true;
+    h.ray.settings.shadows = false;
+    h.ray.settings.lighting = true;
+    h.ray.settings.reflections = true;
+    let empty = Builder::default().finish();
+    let mut f = test_frame(Vec3::ZERO, -Vec3::Z, 3);
+    f.ambient = [0.; 4];
+    let scene = |solid: bool| {
+        let mut b = Builder::default();
+        let art = Surface::new(0, 0, 0., 0.);
+        let glass = if solid {
+            art.with_solid_glass([1.; 3], 1.5)
+        } else {
+            art.with_glass([1., 0.5, 0.25], 1.5)
+        };
+        let mut pane = |z, reversed| {
+            let mut corners = [[-1., 1., z], [1., 1., z], [-1., -1., z], [1., -1., z]];
+            if reversed {
+                corners.swap(0, 1);
+                corners.swap(2, 3);
+            }
+            let mesh = quad_material(&mut b, corners, [0., 0., 1.], glass, u32::MAX);
+            put(&mut b, mesh);
+        };
+        pane(-3., false);
+        if solid {
+            pane(-4., true);
+        }
+        let far = upright(&mut b, -5., [0., 0., 1., 1.], EMISSIVE, 0);
+        put(&mut b, far);
+        let near = upright(&mut b, 2., [0., 1., 0., 1.], EMISSIVE, 0);
+        put(&mut b, near);
+        (b.finish(), Textures::default())
+    };
+    h.ray.install(Ok(scene(false)));
+    let f_thin = 2. * 0.04 / 1.04;
+    let thin = h.pixel(f, &empty);
+    assert_radiance(
+        "thin glass split, reverse-depth and linear tint",
+        thin,
+        [0., f_thin, (1. - f_thin) * 0.25],
+    );
+    assert!((thin.1 - depth_at(f, -3. * Vec3::Z)).abs() < 1e-5);
+    h.ray.install(Ok(scene(true)));
+    h.ray.settings.reflections = false;
+    assert_radiance(
+        "glass slab exiting cancels the eta-squared factors",
+        h.pixel(f, &empty),
+        [0., 0., 0.96 * 0.96],
+    );
+
+    let mut b = Builder::default();
+    let conductor = quad_material(
+        &mut b,
+        [
+            [-1., 1., -5.],
+            [1., 1., -5.],
+            [-1., -1., -5.],
+            [1., -1., -5.],
+        ],
+        [0., 0., 1.],
+        Surface::new(0, 0, 0., 0.).with_pbr(1., 0.65),
+        rgba([0.8, 0.1, 0.05, 1.]),
+    );
+    put(&mut b, conductor);
+    b.light(Light::point([0., 0., -2., 10.], [1.; 4]));
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    h.ray.settings.bounces = 0;
+    h.ray.settings.reflections = true;
+    let lit = h.pixel(f, &empty);
+    assert!(
+        lit.0[0] > 70 && u32::from(lit.0[0]) > 16 * u32::from(lit.0[1].max(1)),
+        "conductor lost colored Fresnel: {lit:?}"
+    );
+    h.ray.settings.physical_bsdf = false;
+    eprintln!("Lighter: thin and solid glass interfaces and colored GGX conductor passed");
+}
+
+fn exercise_bsdf_energy(h: &Harness) {
+    const N: u64 = 25;
+    let output = h.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("BSDF furnace probe"),
+        size: N * 16,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let map = h.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: N * 16,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let shader = h.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("BSDF furnace across angles and materials"),
+        source: wgpu::ShaderSource::Wgsl(
+            [
+                BSDF,
+                r#"
+@group(0) @binding(0) var<storage,read_write> values: array<vec4<f32>>;
+fn rng(seed: u32) -> f32 {
+    var x = (seed ^ (seed >> 16u))*0x7feb352du;
+    x = (x ^ (x >> 15u))*0x846ca68bu;
+    return f32((x ^ (x >> 16u)) & 0xffffffu)/16777216.;
+}
+@compute @workgroup_size(1) fn integrate(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i=id.x;
+    let n=vec3<f32>(0.,0.,1.);
+    if i==24u {
+        values[i]=vec4<f32>(dielectric(vec3<f32>(0.8660254,0.,-0.5),n,1.5).fresnel,
+                           dielectric(-n,n,1./1.5).fresnel,0.,0.);
+        return;
+    }
+    var cosines=array<f32,4>(1.,0.7,0.25,0.07);
+    var alphas=array<f32,3>(0.04,0.25,0.8);
+    let nv=cosines[i%4u];
+    let alpha=alphas[(i/4u)%3u];
+    let metal=i>=12u;
+    let b=Bsdf(select(vec3<f32>(1.),vec3<f32>(0.),metal),
+               select(vec3<f32>(0.04),vec3<f32>(0.95,0.6,0.2),metal),alpha);
+    let wo=vec3<f32>(sqrt(1.-nv*nv),0.,nv);
+    var accum=vec3<f32>(0.);
+    for (var j=0u;j<8192u;j++) {
+        let u = vec3<f32>((f32(j)+0.5)/8192.,rng(j*3u+1u),rng(j*3u+2u));
+        accum += bsdf_sample(b,n,wo,u).weight;
+    }
+    values[i]=vec4<f32>(accum/8192.,0.);
+}
+"#,
+            ]
+            .concat()
+            .into(),
+        ),
+    });
+    let pipeline = h
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &shader,
+            entry_point: "integrate",
+        });
+    let bind = h.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: output.as_entire_binding(),
+        }],
+    });
+    let mut e = h.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = e.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: None,
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(N as u32, 1, 1);
+    }
+    e.copy_buffer_to_buffer(&output, 0, &map, 0, N * 16);
+    h.queue.submit(Some(e.finish()));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let view = map.slice(..);
+    view.map_async(wgpu::MapMode::Read, move |v| {
+        let _ = tx.send(v);
+    });
+    crate::gpu::wait_for_capture_callback(&h.device, rx)
+        .unwrap()
+        .unwrap();
+    let bytes = view.get_mapped_range();
+    let values: &[[f32; 4]] = bytemuck::cast_slice(&bytes);
+    assert!(
+        (values[24][0] - 1.).abs() < 1e-7 && (values[24][1] - 0.04).abs() < 1e-6,
+        "Snell/TIR {:?}",
+        values[24]
+    );
+    let mut max = 0.0f32;
+    for (i, value) in values[..24].iter().enumerate() {
+        for &v in &value[..3] {
+            assert!(
+                (0. ..=1.015).contains(&v),
+                "BSDF energy exceeded incident at case {i}: {value:?}"
+            );
+            max = max.max(v);
+        }
+    }
+    assert!(
+        values[12][0] > 0.9 && values[12][0] > values[12][2] * 3.,
+        "gloss was extinguished instead of conserving energy"
+    );
+    eprintln!("Lighter: GGX furnace at 24 angle/roughness/material points, peak reflected fraction {max:.5}");
 }
 
 fn exercise_finite_emitters(h: &mut Harness) {
@@ -2254,6 +2454,7 @@ fn exercise_streamed_bmds(h: &mut Harness) {
         soft_sun: false,
         anisotropy: 8,
         relight_baked: false,
+        physical_bsdf: false,
     };
     let sample = |h: &mut Harness| {
         h.ray.settings.bounces = 0;

@@ -8005,6 +8005,13 @@ fn preview_frame(
         mode,
         ..LighterSettings::default()
     };
+    if let Ok(value) = std::env::var("PW_PREVIEW_PHYSICAL_BSDF") {
+        lighter_settings.physical_bsdf = match value.as_str() {
+            "0" => false,
+            "1" => true,
+            _ => return Err("PW_PREVIEW_PHYSICAL_BSDF must be 0 or 1".into()),
+        };
+    }
     if let Ok(value) = std::env::var("PW_PREVIEW_RELIGHT_BAKED") {
         lighter_settings.relight_baked = match value.as_str() {
             "0" => false,

@@ -76,6 +76,7 @@ const BAKED_LIGHTMAPS: u32 = 512u;
 const GRASS_AREA_LIGHTMAPS: u32 = 1024u;
 const RELIGHT_BAKED: u32 = 2048u;
 const CLOUD_DETAIL: u32 = 4096u;
+const PHYSICAL_BSDF: u32 = 8192u;
 const VIEW: u32 = 0u;
 const SHADOW: u32 = 1u;
 const WATER_REFLECT: u32 = 2u;
@@ -94,6 +95,7 @@ struct Surface {
     n: vec3<f32>, face: vec3<f32>, // shading and incident-facing geometric normals
     uv: vec2<f32>, color: vec4<f32>, flags: u32, reflectance: f32, power: f32,
     specular: vec3<f32>, ambient: vec3<f32>, emission: vec3<f32>, glaze: vec4<f32>, blend: u32,
+    glass: vec4<f32>, pbr: vec2<f32>, entering: bool,
 }
 // Order is nonzero only while enumerating the narrow distance band of
 // coplanar sheets. A cursor excludes exactly the layers already composited,
@@ -336,7 +338,7 @@ fn vertex_tint(m: bool, v: u32) -> vec4<f32> {
 }
 fn material_addr(m: bool, primitive: u32) -> u32 {
     // Same word order as scene::Surface.
-    return word(m,3u) + 24u*word(m,word(m,2u)+2u*primitive);
+    return word(m,3u) + 26u*word(m,word(m,2u)+2u*primitive);
 }
 fn layer_key(hit: Hit) -> vec2<u32> {
     let m = (hit.instance & DYNAMIC)!=0u;
@@ -588,7 +590,7 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
             let addr = frame.water_effects.x;
             art = simple_water_art(uv,mesh_taps(addr,ray,hit,m,inst,v,vec2<f32>(2.5)),bitcast<f32>(frame.waves.w),addr);
         }
-        return Surface(n,face,uv,art,flags,0.,-1.,vec3<f32>(0.),vec3<f32>(0.),vec3<f32>(0.),vec4<f32>(0.),0u);
+        return Surface(n,face,uv,art,flags,0.,-1.,vec3<f32>(0.),vec3<f32>(0.),vec3<f32>(0.),vec4<f32>(0.),0u,vec4<f32>(0.),vec2<f32>(0.,-1.),false);
     }
     let terrain = (flags & TERRAIN)!=0u;
     let grass = (flags & GRASS_MATERIAL)!=0u;
@@ -606,7 +608,7 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
         let ground = terrain_color(p,face,ray,hit.t,baked);
         flags |= select(0u,BAKED,baked.a>0.);
         return Surface(n,face,uv,vec4<f32>(ground,1.),flags,0.,-1.,
-                       vec3<f32>(1.),ground,vec3<f32>(0.),vec4<f32>(0.),0u);
+                       vec3<f32>(1.),ground,vec3<f32>(0.),vec4<f32>(0.),0u,vec4<f32>(0.),vec2<f32>(0.,-1.),false);
     }
     let relight = (frame.options.x & RELIGHT_BAKED)!=0u;
     if relight { flags &= ~BAKED; }
@@ -674,7 +676,9 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
     var emission = vec3<f32>(0.);
     if (flags & BAKED)==0u { emission = floats(m,mat+7u)*base; }
     return Surface(n,face,uv,vec4<f32>(color,alpha),flags,bitcast<f32>(word(m,mat+3u)),bitcast<f32>(word(m,mat+4u)),
-                   rgba(word(m,mat+5u)).rgb,base*rgba(word(m,mat+10u)).rgb,emission,glaze,word(m,mat+21u));
+                   rgba(word(m,mat+5u)).rgb,base*rgba(word(m,mat+10u)).rgb,emission,glaze,word(m,mat+21u),
+                   vec4<f32>(rgba(word(m,mat+22u)).rgb,bitcast<f32>(word(m,mat+23u))),
+                   words2(m,mat+24u),dot(gn,ray.dir)<0.);
 }
 fn none(ray: Ray) -> Hit { return Hit(ray.high,NIL,0u,vec2<f32>(0.)); }
 fn trace(ray: Ray, q: Query) -> Hit {
@@ -720,7 +724,9 @@ fn visibility(p: vec3<f32>, face: vec3<f32>, light: LightRay, width: f32, source
             // refracted light connections through thick solids are separate.
             let gn = norm(geometric(m,inst,v));
             let local_n = select(gn,-gn,dot(gn,r.dir)>0.);
-            let optics = dielectric(r.dir,local_n,1./bitcast<f32>(word(m,mat+23u)));
+            let ior = bitcast<f32>(word(m,mat+23u));
+            if ior<0. { return vec3<f32>(0.); } // thick glass needs a bent connection
+            let optics = dielectric(r.dir,local_n,1./ior);
             throughput *= rgba(word(m,mat+22u)).rgb*((1.-optics.fresnel)/(1.+optics.fresnel));
         } else {
             let w = weights_of(hit);
@@ -896,6 +902,18 @@ fn local_color(s: Surface, light: vec3<f32>, ambient: vec3<f32>) -> vec3<f32> {
     if s.glaze.a>0. { return linear(mix(encoded(lit),encoded(s.glaze.rgb),s.glaze.a)); }
     return lit;
 }
+fn physical_material(s: Surface) -> bool {
+    return (s.flags & (BAKED|EMISSIVE|BLEND|WATER|GLASS|FOLIAGE))==0u
+        && ((frame.options.x & PHYSICAL_BSDF)!=0u || s.pbr.y>=0.);
+}
+fn material_bsdf(s: Surface) -> Bsdf {
+    let authored = s.pbr.y>=0.;
+    let metallic = select(0.,s.pbr.x,authored);
+    let albedo = clamp(s.color.rgb,vec3<f32>(0.),vec3<f32>(1.));
+    let f0 = select(s.reflectance*s.specular,mix(vec3<f32>(0.04),albedo,metallic),authored);
+    let alpha = select(sqrt(2./(2.+max(s.power,0.))),s.pbr.y*s.pbr.y,authored);
+    return Bsdf(albedo*(1.-metallic),select(vec3<f32>(0.),clamp(f0,vec3<f32>(0.),vec3<f32>(1.)),(frame.options.x & REFLECTIONS)!=0u),clamp(alpha,0.002,1.));
+}
 fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, seed: ptr<function,u32>) -> vec3<f32> {
     let albedo = s.color.rgb;
     if (s.flags & EMISSIVE)!=0u { return albedo; }
@@ -913,6 +931,9 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, seed: ptr<
         if (s.flags & PRECIPITATION)!=0u { cosine = select(0.,1.,sun.y>0.); }
         sun_pending = cosine>0.;
     }
+    let physical = lit && physical_material(s);
+    var b: Bsdf;
+    if physical { b = material_bsdf(s); }
     let width = footprint(ray,t);
     var color = vec3<f32>(1.);
     var ambient = vec3<f32>(0.);
@@ -940,8 +961,11 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, seed: ptr<
         // One shadow traversal site for sun, static points and GFX points.
         // Drivers inline ray queries, so duplicating the call at each branch
         // can make shader compilation dominate the first frame.
-        color += light.energy*visibility(p,s.face,light,width,ray);
+        var response = vec3<f32>(1.);
+        if physical { response = BSDF_PI*bsdf_eval(b,s.n,-ray.dir,light.dir).f; }
+        color += response*light.energy*visibility(p,s.face,light,width,ray);
     }
+    if physical { return color+ambient+s.emission; }
     return local_color(s,color,ambient);
 }
 fn hemisphere(n: vec3<f32>, seed: ptr<function,u32>) -> vec3<f32> {
@@ -968,16 +992,6 @@ fn wave(s: Surface, ray: Ray, hit: Hit) -> vec3<f32> {
     n *= select(1.,-1.,direction.y>0.);
     if dot(n,direction)>-0.01 { n = vec3<f32>(0.,select(1.,-1.,direction.y>0.),0.); }
     return n;
-}
-struct Optics { transmitted: vec3<f32>, fresnel: f32 }
-fn dielectric(d: vec3<f32>, n: vec3<f32>, eta: f32) -> Optics {
-    let cos_i = clamp(dot(-d,n),0.,1.);
-    let cos_t2 = 1.-eta*eta*(1.-cos_i*cos_i);
-    if cos_t2<=0. { return Optics(vec3<f32>(0.),1.); }
-    let cos_t = sqrt(cos_t2);
-    let rs = (eta*cos_i-cos_t)/(eta*cos_i+cos_t);
-    let rp = (cos_i-eta*cos_t)/(cos_i+eta*cos_t);
-    return Optics(norm(eta*d+(eta*cos_i-cos_t)*n),clamp(0.5*(rs*rs+rp*rp),0.,1.));
 }
 fn medium_color(wet: bool) -> vec3<f32> {
     return select(frame.air_color.rgb,frame.water_color.rgb,wet);
@@ -1140,7 +1154,7 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                 }
                 s = surface(hit,ray);
                 let p = ray.origin+ray.dir*hit.t;
-                if (s.flags & WATER)!=0u { break; }
+                if (s.flags & (WATER|GLASS))!=0u { break; }
                 color = vec3<f32>(0.);
                 if has_weight { color = direct(p,s,ray,hit.t,terminal || sheet,seed); }
                 if !sheet {
@@ -1185,9 +1199,8 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
             result += path.weight*(1.-t)*medium_color(path.wet);
             path.weight *= t;
             if strongest(abs(path.weight))<0.002 { break; }
-            if (s.flags & WATER)!=0u {
-                // Alternate fixed-function water is a colored alpha layer over
-                // the bottom, not a normal-mapped specular interface.
+            if (s.flags & (WATER|GLASS))!=0u {
+                let water = (s.flags & WATER)!=0u;
                 let simple = (s.flags & SIMPLE_WATER)!=0u && frame.water_effects.x!=0u;
                 if simple {
                     result += path.weight*s.color.rgb*select(s.color.a,1.,terminal);
@@ -1200,53 +1213,68 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                     continue;
                 }
                 if terminal {
-                    result += path.weight*mix(frame.water_color.rgb,s.color.rgb,0.4);
+                    if water { result += path.weight*mix(frame.water_color.rgb,s.color.rgb,0.4); }
                     break;
                 }
                 let from_water = s.face.y<0.;
-                let eta = select(1./1.333,1.333,from_water);
-                let n = wave(s,ray,solid);
+                let thin = !water && s.glass.w>0.;
+                let ior = select(abs(s.glass.w),1.333,water);
+                let from_inside = select(!s.entering && !thin,from_water,water);
+                let eta = select(1./ior,ior,from_inside);
+                var n = s.face;
+                if water { n = wave(s,ray,solid); }
                 var optics = dielectric(ray.dir,n,eta);
                 var reflected = norm(reflect(ray.dir,n));
-                // A normal map perturbs the interface but not the water cell.
-                // Use one consistent flat interface if either ray would be
-                // sent to the wrong side of that cell.
+                // Bump maps may not send a lobe through the wrong geometric side.
                 if dot(reflected,s.face)<=0. || (optics.fresnel<1. && dot(optics.transmitted,s.face)>=0.) {
                     optics = dielectric(ray.dir,s.face,eta);
                     reflected = norm(reflect(ray.dir,s.face));
                 }
-                let can_reflect = (frame.options.x & (REFLECTIONS|WATER_MIRROR))==(REFLECTIONS|WATER_MIRROR)
-                    && (s.flags & SIMPLE_WATER)==0u;
-                let f = optics.fresnel;
+                let can_reflect = (frame.options.x & REFLECTIONS)!=0u
+                    && (!water || ((frame.options.x & WATER_MIRROR)!=0u && (s.flags & SIMPLE_WATER)==0u));
+                let f = select(optics.fresnel,2.*optics.fresnel/(1.+optics.fresnel),thin);
+                let specular = select(path.purpose,SPECULAR,path.purpose==VIEW || path.purpose==DIFFUSE);
+                let reflect_purpose = select(specular,WATER_REFLECT,water);
+                let reflect_wet = select(path.wet,from_water,water);
                 path.depth++;
                 if f>=1. {
-                    if !can_reflect { result += path.weight*frame.water_color.rgb; break; }
+                    if !can_reflect {
+                        if water { result += path.weight*frame.water_color.rgb; }
+                        break;
+                    }
                     path.ray = secondary(p,reflected,s.face,ray,solid.t);
-                    path.purpose = WATER_REFLECT;
-                    path.wet = from_water;
+                    path.purpose = reflect_purpose;
+                    path.wet = reflect_wet;
                     continue;
                 }
                 if can_reflect && f>0. {
-                    // Trace both first-water lobes without noise. At later
-                    // interfaces choose by Fresnel probability; that probability
-                    // accounts for the lobe weight, so don't multiply it twice.
                     if !split && branch==0u {
-                        pending = Path(secondary(p,reflected,s.face,ray,solid.t),path.weight*f,path.depth,WATER_REFLECT,from_water);
+                        pending = Path(secondary(p,reflected,s.face,ray,solid.t),path.weight*f,path.depth,reflect_purpose,reflect_wet);
                         split = true;
                         path.weight *= 1.-f;
                     } else if random(seed)<f {
                         path.ray = secondary(p,reflected,s.face,ray,solid.t);
-                        path.purpose = WATER_REFLECT;
-                        path.wet = from_water;
+                        path.purpose = reflect_purpose;
+                        path.wet = reflect_wet;
                         continue;
                     }
-                }
-                // Radiance transport across a change in index of refraction.
-                // This factor cancels for a path that exits back into air.
-                path.weight *= eta*eta;
-                path.wet = !from_water;
-                path.ray = secondary(p,optics.transmitted,s.face,ray,solid.t);
-                path.purpose = WATER_TRANSMIT;
+                } else if !water { path.weight *= 1.-f; }
+                // Radiance Jacobian cancels at the two sides of a solid slab.
+                path.weight *= select(s.glass.rgb,vec3<f32>(1.),water)*select(eta*eta,1.,thin);
+                path.wet = select(path.wet,!from_water,water);
+                path.ray = secondary(p,select(optics.transmitted,ray.dir,thin),s.face,ray,solid.t);
+                path.purpose = select(specular,WATER_TRANSMIT,water);
+                continue;
+            }
+            if physical_material(s) && (frame.options.x & LIGHTING)!=0u {
+                result += path.weight*color;
+                if terminal { break; }
+                let e = bsdf_sample(material_bsdf(s),s.n,-ray.dir,vec3<f32>(random(seed),random(seed),random(seed)));
+                if e.pdf<=0. || dot(e.dir,s.face)<=0. { break; }
+                path.ray = secondary(p,e.dir,s.face,ray,solid.t);
+                path.weight *= e.weight;
+                if path.purpose!=WATER_REFLECT && path.purpose!=WATER_TRANSMIT { path.purpose = DIFFUSE; }
+                path.depth++;
                 continue;
             }
             let glossy = !terminal && (s.flags & EMISSIVE)==0u && (frame.options.x & REFLECTIONS)!=0u;

@@ -46,6 +46,7 @@ pub struct Settings {
     pub resolution: u32,
     pub anisotropy: u32,
     pub relight_baked: bool,
+    pub physical_bsdf: bool,
 }
 
 impl Default for Settings {
@@ -63,6 +64,7 @@ impl Default for Settings {
             resolution: 50,
             anisotropy: 8,
             relight_baked: false,
+            physical_bsdf: false,
         }
     }
 }
@@ -96,6 +98,7 @@ impl Settings {
                 "bounces" => settings.bounces = number(settings.bounces, 0, 4),
                 "samples" => settings.samples = number(settings.samples, 1, 4),
                 "resolution" => settings.resolution = number(settings.resolution, 25, 100),
+                "physical_bsdf" => settings.physical_bsdf = toggle(settings.physical_bsdf),
                 "relight_baked" => settings.relight_baked = toggle(settings.relight_baked),
                 "anisotropy" => {
                     if let Ok(n @ (1 | 8 | 16)) = value.parse::<u32>() {
@@ -110,9 +113,9 @@ impl Settings {
 
     fn encode(self) -> String {
         format!(
-            "# Lighter settings\nmode={}\nlighting={}\nshadows={}\nsoft_sun={}\nreflections={}\ndenoiser={}\nprogressive={}\nbounces={}\nsamples={}\nresolution={}\nanisotropy={}\nrelight_baked={}\n",
+            "# Lighter settings\nmode={}\nlighting={}\nshadows={}\nsoft_sun={}\nreflections={}\ndenoiser={}\nprogressive={}\nbounces={}\nsamples={}\nresolution={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\n",
             self.mode.token(), self.lighting, self.shadows, self.soft_sun, self.reflections, self.denoiser, self.progressive, self.bounces,
-            self.samples, self.resolution, self.anisotropy, self.relight_baked,
+            self.samples, self.resolution, self.anisotropy, self.relight_baked, self.physical_bsdf,
         )
     }
 
@@ -157,7 +160,7 @@ mod tests {
         );
         assert!(defaults.progressive && defaults.denoiser);
         let s = Settings::decode(
-            "mode=hardware\nbounces=99\nshadows=false\nsoft_sun=false\ndenoiser=false\nprogressive=false\nsamples=0\nresolution=bad\nanisotropy=16",
+            "mode=hardware\nbounces=99\nshadows=false\nsoft_sun=false\ndenoiser=false\nprogressive=false\nsamples=0\nresolution=bad\nanisotropy=16\nphysical_bsdf=true",
         );
         assert_eq!(s.mode, Mode::Hardware);
         assert_eq!(s.bounces, 4);
@@ -167,6 +170,7 @@ mod tests {
         assert_eq!(Settings::decode("anisotropy=12").anisotropy, 8);
         assert!(!s.shadows && s.lighting && s.reflections);
         assert!(!s.denoiser && !s.progressive && !s.soft_sun);
+        assert!(s.physical_bsdf);
         assert_eq!(Settings::decode(&s.encode()), s);
         assert_eq!(Settings::decode("mode=unknown"), Settings::default());
     }

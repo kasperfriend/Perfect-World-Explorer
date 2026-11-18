@@ -19,6 +19,7 @@ use std::time::Instant;
 use textures::{suffix_segments, TexelPrefix, Textures};
 
 const PIXELS: &str = include_str!("pixels.wgsl");
+const BSDF: &str = include_str!("bsdf.wgsl");
 const BASE: &str = include_str!("trace.wgsl");
 const SOFTWARE: &str = include_str!("software.wgsl");
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -99,6 +100,7 @@ pub const BAKED_LIGHTMAPS: u32 = 512;
 pub const GRASS_AREA_LIGHTMAPS: u32 = 1024;
 const RELIGHT_BAKED: u32 = 2048;
 pub const CLOUD_DETAIL: u32 = 4096;
+const PHYSICAL_BSDF: u32 = 8192;
 
 pub(crate) fn storage_limit(device: &wgpu::Device) -> usize {
     let limits = device.limits();
@@ -304,7 +306,7 @@ impl Software {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Lighter software BVH"),
-            source: wgpu::ShaderSource::Wgsl([PIXELS, BASE, SOFTWARE].concat().into()),
+            source: wgpu::ShaderSource::Wgsl([PIXELS, BSDF, BASE, SOFTWARE].concat().into()),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Lighter compute ray tracer"),
@@ -815,7 +817,7 @@ impl Lighter {
             if self.hardware.is_none() {
                 self.hardware = Some(vulkan::Renderer::new(
                     device,
-                    &[PIXELS, BASE, HARDWARE].concat(),
+                    &[PIXELS, BSDF, BASE, HARDWARE].concat(),
                 )?);
             }
             let rt = self.hardware.as_mut().unwrap();
@@ -878,6 +880,11 @@ impl Lighter {
         frame.options[0] |= u32::from(self.settings.lighting)
             | u32::from(self.settings.shadows) << 1
             | u32::from(self.settings.reflections) << 2
+            | if self.settings.physical_bsdf {
+                PHYSICAL_BSDF
+            } else {
+                0
+            }
             | if self.settings.soft_sun { SOFT_SUN } else { 0 }
             | if self.settings.relight_baked {
                 RELIGHT_BAKED
@@ -1005,11 +1012,13 @@ impl Lighter {
             egui::Checkbox::new(&mut self.settings.soft_sun, "Soft sun shadows"),
         )
         .on_hover_text(
-            "Sample across the sun's angular disc. Point lights still cast sharp shadows.",
+            "Sample across the sun's angular disc. Local area emitters are sampled separately.",
         );
         ui.checkbox(&mut self.settings.reflections, "Ray-traced reflections");
         ui.checkbox(&mut self.settings.denoiser, "Edge-aware denoiser")
             .on_hover_text("Filter linear radiance using primary depth, normals and albedo. Never changes output depth.");
+        ui.checkbox(&mut self.settings.physical_bsdf, "GGX / Lambert materials")
+            .on_hover_text("Evaluate and sample energy-bounded microfacet and diffuse lobes on relit materials. Preserve the legacy color stages for baked surfaces and GFX sheets.");
         ui.checkbox(&mut self.settings.progressive, "Progressive sampling while still")
             .on_hover_text("Reuse lighting samples in stable scenes. Reproject tiny view changes; camera movement, changed lighting or incompatible surfaces discard history.");
         ui.add(egui::Slider::new(&mut self.settings.bounces,0..=4).text("Secondary bounces"))
