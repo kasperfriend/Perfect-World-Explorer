@@ -114,12 +114,13 @@ jobs:
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           done
-      - name: Capture the same authored shoreline in Native and Software
+      - name: Capture the same authored shoreline in Native and Software (unbound lightmaps)
         env:
           XDG_RUNTIME_DIR: ${{ runner.temp }}
           PW_CACHE_DIR: ${{ runner.temp }}/lighter-cache
           WGPU_BACKEND: vulkan
           PW_PREVIEW_HOUR: '12'
+          PW_TEST_NO_LIGHTMAPS: '1'
         run: |
           set -euo pipefail
           # Overlook the authored wet cell near x=16, z=48 at y=330.83.

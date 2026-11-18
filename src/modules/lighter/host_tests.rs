@@ -439,6 +439,17 @@ fn ray_lightmaps_keep_day_only_and_distinct_night_bindings() {
     assert!(super::lightmaps::load(&t, &material, &mut bank)
         .unwrap()
         .is_empty());
+    std::fs::write(root.0.join("fixture.t2lm"), [0u8; 128]).unwrap();
+    let size = bank.byte_len();
+    assert_eq!(
+        super::lightmaps::load(&t, &material, &mut bank).unwrap(),
+        vec![[0; 2]; 16]
+    );
+    assert_eq!(
+        bank.byte_len(),
+        size,
+        "an unsupported optional record must not poison the bank"
+    );
     write("t2lm", 0xf800);
     let offsets = super::lightmaps::load(&t, &material, &mut bank).unwrap();
     assert_eq!(offsets.len(), 16);

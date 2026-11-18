@@ -75,8 +75,17 @@ pub(crate) struct Inventory {
 
 impl Inventory {
     pub fn combine(&self, moving: &Self) -> Self {
-        // Static and moving producers own disjoint rows.
+        // Some vegetation omissions are discovered at residency time, but
+        // the admitted animated instances are counted in the moving packet.
         let mut combined = *self;
+        for class in [Class::Trees, Class::Grass] {
+            let live = moving[class];
+            let row = &mut combined[class];
+            row.loaded += live.loaded;
+            row.budget += live.budget;
+            row.empty += live.empty;
+            row.invalid += live.invalid;
+        }
         combined.rows[Class::WorldModels as usize..]
             .copy_from_slice(&moving.rows[Class::WorldModels as usize..]);
         combined

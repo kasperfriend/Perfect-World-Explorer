@@ -41,10 +41,29 @@ pub(super) fn load(
     let mut offsets = vec![[0; 2]; material.areas.len()];
     let mut missing = 0;
     for (sub, name) in t.subterrain_names.iter().enumerate() {
-        let [day, night] = paths(name);
-        let Some(pair) = Pair::read_optional(&day, &night)? else {
-            missing += TILES;
-            continue;
+        let [day_path, night_path] = paths(name);
+        let load_pair = || -> Result<_, String> {
+            let Some(pair) = Pair::read_optional(&day_path, &night_path)? else {
+                return Ok(None);
+            };
+            Tiles::parse(pair.bytes(false)).map_err(|e| format!("{}: {e}", day_path.display()))?;
+            if pair.availability() == Availability::Both {
+                Tiles::parse(pair.bytes(true))
+                    .map_err(|e| format!("{}: {e}", night_path.display()))?;
+            }
+            Ok(Some(pair))
+        };
+        let pair = match load_pair() {
+            Ok(Some(pair)) => pair,
+            Ok(None) => {
+                missing += TILES;
+                continue;
+            }
+            Err(error) => {
+                eprintln!("Lighter: baked lightmap pair unbound ({error})");
+                missing += TILES;
+                continue;
+            }
         };
         let day = Tiles::parse(pair.bytes(false))?;
         let night = if pair.availability() == Availability::Both {
