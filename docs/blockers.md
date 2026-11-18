@@ -1600,3 +1600,88 @@ file.
 - **Status:** fixed and unit-tested. Verified offline against real Drive BSData
   (`water`, `gfx`, `music`, `material` harness modes, 152 tests). The remaining
   hardware questions are the same as B-2 and B-3.
+
+## B-9: the `.pck`/`.pkx` split, and grass that aborts the whole map
+
+Two runtime failures the 1.5.2 and 1.3.1 clients reported, both caused by a
+reader treating "I do not handle this" as "the data is corrupt".
+
+**The split package.** The 1.5.2 client ships `litmodels.pck` as a
+2,147,483,392-byte file. That number is `0x7fff_ff00`, the engine's
+`MAX_FILE_PACKAGE`: `AFilePackage` never writes past it, and starts the next
+file of the same stem with a `.pkx` extension instead. The header still declares
+the size of the *whole* package (2,859,188,412 bytes here), and an entry's
+`dwOffset` is measured from the start of the first file, so it runs past the
+split point rather than restarting at zero. Both the entry table and the trailer
+land in the `.pkx` because they are written last.
+
+The reader opened only the `.pck`, saw a declared size larger than the file, and
+reported `bad package end offset`. `objects.rs` then dropped the archive, so
+every scenery model was "unavailable" — 22,981 of them in the 1.5.2 report. The
+map itself was fine.
+
+`pck::Package` now opens the pair and reads it as one package:
+
+- `Package::open` picks up `<stem>.pkx` only when the `.pck` is exactly
+  `MAX_FILE_PACKAGE` long, so a stray `.pkx` beside a small pack is never
+  mounted.
+- The trailer is read from the `.pkx`'s tail, with `end` rebased on that file
+  because its offsets are relative to *its* start.
+- `read_package_range` and `read_entries_parts` read positionally, so an entry
+  that starts in one half and ends in the other is read from both. The
+  DirectStorage batch path is skipped for a split, since its queue is opened on
+  one file.
+- A file of exactly `MAX_FILE_PACKAGE` with no `.pkx` now names the missing half
+  instead of calling the size word corrupt.
+
+Pinned by `a_split_package_is_read_through_its_pkx_continuation`, which builds a
+real split (a `.pck` at the split point, a `.pkx` holding the trailer, the table
+and the tail of a straddling payload) and checks the payload is reassembled, and
+by `a_split_package_must_have_halves_that_add_up_to_the_declared_size`.
+
+**Grass that took the map with it.** `Grass::load` returned `Err` from inside
+its per-group closure for any area it could not decode — a BSData index past the
+EC-BSD name table (`grass record index`), a record whose uncompressed size did
+not match the area's own mask (the `invalid grass compress size` guard), or a
+BSData file that is not in the map folder. One such area aborted the load for the
+whole map, which surfaced as a modal error instead of as thin grass.
+
+Each of those is now a per-area skip with one summary line naming the first eight
+distinct reasons, and an authored-empty BSData stub (`MOXB`, version 2, zero
+records) is recognised as empty rather than as corruption. Against the real 1.3.1
+`world`: 113,101 live grass cells load, where before the load failed outright.
+
+The layout itself was never wrong — the real `.ecbsd` records at the offsets the
+ECWLD references point at are well-formed 36-byte areas (`type_id` +0, centre
++4/8/12, grid +16, width +20, height +24, record +32), and all 1,120 references
+to the staged `BSData\20.dat` decode their masks exactly.
+
+- **Status:** split reading fixed and tested (45 `client`-mode tests green). Grass
+  degrades per area instead of aborting. Water is still open: see B-10.
+
+## B-10: an open-water area reads 21 % dry
+
+Both the 1.3.6 and 1.5.2 runs log exactly one water area, and log it identically:
+
+```
+export=2538 colour=0xff4f889d simple=false height=216.000 grid=32.000
+cells=16x21 wet=265 of 336 centre=(1792.00,216.00,4272.00) shore_waves=10
+```
+
+32 m cells over 16x21 is a 512 m x 672 m patch centred on open water, and 71 of
+its 336 cells have a zero mask byte. The client does not use the mask the way
+this reader does: `A3DWaterArea::IsInWater` (`0x781c50`) threshold-tests a
+bilinearly interpolated height, so a zero cell is a *depth* edge, not a hole, and
+the surface still exists there. What the log then renders is a water plane with a
+fifth of it missing.
+
+`contains_xz` reproduces the client's inside test, which is right for "is the
+camera under this surface". It is the wrong function to build the drawn surface
+from. The fix is to keep the mask as authored (it is depth/shoreline data) and
+draw the area's full `columns x rows` extent, thresholding per cell only where the
+client does.
+
+- **Status:** open. The mask values are read correctly (the byte distribution is
+  the same in both clients and the area's own `shore_waves=10` parses), so this is
+  a rendering decision, not a decoding bug. No sandbox path can render a frame to
+  confirm it, so it is documented rather than changed blind.

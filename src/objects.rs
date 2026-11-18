@@ -28,7 +28,6 @@ use crate::{
 };
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
     path::Path,
     sync::Arc,
 };
@@ -243,8 +242,8 @@ pub struct Objects {
     resolver: TextureResolver,
     /// Scenery archives are optional: an instance map can still show terrain,
     /// water, trees and the models it does have when one package is absent.
-    litfile: Option<File>,
-    texfile: Option<File>,
+    litfile: Option<pck::Package>,
+    texfile: Option<pck::Package>,
     lit_archive_error: Option<String>,
     lit_archive_entries: usize,
     litmodel_map_id: String,
@@ -288,16 +287,28 @@ pub fn unbounded_textures() -> bool {
 }
 fn open_optional_archive(
     path: &Path,
-) -> (Option<File>, HashMap<String, pck::Entry>, Option<String>) {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
+) -> (Option<pck::Package>, HashMap<String, pck::Entry>, Option<String>) {
+    // A package cut at `MAX_FILE_PACKAGE` keeps the rest of itself in the `.pkx`
+    // of the same stem; opening only the `.pck` rejected `litmodels.pck` outright
+    // in the 1.5.2 client and left every scenery model unavailable.
+    let mut package = match pck::Package::open(path) {
+        Ok(package) => package,
         Err(error) => {
             let reason = format!("{}: {error}", path.display());
             eprintln!("Optional scenery archive unavailable: {reason}");
             return (None, HashMap::new(), Some(reason));
         }
     };
-    match pck::directory(&mut file) {
+    if package.is_split() {
+        if let Some(pkx) = package.continuation() {
+            eprintln!(
+                "Scenery archive {} is split at MAX_FILE_PACKAGE; reading it with {}",
+                path.display(),
+                pkx.display()
+            );
+        }
+    }
+    match package.directory() {
         Ok(entries) => {
             let indexed: HashMap<_, _> = entries
                 .into_iter()
@@ -310,7 +321,7 @@ fn open_optional_archive(
                 indexed.len(),
                 bmd_count
             );
-            (Some(file), indexed, None)
+            (Some(package), indexed, None)
         }
         Err(error) => {
             let reason = format!("{}: {error}", path.display());
@@ -530,7 +541,7 @@ impl Objects {
                                 for batch in chunk.chunks(16) {
                                     let entries: Vec<&pck::Entry> =
                                         batch.iter().map(|(_, _, entry)| entry).collect();
-                                    match pck::read_entries_at(litfile, &entries) {
+                                    match pck::read_entries_parts(litfile.first_file(), litfile.second_file(), litfile.layout(), &entries) {
                                         Ok(data) => {
                                             for ((index, name, _), data) in batch.iter().zip(data) {
                                                 let result = bmd::Model::parse(&data)
@@ -709,7 +720,7 @@ impl Objects {
                                                 .iter()
                                                 .map(|(_, entry)| entry)
                                                 .collect();
-                                            pck::read_entries_at(file, &entries)
+                                            pck::read_entries_parts(file.first_file(), file.second_file(), file.layout(), &entries)
                                         };
                                         match read {
                                             Ok(bytes) => {
@@ -915,22 +926,22 @@ impl Objects {
                 .get(key)
                 .cloned()
                 .ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
-            let file = self
+            let package = self
                 .litfile
-                .as_mut()
+                .as_ref()
                 .ok_or_else(|| "litmodels.pck unavailable".to_string())?;
-            pck::read_entry(file, &entry)?
+            package.read(&entry)?
         } else {
             let entry = self
                 .texentries
                 .get(key)
                 .cloned()
                 .ok_or_else(|| format!("resolver/index mismatch for {key}"))?;
-            let file = self
+            let package = self
                 .texfile
-                .as_mut()
+                .as_ref()
                 .ok_or_else(|| "building.pck unavailable".to_string())?;
-            pck::read_entry(file, &entry)?
+            package.read(&entry)?
         };
         self.decode_and_store(key, &data)
     }

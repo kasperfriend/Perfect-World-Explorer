@@ -85,6 +85,13 @@ pub struct Grass {
     /// The default world path ignores these; P4.07 opt-in uploads them verbatim.
     pub texture_mips: HashMap<String, Vec<image::RgbaImage>>,
 }
+/// Record one dropped placement without letting a bad area take the map down.
+fn note(sink: &std::sync::Mutex<Vec<String>>, message: String) {
+    if let Ok(mut notes) = sink.lock() {
+        notes.push(message);
+    }
+}
+
 fn cstr<'a>(b: &'a [u8], start: usize) -> Result<(&'a [u8], usize), String> {
     let bytes = b.get(start..).ok_or("invalid MOXB string")?;
     let n = bytes
@@ -338,16 +345,48 @@ impl Grass {
             groups.push((idx, &records[g_start..g_end]));
             g_start = g_end;
         }
+        // Diagnostics for placements that were dropped. Threads share one
+        // sink and it is summarised once, so a map with many odd areas prints
+        // a handful of lines instead of thousands.
+        let notes: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        // A grass area that cannot be decoded is dropped on its own: the map
+        // still draws every other patch. Only a placement file that cannot be
+        // opened at all is reported once per group.
         let process_group = |&(index, group): &(usize, &[(usize, usize, usize)])| {
-            let name = names
-                .get(index)
-                .ok_or_else(|| "grass BSData index".to_string())?;
-            let path = water::resolve_case_insensitive(dir, name).map_err(|e| e.to_string())?;
-            let data = fs::read(path).map_err(|e| e.to_string())?;
+            let Some(name) = names.get(index) else {
+                note(&notes, format!("BSData {index}: no name in the EC-BSD table"));
+                return Ok(Vec::new());
+            };
+            let path = match water::resolve_case_insensitive(dir, name) {
+                Ok(path) => path,
+                Err(_) => {
+                    note(&notes, format!("{name}: not in this map folder"));
+                    return Ok(Vec::new());
+                }
+            };
+            let data = match fs::read(&path) {
+                Ok(data) => data,
+                Err(error) => {
+                    note(&notes, format!("{name}: {error}"));
+                    return Ok(Vec::new());
+                }
+            };
+            // An authored-empty stub is a real file with a zero record count,
+            // not corruption: nothing was placed in this area, so there is
+            // nothing to decode.
+            if data.len() >= 16 {
+                let magic = u(&data, 0).map_err(|e| e.to_string())?;
+                let version = u(&data, 4).map_err(|e| e.to_string())?;
+                let count = u(&data, data.len() - 4).map_err(|e| e.to_string())?;
+                if magic == 0x42584f4d && version == 2 && count == 0 {
+                    return Ok(Vec::new());
+                }
+            }
             if u(&data, 0).map_err(|e| e.to_string())? != 0x42584f4d
                 || u(&data, 4).map_err(|e| e.to_string())? != 2
             {
-                return Err("unsupported grass BSData".to_string());
+                note(&notes, format!("{name}: unsupported grass BSData"));
+                return Ok(Vec::new());
             }
             let tail = data
                 .len()
@@ -362,9 +401,13 @@ impl Grass {
                 .ok_or_else(|| "bad grass table".to_string())?;
             let mut group_areas = Vec::with_capacity(group.len());
             for &(_, order, off) in group {
+                // Every per-area read is checked and, on failure, this one area
+                // is dropped. Aborting here turned one odd area into a modal
+                // error that blanked every grass patch in the map.
                 let type_id = u(&b, off).map_err(|e| e.to_string())? as usize;
                 if type_id >= scene.grass_types.len() {
-                    return Err("grass type index".to_string());
+                    note(&notes, format!("grass type {type_id} out of range"));
+                    continue;
                 }
                 let cx = f(&b, off + 4).map_err(|e| e.to_string())?;
                 let cy = f(&b, off + 8).map_err(|e| e.to_string())?;
@@ -379,26 +422,53 @@ impl Grass {
                     || height > 4096
                     || width * height % 8 != 0
                 {
-                    return Err("grass mask size".to_string());
+                    note(&notes, format!("mask {width}x{height}"));
+                    continue;
                 }
                 let cells = width
                     .checked_mul(height)
                     .ok_or_else(|| "grass mask overflow".to_string())?;
                 let bytes = cells / 8;
                 let rec = u(&b, off + 32).map_err(|e| e.to_string())? as usize;
+                let Some(row) = rec
+                    .checked_mul(4)
+                    .and_then(|row| table.checked_add(row))
+                    .map(|at| u(&data, at))
+                else {
+                    note(&notes, format!("area at {off}: record {rec}"));
+                    continue;
+                };
+                let Ok(start) = row.map(|s| s as usize) else {
+                    note(&notes, format!("area at {off}: record {rec}"));
+                    continue;
+                };
                 if rec >= count {
-                    return Err("grass record index".to_string());
+                    note(&notes, format!("area at {off}: record {rec} of {count}"));
+                    continue;
                 }
-                let start = u(&data, table + rec * 4).map_err(|e| e.to_string())? as usize;
-                let stored = u(&data, start).map_err(|e| e.to_string())? as usize;
-                let raw = u(&data, start + 4).map_err(|e| e.to_string())? as usize;
+                let (Ok(stored), Ok(raw)) = (u(&data, start), u(&data, start + 4)) else {
+                    note(&notes, format!("area at {off}: record {rec} header"));
+                    continue;
+                };
+                let (stored, raw) = (stored as usize, raw as usize);
+                // The record's uncompressed size must be the area's own cell
+                // count. A mismatch means the index points at a different
+                // area's row, not that the map is unreadable.
                 if raw != bytes || stored > bytes * 2 + 1024 {
-                    return Err("invalid grass compressed size".to_string());
+                    note(
+                        &notes,
+                        format!("area at {off}: record {rec} holds {raw} bytes for a {bytes}-byte mask"),
+                    );
+                    continue;
                 }
-                let src = data
-                    .get(start + 8..start + 8 + stored)
-                    .ok_or_else(|| "short grass compressed bitmap".to_string())?;
-                let output = crate::pck::inflate(src, bytes)?;
+                let Some(src) = data.get(start + 8..start + 8 + stored) else {
+                    note(&notes, format!("area at {off}: record {rec} is truncated"));
+                    continue;
+                };
+                let Ok(output) = crate::pck::inflate(src, bytes) else {
+                    note(&notes, format!("area at {off}: record {rec} does not inflate"));
+                    continue;
+                };
                 let count = output.iter().map(|byte| byte.count_ones() as usize).sum();
                 let active = ActiveMask {
                     packed: src.to_vec(),
@@ -447,6 +517,28 @@ impl Grass {
         let mut areas = Vec::with_capacity(records.len());
         for res in bsd_results {
             areas.extend(res?);
+        }
+        // Name what was dropped, once per distinct reason. Silence here would
+        // hide a map whose grass is thinner than the archive says it is.
+        {
+            let notes = notes.into_inner().unwrap_or_default();
+            let mut seen = HashSet::new();
+            let mut listed = 0usize;
+            for note in &notes {
+                if !seen.insert(note.as_str()) {
+                    continue;
+                }
+                listed += 1;
+                if listed <= 8 {
+                    eprintln!("grass placement skipped: {note}");
+                }
+            }
+            if seen.len() > 8 {
+                eprintln!(
+                    "grass placement skipped: {} further reasons not listed",
+                    seen.len() - 8
+                );
+            }
         }
         areas.sort_by_key(|a| a.0);
         let areas: Vec<_> = areas.into_iter().map(|(_, area)| area).collect();

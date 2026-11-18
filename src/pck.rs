@@ -6,9 +6,9 @@ use flate2::{Decompress, FlushDecompress};
 #[path = "direct_storage.rs"]
 pub(crate) mod direct_storage;
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
 };
 const MASK: u32 = 0xa8937462;
 const CHECK: u32 = 0x59374231;
@@ -30,6 +30,24 @@ fn at(f: &mut File, p: u64, n: usize) -> Result<Vec<u8>, String> {
     f.seek(SeekFrom::Start(p))
         .and_then(|_| f.read_exact(&mut b))
         .map_err(|e| e.to_string())?;
+    Ok(b)
+}
+/// Positional read that needs no `&mut File`, so a shared handle can be read
+/// from several places at once (and from both halves of a split package).
+fn at_shared(f: &File, p: u64, n: usize) -> Result<Vec<u8>, String> {
+    let mut b = vec![0; n];
+    let mut read = 0usize;
+    while read < n {
+        #[cfg(windows)]
+        let step = std::os::windows::fs::FileExt::seek_read(f, &mut b[read..], p + read as u64);
+        #[cfg(unix)]
+        let step = std::os::unix::fs::FileExt::read_at(f, &mut b[read..], p + read as u64);
+        let step = step.map_err(|e| e.to_string())?;
+        if step == 0 {
+            return Err("truncated".into());
+        }
+        read += step;
+    }
     Ok(b)
 }
 pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
@@ -168,12 +186,11 @@ const REVISIONS: [Revision; 3] = [
 
 /// Validate the 12-byte prefix every package starts with.
 ///
-/// `continuation` names the `.pkx` half of a split archive when the caller
-/// found one beside the `.pck`, so a declared size larger than this file is
-/// reported as the split it is. Without that evidence the same bytes are a
-/// corrupt size word, and calling it a split would send a reader looking for a
-/// file that does not exist.
-fn safe_header(safe: &[u8], size: u64, continuation: Option<&Path>) -> Result<(), String> {
+/// `whole` is the size of the package when its two halves are known, so a
+/// declared size larger than the file on disk is the split it is. Without that
+/// evidence the same bytes are a corrupt size word, and calling it a split would
+/// send a reader looking for a file that does not exist.
+fn safe_header(safe: &[u8], size: u64, whole: Option<u64>) -> Result<(), String> {
     if u32le(safe, 0)? != 0x4dca23ef || u32le(safe, 8)? != 0x56a089b7 {
         return Err("unsupported PCK safe header".into());
     }
@@ -183,14 +200,22 @@ fn safe_header(safe: &[u8], size: u64, continuation: Option<&Path>) -> Result<()
     }
     if end > size {
         // The client reads a package split at `MAX_FILE_PACKAGE` together with
-        // its `.pkx` continuation (`models.pck` + `models.pkx` in the 1.5.2
-        // client is one 2.93 GB archive). This reader is handed a single open
-        // file, so it names the split instead of calling the archive corrupt.
-        return Err(match continuation {
-            Some(path) => format!(
-                "split package: the header declares {end} bytes but this file holds {size}; \
-                 the rest is in `{}`, which this reader does not open",
-                path.display()
+        // its `.pkx` continuation (`litmodels.pck` + `litmodels.pkx` in the
+        // 1.5.2 client is one 2.86 GB archive). With both halves open the
+        // declared size is simply the package's size and is not an error.
+        if whole == Some(end) {
+            return Ok(());
+        }
+        return Err(match whole {
+            Some(whole) => format!(
+                "split package: the header declares {end} bytes but the two halves hold {whole}"
+            ),
+            // A file of exactly `MAX_FILE_PACKAGE` is the first half of a split
+            // package even when no `.pkx` sits beside it, so the missing half is
+            // named rather than the size word being called corrupt.
+            None if size == MAX_FILE_PACKAGE => format!(
+                "split package: the header declares {end} bytes, this file holds the first \
+                 {size} of them and the `.pkx` continuation is missing"
             ),
             None => format!(
                 "bad package end offset: the header declares {end} bytes but this file holds {size}"
@@ -198,6 +223,66 @@ fn safe_header(safe: &[u8], size: u64, continuation: Option<&Path>) -> Result<()
         });
     }
     Ok(())
+}
+
+/// The size the client's `MAX_FILE_PACKAGE` splits a package at.
+///
+/// `AFilePackage` never writes more than this into one file: past it the next
+/// package is opened, which is why a 2.86 GB `litmodels.pck` sits on disk as a
+/// 2,147,483,392-byte `litmodels.pck` (`0x7fffff00` = this constant) plus the
+/// remainder in `litmodels.pkx`.
+pub const MAX_FILE_PACKAGE: u64 = 0x7fff_ff00;
+
+/// The two files that make up one package.
+///
+/// An unsplit package is just the `.pck`. A split package is the `.pck` cut at
+/// [`MAX_FILE_PACKAGE`] with the rest in the `.pkx` of the same stem, and an
+/// entry's `dwOffset` is measured from the start of the *first* file, so it
+/// continues past the split point rather than restarting at zero.
+#[derive(Clone, Copy)]
+pub struct Layout {
+    /// Bytes of `part0` (the `.pck`) that belong to the package. Equals the
+    /// whole file for an unsplit package.
+    pub part0: u64,
+    /// Whether a `.pkx` continuation was opened.
+    pub split: bool,
+}
+
+impl Layout {
+    /// Every byte of one file.
+    pub fn single(len: u64) -> Self {
+        Self {
+            part0: len,
+            split: false,
+        }
+    }
+
+    /// The package as a single logical byte range, so a caller can check an
+    /// entry's span against one number.
+    pub fn total(&self, part1: u64) -> u64 {
+        if self.split {
+            self.part0.saturating_add(part1)
+        } else {
+            self.part0
+        }
+    }
+}
+
+/// Open the `.pkx` that continues a `.pck` cut at [`MAX_FILE_PACKAGE`].
+///
+/// Only a `.pck` that reaches the split point can have one, so a stray `.pkx`
+/// next to a small pack is never mounted.
+pub fn open_continuation(path: &Path) -> Option<(File, u64)> {
+    let len = fs::metadata(path).ok()?.len();
+    if len != MAX_FILE_PACKAGE {
+        return None;
+    }
+    let mut name = path.file_stem()?.to_os_string();
+    name.push(".pkx");
+    let pkx = path.with_file_name(name);
+    let file = File::open(&pkx).ok()?;
+    let len = file.metadata().ok()?.len();
+    Some((file, len))
 }
 
 /// The offset the trailer sits at: the prefix's declared size when it fits on
@@ -222,8 +307,8 @@ fn package_end(f: &mut File) -> Result<u64, String> {
 /// large the trailer is, then reads the trailer at `end - (header + 4 + 4)`
 /// because the file count sits between the trailer and the version word. The
 /// two reads are reproduced here in that order.
-fn read_trailer(f: &mut File, end: u64) -> Result<(Revision, usize, Vec<u8>), String> {
-    let version = u32le(&at(f, end - 4, 4)?, 0)?;
+fn read_trailer(f: &File, end: u64) -> Result<(Revision, usize, Vec<u8>), String> {
+    let version = u32le(&at_shared(f, end - 4, 4)?, 0)?;
     let Some(rev) = REVISIONS.iter().find(|r| r.version == version) else {
         return Err(format!("unsupported PCK version {version:08x}"));
     };
@@ -234,8 +319,8 @@ fn read_trailer(f: &mut File, end: u64) -> Result<(Revision, usize, Vec<u8>), St
     let header_start = end
         .checked_sub((rev.header + 8) as u64)
         .ok_or("bad package end offset")?;
-    let count = u32le(&at(f, end - 8, 4)?, 0)? as usize;
-    let header = at(f, header_start, rev.header)?;
+    let count = u32le(&at_shared(f, end - 8, 4)?, 0)? as usize;
+    let header = at_shared(f, header_start, rev.header)?;
     if u32le(&header, 0)? != 0xfdfdfeee || u32le(&header, rev.guard_byte1)? != 0xf00dbeef {
         return Err("unsupported PCK guard keys".into());
     }
@@ -263,7 +348,26 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     let safe = at(f, 0, 12)?;
     safe_header(&safe, size, None)?;
     let end = package_end(f)?;
-    let (rev, count, header) = read_trailer(f, end)?;
+    read_directory(f, None, Layout::single(size), end, 0)
+}
+
+/// Read the trailer and the entry table.
+///
+/// `end` is the end of the logical package and `base` the position inside it
+/// where the trailer-bearing half starts: zero for a single file, and
+/// [`MAX_FILE_PACKAGE`] for the `.pkx` half of a split package. The trailer's
+/// own offsets are measured from the start of *its* file, which is why both
+/// numbers are needed.
+fn read_directory(
+    first: &File,
+    second: Option<&File>,
+    layout: Layout,
+    end: u64,
+    base: u64,
+) -> Result<Vec<Entry>, String> {
+    let reader: &File = second.unwrap_or(first);
+    let part_end = end - base;
+    let (rev, count, header) = read_trailer(reader, part_end)?;
     if u32le(&header, rev.flags_at)? & 0x80000000 != 0 {
         return Err("encrypted package unsupported".into());
     }
@@ -274,12 +378,188 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     // AFPCK_MASKDWORD`) and seeks there; the trailer follows the table, so a
     // table that starts at or past it is corrupt.
     let pos = (u32le(&header, 8)? ^ MASK) as u64;
-    let table_end = end - (rev.header + 8) as u64;
+    let table_end = part_end - (rev.header + 8) as u64;
     if pos >= table_end {
         return Err("entry table overlaps footer".into());
     }
-    let table = at(f, pos, (table_end - pos) as usize)?;
-    read_entry_table(&table, count, &rev, end, size)
+    // The entry table may sit either side of the split, so it is walked through
+    // the two-part reader rather than one file.
+    let table = read_package_range(first, second, &layout, base + pos, table_end - pos)?;
+    read_entry_table(&table, count, &rev, end, layout.total(end - base))
+}
+
+/// A whole package, which is one file unless it was split at
+/// [`MAX_FILE_PACKAGE`].
+///
+/// The client never writes more than [`MAX_FILE_PACKAGE`] bytes into one file:
+/// it starts the next file of the same stem with the `.pkx` extension and keeps
+/// writing, and an entry's `dwOffset` is measured from the start of the *first*
+/// file, so it runs past the split point instead of restarting at zero. The
+/// 1.5.2 client ships `litmodels.pck` exactly that way — a 2,147,483,392-byte
+/// `.pck` holding the first half of a 2,859,188,412-byte package, with the rest
+/// in `litmodels.pkx`.
+///
+/// Reading one half alone rejected the archive as corrupt and left every
+/// scenery model in the map unavailable, so the pair is opened and read as the
+/// single package the client sees.
+pub struct Package {
+    path: PathBuf,
+    first: File,
+    second: Option<File>,
+    layout: Layout,
+    /// Bytes of `second`, or zero when the package is not split.
+    part1: u64,
+}
+
+impl Package {
+    /// Open `path`, picking up the `.pkx` continuation when `path` is the first
+    /// half of a split package.
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let first = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let size = first.metadata().map_err(|e| e.to_string())?.len();
+        let mut second = None;
+        let mut layout = Layout::single(size);
+        let mut part1 = 0;
+        if size == MAX_FILE_PACKAGE {
+            let mut name = path.file_stem().ok_or("package has no stem")?.to_os_string();
+            name.push(".pkx");
+            let pkx = path.with_file_name(name);
+            if let Ok(file) = File::open(&pkx) {
+                part1 = file.metadata().map_err(|e| e.to_string())?.len();
+                layout = Layout {
+                    part0: size,
+                    split: true,
+                };
+                second = Some(file);
+            }
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            first,
+            second,
+            layout,
+            part1,
+        })
+    }
+
+    /// Whether the package is stored as a `.pck`/`.pkx` pair.
+    pub fn is_split(&self) -> bool {
+        self.layout.split
+    }
+
+    /// The `.pkx` that completes this package, when it is split.
+    pub fn continuation(&self) -> Option<PathBuf> {
+        self.layout.split.then(|| {
+            let mut name = self.path.file_stem().unwrap_or_default().to_os_string();
+            name.push(".pkx");
+            self.path.with_file_name(name)
+        })
+    }
+
+    /// Bytes of the whole logical package.
+    pub fn len(&self) -> u64 {
+        self.layout.total(self.part1)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The first half of the package: always the file that was opened.
+    pub fn first_file(&self) -> &File {
+        &self.first
+    }
+
+    /// The `.pkx` half of a split package.
+    pub fn second_file(&self) -> Option<&File> {
+        self.second.as_ref()
+    }
+
+    /// The two files' sizes, for code that reads the halves itself.
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    /// The package's own entry directory.
+    pub fn directory(&mut self) -> Result<Vec<Entry>, String> {
+        let safe = at(&mut self.first, 0, 12)?;
+        // A split is only the explanation when the two halves add up to what the
+        // header declares; safe_header says so, and read_directory re-checks the
+        // table's own offsets.
+        safe_header(
+            &safe,
+            self.layout.part0,
+            if self.layout.split {
+                Some(self.len())
+            } else {
+                None
+            },
+        )?;
+        if self.layout.split {
+            return read_directory(
+                &self.first,
+                self.second.as_ref(),
+                self.layout,
+                self.len(),
+                MAX_FILE_PACKAGE,
+            );
+        }
+        let end = package_end(&mut self.first)?;
+        read_directory(&self.first, None, self.layout, end, 0)
+    }
+
+    /// One entry's bytes, spanning the split when the payload does.
+    pub fn read(&self, e: &Entry) -> Result<Vec<u8>, String> {
+        let stored = read_package_range(
+            &self.first,
+            self.second.as_ref(),
+            &self.layout,
+            e.offset as u64,
+            e.compressed as u64,
+        )?;
+        if e.compressed < e.size {
+            inflate(&stored, e.size as usize)
+        } else {
+            Ok(stored)
+        }
+    }
+}
+
+/// Read `len` bytes starting at `pos` inside the logical package, which spans
+/// `first` and then `second` when the package is split.
+fn read_package_range(
+    first: &File,
+    second: Option<&File>,
+    layout: &Layout,
+    pos: u64,
+    len: u64,
+) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(len as usize);
+    let mut left = len;
+    let mut cursor = pos;
+    while left > 0 {
+        let in_first = cursor < layout.part0;
+        let take = if in_first {
+            left.min(layout.part0 - cursor)
+        } else {
+            left
+        };
+        if take == 0 {
+            return Err("split package range is empty".into());
+        }
+        let chunk = if in_first {
+            at_shared(first, cursor, take as usize)?
+        } else {
+            // Both halves are read positionally, so reading one never disturbs
+            // a cursor the other half's caller may hold.
+            let second = second.ok_or("entry continues into a missing .pkx half")?;
+            at_shared(second, cursor - layout.part0, take as usize)?
+        };
+        out.extend_from_slice(&chunk);
+        cursor += take;
+        left -= take;
+    }
+    Ok(out)
 }
 
 /// Walk the length-prefixed run of entry records the client reads one at a
@@ -402,6 +682,20 @@ pub fn read_entries_at(
     f: &File,
     entries: &[&Entry],
 ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    read_entries_parts(f, None, &Layout::single(u64::MAX), entries)
+}
+
+/// Read a batch of entries out of a package that may be split in two.
+///
+/// Everything is positioned I/O, so the same batch can span both halves without
+/// disturbing any cursor; an entry that starts in `first` and ends in `second`
+/// is simply read twice.
+pub fn read_entries_parts(
+    first: &File,
+    second: Option<&File>,
+    layout: &Layout,
+    entries: &[&Entry],
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
     let mut raw: Vec<Vec<u8>> = entries
         .iter()
         .map(|entry| vec![0u8; entry.compressed as usize])
@@ -418,6 +712,12 @@ pub fn read_entries_at(
         let mut range_indices = Vec::with_capacity(BATCH_CAPACITY);
         for (index, (entry, bytes)) in entries.iter().zip(raw.iter_mut()).enumerate() {
             if bytes.len() < DIRECT_STORAGE_MIN {
+                continue;
+            }
+            // A split package lives in two files and this queue is opened on
+            // one, so a split never takes the DirectStorage path; the
+            // positioned read below handles both halves.
+            if second.is_some() {
                 continue;
             }
             ranges.push((entry.offset as u64, bytes.as_mut_slice()));
@@ -447,11 +747,31 @@ pub fn read_entries_at(
         }
         let mut read = 0usize;
         while read < bytes.len() {
-            let off = entry.offset as u64 + read as u64;
+            let cursor = entry.offset as u64 + read as u64;
+            // An entry that begins in the first half and ends in the `.pkx`
+            // continuation is read from each half in turn.
+            let (file, off) = if cursor < layout.part0 {
+                (first, cursor)
+            } else {
+                (
+                    second.ok_or_else(|| {
+                        format!(
+                            "PCK entry {} continues past the split into a missing .pkx half",
+                            entry.name
+                        )
+                    })?,
+                    cursor - layout.part0,
+                )
+            };
+            let room = if cursor < layout.part0 {
+                (layout.part0 - cursor).min((bytes.len() - read) as u64) as usize
+            } else {
+                bytes.len() - read
+            };
             #[cfg(windows)]
-            let n = std::os::windows::fs::FileExt::seek_read(f, &mut bytes[read..], off)?;
+            let n = std::os::windows::fs::FileExt::seek_read(file, &mut bytes[read..read + room], off)?;
             #[cfg(unix)]
-            let n = std::os::unix::fs::FileExt::read_at(f, &mut bytes[read..], off)?;
+            let n = std::os::unix::fs::FileExt::read_at(file, &mut bytes[read..read + room], off)?;
             if n == 0 {
                 return Err(format!("unexpected EOF in PCK entry {}", entry.name).into());
             }
@@ -1005,29 +1325,117 @@ mod tests {
         );
     }
 
-    /// A package whose header declares more bytes than the file holds has been
-    /// split at `MAX_FILE_PACKAGE`; the continuation lives in `.pkx`. With that
-    /// continuation present the reader must name the split, because "corrupt
-    /// archive" would be the wrong thing to go looking for — the archive is
-    /// fine and the second half is simply not read.
+    /// A declared size larger than the file is a split when the two halves add
+    /// up to it, and corruption when they do not.
+    ///
+    /// "Corrupt archive" would send a reader after damage that is not there: the
+    /// archive is whole, it is just stored in two files.
     #[test]
-    fn a_split_package_is_named_as_a_split_when_its_continuation_is_present() {
+    fn a_split_package_must_have_halves_that_add_up_to_the_declared_size() {
         let mut bytes = package(0x0002_0003, &[("a.txt", b"x")], false);
-        let declared = bytes.len() as u32 + 4096;
-        bytes[4..8].copy_from_slice(&declared.to_le_bytes());
-        let path = write_temp(&bytes, "split");
-        let file = std::fs::File::open(&path).unwrap();
-        safe_header(
-            &bytes[..12],
-            bytes.len() as u64,
-            Some(Path::new("models.pkx")),
-        )
-        .unwrap_err()
-        .contains("split package")
-        .then_some(())
-        .expect("a declared size past the file, with a .pkx present, is a split");
+        let declared = bytes.len() as u64 + 4096;
+        let size = bytes.len() as u64;
+        bytes[4..8].copy_from_slice(&(declared as u32).to_le_bytes());
+        safe_header(&bytes[..12], size, Some(declared))
+            .expect("the two halves add up to the declared size");
+        let error = safe_header(&bytes[..12], size, Some(declared + 1)).unwrap_err();
+        assert!(error.contains("split package"), "unexpected error: {error}");
+        assert!(error.contains("two halves"), "unexpected error: {error}");
+    }
+
+    /// Build the retail split: a `.pck` of exactly `MAX_FILE_PACKAGE` holding
+    /// the start of the package, and a `.pkx` holding everything after it.
+    ///
+    /// The trailer and the entry table live in the second half, which is what
+    /// made a half-read fatal rather than partial. `straddler` is placed so that
+    /// it begins just before the split point and ends just after it, so reading
+    /// it needs both files.
+    fn split_package(tag: &str, straddler: &[u8]) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::io::{Seek, SeekFrom};
+        let dir = std::env::temp_dir().join(format!(
+            "pw-pck-split-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pck = dir.join("models.pck");
+        let pkx = dir.join("models.pkx");
+        let split = MAX_FILE_PACKAGE;
+        // Offsets are measured from the start of the first file, so an entry
+        // near the split point is a package-relative number past `split - 8`.
+        // Eight bytes of the payload sit in the `.pck`, the rest in the `.pkx`.
+        let straddle_at = split - 8;
+        let mut head = Vec::new();
+        head.extend_from_slice(&0x4dca23efu32.to_le_bytes());
+        head.extend_from_slice(&0u32.to_le_bytes()); // declared size, patched below
+        head.extend_from_slice(&0x56a089b7u32.to_le_bytes());
+        let mut first = std::fs::File::create(&pck).unwrap();
+        first.write_all(&head).unwrap();
+        first.seek(SeekFrom::Start(straddle_at)).unwrap();
+        first.write_all(straddler).unwrap();
+        first.set_len(split).unwrap();
+        drop(first);
+
+        // Second half: the straddler's tail, then the table and the trailer.
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&straddler[(split - straddle_at) as usize..]);
+        let table_at = tail.len();
+        let mut record = vec![0u8; 288];
+        let name = b"litmodels/world/a.bmd";
+        record[..name.len()].copy_from_slice(name);
+        record[264..272].copy_from_slice(&straddle_at.to_le_bytes());
+        record[272..276].copy_from_slice(&(straddler.len() as u32).to_le_bytes());
+        record[276..280].copy_from_slice(&(straddler.len() as u32).to_le_bytes());
+        let masked = (record.len() as u32) ^ MASK;
+        tail.extend_from_slice(&masked.to_le_bytes());
+        tail.extend_from_slice(&(masked ^ CHECK).to_le_bytes());
+        tail.extend_from_slice(&record);
+        let mut header = vec![0u8; 280];
+        header[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
+        header[4..8].copy_from_slice(&0x0002_0003u32.to_le_bytes());
+        header[8..12].copy_from_slice(&((table_at as u32) ^ MASK).to_le_bytes());
+        let tag_bytes = b"Angelica File Package, Perfect World Co. Ltd.";
+        header[20..20 + tag_bytes.len()].copy_from_slice(tag_bytes);
+        header[272..276].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
+        tail.extend_from_slice(&header);
+        tail.extend_from_slice(&1u32.to_le_bytes());
+        tail.extend_from_slice(&0x0002_0003u32.to_le_bytes());
+        std::fs::write(&pkx, &tail).unwrap();
+
+        // The header declares the size of the whole package.
+        let declared = (split + tail.len() as u64) as u32;
+        let mut file = std::fs::OpenOptions::new().write(true).open(&pck).unwrap();
+        file.seek(SeekFrom::Start(4)).unwrap();
+        file.write_all(&declared.to_le_bytes()).unwrap();
         drop(file);
-        std::fs::remove_file(path).unwrap();
+        (dir, pck)
+    }
+
+    /// A package cut at `MAX_FILE_PACKAGE` is read as the one package the client
+    /// sees: the directory comes out of the `.pkx` half and an entry that spans
+    /// the split point is reassembled from both files.
+    ///
+    /// The 1.5.2 client ships `litmodels.pck` this way (a 2,147,483,392-byte
+    /// `.pck` for a 2,859,188,412-byte package). Reading one half alone reported
+    /// the archive as unreadable and left all 22,981 scenery models unavailable.
+    #[test]
+    fn a_split_package_is_read_through_its_pkx_continuation() {
+        let straddler = b"ABCDEFGHstraddling-payload-tail";
+        let (dir, pck) = split_package("read", straddler);
+        let mut package = Package::open(&pck).unwrap();
+        assert!(package.is_split(), "a .pck at MAX_FILE_PACKAGE is a split");
+        let entries = package.directory().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "litmodels/world/a.bmd");
+        let data = package.read(&entries[0]).unwrap();
+        assert_eq!(
+            data, straddler,
+            "the payload was not reassembled across the split"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The same bytes with **no** `.pkx` beside them are a corrupt size word,
@@ -1049,4 +1457,27 @@ mod tests {
         );
         assert!(!error.contains("split"), "unexpected error: {error}");
     }
+
+    /// A file of exactly `MAX_FILE_PACKAGE` with no `.pkx` beside it is the
+    /// first half of a package whose second half is missing. Calling that a
+    /// corrupt size word would send a reader after a damaged archive that is
+    /// merely incomplete.
+    #[test]
+    fn a_pck_at_max_file_package_without_its_pkx_names_the_missing_half() {
+        let whole = package(0x0002_0003, &[("a.txt", b"x")], false);
+        let mut bytes = vec![0u8; MAX_FILE_PACKAGE as usize];
+        bytes[..whole.len()].copy_from_slice(&whole);
+        // The header declares a package larger than the one file on disk, which
+        // is exactly what a split looks like from this side.
+        let declared = (MAX_FILE_PACKAGE + 4096) as u32;
+        bytes[4..8].copy_from_slice(&declared.to_le_bytes());
+        let path = write_temp(&bytes, "truncated-split");
+        let mut file = std::fs::File::open(&path).unwrap();
+        let error = directory(&mut file).unwrap_err();
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        assert!(error.contains("split package"), "unexpected error: {error}");
+        assert!(error.contains("missing"), "unexpected error: {error}");
+    }
+
 }
