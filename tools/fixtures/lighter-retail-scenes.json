@@ -1,0 +1,178 @@
+{
+  "cases": [
+    {
+      "id": "a01-day",
+      "map": "a01",
+      "classes": [
+        "cave_instance",
+        "effects"
+      ],
+      "condition": "day",
+      "camera": null,
+      "warmup": 24,
+      "lightmaps": true,
+      "authored_totals": {
+        "buildings": 328,
+        "effect_roots": 304
+      }
+    },
+    {
+      "id": "a01-night",
+      "map": "a01",
+      "classes": [
+        "cave_instance",
+        "effects"
+      ],
+      "condition": "night",
+      "camera": null,
+      "warmup": 24,
+      "lightmaps": true,
+      "authored_totals": {
+        "buildings": 328,
+        "effect_roots": 304
+      }
+    },
+    {
+      "id": "a01-rain",
+      "map": "a01",
+      "classes": [
+        "cave_instance",
+        "effects"
+      ],
+      "condition": "rain",
+      "camera": null,
+      "warmup": 24,
+      "lightmaps": true,
+      "authored_totals": {
+        "buildings": 328,
+        "effect_roots": 304
+      }
+    },
+    {
+      "id": "a02-day",
+      "map": "a02",
+      "classes": [
+        "cave_instance",
+        "open_distance"
+      ],
+      "condition": "day",
+      "camera": [
+        0,
+        332.56123,
+        0,
+        0,
+        -0.1
+      ],
+      "warmup": 24,
+      "lightmaps": true,
+      "authored_totals": {
+        "buildings": 32,
+        "effect_roots": 42
+      }
+    },
+    {
+      "id": "a02-night",
+      "map": "a02",
+      "classes": [
+        "cave_instance",
+        "open_distance"
+      ],
+      "condition": "night",
+      "camera": [
+        0,
+        332.56123,
+        0,
+        0,
+        -0.1
+      ],
+      "warmup": 24,
+      "lightmaps": true,
+      "authored_totals": {
+        "buildings": 32,
+        "effect_roots": 42
+      }
+    },
+    {
+      "id": "a02-rain",
+      "map": "a02",
+      "classes": [
+        "cave_instance",
+        "open_distance"
+      ],
+      "condition": "rain",
+      "camera": [
+        0,
+        332.56123,
+        0,
+        0,
+        -0.1
+      ],
+      "warmup": 24,
+      "lightmaps": true,
+      "authored_totals": {
+        "buildings": 32,
+        "effect_roots": 42
+      }
+    },
+    {
+      "id": "a07-day",
+      "map": "a07",
+      "classes": [
+        "water"
+      ],
+      "condition": "day",
+      "camera": [
+        16,
+        356,
+        84,
+        0,
+        -0.6
+      ],
+      "warmup": 12,
+      "lightmaps": false,
+      "min_loaded": {
+        "water": 1
+      }
+    },
+    {
+      "id": "a07-night",
+      "map": "a07",
+      "classes": [
+        "water"
+      ],
+      "condition": "night",
+      "camera": [
+        16,
+        356,
+        84,
+        0,
+        -0.6
+      ],
+      "warmup": 12,
+      "lightmaps": false,
+      "min_loaded": {
+        "water": 1
+      }
+    },
+    {
+      "id": "a07-rain",
+      "map": "a07",
+      "classes": [
+        "water"
+      ],
+      "condition": "rain",
+      "camera": [
+        16,
+        356,
+        84,
+        0,
+        -0.6
+      ],
+      "warmup": 12,
+      "lightmaps": false,
+      "min_loaded": {
+        "water": 1
+      }
+    }
+  ]
+}

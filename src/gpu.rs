@@ -8126,21 +8126,35 @@ fn preview_frame(
             .filter(|n| matches!(n, 1 | 8 | 16))
             .ok_or("PW_PREVIEW_ANISOTROPY must be 1, 8 or 16")?;
     }
+    if let Ok(value) = std::env::var("PW_PREVIEW_RAY_RESOLUTION") {
+        lighter_settings.resolution = value
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (25..=100).contains(n))
+            .ok_or("PW_PREVIEW_RAY_RESOLUTION must be an integer from 25 through 100")?;
+    }
+    let timed_frames = match std::env::var("PW_PREVIEW_TIMED_FRAMES") {
+        Ok(value) if audit.is_some() => value
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n <= 120)
+            .ok_or("PW_PREVIEW_TIMED_FRAMES must be an integer from 0 through 120")?,
+        Ok(_) => return Err("PW_PREVIEW_TIMED_FRAMES requires PW_PREVIEW_COVERAGE".into()),
+        Err(_) => 0,
+    };
     if audit.is_some() {
-        if mode == LighterMode::Off {
-            return Err("PW_PREVIEW_COVERAGE requires software or hardware Lighter".into());
-        }
         if let Some(notice) = t.startup_notice.as_deref() {
             return Err(format!("Coverage capture refused a fallback map: {notice}"));
         }
         // Report this frame, not a radiance mixture of the warm-up frames.
         lighter_settings.progressive = false;
     }
-    if mode != LighterMode::Off
+    if (audit.is_some() || mode != LighterMode::Off)
         && (std::env::var_os("PW_PREVIEW_WORLD_TEST").is_some()
-            || std::env::var_os("PW_PREVIEW_MINIMAP").is_some())
+            || std::env::var_os("PW_PREVIEW_MINIMAP").is_some()
+            || (audit.is_some() && std::env::var_os("PW_PREVIEW_EFFECT_AB").is_some()))
     {
-        return Err("Lighter preview requires the main streamed world, not a whole-world preload or minimap".into());
+        return Err("Matched previews require the main streamed world, not preload, minimap or an effect A/B".into());
     }
     let mut instance = make_instance(lighter_settings.mode);
     let mut adapter_result = pollster::block_on(adapter(&instance, None, lighter_settings.mode));
@@ -8450,12 +8464,11 @@ fn preview_frame(
         );
     }
     let bytes = read_target_pixels(&renderer, &mut captures, &target)?;
+    renderer.lighter.profile_collect(&renderer.queue);
     readback::png_rgba(path, width, height, &bytes)?;
     if let (Some(warmup), Some(info)) = (audit, adapter_info) {
         use sha2::{Digest, Sha256};
         use std::fmt::Write;
-        let inventory = renderer.ray_inventory();
-        let counts_path = path.with_extension("coverage.csv");
         let meta_path = path.with_extension("coverage.txt");
         let digest = Sha256::digest(&bytes);
         let critters = t
@@ -8465,32 +8478,62 @@ fn preview_frame(
             .map(|block| block.critters.len())
             .sum::<usize>();
         let mut meta = format!(
-            "coverage_schema=1\nmap={:?}\nmode={mode:?}\nrgba8_sha256={digest:x}\nimage={width}x{height}\n\
-             eye={:?}\nyaw={}\npitch={}\nfar={}\nhour={}\nweather={}\nwarmup_frames={warmup}\nwarmup_step_ms=16\n\
-             cutoff={}\nscenery_quality={}\nsettings={:?}\nadapter={info:?}\ncritters_authored_not_in_world_model_feed={critters}\n",
-            t.map.id, cam.pos.to_array(), cam.yaw, cam.pitch, cam.far, cam.time_of_day,
+            "coverage_schema=2\nmap={:?}\nmode={mode:?}\nrgba8_sha256={digest:x}\nimage={width}x{height}\n\
+             eye={:?}\nyaw={}\npitch={}\nfar={}\nfov_y={}\nhour={}\nweather={}\nwarmup_frames={warmup}\nwarmup_step_ms=16\n\
+             cutoff={}\nscenery_quality={}\nsettings={:?}\nsettings_effective={:?}\nadapter={info:?}\ncritters_authored_not_in_world_model_feed={critters}\n\
+             reflection={}\nfog={}\neffects={}\ncloud_detail={}\nbloom={}\nlightmaps={}\narea_grass_lightmaps={}\n",
+            t.map.id, cam.pos.to_array(), cam.yaw, cam.pitch, cam.far, CAMERA_FOV_Y_RADIANS, cam.time_of_day,
             cam.weather_override.token(), renderer.detail.terrain_cutoff,
-            renderer.detail.scenery_quality, renderer.lighter.settings,
+            renderer.detail.scenery_quality, renderer.lighter.settings, renderer.lighter.settings.effective(),
+            cam.water_reflections, cam.atmospheric_fog, cam.world_effects, cam.cloud_detail,
+            cam.bloom, cam.terrain_lightmaps, cam.area_grass_lightmaps,
         );
-        for (name, count) in ["world", "walker", "populator"]
-            .into_iter()
-            .zip(renderer.lighter.skin_omissions)
-        {
-            writeln!(meta, "unsupported_ski_{name}={count}").unwrap();
+        if mode == LighterMode::Off {
+            let effects = renderer
+                .models
+                .as_ref()
+                .map_or(0, |models| models.effect_quad_count());
+            writeln!(meta,"native_local_scenery_pages={}\nnative_last_scene_passes={}\nnative_effect_quads={effects}\nnative_visible_water_batches={}",
+                renderer.local_pages.len(),renderer.scene_passes,renderer.visible_water_batches.len()).unwrap();
+        } else {
+            let inventory = renderer.ray_inventory();
+            let counts_path = path.with_extension("coverage.csv");
+            std::fs::write(&counts_path, inventory.csv())
+                .map_err(|e| format!("{}: {e}", counts_path.display()))?;
+            for (name, count) in ["world", "walker", "populator"]
+                .into_iter()
+                .zip(renderer.lighter.skin_omissions)
+            {
+                writeln!(meta, "unsupported_ski_{name}={count}").unwrap();
+            }
+            let mips = renderer.lighter.texture_mips();
+            writeln!(
+                meta,
+                "mip_fallback={}\nmip_generated={}\nmip_reduced={}\nmip_authored_levels={}",
+                mips.fallback, mips.generated, mips.reduced, mips.authored_levels
+            )
+            .unwrap();
+            if let Some(bmd) = &renderer.lighter.scenery_coverage {
+                writeln!(meta, "{bmd}").unwrap();
+            }
         }
-        let mips = renderer.lighter.texture_mips();
-        writeln!(
-            meta,
-            "mip_fallback={}\nmip_generated={}\nmip_reduced={}\nmip_authored_levels={}",
-            mips.fallback, mips.generated, mips.reduced, mips.authored_levels
-        )
-        .unwrap();
-        if let Some(bmd) = &renderer.lighter.scenery_coverage {
-            writeln!(meta, "{bmd}").unwrap();
+        // Capture timing is optional and is deliberately distinct from GPU
+        // stage timings and the live asynchronous viewer's frame rate.
+        let mut capture_ms = Vec::new();
+        for _ in 0..timed_frames {
+            let start = Instant::now();
+            draw(&mut renderer, &cam);
+            if let Some(error) = renderer.lighter.error() {
+                return Err(error.into());
+            }
+            read_target_pixels(&renderer, &mut captures, &target)?;
+            capture_ms.push(start.elapsed().as_secs_f64() * 1000.);
+            renderer.lighter.profile_collect(&renderer.queue);
         }
-        for (file, text) in [(counts_path, inventory.csv()), (meta_path, meta)] {
-            std::fs::write(&file, text).map_err(|e| format!("{}: {e}", file.display()))?;
+        if !capture_ms.is_empty() {
+            writeln!(meta, "synchronized_capture_ms={capture_ms:?}").unwrap();
         }
+        std::fs::write(&meta_path, meta).map_err(|e| format!("{}: {e}", meta_path.display()))?;
     }
     Ok(())
 }

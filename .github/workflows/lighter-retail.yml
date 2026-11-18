@@ -1,4 +1,4 @@
-name: Lighter retail coverage
+name: Lighter retail capture matrix
 
 # Optional evidence, not a required PR check. Use the same public client tree
 # for maps and packages; never cache or upload client asset bytes.
@@ -14,9 +14,9 @@ permissions:
 
 jobs:
   capture:
-    name: Compare authored scenery and a07 shoreline on CPU Vulkan
+    name: Compare matched Native and Software cameras on CPU Vulkan
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -58,95 +58,28 @@ jobs:
             icd="$dir/lvp_icd.json"
             printf '{"file_format_version":"1.0.0","ICD":{"library_path":"%s/libvulkan_lvp.so","api_version":"1.3.0"}}\n' "$dir" > "$icd"
             echo "LD_LIBRARY_PATH=$dir" >> "$GITHUB_ENV"
-            echo "GALLIVM_PERF=nopt" >> "$GITHUB_ENV"
           fi
           echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+          echo "GALLIVM_PERF=nopt" >> "$GITHUB_ENV"
       - name: Build viewer
         run: cargo build --locked --bin perfect-world-explorer
-      - name: Render and inventory both maps
+      - name: Compare matched day, night and rain cameras
         env:
           XDG_RUNTIME_DIR: ${{ runner.temp }}
           PW_CACHE_DIR: ${{ runner.temp }}/lighter-cache
-          WGPU_BACKEND: vulkan
-          PW_PREVIEW_LIGHTER: software
-          PW_PREVIEW_COVERAGE: '1'
-          PW_PREVIEW_ANISOTROPY: '8'
-          PW_PREVIEW_WARMUP: '24'
         run: |
           set -euo pipefail
-          mkdir -p target/lighter-retail
-          test -n "$VK_ICD_FILENAMES"
-          for map in a01 a02; do
-            stem="target/lighter-retail/${map}-software"
-            if ! target/debug/perfect-world-explorer "$RUNNER_TEMP/lighter-client" \
-                --world "$map" --gpu-preview "$stem.png" >"$stem.log" 2>&1; then
-              tail -8 "$stem.log" | tac | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
-              exit 1
-            fi
-            test -s "$stem.png"
-            grep -Fx "map=\"$map\"" "$stem.coverage.txt"
-            # These totals are independent of the culling/ranking choices at
-            # the camera; both live and omitted owners have to be accounted for.
-            case "$map" in
-              a01) bmd=328; effects=304 ;;
-              a02) bmd=32; effects=42 ;;
-            esac
-            if ! awk -F, -v bmd="$bmd" -v effects="$effects" '
-              $1=="near_terrain" { terrain=$2 }
-              $1=="buildings" { placed=$2+$3+$4 }
-              $1=="effect_roots" { roots=$2+$3+$4 }
-              END { exit !(terrain>0 && placed==bmd && roots==effects) }
-            ' "$stem.coverage.csv"; then
-              grep -E '^(near_terrain|buildings|effect_roots),' "$stem.coverage.csv" |
-                while IFS= read -r line; do printf '::error::%s %s\n' "$map" "$line"; done
-              exit 1
-            fi
-            echo "::notice::$map $(grep '^rgba8_sha256=' "$stem.coverage.txt")"
-            grep -Eq '^mip_authored_levels=[1-9][0-9]*$' "$stem.coverage.txt"
-            echo "::notice::$map $(grep '^mip_' "$stem.coverage.txt" | tr '\n' ' ')"
-            for row in near_terrain buildings effect_roots effect_draws; do
-              echo "::notice::$map $(grep "^$row," "$stem.coverage.csv")"
-            done
-            {
-              echo "### $map — Software / lavapipe"
-              echo '```'
-              cat "$stem.coverage.txt" "$stem.coverage.csv"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-          done
-      - name: Capture the same authored shoreline in Native and Software (unbound lightmaps)
-        env:
-          XDG_RUNTIME_DIR: ${{ runner.temp }}
-          PW_CACHE_DIR: ${{ runner.temp }}/lighter-cache
-          WGPU_BACKEND: vulkan
-          PW_PREVIEW_HOUR: '12'
-          PW_TEST_NO_LIGHTMAPS: '1'
-        run: |
-          set -euo pipefail
-          # Overlook the authored wet cell near x=16, z=48 at y=330.83.
-          camera=(16 356 84 0 -0.60)
-          for mode in off software; do
-            stem="target/lighter-retail/a07-$mode"
-            audit=()
-            if [[ "$mode" == software ]]; then audit=(PW_PREVIEW_COVERAGE=1 PW_PREVIEW_WARMUP=0); fi
-            if ! env "${audit[@]}" PW_PREVIEW_LIGHTER="$mode" target/debug/perfect-world-explorer \
-                "$RUNNER_TEMP/lighter-client" --world a07 --gpu-preview-at "${camera[@]}" "$stem.png" \
-                >"$stem.log" 2>&1; then
-              tail -10 "$stem.log" | while IFS= read -r line; do printf '::error::%s\n' "$line"; done
-              exit 1
-            fi
-            test -s "$stem.png"
-            grep '^GPU adapter:' "$stem.log"
-          done
-          grep -Fx 'map="a07"' target/lighter-retail/a07-software.coverage.txt
-          awk -F, '$1=="water" { found=$2 } END { exit !(found==1) }' \
-            target/lighter-retail/a07-software.coverage.csv
-          sha256sum target/lighter-retail/a07-*.png
+          python3 -m venv "$RUNNER_TEMP/lighter-python"
+          py="$RUNNER_TEMP/lighter-python/bin/python"
+          "$py" -m pip install --disable-pip-version-check Pillow==11.3.0
+          "$py" -m unittest discover -s tools -p test_lighter_capture_matrix.py
+          "$py" tools/lighter_capture_matrix.py \
+            --profile cpu --manifest tools/fixtures/lighter-retail-scenes.json \
+            --viewer target/debug/perfect-world-explorer --client "$RUNNER_TEMP/lighter-client" \
+            --output target/lighter-retail
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: lighter-retail-coverage
-          path: |
-            target/lighter-retail/*.png
-            target/lighter-retail/*.coverage.*
-            target/lighter-retail/a07-*.log
-          if-no-files-found: error
+          name: lighter-retail-matrix
+          path: target/lighter-retail/
+          if-no-files-found: warn

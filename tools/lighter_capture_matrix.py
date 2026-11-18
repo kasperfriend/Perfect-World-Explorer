@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Capture matched retail cameras; never substitute a CPU driver for Hardware.
+
+Requires Pillow for PNG decoding and region statistics. Client bytes are not
+copied into the output, only per-frame images, sidecars, logs and the report.
+"""
+
+import argparse
+import csv
+import hashlib
+from itertools import combinations
+import json
+import math
+import os
+from pathlib import Path
+import re
+import statistics
+import subprocess
+from datetime import datetime, timezone
+
+from PIL import Image, ImageChops
+
+
+PROFILES = {
+    "cpu": ("off", "software"),
+    "physical": ("off", "software", "hardware"),
+}
+CLASSES = {"city", "forest", "open_distance", "water", "cave_instance", "effects"}
+CONDITIONS = {"day": (12, "Clear"), "night": (0, "Clear"), "rain": (12, "Rain")}
+MATCH_KEYS = (
+    "map", "eye", "yaw", "pitch", "image", "far", "fov_y", "hour", "weather",
+    "warmup_frames", "warmup_step_ms", "cutoff", "scenery_quality", "reflection",
+    "fog", "effects", "cloud_detail", "bloom", "lightmaps", "area_grass_lightmaps",
+    "adapter",
+)
+REGIONS = {
+    "whole": (0, 0, 1, 1),
+    "upper": (0, 0, 1, 1 / 3),
+    "middle": (0, 1 / 3, 1, 2 / 3),
+    "lower": (0, 2 / 3, 1, 1),
+    "center": (0.35, 0.35, 0.65, 0.65),
+}
+
+
+def metadata(path):
+    fields = dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
+    if fields.get("coverage_schema") != "2":
+        raise ValueError(f"{path}: expected matched capture schema 2")
+    return fields
+
+
+def validate_match(baseline, candidate):
+    for key in MATCH_KEYS:
+        if baseline.get(key) is None or baseline[key] != candidate.get(key):
+            raise ValueError(f"unmatched {key}: {baseline.get(key)!r} vs {candidate.get(key)!r}")
+    # Native has no ray settings. Software and Hardware must use exactly the
+    # same effective transport parameters, including ray resolution.
+    if "Off" not in (baseline["mode"], candidate["mode"]):
+        strip_mode = lambda m: re.sub(r"mode: \w+, ", "", m["settings_effective"], count=1)
+        if strip_mode(baseline) != strip_mode(candidate):
+            raise ValueError("Software and Hardware have different effective settings")
+
+
+def regions_for(size, custom=None):
+    width, height = size
+    for name, bounds in (REGIONS | (custom or {})).items():
+        if len(bounds) != 4:
+            raise ValueError(f"invalid region {name}: {bounds}")
+        x0, y0, x1, y1 = bounds
+        if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+            raise ValueError(f"invalid region {name}: {bounds}")
+        box = (round(x0 * width), round(y0 * height), round(x1 * width), round(y1 * height))
+        if box[0] >= box[2] or box[1] >= box[3]:
+            raise ValueError(f"empty pixel region {name}: {box}")
+        yield name, box
+
+
+def compare(a, b, custom=None):
+    if a.size != b.size:
+        raise ValueError(f"different image extents: {a.size} vs {b.size}")
+    diff = ImageChops.difference(a.convert("RGB"), b.convert("RGB"))
+    summary = {}
+    for name, box in regions_for(a.size, custom):
+        pixels = (box[2] - box[0]) * (box[3] - box[1])
+        hist = diff.crop(box).histogram()
+        channel_mae = [sum(i * n for i, n in enumerate(hist[j:j + 256])) / pixels for j in (0, 256, 512)]
+        summary[name] = {
+            "box_xyxy": box,
+            "pixels": pixels,
+            "mean_abs_rgb8": round(statistics.mean(channel_mae), 5),
+            "channel_mean_abs_rgb8": [round(v, 5) for v in channel_mae],
+        }
+    return summary, diff
+
+
+def capture_metadata(stem, mode, case, profile):
+    meta = metadata(stem.with_suffix(".coverage.txt"))
+    if (json.loads(meta["map"]) != case["map"] or meta["mode"].lower() != mode
+            or (float(meta["hour"]), meta["weather"].capitalize()) != CONDITIONS[case["condition"]]
+            or int(meta["warmup_frames"]) != case["warmup"]
+            or (meta["lightmaps"] == "true") != case["lightmaps"]):
+        raise ValueError(f"{stem.name}: capture doesn't match the case")
+    adapter = meta["adapter"]
+    device = re.search(r"device_type: (\w+)", adapter)
+    if not device or "backend: Vulkan" not in adapter:
+        raise ValueError(f"{stem.name}: missing Vulkan adapter information")
+    if profile == "cpu" and device[1] != "Cpu":
+        raise ValueError(f"{stem.name}: CPU evidence needs a CPU adapter")
+    if profile == "physical" and device[1] not in ("DiscreteGpu", "IntegratedGpu"):
+        raise ValueError(f"{stem.name}: physical evidence cannot use {device[1]}")
+    if case.get("camera") is not None:
+        pose = json.loads(meta["eye"]) + [float(meta["yaw"]), float(meta["pitch"])]
+        if not all(math.isclose(a, b, abs_tol=0.0001, rel_tol=1e-7) for a, b in zip(pose, case["camera"], strict=True)):
+            raise ValueError(f"{stem.name}: captured the wrong camera")
+    with Image.open(stem.with_suffix(".png")) as source:
+        image = source.convert("RGBA")
+    if f"{image.width}x{image.height}" != meta["image"]:
+        raise ValueError(f"{stem.name}: extent disagrees with metadata")
+    if hashlib.sha256(image.tobytes()).hexdigest() != meta["rgba8_sha256"]:
+        raise ValueError(f"{stem.name}: decoded RGBA8 hash disagrees with metadata")
+    return meta, image
+
+
+def inventory_for(stem, case):
+    with stem.with_suffix(".coverage.csv").open(newline="", encoding="utf-8") as stream:
+        rows = {r["class"]: {key: int(value) for key, value in r.items() if key != "class"} for r in csv.DictReader(stream)}
+    if rows["near_terrain"]["loaded"] <= 0:
+        raise ValueError(f"{stem.name}: no near terrain")
+    for cls, expected in case.get("authored_totals", {}).items():
+        total = sum(rows[cls][key] for key in ("loaded", "skipped", "failed"))
+        if total != expected:
+            raise ValueError(f"{stem.name}: {cls} accounted for {total}, not {expected}")
+    for cls, expected in case.get("min_loaded", {}).items():
+        if rows[cls]["loaded"] < expected:
+            raise ValueError(f"{stem.name}: {cls} loaded {rows[cls]['loaded']}, expected at least {expected}")
+    return rows
+
+
+def run_case(case, args):
+    name = case["id"]
+    if not re.fullmatch(r"[a-z0-9-]+", name):
+        raise ValueError(f"unsafe case ID {name!r}")
+    profile = args.profile
+    mode_results, images = {}, {}
+    for mode in PROFILES[profile]:
+        stem = args.output / f"{name}-{mode}"
+        hour, weather = CONDITIONS[case["condition"]]
+        env = {k: v for k, v in os.environ.items() if not k.startswith("PW_PREVIEW_")}
+        env.pop("PW_TEST_NO_LIGHTMAPS", None)
+        env.update(WGPU_BACKEND="vulkan", PW_PREVIEW_COVERAGE="1", PW_PREVIEW_LIGHTER=mode,
+                   PW_PREVIEW_RAY_RESOLUTION=str(args.ray_resolution), PW_PREVIEW_ANISOTROPY="8",
+                   PW_PREVIEW_HOUR=str(hour), PW_PREVIEW_WEATHER=weather, PW_PREVIEW_WARMUP=str(case["warmup"]),
+                   PW_PREVIEW_TIMED_FRAMES=str(args.timed_frames))
+        if not case["lightmaps"]:
+            env["PW_TEST_NO_LIGHTMAPS"] = "1"
+        cmd = [str(args.viewer.resolve()), str(args.client.resolve()), "--world", case["map"]]
+        if case.get("camera") is not None:
+            cmd += ["--gpu-preview-at", *map(str, case["camera"])]
+        else:
+            cmd += ["--gpu-preview"]
+        cmd.append(str(stem.with_suffix(".png").resolve()))
+        path = stem.with_suffix(".log")
+        print(f"{name}: {mode}", flush=True)
+        with path.open("wb") as log:
+            proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout)
+        if proc.returncode != 0:
+            tail = "\n".join(path.read_text(errors="replace").splitlines()[-12:])
+            raise RuntimeError(f"{stem.name}: viewer exited {proc.returncode}\n{tail}")
+        meta, images[mode] = capture_metadata(stem, mode, case, profile)
+        rows = inventory_for(stem, case) if mode != "off" else None
+        timings = json.loads(meta.get("synchronized_capture_ms", "[]"))
+        durations = None if not timings else {
+            "samples": timings,
+            "p50": statistics.median(timings),
+            "p95": sorted(timings)[math.ceil(0.95 * len(timings)) - 1],
+        }
+        mode_results[mode] = {"files": stem.name, "meta": meta, "inventory": rows, "synchronized_capture_ms": durations}
+    comparisons = {}
+    for first, second in combinations(PROFILES[profile], 2):
+        validate_match(mode_results[first]["meta"], mode_results[second]["meta"])
+        regions, diff = compare(images[first], images[second], case.get("regions"))
+        pair = f"{first}-vs-{second}"
+        diff.save(args.output / f"{name}-{pair}-abs.png")
+        comparisons[pair] = regions
+    return {"case": case, "captures": mode_results, "comparisons": comparisons}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ("manifest", "viewer", "client", "output"):
+        parser.add_argument(f"--{name}", type=Path, required=True)
+    parser.add_argument("--profile", choices=PROFILES, default="physical")
+    parser.add_argument("--ray-resolution", type=int, default=50, choices=range(25, 101), metavar="25..100")
+    parser.add_argument("--timed-frames", type=int, choices=range(121), default=0, metavar="0..120")
+    parser.add_argument("--timeout", type=int, default=360, help="seconds per capture")
+    parser.add_argument("--require-complete", action="store_true", help="fail unless all required physical matrix cells exist")
+    args = parser.parse_args()
+    cases = json.loads(args.manifest.read_text(encoding="utf-8"))["cases"]
+    if not cases or len({case["id"] for case in cases}) != len(cases):
+        parser.error("expected nonempty, unique case identifiers")
+    covered = {(cls, case["condition"]) for case in cases for cls in case["classes"]}
+    missing = sorted({(cls, condition) for cls in CLASSES for condition in CONDITIONS} - covered)
+    complete = not missing and args.profile == "physical"
+    if args.require_complete and not complete:
+        parser.error(f"physical matrix is incomplete: profile={args.profile}, missing cells={missing}")
+    args.output.mkdir(parents=True, exist_ok=True)
+    if any(args.output.iterdir()):
+        parser.error(f"use a fresh output directory: {args.output}")
+    report = {"started_utc": datetime.now(timezone.utc).isoformat(), "source_sha": os.environ.get("GITHUB_SHA"),
+              "profile": args.profile, "declared_physical_matrix_complete": complete, "missing_scene_conditions": missing,
+              "metric": "mean absolute difference of encoded RGB8 pixel channels (lower is closer, not a pass threshold)",
+              "cases": []}
+    try:
+        for case in cases:
+            result = run_case(case, args)
+            report["cases"].append(result)
+            software = result["captures"]["software"]
+            metrics = result["comparisons"]["off-vs-software"]
+            bmd = software["inventory"]["buildings"]
+            roots = software["inventory"]["effect_roots"]
+            summary = ", ".join(f"{key}:{r['mean_abs_rgb8']:.3f}" for key, r in metrics.items())
+            prefix = "::notice::" if os.environ.get("GITHUB_ACTIONS") == "true" else ""
+            print(f"{prefix}{case['id']} RGB8 MAE {summary}; ray BMD {bmd['loaded']}/{bmd['skipped']}/{bmd['failed']}; "
+                  f"GFX roots {roots['loaded']}/{roots['skipped']}/{roots['failed']}; "
+                  f"eye {software['meta']['eye']} yaw {software['meta']['yaw']} pitch {software['meta']['pitch']}", flush=True)
+            if len(report["cases"]) == 1:
+                print(f"{prefix}{software['meta']['adapter']}", flush=True)
+    except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired, KeyError) as error:
+        report["error"] = str(error)
+        raise SystemExit(str(error)) from error
+    finally:
+        report["declared_physical_matrix_complete"] = complete and "error" not in report
+        (args.output / "matrix.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()
