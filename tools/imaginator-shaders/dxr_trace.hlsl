@@ -358,7 +358,10 @@ void cs(uint3 id : SV_DispatchThreadID)
     float3 radiance = (reflection + indirect * mean_visibility + lamps) * inv;
     if ((terms & TERM_FULL_TRACE) != 0u)
     {
-        out_tex[int2(id.xy)] = float4((full_direct + reflection + indirect + lamps) * inv, 1.0);
+        // Ray distance, not projected device depth; -1 means sky. Temporal
+        // consumers also need camera/object motion before they can use it.
+        out_tex[int2(id.xy)] = float4((full_direct + reflection + indirect + lamps) * inv,
+                                     hits > 0.0 ? distance / hits : -1.0);
     }
     else
     {

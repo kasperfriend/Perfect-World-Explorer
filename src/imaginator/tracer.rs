@@ -739,15 +739,21 @@ impl Tracer {
             out[o + 3] = if s.hit > 0.5 { s.occlusion } else { -1. };
         }
     }
-    /// Pack the independently shaded image, including sky misses. Alpha is
-    /// unused by full-image output and deliberately does not shadow it again.
+    /// Pack full-image radiance and primary-ray distance. Alpha is the mean
+    /// distance among hits, or -1 for sky. It is not device depth: projecting
+    /// this value and producing motion vectors are still required by temporal
+    /// upscalers and frame generation. The full-image compositor ignores alpha.
     pub fn pack_full(samples: &[Sample], out: &mut [f32]) {
         for (i, sample) in samples.iter().enumerate() {
             let o = i * 4;
             out[o] = sample.radiance.x;
             out[o + 1] = sample.radiance.y;
             out[o + 2] = sample.radiance.z;
-            out[o + 3] = 1.;
+            out[o + 3] = if sample.hit > 0. {
+                sample.distance / sample.hit
+            } else {
+                -1.
+            };
         }
     }
 }
@@ -976,6 +982,28 @@ mod tests {
     }
 
     #[test]
+    fn full_trace_distance_averages_only_primary_hits() {
+        let mut packed = [0.; 8];
+        Tracer::pack_full(
+            &[
+                Sample {
+                    distance: 5.,
+                    hit: 0.5,
+                    ..Sample::default()
+                },
+                Sample {
+                    distance: 0.,
+                    hit: 0.,
+                    ..Sample::default()
+                },
+            ],
+            &mut packed,
+        );
+        assert_eq!(packed[3], 10.);
+        assert_eq!(packed[7], -1.);
+    }
+
+    #[test]
     fn full_trace_packs_surface_and_sky_radiance() {
         let tracer = Tracer::new(room(), Environment::default());
         let samples = tracer.trace(&camera(), &options(), 8, 8, 1);
@@ -988,7 +1016,14 @@ mod tests {
             assert_eq!(pixel[0], sample.radiance.x);
             assert_eq!(pixel[1], sample.radiance.y);
             assert_eq!(pixel[2], sample.radiance.z);
-            assert_eq!(pixel[3], 1.);
+            assert_eq!(
+                pixel[3],
+                if sample.hit > 0. {
+                    sample.distance / sample.hit
+                } else {
+                    -1.
+                }
+            );
         }
         let sky_ray = Ray::new(v3(0., 100., 0.), v3(0., 1., 0.));
         let mut rays = 0;
