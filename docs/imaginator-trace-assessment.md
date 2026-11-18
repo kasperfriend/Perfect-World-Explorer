@@ -18,7 +18,7 @@ This describes the implementation, not a claim of full world parity.
 * CPU ray traversal uses foliage and captured scenery alpha cutouts. DXR now
   packs captured texture/UV data and evaluates non-opaque triangle candidates,
   including shadow rays, using per-hit barycentrics. This DXR path has not been
-  verified on physical hardware. Terrain still uses per-triangle preview colours.
+  verified on physical hardware. Terrain uses the same bounded per-hit baked preview as the CPU path.
   Both paths cast rays, but neither reproduces the entire existing world.
 * The traced image is bilinearly scaled by the compositor. FSR/XeSS/DLSS temporal
   upscalers and their frame generators were gated because their existing inputs

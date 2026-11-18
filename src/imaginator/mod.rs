@@ -293,9 +293,8 @@ enum CaptureState {
     Done,
 }
 
-/// Pack material records. Terrain has a bounded world-aligned preview and is
-/// still approximated at triangle centroids; per-hit texture surfaces override
-/// these material colours in the DXR shader.
+/// Pack the material IDs and fallback colours. Per-hit samples override these
+/// colours when a captured texture or terrain preview is available.
 fn pack_hardware_materials(bvh: &bvh::Bvh, source: &[bvh::Material]) -> (Vec<u8>, Vec<u8>) {
     let mut normals = Vec::with_capacity(bvh.triangles.len() * 16);
     let mut materials = Vec::with_capacity(source.len() * 16);
@@ -309,26 +308,13 @@ fn pack_hardware_materials(bvh: &bvh::Bvh, source: &[bvh::Material]) -> (Vec<u8>
             materials.extend_from_slice(&value.to_ne_bytes());
         }
     }
-    for (index, tri) in bvh.triangles.iter().enumerate() {
-        let mut material = tri.material as usize;
-        if tri.material == bvh::material::TERRAIN || tri.material == bvh::material::SCENERY {
-            if let Some((rgba, _)) = bvh.surface_sample(index as u32, [1. / 3., 1. / 3.]) {
-                let linear = |c: u8| {
-                    let c = c as f32 / 255.;
-                    if c <= 0.04045 {
-                        c / 12.92
-                    } else {
-                        ((c + 0.055) / 1.055).powf(2.4)
-                    }
-                };
-                let specular = source.get(material).map(|m| m.specular).unwrap_or(0.);
-                material = materials.len() / 16;
-                for value in [linear(rgba[0]), linear(rgba[1]), linear(rgba[2]), specular] {
-                    materials.extend_from_slice(&value.to_ne_bytes());
-                }
-            }
-        }
-        for value in [tri.normal.x, tri.normal.y, tri.normal.z, material as f32] {
+    for tri in &bvh.triangles {
+        for value in [
+            tri.normal.x,
+            tri.normal.y,
+            tri.normal.z,
+            tri.material as f32,
+        ] {
             normals.extend_from_slice(&value.to_ne_bytes());
         }
     }
@@ -340,6 +326,17 @@ fn pack_hardware_materials(bvh: &bvh::Bvh, source: &[bvh::Material]) -> (Vec<u8>
 /// once even when several streamed pages refer to the same Arc.
 fn pack_hardware_surfaces(bvh: &bvh::Bvh) -> Result<Vec<u8>, String> {
     let primitive_count = bvh.triangles.len();
+    let terrain = bvh.terrain_albedo.as_ref().filter(|t| {
+        t.width > 0
+            && t.height > 0
+            && t.extent.iter().all(|v| v.is_finite() && *v > 0.)
+            && t.origin.iter().all(|v| v.is_finite())
+            && (t.width as usize)
+                .checked_mul(t.height as usize)
+                .and_then(|n| n.checked_mul(4))
+                == Some(t.rgba.len())
+    });
+    let texture_count = bvh.textures.len() + usize::from(terrain.is_some());
     let dir = 4usize
         .checked_add(
             primitive_count
@@ -349,8 +346,7 @@ fn pack_hardware_surfaces(bvh: &bvh::Bvh) -> Result<Vec<u8>, String> {
         .ok_or("surface size overflow")?;
     let header_words = dir
         .checked_add(
-            bvh.textures
-                .len()
+            texture_count
                 .checked_mul(4)
                 .ok_or("texture table overflow")?,
         )
@@ -360,7 +356,7 @@ fn pack_hardware_surfaces(bvh: &bvh::Bvh) -> Result<Vec<u8>, String> {
     }
     let mut words = vec![0u32; header_words];
     words[0] = primitive_count as u32;
-    words[1] = bvh.textures.len() as u32;
+    words[1] = texture_count as u32;
     words[2] = dir as u32;
     for i in 0..primitive_count {
         words[4 + i * 12 + 10] = u32::MAX;
@@ -383,6 +379,21 @@ fn pack_hardware_surfaces(bvh: &bvh::Bvh) -> Result<Vec<u8>, String> {
         }
         words[base + 10] = surface.texture;
         words[base + 11] = surface.alpha_cutoff.map_or(u32::MAX, u32::from);
+    }
+    if let Some(terrain) = terrain {
+        for (i, tri) in bvh.triangles.iter().enumerate() {
+            if tri.material != bvh::material::TERRAIN {
+                continue;
+            }
+            let base = 4 + i * 12;
+            for (j, v) in [tri.a, tri.b, tri.c].iter().enumerate() {
+                words[base + j * 2] = ((v.x - terrain.origin[0]) / terrain.extent[0]).to_bits();
+                words[base + j * 2 + 1] = ((v.z - terrain.origin[1]) / terrain.extent[1]).to_bits();
+            }
+            // Marker selects bounded nearest sampling and missing-pixel fallback.
+            words[base + 10] = bvh.textures.len() as u32;
+            words[base + 11] = u32::MAX - 1;
+        }
     }
     let mut offsets = std::collections::HashMap::<usize, u32>::new();
     for (i, texture) in bvh.textures.iter().enumerate() {
@@ -417,6 +428,25 @@ fn pack_hardware_surfaces(bvh: &bvh::Bvh) -> Result<Vec<u8>, String> {
         words[dir + i * 4] = offset;
         words[dir + i * 4 + 1] = texture.width;
         words[dir + i * 4 + 2] = texture.height;
+    }
+    if let Some(terrain) = terrain {
+        let end = words
+            .len()
+            .checked_add(terrain.rgba.len() / 4)
+            .ok_or("terrain payload overflow")?;
+        if end > u32::MAX as usize {
+            return Err("hardware texture data exceeds 32-bit addressing".into());
+        }
+        let desc = dir + bvh.textures.len() * 4;
+        words[desc] = words.len() as u32;
+        words[desc + 1] = terrain.width;
+        words[desc + 2] = terrain.height;
+        words.extend(
+            terrain
+                .rgba
+                .chunks_exact(4)
+                .map(|p| u32::from_le_bytes([p[0], p[1], p[2], p[3]])),
+        );
     }
     Ok(words.into_iter().flat_map(u32::to_le_bytes).collect())
 }
@@ -2139,7 +2169,45 @@ mod tests {
     }
 
     #[test]
-    fn hardware_terrain_material_uses_preview_and_preserves_other_ids() {
+    fn hardware_terrain_preview_packs_world_uv_and_missing_texels() {
+        use super::{bvh, math::v3, pack_hardware_surfaces};
+        let tri = bvh::Triangle {
+            a: v3(10., 0., 20.),
+            b: v3(14., 0., 20.),
+            c: v3(10., 0., 28.),
+            normal: v3(0., 1., 0.),
+            material: bvh::material::TERRAIN,
+        };
+        let mut tree = bvh::Bvh::build(vec![tri]);
+        tree.terrain_albedo = Some(std::sync::Arc::new(bvh::TerrainAlbedo {
+            origin: [10., 20.],
+            extent: [4., 8.],
+            width: 2,
+            height: 1,
+            rgba: vec![1, 2, 3, 255, 4, 5, 6, 0],
+        }));
+        let bytes = pack_hardware_surfaces(&tree).unwrap();
+        let word = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        assert_eq!((word(0), word(1), word(2)), (1, 1, 16));
+        assert_eq!(
+            [word(4), word(5), word(6), word(7), word(8), word(9)],
+            [
+                0f32.to_bits(),
+                0f32.to_bits(),
+                1f32.to_bits(),
+                0f32.to_bits(),
+                0f32.to_bits(),
+                1f32.to_bits()
+            ]
+        );
+        assert_eq!(word(14), 0);
+        assert_eq!(word(15), u32::MAX - 1);
+        assert_eq!((word(16), word(17), word(18)), (20, 2, 1));
+        assert_eq!((word(20), word(21)), (0xff030201, 0x00060504));
+    }
+
+    #[test]
+    fn hardware_terrain_uses_fallback_material_and_preserves_ids() {
         use super::math::v3;
         use super::{bvh, pack_hardware_materials};
         use std::sync::Arc;
@@ -2165,10 +2233,9 @@ mod tests {
         let word = |bytes: &[u8], offset: usize| {
             f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
         };
-        assert_eq!(word(&normals, 12) as usize, scene.materials.len());
+        assert_eq!(word(&normals, 12) as u16, bvh::material::TERRAIN);
         assert_eq!(word(&normals, 28) as u16, bvh::material::SCENERY);
-        assert_eq!(word(&materials, scene.materials.len() * 16), 1.);
-        assert_eq!(word(&materials, scene.materials.len() * 16 + 4), 0.);
+        assert_eq!(materials.len(), scene.materials.len() * 16);
     }
 
     /// Building DXR structures is only for the hardware tracer.

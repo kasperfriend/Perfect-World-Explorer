@@ -96,7 +96,7 @@ pub struct Bvh {
     /// Sparse per-triangle texture data; non-textured geometry has no entry.
     pub surfaces: Arc<std::collections::HashMap<u32, TexturedTriangle>>,
     pub textures: Arc<Vec<Arc<Texture>>>,
-    /// Bounded, world-aligned terrain albedo preview (software tracer only).
+    /// Bounded, world-aligned terrain albedo preview shared by both tracers.
     pub terrain_albedo: Option<Arc<TerrainAlbedo>>,
     pub nodes: Vec<Node>,
     /// Triangle indices, permuted so every leaf owns a contiguous range.

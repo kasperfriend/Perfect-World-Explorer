@@ -93,13 +93,24 @@ bool texture_sample(uint primitive, float2 bary, out float4 rgba, out uint cutof
     float2 uv1 = asfloat(uint2(surface_data[base + 2u], surface_data[base + 3u]));
     float2 uv2 = asfloat(uint2(surface_data[base + 4u], surface_data[base + 5u]));
     float2 uv = uv0 * (1.0 - bary.x - bary.y) + uv1 * bary.x + uv2 * bary.y;
+    cutoff = surface_data[base + 11u];
+    if (cutoff == 0xfffffffeu)
+    {
+        // Terrain uses the CPU preview's bounded nearest sample, not UV wrap.
+        if (!all(isfinite(uv)) || any(uv < 0.0) || any(uv > 1.0)) { return false; }
+        uint2 xy = uint2(floor(uv * float2(width - 1u, height - 1u) + 0.5));
+        uint pixel = surface_data[offset + xy.y * width + xy.x];
+        if ((pixel >> 24u) == 0u) { return false; }
+        rgba = float4(pixel & 255u, (pixel >> 8u) & 255u, (pixel >> 16u) & 255u, (pixel >> 24u)) / 255.0;
+        cutoff = 0xffffffffu;
+        return true;
+    }
     float2 origin = asfloat(uint2(surface_data[base + 6u], surface_data[base + 7u]));
     float2 scale = asfloat(uint2(surface_data[base + 8u], surface_data[base + 9u]));
     uv = frac(origin + frac(uv) * scale);
     uint2 xy = min(uint2(uv * float2(width, height)), uint2(width - 1u, height - 1u));
     uint pixel = surface_data[offset + xy.y * width + xy.x];
     rgba = float4(pixel & 255u, (pixel >> 8u) & 255u, (pixel >> 16u) & 255u, (pixel >> 24u) & 255u) / 255.0;
-    cutoff = surface_data[base + 11u];
     return true;
 }
 
