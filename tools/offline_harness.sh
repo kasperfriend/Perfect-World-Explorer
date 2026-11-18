@@ -913,7 +913,7 @@ fn main() {
             let ext = e.name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
             if !matches!(ext.as_str(),
                 "gfx" | "gfx_err" | "sdr" | "ski" | "bon" | "mox" | "spt"
-                | "dds" | "tga" | "bmp" | "jpg") {
+                | "dds" | "tga" | "bmp" | "jpg" | "ttf") {
                 continue;
             }
             let payload = match pck::read_entry(&mut f, e) {
@@ -998,6 +998,19 @@ fn main() {
                     t.record(&e.name,
                         if payload.len() >= 4 && payload[..2] == [0xff, 0xd8] { Ok(()) }
                         else { Err(format!("{} bytes, not FFD8", payload.len())) });
+                }
+                "ttf" => {
+                    // TrueType outlines start 00 01 00 00, CFF-based OTTO, and
+                    // a collection ttcf. Reading the glyphs needs a font
+                    // library this project does not carry.
+                    let r = (|| -> Result<(), String> {
+                        if payload.len() < 12 { return Err(format!("{} bytes", payload.len())); }
+                        match &payload[..4] {
+                            b"\x00\x01\x00\x00" | b"OTTO" | b"true" | b"ttcf" => Ok(()),
+                            other => Err(format!("not a font sfnt: {other:02x?}")),
+                        }
+                    })();
+                    t.record(&e.name, r);
                 }
                 _ => {}
             }
