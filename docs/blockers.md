@@ -1656,8 +1656,25 @@ ECWLD references point at are well-formed 36-byte areas (`type_id` +0, centre
 +4/8/12, grid +16, width +20, height +24, record +32), and all 1,120 references
 to the staged `BSData\20.dat` decode their masks exactly.
 
+**`grasses.pck` is an Angelica container.** The geometry half opened the pack with
+`pck::directory` only, and this pack has no `fdfdfeee`/`f00dbeef` guard words —
+its entries sit behind the plain `0x4dca23ef` prefix. So the reader rejected the
+archive and the whole grass load failed, taking the placements with it. Both
+containers are now tried, and a pack that opens as neither leaves the placements
+in place without geometry instead of failing:
+
+```
+Loaded 121 grass areas, 72121 active bits, 0/220 MOXB types, 0 textures
+```
+
+The `0/220` is honest: the 1.3.1 `grasses.pck` staged here is the 103-entry
+editor corpus (`帝国花草/…`), which does not contain the world's `水草02.mox` and
+friends. The loader names each missing model rather than pretending it loaded
+one.
+
 - **Status:** split reading fixed and tested (45 `client`-mode tests green). Grass
-  degrades per area instead of aborting. Water is still open: see B-10.
+  loads 121 areas / 72,121 live cells from the real 1.3.1 world instead of
+  failing, and degrades per area and per model. Water is still open: see B-10.
 
 ## B-10: an open-water area reads 21 % dry
 

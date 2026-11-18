@@ -554,11 +554,49 @@ impl Grass {
         let active: usize = areas.iter().map(|a| a.active.len()).sum();
         eprintln!("Grass placement residency: {:.2} MiB compressed bitmaps; {} live cells; avoided {:.2} MiB of eager IDs/transforms", packed as f64 / 1048576., active,
             active as f64 * (4 + std::mem::size_of::<random::Placement>()) as f64 / 1048576.);
-        let mut archive = File::open(element.join("grasses.pck")).map_err(|e| e.to_string())?;
-        let entries: HashMap<_, _> = pck::directory(&mut archive)?
-            .into_iter()
-            .map(|e| (e.name.to_lowercase(), e))
-            .collect();
+        // `grasses.pck` is an Angelica container, not a retail v2 PCK: its
+        // entries sit behind the 0x4dca23ef prefix with no `fdfdfeee` guard
+        // words, so `pck::directory` rejects it outright. Both containers are
+        // tried, and a pack that fails both leaves the placements in place
+        // without geometry rather than failing the whole load.
+        let mut archive = match File::open(element.join("grasses.pck")) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!("grass geometry unavailable ({}): {error}", element.display());
+                return Ok(Self {
+                    areas,
+                    types: scene.grass_types.clone(),
+                    models: Vec::new(),
+                    textures: HashMap::new(),
+                    texture_mips: HashMap::new(),
+                });
+            }
+        };
+        let directory = match pck::directory(&mut archive) {
+            Ok(entries) => Ok(entries),
+            Err(v2) => match crate::angelica_pck::directory(&mut archive) {
+                Ok(entries) => Ok(entries),
+                Err(angelica) => Err(format!(
+                    "grasses.pck is neither container: v2: {v2}; Angelica: {angelica}"
+                )),
+            },
+        };
+        let entries: HashMap<_, _> = match directory {
+            Ok(entries) => entries
+                .into_iter()
+                .map(|e| (e.name.to_lowercase(), e))
+                .collect(),
+            Err(error) => {
+                eprintln!("grass geometry unavailable: {error}");
+                return Ok(Self {
+                    areas,
+                    types: scene.grass_types.clone(),
+                    models: Vec::new(),
+                    textures: HashMap::new(),
+                    texture_mips: HashMap::new(),
+                });
+            }
+        };
         let mut models = Vec::with_capacity(scene.grass_types.len());
         let mut textures = HashMap::new();
         let mut texture_mips = HashMap::new();
