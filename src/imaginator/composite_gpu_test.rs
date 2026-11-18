@@ -68,10 +68,13 @@ fn the_composite_changes_a_frame_on_a_real_device() {
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
+        // Exactly what DX12 reports for a swapchain surface, and nothing more:
+        // `COLOR_TARGET | COPY_SRC | COPY_DST`, with no `TEXTURE_BINDING`. A test
+        // that hands the composite a *sampleable* frame passes where the real one
+        // fails, which is why this has to be the restricted set.
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::TEXTURE_BINDING,
+            | wgpu::TextureUsages::COPY_DST,
         // Declared so the readback can be done through a *linear* view: an
         // `Rgba8UnormSrgb` texture copied to a buffer yields the raw stored
         // bytes, but the values compared below are meant to be the same ones a
@@ -154,7 +157,12 @@ fn the_composite_changes_a_frame_on_a_real_device() {
             &device,
             &queue,
             &mut encoder,
-            None,
+            // `Some`, not `None`: production always passes the swapchain image,
+            // and that is the path that copies the frame into a sampleable scratch
+            // texture first. Testing only `None` left the copy - and everything
+            // that depends on the surface's usages - completely unexercised, which
+            // is how a whole release can compose nothing while the test passes.
+            Some(&frame_texture),
             &frame_view,
             (W, H),
             &settings,

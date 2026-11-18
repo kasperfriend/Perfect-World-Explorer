@@ -6060,7 +6060,7 @@ pub fn run(
                                             label: Some("imaginator composite"),
                                         },
                                     );
-                                    renderer.modules.imaginator().composite(
+                                    let composited = renderer.modules.imaginator().composite(
                                         &renderer.device,
                                         &renderer.queue,
                                         &mut encoder,
@@ -6070,6 +6070,13 @@ pub fn run(
                                         params,
                                     );
                                     renderer.queue.submit(Some(encoder.finish()));
+                                    if !composited {
+                                        // Every gate that refuses a frame records why;
+                                        // this is what carries it to `startup.log`, so a
+                                        // stalled module explains itself instead of
+                                        // showing "frames composited: 0" and nothing else.
+                                        renderer.modules.imaginator().note_skipped_frame();
+                                    }
                                 }
                             }
                             // When frame generation separates the UI from the scene,

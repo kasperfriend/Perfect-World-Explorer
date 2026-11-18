@@ -198,6 +198,16 @@ pub struct Imaginator {
     pub last_error: Option<String>,
     /// Set while the page is open, so the preview can be read back.
     page_open: bool,
+    /// Why the last frame did not composite, if it did not.
+    ///
+    /// The module could previously be active with `frames` stuck at zero and
+    /// nothing anywhere saying which of half a dozen early returns fired. Every
+    /// skip now records its reason here, and the page shows it next to the count.
+    pub skip_reason: Option<String>,
+    /// How many frames have been skipped, and the reason already printed, so a
+    /// stall appears in `startup.log` without repeating every frame.
+    skipped_frames: u64,
+    logged_skip: Option<String>,
     /// Whether the user has asked for a capture since the world loaded.
     capture_state: CaptureState,
     /// Name of the loaded map, for the page.
@@ -236,6 +246,9 @@ impl Imaginator {
             frames: 0,
             last_error: None,
             page_open: false,
+            skip_reason: None,
+            skipped_frames: 0,
+            logged_skip: None,
             capture_state: CaptureState::WaitingForWorld,
             map_label: String::new(),
         }
@@ -372,9 +385,32 @@ impl Imaginator {
     /// backend without it says "unavailable" on the module page instead of
     /// submitting a copy the validation layer would reject.
     pub fn report_uncopyable_frame(&mut self) {
-        self.status = "the swapchain image is not copyable on this backend \
-                       (no `COPY_SRC`), so the traced terms cannot be composited"
-            .into();
+        let why = "the swapchain image is not copyable on this backend \
+                   (no `COPY_SRC`), so the traced terms cannot be composited";
+        self.status = why.into();
+        self.skip_reason = Some(why.into());
+    }
+
+    /// Record that the composite did not run this frame, and say so in the log
+    /// once per reason.
+    ///
+    /// The report that started this round was "both of them green, no changes,
+    /// frames composited 0": the page had the number and nothing had the reason,
+    /// so the only way to find the gate was to read the code and guess. A reason
+    /// now reaches `startup.log` the first time it happens, which is the artefact
+    /// that actually gets attached.
+    pub fn note_skipped_frame(&mut self) {
+        self.skipped_frames += 1;
+        let reason = self.skip_reason.clone().unwrap_or_else(|| {
+            "no gate reported a reason; the frame loop never reached the composite".into()
+        });
+        if self.logged_skip.as_deref() != Some(reason.as_str()) {
+            eprintln!(
+                "Imaginator: not compositing (frame {}): {}",
+                self.skipped_frames, reason
+            );
+            self.logged_skip = Some(reason);
+        }
     }
 
     /// Tell the module the frame is composed by a frame generator this frame.
@@ -898,8 +934,16 @@ impl Imaginator {
         params: GpuParams,
     ) -> bool {
         if !self.settings.active() {
+            self.skip_reason = Some(if self.settings.tracer == TracerKind::Off {
+                "the tracer is off".into()
+            } else if self.settings.strength <= 0. {
+                format!("strength is {}", self.settings.strength)
+            } else {
+                "reflections, lighting and shadows are all off".into()
+            });
             return false;
         }
+        self.skip_reason = None;
         if DEVICE_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
             // Set once by the handler above. Drawing again would only repeat the
             // same rejection, so the module goes quiet and says why. Saving the
@@ -914,6 +958,7 @@ impl Imaginator {
             return false;
         }
         if self.composite.is_none() {
+            self.skip_reason = Some("the composite was never created on this device".into());
             return false;
         }
         let (tw, th) = gpu::traced_extent(extent.0, extent.1, self.settings.trace_scale);
@@ -1042,7 +1087,9 @@ impl Imaginator {
         };
         composite.set_lights(queue, &lights);
         if composite.triangle_count() == 0 {
-            self.status = "no geometry captured yet".into();
+            let why = "the composite has no scene buffers: the capture has not been                        uploaded to this device";
+            self.status = why.into();
+            self.skip_reason = Some(why.into());
             return false;
         }
         let source = match self.settings.tracer {
@@ -1067,6 +1114,7 @@ impl Imaginator {
             }
             Err(why) => {
                 self.last_error = Some(why.clone());
+                self.skip_reason = Some(why.clone());
                 self.status = why;
                 false
             }
@@ -1311,6 +1359,26 @@ impl Imaginator {
             .small()
             .weak(),
         );
+        // A stalled module has to say which gate stopped it. This sits directly
+        // under the count because that is the number a reader looks at first.
+        if self.frames == 0 {
+            if let Some(why) = self.skip_reason.as_ref() {
+                ui.label(
+                    egui::RichText::new(format!("Nothing composited because: {why}"))
+                        .small()
+                        .color(egui::Color32::LIGHT_RED),
+                );
+            } else if self.settings.active() {
+                ui.label(
+                    egui::RichText::new(
+                        "Nothing composited yet, and no gate reported a reason: the frame loop \
+                         is not reaching the composite at all",
+                    )
+                    .small()
+                    .color(egui::Color32::LIGHT_RED),
+                );
+            }
+        }
         ui.horizontal(|ui| {
             // The geometry is captured while the map loads, whether or not the
             // module is switched on, so switching the tracer on works on the

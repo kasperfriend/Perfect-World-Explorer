@@ -7,6 +7,8 @@ pub struct Color32(pub [u8; 4]);
 impl Color32 {
     pub const GRAY: Color32 = Color32([128, 128, 128, 255]);
     pub const LIGHT_GREEN: Color32 = Color32([144, 238, 144, 255]);
+    pub const LIGHT_RED: Color32 = Color32([255, 128, 128, 255]);
+    pub const RED: Color32 = Color32([255, 0, 0, 255]);
     pub const fn from_rgb(r: u8, g: u8, b: u8) -> Color32 {
         Color32([r, g, b, 255])
     }
