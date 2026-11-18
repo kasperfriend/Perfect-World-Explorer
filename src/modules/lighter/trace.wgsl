@@ -248,7 +248,7 @@ fn coverage_sample(ray: Ray, m: bool, inst: u32, v: vec3<u32>) -> f32 {
     let p = floats(m,inst) + rotate(floats(m,v.x),bitcast<f32>(word(m,inst+4u)),bitcast<f32>(word(m,inst+5u)))*bitcast<f32>(word(m,inst+3u));
     let key = bitcast<u32>(i32(round(dot(n,p)*64.)));
     let shape = bitcast<vec3<u32>>(vec3<i32>(round(n*16.)));
-    let salt = hash(key ^ shape.x*0x9e3779b9u ^ shape.y*0x85ebca6bu ^ shape.z*0xc2b2ae35u ^ ray.pixel_seed);
+    let salt = hash(key ^ (shape.x*0x9e3779b9u) ^ (shape.y*0x85ebca6bu) ^ (shape.z*0xc2b2ae35u) ^ ray.pixel_seed);
     // Rotate the strata independently per pixel and plane, not per frame.
     // A fixed plane-only rotation would correlate every pixel at low SPP.
     return fract(ray.coverage + f32(salt & 0xffffffu)/16777216.);
@@ -723,8 +723,8 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                     // Sample a normalized power-cosine lobe around the mirror.
                     // Near its peak, Blinn's half-angle is half the outgoing
                     // angle, so the equivalent outgoing exponent is power/4.
-                    let exponent = s.power*0.25+1.;
-                    let cosine = pow(max(random(seed),1.e-7),1./exponent);
+                    let power = s.power*0.25;
+                    let cosine = pow(max(random(seed),1.e-7),1./(power+1.));
                     d = around(d,cosine,sqrt(max(0.,1.-cosine*cosine)),random(seed)*6.2831853);
                     // Clipping the lobe conserves energy at the geometric
                     // horizon. Resampling would artificially brighten it.
@@ -764,7 +764,7 @@ fn render(@builtin(global_invocation_id) id: vec3<u32>) {
     for (var sample=0u; sample<frame.options.z; sample++) {
         // Camera jitter and coverage of the next sample don't depend on how
         // many random numbers the previous sample's paths consumed.
-        var seed = hash(pixel_seed ^ sample*0x9e3779b9u);
+        var seed = hash(pixel_seed ^ (sample*0x9e3779b9u));
         let jitter = select(vec2<f32>(0.5),vec2<f32>(random(&seed),random(&seed)),frame.options.z>1u);
         let screen = (vec2<f32>(id.xy)+jitter)/vec2<f32>(frame.extent.xy);
         let ndc = screen*vec2<f32>(2.,-2.)+vec2<f32>(-1.,1.);

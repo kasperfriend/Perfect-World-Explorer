@@ -241,3 +241,68 @@ impl<'a> Moving<'a> {
         Ok(self.builder.finish())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gfx_player::{EffectMesh, EffectVertex, MeshMaterial};
+
+    #[test]
+    fn opaque_gfx_skins_keep_authored_power_without_promoting_sheets() {
+        let mut quad = EffectQuad {
+            texture: String::new(),
+            source_blend: 5,
+            destination_blend: 6,
+            depth_test: true,
+            layer: 0,
+            priority: 0,
+            tile: false,
+            positions: [[0.; 3]; 4],
+            uv: [[0.; 2]; 4],
+            color: [1.; 4],
+            vertex_colors: None,
+            mesh: Some(EffectMesh {
+                texture: "fixture.png".into(),
+                vertices: [[0., 0., -1.], [1., 0., -1.], [0., 1., -1.]]
+                    .map(|position| EffectVertex {
+                        position,
+                        uv: [0.; 2],
+                        normal: [0., 0., 1.],
+                    })
+                    .to_vec(),
+                write_depth: true,
+                material: Some(MeshMaterial {
+                    ambient: [0.; 4],
+                    diffuse: [1.; 4],
+                    emissive: [0.; 4],
+                    specular: [1.; 4],
+                    power: 37.,
+                }),
+            }),
+        };
+        let pack = |q: &EffectQuad, has_alpha| {
+            let mut bank = Textures::default();
+            let mut moving = Moving::new(&mut bank);
+            moving
+                .effects("fixture", std::slice::from_ref(q), &mut |_| {
+                    Ok((
+                        image::RgbaImage::from_pixel(1, 1, image::Rgba([255; 4])),
+                        has_alpha,
+                    ))
+                })
+                .unwrap();
+            moving.finish().unwrap().words
+        };
+        let solid = pack(&quad, false);
+        let material = solid[3] as usize;
+        assert_eq!(solid[11], u32::from(MASK_SOLID | MASK_SHADOW));
+        assert_eq!(f32::from_bits(solid[material + 3]), 0.25);
+        assert_eq!(f32::from_bits(solid[material + 4]), 37.);
+        let alpha = pack(&quad, true);
+        assert_eq!(alpha[11], u32::from(MASK_BLEND | MASK_SHADOW));
+        quad.color[3] = 0.5;
+        let sheet = pack(&quad, false);
+        assert_eq!(sheet[11], u32::from(MASK_BLEND | MASK_SHADOW));
+        assert_ne!(sheet[sheet[3] as usize + 1] & WRITE_DEPTH, 0);
+    }
+}

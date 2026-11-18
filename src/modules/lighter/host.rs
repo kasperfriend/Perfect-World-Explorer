@@ -204,6 +204,7 @@ impl Feed {
             let id = builder.surface(Surface::new(0, 0, 0., 0.));
             builder.world_mesh(&span(&m.vertices, extras, id, |v| rgba(v.color))?)?;
         }
+        debug_assert_eq!(m.local_pages.len(), m.local_gloss.len());
         for (page, gloss) in m.local_pages.iter().zip(&m.local_gloss) {
             building(&mut builder, &mut bank, page, gloss)?;
         }
@@ -718,6 +719,7 @@ fn building(
     if page.placements.is_empty() {
         append(&page.indices, 0, Gloss::default())?;
     }
+    debug_assert_eq!(page.placements.len(), gloss.len());
     for (range, &gloss) in page.placements.iter().zip(gloss) {
         let flags = if range.visibility.reflect {
             0

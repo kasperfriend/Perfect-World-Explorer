@@ -140,13 +140,15 @@ mod tests {
     #[test]
     fn defaults_off_and_validates_persisted_controls() {
         assert_eq!(Settings::default().mode, Mode::Off);
-        let s =
-            Settings::decode("mode=hardware\nbounces=99\nshadows=false\nsamples=0\nresolution=bad");
+        let s = Settings::decode(
+            "mode=hardware\nbounces=99\nshadows=false\nsoft_sun=false\ndenoiser=false\nprogressive=false\nsamples=0\nresolution=bad",
+        );
         assert_eq!(s.mode, Mode::Hardware);
         assert_eq!(s.bounces, 4);
         assert_eq!(s.samples, 1);
         assert_eq!(s.resolution, 50);
         assert!(!s.shadows && s.lighting && s.reflections);
+        assert!(!s.denoiser && !s.progressive && !s.soft_sun);
         assert_eq!(Settings::decode(&s.encode()), s);
         assert_eq!(Settings::decode("mode=unknown"), Settings::default());
     }

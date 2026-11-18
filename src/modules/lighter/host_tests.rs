@@ -598,7 +598,7 @@ fn lighter_streamed_world_pixels() {
             .chunks_exact(5)
             .any(|m| m[1] & super::BAKED != 0
                 && f32::from_bits(m[4]) == 96.
-                && (f32::from_bits(m[3]) - 0.15).abs() < 1.e - 6),
+                && (f32::from_bits(m[3]) - 0.15).abs() < 1.0e-6),
         "BMD specular material lost in streaming"
     );
     camera.pos = Vec3::new(-2.5, 5., 0.);

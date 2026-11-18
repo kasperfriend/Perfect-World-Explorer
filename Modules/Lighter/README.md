@@ -16,11 +16,14 @@ ray-traced scene and its reverse-Z depth.
    driver exposing acceleration structures and `VK_KHR_ray_query`. It builds
    BLAS/TLAS and dispatches native ray queries on the same device as the viewer.
    On Windows select Hardware and restart to use Vulkan instead of D3D12.
-3. Adjust ray resolution, samples and bounces. At zero bounces you still get
-   camera rays, local lighting and optional shadow rays. Water transmission,
-   mirror rays and indirect lighting require at least one bounce. The separate
-   **Water reflections** switch on the World tab still gates water mirrors.
-   Without a bounce, the authored ambient approximates indirect light.
+3. Adjust ray resolution, samples per pixel and bounces. At zero bounces you
+   still get camera rays, local lighting and optional shadow rays. Water
+   transmission, glossy reflections and indirect lighting require at least
+   one bounce. The separate **Water reflections** switch on the World tab still
+   gates water mirrors. Without a bounce, the authored ambient approximates
+   indirect light. The **Edge-aware denoiser**, **Progressive sampling while
+   still** and **Soft sun shadows** are on by default and can be toggled
+   independently. Leave the camera still to accumulate lighting samples.
 4. **Off** returns to the native world renderer. An unsupported or failed
    selected backend reports an error rather than silently drawing native or
    switching to the other ray backend.
@@ -45,8 +48,33 @@ installed manifests (the repository's `Modules` directory). Settings live in
   internal reflection. The baked scenery placement flags gate water views.
 - The client's sky panorama and roof textures are sampled by ray direction.
   The sun, static scene point lights, and point lights published by GFX owners
-  can all cast occlusion rays. Optional indirect rays contribute diffuse
-  lighting. The native world passes do not composite on top.
+  can all cast occlusion rays. Sun shadows sample a disc with an angular radius
+  of 0.27°, producing penumbras that widen with blocker distance. Disabling
+  **Soft sun shadows** restores a single directional shadow ray. Point lights
+  still have sharp shadows. The native world passes do not composite on top.
+
+### Denoising and convergence
+
+- Both backends write linear radiance, reverse-Z depth, and primary hit depth,
+  normal and albedo guides. A 3×3 joint bilateral filter smooths compatible
+  surfaces, and guide-aware upscaling avoids mixing across depth or normal
+  discontinuities. Mixed-coverage and translucent pixels are not averaged with
+  their neighbors. Sky, emissive and water pixels bypass the spatial filter.
+  Depth always comes from the closest current camera sample, never from a
+  neighboring pixel or an older frame.
+- Progressive sampling varies the light transport sequence while keeping the
+  camera and cutout pattern stable. It averages unfiltered radiance for up to
+  32 frames, then uses a fixed 1/32 weight for new samples. There is no
+  reprojection: changed view/projection, resolution, backend, lighting or scene
+  data discards history, including off-camera poses and moving lights. Water
+  normals and scrolling textures reset pixels whose rays used them when those
+  inputs change. Roof drift is allowed up to a quarter texel before resetting
+  roof-dependent history; the texture itself keeps animating every frame.
+- On a moving view or with animated poses/lights, the spatial filter still
+  works, but there may be little usable history. Raising samples per pixel can
+  help at a higher ray cost. The requested ray resolution is an upper bound:
+  at large sizes it can be reduced to stay within adapter storage limits and
+  a 256 MiB budget for active ray, history and filter images.
 
 ### Light transport and its limits
 
@@ -58,7 +86,11 @@ code. They are not two different lighting models.
   not a fixed brightness multiplier, and replace the ambient approximation on
   that surface. Baked vertex lighting is not treated as diffuse albedo and
   bounced again. Reflective materials share their energy between a matte lobe
-  and an ideal mirror lobe; they don't get full diffuse light plus a mirror.
+  and a reflected lobe; they don't get full diffuse light plus a mirror.
+  Authored specular strength and power on opaque BMDs, posed skins and eligible
+  GFX skins control reflection strength and lobe width. Higher power gives a
+  narrower reflection. GFX skins must be opaque, use standard alpha blend and
+  test/write depth; translucent and additive effects keep their sheet order.
 - The geometric face determines which side can receive shadows or emit a
   secondary ray. Interpolated and water normal-map normals steer shading but do
   not move the geometry or let light shine through a back face.
@@ -69,11 +101,12 @@ code. They are not two different lighting models.
   evaluated on both sides; later interfaces sample one lobe to bound ray counts.
 
 This is still a bounded, low-sample renderer for legacy assets, not a reference
-path tracer. The sun and point lights have hard visibility and retain authored
-colors/ranges rather than calibrated radiant intensities. The panoramas are not
-HDR light probes, reflectance is a scalar from the old material, air fog is
-linear, and water is an open height surface rather than a closed volume. There
-is no roughness-based specular model, caustic solver, or temporal denoiser.
+path tracer. Lights retain authored colors/ranges rather than calibrated radiant
+intensities. Panoramas are not HDR light probes. Gloss is a normalized
+power-cosine approximation with scalar reflectance, not a full microfacet BRDF
+with independently sampled analytic highlights. Air fog is linear, and water
+is an open height surface rather than a closed volume. There is no caustic
+solver.
 
 ### Coverage and work per frame
 
@@ -108,7 +141,10 @@ cutouts, small camera moves, blended sheets, sun and point shadows, and water
 visibility gates. Analytic pixel cases check Lambertian sky lighting, baked
 colors, diffuse/mirror energy, back-face light rejection, Fresnel both above
 and below water, total internal reflection, and distance-based extinction.
-The tests verify that unchanged geometry does not rebuild acceleration
+Both backends also check spatial noise reduction, sharp depth/normal edges
+through upscaling, unchanged depth, analytic sun-disc coverage, progressive
+averaging and invalidation, and different reflection widths at equal material
+strength. The tests verify that unchanged geometry does not rebuild acceleration
 structures. The viewer fixture switches between native and RT and checks
 actual native-pass submission, terrain, water cells, trees, authored sky, a
 streamed BMD, GFX texture/playback, and static and runtime point-light shadows.

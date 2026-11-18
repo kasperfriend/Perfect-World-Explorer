@@ -244,3 +244,61 @@ impl Post {
         image
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytemuck::Zeroable;
+
+    #[test]
+    fn history_is_sensitive_to_scene_state_but_tracks_continuous_inputs_separately() {
+        let mut history = History::default();
+        let mut frame = Frame::zeroed();
+        let step = |h: &mut History, f: &mut Frame| h.prepare(f, 1, 8, Mode::Software, true);
+        assert!(!step(&mut history, &mut frame).reuse);
+        assert_eq!(frame.sampling[0], 0);
+        assert!(step(&mut history, &mut frame).reuse);
+        assert_eq!(frame.sampling[0], 1);
+
+        frame.sky_uv[0] = 0.15 / COLOR_SIDE as f32;
+        frame.waves[2] = 42;
+        frame.air[3] = 0.1;
+        let h = step(&mut history, &mut frame);
+        assert!(h.reuse);
+        assert_eq!(h.changed_animations, ANIM_WAVES | ANIM_SCROLL);
+        frame.sky_uv[0] *= 2.;
+        assert_eq!(step(&mut history, &mut frame).changed_animations, ANIM_SKY);
+        assert_eq!(step(&mut history, &mut frame).changed_animations, 0);
+
+        frame.extent[2] = 1;
+        assert!(!step(&mut history, &mut frame).reuse);
+        frame.sun_color[0] = 0.7;
+        assert!(!step(&mut history, &mut frame).reuse);
+        assert!(
+            !history
+                .prepare(&mut frame, 1, 8, Mode::Hardware, true)
+                .reuse
+        );
+        assert!(
+            !history
+                .prepare(&mut frame, 2, 8, Mode::Hardware, true)
+                .reuse
+        );
+        assert!(
+            !history
+                .prepare(&mut frame, 2, 16, Mode::Hardware, true)
+                .reuse
+        );
+        assert!(
+            !history
+                .prepare(&mut frame, 2, 16, Mode::Hardware, false)
+                .reuse
+        );
+        history.reset();
+        assert!(
+            !history
+                .prepare(&mut frame, 2, 16, Mode::Hardware, true)
+                .reuse
+        );
+    }
+}
