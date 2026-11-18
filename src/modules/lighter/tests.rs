@@ -45,6 +45,39 @@ fn packet_rejects_bad_indices_and_materials() {
     assert!(builder.place(0, Transform::IDENTITY).is_err());
 }
 
+#[test]
+fn light_influence_tree_limits_per_hit_work() {
+    let mut b = Builder::default();
+    for i in 0..1024 {
+        b.light(Light {
+            position_range: [i as f32 * 8., 0., 0., 2.],
+            color: [1.; 4],
+        });
+    }
+    let packet = b.finish();
+    let w = &packet.words;
+    assert_eq!(w[10], 1024);
+    let at = w[5] as usize;
+    let mut node = w[12];
+    let mut candidates = 0;
+    let mut visited = 0;
+    let p = 2048.;
+    // Traverse the packed nodes the GPU sees without the subsequent sphere
+    // test. Counting leaf entries measures work saved even in a no-hit leaf.
+    while node < w[13] {
+        visited += 1;
+        let n = at + 9 * node as usize;
+        if p < f32::from_bits(w[n]) || p > f32::from_bits(w[n + 3]) {
+            node = w[n + 6];
+        } else {
+            candidates += w[n + 8];
+            node += 1;
+        }
+    }
+    assert_eq!(candidates, 4);
+    assert_eq!(visited, 17);
+}
+
 fn test_frame(eye: Vec3, dir: Vec3, e: u32) -> Frame {
     let vp = Mat4::perspective_rh(0.7, 1., 64., 1.) * Mat4::look_to_rh(eye, dir, Vec3::Y);
     Frame {
@@ -348,6 +381,9 @@ fn exercise(mode: Mode, cpu_query: bool) {
         "distinct coincident cards (two triangles each)"
     );
     let builds = h.builds();
+    if mode == Mode::Hardware {
+        assert!(builds.into_iter().all(|n| n > 0));
+    }
     let uploads = h.ray.software.as_ref().map(|s| s.moving_uploads);
     for x in [0., 0.001, -0.001, 0.] {
         let moved = test_frame(Vec3::new(x, 0., 0.), -Vec3::Z, 3);

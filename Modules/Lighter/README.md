@@ -43,15 +43,30 @@ installed manifests (the repository's `Modules` directory). Settings live in
   internal reflection, underwater fog/transmission and shallow-edge attenuation
   from a terrain ray. The baked scenery placement flags gate water views.
 - The client's sky panorama and roof textures are sampled by ray direction.
-  Sun and local lights cast occlusion rays; optional indirect rays contribute
-  diffuse lighting. The native world passes, including water and shadows, do
-  not composite on top.
+  The sun, static scene point lights, and point lights published by GFX owners
+  can all cast occlusion rays. Optional indirect rays contribute diffuse
+  lighting. The native world passes do not composite on top.
+
+### Coverage and work per frame
+
+Both backends test material visibility and alpha before accepting an
+intersection. Transparent holes don't shift the start of the ray past another
+surface. Solid shadows stop at the first covered blocker. Texture tiles have
+isolated, ray-footprint-filtered mips with alpha-weighted color; distant cutouts
+sample the fraction of passing texels using a fixed per-pixel pattern, not a
+new seed each frame. Blended sheets sort by distance, using authored
+layer/priority for coincident GFX cards; the two halves of a card blend once.
+
+Point lights are indexed by their world-space influence, not a list of the 48
+nearest the camera. Static lights upload with the resident world, and a light
+pulse doesn't rebuild the Vulkan acceleration structures. Unchanged moving
+packets skip upload; unchanged geometry skips Vulkan BLAS/TLAS builds.
 
 Lighter is a different lighting model, not pixel-for-pixel retail emulation.
 Texture tiles and distant terrain are simplified. Native terrain lightmaps,
 vegetation wind and camera-facing leaf behavior, cloud detail, rain/snow and
-shoreline wave overlays, lens flares and some legacy effect/skin blend modes
-are not reproduced. Blended ray-visible surfaces are composited by hit distance.
+shoreline wave overlays, lens flares and some legacy effect/skin blend and
+no-depth-test modes are not reproduced.
 The whole-world BMD preload, temporal upscalers and frame generation are paused
 while Lighter renders. Existing saved choices for those features are unchanged.
 
@@ -59,13 +74,18 @@ while Lighter renders. Existing saved choices for those features are unchanged.
 
 The viewer tests validate both WGSL paths and inspect the emitted Vulkan
 ray-query SPIR-V. The hardware path uses Naga 25 for safe hit queries after
-traversal without changing the viewer's wgpu version. The opt-in pixel tests trace a
-controlled scene, then read back the *composited* color and depth. They cover
-static and transformed moving geometry, cutout and blended surfaces, an
-out-of-view shadow caster, and reflection/refraction with visibility gates. A
-second test checks the viewer's terrain, water cells, trees and authored sky,
-including a streamed mesh replacement and rejection of Hardware RT on a CPU ICD.
-The first frame on software Vulkan may be slow while the driver compiles the ray shader.
+traversal without changing the viewer's wgpu version. The pixel tests read
+back *composited* color and depth. The controlled scene covers stacked and
+coincident cutouts, minified coverage and small camera moves, blended sheets,
+local-light and sun shadows, and water reflection/refraction gates. It checks
+that identical packets and light-only updates don't rebuild acceleration
+structures. The viewer fixture switches between native and RT and checks
+actual native-pass submission, terrain, water cells, trees, authored sky, a
+streamed BMD, GFX texture/playback, and static and runtime point-light shadows.
+It also checks eviction and that Hardware RT on a CPU ICD fails without
+falling back to raster. These are synthetic scenes, not real-map visual or
+physical GPU performance certification. The first frame on software Vulkan
+may be slow while the driver compiles the shader.
 
 ```sh
 # Headless software traversal. Point VK_ICD_FILENAMES at lavapipe for CPU Vulkan.

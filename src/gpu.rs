@@ -1801,6 +1801,8 @@ struct Renderer {
     /// World renders this frame will submit: the main view plus a mirror and a
     /// refraction pass for every visible water plane.
     scene_passes: u32,
+    #[cfg(test)]
+    native_opaque_draws: std::cell::Cell<u64>,
     /// Water views this frame that were scissored, and their mean share of the
     /// target. Reported once a second so the saving is visible in the log.
     water_scissored: u32,
@@ -2560,6 +2562,8 @@ impl Renderer {
             frame: FrameSnapshot::default(),
             frame_budget: FrameBudget::default(),
             scene_passes: 1,
+            #[cfg(test)]
+            native_opaque_draws: std::cell::Cell::new(0),
             water_scissored: 0,
             water_scissor_cover: 0.,
             world_glow: crate::post_gpu::WorldGlow::default(),
@@ -3171,6 +3175,9 @@ impl Renderer {
         // `water_view_scissor`'s rectangle. `None` draws the whole attachment.
         scissor: Option<[u32; 4]>,
     ) {
+        #[cfg(test)]
+        self.native_opaque_draws
+            .set(self.native_opaque_draws.get() + 1);
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3685,10 +3692,10 @@ impl Renderer {
         // the `TimingFrame` channel; see `FrameBudget`.
         let mut stage_ms = [0f64; STAGE_COUNT];
         let mut lap_at = Instant::now();
+        self.scene_passes = u32::from(!ray_world);
+        self.water_scissored = 0;
+        self.water_scissor_cover = 0.;
         if !ray_world {
-            self.scene_passes = 1;
-            self.water_scissored = 0;
-            self.water_scissor_cover = 0.;
             // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
             // the same block walk the client runs before the level rule.
             // Both buffers are reused: this runs for every view of every frame.
