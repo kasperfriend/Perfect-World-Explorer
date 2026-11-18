@@ -473,6 +473,7 @@ impl Imaginator {
                 if let Some(old) = current.bvh.as_ref() {
                     bvh.surfaces = old.surfaces.clone();
                     bvh.textures = old.textures.clone();
+                    bvh.terrain_albedo = old.terrain_albedo.clone();
                 }
                 let mut stats = current.stats;
                 stats.triangles = bvh.triangles.len();

@@ -43,6 +43,21 @@ if (-not (Test-Path -LiteralPath (Join-Path $modulesPath 'Walker/module.ini') -P
     throw "Walker module manifest not found under: $modulesPath"
 }
 
+# The hardware tracer loads the CSO; the DXIL alias is also a shipped asset.
+# Fail before staging rather than producing a seemingly complete broken package.
+foreach ($name in @('dxr_trace.cso', 'dxr_trace.dxil')) {
+    $path = Join-Path $modulesPath "Imaginator/imaginator/$name"
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Required RayQuery shader missing: $path" }
+    $bytes = [System.IO.File]::ReadAllBytes($path)
+    if ($bytes.Length -lt 256 -or [System.Text.Encoding]::ASCII.GetString($bytes, 0, 4) -ne 'DXBC') {
+        throw "Invalid RayQuery shader container: $path"
+    }
+}
+if ((Get-FileHash (Join-Path $modulesPath 'Imaginator/imaginator/dxr_trace.cso')).Hash -ne
+    (Get-FileHash (Join-Path $modulesPath 'Imaginator/imaginator/dxr_trace.dxil')).Hash) {
+    throw 'The CSO and DXIL shader assets do not match.'
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $noticesPath = Join-Path $repoRoot 'THIRD_PARTY_NOTICES.md'
 if (-not (Test-Path -LiteralPath $noticesPath -PathType Leaf)) {
@@ -324,13 +339,10 @@ if (-not [string]::IsNullOrWhiteSpace($ArchivePath)) {
                 throw "Release archive is missing required entry: $required"
             }
         }
-        # When a compiled trace shader was supplied, verify it was actually
-        # copied into the release archive, not merely present before staging.
         foreach ($name in @('dxr_trace.cso', 'dxr_trace.dxil')) {
             $relative = "Modules/Imaginator/imaginator/$name"
-            if ((Test-Path -LiteralPath (Join-Path $modulesPath $relative) -PathType Leaf) -and
-                $entries -notcontains "Perfect World Explorer/$relative") {
-                throw "Release archive is missing supplied shader: $relative"
+            if ($entries -notcontains "Perfect World Explorer/$relative") {
+                throw "Release archive is missing required shader: $relative"
             }
         }
         if ($entries | Where-Object { $_ -match '(?i)bmd.*survey|survey.*bmd' }) {
@@ -358,6 +370,15 @@ if (-not [string]::IsNullOrWhiteSpace($ArchivePath)) {
             if ($manifestPaths -notcontains $relative) {
                 throw "Release archive entry is not covered by SHA256SUMS.txt: $relative"
             }
+            $line = @($manifestLines | Where-Object { ($_ -split '\s+', 2)[1] -ceq $relative })
+            if ($line.Count -ne 1) { throw "Duplicate or missing checksum: $relative" }
+            $expected = ($line[0] -split '\s+', 2)[0]
+            $zipEntry = $archive.Entries | Where-Object { $_.FullName.Replace('\', '/') -ceq $entry } | Select-Object -First 1
+            $stream = $zipEntry.Open()
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try { $actual = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+            finally { $stream.Dispose(); $sha.Dispose() }
+            if ($actual -ne $expected.ToLowerInvariant()) { throw "Archive checksum mismatch: $relative" }
         }
         if ($manifestPaths.Count + 1 -ne $entries.Count) {
             throw "SHA256SUMS.txt lists $($manifestPaths.Count) files but the archive contains $($entries.Count) entries including the manifest itself."

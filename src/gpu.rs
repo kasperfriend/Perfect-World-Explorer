@@ -4608,7 +4608,7 @@ pub fn run(
                 spacing: t.grid_spacing,
                 heights: t.heights.clone(),
             };
-            let scene = crate::imaginator::capture::capture(
+            let mut scene = crate::imaginator::capture::capture(
                 &crate::imaginator::capture::Sources {
                     map: &grid,
                     water: &t.water,
@@ -4635,6 +4635,54 @@ pub fn run(
                     ..crate::imaginator::capture::CaptureBudget::default()
                 },
             );
+            // The tracer previously assigned every terrain triangle a single
+            // grey material, ignoring the loaded DDS layers and masks entirely.
+            // Bake a bounded world-aligned approximation while those sources are
+            // still resident. It is deliberately small; it is not a substitute
+            // for full-resolution material sampling in the DXR shader.
+            let side = 256u32;
+            let radius = crate::imaginator::capture::CAPTURE_RADIUS;
+            let origin = [camera.pos.x - radius, camera.pos.z - radius];
+            let extent = [radius * 2., radius * 2.];
+            let mut rgba = Vec::with_capacity((side * side * 4) as usize);
+            for y in 0..side {
+                for x in 0..side {
+                    let wx = origin[0] + extent[0] * x as f32 / (side - 1) as f32;
+                    let wz = origin[1] + extent[1] * y as f32 / (side - 1) as f32;
+                    let gx = wx / grid.spacing + grid.width as f32 * 0.5;
+                    let gy = grid.height as f32 * 0.5 - wz / grid.spacing;
+                    if gx >= 0.
+                        && gy >= 0.
+                        && gx < grid.width as f32
+                        && gy < grid.height as f32
+                        && t.materials.has_sample(gx, gy)
+                    {
+                        let index = (gy as usize) * grid.width + gx as usize;
+                        let color = t.materials.sample(gx, gy, grid.heights.at(index));
+                        rgba.extend_from_slice(&[
+                            color[0].clamp(0., 255.) as u8,
+                            color[1].clamp(0., 255.) as u8,
+                            color[2].clamp(0., 255.) as u8,
+                            255,
+                        ]);
+                    } else {
+                        rgba.extend_from_slice(&[0, 0, 0, 0]);
+                    }
+                }
+            }
+            t.materials.release_cpu_samples();
+            if let Some(bvh) = std::sync::Arc::get_mut(&mut scene).and_then(|s| s.bvh.as_mut()) {
+                bvh.terrain_albedo = Some(std::sync::Arc::new(
+                    crate::imaginator::bvh::TerrainAlbedo {
+                        origin,
+                        extent,
+                        width: side,
+                        height: side,
+                        rgba,
+                    },
+                ));
+            }
+            eprintln!("Imaginator: baked {side}x{side} terrain material preview for software tracing (DXR materials remain flat)");
             // Say what was *captured*, not what is in the map. The old line
             // printed the number of ornament placements and called it "resident
             // ornaments", which reads as though the whole world had been traced;

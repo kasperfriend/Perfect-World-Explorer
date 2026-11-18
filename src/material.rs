@@ -417,6 +417,30 @@ impl Materials {
             malloc_trim(0);
         }
     }
+    /// Drop transient CPU sampling caches; packed upload sources remain intact.
+    pub fn release_cpu_samples(&mut self) {
+        for texture in &mut self.textures {
+            texture.levels.take();
+        }
+        for area in &mut self.areas {
+            for layer in &mut area.layers {
+                layer.mask.decoded.take();
+            }
+        }
+    }
+
+    /// Whether this grid coordinate has source layers resident for CPU sampling.
+    pub fn has_sample(&self, x: f32, y: f32) -> bool {
+        if self.width == 0 || self.height == 0 || self.mask_grid == 0 {
+            return false;
+        }
+        let gx = x.clamp(0., self.width as f32 - 1.) as usize;
+        let gy = y.clamp(0., self.height as f32 - 1.) as usize;
+        self.areas
+            .get((gy / self.mask_grid) * self.areas_x + gx / self.mask_grid)
+            .is_some_and(|area| !area.layers.is_empty())
+    }
+
     pub fn sample(&self, x: f32, y: f32, h: f32) -> [f32; 3] {
         let gx = x.clamp(0., self.width as f32 - 1.);
         let gy = y.clamp(0., self.height as f32 - 1.);

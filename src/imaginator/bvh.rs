@@ -96,10 +96,48 @@ pub struct Bvh {
     /// Sparse per-triangle texture data; non-textured geometry has no entry.
     pub surfaces: Arc<std::collections::HashMap<u32, TexturedTriangle>>,
     pub textures: Arc<Vec<Texture>>,
+    /// Bounded, world-aligned terrain albedo preview (software tracer only).
+    pub terrain_albedo: Option<Arc<TerrainAlbedo>>,
     pub nodes: Vec<Node>,
     /// Triangle indices, permuted so every leaf owns a contiguous range.
     pub order: Vec<u32>,
     pub triangles: Vec<Triangle>,
+}
+
+/// Approximate, bounded terrain colour baked from the client's layered materials.
+/// Coordinates are world X/Z; unavailable samples retain the material fallback.
+#[derive(Clone, Debug)]
+pub struct TerrainAlbedo {
+    pub origin: [f32; 2],
+    pub extent: [f32; 2],
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl TerrainAlbedo {
+    pub fn sample(&self, x: f32, z: f32) -> Option<[u8; 4]> {
+        if self.width == 0 || self.height == 0 || self.extent[0] <= 0. || self.extent[1] <= 0. {
+            return None;
+        }
+        let u = (x - self.origin[0]) / self.extent[0];
+        let v = (z - self.origin[1]) / self.extent[1];
+        if !u.is_finite()
+            || !v.is_finite()
+            || !(0.0..=1.0).contains(&u)
+            || !(0.0..=1.0).contains(&v)
+        {
+            return None;
+        }
+        let ix = (u * (self.width - 1) as f32).round() as usize;
+        let iy = (v * (self.height - 1) as f32).round() as usize;
+        let i = (iy * self.width as usize + ix) * 4;
+        let p = self.rgba.get(i..i + 4)?;
+        if p[3] == 0 {
+            return None;
+        }
+        Some([p[0], p[1], p[2], p[3]])
+    }
 }
 
 /// Texture-backed triangle attributes. UVs use the triangle's own vertex order.
@@ -157,6 +195,7 @@ impl Bvh {
             return Self {
                 surfaces: Arc::new(Default::default()),
                 textures: Arc::new(Vec::new()),
+                terrain_albedo: None,
                 nodes: vec![Node {
                     bounds: Aabb::EMPTY,
                     left_first: 0,
@@ -253,6 +292,7 @@ impl Bvh {
         Self {
             surfaces: Arc::new(Default::default()),
             textures: Arc::new(Vec::new()),
+            terrain_albedo: None,
             nodes,
             order,
             triangles,
@@ -261,6 +301,18 @@ impl Bvh {
 
     /// Returns the sampled texture and cutout state for a triangle hit.
     pub fn surface_sample(&self, triangle: u32, bary: [f32; 2]) -> Option<([u8; 4], Option<u8>)> {
+        if let Some(tri) = self.triangles.get(triangle as usize) {
+            if tri.material == material::TERRAIN {
+                let position = tri.a + (tri.b - tri.a) * bary[0] + (tri.c - tri.a) * bary[1];
+                if let Some(rgba) = self
+                    .terrain_albedo
+                    .as_ref()
+                    .and_then(|t| t.sample(position.x, position.z))
+                {
+                    return Some((rgba, None));
+                }
+            }
+        }
         let surface = self.surfaces.get(&triangle)?;
         let w = 1. - bary[0] - bary[1];
         let uv = [
@@ -597,6 +649,22 @@ impl Scene {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terrain_albedo_samples_world_positions_and_respects_missing_regions() {
+        let map = super::TerrainAlbedo {
+            origin: [-10., 20.],
+            extent: [20., 10.],
+            width: 2,
+            height: 2,
+            rgba: vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 0, 0, 0, 0],
+        };
+        assert_eq!(map.sample(-10., 20.), Some([255, 0, 0, 255]));
+        assert_eq!(map.sample(10., 20.), Some([0, 255, 0, 255]));
+        assert_eq!(map.sample(-10., 30.), Some([0, 0, 255, 255]));
+        assert_eq!(map.sample(10., 30.), None);
+        assert_eq!(map.sample(11., 20.), None);
+    }
+
     use super::*;
 
     /// Two quads at y = 0 and y = 5, the second only over x in [1, 2].

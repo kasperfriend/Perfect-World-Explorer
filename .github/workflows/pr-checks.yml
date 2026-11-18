@@ -702,6 +702,22 @@ jobs:
               throw "Uploaded artifact is missing: $relative"
             }
           }
+          # Check the bytes after artifact upload/download, not just names in staging.
+          $manifest = Join-Path $package 'SHA256SUMS.txt'
+          $lines = @(Get-Content -LiteralPath $manifest | Where-Object { $_.Trim() })
+          $files = @(Get-ChildItem -LiteralPath $package -Recurse -File | Where-Object { $_.FullName -ne $manifest })
+          if ($lines.Count -ne $files.Count) { throw 'Uploaded checksum manifest file count mismatch' }
+          foreach ($line in $lines) {
+            $parts = $line.Trim() -split '\s+', 2
+            if ($parts.Count -ne 2 -or $parts[1] -match '(^|[/\\])\.\.([/\\]|$)') { throw "Invalid checksum line: $line" }
+            $path = Join-Path $package $parts[1]
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $parts[0]) {
+              throw "Uploaded artifact checksum mismatch: $($parts[1])"
+            }
+          }
+          $cso = Join-Path $package 'Modules/Imaginator/imaginator/dxr_trace.cso'
+          $dxil = Join-Path $package 'Modules/Imaginator/imaginator/dxr_trace.dxil'
+          if ((Get-FileHash -LiteralPath $cso).Hash -ne (Get-FileHash -LiteralPath $dxil).Hash) { throw 'Uploaded shader copies differ' }
           if (Get-ChildItem -LiteralPath $package -Recurse -File | Where-Object { $_.Name -match '(?i)bmd.*survey|survey.*bmd' }) {
             throw 'The uploaded artifact contains a BMD survey executable.'
           }
