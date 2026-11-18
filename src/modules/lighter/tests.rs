@@ -234,8 +234,9 @@ impl Harness {
         read.map_async(wgpu::MapMode::Read, move |r| {
             let _ = send.send(r);
         });
-        self.device.poll(wgpu::Maintain::Wait);
-        recv.recv().unwrap().unwrap();
+        crate::gpu::wait_for_gpu(&self.device, recv)
+            .unwrap()
+            .unwrap();
         let data = read.get_mapped_range();
         let index = ((e / 2) * row + (e / 2) * 4) as usize;
         let z = index + stride as usize;

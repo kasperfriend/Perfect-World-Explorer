@@ -258,16 +258,18 @@ jobs:
         env:
           WGPU_BACKEND: vulkan
           XDG_RUNTIME_DIR: /tmp
+          CARGO_TERM_COLOR: never
         run: |
           export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
           test -n "$VK_ICD_FILENAMES"
           status=0
           (set -o pipefail; cargo test --locked --bin perfect-world-explorer lighter_ -- --ignored \
-            --skip lighter_hardware_pixels --skip lighter_vulkan_interop_on_cpu --test-threads=1 \
+            --skip lighter_hardware_pixels --skip lighter_vulkan_interop_on_cpu --test-threads=1 --nocapture \
             2>&1 | tee /tmp/lighter-pixels.log) || status=$?
           if [ "$status" -ne 0 ]; then
-            grep -A4 -E 'panicked at|^error(\[|:)' /tmp/lighter-pixels.log | head -25 \
-              | while IFS= read -r line; do echo "::error::$line"; done
+            tail -40 /tmp/lighter-pixels.log | while IFS= read -r line; do
+              if [ -n "$line" ]; then echo "::error::$line"; fi
+            done
           fi
           exit "$status"
       - name: Run Phase 1 production shader regressions

@@ -62,7 +62,10 @@ ray-query SPIR-V. The hardware path uses Naga 25 for safe hit queries after
 traversal without changing the viewer's wgpu version. The opt-in pixel tests trace a
 controlled scene, then read back the *composited* color and depth. They cover
 static and transformed moving geometry, cutout and blended surfaces, an
-out-of-view shadow caster, and reflection/refraction with visibility gates.
+out-of-view shadow caster, and reflection/refraction with visibility gates. A
+second test checks the viewer's terrain, water cells, trees and authored sky,
+including a streamed mesh replacement and rejection of Hardware RT on a CPU ICD.
+The first frame on software Vulkan may be slow while the driver compiles the ray shader.
 
 ```sh
 # Headless software traversal. Point VK_ICD_FILENAMES at lavapipe for CPU Vulkan.

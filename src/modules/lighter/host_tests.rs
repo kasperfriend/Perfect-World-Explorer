@@ -220,6 +220,7 @@ fn lighter_streamed_world_pixels() {
         ..Default::default()
     });
     let (a, device, queue) = pollster::block_on(adapter(&instance, None, Mode::Software)).unwrap();
+    let cpu_adapter = a.get_info().device_type == wgpu::DeviceType::Cpu;
     let lighter = Lighter::new(
         Settings {
             mode: Mode::Software,
@@ -265,7 +266,7 @@ fn lighter_streamed_world_pixels() {
         format: Some(wgpu::TextureFormat::Rgba8Unorm),
         ..Default::default()
     });
-    let at_center = |r: &mut Renderer, c: &Camera| -> [u8; 4] {
+    let render_center = |r: &mut Renderer, c: &Camera| -> [u8; 4] {
         r.render(
             &view,
             &raw,
@@ -275,10 +276,14 @@ fn lighter_streamed_world_pixels() {
             SIZE,
             true,
         );
-        assert_eq!(r.lighter.error(), None);
         let bytes = read_target_pixels(r, &target, SIZE, SIZE).unwrap();
         let offset = (4 * (SIZE / 2 * SIZE + SIZE / 2)) as usize;
         bytes[offset..offset + 4].try_into().unwrap()
+    };
+    let at_center = |r: &mut Renderer, c: &Camera| {
+        let pixel = render_center(r, c);
+        assert_eq!(r.lighter.error(), None);
+        pixel
     };
     let wet = at_center(&mut r, &camera);
     assert!(
@@ -317,4 +322,14 @@ fn lighter_streamed_world_pixels() {
         [0, 255, 0, 255],
         "stale water after stream replacement"
     );
+    if cpu_adapter {
+        r.lighter.settings.mode = Mode::Hardware;
+        let refused = render_center(&mut r, &camera);
+        assert!(r.lighter.error().is_some());
+        assert_eq!(
+            refused,
+            [0, 0, 0, 255],
+            "unsupported mode silently fell back"
+        );
+    }
 }

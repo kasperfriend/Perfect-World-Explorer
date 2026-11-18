@@ -7538,7 +7538,18 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                             if let Some(pacer) = reflex.as_mut() {
                                 pacer.present();
                             }
-                            if software_adapter { renderer.device.poll(wgpu::Maintain::Wait); }
+                            if software_adapter {
+                                if renderer.lighter.armed() {
+                                    let (send, recv) = std::sync::mpsc::channel();
+                                    renderer.queue.on_submitted_work_done(move || { let _ = send.send(()); });
+                                    if let Err(error) = wait_for_gpu(&renderer.device, recv) {
+                                        eprintln!("Lighter GPU completion: {error}");
+                                        target.exit();
+                                    }
+                                } else {
+                                    renderer.device.poll(wgpu::Maintain::Wait);
+                                }
+                            }
                         }
                 }
                 _ => {}
@@ -7635,7 +7646,28 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
         })
         .map_err(|e| e.to_string())
 }
-/// Render one frame without a window. Useful for validation on headless systems.
+/// Wait for the actual completion callback. wgpu 0.19's blocking poll may
+/// retire work after a 5-second fence timeout; cold software Vulkan shader
+/// compilation can outlast that and make a readback race the GPU.
+pub(crate) fn wait_for_gpu<T>(
+    device: &wgpu::Device,
+    completion: std::sync::mpsc::Receiver<T>,
+) -> Result<T, String> {
+    use std::{sync::mpsc::RecvTimeoutError, time::Duration};
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        device.poll(wgpu::Maintain::Poll);
+        match completion.recv_timeout(Duration::from_millis(2)) {
+            Ok(result) => return Ok(result),
+            Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+            Err(RecvTimeoutError::Timeout) => {
+                return Err("GPU work did not complete within 120 seconds".into())
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
 /// Read a rendered target back to CPU bytes, one `RGBA` word per pixel.
 ///
 /// The preview path needs the pixels themselves to answer questions that a
@@ -7680,14 +7712,12 @@ fn read_target_pixels(
     buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
     });
-    renderer.device.poll(wgpu::Maintain::Wait);
-    rx.recv()
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+    wait_for_gpu(&renderer.device, rx)?.map_err(|e| e.to_string())?;
     let bytes = buffer.slice(..).get_mapped_range().to_vec();
     Ok(bytes)
 }
 
+/// Render one frame without a window. Useful for validation on headless systems.
 pub fn preview(
     mut t: Terrain,
     path: &std::path::Path,
@@ -8002,45 +8032,7 @@ pub fn preview(
             false,
         );
     }
-    let row = width * 4;
-    let buffer = renderer.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("image readback"),
-        size: (row * height) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut e = renderer.device.create_command_encoder(&Default::default());
-    e.copy_texture_to_buffer(
-        wgpu::ImageCopyTexture {
-            texture: &target,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::ImageCopyBuffer {
-            buffer: &buffer,
-            layout: wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(row),
-                rows_per_image: Some(height),
-            },
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    renderer.queue.submit(Some(e.finish()));
-    let (tx, rx) = std::sync::mpsc::channel();
-    buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    renderer.device.poll(wgpu::Maintain::Wait);
-    rx.recv()
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-    let bytes = buffer.slice(..).get_mapped_range();
+    let bytes = read_target_pixels(&renderer, &target, width, height)?;
     let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
     encoder.set_color(png::ColorType::Rgba);
@@ -8048,8 +8040,6 @@ pub fn preview(
     let mut out = encoder.write_header().map_err(|e| e.to_string())?;
     out.write_image_data(&bytes).map_err(|e| e.to_string())?;
     out.finish().map_err(|e| e.to_string())?;
-    drop(bytes);
-    buffer.unmap();
     Ok(())
 }
 
