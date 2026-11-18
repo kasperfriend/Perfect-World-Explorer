@@ -34,7 +34,7 @@ A required load/build failure ends the command with an error; it does **not** pu
 
 - **Step 8:** [CI on `21813ca`](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44400799795) passed Linux and the Windows portable build/audit. Both Software and CPU Vulkan fixtures hit the animated off-camera Populator caster's shadow before movement and saw the receiver lit after movement, at unchanged receiver depth. Both found the rotated/scaled hook child in a reflection after it was hidden from the primary ray; moving the hook removed the reflected hit without rebuilding its BLAS. The primary mask also changes Vulkan instance opacity, so the fixed-function opaque commit cannot bypass it. The mask and hook changes do not recreate the child's BLAS. This is not physical GPU validation or a retail actor census.
 - **Step 9 fixture:** `tools/fixtures/lighter-coverage.csv` is the expected inventory for `lighter_coverage_fixture_capture`. It renders a real 960×720 offscreen PNG through the main streamed Software path, verifies the counts against the saved CSV and binds them to the capture's pixel hash. [Linux CI on `c19e10e`](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44403096687) passed the comparison and keeps the synthetic files in its `lighter-coverage-fixture` artifact. The streamed BMD regression separately checks that an optional asset denied by the GPU packet budget increments `budget` without packing part of its geometry.
-- **Retail inputs still needed:** the S38/S40 heights in the terrain report came from *Forsaken World 0.525*. The actual scene headers on both maps are **ECWLD v14 / EC-BSD v15**; the current Explorer scene and water loaders accept **v12 / v12**. Those height checks cannot serve as retail world captures. A compatible client's complete matching texture package could not be transferred here: the identified `textures.pck` is 117,047,648 bytes, above the Drive connector's 100 MiB workspace limit, and its models/building archives are larger. No real map capture or unsupported-SKI total is claimed for those maps. Use an already installed compatible client for the command above. The optional **Lighter retail coverage** workflow tries the public v12 `a01`/`a02` inputs on the runner, checking hashes before loading and keeping only rendered outputs and inventories.
+- **Incompatible inputs:** the S38/S40 heights in the terrain report came from *Forsaken World 0.525*. The actual scene headers on both maps are **ECWLD v14 / EC-BSD v15**; the current Explorer scene and water loaders accept **v12 / v12**. Those height checks cannot serve as retail world captures. No full map capture or unsupported-SKI total is claimed for S38/S40.
 
 For compatible inputs, a separate read-only ECWLD/EC-BSD catalog check walked
 and checked the block boundaries and validated ornament export offsets and BMD
@@ -45,3 +45,36 @@ path suffixes for `a01` and `a02` (both v12). See
 These numbers are **authored**, not admitted or rendered. The two instances
 are useful BMD/GFX capture targets but are not a substitute for the map mix in
 RT-17.
+
+### Retail Software captures — 2026-11-18
+
+The [Lighter retail coverage run on `7a71750`](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44406210481)
+loaded the two v12 maps with matching, SHA-256-pinned packages and saved both
+960×720 PNGs, inventories and camera/driver metadata in `lighter-retail-coverage`.
+The optional workflow downloads its inputs only on the runner; none of the
+client packages are in the repository or the artifact. It verifies each map ID,
+nonempty near terrain and full accounting of the authored BMD and GFX owners.
+
+| Map | Near blocks loaded | Buildings loaded / skipped / failed | GFX roots loaded / pending / inactive / failed | Effect draws loaded |
+| --- | ---: | ---: | ---: | ---: |
+| `a01` | 225 | 310 / 18 / 0 | 25 / 195 / 84 / 0 | 141 |
+| `a02` | 225 | 32 / 0 / 0 | 25 / 14 / 3 / 0 | 91 |
+
+The 18 skipped `a01` buildings hit the packet/residency budget, not a parser
+error. No admitted BMD material reference fell back to white in either capture.
+The two runs use Software RT on lavapipe, a center camera at terrain height +160,
+noon, and 24 fixed 16 ms warm-up frames. They do not measure a physical GPU or
+cover retail water, vegetation or animated actors. Large pending counts reflect
+the native root queue at the selected tick, not missing root definitions.
+
+Decoded RGBA8 SHA-256:
+
+- `a01`: `73403e084cdd9adfbac7979fba445441cd31688e65d718fc4afec619bf1a1e90`
+- `a02`: `3a27f4d6e60a18a3fbb2380973f0aec785a25029b2429bc555001231ba18559e`
+
+Coverage does not establish geometric accuracy. The independent height-only
+audit found `a02` flat but `a01` exceeded the 0.5-unit tolerance at both strides
+4 and 2 (peak **100.3922** in both; **29,807** and **12,797** of 523,265 samples
+over tolerance). Stride 1 on those 512² fields needs 1,566,726 indices, above
+the current 600,000-index regular-grid refinement ceiling. This is additional
+RT-02b evidence, not a streamed silhouette comparison.

@@ -4,9 +4,6 @@ name: Lighter retail coverage
 # for maps and packages; never cache or upload client asset bytes.
 on:
   workflow_dispatch:
-  # Bootstrap the run while this workflow is under review.
-  push:
-    paths: ['.github/workflows/lighter-retail.yml']
 
 permissions:
   contents: read
