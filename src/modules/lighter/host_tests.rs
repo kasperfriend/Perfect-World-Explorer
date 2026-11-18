@@ -49,7 +49,7 @@ fn fixture(element: &std::path::Path) -> Terrain {
         )
         .unwrap();
     let (heights, normals) = elevation.finish(0).unwrap();
-    let tree = crate::trees::TreeLod {
+    let tree = || crate::trees::TreeLod {
         branch: crate::trees::Part {
             vertices: [[-1., 0., 0.], [1., 0., 0.], [0., 0., 6.]]
                 .map(|pos| crate::trees::Vert {
@@ -137,7 +137,7 @@ fn fixture(element: &std::path::Path) -> Terrain {
         ],
         trees: crate::trees::Trees {
             types: vec![Some(crate::trees::TreeMesh {
-                lods: vec![tree],
+                lods: (0..3).map(|_| tree()).collect(),
                 bark: red.clone(),
                 composite: red,
                 bark_mips: vec![],

@@ -707,10 +707,13 @@ impl TerrainGpu {
         });
         // Variant selection and pass state come from the recovered native
         // switch (`src/terrain_shading.rs`, 0x7c1450) instead of being restated
-        // here. `Caps::default()` is the stock 1.4.2 state: a device with a pixel
-        // pipeline and neither terrain-env mode flag set, i.e. `Variant::Batch3Layer`.
-        let variant = crate::terrain_shading::select(crate::terrain_shading::Caps::default())
-            .map_err(|e| format!("terrain variant {e:?} is unreachable in the client"))?;
+        // here. This viewer uses the stock programmable pipeline, not the
+        // no-pixel-shader variant represented by the all-false caps.
+        let variant = crate::terrain_shading::select(crate::terrain_shading::Caps {
+            pixel_pipeline: true,
+            ..Default::default()
+        })
+        .map_err(|e| format!("terrain variant {e:?} is unreachable in the client"))?;
         debug_assert_eq!(variant, crate::terrain_shading::Variant::Batch3Layer);
         let state = crate::terrain_shading::pass_state(variant);
         // 0x7cd789 pushes D3DCULL_NONE (1); the state type keeps the restored

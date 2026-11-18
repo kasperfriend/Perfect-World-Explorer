@@ -258,6 +258,7 @@ jobs:
         env:
           WGPU_BACKEND: vulkan
           XDG_RUNTIME_DIR: /tmp
+          PW_SMALL_TREE_ATLAS: "1"
           CARGO_TERM_COLOR: never
         run: |
           export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
