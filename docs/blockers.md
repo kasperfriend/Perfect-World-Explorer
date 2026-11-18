@@ -220,6 +220,21 @@ done.
   copied into this branch.
 - **Status:** open (PRs must be rebased/merged in order by the maintainer).
 
+### B-6 addendum (2026-11-18) — client-version scanning
+
+`src/client_detect.rs`, `src/main.rs`, `src/launcher_ui.rs` and
+`src/windows_setup.rs` now also carry the folder scan (executable identity, the
+`(elements.data, tasks.data)` data-version pair, every `.pck` container version).
+PR **#38** touches `src/client_detect.rs`, `README.md`,
+`Findings/Unsupported-client-paths.md`, `src/main.rs` and
+`src/windows_setup.rs` as well, so the overlap is now five files rather than
+four. All of it is non-algorithmic: #38 edits the Teleport-List/world-selection
+text and its own README section, while this work edits the "Client version
+scanning" section, the data rows of the launcher card and the `--diagnose-client`
+printer. `src/modules/librarian/{elements,database,mod}.rs`,
+`src/modules/designer/catalog.rs` and `src/bin/client-check.rs` are not touched
+by #38.
+
 ## B-7 — Frame pacing / UI input rate (Phase 4.21)
 
 - **Step:** Phase 4.21 — with FG on, present frames in order and never drop

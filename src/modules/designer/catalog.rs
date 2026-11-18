@@ -9,6 +9,27 @@ use std::collections::HashMap;
 
 pub const ELEMENTS_V27: u32 = 0x3000_001b;
 
+/// Why this file cannot be read as the v27 layout, phrased with the version it
+/// actually carries: `elements.data` reports `(family << 16) | version`, so a
+/// RUS 1.4.2 client's v29 file reads as v29 rather than as an unknown hex word.
+pub fn unsupported_layout(version: u32) -> String {
+    let number = version & 0xffff;
+    let family = version >> 16;
+    if version == ELEMENTS_V27 {
+        return "elements.data v27 is the supported layout".into();
+    }
+    if family != 0x3000 {
+        return format!(
+            "elements.data 0x{version:08x} is not an elements file this build knows \
+             (family 0x{family:04x}, version {number}); the v27 reader expects family 0x3000"
+        );
+    }
+    format!(
+        "elements.data is v{number} (0x{version:08x}), not the v27 layout this build reads; \
+         the face and equipment tables are version-specific and are not guessed"
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u32)]
 pub enum Gender {
@@ -528,9 +549,7 @@ impl Catalog {
         let mut cursor = Cursor { bytes, pos: 0 };
         let version = cursor.u32()?;
         if version != ELEMENTS_V27 {
-            return Err(format!(
-                "unsupported elements.data version 0x{version:08x}; expected PW 1.4.2 v27"
-            ));
+            return Err(unsupported_layout(version));
         }
         let _timestamp = cursor.u32()?;
         let mut catalog = Self::default();
@@ -1146,6 +1165,21 @@ const SECTION_SIZES: [Size; 131] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_elements_revision_is_named_by_its_own_version() {
+        // v29 is the RUS 1.4.2 revision; the reader must say so plainly
+        // instead of printing a hex word or trying the v27 tables anyway.
+        let error = Catalog::parse_v27(&0x3000_001du32.to_le_bytes()).unwrap_err();
+        assert!(error.contains("v29"), "{error}");
+        assert!(error.contains("not the v27 layout"), "{error}");
+        // A file that is not an elements file at all is distinguished from a
+        // different revision of one.
+        let error = Catalog::parse_v27(&0x2000_001bu32.to_le_bytes()).unwrap_err();
+        assert!(error.contains("not an elements file"), "{error}");
+        assert!(unsupported_layout(ELEMENTS_V27).contains("supported"));
+    }
+
     #[test]
     fn authentic_paths_keep_class_specific_and_shared_assets_distinct() {
         assert_eq!(

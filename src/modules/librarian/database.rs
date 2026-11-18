@@ -278,7 +278,11 @@ mod tests {
     #[test]
     fn rejects_unknown_and_truncated_files() {
         assert!(Database::parse_v27(&[]).is_err());
-        assert!(Database::parse_v27(&0x3000_001au32.to_le_bytes()).is_err());
+        // A neighbouring revision is refused with its own version number, so
+        // the Librarian can say "v26" instead of "unexpected hex word".
+        let error = Database::parse_v27(&0x3000_001au32.to_le_bytes()).unwrap_err();
+        assert!(error.contains("v26"), "{error}");
+        assert!(error.contains("not the v27 layout"), "{error}");
         let mut data = 0x3000_001bu32.to_le_bytes().to_vec();
         data.extend_from_slice(&0u32.to_le_bytes());
         data.extend_from_slice(&u32::MAX.to_le_bytes());

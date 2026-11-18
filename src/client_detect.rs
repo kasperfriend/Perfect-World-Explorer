@@ -1,22 +1,557 @@
-//! Identify known clients from their actual PE executable, not a folder name.
+//! Identify a Perfect World client from what its folder actually contains,
+//! not from a folder name or one hard-coded build.
+//!
+//! Three independent kinds of evidence are collected, because they do **not**
+//! move together between client versions:
+//!
+//! * **the executable** — `elementclient.exe` is fingerprinted by size and
+//!   SHA-256 against the builds this repository has inspected, and its PE
+//!   version resource (`VS_VERSIONINFO`) is read for a marketing string. A
+//!   build nobody has inspected still yields a usable answer: the resource
+//!   string, the file size and the PE timestamp are printed so a report can
+//!   name the build, and the client is loaded as an unverified build instead of
+//!   being refused.
+//! * **the data files** — `data/elements.data`, `tasks.data`, `dyn_tasks.data`,
+//!   `task_npc.data`, `aipolicy.data`, `domain.data` and the `gshop*.data`
+//!   family each carry their own header version or timestamp. These are read
+//!   here and reported separately from the executable, because one executable
+//!   version is routinely shipped with several different elements/tasks
+//!   versions (a 1.4.2 engine with a v27 or a v29 `elements.data`, a v70 pair
+//!   from a regional client, and so on).
+//! * **the archives** — every `*.pck` beside the executable is opened and its
+//!   container version, entry count and the pack's own `version.sw` marker are
+//!   reported. A pack that is missing, truncated, or in a container this
+//!   reader does not know is named rather than silently skipped.
+//!
+//! The result is a [`Scan`] with a stable text rendering ([`Scan::report`]),
+//! so the launcher window, the `client-check` diagnostic and the viewer's
+//! `--diagnose-client` flag all print the same thing. Nothing here decides
+//! compatibility by itself: the hard requirement stays "the world files are
+//! readable", and every version is reported factually, including versions this
+//! viewer cannot parse yet.
+
 use std::{
     ffi::OsStr,
     fs,
     path::{Path, PathBuf},
 };
 
-const PW142_SIZE: usize = 6_000_640;
-const PW142_SHA256: &str = "a290998dc13cc5558b54bda3f65d099f95bc0702e54a0613c6d7669f35c6cdb0";
+/// Known executable fingerprints, in the order they are tested. A build that
+/// is not listed is reported by its own facts rather than rejected, so adding
+/// a row here is how a future client becomes "known" (and gets a name in the
+/// launcher) without changing any other code.
+struct KnownBuild {
+    /// Marketing/label string shown to the user.
+    label: &'static str,
+    size: usize,
+    sha256: &'static str,
+    /// Pairs of data-file / version seen beside this executable when it was
+    /// inspected. Informational only: the file's own header is what the scan
+    /// reports, because one executable ships with several data revisions.
+    data_versions: &'static [(&'static str, u32)],
+}
 
+const KNOWN_BUILDS: &[KnownBuild] = &[KnownBuild {
+    label: "PW 1.4.2",
+    // The one executable this repository has fully inspected: the 1.4.2
+    // `elementclient.exe` (PE32, 6,000,640 bytes).
+    size: 6_000_640,
+    sha256: "a290998dc13cc5558b54bda3f65d099f95bc0702e54a0613c6d7669f35c6cdb0",
+    // `elements.data` v27 (`0x3000_001b`, stamp `0x4b39_c931`) and
+    // `tasks.data` v75 (magic `0x9385_8361`) on the inspected client.
+    data_versions: &[("elements.data", 27), ("tasks.data", 75)],
+}];
+
+/// Required files for a loadable world. `elementclient.exe` is reported but not
+/// required to be byte-identical: patched clients are common and the world
+/// reader never runs the executable, so its identity is evidence, not a gate.
+///
+/// These three are what the world load itself opens, so their absence really is
+/// fatal. Everything else — `litmodels.pck`, `models.pck`, `gfx.pck`,
+/// `configs.pck`, `speedtreert.dll` — is reported by name in the scan instead
+/// of being refused here, because a regional client may legitimately ship a
+/// different set and the viewer names what a missing asset costs.
+const REQUIRED_ARCHIVES: &[&str] = &["trees.pck", "building.pck", "textures.pck"];
+
+/// Archives whose container version is worth reporting. A pack that is present
+/// but unreadable is a row with the reason; a pack that is absent is left out.
+/// Only [`REQUIRED_ARCHIVES`] may fail the scan.
+const REPORTED_ARCHIVES: &[&str] = &[
+    "textures.pck",
+    "building.pck",
+    "litmodels.pck",
+    "models.pck",
+    "trees.pck",
+    "grasses.pck",
+    "gfx.pck",
+    "sfx.pck",
+    "surfaces.pck",
+    "interfaces.pck",
+    "facedata.pck",
+    "loddata.pck",
+    "configs.pck",
+    "shaders.pck",
+    "help.pck",
+    "fonts.pck",
+];
+
+/// How a container file was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerKind {
+    /// Retail v2 PCK (`src/pck.rs`).
+    Pck,
+    /// Angelica File Package with the alternate trailer (`src/angelica_pck.rs`).
+    Angelica,
+    /// Not a container this viewer reads.
+    Unknown,
+}
+
+impl ContainerKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pck => "PCK v2",
+            Self::Angelica => "Angelica pack",
+            Self::Unknown => "unknown container",
+        }
+    }
+}
+
+/// One archive's result. `version` is the container version word from the
+/// trailer, which is not the client version.
+#[derive(Debug, Clone)]
+pub struct ArchiveInfo {
+    pub name: String,
+    pub kind: ContainerKind,
+    pub version: Option<u32>,
+    pub entries: Option<usize>,
+    /// `<pack stem>\version.sw` content, e.g. `142 0` in the patcher's packs.
+    /// Absent for the shipped retail packs, which carry no such entry.
+    pub pack_version: Option<String>,
+    /// The pack's own directory listing failed, or the file is missing.
+    pub problem: Option<String>,
+}
+
+/// The version word of a loose `.data` file and where it was read from.
+#[derive(Debug, Clone)]
+pub struct DataFileInfo {
+    pub name: String,
+    pub path: Option<PathBuf>,
+    /// `elements.data`'s structured header, when this row is that file. Parsed
+    /// once so the scan does not read the file twice.
+    pub header: Option<ElementsHeader>,
+    /// Raw header word as read (u16 or u32 depending on the file).
+    pub raw: Option<u32>,
+    /// Human-readable version, e.g. `v27 (0x3000001b)`.
+    pub version: Option<String>,
+    /// Extra header fields worth printing (`timestamp`, `count`, ...).
+    pub detail: Option<String>,
+    pub problem: Option<String>,
+}
+
+/// The header of an `elements.data` file, which is what decides which reader
+/// (and therefore which element/record layout) is correct.
+///
+/// The first four bytes are one `u32` that reads as **two** fields, and the
+/// client's own tools and this repository's readers look at it differently:
+///
+/// * `u16` at offset 0 — the version, and the number every Perfect World data
+///   tool prints (`27` for the inspected 1.4.2 client, `6`, `12`, `70`, `85`,
+///   `253`, `267` for other releases). This is the low half of the `u32`.
+/// * the high half is the table-family marker `0x3000`, so the whole word for
+///   the 1.4.2 client is `0x3000_001b` — the exact constant the Librarian and
+///   Designer readers compare against.
+///
+/// Reading the version out of the high half (or calling the low half a "flag")
+/// is the mistake this struct exists to prevent: it would report v27 as `0x1b`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElementsHeader {
+    /// The version: `i16`/`u16` at offset 0, and the low half of [`Self::word`].
+    pub short: u16,
+    /// The whole `u32` at offset 0, canonical form as the v27 readers spell it.
+    pub word: u32,
+    /// `u32` at offset 4: the content timestamp.
+    pub timestamp: u32,
+}
+
+impl ElementsHeader {
+    /// Parse the header without reading the whole file. `None` when the file
+    /// is too short to carry a header.
+    pub fn parse(bytes: &[u8]) -> Option<Self> {
+        let word = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
+        let timestamp = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);
+        Some(Self {
+            short: u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?),
+            word,
+            timestamp,
+        })
+    }
+
+    /// The table-family marker in the high half (`0x3000` for every retail
+    /// `elements.data` seen so far).
+    pub fn family(self) -> u16 {
+        (self.word >> 16) as u16
+    }
+
+    /// The version as the client's own tools print it (`27`).
+    pub fn version(self) -> u32 {
+        // The low half of the word and the `u16` at offset 0 are the same
+        // field; assert nothing about the high half here.
+        self.short as u32
+    }
+
+    /// The version word in canonical form (`0x3000_001b` for v27) — the
+    /// constant the Librarian/Designer readers compare against.
+    pub fn canonical(self) -> u32 {
+        self.word
+    }
+
+    /// Whether this header is the exact layout the v27 readers implement.
+    /// Both halves must match: a file that only happens to carry `0x001b` in
+    /// the low half but a different family is not a v27 table.
+    pub fn is_v27_layout(self) -> bool {
+        self.word == 0x3000_001b
+    }
+
+    pub fn describe(self) -> String {
+        format!("v{} ({:#010x})", self.version(), self.canonical())
+    }
+}
+
+/// The executable's identity.
+#[derive(Debug, Clone)]
+pub struct ExecutableInfo {
+    pub path: PathBuf,
+    pub size: usize,
+    pub sha256: String,
+    pub pe32: bool,
+    /// Whether `goblin` could read the image at all. `pe32: false` with this
+    /// set means a readable PE of another architecture; without it, the file
+    /// has no PE header this reader can open.
+    pub parsed_as_pe: bool,
+    /// Name of the matching [`KNOWN_BUILDS`] row.
+    pub known: Option<&'static str>,
+    /// `VS_VERSIONINFO` string, when the build has one.
+    pub file_version: Option<String>,
+    pub product_version: Option<String>,
+    pub pe_timestamp: Option<u32>,
+}
+
+impl ExecutableInfo {
+    /// Display label: the known build's name, else the resource version, else
+    /// the fingerprint itself.
+    pub fn label(&self) -> String {
+        if let Some(known) = self.known {
+            return known.to_string();
+        }
+        if let Some(version) = &self.file_version {
+            return format!("unverified build {version}");
+        }
+        format!(
+            "unverified build ({} bytes, sha256 {}…)",
+            self.size,
+            &self.sha256[..12.min(self.sha256.len())]
+        )
+    }
+
+    pub fn is_known(&self) -> bool {
+        self.known.is_some()
+    }
+
+    /// Data revisions this fingerprint was inspected with, as
+    /// `elements.data v27, tasks.data v75`. A different revision beside the
+    /// same executable is not an error — it is exactly what the scan reports
+    /// above this line.
+    pub fn known_data_versions(&self) -> Option<String> {
+        let build = KNOWN_BUILDS
+            .iter()
+            .find(|build| Some(build.label) == self.known)?;
+        if build.data_versions.is_empty() {
+            return None;
+        }
+        Some(
+            build
+                .data_versions
+                .iter()
+                .map(|(file, version)| format!("{file} v{version}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
+    }
+}
+
+/// Everything the scan found.
+#[derive(Debug, Clone)]
+pub struct Scan {
+    /// Folder that holds the archives and the `data/` directory.
+    pub element: PathBuf,
+    /// A readable `maps/<id>/<id>.{trn2,ecwld,ecbsd}` set was found.
+    pub readable_map: Option<PathBuf>,
+    pub executable: Option<ExecutableInfo>,
+    pub executable_problem: Option<String>,
+    pub elements: Option<DataFileInfo>,
+    pub data_files: Vec<DataFileInfo>,
+    pub archives: Vec<ArchiveInfo>,
+    /// Fatal problems: the folder cannot be loaded at all.
+    pub errors: Vec<String>,
+    /// Non-fatal notes: absent optional archives, unreadable containers.
+    pub notes: Vec<String>,
+}
+
+impl Scan {
+    /// Whether the viewer can attempt to load this folder. Unknown versions are
+    /// allowed — the report says what is unverified — but a missing world or a
+    /// missing required archive is not.
+    pub fn loadable(&self) -> bool {
+        self.errors.is_empty()
+    }
+
+    /// The data revision this folder ships, as the `(elements, tasks)` pair.
+    ///
+    /// The two files are versioned together and move independently of the
+    /// executable, so one game build can sit beside several data revisions —
+    /// 1.4.2 ships with elements v27/tasks v75 in one release and v29/v78 in
+    /// another. Either half is reported as `None` when that file is missing or
+    /// its version word could not be read.
+    pub fn data_versions(&self) -> (Option<String>, Option<String>) {
+        let elements = self.elements.as_ref().and_then(|info| info.version.clone());
+        let tasks = self
+            .data_files
+            .iter()
+            .find(|info| info.name == "tasks.data")
+            .and_then(|info| info.version.clone());
+        (elements, tasks)
+    }
+
+    /// The data version line: the `elements.data` / `tasks.data` pair, which is
+    /// what changes between client builds that share one executable.
+    pub fn data_version_summary(&self) -> String {
+        let (elements, tasks) = self.data_versions();
+        let elements = match (&elements, self.elements.as_ref()) {
+            (Some(version), _) => format!("elements.data {version}"),
+            (None, Some(info)) => {
+                let why = info.problem.as_deref().unwrap_or("version not readable");
+                format!("elements.data unreadable ({why})")
+            }
+            (None, None) => "elements.data absent".into(),
+        };
+        let tasks = match &tasks {
+            Some(version) => format!("tasks.data {version}"),
+            None => match self
+                .data_files
+                .iter()
+                .find(|info| info.name == "tasks.data")
+            {
+                Some(info) => {
+                    let why = info.problem.as_deref().unwrap_or("version not readable");
+                    format!("tasks.data unreadable ({why})")
+                }
+                None => "tasks.data absent".into(),
+            },
+        };
+        format!("{elements} / {tasks}")
+    }
+
+    /// One-line launcher status.
+    pub fn headline(&self) -> String {
+        if !self.loadable() {
+            return self
+                .errors
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "Client not detected".into());
+        }
+        let exe = self
+            .executable
+            .as_ref()
+            .map(ExecutableInfo::label)
+            .unwrap_or_else(|| "unknown executable".into());
+        format!("{exe} · {}", self.data_version_summary())
+    }
+
+    /// The rows the launcher card draws: one `(label, value)` per version that
+    /// actually answered. Kept short on purpose — the full report is what
+    /// `--diagnose-client`, the `client-check` binary and the log carry.
+    pub fn summary_rows(&self) -> Vec<(String, String)> {
+        let mut rows = Vec::new();
+        if let Some(exe) = &self.executable {
+            rows.push(("build".into(), exe.label()));
+        }
+        // The pair is the data version; it is reported on one row because the
+        // card has four and the executable already owns one of them.
+        rows.push(("data".into(), self.data_version_summary()));
+        // `elements.data` and `tasks.data` are the row above; `gshop*.data`
+        // carry a timestamp rather than a version, so they stay in the full
+        // report. Everything else here is a revision too, on its own row.
+        let others: Vec<String> = self
+            .data_files
+            .iter()
+            .filter(|info| {
+                info.name != "tasks.data"
+                    && !info.name.starts_with("gshop")
+                    && info.version.is_some()
+            })
+            .map(|info| format!("{} {}", info.name, info.version.as_deref().unwrap()))
+            .collect();
+        if !others.is_empty() {
+            rows.push(("data".into(), others.join(", ")));
+        }
+        let readable = self
+            .archives
+            .iter()
+            .filter(|archive| archive.problem.is_none())
+            .count();
+        let mut packs = format!("{readable} archives readable");
+        let broken: Vec<&str> = self
+            .archives
+            .iter()
+            .filter(|archive| archive.problem.is_some())
+            .map(|archive| archive.name.as_str())
+            .collect();
+        if !broken.is_empty() {
+            packs.push_str(&format!("; unreadable: {}", broken.join(", ")));
+        }
+        rows.push(("archive".into(), packs));
+        rows
+    }
+
+    /// Multi-line report: the executable, then every data file, then every
+    /// archive, then the errors and notes. Stable order, no invention — a
+    /// field that could not be read says why.
+    pub fn report(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("Client folder: {}\n", self.element.display()));
+        match &self.readable_map {
+            Some(map) => out.push_str(&format!("World files:   {} (readable)\n", map.display())),
+            None => out.push_str("World files:   none readable\n"),
+        }
+
+        out.push_str("\nExecutable\n");
+        match (&self.executable, &self.executable_problem) {
+            (Some(exe), _) => {
+                out.push_str(&format!("  file      {}\n", exe.path.display()));
+                out.push_str(&format!("  size      {} bytes\n", exe.size));
+                out.push_str(&format!("  sha256    {}\n", exe.sha256));
+                out.push_str(&format!(
+                    "  format    {}\n",
+                    if exe.pe32 {
+                        "PE32 i386"
+                    } else {
+                        "not a 32-bit x86 executable"
+                    }
+                ));
+                if let Some(timestamp) = exe.pe_timestamp {
+                    out.push_str(&format!("  PE time   0x{timestamp:08x}\n"));
+                }
+                match (&exe.file_version, &exe.product_version) {
+                    (None, None) => out.push_str("  resource  no version resource\n"),
+                    (file, product) => {
+                        out.push_str(&format!(
+                            "  resource  file {} / product {}\n",
+                            file.as_deref().unwrap_or("-"),
+                            product.as_deref().unwrap_or("-")
+                        ));
+                    }
+                }
+                out.push_str(&format!("  identity  {}\n", exe.label()));
+                if let Some(versions) = exe.known_data_versions() {
+                    out.push_str(&format!("  inspected with  {versions}\n"));
+                }
+            }
+            (None, Some(problem)) => out.push_str(&format!("  unavailable: {problem}\n")),
+            (None, None) => out.push_str("  unavailable\n"),
+        }
+
+        out.push_str(
+            "\nData version (elements.data and tasks.data move independently of the executable)\n",
+        );
+        out.push_str(&format!("  pair      {}\n", self.data_version_summary()));
+        match &self.elements {
+            Some(elements) => {
+                out.push_str(&format!("  {}\n", elements_line(elements)));
+                if let Some(detail) = &elements.detail {
+                    out.push_str(&format!("      {detail}\n"));
+                }
+            }
+            None => out.push_str("  elements.data: absent\n"),
+        }
+        if self.data_files.is_empty() {
+            out.push_str("  no other loose .data files found\n");
+        }
+        for info in &self.data_files {
+            out.push_str(&format!("  {}\n", elements_line(info)));
+            if let Some(detail) = &info.detail {
+                out.push_str(&format!("      {detail}\n"));
+            }
+        }
+
+        out.push_str("\nArchives\n");
+        for archive in &self.archives {
+            out.push_str(&format!("  {}\n", archive_line(archive)));
+        }
+
+        if !self.errors.is_empty() {
+            out.push_str("\nErrors\n");
+            for error in &self.errors {
+                out.push_str(&format!("  {error}\n"));
+            }
+        }
+        if !self.notes.is_empty() {
+            out.push_str("\nNotes\n");
+            for note in &self.notes {
+                out.push_str(&format!("  {note}\n"));
+            }
+        }
+        out
+    }
+}
+
+fn elements_line(info: &DataFileInfo) -> String {
+    match (&info.version, &info.problem) {
+        (Some(version), _) => format!("{:<16} {version}", info.name),
+        (None, Some(problem)) => format!("{:<16} unreadable: {problem}", info.name),
+        (None, None) => format!("{:<16} present, no version field", info.name),
+    }
+}
+
+fn archive_line(info: &ArchiveInfo) -> String {
+    if let Some(problem) = &info.problem {
+        return format!("{:<16} {}", info.name, problem);
+    }
+    let mut line = format!("{:<16} {}", info.name, info.kind.label());
+    if let Some(version) = info.version {
+        line.push_str(&format!(" v{version:#07x}"));
+    }
+    if let Some(entries) = info.entries {
+        line.push_str(&format!(" · {entries} entries"));
+    }
+    if let Some(pack) = &info.pack_version {
+        line.push_str(&format!(" · version.sw {pack}"));
+    }
+    line
+}
+
+/// A client folder that passed the minimum checks.
 #[derive(Debug)]
 pub struct Client {
     pub element: PathBuf,
+    /// The executable is the inspected 1.4.2 build.
     pub known_142: bool,
 }
+
+impl Client {
+    pub fn from_scan(scan: &Scan) -> Self {
+        Self {
+            element: scan.element.clone(),
+            known_142: scan.executable.as_ref().is_some_and(|e| e.is_known()),
+        }
+    }
+}
+
 fn digest(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(bytes))
 }
+
 fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     let exact = dir.join(name);
     if exact.is_file() {
@@ -28,6 +563,7 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
         .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))
         .map(|e| e.path())
 }
+
 /// A client may ship only instance maps, so validate any readable
 /// `maps/<id>/<id>.{trn2,ecwld,ecbsd}` set rather than requiring `world.*`.
 fn readable_map_dir(element: &Path) -> Option<PathBuf> {
@@ -53,51 +589,664 @@ fn readable_map_dir(element: &Path) -> Option<PathBuf> {
             .all(|ext| find_file(dir, &format!("{stem}.{ext}")).is_some())
     })
 }
-pub fn detect(selected: &Path) -> Result<Client, String> {
-    let element = [selected.join("element"), selected.to_path_buf()]
-        .into_iter()
-        .find(|candidate| readable_map_dir(candidate).is_some())
-        .unwrap_or_else(|| selected.to_path_buf());
-    let map = readable_map_dir(&element).ok_or_else(|| {
-        "The selected folder has no readable maps/<id>/<id>.trn2, .ecwld and .ecbsd set. Select the extracted client root or its element folder.".to_string()
-    })?;
-    let id = map.file_name().and_then(OsStr::to_str).unwrap_or("world");
-    let stem = if find_file(&map, &format!("{id}.ecbsd")).is_some() {
-        id
-    } else {
-        "world"
+
+/// Read the whole executable and fingerprint it. Small (6 MB) and read once.
+fn scan_executable(element: &Path) -> (Option<ExecutableInfo>, Option<String>) {
+    let Some(path) = find_file(element, "elementclient.exe") else {
+        return (None, Some("elementclient.exe is absent".into()));
     };
-    for path in [
-        "elementclient.exe",
-        "trees.pck",
-        "building.pck",
-        "textures.pck",
-        "speedtreert.dll",
-    ] {
-        if !element.join(path).is_file() {
-            return Err(format!("The selected folder is missing {path}. Select the extracted client root or its element folder."));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                None,
+                Some(format!("cannot read elementclient.exe: {error}")),
+            )
+        }
+    };
+    let sha256 = digest(&bytes);
+    let parsed = goblin::pe::PE::parse(&bytes).is_ok();
+    let (pe32, pe_timestamp, file_version, product_version) = match goblin::pe::PE::parse(&bytes) {
+        Ok(pe) => {
+            let timestamp = pe.header.coff_header.time_date_stamp;
+            let (file, product) = pe_version_strings(&bytes, &pe);
+            (
+                pe.header.coff_header.machine == 0x14c && !pe.is_64,
+                Some(timestamp),
+                file,
+                product,
+            )
+        }
+        Err(_) => (false, None, None, None),
+    };
+    let known = KNOWN_BUILDS
+        .iter()
+        .find(|build| build.size == bytes.len() && build.sha256 == sha256);
+    (
+        Some(ExecutableInfo {
+            path,
+            size: bytes.len(),
+            sha256,
+            pe32,
+            parsed_as_pe: parsed,
+            known: known.map(|build| build.label),
+            file_version,
+            product_version,
+            pe_timestamp,
+        }),
+        None,
+    )
+}
+
+/// `VS_VERSIONINFO` strings. Every real Perfect World build carries them, and
+/// they are the only self-description a patched build gives.
+fn pe_version_strings(bytes: &[u8], pe: &goblin::pe::PE) -> (Option<String>, Option<String>) {
+    let Some(blob) = version_blob(bytes, pe) else {
+        return (None, None);
+    };
+    (
+        version_string(blob, "FileVersion"),
+        version_string(blob, "ProductVersion"),
+    )
+}
+
+/// The `VS_VERSIONINFO` blob for the image, or `None` when the executable has
+/// no version resource (a stripped or MinGW build may not).
+///
+/// Two walks, both checked against the five vendor DLLs in `sdk/`:
+///
+/// 1. the **resource directory**, three levels of `IMAGE_RESOURCE_DIRECTORY`.
+///    Each entry's target has bit 31 set for a subdirectory (an offset from the
+///    resource base) and clear for a leaf, which at the bottom level is an
+///    offset to an `IMAGE_RESOURCE_DATA_ENTRY` — *not* the data itself. Descend
+///    type `RT_VERSION` (16), then the first name, then the first language, and
+///    read `OffsetToData`/`Size` from that data entry.
+/// 2. the **`VS_VERSIONINFO` tree** itself, a chain of length-prefixed nodes.
+///    The root's `wValueLength` is the byte size of `VS_FIXEDFILEINFO`; a
+///    `String` node's is the number of UTF-16 units in its value — the one
+///    unit mismatch in the format. `StringTable`'s is a child *count* in some
+///    writers, so the tree is walked by each node's own `wLength` rather than
+///    by that field.
+pub(crate) fn version_blob<'a>(bytes: &'a [u8], pe: &goblin::pe::PE) -> Option<&'a [u8]> {
+    let optional = pe.header.optional_header.as_ref()?;
+    let resource_rva = optional.data_directories.resource_directory.virtual_address;
+    if resource_rva == 0 {
+        return None;
+    }
+    // An RVA is not a file offset: map it through the section table. The
+    // section's mapped span decides membership, its raw span decides how much
+    // can actually be read.
+    let file_offset = |rva: u64| -> Option<usize> {
+        let section = pe.sections.iter().find(|section| {
+            let start = section.virtual_address as u64;
+            let span = section.virtual_size.max(section.size_of_raw_data) as u64;
+            start <= rva && rva < start + span
+        })?;
+        let offset = section.pointer_to_raw_data as u64 + (rva - section.virtual_address as u64);
+        let raw_end = section.pointer_to_raw_data as u64 + section.size_of_raw_data as u64;
+        (offset < raw_end).then_some(offset as usize)
+    };
+    let read_u16 = |at: usize| -> Option<u16> {
+        Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))
+    };
+    let read_u32 = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    };
+    let base = file_offset(resource_rva as u64)?;
+    // Three levels of `IMAGE_RESOURCE_DIRECTORY`: type, name, language. The
+    // first two are searched; at each, entries with bit 31 set are
+    // subdirectories holding an offset from the resource base, and an entry
+    // with bit 31 clear at level two points at an `IMAGE_RESOURCE_DATA_ENTRY`.
+    let mut directory = base;
+    for level in 0..3 {
+        let named = read_u16(directory + 12)? as usize;
+        let ids = read_u16(directory + 14)? as usize;
+        let mut target = None;
+        for index in 0..(named + ids) {
+            let entry = directory + 16 + index * 8;
+            let name = read_u32(entry)?;
+            let value = read_u32(entry + 4)?;
+            if level == 0 && name != 16 {
+                // `RT_VERSION` only: the other types here are icons, a
+                // manifest and a string table nobody reads.
+                continue;
+            }
+            target = Some(value);
+            break;
+        }
+        let target = target?;
+        if level == 2 {
+            if target & 0x8000_0000 != 0 {
+                return None;
+            }
+            // `IMAGE_RESOURCE_DATA_ENTRY`:
+            //   u32 OffsetToData (RVA), u32 Size, u32 CodePage, u32 Reserved
+            let entry = base.checked_add(target as usize)?;
+            let data_rva = read_u32(entry)? as u64;
+            let size = read_u32(entry + 4)? as usize;
+            let start = file_offset(data_rva)?;
+            return bytes.get(start..start.checked_add(size)?);
+        }
+        if target & 0x8000_0000 == 0 {
+            // A leaf where a directory was expected: a malformed table.
+            return None;
+        }
+        directory = base.checked_add((target & 0x7fff_ffff) as usize)?;
+    }
+    None
+}
+
+/// Find one `String` value in a `VS_VERSIONINFO` blob by key.
+pub(crate) fn version_string(blob: &[u8], key: &str) -> Option<String> {
+    fn align4(value: usize) -> usize {
+        (value + 3) & !3
+    }
+    fn u16_at(blob: &[u8], offset: usize) -> Option<u16> {
+        Some(u16::from_le_bytes(
+            blob.get(offset..offset + 2)?.try_into().ok()?,
+        ))
+    }
+    /// A UTF-16LE key or value up to its terminator, never past `end`. The
+    /// returned offset is one past the terminator.
+    fn utf16(blob: &[u8], start: usize, end: usize) -> Option<(String, usize)> {
+        let mut units = Vec::new();
+        let mut pos = start;
+        while pos + 2 <= end {
+            let unit = u16_at(blob, pos)?;
+            pos += 2;
+            if unit == 0 {
+                break;
+            }
+            units.push(unit);
+        }
+        String::from_utf16(&units).ok().map(|text| (text, pos))
+    }
+    struct Node {
+        length: usize,
+        value_length: usize,
+        kind: u16,
+        key: String,
+        value_at: usize,
+        end: usize,
+    }
+    fn node(blob: &[u8], pos: usize, end: usize) -> Option<Node> {
+        if pos + 6 > end {
+            return None;
+        }
+        let length = u16_at(blob, pos)? as usize;
+        let value_length = u16_at(blob, pos + 2)? as usize;
+        let kind = u16_at(blob, pos + 4)?;
+        if length < 6 || pos + length > end {
+            return None;
+        }
+        let (key, after) = utf16(blob, pos + 6, pos + length)?;
+        Some(Node {
+            length,
+            value_length,
+            kind,
+            key,
+            value_at: align4(after),
+            end: pos + length,
+        })
+    }
+    // Node kinds are distinguished by depth, not by `wType`: a `StringTable` is
+    // also `wType` 1, so keying off the type turns it into a `String` and its
+    // children are never visited. The format has exactly four levels:
+    //
+    //   0 `VS_VERSION_INFO`   value = `VS_FIXEDFILEINFO`, length in bytes
+    //   1 `StringFileInfo` / `VarFileInfo`
+    //   2 `040904b0` and other `StringTable`s
+    //   3 `String` entries     value = the text, length in UTF-16 units
+    //
+    // so the level decides how the value is measured and where children start.
+    fn walk(blob: &[u8], pos: usize, end: usize, depth: usize, key: &str) -> Option<String> {
+        let current = node(blob, pos, end)?;
+        let child_start = match depth {
+            // Containers: children follow the aligned key.
+            0..=2 => current.value_at,
+            3 if current.kind == 1 => {
+                let (text, _) = utf16(blob, current.value_at, current.end)?;
+                if !current.key.eq_ignore_ascii_case(key) {
+                    return None;
+                }
+                // `wValueLength` counts UTF-16 units here, not bytes.
+                let value = if current.value_length > 0 {
+                    text.chars().take(current.value_length).collect()
+                } else {
+                    text
+                };
+                return Some(value);
+            }
+            _ => return None,
+        };
+        // At level 0 the value is `VS_FIXEDFILEINFO`, whose length is in bytes,
+        // so the children start after it.
+        let child_start = if depth == 0 {
+            align4(child_start + current.value_length)
+        } else {
+            child_start
+        };
+        let mut child = child_start;
+        while child + 6 <= current.end {
+            let next = node(blob, child, current.end)?;
+            if let Some(value) = walk(blob, child, current.end, depth + 1, key) {
+                return Some(value);
+            }
+            child += align4(next.length);
+        }
+        None
+    }
+    walk(blob, 0, blob.len(), 0, key)
+}
+
+/// `elements.data` header. Reads only the first bytes.
+fn scan_elements(element: &Path) -> Option<DataFileInfo> {
+    let path = [
+        element.join("data/elements.data"),
+        element.join("elements.data"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())?;
+    let mut info = DataFileInfo {
+        name: "elements.data".into(),
+        path: Some(path.clone()),
+        header: None,
+        raw: None,
+        version: None,
+        detail: None,
+        problem: None,
+    };
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            info.problem = Some(error.to_string());
+            return Some(info);
+        }
+    };
+    let Some(header) = ElementsHeader::parse(&bytes) else {
+        info.problem = Some("truncated header".into());
+        return Some(info);
+    };
+    info.header = Some(header);
+    info.raw = Some(header.canonical());
+    info.version = Some(header.describe());
+    let support = if header.is_v27_layout() {
+        "v27 layout, read by the Librarian/Designer readers"
+    } else {
+        "no v27 reader: element/record tables are reported, not parsed"
+    };
+    info.detail = Some(format!(
+        "{} · timestamp 0x{:08x} · family 0x{:04x} · {} bytes",
+        support,
+        header.timestamp,
+        header.family(),
+        bytes.len(),
+    ));
+    Some(info)
+}
+
+/// Every other loose `.data` file with a header word this viewer can name.
+/// Each entry says which field it is, because they are not the same field:
+/// `tasks.data` holds a magic then a version, `gshop*.data` holds a timestamp.
+fn scan_data_files(element: &Path) -> Vec<DataFileInfo> {
+    let data = element.join("data");
+    let dir = if data.is_dir() {
+        data
+    } else {
+        element.to_path_buf()
+    };
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return out;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("data"))
+        })
+        .collect();
+    paths.sort();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("?")
+            .to_ascii_lowercase();
+        if name == "elements.data" {
+            continue;
+        }
+        let mut info = DataFileInfo {
+            name: name.clone(),
+            path: Some(path.clone()),
+            header: None,
+            raw: None,
+            version: None,
+            detail: None,
+            problem: None,
+        };
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                info.problem = Some(error.to_string());
+                out.push(info);
+                continue;
+            }
+        };
+        describe_data_file(&name, &bytes, &mut info);
+        out.push(info);
+    }
+    out
+}
+
+fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn describe_data_file(name: &str, bytes: &[u8], info: &mut DataFileInfo) {
+    match name {
+        "tasks.data" | "tasks_sample.data" => {
+            let magic = u32_at(bytes, 0);
+            let version = u32_at(bytes, 4);
+            if let (Some(magic), Some(version)) = (magic, version) {
+                info.raw = Some(version);
+                info.version = Some(format!("v{version}"));
+                info.detail = Some(format!(
+                    "header magic 0x{magic:08x}, version word {version} · {} bytes{}",
+                    bytes.len(),
+                    if magic == 0x93858361 {
+                        ""
+                    } else {
+                        " · magic is not the 1.4.2 tasks.data magic"
+                    }
+                ));
+            } else {
+                info.problem = Some("truncated header".into());
+            }
+        }
+        "dyn_tasks.data" => {
+            if let (Some(size), Some(version)) = (u32_at(bytes, 0), u16_at(bytes, 8)) {
+                info.raw = Some(version as u32);
+                info.version = Some(format!("v{version}"));
+                info.detail = Some(format!(
+                    "declared size {size}, timestamp 0x{:08x} · {} bytes",
+                    u32_at(bytes, 4).unwrap_or(0),
+                    bytes.len()
+                ));
+            } else {
+                info.problem = Some("truncated header".into());
+            }
+        }
+        "task_npc.data" => {
+            if let (Some(size), Some(version)) = (u32_at(bytes, 0), u16_at(bytes, 8)) {
+                info.raw = Some(version as u32);
+                info.version = Some(format!("v{version}"));
+                info.detail = Some(format!(
+                    "declared size {size}, timestamp 0x{:08x}, {} records · {} bytes",
+                    u32_at(bytes, 4).unwrap_or(0),
+                    u16_at(bytes, 10).unwrap_or(0),
+                    bytes.len()
+                ));
+            } else {
+                info.problem = Some("truncated header".into());
+            }
+        }
+        "aipolicy.data" => {
+            if let (Some(header), Some(trigger)) = (u32_at(bytes, 0), u32_at(bytes, 4)) {
+                info.raw = Some(trigger);
+                info.version = Some(format!("header {header}, trigger v{trigger}"));
+                info.detail = Some(format!("{} bytes", bytes.len()));
+            } else {
+                info.problem = Some("truncated header".into());
+            }
+        }
+        "domain.data" => {
+            if let Some(magic) = u32_at(bytes, 0) {
+                info.raw = Some(magic);
+                info.version = Some(format!("magic 0x{magic:08x}"));
+                info.detail = Some(format!(
+                    "{} bytes{}",
+                    bytes.len(),
+                    if magic == 0x42584f4d {
+                        " (MOXB binary)"
+                    } else {
+                        " (not the MOXB binary marker)"
+                    }
+                ));
+            } else {
+                info.problem = Some("truncated header".into());
+            }
+        }
+        _ if name.starts_with("gshop") => {
+            if let Some(stamp) = u32_at(bytes, 0) {
+                info.raw = Some(stamp);
+                info.version = Some("timestamped, no version word".into());
+                info.detail = Some(format!(
+                    "timestamp 0x{stamp:08x} ({}) · {} bytes",
+                    format_unix_timestamp(stamp as i64),
+                    bytes.len()
+                ));
+            } else {
+                info.problem = Some("truncated header".into());
+            }
+        }
+        _ => {
+            info.version = Some("no known header".into());
+            info.detail = Some(format!("{} bytes", bytes.len()));
         }
     }
-    for ext in ["trn2", "ecwld", "ecbsd"] {
-        if find_file(&map, &format!("{stem}.{ext}")).is_none() {
-            return Err(format!(
-                "The selected folder is missing maps/{id}/{stem}.{ext}."
+}
+
+/// `yyyy-mm-dd hh:mm:ss` in UTC, from a Unix timestamp. Used for the `gshop`
+/// header stamps, which are what the client's own version auditor prints.
+fn format_unix_timestamp(seconds: i64) -> String {
+    let days = seconds.div_euclid(86_400);
+    let rem = seconds.rem_euclid(86_400);
+    let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as i64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+}
+
+/// Open one archive just far enough to name its container, version and entry
+/// count. Errors are recorded on the row, never dropped.
+fn scan_archive(element: &Path, name: &str) -> ArchiveInfo {
+    let mut info = ArchiveInfo {
+        name: name.into(),
+        kind: ContainerKind::Unknown,
+        version: None,
+        entries: None,
+        pack_version: None,
+        problem: None,
+    };
+    let Some(path) = find_file(element, name) else {
+        info.problem = Some("absent".into());
+        return info;
+    };
+    let mut file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            info.problem = Some(format!("cannot open: {error}"));
+            return info;
+        }
+    };
+    // Retail v2 PCK first, then the Angelica trailer the config packs use.
+    let (kind, directory) = match crate::pck::directory(&mut file) {
+        Ok(entries) => (ContainerKind::Pck, Ok(entries)),
+        Err(pck_error) => match crate::angelica_pck::directory(&mut file) {
+            Ok(entries) => (ContainerKind::Angelica, Ok(entries)),
+            Err(angelica_error) => (
+                ContainerKind::Unknown,
+                Err(format!("{pck_error}; {angelica_error}")),
+            ),
+        },
+    };
+    info.kind = kind;
+    info.version = container_version(&path, kind);
+    match directory {
+        Ok(entries) => {
+            info.entries = Some(entries.len());
+            // `PackDLL::FillPackVersion` writes `<pack stem>\version.sw` into
+            // the pack it patches; retail packs never contain one, so this is
+            // normally absent and only names a repacked/modified client.
+            let stem = name.strip_suffix(".pck").unwrap_or(name);
+            let marker = format!("{stem}\\version.sw");
+            info.pack_version = entries
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(&marker))
+                .and_then(|entry| crate::pck::read_entry(&mut file, entry).ok())
+                .map(|bytes| {
+                    String::from_utf8_lossy(&bytes)
+                        .trim()
+                        .replace(['\r', '\n'], " ")
+                        .trim()
+                        .to_string()
+                })
+                .filter(|text| !text.is_empty());
+        }
+        Err(error) => info.problem = Some(error),
+    }
+    info
+}
+
+/// The container version word from the trailer. Read directly so a pack whose
+/// directory fails still reports its format version.
+fn container_version(path: &Path, kind: ContainerKind) -> Option<u32> {
+    let mut file = fs::File::open(path).ok()?;
+    use std::io::{Read, Seek, SeekFrom};
+    let size = file.seek(SeekFrom::End(0)).ok()?;
+    if size < 280 {
+        return None;
+    }
+    file.seek(SeekFrom::Start(size - 4)).ok()?;
+    let mut word = [0u8; 4];
+    file.read_exact(&mut word).ok()?;
+    let _ = kind;
+    Some(u32::from_le_bytes(word))
+}
+
+/// Locate the `element` folder under the selected path, then scan it.
+pub fn scan(selected: &Path) -> Scan {
+    let readable = [selected.join("element"), selected.to_path_buf()]
+        .into_iter()
+        .find(|candidate| readable_map_dir(candidate).is_some());
+    let element = readable.clone().unwrap_or_else(|| selected.to_path_buf());
+    let mut scan = Scan {
+        element: element.clone(),
+        readable_map: readable.and_then(|path| readable_map_dir(&path)),
+        executable: None,
+        executable_problem: None,
+        elements: None,
+        data_files: Vec::new(),
+        archives: Vec::new(),
+        errors: Vec::new(),
+        notes: Vec::new(),
+    };
+
+    if !element.is_dir() {
+        scan.errors
+            .push(format!("{} is not a folder", element.display()));
+        return scan;
+    }
+    if scan.readable_map.is_none() {
+        scan.errors.push(
+            "The selected folder has no readable maps/<id>/<id>.trn2, .ecwld and .ecbsd set. Select the extracted client root or its element folder.".into(),
+        );
+    }
+    for required in REQUIRED_ARCHIVES {
+        if find_file(&element, required).is_none() {
+            scan.errors.push(format!(
+                "The selected folder is missing {required}. Select the extracted client root or its element folder."
             ));
         }
     }
-    let bytes = fs::read(element.join("elementclient.exe"))
-        .map_err(|e| format!("Cannot read elementclient.exe: {e}"))?;
-    let pe = goblin::pe::PE::parse(&bytes)
-        .map_err(|e| format!("elementclient.exe is not a valid Windows PE executable: {e}"))?;
-    if pe.header.coff_header.machine != 0x14c || pe.is_64 {
-        return Err("elementclient.exe is not a 32-bit x86 game client".into());
+
+    let (executable, problem) = scan_executable(&element);
+    scan.executable_problem = problem;
+    if let Some(exe) = &executable {
+        // The world reader never runs `elementclient.exe`, so neither an
+        // unrecognized build nor a PE the parser cannot open may block the
+        // load. Both are reported as notes: a client whose executable this
+        // viewer cannot read still has readable world files, and that is what
+        // loading requires.
+        if !exe.pe32 {
+            scan.notes.push(if exe.parsed_as_pe {
+                "elementclient.exe is not a 32-bit x86 game client. The world files are read directly and do not need it.".into()
+            } else {
+                "elementclient.exe has no PE header this reader can open (stripped, packed or not a Windows executable). The world files are read directly and do not need it.".into()
+            });
+        }
+        if exe.known.is_none() {
+            scan.notes.push(
+                "The executable is not one of the inspected builds. It is loaded as an unverified build: the files it reads are reported above, and any format this viewer does not know is named instead of guessed.".into(),
+            );
+        }
     }
-    let known_142 = bytes.len() == PW142_SIZE && digest(&bytes) == PW142_SHA256;
-    Ok(Client { element, known_142 })
+    scan.executable = executable;
+
+    scan.elements = scan_elements(&element);
+    if let Some(elements) = &scan.elements {
+        if let Some(header) = elements.header {
+            if header.is_v27_layout() {
+                // The exact layout the Designer/Librarian readers implement.
+            } else {
+                scan.notes.push(format!(
+                    "elements.data is {}. The world itself does not depend on it, but the Character Designer and Librarian read the v27 layout only, so their sections report the version and stop.",
+                    header.describe()
+                ));
+            }
+        }
+    }
+
+    scan.data_files = scan_data_files(&element);
+    // Optional packs that are absent are not rows: their absence is normal for
+    // a regional client, and listing a dozen `absent` lines would bury the
+    // packs that are actually there. A pack that is present but unreadable is
+    // always kept, because that is the case worth naming.
+    for name in REPORTED_ARCHIVES {
+        let info = scan_archive(&element, name);
+        if info.problem.as_deref() == Some("absent") {
+            continue;
+        }
+        scan.archives.push(info);
+    }
+    scan
 }
+
+/// Scan and reduce to the loadable minimum. Kept for callers that only need a
+/// folder and a known-build flag.
+pub fn detect(selected: &Path) -> Result<Client, String> {
+    let scan = scan(selected);
+    if !scan.loadable() {
+        return Err(scan.errors.join("\n"));
+    }
+    Ok(Client::from_scan(&scan))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn hash_reference() {
         assert_eq!(
@@ -105,9 +1254,60 @@ mod tests {
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
     }
+
     #[test]
     fn rejects_missing() {
         assert!(detect(Path::new("__not_a_client__")).is_err());
+    }
+
+    #[test]
+    fn elements_header_reads_the_short_version_and_the_word() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x3000_001bu32.to_le_bytes());
+        bytes.extend_from_slice(&0x4b39_c931u32.to_le_bytes());
+        let header = ElementsHeader::parse(&bytes).unwrap();
+        assert_eq!(header.short, 27);
+        assert_eq!(header.version(), 27);
+        assert_eq!(header.family(), 0x3000);
+        assert_eq!(header.canonical(), 0x3000_001b);
+        assert!(header.is_v27_layout());
+        assert_eq!(header.describe(), "v27 (0x3000001b)");
+        assert_eq!(header.timestamp, 0x4b39_c931);
+    }
+
+    #[test]
+    fn a_later_elements_version_is_reported_not_mistaken_for_v27() {
+        // Other releases keep the family marker and change only the version
+        // half: v29 and the much later v267 both read as themselves.
+        for version in [29u32, 70, 85, 253, 267] {
+            let word = (version & 0xffff) | 0x3000_0000;
+            let mut bytes = word.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            let header = ElementsHeader::parse(&bytes).unwrap();
+            assert_eq!(header.version(), version);
+            assert_eq!(header.family(), 0x3000);
+            assert_eq!(header.canonical(), word);
+            assert!(!header.is_v27_layout());
+        }
+        // A different family with the same version number is also not v27.
+        let mut foreign = 0x2000_001bu32.to_le_bytes().to_vec();
+        foreign.extend_from_slice(&0u32.to_le_bytes());
+        let header = ElementsHeader::parse(&foreign).unwrap();
+        assert_eq!(header.version(), 27);
+        assert!(!header.is_v27_layout());
+    }
+
+    #[test]
+    fn short_files_do_not_panic() {
+        assert!(ElementsHeader::parse(&[]).is_none());
+        assert!(ElementsHeader::parse(&[0x1b]).is_none());
+    }
+
+    #[test]
+    fn unix_timestamp_matches_the_client_tool() {
+        // `gshop.data` header stamp from the 1.4.2 client (0x5ccc5f37).
+        assert_eq!(format_unix_timestamp(0x5ccc_5f37), "2019-05-03 15:33:11");
+        assert_eq!(format_unix_timestamp(0), "1970-01-01 00:00:00");
     }
 
     #[test]
@@ -123,5 +1323,427 @@ mod tests {
         fs::write(a01.join("A01.ECBSD"), []).unwrap();
         assert_eq!(readable_map_dir(&root), Some(a01));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Build a tiny client tree: a readable world, the three required packs, a
+    /// PE32 executable, an `elements.data` header and a `tasks.data` header.
+    fn synthetic_client(tag: &str, elements_version: u16, tasks_version: u32) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("pw-scan-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let element = root.join("element");
+        let map = element.join("maps/world");
+        fs::create_dir_all(&map).unwrap();
+        for ext in ["trn2", "ecwld", "ecbsd"] {
+            fs::write(map.join(format!("world.{ext}")), []).unwrap();
+        }
+        for name in REQUIRED_ARCHIVES {
+            fs::write(element.join(name), []).unwrap();
+        }
+        // A minimal PE32 i386 header: the scanner only reads the machine word
+        // and the resource directory offset, both of which are zero here.
+        let mut pe = vec![0u8; 512];
+        pe[0..2].copy_from_slice(b"MZ");
+        let pe_offset = 0x40usize;
+        pe[0x3c..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
+        pe[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+        pe[pe_offset + 4..pe_offset + 6].copy_from_slice(&0x014cu16.to_le_bytes());
+        fs::write(element.join("elementclient.exe"), &pe).unwrap();
+        fs::create_dir_all(element.join("data")).unwrap();
+        // Same layout the real files use: family in the high half, version in
+        // the low half (`0x3000_001b` for v27).
+        let word = 0x3000_0000u32 | elements_version as u32;
+        let mut elements = word.to_le_bytes().to_vec();
+        elements.extend_from_slice(&0x4b39_c931u32.to_le_bytes());
+        fs::write(element.join("data/elements.data"), elements).unwrap();
+        let mut tasks = 0x9385_8361u32.to_le_bytes().to_vec();
+        tasks.extend_from_slice(&tasks_version.to_le_bytes());
+        fs::write(element.join("data/tasks.data"), tasks).unwrap();
+        root
+    }
+
+    #[test]
+    fn scan_reports_data_versions_independently_of_the_executable() {
+        let root = synthetic_client("v27", 27, 75);
+        let scan = scan(&root);
+        assert!(scan.loadable(), "{}", scan.report());
+        assert_eq!(scan.element, root.join("element"));
+        assert!(scan.readable_map.is_some());
+        let elements = scan.elements.as_ref().expect("elements.data");
+        assert_eq!(elements.raw, Some(0x3000_001b));
+        assert_eq!(elements.version.as_deref(), Some("v27 (0x3000001b)"));
+        let tasks = scan
+            .data_files
+            .iter()
+            .find(|info| info.name == "tasks.data")
+            .expect("tasks.data");
+        assert_eq!(tasks.version.as_deref(), Some("v75"));
+        // The synthetic executable is not the inspected build, so it is
+        // reported as unverified rather than refused.
+        let exe = scan.executable.as_ref().expect("executable");
+        assert!(!exe.is_known());
+        assert!(exe.label().starts_with("unverified build"));
+        // The pair is the data version, and the headline carries both halves:
+        // a 1.4.2 client can sit beside v27/v75 or v29/v78.
+        assert_eq!(
+            scan.data_versions(),
+            (Some("v27 (0x3000001b)".into()), Some("v75".into()))
+        );
+        assert_eq!(
+            scan.data_version_summary(),
+            "elements.data v27 (0x3000001b) / tasks.data v75"
+        );
+        assert!(scan.headline().contains("v27"));
+        assert!(scan.headline().contains("v75"));
+        assert!(scan
+            .summary_rows()
+            .iter()
+            .any(|(label, value)| label == "data" && value.contains("tasks.data v75")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_report_states_the_pair_before_the_per_file_lines() {
+        let root = synthetic_client("report-pair", 27, 75);
+        let scan = scan(&root);
+        let report = scan.report();
+        let pair = report
+            .find("pair      elements.data v27 (0x3000001b) / tasks.data v75")
+            .unwrap_or_else(|| panic!("pair line missing from:\n{report}"));
+        let elements = report.find("elements.data    v27").expect("elements line");
+        let tasks = report.find("tasks.data       v75").expect("tasks line");
+        assert!(pair < elements && elements < tasks, "{report}");
+        assert!(report.contains("move independently of the executable"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_tasks_file_leaves_the_elements_half_of_the_pair() {
+        let root = synthetic_client("no-tasks", 27, 75);
+        fs::remove_file(root.join("element/data/tasks.data")).unwrap();
+        let scan = scan(&root);
+        assert!(scan.loadable(), "{}", scan.report());
+        assert_eq!(
+            scan.data_versions(),
+            (Some("v27 (0x3000001b)".into()), None)
+        );
+        assert!(scan.data_version_summary().contains("tasks.data absent"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_client_on_another_data_revision_is_still_loadable() {
+        // The same executable fingerprint with the RUS 1.4.2 data revision
+        // beside it: reported as v29/v78, not refused.
+        let root = synthetic_client("v29-pair", 29, 78);
+        let scan = scan(&root);
+        assert!(scan.loadable(), "{}", scan.report());
+        assert_eq!(
+            scan.data_versions(),
+            (Some("v29 (0x3000001d)".into()), Some("v78".into()))
+        );
+        assert_eq!(
+            scan.data_version_summary(),
+            "elements.data v29 (0x3000001d) / tasks.data v78"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_names_a_different_elements_version_instead_of_parsing_it_as_v27() {
+        let root = synthetic_client("v29", 29, 78);
+        let scan = scan(&root);
+        assert!(scan.loadable(), "{}", scan.report());
+        let elements = scan.elements.as_ref().expect("elements.data");
+        assert_eq!(elements.raw, Some(0x3000_001d));
+        assert_eq!(elements.version.as_deref(), Some("v29 (0x3000001d)"));
+        assert!(
+            scan.notes
+                .iter()
+                .any(|note| note.contains("v29") && note.contains("v27 layout")),
+            "{:?}",
+            scan.notes
+        );
+        let tasks = scan
+            .data_files
+            .iter()
+            .find(|info| info.name == "tasks.data")
+            .expect("tasks.data");
+        assert_eq!(tasks.version.as_deref(), Some("v78"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_broken_archive_is_named_in_the_report() {
+        let root = synthetic_client("broken-pack", 27, 75);
+        // `configs.pck` is optional, so a truncated one must be reported and
+        // must not make the client unloadable.
+        fs::write(root.join("element/configs.pck"), b"not a pack at all").unwrap();
+        let scan = scan(&root);
+        assert!(scan.loadable(), "{}", scan.report());
+        let configs = scan
+            .archives
+            .iter()
+            .find(|archive| archive.name == "configs.pck")
+            .expect("configs.pck row");
+        assert!(configs.problem.is_some());
+        assert!(scan.report().contains("configs.pck"));
+        assert!(scan
+            .summary_rows()
+            .iter()
+            .any(|(label, value)| { label == "archive" && value.contains("configs.pck") }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_required_archive_fails_the_scan() {
+        let root = synthetic_client("missing-pack", 27, 75);
+        fs::remove_file(root.join("element/textures.pck")).unwrap();
+        let scan = scan(&root);
+        assert!(!scan.loadable());
+        assert!(scan
+            .errors
+            .iter()
+            .any(|error| error.contains("textures.pck")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gshop_rows_print_their_header_timestamp() {
+        let mut info = DataFileInfo {
+            name: "gshop.data".into(),
+            path: None,
+            header: None,
+            raw: None,
+            version: None,
+            detail: None,
+            problem: None,
+        };
+        let mut bytes = 0x5ccc_5f37u32.to_le_bytes().to_vec();
+        bytes.resize(64, 0);
+        describe_data_file("gshop.data", &bytes, &mut info);
+        assert_eq!(info.raw, Some(0x5ccc_5f37));
+        assert!(info
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("2019-05-03 15:33:11"));
+    }
+
+    /// A `VS_VERSIONINFO` blob with one `StringFileInfo / 040904b0 / String`
+    /// pair per `(key, value)`. Built the way Windows builds it, including the
+    /// `StringTable` value length being counted in UTF-16 units.
+    fn synthetic_version_blob(entries: &[(&str, &str)]) -> Vec<u8> {
+        fn utf16(text: &str) -> Vec<u8> {
+            text.encode_utf16()
+                .chain(Some(0))
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        }
+        fn node(
+            key: &str,
+            value: &[u8],
+            value_length: usize,
+            kind: u16,
+            children: &[u8],
+        ) -> Vec<u8> {
+            // Field offsets are relative to the node start, so the key pad
+            // counts the 6-byte header. Aligning the key alone would put the
+            // value two bytes early and shift every child with it.
+            let mut body = utf16(key);
+            while (6 + body.len()) % 4 != 0 {
+                body.push(0);
+            }
+            body.extend_from_slice(value);
+            body.extend_from_slice(children);
+            let length = 6 + body.len();
+            let mut out = Vec::with_capacity(length + 3);
+            out.extend_from_slice(&(length as u16).to_le_bytes());
+            out.extend_from_slice(&(value_length as u16).to_le_bytes());
+            out.extend_from_slice(&kind.to_le_bytes());
+            out.extend_from_slice(&body);
+            // Each node starts on a DWORD boundary, so the builder pads the
+            // node to four bytes even though `wLength` does not count the pad.
+            while out.len() % 4 != 0 {
+                out.push(0);
+            }
+            out
+        }
+        let mut strings = Vec::new();
+        for (key, value) in entries {
+            strings.extend_from_slice(&node(key, &utf16(value), value.len() + 1, 1, &[]));
+        }
+        let table = node("040904b0", &[], 0, 1, &strings);
+        let file_info = node("StringFileInfo", &[], 0, 1, &table);
+        // Root value: VS_FIXEDFILEINFO (52 bytes), length in bytes.
+        node("VS_VERSION_INFO", &[0u8; 52], 52, 0, &file_info)
+    }
+
+    #[test]
+    fn version_resource_strings_are_read_from_the_string_tables() {
+        let blob = synthetic_version_blob(&[
+            ("FileVersion", "1.4.2.2305"),
+            ("ProductVersion", "1.4.2.2305"),
+            ("CompanyName", "Perfect World"),
+        ]);
+        assert_eq!(
+            version_string(&blob, "FileVersion").as_deref(),
+            Some("1.4.2.2305")
+        );
+        assert_eq!(
+            version_string(&blob, "ProductVersion").as_deref(),
+            Some("1.4.2.2305")
+        );
+        assert_eq!(
+            version_string(&blob, "CompanyName").as_deref(),
+            Some("Perfect World")
+        );
+        assert_eq!(version_string(&blob, "Comments"), None);
+    }
+
+    /// A minimal but structurally real PE32 image: one `.rsrc` section holding
+    /// a three-level resource directory and a `VS_VERSIONINFO` blob, so the
+    /// resource walk can be exercised without shipping a binary. The `PE` is
+    /// deserialised by the real `goblin`, which is why the header has to be
+    /// laid out properly rather than hand-built.
+    fn pe_with_version_blob(blob: &[u8]) -> Vec<u8> {
+        const FILE_ALIGN: usize = 0x200;
+        const SECTION_RVA: usize = 0x1000;
+        // Resource directory: root (RT_VERSION -> name -> language), then the
+        // `IMAGE_RESOURCE_DATA_ENTRY` the leaf points at.
+        let root = 0usize;
+        let type_dir = 0x18;
+        let name_dir = 0x30;
+        let data_entry = 0x60;
+        let blob_at = 0x70;
+        let mut rsrc = vec![0u8; blob_at + blob.len()];
+        fn put16(data: &mut [u8], at: usize, value: u16) {
+            data[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        fn put32(data: &mut [u8], at: usize, value: u32) {
+            data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        // Exactly three directory levels, as Windows writes them: type
+        // (`RT_VERSION` = 16), name (the resource id), language. The language
+        // level's entry has bit 31 clear and points at the data entry.
+        for (at, named, ids, entry_name, target) in [
+            (root, 0, 1, 16u32, 0x8000_0000u32 | type_dir as u32),
+            (type_dir, 0, 1, 1, 0x8000_0000 | name_dir as u32),
+            (name_dir, 0, 1, 0x0409, data_entry as u32),
+        ] {
+            put16(&mut rsrc, at + 12, named);
+            put16(&mut rsrc, at + 14, ids);
+            put32(&mut rsrc, at + 16, entry_name);
+            put32(&mut rsrc, at + 20, target);
+        }
+        put32(&mut rsrc, data_entry, (SECTION_RVA + blob_at) as u32);
+        put32(&mut rsrc, data_entry + 4, blob.len() as u32);
+        rsrc[blob_at..].copy_from_slice(blob);
+        let raw_size = rsrc.len().div_ceil(FILE_ALIGN) * FILE_ALIGN;
+
+        PeBuilder::new(SECTION_RVA, rsrc, raw_size).finish()
+    }
+
+    /// Just enough of a PE32 writer for the test above.
+    struct PeBuilder {
+        rva: usize,
+        data: Vec<u8>,
+        raw_size: usize,
+    }
+
+    impl PeBuilder {
+        fn new(rva: usize, data: Vec<u8>, raw_size: usize) -> Self {
+            Self {
+                rva,
+                data,
+                raw_size,
+            }
+        }
+
+        fn finish(&self) -> Vec<u8> {
+            const FILE_ALIGN: usize = 0x200;
+            let pe_offset = 0x40usize;
+            let optional_size = 0xe0usize;
+            let header_end = pe_offset + 24 + optional_size + 40;
+            fn put16(data: &mut [u8], at: usize, value: u16) {
+                data[at..at + 2].copy_from_slice(&value.to_le_bytes());
+            }
+            fn put32(data: &mut [u8], at: usize, value: u32) {
+                data[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            let mut image = vec![0u8; header_end + self.raw_size];
+            image[0] = b'M';
+            image[1] = b'Z';
+            put32(&mut image, 0x3c, pe_offset as u32);
+            image[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+            put16(&mut image, pe_offset + 4, 0x14c); // i386
+            put16(&mut image, pe_offset + 6, 1); // one section
+            put16(&mut image, pe_offset + 20, optional_size as u16);
+            let opt = pe_offset + 24;
+            put16(&mut image, opt, 0x10b); // PE32
+            put32(&mut image, opt + 28, 0x0040_0000); // ImageBase
+            put32(&mut image, opt + 32, FILE_ALIGN as u32);
+            put32(&mut image, opt + 36, FILE_ALIGN as u32);
+            put32(&mut image, opt + 56, (header_end + self.raw_size) as u32);
+            put32(&mut image, opt + 60, header_end as u32);
+            put32(&mut image, opt + 92, 16); // NumberOfRvaAndSizes
+                                             // DataDirectory[2] = resources.
+            put32(&mut image, opt + 96 + 16, self.rva as u32);
+            put32(&mut image, opt + 96 + 20, self.data.len() as u32);
+            let section = opt + optional_size;
+            image[section..section + 5].copy_from_slice(b".rsrc");
+            put32(&mut image, section + 8, self.data.len() as u32);
+            put32(&mut image, section + 12, self.rva as u32);
+            put32(&mut image, section + 16, self.raw_size as u32);
+            put32(&mut image, section + 20, header_end as u32);
+            put32(&mut image, section + 36, 0x4000_0040); // read, initialised
+            image[header_end..header_end + self.data.len()].copy_from_slice(&self.data);
+            image
+        }
+    }
+
+    #[test]
+    fn the_version_resource_is_reached_through_the_resource_directory() {
+        let blob = synthetic_version_blob(&[
+            ("FileVersion", "1.4.2.2305"),
+            ("ProductVersion", "1.4.2.2305"),
+        ]);
+        let image = pe_with_version_blob(&blob);
+        let pe = goblin::pe::PE::parse(&image).unwrap();
+        assert!(!pe.is_64);
+        let found = version_blob(&image, &pe).expect("version resource");
+        assert_eq!(
+            found,
+            &blob[..],
+            "the walk must return the resource verbatim"
+        );
+        assert_eq!(
+            version_string(found, "FileVersion").as_deref(),
+            Some("1.4.2.2305")
+        );
+    }
+
+    #[test]
+    fn an_image_without_a_resource_directory_yields_no_version_strings() {
+        let image = PeBuilder::new(0x1000, vec![0u8; 8], 0x200).finish();
+        let pe = goblin::pe::PE::parse(&image).unwrap();
+        assert_eq!(version_blob(&image, &pe), None);
+        assert_eq!(version_string(b"", "FileVersion"), None);
+    }
+
+    #[test]
+    fn a_version_blob_without_string_tables_yields_nothing_instead_of_noise() {
+        let blob = synthetic_version_blob(&[]);
+        assert_eq!(version_string(&blob, "FileVersion"), None);
+        assert_eq!(version_string(&[], "FileVersion"), None);
+        assert_eq!(version_string(b"not a resource", "FileVersion"), None);
+    }
+
+    #[test]
+    fn known_rows_name_every_fingerprint_constant() {
+        for build in KNOWN_BUILDS {
+            assert!(!build.label.is_empty());
+            assert_eq!(build.sha256.len(), 64);
+            assert!(!build.data_versions.is_empty());
+        }
     }
 }

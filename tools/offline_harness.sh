@@ -20,15 +20,26 @@
 #
 # Everything lands in target/offline/, which .gitignore already excludes.
 #
-# Two things this deliberately does not do. It does not link flate2, so
-# `crate::pck` is stubbed: the corpus tests that read an archive early-return on
-# a missing path and stay skipped, and building flate2 offline is a dead end (its
-# rust backend needs miniz_oxide 0.9 and crc32fast, and an rlib built against a
-# dependency rustc also finds in the sysroot fails to load downstream with
-# E0463/E0460 no matter which copy is pinned). And it does not use the real
-# encoding_rs, whose default build pulls multiversion, simdutf8 and core_detect;
-# the GBK decoder here is generated from Python's `gbk` codec instead, which
-# covers every double-byte sequence the client's text files use.
+# Corrections to what this script used to claim (2026-11-18). The real flate2
+# *can* be built offline: clone flate2 1.0.35, miniz_oxide 0.8.4 (it lives in
+# the `miniz/miniz_oxide` subdirectory of that repository), crc32fast, adler2
+# and cfg-if, then build them in dependency order with
+#
+#   rustc --crate-type rlib -C opt-level=1 --sysroot <sysroot> \
+#         [--cfg 'feature="…"'] -L target/offline -o libcrate.rlib src/lib.rs
+#
+# (miniz_oxide needs `--cfg feature="with-alloc"`; flate2 needs
+# `--cfg feature="any_impl"` and `--cfg feature="rust_backend"` plus
+# `--cfg feature="miniz_oxide"`). The earlier E0463/E0460 failures came from
+# omitting `-L` for flate2's own dependencies, not from the sysroot. Once
+# target/offline/libflate2.rlib exists, pass
+# `--extern flate2=…/libflate2.rlib` and the real `crate::pck` is tested
+# instead of the stub.
+#
+# What this still does not do: use the real encoding_rs, whose default build
+# pulls multiversion, simdutf8 and core_detect. The GBK decoder here is
+# generated from Python's `gbk` codec instead, which covers every double-byte
+# sequence the client's text files use.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

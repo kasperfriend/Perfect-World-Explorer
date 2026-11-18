@@ -66,6 +66,24 @@ reproduce, so none of them is a silent skip or an assumed parity claim.
 | Experimental software viewer | `src/viewer.rs` now shares the recovered ten-class residency and turns missing models/textures into explicit errors, but it is not the Angelica pipeline: it has no reflection/refraction/minimap passes, no baked material/culling/alpha table and no `ALPHABLENDENABLE` pass states. | P3.02–07 |
 | Whole-world GPU residency benchmark | `Objects::load_ids` retires models and the texture cache evicts unpinned LRU content; regional load/evict/distance-cull counters are logged. A measured full-world GPU page/VRAM residency benchmark and live-client screenshot comparison were not run. | P3.08, P8.09 |
 
+## Other client versions (data-version reporting, 18 November 2026)
+
+The folder scan now reports three things separately instead of comparing the
+folder with one 1.4.2 fingerprint: the executable (size, SHA-256, PE32 machine,
+`VS_VERSIONINFO` strings), the **data version as the `(elements.data,
+tasks.data)` pair**, and every archive's container version. A version that is
+not 1.4.2 is reported, not refused — these rows name what is still missing for
+older and newer clients.
+
+| Path / behavior | Remaining limitation | Requirements |
+|---|---|---|
+| `elements.data` record layout beyond v27 | Only v27 (`0x3000_001b`) is parsed. The scan reports the revision it finds (the low 16 bits of the header word, e.g. `v29 (0x3000001d)` for the RUS 1.4.2 data, `v267` for CN 1.6.6), and `Catalog::parse_v27` / `visit_v27_records` refuse the tables with that version named. The record sizes and section table of v6/v12/v13/v70/v85/v253/v267 releases are **not** decoded; their section counts and record strides differ from v27 and are not guessed. Family `0x3000` is assumed for every `elements.data`; a file with another family word is called out as not being an elements file. | client-version support |
+| `tasks.data` layout beyond v75 | Only the header is read (magic `0x93858361`, version word at 4). `ATaskTemplMan_LoadTasksFromPack_v75` is the only record loader known; the offsets and record tables of v52/v56/v78/v105/v167/v176 are not decoded. The scan reports the number it reads, so a mismatched pair is visible even though it cannot be read. | client-version support |
+| `elements`/`tasks` pairing | The two halves are reported as one line, but nothing enforces a valid combination: a mixed folder (v27 beside v78) is reported as such and loads. No table of known-good pairs is shipped beyond the 1.4.2 row and the community list in `docs/blockers.md` B-6's sources. | client-version support |
+| Known executable fingerprints | `KNOWN_BUILDS` has one byte-exact row (PW 1.4.2, 6 MB SHA-256). Every other build — including the RUS 1.4.2 pair, whose `FileVersion` is present but whose image differs — is labelled from its own version resource and reported as unverified. Reading the `VS_VERSIONINFO` `FileVersion`/`ProductVersion` strings is the only self-description those builds provide. | client-version support |
+| Archive containers of other clients | Retail v2 PCK (`0x20002`/`0x20001`) and the Angelica pack are read. A repack with a different trailer version is named with its version word and refused rather than misparsed; `<pack>\version.sw` is reported when present. | client-version support |
+| World/asset gates outside 1.4.2 | ECWLD is read at v12; T2BK at v2–6; BMD model `0x1000_0001/0002` with mesh `0x1000_0002–0x1000_0005`; GFX roots ≤79. Those gates are still hard refusals with the version they found; they are not softened by the scan, which only reports them. | client-version support |
+
 ## Completion policy
 
 P8.10's **tracking/policy deliverable** is implemented by maintaining this register;

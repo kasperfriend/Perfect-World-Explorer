@@ -99,6 +99,9 @@ struct State {
     low_memory: bool,
     hover: u8,
     focus: u8,
+    /// Version rows from the folder scan: executable identity, the data-file
+    /// versions that move independently of it, and the archive tally.
+    rows: Vec<(String, String)>,
 }
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 fn state() -> &'static Mutex<State> {
@@ -141,11 +144,38 @@ pub fn set_client(hwnd: Handle, status: &str, path: &str, ready: bool, known: bo
         s.path = path.into();
         s.ready = ready;
         s.known = known;
+        s.rows.clear();
     }
     unsafe {
         InvalidateRect(hwnd, std::ptr::null(), 0);
     }
 }
+
+/// Install the result of a full folder scan: the one-line status plus the
+/// version rows drawn under it. The rows come from
+/// [`crate::client_detect::Scan::summary_rows`], the same values
+/// `--diagnose-client` prints, so the launcher and the diagnostic cannot drift
+/// apart.
+pub fn set_scan(
+    hwnd: Handle,
+    status: &str,
+    path: &str,
+    ready: bool,
+    known: bool,
+    rows: Vec<(String, String)>,
+) {
+    if let Ok(mut s) = state().lock() {
+        s.status = status.into();
+        s.path = path.into();
+        s.ready = ready;
+        s.known = known;
+        s.rows = rows;
+    }
+    unsafe {
+        InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
+}
+
 pub fn low_memory() -> bool {
     state().lock().map(|s| s.low_memory).unwrap_or(false)
 }
@@ -262,6 +292,20 @@ unsafe fn text(dc: Handle, x: i32, y: i32, s: &str, size: i32, weight: i32, colo
     SelectObject(dc, old);
     DeleteObject(font);
 }
+/// Keep one label/value row inside the launcher card, ending with an ellipsis
+/// so a truncated value is visibly truncated instead of silently wrong.
+fn compact_line(text: &str, width: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() > width {
+        format!(
+            "{}…",
+            chars[..width.saturating_sub(1)].iter().collect::<String>()
+        )
+    } else {
+        text.into()
+    }
+}
+
 fn compact(path: &str) -> String {
     let cs: Vec<char> = path.chars().collect();
     if cs.len() > 50 {
@@ -344,13 +388,14 @@ pub unsafe fn paint(hwnd: Handle) {
             400,
             rgb(151, 177, 184),
         );
-        // Client status card: low-contrast border and inset dark panel.
-        rect(dc, 54, 276, 397, 64, rgb(56, 94, 100));
-        rect(dc, 55, 277, 395, 62, rgb(14, 36, 44));
+        // Client status card: low-contrast border and inset dark panel. It is
+        // tall enough for the identity line, the path and four version rows.
+        rect(dc, 54, 252, 397, 96, rgb(56, 94, 100));
+        rect(dc, 55, 253, 395, 94, rgb(14, 36, 44));
         rect(
             dc,
             70,
-            292,
+            268,
             7,
             7,
             if s.ready && s.known {
@@ -360,16 +405,16 @@ pub unsafe fn paint(hwnd: Handle) {
             },
         );
         let title = if s.ready && s.known {
-            "DETECTED PW 1.4.2 CLIENT"
+            "DETECTED CLIENT"
         } else if s.ready {
-            "UNRECOGNIZED CLIENT BUILD"
+            "DETECTED CLIENT (UNVERIFIED BUILD)"
         } else {
             "GAME CLIENT"
         };
         text(
             dc,
             86,
-            284,
+            260,
             title,
             11,
             700,
@@ -384,7 +429,28 @@ pub unsafe fn paint(hwnd: Handle) {
         } else {
             compact(&s.path)
         };
-        text(dc, 70, 307, &desc, 12, 400, rgb(190, 209, 210));
+        text(dc, 70, 283, &desc, 12, 400, rgb(190, 209, 210));
+        // Version rows: the executable identity, the data versions that move
+        // independently of it, and the archive tally. They are what makes a
+        // client other than the inspected 1.4.2 legible instead of "unknown".
+        let mut y = 302;
+        for (label, value) in s.rows.iter().take(4) {
+            let line = if value.is_empty() {
+                label.clone()
+            } else {
+                format!("{label}  {value}")
+            };
+            text(
+                dc,
+                70,
+                y,
+                &compact_line(&line, 76),
+                11,
+                400,
+                rgb(151, 183, 186),
+            );
+            y += 14;
+        }
         let c = if s.hover == 1 || s.focus == 1 {
             rgb(134, 218, 205)
         } else {

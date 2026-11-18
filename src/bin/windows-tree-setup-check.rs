@@ -1,6 +1,9 @@
 //! End-to-end check of the embedded PE32 client DLL bridge on Windows/Wine.
 #![allow(dead_code)]
 #[cfg(windows)]
+#[path = "../angelica_pck.rs"]
+mod angelica_pck;
+#[cfg(windows)]
 #[path = "../client_detect.rs"]
 mod client_detect;
 #[cfg(windows)]

@@ -784,12 +784,21 @@ unsafe fn control(
     }
     hnd
 }
-fn detection_label(c: &crate::client_detect::Client) -> &'static str {
-    if c.known_142 {
-        "Detected PW 1.4.2 Client"
-    } else {
-        "Unrecognized client executable — loading is experimental"
-    }
+/// Show one folder scan in the launcher: the headline names the executable
+/// identity and the data version pair (`elements.data` + `tasks.data`), and the
+/// card rows carry that pair plus every archive version the scan read. The whole report also goes to the
+/// session log, so a client that loads but still looks wrong can be described
+/// later without re-scanning.
+fn present_scan(hwnd: Hwnd, scan: &crate::client_detect::Scan) {
+    crate::launcher_ui::set_scan(
+        hwnd,
+        &scan.headline(),
+        &scan.element.to_string_lossy(),
+        scan.loadable(),
+        scan.executable.as_ref().is_some_and(|exe| exe.is_known()),
+        scan.summary_rows(),
+    );
+    eprintln!("{}", scan.report());
 }
 pub fn start_window() -> Result<Option<PathBuf>, String> {
     use std::sync::atomic::Ordering;
@@ -833,24 +842,18 @@ pub fn start_window() -> Result<Option<PathBuf>, String> {
         }
         let mut selected: Option<crate::client_detect::Client> = None;
         if let Some(path) = remembered() {
-            match crate::client_detect::detect(&path) {
-                Ok(client) => {
-                    crate::launcher_ui::set_client(
-                        hwnd,
-                        detection_label(&client),
-                        &client.element.to_string_lossy(),
-                        true,
-                        client.known_142,
-                    );
-                    selected = Some(client);
-                }
-                Err(_) => crate::launcher_ui::set_client(
+            let scan = crate::client_detect::scan(&path);
+            if scan.loadable() {
+                present_scan(hwnd, &scan);
+                selected = Some(crate::client_detect::Client::from_scan(&scan));
+            } else {
+                crate::launcher_ui::set_client(
                     hwnd,
                     "Saved folder unavailable — select it again",
                     "",
                     false,
                     false,
-                ),
+                );
             }
         }
         ShowWindow(hwnd, 5);
@@ -870,34 +873,26 @@ pub fn start_window() -> Result<Option<PathBuf>, String> {
                     let choice =
                         choose_client(hwnd, selected.as_ref().map(|c| c.element.as_path()))?;
                     if let Some(path) = choice {
-                        match crate::client_detect::detect(&path) {
-                            Ok(client) => {
-                                if let Err(e) = remember(&client.element) {
-                                    show_error(&format!("{e}\nYou can still load the world."));
-                                }
-                                crate::launcher_ui::set_client(
-                                    hwnd,
-                                    detection_label(&client),
-                                    &client.element.to_string_lossy(),
-                                    true,
-                                    client.known_142,
-                                );
-                                UpdateWindow(hwnd);
-                                selected = Some(client);
-                                // Keep the detection result visible before showing loading.
-                                SetTimer(hwnd, 1, 1600, std::ptr::null());
+                        let scan = crate::client_detect::scan(&path);
+                        if scan.loadable() {
+                            if let Err(e) = remember(&scan.element) {
+                                show_error(&format!("{e}\nYou can still load the world."));
                             }
-                            Err(e) => {
-                                selected = None;
-                                crate::launcher_ui::set_client(
-                                    hwnd,
-                                    "Client not detected — select a valid folder",
-                                    "",
-                                    false,
-                                    false,
-                                );
-                                show_error(&e);
-                            }
+                            present_scan(hwnd, &scan);
+                            UpdateWindow(hwnd);
+                            selected = Some(crate::client_detect::Client::from_scan(&scan));
+                            // Keep the scan result visible before showing loading.
+                            SetTimer(hwnd, 1, 1800, std::ptr::null());
+                        } else {
+                            selected = None;
+                            crate::launcher_ui::set_client(
+                                hwnd,
+                                "Client not detected — select a valid folder",
+                                "",
+                                false,
+                                false,
+                            );
+                            show_error(&scan.errors.join("\n"));
                         }
                     }
                 }

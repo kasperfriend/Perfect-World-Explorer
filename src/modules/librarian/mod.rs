@@ -224,6 +224,11 @@ impl Librarian {
         }
         let mut assets = LibrarianAssets::open(&self.root);
         let elements = assets.read_elements_data();
+        // The data version is the `(elements, tasks)` pair. `visit_v27_records`
+        // already refuses a foreign layout with the version it found, so a
+        // client on another revision that the folder scan reported as loadable
+        // fails here with "elements.data is v29 …" rather than with a bare hex
+        // word or a silently shifted table.
         let mut npc_database = npcs::Database::default();
         let mut npc_error = None;
         if let Ok(bytes) = &elements {

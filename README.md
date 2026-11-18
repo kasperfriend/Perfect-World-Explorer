@@ -24,7 +24,7 @@ Features are limited to formats and data encountered in one inspected build; oth
 
 - 64-bit Windows 10 or 11, a compatible GPU with current drivers and a trusted, extracted Perfect World client with its data packages and 32-bit SpeedTree runtime. Game assets and the client are **not included**.
 - Startup reads the terrain and may take time. Terrain DDS/mask sources remain compact during loading; supported GPUs sample the original BC1/BC2 terrain blocks, and repeated world models share textures, pipelines and animation tracks. This reduces allocations without lowering texture resolution. Memory still depends on the client, driver and enabled features. Whole-world static scenery for the inspected client uses approximately **5.4 GiB of texture pages alone**, before geometry, terrain and other GPU resources. Use nearby streaming and the launcher's lower-memory terrain-mask option if needed.
-- The launcher recognizes one particular 1.4.2 executable fingerprint. Other patched or regional clients are not guaranteed to work and may be marked unrecognized.
+- The launcher inspects the selected folder rather than trusting one fingerprint. It reads `elementclient.exe` (size, SHA-256, PE version resource), every loose `.data` file, and every `*.pck` container, so a client whose executable is not the inspected 1.4.2 build is still described by name and loaded as an **unverified build** instead of being refused. Different element/data layouts than v27 are reported and named; visual and data coverage for those builds is not claimed.
 
 ## Run the Windows executable
 
@@ -104,6 +104,7 @@ The executable distributed alongside this source was rebuilt from this packaged 
 
 - `src/` contains parsers, scene loading, GPU rendering, UI and audio; `src/bin/` contains diagnostic and survey programs. These are development tools, are not required to run the viewer, and are not included in shipped viewer packages.
 - Example: `cargo run --release --bin pck-inspect -- /path/to/element/shaders.pck` lists archive entries. Input client files are required.
+- `perfect-world-explorer --diagnose-client <client root or element folder>` (also `cargo run --bin client-check -- <folder>`) prints the same scan the launcher shows: executable identity, the data version pair (`elements.data` + `tasks.data`), every other `.data` header, and every archive container version with its entry count. Add `--json` for a machine-readable form. Exit code 0 means the folder is loadable; unknown versions are reported, not refused. See [client version scanning](#client-version-scanning).
 - `cargo run --bin water-record-survey -- <directory>` expects `world.ecwld`, `world.ecbsd` and referenced BSData `.dat` files in that directory. Set `PW_WATER_SAMPLE_69` to a local `69.dat` path to enable optional real-data water tests. Do not commit these files.
 - The shipped-corpus tests skip when the retail archives (`google_drive/gfx.pck`, `google_drive/world.ecwld`, `google_drive/x`, `google_drive/pw142/element`) are not staged beside the checkout, which is the case on CI. Set `PWE_CORPUS=require` to turn every one of those skips into a failure and run the suite as a gate on a machine that has them; it is all-or-nothing and names the archive it is missing. See `pck::corpus_absent` in `src/pck.rs`.
 - GPU diagnostics include `water-pass-gpu-check`, `simple-water-gpu-check` and `post-gpu-check`. They require a working graphics adapter; synthetic tests do not prove in-game visual parity.
@@ -112,6 +113,21 @@ The executable distributed alongside this source was rebuilt from this packaged 
 - Some helper binaries and research scripts assume specific test data layouts. Consult their source and [Findings](Findings/README.md) before use.
 
 See [the world-loading optimization report](Findings/World-loading-optimization-2026-11-04.md) for implementation details, regression checks and measurement limits. A 6 GB laptop has not yet been hardware-verified.
+
+## Client version scanning
+
+The selected folder is scanned instead of being compared with one fingerprint. Three kinds of evidence are read separately, because they do not move together between client builds:
+
+| Evidence | Where it comes from | What it answers |
+| --- | --- | --- |
+| Executable | `elementclient.exe` size, SHA-256, PE32 machine, `VS_VERSIONINFO` `FileVersion`/`ProductVersion` | Which engine build this is. `PW 1.4.2` is the only byte-exact fingerprint known; anything else is labelled from its own version resource and the scan says it is an unverified build. |
+| Data version | The pair `data/elements.data` (version in the low 16 bits of the `u32` at 0 — `0x3000001b` is v27 — with the family marker in the high half, timestamp at 4) and `tasks.data` (magic `0x93858361`, version at 4), reported as `elements v…  / tasks v…` | The data revision, as the `(elements, tasks)` pair the client ships. **This moves independently of the executable**: 1.4.2 engines appear with `elements` v27/tasks v75 and with v29/tasks v78, and later releases go much further (1.5.0 v253/tasks v167). |
+| Other data files | `dyn_tasks.data`, `task_npc.data`, `aipolicy.data`, `domain.data`, `gshop*.data` (header timestamps) | Their own versions and timestamps, each on its own line; `gshop*.data` carries a timestamp rather than a version. |
+| Archives | Every `*.pck` beside the executable: container kind (retail v2 PCK or Angelica pack), trailer version word, entry count, and `<pack>\version.sw` when a repack left one | Whether the archives are readable at all, and which container format a regional client uses. A pack this reader cannot open is named, never skipped silently. |
+
+`elements.data` v27 is the only layout the Character Designer and Librarian read. A different version is reported as such — those modules name the revision they found (`v29 (0x3000001d)`, not a bare hex word) and refuse the record tables instead of guessing at them; the world itself loads from the map, archive and model files, which are versioned independently. A file whose family marker is not `0x3000` is called out as not being an `elements.data` at all.
+
+The report is produced once, in `src/client_detect.rs`, and rendered identically by the launcher card, `--diagnose-client` and the `client-check` binary.
 
 ## Known limitations
 
