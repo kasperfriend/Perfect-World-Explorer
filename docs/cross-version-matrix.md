@@ -84,6 +84,13 @@ Measured, in every case all entries decoding to their declared length:
 | `shaders.pck` (8.23 MB) | Angelica | 371 |
 | `script.pck` (1.5.2) | Angelica | 2 |
 
+The 1.5.2 `script.pck` is the only staged archive carrying a version marker at
+all: its two entries are a zero-length `dir` and a bare `version.sw` holding
+`0.525.0`. Both are now reported, so a client card reads
+`script.pck  Angelica pack v0x20002 · 2 entries · version.sw 0.525.0`. The
+lookup matches the bare name as well as the `<stem>\version.sw` a patcher
+writes, because this one uses the bare spelling.
+
 ## Scenery
 
 Six `.ecwld` files parse, from small instance maps to full world maps:
