@@ -2345,6 +2345,28 @@ pub fn jitter_offset(frame_index: u32) -> (f32, f32) {
 mod tests {
     use super::*;
 
+    /// Selecting a folder scans it and shows the card; only **Enter world**
+    /// launches. The launcher used to arm a 1800 ms `SetTimer` after a scan and
+    /// launch on `WM_TIMER`, so choosing a folder started the viewer by itself.
+    /// The window procedure cannot be driven from a test, so this guards its
+    /// source: it runs on every platform, which is also why it lives here and
+    /// not beside the `#[cfg(windows)]` code it describes.
+    #[test]
+    fn selecting_a_folder_never_launches_on_a_timer() {
+        let launcher = include_str!("windows_setup.rs");
+        assert!(
+            !launcher.contains("SetTimer"),
+            "the launcher must not arm a timer after a folder scan"
+        );
+        assert!(
+            !launcher.contains("0x113"),
+            "WM_TIMER must not be handled, or an armed timer launches the viewer"
+        );
+        // The two deliberate launches stay: the button id, and the action it sets.
+        assert!(launcher.contains("102 => LAUNCH_ACTION.store(2"));
+        assert!(launcher.contains("2 => {"));
+    }
+
     fn nvidia_rtx4070() -> GpuFacts {
         GpuFacts::from_parts(
             VENDOR_NVIDIA,

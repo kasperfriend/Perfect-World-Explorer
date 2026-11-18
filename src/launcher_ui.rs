@@ -99,8 +99,9 @@ struct State {
     low_memory: bool,
     hover: u8,
     focus: u8,
-    /// Version rows from the folder scan: executable identity, the data-file
-    /// versions that move independently of it, and the archive tally.
+    /// Version rows from the folder scan: the game build, then the `tasks.data`
+    /// and `elements.data` revisions. Exactly three, which is what the card has
+    /// room for.
     rows: Vec<(String, String)>,
 }
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -389,9 +390,11 @@ pub unsafe fn paint(hwnd: Handle) {
             rgb(151, 177, 184),
         );
         // Client status card: low-contrast border and inset dark panel. It is
-        // tall enough for the identity line, the path and four version rows.
-        rect(dc, 54, 252, 397, 96, rgb(56, 94, 100));
-        rect(dc, 55, 253, 395, 94, rgb(14, 36, 44));
+        // sized for the identity line, the folder path and exactly three version
+        // rows (game, tasks, elements), which end 40 pixels above the card's
+        // bottom edge so nothing is clipped or painted over the buttons.
+        rect(dc, 54, 252, 397, 104, rgb(56, 94, 100));
+        rect(dc, 55, 253, 395, 102, rgb(14, 36, 44));
         rect(
             dc,
             70,
@@ -430,11 +433,11 @@ pub unsafe fn paint(hwnd: Handle) {
             compact(&s.path)
         };
         text(dc, 70, 283, &desc, 12, 400, rgb(190, 209, 210));
-        // Version rows: the executable identity, the data versions that move
-        // independently of it, and the archive tally. They are what makes a
-        // client other than the inspected 1.4.2 legible instead of "unknown".
-        let mut y = 302;
-        for (label, value) in s.rows.iter().take(4) {
+        // Version rows: the game build, then the two data revisions that move
+        // independently of it. They are what makes a client other than the
+        // inspected 1.4.2 legible instead of "unknown".
+        let mut y = 306;
+        for (label, value) in s.rows.iter().take(3) {
             let line = if value.is_empty() {
                 label.clone()
             } else {

@@ -160,7 +160,10 @@ impl Root {
                 .and_then(|line| line.trim().strip_prefix("MOXTVersion:"))
                 .ok_or("expected MOXT text GFX")?,
         )?;
-        if version == 0 || version > 79 {
+        // Only a missing version is invalid. A newer client writes newer roots
+        // with the same container, so an upper bound here just pushed those onto
+        // the animated reader; the version is carried and gated per key.
+        if version == 0 {
             return Err(format!("unverified static decal GFX version {version}"));
         }
         let mut header = Vec::<(String, String)>::new();

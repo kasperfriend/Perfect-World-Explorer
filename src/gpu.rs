@@ -5284,25 +5284,39 @@ pub fn run(
         ) {
             Ok(mut list) => {
                 if list.is_empty() {
+                    // A map with no `world_targets.txt` still has precinct
+                    // zones, and those are the real destinations: each one's
+                    // authored centre, or a point inside its own polygon when
+                    // the file is version 6 and carries no centre line. A zone
+                    // with neither cannot be flown to, so it is skipped rather
+                    // than listed as a blank row.
                     if let Some(zones) = &ui_zones {
                         let mut fallback_id = 90_000u32;
                         for zone in &zones.zones {
-                            if let Some(position) = zone.center {
-                                list.push(crate::navigation::Destination {
-                                    id: fallback_id,
-                                    name: zone.name.clone(),
-                                    position,
-                                });
-                                fallback_id += 1;
+                            let name = zone.name.trim();
+                            let Some(position) = zone.fallback_position() else {
+                                continue;
+                            };
+                            if name.is_empty() {
+                                continue;
                             }
+                            list.push(crate::navigation::Destination {
+                                id: fallback_id,
+                                name: name.to_string(),
+                                position,
+                            });
+                            fallback_id += 1;
                         }
                     }
                 }
                 if list.is_empty() {
+                    // Last resort, and it must still be on the ground: the old
+                    // fixed +30 above the origin dropped the camera into empty
+                    // sky on maps whose terrain does not start at zero.
                     list.push(crate::navigation::Destination {
                         id: 0,
                         name: format!("{} centre", current_map.display_name),
-                        position: [0., map_space.ground(0., 0.) + 30., 0.],
+                        position: [0., map_space.ground(0., 0.) + 3., 0.],
                     });
                 }
                 Ok(list)

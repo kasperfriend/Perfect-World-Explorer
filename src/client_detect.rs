@@ -368,50 +368,60 @@ impl Scan {
         format!("{exe} · {}", self.data_version_summary())
     }
 
-    /// The rows the launcher card draws: one `(label, value)` per version that
-    /// actually answered. Kept short on purpose — the full report is what
-    /// `--diagnose-client`, the `client-check` binary and the log carry.
+    /// The game build this folder ships, as the version a user recognises.
+    ///
+    /// A fingerprint we have inspected answers with its build name (`PW 1.4.2`);
+    /// otherwise the executable's own `FileVersion` resource is the closest
+    /// thing to a game version, and a build that has neither says so instead of
+    /// inventing a number.
+    pub fn game_version(&self) -> String {
+        match &self.executable {
+            Some(exe) if exe.is_known() => exe.label().trim_start_matches("PW ").to_string(),
+            Some(exe) => match exe
+                .file_version
+                .clone()
+                .or_else(|| exe.product_version.clone())
+            {
+                Some(version) => version,
+                None => "unverified build".into(),
+            },
+            None => "no executable".into(),
+        }
+    }
+
+    /// The three version rows the launcher card draws, and only those: the game
+    /// build, the `tasks.data` revision, and the `elements.data` revision.
+    ///
+    /// The card has four 14-pixel rows in a fixed-height panel, so a fourth row
+    /// used to paint over the buttons below it; the archive tally and the extra
+    /// data files stay in [`Scan::report`], which is what the log and
+    /// `--diagnose-client` print.
     pub fn summary_rows(&self) -> Vec<(String, String)> {
-        let mut rows = Vec::new();
-        if let Some(exe) = &self.executable {
-            rows.push(("build".into(), exe.label()));
-        }
-        // The pair is the data version; it is reported on one row because the
-        // card has four and the executable already owns one of them.
-        rows.push(("data".into(), self.data_version_summary()));
-        // `elements.data` and `tasks.data` are the row above; `gshop*.data`
-        // carry a timestamp rather than a version, so they stay in the full
-        // report. Everything else here is a revision too, on its own row.
-        let others: Vec<String> = self
-            .data_files
-            .iter()
-            .filter(|info| {
-                info.name != "tasks.data"
-                    && !info.name.starts_with("gshop")
-                    && info.version.is_some()
-            })
-            .map(|info| format!("{} {}", info.name, info.version.as_deref().unwrap()))
-            .collect();
-        if !others.is_empty() {
-            rows.push(("data".into(), others.join(", ")));
-        }
-        let readable = self
-            .archives
-            .iter()
-            .filter(|archive| archive.problem.is_none())
-            .count();
-        let mut packs = format!("{readable} archives readable");
-        let broken: Vec<&str> = self
-            .archives
-            .iter()
-            .filter(|archive| archive.problem.is_some())
-            .map(|archive| archive.name.as_str())
-            .collect();
-        if !broken.is_empty() {
-            packs.push_str(&format!("; unreadable: {}", broken.join(", ")));
-        }
-        rows.push(("archive".into(), packs));
-        rows
+        let (elements, tasks) = self.data_versions();
+        let tasks = tasks.or_else(|| {
+            self.data_files
+                .iter()
+                .find(|info| info.name == "tasks.data")
+                .map(|info| {
+                    info.problem
+                        .clone()
+                        .unwrap_or_else(|| "version not readable".into())
+                })
+        });
+        vec![
+            ("game".into(), self.game_version()),
+            ("tasks".into(), tasks.unwrap_or_else(|| "absent".into())),
+            (
+                "elements".into(),
+                elements.unwrap_or_else(|| match self.elements.as_ref() {
+                    Some(info) => info
+                        .problem
+                        .clone()
+                        .unwrap_or_else(|| "version not readable".into()),
+                    None => "absent".into(),
+                }),
+            ),
+        ]
     }
 
     /// Multi-line report: the executable, then every data file, then every
@@ -1403,10 +1413,18 @@ mod tests {
         );
         assert!(scan.headline().contains("v27"));
         assert!(scan.headline().contains("v75"));
-        assert!(scan
-            .summary_rows()
-            .iter()
-            .any(|(label, value)| label == "data" && value.contains("tasks.data v75")));
+        // The card carries exactly the three requested versions, in order.
+        let rows = scan.summary_rows();
+        assert_eq!(
+            rows.iter()
+                .map(|(label, _)| label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["game", "tasks", "elements"]
+        );
+        assert_eq!(rows[1].1, "v75");
+        assert!(rows[2].1.contains("v27"));
+        // Nothing else may share the card; the archive tally stays in the report.
+        assert!(!rows.iter().any(|(_, value)| value.contains("archives")));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1496,10 +1514,11 @@ mod tests {
             .expect("configs.pck row");
         assert!(configs.problem.is_some());
         assert!(scan.report().contains("configs.pck"));
-        assert!(scan
+        // A broken optional archive is named in the report, not on the card.
+        assert!(!scan
             .summary_rows()
             .iter()
-            .any(|(label, value)| { label == "archive" && value.contains("configs.pck") }));
+            .any(|(_, value)| value.contains("configs.pck")));
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -248,6 +248,22 @@ were wrong, and the stand-in cost real time: its `goblin` exposed a
 This is a tooling correction, not a client blocker: it is recorded here because
 "the offline suite is green" was used as evidence, and it was wrong.
 
+The same gap cost time again on 2026-11-18: `client` listed `libflate2.rlib` as
+an `--extern` but nothing ever built it, so every `client` run died on a missing
+extern. `real_deps` now clones and builds `miniz_oxide` (plus `adler2`),
+`crc32fast` (plus `cfg_if`) and `flate2` with the recipes in the script header,
+and four focused modes were added for the modules the gfx harness cannot reach:
+
+| mode | covers | tests |
+| --- | --- | --- |
+| `water` | `src/water.rs`, BSData record framing, shoreline arrays | 14 |
+| `gfx` | `gfx_file`, `gfx_decal`, `gfx_light`, `pck` | 74 |
+| `music` | `src/music.rs` precinct zones and teleport fallbacks | 12 |
+| `material` | `src/material.rs`, `dxt`, `terrain_sampling` | 25 |
+| `client` | `client_detect`, `pck`, `angelica_pck` | 27 |
+
+`PW_WATER_BSDATAS=<paths>` additionally runs the water suite against real client
+BSData files, which is how the `0x1af` framing bug was found and locked down.
 ### B-6 addendum (2026-11-18) — client-version scanning
 
 `src/client_detect.rs`, `src/main.rs`, `src/launcher_ui.rs` and
@@ -1497,3 +1513,56 @@ DLSS-G parameter type.
   answers — every path already writes its first successful frame
   (`[DLSS] first evaluate OK (…, DLAA)` /
   `[XeSS] first execute OK (…, Native AA)`), so one run per mode settles it.
+
+## B-29 — The six old-vs-new client bugs are one class: a version or size word read as data (fixed)
+
+The uploaded logs and the Drive clients (`Games/`: 1.3.1, 1.3.6, 1.4.2, 1.4.4,
+1.5.0, 1.5.2) describe six symptoms. Five of them are the same mistake in
+different places: a number that describes the file was treated as part of the
+file.
+
+- **`unsupported A3DWaterArea version 0x1af` (1.3.1 world, 431 = `0x1af`).**
+  Every BSData record from 1.4.x/1.5.x is stored zlib-framed as
+  `stored_len, raw_len, zlib(raw)`; 431 is a *stored length*, and the old reader
+  read it as a version word and rejected the whole map, which is what forced the
+  "no water" fallback. Verified against `8.dat` and `9.dat` from the Drive
+  `a37` folder: all 128 records carry the 32768-byte window. `water::parse_record`
+  now resolves the framing, then walks `version, count, area…` from the first
+  real version word inside the inflate window. Field offsets moved to the
+  fields-relative base (`color` at +0, mask at +37/+36) so a run of several
+  areas sharing one header walks correctly. A record that still cannot be read
+  is skipped with a diagnostic instead of failing `water::load`, which used to
+  abort the entire world load.
+- **`a37` (Morai) failing on a missing `Temp/notex.bmp`.** `material::Materials`
+  turned one absent terrain texture into `missing texture …`, which failed the
+  map. The client paints its missing-texture image and keeps the map;
+  `notex_pixels()` builds that stand-in (a 4x4 DXT1 magenta DDS, no mip chain)
+  and it is validated against the real sampler and DXT decoder in
+  `tools/offline_harness.sh material`. An authored DDS the device would reject
+  is still an error — only an absent name substitutes.
+- **1.5.2 scenery missing: `GFX version 93 is newer than the client's 79`.**
+  `gfx_file::parse` refused any `MOXTVersion` above the measured 79. The
+  container grammar is version-gated per key, so a newer root is readable; the
+  gate is now a one-line note. `gfx_decal` lost its upper bound the same way.
+  `gfx_light` keeps its 79 refusal on purpose: it validates a light layout it
+  has measured, and reading version-90 keys as 79 would publish invented lights.
+  A root refused there is retried through the animated reader, so its other
+  elements still play.
+- **1.4.4 teleport lists empty / flat.** Version-6 precinct files carry a polygon
+  but no centre line, and `music::Zone::center` was `None` for all of them, so
+  the fallback in `gpu.rs` had no position for any zone and fell through to a
+  single synthetic point at the origin. `polygon_centre` supplies the
+  area-weighted centroid (average vertex for a degenerate polygon) and the
+  authored vertex height, so each zone is a real fly-to location. The last-resort
+  destination is now 3 units above the terrain rather than 30 above y=0.
+- **Launcher card overflow + auto-launch.** The card had four version rows in a
+  96-pixel panel, so the fourth row painted over the buttons; it now draws
+  exactly the three requested versions (game, tasks, elements) in a 104-pixel
+  panel. `summary_rows` returns exactly those three. Selecting a folder armed
+  `SetTimer(hwnd, 1, 1800, …)` and launched on `WM_TIMER`; both are gone, so only
+  the **Enter world** button (id 102) launches. Guarded by
+  `selecting_a_folder_never_launches_on_a_timer` in `src/main.rs`, which scans
+  the launcher source and runs on Linux CI.
+- **Status:** fixed and unit-tested. Verified offline against real Drive BSData
+  (`water`, `gfx`, `music`, `material` harness modes, 152 tests). The remaining
+  hardware questions are the same as B-2 and B-3.

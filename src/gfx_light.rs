@@ -233,9 +233,9 @@ pub fn parse(text: &str) -> Result<Vec<Definition>, String> {
             .trim(),
     )?;
     // The client's root loader (0x6e3470) reads `MOXTVersion` first and rejects
-    // anything **above** 79 (`cmp 0x4f`). That is the whole rule: there is no
-    // lower bound, and every optional key is gated per version inside the
-    // element loaders rather than the file being refused outright.
+    // anything **above** 79 (`cmp 0x4f`). Every optional key is gated per
+    // version inside the element loaders rather than the file being refused
+    // outright.
     //
     // This used to be a ten-value whitelist, which was invented rather than
     // measured and cost most of the map. `gfx.pck` ships 27 distinct versions;
@@ -245,6 +245,11 @@ pub fn parse(text: &str) -> Result<Vec<Definition>, String> {
     // refusal here marks the owner `State::Failed`, and only `State::Live`
     // owners ever build a player, those roots drew no geometry at all: the map
     // showed its one allowed waterfall and nothing else.
+    // Unlike the shared container parser, this reader *validates* a light
+    // layout it has measured, so a version above that measurement really is
+    // unverified: reading 90 or 93 light keys with the 79 grammar would publish
+    // invented lights. The root's other elements still play, because a root
+    // rejected here is retried through the animated reader.
     if version > 79 {
         return Err(format!("GFX version {version} is newer than 79"));
     }

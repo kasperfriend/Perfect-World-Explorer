@@ -157,6 +157,42 @@ fn in_window(id: usize, cols: usize, window: Option<[usize; 4]>) -> bool {
         x >= x0 && x < x1 && y >= y0 && y < y1
     })
 }
+/// The stand-in the client paints where a terrain texture is absent.
+///
+/// `a37` names `Temp\\notex.bmp` in its flat ground texture list and never ships
+/// it. The client substitutes its missing-texture image and keeps the map, so
+/// this builds the same thing the terrain sampler understands: a DXT1 DDS whose
+/// block is the client's missing-texture magenta, with a single mip level.
+/// Sizes stay multiples of four because DXT1 encodes 4x4 blocks.
+fn notex_pixels() -> Vec<u8> {
+    let (width, height) = (4u32, 4u32);
+    let mut dds = vec![0u8; 128];
+    dds[..4].copy_from_slice(b"DDS ");
+    for (p, v) in [
+        (4, 124u32),
+        (12, height),
+        (16, width),
+        (20, width * 2),
+        (28, 1),
+        (76, 32),
+        (80, 0x4),
+        (84, 0x3154_5844),
+    ] {
+        dds[p..p + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // One colour block: colour0 = magenta, colour1 = black, all-white indices,
+    // which DXT1 resolves to colour0 everywhere.
+    dds.extend_from_slice(&0xf800u16.to_le_bytes());
+    dds.extend_from_slice(&0x0000u16.to_le_bytes());
+    dds.extend_from_slice(&0xffffu32.to_le_bytes());
+    dds
+}
+
+#[cfg(test)]
+pub(crate) fn notex_pixels_for_test() -> Vec<u8> {
+    notex_pixels()
+}
+
 impl Materials {
     pub fn load(
         dir: &Path,
@@ -217,17 +253,44 @@ impl Materials {
             .collect();
         let mut textures = Vec::with_capacity(paths.len());
         for path in paths.iter().filter(|_| colors) {
-            let entry = entry_index
-                .get(&path.to_ascii_lowercase())
-                .map(|&i| &entries[i])
-                .ok_or_else(|| format!("missing texture {path}"))?;
-            let raw = pck::read_entry(&mut file, entry)?;
+            // A map may name a texture the client never packed: `a37` (Morai)
+            // asks for `Temp\notex.bmp` in its flat terrain texture list. The
+            // client paints such a slot with its missing-texture placeholder and
+            // keeps the map, so one absent name must not cost the whole world --
+            // the missing mask is what made the instance fail to load at all.
+            let raw = match entry_index.get(&path.to_ascii_lowercase()) {
+                Some(&i) => pck::read_entry(&mut file, &entries[i])?,
+                None => {
+                    eprintln!(
+                        "terrain: texture {path} is not in textures.pck; using a placeholder"
+                    );
+                    notex_pixels()
+                }
+            };
             // Terrain sources must be one of the compressed formats the client
             // can create; anything else is an explicit error naming the file
             // instead of an `image` crate fallback that silently decodes a
             // format the native device would have rejected.
-            let info = crate::terrain_sampling::parse_terrain_dds(&raw)
-                .map_err(|e| format!("texture {path}: {e}"))?;
+            let info = match crate::terrain_sampling::parse_terrain_dds(&raw) {
+                Ok(info) => info,
+                // Only the stand-in may be re-tried as a placeholder: an
+                // authored DDS the device would reject stays an error.
+                Err(e) if entry_index.contains_key(&path.to_ascii_lowercase()) => {
+                    return Err(format!("texture {path}: {e}"))
+                }
+                Err(_) => {
+                    let raw = notex_pixels();
+                    let info = crate::terrain_sampling::parse_terrain_dds(&raw)
+                        .map_err(|e| format!("placeholder texture: {e}"))?;
+                    textures.push(Texture {
+                        w: info.width as usize,
+                        h: info.height as usize,
+                        source: raw,
+                        levels: Default::default(),
+                    });
+                    continue;
+                }
+            };
             let (w, h) = (info.width as usize, info.height as usize);
             textures.push(Texture {
                 w,

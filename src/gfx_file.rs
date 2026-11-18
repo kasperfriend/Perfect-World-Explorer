@@ -66,7 +66,16 @@
 
 use glam::{Quat, Vec3};
 
-/// Highest `MOXTVersion` the client accepts (`cmp 0x4f` in the root loader).
+/// Highest `MOXTVersion` the viewer has measured evidence for: `cmp 0x4f` in
+/// the 1.4.2 root loader, whose content tops out at 79.
+///
+/// This is **not** a gate. A newer client writes newer roots, and refusing them
+/// costs that client every effect that uses one: a 1.5.2 client ships version 90
+/// and 93 roots, and the old hard gate dropped all of them (the
+/// `GFX version 93 is newer than the client's 79` line in
+/// `effect-problems.log`). Every optional key is already version gated inside
+/// the element loaders, so a newer version is read with the newest known
+/// grammar and reported, exactly as `gfx_light` does.
 pub const MAX_VERSION: u32 = 79;
 
 /// One decoded `Key: value` line, in file order.
@@ -1274,9 +1283,11 @@ pub fn parse(source: &str) -> Result<Root, String> {
     #[allow(clippy::cast_sign_loss)]
     let version = version as u32;
     if version > MAX_VERSION {
-        return Err(format!(
-            "GFX version {version} is newer than the client's {MAX_VERSION}"
-        ));
+        // Not an error: a newer client is newer everywhere, and its roots use
+        // the same container. Report it once per root and read on.
+        eprintln!(
+            "gfx: version {version} is newer than the measured {MAX_VERSION}; reading it with the newest known grammar"
+        );
     }
     if version < 24 {
         // Version 4 records in the corpus are skill missile paths (`MoveMode`,
@@ -3290,11 +3301,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_versions_the_client_rejects() {
-        let too_new = header37(0).replace("MOXTVersion: 37", "MOXTVersion: 80");
-        assert!(parse(&too_new)
-            .unwrap_err()
-            .contains("newer than the client's 79"));
+    fn version_gates_only_where_the_container_changes() {
+        // A newer client writes newer roots and the container is the same, so a
+        // version above the measured 79 must read, not be refused: 1.5.2 ships
+        // 90 and 93, and refusing them cost that client every effect.
+        let newer = header37(0).replace("MOXTVersion: 37", "MOXTVersion: 93");
+        assert_eq!(parse(&newer).unwrap().version, 93);
 
         // `gfx/sgc/刺客_致盲_技能击中.gfx` is a version 4 skill missile record.
         let mover = "MOXTVersion: 4\nPath: \nPath: \nScale: 1\nMoveMode: 0\nTargetMode: 0\n";

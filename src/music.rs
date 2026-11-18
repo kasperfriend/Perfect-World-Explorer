@@ -47,6 +47,47 @@ fn vector(s: &str) -> Result<[f32; 3], String> {
     }
     Ok([vals[0], vals[1], vals[2]])
 }
+/// Middle of a closed XZ polygon: the area-weighted centroid when the polygon
+/// has area, otherwise the average vertex.
+///
+/// Used where a precinct file carries a polygon but no centre line, which is
+/// every version-6 file. A centre is what the teleport list needs; without one
+/// the only destination a map offers is a synthetic point at the origin.
+fn polygon_centre(poly: &[[f32; 2]]) -> [f32; 3] {
+    let n = poly.len();
+    if n == 0 {
+        return [0., 0., 0.];
+    }
+    let (mut a, mut cx, mut cz) = (0f64, 0f64, 0f64);
+    for j in 0..n {
+        let p = poly[j];
+        let q = poly[(j + 1) % n];
+        let cross = p[0] as f64 * q[1] as f64 - q[0] as f64 * p[1] as f64;
+        a += cross;
+        cx += (p[0] as f64 + q[0] as f64) * cross;
+        cz += (p[1] as f64 + q[1] as f64) * cross;
+    }
+    if a.abs() < 1e-6 {
+        let mean = |pick: fn(&[f32; 2]) -> f32| {
+            poly.iter().map(pick).map(f64::from).sum::<f64>() / n as f64
+        };
+        return [mean(|p| p[0]) as f32, 0., mean(|p| p[1]) as f32];
+    }
+    [(cx / (3. * a)) as f32, 0., (cz / (3. * a)) as f32]
+}
+
+impl Zone {
+    /// Somewhere a camera can be sent inside this zone.
+    ///
+    /// The authored centre when the file states one (version 7), else the middle
+    /// of the polygon (version 6, and version 7 files that repeat a vertex).
+    /// `None` only for a zone with neither.
+    pub fn fallback_position(&self) -> Option<[f32; 3]> {
+        self.center
+            .or_else(|| (!self.polygon.is_empty()).then(|| polygon_centre(&self.polygon)))
+    }
+}
+
 impl Zones {
     pub fn open(path: &Path) -> Result<Self, String> {
         let bytes = fs::read(path).map_err(|e| e.to_string())?;
@@ -102,9 +143,11 @@ impl Zones {
                 return Err(format!("truncated precinct {name}"));
             }
             let mut poly = Vec::with_capacity(n);
+            let mut height = 0f64;
             for line in &lines[begin..stop] {
-                let [x, _, z] = vector(line)?;
+                let [x, y, z] = vector(line)?;
                 poly.push([x, z]);
+                height += f64::from(y);
             }
             let mut area = 0.;
             for j in 0..n {
@@ -122,9 +165,18 @@ impl Zones {
                     playlist.push(path)
                 }
             }
+            // A version-6 precinct ships no centre line, but its polygon is the
+            // zone, and the teleport fallback needs somewhere inside it or the
+            // map offers only a synthetic point at the origin — which on a
+            // version-7 world like 1.4.4's `a37` is empty, flat ground. The
+            // area-weighted centroid is the zone's middle; the polygon's own
+            // height is averaged too, because teleporting to y=0 would drop the
+            // camera under terrain that sits at 200.
+            let mut center = polygon_centre(&poly);
+            center[1] = (height / n as f64) as f32;
             zones.push(Zone {
                 name,
-                center: None,
+                center: Some(center),
                 polygon: poly,
                 tracks: playlist,
                 ambience_day,
@@ -823,6 +875,25 @@ mod tests {
         assert_eq!(z.zones[1].tracks[0], "Music\\b.ogg");
         assert_eq!(z.zones[1].ambience_day, "");
     }
+    /// A version-6 precinct states no centre, but the teleport list needs one.
+    /// Without it every 1.4.4 map offered a single synthetic point at the
+    /// origin, which on those worlds is empty flat ground.
+    #[test]
+    fn a_version_6_zone_centres_on_its_own_polygon() {
+        let s = "version 6\n123\n\"square\"\n1 5 0 0 1 1 60 1 1 0\n0, 250, 0\n\
+                 -10 200 -10\n10 200 -10\n10 200 10\n-10 200 10\n-10 200 -10\n\
+                 \"\"\n\"Music\\a.mp3\"\n\"\"";
+        let zones = Zones::parse(s).unwrap();
+        let position = zones.zones[0]
+            .fallback_position()
+            .expect("a polygon zone has a reachable point");
+        // The polygon's middle, at the height its vertices are authored at --
+        // not the file's y=0 or the centre line version 6 does not carry.
+        assert!(position[0].abs() < 0.01, "{position:?}");
+        assert!(position[2].abs() < 0.01, "{position:?}");
+        assert!((position[1] - 200.).abs() < 0.01, "{position:?}");
+    }
+
     #[test]
     fn instance_precinct_version_7_keeps_zone_names_and_polygons() {
         let text = r#"version 7

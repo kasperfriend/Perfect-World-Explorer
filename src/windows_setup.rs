@@ -659,8 +659,6 @@ extern "system" {
     fn SetWindowTextW(hwnd: Hwnd, text: *const u16) -> i32;
     fn EnableWindow(hwnd: Hwnd, enable: i32) -> i32;
     fn SendMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
-    fn SetTimer(hwnd: Hwnd, id: usize, interval: u32, callback: *const c_void) -> usize;
-    fn KillTimer(hwnd: Hwnd, id: usize) -> i32;
     fn GetSysColorBrush(index: i32) -> *mut c_void;
     fn LoadCursorW(instance: *mut c_void, name: *const u16) -> *mut c_void;
 }
@@ -714,11 +712,6 @@ unsafe extern "system" fn launch_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
         }
         0x10 => {
             LAUNCH_ACTION.store(3, Ordering::SeqCst);
-            0
-        }
-        0x113 => {
-            KillTimer(hwnd, 1);
-            LAUNCH_ACTION.store(2, Ordering::SeqCst);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -869,7 +862,6 @@ pub fn start_window() -> Result<Option<PathBuf>, String> {
             DispatchMessageW(&msg);
             match LAUNCH_ACTION.swap(0, Ordering::SeqCst) {
                 1 => {
-                    KillTimer(hwnd, 1);
                     let choice =
                         choose_client(hwnd, selected.as_ref().map(|c| c.element.as_path()))?;
                     if let Some(path) = choice {
@@ -881,8 +873,6 @@ pub fn start_window() -> Result<Option<PathBuf>, String> {
                             present_scan(hwnd, &scan);
                             UpdateWindow(hwnd);
                             selected = Some(crate::client_detect::Client::from_scan(&scan));
-                            // Keep the scan result visible before showing loading.
-                            SetTimer(hwnd, 1, 1800, std::ptr::null());
                         } else {
                             selected = None;
                             crate::launcher_ui::set_client(
@@ -897,7 +887,6 @@ pub fn start_window() -> Result<Option<PathBuf>, String> {
                     }
                 }
                 2 => {
-                    KillTimer(hwnd, 1);
                     if let Some(client) = selected {
                         if crate::launcher_ui::low_memory() {
                             std::env::set_var("PW_SMALL_MASK_ATLAS", "1");

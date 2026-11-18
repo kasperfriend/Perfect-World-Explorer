@@ -19,7 +19,14 @@
 #   tools/offline_harness.sh fmt      rustfmt --check the modules CI formats
 #   tools/offline_harness.sh client   build+test the client_detect closure
 #                                     against the REAL goblin/flate2/sha2
-#
+#   tools/offline_harness.sh water    build+test `src/water.rs` against the REAL
+#                                     flate2 (BSData records are zlib-framed)
+#   tools/offline_harness.sh gfx      build+test the GFX containers (file, decal,
+#                                     light) and the `pck` they read from
+#   tools/offline_harness.sh music    build+test `src/music.rs` (precinct zones and
+#                                     the teleport fallback points)
+#   tools/offline_harness.sh material build+test the terrain material set and the
+#                                     missing-texture placeholder the client paints#
 # Everything lands in target/offline/, which .gitignore already excludes.
 #
 # The real `flate2`, `goblin` and a correct SHA-256 are built here from pinned
@@ -171,7 +178,39 @@ real_deps() {
         --cfg 'feature="pe32"' --cfg 'feature="pe64"' --cfg 'feature="archive"' \
         -L "$OUT" --extern scroll="$OUT/libscroll.rlib" --extern log="$OUT/liblog.rlib" \
         "$DEP/goblin/src/lib.rs" -o "$OUT/libgoblin.rlib"
-    # `sha2` compresses through `digest`/`generic-array`, a lot of transitive
+    # `flate2` is what `pck` and `angelica_pck` actually use, and the water
+    # BSData reader needs it too (`stored, raw, zlib` records). It was claimed
+    # below but never built, so every `client` run failed on a missing extern.
+    if [ ! -f "$OUT/libflate2.rlib" ]; then
+        if [ ! -d "$DEP/flate2" ]; then
+            mkdir -p "$DEP"
+            git clone -q --depth 1 https://github.com/rust-lang/flate2-rs "$DEP/flate2"
+            git clone -q --depth 1 https://github.com/Frommi/miniz_oxide "$DEP/miniz_oxide"
+            git clone -q --depth 1 https://github.com/oyvindln/adler2 "$DEP/adler2"
+            git clone -q --depth 1 https://github.com/srijs/rust-crc32fast "$DEP/crc32fast"
+            git clone -q --depth 1 https://github.com/rust-lang/cfg-if "$DEP/cfg_if"
+        fi
+        [ -f "$OUT/libadler2.rlib" ] || "$RUSTC" --crate-type rlib \
+            --crate-name adler2 --edition 2021 --sysroot "$SYSROOT" -C opt-level=1 \
+            "$DEP/adler2/src/lib.rs" -o "$OUT/libadler2.rlib"
+        [ -f "$OUT/libminiz_oxide.rlib" ] || "$RUSTC" --crate-type rlib \
+            --crate-name miniz_oxide --edition 2021 --sysroot "$SYSROOT" -C opt-level=1 \
+            --cfg 'feature="with-alloc"' -L "$OUT" --extern adler2="$OUT/libadler2.rlib" \
+            "$DEP/miniz_oxide/miniz_oxide/src/lib.rs" -o "$OUT/libminiz_oxide.rlib"
+        [ -f "$OUT/libcfg_if.rlib" ] || "$RUSTC" --crate-type rlib \
+            --crate-name cfg_if --edition 2021 --sysroot "$SYSROOT" -C opt-level=1 \
+            "$DEP/cfg_if/src/lib.rs" -o "$OUT/libcfg_if.rlib"
+        [ -f "$OUT/libcrc32fast.rlib" ] || "$RUSTC" --crate-type rlib \
+            --crate-name crc32fast --edition 2021 --sysroot "$SYSROOT" -C opt-level=1 \
+            --cfg 'feature="std"' -L "$OUT" --extern cfg_if="$OUT/libcfg_if.rlib" \
+            "$DEP/crc32fast/src/lib.rs" -o "$OUT/libcrc32fast.rlib"
+        "$RUSTC" --crate-type rlib --crate-name flate2 --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 --cfg 'feature="any_impl"' --cfg 'feature="rust_backend"' \
+            --cfg 'feature="miniz_oxide"' -L "$OUT" \
+            --extern miniz_oxide="$OUT/libminiz_oxide.rlib" \
+            --extern crc32fast="$OUT/libcrc32fast.rlib" \
+            "$DEP/flate2/src/lib.rs" -o "$OUT/libflate2.rlib"
+    fi    # `sha2` compresses through `digest`/`generic-array`, a lot of transitive
     # surface for one known-answer test; the stand-in is a correct SHA-256
     # instead (below), so `hash_reference` stays meaningful.
     if [ ! -f "$OUT/libsha2.rlib" ]; then
@@ -410,6 +449,13 @@ EOF
 //! Offline stand-in for `crate::pck`; see the note at the top of the script.
 use std::fs::File;
 
+pub(crate) fn inflate(_raw: &[u8], _expected: usize) -> Result<Vec<u8>, String> {
+    Err("offline harness: no zlib backend".to_string())
+}
+
+pub fn corpus_absent(_what: &str) {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub name: String,
     pub offset: u32,
@@ -496,12 +542,168 @@ case "${1:-test}" in
             --extern goblin="$OUT/libgoblin.rlib" \
             "$OUT/cd/harness.rs" -o "$OUT/cdtest"
         (cd "$REPO" && exec "$OUT/cdtest" "$@") ;;
-    fmt)   toolchain
+    water) toolchain; sysroot; deps
+        # `water` needs flate2 (BSData records are zlib-framed) and the parse
+        # path does not touch `image`, so a small shim stands in for it.
+        real_deps
+        mkdir -p "$OUT/water"
+        cat > "$OUT/water/lib.rs" <<EOF
+pub mod scene {
+    pub struct WaterRef { pub export_id: u32, pub offset: u32 }
+    pub struct Block { pub water: Vec<WaterRef> }
+    pub struct Scene { pub blocks: Vec<Block> }
+}
+#[path = "$OUT/water/pck.rs"]
+pub mod pck;
+#[path = "$REPO/src/water.rs"]
+pub mod water;
+EOF
+        cat > "$OUT/water/pck.rs" <<'EOF'
+//! `inflate` from the shipped `pck`, so record framing is tested for real.
+pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
+    use flate2::{Decompress, FlushDecompress, Status};
+    let mut decomp = Decompress::new(true);
+    let cap = expected.checked_add(1).ok_or("zlib size overflow")?;
+    let mut out = Vec::with_capacity(cap);
+    let status = decomp
+        .decompress_vec(raw, &mut out, FlushDecompress::Finish)
+        .map_err(|e| e.to_string())?;
+    if out.len() != expected {
+        return Err(format!("bad decompressed size: {} != {expected}", out.len()));
+    }
+    if status != Status::StreamEnd {
+        return Err("truncated zlib stream".into());
+    }
+    Ok(out)
+}
+pub struct Entry { pub name: String, pub offset: u32, pub size: u32, pub compressed: u32 }
+pub fn directory(_f: &mut std::fs::File) -> Result<Vec<Entry>, String> { Err("stub".into()) }
+pub fn read_entry(_f: &mut std::fs::File, _e: &Entry) -> Result<Vec<u8>, String> { Err("stub".into()) }
+EOF
+        cat > "$OUT/water/image.rs" <<'EOF'
+//! The few `image` items `src/water.rs` names outside the decode path.
+pub struct RgbaImage { pub w: u32, pub h: u32, pub pixels: Vec<u8> }
+impl RgbaImage {
+    pub fn from_raw(w: u32, h: u32, pixels: Vec<u8>) -> Option<Self> {
+        if pixels.len() != (w as usize) * (h as usize) * 4 { return None; }
+        Some(Self { w, h, pixels })
+    }
+    pub fn dimensions(&self) -> (u32, u32) { (self.w, self.h) }
+    pub fn get_pixel(&self, x: u32, y: u32) -> ([u8; 4], ()) {
+        let i = ((y * self.w + x) * 4) as usize;
+        let p = &self.pixels[i..i + 4];
+        ([p[0], p[1], p[2], p[3]], ())
+    }
+}
+pub struct DynamicImage;
+impl DynamicImage {
+    pub fn to_rgba8(&self) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
+}
+pub enum ImageFormat { Dds }
+pub fn load_from_memory_with_format(_b: &[u8], _f: ImageFormat) -> Result<DynamicImage, String> {
+    Err("stub".into())
+}
+pub mod imageops {
+    use super::RgbaImage;
+    pub fn crop_imm(_img: &RgbaImage, _x: u32, _y: u32, _w: u32, _h: u32) -> Crop { Crop }
+    pub struct Crop;
+    impl Crop {
+        pub fn to_image(self) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
+    }
+}
+#[allow(dead_code)]
+fn _uses(_: DynamicImage) {}
+EOF
+        "$RUSTC" --crate-type rlib --crate-name image --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=0 "$OUT/water/image.rs" -o "$OUT/libimage_stub.rlib"
+        "$RUSTC" --test --crate-name watertest --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern image="$OUT/libimage_stub.rlib" \
+            "$OUT/water/lib.rs" -o "$OUT/watertest"
+        shift || true
+        (cd "$REPO" && exec "$OUT/watertest" "$@") ;;
+    gfx)   toolchain; sysroot; deps; real_deps
+        # The GFX containers on their own: `gfx_file`, `gfx_decal`, `gfx_light`
+        # and the `pck` they read from, without the renderer or the `main.rs`
+        # macros the full harness cannot resolve. Version-gate changes live here.
+        mkdir -p "$OUT/gfx"
+        cat > "$OUT/gfx/lib.rs" <<EOF
+#[path = "$REPO/src/animation.rs"]
+pub mod animation;
+#[path = "$REPO/src/ecmodel.rs"]
+pub mod ecmodel;
+#[path = "$REPO/src/gfx_color_track.rs"]
+pub mod gfx_color_track;
+#[path = "$REPO/src/gfx_decal.rs"]
+pub mod gfx_decal;
+#[path = "$REPO/src/gfx_file.rs"]
+pub mod gfx_file;
+#[path = "$REPO/src/gfx_light.rs"]
+pub mod gfx_light;
+#[path = "$REPO/src/pck.rs"]
+pub mod pck;
+#[path = "$REPO/src/scene_lights.rs"]
+pub mod scene_lights;
+EOF
+        "$RUSTC" --test --crate-name gfxver --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 -L "$OUT" --extern glam="$OUT/libglam.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern flate2="$OUT/libflate2.rlib" \
+            "$OUT/gfx/lib.rs" -o "$OUT/gfxver"
+        shift || true
+        (cd "$REPO" && exec "$OUT/gfxver" "$@") ;;
+    music) toolchain; sysroot; deps; real_deps
+        # `src/music.rs` alone: precinct parsing and the zone fallback points the
+        # teleport list uses when a map ships no `world_targets.txt`.
+        mkdir -p "$OUT/music"
+        cat > "$OUT/music/lib.rs" <<EOF
+#[path = "$OUT/pck_stub.rs"]
+pub mod pck;
+#[path = "$REPO/src/music.rs"]
+pub mod music;
+EOF
+        "$RUSTC" --test --crate-name musictest --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 -L "$OUT" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern flate2="$OUT/libflate2.rlib" \
+            "$OUT/music/lib.rs" -o "$OUT/musictest"
+        shift || true
+        (cd "$REPO" && exec "$OUT/musictest" "$@") ;;
+    material) toolchain; sysroot; deps; real_deps
+        # The terrain material set: the missing-texture placeholder the client
+        # substitutes must be a DDS the sampler and the DXT decoder both accept.
+        mkdir -p "$OUT/mat"
+        cat > "$OUT/mat/lib.rs" <<EOF
+#[path = "$OUT/pck_stub.rs"]
+pub mod pck;
+#[path = "$REPO/src/dxt.rs"]
+pub mod dxt;
+#[path = "$REPO/src/terrain_sampling.rs"]
+pub mod terrain_sampling;
+#[path = "$REPO/src/material.rs"]
+pub mod material;
+
+pub fn u32at(b: &[u8], p: usize) -> Result<u32, String> {
+    Ok(u32::from_le_bytes(
+        b.get(p..p + 4).ok_or("truncated")?.try_into().map_err(|_| "truncated")?,
+    ))
+}
+pub fn f32at(b: &[u8], p: usize) -> Result<f32, String> {
+    Ok(f32::from_bits(u32at(b, p)?))
+}
+EOF
+        "$RUSTC" --test --crate-name mattest --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 -L "$OUT" --extern glam="$OUT/libglam.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern flate2="$OUT/libflate2.rlib" \
+            "$OUT/mat/lib.rs" -o "$OUT/mattest"
+        shift || true
+        (cd "$REPO" && exec "$OUT/mattest" "$@") ;;    fmt)   toolchain
         rustfmt --check --edition 2021 \
             "$REPO/src/gfx_player.rs" "$REPO/src/gfx_file.rs" "$REPO/src/gfx_decal.rs" \
             "$REPO/src/gfx_color_track.rs" "$REPO/src/gfx_catalog.rs" "$REPO/src/ecmodel.rs" \
             "$REPO/src/gfx_light.rs" "$REPO/src/gfx_owner.rs" "$REPO/src/scene_lights.rs" \
             "$REPO/src/view_settings.rs" "$REPO/src/client_weather.rs" \
             "$REPO/src/sky_transition.rs" "$REPO/src/scene.rs" "$REPO/src/model_dds.rs" "$REPO/src/skin.rs" "$REPO/src/skeleton.rs" "$REPO/src/skeleton_pose.rs" "$REPO/src/skin_pose.rs" "$REPO/src/model_asset.rs" "$REPO/src/model_material.rs" ;;
-    *) echo "usage: $0 {setup|check|test|fmt|client}" >&2; exit 2 ;;
-esac
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|gfx|music|material}" >&2; exit 2 ;;esac
