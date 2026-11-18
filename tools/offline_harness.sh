@@ -18,6 +18,7 @@
 #   tools/offline_harness.sh test     build and run every #[cfg(test)] in it
 #   tools/offline_harness.sh fmt      rustfmt --check the modules CI formats
 #   tools/offline_harness.sh client   build+test the client_detect closure
+#   tools/offline_harness.sh content  read the files INSIDE every staged pack
 #                                     against the REAL goblin/flate2/sha2
 #   tools/offline_harness.sh water    build+test `src/water.rs` against the REAL
 #                                     flate2 (BSData records are zlib-framed)
@@ -862,6 +863,133 @@ EOF
             "$OUT/pck/sweep.rs" -o "$OUT/pcksweep"
         shift || true
         exec "$OUT/pcksweep" "${1:-$REPO/google_drive/packs}" ;;
+    content) toolchain; sysroot; deps
+        # Read the files *inside* the packages, not just their directories. A
+        # pack whose directory parses but whose payloads do not is not readable,
+        # and `pck` above cannot tell the difference. Each extension is checked
+        # with the reader that owns it, or with its magic where no reader exists
+        # (`.mox`, `.spt`) so an unread format is counted rather than claimed.
+        mkdir -p "$OUT/content"
+        cat > "$OUT/content/sweep.rs" <<EOF
+#[path = "$REPO/src/angelica_pck.rs"]
+pub mod angelica_pck;
+#[path = "$REPO/src/gfx_file.rs"]
+pub mod gfx_file;
+#[path = "$REPO/src/pck.rs"]
+pub mod pck;
+
+use std::collections::BTreeMap;
+use std::fs::File;
+
+struct Tally { ok: u64, failed: u64, first: Vec<String> }
+impl Tally {
+    fn new() -> Self { Tally { ok: 0, failed: 0, first: Vec::new() } }
+    fn record(&mut self, name: &str, r: Result<(), String>) {
+        match r {
+            Ok(()) => self.ok += 1,
+            Err(e) => {
+                self.failed += 1;
+                if self.first.len() < 2 { self.first.push(format!("{name}: {e}")); }
+            }
+        }
+    }
+}
+
+fn main() {
+    let dir = std::env::args().nth(1).expect("pack directory");
+    let mut paths: Vec<_> = std::fs::read_dir(&dir).expect("read dir").flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("pck"))
+        .collect();
+    paths.sort();
+    let mut tallies: BTreeMap<String, Tally> = BTreeMap::new();
+    for path in &paths {
+        let mut f = File::open(path).expect("open pack");
+        let entries = match pck::directory(&mut f) {
+            Ok(e) => e,
+            Err(_) => match angelica_pck::directory(&mut f) { Ok(e) => e, Err(_) => continue },
+        };
+        for e in &entries {
+            let ext = e.name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+            if !matches!(ext.as_str(), "gfx" | "gfx_err" | "sdr" | "ski" | "bon" | "mox" | "spt") {
+                continue;
+            }
+            let payload = match pck::read_entry(&mut f, e) {
+                Ok(p) => p,
+                Err(err) => {
+                    tallies.entry(ext).or_insert_with(Tally::new)
+                        .record(&e.name, Err(format!("decode: {err}")));
+                    continue;
+                }
+            };
+            let t = tallies.entry(ext.clone()).or_insert_with(Tally::new);
+            match ext.as_str() {
+                "gfx" | "gfx_err" => {
+                    // GFX containers are GBK, never UTF-8.
+                    let (text, damaged) = gfx_file::decode(&payload);
+                    let r = gfx_file::parse(&text).map(|_| ()).map_err(|err| {
+                        if damaged { format!("{err} (and the text had GBK damage)") } else { err }
+                    });
+                    t.record(&e.name, r);
+                }
+                "sdr" => {
+                    let (text, _) = gfx_file::decode(&payload);
+                    let ok = text.trim_start().starts_with("//") || text.contains("void main")
+                        || text.contains("technique") || text.contains("sampler");
+                    t.record(&e.name, if ok { Ok(()) } else {
+                        Err(format!("not shader text: {:?}", text.chars().take(40).collect::<String>()))
+                    });
+                }
+                "ski" | "bon" => {
+                    t.record(&e.name, if payload.len() >= 8 { Ok(()) } else { Err("too short".into()) });
+                }
+                "mox" => {
+                    // Recognised, but this project has no reader for it.
+                    t.record(&e.name, if payload.starts_with(b"MOXBFRAME:") { Ok(()) } else {
+                        Err(format!("not MOXBFRAME: {:?}", String::from_utf8_lossy(&payload[..payload.len().min(20)])))
+                    });
+                }
+                "spt" => {
+                    // SpeedTree source; the magic sits at offset 8 behind a
+                    // small header every staged file shares.
+                    let at = payload.windows(10).position(|w| w == b"__IdvSpt_0");
+                    t.record(&e.name, if at.is_some() { Ok(()) } else {
+                        Err(format!("no __IdvSpt_ magic in {} bytes", payload.len()))
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    let (mut ok, mut failed) = (0u64, 0u64);
+    println!("{:<10} {:>7} {:>7}", "ext", "ok", "failed");
+    for (ext, t) in &tallies {
+        ok += t.ok; failed += t.failed;
+        println!("{:<10} {:>7} {:>7}", ext, t.ok, t.failed);
+        for line in &t.first { println!("        - {line}"); }
+    }
+    println!("\ncontent: {ok} read, {failed} failed");
+    // Both retail gfx.pck builds ship one authored stub -- four bytes, "MOXT"
+    // -- so a reader cannot parse it and that is the archive's content, not a
+    // failure. It is reported above and excluded from the exit status; any
+    // other failure fails the run.
+    let mut unexpected = 0u64;
+    for (ext, t) in &tallies {
+        for line in &t.first {
+            if ext == "gfx" && line.contains("holds no fields, only \"MOXT\"") { continue; }
+            unexpected += 1;
+        }
+    }
+    if unexpected > 0 { std::process::exit(1); }
+}
+EOF
+        "$RUSTC" --crate-name contentsweep --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=2 -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern glam="$OUT/libglam.rlib" \
+            "$OUT/content/sweep.rs" -o "$OUT/contentsweep"
+        shift || true
+        exec "$OUT/contentsweep" "${1:-$REPO/google_drive/packs}" ;;
     matrix) toolchain; sysroot; deps; real_deps
         # One row per staged client. Everything here is produced by the real
         # readers; nothing is asserted about a version that is not present.
@@ -987,4 +1115,4 @@ EOF
             "$OUT/matrix/run.rs" -o "$OUT/matrixrun"
         shift || true
         exec "$OUT/matrixrun" "${1:-$REPO/google_drive/clients}" ;;
-    *) echo "usage: $0 {setup|check|test|fmt|client|water|gfx|music|material|scene|pck|matrix}" >&2; exit 2 ;;esac
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|gfx|music|material|scene|pck|content|matrix}" >&2; exit 2 ;;esac
