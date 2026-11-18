@@ -200,6 +200,11 @@ impl StaticGrid {
             }
         }
     }
+    /// Snapshot consumed from effect producers during the latest main pass.
+    pub fn dynamic_lights(&self) -> &[DynamicLight] {
+        &self.dynamic
+    }
+
     /// Rebuild the dynamic list each frame. The client takes at most three
     /// runtime candidates per cell in source order (0x425b09).
     pub fn update_dynamic(&mut self, lights: &[DynamicLight]) {

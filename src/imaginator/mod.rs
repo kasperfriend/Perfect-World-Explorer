@@ -290,7 +290,7 @@ enum CaptureState {
 }
 
 /// DXR currently uses one constant material per primitive. Bake the bounded
-/// terrain preview at triangle centroids; foliage cutouts and detailed textures
+/// captured textures at triangle centroids; foliage cutouts and detailed textures
 /// still require a separate GPU texture/any-hit implementation.
 fn pack_hardware_materials(bvh: &bvh::Bvh, source: &[bvh::Material]) -> (Vec<u8>, Vec<u8>) {
     let mut normals = Vec::with_capacity(bvh.triangles.len() * 16);
@@ -307,7 +307,7 @@ fn pack_hardware_materials(bvh: &bvh::Bvh, source: &[bvh::Material]) -> (Vec<u8>
     }
     for (index, tri) in bvh.triangles.iter().enumerate() {
         let mut material = tri.material as usize;
-        if tri.material == bvh::material::TERRAIN {
+        if tri.material == bvh::material::TERRAIN || tri.material == bvh::material::SCENERY {
             if let Some((rgba, _)) = bvh.surface_sample(index as u32, [1. / 3., 1. / 3.]) {
                 let linear = |c: u8| {
                     let c = c as f32 / 255.;
@@ -1537,7 +1537,7 @@ impl Imaginator {
             }
         });
         if self.settings.output == settings::Output::TraceOnly {
-            ui.label("Experimental full trace: software samples tree cutouts and approximate terrain colour. DXR terrain colour is per triangle; building textures, DXR foliage cutouts and effects are not yet supported. Raster rendering still runs before this view.");
+            ui.label("Experimental full trace: software samples tree cutouts, resident building textures and approximate terrain colour. DXR textures are sampled per triangle; streamed building textures, DXR cutouts and effect geometry remain unsupported. Raster rendering still runs before this view.");
             changed |= ui
                 .add(
                     egui::Slider::new(&mut self.settings.exposure, 0.05..=8.0)

@@ -6343,11 +6343,40 @@ pub fn run(
                             // encoder, dispatched and blitted before the present
                             // encode runs.
                             let eye = camera.pos;
-                            let environment = imaginator_environment_at(
+                            let mut environment = imaginator_environment_at(
                                 &camera,
                                 &renderer.model_lights,
                                 eye,
                             );
+                            if let Some(world) = renderer.models.as_ref() {
+                                for light in world.dynamic_lights() {
+                                    if !light.radius.is_finite() || light.radius <= 0.
+                                        || light.position.iter().chain(light.color.iter()).any(|v| !v.is_finite())
+                                    {
+                                        continue;
+                                    }
+                                    // Match the world-model dynamic light's diffuse
+                                    // scale; the tracer uses the authored radius as
+                                    // its range and traces its own shadow rays.
+                                    let scale = (2. * light.color[3]).max(0.);
+                                    environment.lights.push(crate::imaginator::tracer::PointLight {
+                                        position: crate::imaginator::math::V3::from_array(light.position),
+                                        range: light.radius,
+                                        colour: crate::imaginator::math::v3(
+                                            (light.color[0] * scale).max(0.),
+                                            (light.color[1] * scale).max(0.),
+                                            (light.color[2] * scale).max(0.),
+                                        ),
+                                    });
+                                }
+                            }
+                            environment.lights.sort_by(|a, b| {
+                                let eye = crate::imaginator::math::v3(eye.x, eye.y, eye.z);
+                                let da = ((a.position - eye).length() - a.range).max(0.);
+                                let db = ((b.position - eye).length() - b.range).max(0.);
+                                da.total_cmp(&db)
+                            });
+                            environment.lights.truncate(32);
                             renderer
                                 .modules
                                 .imaginator()

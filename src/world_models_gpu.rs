@@ -629,6 +629,11 @@ impl World {
     pub fn gfx_status(&self) -> gfx_owner::Status {
         self.owners.status()
     }
+    /// Effect lights consumed on the latest main pass, for the ray tracer.
+    pub fn dynamic_lights(&self) -> &[DynamicLight] {
+        self.grid.dynamic_lights()
+    }
+
     /// Direct publication entry point for an already-resolved producer.
     /// Production uses the owner manager below; this stays public because the
     /// publication bridge regressions drive it with explicit identities.

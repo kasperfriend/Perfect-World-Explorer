@@ -71,6 +71,7 @@ pub mod bmd {
         pub normal: [f32; 3],
     }
     pub struct Mesh {
+        pub texture: String,
         pub vertices: Vec<Vertex>,
         pub indices: Vec<u16>,
     }
@@ -103,7 +104,15 @@ pub mod scene {
 pub mod objects {
     use crate::bmd;
     pub struct Objects;
+    pub struct Texture {
+        pub width: usize,
+        pub height: usize,
+        pub rgba: Vec<u8>,
+    }
     impl Objects {
+        pub fn texture(&self, _path: &str) -> Option<&Texture> {
+            None
+        }
         pub fn get(&self, _idx: usize) -> Option<&bmd::Model> {
             None
         }

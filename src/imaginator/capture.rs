@@ -189,9 +189,10 @@ impl Builder {
         uv: [[f32; 2]; 3],
         texture: u32,
         alpha_cutoff: Option<u8>,
+        material: u16,
     ) {
         let index = self.triangles.len();
-        self.push(a, b, c, normal, material::VEGETATION);
+        self.push(a, b, c, normal, material);
         if self.triangles.len() != index {
             self.surfaces.insert(
                 index as u32,
@@ -419,6 +420,7 @@ fn basis(v: [f32; 3]) -> V3 {
 /// had been traced.
 fn capture_scenery(b: &mut Builder, objects: &Objects, ornaments: &[Ornament]) -> usize {
     let mut captured = 0;
+    let mut texture_ids = std::collections::HashMap::<String, u32>::new();
     for (index, ornament) in ornaments.iter().enumerate() {
         if !b.has_room() {
             b.clipped = true;
@@ -438,6 +440,27 @@ fn capture_scenery(b: &mut Builder, objects: &Objects, ornaments: &[Ornament]) -
         let x_axis = y_axis.cross(z_axis).normalize_or_zero();
         let scale = V3::from_array(model.scale);
         for mesh in &model.meshes {
+            let texture = if let Some(&id) = texture_ids.get(&mesh.texture) {
+                Some(id)
+            } else if let Some(image) = objects.texture(&mesh.texture) {
+                if image.width > 0
+                    && image.height > 0
+                    && image.rgba.len() == image.width * image.height * 4
+                {
+                    let id = b.textures.len() as u32;
+                    b.textures.push(super::bvh::Texture {
+                        width: image.width as u32,
+                        height: image.height as u32,
+                        rgba: image.rgba.clone(),
+                    });
+                    texture_ids.insert(mesh.texture.clone(), id);
+                    Some(id)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             for tri in mesh.indices.chunks_exact(3) {
                 let Some(pa) = mesh.vertices.get(tri[0] as usize) else {
                     continue;
@@ -458,7 +481,20 @@ fn capture_scenery(b: &mut Builder, objects: &Objects, ornaments: &[Ornament]) -
                 // buildings keep their shading instead of going faceted.
                 let n = (x_axis * pa.normal[0] + y_axis * pa.normal[1] + z_axis * pa.normal[2])
                     .normalize_or_zero();
-                b.push(a, bb, c, n, material::SCENERY);
+                if let Some(texture) = texture {
+                    b.textured(
+                        a,
+                        bb,
+                        c,
+                        n,
+                        [pa.uv, pb.uv, pc.uv],
+                        texture,
+                        Some(127),
+                        material::SCENERY,
+                    );
+                } else {
+                    b.push(a, bb, c, n, material::SCENERY);
+                }
             }
         }
     }
@@ -547,6 +583,7 @@ fn capture_trees(b: &mut Builder, trees: &Trees, scene: &WorldScene) {
                     [a.uv, bv.uv, c.uv],
                     texture,
                     cutoff,
+                    material::VEGETATION,
                 );
             }
         }
@@ -574,6 +611,7 @@ fn capture_trees(b: &mut Builder, trees: &Trees, scene: &WorldScene) {
                 [leaf.uv[0], leaf.uv[1], leaf.uv[2]],
                 composite,
                 Some(127),
+                material::VEGETATION,
             );
             b.textured(
                 c0,
@@ -583,6 +621,7 @@ fn capture_trees(b: &mut Builder, trees: &Trees, scene: &WorldScene) {
                 [leaf.uv[0], leaf.uv[2], leaf.uv[3]],
                 composite,
                 Some(127),
+                material::VEGETATION,
             );
         }
     }
@@ -776,6 +815,43 @@ mod tests {
             z += stride;
         }
         assert_eq!(counted, 8, "two quads, four triangles per 9x9 grid");
+    }
+
+    #[test]
+    fn building_material_preserves_uv_and_cutout_on_trace_rays() {
+        let mut builder = Builder {
+            triangles: Vec::new(),
+            surfaces: Default::default(),
+            textures: vec![super::super::bvh::Texture {
+                width: 2,
+                height: 1,
+                rgba: vec![255, 0, 0, 0, 0, 255, 0, 255],
+            }],
+            budget: CaptureBudget::default(),
+            clipped: false,
+            ceiling: None,
+        };
+        builder.textured(
+            v3(0., 0., 0.),
+            v3(1., 0., 0.),
+            v3(0., 0., 1.),
+            v3(0., 1., 0.),
+            [[0., 0.], [1., 0.], [0., 0.]],
+            0,
+            Some(127),
+            material::SCENERY,
+        );
+        assert_eq!(builder.triangles[0].material, material::SCENERY);
+        let mut bvh = Bvh::build(builder.triangles);
+        bvh.surfaces = Arc::new(builder.surfaces);
+        bvh.textures = Arc::new(builder.textures);
+        let ray = |x| super::super::math::Ray::new(v3(x, 1., 0.1), v3(0., -1., 0.));
+        assert!(bvh.closest_hit(&ray(0.1), 0., 10.).is_none());
+        let hit = bvh.closest_hit(&ray(0.7), 0., 10.).unwrap();
+        assert_eq!(
+            bvh.surface_sample(hit.triangle, hit.bary).unwrap().0,
+            [0, 255, 0, 255]
+        );
     }
 
     #[test]
