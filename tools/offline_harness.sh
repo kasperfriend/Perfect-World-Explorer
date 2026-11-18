@@ -140,6 +140,89 @@ PY
 # CI: the first version of the offline shim invented a `resource_directory`
 # field that goblin 0.8.2 does not have, and only `cargo check --bins` noticed.
 # Mirroring the real crates is therefore the point of this function.
+# The `image` API surface the offline module set names, as a stub: this
+# toolchain has no `image` crate, and these binaries only need the types to
+# type-check. Built here rather than inside one target, so a stub that gains an
+# item is not left stale for every other target that never rebuilds it.
+image_stub() {
+    [ -f "$OUT/libimage_stub.rlib" ] && return 0
+    cat > "$OUT/water/image.rs" <<'EOF'
+//! The few `image` items `src/water.rs` names outside the decode path.
+#[derive(Clone)]
+pub struct RgbaImage { pub w: u32, pub h: u32, pub pixels: Vec<u8> }
+impl RgbaImage {
+    pub fn from_raw(w: u32, h: u32, pixels: Vec<u8>) -> Option<Self> {
+        if pixels.len() != (w as usize) * (h as usize) * 4 { return None; }
+        Some(Self { w, h, pixels })
+    }
+    pub fn dimensions(&self) -> (u32, u32) { (self.w, self.h) }
+    pub fn get_pixel(&self, x: u32, y: u32) -> ([u8; 4], ()) {
+        let i = ((y * self.w + x) * 4) as usize;
+        let p = &self.pixels[i..i + 4];
+        ([p[0], p[1], p[2], p[3]], ())
+    }
+}
+impl RgbaImage {
+    pub fn width(&self) -> u32 { self.w }
+    pub fn height(&self) -> u32 { self.h }
+    pub fn pixels(&self) -> std::slice::Iter<'_, u8> { self.pixels.iter() }
+    pub fn as_raw(&self) -> &Vec<u8> { &self.pixels }
+    pub fn into_raw(self) -> Vec<u8> { self.pixels }
+    pub fn new(w: u32, h: u32) -> Self {
+        Self { w, h, pixels: vec![0; (w as usize) * (h as usize) * 4] }
+    }
+    pub fn from_pixel(w: u32, h: u32, p: Rgba<u8>) -> Self {
+        Self { w, h, pixels: p.0.iter().copied().cycle().take((w as usize) * (h as usize) * 4).collect() }
+    }
+}
+#[derive(Clone, Copy)]
+pub struct Rgba<T>(pub [T; 4]);
+impl Rgba<u8> {
+    pub fn channels(&self) -> [u8; 4] { self.0 }
+}
+pub struct DynamicImage;
+impl DynamicImage {
+    pub fn to_rgba8(&self) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
+    pub fn into_rgba8(self) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
+    pub fn width(&self) -> u32 { 0 }
+    pub fn height(&self) -> u32 { 0 }
+}
+pub enum ImageFormat { Dds, Png, Tga }
+pub fn load_from_memory_with_format(_b: &[u8], _f: ImageFormat) -> Result<DynamicImage, String> {
+    Err("stub".into())
+}
+pub fn load_from_memory(_b: &[u8]) -> Result<DynamicImage, String> { Err("stub".into()) }
+pub fn open(_p: impl AsRef<std::path::Path>) -> Result<DynamicImage, String> { Err("stub".into()) }
+pub fn save_buffer(_p: impl AsRef<std::path::Path>, _b: &[u8], _w: u32, _h: u32, _c: ()) -> Result<(), String> {
+    Err("stub".into())
+}
+
+pub mod imageops {
+    use super::RgbaImage;
+    pub fn resize(img: &RgbaImage, w: u32, h: u32, _f: FilterType) -> RgbaImage {
+        RgbaImage { w, h, pixels: img.pixels.clone() }
+    }
+    pub fn grayscale(_img: &RgbaImage) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
+    pub fn flip_vertical(_img: &RgbaImage) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
+    pub enum FilterType { Nearest, Triangle }
+    pub fn resize_exact(img: &RgbaImage, w: u32, h: u32, _f: FilterType) -> RgbaImage {
+        RgbaImage { w, h, pixels: img.pixels.clone() }
+    }
+    pub fn replace(_dst: &mut RgbaImage, _src: &RgbaImage, _x: i64, _y: i64) {}
+    pub fn crop_imm(_img: &RgbaImage, _x: u32, _y: u32, _w: u32, _h: u32) -> Crop { Crop }
+    pub struct Crop;
+    impl Crop {
+        pub fn to_image(self) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
+    }
+}
+#[allow(dead_code)]
+fn _uses(_: DynamicImage) {}
+EOF
+    "$RUSTC" --crate-type rlib --crate-name image --edition 2021 \
+        --sysroot "$SYSROOT" -C opt-level=0 "$OUT/water/image.rs" \
+        -o "$OUT/libimage_stub.rlib"
+}
+
 real_deps() {
     if [ ! -d "$DEP/goblin" ]; then
         mkdir -p "$DEP"
@@ -552,6 +635,45 @@ case "${1:-test}" in
             $EXT -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
             -C opt-level=0 "$OUT/lib.rs" -o "$OUT/libharness.rlib"
         echo "type-check clean" ;;
+    bins)  toolchain; sysroot; deps; real_deps; image_stub
+        # Type-check the `src/bin` targets whose whole dependency set exists
+        # offline, in their test configuration, which is how CI builds them.
+        #
+        # `check` only covers the library module set, so a bug in a binary -- or
+        # in the `#[test]` block of a `#[path]`-included module, which the binary
+        # compiles -- reached CI unseen. `unwrap_err()` on a type without `Debug`
+        # did exactly that. The window and GPU binaries need
+        # `wgpu`/`egui`/`winit` and stay CI's job.
+        mkdir -p "$OUT/bins"
+        total=0
+        failed=0
+        for path in "$REPO"/src/bin/*.rs; do
+            name="$(basename "$path" .rs)"
+            # Skip a binary that names a crate this toolchain does not have.
+            if grep -qE '(^|[^A-Za-z_])(wgpu|bytemuck|egui|egui_wgpu|egui_winit|winit)::' "$path"; then
+                continue
+            fi
+            # A binary that reaches a `#[path]` module needing `Digest::new`:
+            # the sorted `sha2` here is a stub without it.
+            if grep -q "sha2::" "$path" || grep -rqs "Sha256::new" "$REPO/src/terrain_store.rs"; then
+                case "$name" in terrain-memory-check|navigation-survey) continue ;; esac
+            fi
+            total=$((total + 1))
+            if ! "$RUSTC" --crate-name "b_$(echo "$name" | tr '-' '_')" --edition 2021 \
+                --test --sysroot "$SYSROOT" -L "$OUT" \
+                $EXT --extern flate2="$OUT/libflate2.rlib" \
+                --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+                --extern image="$OUT/libimage_stub.rlib" \
+                --extern goblin="$OUT/libgoblin.rlib" \
+                --extern sha2="$OUT/libsha2.rlib" \
+                -o "$OUT/bins/$name" "$path" 2>"$OUT/bins/$name.log"; then
+                failed=$((failed + 1))
+                echo "FAIL $name"
+                grep -E "^error" -A4 "$OUT/bins/$name.log" | head -10
+            fi
+        done
+        echo "bins: $((total - failed))/$total type-check clean"
+        [ "$failed" -eq 0 ] ;;
     test)  toolchain; sysroot; deps
         "$RUSTC" --test --crate-name harness --edition 2021 --sysroot "$SYSROOT" \
             $EXT -C opt-level=1 "$OUT/lib.rs" -o "$OUT/gfxtest"
@@ -631,71 +753,6 @@ pub struct Entry { pub name: String, pub offset: u32, pub size: u32, pub compres
 pub fn directory(_f: &mut std::fs::File) -> Result<Vec<Entry>, String> { Err("stub".into()) }
 pub fn read_entry(_f: &mut std::fs::File, _e: &Entry) -> Result<Vec<u8>, String> { Err("stub".into()) }
 EOF
-        cat > "$OUT/water/image.rs" <<'EOF'
-//! The few `image` items `src/water.rs` names outside the decode path.
-#[derive(Clone)]
-pub struct RgbaImage { pub w: u32, pub h: u32, pub pixels: Vec<u8> }
-impl RgbaImage {
-    pub fn from_raw(w: u32, h: u32, pixels: Vec<u8>) -> Option<Self> {
-        if pixels.len() != (w as usize) * (h as usize) * 4 { return None; }
-        Some(Self { w, h, pixels })
-    }
-    pub fn dimensions(&self) -> (u32, u32) { (self.w, self.h) }
-    pub fn get_pixel(&self, x: u32, y: u32) -> ([u8; 4], ()) {
-        let i = ((y * self.w + x) * 4) as usize;
-        let p = &self.pixels[i..i + 4];
-        ([p[0], p[1], p[2], p[3]], ())
-    }
-}
-impl RgbaImage {
-    pub fn width(&self) -> u32 { self.w }
-    pub fn height(&self) -> u32 { self.h }
-    pub fn pixels(&self) -> std::slice::Iter<'_, u8> { self.pixels.iter() }
-    pub fn as_raw(&self) -> &Vec<u8> { &self.pixels }
-    pub fn from_pixel(w: u32, h: u32, p: Rgba<u8>) -> Self {
-        Self { w, h, pixels: p.0.iter().copied().cycle().take((w as usize) * (h as usize) * 4).collect() }
-    }
-}
-#[derive(Clone, Copy)]
-pub struct Rgba<T>(pub [T; 4]);
-impl Rgba<u8> {
-    pub fn channels(&self) -> [u8; 4] { self.0 }
-}
-pub struct DynamicImage;
-impl DynamicImage {
-    pub fn to_rgba8(&self) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
-    pub fn into_rgba8(self) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
-    pub fn width(&self) -> u32 { 0 }
-    pub fn height(&self) -> u32 { 0 }
-}
-pub enum ImageFormat { Dds, Png }
-pub fn load_from_memory_with_format(_b: &[u8], _f: ImageFormat) -> Result<DynamicImage, String> {
-    Err("stub".into())
-}
-pub fn load_from_memory(_b: &[u8]) -> Result<DynamicImage, String> { Err("stub".into()) }
-pub fn open(_p: impl AsRef<std::path::Path>) -> Result<DynamicImage, String> { Err("stub".into()) }
-pub fn save_buffer(_p: impl AsRef<std::path::Path>, _b: &[u8], _w: u32, _h: u32, _c: ()) -> Result<(), String> {
-    Err("stub".into())
-}
-
-pub mod imageops {
-    use super::RgbaImage;
-    pub fn resize(img: &RgbaImage, w: u32, h: u32, _f: ()) -> RgbaImage {
-        RgbaImage { w, h, pixels: img.pixels.clone() }
-    }
-    pub fn grayscale(_img: &RgbaImage) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
-    pub fn flip_vertical(_img: &RgbaImage) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
-    pub fn crop_imm(_img: &RgbaImage, _x: u32, _y: u32, _w: u32, _h: u32) -> Crop { Crop }
-    pub struct Crop;
-    impl Crop {
-        pub fn to_image(self) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
-    }
-}
-#[allow(dead_code)]
-fn _uses(_: DynamicImage) {}
-EOF
-        "$RUSTC" --crate-type rlib --crate-name image --edition 2021 --sysroot "$SYSROOT" \
-            -C opt-level=0 "$OUT/water/image.rs" -o "$OUT/libimage_stub.rlib"
         "$RUSTC" --test --crate-name watertest --edition 2021 --sysroot "$SYSROOT" \
             -C opt-level=1 -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
             --extern encoding_rs="$OUT/libencoding_rs.rlib" \

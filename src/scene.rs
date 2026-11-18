@@ -664,20 +664,28 @@ mod tests {
         // supported", which does not say what the file held or what the build
         // wanted. The gate now names both, and anything at or above 12 is
         // attempted rather than refused by number.
+        // `Result::unwrap_err` would need `Scene: Debug`, which this module does
+        // not implement and should not gain just for a test.
+        fn error(b: &[u8]) -> String {
+            match Scene::parse(b) {
+                Err(error) => error,
+                Ok(_) => panic!("this header should not parse"),
+            }
+        }
         let mut b = vec![0u8; 116];
         b[0..4].copy_from_slice(&0x45435744u32.to_le_bytes());
         b[4..8].copy_from_slice(&13u32.to_le_bytes());
-        let newer = Scene::parse(&b).unwrap_err();
+        let newer = error(&b);
         assert!(!newer.contains("only ECWLD"), "{newer}");
         assert!(!newer.contains("version 13"), "13 is attempted: {newer}");
 
         b[4..8].copy_from_slice(&7u32.to_le_bytes());
-        let older = Scene::parse(&b).unwrap_err();
+        let older = error(&b);
         assert!(older.contains("version 7"), "{older}");
         assert!(older.contains("version 12"), "{older}");
 
         b[0..4].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
-        let not_a_world = Scene::parse(&b).unwrap_err();
+        let not_a_world = error(&b);
         assert!(not_a_world.contains("not a world file"), "{not_a_world}");
     }
     #[test]
