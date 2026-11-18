@@ -168,7 +168,8 @@ solver.
 
 Both backends test material visibility and alpha before accepting an
 intersection. Transparent holes don't shift the start of the ray past another
-surface. Solid shadows stop at the first covered blocker. Texture tiles have
+surface. Opaque shadows stop at the first covered blocker; covered leaves transmit
+a bounded, pigment-tinted fraction. Texture tiles have
 isolated, ray-footprint-filtered mips with alpha-weighted color; distant cutouts
 sample the fraction of passing texels using a fixed per-pixel pattern, not a
 new seed each frame. Blended sheets sort by distance, using authored
@@ -180,8 +181,8 @@ pulse doesn't rebuild the Vulkan acceleration structures. Unchanged moving
 packets skip upload; unchanged geometry skips Vulkan BLAS/TLAS builds.
 
 Lighter is a different lighting model, not pixel-for-pixel retail emulation.
-Texture tiles and distant terrain are simplified. Vegetation wind and
-camera-facing leaf behavior, cloud detail, rain/snow, shoreline wave overlays,
+Texture tiles and distant terrain are simplified. Vegetation uses sampled motion and independent secondary cards; see
+[vegetation motion and LOD scope](vegetation.md). Cloud detail, rain/snow, shoreline wave overlays,
 lens flares and some legacy effect/skin blend and no-depth-test modes are
 not reproduced.
 The native whole-world BMD preload, temporal upscalers and frame generation
