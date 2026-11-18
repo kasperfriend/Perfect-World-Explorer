@@ -624,6 +624,18 @@ fn push_quad(v: &mut Vec<Vertex>, i: &mut Vec<u32>, points: [[f32; 3]; 4], color
     }
     i.extend_from_slice(&[n, n + 1, n + 2, n + 1, n + 3, n + 2]);
 }
+fn block_coordinates(width: usize, height: usize, spacing: f32, cam: [f32; 2]) -> [f32; 2] {
+    [
+        (cam[0] / spacing + width as f32 * 0.5) / TILE as f32,
+        (height as f32 * 0.5 - cam[1] / spacing) / TILE as f32,
+    ]
+}
+
+fn camera_block(width: usize, height: usize, spacing: f32, cam: [f32; 2]) -> (isize, isize) {
+    let [x, y] = block_coordinates(width, height, spacing, cam);
+    (x.floor() as isize, y.floor() as isize)
+}
+
 /// Recovered block window and per-block levels (`src/terrain_lod.rs`). The client
 /// re-evaluates `0x77e360` for every resident block on every frame, so the viewer
 /// re-runs the same rule per frame and rebuilds geometry only when the answer
@@ -644,8 +656,6 @@ fn lod_setup(
     let cols = width / TILE;
     let rows = height / TILE;
     let block_world = TILE as f32 * spacing;
-    let gx = cam[0] / spacing + width as f32 * 0.5;
-    let gy = height as f32 * 0.5 - cam[1] / spacing;
     let lod = crate::terrain_lod::LodConfig {
         block_size: block_world,
         ..Default::default()
@@ -653,7 +663,7 @@ fn lod_setup(
     // `world+0x1bc`: draw range in world units, one slider step = one block.
     let range = radius.max(1) as f32 * block_world;
     let win = crate::terrain_lod::window(
-        [gx / TILE as f32, gy / TILE as f32],
+        block_coordinates(width, height, spacing, cam),
         [cols, rows],
         range,
         block_world,
@@ -817,11 +827,9 @@ fn build(
         });
     }
     let rad = detail.radius;
-    let gx = cx / t.grid_spacing + t.width as f32 * 0.5;
-    let gy = t.height as f32 * 0.5 - cz / t.grid_spacing;
-    // Camera block, used as the rebuild anchor compared against `self.center`.
-    let bx = (gx / TILE as f32).floor() as isize;
-    let by = (gy / TILE as f32).floor() as isize;
+    // Camera block, also the ray stream's rebuild anchor. The block is not
+    // clamped to the terrain window: rays can reach outside a small map.
+    let (bx, by) = camera_block(t.width, t.height, t.grid_spacing, [cx, cz]);
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     // Recovered block residency, resolution levels and block-edge rule
@@ -1494,10 +1502,9 @@ fn build(
     // Snap the independent ray region to the same block that drives stream
     // requests. Rotating or moving within an unchanged block cannot change it.
     let ray_scenery = ray_scenery.map(|stream| {
-        let block = TILE as f32 * t.grid_spacing;
         let center = [
-            cx + (0.5 - (gx / TILE as f32).rem_euclid(1.)) * block,
-            cz - (0.5 - (gy / TILE as f32).rem_euclid(1.)) * block,
+            ((bx as f32 + 0.5) * TILE as f32 - t.width as f32 * 0.5) * t.grid_spacing,
+            (t.height as f32 * 0.5 - (by as f32 + 0.5) * TILE as f32) * t.grid_spacing,
         ];
         stream.prepare(&mut t.objects, &ornament_ids, center, resident_bounds)
     });
@@ -6367,6 +6374,10 @@ pub fn run(
                             aim != &renderer.lod
                                 || renderer.detail != settings.detail
                                 || renderer.local_scenery_skipped != skip_local_scenery
+                                // A clamped terrain window and its LODs may
+                                // hold steady across a block crossing. The ray
+                                // scenery range still has to follow the eye.
+                                || (ray_world && renderer.center != camera_block(width, height, spacing, [camera.pos.x, camera.pos.z]))
                         }
                         None => false,
                     };

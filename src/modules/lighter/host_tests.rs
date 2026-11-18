@@ -967,3 +967,12 @@ pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
         reflect_only,
     }
 }
+
+#[test]
+fn ray_stream_anchor_crosses_blocks_even_when_terrain_lods_are_clamped() {
+    let terrain = |x| super::super::lod_levels(TILE, TILE, 1., [x, 0.], 7);
+    let anchor = |x| super::super::camera_block(TILE, TILE, 1., [x, 0.]);
+    assert_eq!(terrain(-900.), terrain(-1000.));
+    assert_ne!(anchor(-900.), anchor(-1000.));
+    assert_eq!(anchor(-900.), anchor(-901.));
+}
