@@ -7,8 +7,9 @@ use scene::*;
 fn naga_validates_both_paths_and_emits_native_ray_queries() {
     use naga_rt as naga;
     for src in [
-        [BASE, SOFTWARE].concat(),
-        include_str!("present.wgsl").into(),
+        [PIXELS, BASE, SOFTWARE].concat(),
+        [PIXELS, include_str!("present.wgsl")].concat(),
+        [PIXELS, post::SHADER].concat(),
     ] {
         let module = naga::front::wgsl::parse_str(&src)
             .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
@@ -19,8 +20,8 @@ fn naga_validates_both_paths_and_emits_native_ray_queries() {
         .validate(&module)
         .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
     }
-    let shader =
-        vulkan::shader(&[BASE, HARDWARE].concat()).expect("Vulkan ray-query WGSL to SPIR-V");
+    let shader = vulkan::shader(&[PIXELS, BASE, HARDWARE].concat())
+        .expect("Vulkan ray-query WGSL to SPIR-V");
     assert_eq!(shader[0], 0x0723_0203);
     let mut opcodes = Vec::new();
     let mut intersection_kinds = std::collections::BTreeSet::new();
@@ -209,6 +210,9 @@ impl Harness {
                 shadows: false,
                 bounces: 0,
                 resolution: 100,
+                denoiser: false,
+                soft_sun: false,
+                progressive: false,
                 ..Settings::default()
             },
             &adapter,
@@ -639,6 +643,10 @@ fn exercise(mode: Mode, cpu_query: bool) {
         assert!((mean - expected).abs() < 0.055, "channel {i}: {mean}");
     }
     exercise_transport(&mut h);
+    exercise_denoiser_edges(&mut h);
+    exercise_sun_and_history(&mut h);
+    exercise_temporal_animation(&mut h);
+    exercise_gloss(&mut h);
 }
 
 fn assert_radiance(label: &str, pixel: ([u8; 4], f32), linear: [f32; 3]) {
@@ -834,6 +842,343 @@ fn exercise_transport(h: &mut Harness) {
             [value; 3],
         );
     }
+}
+
+// The same test suite runs through the compute BVH, CPU Vulkan queries, and
+// opt-in physical Vulkan hardware. Measurements are from the linear target.
+fn exercise_denoiser_edges(h: &mut Harness) {
+    let empty = Builder::default().finish();
+    h.ray.settings.lighting = true;
+    h.ray.settings.shadows = false;
+    h.ray.settings.reflections = false;
+    h.ray.settings.bounces = 0;
+    let mut frame = test_frame(Vec3::ZERO, -Vec3::Z, 7);
+    frame.sun = [0., 0.8, 0.6, 1.];
+    frame.ambient = [0.; 4];
+    let small = |p: &[([u8; 4], f32)], x: usize| p[3 * 7 + x];
+    for (label, z, n) in [
+        ("depth step", -8., [0., 0., 1.]),
+        ("coplanar normal crease", -5., [0., -0.8, 0.6]),
+    ] {
+        let mut b = Builder::default();
+        for (x0, x1, z, n) in [(-4., 0.1, -5., [0., 0., 1.]), (0.1, 4., z, n)] {
+            let mesh = quad(
+                &mut b,
+                [[x0, 4., z], [x1, 4., z], [x0, -4., z], [x1, -4., z]],
+                n,
+                0,
+                0,
+                u32::MAX,
+            );
+            put(&mut b, mesh);
+        }
+        h.ray.install(Ok((b.finish(), Textures::default())));
+        // Same white material on both sides. Only depth (distance fog) or
+        // normal (direct sun) can explain the discontinuity.
+        frame.air = [6., 7., 1., 0.];
+        frame.extent = [0, 0, 7, 7];
+        h.ray.settings.denoiser = false;
+        h.ray.settings.resolution = 100;
+        let raw = h.pixels(frame, &empty);
+        let left = small(&raw, 3);
+        let right = small(&raw, 4);
+        assert!(left.0[0] > right.0[0] + 80, "{label}: {left:?} {right:?}");
+        h.ray.settings.denoiser = true;
+        let filtered = h.pixels(frame, &empty);
+        assert_eq!(small(&filtered, 3), left, "{label}: left edge filtered");
+        assert_eq!(small(&filtered, 4), right, "{label}: right edge filtered");
+        assert!(filtered.iter().zip(&raw).all(|(a, b)| a.1 == b.1));
+
+        frame.extent = [0, 0, 14, 14];
+        h.ray.settings.resolution = 50;
+        let guided = h.pixels(frame, &empty);
+        h.ray.settings.denoiser = false;
+        let bilinear = h.pixels(frame, &empty);
+        let at = 7 * 14 + 7; // exactly between source texels 3 and 4
+        assert_eq!(guided[at], left, "{label}: upscale bled into left");
+        assert_eq!(guided[at + 1], right, "{label}: upscale bled into right");
+        assert!(bilinear[at].0[0] < left.0[0] - 10);
+        assert!(guided.iter().zip(&bilinear).all(|(a, b)| a.1 == b.1));
+    }
+    h.ray.settings.resolution = 100;
+}
+
+fn exercise_sun_and_history(h: &mut Harness) {
+    const SIDE: usize = 33;
+    let empty = Builder::default().finish();
+    let scene = |block| {
+        let mut b = Builder::default();
+        let wall = quad(
+            &mut b,
+            [
+                [-4., 4., -5.],
+                [4., 4., -5.],
+                [-4., -4., -5.],
+                [4., -4., -5.],
+            ],
+            [0., 0., 1.],
+            0,
+            0,
+            u32::MAX,
+        );
+        put(&mut b, wall);
+        if block {
+            // A straight edge outside the primary view, 30 units toward the
+            // sun. The disc has radius ~0.141 in this plane; x=0 sees only
+            // the slice on the right of a 0.025-unit obstruction.
+            let shader_edge = quad(
+                &mut b,
+                [
+                    [-8., 35., 13.],
+                    [0.025, 35., 13.],
+                    [-8., 13., 13.],
+                    [0.025, 13., 13.],
+                ],
+                [0., 0., -1.],
+                0,
+                0,
+                u32::MAX,
+            );
+            put(&mut b, shader_edge);
+        }
+        (b.finish(), Textures::default())
+    };
+    h.ray.install(Ok(scene(true)));
+    let mut frame = test_frame(Vec3::ZERO, -Vec3::Z, SIDE as u32);
+    frame.ambient = [0.; 4];
+    frame.sun = [0., 0.8, 0.6, 1.];
+    h.ray.settings.lighting = true;
+    h.ray.settings.shadows = true;
+    let column = |y| y * SIDE + SIDE / 2;
+    let center = column(SIDE / 2);
+    let hard = h.pixels(frame, &empty);
+    let full = hard[center + 5].0[0];
+    assert!(full > 100);
+    assert_eq!(hard[center].0[0], 0, "point sun did not cast a hard shadow");
+    h.ray.settings.soft_sun = true;
+    let grain = h.pixels(frame, &empty);
+    h.ray.settings.denoiser = true;
+    let smooth = h.pixels(frame, &empty);
+    let stats = |pixels: &[([u8; 4], f32)]| {
+        let row = (2..SIDE - 2).map(|y| f32::from(pixels[column(y)].0[0]) / f32::from(full));
+        let mean = row.clone().sum::<f32>() / (SIDE - 4) as f32;
+        let variance = row.map(|v| (v - mean).powi(2)).sum::<f32>() / (SIDE - 4) as f32;
+        (mean, variance)
+    };
+    let (_, noisy_variance) = stats(&grain);
+    let (_, smooth_variance) = stats(&smooth);
+    assert!(
+        noisy_variance > 0.1,
+        "finite sun did not sample both sides of the edge"
+    );
+    assert!(
+        smooth_variance < 0.55 * noisy_variance,
+        "filter did not reduce flat-surface noise"
+    );
+    assert!(smooth.iter().zip(&grain).all(|(a, b)| a.1 == b.1));
+    assert_eq!(smooth[center - 5].0[0], 0);
+    assert!(smooth[center + 5].0[0].abs_diff(full) <= 1);
+
+    // Same transport seeds, independently sampled versus reused. The latter
+    // must equal the mean, not just render the same seed for every frame.
+    const FRAMES: u32 = 12;
+    h.ray.settings.denoiser = false;
+    h.ray.settings.progressive = true;
+    let mut sum = vec![0u32; SIDE * SIDE];
+    for _ in 0..FRAMES {
+        h.ray.reset_history();
+        for (s, pixel) in sum.iter_mut().zip(h.pixels(frame, &empty)) {
+            *s += u32::from(pixel.0[0]);
+        }
+    }
+    h.ray.history = post::History::default();
+    let mut converged = Vec::new();
+    for _ in 0..FRAMES {
+        converged = h.pixels(frame, &empty);
+    }
+    for ((actual, &sum), reference) in converged.iter().zip(&sum).zip(&grain) {
+        let expected = sum as f32 / FRAMES as f32;
+        assert!((f32::from(actual.0[0]) - expected).abs() <= 1.5);
+        assert_eq!(actual.1, reference.1, "history changed primary depth");
+    }
+    let (lit_fraction, _) = stats(&converged);
+    let x = 0.025 / (30. * 0.27_f32.to_radians());
+    let analytic = (x.acos() - x * (1. - x * x).sqrt()) / std::f32::consts::PI;
+    assert!(
+        (lit_fraction - analytic).abs() < 0.09,
+        "disc slice {lit_fraction}, expected {analytic}"
+    );
+    eprintln!("Lighter: penumbra visibility {lit_fraction:.3} (analytic {analytic:.3}); spatial variance {noisy_variance:.4} -> {smooth_variance:.4}");
+
+    // Identical receiver depth/normal/albedo, but the camera crosses from
+    // penumbra to full sun. Per-pixel G-buffer comparison alone wouldn't know.
+    let mut shifted = test_frame(Vec3::new(0.4, 0., 0.), -Vec3::Z, SIDE as u32);
+    shifted.sun = frame.sun;
+    shifted.ambient = frame.ambient;
+    assert!(
+        h.pixel(shifted, &empty).0[0].abs_diff(full) <= 1,
+        "camera left a lighting trail"
+    );
+    let _ = h.pixels(frame, &empty);
+    let _ = h.pixels(frame, &empty);
+    h.ray.install(Ok(scene(false)));
+    assert!(
+        h.pixel(frame, &empty).0[0].abs_diff(full) <= 1,
+        "evicted caster left a shadow"
+    );
+
+    frame.sun = [0.; 4];
+    let lamp = |color| {
+        let mut b = Builder::default();
+        b.light(Light {
+            position_range: [0., 0., -2., 10.],
+            color,
+        });
+        b.finish()
+    };
+    let red = lamp([1., 0., 0., 1.]);
+    let green = lamp([0., 1., 0., 1.]);
+    for _ in 0..2 {
+        assert_radiance("red runtime light", h.pixel(frame, &red), [0.49, 0., 0.]);
+    }
+    let builds = h.builds();
+    assert_radiance(
+        "light-only history reset",
+        h.pixel(frame, &green),
+        [0., 0.49, 0.],
+    );
+    assert_eq!(h.builds(), builds, "light change rebuilt Vulkan ASes");
+}
+
+fn exercise_temporal_animation(h: &mut Harness) {
+    let empty = Builder::default().finish();
+    let mut bank = Textures::default();
+    let tile = |bank: &mut Textures, dims| {
+        bank.tile(dims, 2, textures::Filter::Color, |x, y| {
+            if x + y == 0 {
+                0xff00_00ff
+            } else {
+                0xff00_ff00
+            }
+        })
+        .unwrap()
+    };
+    let roof = tile(&mut bank, [2, 1]);
+    let scroll = tile(&mut bank, [1, 2]);
+    h.ray.settings.lighting = false;
+    h.ray.settings.shadows = false;
+    h.ray.settings.bounces = 0;
+    let mut frame = test_frame(Vec3::ZERO, Vec3::Y, 1);
+    frame.sky0 = [roof, roof, roof, 0];
+    frame.sky_tint = [1.; 4];
+    frame.sky_uv = [0., 0., 0.5, 0.];
+    h.ray
+        .install(Ok((Builder::default().finish(), bank.clone())));
+    for _ in 0..2 {
+        assert_eq!(h.pixel(frame, &empty), ([255, 0, 0, 255], 0.));
+    }
+    frame.sky_uv[0] = 0.5;
+    assert_eq!(
+        h.pixel(frame, &empty),
+        ([0, 255, 0, 255], 0.),
+        "animated roof ghosted"
+    );
+
+    let mut b = Builder::default();
+    let sheet = upright(&mut b, -2., [1.; 4], BAKED | BLEND, scroll);
+    put(&mut b, sheet);
+    h.ray.install(Ok((b.finish(), bank)));
+    let mut frame = test_frame(Vec3::ZERO, -Vec3::Z, 9);
+    frame.air[3] = 0.5;
+    for _ in 0..2 {
+        assert_eq!(h.pixel(frame, &empty), ([255, 0, 0, 255], 0.));
+    }
+    frame.air[3] = 1.5;
+    assert_eq!(
+        h.pixel(frame, &empty),
+        ([0, 255, 0, 255], 0.),
+        "scrolling sheet ghosted"
+    );
+}
+
+fn exercise_gloss(h: &mut Harness) {
+    const SIDE: usize = 15;
+    let empty = Builder::default().finish();
+    let mut bank = Textures::default();
+    let sky = bank
+        .tile([1, 1], 1, textures::Filter::Color, |_, _| 0xff00_0000)
+        .unwrap();
+    let mut frame = test_frame(Vec3::ZERO, -Vec3::Z, SIDE as u32);
+    frame.sky0 = [sky, sky, sky, 0];
+    frame.sky_tint = [1.; 4];
+    h.ray.settings.reflections = true;
+    h.ray.settings.bounces = 1;
+    let mut means = Vec::new();
+    for power in [2., 128.] {
+        let mut b = Builder::default();
+        let material = Surface::new(0, BAKED, 0., 0.).with_gloss(Gloss::authored([1.; 4], power));
+        let mirror = quad_material(
+            &mut b,
+            [
+                [-3., 3., -4.],
+                [3., 3., -4.],
+                [-3., -3., -4.],
+                [3., -3., -4.],
+            ],
+            [0., 0., 1.],
+            material,
+            rgba([0., 0., 0., 1.]),
+        );
+        put(&mut b, mirror);
+        let red = upright(&mut b, 1., [1., 0., 0., 1.], EMISSIVE, 0);
+        put(&mut b, red);
+        let green = quad(
+            &mut b,
+            [
+                [-100., 100., 2.],
+                [100., 100., 2.],
+                [-100., -100., 2.],
+                [100., -100., 2.],
+            ],
+            [0., 0., 1.],
+            0,
+            EMISSIVE,
+            rgba([0., 1., 0., 1.]),
+        );
+        put(&mut b, green);
+        h.ray.install(Ok((b.finish(), bank.clone())));
+        let mut pixels = Vec::new();
+        for _ in 0..16 {
+            pixels = h.pixels(frame, &empty);
+        }
+        let region = pixels
+            .chunks_exact(SIDE)
+            .skip(5)
+            .take(5)
+            .flat_map(|row| &row[5..10]);
+        let mut mean = [0.; 2];
+        for (rgb, depth) in region {
+            for i in 0..2 {
+                mean[i] += f32::from(rgb[i]) / (25. * 255.);
+            }
+            assert!((*depth - depth_at(frame, Vec3::new(0., 0., -4.))).abs() < 1e-5);
+        }
+        assert!(
+            (mean[0] + mean[1] - 0.25).abs() < 0.016,
+            "reflection energy {mean:?}"
+        );
+        means.push(mean);
+    }
+    assert!(
+        means[1][0] > means[0][0] + 0.07 && means[0][1] > means[1][1] + 0.07,
+        "increasing authored power did not concentrate the reflection: {means:?}"
+    );
+    h.ray.settings.reflections = false;
+    assert_radiance("reflections disabled", h.pixel(frame, &empty), [0.; 3]);
+    eprintln!(
+        "Lighter: reflected red/green, power 2 {:?}, power 128 {:?}",
+        means[0], means[1]
+    );
 }
 
 #[test]

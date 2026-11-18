@@ -673,6 +673,10 @@ impl Renderer {
             .collect()
     }
 
+    pub(super) fn moving_unchanged(&self, moving: &Packet) -> bool {
+        self.last_moving == moving.words
+    }
+
     pub fn trace(
         &mut self,
         device: &wgpu::Device,
@@ -894,10 +898,11 @@ impl Renderer {
             if let Some(build) = &tlas_build {
                 build.encode(ctx, cmd, tlas, scratch);
             }
-            // wgpu's previous fragment pass may still be reading this buffer.
+            // The previous wgpu denoiser or compositor may still read this
+            // buffer. Both execute on this VkQueue, in submission order.
             d.cmd_pipeline_barrier(
                 cmd,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -922,7 +927,7 @@ impl Renderer {
             d.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[vk::MemoryBarrier::builder()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)

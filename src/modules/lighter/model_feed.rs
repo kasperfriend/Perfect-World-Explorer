@@ -72,13 +72,13 @@ impl<'a> Moving<'a> {
                 .to_le_bytes()
                 .map(|b| f32::from(b) / 255.);
             let tint = rgba([tint[0] * d[0], tint[1] * d[1], tint[2] * d[2], d[3]]);
-            let reflect = part.material.specular[..3].iter().sum::<f32>() / 12.;
+            let gloss = Gloss::authored(part.material.specular, part.material.power);
             if alpha && flags & (BLEND | IGNORE_TEXTURE_ALPHA) == 0 {
                 flags |= CUTOUT;
             }
             let id = self
                 .builder
-                .surface(Surface::new(texture, flags, 0.5, reflect.min(0.35)));
+                .surface(Surface::new(texture, flags, 0.5, 0.).with_gloss(gloss));
             let base = self.geometry.vertices.len() as u32;
             self.geometry.vertices.extend(
                 part.vertices
@@ -124,16 +124,34 @@ impl<'a> Moving<'a> {
                 }
                 | if q.tile { 0 } else { CLAMP_UV };
             if let Some(skin) = &q.mesh {
-                let texture = self
+                let (texture, has_alpha) = self
                     .textures
                     .archive(namespace, &skin.texture, Filter::Alpha, decode)?
-                    .map_or(0, |v| v.0);
-                let flags = flags
+                    .unwrap_or((0, true));
+                let mut flags = flags
                     | if skin.write_depth { WRITE_DEPTH } else { 0 }
                     | if skin.material.is_none() { EMISSIVE } else { 0 };
                 let d = skin.material.map_or([1.; 4], |m| m.diffuse);
                 let color = rgba(std::array::from_fn(|i| q.color[i] * d[i]));
-                let id = self.builder.surface(Surface::new(texture, flags, 0., 0.));
+                let gloss = skin
+                    .material
+                    .map_or(Gloss::default(), |m| Gloss::authored(m.specular, m.power));
+                // Fully opaque standard-alpha, depth-writing GFX skins have
+                // the same visibility as a solid. Do not promote translucent
+                // or additive effects out of the ordered sheet queue.
+                if gloss.reflective()
+                    && skin.write_depth
+                    && q.depth_test
+                    && !has_alpha
+                    && color >> 24 == 255
+                    && q.source_blend == 5
+                    && q.destination_blend == 6
+                {
+                    flags &= !(BLEND | WRITE_DEPTH);
+                }
+                let id = self
+                    .builder
+                    .surface(Surface::new(texture, flags, 0., 0.).with_gloss(gloss));
                 for tri in skin.vertices.chunks_exact(3) {
                     let base = self.geometry.vertices.len() as u32;
                     self.geometry.vertices.extend(

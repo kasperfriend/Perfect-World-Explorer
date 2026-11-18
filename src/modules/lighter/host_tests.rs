@@ -115,7 +115,14 @@ fn bmd_fixture() -> Vec<u8> {
         b.extend_from_slice(&[255; 32]); // day/night vertex colors
         b.extend_from_slice(&[0; 48]);
         b.extend_from_slice(b"fixture\0");
-        b.extend_from_slice(&[0; 68]);
+        b.extend_from_slice(&[0; 48]);
+        for v in if texture.is_empty() {
+            [0f32; 5]
+        } else {
+            [0.8f32, 0.6, 0.4, 1., 96.]
+        } {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
         b.push(1); // material is two-sided
     };
     quad(
@@ -585,6 +592,15 @@ fn lighter_streamed_world_pixels() {
         "fixture BMD did not reach the local page builder"
     );
     r.update_mesh(streamed).unwrap();
+    let packet = &r.lighter.world.as_ref().unwrap().packet.words;
+    assert!(
+        packet[packet[3] as usize..packet[4] as usize]
+            .chunks_exact(5)
+            .any(|m| m[1] & super::BAKED != 0
+                && f32::from_bits(m[4]) == 96.
+                && (f32::from_bits(m[3]) - 0.15).abs() < 1.e - 6),
+        "BMD specular material lost in streaming"
+    );
     camera.pos = Vec3::new(-2.5, 5., 0.);
     camera.pitch = -std::f32::consts::FRAC_PI_4;
     assert_eq!(

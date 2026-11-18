@@ -36,8 +36,11 @@ impl Mode {
 pub struct Settings {
     pub mode: Mode,
     pub shadows: bool,
+    pub soft_sun: bool,
     pub lighting: bool,
     pub reflections: bool,
+    pub denoiser: bool,
+    pub progressive: bool,
     pub bounces: u32,
     pub samples: u32,
     pub resolution: u32,
@@ -48,8 +51,11 @@ impl Default for Settings {
         Self {
             mode: Mode::Off,
             shadows: true,
+            soft_sun: true,
             lighting: true,
             reflections: true,
+            denoiser: true,
+            progressive: true,
             bounces: 1,
             samples: 1,
             resolution: 50,
@@ -78,8 +84,11 @@ impl Settings {
                     }
                 }
                 "shadows" => settings.shadows = toggle(settings.shadows),
+                "soft_sun" => settings.soft_sun = toggle(settings.soft_sun),
                 "lighting" => settings.lighting = toggle(settings.lighting),
                 "reflections" => settings.reflections = toggle(settings.reflections),
+                "denoiser" => settings.denoiser = toggle(settings.denoiser),
+                "progressive" => settings.progressive = toggle(settings.progressive),
                 "bounces" => settings.bounces = number(settings.bounces, 0, 4),
                 "samples" => settings.samples = number(settings.samples, 1, 4),
                 "resolution" => settings.resolution = number(settings.resolution, 25, 100),
@@ -91,8 +100,8 @@ impl Settings {
 
     fn encode(self) -> String {
         format!(
-            "# Lighter settings\nmode={}\nlighting={}\nshadows={}\nreflections={}\nbounces={}\nsamples={}\nresolution={}\n",
-            self.mode.token(), self.lighting, self.shadows, self.reflections, self.bounces,
+            "# Lighter settings\nmode={}\nlighting={}\nshadows={}\nsoft_sun={}\nreflections={}\ndenoiser={}\nprogressive={}\nbounces={}\nsamples={}\nresolution={}\n",
+            self.mode.token(), self.lighting, self.shadows, self.soft_sun, self.reflections, self.denoiser, self.progressive, self.bounces,
             self.samples, self.resolution,
         )
     }

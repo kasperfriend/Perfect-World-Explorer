@@ -78,6 +78,33 @@ pub fn argb_to_rgba(v: u32) -> u32 {
     u32::from_le_bytes([r, g, b, a])
 }
 
+/// Optional legacy specular metadata. This does not change any native vertex,
+/// material constants or serialized scenery pages.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Gloss {
+    reflectance: f32,
+    power: f32,
+}
+
+impl Gloss {
+    pub fn authored(specular: [f32; 4], power: f32) -> Self {
+        // Keep Lighter's existing scalar reflectance budget for model skins.
+        let reflectance = specular[..3].iter().map(|v| v.max(0.)).sum::<f32>() / 12.;
+        Self {
+            reflectance: reflectance.min(0.35),
+            power: if power.is_finite() {
+                power.clamp(0., 128.)
+            } else {
+                0.
+            },
+        }
+    }
+
+    pub fn reflective(self) -> bool {
+        self.reflectance > 0.
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, PartialEq, Eq, Hash)]
 pub struct Surface {
@@ -85,6 +112,7 @@ pub struct Surface {
     pub flags: u32,
     cutoff: u32,
     reflectance: u32,
+    power: u32,
 }
 
 impl Surface {
@@ -94,7 +122,16 @@ impl Surface {
             flags,
             cutoff: cutoff.clamp(0., 1.).to_bits(),
             reflectance: reflectance.clamp(0., 1.).to_bits(),
+            power: (-1.0f32).to_bits(), // ideal mirror when no authored lobe
         }
+    }
+
+    pub fn with_gloss(mut self, gloss: Gloss) -> Self {
+        if gloss.reflective() {
+            self.reflectance = gloss.reflectance.to_bits();
+            self.power = gloss.power.to_bits();
+        }
+        self
     }
 
     fn ray_mask(self) -> u8 {

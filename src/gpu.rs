@@ -544,6 +544,8 @@ struct MeshData {
     water_start: u32,
     water_batches: Vec<WaterBatch>,
     local_pages: Vec<crate::world_objects::Page>,
+    /// Lighter-only specular metadata parallel to local pages/placement ranges.
+    local_gloss: Vec<Vec<crate::modules::lighter::scene::Gloss>>,
     /// True when this build left the locally streamed scenery out because the
     /// whole-world preload owns it. The renderer compares it against the state
     /// it is drawing with, the same way `lod` is compared, so a crossing into
@@ -1388,6 +1390,7 @@ fn build(
         requested.len(),
         pages.len()
     );
+    let mut page_gloss = vec![Vec::new(); pages.len()];
     for id in ornament_ids {
         let Some(model) = t.objects.get(id) else {
             continue;
@@ -1458,6 +1461,13 @@ fn build(
                     order: 0,
                     visibility,
                 });
+                page_gloss[page_id].push(
+                    mesh.material
+                        .as_ref()
+                        .map_or_else(crate::modules::lighter::scene::Gloss::default, |m| {
+                            crate::modules::lighter::scene::Gloss::authored(m.specular, m.power)
+                        }),
+                );
             }
         }
     }
@@ -1478,13 +1488,15 @@ fn build(
     }
     let mut local_pages = Vec::with_capacity(pages.len());
     let mut local_page_keys = Vec::with_capacity(pages.len());
-    for (index, (_, page)) in pages.into_iter().enumerate() {
+    let mut local_gloss = Vec::with_capacity(pages.len());
+    for (index, ((_, page), gloss)) in pages.into_iter().zip(page_gloss).enumerate() {
         let page = page.finish();
         if page.indices.is_empty() {
             continue;
         }
         local_page_keys.push(local_page_key(&page, &page_textures[index]));
         local_pages.push(page);
+        local_gloss.push(gloss);
     }
     // Keep opaque indices separate so water can sample reflected/refracted scene passes.
     let water_start = indices.len() as u32;
@@ -1675,6 +1687,7 @@ fn build(
         water_start,
         water_batches,
         local_pages,
+        local_gloss,
         local_scenery_skipped: skip_local_scenery,
     })
 }
@@ -3716,6 +3729,9 @@ impl Renderer {
         }
         let frame = self.begin_frame(camera, w, h);
         if ray_world {
+            if reset_history {
+                self.lighter.reset_history();
+            }
             return self.render_lighter(target, matrix, camera, &frame, w, h);
         }
         self.weather.advance(camera.logic_delta_ms);

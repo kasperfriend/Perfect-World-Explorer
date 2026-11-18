@@ -3,6 +3,7 @@
 //! writes the scene and reverse-Z depth target, never both.
 mod bvh;
 pub(crate) mod model_feed;
+mod post;
 pub(crate) mod scene;
 mod settings;
 pub(crate) mod sky;
@@ -15,6 +16,7 @@ use scene::Packet;
 pub(crate) use settings::{Mode, Settings};
 use textures::Textures;
 
+const PIXELS: &str = include_str!("pixels.wgsl");
 const BASE: &str = include_str!("trace.wgsl");
 const SOFTWARE: &str = include_str!("software.wgsl");
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -64,11 +66,24 @@ pub struct Frame {
     pub sky_uv: [f32; 4],
     pub sun_disc: [f32; 4],
     pub moon_disc: [f32; 4],
+    pub sampling: [u32; 4],
 }
+
+// Matches Pixel in pixels.wgsl. Includes padding-free guide storage.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct Pixel {
+    radiance: [f32; 4],
+    guide: [u32; 4],
+}
+const PIXEL_BYTES: u64 = std::mem::size_of::<Pixel>() as u64;
+// Keep trace + history + spatial scratch bounded at high output resolutions.
+const MAX_RAY_IMAGE_BYTES: u64 = 256 << 20;
 
 pub const WATER_MIRROR: u32 = 8;
 pub const CULL_BUILDINGS: u32 = 16;
 pub const UNDERWATER: u32 = 32;
+const SOFT_SUN: u32 = 64;
 
 pub struct World {
     pub packet: Packet,
@@ -182,7 +197,7 @@ impl Software {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Lighter software BVH"),
-            source: wgpu::ShaderSource::Wgsl([BASE, SOFTWARE].concat().into()),
+            source: wgpu::ShaderSource::Wgsl([PIXELS, BASE, SOFTWARE].concat().into()),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Lighter compute ray tracer"),
@@ -204,7 +219,12 @@ impl Software {
             world: upload("Lighter world"),
             moving: upload("Lighter moving geometry"),
             textures: upload("Lighter texels"),
-            output: Storage::new(device, "Lighter image", 16, wgpu::BufferUsages::empty()),
+            output: Storage::new(
+                device,
+                "Lighter image",
+                PIXEL_BYTES,
+                wgpu::BufferUsages::empty(),
+            ),
             revision: None,
             texture_len: 0,
             last_moving: Vec::new(),
@@ -296,7 +316,9 @@ impl Present {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Lighter scene and depth blit"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("present.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                [PIXELS, include_str!("present.wgsl")].concat().into(),
+            ),
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Lighter scene and depth output"),
@@ -327,8 +349,8 @@ impl Present {
             }),
         });
         let extent = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Lighter output extent"),
-            size: 16,
+            label: Some("Lighter output parameters"),
+            size: 32,
             mapped_at_creation: false,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -347,10 +369,15 @@ impl Present {
         encoder: &mut wgpu::CommandEncoder,
         image: &wgpu::Buffer,
         extent: [u32; 4],
+        guided: bool,
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
     ) {
-        queue.write_buffer(&self.extent, 0, bytemuck::bytes_of(&extent));
+        queue.write_buffer(
+            &self.extent,
+            0,
+            bytemuck::bytes_of(&[extent, [u32::from(guided), 0, 0, 0]]),
+        );
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Lighter composition"),
             layout: &self.layout,
@@ -397,6 +424,8 @@ pub struct Lighter {
     hardware: Option<vulkan::Renderer>,
     software: Option<Software>,
     present: Option<Present>,
+    post: Option<post::Post>,
+    history: post::History,
     pub settings: Settings,
     armed: bool,
     adapter_supports_compute: bool,
@@ -417,6 +446,8 @@ impl Default for Lighter {
             hardware: None,
             software: None,
             present: None,
+            post: None,
+            history: post::History::default(),
             settings: Settings::default(),
             armed: false,
             adapter_supports_compute: false,
@@ -507,7 +538,12 @@ impl Lighter {
         drop(output_pass(encoder, target, depth));
     }
 
+    pub(crate) fn reset_history(&mut self) {
+        self.history.reset();
+    }
+
     pub fn fail_frame(&mut self, error: String) {
+        self.reset_history();
         if self.frame_error.as_deref() != Some(&error) {
             eprintln!("Lighter: {error}");
         }
@@ -549,26 +585,59 @@ impl Lighter {
             }
         }
         let [_, _, w, h] = frame.extent;
+        let image_count =
+            1 + u64::from(self.settings.denoiser) + u64::from(self.settings.progressive);
+        let pixel_limit = storage.min(MAX_RAY_IMAGE_BYTES / image_count) / PIXEL_BYTES;
+        if pixel_limit == 0 {
+            return Err("Lighter cannot allocate ray image".into());
+        }
         let scaled = |n: u32| (n * self.settings.resolution / 100).max(1);
         let mut rw = scaled(w);
         let mut rh = scaled(h);
-        while u64::from(rw) * u64::from(rh) * 16 > storage {
-            if rw == 1 && rh == 1 {
-                return Err("Lighter cannot allocate ray image".into());
-            }
-            rw = rw.div_ceil(2);
-            rh = rh.div_ceil(2);
+        while u64::from(rw) * u64::from(rh) > pixel_limit {
+            let fit = (pixel_limit as f64 / (f64::from(rw) * f64::from(rh))).sqrt();
+            rw = ((f64::from(rw) * fit) as u32).max(1);
+            rh = ((f64::from(rh) * fit) as u32).max(1);
         }
         frame.extent = [rw, rh, w, h];
         frame.options[0] |= u32::from(self.settings.lighting)
             | u32::from(self.settings.shadows) << 1
-            | u32::from(self.settings.reflections) << 2;
+            | u32::from(self.settings.reflections) << 2
+            | if self.settings.soft_sun { SOFT_SUN } else { 0 };
         frame.options[1] = self.settings.bounces;
         frame.options[2] = self.settings.samples;
-        let bytes = u64::from(rw) * u64::from(rh) * 16;
+        let bytes = u64::from(rw) * u64::from(rh) * PIXEL_BYTES;
         if self.present.is_none() {
             self.present = Some(checked_pipeline(device, || Present::new(device, format))?);
         }
+        if (self.settings.denoiser || self.settings.progressive) && self.post.is_none() {
+            self.post = Some(checked_pipeline(device, || post::Post::new(device))?);
+        }
+        let history = if self.settings.progressive {
+            let moving_unchanged = match self.settings.mode {
+                Mode::Software => self
+                    .software
+                    .as_ref()
+                    .is_some_and(|s| s.last_moving == moving.words),
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                Mode::Hardware => self
+                    .hardware
+                    .as_ref()
+                    .is_some_and(|h| h.moving_unchanged(moving)),
+                _ => false,
+            };
+            Some(self.history.prepare(
+                &mut frame,
+                world.revision,
+                world.textures.bytes().len(),
+                self.settings.mode,
+                moving_unchanged,
+            ))
+        } else {
+            self.history.reset();
+            frame.sampling = [0; 4];
+            None
+        };
         let image = match self.settings.mode {
             Mode::Software => {
                 if self.software.is_none() {
@@ -583,8 +652,10 @@ impl Lighter {
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 {
                     if self.hardware.is_none() {
-                        self.hardware =
-                            Some(vulkan::Renderer::new(device, &[BASE, HARDWARE].concat())?);
+                        self.hardware = Some(vulkan::Renderer::new(
+                            device,
+                            &[PIXELS, BASE, HARDWARE].concat(),
+                        )?);
                     }
                     self.hardware.as_mut().unwrap().trace(
                         device,
@@ -603,12 +674,26 @@ impl Lighter {
             }
             Mode::Off => return Err("Lighter render requested while off".into()),
         };
+        let image = if let Some(post) = &mut self.post {
+            post.process(
+                device,
+                queue,
+                encoder,
+                image,
+                frame.extent,
+                history,
+                self.settings.denoiser,
+            )
+        } else {
+            image
+        };
         self.present.as_ref().unwrap().draw(
             device,
             queue,
             encoder,
             image,
             frame.extent,
+            self.settings.denoiser,
             target,
             depth,
         );
@@ -636,7 +721,18 @@ impl Lighter {
             "Ray-traced lighting / indirect bounce",
         );
         ui.checkbox(&mut self.settings.shadows, "Ray-traced shadows");
+        ui.add_enabled(
+            self.settings.shadows,
+            egui::Checkbox::new(&mut self.settings.soft_sun, "Soft sun shadows"),
+        )
+        .on_hover_text(
+            "Sample across the sun's angular disc. Point lights still cast sharp shadows.",
+        );
         ui.checkbox(&mut self.settings.reflections, "Ray-traced reflections");
+        ui.checkbox(&mut self.settings.denoiser, "Edge-aware denoiser")
+            .on_hover_text("Filter linear radiance using primary depth, normals and albedo. Never changes output depth.");
+        ui.checkbox(&mut self.settings.progressive, "Progressive sampling while still")
+            .on_hover_text("Accumulate new lighting samples while the camera and scene are stable. Movement or changed lighting discards incompatible history.");
         ui.add(egui::Slider::new(&mut self.settings.bounces,0..=4).text("Secondary bounces"))
             .on_hover_text("0 traces primary visibility and direct shadows only. Reflection and water transmission need at least one bounce.");
         ui.add(egui::Slider::new(&mut self.settings.samples, 1..=4).text("Samples per pixel"));
@@ -646,6 +742,7 @@ impl Lighter {
                 .suffix("%"),
         );
         if self.settings != old {
+            self.reset_history();
             self.persistence_error = self.settings.save().err();
             self.frame_error = None;
             self.status = None;

@@ -204,8 +204,8 @@ impl Feed {
             let id = builder.surface(Surface::new(0, 0, 0., 0.));
             builder.world_mesh(&span(&m.vertices, extras, id, |v| rgba(v.color))?)?;
         }
-        for page in &m.local_pages {
-            building(&mut builder, &mut bank, page)?;
+        for (page, gloss) in m.local_pages.iter().zip(&m.local_gloss) {
+            building(&mut builder, &mut bank, page, gloss)?;
         }
         self.vegetation(m, &mut builder, &mut bank)?;
         Ok((builder.finish(), bank))
@@ -421,6 +421,7 @@ impl Feed {
             ],
             sun_disc: disc(f.sky_sun),
             moon_disc: disc(f.sky_moon),
+            sampling: [0; 4],
         }
     }
 }
@@ -664,6 +665,7 @@ fn building(
     builder: &mut Builder,
     textures: &mut Textures,
     page: &crate::world_objects::Page,
+    gloss: &[Gloss],
 ) -> Result<(), String> {
     let mut mesh = Mesh::default();
     mesh.vertices = page
@@ -676,7 +678,7 @@ fn building(
         .collect();
     let mut tiles = HashMap::new();
     let mut ids = HashMap::new();
-    let mut append = |index: &[u32], visibility: u32| -> Result<(), String> {
+    let mut append = |index: &[u32], visibility: u32, gloss: Gloss| -> Result<(), String> {
         for tri in index.chunks_exact(3) {
             let v = &page.vertices[tri[0] as usize];
             let is_sdr = (v.kind > 2.01 && v.kind < 2.03) || (v.kind > 2.11 && v.kind < 2.13);
@@ -708,15 +710,15 @@ fn building(
             if (v.kind > 1.05 && v.kind < 1.15) || (v.kind > 1.5 && v.kind < 2.05 && !is_sdr) {
                 flags |= CULL_BACK;
             }
-            let id = builder.surface(Surface::new(tex, flags, 0.5, 0.));
+            let id = builder.surface(Surface::new(tex, flags, 0.5, 0.).with_gloss(gloss));
             mesh.tri([tri[0], tri[1], tri[2]], id);
         }
         Ok(())
     };
     if page.placements.is_empty() {
-        append(&page.indices, 0)?;
+        append(&page.indices, 0, Gloss::default())?;
     }
-    for range in &page.placements {
+    for (range, &gloss) in page.placements.iter().zip(gloss) {
         let flags = if range.visibility.reflect {
             0
         } else {
@@ -729,6 +731,7 @@ fn building(
         append(
             &page.indices[range.start as usize..range.end as usize],
             flags,
+            gloss,
         )?;
     }
     builder.world_mesh(&mesh)
@@ -785,6 +788,7 @@ impl super::Renderer {
         let depth = self.depth.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
         if self.lighter.error().is_some() || self.local_scenery_skipped {
+            self.lighter.reset_history();
             Lighter::clear(&mut encoder, target, &depth);
             self.queue.submit(Some(encoder.finish()));
             return;
