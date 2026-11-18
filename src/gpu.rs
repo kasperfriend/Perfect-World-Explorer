@@ -4083,11 +4083,14 @@ fn imaginator_lights(
             let d = glam::Vec3::from_array(l.position).distance_squared(eye);
             (d, l)
         })
-        // Outside its own range a light contributes nothing, so a lamp across the
-        // map is not a candidate however bright it is.
-        .filter(|(d, l)| *d <= l.range * l.range)
         .collect();
-    candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // A light can affect visible geometry even when the camera is outside its
+    // range. Rank by distance to its influence sphere instead of discarding it.
+    candidates.sort_by(|a, b| {
+        let da = (a.0.sqrt() - a.1.range).max(0.);
+        let db = (b.0.sqrt() - b.1.range).max(0.);
+        da.total_cmp(&db)
+    });
     candidates
         .into_iter()
         .take(MAX_TRACED_LIGHTS)

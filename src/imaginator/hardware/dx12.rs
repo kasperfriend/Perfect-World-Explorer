@@ -93,15 +93,9 @@ pub fn module_candidates() -> Vec<std::path::PathBuf> {
 /// same string.
 pub const MODULE_DIR: &str = "Modules/Imaginator";
 
-/// The shader's `Params` block in 32-bit floats: ten `float4`/`uint4` members,
-/// i.e. 160 bytes, which is `PARAMS_BYTES` below.
-pub const PARAMS_FLOATS: usize = 40;
-
-/// The shader's `Params` block: ten `float4`/`uint4` members, 160 bytes. It is
-/// declared in `tools/imaginator-shaders/dxr_trace.hlsl` and mirrored field for
-/// field by `imaginator::gpu::GpuParams`. The root CBV points at a GPU buffer
-/// containing these bytes.
-pub const PARAMS_BYTES: usize = 160;
+/// DXR camera parameters, light count, and 32 position/colour pairs.
+pub const PARAMS_FLOATS: usize = 44 + 32 * 8;
+pub const PARAMS_BYTES: usize = PARAMS_FLOATS * 4;
 
 /// `DXGI_FORMAT_R32G32B32A32_FLOAT`, the trace output's format. `winapi` spells
 /// this as an enum variant, which the offline shim types as a bare integer, so it
@@ -519,7 +513,7 @@ impl HardwareTracer {
     /// texture, the buffer and the views are all created on the raw device, which
     /// is what keeps this path independent of what the frame's own renderer does.
     ///
-    /// `params` is the shader's 160-byte `Params` block; `bindings` are the four
+    /// `params` is the shader's `Params` block; `bindings` are the four
     /// read-only buffers — the per-triangle records, the material table, and the
     /// two the trace reads for its tree and ground masks — in the order the root
     /// signature's SRV table declares them.

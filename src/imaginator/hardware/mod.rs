@@ -34,7 +34,7 @@ pub const DXIL_FILE: &str = "imaginator/dxr_trace.cso";
 
 /// The shader's `Params` block in 32-bit floats: ten `float4`/`uint4` members.
 #[cfg(not(windows))]
-pub const PARAMS_FLOATS: usize = 40;
+pub const PARAMS_FLOATS: usize = 44 + 32 * 8;
 
 /// Where the module directory may be, most specific first.
 ///

@@ -289,6 +289,48 @@ enum CaptureState {
     Done,
 }
 
+/// DXR currently uses one constant material per primitive. Bake the bounded
+/// terrain preview at triangle centroids; foliage cutouts and detailed textures
+/// still require a separate GPU texture/any-hit implementation.
+fn pack_hardware_materials(bvh: &bvh::Bvh, source: &[bvh::Material]) -> (Vec<u8>, Vec<u8>) {
+    let mut normals = Vec::with_capacity(bvh.triangles.len() * 16);
+    let mut materials = Vec::with_capacity(source.len() * 16);
+    for material in source {
+        for value in [
+            material.albedo.x,
+            material.albedo.y,
+            material.albedo.z,
+            material.specular,
+        ] {
+            materials.extend_from_slice(&value.to_ne_bytes());
+        }
+    }
+    for (index, tri) in bvh.triangles.iter().enumerate() {
+        let mut material = tri.material as usize;
+        if tri.material == bvh::material::TERRAIN {
+            if let Some((rgba, _)) = bvh.surface_sample(index as u32, [1. / 3., 1. / 3.]) {
+                let linear = |c: u8| {
+                    let c = c as f32 / 255.;
+                    if c <= 0.04045 {
+                        c / 12.92
+                    } else {
+                        ((c + 0.055) / 1.055).powf(2.4)
+                    }
+                };
+                let specular = source.get(material).map(|m| m.specular).unwrap_or(0.);
+                material = materials.len() / 16;
+                for value in [linear(rgba[0]), linear(rgba[1]), linear(rgba[2]), specular] {
+                    materials.extend_from_slice(&value.to_ne_bytes());
+                }
+            }
+        }
+        for value in [tri.normal.x, tri.normal.y, tri.normal.z, material as f32] {
+            normals.extend_from_slice(&value.to_ne_bytes());
+        }
+    }
+    (normals, materials)
+}
+
 impl Imaginator {
     pub fn new(client_root: &Path) -> Self {
         let directory = client_root.join(DIRECTORY);
@@ -966,18 +1008,7 @@ impl Imaginator {
                 .bvh
                 .as_ref()
                 .ok_or("this world has no captured geometry")?;
-            let mut normals = Vec::with_capacity(bvh.triangles.len() * 16);
-            for t in &bvh.triangles {
-                for value in [t.normal.x, t.normal.y, t.normal.z, t.material as f32] {
-                    normals.extend_from_slice(&value.to_ne_bytes());
-                }
-            }
-            let mut materials = Vec::with_capacity(self.scene.materials.len() * 16);
-            for m in &self.scene.materials {
-                for value in [m.albedo.x, m.albedo.y, m.albedo.z, m.specular] {
-                    materials.extend_from_slice(&value.to_ne_bytes());
-                }
-            }
+            let (normals, materials) = pack_hardware_materials(bvh, &self.scene.materials);
             self.hardware_records = Some((self.generation, normals, materials));
         }
         // The top-level structure for the traversal. This build is the one place
@@ -1037,6 +1068,14 @@ impl Imaginator {
         }
         for (index, value) in params.screen.iter().enumerate() {
             block[36 + index] = *value;
+        }
+        let eye = V3::from_array([params.eye[0], params.eye[1], params.eye[2]]);
+        let lights = self.gpu_lights(eye);
+        block[40] = f32::from_bits(lights.len() as u32);
+        for (index, light) in lights.iter().enumerate() {
+            let start = 44 + index * 8;
+            block[start..start + 4].copy_from_slice(&light.position_range);
+            block[start + 4..start + 8].copy_from_slice(&light.colour);
         }
         let bytes: Vec<u8> = block.iter().flat_map(|value| value.to_ne_bytes()).collect();
         let (_, normals, materials) = self
@@ -1498,7 +1537,7 @@ impl Imaginator {
             }
         });
         if self.settings.output == settings::Output::TraceOnly {
-            ui.label("Experimental full trace: flat material colours; textures and foliage cutouts are not yet supported.");
+            ui.label("Experimental full trace: software samples tree cutouts and approximate terrain colour. DXR terrain colour is per triangle; building textures, DXR foliage cutouts and effects are not yet supported. Raster rendering still runs before this view.");
             changed |= ui
                 .add(
                     egui::Slider::new(&mut self.settings.exposure, 0.05..=8.0)
@@ -1781,6 +1820,39 @@ mod tests {
                 assert_eq!(covered, height, "{height}/{slice} covers {covered} rows");
             }
         }
+    }
+
+    #[test]
+    fn hardware_terrain_material_uses_preview_and_preserves_other_ids() {
+        use super::math::v3;
+        use super::{bvh, pack_hardware_materials};
+        use std::sync::Arc;
+        let terrain = bvh::Triangle {
+            a: v3(0., 0., 0.),
+            b: v3(1., 0., 0.),
+            c: v3(0., 0., 1.),
+            normal: v3(0., 1., 0.),
+            material: bvh::material::TERRAIN,
+        };
+        let mut building = terrain;
+        building.material = bvh::material::SCENERY;
+        let mut bvh = bvh::Bvh::build(vec![terrain, building]);
+        bvh.terrain_albedo = Some(Arc::new(bvh::TerrainAlbedo {
+            origin: [0., 0.],
+            extent: [1., 1.],
+            width: 1,
+            height: 1,
+            rgba: vec![255, 0, 0, 255],
+        }));
+        let scene = bvh::Scene::with_builtin_materials();
+        let (normals, materials) = pack_hardware_materials(&bvh, &scene.materials);
+        let word = |bytes: &[u8], offset: usize| {
+            f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        };
+        assert_eq!(word(&normals, 12) as usize, scene.materials.len());
+        assert_eq!(word(&normals, 28) as u16, bvh::material::SCENERY);
+        assert_eq!(word(&materials, scene.materials.len() * 16), 1.);
+        assert_eq!(word(&materials, scene.materials.len() * 16 + 4), 0.);
     }
 
     /// Building DXR structures is only for the hardware tracer.

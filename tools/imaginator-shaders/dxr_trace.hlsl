@@ -30,7 +30,9 @@ struct Params
     float4 sky_up;
     float4 sky_horizon;
     uint4  config;       // x bounces, y sample, z samples, w term mask
-    float4 screen;       // x aspect, y height, z scene limit, w unused
+    float4 screen;       // x aspect, y height, z scene limit, w fog distance
+    uint4 light_info;    // x count, at most 32
+    float4 light_data[64]; // interleaved position/range and colour
 };
 
 ConstantBuffer<Params> p : register(b0);
@@ -90,6 +92,40 @@ float sun_visibility(float3 position, float3 normal, inout uint seed)
     q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
     q.Proceed();
     return q.CommittedStatus() == COMMITTED_NOTHING ? 1.0 : 0.0;
+}
+
+// Range-limited direct point lighting, with an independent shadow ray.
+float3 point_lighting(float3 position, float3 normal, uint terms)
+{
+    float3 sum = float3(0, 0, 0);
+    for (uint i = 0; i < min(p.light_info.x, 32u); ++i)
+    {
+        float4 source = p.light_data[i * 2u];
+        float3 delta = source.xyz - position;
+        float d2 = dot(delta, delta);
+        float r2 = source.w * source.w;
+        if (d2 <= 1e-8 || d2 >= r2) { continue; }
+        float d = sqrt(d2);
+        float3 dir = delta / d;
+        float cosine = max(dot(normal, dir), 0.0);
+        if (cosine <= 0.0) { continue; }
+        if ((terms & TERM_SHADOWS) != 0u)
+        {
+            RayDesc ray;
+            ray.Origin = position + normal * 0.02 + dir * 0.02;
+            ray.Direction = dir;
+            ray.TMin = 0.0;
+            ray.TMax = max(d * 0.999 - 0.02, 0.0);
+            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> q;
+            q.TraceRayInline(scene, RAY_FLAG_NONE, 0xFF, ray);
+            q.Proceed();
+            if (q.CommittedStatus() != COMMITTED_NOTHING) { continue; }
+        }
+        float window = 1.0 - d2 / r2;
+        float falloff = window * window * (r2 * 0.0625) / (d2 + 1.0);
+        sum += p.light_data[i * 2u + 1u].rgb * (cosine * falloff);
+    }
+    return sum;
 }
 
 struct Hit
@@ -174,6 +210,7 @@ void cs(uint3 id : SV_DispatchThreadID)
     float3 reflection = float3(0.0, 0.0, 0.0);
     float3 indirect = float3(0.0, 0.0, 0.0);
     float3 full_direct = float3(0.0, 0.0, 0.0);
+    float3 lamps = float3(0.0, 0.0, 0.0);
     float visibility = 0.0;
     float distance = 0.0;
     float hits = 0.0;
@@ -208,6 +245,7 @@ void cs(uint3 id : SV_DispatchThreadID)
         float4 mat = material_of(hit.primitive);
         if ((terms & TERM_LIGHTING) != 0u)
         {
+            lamps += mat.rgb * point_lighting(position, normal, terms);
             if ((terms & TERM_FULL_TRACE) != 0u)
             {
                 full_direct += mat.rgb * (p.sun_color.rgb * (lit * vis) + sky(normal.y));
@@ -317,10 +355,10 @@ void cs(uint3 id : SV_DispatchThreadID)
     // back, and the picture was wrong in a way no status line could show.
     float inv = 1.0 / float(samples);
     float mean_visibility = hits > 0.0 ? visibility * inv : 0.0;
-    float3 radiance = (reflection + indirect * mean_visibility) * inv;
+    float3 radiance = (reflection + indirect * mean_visibility + lamps) * inv;
     if ((terms & TERM_FULL_TRACE) != 0u)
     {
-        out_tex[int2(id.xy)] = float4((full_direct + reflection + indirect) * inv, 1.0);
+        out_tex[int2(id.xy)] = float4((full_direct + reflection + indirect + lamps) * inv, 1.0);
     }
     else
     {

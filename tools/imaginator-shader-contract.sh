@@ -23,8 +23,8 @@ grep -q 'let radiance = s.reflection + s.indirect \* s.occlusion;' "$PACKER" \
 
 # 2. The shader writes colour into rgb and visibility into a, with the same
 #    negative-for-sky signal.
-grep -q 'float3 radiance = (reflection + indirect \* mean_visibility) \* inv;' "$SHADER" \
-  || fail "the shader must build its rgb as reflection + indirect*visibility (see Tracer::pack)"
+grep -q 'float3 radiance = (reflection + indirect \* mean_visibility + lamps) \* inv;' "$SHADER" \
+  || fail "the shader must include reflection, indirect*visibility and direct lamps"
 grep -q 'hits > 0.0 ? mean_visibility : -1.0' "$SHADER" \
   || fail "the shader's alpha must be sun visibility, and -1 for a ray that escaped"
 
