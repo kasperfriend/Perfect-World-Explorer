@@ -28,15 +28,38 @@ struct Camera {
     yaw: f32,
     pitch: f32,
 }
-fn camera_vertex(t: &Terrain, c: &Camera, x: usize, y: usize) -> Vertex {
+struct View<'a> {
+    camera: &'a Camera,
+    yaw: (f32, f32),
+    pitch: (f32, f32),
+}
+impl<'a> View<'a> {
+    fn new(c: &'a Camera) -> Self {
+        Self {
+            camera: c,
+            yaw: c.yaw.sin_cos(),
+            pitch: c.pitch.sin_cos(),
+        }
+    }
+}
+fn camera_vertex(
+    t: &Terrain,
+    view: &View,
+    reader: &mut crate::terrain_store::Reader,
+    x: usize,
+    y: usize,
+) -> Vertex {
+    let c = view.camera;
     let dx = x as f32 - c.x;
     let dy = y as f32 - c.y;
-    let dz = t.heights.at(y * t.width + x) / t.grid_spacing - c.altitude;
-    let (s, co) = c.yaw.sin_cos();
+    let (h, n) = reader
+        .cell(y * t.width + x)
+        .expect("lossless terrain backing store read failed");
+    let dz = h / t.grid_spacing - c.altitude;
+    let (s, co) = view.yaw;
     let right = dx * co - dy * s;
     let forward = dx * s + dy * co;
-    let (sp, cp) = c.pitch.sin_cos();
-    let n = t.normals.at(y * t.width + x);
+    let (sp, cp) = view.pitch;
     let lighting = (0.55
         + (n[0] as f32 * -0.32 + n[1] as f32 * 0.82 + n[2] as f32 * 0.46).max(0.) / 127. * 0.45)
         .clamp(0.35, 1.0);
@@ -46,7 +69,7 @@ fn camera_vertex(t: &Terrain, c: &Camera, x: usize, y: usize) -> Vertex {
         z: forward * cp + dz * sp,
         wx: x as f32,
         wy: y as f32,
-        wh: t.heights.at(y * t.width + x),
+        wh: h,
         light: lighting,
         tu: 0.,
         tv: 0.,
@@ -65,22 +88,29 @@ fn lerp(a: Vertex, b: Vertex, t: f32) -> Vertex {
         tv: a.tv + (b.tv - a.tv) * t,
     }
 }
-fn clip_near(input: &[Vertex]) -> Vec<Vertex> {
-    let mut out = Vec::with_capacity(4);
-    let mut a = input[input.len() - 1];
-    for &b in input {
+fn clip_near_stack(v: [Vertex; 3]) -> ([Vertex; 4], usize) {
+    if v.iter().all(|p| p.z >= NEAR) {
+        return ([v[0], v[1], v[2], v[2]], 3);
+    }
+    let mut out = [v[0]; 4];
+    let mut n = 0;
+    let mut a = v[2];
+    for b in v {
         let ai = a.z >= NEAR;
         let bi = b.z >= NEAR;
         if ai != bi {
-            out.push(lerp(a, b, (NEAR - a.z) / (b.z - a.z)));
+            out[n] = lerp(a, b, (NEAR - a.z) / (b.z - a.z));
+            n += 1;
         }
         if bi {
-            out.push(b);
+            out[n] = b;
+            n += 1;
         }
         a = b;
     }
-    out
+    (out, n)
 }
+
 fn project(v: Vertex) -> Vertex {
     let f = 600.;
     Vertex {
@@ -163,26 +193,28 @@ fn triangle(
 fn clipped_triangle(
     frame: &mut [u32],
     depth: &mut [f32],
-    a: Vertex,
-    b: Vertex,
-    c: Vertex,
+    face: [Vertex; 3],
     color: u32,
-    materials: &crate::material::Materials,
+    materials: Option<&crate::material::Materials>,
+    texture: Option<&crate::objects::Texture>,
 ) {
-    let p = clip_near(&[a, b, c]);
-    if p.len() < 3 {
+    let (mut p, n) = clip_near_stack(face);
+    if n < 3 {
         return;
     }
-    for i in 1..p.len() - 1 {
+    for v in &mut p[..n] {
+        *v = project(*v);
+    }
+    for i in 1..n - 1 {
         triangle(
             frame,
             depth,
-            project(p[0]),
-            project(p[i]),
-            project(p[i + 1]),
+            p[0],
+            p[i],
+            p[i + 1],
             color,
-            Some(materials),
-            None,
+            materials,
+            texture,
         );
     }
 }
@@ -197,7 +229,7 @@ fn default_camera(t: &Terrain) -> Camera {
         pitch: -0.15,
     }
 }
-fn draw(t: &Terrain, cam: &Camera, frame: &mut [u32], depth: &mut [f32]) {
+fn draw(t: &Terrain, view: &View, frame: &mut [u32], depth: &mut [f32]) {
     for y in 0..H {
         let f = y as f32 / H as f32;
         let r = (85. + 45. * f) as u32;
@@ -206,28 +238,36 @@ fn draw(t: &Terrain, cam: &Camera, frame: &mut [u32], depth: &mut [f32]) {
         frame[y * W..(y + 1) * W].fill((r << 16) | (g << 8) | b);
     }
     depth.fill(0.);
-    let step = 1usize;
-    let startx = (((cam.x - FAR).max(0.) as usize) / step) * step;
-    let starty = (((cam.y - FAR).max(0.) as usize) / step) * step;
+    let cam = view.camera;
+    let startx = (cam.x - FAR).max(0.) as usize;
+    let starty = (cam.y - FAR).max(0.) as usize;
     let endx = ((cam.x + FAR) as usize).min(t.width - 1);
     let endy = ((cam.y + FAR) as usize).min(t.height - 1);
-    for y in (starty..endy).step_by(step) {
-        for x in (startx..endx).step_by(step) {
-            let xx = (x + step).min(t.width - 1);
-            let yy = (y + step).min(t.height - 1);
-            let a = camera_vertex(t, cam, x, y);
-            let b = camera_vertex(t, cam, xx, y);
-            let c = camera_vertex(t, cam, x, yy);
-            let d = camera_vertex(t, cam, xx, yy);
-            if a.z < NEAR && b.z < NEAR && c.z < NEAR && d.z < NEAR {
-                continue;
+    if startx >= endx || starty >= endy {
+        return;
+    }
+    // Overwrite the previous scanline in place. A grid corner is sampled and
+    // transformed once even when four terrain quads share it.
+    let mut reader = t.heights.reader();
+    let mut row: Vec<_> = (startx..=endx)
+        .map(|x| camera_vertex(t, view, &mut reader, x, starty))
+        .collect();
+    for y in starty..endy {
+        let mut a = row[0];
+        let mut c = camera_vertex(t, view, &mut reader, startx, y + 1);
+        row[0] = c;
+        for (i, next) in row[1..].iter_mut().enumerate() {
+            let b = *next;
+            let d = camera_vertex(t, view, &mut reader, startx + i + 1, y + 1);
+            *next = d;
+            if !(a.z < NEAR && b.z < NEAR && c.z < NEAR && d.z < NEAR
+                || a.z > FAR && b.z > FAR && c.z > FAR && d.z > FAR)
+            {
+                clipped_triangle(frame, depth, [a, b, c], 0, Some(&t.materials), None);
+                clipped_triangle(frame, depth, [b, d, c], 0, Some(&t.materials), None);
             }
-            if a.z > FAR && b.z > FAR && c.z > FAR && d.z > FAR {
-                continue;
-            }
-            let rgb = 0;
-            clipped_triangle(frame, depth, a, b, c, rgb, &t.materials);
-            clipped_triangle(frame, depth, b, d, c, rgb, &t.materials);
+            a = b;
+            c = d;
         }
     }
 }
@@ -239,12 +279,7 @@ fn normalize(v: [f32; 3]) -> [f32; 3] {
         [v[0] / len, v[1] / len, v[2] / len]
     }
 }
-fn model_vertex(
-    t: &Terrain,
-    cam: &Camera,
-    model: &crate::bmd::Model,
-    v: &crate::bmd::Vertex,
-) -> Vertex {
+fn model_basis(model: &crate::bmd::Model) -> [[f32; 3]; 3] {
     let z = normalize(model.direction);
     let y = normalize(model.up);
     let x = normalize([
@@ -252,6 +287,15 @@ fn model_vertex(
         y[2] * z[0] - y[0] * z[2],
         y[0] * z[1] - y[1] * z[0],
     ]);
+    [x, y, z]
+}
+fn model_vertex(
+    t: &Terrain,
+    view: &View,
+    [x, y, z]: [[f32; 3]; 3],
+    model: &crate::bmd::Model,
+    v: &crate::bmd::Vertex,
+) -> Vertex {
     let mut w = model.position;
     let mut n = [0.; 3];
     for i in 0..3 {
@@ -262,13 +306,14 @@ fn model_vertex(
     }
     let gx = w[0] / t.grid_spacing + t.width as f32 * 0.5;
     let gy = t.height as f32 * 0.5 - w[2] / t.grid_spacing;
+    let cam = view.camera;
     let dx = gx - cam.x;
     let dy = gy - cam.y;
     let dz = w[1] / t.grid_spacing - cam.altitude;
-    let (s, co) = cam.yaw.sin_cos();
+    let (s, co) = view.yaw;
     let right = dx * co - dy * s;
     let forward = dx * s + dy * co;
-    let (sp, cp) = cam.pitch.sin_cos();
+    let (sp, cp) = view.pitch;
     let n = normalize(n);
     let light = (0.55 + (-n[0] * 0.32 + n[1] * 0.82 + n[2] * 0.46).max(0.) * 0.45).clamp(0.35, 1.);
     Vertex {
@@ -283,16 +328,17 @@ fn model_vertex(
         tv: v.uv[1],
     }
 }
-fn point_in_world(t: &Terrain, cam: &Camera, x: f32, y: f32, z: f32) -> Vertex {
+fn point_in_world(t: &Terrain, view: &View, x: f32, y: f32, z: f32) -> Vertex {
     let gx = x / t.grid_spacing + t.width as f32 * 0.5;
     let gy = t.height as f32 * 0.5 - z / t.grid_spacing;
+    let cam = view.camera;
     let dx = gx - cam.x;
     let dy = gy - cam.y;
     let dz = y / t.grid_spacing - cam.altitude;
-    let (s, co) = cam.yaw.sin_cos();
+    let (s, co) = view.yaw;
     let right = dx * co - dy * s;
     let forward = dx * s + dy * co;
-    let (sp, cp) = cam.pitch.sin_cos();
+    let (sp, cp) = view.pitch;
     Vertex {
         x: right,
         y: dz * cp - forward * sp,
@@ -305,7 +351,7 @@ fn point_in_world(t: &Terrain, cam: &Camera, x: f32, y: f32, z: f32) -> Vertex {
         tv: 0.,
     }
 }
-fn draw_water(t: &Terrain, cam: &Camera, frame: &mut [u32], depth: &mut [f32]) {
+fn draw_water(t: &Terrain, view: &View, frame: &mut [u32], depth: &mut [f32]) {
     for area in &t.water {
         let halfx = area.columns as f32 * area.grid_size * 0.5;
         let halfz = area.rows as f32 * area.grid_size * 0.5;
@@ -319,10 +365,10 @@ fn draw_water(t: &Terrain, cam: &Camera, frame: &mut [u32], depth: &mut [f32]) {
                 let x = x0 + col as f32 * area.grid_size;
                 let z = z0 - row as f32 * area.grid_size;
                 let size = area.grid_size;
-                let a = point_in_world(t, cam, x, area.height, z);
-                let b = point_in_world(t, cam, x + size, area.height, z);
-                let c = point_in_world(t, cam, x, area.height, z - size);
-                let d = point_in_world(t, cam, x + size, area.height, z - size);
+                let a = point_in_world(t, view, x, area.height, z);
+                let b = point_in_world(t, view, x + size, area.height, z);
+                let c = point_in_world(t, view, x, area.height, z - size);
+                let d = point_in_world(t, view, x + size, area.height, z - size);
                 if a.z < NEAR && b.z < NEAR && c.z < NEAR && d.z < NEAR {
                     continue;
                 }
@@ -330,19 +376,7 @@ fn draw_water(t: &Terrain, cam: &Camera, frame: &mut [u32], depth: &mut [f32]) {
                     continue;
                 }
                 for face in [[a, b, c], [b, d, c]] {
-                    let poly = clip_near(&face);
-                    for i in 1..poly.len().saturating_sub(1) {
-                        triangle(
-                            frame,
-                            depth,
-                            project(poly[0]),
-                            project(poly[i]),
-                            project(poly[i + 1]),
-                            area.color & 0x00ffffff,
-                            None,
-                            None,
-                        );
-                    }
+                    clipped_triangle(frame, depth, face, area.color & 0x00ffffff, None, None);
                 }
             }
         }
@@ -377,11 +411,14 @@ fn render(
         t.scenery_residency.evictions,
         t.scenery_residency.distance_culls
     );
-    draw(t, cam, frame, depth);
+    let view = View::new(cam);
+    draw(t, &view, frame, depth);
+    let mut vertices = Vec::new();
     for id in ornament_ids {
         let Some(model) = t.objects.get(id) else {
             return Err(format!("missing resident scenery model {id}"));
         };
+        let basis = model_basis(model);
         for mesh in &model.meshes {
             let Some(texture) = t.objects.texture(&mesh.texture) else {
                 return Err(format!(
@@ -389,11 +426,12 @@ fn render(
                     mesh.texture, id
                 ));
             };
-            let vertices: Vec<Vertex> = mesh
-                .vertices
-                .iter()
-                .map(|v| model_vertex(t, cam, model, v))
-                .collect();
+            vertices.clear();
+            vertices.extend(
+                mesh.vertices
+                    .iter()
+                    .map(|v| model_vertex(t, &view, basis, model, v)),
+            );
             for face in mesh.indices.chunks_exact(3) {
                 let a = vertices[face[0] as usize];
                 let b = vertices[face[1] as usize];
@@ -401,23 +439,11 @@ fn render(
                 if a.z < NEAR && b.z < NEAR && c.z < NEAR {
                     continue;
                 }
-                let poly = clip_near(&[a, b, c]);
-                for i in 1..poly.len().saturating_sub(1) {
-                    triangle(
-                        frame,
-                        depth,
-                        project(poly[0]),
-                        project(poly[i]),
-                        project(poly[i + 1]),
-                        0,
-                        None,
-                        Some(texture),
-                    );
-                }
+                clipped_triangle(frame, depth, [a, b, c], 0, None, Some(texture));
             }
         }
     }
-    draw_water(t, cam, frame, depth);
+    draw_water(t, &view, frame, depth);
     Ok(())
 }
 pub fn preview(t: &mut Terrain, output: &std::path::Path) -> Result<(), String> {
@@ -571,7 +597,7 @@ mod tests {
     }
     #[test]
     fn clips_near_plane() {
-        let p = clip_near(&[
+        let (p, n) = clip_near_stack([
             Vertex {
                 x: 0.,
                 y: 0.,
@@ -606,7 +632,7 @@ mod tests {
                 tv: 0.,
             },
         ]);
-        assert_eq!(p.len(), 4);
+        assert_eq!(n, 4);
         assert!(p.iter().all(|x| x.z >= NEAR - 0.0001));
     }
     #[test]

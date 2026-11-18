@@ -21,7 +21,9 @@ fn read_string(b: &[u8], pos: &mut usize) -> Result<String, String> {
     }
     let s = b.get(*pos..*pos + n).ok_or("truncated string")?;
     *pos += n;
-    String::from_utf8(s.to_vec()).map_err(|_| "non-UTF8 subterrain name".into())
+    std::str::from_utf8(s)
+        .map(str::to_owned)
+        .map_err(|e| format!("invalid string: {e}"))
 }
 mod angelica_pck;
 mod animation;
@@ -260,7 +262,6 @@ impl DecodeWindow {
 /// Blocks are decoded on several threads (see `decode_blocks`), so each worker
 /// keeps its own scratch and only the two finished arrays travel back to the
 /// builder. Reusing the rest keeps the per-block allocation count at two.
-#[derive(Default)]
 struct BlockScratch {
     decoded: Vec<u8>,
     values: Vec<f32>,
@@ -271,6 +272,19 @@ struct BlockScratch {
     normals: Vec<[i8; 3]>,
 }
 
+impl Default for BlockScratch {
+    fn default() -> Self {
+        Self {
+            decoded: Vec::with_capacity(65 * 65 * 4),
+            values: Vec::with_capacity(65 * 65),
+            normal_data: Vec::with_capacity(65 * 65 * 4),
+            block_normals: Vec::with_capacity(65 * 65),
+            decoded_colour: Vec::with_capacity(65 * 65 * 4),
+            heights: Vec::new(),
+            normals: Vec::new(),
+        }
+    }
+}
 /// Decode one block and move its two arrays out of the worker's scratch.
 fn decode_block_owned(
     tile: &TileDecode,

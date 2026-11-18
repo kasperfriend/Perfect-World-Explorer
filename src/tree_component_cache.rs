@@ -165,16 +165,19 @@ pub fn parse(
         }
         let branch_texture = r.text()?;
         let composite_texture = r.text()?;
-        let mut branches = Vec::new();
-        for _ in 0..r.levels()? {
+        let branch_lods = r.levels()?;
+        let mut branches = Vec::with_capacity(branch_lods as usize);
+        for _ in 0..branch_lods {
             branches.push(r.part().map_err(|e| format!("branch material: {e}"))?);
         }
-        let mut fronds = Vec::new();
-        for _ in 0..r.levels()? {
+        let frond_lods = r.levels()?;
+        let mut fronds = Vec::with_capacity(frond_lods as usize);
+        for _ in 0..frond_lods {
             fronds.push(r.part().map_err(|e| format!("frond material: {e}"))?);
         }
-        let mut leaves = Vec::new();
-        for _ in 0..r.levels()? {
+        let leaf_lods = r.levels()?;
+        let mut leaves = Vec::with_capacity(leaf_lods as usize);
+        for _ in 0..leaf_lods {
             leaves.push(r.leaf_lod().map_err(|e| format!("leaf material: {e}"))?);
         }
         if r.offset != data.len() {

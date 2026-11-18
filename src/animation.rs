@@ -103,8 +103,8 @@ impl<const N: usize> KeyTrack<N> {
         let mut length = 0;
         let mut compression = 0;
         if version == 1 {
-            let mut ordered = Vec::new();
-            let mut f = Vec::new();
+            let mut ordered = Vec::with_capacity(n);
+            let mut f = Vec::with_capacity(n);
             for _ in 0..segs {
                 let start = r.i32()?;
                 let end = r.i32()?;
@@ -250,7 +250,7 @@ impl TrackSet {
         if fps <= 0 || end < start {
             return Err("invalid animation range".into());
         }
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::with_capacity(n.min(4096));
         let mut tracks = Vec::with_capacity(n);
         for _ in 0..n {
             let id = r.i32()?;

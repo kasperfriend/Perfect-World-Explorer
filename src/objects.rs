@@ -26,7 +26,6 @@ use crate::{
         Resolution, TextureResolver,
     },
 };
-use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -57,12 +56,13 @@ impl Texture {
     }
 }
 fn content_hash(tex: &Texture) -> u64 {
-    let mut hasher = Sha256::new();
-    hasher.update((tex.width as u64).to_le_bytes());
-    hasher.update((tex.height as u64).to_le_bytes());
-    hasher.update(&tex.rgba);
-    let digest = hasher.finalize();
-    u64::from_le_bytes(digest[..8].try_into().unwrap())
+    let mut h: u64 = 0xcbf29ce484222325 ^ ((tex.width as u64) << 32) ^ (tex.height as u64);
+    for chunk in tex.rgba.chunks(8) {
+        let mut v = [0u8; 8];
+        v[..chunk.len()].copy_from_slice(chunk);
+        h = (h ^ u64::from_le_bytes(v)).wrapping_mul(0x100000001b3);
+    }
+    h
 }
 /// Measured residency counters (P3.08 acceptance: measured numbers, not
 /// estimates).
@@ -351,7 +351,7 @@ fn decode_texture_bytes(key: &str, data: &[u8]) -> Result<Texture, String> {
     };
     match decoded {
         Ok(img) => {
-            let img = img.to_rgba8();
+            let img = img.into_rgba8();
             let (w, h) = img.dimensions();
             Ok(Texture {
                 width: w as usize,

@@ -73,6 +73,37 @@ pub fn evaluate(
         local[bone] =
             Mat4::from_rotation_translation(Quat::from_array(rotation), Vec3::from_array(position));
     }
+    let topo = s
+        .bones
+        .iter()
+        .enumerate()
+        .all(|(i, b)| b.parent == -1 || (b.parent >= 0 && (b.parent as usize) < i));
+    if topo {
+        let mut absolute = local;
+        let mut skin = Vec::with_capacity(count);
+        for (index, bone) in s.bones.iter().enumerate() {
+            let initial = Mat4::from_cols_array(&bone.initial);
+            if !absolute[index].is_finite() || !initial.is_finite() {
+                return Err("nonfinite bone matrix".into());
+            }
+            absolute[index] = if bone.parent < 0 {
+                model * absolute[index]
+            } else {
+                absolute[bone.parent as usize] * absolute[index]
+            };
+            skin.push(absolute[index] * initial);
+            if !absolute[index].is_finite() || !skin[index].is_finite() {
+                return Err("nonfinite composed pose".into());
+            }
+        }
+        return Ok(Pose {
+            absolute,
+            skin,
+            model,
+        });
+    }
+    let mut absolute = vec![Mat4::IDENTITY; count];
+    let mut skin = vec![Mat4::IDENTITY; count];
     let mut children = vec![Vec::new(); count];
     let mut queue = VecDeque::new();
     for (index, bone) in s.bones.iter().enumerate() {
@@ -89,8 +120,6 @@ pub fn evaluate(
             return Err("nonfinite bone matrix".into());
         }
     }
-    let mut absolute = vec![Mat4::IDENTITY; count];
-    let mut skin = vec![Mat4::IDENTITY; count];
     let mut visited = 0;
     while let Some(i) = queue.pop_front() {
         let parent = s.bones[i].parent;
