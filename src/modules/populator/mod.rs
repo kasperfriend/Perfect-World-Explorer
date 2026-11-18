@@ -3019,7 +3019,13 @@ impl Populator {
             live.visible = live.failure.is_none()
                 && !live.wedged
                 && on_screen(matrix, live.position, live.head);
-            if live.failure.is_some() || live.wedged {
+            use super::lighter::coverage::Class::Populator as Class;
+            if live.failure.is_some() {
+                out.coverage[Class].invalid += 1;
+                continue;
+            }
+            if live.wedged {
+                out.coverage[Class].disabled += 1;
                 continue;
             }
             // Off-camera actors still exist in the ray scene (shadows,
@@ -3040,7 +3046,10 @@ impl Populator {
                         decode,
                     )?;
                 }
-                Err(error) => live.failure = Some(error),
+                Err(error) => {
+                    out.coverage[Class].invalid += 1;
+                    live.failure = Some(error);
+                }
             }
         }
         Ok(())

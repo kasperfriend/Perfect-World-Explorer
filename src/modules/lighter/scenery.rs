@@ -5,6 +5,7 @@
 use crate::{
     bmd_baked::{self, Cull, Stage},
     modules::lighter::{
+        coverage::Counts,
         scene::{self, Builder, Gloss, Mesh, MeshBudget, Surface, Vertex},
         textures::{Filter, Textures, Tile, COLOR_SIDE, MAX_TEXTURE_BYTES},
     },
@@ -33,16 +34,14 @@ type TileKey = (u64, Filter);
 pub(in crate::gpu) struct SceneryStream {
     catalog: Option<Arc<[Ornament]>>,
     manifest: Manifest,
-    assets: HashMap<usize, Option<Arc<Asset>>>,
+    assets: HashMap<usize, Result<Arc<Asset>, Omission>>,
     tiles: HashMap<TileKey, Weak<Tile>>,
 }
 
 pub(in crate::gpu) struct Snapshot {
     local: Vec<Arc<Asset>>,
     extra: Vec<Arc<Asset>>,
-    outside: usize,
-    deferred: usize,
-    unavailable: usize,
+    counts: Counts,
     catalog_chunks: usize,
     estimated_bounds: usize,
 }
@@ -51,10 +50,8 @@ pub(in crate::gpu) struct Snapshot {
 pub(in crate::gpu) struct Coverage {
     pub local: usize,
     pub extra: usize,
-    pub outside: usize,
-    pub deferred: usize,
-    pub unavailable: usize,
-    pub missing_textures: usize,
+    /// Final counts, after applying both the loader and the GPU packet budgets.
+    pub counts: Counts,
     pub catalog_chunks: usize,
     pub resident_chunks: usize,
     pub estimated_bounds: usize,
@@ -64,9 +61,28 @@ impl std::fmt::Display for Coverage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "BMD ray coverage: {} local + {} extended in {}/{} chunks; {} out of range/cutoff, {} budget-limited, {} unavailable, {} missing texture references, {} estimated bounds",
-            self.local, self.extra, self.resident_chunks, self.catalog_chunks, self.outside, self.deferred, self.unavailable, self.missing_textures, self.estimated_bounds
+            "BMD ray coverage: {} local + {} extended in {}/{} chunks; {} out of range, {} cutoff, {} budget-limited, {} failed, {} missing texture references, {} estimated bounds",
+            self.local, self.extra, self.resident_chunks, self.catalog_chunks, self.counts.range, self.counts.cutoff, self.counts.budget, self.counts.failed(), self.counts.texture_fallback, self.estimated_bounds
         )
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Omission {
+    Package,
+    Unavailable,
+    Invalid,
+    Empty,
+}
+
+impl Omission {
+    fn count(self, counts: &mut Counts) {
+        match self {
+            Self::Package => counts.package += 1,
+            Self::Unavailable => counts.unavailable += 1,
+            Self::Invalid => counts.invalid += 1,
+            Self::Empty => counts.empty += 1,
+        }
     }
 }
 
@@ -84,11 +100,9 @@ impl Asset {
     fn read(
         objects: &Objects,
         id: usize,
+        model: &crate::bmd::Model,
         tiles: &mut HashMap<TileKey, Weak<Tile>>,
     ) -> Result<Option<Self>, String> {
-        let Some(model) = objects.get(id) else {
-            return Ok(None);
-        };
         let visibility = Visibility::from_extra(objects.ornaments[id].extra);
         let visibility = if visibility.reflect {
             0
@@ -272,21 +286,29 @@ impl Budget {
 }
 
 impl SceneryStream {
-    fn read(&mut self, objects: &Objects, id: usize) -> Option<Arc<Asset>> {
+    fn read(&mut self, objects: &Objects, id: usize) -> Result<Arc<Asset>, Omission> {
         if let Some(asset) = self.assets.remove(&id) {
             return asset;
         }
-        match Asset::read(objects, id, &mut self.tiles) {
-            Ok(asset) => asset.map(|asset| {
+        let model = objects.get(id).ok_or_else(|| {
+            if objects.lit_archive_available() {
+                Omission::Unavailable
+            } else {
+                Omission::Package
+            }
+        })?;
+        match Asset::read(objects, id, model, &mut self.tiles) {
+            Ok(Some(asset)) => {
                 self.manifest.learned_bounds(id, asset.bounds);
-                Arc::new(asset)
-            }),
+                Ok(Arc::new(asset))
+            }
+            Ok(None) => Err(Omission::Empty),
             Err(error) => {
                 eprintln!(
                     "Lighter: BMD {:?} unavailable ({error})",
                     objects.ornaments[id].path
                 );
-                None
+                Err(Omission::Invalid)
             }
         }
     }
@@ -316,22 +338,32 @@ impl SceneryStream {
         let mut ids = HashSet::with_capacity(local_ids.len());
         let mut next = HashMap::new();
         let mut local = Vec::new();
-        let mut unavailable = 0;
+        let mut counts = Counts {
+            cutoff: self.manifest.cutoff_count(cutoff),
+            invalid: self.manifest.invalid_anchors(),
+            ..Counts::default()
+        };
         for &id in local_ids {
-            if ids.insert(id) {
+            if self.manifest.valid_anchor(id)
+                && crate::terrain_cutoff::contains(cutoff, objects.ornaments[id].position)
+                && ids.insert(id)
+            {
                 let asset = self.read(objects, id);
-                if let Some(asset) = &asset {
-                    local.push(asset.clone());
-                } else {
-                    unavailable += 1;
+                match &asset {
+                    Ok(asset) => local.push(asset.clone()),
+                    Err(reason) => reason.count(&mut counts),
                 }
                 next.insert(id, asset);
             }
         }
         let query = Query::new(center, local_reach, cutoff, lights);
         let mut order = self.manifest.select(&ids, &query);
-        let mut outside = objects.ornaments.len() - ids.len() - order.len();
-        let mut deferred = order.len().saturating_sub(EXTRA_PLACEMENTS);
+        counts.range = objects.ornaments.len()
+            - ids.len()
+            - order.len()
+            - counts.cutoff
+            - self.manifest.invalid_anchors();
+        counts.budget = order.len().saturating_sub(EXTRA_PLACEMENTS);
         order.truncate(EXTRA_PLACEMENTS);
         let mut budget = Budget {
             geometry: MeshBudget {
@@ -365,15 +397,15 @@ impl SceneryStream {
                 match asset {
                     // A first decode can invalidate a placement estimate. Do
                     // not publish geometry ranked out of the exact reach.
-                    Some(_) if !self.manifest.reachable(id, &query) => outside += 1,
-                    Some(asset) if budget.admit(&asset) => {
+                    Ok(_) if !self.manifest.reachable(id, &query) => counts.range += 1,
+                    Ok(asset) if budget.admit(&asset) => {
                         extra.push(asset.clone());
-                        next.insert(id, Some(asset));
+                        next.insert(id, Ok(asset));
                     }
-                    Some(_) => deferred += 1,
-                    None => {
-                        unavailable += 1;
-                        next.insert(id, None);
+                    Ok(_) => counts.budget += 1,
+                    Err(reason) => {
+                        reason.count(&mut counts);
+                        next.insert(id, Err(reason));
                     }
                 }
             }
@@ -383,9 +415,7 @@ impl SceneryStream {
         Ok(Snapshot {
             local,
             extra,
-            outside,
-            deferred,
-            unavailable,
+            counts,
             catalog_chunks: self.manifest.chunks(),
             estimated_bounds: self.manifest.estimated(),
         })
@@ -403,9 +433,7 @@ impl Snapshot {
         let mut chunks = BTreeMap::<_, Vec<(&Asset, Vec<u32>)>>::new();
         let mut coverage = Coverage {
             local: self.local.len(),
-            outside: self.outside,
-            deferred: self.deferred,
-            unavailable: self.unavailable,
+            counts: self.counts,
             catalog_chunks: self.catalog_chunks,
             estimated_bounds: self.estimated_bounds,
             ..Coverage::default()
@@ -422,7 +450,7 @@ impl Snapshot {
                 .entry(asset.block)
                 .or_default()
                 .push((asset, materials));
-            coverage.missing_textures += asset.missing;
+            coverage.counts.texture_fallback += asset.missing;
         }
         let mut budget = Budget {
             geometry,
@@ -441,9 +469,9 @@ impl Snapshot {
                     .or_default()
                     .push((asset, materials));
                 coverage.extra += 1;
-                coverage.missing_textures += asset.missing;
+                coverage.counts.texture_fallback += asset.missing;
             } else {
-                coverage.deferred += 1;
+                coverage.counts.budget += 1;
             }
         }
         coverage.resident_chunks = chunks.len();
@@ -457,6 +485,7 @@ impl Snapshot {
             }
             builder.chunk(scene::ChunkKey::Scenery(x, z), &mesh)?;
         }
+        coverage.counts.loaded = coverage.local + coverage.extra;
         Ok(coverage)
     }
 }

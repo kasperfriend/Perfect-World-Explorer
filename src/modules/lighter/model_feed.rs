@@ -2,6 +2,7 @@
 //! module keeps its native archive lookup and animation ownership. No draw
 //! queues, framebuffer data, or main-view frustum are needed here.
 use super::{
+    coverage::{Class, Inventory},
     scene::*,
     textures::{Filter, Textures},
 };
@@ -24,6 +25,7 @@ pub(crate) struct Posed<'a> {
 
 pub(crate) struct Moving<'a> {
     pub builder: Builder,
+    pub coverage: Inventory,
     effects: Mesh,
     textures: &'a mut Textures,
     layer: u32,
@@ -33,6 +35,7 @@ impl<'a> Moving<'a> {
     pub fn new(textures: &'a mut Textures) -> Self {
         Self {
             builder: Builder::default(),
+            coverage: Inventory::default(),
             effects: Mesh::default(),
             textures,
             layer: 0,
@@ -55,9 +58,21 @@ impl<'a> Moving<'a> {
             meshes,
             attached,
         } = model;
+        let class = match namespace {
+            "world" => Class::WorldModels,
+            "walker" => Class::Walker,
+            "populator" => Class::Populator,
+            _ => return Err(format!("unknown Lighter model namespace {namespace:?}")),
+        };
+        let counts = &mut self.coverage[class];
         let Ok(prepared) = crate::model_draw::prepare(asset, meshes) else {
+            counts.invalid += 1;
             return Ok(());
         };
+        if prepared.is_empty() {
+            counts.empty += 1;
+            return Ok(());
+        }
         let settings = asset.descriptor.render_settings();
         let mut geometry = Mesh::default();
         // An authored zero-scale/singular bone can collapse its skin. Do
@@ -90,6 +105,8 @@ impl<'a> Moving<'a> {
                     break;
                 }
             }
+            counts.texture_fallback +=
+                usize::from(loaded.is_none() && !part.texture_paths.is_empty());
             let (texture, alpha) = loaded.unwrap_or((0, false));
             let tint = argb_to_rgba(part.color)
                 .to_le_bytes()
@@ -136,7 +153,10 @@ impl<'a> Moving<'a> {
             }));
             append_triangles(&mut geometry, &part.indices, base, id);
         }
-        self.builder.posed_mesh(namespace, owner, &geometry, parent)
+        self.builder
+            .posed_mesh(namespace, owner, &geometry, parent)?;
+        counts.loaded += 1;
+        Ok(())
     }
 
     pub fn effects(
@@ -164,10 +184,16 @@ impl<'a> Moving<'a> {
                 }
                 | if q.tile { 0 } else { CLAMP_UV };
             if let Some(skin) = &q.mesh {
-                let (texture, has_alpha) = self
-                    .textures
-                    .archive(namespace, &skin.texture, Filter::Alpha, decode)?
-                    .unwrap_or((0, true));
+                if skin.vertices.len() < 3 {
+                    self.coverage[Class::EffectDraws].empty += 1;
+                    continue;
+                }
+                let loaded =
+                    self.textures
+                        .archive(namespace, &skin.texture, Filter::Alpha, decode)?;
+                self.coverage[Class::EffectDraws].texture_fallback += usize::from(loaded.is_none());
+                self.coverage[Class::EffectDraws].loaded += 1;
+                let (texture, has_alpha) = loaded.unwrap_or((0, true));
                 let mut flags = flags
                     | if skin.write_depth { WRITE_DEPTH } else { 0 }
                     | if skin.material.is_none() { EMISSIVE } else { 0 };
@@ -253,10 +279,12 @@ impl<'a> Moving<'a> {
         color: [[f32; 4]; 4],
         decode: &mut Decode<'_>,
     ) -> Result<(), String> {
-        let tex = self
+        let loaded = self
             .textures
-            .archive(namespace, name, Filter::Alpha, decode)?
-            .map_or(0, |v| v.0);
+            .archive(namespace, name, Filter::Alpha, decode)?;
+        self.coverage[Class::EffectDraws].texture_fallback += usize::from(loaded.is_none());
+        self.coverage[Class::EffectDraws].loaded += 1;
+        let tex = loaded.map_or(0, |v| v.0);
         let base = self.effects.vertices.len() as u32;
         let id = self
             .builder

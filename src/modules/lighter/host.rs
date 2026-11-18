@@ -5,6 +5,7 @@
 use super::{Camera, FrameSnapshot, MeshData, Vertex as WorldVertex};
 use crate::modules::lighter::{
     self,
+    coverage::{Class, Counts, Inventory},
     scene::*,
     textures::{Filter, Textures, Tile, COLOR_SIDE, MASK_SIDE},
     Lighter,
@@ -34,6 +35,7 @@ pub(super) struct Feed {
     far: Vec<(crate::terrain_residency::Span, Mesh)>,
     accel: AccelCache,
     trees: Vec<Option<Tree>>,
+    tree_archive_missing: bool,
     placements: Vec<crate::scene::Tree>,
     grass: HashMap<(Rect, Filter), Tile>,
     waves: Vec<u32>,
@@ -93,6 +95,7 @@ impl Feed {
                 )?);
             }
         }
+        result.tree_archive_missing = !t.element.join("trees.pck").is_file();
         for tree in &t.trees.types {
             let Some(tree) = tree else {
                 result.trees.push(None);
@@ -192,15 +195,19 @@ impl Feed {
         ray.scenery_coverage = result
             .as_ref()
             .ok()
-            .map(|(_, _, coverage)| coverage.to_string());
-        ray.install(result.map(|(packet, bank, _)| (packet, bank)));
+            .map(|(_, _, _, scenery)| scenery.to_string());
+        let packet = result.map(|(packet, bank, coverage, _)| {
+            ray.static_coverage = coverage;
+            (packet, bank)
+        });
+        ray.install(packet);
     }
 
     fn snapshot(
         &mut self,
         m: &MeshData,
         storage: usize,
-    ) -> Result<(Packet, Textures, scenery::Coverage), String> {
+    ) -> Result<(Packet, Textures, Inventory, scenery::Coverage), String> {
         if let Some(upload) = &m.terrain_upload {
             self.terrain_masks(&upload.materials)?;
         }
@@ -229,6 +236,7 @@ impl Feed {
         for &light in &self.static_lights {
             builder.light(light);
         }
+        let mut inventory = Inventory::default();
         let terrain_id = builder.surface(Surface::new(0, TERRAIN, 0., 0.));
         for block in &m.spans {
             let (x, y) = block.block;
@@ -239,8 +247,15 @@ impl Feed {
                 |_| u32::MAX,
             )?;
             builder.chunk(ChunkKey::NearTerrain(x, y), &near)?;
+            if near.triangles.is_empty() {
+                inventory[Class::NearTerrain].empty += 1;
+            } else {
+                inventory[Class::NearTerrain].loaded += 1;
+            }
         }
+        let far = &mut inventory[Class::FarTerrain];
         if m.detail.terrain_cutoff {
+            far.cutoff = self.far.len();
             crate::diag!(
                 TimingLoad,
                 "Lighter terrain cutoff: {} resident blocks; {} far patches intentionally omitted",
@@ -263,22 +278,33 @@ impl Feed {
                 let key = ChunkKey::FarTerrain(x, y);
                 if hi_x < x0 || lo_x > x1 || hi_z < z0 || lo_z > z1 {
                     builder.chunk(key, patch)?;
-                } else if !(lo_x >= x0 && hi_x <= x1 && lo_z >= z0 && hi_z <= z1) {
-                    builder.chunk(
-                        key,
-                        &stitch_patch(patch, &edges, self.near_bounds, terrain_id),
-                    )?;
+                    if patch.triangles.is_empty() {
+                        far.empty += 1;
+                    } else {
+                        far.loaded += 1;
+                    }
+                } else if lo_x >= x0 && hi_x <= x1 && lo_z >= z0 && hi_z <= z1 {
+                    far.replaced += 1;
+                } else {
+                    let exterior = stitch_patch(patch, &edges, self.near_bounds, terrain_id);
+                    builder.chunk(key, &exterior)?;
+                    if exterior.triangles.is_empty() {
+                        far.replaced += 1;
+                    } else {
+                        far.loaded += 1;
+                    }
                 }
             }
         }
         let water_mesh = water_mesh(m, &mut builder)?;
         builder.world_mesh(&water_mesh)?;
+        inventory[Class::Water] = m.water_coverage;
         let extras = &m.indices[m.terrain_end as usize..m.water_start as usize];
         if !extras.is_empty() {
             let id = builder.surface(Surface::new(0, 0, 0., 0.));
             builder.world_mesh(&span(&m.vertices, extras, id, |v| rgba(v.color))?)?;
         }
-        self.vegetation(m, &mut builder, &mut bank)?;
+        self.vegetation(m, &mut builder, &mut bank, &mut inventory)?;
         let scenery = m
             .ray_scenery
             .as_ref()
@@ -288,7 +314,13 @@ impl Feed {
                 .as_ref()
                 .map_err(Clone::clone)?
                 .append(&mut builder, &mut bank, storage)?;
-        Ok((builder.finish_cached(&mut self.accel), bank, coverage))
+        inventory[Class::Buildings] = coverage.counts;
+        Ok((
+            builder.finish_cached(&mut self.accel),
+            bank,
+            inventory,
+            coverage,
+        ))
     }
 
     fn vegetation(
@@ -296,23 +328,42 @@ impl Feed {
         m: &MeshData,
         builder: &mut Builder,
         textures: &mut Textures,
+        inventory: &mut Inventory,
     ) -> Result<(), String> {
-        if !super::skip_trees_test() && !super::ui_test() {
+        let trees = &mut inventory[Class::Trees];
+        if super::skip_trees_test() || super::ui_test() {
+            trees.disabled = self.placements.len();
+        } else {
             let mut ids = HashMap::<(usize, usize), Option<u32>>::new();
             let [cx, cz] = [m.tree_center.0, m.tree_center.1];
             let cutoff = m.detail.terrain_cutoff.then_some(self.near_bounds);
             for placement in &self.placements {
+                if !placement.position.iter().all(|x| x.is_finite()) {
+                    trees.invalid += 1;
+                    continue;
+                }
                 if !crate::terrain_cutoff::contains(cutoff, placement.position) {
+                    trees.cutoff += 1;
                     continue;
                 }
                 let type_id = placement.tree_type as usize;
-                let Some(Some(tree)) = self.trees.get(type_id) else {
+                let Some(tree) = self.trees.get(type_id) else {
+                    trees.invalid += 1;
+                    continue;
+                };
+                let Some(tree) = tree else {
+                    if self.tree_archive_missing {
+                        trees.package += 1;
+                    } else {
+                        trees.unavailable += 1;
+                    }
                     continue;
                 };
                 let Some(distance) = crate::tree_lod::client_distance(
                     placement.position,
                     [cx, placement.position[1], cz],
                 ) else {
+                    trees.invalid += 1;
                     continue;
                 };
                 let selection = crate::tree_lod::select(
@@ -332,6 +383,7 @@ impl Feed {
                     *id
                 } else {
                     let Some((source, materials)) = tree.lods.get(level) else {
+                        trees.invalid += 1;
                         continue;
                     };
                     let map = materials.map(|m| builder.surface(m));
@@ -341,6 +393,9 @@ impl Feed {
                 };
                 if let Some(id) = id {
                     builder.place(id, Transform::translation(placement.position))?;
+                    trees.loaded += 1;
+                } else {
+                    trees.empty += 1;
                 }
             }
         }
@@ -349,6 +404,7 @@ impl Feed {
         }
         let mut grass_ids = HashMap::new();
         let (vertices, indices, instances, batches) = m.grass.geometry();
+        let grass = &mut inventory[Class::Grass];
         for batch in batches {
             let indices = &indices[batch.indices.start as usize..batch.indices.end as usize];
             let Some((&low, &high)) = indices.iter().min().zip(indices.iter().max()) else {
@@ -393,9 +449,11 @@ impl Feed {
                             sin: -v[5],
                         },
                     )?;
+                    grass.loaded += 1;
                 }
             }
         }
+        grass.empty = instances.len().saturating_sub(grass.loaded);
         Ok(())
     }
 
@@ -861,8 +919,10 @@ fn moving(
     textures: &mut Textures,
     matrix: Mat4,
     cache: &mut AccelCache,
-) -> Result<Packet, String> {
+    absences: Counts,
+) -> Result<(Packet, Inventory), String> {
     let mut out = lighter::model_feed::Moving::new(textures);
+    out.coverage[Class::WorldModels] = absences;
     if let Some(models) = models {
         let (geometry, effects, dynamic, read) = models.ray_sources();
         for l in dynamic {
@@ -871,27 +931,60 @@ fn moving(
         }
         let mut decode =
             |path: &str| read(path).and_then(|b| crate::model_texture_gpu::decode_for_rays(&b));
-        for (owner, asset, pose, meshes) in geometry {
-            out.model(
-                "world",
-                owner,
-                lighter::model_feed::Posed {
-                    asset,
-                    pose,
-                    meshes,
-                    attached: false,
-                },
-                |_| true,
-                &mut decode,
-            )?;
+        use world_models_gpu::RayActor;
+        for actor in geometry {
+            match actor {
+                RayActor::Pose(owner, asset, pose, meshes) => out.model(
+                    "world",
+                    owner,
+                    lighter::model_feed::Posed {
+                        asset,
+                        pose,
+                        meshes,
+                        attached: false,
+                    },
+                    |_| true,
+                    &mut decode,
+                )?,
+                RayActor::Cutoff => out.coverage[Class::WorldModels].cutoff += 1,
+                RayActor::Range => out.coverage[Class::WorldModels].range += 1,
+                RayActor::Invalid => out.coverage[Class::WorldModels].invalid += 1,
+            }
         }
         out.effects("world", effects, &mut decode)?;
     }
     modules.ray_inputs(matrix, &mut out)?;
-    out.finish_cached(cache)
+    let coverage = out.coverage;
+    Ok((out.finish_cached(cache)?, coverage))
 }
 
 impl super::Renderer {
+    /// Snapshot counts. Root census is sampled on request, not on each frame.
+    pub(super) fn ray_inventory(&self) -> Inventory {
+        let mut inventory = self
+            .lighter
+            .static_coverage
+            .combine(&self.lighter.moving_coverage);
+        let roots = &mut inventory[Class::EffectRoots];
+        if let Some(models) = &self.models {
+            let status = models.ray_effect_status();
+            roots.invalid = self.ray_rejected_scene_effects;
+            if self.ray_gfx_archive_unavailable {
+                roots.package = status.total();
+            } else {
+                roots.loaded = status.playing;
+                roots.pending = status.queued;
+                roots.disabled = status.inactive;
+                roots.invalid += status.invalid;
+                roots.unavailable = status.unavailable;
+                roots.unsupported = status.unsupported;
+            }
+        } else {
+            roots.disabled = self.ray_scene_effects;
+        }
+        inventory
+    }
+
     /// Lighter owns primary visibility and all water/shadow/lighting rays.
     /// Post/presentation (and independent map views) still use the host.
     pub(super) fn render_lighter(
@@ -945,11 +1038,7 @@ impl super::Renderer {
             );
         }
         let [walker, populator] = self.modules.ray_skin_omissions();
-        let world = self.models.as_ref().map_or_else(
-            Default::default,
-            world_models_gpu::World::ray_skin_omissions,
-        );
-        self.lighter.skin_omissions = [world, walker, populator];
+        self.lighter.skin_omissions[1..].copy_from_slice(&[walker, populator]);
         // Underwater fog/transmission are evaluated along Lighter's actual
         // paths. Don't re-tint those pixels with the raster underwater pass.
         let use_post = crate::view_settings::post_required(
@@ -971,14 +1060,15 @@ impl super::Renderer {
                 .world
                 .as_mut()
                 .ok_or("Lighter has no resident geometry")?;
-            let moving = moving(
+            let (moving, coverage) = moving(
                 self.models.as_mut(),
                 &mut self.modules,
                 &mut world.textures,
                 matrix,
                 &mut self.lighter.moving_accel,
+                self.ray_model_absences,
             )?;
-            self.lighter.render(
+            let rendered = self.lighter.render(
                 &self.device,
                 &self.queue,
                 &mut encoder,
@@ -987,7 +1077,11 @@ impl super::Renderer {
                 self.scene_format,
                 frame,
                 &moving,
-            )
+            )?;
+            if rendered {
+                self.lighter.moving_coverage = coverage;
+            }
+            Ok(rendered)
         })();
         match result {
             Ok(true) => {}

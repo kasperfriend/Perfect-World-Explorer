@@ -2,6 +2,7 @@
 //! and a frame snapshot, then either Lighter or the native world renderer
 //! writes the scene and reverse-Z depth target, never both.
 mod bvh;
+pub(crate) mod coverage;
 pub(crate) mod model_feed;
 mod post;
 pub(crate) mod scene;
@@ -575,6 +576,8 @@ pub struct Lighter {
     persistence_error: Option<String>,
     status: Option<String>,
     pub(crate) scenery_coverage: Option<String>,
+    pub(crate) static_coverage: coverage::Inventory,
+    pub(crate) moving_coverage: coverage::Inventory,
     pub(crate) skin_omissions: [crate::skin::SkinOmissions; 3],
 }
 
@@ -603,6 +606,8 @@ impl Default for Lighter {
             persistence_error: None,
             status: None,
             scenery_coverage: None,
+            static_coverage: Default::default(),
+            moving_coverage: Default::default(),
             skin_omissions: Default::default(),
         }
     }
@@ -1017,6 +1022,13 @@ impl Lighter {
         if self.replaces_world() {
             if let Some(coverage) = &self.scenery_coverage {
                 ui.label(coverage);
+            }
+            if self.error().is_none() && self.world.is_some() {
+                ui.collapsing("Ray scene inventory", |ui| {
+                    for entry in self.static_coverage.combine(&self.moving_coverage).labels() {
+                        ui.label(entry);
+                    }
+                });
             }
             for (source, counts) in ["World", "Walker", "Populator"]
                 .iter()

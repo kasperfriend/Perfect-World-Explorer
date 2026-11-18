@@ -110,6 +110,21 @@ pub struct AlphaStatus {
     pub slots: usize,
 }
 
+/// Skip reasons use the same gates as the ray pose iterator, not the raster
+/// queue (which additionally rejects off-screen actors).
+#[allow(dead_code)] // The standalone model tools do not consume the ray feed.
+pub(crate) enum RayActor<'a> {
+    Pose(
+        u64,
+        &'a crate::model_asset::ModelAsset,
+        &'a crate::skeleton_pose::Pose,
+        &'a [crate::model_asset::PosedMesh],
+    ),
+    Cutoff,
+    Range,
+    Invalid,
+}
+
 pub struct World {
     assets: Assets,
     keep_unbounded: bool,
@@ -628,6 +643,11 @@ impl World {
     pub fn light_priority_limit(&self) -> i32 {
         self.owners.priority_limit()
     }
+    #[allow(dead_code)]
+    pub(crate) fn ray_effect_status(&self) -> gfx_owner::GeometryStatus {
+        self.owners.geometry_status()
+    }
+
     pub fn gfx_status(&self) -> gfx_owner::Status {
         self.owners.status()
     }
@@ -828,25 +848,13 @@ impl World {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn ray_skin_omissions(&self) -> crate::skin::SkinOmissions {
-        self.assets.skin_omissions.totals()
-    }
-
     // Source data, not the current raster queue. In particular don't discard
     // poses outside the camera frustum: a reflected or shadow ray can see them.
     #[allow(dead_code, clippy::type_complexity)]
     pub(crate) fn ray_sources(
         &mut self,
     ) -> (
-        impl Iterator<
-                Item = (
-                    u64,
-                    &crate::model_asset::ModelAsset,
-                    &crate::skeleton_pose::Pose,
-                    &[crate::model_asset::PosedMesh],
-                ),
-            > + '_,
+        impl Iterator<Item = RayActor<'_>> + '_,
         &[crate::gfx_player::EffectQuad],
         &[DynamicLight],
         &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
@@ -860,23 +868,25 @@ impl World {
             .iter()
             .zip(&self.slots)
             .enumerate()
-            .filter_map(move |(owner, (i, slot))| {
+            .map(move |(owner, (i, slot))| {
                 let p = i.placement.position;
-                if !cutoff_residency::contains(bounds, p)
-                    || slot.failed
-                    || view.is_some_and(|(x, z, r)| {
-                        (p[0] - x).powi(2) + (p[2] - z).powi(2) > (r + 128.).powi(2)
-                    })
-                {
-                    return None;
+                if !p.iter().all(|x| x.is_finite()) {
+                    return RayActor::Invalid;
                 }
-                let pose = slot.posed.as_ref()?.as_ref().ok()?;
-                Some((
-                    owner as u64,
-                    &assets[i.asset],
-                    &pose.pose,
-                    pose.meshes.as_slice(),
-                ))
+                if !cutoff_residency::contains(bounds, p) {
+                    return RayActor::Cutoff;
+                }
+                if view.is_some_and(|(x, z, r)| {
+                    (p[0] - x).powi(2) + (p[2] - z).powi(2) > (r + 128.).powi(2)
+                }) {
+                    return RayActor::Range;
+                }
+                match &slot.posed {
+                    Some(Ok(pose)) if !slot.failed => {
+                        RayActor::Pose(owner as u64, &assets[i.asset], &pose.pose, &pose.meshes)
+                    }
+                    _ => RayActor::Invalid,
+                }
             });
         (poses, &self.effect_quads, &self.ray_lights, &mut *self.read)
     }

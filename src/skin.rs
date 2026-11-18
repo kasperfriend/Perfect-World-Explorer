@@ -158,12 +158,12 @@ pub struct UnsupportedSkins {
 }
 
 impl UnsupportedSkins {
-    pub fn observe(&mut self, path: &str, bytes: &[u8]) {
+    pub fn observe(&mut self, path: &str, bytes: &[u8]) -> bool {
         if !(bytes.starts_with(b"IKSA")
             || bytes.starts_with(b"MOXBIKSA")
             || bytes.starts_with(b"MOXTIKSA"))
         {
-            return;
+            return false;
         }
         if let Ok((_, header)) = skin_header(bytes) {
             let c = header.unsupported;
@@ -174,7 +174,9 @@ impl UnsupportedSkins {
                 self.totals.supple += c.supple;
                 self.totals.muscle += c.muscle;
             }
+            return c.files != 0;
         }
+        false
     }
 
     pub fn totals(&self) -> SkinOmissions {

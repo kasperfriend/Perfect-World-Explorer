@@ -1138,6 +1138,7 @@ impl Walker {
                 PartVisibility::Hidden
             ) {
                 // Authored travel/weapon visibility is not a first-person mask.
+                out.coverage[super::lighter::coverage::Class::Walker].disabled += 1;
                 continue;
             }
             let primary = part_visibility(&model.part, self.settings.first_person, false);

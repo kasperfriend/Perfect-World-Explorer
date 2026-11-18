@@ -1,0 +1,12 @@
+class,loaded,skipped,failed,range,cutoff,replaced,budget,pending,disabled,empty,package,unavailable,invalid,unsupported,texture_fallback
+near_terrain,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+far_terrain,0,1,0,0,0,1,0,0,0,0,0,0,0,0,0
+trees,1,0,1,0,0,0,0,0,0,0,1,0,0,0,0
+grass,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+buildings,1,1,1,1,0,0,0,0,0,0,0,1,0,0,1
+water,1,1,0,0,0,0,0,0,0,1,0,0,0,0,0
+world_models,1,0,1,0,0,0,0,0,0,0,0,1,0,0,1
+walker,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+populator,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+effect_draws,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+effect_roots,1,0,1,0,0,0,0,0,0,0,0,0,0,1,0

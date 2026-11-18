@@ -34,6 +34,7 @@ pub(super) struct Manifest {
     entries: Vec<Option<Entry>>,
     chunks: BTreeMap<ChunkId, Chunk>,
     estimated: usize,
+    invalid: usize,
     warned_expansion: bool,
 }
 
@@ -46,6 +47,7 @@ impl Manifest {
             let p = Vec3::from_array(position);
             if !p.is_finite() {
                 manifest.entries.push(None);
+                manifest.invalid += 1;
                 continue;
             }
             let owner = owner(position);
@@ -104,6 +106,25 @@ impl Manifest {
     }
     pub fn estimated(&self) -> usize {
         self.estimated
+    }
+
+    pub fn invalid_anchors(&self) -> usize {
+        self.invalid
+    }
+
+    pub fn valid_anchor(&self, id: usize) -> bool {
+        self.entries.get(id).is_some_and(Option::is_some)
+    }
+
+    pub fn cutoff_count(&self, cutoff: Option<[f32; 4]>) -> usize {
+        if cutoff.is_none() {
+            return 0;
+        }
+        self.entries
+            .iter()
+            .flatten()
+            .filter(|entry| !crate::terrain_cutoff::contains(cutoff, entry.position))
+            .count()
     }
 
     pub fn reachable(&self, id: usize, query: &Query) -> bool {

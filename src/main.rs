@@ -860,14 +860,7 @@ fn terrain(
                     objects::Objects::open(element, ornaments).map_err(|e| e.to_string())
                 });
                 let models_task =
-                    s.spawn(
-                        || match world_models::Assets::open(element, placements.clone()) {
-                            Ok(models) => models,
-                            Err(e) => {
-                                world_models::Assets::load_with(placements, |_| Err(e.clone()))
-                            }
-                        },
-                    );
+                    s.spawn(|| world_models::Assets::open_or_unloaded(element, placements));
                 let grass_task = s.spawn(|| {
                     grass::Grass::load(&world_scene, &dir, element).map_err(|e| e.to_string())
                 });
@@ -914,14 +907,7 @@ fn terrain(
                 })?;
             let (models, grass, trees) = std::thread::scope(|s| {
                 let models_task =
-                    s.spawn(
-                        || match world_models::Assets::open(element, placements.clone()) {
-                            Ok(models) => models,
-                            Err(e) => {
-                                world_models::Assets::load_with(placements, |_| Err(e.clone()))
-                            }
-                        },
-                    );
+                    s.spawn(|| world_models::Assets::open_or_unloaded(element, placements));
                 let grass_task = s.spawn(|| {
                     grass::Grass::load(&world_scene, &dir, element).map_err(|e| e.to_string())
                 });
@@ -3741,22 +3727,37 @@ fn main() {
         };
         terrain(load_root, all_to_vram, preferred, notice)
     };
-    let (t, fallback_notice) =
-        match world_load::load_with_main_world_fallback_notified(&preferred_world, load_terrain) {
-            Ok((loaded, notice)) => (loaded, notice),
-            Err(error) => {
-                // A replacement child must report failure before showing its
-                // own error; otherwise the old window would wait for a
-                // readiness signal that will never arrive.
-                world_handoff::publish_failure(&error);
-                eprintln!("Error: {error}");
-                #[cfg(windows)]
-                if !world_handoff::is_handoff_child() {
-                    windows_setup::show_error(&error);
-                }
-                std::process::exit(1);
+    // A coverage capture is evidence for one specific map. Do not save a
+    // plausible screenshot and zero failures from an automatic fallback map.
+    let audit = env::var_os("PW_PREVIEW_COVERAGE").is_some()
+        && args
+            .get(2)
+            .is_some_and(|arg| arg == "--gpu-preview" || arg == "--gpu-preview-at");
+    let loaded = if audit {
+        world_load::recoverable_map_operation(|| load_terrain(&preferred_world, None))
+            .and_then(|result| result)
+            .map(|terrain| (terrain, None))
+            .map_err(|error| {
+                format!("Coverage capture for {preferred_world} failed before rendering: {error}")
+            })
+    } else {
+        world_load::load_with_main_world_fallback_notified(&preferred_world, load_terrain)
+    };
+    let (t, fallback_notice) = match loaded {
+        Ok((loaded, notice)) => (loaded, notice),
+        Err(error) => {
+            // A replacement child must report failure before showing its
+            // own error; otherwise the old window would wait for a
+            // readiness signal that will never arrive.
+            world_handoff::publish_failure(&error);
+            eprintln!("Error: {error}");
+            #[cfg(windows)]
+            if !world_handoff::is_handoff_child() {
+                windows_setup::show_error(&error);
             }
-        };
+            std::process::exit(1);
+        }
+    };
     if let Some(notice) = fallback_notice.as_deref() {
         preferred_world = "world".into();
         saved.selected_world = "world".into();

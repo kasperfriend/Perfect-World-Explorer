@@ -948,6 +948,124 @@ fn lighter_headless_preview_png() {
     assert_world_png(&path, (960, 720));
 }
 
+#[test]
+#[ignore = "requires Vulkan for the coverage capture"]
+fn lighter_coverage_fixture_capture() {
+    let root = FixtureRoot::new();
+    // One available façade with a missing texture, one absent member and an
+    // out-of-range placement. These are mutually exclusive placement results.
+    std::fs::remove_file(root.0.join("building.pck")).unwrap();
+    let mut terrain = fixture(&root.0);
+    terrain.objects = crate::objects::Objects::open(
+        &root.0,
+        vec![
+            ornament_record(),
+            crate::scene::Ornament {
+                export_id: 124,
+                path: "not-installed.bmd".into(),
+                ..ornament_record()
+            },
+            crate::scene::Ornament {
+                export_id: 125,
+                position: [3000., 0., 0.],
+                ..ornament_record()
+            },
+        ],
+    )
+    .unwrap();
+    terrain.trees.types.push(None);
+    terrain.trees.placements.push(crate::scene::Tree {
+        tree_type: 1,
+        position: [-8., 0., 0.],
+    });
+    let dry = crate::water::WaterArea {
+        export_id: 2,
+        mask: vec![0, 0],
+        shore_waves: Vec::new(),
+        ..terrain.water[0].clone()
+    };
+    terrain.water.push(dry);
+    let effects = &mut std::sync::Arc::get_mut(&mut terrain.scene).unwrap().blocks[0].effects;
+    effects.truncate(1);
+    effects.push(placement(1, "scene/binary.gfx", [-6., 2., 0.]));
+    let sprite = gfx_header() + SPRITE;
+    let glow = encode(
+        &image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 32, 0, 128])),
+        image::ImageFormat::Png,
+    );
+    crate::pck::write_test_archive(
+        &root.0.join("gfx.pck"),
+        &[
+            ("gfx/scene/lighter-sprite.gfx", sprite.as_bytes()),
+            ("gfx/scene/binary.gfx", b"MOXB synthetic unsupported root"),
+            ("gfx/textures/lighter-glow.png", &glow),
+        ],
+    );
+    let actor = crate::scene::SceneModel {
+        export_id: 1,
+        position: [0., 2., -4.],
+        direction: [0., 0., 1.],
+        up: [0., 1., 0.],
+        path: "models/a/a.ecm".into(),
+        action: String::new(),
+    };
+    let (mut asset, _) = crate::model_draw_fixture::fixture();
+    asset.skins[0].data.meshes[0].vertices[1].position[1] = 1.;
+    let playback = crate::model_playback::Playback::new(&asset, None);
+    terrain.models = crate::world_models::Assets::load_with(
+        vec![crate::scene::SceneModel {
+            export_id: 2,
+            path: "models/missing.ecm".into(),
+            ..actor.clone()
+        }],
+        |_| Err("synthetic absent archive member".into()),
+    );
+    terrain
+        .models
+        .instances
+        .push(crate::world_models::Instance {
+            placement: actor,
+            asset: 0,
+            action: None,
+            playback,
+        });
+    terrain.models.assets.push(asset);
+    crate::pck::write_test_archive(
+        &root.0.join("models.pck"),
+        &[("fixture-placeholder", b"no textures")],
+    );
+
+    let path = root.0.join("coverage.png");
+    super::super::preview_frame(
+        terrain,
+        &path,
+        Some([-2.5, 5., 0., 0., -std::f32::consts::FRAC_PI_4]),
+        Mode::Software,
+        Some(2),
+    )
+    .unwrap();
+    assert_world_png(&path, (960, 720));
+    let csv = std::fs::read_to_string(path.with_extension("coverage.csv")).unwrap();
+    assert_eq!(
+        csv,
+        include_str!("../../../tools/fixtures/lighter-coverage.csv")
+    );
+    let meta = std::fs::read_to_string(path.with_extension("coverage.txt")).unwrap();
+    assert!(meta.contains("map=\"lighter-fixture\"\n") && meta.contains("warmup_frames=2\n"));
+    use sha2::{Digest, Sha256};
+    let rgba = image::open(&path).unwrap().into_rgba8();
+    let digest = Sha256::digest(rgba.as_raw());
+    assert!(meta.contains(&format!("rgba8_sha256={digest:x}\n")));
+    if let Some(dir) = std::env::var_os("PW_SAVE_LIGHTER_COVERAGE") {
+        let dir = std::path::PathBuf::from(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for ext in ["png", "coverage.csv", "coverage.txt"] {
+            let src = path.with_extension(ext);
+            std::fs::copy(&src, dir.join(src.file_name().unwrap())).unwrap();
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires an X11 display (e.g. xvfb-run) and Vulkan"]
@@ -1042,9 +1160,13 @@ pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
     let install = |feed: &mut super::Feed,
                    mesh: &super::MeshData,
                    (local, extra, outside): (usize, usize, usize)| {
-        let (packet, textures, coverage) = feed.snapshot(mesh, storage).unwrap();
+        let (packet, textures, inventory, coverage) = feed.snapshot(mesh, storage).unwrap();
         assert_eq!(
-            (coverage.local, coverage.extra, coverage.outside),
+            (
+                coverage.local,
+                coverage.extra,
+                coverage.counts.range + coverage.counts.cutoff
+            ),
             (local, extra, outside),
             "{coverage}"
         );
@@ -1058,20 +1180,23 @@ pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
         );
         assert_eq!(
             (
-                coverage.missing_textures,
-                coverage.deferred,
-                coverage.unavailable
+                coverage.counts.texture_fallback,
+                coverage.counts.budget,
+                coverage.counts.failed()
             ),
             (0, 0, 0),
             "{coverage}"
         );
+        assert_eq!(inventory[super::Class::Buildings], coverage.counts);
         (packet, textures)
     };
     let extended = install(&mut feed, &first, (0, 1, 0));
     // Required terrain and vegetation can already occupy the binding. The
     // optional asset must be deferred, not leave a partially packed mesh.
-    let (limited, _, stats) = feed.snapshot(&first, extended.0.bytes().len() - 1).unwrap();
-    assert_eq!((stats.extra, stats.deferred), (0, 1));
+    let (limited, _, inventory, stats) =
+        feed.snapshot(&first, extended.0.bytes().len() - 1).unwrap();
+    assert_eq!((stats.extra, stats.counts.budget), (0, 1));
+    assert_eq!(inventory[super::Class::Buildings].budget, 1);
     assert_eq!(extended.0.triangles(), limited.triangles() + 2);
     let local_mesh = make(&mut t, 160.);
     assert!(!local_mesh.local_pages.is_empty());
@@ -1134,7 +1259,14 @@ pub(crate) fn joined_bmd_packets(storage: usize) -> [Scene; 4] {
         let mut builder = super::Builder::default();
         let mut bank = super::Textures::default();
         let stats = snapshot.append(&mut builder, &mut bank, storage).unwrap();
-        assert_eq!((stats.local, stats.extra, stats.outside), counts);
+        assert_eq!(
+            (
+                stats.local,
+                stats.extra,
+                stats.counts.range + stats.counts.cutoff
+            ),
+            counts
+        );
         assert_eq!((stats.catalog_chunks, stats.estimated_bounds), (2, 0));
         let packet = builder.finish_cached(&mut cache);
         assert_eq!(packet.triangles(), (counts.0 + counts.1) * 2);

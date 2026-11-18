@@ -17,6 +17,8 @@ pub struct Assets {
     pub instances: Vec<Instance>,
     pub failures: Vec<String>,
     pub unloaded: Vec<SceneModel>,
+    pub unloaded_unsupported: usize,
+    pub archive_unavailable: bool,
     pub skin_omissions: crate::skin::UnsupportedSkins,
 }
 impl Assets {
@@ -27,7 +29,7 @@ impl Assets {
         mut read: impl FnMut(&str) -> Result<Vec<u8>, String>,
     ) -> Self {
         let mut result = Self::default();
-        let mut cache: HashMap<String, Option<usize>> = HashMap::new();
+        let mut cache: HashMap<String, Result<usize, bool>> = HashMap::new();
         let mut tracks = crate::model_asset::TrackCache::default();
         result.instances.reserve(placements.len());
         for placement in placements {
@@ -35,26 +37,28 @@ impl Assets {
             let asset = if let Some(index) = cache.get(&path) {
                 *index
             } else {
+                let mut unsupported = false;
                 let mut read_skin = |dependency: &str| {
                     let bytes = read(dependency)?;
-                    result.skin_omissions.observe(dependency, &bytes);
+                    unsupported |= result.skin_omissions.observe(dependency, &bytes);
                     Ok(bytes)
                 };
                 let index = match ModelAsset::load_cached(&path, &mut read_skin, &mut tracks) {
                     Ok(asset) => {
                         let index = result.assets.len();
                         result.assets.push(asset);
-                        Some(index)
+                        Ok(index)
                     }
                     Err(e) => {
                         result.failures.push(e);
-                        None
+                        // An unread SKI is a format gap, not a missing model.
+                        Err(unsupported)
                     }
                 };
                 cache.insert(path, index);
                 index
             };
-            if let Some(asset) = asset {
+            if let Ok(asset) = asset {
                 let action = result.assets[asset]
                     .descriptor
                     .scene_action(&placement.action);
@@ -66,15 +70,36 @@ impl Assets {
                     playback,
                 });
             } else {
+                result.unloaded_unsupported += usize::from(asset == Err(true));
                 result.unloaded.push(placement);
             }
         }
         result
     }
+    #[allow(dead_code)] // Viewer fallback; standalone surveys can fail closed.
+    pub fn open_or_unloaded(element: &Path, placements: Vec<SceneModel>) -> Self {
+        if placements.is_empty() {
+            return Self::default();
+        }
+        match Self::reader(element) {
+            Ok(read) => Self::load_with(placements, read),
+            Err(error) => Self {
+                failures: vec![error],
+                unloaded: placements,
+                archive_unavailable: true,
+                ..Default::default()
+            },
+        }
+    }
+
     pub fn open(element: &Path, placements: Vec<SceneModel>) -> Result<Self, String> {
         if placements.is_empty() {
-            return Ok(Self::load_with(placements, |_| unreachable!()));
+            return Ok(Self::default());
         }
+        Ok(Self::load_with(placements, Self::reader(element)?))
+    }
+
+    fn reader(element: &Path) -> Result<impl FnMut(&str) -> Result<Vec<u8>, String>, String> {
         let mut file =
             File::open(element.join("models.pck")).map_err(|e| format!("models.pck: {e}"))?;
         let dir = crate::pck::directory(&mut file)?;
@@ -85,12 +110,12 @@ impl Assets {
                 return Err(format!("duplicate normalized models.pck entry: {name}"));
             }
         }
-        Ok(Self::load_with(placements, |path| {
+        Ok(move |path: &str| {
             let entry = entries
                 .get(path)
                 .ok_or_else(|| format!("missing models.pck entry: {path}"))?;
             crate::pck::read_entry(&mut file, entry)
-        }))
+        })
     }
 }
 /// 1.4.2 0x6d4304 -> 0x7b0d60 -> 0x788960. Normalize forward/up

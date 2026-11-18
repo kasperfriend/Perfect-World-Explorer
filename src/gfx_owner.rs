@@ -258,7 +258,40 @@ enum State {
         lights: Vec<Emitter>,
         light_error: Option<String>,
     },
-    Failed,
+    Failed(Failure),
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Failures' categories are read by the viewer census.
+enum Failure {
+    Invalid,
+    Unavailable,
+    Unsupported,
+}
+
+/// Current root states, not the cumulative logging counters. No record is
+/// counted twice when a failed root's lights or dependencies also have errors.
+#[derive(Default)]
+#[allow(dead_code)]
+pub(crate) struct GeometryStatus {
+    pub playing: usize,
+    pub queued: usize,
+    pub inactive: usize,
+    pub invalid: usize,
+    pub unavailable: usize,
+    pub unsupported: usize,
+}
+
+impl GeometryStatus {
+    #[allow(dead_code)]
+    pub fn total(&self) -> usize {
+        self.playing
+            + self.queued
+            + self.inactive
+            + self.invalid
+            + self.unavailable
+            + self.unsupported
+    }
 }
 
 struct Owner {
@@ -771,7 +804,7 @@ impl Manager {
     fn unregister(&self, owner: &Owner, publications: &mut LightPublications) {
         let count = match &owner.state {
             State::Live { lights, .. } => lights.len(),
-            State::Pending | State::Failed => 0,
+            State::Pending | State::Failed(_) => 0,
         };
         for index in 0..count {
             publications.unregister(element_identity(owner.serial, index));
@@ -810,7 +843,7 @@ impl Manager {
             if let Some(index) = self.position_of(identity) {
                 self.unregister(&self.owners[index], publications);
                 let origin = self.owners[index].request.origin.clone();
-                self.owners[index].state = State::Failed;
+                self.owners[index].state = State::Failed(Failure::Invalid);
                 self.failures.push(format!("{origin}: {error}"));
             }
         }
@@ -1237,12 +1270,13 @@ impl Manager {
         let text = match result {
             Ok(text) => text,
             Err(e) => {
-                self.owners[index].state = State::Failed;
-                if is_unsupported(&e) {
+                self.owners[index].state = State::Failed(if is_unsupported(&e) {
                     self.unsupported.push(format!("{origin}: {e}"));
+                    Failure::Unsupported
                 } else {
                     self.failures.push(format!("{origin}: {e}"));
-                }
+                    Failure::Unavailable
+                });
                 return;
             }
         };
@@ -1259,7 +1293,7 @@ impl Manager {
             // side either, so the owner keeps the old dead-end treatment and is
             // reported as unsupported rather than failed.
             Err(error) if is_unsupported(&error) => {
-                self.owners[index].state = State::Failed;
+                self.owners[index].state = State::Failed(Failure::Unsupported);
                 self.unsupported.push(format!("{origin}: {error}"));
                 return;
             }
@@ -1285,6 +1319,28 @@ impl Manager {
         Ok(definitions.into_iter().map(Emitter::new).collect())
     }
 
+    #[allow(dead_code)] // Ray capture; standalone tools use the wider status.
+    pub(crate) fn geometry_status(&self) -> GeometryStatus {
+        let mut status = GeometryStatus::default();
+        for owner in &self.owners {
+            match owner.state {
+                State::Failed(Failure::Invalid) => status.invalid += 1,
+                State::Failed(Failure::Unavailable) => status.unavailable += 1,
+                State::Failed(Failure::Unsupported) => status.unsupported += 1,
+                State::Live { .. } if owner.player_failed => status.invalid += 1,
+                _ if !self.effects
+                    || !owner.request.active
+                    || owner.elapsed < owner.request.start_ms =>
+                {
+                    status.inactive += 1;
+                }
+                State::Live { .. } if owner.player.is_some() => status.playing += 1,
+                State::Pending | State::Live { .. } => status.queued += 1,
+            }
+        }
+        status
+    }
+
     pub fn status(&self) -> Status {
         let mut status = Status {
             removed: self.removed,
@@ -1298,7 +1354,7 @@ impl Manager {
         for owner in &self.owners {
             match &owner.state {
                 State::Pending => status.pending += 1,
-                State::Failed => status.failed_owners += 1,
+                State::Failed(_) => status.failed_owners += 1,
                 State::Live { lights, .. } => {
                     status.live += 1;
                     status.emitters += lights.len();

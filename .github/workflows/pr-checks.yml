@@ -306,6 +306,33 @@ jobs:
               exit "$status"
             fi
           done
+      - name: Check saved Lighter inventory and matching PNG
+        env:
+          WGPU_BACKEND: vulkan
+          XDG_RUNTIME_DIR: /tmp
+          PW_SMALL_TREE_ATLAS: "1"
+          PW_SAVE_LIGHTER_COVERAGE: target/lighter-coverage-fixture
+          CARGO_TERM_COLOR: never
+        run: |
+          export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
+          test -n "$VK_ICD_FILENAMES"
+          status=0
+          (set -o pipefail; cargo test --locked --bin perfect-world-explorer lighter_coverage_fixture_capture -- --ignored --nocapture \
+            2>&1 | tee /tmp/lighter-coverage.log) || status=$?
+          if [ "$status" -ne 0 ]; then
+            tail=$(tail -40 /tmp/lighter-coverage.log)
+            tail=${tail//%/%25}
+            tail=${tail//$'\r'/%0D}
+            tail=${tail//$'\n'/%0A}
+            printf '::error title=Lighter fixture coverage::%s\n' "$tail"
+            exit "$status"
+          fi
+      - name: Keep the Lighter coverage fixture capture
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighter-coverage-fixture
+          path: target/lighter-coverage-fixture
+          if-no-files-found: error
       - name: Run Phase 1 production shader regressions
         env:
           WGPU_BACKEND: vulkan

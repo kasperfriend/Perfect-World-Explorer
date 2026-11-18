@@ -460,6 +460,11 @@ impl Objects {
         result
     }
 
+    #[allow(dead_code)] // Used by the viewer's ray coverage report.
+    pub(crate) fn lit_archive_available(&self) -> bool {
+        self.litfile.is_some() && self.lit_archive_error.is_none()
+    }
+
     /// Loads a small explicit batch for the independent world preload worker.
     pub fn load_ids(&mut self, ids: &[usize]) -> Result<(), String> {
         let mut active = HashSet::with_capacity(ids.len());

@@ -1,6 +1,8 @@
 //! Experimental GPU world renderer: actual client terrain, static BMDs and water masks.
 //! Baked terrain material atlas, fixed lighting and flat water are not client parity.
-use crate::modules::lighter::{Lighter, Mode as LighterMode, Settings as LighterSettings};
+use crate::modules::lighter::{
+    coverage::Counts as RayCounts, Lighter, Mode as LighterMode, Settings as LighterSettings,
+};
 use crate::scenery_visibility::{
     allows_class_with_context, lod_scale, Class, ModelClass, Pass, RenderContext, Visibility,
     NATIVE_DEFAULT_WATER_EFFECT,
@@ -548,6 +550,7 @@ struct MeshData {
     object_start: u32,
     water_start: u32,
     water_batches: Vec<WaterBatch>,
+    water_coverage: RayCounts,
     local_pages: Vec<crate::world_objects::Page>,
     /// Optional ray feed prepared on the same loader as the native pages.
     ray_scenery: Option<Result<lighter_host::ScenerySnapshot, String>>,
@@ -1531,6 +1534,7 @@ fn build(
     // Keep opaque indices separate so water can sample reflected/refracted scene passes.
     let water_start = indices.len() as u32;
     let mut water_batches: Vec<WaterBatch> = Vec::new();
+    let mut water_coverage = RayCounts::default();
     let mut areas: Vec<_> = t.water.iter().collect();
     areas.sort_by(|a, b| a.height.total_cmp(&b.height));
     // The water records had no channel of their own: `SceneWater` and
@@ -1636,7 +1640,14 @@ fn build(
             }
         }
         let end = indices.len() as u32;
-        if end > start {
+        if start == end {
+            if resident_bounds.is_some() && a.mask.iter().any(|&cell| cell & 1 != 0) {
+                water_coverage.cutoff += 1;
+            } else {
+                water_coverage.empty += 1;
+            }
+        } else {
+            water_coverage.loaded += 1;
             if let Some(last) = water_batches.last_mut().filter(|last| {
                 last.height == a.height && last.simple == a.simple && last.end == start
             }) {
@@ -1719,6 +1730,7 @@ fn build(
         object_start,
         water_start,
         water_batches,
+        water_coverage,
         local_pages,
         ray_scenery,
         local_scenery_skipped: skip_local_scenery,
@@ -1779,6 +1791,10 @@ struct Renderer {
     modules: crate::modules::Modules,
     module_format: wgpu::TextureFormat,
     models: Option<crate::world_models_gpu::World>,
+    ray_model_absences: RayCounts,
+    ray_scene_effects: usize,
+    ray_rejected_scene_effects: usize,
+    ray_gfx_archive_unavailable: bool,
     model_lights: std::sync::Arc<crate::scene_lights::SceneLights>,
     model_scene: std::sync::Arc<crate::scene::Scene>,
     device: wgpu::Device,
@@ -2509,8 +2525,28 @@ impl Renderer {
         // model assets. Only the opt-out and a genuinely missing archive decide
         // whether the object is built; the model queue inside it is skipped
         // lazily when there are no instances.
+        let mut ray_model_absences = RayCounts::default();
+        let ray_scene_effects = t
+            .scene
+            .blocks
+            .iter()
+            .map(|block| block.effects.len())
+            .sum::<usize>();
+        let mut ray_rejected_scene_effects = 0;
+        let mut ray_gfx_archive_unavailable = false;
+        // Preserve the SKI census even if reopening the GPU-side texture pack
+        // fails and the model queue cannot be installed.
+        lighter.skin_omissions[0] = t.models.skin_omissions.totals();
         let models = if std::env::var_os("PW_DISABLE_WORLD_MODELS").is_none() {
             let assets = std::mem::take(&mut t.models);
+            let loaded = assets.instances.len();
+            if assets.archive_unavailable {
+                ray_model_absences.package = assets.unloaded.len();
+            } else {
+                ray_model_absences.unsupported = assets.unloaded_unsupported;
+                ray_model_absences.unavailable =
+                    assets.unloaded.len() - assets.unloaded_unsupported;
+            }
             // `models.pck` holds the model textures; the effect roots come from
             // `gfx.pck` below. A map that ships no EC model still gets its
             // effects, so a missing model archive costs the model queue and
@@ -2519,6 +2555,7 @@ impl Renderer {
                 match crate::world_models_gpu::World::new(&device, format, assets, &t.element) {
                     Ok(world) => world,
                     Err(error) => {
+                        ray_model_absences.unavailable += loaded;
                         eprintln!("World models unavailable ({error}); world effects continue");
                         crate::world_models_gpu::World::without_models(&device, format)
                     }
@@ -2531,11 +2568,15 @@ impl Renderer {
             // silent removal of either half.
             match world.attach_gfx_archive(&t.element) {
                 Ok(()) => {}
-                Err(e) => eprintln!("World FX light roots unavailable: {e}"),
+                Err(e) => {
+                    ray_gfx_archive_unavailable = true;
+                    eprintln!("World FX light roots unavailable: {e}");
+                }
             }
             // A placement the reader or the owner queue rejects is a reported
             // absence on the status line, not a refused world.
             let effects = world.install_scene_effects(&t.scene);
+            ray_rejected_scene_effects = ray_scene_effects - effects;
             let events = world.install_model_events();
             eprintln!(
                 "Installed {effects} scene effects and {events} model events (light producers and animated roots)"
@@ -2545,6 +2586,7 @@ impl Renderer {
             }
             Some(world)
         } else {
+            ray_model_absences.disabled = t.models.instances.len() + t.models.unloaded.len();
             None
         };
         // Install the day/night pair the client's own `autoscene.cfg` names
@@ -2565,6 +2607,10 @@ impl Renderer {
             modules: crate::modules::Modules::default(),
             module_format: format.remove_srgb_suffix(),
             models,
+            ray_model_absences,
+            ray_scene_effects,
+            ray_rejected_scene_effects,
+            ray_gfx_archive_unavailable,
             model_lights: t.scene_lights.clone(),
             model_scene: t.scene.clone(),
             terrain_gpu,
@@ -7905,22 +7951,54 @@ fn read_target_pixels(
 }
 
 /// Render one frame without a window. Useful for validation on headless systems.
-pub fn preview(
+pub fn preview(t: Terrain, path: &std::path::Path, camera: Option<[f32; 5]>) -> Result<(), String> {
+    let mode = match std::env::var("PW_PREVIEW_LIGHTER") {
+        Ok(mode) => LighterMode::parse(&mode)
+            .ok_or("PW_PREVIEW_LIGHTER must be off, software or hardware")?,
+        Err(_) => LighterMode::Off,
+    };
+    let audit = if std::env::var_os("PW_PREVIEW_COVERAGE").is_some() {
+        let warmup = std::env::var("PW_PREVIEW_WARMUP").unwrap_or_else(|_| "0".into());
+        Some(
+            warmup
+                .parse::<u32>()
+                .ok()
+                .filter(|&n| n <= 120)
+                .ok_or("PW_PREVIEW_WARMUP must be an integer from 0 through 120")?,
+        )
+    } else {
+        None
+    };
+    preview_frame(t, path, camera, mode, audit)
+}
+
+fn preview_frame(
     mut t: Terrain,
     path: &std::path::Path,
     camera: Option<[f32; 5]>,
+    mode: LighterMode,
+    audit: Option<u32>,
 ) -> Result<(), String> {
-    // Never read interactive settings for an ordinary headless preview.
-    let mut lighter_settings = LighterSettings::default();
-    if let Ok(mode) = std::env::var("PW_PREVIEW_LIGHTER") {
-        lighter_settings.mode = LighterMode::parse(&mode)
-            .ok_or("PW_PREVIEW_LIGHTER must be off, software or hardware")?;
-        if lighter_settings.mode != LighterMode::Off
-            && (std::env::var_os("PW_PREVIEW_WORLD_TEST").is_some()
-                || std::env::var_os("PW_PREVIEW_MINIMAP").is_some())
-        {
-            return Err("Lighter preview requires the main streamed world, not a whole-world preload or minimap".into());
+    // Never read interactive Lighter settings for an ordinary headless preview.
+    let mut lighter_settings = LighterSettings {
+        mode,
+        ..LighterSettings::default()
+    };
+    if audit.is_some() {
+        if mode == LighterMode::Off {
+            return Err("PW_PREVIEW_COVERAGE requires software or hardware Lighter".into());
         }
+        if let Some(notice) = t.startup_notice.as_deref() {
+            return Err(format!("Coverage capture refused a fallback map: {notice}"));
+        }
+        // Report this frame, not a radiance mixture of the warm-up frames.
+        lighter_settings.progressive = false;
+    }
+    if mode != LighterMode::Off
+        && (std::env::var_os("PW_PREVIEW_WORLD_TEST").is_some()
+            || std::env::var_os("PW_PREVIEW_MINIMAP").is_some())
+    {
+        return Err("Lighter preview requires the main streamed world, not a whole-world preload or minimap".into());
     }
     let mut instance = make_instance(lighter_settings.mode);
     let mut adapter_result = pollster::block_on(adapter(&instance, None, lighter_settings.mode));
@@ -7937,6 +8015,7 @@ pub fn preview(
         }
     }
     let (adapter, device, queue) = adapter_result?;
+    let adapter_info = audit.map(|_| adapter.get_info());
     let mut cam = if let Some([x, y, z, yaw, pitch]) = camera {
         if ![x, y, z, yaw, pitch].iter().all(|x| x.is_finite()) {
             return Err("non-finite camera".into());
@@ -8134,6 +8213,22 @@ pub fn preview(
         },
     });
     let mut captures = readback::Ring::default();
+    let view = target.create_view(&Default::default());
+    let raw = target.create_view(&wgpu::TextureViewDescriptor {
+        format: Some(fmt.remove_srgb_suffix()),
+        ..Default::default()
+    });
+    let draw = |r: &mut Renderer, cam: &Camera| {
+        r.render(
+            &view,
+            &raw,
+            cam.matrix(width, height, cam.far),
+            cam,
+            width,
+            height,
+            false,
+        );
+    };
     // An A/B of the world-effect pass, so "no effects" can be answered rather
     // than argued. The same camera and the same frame are rendered twice, the
     // only difference being the map's own effect roots, and the two images are
@@ -8146,22 +8241,6 @@ pub fn preview(
         // reaching this target at all; if they differ, the effects are on screen
         // and what remains is a question of what was authored where.
         cam.world_effects = true;
-        let draw = |r: &mut Renderer, cam: &Camera| {
-            let view = target.create_view(&Default::default());
-            let raw = target.create_view(&wgpu::TextureViewDescriptor {
-                format: Some(fmt.remove_srgb_suffix()),
-                ..Default::default()
-            });
-            r.render(
-                &view,
-                &raw,
-                cam.matrix(width, height, cam.far),
-                cam,
-                width,
-                height,
-                false,
-            );
-        };
         // Drain the one-root-per-frame queue first: an effect still waiting for
         // its player must not be mistaken for one that never drew.
         for _ in 0..60 {
@@ -8197,18 +8276,17 @@ pub fn preview(
             on.len() / 4
         );
     }
-    renderer.render(
-        &target.create_view(&Default::default()),
-        &target.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(fmt.remove_srgb_suffix()),
-            ..Default::default()
-        }),
-        cam.matrix(width, height, cam.far),
-        &cam,
-        width,
-        height,
-        false,
-    );
+    if let Some(warmup) = audit {
+        for _ in 0..warmup {
+            cam.logic_delta_ms = 16;
+            draw(&mut renderer, &cam);
+            if let Some(error) = renderer.lighter.error() {
+                return Err(error.into());
+            }
+        }
+        cam.logic_delta_ms = 0;
+    }
+    draw(&mut renderer, &cam);
     if let Some(error) = renderer.lighter.error() {
         return Err(error.into());
     }
@@ -8223,7 +8301,42 @@ pub fn preview(
         );
     }
     let bytes = read_target_pixels(&renderer, &mut captures, &target)?;
-    readback::png_rgba(path, width, height, &bytes)
+    readback::png_rgba(path, width, height, &bytes)?;
+    if let (Some(warmup), Some(info)) = (audit, adapter_info) {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write;
+        let inventory = renderer.ray_inventory();
+        let counts_path = path.with_extension("coverage.csv");
+        let meta_path = path.with_extension("coverage.txt");
+        let digest = Sha256::digest(&bytes);
+        let critters = t
+            .scene
+            .blocks
+            .iter()
+            .map(|block| block.critters.len())
+            .sum::<usize>();
+        let mut meta = format!(
+            "coverage_schema=1\nmap={:?}\nmode={mode:?}\nrgba8_sha256={digest:x}\nimage={width}x{height}\n\
+             eye={:?}\nyaw={}\npitch={}\nfar={}\nhour={}\nweather={}\nwarmup_frames={warmup}\nwarmup_step_ms=16\n\
+             cutoff={}\nscenery_quality={}\nsettings={:?}\nadapter={info:?}\ncritters_authored_not_in_world_model_feed={critters}\n",
+            t.map.id, cam.pos.to_array(), cam.yaw, cam.pitch, cam.far, cam.time_of_day,
+            cam.weather_override.token(), renderer.detail.terrain_cutoff,
+            renderer.detail.scenery_quality, renderer.lighter.settings,
+        );
+        for (name, count) in ["world", "walker", "populator"]
+            .into_iter()
+            .zip(renderer.lighter.skin_omissions)
+        {
+            writeln!(meta, "unsupported_ski_{name}={count}").unwrap();
+        }
+        if let Some(bmd) = &renderer.lighter.scenery_coverage {
+            writeln!(meta, "{bmd}").unwrap();
+        }
+        for (file, text) in [(counts_path, inventory.csv()), (meta_path, meta)] {
+            std::fs::write(&file, text).map_err(|e| format!("{}: {e}", file.display()))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
