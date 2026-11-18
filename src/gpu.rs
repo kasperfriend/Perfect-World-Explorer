@@ -3080,10 +3080,17 @@ impl Renderer {
             snapshot.clip,
             snapshot.fog_range,
             snapshot.fog_color,
-            [crate::render_scale::mip_bias(), crate::render_scale::mip_gradient_scale(), 0., 0.],
+            [
+                crate::render_scale::mip_bias(),
+                crate::render_scale::mip_gradient_scale(),
+                0.,
+                0.,
+            ],
         );
         let radius = self.detail.radius.max(1) as f32 * self.model_scene.block_size.max(1.);
-        if let Some(light) = camera.regional_light { self.retained_regional_light = Some(light); }
+        if let Some(light) = camera.regional_light {
+            self.retained_regional_light = Some(light);
+        }
         let light = camera.regional_light.or(self.retained_regional_light);
         let resident = self.resident_bounds();
         if let Some(models) = &mut self.models {
@@ -3091,11 +3098,20 @@ impl Renderer {
             models.set_resident_bounds(resident);
             models.set_effects_enabled(camera.world_effects);
             models.set_effect_distance(camera.effect_distance);
-            models.set_frustum(Some(crate::world_objects::frustum_planes_from_matrix(matrix.to_cols_array())));
+            models.set_frustum(Some(crate::world_objects::frustum_planes_from_matrix(
+                matrix.to_cols_array(),
+            )));
             models.set_keep_unbounded(crate::objects::unbounded_textures());
-            models.update_pass(&self.device, &self.queue, receiving_model_frame(&uniform, camera, light),
-                camera.pos.to_array(), &self.model_lights,
-                crate::environment::night_factor(camera.time_of_day), camera.logic_delta_ms, true);
+            models.update_pass(
+                &self.device,
+                &self.queue,
+                receiving_model_frame(&uniform, camera, light),
+                camera.pos.to_array(),
+                &self.model_lights,
+                crate::environment::night_factor(camera.time_of_day),
+                camera.logic_delta_ms,
+                true,
+            );
         }
     }
 
