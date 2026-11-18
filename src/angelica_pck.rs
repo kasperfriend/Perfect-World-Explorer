@@ -29,6 +29,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
 const WINDOWS: [usize; 3] = [1 << 16, 1 << 19, 1 << 22];
+/// `u32 0x4dca23ef`, file size, `u32 0x56a089b7`; the first payload follows it.
+const ANGELICA_PREFIX_LEN: usize = 12;
 const MIN_COMPRESSED_RECORD: usize = 8;
 
 fn u32le(b: &[u8], p: usize) -> Result<u32, String> {
@@ -86,7 +88,7 @@ fn record_ending_at(
 /// [`crate::pck::read_entry`] can read their payloads unchanged.
 pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     let file_len = f.seek(SeekFrom::End(0)).map_err(|e| e.to_string())?;
-    if file_len < 12 + 280 {
+    if file_len < (ANGELICA_PREFIX_LEN + 280) as u64 {
         return Err("Angelica package too small".into());
     }
     f.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
@@ -146,6 +148,25 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
             return Err("Angelica record prefix out of bounds".into());
         }
         pos = start - 8;
+    }
+    // The records were walked backwards from the trailer, so after `count` of
+    // them the cursor should sit exactly on the end of the last payload. A gap
+    // means the framing was misread -- a wrong count, a record stream that is
+    // not where it was expected -- and the entries that came out would not be
+    // the archive's. The shipped packs land exactly, so this costs no coverage.
+    // Payloads start right after the 12-byte prefix, so that is where an
+    // empty package -- a real one is exactly 12 + 280 bytes -- leaves the run.
+    // Checking it unconditionally is what makes a tampered count of 0 a
+    // refusal instead of a plausible-looking empty archive.
+    let payload_end = reversed
+        .iter()
+        .map(|e| e.offset as u64 + e.compressed as u64)
+        .max()
+        .unwrap_or(ANGELICA_PREFIX_LEN as u64);
+    if pos as u64 != payload_end {
+        return Err(format!(
+            "Angelica record run ends at {pos} but the payloads end at {payload_end}"
+        ));
     }
     reversed.reverse();
     Ok(reversed)
@@ -209,5 +230,33 @@ mod tests {
         let payload = crate::pck::read_entry(&mut file, &entries[0]).unwrap();
         assert_eq!(payload, stored);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The record run is walked backwards from the trailer, so `count` decides
+    /// how far back it goes. A count that is too small leaves the cursor short
+    /// of the prefix and a count that is too large runs past it; either way the
+    /// records that came out are not the archive's directory. Before the run
+    /// was checked against the payloads, a count of 0 was reported as a valid
+    /// empty archive.
+    #[test]
+    fn a_record_run_that_does_not_land_on_the_prefix_is_refused() {
+        let pkg = package("configs/sky.lst", b"3\r\n0\r\n");
+        let count_at = pkg.len() - 280 + 272;
+        let count = u32::from_le_bytes(pkg[count_at..count_at + 4].try_into().unwrap());
+        assert_eq!(count, 1, "the fixture has one record");
+        for wrong in [0u32, count - 1, count + 1, count + 7] {
+            let mut tampered = pkg.clone();
+            tampered[count_at..count_at + 4].copy_from_slice(&wrong.to_le_bytes());
+            let path = std::env::temp_dir().join(format!("pw-angelica-count-{wrong}.pck"));
+            std::fs::write(&path, &tampered).unwrap();
+            let mut file = File::open(&path).unwrap();
+            let result = directory(&mut file);
+            assert!(
+                result.is_err(),
+                "a count of {wrong} must not yield a directory, got {:?}",
+                result.map(|e| e.len())
+            );
+            std::fs::remove_file(&path).ok();
+        }
     }
 }
