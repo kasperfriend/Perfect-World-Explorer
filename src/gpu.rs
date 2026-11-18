@@ -3146,8 +3146,14 @@ impl Renderer {
             sky_moon: frame.moon,
             time_advances: 1,
             light_publications: 1,
-            weather: Default::default(),
-            weather_ticks: 0,
+            weather: camera.weather_override.apply(
+                camera
+                    .regional_light
+                    .map_or_else(crate::client_weather::WeatherSelection::default, |light| {
+                        light.weather_selection()
+                    }),
+            ),
+            weather_ticks: self.weather.wrapped_ticks(),
         };
         self.frame = snapshot;
         snapshot
@@ -3839,16 +3845,10 @@ impl Renderer {
             self.queue_main_runs();
             lap(STAGE_VISIBILITY, &mut stage_ms, &mut lap_at);
         }
-        let mut frame = self.begin_frame(camera, w, h);
+        // Main, reflection and refraction share one authored state/tick.
         self.weather.advance(camera.logic_delta_ms);
-        let selected_weather = camera.regional_light.map_or(
-            crate::client_weather::WeatherSelection::default(),
-            |light| light.weather_selection(),
-        );
-        // Both ray and raster share the authored flag selection and 33ms tick.
-        let selected_weather = camera.weather_override.apply(selected_weather);
-        frame.weather = selected_weather;
-        frame.weather_ticks = self.weather.wrapped_ticks();
+        let frame = self.begin_frame(camera, w, h);
+        let selected_weather = frame.weather;
         if ray_world {
             if reset_history {
                 self.lighter.reset_history();

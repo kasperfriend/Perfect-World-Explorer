@@ -45,5 +45,12 @@ uses eye `(16, 356, 84)`, yaw `0`, pitch `−0.60`, hour `12`, and the same
 adapter for Native and Software. The first attempt, `44415303447`, failed
 before rendering while fetching the identical empty cloud header; it is
 not visual evidence. The retry copies the hash-verified 32-byte header from
-`a01` instead of fetching a duplicate. Keep its result separate from the
-synthetic proofs above.
+`a01` instead of fetching a duplicate. The [second attempt](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44415619628)
+stopped at an unsupported T2LM record. A third run disabled baked lightmaps
+in both backends and [passed](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44416746078)
+on `234075e`. Its [artifact](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44416746078/artifacts/14480306616)
+contains both PNGs, the Software count gate (one water body), adapter logs,
+and hashes/coverage for the other tested maps. The capture is CPU Vulkan
+and does not diagnose the unsupported lightmap. The sandbox could not
+retrieve the signed artifact blob to inspect the pixels. Keep this distinct
+from the checked synthetic shoreline material comparisons above.
