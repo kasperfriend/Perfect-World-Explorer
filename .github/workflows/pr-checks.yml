@@ -196,14 +196,27 @@ jobs:
           # Same flaky mirror as the build dependencies above: retry the install
           # instead of failing the three Vulkan checks behind it, and print apt's
           # own diagnosis as annotations if every attempt fails.
-          if dpkg -s mesa-vulkan-drivers >/dev/null 2>&1; then
-            echo "mesa-vulkan-drivers already installed"
+          #
+          # `dpkg -s` is not enough evidence: an image can report the package
+          # installed while the driver file itself is absent (the step used to
+          # exit 0 on `dpkg -s` and the sRGB step behind it then reported
+          # "no lavapipe ICD"), so the actual ICD is what gets checked, and a
+          # package that claims to be installed without one is reinstalled.
+          icd_present() {
+            find /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d /etc/vulkan/icd.d \
+              -maxdepth 1 -name '*lvp*' -print -quit 2>/dev/null | grep -q .
+          }
+          if dpkg -s mesa-vulkan-drivers >/dev/null 2>&1 && icd_present; then
+            echo "mesa-vulkan-drivers already installed, lavapipe ICD present"
             exit 0
+          fi
+          if dpkg -s mesa-vulkan-drivers >/dev/null 2>&1; then
+            echo "mesa-vulkan-drivers claims to be installed but the lavapipe ICD is missing; reinstalling"
           fi
           status=1
           for attempt in 1 2 3; do
             if timeout 240 sudo apt-get install -y --no-install-recommends \
-              mesa-vulkan-drivers 2>&1 | tee /tmp/vulkan-apt.log; then
+              --reinstall mesa-vulkan-drivers 2>&1 | tee /tmp/vulkan-apt.log; then
               status=0
               break
             fi
@@ -236,6 +249,23 @@ jobs:
             found="$(find "$dir" -maxdepth 1 -name '*lvp*' -print -quit 2>/dev/null || true)"
             if [ -n "$found" ]; then icd="$found"; continue; fi
           done
+          # Some Mesa builds ship the driver library without an ICD manifest.
+          # Writing the manifest here is what the loader needs and what an
+          # installed driver already provides, so it adds no assumption about
+          # the driver itself — only the path to it.
+          if [ -z "$icd" ]; then
+            driver="$(find /usr/lib /lib -name 'libvulkan_lvp.so*' -print -quit 2>/dev/null || true)"
+            if [ -n "$driver" ]; then
+              icd="$RUNNER_TEMP/lvp_icd.json"
+              cat >"$icd" <<JSON
+          {
+            "file_format_version": "1.0.0",
+            "ICD": { "library_path": "$driver", "api_version": "1.3.0" }
+          }
+          JSON
+              echo "lavapipe has no ICD manifest; wrote one for $driver" >>"$log"
+            fi
+          fi
           echo "VK_ICD_FILENAMES=$icd" >>"$log"
           ls -l /usr/share/vulkan/icd.d >>"$log" 2>&1 || true
           if [ -z "$icd" ]; then
