@@ -14,8 +14,8 @@ permissions:
 jobs:
   capture:
     name: Capture a01 and a02 (Software RT on CPU Vulkan)
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -38,9 +38,19 @@ jobs:
           done < tools/fixtures/lighter-retail-inputs.txt
       - name: Install Linux renderer dependencies
         run: |
-          sudo apt-get update -o Acquire::Retries=2
-          sudo apt-get install -y --no-install-recommends \
-            libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxkbcommon-dev mesa-vulkan-drivers
+          set -euo pipefail
+          missing=()
+          for package in libx11-dev libxi-dev libxcursor-dev libxrandr-dev libxkbcommon-dev mesa-vulkan-drivers; do
+            if ! dpkg -s "$package" >/dev/null 2>&1; then missing+=("$package"); fi
+          done
+          if (( ${#missing[@]} == 0 )); then exit 0; fi
+          install() {
+            timeout 120 sudo apt-get -o Acquire::Retries=1 install -y --no-install-recommends "${missing[@]}"
+          }
+          install || {
+            timeout 180 sudo apt-get -o Acquire::Retries=1 update
+            install
+          }
       - name: Build viewer
         run: cargo build --locked --bin perfect-world-explorer
       - name: Render and inventory both maps
