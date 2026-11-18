@@ -601,9 +601,9 @@ impl Drop for Core {
 
 struct Output {
     // wgpu owns VkBuffer after import. We own its allocation. The interop
-    // path observes completion of both queues of work (native and wgpu, on
-    // the same VkQueue) before replacement/drop. `destroy()` then releases
-    // the VkBuffer before we free the allocation; wgpu no longer uses it.
+    // path observes completion of both native and wgpu work on the same
+    // VkQueue before replacement/drop. `destroy()` invalidates the import
+    // before we free the allocation; no later commands can use it.
     imported: Option<wgpu::Buffer>,
     raw: Buffer,
 }

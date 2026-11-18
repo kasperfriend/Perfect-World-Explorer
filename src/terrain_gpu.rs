@@ -1,6 +1,10 @@
 //! GPU terrain: original material layers and masks, plus a persistent world LOD mesh.
 use crate::{gpu::Vertex, Terrain};
 use bytemuck::{Pod, Zeroable};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use wgpu::util::DeviceExt;
 const MASK_PAGE: usize = 4096;
 const TEX: usize = 512;
@@ -37,7 +41,7 @@ pub struct TerrainGpu {
     resources: MaterialBindings,
     tex_map: Vec<u32>,
     mask_bytes: usize,
-    mask_upload: Option<std::sync::mpsc::Receiver<()>>,
+    mask_upload: Option<Arc<AtomicBool>>,
     pub grass_light_layout: wgpu::BindGroupLayout,
     pub grass_light_bind: wgpu::BindGroup,
     /// One indirect record per visible run, for the near and the far mesh. The
@@ -881,11 +885,10 @@ impl TerrainGpu {
             &self.tex_map,
             MaskUpload::Streaming,
         )?;
-        let (sent, complete) = std::sync::mpsc::channel();
-        queue.on_submitted_work_done(move || {
-            let _ = sent.send(());
-        });
-        self.mask_upload = Some(complete);
+        // TerrainGpu is also shared by the scoped visibility workers.
+        let complete = Arc::new(AtomicBool::new(false));
+        self.mask_upload = Some(complete.clone());
+        queue.on_submitted_work_done(move || complete.store(true, Ordering::Release));
         self.mask_bytes = masks.bytes;
         self.bind = self.resources.bind(device, normal, &masks);
         self.reflect_bind = self.resources.bind(device, reflection, &masks);
@@ -899,9 +902,11 @@ impl TerrainGpu {
     /// Until then leave the new mesh in the worker's result channel; the current
     /// bindings are valid and all draws follow the upload on the same queue.
     pub fn can_update_residency(&mut self) -> bool {
-        if self.mask_upload.as_ref().is_some_and(|upload| {
-            matches!(upload.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty))
-        }) {
+        if self
+            .mask_upload
+            .as_ref()
+            .is_some_and(|upload| !upload.load(Ordering::Acquire))
+        {
             return false;
         }
         self.mask_upload = None;
