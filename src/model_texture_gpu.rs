@@ -126,11 +126,14 @@ pub(crate) fn decode_for_rays(bytes: &[u8]) -> Result<(Vec<image::RgbaImage>, bo
     // generated mip tail is a mip fallback rather than a missing texture.
     let dds = match Dds::parse(bytes) {
         Ok(dds) => dds,
-        Err(error) => {
-            return decode_rgba(bytes)
-                .map(|(image, alpha)| (vec![image], alpha))
-                .map_err(|_| error)
-        }
+        Err(error) => match Dds::parse_base(bytes) {
+            Ok(base) => base,
+            Err(_) => {
+                return decode_rgba(bytes)
+                    .map(|(image, alpha)| (vec![image], alpha))
+                    .map_err(|_| error)
+            }
+        },
     };
     let mut images = Vec::with_capacity(dds.mips.len());
     let mut has_alpha = dds.format.alpha_texture();
@@ -334,6 +337,10 @@ mod tests {
         assert_eq!(levels[1].dimensions(), (2, 1));
         assert_eq!(levels[0].get_pixel(0, 0).0, [255, 0, 0, 255]);
         assert_eq!(levels[1].get_pixel(1, 0).0, [0, 255, 0, 255]);
+        bytes.truncate(136);
+        assert!(Dds::parse(&bytes).is_err());
+        let (fallback, _) = decode_for_rays(&bytes).unwrap();
+        assert_eq!(&fallback, &levels[..1]);
     }
 
     #[test]

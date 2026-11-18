@@ -217,10 +217,6 @@ fn filtered_tile(addr: u32, uv: vec2<f32>, edge: bool, taps: Taps) -> vec4<f32> 
     let data = (texels[addr+3u] & LINEAR_DATA)!=0u;
     return unassociate(tap_average(addr,uv,edge,taps,data,false,0.,0u),data);
 }
-fn tile(addr: u32, uv: vec2<f32>, edge: bool) -> vec4<f32> {
-    let data = (texels[addr+3u] & LINEAR_DATA)!=0u;
-    return unassociate(level(addr,uv,edge,0u,data),data);
-}
 fn terrain_color(p: vec3<f32>, face: vec3<f32>, ray: Ray, t: f32) -> vec3<f32> {
     let coord = clamp(vec2<f32>(p.x,-p.z)/frame.terrain.z + frame.terrain.xy*0.5,
                       vec2<f32>(0.),frame.terrain.xy-vec2<f32>(1.))/frame.terrain.w;
@@ -453,34 +449,59 @@ fn advance(t: f32) -> f32 {
     // from being visited twice, without leaving a gap before the next one.
     return bitcast<f32>(bitcast<u32>(t)+1u);
 }
-fn sky_triple(d: vec3<f32>, layer: vec3<u32>) -> vec3<f32> {
-    // Native camera-centred roof cap and panorama skirt mapping, fed with
-    // this ray's direction rather than a rasterized screen coordinate.
-    let y = clamp(d.y,0.,1.);
-    let cap = -47.685848*y + sqrt(226.05995+2273.93991*y*y);
-    let roof_uv = vec2<f32>(0.5) + d.xz*(cap/30.070580);
-    let roof = tile(layer.z,roof_uv*frame.sky_uv.z+frame.sky_uv.xy,false).rgb;
+fn sky_triple(d: vec3<f32>, spread: f32, layer: vec3<u32>) -> vec3<f32> {
+    // Native camera-centred roof cap and panorama skirt mapping. At infinity
+    // the cone's angle, not its world-space width, controls the lookup.
+    let roof_weight = smoothstep(-0.015,0.015,d.y);
+    var roof = vec3<f32>(0.);
+    if roof_weight>0. {
+        let y = max(d.y,0.);
+        let root = sqrt(226.05995+2273.93991*y*y);
+        let cap = (-47.685848*y + root)/30.070580;
+        let dy = select(0.,(-47.685848 + 2273.93991*y/root)/30.070580,d.y>=0.);
+        let scale = frame.sky_uv.z;
+        let uv = (vec2<f32>(0.5) + d.xz*cap)*scale + frame.sky_uv.xy;
+        let taps = footprint_taps(layer.z,d,d,vec3<f32>(cap,d.x*dy,0.)*scale,
+                                  vec3<f32>(0.,d.z*dy,cap)*scale,spread);
+        roof = filtered_tile(layer.z,uv,false,taps).rgb;
+        dependencies |= ANIM_SKY;
+    }
+    if roof_weight>=1. { return roof; }
+    let horizon = max(length(d.xz),1.e-6);
     let az = atan2(max(abs(d.z),1.e-7),d.x);
-    let v = mix(0.275,0.5,clamp((50.*d.y/max(length(d.xz),1.e-6)) / -10.602875,0.,1.));
+    let row = (50./-10.602875)*d.y/horizon;
+    let v = mix(0.275,0.5,clamp(row,0.,1.));
     let mirrored = az>=1.5707963;
     let u = clamp(select(1.,2.,mirrored) - 2.*az/3.14159265,0.,1.);
     let other = clamp(select(2.,1.,mirrored) - 2.*az/3.14159265,0.,1.);
     let primary = select(layer.y,layer.x,d.z>=0.);
     let side = select(layer.x,layer.y,d.z>=0.);
+    let gu = (2./3.14159265)*vec3<f32>(abs(d.z),0.,-d.x*sign(d.z))/(horizon*horizon);
+    let gv = select(vec3<f32>(0.), (0.225*50./-10.602875)/horizon
+                  *vec3<f32>(-d.x*d.y/(horizon*horizon),1.,-d.z*d.y/(horizon*horizon)),
+                   row>0. && row<1.);
+    let primary_taps = footprint_taps(primary,d,d,gu,gv,spread);
+    let a = filtered_tile(primary,vec2<f32>(u,v),true,primary_taps).rgb;
+    var skirt = a;
     let seam = (1.-smoothstep(0.,0.06,abs(az-1.5707963)))*0.5;
-    let a = mix(tile(primary,vec2<f32>(u,v),true).rgb,tile(primary,vec2<f32>(other,v),true).rgb,seam);
-    let b = tile(side,vec2<f32>(u,v),true).rgb;
-    let skirt = mix(a,b,(1.-smoothstep(0.,0.12,abs(d.z)))*0.5);
-    if d.y> -0.015 { dependencies |= ANIM_SKY; }
-    return mix(skirt,roof,smoothstep(-0.015,0.015,d.y));
+    if seam>0. {
+        skirt = mix(skirt,filtered_tile(primary,vec2<f32>(other,v),true,primary_taps).rgb,seam);
+    }
+    let side_weight = (1.-smoothstep(0.,0.12,abs(d.z)))*0.5;
+    if side_weight>0. {
+        let side_taps = footprint_taps(side,d,d,gu,gv,spread);
+        skirt = mix(skirt,filtered_tile(side,vec2<f32>(u,v),true,side_taps).rgb,side_weight);
+    }
+    return mix(skirt,roof,roof_weight);
 }
-fn environment(dir: vec3<f32>, seen_sun: bool) -> vec3<f32> {
+fn environment(ray: Ray, seen_sun: bool) -> vec3<f32> {
+    let dir = ray.dir;
     var sky = vec3<f32>(0.);
     if frame.sky0.x!=0u {
-        var radiance = sky_triple(dir,frame.sky0.xyz);
+        var radiance = sky_triple(dir,ray.spread,frame.sky0.xyz);
         let f = bitcast<f32>(frame.sky0.w);
         if f>0. && frame.sky1.x!=0u {
-            radiance = mix(radiance,sky_triple(dir,frame.sky1.xyz),f);
+            radiance = mix(radiance,sky_triple(dir,ray.spread,frame.sky1.xyz),f);
         }
         sky = linear(encoded(radiance)*clamp(frame.sky_tint.rgb,vec3<f32>(0.),vec3<f32>(1.)));
     } else {
@@ -729,7 +750,7 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
             if solid.instance==NIL {
                 // No exit surface was found within the streamed world.
                 if path.wet { result += path.weight*frame.water_color.rgb; }
-                else { result += path.weight*environment(ray.dir,path.purpose!=DIFFUSE); }
+                else { result += path.weight*environment(ray,path.purpose!=DIFFUSE); }
                 break;
             }
             let p = ray.origin + ray.dir*solid.t;

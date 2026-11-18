@@ -188,6 +188,32 @@ The native whole-world BMD preload, temporal upscalers and frame generation
 are paused while Lighter renders. Existing saved choices for those features
 are unchanged; Lighter uses the separate bounded BMD region described above.
 
+### Ray texture filtering
+
+The texture bank retains authored DDS levels for terrain, vegetation, scenery,
+animated models/effects, sky and water normals when they fit. An oversized
+source uses the first authored level that fits and keeps its contiguous tail;
+short authored chains clamp to their last resident level. Single-level images
+and sources with no usable authored level under the cap get generated mips.
+The common terrain cap targets 48 MiB, with a 512-pixel maximum side for color,
+128 for water normals and 32 for the terrain blend masks. The shared bank is
+limited to 128 MiB (also subject to the device's buffer limits). This isn't
+a virtual texture system or a promise to retain every original top level.
+
+RGB is decoded from sRGB before each filter tap and associated with linear
+alpha to avoid transparent color fringes. Masks, normals and alpha aren't
+sRGB-decoded. Generated cutout levels store passing area; authored cutouts
+retain their original alpha levels and test against the material reference.
+Grass uses its original image chain independent of the native atlas layout.
+
+**Ray texture anisotropy** defaults to 8×; 1× uses isotropic trilinear and 16×
+spends more samples along the projected footprint's long axis to retain detail
+across it. Primary and secondary rays use that same filter. For headless
+comparisons set `PW_PREVIEW_ANISOTROPY=1|8|16`. Capture metadata records
+`mip_authored_levels`, `mip_generated`, `mip_reduced` and `mip_fallback` (the
+union of generated and reduced **tiles**, counted once per admitted tile).
+These are separate from missing textures. Masks contribute to generated counts.
+
 ## Capture geometry coverage
 
 Set `PW_PREVIEW_COVERAGE=1` with an explicit Software or Hardware headless

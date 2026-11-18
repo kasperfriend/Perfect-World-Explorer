@@ -390,6 +390,49 @@ fn fixture(element: &std::path::Path) -> Terrain {
 }
 
 #[test]
+fn ray_grass_tiles_reuse_authored_rectangles_without_native_atlas_pixels() {
+    use crate::modules::lighter::textures::Textures;
+    use std::sync::Arc;
+    let path = "grass.dds";
+    let mut grass = crate::grass::Grass {
+        areas: vec![],
+        types: vec![],
+        models: vec![],
+        textures: Default::default(),
+        texture_mips: Default::default(),
+    };
+    grass.textures.insert(
+        path.into(),
+        image::RgbaImage::from_pixel(8, 2, image::Rgba([9, 77, 133, 255])),
+    );
+    grass.texture_mips.insert(
+        path.into(),
+        vec![image::RgbaImage::from_pixel(
+            4,
+            1,
+            image::Rgba([5, 30, 60, 128]),
+        )],
+    );
+    let mut stream = super::SceneryStream::default();
+    // A change of renderer slot never replaces the source mip chain; without
+    // a slot change the native build may omit its atlas pixels altogether.
+    let slot = |x| crate::texture_atlas::Slot {
+        x,
+        y: 0,
+        w: 128,
+        h: 128,
+    };
+    let first = super::grass_tiles(&mut stream, &grass, &[(slot(0), path, false)]).unwrap();
+    let next = super::grass_tiles(&mut stream, &grass, &[(slot(128), path, false)]).unwrap();
+    assert!(Arc::ptr_eq(&first[&[0, 0]], &next[&[128, 0]]));
+    let mut bank = Textures::default();
+    bank.insert(&next[&[128, 0]]).unwrap();
+    assert_eq!(bank.mips.authored_levels, 2);
+    assert_eq!(bank.mips.fallback, 0);
+    assert_eq!(bank.byte_len(), (6 + 6 + 16 + 4) * 4);
+}
+
+#[test]
 fn far_terrain_keeps_only_triangles_outside_the_resident_footprint() {
     let points = [[-4., 0., 0.], [0., 0., 0.], [0., 0., 4.], [4., 0., 4.]];
     let far = super::Mesh {
@@ -1052,6 +1095,18 @@ fn lighter_coverage_fixture_capture() {
     );
     let meta = std::fs::read_to_string(path.with_extension("coverage.txt")).unwrap();
     assert!(meta.contains("map=\"lighter-fixture\"\n") && meta.contains("warmup_frames=2\n"));
+    for field in [
+        "mip_fallback",
+        "mip_generated",
+        "mip_reduced",
+        "mip_authored_levels",
+    ] {
+        let value = meta
+            .lines()
+            .find_map(|line| line.strip_prefix(field).and_then(|s| s.strip_prefix('=')))
+            .and_then(|s| s.parse::<usize>().ok());
+        assert!(value.is_some(), "invalid mip audit field: {field}");
+    }
     use sha2::{Digest, Sha256};
     let rgba = image::open(&path).unwrap().into_rgba8();
     let digest = Sha256::digest(rgba.as_raw());

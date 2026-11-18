@@ -51,6 +51,17 @@ pub struct Dds<'a> {
 }
 impl<'a> Dds<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, String> {
+        Self::parse_levels(bytes, false)
+    }
+
+    /// Decodable base of a DDS whose declared lower chain is damaged. Keep
+    /// native upload strict, but allow ray consumers to generate a mip tail.
+    #[allow(dead_code)] // only the viewer's alternate texture sampler needs it
+    pub(crate) fn parse_base(bytes: &'a [u8]) -> Result<Self, String> {
+        Self::parse_levels(bytes, true)
+    }
+
+    fn parse_levels(bytes: &'a [u8], base_only: bool) -> Result<Self, String> {
         let header = bytes.get(..128).ok_or("truncated model DDS header")?;
         let word = |i| u32::from_le_bytes(header[i..i + 4].try_into().unwrap());
         if &header[..4] != b"DDS " || word(4) != 124 || word(76) != 32 {
@@ -125,7 +136,7 @@ impl<'a> Dds<'a> {
         if width == 0 || height == 0 || width > 16384 || height > 16384 {
             return Err("model DDS dimensions out of bounds".into());
         }
-        let count = word(28).max(1);
+        let count = if base_only { 1 } else { word(28).max(1) };
         let max_count = 32 - width.max(height).leading_zeros();
         if count > max_count {
             return Err("model DDS mip count exceeds dimensions".into());

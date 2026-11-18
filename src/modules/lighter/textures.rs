@@ -543,6 +543,17 @@ mod tests {
     }
 
     #[test]
+    fn failed_tile_admission_does_not_change_mip_stats() {
+        let mut bank = Textures::default();
+        // Simulate a full sealed prefix without allocating 128 MiB in a test.
+        bank.prefix_words = MAX_TEXTURE_BYTES / 4 - bank.tail.len();
+        let tile = Tile::new([2, 1], 2, Filter::Data, |_, _| 0).unwrap();
+        assert!(bank.insert(&tile).is_err());
+        assert_eq!(bank.mips, MipStats::default());
+        assert_eq!(bank.byte_len(), MAX_TEXTURE_BYTES);
+    }
+
+    #[test]
     fn reduced_cutout_stores_area_and_cannot_inherit_hidden_rgb() {
         // 1 of 3 texels passes the strict reference. Neither of the failed
         // texels (blue with nonzero alpha and transparent magenta) can bleed.

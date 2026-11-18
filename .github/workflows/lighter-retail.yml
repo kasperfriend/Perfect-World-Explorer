@@ -4,6 +4,9 @@ name: Lighter retail coverage
 # for maps and packages; never cache or upload client asset bytes.
 on:
   workflow_dispatch:
+  push:
+    branches: [arena/69c8ea78-perfect-world-explorer]
+    paths: [.github/workflows/lighter-retail.yml]
 
 permissions:
   contents: read
@@ -57,6 +60,7 @@ jobs:
           WGPU_BACKEND: vulkan
           PW_PREVIEW_LIGHTER: software
           PW_PREVIEW_COVERAGE: '1'
+          PW_PREVIEW_ANISOTROPY: '8'
           PW_PREVIEW_WARMUP: '24'
         run: |
           set -euo pipefail
@@ -89,6 +93,8 @@ jobs:
               exit 1
             fi
             echo "::notice::$map $(grep '^rgba8_sha256=' "$stem.coverage.txt")"
+            grep -Eq '^mip_authored_levels=[1-9][0-9]*$' "$stem.coverage.txt"
+            echo "::notice::$map $(grep '^mip_' "$stem.coverage.txt" | tr '\n' ' ')"
             for row in near_terrain buildings effect_roots effect_draws; do
               echo "::notice::$map $(grep "^$row," "$stem.coverage.csv")"
             done
