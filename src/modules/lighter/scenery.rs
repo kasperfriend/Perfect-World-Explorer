@@ -95,10 +95,10 @@ impl Asset {
         let x = y.cross(z).normalize_or_zero();
         let position = Vec3::from_array(model.position);
         // Group by stable 128 m world cells, not by camera or local/extra status.
-        let [x, _, z] = objects.ornaments[id].position;
+        let [px, _, pz] = objects.ornaments[id].position;
         let mut asset = Self {
             id,
-            block: ((x / 128.).floor() as i32, (z / 128.).floor() as i32),
+            block: ((px / 128.).floor() as i32, (pz / 128.).floor() as i32),
             mesh: Mesh::default(),
             surfaces: Vec::new(),
             tiles: Vec::new(),

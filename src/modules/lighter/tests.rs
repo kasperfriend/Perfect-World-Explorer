@@ -1442,6 +1442,12 @@ fn exercise_accel_reuse(h: &mut Harness) {
         let [a, b, c] = refits.unwrap();
         assert_eq!(rt.as_refits, [a, b + 1, c + 1]);
     }
+    let moved_view = test_frame(Vec3::X * 3., -Vec3::Z, 3);
+    assert_eq!(
+        h.pixel(moved_view, &pose(3., true)),
+        tinted,
+        "refit did not cover the new pose bounds"
+    );
     assert_eq!(cache.builds, [1, 1]);
     assert_eq!(cache.refits, [1, 1]);
 }
