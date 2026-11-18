@@ -633,6 +633,7 @@ pub fn read_entry(_f: &mut std::fs::File, _e: &Entry) -> Result<Vec<u8>, String>
 EOF
         cat > "$OUT/water/image.rs" <<'EOF'
 //! The few `image` items `src/water.rs` names outside the decode path.
+#[derive(Clone)]
 pub struct RgbaImage { pub w: u32, pub h: u32, pub pixels: Vec<u8> }
 impl RgbaImage {
     pub fn from_raw(w: u32, h: u32, pixels: Vec<u8>) -> Option<Self> {
@@ -646,16 +647,44 @@ impl RgbaImage {
         ([p[0], p[1], p[2], p[3]], ())
     }
 }
+impl RgbaImage {
+    pub fn width(&self) -> u32 { self.w }
+    pub fn height(&self) -> u32 { self.h }
+    pub fn pixels(&self) -> std::slice::Iter<'_, u8> { self.pixels.iter() }
+    pub fn as_raw(&self) -> &Vec<u8> { &self.pixels }
+    pub fn from_pixel(w: u32, h: u32, p: Rgba<u8>) -> Self {
+        Self { w, h, pixels: p.0.iter().copied().cycle().take((w as usize) * (h as usize) * 4).collect() }
+    }
+}
+#[derive(Clone, Copy)]
+pub struct Rgba<T>(pub [T; 4]);
+impl Rgba<u8> {
+    pub fn channels(&self) -> [u8; 4] { self.0 }
+}
 pub struct DynamicImage;
 impl DynamicImage {
     pub fn to_rgba8(&self) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
+    pub fn into_rgba8(self) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
+    pub fn width(&self) -> u32 { 0 }
+    pub fn height(&self) -> u32 { 0 }
 }
-pub enum ImageFormat { Dds }
+pub enum ImageFormat { Dds, Png }
 pub fn load_from_memory_with_format(_b: &[u8], _f: ImageFormat) -> Result<DynamicImage, String> {
     Err("stub".into())
 }
+pub fn load_from_memory(_b: &[u8]) -> Result<DynamicImage, String> { Err("stub".into()) }
+pub fn open(_p: impl AsRef<std::path::Path>) -> Result<DynamicImage, String> { Err("stub".into()) }
+pub fn save_buffer(_p: impl AsRef<std::path::Path>, _b: &[u8], _w: u32, _h: u32, _c: ()) -> Result<(), String> {
+    Err("stub".into())
+}
+
 pub mod imageops {
     use super::RgbaImage;
+    pub fn resize(img: &RgbaImage, w: u32, h: u32, _f: ()) -> RgbaImage {
+        RgbaImage { w, h, pixels: img.pixels.clone() }
+    }
+    pub fn grayscale(_img: &RgbaImage) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
+    pub fn flip_vertical(_img: &RgbaImage) -> RgbaImage { RgbaImage { w: 0, h: 0, pixels: Vec::new() } }
     pub fn crop_imm(_img: &RgbaImage, _x: u32, _y: u32, _w: u32, _h: u32) -> Crop { Crop }
     pub struct Crop;
     impl Crop {

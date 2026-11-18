@@ -85,6 +85,21 @@ pub struct Grass {
     /// The default world path ignores these; P4.07 opt-in uploads them verbatim.
     pub texture_mips: HashMap<String, Vec<image::RgbaImage>>,
 }
+impl Grass {
+    /// A map with no grass, for a map whose placement file cannot be read.
+    ///
+    /// The types still come from the scene, so the rest of the renderer sees
+    /// the same shape it always does; only `areas` is empty.
+    pub fn empty(scene: &scene::Scene) -> Self {
+        Self {
+            areas: Vec::new(),
+            types: scene.grass_types.clone(),
+            models: Vec::new(),
+            textures: HashMap::new(),
+            texture_mips: HashMap::new(),
+        }
+    }
+}
 /// Record one dropped placement without letting a bad area take the map down.
 fn note(sink: &std::sync::Mutex<Vec<String>>, message: String) {
     if let Ok(mut notes) = sink.lock() {
@@ -301,34 +316,116 @@ fn mask(b: &[u8], expected: usize) -> Result<Vec<u32>, String> {
     }
     Ok(out)
 }
+/// Read the EC-BSD name table, or as much of it as the file really holds.
+///
+/// A map whose placement file is missing, truncated or not a grass EC-BSD at
+/// all has no grass — but it is still a map. Returning `Err` here aborted the
+/// whole load, which reached the user as a modal box holding one internal
+/// string ("grass record index", "invalid grass compress size"). Nothing below
+/// this point needs the name table to be complete, so the failures are returned
+/// as notes and the caller decides what to keep.
+fn grass_names(
+    b: &[u8],
+    notes: &std::sync::Mutex<Vec<String>>,
+) -> Result<Vec<String>, &'static str> {
+    if b.len() < 0x4c {
+        return Err("the grass EC-BSD is shorter than its header");
+    }
+    if u(b, 0).ok() != Some(0x42584f4d)
+        || u(b, 4).ok() != Some(0x42534446)
+        || u(b, 8).ok() != Some(12)
+    {
+        return Err("the grass EC-BSD header is not one this build reads");
+    }
+    let n = u(b, 12).unwrap_or(0) as usize;
+    if n > 10000 {
+        return Err("the grass EC-BSD declares an implausible name count");
+    }
+    let mut p = 0x4c;
+    let mut names = Vec::new();
+    for index in 0..n {
+        match water::path_string(b, &mut p) {
+            Ok(name) => names.push(name),
+            Err(_) => {
+                note(
+                    notes,
+                    format!("grass EC-BSD name {index} of {n} is truncated"),
+                );
+                break;
+            }
+        }
+    }
+    Ok(names)
+}
+
 impl Grass {
     pub fn load(scene: &scene::Scene, dir: &Path, element: &Path) -> Result<Self, String> {
-        let b = fs::read(ecbsd_path(dir)).map_err(|e| e.to_string())?;
-        if u(&b, 0)? != 0x42584f4d || u(&b, 4)? != 0x42534446 || u(&b, 8)? != 12 {
-            return Err("unsupported grass EC-BSD".into());
-        }
-        let n = u(&b, 12)? as usize;
-        if n > 10000 {
-            return Err("invalid grass BSData count".into());
-        }
-        let mut p = 0x4c;
-        let mut names = Vec::new();
-        for _ in 0..n {
-            names.push(water::path_string(&b, &mut p)?)
-        }
+        // Diagnostics for placements that were dropped. Threads share one sink
+        // and it is summarised once, so a map with many odd areas prints a
+        // handful of lines instead of thousands. It has to exist before the
+        // header is read, because the header can fail too.
+        let notes: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let b = match fs::read(ecbsd_path(dir)) {
+            Ok(b) => b,
+            Err(error) => {
+                // No placement file at all is a map without grass, not a
+                // failure to open the map.
+                crate::diag!(
+                    TimingLoad,
+                    "Grass: no EC-BSD placement file in this map ({error}); the map loads without grass"
+                );
+                return Ok(Self::empty(scene));
+            }
+        };
+        let names = match grass_names(&b, &notes) {
+            Ok(names) => names,
+            Err(reason) => {
+                crate::diag!(TimingLoad, "Grass: {reason}; the map loads without grass");
+                return Ok(Self::empty(scene));
+            }
+        };
         let mut records = Vec::new();
         let mut seen = HashMap::new();
+        let mut skipped_blocks = 0usize;
         for block in &scene.blocks {
             for r in &block.grass {
                 if let Some(previous) = seen.insert(r.export_id, r.offset) {
                     if previous != r.offset {
-                        return Err("inconsistent grass record".into());
+                        // One export id with two offsets is a duplicated
+                        // reference. Drop the copy instead of the map.
+                        note(
+                            &notes,
+                            format!("grass export {} names two record offsets", r.export_id),
+                        );
+                        continue;
                     }
                     continue;
                 }
                 let off = r.offset as usize;
-                records.push((u(&b, off + 28)? as usize, records.len(), off));
+                // A placement offset past the end of the file costs this
+                // reference and nothing else.
+                match u(&b, off + 28) {
+                    Ok(index) => records.push((index as usize, records.len(), off)),
+                    Err(_) => {
+                        skipped_blocks += 1;
+                        if skipped_blocks <= 8 {
+                            note(
+                                &notes,
+                                format!("grass area at {off}: outside the EC-BSD placement file"),
+                            );
+                        }
+                    }
+                }
             }
+        }
+        if skipped_blocks > 8 {
+            note(
+                &notes,
+                format!(
+                    "{} more grass areas outside the EC-BSD placement file",
+                    skipped_blocks - 8
+                ),
+            );
         }
         // Read each BSData file exactly once, retaining only one at a time.
         // Restore original area order afterwards so draw order stays unchanged.
@@ -345,10 +442,6 @@ impl Grass {
             groups.push((idx, &records[g_start..g_end]));
             g_start = g_end;
         }
-        // Diagnostics for placements that were dropped. Threads share one
-        // sink and it is summarised once, so a map with many odd areas prints
-        // a handful of lines instead of thousands.
-        let notes: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
         // A grass area that cannot be decoded is dropped on its own: the map
         // still draws every other patch. Only a placement file that cannot be
         // opened at all is reported once per group.
@@ -378,47 +471,63 @@ impl Grass {
             // not corruption: nothing was placed in this area, so there is
             // nothing to decode.
             if data.len() >= 16 {
-                let magic = u(&data, 0).map_err(|e| e.to_string())?;
-                let version = u(&data, 4).map_err(|e| e.to_string())?;
-                let count = u(&data, data.len() - 4).map_err(|e| e.to_string())?;
+                let magic = u(&data, 0).unwrap_or(0);
+                let version = u(&data, 4).unwrap_or(0);
+                let count = u(&data, data.len() - 4).unwrap_or(u32::MAX);
                 if magic == 0x42584f4d && version == 2 && count == 0 {
                     return Ok(Vec::new());
                 }
             }
-            if u(&data, 0).map_err(|e| e.to_string())? != 0x42584f4d
-                || u(&data, 4).map_err(|e| e.to_string())? != 2
-            {
+            if u(&data, 0).ok() != Some(0x42584f4d) || u(&data, 4).ok() != Some(2) {
                 note(&notes, format!("{name}: unsupported grass BSData"));
                 return Ok(Vec::new());
             }
-            let tail = data
-                .len()
-                .checked_sub(4)
-                .ok_or_else(|| "short grass BSData".to_string())?;
-            let count = u(&data, tail).map_err(|e| e.to_string())? as usize;
-            let table_len = count
+            // Every bound below belongs to this one placement file. A file that
+            // does not describe a reachable record table is skipped with a note
+            // -- returning an error here is what turned one odd BSData file into
+            // a modal box over the whole map.
+            let Some(tail) = data.len().checked_sub(4) else {
+                note(&notes, format!("{name}: shorter than its own trailer"));
+                return Ok(Vec::new());
+            };
+            let count = u(&data, tail).unwrap_or(0) as usize;
+            let Some(table) = count
                 .checked_mul(4)
-                .ok_or_else(|| "grass table overflow".to_string())?;
-            let table = tail
-                .checked_sub(table_len)
-                .ok_or_else(|| "bad grass table".to_string())?;
+                .and_then(|table_len| tail.checked_sub(table_len))
+            else {
+                note(
+                    &notes,
+                    format!("{name}: record table of {count} does not fit the file"),
+                );
+                return Ok(Vec::new());
+            };
             let mut group_areas = Vec::with_capacity(group.len());
             for &(_, order, off) in group {
                 // Every per-area read is checked and, on failure, this one area
                 // is dropped. Aborting here turned one odd area into a modal
                 // error that blanked every grass patch in the map.
-                let type_id = u(&b, off).map_err(|e| e.to_string())? as usize;
+                let (Ok(type_id), Ok(cx), Ok(cy), Ok(cz)) =
+                    (u(&b, off), f(&b, off + 4), f(&b, off + 8), f(&b, off + 12))
+                else {
+                    note(
+                        &notes,
+                        format!("grass area at {off}: past the placement file"),
+                    );
+                    continue;
+                };
+                let type_id = type_id as usize;
                 if type_id >= scene.grass_types.len() {
                     note(&notes, format!("grass type {type_id} out of range"));
                     continue;
                 }
-                let cx = f(&b, off + 4).map_err(|e| e.to_string())?;
-                let cy = f(&b, off + 8).map_err(|e| e.to_string())?;
-                let cz = f(&b, off + 12).map_err(|e| e.to_string())?;
                 let center = [cx, cy, cz];
-                let grid = f(&b, off + 16).map_err(|e| e.to_string())?;
-                let width = u(&b, off + 20).map_err(|e| e.to_string())? as usize;
-                let height = u(&b, off + 24).map_err(|e| e.to_string())? as usize;
+                let (Ok(grid), Ok(width), Ok(height)) =
+                    (f(&b, off + 16), u(&b, off + 20), u(&b, off + 24))
+                else {
+                    note(&notes, format!("grass area at {off}: short record"));
+                    continue;
+                };
+                let (width, height) = (width as usize, height as usize);
                 if width == 0
                     || height == 0
                     || width > 4096
@@ -428,11 +537,16 @@ impl Grass {
                     note(&notes, format!("mask {width}x{height}"));
                     continue;
                 }
-                let cells = width
-                    .checked_mul(height)
-                    .ok_or_else(|| "grass mask overflow".to_string())?;
+                let Some(cells) = width.checked_mul(height) else {
+                    note(&notes, format!("grass area at {off}: mask size overflows"));
+                    continue;
+                };
                 let bytes = cells / 8;
-                let rec = u(&b, off + 32).map_err(|e| e.to_string())? as usize;
+                let Ok(rec) = u(&b, off + 32) else {
+                    note(&notes, format!("grass area at {off}: no record index"));
+                    continue;
+                };
+                let rec = rec as usize;
                 let Some(row) = rec
                     .checked_mul(4)
                     .and_then(|row| table.checked_add(row))
@@ -524,7 +638,13 @@ impl Grass {
         };
         let mut areas = Vec::with_capacity(records.len());
         for res in bsd_results {
-            areas.extend(res?);
+            match res {
+                Ok(group) => areas.extend(group),
+                // A group is one placement file. Failing it costs that file's
+                // areas, never the map, which is the whole point of the
+                // per-area tolerance above.
+                Err(reason) => note(&notes, reason),
+            }
         }
         // Name what was dropped, once per distinct reason. Silence here would
         // hide a map whose grass is thinner than the archive says it is.
@@ -732,6 +852,35 @@ mod tests {
     fn bits_are_most_significant_first() {
         assert_eq!(mask(&[0x81, 0x40], 2).unwrap(), vec![0, 7, 9]);
         assert!(mask(&[0], 2).is_err())
+    }
+    #[test]
+    fn a_placement_file_that_is_not_grass_ec_bsd_costs_only_the_grass() {
+        // The reported failure was a modal box holding "grass record index":
+        // `Grass::load` returned `Err` from inside its per-group closure, and
+        // the caller's `?` took the whole map down. A header the build does not
+        // read is now a note plus an empty grass set, so this must be `Ok`.
+        let notes = std::sync::Mutex::new(Vec::new());
+        assert!(grass_names(b"", &notes).is_err());
+        assert!(grass_names(b"not an ec-bsd file at all", &notes).is_err());
+        // A well-formed header with a truncated name table keeps the names it
+        // managed to read instead of failing.
+        let mut b = Vec::new();
+        b.extend_from_slice(&0x42584f4du32.to_le_bytes());
+        b.extend_from_slice(&0x42534446u32.to_le_bytes());
+        b.extend_from_slice(&12u32.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.resize(0x4c, 0);
+        // Names are a length word followed by GBK bytes, not NUL-terminated.
+        b.extend_from_slice(&15u32.to_le_bytes());
+        b.extend_from_slice(b"grasses/one.bsd");
+        let names = grass_names(&b, &notes).unwrap();
+        assert_eq!(names, vec!["grasses/one.bsd".to_string()], "got {names:?}");
+        // A name whose length byte runs past the file is the truncation the
+        // reported modal came from: the names that did read are kept.
+        let mut cut = b.clone();
+        cut.truncate(0x4c + 4 + 5);
+        let kept = grass_names(&cut, &notes).unwrap();
+        assert!(kept.is_empty(), "got {kept:?}");
     }
     #[test]
     fn truncated_mox_fails() {
