@@ -235,4 +235,80 @@ fn the_composite_changes_a_frame_on_a_real_device() {
         centre > 0,
         "the composite wrote black ({centre}) instead of a darkened frame"
     );
+    readback.unmap();
+
+    // The full-image path must replace, not tint, a white raster frame. Use a
+    // distinctly coloured synthetic traced image so a cleared texture or a
+    // retained raster frame cannot accidentally pass this check.
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &frame_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &vec![255u8; (W * H * 4) as usize],
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(W * 4),
+            rows_per_image: Some(H),
+        },
+        wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
+    );
+    let mut full = settings.clone();
+    full.output = super::settings::Output::TraceOnly;
+    let mut full_pixels = Vec::with_capacity(packed.len());
+    for _ in 0..(traced_extent.0 * traced_extent.1) {
+        full_pixels.extend_from_slice(&[0.10, 0.30, 0.02, 1.0]);
+    }
+    composite.upload_software(&full_pixels, traced_extent, &device, &queue);
+    let mut encoder = device.create_command_encoder(&Default::default());
+    composite
+        .render(
+            &device,
+            &queue,
+            &mut encoder,
+            Some(&frame_texture),
+            &frame_view,
+            (W, H),
+            &full,
+            params,
+            TraceSource::Software,
+        )
+        .expect("full trace composite");
+    encoder.copy_texture_to_buffer(
+        wgpu::ImageCopyTexture {
+            texture: &frame_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::ImageCopyBuffer {
+            buffer: &readback,
+            layout: wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(W * 4),
+                rows_per_image: Some(H),
+            },
+        },
+        wgpu::Extent3d {
+            width: W,
+            height: H,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+    readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::Maintain::Wait);
+    let pixels = readback.slice(..).get_mapped_range();
+    let offset = (((H / 2) * W + W / 2) * 4) as usize;
+    let (r, g, b) = (pixels[offset], pixels[offset + 1], pixels[offset + 2]);
+    assert!(
+        g > r && r > b && g < 200,
+        "full trace did not replace white raster: {r}, {g}, {b}"
+    );
 }

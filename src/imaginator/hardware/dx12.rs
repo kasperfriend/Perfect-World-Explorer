@@ -290,6 +290,26 @@ impl HardwareTracer {
             ));
             return;
         }
+        // DXR tier alone does not prove shader model 6.5 support. Ask the
+        // driver separately so an unsupported shader is reported explicitly.
+        let mut shader_model: u32 = 0x65; // D3D_SHADER_MODEL_6_5
+        let hr = unsafe {
+            self.device.CheckFeatureSupport(
+                7 as win::D3D12_FEATURE, // D3D12_FEATURE_SHADER_MODEL
+                &mut shader_model as *mut _ as *mut c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        if !SUCCEEDED(hr) || shader_model < 0x65 {
+            self.status = HardwareStatus::Unsupported(format!(
+                "DXR inline RayQuery needs shader model 6.5; query returned 0x{shader_model:x} (HRESULT 0x{hr:08x})"
+            ));
+            return;
+        }
+        eprintln!(
+            "Imaginator: DXR tier {} and shader model 0x{shader_model:x}",
+            self.tier_label()
+        );
         // 2. Device5 and CommandList4. Neither is declared by `winapi`.
         let mut device5: *mut c_void = std::ptr::null_mut();
         let Some(iid) = sys::guid(sys::IID_ID3D12DEVICE5) else {

@@ -62,7 +62,7 @@ impl Output {
     pub fn label(self) -> &'static str {
         match self {
             Output::Lighting => "Add to the rendered frame",
-            Output::TraceOnly => "Traced image only (diagnostic)",
+            Output::TraceOnly => "Full traced image (experimental)",
         }
     }
 
@@ -148,7 +148,7 @@ impl ImaginatorSettings {
     pub fn active(&self) -> bool {
         self.tracer != Tracer::Off
             && (self.reflections || self.lighting || self.shadows)
-            && self.strength > 0.
+            && (self.output == Output::TraceOnly || self.strength > 0.)
     }
 
     pub fn encode(&self) -> String {
@@ -378,6 +378,11 @@ mod tests {
         s.lighting = true;
         s.strength = 0.;
         assert!(!s.active());
+        s.output = Output::TraceOnly;
+        assert!(
+            s.active(),
+            "the full traced image does not use overlay strength"
+        );
     }
 
     #[test]

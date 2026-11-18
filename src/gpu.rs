@@ -4370,6 +4370,9 @@ fn preferred_backends() -> wgpu::Backends {
 fn make_instance() -> wgpu::Instance {
     wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: preferred_backends(),
+        // Allows WGPU_VALIDATION=1 to enable the D3D12 debug layer before
+        // device creation when diagnosing native DXR failures.
+        flags: wgpu::InstanceFlags::default().with_env(),
         ..Default::default()
     })
 }

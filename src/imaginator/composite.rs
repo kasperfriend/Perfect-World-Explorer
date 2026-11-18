@@ -1027,11 +1027,10 @@ pub fn composite_pixel(
     trace_only: bool,
 ) -> [f32; 3] {
     if trace_only {
-        let shadowed = lerp(0.35, 1.0, traced[3].clamp(0., 1.));
         return [
-            traced[0] * shadowed * exposure,
-            traced[1] * shadowed * exposure,
-            traced[2] * shadowed * exposure,
+            traced[0] * exposure,
+            traced[1] * exposure,
+            traced[2] * exposure,
         ];
     }
     if traced[3] < 0.0 {

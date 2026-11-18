@@ -208,6 +208,7 @@ struct TraceRequest {
     /// travels with the request rather than being fixed when the worker starts.
     environment: tracer::Environment,
     options: tracer::TraceOptions,
+    output: settings::Output,
     width: u32,
     height: u32,
     samples: u32,
@@ -217,6 +218,7 @@ struct TraceRequest {
 
 struct TraceResult {
     generation: u64,
+    output: settings::Output,
     packed: Vec<f32>,
     width: u32,
     height: u32,
@@ -231,6 +233,9 @@ pub struct Imaginator {
     scene: SharedScene,
     /// CPU-side DXR material and normal records, rebuilt only when the scene changes.
     hardware_records: Option<(u64, Vec<u8>, Vec<u8>)>,
+    /// The mode of the trace currently in the composite target.
+    trace_output: Option<settings::Output>,
+    logged_dxil: Option<u64>,
     /// Base capture and pending streamed triangles for the current world load.
     scenery_base: Option<SharedScene>,
     scenery_pending: Vec<bvh::Triangle>,
@@ -293,6 +298,8 @@ impl Imaginator {
             directory,
             scene: Arc::new(bvh::Scene::empty()),
             hardware_records: None,
+            trace_output: None,
+            logged_dxil: None,
             scenery_base: None,
             scenery_pending: Vec::new(),
             scenery_build: None,
@@ -817,7 +824,11 @@ impl Imaginator {
                             continue;
                         }
                         let mut packed = vec![0f32; samples.len() * 4];
-                        tracer::Tracer::pack(&samples, &mut packed);
+                        if req.output == settings::Output::TraceOnly {
+                            tracer::Tracer::pack_full(&samples, &mut packed);
+                        } else {
+                            tracer::Tracer::pack(&samples, &mut packed);
+                        }
                         let rays = tracer.rays.load(std::sync::atomic::Ordering::Relaxed);
                         let micros = start.elapsed().as_micros();
                         // Match the budget by moving the quality scale, not by
@@ -836,6 +847,7 @@ impl Imaginator {
                         micros_slot.store(micros.min(u64::MAX as u128) as u64, Ordering::Relaxed);
                         let trace = TraceResult {
                             generation: req.generation,
+                            output: req.output,
                             packed,
                             width: trace_width,
                             height: trace_height,
@@ -881,6 +893,7 @@ impl Imaginator {
             camera,
             environment: self.environment.clone(),
             options: tracer::TraceOptions::from_settings(settings),
+            output: settings.output,
             width: extent.0,
             height: extent.1,
             samples: settings.samples.max(1),
@@ -971,19 +984,30 @@ impl Imaginator {
         // `Modules/Imaginator`. A portable install keeps the module beside the
         // executable, and the module object is built from whatever client root the
         // host had, which is not always the same thing.
-        let blob = hardware::ray_query_blob(&self.directory)
+        let (blob, blob_path) = hardware::ray_query_blob(&self.directory)
             .or_else(|| {
                 hardware::module_candidates()
                     .into_iter()
                     .find_map(|dir| hardware::ray_query_blob(&dir))
             })
-            .map(|(blob, _)| blob)
             .ok_or_else(|| {
                 format!(
                     "the RayQuery shader {} is not installed beside the executable;                      the module traced this frame on the CPU instead",
                     hardware::DXIL_FILE
                 )
             })?;
+        let blob_hash = blob.iter().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+        if self.logged_dxil != Some(blob_hash) {
+            eprintln!(
+                "Imaginator: DXIL {} bytes, FNV64 {:016x}, path {}",
+                blob.len(),
+                blob_hash,
+                blob_path.display()
+            );
+            self.logged_dxil = Some(blob_hash);
+        }
         // The shader's Params block, field for field.
         let mut block = [0f32; hardware::PARAMS_FLOATS];
         for (target, source) in block.chunks_exact_mut(4).zip(
@@ -1014,7 +1038,9 @@ impl Imaginator {
             .hardware_records
             .as_ref()
             .expect("records were just built");
-        hardware.trace_frame(&blob, tlas, width, height, &bytes, normals, materials)
+        hardware
+            .trace_frame(&blob, tlas, width, height, &bytes, normals, materials)
+            .map_err(|why| format!("{why} (DXIL FNV64 {blob_hash:016x}, {} bytes)", blob.len()))
     }
 
     /// The pack of channels the software worker finished, if any.
@@ -1022,6 +1048,9 @@ impl Imaginator {
         let software = self.software.as_ref()?;
         let mut slot = software.result.lock().ok()?;
         let result = slot.take()?;
+        if result.output != self.settings.output {
+            return None;
+        }
         Some((result.packed, (result.width, result.height)))
     }
 
@@ -1105,7 +1134,9 @@ impl Imaginator {
         if !self.settings.active() {
             self.skip_reason = Some(if self.settings.tracer == TracerKind::Off {
                 "the tracer is off".into()
-            } else if self.settings.strength <= 0. {
+            } else if self.settings.output == settings::Output::Lighting
+                && self.settings.strength <= 0.
+            {
                 format!("strength is {}", self.settings.strength)
             } else {
                 "reflections, lighting and shadows are all off".into()
@@ -1205,6 +1236,7 @@ impl Imaginator {
                         Ok(pixels) => {
                             if let Some(composite) = self.composite.as_mut() {
                                 composite.upload_software(&pixels, (tw, th), device, queue);
+                                self.trace_output = Some(self.settings.output);
                             }
                         }
                         Err(why) => {
@@ -1228,6 +1260,7 @@ impl Imaginator {
                         (self.take_software_result(), self.composite.as_mut())
                     {
                         composite.upload_software(&packed, arrived, device, queue);
+                        self.trace_output = Some(self.settings.output);
                     }
                 }
             }
@@ -1242,10 +1275,15 @@ impl Imaginator {
                     (self.take_software_result(), self.composite.as_mut())
                 {
                     composite.upload_software(&packed, arrived, device, queue);
+                    self.trace_output = Some(self.settings.output);
                 }
                 self.status = self.software_status();
             }
             TracerKind::Off => return false,
+        }
+        if self.trace_output != Some(self.settings.output) {
+            self.skip_reason = Some("waiting for a trace in the selected output mode".into());
+            return false;
         }
         // The world's lamps, published once per frame for whichever tracer runs.
         // Built before the mutable borrow: the list is a read of `self`.
@@ -1455,11 +1493,12 @@ impl Imaginator {
             }
         });
         if self.settings.output == settings::Output::TraceOnly {
+            ui.label("Experimental full trace: flat material colours; textures and foliage cutouts are not yet supported.");
             changed |= ui
                 .add(
                     egui::Slider::new(&mut self.settings.exposure, 0.05..=8.0)
                         .logarithmic(true)
-                        .text("Diagnostic exposure"),
+                        .text("Trace exposure"),
                 )
                 .changed();
         }
@@ -1640,6 +1679,7 @@ impl Imaginator {
         if let Some((packed, extent)) = self.take_software_result() {
             if let Some(composite) = self.composite.as_mut() {
                 composite.upload_software(&packed, extent, device, queue);
+                self.trace_output = Some(self.settings.output);
             }
         }
         if self.page_open {

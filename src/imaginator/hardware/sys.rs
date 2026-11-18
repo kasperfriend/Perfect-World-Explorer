@@ -799,6 +799,60 @@ unsafe fn create_root_signature(
     create(device, 0, blob, length, &iid, out)
 }
 
+/// Read recent messages from the optional D3D12 debug layer. It must have been
+/// enabled before creating the device; no queue is available on normal installs.
+unsafe fn recent_debug_messages(device: *mut c_void) -> Vec<String> {
+    let Some(iid) = guid("0742a90b-c387-483f-b946-30a7e4e61458") else {
+        return Vec::new();
+    };
+    let mut queue = std::ptr::null_mut();
+    if query_interface(device, &iid, &mut queue) < 0 || queue.is_null() {
+        return Vec::new();
+    }
+    let vt = *(queue as *mut *const usize);
+    let count_fn: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(*vt.add(9));
+    let get: unsafe extern "system" fn(*mut c_void, u64, *mut c_void, *mut usize) -> HRESULT =
+        std::mem::transmute(*vt.add(5));
+    #[repr(C)]
+    struct Message {
+        category: u32,
+        severity: u32,
+        id: u32,
+        description: *const u8,
+        len: usize,
+    }
+    let count = count_fn(queue);
+    let mut messages = Vec::new();
+    for index in count.saturating_sub(12)..count {
+        let mut size = 0usize;
+        if get(queue, index, std::ptr::null_mut(), &mut size) < 0
+            || size < std::mem::size_of::<Message>()
+            || size > 65536
+        {
+            continue;
+        }
+        let mut storage = vec![0u64; size.div_ceil(8)];
+        if get(queue, index, storage.as_mut_ptr() as *mut c_void, &mut size) < 0 {
+            continue;
+        }
+        let message = &*(storage.as_ptr() as *const Message);
+        let base = storage.as_ptr() as usize;
+        let end = base.saturating_add(storage.len() * 8);
+        let address = message.description as usize;
+        if address < base || address > end || message.len > end.saturating_sub(address) {
+            continue;
+        }
+        let text = std::slice::from_raw_parts(message.description, message.len);
+        messages.push(format!(
+            "D3D12 #{}: {}",
+            message.id,
+            String::from_utf8_lossy(text).trim_end_matches('\0')
+        ));
+    }
+    release(queue);
+    messages
+}
+
 /// Create the compute pipeline state object that runs the DXIL trace shader.
 ///
 /// # Safety
@@ -832,10 +886,14 @@ pub unsafe fn create_compute_pipeline(
     let mut state: *mut c_void = std::ptr::null_mut();
     let hr = create(device, &desc, &iid, &mut state);
     if hr < 0 || state.is_null() {
+        let messages = recent_debug_messages(device);
+        let detail = if messages.is_empty() {
+            "no debug-layer details; restart with WGPU_VALIDATION=1 and Windows Graphics Tools installed".into()
+        } else {
+            messages.join(" | ")
+        };
         return Err(format!(
-            "CreateComputePipelineState rejected the DXIL trace shader (HRESULT \
-             0x{hr:08x}); it must be a compute shader compiled for this feature \
-             level with dxc"
+            "CreateComputePipelineState failed (HRESULT 0x{hr:08x}): {detail}"
         ));
     }
     Ok(state)

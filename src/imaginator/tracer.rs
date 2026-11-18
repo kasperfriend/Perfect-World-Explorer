@@ -293,7 +293,8 @@ impl TraceOptions {
             // the thread. Generous: a full-resolution frame at four bounces
             // stays well inside it.
             guard: 4_000_000_000,
-            water_reflection_fill: settings.water_reflection_fill,
+            water_reflection_fill: settings.water_reflection_fill
+                || settings.output == super::settings::Output::TraceOnly,
         }
     }
 }
@@ -325,13 +326,16 @@ impl Tracer {
 
     /// Shade one primary ray.
     fn shade(&self, ray: &Ray, options: &TraceOptions, rng: &mut Rng, rays: &mut u64) -> Sample {
+        let sky = || Sample {
+            radiance: self.environment.sky_only(ray.direction),
+            ..Sample::default()
+        };
         let Some(bvh) = self.scene.bvh.as_ref() else {
-            return Sample::default();
+            return sky();
         };
         *rays += 1;
         let Some(hit) = bvh.closest_hit(ray, 0., self.scene_limit()) else {
-            // Nothing hit: the pixel is sky, and the compositor must not touch it.
-            return Sample::default();
+            return sky();
         };
         let albedo = self.albedo(hit);
         let normal = self.shading_normal(hit, ray);
@@ -383,7 +387,7 @@ impl Tracer {
                         continue;
                     }
                 }
-                lamps += albedo * radiance;
+                lamps += radiance;
             }
         }
         let direct = if options.lighting {
@@ -527,7 +531,7 @@ impl Tracer {
         // `direct` is already gated by the lighting switch, so a tracer with
         // every term off produces exactly no light instead of leaking the sun
         // it was told not to compute.
-        sample.radiance = albedo * direct + indirect + reflection * self.specular(hit);
+        sample.radiance = albedo * direct + indirect + reflection;
 
         sample
     }
@@ -716,6 +720,17 @@ impl Tracer {
             out[o + 1] = radiance.y;
             out[o + 2] = radiance.z;
             out[o + 3] = if s.hit > 0.5 { s.occlusion } else { -1. };
+        }
+    }
+    /// Pack the independently shaded image, including sky misses. Alpha is
+    /// unused by full-image output and deliberately does not shadow it again.
+    pub fn pack_full(samples: &[Sample], out: &mut [f32]) {
+        for (i, sample) in samples.iter().enumerate() {
+            let o = i * 4;
+            out[o] = sample.radiance.x;
+            out[o + 1] = sample.radiance.y;
+            out[o + 2] = sample.radiance.z;
+            out[o + 3] = 1.;
         }
     }
 }
@@ -936,8 +951,33 @@ mod tests {
         let out = tracer.trace(&cam, &options(), 4, 4, 1);
         for s in &out {
             assert_eq!(s.hit, 0.);
-            assert_eq!(s.radiance, V3::ZERO);
+            assert!(s.radiance.max_component() > 0.);
+            let mut packed = [0.; 4];
+            Tracer::pack(&[*s], &mut packed);
+            assert_eq!(packed[3], -1.); // lighting overlay preserves the raster sky
         }
+    }
+
+    #[test]
+    fn full_trace_packs_surface_and_sky_radiance() {
+        let tracer = Tracer::new(room(), Environment::default());
+        let samples = tracer.trace(&camera(), &options(), 8, 8, 1);
+        let mut packed = vec![0.; samples.len() * 4];
+        Tracer::pack_full(&samples, &mut packed);
+        assert!(samples
+            .iter()
+            .any(|s| s.hit > 0.5 && s.radiance.max_component() > 0.));
+        for (sample, pixel) in samples.iter().zip(packed.chunks_exact(4)) {
+            assert_eq!(pixel[0], sample.radiance.x);
+            assert_eq!(pixel[1], sample.radiance.y);
+            assert_eq!(pixel[2], sample.radiance.z);
+            assert_eq!(pixel[3], 1.);
+        }
+        let sky_ray = Ray::new(v3(0., 100., 0.), v3(0., 1., 0.));
+        let mut rays = 0;
+        let sky = tracer.shade(&sky_ray, &options(), &mut Rng::new(1), &mut rays);
+        assert_eq!(sky.hit, 0.);
+        assert!(sky.radiance.max_component() > 0.);
     }
 
     #[test]
@@ -977,7 +1017,10 @@ mod tests {
         o.lighting = false;
         o.reflections = false;
         let nothing = tracer.trace(&camera(), &o, 8, 8, 1);
-        assert!(nothing.iter().all(|s| s.radiance == V3::ZERO));
+        assert!(nothing
+            .iter()
+            .filter(|s| s.hit > 0.5)
+            .all(|s| s.radiance == V3::ZERO));
     }
 
     #[test]

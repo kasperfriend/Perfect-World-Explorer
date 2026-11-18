@@ -45,6 +45,7 @@ static const uint TERM_SHADOWS = 4u;
 // Let the traced reflection cover water, which otherwise keeps the core's own
 // screen reflection. Matches the module page's switch and the WGSL fallback.
 static const uint TERM_WATER_FILL = 8u;
+static const uint TERM_FULL_TRACE = 16u;
 // `bvh::material::WATER`.
 static const uint MATERIAL_WATER = 2u;
 
@@ -172,6 +173,7 @@ void cs(uint3 id : SV_DispatchThreadID)
     // every traced surface tint flat.
     float3 reflection = float3(0.0, 0.0, 0.0);
     float3 indirect = float3(0.0, 0.0, 0.0);
+    float3 full_direct = float3(0.0, 0.0, 0.0);
     float visibility = 0.0;
     float distance = 0.0;
     float hits = 0.0;
@@ -185,7 +187,11 @@ void cs(uint3 id : SV_DispatchThreadID)
         float3 rd = normalize(p.forward.xyz + p.right.xyz * sx + p.up.xyz * sy);
         float3 ro = p.eye.xyz;
         Hit hit = closest(ro, rd);
-        if (!hit.hit) { continue; }
+        if (!hit.hit)
+        {
+            if ((terms & TERM_FULL_TRACE) != 0u) { full_direct += sky(rd.y); }
+            continue;
+        }
         hits += 1.0;
         distance += hit.t;
         float3 position = ro + rd * hit.t;
@@ -202,6 +208,10 @@ void cs(uint3 id : SV_DispatchThreadID)
         float4 mat = material_of(hit.primitive);
         if ((terms & TERM_LIGHTING) != 0u)
         {
+            if ((terms & TERM_FULL_TRACE) != 0u)
+            {
+                full_direct += mat.rgb * (p.sun_color.rgb * (lit * vis) + sky(normal.y));
+            }
             // Cosine-weighted bounce walk; every step is one hardware ray.
             float3 weight = mat.rgb;
             float3 origin = position + normal * 0.02;
@@ -308,5 +318,12 @@ void cs(uint3 id : SV_DispatchThreadID)
     float inv = 1.0 / float(samples);
     float mean_visibility = hits > 0.0 ? visibility * inv : 0.0;
     float3 radiance = (reflection + indirect * mean_visibility) * inv;
-    out_tex[int2(id.xy)] = float4(radiance, hits > 0.0 ? mean_visibility : -1.0);
+    if ((terms & TERM_FULL_TRACE) != 0u)
+    {
+        out_tex[int2(id.xy)] = float4((full_direct + reflection + indirect) * inv, 1.0);
+    }
+    else
+    {
+        out_tex[int2(id.xy)] = float4(radiance, hits > 0.0 ? mean_visibility : -1.0);
+    }
 }

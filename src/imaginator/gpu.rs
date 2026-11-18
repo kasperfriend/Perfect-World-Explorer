@@ -104,6 +104,7 @@ pub const TERM_SHADOWS: u32 = 4;
 /// and replacing it changes the look of every river on the map. The module page
 /// has always offered this as a checkbox; it now reaches the shaders.
 pub const TERM_WATER_FILL: u32 = 8;
+pub const TERM_FULL_TRACE: u32 = 16;
 
 impl GpuParams {
     pub fn mask(settings: &ImaginatorSettings) -> u32 {
@@ -117,8 +118,11 @@ impl GpuParams {
         if settings.shadows {
             m |= TERM_SHADOWS;
         }
-        if settings.water_reflection_fill {
+        if settings.water_reflection_fill || settings.output == super::settings::Output::TraceOnly {
             m |= TERM_WATER_FILL;
+        }
+        if settings.output == super::settings::Output::TraceOnly {
+            m |= TERM_FULL_TRACE;
         }
         m
     }
@@ -656,11 +660,10 @@ fn cs(@builtin(global_invocation_id) id: vec3<u32>) {
  let exposure = p.strength.y;
  let render_mode = p.flags.x;
  if render_mode == 1u {
-  // Diagnostic: the traced light alone, so the rays can be judged on their own.
-  // `rgb` is reflected + interreflected radiance and `a` is sun visibility.
-  let shadowed = vec3<f32>(mix(0.35, 1.0, clamp(traced_s.a, 0.0, 1.0)));
+  // Full traced image: rgb already includes surface lighting and sky.
+  // Do not apply visibility again or blend the raster frame into it.
   textureStore(out_tex, vec2<i32>(i32(id.x), i32(id.y)),
-   vec4<f32>(traced_s.rgb * shadowed * exposure, 1.0));
+   vec4<f32>(traced_s.rgb * exposure, 1.0));
   return;
  }
  // `traced.a` is negative when the primary ray escaped: sky, left as drawn.
@@ -821,6 +824,18 @@ mod tests {
     use super::super::bvh::{Bvh, Material, Triangle};
     use super::super::math::v3;
     use super::*;
+
+    #[test]
+    fn full_trace_requests_complete_image_and_water_reflections() {
+        let mut settings = ImaginatorSettings::default();
+        settings.output = super::super::settings::Output::TraceOnly;
+        settings.water_reflection_fill = false;
+        let mask = GpuParams::mask(&settings);
+        assert_ne!(mask & TERM_FULL_TRACE, 0);
+        assert_ne!(mask & TERM_WATER_FILL, 0);
+        settings.output = super::super::settings::Output::Lighting;
+        assert_eq!(GpuParams::mask(&settings) & TERM_FULL_TRACE, 0);
+    }
 
     #[test]
     fn packing_keeps_the_bvh_a_leaf_can_find() {
