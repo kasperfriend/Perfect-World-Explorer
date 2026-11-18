@@ -150,6 +150,8 @@ fn the_composite_changes_a_frame_on_a_real_device() {
         2,
         &settings,
         1000.,
+        // The fog distance the composite fades traced light with.
+        1000.,
     );
     let mut encoder = device.create_command_encoder(&Default::default());
     composite
