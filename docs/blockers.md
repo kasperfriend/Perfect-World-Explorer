@@ -1563,6 +1563,40 @@ file.
   the **Enter world** button (id 102) launches. Guarded by
   `selecting_a_folder_never_launches_on_a_timer` in `src/main.rs`, which scans
   the launcher source and runs on Linux CI.
+- **`unsupported PCK version 00020003` (1.5.2).** The client dispatches on the
+  version word at `nOffset - 4` and has three revisions in use; the reader
+  handled only `0x00020002` and `0x00020001`, so a `0x00020003` pack — the one
+  the 1.5.2 client's `models.pck` uses — was refused outright. All three share
+  one shape (a trailer holding the guards and the entry offset, then a run of
+  length-prefixed entry records), and only the sizes differ, so the reader now
+  walks them from one table derived from the engine structs:
+
+  | struct | `sizeof` | fields |
+  |---|---|---|
+  | `FILEHEADER` | 272 | `dwFlags` +12, `szDescription` +16, `guardByte1` +268 |
+  | `FILEENTRY` | 276 | `dwOffset` +260, `dwLength` +264, `dwCompressedLength` +268 |
+  | `FILEHEADER_0x00020003` | 280 | `dwFlags` +16, `szDescription` +20, `guardByte1` +272 |
+  | `FILEENTRY_0x00020003` | 288 | `dwOffset` +264 (64-bit), `dwLength` +272, `dwCompressedLength` +276 |
+
+  The trailer's field offsets move in `0x00020003` because `dwEntryOffset` is
+  64-bit there, which pushes `dwFlags` and `szDescription` eight bytes along;
+  that is the part a guessed layout gets wrong first. The file count is not a
+  trailer field in any revision — the client reads it from `nOffset - 8`.
+
+  Two further mistakes this exposed, both now fixed and pinned by a test:
+  entry records are stored verbatim only when compressing them did not shrink
+  them, otherwise each is a zlib stream of itself (the old loop would have
+  desynchronised on the second record of a compressed table); and the
+  `szDescription` "lica File Package" check the client performs was not
+  reproduced, so two synthetic test fixtures were not packages the client would
+  ever open and passed only while that check was missing.
+
+  Verified against a real pack: `gfx.pck` from the 1.3.6 client parses to 3499
+  entries and **all 3499** decode to their declared length. The reader also now
+  names a split package (a prefix declaring more bytes than the file holds, with
+  a `.pkx` beside it) instead of reporting a truncated archive, and reproduces
+  the same length-prefixed record walk for both older revisions.
+
 - **Status:** fixed and unit-tested. Verified offline against real Drive BSData
   (`water`, `gfx`, `music`, `material` harness modes, 152 tests). The remaining
   hardware questions are the same as B-2 and B-3.
