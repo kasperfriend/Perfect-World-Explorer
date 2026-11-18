@@ -131,16 +131,34 @@ read, 2 failed**.
 | `bon`, `ski` | 148 | length; containers with no leaf parser here |
 | `sdr` | 60 | shader text |
 | `mox` | 44 | `MOXBFRAME:` magic — **no reader in this project** |
+| `dds`,`tga`,`bmp`,`jpg` | 3951 | magic and header, not pixels |
 
-The 2 failures are the same authored stub in both `gfx.pck` builds:
-`gfx/人物/技能/羽芒/翼击击中.gfx` is four bytes, `MOXT`. The archive really does
-ship that, so it is named and excluded from the exit status.
+Images are checked by header rather than by pixel: the offline toolchain has
+only a stub `image`, but DDS carries a magic and a 124-byte header, TGA a type
+field, BMP and JPEG their own magics, which is enough to catch truncation.
 
-What this does *not* cover, stated plainly: `.dds`/`.tga`/`.jpg`/`.bmp` (3 950
-images, 288 MB) go through `image`-side code that the offline toolchain has no
-copy of, so they are counted in the inventory but not decoded here.
-`.ttf`, `.xls`, `.lua`, `.txt`, `.ini` and the rest are opaque blobs to this
-project.
+| extension | count | result |
+|---|---|---|
+| `dds` | 3021 | 3020 valid; **1 is machine code** (below) |
+| `tga` | 691 | all valid |
+| `bmp` | 213 | all valid |
+| `jpg` | 26 | all valid |
+
+Three members across the corpus are named exceptions rather than reader faults,
+and are excluded from the exit status:
+
+- `gfx/人物/技能/羽芒/翼击击中.gfx` in **both** `gfx.pck` builds — four bytes,
+  `MOXT`.
+- `interfaces/iconlist_guild.dds` — 5 MB of x86 machine code (`8b 44 24 04`,
+  `c2 04 00` thunks) with long runs of `$` and three embedded `DDS ` strings
+  whose header sizes are nonsense. Every 64 KiB window stays under 7.5 bits/byte
+  and 42.6% is printable-or-zero. The pack's 1158 spans have **zero overlaps**
+  and this member sits exactly where the byte stream places it, so it is the
+  archive's content, not a misread offset.
+
+What this still does *not* cover: none of these payloads are decoded to pixels
+offline. `.ttf`, `.xls`, `.lua`, `.txt`, `.ini` and the remaining extensions are
+opaque blobs to this project and are counted in the inventory only.
 
 ## Scenery
 
