@@ -3,7 +3,7 @@ name: PR checks and Windows build
 on:
   pull_request:
   push:
-    branches: [main, arena/69c8ea78-perfect-world-explorer]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
