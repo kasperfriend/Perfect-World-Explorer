@@ -95,7 +95,7 @@ writes, because this one uses the bare spelling.
 ## Package inventory
 
 Fifteen staged packages, every entry decoded and checked against the length its
-record declares — 12 751 entries, 0 failures:
+record declares — 12 806 entries, 0 failures:
 
 | pack | container | entries | bytes out |
 |---|---|---|---|
@@ -111,7 +111,7 @@ record declares — 12 751 entries, 0 failures:
 | `configs.pck` (1.3.6) | retail v2 | 66 | 3 160 870 |
 | `configs.pck` (1.5.2) | retail v2 | 58 | 2 179 038 |
 | `script.pck` (small) | retail v2 | 32 | 51 717 |
-| `textures.pck` | retail v2 | 887 | — |
+| `textures.pck` | retail v2 | 942 | — |
 | `fonts.pck` | retail v2 | 2 | 8 242 268 |
 | `script.pck` (1.5.2) | Angelica | 2 | 9 |
 
