@@ -2963,6 +2963,53 @@ impl Populator {
         }
     }
 
+    pub(super) fn ray_inputs(
+        &mut self,
+        matrix: Mat4,
+        out: &mut super::lighter::model_feed::Moving<'_>,
+    ) -> Result<(), String> {
+        if !self.active {
+            return Ok(());
+        }
+        let Some(library) = self.library.as_mut() else {
+            return Ok(());
+        };
+        let mut decode = |path: &str| {
+            let mut error = String::new();
+            for bytes in library.texture_candidates(path)? {
+                match crate::model_texture_gpu::decode_for_rays(&bytes) {
+                    Ok(tex) => return Ok(tex),
+                    Err(e) => error = e,
+                }
+            }
+            Err(error)
+        };
+        for live in &mut self.live {
+            live.visible = live.failure.is_none()
+                && !live.wedged
+                && on_screen(matrix, live.position, live.head);
+            if live.failure.is_some() || live.wedged {
+                continue;
+            }
+            // Off-camera actors still exist in the ray scene (shadows,
+            // reflected views). Their animation clock has already advanced.
+            match live.pose() {
+                Ok(meshes) => {
+                    live.motion.observe(pose_signature(&meshes));
+                    out.model(
+                        "populator",
+                        live.asset.as_ref(),
+                        &meshes,
+                        |_| true,
+                        &mut decode,
+                    )?;
+                }
+                Err(error) => live.failure = Some(error),
+            }
+        }
+        Ok(())
+    }
+
     /// Adds the population to the host's model pass. The pass is only opened
     /// when at least one actor has a valid draw.
     #[allow(clippy::too_many_arguments)]

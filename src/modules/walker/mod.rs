@@ -1093,6 +1093,74 @@ impl Walker {
         }
     }
 
+    pub(super) fn ray_inputs(
+        &mut self,
+        matrix: Mat4,
+        out: &mut super::lighter::model_feed::Moving<'_>,
+    ) -> Result<(), String> {
+        if !self.is_active() {
+            return Ok(());
+        }
+        let view = gfx_player::View::from_inverse_view_projection(matrix.inverse());
+        let effects = match self.advance_effects(&view) {
+            Ok(effects) => effects,
+            Err(error) => {
+                self.last_error = Some(format!("Walker effects: {error}"));
+                Vec::new()
+            }
+        };
+        let (Some(character), Some(assets)) = (self.character.as_ref(), self.assets.as_mut())
+        else {
+            return Ok(());
+        };
+        let mut decode = |path: &str| {
+            assets
+                .read(path)
+                .and_then(|b| crate::model_texture_gpu::decode_for_rays(&b))
+        };
+        for model in render_models(character, &character.posed.meshes)? {
+            let visible = part_visibility(
+                &model.part,
+                self.settings.first_person,
+                character.soulsphere_hidden(),
+            );
+            if !matches!(visible, PartVisibility::Hidden) {
+                out.model(
+                    "walker",
+                    model.asset,
+                    model.poses,
+                    |skin| !matches!(visible, PartVisibility::BodyWithoutHead) || skin != 1,
+                    &mut decode,
+                )?;
+            }
+        }
+        let decals = character
+            .gfx
+            .quads(&character.assembly, &character.posed.pose)?;
+        out.decals("walker", &decals, &mut decode)?;
+        out.effects("walker", &effects, &mut decode)
+    }
+
+    fn advance_effects(
+        &mut self,
+        view: &gfx_player::View,
+    ) -> Result<Vec<gfx_player::EffectQuad>, String> {
+        let character = self.character.as_mut().ok_or("Walker character missing")?;
+        let map = self.map.as_ref();
+        // Once per world frame; reflection/refraction consume that pose, not
+        // another tick. Clamp wall time after a stall or resize.
+        let now = std::time::Instant::now();
+        let dt_ms = self.last_render.replace(now).map_or(0., |last| {
+            (now.duration_since(last).as_secs_f32() * 1000.).clamp(0., 100.)
+        });
+        let mut quads =
+            character
+                .gfx
+                .advance(&character.assembly, &character.posed.pose, view, dt_ms, map)?;
+        quads.extend(self.gallery.advance(view, dt_ms, map)?);
+        Ok(quads)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -1241,39 +1309,11 @@ impl Walker {
         // triple speed and let an emitter discharge three times the particles.
         if !pose_uploaded {
             let effects = (|| -> Result<Vec<gfx_player::EffectQuad>, String> {
-                let character = self.character.as_mut().ok_or("Walker character missing")?;
-                let assets = self.assets.as_mut().ok_or("Walker assets missing")?;
-                // Terrain for the effects' own ground query: `MatchGrnd` and
-                // `GroundHeight` are gated on an owner byte no `.gfx` file can
-                // set, so the host supplies the sample and those keys stay inert
-                // only while no map is loaded.
-                let map = self.map.as_ref();
-                // `render` carries no delta, so the wall clock supplies one,
-                // clamped: a stall (shader compile, window drag, a breakpoint)
-                // must not fast-forward an effect or let an emitter discharge a
-                // thousand particles in a single frame.
-                let now = std::time::Instant::now();
-                let dt_ms = match self.last_render {
-                    Some(last) => (now.duration_since(last).as_secs_f32() * 1000.).clamp(0., 100.),
-                    None => 0.,
-                };
-                self.last_render = Some(now);
-                // The billboards need a camera basis, and `Frame` only carries
-                // the view-projection, so the eye is recovered from its inverse.
                 let view = gfx_player::View::from_inverse_view_projection(
                     Mat4::from_cols_array_2d(&frame.matrix).inverse(),
                 );
-                let mut quads = character.gfx.advance(
-                    &character.assembly,
-                    &character.posed.pose,
-                    &view,
-                    dt_ms,
-                    map,
-                )?;
-                // The gallery shares this pass: the same draw object, the same
-                // blend buckets and the same texture resolution, so a
-                // free-standing root renders exactly like an attached one.
-                quads.extend(self.gallery.advance(&view, dt_ms, map)?);
+                let quads = self.advance_effects(&view)?;
+                let assets = self.assets.as_mut().ok_or("Walker assets missing")?;
                 if let Some(gpu) = self.gpu.as_mut() {
                     // Element 160 is a skin model like any other, so it takes this
                     // frame's `LIGHTINFO` — the same ambient and directional colour

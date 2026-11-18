@@ -156,6 +156,11 @@ impl Default for StaticGrid {
     }
 }
 impl StaticGrid {
+    #[allow(dead_code)]
+    pub(crate) fn dynamic_lights(&self) -> &[DynamicLight] {
+        &self.dynamic
+    }
+
     pub fn update(&mut self, lights: &SceneLights, center: [f32; 3]) {
         // The cheap tests come first: the retail rule is a move of one 12-unit
         // cell in X or Z, and comparing the captured corpus is a record-by-record

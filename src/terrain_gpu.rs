@@ -1474,6 +1474,15 @@ pub struct FarVertex {
     pos: [f32; 3],
     normal: [i8; 4],
 }
+impl FarVertex {
+    #[allow(dead_code)] // `terrain_gpu` also builds in standalone checks.
+    pub(crate) fn position_normal(&self) -> ([f32; 3], [f32; 3]) {
+        (
+            self.pos,
+            std::array::from_fn(|i| f32::from(self.normal[i]) / 127.),
+        )
+    }
+}
 pub fn world_mesh(
     t: &Terrain,
     step: usize,

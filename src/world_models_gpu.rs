@@ -776,23 +776,95 @@ impl World {
         advance: bool,
     ) {
         if advance {
-            // 1. Playback advances once per frame and each model is posed once.
-            self.advance_poses(delta_ms);
-            // 2. Hook-attached producers resolve their parent from those poses
-            //    (0x7b2520), then publish before the grid consumes, so a light
-            //    created or moved on this tick already lights this frame.
-            self.resolve_attachments();
-            self.apply_activation(night, delta_ms, center);
-            self.owners.update(delta_ms, &mut self.publications);
-            self.update_effects(device, queue, frame, delta_ms);
-            self.grid.update(lights, center);
-            self.publications.consume_into(&mut self.grid);
+            self.advance_frame(device, queue, frame, center, lights, night, delta_ms, true);
         }
         self.draw_models(device, queue, frame, night);
         if advance {
             self.rebuild_alpha_order(center);
         }
     }
+
+    /// Same playback/light publication, without raster buffer or pipeline work.
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) fn update_for_rays(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: Frame,
+        center: [f32; 3],
+        lights: &SceneLights,
+        night: f32,
+        delta_ms: u32,
+    ) {
+        self.advance_frame(device, queue, frame, center, lights, night, delta_ms, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn advance_frame(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: Frame,
+        center: [f32; 3],
+        lights: &SceneLights,
+        night: f32,
+        delta_ms: u32,
+        upload: bool,
+    ) {
+        self.advance_poses(delta_ms);
+        self.resolve_attachments();
+        self.apply_activation(night, delta_ms, center);
+        self.owners.update(delta_ms, &mut self.publications);
+        self.update_effects(device, queue, frame, delta_ms, upload);
+        self.grid.update(lights, center);
+        self.publications.consume_into(&mut self.grid);
+    }
+
+    // Source data, not the current raster queue. In particular don't discard
+    // poses outside the camera frustum: a reflected or shadow ray can see them.
+    #[allow(dead_code, clippy::type_complexity)]
+    pub(crate) fn ray_sources(
+        &mut self,
+    ) -> (
+        impl Iterator<
+                Item = (
+                    &crate::model_asset::ModelAsset,
+                    &[crate::model_asset::PosedMesh],
+                ),
+            > + '_,
+        &[crate::gfx_player::EffectQuad],
+        &[DynamicLight],
+        &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+    ) {
+        let bounds = self.resident_bounds;
+        let view = self.view;
+        let assets = &self.assets.assets;
+        let poses = self
+            .assets
+            .instances
+            .iter()
+            .zip(&self.slots)
+            .filter_map(move |(i, slot)| {
+                let p = i.placement.position;
+                if !cutoff_residency::contains(bounds, p)
+                    || slot.failed
+                    || view.is_some_and(|(x, z, r)| {
+                        (p[0] - x).powi(2) + (p[2] - z).powi(2) > (r + 128.).powi(2)
+                    })
+                {
+                    return None;
+                }
+                let pose = slot.posed.as_ref()?.as_ref().ok()?;
+                Some((&assets[i.asset], pose.meshes.as_slice()))
+            });
+        (
+            poses,
+            &self.effect_quads,
+            self.grid.dynamic_lights(),
+            &mut *self.read,
+        )
+    }
+
     /// Install the surface query the effect pass needs to drape a
     /// ground-matched decal over the terrain.
     ///
@@ -844,6 +916,7 @@ impl World {
         queue: &wgpu::Queue,
         frame: Frame,
         delta_ms: u32,
+        upload: bool,
     ) {
         if !self.owners.effects_enabled() {
             self.effect_quads.clear();
@@ -914,6 +987,9 @@ impl World {
             ..
         } = self;
         *effect_quads = quads;
+        if !upload {
+            return;
+        }
         if effects.is_none() {
             // The same reverse-Z depth buffer the world's models use, so an
             // effect in front of a wall is occluded by nothing and one behind it

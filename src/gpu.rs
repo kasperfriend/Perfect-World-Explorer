@@ -1,10 +1,13 @@
 //! Experimental GPU world renderer: actual client terrain, static BMDs and water masks.
 //! Baked terrain material atlas, fixed lighting and flat water are not client parity.
+use crate::modules::lighter::{Lighter, Mode as LighterMode, Settings as LighterSettings};
 use crate::scenery_visibility::{
     allows_class_with_context, lod_scale, Class, ModelClass, Pass, RenderContext, Visibility,
     NATIVE_DEFAULT_WATER_EFFECT,
 };
 use crate::Terrain;
+#[path = "modules/lighter/host.rs"]
+mod lighter_host;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 use std::{
@@ -93,6 +96,11 @@ struct FrameSnapshot {
     celestial_alpha: f32,
     authored: [f32; 3],
     celestial: [f32; 3],
+    sky_sets: (i32, i32, f32),
+    sky_tint: [f32; 3],
+    sky_drift: [f32; 2],
+    sky_sun: [f32; 4],
+    sky_moon: [f32; 4],
     time_advances: u32,
     light_publications: u32,
 }
@@ -124,6 +132,11 @@ impl Default for FrameSnapshot {
             celestial_alpha: 0.,
             authored: [0.; 3],
             celestial: [0.; 3],
+            sky_sets: (0, 0, 0.),
+            sky_tint: [1.; 3],
+            sky_drift: [0.; 2],
+            sky_sun: [0.; 4],
+            sky_moon: [0.; 4],
             time_advances: 0,
             light_publications: 0,
         }
@@ -1712,6 +1725,10 @@ fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || 
 @fragment fn fs_sdr(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if !sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
 "#;
 struct Renderer {
+    // Drop the Vulkan interop resources before the device they borrow.
+    lighter: Lighter,
+    lighter_feed: Option<lighter_host::Feed>,
+    scene_format: wgpu::TextureFormat,
     /// Optional add-ons; default-disabled and absent from headless previews.
     modules: crate::modules::Modules,
     module_format: wgpu::TextureFormat,
@@ -1994,7 +2011,22 @@ impl Renderer {
         mut m: MeshData,
         t: &mut Terrain,
         vegetation_authored_mips: bool,
+        mut lighter: Lighter,
     ) -> Result<Self, String> {
+        let lighter_feed = if lighter.armed() {
+            match lighter_host::Feed::new(t, &m, vegetation_authored_mips) {
+                Ok(mut feed) => {
+                    lighter.install(feed.snapshot(&m));
+                    Some(feed)
+                }
+                Err(error) => {
+                    lighter.install(Err(error));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),
             contents: bytemuck::bytes_of(&Uniform {
@@ -2477,6 +2509,9 @@ impl Renderer {
             crate::sky_transition::Triple(sky.night_set().min(2) as u8),
         );
         Ok(Self {
+            lighter,
+            lighter_feed,
+            scene_format: format,
             modules: crate::modules::Modules::default(),
             module_format: format.remove_srgb_suffix(),
             models,
@@ -2987,6 +3022,11 @@ impl Renderer {
             celestial_alpha,
             authored,
             celestial,
+            sky_sets: main_sets,
+            sky_tint: frame.tint,
+            sky_drift: frame.drift,
+            sky_sun: frame.sun,
+            sky_moon: frame.moon,
             time_advances: 1,
             light_publications: 1,
         };
@@ -2994,6 +3034,9 @@ impl Renderer {
         snapshot
     }
     fn update_mesh(&mut self, mut m: MeshData) -> Result<(), String> {
+        if let Some(feed) = &mut self.lighter_feed {
+            self.lighter.install(feed.snapshot(&m));
+        }
         if let Some(mut upload) = m.terrain_upload.take() {
             self.terrain_gpu.update_residency(
                 &self.device,
@@ -3637,6 +3680,10 @@ impl Renderer {
         // against a view that no longer exists.
         reset_history: bool,
     ) {
+        let frame = self.begin_frame(camera, w, h);
+        if self.lighter.replaces_world() {
+            return self.render_lighter(target, matrix, camera, &frame, w, h);
+        }
         // Where this frame's CPU time goes, stage by stage. One line a second on
         // the `TimingFrame` channel; see `FrameBudget`.
         let mut stage_ms = [0f64; STAGE_COUNT];
@@ -3659,7 +3706,6 @@ impl Renderer {
         // instead of one call per run.
         self.queue_main_runs();
         lap(STAGE_VISIBILITY, &mut stage_ms, &mut lap_at);
-        let frame = self.begin_frame(camera, w, h);
         self.weather.advance(camera.logic_delta_ms);
         let selected_weather = camera.regional_light.map_or(
             crate::client_weather::WeatherSelection::default(),
@@ -4901,9 +4947,17 @@ fn preferred_backends() -> wgpu::Backends {
     })
 }
 
-fn make_instance() -> wgpu::Instance {
+fn instance_backends(lighter: LighterMode) -> wgpu::Backends {
+    if lighter == LighterMode::Hardware && cfg!(any(target_os = "windows", target_os = "linux")) {
+        wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::VULKAN)
+    } else {
+        preferred_backends()
+    }
+}
+
+fn make_instance(lighter: LighterMode) -> wgpu::Instance {
     wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: preferred_backends(),
+        backends: instance_backends(lighter),
         ..Default::default()
     })
 }
@@ -4911,6 +4965,7 @@ fn make_instance() -> wgpu::Instance {
 async fn adapter(
     instance: &wgpu::Instance,
     surface: Option<&wgpu::Surface<'_>>,
+    lighter: LighterMode,
 ) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
     let a = if let Ok(name) = std::env::var("WGPU_ADAPTER_NAME") {
         let query = name.to_lowercase();
@@ -4922,6 +4977,18 @@ async fn adapter(
                     && surface.map_or(true, |s| a.is_surface_supported(s))
             })
             .ok_or_else(|| format!("No compatible GPU adapter contains {name:?}"))?
+    } else if let Some(rt) = (lighter == LighterMode::Hardware)
+        .then(|| {
+            instance
+                .enumerate_adapters(wgpu::Backends::VULKAN)
+                .into_iter()
+                .filter(|adapter| surface.map_or(true, |s| adapter.is_surface_supported(s)))
+                .filter(crate::modules::lighter::supports_hardware)
+                .max_by_key(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
+        })
+        .flatten()
+    {
+        rt
     } else {
         instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -4934,23 +5001,34 @@ async fn adapter(
             .ok_or("No compatible GPU adapter")?
     };
     eprintln!("GPU adapter: {:?}", a.get_info());
-    let (d, q) = a
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                label: None,
-                // The tree batches are one `multi_draw_indexed_indirect` call
-                // when the adapter has these; `FarTrees` falls back to one
-                // indirect draw per batch when it does not.
-                required_features: a.features()
-                    & (wgpu::Features::TEXTURE_COMPRESSION_BC
-                        | wgpu::Features::MULTI_DRAW_INDIRECT
-                        | wgpu::Features::INDIRECT_FIRST_INSTANCE),
-                required_limits: wgpu::Limits::downlevel_defaults().using_resolution(a.limits()),
-            },
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    // Request RT bits only for an opted-in scene and only on a physical
+    // Vulkan device which advertised actual acceleration-structure features.
+    let rt = crate::modules::lighter::device_features(&a, lighter);
+    let native = a.features()
+        & (wgpu::Features::TEXTURE_COMPRESSION_BC
+            | wgpu::Features::MULTI_DRAW_INDIRECT
+            | wgpu::Features::INDIRECT_FIRST_INSTANCE);
+    let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(a.limits());
+    if lighter != LighterMode::Off {
+        limits.max_buffer_size = a.limits().max_buffer_size.min(512 << 20);
+        limits.max_storage_buffer_binding_size =
+            a.limits().max_storage_buffer_binding_size.min(256 << 20);
+    }
+    let request = |required_features| wgpu::DeviceDescriptor {
+        label: None,
+        required_features,
+        required_limits: limits.clone(),
+    };
+    let (d, q) = match a.request_device(&request(native | rt), None).await {
+        Ok(device) => device,
+        Err(error) if !rt.is_empty() => {
+            eprintln!("Lighter: Vulkan RT device creation refused ({error}); hardware mode will be unavailable");
+            a.request_device(&request(native), None)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     Ok((a, d, q))
 }
 pub fn run(
@@ -4994,28 +5072,31 @@ pub fn run(
             .build(&event_loop)
             .map_err(|e| e.to_string())?,
     );
-    let mut instance = make_instance();
-    let mut surface = instance
-        .create_surface(window.clone())
-        .map_err(|e| e.to_string())?;
-    let mut adapter_result = pollster::block_on(adapter(&instance, Some(&surface)));
-    if let Err(error) = &adapter_result {
-        if std::env::var_os("WGPU_BACKEND").is_none() {
-            eprintln!(
-                "Perfect World Explorer: no D3D12 adapter ({error}); falling back to all backends"
-            );
-            let fallback = wgpu::Instance::new(wgpu::InstanceDescriptor {
+    let lighter_settings = if crate::modules::lighter_installed() {
+        LighterSettings::load()
+    } else {
+        LighterSettings::default()
+    };
+    let try_surface = |instance: &wgpu::Instance| {
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|e| e.to_string())?;
+        let gpu = pollster::block_on(adapter(instance, Some(&surface), lighter_settings.mode))?;
+        Ok::<_, String>((surface, gpu))
+    };
+    let mut instance = make_instance(lighter_settings.mode);
+    let (mut surface, (adapter, device, queue)) = match try_surface(&instance) {
+        Ok(startup) => startup,
+        Err(error) if std::env::var_os("WGPU_BACKEND").is_none() => {
+            eprintln!("Perfect World Explorer: preferred adapter unavailable ({error}); checking all backends");
+            instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::all(),
                 ..Default::default()
             });
-            surface = fallback
-                .create_surface(window.clone())
-                .map_err(|e| format!("surface unavailable on the fallback backend: {e}"))?;
-            instance = fallback;
-            adapter_result = pollster::block_on(adapter(&instance, Some(&surface)));
+            try_surface(&instance)?
         }
-    }
-    let (adapter, device, queue) = adapter_result?;
+        Err(error) => return Err(error),
+    };
     let software_adapter = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
     window.set_title(&format!(
         "Perfect World Explorer — {} — click mouse to look, Esc menu, WASD fly",
@@ -5085,6 +5166,7 @@ pub fn run(
         0,
         false,
     )?;
+    let lighter = Lighter::new(lighter_settings, &adapter, &device);
     let mut renderer = Renderer::new(
         device,
         queue,
@@ -5094,6 +5176,7 @@ pub fn run(
         m,
         &mut t,
         vegetation_authored_mips,
+        lighter,
     )?;
     // Resolution scaling: the world renders into an offscreen target at a
     // scaled extent and is bilinearly blitted to the full-size composition
@@ -5626,7 +5709,11 @@ pub fn run(
                     let slider_extent = crate::render_scale::scaled_extent(config.width, config.height, settings.resolution_scale, max_texture_dimension);
                     settings.upscale_quality =
                         crate::nearest_available(settings.upscaling, settings.upscale_quality);
-                    let wanted_extent = crate::render_extent(slider_extent, (config.width, config.height), max_texture_dimension, settings.upscaling, settings.upscale_quality, &gpu_facts, &sdk_report);
+                    let ray_world = renderer.lighter.replaces_world();
+                    let extent_upscaling = if ray_world && settings.upscaling != crate::UpscaleMethod::Fsr1 {
+                        crate::UpscaleMethod::Off
+                    } else { settings.upscaling };
+                    let wanted_extent = crate::render_extent(slider_extent, (config.width, config.height), max_texture_dimension, extent_upscaling, settings.upscale_quality, &gpu_facts, &sdk_report);
                     applied_extent = wanted_extent;
                     // Recreate the FSR context lazily; a pure window resize
                     // can move the display extent even when the render
@@ -5640,7 +5727,7 @@ pub fn run(
                             fsr_upscaler = None;
                         }
                     }
-                    let want_fsr = settings.upscaling.is_ffx_fsr()
+                    let want_fsr = !ray_world && settings.upscaling.is_ffx_fsr()
                         && !fsr_failed
                         && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
                     if want_fsr && fsr_upscaler.is_none() {
@@ -5683,7 +5770,7 @@ pub fn run(
                         dlss_failed = false;
                         dlss_fail_reason = None;
                     }
-                    let want_xess = settings.upscaling == crate::UpscaleMethod::Xess
+                    let want_xess = !ray_world && settings.upscaling == crate::UpscaleMethod::Xess
                         && !xess_failed
                         && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
                     if want_xess && xess_upscaler.is_none() {
@@ -5720,7 +5807,7 @@ pub fn run(
                     // spend the retry budget or to record a failure the user
                     // would then read in the Graphics tab.
                     let dlss_window_big_enough = config.width >= 32 && config.height >= 32;
-                    let want_dlss = settings.upscaling == crate::UpscaleMethod::Dlss
+                    let want_dlss = !ray_world && settings.upscaling == crate::UpscaleMethod::Dlss
                         && !dlss_failed
                         && dlss_window_big_enough
                         && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
@@ -5843,7 +5930,7 @@ pub fn run(
                     };
                     // Frame generation transitions (enable / disable / extent
                     // change). Runs before any surface access this frame.
-                    let want_fg = settings.frame_generation == crate::FrameGenMethod::Fsr
+                    let want_fg = !ray_world && settings.frame_generation == crate::FrameGenMethod::Fsr
                         && presented_once
                         && !fg_failed
                         && crate::support_framegen(
@@ -5870,7 +5957,7 @@ pub fn run(
                     }
                     // XeSS Frame Generation transitions (enable / disable /
                     // extent change). Same one-swapchain-per-hwnd rule.
-                    let want_xess_fg = settings.frame_generation == crate::FrameGenMethod::Xess
+                    let want_xess_fg = !ray_world && settings.frame_generation == crate::FrameGenMethod::Xess
                         && presented_once
                         && !xess_fg_failed
                         && crate::support_framegen(
@@ -5940,7 +6027,7 @@ pub fn run(
                     }
                     // DLSS Frame Generation. Same one-swapchain-per-hwnd rule as
                     // the other two: the wgpu surface is dropped first.
-                    let want_dlss_fg = settings.frame_generation
+                    let want_dlss_fg = !ray_world && settings.frame_generation
                         == crate::FrameGenMethod::Dlss
                         && presented_once
                         && !dlss_fg_failed
@@ -6240,7 +6327,7 @@ pub fn run(
                     // atlases nothing samples. Crossing into or out of that
                     // state changes what the mesh should contain, so it is part
                     // of the staleness test and not just of the request.
-                    let skip_local_scenery = renderer.world_done;
+                    let skip_local_scenery = renderer.world_done && !ray_world;
                     let stale = match &aim {
                         Some(aim) => {
                             aim != &renderer.lod
@@ -6275,7 +6362,7 @@ pub fn run(
                     if !settings.show_zone_entry {zone_banner=None;}
                     if settings.fullscreen!=fullscreen_applied {window.set_fullscreen(if settings.fullscreen{Some(Fullscreen::Borderless(window.current_monitor()))}else{None});fullscreen_applied=settings.fullscreen;}
 
-                    let want_world=settings.whole_world && !settings.detail.terrain_cutoff && !renderer.detail.terrain_cutoff;
+                    let want_world=settings.whole_world && !ray_world && !settings.detail.terrain_cutoff && !renderer.detail.terrain_cutoff;
                     if want_world != world_enabled {
                         world_enabled=want_world;
                         if let Some(c)=world_cancel.take(){c.store(true,std::sync::atomic::Ordering::Relaxed);}
@@ -6288,7 +6375,7 @@ pub fn run(
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
                             std::thread::Builder::new().name("whole-world-objects".into()).spawn(move ||crate::world_objects::build(root,ornaments,tx,c)).expect("world preload thread");
                             world_rx=Some(rx);world_cancel=Some(cancel);world_started_at=Some(std::time::Instant::now());world_last_log_at=std::time::Instant::now();world_last_logged_pages=0;world_status=String::from("Loading world objects...");
-                        } else {world_started_at=None;world_status=String::from("Off");}
+                        } else {world_started_at=None;world_status=String::from(if ray_world { "Paused by Lighter (streamed scenery only)" } else { "Off" });}
                     }
                 if let Some(rx) = &world_rx {
                     // Favor completing the explicitly requested whole-world
@@ -6997,7 +7084,7 @@ pub fn run(
                                 || fg_failed
                                 || xess_fg_failed
                                 || dlss_fg_failed;
-                            if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
+                            if menu_page.is_open() || renderer.lighter.error().is_some() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
                                 let input=egui_state.take_egui_input(&window);
                                 let output=egui_ctx.run(input,|ctx| {
                                     // A replacement-process handoff leaves this
@@ -7077,7 +7164,7 @@ pub fn run(
                                             });
                                     }
                                     if menu_page==MenuPage::Modules {
-                                        if renderer.modules.menu_ui(ctx,camera.pos,camera.yaw){menu_page=MenuPage::Main;}
+                                        if renderer.modules.menu_ui(ctx,camera.pos,camera.yaw,&mut renderer.lighter){menu_page=MenuPage::Main;}
                                     }
                                     if menu_page==MenuPage::Settings {
                                         egui::Window::new("SETTINGS  |  ESC to go back")
@@ -7228,6 +7315,15 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         } else { ui.add(egui::Image::new((map_id,egui::vec2(MINIMAP_HUD,MINIMAP_HUD))).rounding(round)) };
                                         let center=image.rect.center();let dir=egui::vec2(camera.yaw.sin(),camera.yaw.cos());let side=egui::vec2(-dir.y,dir.x);let points=vec![center+dir*10.,center-dir*7.+side*5.,center-dir*7.-side*5.];ui.painter().add(egui::Shape::convex_polygon(points,egui::Color32::from_rgb(255,225,130),egui::Stroke::new(1.0f32,egui::Color32::BLACK)));ui.painter().text(image.rect.left_top()+egui::vec2(5.,5.),egui::Align2::LEFT_TOP,"N",egui::FontId::proportional(14.),egui::Color32::WHITE);});});}
                                     if show_status_badge {egui::Area::new(egui::Id::new("fsr-status-hud")).anchor(egui::Align2::LEFT_TOP,egui::vec2(16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.0).show(ui,|ui|{if let Some(label)=&fsr_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&xess_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&dlss_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,150)));}if let Some(label)=&fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&xess_fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&dlss_fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&latency_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(190,255,140)));}if latency_failed_note {ui.label(egui::RichText::new("XeLL failed -> VSync pacing").small().color(egui::Color32::LIGHT_RED));}if fsr_failed_note {ui.label(egui::RichText::new("FSR failed -> native render, no upscaling").small().color(egui::Color32::LIGHT_RED));}if xess_failed_note {ui.label(egui::RichText::new("XeSS failed -> native render, no upscaling").small().color(egui::Color32::LIGHT_RED));}if dlss_failed_note {ui.label(egui::RichText::new("DLSS failed -> native render, no upscaling").small().color(egui::Color32::LIGHT_RED));}if fsr_failed_note {if let Some(reason)=&fsr_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}}if fg_failed {ui.label(egui::RichText::new("FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if xess_fg_failed {ui.label(egui::RichText::new("XeSS FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if dlss_fg_failed {ui.label(egui::RichText::new("DLSS FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&dlss_fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"\u{2026}";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&xess_fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if xess_failed_note {if let Some(reason)=&xess_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}}if dlss_failed_note {if let Some(reason)=&dlss_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}}if let Some(reason)=&latency_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}});});}
+                                    if let Some(error)=renderer.lighter.error() {
+                                        egui::Area::new(egui::Id::new("lighter-error")).anchor(egui::Align2::RIGHT_TOP,egui::vec2(-16.,16.)).interactable(false).show(ctx,|ui| {
+                                            egui::Frame::popup(ui.style()).show(ui,|ui| {
+                                                ui.set_max_width(360.);
+                                                ui.colored_label(egui::Color32::LIGHT_RED,error);
+                                                ui.label("Change renderer in Esc → Modules → Lighter.");
+                                            });
+                                        });
+                                    }
                                     if menu_page.is_open(){renderer.modules.settings_panel(ctx,config.width as f32/window.scale_factor() as f32);}
                                     if renderer.modules.overlay_active() {
                                         // Overhead names: the same view-projection the world
@@ -7592,8 +7688,20 @@ pub fn preview(
     path: &std::path::Path,
     camera: Option<[f32; 5]>,
 ) -> Result<(), String> {
-    let mut instance = make_instance();
-    let mut adapter_result = pollster::block_on(adapter(&instance, None));
+    // Never read interactive settings for an ordinary headless preview.
+    let mut lighter_settings = LighterSettings::default();
+    if let Ok(mode) = std::env::var("PW_PREVIEW_LIGHTER") {
+        lighter_settings.mode = LighterMode::parse(&mode)
+            .ok_or("PW_PREVIEW_LIGHTER must be off, software or hardware")?;
+        if lighter_settings.mode != LighterMode::Off
+            && (std::env::var_os("PW_PREVIEW_WORLD_TEST").is_some()
+                || std::env::var_os("PW_PREVIEW_MINIMAP").is_some())
+        {
+            return Err("Lighter preview requires the main streamed world, not a whole-world preload or minimap".into());
+        }
+    }
+    let mut instance = make_instance(lighter_settings.mode);
+    let mut adapter_result = pollster::block_on(adapter(&instance, None, lighter_settings.mode));
     if let Err(error) = &adapter_result {
         if std::env::var_os("WGPU_BACKEND").is_none() {
             eprintln!(
@@ -7603,10 +7711,10 @@ pub fn preview(
                 backends: wgpu::Backends::all(),
                 ..Default::default()
             });
-            adapter_result = pollster::block_on(adapter(&instance, None));
+            adapter_result = pollster::block_on(adapter(&instance, None, lighter_settings.mode));
         }
     }
-    let (_adapter, device, queue) = adapter_result?;
+    let (adapter, device, queue) = adapter_result?;
     let mut cam = if let Some([x, y, z, yaw, pitch]) = camera {
         if ![x, y, z, yaw, pitch].iter().all(|x| x.is_finite()) {
             return Err("non-finite camera".into());
@@ -7708,7 +7816,13 @@ pub fn preview(
     )?;
     let (width, height) = (960u32, 720u32);
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let mut renderer = Renderer::new(device, queue, fmt, width, height, mesh, &mut t, false)?;
+    let lighter = Lighter::new(lighter_settings, &adapter, &device);
+    let mut renderer = Renderer::new(
+        device, queue, fmt, width, height, mesh, &mut t, false, lighter,
+    )?;
+    if let Some(error) = renderer.lighter.error() {
+        return Err(error.into());
+    }
     if std::env::var_os("PW_PREVIEW_WORLD_TEST").is_some() {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let root = t.element.clone();
@@ -7870,6 +7984,9 @@ pub fn preview(
         height,
         false,
     );
+    if let Some(error) = renderer.lighter.error() {
+        return Err(error.into());
+    }
     if std::env::var_os("PW_PREVIEW_MINIMAP").is_some() {
         let d = depth(&renderer.device, width, height);
         renderer.render_minimap(

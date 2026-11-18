@@ -115,6 +115,23 @@ fn decode_rgba(bytes: &[u8]) -> Result<(image::RgbaImage, bool), String> {
     Ok((image.into_rgba8(), alpha_texture))
 }
 
+/// Top-level RGBA for alternate renderers that need texels instead of a GPU
+/// texture. Share the DDS decoder (including BC1's one-bit transparency).
+#[allow(dead_code)]
+pub(crate) fn decode_for_rays(bytes: &[u8]) -> Result<(image::RgbaImage, bool), String> {
+    if !bytes.starts_with(b"DDS ") {
+        return decode_rgba(bytes);
+    }
+    let dds = Dds::parse(bytes)?;
+    let mip = dds.mips.first().ok_or("empty model DDS")?;
+    let mut rgba = Vec::new();
+    append_mip(bytes, dds.format, mip, &mut rgba)?;
+    let has_alpha = dds.format.alpha_texture() || rgba.chunks_exact(4).any(|pixel| pixel[3] < 255);
+    let image = image::RgbaImage::from_raw(mip.width, mip.height, rgba)
+        .ok_or("invalid decoded model texture extent")?;
+    Ok((image, has_alpha))
+}
+
 fn upload_image(
     device: &wgpu::Device,
     queue: &wgpu::Queue,

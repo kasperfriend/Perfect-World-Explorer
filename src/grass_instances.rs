@@ -26,8 +26,8 @@ pub struct Builder {
     groups: BTreeMap<(usize, usize), Group>,
 }
 pub struct Batch {
-    indices: Range<u32>,
-    instances: Range<u32>,
+    pub(crate) indices: Range<u32>,
+    pub(crate) instances: Range<u32>,
 }
 #[derive(Default)]
 pub struct Data {
@@ -127,6 +127,16 @@ impl Builder {
     }
 }
 impl Data {
+    #[allow(dead_code)] // consumed by the viewer's alternate world renderer
+    pub(crate) fn geometry(&self) -> (&[GrassVertex], &[u32], &[[f32; 12]], &[Batch]) {
+        (
+            &self.vertices,
+            &self.indices,
+            &self.instances,
+            &self.batches,
+        )
+    }
+
     pub fn counts(&self) -> (usize, usize, usize) {
         (
             self.vertices.len(),

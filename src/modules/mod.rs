@@ -4,6 +4,7 @@
 
 mod designer;
 mod librarian;
+pub(crate) mod lighter;
 mod package;
 mod populator;
 mod walker;
@@ -26,6 +27,13 @@ fn extend_fonts(ctx: &egui::Context, extend: impl FnOnce(&mut egui::FontDefiniti
     extend(&mut definitions);
     ctx.data_mut(|data| data.insert_temp(id, definitions.clone()));
     ctx.set_fonts(definitions);
+}
+
+pub(crate) fn lighter_installed() -> bool {
+    Registry::discover(package::default_root())
+        .packages
+        .iter()
+        .any(|p| p.id == "lighter")
 }
 
 pub struct Modules {
@@ -91,11 +99,12 @@ impl Modules {
 
     /// True when the executable implements this package id and the module is
     /// currently enabled.
-    fn module_enabled(&self, id: &str) -> bool {
+    fn module_enabled(&self, id: &str, lighter: &lighter::Lighter) -> bool {
         match id {
             "walker" => self.walker.is_active(),
             "populator" => self.populator.is_active(),
             "librarian" => self.librarian.active(),
+            "lighter" => lighter.replaces_world() && lighter.error().is_none(),
             _ => false,
         }
     }
@@ -117,7 +126,13 @@ impl Modules {
     }
 
     /// Returns true when the user asks to go back to the main Escape menu.
-    pub fn menu_ui(&mut self, ctx: &egui::Context, spawn: Vec3, yaw: f32) -> bool {
+    pub fn menu_ui(
+        &mut self,
+        ctx: &egui::Context,
+        spawn: Vec3,
+        yaw: f32,
+        lighter: &mut lighter::Lighter,
+    ) -> bool {
         let mut back = false;
         egui::Window::new("MODULES  |  ESC to go back")
             .default_pos(egui::pos2(16., 16.))
@@ -157,7 +172,7 @@ impl Modules {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::default())
                     .show_inside(ui, |ui| {
-                        self.module_browser_ui(ui, &mut selected, spawn, yaw);
+                        self.module_browser_ui(ui, &mut selected, spawn, yaw, lighter);
                     });
                 self.selected = selected;
             });
@@ -171,6 +186,7 @@ impl Modules {
         selected: &mut usize,
         spawn: Vec3,
         yaw: f32,
+        lighter: &mut lighter::Lighter,
     ) {
         egui::SidePanel::left("installed_module_browser")
             .exact_width(190.)
@@ -184,7 +200,7 @@ impl Modules {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         for (index, installed) in self.packages.packages.iter().enumerate() {
-                            let enabled = self.module_enabled(&installed.id);
+                            let enabled = self.module_enabled(&installed.id, lighter);
                             let text = if enabled {
                                 egui::RichText::new(format!("● {}", installed.name))
                                     .color(egui::Color32::LIGHT_GREEN)
@@ -234,7 +250,7 @@ impl Modules {
                         // descriptions must wrap, never size the outer Window.
                         ui.set_max_width(width);
                         if let Some(installed) = self.packages.packages.get(*selected).cloned() {
-                            self.selected_module_ui(ui, installed, spawn, yaw);
+                            self.selected_module_ui(ui, installed, spawn, yaw, lighter);
                         } else {
                             ui.heading("Module details");
                             ui.label("Select a module on the left.");
@@ -243,7 +259,14 @@ impl Modules {
             });
     }
 
-    fn selected_module_ui(&mut self, ui: &mut egui::Ui, installed: Package, spawn: Vec3, yaw: f32) {
+    fn selected_module_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        installed: Package,
+        spawn: Vec3,
+        yaw: f32,
+        lighter: &mut lighter::Lighter,
+    ) {
         ui.heading(&installed.name);
         ui.label(
             egui::RichText::new(format!("Version {}", installed.version))
@@ -260,6 +283,7 @@ impl Modules {
         match installed.id.as_str() {
             "walker" => self.walker_module_ui(ui, spawn, yaw),
             "populator" => self.populator_module_ui(ui, spawn),
+            "lighter" => lighter.ui(ui),
             "librarian" => {
                 let active = self.librarian.active();
                 if ui
@@ -537,6 +561,15 @@ impl Modules {
 
     /// The host calls this only when the Walker add-on itself is visible in the
     /// pass; the two add-ons are independent.
+    pub(crate) fn ray_inputs(
+        &mut self,
+        matrix: glam::Mat4,
+        out: &mut lighter::model_feed::Moving<'_>,
+    ) -> Result<(), String> {
+        self.walker.ray_inputs(matrix, out)?;
+        self.populator.ray_inputs(matrix, out)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render_walker(
         &mut self,
@@ -600,7 +633,7 @@ mod tests {
                     ..Default::default()
                 },
                 |context| {
-                    modules.menu_ui(context, Vec3::ZERO, 0.);
+                    modules.menu_ui(context, Vec3::ZERO, 0., &mut lighter::Lighter::default());
                 },
             );
         };
@@ -654,7 +687,7 @@ mod tests {
                     ..Default::default()
                 },
                 |context| {
-                    modules.menu_ui(context, Vec3::ZERO, 0.);
+                    modules.menu_ui(context, Vec3::ZERO, 0., &mut lighter::Lighter::default());
                 },
             );
         }
