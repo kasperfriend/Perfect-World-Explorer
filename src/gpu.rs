@@ -5366,8 +5366,13 @@ fn run_viewer(
         Err(error) => return Err(error),
     };
     let gpu_loss = recovery::Loss::default();
-    let wake = window.clone();
-    gpu_loss.register(&device, move || wake.request_redraw());
+    let wake = startup_redraw.clone();
+    gpu_loss.register(&device, move || {
+        // A driver may report Destroyed while dropping the device after the
+        // event loop has already exited. X11 request_redraw panics then, but
+        // waking by proxy is fallible and never needs the window to be visible.
+        let _ = wake.send_event(());
+    });
     let software_adapter = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
     window.set_title(&format!(
         "Perfect World Explorer — {} — click mouse to look, Esc menu, WASD fly",
@@ -7303,10 +7308,11 @@ fn run_viewer(
                                 gpu_loss.report(error.to_owned());
                             }
                             if gpu_loss.pending() { return; }
-                            if let Some(snapshot) = restoring.as_ref().filter(|_| !presented_once) {
-                                if let Some(error) = renderer.lighter.error() {
-                                    // A native fallback is fine on standalone
-                                    // startup, but did not apply this request.
+                            if let Some(snapshot) = restoring.as_ref().filter(|s| !presented_once && s.kind == recovery::RestoreKind::Reload) {
+                                // Native is usable on startup or device recovery,
+                                // but cannot satisfy an explicit ray reload.
+                                let fallback = snapshot.lighter.mode != LighterMode::Off && !renderer.renders_rays();
+                                if let Some(error) = renderer.lighter.error().or_else(|| fallback.then_some("The requested ray renderer did not draw the world.")) {
                                     run_error = Some(format!("{}: {error}", snapshot.kind.label()));
                                     target.set_control_flow(winit::event_loop::ControlFlow::Poll);
                                     target.exit();
