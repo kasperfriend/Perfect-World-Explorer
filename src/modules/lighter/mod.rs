@@ -2452,18 +2452,21 @@ impl Lighter {
         });
         if self.logger.level() != log::LogLevel::Off {
             ui.separator();
-            let copy_btn = ui.button("Copy diagnostics to clipboard")
+            let copy_btn = ui
+                .button("Copy diagnostics to clipboard")
                 .on_hover_text("Copy the current session diagnostics text to the clipboard.");
             if copy_btn.clicked() {
                 // Clipboard copy handled by the host; the diagnostics text is
                 // available from the log file.
             }
-            let open_btn = ui.button("Open log folder")
+            let open_btn = ui
+                .button("Open log folder")
                 .on_hover_text("Open the folder containing the rotating lighter log files.");
             if open_btn.clicked() {
                 // Open the log directory in the host file manager.
             }
-            let export_btn = ui.button("Export frame timings CSV")
+            let export_btn = ui
+                .button("Export frame timings CSV")
                 .on_hover_text("Export per-frame timing samples as CSV.");
             if export_btn.clicked() {
                 // Export per-frame timing samples as CSV.
