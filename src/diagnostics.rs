@@ -203,9 +203,16 @@ pub enum Channel {
     TimingCamera = 34,
     /// Audio: zone track, ambience, effect sounds.
     AudioState = 35,
+    /// Sound *elements* inside a playing effect root (170): the authored path,
+    /// volume, 2D flag and loop flag. Distinct from `AudioState`, which is what
+    /// the audio backend is playing. Nothing performs these elements — world
+    /// audio is `world_audio.rs`, which plays the EC-BLD sound records — so this
+    /// channel exists to make that gap measurable per root instead of being one
+    /// number on a status line.
+    EffectSounds = 36,
 }
 
-pub const CHANNELS: usize = 36;
+pub const CHANNELS: usize = 37;
 
 impl Channel {
     pub const ALL: [Channel; CHANNELS] = [
@@ -245,6 +252,11 @@ impl Channel {
         Self::TimingMemory,
         Self::TimingCamera,
         Self::AudioState,
+        // Last because the discriminants are the bit positions and this one was
+        // added after the table was full: `every_channel_has_a_unique_key_and_fits_the_mask`
+        // requires `ALL` to be in discriminant order, so a new channel goes at
+        // the end rather than beside its neighbours.
+        Self::EffectSounds,
     ];
 
     pub fn index(self) -> usize {
@@ -265,6 +277,7 @@ impl Channel {
             | Self::EffectTrails
             | Self::EffectModels
             | Self::EffectLights
+            | Self::EffectSounds
             | Self::EffectCulling
             | Self::EffectClock
             | Self::EffectDecals
@@ -310,6 +323,7 @@ impl Channel {
             | Self::EffectTrails
             | Self::EffectModels
             | Self::EffectLights
+            | Self::EffectSounds
             | Self::EffectGround => "Sub-elements",
             Self::EffectProblems => "Diagnosis",
             Self::SceneEffects | Self::SceneOrnaments | Self::SceneSounds => "Placements",
@@ -340,6 +354,7 @@ impl Channel {
             Self::EffectParticles => "effect-particles",
             Self::EffectTrails => "effect-trails",
             Self::EffectModels => "effect-models",
+            Self::EffectSounds => "effect-sounds",
             Self::EffectLights => "effect-lights",
             Self::EffectCulling => "effect-culling",
             Self::EffectClock => "effect-clock",
@@ -381,6 +396,7 @@ impl Channel {
             Self::EffectParticles => "Particles: spawns, volume, direction",
             Self::EffectTrails => "Trails, ribbons, fractals, waves",
             Self::EffectModels => "Model elements: file and placement",
+            Self::EffectSounds => "Sound elements: path, volume, 2D, loop",
             Self::EffectLights => "Lights a root publishes",
             Self::EffectCulling => "Activation radius and visibility",
             Self::EffectClock => "Clocks, loops, play speed, binds",
@@ -414,6 +430,14 @@ impl Channel {
     /// to read the source first.
     pub fn help(self) -> &'static str {
         match self {
+            Self::EffectSounds => {
+                "Every sound element (170) a playing root carries: the authored \
+                 paths, volume, the Force2D flag and the IsLoop flag, with the \
+                 root and the placed position. Nothing plays these -- world audio \
+                 is `world_audio.rs`, which reads the EC-BLD sound records -- so \
+                 this channel is how the gap is measured per root instead of \
+                 being one number on a status line."
+            }
             Self::EffectRoots => {
                 "Each effect root the world places, as the loader sees it: path, \
                  key, record position/direction/up/scale/alpha/play speed, the \
@@ -600,6 +624,7 @@ impl Channel {
                 | Self::EffectTrails
                 | Self::EffectModels
                 | Self::EffectLights
+                | Self::EffectSounds
                 | Self::EffectCulling
                 | Self::EffectClock
                 | Self::EffectDecals
@@ -629,6 +654,7 @@ impl Channel {
             | Self::EffectElements
             | Self::EffectTextures
             | Self::EffectModels
+            | Self::EffectSounds
             | Self::EffectProblems
             | Self::SceneEffects
             | Self::SceneOrnaments
@@ -715,6 +741,7 @@ const SUB_ELEMENTS: &[Channel] = &[
     Channel::EffectTrails,
     Channel::EffectModels,
     Channel::EffectLights,
+    Channel::EffectSounds,
     Channel::EffectGround,
     // Same reason as the cards group: "is the ring turning" is a clock question.
     Channel::EffectClock,
@@ -2536,7 +2563,13 @@ mod tests {
         assert!(text.contains("client root X"), "{text}");
         assert!(text.contains("effect-roots"), "{text}");
         assert!(text.contains("a root"), "{text}");
-        assert!(text.contains("of 36 on"), "{text}");
+        // Not a literal: the channel count changes when a channel is added, and
+        // a hard-coded number turns that into a failure that says nothing about
+        // the report. This line is what caught `36` going stale.
+        assert!(
+            text.contains(&format!("of {CHANNELS} on")),
+            "report must name the live channel count {CHANNELS}: {text}"
+        );
         set_mask(0);
         let _ = std::fs::remove_dir_all(&dir);
     }

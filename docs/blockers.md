@@ -1929,3 +1929,41 @@ tests prove nothing about the shipped data.
 
 Measured after the fix: `check` clean, `test` 203, `player` 286, `music` 27,
 `gfx` 94, `water` 20, `material` 25, `bins` 38/38.
+
+**Same class, third instance.** `src/diagnostics.rs` has 18 tests and the
+harness stubbed the whole module out, because it calls a dozen `egui` builder
+methods from the settings page. The tests went with the stub, so
+`every_channel_has_a_unique_key_and_fits_the_mask` — the test that requires
+`Channel::ALL` to be in discriminant order, because the discriminant *is* the
+mask bit — had never run. Adding one channel broke it and nothing said so.
+`tools/fixtures/egui_stub.rs` is the smallest `egui` that satisfies those call
+sites (builder methods return themselves, widgets do nothing), and
+`offline_harness.sh diagnostics` runs the real file against it: 18 tests. Two
+of them failed immediately on the new channel, and one of those was a
+hard-coded `36` in an assertion about the channel count, now derived from
+`CHANNELS`.
+
+## B-31: element 170 is authored but never played, and the status line hid which files were dropped
+
+`gfx_player` counted `170` sound elements in `Stats::sounds` and drew nothing,
+which is honest as far as it goes, but nothing named *which* sounds were
+dropped, so an entire element type stayed invisible. Measured over the 2,071
+`gfx.pck` roots of the staged 1.3.1 pack:
+
+- 2,070 roots parse; **0** reach `Spec::Unknown`; the one failure is a 4-byte
+  `MOXT` stub with no fields. No element id in that corpus is unhandled.
+- Element 170: **355 elements in 340 roots, 355 path rows** — one path each, so
+  `PathNum` batching is authored but never used in this pack.
+- The 355 rows name **139 distinct paths** under five roots: `Skill\` 77,
+  `Effect\` 33, `Creature\` 19, `Item\` 8, `Ambience\` 2. Volume 100,
+  `Force2D: 0` and `IsLoop: 0` in every sample.
+
+So these are skill and creature sounds, and they are *effect* audio, distinct
+from the EC-BLD sound records `world_audio.rs` already plays. New diagnostic
+channel `effect-sounds` prints each one with its root, paths, volume, 2D and
+loop flags and placed position, so the gap is per-root and measurable.
+
+Not wired to playback: `world_audio` resolves paths under an `sfx/` prefix
+against `sfx.pck`, and no `sfx.pck` is staged here, so whether these authored
+paths use the same base is unverified. Guessing the base and shipping silence
+would be worse than a named gap.

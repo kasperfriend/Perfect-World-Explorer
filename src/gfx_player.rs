@@ -3971,7 +3971,31 @@ fn emit_clock(
                 context.clock
             );
         }
-        Spec::Sound(_) => stats.sounds += 1,
+        Spec::Sound(sound) => {
+            stats.sounds += 1;
+            // Not played: world audio is `world_audio.rs`, which reads the EC-BLD
+            // sound records. A 170 element is a *skill* sound -- measured over the
+            // staged `gfx.pck`, the 355 element-170 records name 139 distinct
+            // paths under `Skill\`, `Effect\`, `Creature\`, `Item\` and
+            // `Ambience\`, with volume 100, `Force2D: 0` and `IsLoop: 0` the
+            // common case. The channel prints them so the gap is named per root:
+            // `Stats::sounds` counted them and nothing said which files were
+            // dropped, which is how a whole element type stayed unnoticed.
+            crate::diag_keyed!(
+                EffectSounds,
+                at(context),
+                1000,
+                "{} id=170 paths={:?} volume={} force2d={} loop={} at ({:.2},{:.2},{:.2})",
+                context.root,
+                sound.paths,
+                sound.volume,
+                sound.force_2d,
+                sound.is_loop,
+                context.placement.w_axis.x,
+                context.placement.w_axis.y,
+                context.placement.w_axis.z
+            );
+        }
         Spec::Model(_) => stats.models += 1,
         Spec::Curve(curve) => emit_paraboloid(curve, context, out),
         Spec::Unknown { .. } => stats.unrendered += 1,

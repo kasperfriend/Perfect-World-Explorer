@@ -1071,6 +1071,22 @@ EOF
             "$OUT/music/lib.rs" -o "$OUT/musictest"
         shift || true
         (cd "$REPO" && exec "$OUT/musictest" "$@") ;;
+    diagnostics) toolchain; sysroot; deps
+        # `src/diagnostics.rs` on its own, against `tools/fixtures/egui_stub.rs`.
+        # Its 18 tests had never run anywhere: the module has no GPU dependency,
+        # but it calls a dozen `egui` builder methods from the settings page, so
+        # the harness stubbed the whole module out and the tests inside it went
+        # with it. Two of them are load-bearing — one requires `Channel::ALL` to be
+        # in discriminant order because the discriminant is the mask bit, and one
+        # checks the report's channel count. Both failed immediately on a new
+        # channel, which is exactly what they are for.
+        "$RUSTC" --crate-type lib --crate-name egui --edition 2021 --sysroot "$SYSROOT" \
+            "$REPO/tools/fixtures/egui_stub.rs" -o "$OUT/libegui_stub.rlib"
+        "$RUSTC" --test --crate-name diagtest --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 --extern egui="$OUT/libegui_stub.rlib" \
+            "$REPO/src/diagnostics.rs" -o "$OUT/diagtest"
+        shift || true
+        (cd "$REPO" && exec "$OUT/diagtest" "$@") ;;
     material) toolchain; sysroot; deps; real_deps
         # The terrain material set: the missing-texture placeholder the client
         # substitutes must be a DDS the sampler and the DXT decoder both accept.
@@ -1702,4 +1718,4 @@ EOF
             -o "$OUT/matrix-maps" "$OUT/mm/run.rs"
         shift || true
         (cd "$REPO" && exec "$OUT/matrix-maps" "${1:-$REPO/google_drive/clients}") ;;
-    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|gfx|player|bins|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
