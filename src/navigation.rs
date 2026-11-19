@@ -353,11 +353,16 @@ mod tests {
     /// Copied from the two authored tables, not invented. All four were
     /// rejected by the reader that required five tab-separated fields and a
     /// quoted name, which is why 1.5.2's main world listed no destinations.
+    ///
+    /// The two `雪霏村` rows are the same destination in the Chinese and the
+    /// Russian client, so they carry different ids here even though a single
+    /// client never ships both: the list is sorted by name, and two entries
+    /// with one id make `by_id` ambiguous.
     #[test]
     fn hand_edited_destination_rows_still_yield_a_target() {
         let text = [
             "1001\t雪霏村\t1\t\"-2545.362,215.254,4116.355\"\t1",
-            "1001\t\"Снежная деревня\"\t1\t\"-2545.362,215.254,4116.355\"\t1",
+            "1002\t\"Снежная деревня\"\t1\t\"-2545.362,215.254,4116.355\"\t1",
             "9047    九冕尘寰台\t161\t\"-799.016,45,-282.283\"\t-1",
             "9048\t萝会城\t\t161\t\"-162.798,36,299.386\"\t-1",
             "9045    赢霄城\t1\t\"3545.439,282,3051.461\"\t52\t",
