@@ -153,7 +153,11 @@ pub struct World {
     /// Why the last activation pass left producers out, so a zone that draws
     /// nothing can say which gate closed on it: beyond the activation radius,
     /// outside the resident terrain window, or outside its day/night window.
-    census: [usize; 3],
+    /// Effect activation census, a partition of every registered producer:
+    /// `[playing, beyond the radius, outside the resident window, outside the
+    /// day/night window]`. The three refusal buckets are disjoint and checked in
+    /// that order, so the four numbers add up to the producer count.
+    census: [usize; 4],
     resident_bounds: Option<[f32; 4]>,
     /// Retail alpha insertion order as (slot, mesh) pairs.
     alpha: Vec<model_queue::AlphaCandidate>,
@@ -251,7 +255,7 @@ impl World {
             catalog_spawns: 0,
             view: None,
             effect_distance: 0.,
-            census: [0; 3],
+            census: [0; 4],
             resident_bounds: None,
             alpha: Vec::new(),
             reported: Vec::new(),
@@ -592,11 +596,21 @@ impl World {
     pub fn set_view_center(&mut self, x: f32, z: f32, radius: f32) {
         self.view = Some((x, z, radius.max(0.)));
     }
-    /// Producers the last activation pass left out, by reason: beyond the
-    /// activation radius, outside the resident terrain window, outside their
-    /// day/night window. The three overlap, so they are not a partition.
-    pub fn activation_census(&self) -> [usize; 3] {
+    /// Every registered producer, bucketed by what the last activation pass did
+    /// with it: `[playing, beyond the radius, outside the resident window,
+    /// outside the day/night window]`.
+    ///
+    /// This is a **partition**: the buckets are disjoint and sum to the number of
+    /// producers. It used to be three overlapping counters, which meant the
+    /// status line's numbers could not be added up and a root missing for two
+    /// reasons was counted twice -- the exact question the line exists to answer
+    /// ("where did the rest go?") could not be answered from it.
+    pub fn activation_census(&self) -> [usize; 4] {
         self.census
+    }
+    /// Total producers the census covers.
+    pub fn effect_producer_count(&self) -> usize {
+        self.producers.len()
     }
     /// Radius of the client's effect distance fade, in world units.
     ///
@@ -676,7 +690,7 @@ impl World {
             return;
         }
         let (x, z, radius) = self.view.unwrap_or((0., 0., -1.));
-        let mut census = [0usize; 3];
+        let mut census = [0usize; 4];
         let updates: Vec<(u64, bool)> = self
             .producers
             .iter()
@@ -689,14 +703,15 @@ impl World {
                     Some(mode) => crate::scene::effect_visible(mode, night),
                     None => true,
                 };
+                // First refusal wins, so a root is counted once.
                 if !near {
-                    census[0] += 1;
-                }
-                if !resident {
                     census[1] += 1;
-                }
-                if !visible {
+                } else if !resident {
                     census[2] += 1;
+                } else if !visible {
+                    census[3] += 1;
+                } else {
+                    census[0] += 1;
                 }
                 (producer.identity, near && resident && visible)
             })

@@ -1881,3 +1881,51 @@ joining the two shipped files for the same map — the Chinese `precinct.clt` fr
 the Chinese file, 378 found in the English file, all 378 agreeing on one English
 name, 243 distinct, no conflicts. Four zones the English file does not carry are
 left as authored rather than guessed, and the teleport list uses the same table.
+
+## B-30: a duplicated `case` label hid a whole test suite (fixed)
+
+`tools/offline_harness.sh` dispatches on `${1:-test}` through one `case`. Two
+arms were labelled `music`:
+
+- the first, a `precinct.clt` **probe** binary that prints zones/tracks/ambience
+  per file;
+- the second, the **test suite** for `src/music.rs`.
+
+A shell `case` takes its first match. So `offline_harness.sh music` ran the
+probe, the suite behind it never ran, and nothing said so: `case` does not warn
+about a duplicate label, and both arms are syntactically valid. The suite it hid
+is the only place that exercises the version-7 precinct reader and the zone
+fallback points, and it is not small — **27 tests** that had never executed.
+
+This is the same shape as the earlier finding that `test` never compiled
+`gfx_player`: a gate that reports success because it never ran the thing. The
+difference is that a missing module is visible in the file, while a shadowed
+`case` arm is not visible anywhere.
+
+**Fix.** The probe is now `music-probe` (and the usage line lists both), and
+`check` runs `tools/check-harness-arms.py`, which parses the mode labels and
+fails on a duplicate with both line numbers. 19 labels, all reachable. The guard
+is tested against a two-arm duplicate and does fail on it.
+
+**Same class, second instance, also fixed.** One comment in the generated
+`lib.rs` heredoc contained a bare backtick pair (`` `terrain_block` ``), so the
+shell ran ``terrain_block`` as a command substitution while writing the file:
+`bins` printed `line 594: terrain_block: command not found`, and the comment
+line in the generated Rust was left with an empty gap. Everything after the
+backtick silently vanished. Heredocs that write Rust escape every backtick as
+`` \` ``; this one line had been added without it.
+
+**Corpus tests that skip are now counted.** A corpus test that prints `SKIPPED:`
+and returns `Ok` is a *pass* to libtest, so `286 passed` read the same whether
+or not the tests that open shipped data actually opened it. Three cases are now
+counted and printed under the summary: a missing archive, and — new — a *member*
+a staged archive does not carry. Builds differ: the staged 1.3.1 `gfx.pck` has
+no `gfx/场景/新种族地图/` tree at all, so four tests panicked with "is not in
+gfx.pck" on a pack that simply does not contain those records. That is a property
+of the staged file, not a reader regression, so `pck::corpus_member_absent` makes
+it a counted skip (`PWE_CORPUS=require` still makes it a hard failure). The
+`test` and `player` modes now end with the skip count and a line saying those
+tests prove nothing about the shipped data.
+
+Measured after the fix: `check` clean, `test` 203, `player` 286, `music` 27,
+`gfx` 94, `water` 20, `material` 25, `bins` 38/38.

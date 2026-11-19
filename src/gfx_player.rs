@@ -10449,6 +10449,81 @@ mod tests {
     /// are. The old branch built a ribbon along the root's `Vec:` pair instead
     /// and produced nothing at all when the file had no pair.
     #[test]
+    /// Element 170 is a sound emitter, not geometry.
+    ///
+    /// It is parsed and timed, and it is counted in `Stats::sounds` so the
+    /// status line stays honest about what the root contains. The effect
+    /// player does not play it: world audio is `world_audio.rs`, which reads
+    /// the EC-BLD sound records. A 170 element that invented a quad would put a
+    /// card where the map authored a noise.
+    #[test]
+    fn an_element_170_is_counted_as_a_sound_and_not_drawn() {
+        let sound = "GFXELEMENTID: 170\r\nName: roar\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+                     RepeatCount: 0\r\nRepeatDelay: 0\r\nTexFile: \r\nBindEle: \r\n\
+                     ZEnable: 0\r\nMatchGrnd: 0\r\nTexRow: 1\r\nTexCol: 1\r\n\
+                     TexInterval: 50\r\nPriority: 0\r\nIsDummy: 0\r\nDummyEle: \r\n\
+                     Warp: 0\r\nTileMode: 0\r\nTexSpeed: 0\r\nTexSpeed: 0\r\n\
+                     UReverse: 0\r\nVReverse: 0\r\nUVExchg: 0\r\nRenderLayer: 0\r\n\
+                     PathNum: 1\r\nPath: SFX\\monster\\roar.wav\r\nSoundVer: 1\r\n\
+                     Force2D: 0\r\nIsLoop: 0\r\nStartTime: 0\r\nKEYPOINTCOUNT: 1\r\n\
+                     InterpolateMode: 0\r\nTimeSpan: -1\r\nPosition: 0, 0, 0\r\n\
+                     Color: -1\r\nScale: 1.000000\r\nDirection: 0, 0, 0, 1\r\n\
+                     Rad_2D: 0\r\nCtrlMethodCount: 0\r\n";
+        let mut player = build(&(header79(1) + sound));
+        step(&mut player, 16.);
+        let stats = player.stats();
+        assert_eq!(stats.sounds, 1, "the sound is counted");
+        assert!(player.quads().is_empty(), "a sound draws no geometry");
+        assert_eq!(stats.unrendered, 0, "and it is not an unknown type");
+    }
+
+    /// The three stateless types a world effect most often carries are counted
+    /// apart, in the order the status line prints them: models (160), sounds
+    /// (170), curves (190). Each id reaches its own arm, so a root holding one
+    /// of each reports one of each and no quad from the two that are not
+    /// geometry.
+    #[test]
+    fn element_160_170_and_190_are_counted_by_their_own_type() {
+        let model = "GFXELEMENTID: 160\r\nName: crystal\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+                     RepeatCount: 1\r\nRepeatDelay: 0\r\nTexFile: \r\nBindEle: \r\n\
+                     ZEnable: 0\r\nMatchGrnd: 0\r\nTexRow: 1\r\nTexCol: 1\r\n\
+                     TexInterval: 50\r\nPriority: 0\r\nIsDummy: 0\r\nDummyEle: \r\n\
+                     Warp: 0\r\nTileMode: 0\r\nTexSpeed: 0\r\nTexSpeed: 0\r\n\
+                     UReverse: 0\r\nVReverse: 0\r\nUVExchg: 0\r\nRenderLayer: 0\r\n\
+                     ModelPath: 测试\\三角形.SMD\r\nModelActName: \r\nLoops: 1\r\n\
+                     AlphaCmp: 0\r\nWriteZ: 1\r\nUse3DCam: 0\r\nStartTime: 0\r\n\
+                     KEYPOINTCOUNT: 1\r\nInterpolateMode: 0\r\nTimeSpan: -1\r\n\
+                     Position: 0, 0, 0\r\nColor: -1\r\nScale: 1.000000\r\n\
+                     Direction: 0, 0, 0, 1\r\nRad_2D: 0\r\nCtrlMethodCount: 0\r\n";
+        let sound = "GFXELEMENTID: 170\r\nName: roar\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+                     RepeatCount: 0\r\nRepeatDelay: 0\r\nTexFile: \r\nBindEle: \r\n\
+                     ZEnable: 0\r\nMatchGrnd: 0\r\nTexRow: 1\r\nTexCol: 1\r\n\
+                     TexInterval: 50\r\nPriority: 0\r\nIsDummy: 0\r\nDummyEle: \r\n\
+                     Warp: 0\r\nTileMode: 0\r\nTexSpeed: 0\r\nTexSpeed: 0\r\n\
+                     UReverse: 0\r\nVReverse: 0\r\nUVExchg: 0\r\nRenderLayer: 0\r\n\
+                     PathNum: 1\r\nPath: SFX\\monster\\roar.wav\r\nSoundVer: 1\r\n\
+                     Force2D: 0\r\nIsLoop: 0\r\nStartTime: 0\r\nKEYPOINTCOUNT: 1\r\n\
+                     InterpolateMode: 0\r\nTimeSpan: -1\r\nPosition: 0, 0, 0\r\n\
+                     Color: -1\r\nScale: 1.000000\r\nDirection: 0, 0, 0, 1\r\n\
+                     Rad_2D: 0\r\nCtrlMethodCount: 0\r\n";
+        let bowl = "GFXELEMENTID: 190\r\nName: bowl\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+                    TexFile: 物体\\water.dds\r\nTexRow: 1\r\nTexCol: 1\r\n\
+                    TexInterval: 50\r\nPriority: 2\r\nCoeff: 1\r\nheight: 0.3\r\n\
+                    StartTime: 0\r\nKEYPOINTCOUNT: 1\r\nInterpolateMode: 0\r\n\
+                    TimeSpan: -1\r\nPosition: 0, 0, 0\r\nColor: -1\r\nScale: 2\r\n\
+                    Direction: 0, 0, 0, 1\r\nRad_2D: 0\r\nCtrlMethodCount: 0\r\n";
+        let source = header79(3) + &format!("{model}{sound}{bowl}");
+        let mut player = build(&source);
+        step(&mut player, 16.);
+        let stats = player.stats();
+        assert_eq!(stats.models, 1, "160 is a model");
+        assert_eq!(stats.sounds, 1, "170 is a sound");
+        assert_eq!(stats.unrendered, 0, "neither is an unknown type");
+        // 190 is the only one of the three that is geometry, and it is the only
+        // one contributing quads.
+        assert_eq!(player.quads().len(), 3 * 24);
+    }
+
     fn an_element_190_is_a_paraboloid_bowl_of_the_authored_height() {
         let bowl = "GFXELEMENTID: 190\r\nName: bowl\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
                     TexFile: 物体\\water.dds\r\nTexRow: 1\r\nTexCol: 1\r\n\
@@ -13845,7 +13920,10 @@ mod tests {
                 .iter()
                 .position(|entry| entry.name.eq_ignore_ascii_case(name))
         };
-        let index = find("gfx/场景/新种族地图/盆景水晶.gfx").expect("the root is in the pack");
+        let Some(index) = find("gfx/场景/新种族地图/盆景水晶.gfx") else {
+            crate::pck::corpus_member_absent("gfx/场景/新种族地图/盆景水晶.gfx");
+            return;
+        };
         let raw = crate::pck::read_entry(&mut file, &entries[index]).expect("read the root");
         let (text, bad) = crate::gfx_file::decode(&raw);
         assert!(!bad, "the root is not valid GBK text");
@@ -13976,14 +14054,18 @@ mod tests {
         entries: &[crate::pck::Entry],
         name: &str,
     ) -> gfx_file::Root {
-        let index = entries
-            .iter()
-            .position(|entry| entry.name.eq_ignore_ascii_case(name))
-            .unwrap_or_else(|| panic!("{name} is not in gfx.pck"));
-        let raw = crate::pck::read_entry(file, &entries[index]).expect("read the root");
-        let (text, bad) = gfx_file::decode(&raw);
-        assert!(!bad, "{name} is not valid GBK text");
-        gfx_file::parse(&text).unwrap_or_else(|error| panic!("{name}: {error}"))
+        match shipped_root_opt(file, entries, name) {
+            Some(root) => root,
+            None => {
+                // A counted skip, not a panic: the staged pack is whatever build
+                // was downloaded and an older one simply has no such record.
+                // `corpus_member_absent` panics by itself under
+                // `PWE_CORPUS=require`, so the suite cannot pass on the strength
+                // of builds it never read.
+                crate::pck::corpus_member_absent(name);
+                panic!("unreachable: corpus_member_absent returns only when the corpus is optional")
+            }
+        }
     }
 
     /// `shipped_root` for a root some pack builds do not carry. The Drive
@@ -14138,10 +14220,13 @@ mod tests {
             return;
         };
         let name = "gfx/textures/纹理/气连续03.tga";
-        let index = entries
+        let Some(index) = entries
             .iter()
             .position(|entry| entry.name.eq_ignore_ascii_case(name))
-            .unwrap_or_else(|| panic!("{name} is not in gfx.pck"));
+        else {
+            crate::pck::corpus_member_absent(name);
+            return;
+        };
         let tga = crate::pck::read_entry(&mut file, &entries[index]).expect("read the sheet");
         assert_eq!(tga[2], 2, "uncompressed true-colour TGA");
         assert_eq!(tga[16], 32, "32 bits per pixel");
@@ -14175,7 +14260,10 @@ mod tests {
             return;
         };
         let name = "gfx/场景/新种族地图/水门_瀑布.gfx";
-        let root = shipped_root(&mut file, &entries, name);
+        let Some(root) = shipped_root_opt(&mut file, &entries, name) else {
+            crate::pck::corpus_member_absent(name);
+            return;
+        };
         let ids: Vec<u32> = root.elements.iter().map(|element| element.id).collect();
         assert_eq!(
             ids,
@@ -14263,7 +14351,10 @@ mod tests {
             return;
         };
         let name = "gfx/场景/新种族地图/瀑布大.gfx";
-        let root = shipped_root(&mut file, &entries, name);
+        let Some(root) = shipped_root_opt(&mut file, &entries, name) else {
+            crate::pck::corpus_member_absent(name);
+            return;
+        };
         let ids: Vec<u32> = root.elements.iter().map(|element| element.id).collect();
         assert_eq!(
             ids,

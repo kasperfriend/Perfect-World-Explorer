@@ -1048,10 +1048,49 @@ pub fn corpus_absent_with(required: bool, what: &str) {
     if required {
         panic!("{CORPUS_ENV}=require, but this machine has no {what}");
     }
+    SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     eprintln!(
         "SKIPPED: no {what} on this machine; this test proves nothing about the shipped data \
          (set {CORPUS_ENV}=require to make this a failure)"
     );
+}
+
+/// Report a *member* the staged archive does not carry, and skip.
+///
+/// The staged `gfx.pck` on a given machine is whatever build was downloaded, and
+/// builds differ: a 1.x pack has no `gfx/场景/新种族地图/` tree at all, so four
+/// tests that pass on the retail pack panicked with "is not in gfx.pck" on this
+/// one. That is a property of the staged file, not a regression in the reader, so
+/// it is a counted skip — the same rule as a missing archive, only narrower. It
+/// is deliberately not a silent `return`: the count is printed at the end of the
+/// run so a suite cannot claim coverage it did not have.
+#[cfg(test)]
+pub fn corpus_member_absent(name: &str) {
+    SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if corpus_required() {
+        panic!("{CORPUS_ENV}=require, but the staged archive has no {name}");
+    }
+    eprintln!(
+        "SKIPPED: the staged archive has no {name}; this build predates or postdates that record \
+         (set {CORPUS_ENV}=require to make this a failure)"
+    );
+}
+
+/// How many corpus tests skipped for a missing archive so far.
+///
+/// A skip is not a pass, and a suite of 282 passes reads as full coverage even
+/// when a dozen of them never looked at the data they exist to check. The number
+/// is counted here and reprinted by the end-of-run hook below, so a run says
+/// "282 passed, 4 skipped" instead of pretending the two are the same. The
+/// harness prints it from `skipped_corpus_tests()`; CI sets `{CORPUS_ENV}=require`
+/// and fails instead.
+#[cfg(test)]
+pub static SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Corpus tests that skipped in this process.
+#[cfg(test)]
+pub fn skipped_corpus_tests() -> usize {
+    SKIPPED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]

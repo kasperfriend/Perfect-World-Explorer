@@ -664,7 +664,7 @@ pub mod angelica_pck;
 // "174 passed" whether or not the parser worked.
 #[path = "$REPO/src/music.rs"]
 pub mod music;
-// The T2BK/TRN2 header decoders. `terrain_block` names the versions it reads
+// The T2BK/TRN2 header decoders. \`terrain_block\` names the versions it reads
 // and the TRN2 reader is where "an instance map has no world transform" is
 // proved, so both belong in the suite that runs without a GPU.
 #[path = "$REPO/src/terrain_block.rs"]
@@ -676,7 +676,20 @@ EXT="--extern glam=$OUT/libglam.rlib --extern encoding_rs=$OUT/libencoding_rs.rl
 
 case "${1:-test}" in
     setup) toolchain; sysroot; deps; echo "harness ready in $OUT" ;;
+    arms)  # Every mode label this script dispatches, one per line.
+        # A shell `case` takes its first match, so a duplicated label silently
+        # makes the later arm dead code. That happened: two arms were labelled
+        # `music`, and for as long as it lasted `music` ran a probe binary and
+        # the 27-test precinct suite behind it never ran at all. `tools/check-harness-arms.py`
+        # reads this list and fails on a duplicate.
+        sed -n 's/^    \([a-z][a-z_|-]*\)) .*/\1/p' "$0" | tr '|' '\n' ;;
     check) toolchain; sysroot; deps; real_deps
+        # A duplicated `case` label is silent: the shell takes the first match and
+        # every arm after it is dead code. Two arms were once both labelled
+        # `music`, so that mode ran a probe and the 27-test precinct suite behind
+        # it never ran -- a whole suite reported as passing because nothing
+        # executed it. This gate is what would have caught it.
+        python3 "$REPO/tools/check-harness-arms.py" "$0"
         # Type-check the modules that only need the dependencies this offline
         # toolchain has. `gfx_player`, `gfx_owner`, `view_settings` and
         # `diagnostics` are left out because they reach for `egui` and the fps
@@ -730,11 +743,25 @@ case "${1:-test}" in
         # `angelica_pck` is in the closure and it really decompresses, so the
         # real `flate2` is required here; without it the whole suite failed to
         # build on a missing crate rather than on its own code.
+        #
+        # The run is captured so the corpus skip count can be reported under the
+        # summary. A corpus test that skips for a missing archive prints
+        # `SKIPPED:` and returns Ok, so libtest counts it as a pass; "282 passed"
+        # then reads the same whether or not the tests that check shipped data
+        # actually ran. Only the exit status is propagated.
         "$RUSTC" --test --crate-name harness --edition 2021 --sysroot "$SYSROOT" \
             $EXT -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
             -C opt-level=1 "$OUT/lib.rs" -o "$OUT/gfxtest"
         shift || true
-        (cd "$REPO" && exec "$OUT/gfxtest" "$@") ;;
+        ( cd "$REPO" && "$OUT/gfxtest" "$@" ) > "$OUT/test.log" 2>&1
+        status=$?
+        grep -v '^SKIPPED:' "$OUT/test.log" || true
+        skipped=$(grep -c '^SKIPPED:' "$OUT/test.log" || true)
+        if [ "$skipped" -gt 0 ]; then
+            printf '\n%d corpus test(s) SKIPPED for a missing archive; those prove nothing about the shipped data.\n' "$skipped"
+            printf 'Stage the archive (see tools/pck_lib.py) or set PWE_CORPUS=require to make a skip a failure.\n'
+        fi
+        exit "$status" ;;
     client) toolchain; sysroot; deps
         shift || true
         "$RUSTC" --test --crate-name cdtest --edition 2021 --sysroot "$SYSROOT" \
@@ -851,12 +878,17 @@ EOF
         shift || true
         [ $# -gt 0 ] || set -- "$REPO/google_drive"
         (cd "$REPO" && exec "$OUT/survey/water-record-survey" "$@") ;;
-    music) toolchain; sysroot; deps; real_deps
-        # Read every `precinct.clt` under the given roots with the real reader.
-        # The map's music, its stereo ambience and its teleport list all come
-        # from this one UTF-16 file, and one unreadable zone used to cost the
-        # whole file. Prints per file: zones, playlist tracks, zones with an
+    music-probe) toolchain; sysroot; deps; real_deps
+        # Probe: read every `precinct.clt` under the given roots with the real
+        # reader. The map's music, its stereo ambience and its teleport list all
+        # come from this one UTF-16 file, and one unreadable zone used to cost
+        # the whole file. Prints per file: zones, playlist tracks, zones with an
         # ambience path, and the version word.
+        #
+        # This is `music-probe`, not `music`. Both arms used to be labelled
+        # `music`; a shell `case` takes the first match, so the test arm below
+        # was dead and `music` ran this probe instead of the suite. The suite it
+        # hid is the only thing that exercises the version-7 precinct reader.
         cat > "$OUT/music_probe.rs" <<EOF
 #[path = "$REPO/src/pck.rs"]
 mod pck;
@@ -1007,7 +1039,16 @@ EOF
             --extern flate2="$OUT/libflate2.rlib" \
             "$OUT/player/lib.rs" -o "$OUT/playertest"
         shift || true
-        (cd "$REPO" && exec "$OUT/playertest" "$@") ;;
+        # Same skip reporting as `test`: see the note there.
+        ( cd "$REPO" && "$OUT/playertest" "$@" ) > "$OUT/player.log" 2>&1
+        status=$?
+        grep -v '^SKIPPED:' "$OUT/player.log" || true
+        skipped=$(grep -c '^SKIPPED:' "$OUT/player.log" || true)
+        if [ "$skipped" -gt 0 ]; then
+            printf '\n%d corpus test(s) SKIPPED for a missing archive; those prove nothing about the shipped data.\n' "$skipped"
+            printf 'Stage the archive (see tools/pck_lib.py) or set PWE_CORPUS=require to make a skip a failure.\n'
+        fi
+        exit "$status" ;;
     music) toolchain; sysroot; deps; real_deps
         # `src/music.rs` alone: precinct parsing and the zone fallback points the
         # teleport list uses when a map ships no `world_targets.txt`.
@@ -1017,7 +1058,7 @@ EOF
 pub mod pck;
 #[path = "$REPO/src/music.rs"]
 pub mod music;
-// The T2BK/TRN2 header decoders. `terrain_block` names the versions it reads
+// The T2BK/TRN2 header decoders. \`terrain_block\` names the versions it reads
 // and the TRN2 reader is where "an instance map has no world transform" is
 // proved, so both belong in the suite that runs without a GPU.
 #[path = "$REPO/src/terrain_block.rs"]
@@ -1661,4 +1702,4 @@ EOF
             -o "$OUT/matrix-maps" "$OUT/mm/run.rs"
         shift || true
         (cd "$REPO" && exec "$OUT/matrix-maps" "${1:-$REPO/google_drive/clients}") ;;
-    *) echo "usage: $0 {setup|check|test|fmt|client|water|gfx|music|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|gfx|player|bins|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
