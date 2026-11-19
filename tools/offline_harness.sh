@@ -1458,7 +1458,22 @@ EOF
         # One row per staged client. Everything here is produced by the real
         # readers; nothing is asserted about a version that is not present.
         mkdir -p "$OUT/matrix"
+        # `water.rs` reports through `crate::diag!`, so the stub the player gate
+        # uses has to exist here too; without it this gate stops compiling the
+        # moment `water.rs` gains a diagnostic, which is not a fact about any
+        # client.
+        # The expansion has to be an expression, not an empty statement:
+        # `water.rs` calls `diag!` in an `Err(..) =>` arm, where `{}` is a type
+        # error but `() ` is the unit value the arm needs.
+        cat > "$OUT/matrix/macros.rs" <<'EOF'
+#[macro_export]
+macro_rules! diag { ($($t:tt)*) => { () }; }
+#[macro_export]
+macro_rules! diag_keyed { ($($t:tt)*) => { () }; }
+EOF
         cat > "$OUT/matrix/run.rs" <<EOF
+#[path = "$OUT/matrix/macros.rs"]
+mod macros;
 #[path = "$REPO/src/client_detect.rs"]
 pub mod client_detect;
 #[path = "$REPO/src/pck.rs"]

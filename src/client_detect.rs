@@ -756,59 +756,129 @@ pub(crate) fn version_blob<'a>(bytes: &'a [u8], pe: &goblin::pe::PE) -> Option<&
     None
 }
 
-/// Find one `String` value in a `VS_VERSIONINFO` blob by key.
-pub(crate) fn version_string(blob: &[u8], key: &str) -> Option<String> {
-    fn align4(value: usize) -> usize {
-        (value + 3) & !3
+/// One node of a `VS_VERSIONINFO` tree.
+///
+/// The format is a chain of length-prefixed nodes: a 6-byte header
+/// (`wLength`, `wValueLength`, `wType`), a UTF-16 key, an aligned value, then
+/// children. `wValueLength` means bytes at the root (it is `VS_FIXEDFILEINFO`)
+/// and UTF-16 units at a `String`, which is the one unit mismatch in the
+/// format; `StringTable`'s is a child count in some writers, so every walk
+/// steps by each node's own `wLength` instead of trusting that field.
+struct VersionNode {
+    length: usize,
+    value_length: usize,
+    kind: u16,
+    key: String,
+    value_at: usize,
+    end: usize,
+}
+
+fn align4(value: usize) -> usize {
+    (value + 3) & !3
+}
+
+fn version_u16_at(blob: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        blob.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+/// A UTF-16LE key or value up to its terminator, never past `end`. The
+/// returned offset is one past the terminator.
+fn version_utf16_at(blob: &[u8], start: usize, end: usize) -> Option<(String, usize)> {
+    let mut units = Vec::new();
+    let mut pos = start;
+    while pos + 2 <= end {
+        let unit = version_u16_at(blob, pos)?;
+        pos += 2;
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
     }
-    fn u16_at(blob: &[u8], offset: usize) -> Option<u16> {
-        Some(u16::from_le_bytes(
-            blob.get(offset..offset + 2)?.try_into().ok()?,
-        ))
+    String::from_utf16(&units).ok().map(|text| (text, pos))
+}
+
+fn version_node_at(blob: &[u8], pos: usize, end: usize) -> Option<VersionNode> {
+    if pos + 6 > end {
+        return None;
     }
-    /// A UTF-16LE key or value up to its terminator, never past `end`. The
-    /// returned offset is one past the terminator.
-    fn utf16(blob: &[u8], start: usize, end: usize) -> Option<(String, usize)> {
-        let mut units = Vec::new();
-        let mut pos = start;
-        while pos + 2 <= end {
-            let unit = u16_at(blob, pos)?;
-            pos += 2;
-            if unit == 0 {
-                break;
+    let length = version_u16_at(blob, pos)? as usize;
+    let value_length = version_u16_at(blob, pos + 2)? as usize;
+    let kind = version_u16_at(blob, pos + 4)?;
+    if length < 6 || pos + length > end {
+        return None;
+    }
+    let (key, after) = version_utf16_at(blob, pos + 6, pos + length)?;
+    Some(VersionNode {
+        length,
+        value_length,
+        kind,
+        key,
+        value_at: align4(after),
+        end: pos + length,
+    })
+}
+
+/// The keys of every `StringTable` in a `VS_VERSIONINFO` blob, in file order.
+fn string_tables(blob: &[u8]) -> Vec<String> {
+    let mut found = Vec::new();
+    let Some(root) = version_node_at(blob, 0, blob.len()) else {
+        return found;
+    };
+    let mut child = if root.value_length > 0 {
+        align4(root.value_at + root.value_length)
+    } else {
+        root.value_at
+    };
+    while child + 6 <= root.end {
+        let Some(next) = version_node_at(blob, child, root.end) else {
+            break;
+        };
+        if next.key.eq_ignore_ascii_case("StringFileInfo") {
+            let mut table = next.value_at;
+            while table + 6 <= next.end {
+                let Some(table_node) = version_node_at(blob, table, next.end) else {
+                    break;
+                };
+                found.push(table_node.key.clone());
+                table += align4(table_node.length);
             }
-            units.push(unit);
         }
-        String::from_utf16(&units).ok().map(|text| (text, pos))
+        child += align4(next.length);
     }
-    struct Node {
-        length: usize,
-        value_length: usize,
-        kind: u16,
-        key: String,
-        value_at: usize,
-        end: usize,
-    }
-    fn node(blob: &[u8], pos: usize, end: usize) -> Option<Node> {
-        if pos + 6 > end {
-            return None;
-        }
-        let length = u16_at(blob, pos)? as usize;
-        let value_length = u16_at(blob, pos + 2)? as usize;
-        let kind = u16_at(blob, pos + 4)?;
-        if length < 6 || pos + length > end {
-            return None;
-        }
-        let (key, after) = utf16(blob, pos + 6, pos + length)?;
-        Some(Node {
-            length,
-            value_length,
-            kind,
-            key,
-            value_at: align4(after),
-            end: pos + length,
-        })
-    }
+    found
+}
+
+/// A `StringTable`'s language, as the four hex digits of its key.
+///
+/// The key is the Win32 `LANGID` followed by the code page (`040904b0` =
+/// English (US), Unicode; `080404b0` = Chinese (Simplified, PRC)). Only the
+/// language half is compared, because the code page says nothing about which
+/// string a reader wants and every table in this project's corpus is `04b0`.
+fn table_language(key: &str) -> Option<u16> {
+    u16::from_str_radix(key.get(..4)?, 16).ok()
+}
+
+/// Whether a `StringTable` key names English.
+///
+/// English is `0x0409` (US) plus the three other English `LANGID`s Win32
+/// defines: `0x0809` (UK), `0x0c09` (Australia) and `0x1009` (Canada).
+fn is_english(key: &str) -> bool {
+    matches!(
+        table_language(key),
+        Some(0x0409 | 0x0809 | 0x0c09 | 0x1009)
+    )
+}
+
+/// Find one `String` value in a `VS_VERSIONINFO` blob by key.
+///
+/// Language order is English first, then every other table in file order.
+/// Reading whichever table happened to come first is what this used to do, and
+/// a build whose resources were authored in more than one language would then
+/// report a product name and version from the wrong locale — the two strings a
+/// patch check compares against a known build.
+pub(crate) fn version_string(blob: &[u8], key: &str) -> Option<String> {
     // Node kinds are distinguished by depth, not by `wType`: a `StringTable` is
     // also `wType` 1, so keying off the type turns it into a `String` and its
     // children are never visited. The format has exactly four levels:
@@ -817,15 +887,20 @@ pub(crate) fn version_string(blob: &[u8], key: &str) -> Option<String> {
     //   1 `StringFileInfo` / `VarFileInfo`
     //   2 `040904b0` and other `StringTable`s
     //   3 `String` entries     value = the text, length in UTF-16 units
-    //
-    // so the level decides how the value is measured and where children start.
-    fn walk(blob: &[u8], pos: usize, end: usize, depth: usize, key: &str) -> Option<String> {
-        let current = node(blob, pos, end)?;
+    fn walk(
+        blob: &[u8],
+        pos: usize,
+        end: usize,
+        depth: usize,
+        key: &str,
+        only_language: Option<&str>,
+    ) -> Option<String> {
+        let current = version_node_at(blob, pos, end)?;
         let child_start = match depth {
             // Containers: children follow the aligned key.
             0..=2 => current.value_at,
             3 if current.kind == 1 => {
-                let (text, _) = utf16(blob, current.value_at, current.end)?;
+                let (text, _) = version_utf16_at(blob, current.value_at, current.end)?;
                 if !current.key.eq_ignore_ascii_case(key) {
                     return None;
                 }
@@ -848,15 +923,43 @@ pub(crate) fn version_string(blob: &[u8], key: &str) -> Option<String> {
         };
         let mut child = child_start;
         while child + 6 <= current.end {
-            let next = node(blob, child, current.end)?;
-            if let Some(value) = walk(blob, child, current.end, depth + 1, key) {
+            let next = version_node_at(blob, child, current.end)?;
+            // At level 1 the children are `StringTable`s, and this is where a
+            // language filter applies: a table whose key names a different
+            // language is skipped whole rather than descended into.
+            if depth == 1 {
+                if let Some(wanted) = only_language {
+                    if !next.key.eq_ignore_ascii_case(wanted) {
+                        child += align4(next.length);
+                        continue;
+                    }
+                }
+            }
+            if let Some(value) = walk(blob, child, current.end, depth + 1, key, only_language) {
                 return Some(value);
             }
             child += align4(next.length);
         }
         None
     }
-    walk(blob, 0, blob.len(), 0, key)
+    let tables = string_tables(blob);
+    for language in tables.iter().filter(|key| is_english(key)) {
+        if let Some(value) = walk(blob, 0, blob.len(), 0, key, Some(language)) {
+            return Some(value);
+        }
+    }
+    if tables.is_empty() {
+        // No `StringTable` was enumerable (a writer that flattened the tree).
+        // Fall back to the unfiltered walk rather than reporting no version at
+        // all from a blob the old reader could still read.
+        return walk(blob, 0, blob.len(), 0, key, None);
+    }
+    for language in &tables {
+        if let Some(value) = walk(blob, 0, blob.len(), 0, key, Some(language)) {
+            return Some(value);
+        }
+    }
+    None
 }
 
 /// `elements.data` header. Reads only the first bytes.
@@ -1894,11 +1997,14 @@ mod tests {
     /// pair per `(key, value)`. Built the way Windows builds it, including the
     /// `StringTable` value length being counted in UTF-16 units.
     fn synthetic_version_blob(entries: &[(&str, &str)]) -> Vec<u8> {
+        synthetic_version_blob_with(entries, "040904b0")
+    }
+
+    /// The same builder, but with any `StringTable` key, so a test can author a
+    /// localised table or several tables in one `StringFileInfo`.
+    fn synthetic_version_blob_with(entries: &[(&str, &str)], table_key: &str) -> Vec<u8> {
         fn utf16(text: &str) -> Vec<u8> {
-            text.encode_utf16()
-                .chain(Some(0))
-                .flat_map(u16::to_le_bytes)
-                .collect()
+            version_utf16(text)
         }
         fn node(
             key: &str,
@@ -1933,10 +2039,44 @@ mod tests {
         for (key, value) in entries {
             strings.extend_from_slice(&node(key, &utf16(value), value.len() + 1, 1, &[]));
         }
-        let table = node("040904b0", &[], 0, 1, &strings);
+        let table = node(table_key, &[], 0, 1, &strings);
         let file_info = node("StringFileInfo", &[], 0, 1, &table);
         // Root value: VS_FIXEDFILEINFO (52 bytes), length in bytes.
         node("VS_VERSION_INFO", &[0u8; 52], 52, 0, &file_info)
+    }
+
+    /// Module-level copies of the builder's two primitives, for a test that has
+    /// to assemble several `StringTable`s itself.
+    fn version_utf16(text: &str) -> Vec<u8> {
+        text.encode_utf16()
+            .chain(Some(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+
+    fn version_node(
+        key: &str,
+        value: &[u8],
+        value_length: usize,
+        kind: u16,
+        children: &[u8],
+    ) -> Vec<u8> {
+        let mut body = version_utf16(key);
+        while (6 + body.len()) % 4 != 0 {
+            body.push(0);
+        }
+        body.extend_from_slice(value);
+        body.extend_from_slice(children);
+        let length = 6 + body.len();
+        let mut out = Vec::with_capacity(length + 3);
+        out.extend_from_slice(&(length as u16).to_le_bytes());
+        out.extend_from_slice(&(value_length as u16).to_le_bytes());
+        out.extend_from_slice(&kind.to_le_bytes());
+        out.extend_from_slice(&body);
+        while out.len() % 4 != 0 {
+            out.push(0);
+        }
+        out
     }
 
     #[test]
@@ -1959,6 +2099,60 @@ mod tests {
             Some("Perfect World")
         );
         assert_eq!(version_string(&blob, "Comments"), None);
+    }
+
+    /// A resource authored in two languages: the first `StringTable` is the
+    /// localised one and the English table follows it. Reading whichever table
+    /// came first would report the localised product name and version, and a
+    /// patch check compares exactly those two strings against a known build.
+    #[test]
+    fn the_english_string_table_wins_over_one_that_precedes_it() {
+        fn table(language: &str, version: &str) -> Vec<u8> {
+            let mut strings = Vec::new();
+            for key in ["FileVersion", "ProductVersion"] {
+                strings.extend_from_slice(&version_node(
+                    key,
+                    &version_utf16(version),
+                    version.len() + 1,
+                    1,
+                    &[],
+                ));
+            }
+            version_node(language, &[], 0, 1, &strings)
+        }
+        let localized = table("080404b0", "1.4.2.9999");
+        let english = table("040904b0", "1.4.2.2305");
+        let mut both = localized.clone();
+        both.extend_from_slice(&english);
+        let blob = version_node(
+            "VS_VERSION_INFO",
+            &[0u8; 52],
+            52,
+            0,
+            &version_node("StringFileInfo", &[], 0, 1, &both),
+        );
+        assert_eq!(
+            version_string(&blob, "FileVersion").as_deref(),
+            Some("1.4.2.2305"),
+            "the English table must win even though it comes second"
+        );
+        assert_eq!(
+            version_string(&blob, "ProductVersion").as_deref(),
+            Some("1.4.2.2305")
+        );
+        // With the English table removed the localised one is still readable:
+        // a build with no English resource must not lose its version.
+        let only_localized = version_node(
+            "VS_VERSION_INFO",
+            &[0u8; 52],
+            52,
+            0,
+            &version_node("StringFileInfo", &[], 0, 1, &localized),
+        );
+        assert_eq!(
+            version_string(&only_localized, "FileVersion").as_deref(),
+            Some("1.4.2.9999")
+        );
     }
 
     /// A minimal but structurally real PE32 image: one `.rsrc` section holding

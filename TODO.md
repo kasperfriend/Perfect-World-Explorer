@@ -22,27 +22,49 @@ soft "not established".
       and the row now says exactly that instead of "the two have not been
       separated".
 
-- [ ] **R2. Decode the precinct ambience-priority field (header index 3).**
+- [x] **R2. Decode the precinct ambience-priority field (header index 3).**
       Five values across the 1.8.4 file (0×53, 1×38, 2×22, 3×104, 4×167),
       correlated with having a stereo ambience path.
-      *Done when:* the client's precinct reader is found and the field's use is
-      either decoded and implemented, or the search is recorded with what was
-      ruled out.
+      *Done:* the reader **was** found — `0x654320` is `CELPrecinct::Load`, it
+      parses zones with repeated `seek/read` pairs and stores numbers at `+0x40`,
+      `+0x54`, `+0x58`, `+0x68`; the selector `0x654cb0` filters on `+0x54`
+      equalling a caller-supplied player state and tie-breaks on `+0x58`. What
+      is **not** done is the last step: mapping a file index onto those slots.
+      The parse loop is stdcall with a self-balancing stack, so static offsets
+      cannot be assigned to indices without modelling each callee's arity, and
+      the data is ambiguous (index 8 is 1 for all 383 zones, so a group
+      tie-break on it would never fire). Implementing either reading would have
+      been a guess, so the register row now names the function, the addresses
+      and the missing step instead. No code changed.
 
-- [ ] **R3. Search `VS_VERSIONINFO` StringTables by language, not first-wins.**
+- [x] **R3. Search `VS_VERSIONINFO` StringTables by language, not first-wins.**
       Concrete, testable, no assets needed beyond `sdk/*.dll` and the staged
       executables.
-      *Done when:* the reader prefers a known language (English, then any) and a
-      test covers a multi-table resource.
+      *Done:* `version_string` prefers English (`0409`, `0809`, `0c09`, `1009`)
+      ahead of any other table, then falls back to the rest in file order; a
+      flattened blob with no enumerable `StringTable` still uses the unfiltered
+      walk. `the_english_string_table_wins_over_one_that_precedes_it` authors a
+      Chinese table ahead of an English one. `client` gate: 49 passed (was 48).
 
-- [ ] **R4. Make the soft/duplicated rows tell the truth.**
+- [x] **R4. Make the soft/duplicated rows tell the truth.**
       `World/asset gates outside 1.4.2` still says "GFX roots ≤79", which the
       version-ceiling work made false. `Audio codec coverage` and
       `Movement sound table` are written as gaps but are answered. `Instance
       aliases for b07-b29` explains itself but reads like an open defect.
-      *Done when:* each row states its current status and the register has no
-      claim the code contradicts.
+      *Done:* four rows rewritten. `World/asset gates outside 1.4.2` no longer
+      claims a GFX ceiling of 79 — it names `gfx_file::MAX_VERSION = 103` and
+      says an over-ceiling root is read and reported, not refused.
+      `Audio codec coverage` and `Movement sound table` now open by saying they
+      are answered. `Instance aliases for b07-b29` is stated as an absent input
+      rather than an open defect, and the regenerating tool is named.
 
-- [ ] **R5. Full gate sweep, push, refresh the PR body.**
+- [x] **R5. Full gate sweep, push, refresh the PR body.**
+      All fifteen gates green: `check`, `test` 211, `diagnostics` 18, `music` 27,
+      `player` 286, `gfx` 94, `water` 20, `material` 27, `bins` 38/38, `scene`
+      3 ok/0 failed, `pck` 3 ok/0 failed, `content` 2828 read/1 failed (the known
+      4-byte `MOXT` stub, `翼击击中.gfx`), `matrix` ok, `matrix-maps` ok,
+      `instance` 2 maps/0 failed. One gate was itself broken and is fixed here:
+      `matrix` had stopped compiling because `src/water.rs` reports through
+      `crate::diag!` and that gate had no stub for it.
 
 ## Notes taken while working
