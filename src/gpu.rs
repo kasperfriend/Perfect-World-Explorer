@@ -8606,6 +8606,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         primary: renderer.lighter.travel_primary(),
                                         acceleration: renderer.lighter.travel_rt_counts(),
                                         game_profile_active: renderer.lighter.game_profile_active(),
+                                        provider: renderer.lighter.reconstruction_status().unwrap_or("portable"),
                                         textures: renderer.lighter.travel_textures(),
                                         pacing: if committed { renderer.lighter.travel_pacing() } else { None },
                                     });

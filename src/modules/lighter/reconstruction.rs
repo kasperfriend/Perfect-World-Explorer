@@ -206,10 +206,41 @@ impl Request {
     }
 }
 
+#[derive(Default)]
+struct Fallback(Option<PathBuf>);
+
+impl Fallback {
+    fn new(skip: Bisect) -> Self {
+        let requested = skip == Bisect::None
+            && std::env::var("PW_RAY_RECONSTRUCTION").as_deref() == Ok("rr")
+            && std::env::var("PW_RAY_RECONSTRUCTION_FALLBACK").as_deref() == Ok("rr-fsr-portable");
+        if !requested {
+            return Self::default();
+        }
+        let path = std::env::var_os("PW_RAY_FSR_VK_DLL").map(PathBuf::from);
+        if path.is_none() {
+            eprintln!("Lighter fallback FSR unavailable: set PW_RAY_FSR_VK_DLL");
+        }
+        Self(path)
+    }
+
+    fn try_fsr(&mut self, reason: &str) -> Option<Request> {
+        let path = self.0.take()?;
+        eprintln!("Lighter reconstruction fallback: RR rejected ({reason}); trying FSR");
+        match ffx::Api::load(&path) {
+            Ok(api) => Some(Request::Fsr(Arc::new(api))),
+            Err(error) => {
+                eprintln!("Lighter reconstruction fallback: FSR unavailable; portable: {error}");
+                None
+            }
+        }
+    }
+}
+
 /// Owned by startup, not global; a failed optional path leaves ordinary wgpu
 /// device selection and reload/recovery available.
 #[derive(Default)]
-pub(crate) struct Startup(Option<Request>, Bisect);
+pub(crate) struct Startup(Option<Request>, Bisect, Fallback);
 
 impl Startup {
     pub(crate) fn new(mode: Mode) -> Self {
@@ -222,13 +253,32 @@ impl Startup {
             }
             return Self::default();
         }
-        match Bisect::from_env().and_then(|skip| Ok(Self(Request::load(skip)?, skip))) {
-            Ok(startup) => startup,
+        let skip = match Bisect::from_env() {
+            Ok(skip) => skip,
             Err(error) => {
                 eprintln!("Lighter reconstruction unavailable; using portable resolve: {error}");
-                Self::default()
+                return Self::default();
+            }
+        };
+        let mut fallback = Fallback::new(skip);
+        let request = match Request::load(skip) {
+            Ok(request) => request,
+            Err(error) => fallback.try_fsr(&error).or_else(|| {
+                eprintln!("Lighter reconstruction unavailable; using portable resolve: {error}");
+                None
+            }),
+        };
+        Self(request, skip, fallback)
+    }
+
+    fn optional_import_failed(&mut self, reason: &str) {
+        if self.0.as_ref().is_some_and(Request::is_rr) {
+            if let Some(next) = self.2.try_fsr(reason) {
+                self.0 = Some(next);
+                return;
             }
         }
+        self.disable(reason);
     }
 
     pub(crate) fn instance(&mut self, backends: wgpu::Backends) -> wgpu::Instance {
@@ -254,7 +304,7 @@ impl Startup {
                     .and_then(|extensions| bootstrap::instance(&extensions, desc.flags));
                 match optional {
                     Ok(instance) => return instance,
-                    Err(error) => self.disable(&error),
+                    Err(error) => self.optional_import_failed(&error),
                 }
             }
         }
@@ -265,6 +315,7 @@ impl Startup {
     }
 
     pub(crate) fn disable(&mut self, reason: &str) {
+        self.2 = Fallback::default();
         if let Some(req) = self.0.take() {
             eprintln!(
                 "Lighter: {} unavailable; using portable resolve: {reason}",
@@ -285,7 +336,14 @@ impl Startup {
         match bootstrap::device(adapter, desc, request) {
             Ok(device) => Some(device),
             Err(error) => {
-                self.disable(&error);
+                // FSR uses the base Vulkan extensions; the normal wgpu
+                // device returned by the caller is sufficient after an RR
+                // raw import failure. Never retry a lost Vulkan device.
+                if crate::gpu::reconstruction_device_lost(&error) {
+                    self.disable(&error);
+                } else {
+                    self.optional_import_failed(&error);
+                }
                 None
             }
         }
@@ -294,7 +352,7 @@ impl Startup {
     pub(crate) fn install(self, lighter: &mut super::Lighter, device: &wgpu::Device) {
         if let Some(req) = self.0 {
             match Raw::new(device) {
-                Ok(raw) => lighter.reconstruction = Some(Session::new(req, raw, self.1)),
+                Ok(raw) => lighter.reconstruction = Some(Session::new(req, raw, self.1, self.2)),
                 Err(error) => eprintln!(
                     "Lighter: {} unavailable; using portable resolve: {error}",
                     req.label()
@@ -848,10 +906,11 @@ pub(super) struct Session {
     rejected: Option<[u32; 4]>,
     active: bool,
     skip: Bisect,
+    fallback: Fallback,
 }
 
 impl Session {
-    fn new(request: Request, raw: Raw, skip: Bisect) -> Self {
+    fn new(request: Request, raw: Raw, skip: Bisect, fallback: Fallback) -> Self {
         Self {
             epoch: None,
             request,
@@ -860,6 +919,7 @@ impl Session {
             rejected: None,
             active: false,
             skip,
+            fallback,
         }
     }
     pub(super) fn poll(&mut self) -> R<bool> {
@@ -936,10 +996,12 @@ impl Session {
             || h > device.limits().max_texture_dimension_2d
             || (self.request.is_fsr() && (rw.saturating_mul(3) < w || rh.saturating_mul(3) < h))
         {
-            self.reject(
+            if self.reject(
                 extent,
                 "unsupported render/display size or ray input budget",
-            );
+            ) {
+                return self.prepare(device, extent, settings);
+            }
             return Ok(true);
         }
         match Epoch::new(device, &self.raw, &self.request, extent, self.skip) {
@@ -948,20 +1010,34 @@ impl Session {
                 self.rejected = None;
             }
             Err(error) if crate::gpu::reconstruction_device_lost(&error) => return Err(error),
-            Err(error) => self.reject(extent, &error),
+            Err(error) => {
+                if self.reject(extent, &error) {
+                    // No frame recorded yet: safe to prepare the new inputs
+                    // here. Never recurse past the one-shot fallback slot.
+                    return self.prepare(device, extent, settings);
+                }
+            }
         }
         Ok(true)
     }
-    fn reject(&mut self, extent: [u32; 4], error: &str) {
+    fn reject(&mut self, extent: [u32; 4], error: &str) -> bool {
         // Called only after observing the preceding native fence (or before
         // any new native submit). wgpu tracks its own resource references.
         self.epoch = None;
         self.rejected = Some(extent);
         self.reset();
+        if self.request.is_rr() {
+            if let Some(next) = self.fallback.try_fsr(error) {
+                self.request = next;
+                self.rejected = None;
+                return true;
+            }
+        }
         eprintln!(
             "Lighter: {} unavailable; using portable resolve: {error}",
             self.request.label()
         );
+        false
     }
 
     pub(super) fn begin(
@@ -1034,7 +1110,9 @@ impl Session {
             Err(err) if crate::gpu::reconstruction_device_lost(&err) => Err(err),
             Err(err) => {
                 let extent = epoch.extent;
-                self.reject(extent, &err);
+                if self.reject(extent, &err) {
+                    eprintln!("Lighter reconstruction fallback: portable for failed RR dispatch; FSR prepares next frame");
+                }
                 Ok(false)
             }
         }

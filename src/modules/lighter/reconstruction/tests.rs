@@ -169,7 +169,7 @@ fn make(mode: Mode, cpu_query: bool, rr: bool) -> Harness {
     let mut h = Harness::on_instance(&instance, mode, cpu_query, |adapter, desc| {
         bootstrap::device(adapter, desc, &request).unwrap()
     });
-    Startup(Some(request), Bisect::None).install(&mut h.ray, &h.device);
+    Startup(Some(request), Bisect::None, Fallback::default()).install(&mut h.ray, &h.device);
     h.ray.install(Ok((
         world(mode),
         super::super::textures::Textures::default(),
@@ -526,7 +526,11 @@ fn reconstruction_bisect_gates_opt_in_loads_before_path_lookup() {
 #[test]
 #[ignore = "requires Vulkan CPU; no SDK DLL is loaded"]
 fn lighter_reconstruction_bisect_uses_valid_portable_draws() {
-    let mut startup = Startup(Some(Request::Probe { rr: true }), Bisect::RawDevice);
+    let mut startup = Startup(
+        Some(Request::Probe { rr: true }),
+        Bisect::RawDevice,
+        Fallback::default(),
+    );
     let _instance = startup.instance(wgpu::Backends::VULKAN);
     assert!(startup.0.is_none());
     let mode = Mode::Software;
@@ -562,6 +566,19 @@ fn sdk_missing_dll_and_same_length_bad_hash_fail_before_loading() {
     let invalid = ffx::verified_dll(&path).unwrap_err();
     assert!(invalid.contains("pinned SHA-256"), "{invalid}");
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sdk_fallback_is_one_shot_and_missing_fsr_stays_portable() {
+    let path = PathBuf::from("pwe-missing-vulkan-upscaler-for-fallback-test.dll");
+    assert!(!path.exists());
+    let mut f = Fallback(Some(path));
+    assert!(f.try_fsr("injected RR error").is_none());
+    assert!(
+        f.0.is_none(),
+        "a missing FSR must not reload on every frame"
+    );
+    assert!(f.try_fsr("previously failed").is_none());
 }
 
 #[test]
@@ -627,11 +644,16 @@ fn lighter_temporal_vendor_dispatch() {
         Mode::Software
     };
     let mut startup = Startup::new(mode);
-    let label = startup
-        .0
-        .as_ref()
-        .expect("set PW_RAY_RECONSTRUCTION and its SDK paths")
-        .label();
+    let label = match std::env::var("PW_RAY_RECONSTRUCTION").as_deref() {
+        Ok("rr") => "Vulkan DLSS Ray Reconstruction",
+        Ok("fsr") => "Vulkan temporal FSR",
+        _ => panic!("set PW_RAY_RECONSTRUCTION=rr or fsr and its SDK paths"),
+    };
+    assert_eq!(
+        startup.0.as_ref().map(Request::label),
+        Some(label),
+        "requested SDK did not load; fallback is not a pass"
+    );
     let instance = startup.instance(wgpu::Backends::VULKAN);
     let mut h = Harness::on_instance(&instance, mode, false, |adapter, desc| {
         eprintln!("Vendor reconstruction adapter: {:?}", adapter.get_info());
