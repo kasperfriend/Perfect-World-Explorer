@@ -1263,6 +1263,22 @@ EOF
             "$OUT/settings/lib.rs" -o "$OUT/settingstest"
         shift || true
         (cd "$REPO" && exec "$OUT/settingstest" "$@") ;;
+    bmd-baked) toolchain; sysroot
+        # `src/bmd_baked.rs` has no dependencies at all -- no glam, no pck, no
+        # egui -- and twelve tests, and none of them had ever run except inside
+        # the six GPU binaries that `#[path]`-include it. That is the same shape
+        # as the walker's audio suite and the settings suite: a module whose
+        # tests live only inside a target the offline harness cannot build. This
+        # one needs nothing but `rustc`, so there is no excuse for it.
+        #
+        # CI does reach them (`cargo test --bin perfect-world-explorer` builds
+        # every module `main.rs` declares, and `bmd_baked` is one), but nothing
+        # in this harness did, and a rule about draw state should not need a
+        # runner to be checked.
+        "$RUSTC" --test --crate-name bmdbakedtest --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 "$REPO/src/bmd_baked.rs" -o "$OUT/bmdbakedtest"
+        shift || true
+        (cd "$REPO" && exec "$OUT/bmdbakedtest" "$@") ;;
     diagnostics) toolchain; sysroot; deps
         # `src/diagnostics.rs` on its own, against `tools/fixtures/egui_stub.rs`.
         # Its 18 tests had never run anywhere: the module has no GPU dependency,
@@ -1972,4 +1988,4 @@ EOF
             -o "$OUT/matrix-maps" "$OUT/mm/run.rs"
         shift || true
         (cd "$REPO" && exec "$OUT/matrix-maps" "${1:-$REPO/google_drive/clients}") ;;
-    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|precinct|settings|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|precinct|settings|bmd-baked|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
