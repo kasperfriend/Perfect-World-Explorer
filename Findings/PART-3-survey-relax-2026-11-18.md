@@ -9,9 +9,15 @@ item that needs data which is not in this checkout says exactly what is missing;
 it does not say "not established".
 
 Corpus staged in this checkout on 18 November (all `google_drive/`, gitignored):
-`configs.pck`, `gfx.pck`, `grasses.pck`, `textures.pck`, `trees.pck`. There are
-**no per-client `element/` folders**, so any item whose survey is per-client
-(1.3.1/1.4.4/1.8.4 …) cannot run here and says so.
+`configs.pck`, `gfx.pck`, `grasses.pck`, `textures.pck`, `trees.pck`, plus — via
+the Drive connector — real `elements.data` from three clients, four `.t2lm`
+lightmap files, eight `.ecbsd` placement files and `speedtreert.dll`.
+
+Two earlier entries in this file were wrong and are corrected where they stand:
+the claim that "no staged pack contains an EC-BSD" was true about packs and
+false about the format (EC-BSDs live under `maps/world/`), and the T2LM tile
+edge was not 256 for every file. Both are the same mistake — a survey answers
+about the place it was pointed at, so each row now records *where* it measured.
 
 ## Done
 
@@ -46,7 +52,7 @@ larger change than the data supports.
 | # | item | what blocks it |
 | --- | --- | --- |
 | 81 | rodio features in `Cargo.toml` | Needs a Windows build to test the audio backend selection; the offline toolchain has no rodio |
-| 85 | split the 61-file PR into four | Explicitly ordered **after** the code items, so it is not started; splitting mid-change would fragment the commits it is meant to separate |
+| 85 | split the PR into four | **Plan written, not executed.** `Findings/PR-50-split-plan.md` partitions all **108** files (the item's 61 is stale) into four cuts and machine-checks the partition: 108 changed, 108 assigned, no orphan, no duplicate — A 20, B 8, C 23, D 57. Two things block execution: this session may only push to `arena/3074ae8a-perfect-world-explorer`, and the 110 commits interleave the cuts, so they are partitions of the final tree rather than disjoint slices — producing them needs four check-out/repair/verify cycles before any of the four PRs is worth opening |
 
 ### The corpus this depends on
 
