@@ -1,8 +1,10 @@
 # Lighter
 
-Lighter is an optional replacement for the **main world renderer**. It does not
-use a raster color, depth, shadow map, or reflection texture to find ray hits.
-The native renderer is the default. The interface and map views still use the
+Lighter is an optional replacement for the **main world renderer**. By default
+its visibility comes from rays, not the Native renderer's raster targets.
+Hardware also offers an experimental raster *primary visibility* pass using
+Lighter's own geometry. Shadows, reflections and refraction remain rays.
+The Native renderer is the default. The interface and map views still use the
 viewer; post-processing for bloom, sharpen and display gamma can consume the
 ray-traced scene and its reverse-Z depth.
 
@@ -38,6 +40,16 @@ ray-traced scene and its reverse-Z depth.
    With **Follow local region lighting** off (default), the sun, ambient and
    sky palette follow the map and clock, not the local box under the camera.
    Regional fog and weather still apply. See the [optimized renderer](performance.md#interactive-hardware-rt-pass).
+   **Single-path transport** (default) limits water/glass to one sampled
+   continuation and samples one local light in dense lighting. Turn it off
+   for the deterministic first split or if water noise is objectionable.
+   **Automatic ray resolution** is opt-in and targets completed ray and
+   reconstruction GPU time, not total frame time; the slider seeds its
+   50–100% range. Start with a fixed scale when comparing renderers.
+   To try **Rasterized primary visibility**, select Hardware, enable it and
+   click **Reload World**. It requires one sample per pixel, is off by default,
+   and falls back to full primary rays if the raster target is unavailable.
+   Its extra render pass does not guarantee a speedup.
 4. Select **Off** and reload to leave Lighter off and save Native as the
    preference. In a running ray world, an unavailable backend or an unfittable
    scene falls back to Native with the reason in the HUD and Lighter menu. It
@@ -132,25 +144,22 @@ lighting and verification, see the [full ray-tracing checklist](TODO.md).
 
 ### Denoising and convergence
 
-- Both backends write linear radiance, reverse-Z depth, and primary hit depth,
-  normal and albedo guides. A 3×3 joint bilateral filter smooths compatible
-  surfaces, and guide-aware upscaling avoids mixing across depth or normal
-  discontinuities. Mixed-coverage and translucent pixels are not averaged with
-  their neighbors. Sky, emissive and water pixels bypass the spatial filter.
-  Depth always comes from the closest current camera sample, never from a
-  neighboring pixel or an older frame.
-- The interactive defaults are one sample, one secondary bounce and 50%
-  ray resolution per axis. Progressive sampling varies the light transport
-  sequence without jittering the single-sample depth or cutout pattern.
-  It averages the first ten compatible samples, then uses 10% new radiance
-  and 90% history. Tiny single-sample view changes reproject the primary
-  hit into the previous view; depth, normal and albedo must agree. Sky,
-  water and blended or mixed pixels do not reproject through view changes.
-  Movement of more than one ray pixel from the last reset's frustum (or a
-  material change to near/far depth), changed resolution, backend, lighting,
-  off-camera poses or moving lights reset history. Water-wave and scrolling
-  inputs invalidate only pixels whose paths used them. Roof drift is allowed
-  up to a quarter texel before resetting roof-dependent history.
+- Both backends write half-float radiance and luminance variance, compact
+  guides, and **FP32** reverse-Z and linear guide depth (28 bytes/pixel).
+  A variance-guided à-trous filter uses up to five spaced 3×3 passes with a
+  single scratch buffer. Wider passes require accumulated, noisy guides.
+  Guide-aware upscaling respects depth/normal discontinuities. Mixed or
+  translucent guides, sky, emissive surfaces and water bypass spatial
+  filtering. Depth remains the closest **current** camera sample.
+- The defaults are one sample, one secondary bounce and 50% scale per axis.
+  Progressive sampling varies transport without moving the one-sample camera
+  ray or cutout pattern. It blends compatible history with variance-adaptive
+  weight and a 32-sample count limit. A small single-sample camera change can
+  reproject a matching owner, depth, normal and albedo. Sky, water and blended
+  or mixed pixels do not reproject across view changes. Camera cuts, resized
+  output, changed static scene revision or changed lighting reset history.
+  Moving geometry, waves and scrolling invalidate affected paths. Roof drift
+  may advance by a quarter texel before invalidating roof-dependent history.
 - On a moving view or with animated poses/lights, the spatial filter still
   works, but there may be little usable history. Raising samples per pixel can
   help at a higher ray cost. The requested ray resolution is an upper bound:
@@ -161,9 +170,9 @@ lighting and verification, see the [full ray-tracing checklist](TODO.md).
 
 ### Light transport and its limits
 
-This is genuine ray-traced visibility in both modes. Software intersects a
-compute BVH; Hardware uses Vulkan ray queries. The two modes share the shading
-code. They are not two different lighting models.
+Software intersects a compute BVH; Hardware uses Vulkan ray queries. In the
+optional Hybrid path only primary solids use raster visibility. Both modes
+share shading and the same world-space secondary visibility rules.
 
 - Diffuse bounces sample a cosine-weighted hemisphere. They carry linear albedo,
   not a fixed brightness multiplier, and replace the ambient approximation on
@@ -180,8 +189,10 @@ code. They are not two different lighting models.
 - Underwater paths lose light exponentially with distance traveled. The
   authored fog range and hue approximate extinction and in-scattering; shallow
   bottoms show through because the underwater path is short, not because a
-  shoreline mask reduces the interface reflection. The first water split is
-  evaluated on both sides; later interfaces sample one lobe to bound ray counts.
+  shoreline mask reduces the interface reflection. Single-path transmission
+  retains the radiance Jacobian and tint; total internal reflection still
+  reflects. Disable Single-path for the legacy first split, including in
+  Reference. Moving water may not accumulate enough samples to hide noise.
   See [per-body geometry and authored water materials](water-fidelity.md).
 
 This is still a bounded, low-sample renderer for legacy assets, not a reference

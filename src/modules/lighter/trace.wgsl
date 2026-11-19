@@ -28,6 +28,9 @@ struct Frame {
 @group(0) @binding(3) var<storage,read> texels: array<u32>;
 @group(0) @binding(4) var<storage,read_write> image: array<Pixel>;
 var<private> dependencies: u32;
+var<private> motion_dependent: bool;
+var<private> sun_cache_read: u32;
+var<private> sun_cache_write: u32;
 
 const NIL: u32 = 0xffffffffu;
 const DYNAMIC: u32 = 0x800000u;
@@ -83,6 +86,7 @@ const RELIGHT_BAKED: u32 = 2048u;
 const CLOUD_DETAIL: u32 = 4096u;
 const PHYSICAL_BSDF: u32 = 8192u;
 const REFERENCE_MODE: u32 = 16384u;
+const SINGLE_PATH: u32 = 32768u;
 const VIEW: u32 = 0u;
 const SHADOW: u32 = 1u;
 const WATER_REFLECT: u32 = 2u;
@@ -791,7 +795,9 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
 fn none(ray: Ray) -> Hit { return Hit(ray.high,NIL,0u,vec2<f32>(0.)); }
 fn trace(ray: Ray, q: Query) -> Hit {
     if ray.low>ray.high || ((world[11u]|moving[11u]) & q.mask)==0u { return none(ray); }
-    return intersect(ray,q);
+    let hit = intersect(ray,q);
+    if hit.instance!=NIL && (hit.instance & DYNAMIC)!=0u { motion_dependent = true; }
+    return hit;
 }
 fn bias(p: vec3<f32>) -> f32 {
     return max(0.0005,strongest(abs(p))*4.77e-7);
@@ -941,6 +947,11 @@ fn analytic_sky(dir: vec3<f32>) -> vec3<f32> {
 fn environment(ray: Ray, seen_sun: bool) -> vec3<f32> {
     let dir = ray.dir;
     var sky = vec3<f32>(0.);
+    if !seen_sun && (frame.options.x & SINGLE_PATH)!=0u && frame.sky_cdf.x!=0u {
+        // Cache only the broad diffuse environment term. The authored view,
+        // mirrors, and refraction keep their filtered sky art and roof drift.
+        return diffuse_sky(dir);
+    }
     if frame.sky0.x!=0u {
         var radiance = sky_triple(dir,ray.spread,frame.sky0.xyz);
         let f = bitcast<f32>(frame.sky0.w);
@@ -1024,6 +1035,25 @@ fn next_light(p: vec3<f32>, s: Surface, cursor: ptr<function,LightCursor>, seed:
     }
     return LightRay(vec3<f32>(0.),0.,vec3<f32>(0.),vec3<f32>(0.),VIEW,vec2<u32>(NIL));
 }
+// Single-frame importance resampling of local area/point proposals. Only the
+// selected candidate spends a shadow ray. The power (unshadowed luminance)
+// PMF uses one realization per source: conditioning on those realizations,
+// the selected energy divided by its PMF has the original summed expectation.
+fn resample_lights(p: vec3<f32>, s: Surface, cursor: ptr<function,LightCursor>, seed: ptr<function,u32>) -> LightRay {
+    var selected = LightRay(vec3<f32>(0.),0.,vec3<f32>(0.),vec3<f32>(0.),VIEW,vec2<u32>(NIL));
+    var sum = 0.;
+    var chosen = 0.;
+    loop {
+        let candidate = next_light(p,s,cursor,seed);
+        if candidate.distance<=0. { break; }
+        let power = max(luminance(max(candidate.energy,vec3<f32>(0.))),0.);
+        if power<=0. { continue; }
+        sum += power;
+        if random(seed)*sum<power { selected = candidate; chosen = power; }
+    }
+    if chosen>0. { selected.energy *= sum/chosen; }
+    return selected;
+}
 fn random(seed: ptr<function,u32>) -> f32 {
     let value = hash(*seed);
     *seed = *seed*747796405u + 2891336453u;
@@ -1034,12 +1064,32 @@ fn around(axis: vec3<f32>, axial: f32, radial: f32, angle: f32) -> vec3<f32> {
     let v = cross(axis,u);
     return norm((u*cos(angle)+v*sin(angle))*radial+axis*axial);
 }
-fn sun_sample(seed: ptr<function,u32>) -> vec3<f32> {
+// Two digitally shifted Sobol dimensions. Gray code indexes the direction
+// numbers; the second dimension uses the x+1 recurrence. The scramble is
+// fixed in screen space so a stationary pixel sees stratified disk samples.
+fn sun_sobol(sequence: u32, pixel: u32) -> vec2<f32> {
+    var gray = sequence ^ (sequence >> 1u);
+    var direction = 0x80000000u;
+    var y = 0u;
+    let x = reverseBits(gray);
+    while gray!=0u {
+        if (gray & 1u)!=0u { y ^= direction; }
+        gray >>= 1u;
+        direction ^= direction >> 1u;
+    }
+    let shift = vec2<u32>(hash(pixel ^ 0xa511e9b3u),hash(pixel ^ 0x63d83595u));
+    return vec2<f32>((vec2<u32>(x,y) ^ shift) >> vec2<u32>(8u))/16777216.;
+}
+fn sun_sample(ray: Ray, purpose: u32, seed: ptr<function,u32>) -> vec3<f32> {
     if (frame.options.x & (SHADOWS|SOFT_SUN))!=(SHADOWS|SOFT_SUN) { return frame.sun.xyz; }
     // Uniform solid angle over a 0.27-degree angular radius. Compute sin
     // without subtracting nearly equal cosines at this narrow aperture.
-    let delta = random(seed)*0.000011103284; // 1 - cos(0.27 deg)
-    return around(frame.sun.xyz,1.-delta,sqrt(delta*(2.-delta)),random(seed)*6.2831853);
+    var u = vec2<f32>(random(seed),random(seed));
+    if (frame.options.x & SINGLE_PATH)!=0u && purpose==VIEW && frame.options.z==1u {
+        u = sun_sobol(frame.sampling.x,ray.pixel_seed);
+    }
+    let delta = u.x*0.000011103284; // 1 - cos(0.27 deg)
+    return around(frame.sun.xyz,1.-delta,sqrt(delta*(2.-delta)),u.y*6.2831853);
 }
 fn local_color(s: Surface, light: vec3<f32>, ambient: vec3<f32>) -> vec3<f32> {
     let lit = s.color.rgb*light + ambient + s.emission;
@@ -1058,9 +1108,8 @@ fn material_bsdf(s: Surface) -> Bsdf {
     let alpha = select(sqrt(2./(2.+max(s.power,0.))),s.pbr.y*s.pbr.y,authored);
     return Bsdf(albedo*(1.-metallic),select(vec3<f32>(0.),clamp(f0,vec3<f32>(0.),vec3<f32>(1.)),(frame.options.x & REFLECTIONS)!=0u),clamp(alpha,0.002,1.));
 }
-fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u32, purpose: u32, emission_weight: f32, seed: ptr<function,u32>) -> vec3<f32> {
-    let albedo = s.color.rgb;
-    if (s.flags & EMISSIVE)!=0u { return albedo*emission_weight; }
+fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u32, purpose: u32, emission_weight: f32, cache_sun: bool, seed: ptr<function,u32>) -> vec3<f32> {
+    if (s.flags & EMISSIVE)!=0u { return s.color.rgb*emission_weight; }
     let lit = (frame.options.x & LIGHTING)!=0u;
     let baked = (s.flags & BAKED)!=0u;
     if lit && baked { return local_color(s,vec3<f32>(1.),vec3<f32>(0.)); }
@@ -1071,7 +1120,7 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u3
     var sun_tail = vec3<f32>(0.);
     var sun_loss = vec3<f32>(1.);
     if sun_pending {
-        sun = sun_sample(seed);
+        sun = sun_sample(ray,purpose,seed);
         if medium!=0u && medium!=OPEN_WATER && sun.y>0. {
             let link = sun_caustic(p,sun,medium);
             sun_tail = sun;
@@ -1103,8 +1152,12 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u3
     }
     var cursor = LightCursor(0u,world[12u],0u,0u);
     var proposal = select(0u,2u,reference() && physical);
+    var local_spent = false;
+    let sample_local = (frame.options.x & SINGLE_PATH)!=0u && (world[10u]+moving[10u])>4u
+        && (frame.options.x & SHADOWS)!=0u;
     loop {
         var light: LightRay;
+        let cache = sun_pending && cache_sun && frame.sampling.y!=0u;
         if sun_pending {
             sun_pending = false;
             light = LightRay(sun,sun_leg,energy*sun_loss,sun_tail,VIEW,vec2<u32>(NIL));
@@ -1136,7 +1189,11 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u3
             light = LightRay(sample.dir,sample.t,eval.f*radiance*tr*(cosine*mis/sample.pdf),vec3<f32>(0.),next_purpose,sample.key);
         } else {
             if !lit { break; }
-            light = next_light(p,s,&cursor,seed);
+            if sample_local {
+                if local_spent { break; }
+                local_spent = true;
+                light = resample_lights(p,s,&cursor,seed);
+            } else { light = next_light(p,s,&cursor,seed); }
             if light.distance<=0. { break; }
             if medium!=0u && medium!=OPEN_WATER {
                 let sizing = Ray(p,light.dir,0.,light.distance,0.,0.,0.,0u);
@@ -1148,7 +1205,17 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u3
         // can make shader compilation dominate the first frame.
         var response = vec3<f32>(1.);
         if physical && light.purpose==VIEW { response = BSDF_PI*bsdf_eval(b,s.n,-ray.dir,light.dir).f; }
-        color += response*light.energy*visibility(p,s.face,light,width,ray);
+        var tr = vec3<f32>(0.);
+        if cache && (sun_cache_read & SUN_VALID)!=0u {
+            tr = vec3<f32>(select(1.,0.,(sun_cache_read & SUN_BLOCKED)!=0u));
+        } else { tr = visibility(p,s.face,light,width,ray); }
+        if cache {
+            // Colored transmission has no lossless binary encoding. Cache
+            // only an all-clear or an opaque result in a stationary snapshot.
+            if all(tr==vec3<f32>(0.)) { sun_cache_write = SUN_VALID|SUN_BLOCKED; }
+            else if all(tr==vec3<f32>(1.)) { sun_cache_write = SUN_VALID; }
+        }
+        color += response*light.energy*tr;
     }
     if physical { return color+ambient+s.emission*emission_weight; }
     return local_color(s,color,ambient);
@@ -1248,10 +1315,12 @@ fn project_decals(s: Surface, p: vec3<f32>, ray: Ray, t: f32, original: vec3<f32
     }
     return color;
 }
-fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
+struct Transport { radiance: vec4<f32>, guide: vec4<u32>, owner: u32 }
+fn transport(first: Ray, primary: Hit, raster: bool, seed: ptr<function,u32>) -> Transport {
     var result = vec3<f32>(0.);
     var depth = 0.;
     var guide = vec4<u32>(0u);
+    var owner = 0u;
     var layered = false;
     let categories = world[11u]|moving[11u];
     let blend_present = (categories & BLEND_MASK)!=0u;
@@ -1260,10 +1329,18 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
     var path = Path(first,vec3<f32>(1.),0u,VIEW,start_medium,vec4<f32>(0.));
     var pending = path;
     var split = false;
+    let single = (frame.options.x & SINGLE_PATH)!=0u;
     for (var branch=0u; branch<2u; branch++) {
         for (var segment=0u; segment<=frame.options.y; segment++) {
             let minimum = select(0.002,1.e-12,reference());
             if strongest(abs(path.weight))<minimum { break; }
+            if single && path.depth>=2u {
+                // Kill before tracing the next segment. The reciprocal
+                // weight preserves the conditional expectation of survivors.
+                let survive = clamp(strongest(abs(path.weight)),0.1,0.95);
+                if random(seed)>=survive { break; }
+                path.weight /= survive;
+            }
             var ray = path.ray;
             // Budget only dry diffuse transport. Primary, shadow, mirrors
             // and both water/glass interface directions keep their ranges.
@@ -1301,7 +1378,12 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                 }
                 else if ordered { r.high = group_end; }
                 let query_mask = select(mask,0u,mask==BLEND_MASK && !has_weight);
-                var hit = trace(r,Query(path.purpose,query_mask,ordered,after));
+                var hit: Hit;
+                if raster && path.depth==0u && mask==solid_bit {
+                    hit = primary;
+                    if hit.instance!=NIL && (hit.instance & DYNAMIC)!=0u { motion_dependent = true; }
+                }
+                else { hit = trace(r,Query(path.purpose,query_mask,ordered,after)); }
                 if mask==solid_bit {
                     solid = hit;
                     // A solid-only scene can shade its hit immediately. Skip
@@ -1352,7 +1434,8 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                     if !sheet && path.previous.w>0. && ((s.flags & EMISSIVE)!=0u || strongest(s.emission)>0.) {
                         mis = balance(path.previous.w,emitter_pdf_at(hit,path.previous.xyz,p));
                     }
-                    color = direct(p,s,ray,hit.t,terminal || sheet,medium.body,path.purpose,mis,seed);
+                    let cache = !sheet && path.depth==0u && branch==0u && medium.body==0u;
+                    color = direct(p,s,ray,hit.t,terminal || sheet,medium.body,path.purpose,mis,cache,seed);
                 }
                 if !sheet {
                     color = project_decals(s,p,ray,hit.t,color);
@@ -1401,6 +1484,8 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                 let clip = frame.vp*vec4<f32>(p,1.);
                 depth = max(depth,clamp(clip.z/clip.w,0.,1.));
                 guide = primary_guide(clip,s);
+                let m = (solid.instance & DYNAMIC)!=0u;
+                owner = (hash(solid.instance ^ hash(material_addr(m,solid.primitive))) & OWNER_MASK) | 1u;
             }
             result += path.weight*medium.inscatter;
             path.weight *= medium.tr;
@@ -1458,7 +1543,17 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
                     continue;
                 }
                 if can_reflect && f>0. {
-                    if !split && branch==0u {
+                    if single {
+                        // Sample exactly one lobe. For the chosen proposal
+                        // p=F or p=1-F the BSDF/PMF ratio is exactly one. The
+                        // independent eta^2/tint below still applies to T.
+                        if random(seed)<f {
+                            path.ray = secondary(p,reflected,s.face,ray,solid.t);
+                            path.purpose = reflect_purpose;
+                            path.medium = reflect_medium;
+                            continue;
+                        }
+                    } else if !split && branch==0u {
                         pending = Path(secondary(p,reflected,s.face,ray,solid.t),path.weight*f,path.depth,reflect_purpose,reflect_medium,vec4<f32>(0.));
                         split = true;
                         path.weight *= 1.-f;
@@ -1536,43 +1631,60 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
         path = pending;
     }
     guide.w |= select(0u,GUIDE_SHEET,layered);
-    return Pixel(vec4<f32>(max(result,vec3<f32>(0.)),depth),guide);
+    return Transport(vec4<f32>(max(result,vec3<f32>(0.)),depth),guide,owner);
+}
+
+fn camera_ray(id: vec2<u32>, sample: u32, seed: ptr<function,u32>) -> Ray {
+    let pixel_seed = id.x + id.y*frame.extent.x + 1u;
+    *seed = hash(pixel_seed ^ (sample*0x9e3779b9u));
+    let spread = 2.*max(length(frame.inv_vp[0].xyz)/f32(frame.extent.x),
+                        length(frame.inv_vp[1].xyz)/f32(frame.extent.y));
+    let jitter = select(vec2<f32>(0.5),vec2<f32>(random(seed),random(seed)),frame.options.z>1u);
+    let screen = (vec2<f32>(id)+jitter)/vec2<f32>(frame.extent.xy);
+    let ndc = screen*vec2<f32>(2.,-2.)+vec2<f32>(-1.,1.);
+    let near4 = frame.inv_vp*vec4<f32>(ndc,1.,1.);
+    let far4 = frame.inv_vp*vec4<f32>(ndc,0.,1.);
+    let near = near4.xyz/near4.w-frame.eye.xyz;
+    let far = far4.xyz/far4.w-frame.eye.xyz;
+    let coverage = (f32(sample)+random(seed))/f32(frame.options.z);
+    return Ray(frame.eye.xyz,norm(near),length(near),length(far),0.,spread,coverage,pixel_seed);
+}
+
+fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool) {
+    dependencies = 0u;
+    motion_dependent = false;
+    sun_cache_read = 0u;
+    sun_cache_write = 0u;
+    let at = id.y*frame.extent.x+id.x;
+    if frame.sampling.z!=0u { sun_cache_read = image[at].albedo_history & SUN_CACHE; }
+    var total = vec3<f32>(0.);
+    var depth = 0.;
+    var guide = vec4<u32>(0u);
+    var unsafe_guide = 0u;
+    var owner = 0u;
+    for (var sample=0u; sample<frame.options.z; sample++) {
+        // Camera jitter and coverage of the next sample don't depend on how
+        // many random numbers the previous sample's paths consumed.
+        var seed = 0u;
+        let ray = camera_ray(id,sample,&seed);
+        // Rotate transport independently of camera jitter/cutout coverage.
+        if frame.sampling.x!=0u { seed ^= hash(frame.sampling.x); }
+        let out = transport(ray,primary,raster,&seed);
+        total += out.radiance.rgb;
+        unsafe_guide |= out.guide.w & GUIDE_SHEET;
+        if sample>0u && guide_weight(guide,out.guide)<0.25 { unsafe_guide |= GUIDE_MIXED; }
+        if sample==0u || out.radiance.a>depth { guide = out.guide; owner = out.owner; }
+        // Reverse Z: take the nearest of the samples for consumers of depth.
+        depth = max(depth,out.radiance.a);
+    }
+    guide.w |= unsafe_guide|dependencies;
+    var pixel = pack_pixel(total/f32(frame.options.z),depth,guide,owner|select(0u,DEP_MOVING,motion_dependent));
+    pixel.albedo_history |= sun_cache_write;
+    image[at] = pixel;
 }
 
 @compute @workgroup_size(8,8)
 fn render(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy>=frame.extent.xy) { return; }
-    dependencies = 0u;
-    let pixel_seed = id.x + id.y*frame.extent.x + 1u;
-    let spread = 2.*max(length(frame.inv_vp[0].xyz)/f32(frame.extent.x),
-                        length(frame.inv_vp[1].xyz)/f32(frame.extent.y));
-    var total = vec3<f32>(0.);
-    var depth = 0.;
-    var guide = vec4<u32>(0u);
-    var unsafe_guide = 0u;
-    for (var sample=0u; sample<frame.options.z; sample++) {
-        // Camera jitter and coverage of the next sample don't depend on how
-        // many random numbers the previous sample's paths consumed.
-        var seed = hash(pixel_seed ^ (sample*0x9e3779b9u));
-        let jitter = select(vec2<f32>(0.5),vec2<f32>(random(&seed),random(&seed)),frame.options.z>1u);
-        let screen = (vec2<f32>(id.xy)+jitter)/vec2<f32>(frame.extent.xy);
-        let ndc = screen*vec2<f32>(2.,-2.)+vec2<f32>(-1.,1.);
-        let near4 = frame.inv_vp*vec4<f32>(ndc,1.,1.);
-        let far4 = frame.inv_vp*vec4<f32>(ndc,0.,1.);
-        let near = near4.xyz/near4.w-frame.eye.xyz;
-        let far = far4.xyz/far4.w-frame.eye.xyz;
-        let coverage = (f32(sample)+random(&seed))/f32(frame.options.z);
-        // Rotate the transport sequence independently of camera jitter and
-        // cutout coverage, so progressive lighting cannot pump scene depth.
-        if frame.sampling.x!=0u { seed ^= hash(frame.sampling.x); }
-        let out = transport(Ray(frame.eye.xyz,norm(near),length(near),length(far),0.,spread,coverage,pixel_seed),&seed);
-        total += out.radiance.rgb;
-        unsafe_guide |= out.guide.w & GUIDE_SHEET;
-        if sample>0u && guide_weight(guide,out.guide)<0.25 { unsafe_guide |= GUIDE_MIXED; }
-        if sample==0u || out.radiance.a>depth { guide = out.guide; }
-        // Reverse Z: take the nearest of the samples for consumers of depth.
-        depth = max(depth,out.radiance.a);
-    }
-    guide.w |= unsafe_guide|dependencies;
-    image[id.y*frame.extent.x+id.x] = Pixel(vec4<f32>(total/f32(frame.options.z),depth),guide);
+    render_pixel(id.xy,Hit(0.,NIL,0u,vec2<f32>(0.)),false);
 }

@@ -40,12 +40,16 @@ pub struct Settings {
     pub lighting: bool,
     pub regional_lighting: bool,
     pub reflections: bool,
+    pub single_path: bool,
+    pub hybrid_primary: bool,
     pub denoiser: bool,
     pub progressive: bool,
     pub bounces: u32,
     pub diffuse_distance: u32,
     pub samples: u32,
     pub resolution: u32,
+    pub dynamic_resolution: bool,
+    pub gpu_target_ms: u32,
     pub anisotropy: u32,
     pub relight_baked: bool,
     pub physical_bsdf: bool,
@@ -61,12 +65,16 @@ impl Default for Settings {
             lighting: true,
             regional_lighting: false,
             reflections: true,
+            single_path: true,
+            hybrid_primary: false,
             denoiser: true,
             progressive: true,
             bounces: 1,
             diffuse_distance: 256,
             samples: 1,
             resolution: 50,
+            dynamic_resolution: false,
+            gpu_target_ms: 12,
             anisotropy: 8,
             relight_baked: false,
             physical_bsdf: false,
@@ -87,6 +95,8 @@ impl Settings {
             shadows: true,
             reflections: true,
             physical_bsdf: true,
+            single_path: false,
+            hybrid_primary: false,
             relight_baked: true,
             progressive: false,
             denoiser: false,
@@ -94,6 +104,7 @@ impl Settings {
             diffuse_distance: 0,
             samples: 32,
             resolution: 100,
+            dynamic_resolution: false,
             ..self
         }
     }
@@ -124,6 +135,8 @@ impl Settings {
                     settings.regional_lighting = toggle(settings.regional_lighting)
                 }
                 "reflections" => settings.reflections = toggle(settings.reflections),
+                "single_path" => settings.single_path = toggle(settings.single_path),
+                "hybrid_primary" => settings.hybrid_primary = toggle(settings.hybrid_primary),
                 "denoiser" => settings.denoiser = toggle(settings.denoiser),
                 "progressive" => settings.progressive = toggle(settings.progressive),
                 "bounces" => settings.bounces = number(settings.bounces, 0, 4),
@@ -132,6 +145,10 @@ impl Settings {
                 }
                 "samples" => settings.samples = number(settings.samples, 1, 4),
                 "resolution" => settings.resolution = number(settings.resolution, 25, 100),
+                "dynamic_resolution" => {
+                    settings.dynamic_resolution = toggle(settings.dynamic_resolution)
+                }
+                "gpu_target_ms" => settings.gpu_target_ms = number(settings.gpu_target_ms, 4, 50),
                 "reference" => settings.reference = toggle(settings.reference),
                 "physical_bsdf" => settings.physical_bsdf = toggle(settings.physical_bsdf),
                 "relight_baked" => settings.relight_baked = toggle(settings.relight_baked),
@@ -148,13 +165,13 @@ impl Settings {
 
     pub(crate) fn encode(self) -> String {
         format!(
-            "# Lighter settings\nmode={}\nlighting={}\nregional_lighting={}\nshadows={}\nsoft_sun={}\nreflections={}\ndenoiser={}\nprogressive={}\nbounces={}\ndiffuse_distance={}\nsamples={}\nresolution={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\nreference={}\n",
-            self.mode.token(), self.lighting, self.regional_lighting, self.shadows, self.soft_sun, self.reflections, self.denoiser, self.progressive, self.bounces,
-            self.diffuse_distance, self.samples, self.resolution, self.anisotropy, self.relight_baked, self.physical_bsdf, self.reference,
+            "# Lighter settings\nmode={}\nlighting={}\nregional_lighting={}\nshadows={}\nsoft_sun={}\nreflections={}\nsingle_path={}\nhybrid_primary={}\ndenoiser={}\nprogressive={}\nbounces={}\ndiffuse_distance={}\nsamples={}\nresolution={}\ndynamic_resolution={}\ngpu_target_ms={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\nreference={}\n",
+            self.mode.token(), self.lighting, self.regional_lighting, self.shadows, self.soft_sun, self.reflections, self.single_path, self.hybrid_primary, self.denoiser, self.progressive, self.bounces,
+            self.diffuse_distance, self.samples, self.resolution, self.dynamic_resolution, self.gpu_target_ms, self.anisotropy, self.relight_baked, self.physical_bsdf, self.reference,
         )
     }
 
-    fn path() -> Option<PathBuf> {
+    pub(super) fn path() -> Option<PathBuf> {
         #[cfg(windows)]
         let directory = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
         #[cfg(not(windows))]
@@ -212,12 +229,15 @@ mod tests {
         assert!(s.physical_bsdf);
         assert_eq!(Settings::decode(&s.encode()), s);
         assert_eq!(Settings::decode("mode=unknown"), Settings::default());
-        let reference = Settings::decode("reference=true");
+        let reference =
+            Settings::decode("reference=true\nhybrid_primary=true\ndynamic_resolution=true");
         assert_eq!(Settings::decode(&reference.encode()), reference);
         let e = reference.effective();
         assert_eq!([e.samples, e.bounces, e.resolution], [32, 8, 100]);
         assert!(e.physical_bsdf && e.shadows && e.relight_baked);
         assert!(!e.progressive && !e.denoiser && reference.progressive);
         assert_eq!(e.diffuse_distance, 0);
+        assert!(!e.hybrid_primary && !e.single_path && !e.dynamic_resolution);
+        assert!(reference.hybrid_primary && reference.single_path && reference.dynamic_resolution);
     }
 }

@@ -267,7 +267,7 @@ jobs:
         run: |
           export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
           test -n "$VK_ICD_FILENAMES"
-          for suite in lighter_software_pixels lighter_streamed_world_pixels lighter_vulkan_interop_on_cpu; do
+          for suite in lighter_software_pixels lighter_streamed_world_pixels lighter_vulkan_interop_on_cpu lighter_raster_primary_parity; do
             status=0
             (set -o pipefail; cargo test --locked --bin perfect-world-explorer "$suite" -- --ignored --nocapture \
               2>&1 | tee /tmp/lighter-pixels.log) || status=$?

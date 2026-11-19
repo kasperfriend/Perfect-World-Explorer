@@ -48,6 +48,13 @@ python3 tools/lighter_capture_matrix.py \
   --output target/lighter-retail-physical
 ```
 
+Add `--hybrid-ab` to the physical run to render a fourth path: the same
+Hardware settings with raster primary visibility enabled. The tool rejects a
+full-ray fallback for this variant and writes both the Hardware-vs-Hybrid
+regional diff and per-stage timing. At the headless CLI level,
+`PW_PREVIEW_HYBRID_PRIMARY=1` requests that variant and
+`PW_PREVIEW_SINGLE_PATH=0` uses split transport for a control.
+
 Use the `.exe` build on Windows. Choose the expected Vulkan adapter on a
 multi-GPU host; the tool rejects a CPU/virtual adapter for a physical report,
 and Hardware mode fails instead of substituting raster or compute. Each pair
@@ -75,7 +82,10 @@ it does not inspect the artistic subject or assert pixel parity.
   Report p50 and nearest-rank p95, sample count, device and driver. These
   values are not live FPS or GPU-only stage durations. The asynchronous
   Software/Vulkan build, trace and filter samples, when supported, are
-  collected separately from the logs. Keep [synthetic GPU budget results](gpu-budget.md)
+  collected separately from the logs. `gpu_completed_stage_ms` records
+  sampled GPU stages for the warmed draws when available; `primary` and
+  `traversal` should be considered together in the Hybrid comparison.
+  Keep [synthetic GPU budget results](gpu-budget.md)
   separate from these retail captures.
 
 ## Completed CPU Vulkan matrix — run started 2026-11-18 UTC

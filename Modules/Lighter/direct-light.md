@@ -28,6 +28,22 @@ blocks the connection. Legacy alpha-blended effects are not reinterpreted
 as glass. This is a direct-shadow model, not a solution for specular
 connections through thick, refracting objects.
 
+## Interactive sampling
+
+At one sample per pixel, Single-path mode uses a digitally shifted 2D Sobol
+sequence for primary soft-sun samples. For more than four published static
+and runtime local lights, shadowed Single-path transport importance-resamples
+one eligible local proposal per shaded hit. The influence BVHs and normal
+checks still reject out-of-range and back-facing proposals before visibility.
+Dividing the selected energy by its probability preserves the summed mean,
+not the per-frame colors. The sun remains separate. This is single-frame
+resampling, not temporal/spatial ReSTIR reuse.
+
+With progressive sampling, a stationary one-sample hard sun can reuse a
+binary clear/opaque result at an unchanged primary receiver. View, lighting,
+scene, animated coverage or moving geometry changes invalidate reuse. Partial
+RGB transmission is never stored as a binary result.
+
 ## Validation (2026-11-18)
 
 `6f758c8` passed the shared Software and CPU Vulkan ray-query tests on Mesa

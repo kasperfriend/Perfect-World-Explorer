@@ -45,6 +45,7 @@ pub(super) fn exercise(h: &mut Harness) {
         bounces: 1,
         samples: 1,
         resolution: 100,
+        single_path: false, // fixed-radiance optics probes
         ..Settings::default()
     };
     opaque_leaves_keep_cutout_holes(h);

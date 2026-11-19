@@ -4,7 +4,8 @@
 use super::scene::{Fingerprint, MeshKey, MeshRange, Packet, DYNAMIC_BIT, VERTEX_WORDS};
 use super::{
     grown_capacity, image_limit, profile::INTERVAL, storage_limit, suffix_segments,
-    textures::UPLOAD_PAGE_BYTES, Frame, TexelPrefix, Textures, RAY_ALLOCATION_BUDGET,
+    textures::UPLOAD_PAGE_BYTES, Frame, TexelPrefix, Textures, HYBRID_PRIMARY,
+    RAY_ALLOCATION_BUDGET,
 };
 use ash::{extensions::khr, vk};
 use std::{
@@ -17,6 +18,9 @@ use std::{
     time::Instant,
 };
 use wgpu::hal::{api::Vulkan, vulkan::Device as HalDevice};
+
+mod cache;
+mod primary;
 
 pub const FEATURES: wgpu::Features =
     wgpu::Features::RAY_QUERY.union(wgpu::Features::RAY_TRACING_ACCELERATION_STRUCTURE);
@@ -58,16 +62,31 @@ pub fn supported(a: &wgpu::Adapter) -> bool {
 }
 
 pub fn shader(source: &str) -> Result<Vec<u32>, String> {
+    shader_entry(source, naga_rt::ShaderStage::Compute, "render")
+}
+
+pub(super) fn shader_entry(source: &str, stage: naga_rt::ShaderStage, entry: &str) -> R<Vec<u32>> {
     // Use the guarded getters and separate candidate/committed helpers from
     // Naga 26 without changing wgpu's pinned shader compiler.
     use naga_rt as naga;
-    let module = naga::front::wgsl::parse_str(source).map_err(|e| e.emit_to_string(source))?;
-    let info = naga::valid::Validator::new(
+    let mut module = naga::front::wgsl::parse_str(source).map_err(|e| e.emit_to_string(source))?;
+    module
+        .entry_points
+        .retain(|e| e.stage == stage && e.name == entry);
+    let mut validator = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
         naga::valid::Capabilities::RAY_QUERY,
-    )
-    .validate(&module)
-    .map_err(|e| e.emit_to_string(source))?;
+    );
+    validator
+        .validate(&module)
+        .map_err(|e| e.emit_to_string(source))?;
+    if module.entry_points.is_empty() {
+        return Err(format!("Missing Vulkan shader entry {entry}"));
+    }
+    naga::compact::compact(&mut module, naga::compact::KeepUnused::No);
+    let info = validator
+        .validate(&module)
+        .map_err(|e| e.emit_to_string(source))?;
     naga::back::spv::write_vec(
         &module,
         &info,
@@ -81,8 +100,8 @@ pub fn shader(source: &str) -> Result<Vec<u32>, String> {
             ..Default::default()
         },
         Some(&naga::back::spv::PipelineOptions {
-            shader_stage: naga::ShaderStage::Compute,
-            entry_point: "render".into(),
+            shader_stage: stage,
+            entry_point: entry.into(),
         }),
     )
     .map_err(|e| format!("Lighter SPIR-V: {e}"))
@@ -97,9 +116,12 @@ struct Context {
     device: ash::Device,
     queue: vk::Queue,
     family: u32,
+    raster_capable: bool,
+    identity: (u32, u32, [u8; 16]),
     acceleration: khr::AccelerationStructure,
     addresses: khr::BufferDeviceAddress,
     memory: vk::PhysicalDeviceMemoryProperties,
+    heap_probe: Option<(ash::Instance, vk::PhysicalDevice)>,
     scratch_align: u64,
     max_primitives: u64,
     max_instances: u64,
@@ -140,6 +162,25 @@ fn timestamp_ms(start: u64, end: u64, valid_bits: u32, period: f32) -> f64 {
 }
 
 impl Context {
+    fn heap_usage(&self) -> Option<u64> {
+        let (instance, physical) = self.heap_probe.as_ref()?;
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        unsafe {
+            instance.get_physical_device_memory_properties2(
+                *physical,
+                &mut vk::PhysicalDeviceMemoryProperties2::builder().push_next(&mut budget),
+            );
+        }
+        Some(
+            self.memory.memory_heaps[..self.memory.memory_heap_count as usize]
+                .iter()
+                .zip(budget.heap_usage)
+                .filter(|(h, _)| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                .map(|(_, bytes)| bytes)
+                .sum(),
+        )
+    }
+
     // `device` outlives the backend, including every buffer imported into it.
     fn new(device: &wgpu::Device) -> R<Arc<Self>> {
         if !device.features().contains(FEATURES) {
@@ -159,6 +200,17 @@ impl Context {
                         &mut vk::PhysicalDeviceProperties2::builder().push_next(&mut p),
                     );
                     let memory = instance.get_physical_device_memory_properties(physical);
+                    let heap_probe = instance
+                        .enumerate_device_extension_properties(physical)
+                        .ok()
+                        .and_then(|exts| {
+                            exts.iter()
+                                .any(|e| {
+                                    CStr::from_ptr(e.extension_name.as_ptr())
+                                        == vk::ExtMemoryBudgetFn::name()
+                                })
+                                .then(|| (instance.clone(), physical))
+                        });
                     let local = memory.memory_heaps[..memory.memory_heap_count as usize]
                         .iter()
                         .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
@@ -168,16 +220,20 @@ impl Context {
                     let family = hal.queue_family_index();
                     let queues = instance.get_physical_device_queue_family_properties(physical);
                     let timestamp_bits = queues[family as usize].timestamp_valid_bits;
-                    let timestamp_period = instance
-                        .get_physical_device_properties(physical)
-                        .limits
-                        .timestamp_period;
+                    let props = instance.get_physical_device_properties(physical);
+                    let timestamp_period = props.limits.timestamp_period;
                     Ok(Arc::new(Self {
                         queue: hal.raw_queue(),
                         family,
+                        identity: (props.vendor_id, props.device_id, props.pipeline_cache_uuid),
+                        raster_capable: queues[family as usize]
+                            .queue_flags
+                            .contains(vk::QueueFlags::GRAPHICS)
+                            && primary::supported(instance, physical),
                         acceleration: khr::AccelerationStructure::new(instance, &device),
                         addresses: khr::BufferDeviceAddress::new(instance, &device),
                         memory,
+                        heap_probe,
                         budget: AllocationBudget {
                             limit: local.min(RAY_ALLOCATION_BUDGET),
                             held: AtomicU64::new(0),
@@ -628,7 +684,44 @@ struct TlasInstance {
     address: u64,
 }
 
+fn pipeline(
+    d: &ash::Device,
+    layout: vk::PipelineLayout,
+    cache: vk::PipelineCache,
+    spirv: &[u32],
+    entry: &CStr,
+) -> R<vk::Pipeline> {
+    unsafe {
+        let shader = d
+            .create_shader_module(&vk::ShaderModuleCreateInfo::builder().code(spirv), None)
+            .map_err(vkerr("create ray-query shader"))?;
+        let stage = vk::PipelineShaderStageCreateInfo::builder()
+            .module(shader)
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .name(entry);
+        let result = d.create_compute_pipelines(
+            cache,
+            &[vk::ComputePipelineCreateInfo::builder()
+                .stage(*stage)
+                .layout(layout)
+                .build()],
+            None,
+        );
+        d.destroy_shader_module(shader, None);
+        match result {
+            Ok(pipelines) => Ok(pipelines[0]),
+            Err((pipelines, error)) => {
+                for p in pipelines {
+                    d.destroy_pipeline(p, None);
+                }
+                Err(vkerr("create ray-query pipeline")(error))
+            }
+        }
+    }
+}
+
 struct Core {
+    cache: cache::PipelineCache,
     ctx: Arc<Context>,
     pool: vk::CommandPool,
     commands: vk::CommandBuffer,
@@ -643,7 +736,9 @@ struct Core {
 
 impl Core {
     fn new(ctx: Arc<Context>, spirv: &[u32]) -> R<Self> {
+        let (vendor, device, uuid) = ctx.identity;
         let mut c = Self {
+            cache: cache::PipelineCache::new(&ctx.device, vendor, device, uuid),
             ctx,
             pool: vk::CommandPool::null(),
             commands: vk::CommandBuffer::null(),
@@ -681,6 +776,7 @@ impl Core {
                 vk::DescriptorType::STORAGE_BUFFER,
                 vk::DescriptorType::STORAGE_BUFFER,
                 vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+                vk::DescriptorType::SAMPLED_IMAGE,
             ];
             let bindings: Vec<_> = types
                 .into_iter()
@@ -690,7 +786,14 @@ impl Core {
                         .binding(i as u32)
                         .descriptor_type(descriptor_type)
                         .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                        .stage_flags(
+                            vk::ShaderStageFlags::COMPUTE
+                                | if i < 4 && c.ctx.raster_capable {
+                                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT
+                                } else {
+                                    vk::ShaderStageFlags::empty()
+                                },
+                        )
                         .build()
                 })
                 .collect();
@@ -711,6 +814,10 @@ impl Core {
                 },
                 vk::DescriptorPoolSize {
                     ty: types[5],
+                    descriptor_count: 1,
+                },
+                vk::DescriptorPoolSize {
+                    ty: types[6],
                     descriptor_count: 1,
                 },
             ];
@@ -735,32 +842,15 @@ impl Core {
                     None,
                 )
                 .map_err(vkerr("create pipeline layout"))?;
-            let shader = d
-                .create_shader_module(&vk::ShaderModuleCreateInfo::builder().code(spirv), None)
-                .map_err(vkerr("create ray-query shader"))?;
-            let stage = vk::PipelineShaderStageCreateInfo::builder()
-                .module(shader)
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .name(CStr::from_bytes_with_nul(b"render\0").unwrap());
-            let result = d.create_compute_pipelines(
-                vk::PipelineCache::null(),
-                &[vk::ComputePipelineCreateInfo::builder()
-                    .stage(*stage)
-                    .layout(c.layout)
-                    .build()],
-                None,
-            );
-            d.destroy_shader_module(shader, None);
-            c.pipeline = match result {
-                Ok(pipelines) => pipelines[0],
-                Err((pipelines, error)) => {
-                    for p in pipelines {
-                        d.destroy_pipeline(p, None);
-                    }
-                    return Err(vkerr("create ray-query pipeline")(error));
-                }
-            };
+            c.pipeline = pipeline(
+                d,
+                c.layout,
+                c.cache.handle,
+                spirv,
+                CStr::from_bytes_with_nul(b"render\0").unwrap(),
+            )?;
         }
+        c.cache.save();
         if c.ctx.timestamp_bits > 0 {
             // Profiling is optional; inability to create a query pool does not
             // make an otherwise suitable RT device unavailable.
@@ -861,6 +951,11 @@ struct AccelPlan {
 }
 
 pub struct Renderer {
+    primary: Option<primary::Primary>,
+    primary_failed: bool,
+    primary_error_extent: Option<[u32; 4]>,
+    last_raster: bool,
+    primary_source: Option<String>,
     core: Core,
     // Kept by the engine until device teardown; raw uses are not tracked by it.
     world: Option<Upload>,
@@ -877,7 +972,9 @@ pub struct Renderer {
     output: Option<Output>,
     submitted: bool,
     scene_upload_pending: bool,
-    timing_pending: Option<(bool, u64, u64)>,
+    timing_pending: Option<([u32; 4], bool, bool, u64, u64)>,
+    last_gpu: Option<([u32; 4], [f64; 3])>,
+    heap_usage: Option<u64>,
     last_timing: Option<Instant>,
     revision: Option<u64>,
     texture_len: usize,
@@ -899,6 +996,11 @@ impl Renderer {
             HOST,
         )?;
         Ok(Self {
+            primary: None,
+            primary_failed: false,
+            primary_error_extent: None,
+            last_raster: false,
+            primary_source: Some(source.to_owned()),
             core: Core::new(ctx, &spirv)?,
             world: None,
             moving: None,
@@ -915,6 +1017,8 @@ impl Renderer {
             submitted: false,
             scene_upload_pending: false,
             timing_pending: None,
+            last_gpu: None,
+            heap_usage: None,
             last_timing: None,
             revision: None,
             texture_len: 0,
@@ -924,6 +1028,15 @@ impl Renderer {
             as_builds: [0; 3],
             as_refits: [0; 3],
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn simulate_primary_allocation_failure(&mut self, extent: [u32; 4]) {
+        self.primary_error_extent = Some(extent);
+    }
+
+    pub(super) fn raster_active(&self) -> bool {
+        self.last_raster
     }
 
     pub(super) fn allocation_counts(&self) -> [u64; 3] {
@@ -1066,6 +1179,19 @@ impl Renderer {
         Ok(plan)
     }
 
+    pub(super) fn gpu_stages(&self) -> Option<([u32; 4], [f64; 3])> {
+        self.last_gpu
+    }
+
+    pub(super) fn memory_usage(&self) -> (u64, u64, Option<u64>) {
+        let b = &self.core.ctx.budget;
+        (b.held.load(Ordering::Relaxed), b.limit, self.heap_usage)
+    }
+
+    pub(super) fn same_moving_lighting(&self, moving: &Packet) -> bool {
+        super::scene::same_moving_lighting(&self.last_moving, &moving.words)
+    }
+
     pub(super) fn moving_unchanged(&self, moving: &Packet) -> bool {
         !self.scene_upload_pending && self.last_moving == moving.words
     }
@@ -1078,7 +1204,9 @@ impl Renderer {
                 .map_err(vkerr("poll ray frame"))?;
             self.submitted = !ready;
             if ready {
-                if let Some((built, moving_bytes, instance_bytes)) = self.timing_pending.take() {
+                if let Some((extent, built, raster, moving_bytes, instance_bytes)) =
+                    self.timing_pending.take()
+                {
                     let ctx = &self.core.ctx;
                     let mut ticks = [0u64; 4];
                     let result = unsafe {
@@ -1100,13 +1228,46 @@ impl Renderer {
                             )
                         };
                         let build = if built { duration(0) } else { 0. };
-                        let bytes = ctx.budget.held.load(Ordering::Relaxed);
-                        eprintln!("Lighter gpu stage Vulkan: build_ms={build:.3} traversal_ms={:.3} allocation_bytes={bytes} budget_bytes={} moving_copy_bytes={moving_bytes} instance_copy_bytes={instance_bytes}",duration(2),ctx.budget.limit);
+                        let primary = if raster { duration(1) } else { 0. };
+                        let trace = duration(2);
+                        self.last_gpu = Some((extent, [build, primary, trace]));
+                        if self.last_timing.is_none_or(|t| t.elapsed() >= INTERVAL) {
+                            self.heap_usage = ctx.heap_usage();
+                            let bytes = ctx.budget.held.load(Ordering::Relaxed);
+                            let heap = self
+                                .heap_usage
+                                .map_or(String::new(), |n| format!(" heap_usage_bytes={n}"));
+                            eprintln!("Lighter gpu stage Vulkan: build_ms={build:.3} primary_ms={primary:.3} traversal_ms={trace:.3} allocation_bytes={bytes} budget_bytes={} moving_copy_bytes={moving_bytes} instance_copy_bytes={instance_bytes}{heap}",ctx.budget.limit);
+                            self.last_timing = Some(Instant::now());
+                        }
                     }
                 }
             }
         }
         Ok(!self.submitted)
+    }
+
+    // Called during preflight, before swapchain acquisition. Both the raw
+    // Vulkan code and the optional raster sibling share the driver cache.
+    pub(super) fn prewarm_primary(&mut self) {
+        let Some(source) = self.primary_source.take() else {
+            return;
+        };
+        match primary::Primary::new(
+            &self.core.ctx,
+            self.core.layout,
+            self.core.cache.handle,
+            &source,
+        ) {
+            Ok(primary) => {
+                self.primary = Some(primary);
+                self.core.cache.save();
+            }
+            Err(error) => {
+                self.primary_failed = true;
+                eprintln!("Lighter primary raster unavailable; using full rays: {error}");
+            }
+        }
     }
 
     pub(super) fn try_prepare_image(&mut self, device: &wgpu::Device, size: u64) -> R<bool> {
@@ -1243,6 +1404,32 @@ impl Renderer {
         } else {
             None
         };
+        let requested = frame.options[0] & HYBRID_PRIMARY != 0;
+        let mut raster = None;
+        if let Some(primary) = &mut self.primary {
+            if requested && !self.primary_failed && self.primary_error_extent != Some(frame.extent)
+            {
+                match primary.prepare(
+                    frame,
+                    world,
+                    moving,
+                    revision,
+                    moving_changed || moving_keys_changed,
+                ) {
+                    Ok(view) => raster = Some((&*primary, view)),
+                    Err(error) => {
+                        self.primary_error_extent = Some(frame.extent);
+                        primary.inactive();
+                        eprintln!("Lighter primary raster unavailable; using full rays: {error}");
+                    }
+                }
+            } else {
+                primary.inactive();
+                if !requested {
+                    self.primary_error_extent = None;
+                }
+            }
+        }
         let ctx = &self.core.ctx;
         let d = &ctx.device;
         let cmd = self.core.commands;
@@ -1305,8 +1492,24 @@ impl Renderer {
             }
             self.bound_ids = Some(bound);
         }
-        let timing = self.core.query != vk::QueryPool::null()
-            && self.last_timing.is_none_or(|t| t.elapsed() >= INTERVAL);
+        if let Some((_, view)) = raster {
+            let info = vk::DescriptorImageInfo::builder()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .build();
+            unsafe {
+                d.update_descriptor_sets(
+                    &[vk::WriteDescriptorSet::builder()
+                        .dst_set(self.core.set)
+                        .dst_binding(6)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(std::slice::from_ref(&info))
+                        .build()],
+                    &[],
+                );
+            }
+        }
+        let timing = self.core.query != vk::QueryPool::null();
         let built = plan
             .as_ref()
             .is_some_and(|p| !p.blas.is_empty() || p.tlas.is_some());
@@ -1331,7 +1534,13 @@ impl Renderer {
                 cmd,
                 vk::PipelineStageFlags::TRANSFER,
                 vk::PipelineStageFlags::COMPUTE_SHADER
-                    | vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                    | vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
+                    | if raster.is_some() {
+                        vk::PipelineStageFlags::VERTEX_SHADER
+                            | vk::PipelineStageFlags::FRAGMENT_SHADER
+                    } else {
+                        vk::PipelineStageFlags::empty()
+                    },
                 vk::DependencyFlags::empty(),
                 &[vk::MemoryBarrier::builder()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -1343,7 +1552,7 @@ impl Renderer {
                 &[],
                 &[],
             );
-            let build_stage = vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR;
+            let build_stage = vk::PipelineStageFlags::BOTTOM_OF_PIPE;
             if timing {
                 d.cmd_write_timestamp(cmd, build_stage, self.core.query, 0);
             }
@@ -1358,6 +1567,9 @@ impl Renderer {
             if timing {
                 d.cmd_write_timestamp(cmd, build_stage, self.core.query, 1);
             }
+            if let Some((primary, _)) = raster {
+                primary.encode(cmd, self.core.layout, self.core.set, frame);
+            }
             // The previous wgpu denoiser or compositor may still read this
             // buffer. Both execute on this VkQueue, in submission order.
             d.cmd_pipeline_barrier(
@@ -1366,18 +1578,26 @@ impl Renderer {
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
-                &[],
+                &[vk::BufferMemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(output.raw.handle)
+                    .size(vk::WHOLE_SIZE)
+                    .build()],
                 &[],
             );
             if timing {
                 d.cmd_write_timestamp(
                     cmd,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     self.core.query,
                     2,
                 );
             }
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.core.pipeline);
+            let pipeline = raster.map_or(self.core.pipeline, |(primary, _)| primary.trace);
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             d.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
@@ -1395,7 +1615,7 @@ impl Renderer {
             if timing {
                 d.cmd_write_timestamp(
                     cmd,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     self.core.query,
                     3,
                 );
@@ -1414,17 +1634,23 @@ impl Renderer {
             );
         }
         self.core.submit()?;
+        self.last_raster = raster.is_some();
         self.submitted = true;
         self.scene_upload_pending = false;
         if timing {
-            self.last_timing = Some(Instant::now());
             let moving_bytes = if moving_changed { m.copied_bytes() } else { 0 };
             let instance_bytes = if plan.as_ref().is_some_and(|p| p.tlas.is_some()) {
                 self.instances.as_ref().unwrap().copied_bytes()
             } else {
                 0
             };
-            self.timing_pending = Some((built, moving_bytes, instance_bytes));
+            self.timing_pending = Some((
+                frame.extent,
+                built,
+                raster.is_some(),
+                moving_bytes,
+                instance_bytes,
+            ));
         }
         if moving_changed {
             self.last_moving.resize(moving.words.len(), 0);

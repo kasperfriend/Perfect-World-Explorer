@@ -9,6 +9,7 @@ pub(super) const SHADER: &str = include_str!("post.wgsl");
 const ANIM_WAVES: u32 = 32;
 const ANIM_SCROLL: u32 = 64;
 const ANIM_SKY: u32 = 128;
+pub(super) const ANIM_GEOMETRY: u32 = 256;
 
 pub(super) struct HistoryUse {
     pub(super) reuse: bool,
@@ -60,6 +61,7 @@ struct Stamp {
     waves: [u32; 4],
     water_art: [u32; 4],
     scroll: u32,
+    grass: [[f32; 4]; super::scene::GRASS_WIND_SLOTS],
     sky_anchor: [f32; 2],
 }
 
@@ -80,10 +82,10 @@ impl History {
         revision: u64,
         texture_len: usize,
         mode: Mode,
-        moving_unchanged: bool,
+        lighting_unchanged: bool,
     ) -> HistoryUse {
-        // A mover can change another pixel's shadow/reflection without
-        // moving it. Only reproject in the same lighting and scene snapshot.
+        // Geometry dependencies are tagged per pixel, including shadow and
+        // secondary hits. Do not reproject a changed light/decal snapshot.
         let mut stable = *frame;
         stable.vp = [[0.; 4]; 4];
         stable.inv_vp = [[0.; 4]; 4];
@@ -94,6 +96,7 @@ impl History {
         stable.air[3] = 0.;
         stable.sky_uv[..2].fill(0.);
         stable.sampling = [0; 4];
+        stable.grass_history.fill([0.; 4]);
         let vp = Mat4::from_cols_array_2d(&frame.vp);
         let inv_vp = Mat4::from_cols_array_2d(&frame.inv_vp);
         let eye = [frame.eye[0], frame.eye[1], frame.eye[2]];
@@ -114,11 +117,12 @@ impl History {
                 frame.shore_offsets[2].to_bits(),
             ],
             scroll: frame.air[3].to_bits(),
+            grass: frame.grass_history,
             sky_anchor: [frame.sky_uv[0], frame.sky_uv[1]],
         };
         let mut changed_animations = 0;
         let mut previous_from_current = None;
-        let reuse = moving_unchanged
+        let reuse = lighting_unchanged
             && self.previous.as_ref().is_some_and(|old| {
                 if old.revision != revision
                     || old.texture_len != texture_len
@@ -140,6 +144,9 @@ impl History {
                 stamp.camera_anchor = old.camera_anchor;
                 if old.waves != stamp.waves || old.water_art != stamp.water_art {
                     changed_animations |= ANIM_WAVES;
+                }
+                if old.grass != stamp.grass {
+                    changed_animations |= ANIM_GEOMETRY;
                 }
                 if old.scroll != stamp.scroll {
                     changed_animations |= ANIM_SCROLL;
@@ -175,13 +182,13 @@ impl History {
 pub(super) struct Post {
     layout: wgpu::BindGroupLayout,
     accumulate: wgpu::ComputePipeline,
-    denoise: wgpu::ComputePipeline,
+    atrous: [wgpu::ComputePipeline; 5],
     parameters: wgpu::Buffer,
     history: [Option<Storage>; 2],
     filtered: Option<Storage>,
     history_write: usize,
     accumulate_bind: Bindings<4, 2>,
-    denoise_bind: Bindings<4, 2>,
+    denoise_bind: Bindings<4, 4>,
     buffers_created: u64,
 }
 
@@ -227,7 +234,8 @@ impl Post {
             })
         };
         let accumulate = pipeline("Lighter progressive accumulation", "accumulate");
-        let denoise = pipeline("Lighter edge-aware denoiser", "denoise");
+        let atrous = ["filter_1", "filter_2", "filter_4", "filter_8", "filter_16"]
+            .map(|entry| pipeline("Lighter variance-guided à-trous", entry));
         let parameters = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Lighter radiance processing parameters"),
             size: std::mem::size_of::<Params>() as u64,
@@ -237,7 +245,7 @@ impl Post {
         Self {
             layout,
             accumulate,
-            denoise,
+            atrous,
             parameters,
             history: [None, None],
             filtered: None,
@@ -246,6 +254,22 @@ impl Post {
             denoise_bind: Bindings::default(),
             buffers_created: 1,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn last_history(&self) -> &wgpu::Buffer {
+        &self.history[self.history_write ^ 1].as_ref().unwrap().0
+    }
+
+    pub(super) fn allocation_bytes(&self) -> u64 {
+        self.parameters.size()
+            + self
+                .history
+                .iter()
+                .chain(std::iter::once(&self.filtered))
+                .filter_map(|s| s.as_ref())
+                .map(|s| s.0.size())
+                .sum::<u64>()
     }
 
     pub(super) fn allocation_counts(&self) -> (u64, u64) {
@@ -265,6 +289,7 @@ impl Post {
         extent: [u32; 4],
         history: Option<HistoryUse>,
         denoise: bool,
+        timed: Option<&super::profile::Timings>,
     ) -> &'a wgpu::Buffer {
         let needed = u64::from(extent[0]) * u64::from(extent[1]) * PIXEL_BYTES;
         let allocate = |slot: &mut Option<Storage>, label: &'static str| {
@@ -298,6 +323,9 @@ impl Post {
                 u64::from(allocate(&mut self.filtered, "Lighter filtered image"));
         }
         if !denoise && !progress {
+            if let Some(t) = timed {
+                t.stamp(encoder, 2);
+            }
             return raw;
         }
         let mut params = Params {
@@ -344,17 +372,28 @@ impl Post {
             dispatch(encoder, label, &self.accumulate, bind);
             image = next;
         }
+        if let Some(t) = timed {
+            t.stamp(encoder, 2);
+        }
         if denoise {
             let filtered = &self.filtered.as_ref().unwrap().0;
-            let label = "Lighter filter radiance";
-            let bind = self.denoise_bind.get(
-                device,
-                label,
-                &self.layout,
-                [&self.parameters, image, filtered, image],
-            );
-            dispatch(encoder, label, &self.denoise, bind);
-            image = filtered;
+            // Transport output is dead after the first filter dispatch. Ping
+            // pong it with one scratch allocation, never touch next history.
+            let label = "Lighter à-trous radiance";
+            // A fresh image cannot use the wide variance passes. Avoid
+            // dispatching three full-image copies on nonprogressive frames.
+            let stages = if params.history[0] != 0 { 5 } else { 2 };
+            for (step, pipeline) in self.atrous[..stages].iter().enumerate() {
+                let next = if step % 2 == 0 { filtered } else { raw };
+                let bind = self.denoise_bind.get(
+                    device,
+                    label,
+                    &self.layout,
+                    [&self.parameters, image, next, image],
+                );
+                dispatch(encoder, label, pipeline, bind);
+                image = next;
+            }
         }
         image
     }

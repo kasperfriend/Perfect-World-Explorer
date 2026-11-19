@@ -111,7 +111,7 @@ fn wet_distance(ray: Ray, distance: f32, id: u32) -> f32 {
 }
 fn water_tr(distance: f32) -> vec3<f32> {
     let fog = frame.water;
-    if fog.z<0.5 { return vec3<f32>(1.); }
+    if fog.z<0.5 || distance<=0. { return vec3<f32>(1.); }
     // Map authored range/hue to RGB extinction: 5% left after one span in
     // the clearest channel. The normalized RGB hue biases the other channels.
     let hue = frame.water_color.rgb;

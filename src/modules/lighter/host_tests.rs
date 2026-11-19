@@ -1691,3 +1691,82 @@ fn ray_stream_anchor_crosses_blocks_even_when_terrain_lods_are_clamped() {
     assert_ne!(anchor(-900.), anchor(-1000.));
     assert_eq!(anchor(-900.), anchor(-901.));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "benchmark: requires lavapipe with KHR_ray_query and saves matched headless paths"]
+fn lighter_matched_fixture_capture() {
+    let root = FixtureRoot::new();
+    let save = std::env::var_os("PW_SAVE_LIGHTER_MATCHED")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.0.clone());
+    std::fs::create_dir_all(&save).unwrap();
+    let mut adapter_name = None;
+    for (name, mode, raster) in [
+        ("native", Mode::Off, false),
+        ("software", Mode::Software, false),
+        ("full-ray", Mode::Hardware, false),
+        ("hybrid", Mode::Hardware, true),
+    ] {
+        let path = save.join(format!("{name}.png"));
+        super::super::preview_frame_using(
+            fixture(&root.0),
+            &path,
+            Some([-2.5, 5., 0., 0., -std::f32::consts::FRAC_PI_4]),
+            mode,
+            Some(4),
+            |mut settings| {
+                settings.hybrid_primary = raster;
+                let context = if mode != Mode::Hardware {
+                    super::super::preview_device(settings)?
+                } else {
+                    // Test only. Never offer Hardware mode to a CPU adapter
+                    // in the viewer or the production preview CLI.
+                    let instance = super::super::make_instance(mode);
+                    let adapter = pollster::block_on(
+                        instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+                    )
+                    .ok_or("missing CPU Vulkan adapter")?;
+                    let info = adapter.get_info();
+                    assert_eq!(info.device_type, wgpu::DeviceType::Cpu);
+                    let available = adapter.features();
+                    let mut limits =
+                        wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
+                    limits.max_buffer_size = adapter.limits().max_buffer_size.min(512 << 20);
+                    limits.max_storage_buffer_binding_size = adapter
+                        .limits()
+                        .max_storage_buffer_binding_size
+                        .min(256 << 20);
+                    let features = Lighter::CPU_QUERY_TEST_FEATURES
+                        | (available
+                            & (wgpu::Features::TIMESTAMP_QUERY
+                                | wgpu::Features::TEXTURE_COMPRESSION_BC
+                                | wgpu::Features::MULTI_DRAW_INDIRECT
+                                | wgpu::Features::INDIRECT_FIRST_INSTANCE));
+                    let (device, queue) = pollster::block_on(adapter.request_device(
+                        &wgpu::DeviceDescriptor {
+                            label: None,
+                            required_features: features,
+                            required_limits: limits,
+                        },
+                        None,
+                    ))
+                    .map_err(|e| e.to_string())?;
+                    let lighter = Lighter::new(settings, &adapter, &device)
+                        .for_cpu_query_test(&adapter, &device);
+                    (info, device, queue, lighter)
+                };
+                assert_eq!(context.0.device_type, wgpu::DeviceType::Cpu);
+                if let Some(info) = &adapter_name {
+                    assert_eq!(info, &context.0);
+                } else {
+                    adapter_name = Some(context.0.clone());
+                }
+                eprintln!("Lighter matched capture: {name}, {:?}", context.0);
+                Ok(context)
+            },
+        )
+        .unwrap();
+        assert_world_png(&path, (960, 720));
+    }
+}

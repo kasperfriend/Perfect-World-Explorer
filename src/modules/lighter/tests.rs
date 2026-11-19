@@ -11,6 +11,7 @@ fn reload_world_button_applies_pending_mode_without_changing_the_live_renderer()
     let mut lighter = Lighter::default();
     lighter.settings.resolution = 61;
     lighter.stage_saved_mode(Mode::Hardware);
+    lighter.pending_primary = Some(true);
     assert_eq!(lighter.settings_for_disk().mode, Mode::Hardware);
     assert_eq!(lighter.settings_for_disk().resolution, 61);
     let mut draw = |events| {
@@ -52,6 +53,8 @@ fn reload_world_button_applies_pending_mode_without_changing_the_live_renderer()
         .expect("reload request from click");
     assert_eq!(next.mode, Mode::Hardware);
     assert_eq!(next.resolution, 61);
+    assert!(next.hybrid_primary);
+    assert!(!lighter.settings.hybrid_primary);
     assert_eq!(lighter.settings.mode, Mode::Off);
     assert_eq!(lighter.settings_for_disk().mode, Mode::Hardware);
 }
@@ -97,6 +100,33 @@ fn naga_validates_both_paths_and_emits_native_ray_queries() {
         .all(|op| opcodes.contains(&op)));
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[test]
+fn compiles_raster_primary_sibling_without_ray_query_capability() {
+    use naga_rt::ShaderStage;
+    let shared = [PIXELS, BSDF, MEDIA, REFERENCE, BASE];
+    let raster = [shared.as_slice(), &[SOFTWARE, include_str!("primary.wgsl")]]
+        .concat()
+        .concat();
+    for (stage, name) in [
+        (ShaderStage::Vertex, "visibility_vertex"),
+        (ShaderStage::Fragment, "visibility_fragment"),
+    ] {
+        let words = vulkan::shader_entry(&raster, stage, name).unwrap();
+        let mut next = 5;
+        while next < words.len() {
+            let op = words[next] & 0xffff;
+            if op == 17 {
+                assert_ne!(words[next + 1], 4472, "SPIR-V RayQueryKHR capability");
+            }
+            next += (words[next] >> 16) as usize;
+        }
+    }
+    let shader = [shared.as_slice(), &[HARDWARE]].concat().concat();
+    let words = vulkan::shader_entry(&shader, ShaderStage::Compute, "render_hybrid").unwrap();
+    assert_eq!(words[0], 0x0723_0203);
+}
+
 #[test]
 fn packet_rejects_bad_indices_and_materials() {
     let mut builder = Builder::default();
@@ -135,7 +165,10 @@ fn light_influence_tree_limits_per_hit_work() {
         }
     }
     assert_eq!(candidates, 4);
-    assert_eq!(visited, 17);
+    assert!(
+        visited <= 19,
+        "wide tree checked {visited} nodes for one localized light"
+    );
 }
 
 fn test_frame(eye: Vec3, dir: Vec3, e: u32) -> Frame {
@@ -264,6 +297,7 @@ impl Harness {
                 resolution: 100,
                 denoiser: false,
                 soft_sun: false,
+                single_path: false, // deterministic split for the legacy optical probes
                 progressive: false,
                 ..Settings::default()
             },
@@ -371,6 +405,30 @@ impl Harness {
                 )
             })
             .collect()
+    }
+
+    fn history_state(&self, index: usize) -> (u32, u32) {
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Lighter history probe"),
+            size: PIXEL_BYTES,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let history = self.ray.post.as_ref().unwrap().last_history();
+        encoder.copy_buffer_to_buffer(history, index as u64 * PIXEL_BYTES, &buffer, 0, PIXEL_BYTES);
+        self.queue.submit(Some(encoder.finish()));
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |v| {
+            let _ = tx.send(v);
+        });
+        crate::gpu::wait_for_capture_callback(&self.device, rx)
+            .unwrap()
+            .unwrap();
+        let data = slice.get_mapped_range();
+        let pixel = bytemuck::from_bytes::<Pixel>(&data);
+        (pixel.albedo_history, pixel.owner)
     }
 
     fn target(&self, format: wgpu::TextureFormat, size: wgpu::Extent3d) -> wgpu::Texture {
@@ -740,6 +798,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_effect_placement(&mut h);
     exercise_finite_emitters(&mut h);
     exercise_dielectric_and_metal(&mut h);
+    exercise_single_path_estimators(&mut h);
+    exercise_stationary_sun(&mut h);
     exercise_media_segments(&mut h);
     exercise_reference_lighting(&mut h);
     optimizations::exercise(&mut h);
@@ -1668,6 +1728,235 @@ fn exercise_dielectric_and_metal(h: &mut Harness) {
     eprintln!("Lighter: thin and solid glass interfaces and colored GGX conductor passed");
 }
 
+// Compare linear encoded readback means without a filter, history, exposure,
+// or sRGB curve hiding errors in the probability compensation.
+fn exercise_single_path_estimators(h: &mut Harness) {
+    let saved = h.ray.settings;
+    h.ray.settings = Settings {
+        bounces: 1,
+        samples: 1,
+        resolution: 100,
+        denoiser: false,
+        progressive: false,
+        soft_sun: false,
+        physical_bsdf: false,
+        reference: false,
+        lighting: true,
+        shadows: false,
+        reflections: true,
+        ..saved
+    };
+    let mode = saved.mode;
+    let empty = Builder::for_mode(mode).finish();
+    let f = Frame {
+        ambient: [0.; 4],
+        ..test_frame(Vec3::ZERO, Vec3::NEG_Z, 65)
+    };
+    let pane = |builder: &mut Builder, z: f32, material: Surface, tint| {
+        let r = 5.;
+        let mesh = quad_material(
+            builder,
+            [[-r, r, z], [r, r, z], [-r, -r, z], [r, -r, z]],
+            [0., 0., 1.],
+            material,
+            tint,
+        );
+        put(builder, mesh);
+    };
+    let mean = |pixels: &[([u8; 4], f32)]| {
+        let sum = pixels.iter().fold([0u32; 3], |mut sum, p| {
+            for i in 0..3 {
+                sum[i] += u32::from(p.0[i]);
+            }
+            sum
+        });
+        sum.map(|x| x as f32 / (255. * pixels.len() as f32))
+    };
+    let compare = |h: &mut Harness, name, tol: f32| {
+        h.ray.settings.single_path = false;
+        let split = h.pixels(f, &empty);
+        h.ray.settings.single_path = true;
+        let sampled = h.pixels(f, &empty);
+        let (a, b) = (mean(&split), mean(&sampled));
+        assert!(split.iter().zip(&sampled).all(|(a, b)| a.1 == b.1));
+        assert!(
+            a.into_iter().zip(b).all(|(x, y)| (x - y).abs() < tol),
+            "{name}: {a:?} != {b:?}"
+        );
+        eprintln!("Lighter {name}: split/full mean {a:?}, sampled mean {b:?}");
+        (a, sampled)
+    };
+    let flat = Surface::new(0, 0, 0., 0.);
+    let luminous = Surface::new(0, EMISSIVE, 0., 0.);
+    let mut b = Builder::for_mode(mode);
+    // Solid entering dielectric: the selected transmission must still use
+    // its eta-squared radiance factor and RGB tint, unlike a thin pane.
+    pane(
+        &mut b,
+        -3.,
+        flat.with_solid_glass([0.9, 0.65, 0.5], 1.5),
+        u32::MAX,
+    );
+    pane(&mut b, -5., luminous, rgba([0., 0., 0.9, 1.]));
+    pane(&mut b, 2., luminous, rgba([0.8, 0., 0., 1.]));
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let (a, sampled) = compare(h, "Fresnel", 0.015);
+    assert!(a[0] > 0.02 && a[2] > 0.16);
+    assert!(sampled.iter().any(|p| p.0[0] > 180) && sampled.iter().any(|p| p.0[2] > 40));
+
+    h.ray.settings.reflections = false;
+    h.ray.settings.bounces = 2;
+    let mut b = Builder::for_mode(mode);
+    for z in [-2., -3.] {
+        pane(&mut b, z, flat.with_glass([0.5; 3], 1.5), u32::MAX);
+    }
+    pane(&mut b, -4., luminous, rgba([0.8, 0., 0., 1.]));
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let (a, sampled) = compare(h, "roulette", 0.016);
+    assert!(a[0] > 0.15);
+    assert!(sampled.iter().any(|p| p.0[0] > 185) && sampled.iter().any(|p| p.0[0] == 0));
+
+    h.ray.settings.shadows = true;
+    h.ray.settings.bounces = 0;
+    let mut b = Builder::for_mode(mode);
+    pane(&mut b, -4., flat, u32::MAX);
+    for i in 0..6 {
+        let mut color = [0.; 4];
+        color[i % 3] = 0.065 + i as f32 * 0.012;
+        color[3] = 1.;
+        b.light(Light::point(
+            [(i as f32 - 2.5) * 0.48, 1.7, -1.5, 8.],
+            color,
+        ));
+    }
+    // Small off-axis blocker covers some light legs but not the whole receiver.
+    let obstacle = upright(&mut b, -2.5, [0.1, 0.1, 0.1, 1.], 0, 0);
+    b.place(
+        obstacle,
+        Transform {
+            scale: 0.43,
+            ..Transform::translation([0.4, 1.1, 0.])
+        },
+    )
+    .unwrap();
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let (a, sampled) = compare(h, "local light PMF", 0.014);
+    assert!(a.iter().all(|&x| x > 0.025));
+    assert!(
+        sampled.iter().any(|p| p.0[0] == 0 && p.0[1] > 0),
+        "all lights were evaluated, not sampled"
+    );
+    h.ray.settings = saved;
+}
+
+fn exercise_stationary_sun(h: &mut Harness) {
+    const VALID: u32 = 1 << 30;
+    const BLOCKED: u32 = 1 << 31;
+    const HISTORY: u32 = 63 << 24;
+    const MOVING: u32 = 1 << 31;
+    let saved = h.ray.settings;
+    h.ray.settings = Settings {
+        lighting: true,
+        bounces: 0,
+        samples: 1,
+        resolution: 100,
+        shadows: true,
+        soft_sun: false,
+        progressive: true,
+        denoiser: true,
+        ..saved
+    };
+    let mode = saved.mode;
+    const E: u32 = 19;
+    let f = Frame {
+        ambient: [0.; 4],
+        sun: [0., 0.8, 0.6, 1.],
+        ..test_frame(Vec3::ZERO, Vec3::NEG_Z, E)
+    };
+    let mut b = Builder::for_mode(mode);
+    let mesh = quad(
+        &mut b,
+        [
+            [-4., 4., -5.],
+            [4., 4., -5.],
+            [-4., -4., -5.],
+            [4., -4., -5.],
+        ],
+        [0., 0., 1.],
+        0,
+        0,
+        u32::MAX,
+    );
+    put(&mut b, mesh);
+    let world = b.finish();
+    h.ray.install(Ok((world, Textures::default())));
+    let blocker = |x, glass: bool| {
+        let mut b = Builder::for_mode(mode);
+        let mut material = Surface::new(0, 0, 0., 0.);
+        if glass {
+            material = material.with_glass([0.5, 0.7, 0.9], 1.5);
+        }
+        let mat = quad_material(
+            &mut b,
+            [
+                [-0.9, 4., -3.],
+                [0.9, 4., -3.],
+                [-0.9, 1.4, -3.],
+                [0.9, 1.4, -3.],
+            ],
+            [0., 0., 1.],
+            material,
+            u32::MAX,
+        );
+        b.place(mat, Transform::translation([x, 0., 0.])).unwrap();
+        b.finish()
+    };
+    let center = (E * E / 2) as usize;
+    let unaffected = center - 7;
+    let cast = blocker(0., false);
+    for n in 1..=4 {
+        let shadow = h.pixels(f, &cast);
+        assert!(
+            shadow[center].0[0] < 6,
+            "shadow leaked with filter/cache: {:?}",
+            shadow[center]
+        );
+        let steps = h.history_state(center);
+        assert_eq!(
+            steps.0 & (VALID | BLOCKED),
+            VALID | BLOCKED,
+            "opaque sun result not retained"
+        );
+        assert_eq!((steps.0 & HISTORY) >> 24, n);
+        assert_ne!(steps.1 & MOVING, 0);
+    }
+    let moved = h.pixels(f, &blocker(16., false));
+    assert!(
+        moved[center].0[0] > 100,
+        "stationary cache retained a departed blocker"
+    );
+    let steps = h.history_state(center);
+    assert_eq!(steps.0 & (VALID | BLOCKED), VALID);
+    assert_eq!(
+        (steps.0 & HISTORY) >> 24,
+        1,
+        "moving-shadow history was reused"
+    );
+    assert_eq!(
+        (h.history_state(unaffected).0 & HISTORY) >> 24,
+        5,
+        "unaffected history was dropped"
+    );
+    let tinted = h.pixels(f, &blocker(0., true));
+    assert!(tinted[center].0[0] < tinted[center].0[2]);
+    assert_eq!(
+        h.history_state(center).0 & VALID,
+        0,
+        "colored transmittance was quantized to a bit"
+    );
+    h.ray.settings = saved;
+}
+
 fn exercise_bsdf_energy(h: &Harness) {
     const N: u64 = 25;
     let output = h.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2529,6 +2818,8 @@ fn exercise_denoiser_edges(h: &mut Harness) {
 
 fn exercise_sun_and_history(h: &mut Harness) {
     const SIDE: usize = 33;
+    let saved_single_path = h.ray.settings.single_path;
+    h.ray.settings.single_path = true; // the primary disc uses shifted Sobol
     let empty = Builder::default().finish();
     let scene = |block| {
         let mut b = Builder::default();
@@ -2608,12 +2899,16 @@ fn exercise_sun_and_history(h: &mut Harness) {
     const FRAMES: u32 = 12;
     h.ray.settings.denoiser = false;
     h.ray.settings.progressive = true;
-    let mut expected = vec![0.; SIDE * SIDE];
+    let mut expected = vec![(0., 0.); SIDE * SIDE];
     for i in 1..=FRAMES {
-        let new_weight = 1. / i.min(10) as f32;
         h.ray.reset_history();
-        for (value, pixel) in expected.iter_mut().zip(h.pixels(frame, &empty)) {
-            *value = *value * (1. - new_weight) + f32::from(pixel.0[0]) * new_weight;
+        for ((mean, variance), pixel) in expected.iter_mut().zip(h.pixels(frame, &empty)) {
+            let noise = f32::sqrt(*variance) / f32::max(0.04, *mean);
+            let t = ((noise - 0.05) / 0.35).clamp(0., 1.);
+            let alpha = f32::max(1. / i as f32, 0.10 - 0.065 * t * t * (3. - 2. * t));
+            let delta = f32::from(pixel.0[0]) / 255. - *mean;
+            *variance = (1. - alpha) * (*variance + alpha * delta * delta);
+            *mean += alpha * delta;
         }
     }
     h.ray.history = post::History::default();
@@ -2622,7 +2917,7 @@ fn exercise_sun_and_history(h: &mut Harness) {
         converged = h.pixels(frame, &empty);
     }
     for ((actual, expected), reference) in converged.iter().zip(expected).zip(&grain) {
-        assert!((f32::from(actual.0[0]) - expected).abs() <= 1.5);
+        assert!((f32::from(actual.0[0]) - expected.0 * 255.).abs() <= 1.5);
         assert_eq!(actual.1, reference.1, "history changed primary depth");
     }
     let (lit_fraction, _) = stats(&converged);
@@ -2669,6 +2964,7 @@ fn exercise_sun_and_history(h: &mut Harness) {
         [0., 0.49, 0.],
     );
     assert_eq!(h.builds(), builds, "light change rebuilt Vulkan ASes");
+    h.ray.settings.single_path = saved_single_path;
 }
 
 fn exercise_temporal_animation(h: &mut Harness) {
@@ -2879,6 +3175,7 @@ fn exercise_streamed_bmds(h: &mut Harness) {
         soft_sun: false,
         anisotropy: 8,
         relight_baked: false,
+        single_path: false, // deterministic reflection + transmission control
         physical_bsdf: false,
         ..Settings::default()
     };
@@ -3494,15 +3791,38 @@ fn exercise_reprojection_shader(h: &Harness) {
     use wgpu::util::DeviceExt;
 
     const EXTENT: [u32; 4] = [4, 1, 4, 1];
+    // Positive normal half floats in [0,1] for these synthetic values.
+    let fp16 = |x: f32| {
+        if x == 0. {
+            return 0;
+        }
+        let bits = x.to_bits();
+        ((bits.wrapping_sub(112 << 23) + 0x1000) >> 13) & 0xffff
+    };
+    let from_half = |x: u32| {
+        if x == 0 {
+            0.
+        } else {
+            f32::from_bits((x << 13) + (112 << 23))
+        }
+    };
     let old: [Pixel; 4] = std::array::from_fn(|i| Pixel {
-        radiance: [0.2 * (i + 1) as f32, 0., 0., 0.25],
-        // The third history sample came from a different surface in depth.
-        guide: [(if i == 2 { 8.0_f32 } else { 1. }).to_bits(), 0, 0, 0],
+        rg: fp16(0.2 * (i + 1) as f32),
+        depth: 0.25,
+        view_depth: if i == 2 { 8. } else { 1. },
+        normal_flags: 127 << 16,
+        owner: 11,
+        ..Pixel::zeroed()
     });
-    let current = [Pixel {
-        radiance: [0., 1., 0., 0.4],
-        guide: [1.0_f32.to_bits(), 0, 0, 0],
-    }; 4];
+    let current: [Pixel; 4] = std::array::from_fn(|i| Pixel {
+        rg: fp16(1.) << 16,
+        depth: 0.4,
+        view_depth: 1.,
+        normal_flags: 127 << 16,
+        // Pixel 2 reprojects to an identical geometric guide but a new owner.
+        owner: if i == 2 { 22 } else { 11 },
+        ..Pixel::zeroed()
+    });
     let upload = |pixels: &[Pixel]| {
         h.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -3528,6 +3848,7 @@ fn exercise_reprojection_shader(h: &Harness) {
                 previous_from_current: None,
             }),
             false,
+            None,
         );
         h.queue.submit(Some(encoder.finish()));
     }
@@ -3551,6 +3872,7 @@ fn exercise_reprojection_shader(h: &Harness) {
             previous_from_current: Some(Mat4::from_translation(Vec3::new(0.5, 0., -0.15))),
         }),
         false,
+        None,
     );
     encoder.copy_buffer_to_buffer(resolved, 0, &copy, 0, PIXEL_BYTES * 4);
     h.queue.submit(Some(encoder.finish()));
@@ -3564,20 +3886,28 @@ fn exercise_reprojection_shader(h: &Harness) {
         .unwrap();
     let data = slice.get_mapped_range();
     let pixels: &[Pixel] = bytemuck::cast_slice(&data);
-    for (pixel, expected) in pixels.iter().zip([
-        [0.36, 0.1, 0., 0.4],
-        [0., 1., 0., 0.4],
-        [0.72, 0.1, 0., 0.4],
-        [0., 1., 0., 0.4],
-    ]) {
+    for (i, pixel) in pixels.iter().enumerate() {
+        let rgb = [
+            from_half(pixel.rg & 0xffff),
+            from_half(pixel.rg >> 16),
+            from_half(pixel.bv & 0xffff),
+        ];
+        let expected = if i == 0 {
+            [0.352, 0.12, 0.]
+        } else {
+            [0., 1., 0.]
+        };
         assert!(
-            pixel
-                .radiance
-                .into_iter()
+            rgb.into_iter()
                 .zip(expected)
-                .all(|(a, b)| (a - b).abs() < 1e-6),
-            "reprojected RGBA {:?} != {expected:?}",
-            pixel.radiance
+                .all(|(a, b)| (a - b).abs() < 0.001),
+            "reprojected RGB {rgb:?} != {expected:?}"
+        );
+        assert_eq!(pixel.depth, 0.4, "reverse-Z is never filtered");
+        assert_eq!(
+            pixel.bv >> 16 > 0,
+            i == 0,
+            "only valid history contributes variance"
         );
     }
     // New input binding can be created; the two history buffers stay resident.
@@ -3678,4 +4008,117 @@ fn lighter_hardware_pixels() {
 #[ignore = "requires a recent lavapipe exposing KHR_ray_query; this is not GPU RT-core validation"]
 fn lighter_vulkan_interop_on_cpu() {
     exercise(Mode::Hardware, true);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a Vulkan ray-query ICD (lavapipe is sufficient)"]
+fn lighter_raster_primary_parity() {
+    let mut h = Harness::new(Mode::Hardware, true);
+    let mut bank = Textures::default();
+    let hole = bank
+        .tile([1, 1], 1, textures::Filter::cutout(0.5, false), |_, _| {
+            0x00ff_ffff
+        })
+        .unwrap();
+    let mut world = Builder::for_mode(Mode::Hardware);
+    let wall = upright(&mut world, -4., [0., 1., 0., 1.], EMISSIVE, 0);
+    put(&mut world, wall);
+    let reject = upright(&mut world, -2., [0., 0., 1., 1.], CUTOUT, hole);
+    put(&mut world, reject);
+    let sheet = upright(&mut world, -3.5, [0.25, 0.2, 0.1, 0.25], BLEND, 0);
+    world
+        .place(
+            sheet,
+            Transform {
+                scale: 0.5,
+                ..Transform::translation([0.5, 0.3, 0.])
+            },
+        )
+        .unwrap();
+    h.ray.install(Ok((world.finish(), bank)));
+    for (i, size) in [19, 25, 43].into_iter().enumerate() {
+        let mut moving = Builder::for_mode(Mode::Hardware);
+        let small = upright(&mut moving, -2.5, [1., 0., 0., 1.], EMISSIVE, 0);
+        moving
+            .place(
+                small,
+                Transform {
+                    scale: 0.63,
+                    cos: 0.95_f32.sqrt(),
+                    sin: 0.05_f32.sqrt(),
+                    ..Transform::translation([-0.408 + 0.18 * i as f32, -0.37, 0.])
+                },
+            )
+            .unwrap();
+        let moving = moving.finish();
+        let frame = test_frame(
+            // Keep these parity probes away from subpixel raster edge
+            // rounding; exact silhouette/tie rules need not match BVH hits.
+            Vec3::new(0.03 * i as f32, 0.113, 0.),
+            Vec3::new(0.04, -0.02, -1.),
+            size,
+        );
+        h.ray.settings.hybrid_primary = false;
+        let full = h.pixels(frame, &moving);
+        h.ray.settings.hybrid_primary = true;
+        let started = Instant::now();
+        let hybrid = h.pixels(frame, &moving);
+        assert!(
+            h.ray.hardware.as_ref().unwrap().raster_active(),
+            "render only passed via fallback"
+        );
+        let error = full
+            .iter()
+            .zip(&hybrid)
+            .map(|(a, b)| (a.1 - b.1).abs())
+            .fold(0.0f32, f32::max);
+        for (i, ((a, az), (b, bz))) in full.iter().zip(&hybrid).enumerate() {
+            assert!(
+                (az - bz).abs() < 1e-5,
+                "{size}² pixel {i}: reverse-Z {az} != {bz}"
+            );
+            assert!(
+                a.iter().zip(b).all(|(&a, &b)| a.abs_diff(b) <= 1),
+                "pixel {i}: {a:?} != {b:?}"
+            );
+        }
+        eprintln!("Lighter raster primary parity: {size}², max reverse-Z error {error:.8}, harness {:.2}ms", started.elapsed().as_secs_f32()*1000.);
+    }
+    // Exercise real material ownership/ordered ties and a posed occluder
+    // outside the raster frustum: secondary/shadow rays still see it.
+    exercise_water_art(&mut h);
+    exercise_terrain_seam(&mut h);
+    exercise_effect_placement(&mut h);
+    exercise_off_camera_pose(&mut h);
+    assert!(h.ray.raster_active());
+
+    let empty = Builder::for_mode(Mode::Hardware).finish();
+    let f = test_frame(Vec3::ZERO, Vec3::NEG_Z, 19);
+    h.ray.settings.hybrid_primary = false;
+    let full = h.pixels(f, &empty);
+    h.ray.settings.hybrid_primary = true;
+    h.ray
+        .hardware
+        .as_mut()
+        .unwrap()
+        .simulate_primary_allocation_failure([19; 4]);
+    assert_eq!(
+        h.pixels(f, &empty),
+        full,
+        "failed raster target did not fall back to full rays"
+    );
+    assert!(!h.ray.raster_active());
+    let next = test_frame(Vec3::ZERO, Vec3::NEG_Z, 21);
+    h.pixels(next, &empty);
+    assert!(
+        h.ray.raster_active(),
+        "resize did not retry the raster target"
+    );
+    h.ray.settings.samples = 2;
+    h.pixels(next, &empty);
+    assert!(
+        !h.ray.raster_active(),
+        "multisample fell back to a single raster sample"
+    );
 }

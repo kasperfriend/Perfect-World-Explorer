@@ -49,16 +49,18 @@ def metadata(path):
     return fields
 
 
-def validate_match(baseline, candidate):
+def validate_match(baseline, candidate, *, compare_primary=False):
     for key in MATCH_KEYS:
         if baseline.get(key) is None or baseline[key] != candidate.get(key):
             raise ValueError(f"unmatched {key}: {baseline.get(key)!r} vs {candidate.get(key)!r}")
-    # Native has no ray settings. Software and Hardware must use exactly the
-    # same effective transport parameters, including ray resolution.
+    # Native has no ray settings. All ray variants use exactly the same
+    # transport, except for the explicitly requested primary-visibility A/B.
     if "Off" not in (baseline["mode"], candidate["mode"]):
         a, b = (re.sub(r"mode: \w+, ", "", m["settings_effective"], count=1) for m in (baseline, candidate))
+        if compare_primary:
+            a, b = (re.sub(r"hybrid_primary: (?:true|false), ", "", s, count=1) for s in (a, b))
         if a != b:
-            raise ValueError("Software and Hardware have different effective settings")
+            raise ValueError("ray modes have different effective settings")
 
 
 def regions_for(size, custom=None):
@@ -154,14 +156,33 @@ def gpu_stage_samples(path):
     return samples
 
 
+STAGES = ("build", "primary", "traversal", "reproject", "filter", "upscale")
+
+
+def completed_stages(meta, count):
+    # Optional measurements paired with the synchronized timed draws, not
+    # the periodic stage samples printed independently of capture wall time.
+    values = json.loads(meta.get("gpu_timed_ms", "[]"))
+    if not values:
+        return None
+    if (json.loads(meta["gpu_timed_stages"]) != ",".join(STAGES) or len(values) > count
+            or any(len(row) != len(STAGES) or any(not math.isfinite(t) or t < 0 for t in row) for row in values)):
+        raise ValueError("invalid completed GPU stage samples")
+    return {"stages": STAGES, "samples": values,
+            "p50": dict(zip(STAGES, map(statistics.median, zip(*values, strict=True)), strict=True))}
+
+
 def run_case(case, args):
     name = case["id"]
     if not re.fullmatch(r"[a-z0-9-]+", name):
         raise ValueError(f"unsafe case ID {name!r}")
     profile = args.profile
     mode_results, images = {}, {}
-    for mode in PROFILES[profile]:
-        stem = args.output / f"{name}-{mode}"
+    variants = PROFILES[profile] + (("hybrid",) if args.hybrid_ab else ())
+    for variant in variants:
+        raster = variant == "hybrid"
+        mode = "hardware" if raster else variant
+        stem = args.output / f"{name}-{variant}"
         hour, weather = CONDITIONS[case["condition"]]
         env = {k: v for k, v in os.environ.items() if not k.startswith("PW_PREVIEW_")}
         env.pop("PW_TEST_NO_LIGHTMAPS", None)
@@ -169,6 +190,8 @@ def run_case(case, args):
                    PW_PREVIEW_RAY_RESOLUTION=str(args.ray_resolution), PW_PREVIEW_ANISOTROPY="8",
                    PW_PREVIEW_HOUR=str(hour), PW_PREVIEW_WEATHER=weather, PW_PREVIEW_WARMUP=str(case["warmup"]),
                    PW_PREVIEW_TIMED_FRAMES=str(args.timed_frames))
+        if raster:
+            env["PW_PREVIEW_HYBRID_PRIMARY"] = "1"
         if not case["lightmaps"]:
             env["PW_TEST_NO_LIGHTMAPS"] = "1"
         cmd = [str(args.viewer.resolve()), str(args.client.resolve()), "--world", case["map"]]
@@ -178,7 +201,7 @@ def run_case(case, args):
             cmd += ["--gpu-preview"]
         cmd.append(str(stem.with_suffix(".png").resolve()))
         path = stem.with_suffix(".log")
-        print(f"{name}: {mode}", flush=True)
+        print(f"{name}: {variant}", flush=True)
         try:
             with path.open("wb") as log:
                 proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=args.timeout)
@@ -187,7 +210,9 @@ def run_case(case, args):
         except (RuntimeError, subprocess.TimeoutExpired) as error:
             tail = "\n".join(path.read_text(errors="replace").splitlines()[-12:])
             raise RuntimeError(f"{stem.name}: {error}\n{tail}") from error
-        meta, images[mode] = capture_metadata(stem, mode, case, profile)
+        meta, images[variant] = capture_metadata(stem, mode, case, profile)
+        if meta.get("raster_primary", "false") != str(raster).lower():
+            raise ValueError(f"{stem.name}: requested and recorded primary path differ")
         rows = inventory_for(stem, case) if mode != "off" else None
         timings = json.loads(meta.get("synchronized_capture_ms", "[]"))
         if len(timings) != args.timed_frames or any(not math.isfinite(t) or t < 0 for t in timings):
@@ -197,16 +222,17 @@ def run_case(case, args):
             "p50": statistics.median(timings),
             "p95": sorted(timings)[math.ceil(0.95 * len(timings)) - 1],
         }
-        mode_results[mode] = {
+        mode_results[variant] = {
             "files": stem.name,
             "meta": meta,
             "inventory": rows,
             "synchronized_capture_ms": durations,
+            "gpu_completed_stage_ms": completed_stages(meta, len(timings)),
             "gpu_stage_samples": gpu_stage_samples(path),
         }
     comparisons = {}
-    for first, second in combinations(PROFILES[profile], 2):
-        validate_match(mode_results[first]["meta"], mode_results[second]["meta"])
+    for first, second in combinations(variants, 2):
+        validate_match(mode_results[first]["meta"], mode_results[second]["meta"], compare_primary=second == "hybrid")
         regions, diff = compare(images[first], images[second], case.get("regions"))
         pair = f"{first}-vs-{second}"
         diff.save(args.output / f"{name}-{pair}-abs.png")
@@ -222,8 +248,11 @@ def main():
     parser.add_argument("--ray-resolution", type=int, default=50, choices=range(25, 101), metavar="25..100")
     parser.add_argument("--timed-frames", type=int, choices=range(121), default=0, metavar="0..120")
     parser.add_argument("--timeout", type=int, default=360, help="seconds per capture")
+    parser.add_argument("--hybrid-ab", action="store_true", help="also capture Hardware with rasterized 1-spp primary visibility")
     parser.add_argument("--require-complete", action="store_true", help="fail unless all required physical matrix cells exist")
     args = parser.parse_args()
+    if args.hybrid_ab and args.profile != "physical":
+        parser.error("--hybrid-ab requires --profile physical")
     cases = json.loads(args.manifest.read_text(encoding="utf-8"))["cases"]
     if not cases or len({case["id"] for case in cases}) != len(cases):
         parser.error("expected nonempty, unique case identifiers")

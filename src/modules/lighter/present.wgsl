@@ -21,8 +21,8 @@ struct Output { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 }
 @fragment fn fragment(@builtin(position) coord: vec4<f32>) -> Output {
     let extent = present.extent;
     if all(extent.xy==extent.zw) {
-        let c = pixels[index(vec2<i32>(coord.xy))].radiance;
-        return Output(vec4<f32>(c.rgb,1.),c.a);
+        let c = pixels[index(vec2<i32>(coord.xy))];
+        return Output(vec4<f32>(color_of(c),1.),c.depth);
     }
     let source = coord.xy*vec2<f32>(extent.xy)/vec2<f32>(extent.zw)-0.5;
     let nearest = index(vec2<i32>(floor(source+0.5)));
@@ -37,9 +37,9 @@ struct Output { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 }
         let neighbor = pixels[i];
         let bilinear = select(1.-f,f,off!=vec2<u32>(0u));
         var weight = bilinear.x*bilinear.y;
-        if present.options.x!=0u && i!=nearest { weight *= guide_weight(center.guide,neighbor.guide); }
-        rgb += neighbor.radiance.rgb*weight;
+        if present.options.x!=0u && i!=nearest { weight *= guide_weight(guide_of(center),guide_of(neighbor)); }
+        rgb += color_of(neighbor)*weight;
         total += weight;
     }
-    return Output(vec4<f32>(rgb/total,1.),center.radiance.a);
+    return Output(vec4<f32>(select(color_of(center),rgb/max(1.e-8,total),total>1.e-8),1.),center.depth);
 }

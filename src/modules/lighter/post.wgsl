@@ -9,12 +9,17 @@ struct Params {
 @group(0) @binding(3) var<storage,read> previous_pixels: array<Pixel>;
 
 fn same_history(old: Pixel, current: Pixel, expected_w: f32, reproject: bool) -> bool {
-    let animations = (old.guide.w|current.guide.w) & ANIM_MASK;
-    if (animations & params.history.y)!=0u || ((old.guide.w^current.guide.w) & GUIDE_KIND)!=0u { return false; }
-    if !reproject { return all(old.guide.xyz==current.guide.xyz); }
-    let previous_w = bitcast<f32>(old.guide.x);
-    return previous_w>0. && abs(previous_w-expected_w)<0.01*expected_w
-        && all(old.guide.yz==current.guide.yz);
+    let a = guide_of(old);
+    let b = guide_of(current);
+    let animations = (a.w|b.w) & ANIM_MASK;
+    if (old.owner & OWNER_MASK)!=(current.owner & OWNER_MASK)
+        || (animations & params.history.y)!=0u || ((a.w^b.w) & GUIDE_KIND)!=0u
+        || ((params.history.y & 256u)!=0u && ((old.owner|current.owner) & DEP_MOVING)!=0u) { return false; }
+    if !reproject {
+        return a.x==b.x && a.y==b.y && a.z==b.z && old.depth==current.depth;
+    }
+    return old.view_depth>0. && abs(old.view_depth-expected_w)<0.012*expected_w
+        && guide_weight(vec4<u32>(a.x,b.yzw),a)>=0.5;
 }
 
 fn temporal(current: Pixel, coord: vec2<u32>, i: u32) -> Pixel {
@@ -22,26 +27,41 @@ fn temporal(current: Pixel, coord: vec2<u32>, i: u32) -> Pixel {
     var at = i;
     var expected_w = 0.;
     if reproject {
-        // No reliable single surface position for sky, moving water,
+        // No reliable single surface position for sky, water,
         // layered transparency or multi-sample silhouettes.
-        if current.guide.x==0u || (current.guide.w & (GUIDE_UNSAFE|GUIDE_WATER))!=0u { return current; }
+        if current.view_depth==0. || ((current.normal_flags>>24u) & (GUIDE_UNSAFE|GUIDE_WATER))!=0u { return current; }
         let screen = (vec2<f32>(coord)+0.5)/vec2<f32>(params.extent.xy);
         let ndc = screen*vec2<f32>(2.,-2.)+vec2<f32>(-1.,1.);
-        let previous = params.previous_from_current*vec4<f32>(ndc,current.radiance.a,1.);
+        let previous = params.previous_from_current*vec4<f32>(ndc,current.depth,1.);
         if previous.w<=0. { return current; }
         let p = previous.xyz/previous.w;
         let uv = p.xy*vec2<f32>(0.5,-0.5)+0.5;
         if any(uv<vec2<f32>(0.)) || any(uv>=vec2<f32>(1.)) || p.z<0. || p.z>1. { return current; }
         let sample = vec2<u32>(uv*vec2<f32>(params.extent.xy));
         at = sample.x + sample.y*params.extent.x;
-        expected_w = previous.w*bitcast<f32>(current.guide.x);
+        expected_w = previous.w*current.view_depth;
     }
     let old = previous_pixels[at];
     if !same_history(old,current,expected_w,reproject) { return current; }
-    let count = min(MAX_HISTORY,(old.guide.w >> HISTORY_SHIFT)+1u);
-    let blend = max(0.1,1./f32(count));
-    let guide = current.guide.w | (old.guide.w & ANIM_MASK) | (count << HISTORY_SHIFT);
-    return Pixel(vec4<f32>(mix(old.radiance.rgb,current.radiance.rgb,blend),current.radiance.a), vec4<u32>(current.guide.xyz,guide));
+    let count = min(MAX_HISTORY,((old.albedo_history >> HISTORY_SHIFT) & HISTORY_COUNT)+1u);
+    let a = color_of(old);
+    let b = color_of(current);
+    let old_mean = luminance(a);
+    let old_variance = max(0.,variance_of(old));
+    let noise = sqrt(old_variance)/max(0.04,old_mean);
+    // High-variance pixels benefit from a longer window. Moving the view
+    // reduces its confidence even when the old hit passes all guide tests.
+    let floor_alpha = select(mix(0.10,0.035,smoothstep(0.05,0.4,noise)),0.12,reproject);
+    let alpha = max(floor_alpha,1./f32(count));
+    let delta = luminance(b)-old_mean;
+    // Weighted central second moment; E[Y] is luminance of the stored mean RGB.
+    let variance = (1.-alpha)*(old_variance+alpha*delta*delta);
+    var out = current;
+    out.albedo_history |= count << HISTORY_SHIFT;
+    out.normal_flags |= old.normal_flags & (ANIM_MASK << 24u);
+    out.owner |= old.owner & DEP_MOVING;
+    write_radiance(&out,mix(a,b,alpha),variance);
+    return out;
 }
 
 @compute @workgroup_size(8,8)
@@ -50,36 +70,58 @@ fn accumulate(@builtin(global_invocation_id) id: vec3<u32>) {
     let i = id.y*params.extent.x+id.x;
     var current = input_pixels[i];
     if params.history.x!=0u { current = temporal(current,id.xy,i); }
-    if current.guide.w >> HISTORY_SHIFT==0u { current.guide.w |= 1u << HISTORY_SHIFT; }
+    if ((current.albedo_history >> HISTORY_SHIFT) & HISTORY_COUNT)==0u { current.albedo_history |= 1u << HISTORY_SHIFT; }
     output_pixels[i] = current;
 }
 
-@compute @workgroup_size(8,8)
-fn denoise(@builtin(global_invocation_id) id: vec3<u32>) {
-    let extent = params.extent;
-    if any(id.xy>=extent.xy) { return; }
-    let i = id.y*extent.x+id.x;
+fn atrous(coord: vec2<u32>, step: i32) {
+    let extent = params.extent.xy;
+    if any(coord>=extent) { return; }
+    let i = coord.y*extent.x+coord.x;
     var center = input_pixels[i];
-    // A translucent composite and a mixed silhouette have no single guide.
-    // Don't smear either across its neighbors. Sky and emissive are clean;
-    // the water interface normal also says little about reflected silhouettes.
-    if center.guide.x!=0u && (center.guide.w & (GUIDE_UNSAFE|GUIDE_EMISSIVE|GUIDE_WATER))==0u {
-        var sum = center.radiance.rgb*4.;
-        var total = 4.;
-        for (var y=-1; y<=1; y++) {
-            for (var x=-1; x<=1; x++) {
-                if x==0 && y==0 { continue; }
-                let at = vec2<i32>(id.xy)+vec2<i32>(x,y);
-                if any(at<vec2<i32>(0)) || any(at>=vec2<i32>(extent.xy)) { continue; }
-                let neighbor = input_pixels[u32(at.y)*extent.x+u32(at.x)];
-                let weight = f32((2-abs(x))*(2-abs(y)))*guide_weight(center.guide,neighbor.guide);
-                sum += neighbor.radiance.rgb*weight;
-                total += weight;
-            }
-        }
-        // As transport converges, prefer its recovered detail to spatial blur.
-        let strength = inverseSqrt(f32(max(1u,center.guide.w >> HISTORY_SHIFT)));
-        center.radiance = vec4<f32>(mix(center.radiance.rgb,sum/total,strength),center.radiance.a);
+    let guide = guide_of(center);
+    // No spatial filtering of sky, shifted mirror/refracted silhouettes, or
+    // colors with no unique owner. Leave their reverse-Z and temporal mean intact.
+    if guide.x==0u || (guide.w & (GUIDE_UNSAFE|GUIDE_EMISSIVE|GUIDE_WATER))!=0u {
+        output_pixels[i] = center;
+        return;
     }
+    let radiance = color_of(center);
+    let mean = luminance(radiance);
+    let variance = variance_of(center);
+    let n = (center.albedo_history >> HISTORY_SHIFT) & HISTORY_COUNT;
+    if step>=4 && (n<3u || variance<0.004*max(0.0025,mean*mean)) {
+        output_pixels[i] = center;
+        return;
+    }
+    let sigma = sqrt(max(0.,variance));
+    let phi = 2.5*sigma+max(0.025,0.15*mean);
+    var sum = radiance*4.;
+    var total = 4.;
+    var sum_var = variance*16.;
+    for (var y=-1; y<=1; y++) {
+        for (var x=-1; x<=1; x++) {
+            if x==0 && y==0 { continue; }
+            let at = vec2<i32>(coord)+step*vec2<i32>(x,y);
+            if any(at<vec2<i32>(0)) || any(at>=vec2<i32>(extent)) { continue; }
+            let neighbor = input_pixels[u32(at.y)*extent.x+u32(at.x)];
+            if (neighbor.owner & OWNER_MASK)!=(center.owner & OWNER_MASK) { continue; }
+            let geo = guide_weight(guide,guide_of(neighbor));
+            if geo<=0. { continue; }
+            let c = color_of(neighbor);
+            let photometric = select(1., exp(-abs(mean-luminance(c))/phi), n>=3u);
+            let weight = f32((2-abs(x))*(2-abs(y)))*geo*photometric;
+            sum += c*weight;
+            sum_var += variance_of(neighbor)*weight*weight;
+            total += weight;
+        }
+    }
+    write_radiance(&center,sum/total,sum_var/(total*total));
     output_pixels[i] = center;
 }
+
+@compute @workgroup_size(8,8) fn filter_1(@builtin(global_invocation_id) id: vec3<u32>) { atrous(id.xy,1); }
+@compute @workgroup_size(8,8) fn filter_2(@builtin(global_invocation_id) id: vec3<u32>) { atrous(id.xy,2); }
+@compute @workgroup_size(8,8) fn filter_4(@builtin(global_invocation_id) id: vec3<u32>) { atrous(id.xy,4); }
+@compute @workgroup_size(8,8) fn filter_8(@builtin(global_invocation_id) id: vec3<u32>) { atrous(id.xy,8); }
+@compute @workgroup_size(8,8) fn filter_16(@builtin(global_invocation_id) id: vec3<u32>) { atrous(id.xy,16); }

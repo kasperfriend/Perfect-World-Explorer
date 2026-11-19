@@ -31,6 +31,28 @@ class CaptureMatrixTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different effective settings"):
             matrix.validate_match(soft, hard | {"settings_effective": hard["settings_effective"].replace("1", "2")})
 
+    def test_hybrid_ab_relaxes_only_the_primary_toggle(self):
+        full = dict.fromkeys(matrix.MATCH_KEYS, "fixed") | {
+            "mode": "Hardware", "settings_effective": "Settings { mode: Hardware, hybrid_primary: false, samples: 1 }",
+        }
+        hybrid = full | {"settings_effective": full["settings_effective"].replace("false", "true")}
+        matrix.validate_match(full, hybrid, compare_primary=True)
+        with self.assertRaisesRegex(ValueError, "different effective settings"):
+            matrix.validate_match(full, hybrid)
+        with self.assertRaisesRegex(ValueError, "different effective settings"):
+            matrix.validate_match(full, hybrid | {"settings_effective": hybrid["settings_effective"].replace("1", "2")},
+                                  compare_primary=True)
+
+    def test_completed_stages_are_named_and_bounded_by_timed_draws(self):
+        meta = {"gpu_timed_stages": '"build,primary,traversal,reproject,filter,upscale"',
+                "gpu_timed_ms": "[[0,2,10,1,1.4,0.8],[4,4,8,2,2.6,1.2]]"}
+        self.assertEqual(matrix.completed_stages(meta, 2)["p50"], {
+            "build": 2, "primary": 3, "traversal": 9, "reproject": 1.5, "filter": 2, "upscale": 1,
+        })
+        with self.assertRaisesRegex(ValueError, "invalid completed GPU stage samples"):
+            matrix.completed_stages(meta, 1)
+        self.assertIsNone(matrix.completed_stages({}, 9))
+
     def test_physical_profile_cannot_use_cpu_and_digest_binds_image(self):
         with tempfile.TemporaryDirectory() as tmp:
             stem = Path(tmp) / "water"

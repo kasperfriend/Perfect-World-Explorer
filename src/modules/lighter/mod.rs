@@ -85,14 +85,20 @@ pub struct Frame {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Pixel {
-    radiance: [f32; 4],
-    guide: [u32; 4],
+    rg: u32,
+    bv: u32,
+    depth: f32,
+    view_depth: f32,
+    normal_flags: u32,
+    albedo_history: u32,
+    owner: u32,
 }
 const PIXEL_BYTES: u64 = std::mem::size_of::<Pixel>() as u64;
 // Reserve a stable share even when a retained stage is toggled off. A
 // resolution increase in another stage must not consume its reservation.
 // Trace, two reprojection histories, and spatial filter.
-pub(super) const RAY_ALLOCATION_BUDGET: u64 = 8 << 30;
+pub(super) const RAY_ALLOCATION_BUDGET: u64 = 6_500_000_000;
+const HEAP_WARNING_BYTES: u64 = 7_000_000_000;
 const MAX_IMAGE_BYTES: u64 = (256 << 20) / 4;
 
 pub const WATER_MIRROR: u32 = 8;
@@ -106,6 +112,9 @@ pub const GRASS_AREA_LIGHTMAPS: u32 = 1024;
 const RELIGHT_BAKED: u32 = 2048;
 pub const CLOUD_DETAIL: u32 = 4096;
 const REFERENCE_MODE: u32 = 16384;
+const SINGLE_PATH: u32 = 32768;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+const HYBRID_PRIMARY: u32 = 65536;
 const PHYSICAL_BSDF: u32 = 8192;
 
 pub(crate) fn storage_limit(device: &wgpu::Device) -> usize {
@@ -584,11 +593,15 @@ pub struct Lighter {
     post: Option<post::Post>,
     history: post::History,
     timings: Option<profile::Timings>,
+    gpu_sample: Option<profile::GpuSample>,
+    adaptive: profile::Resolution,
+    cadence: profile::Cadence,
     allocation_sample: Option<(Instant, [u64; 3], u64)>,
     pub(crate) moving_accel: scene::AccelCache,
     pub settings: Settings,
     saved_mode: Mode,
     pending_mode: Option<Mode>,
+    pending_primary: Option<bool>,
     armed: bool,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     capture: bool,
@@ -617,11 +630,15 @@ impl Default for Lighter {
             post: None,
             history: post::History::default(),
             timings: None,
+            gpu_sample: None,
+            adaptive: profile::Resolution::default(),
+            cadence: profile::Cadence::default(),
             allocation_sample: None,
             moving_accel: Default::default(),
             settings: Settings::default(),
             saved_mode: Mode::Off,
             pending_mode: None,
+            pending_primary: None,
             armed: false,
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             capture: false,
@@ -684,6 +701,30 @@ impl Lighter {
         };
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         self
+    }
+
+    pub(crate) fn raster_active(&self) -> bool {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(rt) = &self.hardware {
+            return self.settings.mode == Mode::Hardware && rt.raster_active();
+        }
+        false
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) const CPU_QUERY_TEST_FEATURES: wgpu::Features = vulkan::FEATURES;
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn for_cpu_query_test(
+        mut self,
+        adapter: &wgpu::Adapter,
+        device: &wgpu::Device,
+    ) -> Self {
+        assert_eq!(adapter.get_info().device_type, wgpu::DeviceType::Cpu);
+        assert!(!supports_hardware(adapter));
+        assert!(device.features().contains(Self::CPU_QUERY_TEST_FEATURES));
+        self.has_hardware_device = true;
+        self.for_capture()
     }
 
     pub fn armed(&self) -> bool {
@@ -763,8 +804,43 @@ impl Lighter {
 
     pub(crate) fn profile_collect(&mut self, queue: &wgpu::Queue) {
         if let Some(timings) = &mut self.timings {
-            timings.collect(queue);
+            if let Some(sample) = timings.collect(queue) {
+                self.gpu_sample = Some(sample);
+            }
         }
+    }
+
+    /// Headless captures have already synchronized their readback. Take
+    /// stage samples for that completed draw, not the prior raw Vulkan fence
+    /// normally used by the live controller. Never wait here.
+    pub(crate) fn capture_stage_sample(&mut self, queue: &wgpu::Queue) -> Option<[f64; 6]> {
+        let post = self.timings.as_mut()?.collect(queue)?;
+        self.gpu_sample = Some(post);
+        let mut stages = [
+            0.,
+            0.,
+            post.trace_ms,
+            post.reproject_ms,
+            post.filter_ms,
+            post.upscale_ms,
+        ];
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if post.mode == Mode::Hardware {
+            let rt = self.hardware.as_mut()?;
+            if !rt.poll_frame().ok()? {
+                return None;
+            }
+            let (extent, native) = rt.gpu_stages()?;
+            if extent != post.extent {
+                return None;
+            }
+            stages[..3].copy_from_slice(&native);
+        }
+        stages.iter().all(|s| s.is_finite()).then_some(stages)
+    }
+
+    pub(crate) fn profile_presented(&mut self, now: Instant) {
+        self.cadence.present(now);
     }
 
     pub(crate) fn reset_history(&mut self) {
@@ -828,7 +904,16 @@ impl Lighter {
         if pixel_limit == 0 {
             return Err("Lighter cannot allocate ray image".into());
         }
-        let scaled = |n: u32| (n * self.settings.effective().resolution / 100).max(1);
+        let settings = self.settings.effective();
+        let pct = if settings.dynamic_resolution && self.timings.is_some() {
+            self.adaptive
+                .percent
+                .unwrap_or(settings.resolution)
+                .clamp(50, 100)
+        } else {
+            settings.resolution
+        };
+        let scaled = |n: u32| (n * pct / 100).max(1);
         let mut rw = scaled(w);
         let mut rh = scaled(h);
         while u64::from(rw) * u64::from(rh) > pixel_limit {
@@ -874,6 +959,11 @@ impl Lighter {
                 )?);
             }
             let rt = self.hardware.as_mut().unwrap();
+            if self.settings.hybrid_primary {
+                // The UI stages this only through Reload World. Prewarm even
+                // if a later per-frame setting (SPP/Reference) uses full rays.
+                rt.prewarm_primary();
+            }
             if self.capture {
                 crate::gpu::wait_for_capture(device, || {
                     rt.try_prepare_image(device, bytes)
@@ -939,6 +1029,7 @@ impl Lighter {
         frame.options[0] |= u32::from(settings.lighting)
             | u32::from(settings.shadows) << 1
             | u32::from(settings.reflections) << 2
+            | if settings.single_path { SINGLE_PATH } else { 0 }
             | if settings.physical_bsdf {
                 PHYSICAL_BSDF
             } else {
@@ -960,6 +1051,10 @@ impl Lighter {
                 1 => ANISO_ISOTROPIC,
                 _ => 0,
             };
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if settings.mode == Mode::Hardware && settings.hybrid_primary && settings.samples == 1 {
+            frame.options[0] |= HYBRID_PRIMARY;
+        }
         frame.options[1] = settings.bounces;
         frame.options[2] = settings.samples;
         frame.material_time[3] = settings.diffuse_distance as f32;
@@ -983,22 +1078,47 @@ impl Lighter {
                     .is_some_and(|h| h.moving_unchanged(moving)),
                 _ => false,
             };
-            Some(self.history.prepare(
+            let lighting_unchanged = moving_unchanged
+                || match settings.mode {
+                    Mode::Software => self.software.as_ref().is_some_and(|s| {
+                        scene::same_moving_lighting(&s.last_moving, &moving.words)
+                    }),
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    Mode::Hardware => self
+                        .hardware
+                        .as_ref()
+                        .is_some_and(|h| h.same_moving_lighting(moving)),
+                    _ => false,
+                };
+            let mut history = self.history.prepare(
                 &mut frame,
                 world.revision,
                 world.textures.byte_len(),
                 settings.mode,
-                moving_unchanged,
-            ))
+                lighting_unchanged,
+            );
+            if !moving_unchanged {
+                history.changed_animations |= post::ANIM_GEOMETRY;
+            }
+            let hard_sun = settings.shadows && !settings.soft_sun && settings.samples == 1;
+            frame.sampling[1] = u32::from(hard_sun);
+            frame.sampling[2] = u32::from(
+                hard_sun
+                    && history.reuse
+                    && history.changed_animations == 0
+                    && history.previous_from_current.is_none(),
+            );
+            Some(history)
         } else {
             self.history.reset();
             frame.sampling = [0; 4];
             None
         };
-        if let Some(t) = &mut self.timings {
-            t.collect(queue);
+        let completed = self.timings.as_mut().and_then(|t| t.collect(queue));
+        if let Some(sample) = completed {
+            self.gpu_sample = Some(sample);
         }
-        let timed = self.timings.as_mut().filter(|t| t.due());
+        let timed = self.timings.as_ref().filter(|t| t.due());
         let image = match settings.mode {
             Mode::Software => {
                 if let Some(t) = &timed {
@@ -1038,9 +1158,8 @@ impl Lighter {
                 t.stamp(encoder, 0);
                 t.stamp(encoder, 1);
             }
-            t.stamp(encoder, 2);
         }
-        let filtered = settings.denoiser || history.is_some();
+
         let image = if let Some(post) = &mut self.post {
             post.process(
                 device,
@@ -1050,13 +1169,16 @@ impl Lighter {
                 frame.extent,
                 history,
                 settings.denoiser,
+                timed,
             )
         } else {
+            if let Some(t) = timed {
+                t.stamp(encoder, 2);
+            }
             image
         };
         if let Some(t) = timed {
             t.stamp(encoder, 3);
-            t.record(encoder, settings.mode, filtered);
         }
         self.present.as_mut().unwrap().draw(
             device,
@@ -1064,19 +1186,112 @@ impl Lighter {
             encoder,
             image,
             frame.extent,
-            self.settings.denoiser,
+            settings.denoiser,
             target,
             depth,
         );
+        if let Some(t) = timed {
+            t.stamp(encoder, 4);
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            let native_ms = if settings.mode == Mode::Hardware {
+                self.hardware
+                    .as_ref()
+                    .and_then(vulkan::Renderer::gpu_stages)
+                    .filter(|(extent, _)| *extent == frame.extent)
+                    .map_or(f64::NAN, |(_, s)| s.iter().sum())
+            } else {
+                0.
+            };
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+            let native_ms = 0.;
+            self.timings
+                .as_mut()
+                .unwrap()
+                .record(encoder, settings.mode, frame.extent, native_ms);
+        }
+        if settings.dynamic_resolution {
+            if let Some(s) =
+                completed.filter(|s| s.mode == settings.mode && s.extent == frame.extent)
+            {
+                self.adaptive.observe(
+                    settings.resolution,
+                    s.total_ms,
+                    f64::from(settings.gpu_target_ms),
+                    Instant::now(),
+                );
+            }
+        }
         self.frame_error = None;
-        let message = format!("{} active · {rw}×{rh} rays · {} unique resident / {} moving triangles · {} instances · {} unavailable texture(s) · mip_fallback {} ({} reduced)",
-            self.settings.mode.label(),world.packet.triangles(),moving.triangles(),world.packet.instances.len(),world.textures.missing,world.textures.mips.fallback,world.textures.mips.reduced);
+        let message = format!("{} active{} · {rw}×{rh} rays · {} unique resident / {} moving triangles · {} instances · {} unavailable texture(s) · mip_fallback {} ({} reduced)",
+            self.settings.mode.label(),if self.raster_active() { " (raster primary)" } else { "" },world.packet.triangles(),moving.triangles(),world.packet.instances.len(),world.textures.missing,world.textures.mips.fallback,world.textures.mips.reduced);
         if self.status.is_none() {
             eprintln!("Lighter: {message}");
         }
         self.status = Some(message);
         self.log_allocations();
         Ok(true)
+    }
+
+    fn profile_ui(&self, ui: &mut egui::Ui) {
+        let mut known = self.post.as_ref().map_or(0, post::Post::allocation_bytes);
+        if let Some(software) = &self.software {
+            known += [
+                &software.world,
+                &software.moving,
+                &software.textures,
+                &software.output,
+            ]
+            .iter()
+            .map(|s| s.0.size())
+            .sum::<u64>();
+        }
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(hardware) = &self.hardware {
+            let (bytes, limit, heap) = hardware.memory_usage();
+            known += bytes;
+            ui.label(format!(
+                "Vulkan ray allocations: {:.2} / {:.2} GB",
+                bytes as f64 * 1e-9,
+                limit as f64 * 1e-9
+            ));
+            if let Some(heap) = heap {
+                if heap >= HEAP_WARNING_BYTES {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!(
+                            "Device-local usage ≈ {:.2} GB (above 7 GB)",
+                            heap as f64 * 1e-9
+                        ),
+                    );
+                } else {
+                    ui.label(format!(
+                        "Driver-estimated device-local usage: {:.2} GB",
+                        heap as f64 * 1e-9
+                    ));
+                }
+            }
+            if let Some((_, [build, primary, trace])) = hardware.gpu_stages() {
+                ui.label(format!(
+                    "AS {build:.2} ms · raster primary {primary:.2} ms · rays {trace:.2} ms"
+                ));
+            }
+        }
+        ui.label(format!(
+            "Tracked ray resources: {:.1} MiB (excludes Native resources)",
+            known as f64 / 1048576.
+        ));
+        if let Some(s) = self.gpu_sample.filter(|s| s.mode == self.settings.mode) {
+            ui.label(format!(
+                "Reproject {:.2} ms · filter {:.2} ms · upscale/compose {:.2} ms",
+                s.reproject_ms, s.filter_ms, s.upscale_ms
+            ));
+            if s.mode == Mode::Software {
+                ui.label(format!("Software rays {:.2} ms", s.trace_ms));
+            }
+        }
+        if let Some(low) = self.cadence.low {
+            ui.label(format!("Present cadence 1% low: {low:.1} FPS"));
+        }
     }
 
     /// Return the replacement's settings only on an explicit reload. Changing
@@ -1093,6 +1308,10 @@ impl Lighter {
                 }
             });
         self.pending_mode = (mode != old.mode).then_some(mode);
+        let mut hybrid_primary = self.pending_primary.unwrap_or(old.hybrid_primary);
+        ui.add_enabled(mode == Mode::Hardware, egui::Checkbox::new(&mut hybrid_primary, "Rasterized primary visibility (experimental)"))
+            .on_hover_text("Apply with Reload World so the new pipeline compiles in the watched replacement. Hardware, 1 sample per pixel only. Ordered sheets and secondary visibility still use rays.");
+        self.pending_primary = (hybrid_primary != old.hybrid_primary).then_some(hybrid_primary);
         let reload = ui.button("Reload World")
             .on_hover_text("Reload this map at the current camera position and time with the selected renderer.")
             .clicked();
@@ -1101,6 +1320,9 @@ impl Lighter {
                 "Current renderer setting: {}. Press Reload World to apply the selection.",
                 old.mode.label()
             ));
+        }
+        if self.pending_primary.is_some() && mode == Mode::Hardware {
+            ui.label("Press Reload World to apply the primary visibility change.");
         }
         ui.separator();
         ui.checkbox(
@@ -1118,6 +1340,8 @@ impl Lighter {
             "Sample across the sun's angular disc. Local area emitters are sampled separately.",
         );
         ui.checkbox(&mut self.settings.reflections, "Ray-traced reflections");
+        ui.checkbox(&mut self.settings.single_path, "Single-path transport")
+            .on_hover_text("Sample one Fresnel lobe at water/glass and use roulette after two bounces. Keep progressive sampling on to resolve both lobes over time.");
         ui.checkbox(&mut self.settings.reference, "Reference (32 spp, 8 bounces)")
             .on_hover_text("Full resolution with sky and mesh light sampling, no history or denoising. Overrides lighting, relight and quality settings while enabled.");
         ui.checkbox(&mut self.settings.denoiser, "Edge-aware denoiser")
@@ -1145,6 +1369,15 @@ impl Lighter {
                 .text("Ray resolution")
                 .suffix("%"),
         );
+        ui.checkbox(&mut self.settings.dynamic_resolution,"Automatic ray resolution (50–100%)")
+            .on_hover_text("Uses completed GPU timings with hysteresis. The slider seeds the adaptive scale; pipelines without timestamps keep the fixed scale.");
+        if self.settings.dynamic_resolution && !self.settings.reference {
+            ui.add(
+                egui::Slider::new(&mut self.settings.gpu_target_ms, 4..=50)
+                    .text("Ray + filter GPU budget")
+                    .suffix(" ms"),
+            );
+        }
         egui::ComboBox::from_label("Ray texture anisotropy")
             .selected_text(format!("{}×", self.settings.anisotropy))
             .show_ui(ui, |ui| {
@@ -1157,6 +1390,7 @@ impl Lighter {
         ui.checkbox(&mut self.settings.relight_baked, "Relight baked scenery")
             .on_hover_text("Use authored reflectance rather than baked building vertex light or terrain/grass lightmaps. Ray lighting replaces the bake; the two are not multiplied together.");
         if self.settings != old {
+            self.adaptive = profile::Resolution::default();
             self.reset_history();
             self.persistence_error = self.settings_for_disk().save().err();
             self.frame_error = None;
@@ -1184,6 +1418,7 @@ impl Lighter {
             ui.label("Preparing the first ray-traced frame…");
         }
         if self.replaces_world() {
+            self.profile_ui(ui);
             if let Some(coverage) = &self.scenery_coverage {
                 ui.label(coverage);
             }
@@ -1210,6 +1445,7 @@ impl Lighter {
         ui.label("Hardware mode uses Vulkan, not DirectX 12. Lighter uses its own bounded BMD residency. Temporal upscaling/frame generation are suspended only while rays draw the world. See Modules/Lighter/README.md for compatibility notes.");
         reload.then_some(Settings {
             mode,
+            hybrid_primary,
             ..self.settings
         })
     }

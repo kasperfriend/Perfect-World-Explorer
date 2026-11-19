@@ -8264,6 +8264,9 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                             } else if let Some(frame) = frame {
                                 window.pre_present_notify();
                                 frame.present();
+                                if renderer.renders_rays() {
+                                    renderer.lighter.profile_presented(Instant::now());
+                                }
                                 #[cfg(test)]
                                 if smoke_dir.is_some() && !smoke_reload {
                                     let mode = match smoke_frames {
@@ -8527,11 +8530,42 @@ pub fn preview(t: Terrain, path: &std::path::Path, camera: Option<[f32; 5]>) -> 
 }
 
 fn preview_frame(
+    t: Terrain,
+    path: &std::path::Path,
+    camera: Option<[f32; 5]>,
+    mode: LighterMode,
+    audit: Option<u32>,
+) -> Result<(), String> {
+    preview_frame_using(t, path, camera, mode, audit, preview_device)
+}
+
+type PreviewDevice = (wgpu::AdapterInfo, wgpu::Device, wgpu::Queue, Lighter);
+
+fn preview_device(settings: LighterSettings) -> Result<PreviewDevice, String> {
+    let mut instance = make_instance(settings.mode);
+    let mut result = pollster::block_on(adapter(&instance, None, settings.mode));
+    if let Err(error) = &result {
+        if std::env::var_os("WGPU_BACKEND").is_none() {
+            eprintln!("Perfect World Explorer preview: no D3D12 adapter ({error}); falling back to all backends");
+            instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
+                ..Default::default()
+            });
+            result = pollster::block_on(adapter(&instance, None, settings.mode));
+        }
+    }
+    let (adapter, device, queue) = result?;
+    let lighter = Lighter::new(settings, &adapter, &device).for_capture();
+    Ok((adapter.get_info(), device, queue, lighter))
+}
+
+fn preview_frame_using(
     mut t: Terrain,
     path: &std::path::Path,
     camera: Option<[f32; 5]>,
     mode: LighterMode,
     audit: Option<u32>,
+    open: impl FnOnce(LighterSettings) -> Result<PreviewDevice, String>,
 ) -> Result<(), String> {
     // Never read interactive Lighter settings for an ordinary headless preview.
     let mut lighter_settings = LighterSettings {
@@ -8573,6 +8607,26 @@ fn preview_frame(
             .filter(|n| (25..=100).contains(n))
             .ok_or("PW_PREVIEW_RAY_RESOLUTION must be an integer from 25 through 100")?;
     }
+    for (key, option) in [
+        ("PW_PREVIEW_SINGLE_PATH", &mut lighter_settings.single_path),
+        (
+            "PW_PREVIEW_HYBRID_PRIMARY",
+            &mut lighter_settings.hybrid_primary,
+        ),
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            *option = match value.as_str() {
+                "0" => false,
+                "1" => true,
+                _ => return Err(format!("{key} must be 0 or 1")),
+            };
+        }
+    }
+    if lighter_settings.hybrid_primary
+        && (mode != LighterMode::Hardware || lighter_settings.reference)
+    {
+        return Err("PW_PREVIEW_HYBRID_PRIMARY requires non-Reference Hardware mode".into());
+    }
     let timed_frames = match std::env::var("PW_PREVIEW_TIMED_FRAMES") {
         Ok(value) if audit.is_some() => value
             .parse::<u32>()
@@ -8596,22 +8650,7 @@ fn preview_frame(
     {
         return Err("Matched previews require the main streamed world, not preload, minimap or an effect A/B".into());
     }
-    let mut instance = make_instance(lighter_settings.mode);
-    let mut adapter_result = pollster::block_on(adapter(&instance, None, lighter_settings.mode));
-    if let Err(error) = &adapter_result {
-        if std::env::var_os("WGPU_BACKEND").is_none() {
-            eprintln!(
-                "Perfect World Explorer preview: no D3D12 adapter ({error}); falling back to all backends"
-            );
-            instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
-                ..Default::default()
-            });
-            adapter_result = pollster::block_on(adapter(&instance, None, lighter_settings.mode));
-        }
-    }
-    let (adapter, device, queue) = adapter_result?;
-    let adapter_info = audit.map(|_| adapter.get_info());
+    let (adapter_info, device, queue, lighter) = open(lighter_settings)?;
     let mut cam = if let Some([x, y, z, yaw, pitch]) = camera {
         if ![x, y, z, yaw, pitch].iter().all(|x| x.is_finite()) {
             return Err("non-finite camera".into());
@@ -8706,7 +8745,6 @@ fn preview_frame(
         .environments
         .underwater(cam.pos.to_array(), cam.time_of_day);
     let mut residency = crate::terrain_residency::Residency::default();
-    let lighter = Lighter::new(lighter_settings, &adapter, &device).for_capture();
     let mut ray_scenery = lighter.armed().then(lighter_host::SceneryStream::default);
     let mesh = build(
         &mut t,
@@ -8835,6 +8873,11 @@ fn preview_frame(
         if let Some(error) = r.lighter.error() {
             return Err(error.into());
         }
+        if r.lighter.settings.effective().hybrid_primary && !r.lighter.raster_active() {
+            return Err(
+                "Lighter capture requested raster primary visibility but used full rays".into(),
+            );
+        }
         if !ready || (mode != LighterMode::Off && !r.renders_rays()) {
             return Err("Lighter capture did not render the requested frame".into());
         }
@@ -8908,7 +8951,8 @@ fn preview_frame(
     let bytes = read_target_pixels(&renderer, &mut captures, &target)?;
     renderer.lighter.profile_collect(&renderer.queue);
     readback::png_rgba(path, width, height, &bytes)?;
-    if let (Some(warmup), Some(info)) = (audit, adapter_info) {
+    if let Some(warmup) = audit {
+        let info = adapter_info;
         use sha2::{Digest, Sha256};
         use std::fmt::Write;
         let meta_path = path.with_extension("coverage.txt");
@@ -8963,15 +9007,22 @@ fn preview_frame(
         // Capture timing is optional and is deliberately distinct from GPU
         // stage timings and the live asynchronous viewer's frame rate.
         let mut capture_ms = Vec::new();
+        let mut gpu_ms = Vec::new();
         for _ in 0..timed_frames {
             let start = Instant::now();
             draw(&mut renderer, &cam)?;
             read_target_pixels(&renderer, &mut captures, &target)?;
             capture_ms.push(start.elapsed().as_secs_f64() * 1000.);
-            renderer.lighter.profile_collect(&renderer.queue);
+            if let Some(stages) = renderer.lighter.capture_stage_sample(&renderer.queue) {
+                gpu_ms.push(stages);
+            }
         }
+        writeln!(meta, "raster_primary={}", renderer.lighter.raster_active()).unwrap();
         if !capture_ms.is_empty() {
             writeln!(meta, "synchronized_capture_ms={capture_ms:?}").unwrap();
+        }
+        if !gpu_ms.is_empty() {
+            writeln!(meta, "gpu_timed_stages=\"build,primary,traversal,reproject,filter,upscale\"\ngpu_timed_ms={gpu_ms:?}").unwrap();
         }
         std::fs::write(&meta_path, meta).map_err(|e| format!("{}: {e}", meta_path.display()))?;
     }

@@ -1,23 +1,29 @@
 # GPU timing and residency envelope (Step 19)
 
-Lighter samples traversal and filter timestamps at most once per second. The
-Software BVH is packed/refit on the CPU, so there is no GPU AS build to time.
-Vulkan separately reports the GPU BLAS/TLAS build/refit and traversal. The raw
-query pool is only read after the trace fence signals; the wgpu query resolve
-is mapped asynchronously after submission. A pending measurement is skipped,
-not waited for. Unsupported queries are omitted. The numbers are stage samples,
-not synchronized frame-time percentiles.
+Lighter logs GPU stage samples at most once per second per source. The
+Software BVH is packed/refit on the CPU, so it has no GPU AS build to time.
+Vulkan reports AS build/refit, raster primary (if active), and ray traversal
+separately. wgpu reports Software traversal, reprojection, filtering and
+upscale/compose. The raw query pool is read only after its fence signals,
+and wgpu uses a three-slot timestamp readback ring. Unsupported or pending
+queries do not block the viewer. Headless capture GPU stages are separate
+from its synchronized draw-plus-readback wall time.
 
-The raw Vulkan allocator's default ceiling is **8 GiB** or the largest
-reported device-local heap, whichever is smaller. It charges Vulkan buffer
-memory requirements for BLAS/TLAS, scratch, uploads and staging, and the
-shared image, including transient growth. Departed BLAS retire before new chunks
-claim that space. This is a conservative Lighter allocation ceiling, not an
-estimate of free VRAM or a claim about the whole viewer. Software stays under
-its stricter per-binding, packed mesh and image ceilings. The viewer requests
-at most 256 MiB per storage binding (or the adapter's limit); the texel bank is
-capped at 128 MiB or the device's storage limit, whichever is smaller. Trace,
-two history buffers and filter each reserve at most 64 MiB.
+The raw Vulkan allocator's ceiling is **6.5 GB** or the largest reported
+local heap, whichever is smaller. It charges Vulkan memory requirements for
+BLAS/TLAS, scratch, uploads and staging, the shared image and optional raster
+attachments, including transient growth. Departed BLAS retire before new
+chunks claim that space. Where `VK_EXT_memory_budget` is advertised, the menu
+also shows the driver's device-local usage estimate and warns at 7 GB. The
+raw limit is **not** a hard 7 GB cap on the whole application or the adapter.
+Tracked allocations exclude Native scene/UI/swapchain resources and opaque
+wgpu/driver allocations. The live cadence reports a rolling 1% low for normal
+presents, not headless timings or frame-generation cadence.
+
+Software stays under per-binding, packed mesh and image ceilings. The viewer
+requests at most 256 MiB per storage binding (or the adapter's limit); the
+texel bank is capped at 128 MiB or the device's storage limit, whichever is
+smaller. Trace, two history buffers and filter each reserve at most 64 MiB.
 The Vulkan device's primitive, instance, address and alignment limits also apply.
 
 Terrain blend masks store one byte per texel instead of four. With the same

@@ -61,6 +61,27 @@ fn reference_sky(d: vec3<f32>) -> vec3<f32> {
     let moon = smoothstep(0.9985,0.9992,dot(d,frame.moon_disc.xyz))*frame.moon_disc.w;
     return linear(encoded(raw)*tint)+vec3<f32>(0.45,0.5,0.6)*moon;
 }
+fn bilinear_sky(at: u32, x: i32, y: i32, f: vec2<f32>, d: vec3<f32>) -> vec3<f32> {
+    let w = i32(SKY_COLUMNS);
+    let h = i32(SKY_ROWS);
+    let a = u32((x+w)%w);
+    let b = u32((x+1+w)%w);
+    let c = u32(clamp(y,0,h-1))*SKY_COLUMNS;
+    let e = u32(clamp(y+1,0,h-1))*SKY_COLUMNS;
+    return mix(mix(sky_cell_rgb(at,c+a,d),sky_cell_rgb(at,c+b,d),f.x),
+               mix(sky_cell_rgb(at,e+a,d),sky_cell_rgb(at,e+b,d),f.x),f.y);
+}
+fn diffuse_sky(d: vec3<f32>) -> vec3<f32> {
+    let phi = atan2(d.z,d.x)/(2.*BSDF_PI);
+    let grid = vec2<f32>(fract(phi),d.y*0.5+0.5)*vec2<f32>(f32(SKY_COLUMNS),f32(SKY_ROWS))-0.5;
+    let p = vec2<i32>(floor(grid));
+    let f = fract(grid);
+    let fade = sky_fade();
+    var rgb = bilinear_sky(frame.sky_cdf.x,p.x,p.y,f,d);
+    if fade>0. { rgb = mix(rgb,bilinear_sky(frame.sky_cdf.y,p.x,p.y,f,d),fade); }
+    let moon = smoothstep(0.9985,0.9992,dot(d,frame.moon_disc.xyz))*frame.moon_disc.w;
+    return linear(encoded(rgb)*clamp(frame.sky_tint.rgb,vec3<f32>(0.),vec3<f32>(1.)))+vec3<f32>(0.45,0.5,0.6)*moon;
+}
 // Corresponds to Surface::emitter; these use a simple filtered base channel
 // and do not need a second dispatch of the authored surface interpreter.
 fn reference_emitter(flags: u32, face_mode: u32, gloss: u32, emission: vec3<f32>) -> bool {

@@ -625,6 +625,7 @@ pub struct Builder {
 struct CachedMesh {
     shape: Fingerprint,
     tree: Bvh,
+    posed_bounds: Vec<Bounds>,
 }
 
 struct CachedTree<K> {
@@ -649,7 +650,7 @@ impl<K: PartialEq> CachedTree<K> {
             self.bounds = bounds;
             [1, 0]
         } else if self.bounds != bounds {
-            self.tree.refit(&bounds);
+            self.tree.refit_changed(&self.bounds, &bounds);
             self.bounds = bounds;
             [0, 1]
         } else {
@@ -720,7 +721,10 @@ impl AccelCache {
                 std::collections::hash_map::Entry::Occupied(e) => {
                     let entry = e.into_mut();
                     if entry.shape != mesh.shape {
-                        entry.tree.refit(&bounds());
+                        let next = bounds();
+                        debug_assert_eq!(entry.posed_bounds.len(), next.len());
+                        entry.tree.refit_changed(&entry.posed_bounds, &next);
+                        entry.posed_bounds = next;
                         entry.shape = mesh.shape;
                         self.refits[0] += 1;
                     }
@@ -728,9 +732,15 @@ impl AccelCache {
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
                     self.builds[0] += 1;
+                    let bounds = bounds();
                     e.insert(CachedMesh {
                         shape: mesh.shape,
-                        tree: Bvh::from_bounds(&bounds()),
+                        tree: Bvh::from_bounds(&bounds),
+                        posed_bounds: if matches!(mesh.key, MeshKey::Posed(..)) {
+                            bounds
+                        } else {
+                            Vec::new()
+                        },
                     })
                 }
             };
@@ -810,7 +820,7 @@ impl Builder {
             let nodes: usize = self
                 .meshes
                 .iter()
-                .map(|m| Bvh::node_count(m.triangle.len()))
+                .map(|m| Bvh::node_bound(m.triangle.len()))
                 .sum();
             nodes * super::bvh::NODE_WORDS as usize
                 + self.triangles.len()
@@ -1356,6 +1366,22 @@ pub struct Packet {
     attachments: Vec<Attachment>,
     triangle_count: usize,
     pub(super) hardware_only: bool,
+}
+
+// Geometry-only changes can keep history at pixels which never sampled any
+// moving geometry. A light or projected decal can change a fixed receiver
+// even without a moving-triangle hit, so compare their real serialized spans.
+pub(super) fn same_moving_lighting(old: &[u32], new: &[u32]) -> bool {
+    fn span(words: &[u32], header: usize, stride: usize) -> Option<&[u32]> {
+        let start = *words.get(header)? as usize;
+        let count = *words.get(header + 1)? as usize;
+        words.get(start..start.checked_add(count.checked_mul(stride)?)?)
+    }
+    [(9, LIGHT_WORDS), (14, 22)]
+        .into_iter()
+        .all(|(header, stride)| {
+            span(old, header, stride).is_some_and(|a| span(new, header, stride) == Some(a))
+        })
 }
 
 impl Packet {

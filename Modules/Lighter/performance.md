@@ -165,3 +165,95 @@ Use the capture tooling in [retail validation](retail-matrix.md) to retain
 GPU build/traversal samples and wall times separately. The synthetic
 submerged check is not a reproduction of the reported retail seam; retail
 screenshots and the physical GPU comparison are still needed.
+
+## Transport, hybrid visibility and noise follow-up
+
+Native is still the first renderer at launch. **Reload World** also stages
+changes to the experimental raster-primary pipeline, so its initial compile is
+in the watched replacement, not the working window. Software keeps full
+primary rays. Hardware keeps full rays by default and uses them for Reference,
+multiple samples, or failed optional raster attachment admission.
+
+| Checklist area | Status and scope |
+|---|---|
+| Shadow traversal | **Already present:** early-out on the first accepted opaque blocker, with a separate ordered colored-transmission query. Hardware uses inline ray queries, not a closest-hit shader. **Added:** skip unnecessary hit decoding on blocker commits; reuse binary hard-sun visibility only for a stationary, matching one-sample snapshot. |
+| Ray count and noise | **Added:** sample one Fresnel lobe at every dielectric, with tint and radiance `eta²` on transmission and probability compensation for roulette from depth two. Keep deterministic first split as the control. Soft-sun primary samples use a shifted Sobol sequence; stochastic radiance does not jitter single-sample primary depth or cutout coverage. |
+| Direct proposals | **Already present:** back-face rejection, range/influence culling, and Reference sky and power-weighted mesh proposals. **Added:** resample one of the eligible local proposals with inverse-PMF weighting when shadows and more than four local sources are active. No temporal/spatial light reservoirs. |
+| Primary visibility | **Experimental:** packet-driven reverse-Z raster pass writes instance, triangle, hit distance and barycentrics. Same material acceptance, including cutouts, and the same posed vertices/transforms. Frustum culling and contiguous batches only affect the raster pass, not secondary or shadow BVHs. Sheets still use ordered ray visibility. Raster coverage at subpixel edges and exactly coplanar solid ties is not guaranteed to match a ray query. |
+| History and filtering | **Added:** 28 B/pixel instead of 32 B (12.5% less at equal extent), FP32 depth, packed guides, half RGB/log variance, owner/depth checks, bounded variance-adaptive history. Reject moving-path, water-wave and scrolling dependencies selectively; reset for changed light/decal records or scene revision. Two local à-trous passes on a fresh image; three wider passes when usable history exists. Reuse dead trace output and one scratch, with no extra full-resolution history. |
+| Software BVH | **Added:** 2–4 child stackless layout with 12-bin SAH for larger partitions, and sparse leaf/ancestor refits with a dense fallback. No change to the WGSL escape ABI. Immediate CPU partition cost can increase; no hardware BLAS layout claim. |
+| Sky and medium | **Alternative:** bilinearly reuse the precomputed sky table only on interactive diffuse misses; primary, mirrors and refraction retain the authored filtered art. No screen-space GI cache. Water keeps exact per-leg exponential extinction (with a zero-length fast path), not a new fog LUT. |
+| Texture and streaming work | **Existing/partial:** authored mips, ray-side packed mask bytes and budgets, rank/reuse of decoded scenery, dirty upload ranges and retired ASes. Ray material texels are still decoded into a storage bank; no BC1/3/5/7 hardware-sampled ray texture array. No new residency cap or loader-thread packet pacing here: mask admission and packet assembly still happen during install. |
+| Pipeline startup | **Added:** validate and compact individual Vulkan entry points; best-effort bounded driver cache keyed by adapter/driver UUID. No guaranteed cache hit or physical cold-start reduction. |
+| Upscaling / SDKs | **Alternative:** built-in guide-aware composition and opt-in 50–100% adaptive ray scale with hysteresis. The bundled FidelityFX integration is DX12, and the NVIDIA Ray Reconstruction headers do not supply an integrated Vulkan runtime path. Neither FSR nor DLSS RR handles ray-world reconstruction here. |
+| Measurement | **Added:** nonblocking AS/raster/trace, reprojection, denoise and upscale/compose timing; normal-present 1% low; tracked ray allocations and optional driver heap usage. See [the limits and 7 GB warning](gpu-budget.md). A physical RTX 3080 FPS, tail latency or whole-viewer VRAM target is not verified. |
+
+### Reproduce the matched synthetic capture
+
+Use the same Vulkan ICD throughout. The Linux-only test explicitly admits a
+CPU ray-query adapter for the fixture, which production still rejects for
+Hardware mode. This is not a retail map or a GPU performance claim.
+
+```sh
+WGPU_BACKEND=vulkan GALLIVM_PERF=nopt PW_SMALL_TREE_ATLAS=1 \
+PW_PREVIEW_WEATHER=Clear PW_PREVIEW_TIMED_FRAMES=9 \
+PW_SAVE_LIGHTER_MATCHED=target/lighter-matched-fixture \
+  cargo test --locked --bin perfect-world-explorer lighter_matched_fixture_capture -- --ignored --nocapture
+```
+
+For actual GPU measurements, use `--profile physical --hybrid-ab` with the
+[retail capture matrix](retail-matrix.md). Inspect the matched color and depth
+controls first; render-stage intervals may vary by driver. Compare Hybrid's
+**raster plus traversal** cost and complete frame time, not the traversal
+marker alone. Keep frame-time tail and memory measurements separate from
+headless image readback.
+
+### Matched local results
+
+Pinned `19afdaf` (capture-only test scaffolding) and this follow-up ran on
+**llvmpipe, Mesa 25.0.7 / LLVM 19.1.7**, with `GALLIVM_PERF=nopt`. All
+captures used the same synthetic streamed-map camera, noon/clear light,
+four 16 ms warm-ups, a frozen clock, 960×720 output and 480×360 internal
+rays. Each timing is from nine warmed draws **including synchronized
+readback**. Adaptive scale and progressive sampling were off. The follow-up
+retains the default Single-path and filter changes, so the before/after rows
+measure the combined change, not just the addition of raster visibility.
+
+| Path | `19afdaf` p50 / p95 (ms) | Follow-up p50 / p95 (ms) |
+|---|---:|---:|
+| Native | 153.2 / 243.9 | 146.1 / 160.9 |
+| Software BVH | 3242.7 / 3369.4 | 3230.5 / 3324.4 |
+| Full Vulkan rays | 2184.1 / 2314.8 | 2229.0 / 2299.0 |
+| Hybrid Vulkan | — | 2206.3 / 2315.6 |
+
+Native's decoded RGBA8 hash was identical. Full rays vs Hybrid averaged
+**0.00020 RGB8 levels** of difference over the frame (119 of 691,200 pixels
+changed; maximum channel delta 38). The subpixel raster parity fixture checks
+sampled interiors, not exact silhouette coverage. It passed at 19², 25² and
+43² with a maximum reverse-Z error of `3e-7`, then exercised water ownership,
+terrain joins, ordered sheets, off-screen posed shadows and simulated raster
+allocation fallback/retry.
+
+Hybrid's warmed combined raw GPU-stage median was **2094.8 ms** vs **2118.1
+ms** for full rays on this CPU driver. The driver attributed nearly all of
+Hybrid's combined time to the interval ending at the raster marker, so this
+is not evidence of near-zero traversal cost. The wall-time difference is
+small, p95 is slightly worse, and the raster attachments cost an additional
+3,456,000 tracked bytes here. There is no clear win that warrants enabling
+Hybrid by default. At equal ray extent, full-ray Vulkan input/AS/output
+allocations went from 6,040,440 to 5,349,240 B, exactly the reduction in the
+raw output stride. The wgpu resources and total GPU residency are separate.
+
+The 96², zero-bounce, filter-off full-ray chunk sweep was faster on this ICD:
+43.5→39.5 ms (512 triangles), 45.3→41.6 ms (2,048), and 50.8→42.6 ms (8,192).
+The larger streamed control did **not** show an end-to-end full-ray speedup.
+Neither run establishes RTX 3080 performance.
+
+In the soft-sun fixture both tracers gave 0.382 penumbra visibility (analytic
+0.388) and reduced spatial variance from 0.2456 to 0.0020 without brightening
+the deep shadow. Separate unfiltered 65² tests matched the split/full-light
+means for Fresnel, roulette and local-light resampling within 0.0025 per
+linear RGB channel; they also checked unchanged primary depth. The stationary
+sun fixture verifies cache bits survive filtering, a displaced shadow does
+not reuse old history, unaffected pixels keep history, and colored glass
+still traces RGB transmittance.
