@@ -104,11 +104,11 @@ pub struct Entry {
 /// alignment padding after the struct, which is why the trailer looks eight
 /// bytes longer than it is).
 #[derive(Clone, Copy)]
-struct Revision {
-    version: u32,
+pub(crate) struct Revision {
+    pub(crate) version: u32,
     /// `sizeof(FILEHEADER*)` — the trailer alone, without the count or the
     /// version word that follow it.
-    header: usize,
+    pub(crate) header: usize,
     /// `sizeof(FILEENTRY*)`, which is also the size of an uncompressed entry
     /// record: `szFileName[260]`, `dwOffset`, `dwLength`,
     /// `dwCompressedLength`, `iAccessCnt`, plus `Zalupa0`/`Zalupa1` in the
@@ -123,11 +123,11 @@ struct Revision {
     /// Where `dwCompressedLength` starts.
     compressed_at: usize,
     /// Where `dwFlags` starts inside the trailer.
-    flags_at: usize,
+    pub(crate) flags_at: usize,
     /// Where `szDescription` starts inside the trailer.
     description_at: usize,
     /// Where `guardByte1` starts inside the trailer.
-    guard_byte1: usize,
+    pub(crate) guard_byte1: usize,
 }
 
 /// One table serves all three revisions; only the sizes differ.
@@ -146,7 +146,7 @@ struct Revision {
 /// The count is *not* a trailer field in any revision: the client reads it from
 /// `end - 8`, the four bytes between the trailer and the version word at
 /// `end - 4`.
-const REVISIONS: [Revision; 3] = [
+pub(crate) const REVISIONS: [Revision; 3] = [
     Revision {
         version: 0x2_0003,
         header: 280,
@@ -184,6 +184,34 @@ const REVISIONS: [Revision; 3] = [
         guard_byte1: 268,
     },
 ];
+
+/// The guard pair `guardByte0` / `guardByte1` that every revision's trailer
+/// carries.
+///
+/// The value is the same in every revision because it is the engine's own
+/// constant, not a per-format choice, which is why one pair serves the retail
+/// reader and the `configs.pck` reader alike. Naming it once is the point: the
+/// Angelica reader used to spell `0xfdfdfeee`/`0xf00dbeef` a second time
+/// beside a pair for other builds, so a reader that accepted one and a writer
+/// that checked the other could drift apart with nothing to catch it.
+pub(crate) const GUARD_0: u32 = 0xfdfdfeee;
+pub(crate) const GUARD_1: u32 = 0xf00dbeef;
+
+/// The revision whose trailer *is* an Angelica package trailer.
+///
+/// `configs.pck` and `shaders.pck` carry the same 280-byte tail as the retail
+/// package's oldest revision: a 272-byte `FILEHEADER`, then the count, then the
+/// version word. That is why the Angelica reader can share this table rather
+/// than restate it -- the layout is not similar, it is identical, and the two
+/// shipped archives' `0x00020002` word is a retail revision number.
+pub(crate) fn angelica_revision(version: u32) -> Option<Revision> {
+    match version {
+        // `0x00020001` shares the layout byte for byte, so it is read on the
+        // word the archive states rather than refused for the one it does not.
+        0x0002_0001 | 0x0002_0002 => REVISIONS.iter().find(|r| r.version == 0x0002_0002).copied(),
+        _ => None,
+    }
+}
 
 /// Validate the 12-byte prefix every package starts with.
 ///
@@ -1137,6 +1165,43 @@ pub fn skipped_corpus_tests() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Angelica readers and the retail reader must agree on the trailer.
+    ///
+    /// `configs.pck` and `shaders.pck` carry the retail package's oldest
+    /// revision, and this asserts it rather than restating it: if a later change
+    /// moves the offsets in `REVISIONS`, `angelica_pck` moves with them instead
+    /// of silently keeping a second, divergent copy of the layout.
+    #[test]
+    fn the_angelica_trailer_is_the_retail_revisions_trailer() {
+        let v1 = angelica_revision(0x0002_0001).expect("0x00020001 is an Angelica trailer");
+        let v2 = angelica_revision(0x0002_0002).expect("0x00020002 is an Angelica trailer");
+        for rev in [v1, v2] {
+            let retail = REVISIONS
+                .iter()
+                .find(|r| r.version == 0x0002_0002)
+                .expect("the retail table carries 0x00020002");
+            assert_eq!(rev.header, retail.header);
+            assert_eq!(rev.guard_byte1, retail.guard_byte1);
+            // 272-byte header + count + version word is the 280-byte tail the
+            // Angelica reader anchors its walk on.
+            assert_eq!(rev.header + 8, 280);
+            assert_eq!(rev.guard_byte1, 268);
+        }
+        // The pair for other builds is gone on purpose: it was never in a
+        // staged archive and `pck` itself never accepted it.
+        assert!(angelica_revision(0x0000_0000).is_none());
+        assert!(angelica_revision(0x0002_0003).is_none());
+    }
+
+    /// And the guard pair is one constant, not two spellings of the same value.
+    #[test]
+    fn the_package_guard_pair_is_the_retail_one() {
+        assert_eq!(GUARD_0, 0xfdfdfeee);
+        assert_eq!(GUARD_1, 0xf00dbeef);
+        let v2 = REVISIONS.iter().find(|r| r.version == 0x0002_0002).unwrap();
+        assert_eq!(v2.guard_byte1, 268);
+    }
 
     /// A missing staged-client file must count as a skip, not as a pass.
     ///

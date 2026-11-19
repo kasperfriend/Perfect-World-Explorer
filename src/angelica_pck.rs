@@ -15,7 +15,7 @@
 //! | `0x000` | `u32 0x4dca23ef`, file size, `u32 0x56a089b7` |
 //! | `0x00c` | file payloads; stored raw or bare zlib |
 //! | directory | `count` records, each an 8-byte prefix then a zlib stream of one 276-byte record, stored backwards |
-//! | `-280` | 280-byte trailer: guard `0xa508bdc4`, version, description, guard `0x853567c8`, count at `+272`, version at `+276` |
+//! | `-280` | 280-byte trailer: guard `0xfdfdfeee`, version, description, guard `0xf00dbeef` at `+268`, count at `+272`, version at `+276` |
 //!
 //! The directory is not a forward table: starting at the trailer, each record
 //! is the zlib stream that ends exactly at the current position. The 8-byte
@@ -105,18 +105,42 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
         .map_err(|e| e.to_string())?;
     let mut blob = Vec::with_capacity((file_len - tail_start) as usize);
     f.read_to_end(&mut blob).map_err(|e| e.to_string())?;
-    let trailer = blob.len() - 280;
-    let guard = u32le(&blob, trailer)?;
-    let guard2 = u32le(&blob, trailer + 268)?;
-    let version = u32le(&blob, trailer + 276)?;
-    // Both shipped archives use the `0xfdfdfeee` / `0xf00dbeef` pair; the
-    // `0xa508bdc4` / `0x853567c8` pair is accepted for other Angelica builds.
-    let known_guard = (guard == 0xa508bdc4 && guard2 == 0x853567c8)
-        || (guard == 0xfdfdfeee && guard2 == 0xf00dbeef);
-    if !known_guard || (version != 0x20002 && version != 0x20001) {
-        return Err("unsupported Angelica trailer".into());
+    // The trailer is the retail package's oldest revision, byte for byte: a
+    // 272-byte `FILEHEADER`, the count, then the version word. Both shipped
+    // archives state `0x00020002` (1.5.2's `configs.pck`) or `0x00020001`
+    // (`shaders.pck`), which is why the layout, the field offsets and the guard
+    // pair all come from the one table in `pck` instead of a second copy here.
+    //
+    // The `0xa508bdc4` / `0x853567c8` pair that an earlier version also accepted
+    // is gone: it appears in no staged archive, `pck` never accepts it, and two
+    // readers disagreeing about which guards are valid is the thing this
+    // consolidation removes. An archive carrying it is refused by name below.
+    //
+    // The version word sits in the last four bytes, exactly as in a retail
+    // package, and it is what says how long the trailer is -- so it is read
+    // first, the same order `pck::read_trailer` uses.
+    let version = u32le(&blob, blob.len() - 4)?;
+    let Some(rev) = crate::pck::angelica_revision(version) else {
+        return Err(format!(
+            "unsupported Angelica trailer: version {version:08x} is not a package \
+             revision this build reads"
+        ));
+    };
+    // `header` is `sizeof(FILEHEADER*)`; the count follows it and the version
+    // word follows the count.
+    let trailer = blob.len() - (rev.header + 8);
+    let header = &blob[trailer..trailer + rev.header];
+    let guard = u32le(header, 0)?;
+    let guard2 = u32le(header, rev.guard_byte1)?;
+    if guard != crate::pck::GUARD_0 || guard2 != crate::pck::GUARD_1 {
+        return Err(format!(
+            "unsupported Angelica trailer: guard {guard:08x}/{guard2:08x} is not the \
+             package guard pair {:08x}/{:08x}",
+            crate::pck::GUARD_0,
+            crate::pck::GUARD_1
+        ));
     }
-    let count = u32le(&blob, trailer + 272)? as usize;
+    let count = u32le(&blob, trailer + rev.header)? as usize;
     if count > 1_000_000 {
         return Err("Angelica entry count exceeds limit".into());
     }
@@ -203,9 +227,9 @@ mod tests {
         out.extend_from_slice(&[0u8; 8]); // 8-byte record prefix
         out.extend_from_slice(&stream);
         let mut header = vec![0u8; 280];
-        header[0..4].copy_from_slice(&0xa508bdc4u32.to_le_bytes());
+        header[0..4].copy_from_slice(&crate::pck::GUARD_0.to_le_bytes());
         header[4..8].copy_from_slice(&0x20002u32.to_le_bytes());
-        header[268..272].copy_from_slice(&0x853567c8u32.to_le_bytes());
+        header[268..272].copy_from_slice(&crate::pck::GUARD_1.to_le_bytes());
         header[272..276].copy_from_slice(&1u32.to_le_bytes());
         header[276..280].copy_from_slice(&0x20002u32.to_le_bytes());
         out.extend_from_slice(&header);

@@ -583,6 +583,30 @@ pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// The shared ordinary-package trailer description, mirrored from `pck` so the
+/// real `angelica_pck` compiles against this stand-in unchanged. Only the fields
+/// it reads are carried.
+#[derive(Clone, Copy)]
+pub(crate) struct Revision {
+    pub(crate) version: u32,
+    pub(crate) header: usize,
+    pub(crate) guard_byte1: usize,
+}
+
+pub(crate) const GUARD_0: u32 = 0xfdfdfeee;
+pub(crate) const GUARD_1: u32 = 0xf00dbeef;
+
+pub(crate) fn angelica_revision(version: u32) -> Option<Revision> {
+    match version {
+        0x0002_0001 | 0x0002_0002 => Some(Revision {
+            version: 0x0002_0002,
+            header: 272,
+            guard_byte1: 268,
+        }),
+        _ => None,
+    }
+}
+
 /// Mirrors the counted skip in the real `pck`: the offline stand-in must not be
 /// quieter than the thing it stands in for, or an offline run reports a corpus
 /// test as a pass when it looked at nothing. (Same defect as the bare
