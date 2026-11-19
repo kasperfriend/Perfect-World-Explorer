@@ -593,6 +593,9 @@ pub(crate) struct Revision {
     pub(crate) guard_byte1: usize,
 }
 
+/// Mirrors `pck::ENTRY_LIMIT` so the real `angelica_pck` compiles here.
+pub(crate) const ENTRY_LIMIT: usize = 1_000_000;
+
 pub(crate) const GUARD_0: u32 = 0xfdfdfeee;
 pub(crate) const GUARD_1: u32 = 0xf00dbeef;
 

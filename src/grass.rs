@@ -107,6 +107,23 @@ fn note(sink: &std::sync::Mutex<Vec<String>>, message: String) {
     }
 }
 
+/// Bounds on one MOXB mesh, from the 138 in the staged `grasses.pck`.
+///
+/// Measured maxima there are 56 vertices and 144 indices; these are set high
+/// enough that a genuine larger mesh still reads, and low enough that a damaged
+/// count cannot allocate a gigabyte.
+const MAX_MOXB_VERTICES: usize = 100_000;
+const MAX_MOXB_INDICES: usize = 300_000;
+
+/// Bound on the names a grass EC-BSD placement file declares.
+///
+/// Measured maximum is *not available*: no staged pack contains an EC-BSD at
+/// all. `grasses.pck` and `trees.pck` were both scanned for the
+/// `0x42584f4d` / `0x42534446` identity and neither carries one, so this rests
+/// on the producer's shape rather than on data -- a placement file names its
+/// textures, and 10,000 is far past any plausible list.
+const ECBSD_NAME_LIMIT: usize = 10_000;
+
 fn cstr<'a>(b: &'a [u8], start: usize) -> Result<(&'a [u8], usize), String> {
     let bytes = b.get(start..).ok_or("invalid MOXB string")?;
     let n = bytes
@@ -246,8 +263,23 @@ fn parse_model(b: &[u8], name: &str) -> Result<Model, String> {
         let nv = u(b, p)? as usize;
         let ni = u(b, p + 4)? as usize;
         let nf = u(b, p + 8)? as usize;
-        if nv == 0 || nv > 100_000 || ni == 0 || ni > 300_000 || ni % 3 != 0 || nf != 1 {
-            return Err("unsupported MOXB mesh".into());
+        // Measured over all 138 MOXB meshes in the staged `grasses.pck`: at most
+        // 56 vertices and 144 indices, and `nf` is exactly 1 in every one. The
+        // caps sit three orders of magnitude above those and exist to stop a
+        // damaged count from reserving memory. `nf != 1` is a different kind of
+        // check -- the mesh is one triangle-strip frame, and a file declaring
+        // more is a layout this reader has not been shown -- so it stays an
+        // equality and says so by name rather than joining the caps.
+        if nv == 0 || nv > MAX_MOXB_VERTICES || ni == 0 || ni > MAX_MOXB_INDICES || ni % 3 != 0 {
+            return Err(format!(
+                "unsupported MOXB mesh: {nv} vertices (limit {MAX_MOXB_VERTICES}), \
+                 {ni} indices (limit {MAX_MOXB_INDICES})"
+            ));
+        }
+        if nf != 1 {
+            return Err(format!(
+                "unsupported MOXB frame count {nf}; this build reads the one-frame layout"
+            ));
         }
         let tex = find(b, p, b"TEXTURE: ")?;
         let vertbytes = nv.checked_mul(32).ok_or("MOXB vertex overflow")?;
@@ -338,8 +370,11 @@ fn grass_names(
         return Err("the EC-BSD is not a placement file this build reads");
     }
     let n = u(b, 12).unwrap_or(0) as usize;
-    if n > 10000 {
-        return Err("the grass EC-BSD declares an implausible name count");
+    if n > ECBSD_NAME_LIMIT {
+        // This function returns `&'static str`, so the bound is reported by
+        // name rather than formatted. The measured maximum is unavailable (no
+        // staged pack carries an EC-BSD at all); see `ECBSD_NAME_LIMIT`.
+        return Err("the grass EC-BSD declares more names than a placement file can hold");
     }
     let mut p = 0x4c;
     let mut names = Vec::new();

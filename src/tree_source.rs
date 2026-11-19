@@ -26,6 +26,12 @@ pub fn extract(root: &Path, out: &Path) -> Result<(), String> {
 /// `source_count` may exceed the authored table: the legacy checked-in bridge
 /// always loops 59 types, so instance maps with fewer types are padded with
 /// repeated source files. `Trees::open` reads only the scene's authored types.
+/// Upper bound on the tree source count handed to the SpeedTree bridge.
+///
+/// See the call site: the measured maximum across staged clients is 59 tree
+/// types, and this is a guard against a mistyped count.
+const TREE_SOURCE_LIMIT: usize = 10_000;
+
 pub fn extract_for_scene(
     element: &Path,
     scene_path: &Path,
@@ -35,8 +41,17 @@ pub fn extract_for_scene(
     if out.exists() {
         return Err("output path already exists; choose a new directory".into());
     }
-    if source_count > 10000 {
-        return Err("tree source count exceeds the SpeedTree bridge limit".into());
+    // The bridge's own bound, not a measured one: the largest tree table in any
+    // staged client is 59 types (`windows_setup::LEGACY_BRIDGE_TREE_TYPES` says
+    // why 59 is the padded size), so a caller asking for more than 10,000 is
+    // asking the DLL to bake a table no client authors. The number is two
+    // orders of magnitude above the measured maximum and exists to reject a
+    // mistyped count, not to police a newer client.
+    if source_count > TREE_SOURCE_LIMIT {
+        return Err(format!(
+            "tree source count {source_count} exceeds the SpeedTree bridge limit \
+             {TREE_SOURCE_LIMIT}"
+        ));
     }
     let scene = scene::Scene::load(scene_path)?;
     if source_count > 0 && scene.tree_types.is_empty() {

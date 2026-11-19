@@ -141,8 +141,14 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
         ));
     }
     let count = u32le(&blob, trailer + rev.header)? as usize;
-    if count > 1_000_000 {
-        return Err("Angelica entry count exceeds limit".into());
+    // The same bound as the retail reader, and for the same reason: the largest
+    // staged Angelica package is 1.5.2's `configs.pck` at 58 entries, so this
+    // only ever fires on a damaged count.
+    if count > crate::pck::ENTRY_LIMIT {
+        return Err(format!(
+            "Angelica entry count {count} exceeds limit {}",
+            crate::pck::ENTRY_LIMIT
+        ));
     }
     let mut pos = trailer;
     let mut reversed = Vec::with_capacity(count);

@@ -220,6 +220,13 @@ pub fn is_encrypted_refusal(err: &str) -> bool {
     err.starts_with(ENCRYPTED_REFUSAL)
 }
 
+/// Upper bound on a package's entry count.
+///
+/// The number is a memory guard, not a property of the format: the largest
+/// staged pack declares 3,499 entries, and this sits ~285x above it. Exceeding
+/// it means the count word is damaged.
+pub(crate) const ENTRY_LIMIT: usize = 1_000_000;
+
 /// The revision whose trailer *is* an Angelica package trailer.
 ///
 /// `configs.pck` and `shaders.pck` carry the same 280-byte tail as the retail
@@ -493,8 +500,13 @@ fn read_directory(
             rev.version
         ));
     }
-    if count > 1_000_000 {
-        return Err("entry count exceeds limit".into());
+    // Measured maxima, largest staged pack first: `gfx.pck` 3,499 entries,
+    // `grasses.pck` 1,453, `textures.pck` 943, `trees.pck` 326, `configs.pck`
+    // 58. The limit is two orders of magnitude above the largest of those and
+    // exists to stop a damaged count from reserving memory, not to police what
+    // a newer client may ship -- so it is a bound, not a format rule.
+    if count > ENTRY_LIMIT {
+        return Err(format!("entry count {count} exceeds limit {ENTRY_LIMIT}"));
     }
     // The client unmasks the entry offset in place (`dwEntryOffset ^=
     // AFPCK_MASKDWORD`) and seeks there; the trailer follows the table, so a
