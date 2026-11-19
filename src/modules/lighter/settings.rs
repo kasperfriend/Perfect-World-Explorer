@@ -307,6 +307,6 @@ mod tests {
         assert!(!e.progressive && reference.progressive);
         assert_eq!(e.diffuse_distance, 0);
         assert!(!e.hybrid_primary && !e.single_path && !e.dynamic_resolution);
-                assert!(reference.hybrid_primary && reference.single_path && reference.dynamic_resolution);
+        assert!(reference.hybrid_primary && reference.single_path && reference.dynamic_resolution);
     }
 }
