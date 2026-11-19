@@ -1918,11 +1918,7 @@ impl Lighter {
             } else {
                 0
             }
-            | if settings.single_path {
-                SINGLE_PATH
-            } else {
-                0
-            }
+            | if settings.single_path { SINGLE_PATH } else { 0 }
             | if settings.physical_bsdf {
                 PHYSICAL_BSDF
             } else {
