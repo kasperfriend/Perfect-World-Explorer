@@ -265,7 +265,9 @@ fn lighter_bc_texture_pages_interop() {
     assert_eq!(h.ray.bc_page_stats(), stats);
     h.ray.install(Ok((scene(), buffer)));
     let fallback = draw(&mut h, 1);
-    assert_eq!(h.ray.bc_page_stats(), [0; 3]);
+    // The mismatched bank cannot sample any pages, but the persistent
+    // images are still allocated and must be charged to the experiment.
+    assert_eq!(h.ray.bc_page_stats(), [0, 0, stats[2]]);
     h.ray.install(Ok((scene(), rgba)));
     let reference = draw(&mut h, 2);
     let mut max = 0;
