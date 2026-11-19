@@ -1318,12 +1318,33 @@ fn lighter_live_viewer_frames() {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "entrypoint for the Xvfb recovery subprocess"]
-fn lighter_live_recovery_child() {
-    let Some(dir) = std::env::var_os("PW_TEST_LIGHTER_RECOVERY_DIR") else {
+#[ignore = "requires an X11 display and a CPU Vulkan adapter without hardware RT"]
+fn lighter_live_world_reload() {
+    let root = FixtureRoot::new();
+    std::fs::write(
+        root.0.join("reload-test"),
+        b"native => hardware rejection => software",
+    )
+    .unwrap();
+    super::super::run_viewer(fixture(&root.0), Some(&root.0)).unwrap();
+    for file in ["0.png", "after-failed-reload.png", "reload-software.png"] {
+        assert_world_png(&root.0.join(file), (160, 96));
+    }
+    let child_pid: u32 = std::fs::read_to_string(root.0.join("restored-present"))
+        .expect("same-world reload did not present")
+        .parse()
+        .unwrap();
+    assert_ne!(child_pid, std::process::id());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "entrypoint for an Xvfb handoff subprocess"]
+fn lighter_live_handoff_child() {
+    let Some(dir) = std::env::var_os("PW_TEST_LIGHTER_VIEWER_DIR") else {
         return;
     };
-    assert!(super::super::is_device_recovery_child());
+    assert!(super::super::same_world_handoff().is_some());
     let root = FixtureRoot::new();
     if let Err(error) = super::super::run_viewer(fixture(&root.0), Some(std::path::Path::new(&dir)))
     {

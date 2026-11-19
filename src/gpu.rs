@@ -4745,6 +4745,17 @@ struct Camera {
     logic_delta_ms: u32,
 }
 impl Camera {
+    fn handoff_view(&self) -> [f32; 6] {
+        [
+            self.pos.x,
+            self.pos.y,
+            self.pos.z,
+            self.yaw,
+            self.pitch,
+            self.time_of_day,
+        ]
+    }
+
     fn new(t: &Terrain) -> Self {
         let x = t.width / 2;
         let y = t.height / 2;
@@ -4938,15 +4949,15 @@ fn selected_map_label(catalog: &crate::world_catalog::Catalog, id: &str) -> Stri
         .unwrap_or_else(|| "(metadata unavailable)".into())
 }
 
-/// A child signals readiness only after its visible window has presented a
-/// usable frame, not when its data structures merely exist in memory.
-fn signal_handoff_first_frame(signaled: &mut bool) {
-    if *signaled || !crate::world_handoff::is_handoff_child() {
-        return;
-    }
-    *signaled = true;
-    crate::world_handoff::publish_progress("First world frame is ready.");
-    crate::world_handoff::signal_ready();
+/// Keep the startup stage in the always-on session log, even if the driver
+/// never returns from work in that stage. Windows' loader has its own pump.
+fn startup_progress(message: &str) {
+    crate::diagnostics::session(format!("Viewer startup: {message}"));
+    eprintln!("Viewer startup: {message}");
+    #[cfg(windows)]
+    crate::windows_setup::loading_progress(message.into());
+    #[cfg(not(windows))]
+    crate::world_handoff::publish_progress(message);
 }
 
 /// Steps the old process must take as soon as a replacement world is ready.
@@ -4983,22 +4994,21 @@ fn close_old_window_after_handoff_ready<T: 'static>(
     }
 }
 
-/// Launch a replacement process for another map. The old process remains the
-/// foreground owner and keeps its own files/focus state; the child only
-/// publishes progress, its HWND, and readiness after a usable frame.
+struct WorldHandoff {
+    files: crate::world_handoff::Files,
+    messages: std::sync::mpsc::Receiver<crate::world_handoff::Message>,
+    // Commit the selected mode only when the same-map replacement is ready.
+    reload: Option<LighterSettings>,
+}
+
+/// Launch a replacement without touching the live renderer/device.
 fn spawn_world_handoff(
     client_root: &std::path::Path,
     map_id: &str,
     focused: bool,
-    recovery: Option<&recovery::Snapshot>,
+    snapshot: Option<&recovery::Snapshot>,
     #[cfg(test)] smoke_dir: Option<&std::path::Path>,
-) -> Result<
-    (
-        crate::world_handoff::Files,
-        std::sync::mpsc::Receiver<crate::world_handoff::Message>,
-    ),
-    String,
-> {
+) -> Result<WorldHandoff, String> {
     let validated = crate::world_catalog::validate_selection(map_id)?;
     let id = validated.to_ascii_lowercase();
     let exe = std::env::current_exe().map_err(|e| format!("cannot find viewer executable: {e}"))?;
@@ -5013,17 +5023,17 @@ fn spawn_world_handoff(
             .args([
                 "--ignored",
                 "--exact",
-                "gpu::lighter_host::tests::lighter_live_recovery_child",
+                "gpu::lighter_host::tests::lighter_live_handoff_child",
                 "--nocapture",
             ])
-            .env("PW_TEST_LIGHTER_RECOVERY_DIR", dir);
+            .env("PW_TEST_LIGHTER_VIEWER_DIR", dir);
     } else {
         command.arg(client_root).arg("--world").arg(&id);
     }
     #[cfg(not(test))]
     command.arg(client_root).arg("--world").arg(&id);
     files.configure(&mut command);
-    recovery::Snapshot::configure(&mut command, recovery);
+    recovery::Snapshot::configure(&mut command, snapshot);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -5047,7 +5057,13 @@ fn spawn_world_handoff(
         files.cleanup();
         return Err(error);
     }
-    Ok((files, rx))
+    Ok(WorldHandoff {
+        files,
+        messages: rx,
+        reload: snapshot
+            .filter(|s| s.kind == recovery::RestoreKind::Reload)
+            .map(|s| s.lighter),
+    })
 }
 
 /// The neutral light a map gets when no environment record answers: full white
@@ -5219,9 +5235,10 @@ async fn adapter(
     Ok((a, d, q))
 }
 const GPU_RETRY_DELAY: Duration = Duration::from_millis(2);
+const FIRST_PRESENT_TIMEOUT: Duration = Duration::from_secs(120);
 
-pub(crate) fn is_device_recovery_child() -> bool {
-    recovery::is_child()
+pub(crate) fn same_world_handoff() -> Option<&'static str> {
+    recovery::is_child().then(|| recovery::kind().label())
 }
 
 pub fn run(
@@ -5242,6 +5259,11 @@ fn run_viewer(
     #[cfg(windows)] loading: Option<crate::windows_setup::LoadingWindow>,
     #[cfg(test)] smoke_dir: Option<&std::path::Path>,
 ) -> Result<(), String> {
+    // Retain the platform loader even if teardown must wait on a driver.
+    #[cfg(windows)]
+    let mut loading = loading;
+    #[cfg(test)]
+    let smoke_reload = smoke_dir.is_some_and(|dir| dir.join("reload-test").exists());
     let current_map = t.map.clone();
     let map_dir = t.map_dir.clone();
     let client_root = t.client_root.clone();
@@ -5265,22 +5287,21 @@ fn run_viewer(
     if let Some(warning) = &catalog.warning {
         eprintln!("World catalog: {warning}");
     }
-    crate::world_handoff::publish_progress(&format!(
-        "Preparing {} ({}) GPU world...",
-        current_map.display_name, current_map.id
-    ));
-    #[cfg(windows)]
-    crate::windows_setup::loading_progress("Preparing GPU world and textures...".into());
-    let mut event_loop = EventLoopBuilder::new();
+    let handoff_child = crate::world_handoff::is_handoff_child();
+    let mut event_loop = EventLoopBuilder::<()>::with_user_event();
     #[cfg(all(test, target_os = "linux"))]
     if smoke_dir.is_some() {
         use winit::platform::x11::EventLoopBuilderExtX11;
         event_loop.with_x11().with_any_thread(true);
     }
     let event_loop = event_loop.build().map_err(|e| e.to_string())?;
+    let startup_redraw = event_loop.create_proxy();
     let window_builder = WindowBuilder::new()
         .with_title("Perfect World Explorer — WASD fly, E/Q altitude, arrows look, Shift speed")
-        .with_maximized(true)
+        // Win32's SW_MAXIMIZE can show/activate even a hidden HWND. Defer it
+        // until a frame exists and a replacement actually owns focus.
+        .with_maximized(!cfg!(windows))
+        .with_active(!handoff_child)
         .with_visible(false);
     #[cfg(test)]
     let window_builder = if smoke_dir.is_some() {
@@ -5305,7 +5326,11 @@ fn run_viewer(
     #[cfg(test)]
     let lighter_settings = if smoke_dir.is_some() && restoring.is_none() {
         LighterSettings {
-            mode: LighterMode::Software,
+            mode: if smoke_reload {
+                LighterMode::Off
+            } else {
+                LighterMode::Software
+            },
             lighting: false,
             shadows: false,
             denoiser: false,
@@ -5322,6 +5347,11 @@ fn run_viewer(
         let gpu = pollster::block_on(adapter(instance, Some(&surface), lighter_settings.mode))?;
         Ok::<_, String>((surface, gpu))
     };
+    startup_progress(&format!(
+        "Opening graphics device for {} — {}",
+        current_map.id,
+        lighter_settings.mode.label()
+    ));
     let mut instance = make_instance(lighter_settings.mode);
     let (mut surface, (adapter, device, queue)) = match try_surface(&instance) {
         Ok(startup) => startup,
@@ -5348,7 +5378,8 @@ fn run_viewer(
         .formats
         .iter()
         .find(|x| x.is_srgb())
-        .unwrap_or(&caps.formats[0]);
+        .or(caps.formats.first())
+        .ok_or("The graphics device offers no surface formats")?;
     // Every material shader returns linear color and the render target performs
     // the single encode. When the swapchain has no sRGB format, composition
     // happens in an sRGB intermediate that is encoded once at presentation
@@ -5369,7 +5400,11 @@ fn run_viewer(
             .view_formats
             .push(surface_format.remove_srgb_suffix());
     }
-    surface.configure(&device, &config);
+    startup_progress(&format!(
+        "Building GPU world and textures on {} ({:?})…",
+        adapter.get_info().name,
+        adapter.get_info().backend
+    ));
     let mut camera = Camera::new(&t);
     if let Some(snapshot) = &restoring {
         let [x, y, z, yaw, pitch, hour] = snapshot.view;
@@ -5386,6 +5421,7 @@ fn run_viewer(
         .atmosphere(camera.pos.to_array(), camera.time_of_day);
     let mut settings = ViewSettings::load_with_default_fog(t.environments.auto_fog_enabled());
     if restoring.is_some() {
+        settings.selected_world = current_map.id.clone();
         settings.time_of_day = camera.time_of_day;
     }
     #[cfg(test)]
@@ -5396,6 +5432,7 @@ fn run_viewer(
             camera.pitch = -std::f32::consts::FRAC_PI_4;
         }
         settings = ViewSettings::default();
+        settings.selected_world = current_map.id.clone();
         settings.time_of_day = camera.time_of_day;
         settings.time_pass_enabled = false;
         settings.show_minimap = false;
@@ -5557,33 +5594,25 @@ fn run_viewer(
     // that wgpu has presented on it at least once.
     let mut presented_once = false;
     let mut display_gamma: Option<crate::display_gamma::DisplayGamma> = None;
-    // Only allocated for UNORM-only swapchains; None is the normal sRGB route.
-    let mut present_encode: Option<crate::present_encode::PresentEncode> =
-        if crate::color_chain::present_encode_required(surface_format.is_srgb()) {
-            Some(crate::present_encode::PresentEncode::new(
-                &renderer.device,
-                surface_format,
-                config.width,
-                config.height,
-            ))
-        } else {
-            None
-        };
+    // Stage the entire first frame (including the menu) offscreen. After the
+    // first present, only a UNORM swapchain still needs the intermediate.
+    let mut present_encode = Some(crate::present_encode::PresentEncode::new(
+        &renderer.device,
+        surface_format,
+        config.width,
+        config.height,
+    ));
+    startup_progress("Preparing the viewer interface and world audio…");
     let zones_path = crate::world_catalog::named_file(&map_dir, "precinct.clt");
     let ui_zones = crate::music::Zones::open(&zones_path).ok();
     let mut music = crate::music::MusicPlayer::new_for_map(&t.element, &zones_path);
     let mut ambience = crate::music::AmbiencePlayer::new_for_map(&t.element, &zones_path);
     let mut world_audio = crate::world_audio::WorldAudio::new(&t.element, &t.scene);
     #[cfg(windows)]
-    drop(loading);
-    window.set_visible(true);
-    if crate::world_handoff::is_handoff_child() {
-        // The child publishes its HWND; only the old foreground process may
-        // activate it. This process must not call SetForegroundWindow itself.
-        if let Ok(hwnd) = window_hwnd(&window) {
-            crate::world_handoff::publish_window_handle(hwnd as usize);
-        }
-        crate::world_handoff::publish_progress("Preparing the first visible frame...");
+    let mut maximize_after_startup = true;
+    #[cfg(all(windows, test))]
+    if smoke_dir.is_some() {
+        maximize_after_startup = false;
     }
     let water_areas = t.water.clone();
     let environments = t.environments.clone();
@@ -5827,33 +5856,49 @@ fn run_viewer(
     // Winit sends Focused(true) when the visible window actually gains focus.
     // Start conservatively so input cannot move the camera before that event.
     let mut window_focused = false;
-    let mut world_loading_active = false;
     let mut world_loading_status = String::from("Preparing the selected world...");
     let mut world_change_notice = startup_notice;
     let mut world_change_error: Option<String> = None;
     let mut selected_world_ui = current_map.id.clone();
     let map_zone = current_map.id.clone();
-    let mut handoff_files: Option<crate::world_handoff::Files> = None;
-    let mut handoff_rx: Option<std::sync::mpsc::Receiver<crate::world_handoff::Message>> = None;
-    let mut handoff_ready_signaled = false;
+    let mut handoff: Option<WorldHandoff> = None;
+    let mut reload_requested = None;
+    let mut close_after_handoff = false;
     let mut gpu_recovering = false;
+    #[cfg(test)]
+    let persist_reload = smoke_dir.is_none();
+    #[cfg(not(test))]
+    let persist_reload = true;
     let mut saved_settings = settings.clone();
     let mut last_settings_save = Instant::now();
     let mut last = Instant::now();
     let mut gpu_retry_at = None;
-    let mut surface_needs_config = false;
+    let mut surface_needs_config = true;
+    let mut first_composition: Option<(Instant, LighterMode)> = None;
+    let mut viewer_shown = false;
+    let mut run_error = None;
     let mut display_extent = (config.width, config.height);
     let mut frame_capture = readback::ViewerCapture::default();
     #[cfg(test)]
     let mut smoke_frames = 0;
     #[cfg(test)]
-    let mut smoke_resize_requested = false;
-    #[cfg(test)]
     let smoke_deadline = Instant::now() + Duration::from_secs(185);
     let mut region_tick_ms = renderer.started.elapsed().as_millis() as u64;
     let mut last_minimap_key: Option<MinimapKey> = None;
+    startup_progress("Rendering the first world frame (including any cold shader compilation)…");
     event_loop
-        .run(move |event, target| match event {
+        .run(|event, target| {
+            // Hidden HWNDs need not receive WM_PAINT. Drive startup from a
+            // proxy wake until the first presentation, not a synthetic paint.
+            let event = match event {
+                Event::UserEvent(()) if !presented_once => Event::WindowEvent {
+                    window_id: window.id(),
+                    event: WindowEvent::RedrawRequested,
+                },
+                event => event,
+            };
+            let world_loading_active = handoff.is_some() || gpu_recovering;
+            match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => {
                 if world_loading_active && matches!(&event, WindowEvent::KeyboardInput { .. }) {
                     keys.clear();
@@ -5912,7 +5957,15 @@ fn run_viewer(
                     if menu_page.is_open() && (response.consumed || matches!(event,WindowEvent::KeyboardInput{..})) && !matches!(event, WindowEvent::RedrawRequested | WindowEvent::Resized(_) | WindowEvent::CloseRequested | WindowEvent::Focused(_)) {return;}
                 }
                 match event {
-                WindowEvent::CloseRequested => { if let Err(e)=settings.save(){eprintln!("Settings save: {e}");} target.exit(); },
+                WindowEvent::CloseRequested => {
+                    if let Some(task) = &handoff {
+                        close_after_handoff = true;
+                        task.files.cancel();
+                    } else {
+                        if let Err(e) = settings.save() { eprintln!("Settings save: {e}"); }
+                        target.exit();
+                    }
+                }
                 WindowEvent::KeyboardInput { .. } => {}
                 WindowEvent::MouseWheel { delta, .. } if normal_input_allowed(window_focused, menu_page.is_open(), world_loading_active) && captured => {
                     let steps = match delta {
@@ -5941,6 +5994,11 @@ fn run_viewer(
                 }
                 WindowEvent::Focused(focused) => {
                     window_focused = focused;
+                    #[cfg(windows)]
+                    if focused && presented_once && maximize_after_startup {
+                        maximize_after_startup = false;
+                        if !settings.fullscreen { window.set_maximized(true); }
+                    }
                     // Clear on both gain and loss: a key released in another
                     // application never sends us its KeyUp event.
                     keys.clear();
@@ -5949,8 +6007,8 @@ fn run_viewer(
                         window.set_cursor_visible(true);
                         captured = false;
                     }
-                    if let Some(files) = &handoff_files {
-                        files.set_focused(focused);
+                    if let Some(task) = &handoff {
+                        task.files.set_focused(focused);
                     }
                 }
                 WindowEvent::Resized(s) if s.width > 0 && s.height > 0 => {
@@ -5961,15 +6019,146 @@ fn run_viewer(
                     // A resize event can arrive on an already-lost device.
                 }
                 WindowEvent::RedrawRequested => {
-                    if gpu_recovering || gpu_loss.pending() { return; }
+                    if gpu_recovering || gpu_loss.pending() || gpu_retry_at.is_some_and(|at| Instant::now() < at) { return; }
                     gpu_loss.guard_frame(|| {
                     let queue_idle = renderer.device.poll(wgpu::Maintain::Poll).is_queue_empty();
                     if gpu_loss.pending() { return; }
                     frame_capture.collect();
+                    if let Some((submitted, drawn_mode)) = first_composition {
+                        if submitted.elapsed() >= FIRST_PRESENT_TIMEOUT {
+                            run_error = Some("Timed out waiting to present the first world frame. See the last Viewer startup stage in session.log.".into());
+                            target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                            target.exit();
+                            return;
+                        }
+                        if !queue_idle {
+                            gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                            return;
+                        }
+                        #[cfg(test)]
+                        if let Some(dir) = smoke_dir.filter(|_| smoke_reload && restoring.is_some()) {
+                            if image::open(dir.join("reload-software.png")).is_err() {
+                                gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                return;
+                            }
+                        }
+                        if display_extent != (config.width, config.height) {
+                            // A resize before the first present invalidates the
+                            // one-to-one copy. Recompose with the new extent.
+                            first_composition = None;
+                        } else {
+                            if !viewer_shown {
+                                #[cfg(test)]
+                                if smoke_dir.is_some() {
+                                    assert_ne!(window.is_visible(), Some(true), "viewer was exposed before its first frame");
+                                }
+                                startup_progress("First frame finished on the GPU; opening the swapchain…");
+                                window.set_visible(true);
+                                viewer_shown = true;
+                            }
+                            let active_surface = surface.as_ref().expect("startup uses the standard swapchain");
+                            if surface_needs_config {
+                                active_surface.configure(&renderer.device, &config);
+                                surface_needs_config = false;
+                            }
+                            let frame = match active_surface.get_current_texture() {
+                                Ok(frame) => frame,
+                                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                                    surface_needs_config = true;
+                                    gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                    return;
+                                }
+                                Err(wgpu::SurfaceError::Timeout) => {
+                                    gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                    return;
+                                }
+                                Err(wgpu::SurfaceError::OutOfMemory) => {
+                                    run_error = Some("Out of memory acquiring the first world frame.".into());
+                                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                                    target.exit();
+                                    return;
+                                }
+                            };
+                            let view = frame.texture.create_view(&Default::default());
+                            present_encode.as_ref().unwrap().present(&renderer.device, &renderer.queue, &view);
+                            window.pre_present_notify();
+                            frame.present();
+                            if gpu_loss.pending() { return; }
+                            first_composition = None;
+                            presented_once = true;
+                            last = Instant::now();
+                            if !crate::color_chain::present_encode_required(surface_format.is_srgb()) { present_encode = None; }
+                            #[cfg(windows)]
+                            {
+                                drop(loading.take());
+                                if maximize_after_startup && (!handoff_child || window_focused) {
+                                    maximize_after_startup = false;
+                                    if !settings.fullscreen { window.set_maximized(true); }
+                                }
+                            }
+                            startup_progress(&format!("Presented the first world frame — {} ({})", current_map.id, drawn_mode.label()));
+                            if handoff_child {
+                                // The old process may activate this HWND only
+                                // after a real world frame, never during boot.
+                                if let Ok(hwnd) = window_hwnd(&window) {
+                                    crate::world_handoff::publish_window_handle(hwnd as usize);
+                                }
+                            }
+                            #[cfg(test)]
+                            if let (Some(dir), Some(snapshot)) = (smoke_dir, restoring.as_ref()) {
+                                assert_eq!(snapshot.view[5], 7.5);
+                                assert_eq!(snapshot.lighter.resolution, 61);
+                                assert_eq!(snapshot.lighter.mode, LighterMode::Software);
+                                assert_eq!(snapshot.view, [camera.pos.x, camera.pos.y, camera.pos.z, camera.yaw, camera.pitch, camera.time_of_day]);
+                                assert_eq!(snapshot.lighter, renderer.lighter.settings);
+                                assert_eq!(snapshot.lighter.mode, drawn_mode);
+                                assert_eq!(smoke_reload, snapshot.kind == recovery::RestoreKind::Reload);
+                                std::fs::write(dir.join("restored-present"), std::process::id().to_string()).unwrap();
+                            }
+                            if handoff_child { crate::world_handoff::signal_ready(); }
+                            #[cfg(test)]
+                            if smoke_dir.is_some() {
+                                if restoring.is_some() {
+                                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                                    target.exit();
+                                } else if !smoke_reload {
+                                    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(192, 112));
+                                }
+                            }
+                            return;
+                        }
+                    }
                     #[cfg(test)]
                     if let Some(dir) = smoke_dir {
-                        assert!(Instant::now() < smoke_deadline, "viewer did not finish the resize/mode-switch captures");
-                        if restoring.is_none() && smoke_frames == 4 && (0..4).all(|i| image::open(dir.join(format!("{i}.png"))).is_ok()) {
+                        assert!(Instant::now() < smoke_deadline, "viewer did not finish live frame checks");
+                        if smoke_reload && restoring.is_none() && presented_once {
+                            if smoke_frames == 1 && image::open(dir.join("0.png")).is_ok() {
+                                assert_eq!(renderer.lighter.settings.mode, LighterMode::Off);
+                                camera.yaw = 0.1;
+                                settings.time_of_day = 7.5;
+                                camera.time_of_day = settings.time_of_day;
+                                reload_requested = Some(LighterSettings { mode: LighterMode::Hardware, resolution: 61, ..renderer.lighter.settings });
+                                smoke_frames = 2;
+                                menu_page = MenuPage::Modules;
+                                return;
+                            }
+                            if smoke_frames == 2 && !world_loading_active {
+                                let reason = world_change_error.as_deref().expect("unsupported hardware reload was not rejected");
+                                assert!(reason.contains("ray-query support"), "{reason}");
+                                assert_eq!(settings.selected_world, current_map.id);
+                                assert_eq!(menu_page, MenuPage::Modules);
+                                assert_eq!(renderer.lighter.settings.mode, LighterMode::Off);
+                                assert!(!dir.join("restored-present").exists());
+                                frame_capture.requested = Some(dir.join("after-failed-reload.png"));
+                                smoke_frames = 3;
+                            }
+                            if smoke_frames == 3 && image::open(dir.join("after-failed-reload.png")).is_ok() {
+                                reload_requested = Some(LighterSettings { mode: LighterMode::Software, resolution: 61, ..renderer.lighter.settings });
+                                smoke_frames = 4;
+                                return;
+                            }
+                        }
+                        if !smoke_reload && restoring.is_none() && smoke_frames == 4 && (0..4).all(|i| image::open(dir.join(format!("{i}.png"))).is_ok()) {
                             assert!(presented_once);
                             assert!(renderer.lighter.error().is_none(), "{:?}", renderer.lighter.error());
                             if !queue_idle {
@@ -6016,7 +6205,7 @@ fn run_viewer(
                         config.present_mode = wanted_present_mode;
                         surface_needs_config = true;
                     }
-                    if surface_needs_config {
+                    if surface_needs_config && presented_once {
                         if let Some(active_surface) = surface.as_ref() {
                             // wgpu may synchronously drain outstanding work
                             // inside configure. Defer rather than stall for it.
@@ -6114,7 +6303,7 @@ fn run_viewer(
                             fsr_upscaler = None;
                         }
                     }
-                    let want_fsr = !ray_world && settings.upscaling.is_ffx_fsr()
+                    let want_fsr = presented_once && !ray_world && settings.upscaling.is_ffx_fsr()
                         && !fsr_failed
                         && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
                     if want_fsr && fsr_upscaler.is_none() {
@@ -6157,7 +6346,7 @@ fn run_viewer(
                         dlss_failed = false;
                         dlss_fail_reason = None;
                     }
-                    let want_xess = !ray_world && settings.upscaling == crate::UpscaleMethod::Xess
+                    let want_xess = presented_once && !ray_world && settings.upscaling == crate::UpscaleMethod::Xess
                         && !xess_failed
                         && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
                     if want_xess && xess_upscaler.is_none() {
@@ -6194,7 +6383,7 @@ fn run_viewer(
                     // spend the retry budget or to record a failure the user
                     // would then read in the Graphics tab.
                     let dlss_window_big_enough = config.width >= 32 && config.height >= 32;
-                    let want_dlss = !ray_world && settings.upscaling == crate::UpscaleMethod::Dlss
+                    let want_dlss = presented_once && !ray_world && settings.upscaling == crate::UpscaleMethod::Dlss
                         && !dlss_failed
                         && dlss_window_big_enough
                         && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
@@ -6534,7 +6723,7 @@ fn run_viewer(
                     // Generation, or does not run it at all.
                     // Only XeLL creates a context; Reflex is the viewer's own
                     // pacer and never touches `libxell.dll`.
-                    let want_latency = matches!(
+                    let want_latency = presented_once && matches!(
                         crate::latency_owner(settings.latency, settings.frame_generation),
                         crate::LatencyOwner::Independent
                     ) && settings.latency == crate::LatencyMode::Xell
@@ -6549,7 +6738,7 @@ fn run_viewer(
                     // Graphics -> Latency -> Reflex: pure CPU pacing, so it is
                     // created whenever the mode is selected and needs no
                     // capability probe or failure path.
-                    if settings.latency == crate::LatencyMode::Reflex {
+                    if presented_once && settings.latency == crate::LatencyMode::Reflex {
                         if reflex.is_none() {
                             // Seeded at 60 Hz and re-learned from the present
                             // timestamps within a few frames, so this needs no
@@ -6616,7 +6805,7 @@ fn run_viewer(
                     }
                     last_fsr_camera_pos = camera.pos;
                     last_fsr_camera_dir = camera.direction();
-                    if settings != saved_settings && last_settings_save.elapsed().as_secs_f32() >= 1. {
+                    if persist_reload && presented_once && !world_loading_active && settings != saved_settings && last_settings_save.elapsed().as_secs_f32() >= 1. {
                         if let Err(e)=settings.save(){eprintln!("Settings save: {e}");} else {saved_settings=settings.clone();}
                         last_settings_save=Instant::now();
                     }
@@ -6625,7 +6814,7 @@ fn run_viewer(
                     // Add-ons get an optional camera-owner hook. `None` leaves
                     // the original free-flight controls completely untouched.
                     let input_allowed = normal_input_allowed(
-                        window_focused,
+                        presented_once && window_focused,
                         menu_page.is_open(),
                         world_loading_active,
                     );
@@ -6633,7 +6822,7 @@ fn run_viewer(
                     let active_keys: &HashSet<KeyCode> =
                         if input_allowed { &keys } else { &empty_keys };
                     let addon_camera = renderer.modules.update(dt, input_allowed, active_keys, camera.yaw, camera.pitch, camera.pos);
-                    renderer.modules.update_walker_audio(settings.effects_enabled, settings.effects_volume);
+                    if presented_once { renderer.modules.update_walker_audio(settings.effects_enabled, settings.effects_volume); }
                     if input_allowed && addon_camera.is_some() {
                         camera.pos = addon_camera.unwrap();
                     } else if input_allowed {
@@ -6729,16 +6918,18 @@ fn run_viewer(
                         }
                         streaming = true;
                     }
-                    music.update(settings.music_enabled,settings.music_volume,camera.pos.x,camera.pos.z);
-                    ambience.update(settings.ambience_enabled,settings.sound_volume,camera.pos.x,camera.pos.z,crate::environment::daylight(settings.time_of_day)<0.5);
-                    world_audio.update(settings.effects_enabled,settings.effects_volume,camera.pos.to_array(),camera.yaw,crate::environment::night_factor(settings.time_of_day));
+                    if presented_once {
+                        music.update(settings.music_enabled,settings.music_volume,camera.pos.x,camera.pos.z);
+                        ambience.update(settings.ambience_enabled,settings.sound_volume,camera.pos.x,camera.pos.z,crate::environment::daylight(settings.time_of_day)<0.5);
+                        world_audio.update(settings.effects_enabled,settings.effects_volume,camera.pos.to_array(),camera.yaw,crate::environment::night_factor(settings.time_of_day));
+                    }
                     if zone_check.elapsed()>=std::time::Duration::from_millis(350){
                         zone_check=Instant::now();let zone=ui_zones.as_ref().and_then(|z|z.find(camera.pos.x,camera.pos.z));
                         if (!zone_initialized || zone!=last_zone) && settings.show_zone_entry {if let Some(i)=zone {if let Some(db)=&ui_zones {let name=db.zones[i].name.trim();if !name.is_empty(){zone_banner=Some((name.to_string(),Instant::now()));}}}}
                         zone_initialized=true;last_zone=zone;
                     }
                     if !settings.show_zone_entry {zone_banner=None;}
-                    if settings.fullscreen!=fullscreen_applied {window.set_fullscreen(if settings.fullscreen{Some(Fullscreen::Borderless(window.current_monitor()))}else{None});fullscreen_applied=settings.fullscreen;}
+                    if presented_once && (!handoff_child || window_focused) && settings.fullscreen!=fullscreen_applied {window.set_fullscreen(if settings.fullscreen{Some(Fullscreen::Borderless(window.current_monitor()))}else{None});fullscreen_applied=settings.fullscreen;}
 
                     // Don't tear down the only copy of the scenery while a
                     // ray-enabled local mesh is still on the streaming worker.
@@ -6868,7 +7059,7 @@ fn run_viewer(
                     // time. `sky_time::advance` is 1/600 authored hour per real
                     // second at 1x, which is `CECSunMoon::Tick`'s
                     // 1/14,400,000-per-millisecond day fraction.
-                    if settings.time_pass_enabled {
+                    if presented_once && !world_loading_active && settings.time_pass_enabled {
                         settings.time_of_day = crate::sky_time::advance(
                             settings.time_of_day,
                             dt,
@@ -6960,7 +7151,7 @@ fn run_viewer(
                     // Acquire the frame. Frame generation owns presentation:
                     // no wgpu swapchain exists in that mode, so there is
                     // nothing to acquire — the pipeline presents instead.
-                    let frame = if framegen.is_some()
+                    let frame = if !presented_once || framegen.is_some()
                         || xess_framegen.is_some()
                         || dlss_framegen.is_some()
                     {
@@ -6985,7 +7176,7 @@ fn run_viewer(
                         eprintln!("surface: presentation unavailable (no swapchain)");
                         None
                     };
-                    if framegen.is_some() || xess_framegen.is_some() || dlss_framegen.is_some() || frame.is_some() {
+                    if !presented_once || framegen.is_some() || xess_framegen.is_some() || dlss_framegen.is_some() || frame.is_some() {
                             let surface_view = frame
                                 .as_ref()
                                 .map(|frame| frame.texture.create_view(&Default::default()));
@@ -7043,19 +7234,14 @@ fn run_viewer(
                             let ui_only_view = dlss_framegen
                                 .as_ref()
                                 .and_then(|fg| fg.ui_only_view());
-                            let final_view: &wgpu::TextureView = match fg_views.as_ref() {
-                                Some((compose, _)) => compose,
-                                None => surface_view
-                                    .as_ref()
-                                    .expect("a frame exists whenever the frame generation pipeline does not"),
-                            };
+                            let final_view = fg_views.as_ref().map(|(compose, _)| compose).or(surface_view.as_ref());
                             let mut ui_visible = false;
                             // Composition target: the whole-frame gamma intermediate, else the
                             // present-encode intermediate, else the final target. This is
                             // always the full window resolution: UI and the final present chain
                             // stay sharp regardless of the 3D resolution scale.
                             let composed_view=if whole_frame_gamma {Some(display_gamma.as_ref().unwrap().view())} else if let Some(encode)=present_encode.as_ref() {Some(encode.view())} else {None};
-                            let scene_view=composed_view.as_ref().unwrap_or(final_view);
+                            let scene_view=composed_view.as_ref().or(final_view).expect("a composition target");
                             // Draw the world into the scaled offscreen target, then bilinearly
                             // present it into `scene_view` before the UI pass loads that result.
                             let world_view = render_scale.view();
@@ -7117,9 +7303,12 @@ fn run_viewer(
                                 gpu_loss.report(error.to_owned());
                             }
                             if gpu_loss.pending() { return; }
-                            if restoring.is_some() && !presented_once {
+                            if let Some(snapshot) = restoring.as_ref().filter(|_| !presented_once) {
                                 if let Some(error) = renderer.lighter.error() {
-                                    crate::world_handoff::publish_failure(error);
+                                    // A native fallback is fine on standalone
+                                    // startup, but did not apply this request.
+                                    run_error = Some(format!("{}: {error}", snapshot.kind.label()));
+                                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
                                     target.exit();
                                     return;
                                 }
@@ -7132,10 +7321,14 @@ fn run_viewer(
                                 return;
                             }
                             #[cfg(test)]
-                            if let Some(dir) = smoke_dir.filter(|_| restoring.is_none()) {
-                                if smoke_frames == 0 || (1..4).contains(&smoke_frames) && world_extent == (192, 112) {
+                            if let Some(dir) = smoke_dir {
+                                if restoring.is_none() && (smoke_frames == 0 || !smoke_reload && (1..4).contains(&smoke_frames) && world_extent == (192, 112)) {
                                     frame_capture.requested = Some(dir.join(format!("{smoke_frames}.png")));
                                     smoke_frames += 1;
+                                } else if smoke_reload && restoring.is_some() && !presented_once {
+                                    assert_eq!(renderer.lighter.settings.mode, LighterMode::Software);
+                                    assert!(renderer.renders_rays());
+                                    frame_capture.requested = Some(dir.join("reload-software.png"));
                                 }
                             }
                             frame_capture.submit(&renderer.device, &renderer.queue, render_scale.texture());
@@ -7187,6 +7380,7 @@ fn run_viewer(
                             // (`fg.compose_view()`) *before* `fg.prepare` copies it to
                             // `ui_view()`, otherwise `compose` is still empty/stale.
                             if fg_views.is_some() && !xefg_ui_in_composition {
+                                let final_view = final_view.expect("frame generation target");
                                 if let Some(encode) = present_encode.as_ref() {
                                     let ramp_target = encode.view();
                                     if let Some(gamma) = display_gamma.as_ref() {
@@ -7497,14 +7691,11 @@ fn run_viewer(
                             if menu_page.is_open() || renderer.lighter.error().is_some() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
                                 let input=egui_state.take_egui_input(&window);
                                 let output=egui_ctx.run(input,|ctx| {
-                                    // A replacement-process handoff leaves this
-                                    // window alive but completely non-interactive.
-                                    // Recovery events are polled by the event loop,
-                                    // never by this overlay.
                                     if world_loading_active {
+                                        let reloading = handoff.as_ref().filter(|task| task.reload.is_some());
                                         egui::Area::new(egui::Id::new("world-handoff-loading"))
                                             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.))
-                                            .interactable(false)
+                                            .interactable(reloading.is_some())
                                             .show(ctx, |ui| {
                                                 egui::Frame::none()
                                                     .fill(egui::Color32::from_black_alpha(225))
@@ -7512,11 +7703,18 @@ fn run_viewer(
                                                     .rounding(8.)
                                                     .show(ui, |ui| {
                                                         ui.set_min_width(360.);
-                                                        ui.heading("Changing world…");
+                                                        ui.heading(if reloading.is_some() { "Reloading world…" } else { "Changing world…" });
                                                         ui.add_space(8.);
                                                         ui.label(&world_loading_status);
                                                         ui.add_space(4.);
                                                         ui.label(egui::RichText::new("This window will close when the new world is ready.").small().weak());
+                                                        if let Some(task) = reloading {
+                                                            if task.files.is_cancelled() {
+                                                                ui.label("Cancelling reload…");
+                                                            } else if ui.button("Cancel Reload").clicked() {
+                                                                task.files.cancel();
+                                                            }
+                                                        }
                                                     });
                                             });
                                         return;
@@ -7525,13 +7723,13 @@ fn run_viewer(
                                     // Dismiss button needs a mutable borrow of the
                                     // Option while the label is displayed.
                                     if let Some(reason) = world_change_error.clone() {
-                                        egui::Window::new("WORLD CHANGE FAILED")
+                                        egui::Window::new("WORLD LOAD FAILED")
                                             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.))
                                             .collapsible(false)
                                             .resizable(false)
                                             .show(ctx, |ui| {
                                                 ui.colored_label(egui::Color32::LIGHT_RED, reason.as_str());
-                                                ui.label("The viewer stayed on the current world and restored a safe saved setting.");
+                                                ui.label("The current world is still open.");
                                                 if ui.button("Dismiss").clicked() {
                                                     world_change_error = None;
                                                 }
@@ -7574,7 +7772,11 @@ fn run_viewer(
                                             });
                                     }
                                     if menu_page==MenuPage::Modules {
-                                        if renderer.modules.menu_ui(ctx,camera.pos,camera.yaw,&mut renderer.lighter){menu_page=MenuPage::Main;}
+                                        match renderer.modules.menu_ui(ctx, camera.pos, camera.yaw, &mut renderer.lighter) {
+                                            Some(crate::modules::MenuAction::Back) => menu_page = MenuPage::Main,
+                                            Some(crate::modules::MenuAction::ReloadWorld(settings)) => reload_requested = Some(settings),
+                                            None => {}
+                                        }
                                     }
                                     if menu_page==MenuPage::Settings {
                                         egui::Window::new("SETTINGS  |  ESC to go back")
@@ -7642,16 +7844,14 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                     world_change_error = Some(format!("{} is already the active world.", current_map.display_name));
                                                 } else {
                                                     match spawn_world_handoff(&client_root, &selected_world_ui, window_focused, None, #[cfg(test)] None) {
-                                                        Ok((files, rx)) => {
+                                                        Ok(task) => {
                                                             settings.selected_world = selected_world_ui.to_ascii_lowercase();
                                                             if let Err(error) = settings.save() {
                                                                 eprintln!("Settings save before world handoff: {error}");
                                                             } else {
                                                                 saved_settings = settings.clone();
                                                             }
-                                                            handoff_files = Some(files);
-                                                            handoff_rx = Some(rx);
-                                                            world_loading_active = true;
+                                                            handoff = Some(task);
                                                             world_change_error = None;
                                                             world_change_notice = None;
                                                             world_loading_status = format!("Starting {}...", selected_world_ui);
@@ -7851,12 +8051,19 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         frame_gamma_setting,
                                     );
                                 }
-                                encode.present(&renderer.device, &renderer.queue, final_view);
+                                if let Some(view) = final_view {
+                                    encode.present(&renderer.device, &renderer.queue, view);
+                                } else {
+                                    let drawn_mode = if renderer.renders_rays() { renderer.lighter.settings.mode } else { LighterMode::Off };
+                                    first_composition = Some((Instant::now(), drawn_mode));
+                                    startup_progress("First frame submitted; waiting for GPU completion…");
+                                    return;
+                                }
                             } else if let Some(gamma) = display_gamma.as_ref() {
                                 gamma.present(
                                     &renderer.device,
                                     &renderer.queue,
-                                    final_view,
+                                    final_view.expect("standard present target"),
                                     frame_gamma_setting,
                                 );
                                 }
@@ -7928,14 +8135,10 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     }
                                 }
                             } else if let Some(frame) = frame {
+                                window.pre_present_notify();
                                 frame.present();
                                 #[cfg(test)]
-                                if smoke_dir.is_some() && smoke_frames == 1 && !smoke_resize_requested {
-                                    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(192, 112));
-                                    smoke_resize_requested = true;
-                                }
-                                #[cfg(test)]
-                                if smoke_dir.is_some() {
+                                if smoke_dir.is_some() && !smoke_reload {
                                     let mode = match smoke_frames {
                                         2 => Some(LighterMode::Off),
                                         3 => Some(LighterMode::Software),
@@ -7945,26 +8148,6 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         renderer.lighter.settings.mode = mode;
                                         renderer.lighter.reset_history();
                                     }
-                                }
-                                // The window now has a presentation history, so
-                                // frame generation may take the swapchain over.
-                                presented_once = true;
-                            }
-                            if presented_once {
-                                #[cfg(test)]
-                                if let (Some(dir), Some(snapshot)) = (smoke_dir, restoring.as_ref()) {
-                                    assert_eq!(snapshot.view[5], 7.5);
-                                    assert_eq!(snapshot.lighter.resolution, 61);
-                                    assert_eq!(snapshot.lighter.mode, LighterMode::Software);
-                                    assert_eq!(snapshot.view, [camera.pos.x, camera.pos.y, camera.pos.z, camera.yaw, camera.pitch, camera.time_of_day]);
-                                    assert_eq!(snapshot.lighter, renderer.lighter.settings);
-                                    std::fs::write(dir.join("restored-present"), std::process::id().to_string()).unwrap();
-                                }
-                                signal_handoff_first_frame(&mut handoff_ready_signaled);
-                                #[cfg(test)]
-                                if smoke_dir.is_some() && restoring.is_some() {
-                                    target.exit();
-                                    return;
                                 }
                             }
                             if let Some(session) = latency.as_mut() {
@@ -7996,106 +8179,124 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                     let reason = gpu_loss.take().or_else(|| renderer.lighter.error().filter(|m| recovery::lost_error(m)).map(str::to_owned));
                     if let Some(reason) = reason {
                         eprintln!("Graphics device lost: {reason}");
-                        if restoring.is_some() {
-                            crate::world_handoff::publish_failure("The replacement graphics device was also lost.");
+                        if handoff_child && !presented_once {
+                            run_error = Some(format!("The replacement graphics device was lost before its first frame: {reason}"));
+                            target.set_control_flow(winit::event_loop::ControlFlow::Poll);
                             target.exit();
                             return;
                         }
                         gpu_recovering = true;
-                        world_loading_active = true;
                         captured = false;
                         keys.clear();
                         let _ = window.set_cursor_grab(CursorGrabMode::None);
                         window.set_cursor_visible(true);
                         window.set_title("Perfect World Explorer — restoring graphics device…");
-                        if handoff_rx.is_none() {
+                        if handoff.is_none() {
                             let snapshot = recovery::Snapshot {
+                                kind: recovery::RestoreKind::DeviceRecovery,
                                 map: current_map.id.clone(),
-                                view: [camera.pos.x,camera.pos.y,camera.pos.z,camera.yaw,camera.pitch,camera.time_of_day],
+                                view: camera.handoff_view(),
                                 lighter: renderer.lighter.settings,
                             };
-                            match spawn_world_handoff(&client_root,&snapshot.map,window_focused,Some(&snapshot), #[cfg(test)] smoke_dir) {
-                                Ok((files,rx)) => { handoff_files = Some(files); handoff_rx = Some(rx); }
-                                Err(error) => { eprintln!("Graphics recovery could not start: {error}"); target.exit(); return; }
+                            match spawn_world_handoff(&client_root, &snapshot.map, window_focused, Some(&snapshot), #[cfg(test)] smoke_dir) {
+                                Ok(task) => handoff = Some(task),
+                                Err(error) => {
+                                    let message = format!("Graphics recovery could not start: {error}");
+                                    eprintln!("{message}");
+                                    crate::diagnostics::session(message);
+                                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                                    target.exit();
+                                    return;
+                                }
                             }
                         }
                     }
                 }
-                // Handoff/recovery messages are polled outside egui, so the
-                // non-interactive loading overlay cannot swallow them.
-                if let Some(rx) = handoff_rx.take() {
-                    let mut keep_receiver = false;
-                    loop {
-                        match rx.try_recv() {
-                            Ok(crate::world_handoff::Message::Progress(status)) => {
-                                world_loading_status = status;
-                            }
-                            Ok(crate::world_handoff::Message::Ready { activated }) => {
-                                // The replacement is visible and has presented
-                                // a usable frame. Exit this old process without
-                                // forcing focus if the user Alt-Tabbed away.
-                                if !activated {
-                                    eprintln!("Replacement world is ready; leaving it visible without forced activation.");
-                                }
-                                // The replacement owns persistence now: it may
-                                // have fallen back to the main world after the
-                                // old process selected an instance. Saving the
-                                // old selection here would undo that recovery.
-                                world_loading_active = false;
-                                handoff_files = None;
-                                keys.clear();
-                                close_old_window_after_handoff_ready(target, &window);
-                                return;
-                            }
-                            Ok(crate::world_handoff::Message::Failed(reason)) => {
-                                if gpu_recovering { eprintln!("Graphics recovery failed: {reason}"); target.exit(); return; }
-                                settings.selected_world = "world".into();
-                                if let Err(error) = settings.save() {
-                                    eprintln!("Settings save after world handoff failure: {error}");
-                                } else {
-                                    saved_settings = settings.clone();
-                                }
-                                selected_world_ui = current_map.id.clone();
-                                world_change_error = Some(reason);
-                                world_change_notice = None;
-                                world_loading_active = false;
-                                if let Some(files) = handoff_files.take() {
-                                    files.cleanup();
-                                }
-                                menu_page = MenuPage::Main;
-                                keys.clear();
-                                break;
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                keep_receiver = true;
-                                break;
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                if gpu_recovering { eprintln!("Graphics recovery watcher disconnected"); target.exit(); return; }
-                                settings.selected_world = "world".into();
-                                if let Err(error) = settings.save() {
-                                    eprintln!("Settings save after world handoff failure: {error}");
-                                } else {
-                                    saved_settings = settings.clone();
-                                }
-                                selected_world_ui = current_map.id.clone();
-                                world_change_error = Some(
-                                    "The world handoff watcher stopped without a result.".into(),
-                                );
-                                world_change_notice = None;
-                                world_loading_active = false;
-                                if let Some(files) = handoff_files.take() {
-                                    files.cleanup();
-                                }
-                                menu_page = MenuPage::Main;
-                                keys.clear();
-                                break;
-                            }
+                if let Some(lighter) = reload_requested.take().filter(|_| presented_once && handoff.is_none() && !gpu_recovering) {
+                    let snapshot = recovery::Snapshot {
+                        kind: recovery::RestoreKind::Reload,
+                        map: current_map.id.clone(),
+                        view: camera.handoff_view(),
+                        lighter,
+                    };
+                    // Flush current viewer preferences before the child loads
+                    // them. The map, renderer and exact view are in the snapshot.
+                    if persist_reload && settings != saved_settings {
+                        match settings.save() {
+                            Ok(()) => saved_settings = settings.clone(),
+                            Err(error) => eprintln!("Settings save before reload: {error}"),
                         }
                     }
-                    if keep_receiver {
-                        handoff_rx = Some(rx);
+                    match spawn_world_handoff(&client_root, &snapshot.map, window_focused, Some(&snapshot), #[cfg(test)] smoke_dir) {
+                        Ok(task) => {
+                            handoff = Some(task);
+                            world_loading_status = format!("Starting {} with {}…", current_map.display_name, lighter.mode.label());
+                            world_change_error = None;
+                            keys.clear();
+                            if captured {
+                                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                                window.set_cursor_visible(true);
+                                captured = false;
+                            }
+                        }
+                        Err(error) => world_change_error = Some(format!("World reload could not start: {error}")),
                     }
+                }
+                // Poll even when no frame is drawn (e.g. minimised or device
+                // lost). Both failure and cancellation leave the old map open.
+                while let Some(task) = handoff.as_ref() {
+                    use crate::world_handoff::Message;
+                    use std::sync::mpsc::TryRecvError;
+                    let message = match task.messages.try_recv() {
+                        Ok(message) => message,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => Message::Failed("The world handoff watcher stopped without a result.".into()),
+                    };
+                    if let Message::Progress(status) = message {
+                        world_loading_status = status;
+                        continue;
+                    }
+                    let task = handoff.take().unwrap();
+                    task.files.cleanup();
+                    if let Message::Ready { activated } = message {
+                        if !activated {
+                            eprintln!("Replacement world is ready; leaving it visible without forced activation.");
+                        }
+                        if let Some(lighter) = task.reload.filter(|_| persist_reload) {
+                            if let Err(error) = lighter.save() { eprintln!("Lighter settings save after reload: {error}"); }
+                            settings.selected_world = current_map.id.clone();
+                            if let Err(error) = settings.save() { eprintln!("Settings save after reload: {error}"); }
+                        }
+                        close_old_window_after_handoff_ready(target, &window);
+                        return;
+                    }
+                    if gpu_recovering || close_after_handoff {
+                        if let Message::Failed(reason) = message {
+                            let message = format!("Replacement world failed: {reason}");
+                            eprintln!("{message}");
+                            crate::diagnostics::session(message);
+                        }
+                        target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                        target.exit();
+                        return;
+                    }
+                    if let Message::Failed(reason) = message {
+                        crate::diagnostics::session(format!("Replacement world failed: {reason}"));
+                        world_change_error = Some(reason);
+                    }
+                    if task.reload.is_none() {
+                        // Keep the original map-change failure policy. A
+                        // failed reload must not reset the map or ray settings.
+                        settings.selected_world = "world".into();
+                        match settings.save() {
+                            Ok(()) => saved_settings = settings.clone(),
+                            Err(error) => eprintln!("Settings save after world handoff failure: {error}"),
+                        }
+                        selected_world_ui = current_map.id.clone();
+                        world_change_notice = None;
+                        menu_page = MenuPage::Main;
+                    }
+                    keys.clear();
                 }
                 if gpu_recovering {
                     target.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(Instant::now()+Duration::from_millis(100)));
@@ -8111,11 +8312,21 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                     gpu_retry_at = None;
                     target.set_control_flow(winit::event_loop::ControlFlow::Wait);
                 }
-                window.request_redraw();
+                if handoff.is_some() {
+                    target.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(100)));
+                } else {
+                    target.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                }
+                if presented_once {
+                    window.request_redraw();
+                } else {
+                    let _ = startup_redraw.send_event(());
+                }
             }
             _ => {}
-        })
-        .map_err(|e| e.to_string())
+        }})
+        .map_err(|e| e.to_string())?;
+    run_error.map_or(Ok(()), Err)
 }
 /// Explicit blocking capture/test path only. wgpu 0.19's blocking poll can
 /// retire submissions after its 5-second fence timeout. Instead poll and wait

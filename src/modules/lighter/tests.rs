@@ -2,6 +2,54 @@ use super::*;
 use glam::{Mat4, Vec3};
 use scene::*;
 
+#[test]
+fn reload_world_button_applies_pending_mode_without_changing_the_live_renderer() {
+    let ctx = egui::Context::default();
+    let mut lighter = Lighter::default();
+    lighter.settings.resolution = 61;
+    lighter.pending_mode = Some(Mode::Hardware);
+    let mut draw = |events| {
+        let mut result = None;
+        let output = ctx.run(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| result = lighter.ui(ui));
+            },
+        );
+        (result, output)
+    };
+    let (result, output) = draw(Vec::new());
+    assert!(result.is_none());
+    let button = output
+        .shapes
+        .iter()
+        .find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text() == "Reload World" => {
+                Some(text.visual_bounding_rect().center())
+            }
+            _ => None,
+        })
+        .expect("Reload World button");
+    let click = |pressed| egui::Event::PointerButton {
+        pos: button,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    assert!(draw(vec![egui::Event::PointerMoved(button), click(true)])
+        .0
+        .is_none());
+    let next = draw(vec![click(false)])
+        .0
+        .expect("reload request from click");
+    assert_eq!(next.mode, Mode::Hardware);
+    assert_eq!(next.resolution, 61);
+    assert_eq!(lighter.settings.mode, Mode::Off);
+}
+
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 #[test]
 fn naga_validates_both_paths_and_emits_native_ray_queries() {

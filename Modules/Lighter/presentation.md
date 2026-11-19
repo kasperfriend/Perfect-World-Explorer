@@ -17,7 +17,22 @@ It requests a fresh device and builds the current streamed window at that
 camera. It does not transfer GPU objects, temporal history, SDK contexts, or
 transient actor/particle state. The old window retires only after a usable
 present; failures are logged and a replacement does not recursively restart
-if its own device is lost. Ordinary surface loss/resize does not take this path.
+if its device is lost before that first present. Ordinary surface loss/resize
+does not take this path.
+
+**Reload World** uses the same snapshot and watched handoff without marking the
+old device lost. The Lighter menu stages renderer changes until Reload World
+is pressed. The old world continues drawing with its last active renderer and
+can cancel a stalled replacement. The saved renderer is updated on a successful
+same-map handoff, not when choosing a dropdown entry or on child launch.
+
+At startup, Explorer builds and submits the first world and menu offscreen,
+then polls for GPU completion before opening the standard swapchain. The first
+swapchain pass copies that finished composition (sRGB or UNORM), and only then
+are audio and the optional temporal/FG paths allowed to start. On Windows the
+separate loading UI remains available up to first present. This does not make
+all synchronous calls inside a graphics driver interruptible; the loading UI
+can still quit, or the old viewer can cancel a replacement.
 
 Validation:
 

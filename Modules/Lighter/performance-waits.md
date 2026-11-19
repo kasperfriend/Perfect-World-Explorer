@@ -5,6 +5,7 @@
 | Site | Caller and lifetime | Policy |
 | --- | --- | --- |
 | `gpu::Renderer::new` staging flush | Initial viewer construction (including a new world in the replacement process), `--gpu-preview`, or a test. Runs before the interactive event loop. | Keep the startup drain to cap peak staging memory before scenery upload. |
+| First visible frame | The first world and menu are composed offscreen using the same render path as normal frames. | Poll that work before opening the swapchain. Keep the Windows loading window (or old world) until first present. The regular redraw never uses the blocking capture wait for this. |
 | `gpu::run_viewer` redraw | The former `software_adapter` branch called `Maintain::Wait` in Native and waited for a submission callback in Lighter. | Poll before starting a redraw. On a CPU adapter, defer the frame while work is still queued. A 2 ms event-loop deadline schedules the retry; the loop remains available for input/close/handoff. |
 | `gpu::run_viewer` surface and XeLL transitions | Reconfigure an existing swapchain; Intel's XeLL initialization requires idle GPU work. | Defer the operation until a later poll observes a drained wgpu queue rather than draining it synchronously for the transition. Swapchain recreation also checks any raw Vulkan fence (an image fill is not tracked by wgpu). |
 | `gpu::wait_for_capture`, `read_target_pixels` | Explicit one-shot `--gpu-preview`/`--gpu-preview-at` (including effect A/B) and tests. Lighter opts in with `for_capture()`. | Bounded synchronous wait for actual completion, using `Maintain::Poll`. wgpu 0.19's blocking poll can retire submissions after a short fence timeout on a cold CPU driver. The normal viewer doesn't call the capture wait, even for a screenshot. |
@@ -31,10 +32,11 @@ cargo test --locked --bin perfect-world-explorer live_readback_ring_pixels -- --
 cargo test --locked --bin perfect-world-explorer cutoff_gpu_residency_repacking -- --ignored
 PW_PREVIEW_LIGHTER=software cargo test --locked --bin perfect-world-explorer lighter_headless_preview_png -- --ignored
 xvfb-run -a cargo test --locked --bin perfect-world-explorer lighter_live_viewer_frames -- --ignored
+xvfb-run -a cargo test --locked --bin perfect-world-explorer lighter_live_world_reload -- --ignored
 cargo test --locked --bin perfect-world-explorer lighter_vulkan_interop_on_cpu -- --ignored
 ```
 
-The ring test fills all three slots before consuming them, rejects an extra request, then reuses the slots and checks pixels from an unaligned BGRA target. The viewer test presents through the real winit event loop to a virtual X11 display and verifies later-frame world captures before and after a window resize. The explicit preview test opens the PNG and checks its dimensions and contents. The Vulkan suite checks deferred initialization/replacement and color/depth after resize in addition to the existing ray tests. These are synthetic correctness checks, not frame-rate, physical-GPU or real-map results.
+The ring test fills all three slots before consuming them, rejects an extra request, then reuses the slots and checks pixels from an unaligned BGRA target. The viewer tests present through the real winit event loop to a virtual X11 display and verify first-frame, resize and device-replacement behavior. The reload test rejects Hardware on a CPU adapter, captures the still-running Native world, then reloads with Software and verifies the snapshot and the replacement's first frame. The explicit preview test opens the PNG and checks its dimensions and contents. The Vulkan suite checks deferred initialization/replacement and color/depth after resize in addition to the existing ray tests. These are synthetic correctness checks, not frame-rate, physical-GPU or real-map results.
 
 ## Verification record
 

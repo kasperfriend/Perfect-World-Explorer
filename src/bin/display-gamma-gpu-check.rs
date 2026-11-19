@@ -258,9 +258,9 @@ fn main() {
             !surface_format.is_srgb()
         );
         if surface_format.is_srgb() {
-            // The swapchain itself is the render target: no extra pass exists.
+            // Normal drawing targets the swapchain directly; the startup
+            // frame still makes one staged copy to this same target format.
             assert_eq!(render_format, surface_format);
-            continue;
         }
         let mut encode = present_encode::PresentEncode::new(&device, surface_format, 1, 1);
         encode.resize(&device, w, h);
@@ -290,7 +290,7 @@ fn main() {
             multiview: None,
         });
         let surface = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("unorm swapchain stand-in"),
+            label: Some("swapchain stand-in"),
             size: wgpu::Extent3d {
                 width: w,
                 height: h,
@@ -390,6 +390,6 @@ fn main() {
         "present encode fixture is insensitive"
     );
     println!(
-        "Present encode: {encode_cases} encoded-byte readbacks passed (UNORM RGBA/BGRA swapchains, one encode)"
+        "Present encode: {encode_cases} encoded-byte readbacks passed (RGBA/BGRA, UNORM and sRGB startup copies)"
     );
 }

@@ -1,4 +1,4 @@
-//! Recover by opening a fresh device/world in the existing handoff process.
+//! Restore the current map and view in a fresh process (reload or device loss).
 //! Do not attempt to reuse a lost device, its SDK contexts or stale ray AS.
 use super::LighterSettings;
 use std::{
@@ -8,6 +8,30 @@ use std::{
 
 const VIEW_ENV: &str = "PW_GPU_RECOVERY_VIEW";
 const LIGHTER_ENV: &str = "PW_GPU_RECOVERY_LIGHTER";
+const RELOAD_ENV: &str = "PWE_WORLD_RELOAD";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum RestoreKind {
+    Reload,
+    DeviceRecovery,
+}
+
+impl RestoreKind {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Reload => "World reload",
+            Self::DeviceRecovery => "Graphics recovery",
+        }
+    }
+}
+
+pub(super) fn kind() -> RestoreKind {
+    if std::env::var_os(RELOAD_ENV).is_some() {
+        RestoreKind::Reload
+    } else {
+        RestoreKind::DeviceRecovery
+    }
+}
 
 pub(super) fn is_child() -> bool {
     crate::world_handoff::is_handoff_child() && std::env::var_os(VIEW_ENV).is_some()
@@ -63,6 +87,7 @@ pub(super) fn lost_error(message: &str) -> bool {
 }
 
 pub(super) struct Snapshot {
+    pub(super) kind: RestoreKind,
     pub(super) map: String,
     pub(super) view: [f32; 6], // x y z yaw pitch hour
     pub(super) lighter: LighterSettings,
@@ -74,26 +99,28 @@ impl Snapshot {
             .collect::<Vec<_>>()
             .join(" ")
     }
-    fn decode(map: &str, view: &str, lighter: &str) -> Result<Self, String> {
+    fn decode(kind: RestoreKind, map: &str, view: &str, lighter: &str) -> Result<Self, String> {
+        let operation = kind.label();
         let mut parts = view.split_ascii_whitespace();
         if !parts.next().is_some_and(|m| m.eq_ignore_ascii_case(map)) {
-            return Err("Device recovery refused a fallback or different map".into());
+            return Err(format!("{operation} refused a fallback or different map"));
         }
         let values: Vec<f32> = parts
             .map(str::parse::<f32>)
             .collect::<Result<_, _>>()
-            .map_err(|_| "Invalid camera for device recovery")?;
+            .map_err(|_| format!("Invalid camera for {operation}"))?;
         let view: [f32; 6] = values
             .try_into()
-            .map_err(|_| "Invalid camera extent for device recovery")?;
+            .map_err(|_| format!("Invalid camera extent for {operation}"))?;
         if !view.iter().all(|v| v.is_finite())
             || view[..3].iter().any(|v| v.abs() > 1.0e7)
             || view[4].abs() > 1.57
             || !(0. ..=24.).contains(&view[5])
         {
-            return Err("Invalid camera range for device recovery".into());
+            return Err(format!("Invalid camera range for {operation}"));
         }
         Ok(Self {
+            kind,
             map: map.to_string(),
             view,
             lighter: LighterSettings::decode(lighter),
@@ -103,24 +130,32 @@ impl Snapshot {
         if !crate::world_handoff::is_handoff_child() {
             return Ok(None);
         }
+        let kind = kind();
         match std::env::var(VIEW_ENV) {
             Ok(view) => Self::decode(
+                kind,
                 map,
                 &view,
                 &std::env::var(LIGHTER_ENV)
-                    .map_err(|_| "Missing renderer settings for device recovery")?,
+                    .map_err(|_| format!("Missing renderer settings for {}", kind.label()))?,
             )
             .map(Some),
             Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(_) => Err("Invalid device recovery metadata".into()),
+            Err(_) => Err(format!("Invalid {} metadata", kind.label())),
         }
     }
     pub(super) fn configure(command: &mut Command, snapshot: Option<&Self>) {
-        command.env_remove(VIEW_ENV).env_remove(LIGHTER_ENV);
+        command
+            .env_remove(VIEW_ENV)
+            .env_remove(LIGHTER_ENV)
+            .env_remove(RELOAD_ENV);
         if let Some(s) = snapshot {
             command
                 .env(VIEW_ENV, s.encode_view())
                 .env(LIGHTER_ENV, s.lighter.encode());
+            if s.kind == RestoreKind::Reload {
+                command.env(RELOAD_ENV, "1");
+            }
         }
     }
 }
@@ -129,17 +164,38 @@ impl Snapshot {
 mod tests {
     use super::*;
     #[test]
+    fn reload_metadata_is_explicit_and_not_inherited_by_later_handoffs() {
+        let snapshot = Snapshot {
+            kind: RestoreKind::Reload,
+            map: "a07".into(),
+            view: [16., 332., 84., 0., -0.6, 1.5],
+            lighter: LighterSettings::default(),
+        };
+        let mut command = Command::new("viewer");
+        Snapshot::configure(&mut command, Some(&snapshot));
+        assert!(command
+            .get_envs()
+            .any(|(key, value)| key == RELOAD_ENV && value.is_some()));
+        let wrong_map = Snapshot::decode(snapshot.kind, "world", &snapshot.encode_view(), "").err();
+        assert!(wrong_map.unwrap().starts_with("World reload"));
+        Snapshot::configure(&mut command, None);
+        assert!(command.get_envs().all(|(_, value)| value.is_none()));
+    }
+
+    #[test]
     fn restart_preserves_world_view_and_renderer_and_rejects_wrong_map() {
         let s = Snapshot {
+            kind: RestoreKind::DeviceRecovery,
             map: "a07".into(),
             view: [16., 332., 84., 0., -0.6, 1.5],
             lighter: LighterSettings::decode("mode=hardware\nreference=true"),
         };
-        let restored = Snapshot::decode("A07", &s.encode_view(), &s.lighter.encode()).unwrap();
+        let restored =
+            Snapshot::decode(s.kind, "A07", &s.encode_view(), &s.lighter.encode()).unwrap();
         assert_eq!(restored.view, s.view);
         assert_eq!(restored.lighter, s.lighter);
-        assert!(Snapshot::decode("world", &s.encode_view(), "").is_err());
-        assert!(Snapshot::decode("a07", "a07 0 NaN 0 0 0 0", "").is_err());
+        assert!(Snapshot::decode(s.kind, "world", &s.encode_view(), "").is_err());
+        assert!(Snapshot::decode(s.kind, "a07", "a07 0 NaN 0 0 0 0", "").is_err());
         assert!(lost_error("Error in Device::poll: Parent device is lost"));
         assert!(lost_error(
             "Lighter Vulkan submit ray commands: ERROR_DEVICE_LOST"

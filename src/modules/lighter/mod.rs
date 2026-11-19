@@ -587,6 +587,7 @@ pub struct Lighter {
     allocation_sample: Option<(Instant, [u64; 3], u64)>,
     pub(crate) moving_accel: scene::AccelCache,
     pub settings: Settings,
+    pending_mode: Option<Mode>,
     armed: bool,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     capture: bool,
@@ -618,6 +619,7 @@ impl Default for Lighter {
             allocation_sample: None,
             moving_accel: Default::default(),
             settings: Settings::default(),
+            pending_mode: None,
             armed: false,
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             capture: false,
@@ -708,7 +710,7 @@ impl Lighter {
             Some("This adapter cannot run Lighter's compute and storage-buffer passes.")
         } else if self.settings.mode == Mode::Hardware && !self.has_hardware_device {
             if self.native_backend != wgpu::Backend::Vulkan {
-                Some("Hardware RT needs Vulkan 1.2 with ray queries. Restart after selecting Hardware; remove any conflicting WGPU_BACKEND override.")
+                Some("Hardware RT needs Vulkan 1.2 with ray queries. Use Reload World with Hardware selected and remove any conflicting WGPU_BACKEND override.")
             } else {
                 Some("No hardware ray-query support on the selected Vulkan adapter. Choose Software or select an RT-capable GPU.")
             }
@@ -1053,15 +1055,30 @@ impl Lighter {
         Ok(true)
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    /// Return the replacement's settings only on an explicit reload. Changing
+    /// the dropdown must not compile a new backend on the live viewer or save
+    /// a configuration that has not yet opened a usable world.
+    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Settings> {
         let old = self.settings;
+        let mut mode = self.pending_mode.unwrap_or(old.mode);
         egui::ComboBox::from_label("World renderer")
-            .selected_text(self.settings.mode.label())
+            .selected_text(mode.label())
             .show_ui(ui, |ui| {
-                for mode in Mode::ALL {
-                    ui.selectable_value(&mut self.settings.mode, mode, mode.label());
+                for choice in Mode::ALL {
+                    ui.selectable_value(&mut mode, choice, choice.label());
                 }
             });
+        self.pending_mode = (mode != old.mode).then_some(mode);
+        let reload = ui.button("Reload World")
+            .on_hover_text("Reload this map at the current camera position and time with the selected renderer.")
+            .clicked();
+        if self.pending_mode.is_some() {
+            ui.label(format!(
+                "Current renderer setting: {}. Press Reload World to apply the selection.",
+                old.mode.label()
+            ));
+        }
+        ui.separator();
         ui.checkbox(
             &mut self.settings.lighting,
             "Ray-traced lighting / indirect bounce",
@@ -1119,7 +1136,7 @@ impl Lighter {
         } else if !self.armed {
             ui.colored_label(
                 egui::Color32::YELLOW,
-                "Restart Explorer to load ray geometry. Active now: native renderer.",
+                "Reload World to load ray geometry. Active now: native renderer.",
             );
         } else if let Some(error) = self.error() {
             ui.label("Active: Native renderer (Lighter unavailable).");
@@ -1154,6 +1171,10 @@ impl Lighter {
         ui.separator();
         ui.label("Lighter traces the streamed main world, including water, vegetation, buildings and animated world effects. It uses its own ray lighting and samples the client's sky textures. Map views and UI are unchanged.");
         ui.label("Hardware mode uses Vulkan, not DirectX 12. Lighter uses its own bounded BMD residency. Temporal upscaling/frame generation are suspended only while rays draw the world. See Modules/Lighter/README.md for compatibility notes.");
+        reload.then_some(Settings {
+            mode,
+            ..self.settings
+        })
     }
 }
 

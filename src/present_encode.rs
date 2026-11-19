@@ -1,4 +1,4 @@
-//! Final output encode for swapchains that offer no sRGB format.
+//! Final blit for a precomposed frame (startup or a UNORM swapchain).
 //!
 //! Every material shader in this viewer returns *linear* color and relies on an
 //! sRGB render target to perform exactly one encode on write. When the surface
@@ -10,6 +10,8 @@
 //! pass copies those already-encoded bytes to the swapchain. The copy reads a
 //! raw (UNORM) view of the intermediate, so no second transfer function is
 //! applied: the output bytes are exactly the encoded client framebuffer values.
+//! For an sRGB swapchain we sample the sRGB view and let the attachment encode
+//! again, preserving the same colors when the first frame is composed offscreen.
 //!
 //! This is a viewer presentation route. It is not evidence about the retail
 //! hardware gamma ramp, and the synthetic readback tests that exercise it are
@@ -40,8 +42,7 @@ const SHADER: &str = r#"
  let x=f32((id<<1u)&2u);let y=f32(id&2u);
  return vec4<f32>(x*2.-1.,1.-y*2.,0.,1.);
 }
-// One-to-one copy of already encoded bytes. The source is bound through a
-// UNORM view, so this pass neither decodes nor encodes.
+// One-to-one copy. The source view matches the target transfer function.
 @fragment fn fs(@builtin(position) pos:vec4<f32>)->@location(0) vec4<f32> {
  let p=vec2<i32>(pos.xy);
  return vec4<f32>(textureLoad(frame,p,0).rgb,1.);
@@ -59,10 +60,15 @@ pub struct PresentEncode {
 }
 
 impl PresentEncode {
-    fn texture(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
-        let alternate = [INTERMEDIATE.remove_srgb_suffix()];
+    fn texture(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        w: u32,
+        h: u32,
+    ) -> wgpu::Texture {
+        let alternate = [format.remove_srgb_suffix()];
         device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("presentation encode intermediate"),
+            label: Some("offscreen presentation intermediate"),
             size: wgpu::Extent3d {
                 width: w.max(1),
                 height: h.max(1),
@@ -71,7 +77,7 @@ impl PresentEncode {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: INTERMEDIATE,
+            format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
@@ -80,7 +86,7 @@ impl PresentEncode {
     }
 
     pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat, w: u32, h: u32) -> Self {
-        let frame = Self::texture(device, w, h);
+        let frame = Self::texture(device, render_format(surface_format), w, h);
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("present encode layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
@@ -125,7 +131,7 @@ impl PresentEncode {
             multisample: Default::default(),
             multiview: None,
         });
-        let bind_group = Self::create_bind_group(device, &layout, &frame);
+        let bind_group = Self::create_bind_group(device, surface_format, &layout, &frame);
         Self {
             surface_format,
             frame,
@@ -143,8 +149,14 @@ impl PresentEncode {
         }
         self.width = w.max(1);
         self.height = h.max(1);
-        self.frame = Self::texture(device, self.width, self.height);
-        self.bind_group = Self::create_bind_group(device, &self.layout, &self.frame);
+        self.frame = Self::texture(
+            device,
+            render_format(self.surface_format),
+            self.width,
+            self.height,
+        );
+        self.bind_group =
+            Self::create_bind_group(device, self.surface_format, &self.layout, &self.frame);
     }
 
     pub fn surface_format(&self) -> wgpu::TextureFormat {
@@ -168,18 +180,23 @@ impl PresentEncode {
     /// scene copies) exactly like the sRGB-target path.
     pub fn raw_view(&self) -> wgpu::TextureView {
         self.frame.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(INTERMEDIATE.remove_srgb_suffix()),
+            format: Some(self.frame.format().remove_srgb_suffix()),
             ..Default::default()
         })
     }
 
     fn create_bind_group(
         device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
         layout: &wgpu::BindGroupLayout,
         frame: &wgpu::Texture,
     ) -> wgpu::BindGroup {
         let source = frame.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(INTERMEDIATE.remove_srgb_suffix()),
+            format: Some(if surface_format.is_srgb() {
+                frame.format()
+            } else {
+                frame.format().remove_srgb_suffix()
+            }),
             ..Default::default()
         });
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -192,7 +209,7 @@ impl PresentEncode {
         })
     }
 
-    /// Copy the encoded frame to the swapchain. Runs after the whole-frame
+    /// Copy the composed frame to the swapchain. Runs after the whole-frame
     /// display ramp (which writes into [`Self::view`]).
     pub fn present(&self, device: &wgpu::Device, queue: &wgpu::Queue, target: &wgpu::TextureView) {
         let mut encoder = device.create_command_encoder(&Default::default());

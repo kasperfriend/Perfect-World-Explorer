@@ -1,4 +1,4 @@
-//! Parent/child handoff for changing worlds without tearing down the current
+//! Parent/child handoff for replacing worlds without tearing down the current
 //! renderer.
 //!
 //! The old, foreground process owns the handoff. It writes a focus file from
@@ -11,7 +11,11 @@ use std::{
     fs,
     path::PathBuf,
     process::{Child, Command},
-    sync::{mpsc::Sender, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+        Arc, Mutex,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -44,6 +48,7 @@ pub enum Message {
         activated: bool,
     },
     Failed(String),
+    Cancelled,
 }
 
 /// A headless decision about one watcher poll. `watch` turns filesystem and
@@ -103,6 +108,7 @@ pub struct Files {
     status: PathBuf,
     focus: PathBuf,
     hwnd: PathBuf,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Files {
@@ -118,6 +124,7 @@ impl Files {
             status: root.join(format!("{stem}.status")),
             focus: root.join(format!("{stem}.focus")),
             hwnd: root.join(format!("{stem}.hwnd")),
+            cancelled: Arc::new(AtomicBool::new(false)),
         };
         let _ = fs::write(&files.focus, b"focused");
         let _ = fs::remove_file(&files.hwnd);
@@ -155,6 +162,14 @@ impl Files {
             .ok()
     }
 
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
     pub fn cleanup(&self) {
         for path in [&self.ready, &self.status, &self.focus, &self.hwnd] {
             let _ = fs::remove_file(path);
@@ -187,6 +202,13 @@ impl Files {
                 let mut previous_status = String::new();
                 let started = Instant::now();
                 loop {
+                    if files.is_cancelled() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        files.cleanup();
+                        let _ = tx.send(Message::Cancelled);
+                        return;
+                    }
                     let status = fs::read_to_string(&files.status).ok();
                     if let Some(status) = status.as_ref() {
                         if status != &previous_status && !status.starts_with(FAILED_PREFIX) {
@@ -221,7 +243,10 @@ impl Files {
                             let _ = tx.send(Message::Ready { activated });
                             return;
                         }
-                        Decision::Fail(reason) => {
+                        Decision::Fail(mut reason) => {
+                            if snapshot.timed_out && !previous_status.is_empty() {
+                                reason.push_str(&format!(" Last stage: {previous_status}"));
+                            }
                             let _ = child.kill();
                             let _ = child.wait();
                             files.cleanup();
@@ -403,20 +428,22 @@ mod tests {
         assert_eq!(decide(&state), Decision::Wait);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn a_restart_progress_notice_completes_handoff_as_ready() {
-        let mut state = snapshot();
-        state.ready = true;
-        state.hwnd = None;
-        state.status = Some(
-            "Map a01 failed after loading. The explorer is restarting in the main world.".into(),
-        );
+    fn cancelling_a_running_handoff_reaps_the_child_and_removes_its_files() {
+        let files = Files::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        files
+            .clone()
+            .watch(child, tx, Duration::from_secs(5))
+            .unwrap();
+        files.cancel();
         assert_eq!(
-            decide(&state),
-            Decision::Ready {
-                activate_hwnd: None
-            }
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Message::Cancelled)
         );
+        assert!(!files.focus.exists());
     }
 
     #[test]

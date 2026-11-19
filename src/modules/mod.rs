@@ -39,6 +39,11 @@ pub(crate) fn lighter_installed() -> bool {
         .any(|p| p.id == "lighter")
 }
 
+pub enum MenuAction {
+    Back,
+    ReloadWorld(lighter::Settings),
+}
+
 pub struct Modules {
     walker: Walker,
     librarian: librarian::Librarian,
@@ -128,15 +133,15 @@ impl Modules {
         self.walker.visible_in_water_pass(plane, reflection)
     }
 
-    /// Returns true when the user asks to go back to the main Escape menu.
+    /// Report requests that need to be handled by the viewer, not a module.
     pub fn menu_ui(
         &mut self,
         ctx: &egui::Context,
         spawn: Vec3,
         yaw: f32,
         lighter: &mut lighter::Lighter,
-    ) -> bool {
-        let mut back = false;
+    ) -> Option<MenuAction> {
+        let mut action = None;
         egui::Window::new("MODULES  |  ESC to go back")
             .default_pos(egui::pos2(16., 16.))
             .default_size(egui::vec2(780., 650.))
@@ -167,7 +172,7 @@ impl Modules {
                     .show_inside(ui, |ui| {
                         ui.separator();
                         if ui.button("Back to menu").clicked() {
-                            back = true;
+                            action = Some(MenuAction::Back);
                         }
                     });
 
@@ -175,12 +180,14 @@ impl Modules {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::default())
                     .show_inside(ui, |ui| {
-                        self.module_browser_ui(ui, &mut selected, spawn, yaw, lighter);
+                        if let Some(settings) = self.module_browser_ui(ui, &mut selected, spawn, yaw, lighter) {
+                            action = Some(MenuAction::ReloadWorld(settings));
+                        }
                     });
                 self.selected = selected;
             });
         self.librarian.ui(ctx);
-        back
+        action
     }
 
     fn module_browser_ui(
@@ -190,7 +197,7 @@ impl Modules {
         spawn: Vec3,
         yaw: f32,
         lighter: &mut lighter::Lighter,
-    ) {
+    ) -> Option<lighter::Settings> {
         egui::SidePanel::left("installed_module_browser")
             .exact_width(190.)
             .resizable(false)
@@ -253,13 +260,16 @@ impl Modules {
                         // descriptions must wrap, never size the outer Window.
                         ui.set_max_width(width);
                         if let Some(installed) = self.packages.packages.get(*selected).cloned() {
-                            self.selected_module_ui(ui, installed, spawn, yaw, lighter);
+                            self.selected_module_ui(ui, installed, spawn, yaw, lighter)
                         } else {
                             ui.heading("Module details");
                             ui.label("Select a module on the left.");
+                            None
                         }
-                    });
-            });
+                    })
+                    .inner
+            })
+            .inner
     }
 
     fn selected_module_ui(
@@ -269,7 +279,7 @@ impl Modules {
         spawn: Vec3,
         yaw: f32,
         lighter: &mut lighter::Lighter,
-    ) {
+    ) -> Option<lighter::Settings> {
         ui.heading(&installed.name);
         ui.label(
             egui::RichText::new(format!("Version {}", installed.version))
@@ -286,7 +296,7 @@ impl Modules {
         match installed.id.as_str() {
             "walker" => self.walker_module_ui(ui, spawn, yaw),
             "populator" => self.populator_module_ui(ui, spawn),
-            "lighter" => lighter.ui(ui),
+            "lighter" => return lighter.ui(ui),
             "librarian" => {
                 let active = self.librarian.active();
                 if ui
@@ -312,6 +322,7 @@ impl Modules {
                 );
             }
         }
+        None
     }
 
     fn populator_module_ui(&mut self, ui: &mut egui::Ui, spawn: Vec3) {
