@@ -23,7 +23,24 @@ fn append_mip(
     // Round-tripping it through the block decoder's synthetic header is what
     // used to fail, and a failure here becomes the draw's white placeholder.
     if let Format::Uncompressed(layout) = format {
-        if layout.bits == 16 {
+        if layout.luminance {
+            // One channel widened into R, G and B: a grey mask, which is what
+            // `textures/water/caustic/` is. Inventing colour here would be
+            // worse than the grey the author stored.
+            if layout.bits == 8 {
+                for &l in mip.bytes {
+                    rgba.extend_from_slice(&[l, l, l, 255]);
+                }
+            } else {
+                // 16-bit luminance keeps the sample in the low byte of each
+                // word (masks `000000ff` / `0000ff00`), so the byte pair is the
+                // sample and its zero.
+                for pixel in mip.bytes.chunks_exact(2) {
+                    let l = pixel[0];
+                    rgba.extend_from_slice(&[l, l, l, 255]);
+                }
+            }
+        } else if layout.bits == 16 {
             // RGB565: five or six bits per channel, expanded by replicating the
             // high bits into the low ones so full scale is 255 rather than 248.
             for pixel in mip.bytes.chunks_exact(2) {
