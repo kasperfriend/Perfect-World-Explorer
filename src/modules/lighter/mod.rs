@@ -269,6 +269,7 @@ const SINGLE_PATH: u32 = 32768;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 const HYBRID_PRIMARY: u32 = 65536;
 const PHYSICAL_BSDF: u32 = 8192;
+const RAY_LIGHTING_OVERLAY: u32 = 1;
 
 pub(crate) fn storage_limit(device: &wgpu::Device) -> usize {
     let limits = device.limits();
@@ -1908,6 +1909,7 @@ impl Lighter {
         frame.options[0] |= u32::from(settings.lighting)
             | u32::from(settings.shadows) << 1
             | u32::from(settings.reflections) << 2
+            | if settings.ray_lighting { RAY_LIGHTING_OVERLAY } else { 0 }
             | if settings.single_path { SINGLE_PATH } else { 0 }
             | if settings.physical_bsdf {
                 PHYSICAL_BSDF

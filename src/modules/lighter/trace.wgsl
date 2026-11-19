@@ -1699,7 +1699,12 @@ fn camera_ray(id: vec2<u32>, sample: u32, seed: ptr<function,u32>) -> Ray {
     return Ray(frame.eye.xyz,norm(near),length(near),length(far),0.,spread,coverage,pixel_seed);
 }
 
-fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool) {
+/// Ray-lighting overlay flag bit in frame.options.x. When set, the ray pass
+/// adds lighting on top of the raster color instead of replacing it, and
+/// never outputs black: if the ray result is invalid, the raster color stands.
+const RAY_LIGHTING_OVERLAY: u32 = 1u;
+
+fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool, overlay: bool) {
     dependencies = 0u;
     motion_dependent = false;
     sun_cache_read = 0u;
@@ -1731,7 +1736,27 @@ fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool) {
     guide.w |= unsafe_guide|dependencies;
     var pixel = pack_pixel(total/f32(frame.options.z),depth,guide,owner|select(0u,DEP_MOVING,motion_dependent));
     pixel.albedo_history |= sun_cache_write;
-    image[at] = pixel;
+
+    if overlay {
+        // Ray-lighting overlay: add radiance on top of the raster color.
+        // Never output black — if the ray result is invalid, keep raster.
+        let existing = image[at];
+        let existing_rgb = color_of(existing);
+        let ray_rgb = color_of(pixel);
+        let has_lighting = luminance(ray_rgb) > 0.;
+        if has_lighting {
+            // Multiply/add ray lighting onto raster color; clamp to valid range.
+            let combined = existing_rgb + ray_rgb;
+            var combined_pixel = pack_pixel(combined, depth, guide, owner|select(0u,DEP_MOVING,motion_dependent));
+            combined_pixel.albedo_history = existing.albedo_history | sun_cache_write;
+            image[at] = combined_pixel;
+        } else {
+            // No usable ray lighting — keep the raster color unchanged.
+            image[at] = existing;
+        }
+    } else {
+        image[at] = pixel;
+    }
     temporal_end(at);
     screen_end();
 }
@@ -1739,5 +1764,6 @@ fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool) {
 @compute @workgroup_size(8,8)
 fn render(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy>=frame.extent.xy) { return; }
-    render_pixel(id.xy,Hit(0.,NIL,0u,vec2<f32>(0.)),false);
+    let overlay = (frame.options.x & RAY_LIGHTING_OVERLAY)!=0u;
+    render_pixel(id.xy,Hit(0.,NIL,0u,vec2<f32>(0.)),false,overlay);
 }
