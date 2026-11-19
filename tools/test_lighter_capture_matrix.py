@@ -63,9 +63,31 @@ class CaptureMatrixTests(unittest.TestCase):
     def test_missing_inventory_class_is_not_complete(self):
         with tempfile.TemporaryDirectory() as tmp:
             stem = Path(tmp) / "partial"
-            stem.with_suffix(".coverage.csv").write_text("class,loaded\nnear_terrain,1\n", encoding="utf-8")
+            stem.with_suffix(".coverage.csv").write_text(",".join(matrix.INVENTORY_COLUMNS) + "\nnear_terrain,1," + ",".join(["0"] * 14) + "\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "missing inventory rows"):
                 matrix.inventory_for(stem, {})
+
+    def test_native_inventory_binds_csv_and_reconciles_totals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = Path(tmp) / "fixture"
+            raw = (",".join(matrix.INVENTORY_COLUMNS) + "\n"
+                   + "".join(f"{name},{int(name == 'near_terrain')}," + ",".join(["0"] * 14) + "\n"
+                             for name in ("near_terrain", "far_terrain", "trees", "grass", "buildings", "water",
+                                          "world_models", "walker", "populator", "effect_draws", "effect_roots")))
+            stem.with_suffix(".coverage.csv").write_bytes(raw.encode())
+            meta = dict.fromkeys(("native_authored_bmds", "native_authored_water_areas", "native_authored_tree_placements",
+                                  "native_authored_world_actors", "native_effect_quads", "world_effect_authored_scene_roots",
+                                  "world_effect_decoded_model_event_roots", "grass_authored_areas"), "0")
+            meta |= {f"grass_areas_{k}": "0" for k in (*matrix.TOTALS, "range", "empty", "cutoff", "budget", "disabled", "unavailable")}
+            meta |= {"native_inventory_scope": matrix.NATIVE_SCOPE, "grass_inventory_scope": "native_stream_only",
+                     "inventory_sha256": hashlib.sha256(raw.encode()).hexdigest()}
+            self.assertEqual(matrix.capture_inventory(stem, "off", meta, {})["near_terrain"]["loaded"], 1)
+            with self.assertRaisesRegex(ValueError, "Native grass area"):
+                matrix.capture_inventory(stem, "off", meta | {"grass_authored_areas": "1"}, {})
+            self.assertIsNone(matrix.capture_inventory(stem, "off", meta | {"native_inventory_scope": "partial"}, {}))
+            stem.with_suffix(".coverage.csv").write_bytes(raw.encode() + b"\n")
+            with self.assertRaisesRegex(ValueError, "inventory SHA-256"):
+                matrix.capture_inventory(stem, "off", meta, {})
 
     def test_completed_stages_are_named_and_bounded_by_timed_draws(self):
         meta = {"gpu_timed_stages": '"build,primary,traversal,reproject,filter,upscale"',
@@ -128,17 +150,46 @@ class CaptureMatrixTests(unittest.TestCase):
             temporal.validate_temporal(metas | {"reference": metas["reference"] | {"settings_effective": ref % 32}}, "reveal")
 
     def test_rt17_ignores_cpu_pairs_and_identifies_incomplete_native_counts(self):
-        cases = [{"id": "wet", "classes": ["water"], "condition": "day"}]
+        cases = [{"id": "wet", "map": "a07", "classes": ["water"], "condition": "day",
+                  "camera": [16, 356, 84, 0, -0.6], "camera_evidence": "review/a07.png"}]
         timing = {"samples": [1, 2, 3]}
-        captures = {"off": {"inventory": None, "synchronized_capture_ms": timing},
-                    "software": {"inventory": {"water": {}}, "synchronized_capture_ms": timing},
-                    "hardware": {"inventory": {"water": {}}, "synchronized_capture_ms": timing}}
-        report = {"profile": "physical", "cases": [{"case": cases[0], "captures": captures}], "errors": {}}
+        meta = {"platform": "windows", "architecture": "x86_64",
+                "adapter": 'name: "NVIDIA GeForce RTX 3080", vendor: 4318, device_type: DiscreteGpu, backend: Vulkan',
+                "vulkan_largest_device_local_heap_bytes": str(10 << 30),
+                "trace_image": "480x360", "inventory_sha256": "a" * 64}
+        sample = {"inventory": {"water": {}}, "synchronized_capture_ms": timing, "meta": meta}
+        captures = {"off": sample | {"inventory": None}, "software": sample, "hardware": sample}
+        pins = dict.fromkeys(matrix.SHARED_INPUTS | {f"maps/a07/a07{suffix}" for suffix in
+                            (".ecwld", ".ecbsd", ".trn2", "_1.t2bk", "_1.t2mk")}, "b" * 64)
+        report = {"profile": "physical", "cases": [{"case": cases[0], "captures": captures}],
+                  "errors": {}, "client_inputs": pins}
         physical = matrix.missing_rt17_cells(cases, report)
         self.assertEqual(len(physical), 52)
         self.assertTrue(any(c["route"] == "off" and c["scene_class"] == "water"
                             and "Native" in c["reason"] for c in physical))
         self.assertEqual(len(matrix.missing_rt17_cells(cases, report | {"profile": "cpu"})), 54)
+        self.assertEqual(len(matrix.missing_rt17_cells(cases, report | {"client_inputs": {}})), 54)
+        self.assertEqual(len(matrix.missing_rt17_cells([cases[0] | {"camera_evidence": None}], report)), 54)
+        self.assertTrue(matrix.requested_target(meta))
+        self.assertFalse(matrix.requested_target(meta | {"vulkan_largest_device_local_heap_bytes": str(12 << 30)}))
+        self.assertFalse(matrix.requested_target(meta | {"platform": "linux"}))
+
+    def test_input_hashes_refuse_mixed_clients_and_path_traversal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = Path(tmp)
+            (client / "element/maps").mkdir(parents=True)
+            payload = client / "element/textures.pck"
+            payload.write_bytes(b"exact bytes")
+            good = hashlib.sha256(b"exact bytes").hexdigest()
+            pins = client / "pins.txt"
+            pins.write_text(f"# pins\n{good}  textures.pck\n", encoding="utf-8")
+            self.assertEqual(matrix.verify_inputs(client, pins), {"textures.pck": good})
+            payload.write_bytes(b"same length")
+            with self.assertRaisesRegex(ValueError, "input SHA-256 mismatch"):
+                matrix.verify_inputs(client, pins)
+            pins.write_text(f"{good} ../textures.pck\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "invalid or duplicate"):
+                matrix.verify_inputs(client, pins)
 
     def test_gpu_stages_keep_gpu_time_separate_from_capture_wall_time(self):
         with tempfile.TemporaryDirectory() as tmp:

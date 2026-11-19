@@ -4,6 +4,18 @@ name: Lighter retail capture matrix
 # for maps and packages; never cache or upload client asset bytes.
 on:
   workflow_dispatch:
+  # Run on branch updates to the evidence pipeline itself. Documentation-only
+  # pushes and the eventual merge to main need not download the packs again.
+  push:
+    branches-ignore: [main]
+    paths:
+      - '.github/workflows/lighter-retail.yml'
+      - 'tools/lighter_capture_matrix.py'
+      - 'tools/fixtures/lighter-retail-*'
+
+concurrency:
+  group: lighter-retail-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -33,7 +45,8 @@ jobs:
               exit 1
             fi
           done < tools/fixtures/lighter-retail-inputs.txt
-          # Both records have the same pinned 32-byte empty cloud header.
+          # The established CPU fixture uses the pinned empty cloud header
+          # for a07; this is not a byte receipt for an a07-specific cloud file.
           cp "$RUNNER_TEMP/lighter-client/element/maps/a01/a01.cld" \
             "$RUNNER_TEMP/lighter-client/element/maps/a07/a07.cld"
       - name: Select the CPU Vulkan driver
@@ -58,7 +71,7 @@ jobs:
           echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
           echo "GALLIVM_PERF=nopt" >> "$GITHUB_ENV"
       - name: Build viewer
-        run: cargo build --locked --bin perfect-world-explorer
+        run: cargo build --locked --bin perfect-world-explorer --bin lighter-terrain-plan
       - name: Compare matched day, night and rain cameras
         env:
           XDG_RUNTIME_DIR: ${{ runner.temp }}
@@ -69,13 +82,29 @@ jobs:
           py="$RUNNER_TEMP/lighter-python/bin/python"
           "$py" -m pip install --disable-pip-version-check Pillow==11.3.0
           "$py" -m unittest discover -s tools -p test_lighter_capture_matrix.py
+          "$py" -m unittest discover -s tools -p test_lighter_terrain_audit.py
+          mkdir -p target/lighter-terrain-input-audit
+          maps="$RUNNER_TEMP/lighter-client/element/maps"
+          "$py" tools/lighter-terrain-audit.py "$maps/a01/a01.trn2" "$maps/a02/a02.trn2" "$maps/a07/a07.trn2" \
+            --viewer-planner target/debug/lighter-terrain-plan --json target/lighter-terrain-input-audit/pw142.json
           "$py" tools/lighter_capture_matrix.py \
             --profile cpu --manifest tools/fixtures/lighter-retail-scenes.json \
+            --input-manifest tools/fixtures/lighter-retail-inputs.txt \
             --viewer target/debug/perfect-world-explorer --client "$RUNNER_TEMP/lighter-client" \
             --output target/lighter-retail --ray-resolution 25 --timed-frames 3
+      - name: Report capture manifest hashes
+        if: always()
+        run: |
+          for file in target/lighter-retail/SHA256SUMS.txt target/lighter-terrain-input-audit/pw142.json; do
+            if [[ -f "$file" ]]; then
+              echo "::notice title=Lighter receipt SHA-256::$(sha256sum "$file")"
+            fi
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: lighter-retail-matrix
-          path: target/lighter-retail/
+          path: |
+            target/lighter-retail/
+            target/lighter-terrain-input-audit/
           if-no-files-found: warn
