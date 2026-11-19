@@ -1543,6 +1543,14 @@ fn lighter_live_travel_csv() {
                 (160, 96),
             );
         }
+        if let Some(path) = std::env::var_os("PW_SAVE_LIGHTER_TRAVEL_MOTION") {
+            let path = std::path::Path::new(&path);
+            std::fs::create_dir_all(path).unwrap();
+            for i in 0..30 {
+                let name = format!("{i:06}.png");
+                std::fs::copy(root.0.join("motion").join(&name), path.join(&name)).unwrap();
+            }
+        }
     } else {
         let policy = if sync {
             "synchronized"

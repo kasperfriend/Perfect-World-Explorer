@@ -1204,7 +1204,7 @@ impl Lighter {
     /// stage samples for that completed draw, not the prior raw Vulkan fence
     /// normally used by the live controller. Never wait here.
     pub(crate) fn capture_stage_sample(&mut self, queue: &wgpu::Queue) -> Option<[f64; 6]> {
-        let post = self.timings.as_mut()?.collect(queue)?;
+        let post = self.timings.as_mut()?.collect_submitted(queue)?;
         self.gpu_sample = Some(post);
         let mut stages = [
             0.,

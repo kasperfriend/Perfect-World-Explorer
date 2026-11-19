@@ -304,8 +304,10 @@ impl Travel {
     }
 
     pub(super) fn enable_motion(&mut self, dir: PathBuf) -> Result<(), String> {
-        if self.plan.samples() > 600 {
-            return Err("motion sequences are limited to 600 frames per run".into());
+        if self.sync || self.plan.samples() > 600 {
+            return Err(
+                "motion sequences are limited to 600 frames and cannot synchronize timing".into(),
+            );
         }
         std::fs::create_dir_all(&dir).map_err(|e| format!("travel capture directory: {e}"))?;
         if std::fs::read_dir(&dir)
@@ -466,8 +468,9 @@ impl Travel {
             self.finished = true;
             match self.save() {
                 Ok(()) => eprintln!(
-                    "Lighter travel: {} normal present calls saved to {}",
+                    "Lighter travel: {} {} presents saved to {}",
                     self.samples.len(),
+                    self.capture_policy(),
                     self.path.display()
                 ),
                 Err(e) => eprintln!("Lighter travel could not save: {e}"),
@@ -478,6 +481,16 @@ impl Travel {
     #[cfg(test)]
     pub(super) fn recorded(&self) -> bool {
         self.finished && self.samples.len() == self.plan.samples() as usize
+    }
+
+    fn capture_policy(&self) -> &'static str {
+        if self.sync {
+            "synchronized"
+        } else if self.motion_dir.is_some() {
+            "motion_readback"
+        } else {
+            "normal_present"
+        }
     }
 
     fn save(&self) -> std::io::Result<()> {
@@ -491,13 +504,10 @@ impl Travel {
             self.plan.map,self.plan.hash,self.plan.hour,self.plan.warmup,self.samples.len(),self.hybrid,self.adapter)?;
         writeln!(
             out,
-            "# ray_reconstruction={}\n# capture_policy={}",
+            "# ray_reconstruction={}\n# capture_policy={}\n# platform={}",
             self.expected_provider,
-            if self.motion_dir.is_some() {
-                "motion_readback"
-            } else {
-                "normal_present"
-            }
+            self.capture_policy(),
+            std::env::consts::OS
         )?;
         if let Some(s) = &self.setup {
             let [(w, h), (rw, rh), (tw, th)] = s.extents;

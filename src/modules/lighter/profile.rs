@@ -21,6 +21,7 @@ struct Sample {
 
 #[derive(Clone, Copy)]
 pub(super) struct GpuSample {
+    order: u64,
     pub mode: Mode,
     pub extent: [u32; 4],
     pub trace_ms: f64,
@@ -40,6 +41,7 @@ pub(super) struct Timings {
     query: wgpu::QuerySet,
     slots: [Slot; 3],
     recorded: Option<(usize, Sample)>,
+    submitted_order: Option<u64>,
     serial: u64,
     latest: u64,
     last_log: Option<Instant>,
@@ -77,6 +79,7 @@ impl Timings {
                 pending: None,
             }),
             recorded: None,
+            submitted_order: None,
             serial: 0,
             latest: 0,
             last_log: None,
@@ -109,6 +112,7 @@ impl Timings {
                         let [reproject_ms, filter_ms, upscale_ms] =
                             [elapsed(1), elapsed(2), elapsed(3)];
                         newest = Some(GpuSample {
+                            order: sample.order,
                             mode: sample.mode,
                             extent: sample.extent,
                             trace_ms,
@@ -144,6 +148,13 @@ impl Timings {
         newest
     }
 
+    /// Capture only the draw just submitted, even if backpressure left it
+    /// without a timestamp slot and an older readback completes now.
+    pub(super) fn collect_submitted(&mut self, queue: &wgpu::Queue) -> Option<GpuSample> {
+        self.collect(queue)
+            .filter(|sample| self.submitted_order == Some(sample.order))
+    }
+
     pub(super) fn due(&self) -> bool {
         self.recorded.is_none() && self.slots.iter().any(|s| s.pending.is_none())
     }
@@ -176,7 +187,9 @@ impl Timings {
     }
 
     pub(super) fn submitted(&mut self) {
-        if let Some((index, sample)) = self.recorded.take() {
+        let recorded = self.recorded.take();
+        self.submitted_order = recorded.map(|(_, sample)| sample.order);
+        if let Some((index, sample)) = recorded {
             let slot = &mut self.slots[index];
             let (tx, rx) = mpsc::channel();
             slot.readback

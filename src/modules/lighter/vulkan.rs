@@ -1301,6 +1301,9 @@ impl Renderer {
                 .map_err(vkerr("poll ray frame"))?;
             self.submitted = !ready;
             if ready {
+                // A missing/unreadable timestamp on this fence must not
+                // be paired with the new wgpu compose sample at the same extent.
+                self.last_gpu = None;
                 if let Some((extent, built, raster, moving_bytes, instance_bytes)) =
                     self.timing_pending.take()
                 {

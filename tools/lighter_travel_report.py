@@ -95,6 +95,8 @@ def validate_pair(a, b, reuse_ab=False):
     for key in MATCH:
         if a[0][key] != b[0][key]:
             raise ValueError(f"unmatched travel {key}: {a[0][key]} vs {b[0][key]}")
+    if a[0].get("platform") != b[0].get("platform"):
+        raise ValueError("unmatched travel platform")
     if a[2] != b[2]:
         raise ValueError("recorded camera paths disagree")
     if "Off" not in (a[1], b[1]):
@@ -151,6 +153,10 @@ def validate_suite(records):
     if len(pairs) != len(required) or set(pairs) != required:
         raise ValueError(f"missing or duplicate synchronized routes: {sorted(required - set(pairs))}")
     for meta, mode, _, rows in records:
+        if (meta.get("platform") != "windows"
+                or any(token not in meta["adapter"] for token in ('name: "NVIDIA GeForce RTX 3080"',
+                       "vendor: 4318", "device_type: DiscreteGpu", "backend: Vulkan"))):
+            raise ValueError("SDK matrix needs the exact Windows NVIDIA GeForce RTX 3080 Vulkan adapter")
         provider = meta["ray_reconstruction"]
         if any(r[4] is None or r[4] <= 0 for r in rows):
             raise ValueError(f"{mode}/{provider}: whole-viewer heap samples are missing")
