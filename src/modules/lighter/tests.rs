@@ -317,7 +317,7 @@ impl Harness {
                 shadows: false,
                 bounces: 0,
                 resolution: 100,
-                denoiser: false,
+                denoiser: Denoiser::None,
                 soft_sun: false,
                 single_path: false, // deterministic split for the legacy optical probes
                 progressive: false,
@@ -856,7 +856,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
 fn exercise_backend_switch(h: &mut Harness) {
     let saved = h.ray.settings;
     h.ray.settings.lighting = false;
-    h.ray.settings.denoiser = false;
+    h.ray.settings.denoiser = Denoiser::None;
     h.ray.settings.progressive = false;
     h.ray.settings.bounces = 0;
     h.ray.settings.samples = 1;
@@ -890,7 +890,7 @@ fn exercise_ray_texture_filter(h: &mut Harness) {
     h.ray.settings.lighting = false;
     h.ray.settings.shadows = false;
     h.ray.settings.reflections = false;
-    h.ray.settings.denoiser = false;
+    h.ray.settings.denoiser = Denoiser::None;
     h.ray.settings.progressive = false;
     h.ray.settings.bounces = 0;
     h.ray.settings.samples = 1;
@@ -1019,7 +1019,7 @@ fn exercise_material_channels(h: &mut Harness) {
     h.ray.settings.shadows = false;
     h.ray.settings.soft_sun = false;
     h.ray.settings.reflections = false;
-    h.ray.settings.denoiser = false;
+    h.ray.settings.denoiser = Denoiser::None;
     h.ray.settings.progressive = false;
     h.ray.settings.relight_baked = false;
     h.ray.settings.bounces = 0;
@@ -1791,7 +1791,7 @@ fn exercise_single_path_estimators(h: &mut Harness) {
         bounces: 1,
         samples: 1,
         resolution: 100,
-        denoiser: false,
+        denoiser: Denoiser::None,
         progressive: false,
         soft_sun: false,
         physical_bsdf: false,
@@ -1918,7 +1918,7 @@ fn exercise_stationary_sun(h: &mut Harness) {
         shadows: true,
         soft_sun: false,
         progressive: true,
-        denoiser: true,
+        denoiser: Denoiser::Svgf,
         ..saved
     };
     let mode = saved.mode;
@@ -2391,9 +2391,8 @@ fn exercise_spatial_upscale(h: &mut Harness) {
         samples: 1,
         resolution: 50,
         progressive: false,
-        denoiser: false,
+        denoiser: Denoiser::None,
         lighting: false,
-        fsr1_easu: false,
         ..saved
     };
     let mut b = Builder::for_mode(saved.mode);
@@ -2403,14 +2402,12 @@ fn exercise_spatial_upscale(h: &mut Harness) {
     let f = test_frame(Vec3::ZERO, Vec3::NEG_Z, 47);
     let empty = Builder::for_mode(saved.mode).finish();
     let linear = h.pixels(f, &empty);
-    h.ray.settings.fsr1_easu = true;
     let spatial = h.pixels(f, &empty);
     assert!(linear.iter().zip(&spatial).all(|(a, b)| a.1 == b.1));
     assert!(linear.iter().zip(&spatial).any(|(a, b)| a.0 != b.0));
     assert_eq!(spatial[47 * 23 + 23].0, [255, 0, 0, 255]);
     h.ray.settings.resolution = 100;
     let native = h.pixels(f, &empty);
-    h.ray.settings.fsr1_easu = false;
     assert_eq!(
         native,
         h.pixels(f, &empty),
@@ -2429,7 +2426,7 @@ fn exercise_stable_primary_water(h: &mut Harness) {
         shadows: false,
         reflections: true,
         progressive: false,
-        denoiser: false,
+        denoiser: Denoiser::None,
         single_path: false,
         ..saved
     };
@@ -2583,7 +2580,7 @@ fn exercise_vegetation(h: &mut Harness) {
     h.ray.settings.shadows = true;
     h.ray.settings.soft_sun = false;
     h.ray.settings.reflections = false;
-    h.ray.settings.denoiser = false;
+    h.ray.settings.denoiser = Denoiser::None;
     h.ray.settings.progressive = false;
     h.ray.settings.bounces = 0;
     h.ray.settings.samples = 1;
@@ -2939,13 +2936,13 @@ fn exercise_denoiser_edges(h: &mut Harness) {
         // normal (direct sun) can explain the discontinuity.
         frame.air = [6., 7., 1., 0.];
         frame.extent = [0, 0, 7, 7];
-        h.ray.settings.denoiser = false;
+        h.ray.settings.denoiser = Denoiser::None;
         h.ray.settings.resolution = 100;
         let raw = h.pixels(frame, &empty);
         let left = small(&raw, 3);
         let right = small(&raw, 4);
         assert!(left.0[0] > right.0[0] + 80, "{label}: {left:?} {right:?}");
-        h.ray.settings.denoiser = true;
+        h.ray.settings.denoiser = Denoiser::Svgf;
         let filtered = h.pixels(frame, &empty);
         assert_eq!(small(&filtered, 3), left, "{label}: left edge filtered");
         assert_eq!(small(&filtered, 4), right, "{label}: right edge filtered");
@@ -2954,7 +2951,7 @@ fn exercise_denoiser_edges(h: &mut Harness) {
         frame.extent = [0, 0, 14, 14];
         h.ray.settings.resolution = 50;
         let guided = h.pixels(frame, &empty);
-        h.ray.settings.denoiser = false;
+        h.ray.settings.denoiser = Denoiser::None;
         let bilinear = h.pixels(frame, &empty);
         let at = 7 * 14 + 7; // exactly between source texels 3 and 4
         assert_eq!(guided[at], left, "{label}: upscale bled into left");
@@ -3021,7 +3018,7 @@ fn exercise_sun_and_history(h: &mut Harness) {
     assert_eq!(hard[center].0[0], 0, "point sun did not cast a hard shadow");
     h.ray.settings.soft_sun = true;
     let grain = h.pixels(frame, &empty);
-    h.ray.settings.denoiser = true;
+    h.ray.settings.denoiser = Denoiser::Svgf;
     let smooth = h.pixels(frame, &empty);
     let stats = |pixels: &[([u8; 4], f32)]| {
         let row = (2..SIDE - 2).map(|y| f32::from(pixels[column(y)].0[0]) / f32::from(full));
@@ -3046,7 +3043,7 @@ fn exercise_sun_and_history(h: &mut Harness) {
     // Compare the history to independent draws of the same transport seeds.
     // Build the expected EMA on the CPU (linear target, with 8-bit rounding).
     const FRAMES: u32 = 12;
-    h.ray.settings.denoiser = false;
+    h.ray.settings.denoiser = Denoiser::None;
     h.ray.settings.progressive = true;
     let mut expected = vec![(0., 0.); SIDE * SIDE];
     for i in 1..=FRAMES {
@@ -3319,7 +3316,7 @@ fn exercise_streamed_bmds(h: &mut Harness) {
         bounces: 0,
         samples: 1,
         resolution: 100,
-        denoiser: false,
+        denoiser: Denoiser::None,
         progressive: false,
         soft_sun: false,
         anisotropy: 8,
@@ -3443,7 +3440,7 @@ fn exercise_accel_reuse(h: &mut Harness) {
     h.ray.settings.shadows = false;
     h.ray.settings.reflections = false;
     h.ray.settings.progressive = false;
-    h.ray.settings.denoiser = false;
+    h.ray.settings.denoiser = Denoiser::None;
     h.ray.settings.resolution = 100;
     h.ray.settings.samples = 1;
     let empty = Builder::default().finish();
@@ -3706,7 +3703,7 @@ fn exercise_resource_reuse(h: &mut Harness) {
     put(&mut b, id);
     h.ray.install(Ok((b.finish(), bank)));
     h.ray.settings.progressive = true;
-    h.ray.settings.denoiser = true;
+    h.ray.settings.denoiser = Denoiser::Svgf;
     let empty = Builder::default().finish();
     let before = h.pixel(test_frame(Vec3::ZERO, -Vec3::Z, 25), &empty);
     assert!(before.0[0] > 245 && before.0[1] > 70 && before.0[2] < 5 && before.1 > 0.);
@@ -3814,7 +3811,7 @@ fn exercise_chunk_scaling(h: &mut Harness) {
     h.ray.settings.samples = 1;
     h.ray.settings.lighting = false;
     h.ray.settings.bounces = 0;
-    h.ray.settings.denoiser = false;
+    h.ray.settings.denoiser = Denoiser::None;
     h.ray.settings.progressive = false;
     let empty = Builder::default().finish();
     let mut accel = AccelCache::default();

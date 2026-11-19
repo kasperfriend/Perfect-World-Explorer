@@ -32,6 +32,56 @@ impl Mode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Denoiser {
+    #[default]
+    Svgf,
+    None,
+    DlssRr,
+    FsrRayRegen,
+}
+
+impl Denoiser {
+    pub const ALL: [Self; 4] = [Self::Svgf, Self::None, Self::DlssRr, Self::FsrRayRegen];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Svgf => "SVGF (portable)",
+            Self::None => "None",
+            Self::DlssRr => "DLSS Ray Reconstruction (RTX)",
+            Self::FsrRayRegen => "FSR Ray Regeneration",
+        }
+    }
+
+    pub fn unavailable_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Svgf => None,
+            Self::None => None,
+            Self::DlssRr => Some("requires RTX GPU"),
+            Self::FsrRayRegen => Some("SDK not found at PW_RAY_FSR_VK_DLL"),
+        }
+    }
+
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "svgf" => Some(Self::Svgf),
+            "none" => Some(Self::None),
+            "rr" => Some(Self::DlssRr),
+            "fsr-ray-regen" => Some(Self::FsrRayRegen),
+            _ => None,
+        }
+    }
+
+    fn token(self) -> &'static str {
+        match self {
+            Self::Svgf => "svgf",
+            Self::None => "none",
+            Self::DlssRr => "rr",
+            Self::FsrRayRegen => "fsr-ray-regen",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub mode: Mode,
@@ -42,14 +92,14 @@ pub struct Settings {
     pub reflections: bool,
     pub single_path: bool,
     pub hybrid_primary: bool,
-    pub denoiser: bool,
+    pub denoiser: Denoiser,
+    pub ray_lighting: bool,
     pub progressive: bool,
     pub bounces: u32,
     pub diffuse_distance: u32,
     pub samples: u32,
     pub resolution: u32,
     pub dynamic_resolution: bool,
-    pub fsr1_easu: bool,
     pub gpu_target_ms: u32,
     pub anisotropy: u32,
     pub relight_baked: bool,
@@ -68,14 +118,14 @@ impl Default for Settings {
             reflections: true,
             single_path: true,
             hybrid_primary: false,
-            denoiser: true,
+            denoiser: Denoiser::Svgf,
+            ray_lighting: true,
             progressive: true,
             bounces: 1,
             diffuse_distance: 256,
             samples: 1,
             resolution: 50,
             dynamic_resolution: false,
-            fsr1_easu: false,
             gpu_target_ms: 12,
             anisotropy: 8,
             relight_baked: false,
@@ -101,13 +151,12 @@ impl Settings {
             hybrid_primary: false,
             relight_baked: true,
             progressive: false,
-            denoiser: false,
+            denoiser: Denoiser::Svgf,
             bounces: 8,
             diffuse_distance: 0,
             samples: 32,
             resolution: 100,
             dynamic_resolution: false,
-            fsr1_easu: false,
             ..self
         }
     }
@@ -140,7 +189,12 @@ impl Settings {
                 "reflections" => settings.reflections = toggle(settings.reflections),
                 "single_path" => settings.single_path = toggle(settings.single_path),
                 "hybrid_primary" => settings.hybrid_primary = toggle(settings.hybrid_primary),
-                "denoiser" => settings.denoiser = toggle(settings.denoiser),
+                "denoiser" => {
+                    if let Some(d) = Denoiser::parse(value) {
+                        settings.denoiser = d;
+                    }
+                }
+                "ray_lighting" => settings.ray_lighting = toggle(settings.ray_lighting),
                 "progressive" => settings.progressive = toggle(settings.progressive),
                 "bounces" => settings.bounces = number(settings.bounces, 0, 4),
                 "diffuse_distance" => {
@@ -151,7 +205,6 @@ impl Settings {
                 "dynamic_resolution" => {
                     settings.dynamic_resolution = toggle(settings.dynamic_resolution)
                 }
-                "fsr1_easu" => settings.fsr1_easu = toggle(settings.fsr1_easu),
                 "gpu_target_ms" => settings.gpu_target_ms = number(settings.gpu_target_ms, 4, 50),
                 "reference" => settings.reference = toggle(settings.reference),
                 "physical_bsdf" => settings.physical_bsdf = toggle(settings.physical_bsdf),
@@ -169,9 +222,9 @@ impl Settings {
 
     pub(crate) fn encode(self) -> String {
         format!(
-            "# Lighter settings\nmode={}\nlighting={}\nregional_lighting={}\nshadows={}\nsoft_sun={}\nreflections={}\nsingle_path={}\nhybrid_primary={}\ndenoiser={}\nprogressive={}\nbounces={}\ndiffuse_distance={}\nsamples={}\nresolution={}\ndynamic_resolution={}\nfsr1_easu={}\ngpu_target_ms={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\nreference={}\n",
-            self.mode.token(), self.lighting, self.regional_lighting, self.shadows, self.soft_sun, self.reflections, self.single_path, self.hybrid_primary, self.denoiser, self.progressive, self.bounces,
-            self.diffuse_distance, self.samples, self.resolution, self.dynamic_resolution, self.fsr1_easu, self.gpu_target_ms, self.anisotropy, self.relight_baked, self.physical_bsdf, self.reference,
+            "# Lighter settings\nmode={}\nlighting={}\nregional_lighting={}\nshadows={}\nsoft_sun={}\nreflections={}\nsingle_path={}\nhybrid_primary={}\ndenoiser={}\nray_lighting={}\nprogressive={}\nbounces={}\ndiffuse_distance={}\nsamples={}\nresolution={}\ndynamic_resolution={}\ngpu_target_ms={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\nreference={}\n",
+            self.mode.token(), self.lighting, self.regional_lighting, self.shadows, self.soft_sun, self.reflections, self.single_path, self.hybrid_primary, self.denoiser.token(), self.ray_lighting, self.progressive, self.bounces,
+            self.diffuse_distance, self.samples, self.resolution, self.dynamic_resolution, self.gpu_target_ms, self.anisotropy, self.relight_baked, self.physical_bsdf, self.reference,
         )
     }
 
@@ -214,11 +267,11 @@ mod tests {
             [defaults.samples, defaults.bounces, defaults.resolution],
             [1, 1, 50]
         );
-        assert!(defaults.progressive && defaults.denoiser);
+        assert!(defaults.progressive && defaults.denoiser == Denoiser::Svgf);
         assert_eq!(defaults.diffuse_distance, 256);
         assert!(!defaults.regional_lighting);
         let s = Settings::decode(
-            "mode=hardware\nbounces=99\nshadows=false\nsoft_sun=false\ndenoiser=false\nprogressive=false\nsamples=0\nresolution=bad\nanisotropy=16\nphysical_bsdf=true\ndiffuse_distance=512\nregional_lighting=true",
+            "mode=hardware\nbounces=99\nshadows=false\nsoft_sun=false\nprogressive=false\nsamples=0\nresolution=bad\nanisotropy=16\nphysical_bsdf=true\ndiffuse_distance=512\nregional_lighting=true",
         );
         assert_eq!(s.diffuse_distance, 512);
         assert!(s.regional_lighting);
@@ -229,21 +282,20 @@ mod tests {
         assert_eq!(s.anisotropy, 16);
         assert_eq!(Settings::decode("anisotropy=12").anisotropy, 8);
         assert!(!s.shadows && s.lighting && s.reflections);
-        assert!(!s.denoiser && !s.progressive && !s.soft_sun);
+        assert!(s.denoiser == Denoiser::Svgf && !s.progressive && !s.soft_sun);
         assert!(s.physical_bsdf);
         assert_eq!(Settings::decode(&s.encode()), s);
         assert_eq!(Settings::decode("mode=unknown"), Settings::default());
         let reference = Settings::decode(
-            "reference=true\nhybrid_primary=true\ndynamic_resolution=true\nfsr1_easu=true",
+            "reference=true\nhybrid_primary=true\ndynamic_resolution=true",
         );
         assert_eq!(Settings::decode(&reference.encode()), reference);
         let e = reference.effective();
         assert_eq!([e.samples, e.bounces, e.resolution], [32, 8, 100]);
         assert!(e.physical_bsdf && e.shadows && e.relight_baked);
-        assert!(!e.progressive && !e.denoiser && reference.progressive);
+        assert!(!e.progressive && reference.progressive);
         assert_eq!(e.diffuse_distance, 0);
-        assert!(!e.hybrid_primary && !e.single_path && !e.dynamic_resolution && !e.fsr1_easu);
-        assert!(reference.fsr1_easu);
-        assert!(reference.hybrid_primary && reference.single_path && reference.dynamic_resolution);
+        assert!(!e.hybrid_primary && !e.single_path && !e.dynamic_resolution);
+                assert!(reference.hybrid_primary && reference.single_path && reference.dynamic_resolution);
     }
 }

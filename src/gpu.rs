@@ -9075,7 +9075,6 @@ fn preview_frame_using(
     }
     for (key, option) in [
         ("PW_PREVIEW_SINGLE_PATH", &mut lighter_settings.single_path),
-        ("PW_PREVIEW_FSR1_EASU", &mut lighter_settings.fsr1_easu),
         (
             "PW_PREVIEW_HYBRID_PRIMARY",
             &mut lighter_settings.hybrid_primary,

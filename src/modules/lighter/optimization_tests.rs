@@ -41,7 +41,7 @@ pub(super) fn exercise(h: &mut Harness) {
         shadows: false,
         reflections: false,
         progressive: false,
-        denoiser: false,
+        denoiser: Denoiser::None,
         bounces: 1,
         samples: 1,
         resolution: 100,

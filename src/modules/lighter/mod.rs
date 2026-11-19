@@ -47,7 +47,7 @@ mod vulkan;
 
 use bytemuck::{Pod, Zeroable};
 use scene::Packet;
-pub(crate) use settings::{Mode, Settings};
+pub(crate) use settings::{Denoiser, Mode, Settings};
 use std::time::Instant;
 use textures::{suffix_segments, upload_pages, TexelPrefix, Textures};
 
@@ -56,7 +56,6 @@ const BSDF: &str = include_str!("bsdf.wgsl");
 const REFERENCE: &str = include_str!("reference.wgsl");
 const MEDIA: &str = include_str!("media.wgsl");
 const BASE: &str = include_str!("trace.wgsl");
-const EASU: &str = include_str!("../../fsr1_easu.wgsl");
 const PRESENT: &str = include_str!("present.wgsl");
 const PRESENT_PORTABLE: &str = r#"
 @fragment fn fragment(@builtin(position) coord: vec4<f32>) -> Output {
@@ -783,7 +782,6 @@ impl Present {
         image: &wgpu::Buffer,
         extent: [u32; 4],
         guided: bool,
-        fsr1_easu: bool,
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
         temporal_output: Option<(&wgpu::TextureView, &wgpu::TextureView)>,
@@ -791,7 +789,7 @@ impl Present {
         queue.write_buffer(
             &self.extent,
             0,
-            bytemuck::bytes_of(&[extent, [u32::from(guided), u32::from(fsr1_easu), 0, 0]]),
+            bytemuck::bytes_of(&[extent, [u32::from(guided), 0, 0, 0]]),
         );
         let bind = if let Some((color, mask)) = temporal_output {
             let key = (image.global_id(), color.global_id(), mask.global_id());
@@ -2085,8 +2083,8 @@ impl Lighter {
                 encoder,
                 image,
                 frame.extent,
-                settings.denoiser,
-                settings.fsr1_easu,
+                true,
+                false,
                 target,
                 depth,
                 Some(self.reconstruction.as_ref().unwrap().output()),
@@ -2098,7 +2096,7 @@ impl Lighter {
             if let Some(present) = &mut self.vendor_present {
                 present.resolved = None;
             }
-            if (settings.denoiser || history.is_some()) && self.post.is_none() {
+            if history.is_some() && self.post.is_none() {
                 self.post = Some(checked_pipeline(device, || post::Post::new(device))?);
             }
             let image = if let Some(post) = &mut self.post {
@@ -2109,7 +2107,7 @@ impl Lighter {
                     image,
                     frame.extent,
                     history,
-                    settings.denoiser,
+                    settings.denoiser == Denoiser::Svgf,
                     timed,
                 )
             } else {
@@ -2127,8 +2125,8 @@ impl Lighter {
                 encoder,
                 image,
                 frame.extent,
-                settings.denoiser,
-                settings.fsr1_easu,
+                true,
+                false,
                 target,
                 depth,
                 None,
@@ -2328,8 +2326,24 @@ impl Lighter {
             .on_hover_text("Sample one Fresnel lobe and use roulette after two bounces. A first-hit water surface still splits at one sample to avoid visible, unfiltered speckle.");
         ui.checkbox(&mut self.settings.reference, "Reference (32 spp, 8 bounces)")
             .on_hover_text("Full resolution with sky and mesh light sampling, no history or denoising. Overrides lighting, relight and quality settings while enabled.");
-        ui.checkbox(&mut self.settings.denoiser, "Edge-aware denoiser")
-            .on_hover_text("Filter linear radiance using primary depth, normals and albedo. Never changes output depth.");
+        // Ray lighting toggle: off = raster world only, Graphics upscaler/frame-gen as normal.
+        ui.checkbox(&mut self.settings.ray_lighting, "Ray lighting")
+            .on_hover_text("When on, the ray overlay reads the raster G-buffer and adds sun shadow, reflection radiance and short-range indirect lighting. When off, the world is raster-only and byte-identical to the native renderer for every Graphics setting.");
+        ui.separator();
+        egui::ComboBox::from_label("Ray denoiser")
+            .selected_text(self.settings.denoiser.label())
+            .show_ui(ui, |ui| {
+                for d in Denoiser::ALL {
+                    let disabled = d.unavailable_reason().is_some();
+                    let text = match d.unavailable_reason() {
+                        Some(reason) => format!("{} — {}", d.label(), reason),
+                        None => d.label().to_string(),
+                    };
+                    ui.add_enabled(!disabled, ui.selectable_value(&mut self.settings.denoiser, d, text))
+                        .on_hover_text(d.unavailable_reason().unwrap_or("Always available portable denoiser."));
+                }
+            });
+        ui.label("Upscaling and frame generation come from Graphics settings: inherited by the ray overlay.");
         ui.checkbox(&mut self.settings.physical_bsdf, "GGX / Lambert materials")
             .on_hover_text("Evaluate and sample energy-bounded microfacet and diffuse lobes on relit materials. Preserve the legacy color stages for baked surfaces and GFX sheets.");
         ui.checkbox(&mut self.settings.progressive, "Progressive sampling while still")
@@ -2353,8 +2367,7 @@ impl Lighter {
                 .text("Ray resolution")
                 .suffix("%"),
         );
-        ui.add_enabled(!self.settings.reference, egui::Checkbox::new(&mut self.settings.fsr1_easu, "FSR 1 spatial upscale (EASU)"))
-            .on_hover_text("Reconstruct color from the filtered ray image when rays are below output resolution. Depth is still the nearest current ray sample. This is not the temporal FSR SDK or DLSS Ray Reconstruction.");
+
         ui.checkbox(&mut self.settings.dynamic_resolution,"Automatic ray resolution (50–100%)")
             .on_hover_text("Uses completed Hardware raster/trace timestamps with hysteresis (Software requires a profiling capture). SDK and game profiles keep a fixed scale.");
         if self.settings.dynamic_resolution && !self.settings.reference {
@@ -2441,6 +2454,8 @@ impl Lighter {
         reload.then_some(Settings {
             mode,
             hybrid_primary,
+            denoiser: self.settings.denoiser,
+            ray_lighting: self.settings.ray_lighting,
             ..self.settings
         })
     }
