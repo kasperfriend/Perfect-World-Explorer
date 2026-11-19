@@ -588,30 +588,12 @@ fn read_named_trailer(f: &File, end: u64, rev: &Revision) -> Result<Vec<u8>, Str
     Ok(header)
 }
 
-/// Read the trailer the version word implies. Kept for callers that only want
-/// the revision and the count (tests, the Angelica cross-check); the entry
-/// table itself is read by [`read_directory`], which is where a probe is
-/// proven or refused.
-fn read_trailer(f: &File, end: u64) -> Result<(Revision, usize, Vec<u8>), String> {
-    let version = u32le(&at_shared(f, end - 4, 4)?, 0)?;
-    let mut candidates = trailer_candidates(version);
-    if candidates.is_empty() {
-        return Err(format!("unsupported PCK version {version:08x}"));
-    }
-    let count = u32le(&at_shared(f, end - 8, 4)?, 0)? as usize;
-    let mut refused = Vec::new();
-    for rev in candidates.drain(..) {
-        match read_named_trailer(f, end, &rev) {
-            Ok(header) => return Ok((rev, count, header)),
-            Err(e) => refused.push(format!("{:08x}: {e}", rev.version)),
-        }
-    }
-    Err(refused.join("; "))
-}
-
 pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     let size = f.metadata().map_err(|e| e.to_string())?.len();
-    if size < 292 {
+    // The trailer is at least 280 bytes plus the count and version words; a
+    // shorter file cannot hold the narrow trailer either, so one bound covers
+    // every layout rather than one bound per revision.
+    if size < 288 {
         return Err("archive too small".into());
     }
     let safe = at(f, 0, 12)?;

@@ -478,3 +478,64 @@ wet` and list each area's export id, height and grid — which is the evidence
 needed to separate "the EC-BSD reader dropped them" from "the map's water is
 static-mesh water this loader does not read". Claiming a fix before that line
 exists would be the same error as the four above.
+
+## The seventh instance, and the one that ends the guessing (18 November)
+
+The 1.8.4 archive opened, and the next report was `trees.pck`:
+
+```
+entry table overlaps footer: the trailer declares its table at
+18446744069440788065 but only 26227656 bytes of this file (len 26227944)
+precede the footer (declared end 26227944, base 0, count 326, flags 0x65676e41)
+```
+
+**This one was mine.** The 64-bit read added for `litmodels` read `+8` as eight
+bytes on a trailer that stores four there, so the high half became the
+`0xffffffff` at `+12`. The 32-bit read before it had handled this file
+correctly. Two details in the message say so without any file:
+
+- `18446744069440788065` = `0xffff_ffff_a91c_a203`: the offset's low half with
+  `0xffffffff` glued on top, which is not a position in a 26 MB file.
+- `flags 0x65676e41` = `Ange`, the first four bytes of *"Angelica File Package"*.
+
+### The version word does not select a layout
+
+That second detail is the important one. `szDescription` starts at `+16` in this
+trailer, where the wide revision puts `dwFlags`. So this file has **no
+`dwFlags` field at all** — the `0x00020002` field order inside a 280-byte struct
+whose tail still reaches `guardByte1` at `+272`. Checked against the shipped
+bytes:
+
+| offset | `trees.pck` (1.8.4) | meaning |
+|---|---|---|
+| `+0` | `0xfdfdfeee` | `guardByte0` |
+| `+4` | `0x00020003` | `dwVersion` — **same word as `litmodels`** |
+| `+8` | `0xa91ca203` | `dwEntryOffset` u32 → `26203745` after unmask |
+| `+12` | `0xffffffff` | not a flag word (the wide layout calls it `dwFlags`) |
+| `+16` | `"Ange…"` | `szDescription` |
+| `+272` | `0xf00dbeef` | `guardByte1` |
+
+And `litmodels.pck`, same client, same version word, writes `dwEntryOffset` as
+`UINT64` with `dwFlags` at `+16` and `szDescription` at `+20`. **One version,
+two layouts.** A small package cannot name its table above 4 GiB, so the
+compiler that emitted it narrowed the field instead of enlarging the package —
+which is the client's own inconsistency, not a revision.
+
+So the fix is not another entry in a version table. `trailer_candidates` returns
+the version's layout *and* a probe list, and `read_directory` proves each by
+walking the entry table it names. A probe that guesses wrong is refused by the
+table walk rather than mis-parsed. `dwFlags` became `Option<usize>` because the
+narrow trailer has no such field, and the absence is spelled as an absence — a
+sentinel offset would have been read as `Ange` and refused as "encrypted".
+
+Verified on three shipped eras: 1.8.4 `trees.pck` 326 entries
+(`trees/badtree.spt` … `trees/version.sw`), 1.5.2 325, a 2016 pack 326, all
+decoded to the length their records claim by `tools/offline_harness.sh pck`.
+
+### What this settles about "support every version"
+
+Every defect in this file has been the same shape — a rule inferred from the
+files that happened to be staged. The durable answer is not a longer list of
+magic numbers; it is to let the container's own checks (guard pair, description
+tag, and a full walk of the table) decide, and to keep the version word as a
+hint about ordering. That is what the `pck` reader does now.
