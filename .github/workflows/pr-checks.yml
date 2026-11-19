@@ -157,6 +157,11 @@ jobs:
           python3 tools/test_phase1_ready.py
           python3 tools/test_eight_phase_status.py
           python3 tools/check-eight-phase-status.py
+          # The register's row count is quoted in TODO.md and the PR body. It
+          # said 62 while the file held 61, which is the kind of number nobody
+          # re-derives. This prints it, and the status audit below fails if the
+          # total the docs claim stops matching.
+          python3 tools/count-register.py 61
           python3 tools/audit-static-model-gpu-programs.py
           rustc --edition=2021 --test src/scenery_visibility.rs -o /tmp/scenery-visibility-tests
           /tmp/scenery-visibility-tests

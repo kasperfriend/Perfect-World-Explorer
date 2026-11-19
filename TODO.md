@@ -1,9 +1,11 @@
 # To-do — remaining open register entries
 
-Built by reading all 62 rows of `Findings/Unsupported-client-paths.md` and
-splitting them into: already resolved but worded softly (bookkeeping), genuinely
-implementable here (code), and blocked on something this environment cannot
-supply (no GPU / no staged asset / not enough disassembly). Every item is worked
+Built by reading every row of `Findings/Unsupported-client-paths.md` -- **61**
+of them, in three tables of 40, 7 and 14 -- and splitting them into: already
+resolved but worded softly (bookkeeping), genuinely implementable here (code),
+and blocked on something this environment cannot supply (no GPU / no staged
+asset / not enough disassembly). The old text said 62; `tools/count-register.py`
+now prints the number so a count in prose can be checked against the file. Every item is worked
 in order; blocked ones are made to say precisely *what* blocks them instead of a
 soft "not established".
 
