@@ -173,6 +173,10 @@ jobs:
         run: |
           python3 tools/test_phase1_ready.py
           python3 tools/test_eight_phase_status.py
+          # The archive census's own classification table. It reported 2,439
+          # `.gfx`/`.sgc` effect members as unparsed because the table listed
+          # neither extension; these tests keep that from happening again.
+          python3 -m unittest tools.test_archive_census
           python3 tools/check-eight-phase-status.py
           # The register's row count is quoted in TODO.md and the PR body. It
           # said 62 while the file held 61, which is the kind of number nobody

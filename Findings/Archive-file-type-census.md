@@ -111,10 +111,38 @@ archive content rather than at the viewer's assumptions. Both were invisible to
 
 ## Honest scope statement
 
+## `gfx.pck` measured in this checkout (18 November)
+
+The table above predates `gfx.pck` being staged. It is now, and the same tool
+runs on it:
+
+| pack | members | supported | out of scope | unsupported |
+|---|---:|---:|---:|---:|
+| `gfx.pck` | 3499 | 3216 | 106 | **177** |
+
+The 177 are exhaustive and none is a surprise: **174** are the fireworks
+`.fw` files, a `MOXB` container of `FWGlyphText`/`FWFirework` children that no
+`src/` reader touches (fireworks are not part of the eight phases); **1** is a
+4-byte truncated `gfx/人物/技能/羽芒/翼击击中.gfx` whose whole content is the
+ASCII stub `MOXT` -- the same 4-byte stub the `content` harness mode reports as
+its single known failure; **1** is a zero-byte `gfx/场景/logs/af.log`; and **1**
+is an OLE `gfx/烟花/效果.xls`, authoring data.
+
+**What this run corrected.** The first reading of this pack said 2,616
+unsupported, because the classification table listed neither `.gfx` nor `.sgc`.
+Those two extensions are 2,439 members -- the entire reason the pack exists --
+and `src/gfx_file.rs` parses both: they start `MOXTVersion:` exactly like the
+effect graphs already in the table. The census was measuring its own table
+rather than the code. `.fw` and a signature-based fallback for members whose
+name lies (`gfx/怪物/通用/地狱狮王效果`, extensionless, holding a
+`MOXTVersion: 41` graph) are now classified too, and
+`tools/test_archive_census.py` pins the rules so the table cannot silently drift
+again.
+
 "Zero unsupported" here means: every member of these four packs is either parsed
 by the viewer or positively identified as belonging to another subsystem, with
 the reason recorded. It does **not** mean the viewer renders everything those
-parsers accept at full fidelity. Six packs are covered; `building.pck`,
-`litmodels.pck`, `surfaces.pck`, `gfx.pck` and `loddata.pck` are not staged, and
+parsers accept at full fidelity. Seven packs are covered (`gfx.pck` as of 18 November);
+`building.pck`, `litmodels.pck`, `surfaces.pck` and `loddata.pck` are not staged, and
 BMD coverage therefore rests on the existing `litmodels.pck` census rather than
 on this tool.

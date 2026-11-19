@@ -46,6 +46,23 @@ HANDLED = {
     "sdr": (None, "src/post_gpu.rs"),
     "action": (None, "src/ecmodel.rs, src/model_playback.rs"),
     "ogg": ("OggS", "src/music.rs"),
+    # Both skills and effect graphs are the same container: they start
+    # `MOXTVersion:` and `src/gfx_file.rs` parses them, `.sgc` as a version-4
+    # record with `Path:`/`ActionCount` keys and `.gfx` with the full element
+    # grammar. Leaving them out of this table reported 2,439 members of the
+    # staged `gfx.pck` as "no parser in src/" when they are the one format that
+    # pack exists for -- the census was measuring its own table, not the code.
+    "gfx": ("MOXTVERSION: ", "src/gfx_file.rs, src/gfx_owner.rs"),
+    "sgc": ("MOXTVERSION: ", "src/gfx_file.rs"),
+}
+# Extensions whose *content* is a format `src/` reads but whose name is not the
+# extension that format ships under. `gfx/怪物/通用/地狱狮王效果` has no extension
+# and holds a `MOXTVersion: 41` effect graph, so classifying by name alone
+# reported a parsed file as unsupported. A member that sniffs as a handled
+# signature is classified by the signature and says so.
+SNIFF_ONLY = {
+    "MOXTVERSION: ": ("gfx", "src/gfx_file.rs (extensionless effect graph)"),
+    "MOXB": ("fw", "no src/ reader (fireworks only); children are FW* records"),
 }
 # Formats that belong to the client but not to the renderer, with the reason
 # they are out of scope. These are reported separately from real gaps.
@@ -74,7 +91,7 @@ OUT_OF_SCOPE = {
            "collision data, not rendered geometry",
 }
 SUPPORTED = {"dds", "mox", "mod", "bmd", "ecm", "ski", "bon", "smd", "stck",
-             "tga", "bmp", "txt", "sdr", "action", "ogg"}
+             "tga", "bmp", "txt", "sdr", "action", "ogg", "gfx", "sgc"}
 
 
 def sniff(b):
@@ -120,7 +137,9 @@ def census(path):
             rows.append(row)
             continue
         sig = None
-        if ext in ("dds", "mox", "mod", "spt", "tga", "bmp", "ogg", "ecm", "ski", "bon", "smd", "stck"):
+        # Sniff everything: an extensionless member can still be a format we
+        # read, and a wrong extension is exactly what this census is for.
+        if True:
             sig = sniff(pck.read_entry(path, (name, offset, size, flag))[:16])
         row["signature"] = sig
         if ext in SUPPORTED:
@@ -132,6 +151,12 @@ def census(path):
                 row.update(status="supported", where=HANDLED.get(ext, (None, "?"))[1])
         elif ext in OUT_OF_SCOPE:
             row.update(status="out-of-scope", reason=OUT_OF_SCOPE[ext])
+        elif sig in SNIFF_ONLY:
+            ext_by_content, where = SNIFF_ONLY[sig]
+            row.update(status="supported" if where.startswith("src/") else "unsupported",
+                       where=where,
+                       reason=f"content is {sig!r} (the {ext_by_content} format), "
+                              f"not the extension's own format")
         else:
             row.update(status="unsupported",
                        reason="no parser in src/ for this extension")
