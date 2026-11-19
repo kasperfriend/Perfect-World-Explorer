@@ -698,3 +698,23 @@ fn lighter_temporal_vendor_dispatch() {
         eprintln!("{label} vendor smoke {side}²: {nonzero}/{checked} opaque pixels have positive SDK radiance");
     }
 }
+
+/// P9-a: Fail-closed smoke tests per provider. Each failure mode must fail
+/// the smoke test — no silent fallback, no portable substitution.
+
+#[test]
+fn smoke_bad_hash_fails() {
+    // verified_binary rejects a file whose SHA-256 does not match the pin.
+    // A temp file with wrong content must fail verification.
+    use std::io::Write;
+    let root = std::env::temp_dir().join(format!("pwe-hash-test-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&root);
+    let bad = root.join("bad-sdk.dll");
+    std::fs::File::create(&bad)
+        .unwrap()
+        .write_all(b"wrong content that does not match any pinned SHA-256")
+        .unwrap();
+    let result = super::verified_binary(&bad, 1024, "deadbeef");
+    assert!(result.is_err(), "bad hash must fail verification");
+    let _ = std::fs::remove_dir_all(&root);
+}
