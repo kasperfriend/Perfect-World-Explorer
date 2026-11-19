@@ -381,15 +381,17 @@ mod tests {
             "every hand-edited row is a destination: {list:?}"
         );
         let by_id = |id: u32| list.iter().find(|d| d.id == id).unwrap().clone();
-        assert_eq!(by_id(1001).name, "雪霏村");
+        // A Chinese name is read and then translated; the geometry is untouched.
+        assert_eq!(by_id(1001).name, "Snowy Village");
         assert_eq!(by_id(1001).position, [-2545.362, 215.254, 4116.355]);
-        // The quoted row keeps its text and loses only the quotes.
+        // The quoted row keeps its text and loses only the quotes. Russian has no
+        // entry, so it is shown as authored -- better than a placeholder.
         assert!(list.iter().any(|d| d.name == "Снежная деревня"));
         // The space-for-tab row keeps its id as an id, not part of the name.
         assert_eq!(by_id(9047).name, "九冕尘寰台");
         assert_eq!(by_id(9047).position, [-799.016, 45., -282.283]);
         // The row with the empty column finds the position, not the gap.
-        assert_eq!(by_id(9048).name, "萝会城");
+        assert_eq!(by_id(9048).name, "Lorreway City");
         assert_eq!(by_id(9048).position, [-162.798, 36., 299.386]);
         assert_eq!(by_id(9045).position, [3545.439, 282., 3051.461]);
     }

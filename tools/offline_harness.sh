@@ -344,9 +344,19 @@ pub trait Digest {
     fn digest(data: &[u8]) -> Self::Output;
 }
 
-pub struct Sha256;
+#[derive(Clone, Default)]
+pub struct Sha256 {
+    buffer: Vec<u8>,
+}
 
+#[derive(Clone, PartialEq, Eq)]
 pub struct Output([u8; 32]);
+
+impl Output {
+    pub fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
 
 impl fmt::LowerHex for Output {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -430,6 +440,31 @@ impl Digest for Sha256 {
             out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
         }
         Output(out)
+    }
+}
+
+/// The streaming surface `terrain_store` uses (`Sha256::new`, `update`,
+/// `finalize`), not only the one-shot `digest` the detector needs. Buffering the
+/// input and hashing it at `finalize` is enough here: the shim exists to make
+/// the module *compile and run its tests* offline, and the value it produces is
+/// still a real SHA-256 of the whole input.
+impl Sha256 {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    /// Takes anything that dereferences to bytes, as the real `sha2` does: the
+    /// module feeds both `&[u8]` and `[u8; 8]`.
+    pub fn update<D: AsRef<[u8]>>(&mut self, data: D) {
+        self.buffer.extend_from_slice(data.as_ref());
+    }
+    pub fn finalize(self) -> Output {
+        <Sha256 as Digest>::digest(&self.buffer)
+    }
+}
+
+impl From<Output> for [u8; 32] {
+    fn from(output: Output) -> Self {
+        output.0
     }
 }
 EOF
@@ -1398,6 +1433,31 @@ EOF
             "$OUT/objects/lib.rs" -o "$OUT/objectstest"
         shift || true
         (cd "$REPO" && exec "$OUT/objectstest" "$@") ;;
+    navigation) toolchain; sysroot; deps; real_deps; image_stub
+        # `src/navigation.rs` -- the destination list the "still in Chinese"
+        # report was about -- with the modules it reaches. Nothing in this
+        # harness compiled it, so its tests ran only under
+        # `cargo test --bin perfect-world-explorer`; that is how a change here
+        # shipped a broken build and was caught by CI instead of by a gate.
+        mkdir -p "$OUT/navigation"
+        cat > "$OUT/navigation/lib.rs" <<EOF
+#[path = "$REPO/src/pck.rs"]
+pub mod pck;
+#[path = "$REPO/src/terrain_store.rs"]
+pub mod terrain_store;
+#[path = "$REPO/src/world_place_names.rs"]
+pub mod world_place_names;
+#[path = "$REPO/src/navigation.rs"]
+pub mod navigation;
+EOF
+        "$RUSTC" --test --crate-name navigationtest --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern image="$OUT/libimage_stub.rlib" \
+            --extern sha2="$OUT/libsha2.rlib" \
+            "$OUT/navigation/lib.rs" -o "$OUT/navigationtest"
+        shift || true
+        (cd "$REPO" && exec "$OUT/navigationtest" "$@") ;;
     launcher) toolchain; sysroot; deps; image_stub
         # `src/launcher_ui.rs` is `#[cfg(windows)]`, and the two things that make
         # it untestable here are the Win32 `#[link]` attributes and nothing else:
@@ -2126,4 +2186,4 @@ EOF
             -o "$OUT/matrix-maps" "$OUT/mm/run.rs"
         shift || true
         (cd "$REPO" && exec "$OUT/matrix-maps" "${1:-$REPO/google_drive/clients}") ;;
-    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|precinct|settings|bmd-baked|objects|launcher|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|precinct|settings|bmd-baked|objects|navigation|launcher|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
