@@ -361,6 +361,15 @@ On a supported GPU, compare the same location on land, over shallow water and
 underwater in both modes, with the reflection/shadow switches on and off. Use a
 location with authored effects and an off-camera building near the water.
 
+## Windows performance handoff
+
+Use the [operator handoff](HANDOFF.md) for a reproducible 1440p a07 session on
+Windows x64 / RTX 3080 10 GB. It separates replacement startup, regular
+present cadence, synchronized GPU work, strict vendor smoke and long-travel
+memory. Check the [plan](PERF-PLAN.md) and [results](PERF-RESULTS.md) before
+using a capture as evidence. Neither CPU Vulkan nor a hosted build verifies
+physical performance, and provider fallback does not pass vendor smoke.
+
 ## Reconstruction crash diagnostics (opt-in)
 
 For a repeatable crash with `PW_RAY_RECONSTRUCTION=fsr` or `rr`, first

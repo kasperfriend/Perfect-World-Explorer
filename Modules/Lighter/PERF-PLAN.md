@@ -4,6 +4,26 @@ This work extends the acceptance follow-up from `5a81c22` on PR #51. The default
 
 Physical targets at 2560×1440: ordinary present intervals median ≤16.6 ms and slowest 1% mean ≤25 ms; synchronized ray GPU scope ≤5 ms (report the stage definition and distributions separately); sampled process device-local heap <7,000,000,000 bytes over ≥600 s of travel; successful first and second Hardware launches, with no device loss, timeout or crash. Normal cadence and synchronized measurements are different runs. Do not mix them, treat output-size metadata as proof of a real provider, or conflate tracked allocations with driver heap usage.
 
+## Status at handoff
+
+- [x] **Step 0:** record the plan first (`52b9712`).
+- **S passed:** A1 preflight/bisection, A2 watch/pacing/cache reopen, A3
+  injected teardown, A4 hosted synthetic parity and A8 negative controls.
+  Physical/retail criteria remain open.
+- **Partial:** A5 exact tail only; A6
+  targeted dry-surface policy without effect counters/planes; A7 isolated
+  SVGF only; A9 no real-world specialization/scale acceptance; A10 no
+  physical heap trace or retail compaction savings verified.
+- **B** [capture kit built and failed-preflight packaging tested](HANDOFF.md);
+  B1–B7 physical receipts not yet returned.
+- **C** strict intake/report implemented and synthetic parser tests passed.
+  No physical results table can be populated yet.
+- **D** [operator handoff](HANDOFF.md) and [S-only results](PERF-RESULTS.md)
+  are available. Leave PR #51 open. There are no P or V results to sign off.
+
+Checkboxes below cover the full acceptance, including physical/quality work
+where listed. S-only progress must not be used to close them.
+
 ## A — Code and synthetic validation
 
 - [ ] **A1 — Startup bisection and ABI/ownership audit.** Independently skip bootstrap, raw-device import, FFX, NGX and reconstruction image-view/descriptor work without using invalid handles or claiming SDK success. Audit enabled features and extension lists, C signatures/layout, opt-in loading and error cleanup. Acceptance: each skip works on the corresponding synthetic path, any fixes have tests. Evidence: `evidence/perf/S-A1.md`, reconstruction tests and Module README.
@@ -29,10 +49,10 @@ Physical targets at 2560×1440: ordinary present intervals median ≤16.6 ms and
 
 ## C — Analysis
 
-- [ ] **C1 — Strict bundle intake.** Validate inventory/checksums, safe paths, target adapter/heap/driver, provider identity and matching paths/poses/settings/extent/policy. Reject fallback and distinguish S/P/V. Evidence: `tools/windows/analyze-perf-session.py` and parser tests.
+- [x] **C1 — Strict bundle intake.** Validate inventory/checksums, safe paths, target adapter/heap/driver, provider identity and matching paths/poses/settings/extent/policy. Reject fallback and distinguish S/P/V. Evidence: `tools/windows/analyze-perf-session.py` and parser tests.
 - [ ] **C2 — Result and gate report.** Write `PERF-RESULTS.md` with the measured table, raw-log links, acceptance comparison and remaining reasons; print what evidence is present without implicitly closing a feature. Evidence: generated report and validated source/session hashes.
 
 ## D — Handoff
 
-- [ ] **D1 — Operator handoff.** `HANDOFF.md` names code commits, S results and exact open checks, command and what to upload (ZIP plus a one-line observation).
-- [ ] **D2 — PR summary.** Post short comment linking `HANDOFF.md` on PR #51; leave it open and unmerged. Verify shared-code PNG regressions without changing expected hashes. No production or target-performance claim without linked physical evidence.
+- [x] **D1 — Operator handoff.** `HANDOFF.md` names code commits, S results and exact open checks, command and what to upload (ZIP plus a one-line observation).
+- [x] **D2 — PR summary.** Post short comment linking `HANDOFF.md` on PR #51; leave it open and unmerged. Verify shared-code PNG regressions without changing expected hashes. No production or target-performance claim without linked physical evidence.

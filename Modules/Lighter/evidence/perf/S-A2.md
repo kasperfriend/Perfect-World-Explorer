@@ -27,3 +27,8 @@ Local raw logs: `cache/lighter-perf/S-A2/`.
 A CPU queue timestamp does not certify a Windows TDR margin. The sub-1 ms
 submit goal, large-mesh/timeline behavior and actual restart cache reuse
 still require the player's target log.
+
+The explicit `lighter_pipeline_cache_disk_round_trip` fixture on the CPU ICD
+wrote a 32-byte compatible cache and reopened it on a second Vulkan device;
+the loader logged the accepted seed bytes. This is not proof that a cached
+retail shader compiles faster. `cache/lighter-perf/S-final/lighter_pipeline_cache_disk_round_trip.log`.

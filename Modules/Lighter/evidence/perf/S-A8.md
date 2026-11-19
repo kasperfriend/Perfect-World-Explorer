@@ -18,3 +18,13 @@ physical adapter, unsupported extent, partial recording failure and positive
 finite raw radiance guards remain. The missing-FFX fallback is one-shot.
 Actual RR→FSR dispatch and finite, non-black positive SDK smoke are still
 Windows RTX 3080 work (V); the S stand-ins are not a vendor runtime.
+
+Latest S controls: `lighter_temporal_rejected_extent_is_not_dispatch`
+passed (no dispatch), and `lighter_temporal_fsr_masks_and_fallback` passed
+with `LP_NATIVE_VECTOR_WIDTH=128 LP_NUM_THREADS=1` after the first attempt
+was killed. It checks FSR mask semantics with a stand-in, simulated failed
+submit retirement, bit-exact portable color/depth and Reference exclusion.
+Missing/wrong RR inputs exited 101 before dispatch; Linux also rejected both
+FSR requests because the real Vulkan runtime is Windows-only. The pinned
+same-length wrong-hash check passed independently. See
+`cache/lighter-perf/S-final/`. None of these are V evidence.
