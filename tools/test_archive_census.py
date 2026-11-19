@@ -127,12 +127,18 @@ class RevisionLayoutTests(unittest.TestCase):
             flags_at,
         ) = pck_lib.REVISIONS[revision]
         del offset_at, offset_width, size_at, comp_at
-        payload = b"\0\0\0\0"
-        body = bytearray(struct.pack("<III", 0x4DCA23EF, 0, 0x56A089B7))
+        # Revision 0x00020003 writes the 64-bit safe-header form: the word at +8
+        # is the low half of the offset, not the 0x56A089B7 tag, and the declared
+        # length is a UINT64. Both shapes ship, so the fixture makes both.
+        tag2 = 0x56A089B7 if revision != 0x20003 else 0
+        body = bytearray(struct.pack("<III", 0x4DCA23EF, 0, tag2))
         body += b"\0" * (12 * entries)
         body += b"\0" * (header_size + 8)
         size = len(body)
-        struct.pack_into("<I", body, 4, size + len(payload))
+        if revision == 0x20003:
+            struct.pack_into("<Q", body, 4, size)
+        else:
+            struct.pack_into("<I", body, 4, size)
         trailer = size - (header_size + 8)
         struct.pack_into("<I", body, trailer, 0xFDFDFEEE)
         struct.pack_into("<I", body, trailer + flags_at, flags)

@@ -17,6 +17,13 @@ fn u32le(b: &[u8], p: usize) -> Result<u32, String> {
         b.get(p..p + 4).ok_or("truncated")?.try_into().unwrap(),
     ))
 }
+/// A little-endian `UINT64`; the 64-bit safe-header form and the `0x00020003`
+/// entry records both carry one.
+fn u64le(b: &[u8], p: usize) -> Result<u64, String> {
+    Ok(u64::from_le_bytes(
+        b.get(p..p + 8).ok_or("truncated")?.try_into().unwrap(),
+    ))
+}
 fn at(f: &mut File, p: u64, n: usize) -> Result<Vec<u8>, String> {
     let mut b = vec![0; n];
     // Small directory/header reads are cheaper through the regular file API.
@@ -268,10 +275,30 @@ pub(crate) fn angelica_revision(version: u32) -> Option<Revision> {
 /// evidence the same bytes are a corrupt size word, and calling it a split would
 /// send a reader looking for a file that does not exist.
 fn safe_header(safe: &[u8], size: u64, whole: Option<u64>) -> Result<(), String> {
-    if u32le(safe, 0)? != 0x4dca23ef || u32le(safe, 8)? != 0x56a089b7 {
+    // Only `tag1` is required. `AFilePackage::LoadSafeHeader` (AFilePackage.cpp)
+    // accepts two shapes and the second is what the 1.8.4 client writes:
+    //
+    //     if (tag1 == 0x4DCA23EF && tag2 == 0x56a089b7)      m_bHasSafeHeader = true;
+    //     else if (tag1 == 0x4DCA23EF && tag2 != 0x56a089b7) { re-read as
+    //             SAFEFILEHEADER_0x00020003; m_bHasSafeHeader = true; }
+    //     else                                                m_bHasSafeHeader = false;
+    //
+    // In the second shape the 8 bytes after `tag1` are a **UINT64** offset
+    // (`SAFEFILEHEADER_0x00020003`), and `tag2` is not a tag at all -- it is the
+    // low half of that offset, which is where 1.8.4's `configs.pck` gets the
+    // `0x00000000` that a tag comparison reports as `a83e5e82`. Requiring
+    // `tag2` here is literally the "unsupported PCK safe header" dialog, and it
+    // rejected every package of that shape.
+    if u32le(safe, 0)? != 0x4dca23ef {
         return Err("unsupported PCK safe header".into());
     }
-    let end = u32le(safe, 4)? as u64;
+    // `tag2 != 0x56a089b7` selects the 64-bit form; the offset must then be read
+    // from 8 bytes rather than 4.
+    let end = if u32le(safe, 8)? == 0x56a089b7 {
+        u32le(safe, 4)? as u64
+    } else {
+        u64le(safe, 4)?
+    };
     // A package longer than 4 GiB cannot state its length in this `DWORD`, so
     // the word is the total truncated. 1.8.4's `building.pck` is 2 GiB + 4 GiB +
     // a remainder, which leaves a declared value smaller than a package's own
@@ -1268,6 +1295,36 @@ mod tests {
     /// moves the offsets in `REVISIONS`, `angelica_pck` moves with them instead
     /// of silently keeping a second, divergent copy of the layout.
     #[test]
+    /// The word at +8 of a package prefix is not always a tag.
+    ///
+    /// `AFilePackage::LoadSafeHeader` re-reads the prefix as
+    /// `SAFEFILEHEADER_0x00020003` whenever that word is not `0x56a089b7`, and
+    /// in that shape the eight bytes after `tag1` are a `UINT64` offset. The
+    /// 1.8.4 client writes exactly that: its `configs.pck` has `00000000` at +8
+    /// and `11,426,315` -- the file's own length -- as the 64-bit offset at +4.
+    /// Requiring the tag was the "unsupported PCK safe header" dialog.
+    #[test]
+    fn a_package_without_the_tag_word_is_read_by_its_64_bit_offset() {
+        let size = 4096u64;
+        let mut safe = vec![0u8; 12];
+        safe[..4].copy_from_slice(&0x4dca23efu32.to_le_bytes());
+        safe[4..12].copy_from_slice(&size.to_le_bytes());
+        assert!(safe_header(&safe, size, None).is_ok(), "{safe:02x?}");
+
+        // The 5.5.2 form still reads its declared length from four bytes.
+        let mut tagged = vec![0u8; 12];
+        tagged[..4].copy_from_slice(&0x4dca23efu32.to_le_bytes());
+        tagged[4..8].copy_from_slice(&(size as u32).to_le_bytes());
+        tagged[8..12].copy_from_slice(&0x56a089b7u32.to_le_bytes());
+        assert!(safe_header(&tagged, size, None).is_ok(), "{tagged:02x?}");
+
+        // A wrong first tag is still refused, and says so in those words.
+        let mut wrong = safe.clone();
+        wrong[..4].copy_from_slice(&0x11223344u32.to_le_bytes());
+        let error = safe_header(&wrong, size, None).unwrap_err();
+        assert!(error.contains("safe header"), "{error}");
+    }
+
     fn the_angelica_trailer_is_the_retail_revisions_trailer() {
         let v1 = angelica_revision(0x0002_0001).expect("0x00020001 is an Angelica trailer");
         let v2 = angelica_revision(0x0002_0002).expect("0x00020002 is an Angelica trailer");

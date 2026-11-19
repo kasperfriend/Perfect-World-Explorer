@@ -44,7 +44,6 @@ CHECK = 0x59374231
 
 PCK_MAGIC = 0x4DCA23EF
 TAG_152 = 0x56A089B7
-TAGS = (TAG_152, 0)
 
 GUARD_0, GUARD_1 = 0xFDFDFEEE, 0xF00DBEEF
 ANGELICA_GUARD_0, ANGELICA_GUARD_1 = 0xA508BDC4, 0x853567C8
@@ -79,10 +78,20 @@ def directory(path):
         raise ValueError("truncated package")
     if U(0) != PCK_MAGIC:
         raise ValueError("bad package magic %08x" % U(0))
-    if U(8) not in TAGS:
+    # Only `tag1` is required, and the word at +8 is not always a tag. The
+    # client's own `AFilePackage::LoadSafeHeader` accepts four bytes of tag1 and
+    # then *re-reads* the prefix as `SAFEFILEHEADER_0x00020003` whenever the word
+    # at +8 is not 0x56a089b7 -- in that shape the eight bytes after tag1 are a
+    # UINT64 offset and the "tag" is its low half, which is where 1.8.4 gets the
+    # 00000000 seen above. Demanding 56a089b7 here was the "unsupported PCK safe
+    # header" refusal.
+    has_tag2 = U(8) == TAG_152
+    # The declared length moves with the shape too: a `DWORD` in the tag1/tag2
+    # form, a `UINT64` in the 0x00020003 form.
+    declared = U(4) if has_tag2 else struct.unpack_from("<Q", data, 4)[0]
+    if declared != size and declared & 0xFFFFFFFF != size & 0xFFFFFFFF:
         raise ValueError(
-            "unsupported package tag %08x; expected 56a089b7 (1.5.2) or 00000000 (1.8.4)"
-            % U(8)
+            "declared length %d does not match the file's %d bytes" % (declared, size)
         )
     version = U(size - 4)
     if version not in REVISIONS:
