@@ -71,3 +71,4 @@ google_drive/
 !/sdk/include/xess_fg/**
 !/sdk/include/xell/
 !/sdk/include/xell/**
+/tools/.toolchain/

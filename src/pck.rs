@@ -129,6 +129,13 @@ pub(crate) struct Revision {
     pub(crate) size_at: usize,
     /// Where `dwCompressedLength` starts.
     pub(crate) compressed_at: usize,
+    /// Where `dwEntryOffset` starts inside the trailer. It is `UINT64` in
+    /// `0x00020003` and `DWORD` before that, so its width has to be read from
+    /// the revision rather than assumed: taking the low half of the 64-bit word
+    /// yields a position that is inside the package but nowhere near the table.
+    pub(crate) table_offset_at: usize,
+    /// Width of `dwEntryOffset` in the trailer, in bytes.
+    pub(crate) table_offset_width: usize,
     /// Where `dwFlags` starts inside the trailer.
     pub(crate) flags_at: usize,
     /// Where `szDescription` starts inside the trailer.
@@ -162,6 +169,8 @@ pub(crate) const REVISIONS: [Revision; 3] = [
         offset_width: 8,
         size_at: 272,
         compressed_at: 276,
+        table_offset_at: 8,
+        table_offset_width: 8,
         flags_at: 16,
         description_at: 20,
         guard_byte1: 272,
@@ -174,6 +183,8 @@ pub(crate) const REVISIONS: [Revision; 3] = [
         offset_width: 4,
         size_at: 264,
         compressed_at: 268,
+        table_offset_at: 8,
+        table_offset_width: 4,
         flags_at: 12,
         description_at: 16,
         guard_byte1: 268,
@@ -186,6 +197,8 @@ pub(crate) const REVISIONS: [Revision; 3] = [
         offset_width: 4,
         size_at: 264,
         compressed_at: 268,
+        table_offset_at: 8,
+        table_offset_width: 4,
         flags_at: 12,
         description_at: 16,
         guard_byte1: 268,
@@ -516,6 +529,23 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     read_directory(&[(file, size)], &Layout::single(size), end, 0)
 }
 
+/// `dwEntryOffset`, unmasked at the revision's own width.
+///
+/// The trailer stores the entry table's position XOR `AFPCK_MASKDWORD`, and the
+/// field is `UINT64` from `0x00020003` on. Its width is load-bearing rather
+/// than tidy: 1.8.4's `litmodels` table starts at 10,107,744,597, so only the
+/// full word can name it, and unmasking the low half alone produces
+/// 1,517,810,005 -- a position inside the package but two gibibytes short of
+/// the table. That is what the `entry table overlaps footer` line reported.
+fn table_offset(header: &[u8], rev: &Revision) -> Result<u64, String> {
+    let stored = if rev.table_offset_width == 8 {
+        u64le(header, rev.table_offset_at)?
+    } else {
+        u32le(header, rev.table_offset_at)? as u64
+    };
+    Ok(stored ^ MASK as u64)
+}
+
 /// Read the trailer and the entry table.
 ///
 /// `end` is the end of the logical package and `base` the position inside it
@@ -576,7 +606,15 @@ fn read_directory(
     // piece's length -- which is why 1.5.2 resolved none of its 22,981 scenery
     // models. Both readings are attempted, in that order, and the first one
     // that yields a well-formed table wins.
-    let pos = (u32le(&header, 8)? ^ MASK) as u64;
+    //
+    // `dwEntryOffset` is `UINT64` in `0x00020003`, and that width is not
+    // cosmetic: 1.8.4's `litmodels` is a 9.4 GiB package whose table starts at
+    // 10,107,744,597, above 4 GiB, so its 32 bits cannot name it. Reading only
+    // the low half yielded 1,517,810,005 -- a position inside the package but
+    // two gibibytes short of the table, which is exactly the "declares its
+    // table at 1517810005 but only 3681422201 bytes precede the footer" line.
+    // The mask is applied at the revision's width for the same reason.
+    let pos = table_offset(&header, &rev)?;
     let table_end = part_end - (rev.header + 8) as u64;
     let mut tried = Vec::new();
     for (label, local) in [
@@ -1323,6 +1361,62 @@ mod tests {
         wrong[..4].copy_from_slice(&0x11223344u32.to_le_bytes());
         let error = safe_header(&wrong, size, None).unwrap_err();
         assert!(error.contains("safe header"), "{error}");
+    }
+
+    /// 1.8.4's `litmodels` names its entry table with the full 64-bit
+    /// `dwEntryOffset`, and only the full word locates it.
+    ///
+    /// The package is 10,123,872,665 bytes in pieces of `MAX_FILE_PACKAGE`, so
+    /// the trailer sits in the piece that begins at 6,442,450,176 and the table
+    /// starts at 10,107,744,597 -- above the 4 GiB a 32-bit word can reach.
+    /// Reading the low half alone gave 1,517,810,005, which was then compared
+    /// against the last piece's length and reported as "declares its table at
+    /// 1517810005 but only 3681422201 bytes precede the footer". That refusal
+    /// is why this client resolved none of its 23,068 scenery names.
+    #[test]
+    fn the_entry_table_is_located_by_the_whole_64_bit_word() {
+        let rev = REVISIONS
+            .iter()
+            .find(|r| r.version == 0x0002_0003)
+            .copied()
+            .expect("0x00020003 is a revision");
+        let table_at = 10_107_744_597u64;
+        let trailer_start = 10_123_872_665u64 - (rev.header + 8) as u64;
+
+        let mut header = vec![0u8; rev.header];
+        header[rev.table_offset_at..rev.table_offset_at + 8]
+            .copy_from_slice(&(table_at ^ MASK as u64).to_le_bytes());
+        assert_eq!(table_offset(&header, &rev).unwrap(), table_at);
+
+        // The low half on its own is the wrong answer, and wrong in a way that
+        // still looks like a position: it lands inside the package.
+        let low_only = u64::from(u32::from_le_bytes(
+            header[rev.table_offset_at..rev.table_offset_at + 4]
+                .try_into()
+                .unwrap(),
+        )) ^ MASK as u64;
+        assert_eq!(low_only, 1_517_810_005);
+
+        // With the real position the table ends exactly where the trailer
+        // begins, and the span is the 16,127,780 bytes the refused read was
+        // reported as missing. `237_241` records of 288 bytes would be
+        // 68,325,408, so the records are deflated on disk -- which is why the
+        // count cannot be inferred from the span.
+        let table_len = trailer_start - table_at;
+        assert_eq!(table_len, 16_127_780);
+        assert!(table_len < 237_241u64 * rev.entry as u64);
+
+        // The older revisions keep their 32-bit field.
+        let old = REVISIONS
+            .iter()
+            .find(|r| r.version == 0x0002_0002)
+            .copied()
+            .expect("0x00020002 is a revision");
+        assert_eq!(old.table_offset_width, 4);
+        let mut small = vec![0u8; old.header];
+        small[old.table_offset_at..old.table_offset_at + 4]
+            .copy_from_slice(&(0x1000u32 ^ MASK).to_le_bytes());
+        assert_eq!(table_offset(&small, &old).unwrap(), 0x1000);
     }
 
     fn the_angelica_trailer_is_the_retail_revisions_trailer() {

@@ -630,6 +630,7 @@ impl Channel {
                 | Self::EffectDecals
                 | Self::EffectProblems
                 | Self::SceneEffects
+                | Self::SceneWater
                 | Self::ModelQueue
                 | Self::RenderEffects
                 | Self::RenderWater
@@ -2499,6 +2500,38 @@ mod tests {
         let dir = fallback_log_dir();
         assert!(dir.is_absolute(), "{}", dir.display());
         assert!(dir.ends_with("pwe-logs"));
+    }
+
+    /// `SceneWater` is emitted from `water.rs` and `gpu.rs`, so leaving it out
+    /// of `wired()` meant the "Everything" preset never enabled it. A capture
+    /// of a map with no water then contained no `scene-water` file at all, and
+    /// "the water is missing" could not be told apart from "nobody asked for
+    /// the water to be logged" -- which is exactly how the 1.8.4 report read.
+    #[test]
+    fn the_water_channels_are_included_by_the_everything_preset() {
+        for channel in [Channel::SceneWater, Channel::RenderWater] {
+            assert!(
+                channel.wired(),
+                "{} is emitted, so a bulk switch must be able to tick it",
+                channel.key()
+            );
+            assert!(
+                all_wired_mask() & (1u64 << channel.index()) != 0,
+                "{} must be in the Everything mask",
+                channel.key()
+            );
+        }
+        let everything = PRESETS
+            .iter()
+            .find(|preset| preset.name == "Everything")
+            .expect("the Everything preset exists");
+        for channel in [Channel::SceneWater, Channel::RenderWater] {
+            assert!(
+                everything.keys().contains(&channel.key()),
+                "Everything must produce a {} file",
+                channel.key()
+            );
+        }
     }
 
     #[test]
