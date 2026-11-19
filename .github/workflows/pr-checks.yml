@@ -84,6 +84,25 @@ jobs:
           # refuses at CreateFeature — so the table is checked against the
           # vendored headers (and the DLL exports, and the packaged layout).
           python3 tools/verify-vendor-sdks.py
+      - name: Guard the offline harness against silent failures
+        run: |
+          # Two failure modes in `tools/offline_harness.sh` are invisible when
+          # they happen, and both have already cost real test coverage:
+          #
+          #   1. A duplicated `case` label. The shell takes the first match, so
+          #      the later arm is dead code. Two arms were once both labelled
+          #      `music`, and the 27-test precinct suite behind one of them had
+          #      never run.
+          #   2. An unescaped backtick inside an unquoted heredoc body. The
+          #      harness writes generated Rust through those heredocs, so the
+          #      shell *executes* whatever sits between a pair of backticks and
+          #      writes the empty result into the file. Four instances were found
+          #      this way; the only symptom was one stray line on stderr.
+          #
+          # Neither is a compile error and neither fails a test, so this has to
+          # be its own gate. `harness.sh check` runs it too; this makes it run on
+          # a machine that has no offline toolchain.
+          python3 tools/check-harness.py
       - name: Test requirement status audits
         run: |
           python3 tools/test_phase1_ready.py

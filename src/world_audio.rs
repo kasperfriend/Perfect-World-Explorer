@@ -22,7 +22,6 @@ struct Emitter {
     asset: Option<Asset>,
 }
 
-
 #[derive(Clone, Debug)]
 struct Voice {
     index: usize,

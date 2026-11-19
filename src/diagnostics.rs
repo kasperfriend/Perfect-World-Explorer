@@ -881,7 +881,7 @@ const MAX_FILE_BYTES: u64 = 8 << 20;
 /// in a loop decides to do.
 const BUDGET_PER_SECOND: f32 = 200.;
 /// How much the budget may hold, so a single load can still dump a whole census
-/// (the map's effect records are 2,275 lines) and still be the whole census.
+/// (the map's effect records are 2,971 lines) and still be the whole census.
 const BUDGET_BURST: f32 = 4000.;
 
 struct Inner {

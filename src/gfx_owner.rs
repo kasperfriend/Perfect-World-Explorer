@@ -371,7 +371,7 @@ pub struct Manager {
     effect_warnings: Vec<String>,
     /// `PWE_EFFECT_CENSUS=1` turns the effect pass into a report: every visible
     /// root's largest quad, its texture, its blend pair and where it sat. A
-    /// screenshot can say "white blob at the altar" but not which of the 2,275
+    /// screenshot can say "white blob at the altar" but not which of the 2,971
     /// installed roots drew it, and the status line only counts quads.
     census: Option<Census>,
     /// Each root's clock at the previous census report, so the next one can say

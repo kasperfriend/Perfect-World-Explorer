@@ -53,8 +53,12 @@ pub struct Effect {
     /// Position of this record in its block's effect list, for diagnostics.
     pub index: u32,
     /// The record's own id word (`record[0]`). It is not the block list index:
-    /// the 2,275 placements of the shipped `world.ecwld` carry 2,275 distinct
-    /// values between 1 and 44,894.
+    /// the **2,971** placements of the shipped `world.ecwld` carry 2,971
+    /// distinct values.
+    ///
+    /// (This said 2,275 for a while. That was an earlier reader's count, left
+    /// behind when the record's leading id word was recovered and every block
+    /// stopped losing its last record; re-measured against the staged file.)
     pub export_id: u32,
     pub scale: f32,
     pub position: [f32; 3],
@@ -78,14 +82,14 @@ impl Effect {
     /// (a float bit pattern, so 1.06e9 — a clock that jumps and freezes), and its
     /// position out of the middle of its own direction vector.
     ///
-    /// The shipped `world.ecwld` decides between the two readings on all 2,275
+    /// The shipped `world.ecwld` decides between the two readings on all **2,971**
     /// records with no exceptions. Under this one `[20..32)` and `[32..44)` are
-    /// unit vectors and perpendicular to each other on 2,275 of 2,275 records,
-    /// the play speeds span 0.03..12 with no non-positive value, the uniform
-    /// scales span 0.164..380.953, and the day/night word takes only the three
-    /// authored modes with the split 1,445 all-day / 154 day-only / 676
+    /// unit vectors and perpendicular to each other on 2,971 of 2,971 records,
+    /// the play speeds span 0.030..12.000 with no non-positive value, the uniform
+    /// scales span 0.054..380.953, and the day/night word takes only the three
+    /// authored modes with the split 2,004 day-and-night / 787 day-only / 180
     /// night-only. Under the old one the same fields are a mixture of ids and
-    /// float bit patterns and 2,222 of 2,275 records have a non-unit direction.
+    /// float bit patterns and the direction is non-unit on almost every record.
     /// `corpus_effect_records_agree_on_one_layout` holds the map to that.
     ///
     /// The copy block at `0x5b3436..0x5b34a6` carries the same field order: the

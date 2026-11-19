@@ -351,14 +351,20 @@ mod tests {
         assert!(contains_world_point(&header, 3070.3, 1500.0));
         assert!(contains_world_point(&header, -3070.3, -1500.0));
         assert!(contains_world_point(&header, 0.0, 0.0));
-        assert!(contains_world_point(&header, -3072.0, -1536.0), "the corner is inside");
+        assert!(
+            contains_world_point(&header, -3072.0, -1536.0),
+            "the corner is inside"
+        );
         // Outside by a hair, in each direction.
         assert!(!contains_world_point(&header, 3072.1, 0.0));
         assert!(!contains_world_point(&header, 0.0, -1536.1));
         // The mistake the old corner-anchored version made: a point a precinct
         // polygon really names on the neighbouring world must not read as
         // "outside this map's extent".
-        assert!(contains_world_point(&header, -1936.0, -428.3), "a37's own placement");
+        assert!(
+            contains_world_point(&header, -1936.0, -428.3),
+            "a37's own placement"
+        );
         let bytes = a37_header();
         assert_eq!(
             &bytes[84..96],

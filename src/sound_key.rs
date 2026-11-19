@@ -64,11 +64,26 @@ mod tests {
     #[test]
     fn the_five_authored_roots_all_key_under_sfx() {
         let authored = [
-            ("Skill\\01Fighter\\霸王龙飞_C.wav", "sfx/skill/01fighter/霸王龙飞_c.wav"),
-            ("Effect\\Player\\魔力燃烧.wav", "sfx/effect/player/魔力燃烧.wav"),
-            ("Creature\\Skill\\冰锥术_A.wav", "sfx/creature/skill/冰锥术_a.wav"),
-            ("Item\\EquipSound\\DownGem.wav", "sfx/item/equipsound/downgem.wav"),
-            ("Ambience\\3DimL\\16_Waterfall.wav", "sfx/ambience/3diml/16_waterfall.wav"),
+            (
+                "Skill\\01Fighter\\霸王龙飞_C.wav",
+                "sfx/skill/01fighter/霸王龙飞_c.wav",
+            ),
+            (
+                "Effect\\Player\\魔力燃烧.wav",
+                "sfx/effect/player/魔力燃烧.wav",
+            ),
+            (
+                "Creature\\Skill\\冰锥术_A.wav",
+                "sfx/creature/skill/冰锥术_a.wav",
+            ),
+            (
+                "Item\\EquipSound\\DownGem.wav",
+                "sfx/item/equipsound/downgem.wav",
+            ),
+            (
+                "Ambience\\3DimL\\16_Waterfall.wav",
+                "sfx/ambience/3diml/16_waterfall.wav",
+            ),
         ];
         for (raw, expected) in authored {
             assert_eq!(asset_key(raw).as_deref(), Some(expected), "{raw}");

@@ -32,17 +32,28 @@ item says so and lands as a named gap instead of a guess.
       100 MiB transfer limit. So the gap is "no staged archive", not "unknown
       path base", and B-31 now says exactly that.
 
-- [ ] **3. Run the silent-failure guard in CI, not just locally.**
+- [x] **3. Run the silent-failure guard in CI, not just locally.**
       `tools/check-harness.py` currently runs only inside `harness.sh check`.
-      *Done when:* the workflow runs it on both platforms and a deliberate
-      duplicate label fails the build (checked, then reverted).
+      *Done:* `pr-checks.yml` gained a **Guard the offline harness against silent
+      failures** step running `python3 tools/check-harness.py`, placed with the
+      other standalone audits. It needs no Rust toolchain, so it also catches
+      things on a machine that never builds the harness. The workflow parses as
+      valid YAML with the step in place; the failure direction is proven by the
+      two negative tests against `/tmp` copies (duplicate label, stray backtick).
 
-- [ ] **4. Re-read the two findings docs for claims this stretch invalidated.**
+- [x] **4. Re-read the two findings docs for claims this stretch invalidated.**
       `Findings/Unsupported-client-paths.md` and `docs/blockers.md` both carry
       older wording ("counts but does not perform", the 79-version ceiling, the
       precinct frame).
-      *Done when:* every row this stretch touched states the current truth, and
-      nothing still claims 160/190 are unimplemented.
+      *Done:* the "counts but does not perform" row now says the plugin draws
+      every placed effect and only the *audio* is unplayed. Beyond the brief, the
+      stale effect count **2,275** was wrong in live prose: the staged
+      `world.ecwld` has **2,971** effects / 2,971 distinct ids, unit and
+      perpendicular directions on 2,971 of 2,971, speeds 0.030–12.000, scales
+      0.054–380.953, split 2,004 / 787 / 180. Corrected in `scene.rs`,
+      `diagnostics.rs`, `gfx_owner.rs` and the findings row. Dated reports such as
+      `Every-effect-2026-11-08.md` keep 2,275 — that is what was measured on that
+      build, and rewriting a dated record would be worse than the stale number.
 
 - [ ] **5. Close out: full gate sweep, benchmark the numbers, push, refresh the
       PR body.**
