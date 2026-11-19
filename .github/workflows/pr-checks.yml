@@ -137,6 +137,12 @@ jobs:
       # because those enums ARE the persisted spellings.
       - name: Settings persistence
         run: bash tools/offline_harness.sh settings
+      # The baked draw-state table: stage, alpha test, cull, blend and the
+      # z-fight/winding rules, including which meshes a mirrored placement may
+      # reverse. `cargo test` above does reach these, but only as part of the
+      # whole viewer binary; this runs them alone, so a failure names the table.
+      - name: Baked draw-state table
+        run: bash tools/offline_harness.sh bmd-baked
       - name: Measure staged precinct files
         run: |
           # An array, not a newline-joined string: `$roots` unquoted from
