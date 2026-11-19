@@ -298,3 +298,57 @@ Every one of the 383 zones has a centre, all 783 playlist tracks survive, and
 the zone names reach English. `extent` is the map's own `.trn2` header, which
 carries no world transform; see `Findings/Unsupported-client-paths.md` for the
 one part of that question still open (the shared coordinate frame).
+
+### GFX container versions in one pack (18 November 2026)
+
+`MOXTVersion` as authored in the staged 1.3.1 `gfx.pck`. Counted with the pack's
+own directory, so this is the archive's own content, not an inference:
+
+| version | roots | | version | roots |
+|---|---|---|---|---|
+| 28 | 25 | | 35 | 181 |
+| 29 | 6 | | 37 | 648 |
+| 30 | 219 | | 39 | 3 |
+| 31 | 19 | | 40 | 16 |
+| 32 | 170 | | 41 | 85 |
+| 33 | 399 | | 45 | 10 |
+| 34 | 93 | | | |
+
+2,071 `.gfx` members; **1,874 carry a `MOXTVersion` header**, and the table sums
+to 1,874. One member is an empty container (the four-byte `MOXT` stub, below);
+the remaining 196 are members whose name ends `.gfx` but whose content is not a
+versioned root. The newest version in this pack is **45**, which is why the
+older "79 is the format ceiling" claim needed a different pack to test — 79 was
+one measurement from the 1.4.2 pack, and the version history plus the reader's
+version-gated keys handle the rest (`Findings/Gfx-version-ceiling-2026-11-18.md`).
+
+The full element sweep over the same 2,071 roots: **2,070 parse, 0 reach
+`Spec::Unknown`**, and the single failure is the empty `MOXT` stub — so no
+element id in this corpus is unhandled. Elements, and the number of roots that
+carry at least one of each id:
+
+| id | what | elements | roots |
+|---|---|---|---|
+| 100 | decal | 1,285 | 426 |
+| 101 | decal variant | 2,183 | 648 |
+| 102 | decal variant | 46 | 17 |
+| 110 | ribbon | 1,096 | 258 |
+| 120 | particle | 680 | 345 |
+| 121 | particle (box) | 252 | 140 |
+| 122 | particle | 40 | 40 |
+| 123 | particle | 2,786 | 1,257 |
+| 124 | particle (cylinder) | 481 | 189 |
+| 125 | particle (generation sequence) | 1 | 1 |
+| 130 | light | 521 | 499 |
+| 140 | cylinder | 786 | 225 |
+| 150 | fractal | 315 | 69 |
+| 151 | lightning | 11 | 7 |
+| 160 | model | 210 | 108 |
+| 170 | sound | 355 | 340 |
+| 180 | wave | 40 | 13 |
+| 190 | curve (paraboloid) | 136 | 34 |
+| 200 | child root (nested `.gfx`) | 21 | 5 |
+
+Element 123 is the most common type in the whole archive, in more than half the
+roots — a pack where it did not draw would look almost empty. Element 170 is the
+only id the player counts without performing it (`Findings/Unsupported-client-paths.md`).
