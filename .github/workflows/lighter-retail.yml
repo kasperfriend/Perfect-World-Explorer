@@ -100,6 +100,21 @@ jobs:
               echo "::notice title=Lighter receipt SHA-256::$(sha256sum "$file")"
             fi
           done
+      - name: Report all matched results, including late a07 views
+        if: always()
+        run: |
+          # Keep the complete captures as the artifact. The small JSON index
+          # is also readable if the signed artifact transfer is unavailable.
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path('target/lighter-retail/capture-summary.json')
+          if path.is_file():
+              report = json.loads(path.read_text(encoding='utf-8'))
+              maps = report.pop('maps')
+              for label, data in [('Lighter capture index', report), *[(m, v) for m, v in maps.items()]]:
+                  print(f"::notice title={label}::{json.dumps(data, separators=(',', ':')).replace('%', '%25')}")
+          PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:

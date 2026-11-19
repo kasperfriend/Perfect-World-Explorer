@@ -149,6 +149,29 @@ class CaptureMatrixTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "doubled budget"):
             temporal.validate_temporal(metas | {"reference": metas["reference"] | {"settings_effective": ref % 32}}, "reveal")
 
+    def test_capture_index_reports_matched_and_failed_cases_separately(self):
+        meta = {"adapter": "CPU Vulkan", "image": "960x720", "trace_image": "240x180", "eye": "[80,329,-144]",
+                "yaw": "0", "pitch": "-0.6", "eye_underwater_depth": "1.8305", "rain_mask_source": "decode_failed",
+                "native_rain_slots_selected": "0", "ray_rain_cards": "0", "native_lightmap_areas_day_night": "16",
+                "world_effect_warp_omitted_elements": "5", "world_effect_dest_color_affine_candidates": "0",
+                "world_effect_dest_color_unsupported_candidates": "0", "ray_lightmap_areas_bound": "16"}
+        rows = {key: dict.fromkeys(matrix.INVENTORY_COLUMNS[1:], 0) for key in
+                ("buildings", "water", "grass", "effect_roots", "effect_draws")}
+        rows["water"]["loaded"] = 1
+        capture = {"meta": meta, "inventory": rows, "synchronized_capture_ms": None}
+        result = {"case": {"id": "a07-submerged", "map": "a07", "condition": "day"},
+                  "captures": {"software": capture},
+                  "comparisons": {"off-vs-software": {"whole": {"mean_abs_rgb8": 2.03, "max_abs_rgb8": 44}}}}
+        report = {"profile": "cpu", "source_sha": "a" * 40, "cases": [result],
+                  "errors": {"a07-night": "capture failed"}, "missing_rt17_cells": [{}] * 54}
+        summary = matrix.summarize_matrix(report, Path("unused"))
+        [wet] = summary["maps"]["a07"]
+        self.assertEqual(summary["failed_cases"], ["a07-night"])
+        self.assertEqual(summary["missing_physical_cells"], 54)
+        self.assertEqual(wet["routes"]["software"]["rain_mask"], "decode_failed")
+        self.assertEqual(wet["routes"]["software"]["water"], {"loaded": 1})
+        self.assertEqual(wet["comparisons"]["off-vs-software"]["whole"], [2.03, 44])
+
     def test_rt17_ignores_cpu_pairs_and_identifies_incomplete_native_counts(self):
         cases = [{"id": "wet", "map": "a07", "classes": ["water"], "condition": "day",
                   "camera": [16, 356, 84, 0, -0.6], "camera_evidence": "review/a07.png"}]

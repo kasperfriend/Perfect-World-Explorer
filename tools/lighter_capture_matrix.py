@@ -440,6 +440,61 @@ def run_case(case, args, attempts):
     return {"case": case, "captures": mode_results, "comparisons": comparisons}
 
 
+def summarize_matrix(report, output):
+    """Small index of *validated* pairs, distinct from their full artifacts."""
+    maps = {}
+    adapters = set()
+    clear = {}
+    for result in report["cases"]:
+        case = result["case"]
+        for route, capture in result["captures"].items():
+            if case["condition"] == "day":
+                # Two day cameras in the same map need not share a baseline.
+                clear[route, case["map"], capture["meta"]["eye"], capture["meta"]["yaw"], capture["meta"]["pitch"]] = capture
+    for result in report["cases"]:
+        case = result["case"]
+        row = {"id": case["id"], "routes": {}, "comparisons": {}}
+        for route, capture in result["captures"].items():
+            meta = capture["meta"]
+            adapters.add(meta["adapter"])
+            stats = {"image": meta["image"], "trace_image": meta["trace_image"],
+                     "eye_depth": float(meta["eye_underwater_depth"]), "rain_mask": meta.get("rain_mask_source", "unknown"),
+                     "rain_count": (int(meta["native_rain_slots_selected"]) if "native_rain_slots_selected" in meta else None)
+                     if route == "off" else int(meta["ray_rain_cards"]),
+                     "lightmap_pairs": int(meta["native_lightmap_areas_day_night"]),
+                     "ray_lightmap_bound": int(meta.get("ray_lightmap_areas_bound", 0)),
+                     "warp_omitted": int(meta["world_effect_warp_omitted_elements"]),
+                     "dst_color_candidates": [int(meta[f"world_effect_dest_color_{key}_candidates"])
+                                              for key in ("affine", "unsupported")],
+                     "effect_event_roots": int(meta.get("world_effect_decoded_model_event_roots", 0))}
+            if route == "off" and "native_last_scene_passes" in meta:
+                stats["native_scene_passes"] = int(meta["native_last_scene_passes"])
+            if capture["inventory"] is not None:
+                for cls in ("buildings", "water", "grass", "effect_roots", "effect_draws"):
+                    stats[cls] = {k: v for k, v in capture["inventory"][cls].items() if v != 0}
+            timing = capture["synchronized_capture_ms"]
+            if timing is not None:
+                stats["sync_count_p50_p95"] = [len(timing["samples"]), round(timing["p50"], 3), round(timing["p95"], 3)]
+            reference = clear.get((route, case["map"], meta["eye"], meta["yaw"], meta["pitch"]))
+            if case["condition"] == "rain" and reference is not None:
+                ref_meta = reference["meta"]
+                controls = tuple(k for k in MATCH_KEYS if k not in ("weather", "rain_at_eye")) + (
+                    "settings_effective", "eye_underwater_depth", "rain_mask_source", "trace_image",
+                )
+                if all(ref_meta.get(k) == meta.get(k) for k in controls):
+                    dry = verified_image(output / reference["files"], ref_meta)
+                    rain = verified_image(output / capture["files"], meta)
+                    delta = ImageChops.difference(dry.convert("RGB"), rain.convert("RGB"))
+                    stats["clear_to_rain_changed_pixels"] = sum(px != (0, 0, 0) for px in delta.getdata())
+            row["routes"][route] = stats
+        for pair, diff in result["comparisons"].items():
+            row["comparisons"][pair] = {region: [d["mean_abs_rgb8"], d["max_abs_rgb8"]] for region, d in diff.items()}
+        maps.setdefault(case["map"], []).append(row)
+    return {"source_sha": report["source_sha"], "profile": report["profile"], "adapters": sorted(adapters),
+            "matched_cases": len(report["cases"]), "failed_cases": sorted(report["errors"]),
+            "missing_physical_cells": len(report["missing_rt17_cells"]), "maps": maps}
+
+
 def missing_rt17_cells(cases, report):
     matched = {result["case"]["id"]: result["captures"] for result in report["cases"]}
     missing = []
@@ -528,7 +583,8 @@ def main():
               "cases": []}
     report["errors"] = {}
     report["capture_attempts"] = {}
-    prefix = "::notice::" if os.environ.get("GITHUB_ACTIONS") == "true" else ""
+    # Print details on every pair to the log. CI separately transports a
+    # compact per-map index since annotations have a per-step count limit.
     for case in cases:
         attempts = report["capture_attempts"][case["id"]] = {}
         try:
@@ -550,28 +606,30 @@ def main():
         if native["inventory"] is not None:
             nb, nr = (native["inventory"][k] for k in ("buildings", "effect_roots"))
             listed = lambda row: "/".join(str(row[k]) for k in TOTALS)
-            print(f"{prefix}{case['id']} Native BMD {listed(nb)}; GFX roots {listed(nr)}; "
+            print(f"{case['id']} Native BMD {listed(nb)}; GFX roots {listed(nr)}; "
                   f"water depth {native['meta']['eye_underwater_depth']}; "
                   f"rain mask authored={native['meta']['rain_mask_authored']}, "
                   f"native slots={native['meta']['native_rain_slots_selected']}, "
                   f"ray cards={software['meta']['ray_rain_cards']}", flush=True)
-        print(f"{prefix}{case['id']} RGB8 MAE {summary}; ray BMD {bmd['loaded']}/{bmd['skipped']}/{bmd['failed']}; "
+        print(f"{case['id']} RGB8 MAE {summary}; ray BMD {bmd['loaded']}/{bmd['skipped']}/{bmd['failed']}; "
               f"GFX roots {roots['loaded']}/{roots['skipped']}/{roots['failed']}; "
               f"eye {software['meta']['eye']} yaw {software['meta']['yaw']} pitch {software['meta']['pitch']}; "
               f"{timing or 'no synchronized timing requested'}", flush=True)
         if len(report["cases"]) == 1:
-            print(f"{prefix}{software['meta']['adapter']}", flush=True)
+            print(software["meta"]["adapter"], flush=True)
     report["missing_rt17_cells"] = missing_rt17_cells(cases, report)
     report["declared_physical_matrix_complete"] = (complete and not report["errors"] and not report["missing_rt17_cells"]
                                                     and args.ray_resolution == 50)
     (args.output / "matrix.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    (args.output / "capture-summary.json").write_text(
+        json.dumps(summarize_matrix(report, args.output), indent=2) + "\n", encoding="utf-8")
     (args.output / "SHA256SUMS.txt").write_text(
         "".join(f"{sha256_file(path)}  {path.name}\n" for path in sorted(args.output.iterdir()) if path.is_file()),
         encoding="utf-8", newline="\n",
     )
     if report["errors"]:
         message = f"Failed capture cases: {', '.join(report['errors'])}; retained partial evidence in matrix.json"
-        print(f"{'::error::' if prefix else ''}{message}", flush=True)
+        print(f"{'::error::' if os.environ.get('GITHUB_ACTIONS') == 'true' else ''}{message}", flush=True)
         raise SystemExit(1)
     if args.require_complete and not report["declared_physical_matrix_complete"]:
         raise SystemExit(f"RT-17 remains incomplete; see {args.output / 'matrix.json'} for per-route reasons")

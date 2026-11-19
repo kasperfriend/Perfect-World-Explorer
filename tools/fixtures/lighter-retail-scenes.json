@@ -266,6 +266,39 @@
           0.56
         ]
       }
+    },
+    {
+      "id": "a07-submerged-rain",
+      "map": "a07",
+      "classes": [],
+      "condition": "rain",
+      "camera": [
+        80.0,
+        329.0,
+        -144.0,
+        0.0,
+        -0.6
+      ],
+      "warmup": 12,
+      "lightmaps": true,
+      "min_lightmap_areas_day_night": 16,
+      "min_loaded": {
+        "water": 1
+      },
+      "authored_totals": {
+        "water": 1,
+        "buildings": 116,
+        "effect_roots": 22
+      },
+      "eye_underwater": true,
+      "regions": {
+        "wet-center": [
+          0.44,
+          0.44,
+          0.56,
+          0.56
+        ]
+      }
     }
   ]
 }
