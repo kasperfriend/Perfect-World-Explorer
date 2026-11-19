@@ -38,8 +38,6 @@ mod gfx_player;
 // `sky_gpu`'s own test reads `sky_time::night_weight`, so a `--test` build of
 // this target needs the module. `world_models_gpu` draws sky through the same
 // module, which is why this target carries `sky_gpu` at all.
-#[path = "../sky_time.rs"]
-mod sky_time;
 #[path = "../model_asset.rs"]
 mod model_asset;
 #[path = "../model_attachment.rs"]
@@ -84,6 +82,8 @@ mod skin_pose;
 mod sky_config;
 #[path = "../sky_gpu.rs"]
 mod sky_gpu;
+#[path = "../sky_time.rs"]
+mod sky_time;
 #[path = "../world_models.rs"]
 mod world_models;
 #[path = "../world_models_gpu.rs"]

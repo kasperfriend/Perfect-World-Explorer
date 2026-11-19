@@ -1173,13 +1173,15 @@ EOF
             "$OUT/mat/lib.rs" -o "$OUT/mattest"
         shift || true
         (cd "$REPO" && exec "$OUT/mattest" "$@") ;;    fmt)   toolchain
-        rustfmt --check --edition 2021 \
-            "$REPO/src/gfx_player.rs" "$REPO/src/gfx_file.rs" "$REPO/src/gfx_decal.rs" \
-            "$REPO/src/gfx_color_track.rs" "$REPO/src/gfx_catalog.rs" "$REPO/src/ecmodel.rs" \
-            "$REPO/src/gfx_light.rs" "$REPO/src/gfx_owner.rs" "$REPO/src/scene_lights.rs" \
-            "$REPO/src/view_settings.rs" "$REPO/src/client_weather.rs" \
-            "$REPO/src/sky_transition.rs" "$REPO/src/scene.rs" "$REPO/src/model_dds.rs" "$REPO/src/skin.rs" "$REPO/src/skeleton.rs" "$REPO/src/skeleton_pose.rs" "$REPO/src/skin_pose.rs" "$REPO/src/model_asset.rs" "$REPO/src/model_material.rs" \
-            "$REPO/src/pck.rs" "$REPO/src/client_detect.rs" ;;
+        # Every `.rs` under `src`, tracked or not, which is what `cargo fmt --all`
+        # in CI checks. This used to be a hand-kept list of twenty modules, and it
+        # drifted: three files were unformatted in CI while this mode said clean,
+        # because they had never been on the list. A list of files to format is
+        # the wrong shape of check -- the thing to format is the tree. `find` and
+        # not `git ls-files` for the same reason: a file added this session is
+        # exactly the one nobody has formatted yet.
+        ( cd "$REPO" && find src -name '*.rs' -print0 \
+            | xargs -0 rustfmt --check --edition 2021 --config skip_children=true ) ;;
     scene) toolchain; sysroot; deps
         # Sweep real `.ecwld` files with the real reader. Map files are the only
         # scenery input, and the body layouts they carry differ by client

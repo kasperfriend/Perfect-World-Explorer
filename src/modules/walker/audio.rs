@@ -885,9 +885,14 @@ mod tests {
             (3, "PetDinasaur"),
             (4, "PetQilin"),
         ] {
-            let mounted =
-                MovementSound::land_in_table(Class::Psychic, Gender::Female, true, Some(kind), &table)
-                    .unwrap();
+            let mounted = MovementSound::land_in_table(
+                Class::Psychic,
+                Gender::Female,
+                true,
+                Some(kind),
+                &table,
+            )
+            .unwrap();
             assert_eq!(mounted.id, 200 + kind as u16 * 2 + 1);
             assert_eq!(
                 mounted.path,

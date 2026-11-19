@@ -206,7 +206,11 @@ mod selector_tests {
             mask_size: 0,
             mask: Mask::raw(Vec::new()),
         };
-        assert_eq!(layer.selector(), 2, "the accessor returns the authored byte");
+        assert_eq!(
+            layer.selector(),
+            2,
+            "the accessor returns the authored byte"
+        );
         assert_eq!(layer.axis, 2, "and the axis it was derived into");
     }
 
