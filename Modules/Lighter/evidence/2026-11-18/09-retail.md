@@ -46,3 +46,17 @@ notices for validated cases (including late a07 views) and retains partial
 receipts on failure. See [CPU results and reproduction](../../retail-matrix.md)
 and the [delivery record](14-delivery.md). Numeric region errors are not
 verdicts about the intended subject when the PNGs have not been inspected.
+
+## Ordered follow-up: preflight the 54 cells
+
+`lighter_capture_matrix.py --plan-only` audits scene/condition declarations,
+explicit cameras, scout-file hashes and verified input pins without launching
+any renderer. The existing CPU manifest, checked against **23 locally
+available pinned inputs**, produced `09-retail/rt17-plan.json`: **27 cells
+have no candidate declaration** (city, forest, distance), **27 have a
+candidate but lack an accepted scout file and the complete input pins**.
+There are **0 ready and 0 measured**; a declaration is not a receipt. The
+physical completion path now requires a source SHA and binds each accepted
+camera's actual scout file. It still checks observed device, output extent,
+inventory and timings. The final previous CPU run remains 12 matched pairs;
+no rerun of those same pairs is counted as new coverage.

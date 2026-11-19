@@ -201,6 +201,25 @@ class CaptureMatrixTests(unittest.TestCase):
         self.assertEqual(wet["routes"]["software"]["water"], {"loaded": 1})
         self.assertEqual(wet["comparisons"]["off-vs-software"]["whole"], [2.03, 44])
 
+    def test_rt17_preflight_lists_incomplete_cells_before_any_viewer_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "plan.json"
+            case = {"id": "wet", "map": "a07", "classes": ["water"], "condition": "day",
+                    "camera": [16, 356, 84, 0, -0.6], "camera_evidence": "shore.png"}
+            receipts, errors = matrix.verify_camera_evidence([case], manifest)
+            self.assertEqual(receipts, {})
+            self.assertIn("missing", errors["wet"])
+            cells = matrix.rt17_plan([case], receipts, errors, {})
+            self.assertEqual(len(cells), 54)
+            self.assertEqual(sum(c["unmeasured_reason"] == "no camera declared" for c in cells), 51)
+            self.assertTrue(all(len(c["candidate_blockers"]["wet"]) == 2
+                                for c in cells if c["scene_class"] == "water" and c["condition"] == "day"))
+            (root / "shore.png").write_bytes(b"fixture scout file")
+            receipts, errors = matrix.verify_camera_evidence([case], manifest)
+            self.assertEqual(receipts["wet"]["sha256"], hashlib.sha256(b"fixture scout file").hexdigest())
+            self.assertEqual(errors, {})
+
     def test_rt17_ignores_cpu_pairs_and_identifies_incomplete_native_counts(self):
         cases = [{"id": "wet", "map": "a07", "classes": ["water"], "condition": "day",
                   "camera": [16, 356, 84, 0, -0.6], "camera_evidence": "review/a07.png"}]
@@ -215,13 +234,14 @@ class CaptureMatrixTests(unittest.TestCase):
                             (".ecwld", ".ecbsd", ".trn2", "_1.t2bk", "_1.t2mk")}, "b" * 64)
         report = {"profile": "physical", "cases": [{"case": cases[0], "captures": captures}],
                   "errors": {}, "client_inputs": pins}
+        report["camera_evidence"] = {"wet": {"file": "review/a07.png", "sha256": "b" * 64}}
         physical = matrix.missing_rt17_cells(cases, report)
         self.assertEqual(len(physical), 52)
         self.assertTrue(any(c["route"] == "off" and c["scene_class"] == "water"
                             and "Native" in c["reason"] for c in physical))
         self.assertEqual(len(matrix.missing_rt17_cells(cases, report | {"profile": "cpu"})), 54)
         self.assertEqual(len(matrix.missing_rt17_cells(cases, report | {"client_inputs": {}})), 54)
-        self.assertEqual(len(matrix.missing_rt17_cells([cases[0] | {"camera_evidence": None}], report)), 54)
+        self.assertEqual(len(matrix.missing_rt17_cells(cases, report | {"camera_evidence": {}})), 54)
         self.assertTrue(matrix.requested_target(meta))
         self.assertFalse(matrix.requested_target(meta | {"vulkan_largest_device_local_heap_bytes": str(12 << 30)}))
         self.assertFalse(matrix.requested_target(meta | {"platform": "linux"}))

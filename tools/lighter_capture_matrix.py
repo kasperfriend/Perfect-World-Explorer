@@ -484,6 +484,45 @@ def summarize_matrix(report, output):
             "missing_physical_cells": len(report["missing_rt17_cells"]), "maps": maps}
 
 
+def verify_camera_evidence(cases, manifest):
+    receipts, errors = {}, {}
+    for case in cases:
+        name = case["id"]
+        if case.get("camera") is None or not isinstance(case.get("camera_evidence"), str) or not case["camera_evidence"].strip():
+            errors[name] = "no reviewed explicit pose and scout file"
+            continue
+        path = manifest.parent / case["camera_evidence"]
+        try:
+            if not path.is_file() or not path.stat().st_size:
+                raise ValueError("scout file missing or empty")
+            receipts[name] = {"file": case["camera_evidence"], "sha256": sha256_file(path)}
+        except (OSError, ValueError) as error:
+            errors[name] = str(error)
+    return receipts, errors
+
+
+def rt17_plan(cases, verified_cameras, camera_errors, pins):
+    entries = []
+    for subject in sorted(CLASSES):
+        for condition in CONDITIONS:
+            declared = [c for c in cases if subject in c["classes"] and c["condition"] == condition]
+            reasons = {}
+            for c in declared:
+                blockers = []
+                if c["id"] not in verified_cameras:
+                    blockers.append(camera_errors[c["id"]])
+                if not case_has_input_pins(c, pins):
+                    blockers.append("shared archive set and map pins not verified")
+                reasons[c["id"]] = blockers
+            for route in PROFILES["physical"]:
+                ready = bool(reasons) and any(not blockers for blockers in reasons.values())
+                entries.append({"scene_class": subject, "condition": condition, "route": route,
+                                "status": "needs_physical_capture" if ready else "not_ready",
+                                "candidate_blockers": reasons,
+                                "unmeasured_reason": "no camera declared" if not declared else "no physical capture supplied"})
+    return entries
+
+
 def missing_rt17_cells(cases, report):
     matched = {result["case"]["id"]: result["captures"] for result in report["cases"]}
     missing = []
@@ -509,8 +548,8 @@ def missing_rt17_cells(cases, report):
                             reason = f"{c['id']}: not the requested Windows x64 RTX 3080 10 GB Vulkan target"
                         elif route != "off" and capture["meta"].get("trace_image") != "480x360":
                             reason = f"{c['id']}: not the required actual 50% ray extent"
-                        elif not c.get("camera") or not c.get("camera_evidence"):
-                            reason = f"{c['id']}: no reviewed explicit camera and evidence reference"
+                        elif not c.get("camera") or c["id"] not in report.get("camera_evidence", {}):
+                            reason = f"{c['id']}: no verified scout file for the explicit camera"
                         elif not case_has_input_pins(c, report.get("client_inputs", {})):
                             reason = f"{c['id']}: input pins for the map and shared archive set were not verified"
                         elif not capture["meta"].get("inventory_sha256"):
@@ -527,8 +566,12 @@ def missing_rt17_cells(cases, report):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("manifest", "viewer", "client", "output"):
+    for name in ("manifest", "output"):
         parser.add_argument(f"--{name}", type=Path, required=True)
+    parser.add_argument("--viewer", type=Path)
+    parser.add_argument("--client", type=Path)
+    parser.add_argument("--plan-only", action="store_true", help="check RT-17 declarations/pins without launching a viewer")
+    parser.add_argument("--source-sha", default=os.environ.get("GITHUB_SHA"), help="full source commit of the supplied executable")
     parser.add_argument("--input-manifest", type=Path, help="trusted SHA-256 pins for the client subset under element/")
     parser.add_argument("--profile", choices=PROFILES, default="physical")
     parser.add_argument("--ray-resolution", type=int, default=50, choices=range(25, 101), metavar="25..100")
@@ -544,11 +587,18 @@ def main():
     args = parser.parse_args()
     if args.hybrid_ab and args.profile != "physical":
         parser.error("--hybrid-ab requires --profile physical")
+    if args.plan_only and (args.require_complete or args.profile != "physical"):
+        parser.error("--plan-only checks the physical plan, not measured completion")
+    if (not args.plan_only and not (args.viewer and args.client)) or (args.input_manifest and not args.client):
+        parser.error("captures need --viewer and --client; verifying pins always needs --client")
+    if args.require_complete and not re.fullmatch("[a-f0-9]{40}", args.source_sha or ""):
+        parser.error("--require-complete needs --source-sha of the tested viewer")
     try:
         cases = json.loads(args.manifest.read_text(encoding="utf-8"))["cases"]
         validate_cases(cases)
         pins = verify_inputs(args.client, args.input_manifest) if args.input_manifest else {}
-        viewer_hash = sha256_file(args.viewer)
+        cameras, camera_errors = verify_camera_evidence(cases, args.manifest)
+        viewer_hash = None if args.plan_only else sha256_file(args.viewer)
     except (ValueError, KeyError, TypeError, OSError) as error:
         parser.error(str(error))
     covered = {(cls, case["condition"]) for case in cases for cls in case["classes"]}
@@ -562,9 +612,19 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     if any(args.output.iterdir()):
         parser.error(f"use a fresh output directory: {args.output}")
-    report = {"started_utc": datetime.now(timezone.utc).isoformat(), "source_sha": os.environ.get("GITHUB_SHA"),
+    if args.plan_only:
+        cells = rt17_plan(cases, cameras, camera_errors, pins)
+        plan = {"scope": "planning only; no physical capture measured", "measured_cells": 0,
+                "manifest_sha256": sha256_file(args.manifest), "camera_evidence": cameras,
+                "verified_client_inputs": pins, "cells": cells}
+        path = args.output / "rt17-plan.json"
+        path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+        print(f"{sum(c['status'] != 'not_ready' for c in cells)}/54 ready to capture; 0 measured; {path}")
+        return
+    report = {"started_utc": datetime.now(timezone.utc).isoformat(), "source_sha": args.source_sha,
               "profile": args.profile, "manifest_sha256": sha256_file(args.manifest),
-              "viewer_sha256": viewer_hash, "client_inputs": pins, "options": {"compact_terrain": args.compact_terrain,
+              "viewer_sha256": viewer_hash, "client_inputs": pins, "camera_evidence": cameras,
+              "camera_evidence_errors": camera_errors, "options": {"compact_terrain": args.compact_terrain,
                                                      "fsr1_easu": args.fsr1_easu, "screen_reuse": args.screen_reuse,
                                                      "progressive": args.progressive or args.screen_reuse != "off"},
               "declared_physical_matrix_complete": complete, "missing_scene_conditions": missing,

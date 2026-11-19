@@ -47,15 +47,21 @@ object masks.
 python3 -m pip install Pillow==11.3.0
 python3 tools/lighter_capture_matrix.py \
   --profile physical --device 'NVIDIA GeForce RTX 3080' --require-complete --timed-frames 30 \
+  --source-sha "$TESTED_COMMIT" \
   --manifest /path/to/verified-cameras.json --input-manifest /path/to/verified-inputs.txt \
   --viewer target/release/perfect-world-explorer --client /path/to/client \
   --output target/lighter-retail-physical
 ```
 
 For the PR #51 acceptance run, use Windows x64 and the specified 10 GB RTX
-3080. `--require-complete` needs explicit reviewed camera evidence, verified
-input pins, actual 480×360 rays, timed draws and a hash-bound census for each
-cell. The Native census is scoped to main-scene submission; it does not count
+3080. `--require-complete` needs a full source SHA, explicit reviewed camera
+evidence (`camera_evidence` points to a nonempty scout file relative to the
+manifest), verified input pins, actual 480×360 rays, timed draws and a
+hash-bound census for each cell. Run `--plan-only --manifest cameras.json
+--output plan-review` first to list every missing declaration, scout file or
+verified input set without starting 54 captures. With `--client` and
+`--input-manifest`, the preflight also verifies the available input pins.
+Planning is not measured completion. The Native census is scoped to main-scene submission; it does not count
 per-subpass or per-pixel visibility. See the [54-cell status](evidence/2026-11-18/09-retail.md).
 
 Add `--hybrid-ab` to the physical run to render a fourth path: the same
