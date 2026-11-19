@@ -352,3 +352,54 @@ still produce exactly the English text they had.
 depends on `world_place_names` could not fail anything locally; CI's "Run viewer
 unit tests" caught it instead. That is the fourth time in this file that a claim
 was checkable and nothing checked it — hence the new `navigation` mode.
+
+## The client source, and what it settles (18 November)
+
+The 1.5.2 client's source is on Drive, under
+`Forsaken World 0.525 Client / ForsakenWorldv260ClientSource / SMElement`.
+`SMCommon/AFilePackage.h`, `AFilePackage.cpp` and `elementpckdir.h` are the
+container's definition, and every offset recorded above from three packs is
+confirmed field for field rather than merely consistent:
+
+```c
+struct SAFEFILEHEADER_0x00020003 { DWORD tag1; UINT64 offset; };
+struct FILEHEADER_0x00020003 {
+    DWORD guardByte0; DWORD dwVersion; UINT64 dwEntryOffset;
+    DWORD dwFlags; char szDescription[252]; DWORD guardByte1; DWORD UNKNOWN;
+};
+struct FILEENTRY_0x00020003 {
+    char szFileName[260]; DWORD Zalupa0; UINT64 dwOffset;
+    DWORD dwLength; DWORD dwCompressedLength; DWORD Zalupa1; int iAccessCnt;
+};
+```
+
+That is a 288-byte record with the 64-bit offset at +264, and a 280-byte header
+with `guardByte1` at +272 and `dwFlags` at **+16** — the three numbers that had
+to be measured out of the files. `AFPCK_GUARDBYTE0/1 = 0xfdfdfeee/0xf00dbeef`
+and `AFPCK_VERSION = 0x00020002` are literals in the source.
+
+### The prefix rule, which was wrong
+
+```c
+if      (tag1 == 0x4DCA23EF && tag2 == 0x56a089b7)      m_bHasSafeHeader = true;
+else if (tag1 == 0x4DCA23EF && tag2 != 0x56a089b7)    { re-read as
+        SAFEFILEHEADER_0x00020003;                        m_bHasSafeHeader = true; }
+else                                                      m_bHasSafeHeader = false;
+```
+
+**`tag1` is the only required word, and the word at +8 is not always a tag.** In
+the second shape the eight bytes after `tag1` are a `UINT64` offset, and the
+reason a tag comparison sees `a83e5e82` in 1.8.4's `configs.pck` is that it is
+the *low half of that offset*. Requiring `0x56a089b7` there is precisely the
+`unsupported PCK safe header` dialog.
+
+This is the same failure as the guard pair, one layer down: a check written
+against the one shape that had been seen, refusing the other. It is the fifth
+instance in this file, and the first where the answer was available in the
+shipped source all along — which is the argument for searching for the source
+before inferring a format from a handful of files.
+
+`elementpckdir.h` also confirms the layout this project already assumed:
+`configs`, `gfx`, `grasses`, `building`, `models`, `litmodels`, `textures` and
+`loddata` are all mounted from `resources\`, so a client's `element` folder is
+its archive root.
