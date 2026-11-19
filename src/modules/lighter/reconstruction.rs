@@ -15,6 +15,49 @@ use wgpu::hal::{api::Vulkan, vulkan::InstanceShared};
 
 type R<T> = Result<T, String>;
 
+// Both optional runtimes use the audited release bytes. Do not load from
+// PATH, a feature DLL in place of the bridge, or an unvalidated SDK path.
+fn verified_binary(path: &std::path::Path, size: u64, sha256: &str) -> R<PathBuf> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let path = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+    if file.metadata().map_err(|e| e.to_string())?.len() != size {
+        return Err(format!(
+            "{}: unexpected SDK binary length (expected {size})",
+            path.display()
+        ));
+    }
+    let mut hash = Sha256::new();
+    let mut chunk = [0; 32 * 1024];
+    loop {
+        let n = file.read(&mut chunk).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&chunk[..n]);
+    }
+    if format!("{:x}", hash.finalize()) != sha256 {
+        return Err(format!(
+            "{}: SDK binary does not match the pinned SHA-256",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn check_adapter(props: &vk::PhysicalDeviceProperties, rr: bool) -> R<()> {
+    if props.device_type == vk::PhysicalDeviceType::CPU {
+        Err("vendor ray reconstruction requires a physical Vulkan GPU".into())
+    } else if rr && props.vendor_id != 0x10de {
+        Err("DLSS RR requires a supported NVIDIA adapter".into())
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) enum Request {
     Fsr(Arc<ffx::Api>),
     Rr(Arc<ngx::Api>),
@@ -77,14 +120,11 @@ impl Request {
         physical: vk::PhysicalDevice,
         props: &vk::PhysicalDeviceProperties,
     ) -> R<Vec<CString>> {
-        if props.device_type == vk::PhysicalDeviceType::CPU && !self.is_probe() {
-            return Err("vendor ray reconstruction requires a physical Vulkan GPU".into());
+        if !self.is_probe() {
+            check_adapter(props, self.is_rr())?;
         }
         match self {
             Self::Rr(api) => {
-                if props.vendor_id != 0x10de {
-                    return Err("DLSS RR requires a supported NVIDIA adapter".into());
-                }
                 let enabled = instance.extensions();
                 let required = api.extensions(vk::Instance::null(), vk::PhysicalDevice::null())?;
                 if required
@@ -325,6 +365,8 @@ struct Commands {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     pending: bool,
+    #[cfg(test)]
+    fail_submit: bool,
 }
 impl Commands {
     fn new(raw: &Raw) -> R<Self> {
@@ -343,6 +385,8 @@ impl Commands {
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             pending: false,
+            #[cfg(test)]
+            fail_submit: false,
         };
         owned.cmd = unsafe {
             owned.device.allocate_command_buffers(
@@ -388,6 +432,12 @@ impl Commands {
             self.device
                 .end_command_buffer(self.cmd)
                 .map_err(vkerr("end"))?;
+            #[cfg(test)]
+            if std::mem::take(&mut self.fail_submit) {
+                return Err(vkerr("submit (injected)")(
+                    vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+                ));
+            }
             self.device
                 .reset_fences(&[self.fence])
                 .map_err(vkerr("reset fence"))?;
@@ -643,8 +693,6 @@ pub(super) struct Session {
     history: temporal::History,
     rejected: Option<[u32; 4]>,
     active: bool,
-    #[cfg(test)]
-    fail_next: bool,
 }
 
 impl Session {
@@ -656,8 +704,6 @@ impl Session {
             history: temporal::History::default(),
             rejected: None,
             active: false,
-            #[cfg(test)]
-            fail_next: false,
         }
     }
     pub(super) fn poll(&mut self) -> R<bool> {
@@ -796,12 +842,6 @@ impl Session {
         queue.submit(Some(
             std::mem::replace(encoder, device.create_command_encoder(&Default::default())).finish(),
         ));
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_next) {
-            let extent = epoch.extent;
-            self.reject(extent, "injected fixture evaluation failure");
-            return Ok(false);
-        }
         match epoch.dispatch(&prepared) {
             Ok(()) => {
                 epoch.input.advance();

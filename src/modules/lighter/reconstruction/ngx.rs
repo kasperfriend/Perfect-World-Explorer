@@ -70,14 +70,20 @@ impl Api {
         let sdk = sdk
             .canonicalize()
             .map_err(|e| format!("{}: {e}", sdk.display()))?;
-        let feature = if cfg!(windows) {
-            "nvngx_dlssd.dll"
+        let (feature, size, sha256) = if cfg!(windows) {
+            (
+                "nvngx_dlssd.dll",
+                48_343_664,
+                "b49435ae346f227feafe7bbe937d88277ea0ee7323975ec06488f377fdb46cee",
+            )
         } else {
-            "libnvidia-ngx-dlssd.so"
+            (
+                "libnvidia-ngx-dlssd.so",
+                48_238_232,
+                "a5d59de18841f15779039dda567a15dd723ba737915f489271fdb5f109fbfb96",
+            )
         };
-        if !sdk.join(feature).is_file() {
-            return Err(format!("{feature} not found in {}", sdk.display()));
-        }
+        super::verified_binary(&sdk.join(feature), size, sha256)?;
         let log = super::super::Settings::path()
             .and_then(|p| p.parent().map(Path::to_path_buf))
             .unwrap_or_else(|| Path::new("cache").to_path_buf())

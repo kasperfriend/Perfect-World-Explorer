@@ -422,9 +422,21 @@ fn lighter_temporal_fsr_masks_and_fallback() {
             .any(|(&r, &m)| f32::from_bits(r) == 0.9 && f32::from_bits(m) == 1.),
         "authored layer must contribute to both FSR masks"
     );
-    h.ray.reconstruction.as_mut().unwrap().fail_next = true;
+    // Even a non-black native write from a stand-in is not vendor evidence.
+    let label = "Vulkan temporal FSR";
+    assert!(require_dispatch(h.ray.reconstruction_status(), label).is_err());
+    h.ray
+        .reconstruction
+        .as_mut()
+        .unwrap()
+        .epoch
+        .as_mut()
+        .unwrap()
+        .commands
+        .fail_submit = true;
     h.pixels_with_camera(f, &moved, Some(c));
     assert!(h.ray.reconstruction_status().is_none());
+    assert!(require_dispatch(h.ray.reconstruction_status(), label).is_err());
     assert!(h.ray.reconstruction.as_ref().unwrap().epoch.is_none());
     let failed = h.pixels_with_camera(f, &moved, Some(c));
     let mut control = Harness::new(mode, false);
@@ -441,6 +453,122 @@ fn lighter_temporal_fsr_masks_and_fallback() {
     h.ray.settings.reference = true;
     h.pixels_with_camera(f, &before, Some(c));
     assert!(h.ray.reconstruction_status().is_none());
+}
+
+fn require_dispatch(active: Option<&str>, requested: &str) -> R<()> {
+    if active == Some(requested) {
+        Ok(())
+    } else {
+        Err(format!(
+            "SDK must not silently fall back: requested {requested}, active {active:?}"
+        ))
+    }
+}
+
+fn check_sdk_radiance(
+    extent: [u32; 4],
+    pixels: &[u32],
+    mask: &[u32],
+    depth: &[u32],
+) -> R<(usize, usize)> {
+    let [rw, rh, w, h] = extent.map(|n| n as usize);
+    let mut checked = 0;
+    let mut nonzero = 0;
+    if w == 0
+        || h == 0
+        || rw == 0
+        || rh == 0
+        || pixels.len() != w * h * 2
+        || mask.len() != rw * rh
+        || depth.len() != rw * rh
+    {
+        return Err("SDK readback extent mismatch".into());
+    }
+    for (i, p) in pixels.chunks_exact(2).enumerate() {
+        let at = (i / w * rh / h) * rw + i % w * rw / w;
+        if f32::from_bits(mask[at]) >= 1. || f32::from_bits(depth[at]) <= 0. {
+            continue;
+        }
+        let rgb = [p[0] & 0xffff, p[0] >> 16, p[1] & 0xffff];
+        if rgb.iter().any(|v| v & 0x7c00 == 0x7c00) {
+            return Err("nonfinite SDK radiance".into());
+        }
+        checked += 1;
+        nonzero += usize::from(rgb.iter().any(|v| (1..0x7c00).contains(v)));
+    }
+    if checked <= 100 || nonzero <= 100 {
+        return Err("missing SDK output on supported opaque pixels".into());
+    }
+    Ok((nonzero, checked))
+}
+
+#[test]
+fn sdk_missing_dll_and_same_length_bad_hash_fail_before_loading() {
+    let root = std::env::temp_dir().join(format!("pwe-ffx-cbk-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("amd_fidelityfx_upscaler_vk.dll");
+    let _ = std::fs::remove_file(&path);
+    let missing = ffx::verified_dll(&path).unwrap_err();
+    assert!(missing.contains("amd_fidelityfx_upscaler_vk.dll"));
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(36_135_696)
+        .unwrap();
+    let invalid = ffx::verified_dll(&path).unwrap_err();
+    assert!(invalid.contains("pinned SHA-256"), "{invalid}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn sdk_unsupported_adapter_and_fallback_are_not_dispatch() {
+    let cpu = vk::PhysicalDeviceProperties {
+        device_type: vk::PhysicalDeviceType::CPU,
+        ..Default::default()
+    };
+    assert!(check_adapter(&cpu, false)
+        .unwrap_err()
+        .contains("physical Vulkan GPU"));
+    assert!(check_adapter(&cpu, true).is_err());
+    let amd = vk::PhysicalDeviceProperties {
+        device_type: vk::PhysicalDeviceType::DISCRETE_GPU,
+        vendor_id: 0x1002,
+        ..Default::default()
+    };
+    assert!(check_adapter(&amd, true).unwrap_err().contains("NVIDIA"));
+    assert!(require_dispatch(None, "Vulkan temporal FSR").is_err());
+    assert!(require_dispatch(
+        Some("Vulkan reconstruction interop fixture"),
+        "Vulkan temporal FSR"
+    )
+    .is_err());
+}
+
+#[test]
+fn sdk_smoke_rejects_black_and_nonfinite_raw_output() {
+    let mask = [0; 256];
+    let depth = [0.5f32.to_bits(); 256];
+    let extent = [16; 4];
+    let mut img = vec![0; 512];
+    assert!(check_sdk_radiance(extent, &img, &mask, &depth)
+        .unwrap_err()
+        .contains("missing SDK output"));
+    img[0] = 0x7c00;
+    assert!(check_sdk_radiance(extent, &img, &mask, &depth)
+        .unwrap_err()
+        .contains("nonfinite"));
+}
+
+#[test]
+#[ignore = "requires a Vulkan ICD; deliberately rejects before vendor or shader work"]
+fn lighter_temporal_rejected_extent_is_not_dispatch() {
+    let mut h = make(Mode::Software, false, false);
+    let w = h.device.limits().max_texture_dimension_2d + 1;
+    let s = h.ray.reconstruction.as_mut().unwrap();
+    let extent = [1, 1, w, 1];
+    assert!(s.prepare(&h.device, extent, h.ray.settings).unwrap());
+    assert_eq!(s.rejected, Some(extent));
+    assert!(s.epoch.is_none());
+    assert!(require_dispatch(h.ray.reconstruction_status(), "Vulkan temporal FSR").is_err());
 }
 
 // Opt-in acceptance, never the CPU mock. A missing SDK, device, incompatible
@@ -482,11 +610,7 @@ fn lighter_temporal_vendor_dispatch() {
             let (frame, lens) = camera(Vec3::X * (i as f32 * 0.013), side);
             let packet = if i < 6 { &p0 } else { &p1 };
             h.pixels_with_camera(frame, packet, Some(lens));
-            assert_eq!(
-                h.ray.reconstruction_status(),
-                Some(label),
-                "SDK must not silently fall back"
-            );
+            require_dispatch(h.ray.reconstruction_status(), label).unwrap();
             assert_eq!(epoch(&h).last_reset, i == 0, "cut vs continuous pan");
         }
         let e = epoch(&h);
@@ -496,25 +620,7 @@ fn lighter_temporal_vendor_dispatch() {
         let pixels = read(&h, &e.output, 8);
         let mask = read(&h, &e.input.mask, 4);
         let depth = read(&h, &e.input.depth, 4);
-        let mut checked = 0;
-        let mut nonzero = 0;
-        for (i, p) in pixels.chunks_exact(2).enumerate() {
-            let at = (i / side as usize / 2) * (side as usize / 2) + i % side as usize / 2;
-            if f32::from_bits(mask[at]) >= 1. || f32::from_bits(depth[at]) <= 0. {
-                continue;
-            }
-            let rgb = [p[0] & 0xffff, p[0] >> 16, p[1] & 0xffff];
-            assert!(
-                rgb.iter().all(|v| v & 0x7c00 != 0x7c00),
-                "nonfinite SDK radiance"
-            );
-            checked += 1;
-            nonzero += usize::from(rgb.iter().any(|v| (1..0x7c00).contains(v)));
-        }
-        assert!(
-            checked > 100 && nonzero > 100,
-            "missing SDK output on supported opaque pixels"
-        );
+        let (nonzero, checked) = check_sdk_radiance(e.extent, &pixels, &mask, &depth).unwrap();
         eprintln!("{label} vendor smoke {side}²: {nonzero}/{checked} opaque pixels have positive SDK radiance");
     }
 }

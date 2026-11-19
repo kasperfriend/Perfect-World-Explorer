@@ -271,7 +271,7 @@ jobs:
           # Run the cold variants in separate processes so their JIT memory
           # does not stack. Leave lavapipe's SIMD/thread choice at the runner
           # default; forcing a narrow vector width can crash CPU ray queries.
-          for suite in lighter_software_pixels lighter_streamed_world_pixels lighter_paced_residency_software lighter_paced_residency_interop lighter_vulkan_interop_on_cpu lighter_raster_primary_parity lighter_compact_terrain_pixels lighter_compact_terrain_interop lighter_bc_texture_pages_interop lighter_screen_reuse_pixels lighter_screen_reuse_interop lighter_temporal_software_vulkan lighter_temporal_fsr_masks_and_fallback; do
+          for suite in lighter_software_pixels lighter_streamed_world_pixels lighter_paced_residency_software lighter_paced_residency_interop lighter_vulkan_interop_on_cpu lighter_raster_primary_parity lighter_compact_terrain_pixels lighter_compact_terrain_interop lighter_bc_texture_pages_interop lighter_screen_reuse_pixels lighter_screen_reuse_interop lighter_temporal_software_vulkan lighter_temporal_fsr_masks_and_fallback lighter_temporal_rejected_extent_is_not_dispatch; do
             status=0
             (set -o pipefail; cargo test --locked --bin perfect-world-explorer "$suite" -- --ignored --nocapture \
               2>&1 | tee /tmp/lighter-pixels.log) || status=$?
@@ -496,6 +496,32 @@ jobs:
             if (-not $entry) { throw "MSVC environment did not define $name" }
             Add-Content -LiteralPath $env:GITHUB_ENV -Value $entry -Encoding utf8
           }
+      - name: Link the optional Vulkan RR bridge with pinned MSVC inputs
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'pwe-rr-build-check'
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          $ngxCommit = '9981c6350dc58c0ce21f024fd65e31e851c31689' # DLSS v310.9.16
+          $loader = Join-Path $dir 'nvsdk_ngx_s.lib'
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/NVIDIA/DLSS/$ngxCommit/lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" -OutFile $loader
+          $vkCommit = '29f979ee5aa58b7b005f805ea8df7a855c39ff37' # Vulkan-Headers v1.3.296
+          $archive = Join-Path $dir 'headers.zip'
+          Invoke-WebRequest -Uri "https://codeload.github.com/KhronosGroup/Vulkan-Headers/zip/$vkCommit" -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne '7bc8879373538d3326dabe2df32cb89f94cea5b5d3988134031aea14be000454') { throw 'Vulkan headers SHA-256 mismatch' }
+          Expand-Archive -LiteralPath $archive -DestinationPath $dir
+          $headers = Join-Path $dir "Vulkan-Headers-$vkCommit/include"
+          cmake -S tools/ray-reconstruction -B "$dir/build" -A x64 "-DNGX_LOADER=$loader" "-DVULKAN_HEADERS=$headers"
+          if ($LASTEXITCODE -ne 0) { throw 'RR bridge configure failed' }
+          cmake --build "$dir/build" --config Release
+          if ($LASTEXITCODE -ne 0) { throw 'RR bridge link failed' }
+          $dll = Join-Path $dir 'build/Release/pwe_ray_rr.dll'
+          $exports = & dumpbin /exports $dll | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'RR bridge export inspection failed' }
+          foreach ($export in @('api_version', 'extensions', 'open', 'record', 'close')) {
+            if ($exports -notmatch "\bpwe_rr_$export\b") { throw "Missing bridge export $export" }
+          }
+          Write-Host 'Linked the x64 RR bridge; exports checked. No vendor DLL/drawing test on hosted CI.'
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW32

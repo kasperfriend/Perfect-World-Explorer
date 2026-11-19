@@ -94,38 +94,25 @@ pub(super) struct Api {
     _lib: libloading::Library,
 }
 
+#[cfg(any(windows, test))]
+pub(super) fn verified_dll(path: &Path) -> R<std::path::PathBuf> {
+    super::verified_binary(
+        path,
+        36_135_696,
+        "4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7",
+    )
+}
+
 impl Api {
     #[cfg(windows)]
     pub(super) fn load(path: &Path) -> R<Self> {
         use libloading::os::windows::{
             Library, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
         };
-        use sha2::{Digest, Sha256};
-        use std::io::Read;
         if std::mem::size_of::<usize>() != 8 {
             return Err("FSR Vulkan needs a 64-bit process".into());
         }
-        let path = path
-            .canonicalize()
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
-        if file.metadata().map_err(|e| e.to_string())?.len() != 36_135_696 {
-            return Err("expected the signed FidelityFX SDK v2.4.0 Vulkan upscaler DLL".into());
-        }
-        let mut hash = Sha256::new();
-        let mut chunk = [0; 32 * 1024];
-        loop {
-            let n = file.read(&mut chunk).map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
-            }
-            hash.update(&chunk[..n]);
-        }
-        if format!("{:x}", hash.finalize())
-            != "4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7"
-        {
-            return Err("Vulkan upscaler DLL does not match the pinned v2.4.0 SHA-256".into());
-        }
+        let path = verified_dll(path)?;
         // SAFETY: known, explicitly provided SDK binary with the pinned ABI.
         unsafe {
             let lib: libloading::Library = Library::load_with_flags(
