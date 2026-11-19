@@ -168,6 +168,9 @@ screenshots and the physical GPU comparison are still needed.
 
 ## Transport, hybrid visibility and noise follow-up
 
+Historical scope and results for `cce1289`; see the continuation below for
+newer changes.
+
 Native is still the first renderer at launch. **Reload World** also stages
 changes to the experimental raster-primary pipeline, so its initial compile is
 in the watched replacement, not the working window. Software keeps full
@@ -257,3 +260,83 @@ linear RGB channel; they also checked unchanged primary depth. The stationary
 sun fixture verifies cache bits survive filtering, a displaced shadow does
 not reuse old history, unaffected pixels keep history, and colored glass
 still traces RGB transmittance.
+
+
+## Streaming, water and optional reconstruction continuation
+
+- **Loader:** the single-flight world loader now assembles the matching ray
+  packet, acceleration-cache update and terrain mask suffix off the render
+  thread. The draw thread keeps the old snapshot through the paced Native
+  terrain upload, then installs the matching Native/ray pair before choosing
+  the next draw route. Failed mask admission clears the ray scene and is
+  carried through LOD-only updates; those updates cannot read an old mask
+  table with a new mesh. Initial setup still prepares the first packet in
+  the watched startup. GPU upload submission, per-frame moving data and
+  raw Vulkan AS recording remain on the draw path.
+- **One-sample water:** the first water interface restores its deterministic
+  two-leg split at 1 spp. Higher-sample water, other dielectrics and roulette
+  retain Single-path's bounded behavior. This is a variance/quality choice,
+  not a Hybrid-primary change or a claim of faster water. The 1-spp optical
+  regression checks that both Fresnel legs contribute and that default and
+  split transport agree in the control scene.
+- **Optional EASU:** `PW_PREVIEW_FSR1_EASU=1` or **FSR 1 spatial upscale
+  (EASU)** in Lighter uses the existing spatial kernel directly on the
+  filtered ray buffer, with no intermediate scaled image. The tests check
+  changed sub-native color, identical reverse-Z, and an exact 1:1 bypass.
+  Use the default guide resolve if EASU's color filtering across an edge
+  is objectionable. This is not a temporal SDK integration.
+
+### Opt-in memory and sample reuse experiments
+
+| Launch setting | Implementation | Limits |
+|---|---|---|
+| `PW_RAY_COMPACT_TERRAIN=1` | Keep eligible authored BC1/2/3 terrain-color mips in the texel buffer. Decode the RGB palette at filter taps with the same integer arithmetic as the expanded control. | Added decode work may outweigh upload/VRAM savings. Generated, tiny or unprofitable chains stay expanded. Same admission ceiling. Not a native BC texture-unit path, nor compression for ray models, cutouts or linear data. |
+| `PW_RAY_SCREEN_REUSE=di` | At eligible primary receivers with >4 local lights, merge the fresh one-light reservoir with fresh-only reservoirs from the prior pixel and one prior cardinal neighbor. Re-evaluate the picked sample at the receiver, with support-aware MIS across the source receivers; trace current visibility once. | Requires Single-path, progressive 1 spp, lighting/shadows and a stationary compatible snapshot. Not iterative ReSTIR: no propagation of a merged reservoir, no shadow reuse and no skipped fresh light search. |
+| `PW_RAY_SCREEN_REUSE=gi` | At the first **terminal** diffuse hit, project the traced hit to the prior ray image. Try its stored primary direct radiance (plus current terminal ambient), before current media and decals. | Approximate and limited to one bounce, legacy diffuse opaque static surfaces, compatible depth/normal/albedo and the same triangle/instance. Excludes motion and incompatible animations. Off-screen/mismatched hits shade normally. Not a replacement for tracing indirect visibility, and may blur lighting at shadow boundaries. |
+| `PW_RAY_SCREEN_REUSE=both` | Shares the same two previous/current cache pages for DI and GI. | Same individual admission gates. Each ray needs 196 B in the trace allocation instead of 28 B: six extra 28 B records per ray. The feature falls back when it cannot fit the existing trace-image reservation; it doesn't lower resolution or relax the cap. |
+
+Both experiments leave the stock pipelines/defaults unchanged and are
+selected when launching the viewer (then use **Reload World** for rays).
+Current color/depth composition still reads the image plane only. Normal
+preview captures continue to freeze animation and disable accumulation;
+screen reuse explicitly enables progressive history. Use `--progressive`
+without reuse for the matching control.
+
+On the odd-sized terrain fixture with a leading authored mip discarded,
+BC1 used **172 B vs 784 B** per tile; BC2/3 used **308 B vs 784 B**. At three
+texture scales both tracers held RGB8 within one level and reverse-Z
+bit-exact. This proves the sampled fixtures and logical storage bytes, not
+physical GPU memory or performance. BC5/BC7 DDS sources can now use the
+decoded ray path and the Native model texture uploader's corresponding BC
+formats on capable devices. BMD BC5 normal maps reconstruct tangent Z from
+filtered RG. Ray BC5/7 are still expanded, not compressed or bound as arrays.
+Model DDS does not accept arrays, cubes, signed BC5 or premultiplied alpha.
+DXGI sRGB entries preserve encoded channel values for the material pipeline;
+the sampler does not apply an implicit second transfer function.
+
+The [capture matrix](retail-matrix.md) records the compressed-tile counts and
+byte savings, screen-reuse admission flags, and the EASU setting. It rejects
+mismatched ray controls. A physical A/B is still required before enabling
+any of these changes by default (other than the one-sample water guard).
+
+### Still open
+
+- Pace wgpu/Vulkan **GPU** scene uploads/AS submission independently of
+  render-thread work; measure map-travel tails and a complete viewer VRAM
+  budget, not just ray allocations. Compare the compact BC experiment with
+  actual native BC1/3/5/7 sampling/paging on eligible GPUs.
+- Measure DI variance and GI bias, cache hit rate and frame-time trade-offs
+  on moving and stationary real scenes. The experimental caches don't
+  certify temporal stability or a production noise/performance win.
+- Integrate and validate temporal FSR and DLSS Ray Reconstruction. The
+  installed FidelityFX SDK binaries are DX12. NVIDIA's upstream
+  [DLSS v310.9.16 SDK](https://github.com/NVIDIA/DLSS/tree/v310.9.16/lib)
+  has Windows x86-64 and Linux x86-64 RR runtime binaries; Explorer's package
+  does **not** ship them or a Vulkan NGX RR integration. Adding a DLL is not
+  enough: adapter/device extension negotiation, coherent material/depth and
+  ray-world motion, correct texture layouts/queue ownership, SDK and driver
+  gating, and physical output/fallback tests are required.
+- Keep Hybrid off until a repeatable raster-inclusive improvement is shown.
+  [RT-17](retail-matrix.md) remains open: complete real-map image review,
+  matched physical GPU modes and normal-present distributions/whole-viewer
+  memory cannot be inferred from fixture or CPU Vulkan evidence.

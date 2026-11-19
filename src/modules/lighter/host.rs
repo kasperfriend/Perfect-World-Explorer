@@ -29,29 +29,20 @@ mod weather;
 pub(super) use scenery::{SceneryStream, Snapshot as ScenerySnapshot};
 use vegetation::{read_tree, Tree};
 
+/// Immutable CPU sources shared by the render feed and the stream packer.
+/// Moving a packer to the worker never copies a decoded texel bank or mesh.
 #[derive(Default)]
-pub(super) struct Feed {
-    // Textures that survive every streaming update. Terrain masks/tiles and
-    // dynamic archive textures are appended to a fresh, bounded bank per
-    // streamed scene; eviction doesn't leave stale material addresses.
+struct FeedSource {
     base: Textures,
     terrain_ids: Vec<u32>,
     lightmaps: Vec<[u32; 2]>,
     static_lights: Vec<Light>,
     light_cycle: Option<crate::environment::LightCycle>,
-    mask_bank: Option<Textures>,
     terrain: [f32; 4],
-    area_table: u32,
-    near_bounds: [f32; 4],
-    cutoff: bool,
     far: Vec<(crate::terrain_residency::Span, Mesh)>,
-    accel: AccelCache,
     trees: Vec<Option<Tree>>,
     tree_archive_missing: bool,
     placements: Vec<crate::scene::Tree>,
-    forest: Vec<(usize, [f32; 3])>,
-    tree_scale: f32,
-    grass: vegetation::Grass,
     waves: Vec<u32>,
     water: water_feed::Water,
     weather: weather::Weather,
@@ -59,8 +50,48 @@ pub(super) struct Feed {
     authored_mips: bool,
 }
 
-impl Feed {
-    pub(super) fn new(
+#[derive(Default)]
+struct ResidentScene {
+    area_table: u32,
+    near_bounds: [f32; 4],
+    cutoff: bool,
+    forest: Vec<(usize, [f32; 3])>,
+    tree_scale: f32,
+    grass: vegetation::Grass,
+}
+
+struct MaskBank {
+    bank: Textures,
+    area_table: u32,
+}
+
+/// Ownership of this cache transfers to the existing world-streaming loader
+/// after the first (monitored) frame. A stream result carries Native data and
+/// this matching ray snapshot together. The draw thread never waits for it.
+pub(super) struct StreamPacker {
+    source: Arc<FeedSource>,
+    // Remember the actual mask failure across a LOD-only update. Reusing the
+    // last good table with the new geometry would silently read wrong layers.
+    masks: Option<Result<MaskBank, String>>,
+    accel: AccelCache,
+}
+
+pub(super) struct PreparedScene {
+    packet: Packet,
+    bank: Textures,
+    inventory: Inventory,
+    coverage: scenery::Coverage,
+    resident: ResidentScene,
+}
+
+pub(super) struct Feed {
+    source: Arc<FeedSource>,
+    resident: ResidentScene,
+    packer: Option<StreamPacker>,
+}
+
+impl FeedSource {
+    fn new(
         t: &mut Terrain,
         m: &MeshData,
         authored_mips: bool,
@@ -106,7 +137,14 @@ impl Feed {
             }) <= terrain_bytes
         })
         .ok_or("Lighter terrain colours exceed their texture budget")?;
+        let compact = lighter::textures::compact_terrain_enabled();
         for texture in &upload.materials.textures {
+            if compact {
+                if let Some(tile) = Tile::compact_terrain(&texture.source, terrain_limit)? {
+                    result.terrain_ids.push(result.base.insert(&tile)?);
+                    continue;
+                }
+            }
             let decoded = texture.decode()?;
             result.terrain_ids.push(
                 result.base.insert(&Tile::levels(
@@ -212,8 +250,7 @@ impl Feed {
         Ok(result)
     }
 
-    fn terrain_masks(&mut self, material: &Materials) -> Result<(), String> {
-        self.mask_bank = None;
+    fn terrain_masks(&self, material: &Materials) -> Result<MaskBank, String> {
         let mut textures = self.base.fork_prefix();
         // Plan before inflating any masks, and leave room for the streamed
         // suffix. On unusually dense maps reduce mask resolution uniformly.
@@ -267,28 +304,62 @@ impl Feed {
                 );
             }
         }
-        self.area_table = table as u32;
         textures.seal();
-        self.mask_bank = Some(textures);
-        Ok(())
+        Ok(MaskBank {
+            bank: textures,
+            area_table: table as u32,
+        })
+    }
+}
+
+impl Feed {
+    pub(super) fn new(
+        t: &mut Terrain,
+        m: &MeshData,
+        authored_mips: bool,
+        storage: usize,
+    ) -> Result<Self, String> {
+        let source = Arc::new(FeedSource::new(t, m, authored_mips, storage)?);
+        Ok(Self {
+            packer: Some(StreamPacker::new(Arc::clone(&source))),
+            resident: ResidentScene::default(),
+            source,
+        })
     }
 
-    pub(super) fn install(&mut self, ray: &mut Lighter, m: &MeshData, device: &wgpu::Device) {
-        if m.terrain_upload.is_none() && self.mask_bank.is_none() {
-            // A failed mask upload already invalidated the scene. Keep its
-            // diagnostic until new material data arrives; don't retry it with
-            // superseded textures or replace the cause with a generic error.
-            return;
-        }
-        let result = self.snapshot_for(m, lighter::storage_limit(device), ray.settings.mode);
-        ray.scenery_coverage = result
-            .as_ref()
-            .ok()
-            .map(|(_, _, _, scenery)| scenery.to_string());
-        let packet = result.map(|(packet, bank, coverage, _)| {
-            ray.static_coverage = coverage;
-            (packet, bank)
+    pub(super) fn install_initial(
+        &mut self,
+        ray: &mut Lighter,
+        m: &MeshData,
+        device: &wgpu::Device,
+    ) {
+        let result = self.packer.as_mut().expect("initial ray packer").prepare(
+            m,
+            lighter::storage_limit(device),
+            ray.settings.mode,
+        );
+        self.install_prepared(ray, result);
+    }
+
+    pub(super) fn take_packer(&mut self) -> Option<StreamPacker> {
+        self.packer.take()
+    }
+
+    pub(super) fn install_prepared(
+        &mut self,
+        ray: &mut Lighter,
+        scene: Result<PreparedScene, String>,
+    ) {
+        let packet = scene.map(|scene| {
+            self.resident = scene.resident;
+            ray.static_coverage = scene.inventory;
+            ray.scenery_coverage = Some(scene.coverage.to_string());
+            (scene.packet, scene.bank)
         });
+        if packet.is_err() {
+            ray.static_coverage = Inventory::default();
+            ray.scenery_coverage = None;
+        }
         ray.install(packet);
     }
 
@@ -298,28 +369,55 @@ impl Feed {
         m: &MeshData,
         storage: usize,
     ) -> Result<(Packet, Textures, Inventory, scenery::Coverage), String> {
-        self.snapshot_for(m, storage, lighter::Mode::Software)
+        let scene = self
+            .packer
+            .as_mut()
+            .unwrap()
+            .prepare(m, storage, lighter::Mode::Software)?;
+        self.resident = scene.resident;
+        Ok((scene.packet, scene.bank, scene.inventory, scene.coverage))
+    }
+}
+
+impl StreamPacker {
+    fn new(source: Arc<FeedSource>) -> Self {
+        Self {
+            source,
+            masks: None,
+            accel: AccelCache::default(),
+        }
     }
 
-    fn snapshot_for(
+    fn update_masks(&mut self, materials: &Materials) {
+        // Release the previous mask suffix before inflating the new one. Its
+        // Arcs are still held by any scene the renderer is drawing.
+        self.masks = None;
+        self.masks = Some(self.source.terrain_masks(materials));
+    }
+
+    pub(super) fn prepare(
         &mut self,
         m: &MeshData,
         storage: usize,
         mode: lighter::Mode,
-    ) -> Result<(Packet, Textures, Inventory, scenery::Coverage), String> {
+    ) -> Result<PreparedScene, String> {
+        let started = std::time::Instant::now();
         if let Some(upload) = &m.terrain_upload {
-            self.terrain_masks(&upload.materials)?;
+            self.update_masks(&upload.materials);
         }
-        let mut bank = self
-            .mask_bank
+        let source = &self.source;
+        let masks = self
+            .masks
             .as_ref()
             .ok_or("Lighter has no terrain materials")?
-            .fork_prefix();
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let mut bank = masks.bank.fork_prefix();
         // The far grid's stride divides the resident block size. Omit its
         // covered triangles before building either acceleration structure. A
         // rejected far hit plus t bias could otherwise skip coplanar near
         // terrain at the same distance and leave holes in flat ground.
-        self.near_bounds = crate::terrain_cutoff::world_bounds(
+        let near_bounds = crate::terrain_cutoff::world_bounds(
             [
                 m.lod.window.x0,
                 m.lod.window.y0,
@@ -327,15 +425,20 @@ impl Feed {
                 m.lod.window.y1,
             ],
             super::TILE,
-            self.terrain[0] as usize,
-            self.terrain[1] as usize,
-            self.terrain[2],
+            source.terrain[0] as usize,
+            source.terrain[1] as usize,
+            source.terrain[2],
         );
         let mut builder = Builder::for_mode(mode);
-        for &light in &self.static_lights {
+        for &light in &source.static_lights {
             builder.light(light);
         }
-        self.cutoff = m.detail.terrain_cutoff;
+        let mut resident = ResidentScene {
+            near_bounds,
+            cutoff: m.detail.terrain_cutoff,
+            area_table: masks.area_table,
+            ..ResidentScene::default()
+        };
         let mut inventory = Inventory::default();
         let terrain_id = builder.surface(Surface::new(0, TERRAIN, 0., 0.));
         for block in &m.spans {
@@ -355,24 +458,24 @@ impl Feed {
         }
         let far = &mut inventory[Class::FarTerrain];
         if m.detail.terrain_cutoff {
-            far.cutoff = self.far.len();
+            far.cutoff = source.far.len();
             crate::diag!(
                 TimingLoad,
                 "Lighter terrain cutoff: {} resident blocks; {} far patches intentionally omitted",
                 m.spans.len(),
-                self.far.len()
+                source.far.len()
             );
         } else {
             let edges = near_edges(
-                self.near_bounds,
+                near_bounds,
                 m.indices[..m.terrain_end as usize].iter().map(|&i| {
                     let v = &m.vertices[i as usize];
                     Vertex::new(v.pos, v.normal, v.uv)
                 }),
             );
-            let [x0, x1, z0, z1] = self.near_bounds;
+            let [x0, x1, z0, z1] = near_bounds;
             debug_assert_eq!(terrain_id, 0);
-            for (block, patch) in &self.far {
+            for (block, patch) in &source.far {
                 let [lo_x, _, lo_z, hi_x, _, hi_z] = block.bounds;
                 let (x, y) = block.block;
                 let key = ChunkKey::FarTerrain(x, y);
@@ -386,7 +489,7 @@ impl Feed {
                 } else if lo_x >= x0 && hi_x <= x1 && lo_z >= z0 && hi_z <= z1 {
                     far.replaced += 1;
                 } else {
-                    let exterior = stitch_patch(patch, &edges, self.near_bounds, terrain_id);
+                    let exterior = stitch_patch(patch, &edges, near_bounds, terrain_id);
                     builder.chunk(key, &exterior)?;
                     if exterior.triangles.is_empty() {
                         far.replaced += 1;
@@ -396,15 +499,15 @@ impl Feed {
                 }
             }
         }
-        self.water.append(m, &mut builder)?;
-        self.weather.clouds(&mut builder)?;
+        source.water.append(m, &mut builder)?;
+        source.weather.clouds(&mut builder)?;
         inventory[Class::Water] = m.water_coverage;
         let extras = &m.indices[m.terrain_end as usize..m.water_start as usize];
         if !extras.is_empty() {
             let id = builder.surface(Surface::new(0, 0, 0., 0.));
             builder.world_mesh(&span(&m.vertices, extras, id, |v| rgba(v.color))?)?;
         }
-        self.vegetation(m, &mut bank, &mut inventory)?;
+        source.vegetation(m, &mut bank, &mut inventory, &mut resident)?;
         let scenery = m
             .ray_scenery
             .as_ref()
@@ -422,17 +525,33 @@ impl Feed {
                 storage >> 20
             ));
         }
-        Ok((packet, bank, inventory, coverage))
+        crate::diag!(
+            TimingLoad,
+            "Lighter packed {:.2} MiB geometry and {:.2} MiB texels in {:.2} ms ({})",
+            packet.bytes().len() as f64 / 1048576.,
+            bank.byte_len() as f64 / 1048576.,
+            started.elapsed().as_secs_f64() * 1000.,
+            std::thread::current().name().unwrap_or("startup")
+        );
+        Ok(PreparedScene {
+            packet,
+            bank,
+            inventory,
+            coverage,
+            resident,
+        })
     }
+}
 
+impl FeedSource {
     fn vegetation(
-        &mut self,
+        &self,
         m: &MeshData,
         textures: &mut Textures,
         inventory: &mut Inventory,
+        resident: &mut ResidentScene,
     ) -> Result<(), String> {
-        self.forest.clear();
-        self.tree_scale = m.detail.tree_lod_scale
+        resident.tree_scale = m.detail.tree_lod_scale
             * crate::scenery_visibility::lod_scale(
                 m.detail.scenery_quality,
                 crate::scenery_visibility::Class::Trees,
@@ -441,7 +560,7 @@ impl Feed {
         if super::skip_trees_test() || super::ui_test() {
             trees.disabled = self.placements.len();
         } else {
-            let cutoff = m.detail.terrain_cutoff.then_some(self.near_bounds);
+            let cutoff = m.detail.terrain_cutoff.then_some(resident.near_bounds);
             for placement in &self.placements {
                 if !placement.position.iter().all(|x| x.is_finite()) {
                     trees.invalid += 1;
@@ -453,14 +572,14 @@ impl Feed {
                 }
                 let id = placement.tree_type as usize;
                 match self.trees.get(id) {
-                    Some(Some(_)) => self.forest.push((id, placement.position)),
+                    Some(Some(_)) => resident.forest.push((id, placement.position)),
                     Some(None) if self.tree_archive_missing => trees.package += 1,
                     Some(None) => trees.unavailable += 1,
                     None => trees.invalid += 1,
                 }
             }
         }
-        self.grass = vegetation::Grass::prepare(
+        resident.grass = vegetation::Grass::prepare(
             m,
             textures,
             self.authored_mips,
@@ -468,7 +587,9 @@ impl Feed {
         )?;
         Ok(())
     }
+}
 
+impl Feed {
     pub(super) fn frame(
         &self,
         matrix: Mat4,
@@ -494,7 +615,7 @@ impl Feed {
         let [ambient, diffuse, sky_tint] =
             if let Some(l) = camera.regional_light.filter(|_| regional_lighting) {
                 [l.ambient.map(srgb), l.diffuse.map(srgb), f.sky_tint]
-            } else if let Some(cycle) = self.light_cycle {
+            } else if let Some(cycle) = self.source.light_cycle {
                 let (a, d) = cycle.colors(hour);
                 [
                     a.map(srgb),
@@ -506,22 +627,22 @@ impl Feed {
             };
         let phase = crate::water_gpu::normal_phase(f.elapsed64);
         let wave_angle = crate::water_gpu::normal_offset_angle(f.elapsed64).to_bits();
-        let waves = if self.waves.is_empty() {
+        let waves = if self.source.waves.is_empty() {
             [
                 0,
                 0,
                 0,
-                if self.water.simple_frame(f.elapsed64) != 0 {
+                if self.source.water.simple_frame(f.elapsed64) != 0 {
                     wave_angle
                 } else {
                     0
                 },
             ]
         } else {
-            let frame = phase.floor() as usize % self.waves.len();
+            let frame = phase.floor() as usize % self.source.waves.len();
             [
-                self.waves[frame],
-                self.waves[(frame + 1) % self.waves.len()],
+                self.source.waves[frame],
+                self.source.waves[(frame + 1) % self.source.waves.len()],
                 phase.fract().to_bits(),
                 wave_angle,
             ]
@@ -536,9 +657,9 @@ impl Feed {
         // Lighter evaluates both media along the ray. The Native camera
         // fog switch (and its nearest-window-edge cap) changes all pixels
         // at once; never use it as the air coefficients of a ray path.
-        let cutoff = self.cutoff.then_some(self.near_bounds);
-        let current_body = self.water.at(camera.pos, cutoff);
-        let [water_table, body_count] = self.water.table();
+        let cutoff = self.resident.cutoff.then_some(self.resident.near_bounds);
+        let current_body = self.source.water.at(camera.pos, cutoff);
+        let [water_table, body_count] = self.source.water.table();
         lighter::Frame {
             vp: matrix.to_cols_array_2d(),
             inv_vp: matrix.inverse().to_cols_array_2d(),
@@ -559,7 +680,7 @@ impl Feed {
             water_color: Vec3::from_array(water.color.map(srgb))
                 .extend(0.)
                 .to_array(),
-            terrain: self.terrain,
+            terrain: self.source.terrain,
             extent: [0, 0, w, h],
             options: [
                 if camera.water_reflections {
@@ -589,12 +710,12 @@ impl Feed {
                 },
                 0,
                 0,
-                self.area_table,
+                self.resident.area_table,
             ],
             waves,
-            sky0: self.sky.layers(f.sky_sets.0, f.sky_sets.2.to_bits()),
-            sky1: self.sky.layers(f.sky_sets.1, 0),
-            sky_cdf: self.sky.distributions(f.sky_sets.0, f.sky_sets.1),
+            sky0: self.source.sky.layers(f.sky_sets.0, f.sky_sets.2.to_bits()),
+            sky1: self.source.sky.layers(f.sky_sets.1, 0),
+            sky_cdf: self.source.sky.distributions(f.sky_sets.0, f.sky_sets.1),
             sky_tint: Vec3::from_array(sky_tint).extend(0.).to_array(),
             sky_uv: [
                 f.sky_drift[0],
@@ -612,10 +733,10 @@ impl Feed {
                 0.,
             ],
             grass_history: f.grass_history,
-            shore_offsets: self.water.shore_offsets(f.elapsed),
+            shore_offsets: self.source.water.shore_offsets(f.elapsed),
             resident_bounds: cutoff.unwrap_or([-1.0e9, 1.0e9, -1.0e9, 1.0e9]),
             water_effects: [
-                self.water.simple_frame(f.elapsed64),
+                self.source.water.simple_frame(f.elapsed64),
                 current_body,
                 water_table,
                 body_count,
@@ -893,15 +1014,15 @@ fn moving(
     modules.ray_inputs(matrix, &mut out)?;
     let mut budget = out.builder.optional_mesh_budget(storage);
     vegetation::forest(
-        &feed.trees,
-        &feed.forest,
-        feed.tree_scale,
+        &feed.source.trees,
+        &feed.resident.forest,
+        feed.resident.tree_scale,
         frame,
         &mut out.builder,
         &mut out.coverage[Class::Trees],
         &mut budget,
     )?;
-    feed.grass.append(
+    feed.resident.grass.append(
         frame,
         &mut out.builder,
         &mut out.coverage[Class::Grass],
@@ -909,8 +1030,13 @@ fn moving(
         settings.mode == lighter::Mode::Hardware && !settings.reference,
     )?;
     if camera.underwater_depth <= 0. {
-        feed.weather
-            .precipitation(camera.pos, camera.yaw, frame, &mut out.builder, &mut budget)?;
+        feed.source.weather.precipitation(
+            camera.pos,
+            camera.yaw,
+            frame,
+            &mut out.builder,
+            &mut budget,
+        )?;
     }
     let coverage = out.coverage;
     Ok((out.finish_cached(cache)?, coverage))

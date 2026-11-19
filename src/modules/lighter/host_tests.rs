@@ -251,6 +251,22 @@ fn ornament(element: &std::path::Path) -> crate::objects::Objects {
     crate::objects::Objects::open(element, vec![ornament_record()]).unwrap()
 }
 
+fn install_streamed_fixture(r: &mut super::super::Renderer, native: super::MeshData) {
+    let mut packer = r.lighter_feed.as_mut().and_then(super::Feed::take_packer);
+    let storage = super::lighter::storage_limit(&r.device);
+    let mode = r.lighter.settings.mode;
+    let mesh = std::thread::scope(|scope| {
+        scope
+            .spawn(|| super::super::StreamedMesh::prepare(native, packer.as_mut(), storage, mode))
+            .join()
+            .unwrap()
+    });
+    if let Some(feed) = &mut r.lighter_feed {
+        feed.packer = packer;
+    }
+    assert!(r.update_mesh(&mut Some(mesh)).unwrap());
+}
+
 fn fixture(element: &std::path::Path) -> Terrain {
     let element = element.to_path_buf();
     let side = TILE as f32;
@@ -409,17 +425,19 @@ fn fixture(element: &std::path::Path) -> Terrain {
 
 #[test]
 fn terrain_masks_fit_the_budget_and_never_reuse_a_failed_upload() {
-    use super::{Feed, Textures};
+    use super::{FeedSource, StreamPacker, Textures};
     let mut material = crate::material::cutoff_mask_fixture();
     material.areas.truncate(8);
-    let mut feed = Feed {
+    let mut source = FeedSource {
         base: Textures::with_limit(4 << 10),
         terrain_ids: vec![0],
-        ..Feed::default()
+        ..FeedSource::default()
     };
-    feed.base.seal();
-    feed.terrain_masks(&material).unwrap();
-    let bank = feed.mask_bank.as_ref().unwrap();
+    source.base.seal();
+    let mut packer = StreamPacker::new(std::sync::Arc::new(source));
+    packer.update_masks(&material);
+    let masks = packer.masks.as_ref().unwrap().as_ref().unwrap();
+    let bank = &masks.bank;
     assert!(bank.remaining_bytes() >= 1024);
     let words: Vec<u32> = bank
         .byte_segments()
@@ -427,7 +445,7 @@ fn terrain_masks_fit_the_budget_and_never_reuse_a_failed_upload() {
         .copied()
         .collect();
     for area in 0..8 {
-        let row = feed.area_table as usize + area * 4;
+        let row = masks.area_table as usize + area * 4;
         assert_eq!(words[row + 1], 2, "do not drop any layers");
         let layer = words[row] as usize;
         let mask = words[layer + 6] as usize;
@@ -435,11 +453,12 @@ fn terrain_masks_fit_the_budget_and_never_reuse_a_failed_upload() {
         let top = mask + words[mask + 4] as usize;
         assert_eq!(words[top].to_le_bytes(), [area as u8; 4]);
     }
-    feed.base = Textures::with_limit(256);
-    feed.base.seal();
-    assert!(feed.terrain_masks(&material).is_err());
+    let source = std::sync::Arc::get_mut(&mut packer.source).unwrap();
+    source.base = Textures::with_limit(256);
+    source.base.seal();
+    packer.update_masks(&material);
     assert!(
-        feed.mask_bank.is_none(),
+        packer.masks.unwrap().is_err(),
         "never use obsolete streamed masks"
     );
 }
@@ -1051,7 +1070,7 @@ fn lighter_streamed_world_pixels() {
         !streamed.local_pages.is_empty(),
         "fixture BMD did not reach the local page builder"
     );
-    assert!(r.update_mesh(&mut Some(streamed)).unwrap());
+    install_streamed_fixture(&mut r, streamed);
     let packet = &r.lighter.world.as_ref().unwrap().packet.words;
     assert!(
         packet[packet[3] as usize..packet[4] as usize]
@@ -1157,7 +1176,7 @@ fn lighter_streamed_world_pixels() {
     terrain.objects = crate::objects::Objects::open(&root.0, Vec::new()).unwrap();
     terrain.scenery_placements = None;
     let evicted = mesh(&mut terrain, r.grass_atlas_key);
-    assert!(r.update_mesh(&mut Some(evicted)).unwrap());
+    install_streamed_fixture(&mut r, evicted);
     for (x, lit) in points.into_iter().zip(bright) {
         let unoccluded = probe(&mut r, &mut camera, x);
         // The no-shadow baseline samples the emitter center. Once the caster
@@ -1193,7 +1212,7 @@ fn lighter_streamed_world_pixels() {
     assert!(r.lighter.world.is_none());
 
     let rebuilt = mesh(&mut terrain, r.grass_atlas_key);
-    assert!(r.update_mesh(&mut Some(rebuilt)).unwrap());
+    install_streamed_fixture(&mut r, rebuilt);
     assert!(r.renders_rays(), "a healthy stream must restore Software");
     assert!(render_center(&mut r, &camera).1 > 0.);
     assert!(r.lighter.error().is_none());
@@ -1221,7 +1240,7 @@ fn lighter_streamed_world_pixels() {
     assert_eq!(render_center(&mut r, &camera), native);
 
     let rebuilt = mesh(&mut terrain, r.grass_atlas_key);
-    assert!(r.update_mesh(&mut Some(rebuilt)).unwrap());
+    install_streamed_fixture(&mut r, rebuilt);
     assert!(r.renders_rays());
     if cpu_adapter {
         r.lighter.settings.mode = Mode::Hardware;
@@ -1585,7 +1604,23 @@ pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
     assert_eq!(extended.0.triangles(), limited.triangles() + 2);
     let local_mesh = make(&mut t, 160.);
     assert!(!local_mesh.local_pages.is_empty());
-    let local = install(&mut feed, &local_mesh, (1, 0, 0));
+    let mut packer = feed.take_packer().unwrap();
+    let local_scene = std::thread::scope(|scope| {
+        scope
+            .spawn(|| packer.prepare(&local_mesh, storage, super::lighter::Mode::Software))
+            .join()
+            .unwrap()
+            .unwrap()
+    });
+    assert_eq!(
+        (local_scene.coverage.local, local_scene.coverage.extra),
+        (1, 0)
+    );
+    assert!(feed.packer.is_none());
+    // Keep both pictures immutable until the native upload is ready. The
+    // fixture then reuses the same worker cache for eviction/re-entry tests.
+    let local = (local_scene.packet, local_scene.bank);
+    feed.packer = Some(packer);
     let evicted = install(&mut feed, &make(&mut t, -1200.), (0, 0, 1));
     let restored = install(&mut feed, &make(&mut t, 0.), (0, 1, 0));
     t.objects = source(0x0100);
@@ -1593,8 +1628,8 @@ pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
     t.objects = source(0x0001);
     let reflect_only = install(&mut feed, &make(&mut t, 0.), (0, 1, 0));
     StreamedBmdScenes {
-        terrain: feed.terrain,
-        area_table: feed.area_table,
+        terrain: feed.source.terrain,
+        area_table: feed.resident.area_table,
         extended,
         local,
         evicted,
@@ -1701,6 +1736,9 @@ fn lighter_matched_fixture_capture() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| root.0.clone());
     std::fs::create_dir_all(&save).unwrap();
+    let only = std::env::var("PW_LIGHTER_FIXTURE_ONLY").ok();
+    let authored = std::env::var("PW_LIGHTER_FIXTURE_AUTHORED_BC").as_deref() == Ok("1");
+    let mut captures = 0;
     let mut adapter_name = None;
     for (name, mode, raster) in [
         ("native", Mode::Off, false),
@@ -1708,9 +1746,46 @@ fn lighter_matched_fixture_capture() {
         ("full-ray", Mode::Hardware, false),
         ("hybrid", Mode::Hardware, true),
     ] {
+        if only.as_ref().is_some_and(|mode| mode != name) {
+            continue;
+        }
+        let mut terrain = fixture(&root.0);
+        if authored {
+            // Real terrain upload and feed, with seven authored mips. Give
+            // this input a distinct ID so it is never diffed with the 4²
+            // single-mip water/Hybrid fixture by accident.
+            terrain.map.id = "lighter-fixture-authored-bc".into();
+            let mut dds = vec![0; 128];
+            dds[..4].copy_from_slice(b"DDS ");
+            dds[84..88].copy_from_slice(b"DXT1");
+            for (at, value) in [(4, 124u32), (12, 64), (16, 64), (28, 7), (76, 32), (80, 4)] {
+                dds[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            for lod in 0..7 {
+                let blocks = (64u32 >> lod).div_ceil(4);
+                for y in 0..blocks {
+                    for x in 0..blocks {
+                        let a = if (x ^ y) & 1 != 0 {
+                            0x8780u16
+                        } else {
+                            0x57a0u16
+                        };
+                        dds.extend(a.to_le_bytes());
+                        dds.extend(0x2900u16.to_le_bytes());
+                        dds.extend([0xe4, 0x4e, 0x4b, 0x93]);
+                    }
+                }
+            }
+            terrain.materials.textures[0] = crate::material::Texture {
+                w: 64,
+                h: 64,
+                source: dds,
+                levels: Default::default(),
+            };
+        }
         let path = save.join(format!("{name}.png"));
         super::super::preview_frame_using(
-            fixture(&root.0),
+            terrain,
             &path,
             Some([-2.5, 5., 0., 0., -std::f32::consts::FRAC_PI_4]),
             mode,
@@ -1768,5 +1843,7 @@ fn lighter_matched_fixture_capture() {
         )
         .unwrap();
         assert_world_png(&path, (960, 720));
+        captures += 1;
     }
+    assert!(captures != 0, "unknown PW_LIGHTER_FIXTURE_ONLY draw route");
 }

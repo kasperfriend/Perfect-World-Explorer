@@ -64,8 +64,10 @@ fn reload_world_button_applies_pending_mode_without_changing_the_live_renderer()
 fn naga_validates_both_paths_and_emits_native_ray_queries() {
     use naga_rt as naga;
     for src in [
-        [PIXELS, BSDF, MEDIA, REFERENCE, BASE, SOFTWARE].concat(),
-        [PIXELS, include_str!("present.wgsl")].concat(),
+        trace_source(SOFTWARE, false, false),
+        trace_source(SOFTWARE, true, true),
+        [PIXELS, EASU, PRESENT].concat(),
+        [EASU, include_str!("../../fsr1.wgsl")].concat(),
         [PIXELS, post::SHADER].concat(),
     ] {
         let module = naga::front::wgsl::parse_str(&src)
@@ -77,7 +79,7 @@ fn naga_validates_both_paths_and_emits_native_ray_queries() {
         .validate(&module)
         .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&src)));
     }
-    let shader = vulkan::shader(&[PIXELS, BSDF, MEDIA, REFERENCE, BASE, HARDWARE].concat())
+    let shader = vulkan::shader(&trace_source(HARDWARE, true, true))
         .expect("Vulkan ray-query WGSL to SPIR-V");
     assert_eq!(shader[0], 0x0723_0203);
     let mut opcodes = Vec::new();
@@ -104,10 +106,7 @@ fn naga_validates_both_paths_and_emits_native_ray_queries() {
 #[test]
 fn compiles_raster_primary_sibling_without_ray_query_capability() {
     use naga_rt::ShaderStage;
-    let shared = [PIXELS, BSDF, MEDIA, REFERENCE, BASE];
-    let raster = [shared.as_slice(), &[SOFTWARE, include_str!("primary.wgsl")]]
-        .concat()
-        .concat();
+    let raster = raster_source();
     for (stage, name) in [
         (ShaderStage::Vertex, "visibility_vertex"),
         (ShaderStage::Fragment, "visibility_fragment"),
@@ -122,7 +121,7 @@ fn compiles_raster_primary_sibling_without_ray_query_capability() {
             next += (words[next] >> 16) as usize;
         }
     }
-    let shader = [shared.as_slice(), &[HARDWARE]].concat().concat();
+    let shader = trace_source(HARDWARE, true, true);
     let words = vulkan::shader_entry(&shader, ShaderStage::Compute, "render_hybrid").unwrap();
     assert_eq!(words[0], 0x0723_0203);
 }
@@ -780,6 +779,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
     }
     exercise_transport(&mut h);
     exercise_denoiser_edges(&mut h);
+    exercise_spatial_upscale(&mut h);
+    exercise_stable_primary_water(&mut h);
     exercise_sun_and_history(&mut h);
     exercise_temporal_animation(&mut h);
     exercise_gloss(&mut h);
@@ -1237,12 +1238,23 @@ fn exercise_material_channels(h: &mut Harness) {
     let map = bank
         .tile([1, 1], 1, Filter::Data, |_, _| rgba([0.8, 0.5, 0.9, 1.]))
         .unwrap();
+    // The same tangent normal in ATI2, with no stored blue channel. Keep
+    // an actual decoded mip in this test rather than manufacturing RGB.
+    let mut bc5 = vec![0; 128];
+    bc5[..4].copy_from_slice(b"DDS ");
+    bc5[84..88].copy_from_slice(b"ATI2");
+    for (at, v) in [(4, 124u32), (12, 1), (16, 1), (76, 32), (80, 4)] {
+        bc5[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    bc5.extend([204, 0, 0, 0, 0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0]);
+    let (levels, _) = crate::model_texture_gpu::decode_for_rays(&bc5).unwrap();
+    let rg = bank.images(&levels, 1, Filter::NormalRg).unwrap();
     let mut frame = test_frame(Vec3::ZERO, -Vec3::Z, 3);
     frame.ambient = [0.; 4];
     frame.sun = [0.6, 0.2, (0.6f32).sqrt(), 1.];
     frame.sun_color = [1.; 4];
     let mut probes = Vec::new();
-    for normal_map in [0, map] {
+    for normal_map in [0, map, rg] {
         let mut b = Builder::default();
         let mut mat = Surface::new(0, SINGLE_SIDED, 0., 0.);
         mat.normal_map = normal_map;
@@ -1270,6 +1282,15 @@ fn exercise_material_channels(h: &mut Harness) {
     assert!(
         probes[1].0[0] > probes[0].0[0] + 30 && probes[1].1 == probes[0].1,
         "NRF basis or side incorrect: {probes:?}"
+    );
+    assert_eq!(probes[2].1, probes[1].1);
+    assert!(
+        probes[2]
+            .0
+            .into_iter()
+            .zip(probes[1].0)
+            .all(|(a, b)| a.abs_diff(b) <= 1),
+        "reconstructed BC5 tangent normal: {probes:?}"
     );
 
     // Real posed-skin producer, including its part-specific face overrides.
@@ -2327,6 +2348,100 @@ fn exercise_effect_placement(h: &mut Harness) {
         [1.; 3],
     );
     eprintln!("Lighter: no-depth GFX order, bounded decal projection and cloud shadow passed");
+}
+
+fn exercise_spatial_upscale(h: &mut Harness) {
+    let saved = h.ray.settings;
+    h.ray.settings = Settings {
+        bounces: 0,
+        samples: 1,
+        resolution: 50,
+        progressive: false,
+        denoiser: false,
+        lighting: false,
+        fsr1_easu: false,
+        ..saved
+    };
+    let mut b = Builder::for_mode(saved.mode);
+    let near = upright(&mut b, -4., [1., 0., 0., 1.], EMISSIVE, 0);
+    put(&mut b, near);
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let f = test_frame(Vec3::ZERO, Vec3::NEG_Z, 47);
+    let empty = Builder::for_mode(saved.mode).finish();
+    let linear = h.pixels(f, &empty);
+    h.ray.settings.fsr1_easu = true;
+    let spatial = h.pixels(f, &empty);
+    assert!(linear.iter().zip(&spatial).all(|(a, b)| a.1 == b.1));
+    assert!(linear.iter().zip(&spatial).any(|(a, b)| a.0 != b.0));
+    assert_eq!(spatial[47 * 23 + 23].0, [255, 0, 0, 255]);
+    h.ray.settings.resolution = 100;
+    let native = h.pixels(f, &empty);
+    h.ray.settings.fsr1_easu = false;
+    assert_eq!(
+        native,
+        h.pixels(f, &empty),
+        "1:1 EASU must bypass the filter"
+    );
+    h.ray.settings = saved;
+}
+
+fn exercise_stable_primary_water(h: &mut Harness) {
+    let saved = h.ray.settings;
+    h.ray.settings = Settings {
+        resolution: 100,
+        samples: 1,
+        bounces: 1,
+        lighting: false,
+        shadows: false,
+        reflections: true,
+        progressive: false,
+        denoiser: false,
+        single_path: false,
+        ..saved
+    };
+    let mut bank = Textures::default();
+    let mirror = bank
+        .tile([1, 1], 1, textures::Filter::Color, |_, _| 0xffff_0000)
+        .unwrap();
+    let mut b = Builder::for_mode(saved.mode);
+    let ground = |y| {
+        [
+            [-10., y, 10.],
+            [10., y, 10.],
+            [-10., y, -10.],
+            [10., y, -10.],
+        ]
+    };
+    let water = quad(&mut b, ground(0.), [0., 1., 0.], 0, WATER, u32::MAX);
+    put(&mut b, water);
+    let bed = quad(
+        &mut b,
+        ground(-1.),
+        [0., 1., 0.],
+        0,
+        EMISSIVE,
+        rgba([0., 1., 0., 1.]),
+    );
+    put(&mut b, bed);
+    h.ray.install(Ok((b.finish(), bank)));
+    let f = Frame {
+        options: [WATER_MIRROR, 0, 0, 0],
+        sky0: [mirror, mirror, mirror, 0],
+        sky1: [mirror, mirror, mirror, 0],
+        ..test_frame(Vec3::new(0., 1., 0.), Vec3::new(0., -1., -1.), 27)
+    };
+    let empty = Builder::for_mode(saved.mode).finish();
+    let control = h.pixels(f, &empty);
+    h.ray.settings.single_path = true;
+    let sampled = h.pixels(f, &empty);
+    let center = 13 * 27 + 13;
+    assert!(
+        control[center].0[1] > 40 && control[center].0[2] > 0,
+        "both water legs must contribute: {:?}",
+        control[center]
+    );
+    assert_eq!(sampled, control, "primary water remains stable at 1 spp");
+    h.ray.settings = saved;
 }
 
 fn exercise_water_art(h: &mut Harness) {
@@ -4008,6 +4123,337 @@ fn lighter_hardware_pixels() {
 #[ignore = "requires a recent lavapipe exposing KHR_ray_query; this is not GPU RT-core validation"]
 fn lighter_vulkan_interop_on_cpu() {
     exercise(Mode::Hardware, true);
+}
+
+#[cfg(target_os = "linux")]
+fn screen_markers(h: &Harness, side: u32, page: u32) -> [usize; 3] {
+    let n = side * side;
+    let offset = n * (1 + 3 * page);
+    let shader = h.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Lighter screen reuse probe"),
+        source: wgpu::ShaderSource::Wgsl(
+            format!(
+                r#"
+@group(0) @binding(0) var<storage,read> image: array<u32>;
+@group(0) @binding(1) var<storage,read_write> marks: array<u32>;
+@compute @workgroup_size(64) fn probe(@builtin(global_invocation_id) id: vec3<u32>) {{
+    if id.x>={n}u {{ return; }}
+    let at = ({offset}u+id.x*3u)*7u;
+    let anchor = image[at+13u]!=0u;
+    let source = image[at+12u];
+    let gi = (image[at+18u] & 0x80000000u)!=0u;
+    marks[id.x] = select(0u,source,anchor) | select(0u,4u,gi);
+}}
+"#
+            )
+            .into(),
+        ),
+    });
+    let pipeline = h
+        .device
+        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: None,
+            module: &shader,
+            entry_point: "probe",
+        });
+    let size = u64::from(n) * 4;
+    let marks = h.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let read = h.device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let image = match h.ray.settings.mode {
+        Mode::Software => &h.ray.software.as_ref().unwrap().output.0,
+        Mode::Hardware => h.ray.hardware.as_ref().unwrap().image_for_test(),
+        Mode::Off => unreachable!(),
+    };
+    let bind = h.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[resource(0, image), resource(1, &marks)],
+    });
+    let mut encoder = h.device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(n.div_ceil(64), 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&marks, 0, &read, 0, size);
+    h.queue.submit(Some(encoder.finish()));
+    let bytes = read.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    bytes.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = tx.send(result);
+    });
+    crate::gpu::wait_for_capture_callback(&h.device, rx)
+        .unwrap()
+        .unwrap();
+    let mut counts = [0; 3];
+    for &bits in bytemuck::cast_slice::<_, u32>(&bytes.get_mapped_range()) {
+        counts[0] += usize::from(bits & 3 == 1);
+        counts[1] += usize::from(bits & 3 == 2);
+        counts[2] += usize::from(bits & 4 != 0);
+    }
+    counts
+}
+
+#[cfg(target_os = "linux")]
+fn exercise_screen_reuse(mode: Mode) {
+    const SIDE: u32 = 43;
+    let mut h = Harness::new(mode, mode == Mode::Hardware);
+    h.ray.screen_reuse = SCREEN_DI | SCREEN_GI;
+    h.ray.settings.lighting = true;
+    h.ray.settings.shadows = true;
+    h.ray.settings.progressive = true;
+    h.ray.settings.bounces = 0;
+    let empty = Builder::for_mode(mode).finish();
+    let mut b = Builder::for_mode(mode);
+    for (plane, normal) in [
+        (
+            [
+                [-10., 0., -4.],
+                [10., 0., -4.],
+                [-10., 0., 6.],
+                [10., 0., 6.],
+            ],
+            [0., 1., 0.],
+        ),
+        (
+            [
+                [-10., 8., -4.],
+                [10., 8., -4.],
+                [-10., 0., -4.],
+                [10., 0., -4.],
+            ],
+            [0., 0., 1.],
+        ),
+    ] {
+        let mesh = quad(&mut b, plane, normal, 0, 0, rgba([0.8, 0.8, 0.8, 1.]));
+        put(&mut b, mesh);
+    }
+    // Colored lights with different influence boundaries. The previous
+    // neighbor need not have support for all of the current pixel's lights.
+    for (i, x) in [-5., -2.5, -1.5, 1.5, 2.5, 5.].into_iter().enumerate() {
+        let mut rgb = [0.08; 4];
+        rgb[i % 3] = 0.5;
+        b.light(Light::point([x, 1.8, -1.7, 4.9], rgb).disk(0.22));
+    }
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let mut f = test_frame(Vec3::new(0., 1.8, 2.), Vec3::new(0., -0.24, -1.), SIDE);
+    f.sun = [0., 0.7, 0.7141428, 1.];
+    f.sun_color = [0.16, 0.16, 0.16, 0.];
+    f.ambient = [0.; 4];
+    // Compile one reuse-capable pipeline, initially with no admitted caches.
+    // Then compare identical progressive histories (sequences 0..12) with
+    // caches off and on. Keep the full light sum as a separate DI reference.
+    let full = h.pixels(f, &empty);
+    assert_eq!(h.ray.screen_reuse_flags(), 0);
+    h.ray.settings.single_path = true;
+    let mean = |p: &[([u8; 4], f32)]| {
+        p.iter()
+            .map(|(p, _)| Vec3::new(p[0] as f32, p[1] as f32, p[2] as f32))
+            .sum::<Vec3>()
+            / p.len() as f32
+    };
+    for bounces in 0..=1 {
+        h.ray.settings.bounces = bounces;
+        h.ray.screen_reuse = 0;
+        h.ray.history = post::History::default();
+        h.ray.reset_history();
+        let first = h.pixels(f, &empty);
+        let control = (0..12).map(|_| h.pixels(f, &empty)).last().unwrap();
+        assert_eq!(h.ray.screen_reuse_flags(), 0);
+
+        h.ray.screen_reuse = SCREEN_DI | SCREEN_GI;
+        h.ray.history = post::History::default();
+        h.ray.reset_history();
+        assert_eq!(first, h.pixels(f, &empty), "empty-page fallback");
+        let requested = SCREEN_DI | u32::from(bounces == 1) * SCREEN_GI;
+        assert_eq!(h.ray.screen_reuse_flags(), requested);
+        let estimate = (0..12).map(|_| h.pixels(f, &empty)).last().unwrap();
+        let previous = SCREEN_PREVIOUS | u32::from(bounces == 1) * SCREEN_GI_PREVIOUS;
+        assert_eq!(h.ray.screen_reuse_flags(), requested | previous);
+        assert!(control.iter().zip(&estimate).all(|(a, b)| a.1 == b.1));
+        assert!(control.iter().zip(&estimate).any(|(a, b)| a.0 != b.0));
+        let (expected, actual) = (mean(&control), mean(&estimate));
+        assert!(
+            (expected - actual).abs().max_element() < 2.0,
+            "{mode:?}, {bounces} bounces: fresh {expected:?}, reuse {actual:?}"
+        );
+        if bounces == 0 {
+            assert!((mean(&full) - actual).abs().max_element() < 2.0);
+        }
+        let abs_sum: u32 = control
+            .iter()
+            .zip(&estimate)
+            .map(|(a, b)| {
+                (0..3)
+                    .map(|i| u32::from(a.0[i].abs_diff(b.0[i])))
+                    .sum::<u32>()
+            })
+            .sum();
+        eprintln!("Lighter {mode:?} {bounces} bounces, 13 progressive frames: fresh vs reused mean RGB8 {expected:?} / {actual:?}, pixel MAE {:.5}", abs_sum as f64 / (3 * control.len()) as f64);
+    }
+    // Last dispatch used sequence 12 (page zero).
+    let marks = screen_markers(&h, SIDE, 0);
+    assert!(
+        marks.into_iter().all(|x| x > 0),
+        "{mode:?}: temporal/spatial/GI hit counts {marks:?}"
+    );
+    let shifted = test_frame(Vec3::new(0.2, 1.8, 2.), Vec3::new(0., -0.24, -1.), SIDE);
+    f.vp = shifted.vp;
+    f.inv_vp = shifted.inv_vp;
+    f.eye = shifted.eye;
+    let _ = h.pixels(f, &empty);
+    assert_eq!(h.ray.screen_reuse_flags(), SCREEN_DI | SCREEN_GI);
+    assert_eq!(
+        screen_markers(&h, SIDE, 1),
+        [0; 3],
+        "camera move must reject both old pages"
+    );
+    h.ray.settings.progressive = false;
+    let _ = h.pixels(f, &empty);
+    assert_eq!(h.ray.screen_reuse_flags(), 0);
+    eprintln!("Lighter {mode:?}: temporal/spatial/GI picks {marks:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a Vulkan compute adapter"]
+fn lighter_screen_reuse_pixels() {
+    exercise_screen_reuse(Mode::Software);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a Vulkan CPU ICD exposing KHR_ray_query"]
+fn lighter_screen_reuse_interop() {
+    exercise_screen_reuse(Mode::Hardware);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires Vulkan and a CPU ICD exposing KHR_ray_query"]
+fn lighter_compact_terrain_pixels() {
+    exercise_compact_terrain(Mode::Software);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a Vulkan CPU ICD exposing KHR_ray_query"]
+fn lighter_compact_terrain_interop() {
+    exercise_compact_terrain(Mode::Hardware);
+}
+
+#[cfg(target_os = "linux")]
+fn exercise_compact_terrain(mode: Mode) {
+    let [w, h] = [33u32, 19u32];
+    let mut harn = Harness::new(mode, mode == Mode::Hardware);
+    harn.ray.compact_terrain = true;
+    let mut camera = test_frame(Vec3::new(0., 3.5, 0.), -Vec3::Y, 37);
+    camera.terrain = [128., 128., 1., 128.];
+    let empty = Builder::for_mode(mode).finish();
+    let geometry = || {
+        let mut b = Builder::for_mode(mode);
+        let patch = quad(
+            &mut b,
+            [
+                [-20., 0., -20.],
+                [20., 0., -20.],
+                [-20., 0., 20.],
+                [20., 0., 20.],
+            ],
+            [0., 1., 0.],
+            0,
+            TERRAIN,
+            u32::MAX,
+        );
+        put(&mut b, patch);
+        b.finish()
+    };
+    for (tag, bytes) in [(b"DXT1", 8), (b"DXT3", 16), (b"DXT5", 16)] {
+        let mut raw = vec![0; 128];
+        raw[..4].copy_from_slice(b"DDS ");
+        raw[84..88].copy_from_slice(tag);
+        for (at, n) in [(4, 124u32), (12, h), (16, w), (28, 6), (76, 32), (80, 4)] {
+            raw[at..at + 4].copy_from_slice(&n.to_le_bytes());
+        }
+        for mip in 0..6 {
+            for i in 0..(w >> mip).max(1).div_ceil(4) * (h >> mip).max(1).div_ceil(4) {
+                if bytes == 16 {
+                    raw.extend_from_slice(&[0; 8]);
+                } // ignored alpha
+                let a = 0x3595 + i as u16 + (mip as u16) * 0x0800;
+                let b = 0xfa2a - (mip as u16) * 0x0400;
+                let (a, b) = if i % 2 == 0 { (a, b) } else { (b, a) };
+                raw.extend(a.to_le_bytes());
+                raw.extend(b.to_le_bytes());
+                raw.extend([0xe4, 0x4e, 0x4b, 0x93]); // all four selectors
+            }
+        }
+        let decoded =
+            crate::dxt::decode_chain(u32::from_le_bytes(*tag), &raw[128..], w, h, 6).unwrap();
+        let reference = textures::Tile::levels(
+            decoded.iter().map(|l| ([l.width, l.height], &*l.rgba)),
+            16,
+            textures::Filter::Color,
+        )
+        .unwrap();
+        let compact = textures::Tile::compact_terrain(&raw, 16).unwrap().unwrap();
+        assert!(compact.bytes() * 2 < reference.bytes());
+        let mut pack = |tile: &textures::Tile, scale: f32| {
+            let mut bank = Textures::default();
+            let addr = bank.insert(tile).unwrap();
+            let area = bank.reserve(9).unwrap();
+            bank.write_words(
+                area,
+                &[
+                    (area + 4) as u32,
+                    1,
+                    0,
+                    0,
+                    addr,
+                    0,
+                    1,
+                    scale.to_bits(),
+                    scale.to_bits(),
+                ],
+            );
+            camera.options[3] = area as u32;
+            let payload = bank.byte_len();
+            let stats = bank.mips;
+            harn.ray.install(Ok((geometry(), bank)));
+            (harn.pixels(camera, &empty), payload, stats)
+        };
+        for scale in [0.4, 2.1, 9.0] {
+            let (a, expanded, _) = pack(&reference, scale);
+            let (b, compressed, stats) = pack(&compact, scale);
+            assert_eq!(expanded - compressed, stats.bc_terrain_saved_bytes);
+            assert_eq!(stats.bc_terrain_tiles, 1);
+            assert!(a.iter().any(|p| p.1 > 0. && p.0[0] > 20));
+            assert!(
+                a.iter().zip(b).all(|(a, b)| a.1 == b.1
+                    && a.0.into_iter().zip(b.0).all(|(a, b)| a.abs_diff(b) <= 1)),
+                "{mode:?} {:?}, scale {scale}",
+                std::str::from_utf8(tag).unwrap()
+            );
+        }
+        eprintln!(
+            "Lighter {mode:?} {:?}: terrain tile {} -> {} bytes, RGB8 <= 1, depth exact",
+            std::str::from_utf8(tag).unwrap(),
+            reference.bytes(),
+            compact.bytes()
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]

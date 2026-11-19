@@ -14,12 +14,22 @@ const AREA_TOP: u32 = 2;
 const LINEAR_DATA: u32 = 4;
 const ALPHA_IS_DATA: u32 = 8;
 const PACKED_MASK: u32 = 16;
+const BC_TERRAIN_1: u32 = 32;
+const BC_TERRAIN_23: u32 = 64;
+const NORMAL_RG: u32 = 128;
+
+// Select at process launch; both the immutable feed and tracer use this.
+// Keep the hot default path free of the additional block decode.
+pub(crate) fn compact_terrain_enabled() -> bool {
+    std::env::var("PW_RAY_COMPACT_TERRAIN").is_ok_and(|v| v == "1")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Filter {
     Color,
     ColorMask, // RGB is sRGB; alpha controls a shader stage, not coverage.
     Data,
+    NormalRg, // two-channel BC5 tangent normal; reconstruct Z after filtering
     Alpha,
     // SpeedTree can author a fractional reference with a strict `>` test.
     Cutout(u32, bool),
@@ -33,6 +43,7 @@ impl Filter {
     fn storage_flags(self) -> u32 {
         match self {
             Self::Data => LINEAR_DATA,
+            Self::NormalRg => LINEAR_DATA | NORMAL_RG,
             Self::ColorMask => ALPHA_IS_DATA,
             _ => 0,
         }
@@ -64,6 +75,8 @@ pub struct MipStats {
     pub reduced: usize,
     // Tile count (generated OR reduced), not a count of missing textures.
     pub fallback: usize,
+    pub bc_terrain_tiles: usize,
+    pub bc_terrain_saved_bytes: usize,
 }
 
 impl MipStats {
@@ -73,6 +86,7 @@ impl MipStats {
             generated: usize::from(generated),
             reduced: usize::from(reduced),
             fallback: usize::from(generated || reduced),
+            ..Self::default()
         }
     }
     fn add(&mut self, tile: Self) {
@@ -80,6 +94,8 @@ impl MipStats {
         self.generated += tile.generated;
         self.reduced += tile.reduced;
         self.fallback += tile.fallback;
+        self.bc_terrain_tiles += tile.bc_terrain_tiles;
+        self.bc_terrain_saved_bytes += tile.bc_terrain_saved_bytes;
     }
 }
 
@@ -166,6 +182,65 @@ impl Tile {
             }));
         }
         Ok(Self(words, stats))
+    }
+
+    /// Preserve the selected *authored* BC1/2/3 levels without an intermediate
+    /// RGBA chain. Only opaque terrain samples these tiles; masks, alpha tests,
+    /// bake maps and sky/mesh proposal estimates still read their own format.
+    pub(crate) fn compact_terrain(dds: &[u8], limit: u32) -> Result<Option<Self>, String> {
+        use crate::terrain_sampling::{parse_terrain_dds, DxtFormat};
+        let info = parse_terrain_dds(dds)?;
+        let size = [info.width, info.height];
+        let start = first_lod(size, limit);
+        if info.authored_mips < 2 || start >= info.authored_mips {
+            // Same generated mip fallback as Tile::levels.
+            return Ok(None);
+        }
+        let block = info.format.block_bytes();
+        let mut offset = 128;
+        let mut decoded = 0;
+        let mut compressed = 0;
+        for lod in 0..info.authored_mips {
+            let [w, h] = extent_at(size, lod).map(|v| v as usize);
+            let bytes = w.div_ceil(4) * h.div_ceil(4) * block;
+            if lod < start {
+                offset += bytes;
+            } else {
+                decoded += w * h * 4;
+                compressed += bytes;
+            }
+        }
+        if decoded <= compressed {
+            return Ok(None);
+        }
+        let levels = info.authored_mips - start;
+        let [w, h] = extent_at(size, start);
+        let storage = if info.format == DxtFormat::Dxt1 {
+            BC_TERRAIN_1
+        } else {
+            BC_TERRAIN_23
+        };
+        let mut words = vec![w, h, levels, storage];
+        words.resize(4 + levels as usize, 0);
+        words.reserve(compressed / 4);
+        for lod in 0..levels {
+            let [w, h] = extent_at([w, h], lod).map(|v| v as usize);
+            let bytes = w.div_ceil(4) * h.div_ceil(4) * block;
+            words[4 + lod as usize] = words.len() as u32;
+            let end = offset + bytes;
+            words.extend(
+                dds[offset..end]
+                    .chunks_exact(4)
+                    .map(|b| u32::from_le_bytes(b.try_into().unwrap())),
+            );
+            offset = end;
+        }
+        let stats = MipStats {
+            bc_terrain_tiles: 1,
+            bc_terrain_saved_bytes: decoded - compressed,
+            ..MipStats::tile(levels as usize, false, start > 0)
+        };
+        Ok(Some(Self(words, stats)))
     }
 
     /// Both an explicit single level (e.g. TGA) and an incomplete chain can
@@ -592,7 +667,7 @@ impl Textures {
                 self.images(
                     &images,
                     COLOR_SIDE,
-                    if has_alpha || filter == Filter::Data {
+                    if has_alpha || filter.storage_flags() & LINEAR_DATA != 0 {
                         filter
                     } else {
                         Filter::Color

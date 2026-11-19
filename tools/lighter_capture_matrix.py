@@ -25,6 +25,7 @@ PROFILES = {
     "cpu": ("off", "software"),
     "physical": ("off", "software", "hardware"),
 }
+REUSE = {"off": 0, "di": 1, "gi": 2, "both": 3}
 CLASSES = {"city", "forest", "open_distance", "water", "cave_instance", "effects"}
 CONDITIONS = {"day": (12, "Clear"), "night": (0, "Clear"), "rain": (12, "Rain")}
 MATCH_KEYS = (
@@ -61,6 +62,9 @@ def validate_match(baseline, candidate, *, compare_primary=False):
             a, b = (re.sub(r"hybrid_primary: (?:true|false), ", "", s, count=1) for s in (a, b))
         if a != b:
             raise ValueError("ray modes have different effective settings")
+        for key in ("bc_terrain_tiles", "bc_terrain_saved_bytes", "screen_reuse_flags"):
+            if baseline.get(key, "0") != candidate.get(key, "0"):
+                raise ValueError(f"unmatched {key}: {baseline.get(key)!r} vs {candidate.get(key)!r}")
 
 
 def regions_for(size, custom=None):
@@ -185,13 +189,23 @@ def run_case(case, args):
         stem = args.output / f"{name}-{variant}"
         hour, weather = CONDITIONS[case["condition"]]
         env = {k: v for k, v in os.environ.items() if not k.startswith("PW_PREVIEW_")}
-        env.pop("PW_TEST_NO_LIGHTMAPS", None)
+        for key in ("PW_TEST_NO_LIGHTMAPS", "PW_RAY_COMPACT_TERRAIN", "PW_RAY_SCREEN_REUSE"):
+            env.pop(key, None)
         env.update(WGPU_BACKEND="vulkan", PW_PREVIEW_COVERAGE="1", PW_PREVIEW_LIGHTER=mode,
                    PW_PREVIEW_RAY_RESOLUTION=str(args.ray_resolution), PW_PREVIEW_ANISOTROPY="8",
                    PW_PREVIEW_HOUR=str(hour), PW_PREVIEW_WEATHER=weather, PW_PREVIEW_WARMUP=str(case["warmup"]),
                    PW_PREVIEW_TIMED_FRAMES=str(args.timed_frames))
         if raster:
             env["PW_PREVIEW_HYBRID_PRIMARY"] = "1"
+        if mode != "off":
+            if args.progressive or args.screen_reuse != "off":
+                env["PW_PREVIEW_PROGRESSIVE"] = "1"
+            if args.compact_terrain:
+                env["PW_RAY_COMPACT_TERRAIN"] = "1"
+            if args.fsr1_easu:
+                env["PW_PREVIEW_FSR1_EASU"] = "1"
+            if args.screen_reuse != "off":
+                env["PW_RAY_SCREEN_REUSE"] = args.screen_reuse
         if not case["lightmaps"]:
             env["PW_TEST_NO_LIGHTMAPS"] = "1"
         cmd = [str(args.viewer.resolve()), str(args.client.resolve()), "--world", case["map"]]
@@ -213,6 +227,9 @@ def run_case(case, args):
         meta, images[variant] = capture_metadata(stem, mode, case, profile)
         if meta.get("raster_primary", "false") != str(raster).lower():
             raise ValueError(f"{stem.name}: requested and recorded primary path differ")
+        requested_reuse = REUSE[args.screen_reuse] if mode != "off" else 0
+        if (int(meta.get("screen_reuse_flags", "0")) & 3) != requested_reuse:
+            raise ValueError(f"{stem.name}: requested screen reuse not admitted")
         rows = inventory_for(stem, case) if mode != "off" else None
         timings = json.loads(meta.get("synchronized_capture_ms", "[]"))
         if len(timings) != args.timed_frames or any(not math.isfinite(t) or t < 0 for t in timings):
@@ -249,6 +266,10 @@ def main():
     parser.add_argument("--timed-frames", type=int, choices=range(121), default=0, metavar="0..120")
     parser.add_argument("--timeout", type=int, default=360, help="seconds per capture")
     parser.add_argument("--hybrid-ab", action="store_true", help="also capture Hardware with rasterized 1-spp primary visibility")
+    parser.add_argument("--compact-terrain", action="store_true", help="use the experimental buffer-backed BC terrain path")
+    parser.add_argument("--fsr1-easu", action="store_true", help="use the spatial EASU color resolve on the ray modes")
+    parser.add_argument("--progressive", action="store_true", help="accumulate ray history without requiring a reuse cache")
+    parser.add_argument("--screen-reuse", choices=REUSE, default="off", help="experimental 1-spp reuse; enables progressive history")
     parser.add_argument("--require-complete", action="store_true", help="fail unless all required physical matrix cells exist")
     args = parser.parse_args()
     if args.hybrid_ab and args.profile != "physical":
@@ -268,7 +289,10 @@ def main():
     if any(args.output.iterdir()):
         parser.error(f"use a fresh output directory: {args.output}")
     report = {"started_utc": datetime.now(timezone.utc).isoformat(), "source_sha": os.environ.get("GITHUB_SHA"),
-              "profile": args.profile, "declared_physical_matrix_complete": complete, "missing_scene_conditions": missing,
+              "profile": args.profile, "options": {"compact_terrain": args.compact_terrain,
+                                                     "fsr1_easu": args.fsr1_easu, "screen_reuse": args.screen_reuse,
+                                                     "progressive": args.progressive or args.screen_reuse != "off"},
+              "declared_physical_matrix_complete": complete, "missing_scene_conditions": missing,
               "metric": "mean absolute difference of encoded RGB8 pixel channels (lower is closer, not a pass threshold)",
               "cases": []}
     report["errors"] = {}

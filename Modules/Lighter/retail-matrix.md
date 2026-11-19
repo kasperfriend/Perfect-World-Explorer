@@ -53,7 +53,14 @@ Hardware settings with raster primary visibility enabled. The tool rejects a
 full-ray fallback for this variant and writes both the Hardware-vs-Hybrid
 regional diff and per-stage timing. At the headless CLI level,
 `PW_PREVIEW_HYBRID_PRIMARY=1` requests that variant and
-`PW_PREVIEW_SINGLE_PATH=0` uses split transport for a control.
+`PW_PREVIEW_SINGLE_PATH=0` uses split transport for a control. Add
+`--compact-terrain`, `--fsr1-easu` or `--screen-reuse di|gi|both` in a fresh
+output directory to test each optional change. The screen-reuse experiment
+requires warm-up and progressive history; use `--progressive` **without**
+`--screen-reuse` for the matching control. On the CLI that is
+`PW_PREVIEW_PROGRESSIVE=1` with `PW_RAY_SCREEN_REUSE` unset. Admission in the
+sidecar does not imply a cache hit at every pixel. Do not compare this
+experiment against a non-progressive timing run.
 
 Use the `.exe` build on Windows. Choose the expected Vulkan adapter on a
 multi-GPU host; the tool rejects a CPU/virtual adapter for a physical report,

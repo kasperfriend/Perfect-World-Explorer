@@ -1,11 +1,18 @@
 //! Borrowed authored DDS block/mip data for model textures. Keep every authored
 //! level; silently regenerating a new mip chain changes alpha and light edges.
-//! This parser does not implement texture shaders, cube maps, DX10 or decoding.
+//! Single 2D surfaces only, including DX10 BC1/2/3/5/7 UNORM and sRGB entries.
+//! Consumers interpret the stored channels according to material role.
+#[path = "model_dds/decode.rs"]
+mod decode;
+#[allow(unused_imports)] // different standalone asset tools use each half
+pub(crate) use decode::{append_mip, decode_base};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Dxt1,
     Dxt3,
     Dxt5,
+    Bc5,
+    Bc7,
     /// An uncompressed `DDPF_RGB` surface, described by its bit count.
     ///
     /// These are the most common effect textures in `gfx.pck`: of the 1,610
@@ -23,8 +30,8 @@ impl Format {
     /// decoded opacity: BC1 one-bit alpha still uses the ordinary alpha test.
     pub fn alpha_texture(self) -> bool {
         match self {
-            Self::Dxt3 | Self::Dxt5 => true,
-            Self::Dxt1 => false,
+            Self::Dxt3 | Self::Dxt5 | Self::Bc7 => true,
+            Self::Dxt1 | Self::Bc5 => false,
             Self::Uncompressed(u) => u.has_alpha,
         }
     }
@@ -48,6 +55,7 @@ pub struct Mip<'a> {
 pub struct Dds<'a> {
     pub format: Format,
     pub mips: Vec<Mip<'a>>,
+    pub data_offset: usize,
 }
 impl<'a> Dds<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, String> {
@@ -76,11 +84,36 @@ impl<'a> Dds<'a> {
         if word(112) != 0 || word(24) > 1 {
             return Err("cube/volume model DDS is not implemented".into());
         }
+        let mut data_offset = 128usize;
         let (format, block_bytes) = if fourcc {
             match &header[84..88] {
                 b"DXT1" => (Format::Dxt1, 8usize),
                 b"DXT3" => (Format::Dxt3, 16),
                 b"DXT5" => (Format::Dxt5, 16),
+                b"ATI2" | b"BC5U" => (Format::Bc5, 16),
+                b"DX10" => {
+                    let extra = bytes
+                        .get(128..148)
+                        .ok_or("truncated model DDS DX10 header")?;
+                    let u = |i| u32::from_le_bytes(extra[i..i + 4].try_into().unwrap());
+                    if u(4) != 3 || u(8) & 4 != 0 || u(12) != 1 {
+                        return Err("DDS DX10 must describe one 2D surface".into());
+                    }
+                    if !matches!(u(16), 0 | 1 | 3) {
+                        return Err(
+                            "unsupported DDS DX10 alpha mode (expected straight or opaque)".into(),
+                        );
+                    }
+                    data_offset = 148;
+                    match u(0) {
+                        71 | 72 => (Format::Dxt1, 8),
+                        74 | 75 => (Format::Dxt3, 16),
+                        77 | 78 => (Format::Dxt5, 16),
+                        83 => (Format::Bc5, 16),
+                        98 | 99 => (Format::Bc7, 16),
+                        _ => return Err("unsupported DDS DXGI format".into()),
+                    }
+                }
                 tag => return Err(format!("unsupported model DDS format {tag:?}")),
             }
         } else {
@@ -142,7 +175,7 @@ impl<'a> Dds<'a> {
             return Err("model DDS mip count exceeds dimensions".into());
         }
         let mut mips = Vec::new();
-        let mut offset = 128usize;
+        let mut offset = data_offset;
         for i in 0..count {
             let w = (width >> i).max(1);
             let h = (height >> i).max(1);
@@ -169,7 +202,11 @@ impl<'a> Dds<'a> {
         // reading at the last mip. Only a chain that runs *past* the file is
         // malformed, and that is caught above by `bytes.get(..)`.
         let _ = offset;
-        Ok(Self { format, mips })
+        Ok(Self {
+            format,
+            mips,
+            data_offset,
+        })
     }
 }
 #[cfg(test)]
@@ -210,6 +247,32 @@ mod tests {
                 assert!(m.bytes.iter().all(|b| *b == i as u8));
                 assert_eq!(m.bytes.len(), if i == 0 { 4 * unit } else { unit });
             }
+        }
+    }
+    #[test]
+    fn dx10_uses_the_extended_header_and_rejects_arrays_cubes_and_snorm() {
+        for (dxgi, format, block_bytes) in [
+            (72u32, Format::Dxt1, 8),
+            (74, Format::Dxt3, 16),
+            (78, Format::Dxt5, 16),
+            (83, Format::Bc5, 16),
+            (99, Format::Bc7, 16),
+        ] {
+            let mut bytes = fixture(b"DX10", block_bytes);
+            bytes.splice(
+                128..128,
+                [dxgi, 3, 0, 1, 0].into_iter().flat_map(u32::to_le_bytes),
+            );
+            let surface = Dds::parse(&bytes).unwrap();
+            assert_eq!(surface.format, format);
+            assert_eq!(surface.data_offset, 148);
+            assert_eq!(surface.mips[3].bytes, vec![3; block_bytes]);
+            for (field, value) in [(128, 84u32), (132, 4), (136, 4), (140, 2), (144, 2)] {
+                let mut wrong = bytes.clone();
+                wrong[field..field + 4].copy_from_slice(&value.to_le_bytes());
+                assert!(Dds::parse(&wrong).is_err());
+            }
+            assert!(Dds::parse(&bytes[..147]).is_err());
         }
     }
     /// One uncompressed `DDPF_RGB` surface, built the way the client stores it:

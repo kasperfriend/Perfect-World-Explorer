@@ -79,7 +79,11 @@ impl Fsr1Gpu {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("FSR 1 EASU and RCAS WGSL"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("fsr1.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                [include_str!("fsr1_easu.wgsl"), include_str!("fsr1.wgsl")]
+                    .concat()
+                    .into(),
+            ),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("FSR 1 pipeline layout"),

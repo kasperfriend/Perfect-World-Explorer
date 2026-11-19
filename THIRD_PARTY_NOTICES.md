@@ -149,8 +149,9 @@ print exactly which names were found):
 
 - **What it is:** AMD's FSR 1 spatial upscaler. This build ships a scalar
   WGSL port of the EASU (edge-adaptive spatial upsampler) and RCAS (robust
-  contrast-adaptive sharpening) passes in `src/fsr1.wgsl` and
-  `src/fsr1_gpu.rs`. It is **not** part of the FidelityFX SDK and needs no
+  contrast-adaptive sharpening) passes in `src/fsr1_easu.wgsl`,
+  `src/fsr1.wgsl` and `src/fsr1_gpu.rs`. Lighter can optionally use EASU
+  alone to upscale filtered ray color. It is **not** part of the FidelityFX SDK and needs no
   vendor binary; the Graphics tab lists it as "FSR 1 (EASU + RCAS)".
 - **License:** MIT License.
   Derived from GPUOpen-Effects/FidelityFX-FSR, `ffx-fsr/ffx_fsr1.h`.
@@ -166,7 +167,15 @@ print exactly which names were found):
   persons to whom the Software is furnished to do so, subject to the
   following conditions:
   The above copyright notice and this permission notice shall be included
-  in all copies or substantial portions of the Software."
+  in all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+  OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE."
 
   The scalar (non-gather4) formulation, the WGSL syntax and the integration
   are this project's work; the algorithm, constants and structure follow
@@ -227,6 +236,33 @@ print exactly which names were found):
   environment — the CI runner has no GPU. XeSS Frame Generation is only
   exposed with XeSS upscaling or none — cross-vendor frame-generation
   pairings are not documented by Intel and are not offered.
+
+## bcdec_rs — BC5 and BC7 decoded texture fallback
+
+[bcdec_rs](https://github.com/ScanMountGoat/image_dds/tree/5e1ef829f8c44980e21bdcda2e1ffb574b81b57b/bcdec_rs)
+0.2.1 is the Rust port of [bcdec](https://github.com/iOrange/bcdec).
+Both are used under the MIT License.
+
+- Copyright (c) 2023 SMG
+- Copyright (c) 2022 Sergii Kudlai
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ## Everything else
 

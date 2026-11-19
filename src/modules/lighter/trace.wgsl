@@ -161,6 +161,7 @@ const AREA_TOP: u32 = 2u;
 const LINEAR_DATA: u32 = 4u;
 const ALPHA_IS_DATA: u32 = 8u;
 const PACKED_MASK: u32 = 16u;
+const NORMAL_RG: u32 = 128u;
 
 fn linear_texels(c: vec4<f32>) -> vec4<f32> {
     return select(c/12.92,pow((c+0.055)/1.055,vec4<f32>(2.4)),c>vec4<f32>(0.04045));
@@ -411,8 +412,8 @@ fn terrain_color(p: vec3<f32>, face: vec3<f32>, ray: Ray, t: f32, baked: vec4<f3
         gu *= scale.x;
         gv *= scale.y;
         let addr = texels[at];
-        let c = filtered_tile(addr,vec2<f32>(dot(gu,p),dot(gv,p)),false,
-            footprint_taps(addr,ray.dir,face,gu,gv,width)).rgb;
+        let c = terrain_tile(addr,vec2<f32>(dot(gu,p),dot(gv,p)),
+            footprint_taps(addr,ray.dir,face,gu,gv,width));
         rgb += (left*weight)*select(c,encoded(c),baked.a>0.);
         left *= 1.-weight;
     }
@@ -743,7 +744,11 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
         switch stage {
             case 0u: { tex = value; }
             case 1u: {
-                let bump = tangent_normal(m,inst,v,scale,n,value.xyz*2.-1.);
+                var sample = value.xyz*2.-1.;
+                if (texels[addr+3u] & NORMAL_RG)!=0u {
+                    sample.z = sqrt(max(0.,1.-dot(sample.xy,sample.xy)));
+                }
+                let bump = tangent_normal(m,inst,v,scale,n,sample);
                 if dot(bump,face)>1.e-4 && dot(bump,ray.dir)<0. { n = bump; }
             }
             case 2u: { hi = value; }
@@ -973,51 +978,67 @@ struct LightRay {
     purpose: u32, key: vec2<u32>,
 }
 struct LightCursor { feed: u32, node: u32, item: u32, end_item: u32 }
-fn next_light(p: vec3<f32>, s: Surface, cursor: ptr<function,LightCursor>, seed: ptr<function,u32>) -> LightRay {
+const LIGHT_MOVING: u32 = 0x80000000u;
+fn empty_light() -> LightRay {
+    return LightRay(vec3<f32>(0.),0.,vec3<f32>(0.),vec3<f32>(0.),VIEW,vec2<u32>(NIL));
+}
+fn local_power(light: LightRay) -> f32 {
+    return max(luminance(max(light.energy,vec3<f32>(0.))),0.);
+}
+fn local_light(p: vec3<f32>, n: vec3<f32>, face: vec3<f32>, key: u32, seed: ptr<function,u32>) -> LightRay {
+    let m = (key & LIGHT_MOVING)!=0u;
+    let index = key & ~LIGHT_MOVING;
+    let a = word(m,9u) + index*12u;
+    let to = floats(m,a)-p;
+    let r = bitcast<f32>(word(m,a+3u));
+    let d2 = dot(to,to);
+    if d2>=r*r || d2<=1.e-8 { return empty_light(); }
+    var rgb = floats(m,a+4u);
+    if (word(m,a+10u) & 1u)!=0u {
+        if frame.material_time.z<=0. { return empty_light(); }
+        // The client scales its encoded diffuse before the color stage.
+        rgb = linear(clamp(rgb*frame.material_time.z,vec3<f32>(0.),vec3<f32>(1.)));
+    }
+    let d = sqrt(d2);
+    var sample = to/d;
+    var end = d;
+    let kind = word(m,a+8u);
+    if (frame.options.x & SHADOWS)!=0u && kind!=0u {
+        let radius = min(bitcast<f32>(word(m,a+9u)),d*0.99);
+        let u = random(seed);
+        let phi = random(seed)*6.2831853;
+        if kind==1u {
+            // Uniform solid-angle cone subtended by the sphere. The
+            // endpoint is its near surface, not the emitter center.
+            let t2 = radius*radius/d2;
+            let delta = u*t2/(1.+sqrt(1.-t2));
+            let sin2 = delta*(2.-delta);
+            sample = around(sample,1.-delta,sqrt(sin2),phi);
+            end = d*(1.-delta)-sqrt(max(0.,radius*radius-d2*sin2));
+        } else {
+            // Authored direction is unavailable for runtime lights;
+            // use a finite, receiver-facing disk of equivalent size.
+            let delta = around(sample,0.,1.,phi)*(radius*sqrt(u));
+            end = length(to+delta);
+            sample = (to+delta)/end;
+        }
+    }
+    let cosine = dot(sample,n);
+    if cosine<=0. || dot(sample,face)<=0. { return empty_light(); }
+    let falloff = 1.-d/r;
+    return LightRay(sample,end,rgb*(cosine*falloff*falloff),vec3<f32>(0.),VIEW,vec2<u32>(NIL));
+}
+fn next_light(p: vec3<f32>, s: Surface, cursor: ptr<function,LightCursor>, seed: ptr<function,u32>, identity: ptr<function,vec2<u32>>) -> LightRay {
     loop {
         let m = (*cursor).feed!=0u;
         if (*cursor).item<(*cursor).end_item {
             let index = word(m,word(m,6u)+(*cursor).item);
-            let a = word(m,9u) + index*12u;
             (*cursor).item++;
-            let to = floats(m,a)-p;
-            let r = bitcast<f32>(word(m,a+3u));
-            let d2 = dot(to,to);
-            if d2>=r*r || d2<=1.e-8 { continue; }
-            var rgb = floats(m,a+4u);
-            if (word(m,a+10u) & 1u)!=0u {
-                if frame.material_time.z<=0. { continue; }
-                // The client scales its encoded diffuse before the color stage.
-                rgb = linear(clamp(rgb*frame.material_time.z,vec3<f32>(0.),vec3<f32>(1.)));
-            }
-            let d = sqrt(d2);
-            var sample = to/d;
-            var end = d;
-            let kind = word(m,a+8u);
-            if (frame.options.x & SHADOWS)!=0u && kind!=0u {
-                let radius = min(bitcast<f32>(word(m,a+9u)),d*0.99);
-                let u = random(seed);
-                let phi = random(seed)*6.2831853;
-                if kind==1u {
-                    // Uniform solid-angle cone subtended by the sphere. The
-                    // endpoint is its near surface, not the emitter center.
-                    let t2 = radius*radius/d2;
-                    let delta = u*t2/(1.+sqrt(1.-t2));
-                    let sin2 = delta*(2.-delta);
-                    sample = around(sample,1.-delta,sqrt(sin2),phi);
-                    end = d*(1.-delta)-sqrt(max(0.,radius*radius-d2*sin2));
-                } else {
-                    // Authored direction is unavailable for runtime lights;
-                    // use a finite, receiver-facing disk of equivalent size.
-                    let delta = around(sample,0.,1.,phi)*(radius*sqrt(u));
-                    end = length(to+delta);
-                    sample = (to+delta)/end;
-                }
-            }
-            let cosine = dot(sample,s.n);
-            if cosine<=0. || dot(sample,s.face)<=0. { continue; }
-            let falloff = 1.-d/r;
-            return LightRay(sample,end,rgb*(cosine*falloff*falloff),vec3<f32>(0.),VIEW,vec2<u32>(NIL));
+            let tag = vec2<u32>(index | select(0u,LIGHT_MOVING,m),*seed);
+            let light = local_light(p,s.n,s.face,tag.x,seed);
+            if light.distance<=0. { continue; }
+            *identity = tag;
+            return light;
         }
         if (*cursor).node>=word(m,13u) {
             if m { break; }
@@ -1035,23 +1056,26 @@ fn next_light(p: vec3<f32>, s: Surface, cursor: ptr<function,LightCursor>, seed:
     }
     return LightRay(vec3<f32>(0.),0.,vec3<f32>(0.),vec3<f32>(0.),VIEW,vec2<u32>(NIL));
 }
-// Single-frame importance resampling of local area/point proposals. Only the
-// selected candidate spends a shadow ray. The power (unshadowed luminance)
-// PMF uses one realization per source: conditioning on those realizations,
-// the selected energy divided by its PMF has the original summed expectation.
-fn resample_lights(p: vec3<f32>, s: Surface, cursor: ptr<function,LightCursor>, seed: ptr<function,u32>) -> LightRay {
-    var selected = LightRay(vec3<f32>(0.),0.,vec3<f32>(0.),vec3<f32>(0.),VIEW,vec2<u32>(NIL));
+// One unshadowed realization per eligible local source, then exactly one
+// shadow ray. The optional screen cache combines only fresh reservoirs.
+fn resample_lights(p: vec3<f32>, s: Surface, cursor: ptr<function,LightCursor>, reuse: bool, seed: ptr<function,u32>) -> LightRay {
+    var selected = empty_light();
     var sum = 0.;
     var chosen = 0.;
+    var identity = vec2<u32>(NIL);
+    var selected_tag = identity;
     loop {
-        let candidate = next_light(p,s,cursor,seed);
+        let candidate = next_light(p,s,cursor,seed,&identity);
         if candidate.distance<=0. { break; }
-        let power = max(luminance(max(candidate.energy,vec3<f32>(0.))),0.);
+        let power = local_power(candidate);
         if power<=0. { continue; }
         sum += power;
-        if random(seed)*sum<power { selected = candidate; chosen = power; }
+        if random(seed)*sum<power { selected = candidate; chosen = power; selected_tag = identity; }
     }
-    if chosen>0. { selected.energy *= sum/chosen; }
+    var inv_pmf = 0.;
+    if chosen>0. { inv_pmf = sum/chosen; }
+    if reuse { return screen_lights(p,s,selected_tag,inv_pmf,selected,seed); }
+    if chosen>0. { selected.energy *= inv_pmf; }
     return selected;
 }
 fn random(seed: ptr<function,u32>) -> f32 {
@@ -1108,7 +1132,7 @@ fn material_bsdf(s: Surface) -> Bsdf {
     let alpha = select(sqrt(2./(2.+max(s.power,0.))),s.pbr.y*s.pbr.y,authored);
     return Bsdf(albedo*(1.-metallic),select(vec3<f32>(0.),clamp(f0,vec3<f32>(0.),vec3<f32>(1.)),(frame.options.x & REFLECTIONS)!=0u),clamp(alpha,0.002,1.));
 }
-fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u32, purpose: u32, emission_weight: f32, cache_sun: bool, seed: ptr<function,u32>) -> vec3<f32> {
+fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u32, purpose: u32, emission_weight: f32, cache_sun: bool, reuse_local: bool, seed: ptr<function,u32>) -> vec3<f32> {
     if (s.flags & EMISSIVE)!=0u { return s.color.rgb*emission_weight; }
     let lit = (frame.options.x & LIGHTING)!=0u;
     let baked = (s.flags & BAKED)!=0u;
@@ -1192,8 +1216,11 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u3
             if sample_local {
                 if local_spent { break; }
                 local_spent = true;
-                light = resample_lights(p,s,&cursor,seed);
-            } else { light = next_light(p,s,&cursor,seed); }
+                light = resample_lights(p,s,&cursor,reuse_local,seed);
+            } else {
+                var unused: vec2<u32>;
+                light = next_light(p,s,&cursor,seed,&unused);
+            }
             if light.distance<=0. { break; }
             if medium!=0u && medium!=OPEN_WATER {
                 let sizing = Ray(p,light.dir,0.,light.distance,0.,0.,0.,0u);
@@ -1435,7 +1462,17 @@ fn transport(first: Ray, primary: Hit, raster: bool, seed: ptr<function,u32>) ->
                         mis = balance(path.previous.w,emitter_pdf_at(hit,path.previous.xyz,p));
                     }
                     let cache = !sheet && path.depth==0u && branch==0u && medium.body==0u;
-                    color = direct(p,s,ray,hit.t,terminal || sheet,medium.body,path.purpose,mis,cache,seed);
+                    var cached = vec4<f32>(0.);
+                    if terminal && path.depth==1u && path.purpose==DIFFUSE && !sheet &&
+                       medium.body==0u && path.medium==0u {
+                        cached = screen_gi_read(p,s,hit);
+                    }
+                    if cached.a>0. { color = cached.rgb; }
+                    else {
+                        let reuse_local = cache && !layered && screen_surface(s,hit);
+                        color = direct(p,s,ray,hit.t,terminal || sheet,medium.body,path.purpose,mis,cache,reuse_local,seed);
+                        if cache && !layered && !terminal && path.medium==0u { screen_gi_write(p,s,hit,color); }
+                    }
                 }
                 if !sheet {
                     color = project_decals(s,p,ray,hit.t,color);
@@ -1543,7 +1580,12 @@ fn transport(first: Ray, primary: Hit, raster: bool, seed: ptr<function,u32>) ->
                     continue;
                 }
                 if can_reflect && f>0. {
-                    if single {
+                    // The single-sample primary water guide deliberately
+                    // refuses spatial filtering and camera reprojection.
+                    // Keep its first split so animated waves do not flicker
+                    // between a full-strength mirror and a transmitted ray.
+                    let stable_water = water && path.purpose==VIEW && path.depth==1u && frame.options.z==1u;
+                    if single && !stable_water {
                         // Sample exactly one lobe. For the chosen proposal
                         // p=F or p=1-F the BSDF/PMF ratio is exactly one. The
                         // independent eta^2/tint below still applies to T.
@@ -1656,6 +1698,7 @@ fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool) {
     sun_cache_read = 0u;
     sun_cache_write = 0u;
     let at = id.y*frame.extent.x+id.x;
+    screen_begin(at);
     if frame.sampling.z!=0u { sun_cache_read = image[at].albedo_history & SUN_CACHE; }
     var total = vec3<f32>(0.);
     var depth = 0.;
@@ -1681,6 +1724,7 @@ fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool) {
     var pixel = pack_pixel(total/f32(frame.options.z),depth,guide,owner|select(0u,DEP_MOVING,motion_dependent));
     pixel.albedo_history |= sun_cache_write;
     image[at] = pixel;
+    screen_end();
 }
 
 @compute @workgroup_size(8,8)

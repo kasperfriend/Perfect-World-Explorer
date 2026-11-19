@@ -234,16 +234,7 @@ impl Primary {
             revision: None,
             moving_current: false,
         };
-        let source = [
-            super::super::PIXELS,
-            super::super::BSDF,
-            super::super::MEDIA,
-            super::super::REFERENCE,
-            super::super::BASE,
-            super::super::SOFTWARE,
-            include_str!("../primary.wgsl"),
-        ]
-        .concat();
+        let source = super::super::raster_source();
         let vs = shader_entry(&source, naga_rt::ShaderStage::Vertex, "visibility_vertex")?;
         let fs = shader_entry(
             &source,

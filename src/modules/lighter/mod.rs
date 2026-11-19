@@ -24,9 +24,77 @@ const BSDF: &str = include_str!("bsdf.wgsl");
 const REFERENCE: &str = include_str!("reference.wgsl");
 const MEDIA: &str = include_str!("media.wgsl");
 const BASE: &str = include_str!("trace.wgsl");
+const EASU: &str = include_str!("../../fsr1_easu.wgsl");
+const PRESENT: &str = include_str!("present.wgsl");
 const SOFTWARE: &str = include_str!("software.wgsl");
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 const HARDWARE: &str = include_str!("hardware.wgsl");
+
+const BC_TERRAIN: &str = include_str!("bc_terrain.wgsl");
+const DECODED_TERRAIN: &str = r#"
+fn terrain_tile(addr: u32, uv: vec2<f32>, taps: Taps) -> vec3<f32> {
+    return filtered_tile(addr,uv,false,taps).rgb;
+}
+"#;
+
+const SCREEN_REUSE: &str = include_str!("screen_reuse.wgsl");
+const SCREEN_OFF: &str = r#"
+fn screen_begin(at: u32) {}
+fn screen_end() {}
+fn screen_surface(s: Surface, hit: Hit) -> bool { return false; }
+fn screen_lights(p: vec3<f32>, s: Surface, tag: vec2<u32>, inv_pmf: f32, fresh: LightRay, seed: ptr<function,u32>) -> LightRay {
+    var ray = fresh;
+    ray.energy *= inv_pmf;
+    return ray;
+}
+fn screen_gi_read(p: vec3<f32>, s: Surface, hit: Hit) -> vec4<f32> { return vec4<f32>(0.); }
+fn screen_gi_write(p: vec3<f32>, s: Surface, hit: Hit, color: vec3<f32>) {}
+"#;
+
+const SCREEN_DI: u32 = 1;
+const SCREEN_GI: u32 = 2;
+const SCREEN_PREVIOUS: u32 = 4;
+const SCREEN_GI_PREVIOUS: u32 = 8;
+const SCREEN_IMAGE_PLANES: u64 = 7;
+
+fn screen_reuse_requested() -> u32 {
+    match std::env::var("PW_RAY_SCREEN_REUSE").as_deref() {
+        Ok("di") => SCREEN_DI,
+        Ok("gi") => SCREEN_GI,
+        Ok("both") => SCREEN_DI | SCREEN_GI,
+        _ => 0,
+    }
+}
+
+pub(crate) fn wants_screen_reuse() -> bool {
+    screen_reuse_requested() != 0
+}
+
+fn trace_source(backend: &str, compact_terrain: bool, screen_reuse: bool) -> String {
+    let terrain = if compact_terrain {
+        BC_TERRAIN
+    } else {
+        DECODED_TERRAIN
+    };
+    let reuse = if screen_reuse {
+        SCREEN_REUSE
+    } else {
+        SCREEN_OFF
+    };
+    [
+        PIXELS, BSDF, MEDIA, REFERENCE, BASE, terrain, reuse, backend,
+    ]
+    .concat()
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn raster_source() -> String {
+    // Only candidate acceptance runs in the fragment stage; opaque terrain
+    // color and screen caches are consumed by the compute sibling instead.
+    let mut source = trace_source(SOFTWARE, false, false);
+    source.push_str(include_str!("primary.wgsl"));
+    source
+}
 
 pub fn supports_hardware(adapter: &wgpu::Adapter) -> bool {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -297,7 +365,7 @@ struct Software {
 }
 
 impl Software {
-    fn new(device: &wgpu::Device) -> Self {
+    fn new(device: &wgpu::Device, compact_terrain: bool, screen_reuse: bool) -> Self {
         let stage = wgpu::ShaderStages::COMPUTE;
         let read = wgpu::BufferBindingType::Storage { read_only: true };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -322,9 +390,7 @@ impl Software {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Lighter software BVH"),
             source: wgpu::ShaderSource::Wgsl(
-                [PIXELS, BSDF, MEDIA, REFERENCE, BASE, SOFTWARE]
-                    .concat()
-                    .into(),
+                trace_source(SOFTWARE, compact_terrain, screen_reuse).into(),
             ),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -480,9 +546,7 @@ impl Present {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Lighter scene and depth blit"),
-            source: wgpu::ShaderSource::Wgsl(
-                [PIXELS, include_str!("present.wgsl")].concat().into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl([PIXELS, EASU, PRESENT].concat().into()),
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Lighter scene and depth output"),
@@ -535,13 +599,14 @@ impl Present {
         image: &wgpu::Buffer,
         extent: [u32; 4],
         guided: bool,
+        fsr1_easu: bool,
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
     ) {
         queue.write_buffer(
             &self.extent,
             0,
-            bytemuck::bytes_of(&[extent, [u32::from(guided), 0, 0, 0]]),
+            bytemuck::bytes_of(&[extent, [u32::from(guided), u32::from(fsr1_easu), 0, 0]]),
         );
         let bind = self.binds.get(
             device,
@@ -605,6 +670,10 @@ pub struct Lighter {
     armed: bool,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     capture: bool,
+    compact_terrain: bool,
+    screen_reuse: u32,
+    screen_written: bool,
+    screen_last_flags: u32,
     adapter_supports_compute: bool,
     has_hardware_device: bool,
     native_backend: wgpu::Backend,
@@ -642,6 +711,10 @@ impl Default for Lighter {
             armed: false,
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             capture: false,
+            compact_terrain: false,
+            screen_reuse: 0,
+            screen_written: false,
+            screen_last_flags: 0,
             adapter_supports_compute: false,
             has_hardware_device: false,
             native_backend: wgpu::Backend::Empty,
@@ -664,6 +737,8 @@ impl Lighter {
         let rt = device_features(adapter, settings.mode);
         Self {
             armed: settings.mode != Mode::Off,
+            compact_terrain: textures::compact_terrain_enabled(),
+            screen_reuse: screen_reuse_requested(),
             timings: (settings.mode != Mode::Off)
                 .then(|| profile::Timings::new(device))
                 .flatten(),
@@ -725,6 +800,10 @@ impl Lighter {
         assert!(device.features().contains(Self::CPU_QUERY_TEST_FEATURES));
         self.has_hardware_device = true;
         self.for_capture()
+    }
+
+    pub(crate) fn screen_reuse_flags(&self) -> u32 {
+        self.screen_last_flags & 15
     }
 
     pub fn armed(&self) -> bool {
@@ -845,6 +924,8 @@ impl Lighter {
 
     pub(crate) fn reset_history(&mut self) {
         self.history.reset();
+        self.screen_written = false;
+        self.screen_last_flags = 0;
     }
 
     pub fn fail_frame(&mut self, error: String) {
@@ -924,6 +1005,27 @@ impl Lighter {
         Ok((rw, rh))
     }
 
+    fn trace_image_layout(&self, device: &wgpu::Device, rw: u32, rh: u32) -> (u64, u32) {
+        let bytes = u64::from(rw) * u64::from(rh) * PIXEL_BYTES;
+        let s = self.settings.effective();
+        if self.screen_reuse == 0
+            || s.reference
+            || !s.progressive
+            || s.samples != 1
+            || !s.lighting
+            || !s.shadows
+            || bytes * SCREEN_IMAGE_PLANES > image_limit(device)
+        {
+            return (bytes, 0);
+        }
+        let flags = self.screen_reuse
+            & (u32::from(s.single_path) * SCREEN_DI | u32::from(s.bounces == 1) * SCREEN_GI);
+        (
+            bytes * if flags != 0 { SCREEN_IMAGE_PLANES } else { 1 },
+            flags,
+        )
+    }
+
     /// Swapchain recreation may idle the native device, not just the wgpu
     /// queue. A raw image fill is not visible to wgpu's lifetime tracker.
     pub(crate) fn poll_hardware(&mut self) -> Result<bool, String> {
@@ -946,16 +1048,18 @@ impl Lighter {
         if self.settings.mode == Mode::Software && self.software.is_none() {
             // Start the cold compute pipeline in the same preflight as Hardware,
             // before acquiring a swapchain image or starting scene submission.
-            self.software = Some(checked_pipeline(device, || Software::new(device))?);
+            self.software = Some(checked_pipeline(device, || {
+                Software::new(device, self.compact_terrain, self.screen_reuse != 0)
+            })?);
         }
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         if self.settings.mode == Mode::Hardware && self.unavailable().is_none() {
             let (rw, rh) = self.ray_extent(device, w, h)?;
-            let bytes = u64::from(rw) * u64::from(rh) * PIXEL_BYTES;
+            let (bytes, _) = self.trace_image_layout(device, rw, rh);
             if self.hardware.is_none() {
                 self.hardware = Some(vulkan::Renderer::new(
                     device,
-                    &[PIXELS, BSDF, MEDIA, REFERENCE, BASE, HARDWARE].concat(),
+                    &trace_source(HARDWARE, self.compact_terrain, self.screen_reuse != 0),
                 )?);
             }
             let rt = self.hardware.as_mut().unwrap();
@@ -1058,7 +1162,7 @@ impl Lighter {
         frame.options[1] = settings.bounces;
         frame.options[2] = settings.samples;
         frame.material_time[3] = settings.diffuse_distance as f32;
-        let bytes = u64::from(rw) * u64::from(rh) * PIXEL_BYTES;
+        let (bytes, screen) = self.trace_image_layout(device, rw, rh);
         if self.present.is_none() {
             self.present = Some(checked_pipeline(device, || Present::new(device, format))?);
         }
@@ -1108,6 +1212,18 @@ impl Lighter {
                     && history.changed_animations == 0
                     && history.previous_from_current.is_none(),
             );
+            if screen != 0 {
+                let same_view =
+                    history.reuse && history.previous_from_current.is_none() && self.screen_written;
+                frame.sampling[3] = screen
+                    | (u32::from(same_view) * SCREEN_PREVIOUS)
+                    | (u32::from(
+                        same_view
+                            && screen & SCREEN_GI != 0
+                            && history.changed_animations & post::ANIM_GEOMETRY == 0,
+                    ) * SCREEN_GI_PREVIOUS)
+                    | (history.changed_animations << 8);
+            }
             Some(history)
         } else {
             self.history.reset();
@@ -1153,6 +1269,8 @@ impl Lighter {
             }
             Mode::Off => return Err("Lighter render requested while off".into()),
         };
+        self.screen_written = screen != 0;
+        self.screen_last_flags = frame.sampling[3];
         if let Some(t) = &timed {
             if settings.mode == Mode::Hardware {
                 t.stamp(encoder, 0);
@@ -1187,6 +1305,7 @@ impl Lighter {
             image,
             frame.extent,
             settings.denoiser,
+            settings.fsr1_easu,
             target,
             depth,
         );
@@ -1341,7 +1460,7 @@ impl Lighter {
         );
         ui.checkbox(&mut self.settings.reflections, "Ray-traced reflections");
         ui.checkbox(&mut self.settings.single_path, "Single-path transport")
-            .on_hover_text("Sample one Fresnel lobe at water/glass and use roulette after two bounces. Keep progressive sampling on to resolve both lobes over time.");
+            .on_hover_text("Sample one Fresnel lobe and use roulette after two bounces. A first-hit water surface still splits at one sample to avoid visible, unfiltered speckle.");
         ui.checkbox(&mut self.settings.reference, "Reference (32 spp, 8 bounces)")
             .on_hover_text("Full resolution with sky and mesh light sampling, no history or denoising. Overrides lighting, relight and quality settings while enabled.");
         ui.checkbox(&mut self.settings.denoiser, "Edge-aware denoiser")
@@ -1369,6 +1488,8 @@ impl Lighter {
                 .text("Ray resolution")
                 .suffix("%"),
         );
+        ui.add_enabled(!self.settings.reference, egui::Checkbox::new(&mut self.settings.fsr1_easu, "FSR 1 spatial upscale (EASU)"))
+            .on_hover_text("Reconstruct color from the filtered ray image when rays are below output resolution. Depth is still the nearest current ray sample. This is not the temporal FSR SDK or DLSS Ray Reconstruction.");
         ui.checkbox(&mut self.settings.dynamic_resolution,"Automatic ray resolution (50–100%)")
             .on_hover_text("Uses completed GPU timings with hysteresis. The slider seeds the adaptive scale; pipelines without timestamps keep the fixed scale.");
         if self.settings.dynamic_resolution && !self.settings.reference {
@@ -1419,6 +1540,15 @@ impl Lighter {
         }
         if self.replaces_world() {
             self.profile_ui(ui);
+            if self.screen_reuse != 0 {
+                let active = self.screen_reuse_flags() & 3;
+                ui.label(match active {
+                    SCREEN_DI => "Experimental local-light reservoirs active",
+                    SCREEN_GI => "Experimental diffuse screen cache active",
+                    3 => "Experimental reservoirs and diffuse screen cache active",
+                    _ => "Screen reuse not admitted at these settings or resolution",
+                });
+            }
             if let Some(coverage) = &self.scenery_coverage {
                 ui.label(coverage);
             }

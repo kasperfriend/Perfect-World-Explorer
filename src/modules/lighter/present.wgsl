@@ -17,6 +17,11 @@ fn index(p: vec2<i32>) -> u32 {
     let v = vec2<u32>(clamp(p,vec2<i32>(0),vec2<i32>(present.extent.xy)-1));
     return v.y*present.extent.x+v.x;
 }
+// FSR 1 EASU loads the filtered linear ray buffer directly. No extra color
+// image or RCAS is required, and the ray depth path below is unchanged.
+fn load_texel(pos: vec2<i32>) -> vec3<f32> {
+    return color_of(pixels[index(pos)]);
+}
 struct Output { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 }
 @fragment fn fragment(@builtin(position) coord: vec4<f32>) -> Output {
     let extent = present.extent;
@@ -27,6 +32,9 @@ struct Output { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 }
     let source = coord.xy*vec2<f32>(extent.xy)/vec2<f32>(extent.zw)-0.5;
     let nearest = index(vec2<i32>(floor(source+0.5)));
     let center = pixels[nearest];
+    if present.options.y!=0u {
+        return Output(vec4<f32>(easu_color(source),1.),center.depth);
+    }
     let p = vec2<i32>(floor(source));
     let f = fract(source);
     var rgb = vec3<f32>(0.);

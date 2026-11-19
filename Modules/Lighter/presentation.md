@@ -4,9 +4,9 @@
 | --- | --- |
 | World shadows, reflections, refraction and fog | Trace paths. Do not run the Native water-reflection or underwater tint a second time. |
 | Temporal accumulation and spatial filtering | Lighter's linear radiance and guides. Current reverse-Z is preserved. Reference bypasses both. |
-| Resolution reconstruction | Lighter resolves its ray image into a full-size scene target, with guide-aware reconstruction **before** the scene post pass. The Native resolution scale and upscaler selection remain saved. |
+| Resolution reconstruction | Lighter resolves its ray image into a full-size scene target **before** scene post. The guide-aware resolve is the default; opt-in FSR 1 EASU reconstructs color only at sub-native ray resolution. Both return the nearest current reverse-Z sample. Reference bypasses the EASU option. |
 | Bloom, sharpen, scene gamma and final display encoding | The viewer's existing post/present stages, after ray reconstruction. No ray-world dependence for HUD or menus. |
-| Vendor upscalers, FSR1 and generated frames | Paused on the ray route, not fed stale Native motion, exposure or depth. Native/off keeps its prior behavior. A future temporal/FG integration needs coherent ray-world inputs before display post. |
+| Native upscalers and generated frames | The Native upscale/FG settings remain saved, but their pipelines are paused on the ray route. Do not feed them stale Native motion, exposure or depth. The Lighter EASU option reuses the portable FSR 1 kernel; it does not run the Native RCAS pass, temporal FidelityFX SDK, DLSS Ray Reconstruction or frame generation. |
 | Minimap, full map and Librarian preview | Independent Native/artwork cameras and offscreen passes. They do not reuse the main ray buffer or evict its scene. |
 
 The window handles both wgpu loss notifications and explicitly reported

@@ -569,6 +569,23 @@ struct MeshData {
     /// half of the world.
     local_scenery_skipped: bool,
 }
+/// A native residency update and the ray snapshot from those exact assets.
+/// Both stay pending until the existing paced native upload is complete.
+struct StreamedMesh {
+    native: MeshData,
+    rays: Option<Result<lighter_host::PreparedScene, String>>,
+}
+impl StreamedMesh {
+    fn prepare(
+        native: MeshData,
+        packer: Option<&mut lighter_host::StreamPacker>,
+        storage: usize,
+        mode: LighterMode,
+    ) -> Self {
+        let rays = packer.map(|p| p.prepare(&native, storage, mode));
+        Self { native, rays }
+    }
+}
 /// Which view's indirect terrain records the next submit draws. The records
 /// live in one buffer, so every pass re-queues the view it draws through: the
 /// main matrix (also used by both refraction passes), the water reflection's
@@ -2286,7 +2303,7 @@ impl Renderer {
                 crate::modules::lighter::storage_limit(&device),
             ) {
                 Ok(mut feed) => {
-                    feed.install(&mut lighter, &m, &device);
+                    feed.install_initial(&mut lighter, &m, &device);
                     Some(feed)
                 }
                 Err(error) => {
@@ -3178,11 +3195,11 @@ impl Renderer {
     }
     /// Advance any staged terrain upload. `pending` remains owned by the
     /// viewer until the replacement mesh and all of its atlas pages are ready.
-    fn update_mesh(&mut self, pending: &mut Option<MeshData>) -> Result<bool, String> {
+    fn update_mesh(&mut self, pending: &mut Option<StreamedMesh>) -> Result<bool, String> {
         let Some(mesh) = pending.as_ref() else {
             return Ok(false);
         };
-        if let Some(upload) = &mesh.terrain_upload {
+        if let Some(upload) = &mesh.native.terrain_upload {
             if !self.terrain_gpu.poll_residency(
                 &self.device,
                 &self.queue,
@@ -3193,9 +3210,12 @@ impl Renderer {
                 return Ok(false);
             }
         }
-        let mut m = pending.take().unwrap();
-        if let Some(feed) = &mut self.lighter_feed {
-            feed.install(&mut self.lighter, &m, &self.device);
+        let StreamedMesh {
+            native: mut m,
+            rays,
+        } = pending.take().unwrap();
+        if let (Some(feed), Some(rays)) = (&mut self.lighter_feed, rays) {
+            feed.install_prepared(&mut self.lighter, rays);
         }
         if let Some(mut upload) = m.terrain_upload.take() {
             upload.materials.release_gpu_source();
@@ -5796,7 +5816,13 @@ fn run_viewer(
     // the worker can leave the local half of the mesh out (see `build`).
     let (request_tx, request_rx) =
         std::sync::mpsc::channel::<(f32, f32, DetailSettings, u64, bool)>();
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<MeshData, String>>(1);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<StreamedMesh, String>>(1);
+    let mut ray_packer = renderer
+        .lighter_feed
+        .as_mut()
+        .and_then(lighter_host::Feed::take_packer);
+    let ray_storage = crate::modules::lighter::storage_limit(&renderer.device);
+    let ray_mode = renderer.lighter.settings.mode;
     std::thread::Builder::new()
         .name("world-streaming".into())
         .spawn(move || {
@@ -5813,10 +5839,13 @@ fn run_viewer(
                     grass_atlas_key,
                     skip_local_scenery,
                     ray_scenery.as_mut(),
-                );
+                )
+                .map(|native| {
+                    StreamedMesh::prepare(native, ray_packer.as_mut(), ray_storage, ray_mode)
+                });
                 crate::diag!(
                     TimingLoad,
-                    "Background terrain build at ({x:.1},{z:.1}) took {:.2}s",
+                    "Background terrain and ray build at ({x:.1},{z:.1}) took {:.2}s",
                     started.elapsed().as_secs_f32()
                 );
                 if result_tx.send(result).is_err() {
@@ -8609,6 +8638,7 @@ fn preview_frame_using(
     }
     for (key, option) in [
         ("PW_PREVIEW_SINGLE_PATH", &mut lighter_settings.single_path),
+        ("PW_PREVIEW_FSR1_EASU", &mut lighter_settings.fsr1_easu),
         (
             "PW_PREVIEW_HYBRID_PRIMARY",
             &mut lighter_settings.hybrid_primary,
@@ -8640,8 +8670,15 @@ fn preview_frame_using(
         if let Some(notice) = t.startup_notice.as_deref() {
             return Err(format!("Coverage capture refused a fallback map: {notice}"));
         }
-        // Report this frame, not a radiance mixture of the warm-up frames.
-        lighter_settings.progressive = false;
+        // Normally report this frame, not a mixture of warm-up radiance.
+        // The explicit screen-reuse experiment needs progressive history.
+        lighter_settings.progressive =
+            mode != LighterMode::Off && crate::modules::lighter::wants_screen_reuse();
+    }
+    match std::env::var("PW_PREVIEW_PROGRESSIVE").as_deref() {
+        Ok("0") => lighter_settings.progressive = false,
+        Ok("1") if mode != LighterMode::Off => lighter_settings.progressive = true,
+        _ => {}
     }
     if (audit.is_some() || mode != LighterMode::Off)
         && (std::env::var_os("PW_PREVIEW_WORLD_TEST").is_some()
@@ -8996,14 +9033,23 @@ fn preview_frame_using(
             let mips = renderer.lighter.texture_mips();
             writeln!(
                 meta,
-                "mip_fallback={}\nmip_generated={}\nmip_reduced={}\nmip_authored_levels={}",
-                mips.fallback, mips.generated, mips.reduced, mips.authored_levels
+                "mip_fallback={}\nmip_generated={}\nmip_reduced={}\nmip_authored_levels={}\nbc_terrain_tiles={}\nbc_terrain_saved_bytes={}",
+                mips.fallback, mips.generated, mips.reduced, mips.authored_levels,
+                mips.bc_terrain_tiles, mips.bc_terrain_saved_bytes
             )
             .unwrap();
             if let Some(bmd) = &renderer.lighter.scenery_coverage {
                 writeln!(meta, "{bmd}").unwrap();
             }
         }
+        // These describe the saved PNG, not the later instrumented draws.
+        writeln!(
+            meta,
+            "raster_primary={}\nscreen_reuse_flags={}",
+            renderer.lighter.raster_active(),
+            renderer.lighter.screen_reuse_flags()
+        )
+        .unwrap();
         // Capture timing is optional and is deliberately distinct from GPU
         // stage timings and the live asynchronous viewer's frame rate.
         let mut capture_ms = Vec::new();
@@ -9017,7 +9063,6 @@ fn preview_frame_using(
                 gpu_ms.push(stages);
             }
         }
-        writeln!(meta, "raster_primary={}", renderer.lighter.raster_active()).unwrap();
         if !capture_ms.is_empty() {
             writeln!(meta, "synchronized_capture_ms={capture_ms:?}").unwrap();
         }

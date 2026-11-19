@@ -247,6 +247,15 @@ impl Asset {
         let tile = if let Some(tile) = tiles.get(&key).and_then(Weak::upgrade) {
             tile
         } else {
+            let filter = if filter == Filter::Data
+                && tex.ray_dds.as_deref().is_some_and(|raw| {
+                    crate::model_dds::Dds::parse_base(raw)
+                        .is_ok_and(|dds| dds.format == crate::model_dds::Format::Bc5)
+                }) {
+                Filter::NormalRg
+            } else {
+                filter
+            };
             let chain = tex
                 .ray_dds
                 .as_deref()

@@ -49,6 +49,7 @@ pub struct Settings {
     pub samples: u32,
     pub resolution: u32,
     pub dynamic_resolution: bool,
+    pub fsr1_easu: bool,
     pub gpu_target_ms: u32,
     pub anisotropy: u32,
     pub relight_baked: bool,
@@ -74,6 +75,7 @@ impl Default for Settings {
             samples: 1,
             resolution: 50,
             dynamic_resolution: false,
+            fsr1_easu: false,
             gpu_target_ms: 12,
             anisotropy: 8,
             relight_baked: false,
@@ -105,6 +107,7 @@ impl Settings {
             samples: 32,
             resolution: 100,
             dynamic_resolution: false,
+            fsr1_easu: false,
             ..self
         }
     }
@@ -148,6 +151,7 @@ impl Settings {
                 "dynamic_resolution" => {
                     settings.dynamic_resolution = toggle(settings.dynamic_resolution)
                 }
+                "fsr1_easu" => settings.fsr1_easu = toggle(settings.fsr1_easu),
                 "gpu_target_ms" => settings.gpu_target_ms = number(settings.gpu_target_ms, 4, 50),
                 "reference" => settings.reference = toggle(settings.reference),
                 "physical_bsdf" => settings.physical_bsdf = toggle(settings.physical_bsdf),
@@ -165,9 +169,9 @@ impl Settings {
 
     pub(crate) fn encode(self) -> String {
         format!(
-            "# Lighter settings\nmode={}\nlighting={}\nregional_lighting={}\nshadows={}\nsoft_sun={}\nreflections={}\nsingle_path={}\nhybrid_primary={}\ndenoiser={}\nprogressive={}\nbounces={}\ndiffuse_distance={}\nsamples={}\nresolution={}\ndynamic_resolution={}\ngpu_target_ms={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\nreference={}\n",
+            "# Lighter settings\nmode={}\nlighting={}\nregional_lighting={}\nshadows={}\nsoft_sun={}\nreflections={}\nsingle_path={}\nhybrid_primary={}\ndenoiser={}\nprogressive={}\nbounces={}\ndiffuse_distance={}\nsamples={}\nresolution={}\ndynamic_resolution={}\nfsr1_easu={}\ngpu_target_ms={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\nreference={}\n",
             self.mode.token(), self.lighting, self.regional_lighting, self.shadows, self.soft_sun, self.reflections, self.single_path, self.hybrid_primary, self.denoiser, self.progressive, self.bounces,
-            self.diffuse_distance, self.samples, self.resolution, self.dynamic_resolution, self.gpu_target_ms, self.anisotropy, self.relight_baked, self.physical_bsdf, self.reference,
+            self.diffuse_distance, self.samples, self.resolution, self.dynamic_resolution, self.fsr1_easu, self.gpu_target_ms, self.anisotropy, self.relight_baked, self.physical_bsdf, self.reference,
         )
     }
 
@@ -229,15 +233,17 @@ mod tests {
         assert!(s.physical_bsdf);
         assert_eq!(Settings::decode(&s.encode()), s);
         assert_eq!(Settings::decode("mode=unknown"), Settings::default());
-        let reference =
-            Settings::decode("reference=true\nhybrid_primary=true\ndynamic_resolution=true");
+        let reference = Settings::decode(
+            "reference=true\nhybrid_primary=true\ndynamic_resolution=true\nfsr1_easu=true",
+        );
         assert_eq!(Settings::decode(&reference.encode()), reference);
         let e = reference.effective();
         assert_eq!([e.samples, e.bounces, e.resolution], [32, 8, 100]);
         assert!(e.physical_bsdf && e.shadows && e.relight_baked);
         assert!(!e.progressive && !e.denoiser && reference.progressive);
         assert_eq!(e.diffuse_distance, 0);
-        assert!(!e.hybrid_primary && !e.single_path && !e.dynamic_resolution);
+        assert!(!e.hybrid_primary && !e.single_path && !e.dynamic_resolution && !e.fsr1_easu);
+        assert!(reference.fsr1_easu);
         assert!(reference.hybrid_primary && reference.single_path && reference.dynamic_resolution);
     }
 }

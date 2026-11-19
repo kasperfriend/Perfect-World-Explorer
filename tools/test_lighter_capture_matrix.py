@@ -30,6 +30,10 @@ class CaptureMatrixTests(unittest.TestCase):
             matrix.validate_match(soft, hard | {"eye": "different"})
         with self.assertRaisesRegex(ValueError, "different effective settings"):
             matrix.validate_match(soft, hard | {"settings_effective": hard["settings_effective"].replace("1", "2")})
+        for name in ("bc_terrain_tiles", "bc_terrain_saved_bytes", "screen_reuse_flags"):
+            with self.assertRaisesRegex(ValueError, f"unmatched {name}"):
+                matrix.validate_match(soft, hard | {name: "3"})
+            matrix.validate_match(soft | {name: "3"}, hard | {name: "3"})
 
     def test_hybrid_ab_relaxes_only_the_primary_toggle(self):
         full = dict.fromkeys(matrix.MATCH_KEYS, "fixed") | {

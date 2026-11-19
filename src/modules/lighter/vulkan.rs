@@ -1270,6 +1270,11 @@ impl Renderer {
         }
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn image_for_test(&self) -> &wgpu::Buffer {
+        self.output.as_ref().unwrap().imported.as_ref().unwrap()
+    }
+
     pub(super) fn try_prepare_image(&mut self, device: &wgpu::Device, size: u64) -> R<bool> {
         if !self.poll_frame()? {
             return Ok(false);

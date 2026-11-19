@@ -359,24 +359,29 @@ enum PendingTexture {
 }
 
 fn decode_texture_bytes(key: &str, data: Vec<u8>, keep_ray_dds: bool) -> Result<Texture, String> {
-    let decoded = if key.ends_with(".tga") {
-        image::load_from_memory_with_format(&data, image::ImageFormat::Tga)
+    let is_dds = data.starts_with(b"DDS ");
+    let img = if is_dds && data.get(84..88) == Some(b"DX10") {
+        // The generic decoder does not enforce the single 2D surface contract.
+        crate::model_dds::decode_base(&data)?
     } else {
-        image::load_from_memory(&data)
-    };
-    match decoded {
-        Ok(img) => {
-            let img = img.into_rgba8();
-            let (w, h) = img.dimensions();
-            Ok(Texture {
-                width: w as usize,
-                height: h as usize,
-                rgba: img.into_raw(),
-                ray_dds: (keep_ray_dds && data.starts_with(b"DDS ")).then_some(data),
-            })
+        let decoded = if key.ends_with(".tga") {
+            image::load_from_memory_with_format(&data, image::ImageFormat::Tga)
+        } else {
+            image::load_from_memory(&data)
+        };
+        match decoded {
+            Ok(img) => img.into_rgba8(),
+            Err(_) if is_dds => crate::model_dds::decode_base(&data)?,
+            Err(err) => return Err(err.to_string()),
         }
-        Err(err) => Err(err.to_string()),
-    }
+    };
+    let (w, h) = img.dimensions();
+    Ok(Texture {
+        width: w as usize,
+        height: h as usize,
+        rgba: img.into_raw(),
+        ray_dds: (keep_ray_dds && is_dds).then_some(data),
+    })
 }
 
 impl Objects {

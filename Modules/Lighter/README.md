@@ -40,9 +40,14 @@ ray-traced scene and its reverse-Z depth.
    With **Follow local region lighting** off (default), the sun, ambient and
    sky palette follow the map and clock, not the local box under the camera.
    Regional fog and weather still apply. See the [optimized renderer](performance.md#interactive-hardware-rt-pass).
-   **Single-path transport** (default) limits water/glass to one sampled
-   continuation and samples one local light in dense lighting. Turn it off
-   for the deterministic first split or if water noise is objectionable.
+   **Single-path transport** (default) usually samples one continuation at
+   glass/water and one local light in dense lighting. At 1 spp it still
+   splits the first water interface, preserving stable reflection and
+   transmission even with accumulation turned off. Turning Single-path off
+   also gives a deterministic first split at glass.
+   **FSR 1 spatial upscale (EASU)** is opt-in. Below full ray resolution it
+   reconstructs color from the filtered ray image, without changing current
+   depth or enabling any vendor temporal SDK.
    **Automatic ray resolution** is opt-in and targets completed ray and
    reconstruction GPU time, not total frame time; the slider seeds its
    50–100% range. Start with a fixed scale when comparing renderers.
