@@ -403,3 +403,78 @@ before inferring a format from a handful of files.
 `configs`, `gfx`, `grasses`, `building`, `models`, `litmodels`, `textures` and
 `loddata` are all mounted from `resources\`, so a client's `element` folder is
 its archive root.
+
+## The sixth instance: a `UINT64` read as a `DWORD` (18 November)
+
+The 1.8.4 report showed no buildings and no objects in the main world or in any
+other world, with terrain and effects loading normally. The log named one cause,
+372 times over, for one file:
+
+```
+litmodels.pck was not indexed: ...\element\litmodels.pck: neither container;
+retail: entry table overlaps footer: the trailer declares its table at
+1517810005 but only 3681422201 bytes of this piece (len 3681422489) precede the
+footer (declared end 10123872665, base 6442450176, count 237241, flags 0x0000…)
+```
+
+Every one of the client's **23,068** scenery names was unreachable, so no
+`litmodel_*.bmd` resolved and 46 in-view placements drew nothing. The tree was
+never missing: the name-to-entry lookup had no table to consult.
+
+### The arithmetic
+
+`FILEHEADER_0x00020003.dwEntryOffset` is a **`UINT64`**. The reader took
+`u32le(&header, 8)` — the low half — and unmasked that alone:
+
+| quantity | value |
+|---|---|
+| stored low dword | `4075062583` (`0xf2e48537`) |
+| `^ AFPCK_MASKDWORD` of it | **`1517810005`** — the number in the log |
+| real `dwEntryOffset` (u64) | **`10107744597`** |
+| the piece holding the trailer starts at | `6442450176` (6 GiB) |
+| table ends (= trailer start) | `10123872377` |
+| span | `16127780` B for 237,241 records |
+
+`1,517,810,005` is not a nonsense value — it lies *inside* the package, in the
+piece that begins at 2 GiB — which is why the failure read as a plausible
+geometry problem rather than a decoding one. But the table was never there;
+`10,107,744,597` is two gibibytes further on, and only the full 64-bit word
+can name it. `16,127,780 / 237,241 ≈ 68` bytes per record also says the records
+are deflated on disk, so the count cannot be back-inferred from the span.
+
+The mask is applied at the revision's width for the same reason the field is
+read at that width: masking 32 bits of a 64-bit word discards the high half
+before the offset is ever formed.
+
+`0x00020001` and `0x00020002` keep their 32-bit field, so nothing about the
+1.5.2 reads changes — and 1.5.2's `litmodels` still splits at
+`MAX_FILE_PACKAGE`, which is what the *piece-local* fallback is for. The two
+mechanisms are independent: one is about which piece the trailer is in, the
+other about whether the offset can address the package at all.
+
+### The general shape
+
+This is the same mistake as the guard pair and the safe header, one field down:
+**a width recovered from the small packages and then assumed for every
+revision.** Both earlier instances were caught by reading the client's own
+header. This one could have been too — `AFilePackage.h` has said `UINT64`
+since `0x00020003` was recorded — which is the argument for checking a field's
+declared width whenever a package crosses 4 GiB, rather than noticing the
+symptom only when a big archive refuses.
+
+### Water, which was a different fault
+
+The report also said the main world had no water. Nothing in the log mentioned
+water at all — and that silence was itself the defect. `SceneWater` had nine
+emit sites across `water.rs` and `gpu.rs`, but it was **absent from
+`Channel::wired()`**, so the "Everything" preset never enabled it: the capture
+contained no `scene-water` file, and "the water is missing" could not be told
+apart from "nobody asked for water to be logged". `RenderWater` was wired and
+did not appear either.
+
+So the water claim is **not yet diagnosed**. It has a channel now, and the next
+capture with the Everything preset will say `N water areas, M cells, K of them
+wet` and list each area's export id, height and grid — which is the evidence
+needed to separate "the EC-BSD reader dropped them" from "the map's water is
+static-mesh water this loader does not read". Claiming a fix before that line
+exists would be the same error as the four above.
