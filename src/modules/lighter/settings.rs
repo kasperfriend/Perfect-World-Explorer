@@ -58,7 +58,7 @@ impl Denoiser {
             Self::Svgf => None,
             Self::None => None,
             Self::DlssRr => Some("requires RTX GPU"),
-            Self::FsrRayRegen => Some("SDK not found at PW_RAY_FSR_VK_DLL"),
+            Self::FsrRayRegen => Some("DirectX 12 only; not available on Vulkan"),
         }
     }
 
