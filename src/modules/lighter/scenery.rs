@@ -7,7 +7,7 @@ use crate::{
     modules::lighter::{
         coverage::Counts,
         scene::{self, Builder, Gloss, Mesh, MeshBudget, Surface, Vertex},
-        textures::{Filter, Textures, Tile, COLOR_SIDE, MAX_TEXTURE_BYTES},
+        textures::{Filter, Textures, Tile, COLOR_SIDE},
     },
     objects::{Objects, SdrUvAnim},
     scene::Ornament,
@@ -398,6 +398,13 @@ impl SceneryStream {
                 next.insert(id, asset);
             }
         }
+        // Under pressure keep the nearest local placements first. Rank from
+        // the installed block centre so camera turns don't change admission.
+        let distance = |asset: &Asset| {
+            let [x, _, z] = objects.ornaments[asset.id].position;
+            (x - center[0]).powi(2) + (z - center[1]).powi(2)
+        };
+        local.sort_unstable_by(|a, b| distance(a).total_cmp(&distance(b)).then(a.id.cmp(&b.id)));
         let query = Query::new(center, local_reach, cutoff, lights);
         let mut order = self.manifest.select(&ids, &query);
         counts.range = objects.ornaments.len()
@@ -454,7 +461,7 @@ impl SceneryStream {
         }
         // Touch low rank first and local last so cache pressure preserves
         // the same priorities used for optional placement admission.
-        for asset in extra.iter().rev().chain(local.iter()) {
+        for asset in extra.iter().rev().chain(local.iter().rev()) {
             for (key, tile) in &asset.tiles {
                 self.recent.touch(*key, tile);
             }
@@ -481,35 +488,37 @@ impl Snapshot {
         let mut addresses = HashMap::new();
         let mut chunks = BTreeMap::<_, Vec<(&Asset, Vec<u32>)>>::new();
         let mut coverage = Coverage {
-            local: self.local.len(),
             counts: self.counts,
             catalog_chunks: self.catalog_chunks,
             estimated_bounds: self.estimated_bounds,
             ..Coverage::default()
         };
-        let mut geometry = builder.optional_mesh_budget(storage);
+        let remaining = bank.remaining_bytes();
+        // Don't let a dense local BMD window consume the whole tail needed
+        // for moving actors/effects. Refuse a whole placement rather than
+        // publishing half a mesh or losing the entire ray scene to one tile.
+        let dynamic_reserve = (16 << 20).min(remaining / 4);
+        let mut budget = Budget {
+            geometry: builder.optional_mesh_budget(storage),
+            texture_bytes: remaining - dynamic_reserve,
+            tiles: HashSet::new(),
+        };
         for asset in &self.local {
-            if !geometry.debit(&asset.mesh, asset.surfaces.len()) {
-                // Required geometry still goes through, but leave no allowance
-                // for optional assets if it has exhausted the budget.
-                geometry.bytes = 0;
+            if !budget.admit(asset) {
+                coverage.counts.budget += 1;
+                continue;
             }
             let materials = asset.materials(builder, bank, &mut addresses)?;
             chunks
                 .entry(asset.block)
                 .or_default()
                 .push((asset, materials));
+            coverage.local += 1;
             coverage.counts.texture_fallback += asset.missing;
         }
-        let mut budget = Budget {
-            geometry,
-            // Keep at least half the remaining bank for posed models/effects.
-            texture_bytes: storage
-                .min(MAX_TEXTURE_BYTES)
-                .saturating_sub(bank.byte_len())
-                / 2,
-            tiles: addresses.keys().copied().collect(),
-        };
+        // Keep at least half the remaining bank for posed models/effects, as
+        // well as the local placements' minimum dynamic reserve.
+        budget.texture_bytes = budget.texture_bytes.min(bank.remaining_bytes() / 2);
         for asset in &self.extra {
             if budget.admit(asset) {
                 let materials = asset.materials(builder, bank, &mut addresses)?;
@@ -594,5 +603,21 @@ mod tests {
         assert!(!budget.admit(&asset(42))); // triangle/vertex budget spent
         assert_eq!(budget.texture_bytes, 0);
         assert_eq!(budget.tiles.len(), 1);
+
+        // The uploader must use that admission policy for locals as well as
+        // extension assets. Denied materials cannot poison the texel bank.
+        let snapshot = Snapshot {
+            local: vec![Arc::new(asset(42)), Arc::new(asset(43))],
+            extra: vec![Arc::new(asset(42)), Arc::new(asset(44))],
+            counts: Counts::default(),
+            catalog_chunks: 1,
+            estimated_bounds: 0,
+        };
+        let mut builder = Builder::default();
+        let mut bank = Textures::with_limit(56);
+        let coverage = snapshot.append(&mut builder, &mut bank, 1 << 20).unwrap();
+        assert_eq!((coverage.local, coverage.extra), (1, 1));
+        assert_eq!(coverage.counts.budget, 2);
+        assert_eq!(bank.byte_len(), 48);
     }
 }

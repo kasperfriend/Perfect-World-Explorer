@@ -7,7 +7,7 @@ use crate::modules::lighter::{
     self,
     coverage::{Class, Counts, Inventory},
     scene::*,
-    textures::{chain_bytes, Filter, Textures, Tile, COLOR_SIDE, MASK_SIDE},
+    textures::{chain_bytes, fit_side, mask_bytes, Filter, Textures, Tile, COLOR_SIDE, MASK_SIDE},
     Lighter,
 };
 use crate::{material::Materials, world_models_gpu, Terrain};
@@ -59,8 +59,14 @@ pub(super) struct Feed {
 }
 
 impl Feed {
-    pub(super) fn new(t: &mut Terrain, m: &MeshData, authored_mips: bool) -> Result<Self, String> {
+    pub(super) fn new(
+        t: &mut Terrain,
+        m: &MeshData,
+        authored_mips: bool,
+        storage: usize,
+    ) -> Result<Self, String> {
         let mut result = Self {
+            base: Textures::with_limit(storage),
             authored_mips,
             static_lights: t
                 .scene_lights
@@ -91,14 +97,13 @@ impl Feed {
         // Reserve most of the bank for masks, streamed objects and effects.
         // All terrain colour sources get the same deterministic ceiling;
         // choose a resident authored mip rather than resampling level zero.
-        let mut terrain_limit = COLOR_SIDE;
-        while terrain_limit > 1
-            && upload.materials.textures.iter().fold(0usize, |sum, t| {
-                sum.saturating_add(chain_bytes([t.w as u32, t.h as u32], terrain_limit))
-            }) > 48 * 1024 * 1024
-        {
-            terrain_limit /= 2;
-        }
+        let terrain_bytes = (48 << 20).min(result.base.remaining_bytes() / 2);
+        let terrain_limit = fit_side(COLOR_SIDE, |side| {
+            upload.materials.textures.iter().fold(0usize, |sum, t| {
+                sum.saturating_add(chain_bytes([t.w as u32, t.h as u32], side))
+            }) <= terrain_bytes
+        })
+        .ok_or("Lighter terrain colours exceed their texture budget")?;
         for texture in &upload.materials.textures {
             let decoded = texture.decode()?;
             result.terrain_ids.push(
@@ -131,14 +136,29 @@ impl Feed {
         result.water = water_feed::Water::load(t, &mut result.base)?;
         result.weather = weather::Weather::load(t, &mut result.base)?;
         result.tree_archive_missing = !t.element.join("trees.pck").is_file();
+        let tree_bytes = (32 << 20).min(result.base.remaining_bytes() / 2);
+        let tree_side = fit_side(COLOR_SIDE, |side| {
+            t.trees.types.iter().flatten().fold(0usize, |sum, tree| {
+                sum.saturating_add(vegetation::tree_texture_bytes(tree, side, authored_mips))
+            }) <= tree_bytes
+        })
+        .ok_or("Lighter tree materials exceed their texture budget")?;
+        if tree_side < COLOR_SIDE {
+            eprintln!(
+                "Lighter: tree textures capped at {tree_side} pixels to fit the texture budget"
+            );
+        }
         for tree in &t.trees.types {
             let Some(tree) = tree else {
                 result.trees.push(None);
                 continue;
             };
-            result
-                .trees
-                .push(Some(read_tree(tree, &mut result.base, authored_mips)?));
+            result.trees.push(Some(read_tree(
+                tree,
+                &mut result.base,
+                tree_side,
+                authored_mips,
+            )?));
         }
         result.base.seal();
         // Audit small maps before borrowing the raster far grid. A narrow
@@ -191,7 +211,35 @@ impl Feed {
     }
 
     fn terrain_masks(&mut self, material: &Materials) -> Result<(), String> {
+        self.mask_bank = None;
         let mut textures = self.base.fork_prefix();
+        // Plan before inflating any masks, and leave room for the streamed
+        // suffix. On unusually dense maps reduce mask resolution uniformly.
+        let available = textures.remaining_bytes();
+        let headroom = (16 << 20).min(available / 4);
+        let bytes_at = |side| {
+            material
+                .areas
+                .iter()
+                .fold(material.areas.len() * 16, |bytes, record| {
+                    record.layers.iter().skip(1).fold(
+                        bytes.saturating_add(record.layers.len() * 20),
+                        |bytes, layer| {
+                            bytes.saturating_add(mask_bytes(layer.mask_size as u32, side))
+                        },
+                    )
+                })
+        };
+        let side = fit_side(MASK_SIDE, |side| bytes_at(side) <= available - headroom)
+            .or_else(|| fit_side(MASK_SIDE, |side| bytes_at(side) <= available))
+            .ok_or("Lighter terrain masks and material tables exceed the ray texture budget")?;
+        if side < MASK_SIDE {
+            crate::diag!(
+                TimingLoad,
+                "Lighter: terrain masks capped at {side} pixels ({} KiB with tables)",
+                bytes_at(side) >> 10
+            );
+        }
         let table = textures.reserve(material.areas.len() * 4)?;
         for (area, record) in material.areas.iter().enumerate() {
             let offset = textures.reserve(record.layers.len() * 5)?;
@@ -209,10 +257,7 @@ impl Feed {
                     0
                 } else {
                     let bytes = l.mask.decode(l.mask_size)?;
-                    let side = l.mask_size as u32;
-                    textures.tile([side, side], MASK_SIDE, Filter::Data, |x, y| {
-                        u32::from(bytes[(y * side + x) as usize]) * 0x01010101
-                    })?
+                    textures.insert(&Tile::mask(l.mask_size as u32, side, &bytes)?)?
                 };
                 textures.write_words(
                     offset + k * 5,
@@ -227,6 +272,12 @@ impl Feed {
     }
 
     pub(super) fn install(&mut self, ray: &mut Lighter, m: &MeshData, device: &wgpu::Device) {
+        if m.terrain_upload.is_none() && self.mask_bank.is_none() {
+            // A failed mask upload already invalidated the scene. Keep its
+            // diagnostic until new material data arrives; don't retry it with
+            // superseded textures or replace the cause with a generic error.
+            return;
+        }
         let result = self.snapshot(m, lighter::storage_limit(device));
         ray.scenery_coverage = result
             .as_ref()
@@ -352,12 +403,14 @@ impl Feed {
                 .map_err(Clone::clone)?
                 .append(&mut builder, &mut bank, storage)?;
         inventory[Class::Buildings] = coverage.counts;
-        Ok((
-            builder.finish_with_emitters(&mut self.accel, Some(&bank)),
-            bank,
-            inventory,
-            coverage,
-        ))
+        let packet = builder.finish_with_emitters(&mut self.accel, Some(&bank));
+        if packet.bytes().len() > storage {
+            return Err(format!(
+                "Lighter resident world exceeds adapter storage limit ({} MiB)",
+                storage >> 20
+            ));
+        }
+        Ok((packet, bank, inventory, coverage))
     }
 
     fn vegetation(
@@ -395,7 +448,12 @@ impl Feed {
                 }
             }
         }
-        self.grass = vegetation::Grass::prepare(m, textures, self.authored_mips)?;
+        self.grass = vegetation::Grass::prepare(
+            m,
+            textures,
+            self.authored_mips,
+            &mut inventory[Class::Grass],
+        )?;
         Ok(())
     }
 
@@ -862,6 +920,9 @@ impl super::Renderer {
 
     /// Lighter owns primary visibility and all water/shadow/lighting rays.
     /// Post/presentation (and independent map views) still use the host.
+    /// False means no current frame to present. In particular, never clear or
+    /// present stale output after an error: the next redraw can render Native
+    /// with its own extent, jitter, and model tick.
     pub(super) fn render_lighter(
         &mut self,
         target: &wgpu::TextureView,
@@ -870,15 +931,9 @@ impl super::Renderer {
         frame: &FrameSnapshot,
         w: u32,
         h: u32,
-    ) {
+    ) -> bool {
         let depth = self.depth.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        if self.lighter.error().is_some() || self.local_scenery_skipped {
-            self.lighter.reset_history();
-            Lighter::clear(&mut encoder, target, &depth);
-            self.queue.submit(Some(encoder.finish()));
-            return;
-        }
         let resident = self.resident_bounds();
         if let Some(light) = camera.regional_light {
             self.retained_regional_light = Some(light);
@@ -964,16 +1019,10 @@ impl super::Renderer {
         })();
         match result {
             Ok(true) => {}
-            Ok(false) => return, // Live preflight normally defers before acquiring a surface.
+            Ok(false) => return false, // Live preflight normally defers before acquiring a surface.
             Err(error) => {
-                let lost = super::recovery::lost_error(&error);
                 self.lighter.fail_frame(error);
-                if lost {
-                    return;
-                }
-                Lighter::clear(&mut encoder, target, &depth);
-                self.queue.submit(Some(encoder.finish()));
-                return;
+                return false;
             }
         }
         if use_post {
@@ -1002,6 +1051,7 @@ impl super::Renderer {
                 camera.gamma_setting,
             );
         }
+        true
     }
 }
 

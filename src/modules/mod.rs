@@ -107,7 +107,7 @@ impl Modules {
             "walker" => self.walker.is_active(),
             "populator" => self.populator.is_active(),
             "librarian" => self.librarian.active(),
-            "lighter" => lighter.replaces_world() && lighter.error().is_none(),
+            "lighter" => lighter.replaces_world(),
             _ => false,
         }
     }

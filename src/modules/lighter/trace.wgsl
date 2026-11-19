@@ -151,6 +151,7 @@ const AREA_MIPS: u32 = 1u;
 const AREA_TOP: u32 = 2u;
 const LINEAR_DATA: u32 = 4u;
 const ALPHA_IS_DATA: u32 = 8u;
+const PACKED_MASK: u32 = 16u;
 
 fn linear_texels(c: vec4<f32>) -> vec4<f32> {
     return select(c/12.92,pow((c+0.055)/1.055,vec4<f32>(2.4)),c>vec4<f32>(0.04045));
@@ -269,6 +270,37 @@ fn filtered_tile(addr: u32, uv: vec2<f32>, edge: bool, taps: Taps) -> vec4<f32> 
     let fmt = texels[addr+3u];
     return unassociate(tap_average(addr,uv,edge,taps,fmt,false,0.,0u),fmt);
 }
+// Keep packed scalar fetches out of the general material sampler. Mip starts
+// are word aligned, with four consecutive R8 weights per word.
+fn mask_level(addr: u32, uv: vec2<f32>, mip: u32) -> f32 {
+    let base = addr + texels[addr+4u+mip];
+    let dims = max(vec2<u32>(1u),vec2<u32>(texels[addr],texels[addr+1u])>>vec2<u32>(mip));
+    if all(dims==vec2<u32>(1u)) { return f32(texels[base]&255u)/255.; }
+    let xy = clamp(uv,vec2<f32>(0.),vec2<f32>(1.))*vec2<f32>(dims)-0.5;
+    let lo = vec2<i32>(floor(xy));
+    let a = vec2<u32>(max(lo,vec2<i32>(0)));
+    let b = vec2<u32>(min(lo+1,vec2<i32>(dims)-1));
+    let i = vec2<u32>(a.y,b.y).xxyy*dims.x+vec2<u32>(a.x,b.x).xyxy;
+    let at = i/vec4<u32>(4u)+base;
+    let words = vec4<u32>(texels[at.x],texels[at.y],texels[at.z],texels[at.w]);
+    let r = vec4<f32>((words>>((i&vec4<u32>(3u))*8u))&vec4<u32>(255u))/255.;
+    let f = fract(xy);
+    return dot(r,vec4<f32>((1.-f.x)*(1.-f.y),f.x*(1.-f.y),(1.-f.x)*f.y,f.x*f.y));
+}
+fn terrain_mask(addr: u32, uv: vec2<f32>, taps: Taps) -> f32 {
+    if (texels[addr+3u] & PACKED_MASK)==0u { return filtered_tile(addr,uv,true,taps).r; }
+    let mip = u32(taps.lod);
+    let part = fract(taps.lod);
+    var sum = 0.;
+    for (var i=0u; i<taps.count; i++) {
+        let p = uv+(f32(i)+0.5-0.5*f32(taps.count))*taps.step;
+        let levels = select(1u,2u,part>0.);
+        for (var l=0u; l<levels; l++) {
+            sum += mask_level(addr,p,mip+l)*select(1.-part,part,l!=0u);
+        }
+    }
+    return sum/f32(taps.count);
+}
 fn terrain_coord(xz: vec2<f32>) -> vec2<f32> {
     return clamp(vec2<f32>(xz.x,-xz.y)/frame.terrain.z + frame.terrain.xy*0.5,
                  vec2<f32>(0.),frame.terrain.xy-vec2<f32>(1.))/frame.terrain.w;
@@ -324,8 +356,8 @@ fn terrain_color(p: vec3<f32>, face: vec3<f32>, ray: Ray, t: f32, baked: vec4<f3
         else {
             let mask = texels[at+1u];
             let s = 1./(frame.terrain.z*frame.terrain.w);
-            let weight = filtered_tile(mask,fract(coord),true,
-                footprint_taps(mask,ray.dir,face,vec3<f32>(s,0.,0.),vec3<f32>(0.,0.,-s),width)).r;
+            let weight = terrain_mask(mask,fract(coord),
+                footprint_taps(mask,ray.dir,face,vec3<f32>(s,0.,0.),vec3<f32>(0.,0.,-s),width));
             rgb = mix(rgb,layer_rgb,weight);
         }
     }

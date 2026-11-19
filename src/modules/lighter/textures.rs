@@ -13,6 +13,7 @@ const AREA_MIPS: u32 = 1;
 const AREA_TOP: u32 = 2;
 const LINEAR_DATA: u32 = 4;
 const ALPHA_IS_DATA: u32 = 8;
+const PACKED_MASK: u32 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Filter {
@@ -95,13 +96,39 @@ fn first_lod(size: [u32; 2], limit: u32) -> u32 {
         .find(|&lod| size[0].max(size[1]) >> lod <= limit)
         .unwrap_or(0)
 }
+/// Largest mip ceiling that fits, without decoding anything to try it.
+pub(crate) fn fit_side(mut side: u32, mut fits: impl FnMut(u32) -> bool) -> Option<u32> {
+    loop {
+        if fits(side) {
+            return Some(side);
+        }
+        if side <= 1 {
+            return None;
+        }
+        side /= 2;
+    }
+}
+
 /// Conservative space estimate used to choose a common admission resolution.
 pub fn chain_bytes(size: [u32; 2], limit: u32) -> usize {
+    chain_storage(size, limit, 1)
+}
+
+pub(crate) fn mask_bytes(side: u32, limit: u32) -> usize {
+    chain_storage([side; 2], limit, 4)
+}
+
+fn chain_storage(size: [u32; 2], limit: u32, texels_per_word: usize) -> usize {
     let start = first_lod(size, limit.max(1));
     let mut words = 4usize;
     for lod in start..level_count(size) {
         let [w, h] = extent_at(size, lod);
-        words = words.saturating_add((w as usize).saturating_mul(h as usize).saturating_add(1));
+        words = words.saturating_add(
+            (w as usize)
+                .saturating_mul(h as usize)
+                .div_ceil(texels_per_word)
+                + 1,
+        );
     }
     words.saturating_mul(4)
 }
@@ -109,6 +136,36 @@ pub fn chain_bytes(size: [u32; 2], limit: u32) -> usize {
 impl Tile {
     pub fn bytes(&self) -> usize {
         self.0.len() * std::mem::size_of::<u32>()
+    }
+
+    /// Terrain masks are linear scalar weights. Keep exactly the same
+    /// filtering/quantization, but store four R8 texels per word in each mip.
+    pub(crate) fn mask(side: u32, limit: u32, data: &[u8]) -> Result<Self, String> {
+        if data.len() != (side as usize).saturating_mul(side as usize) {
+            return Err("invalid ray terrain mask length".into());
+        }
+        let Self(raw, stats) = Self::new([side; 2], limit, Filter::Data, |x, y| {
+            u32::from(data[(y * side + x) as usize]) * 0x01010101
+        })?;
+        let header = 4 + raw[2] as usize;
+        let mut words = Vec::with_capacity(mask_bytes(side, limit) / 4);
+        words.extend_from_slice(&raw[..header]);
+        words[3] |= PACKED_MASK;
+        for at in 4..header {
+            let end = if at + 1 < header {
+                raw[at + 1] as usize
+            } else {
+                raw.len()
+            };
+            words[at] = words.len() as u32;
+            words.extend(raw[raw[at] as usize..end].chunks(4).map(|pixels| {
+                pixels
+                    .iter()
+                    .enumerate()
+                    .fold(0, |out, (i, p)| out | ((p & 255) << (8 * i)))
+            }));
+        }
+        Ok(Self(words, stats))
     }
 
     /// Both an explicit single level (e.g. TGA) and an incomplete chain can
@@ -347,6 +404,7 @@ pub struct Textures {
     prefix: TexelPrefix,
     prefix_words: usize,
     tail: Vec<u32>,
+    limit_bytes: usize,
     archive: HashMap<&'static str, Archive>,
     pub missing: usize,
     pub mips: MipStats,
@@ -358,6 +416,7 @@ impl Default for Textures {
             prefix: Vec::new(),
             prefix_words: 0,
             tail: vec![1, 1, 1, 0, 5, u32::MAX],
+            limit_bytes: MAX_TEXTURE_BYTES,
             archive: HashMap::new(),
             missing: 0,
             mips: MipStats::default(),
@@ -366,6 +425,17 @@ impl Default for Textures {
 }
 
 impl Textures {
+    pub(crate) fn with_limit(storage: usize) -> Self {
+        Self {
+            limit_bytes: storage.min(MAX_TEXTURE_BYTES),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn remaining_bytes(&self) -> usize {
+        self.limit_bytes.saturating_sub(self.byte_len())
+    }
+
     pub fn seal(&mut self) {
         if !self.tail.is_empty() {
             self.prefix_words += self.tail.len();
@@ -380,6 +450,7 @@ impl Textures {
             prefix: self.prefix.clone(),
             prefix_words: self.prefix_words,
             tail: Vec::new(),
+            limit_bytes: self.limit_bytes,
             archive: HashMap::new(),
             missing: self.missing,
             mips: self.mips,
@@ -461,10 +532,12 @@ impl Textures {
 
     pub fn reserve(&mut self, len: usize) -> Result<usize, String> {
         let addr = self.prefix_words + self.tail.len();
-        if addr.saturating_add(len) > MAX_TEXTURE_BYTES / 4 {
-            return Err(
-                "Lighter texture budget exceeded (128 MiB); reduce scenery residency".into(),
-            );
+        if len > self.remaining_bytes() / 4 {
+            return Err(format!(
+                "Lighter texture budget exceeded ({} KiB limit, {} KiB needed)",
+                self.limit_bytes >> 10,
+                addr.saturating_add(len).div_ceil(256),
+            ));
         }
         self.tail.resize(self.tail.len() + len, 0);
         Ok(addr)
@@ -548,6 +621,51 @@ impl Textures {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_masks_keep_every_filtered_byte() {
+        for side in [1u32, 7, 32] {
+            let data: Vec<_> = (0..side * side).map(|i| (i * 73 + 29) as u8).collect();
+            for limit in [32, 8, 2, 1] {
+                let old = Tile::new([side; 2], limit, Filter::Data, |x, y| {
+                    u32::from(data[(y * side + x) as usize]) * 0x01010101
+                })
+                .unwrap();
+                let packed = Tile::mask(side, limit, &data).unwrap();
+                assert_eq!(packed.bytes(), mask_bytes(side, limit));
+                assert_eq!(&old.0[..3], &packed.0[..3]);
+                assert_eq!(packed.0[3], old.0[3] | PACKED_MASK);
+                for mip in 0..old.0[2] {
+                    let dims = extent_at([old.0[0], old.0[1]], mip);
+                    let old_start = old.0[4 + mip as usize] as usize;
+                    let start = packed.0[4 + mip as usize] as usize;
+                    for i in 0..(dims[0] * dims[1]) as usize {
+                        assert_eq!(
+                            old.0[old_start + i] as u8,
+                            packed.0[start + i / 4].to_le_bytes()[i % 4]
+                        );
+                    }
+                }
+            }
+        }
+        assert!(mask_bytes(32, 32) < chain_bytes([32; 2], 32) / 3);
+    }
+
+    #[test]
+    fn streamed_texture_bank_preserves_the_adapter_limit() {
+        let mut base = Textures::with_limit(128);
+        base.reserve(10).unwrap();
+        base.seal();
+        let mut mask = base.fork_prefix();
+        mask.reserve(4).unwrap();
+        mask.seal();
+        let mut live = mask.fork_prefix();
+        assert_eq!(live.remaining_bytes(), 48);
+        assert!(live.reserve(13).is_err());
+        assert_eq!(live.remaining_bytes(), 48);
+        live.reserve(12).unwrap();
+        assert_eq!(live.byte_len(), 128);
+    }
 
     #[test]
     fn a_snapshot_shares_the_immutable_prefix_and_preserves_word_offsets() {

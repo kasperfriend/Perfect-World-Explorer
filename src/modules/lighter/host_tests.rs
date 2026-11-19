@@ -398,6 +398,43 @@ fn fixture(element: &std::path::Path) -> Terrain {
 }
 
 #[test]
+fn terrain_masks_fit_the_budget_and_never_reuse_a_failed_upload() {
+    use super::{Feed, Textures};
+    let mut material = crate::material::cutoff_mask_fixture();
+    material.areas.truncate(8);
+    let mut feed = Feed {
+        base: Textures::with_limit(4 << 10),
+        terrain_ids: vec![0],
+        ..Feed::default()
+    };
+    feed.base.seal();
+    feed.terrain_masks(&material).unwrap();
+    let bank = feed.mask_bank.as_ref().unwrap();
+    assert!(bank.remaining_bytes() >= 1024);
+    let words: Vec<u32> = bank
+        .byte_segments()
+        .flat_map(bytemuck::cast_slice::<u8, u32>)
+        .copied()
+        .collect();
+    for area in 0..8 {
+        let row = feed.area_table as usize + area * 4;
+        assert_eq!(words[row + 1], 2, "do not drop any layers");
+        let layer = words[row] as usize;
+        let mask = words[layer + 6] as usize;
+        assert_eq!(words[mask], 8, "lower the resolution, not the coverage");
+        let top = mask + words[mask + 4] as usize;
+        assert_eq!(words[top].to_le_bytes(), [area as u8; 4]);
+    }
+    feed.base = Textures::with_limit(256);
+    feed.base.seal();
+    assert!(feed.terrain_masks(&material).is_err());
+    assert!(
+        feed.mask_bank.is_none(),
+        "never use obsolete streamed masks"
+    );
+}
+
+#[test]
 fn ray_lightmaps_keep_day_only_and_distinct_night_bindings() {
     use crate::modules::lighter::textures::Textures;
     let root = FixtureRoot::new();
@@ -816,9 +853,9 @@ fn lighter_streamed_world_pixels() {
     });
     let mut capture = readback::Ring::default();
     let mut render_center = |r: &mut Renderer, c: &Camera| -> ([u8; 4], f32) {
-        let rays = r.lighter.replaces_world();
+        let rays = r.renders_rays();
         let native_before = r.native_opaque_draws.get();
-        r.render(
+        assert!(r.render(
             &view,
             &raw,
             c.matrix(SIZE, SIZE, c.far),
@@ -826,7 +863,7 @@ fn lighter_streamed_world_pixels() {
             SIZE,
             SIZE,
             true,
-        );
+        ));
         if rays {
             assert_eq!(
                 r.native_opaque_draws.get(),
@@ -837,7 +874,7 @@ fn lighter_streamed_world_pixels() {
         } else {
             assert!(
                 r.native_opaque_draws.get() > native_before,
-                "Off didn't submit the native world"
+                "Native route did not submit the raster world"
             );
         }
         let bytes = read_target_pixels(r, &mut capture, &target).unwrap();
@@ -1059,15 +1096,61 @@ fn lighter_streamed_world_pixels() {
             "stale shadow after BMD eviction: {unoccluded:?} vs {lit:?}"
         );
     }
+    // Freeze the clock for a pixel/depth comparison with the exact Native
+    // frame. A failed scene should use it even with Software still selected.
+    camera.logic_delta_ms = 0;
+    camera.pos = Vec3::new(-2.5, 5., 0.);
+    camera.time_of_day = 12.;
+    let selection = r.lighter.settings;
+    r.lighter.settings.mode = Mode::Off;
+    let native = at_center(&mut r, &camera);
+    assert!(native.0[1] > 0 && native.1 > 0.);
+    r.lighter.settings = selection;
+    // Inject an actual bank admission error, without requiring a giant map.
+    let error = super::Textures::with_limit(24).reserve(1).unwrap_err();
+    r.lighter.install(Err(error.clone()));
+    assert_eq!(r.lighter.error(), Some(error.as_str()));
+    assert_eq!(render_center(&mut r, &camera), native);
+    assert_eq!(r.lighter.settings, selection, "mode must not be rewritten");
+    assert!(!r.renders_rays());
+    assert!(r.lighter.world.is_none());
+
+    let rebuilt = mesh(&mut terrain, r.grass_atlas_key);
+    assert!(r.update_mesh(&mut Some(rebuilt)).unwrap());
+    assert!(r.renders_rays(), "a healthy stream must restore Software");
+    assert!(render_center(&mut r, &camera).1 > 0.);
+    assert!(r.lighter.error().is_none());
+
+    // An error discovered inside the draw is different from one found during
+    // stream installation: this attempt publishes nothing, and the *next*
+    // redraw uses Native. Do not submit a clear or tick the raster world here.
+    let feed = r.lighter_feed.take().unwrap();
+    let calls = r.native_opaque_draws.get();
+    let mut verify = readback::Ring::default();
+    let last = read_target_pixels(&r, &mut verify, &target).unwrap();
+    assert!(!r.render(
+        &view,
+        &raw,
+        camera.matrix(SIZE, SIZE, camera.far),
+        &camera,
+        SIZE,
+        SIZE,
+        true,
+    ));
+    assert_eq!(r.native_opaque_draws.get(), calls);
+    assert_eq!(read_target_pixels(&r, &mut verify, &target).unwrap(), last);
+    assert_eq!(r.lighter.error(), Some("Lighter scene feed is unavailable"));
+    r.lighter_feed = Some(feed);
+    assert_eq!(render_center(&mut r, &camera), native);
+
+    let rebuilt = mesh(&mut terrain, r.grass_atlas_key);
+    assert!(r.update_mesh(&mut Some(rebuilt)).unwrap());
+    assert!(r.renders_rays());
     if cpu_adapter {
         r.lighter.settings.mode = Mode::Hardware;
-        let refused = render_center(&mut r, &camera);
-        assert!(r.lighter.error().is_some());
-        assert_eq!(
-            refused,
-            ([0, 0, 0, 255], 0.),
-            "unsupported mode silently fell back"
-        );
+        assert!(r.lighter.error().unwrap().contains("ray-query support"));
+        assert_eq!(render_center(&mut r, &camera), native);
+        assert_eq!(r.lighter.settings.mode, Mode::Hardware);
     }
 }
 
@@ -1355,7 +1438,7 @@ pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
         first.local_pages.is_empty(),
         "native renderer must not load this distant BMD"
     );
-    let mut feed = super::Feed::new(&mut t, &first, false).unwrap();
+    let mut feed = super::Feed::new(&mut t, &first, false, storage).unwrap();
     let install = |feed: &mut super::Feed,
                    mesh: &super::MeshData,
                    (local, extra, outside): (usize, usize, usize)| {

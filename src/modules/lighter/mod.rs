@@ -671,8 +671,9 @@ impl Lighter {
     pub fn armed(&self) -> bool {
         self.armed
     }
+    /// Whether a usable ray scene, rather than just a requested mode, is live.
     pub fn replaces_world(&self) -> bool {
-        self.armed && self.settings.mode != Mode::Off
+        self.armed && self.requested() && self.error().is_none()
     }
     pub fn requested(&self) -> bool {
         self.settings.mode != Mode::Off
@@ -691,8 +692,13 @@ impl Lighter {
                 self.scene_error = None;
             }
             Err(error) => {
+                if self.scene_error.as_deref() != Some(&error) {
+                    eprintln!("Lighter: {error}");
+                }
                 self.world = None;
                 self.scene_error = Some(error);
+                self.reset_history();
+                self.status = None;
             }
         }
     }
@@ -718,20 +724,17 @@ impl Lighter {
     }
 
     pub fn error(&self) -> Option<&str> {
-        if !self.replaces_world() {
+        if !self.armed || !self.requested() {
             return None;
         }
         self.unavailable()
             .or(self.scene_error.as_deref())
             .or(self.frame_error.as_deref())
-    }
-
-    pub fn clear(
-        encoder: &mut wgpu::CommandEncoder,
-        target: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
-    ) {
-        drop(output_pass(encoder, target, depth));
+            .or_else(|| {
+                self.world
+                    .is_none()
+                    .then_some("Lighter has no resident ray scene")
+            })
     }
 
     pub(crate) fn profile_submitted(&mut self) {
@@ -1119,6 +1122,7 @@ impl Lighter {
                 "Restart Explorer to load ray geometry. Active now: native renderer.",
             );
         } else if let Some(error) = self.error() {
+            ui.label("Active: Native renderer (Lighter unavailable).");
             ui.colored_label(egui::Color32::LIGHT_RED, error);
         } else if let Some(status) = &self.status {
             ui.label(status);
@@ -1149,7 +1153,7 @@ impl Lighter {
         }
         ui.separator();
         ui.label("Lighter traces the streamed main world, including water, vegetation, buildings and animated world effects. It uses its own ray lighting and samples the client's sky textures. Map views and UI are unchanged.");
-        ui.label("Hardware mode uses Vulkan, not DirectX 12. The native whole-world preload is suspended; Lighter has its own bounded BMD residency. Temporal upscaling/frame generation are also suspended. See Modules/Lighter/README.md for compatibility notes.");
+        ui.label("Hardware mode uses Vulkan, not DirectX 12. Lighter uses its own bounded BMD residency. Temporal upscaling/frame generation are suspended only while rays draw the world. See Modules/Lighter/README.md for compatibility notes.");
     }
 }
 

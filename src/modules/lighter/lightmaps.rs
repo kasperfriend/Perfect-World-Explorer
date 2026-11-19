@@ -2,7 +2,7 @@
 //! and night references separate so a day-only fallback cannot shade grass.
 use crate::{
     material::Materials,
-    modules::lighter::textures::{chain_bytes, Filter, Textures},
+    modules::lighter::textures::{chain_bytes, fit_side, Filter, Textures},
     terrain_lightmaps::{Availability, Layout, Pair, Tiles, TILES},
     Terrain,
 };
@@ -32,11 +32,13 @@ pub(super) fn load(
         material.areas.len(),
         t.subterrain_names.len(),
     )?;
-    let mut side = 64;
-    while side > 1 && chain_bytes([256; 2], side).saturating_mul(material.areas.len() * 2) > BUDGET
-    {
-        side /= 2;
-    }
+    let budget = BUDGET.min(bank.remaining_bytes() / 4);
+    let Some(side) = fit_side(64, |side| {
+        chain_bytes([256; 2], side).saturating_mul(material.areas.len() * 2) <= budget
+    }) else {
+        eprintln!("Lighter: baked lightmaps unbound (ray texture budget)");
+        return Ok(Vec::new());
+    };
     let start = bank.byte_len();
     let mut offsets = vec![[0; 2]; material.areas.len()];
     let mut missing = 0;
@@ -77,7 +79,7 @@ pub(super) fn load(
                 let (levels, _) = crate::model_texture_gpu::decode_for_rays(raw)?;
                 let tile =
                     crate::modules::lighter::textures::Tile::images(&levels, side, Filter::Data)?;
-                if bank.byte_len() - start + tile.bytes() > BUDGET {
+                if bank.byte_len() - start + tile.bytes() > budget {
                     return Err("Lighter baked-lightmap budget exhausted".into());
                 }
                 bank.insert(&tile)

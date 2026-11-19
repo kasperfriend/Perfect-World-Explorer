@@ -16,8 +16,27 @@ claim that space. This is a conservative Lighter allocation ceiling, not an
 estimate of free VRAM or a claim about the whole viewer. Software stays under
 its stricter per-binding, packed mesh and image ceilings. The viewer requests
 at most 256 MiB per storage binding (or the adapter's limit); the texel bank is
-128 MiB, and trace, two history buffers and filter each reserve at most 64 MiB.
+capped at 128 MiB or the device's storage limit, whichever is smaller. Trace,
+two history buffers and filter each reserve at most 64 MiB.
 The Vulkan device's primitive, instance, address and alignment limits also apply.
+
+Terrain blend masks store one byte per texel instead of four. With the same
+32-pixel ceiling and mip chain, the payload is 75% smaller (the small per-tile
+header remains); blend weights and filtering are unchanged. If the material
+tables and masks still exceed their share of the budget, the loader chooses a
+lower common ceiling before decoding them, keeping every layer. Tree textures
+also get a common mip ceiling when their chains exceed their budget, preserving
+placements and cutout modes. Terrain colours and optional baked lightmaps
+scale their budgets down on smaller adapter bindings.
+
+The streamed suffix is shared by grass, local and extended ornaments, and
+moving assets. Grass cannot take more than a quarter of the available room at
+its admission stage. Local ornaments are admitted before the extension, with
+up to 16 MiB or a quarter of their starting room reserved for moving assets.
+When an optional grass material or BMD placement cannot fit, its instances
+are counted in the inventory as budget-limited. If essential ray data cannot
+fit, the live viewer falls back to Native; it does not present an empty ray
+frame. Device loss still triggers device recovery, not a render-mode fallback.
 
 The streaming loader keeps 128 recently used decoded BMD tiles on top of the
 live set. Higher-ranked placements and local assets are touched last. Lower

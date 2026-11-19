@@ -1,7 +1,7 @@
 //! Ray vegetation uses the native sampled SpeedTree motion and grass history.
 //! View-aligned leaf cards are only primary geometry; fixed-world proxies
 //! receive the same motion but never rotate with the main camera.
-use super::{atlas_uv, Counts, FrameSnapshot, MeshData, COLOR_SIDE};
+use super::{atlas_uv, Counts, FrameSnapshot, MeshData};
 use crate::modules::lighter::{
     scene::*,
     textures::{Filter, Textures},
@@ -211,8 +211,11 @@ impl Grass {
         m: &MeshData,
         textures: &mut Textures,
         authored: bool,
+        counts: &mut Counts,
     ) -> Result<Self, String> {
         let (vertices, indices, instances, batches) = m.grass.geometry();
+        // Grass shares the streamed suffix with scenery and moving actors.
+        let mut bytes = textures.remaining_bytes() / 4;
         let mut textures_seen = HashMap::new();
         let mut groups = Vec::new();
         for batch in batches {
@@ -224,15 +227,21 @@ impl Grass {
             let v = &vertices[low as usize].vertex;
             let [x, y, _, alpha] = v.color;
             let at = [x, y].map(|p| (p * super::super::ATLAS as f32).round() as usize);
+            let Some(tile) = m.ray_grass.get(&at) else {
+                counts.unavailable += batch.instances.len();
+                continue;
+            };
             let texture = match textures_seen.entry(at) {
                 Entry::Occupied(e) => *e.get(),
-                Entry::Vacant(e) => *e.insert(
-                    textures.insert(
-                        m.ray_grass
-                            .get(&at)
-                            .ok_or("missing ray grass material source")?,
-                    )?,
-                ),
+                Entry::Vacant(e) => {
+                    if tile.bytes() > bytes {
+                        counts.budget += batch.instances.len();
+                        continue;
+                    }
+                    let address = textures.insert(tile)?;
+                    bytes -= tile.bytes();
+                    *e.insert(address)
+                }
             };
             let mut mesh = Mesh::default();
             for g in &vertices[low as usize..=high as usize] {
@@ -348,12 +357,7 @@ fn wind_local(t: Transform, v: Vec3) -> Vec3 {
     Vec3::new(t.cos * v.x + t.sin * v.z, v.y, -t.sin * v.x + t.cos * v.z) / t.scale
 }
 
-pub(super) fn read_tree(
-    source: &crate::trees::TreeMesh,
-    textures: &mut Textures,
-    authored: bool,
-) -> Result<Tree, String> {
-    let xyz = |p: [f32; 3]| [p[0], p[2], p[1]];
+fn tree_references(lod: &crate::trees::TreeLod, authored: bool) -> [Option<(f32, bool)>; 3] {
     let alpha = |value: Option<f32>, default: Option<f32>| {
         if authored {
             value
@@ -363,6 +367,52 @@ pub(super) fn read_tree(
             default.map(|r| (r, false))
         }
     };
+    [
+        alpha(lod.branch_alpha_ref, None),
+        alpha(lod.frond_alpha_ref, Some(0.5)),
+        if authored {
+            Some((84. / 255., true))
+        } else {
+            Some((0.5, false))
+        },
+    ]
+}
+
+fn tree_filter(reference: Option<(f32, bool)>) -> Filter {
+    reference.map_or(Filter::Color, |(r, strict)| Filter::cutout(r, strict))
+}
+
+pub(super) fn tree_texture_bytes(
+    source: &crate::trees::TreeMesh,
+    side: u32,
+    authored: bool,
+) -> usize {
+    let mut unique = std::collections::HashSet::new();
+    let mut bytes = 0usize;
+    for lod in &source.lods {
+        for (i, reference) in tree_references(lod, authored).into_iter().enumerate() {
+            let bark = i == 0;
+            if unique.insert((bark, tree_filter(reference))) {
+                let image = if bark {
+                    &source.bark
+                } else {
+                    &source.composite
+                };
+                bytes =
+                    bytes.saturating_add(super::chain_bytes([image.width(), image.height()], side));
+            }
+        }
+    }
+    bytes
+}
+
+pub(super) fn read_tree(
+    source: &crate::trees::TreeMesh,
+    textures: &mut Textures,
+    side: u32,
+    authored: bool,
+) -> Result<Tree, String> {
+    let xyz = |p: [f32; 3]| [p[0], p[2], p[1]];
     let height = source.lods.first().map_or(5., |lod| {
         lod.branch
             .vertices
@@ -375,15 +425,7 @@ pub(super) fn read_tree(
     let mut tiles = HashMap::new();
     let mut lods = Vec::with_capacity(source.lods.len());
     for lod in &source.lods {
-        let thresholds = [
-            alpha(lod.branch_alpha_ref, None),
-            alpha(lod.frond_alpha_ref, Some(0.5)),
-            if authored {
-                Some((84. / 255., true))
-            } else {
-                Some((0.5, false))
-            },
-        ];
+        let thresholds = tree_references(lod, authored);
         let mut materials = [Surface::new(0, 0, 0., 0.); 3];
         for (i, reference) in thresholds.into_iter().enumerate() {
             let (image, mips) = if i == 0 {
@@ -391,14 +433,12 @@ pub(super) fn read_tree(
             } else {
                 (&source.composite, &source.composite_mips)
             };
-            let mode = reference.map_or(Filter::Color, |(r, strict)| Filter::cutout(r, strict));
+            let mode = tree_filter(reference);
             let addr = match tiles.entry((i == 0, mode)) {
                 std::collections::hash_map::Entry::Occupied(e) => *e.get(),
-                std::collections::hash_map::Entry::Vacant(e) => *e.insert(textures.images(
-                    std::iter::once(image).chain(mips),
-                    COLOR_SIDE,
-                    mode,
-                )?),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    *e.insert(textures.images(std::iter::once(image).chain(mips), side, mode)?)
+                }
             };
             let (cutoff, flags) = reference.map_or((0., 0), |(r, strict)| {
                 (r, CUTOUT | if strict { STRICT_ALPHA } else { 0 })

@@ -1865,9 +1865,9 @@ struct Renderer {
     /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
     world_draw_cmds: [crate::world_objects::WorldDrawList; crate::world_objects::WORLD_VIEWS],
     world_done: bool,
-    /// The scenery half of the drawn mesh was left out because the whole-world
-    /// preload owns it. Unlike `world_done` this describes the *mesh*, so the
-    /// streamer and the renderer can agree on what a rebuild should contain.
+    /// Local scenery is absent: the streamer omitted it or the whole-world
+    /// preload took over and released the local pages. Clearing the preload
+    /// while Lighter is selected must wait for a rebuild that restores these.
     local_scenery_skipped: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -2278,7 +2278,12 @@ impl Renderer {
         // Both paths consume the same loaded sources. The native path has
         // finished borrowing them; transfer the placement list to Lighter.
         let lighter_feed = if lighter.armed() {
-            match lighter_host::Feed::new(t, &m, vegetation_authored_mips) {
+            match lighter_host::Feed::new(
+                t,
+                &m,
+                vegetation_authored_mips,
+                crate::modules::lighter::storage_limit(&device),
+            ) {
                 Ok(mut feed) => {
                     feed.install(&mut lighter, &m, &device);
                     Some(feed)
@@ -3814,6 +3819,12 @@ impl Renderer {
             Some(&self.reflected_far_runs),
         );
     }
+    fn renders_rays(&self) -> bool {
+        // A Native whole-world mesh can omit local geometry. Keep its Native
+        // pages drawing until a stream with local scenery has arrived.
+        !self.local_scenery_skipped && self.lighter.replaces_world()
+    }
+
     fn render(
         &mut self,
         target: &wgpu::TextureView,
@@ -3827,8 +3838,8 @@ impl Renderer {
         // obey the same cut or they hand the motion-vector pass a vector built
         // against a view that no longer exists.
         reset_history: bool,
-    ) {
-        let ray_world = self.lighter.replaces_world();
+    ) -> bool {
+        let ray_world = self.renders_rays();
         // Where this frame's CPU time goes, stage by stage. One line a second on
         // the `TimingFrame` channel; see `FrameBudget`.
         let mut stage_ms = [0f64; STAGE_COUNT];
@@ -4128,7 +4139,7 @@ impl Renderer {
                 );
             }
             self.end_frame(stage_ms, lap_at);
-            return;
+            return true;
         }
 
         // The reflection texture is reused only after its previous water draw is
@@ -4224,7 +4235,7 @@ impl Renderer {
             self.visible_water_batches = visible;
             lap(STAGE_POST, &mut stage_ms, &mut lap_at);
             self.end_frame(stage_ms, lap_at);
-            return;
+            return true;
         }
         // How far the water surface samples away from itself, in UV: the shader
         // displaces by `n.xz * edge * edge * 0.25`, and `|n.xz|` is bounded by
@@ -4639,6 +4650,7 @@ impl Renderer {
         }
         lap(STAGE_POST, &mut stage_ms, &mut lap_at);
         self.end_frame(stage_ms, lap_at);
+        true
     }
 
     /// Close one frame's stage samples: whatever the last stage did not claim is
@@ -6011,9 +6023,11 @@ fn run_viewer(
                             let native_idle = match renderer.lighter.poll_hardware() {
                                 Ok(idle) => idle,
                                 Err(error) => {
-                                    let lost = recovery::lost_error(&error);
+                                    if recovery::lost_error(&error) {
+                                        gpu_loss.report(error);
+                                        return;
+                                    }
                                     renderer.lighter.fail_frame(error);
-                                    if lost { return; }
                                     true
                                 }
                             };
@@ -6030,12 +6044,59 @@ fn run_viewer(
                         if let Some(gamma) = display_gamma.as_mut() { gamma.resize(&renderer.device, config.width, config.height); }
                         if let Some(encode) = present_encode.as_mut() { encode.resize(&renderer.device, config.width, config.height); }
                     }
+                    // Install Native and ray snapshots together before choosing
+                    // the route, so failure or recovery cannot disagree with
+                    // the swapchain, upscaler or geometry used by this redraw.
+                    if streaming {
+                        if pending_mesh.is_none() {
+                            match result_rx.try_recv() {
+                                Ok(Ok(mesh)) => pending_mesh = Some(mesh),
+                                Ok(Err(e)) => {
+                                    eprintln!("Streaming error: {e}");
+                                    target.exit(); return;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    eprintln!("World streaming worker exited");
+                                    target.exit(); return;
+                                }
+                            }
+                        }
+                        match renderer.update_mesh(&mut pending_mesh) {
+                            Ok(true) => streaming = false,
+                            Ok(false) => {},
+                            Err(e) => {
+                                eprintln!("Terrain residency upload failed: {e}");
+                                target.exit(); return;
+                            }
+                        }
+                    }
+                    if gpu_loss.pending() { return; }
+                    let rt_extent = (config.width.min(max_texture_dimension), config.height.min(max_texture_dimension));
+                    if renderer.renders_rays() {
+                        match renderer.lighter.prepare_frame(&renderer.device, rt_extent.0, rt_extent.1) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                return;
+                            }
+                            Err(error) => {
+                                if recovery::lost_error(&error) {
+                                    gpu_loss.report(error);
+                                    return;
+                                }
+                                renderer.lighter.fail_frame(error);
+                            }
+                        }
+                    }
                     // One place handles both a window resize and a Graphics-tab
                     // scale change: reallocate only when the scaled extent moves.
                     let slider_extent = crate::render_scale::scaled_extent(config.width, config.height, settings.resolution_scale, max_texture_dimension);
                     settings.upscale_quality =
                         crate::nearest_available(settings.upscaling, settings.upscale_quality);
-                    let ray_world = renderer.lighter.replaces_world();
+                    let ray_world = renderer.renders_rays();
+                    let wants_rays = renderer.lighter.armed() && renderer.lighter.requested()
+                        && renderer.lighter_feed.is_some();
                     let extent_upscaling = if ray_world {
                         crate::UpscaleMethod::Off
                     } else { settings.upscaling };
@@ -6174,26 +6235,12 @@ fn run_viewer(
                         .map(|dlss| dlss.render_extent())
                         .unwrap_or(applied_extent);
                     let wanted_world = if ray_world {
-                        (config.width.min(max_texture_dimension),config.height.min(max_texture_dimension))
+                        rt_extent
                     } else if upscaler_running {
                         live_extent
                     } else {
                         slider_extent
                     };
-                    if ray_world && renderer.lighter.error().is_none() {
-                        match renderer.lighter.prepare_frame(&renderer.device, wanted_world.0, wanted_world.1) {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
-                                return;
-                            }
-                            Err(error) => {
-                                let lost = recovery::lost_error(&error);
-                                renderer.lighter.fail_frame(error);
-                                if lost { return; }
-                            }
-                        }
-                    }
                     if wanted_world != world_extent {
                         world_extent = wanted_world;
                         resize_world_targets(&mut renderer, world_extent.0, world_extent.1);
@@ -6629,30 +6676,6 @@ fn run_viewer(
                     if active_keys.contains(&KeyCode::ArrowDown) {
                         camera.pitch = (camera.pitch - dt).max(-1.5)
                     }
-                    if streaming {
-                        if pending_mesh.is_none() {
-                            match result_rx.try_recv() {
-                                Ok(Ok(mesh)) => pending_mesh = Some(mesh),
-                                Ok(Err(e)) => {
-                                    eprintln!("Streaming error: {e}");
-                                    target.exit(); return;
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                    eprintln!("World streaming worker exited");
-                                    target.exit(); return;
-                                }
-                            }
-                        }
-                        match renderer.update_mesh(&mut pending_mesh) {
-                            Ok(true) => streaming = false,
-                            Ok(false) => {},
-                            Err(e) => {
-                                eprintln!("Terrain residency upload failed: {e}");
-                                target.exit(); return;
-                            }
-                        }
-                    }
                     // `0x77e360` runs for every resident block on every frame and
                     // the window origin follows the camera's block, so re-select
                     // both per frame and rebuild only when the drawn mesh would
@@ -6678,7 +6701,7 @@ fn run_viewer(
                     // atlases nothing samples. Crossing into or out of that
                     // state changes what the mesh should contain, so it is part
                     // of the staleness test and not just of the request.
-                    let skip_local_scenery = renderer.world_done && !ray_world;
+                    let skip_local_scenery = renderer.world_done && !wants_rays;
                     let stale = match &aim {
                         Some(aim) => {
                             aim != &renderer.lod
@@ -6687,7 +6710,7 @@ fn run_viewer(
                                 // A clamped terrain window and its LODs may
                                 // hold steady across a block crossing. The ray
                                 // scenery range still has to follow the eye.
-                                || (ray_world && renderer.center != camera_block(width, height, spacing, [camera.pos.x, camera.pos.z]))
+                                || (wants_rays && renderer.center != camera_block(width, height, spacing, [camera.pos.x, camera.pos.z]))
                         }
                         None => false,
                     };
@@ -6717,7 +6740,12 @@ fn run_viewer(
                     if !settings.show_zone_entry {zone_banner=None;}
                     if settings.fullscreen!=fullscreen_applied {window.set_fullscreen(if settings.fullscreen{Some(Fullscreen::Borderless(window.current_monitor()))}else{None});fullscreen_applied=settings.fullscreen;}
 
-                    let want_world=settings.whole_world && !ray_world && !settings.detail.terrain_cutoff && !renderer.detail.terrain_cutoff;
+                    // Don't tear down the only copy of the scenery while a
+                    // ray-enabled local mesh is still on the streaming worker.
+                    // Keep the resident Native fallback available thereafter.
+                    let keep_world_pages = renderer.world_done && renderer.local_scenery_skipped;
+                    let want_world=settings.whole_world && (!wants_rays || keep_world_pages)
+                        && !settings.detail.terrain_cutoff && !renderer.detail.terrain_cutoff;
                     if want_world != world_enabled {
                         world_enabled=want_world;
                         if let Some(c)=world_cancel.take(){c.store(true,std::sync::atomic::Ordering::Relaxed);}
@@ -6730,7 +6758,7 @@ fn run_viewer(
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
                             std::thread::Builder::new().name("whole-world-objects".into()).spawn(move ||crate::world_objects::build(root,ornaments,tx,c)).expect("world preload thread");
                             world_rx=Some(rx);world_cancel=Some(cancel);world_started_at=Some(std::time::Instant::now());world_last_log_at=std::time::Instant::now();world_last_logged_pages=0;world_status=String::from("Loading world objects...");
-                        } else {world_started_at=None;world_status=String::from(if ray_world { "Paused by Lighter (separate ray residency)" } else { "Off" });}
+                        } else {world_started_at=None;world_status=String::from(if wants_rays { "Paused by Lighter (separate ray residency)" } else { "Off" });}
                     }
                 if let Some(rx) = &world_rx {
                     // Favor completing the explicitly requested whole-world
@@ -6794,6 +6822,7 @@ fn run_viewer(
                                 renderer.local_pages.shrink_to_fit();
                                 renderer.local_page_keys.clear();
                                 renderer.world_done = true;
+                                renderer.local_scenery_skipped = true;
                                 let elapsed = world_started_at
                                     .take()
                                     .map(|started| started.elapsed().as_secs_f64());
@@ -7075,7 +7104,7 @@ fn run_viewer(
                                 .or_else(|| xess_upscaler.as_ref().map(|xess| xess.jitter()))
                                 .or_else(|| dlss_upscaler.as_ref().map(|dlss| dlss.jitter()))
                                 .unwrap_or((0.0, 0.0));
-                            renderer.render(
+                            let world_ready = renderer.render(
                                 &world_view,
                                 &world_raw_view,
                                 world_matrix,
@@ -7084,13 +7113,23 @@ fn run_viewer(
                                 world_extent.1,
                                 camera_jumped,
                             );
-                            if gpu_loss.pending() || renderer.lighter.error().is_some_and(recovery::lost_error) { return; }
+                            if let Some(error) = renderer.lighter.error().filter(|e| recovery::lost_error(e)) {
+                                gpu_loss.report(error.to_owned());
+                            }
+                            if gpu_loss.pending() { return; }
                             if restoring.is_some() && !presented_once {
                                 if let Some(error) = renderer.lighter.error() {
                                     crate::world_handoff::publish_failure(error);
                                     target.exit();
                                     return;
                                 }
+                            }
+                            if !world_ready {
+                                // Drop this swapchain image rather than passing
+                                // an unwritten/stale target to capture or present.
+                                if let Some(session) = latency.as_mut() { session.render_submit_end(); }
+                                gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                return;
                             }
                             #[cfg(test)]
                             if let Some(dir) = smoke_dir.filter(|_| restoring.is_none()) {
@@ -7690,6 +7729,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         egui::Area::new(egui::Id::new("lighter-error")).anchor(egui::Align2::RIGHT_TOP,egui::vec2(-16.,16.)).interactable(false).show(ctx,|ui| {
                                             egui::Frame::popup(ui.style()).show(ui,|ui| {
                                                 ui.set_max_width(360.);
+                                                ui.label("Showing the Native renderer");
                                                 ui.colored_label(egui::Color32::LIGHT_RED,error);
                                                 ui.label("Change renderer in Esc → Modules → Lighter.");
                                             });
@@ -8444,8 +8484,8 @@ fn preview_frame(
         format: Some(fmt.remove_srgb_suffix()),
         ..Default::default()
     });
-    let draw = |r: &mut Renderer, cam: &Camera| {
-        r.render(
+    let draw = |r: &mut Renderer, cam: &Camera| -> Result<(), String> {
+        let ready = r.render(
             &view,
             &raw,
             cam.matrix(width, height, cam.far),
@@ -8454,6 +8494,13 @@ fn preview_frame(
             height,
             false,
         );
+        if let Some(error) = r.lighter.error() {
+            return Err(error.into());
+        }
+        if !ready || (mode != LighterMode::Off && !r.renders_rays()) {
+            return Err("Lighter capture did not render the requested frame".into());
+        }
+        Ok(())
     };
     // An A/B of the world-effect pass, so "no effects" can be answered rather
     // than argued. The same camera and the same frame are rendered twice, the
@@ -8470,7 +8517,7 @@ fn preview_frame(
         // Drain the one-root-per-frame queue first: an effect still waiting for
         // its player must not be mistaken for one that never drew.
         for _ in 0..60 {
-            draw(&mut renderer, &cam);
+            draw(&mut renderer, &cam)?;
         }
         let report = renderer
             .models
@@ -8489,7 +8536,7 @@ fn preview_frame(
             .unwrap_or_else(|| "no world".into());
         let on = read_target_pixels(&renderer, &mut captures, &target).unwrap_or_default();
         cam.world_effects = false;
-        draw(&mut renderer, &cam);
+        draw(&mut renderer, &cam)?;
         let off = read_target_pixels(&renderer, &mut captures, &target).unwrap_or_default();
         cam.world_effects = true;
         let differing = on
@@ -8505,17 +8552,11 @@ fn preview_frame(
     if let Some(warmup) = audit {
         for _ in 0..warmup {
             cam.logic_delta_ms = 16;
-            draw(&mut renderer, &cam);
-            if let Some(error) = renderer.lighter.error() {
-                return Err(error.into());
-            }
+            draw(&mut renderer, &cam)?;
         }
         cam.logic_delta_ms = 0;
     }
-    draw(&mut renderer, &cam);
-    if let Some(error) = renderer.lighter.error() {
-        return Err(error.into());
-    }
+    draw(&mut renderer, &cam)?;
     if std::env::var_os("PW_PREVIEW_MINIMAP").is_some() {
         let d = depth(&renderer.device, width, height);
         renderer.render_minimap(
@@ -8586,10 +8627,7 @@ fn preview_frame(
         let mut capture_ms = Vec::new();
         for _ in 0..timed_frames {
             let start = Instant::now();
-            draw(&mut renderer, &cam);
-            if let Some(error) = renderer.lighter.error() {
-                return Err(error.into());
-            }
+            draw(&mut renderer, &cam)?;
             read_target_pixels(&renderer, &mut captures, &target)?;
             capture_ms.push(start.elapsed().as_secs_f64() * 1000.);
             renderer.lighter.profile_collect(&renderer.queue);

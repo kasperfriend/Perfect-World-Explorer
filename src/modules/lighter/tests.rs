@@ -1045,6 +1045,74 @@ fn exercise_material_channels(h: &mut Harness) {
     );
     h.ray.settings.relight_baked = false;
 
+    // Compare the same asymmetric mask in the old RGBA and new packed R8
+    // layouts. Use grazing and distant footprints as well as a close sample.
+    h.ray.settings.lighting = false;
+    let mask: Vec<_> = (0..32 * 32)
+        .map(|i| ((i / 32 * 7 + i % 32 * 5) % 247 + 4) as u8)
+        .collect();
+    let mut probes = Vec::new();
+    for packed in [false, true] {
+        let mut bank = Textures::default();
+        let red = bank
+            .tile([1; 2], 1, Filter::Color, |_, _| 0xff0000ff)
+            .unwrap();
+        let green = bank
+            .tile([1; 2], 1, Filter::Color, |_, _| 0xff00ff00)
+            .unwrap();
+        let addr = if packed {
+            bank.insert(&textures::Tile::mask(32, 32, &mask).unwrap())
+                .unwrap()
+        } else {
+            bank.tile([32; 2], 32, Filter::Data, |x, y| {
+                u32::from(mask[(y * 32 + x) as usize]) * 0x01010101
+            })
+            .unwrap()
+        };
+        let area = bank.reserve(4).unwrap();
+        let layer = bank.reserve(10).unwrap();
+        bank.write_words(area, &[layer as u32, 2, 0, 0]);
+        let one = 1.0f32.to_bits();
+        bank.write_words(layer, &[red, 0, 1, one, one, green, addr, 1, one, one]);
+        let mut b = Builder::default();
+        let plane = quad(
+            &mut b,
+            [[-4., 0., 4.], [4., 0., 4.], [-4., 0., -4.], [4., 0., -4.]],
+            [0., 1., 0.],
+            0,
+            TERRAIN,
+            u32::MAX,
+        );
+        put(&mut b, plane);
+        h.ray.install(Ok((b.finish(), bank)));
+        let mut trace = |eye, dir| {
+            let mut frame = test_frame(eye, dir, 3);
+            frame.terrain = [4., 4., 1., 4.];
+            frame.options[3] = area as u32;
+            h.pixel(frame, &empty)
+        };
+        probes.push([
+            trace(Vec3::new(-0.73, 1., 0.33), -Vec3::Y),
+            trace(Vec3::new(0., 25., 0.), -Vec3::Y),
+            trace(
+                Vec3::new(-12., 1., -0.63),
+                Vec3::new(12., -1., 0.).normalize(),
+            ),
+        ]);
+    }
+    for ((old, depth), (packed, packed_depth)) in probes[0].into_iter().zip(probes[1]) {
+        assert!(
+            old[0] > 0 && old[1] > 0 && old[2] == 0 && depth > 0.,
+            "expected blended terrain: {old:?}, {depth}"
+        );
+        assert_eq!(depth, packed_depth);
+        assert!(
+            old.into_iter().zip(packed).all(|(a, b)| a.abs_diff(b) <= 1),
+            "packed mask changed the terrain blend: {old:?} vs {packed:?}"
+        );
+    }
+    h.ray.settings.lighting = true;
+
     // Normal map steers the shading normal, not the ray-plane side/depth.
     let mut bank = Textures::default();
     let map = bank

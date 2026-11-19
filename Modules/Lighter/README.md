@@ -24,9 +24,12 @@ ray-traced scene and its reverse-Z depth.
    indirect light. The **Edge-aware denoiser**, **Progressive sampling while
    still** and **Soft sun shadows** are on by default and can be toggled
    independently. Leave the camera still to accumulate lighting samples.
-4. **Off** returns to the native world renderer. An unsupported or failed
-   selected backend reports an error rather than silently drawing native or
-   switching to the other ray backend.
+4. **Off** returns to the Native world renderer. If the selected ray backend
+   is unavailable or hits a scene budget that it cannot fit, the interactive
+   viewer shows Native with the reason in the HUD and the Lighter menu. It
+   neither rewrites your selected mode nor switches to the other ray backend.
+   A healthy streamed scene or a changed ray setting can retry it. Explicit
+   headless ray captures still fail instead of saving a Native image.
 
 For a source-tree build, set `PW_MODULES_DIR` to the folder containing the
 installed manifests (the repository's `Modules` directory). Settings live in
@@ -81,7 +84,9 @@ with an estimated ±64-unit box and a warning. Very large or offset assets can
 extend past that estimate until first decoded. Terrain has separate near-block
 and far-patch keys with bounds from the heightfield.
 
-Native local ornaments always have priority. Extra placements are ranked by
+Native local ornaments have priority, nearest to the installed block first.
+When a local placement cannot fit, it is counted as budget-limited and omitted
+whole, not rendered with incomplete material data. Extra placements are ranked by
 distance to the installed block, distance to the local receiver region, and
 whether they overlap a static point-light path to that region. The secondary
 reach is **768 world units beyond the receiver region**, with a coarse corridor
@@ -93,8 +98,10 @@ map views and the native renderer use their existing scenery selection.
 
 The extension considers up to 512 ranked placements, with separate 16 MiB
 budgets for packed geometry (including conservative BVH overhead) and extra
-texture tiles. Available adapter storage can reduce it further; at insertion,
-no more than half of the remaining texture-bank room goes to the extension.
+texture tiles. Available adapter storage can reduce it further. Admission
+reserves texture space for moving actors and effects; the extension can use
+at most half of the room still free after local admission. See the
+[GPU budget](gpu-budget.md) for the terrain-mask and vegetation limits.
 Unchanged resident chunk geometry retains matching software trees and Vulkan
 BLAS across streams; evicted geometry does not accumulate in the cache. The
 **Lighter** menu shows catalog and resident chunks, estimated bounds, local
