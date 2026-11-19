@@ -48,7 +48,7 @@ mod vulkan;
 use bytemuck::{Pod, Zeroable};
 use scene::Packet;
 pub(crate) use settings::{Denoiser, Mode, Settings};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use textures::{suffix_segments, upload_pages, TexelPrefix, Textures};
 
 const PIXELS: &str = include_str!("pixels.wgsl");
@@ -854,7 +854,7 @@ fn output_pass<'a>(
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 enum ColdRayBuild {
-    Progress(&'static str),
+    Progress(u64, &'static str),
     Done(Result<(vulkan::Renderer, bool), String>),
 }
 
@@ -869,10 +869,22 @@ pub struct Lighter {
     hardware: Option<vulkan::Renderer>,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     cold_ray: Option<std::sync::mpsc::Receiver<ColdRayBuild>>,
+    /// Deadline for cold-ray startup; reset on every stage advance so a
+    /// stalled pipeline worker fails closed instead of hanging forever.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    cold_ray_deadline: Option<Instant>,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     paced_startup: bool,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     initial_progress: [u64; 3],
+    /// Read-only mirror of the Graphics upscaler choice, shown in the panel
+    /// so the user knows what the ray overlay inherits. Not a control.
+    graphics_upscaler: Option<String>,
+    /// Read-only mirror of the Graphics frame-gen choice, shown in the panel.
+    graphics_frame_gen: Option<String>,
+    /// Last-frame status: denoiser used, upscaler inherited, frame-gen state,
+    /// fallback reason. Shown in the panel as read-only information.
+    status_line: Option<String>,
     software: Option<Software>,
     present: Option<Present>,
     post: Option<post::Post>,
@@ -934,9 +946,14 @@ impl Default for Lighter {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             cold_ray: None,
             #[cfg(any(target_os = "windows", target_os = "linux"))]
+            cold_ray_deadline: None,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             paced_startup: false,
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             initial_progress: [0; 3],
+            graphics_upscaler: None,
+            graphics_frame_gen: None,
+            status_line: None,
             software: None,
             present: None,
             post: None,
@@ -1549,6 +1566,7 @@ impl Lighter {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             self.cold_ray = None;
+            self.cold_ray_deadline = None;
             self.vendor_present = None;
             self.reconstruction = None;
         }
@@ -1612,8 +1630,10 @@ impl Lighter {
                     .as_ref()
                     .filter(|_| self.bc_pages)
                     .map(|w| w.textures.bc_pages.clone());
+                let mut stage: u64 = 0;
+                self.cold_ray_deadline = Some(Instant::now() + Duration::from_secs(30));
                 std::thread::Builder::new().name("lighter-pipeline-startup".into()).spawn(move || {
-                    let progress = |step| { let _ = tx.send(ColdRayBuild::Progress(step)); };
+                    let progress = |step| { stage += 1; let _ = tx.send(ColdRayBuild::Progress(stage, step)); };
                     let build = |temporal| vulkan::Renderer::new(&device, compact, reuse, pages.as_ref(), temporal, game, &progress);
                     let made = match build(temporal) {
                         Err(error) if temporal && !crate::gpu::reconstruction_device_lost(&error) => {
@@ -1636,18 +1656,32 @@ impl Lighter {
             }
             if let Some(rx) = &self.cold_ray {
                 let made = loop {
+                    if let Some(deadline) = self.cold_ray_deadline {
+                        if Instant::now() > deadline {
+                            return Err("Lighter cold-ray startup exceeded the first-frame timeout".into());
+                        }
+                    }
                     match rx.try_recv() {
-                        Ok(ColdRayBuild::Progress(stage)) => {
-                            crate::gpu::first_frame_progress(stage)
+                        Ok(ColdRayBuild::Progress(_, stage_msg)) => {
+                            crate::gpu::first_frame_progress(stage_msg);
+                            self.cold_ray_deadline = Some(Instant::now() + Duration::from_secs(30));
                         }
                         Ok(ColdRayBuild::Done(made)) => break made,
-                        Err(TryRecvError::Empty) => return Ok(false),
+                        Err(TryRecvError::Empty) => {
+                            if let Some(deadline) = self.cold_ray_deadline {
+                                if Instant::now() > deadline {
+                                    return Err("Lighter cold-ray startup exceeded the first-frame timeout".into());
+                                }
+                            }
+                            return Ok(false);
+                        }
                         Err(TryRecvError::Disconnected) => {
                             break Err("Lighter pipeline worker ended before publication".into())
                         }
                     }
                 };
                 self.cold_ray = None;
+                self.cold_ray_deadline = None;
                 let (renderer, temporal) = made?;
                 if !temporal {
                     self.reconstruction = None;
@@ -2343,7 +2377,14 @@ impl Lighter {
                         .on_hover_text(d.unavailable_reason().unwrap_or("Always available portable denoiser."));
                 }
             });
-        ui.label("Upscaling and frame generation come from Graphics settings: inherited by the ray overlay.");
+        let upscale = self.graphics_upscaler.as_deref().unwrap_or("not yet reported");
+        let framegen = self.graphics_frame_gen.as_deref().unwrap_or("not yet reported");
+        ui.label(format!(
+            "Upscaling and frame generation come from Graphics settings: {upscale} + {framegen} (read-only, inherited by the ray overlay)."
+        ));
+        if let Some(status) = &self.status_line {
+            ui.label(status);
+        }
         ui.checkbox(&mut self.settings.physical_bsdf, "GGX / Lambert materials")
             .on_hover_text("Evaluate and sample energy-bounded microfacet and diffuse lobes on relit materials. Preserve the legacy color stages for baked surfaces and GFX sheets.");
         ui.checkbox(&mut self.settings.progressive, "Progressive sampling while still")
