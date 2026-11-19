@@ -5459,11 +5459,6 @@ fn run_viewer(
         eprintln!("World catalog: {warning}");
     }
     let handoff_child = crate::world_handoff::is_handoff_child();
-    // The capture runner drives the actual replacement startup protocol,
-    // but suppresses recovery/interactive resize so results are deterministic.
-    let perf_capture = handoff_child && std::env::var("PW_PERF_CAPTURE").as_deref() == Ok("1");
-    let trace_ray_provider = std::env::var("PW_RAY_PROVIDER_TRACE").as_deref() == Ok("1");
-    let perf_start_only = perf_capture && std::env::var("PW_PERF_START_ONLY").as_deref() == Ok("1");
     let mut event_loop = EventLoopBuilder::<()>::with_user_event();
     #[cfg(all(test, target_os = "linux"))]
     if smoke_dir.is_some() {
@@ -5484,25 +5479,6 @@ fn run_viewer(
         .with_maximized(!cfg!(windows))
         .with_active(!handoff_child)
         .with_visible(false);
-    let window_builder = if perf_capture {
-        let monitor = event_loop
-            .primary_monitor()
-            .ok_or("performance capture needs an interactive display")?;
-        if (monitor.size().width, monitor.size().height) != (2560, 1440) {
-            return Err(
-                "set the primary Windows display to 2560×1440 for the performance session".into(),
-            );
-        }
-        window_builder
-            .with_maximized(false)
-            .with_active(true)
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_position(monitor.position())
-            .with_inner_size(monitor.size())
-    } else {
-        window_builder
-    };
     #[cfg(test)]
     let window_builder = if smoke_dir.is_some() {
         window_builder
@@ -5865,7 +5841,7 @@ fn run_viewer(
     let mut ambience = crate::music::AmbiencePlayer::new_for_map(&t.element, &zones_path);
     let mut world_audio = crate::world_audio::WorldAudio::new(&t.element, &t.scene);
     #[cfg(windows)]
-    let mut maximize_after_startup = !perf_capture;
+    let mut maximize_after_startup = true;
     #[cfg(all(windows, test))]
     if smoke_dir.is_some() {
         maximize_after_startup = false;
@@ -6119,9 +6095,6 @@ fn run_viewer(
     let mut stream_commit_pending = false;
     let mut travel =
         lighter_travel::Travel::from_env(&current_map.id, adapter.get_info(), &renderer.device)?;
-    if perf_capture && travel.is_none() && !perf_start_only {
-        return Err("performance capture needs a travel plan".into());
-    }
     // A surface retry must not consume a replay cut before it reaches a
     // completed present. Normal interactive jump detection is unchanged.
     let mut travel_cut_pending = false;
@@ -6423,27 +6396,7 @@ fn run_viewer(
                                 }
                                 std::fs::write(dir.join("restored-present"), std::process::id().to_string()).unwrap();
                             }
-                            if trace_ray_provider && drawn_mode != LighterMode::Off {
-                                eprintln!("Lighter present provider: {}", renderer.lighter.reconstruction_status().unwrap_or("portable"));
-                            }
-                            if perf_capture {
-                                eprintln!("Lighter perf first present: {}x{} mode={drawn_mode:?} provider={} adapter={:?}",
-                                    config.width, config.height, renderer.lighter.reconstruction_status().unwrap_or("portable"), adapter.get_info());
-                            }
                             if handoff_child { crate::world_handoff::signal_ready(); }
-                            if perf_capture {
-                                let actual = renderer.lighter.reconstruction_status();
-                                let bad_route = drawn_mode != lighter_settings.mode;
-                                let bad_provider = travel.as_mut().is_some_and(|flight| !flight.check_provider(actual));
-                                if (config.width, config.height) != (2560, 1440) || bad_route || bad_provider {
-                                    run_error = Some("first present did not use the requested 2560x1440 renderer/provider".into());
-                                }
-                                if perf_start_only || run_error.is_some() {
-                                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
-                                    target.exit();
-                                    return;
-                                }
-                            }
                             #[cfg(test)]
                             if smoke_dir.is_some() && smoke_travel.is_none() {
                                 if restoring.is_some() {
@@ -8609,9 +8562,6 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 let present_started = drawn_pose.map(|_| Instant::now());
                                 frame.present();
                                 let presented_at = Instant::now();
-                                if trace_ray_provider && renderer.renders_rays() {
-                                    eprintln!("Lighter present provider: {}", renderer.lighter.reconstruction_status().unwrap_or("portable"));
-                                }
                                 if renderer.renders_rays() {
                                     renderer.lighter.profile_presented(presented_at);
                                 }
@@ -8707,20 +8657,12 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                 camera.pitch = (camera.pitch - delta.1 as f32 * settings.sensitivity).clamp(-1.5, 1.5);
             }
             Event::AboutToWait => {
-                if perf_capture && travel.as_ref().is_some_and(lighter_travel::Travel::finished) {
-                    if !travel.as_ref().unwrap().saved() {
-                        run_error = Some("performance travel did not produce a complete receipt; see the viewer log".into());
-                    }
-                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
-                    target.exit();
-                    return;
-                }
                 if !gpu_recovering {
                     let reason = gpu_loss.take().or_else(|| renderer.lighter.error().filter(|m| recovery::lost_error(m)).map(str::to_owned));
                     if let Some(reason) = reason {
                         eprintln!("Graphics device lost: {reason}");
-                        if perf_capture || handoff_child && !presented_once {
-                            run_error = Some(format!("The replacement graphics device was lost: {reason}"));
+                        if handoff_child && !presented_once {
+                            run_error = Some(format!("The replacement graphics device was lost before its first frame: {reason}"));
                             target.set_control_flow(winit::event_loop::ControlFlow::Poll);
                             target.exit();
                             return;

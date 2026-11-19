@@ -3,11 +3,7 @@
 //! or add GPU waits; separate motion-analysis mode opts into readback.
 use crate::modules::lighter::{Mode, Settings};
 use sha2::{Digest, Sha256};
-use std::{
-    io::Write,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::{io::Write, path::PathBuf, time::Instant};
 
 const MAX_FRAMES: u32 = 30_000;
 
@@ -284,24 +280,6 @@ struct Setup {
     experiments: (u32, bool, bool),
 }
 
-struct MemoryCapture {
-    duration: Duration,
-    start: Option<Instant>,
-    last_sample: Option<Instant>,
-    next_pose: usize,
-    committed: u64,
-    rows: Vec<MemorySample>,
-}
-
-struct MemorySample {
-    elapsed: f64,
-    frame: usize,
-    chunk: (isize, isize),
-    bytes: u64,
-    committed: u64,
-    game: bool,
-}
-
 pub(super) struct Travel {
     plan: Plan,
     path: PathBuf,
@@ -320,10 +298,7 @@ pub(super) struct Travel {
     last: Option<Instant>,
     samples: Vec<Sample>,
     setup: Option<Setup>,
-    memory: Option<MemoryCapture>,
-    require_game: Option<bool>,
     finished: bool,
-    saved: bool,
 }
 
 impl Travel {
@@ -374,30 +349,6 @@ impl Travel {
             Ok("0") | Err(std::env::VarError::NotPresent) => (),
             _ => return Err("PW_LIGHTER_TRAVEL_SYNC must be 0 or 1".into()),
         }
-        if std::env::var("PW_PERF_CAPTURE").as_deref() == Ok("1") {
-            travel.require_game = Some(std::env::var("PW_RAY_GAME_PROFILE").as_deref() == Ok("1"));
-        }
-        if let Some(n) = std::env::var_os("PW_PERF_MEMORY_SECONDS") {
-            let secs = n
-                .to_str()
-                .and_then(|n| n.parse::<u64>().ok())
-                .filter(|s| (600..=3600).contains(s))
-                .ok_or("PW_PERF_MEMORY_SECONDS must be 600..3600")?;
-            if std::env::var("PW_PERF_CAPTURE").as_deref() != Ok("1")
-                || travel.sync
-                || travel.motion_dir.is_some()
-            {
-                return Err("memory capture needs the normal-present performance runner".into());
-            }
-            travel.memory = Some(MemoryCapture {
-                duration: Duration::from_secs(secs),
-                start: None,
-                last_sample: None,
-                next_pose: 0,
-                committed: 0,
-                rows: Vec::with_capacity(secs as usize + 1),
-            });
-        }
         Ok(Some(travel))
     }
 
@@ -437,10 +388,7 @@ impl Travel {
             last: None,
             samples,
             setup: None,
-            memory: None,
-            require_game: None,
             finished: false,
-            saved: false,
         })
     }
 
@@ -513,15 +461,7 @@ impl Travel {
             }
             return None;
         }
-        let frame = self
-            .memory
-            .as_ref()
-            .map_or(self.samples.len(), |m| m.next_pose);
-        Some((
-            self.plan
-                .pose((frame % self.plan.samples() as usize) as u32),
-            self.plan.hour,
-        ))
+        Some((self.plan.pose(self.samples.len() as u32), self.plan.hour))
     }
 
     pub(super) fn invalidate(&mut self, reason: &str) {
@@ -560,13 +500,6 @@ impl Travel {
             self.invalidate("missing ray renderer counters");
             return;
         }
-        if self
-            .require_game
-            .is_some_and(|want| want != ray.as_ref().is_some_and(|r| r.game_profile_active))
-        {
-            self.invalidate("executed game profile differs from the capture recipe");
-            return;
-        }
         if self.sync != sync.is_some() {
             self.invalidate("missing synchronized completion sample");
             return;
@@ -575,17 +508,8 @@ impl Travel {
             self.invalidate("missing motion readback sample");
             return;
         }
-        let capture_heap = if let Some(m) = &self.memory {
-            self.warm >= self.plan.warmup
-                && (m
-                    .last_sample
-                    .is_none_or(|last| now - last >= Duration::from_secs(1))
-                    || m.start.is_some_and(|start| now - start >= m.duration))
-        } else {
-            self.sync || committed || self.samples.len() % 30 == 0
-        };
         #[cfg(any(target_os = "linux", target_os = "windows"))]
-        let heap_bytes = capture_heap
+        let heap_bytes = (self.sync || committed || self.samples.len() % 30 == 0)
             .then(|| self.heap.as_ref().map(Heap::bytes))
             .flatten();
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -625,40 +549,6 @@ impl Travel {
             self.invalidate("extent, present mode or graphics settings changed");
             return;
         }
-        if let Some(m) = &mut self.memory {
-            let start = *m.start.get_or_insert(now);
-            let elapsed = now - start;
-            m.committed += u64::from(committed);
-            if capture_heap {
-                let Some(bytes) = heap_bytes.filter(|&n| n > 0) else {
-                    self.invalidate(
-                        "process device-local driver heap unavailable for memory travel",
-                    );
-                    return;
-                };
-                m.last_sample = Some(now);
-                m.rows.push(MemorySample {
-                    elapsed: elapsed.as_secs_f64(),
-                    frame: m.next_pose,
-                    chunk,
-                    bytes,
-                    committed: m.committed,
-                    game: ray.is_some_and(|r| r.game_profile_active),
-                });
-            }
-            m.next_pose += 1;
-            if elapsed >= m.duration {
-                self.finished = true;
-                match self.save_memory() {
-                    Ok(()) => {
-                        self.saved = true;
-                        eprintln!("Lighter memory travel saved to {}", self.path.display());
-                    }
-                    Err(e) => eprintln!("Lighter memory travel could not save: {e}"),
-                }
-            }
-            return;
-        }
         let Some(previous) = self.last.replace(now) else {
             return;
         };
@@ -678,76 +568,15 @@ impl Travel {
         if self.samples.len() == self.plan.samples() as usize {
             self.finished = true;
             match self.save() {
-                Ok(()) => {
-                    self.saved = true;
-                    eprintln!(
-                        "Lighter travel: {} {} presents saved to {}",
-                        self.samples.len(),
-                        self.capture_policy(),
-                        self.path.display()
-                    );
-                }
+                Ok(()) => eprintln!(
+                    "Lighter travel: {} {} presents saved to {}",
+                    self.samples.len(),
+                    self.capture_policy(),
+                    self.path.display()
+                ),
                 Err(e) => eprintln!("Lighter travel could not save: {e}"),
             }
         }
-    }
-
-    pub(super) fn finished(&self) -> bool {
-        self.finished
-    }
-
-    pub(super) fn saved(&self) -> bool {
-        self.saved
-    }
-
-    fn save_memory(&self) -> std::io::Result<()> {
-        let m = self.memory.as_ref().unwrap();
-        let setup = self.setup.as_ref().unwrap();
-        let mut out = self.output_file()?;
-        let [(w, h), (rw, rh), (tw, th)] = setup.extents;
-        writeln!(out, "# schema=1\n# capture_policy=memory_travel\n# plan_sha256={}\n# map={}\n# count={}\n# adapter={:?}\n# platform={}\n# architecture={}\n# ray_reconstruction={}\n# hybrid={}\n# display={w}x{h}\n# world={rw}x{rh}\n# trace={tw}x{th}\n# ray={:?}\n# present_mode={:?}",
-            self.plan.hash,self.plan.map,m.rows.len(),self.adapter,std::env::consts::OS,std::env::consts::ARCH,self.expected_provider,self.hybrid,setup.ray,setup.present)?;
-        self.write_view(&mut out, setup)?;
-        if let Some(bytes) = self.largest_local_heap_bytes {
-            writeln!(out, "# vulkan_largest_device_local_heap_bytes={bytes}")?;
-        }
-        writeln!(out, "elapsed_s,frame,chunk_x,chunk_z,commits,device_local_heap_estimate_bytes,game_profile_active")?;
-        for r in &m.rows {
-            writeln!(
-                out,
-                "{:.6},{},{},{},{},{},{}",
-                r.elapsed,
-                r.frame,
-                r.chunk.0,
-                r.chunk.1,
-                r.committed,
-                r.bytes,
-                u8::from(r.game)
-            )?;
-        }
-        out.flush()
-    }
-
-    fn output_file(&self) -> std::io::Result<std::io::BufWriter<std::fs::File>> {
-        Ok(std::io::BufWriter::new(
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&self.path)?,
-        ))
-    }
-
-    fn write_view(&self, out: &mut impl Write, setup: &Setup) -> std::io::Result<()> {
-        let mut v = setup.view.clone();
-        v.upscale_sdk_dir.clear();
-        v.logging_dir.clear();
-        v.time_of_day = self.plan.hour;
-        let stamp = format!("{v:?}");
-        writeln!(
-            out,
-            "# view_sha256={:x}\n# view={stamp}",
-            Sha256::digest(stamp.as_bytes())
-        )
     }
 
     #[cfg(test)]
@@ -766,7 +595,12 @@ impl Travel {
     }
 
     fn save(&self) -> std::io::Result<()> {
-        let mut out = self.output_file()?;
+        let mut out = std::io::BufWriter::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&self.path)?,
+        );
         writeln!(out,"# schema=1\n# map={}\n# plan_sha256={}\n# hour={}\n# warmup={}\n# count={}\n# hybrid={}\n# adapter={:?}",
             self.plan.map,self.plan.hash,self.plan.hour,self.plan.warmup,self.samples.len(),self.hybrid,self.adapter)?;
         writeln!(
@@ -788,7 +622,18 @@ impl Travel {
                 out,
                 "# screen_cache_mask={cache}\n# compact_terrain={compact}\n# sampled_bc={sampled}"
             )?;
-            self.write_view(&mut out, s)?;
+            let mut v = s.view.clone();
+            // Do not write local directories to a shareable capture. The route
+            // pins the day/night clock independently of the saved slider.
+            v.upscale_sdk_dir.clear();
+            v.logging_dir.clear();
+            v.time_of_day = self.plan.hour;
+            let stamp = format!("{v:?}");
+            writeln!(
+                out,
+                "# view_sha256={:x}\n# view={stamp}",
+                Sha256::digest(stamp.as_bytes())
+            )?;
         }
         if let Some(peak) = self.heap_peak {
             writeln!(out, "# peak_sampled_device_local_heap_estimate_bytes={peak}\n# heap_at_or_above_7_gb={}", self.heap_warned)?;
