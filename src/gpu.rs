@@ -5532,7 +5532,7 @@ fn run_viewer(
     };
     #[cfg(test)]
     let saved_lighter = if smoke_dir.is_some() && smoke_travel.is_none() && restoring.is_none() {
-            LighterSettings {
+        LighterSettings {
             mode: smoke_mode,
             lighting: false,
             shadows: false,

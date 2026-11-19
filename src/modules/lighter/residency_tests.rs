@@ -390,7 +390,7 @@ pub(super) fn moving_occluder_history(h: &mut Harness) {
     let saved = h.ray.settings;
     h.ray.settings.samples = 1;
     h.ray.settings.resolution = 100;
-    h.ray.settings.denoiser = Denoiser::None;
+    h.ray.settings.denoiser = false;
     h.ray.settings.bounces = 0;
     h.ray.settings.lighting = false;
     h.ray.settings.shadows = false;

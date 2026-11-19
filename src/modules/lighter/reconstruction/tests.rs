@@ -176,7 +176,8 @@ fn make(mode: Mode, cpu_query: bool, rr: bool) -> Harness {
     )));
     h.ray.settings.resolution = 50;
     h.ray.settings.progressive = true;
-    h.ray.settings.denoiser = Denoiser::Svgf;
+    h.ray.settings.denoiser = true;
+    h.ray.settings.fsr1_easu = true;
     h
 }
 
