@@ -308,3 +308,47 @@ error and are corrected there: the EC-BSD "unmeasurable" note and this guard
 pair. Both were produced by looking in one place and writing down a fact about
 the format. That is now the third instance in this file, which is why each row
 records where the measurement was taken.
+
+## The destination list was never translated (18 November)
+
+The "destinations are still in Chinese" report was not a missing row in the
+zone table. `world_place_names::english` was already applied to the zone banner
+and to the precinct fallback; the list itself is built from `world_targets.txt`,
+and `navigation::parse_destinations` took the name straight out of the file. So
+a 1.5.2 client showed `雪霏村` under an English interface while 1.8.4 showed
+`Snowy Village` for the same teleport.
+
+Measured on the two real files:
+
+| client | `maps/world/world_targets.txt` | rows | names |
+| --- | --- | ---: | --- |
+| 1.5.2 | 7,670 B | 89 | all Chinese |
+| 1.8.4 | 24,408 B | 186 | all English |
+
+A row is `id  name  group  "x,y,z"  ...`. The id and the coordinate survive
+localisation and the name does not, so joining on (id, position to 0.01) pairs
+**86 of 87** rows uniquely with no ambiguity — the same invariant-matching
+principle the zone table was built on, with a different invariant.
+
+58 of the 89 were already covered. The other 28 are a **separate** table
+(`DESTINATION_NAMES`) rather than more zone rows, because a destination is often
+a point *inside* a zone — `卫戍营` ("Guardian's Watch") — which no polygon match
+reaches. Three names disagree between the two joins (`邻水镇`, `积羽城`,
+`獠牙镇`); the destination file is not allowed to override them, since the zone
+rows came from a measured polygon match and `獠牙镇` -> "Plume Officer" is not a
+town name. A test pins that so a regeneration cannot flip it silently.
+
+Coverage went 58/89 -> 86/89. The one real miss is `祖龙城南`, which has no
+same-position counterpart because 1.8.4 splits that area differently.
+
+**Checked in both directions**, because a translation table can fail by
+over-translating: all 246 real English zone names in 1.8.4's world
+`precinct.clt` pass through unchanged, and all 243 pre-existing Chinese rows
+still produce exactly the English text they had.
+
+### What this cost
+
+`navigation.rs` had no gate in the offline harness, so a module that now
+depends on `world_place_names` could not fail anything locally; CI's "Run viewer
+unit tests" caught it instead. That is the fourth time in this file that a claim
+was checkable and nothing checked it — hence the new `navigation` mode.
