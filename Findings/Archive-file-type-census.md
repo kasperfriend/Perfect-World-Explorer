@@ -225,3 +225,44 @@ The offline suite compiles `terrain_lightmaps.rs` but never sees a client
 `.t2lm`; the phase-1 check ran on one 256 file and generalised. That is the
 recurring shape here — a claim measured once, written down as a rule, and then
 enforced against data that was never re-measured.
+
+## EC-BSD placement tables measured (18 November)
+
+Item 78's open half was `grasses.pck`'s `ECBSD_NAME_LIMIT`: the constant was
+documented as *unmeasurable*, because both `grasses.pck` and `trees.pck` were
+scanned for the `0x42584F4D` / `0x42534446` identity and hold no such member.
+That scan was correct and the conclusion was wrong — EC-BSD files are not pack
+members. They live under `maps/world/`, one per map, and are only reachable in
+a full client.
+
+`tools/ecbsd-survey.py` over 8 real files:
+
+| file | revision | names |
+| --- | --- | --- |
+| `a117.ecbsd` | 18 | 1 |
+| `a79.ecbsd` | 17 | 1 |
+| `a95.ecbsd` | 18 | 1 |
+| `a64.ecbsd` | 18 | 4 |
+| `login.ecbsd` | 18 | 4 |
+| `a85.ecbsd` | 18 | 9 |
+| `a91.ecbsd` | 18 | 12 |
+| `world.ecbsd` | 18 | **88** |
+
+**The measured maximum is 88**, so the limit sits 9,912 names above the largest
+real table. Every file's name table parses completely under the three rules
+`water::path_string` applies — length ≤ 1024, clean GBK, and no `..`, leading
+`/` or `:` in the result — and both shipped revisions (17 and 18) read, which
+`scene::ecbsd_header` already allowed because it gates on identity only.
+
+The non-obvious part is what the names *are*: `BSData/1.dat` … `BSData/88.dat`
+in `world.ecbsd`, and `BSData/Login.dat` first in `login.ecbsd`. The name table
+indexes terrain grass-placement blocks, not textures, which is why 88 is a
+plausible ceiling for a large world rather than an odd one.
+
+### The pattern this is the third instance of
+
+`grasses.pck` was scanned, nothing was found, and the absence was written down
+as "unmeasurable" — accurate about the pack and false about the format. The
+tile-edge mistake above is the same shape from the other direction: one file
+measured, generalised to all. A survey answers the question it was pointed at,
+so the register now records *where* each measurement was taken.

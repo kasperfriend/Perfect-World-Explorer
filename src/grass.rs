@@ -117,11 +117,14 @@ const MAX_MOXB_INDICES: usize = 300_000;
 
 /// Bound on the names a grass EC-BSD placement file declares.
 ///
-/// Measured maximum is *not available*: no staged pack contains an EC-BSD at
-/// all. `grasses.pck` and `trees.pck` were both scanned for the
-/// `0x42584f4d` / `0x42534446` identity and neither carries one, so this rests
-/// on the producer's shape rather than on data -- a placement file names its
-/// textures, and 10,000 is far past any plausible list.
+/// Measured over 8 real placement files: the maximum is **88**
+/// (`world.ecbsd`, 2,678,024 B). The rest are far smaller -- `a91` 12, `a85`
+/// 9, `a64` and `login` 4, `a117`/`a79`/`a95` 1. The staged *packs* contain no
+/// EC-BSD at all; these files live under `maps/world/` in a full client, which
+/// is why the earlier note said the maximum was unavailable.
+///
+/// So the limit sits two orders of magnitude above the largest real table and
+/// is a guard against a damaged dword, not a statement about the format.
 const ECBSD_NAME_LIMIT: usize = 10_000;
 
 fn cstr<'a>(b: &'a [u8], start: usize) -> Result<(&'a [u8], usize), String> {
@@ -372,8 +375,8 @@ fn grass_names(
     let n = u(b, 12).unwrap_or(0) as usize;
     if n > ECBSD_NAME_LIMIT {
         // This function returns `&'static str`, so the bound is reported by
-        // name rather than formatted. The measured maximum is unavailable (no
-        // staged pack carries an EC-BSD at all); see `ECBSD_NAME_LIMIT`.
+        // name rather than formatted. The largest real table is 88 names
+        // (`world.ecbsd`); see `ECBSD_NAME_LIMIT`.
         return Err("the grass EC-BSD declares more names than a placement file can hold");
     }
     let mut p = 0x4c;
@@ -888,6 +891,33 @@ mod tests {
         assert_eq!(mask(&[0x81, 0x40], 2).unwrap(), vec![0, 7, 9]);
         assert!(mask(&[0], 2).is_err())
     }
+    /// The largest real name table is 88 (`world.ecbsd`); versions 17 and 18
+    /// both ship, and `ecbsd_header` gates on identity only, so both read.
+    /// `ECBSD_NAME_LIMIT` must stay far above the measured maximum -- a cap
+    /// that a real client trips is a refusal, not a guard.
+    #[test]
+    fn the_name_limit_is_above_every_measured_table() {
+        let notes = std::sync::Mutex::new(Vec::new());
+        for (version, count) in [(18u32, 88u32), (17, 1), (18, 12), (18, 4)] {
+            let mut b = vec![0u8; 0x4c + 64 * count as usize];
+            b[0..4].copy_from_slice(&0x42584f4du32.to_le_bytes());
+            b[4..8].copy_from_slice(&0x42534446u32.to_le_bytes());
+            b[8..12].copy_from_slice(&version.to_le_bytes());
+            b[12..16].copy_from_slice(&count.to_le_bytes());
+            let mut p = 0x4c;
+            for i in 0..count {
+                let name = format!("BSData/{}.dat", i + 1);
+                b[p..p + 4].copy_from_slice(&(name.len() as u32).to_le_bytes());
+                b[p + 4..p + 4 + name.len()].copy_from_slice(name.as_bytes());
+                p += 4 + name.len();
+            }
+            let names = grass_names(&b[..p], &notes)
+                .unwrap_or_else(|e| panic!("v{version} with {count} names must read, got {e}"));
+            assert_eq!(names.len(), count as usize, "v{version} {count} names");
+        }
+        assert!((88usize) < ECBSD_NAME_LIMIT);
+    }
+
     #[test]
     fn a_placement_file_that_is_not_grass_ec_bsd_costs_only_the_grass() {
         // The reported failure was a modal box holding "grass record index":

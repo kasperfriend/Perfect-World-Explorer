@@ -186,6 +186,11 @@ jobs:
           # 128-tile world maps were refused outright. This pins the survey to
           # the reader for both shipped edges.
           python3 -m unittest tools.test_lightmap_survey
+          # The EC-BSD survey measures `ECBSD_NAME_LIMIT`. The cap used to be
+          # documented as unmeasurable because the staged packs hold no EC-BSD;
+          # they live under `maps/world/` instead, and the largest real table is
+          # 88 names against a limit of 10,000.
+          python3 -m unittest tools.test_ecbsd_survey
           python3 tools/check-eight-phase-status.py
           # The register's row count is quoted in TODO.md and the PR body. It
           # said 62 while the file held 61, which is the kind of number nobody
