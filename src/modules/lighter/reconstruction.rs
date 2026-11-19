@@ -148,6 +148,12 @@ pub(crate) struct Startup(Option<Request>);
 impl Startup {
     pub(crate) fn new(mode: Mode) -> Self {
         if mode == Mode::Off {
+            if matches!(
+                std::env::var("PW_RAY_RECONSTRUCTION").as_deref(),
+                Ok("fsr" | "rr")
+            ) {
+                eprintln!("Native ignores PW_RAY_RECONSTRUCTION; no Vulkan ray SDK initialized");
+            }
             return Self::default();
         }
         match Request::load() {
