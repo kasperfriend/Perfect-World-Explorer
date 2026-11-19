@@ -590,6 +590,10 @@ fn lighter_retail_t2lm_record_fixture() {
         assert!(sidecar.contains("lightmaps=true\n"));
         assert!(sidecar.contains("native_lightmap_areas_day_night=16\n"));
         assert!(sidecar.contains("native_lightmap_areas_unbound=0\n"));
+        if mode == Mode::Software {
+            assert!(sidecar.contains("ray_lightmap_areas_bound=16\n"));
+            assert!(sidecar.contains("ray_lightmap_areas_unbound=0\n"));
+        }
     }
 }
 

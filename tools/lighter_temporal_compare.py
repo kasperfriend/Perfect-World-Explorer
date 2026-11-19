@@ -36,9 +36,9 @@ def validate_temporal(metas, scene):
     if off["mode"] not in ("Software", "Hardware"):
         raise ValueError("off is the portable ray control, not Native")
     adapter = off["adapter"]
-    if ('name: "NVIDIA GeForce RTX 3080"' not in adapter or "backend: Vulkan" not in adapter
+    if (off.get("platform") != "windows" or 'name: "NVIDIA GeForce RTX 3080"' not in adapter or "backend: Vulkan" not in adapter
             or "device_type: DiscreteGpu" not in adapter or "vendor: 4318" not in adapter):
-        raise ValueError("expected the physical NVIDIA GeForce RTX 3080 Vulkan adapter")
+        raise ValueError("expected the physical Windows NVIDIA GeForce RTX 3080 Vulkan adapter")
     for label, expected in PROVIDERS.items():
         meta = metas[label]
         if meta.get("ray_reconstruction") != expected:
@@ -63,7 +63,7 @@ def validate_temporal(metas, scene):
             if settings_field(meta, "samples") != "1":
                 raise ValueError(f"{label}: expected 1 spp")
             validate_match(off, meta)
-        for key in (*MATCH_KEYS, "camera_path_sha256"):
+        for key in (*MATCH_KEYS, "platform", "camera_path_sha256"):
             if meta.get(key) != off.get(key):
                 raise ValueError(f"{label}: unmatched {key}")
     if scene in ("path", "reveal") and not re.fullmatch("[0-9a-f]{64}", off.get("camera_path_sha256", "")):

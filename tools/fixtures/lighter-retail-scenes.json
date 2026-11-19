@@ -127,11 +127,14 @@
       ],
       "warmup": 12,
       "lightmaps": true,
+      "min_lightmap_areas_day_night": 16,
       "min_loaded": {
         "water": 1
       },
       "authored_totals": {
-        "water": 1
+        "water": 1,
+        "buildings": 116,
+        "effect_roots": 22
       }
     },
     {
@@ -150,11 +153,14 @@
       ],
       "warmup": 12,
       "lightmaps": true,
+      "min_lightmap_areas_day_night": 16,
       "min_loaded": {
         "water": 1
       },
       "authored_totals": {
-        "water": 1
+        "water": 1,
+        "buildings": 116,
+        "effect_roots": 22
       }
     },
     {
@@ -173,11 +179,14 @@
       ],
       "warmup": 12,
       "lightmaps": true,
+      "min_lightmap_areas_day_night": 16,
       "min_loaded": {
         "water": 1
       },
       "authored_totals": {
-        "water": 1
+        "water": 1,
+        "buildings": 116,
+        "effect_roots": 22
       }
     }
   ]

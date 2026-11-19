@@ -1050,7 +1050,7 @@ fn moving(
         settings.mode == lighter::Mode::Hardware && !settings.reference,
     )?;
     if camera.underwater_depth <= 0. {
-        feed.source.weather.precipitation(
+        out.coverage.ray_rain_cards = feed.source.weather.precipitation(
             camera.pos,
             camera.yaw,
             frame,
@@ -1063,13 +1063,10 @@ fn moving(
 }
 
 impl super::Renderer {
-    /// Snapshot counts. Root census is sampled on request, not on each frame.
-    pub(super) fn ray_inventory(&self) -> Inventory {
-        let mut inventory = self
-            .lighter
-            .static_coverage
-            .combine(&self.lighter.moving_coverage);
-        let roots = &mut inventory[Class::EffectRoots];
+    /// Snapshot counts. The same world-root queue feeds Native and ray modes.
+    pub(super) fn effect_root_coverage(&self) -> (Counts, usize) {
+        let mut roots = Counts::default();
+        let mut warp = 0;
         if let Some(models) = &self.models {
             let status = models.ray_effect_status();
             roots.invalid = self.ray_rejected_scene_effects;
@@ -1082,11 +1079,31 @@ impl super::Renderer {
                 roots.invalid += status.invalid;
                 roots.unavailable = status.unavailable;
                 roots.unsupported = status.unsupported;
+                warp = status.warp_omitted_elements;
             }
         } else {
             roots.disabled = self.ray_scene_effects;
         }
+        (roots, warp)
+    }
+
+    pub(super) fn ray_inventory(&self) -> Inventory {
+        let mut inventory = self
+            .lighter
+            .static_coverage
+            .combine(&self.lighter.moving_coverage);
+        inventory[Class::EffectRoots] = self.effect_root_coverage().0;
         inventory
+    }
+
+    pub(super) fn ray_lightmap_areas_bound(&self) -> usize {
+        self.lighter_feed.as_ref().map_or(0, |feed| {
+            feed.source
+                .lightmaps
+                .iter()
+                .filter(|&&[day, _]| day != 0)
+                .count()
+        })
     }
 
     /// Lighter owns primary visibility and all water/shadow/lighting rays.

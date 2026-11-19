@@ -7,6 +7,8 @@ use crate::modules::lighter::{
 };
 use glam::Vec3;
 
+const RAIN_CARDS: usize = 320;
+
 #[derive(Default)]
 pub(super) struct Weather {
     weather: [u32; 2],
@@ -45,7 +47,7 @@ impl Weather {
         for (id, img) in out
             .weather
             .iter_mut()
-            .zip(crate::weather_gpu::weather_images(&t.element))
+            .zip(crate::weather_gpu::weather_images(&t.element).0)
         {
             *id = tex.images(&[img], 64, Filter::Alpha)?;
         }
@@ -126,17 +128,17 @@ impl Weather {
         frame: &FrameSnapshot,
         b: &mut Builder,
         budget: &mut MeshBudget,
-    ) -> Result<(), String> {
+    ) -> Result<usize, String> {
         use crate::client_weather::{RAIN, SNOW, SNOW_SPEED_SCALE};
         if !frame.weather.rain && !frame.weather.snow {
-            return Ok(());
+            return Ok(0);
         }
         let (s, c) = yaw.sin_cos();
         let right = Vec3::new(c, 0., s);
         let up = right.cross(frame.direction).normalize_or_zero();
         let mut mesh = Mesh::default();
         for (kind, count, profile, enabled) in [
-            (0, 320, RAIN, frame.weather.rain),
+            (0, RAIN_CARDS, RAIN, frame.weather.rain),
             (1, 160, SNOW, frame.weather.snow),
         ] {
             if !enabled {
@@ -186,8 +188,9 @@ impl Weather {
         }
         if budget.debit(&mesh, 0) {
             b.posed_world_mesh("weather", 0, &mesh)?;
+            return Ok(if frame.weather.rain { RAIN_CARDS } else { 0 });
         }
-        Ok(())
+        Ok(0)
     }
 }
 fn hash(seed: f32) -> f32 {

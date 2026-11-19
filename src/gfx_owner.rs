@@ -275,6 +275,7 @@ enum Failure {
 #[allow(dead_code)]
 pub(crate) struct GeometryStatus {
     pub playing: usize,
+    pub warp_omitted_elements: usize,
     pub queued: usize,
     pub inactive: usize,
     pub invalid: usize,
@@ -1334,7 +1335,10 @@ impl Manager {
                 {
                     status.inactive += 1;
                 }
-                State::Live { .. } if owner.player.is_some() => status.playing += 1,
+                State::Live { .. } if owner.player.is_some() => {
+                    status.playing += 1;
+                    status.warp_omitted_elements += owner.player.as_ref().unwrap().stats().warp;
+                }
                 State::Pending | State::Live { .. } => status.queued += 1,
             }
         }

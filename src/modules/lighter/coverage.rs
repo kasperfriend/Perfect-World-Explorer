@@ -71,6 +71,8 @@ impl Counts {
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Inventory {
     rows: [Counts; CLASSES.len()],
+    /// Generated in the installed moving packet; not a count of visible pixels.
+    pub ray_rain_cards: usize,
 }
 
 impl Inventory {
@@ -86,6 +88,7 @@ impl Inventory {
             row.empty += live.empty;
             row.invalid += live.invalid;
         }
+        combined.ray_rain_cards = moving.ray_rain_cards;
         combined.rows[Class::WorldModels as usize..]
             .copy_from_slice(&moving.rows[Class::WorldModels as usize..]);
         combined

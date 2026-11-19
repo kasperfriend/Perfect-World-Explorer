@@ -15,6 +15,12 @@ use sha2::{Digest, Sha256};
 
 pub(crate) type Decode<'a> = dyn FnMut(&str) -> Result<(Vec<image::RgbaImage>, bool), String> + 'a;
 
+/// Ray HDR front-to-back composition can preserve A+B*background. It
+/// cannot reproduce all destination-dependent raster attachment operations.
+pub(crate) fn affine_blend_supported(src: u32, dst: u32) -> bool {
+    matches!(src, 1..=6 | 9 | 10) && matches!(dst, 1..=6)
+}
+
 pub(crate) struct Posed<'a> {
     pub asset: &'a ModelAsset,
     pub pose: &'a Pose,
@@ -257,7 +263,7 @@ impl<'a> Moving<'a> {
         // HDR front-to-back compositing can preserve expressions A+B*dst.
         // Destination alpha and nonlinear destination-color factors need a
         // separate encoded framebuffer pass: report them, don't substitute 5/6.
-        if matches!(src, 1..=6 | 9 | 10) && matches!(dst, 1..=6) {
+        if affine_blend_supported(src, dst) {
             Some(src | (dst << 4))
         } else {
             self.coverage[Class::EffectDraws].unsupported += 1;

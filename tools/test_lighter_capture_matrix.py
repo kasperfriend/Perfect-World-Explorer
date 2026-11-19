@@ -51,6 +51,22 @@ class CaptureMatrixTests(unittest.TestCase):
             matrix.validate_match(full, hybrid | {"settings_effective": hybrid["settings_effective"].replace("1", "2")},
                                   compare_primary=True)
 
+    def test_water_needs_actual_lightmap_admission_on_both_routes(self):
+        case = {"lightmaps": True, "min_lightmap_areas_day_night": 16}
+        meta = {"native_lightmap_areas_day_night": "16"}
+        matrix.validate_lightmap_admission(meta, "off", case, "water-off")
+        for ray in ("software", "hardware"):
+            with self.assertRaisesRegex(ValueError, "16 bound authored"):
+                matrix.validate_lightmap_admission(meta, ray, case, "water-ray")
+            matrix.validate_lightmap_admission(meta | {"ray_lightmap_areas_bound": "16"}, ray, case, "water-ray")
+
+    def test_missing_inventory_class_is_not_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stem = Path(tmp) / "partial"
+            stem.with_suffix(".coverage.csv").write_text("class,loaded\nnear_terrain,1\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "missing inventory rows"):
+                matrix.inventory_for(stem, {})
+
     def test_completed_stages_are_named_and_bounded_by_timed_draws(self):
         meta = {"gpu_timed_stages": '"build,primary,traversal,reproject,filter,upscale"',
                 "gpu_timed_ms": "[[0,2,10,1,1.4,0.8],[4,4,8,2,2.6,1.2]]"}
@@ -91,6 +107,7 @@ class CaptureMatrixTests(unittest.TestCase):
 
     def test_temporal_receipts_reject_fallback_unmatched_path_and_unrefined_reference(self):
         shared = dict.fromkeys(matrix.MATCH_KEYS, "fixed") | {
+            "platform": "windows",
             "adapter": 'name: "NVIDIA GeForce RTX 3080", vendor: 4318, device_type: DiscreteGpu, backend: Vulkan',
             "mode": "Software", "warmup_frames": "48", "warmup_step_ms": "16", "animation_elapsed_ms": "768",
             "raster_primary": "false", "screen_reuse_flags": "0", "camera_path_sha256": "a" * 64,

@@ -103,6 +103,14 @@ def compare(a, b, custom=None):
     return summary, diff
 
 
+def validate_lightmap_admission(meta, mode, case, capture_name):
+    minimum = case.get("min_lightmap_areas_day_night", 0)
+    if minimum and (not case["lightmaps"]
+                    or int(meta.get("native_lightmap_areas_day_night", 0)) < minimum
+                    or (mode != "off" and int(meta.get("ray_lightmap_areas_bound", 0)) < minimum)):
+        raise ValueError(f"{capture_name}: need at least {minimum} bound authored day/night lightmap areas")
+
+
 def capture_metadata(stem, mode, case, profile):
     meta = metadata(stem.with_suffix(".coverage.txt"))
     if (json.loads(meta["map"]) != case["map"] or meta["mode"].lower() != mode
@@ -127,6 +135,7 @@ def capture_metadata(stem, mode, case, profile):
         pose = json.loads(meta["eye"]) + [float(meta["yaw"]), float(meta["pitch"])]
         if not all(math.isclose(a, b, abs_tol=0.0001, rel_tol=1e-7) for a, b in zip(pose, case["camera"], strict=True)):
             raise ValueError(f"{stem.name}: captured the wrong camera")
+    validate_lightmap_admission(meta, mode, case, stem.name)
     return meta, verified_image(stem, meta)
 
 
@@ -142,7 +151,16 @@ def verified_image(stem, meta):
 
 def inventory_for(stem, case):
     with stem.with_suffix(".coverage.csv").open(newline="", encoding="utf-8") as stream:
-        rows = {r["class"]: {key: int(value) for key, value in r.items() if key != "class"} for r in csv.DictReader(stream)}
+        rows = {}
+        for row in csv.DictReader(stream):
+            cls = row.pop("class")
+            if cls in rows:
+                raise ValueError(f"{stem.name}: duplicate class {cls}")
+            rows[cls] = {key: int(value) for key, value in row.items()}
+    required = {"near_terrain", "far_terrain", "trees", "grass", "buildings", "water",
+                "world_models", "walker", "populator", "effect_draws", "effect_roots"}
+    if missing := required - rows.keys():
+        raise ValueError(f"{stem.name}: missing inventory rows {sorted(missing)}")
     for cls, row in rows.items():
         skipped = sum(row[k] for k in ("range", "cutoff", "replaced", "budget", "pending", "disabled", "empty"))
         failed = sum(row[k] for k in ("package", "unavailable", "invalid", "unsupported"))

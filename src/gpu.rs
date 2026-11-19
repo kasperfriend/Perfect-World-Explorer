@@ -9326,15 +9326,37 @@ fn preview_frame_using(
         }
         let [both, day, unbound] = renderer.terrain_gpu.lightmap_areas;
         writeln!(meta, "native_lightmap_areas_day_night={both}\nnative_lightmap_areas_day_only={day}\nnative_lightmap_areas_unbound={unbound}").unwrap();
+        let (roots, warp) = renderer.effect_root_coverage();
+        let (mut dest_affine, mut dest_unsupported) = (0, 0);
+        if let Some(models) = &renderer.models {
+            for q in models.effect_quads() {
+                let (src, dst) = (q.source_blend, q.destination_blend);
+                if matches!(src, 9 | 10) || matches!(dst, 9 | 10) {
+                    if crate::modules::lighter::model_feed::affine_blend_supported(src, dst) {
+                        dest_affine += 1;
+                    } else {
+                        dest_unsupported += 1;
+                    }
+                }
+            }
+        }
+        writeln!(meta,
+            "platform={}\neye_underwater_depth={}\nrain_mask_authored={}\nworld_effect_roots_playing={}\nworld_effect_roots_queued={}\nworld_effect_roots_inactive={}\nworld_effect_roots_rejected={}\nworld_effect_roots_unreadable={}\nworld_effect_roots_no_package={}\nworld_effect_roots_unsupported={}\nworld_effect_warp_omitted_elements={warp}\nworld_effect_dest_color_affine_candidates={dest_affine}\nworld_effect_dest_color_unsupported_candidates={dest_unsupported}",
+            std::env::consts::OS, cam.underwater_depth, renderer.weather.rain_mask_authored,
+            roots.loaded, roots.pending, roots.disabled, roots.invalid, roots.unavailable, roots.package, roots.unsupported,
+        ).unwrap();
         if mode == LighterMode::Off {
             let effects = renderer
                 .models
                 .as_ref()
                 .map_or(0, |models| models.effect_quad_count());
-            writeln!(meta,"native_local_scenery_pages={}\nnative_last_scene_passes={}\nnative_effect_quads={effects}\nnative_visible_water_batches={}",
+            writeln!(meta,"native_inventory_scope=partial\nnative_local_scenery_pages={}\nnative_last_scene_passes={}\nnative_effect_quads={effects}\nnative_visible_water_batches={}",
                 renderer.local_pages.len(),renderer.scene_passes,renderer.visible_water_batches.len()).unwrap();
         } else {
             let inventory = renderer.ray_inventory();
+            let ray_bound = renderer.ray_lightmap_areas_bound();
+            writeln!(meta, "grass_inventory_scope=native_stream_only\nray_rain_cards={}\nray_lightmap_areas_bound={ray_bound}\nray_lightmap_areas_unbound={}",
+                inventory.ray_rain_cards, (both+day+unbound).saturating_sub(ray_bound)).unwrap();
             let counts_path = path.with_extension("coverage.csv");
             std::fs::write(&counts_path, inventory.csv())
                 .map_err(|e| format!("{}: {e}", counts_path.display()))?;

@@ -304,7 +304,7 @@ fn snow_luminance_mask(mut pixels: image::RgbaImage) -> image::RgbaImage {
     pixels
 }
 
-pub(crate) fn weather_images(element: &Path) -> [image::RgbaImage; 2] {
+pub(crate) fn weather_images(element: &Path) -> ([image::RgbaImage; 2], [bool; 2]) {
     const SIZE: u32 = 64;
     let mut file = File::open(element.join("textures.pck")).ok();
     let entries = file
@@ -327,40 +327,41 @@ pub(crate) fn weather_images(element: &Path) -> [image::RgbaImage; 2] {
                 img = snow_luminance_mask(img);
             }
             if img.width() == SIZE && img.height() == SIZE {
-                return img;
+                return (img, true);
             }
-            return image::imageops::resize(
-                &img,
-                SIZE,
-                SIZE,
-                image::imageops::FilterType::Triangle,
+            return (
+                image::imageops::resize(&img, SIZE, SIZE, image::imageops::FilterType::Triangle),
+                true,
             );
         }
         eprintln!("Native {name} weather texture unavailable; using a simple fallback mask");
-        image::RgbaImage::from_fn(SIZE, SIZE, |x, y| {
-            let dx = x as f32 - 31.5;
-            let dy = y as f32 - 31.5;
-            let alpha = if kind == 0 {
-                if x >= 29 && x <= 34 {
+        (
+            image::RgbaImage::from_fn(SIZE, SIZE, |x, y| {
+                let dx = x as f32 - 31.5;
+                let dy = y as f32 - 31.5;
+                let alpha = if kind == 0 {
+                    if x >= 29 && x <= 34 {
+                        220
+                    } else {
+                        0
+                    }
+                } else if dx * dx + dy * dy <= 220. {
                     220
                 } else {
                     0
-                }
-            } else if dx * dx + dy * dy <= 220. {
-                220
-            } else {
-                0
-            };
-            image::Rgba([255, 255, 255, alpha])
-        })
+                };
+                image::Rgba([255, 255, 255, alpha])
+            }),
+            false,
+        )
     };
-    [
-        load("textures/rain.tga", 0, &mut file),
-        load("textures/snow.bmp", 1, &mut file),
-    ]
+    let (rain, rain_authored) = load("textures/rain.tga", 0, &mut file);
+    let (snow, snow_authored) = load("textures/snow.bmp", 1, &mut file);
+    ([rain, snow], [rain_authored, snow_authored])
 }
 
 pub struct WeatherGpu {
+    pub(crate) rain_mask_authored: bool,
     pipeline: wgpu::RenderPipeline,
     /// Motion twin of `pipeline`: same particles, same effective-alpha and depth
     /// tests, writing a motion vector into the object-motion attachment instead of
@@ -391,7 +392,7 @@ impl WeatherGpu {
         format: wgpu::TextureFormat,
         water_areas: &[crate::water::WaterArea],
     ) -> Self {
-        let images = weather_images(element);
+        let (images, [rain_mask_authored, _]) = weather_images(element);
         let mut pixels = Vec::with_capacity(64 * 64 * 4 * 2);
         for image in images {
             pixels.extend_from_slice(image.as_raw());
@@ -625,6 +626,7 @@ impl WeatherGpu {
             multiview: None,
         });
         Self {
+            rain_mask_authored,
             pipeline,
             motion_pipeline,
             bind,

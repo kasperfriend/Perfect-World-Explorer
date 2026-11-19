@@ -1,5 +1,6 @@
-//! rustc --edition=2021 tools/validate-terrain-lightmaps.rs -o /tmp/validate-lightmaps
-//! validate-lightmaps /path/to/element/maps/world
+//! Build with `rustc --edition=2021 -L dependency=target/debug/deps` and
+//! `--extern image=... --extern bcdec_rs=...` using the viewer's Cargo rlibs.
+//! validate-lightmaps /path/to/element/maps/world (or --records FILE...)
 //! Missing files are reported as incomplete, never as a successful census.
 #![allow(dead_code)]
 #[path = "../src/model_dds.rs"]
