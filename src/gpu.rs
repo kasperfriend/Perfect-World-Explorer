@@ -8603,6 +8603,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         ((0,0),(0,false,false))
                                     };
                                     let ray = actual_rays.then(|| lighter_travel::RaySample {
+                                        primary: renderer.lighter.travel_primary(),
                                         textures: renderer.lighter.travel_textures(),
                                         pacing: if committed { renderer.lighter.travel_pacing() } else { None },
                                     });

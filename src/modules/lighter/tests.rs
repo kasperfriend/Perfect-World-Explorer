@@ -4769,9 +4769,11 @@ fn lighter_raster_primary_parity() {
         );
         h.ray.settings.hybrid_primary = false;
         let full = h.pixels(frame, &moving);
+        assert_eq!(h.ray.travel_primary(), [u64::from(size * size), 0]);
         h.ray.settings.hybrid_primary = true;
         let started = Instant::now();
         let hybrid = h.pixels(frame, &moving);
+        assert_eq!(h.ray.travel_primary(), [0, u64::from(size * size)]);
         assert!(
             h.ray.hardware.as_ref().unwrap().raster_active(),
             "render only passed via fallback"

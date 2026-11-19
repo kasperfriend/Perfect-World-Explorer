@@ -27,6 +27,9 @@ struct VisibilityVertex {
     let hit = Hit(t,in.key.x,in.key.y,in.bary);
     // Same acceptance rules as the full-ray path: terrain/water edge, wind
     // and tree LOD, instance culling, cutout coverage, hidden owner, etc.
-    if !accepts(hit,ray,Query(VIEW,SOLID_MASK,false,vec2<u32>(NIL))) { discard; }
+    // The same closed camera interval as rayQueryInitialize. Do not turn a
+    // rounded edge at the clip plane into a hit outside the ray segment.
+    if !(t>=ray.low && t<=ray.high) ||
+        !accepts(hit,ray,Query(VIEW,SOLID_MASK,false,vec2<u32>(NIL))) { discard; }
     return vec4<u32>(in.key,bitcast<u32>(t),pack2x16unorm(in.bary));
 }

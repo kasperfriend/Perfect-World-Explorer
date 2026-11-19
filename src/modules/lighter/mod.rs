@@ -897,6 +897,7 @@ pub struct Lighter {
     screen_written: bool,
     screen_last_flags: u32,
     last_trace_extent: (u32, u32),
+    last_primary: [u64; 2],
     adapter_supports_compute: bool,
     has_hardware_device: bool,
     native_backend: wgpu::Backend,
@@ -956,6 +957,7 @@ impl Default for Lighter {
             screen_written: false,
             screen_last_flags: 0,
             last_trace_extent: (0, 0),
+            last_primary: [0, 0],
             adapter_supports_compute: false,
             has_hardware_device: false,
             native_backend: wgpu::Backend::Empty,
@@ -1073,6 +1075,12 @@ impl Lighter {
     pub(crate) fn screen_reuse_flags(&self) -> u32 {
         self.screen_last_flags
             & (SCREEN_DI | SCREEN_GI | SCREEN_PREVIOUS | SCREEN_GI_PREVIOUS | SCREEN_REPROJECTED)
+    }
+
+    /// Exact eligible first-solid query slots, independent of the number
+    /// of ray-box/triangle tests or later ordered/secondary traversals.
+    pub(crate) fn travel_primary(&self) -> [u64; 2] {
+        self.last_primary
     }
 
     pub(crate) fn travel_trace(&self) -> ((u32, u32), (u32, bool, bool)) {
@@ -2072,6 +2080,17 @@ impl Lighter {
         }
         self.frame_error = None;
         self.last_trace_extent = (rw, rh);
+        let solid_slots =
+            if (world.packet.words[11] | moving.words[11]) & u32::from(scene::MASK_SOLID) != 0 {
+                u64::from(rw) * u64::from(rh) * u64::from(settings.samples)
+            } else {
+                0
+            };
+        self.last_primary = if self.raster_active() {
+            [0, solid_slots]
+        } else {
+            [solid_slots, 0]
+        };
         let message = format!("{} active{} · {rw}×{rh} rays · {} unique resident / {} moving triangles · {} instances · {} unavailable texture(s) · mip_fallback {} ({} reduced)",
             self.settings.mode.label(),if self.raster_active() { " (raster primary)" } else { "" },world.packet.triangles(),moving.triangles(),world.packet.instances.len(),world.textures.missing,world.textures.mips.fallback,world.textures.mips.reduced);
         if self.status.is_none() {
