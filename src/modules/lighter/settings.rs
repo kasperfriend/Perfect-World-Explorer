@@ -239,10 +239,22 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        Self::path()
+        let mut settings = Self::path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .filter(|s| s.len() <= 4096)
-            .map_or_else(Self::default, |text| Self::decode(&text))
+            .map_or_else(Self::default, |text| Self::decode(&text));
+        // PW_RAY_RECONSTRUCTION overrides the denoiser dropdown:
+        // fsr → FSR Ray Regeneration, rr → DLSS Ray Reconstruction,
+        // off → SVGF (portable default).
+        if let Ok(val) = std::env::var("PW_RAY_RECONSTRUCTION") {
+            match val.as_str() {
+                "fsr" => settings.denoiser = Denoiser::FsrRayRegen,
+                "rr" => settings.denoiser = Denoiser::DlssRr,
+                "off" | "" => settings.denoiser = Denoiser::Svgf,
+                _ => {}
+            }
+        }
+        settings
     }
 
     pub fn save(self) -> Result<(), String> {
