@@ -23,6 +23,8 @@ mod model_dds;
 mod pck;
 #[path = "../scene.rs"]
 mod scene;
+#[path = "../speedtree_version.rs"]
+mod speedtree_version;
 #[path = "../tree_lod.rs"]
 mod tree_lod;
 #[path = "../trees.rs"]

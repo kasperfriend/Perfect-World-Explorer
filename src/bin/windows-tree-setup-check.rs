@@ -24,6 +24,10 @@ mod scene;
 #[cfg(windows)]
 #[path = "../tree_source.rs"]
 mod tree_source;
+// `trees.rs` compiles on every platform and names this module, so the module
+// cannot be Windows-only even though the bridge around it is.
+#[path = "../speedtree_version.rs"]
+mod speedtree_version;
 #[cfg(windows)]
 #[path = "../trees.rs"]
 mod trees;

@@ -224,6 +224,9 @@ pub struct FarTrees {
     lod_bind: wgpu::BindGroup,
     lod_params: wgpu::Buffer,
     placements: u32,
+    /// Why no trees are drawn, copied from the loader so the panel and the log
+    /// say the same sentence.
+    off_reason: Option<String>,
     /// Indirect args, one record per batch (`DRAW_ARGS` bytes each), plus the
     /// static part of each record with `instance_count` zeroed.
     lod_args: wgpu::Buffer,
@@ -1063,6 +1066,7 @@ impl FarTrees {
             lod_bind,
             lod_params,
             placements: placement_count,
+            off_reason: trees.off_reason.clone(),
             lod_args,
             lod_args_reset,
             multi_draw: one_call,
@@ -1179,6 +1183,13 @@ impl FarTrees {
     }
     pub fn residency_stats(&self) -> (usize, u64) {
         (self.capacity, self.instances.size())
+    }
+    /// Why no trees are drawn, when there are none and there ought to be.
+    ///
+    /// The reason comes from the loader rather than being re-derived here, so
+    /// the log line and the on-screen line cannot say different things.
+    pub fn off_reason(&self) -> Option<&str> {
+        self.off_reason.as_deref()
     }
     /// Tree types the forest actually built, i.e. those with placements and
     /// both an atlas slot for their bark and one for their composite.

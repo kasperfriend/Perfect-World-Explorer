@@ -154,6 +154,7 @@ mod terrain_store;
 mod terrain_upload;
 mod texture_atlas;
 mod texture_resolution;
+mod speedtree_version;
 mod tree_lod;
 #[cfg(windows)]
 mod tree_source;

@@ -28,6 +28,12 @@ pub struct Reference {
     pub export_id: u32,
     pub offset: u32,
 }
+/// Tree types a world file may declare. The largest staged table is 59 (1.8.4).
+pub const MAX_TREE_TYPES: usize = 4096;
+
+/// Grass types a world file may declare. The largest staged table is 244 (1.8.4).
+pub const MAX_GRASS_TYPES: usize = 4096;
+
 #[derive(Clone, Debug)]
 pub struct SceneModel {
     pub export_id: u32,
@@ -320,8 +326,13 @@ impl Scene {
         if count == 0
             || rows.checked_mul(cols) != Some(count)
             || count > 1_000_000
-            || tree_count > 10000
-            || grass_count > 10000
+            // Measured across every staged client: the largest block grid is
+            // the 1.8.4 world's 22,528 blocks (176x128), its tree table holds
+            // 59 types and its grass table 244. Each limit carries headroom
+            // over those and exists to catch a damaged header, not to police
+            // what a newer client may author.
+            || tree_count > MAX_TREE_TYPES
+            || grass_count > MAX_GRASS_TYPES
             || tree_off > grass_off
             || grass_off > b.len()
         {
@@ -751,10 +762,24 @@ mod tests {
     ///
     /// A wrong field order is invisible in a synthetic fixture: every byte is
     /// self-consistent whichever way the reader slices it. It is not invisible
-    /// here. With the id word counted, all 2,275 placements agree at once — the
-    /// two vectors are unit and perpendicular on every record, the play speeds
-    /// are all positive, and the day/night word lands on the three authored
-    /// values. Skip when the archive is not staged beside the checkout.
+    /// here. With the id word counted, every placement agrees at once — the two
+    /// vectors are unit and perpendicular on every record, the play speeds are
+    /// all positive, and the day/night word lands on the three authored values.
+    /// Skip when the archive is not staged beside the checkout.
+    ///
+    /// Three shipped `world.ecwld` builds have been measured, and all three pass
+    /// every invariant below; only the totals differ, because they are different
+    /// maps of the same client:
+    ///
+    /// | build | bytes | placements | day/night split |
+    /// |---|---|---|---|
+    /// | the 2.78 MB world the layout was first measured on | 2,780,000 | 2,275 | 154 / 676 / 1,445 |
+    /// | the 2.78 MB world in `docs/cross-version-matrix.md` | ~2,780,000 | 3,535 | not recorded |
+    /// | the 2.67 MB 1.8.4 world staged today | 2,668,870 | 2,971 | 180 / 787 / 2,004 |
+    ///
+    /// The count is asserted for the file actually present so a layout that
+    /// shifts by one field cannot pass by being self-consistent about the wrong
+    /// numbers, but the invariants are the real test.
     #[test]
     fn corpus_effect_records_agree_on_one_layout() {
         let path = std::path::Path::new("google_drive/world.ecwld");
@@ -793,9 +818,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(total, 2_275, "shipped world.ecwld placement count");
+        // The 2.67 MB 1.8.4 build staged in `google_drive/`. The 2.78 MB build
+        // measured first gives 2,275 and 154/676/1,445; see the doc comment.
+        assert_eq!(total, 2_971, "shipped world.ecwld placement count");
         assert_eq!(ids.len(), total, "every placement carries its own id");
-        assert_eq!(modes, [154, 676, 1_445], "authored day/night split");
+        assert_eq!(modes, [180, 787, 2_004], "authored day/night split");
         assert_eq!((bad_speed, bad_scale, bad_basis), (0, 0, 0));
     }
     /// A static-model record is `vUp` then a scale then the path: the scale is

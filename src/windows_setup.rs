@@ -177,6 +177,15 @@ fn cache_key(element: &Path, scene_path: &Path, tree_type_count: usize) -> Resul
     Ok(h.finish())
 }
 
+/// Tree types one map may declare and have prepared.
+///
+/// See `prepare_trees_for_scene`; the largest table in any staged client is 59.
+pub const MAX_TREE_TYPES: usize = 4096;
+
+/// Tree types the legacy three-argument bridge bakes, and therefore the size of
+/// the padded source table it is given.
+pub const LEGACY_BRIDGE_TREE_TYPES: usize = 59;
+
 /// A map with no tree types needs only its ready marker; other maps need one
 /// PWT per authored tree type. The legacy three-argument bridge expects 59.
 fn ready(dir: &Path, tree_type_count: usize) -> bool {
@@ -199,10 +208,17 @@ pub fn prepare_trees_for_scene(
     scene_path: &Path,
     tree_type_count: usize,
 ) -> Result<PathBuf, String> {
-    if tree_type_count > 10000 {
+    // Measured, not guessed: the largest authored tree table staged is the
+    // 1.8.4 world's 59 types (`tools/version-gates.py` reads the field straight
+    // out of every `.ecwld` header). The bridge writes one file per type, so the
+    // limit is about the filesystem rather than memory; 4,096 keeps two orders
+    // of magnitude of headroom over anything shipped and still fails loudly
+    // instead of trying to write a million files.
+    if tree_type_count > MAX_TREE_TYPES {
         return Err(format!(
-            "{scene_path} declares {tree_type_count} tree types; the SpeedTree bridge supports at most 10000",
-            scene_path = scene_path.display()
+            "{} declares {tree_type_count} tree types; this build prepares at most {MAX_TREE_TYPES} \
+             (the largest table in any staged client is 59)",
+            scene_path.display()
         ));
     }
     let base = std::env::var_os("LOCALAPPDATA")
@@ -244,15 +260,20 @@ pub fn prepare_trees_for_scene(
             "Preparing SpeedTree sources for {}...",
             scene_path.display()
         ));
-        // Keep a padded 59-type source table so the legacy checked-in bridge
-        // still works when the selected map authors fewer types. Extra PWTs are
-        // harmless: `Trees::open` reads only the scene's authored table.
-        let source_count = if tree_type_count == 0 {
-            0
-        } else {
-            tree_type_count.max(59)
-        };
+        // The table is built from the count the world file declares. It used to
+        // be padded to 59 unconditionally, to suit the legacy three-argument
+        // bridge, and that padding had a real cost: a map authoring 60+ types
+        // got the wrong tree or none, because the padded run stopped at 59.
+        //
+        // Padding is only ever needed by the *legacy* fallback below, and only
+        // when it actually runs, so it now happens there. The embedded bridge
+        // is called first with the exact count.
+        let mut source_count = tree_type_count;
         crate::tree_source::extract_for_scene(element, scene_path, &data, source_count)?;
+        eprintln!(
+            "SpeedTree: {source_count} authored tree type(s) in {}",
+            scene_path.display()
+        );
         if tree_type_count == 0 {
             fs::write(
                 data.join("tree-alpha-refs.csv"),
@@ -293,7 +314,17 @@ pub fn prepare_trees_for_scene(
                         tree_type_count
                     ));
                 }
-                eprintln!("Variable-count SpeedTree bridge unavailable; using the legacy 59-type protocol.");
+                // Only here, and only now, does the table get padded: the
+                // legacy bridge has no way to be told how many types to bake,
+                // so it bakes its fixed 59. A map with more than 59 types
+                // cannot be served by it at all, and says so by name above.
+                eprintln!(
+                    "Variable-count SpeedTree bridge unavailable; using the legacy 59-type protocol \
+                     ({} authored type(s) padded to 59)",
+                    tree_type_count
+                );
+                let padded = LEGACY_BRIDGE_TREE_TYPES;
+                crate::tree_source::extract_for_scene(element, scene_path, &data, padded)?;
                 let legacy = Command::new(&helper)
                     .arg(element.join("speedtreert.dll"))
                     .arg(&data)
@@ -307,7 +338,8 @@ pub fn prepare_trees_for_scene(
                         bridge_error(&legacy)
                     ));
                 }
-                expected_count = source_count;
+                expected_count = padded;
+                source_count = padded;
             }
             for i in 0..expected_count {
                 if !data.join(format!("tree-{i:03}.pwt")).is_file() {
