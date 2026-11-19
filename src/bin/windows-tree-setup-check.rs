@@ -37,6 +37,10 @@ mod vegetation_textures;
 #[cfg(windows)]
 #[path = "../windows_setup.rs"]
 mod windows_setup;
+// `windows_setup` draws its load-rate sparkline through
+// `crate::loading_graph`.
+#[path = "../loading_graph.rs"]
+mod loading_graph;
 #[cfg(windows)]
 fn main() {
     let root = std::path::PathBuf::from(std::env::args_os().nth(1).expect("element path"));

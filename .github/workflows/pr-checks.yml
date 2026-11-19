@@ -103,6 +103,20 @@ jobs:
           # be its own gate. `harness.sh check` runs it too; this makes it run on
           # a machine that has no offline toolchain.
           python3 tools/check-harness.py
+          # Every binary reaches some `src/*.rs` module through `#[path]`, and
+          # any `crate::x` inside those files has to be declared by the binary
+          # too. `cargo check --bins` below is what really proves it, but it
+          # fails one target at a time and its log is often unretrievable; this
+          # names the file and the module without a toolchain. It is a closure
+          # check, not a compile: a module can be declared and still need
+          # `wgpu`, which is why the two are not redundant.
+          for binary in src/bin/*.rs; do
+            missing="$(python3 tools/binary-module-closure.py "$binary")" || exit 1
+            if [ -n "$missing" ]; then
+              echo "::error file=$binary::declares no module for: $missing"
+              exit 1
+            fi
+          done
       - name: Test requirement status audits
         run: |
           python3 tools/test_phase1_ready.py

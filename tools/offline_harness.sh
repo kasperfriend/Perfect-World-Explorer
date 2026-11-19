@@ -748,8 +748,27 @@ case "${1:-test}" in
                 grep -E "^error" -A4 "$OUT/bins/$name.log" | head -10
             fi
         done
-        echo "bins: $((total - failed))/$total type-check clean"
-        [ "$failed" -eq 0 ] ;;
+        # The binaries above that name `wgpu` are skipped here because the
+        # offline toolchain has no `wgpu` -- but they still have a module list,
+        # and `cargo check --bins` in CI compiles it. A `#[path]` module that
+        # reaches `crate::effect_census` without declaring it is not a `wgpu`
+        # problem: it is a missing line in the binary, and it took a failing CI
+        # run to find one. This closes the dependency closure of every binary's
+        # declared modules and names any `src/*.rs` module it reaches but does
+        # not declare, so the window and GPU targets get the same check the
+        # type-checked ones just had.
+        holes=0
+        for path in "$REPO"/src/bin/*.rs; do
+            name="$(basename "$path" .rs)"
+            missing="$(python3 "$REPO"/tools/binary-module-closure.py "$path")" || {
+                failed=$((failed + 1)); holes=$((holes + 1)); continue; }
+            if [ -n "$missing" ]; then
+                echo "FAIL $name: declares no module for: $missing"
+                holes=$((holes + 1))
+            fi
+        done
+        echo "bins: $((total - failed))/$total type-check clean, $holes missing module declaration(s)"
+        [ "$failed" -eq 0 ] && [ "$holes" -eq 0 ] ;;
     test)  toolchain; sysroot; deps; real_deps
         # `angelica_pck` is in the closure and it really decompresses, so the
         # real `flate2` is required here; without it the whole suite failed to

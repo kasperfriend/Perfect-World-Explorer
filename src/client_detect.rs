@@ -865,10 +865,7 @@ fn table_language(key: &str) -> Option<u16> {
 /// English is `0x0409` (US) plus the three other English `LANGID`s Win32
 /// defines: `0x0809` (UK), `0x0c09` (Australia) and `0x1009` (Canada).
 fn is_english(key: &str) -> bool {
-    matches!(
-        table_language(key),
-        Some(0x0409 | 0x0809 | 0x0c09 | 0x1009)
-    )
+    matches!(table_language(key), Some(0x0409 | 0x0809 | 0x0c09 | 0x1009))
 }
 
 /// Find one `String` value in a `VS_VERSIONINFO` blob by key.

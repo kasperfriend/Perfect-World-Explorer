@@ -27,6 +27,10 @@ mod sky_config;
 mod sky_gpu;
 #[path = "../sky_transition.rs"]
 mod sky_transition;
+// `sky_gpu`'s own test reads `sky_time::night_weight`, so a `--test` build of
+// this target needs the module even though the non-test build does not.
+#[path = "../sky_time.rs"]
+mod sky_time;
 
 use glam::{Mat4, Vec3};
 use scenery_visibility::Pass;
