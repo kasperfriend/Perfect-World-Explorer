@@ -2382,13 +2382,20 @@ impl Lighter {
             .selected_text(self.settings.denoiser.label())
             .show_ui(ui, |ui| {
                 for d in Denoiser::ALL {
-                    let disabled = d.unavailable_reason().is_some();
                     let text = match d.unavailable_reason() {
                         Some(reason) => format!("{} — {}", d.label(), reason),
                         None => d.label().to_string(),
                     };
-                    ui.add_enabled(!disabled, egui::SelectableValue::new(&mut self.settings.denoiser, d, text))
-                        .on_hover_text(d.unavailable_reason().unwrap_or("Always available portable denoiser."));
+                    match d.unavailable_reason() {
+                        Some(reason) => {
+                            ui.add(egui::Label::new(text).text_color(egui::Color32::GRAY))
+                                .on_hover_text(reason);
+                        }
+                        None => {
+                            ui.selectable_value(&mut self.settings.denoiser, d, text)
+                                .on_hover_text("Always available portable denoiser.");
+                        }
+                    }
                 }
             });
         let upscale = self.graphics_upscaler.as_deref().unwrap_or("not yet reported");
