@@ -177,6 +177,10 @@ jobs:
           # `.gfx`/`.sgc` effect members as unparsed because the table listed
           # neither extension; these tests keep that from happening again.
           python3 -m unittest tools.test_archive_census
+          # The DDS survey's format table, checked against `model_dds.rs`
+          # rather than against a pack -- its first version reported 33 members
+          # as unreadable that the parser has always accepted.
+          python3 -m unittest tools.test_dds_survey
           python3 tools/check-eight-phase-status.py
           # The register's row count is quoted in TODO.md and the PR body. It
           # said 62 while the file held 61, which is the kind of number nobody

@@ -146,3 +146,43 @@ parsers accept at full fidelity. Seven packs are covered (`gfx.pck` as of 18 Nov
 `building.pck`, `litmodels.pck`, `surfaces.pck` and `loddata.pck` are not staged, and
 BMD coverage therefore rests on the existing `litmodels.pck` census rather than
 on this tool.
+
+## DDS pixel formats measured (18 November)
+
+`tools/dds-survey.py` is the survey for the one thing `model_dds.rs` dispatches
+on: the `DDS_PIXELFORMAT`. It reports each format a pack carries, whether this
+build reads it, and which accepted FourCCs no pack carries -- because a format
+the reader accepts and nothing ships is dead code that reads like coverage.
+
+Run over the four packs staged in this checkout, **1,433 DDS members**:
+
+| format | members | read |
+| --- | ---: | --- |
+| `DXT3` | 651 | yes |
+| `DXT1` | 613 | yes |
+| 32-bit `00ff0000/0000ff00/000000ff` (+ alpha mask or not) | 77 | yes |
+| 16-bit luminance (`DDPF_LUMINANCE`, flags `0x80000`) | 59 | yes, as of this change |
+| 24-bit BGR | 33 | yes |
+| `DXT5` | **0** | accepted by the reader, carried by nothing here |
+| `DX10` | **0** | no DX10 header path is needed |
+
+Two things came out of this.
+
+**The 59 luminance members were a real loss, not a cosmetic one.** They are the
+whole `textures/water/caustic/` set: 16-bit, masks `000000ff` / `0000ff00`, one
+channel with the sample in the low byte of each word. The reader refused every
+one, so each caustic light pattern drew as the flat white placeholder.
+`Uncompressed` now carries a `luminance` flag and `model_texture_gpu` widens
+the single channel into R, G and B. After the change all 1,433 parse.
+
+**No `DX10` exists in any staged pack, so adding one would be speculative.**
+Item 74 asked whether the FourCC match should grow a `DX10` case; the answer
+from the data is no, and the reader still names an unknown FourCC instead of
+dropping the member.
+
+The survey also caught a mistake in its own first table: it reported the 33
+24-bit members as unreadable, but `model_dds.rs` already accepts 24-bit BGR.
+The table was wrong, not the reader -- so `READ_RGB` is now checked against the
+parser rather than guessed from the pack. This is the same failure shape the
+`gfx.pck` census had (measuring the table instead of the code), which is why
+the two surveys live beside each other here.
