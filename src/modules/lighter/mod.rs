@@ -1673,7 +1673,9 @@ impl Lighter {
                 let made = loop {
                     if let Some(deadline) = self.cold_ray_deadline {
                         if Instant::now() > deadline {
-                            return Err("Lighter cold-ray startup exceeded the first-frame timeout".into());
+                            return Err(
+                                "Lighter cold-ray startup exceeded the first-frame timeout".into(),
+                            );
                         }
                     }
                     match rx.try_recv() {
