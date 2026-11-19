@@ -2409,8 +2409,14 @@ impl Lighter {
                     }
                 }
             });
-        let upscale = self.graphics_upscaler.as_deref().unwrap_or("not yet reported");
-        let framegen = self.graphics_frame_gen.as_deref().unwrap_or("not yet reported");
+        let upscale = self
+            .graphics_upscaler
+            .as_deref()
+            .unwrap_or("not yet reported");
+        let framegen = self
+            .graphics_frame_gen
+            .as_deref()
+            .unwrap_or("not yet reported");
         ui.label(format!(
             "Upscaling and frame generation come from Graphics settings: {upscale} + {framegen} (read-only, inherited by the ray overlay)."
         ));
