@@ -2387,8 +2387,11 @@ impl Lighter {
                         Some(reason) => format!("{} — {}", d.label(), reason),
                         None => d.label().to_string(),
                     };
-                    ui.add_enabled(!disabled, ui.selectable_value(&mut self.settings.denoiser, d, text))
-                        .on_hover_text(d.unavailable_reason().unwrap_or("Always available portable denoiser."));
+                    let mut response = ui.selectable_value(&mut self.settings.denoiser, d, text);
+                    if disabled {
+                        response = response.disabled();
+                    }
+                    response.on_hover_text(d.unavailable_reason().unwrap_or("Always available portable denoiser."));
                 }
             });
         let upscale = self.graphics_upscaler.as_deref().unwrap_or("not yet reported");
