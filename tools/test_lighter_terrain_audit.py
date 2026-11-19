@@ -50,6 +50,15 @@ class TerrainAuditTests(unittest.TestCase):
         # Four corners with a nonplanar quad. The mesh uses b–c, not a–d.
         self.assertEqual(audit.Mesh([0., 2., 4., 16.], 2, 2, 1).height(0.5, 0.5), 3.)
 
+    def test_emitted_geometry_is_audited_and_rejects_unpaired_edges(self):
+        native = audit.Mesh([0., 2., 4., 16.], 2, 2, 1)
+        native_split = [(0, 0, 1, 0, 0, 1), (1, 0, 1, 1, 0, 1)]
+        refined = audit.RefinedMesh(native, 4, 6, native_split)
+        self.assertEqual(refined.height(.5, .5), 3.)
+        self.assertEqual(audit.compare(native, refined, 2., .5)["height_grid"]["max_abs"], 0.)
+        with self.assertRaisesRegex(ValueError, "unpaired edge"):
+            audit.RefinedMesh(native, 4, 3, native_split[:1])
+
     def test_cli_distinguishes_geometry_failure_cutoff_and_missing_data(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

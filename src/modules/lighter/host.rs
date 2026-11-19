@@ -228,40 +228,53 @@ impl FeedSource {
             })
             .map_err(|error| format!("Lighter far terrain height load failed: {error}"))?
         };
-        match plan.max_sample_error {
-            Some(error) if error > terrain_fidelity::GRID_TOLERANCE => eprintln!(
-                "Lighter: far terrain stride {} exceeds the {:.2}-unit height tolerance (measured {error:.3}); finer grid would exceed its budget",
-                plan.step, terrain_fidelity::GRID_TOLERANCE,
-            ),
-            Some(error) => crate::diag!(TimingLoad, "Lighter far terrain stride {}: measured max height error {error:.3}", plan.step),
-            None => eprintln!("Lighter: far terrain uses stride {} to fit large maps; height tolerance is unverified", plan.step),
-        }
-        let far = if let Some(far) = upload.far.as_ref().filter(|_| plan.step == 4) {
-            far
-        } else {
-            // Also prepare this for a session starting with cutoff enabled:
-            // the live cutoff toggle can bring back distant geometry.
-            &crate::terrain_gpu::world_mesh(t, plan.step)
-                .map_err(|error| format!("Lighter far terrain mesh load failed: {error}"))?
-        };
-        for span in &far.2 {
-            let mut patch = Mesh::default();
-            let mut remap = HashMap::new();
-            for tri in
-                far.1[span.start as usize..(span.start + span.count) as usize].chunks_exact(3)
-            {
-                let tri = [tri[0], tri[1], tri[2]].map(|i| {
-                    *remap.entry(i).or_insert_with(|| {
-                        let id = patch.vertices.len() as u32;
-                        let (p, n) = far.0[i as usize].position_normal();
-                        patch.vertices.push(Vertex::new(p, n, [0.; 2]));
-                        id
-                    })
-                });
-                // The terrain material is the first surface in every packet.
-                patch.tri(tri, 0);
+        match plan {
+            terrain_fidelity::Layout::Refined(grid) => {
+                eprintln!(
+                    "Lighter: far terrain locally refined {} tiles, {} indices, {:.4}-unit maximum source-mesh error",
+                    grid.refined, grid.index_count, grid.max_error,
+                );
+                result.far = adaptive_far_mesh(t, &grid).map_err(|error| {
+                    format!("Lighter refined far terrain mesh load failed: {error}")
+                })?;
             }
-            result.far.push((*span, patch));
+            terrain_fidelity::Layout::Regular(plan) => {
+                match plan.max_sample_error {
+                    Some(error) if error > terrain_fidelity::GRID_TOLERANCE => eprintln!(
+                        "Lighter: far terrain stride {} exceeds the {:.2}-unit height tolerance (measured {error:.3}); conforming refinement would exceed its budget",
+                        plan.step, terrain_fidelity::GRID_TOLERANCE,
+                    ),
+                    Some(error) => crate::diag!(TimingLoad, "Lighter far terrain stride {}: measured max height error {error:.3}", plan.step),
+                    None => eprintln!("Lighter: far terrain uses stride {} to fit large maps; height tolerance is unverified", plan.step),
+                }
+                let far = if let Some(far) = upload.far.as_ref().filter(|_| plan.step == 4) {
+                    far
+                } else {
+                    // Also prepare this for a session starting with cutoff enabled:
+                    // the live cutoff toggle can bring back distant geometry.
+                    &crate::terrain_gpu::world_mesh(t, plan.step)
+                        .map_err(|error| format!("Lighter far terrain mesh load failed: {error}"))?
+                };
+                for span in &far.2 {
+                    let mut patch = Mesh::default();
+                    let mut remap = HashMap::new();
+                    for tri in far.1[span.start as usize..(span.start + span.count) as usize]
+                        .chunks_exact(3)
+                    {
+                        let tri = [tri[0], tri[1], tri[2]].map(|i| {
+                            *remap.entry(i).or_insert_with(|| {
+                                let id = patch.vertices.len() as u32;
+                                let (p, n) = far.0[i as usize].position_normal();
+                                patch.vertices.push(Vertex::new(p, n, [0.; 2]));
+                                id
+                            })
+                        });
+                        // The terrain material is the first surface in every packet.
+                        patch.tri(tri, 0);
+                    }
+                    result.far.push((*span, patch));
+                }
+            }
         }
         result.placements = std::mem::take(&mut t.trees.placements);
         Ok(result)
@@ -802,6 +815,69 @@ fn span(
 }
 
 type Perimeter = [Vec<(f32, Vertex)>; 4];
+
+fn adaptive_far_mesh(
+    t: &Terrain,
+    grid: &terrain_fidelity::AdaptiveGrid,
+) -> Result<Vec<(crate::terrain_residency::Span, Mesh)>, String> {
+    let [cols, rows] = grid.tiles();
+    let mut reader = t.heights.reader();
+    let mut patches = Vec::new();
+    for py in (0..rows).step_by(32) {
+        for px in (0..cols).step_by(32) {
+            let mut patch = Mesh::default();
+            let mut indices = HashMap::new();
+            let mut points = Vec::new();
+            for y in py..(py + 32).min(rows) {
+                for x in px..(px + 32).min(cols) {
+                    grid.triangles(x, y, |tri| {
+                        let tri = tri.map(|p| {
+                            *indices.entry(p).or_insert_with(|| {
+                                let id = points.len() as u32;
+                                points.push(p);
+                                id
+                            })
+                        });
+                        patch.tri(tri, 0);
+                    });
+                }
+            }
+            let mut lo = [f32::INFINITY; 3];
+            let mut hi = [f32::NEG_INFINITY; 3];
+            patch.vertices.reserve(points.len());
+            for [x, y] in points {
+                let (h, n) = reader.cell(y * t.width + x)?;
+                let p = [
+                    (x as f32 - t.width as f32 * 0.5) * t.grid_spacing,
+                    h,
+                    (t.height as f32 * 0.5 - y as f32) * t.grid_spacing,
+                ];
+                for axis in 0..3 {
+                    lo[axis] = lo[axis].min(p[axis]);
+                    hi[axis] = hi[axis].max(p[axis]);
+                }
+                patch
+                    .vertices
+                    .push(Vertex::new(p, n.map(|v| f32::from(v) / 127.), [0.; 2]));
+            }
+            let span = crate::terrain_residency::Span {
+                block: (px, py),
+                start: 0,
+                count: (patch.triangles.len() * 3) as u32,
+                bounds: [lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]],
+            };
+            patches.push((span, patch));
+        }
+    }
+    debug_assert_eq!(
+        patches
+            .iter()
+            .map(|(span, _)| span.count as usize)
+            .sum::<usize>(),
+        grid.index_count
+    );
+    Ok(patches)
+}
 
 fn near_edges([x0, x1, z0, z1]: [f32; 4], vertices: impl Iterator<Item = Vertex>) -> Perimeter {
     let mut edges: Perimeter = std::array::from_fn(|_| Vec::new());

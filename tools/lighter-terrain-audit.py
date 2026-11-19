@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent height-only audit of Lighter's regular far terrain grid.
+"""Independent height-only audit of Lighter's regular or locally refined far terrain.
 
 Reads actual TRN2/T2BK heights without the client, masks, or a graphics device.
 Compares the production triangle split to the unstitched stride-one surface at
@@ -14,6 +14,8 @@ import json
 import math
 from pathlib import Path
 import struct
+import subprocess
+import sys
 import zlib
 
 
@@ -136,6 +138,104 @@ class Mesh:
         return [(k, self.height(placement, k) if row else self.height(k, placement)) for k in knots]
 
 
+
+class RefinedMesh:
+    """Audit the actual emitted indices, not a second refinement heuristic."""
+    def __init__(self, native, step, indices, triangles):
+        self.w, self.h, self.step = native.w, native.h, step
+        self.nx, self.ny = len(axis(self.w, step)) - 1, len(axis(self.h, step)) - 1
+        self.tiles = [[] for _ in range(self.nx * self.ny)]
+        areas = [0] * len(self.tiles)
+        edges = {}
+        if step != 4 or len(triangles) * 3 != indices or not 0 < indices <= 600_000:
+            raise ValueError("invalid production refinement budget")
+        for tri in triangles:
+            if len(tri) != 6 or any(not (0 <= x < self.w and 0 <= y < self.h)
+                                    for x, y in zip(tri[::2], tri[1::2])):
+                raise ValueError("refined terrain references an invalid source vertex")
+            a, b, c = tuple((x, y, native.field[y * self.w + x]) for x, y in zip(tri[::2], tri[1::2]))
+            tx, ty = min(a[0], b[0], c[0]) // step, min(a[1], b[1], c[1]) // step
+            if max(a[0], b[0], c[0]) > (tx + 1) * step or max(a[1], b[1], c[1]) > (ty + 1) * step:
+                raise ValueError("refined triangle crosses a tile boundary")
+            area = self.cross(a, b, c[0], c[1])
+            if area <= 0:
+                raise ValueError("refined terrain contains a flipped or zero-area triangle")
+            index = ty * self.nx + tx
+            self.tiles[index].append((a, b, c, area))
+            areas[index] += area
+            for start, end in ((a, b), (b, c), (c, a)):
+                key = tuple(sorted((start[:2], end[:2])))
+                edges[key] = edges.get(key, 0) + 1
+        for ((ax, ay), (bx, by)), count in edges.items():
+            boundary = ax == bx and ax in (0, self.w - 1) or ay == by and ay in (0, self.h - 1)
+            if count != (1 if boundary else 2):
+                raise ValueError("unpaired edge in production far terrain (gap or T-junction)")
+        for i, area in enumerate(areas):
+            x, y = i % self.nx * step, i // self.nx * step
+            if area != 2 * min(step, self.w - 1 - x) * min(step, self.h - 1 - y):
+                raise ValueError("refined terrain does not cover its source rectangle")
+
+    @staticmethod
+    def cross(a, b, x, y):
+        return (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0])
+
+    def height(self, x, y):
+        tx = min(self.nx - 1, int(x) // self.step)
+        ty = min(self.ny - 1, int(y) // self.step)
+        for a, b, c, area in self.tiles[ty * self.nx + tx]:
+            wa, wb, wc = self.cross(b, c, x, y), self.cross(c, a, x, y), self.cross(a, b, x, y)
+            if min(wa, wb, wc) >= 0:
+                return (wa * a[2] + wb * b[2] + wc * c[2]) / area
+        raise ValueError("height probe outside refined mesh")
+
+    def profile_knots(self, placement, *, row):
+        i, j = (0, 1) if row else (1, 0)
+        if row:
+            tiles = (self.tiles[y * self.nx + min(self.nx - 1, placement // self.step)] for y in range(self.ny))
+        else:
+            start = min(self.ny - 1, placement // self.step) * self.nx
+            tiles = iter(self.tiles[start : start + self.nx])
+        points = set()
+        for tile in tiles:
+            for a, b, c, _ in tile:
+                for p, q in ((a, b), (b, c), (c, a)):
+                    if p[i] == placement:
+                        points.add((p[j], p[2]))
+                    if q[i] == placement:
+                        points.add((q[j], q[2]))
+                    if min(p[i], q[i]) < placement < max(p[i], q[i]):
+                        t = (placement - p[i]) / (q[i] - p[i])
+                        points.add((p[j] + t * (q[j] - p[j]), p[2] + t * (q[2] - p[2])))
+        return points
+
+
+def production_mesh(native, planner):
+    source = native.field
+    if sys.byteorder != "little":
+        source = source[:]
+        source.byteswap()
+    done = subprocess.run([str(planner.resolve()), str(native.w), str(native.h)], input=source.tobytes(),
+                          capture_output=True, timeout=60)
+    if done.returncode:
+        raise ValueError(f"production planner failed: {done.stderr.decode(errors='replace').strip()}")
+    header, *triangles = done.stdout.decode("ascii").splitlines()
+    words = header.split()
+    if len(words) == 3 and words[0] == "regular" and not triangles:
+        step = int(words[1])
+        if step not in (1, 2, 4, 16):
+            raise ValueError("unexpected regular far stride")
+        mesh = Mesh(native.field, native.w, native.h, step)
+        return step, mesh, {"source": "production", "kind": "regular", "stride": step,
+                            "indices": 6 * (len(mesh.x) - 1) * (len(mesh.y) - 1)}
+    if len(words) != 5 or words[0] != "adaptive":
+        raise ValueError("unexpected production far-layout header")
+    step, indices, refined = map(int, words[1:4])
+    return "adaptive", RefinedMesh(native, step, indices, [tuple(int(n) for n in tri.split()) for tri in triangles]), {
+        "source": "production", "kind": "adaptive", "base_stride": step, "indices": indices,
+        "refined_tiles": refined, "planner_continuous_max_abs": float(words[4]),
+        "emitted_layout_sha256": hashlib.sha256(done.stdout).hexdigest(),
+    }
+
 def stats(errors, limit):
     n, total, peak, beyond = 0, 0.0, 0.0, 0
     for delta in errors:
@@ -159,8 +259,8 @@ def height_error(native, far, limit):
 
 
 def viewer_stride(native):
-    # Mirror terrain_fidelity.rs; --stride overrides this to compare the old
-    # viewer or the large-map fallback even on a small authored heightfield.
+    # Uniform-only estimate, retained to compare the old viewer or diagnose
+    # the large-map fallback. --viewer-planner runs the production policy.
     selected = (math.inf, 16)
     for stride in (4, 2, 1):
         far = Mesh(native.field, native.w, native.h, stride)
@@ -199,7 +299,7 @@ def compare(native, far, spacing, limit):
     return report
 
 
-def audit(path, strides, cutoff, limit):
+def audit(path, strides, cutoff, limit, planner=None):
     field, w, h, grid, spacing, sources = load(path)
     report = {"map": path.stem, "heightfield": [w, h], "spacing": spacing,
               "decoded_blocks": (w // grid) * (h // grid), "source_sha256": sources}
@@ -213,9 +313,14 @@ def audit(path, strides, cutoff, limit):
     report["status"] = "within_tolerance"
     report["strides"] = {}
     native = Mesh(field, w, h, 1)
-    strides = strides or [viewer_stride(native)]
-    for stride in strides:
-        result = compare(native, Mesh(field, w, h, stride), spacing, limit)
+    if planner is not None:
+        name, mesh, report["layout"] = production_mesh(native, planner)
+        layouts = [(name, mesh)]
+    else:
+        report["layout"] = {"source": "requested strides" if strides else "uniform-only estimate"}
+        layouts = [(stride, Mesh(field, w, h, stride)) for stride in (strides or [viewer_stride(native)])]
+    for stride, mesh in layouts:
+        result = compare(native, mesh, spacing, limit)
         report["strides"][stride] = result
         if any(stat["over_limit"] for stat in (result["height_grid"], *result["grazing"].values())):
             report["status"] = "geometry_error"
@@ -225,20 +330,21 @@ def audit(path, strides, cutoff, limit):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("trn2", nargs="+", type=Path, help="each TRN2 must be beside its T2BK files")
-    parser.add_argument("--stride", action="append", type=int, choices=[1, 2, 4, 8, 16], help="override stride; repeat for multiple comparisons (default: current viewer policy)")
+    parser.add_argument("--stride", action="append", type=int, choices=[1, 2, 4, 8, 16], help="override stride; repeat for multiple comparisons (default: uniform-only estimate)")
+    parser.add_argument("--viewer-planner", type=Path, help="compiled lighter-terrain-plan binary (audit actual emitted indices)")
     parser.add_argument("--limit", default=0.5, type=float, help="maximum height/silhouette error in world units")
     parser.add_argument("--cutoff-window", nargs=4, type=int, metavar=("X0", "Y0", "X1", "Y1"), help="model an intentional near-only block window; still validate source heights")
     parser.add_argument("--json", type=Path, help="write the full per-view statistics as JSON")
     args = parser.parse_args()
     if not 0 < args.limit < math.inf:
         parser.error("--limit must be positive and finite")
-    if args.cutoff_window and args.stride:
-        parser.error("select either a cutoff window or a far stride")
+    if sum(map(bool, (args.cutoff_window, args.stride, args.viewer_planner))) > 1:
+        parser.error("select a cutoff window, explicit stride(s), or the production planner")
     results = []
     for path in args.trn2:
         try:
-            report = audit(path, args.stride, args.cutoff_window, args.limit)
-        except (ValueError, OSError, struct.error, zlib.error) as error:
+            report = audit(path, args.stride, args.cutoff_window, args.limit, args.viewer_planner)
+        except (ValueError, OSError, struct.error, zlib.error, subprocess.TimeoutExpired) as error:
             report = {"map": path.stem, "status": "load_failed", "error": str(error)}
         results.append(report)
         print(f"{report['map']}: {report['status']}")
@@ -246,10 +352,14 @@ def main():
             print(f"  {report['error']}")
         if "cutoff_blocks" in report:
             print(f"  {report['cutoff_blocks']} of {report['decoded_blocks']} loaded blocks intentionally omitted")
+        if "indices" in report.get("layout", {}):
+            layout = report["layout"]
+            print(f"  production {layout['kind']}: {layout['indices']} indices")
         for stride, stats_by_kind in report.get("strides", {}).items():
             heights = stats_by_kind["height_grid"]
             name, worst = max(stats_by_kind["grazing"].items(), key=lambda item: item[1]["max_abs"])
-            print(f"  stride {stride}: height mean {heights['mean_abs']:.4f}, max {heights['max_abs']:.4f} "
+            label = "adaptive" if stride == "adaptive" else f"stride {stride}"
+            print(f"  {label}: height mean {heights['mean_abs']:.4f}, max {heights['max_abs']:.4f} "
                   f"({heights['over_limit']}/{heights['samples']} beyond {args.limit}); "
                   f"worst silhouette {worst['max_abs']:.4f} ({name})")
     if args.json:
