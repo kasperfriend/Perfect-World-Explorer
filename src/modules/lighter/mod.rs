@@ -891,6 +891,7 @@ pub struct Lighter {
     pending_primary: Option<bool>,
     armed: bool,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
+    target_16_6: bool,
     capture: bool,
     capture_reference_samples: Option<u32>,
     #[cfg(test)]
@@ -954,6 +955,7 @@ impl Default for Lighter {
             pending_primary: None,
             armed: false,
             #[cfg(any(target_os = "windows", target_os = "linux"))]
+            target_16_6: std::env::var("PW_RAY_ADAPTIVE_TIMESTAMPS").as_deref() == Ok("1"),
             capture: false,
             capture_reference_samples: None,
             #[cfg(test)]
@@ -1004,9 +1006,13 @@ impl Lighter {
             compact_terrain: bc_pages || textures::compact_terrain_enabled(),
             bc_pages,
             screen_reuse: screen_reuse_requested(),
-            timings: (settings.mode != Mode::Off)
-                .then(|| profile::Timings::new(device))
-                .flatten(),
+            // Readbacks belong to explicitly requested capture, not normal
+            // present. Vulkan adaptive scaling reads a signaled query below.
+            timings: (settings.mode != Mode::Off
+                && (std::env::var("PW_LIGHTER_TRAVEL_SYNC").as_deref() == Ok("1")
+                    || std::env::var("PW_RAY_CAPTURE_TIMINGS").as_deref() == Ok("1")))
+            .then(|| profile::Timings::new(device))
+            .flatten(),
             settings,
             saved_mode: settings.mode,
             native_backend: adapter.get_info().backend,
@@ -1448,13 +1454,26 @@ impl Lighter {
         }
     }
 
+    fn has_adaptive_samples(&self) -> bool {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if self.settings.mode == Mode::Hardware {
+            return self.reconstruction.is_none()
+                && self.game_profile.is_none()
+                && self
+                    .hardware
+                    .as_ref()
+                    .is_some_and(vulkan::Renderer::has_timestamps);
+        }
+        self.timings.is_some()
+    }
+
     fn ray_extent(&self, device: &wgpu::Device, w: u32, h: u32) -> Result<(u32, u32), String> {
         let pixel_limit = image_limit(device) / PIXEL_BYTES;
         if pixel_limit == 0 {
             return Err("Lighter cannot allocate ray image".into());
         }
         let settings = self.settings.effective();
-        let pct = if settings.dynamic_resolution && self.timings.is_some() {
+        let pct = if settings.dynamic_resolution && self.has_adaptive_samples() {
             self.adaptive
                 .percent
                 .unwrap_or(settings.resolution)
@@ -1671,6 +1690,9 @@ impl Lighter {
         w: u32,
         h: u32,
     ) -> Result<bool, String> {
+        if self.settings.mode != Mode::Off && self.capture && self.timings.is_none() {
+            self.timings = profile::Timings::new(device);
+        }
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         let temporal_capable = if self.reconstruction.is_some() {
             let (rw, rh) = self.ray_extent(device, w, h)?;
@@ -2114,16 +2136,29 @@ impl Lighter {
                 .unwrap()
                 .record(encoder, settings.mode, frame.extent, native_ms);
         }
-        if settings.dynamic_resolution {
-            if let Some(s) =
-                completed.filter(|s| s.mode == settings.mode && s.extent == frame.extent)
-            {
-                self.adaptive.observe(
-                    settings.resolution,
-                    s.total_ms,
-                    f64::from(settings.gpu_target_ms),
-                    Instant::now(),
-                );
+        if settings.dynamic_resolution && self.has_adaptive_samples() {
+            let mut cost = completed
+                .filter(|s| s.mode == settings.mode && s.extent == frame.extent)
+                .map(|s| s.total_ms);
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            if settings.mode == Mode::Hardware {
+                // Consume at most once; an old sample cannot advance the
+                // hysteresis just because a presentation was retried.
+                cost = self
+                    .hardware
+                    .as_mut()
+                    .and_then(vulkan::Renderer::take_adaptive_timestamp)
+                    .filter(|(extent, _)| *extent == frame.extent)
+                    .map(|(_, ms)| ms);
+            }
+            if let Some(ms) = cost {
+                let target = if self.target_16_6 {
+                    16.6
+                } else {
+                    f64::from(settings.gpu_target_ms)
+                };
+                self.adaptive
+                    .observe(settings.resolution, ms, target, Instant::now());
             }
         }
         self.frame_error = None;
@@ -2304,11 +2339,11 @@ impl Lighter {
         ui.add_enabled(!self.settings.reference, egui::Checkbox::new(&mut self.settings.fsr1_easu, "FSR 1 spatial upscale (EASU)"))
             .on_hover_text("Reconstruct color from the filtered ray image when rays are below output resolution. Depth is still the nearest current ray sample. This is not the temporal FSR SDK or DLSS Ray Reconstruction.");
         ui.checkbox(&mut self.settings.dynamic_resolution,"Automatic ray resolution (50–100%)")
-            .on_hover_text("Uses completed GPU timings with hysteresis. The slider seeds the adaptive scale; pipelines without timestamps keep the fixed scale.");
+            .on_hover_text("Uses completed Hardware raster/trace timestamps with hysteresis (Software requires a profiling capture). SDK and game profiles keep a fixed scale.");
         if self.settings.dynamic_resolution && !self.settings.reference {
             ui.add(
                 egui::Slider::new(&mut self.settings.gpu_target_ms, 4..=50)
-                    .text("Ray + filter GPU budget")
+                    .text("Adaptive ray GPU budget")
                     .suffix(" ms"),
             );
         }

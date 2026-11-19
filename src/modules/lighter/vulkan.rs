@@ -69,6 +69,20 @@ pub fn shader(source: &str) -> Result<Vec<u32>, String> {
 }
 
 pub(super) fn shader_entry(source: &str, stage: naga_rt::ShaderStage, entry: &str) -> R<Vec<u32>> {
+    shader_constants(
+        source,
+        stage,
+        entry,
+        &naga_rt::back::PipelineConstants::default(),
+    )
+}
+
+fn shader_constants(
+    source: &str,
+    stage: naga_rt::ShaderStage,
+    entry: &str,
+    constants: &naga_rt::back::PipelineConstants,
+) -> R<Vec<u32>> {
     // Use the guarded getters and separate candidate/committed helpers from
     // Naga 26 without changing wgpu's pinned shader compiler.
     use naga_rt as naga;
@@ -90,6 +104,9 @@ pub(super) fn shader_entry(source: &str, stage: naga_rt::ShaderStage, entry: &st
     let info = validator
         .validate(&module)
         .map_err(|e| e.emit_to_string(source))?;
+    let (module, info) =
+        naga::back::pipeline_constants::process_overrides(&module, &info, None, constants)
+            .map_err(|e| format!("Lighter shader specialization {entry}: {e}"))?;
     naga::back::spv::write_vec(
         &module,
         &info,
@@ -1026,6 +1043,7 @@ pub struct Renderer {
     resident_upload: Option<residency::ResidentUpload>,
     timing_pending: Option<([u32; 4], bool, bool, u64, u64)>,
     last_gpu: Option<([u32; 4], [f64; 3])>,
+    adaptive_timestamp: Option<([u32; 4], f64)>,
     heap_usage: Option<u64>,
     last_timing: Option<Instant>,
     revision: Option<u64>,
@@ -1151,6 +1169,7 @@ impl Renderer {
             resident_upload: None,
             timing_pending: None,
             last_gpu: None,
+            adaptive_timestamp: None,
             heap_usage: None,
             last_timing: None,
             revision: None,
@@ -1347,6 +1366,14 @@ impl Renderer {
         [self.rt_triangles, self.members.len() as u64]
     }
 
+    pub(super) fn has_timestamps(&self) -> bool {
+        self.core.query != vk::QueryPool::null()
+    }
+
+    pub(super) fn take_adaptive_timestamp(&mut self) -> Option<([u32; 4], f64)> {
+        self.adaptive_timestamp.take()
+    }
+
     pub(super) fn gpu_stages(&self) -> Option<([u32; 4], [f64; 3])> {
         self.last_gpu
     }
@@ -1399,6 +1426,7 @@ impl Renderer {
                 // A missing/unreadable timestamp on this fence must not
                 // be paired with the new wgpu compose sample at the same extent.
                 self.last_gpu = None;
+                self.adaptive_timestamp = None;
                 if let Some((extent, built, raster, moving_bytes, instance_bytes)) =
                     self.timing_pending.take()
                 {
@@ -1426,6 +1454,7 @@ impl Renderer {
                         let primary = if raster { duration(1) } else { 0. };
                         let trace = duration(2);
                         self.last_gpu = Some((extent, [build, primary, trace]));
+                        self.adaptive_timestamp = Some((extent, primary + trace));
                         if self.last_timing.is_none_or(|t| t.elapsed() >= INTERVAL) {
                             self.heap_usage = ctx.heap_usage();
                             let bytes = ctx.budget.held.load(Ordering::Relaxed);
@@ -1981,5 +2010,52 @@ mod budget_tests {
     #[test]
     fn queue_timestamps_wrap_at_valid_bits() {
         assert_eq!(timestamp_ms(250, 4, 8, 100_000.), 1.);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn naga_lowers_overrides_for_media_reference_emissive_and_transmission() {
+    use naga_rt::{back::PipelineConstants, ShaderStage};
+    let mut source = super::trace_source(super::HARDWARE, false, false);
+    for (name, anchor, gate) in [
+        (
+            "MEDIA",
+            "    let wet = wet_span(ray,distance,body);",
+            "    if !TRACE_MEDIA { return SegmentMedium(vec3<f32>(1.),vec3<f32>(0.),0u); }\n",
+        ),
+        (
+            "REFERENCE",
+            "fn reference() -> bool { ",
+            "if !TRACE_REFERENCE { return false; } ",
+        ),
+        (
+            "EMISSIVE",
+            "    if (s.flags & EMISSIVE)!=0u { return s.color.rgb*emission_weight; }",
+            "    if !TRACE_EMISSIVE && (s.flags & EMISSIVE)!=0u { return vec3<f32>(0.); }\n",
+        ),
+        (
+            "TRANSMISSION",
+            "                let from_water = s.face.y<0.;",
+            "                if !TRACE_TRANSMISSION { break; }\n",
+        ),
+    ] {
+        let mut at = source.find(anchor).expect(anchor);
+        if name == "REFERENCE" {
+            at += anchor.len();
+        }
+        source.insert_str(at, gate);
+        source.insert_str(0, &format!("override TRACE_{name}: bool = true;\n"));
+    }
+    for variant in ["MEDIA", "REFERENCE", "EMISSIVE", "TRANSMISSION", "dry"] {
+        let mut constants = PipelineConstants::default();
+        for name in ["MEDIA", "REFERENCE", "EMISSIVE", "TRANSMISSION"] {
+            if variant == name || variant == "dry" {
+                constants.insert(format!("TRACE_{name}"), 0.);
+            }
+        }
+        let spirv =
+            shader_constants(&source, ShaderStage::Compute, "render_hybrid", &constants).unwrap();
+        assert!(spirv.len() > 64, "{variant}");
     }
 }
