@@ -1589,10 +1589,10 @@ impl Lighter {
     /// Write an error/fallback to stderr and (if logging is on) to the log file.
     pub(crate) fn log_error(&mut self, stage: &str, reason: &str) {
         eprintln!("Lighter: {stage}: {reason}");
-        self.logger.write(&log::LogEntry::Error {
+        self.logger.write(&log::LogEntry::Error(log::ErrorEvent {
             stage: stage.to_string(),
             reason: reason.to_string(),
-        });
+        }));
         self.status_line = Some(format!("{stage}: {reason}"));
     }
 
