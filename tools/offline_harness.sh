@@ -1072,6 +1072,22 @@ pub mod skeleton_pose;
 pub mod skin;
 #[path = "$REPO/src/skin_pose.rs"]
 pub mod skin_pose;
+// The walker's audio module is compiled only by the viewer binary in CI, so
+// its tests never ran anywhere: one of them had been asserting the wrong event
+// id since it was written, and nothing said so. It needs music, pck and the
+// class catalog, all of which this gate already has.
+#[path = "$REPO/src/music.rs"]
+pub mod music;
+pub mod modules {
+    pub mod designer {
+        #[path = "$REPO/src/modules/designer/catalog.rs"]
+        pub mod catalog;
+    }
+    pub mod walker {
+        #[path = "$REPO/src/modules/walker/audio.rs"]
+        pub mod audio;
+    }
+}
 EOF
         "$RUSTC" --test --crate-name playertest --edition 2021 --sysroot "$SYSROOT" \
             -C opt-level=1 -L "$OUT" --extern glam="$OUT/libglam.rlib" \

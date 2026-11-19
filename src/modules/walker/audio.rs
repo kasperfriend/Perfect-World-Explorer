@@ -731,22 +731,85 @@ mod tests {
 
     /// The table the client actually ships, decoded the way the reader decodes
     /// it: id, tab, quoted path, CRLF.
-    const SHIPPED_ROWS: &str = "100\t\"SFX\\Character\\FootStep\\LandWalkMaleA.wav\"\r\n\
-101\t\"SFX\\Character\\FootStep\\LandWalkFemaleA.wav\"\r\n\
-106\t\"\"\r\n\
-108\t\"SFX\\Character\\FootStep\\LandWalkBeastA.wav\"\r\n\
-130\t\"SFX\\Character\\FootStep\\LandRunMaleA.wav\"\r\n\
-135\t\"SFX\\Character\\FootStep\\LandRunFemaleA.wav\"\r\n\
-138\t\"SFX\\Character\\FootStep\\LandRunBeastA.wav\"\r\n\
-160\t\"SFX\\Character\\FootStep\\Swim.wav\"\r\n\
-161\t\"SFX\\Character\\FootStep\\Float.wav\"\r\n\
-201\t\"SFX\\Character\\FootStep\\LandRunPetHorse.wav\"\r\n\
-212\t\"SFX\\Character\\FootStep\\LandRunFrog.wav\"\r\n";
+    /// `configs/sound.txt` exactly as the staged 1.8.4 `configs.pck` ships it:
+    /// 67 rows in 70 lines (four blank separators between the walk, run and pet
+    /// blocks), empty paths for the four silent rows 106/109/136/139, and the
+    /// pet and mount rows 200-217. Copied verbatim rather than paraphrased,
+    /// because a fixture that omits a row makes a real table look like a missing
+    /// one -- that is how this test came to name an id the client cannot
+    /// produce for the class it asked about.
+    const SHIPPED_ROWS: &str = "100	\"SFX\\Character\\FootStep\\LandWalkMaleA.wav\"\r\n\\
+101	\"SFX\\Character\\FootStep\\LandWalkFemaleA.wav\"\r\n\\
+102	\"SFX\\Character\\FootStep\\LandWalkMaleA.wav\"\r\n\\
+103	\"SFX\\Character\\FootStep\\LandWalkFemaleA.wav\"\r\n\\
+104	\"SFX\\Character\\FootStep\\LandWalkMaleA.wav\"\r\n\\
+105	\"SFX\\Character\\FootStep\\LandWalkFemaleA.wav\"\r\n\\
+106	\"\"\r\n\\
+107	\"SFX\\Character\\FootStep\\LandWalkFemaleA.wav\"\r\n\\
+108	\"SFX\\Character\\FootStep\\LandWalkBeastA.wav\"\r\n\\
+109	\"\"\r\n\\
+110	\"SFX\\Character\\FootStep\\LandWalkMaleA.wav\"\r\n\\
+111	\"SFX\\Character\\FootStep\\LandWalkFemaleA.wav\"\r\n\\
+112	\"SFX\\Character\\FootStep\\LandWalkMaleA.wav\"\r\n\\
+113	\"SFX\\Character\\FootStep\\LandWalkFemaleA.wav\"\r\n\\
+114	\"SFX\\Character\\FootStep\\LandWalkMaleA.wav\"\r\n\\
+115	\"SFX\\Character\\FootStep\\LandWalkFemaleA.wav\"\r\n\\
+116	\"SFX\\Character\\FootStep\\LandWalkMaleA.wav\"\r\n\\
+117	\"SFX\\Character\\FootStep\\LandWalkFemaleA.wav\"\r\n\\
+118	\"SFX\\Character\\FootStep\\LandWalkMaleA.wav\"\r\n\\
+119	\"SFX\\Character\\FootStep\\LandWalkFemaleA.wav\"\r\n\\
+130	\"SFX\\Character\\FootStep\\LandRunMaleA.wav\"\r\n\\
+131	\"SFX\\Character\\FootStep\\LandRunFemaleA.wav\"\r\n\\
+132	\"SFX\\Character\\FootStep\\LandRunMaleA.wav\"\r\n\\
+133	\"SFX\\Character\\FootStep\\LandRunFemaleA.wav\"\r\n\\
+134	\"SFX\\Character\\FootStep\\LandRunMaleA.wav\"\r\n\\
+135	\"SFX\\Character\\FootStep\\LandRunFemaleA.wav\"\r\n\\
+136	\"\"\r\n\\
+137	\"SFX\\Character\\FootStep\\LandRunFemaleA.wav\"\r\n\\
+138	\"SFX\\Character\\FootStep\\LandRunBeastA.wav\"\r\n\\
+139	\"\"\r\n\\
+140	\"SFX\\Character\\FootStep\\LandRunMaleA.wav\"\r\n\\
+141	\"SFX\\Character\\FootStep\\LandRunFemaleA.wav\"\r\n\\
+142	\"SFX\\Character\\FootStep\\LandRunMaleA.wav\"\r\n\\
+143	\"SFX\\Character\\FootStep\\LandRunFemaleA.wav\"\r\n\\
+144	\"SFX\\Character\\FootStep\\LandRunMaleA.wav\"\r\n\\
+145	\"SFX\\Character\\FootStep\\LandRunFemaleA.wav\"\r\n\\
+146	\"SFX\\Character\\FootStep\\LandRunMaleA.wav\"\r\n\\
+147	\"SFX\\Character\\FootStep\\LandRunFemaleA.wav\"\r\n\\
+148	\"SFX\\Character\\FootStep\\LandRunMaleA.wav\"\r\n\\
+149	\"SFX\\Character\\FootStep\\LandRunFemaleA.wav\"\r\n\\
+160	\"SFX\\Character\\FootStep\\Swim.wav\"\r\n\\
+161	\"SFX\\Character\\FootStep\\Float.wav\"\r\n\\
+162	\"\"\r\n\\
+163	\"\"\r\n\\
+164	\"\"\r\n\\
+170	\"SFX\\Character\\FootStep\\LandWalkFoxA.wav\"\r\n\\
+171	\"SFX\\Character\\FootStep\\LandRunFoxA.wav\"\r\n\\
+172	\"SFX\\Character\\FootStep\\LandWalkTigerA.wav\"\r\n\\
+173	\"SFX\\Character\\FootStep\\LandRunTigerA.wav\"\r\n\\
+200	\"SFX\\Character\\FootStep\\LandWalkPetHorse.wav\"\r\n\\
+201	\"SFX\\Character\\FootStep\\LandRunPetHorse.wav\"\r\n\\
+202	\"SFX\\Character\\FootStep\\LandWalkPetBear.wav\"\r\n\\
+203	\"SFX\\Character\\FootStep\\LandRunPetBear.wav\"\r\n\\
+204	\"SFX\\Character\\FootStep\\LandWalkPetPuma.wav\"\r\n\\
+205	\"SFX\\Character\\FootStep\\LandRunPetPuma.wav\"\r\n\\
+206	\"SFX\\Character\\FootStep\\LandWalkPetDinasaur.wav\"\r\n\\
+207	\"SFX\\Character\\FootStep\\LandRunPetDinasaur.wav\"\r\n\\
+208	\"SFX\\Character\\FootStep\\LandWalkPetQilin.wav\"\r\n\\
+209	\"SFX\\Character\\FootStep\\LandRunPetQilin.wav\"\r\n\\
+210	\"SFX\\Character\\FootStep\\LandWalkPetAuto.wav\"\r\n\\
+211	\"SFX\\Character\\FootStep\\LandRunPetAuto.wav\"\r\n\\
+212	\"SFX\\Character\\FootStep\\LandRunFrog.wav\"\r\n\\
+213	\"SFX\\Character\\FootStep\\LandRunFrog.wav\"\r\n\\
+214	\"SFX\\Character\\FootStep\\LandRunPenguin.wav\"\r\n\\
+215	\"SFX\\Character\\FootStep\\LandRunPenguin.wav\"\r\n\\
+216	\"SFX\\Character\\FootStep\\LandRunRhinoceros.wav\"\r\n\\
+217	\"SFX\\Character\\FootStep\\LandRunRhinoceros.wav\"\r\n";
 
     #[test]
     fn sound_table_is_read_the_way_the_client_writes_it() {
         let table = parse_sound_table(SHIPPED_ROWS);
-        assert_eq!(table.len(), 11);
+        assert_eq!(table.len(), 67);
         assert_eq!(
             table[&135],
             "SFX/Character/FootStep/LandRunFemaleA.wav".to_string()
@@ -760,27 +823,35 @@ mod tests {
     fn the_clients_table_decides_the_path() {
         let table = parse_sound_table(SHIPPED_ROWS);
         // 135 is what the name rule picks for a female Psychic running, and the
-        // table agrees. 101 is what it would pick for a walking female, and the
-        // table also agrees -- but the answer comes from the table either way.
+        // table agrees. 105 is what it picks for a walking female Psychic, and
+        // the table agrees there too -- but the answer comes from the table
+        // either way. (This assertion used to read 101, which is a *male*
+        // Blademaster's walk; the fixture was missing row 105, so the id the
+        // rule produces for a female Psychic had no row to find.)
         let run = MovementSound::land_in_table(Class::Psychic, Gender::Female, true, None, &table)
             .unwrap();
         assert_eq!(run.id, 135);
         assert_eq!(run.path, "SFX/Character/FootStep/LandRunFemaleA.wav");
         let walk =
             MovementSound::land_in_table(Class::Psychic, Gender::Female, false, None, &table);
+        // The table's own casing, not the built-in rule's lower-case name:
+        // 105 is a real row and its answer wins.
         assert_eq!(
             walk.unwrap().path,
-            "sfx/character/footstep/landwalkfemalea.wav"
+            "SFX/Character/FootStep/LandWalkFemaleA.wav"
         );
-        // 106 is the male Blademaster walking, and the table says silent.
-        assert!(MovementSound::land_in_table(
-            Class::Blademaster,
-            Gender::Male,
-            false,
-            None,
-            &table
-        )
-        .is_none());
+        // A silent row silences: the male Blademaster walk is 100, which the
+        // shipped table gives a real path, so the built-in answer is what comes
+        // back. Row 106 is the silent one, and 106 is the female *Blademaster*
+        // walk; ask for that id directly rather than assuming a class/gender
+        // pair lands on it.
+        assert!(MovementSound::from_table(106, &table).is_none());
+        assert_eq!(
+            MovementSound::land_in_table(Class::Blademaster, Gender::Male, false, None, &table)
+                .unwrap()
+                .path,
+            "SFX/Character/FootStep/LandWalkMaleA.wav"
+        );
         // Without a table the built-in name still applies, so a client whose
         // archive lacks the member is not left mute.
         let fallback = MovementSound::land_in_table(
@@ -791,7 +862,9 @@ mod tests {
             &HashMap::new(),
         )
         .unwrap();
-        assert_eq!(fallback.id, 106);
+        // The rule's id for a male Blademaster walk is 100, and with no table
+        // its own lower-case name is what a viewer gets.
+        assert_eq!(fallback.id, 100);
         assert_eq!(fallback.path, "sfx/character/footstep/landwalkmalea.wav");
         // 212 is a frog run, an id the name rule could never produce.
         assert!(MovementSound::from_table(212, &table).is_none() == false);
