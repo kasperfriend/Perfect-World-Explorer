@@ -9031,7 +9031,8 @@ fn preview_frame_using(
             &std::fs::read_to_string(file).map_err(|e| e.to_string())?,
         )?;
         plan.preview_path(&t.map.id, cam.time_of_day, warmup)?;
-        let block = |[x, _, z, _, _]| camera_block(t.width, t.height, t.grid_spacing, [x, z]);
+        let block =
+            |[x, _, z, _, _]: [f32; 5]| camera_block(t.width, t.height, t.grid_spacing, [x, z]);
         if plan.pose(warmup) != final_pose
             || (0..warmup).any(|i| block(plan.pose(i)) != block(final_pose))
         {
