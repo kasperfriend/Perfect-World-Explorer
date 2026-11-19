@@ -739,12 +739,39 @@ jobs:
             $file = Get-ChildItem -LiteralPath artifact -Recurse -File -Filter $name | Select-Object -First 1
             if ($file) { Copy-Item -LiteralPath $file.FullName -Destination $kit }
           }
+          # Preserve redistribution notices for optional DirectStorage DLLs.
+          $notices = Get-ChildItem -LiteralPath artifact -Recurse -Directory -Filter 'DirectStorage' | Select-Object -First 1
+          if ($notices) { Copy-Item -LiteralPath $notices.FullName -Destination $kit -Recurse }
           $files = [ordered]@{}
           Get-ChildItem -LiteralPath $kit -File | Sort-Object Name | ForEach-Object {
             $files[$_.Name] = (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash.ToLowerInvariant()
           }
           @{ schema = 1; source_commit = (git rev-parse HEAD); run_id = $env:GITHUB_RUN_ID; files = $files } |
             ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8NoBOM -LiteralPath "$kit/build.json"
+      - name: Exercise performance runner preflight and failed-bundle packaging
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kit = Join-Path $env:RUNNER_TEMP 'Lighter-Windows-Perf-Kit'
+          $temp = Join-Path $env:RUNNER_TEMP 'Lighter-preflight-fixture'
+          $client = Join-Path $temp 'empty-client'
+          $out = Join-Path $temp 'output'
+          New-Item -ItemType Directory -Path $client, $out -Force | Out-Null
+          try {
+            & "$kit/run-perf-session.ps1" -ClientRoot $client -OutputDirectory $out -StartupOnly
+            throw 'Missing client was unexpectedly admitted.'
+          } catch {
+            if ($_.Exception.Message -notmatch 'Missing retail file: elementclient.exe') { throw }
+          }
+          $archive = Get-ChildItem -LiteralPath $out -Filter '*.zip' -File -Recurse | Select-Object -First 1
+          if (-not $archive) { throw 'No failed-preflight archive.' }
+          $raw = Join-Path $temp 'check'
+          Expand-Archive -LiteralPath $archive.FullName -DestinationPath $raw
+          $manifest = Get-Content -LiteralPath "$raw/session.json" -Raw | ConvertFrom-Json
+          if ($manifest.prerequisites_ok -or $manifest.build.source_commit -ne (git rev-parse HEAD)) { throw 'Incorrect failed-preflight provenance.' }
+          foreach ($file in 'session.json','SUMMARY.txt','SHA256SUMS.json') {
+            if (-not (Test-Path -LiteralPath "$raw/$file" -PathType Leaf)) { throw "Missing $file" }
+          }
       - name: Upload the Windows Lighter performance kit (no vendor SDKs)
         uses: actions/upload-artifact@v4
         with:

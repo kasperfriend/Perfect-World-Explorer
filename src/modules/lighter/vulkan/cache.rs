@@ -40,6 +40,16 @@ impl PipelineCache {
                         .join(format!("{vendor:04x}-{id:04x}-{key}.bin"))
                 })
         };
+        Self::open(device, vendor, id, uuid, path).0
+    }
+
+    fn open(
+        device: &ash::Device,
+        vendor: u32,
+        id: u32,
+        uuid: [u8; 16],
+        path: Option<PathBuf>,
+    ) -> (Self, bool) {
         let mut data = Vec::new();
         if let Some(file) = path.as_ref().and_then(|p| std::fs::File::open(p).ok()) {
             if file.take(LIMIT + 1).read_to_end(&mut data).is_err()
@@ -48,6 +58,7 @@ impl PipelineCache {
                 data.clear();
             }
         }
+        let mut loaded = false;
         unsafe {
             let handle = device
                 .create_pipeline_cache(
@@ -57,6 +68,7 @@ impl PipelineCache {
                 .map(|handle| {
                     if !data.is_empty() {
                         eprintln!("Lighter Vulkan pipeline cache: loaded {} bytes", data.len());
+                        loaded = true;
                     }
                     handle
                 })
@@ -64,11 +76,14 @@ impl PipelineCache {
                     device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
                 })
                 .unwrap_or_default();
-            Self {
-                handle,
-                path,
-                device: device.clone(),
-            }
+            (
+                Self {
+                    handle,
+                    path,
+                    device: device.clone(),
+                },
+                loaded,
+            )
         }
     }
 
@@ -117,5 +132,61 @@ mod tests {
         assert!(!compatible(&bytes, 0x1002, 123, uuid));
         assert!(!compatible(&bytes, 0x10de, 123, [0; 16]));
         assert!(!compatible(&bytes[..28], 0x10de, 123, uuid));
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan ICD; does not compile a pipeline"]
+    fn lighter_pipeline_cache_disk_round_trip() {
+        let root = std::env::temp_dir().join(format!(
+            "pwe-lighter-cache-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        let path = root.join("cache.bin");
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..Default::default()
+        });
+        // Distinct device lifetimes; the second context takes its bytes from disk.
+        for warm in [false, true] {
+            let adapter =
+                pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
+            let (device, _) =
+                pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+            unsafe {
+                device.as_hal::<wgpu::hal::api::Vulkan, _, _>(|hal| {
+                    let hal = hal.expect("Vulkan device");
+                    let id = hal
+                        .shared_instance()
+                        .raw_instance()
+                        .get_physical_device_properties(hal.raw_physical_device());
+                    let (cache, loaded) = PipelineCache::open(
+                        hal.raw_device(),
+                        id.vendor_id,
+                        id.device_id,
+                        id.pipeline_cache_uuid,
+                        Some(path.clone()),
+                    );
+                    assert_ne!(cache.handle, vk::PipelineCache::null());
+                    assert_eq!(loaded, warm);
+                    cache.save();
+                    assert!(compatible(
+                        &std::fs::read(&path).unwrap(),
+                        id.vendor_id,
+                        id.device_id,
+                        id.pipeline_cache_uuid
+                    ));
+                });
+            }
+        }
+        eprintln!("S Vulkan cache saved and reopened across two device lifetimes (no pipeline speedup measured)");
     }
 }

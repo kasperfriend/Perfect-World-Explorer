@@ -181,6 +181,7 @@ function Invoke-Run {
         LOCALAPPDATA = (Join-Path $data 'local'); APPDATA = (Join-Path $data 'roaming'); ProgramData = (Join-Path $data 'program-data')
         TEMP = (Join-Path $data 'temp'); TMP = (Join-Path $data 'temp'); PW_CACHE_DIR = $cache
         PW_MODULES_DIR = (Join-Path $scratch 'Modules'); WGPU_BACKEND = $Backend; WGPU_POWER_PREF = 'high'
+        WGPU_ADAPTER_NAME = 'NVIDIA GeForce RTX 3080'
         PW_RAY_RECONSTRUCTION = $(if ($pass) { $Provider } else { 'off' })
     }
     # Input files are copied for provenance/read-only use. Missing or unpinned
@@ -464,6 +465,9 @@ try {
     Write-Host 'Waiting 60 seconds before the second Hardware start…'
     Start-Sleep -Seconds 60
     $second = Invoke-Run -Id hardware-2 -Kind startup -Provider $StartupProvider -BaselineStartup
+    if ($StartupProvider -eq 'portable' -and ($first.result -ne 'completed' -or $second.result -ne 'completed')) {
+        $summary.Add('Skipped SDK bisection: neither baseline launch requested an SDK. Re-run on the originally failing SDK route if applicable.')
+    }
     if ($StartupProvider -ne 'portable' -and $sdkReady[$StartupProvider] -and
         ($first.result -ne 'completed' -or $second.result -ne 'completed')) {
         $loader = if ($StartupProvider -eq 'rr') { 'ngx-loader' } else { 'ffx-loader' }

@@ -6431,12 +6431,18 @@ fn run_viewer(
                                     config.width, config.height, renderer.lighter.reconstruction_status().unwrap_or("portable"), adapter.get_info());
                             }
                             if handoff_child { crate::world_handoff::signal_ready(); }
-                            if perf_start_only {
-                                if (config.width, config.height) != (2560, 1440) {
-                                    run_error = Some("first present did not use the 2560x1440 capture surface".into());
+                            if perf_capture {
+                                let actual = renderer.lighter.reconstruction_status();
+                                let bad_route = drawn_mode != lighter_settings.mode;
+                                let bad_provider = travel.as_mut().is_some_and(|flight| !flight.check_provider(actual));
+                                if (config.width, config.height) != (2560, 1440) || bad_route || bad_provider {
+                                    run_error = Some("first present did not use the requested 2560x1440 renderer/provider".into());
                                 }
-                                target.set_control_flow(winit::event_loop::ControlFlow::Poll);
-                                target.exit();
+                                if perf_start_only || run_error.is_some() {
+                                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                                    target.exit();
+                                    return;
+                                }
                             }
                             #[cfg(test)]
                             if smoke_dir.is_some() && smoke_travel.is_none() {
