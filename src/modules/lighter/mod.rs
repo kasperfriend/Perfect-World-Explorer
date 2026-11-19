@@ -2397,8 +2397,10 @@ impl Lighter {
                     };
                     match d.unavailable_reason() {
                         Some(reason) => {
-                            ui.add(egui::Label::new(egui::RichText::new(text).color(egui::Color32::GRAY)))
-                                .on_hover_text(reason);
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(text).color(egui::Color32::GRAY),
+                            ))
+                            .on_hover_text(reason);
                         }
                         None => {
                             ui.selectable_value(&mut self.settings.denoiser, d, text)
