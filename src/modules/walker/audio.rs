@@ -840,11 +840,11 @@ mod tests {
             walk.unwrap().path,
             "SFX/Character/FootStep/LandWalkFemaleA.wav"
         );
-        // A silent row silences: the male Blademaster walk is 100, which the
-        // shipped table gives a real path, so the built-in answer is what comes
-        // back. Row 106 is the silent one, and 106 is the female *Blademaster*
-        // walk; ask for that id directly rather than assuming a class/gender
-        // pair lands on it.
+        // A silent row silences. 106 is a silent row and the rule's id for a
+        // male Venomancer walk; ask for that id directly rather than assuming a
+        // class/gender pair lands on it. (100 is the male Blademaster walk, and
+        // the shipped table gives it a real path, so that lookup answers from
+        // the table -- which is the case just above.)
         assert!(MovementSound::from_table(106, &table).is_none());
         assert_eq!(
             MovementSound::land_in_table(Class::Blademaster, Gender::Male, false, None, &table)
@@ -866,6 +866,34 @@ mod tests {
         // its own lower-case name is what a viewer gets.
         assert_eq!(fallback.id, 100);
         assert_eq!(fallback.path, "sfx/character/footstep/landwalkmalea.wav");
+        // Swim and float are rows 160 and 161 in the shipped table, spelled the
+        // way the table spells them rather than the way `water()` builds them.
+        assert_eq!(
+            MovementSound::water_in_table(true, &table).unwrap().path,
+            "SFX/Character/FootStep/Swim.wav"
+        );
+        assert_eq!(
+            MovementSound::water_in_table(false, &table).unwrap().path,
+            "SFX/Character/FootStep/Float.wav"
+        );
+        // A mount pair is `200 + kind*2 + running`, and every one of the five
+        // kinds is a row; 210/211 are the generic pair the rule cannot name.
+        for (kind, stem) in [
+            (0u32, "PetHorse"),
+            (1, "PetBear"),
+            (2, "PetPuma"),
+            (3, "PetDinasaur"),
+            (4, "PetQilin"),
+        ] {
+            let mounted =
+                MovementSound::land_in_table(Class::Psychic, Gender::Female, true, Some(kind), &table)
+                    .unwrap();
+            assert_eq!(mounted.id, 200 + kind as u16 * 2 + 1);
+            assert_eq!(
+                mounted.path,
+                format!("SFX/Character/FootStep/LandRun{stem}.wav")
+            );
+        }
         // 212 is a frog run, an id the name rule could never produce.
         assert!(MovementSound::from_table(212, &table).is_none() == false);
         assert_eq!(
