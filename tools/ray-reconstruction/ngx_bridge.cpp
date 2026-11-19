@@ -7,6 +7,7 @@
 #include <codecvt>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <locale>
 #include <memory>
@@ -135,6 +136,8 @@ PWE_API uint32_t pwe_rr_open(VkInstance instance, VkPhysicalDevice physical, VkD
     if (!query) return NVSDK_NGX_Result_FAIL_OutOfDate;
     const auto optimal = reinterpret_cast<PFN_NVSDK_NGX_DLSS_GetOptimalSettingsCallback>(query);
     bool matched = false;
+    struct Optimal { int tier; uint32_t status, w, h; } tried[5]{};
+    size_t attempts = 0;
     // Query an exact supported size. RR does not support dynamic resolution.
     for (const auto tier : {NVSDK_NGX_PerfQuality_Value_DLAA, NVSDK_NGX_PerfQuality_Value_MaxQuality,
             NVSDK_NGX_PerfQuality_Value_Balanced, NVSDK_NGX_PerfQuality_Value_MaxPerf,
@@ -145,17 +148,27 @@ PWE_API uint32_t pwe_rr_open(VkInstance instance, VkPhysicalDevice physical, VkD
         NVSDK_NGX_Parameter_SetI(p, NVSDK_NGX_Parameter_PerfQualityValue, tier);
         NVSDK_NGX_Parameter_SetI(p, NVSDK_NGX_Parameter_RTXValue, 0);
         unsigned int w = 0, h = 0;
-        if (NVSDK_NGX_SUCCEED(optimal(p))) {
+        const auto status = optimal(p);
+        if (NVSDK_NGX_SUCCEED(status)) {
             NVSDK_NGX_Parameter_GetUI(p, NVSDK_NGX_Parameter_OutWidth, &w);
             NVSDK_NGX_Parameter_GetUI(p, NVSDK_NGX_Parameter_OutHeight, &h);
         }
+        tried[attempts++] = {static_cast<int>(tier), static_cast<uint32_t>(status), w, h};
         if (w == extent[0] && h == extent[1]) {
             ctx->create.InPerfQualityValue = tier;
             matched = true;
             break;
         }
     }
-    if (!matched) return fail;
+    if (!matched) {
+        std::fprintf(stderr, "DLSSD: %ux%u -> %ux%u rejected; no exact optimal input reported\n",
+            extent[0], extent[1], extent[2], extent[3]);
+        for (size_t i = 0; i < attempts; ++i) {
+            const auto& t = tried[i];
+            std::fprintf(stderr, "DLSSD: tier %d optimal %ux%u, callback 0x%08x\n", t.tier, t.w, t.h, t.status);
+        }
+        return fail;
+    }
     ctx->create.InDenoiseMode = NVSDK_NGX_DLSS_Denoise_Mode_DLUnified;
     ctx->create.InRoughnessMode = NVSDK_NGX_DLSS_Roughness_Mode_Packed;
     ctx->create.InUseHWDepth = NVSDK_NGX_DLSS_Depth_Type_HW;

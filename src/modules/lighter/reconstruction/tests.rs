@@ -599,13 +599,21 @@ fn lighter_temporal_vendor_dispatch() {
         world(mode),
         super::super::textures::Textures::default(),
     )));
-    h.ray.settings.resolution = 50;
+    h.ray.settings.resolution = match std::env::var("PW_TEST_RAY_RESOLUTION").as_deref() {
+        Ok("100") => 100,
+        Ok("50") | Err(std::env::VarError::NotPresent) => 50,
+        _ => panic!("PW_TEST_RAY_RESOLUTION must be 50 or 100"),
+    };
     let p0 = moving(mode, false);
     let p1 = moving(mode, true);
     for side in [512, 640] {
         let (cut, changed) = camera(-Vec3::Z * 20., side);
         h.pixels_with_camera(cut, &p0, Some(changed));
-        assert!(epoch(&h).last_reset, "first draw at each extent must reset");
+        require_dispatch(h.ray.reconstruction_status(), label).unwrap();
+        let first = epoch(&h);
+        let render = side * h.ray.settings.resolution / 100;
+        assert_eq!(first.extent, [render, render, side, side]);
+        assert!(first.last_reset, "first draw at each extent must reset");
         for i in 0..12 {
             let (frame, lens) = camera(Vec3::X * (i as f32 * 0.013), side);
             let packet = if i < 6 { &p0 } else { &p1 };

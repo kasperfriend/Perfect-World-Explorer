@@ -756,6 +756,15 @@ impl Session {
         if self.extent_ready(extent) || self.rejected == Some(extent) {
             return Ok(true);
         }
+        if let Some(old) = &self.epoch {
+            debug_assert!(!old.commands.pending);
+            eprintln!(
+                "Lighter: {} retiring {:?} after the prior submission fence before resize to {:?}",
+                self.request.label(),
+                old.extent,
+                extent
+            );
+        }
         self.epoch = None;
         self.reset();
         let [rw, rh, w, h] = extent;
