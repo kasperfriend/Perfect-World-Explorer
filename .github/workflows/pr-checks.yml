@@ -5,6 +5,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+# Baseline probe only: this workflow copy runs from main as published so its
+# step results describe the untouched tree. It is not part of the change.
 
 permissions:
   contents: read
