@@ -217,6 +217,47 @@ fn string(b: &[u8], p: &mut usize) -> Result<String, String> {
         s.into_owned()
     })
 }
+/// The EC-BSD header word that has stayed put, and the version this reader's
+/// record layout was measured on.
+///
+/// `MOXB`/`FDSB` (little-endian `0x42584f4d` / `0x42534446`) identify the file;
+/// the third word is its revision. The revision has moved -- 1.5.2's world
+/// writes 12 and 1.8.4's writes 18 -- while everything below the header stayed
+/// byte-identical, which the two shipped maps prove rather than suggest:
+///
+/// | client | EC-BSD | ECWLD | ornament refs readable | water refs |
+/// |---|---|---|---|---|
+/// | 1.5.2 | 12 | 12 | 22,981 of 22,981 | 111 of 111 |
+/// | 1.8.4 | 18 | 17 | 23,068 of 23,068 | 111 of 111 |
+///
+/// Both files keep the name table at `+0x4c` with the same `u32 length` framing,
+/// and both end it at exactly the same offset, so the revision word gates
+/// nothing this reader touches. Refusing a revision other than 12 turned 1.8.4's
+/// map into "unsupported EC-BSD header" and, through the viewer's fallback,
+/// into a box that gave the user no map at all.
+///
+/// The revision is still read and reported, because a future layout change has
+/// to start somewhere; it just is not a reason to abandon a map whose records
+/// parse.
+pub const ECBSD_VERSION: u32 = 12;
+pub const ECBSD_IDENTITY: (u32, u32) = (0x42584f4d, 0x42534446);
+
+/// Validate an EC-BSD's identity and revision.
+///
+/// Pass the revision only when the caller needs to know it; a file whose
+/// revision is below [`ECBSD_VERSION`] is still read, because nothing in the
+/// record layout below depends on the revision having reached it.
+pub fn ecbsd_header(b: &[u8]) -> Result<u32, String> {
+    let identity = (u32at(b, 0)?, u32at(b, 4)?);
+    if identity != ECBSD_IDENTITY {
+        return Err(format!(
+            "this is not an EC-BSD file: it starts with {:#010x} {:#010x}",
+            identity.0, identity.1
+        ));
+    }
+    u32at(b, 8)
+}
+
 fn vec3(b: &[u8], p: usize) -> Result<[f32; 3], String> {
     Ok([f32at(b, p)?, f32at(b, p + 4)?, f32at(b, p + 8)?])
 }
@@ -493,9 +534,7 @@ impl Scene {
     /// Blocks can refer to the same export ID, so each instance is returned once.
     pub fn load_ornaments(&self, path: &Path) -> Result<Vec<Ornament>, String> {
         let b = fs::read(path).map_err(|e| e.to_string())?;
-        if u32at(&b, 0)? != 0x42584f4d || u32at(&b, 4)? != 0x42534446 || u32at(&b, 8)? != 12 {
-            return Err("unsupported EC-BSD header".into());
-        }
+        ecbsd_header(&b)?;
         let map_id = map_id_from_ecbsd_path(path);
         let mut seen = std::collections::HashMap::<u32, u32>::new();
         let mut result = Vec::new();
@@ -538,6 +577,70 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Both shipped client revisions' EC-BSD files are the same layout.
+    ///
+    /// This is the test that keeps the version gate honest. The revision word
+    /// moved (1.5.2 writes 12, 1.8.4 writes 18) while nothing below the header
+    /// changed, so the reader must not refuse either one. These are the real
+    /// files, staged in `google_drive/`; where they are absent the test says so
+    /// rather than passing quietly.
+    #[test]
+    fn both_ecbsd_revisions_share_one_layout() {
+        // The corpus lives at `google_drive/` beside the repository, which is
+        // the working directory under both Cargo and the offline harness.
+        let root = Path::new("google_drive");
+        let cases = [
+            (
+                "ecbsd/world-1.5.2.ecbsd",
+                "worlds/world-1.5.2.ecwld",
+                12u32,
+                12u32,
+                22981,
+            ),
+            (
+                "ecbsd/world-1.8.4.ecbsd",
+                "scenecorpus/world-2.85M.ecwld",
+                18,
+                17,
+                23068,
+            ),
+        ];
+        let mut checked = 0;
+        for (ecbsd, ecwld, want_ecbsd, want_ecwld, want_ornaments) in cases {
+            let (ecbsd_path, ecwld_path) = (root.join(ecbsd), root.join(ecwld));
+            let (Ok(bytes), Ok(world)) = (std::fs::read(&ecbsd_path), std::fs::read(&ecwld_path))
+            else {
+                println!("SKIPPED: {} or {} is not staged", ecbsd, ecwld);
+                continue;
+            };
+            // The header check accepts the revision and reports it.
+            let revision = ecbsd_header(&bytes).expect("an EC-BSD this build reads");
+            assert_eq!(revision, want_ecbsd, "{ecbsd}: revision");
+            let scene = Scene::parse(&world).expect("the paired world file parses");
+            assert_eq!(
+                u32at(&world, 4).unwrap(),
+                want_ecwld,
+                "{ecwld}: ECWLD revision"
+            );
+            // Every ornament reference in that world resolves to a record in
+            // this EC-BSD: a BMD path, a finite position and no other payload.
+            let ornaments = scene
+                .load_ornaments(&ecbsd_path)
+                .unwrap_or_else(|e| panic!("{ecbsd}: {e}"));
+            assert_eq!(ornaments.len(), want_ornaments, "{ecbsd}: ornament count");
+            assert!(
+                ornaments
+                    .iter()
+                    .all(|o| o.path.to_lowercase().ends_with(".bmd")),
+                "{ecbsd}: every ornament names a BMD"
+            );
+            checked += 1;
+        }
+        if checked == 0 {
+            println!("SKIPPED: no EC-BSD pair is staged");
+        }
+    }
+
     #[test]
     fn scenery_map_namespace_comes_from_the_map_ecbsd_filename() {
         assert_eq!(

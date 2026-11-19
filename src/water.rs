@@ -436,9 +436,9 @@ fn parse_shore_waves(b: &[u8], offset: usize) -> Result<(Vec<ShoreWave>, usize),
 }
 pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
     let b = fs::read(ecbsd_path(dir)).map_err(|e| e.to_string())?;
-    if u(&b, 0)? != 0x42584f4d || u(&b, 4)? != 0x42534446 || u(&b, 8)? != 12 {
-        return Err("unsupported EC-BSD header".into());
-    }
+    // One check owns the EC-BSD identity and revision, so water, scenery and
+    // grass cannot disagree about which revisions a map may carry.
+    crate::scene::ecbsd_header(&b)?;
     let count = u(&b, 12)? as usize;
     if count > 10000 {
         return Err("invalid BSData file count".into());

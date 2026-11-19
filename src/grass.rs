@@ -331,11 +331,11 @@ fn grass_names(
     if b.len() < 0x4c {
         return Err("the grass EC-BSD is shorter than its header");
     }
-    if u(b, 0).ok() != Some(0x42584f4d)
-        || u(b, 4).ok() != Some(0x42534446)
-        || u(b, 8).ok() != Some(12)
-    {
-        return Err("the grass EC-BSD header is not one this build reads");
+    // Same header check as the water and scenery readers: a revision other
+    // than 12 is read, not refused, because the layout below the header has
+    // not changed between the shipped revisions.
+    if crate::scene::ecbsd_header(b).is_err() {
+        return Err("the EC-BSD is not a placement file this build reads");
     }
     let n = u(b, 12).unwrap_or(0) as usize;
     if n > 10000 {

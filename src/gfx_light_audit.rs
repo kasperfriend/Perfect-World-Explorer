@@ -17,8 +17,11 @@ pub fn parse(text: &str) -> Result<Audit, String> {
         .and_then(|l| l.trim().strip_prefix("Version: "))
         .and_then(|s| s.parse::<u32>().ok())
         .ok_or("invalid GFX version")?;
-    if version == 0 || version > 79 {
-        return Err("unverified GFX version for light audit".into());
+    // No version cap. An audit is a dependency census over the `Key: value`
+    // lines, and `A3DGFXLight::Load` reads the same fourteen light lines at
+    // every version, so a 90 or 93 root audits exactly like a 33 one.
+    if version == 0 {
+        return Err("invalid GFX version for light audit".into());
     }
     let mut out = Audit {
         version,

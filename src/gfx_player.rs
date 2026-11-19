@@ -876,6 +876,8 @@ struct CtrlState {
     color_override: Option<u32>,
     path_override: Option<Vec3>,
     ramp: Option<ColorTrack>,
+    /// Version 81's `AlphaOnly` on the ramp that produced `ramp`.
+    ramp_alpha_only: bool,
     scale_ramp: Option<(f32, Vec<(f32, f32)>)>,
     path_points: Option<Vec<Vec3>>,
     path_direction: bool,
@@ -960,6 +962,7 @@ impl CtrlState {
             color_override: None,
             path_override: None,
             ramp: None,
+            ramp_alpha_only: false,
             scale_ramp: None,
             path_points: None,
             path_direction: false,
@@ -970,8 +973,13 @@ impl CtrlState {
     fn bind(&mut self, key: &KeyPoint) {
         for control in &key.controls {
             match &control.data {
-                ControlData::ColorRamp { original, stops } => {
+                ControlData::ColorRamp {
+                    original,
+                    stops,
+                    alpha_only,
+                } => {
                     self.ramp = color_track(control.start, control.end, *original, stops);
+                    self.ramp_alpha_only = *alpha_only;
                 }
                 ControlData::ScaleRamp { first, stops } => {
                     self.scale_ramp = Some((*first, stops.clone()));
@@ -1601,9 +1609,9 @@ impl Player {
                         .affectors
                         .iter()
                         .map(|control| match &control.data {
-                            ControlData::ColorRamp { original, stops } => {
-                                color_track(control.start, control.end, *original, stops)
-                            }
+                            ControlData::ColorRamp {
+                                original, stops, ..
+                            } => color_track(control.start, control.end, *original, stops),
                             _ => None,
                         })
                         .collect(),
@@ -2891,8 +2899,20 @@ fn apply_controls(state: &mut CtrlState, key: &KeyPoint, sampled: &Sampled, dt: 
                 // `ProcData.m_fTimeSpan * 1000` — the keypoint clock, with no
                 // StartTime subtraction (the Tick gate already decided that
                 // this controller is inside its window).
-                if let Some(track) = &state.ramp {
-                    state.color_override = track.sample(age);
+                if let (Some(track), Some(ramped)) =
+                    (&state.ramp, state.ramp.as_ref().and_then(|t| t.sample(age)))
+                {
+                    // Version 81's `AlphaOnly` keeps the colour the element is
+                    // showing and takes only the ramp's alpha, which is what
+                    // `A3DGFXCtrlColorChange::Process` does when the flag is
+                    // set: the RGB channels are preserved and only the top byte
+                    // is replaced by the table entry's.
+                    state.color_override = Some(if state.ramp_alpha_only {
+                        let base = state.color_override.unwrap_or(sampled.color);
+                        (base & 0x00FF_FFFF) | (ramped & 0xFF00_0000)
+                    } else {
+                        ramped
+                    });
                 }
             }
             ControlData::ScaleRamp { .. } => {
@@ -12555,10 +12575,22 @@ mod tests {
             .replace("Position: 1, 2, 3", "Position: 0, 0, 0")
     }
 
-    /// Version 79, the newest in the corpus and one of the twelve that reads
-    /// `GroundHeight`.
+    /// Version 79, the newest in the 1.4.2 corpus and one of the twelve that
+    /// reads `GroundHeight`.
     fn header79(elements: u32) -> String {
         header37(elements).replace("MOXTVersion: 37", "MOXTVersion: 79")
+    }
+
+    /// The header a version-93 client writes: `IsAngelica3` after `Version`,
+    /// `AccurateAABB` after `UseAABB`, `ShakeDamp` after `ShakeCam`, and the
+    /// 2D/physics lines that come after it. 1.5.2 ships 86, 90 and 93 roots, so
+    /// this is the shape a real map effect has there.
+    fn header93(elements: u32) -> String {
+        header37(elements)
+            .replace("MOXTVersion: 37", "MOXTVersion: 93\r\nIsAngelica3: 0")
+            .replace("Raytrace: 0", "Raytrace: 0\r\nFaceToViewer: 0")
+            .replace("UseAABB: 0", "UseAABB: 0\r\nAccurateAABB: 0")
+            .replace("ShakeCam: 0", "ShakeCam: 0\r\nShakeDamp: 0")
     }
 
     /// A trail (element 152) at version 79, where all five trail keys are read.
@@ -12847,6 +12879,33 @@ mod tests {
     /// `acos(up·normal)` through `_CIacos` at `0x892f06`, and the up vector is
     /// the global `0x6ea170` initialises to (0.0, 1.0, 0.0). Applying the result
     /// to +Y must therefore land on the normal itself.
+    /// A version-93 root must not merely parse: it must build a player and put
+    /// its quads on screen. 1.5.2's map draws buildings and terrain but showed
+    /// no effect newer than 1.4.2, and both halves of that pipeline — the file
+    /// reader and the light decoder — refused 90/93 roots by version.
+    #[test]
+    fn a_version_93_root_builds_a_player_and_draws_its_quads() {
+        let mut player = build(&(header93(1) + SPRITE));
+        assert!(
+            player.warnings().is_empty(),
+            "a clean 93 root warns: {:?}",
+            player.warnings()
+        );
+        step(&mut player, 16.);
+        assert!(
+            !player.quads().is_empty(),
+            "a version-93 sprite drew nothing"
+        );
+        // And the same root at 90, the other version 1.5.2 introduces.
+        let at_90 = header93(1).replace("MOXTVersion: 93", "MOXTVersion: 90");
+        let mut player = build(&(at_90 + SPRITE));
+        step(&mut player, 16.);
+        assert!(
+            !player.quads().is_empty(),
+            "a version-90 sprite drew nothing"
+        );
+    }
+
     #[test]
     fn ground_alignment_takes_world_up_onto_the_normal() {
         for degrees in [0f32, 0.5, 1., 2., 3., 4.9] {

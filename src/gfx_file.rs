@@ -66,17 +66,20 @@
 
 use glam::{Quat, Vec3};
 
-/// Highest `MOXTVersion` the viewer has measured evidence for: `cmp 0x4f` in
-/// the 1.4.2 root loader, whose content tops out at 79.
+/// The format ceiling, taken from the SDK rather than from any one client's
+/// content: `A3DGFXEx.cpp` writes `#define GFX_CUR_VERSION 103`, and its own
+/// history runs V2 through V101.
 ///
-/// This is **not** a gate. A newer client writes newer roots, and refusing them
-/// costs that client every effect that uses one: a 1.5.2 client ships version 90
-/// and 93 roots, and the old hard gate dropped all of them (the
-/// `GFX version 93 is newer than the client's 79` line in
-/// `effect-problems.log`). Every optional key is already version gated inside
-/// the element loaders, so a newer version is read with the newest known
-/// grammar and reported, exactly as `gfx_light` does.
-pub const MAX_VERSION: u32 = 79;
+/// 79 was previously believed to be the client's maximum because that is the
+/// newest `MOXTVersion` in the 1.4.2 archives. It was never a format limit, and
+/// treating it as one cost every newer client its effects: 1.5.2 ships version
+/// 90 and 93 roots, and both were refused (`GFX version 93 is newer than the
+/// client's 79` in `effect-problems.log`). The 1.8.4 archive goes further.
+///
+/// This is **not** a gate even now — a version above the ceiling is still read
+/// with the newest known grammar and reported once, because refusing it would
+/// only trade a misread root for no root at all.
+pub const MAX_VERSION: u32 = 103;
 
 /// One decoded `Key: value` line, in file order.
 pub type Field = (String, String);
@@ -321,6 +324,24 @@ pub struct Common {
     pub no_scale: [bool; 2],
     /// Two `OrgPt` values under the same key: the width and height anchors.
     pub origin: [f32; 2],
+    /// Version 91's pixel-shader block, read straight after `TexAnimMaxTime` by
+    /// `A3DGFXElement::LoadElementFromFile`. At version 95 and above the block
+    /// starts with its own `PSFileVersion` line and carries the loop count; from
+    /// 91 to 94 the same lines appear without the header. The parser removes
+    /// the block before the class readers run, so it is validated here and kept
+    /// only for information: the viewer renders no pixel shaders, and dropping
+    /// the keys instead would make a 91+ root unreadable.
+    pub pixel_shader: Option<PixelShader>,
+    /// Version 92's `CanDoFadeOut`, the last line of the element header.
+    pub can_fade_out: bool,
+}
+
+/// The version 91+ pixel-shader block. `constants` is opaque to the viewer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PixelShader {
+    pub path: String,
+    pub texture: String,
+    pub constants: usize,
 }
 
 impl Default for Common {
@@ -356,6 +377,8 @@ impl Default for Common {
             tex_anim_max_time: 0.,
             no_scale: [false; 2],
             origin: [0.5; 2],
+            pixel_shader: None,
+            can_fade_out: false,
         }
     }
 }
@@ -480,6 +503,10 @@ pub enum ControlData {
     ColorRamp {
         original: u32,
         stops: Vec<(u32, f32)>,
+        /// Version 81's `AlphaOnly`: the ramp drives alpha and leaves RGB
+        /// alone. `A3DGFXCtrlColorChange::Load` reads it as the last line of
+        /// the controller, after the stop table.
+        alpha_only: bool,
     },
     /// 110: path through space; `calc_dir` re-aims the element along it.
     Path { calc_dir: bool, points: Vec<Vec3> },
@@ -1300,7 +1327,7 @@ pub fn parse(source: &str) -> Result<Root, String> {
         // Not an error: a newer client is newer everywhere, and its roots use
         // the same container. Report it once per root and read on.
         eprintln!(
-            "gfx: version {version} is newer than the measured {MAX_VERSION}; reading it with the newest known grammar"
+            "gfx: version {version} is above the SDK's GFX_CUR_VERSION {MAX_VERSION}; reading it with the newest known grammar"
         );
     }
     if version < 24 {
@@ -1311,20 +1338,76 @@ pub fn parse(source: &str) -> Result<Root, String> {
             "GFX version {version} predates the effect container (client gate 24)"
         ));
     }
+    // Version 89 added a line the older container does not have: `A3DGFXEx.cpp`
+    // reads `IsAngelica3: %d` immediately after `Version:` when
+    // `m_dwVersion >= 89`, and refuses the file outright if it is set, because
+    // an Angelica-3 effect is a different container that this library must not
+    // read ("Try to load angelica 3 gfx using the angelica2 gfx library").
+    //
+    // Not reading the line was fatal for every effect newer than 1.4.2: 1.5.2
+    // ships 86, 90 and 93 roots, and each was rejected on its second line with
+    // "expected DedaultScale, found IsAngelica3". The version history in that
+    // same file runs to 103, so these are ordinary newer roots, not a format
+    // this reader must refuse.
+    if version >= 89 {
+        if let Some(value) = reader.take_if("IsAngelica3") {
+            if integer("IsAngelica3", &value)? != 0 {
+                return Err("this is an Angelica 3 effect, which is a different container".into());
+            }
+        }
+        // A 89+ root without the line is still read: the client would fall
+        // through to the next line, and so does this reader.
+    }
+    // The client reads the header as a *sequence of lines*, one per revision
+    // that added one (`A3DGFXEx::Load`), so the order below is the file order
+    // and not a key set: a version-93 root carries `AccurateAABB` between
+    // `UseAABB` and `ShakeCam` and `ShakeDamp` after the shake-camera block.
+    // Reading them out of order refused every root newer than version 83 on
+    // the line it did not expect, which is every effect in a client newer than
+    // 1.4.2.
+    let default_scale = reader.number("DedaultScale")?;
+    let play_speed = reader.number("PlaySpeed")?;
+    let default_alpha = reader.number("DefaultAlpha")?;
+    let raytrace = boolean("Raytrace", &reader.take("Raytrace")?)?;
+    let face_to_viewer = reader.flag("FaceToViewer", false)?;
+    let fade_by_dist = boolean("FadeByDist", &reader.take("FadeByDist")?)?;
+    let fade_start = reader.number("FadeStart")?;
+    let fade_end = reader.number("FadeEnd")?;
+    let aabb_center = reader.vector("Vec")?;
+    let aabb_half = reader.vector("Vec")?;
+    let use_aabb = reader.flag("UseAABB", false)?;
+    // Version 84: `m_bAccurateAABB` only selects whether the client builds the
+    // eight AABB vertices for its render-time cull. It changes no geometry, so
+    // it is consumed to keep the line order intact but not carried further.
+    // The client reads one line here whether or not it is this key, so a root
+    // below 84 that carries it would shift every later line: gated, not skipped.
+    let accurate_aabb = match reader.take_if("AccurateAABB") {
+        Some(value) => {
+            if version < 84 {
+                return Err(format!(
+                    "GFX version {version} carries AccurateAABB, which needs 84"
+                ));
+            }
+            boolean("AccurateAABB", &value)?
+        }
+        None => false,
+    };
+    let _ = accurate_aabb;
+    let shake_cam = clamp_u32(reader.integer("ShakeCam")?);
     let root = Root {
         version,
-        default_scale: reader.number("DedaultScale")?,
-        play_speed: reader.number("PlaySpeed")?,
-        default_alpha: reader.number("DefaultAlpha")?,
-        raytrace: boolean("Raytrace", &reader.take("Raytrace")?)?,
-        face_to_viewer: reader.flag("FaceToViewer", false)?,
-        fade_by_dist: boolean("FadeByDist", &reader.take("FadeByDist")?)?,
-        fade_start: reader.number("FadeStart")?,
-        fade_end: reader.number("FadeEnd")?,
-        aabb_center: reader.vector("Vec")?,
-        aabb_half: reader.vector("Vec")?,
-        use_aabb: reader.flag("UseAABB", false)?,
-        shake_cam: clamp_u32(reader.integer("ShakeCam")?),
+        default_scale,
+        play_speed,
+        default_alpha,
+        raytrace,
+        face_to_viewer,
+        fade_by_dist,
+        fade_start,
+        fade_end,
+        aabb_center,
+        aabb_half,
+        use_aabb,
+        shake_cam,
         controls: Vec::new(),
         no_change_dir: false,
         render_2d: false,
@@ -1334,10 +1417,21 @@ pub fn parse(source: &str) -> Result<Root, String> {
     };
     let mut root = root;
     while reader.peek() == Some("CtrlType") {
-        root.controls.push(control(&mut reader)?);
+        root.controls.push(control(&mut reader, version)?);
     }
-    // Version 50 adds the 2D flags, version 64 adds the physics marker. Both
-    // are read in file order and only when present.
+    // Version 82 adds the shake damping mode, the line that follows the
+    // shake-camera block. The affector it selects only shapes the camera
+    // shake, so it is consumed and reported rather than modelled here.
+    if let Some(value) = reader.take_if("ShakeDamp") {
+        if version < 82 {
+            return Err(format!(
+                "GFX version {version} carries ShakeDamp, which needs 82"
+            ));
+        }
+        let _mode = integer("ShakeDamp", &value)?;
+    }
+    // Version 46 adds `NoChangeDir` and version 50 adds the 2D flags around it;
+    // they are read in file order and only when present.
     if reader.peek() == Some("NoChangeDir") {
         root.no_change_dir = reader.flag("NoChangeDir", false)?;
         root.render_2d = reader.flag("2DRender", false)?;
@@ -1413,7 +1507,7 @@ fn element(reader: &mut Reader, id: u32, version: u32) -> Result<Element, String
         // Element 125 writes one keypoint-shaped generation sequence, carrying
         // the path controller its particles are spawned along, before the
         // affector list. No other class reaches this branch.
-        generation_sequence = Some(Box::new(keypoint(reader)?));
+        generation_sequence = Some(Box::new(keypoint(reader, version)?));
     }
     if let Some(value) = reader.take_if("AffectorCount") {
         let count = integer("AffectorCount", &value)?;
@@ -1421,7 +1515,7 @@ fn element(reader: &mut Reader, id: u32, version: u32) -> Result<Element, String
             return Err(format!("affector count {count} is out of range"));
         }
         for _ in 0..count {
-            affectors.push(control(reader)?);
+            affectors.push(control(reader, version)?);
         }
     }
     let start_time = reader.optional_number("StartTime", 0.)?;
@@ -1432,7 +1526,7 @@ fn element(reader: &mut Reader, id: u32, version: u32) -> Result<Element, String
             return Err(format!("keypoint count {count} is out of range"));
         }
         for _ in 0..count {
-            keypoints.push(keypoint(reader)?);
+            keypoints.push(keypoint(reader, version)?);
         }
     }
     if !start_time.is_finite() || start_time < 0. {
@@ -1447,6 +1541,55 @@ fn element(reader: &mut Reader, id: u32, version: u32) -> Result<Element, String
         affectors,
         generation_sequence,
     })
+}
+
+/// Read the version 91+ pixel-shader block out of the shared keys and the
+/// version 92 fade flag, leaving the class payload untouched.
+///
+/// `A3DGFXElement::LoadElementFromFile` writes it after `TexAnimMaxTime`:
+///
+/// ```text
+/// >= 91  PSFileVersion (from 95 on), ShaderFile, ShaderTex,
+///        PSConstCount x { PSConstIndex, PSConstValue,
+///                        PSLoopCount (from 93), PSTargetCount x
+///                        { PSInterval, PSConstValue } }
+/// >= 92  CanDoFadeOut
+/// ```
+///
+/// The keys are taken by name rather than in sequence because the shared block
+/// is collected by key. Their presence is what distinguishes a 91+ root, so a
+/// root that carries them at a lower version is damage, not a layout to guess.
+fn pixel_shader(fields: &[Field], version: u32) -> Result<Option<PixelShader>, String> {
+    let lookup = Lookup::new(fields);
+    let path = lookup.one("ShaderFile").unwrap_or_default();
+    let texture = lookup.one("ShaderTex").unwrap_or_default();
+    let declared = lookup
+        .one("PSConstCount")
+        .map(|value| integer("PSConstCount", value))
+        .transpose()?
+        .unwrap_or(0);
+    if declared < 0 || declared > 64 {
+        return Err(format!("PSConstCount {declared} is out of range"));
+    }
+    let indices = lookup.all("PSConstIndex").len();
+    if indices as i64 != declared {
+        return Err(format!(
+            "PSConstCount is {declared} but {indices} PSConstIndex lines follow"
+        ));
+    }
+    if path.is_empty() && texture.is_empty() && declared == 0 {
+        return Ok(None);
+    }
+    if version < 91 {
+        return Err(format!(
+            "GFX version {version} carries a pixel-shader block, which needs 91"
+        ));
+    }
+    Ok(Some(PixelShader {
+        path: path.to_string(),
+        texture: texture.to_string(),
+        constants: indices,
+    }))
 }
 
 /// The shared keys, read by name because every one of them is version gated.
@@ -1467,6 +1610,7 @@ fn common(fields: &[Field], id: u32, version: u32) -> Result<Common, String> {
     for (index, value) in lookup.all("OrgPt").into_iter().enumerate().take(2) {
         origin[index] = float("OrgPt", value)?;
     }
+    let shader = pixel_shader(fields, version)?;
     let common = Common {
         name: lookup.one("Name").unwrap_or_default().to_string(),
         source_blend: clamp_u32(lookup.integer("SrcBlend", 5)?),
@@ -1500,6 +1644,8 @@ fn common(fields: &[Field], id: u32, version: u32) -> Result<Common, String> {
         tex_anim_max_time: lookup.number("TexAnimMaxTime", 0.)?,
         no_scale,
         origin,
+        pixel_shader: shader,
+        can_fade_out: lookup.flag("CanDoFadeOut", false)?,
     };
     if common.name.len() > 64 {
         return Err("element name is longer than the client's 64 bytes".into());
@@ -1553,6 +1699,18 @@ const SHARED_KEYS: &[&str] = &[
     "NoDownSample",
     "ResetLoopEnd",
     "TexAnimMaxTime",
+    // Version 91 adds the pixel-shader block, version 92 its fade-out flag.
+    // Both are written after `TexAnimMaxTime`, in `A3DGFXElement`'s own order.
+    "PSFileVersion",
+    "ShaderFile",
+    "ShaderTex",
+    "PSConstCount",
+    "PSConstIndex",
+    "PSConstValue",
+    "PSLoopCount",
+    "PSTargetCount",
+    "PSInterval",
+    "CanDoFadeOut",
 ];
 
 /// Read-by-name access over a specification block, preserving repeated keys in
@@ -2141,7 +2299,7 @@ fn grid(lookup: &Lookup) -> Result<Grid, String> {
     })
 }
 
-fn keypoint(reader: &mut Reader) -> Result<KeyPoint, String> {
+fn keypoint(reader: &mut Reader, version: u32) -> Result<KeyPoint, String> {
     let interpolate_mode = clamp_u32(reader.integer("InterpolateMode")?);
     let time_span = reader.number("TimeSpan")?;
     let position = reader.vector("Position")?;
@@ -2155,7 +2313,7 @@ fn keypoint(reader: &mut Reader) -> Result<KeyPoint, String> {
     }
     let mut controls = Vec::with_capacity(count as usize);
     for _ in 0..count {
-        controls.push(control(reader)?);
+        controls.push(control(reader, version)?);
     }
     if !time_span.is_finite() {
         return Err("non-finite keypoint TimeSpan".into());
@@ -2185,7 +2343,7 @@ fn keypoint(reader: &mut Reader) -> Result<KeyPoint, String> {
     })
 }
 
-fn control(reader: &mut Reader) -> Result<Control, String> {
+fn control(reader: &mut Reader, version: u32) -> Result<Control, String> {
     let kind = clamp_u32(reader.integer("CtrlType")?);
     let start = reader.number("StartTime")?;
     let end = reader.number("EndTime")?;
@@ -2296,7 +2454,23 @@ fn control(reader: &mut Reader) -> Result<Control, String> {
                 }
                 stops.push((value, span));
             }
-            ControlData::ColorRamp { original, stops }
+            // Version 81 appends `AlphaOnly` to the colour-change controller.
+            // From 81 on it is always written, so a 90 or 93 root carries it
+            // after every ramp; a root below 81 that carries it is damage.
+            let alpha_only = match reader.take_if("AlphaOnly") {
+                Some(value) => boolean("AlphaOnly", &value)?,
+                None => false,
+            };
+            if alpha_only && version < 81 {
+                return Err(format!(
+                    "GFX version {version} carries AlphaOnly, which needs 81"
+                ));
+            }
+            ControlData::ColorRamp {
+                original,
+                stops,
+                alpha_only,
+            }
         }
         110 => {
             // `CalcDir` is optional: 129 of the 1,918 retail paths omit it.
@@ -2882,7 +3056,9 @@ mod tests {
         }
         assert_eq!(element.affectors.len(), 2);
         match &element.affectors[1].data {
-            ControlData::ColorRamp { original, stops } => {
+            ControlData::ColorRamp {
+                original, stops, ..
+            } => {
                 assert_eq!(*original, 16769968u32);
                 assert_eq!(stops.len(), 3);
                 assert_eq!(stops[0], ((-795458i32) as u32, 300.));
@@ -3306,7 +3482,9 @@ mod tests {
             other => panic!("controller 110 is a path, found {other:?}"),
         }
         match &controls[1].data {
-            ControlData::ColorRamp { original, stops } => {
+            ControlData::ColorRamp {
+                original, stops, ..
+            } => {
                 assert_eq!(*original, 0xffff_ffff);
                 assert_eq!(stops, &vec![(0x00ff_0000, 100.)]);
             }
@@ -3333,6 +3511,187 @@ mod tests {
         assert!(parse("GFXELEMENTCOUNT: 0\n")
             .unwrap_err()
             .contains("not MOXTVersion"));
+    }
+
+    /// A version-93 root carries two header lines a version-79 root does not,
+    /// and both are read by the client's own loader.
+    ///
+    /// `A3DGFXEx.cpp` is the shipped root loader, and its `Load` reads the file
+    /// as a *sequence of version-gated lines*, not as a set of keys:
+    ///
+    /// ```text
+    /// if (m_dwVersion >= 89)   read "IsAngelica3: %d"   // V89, 10.5.26
+    /// if (m_dwVersion >= 84)   read "AccurateAABB: %d"  // V84, 10.1.22
+    /// ```
+    ///
+    /// So a 90 or 93 root really does start with an extra line after
+    /// `Version:`, and it really does carry `AccurateAABB` in the header. This
+    /// is the exact shape `gfx/场景/灵族/门缝光.gfx` (version 90) and the 93
+    /// roots in `gfx/场景/新种族地图/` have, and it must parse: the version
+    /// history in the same file runs to 103 (`#define GFX_CUR_VERSION 103`),
+    /// so 79 was the limit of the 1.4.2 *content*, never a format limit.
+    #[test]
+    fn a_version_93_root_reads_its_two_extra_header_lines() {
+        // The client's line order for 93: Version, IsAngelica3 (>=89), and the
+        // gate-ordered remainder from `A3DGFXEx::Load`.
+        let root = "MOXTVersion: 93\r\nIsAngelica3: 0\r\nDedaultScale: 1\r\n\
+                    PlaySpeed: 1\r\nDefaultAlpha: 1\r\nRaytrace: 0\r\n\
+                    FaceToViewer: 0\r\nFadeByDist: 0\r\nFadeStart: 0\r\n\
+                    FadeEnd: 0\r\nVec: 0, 0, 0\r\nVec: 1, 1, 1\r\n\
+                    UseAABB: 1\r\nAccurateAABB: 0\r\nShakeCam: 0\r\n\
+                    ShakeDamp: 0\r\nGFXELEMENTCOUNT: 1\r\n";
+        let parsed = parse(&(root.to_string() + SPRITE)).unwrap();
+        assert_eq!(parsed.version, 93);
+        assert_eq!(parsed.elements.len(), 1);
+        // A root that claims to be Angelica-3 content is *not* this container.
+        // The client refuses it outright ("Try to load angelica 3 gfx using the
+        // angelica2 gfx library"), so the reader must too rather than misread
+        // its body.
+        let angelica3 = root.replace("IsAngelica3: 0", "IsAngelica3: 1");
+        let error = parse(&(angelica3 + SPRITE)).unwrap_err();
+        assert!(error.contains("Angelica"), "unexpected error: {error}");
+    }
+
+    /// A version-93 sprite carries the version-91 pixel-shader block and the
+    /// version-92 fade flag between `TexAnimMaxTime` and `StartTime`, both read
+    /// by `A3DGFXElement::LoadElementFromFile` rather than by the class.
+    #[test]
+    fn a_version_93_element_reads_its_shader_block_and_fade_flag() {
+        let element = "GFXELEMENTID: 100\r\nName: glow\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+             RepeatCount: 1\r\nRepeatDelay: 0\r\nTexFile: 粒子\\glow.dds\r\nBindEle: \r\n\
+             ZEnable: 0\r\nMatchGrnd: 0\r\nGroundHeight: 0\r\nTexRow: 1\r\nTexCol: 1\r\n\
+             TexInterval: 50\r\nPriority: 2\r\nIsDummy: 0\r\nDummyEle: \r\nWarp: 0\r\n\
+             TileMode: 0\r\nTexSpeed: 0\r\nTexSpeed: 0\r\nUReverse: 0\r\nVReverse: 0\r\n\
+             UVExchg: 0\r\nRenderLayer: 0\r\nNoDownSample: 0\r\nResetLoopEnd: 0\r\n\
+             TexAnimMaxTime: 0\r\nPSFileVersion: 1\r\nShaderFile: 粒子\\glow.fx\r\n\
+             ShaderTex: 粒子\\mask.dds\r\nPSConstCount: 1\r\nPSConstIndex: 2\r\n\
+             PSConstValue: 1.000000, 0.000000, 0.000000, 1.000000\r\nPSLoopCount: 1\r\n\
+             PSTargetCount: 1\r\nPSInterval: 0\r\n\
+             PSConstValue: 0.000000, 1.000000, 0.000000, 1.000000\r\nCanDoFadeOut: 1\r\n\
+             Width: 0.25\r\nHeight: 0.5\r\nRotFromView: 0\r\nGrndNormOnly: 0\r\n\
+             StartTime: 0\r\nKEYPOINTCOUNT: 1\r\nInterpolateMode: 0\r\nTimeSpan: -1\r\n\
+             Position: 1, 2, 3\r\nColor: -1\r\nScale: 2\r\nDirection: 0, 0, 0, 1\r\n\
+             Rad_2D: 0\r\nCtrlMethodCount: 0\r\n";
+        let root = "MOXTVersion: 93\r\nIsAngelica3: 0\r\nDedaultScale: 1\r\n\
+                    PlaySpeed: 1\r\nDefaultAlpha: 1\r\nRaytrace: 0\r\n\
+                    FaceToViewer: 0\r\nFadeByDist: 0\r\nFadeStart: 0\r\n\
+                    FadeEnd: 0\r\nVec: 0, 0, 0\r\nVec: 1, 1, 1\r\n\
+                    UseAABB: 1\r\nAccurateAABB: 0\r\nShakeCam: 0\r\n\
+                    GFXELEMENTCOUNT: 1\r\n";
+        let parsed = parse(&(root.to_string() + element)).unwrap();
+        let common = &parsed.elements[0].common;
+        let shader = common
+            .pixel_shader
+            .as_ref()
+            .expect("a 93 root's shader block must be read");
+        assert_eq!(shader.path, "粒子\\glow.fx");
+        assert_eq!(shader.texture, "粒子\\mask.dds");
+        assert_eq!(shader.constants, 1);
+        assert!(common.can_fade_out);
+        // The block must not be mistaken for class payload keys: the sprite
+        // reads its own size and nothing else.
+        match &parsed.elements[0].spec {
+            Spec::Sprite(sprite) => {
+                assert_eq!(sprite.width, 0.25);
+                assert_eq!(sprite.height, 0.5);
+            }
+            other => panic!("expected a sprite, found {other:?}"),
+        }
+
+        // Version 92 has the fade flag but no shader block.
+        let old = element.replace(
+            "PSFileVersion: 1\r\nShaderFile: 粒子\\glow.fx\r\n\
+             ShaderTex: 粒子\\mask.dds\r\nPSConstCount: 1\r\nPSConstIndex: 2\r\n\
+             PSConstValue: 1.000000, 0.000000, 0.000000, 1.000000\r\nPSLoopCount: 1\r\n\
+             PSTargetCount: 1\r\nPSInterval: 0\r\n\
+             PSConstValue: 0.000000, 1.000000, 0.000000, 1.000000\r\n",
+            "",
+        );
+        let root92 = root.replace("MOXTVersion: 93", "MOXTVersion: 92");
+        let parsed = parse(&(root92 + &old)).unwrap();
+        assert!(parsed.elements[0].common.pixel_shader.is_none());
+        assert!(parsed.elements[0].common.can_fade_out);
+    }
+
+    /// Version 81 appends `AlphaOnly` to the colour-change controller
+    /// (`A3DGFXCtrlColorChange::Load`), so a 90 or 93 keypoint writes one more
+    /// line than the 79 grammar expected and every ramp in those roots used to
+    /// be refused as "invalid element StartTime".
+    #[test]
+    fn version_81_alpha_only_reads_after_the_colour_ramp() {
+        let ramp = "CtrlType: 108\r\nStartTime: 0\r\nEndTime: -1\r\nColor: -1\r\n\
+                    Count: 1\r\nColor: -256\r\nTimeSpan: 500\r\nAlphaOnly: 1\r\n";
+        let source = header37(1).replace("MOXTVersion: 37", "MOXTVersion: 93")
+            + &SPRITE.replace("CtrlMethodCount: 0", "CtrlMethodCount: 1");
+        let parsed = parse(&(source.clone() + ramp)).unwrap();
+        match &parsed.elements[0].keypoints[0].controls[0].data {
+            ControlData::ColorRamp {
+                stops, alpha_only, ..
+            } => {
+                assert_eq!(stops.len(), 1);
+                assert!(*alpha_only);
+            }
+            other => panic!("expected a colour ramp, found {other:?}"),
+        }
+        // Below 81 the line does not exist, so carrying one is damage.
+        let older =
+            (header37(1) + &SPRITE.replace("CtrlMethodCount: 0", "CtrlMethodCount: 1")) + ramp;
+        assert!(parse(&older)
+            .unwrap_err()
+            .contains("AlphaOnly, which needs 81"));
+    }
+
+    /// The header keys are read in the *client's* order, and that order is a
+    /// sequence of version gates rather than a fixed list. A root that gets one
+    /// of the gated lines in the wrong place must be refused, not silently
+    /// shifted, so this pins the order for the versions that changed it.
+    #[test]
+    fn the_header_follows_the_client_line_order_at_every_gate() {
+        // 84 adds AccurateAABB between UseAABB and ShakeCam; 82 adds ShakeDamp
+        // after the shake camera; 89 adds IsAngelica3 after Version.
+        let ordered = |version: u32| {
+            let mut text = format!("MOXTVersion: {version}\r\n");
+            if version >= 89 {
+                text += "IsAngelica3: 0\r\n";
+            }
+            text += "DedaultScale: 1\r\nPlaySpeed: 1\r\nDefaultAlpha: 1\r\nRaytrace: 0\r\n";
+            if version >= 38 {
+                text += "FaceToViewer: 0\r\n";
+            }
+            text += "FadeByDist: 0\r\nFadeStart: 0\r\nFadeEnd: 0\r\n";
+            text += "Vec: 0, 0, 0\r\nVec: 1, 1, 1\r\n";
+            if version >= 53 {
+                text += "UseAABB: 1\r\n";
+            }
+            if version >= 84 {
+                text += "AccurateAABB: 1\r\n";
+            }
+            if version >= 24 {
+                text += "ShakeCam: 0\r\n";
+            }
+            if version >= 82 {
+                text += "ShakeDamp: 0\r\n";
+            }
+            if version >= 46 {
+                text += "NoChangeDir: 0\r\n";
+            }
+            if version >= 50 {
+                text += "2DRender: 0\r\n2DBackLayer: 0\r\n";
+            }
+            if version >= 63 {
+                text += "PhysExist: 0\r\n";
+            }
+            text + "GFXELEMENTCOUNT: 0\r\n"
+        };
+        for version in [24u32, 27, 38, 46, 50, 53, 63, 79, 82, 84, 89, 90, 93, 103] {
+            parse(&ordered(version)).unwrap_or_else(|e| panic!("version {version} refused: {e}"));
+        }
+        // The two post-79 introductions must not be accepted below their gate.
+        let early = ordered(79).replace("UseAABB: 1", "UseAABB: 1\r\nAccurateAABB: 1");
+        assert!(
+            parse(&early).is_err(),
+            "a pre-84 root carries no AccurateAABB"
+        );
     }
 
     #[test]

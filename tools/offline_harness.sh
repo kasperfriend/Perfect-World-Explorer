@@ -24,6 +24,9 @@
 #                                     flate2 (BSData records are zlib-framed)
 #   tools/offline_harness.sh gfx      build+test the GFX containers (file, decal,
 #                                     light) and the `pck` they read from
+#   tools/offline_harness.sh player   build+test `src/gfx_player.rs` and the model
+#                                     stack it links, so an edit to the player is
+#                                     compiled outside CI too
 #   tools/offline_harness.sh music    build+test `src/music.rs` (precinct zones and
 #                                     the teleport fallback points)
 #   tools/offline_harness.sh material build+test the terrain material set and the
@@ -832,6 +835,82 @@ EOF
             "$OUT/gfx/lib.rs" -o "$OUT/gfxver"
         shift || true
         (cd "$REPO" && exec "$OUT/gfxver" "$@") ;;
+    player) toolchain; sysroot; deps; real_deps
+        # `src/gfx_player.rs` and the modules it links against.
+        #
+        # This exists because `check` cannot compile the player: it reaches for
+        # `egui` through `diagnostics` and for the model stack, so it was left
+        # out of the type-check set and *nothing* outside CI compiled it. A
+        # three-line edit to the colour-ramp arm — adding a field to
+        # `ControlData::ColorRamp` and reading it in the `Process` match — then
+        # shipped two type errors that `check`, `gfx` and `test` all passed over,
+        # because none of them build this file. The stubs below are the smallest
+        # set that lets the real parser, player and their suites compile:
+        # `diagnostics` as a no-op, the diag macros as no-ops.
+        mkdir -p "$OUT/player"
+        # The two macros carry `$`, which the unquoted heredoc below would try
+        # to expand, so they get their own quoted heredoc.
+        cat > "$OUT/player/macros.rs" <<'EOF'
+#[macro_export]
+macro_rules! diag { ($($t:tt)*) => {}; }
+#[macro_export]
+macro_rules! diag_keyed { ($($t:tt)*) => {}; }
+EOF
+        cat > "$OUT/player/lib.rs" <<EOF
+#[path = "$OUT/player/macros.rs"]
+#[macro_use]
+mod macros;
+pub mod diagnostics {
+    #[derive(Clone, Copy)]
+    pub enum Channel {
+        EffectCards,
+        EffectElements,
+        EffectFrames,
+        EffectUv,
+    }
+    pub fn enabled(_channel: Channel) -> bool { false }
+    pub fn any() -> bool { false }
+}
+#[path = "$REPO/src/animation.rs"]
+pub mod animation;
+#[path = "$REPO/src/ecmodel.rs"]
+pub mod ecmodel;
+#[path = "$REPO/src/gfx_color_track.rs"]
+pub mod gfx_color_track;
+#[path = "$REPO/src/gfx_decal.rs"]
+pub mod gfx_decal;
+#[path = "$REPO/src/gfx_file.rs"]
+pub mod gfx_file;
+#[path = "$REPO/src/gfx_player.rs"]
+pub mod gfx_player;
+#[path = "$REPO/src/model_asset.rs"]
+pub mod model_asset;
+#[path = "$REPO/src/model_dds.rs"]
+pub mod model_dds;
+#[path = "$REPO/tools/fixtures/model_draw.rs"]
+pub mod model_draw_fixture;
+#[path = "$REPO/src/model_material.rs"]
+pub mod model_material;
+#[path = "$REPO/src/model_playback.rs"]
+pub mod model_playback;
+#[path = "$REPO/src/pck.rs"]
+pub mod pck;
+#[path = "$REPO/src/skeleton.rs"]
+pub mod skeleton;
+#[path = "$REPO/src/skeleton_pose.rs"]
+pub mod skeleton_pose;
+#[path = "$REPO/src/skin.rs"]
+pub mod skin;
+#[path = "$REPO/src/skin_pose.rs"]
+pub mod skin_pose;
+EOF
+        "$RUSTC" --test --crate-name playertest --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 -L "$OUT" --extern glam="$OUT/libglam.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern flate2="$OUT/libflate2.rlib" \
+            "$OUT/player/lib.rs" -o "$OUT/playertest"
+        shift || true
+        (cd "$REPO" && exec "$OUT/playertest" "$@") ;;
     music) toolchain; sysroot; deps; real_deps
         # `src/music.rs` alone: precinct parsing and the zone fallback points the
         # teleport list uses when a map ships no `world_targets.txt`.

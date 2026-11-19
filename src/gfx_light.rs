@@ -232,27 +232,23 @@ pub fn parse(text: &str) -> Result<Vec<Definition>, String> {
             .ok_or("expected text GFX")?
             .trim(),
     )?;
-    // The client's root loader (0x6e3470) reads `MOXTVersion` first and rejects
-    // anything **above** 79 (`cmp 0x4f`). Every optional key is gated per
-    // version inside the element loaders rather than the file being refused
-    // outright.
+    // There is no version gate here, and the light element is why.
     //
-    // This used to be a ten-value whitelist, which was invented rather than
-    // measured and cost most of the map. `gfx.pck` ships 27 distinct versions;
-    // of the 163 roots `world.ecwld` names, 97 are below the old list's lowest
-    // entry and were refused here — among them every fire, glow and light
-    // shafts (`火焰1`, `篝火`, `光运`, `佛光` all ship as 33 or 35). Because a
-    // refusal here marks the owner `State::Failed`, and only `State::Live`
-    // owners ever build a player, those roots drew no geometry at all: the map
-    // showed its one allowed waterfall and nothing else.
-    // Unlike the shared container parser, this reader *validates* a light
-    // layout it has measured, so a version above that measurement really is
-    // unverified: reading 90 or 93 light keys with the 79 grammar would publish
-    // invented lights. The root's other elements still play, because a root
-    // rejected here is retried through the animated reader.
-    if version > 79 {
-        return Err(format!("GFX version {version} is newer than 79"));
-    }
+    // `A3DGFXLight::Load` in the shipped SDK reads fourteen lines — `LightType`,
+    // `Diffuse`, `Specular`, `Ambient`, `Position`, `Direction`, `Range`,
+    // `Falloff`, `Attenuation0..2`, `Theta`, `Phi` — and never looks at
+    // `dwVersion`. A version-93 light record is byte-for-byte the same shape as
+    // a version-33 one, so refusing by version published no lights and cost
+    // this client every later effect.
+    //
+    // This used to be a ten-value whitelist, then a `< 80` cap that came from
+    // the 1.4.2 corpus maximum rather than from the format: the SDK's own
+    // history runs to 103 (`#define GFX_CUR_VERSION 103`) and 1.5.2 ships 86,
+    // 90 and 93. Since `gfx_owner` marks the owner `State::Failed` on an
+    // `unsupported` error and only buildable owners reach the player, the cap
+    // was not merely dropping light glow, it was dropping the geometry of every
+    // root that also happened to carry a point light.
+    let _ = version;
     let mut expected = None;
     let mut elements = 0;
     let mut current = None;
@@ -472,9 +468,28 @@ mod tests {
             ("Range: 10", "Range: NaN"),
             ("GFXELEMENTCOUNT: 1", "GFXELEMENTCOUNT: 2"),
             ("BindEle: ", "BindEle: parent"),
-            ("Version: 37", "Version: 999"),
         ] {
             assert!(parse(&file().replace(a, b)).is_err(), "{a}");
+        }
+    }
+
+    /// The light element is version invariant, so the same record must read the
+    /// same at any version a shipped client writes.
+    ///
+    /// `A3DGFXLight::Load` takes `dwVersion` and never tests it: fourteen
+    /// unversioned lines, from `LightType` through `Phi`. The reader used to cap
+    /// at 79 because that was the newest version in the 1.4.2 corpus, which
+    /// made every 1.5.2 effect that carries a point light fail to decode and so
+    /// lost its geometry too. The SDK's history runs to V101 with
+    /// `GFX_CUR_VERSION 103`, and 1.5.2 ships 86, 90 and 93 roots.
+    #[test]
+    fn a_light_record_reads_the_same_at_every_shipped_version() {
+        for version in [37, 79, 86, 90, 93] {
+            let source = file().replace("Version: 37", &format!("Version: {version}"));
+            let definitions =
+                parse(&source).unwrap_or_else(|e| panic!("version {version} refused: {e}"));
+            assert_eq!(definitions.len(), 1);
+            assert!(definitions[0].range > 0.);
         }
     }
     #[test]
