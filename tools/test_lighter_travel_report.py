@@ -2,7 +2,7 @@ import tempfile
 from pathlib import Path
 import unittest
 
-from lighter_travel_report import STAGES, capture, summarize, validate_pair, validate_suite
+from lighter_travel_report import PROVIDERS, STAGES, capture, summarize, validate_pair, validate_suite
 
 
 class TravelTest(unittest.TestCase):
@@ -68,6 +68,18 @@ class TravelTest(unittest.TestCase):
                 validate_suite([record])
             with self.assertRaisesRegex(ValueError, "incomplete"):
                 capture(self.write(directory, frames=499, sync=True), synchronized=True)
+
+    def test_sdk_suite_rejects_same_name_12_gb_adapter(self):
+        routes = [("Off", PROVIDERS[0])] + [(mode, provider) for mode in ("Software", "Hardware") for provider in PROVIDERS]
+        meta = {"platform": "windows", "architecture": "x86_64", "vulkan_largest_device_local_heap_bytes": str(10 << 30),
+                "adapter": 'name: "NVIDIA GeForce RTX 3080", vendor: 4318, device_type: DiscreteGpu, backend: Vulkan'}
+        records = [(meta | {"ray_reconstruction": provider}, mode, [],
+                    [(0, 0, False, False, 1, 0, 0, (1, None, None, 1, None, None, None, 1))])
+                   for mode, provider in routes]
+        validate_suite(records)
+        altered = meta | {"ray_reconstruction": "portable", "vulkan_largest_device_local_heap_bytes": str(12 << 30)}
+        with self.assertRaisesRegex(ValueError, "RTX 3080 10 GB"):
+            validate_suite([(altered, *records[0][1:]), *records[1:]])
 
     def test_motion_trace_cannot_enter_either_benchmark_report(self):
         with tempfile.TemporaryDirectory() as directory:

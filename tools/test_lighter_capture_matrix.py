@@ -129,7 +129,7 @@ class CaptureMatrixTests(unittest.TestCase):
 
     def test_temporal_receipts_reject_fallback_unmatched_path_and_unrefined_reference(self):
         shared = dict.fromkeys(matrix.MATCH_KEYS, "fixed") | {
-            "platform": "windows",
+            "platform": "windows", "architecture": "x86_64", "vulkan_largest_device_local_heap_bytes": str(10 << 30),
             "adapter": 'name: "NVIDIA GeForce RTX 3080", vendor: 4318, device_type: DiscreteGpu, backend: Vulkan',
             "mode": "Software", "warmup_frames": "48", "warmup_step_ms": "16", "animation_elapsed_ms": "768",
             "raster_primary": "false", "screen_reuse_flags": "0", "camera_path_sha256": "a" * 64,
@@ -142,6 +142,8 @@ class CaptureMatrixTests(unittest.TestCase):
         metas["reference_low"]["settings_effective"] = ref % 32
         metas["reference"]["settings_effective"] = ref % 64
         temporal.validate_temporal(metas, "reveal")
+        with self.assertRaisesRegex(ValueError, "RTX 3080 10 GB"):
+            temporal.validate_temporal(metas | {"rr": metas["rr"] | {"vulkan_largest_device_local_heap_bytes": str(12 << 30)}}, "reveal")
         with self.assertRaisesRegex(ValueError, "requested.*got portable"):
             temporal.validate_temporal(metas | {"rr": metas["rr"] | {"ray_reconstruction": "portable"}}, "reveal")
         with self.assertRaisesRegex(ValueError, "unmatched camera_path_sha256"):

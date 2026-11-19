@@ -202,6 +202,7 @@ pub(super) struct Travel {
     sync: bool,
     heap_peak: Option<u64>,
     heap_warned: bool,
+    largest_local_heap_bytes: Option<u64>,
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     heap: Option<Heap>,
     warm: u32,
@@ -280,8 +281,6 @@ impl Travel {
             return Err("travel CSV must be a new file".into());
         }
         let samples = Vec::with_capacity(plan.samples() as usize);
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        let _ = device;
         Ok(Self {
             plan,
             path,
@@ -293,6 +292,7 @@ impl Travel {
             sync: false,
             heap_peak: None,
             heap_warned: false,
+            largest_local_heap_bytes: super::native_inventory::device_local_heap(device),
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             heap: Heap::new(device),
             warm: 0,
@@ -504,11 +504,15 @@ impl Travel {
             self.plan.map,self.plan.hash,self.plan.hour,self.plan.warmup,self.samples.len(),self.hybrid,self.adapter)?;
         writeln!(
             out,
-            "# ray_reconstruction={}\n# capture_policy={}\n# platform={}",
+            "# ray_reconstruction={}\n# capture_policy={}\n# platform={}\n# architecture={}",
             self.expected_provider,
             self.capture_policy(),
-            std::env::consts::OS
+            std::env::consts::OS,
+            std::env::consts::ARCH,
         )?;
+        if let Some(bytes) = self.largest_local_heap_bytes {
+            writeln!(out, "# vulkan_largest_device_local_heap_bytes={bytes}")?;
+        }
         if let Some(s) = &self.setup {
             let [(w, h), (rw, rh), (tw, th)] = s.extents;
             writeln!(out,"# display={w}x{h}\n# world={rw}x{rh}\n# trace={tw}x{th}\n# present_mode={:?}\n# ray={:?}",s.present,s.ray)?;

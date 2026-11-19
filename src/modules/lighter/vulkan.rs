@@ -1287,10 +1287,15 @@ impl Renderer {
 
     pub(super) fn bc_page_stats(&self) -> [u64; 3] {
         let mut sum = [0; 3];
-        for atlas in self.bc_pages.iter().filter(|p| p.visible) {
-            for (total, value) in sum.iter_mut().zip(atlas.stats()) {
-                *total += value;
+        for atlas in &self.bc_pages {
+            let [tiles, layers, charged] = atlas.stats();
+            if atlas.visible {
+                sum[0] += tiles;
+                sum[1] += layers;
             }
+            // A replaced bank can fall back without releasing the immutable
+            // images. Their live allocations still count toward the cost.
+            sum[2] += charged;
         }
         sum
     }

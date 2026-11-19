@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 
 from lighter_capture_matrix import MATCH_KEYS, compare, metadata, validate_match, verified_image
+from lighter_host_evidence import requested_target
 
 PROVIDERS = {
     "off": "portable",
@@ -35,12 +36,10 @@ def validate_temporal(metas, scene):
     off = metas["off"]
     if off["mode"] not in ("Software", "Hardware"):
         raise ValueError("off is the portable ray control, not Native")
-    adapter = off["adapter"]
-    if (off.get("platform") != "windows" or 'name: "NVIDIA GeForce RTX 3080"' not in adapter or "backend: Vulkan" not in adapter
-            or "device_type: DiscreteGpu" not in adapter or "vendor: 4318" not in adapter):
-        raise ValueError("expected the physical Windows NVIDIA GeForce RTX 3080 Vulkan adapter")
     for label, expected in PROVIDERS.items():
         meta = metas[label]
+        if not requested_target(meta):
+            raise ValueError(f"{label}: expected Windows x64 RTX 3080 10 GB Vulkan evidence")
         if meta.get("ray_reconstruction") != expected:
             raise ValueError(f"{label}: requested {expected}, got {meta.get('ray_reconstruction')}")
         if meta["mode"] != off["mode"]:
@@ -63,7 +62,7 @@ def validate_temporal(metas, scene):
             if settings_field(meta, "samples") != "1":
                 raise ValueError(f"{label}: expected 1 spp")
             validate_match(off, meta)
-        for key in (*MATCH_KEYS, "platform", "camera_path_sha256"):
+        for key in (*MATCH_KEYS, "platform", "architecture", "vulkan_largest_device_local_heap_bytes", "camera_path_sha256"):
             if meta.get(key) != off.get(key):
                 raise ValueError(f"{label}: unmatched {key}")
     if scene in ("path", "reveal") and not re.fullmatch("[0-9a-f]{64}", off.get("camera_path_sha256", "")):

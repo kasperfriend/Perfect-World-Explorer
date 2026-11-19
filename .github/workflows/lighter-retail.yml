@@ -45,10 +45,6 @@ jobs:
               exit 1
             fi
           done < tools/fixtures/lighter-retail-inputs.txt
-          # The established CPU fixture uses the pinned empty cloud header
-          # for a07; this is not a byte receipt for an a07-specific cloud file.
-          cp "$RUNNER_TEMP/lighter-client/element/maps/a01/a01.cld" \
-            "$RUNNER_TEMP/lighter-client/element/maps/a07/a07.cld"
       - name: Select the CPU Vulkan driver
         run: |
           set -euo pipefail

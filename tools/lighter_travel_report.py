@@ -8,6 +8,8 @@ from pathlib import Path
 import re
 import statistics
 
+from lighter_host_evidence import TARGET_ADAPTER, requested_target
+
 MATCH = ("map", "hour", "plan_sha256", "adapter", "display", "world", "present_mode", "view_sha256", "view", "warmup")
 RAY_MATCH = ("trace", "screen_cache_mask", "compact_terrain", "sampled_bc")
 POSE = ("x", "y", "z", "yaw", "pitch")
@@ -95,8 +97,9 @@ def validate_pair(a, b, reuse_ab=False):
     for key in MATCH:
         if a[0][key] != b[0][key]:
             raise ValueError(f"unmatched travel {key}: {a[0][key]} vs {b[0][key]}")
-    if a[0].get("platform") != b[0].get("platform"):
-        raise ValueError("unmatched travel platform")
+    for key in ("platform", "architecture", "vulkan_largest_device_local_heap_bytes"):
+        if a[0].get(key) != b[0].get(key):
+            raise ValueError(f"unmatched travel {key}")
     if a[2] != b[2]:
         raise ValueError("recorded camera paths disagree")
     if "Off" not in (a[1], b[1]):
@@ -153,10 +156,8 @@ def validate_suite(records):
     if len(pairs) != len(required) or set(pairs) != required:
         raise ValueError(f"missing or duplicate synchronized routes: {sorted(required - set(pairs))}")
     for meta, mode, _, rows in records:
-        if (meta.get("platform") != "windows"
-                or any(token not in meta["adapter"] for token in ('name: "NVIDIA GeForce RTX 3080"',
-                       "vendor: 4318", "device_type: DiscreteGpu", "backend: Vulkan"))):
-            raise ValueError("SDK matrix needs the exact Windows NVIDIA GeForce RTX 3080 Vulkan adapter")
+        if not requested_target(meta):
+            raise ValueError("SDK matrix needs Windows x64 RTX 3080 10 GB Vulkan evidence")
         provider = meta["ray_reconstruction"]
         if any(r[4] is None or r[4] <= 0 for r in rows):
             raise ValueError(f"{mode}/{provider}: whole-viewer heap samples are missing")
@@ -193,7 +194,7 @@ def main():
         rays = [r for r in captures if r[1] != "Off"]
         for b in rays[1:]:
             validate_pair(rays[0], b, reuse_ab=args.reuse_ab)
-        device = "NVIDIA GeForce RTX 3080" if args.require_sdk_matrix else args.device
+        device = TARGET_ADAPTER if args.require_sdk_matrix else args.device
         result = [summarize(r, args.require_commit, args.require_heap, args.physical or args.require_sdk_matrix, device) for r in captures]
     except (OSError, ValueError, TypeError, KeyError, ZeroDivisionError) as exc:
         parser.error(str(exc))

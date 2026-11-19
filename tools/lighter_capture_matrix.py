@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 
 from PIL import Image, ImageChops
 
+from lighter_host_evidence import requested_target
+
 
 PROFILES = {
     "cpu": ("off", "software"),
@@ -30,7 +32,6 @@ REUSE = {"off": 0, "di": 1, "gi": 2, "both": 3}
 CLASSES = {"city", "forest", "open_distance", "water", "cave_instance", "effects"}
 CONDITIONS = {"day": (12, "Clear"), "night": (0, "Clear"), "rain": (12, "Rain")}
 NATIVE_SCOPE = "main_streamed_v1"
-TARGET_ADAPTER = "NVIDIA GeForce RTX 3080"
 SHARED_INPUTS = {"textures.pck", "building.pck", "litmodels.pck", "gfx.pck", "surfaces.pck",
                  "configs.pck", "grasses.pck", "models.pck"}
 SKIP_REASONS = ("range", "cutoff", "replaced", "budget", "pending", "disabled", "empty")
@@ -304,18 +305,6 @@ def capture_inventory(stem, mode, meta, case):
             or areas["failed"] != areas["unavailable"]):
         raise ValueError(f"{stem.name}: Native grass area counts do not reconcile")
     return rows
-
-
-def requested_target(meta):
-    adapter = meta.get("adapter", "")
-    heap = meta.get("vulkan_largest_device_local_heap_bytes", "")
-    # The NVIDIA driver can report slightly less than nominal capacity.
-    # Keep the 10 GiB and 12 GiB variants (same adapter name) distinct.
-    return (meta.get("platform") == "windows" and meta.get("architecture") == "x86_64"
-            and f'name: "{TARGET_ADAPTER}"' in adapter
-            and "vendor: 4318," in adapter and "device_type: DiscreteGpu" in adapter
-            and "backend: Vulkan" in adapter and heap.isdecimal()
-            and 9.5 * (1 << 30) <= int(heap) <= 10 * (1 << 30))
 
 
 def gpu_stage_samples(path):

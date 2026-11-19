@@ -4064,6 +4064,85 @@ fn exercise_reprojection_shader(h: &Harness) {
     assert_eq!(allocation_counts.0, post.allocation_counts().0);
 }
 
+#[test]
+#[ignore = "requires pinned PW142 a07 ECWLD/EC-BSD/water records and Vulkan compute"]
+fn lighter_a07_authored_medium() {
+    let dir = std::path::PathBuf::from(std::env::var_os("PW_TEST_RETAIL_A07").unwrap());
+    let scene = crate::scene::Scene::load(&dir.join("a07.ecwld")).unwrap();
+    let areas = crate::water::load(&scene, &dir).unwrap();
+    let [area] = areas.as_slice() else {
+        panic!("expected one a07 water area")
+    };
+    assert_eq!(area.export_id, 381);
+    let env = crate::environment::Environments::load(&scene, &dir).unwrap();
+    let mut h = Harness::new(Mode::Software, false);
+    let mut bank = Textures::default();
+    let eye = Vec3::new(80., 329., -144.);
+    let dry = Vec3::new(80., 332.66, -144.);
+    let wet = crate::gpu::ray_test_wet_grid(&mut bank, &areas, eye);
+    let air = crate::gpu::ray_test_wet_grid(&mut Textures::default(), &areas, dry);
+    assert_eq!((wet[1], air[1]), (1, 0));
+    // Isolate extinction from Fresnel, surface refraction, art, and other
+    // lighting. The white receiver is diagnostic geometry at the independently
+    // sampled a07 source-height Y at this wet cell center.
+    let bed_y = 326.96274;
+    let receiver = |dx, dz| [eye.x + dx, bed_y, eye.z + dz];
+    let mut b = Builder::default();
+    let patch = quad(
+        &mut b,
+        [
+            receiver(-8., 8.),
+            receiver(8., 8.),
+            receiver(-8., -8.),
+            receiver(8., -8.),
+        ],
+        [0., 1., 0.],
+        0,
+        EMISSIVE,
+        u32::MAX,
+    );
+    put(&mut b, patch);
+    h.ray.install(Ok((b.finish(), bank)));
+    let empty = Builder::default().finish();
+    let from_srgb = |v: f32| {
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let dist = eye.y - bed_y;
+    for hour in [12., 0.] {
+        let fog = env.underwater(eye.to_array(), hour);
+        let hue = Vec3::from_array(fog.color.map(from_srgb));
+        let bias = Vec3::ONE + 0.5 * (Vec3::ONE - hue / hue.max_element().max(1e-5));
+        let tr = Vec3::from_array(
+            (bias * (-4.321928 * dist / (fog.end - fog.start).max(0.01)))
+                .to_array()
+                .map(f32::exp2),
+        );
+        assert!(tr.max_element() < 1. && tr.min_element() > 0.);
+        let mut frame = test_frame(eye, -Vec3::Y, 3);
+        frame.resident_bounds = [-512., 512., -512., 512.];
+        frame.water_effects = wet;
+        frame.water = [fog.start, fog.end, 1., 0.];
+        frame.water_color = hue.extend(0.).to_array();
+        let actual = h.pixel(frame, &empty);
+        let expected = hue * (Vec3::ONE - tr) + tr;
+        assert_radiance("a07 wet-cell attenuation", actual, expected.to_array());
+        frame.water[2] = 0.;
+        let unattenuated = h.pixel(frame, &empty);
+        assert_radiance(
+            "a07 identical ray with extinction disabled",
+            unattenuated,
+            [1.; 3],
+        );
+        assert_eq!(actual.1, unattenuated.1);
+        assert_ne!(actual.0, unattenuated.0);
+        eprintln!("a07 water {} hour {hour}: eye depth {:.5}, wet path {dist:.5}, fog range [{}, {}], linear hue {hue}, expected RGB transmittance {tr}, actual linear UNORM8 {:?} vs dry media-control {:?} at reverse-Z {}", area.export_id, area.height - eye.y, fog.start, fog.end, actual.0, unattenuated.0, actual.1);
+    }
+}
+
 fn exercise_terrain_seam(h: &mut Harness) {
     // Both paths use the viewer's seam builder. Without the fine points in
     // the far triangle the first probe goes straight through the raised rim
