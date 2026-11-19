@@ -189,7 +189,7 @@ def run_case(case, args):
         stem = args.output / f"{name}-{variant}"
         hour, weather = CONDITIONS[case["condition"]]
         env = {k: v for k, v in os.environ.items() if not k.startswith("PW_PREVIEW_")}
-        for key in ("PW_TEST_NO_LIGHTMAPS", "PW_RAY_COMPACT_TERRAIN", "PW_RAY_SCREEN_REUSE"):
+        for key in ("PW_TEST_NO_LIGHTMAPS", "PW_RAY_COMPACT_TERRAIN", "PW_RAY_BC_TEXTURES", "PW_RAY_SCREEN_REUSE"):
             env.pop(key, None)
         env.update(WGPU_BACKEND="vulkan", PW_PREVIEW_COVERAGE="1", PW_PREVIEW_LIGHTER=mode,
                    PW_PREVIEW_RAY_RESOLUTION=str(args.ray_resolution), PW_PREVIEW_ANISOTROPY="8",

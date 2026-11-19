@@ -14,6 +14,8 @@ const AREA_TOP: u32 = 2;
 const LINEAR_DATA: u32 = 4;
 const ALPHA_IS_DATA: u32 = 8;
 const PACKED_MASK: u32 = 16;
+pub(super) mod bc_pages;
+
 const BC_TERRAIN_1: u32 = 32;
 const BC_TERRAIN_23: u32 = 64;
 const NORMAL_RG: u32 = 128;
@@ -22,6 +24,10 @@ const NORMAL_RG: u32 = 128;
 // Keep the hot default path free of the additional block decode.
 pub(crate) fn compact_terrain_enabled() -> bool {
     std::env::var("PW_RAY_COMPACT_TERRAIN").is_ok_and(|v| v == "1")
+}
+
+pub(crate) fn bc_pages_requested() -> bool {
+    std::env::var("PW_RAY_BC_TEXTURES").is_ok_and(|v| v == "1")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -187,7 +193,16 @@ impl Tile {
     /// Preserve the selected *authored* BC1/2/3 levels without an intermediate
     /// RGBA chain. Only opaque terrain samples these tiles; masks, alpha tests,
     /// bake maps and sky/mesh proposal estimates still read their own format.
+    #[cfg(test)]
     pub(crate) fn compact_terrain(dds: &[u8], limit: u32) -> Result<Option<Self>, String> {
+        Self::bc_terrain(dds, limit, false)
+    }
+
+    pub(crate) fn bc_terrain(
+        dds: &[u8],
+        limit: u32,
+        normalize: bool,
+    ) -> Result<Option<Self>, String> {
         use crate::terrain_sampling::{parse_terrain_dds, DxtFormat};
         let info = parse_terrain_dds(dds)?;
         let size = [info.width, info.height];
@@ -207,7 +222,11 @@ impl Tile {
                 offset += bytes;
             } else {
                 decoded += w * h * 4;
-                compressed += bytes;
+                compressed += if normalize {
+                    w.div_ceil(4) * h.div_ceil(4) * 8
+                } else {
+                    bytes
+                };
             }
         }
         if decoded <= compressed {
@@ -215,7 +234,7 @@ impl Tile {
         }
         let levels = info.authored_mips - start;
         let [w, h] = extent_at(size, start);
-        let storage = if info.format == DxtFormat::Dxt1 {
+        let storage = if normalize || info.format == DxtFormat::Dxt1 {
             BC_TERRAIN_1
         } else {
             BC_TERRAIN_23
@@ -228,11 +247,19 @@ impl Tile {
             let bytes = w.div_ceil(4) * h.div_ceil(4) * block;
             words[4 + lod as usize] = words.len() as u32;
             let end = offset + bytes;
-            words.extend(
-                dds[offset..end]
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap())),
-            );
+            if normalize && block == 16 {
+                words.extend(
+                    dds[offset..end]
+                        .chunks_exact(16)
+                        .flat_map(|b| bc_pages::four_color(&b[8..])),
+                );
+            } else {
+                words.extend(
+                    dds[offset..end]
+                        .chunks_exact(4)
+                        .map(|b| u32::from_le_bytes(b.try_into().unwrap())),
+                );
+            }
             offset = end;
         }
         let stats = MipStats {
@@ -481,6 +508,7 @@ pub struct Textures {
     tail: Vec<u32>,
     limit_bytes: usize,
     archive: HashMap<&'static str, Archive>,
+    pub(super) bc_pages: Option<Arc<bc_pages::Pages>>,
     pub missing: usize,
     pub mips: MipStats,
 }
@@ -493,6 +521,7 @@ impl Default for Textures {
             tail: vec![1, 1, 1, 0, 5, u32::MAX],
             limit_bytes: MAX_TEXTURE_BYTES,
             archive: HashMap::new(),
+            bc_pages: None,
             missing: 0,
             mips: MipStats::default(),
         }
@@ -527,6 +556,7 @@ impl Textures {
             tail: Vec::new(),
             limit_bytes: self.limit_bytes,
             archive: HashMap::new(),
+            bc_pages: self.bc_pages.clone(),
             missing: self.missing,
             mips: self.mips,
         }

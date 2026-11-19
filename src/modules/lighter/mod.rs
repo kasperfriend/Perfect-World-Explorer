@@ -32,6 +32,11 @@ const SOFTWARE: &str = include_str!("software.wgsl");
 const HARDWARE: &str = include_str!("hardware.wgsl");
 
 const BC_TERRAIN: &str = include_str!("bc_terrain.wgsl");
+const BC_BUFFER_LOAD: &str = r#"
+fn bc_sample_level(addr: u32, uv: vec2<f32>, mip: u32, fmt: u32) -> vec3<f32> {
+    return bc_terrain_level(addr,uv,mip,(fmt & BC_TERRAIN_1)!=0u);
+}
+"#;
 const DECODED_TERRAIN: &str = r#"
 fn terrain_tile(addr: u32, uv: vec2<f32>, taps: Taps) -> vec3<f32> {
     return filtered_tile(addr,uv,false,taps).rgb;
@@ -72,10 +77,21 @@ pub(crate) fn wants_screen_reuse() -> bool {
 }
 
 fn trace_source(backend: &str, compact_terrain: bool, screen_reuse: bool) -> String {
-    let terrain = if compact_terrain {
-        BC_TERRAIN
+    trace_source_with_pages(backend, compact_terrain, screen_reuse, "")
+}
+
+fn trace_source_with_pages(
+    backend: &str,
+    compact_terrain: bool,
+    screen_reuse: bool,
+    pages: &str,
+) -> String {
+    let (terrain, load) = if !pages.is_empty() {
+        (BC_TERRAIN, pages)
+    } else if compact_terrain {
+        (BC_TERRAIN, BC_BUFFER_LOAD)
     } else {
-        DECODED_TERRAIN
+        (DECODED_TERRAIN, "")
     };
     let reuse = if screen_reuse {
         SCREEN_REUSE
@@ -83,7 +99,7 @@ fn trace_source(backend: &str, compact_terrain: bool, screen_reuse: bool) -> Str
         SCREEN_OFF
     };
     [
-        PIXELS, BSDF, MEDIA, REFERENCE, BASE, terrain, reuse, backend,
+        PIXELS, BSDF, MEDIA, REFERENCE, BASE, terrain, load, reuse, backend,
     ]
     .concat()
 }
@@ -735,6 +751,7 @@ pub struct Lighter {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     capture: bool,
     compact_terrain: bool,
+    bc_pages: bool,
     screen_reuse: u32,
     screen_written: bool,
     screen_last_flags: u32,
@@ -779,6 +796,7 @@ impl Default for Lighter {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             capture: false,
             compact_terrain: false,
+            bc_pages: false,
             screen_reuse: 0,
             screen_written: false,
             screen_last_flags: 0,
@@ -805,9 +823,15 @@ impl Default for Lighter {
 impl Lighter {
     pub fn new(settings: Settings, adapter: &wgpu::Adapter, device: &wgpu::Device) -> Self {
         let rt = device_features(adapter, settings.mode);
+        let bc_pages = settings.mode == Mode::Hardware
+            && textures::bc_pages_requested()
+            && device
+                .features()
+                .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
         Self {
             armed: settings.mode != Mode::Off,
-            compact_terrain: textures::compact_terrain_enabled(),
+            compact_terrain: bc_pages || textures::compact_terrain_enabled(),
+            bc_pages,
             screen_reuse: screen_reuse_requested(),
             timings: (settings.mode != Mode::Off)
                 .then(|| profile::Timings::new(device))
@@ -989,6 +1013,18 @@ impl Lighter {
         } else {
             None
         }
+    }
+
+    pub(crate) fn uses_bc_pages(&self) -> bool {
+        self.bc_pages
+    }
+
+    pub(crate) fn bc_page_stats(&self) -> [u64; 3] {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(rt) = &self.hardware {
+            return rt.bc_page_stats();
+        }
+        [0; 3]
     }
 
     pub fn texture_mips(&self) -> textures::MipStats {
@@ -1197,7 +1233,12 @@ impl Lighter {
             if self.hardware.is_none() {
                 self.hardware = Some(vulkan::Renderer::new(
                     device,
-                    &trace_source(HARDWARE, self.compact_terrain, self.screen_reuse != 0),
+                    self.compact_terrain,
+                    self.screen_reuse != 0,
+                    self.world
+                        .as_ref()
+                        .and_then(|w| w.textures.bc_pages.as_ref())
+                        .filter(|_| self.bc_pages),
                 )?);
             }
             let rt = self.hardware.as_mut().unwrap();

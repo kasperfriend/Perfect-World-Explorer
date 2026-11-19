@@ -283,7 +283,9 @@ impl Harness {
             &wgpu::DeviceDescriptor {
                 label: Some("Lighter test device"),
                 required_features: features
-                    | (adapter.features() & wgpu::Features::TIMESTAMP_QUERY),
+                    | (adapter.features()
+                        & (wgpu::Features::TIMESTAMP_QUERY
+                            | wgpu::Features::TEXTURE_COMPRESSION_BC)),
                 required_limits: wgpu::Limits::downlevel_defaults(),
             },
             None,

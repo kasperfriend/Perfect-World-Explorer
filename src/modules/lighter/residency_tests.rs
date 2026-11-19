@@ -118,3 +118,178 @@ fn lighter_paced_residency_software() {
 fn lighter_paced_residency_interop() {
     crossing(Mode::Hardware, true);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires BC1 sampled arrays and Vulkan KHR_ray_query on a CPU ICD"]
+fn lighter_bc_texture_pages_interop() {
+    let mut h = Harness::new(Mode::Hardware, true);
+    h.ray.bc_pages = true;
+    h.ray.compact_terrain = true;
+    let mut frame = test_frame(Vec3::new(-0.3, 3.5, 0.2), -Vec3::Y, 23);
+    frame.terrain = [128., 128., 1., 128.];
+    let scene = || {
+        let mut b = Builder::for_mode(Mode::Hardware);
+        let patch = quad(
+            &mut b,
+            [
+                [-20., 0., -20.],
+                [20., 0., -20.],
+                [-20., 0., 20.],
+                [20., 0., 20.],
+            ],
+            [0., 1., 0.],
+            0,
+            TERRAIN,
+            u32::MAX,
+        );
+        put(&mut b, patch);
+        b.finish()
+    };
+    let table = |bank: &mut Textures, addr: u32, scale: f32| {
+        let at = bank.reserve(9).unwrap();
+        bank.write_words(
+            at,
+            &[
+                (at + 4) as u32,
+                1,
+                0,
+                0,
+                addr,
+                0,
+                1,
+                scale.to_bits(),
+                scale.to_bits(),
+            ],
+        );
+        at as u32
+    };
+    let mut paged = Textures::default();
+    let mut buffer = Textures::default();
+    let mut rgba = Textures::default();
+    let [w, hgt] = [129u32, 87u32];
+    let levels = 8;
+    let scales = [0.12, 0.7, 5.3];
+    let mut offsets = Vec::new();
+    for (tag, bytes) in [(b"DXT1", 8), (b"DXT3", 16), (b"DXT5", 16)] {
+        let mut raw = vec![0; 128];
+        raw[..4].copy_from_slice(b"DDS ");
+        raw[84..88].copy_from_slice(tag);
+        for (at, n) in [
+            (4, 124u32),
+            (12, hgt),
+            (16, w),
+            (28, levels),
+            (76, 32),
+            (80, 4),
+        ] {
+            raw[at..at + 4].copy_from_slice(&n.to_le_bytes());
+        }
+        for mip in 0..levels {
+            for i in 0..(w >> mip).max(1).div_ceil(4) * (hgt >> mip).max(1).div_ceil(4) {
+                if bytes == 16 {
+                    raw.extend([i as u8; 8]);
+                }
+                let c = 0x2545 + (i % 57) as u16 + 0x800 * (mip as u16);
+                let d = 0xf8bf - 0x400 * (mip as u16);
+                // Both endpoint orderings and the equal-endpoint case.
+                let (a, b) = match i % 5 {
+                    0 => (c, c),
+                    1 | 2 => (c, d),
+                    _ => (d, c),
+                };
+                raw.extend(a.to_le_bytes());
+                raw.extend(b.to_le_bytes());
+                raw.extend([0xe4, 0x93, 0x4e, 0x39]);
+            }
+        }
+        let tile = textures::Tile::bc_terrain(&raw, w, true).unwrap().unwrap();
+        let decoded =
+            crate::dxt::decode_chain(u32::from_le_bytes(*tag), &raw[128..], w, hgt, levels)
+                .unwrap();
+        let a = paged.insert_paged_terrain(&tile).unwrap();
+        let b = buffer.insert(&tile).unwrap();
+        let c = rgba
+            .insert(
+                &textures::Tile::levels(
+                    decoded.iter().map(|l| ([l.width, l.height], &*l.rgba)),
+                    w,
+                    textures::Filter::Color,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        for scale in scales {
+            offsets.push([
+                table(&mut paged, a, scale),
+                table(&mut buffer, b, scale),
+                table(&mut rgba, c, scale),
+            ]);
+        }
+    }
+    paged.seal();
+    let empty = Builder::for_mode(Mode::Hardware).finish();
+    let mut draw = |h: &mut Harness, lane| -> Vec<_> {
+        offsets
+            .iter()
+            .map(|at| {
+                frame.options[3] = at[lane];
+                h.pixels(frame, &empty)
+            })
+            .collect()
+    };
+    let expanded = rgba.byte_len();
+    let compact = buffer.byte_len();
+    let paged_payload = paged.byte_len();
+    h.ray.install(Ok((scene(), paged.fork_prefix())));
+    let samples = draw(&mut h, 0);
+    let stats = h.ray.bc_page_stats();
+    assert_eq!(
+        stats[0], 3,
+        "buffer fallback did not exercise the texture unit"
+    );
+    assert!(stats[1] > 0 && stats[2] > 0);
+    // No re-upload on a differently sized resident suffix with the same
+    // sealed terrain pages. Exercise the paced raw VkBuffer replacement.
+    let mut replacement = paged.fork_prefix();
+    replacement.reserve(500).unwrap();
+    let packet = scene();
+    crate::gpu::wait_for_capture(&h.device, || {
+        h.ray
+            .stage_resident(&h.device, &h.queue, &packet, &replacement)
+            .map(|ready| ready.then_some(()))
+    })
+    .unwrap();
+    h.ray.install(Ok((packet, replacement)));
+    assert_eq!(draw(&mut h, 0), samples);
+    assert_eq!(h.ray.bc_page_stats(), stats);
+    h.ray.install(Ok((scene(), buffer)));
+    let fallback = draw(&mut h, 1);
+    assert_eq!(h.ray.bc_page_stats(), [0; 3]);
+    h.ray.install(Ok((scene(), rgba)));
+    let reference = draw(&mut h, 2);
+    let mut max = 0;
+    let mut sum = 0u64;
+    let mut count = 0u64;
+    for ((a, b), c) in samples
+        .iter()
+        .flatten()
+        .zip(fallback.iter().flatten())
+        .zip(reference.iter().flatten())
+    {
+        assert_eq!(a.1, b.1);
+        assert_eq!(b.1, c.1);
+        for channel in 0..3 {
+            let delta = a.0[channel].abs_diff(c.0[channel]);
+            max = max.max(delta);
+            sum += u64::from(delta);
+            count += 1;
+            assert!(
+                b.0[channel].abs_diff(c.0[channel]) <= 1,
+                "normalized BC1 palette changed RGB"
+            );
+        }
+    }
+    eprintln!("Lighter BC sampled atlas: {stats:?}; RGB8 MAE {:.4}, max {max}; expanded {expanded}, compact {compact}, paged buffer {paged_payload} bytes", sum as f64/count as f64);
+    assert!(max <= 4, "unexpected BC/sRGB discrepancy {max} RGB8");
+}

@@ -107,6 +107,7 @@ impl FeedSource {
         m: &MeshData,
         authored_mips: bool,
         storage: usize,
+        native_bc: bool,
     ) -> Result<Self, String> {
         let mut result = Self {
             base: Textures::with_limit(storage),
@@ -148,11 +149,16 @@ impl FeedSource {
             }) <= terrain_bytes
         })
         .ok_or("Lighter terrain colours exceed their texture budget")?;
-        let compact = lighter::textures::compact_terrain_enabled();
+        let compact = native_bc || lighter::textures::compact_terrain_enabled();
         for texture in &upload.materials.textures {
             if compact {
-                if let Some(tile) = Tile::compact_terrain(&texture.source, terrain_limit)? {
-                    result.terrain_ids.push(result.base.insert(&tile)?);
+                if let Some(tile) = Tile::bc_terrain(&texture.source, terrain_limit, native_bc)? {
+                    let id = if native_bc {
+                        result.base.insert_paged_terrain(&tile)?
+                    } else {
+                        result.base.insert(&tile)?
+                    };
+                    result.terrain_ids.push(id);
                     continue;
                 }
             }
@@ -329,8 +335,9 @@ impl Feed {
         m: &MeshData,
         authored_mips: bool,
         storage: usize,
+        native_bc: bool,
     ) -> Result<Self, String> {
-        let source = Arc::new(FeedSource::new(t, m, authored_mips, storage)?);
+        let source = Arc::new(FeedSource::new(t, m, authored_mips, storage, native_bc)?);
         Ok(Self {
             packer: Some(StreamPacker::new(Arc::clone(&source))),
             resident: ResidentScene::default(),

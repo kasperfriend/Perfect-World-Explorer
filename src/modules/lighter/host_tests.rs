@@ -1570,7 +1570,7 @@ pub(crate) fn streamed_bmd_scenes(storage: usize) -> StreamedBmdScenes {
         first.local_pages.is_empty(),
         "native renderer must not load this distant BMD"
     );
-    let mut feed = super::Feed::new(&mut t, &first, false, storage).unwrap();
+    let mut feed = super::Feed::new(&mut t, &first, false, storage, false).unwrap();
     let install = |feed: &mut super::Feed,
                    mesh: &super::MeshData,
                    (local, extra, outside): (usize, usize, usize)| {

@@ -1,7 +1,7 @@
 //! Rasterize the *packet*, not a second copy of the Native draw list. The
 //! packet's posed vertices, wind transforms, coverage/material rules and
 //! extent match the following trace. Ordered sheets remain in transport.
-use super::{pipeline, shader_entry, vkerr, Context, Frame, Packet, DYNAMIC_BIT, LOCAL, R};
+use super::{image::Image, pipeline, shader_entry, vkerr, Context, Frame, Packet, DYNAMIC_BIT, R};
 use ash::vk;
 use glam::{Mat4, Vec3, Vec4};
 use std::{ffi::CStr, sync::Arc};
@@ -22,111 +22,38 @@ pub(super) fn supported(instance: &ash::Instance, physical: vk::PhysicalDevice) 
     }
 }
 
-struct Attachment {
-    ctx: Arc<Context>,
-    image: vk::Image,
-    memory: vk::DeviceMemory,
-    view: vk::ImageView,
-    charged: u64,
-}
-
-impl Attachment {
-    fn new(ctx: &Arc<Context>, size: vk::Extent2D, color: bool) -> R<Self> {
-        let (format, usage, aspect) = if color {
-            (
-                COLOR,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-                vk::ImageAspectFlags::COLOR,
-            )
-        } else {
-            (
-                DEPTH,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-                vk::ImageAspectFlags::DEPTH,
-            )
-        };
-        let d = &ctx.device;
-        unsafe {
-            let image = d
-                .create_image(
-                    &vk::ImageCreateInfo::builder()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(format)
-                        .extent(vk::Extent3D {
-                            width: size.width,
-                            height: size.height,
-                            depth: 1,
-                        })
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(usage),
-                    None,
-                )
-                .map_err(vkerr("create primary attachment"))?;
-            let mut out = Self {
-                ctx: ctx.clone(),
-                image,
-                memory: vk::DeviceMemory::null(),
-                view: vk::ImageView::null(),
-                charged: 0,
-            };
-            let req = d.get_image_memory_requirements(image);
-            let ty = (0..ctx.memory.memory_type_count)
-                .find(|&i| {
-                    req.memory_type_bits & (1 << i) != 0
-                        && ctx.memory.memory_types[i as usize]
-                            .property_flags
-                            .contains(LOCAL)
-                })
-                .ok_or("No device-local memory type for Lighter primary image")?;
-            ctx.budget.reserve(req.size)?;
-            out.charged = req.size;
-            out.memory = d
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::builder()
-                        .allocation_size(req.size)
-                        .memory_type_index(ty),
-                    None,
-                )
-                .map_err(vkerr("allocate primary attachment"))?;
-            d.bind_image_memory(image, out.memory, 0)
-                .map_err(vkerr("bind primary attachment"))?;
-            out.view = d
-                .create_image_view(
-                    &vk::ImageViewCreateInfo::builder()
-                        .image(image)
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(format)
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: aspect,
-                            base_mip_level: 0,
-                            level_count: 1,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        }),
-                    None,
-                )
-                .map_err(vkerr("create primary attachment view"))?;
-            Ok(out)
-        }
-    }
-}
-impl Drop for Attachment {
-    fn drop(&mut self) {
-        unsafe {
-            self.ctx.device.destroy_image_view(self.view, None);
-            self.ctx.device.destroy_image(self.image, None);
-            self.ctx.device.free_memory(self.memory, None);
-        }
-        self.ctx.budget.release(self.charged);
-    }
+fn attachment(ctx: &Arc<Context>, size: vk::Extent2D, color: bool) -> R<Image> {
+    let (format, usage, aspect) = if color {
+        (
+            COLOR,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageAspectFlags::COLOR,
+        )
+    } else {
+        (
+            DEPTH,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            vk::ImageAspectFlags::DEPTH,
+        )
+    };
+    Image::new(
+        ctx,
+        size,
+        format,
+        usage,
+        vk::ImageSubresourceRange {
+            aspect_mask: aspect,
+            level_count: 1,
+            layer_count: 1,
+            ..Default::default()
+        },
+        vk::ImageViewType::TYPE_2D,
+    )
 }
 
 struct Target {
-    colors: Attachment,
-    _depth: Attachment,
+    colors: Image,
+    _depth: Image,
     frame: vk::Framebuffer,
     size: vk::Extent2D,
 }
@@ -341,8 +268,8 @@ impl Primary {
         if self.target.as_ref().is_none_or(|t| t.size != size) {
             // Native fence has signaled; only this queue ever names these.
             self.target = None;
-            let colors = Attachment::new(&self.ctx, size, true)?;
-            let depth = Attachment::new(&self.ctx, size, false)?;
+            let colors = attachment(&self.ctx, size, true)?;
+            let depth = attachment(&self.ctx, size, false)?;
             let views = [colors.view, depth.view];
             let fb = unsafe {
                 self.ctx.device.create_framebuffer(

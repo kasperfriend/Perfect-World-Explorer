@@ -341,3 +341,34 @@ any of these changes by default (other than the one-sample water guard).
   [RT-17](retail-matrix.md) remains open: complete real-map image review,
   matched physical GPU modes and normal-present distributions/whole-viewer
   memory cannot be inferred from fixture or CPU Vulkan evidence.
+
+
+### Sampled terrain BC pages
+
+`PW_RAY_BC_TEXTURES=1` opts **Hardware Vulkan** into an immutable 256×256
+BC1-sRGB array, at most 64 layers (2 MiB block payload, plus driver
+alignment). Each admitted authored mip occupies a block-aligned rectangle;
+CPU code records an address for each mip. BC2/3 opaque RGB is represented
+by the equivalent four-color BC1 palette with reindexed endpoints; terrain
+does not use those alpha planes. Repeat, fractional mip and anisotropic
+weights are still explicit at the ray footprint. `textureLoad` runs BC and
+sRGB decode through the texture unit and cannot filter across a page boundary.
+This is not hardware anisotropic filtering or demand paging. Large tiles,
+full pages and unsupported/failed image admission fall back to the portable
+buffer path. Masks, alpha cutouts, moving materials and BC5/7 model maps are
+not in this atlas. The atlas persists across world crossings, and its copy
+uses the existing texel bank as the source; the compressed buffer remains
+resident for fallback. The initial atlas copy runs during the watched first
+ray frame. Hardware is unchanged unless the experiment is requested.
+
+On the CPU Vulkan fixture, three 129×87 DXT1/3/5 chains with eight levels
+and three different footprints used **two layers (65,536 allocated bytes)**.
+The padded buffer consumed another 23,852 logical bytes vs 178,788 expanded,
+so the sampled path saves logical payload vs RGBA but costs more than buffer
+BC alone (23,748 B). The color difference from expanded was **0.1596 RGB8
+MAE, maximum 1**; current reverse-Z was identical. The test confirmed the
+sampler path was active, retained it across a staged scene replacement, and
+checked the buffer fallback. `bc_sampled_tiles`, `bc_sampled_pages` and
+`bc_image_allocated_bytes` in a pictured-frame sidecar distinguish actual
+admission from the request. This test does not establish a sampling speedup
+or a whole-viewer memory reduction on a physical GPU.

@@ -2301,6 +2301,7 @@ impl Renderer {
                 &m,
                 vegetation_authored_mips,
                 crate::modules::lighter::storage_limit(&device),
+                lighter.uses_bc_pages(),
             ) {
                 Ok(mut feed) => {
                     feed.install_initial(&mut lighter, &m, &device);
@@ -9060,6 +9061,8 @@ fn preview_frame_using(
                 mips.bc_terrain_tiles, mips.bc_terrain_saved_bytes
             )
             .unwrap();
+            let [tiles, pages, bytes] = renderer.lighter.bc_page_stats();
+            writeln!(meta, "bc_sampled_tiles={tiles}\nbc_sampled_pages={pages}\nbc_image_allocated_bytes={bytes}").unwrap();
             if let Some(bmd) = &renderer.lighter.scenery_coverage {
                 writeln!(meta, "{bmd}").unwrap();
             }

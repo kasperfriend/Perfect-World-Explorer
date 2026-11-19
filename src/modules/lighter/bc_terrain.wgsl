@@ -54,7 +54,7 @@ fn terrain_tile(addr: u32, uv: vec2<f32>, taps: Taps) -> vec3<f32> {
     for (var i=0u; i<taps.count; i++) {
         let p = uv+(f32(i)+0.5-0.5*f32(taps.count))*taps.step;
         for (var l=0u; l<levels; l++) {
-            sum += bc_terrain_level(addr,p,mip+l,fmt==BC_TERRAIN_1)*select(1.-part,part,l!=0u);
+            sum += bc_sample_level(addr,p,mip+l,fmt)*select(1.-part,part,l!=0u);
         }
     }
     return sum/f32(taps.count);
