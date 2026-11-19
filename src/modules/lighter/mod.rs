@@ -1061,6 +1061,31 @@ impl Lighter {
         )
     }
 
+    /// Counters for the just-published streamed candidate, not allocator or
+    /// timing data. The caller only attaches them to a commit receipt.
+    pub(crate) fn travel_pacing(&self) -> Option<[u64; 6]> {
+        self.last_residency.map(|s| {
+            [
+                s.batches,
+                s.host_bytes,
+                s.resident_bytes,
+                s.max_batch_bytes as u64,
+                s.blas_batches,
+                s.blas_builds,
+            ]
+        })
+    }
+
+    pub(crate) fn travel_textures(&self) -> [u64; 5] {
+        let logical = self
+            .world
+            .as_ref()
+            .map_or(0, |w| w.textures.byte_len() as u64);
+        let [tiles, _, images] = self.bc_page_stats();
+        let [bc5, bc7] = self.bc_material_tiles();
+        [logical, tiles, bc5, bc7, images]
+    }
+
     pub fn armed(&self) -> bool {
         self.armed
     }

@@ -109,7 +109,7 @@ def validate_rows(path, meta, rows, policy):
     return meta, mode, poses, result
 
 
-def validate_pair(a, b, reuse_ab=False):
+def validate_pair(a, b, reuse_ab=False, *, sampled_bc_ab=False):
     for key in MATCH:
         if a[0][key] != b[0][key]:
             raise ValueError(f"unmatched travel {key}: {a[0][key]} vs {b[0][key]}")
@@ -121,7 +121,7 @@ def validate_pair(a, b, reuse_ab=False):
     if "Off" not in (a[1], b[1]):
         normalize = lambda meta: re.sub(r"(mode: \w+, |hybrid_primary: (true|false), )", "", meta["ray"])
         for key in RAY_MATCH:
-            if reuse_ab and key == "screen_cache_mask":
+            if (reuse_ab and key == "screen_cache_mask") or (sampled_bc_ab and key == "sampled_bc"):
                 continue
             if a[0][key] != b[0][key]:
                 raise ValueError(f"unmatched ray {key}: {a[0][key]} vs {b[0][key]}")

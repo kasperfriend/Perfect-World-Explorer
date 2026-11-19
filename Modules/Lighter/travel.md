@@ -124,9 +124,10 @@ For each route, use the same plan within each of these distinct modes:
   directory; use a 30–600 frame plan. It writes `000000.png` onward from the
   world-color target before UI and display composition. Readback stalls
   this path. Its CSV has `capture_policy=motion_readback` and is rejected by
-  both timing reports. For each provider retain the path and frame numbers
-  of ghosting, reveals, foliage and water flicker; a replay cut can be
-  represented by consecutive keyframes.
+  the timing reports. Use `lighter_motion_review.py` to bind decoded pixels,
+  camera cuts, fixed animation time and wet-eye depth to the ordered PNGs.
+  Retain actual artifact findings by provider and frame range, not just the
+  presence of a PNG. A replay cut uses consecutive, discontinuous keyframes.
 - **Synchronized GPU stages:** set `PW_LIGHTER_TRAVEL_SYNC=1`, unset motion
   capture, and use **500+** measured frames (last index ≥499). It drains
   the wgpu queue and raw fences before presenting, records current-draw
@@ -142,4 +143,13 @@ python3 tools/lighter_travel_report.py --require-sdk-matrix \
 
 The strict suite requires the exact Windows RTX 3080 Vulkan adapter,
 matched controls, and per-frame heap, ray trace and (where applicable) SDK
-samples. [Acceptance status and host requirements](REMAINING.md).
+samples. Include the seven separate normal-present files after
+`--normal-companions` to verify matched cadence controls in the same report.
+For Native, `gpu_native_world_span_ms` measures the world queue timestamp
+interval, including possible idle between world submissions, not UI or WSI.
+
+In ray travel, the CSV separates logical texture-bank bytes, charged BC image
+bytes and live tile counts. Paced copy/BLAS counters, when available, appear
+only on a resident commit row; partial or rejected uploads are not counted.
+Use `lighter_renderer_ab.py` for the explicit counterbalanced Hybrid or
+sampled-BC timing A/B. [Acceptance status and host requirements](REMAINING.md).

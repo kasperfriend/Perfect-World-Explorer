@@ -99,6 +99,38 @@ class TravelTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "camera paths disagree"):
             matched_normal_companions(records, [(*records[0][:2], [(0, 1, 0, 0, 0)], records[0][3]), *records[1:]])
 
+    def test_renderer_counters_require_admission_and_bounded_paced_publication(self):
+        from lighter_renderer_ab import PACING, TEXTURES, renderer_counters
+
+        base = dict(zip(TEXTURES, map(str, (4000, 3, 1, 1, 131072)), strict=True)) | {"frame": "21", "committed": "1"}
+        paced = dict(zip(PACING, map(str, (5, 27000, 5500, 8192, 3, 18)), strict=True))
+        result = renderer_counters([base | paced], True, True, True)
+        self.assertEqual(result["texture_counters_peak"]["ray_bc_image_allocated_bytes"], 131072)
+        self.assertEqual(result["resident_commit_receipts"][0]["resident_blas_builds"], 18)
+        with self.assertRaisesRegex(ValueError, "both BC5 and BC7"):
+            renderer_counters([base | paced | {"ray_bc7_tiles": "0"}], True, True, True)
+        with self.assertRaisesRegex(ValueError, "allocations survived"):
+            renderer_counters([base | paced | {"ray_bc_tiles": "0", "ray_bc5_tiles": "0", "ray_bc7_tiles": "0"}], False, False, False)
+        with self.assertRaisesRegex(ValueError, "completed publication"):
+            renderer_counters([base | paced | {"committed": "0"}], True, True, True)
+        with self.assertRaisesRegex(ValueError, "over-budget"):
+            renderer_counters([base | paced | {"resident_max_batch_bytes": str((4 << 20) + 1)}], True, True, True)
+
+    def test_ab_needs_raster_inclusive_gain_in_both_repetitions(self):
+        from lighter_renderer_ab import review
+
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = capture(self.write(directory))
+            hybrid = capture(self.write(directory, name="hybrid.csv"))
+            normal = [(r, {"normal_present_calls": {"p95_ms": ms}}) for r, ms in
+                      ((baseline, 22), (hybrid, 18), (hybrid, 19), (baseline, 21))]
+            sync = [(r, {"gpu_primary_plus_trace": {"p50_ms": ms}, "peak_sampled_device_local_heap_estimate_bytes": 100})
+                    for r, ms in ((baseline, 8), (hybrid, 6), (hybrid, 9), (baseline, 8))]
+            report = review("hybrid", normal, sync, 2.)
+            self.assertTrue(report["comparisons"][0]["meets_timing_threshold"])
+            self.assertFalse(report["comparisons"][1]["meets_timing_threshold"])
+            self.assertFalse(report["repeatable_timing_gain_only"])
+
     def test_motion_receipt_binds_pixels_and_review_to_rendered_cut(self):
         import hashlib
         from PIL import Image

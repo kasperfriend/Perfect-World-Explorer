@@ -8593,16 +8593,22 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         }
                                     } else { None };
                                     let mut chosen = renderer.lighter.settings.effective();
-                                    let (trace_extent, experiments) = if ray_world {
+                                    let committed = std::mem::take(&mut stream_commit_pending);
+                                    let actual_rays = renderer.renders_rays();
+                                    let (trace_extent, experiments) = if actual_rays {
                                         renderer.lighter.travel_trace()
                                     } else {
                                         chosen.mode = LighterMode::Off;
                                         ((0,0),(0,false,false))
                                     };
+                                    let ray = actual_rays.then(|| lighter_travel::RaySample {
+                                        textures: renderer.lighter.travel_textures(),
+                                        pacing: if committed { renderer.lighter.travel_pacing() } else { None },
+                                    });
                                     let present_ms = (presented_at-present_started.unwrap()).as_secs_f64() * 1000.;
                                     flight.presented(presented_at, redraw_started, [acquire_ms,present_ms], chosen, renderer.lighter.raster_active(),
                                         [(config.width,config.height),world_extent, trace_extent],config.present_mode,pose,renderer.center,
-                                        streaming,std::mem::take(&mut stream_commit_pending),&settings,experiments,sync,motion);
+                                        streaming,committed,&settings,experiments,sync,motion,ray);
                                     #[cfg(test)]
                                     if smoke_travel.is_some() && flight.recorded() {
                                         target.exit();

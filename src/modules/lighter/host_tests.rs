@@ -1529,10 +1529,15 @@ fn lighter_live_travel_csv() {
     let motion = std::env::var_os("PW_TEST_LIGHTER_TRAVEL_MOTION").is_some();
     let sync = std::env::var_os("PW_TEST_LIGHTER_TRAVEL_SYNC").is_some();
     let count = if sync { 500 } else { 30 };
+    let middle = if motion {
+        "14 0 5 -2 0 -0.6\n15 0 5 -2 0.8 -0.6\n"
+    } else {
+        ""
+    };
     std::fs::write(
         root.0.join("travel.plan"),
         format!(
-            "lighter-fixture 12 3\n0 -2.5 5 0 0 -0.7853982\n{} 2.5 5 -4 0.2 -0.5\n",
+            "lighter-fixture 12 3\n0 -2.5 5 0 0 -0.7853982\n{middle}{} 2.5 5 -4 0.2 -0.5\n",
             count - 1
         ),
     )
@@ -1588,6 +1593,7 @@ fn lighter_live_travel_csv() {
             let path = root.0.join("motion").join(format!("{i:06}.png"));
             let rgba = image::open(path).unwrap().into_rgba8();
             assert_eq!(columns[18], format!("{:x}", Sha256::digest(rgba.as_raw())));
+            assert_eq!(columns[16] == "1", i == 15, "incorrect rendered cut at {i}");
             assert!(columns[15].parse::<u64>().unwrap() >= (i as u64 + 1) * 16);
         }
         assert_eq!(columns[0].parse::<usize>().unwrap(), i);

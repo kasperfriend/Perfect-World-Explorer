@@ -249,6 +249,11 @@ pub(super) struct MotionSample {
     pub(super) underwater_depth: f32,
 }
 
+pub(super) struct RaySample {
+    pub(super) textures: [u64; 5],
+    pub(super) pacing: Option<[u64; 6]>,
+}
+
 struct Sample {
     interval_ms: f64,
     redraw_ms: f64,
@@ -260,6 +265,7 @@ struct Sample {
     heap_bytes: Option<u64>,
     sync: Option<SyncSample>,
     motion: Option<MotionSample>,
+    ray: Option<RaySample>,
 }
 
 struct Setup {
@@ -477,12 +483,17 @@ impl Travel {
         experiments: (u32, bool, bool),
         sync: Option<SyncSample>,
         motion: Option<MotionSample>,
+        ray: Option<RaySample>,
     ) {
         if self.finished {
             return;
         }
         if settings.mode != self.mode || raster != self.hybrid {
             self.invalidate("drawn route does not match travel experiment");
+            return;
+        }
+        if (settings.mode != Mode::Off) != ray.is_some() {
+            self.invalidate("missing ray renderer counters");
             return;
         }
         if self.sync != sync.is_some() {
@@ -548,6 +559,7 @@ impl Travel {
             heap_bytes,
             sync,
             motion,
+            ray,
         });
         if self.samples.len() == self.plan.samples() as usize {
             self.finished = true;
@@ -632,6 +644,9 @@ impl Travel {
                 ",animation_elapsed_ms,camera_cut,eye_underwater_depth,rgba8_sha256"
             )?;
         }
+        if self.mode != Mode::Off {
+            write!(out, ",ray_texture_bank_bytes,ray_bc_tiles,ray_bc5_tiles,ray_bc7_tiles,ray_bc_image_allocated_bytes,resident_copy_batches,resident_host_bytes,resident_reused_bytes,resident_max_batch_bytes,resident_blas_batches,resident_blas_builds")?;
+        }
         writeln!(out)?;
         for (i, s) in self.samples.iter().enumerate() {
             let [x, y, z, yaw, pitch] = s.pose;
@@ -677,6 +692,18 @@ impl Travel {
                     motion.underwater_depth,
                     motion.rgba8_sha256
                 )?;
+            }
+            if let Some(ray) = &s.ray {
+                for counter in ray.textures {
+                    write!(out, ",{counter}")?;
+                }
+                if let Some(pacing) = ray.pacing {
+                    for counter in pacing {
+                        write!(out, ",{counter}")?;
+                    }
+                } else {
+                    write!(out, ",,,,,,")?;
+                }
             }
             writeln!(out)?;
         }

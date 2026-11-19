@@ -75,8 +75,22 @@ fn crossing(mode: Mode, cpu_query: bool) {
         );
     }
     assert_eq!(h.ray.revision, submit_revision);
+    let next_bank_len = next_bank.byte_len() as u64;
     h.ray.install(Ok((packet, next_bank)));
     let stats = h.ray.last_residency.expect("candidate was not installed");
+    let [batches, host, reused, peak, blas_batches, builds] = h.ray.travel_pacing().unwrap();
+    assert_eq!(
+        [batches, host, reused, peak, blas_batches, builds],
+        [
+            stats.batches,
+            stats.host_bytes,
+            stats.resident_bytes,
+            stats.max_batch_bytes as u64,
+            stats.blas_batches,
+            stats.blas_builds
+        ]
+    );
+    assert_eq!(h.ray.travel_textures(), [next_bank_len, 0, 0, 0, 0]);
     assert_eq!(stats.batches as usize, expected_batches);
     assert_eq!(stats.max_batch_bytes, limit);
     assert_eq!(stats.resident_bytes, prefix as u64);

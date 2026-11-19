@@ -54,3 +54,34 @@ rather than attributing the entire delta to filtering. Keep **Hybrid,
 sampled BC and DI/GI reuse off by default** until physical measurements
 justify changing policy. See [performance](../../performance.md),
 [budgets](../../gpu-budget.md) and [travel](../../travel.md).
+
+## Ordered follow-up: live renderer receipts and A/B checks
+
+Ray travel CSVs now record texture-bank payload bytes, sampled tile counts
+(total, BC5, BC7) and charged BC image bytes separately. On a measured
+resident publication they bind the copy count, host/reused bytes, largest
+copy batch, BLAS batches and BLAS builds to the commit row. These are
+counters for completed publications, not cancelled upload work or GPU
+stage times. The driver heap estimate remains a separate measurement.
+
+`tools/lighter_renderer_ab.py --kind hybrid|sampled-bc` evaluates fresh
+**A–B–B–A** normal-present and synchronized sets, rejecting silent route or
+page fallback and mismatched settings/poses. Run `--help` for paths and a
+predeclared minimum gain. Use `--require-pacing` on a path with actual
+static BLAS work and `--require-bc5-bc7` for the sampled material test.
+Hybrid reports **raster primary plus trace** per completed draw before
+summarizing; a traversal-only improvement is insufficient. The report
+requires both repetitions to meet the timing threshold for synchronized
+primary+trace p50 and normal-present p95. It is not a default-enablement
+or image-quality verdict. Retain actual inputs, logs and matched visuals.
+
+New S results: both paced fixture routes passed, including five copies
+with 8,192 B max and 18 Hardware BLAS in three batches. Default-vector
+llvmpipe repeated the 16-sample BC5/BC7 check (max error **0.0000002**); the
+same small test failed with local forced 128-bit vectors/one thread
+(**0.8235295** max error). Do not treat CPU vector overrides as a supported
+performance path. Forced unavailable raster again preserved ambient color
+and reverse-Z. The ordered bundle includes both BC outcomes. None of these
+fixtures supplies live retail tails, physical sampled-vs-buffer allocation
+or speed, or fast-flight DI variance/GI bias vs a converged Reference.
+Keep all three experiments opt-in.

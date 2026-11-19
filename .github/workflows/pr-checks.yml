@@ -132,6 +132,8 @@ jobs:
               | while IFS= read -r line; do [ -n "$line" ] && echo "::error::$line"; done
           fi
           exit "$status"
+      - name: Test the authored scene and effect graph census
+        run: cargo test --locked --bin lighter-scene-audit audit_tests
       - name: Run viewer unit tests
         run: |
           CARGO_TERM_COLOR=never cargo test --locked --bin perfect-world-explorer 2>&1 | tee /tmp/cargo-test.log
@@ -349,6 +351,27 @@ jobs:
           "$RUNNER_TEMP/lighter-evidence-python/bin/python" tools/lighter_motion_review.py \
             --plan target/lighter-travel-motion.plan \
             --fixture target/lighter-travel-motion.csv target/lighter-travel-motion > target/lighter-travel-motion.json
+          python3 - <<'PY'
+          import hashlib, json
+          from pathlib import Path
+          t = Path('target')
+          motion = json.loads((t / 'lighter-travel-motion.json').read_text())['sequences']['fixture']
+          synchronized = json.loads((t / 'lighter-travel-synchronized.json').read_text())['captures'][0]
+          normal = json.loads((t / 'lighter-travel-fixture.json').read_text())['captures'][0]
+          receipt = {
+              'scope': 'synthetic Xvfb Native, CPU Vulkan; not P/V',
+              'normal_frames': normal['normal_present_calls']['n'],
+              'normal_csv_sha256': normal['csv_sha256'],
+              'sync_frames': synchronized['synchronized_present_calls']['n'],
+              'sync_native_gpu_span': synchronized['synchronized_stages']['gpu_native_world_span_ms'],
+              'sync_csv_sha256': synchronized['csv_sha256'],
+              'motion_frames': len(motion['frames']),
+              'motion_cuts': [f['index'] for f in motion['frames'] if f['cut']],
+              'motion_csv_sha256': motion['csv_sha256'],
+              'motion_index_sha256': hashlib.sha256((t / 'lighter-travel-motion.json').read_bytes()).hexdigest(),
+          }
+          print(f'::notice title=Lighter travel fixture receipt::{json.dumps(receipt, separators=(",", ":"))}')
+          PY
       - name: Keep the synthetic live travel capture
         uses: actions/upload-artifact@v4
         with:
