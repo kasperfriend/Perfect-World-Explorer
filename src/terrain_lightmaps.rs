@@ -88,9 +88,56 @@ impl Pair {
     }
 }
 pub const TILES: usize = 16;
+
+/// Edge length of one lightmap tile, in texels.
+///
+/// Two are shipped and both are measured, not guessed: every `login_*`,
+/// `a91_*` and `a85_*` `.t2lm` in the staged clients is **128**, and
+/// `world_8.t2lm` (the file the phase-1 record describes) is **256**. The
+/// header states which, so the reader reads it rather than assuming one --
+/// an assumption of 256 refuses every login map and 128-tile world map, and
+/// one of 128 misreads every 256 tile.
+pub fn tile_side(bytes: &[u8]) -> Result<usize, String> {
+    let side = u32::from_le_bytes(
+        bytes
+            .get(12..16)
+            .ok_or("truncated T2LM header")?
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    match side {
+        128 | 256 => Ok(side),
+        other => Err(format!(
+            "unsupported T2LM tile edge {other}; this build reads 128 and 256"
+        )),
+    }
+}
+
+/// Read the tile edge from a file's header without loading its payload.
+///
+/// The atlas has to be sized before the first upload, and a tile edge can only
+/// be learned from a file, so the caller needs a cheap header probe. `Ok(None)`
+/// means the file is absent -- the caller treats that as "no authored maps"
+/// rather than as an error, matching `Pair::read_optional`.
+pub fn side_of(path: &std::path::Path) -> Result<Option<usize>, String> {
+    use std::io::Read;
+    let mut head = [0u8; 16];
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    file.read_exact(&mut head)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    tile_side(&head)
+        .map(Some)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
 pub struct Tiles<'a> {
     bytes: &'a [u8],
     ranges: [(usize, usize); TILES],
+    side: usize,
 }
 impl<'a> Tiles<'a> {
     pub fn parse(bytes: &'a [u8]) -> Result<Self, String> {
@@ -104,9 +151,12 @@ impl<'a> Tiles<'a> {
                     .unwrap(),
             ) as usize)
         };
-        if u(0)? != 0x54324c4d || u(4)? != 2 || u(8)? != TILES || u(12)? != 256 || u(16)? != 1 {
-            return Err("unsupported T2LM version, tile geometry or DDS flags".into());
+        if u(0)? != 0x54324c4d || u(4)? != 2 || u(8)? != TILES || u(16)? != 1 {
+            return Err("unsupported T2LM version, tile count or DDS flags".into());
         }
+        // The tile edge is read, not asserted: both 128 and 256 ship. See
+        // `tile_side`, which also names the value when it is neither.
+        let side = tile_side(bytes)?;
         let size = u(20)?;
         if size == 0 {
             return Err("empty T2LM tile".into());
@@ -123,7 +173,15 @@ impl<'a> Tiles<'a> {
             }
             ranges[i] = (start, end);
         }
-        Ok(Self { bytes, ranges })
+        Ok(Self {
+            bytes,
+            ranges,
+            side,
+        })
+    }
+    /// Edge length of every tile in this file, in texels (128 or 256).
+    pub fn side(&self) -> usize {
+        self.side
     }
     pub fn tile(&self, i: usize) -> Option<&'a [u8]> {
         self.ranges.get(i).map(|&(a, b)| &self.bytes[a..b])
@@ -260,7 +318,7 @@ mod tests {
             (0, 0),
             (4, 3),
             (8, 15),
-            (12, 128),
+            (12, 64),
             (16, 0),
             (16, 3),
             (20, 0),
@@ -274,6 +332,58 @@ mod tests {
             assert!(Tiles::parse(&b).is_err(), "{p}/{v}");
         }
     }
+    /// The atlas is sized from a header probe before any payload is read, so
+    /// the probe has to agree with `parse` and has to distinguish an absent
+    /// file from a malformed one.
+    #[test]
+    fn header_probe_reports_absent_and_malformed_differently() {
+        let root = std::env::temp_dir().join(format!("pw-lm-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for side in [128u32, 256] {
+            let path = root.join(format!("probe{side}.t2lm"));
+            let mut b = fixture();
+            b[12..16].copy_from_slice(&side.to_le_bytes());
+            std::fs::write(&path, &b).unwrap();
+            assert_eq!(side_of(&path).unwrap(), Some(side as usize));
+            // The probe and the parser must not disagree about the same file.
+            assert_eq!(Tiles::parse(&b).unwrap().side(), side as usize);
+        }
+        // Absent is not an error: a subterrain with no authored map is normal.
+        assert_eq!(side_of(&root.join("missing.t2lm")).unwrap(), None);
+        // Malformed is, and the reason names the file.
+        let bad = root.join("bad.t2lm");
+        let mut b = fixture();
+        b[12..16].copy_from_slice(&512u32.to_le_bytes());
+        std::fs::write(&bad, &b).unwrap();
+        let error = side_of(&bad).unwrap_err();
+        assert!(error.contains("bad.t2lm"), "{error}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Both tile edges ship, so both must read, and the side must be reported
+    /// rather than assumed. `login_*`/`a91_*`/`a85_*` `.t2lm` are 128;
+    /// `world_8.t2lm` is 256.
+    #[test]
+    fn reads_the_tile_edge_the_header_states() {
+        for side in [128u32, 256] {
+            let mut b = fixture();
+            b[12..16].copy_from_slice(&side.to_le_bytes());
+            let t = Tiles::parse(&b).unwrap();
+            assert_eq!(t.side(), side as usize, "header side {side}");
+            assert_eq!(t.tile(0).unwrap(), [0; 4]);
+        }
+        // A tile edge no client ships is refused by name, not silently read as
+        // whichever of the two happens to be first in a `match`.
+        let mut b = fixture();
+        b[12..16].copy_from_slice(&512u32.to_le_bytes());
+        let error = match Tiles::parse(&b) {
+            Ok(_) => panic!("a 512 tile edge must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.contains("512"), "{error}");
+        assert!(error.contains("128 and 256"), "{error}");
+    }
+
     #[test]
     fn rectangular_world_layout_is_bijective() {
         for (x, y) in [(44, 32), (32, 44), (4, 4), (8, 12)] {

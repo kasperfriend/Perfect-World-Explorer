@@ -186,3 +186,42 @@ The table was wrong, not the reader -- so `READ_RGB` is now checked against the
 parser rather than guessed from the pack. This is the same failure shape the
 `gfx.pck` census had (measuring the table instead of the code), which is why
 the two surveys live beside each other here.
+
+## T2LM lightmap tile edges measured (18 November)
+
+Item 75 asked whether `terrain_gpu.rs` should stop requiring DXT1 / one mip /
+256×256 for a lightmap. `tools/lightmap-survey.py` answers it from files
+rather than from the reader:
+
+| file | header edge | tile bytes | DDS | mips | format |
+| --- | --- | --- | --- | --- | --- |
+| `login_login.t2lm` | **128** | 8,320 | 128×128 ×16 | 0 | DXT1 ×16 |
+| `a91_6.t2lm` | **128** | 8,320 | 128×128 ×16 | 0 | DXT1 ×16 |
+| `a85_6.t2lm` | **128** | 8,320 | 128×128 ×16 | 0 | DXT1 ×16 |
+| `world_8.t2lm` | 256 | 32,896 | 256×256 ×16 | 0 | DXT1 ×16 |
+
+**The 256 was wrong for three of the four.** `Tiles::parse` asserted
+`u(12) == 256`, so it refused every login map and every 128-tile world map
+outright — not a silent misread, a hard `unsupported T2LM version, tile
+geometry or DDS flags` on files the client draws. The header at offset 12 is
+the tile edge, and two values ship, so it is now read (`tile_side`) instead of
+asserted, and anything other than 128 or 256 is refused *with the number it
+saw*.
+
+The DXT1 and one-mip parts were correct and stay enforced. The `world_8.t2lm`
+record in `Findings/Phase-1-completion-checks.md` was therefore accurate about
+the file it named and wrong as a general claim; the same 256 appears in
+`Findings/Research-log-02-rendering-and-lighting.md` ("All 88 `.t2lm` and
+`.t2lm1` files contain 16 DXT1 256² DDS images"), which the data contradicts.
+
+One thing the survey settled without being asked: in all four files the header
+edge and the DDS dimensions **agree**. `terrain_gpu` now requires that
+agreement explicitly, so a file repacked at one size but retiled at another is
+named rather than uploaded into a mismatched atlas slot.
+
+### Why the reader could not have caught this itself
+
+The offline suite compiles `terrain_lightmaps.rs` but never sees a client
+`.t2lm`; the phase-1 check ran on one 256 file and generalised. That is the
+recurring shape here — a claim measured once, written down as a rule, and then
+enforced against data that was never re-measured.

@@ -181,6 +181,11 @@ jobs:
           # rather than against a pack -- its first version reported 33 members
           # as unreadable that the parser has always accepted.
           python3 -m unittest tools.test_dds_survey
+          # The T2LM survey. The reader demanded a 256 tile edge while three of
+          # the four staged `.t2lm` files are 128, so every login map and the
+          # 128-tile world maps were refused outright. This pins the survey to
+          # the reader for both shipped edges.
+          python3 -m unittest tools.test_lightmap_survey
           python3 tools/check-eight-phase-status.py
           # The register's row count is quoted in TODO.md and the PR body. It
           # said 62 while the file held 61, which is the kind of number nobody

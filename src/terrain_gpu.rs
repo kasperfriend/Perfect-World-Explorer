@@ -1271,7 +1271,36 @@ fn load_lightmaps(
     let bc = device
         .features()
         .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
-    let side = if bc { 256 } else { side };
+    // The atlas slot is as large as the tiles the world actually ships. Both
+    // 128 and 256 ship (`terrain_lightmaps::tile_side`), and the header of the
+    // first map states which -- so read it instead of pinning 256, which
+    // refused every 128-tile world and mis-sized the atlas for it.
+    let native = {
+        let base = t.element.join("maps/world");
+        let mut found = None;
+        for name in &t.subterrain_names {
+            for ext in ["t2lm", "t2lm1"] {
+                if let Some(edge) =
+                    crate::terrain_lightmaps::side_of(&base.join(format!("{name}.{ext}")))?
+                {
+                    found = Some(edge);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        found
+    };
+    // `bc` uploads the records verbatim, so the slot must equal the authored
+    // edge. The RGBA path scales to whatever diagnostic `side` was configured,
+    // which must still cover the authored edge or the copy would clip.
+    let side = match (bc, native) {
+        (true, Some(edge)) => edge,
+        (false, Some(edge)) => side.max(edge),
+        _ => side,
+    };
     let per_row = 4096 / side;
     let per_page = per_row * per_row;
     let pages = ((m.areas.len() + per_page - 1) / per_page).max(1);
@@ -1363,12 +1392,24 @@ fn load_lightmaps(
                 };
                 let dds = crate::model_dds::Dds::parse(raw)
                     .map_err(|e| format!("lightmap {}: {e}", path.display()))?;
+                // One mip, DXT1, square, and the edge the T2LM header declared.
+                // The header and the DDS are two independent statements of the
+                // same fact; requiring them to agree catches a file that was
+                // repacked at one size but retiled at another.
+                let edge = tiles.side();
                 if dds.format != crate::model_dds::Format::Dxt1
                     || dds.mips.len() != 1
-                    || dds.mips[0].width != 256
-                    || dds.mips[0].height != 256
+                    || dds.mips[0].width != edge
+                    || dds.mips[0].height != edge
                 {
-                    return Err(format!("Unsupported lightmap DDS in {}", path.display()));
+                    return Err(format!(
+                        "Unsupported lightmap DDS in {}: expected one {}x{} DXT1 mip, got {}x{}",
+                        path.display(),
+                        edge,
+                        edge,
+                        dds.mips[0].width,
+                        dds.mips[0].height
+                    ));
                 }
                 // Both upload backends must accept exactly the same records.
                 if bc {
@@ -1377,10 +1418,17 @@ fn load_lightmaps(
                     let img = image::load_from_memory_with_format(raw, image::ImageFormat::Dds)
                         .map_err(|e| format!("lightmap {}: {e}", path.display()))?
                         .to_rgba8();
-                    if img.width() != 256 || img.height() != 256 {
-                        return Err("unexpected lightmap dimensions".into());
+                    if img.width() as usize != edge || img.height() as usize != edge {
+                        return Err(format!(
+                            "unexpected lightmap dimensions: expected {edge}x{edge}, got {}x{}",
+                            img.width(),
+                            img.height()
+                        ));
                     }
-                    let img = if side == 256 {
+                    // Scale only when the slot and the authored edge differ --
+                    // with 128 and 256 both shipping, comparing against the
+                    // literal 256 resized the 256 case as well.
+                    let img = if img.width() as usize == side {
                         img
                     } else {
                         image::imageops::resize(
