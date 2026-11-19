@@ -269,6 +269,58 @@ pub const ZONE_NAMES: &[(&str, &str)] = &[
     ("怨灵沼泽", "Wrth Sw"),
 ];
 
+/// English names for the teleport destinations in `world_targets.txt`.
+///
+/// A separate join from `ZONE_NAMES`, because a destination is often a *point
+/// inside* a zone rather than the zone itself: `卫戍营` ("Guardian's Watch") sits
+/// in the zone the 1.5.2 and 1.8.4 files both call something else, so no
+/// polygon match reaches it. These are the destinations whose Chinese name the
+/// zone table does not carry at all -- 28 of 1.5.2's 89.
+///
+/// Built the same way the zone table was: two shipped files for the **same**
+/// map, matched on the invariant rather than on position in the file. A
+/// `world_targets.txt` row is `id  name  group  "x,y,z"  ...`, and the id and
+/// the coordinate survive localisation while the name does not. Matching on
+/// (id, position to 0.01) across 1.5.2's Chinese file and 1.8.4's English one
+/// pairs 86 of 87 rows uniquely, with no ambiguity to resolve; the 28 here are
+/// those the zone table had no row for.
+///
+/// Three names present in the zone table disagrees with the destination file
+/// (`邻水镇`, `积羽城`, `獠牙镇`), and those are *not* added: the existing rows
+/// were built by polygon match, which is the stronger evidence, and
+/// `獠牙镇` -> "Plume Officer" is plainly not a town name. They stay as they
+/// were rather than being silently corrected into a conflict.
+pub const DESTINATION_NAMES: &[(&str, &str)] = &[
+    ("祖龙城东", "Archosaur East"),
+    ("祖龙城北", "Archosaur, North District"),
+    ("祖龙城西", "Archosaur, West District"),
+    ("秋凉村", "Autumn Village"),
+    ("竹浣村", "Bamboo Raccoon Village"),
+    ("烛华村", "Candlelight Village"),
+    ("隐仙湖", "Celestial Lake"),
+    ("妙严界", "Corona Sanctuary"),
+    ("青龙台", "Dragon Tower"),
+    ("卫戍营", "Guardian's Watch"),
+    ("左翼·护卫营", "Ice Goblin Camp"),
+    ("墨石村", "Inkstone Village"),
+    ("麒麟镇", "Kirin Town"),
+    ("崆峒古镇", "Konton"),
+    ("萝会城", "Lorreway City"),
+    ("追袭营", "Might's Outpost"),
+    ("地泉河", "Netherspring"),
+    ("天枢", "Nexus of Luminance"),
+    ("涣沙水晶", "Sand Light Crystal"),
+    ("观时台", "Sandscape Tower"),
+    ("乌巢岭", "Sapphire Altar"),
+    ("时光倒影", "Shrouded Temple"),
+    ("横天阙", "Skyline Loft"),
+    ("长夏营地", "Solstice Outpost"),
+    ("树浣村", "Tree Raccoon Village"),
+    ("凝望之门", "Unseen Gate"),
+    ("化龙滩", "Warblades Outpost"),
+    ("无咎营", "Wuying City"),
+];
+
 /// The English name for a zone, or the name itself when the table has none.
 ///
 /// A lookup miss is deliberately not an error: a zone a later client adds, a
@@ -279,6 +331,7 @@ pub fn english(name: &str) -> &str {
     if let Some((_, en)) = ZONE_NAMES
         .iter()
         .chain(INSTANCE_NAMES.iter())
+        .chain(DESTINATION_NAMES.iter())
         .find(|(zh, _)| *zh == trimmed)
     {
         return en;
@@ -297,6 +350,8 @@ pub fn english(name: &str) -> &str {
         if let Some((_, en)) = ZONE_NAMES
             .iter()
             .chain(INSTANCE_NAMES.iter())
+            .chain(DESTINATION_NAMES.iter())
+            .chain(DESTINATION_NAMES.iter())
             .find(|(zh, _)| fold(zh) == folded)
         {
             return en;
@@ -417,9 +472,58 @@ pub fn is_localized(name: &str) -> bool {
         .any(|c| !c.is_ascii() && !c.is_whitespace())
 }
 
+/// Every `(Chinese, English)` table, so a test about "all of them" cannot
+/// silently cover only the ones that existed when it was written.
+#[cfg(test)]
+const ALL_TABLES: [&[(&str, &str)]; 3] = [ZONE_NAMES, INSTANCE_NAMES, DESTINATION_NAMES];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The destination list is the one the report was actually about: a 1.5.2
+    /// client showed `雪霏村` where the 1.8.4 client shows `Snowy Village`. The
+    /// banner and the precinct fallback were translated; `world_targets.txt`,
+    /// which is what the destination list is built from, was not.
+    #[test]
+    fn the_1_5_2_destination_list_is_english() {
+        // Real rows from 1.5.2's `maps/world/world_targets.txt`, in order.
+        let shipped = [
+            ("雪霏村", "Snowy Village"),
+            ("碎冰村", "Village of Shattered Ice"),
+            ("雪崩村", "Avalanche Village"),
+            ("伐木场", "Timberfield"),
+            ("万劫城", "City of Misfortune"),
+            ("祖龙城北", "Archosaur, North District"),
+            ("卫戍营", "Guardian's Watch"),
+            ("隐仙湖", "Celestial Lake"),
+            ("无咎营", "Wuying City"),
+            ("横天阙", "Skyline Loft"),
+        ];
+        for (zh, want) in shipped {
+            assert_eq!(english(zh), want, "{zh}");
+        }
+    }
+
+    /// The destination table must not contradict the zone table. Where the two
+    /// joins disagreed the zone row was kept, so this pins that decision: a
+    /// later regeneration must not quietly overwrite a polygon-matched name.
+    #[test]
+    fn a_destination_never_overrides_a_zone_name() {
+        let zone: std::collections::HashMap<&str, &str> = ZONE_NAMES
+            .iter()
+            .chain(INSTANCE_NAMES.iter())
+            .copied()
+            .collect();
+        for (zh, en) in DESTINATION_NAMES {
+            if let Some(existing) = zone.get(zh) {
+                assert_eq!(
+                    existing, en,
+                    "{zh} is in both tables with different English names"
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_shipped_zones_have_english_names() {
@@ -488,7 +592,7 @@ mod tests {
     #[test]
     fn folding_does_not_collide_two_real_zone_names() {
         let mut seen = std::collections::HashMap::new();
-        for (zh, _) in ZONE_NAMES.iter().chain(INSTANCE_NAMES.iter()) {
+        for (zh, _) in ALL_TABLES.iter().copied().flatten() {
             let key = fold(zh);
             if let Some(other) = seen.insert(key.clone(), *zh) {
                 assert_eq!(other, *zh, "{key:?} folds {other:?} and {zh:?} together");
@@ -502,7 +606,7 @@ mod tests {
     #[test]
     fn every_localisable_zone_name_has_english() {
         let mut missing = Vec::new();
-        for (zh, _) in ZONE_NAMES.iter().chain(INSTANCE_NAMES.iter()) {
+        for (zh, _) in ALL_TABLES.iter().copied().flatten() {
             if is_localized(zh) && english(zh) == *zh {
                 missing.push(*zh);
             }

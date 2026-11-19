@@ -122,7 +122,13 @@ fn parse_destination(line: &str, world_ids: &[u32]) -> Result<Option<Destination
     }
     Ok(Some(Destination {
         id,
-        name: fields[name_at].clone(),
+        // A Chinese client authors this list in Chinese (`1001\t雪霏村\t...`).
+        // The zone banner and the precinct fallback below already translate
+        // their names; this list did not, which is why a 1.5.2 client still
+        // showed a Chinese destination list under an English interface. Doing
+        // it here rather than at the two call sites means a destination is
+        // English wherever it is displayed, including the map and the minimap.
+        name: crate::world_place_names::english(fields[name_at].trim()).to_string(),
         position,
     }))
 }
