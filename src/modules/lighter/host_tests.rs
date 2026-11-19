@@ -1544,6 +1544,9 @@ fn lighter_live_travel_csv() {
         std::fs::write(root.0.join("sync-test"), []).unwrap();
     }
     super::super::run_viewer(fixture(&root.0), Some(&root.0)).unwrap();
+    if let Some(path) = std::env::var_os("PW_SAVE_LIGHTER_TRAVEL_PLAN") {
+        std::fs::copy(root.0.join("travel.plan"), path).unwrap();
+    }
     let csv = std::fs::read_to_string(root.0.join("travel.csv")).unwrap();
     for header in [
         "# display=160x96\n",
@@ -1561,12 +1564,28 @@ fn lighter_live_travel_csv() {
     assert_eq!(rows.len(), count);
     for (i, row) in rows.iter().enumerate() {
         let columns = row.split(',').collect::<Vec<_>>();
-        assert_eq!(columns.len(), if sync { 23 } else { 15 });
+        assert_eq!(
+            columns.len(),
+            if sync {
+                23
+            } else if motion {
+                19
+            } else {
+                15
+            }
+        );
         if sync {
             assert!(columns[15]
                 .parse::<f64>()
                 .is_ok_and(|v| v.is_finite() && v >= 0.));
             assert!(columns[16..].iter().all(|column| column.is_empty()));
+        }
+        if motion {
+            use sha2::{Digest, Sha256};
+            let path = root.0.join("motion").join(format!("{i:06}.png"));
+            let rgba = image::open(path).unwrap().into_rgba8();
+            assert_eq!(columns[18], format!("{:x}", Sha256::digest(rgba.as_raw())));
+            assert!(columns[15].parse::<u64>().unwrap() >= (i as u64 + 1) * 16);
         }
         assert_eq!(columns[0].parse::<usize>().unwrap(), i);
         for field in &columns[1..5] {

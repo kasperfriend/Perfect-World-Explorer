@@ -34,26 +34,37 @@ def durations(values, cadence=False):
     return result
 
 
-def capture(path, synchronized=False):
+def read_csv(path):
     with Path(path).open(encoding="utf-8", newline="") as f:
         meta = {}
         for line in f:
             if not line.startswith("# "):
-                rows = list(csv.DictReader(f, fieldnames=line.strip().split(",")))
-                break
+                columns = next(csv.reader([line]))
+                rows = list(csv.DictReader(f, fieldnames=columns))
+                if len(columns) != len(set(columns)) or any(None in r or None in r.values() for r in rows):
+                    raise ValueError(f"{path}: malformed travel columns")
+                return meta, rows
             key, value = line[2:].rstrip("\r\n").split("=", 1)
             if key in meta:
                 raise ValueError(f"{path}: duplicate field {key}")
             meta[key] = value
-        else:
-            raise ValueError(f"{path}: no frame rows")
-    policy = "synchronized" if synchronized else "normal_present"
+    raise ValueError(f"{path}: no frame rows")
+
+
+def capture(path, synchronized=False):
+    meta, rows = read_csv(path)
+    return validate_rows(path, meta, rows, "synchronized" if synchronized else "normal_present")
+
+
+def validate_rows(path, meta, rows, policy):
+    synchronized = policy == "synchronized"
+    motion = policy == "motion_readback"
     if meta.get("capture_policy", "normal_present") != policy:
         raise ValueError(f"{path}: expected a {policy} performance sample; exclude motion/readback")
     provider = meta.get("ray_reconstruction", "portable")
-    if provider not in PROVIDERS or (synchronized and "ray_reconstruction" not in meta):
+    if provider not in PROVIDERS or ((synchronized or motion) and "ray_reconstruction" not in meta):
         raise ValueError(f"{path}: invalid or missing provider receipt")
-    if (meta.get("schema") != "1" or not (500 if synchronized else 30) <= len(rows) <= 30_000 or int(meta["count"]) != len(rows)
+    if (meta.get("schema") != "1" or not (500 if synchronized else 30) <= len(rows) <= (600 if motion else 30_000) or int(meta["count"]) != len(rows)
             or [int(r["frame"]) for r in rows] != list(range(len(rows)))):
         raise ValueError(f"{path}: incomplete or unexpected travel schema")
     for key in MATCH + RAY_MATCH + ("ray", "hybrid"):

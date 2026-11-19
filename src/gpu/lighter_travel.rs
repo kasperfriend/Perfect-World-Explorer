@@ -171,6 +171,13 @@ pub(super) struct SyncSample {
     pub(super) sdk_ms: Option<f64>,
 }
 
+pub(super) struct MotionSample {
+    pub(super) rgba8_sha256: String,
+    pub(super) elapsed_ms: u64,
+    pub(super) camera_cut: bool,
+    pub(super) underwater_depth: f32,
+}
+
 struct Sample {
     interval_ms: f64,
     redraw_ms: f64,
@@ -181,6 +188,7 @@ struct Sample {
     committed: bool,
     heap_bytes: Option<u64>,
     sync: Option<SyncSample>,
+    motion: Option<MotionSample>,
 }
 
 struct Setup {
@@ -397,6 +405,7 @@ impl Travel {
         view: &crate::view_settings::ViewSettings,
         experiments: (u32, bool, bool),
         sync: Option<SyncSample>,
+        motion: Option<MotionSample>,
     ) {
         if self.finished {
             return;
@@ -407,6 +416,10 @@ impl Travel {
         }
         if self.sync != sync.is_some() {
             self.invalidate("missing synchronized completion sample");
+            return;
+        }
+        if motion.is_some() != (self.motion_dir.is_some() && self.warm >= self.plan.warmup) {
+            self.invalidate("missing motion readback sample");
             return;
         }
         #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -463,6 +476,7 @@ impl Travel {
             committed,
             heap_bytes,
             sync,
+            motion,
         });
         if self.samples.len() == self.plan.samples() as usize {
             self.finished = true;
@@ -541,6 +555,12 @@ impl Travel {
         if self.sync {
             write!(out, ",queue_drain_wall_ms,gpu_as_ms,gpu_raster_primary_ms,gpu_trace_ms,gpu_reproject_ms,gpu_filter_ms,gpu_ray_composite_ms,gpu_sdk_ms")?;
         }
+        if self.motion_dir.is_some() {
+            write!(
+                out,
+                ",animation_elapsed_ms,camera_cut,eye_underwater_depth,rgba8_sha256"
+            )?;
+        }
         writeln!(out)?;
         for (i, s) in self.samples.iter().enumerate() {
             let [x, y, z, yaw, pitch] = s.pose;
@@ -573,6 +593,16 @@ impl Travel {
                     out,
                     ",{}",
                     sync.sdk_ms.map_or_else(String::new, |v| format!("{v:.6}"))
+                )?;
+            }
+            if let Some(motion) = &s.motion {
+                write!(
+                    out,
+                    ",{},{},{},{}",
+                    motion.elapsed_ms,
+                    u8::from(motion.camera_cut),
+                    motion.underwater_depth,
+                    motion.rgba8_sha256
                 )?;
             }
             writeln!(out)?;

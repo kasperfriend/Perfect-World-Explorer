@@ -286,8 +286,12 @@ jobs:
               exit "$status"
             fi
           done
-      - name: Check the Lighter travel report parser
-        run: python3 -m unittest discover -s tools -p test_lighter_travel_report.py
+      - name: Check the Lighter evidence parsers
+        run: |
+          python3 -m venv "$RUNNER_TEMP/lighter-evidence-python"
+          py="$RUNNER_TEMP/lighter-evidence-python/bin/python"
+          "$py" -m pip install --disable-pip-version-check Pillow==11.3.0
+          "$py" -m unittest discover -s tools -p 'test_lighter_*.py'
       - name: Exercise nonblocking viewer and explicit headless capture
         env:
           WGPU_BACKEND: vulkan
@@ -336,11 +340,15 @@ jobs:
           python3 tools/lighter_travel_report.py --synchronized target/lighter-travel-synchronized.csv > target/lighter-travel-synchronized.json
           PW_TEST_LIGHTER_TRAVEL_MOTION=1 PW_SAVE_LIGHTER_TRAVEL=target/lighter-travel-motion.csv \
             PW_SAVE_LIGHTER_TRAVEL_MOTION=target/lighter-travel-motion \
+            PW_SAVE_LIGHTER_TRAVEL_PLAN=target/lighter-travel-motion.plan \
             timeout 210 xvfb-run -a cargo test --locked --bin perfect-world-explorer lighter_live_travel_csv -- --ignored --nocapture
           if python3 tools/lighter_travel_report.py target/lighter-travel-motion.csv; then
             echo '::error::Motion readback was accepted as normal-present performance'
             exit 1
           fi
+          "$RUNNER_TEMP/lighter-evidence-python/bin/python" tools/lighter_motion_review.py \
+            --plan target/lighter-travel-motion.plan \
+            --fixture target/lighter-travel-motion.csv target/lighter-travel-motion > target/lighter-travel-motion.json
       - name: Keep the synthetic live travel capture
         uses: actions/upload-artifact@v4
         with:
@@ -351,6 +359,8 @@ jobs:
             target/lighter-travel-synchronized.csv
             target/lighter-travel-synchronized.json
             target/lighter-travel-motion.csv
+            target/lighter-travel-motion.plan
+            target/lighter-travel-motion.json
             target/lighter-travel-motion/*.png
           if-no-files-found: error
       - name: Check saved Lighter inventory and matching PNG

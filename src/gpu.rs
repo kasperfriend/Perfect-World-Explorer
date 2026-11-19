@@ -6088,6 +6088,9 @@ fn run_viewer(
     let mut stream_commit_pending = false;
     let mut travel =
         lighter_travel::Travel::from_env(&current_map.id, adapter.get_info(), &renderer.device)?;
+    // A surface retry must not consume a replay cut before it reaches a
+    // completed present. Normal interactive jump detection is unchanged.
+    let mut travel_cut_pending = false;
     #[cfg(test)]
     if let Some(dir) = smoke_travel {
         let mut fixture = lighter_travel::Travel::open(
@@ -7131,7 +7134,8 @@ fn run_viewer(
                     // without resetting on ordinary fast play.
                     let turned = last_fsr_camera_dir.dot(camera.direction()) < 0.866_025_4;
                     let camera_jumped = camera.pos.distance_squared(last_fsr_camera_pos) > 64.0 * 64.0
-                        || turned;
+                        || turned || (travel_pose.is_some() && travel_cut_pending);
+                    travel_cut_pending = travel_pose.is_some() && camera_jumped;
                     if camera_jumped {
                         if let Some(fsr) = fsr_upscaler.as_mut() {
                             fsr.reset_history();
@@ -8527,20 +8531,32 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     renderer.lighter.profile_presented(presented_at);
                                 }
                                 if let (Some(flight), Some(pose)) = (&mut travel, drawn_pose) {
+                                    travel_cut_pending = false;
                                     if !flight.check_provider(renderer.lighter.reconstruction_status()) {
                                         return;
                                     }
-                                    if let Some(path) = flight.motion_frame() {
+                                    let motion = if let Some(path) = flight.motion_frame() {
                                         // Opt-in image evidence only. Unlike the ordinary travel trace,
                                         // this waits for readback and must never be used to report FPS.
                                         let source = render_scale.texture();
                                         let captured = read_target_pixels(&renderer, &mut motion_capture, source)
-                                            .and_then(|bytes| readback::png_rgba(&path, source.width(), source.height(), &bytes));
-                                        if let Err(error) = captured {
-                                            flight.invalidate(&format!("motion frame {}: {error}", path.display()));
-                                            return;
+                                            .and_then(|bytes| {
+                                                readback::png_rgba(&path, source.width(), source.height(), &bytes)?;
+                                                Ok(format!("{:x}", Sha256::digest(&bytes)))
+                                            });
+                                        match captured {
+                                            Ok(rgba8_sha256) => Some(lighter_travel::MotionSample {
+                                                rgba8_sha256,
+                                                elapsed_ms: renderer.capture_elapsed_ms.unwrap_or_default(),
+                                                camera_cut: camera_jumped,
+                                                underwater_depth: camera.underwater_depth,
+                                            }),
+                                            Err(error) => {
+                                                flight.invalidate(&format!("motion frame {}: {error}", path.display()));
+                                                return;
+                                            }
                                         }
-                                    }
+                                    } else { None };
                                     let mut chosen = renderer.lighter.settings.effective();
                                     let (trace_extent, experiments) = if ray_world {
                                         renderer.lighter.travel_trace()
@@ -8551,7 +8567,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     let present_ms = (presented_at-present_started.unwrap()).as_secs_f64() * 1000.;
                                     flight.presented(presented_at, redraw_started, [acquire_ms,present_ms], chosen, renderer.lighter.raster_active(),
                                         [(config.width,config.height),world_extent, trace_extent],config.present_mode,pose,renderer.center,
-                                        streaming,std::mem::take(&mut stream_commit_pending),&settings,experiments,sync);
+                                        streaming,std::mem::take(&mut stream_commit_pending),&settings,experiments,sync,motion);
                                     #[cfg(test)]
                                     if smoke_travel.is_some() && flight.recorded() {
                                         target.exit();

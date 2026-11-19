@@ -81,6 +81,37 @@ class TravelTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "RTX 3080 10 GB"):
             validate_suite([(altered, *records[0][1:]), *records[1:]])
 
+    def test_motion_receipt_binds_pixels_and_review_to_rendered_cut(self):
+        import hashlib
+        from PIL import Image
+        from lighter_motion_review import review, sequence
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            csv = self.write(directory)
+            lines = csv.read_text(encoding="utf-8").replace("world=960x720", "world=8x8").splitlines()
+            h = next(i for i, row in enumerate(lines) if not row.startswith("#"))
+            lines[h] += ",animation_elapsed_ms,camera_cut,eye_underwater_depth,rgba8_sha256"
+            with Image.new("RGBA", (8, 8), (7, 8, 9, 255)) as image:
+                digest = hashlib.sha256(image.tobytes()).hexdigest()
+                for i in range(30):
+                    lines[h + i + 1] += f",{16*(i+21)},{int(i==15)},0,{digest}"
+                    image.save(root / f"{i:06}.png")
+            csv.write_text("# capture_policy=motion_readback\n# ray_reconstruction=portable\n"
+                           + "\n".join(lines) + "\n", encoding="utf-8")
+            result = sequence(csv, root, "a" * 64)
+            entry = {"provider": "portable", "artifact": "camera_cut", "severity": "low", "location": "near door",
+                     "finding": "synthetic reviewer entry", "start_frame": 14, "end_frame": 16, "screenshot_frame": 15}
+            findings, missing = review([entry], {"portable": result})
+            self.assertEqual(findings[0]["screenshot"]["rgba8_sha256"], digest)
+            self.assertEqual(len(missing), 4)
+            with self.assertRaisesRegex(ValueError, "rendered cut"):
+                review([entry | {"start_frame": 0, "end_frame": 3, "screenshot_frame": 1}], {"portable": result})
+            with Image.new("RGBA", (8, 8), (0, 0, 0, 0)) as image:
+                image.save(root / "000015.png")
+            with self.assertRaisesRegex(ValueError, "RGBA8 hash disagrees"):
+                sequence(csv, root, "a" * 64)
+
     def test_motion_trace_cannot_enter_either_benchmark_report(self):
         with tempfile.TemporaryDirectory() as directory:
             path = self.write(directory)

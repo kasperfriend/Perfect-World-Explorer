@@ -30,3 +30,26 @@ report refuses its CSV. The [CI artifact](https://github.com/kasperfriend/Perfec
 also contains the separate normal and synchronized fixtures. Its signed
 transfer failed here, so the raw live sequence is retained on GitHub, not
 in the local bundle. The missing retail observations above are unchanged.
+
+## Ordered follow-up: frame-bound receipts
+
+New motion CSV rows bind the **decoded RGBA8** hash, the scripted
+animation clock, the actual draw's camera-cut flag and the eye's water
+depth to each numbered PNG. A surface retry cannot consume a scripted
+cut before a completed present. The motion receipt checker rejects PNG
+substitution, missing rows, mismatched poses/clocks, and wrong providers.
+Use `tools/lighter_motion_review.py --plan path.txt --portable off.csv off-frames
+--fsr fsr.csv fsr-frames --rr rr.csv rr-frames` for one ray route. Use
+`--findings findings.json` with an array of observations: `provider`
+(`portable`, `fsr`, `rr`), `artifact` (`ghosting`, `reveal_trails`,
+`foliage_shimmer`, `water_flicker`, `camera_cut`), `start_frame`, `end_frame`,
+`screenshot_frame`, `location`, `severity` (`none`, `low`, `medium`, `high`),
+and `finding`. It binds each screenshot to a verified sequence and lists
+all unreviewed pairs. `none` is a review decision, never the default.
+Inspect the scene, not just an encoded RGB difference. An aligned global
+clock does not prove that asynchronously activated roots share a phase.
+
+The parser tests reject altered fixture pixels and a cut finding without a
+rendered cut. The Xvfb CI fixture exercises the real Native readback path
+and verifies the frame hashes; it supplies no retail visual judgments.
+All five rows above remain **not assessed** on the target.
