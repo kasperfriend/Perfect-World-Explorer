@@ -497,6 +497,44 @@ mod tests {
         );
     }
 
+    /// The end-to-end shape of the "new maps draw no buildings" report: an
+    /// EC-BSD in an instance names its model, and the archive holds it under
+    /// that instance's partition. Before `litmodel_key` kept the partition, the
+    /// key became `litmodels/world/...`, which the archive does not contain, so
+    /// every placement in every non-mainland map resolved to nothing.
+    #[test]
+    fn an_instance_path_resolves_through_its_own_partition() {
+        let (entry_names, by_basename) = scenery_index(&[
+            "litmodels/a01/1/litmodel_1399.bmd",
+            "litmodels/a11/1/litmodel_1399.bmd",
+        ]);
+        // The EC-BSD may spell the fully-qualified path; that is the case that
+        // used to collapse onto `world`.
+        for (path, map_id, want) in [
+            (
+                "litmodels/a01/1/litmodel_1399.bmd",
+                "a01",
+                "litmodels/a01/1/litmodel_1399.bmd",
+            ),
+            (
+                "litmodels/a11/1/litmodel_1399.bmd",
+                "a11",
+                "litmodels/a11/1/litmodel_1399.bmd",
+            ),
+        ] {
+            assert_eq!(
+                litmodel_entry_key(path, map_id, &entry_names, &by_basename).unwrap(),
+                want,
+                "{path} in {map_id}"
+            );
+        }
+        // And the bare EC-BSD spelling still resolves through the map id.
+        assert_eq!(
+            litmodel_entry_key("1/litmodel_1399.bmd", "a11", &entry_names, &by_basename).unwrap(),
+            "litmodels/a11/1/litmodel_1399.bmd"
+        );
+    }
+
     #[test]
     fn map_scoped_litmodel_lookup_uses_the_selected_map_namespace() {
         let (entry_names, by_basename) = scenery_index(&[
