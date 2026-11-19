@@ -508,7 +508,7 @@ pub struct Textures {
     tail: Vec<u32>,
     limit_bytes: usize,
     archive: HashMap<&'static str, Archive>,
-    pub(super) bc_pages: Option<Arc<bc_pages::Pages>>,
+    pub(super) bc_pages: bc_pages::Plans,
     pub missing: usize,
     pub mips: MipStats,
 }
@@ -521,7 +521,7 @@ impl Default for Textures {
             tail: vec![1, 1, 1, 0, 5, u32::MAX],
             limit_bytes: MAX_TEXTURE_BYTES,
             archive: HashMap::new(),
-            bc_pages: None,
+            bc_pages: Default::default(),
             missing: 0,
             mips: MipStats::default(),
         }

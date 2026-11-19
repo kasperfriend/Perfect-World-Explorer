@@ -71,6 +71,12 @@ fn bc_sample_level(addr: u32, uv: vec2<f32>, mip: u32, fmt: u32) -> vec3<f32> {
     return bc_terrain_level(addr,uv,mip,(fmt & BC_TERRAIN_1)!=0u);
 }
 "#;
+const MATERIAL_BUFFER_LOAD: &str = r#"
+fn level(addr: u32, uv: vec2<f32>, edge: bool, mip: u32, fmt: u32) -> vec4<f32> {
+    return buffer_level(addr,uv,edge,mip,fmt);
+}
+"#;
+
 const DECODED_TERRAIN: &str = r#"
 fn terrain_tile(addr: u32, uv: vec2<f32>, taps: Taps) -> vec3<f32> {
     return filtered_tile(addr,uv,false,taps).rgb;
@@ -122,6 +128,22 @@ fn trace_source_with_pages(
     pages: &str,
     temporal: bool,
 ) -> String {
+    trace_source_parts(backend, compact_terrain, screen_reuse, pages, "", temporal)
+}
+
+fn trace_source_parts(
+    backend: &str,
+    compact_terrain: bool,
+    screen_reuse: bool,
+    pages: &str,
+    material_pages: &str,
+    temporal: bool,
+) -> String {
+    let material = if material_pages.is_empty() {
+        MATERIAL_BUFFER_LOAD
+    } else {
+        material_pages
+    };
     let (terrain, load) = if !pages.is_empty() {
         (BC_TERRAIN, pages)
     } else if compact_terrain {
@@ -140,7 +162,7 @@ fn trace_source_with_pages(
         temporal::TRACE_OFF
     };
     [
-        PIXELS, BSDF, MEDIA, REFERENCE, BASE, terrain, load, reuse, inputs, backend,
+        PIXELS, BSDF, MEDIA, REFERENCE, BASE, material, terrain, load, reuse, inputs, backend,
     ]
     .concat()
 }
@@ -1166,6 +1188,18 @@ impl Lighter {
         [0; 3]
     }
 
+    pub(crate) fn bc_material_tiles(&self) -> [u64; 2] {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(rt) = self
+            .hardware
+            .as_ref()
+            .filter(|_| self.settings.mode == Mode::Hardware)
+        {
+            return rt.bc_material_tiles();
+        }
+        [0; 2]
+    }
+
     pub fn texture_mips(&self) -> textures::MipStats {
         self.world
             .as_ref()
@@ -1478,7 +1512,7 @@ impl Lighter {
                         self.screen_reuse != 0,
                         self.world
                             .as_ref()
-                            .and_then(|w| w.textures.bc_pages.as_ref())
+                            .map(|w| &w.textures.bc_pages)
                             .filter(|_| self.bc_pages),
                         temporal,
                     )

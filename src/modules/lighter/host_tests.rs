@@ -1917,7 +1917,9 @@ pub(crate) fn joined_bmd_packets(storage: usize) -> [Scene; 4] {
             .unwrap();
         let mut builder = super::Builder::default();
         let mut bank = super::Textures::default();
-        let stats = snapshot.append(&mut builder, &mut bank, storage).unwrap();
+        let stats = snapshot
+            .append(&mut builder, &mut bank, storage, &Default::default())
+            .unwrap();
         assert_eq!(
             (
                 stats.local,
@@ -2091,4 +2093,324 @@ fn lighter_matched_fixture_capture() {
         captures += 1;
     }
     assert!(captures != 0, "unknown PW_LIGHTER_FIXTURE_ONLY draw route");
+}
+
+// Validate the streamed packets, not only the full-map layout. Reduce shared
+// axis-aligned edges to unit spans so the fine side of a T-junction must lie
+// on exactly the coarser edge (within f32 interpolation precision).
+fn check_terrain_edges(packet: &super::Packet, bounds: [i32; 4]) -> (usize, usize) {
+    use super::{ChunkKey, MeshKey, Vertex};
+    let words = &packet.words;
+    let vertices: &[Vertex] = bytemuck::cast_slice(&words[words[0] as usize..words[1] as usize]);
+    let triangles: &[[u32; 3]] = bytemuck::cast_slice(&words[words[1] as usize..words[2] as usize]);
+    let mut edges = std::collections::HashMap::new();
+    let (mut total_area, mut indices) = (0, 0);
+    let [x0, y0, x1, y1] = bounds;
+    for m in &packet.meshes {
+        if !matches!(
+            m.key,
+            MeshKey::Static(
+                Some(ChunkKey::NearTerrain(_, _) | ChunkKey::FarTerrain(_, _)),
+                _
+            )
+        ) {
+            continue;
+        }
+        for &tri in &triangles[m.triangle.start as usize..m.triangle.end as usize] {
+            let mut points = tri.map(|id| {
+                let [x, h, z] = vertices[(m.vertex.start + id) as usize].pos;
+                ([256 + (x / 2.) as i32, 256 - (z / 2.) as i32], h)
+            });
+            let [a, b, c] = points.map(|p| p.0);
+            let area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+            // At the last stored row/column the Native mesh clamps the
+            // border sample, so a few triangles can collapse to zero area.
+            if area == 0 {
+                assert!(a == b || b == c || c == a);
+                continue;
+            }
+            // The recovered Native index templates can wind either way.
+            // Normalize projected winding for the shared-edge test only.
+            if area < 0 {
+                points.swap(1, 2);
+            }
+            total_area += area.unsigned_abs() as usize;
+            indices += 3;
+            for (p, h) in points {
+                assert!((x0..=x1).contains(&p[0]) && (y0..=y1).contains(&p[1]));
+                assert!(h.is_finite());
+            }
+            for j in 0..3 {
+                let [(mut a, mut ah), (mut b, mut bh)] = [points[j], points[(j + 1) % 3]];
+                let forward = a < b;
+                if !forward {
+                    std::mem::swap(&mut a, &mut b);
+                    std::mem::swap(&mut ah, &mut bh);
+                }
+                let delta = [b[0] - a[0], b[1] - a[1]];
+                let n = if delta.contains(&0) {
+                    delta[0] + delta[1]
+                } else {
+                    1
+                };
+                for i in 0..n {
+                    let xy = |j: i32| [a[0] + j * delta[0] / n, a[1] + j * delta[1] / n];
+                    let height = |j: i32| ah + (bh - ah) * j as f32 / n as f32;
+                    let key = [xy(i), xy(i + 1)];
+                    let hs = [height(i), height(i + 1)];
+                    let entry = edges.entry(key).or_insert((0u8, forward, hs));
+                    if entry.0 > 0 {
+                        assert_eq!(entry.0, 1, "overlap on {key:?}");
+                        assert_ne!(forward, entry.1, "same-side pair on {key:?}");
+                        for (a, b) in hs.into_iter().zip(entry.2) {
+                            assert!(
+                                (a - b).abs() < 0.00025,
+                                "height crack on {key:?}: {a} vs {b}"
+                            );
+                        }
+                    }
+                    entry.0 += 1;
+                }
+            }
+        }
+    }
+    let mut border = 0;
+    for ([[ax, ay], [bx, by]], (count, _, _)) in edges {
+        let outer = (ax == bx && [x0, x1].contains(&ax)) || (ay == by && [y0, y1].contains(&ay));
+        assert_eq!(
+            count,
+            if outer { 1 } else { 2 },
+            "open edge at ({ax},{ay})–({bx},{by})"
+        );
+        border += usize::from(outer);
+    }
+    assert_eq!(total_area, 2 * (x1 - x0) as usize * (y1 - y0) as usize);
+    assert_eq!(border, 2 * (x1 - x0 + y1 - y0) as usize);
+    (indices, border)
+}
+
+// Independent vertical ray sentinels on either side of the rear seam. Test
+// the packed placement/mask as well as triangles; the primary eye points
+// away from these hits. This is a CPU geometry check, not GPU traversal.
+fn rear_seam_rays(
+    packet: &super::Packet,
+    terrain: &Terrain,
+    eye: [f32; 2],
+    window: crate::terrain_lod::Window,
+    cutoff: bool,
+) -> [Option<f64>; 2] {
+    use super::{ChunkKey, MeshKey, Vertex, INSTANCE_WORDS, MASK_BLOCKER, MASK_SECONDARY};
+    let x = (256. + eye[0] / 2.).round() as i32 / 4 * 4;
+    let y = (window.y0 * TILE) as i32;
+    let probes = [[x, y + 4], [x, y - 4]]; // near then far
+    let mut cam = Camera::new(terrain);
+    cam.pos = Vec3::new(eye[0], 512., eye[1]);
+    cam.yaw = 0.;
+    cam.pitch = 0.;
+    let mut hits: [Option<f64>; 2] = [None, None];
+    let words = &packet.words;
+    let vertices: &[Vertex] = bytemuck::cast_slice(&words[words[0] as usize..words[1] as usize]);
+    let triangles: &[[u32; 3]] = bytemuck::cast_slice(&words[words[1] as usize..words[2] as usize]);
+    let cross = |a: [i32; 2], b: [i32; 2], c: [i32; 2]| {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    };
+    for (id, inst) in packet.instances.iter().enumerate() {
+        let m = &packet.meshes[inst.mesh as usize];
+        let lane = match m.key {
+            MeshKey::Static(Some(ChunkKey::NearTerrain(_, _)), _) => 0,
+            MeshKey::Static(Some(ChunkKey::FarTerrain(_, _)), _) => 1,
+            _ => continue,
+        };
+        let at = words[4] as usize + id * INSTANCE_WORDS as usize;
+        assert_eq!(
+            words[at..at + 6],
+            [0., 0., 0., 1., 1., 0.].map(f32::to_bits)
+        );
+        let mask = u32::from(MASK_SECONDARY | MASK_BLOCKER);
+        assert_eq!(words[at + 10] & mask, mask);
+        for tri in &triangles[m.triangle.start as usize..m.triangle.end as usize] {
+            let [a, b, c] = tri.map(|id| vertices[(m.vertex.start + id) as usize].pos);
+            let grid = |[x, _, z]: [f32; 3]| [256 + (x / 2.) as i32, 256 - (z / 2.) as i32];
+            let [p, q, r] = [a, b, c].map(grid);
+            let area = cross(p, q, r);
+            if area == 0 {
+                continue;
+            }
+            for (i, &uv) in probes.iter().enumerate() {
+                let weights = [cross(q, r, uv), cross(r, p, uv), cross(p, q, uv)];
+                if weights.iter().any(|&w| w * area.signum() < 0) {
+                    continue;
+                }
+                assert_eq!(i, lane, "near/far ownership overlapped the seam");
+                let h = weights
+                    .into_iter()
+                    .zip([a[1], b[1], c[1]])
+                    .map(|(w, h)| f64::from(w) * f64::from(h))
+                    .sum::<f64>()
+                    / f64::from(area);
+                if let Some(previous) = hits[i].replace(h) {
+                    assert!(
+                        (previous - h).abs() < 0.00025,
+                        "inconsistent duplicate edge hit"
+                    );
+                }
+            }
+        }
+    }
+    let mut errors = [None, None];
+    for (i, ([gx, gy], hit)) in probes.into_iter().zip(hits).enumerate() {
+        let source = terrain
+            .heights
+            .at(gy as usize * terrain.width + gx as usize);
+        let target = Vec3::new(2. * (gx - 256) as f32, source, 2. * (256 - gy) as f32);
+        let clip = cam.matrix(960, 720, 1024.) * target.extend(1.);
+        assert!(clip.w < 0., "secondary probe is inside the main view");
+        if let Some(h) = hit {
+            assert!(
+                h < f64::from(cam.pos.y),
+                "downward ray starts below terrain"
+            );
+            let error = (h - f64::from(source)).abs();
+            assert!(
+                error <= 0.5,
+                "secondary terrain height error {error} at ({gx},{gy})"
+            );
+            errors[i] = Some(error);
+        } else {
+            assert!(
+                cutoff && i == 1,
+                "secondary ray missed admitted terrain at ({gx},{gy})"
+            );
+        }
+    }
+    errors
+}
+
+fn streamed_terrain_fixture(blocks: crate::terrain_store::Builder, label: &str) {
+    let root = FixtureRoot::new();
+    let mut terrain = fixture(&root.0);
+    (terrain.heights, terrain.normals) = blocks.finish(0).unwrap();
+    terrain.width = 512;
+    terrain.height = 512;
+    terrain.grid_spacing = 2.;
+    terrain.materials = crate::material::single_layer_fixture(512);
+    terrain.water.clear();
+    let mut residency = Default::default();
+    let mut scenery = super::SceneryStream::default();
+    let mut feed = None;
+    let mut previous = None;
+    for (x, z, cutoff) in [
+        (-146., 120., false),
+        (121., -146., false),
+        (121., -146., true),
+    ] {
+        if cutoff {
+            // The geometry probe deliberately does not require the client's
+            // mask/texture packs. Replay only the material input on mode
+            // change; keep the real loaded blocks and stream packer.
+            terrain.terrain_material_window = None;
+            terrain.materials = crate::material::single_layer_fixture(512);
+        }
+        let detail = DetailSettings {
+            radius: 2,
+            terrain_cutoff: cutoff,
+            ..Default::default()
+        };
+        let mesh = build(
+            &mut terrain,
+            x,
+            z,
+            detail,
+            &mut residency,
+            false,
+            0,
+            false,
+            Some(&mut scenery),
+        )
+        .unwrap();
+        let feed = feed.get_or_insert_with(|| {
+            super::Feed::new(&mut terrain, &mesh, false, 64 << 20, false).unwrap()
+        });
+        let (packed, _, inventory, _) = feed.snapshot(&mesh, 64 << 20).unwrap();
+        let have = inventory[super::Class::FarTerrain];
+        let window = mesh.lod.window;
+        let bounds = if cutoff {
+            assert_eq!(have.cutoff, feed.source.far.len());
+            assert_eq!(have.loaded, 0);
+            [window.x0, window.y0, window.x1, window.y1].map(|i| (i * TILE).min(511) as i32)
+        } else {
+            assert!(have.loaded > 0);
+            assert_eq!(have.failed(), 0);
+            assert_ne!(
+                previous.replace((window.x0, window.y0)),
+                Some((window.x0, window.y0))
+            );
+            [0, 0, 511, 511]
+        };
+        let (indices, border) = check_terrain_edges(&packed, bounds);
+        let rear = rear_seam_rays(&packed, &terrain, [x, z], window, cutoff);
+        println!("{label}: eye xz=({x},{z}) window={window:?} cutoff={cutoff} far={have:?}; {indices} packed terrain indices, {border} exterior edge units, no interior cracks; rear near/far ray height errors {rear:?}");
+    }
+}
+
+#[test]
+fn refined_far_terrain_joins_changed_native_windows_without_cracks() {
+    const SIDE: usize = 512;
+    let mut blocks = crate::terrain_store::Builder::new_resident(SIDE, SIDE, TILE).unwrap();
+    for y in 0..SIDE / TILE {
+        for x in 0..SIDE / TILE {
+            let samples: Vec<_> = (0..TILE * TILE)
+                .map(|i| {
+                    let p = [x * TILE + i % TILE, y * TILE + i / TILE];
+                    // Sharp details on opposite sides of the near perimeter and
+                    // an oblique background slope shared between the patches.
+                    let ridge = (p[0] == 96 || p[0] == 352) && p[1] % 7 == 2;
+                    (p[0] + 2 * p[1]) as f32 / 128. + if ridge { 34. } else { 0. }
+                })
+                .collect();
+            blocks
+                .block(x, y, &samples, &vec![[0, 127, 0]; TILE * TILE])
+                .unwrap();
+        }
+    }
+    streamed_terrain_fixture(blocks, "synthetic ridge");
+}
+
+#[test]
+#[ignore = "requires a pinned PW142 512x512 T2BK input, no graphics device"]
+fn lighter_streamed_retail_height_geometry() {
+    let path = std::path::PathBuf::from(
+        std::env::var_os("PW_TEST_RETAIL_T2BK").expect("set PW_TEST_RETAIL_T2BK"),
+    );
+    let bytes = std::fs::read(&path).unwrap();
+    let (magic, version, count) = (
+        crate::u32at(&bytes, 0).unwrap(),
+        crate::u32at(&bytes, 4).unwrap(),
+        crate::u32at(&bytes, 8).unwrap(),
+    );
+    assert_eq!(magic, 0x54424b42);
+    assert!((4..=6).contains(&version));
+    assert_eq!(count, 256);
+    let layout = crate::terrain_block::layout(&bytes, TILE).unwrap();
+    let angles: [f32; 256] = std::array::from_fn(|i| i as f32 * std::f32::consts::TAU / 256.);
+    let tile = crate::TileDecode {
+        data: &bytes,
+        name: path.file_name().unwrap().to_str().unwrap(),
+        version,
+        flags: if version >= 5 {
+            bytes[12]
+        } else if bytes[12] != 0 {
+            0x15
+        } else {
+            0
+        },
+        layout: &layout,
+        grid: TILE,
+        sin_table: &angles.map(f32::sin),
+        cos_table: &angles.map(f32::cos),
+        blocks: count as usize,
+    };
+    let mut blocks = crate::terrain_store::Builder::new_resident(512, 512, TILE).unwrap();
+    crate::decode_blocks(&tile, 1, |i, h, n| blocks.block(i % 16, i / 16, h, n)).unwrap();
+    streamed_terrain_fixture(blocks, tile.name);
 }

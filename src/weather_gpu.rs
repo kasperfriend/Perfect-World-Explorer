@@ -14,7 +14,7 @@ use crate::client_weather::{
 };
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
-use std::{collections::HashMap, fs::File, path::Path};
+use std::{fs::File, path::Path};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -304,37 +304,80 @@ fn snow_luminance_mask(mut pixels: image::RgbaImage) -> image::RgbaImage {
     pixels
 }
 
-pub(crate) fn weather_images(element: &Path) -> ([image::RgbaImage; 2], [bool; 2]) {
-    const SIZE: u32 = 64;
-    let mut file = File::open(element.join("textures.pck")).ok();
-    let entries = file
-        .as_mut()
-        .and_then(|file| crate::pck::directory(file).ok())
-        .unwrap_or_default();
-    let load = |name: &str, kind: usize, file: &mut Option<File>| {
-        let bytes = entries
-            .iter()
-            .find(|entry| entry.name.eq_ignore_ascii_case(name))
-            .and_then(|entry| {
-                file.as_mut()
-                    .and_then(|file| crate::pck::read_entry(file, entry).ok())
-            });
-        let decoded = bytes
-            .and_then(|bytes| image::load_from_memory(&bytes).ok())
-            .map(|img| img.to_rgba8());
-        if let Some(mut img) = decoded {
-            if kind == 1 {
-                img = snow_luminance_mask(img);
-            }
-            if img.width() == SIZE && img.height() == SIZE {
-                return (img, true);
-            }
-            return (
-                image::imageops::resize(&img, SIZE, SIZE, image::imageops::FilterType::Triangle),
-                true,
-            );
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaskSource {
+    Authored,
+    PackageMissing,
+    PackageUnreadable,
+    MemberMissing,
+    MemberUnreadable,
+    DecodeFailed,
+}
+
+impl MaskSource {
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::Authored => "authored",
+            Self::PackageMissing => "package_missing",
+            Self::PackageUnreadable => "package_unreadable",
+            Self::MemberMissing => "member_missing",
+            Self::MemberUnreadable => "member_unreadable",
+            Self::DecodeFailed => "decode_failed",
         }
-        eprintln!("Native {name} weather texture unavailable; using a simple fallback mask");
+    }
+}
+
+pub(crate) fn weather_images(element: &Path) -> ([image::RgbaImage; 2], [MaskSource; 2]) {
+    const SIZE: u32 = 64;
+    let mut archive = (|| {
+        let mut file = File::open(element.join("textures.pck")).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                MaskSource::PackageMissing
+            } else {
+                MaskSource::PackageUnreadable
+            }
+        })?;
+        let entries =
+            crate::pck::directory(&mut file).map_err(|_| MaskSource::PackageUnreadable)?;
+        Ok((file, entries))
+    })();
+    let mut load = |name: &str, kind: usize, format: image::ImageFormat| {
+        let decoded = (|| {
+            let (file, entries) = archive.as_mut().map_err(|err| *err)?;
+            let entry = entries
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(name))
+                .ok_or(MaskSource::MemberMissing)?;
+            let bytes =
+                crate::pck::read_entry(file, entry).map_err(|_| MaskSource::MemberUnreadable)?;
+            // TGA has no reliably sniffable leading signature. Give the
+            // decoder the member format when signature probing did not work.
+            image::load_from_memory(&bytes)
+                .or_else(|_| image::load_from_memory_with_format(&bytes, format))
+                .map(|img| img.to_rgba8())
+                .map_err(|_| MaskSource::DecodeFailed)
+        })();
+        let reason = match decoded {
+            Ok(mut img) => {
+                if kind == 1 {
+                    img = snow_luminance_mask(img);
+                }
+                if img.width() != SIZE || img.height() != SIZE {
+                    img = image::imageops::resize(
+                        &img,
+                        SIZE,
+                        SIZE,
+                        image::imageops::FilterType::Triangle,
+                    );
+                }
+                return (img, MaskSource::Authored);
+            }
+            Err(reason) => reason,
+        };
+        eprintln!(
+            "Weather {name}: {}; using a simple fallback mask",
+            reason.token()
+        );
         (
             image::RgbaImage::from_fn(SIZE, SIZE, |x, y| {
                 let dx = x as f32 - 31.5;
@@ -352,12 +395,12 @@ pub(crate) fn weather_images(element: &Path) -> ([image::RgbaImage; 2], [bool; 2
                 };
                 image::Rgba([255, 255, 255, alpha])
             }),
-            false,
+            reason,
         )
     };
-    let (rain, rain_authored) = load("textures/rain.tga", 0, &mut file);
-    let (snow, snow_authored) = load("textures/snow.bmp", 1, &mut file);
-    ([rain, snow], [rain_authored, snow_authored])
+    let (rain, rain_source) = load("textures/rain.tga", 0, image::ImageFormat::Tga);
+    let (snow, snow_source) = load("textures/snow.bmp", 1, image::ImageFormat::Bmp);
+    ([rain, snow], [rain_source, snow_source])
 }
 
 // Keep in sync with the split in `vs`; the two routes report generated cards,
@@ -366,7 +409,7 @@ pub(crate) const RAIN_INSTANCES: u32 = 320;
 const SNOW_INSTANCES: u32 = 160;
 
 pub struct WeatherGpu {
-    pub(crate) rain_mask_authored: bool,
+    pub(crate) rain_mask_source: MaskSource,
     pipeline: wgpu::RenderPipeline,
     /// Motion twin of `pipeline`: same particles, same effective-alpha and depth
     /// tests, writing a motion vector into the object-motion attachment instead of
@@ -397,7 +440,7 @@ impl WeatherGpu {
         format: wgpu::TextureFormat,
         water_areas: &[crate::water::WaterArea],
     ) -> Self {
-        let (images, [rain_mask_authored, _]) = weather_images(element);
+        let (images, [rain_mask_source, _]) = weather_images(element);
         let mut pixels = Vec::with_capacity(64 * 64 * 4 * 2);
         for image in images {
             pixels.extend_from_slice(image.as_raw());
@@ -631,7 +674,7 @@ impl WeatherGpu {
             multiview: None,
         });
         Self {
-            rain_mask_authored,
+            rain_mask_source,
             pipeline,
             motion_pipeline,
             bind,
@@ -813,7 +856,9 @@ impl WeatherGpu {
 
 #[cfg(test)]
 mod tests {
-    use super::{pack_water_masks, profile_lanes, snow_luminance_mask, SHADER};
+    use super::{
+        pack_water_masks, profile_lanes, snow_luminance_mask, weather_images, MaskSource, SHADER,
+    };
     use crate::client_weather::{RAIN, SNOW, SNOW_SPEED_SCALE};
     use crate::water::WaterArea;
 
@@ -888,6 +933,32 @@ mod tests {
         assert_eq!(metadata[0].data[3], 3);
         assert_eq!(metadata[1].data[3], 2);
         assert_eq!(words.as_slice(), &[0x0302_0100, 0x0000_0004]);
+    }
+
+    #[test]
+    fn weather_mask_sources_distinguish_authored_tga_and_fallback_reasons() {
+        let root = std::env::temp_dir().join(format!("pwe-weather-mask-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        assert_eq!(weather_images(&root).1, [MaskSource::PackageMissing; 2]);
+        let mut tga = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([210, 253, 5, 37]))
+            .write_to(&mut tga, image::ImageFormat::Tga)
+            .unwrap();
+        let path = root.join("textures.pck");
+        crate::pck::write_test_archive(&path, &[("Textures/Rain.tga", tga.get_ref())]);
+        let ([rain, _], sources) = weather_images(&root);
+        assert_eq!(sources, [MaskSource::Authored, MaskSource::MemberMissing]);
+        assert_eq!(rain.get_pixel(2, 4).0, [210, 253, 5, 37]);
+        crate::pck::write_test_archive(&path, &[("textures/rain.tga", b"not a TGA")]);
+        let ([rain, _], sources) = weather_images(&root);
+        assert_eq!(
+            sources,
+            [MaskSource::DecodeFailed, MaskSource::MemberMissing]
+        );
+        assert_eq!(rain.get_pixel(30, 4).0, [255, 255, 255, 220]);
+        std::fs::write(&path, b"not a PCK").unwrap();
+        assert_eq!(weather_images(&root).1, [MaskSource::PackageUnreadable; 2]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -35,6 +35,7 @@ use vegetation::{read_tree, Tree};
 struct FeedSource {
     base: Textures,
     terrain_ids: Vec<u32>,
+    material_pages: scenery::MaterialPages,
     lightmaps: Vec<[u32; 2]>,
     static_lights: Vec<Light>,
     light_cycle: Option<crate::environment::LightCycle>,
@@ -216,6 +217,11 @@ impl FeedSource {
                 tree_side,
                 authored_mips,
             )?));
+        }
+        if native_bc {
+            if let Some(Ok(scenery)) = &m.ray_scenery {
+                result.material_pages = scenery.material_pages(&t.objects, &mut result.base)?;
+            }
         }
         result.base.seal();
         // Audit small maps before borrowing the raster far grid. A narrow
@@ -543,11 +549,12 @@ impl StreamPacker {
             .ray_scenery
             .as_ref()
             .ok_or("Lighter BMD stream is unavailable")?;
-        let coverage =
-            scenery
-                .as_ref()
-                .map_err(Clone::clone)?
-                .append(&mut builder, &mut bank, storage)?;
+        let coverage = scenery.as_ref().map_err(Clone::clone)?.append(
+            &mut builder,
+            &mut bank,
+            storage,
+            &source.material_pages,
+        )?;
         inventory[Class::Buildings] = coverage.counts;
         let packet = builder.finish_with_emitters(&mut self.accel, Some(&bank));
         if packet.bytes().len() > storage {

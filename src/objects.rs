@@ -1050,6 +1050,11 @@ impl Objects {
         self.cache.get_with_key(&normalize(path))
     }
     #[allow(dead_code)] // standalone archive surveys do not shade materials
+    pub(crate) fn ray_dds_by_hash(&self, hash: u64) -> Option<&[u8]> {
+        self.cache.by_hash.get(&hash)?.tex.ray_dds.as_deref()
+    }
+
+    #[allow(dead_code)] // standalone archive surveys do not shade materials
     pub(crate) fn ray_normal_with_key(&self, base: &str) -> Option<(u64, &Texture)> {
         self.cache
             .get_with_key(self.ray_normals.get(&normalize(base))?)

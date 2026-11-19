@@ -775,7 +775,7 @@ struct Core {
 }
 
 impl Core {
-    fn new(ctx: Arc<Context>, spirv: &[u32], bc: bool) -> R<Self> {
+    fn new(ctx: Arc<Context>, spirv: &[u32], bc: usize) -> R<Self> {
         let (vendor, device, uuid) = ctx.identity;
         let mut c = Self {
             cache: cache::PipelineCache::new(&ctx.device, vendor, device, uuid),
@@ -817,9 +817,11 @@ impl Core {
                 vk::DescriptorType::STORAGE_BUFFER,
                 vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
                 vk::DescriptorType::SAMPLED_IMAGE,
-                vk::DescriptorType::SAMPLED_IMAGE, // optional terrain BC pages
+                vk::DescriptorType::SAMPLED_IMAGE, // optional BC1, BC5 and BC7 atlases
+                vk::DescriptorType::SAMPLED_IMAGE,
+                vk::DescriptorType::SAMPLED_IMAGE,
             ];
-            let bindings: Vec<_> = types[..7 + usize::from(bc)]
+            let bindings: Vec<_> = types[..7 + bc]
                 .iter()
                 .copied()
                 .enumerate()
@@ -860,7 +862,7 @@ impl Core {
                 },
                 vk::DescriptorPoolSize {
                     ty: types[6],
-                    descriptor_count: 1 + u32::from(bc),
+                    descriptor_count: 1 + bc as u32,
                 },
             ];
             c.descriptors = d
@@ -999,7 +1001,7 @@ pub struct Renderer {
     last_raster: bool,
     primary_source: Option<String>,
     core: Core,
-    bc_pages: Option<bc_pages::Atlas>,
+    bc_pages: Vec<bc_pages::Atlas>,
     // Kept by the engine until device teardown; raw uses are not tracked by it.
     world: Option<Upload>,
     moving: Option<Upload>,
@@ -1035,46 +1037,56 @@ impl Renderer {
         device: &wgpu::Device,
         compact: bool,
         reuse: bool,
-        pages: Option<&Arc<super::textures::bc_pages::Pages>>,
+        pages: Option<&super::textures::bc_pages::Plans>,
         temporal: bool,
     ) -> R<Self> {
         let ctx = Context::new(device)?;
-        let mut bc_pages = pages
-            .filter(|p| bc_pages::supported(device, p.layers()))
-            .and_then(|p| match bc_pages::Atlas::new(&ctx, p) {
-                Ok(atlas) => Some(atlas),
-                Err(error) => {
-                    eprintln!("Lighter BC image unavailable; using buffer decoding: {error}");
-                    None
+        use super::textures::bc_pages::{Kind, KINDS};
+        let mut bc_pages = Vec::new();
+        if let Some(pages) = pages {
+            for kind in KINDS {
+                let Some(plan) = &pages[kind.index()] else {
+                    continue;
+                };
+                if !bc_pages::supported(device, kind, plan.layers()) {
+                    eprintln!("Lighter {kind:?} BC sampling unsupported; using the buffer tile");
+                    continue;
                 }
-            });
-        let build = |bc| -> R<(String, Core)> {
-            let source = super::trace_source_with_pages(
+                match bc_pages::Atlas::new(&ctx, kind, plan) {
+                    Ok(atlas) => bc_pages.push(atlas),
+                    Err(error) if error.contains("ERROR_DEVICE_LOST") => return Err(error),
+                    Err(error) => eprintln!(
+                        "Lighter {kind:?} BC image unavailable; using the buffer tile: {error}"
+                    ),
+                }
+            }
+        }
+        let build = |bc: &[bc_pages::Atlas]| -> R<(String, Core)> {
+            let source = super::trace_source_parts(
                 super::HARDWARE,
                 compact || pages.is_some(),
                 reuse,
-                if bc {
+                if bc.first().is_some_and(|a| a.kind == Kind::Terrain) {
                     include_str!("bc_pages.wgsl")
                 } else {
                     ""
                 },
+                &bc_pages::material_source(bc),
                 temporal,
             );
-            let core = Core::new(ctx.clone(), &shader(&source)?, bc)?;
+            let core = Core::new(ctx.clone(), &shader(&source)?, bc.len())?;
             Ok((source, core))
         };
-        let (source, core) = match build(bc_pages.is_some()) {
-            Err(error) if bc_pages.is_some() && !error.contains("ERROR_DEVICE_LOST") => {
-                eprintln!(
-                    "Lighter BC sampling pipeline unavailable; using buffer decoding: {error}"
-                );
-                bc_pages = None;
-                build(false)?
+        let (source, core) = match build(&bc_pages) {
+            Err(error) if !bc_pages.is_empty() && !error.contains("ERROR_DEVICE_LOST") => {
+                eprintln!("Lighter BC sampling pipeline unavailable; using buffer tiles: {error}");
+                bc_pages.clear();
+                build(&[])?
             }
             result => result?,
         };
-        if let Some(atlas) = &bc_pages {
-            atlas.bind(&core);
+        for (i, atlas) in bc_pages.iter().enumerate() {
+            atlas.bind(&core, i as u32 + 7);
         }
         let frame = Buffer::new(
             &ctx,
@@ -1274,10 +1286,22 @@ impl Renderer {
     }
 
     pub(super) fn bc_page_stats(&self) -> [u64; 3] {
-        self.bc_pages
-            .as_ref()
-            .filter(|p| p.visible)
-            .map_or([0; 3], bc_pages::Atlas::stats)
+        let mut sum = [0; 3];
+        for atlas in self.bc_pages.iter().filter(|p| p.visible) {
+            for (total, value) in sum.iter_mut().zip(atlas.stats()) {
+                *total += value;
+            }
+        }
+        sum
+    }
+
+    pub(super) fn bc_material_tiles(&self) -> [u64; 2] {
+        std::array::from_fn(|i| {
+            self.bc_pages
+                .iter()
+                .find(|atlas| atlas.kind.index() == i + 1 && atlas.visible)
+                .map_or(0, |atlas| atlas.stats()[0])
+        })
     }
 
     pub(super) fn memory_usage(&self) -> (u64, u64, Option<u64>) {
@@ -1548,7 +1572,8 @@ impl Renderer {
         let w = self.world.as_ref().unwrap();
         let m = self.moving.as_ref().unwrap();
         let textures = self.textures.as_ref().unwrap();
-        let bc_matches = self.bc_pages.as_ref().is_some_and(|p| p.matches(texels));
+        let bc_matches =
+            !self.bc_pages.is_empty() && self.bc_pages.iter().all(|p| p.matches(texels));
         let mut uniform = *frame;
         if bc_matches {
             uniform.options[0] |= bc_pages::ACTIVE;
@@ -1638,7 +1663,7 @@ impl Renderer {
             if textures_changed {
                 textures.encode(cmd);
             }
-            if let Some(atlas) = &self.bc_pages {
+            for atlas in &self.bc_pages {
                 atlas.encode(cmd, bc_matches.then_some(textures.gpu.handle));
             }
             if moving_changed {
@@ -1751,7 +1776,7 @@ impl Renderer {
             );
         }
         self.core.submit()?;
-        if let Some(atlas) = &mut self.bc_pages {
+        for atlas in &mut self.bc_pages {
             atlas.initialized = true;
             atlas.uploaded |= bc_matches;
             atlas.visible = bc_matches;

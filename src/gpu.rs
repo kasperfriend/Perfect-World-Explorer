@@ -9377,10 +9377,11 @@ fn preview_frame_using(
                 }
             }
         }
+        let rain_mask_source = renderer.weather.rain_mask_source;
         writeln!(meta,
-            "platform={}\narchitecture={}\neye_underwater_depth={}\nrain_mask_authored={}\nworld_effect_roots_playing={}\nworld_effect_roots_queued={}\nworld_effect_roots_inactive={}\nworld_effect_roots_rejected={}\nworld_effect_roots_unreadable={}\nworld_effect_roots_no_package={}\nworld_effect_roots_unsupported={}\nworld_effect_warp_omitted_elements={warp}\nworld_effect_dest_color_affine_candidates={dest_affine}\nworld_effect_dest_color_unsupported_candidates={dest_unsupported}",
-            std::env::consts::OS, std::env::consts::ARCH, cam.underwater_depth, renderer.weather.rain_mask_authored,
-            roots.loaded, roots.pending, roots.disabled, roots.invalid, roots.unavailable, roots.package, roots.unsupported,
+            "platform={}\narchitecture={}\neye_underwater_depth={}\nrain_mask_authored={}\nrain_mask_source={}\nworld_effect_roots_playing={}\nworld_effect_roots_queued={}\nworld_effect_roots_inactive={}\nworld_effect_roots_rejected={}\nworld_effect_roots_unreadable={}\nworld_effect_roots_no_package={}\nworld_effect_roots_unsupported={}\nworld_effect_warp_omitted_elements={warp}\nworld_effect_dest_color_affine_candidates={dest_affine}\nworld_effect_dest_color_unsupported_candidates={dest_unsupported}",
+            std::env::consts::OS, std::env::consts::ARCH, cam.underwater_depth, rain_mask_source == crate::weather_gpu::MaskSource::Authored,
+            rain_mask_source.token(), roots.loaded, roots.pending, roots.disabled, roots.invalid, roots.unavailable, roots.package, roots.unsupported,
         ).unwrap();
         let inventory = if let Some(mut native) = native_inventory {
             native.finish(&renderer, &cam, &mut meta)?
@@ -9405,6 +9406,12 @@ fn preview_frame_using(
             .unwrap();
             let [tiles, pages, bytes] = renderer.lighter.bc_page_stats();
             writeln!(meta, "bc_sampled_tiles={tiles}\nbc_sampled_pages={pages}\nbc_image_allocated_bytes={bytes}").unwrap();
+            let [bc5, bc7] = renderer.lighter.bc_material_tiles();
+            writeln!(
+                meta,
+                "bc_sampled_bc5_tiles={bc5}\nbc_sampled_bc7_tiles={bc7}"
+            )
+            .unwrap();
             if let Some(bmd) = &renderer.lighter.scenery_coverage {
                 writeln!(meta, "{bmd}").unwrap();
             }

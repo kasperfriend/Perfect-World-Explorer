@@ -190,7 +190,7 @@ fn bilinear(base: u32, dims: vec2<i32>, uv: vec2<f32>, edge: bool) -> QuadTap {
 fn rgba_mip_dims(addr: u32, mip: u32) -> vec2<i32> {
     return vec2<i32>(max(vec2<u32>(1u),vec2<u32>(texels[addr],texels[addr+1u])>>vec2<u32>(mip)));
 }
-fn level(addr: u32, uv: vec2<f32>, edge: bool, mip: u32, fmt: u32) -> vec4<f32> {
+fn buffer_level(addr: u32, uv: vec2<f32>, edge: bool, mip: u32, fmt: u32) -> vec4<f32> {
     let base = addr + texels[addr+4u+mip];
     let dims = rgba_mip_dims(addr,mip);
     if all(dims==vec2<i32>(1)) { return sample_word(texels[base],fmt); }

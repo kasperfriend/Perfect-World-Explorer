@@ -30,6 +30,7 @@ const EXTRA_TEXTURE_BYTES: usize = 16 << 20;
 const DECODE_BATCH: usize = 16;
 const RECENT_TILES: usize = 128;
 type TileKey = (u64, Filter);
+pub(super) type MaterialPages = HashMap<TileKey, u32>;
 
 #[derive(Default)]
 pub(in crate::gpu) struct SceneryStream {
@@ -489,13 +490,47 @@ impl SceneryStream {
 }
 
 impl Snapshot {
+    /// The initial static BMD textures can share immutable sampled pages
+    /// across streamed replacements. A later texture still has its decoded
+    /// buffer tile: this bounded experiment never stalls on a new atlas.
+    pub(super) fn material_pages(
+        &self,
+        objects: &Objects,
+        bank: &mut Textures,
+    ) -> Result<MaterialPages, String> {
+        let budget = (8 << 20).min(bank.remaining_bytes() / 8);
+        let start = bank.byte_len();
+        let mut addresses = MaterialPages::new();
+        let mut tried = HashSet::new();
+        for asset in self.local.iter().chain(&self.extra) {
+            for &(key, ref tile) in &asset.tiles {
+                if !tried.insert(key) {
+                    continue;
+                }
+                if let Some(bytes) = objects.ray_dds_by_hash(key.0) {
+                    // Only alpha/cutout and normal roles match the raw stored
+                    // channels; the ordinary color role replaces alpha.
+                    if matches!(key.1, Filter::Color) {
+                        continue;
+                    }
+                    let remaining = budget.saturating_sub(bank.byte_len() - start);
+                    if let Some(addr) = bank.insert_paged_material(tile, bytes, remaining)? {
+                        addresses.insert(key, addr);
+                    }
+                }
+            }
+        }
+        Ok(addresses)
+    }
+
     pub(in crate::gpu) fn append(
         &self,
         builder: &mut Builder,
         bank: &mut Textures,
         storage: usize,
+        prepacked: &MaterialPages,
     ) -> Result<Coverage, String> {
-        let mut addresses = HashMap::new();
+        let mut addresses = prepacked.clone();
         let mut chunks = BTreeMap::<_, Vec<(&Asset, Vec<u32>)>>::new();
         let mut coverage = Coverage {
             counts: self.counts,
@@ -511,7 +546,7 @@ impl Snapshot {
         let mut budget = Budget {
             geometry: builder.optional_mesh_budget(storage),
             texture_bytes: remaining - dynamic_reserve,
-            tiles: HashSet::new(),
+            tiles: prepacked.keys().copied().collect(),
         };
         for asset in &self.local {
             if !budget.admit(asset) {
@@ -626,7 +661,9 @@ mod tests {
         };
         let mut builder = Builder::default();
         let mut bank = Textures::with_limit(56);
-        let coverage = snapshot.append(&mut builder, &mut bank, 1 << 20).unwrap();
+        let coverage = snapshot
+            .append(&mut builder, &mut bank, 1 << 20, &MaterialPages::new())
+            .unwrap();
         assert_eq!((coverage.local, coverage.extra), (1, 1));
         assert_eq!(coverage.counts.budget, 2);
         assert_eq!(bank.byte_len(), 48);
