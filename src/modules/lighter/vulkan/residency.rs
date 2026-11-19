@@ -17,16 +17,18 @@ struct Lane {
     pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
+    query: vk::QueryPool,
     busy: bool,
 }
 
 impl Lane {
-    fn new(ctx: &Arc<Context>) -> R<Self> {
+    fn new(ctx: &Arc<Context>, startup: bool) -> R<Self> {
         let mut lane = Self {
             ctx: ctx.clone(),
             pool: vk::CommandPool::null(),
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
+            query: vk::QueryPool::null(),
             busy: false,
         };
         let d = &ctx.device;
@@ -49,6 +51,17 @@ impl Lane {
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .map_err(vkerr("create residency fence"))?;
         }
+        if startup && ctx.timestamp_bits != 0 {
+            lane.query = unsafe {
+                d.create_query_pool(
+                    &vk::QueryPoolCreateInfo::builder()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(2),
+                    None,
+                )
+            }
+            .unwrap_or_default();
+        }
         Ok(lane)
     }
 
@@ -56,6 +69,29 @@ impl Lane {
         if self.busy {
             self.busy = !unsafe { self.ctx.device.get_fence_status(self.fence) }
                 .map_err(vkerr("poll residency fence"))?;
+            if !self.busy && self.query != vk::QueryPool::null() {
+                let mut ticks = [0u64; 2];
+                let d = &self.ctx.device;
+                if unsafe {
+                    d.get_query_pool_results(
+                        self.query,
+                        0,
+                        2,
+                        &mut ticks,
+                        vk::QueryResultFlags::TYPE_64,
+                    )
+                }
+                .is_ok()
+                {
+                    let ms = timestamp_ms(
+                        ticks[0],
+                        ticks[1],
+                        self.ctx.timestamp_bits,
+                        self.ctx.timestamp_period,
+                    );
+                    eprintln!("Lighter startup GPU submit: {ms:.6} ms");
+                }
+            }
         }
         Ok(!self.busy)
     }
@@ -72,6 +108,10 @@ impl Lane {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
             .map_err(vkerr("begin residency commands"))?;
+            if self.query != vk::QueryPool::null() {
+                d.cmd_reset_query_pool(self.cmd, self.query, 0, 2);
+                d.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.query, 0);
+            }
         }
         Ok(self.cmd)
     }
@@ -79,6 +119,14 @@ impl Lane {
     fn submit(&mut self) -> R<()> {
         let d = &self.ctx.device;
         unsafe {
+            if self.query != vk::QueryPool::null() {
+                d.cmd_write_timestamp(
+                    self.cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query,
+                    1,
+                );
+            }
             d.end_command_buffer(self.cmd)
                 .map_err(vkerr("end residency commands"))?;
             d.reset_fences(&[self.fence])
@@ -102,6 +150,7 @@ impl Drop for Lane {
         // Normal disposal is after a signaled fence (or before any submit).
         // Renderer teardown drains the device before any raw resources drop.
         unsafe {
+            self.ctx.device.destroy_query_pool(self.query, None);
             self.ctx.device.destroy_fence(self.fence, None);
             self.ctx.device.destroy_command_pool(self.pool, None);
         }
@@ -123,6 +172,8 @@ pub(super) struct ResidentUpload {
     done: bool,
     cancelled: bool,
     stats: Stats,
+    completed: Stats,
+    startup: bool,
 }
 
 impl ResidentUpload {
@@ -132,6 +183,7 @@ impl ResidentUpload {
         packet: &Packet,
         texels: &Textures,
         limit: usize,
+        startup: bool,
     ) -> R<Self> {
         let ctx = &renderer.core.ctx;
         let prefix = if renderer.scene_upload_pending || renderer.revision.is_none() {
@@ -150,7 +202,7 @@ impl ResidentUpload {
             return Err("Lighter staged Vulkan scene exceeds binding limit".into());
         }
         Ok(Self {
-            lane: Lane::new(ctx)?,
+            lane: Lane::new(ctx, startup)?,
             world: Upload::device_local(ctx, bytes as u64, STORAGE | BUILD_INPUT | ADDRESS)?,
             texels: Upload::device_local(
                 ctx,
@@ -173,6 +225,8 @@ impl ResidentUpload {
             done: false,
             cancelled: false,
             stats: Stats::default(),
+            completed: Stats::default(),
+            startup,
         })
     }
 
@@ -286,7 +340,9 @@ impl ResidentUpload {
             let count = mesh.triangle.len();
             // A single indivisible BLAS may exceed the triangle target.
             if !builds.is_empty()
-                && (builds.len() == BLAS_PER_BATCH || primitives + count > PRIMITIVES_PER_BATCH)
+                && (self.startup
+                    || builds.len() == BLAS_PER_BATCH
+                    || primitives + count > PRIMITIVES_PER_BATCH)
             {
                 break;
             }
@@ -336,6 +392,7 @@ impl ResidentUpload {
         if !self.lane.poll()? {
             return Ok(false);
         }
+        self.completed = self.stats;
         let spans = self.cursor.next(packet.bytes(), texels, self.prefix, limit);
         if !spans.is_empty() {
             self.copy(&spans)?;
@@ -377,9 +434,27 @@ impl Renderer {
         texels: &Textures,
         limit: usize,
     ) -> R<bool> {
+        self.stage_resident_inner(revision, packet, texels, limit, false)
+    }
+
+    pub(super) fn finished_upload_stats(&self) -> Stats {
+        self.resident_upload
+            .as_ref()
+            .map_or(Stats::default(), |u| u.completed)
+    }
+
+    pub(super) fn stage_resident_inner(
+        &mut self,
+        revision: u64,
+        packet: &Packet,
+        texels: &Textures,
+        limit: usize,
+        startup: bool,
+    ) -> R<bool> {
         if self.resident_upload.is_none() {
-            self.resident_upload =
-                Some(ResidentUpload::new(self, revision, packet, texels, limit)?);
+            self.resident_upload = Some(ResidentUpload::new(
+                self, revision, packet, texels, limit, startup,
+            )?);
         }
         let stream = self.resident_upload.as_mut().unwrap();
         assert_eq!(

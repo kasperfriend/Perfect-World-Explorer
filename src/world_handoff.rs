@@ -64,6 +64,34 @@ impl Timeouts {
     }
 }
 
+/// Progress is an ordinal, not a heartbeat or a changing message string.
+/// A total-load deadline still bounds the lifetime of the replacement.
+#[derive(Default)]
+struct FirstFrameWatch {
+    last: Option<(u64, Instant)>,
+}
+
+impl FirstFrameWatch {
+    fn observe<'a>(&mut self, text: &'a str, now: Instant) -> &'a str {
+        let Some(value) = text.strip_prefix(FIRST_FRAME_PREFIX) else {
+            return text;
+        };
+        let (step, message) = value
+            .split_once('\t')
+            .and_then(|(n, msg)| Some((n.parse::<u64>().ok()?, msg)))
+            .unwrap_or((0, value));
+        if self.last.is_none_or(|(previous, _)| step > previous) {
+            self.last = Some((step, now));
+        }
+        message
+    }
+
+    fn expired(&self, now: Instant, limit: Duration) -> bool {
+        self.last
+            .is_some_and(|(_, t)| now.saturating_duration_since(t) >= limit)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Deadline {
     WorldLoad,
@@ -240,7 +268,7 @@ impl Files {
                     .expect("world handoff child lock poisoned");
                 let mut previous_status = String::new();
                 let started = Instant::now();
-                let mut first_frame_started = None::<Instant>;
+                let mut first_frame = FirstFrameWatch::default();
                 loop {
                     if files.is_cancelled() {
                         let _ = child.kill();
@@ -251,14 +279,7 @@ impl Files {
                     }
                     let status = fs::read_to_string(&files.status).ok();
                     if let Some(status) = status.as_deref().filter(|s| !s.starts_with(FAILED_PREFIX)) {
-                        let progress = if let Some(stage) = status.strip_prefix(FIRST_FRAME_PREFIX) {
-                            // Count from entry to the first-frame path, independent
-                            // of whether the driver's compile/poll ever returns.
-                            first_frame_started.get_or_insert_with(Instant::now);
-                            stage
-                        } else {
-                            status
-                        };
+                        let progress = first_frame.observe(status, Instant::now());
                         if progress != previous_status {
                             progress.clone_into(&mut previous_status);
                             let _ = tx.send(Message::Progress(previous_status.clone()));
@@ -274,7 +295,7 @@ impl Files {
                             Ok(None) => None,
                             Err(error) => Some(format!("monitor error: {error}")),
                         },
-                        timeout: if first_frame_started.is_some_and(|start| start.elapsed() >= timeouts.first_frame) {
+                        timeout: if first_frame.expired(Instant::now(), timeouts.first_frame) {
                             Some(Deadline::FirstFrame)
                         } else if started.elapsed() >= timeouts.load {
                             Some(Deadline::WorldLoad)
@@ -346,7 +367,10 @@ pub fn publish_progress(message: &str) {
 /// Start (or report progress within) the first-frame watchdog. The prefix is
 /// stripped by the parent before showing the status to the user.
 pub(crate) fn publish_first_frame_progress(message: &str) {
-    publish_progress(&format!("{FIRST_FRAME_PREFIX}{message}"));
+    use std::sync::atomic::AtomicU64;
+    static STEP: AtomicU64 = AtomicU64::new(1);
+    let ordinal = STEP.fetch_add(1, Ordering::Relaxed);
+    publish_progress(&format!("{FIRST_FRAME_PREFIX}{ordinal}\t{message}"));
 }
 
 /// Report a child-side load error or caught panic. The parent watcher treats
@@ -474,6 +498,21 @@ mod tests {
         assert!(matches!(decide(&state), Decision::Fail(reason) if reason.contains("first frame")));
         state.ready = true;
         assert!(matches!(decide(&state), Decision::Ready { .. }));
+    }
+
+    #[test]
+    fn first_frame_progress_requires_a_strictly_advancing_ordinal() {
+        let mut watch = FirstFrameWatch::default();
+        let t = Instant::now();
+        let sec = Duration::from_secs;
+        let timeout = sec(2);
+        assert_eq!(watch.observe("first-frame:1\tcompile", t), "compile");
+        watch.observe("first-frame:1\tstill compiling", t + sec(1));
+        assert!(watch.expired(t + sec(2), timeout));
+        watch.observe("first-frame:2\tBLAS 1 complete", t + sec(2));
+        watch.observe("first-frame:1\tstale write", t + sec(3));
+        assert!(!watch.expired(t + sec(3), timeout));
+        assert!(watch.expired(t + sec(4), timeout));
     }
 
     #[test]

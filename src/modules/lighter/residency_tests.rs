@@ -120,6 +120,46 @@ fn crossing(mode: Mode, cpu_query: bool) {
     eprintln!("Lighter paced {mode:?}: {pending_frames} old-scene redraws; {stats:?}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires Vulkan CPU query features; opt-in first-frame pipeline and BLAS"]
+fn lighter_paced_cold_startup() {
+    let mode = Mode::Hardware;
+    let mut h = Harness::new(mode, true);
+    h.ray.paced_startup = true;
+    let mut b = Builder::for_mode(mode);
+    for i in 0..3 {
+        let mesh = upright(&mut b, -3. - i as f32, [1.; 4], 0, 0);
+        put(&mut b, mesh);
+    }
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let device = std::sync::Arc::new(h.device);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    assert!(!h.ray.prepare_window_frame(&device, 9, 9, true).unwrap());
+    let mut retries = 0;
+    while !h.ray.prepare_window_frame(&device, 9, 9, true).unwrap() {
+        assert!(
+            std::time::Instant::now() < until,
+            "staged Hardware startup stuck"
+        );
+        retries += 1;
+        device.poll(wgpu::Maintain::Poll);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let stats = h.ray.last_residency.unwrap();
+    assert!(retries >= 4);
+    assert_eq!(stats.blas_batches, stats.blas_builds);
+    assert!(stats.blas_builds > 0 && stats.max_batch_bytes <= 1 << 20);
+    h.device = std::sync::Arc::try_unwrap(device)
+        .ok()
+        .expect("worker retained device");
+    let pixel = h.pixel(
+        test_frame(Vec3::ZERO, -Vec3::Z, 9),
+        &Builder::for_mode(mode).finish(),
+    );
+    assert!(pixel.1 > 0., "staged resident chunk must draw");
+}
+
 #[test]
 #[ignore = "requires Vulkan compute and texture readback"]
 fn lighter_paced_residency_software() {

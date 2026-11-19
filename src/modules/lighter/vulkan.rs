@@ -1040,6 +1040,17 @@ impl Renderer {
         pages: Option<&super::textures::bc_pages::Plans>,
         temporal: bool,
     ) -> R<Self> {
+        Self::new_tracked(device, compact, reuse, pages, temporal, |_| {})
+    }
+
+    pub(super) fn new_tracked(
+        device: &wgpu::Device,
+        compact: bool,
+        reuse: bool,
+        pages: Option<&super::textures::bc_pages::Plans>,
+        temporal: bool,
+        progress: impl Fn(&'static str),
+    ) -> R<Self> {
         let ctx = Context::new(device)?;
         use super::textures::bc_pages::{Kind, KINDS};
         let mut bc_pages = Vec::new();
@@ -1074,7 +1085,10 @@ impl Renderer {
                 &bc_pages::material_source(bc),
                 temporal,
             );
-            let core = Core::new(ctx.clone(), &shader(&source)?, bc.len())?;
+            let spirv = shader(&source)?;
+            progress("Ray shader validated and lowered; creating compute pipeline");
+            let core = Core::new(ctx.clone(), &spirv, bc.len())?;
+            progress("Ray compute pipelines compiled: 1");
             Ok((source, core))
         };
         let (source, core) = match build(&bc_pages) {
@@ -1135,6 +1149,25 @@ impl Renderer {
     #[cfg(test)]
     pub(super) fn simulate_primary_allocation_failure(&mut self, extent: [u32; 4]) {
         self.primary_error_extent = Some(extent);
+    }
+
+    pub(super) fn initial_residency(
+        &mut self,
+        revision: u64,
+        packet: &Packet,
+        textures: &Textures,
+    ) -> R<(bool, super::residency::Stats)> {
+        if self.revision == Some(revision) {
+            return Ok((true, super::residency::Stats::default()));
+        }
+        let limit = 1 << 20;
+        if self.stage_resident_inner(revision, packet, textures, limit, true)? {
+            return self
+                .publish_resident(revision, textures)
+                .map(|stats| (true, stats))
+                .ok_or_else(|| "initial ray residency was not ready to publish".into());
+        }
+        Ok((false, self.finished_upload_stats()))
     }
 
     pub(super) fn raster_active(&self) -> bool {
@@ -1852,8 +1885,10 @@ impl Drop for Renderer {
         // Terminal teardown only, never on a mode switch or resize. There is
         // no next redraw to retire raw work; drain both native and subsequent
         // compositor reads before destroying the imported VkBuffer/allocation.
-        unsafe {
-            let _ = self.core.ctx.device.queue_wait_idle(self.core.ctx.queue);
+        if self.output.is_some() || self.resident_upload.is_some() {
+            unsafe {
+                let _ = self.core.ctx.device.queue_wait_idle(self.core.ctx.queue);
+            }
         }
     }
 }

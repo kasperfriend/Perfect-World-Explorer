@@ -29,14 +29,16 @@ impl PipelineCache {
         let path = if cfg!(test) {
             None
         } else {
-            super::super::Settings::path().and_then(|path| {
-                let key = uuid.iter().map(|b| format!("{b:02x}")).collect::<String>();
-                Some(
-                    path.parent()?
-                        .join("vulkan-cache")
-                        .join(format!("{vendor:04x}-{id:04x}-{key}.bin")),
-                )
-            })
+            std::env::var_os("PW_CACHE_DIR")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    super::super::Settings::path().and_then(|p| Some(p.parent()?.to_owned()))
+                })
+                .map(|root| {
+                    let key = uuid.iter().map(|b| format!("{b:02x}")).collect::<String>();
+                    root.join("vulkan-cache")
+                        .join(format!("{vendor:04x}-{id:04x}-{key}.bin"))
+                })
         };
         let mut data = Vec::new();
         if let Some(file) = path.as_ref().and_then(|p| std::fs::File::open(p).ok()) {
@@ -52,6 +54,12 @@ impl PipelineCache {
                     &vk::PipelineCacheCreateInfo::builder().initial_data(&data),
                     None,
                 )
+                .map(|handle| {
+                    if !data.is_empty() {
+                        eprintln!("Lighter Vulkan pipeline cache: loaded {} bytes", data.len());
+                    }
+                    handle
+                })
                 .or_else(|_| {
                     device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
                 })

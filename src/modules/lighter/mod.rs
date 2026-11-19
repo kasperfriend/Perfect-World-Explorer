@@ -850,6 +850,12 @@ fn output_pass<'a>(
     })
 }
 
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+enum ColdRayBuild {
+    Progress(&'static str),
+    Done(Result<(vulkan::Renderer, bool), String>),
+}
+
 pub struct Lighter {
     // Retire SDK work before releasing imported ray buffers or the device.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -859,6 +865,12 @@ pub struct Lighter {
     // Must be dropped before the wgpu Device (owns native Vulkan objects).
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     hardware: Option<vulkan::Renderer>,
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    cold_ray: Option<std::sync::mpsc::Receiver<ColdRayBuild>>,
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    paced_startup: bool,
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    initial_progress: [u64; 3],
     software: Option<Software>,
     present: Option<Present>,
     post: Option<post::Post>,
@@ -910,6 +922,12 @@ impl Default for Lighter {
             vendor_present: None,
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             hardware: None,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            cold_ray: None,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            paced_startup: false,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            initial_progress: [0; 3],
             software: None,
             present: None,
             post: None,
@@ -964,6 +982,9 @@ impl Lighter {
                 .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
         Self {
             armed: settings.mode != Mode::Off,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            paced_startup: settings.mode == Mode::Hardware
+                && std::env::var("PW_RAY_PACED_STARTUP").as_deref() == Ok("1"),
             compact_terrain: bc_pages || textures::compact_terrain_enabled(),
             bc_pages,
             screen_reuse: screen_reuse_requested(),
@@ -1467,6 +1488,103 @@ impl Lighter {
             return Ok(trace_idle && resident_idle);
         }
         Ok(true)
+    }
+
+    /// First-use Hardware route only. The worker creates pipelines and static
+    /// handles but never submits queue work. An Arc keeps the parent Vulkan
+    /// device alive if recovery or window close abandons the worker.
+    pub(crate) fn prepare_window_frame(
+        &mut self,
+        device: &std::sync::Arc<wgpu::Device>,
+        w: u32,
+        h: u32,
+        #[allow(unused_variables)] first: bool,
+    ) -> Result<bool, String> {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if first
+            && self.paced_startup
+            && self.settings.mode == Mode::Hardware
+            && self.unavailable().is_none()
+        {
+            use std::sync::mpsc::{channel, TryRecvError};
+            if self.hardware.is_none() && self.cold_ray.is_none() {
+                let (tx, rx) = channel();
+                let device = device.clone();
+                let compact = self.compact_terrain;
+                let reuse = self.screen_reuse != 0;
+                let temporal = self.reconstruction.is_some();
+                let hybrid = self.settings.hybrid_primary;
+                let pages = self
+                    .world
+                    .as_ref()
+                    .filter(|_| self.bc_pages)
+                    .map(|w| w.textures.bc_pages.clone());
+                std::thread::Builder::new().name("lighter-pipeline-startup".into()).spawn(move || {
+                    let progress = |step| { let _ = tx.send(ColdRayBuild::Progress(step)); };
+                    let build = |temporal| vulkan::Renderer::new_tracked(&device, compact, reuse, pages.as_ref(), temporal, progress);
+                    let made = match build(temporal) {
+                        Err(error) if temporal && !crate::gpu::reconstruction_device_lost(&error) => {
+                            eprintln!("Lighter temporal tracer unavailable; using portable resolve: {error}");
+                            build(false).map(|r| (r, false))
+                        }
+                        other => other.map(|r| (r, temporal)),
+                    }.map(|(mut r, enabled)| {
+                        if hybrid {
+                            r.prewarm_primary();
+                        }
+                        (r, enabled)
+                    });
+                    // On a closed channel the unused result drops before our
+                    // Arc. There is no queue work or imported image to drain.
+                    let _ = tx.send(ColdRayBuild::Done(made));
+                }).map_err(|e| format!("start Lighter pipeline worker: {e}"))?;
+                self.cold_ray = Some(rx);
+                return Ok(false);
+            }
+            if let Some(rx) = &self.cold_ray {
+                let made = loop {
+                    match rx.try_recv() {
+                        Ok(ColdRayBuild::Progress(stage)) => {
+                            crate::gpu::first_frame_progress(stage)
+                        }
+                        Ok(ColdRayBuild::Done(made)) => break made,
+                        Err(TryRecvError::Empty) => return Ok(false),
+                        Err(TryRecvError::Disconnected) => {
+                            break Err("Lighter pipeline worker ended before publication".into())
+                        }
+                    }
+                };
+                self.cold_ray = None;
+                let (renderer, temporal) = made?;
+                if !temporal {
+                    self.reconstruction = None;
+                }
+                self.hardware = Some(renderer);
+                crate::gpu::first_frame_progress(
+                    "Ray pipeline worker completed; staging initial chunk",
+                );
+                return Ok(false);
+            }
+            if let (Some(rt), Some(world)) = (&mut self.hardware, &self.world) {
+                let (done, stats) =
+                    rt.initial_residency(self.revision, &world.packet, &world.textures)?;
+                let progress = [stats.batches, stats.blas_builds, u64::from(done)];
+                if progress > self.initial_progress {
+                    self.initial_progress = progress;
+                    crate::gpu::first_frame_progress(&format!(
+                        "Initial ray residency: {} chunk(s), {} BLAS, {} copy batches complete",
+                        progress[2], progress[1], progress[0]
+                    ));
+                }
+                if !done {
+                    return Ok(false);
+                }
+                if stats.batches != 0 {
+                    self.last_residency = Some(stats);
+                }
+            }
+        }
+        self.prepare_frame(device, w, h)
     }
 
     /// Check before acquiring a swapchain image. False means retry on a later

@@ -1862,7 +1862,7 @@ struct Renderer {
     ray_gfx_archive_unavailable: bool,
     model_lights: std::sync::Arc<crate::scene_lights::SceneLights>,
     model_scene: std::sync::Arc<crate::scene::Scene>,
-    device: wgpu::Device,
+    device: std::sync::Arc<wgpu::Device>,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     scenery_pipeline: wgpu::RenderPipeline,
@@ -2699,7 +2699,7 @@ impl Renderer {
             world_width: t.width,
             world_height: t.height,
             world_spacing: t.grid_spacing,
-            device,
+            device: std::sync::Arc::new(device),
             queue,
             pipeline,
             scenery_pipeline,
@@ -5027,7 +5027,7 @@ fn startup_progress(message: &str) {
     report_startup(message, false);
 }
 
-fn first_frame_progress(message: &str) {
+pub(crate) fn first_frame_progress(message: &str) {
     report_startup(message, true);
 }
 
@@ -6594,7 +6594,7 @@ fn run_viewer(
                                 panic!("the parent should have killed the stalled reload");
                             }
                         }
-                        match renderer.lighter.prepare_frame(&renderer.device, rt_extent.0, rt_extent.1) {
+                        match renderer.lighter.prepare_window_frame(&renderer.device, rt_extent.0, rt_extent.1, !presented_once) {
                             Ok(true) => {}
                             Ok(false) => {
                                 gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
