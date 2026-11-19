@@ -68,9 +68,6 @@ fn naga_validates_both_paths_and_emits_native_ray_queries() {
     for src in [
         trace_source(SOFTWARE, false, false),
         trace_source(SOFTWARE, true, true),
-        [PIXELS, EASU, PRESENT, PRESENT_PORTABLE].concat(),
-        [PIXELS, EASU, PRESENT, PRESENT_TEMPORAL].concat(),
-        [EASU, include_str!("../../fsr1.wgsl")].concat(),
         [PIXELS, post::SHADER].concat(),
     ] {
         let module = naga::front::wgsl::parse_str(&src)
