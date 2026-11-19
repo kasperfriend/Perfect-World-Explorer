@@ -720,7 +720,6 @@ impl Present {
             source: wgpu::ShaderSource::Wgsl(
                 [
                     PIXELS,
-                    EASU,
                     PRESENT,
                     if temporal_output {
                         PRESENT_TEMPORAL
