@@ -18,9 +18,9 @@ ray-traced scene and its reverse-Z depth.
    first window. Your saved choice is still selected in **Escape → Modules →
    Lighter**. Choose **World renderer** and click **Reload World** to apply it
    to the same map, camera and time. The old world stays open with progress
-   and **Cancel Reload**. If the replacement does not present within two
-   minutes of starting its first-frame work, or if it fails or is cancelled,
-   Explorer keeps the current world and does not overwrite the saved mode.
+   and **Cancel Reload**. If the replacement stops making first-frame progress
+   for two minutes, fails or is cancelled, Explorer keeps the current world
+   and does not overwrite the saved mode.
 2. **Software RT** uses a stackless BVH in a GPU compute shader. It does not
    require RT cores. **Hardware RT** requires a physical Vulkan 1.2+ GPU and a
    driver exposing acceleration structures and `VK_KHR_ray_query`. It builds
@@ -73,10 +73,14 @@ For a source-tree build, set `PW_MODULES_DIR` to the folder containing the
 installed manifests (the repository's `Modules` directory). Settings live in
 `PerfectWorldViewer/lighter.ini` under `%LOCALAPPDATA%`, `$XDG_CONFIG_HOME`, or
 `~/.config`. During Windows startup use **Cancel startup** to quit a stalled
-load. The last few `Viewer startup:` lines in `pwe-logs/session.log` (or your
-configured log folder) name the renderer, graphics device and last reached
-stage. First-frame pipeline preparation, drawing, interface composition,
-GPU completion and swapchain opening are logged separately.
+load. If **Reload World** fails, use **Copy details** in the error dialog. An
+unexpected exit includes its code and the last startup stage Explorer saw.
+`0xc0000005` is a Windows access violation; it does not identify the failing
+module or imply a graphics device loss. The `Viewer startup:` and `Ray adapter`
+lines for the replacement PID in `pwe-logs/session.log` (or your configured
+log folder) give more context, including the adapter and driver. If Windows
+recorded an Application Error for that attempt, its faulting module name and
+exception offset can help narrow the crash.
 
 ## What is traced
 

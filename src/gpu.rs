@@ -5032,7 +5032,10 @@ pub(crate) fn first_frame_progress(message: &str) {
 }
 
 fn report_startup(message: &str, first_frame: bool) {
-    crate::diagnostics::session(format!("Viewer startup: {message}"));
+    crate::diagnostics::session(format!(
+        "Viewer startup: [pid={}] {message}",
+        std::process::id()
+    ));
     eprintln!("Viewer startup: {message}");
     if crate::world_handoff::is_handoff_child() {
         if first_frame {
@@ -5135,6 +5138,14 @@ fn spawn_world_handoff(
             ));
         }
     };
+    let request = snapshot.map_or_else(
+        || format!("World change to {id}"),
+        |s| format!("{} for {id} ({})", s.kind.label(), s.lighter.mode.label()),
+    );
+    crate::diagnostics::session(format!(
+        "{request}: starting replacement PID {}",
+        child.id()
+    ));
     let (tx, rx) = std::sync::mpsc::channel();
     let timeouts = crate::world_handoff::Timeouts::configured();
     #[cfg(test)]
@@ -5305,7 +5316,20 @@ async fn open_adapter(
             .await
             .ok_or("No compatible GPU adapter")?
     };
-    eprintln!("GPU adapter: {:?}", a.get_info());
+    let info = a.get_info();
+    eprintln!("GPU adapter: {info:?}");
+    if surface.is_some() && lighter != LighterMode::Off {
+        crate::diagnostics::session(format!(
+            "Ray adapter [pid={}]: {info:?}",
+            std::process::id()
+        ));
+        startup_progress(&format!(
+            "Requesting a {} device on {} ({:?})…",
+            lighter.label(),
+            info.name,
+            info.backend
+        ));
+    }
     // Request RT bits only for an opted-in scene and only on a physical
     // Vulkan device which advertised actual acceleration-structure features.
     let rt = crate::modules::lighter::device_features(&a, lighter);
@@ -5459,6 +5483,10 @@ fn run_viewer(
         eprintln!("World catalog: {warning}");
     }
     let handoff_child = crate::world_handoff::is_handoff_child();
+    startup_progress(&format!(
+        "Creating the viewer window for {}…",
+        current_map.id
+    ));
     let mut event_loop = EventLoopBuilder::<()>::with_user_event();
     #[cfg(all(test, target_os = "linux"))]
     if smoke_dir.is_some() {
@@ -5531,6 +5559,17 @@ fn run_viewer(
         crate::diagnostics::session(format!(
             "Lighter: kept {} as a saved choice; opening Native before any ray reload",
             saved_lighter.mode.label()
+        ));
+    }
+    if lighter_settings.mode != LighterMode::Off {
+        let provider = match std::env::var("PW_RAY_RECONSTRUCTION").as_deref() {
+            Ok("fsr") => "Vulkan FSR requested",
+            Ok("rr") => "Vulkan DLSS Ray Reconstruction requested",
+            _ => "portable reconstruction",
+        };
+        startup_progress(&format!(
+            "Preparing {} — {provider}…",
+            lighter_settings.mode.label()
         ));
     }
     let mut reconstruction =
@@ -8118,9 +8157,14 @@ fn run_viewer(
                                             .show(ctx, |ui| {
                                                 ui.colored_label(egui::Color32::LIGHT_RED, reason.as_str());
                                                 ui.label("The current world is still open.");
-                                                if ui.button("Dismiss").clicked() {
-                                                    world_change_error = None;
-                                                }
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("Copy details").clicked() {
+                                                        ui.output_mut(|output| output.copied_text = reason.clone());
+                                                    }
+                                                    if ui.button("Dismiss").clicked() {
+                                                        world_change_error = None;
+                                                    }
+                                                });
                                             });
                                     }
                                     if let Some(reason) = world_change_notice.clone() {
@@ -8763,6 +8807,11 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                         return;
                     }
                     if let Message::Failed(reason) = message {
+                        let reason = if let Some(lighter) = task.reload {
+                            format!("Reload {} with {} failed.\n{reason}", current_map.id, lighter.mode.label())
+                        } else {
+                            reason
+                        };
                         crate::diagnostics::session(format!("Replacement world failed: {reason}"));
                         world_change_error = Some(reason);
                     }

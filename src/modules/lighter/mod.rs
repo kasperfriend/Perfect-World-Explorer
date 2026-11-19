@@ -1592,7 +1592,7 @@ impl Lighter {
         device: &std::sync::Arc<wgpu::Device>,
         w: u32,
         h: u32,
-        #[allow(unused_variables)] first: bool,
+        first: bool,
     ) -> Result<bool, String> {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         if first
@@ -1616,7 +1616,7 @@ impl Lighter {
                     .map(|w| w.textures.bc_pages.clone());
                 std::thread::Builder::new().name("lighter-pipeline-startup".into()).spawn(move || {
                     let progress = |step| { let _ = tx.send(ColdRayBuild::Progress(step)); };
-                    let build = |temporal| vulkan::Renderer::new_tracked(&device, compact, reuse, pages.as_ref(), temporal, game, progress);
+                    let build = |temporal| vulkan::Renderer::new(&device, compact, reuse, pages.as_ref(), temporal, game, &progress);
                     let made = match build(temporal) {
                         Err(error) if temporal && !crate::gpu::reconstruction_device_lost(&error) => {
                             eprintln!("Lighter temporal tracer unavailable; using portable resolve: {error}");
@@ -1625,7 +1625,7 @@ impl Lighter {
                         other => other.map(|r| (r, temporal)),
                     }.map(|(mut r, enabled)| {
                         if hybrid {
-                            r.prewarm_primary();
+                            r.prewarm_primary(&progress);
                         }
                         (r, enabled)
                     });
@@ -1679,7 +1679,11 @@ impl Lighter {
                 }
             }
         }
-        self.prepare_frame(device, w, h)
+        self.prepare_frame_with_progress(device, w, h, |stage| {
+            if first {
+                crate::gpu::first_frame_progress(stage);
+            }
+        })
     }
 
     /// Check before acquiring a swapchain image. False means retry on a later
@@ -1690,6 +1694,16 @@ impl Lighter {
         device: &wgpu::Device,
         w: u32,
         h: u32,
+    ) -> Result<bool, String> {
+        self.prepare_frame_with_progress(device, w, h, |_| {})
+    }
+
+    fn prepare_frame_with_progress(
+        &mut self,
+        device: &wgpu::Device,
+        w: u32,
+        h: u32,
+        progress: impl Fn(&'static str),
     ) -> Result<bool, String> {
         if self.settings.mode != Mode::Off && self.capture && self.timings.is_none() {
             self.timings = profile::Timings::new(device);
@@ -1720,6 +1734,7 @@ impl Lighter {
         let temporal_capable = false;
         if self.settings.mode == Mode::Software && self.software.is_none() {
             // Start the cold compute pipeline before acquiring a surface.
+            progress("Compiling the Software RT compute pipeline…");
             let build = |temporal| {
                 checked_pipeline(device, || {
                     Software::new(
@@ -1757,6 +1772,7 @@ impl Lighter {
                             .filter(|_| self.bc_pages),
                         temporal,
                         self.game_profile.is_some() && self.settings.hybrid_primary,
+                        &progress,
                     )
                 };
                 self.hardware = Some(match build(temporal_capable) {
@@ -1777,15 +1793,15 @@ impl Lighter {
             if self.settings.hybrid_primary {
                 // The UI stages this only through Reload World. Prewarm even
                 // if a later per-frame setting (SPP/Reference) uses full rays.
-                rt.prewarm_primary();
+                rt.prewarm_primary(&progress);
             }
             if self.capture {
                 crate::gpu::wait_for_capture(device, || {
-                    rt.try_prepare_image(device, bytes)
+                    rt.try_prepare_image(device, bytes, &progress)
                         .map(|ready| ready.then_some(true))
                 })
             } else {
-                rt.try_prepare_image(device, bytes)
+                rt.try_prepare_image(device, bytes, &progress)
             }
         } else {
             Ok(true)

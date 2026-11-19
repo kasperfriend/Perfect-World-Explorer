@@ -668,6 +668,8 @@ jobs:
           exit $status
       - name: Test world audio selection on Windows
         run: cargo test --locked --target x86_64-pc-windows-msvc --bin perfect-world-explorer world_audio::tests
+      - name: Test world handoff failures on Windows
+        run: cargo test --locked --target x86_64-pc-windows-msvc --bin perfect-world-explorer world_handoff::tests
       - name: Build the shipped survey tool
         shell: bash
         run: cargo build --locked --release --target x86_64-pc-windows-msvc --bin bmd-overlap-survey

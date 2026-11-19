@@ -356,7 +356,13 @@ fn render(@builtin(global_invocation_id) id: vec3<u32>) {{
 }}
 "#
     ));
-    let core = Core::new(ctx.clone(), &super::shader(&source).unwrap(), atlases.len()).unwrap();
+    let core = Core::new(
+        ctx.clone(),
+        &super::shader(&source).unwrap(),
+        atlases.len(),
+        &|_| {},
+    )
+    .unwrap();
     for (i, atlas) in atlases.iter().enumerate() {
         atlas.bind(&core, i as u32 + 7);
     }

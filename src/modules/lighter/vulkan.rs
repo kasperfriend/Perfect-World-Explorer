@@ -833,7 +833,13 @@ struct Core {
 }
 
 impl Core {
-    fn new(ctx: Arc<Context>, spirv: &[u32], bc: usize) -> R<Self> {
+    fn new(
+        ctx: Arc<Context>,
+        spirv: &[u32],
+        bc: usize,
+        progress: &impl Fn(&'static str),
+    ) -> R<Self> {
+        progress("Opening the Vulkan RT pipeline cache…");
         let (vendor, device, uuid) = ctx.identity;
         let mut c = Self {
             cache: cache::PipelineCache::new(&ctx.device, vendor, device, uuid),
@@ -849,6 +855,7 @@ impl Core {
             query: vk::QueryPool::null(),
         };
         let d = &c.ctx.device;
+        progress("Creating Vulkan RT command buffers and descriptors…");
         unsafe {
             c.pool = d
                 .create_command_pool(
@@ -944,6 +951,7 @@ impl Core {
                     None,
                 )
                 .map_err(vkerr("create pipeline layout"))?;
+            progress("Compiling the Vulkan RT compute pipeline…");
             c.pipeline = pipeline(
                 d,
                 c.layout,
@@ -952,6 +960,7 @@ impl Core {
                 CStr::from_bytes_with_nul(b"render\0").unwrap(),
             )?;
         }
+        progress("Saving the Vulkan RT pipeline cache…");
         c.cache.save();
         if c.ctx.timestamp_bits > 0 {
             // Profiling is optional; inability to create a query pool does not
@@ -1098,26 +1107,16 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    pub fn new(
+    pub(super) fn new(
         device: &wgpu::Device,
         compact: bool,
         reuse: bool,
         pages: Option<&super::textures::bc_pages::Plans>,
         temporal: bool,
         game: bool,
+        progress: &impl Fn(&'static str),
     ) -> R<Self> {
-        Self::new_tracked(device, compact, reuse, pages, temporal, game, |_| {})
-    }
-
-    pub(super) fn new_tracked(
-        device: &wgpu::Device,
-        compact: bool,
-        reuse: bool,
-        pages: Option<&super::textures::bc_pages::Plans>,
-        temporal: bool,
-        game: bool,
-        progress: impl Fn(&'static str),
-    ) -> R<Self> {
+        progress("Preparing the Vulkan ray-query context…");
         let ctx = Context::new(device)?;
         use super::textures::bc_pages::{Kind, KINDS};
         let mut bc_pages = Vec::new();
@@ -1153,6 +1152,7 @@ impl Renderer {
                 temporal,
             );
             // Keep the full-ray fallback unchanged, even in a game profile.
+            progress("Lowering the Hardware RT shader to SPIR-V…");
             let spirv = shader(&source)?;
             let source = if game {
                 super::game_profile::specialize(
@@ -1162,9 +1162,8 @@ impl Renderer {
             } else {
                 source
             };
-            progress("Ray shader validated and lowered; creating compute pipeline");
-            let core = Core::new(ctx.clone(), &spirv, bc.len())?;
-            progress("Ray compute pipelines compiled: 1");
+            let core = Core::new(ctx.clone(), &spirv, bc.len(), progress)?;
+            progress("Preparing Vulkan RT buffers…");
             Ok((source, core))
         };
         let (source, core) = match build(&bc_pages) {
@@ -1518,10 +1517,11 @@ impl Renderer {
 
     // Called during preflight, before swapchain acquisition. Both the raw
     // Vulkan code and the optional raster sibling share the driver cache.
-    pub(super) fn prewarm_primary(&mut self) {
+    pub(super) fn prewarm_primary(&mut self, progress: &impl Fn(&'static str)) {
         let Some(source) = self.primary_source.take() else {
             return;
         };
+        progress("Compiling the optional raster primary pipeline…");
         match primary::Primary::new(
             &self.core.ctx,
             self.core.layout,
@@ -1544,7 +1544,12 @@ impl Renderer {
         self.output.as_ref().unwrap().imported.as_ref().unwrap()
     }
 
-    pub(super) fn try_prepare_image(&mut self, device: &wgpu::Device, size: u64) -> R<bool> {
+    pub(super) fn try_prepare_image(
+        &mut self,
+        device: &wgpu::Device,
+        size: u64,
+        progress: &impl Fn(&'static str),
+    ) -> R<bool> {
         // Retire a cancelled candidate, but live frames read independent
         // buffers and needn't wait on the residency fence to record/submit.
         self.poll_resident_upload()?;
@@ -1563,6 +1568,7 @@ impl Renderer {
             {
                 return Ok(false);
             }
+            progress("Initializing the Vulkan RT output buffer…");
             let capacity = grown_capacity(size, old_capacity, image_limit(device) & !3);
             let raw = Buffer::new(
                 ctx,
@@ -1599,6 +1605,7 @@ impl Renderer {
         }
         let output = self.output.as_mut().unwrap();
         if output.imported.is_none() {
+            progress("Importing the Vulkan RT output into the viewer device…");
             output.imported = Some(unsafe {
                 device.create_buffer_from_hal::<Vulkan>(
                     HalDevice::buffer_from_raw(output.raw.handle),

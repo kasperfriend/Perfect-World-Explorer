@@ -164,6 +164,14 @@ fn decide(snapshot: &WatchSnapshot) -> Decision {
     }
 }
 
+fn describe_exit(exit: std::process::ExitStatus) -> String {
+    #[cfg(windows)]
+    if exit.code() == Some(0xc000_0005u32 as i32) {
+        return format!("{exit}; Windows access violation");
+    }
+    exit.to_string()
+}
+
 #[derive(Clone, Debug)]
 pub struct Files {
     ready: PathBuf,
@@ -277,10 +285,19 @@ impl Files {
                         let _ = tx.send(Message::Cancelled);
                         return;
                     }
+                    let child_exit = match child.try_wait() {
+                        Ok(Some(exit)) => Some(describe_exit(exit)),
+                        Ok(None) => None,
+                        Err(error) => Some(format!("monitor error: {error}")),
+                    };
+                    // Sample status after checking the process, so an exit
+                    // observed in this poll includes the child's final write.
                     let status = fs::read_to_string(&files.status).ok();
                     if let Some(status) = status.as_deref().filter(|s| !s.starts_with(FAILED_PREFIX)) {
-                        let progress = first_frame.observe(status, Instant::now());
-                        if progress != previous_status {
+                        let progress = first_frame.observe(status, Instant::now()).trim();
+                        // A crash or a concurrent read during a direct write
+                        // can leave an empty file. Keep the last useful stage.
+                        if !progress.is_empty() && progress != previous_status {
                             progress.clone_into(&mut previous_status);
                             let _ = tx.send(Message::Progress(previous_status.clone()));
                         }
@@ -290,11 +307,7 @@ impl Files {
                         focused: files.focused(),
                         hwnd: files.published_hwnd(),
                         status,
-                        child_exit: match child.try_wait() {
-                            Ok(Some(exit)) => Some(exit.to_string()),
-                            Ok(None) => None,
-                            Err(error) => Some(format!("monitor error: {error}")),
-                        },
+                        child_exit,
                         timeout: if first_frame.expired(Instant::now(), timeouts.first_frame) {
                             Some(Deadline::FirstFrame)
                         } else if started.elapsed() >= timeouts.load {
@@ -319,7 +332,9 @@ impl Files {
                             return;
                         }
                         Decision::Fail(mut reason) => {
-                            if snapshot.timeout.is_some() && !previous_status.is_empty() {
+                            if (snapshot.child_exit.is_some() || snapshot.timeout.is_some())
+                                && !previous_status.is_empty()
+                            {
                                 reason.push_str(&format!(" Last stage: {previous_status}"));
                             }
                             let _ = child.kill();
@@ -544,6 +559,57 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(2)),
             Ok(Message::Cancelled)
         );
+        assert!(!files.focus.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn access_violation_reports_the_windows_exception_code() {
+        use std::os::windows::process::ExitStatusExt;
+        let description = describe_exit(std::process::ExitStatus::from_raw(0xc000_0005));
+        assert!(description.contains("0xc0000005"));
+        assert!(description.contains("Windows access violation"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn early_exit_reports_the_last_startup_stage() {
+        let files = Files::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stage = "Preparing Lighter ray pipeline and buffers";
+        fs::write(&files.status, format!("{FIRST_FRAME_PREFIX}2\t{stage}")).unwrap();
+        #[cfg(unix)]
+        let mut child = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
+        #[cfg(windows)]
+        let mut child = Command::new("cmd.exe")
+            .args(["/D", "/C", "exit 7"])
+            .spawn()
+            .unwrap();
+        let exit = child.wait().unwrap();
+        assert_eq!(exit.code(), Some(7));
+        files
+            .clone()
+            .watch(
+                child,
+                tx,
+                Timeouts {
+                    load: Duration::from_secs(10),
+                    first_frame: Duration::from_secs(10),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Message::Progress(stage.into()))
+        );
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Message::Failed(format!(
+                "The new world process exited before it was ready ({exit}). Last stage: {stage}"
+            )))
+        );
+        assert!(!files.status.exists());
+        assert!(!files.ready.exists());
         assert!(!files.focus.exists());
     }
 
