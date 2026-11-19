@@ -18,17 +18,19 @@ struct Lane {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     query: vk::QueryPool,
+    sizes: vk::QueryPool,
     busy: bool,
 }
 
 impl Lane {
-    fn new(ctx: &Arc<Context>, startup: bool) -> R<Self> {
+    fn new(ctx: &Arc<Context>, startup: bool, compact: bool) -> R<Self> {
         let mut lane = Self {
             ctx: ctx.clone(),
             pool: vk::CommandPool::null(),
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             query: vk::QueryPool::null(),
+            sizes: vk::QueryPool::null(),
             busy: false,
         };
         let d = &ctx.device;
@@ -57,6 +59,17 @@ impl Lane {
                     &vk::QueryPoolCreateInfo::builder()
                         .query_type(vk::QueryType::TIMESTAMP)
                         .query_count(2),
+                    None,
+                )
+            }
+            .unwrap_or_default();
+        }
+        if compact {
+            lane.sizes = unsafe {
+                d.create_query_pool(
+                    &vk::QueryPoolCreateInfo::builder()
+                        .query_type(vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR)
+                        .query_count(BLAS_PER_BATCH as u32),
                     None,
                 )
             }
@@ -151,6 +164,7 @@ impl Drop for Lane {
         // Renderer teardown drains the device before any raw resources drop.
         unsafe {
             self.ctx.device.destroy_query_pool(self.query, None);
+            self.ctx.device.destroy_query_pool(self.sizes, None);
             self.ctx.device.destroy_fence(self.fence, None);
             self.ctx.device.destroy_command_pool(self.pool, None);
         }
@@ -168,6 +182,8 @@ pub(super) struct ResidentUpload {
     mesh_at: usize,
     blas: HashMap<ResidentKey, ResidentBlas>,
     scratch: Option<Buffer>,
+    compaction_sizes: Vec<ResidentKey>,
+    compaction_copies: Vec<Structure>,
     pub revision: u64,
     done: bool,
     cancelled: bool,
@@ -202,7 +218,7 @@ impl ResidentUpload {
             return Err("Lighter staged Vulkan scene exceeds binding limit".into());
         }
         Ok(Self {
-            lane: Lane::new(ctx, startup)?,
+            lane: Lane::new(ctx, startup, renderer.compact_blas)?,
             world: Upload::device_local(ctx, bytes as u64, STORAGE | BUILD_INPUT | ADDRESS)?,
             texels: Upload::device_local(
                 ctx,
@@ -221,6 +237,8 @@ impl ResidentUpload {
             mesh_at: 0,
             blas: HashMap::new(),
             scratch: None,
+            compaction_sizes: Vec::new(),
+            compaction_copies: Vec::new(),
             revision,
             done: false,
             cancelled: false,
@@ -346,7 +364,9 @@ impl ResidentUpload {
             {
                 break;
             }
-            let build = Renderer::blas(ctx, packet, mesh, base, false)?;
+            let mut build = Renderer::blas(ctx, packet, mesh, base, false)?;
+            build.allow_compaction =
+                self.lane.sizes != vk::QueryPool::null() && matches!(mesh.key, MeshKey::Static(..));
             let mut resident = ResidentBlas::default();
             scratch_bytes = scratch_bytes.max(build.prepare(ctx, &mut resident.accel)?);
             resident.shape = Some(mesh.shape);
@@ -373,10 +393,115 @@ impl ResidentUpload {
         for (key, build) in &builds {
             unsafe { build.encode(ctx, cmd, self.blas[key].accel.as_ref().unwrap(), scratch) }
         }
+        if self.lane.sizes != vk::QueryPool::null() {
+            let mut handles = Vec::new();
+            for (key, build) in &builds {
+                if build.allow_compaction {
+                    handles.push(self.blas[key].accel.as_ref().unwrap().handle);
+                    self.compaction_sizes.push(*key);
+                }
+            }
+            if !handles.is_empty() {
+                unsafe {
+                    ctx.device
+                        .cmd_reset_query_pool(cmd, self.lane.sizes, 0, handles.len() as u32);
+                    ctx.acceleration
+                        .cmd_write_acceleration_structures_properties(
+                            cmd,
+                            &handles,
+                            vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+                            self.lane.sizes,
+                            0,
+                        );
+                }
+            }
+        }
         self.lane.submit()?;
         self.stats.blas_batches += 1;
         self.stats.blas_builds += builds.len() as u64;
         Ok(false)
+    }
+
+    fn compact_built_batch(&mut self) -> R<bool> {
+        self.compaction_copies.clear(); // previous copy fence has retired
+        let keys = std::mem::take(&mut self.compaction_sizes);
+        if keys.is_empty() {
+            return Ok(false);
+        }
+        let ctx = &self.lane.ctx;
+        let mut sizes = [0u64; BLAS_PER_BATCH];
+        match unsafe {
+            ctx.device.get_query_pool_results(
+                self.lane.sizes,
+                0,
+                keys.len() as u32,
+                &mut sizes[..keys.len()],
+                vk::QueryResultFlags::TYPE_64,
+            )
+        } {
+            Ok(()) => (),
+            Err(vk::Result::ERROR_DEVICE_LOST) => {
+                return Err("Lighter Vulkan compaction query: ERROR_DEVICE_LOST".into())
+            }
+            Err(error) => {
+                eprintln!("Lighter static compaction queries unavailable: {error:?}");
+                return Ok(false);
+            }
+        }
+        let mut replacements = Vec::new();
+        for (key, size) in keys.into_iter().zip(sizes) {
+            let old = self.blas[&key].accel.as_ref().unwrap();
+            if size == 0 || size >= old.storage.size {
+                continue;
+            }
+            match Structure::new(ctx, size, vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL) {
+                Ok(new) => {
+                    // An unchanged allocation size is not a memory win. The
+                    // driver may round both buffer allocations to one page.
+                    if new.storage.charged < old.storage.charged {
+                        replacements.push((key, new, old.storage.charged));
+                    }
+                }
+                Err(e) if e.contains("ERROR_DEVICE_LOST") => return Err(e),
+                Err(_) => continue, // not enough transient headroom: keep the valid build
+            }
+        }
+        if replacements.is_empty() {
+            return Ok(false);
+        }
+        let cmd = self.lane.begin()?;
+        unsafe {
+            for (key, new, _) in &replacements {
+                ctx.acceleration.cmd_copy_acceleration_structure(
+                    cmd,
+                    &vk::CopyAccelerationStructureInfoKHR::builder()
+                        .src(self.blas[key].accel.as_ref().unwrap().handle)
+                        .dst(new.handle)
+                        .mode(vk::CopyAccelerationStructureModeKHR::COMPACT),
+                );
+            }
+            let stage = vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR;
+            ctx.device.cmd_pipeline_barrier(
+                cmd,
+                stage,
+                stage,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR)
+                    .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR)
+                    .build()],
+                &[],
+                &[],
+            );
+        }
+        self.lane.submit()?;
+        for (key, new, previous) in replacements {
+            self.stats.blas_compacted += 1;
+            self.stats.blas_saved_bytes += previous - new.storage.charged;
+            self.compaction_copies
+                .push(self.blas.get_mut(&key).unwrap().accel.replace(new).unwrap());
+        }
+        Ok(true)
     }
 
     fn poll(
@@ -393,6 +518,9 @@ impl ResidentUpload {
             return Ok(false);
         }
         self.completed = self.stats;
+        if self.compact_built_batch()? {
+            return Ok(false);
+        }
         let spans = self.cursor.next(packet.bytes(), texels, self.prefix, limit);
         if !spans.is_empty() {
             self.copy(&spans)?;
@@ -492,6 +620,12 @@ impl Renderer {
         texels.remember_prefix(&mut self.texture_prefix);
         self.blas.extend(stream.blas);
         self.as_builds[0] += stream.stats.blas_builds;
+        if stream.stats.blas_compacted > 0 {
+            eprintln!(
+                "Lighter static BLAS: compacted {} in resident revision {}, saved {} charged bytes",
+                stream.stats.blas_compacted, revision, stream.stats.blas_saved_bytes
+            );
+        }
         self.resident_dirty = true;
         Some(stream.stats)
     }

@@ -157,6 +157,38 @@ struct AllocationBudget {
     limit: u64,
     held: AtomicU64,
 }
+fn ray_budget(local: u64, requested: Option<&str>) -> u64 {
+    let cap = requested
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| (64 << 20..=RAY_ALLOCATION_BUDGET).contains(&n))
+        .unwrap_or(RAY_ALLOCATION_BUDGET);
+    cap.min(local)
+}
+
+#[cfg(test)]
+#[test]
+fn raw_ray_budget_is_bounded_and_releases_after_rejection() {
+    let max = RAY_ALLOCATION_BUDGET;
+    assert_eq!(ray_budget(10_000_000_000, None), max);
+    assert_eq!(ray_budget(10_000_000_000, Some("6500000001")), max);
+    assert_eq!(ray_budget(3 << 30, Some("4000000000")), 3 << 30);
+    assert_eq!(
+        ray_budget(10_000_000_000, Some("2000000000")),
+        2_000_000_000
+    );
+    assert_eq!(ray_budget(3 << 30, Some("bad")), 3 << 30);
+    let b = AllocationBudget {
+        limit: 100,
+        held: AtomicU64::new(0),
+    };
+    assert!(b.reserve(99).is_ok());
+    assert!(b.reserve(2).is_err());
+    assert_eq!(b.held.load(Ordering::Relaxed), 99);
+    b.release(99);
+    assert!(b.reserve(100).is_ok());
+    assert!(b.reserve(u64::MAX).is_err());
+}
+
 impl AllocationBudget {
     fn reserve(&self, size: u64) -> R<()> {
         self.held
@@ -255,7 +287,10 @@ impl Context {
                         memory,
                         heap_probe,
                         budget: AllocationBudget {
-                            limit: local.min(RAY_ALLOCATION_BUDGET),
+                            limit: ray_budget(
+                                local,
+                                std::env::var("PW_RAY_BUDGET_BYTES").ok().as_deref(),
+                            ),
                             held: AtomicU64::new(0),
                         },
                         timestamp_bits,
@@ -649,6 +684,7 @@ struct Build {
     ty: vk::AccelerationStructureTypeKHR,
     count: u32,
     allow_update: bool,
+    allow_compaction: bool,
     update: bool,
 }
 impl Build {
@@ -665,6 +701,11 @@ impl Build {
                     | vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD
             } else {
                 vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
+                    | if self.allow_compaction {
+                        vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION
+                    } else {
+                        vk::BuildAccelerationStructureFlagsKHR::empty()
+                    }
             })
             .geometries(std::slice::from_ref(&self.geometry))
     }
@@ -1040,6 +1081,7 @@ pub struct Renderer {
     submitted: bool,
     scene_upload_pending: bool,
     resident_dirty: bool,
+    compact_blas: bool,
     resident_upload: Option<residency::ResidentUpload>,
     timing_pending: Option<([u32; 4], bool, bool, u64, u64)>,
     last_gpu: Option<([u32; 4], [f64; 3])>,
@@ -1166,6 +1208,7 @@ impl Renderer {
             submitted: false,
             scene_upload_pending: false,
             resident_dirty: false,
+            compact_blas: std::env::var("PW_RAY_COMPACT_BLAS").as_deref() == Ok("1"),
             resident_upload: None,
             timing_pending: None,
             last_gpu: None,
@@ -1259,6 +1302,7 @@ impl Renderer {
                 .geometry(vk::AccelerationStructureGeometryDataKHR { triangles })
                 .build(),
             allow_update: matches!(m.key, MeshKey::Posed(..)),
+            allow_compaction: false,
             update,
         })
     }
@@ -1351,6 +1395,7 @@ impl Renderer {
                     })
                     .build(),
                 allow_update: true,
+                allow_compaction: false,
                 update: !rebuild,
             };
             // Refresh the TLAS bounds after an in-place BLAS refit. Drivers

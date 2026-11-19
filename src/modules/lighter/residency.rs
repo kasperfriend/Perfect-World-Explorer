@@ -100,6 +100,8 @@ pub(super) struct Stats {
     pub max_batch_bytes: usize,
     pub blas_batches: u64,
     pub blas_builds: u64,
+    pub blas_compacted: u64,
+    pub blas_saved_bytes: u64,
 }
 
 impl Stats {

@@ -1002,7 +1002,8 @@ impl Lighter {
             armed: settings.mode != Mode::Off,
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             paced_startup: settings.mode == Mode::Hardware
-                && std::env::var("PW_RAY_PACED_STARTUP").as_deref() == Ok("1"),
+                && (std::env::var("PW_RAY_PACED_STARTUP").as_deref() == Ok("1")
+                    || std::env::var("PW_RAY_COMPACT_BLAS").as_deref() == Ok("1")),
             compact_terrain: bc_pages || textures::compact_terrain_enabled(),
             bc_pages,
             screen_reuse: screen_reuse_requested(),
