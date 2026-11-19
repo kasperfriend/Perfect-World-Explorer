@@ -10,6 +10,8 @@ mod profile;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub(crate) mod reconstruction;
 mod residency;
+#[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
+mod svgf_tests;
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub(crate) mod reconstruction {
     pub(crate) struct Startup;
@@ -902,6 +904,7 @@ pub struct Lighter {
     last_primary: [u64; 2],
     game_profile: Option<[f32; 4]>,
     game_profile_active: bool,
+    game_sampling: Option<u32>,
     adapter_supports_compute: bool,
     has_hardware_device: bool,
     native_backend: wgpu::Backend,
@@ -964,6 +967,7 @@ impl Default for Lighter {
             last_primary: [0, 0],
             game_profile: game_profile::requested(),
             game_profile_active: false,
+            game_sampling: game_profile::blue_noise_requested().then_some(0),
             adapter_supports_compute: false,
             has_hardware_device: false,
             native_backend: wgpu::Backend::Empty,
@@ -1968,6 +1972,12 @@ impl Lighter {
             self.gpu_sample = Some(sample);
         }
         let timed = self.timings.as_ref().filter(|t| t.due());
+        if let Some(sequence) = &mut self.game_sampling {
+            if frame.ray_effects[3] > 0. {
+                frame.sampling[0] = *sequence;
+                *sequence = sequence.wrapping_add(1);
+            }
+        }
         let image = match settings.mode {
             Mode::Software => {
                 if let Some(t) = &timed {

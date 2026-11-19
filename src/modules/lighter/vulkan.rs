@@ -1095,7 +1095,10 @@ impl Renderer {
             // Keep the full-ray fallback unchanged, even in a game profile.
             let spirv = shader(&source)?;
             let source = if game {
-                super::game_profile::specialize(source)?
+                super::game_profile::specialize(
+                    source,
+                    super::game_profile::blue_noise_requested(),
+                )?
             } else {
                 source
             };

@@ -1,6 +1,11 @@
 use std::{env, path::PathBuf, process::Command};
 
+#[path = "build_support/lighter_noise.rs"]
+mod lighter_noise;
+
 fn main() {
+    println!("cargo:rerun-if-changed=build_support/lighter_noise.rs");
+    lighter_noise::emit(&PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")));
     println!("cargo:rustc-check-cfg=cfg(pwe_directstorage)");
     println!("cargo:rerun-if-env-changed=DIRECTSTORAGE_SDK_DIR");
     println!("cargo:rerun-if-changed=src/directstorage_shim.cpp");

@@ -28,11 +28,15 @@ pub(super) fn requested() -> Option<[f32; 4]> {
     }
 }
 
+pub(super) fn blue_noise_requested() -> bool {
+    std::env::var("PW_RAY_BLUE_NOISE").as_deref() == Ok("1")
+}
+
 /// Inject only into the opt-in Vulkan sibling. Keep normal/Reference WGSL
 /// unchanged apart from the shared uniform's defaulted tail. The anchors
 /// are exact strings: do not silently turn the requested profile into full RT.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-pub(super) fn specialize(mut source: String) -> Result<String, String> {
+pub(super) fn specialize(mut source: String, noise: bool) -> Result<String, String> {
     for (anchor, text) in [
         (
             "fn direct(p:",
@@ -56,6 +60,16 @@ pub(super) fn specialize(mut source: String) -> Result<String, String> {
     source = source
         .replacen("        if sun_pending {\n            sun_pending = false;", "        let sun_leg_selected = sun_pending;\n        if sun_pending {\n            sun_pending = false;", 1)
         .replacen("terminal || sheet,medium.body,path.purpose", "terminal || sheet || game_opaque(s,medium.body,path.purpose),medium.body,path.purpose", 1);
+    if noise {
+        source.push_str(include_str!(concat!(
+            env!("OUT_DIR"),
+            "/lighter-blue-noise.wgsl"
+        )));
+        source.push_str(include_str!("game_noise.wgsl"));
+        source = source
+            .replacen("    let delta = u.x*0.000011103284;", "    if frame.ray_effects.w>0. && purpose==VIEW { u = game_noise(ray, 0u); }\n    let delta = u.x*0.000011103284;", 1)
+            .replace("let d = hemisphere(s.n,seed);\n                    if dot(d,s.face)>0. {", "let u = game_noise(ray, 7u);\n                    let d = around(s.n,sqrt(1.-u.x),sqrt(u.x),u.y*6.2831853);\n                    if dot(d,s.face)>0. {");
+    }
     Ok(source)
 }
 
@@ -76,13 +90,15 @@ mod tests {
     #[test]
     fn game_profile_shader_lowers_both_vulkan_entries() {
         use super::super::{trace_source, vulkan, HARDWARE};
-        let code = specialize(trace_source(HARDWARE, false, false)).unwrap();
-        assert!(vulkan::shader(&code).unwrap().len() > 64);
-        assert!(
-            vulkan::shader_entry(&code, naga_rt::ShaderStage::Compute, "render_hybrid")
-                .unwrap()
-                .len()
-                > 64
-        );
+        for noise in [false, true] {
+            let code = specialize(trace_source(HARDWARE, false, false), noise).unwrap();
+            assert!(vulkan::shader(&code).unwrap().len() > 64);
+            assert!(
+                vulkan::shader_entry(&code, naga_rt::ShaderStage::Compute, "render_hybrid")
+                    .unwrap()
+                    .len()
+                    > 64
+            );
+        }
     }
 }
