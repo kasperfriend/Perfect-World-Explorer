@@ -1,0 +1,93 @@
+name: Fetch and verify SDK components
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [arena/69c8ea78-perfect-world-explorer]
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-sdks:
+    name: Fetch and hash-check SDKs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- AMD FidelityFX SDK v2.4.0 (Vulkan upscaler) ---
+      - name: Download FidelityFX upscaler DLL
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/sdk-fetch/ffx-v2.4.0"
+          mkdir -p "$dir"
+          # Official FidelityFX SDK v2.4.0 signed Vulkan binary.
+          # Version and SHA-256 pinned in Modules/Lighter/temporal-reconstruction.md.
+          url="https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/releases/download/v2.4.0/amd_fidelityfx_upscaler_vk.dll"
+          curl -fsSL -o "$dir/amd_fidelityfx_upscaler_vk.dll" "$url"
+          size=$(stat -c%s "$dir/amd_fidelityfx_upscaler_vk.dll")
+          hash=$(sha256sum "$dir/amd_fidelityfx_upscaler_vk.dll" | awk '{print $1}')
+          echo "amd_fidelityfx_upscaler_vk.dll size=$hash sha256=$hash"
+          # Expected: 36135696 bytes, SHA-256 4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7
+          expected_size=36135696
+          expected_hash="4a7e895af6e0b615d40a84d59eb8c2b1054ad91cdd0c739567940270d51bdab7"
+          if [ "$size" -ne "$expected_size" ]; then
+            echo "::error::FidelityFX upscaler size mismatch: got $size bytes, expected $expected_size"
+            exit 1
+          fi
+          if [ "$hash" != "$expected_hash" ]; then
+            echo "::error::FidelityFX upscaler SHA-256 mismatch: got $hash, expected $expected_hash"
+            exit 1
+          fi
+
+      # --- NVIDIA DLSS v310.9.16 (DLSSD feature binary) ---
+      - name: Download DLSSD feature binary (Linux)
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/sdk-fetch/dlss-v310.9.16/Linux_x86_64/rel"
+          mkdir -p "$dir"
+          # Official NVIDIA DLSS v310.9.16 release.
+          url="https://github.com/NVIDIA/DLSS/releases/download/v310.9.16/libnvidia-ngx-dlssd.so.310.9.16"
+          curl -fsSL -o "$dir/libnvidia-ngx-dlssd.so.310.9.16" "$url"
+          size=$(stat -c%s "$dir/libnvidia-ngx-dlssd.so.310.9.16")
+          hash=$(sha256sum "$dir/libnvidia-ngx-dlssd.so.310.9.16" | awk '{print $1}')
+          echo "libnvidia-ngx-dlssd.so.310.9.16 size=$size sha256=$hash"
+          expected_size=0  # filled in after first successful fetch
+          expected_hash="a5d59de18841f15779039dda567a15dd723ba737915f489271fdb5f109fbfb96"
+          if [ "$hash" != "$expected_hash" ]; then
+            echo "::error::DLSSD SHA-256 mismatch: got $hash, expected $expected_hash"
+            exit 1
+          fi
+
+      - name: Download DLSSD feature binary (Windows)
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/sdk-fetch/dlss-v310.9.16/Windows_x86_64/rel"
+          mkdir -p "$dir"
+          url="https://github.com/NVIDIA/DLSS/releases/download/v310.9.16/nvngx_dlssd.dll"
+          curl -fsSL -o "$dir/nvngx_dlssd.dll" "$url"
+          size=$(stat -c%s "$dir/nvngx_dlssd.dll")
+          hash=$(sha256sum "$dir/nvngx_dlssd.dll" | awk '{print $1}')
+          echo "nvngx_dlssd.dll size=$size sha256=$hash"
+          expected_hash="b49435ae346f227feafe7bbe937d88277ea0ee7323975ec06488f377fdb46cee"
+          if [ "$hash" != "$expected_hash" ]; then
+            echo "::error::nvngx_dlssd.dll SHA-256 mismatch: got $hash, expected $expected_hash"
+            exit 1
+          fi
+
+      # --- Print all fetched files ---
+      - name: List fetched SDK components
+        run: |
+          echo "Fetched SDK components:"
+          find "$RUNNER_TEMP/sdk-fetch" -type f -exec sh -c '
+            echo "  {} $(stat -c%s {}) $(sha256sum {} | awk "{print \$1}")"
+          ' \;
+
+      - name: Upload SDK components as build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighter-sdk-components
+          path: ${{ runner.temp }}/sdk-fetch
+          if-no-files-found: error
+          retention-days: 14
