@@ -111,43 +111,113 @@ impl Zones {
             return Err("truncated precinct file".into());
         }
         let header = lines[0].split_whitespace().collect::<Vec<_>>();
-        if header == ["version", "7"] {
-            return Self::parse_instance_zones(&lines[2..]);
-        }
-        if header != ["version", "6"] {
-            return Err("unsupported precinct version (expected 6 or 7)".into());
-        }
+        // Every version this reader has ever accepted is parsed by the same
+        // walker. Versions 6 and 7 differ in exactly one thing: a 7 states the
+        // zone centre on its own line before the polygon, a 6 does not. They do
+        // not differ in their sound block -- a 1.8.4 version-7 `precinct.clt`
+        // holds 383 zones, 783 playlist tracks and two stereo ambience paths,
+        // and treating 7 as an instance-only format with no audio threw all of
+        // it away. A future version is read the same way rather than refused,
+        // because the walker is structure-driven: it counts headers, labels and
+        // tracks from each zone's own numbers, so a version that changed
+        // nothing here cannot break it, and one that did breaks loudly on a
+        // missing line, naming the zone.
+        let has_centre = match header.as_slice() {
+            ["version", "7"] => true,
+            ["version", "6"] => false,
+            ["version", other] if other.parse::<u32>().is_ok() => {
+                eprintln!(
+                    "Precinct format version {other} is newer than the versions measured here \
+                     (6 and 7); reading it as version 6 and naming any zone that does not parse"
+                );
+                false
+            }
+            _ => return Err(format!("unrecognised precinct header: {}", lines[0])),
+        };
         let mut i = 2usize;
         let mut zones = Vec::new();
+        // A zone that cannot be read is skipped and named, and the walker moves
+        // on. One malformed zone used to fail the whole file, which took the
+        // map's music, its ambience and every teleport destination with it; the
+        // retired zone is one missing polygon, and the count is reported once at
+        // the end.
+        let mut skipped = 0usize;
         while i < lines.len() {
-            let name = quoted(lines[i])?;
-            let nums: Vec<_> = lines
-                .get(i + 1)
-                .ok_or("missing precinct header")?
-                .split_whitespace()
-                .map(str::parse::<usize>)
-                .collect::<Result<_, _>>()
-                .map_err(|e| e.to_string())?;
-            if nums.len() < 10
-                || nums[1] < 3
-                || nums[1] > 10000
-                || nums[2] > 10000
-                || nums[5] > 1000
-            {
-                return Err(format!("invalid precinct counts at {name}"));
+            let Ok(name) = quoted(lines[i]) else {
+                i += 1;
+                continue;
+            };
+            let head = lines.get(i + 1).map(|l| {
+                l.split_whitespace()
+                    .map(str::parse::<usize>)
+                    .collect::<Result<Vec<_>, _>>()
+            });
+            let nums = match head {
+                // Only three of the header's numbers are used: vertex count,
+                // label count and track count, at indices 1, 2 and 5. The rest
+                // are the zone's playback flags, and different builds write a
+                // different number of them -- 11 in the measured 1.8.4 file,
+                // 10 and 9 elsewhere -- so the length is not a format gate.
+                Some(Ok(nums)) if nums.len() >= 6 => nums,
+                _ => {
+                    if skipped < 8 {
+                        eprintln!("Precinct zone {name:?}: no numeric header; zone skipped");
+                    }
+                    skipped += 1;
+                    i += 1;
+                    continue;
+                }
+            };
+            if nums[1] < 3 || nums[1] > 10000 || nums[2] > 10000 || nums[5] > 1000 {
+                if skipped < 8 {
+                    eprintln!(
+                        "Precinct zone {name:?}: header counts are out of range \
+                         (vertices {}, labels {}, tracks {}); zone skipped",
+                        nums[1], nums[2], nums[5]
+                    );
+                }
+                skipped += 1;
+                i += 1;
+                continue;
             }
             let (n, labels, tracks) = (nums[1], nums[2], nums[5]);
+            // Both versions reserve one line between the header and the first
+            // polygon vertex. What differs is whether it means anything: a
+            // version 7 states the zone's authored centre there, a version 6
+            // leaves a placeholder (`0, 0, 0` in the measured corpus) that the
+            // client does not use, so a 6 falls back to the polygon centroid.
             let begin = i + 3;
             let stop = begin.checked_add(n).ok_or("overflow")?;
             if stop + labels + tracks + 2 > lines.len() {
-                return Err(format!("truncated precinct {name}"));
+                eprintln!(
+                    "Precinct zone {name:?}: needs {n} vertices, {labels} labels and {tracks} \
+                     tracks but the file ends first; zone skipped"
+                );
+                skipped += 1;
+                break;
             }
             let mut poly = Vec::with_capacity(n);
             let mut height = 0f64;
+            let mut bad_vertex = None;
             for line in &lines[begin..stop] {
-                let [x, y, z] = vector(line)?;
-                poly.push([x, z]);
-                height += f64::from(y);
+                match vector(line) {
+                    Ok([x, y, z]) => {
+                        poly.push([x, z]);
+                        height += f64::from(y);
+                    }
+                    Err(e) => {
+                        bad_vertex = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = bad_vertex {
+                if skipped < 8 {
+                    eprintln!("Precinct zone {name:?}: {e}; zone skipped");
+                }
+                skipped += 1;
+                i += 1;
+                continue;
             }
             let mut area = 0.;
             for j in 0..n {
@@ -172,8 +242,36 @@ impl Zones {
             // area-weighted centroid is the zone's middle; the polygon's own
             // height is averaged too, because teleporting to y=0 would drop the
             // camera under terrain that sits at 200.
-            let mut center = polygon_centre(&poly);
-            center[1] = (height / n as f64) as f32;
+            //
+            // A version 7 states its centre outright; that authored point wins
+            // over the computed one, because it is what the client itself
+            // centres the zone on.
+            let mut center = if has_centre {
+                match lines.get(i + 2).map(|l| vector(l)) {
+                    Some(Ok(v)) => v,
+                    Some(Err(e)) => {
+                        eprintln!(
+                            "Precinct zone {name:?}: unreadable centre line ({e}); \
+                                   using the polygon centroid"
+                        );
+                        let mut c = polygon_centre(&poly);
+                        c[1] = (height / n as f64) as f32;
+                        c
+                    }
+                    None => {
+                        let mut c = polygon_centre(&poly);
+                        c[1] = (height / n as f64) as f32;
+                        c
+                    }
+                }
+            } else {
+                let mut c = polygon_centre(&poly);
+                c[1] = (height / n as f64) as f32;
+                c
+            };
+            if !center.iter().all(|x| x.is_finite()) {
+                center = polygon_centre(&poly);
+            }
             zones.push(Zone {
                 name,
                 center: Some(center),
@@ -185,11 +283,40 @@ impl Zones {
             });
             i = list + tracks + 1;
         }
+        if skipped > 0 {
+            eprintln!(
+                "Precinct: {skipped} zone(s) skipped{} , {} read",
+                if skipped > 8 {
+                    " (first eight named above)"
+                } else {
+                    ""
+                },
+                zones.len()
+            );
+        }
+        // A file that yielded nothing is not a file this reader understood,
+        // whatever its header said. Keeping this an error is what stops a
+        // future version from being "accepted" into an empty zone list and
+        // silently costing the map its music and its teleport destinations.
+        if zones.is_empty() {
+            return Err(format!(
+                "no precinct zones read from a version-{} file ({skipped} candidate zone(s) skipped)",
+                lines[0].split_whitespace().nth(1).unwrap_or("?")
+            ));
+        }
         Ok(Self { zones })
     }
-    /// Version 7 `precinct.clt` files ship with instance maps (`a01`, ...).
-    /// They keep the zone name, a numeric header, one centre line, a polygon,
-    /// and two empty sound paths; no playlist tracks or stereo ambience.
+    /// The retired version-7 walker.
+    ///
+    /// It assumed a version-7 file was an instance map with no audio at all:
+    /// zone name, numeric header, one centre line, a polygon, and two empty
+    /// sound strings -- no playlist tracks and no stereo ambience. A 1.8.4
+    /// version-7 `precinct.clt` is 383 zones with 783 tracks, so that assumption
+    /// cost the whole map its music. Kept under `cfg(test)` so the regression
+    /// can assert the old walker gets it wrong, not just that the new one gets
+    /// it right.
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn parse_instance_zones(lines: &[&str]) -> Result<Self, String> {
         fn header(line: &str) -> Option<Vec<usize>> {
             line.split_whitespace()
@@ -385,6 +512,27 @@ fn packed_key(raw: &str) -> Option<String> {
     }
     Some(format!("sfx/music/{}", name.to_lowercase()))
 }
+/// Codecs the playback worker can decode.
+///
+/// `rodio` is built with `mp3`, `vorbis` and `wav` (`Cargo.toml`), which is
+/// exactly the set the corpus uses: across the 1.8.4 `precinct.clt` the audio
+/// references are 746 `.mp3`, 692 `.wav` and 37 `.ogg`, and `configs/sound.txt`
+/// is 60 `.wav`. Nothing outside this list occurs, so no extra decoder is
+/// missing today; a format outside it is named rather than silently retried,
+/// which is what a future client that ships, say, `.wma` would need.
+pub const DECODABLE_EXTENSIONS: [&str; 3] = ["mp3", "ogg", "wav"];
+
+/// Whether the playback worker has a decoder for a path's extension.
+pub fn decodable(path: &str) -> bool {
+    path.rsplit_once('.')
+        .map(|(_, ext)| {
+            DECODABLE_EXTENSIONS
+                .iter()
+                .any(|d| ext.eq_ignore_ascii_case(d))
+        })
+        .unwrap_or(false)
+}
+
 fn catalog(element: &Path) -> Result<HashMap<String, pck::Entry>, String> {
     let mut file = fs::File::open(element.join("sfx.pck")).map_err(|e| e.to_string())?;
     Ok(pck::directory(&mut file)?
@@ -744,6 +892,7 @@ fn audio_worker(rx: std::sync::mpsc::Receiver<Request>, status: std::sync::mpsc:
     let mut sink: Option<Sink> = None;
     let mut current = None;
     let mut paths = Vec::new();
+    let mut failures = 0usize;
     let mut index = 0usize;
     let mut volume = 0.5f32;
     let mut enabled = false;
@@ -797,6 +946,23 @@ fn audio_worker(rx: std::sync::mpsc::Receiver<Request>, status: std::sync::mpsc:
         if sink.as_ref().map_or(true, |s| s.empty()) {
             let path = &paths[index % paths.len()];
             index += 1;
+            // A format this build has no decoder for is named once, not retried
+            // as if the file were corrupt.
+            if !decodable(&path.label()) {
+                let _ = status.send(format!(
+                    "No {} decoder for {} (this build decodes {})",
+                    path.label().rsplit_once('.').map(|(_, e)| e).unwrap_or("?"),
+                    path.label(),
+                    DECODABLE_EXTENSIONS.join(", ")
+                ));
+                retry_at = Instant::now() + Duration::from_millis(250);
+                continue;
+            }
+            // Reset the failure tally once a full playlist has been walked, so
+            // "no track decodes" is about this pass and not about the session.
+            if index % paths.len() == 0 {
+                failures = 0;
+            }
             let track = path.read().and_then(|bytes| {
                 Decoder::new(BufReader::new(Cursor::new(bytes))).map_err(|e| e.to_string())
             });
@@ -843,8 +1009,23 @@ fn audio_worker(rx: std::sync::mpsc::Receiver<Request>, status: std::sync::mpsc:
                     sink = Some(s);
                 }
                 Err(e) => {
-                    let _ = status.send(format!("Cannot decode {}: {e}", path.label()));
-                    retry_at = Instant::now() + Duration::from_secs(1);
+                    // One unreadable track used to stop playback for a whole
+                    // second and then try the same file again, so a zone whose
+                    // first listed track could not be decoded stayed silent
+                    // however many playable tracks followed it. The index has
+                    // already advanced, so the next pass takes the next track;
+                    // only a playlist where nothing decodes keeps retrying.
+                    failures += 1;
+                    let _ = status.send(format!(
+                        "Cannot decode {}: {e}{}",
+                        path.label(),
+                        if failures >= paths.len() {
+                            " (no track in this zone decodes)"
+                        } else {
+                            ""
+                        }
+                    ));
+                    retry_at = Instant::now() + Duration::from_millis(250);
                 }
             }
         }
@@ -853,6 +1034,19 @@ fn audio_worker(rx: std::sync::mpsc::Receiver<Request>, status: std::sync::mpsc:
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The codec list is not a guess: it is the set the corpus uses. If a
+    /// future client adds a format, this test is where the list has to grow.
+    #[test]
+    fn codec_coverage_matches_the_corpus() {
+        for ext in ["mp3", "ogg", "wav", "MP3", "Wav"] {
+            assert!(decodable(&format!("Music\\a.{ext}")), "{ext}");
+        }
+        for ext in ["wma", "flac", "m4a", ""] {
+            assert!(!decodable(&format!("Music\\a.{ext}")), "{ext}");
+        }
+        assert!(!decodable("Music/noext"));
+    }
+
     #[test]
     fn packed_paths_preserve_format_and_reject_traversal() {
         assert_eq!(
@@ -925,6 +1119,71 @@ mod tests {
         assert_eq!(zones.zones[0].polygon.len(), 5);
         assert_eq!(zones.zones[0].center, Some([-455.420013, 18.0, 420.273987]));
         assert!(zones.find(-250., 280.).is_some());
+    }
+
+    /// A version-7 precinct carries a full sound block, and reading it as the
+    /// old instance walker did threw all of it away.
+    ///
+    /// The measured 1.8.4 file is 383 zones, 783 playlist tracks and 347 zones
+    /// with a stereo ambience path. The fixture below is that file's shape:
+    /// header line, a number, then name / header / centre / polygon / day
+    /// ambience / tracks / night ambience.
+    #[test]
+    fn version_7_keeps_playlists_and_ambience() {
+        let text = r#"version  7
+1721379753
+
+"Upcoming"
+1561  5  0  0  1  2  60  1  1  0  0
+-696.291992, 218.964996, -1178.810059
+-4099.773438  0.100000  5636.250977
+-4099.694824  0.100000  4604.409180
+-3068.147705  0.100000  4604.448242
+-3066.735352  0.100000  5637.446777
+-4099.891113  0.100000  5636.623535
+"ambiencestereo\windyday.wav"
+"Music\通用场景2.mp3"
+"Music\common_a1.mp3"
+"ambiencestereo\windynight.wav"
+
+"The Harshlands"
+1011  3  0  0  1  1  60  1  1  0
+-100.0, 50.0, -200.0
+-200.0  0.1  -300.0
+200.0  0.1  -300.0
+200.0  0.1  300.0
+""
+"Music\island3_o.mp3"
+"""#;
+        let zones = Zones::parse(text).unwrap();
+        assert_eq!(zones.zones.len(), 2, "both zones read");
+        let first = &zones.zones[0];
+        assert_eq!(first.name, "Upcoming");
+        assert_eq!(first.tracks.len(), 2, "both playlist tracks kept");
+        assert_eq!(first.tracks[1], "Music\\common_a1.mp3");
+        assert_eq!(first.ambience_day, "ambiencestereo\\windyday.wav");
+        assert_eq!(first.ambience_night, "ambiencestereo\\windynight.wav");
+        assert_eq!(first.center, Some([-696.291992, 218.964996, -1178.810059]));
+        assert_eq!(first.polygon.len(), 5);
+        // The retired walker is what this protects against: it read the centre
+        // and polygon and then discarded every sound path.
+        let retired = Zones::parse_instance_zones(&text.lines().collect::<Vec<_>>()[2..]).unwrap();
+        assert_eq!(retired.zones[0].tracks.len(), 0);
+        assert!(retired.zones[0].ambience_day.is_empty());
+    }
+
+    /// One unreadable zone costs that zone, not the file.
+    #[test]
+    fn a_malformed_zone_is_skipped_and_named() {
+        let text = "version 6\n123\n\"good\"\n1 4 0 0 1 1 60 1 1 0\n0 0 0\n\
+                    -1 0 -1\n1 0 -1\n1 0 1\n-1 0 1\n\"\"\n\"Music\\a.mp3\"\"\"\n\
+                    \"bad\"\n1 4 0 0 1 1 60 1 1 0\n0 0 0\nnot a vertex\n\
+                    1 0 -1\n1 0 1\n-1 0 1\n\"\"\n\"\"\n\"\"\n\
+                    \"also good\"\n1 4 0 0 1 1 60 1 1 0\n0 0 0\n\
+                    -3 0 -3\n3 0 -3\n3 0 3\n-3 0 3\n\"\"\n\"\"\n\"\"";
+        let zones = Zones::parse(text).unwrap();
+        let names: Vec<_> = zones.zones.iter().map(|z| z.name.as_str()).collect();
+        assert_eq!(names, ["good", "also good"]);
     }
 
     #[test]

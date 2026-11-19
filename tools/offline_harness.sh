@@ -658,6 +658,12 @@ pub mod model_draw_fixture;
 // packs, so the harness needs it or the whole set fails to type-check.
 #[path = "$REPO/src/angelica_pck.rs"]
 pub mod angelica_pck;
+// The precinct reader. Its tests are the only proof that a version-7
+// \`precinct.clt\`'s playlists and ambience are read at all, and they were not
+// running: this module set did not contain the module, so \`test\` reported
+// "174 passed" whether or not the parser worked.
+#[path = "$REPO/src/music.rs"]
+pub mod music;
 EOF
 }
 
@@ -840,6 +846,57 @@ EOF
         shift || true
         [ $# -gt 0 ] || set -- "$REPO/google_drive"
         (cd "$REPO" && exec "$OUT/survey/water-record-survey" "$@") ;;
+    music) toolchain; sysroot; deps; real_deps
+        # Read every `precinct.clt` under the given roots with the real reader.
+        # The map's music, its stereo ambience and its teleport list all come
+        # from this one UTF-16 file, and one unreadable zone used to cost the
+        # whole file. Prints per file: zones, playlist tracks, zones with an
+        # ambience path, and the version word.
+        cat > "$OUT/music_probe.rs" <<EOF
+#[path = "$REPO/src/pck.rs"]
+mod pck;
+#[path = "$REPO/src/music.rs"]
+mod music;
+fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() { walk(&p, out); }
+        else if p.file_name().and_then(|n| n.to_str()).map(|n| n.eq_ignore_ascii_case("precinct.clt")).unwrap_or(false) { out.push(p); }
+    }
+}
+fn main() {
+    let mut files = Vec::new();
+    for root in std::env::args().skip(1) { walk(std::path::Path::new(&root), &mut files); }
+    if files.is_empty() { eprintln!("no precinct.clt under the given roots"); std::process::exit(2); }
+    println!("{:<58} {:>7} {:>7} {:>7} {:>7}", "file", "version", "zones", "tracks", "amb");
+    let mut bad = 0;
+    for f in &files {
+        let version = std::fs::read(f).ok()
+            .map(|b| b.chunks_exact(2).map(|x| u16::from_le_bytes([x[0], x[1]])).collect::<Vec<_>>())
+            .and_then(|w| String::from_utf16(&w).ok())
+            .and_then(|t| t.lines().find(|l| l.trim().starts_with("version"))
+                .and_then(|l| l.split_whitespace().nth(1).map(str::to_owned)))
+            .unwrap_or_else(|| "?".into());
+        match music::Zones::open(f) {
+            Ok(z) => {
+                let tracks: usize = z.zones.iter().map(|x| x.tracks.len()).sum();
+                let amb = z.zones.iter().filter(|x| !x.ambience_day.is_empty() || !x.ambience_night.is_empty()).count();
+                println!("{:<58} {:>7} {:>7} {:>7} {:>7}", f.display().to_string(), version, z.zones.len(), tracks, amb);
+            }
+            Err(e) => { println!("{:<58} {:>7} FAILED: {e}", f.display().to_string(), version); bad += 1; }
+        }
+    }
+    std::process::exit(if bad == 0 { 0 } else { 1 });
+}
+EOF
+        "$RUSTC" --edition 2021 --crate-name musicprobe --sysroot "$SYSROOT" \
+            -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            -o "$OUT/music-probe" "$OUT/music_probe.rs"
+        shift || true
+        [ $# -gt 0 ] || set -- "$REPO/google_drive"
+        (cd "$REPO" && exec "$OUT/music-probe" "$@") ;;
     gfx)   toolchain; sysroot; deps; real_deps
         # The GFX containers on their own: `gfx_file`, `gfx_decal`, `gfx_light`
         # and the `pck` they read from, without the renderer or the `main.rs`

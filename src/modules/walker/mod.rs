@@ -286,6 +286,11 @@ pub struct Walker {
     /// a millisecond delta and the host's frame carries none.
     last_render: Option<std::time::Instant>,
     last_error: Option<String>,
+    /// `configs/sound.txt` from the client's `configs.pck`, keyed by event id.
+    /// Empty when the archive lacks the member; the built-in names then stand
+    /// in, and `sound_table_error` says why.
+    sound_table: std::collections::HashMap<u16, String>,
+    sound_table_error: Option<String>,
     audio: audio::CharacterAudio,
     collision: collision::Collision,
     /// Free-standing roots from the effect catalogue, placed in the world and
@@ -325,6 +330,8 @@ impl Default for Walker {
             gpu_failed: false,
             last_render: None,
             last_error: None,
+            sound_table: std::collections::HashMap::new(),
+            sound_table_error: None,
             audio: audio::CharacterAudio::default(),
             gallery: gallery::Gallery::default(),
             collision: collision::Collision::default(),
@@ -368,6 +375,18 @@ impl Walker {
         ornaments: Vec<crate::scene::Ornament>,
     ) -> Self {
         let audio = audio::CharacterAudio::new(&element);
+        let (sound_table, sound_table_error) = audio::load_sound_table(&element);
+        if let Some(error) = &sound_table_error {
+            eprintln!(
+                "Movement sound: using the built-in names, because {}",
+                error
+            );
+        } else {
+            eprintln!(
+                "Movement sound: {} event ids from configs/sound.txt",
+                sound_table.len()
+            );
+        }
         let collision = collision::Collision::new(element.clone(), scene, &ornaments);
         Self {
             gallery: gallery::Gallery::new(element.clone()),
@@ -375,6 +394,8 @@ impl Walker {
             map: Some(map),
             water,
             audio,
+            sound_table,
+            sound_table_error,
             collision,
             ..Self::default()
         }
@@ -433,8 +454,15 @@ impl Walker {
             return error.clone();
         }
         if let Some(character) = &self.character {
+            // The sound source matters: a footstep named by the client's own
+            // table and a footstep guessed from a filename look the same on
+            // screen and are not the same claim.
+            let sound = match &self.sound_table_error {
+                None => format!("{} ids from configs/sound.txt", self.sound_table.len()),
+                Some(e) => format!("built-in names, because {e}"),
+            };
             format!(
-                "Active — {} {} — {} persistent GFX root(s), {} animated",
+                "Active — {} {} — {} persistent GFX root(s), {} animated — movement sound: {sound}",
                 character.assembly.design.class.name(),
                 character.assembly.design.gender.name(),
                 character.gfx.effect_count(),
@@ -456,7 +484,7 @@ impl Walker {
                 .water_height
                 .or_else(|| physics::water_height(&self.water, body.position.x, body.position.z))?;
             let camera_y = self.camera_position.unwrap_or(character.eye).y;
-            return Some(audio::MovementSound::water(camera_y > level));
+            return audio::MovementSound::water_in_table(camera_y > level, &self.sound_table);
         }
         if !body.grounded || !body.moving {
             return None;
@@ -466,11 +494,12 @@ impl Walker {
         } else {
             None
         };
-        audio::MovementSound::land(
+        audio::MovementSound::land_in_table(
             character.assembly.design.class,
             character.assembly.design.gender,
             true,
             mount_sound_type,
+            &self.sound_table,
         )
     }
 

@@ -13,6 +13,7 @@ use crate::{
 use std::time::{Duration, Instant};
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -22,18 +23,140 @@ pub const FLIGHT_CHANNEL: u8 = 2;
 pub const WEAPON_CHANNEL: u8 = 3;
 pub const MOVEMENT_CHANNEL: u8 = 4;
 
-/// CECHostPlayer::UpdateMoveSound selection. The retail Configs\sound.txt
-/// table is absent from the supplied PW142 configs archive, so these paths are
-/// resolved directly from authentic sfx/2d.txt examples, the shared gender /
-/// beast filenames, and PET_ESSENCE::pet_snd_type. IDs retain the native
-/// selection semantics; this is not a claim that the missing table was read.
+/// CECHostPlayer::UpdateMoveSound selection.
+///
+/// The table is `configs/sound.txt`, event id then quoted path, and it is read
+/// from the client's `configs.pck` rather than reproduced by name. It used to be
+/// reconstructed here from example filenames because the copy of the archive in
+/// hand had no such member; the 1.8.4 `configs.pck` has one, 67 rows, and it is
+/// the authority. The built-in names below remain as the fallback for a client
+/// whose archive lacks the table, and the two are known to agree on the land,
+/// swim, horse, bear, puma, dinosaur and qilin ids.
+///
+/// The table also states ids the name rule never could: 106 and 109 and 136 and
+/// 139 are empty strings (that class and gender have no footstep), 170-173 are
+/// the fox and tiger forms, and 212-217 are a frog, a penguin and a rhinoceros
+/// sharing a walk and a run file each.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MovementSound {
     pub id: u16,
     pub path: String,
 }
 
+/// One row of `configs/sound.txt`: an event id and the path it plays.
+///
+/// An empty path is a real row, not a missing one: it says that combination is
+/// silent in the client, so it is kept and resolves to no sound rather than
+/// falling through to a guessed name.
+pub fn parse_sound_table(text: &str) -> HashMap<u16, String> {
+    let mut table = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let Some((id, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(id) = id.trim().parse::<u16>() else {
+            continue;
+        };
+        let rest = rest.trim();
+        let path = rest
+            .strip_prefix('"')
+            .and_then(|r| r.split_once('"').map(|(p, _)| p))
+            .unwrap_or(rest);
+        table.insert(id, path.replace('\\', "/"));
+    }
+    table
+}
+
+/// The `configs/sound.txt` member of `configs.pck`, when the client ships it.
+///
+/// A failure here is not fatal -- the built-in names still play -- so the reason
+/// is returned for the status line rather than raised as an error.
+pub fn load_sound_table(element: &Path) -> (HashMap<u16, String>, Option<String>) {
+    let path = element.join("configs.pck");
+    let mut file = match fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => return (HashMap::new(), Some(format!("{}: {e}", path.display()))),
+    };
+    let entries = match pck::directory(&mut file) {
+        Ok(e) => e,
+        Err(e) => return (HashMap::new(), Some(format!("{}: {e}", path.display()))),
+    };
+    let Some(entry) = entries
+        .iter()
+        .find(|e| e.name.eq_ignore_ascii_case("configs/sound.txt"))
+    else {
+        return (
+            HashMap::new(),
+            Some(format!("{} has no configs/sound.txt", path.display())),
+        );
+    };
+    let bytes = match pck::read_entry(&mut file, entry) {
+        Ok(b) => b,
+        Err(e) => return (HashMap::new(), Some(format!("configs/sound.txt: {e}"))),
+    };
+    let (text, _, bad) = encoding_rs::GBK.decode(&bytes);
+    if bad {
+        return (
+            HashMap::new(),
+            Some("configs/sound.txt is not valid GBK".into()),
+        );
+    }
+    let table = parse_sound_table(&text);
+    if table.is_empty() {
+        return (HashMap::new(), Some("configs/sound.txt has no rows".into()));
+    }
+    (table, None)
+}
+
 impl MovementSound {
+    /// The path this id plays, from the client's own table when it ships one.
+    ///
+    /// `table` is `configs/sound.txt`; a hit wins, including a hit on an empty
+    /// path, which the client writes for a class that has no footstep. A miss
+    /// falls back to the built-in name rule, which is the only option for a
+    /// client whose archive omits the table.
+    pub fn from_table(id: u16, table: &HashMap<u16, String>) -> Option<Self> {
+        match table.get(&id) {
+            Some(path) if path.is_empty() => None,
+            Some(path) => Some(Self {
+                id,
+                path: path.clone(),
+            }),
+            None => None,
+        }
+    }
+
+    /// The built-in rule, then the client's table when the table has the row.
+    ///
+    /// The rule exists to *name an id*, so the table can be consulted at all;
+    /// the path it produces is discarded whenever the table answers, including
+    /// when the table's answer is "silent".
+    pub fn land_in_table(
+        class: Class,
+        gender: Gender,
+        running: bool,
+        mount_sound_type: Option<u32>,
+        table: &HashMap<u16, String>,
+    ) -> Option<Self> {
+        let built_in = Self::land(class, gender, running, mount_sound_type)?;
+        if table.is_empty() {
+            return Some(built_in);
+        }
+        Self::from_table(built_in.id, table)
+    }
+
+    pub fn water_in_table(camera_above: bool, table: &HashMap<u16, String>) -> Option<Self> {
+        let built_in = Self::water(camera_above);
+        if table.is_empty() {
+            return Some(built_in);
+        }
+        Self::from_table(built_in.id, table)
+    }
+
     pub fn land(
         class: Class,
         gender: Gender,
@@ -605,6 +728,78 @@ fn worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table the client actually ships, decoded the way the reader decodes
+    /// it: id, tab, quoted path, CRLF.
+    const SHIPPED_ROWS: &str = "100\t\"SFX\\Character\\FootStep\\LandWalkMaleA.wav\"\r\n\
+101\t\"SFX\\Character\\FootStep\\LandWalkFemaleA.wav\"\r\n\
+106\t\"\"\r\n\
+108\t\"SFX\\Character\\FootStep\\LandWalkBeastA.wav\"\r\n\
+130\t\"SFX\\Character\\FootStep\\LandRunMaleA.wav\"\r\n\
+135\t\"SFX\\Character\\FootStep\\LandRunFemaleA.wav\"\r\n\
+138\t\"SFX\\Character\\FootStep\\LandRunBeastA.wav\"\r\n\
+160\t\"SFX\\Character\\FootStep\\Swim.wav\"\r\n\
+161\t\"SFX\\Character\\FootStep\\Float.wav\"\r\n\
+201\t\"SFX\\Character\\FootStep\\LandRunPetHorse.wav\"\r\n\
+212\t\"SFX\\Character\\FootStep\\LandRunFrog.wav\"\r\n";
+
+    #[test]
+    fn sound_table_is_read_the_way_the_client_writes_it() {
+        let table = parse_sound_table(SHIPPED_ROWS);
+        assert_eq!(table.len(), 11);
+        assert_eq!(
+            table[&135],
+            "SFX/Character/FootStep/LandRunFemaleA.wav".to_string()
+        );
+        // An empty quoted path is a row, not a missing one.
+        assert_eq!(table[&106], "");
+    }
+
+    /// The client's table wins, including when it says the id is silent.
+    #[test]
+    fn the_clients_table_decides_the_path() {
+        let table = parse_sound_table(SHIPPED_ROWS);
+        // 135 is what the name rule picks for a female Psychic running, and the
+        // table agrees. 101 is what it would pick for a walking female, and the
+        // table also agrees -- but the answer comes from the table either way.
+        let run = MovementSound::land_in_table(Class::Psychic, Gender::Female, true, None, &table)
+            .unwrap();
+        assert_eq!(run.id, 135);
+        assert_eq!(run.path, "SFX/Character/FootStep/LandRunFemaleA.wav");
+        let walk =
+            MovementSound::land_in_table(Class::Psychic, Gender::Female, false, None, &table);
+        assert_eq!(
+            walk.unwrap().path,
+            "sfx/character/footstep/landwalkfemalea.wav"
+        );
+        // 106 is the male Blademaster walking, and the table says silent.
+        assert!(MovementSound::land_in_table(
+            Class::Blademaster,
+            Gender::Male,
+            false,
+            None,
+            &table
+        )
+        .is_none());
+        // Without a table the built-in name still applies, so a client whose
+        // archive lacks the member is not left mute.
+        let fallback = MovementSound::land_in_table(
+            Class::Blademaster,
+            Gender::Male,
+            false,
+            None,
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(fallback.id, 106);
+        assert_eq!(fallback.path, "sfx/character/footstep/landwalkmalea.wav");
+        // 212 is a frog run, an id the name rule could never produce.
+        assert!(MovementSound::from_table(212, &table).is_none() == false);
+        assert_eq!(
+            MovementSound::from_table(212, &table).unwrap().path,
+            "SFX/Character/FootStep/LandRunFrog.wav"
+        );
+    }
 
     #[test]
     fn movement_selection_uses_native_ids_and_authentic_files() {
