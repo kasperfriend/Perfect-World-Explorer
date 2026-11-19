@@ -921,82 +921,15 @@ EOF
         [ $# -gt 0 ] || set -- "$REPO/google_drive"
         (cd "$REPO" && exec "$OUT/survey/water-record-survey" "$@") ;;
     precinct) toolchain; sysroot; deps; real_deps
-        # What a `precinct.clt` actually contains, per file. This exists because
-        # the register and the code comments both state "the 1.8.4 precinct is
-        # 383 zones, 783 tracks and 347 stereo ambience paths" -- and the file
-        # staged beside the world map is 29 zones with no ambience at all. Both
-        # statements were measured somewhere, of *different files*, and nothing
-        # in the tree could tell them apart. This mode prints the facts a claim
-        # has to be checked against: zones, playlist tracks, zones with a day or
-        # night path, distinct paths, and whether the zone centres fit the map
-        # that ships beside the file.
-        mkdir -p "$OUT/prec"
-        cat > "$OUT/prec/run.rs" <<EOF
-#[path = "$REPO/src/pck.rs"]
-pub mod pck;
-#[path = "$REPO/src/music.rs"]
-pub mod music;
-#[path = "$REPO/src/terrain_block.rs"]
-pub mod terrain_block;
-fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        let p = e.path();
-        if p.is_dir() { walk(&p, out); }
-        else if p.file_name().and_then(|n| n.to_str())
-            .map(|n| n.eq_ignore_ascii_case("precinct.clt")).unwrap_or(false) { out.push(p); }
-    }
-}
-fn main() {
-    let mut files = Vec::new();
-    for root in std::env::args().skip(1) { walk(std::path::Path::new(&root), &mut files); }
-    if files.is_empty() { eprintln!("no precinct.clt under the given roots"); std::process::exit(2); }
-    println!("{:<52} {:>4} {:>6} {:>7} {:>7} {:>7} {:>6} {:>8}",
-             "file", "ver", "zones", "tracks", "day", "night", "paths", "bad");
-    let mut bad = 0;
-    for f in &files {
-        match music::Zones::open(f) {
-            Ok(z) => {
-                let tracks: usize = z.zones.iter().map(|x| x.tracks.len()).sum();
-                let day = z.zones.iter().filter(|x| !x.ambience_day.is_empty()).count();
-                let night = z.zones.iter().filter(|x| !x.ambience_night.is_empty()).count();
-                let mut paths: Vec<&str> = z.zones.iter()
-                    .flat_map(|x| [x.ambience_day.as_str(), x.ambience_night.as_str()])
-                    .filter(|p| !p.is_empty()).collect();
-                paths.sort_unstable(); paths.dedup();
-                println!("{:<52} {:>4} {:>6} {:>7} {:>7} {:>7} {:>6} {:>8}",
-                         f.display().to_string(), "7", z.zones.len(), tracks, day, night,
-                         paths.len(), z.malformed);
-                // The codec census a decoder list has to cover. The decodable
-                // list claims mp3, ogg and wav cover the corpus; that is a
-                // statement about these counts, so print them.
-                let mut ext: std::collections::BTreeMap<&str, usize> =
-                    std::collections::BTreeMap::new();
-                for p in z.zones.iter().flat_map(|x| x.tracks.iter())
-                    .chain(z.zones.iter().flat_map(|x| [&x.ambience_day, &x.ambience_night]))
-                    .filter(|p| !p.is_empty())
-                {
-                    let e = p.rsplit_once('.').map(|(_, e)| e).unwrap_or("?");
-                    *ext.entry(e).or_default() += 1;
-                }
-                let list: Vec<String> = ext.iter()
-                    .map(|(e, n)| format!("{n} {e}")).collect();
-                println!("{:>60} {}", "", list.join(", "));
-                let unknown: Vec<&&str> = ext.keys()
-                    .filter(|e| !crate::music::DECODABLE_EXTENSIONS
-                        .iter().any(|d| d.eq_ignore_ascii_case(e))).collect();
-                if !unknown.is_empty() { bad += 1; }
-            }
-            Err(e) => { println!("{:<52} FAILED: {e}", f.display().to_string()); bad += 1; }
-        }
-    }
-    std::process::exit(if bad == 0 { 0 } else { 1 });
-}
-EOF
-        "$RUSTC" --edition 2021 --crate-name prec --sysroot "$SYSROOT" \
+        # The program lives in `src/bin/precinct-check.rs`, not in a heredoc
+        # here: CI runs it with `cargo run --locked --bin precinct-check`, and a
+        # copy of the same program in this script would be a second thing to
+        # keep in step. That is the mistake this branch keeps finding -- a
+        # hand-kept list standing in for the thing itself.
+        "$RUSTC" --edition 2021 --crate-name precinctcheck --sysroot "$SYSROOT" \
             -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
             --extern encoding_rs="$OUT/libencoding_rs.rlib" \
-            -o "$OUT/precinct" "$OUT/prec/run.rs"
+            -o "$OUT/precinct" "$REPO/src/bin/precinct-check.rs"
         shift || true
         [ $# -gt 0 ] || set -- "$REPO/google_drive"
         (cd "$REPO" && exec "$OUT/precinct" "$@") ;;

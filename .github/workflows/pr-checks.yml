@@ -122,6 +122,28 @@ jobs:
               exit 1
             fi
           done
+      # The register quotes measurements of files that are not in this
+      # checkout -- "the 1.8.4 precinct is 383 zones, 783 tracks" describes the
+      # world map's 885 KB file, while the one staged beside the maps is 29
+      # zones with no ambience. `matrix` and `instance` already read precincts;
+      # this mode prints what a file actually holds, so a number in prose has
+      # something to be checked against. It runs on whatever the workspace has
+      # and is skipped, loudly, when nothing is staged.
+      - name: Measure staged precinct files
+        run: |
+          # An array, not a newline-joined string: `$roots` unquoted from
+          # `ls -d` splits on the newline and hands the binary one argument
+          # that is two paths, which it then reports as a usage error.
+          roots=()
+          [ -d google_drive ] && roots+=(google_drive)
+          for d in /tmp/clients/*/element/maps; do
+            [ -d "$d" ] && roots+=("$d")
+          done
+          if [ ${#roots[@]} -eq 0 ]; then
+            echo "::notice::no staged precinct.clt; the precinct census did not run"
+            exit 0
+          fi
+          cargo run --locked --bin precinct-check -- "${roots[@]}"
       - name: Test requirement status audits
         run: |
           python3 tools/test_phase1_ready.py
