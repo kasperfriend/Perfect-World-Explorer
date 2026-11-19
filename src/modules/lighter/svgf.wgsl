@@ -53,7 +53,7 @@ fn atrous(@builtin(global_invocation_id) id: vec3<u32>) {
     let center = source[i];
     out[i] = center;
     if g.valid!=1u { return; }
-    let kernel = array<f32,5>(1.,4.,6.,4.,1.);
+    var kernel = array<f32,5>(1.,4.,6.,4.,1.);
     let m = center.moments;
     let sigma = sqrt(max(vec2<f32>(0.0004),vec2<f32>(m.y-m.x*m.x,m.w-m.z*m.z)));
     var weights = vec2<f32>(0.);
