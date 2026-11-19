@@ -60,3 +60,20 @@ is `refined_far_terrain_joins_changed_native_windows_without_cracks`.
 live travel run, and the rear probes are not GPU reflection/shadow pixels.
 Inspect matched camera/grazing captures through actual residency changes
 on the [Windows RTX system](01-sdk.md) before closing the physical gate.
+
+## Ordered follow-up: diagonal grazing on pinned inputs (S)
+
+`--diagonal-grazing` adds both diagonal azimuths, forward and reverse,
+at 1°, 2° and 3° to the CPU profile audit. For each integer diagonal slice
+it intersects the actual triangle edges, including fractional crossings;
+nearest vertex sampling could miss the silhouette peak. A nonplanar quad
+fixture detects a diagonal change that the cardinal profiles miss.
+
+On the same pinned `a01`, `a02` and `a07` with the production indices,
+each map supplied **12,276 diagonal profiles**, with **0 beyond 0.5 units**
+and **0 measured diagonal silhouette difference** at the sampled slices.
+The grid results and input checksums match the prior audit. See
+`11-terrain/pw142-diagonal.json` in the ordered bundle. These are CPU
+orthographic height silhouettes, not the live perspective or GPU
+secondary-view screenshots. Neither the prior stream/rear probes nor
+this audit closes the physical RT-02b gate.

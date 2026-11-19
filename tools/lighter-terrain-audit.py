@@ -125,6 +125,21 @@ class Mesh:
             return (1 - u - v) * self.field[y0 * self.w + x0] + u * b + v * c
         return (1 - v) * b + (u + v - 1) * self.field[y1 * self.w + x1] + (1 - u) * c
 
+    def edges(self):
+        """World-mesh triangle edges; emit shared grid boundaries once."""
+        point = lambda x, y: (x, y, self.field[y * self.w + x])
+        for y0, y1 in zip(self.y, self.y[1:]):
+            for x0, x1 in zip(self.x, self.x[1:]):
+                a, b = point(x0, y0), point(x1, y0)
+                c, d = point(x0, y1), point(x1, y1)
+                yield a, b
+                yield a, c
+                yield b, c
+                if x1 == self.w - 1:
+                    yield b, d
+                if y1 == self.h - 1:
+                    yield c, d
+
     def profile_knots(self, placement, *, row):
         """Heights of the mesh along a line, including its diagonal crossings."""
         along = self.y if row else self.x
@@ -187,6 +202,13 @@ class RefinedMesh:
             if min(wa, wb, wc) >= 0:
                 return (wa * a[2] + wb * b[2] + wc * c[2]) / area
         raise ValueError("height probe outside refined mesh")
+
+    def edges(self):
+        for tile in self.tiles:
+            for a, b, c, _ in tile:
+                yield a, b
+                yield b, c
+                yield c, a
 
     def profile_knots(self, placement, *, row):
         i, j = (0, 1) if row else (1, 0)
@@ -274,7 +296,34 @@ def viewer_stride(native):
     return selected[1]
 
 
-def compare(native, far, spacing, limit):
+def diagonal_envelopes(mesh, across_sign, angles):
+    """Exactly intersect triangle edges with integer diagonal slice lines.
+
+    Plane x +/- y = k; along-slice projection is (x -/+ y) / sqrt(2).
+    Every maximum of the piecewise-linear silhouette is an edge knot;
+    do not miss one that falls between the height-grid samples.
+    """
+    offset = 0 if across_sign == 1 else mesh.h - 1
+    projected = [[-math.inf] * (mesh.w + mesh.h - 1) for _ in angles]
+
+    def add(k, along, height):
+        for profile, (cos, sin) in zip(projected, angles, strict=True):
+            profile[k] = max(profile[k], cos * height + sin * along)
+
+    for (x0, y0, z0), (x1, y1, z1) in mesh.edges():
+        k0, k1 = (x0 + across_sign * y0 + offset, x1 + across_sign * y1 + offset)
+        p0, p1 = (x0 - across_sign * y0, x1 - across_sign * y1)
+        add(k0, p0, z0)
+        add(k1, p1, z1)
+        for k in range(min(k0, k1) + 1, max(k0, k1)):
+            q = (k - k0) / (k1 - k0)
+            add(k, p0 + (p1 - p0) * q, z0 + (z1 - z0) * q)
+    if any(not math.isfinite(h) for profile in projected for h in profile):
+        raise ValueError("missing projected terrain on a diagonal profile")
+    return projected
+
+
+def compare(native, far, spacing, limit, diagonal=False):
     w, h = native.w, native.h
     report = {"height_grid": height_error(native, far, limit), "grazing": {}}
     for axis_name, across, row in [("rows", w, True), ("columns", h, False)]:
@@ -296,10 +345,20 @@ def compare(native, far, spacing, limit):
                     profiles[degrees, sign].append(abs(ref - test))
         report["grazing"].update({f"{axis_name}_{degrees}deg_{'forward' if sign == 1 else 'reverse'}": stats(errors, limit)
                                   for (degrees, sign), errors in profiles.items()})
+    if diagonal:
+        keys = [(degree, sign) for degree in (1, 2, 3) for sign in (1, -1)]
+        angles = [(math.cos(math.radians(deg)), sign * math.sin(math.radians(deg)) * spacing / math.sqrt(2))
+                  for deg, sign in keys]
+        for azimuth, across in (("NE_SW", 1), ("NW_SE", -1)):
+            n = diagonal_envelopes(native, across, angles)
+            f = diagonal_envelopes(far, across, angles)
+            for (deg, sign), ref, test in zip(keys, n, f, strict=True):
+                key = f"{azimuth}_{deg}deg_{'forward' if sign == 1 else 'reverse'}"
+                report["grazing"][key] = stats((abs(a - b) for a, b in zip(ref, test, strict=True)), limit)
     return report
 
 
-def audit(path, strides, cutoff, limit, planner=None):
+def audit(path, strides, cutoff, limit, planner=None, diagonal=False):
     field, w, h, grid, spacing, sources = load(path)
     report = {"map": path.stem, "heightfield": [w, h], "spacing": spacing,
               "decoded_blocks": (w // grid) * (h // grid), "source_sha256": sources}
@@ -320,7 +379,7 @@ def audit(path, strides, cutoff, limit, planner=None):
         report["layout"] = {"source": "requested strides" if strides else "uniform-only estimate"}
         layouts = [(stride, Mesh(field, w, h, stride)) for stride in (strides or [viewer_stride(native)])]
     for stride, mesh in layouts:
-        result = compare(native, mesh, spacing, limit)
+        result = compare(native, mesh, spacing, limit, diagonal)
         report["strides"][stride] = result
         if any(stat["over_limit"] for stat in (result["height_grid"], *result["grazing"].values())):
             report["status"] = "geometry_error"
@@ -332,6 +391,7 @@ def main():
     parser.add_argument("trn2", nargs="+", type=Path, help="each TRN2 must be beside its T2BK files")
     parser.add_argument("--stride", action="append", type=int, choices=[1, 2, 4, 8, 16], help="override stride; repeat for multiple comparisons (default: uniform-only estimate)")
     parser.add_argument("--viewer-planner", type=Path, help="compiled lighter-terrain-plan binary (audit actual emitted indices)")
+    parser.add_argument("--diagonal-grazing", action="store_true", help="add exact edge-knot profiles along both diagonal azimuths")
     parser.add_argument("--limit", default=0.5, type=float, help="maximum height/silhouette error in world units")
     parser.add_argument("--cutoff-window", nargs=4, type=int, metavar=("X0", "Y0", "X1", "Y1"), help="model an intentional near-only block window; still validate source heights")
     parser.add_argument("--json", type=Path, help="write the full per-view statistics as JSON")
@@ -343,7 +403,7 @@ def main():
     results = []
     for path in args.trn2:
         try:
-            report = audit(path, args.stride, args.cutoff_window, args.limit, args.viewer_planner)
+            report = audit(path, args.stride, args.cutoff_window, args.limit, args.viewer_planner, args.diagonal_grazing)
         except (ValueError, OSError, struct.error, zlib.error, subprocess.TimeoutExpired) as error:
             report = {"map": path.stem, "status": "load_failed", "error": str(error)}
         results.append(report)

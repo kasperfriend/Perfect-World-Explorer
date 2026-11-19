@@ -59,6 +59,16 @@ class TerrainAuditTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unpaired edge"):
             audit.RefinedMesh(native, 4, 3, native_split[:1])
 
+    def test_diagonal_silhouette_checks_an_interior_triangle_edge_knot(self):
+        native = audit.Mesh([0., 8., 4., 0.], 2, 2, 1)
+        # The x=y profile meets the shared b-c edge at its midpoint (height 6).
+        heights, = audit.diagonal_envelopes(native, -1, [(1., 0.)])
+        self.assertEqual(heights, [4., 6., 8.])
+        other = audit.RefinedMesh(native, 4, 6, [(0, 0, 1, 0, 1, 1), (0, 0, 1, 1, 0, 1)])
+        height_errors = audit.compare(native, other, 2., .5, diagonal=True)
+        self.assertGreater(height_errors["grazing"]["NW_SE_1deg_forward"]["max_abs"], 5.9)
+        self.assertEqual(height_errors["grazing"]["rows_1deg_forward"]["max_abs"], 0.)
+
     def test_cli_distinguishes_geometry_failure_cutoff_and_missing_data(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
