@@ -1,5 +1,9 @@
 # Lighter
 
+[PR #51 acceptance checklist and dated evidence](REMAINING.md). Hardware
+SDK evaluation and retail performance require the specified Windows RTX
+host; CPU and build receipts cover narrower scopes.
+
 Lighter is an optional replacement for the **main world renderer**. By default
 its visibility comes from rays, not the Native renderer's raster targets.
 Hardware also offers an experimental raster *primary visibility* pass using

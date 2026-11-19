@@ -29,4 +29,5 @@ verifies the **actual** ray extent. `--require-complete` rejects schema 2,
 resolution other than 50%, insufficient timings and incomplete inventories.
 The current Native audit does not yet provide exhaustive per-class
 loaded/skipped/failed counts; it is reported incomplete rather than
-borrowing ray counts. See [matrix procedure and CPU results](../../retail-matrix.md).
+borrowing ray counts. The per-route list is also in
+`09-retail/physical-missing.json` in the [bundle](14-delivery.md). See [matrix procedure and CPU results](../../retail-matrix.md).

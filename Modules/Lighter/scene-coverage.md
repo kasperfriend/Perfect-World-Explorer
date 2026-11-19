@@ -1,5 +1,8 @@
 # Lighter scene coverage (RT-03 and RT-04)
 
+See the [PW 1.4.2 direct-root census and runtime omission fields](evidence/2026-11-18/12-inventory.md)
+for `a01`, `a02` and `a07`. Authored and runtime counts are not interchangeable.
+
 ## Capture an installed map
 
 Use one matching, supported Perfect World client tree. Keep the map files, packages and optional SpeedTree cache from that same build. Choose a camera in world units; yaw and pitch are radians.

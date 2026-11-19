@@ -322,6 +322,9 @@ any of these changes by default (other than the one-sample water guard).
 
 ### Still open
 
+See the [PR #51 remaining renderer gates](evidence/2026-11-18/13-renderer.md)
+for the latest separated CPU and physical status.
+
 - [Paced GPU copies and static BLAS](gpu-budget.md#paced-world-crossings) and
   the sampled BC terrain experiment below passed their synthetic admission
   and pixel checks. Measure map-travel tails and whole-viewer memory on a

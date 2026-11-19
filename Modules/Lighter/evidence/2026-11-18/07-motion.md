@@ -23,3 +23,10 @@ fast cuts, use consecutive waypoints and retain the frames on each side.
 
 The earlier [temporal interop stand-in](03-rr.md) checks deterministic
 history resets. It is not a visual motion or per-material retail verdict.
+
+**S capture plumbing:** [Linux/Xvfb CI](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44523578638/job/135558183606) passed the
+30-frame, 160×96 synthetic Native readback run and verified that the timing
+report refuses its CSV. The [CI artifact](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44523578638/artifacts/14529426969)
+also contains the separate normal and synchronized fixtures. Its signed
+transfer failed here, so the raw live sequence is retained on GitHub, not
+in the local bundle. The missing retail observations above are unchanged.

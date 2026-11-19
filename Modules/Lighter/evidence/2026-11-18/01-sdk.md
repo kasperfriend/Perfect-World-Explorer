@@ -12,7 +12,9 @@ no runner exists. No execution connection to the specified Windows machine
 was provided by this session. The repository's `windows-latest` job is a
 hosted build, not access to that RTX 3080. Raw probe: `01-sdk/access.log` in the
 dated evidence archive. Do not substitute CPU Vulkan, a hosted Windows build,
-or evaluator stand-ins for physical results.
+or evaluator stand-ins for physical results. A subset of hash-verified
+client records and packs was obtained for offline input/binding checks;
+this is not a mounted or complete client installation.
 
 ## Release receipts
 

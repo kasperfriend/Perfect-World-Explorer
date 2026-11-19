@@ -22,9 +22,11 @@ camera's frame.
 Use the optional **Lighter retail capture matrix** GitHub Actions workflow
 for the checksum-pinned CPU Vulkan subset. It collects PNGs, Step 9 counts,
 metadata, absolute-difference PNGs and `matrix.json` (including any failed
-cases). No game packages are uploaded. The pinned `a07` data currently
-requires terrain lightmaps to be off for **both** modes. An optional asset
-missing from an input tree remains an omission, not a parity pass.
+cases). No game packages are uploaded. New `a07` captures require **lightmaps
+on and 16 day/night areas bound**. Its pinned 128² BC1 tiles now load; the
+older lightmaps-off matrix below is a different setup. An optional asset
+missing from an input tree remains an omission, not a parity pass. See the
+[water evidence and candidate poses](evidence/2026-11-18/10-water.md).
 
 On a Linux or Windows host with a Vulkan ray-query GPU, build Explorer from
 this revision. Install Pillow in a Python 3.10+ environment. Open a complete
@@ -42,11 +44,16 @@ object masks.
 ```sh
 python3 -m pip install Pillow==11.3.0
 python3 tools/lighter_capture_matrix.py \
-  --profile physical --require-complete --timed-frames 30 \
+  --profile physical --device 'NVIDIA GeForce RTX 3080' --require-complete --timed-frames 30 \
   --manifest /path/to/verified-cameras.json \
   --viewer target/release/perfect-world-explorer --client /path/to/client \
   --output target/lighter-retail-physical
 ```
+
+For the PR #51 acceptance run, use Windows x64 and the specified 10 GB RTX
+3080. `--require-complete` will report a missing cell until a full Native
+loaded/skipped/failed inventory is recorded; Native's current submission
+counters cannot close that gate. See the [54-cell status](evidence/2026-11-18/09-retail.md).
 
 Add `--hybrid-ab` to the physical run to render a fourth path: the same
 Hardware settings with raster primary visibility enabled. The tool rejects a

@@ -24,3 +24,9 @@ See `05-regression/` in the [evidence bundle](14-delivery.md) for the PNGs,
 sidecars, hashes, logs and commit receipt. **P/V: not run**; this is an S
 pixel regression and a Native DX12 source isolation audit, not a new
 Windows GPU/NGX/FG integration test.
+
+**S repeat on `31bfeef`:** The same five routes byte-match the PNGs in the
+table again, including the Native SDK-ignore controls. See
+`05-regression/current/`, `05-regression/CURRENT-PNG-SHA256SUMS.txt` and the
+new tested-commit receipt. Native FSR/NGX/XeSS provider source is still
+unchanged relative to `6f97ea6`; no DX12 GPU test is claimed.

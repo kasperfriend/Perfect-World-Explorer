@@ -41,3 +41,8 @@ two units of RGB extinction on the submerged sky ray with an optical exit,
 and independent four-unit water-leg attenuation of bed lighting. Adding a
 blocker above the flat interface removes the sun term at unchanged bed depth.
 These are synthetic tests, not a retail caustic or fog match.
+
+The [a07 input and water audit](evidence/2026-11-18/10-water.md) records the
+verified 128² baked-lightmap format, synthetic day/night bindings and
+scouted retail water heights. It does not establish visible retail water
+parity or transmission on the target GPU.

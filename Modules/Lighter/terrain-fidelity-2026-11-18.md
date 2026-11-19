@@ -1,5 +1,15 @@
 # Far terrain heightfield audit — 2026-11-18
 
+**Historical stress case, invalid for Perfect World retail RT-02b.** See the
+[verified PW 1.4.2 a01/a02 audit](evidence/2026-11-18/11-terrain.md) for the
+correct inputs and the remaining live-view gate.
+
+The checksum-pinned `pw142/element` a01/a02 scene pairs parse as v12/v12.
+Both select stride four. Against the source grid, a01 has 2.1035 mean and
+100.3922 maximum height error (29,807 samples above 0.5 units); its worst
+1–3° grazing error is 25.0636. Flat a02 has zero height/grazing error.
+Those are offline measurements, not streamed or outside-frustum results.
+
 S38 and S40 are real Forsaken World 0.525 heightfields (one T2BK v6 tile each,
 64 blocks, a 256×256 grid, spacing 2 world units). This is **heightfield
 geometry evidence**, not a matched-camera Native/Software/Hardware capture.

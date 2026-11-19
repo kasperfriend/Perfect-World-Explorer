@@ -48,6 +48,11 @@ parsed weather selection in both backends. `PW_PREVIEW_HOUR` and explicit
 `--gpu-preview-at` pin the other view inputs. An absent cloud atlas or
 unavailable native rain texture is not authored parity.
 
+Preview receipts expose root states, Warp omissions, destination-color
+candidates, rain art fallback and admitted ray rain cards. See the
+[per-map census and scope](evidence/2026-11-18/12-inventory.md); none of
+these counts prove how many effect or rain pixels are visible.
+
 ## Validation (2026-11-18)
 
 `234075e` / `d1f8f11`: Naga accepts both trace paths, all 166 `gfx_player`

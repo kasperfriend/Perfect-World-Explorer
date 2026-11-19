@@ -20,9 +20,16 @@ identical and test refinement against a predeclared tolerance. The higher
 budgets can be expensive and need a physical run to establish reliability.
 
 `tools/lighter_temporal_compare.py --help` checks the matched schema-3
-sidecars, decoded RGBA8 hashes, RTX 3080 Vulkan adapter, exact active
+sidecars, decoded RGBA8 hashes, Windows RTX 3080 Vulkan adapter, exact active
 provider and intended ray settings, and reports per-region RGB8 mean/max
 error vs portable and the higher-budget Reference. It fails a silent
 fallback and reports any Reference refinement threshold violation. These
 are encoded RGB differences, not optical or temporal quality verdicts.
 **S:** seven Python receipt/region tests passed (`06-captures/`).
+
+**S retry on `99f7564`:** Software produced both PNGs at 960×720 with
+48 warm-up frames, 768 ms animation, active `portable` and the path receipt
+`22faa3d4f5d1bf1e7360e6ca98dbd16cf0c6b9a5494370b9d5715228c3058311`.
+The final PNGs byte-match one another (`06e71efd…`). This tests path parsing,
+matching and final capture on a synthetic view, not SDK temporal quality or
+Reference convergence. See `06-captures/path/` and `06-captures/still/`.

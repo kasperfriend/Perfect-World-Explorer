@@ -63,8 +63,8 @@ so different frame rates still produce the same poses.
    progress. It then advances on normal present calls; the in-game hour is
    pinned and the scene uses a fixed 16 ms logic tick during the flight.
    This does not freeze asynchronous asset admission, simulate a fixed wall
-   speed, or reproduce animation phase on retries. Wait for the “normal
-   present calls saved” message before closing. Use separate files for warm
+   speed, or reproduce animation phase on retries. Wait for the
+   `normal_present presents saved` message before closing. Use separate files for warm
    repeats and for the Native, Software, Hardware and Hybrid routes.
 
 ## Read the result
@@ -103,3 +103,39 @@ python3 tools/lighter_travel_report.py --physical --device 'RTX 3080' \
 The Xvfb smoke test uses a 160×96 synthetic Native viewer and verifies the
 CSV comes from the regular present path, without screenshot readback. It
 confirms capture plumbing, not a real-map crossing or a physical benchmark.
+
+## Separate motion and synchronized runs
+
+Set `PW_RAY_RECONSTRUCTION=off|fsr|rr` before launch for the ray routes and
+follow the [verified SDK setup](temporal-reconstruction.md). The recorder
+invalidates the run if the provider used differs from the requested one.
+For each route, use the same plan within each of these distinct modes:
+
+- **Normal present:** leave `PW_LIGHTER_TRAVEL_SYNC` and
+  `PW_LIGHTER_TRAVEL_CAPTURE_DIR` unset. Use the frame intervals for cadence
+  and streaming tails, never as GPU scanout. For the matched portable cache
+  A/B, use `--reuse-ab` with one default and one `PW_RAY_SCREEN_REUSE=both`
+  run of the same route. Keep progressive/history settings matched.
+- **Motion PNG evidence:** set `PW_LIGHTER_TRAVEL_CAPTURE_DIR` to an empty
+  directory; use a 30–600 frame plan. It writes `000000.png` onward from the
+  world-color target before UI and display composition. Readback stalls
+  this path. Its CSV has `capture_policy=motion_readback` and is rejected by
+  both timing reports. For each provider retain the path and frame numbers
+  of ghosting, reveals, foliage and water flicker; a replay cut can be
+  represented by consecutive keyframes.
+- **Synchronized GPU stages:** set `PW_LIGHTER_TRAVEL_SYNC=1`, unset motion
+  capture, and use **500+** measured frames (last index ≥499). It drains
+  the wgpu queue and raw fences before presenting, records current-draw
+  GPU stages if available, and samples process device-local heap per frame
+  plus warm-up. Stage markers exclude WSI/scanout; completion polling
+  changes cadence and must not replace the normal-present runs.
+
+```sh
+python3 tools/lighter_travel_report.py --require-sdk-matrix \
+  native-sync.csv software-sync.csv hardware-sync.csv \
+  software-fsr-sync.csv hardware-fsr-sync.csv software-rr-sync.csv hardware-rr-sync.csv
+```
+
+The strict suite requires the exact Windows RTX 3080 Vulkan adapter,
+matched controls, and per-frame heap, ray trace and (where applicable) SDK
+samples. [Acceptance status and host requirements](REMAINING.md).

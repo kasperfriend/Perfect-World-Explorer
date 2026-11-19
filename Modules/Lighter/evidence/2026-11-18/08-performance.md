@@ -24,7 +24,8 @@ compositor time. GPU ray composition is not whole-viewer GPU presentation.
 The synchronization and polling themselves alter cadence, so retain a
 separate normal-present run. Motion PNG readback cannot be combined with
 this audit. `lighter_travel_report.py --require-sdk-matrix` requires all
-seven provider/route receipts and per-frame heap/trace/SDK samples.
+seven provider/route receipts on the exact Windows RTX 3080 Vulkan adapter
+and per-frame heap/trace/SDK samples.
 
 Sample Vulkan process **device-local heap** usage each measured synced
 frame (and warm-up), not renderer allocation accounting. Log a warning
@@ -37,3 +38,14 @@ and `PW_RAY_SCREEN_REUSE=both`. The report accepts a deliberate `--reuse-ab`
 pair without relaxing other ray settings or camera matching. Keep separate
 PNG/noise and normal-present records, rather than claiming noise gains from
 frame time. See [Step 13](13-renderer.md) for prior fixture scope.
+
+**S completion checks:** the Vulkan timestamp stand-in passed both extents
+and fence-retired resize on `99f7564`. Later coverage tests bind three
+synchronized Software draw samples to the submitted frame at 240×180 rays,
+not to an earlier same-extent query. These are synthetic headless draws and
+not the 500-present benchmark. See `08-performance/` and `10-water/`.
+
+[Hosted Linux/Xvfb](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44523578638/job/135558183606) separately passed a **500-present
+Native synthetic fixture** (synchronized, 160×96, no ray or SDK stages)
+and the 30-frame normal-present control. It tested CPU queue-drain receipt
+shape, not process heap sampling on RTX or any of the seven physical routes.
