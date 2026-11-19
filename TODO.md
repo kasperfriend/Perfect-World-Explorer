@@ -1,82 +1,48 @@
-# To-do — branch `arena/3074ae8a-perfect-world-explorer`
+# To-do — remaining open register entries
 
-Ordered, each item has a definition of done. Ticked = done and verified.
-No item is closed on an assumption; where the evidence is not on disk, the
-item says so and lands as a named gap instead of a guess.
+Built by reading all 62 rows of `Findings/Unsupported-client-paths.md` and
+splitting them into: already resolved but worded softly (bookkeeping), genuinely
+implementable here (code), and blocked on something this environment cannot
+supply (no GPU / no staged asset / not enough disassembly). Every item is worked
+in order; blocked ones are made to say precisely *what* blocks them instead of a
+soft "not established".
 
-- [x] **1. Resolve the TRN2 / precinct coordinate frame** (the one entry
-      `Findings/Unsupported-client-paths.md` still calls *open*).
-      Precinct polygons reach z = 5,637 and negative x in a map whose `.trn2`
-      and `.ecwld` both declare 6,144 × 3,072. Decide between *shared offset
-      frame* and *centred authoring frame* using the ECWLD's own placements
-      (water, ornaments, effects) as the reference cloud — not by eye.
-      *Done:* **Resolved, the frame is centred on the origin.** a37's own
-      `precinct.clt` has 29 zones, all 29 inside the centred 6,144 × 3,072 box,
-      0 outside, x -1,936..651 — and -1,936 is exactly the min x of a37's 362
-      ECWLD placements. `world.ecwld`'s 7,737 placements fill the centred
-      8,192 × 11,264 box to 99.5 %/97.5 % with 0 outside.
-      **Two things were wrong and are now fixed:** `contains_world_point` tested
-      `0.0..=width` (corner-anchored); and the "383-zone a37 precinct" I staged
-      last stretch was byte-identical to the *world* file — under that mix-up
-      240 of 383 centres fell outside a37's extent, which is what exposed it.
-      `instance` now prints an `outside` column.
+- [x] **R1. Separate the T2MK `type` byte from the projection axis.**
+      The register says `world.rs` reads a `+12` selector (0/1/2) as the
+      projection `axis`, and the two meanings have never been separated.
+      *Done:* disassembled the real 1.4.2 `elementclient.exe` (6,000,640 B,
+      `.text` at `0x401000`). `0x77f180` **never reads** the byte — it is a
+      texture-cache acquire that tests `+0x178` and dereferences `[esi]`. A
+      whole-image scan finds `movzx` of `+0xc` exactly once (`0x8213e1`), in a
+      hash loop. So the byte is renderer-visible but unbranched-on in this image.
+      `material::Layer` now carries `selector` (authored, untouched, readable)
+      apart from `axis` (the shader projection, derived 1:1), refuses a selector
+      outside 0..=2, and two tests pin both the mapping and the accessor.
+      **The byte's own native meaning stays open** — no consumer exists to decode,
+      and the row now says exactly that instead of "the two have not been
+      separated".
 
-- [x] **2. Stage `sfx.pck` and settle whether element-170 paths resolve.**
-      `world_audio` resolves under an `sfx/` prefix; the 355 authored 170 paths
-      are `Skill\…`, `Effect\…`, `Creature\…`, `Item\…`, `Ambience\…`.
-      *Done:* the **key rule is settled** — `configs/sound.txt` writes
-      `SFX\Item\EquipSound\DownGem.wav`, a 170 record writes
-      `Item\EquipSound\DownGem.wav`, and both key to
-      `sfx/item/equipsound/downgem.wav` (`src/sound_key.rs`, 4 tests).
-      **`sfx.pck` is not obtainable**: all nine copies are 123–880 MB, over the
-      100 MiB transfer limit. So the gap is "no staged archive", not "unknown
-      path base", and B-31 now says exactly that.
+- [ ] **R2. Decode the precinct ambience-priority field (header index 3).**
+      Five values across the 1.8.4 file (0×53, 1×38, 2×22, 3×104, 4×167),
+      correlated with having a stereo ambience path.
+      *Done when:* the client's precinct reader is found and the field's use is
+      either decoded and implemented, or the search is recorded with what was
+      ruled out.
 
-- [x] **3. Run the silent-failure guard in CI, not just locally.**
-      `tools/check-harness.py` currently runs only inside `harness.sh check`.
-      *Done:* `pr-checks.yml` gained a **Guard the offline harness against silent
-      failures** step running `python3 tools/check-harness.py`, placed with the
-      other standalone audits. It needs no Rust toolchain, so it also catches
-      things on a machine that never builds the harness. The workflow parses as
-      valid YAML with the step in place; the failure direction is proven by the
-      two negative tests against `/tmp` copies (duplicate label, stray backtick).
+- [ ] **R3. Search `VS_VERSIONINFO` StringTables by language, not first-wins.**
+      Concrete, testable, no assets needed beyond `sdk/*.dll` and the staged
+      executables.
+      *Done when:* the reader prefers a known language (English, then any) and a
+      test covers a multi-table resource.
 
-- [x] **4. Re-read the two findings docs for claims this stretch invalidated.**
-      `Findings/Unsupported-client-paths.md` and `docs/blockers.md` both carry
-      older wording ("counts but does not perform", the 79-version ceiling, the
-      precinct frame).
-      *Done:* the "counts but does not perform" row now says the plugin draws
-      every placed effect and only the *audio* is unplayed. Beyond the brief, the
-      stale effect count **2,275** was wrong in live prose: the staged
-      `world.ecwld` has **2,971** effects / 2,971 distinct ids, unit and
-      perpendicular directions on 2,971 of 2,971, speeds 0.030–12.000, scales
-      0.054–380.953, split 2,004 / 787 / 180. Corrected in `scene.rs`,
-      `diagnostics.rs`, `gfx_owner.rs` and the findings row. Dated reports such as
-      `Every-effect-2026-11-08.md` keep 2,275 — that is what was measured on that
-      build, and rewriting a dated record would be worse than the stale number.
+- [ ] **R4. Make the soft/duplicated rows tell the truth.**
+      `World/asset gates outside 1.4.2` still says "GFX roots ≤79", which the
+      version-ceiling work made false. `Audio codec coverage` and
+      `Movement sound table` are written as gaps but are answered. `Instance
+      aliases for b07-b29` explains itself but reads like an open defect.
+      *Done when:* each row states its current status and the register has no
+      claim the code contradicts.
 
-- [x] **5. Close out: full gate sweep, benchmark the numbers, push, refresh the
-      PR body.**
-      *Done:* every mode green at HEAD (below), tree clean, branch and origin
-      identical, PR #50 body carries the measured numbers.
-
-      | mode | result |
-      |---|---|
-      | `check` | type-check clean |
-      | `test` | 211 passed |
-      | `player` | 286 passed |
-      | `diagnostics` | 18 passed |
-      | `music` | 27 passed |
-      | `gfx` | 94 passed |
-      | `water` | 20 passed |
-      | `material` | 25 passed |
-      | `bins` | 38/38 |
-      | `instance` | 1 map, 0 failed, a37 29 zones 0 outside |
-      | `matrix-maps` | a37 29 zones, world 383 zones |
+- [ ] **R5. Full gate sweep, push, refresh the PR body.**
 
 ## Notes taken while working
-
-- **A staged file can be the wrong map's file.** `a37/precinct.clt` was the
-  world's, byte for byte. Nothing about parsing it failed; only comparing it
-  against the map it sits beside did. Any "N of M read" number is only as
-  trustworthy as the join between a file and its map.
