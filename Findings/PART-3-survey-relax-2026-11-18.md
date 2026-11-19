@@ -34,6 +34,7 @@ about the place it was pointed at, so each row now records *where* it measured.
 | 83 | `designer/catalog.rs` family `0x3000` | no change needed: the family word is `0x3000` in every sampled client, so the guard is right and only the *version* varies. `tools/version-gates.py` gained an `elements/task data` rule (dword `@0`, split as `(family << 16) \| version`) and now prints the family separately, because printing the raw word makes a newer client's v70 look like an unknown format rather than a newer revision of a family the reader already handles | four files from three clients: `0x3000000a` (v10), `0x3000000c` (v12), `0x3000000a` again, and `0x30000046` (**v70**, a much newer client). All family `0x3000`. Versions 10..70 against `ELEMENTS_V27 = 0x3000_001b` (v27), which is what `unsupported_layout` already reports by name and version |
 | 80 | legacy 59-type SpeedTree bridge in `windows_setup.rs` | no change needed: the variable-count bridge is tried **first** with the type count as a fourth argument, and the 59-type path is a fallback taken only when that bridge rejects the argument. Above 59 types the fallback refuses by name and tells the user to rebuild the tool. The `59` is the legacy *protocol* size, not a viewer limit: `tree_source::TREE_SOURCE_LIMIT` is 10,000 | `tools/speedtree/bake.cpp` — the shipped `speedtree-bake.exe` already parses an optional third argument (default 59) and caps it at 10,000, which is the same bound `TREE_SOURCE_LIMIT` uses. The real `speedtreert.dll` (450,560 B, staged) is a genuine SpeedTreeRT build: it exports `CSpeedTreeRT`, `LoadTree`, `SaveTree`, `GetTreePosition`, `GetTreeSize`. Item 81's Windows build is what would exercise the fallback end to end |
 | 84 | `startup_notice` should name the failed map and its error | no change needed: `world_load::load_with_main_world_fallback_notified` already builds `"Could not load map {preferred}; returned to the main world.\n\n{first_error}"`, so the notice names both the map and its error, and the both-attempts-failed path names both maps and both errors | `world_load` suite, 8 tests: `selected_map_error_returns_to_main_world_with_the_reason` asserts the notice contains `a01` *and* `bad instance terrain`; `notified_retry_receives_the_first_failure_reason` asserts the fallback attempt receives the first failure; `both_attempts_failing_reports_both_reasons` covers the double failure |
+| 81 | rodio features in `Cargo.toml` | **no change needed.** Each manifest feature is backed by a crate in `Cargo.lock` — `mp3` → `symphonia-bundle-mp3` 0.5.5, `vorbis` → `lewton` 0.10.2, `wav` → `hound` 3.5.1 — all via `rodio` 0.17.3, with no extras on either side. `Cargo.toml` has no `[features]` section, and `rodio` is `cfg(windows)`, which is why an offline Linux toolchain reports it absent | `tools/offline_harness.sh music`, 28 tests including `codec_coverage_matches_the_corpus`. Full detail in "81 — the rodio feature list" below |
 | 72 | `WATER_VERSIONS` is `[0x10002000, 0x10003000]` | no change needed: the constant is already a range-of-two with its measured corpus documented at the declaration, and `parse_record` falls back to a version-agnostic scan so an unknown revision still yields areas instead of being dropped | the comment beside the constant names the six clients surveyed and which word each writes. Nothing to relax: the one thing that *was* a hard rejection is already a fallback |
 
 ### The item-73 correction
@@ -47,12 +48,53 @@ and all 488 light elements declare exactly 1. The guard was therefore rejecting
 nothing. Recorded here because the wrong number would have justified a much
 larger change than the data supports.
 
-## Blocked — needs data this checkout does not have
+## Settled without a code change
 
-| # | item | what blocks it |
+Two items turned out not to need the change their one-line summary implied.
+Neither is blocked; both are answered, and the answers are in the repo rather
+than in a Windows binary or a branch.
+
+### 81 — the rodio feature list
+
+The item reads as if it needs a Windows build to check. It does not: which
+formats this build decodes is a question about `Cargo.toml` and `Cargo.lock`,
+both of which are here.
+
+| feature | crate in `Cargo.lock` | version |
 | --- | --- | --- |
-| 81 | rodio features in `Cargo.toml` | Needs a Windows build to test the audio backend selection; the offline toolchain has no rodio |
-| 85 | split the PR into four | **Plan written, not executed.** `Findings/PR-50-split-plan.md` partitions all **108** files (the item's 61 is stale) into four cuts and machine-checks the partition: 108 changed, 108 assigned, no orphan, no duplicate — A 20, B 8, C 23, D 57. Two things block execution: this session may only push to `arena/3074ae8a-perfect-world-explorer`, and the 110 commits interleave the cuts, so they are partitions of the final tree rather than disjoint slices — producing them needs four check-out/repair/verify cycles before any of the four PRs is worth opening |
+| `mp3` | `symphonia-bundle-mp3` | 0.5.5 |
+| `vorbis` | `lewton` | 0.10.2 |
+| `wav` | `hound` | 3.5.1 |
+
+All three are pulled in by `rodio` 0.17.3 and by nothing else, so the manifest's
+feature list and the locked decoder set agree with no extras on either side.
+There is **no `[features]` section in `Cargo.toml` at all**, so no audio backend
+sits behind an off-by-default flag. `rodio` itself is under `cfg(windows)`,
+which is exactly why an offline Linux toolchain reports it absent — the absence
+is a property of the target, not of the build.
+
+The selection is one `OutputStream::try_default()` per worker thread. A missing
+device becomes a named `Audio output unavailable: {e}` status plus a 2 s retry,
+and a format with no decoder is named once with the list this build does decode
+rather than retried as though the file were corrupt.
+
+Verified: `tools/offline_harness.sh music` — 28 tests, including
+`codec_coverage_matches_the_corpus`, which pins `DECODABLE_EXTENSIONS` =
+`mp3`/`ogg`/`wav` against the case-insensitive spellings a client ships.
+
+What a Windows machine would still add is whether the audio *device* opens on
+that machine. That is a property of the machine, not of this repo, and is not
+something a survey of the corpus can settle.
+
+### 85 — splitting the PR
+
+**Closed by decision: the PR stays whole.** The instruction to finish the items
+without splitting reverses the earlier ordering.
+
+`Findings/PR-50-split-plan.md` is kept as the record of what a split would have
+been, since it was machine-checked and cost nothing to keep: all 108 files in
+four cuts (A 20, B 8, C 23, D 57), with no orphan and no file claimed twice. It
+is reference material, not pending work.
 
 ### The corpus this depends on
 
