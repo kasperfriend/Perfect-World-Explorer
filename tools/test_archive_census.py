@@ -17,6 +17,7 @@ sys.path.insert(0, str(HERE))
 spec = importlib.util.spec_from_file_location("census", HERE / "archive-census.py")
 census = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(census)
+import pck_lib  # noqa: E402 - after the path insert above
 
 
 class ClassificationTests(unittest.TestCase):
@@ -101,3 +102,86 @@ class ClassificationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RevisionLayoutTests(unittest.TestCase):
+    """`dwFlags` and the record geometry move with the revision.
+
+    Reading `dwFlags` at a fixed +12 reports a 1.8.4 package as enciphered,
+    because at that offset revision `0x00020003` carries the first bytes of
+    `szDescription` (`0xffffffff`). The 1.5.2 and 1.8.4 trailers also differ in
+    length, so a fixed `end - 280` reads the wrong place entirely.
+    """
+
+    def _package(self, revision, entries=1, flags=0):
+        import struct
+
+        (
+            header_size,
+            entry_size,
+            offset_at,
+            offset_width,
+            size_at,
+            comp_at,
+            guard_byte1,
+            flags_at,
+        ) = pck_lib.REVISIONS[revision]
+        del offset_at, offset_width, size_at, comp_at
+        payload = b"\0\0\0\0"
+        body = bytearray(struct.pack("<III", 0x4DCA23EF, 0, 0x56A089B7))
+        body += b"\0" * (12 * entries)
+        body += b"\0" * (header_size + 8)
+        size = len(body)
+        struct.pack_into("<I", body, 4, size + len(payload))
+        trailer = size - (header_size + 8)
+        struct.pack_into("<I", body, trailer, 0xFDFDFEEE)
+        struct.pack_into("<I", body, trailer + flags_at, flags)
+        struct.pack_into("<I", body, trailer + guard_byte1, 0xF00DBEEF)
+        struct.pack_into("<I", body, trailer + header_size, 0)
+        struct.pack_into("<I", body, size - 4, revision)
+        return bytes(body)
+
+    def test_flags_are_read_at_the_revisions_own_offset(self):
+        import tempfile
+        from pathlib import Path
+
+        # Unencrypted must not be reported as enciphered at either revision.
+        for revision in (0x20002, 0x20003):
+            data = self._package(revision)
+            with tempfile.NamedTemporaryFile(suffix=".pck", delete=False) as fh:
+                fh.write(data)
+                path = fh.name
+            try:
+                # Whatever the container parse does, it must not be the
+                # *encryption* refusal.
+                try:
+                    pck_lib.directory(path)
+                except pck_lib.EncryptedPackage:
+                    self.fail(f"revision {revision:08x} is not enciphered")
+                except Exception:
+                    pass  # a synthetic zero-entry package may not parse, fine
+            finally:
+                Path(path).unlink()
+
+        # And bit 31 at the right offset *is* reported.
+        for revision in (0x20002, 0x20003):
+            data = self._package(revision, flags=0x80000000)
+            with tempfile.NamedTemporaryFile(suffix=".pck", delete=False) as fh:
+                fh.write(data)
+                path = fh.name
+            try:
+                with self.assertRaises(pck_lib.EncryptedPackage, msg=f"{revision:08x}"):
+                    pck_lib.directory(path)
+            finally:
+                Path(path).unlink()
+
+    def test_every_revision_names_its_flags_offset(self):
+        # +12 for the 272-byte trailer, +16 for the 280-byte one. A revision
+        # added later must state it rather than inherit a default.
+        self.assertEqual(pck_lib.REVISIONS[0x20001][-1], 12)
+        self.assertEqual(pck_lib.REVISIONS[0x20002][-1], 12)
+        self.assertEqual(pck_lib.REVISIONS[0x20003][-1], 16)
+        # And the record geometry differs, which is why the container is chosen
+        # from the revision instead of assumed.
+        self.assertEqual(pck_lib.REVISIONS[0x20003][1], 288)
+        self.assertEqual(pck_lib.REVISIONS[0x20002][1], 276)

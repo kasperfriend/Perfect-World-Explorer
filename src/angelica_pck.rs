@@ -42,16 +42,38 @@ fn u32le(b: &[u8], p: usize) -> Result<u32, String> {
     ))
 }
 
-/// Find the zlib stream that ends exactly at `end` and inflates to 276 bytes.
+fn u64le(b: &[u8], p: usize) -> Result<u64, String> {
+    Ok(u32::from_le_bytes(
+        b.get(p..p + 4)
+            .ok_or("truncated Angelica entry")?
+            .try_into()
+            .unwrap(),
+    ) as u64
+        | (u32::from_le_bytes(
+            b.get(p + 4..p + 8)
+                .ok_or("truncated Angelica entry")?
+                .try_into()
+                .unwrap(),
+        ) as u64)
+            << 32)
+}
+
+/// Find the zlib stream that ends exactly at `end` and inflates to one record.
 /// Mirrors `_stream_ending_at`: scan backwards for a zlib header (CM=8,
 /// window <= 7) and accept the first stream that consumes exactly the bytes up
 /// to `end` and produces one record.
+///
+/// The record length is the revision's, not a constant: 1.5.2 (`0x00020002`)
+/// writes 276-byte records with 4-byte offsets, 1.8.4 (`0x00020003`) writes
+/// 288 with 8. Hard-coding 276 is why the 1.8.4 pack reported "no Angelica
+/// record ends at the expected offset" for every one of its 1,057 entries.
 fn record_ending_at(
     blob: &[u8],
     end: usize,
     decomp: &mut Decompress,
-) -> Result<([u8; 276], usize), String> {
-    let mut out = [0u8; 276];
+    record_len: usize,
+) -> Result<(Vec<u8>, usize), String> {
+    let mut out = vec![0u8; record_len];
     let mut searched_low = end.saturating_sub(MIN_COMPRESSED_RECORD).min(blob.len());
     for span in WINDOWS {
         let low = end.saturating_sub(span);
@@ -72,7 +94,7 @@ fn record_ending_at(
                 continue;
             };
             if status == flate2::Status::StreamEnd
-                && decomp.total_out() == 276
+                && decomp.total_out() == record_len as u64
                 && decomp.total_in() == (end - start) as u64
             {
                 return Ok((out, start));
@@ -97,8 +119,15 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     let magic = u32le(&prefix, 0)?;
     let size = u32le(&prefix, 4)?;
     let tag = u32le(&prefix, 8)?;
-    if magic != 0x4dca23ef || tag != 0x56a089b7 || size as u64 != file_len {
-        return Err("bad Angelica prefix".into());
+    // The tag word is `0x56a089b7` in 1.5.2 and **zero** in 1.8.4 (measured on
+    // both clients' `configs.pck`), so it is checked as part of the family
+    // rather than as one exact value. The first word and the self-declared
+    // size are what actually identify the container.
+    if magic != 0x4dca23ef || !matches!(tag, 0x56a089b7 | 0) || size as u64 != file_len {
+        return Err(format!(
+            "bad Angelica prefix: {magic:08x} {size:08x} {tag:08x}, \
+             expected 4dca23ef <file size> 56a089b7 (1.5.2) or 00000000 (1.8.4)"
+        ));
     }
     let tail_start = file_len.saturating_sub(64 * 1024 * 1024);
     f.seek(SeekFrom::Start(tail_start))
@@ -111,10 +140,11 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     // (`shaders.pck`), which is why the layout, the field offsets and the guard
     // pair all come from the one table in `pck` instead of a second copy here.
     //
-    // The `0xa508bdc4` / `0x853567c8` pair that an earlier version also accepted
-    // is gone: it appears in no staged archive, `pck` never accepts it, and two
-    // readers disagreeing about which guards are valid is the thing this
-    // consolidation removes. An archive carrying it is refused by name below.
+    // The `0xa508bdc4` / `0x853567c8` pair is *required*, not merely accepted:
+    // it is what every 1.5.2 archive carries. A consolidation removed it on the
+    // strength of "it appears in no staged archive", which was a claim about
+    // what had been looked at rather than about the format, and it refused the
+    // whole 1.5.2 client. Both pairs are named in `pck` now.
     //
     // The version word sits in the last four bytes, exactly as in a retail
     // package, and it is what says how long the trailer is -- so it is read
@@ -132,10 +162,18 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     let header = &blob[trailer..trailer + rev.header];
     let guard = u32le(header, 0)?;
     let guard2 = u32le(header, rev.guard_byte1)?;
-    if guard != crate::pck::GUARD_0 || guard2 != crate::pck::GUARD_1 {
+    // Two pairs ship and both are measured, not tolerated. 1.5.2's revision
+    // `0x00020002` writes `a508bdc4`/`853567c8` (`configs.pck` 67 entries,
+    // `grasses.pck` 103); 1.8.4's `0x00020003` writes `fdfdfeee`/`f00dbeef`.
+    // Accepting only the second is what refused every 1.5.2 archive.
+    let known = (guard == crate::pck::ANGELICA_GUARD_0 && guard2 == crate::pck::ANGELICA_GUARD_1)
+        || (guard == crate::pck::GUARD_0 && guard2 == crate::pck::GUARD_1);
+    if !known {
         return Err(format!(
-            "unsupported Angelica trailer: guard {guard:08x}/{guard2:08x} is not the \
-             package guard pair {:08x}/{:08x}",
+            "unsupported Angelica trailer: guard {guard:08x}/{guard2:08x} is neither \
+             {:08x}/{:08x} (1.5.2) nor {:08x}/{:08x} (1.8.4)",
+            crate::pck::ANGELICA_GUARD_0,
+            crate::pck::ANGELICA_GUARD_1,
             crate::pck::GUARD_0,
             crate::pck::GUARD_1
         ));
@@ -154,14 +192,20 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     let mut reversed = Vec::with_capacity(count);
     let mut decomp = Decompress::new(true);
     for _ in 0..count {
-        let (record, start) = record_ending_at(&blob, pos, &mut decomp)?;
+        let (record, start) = record_ending_at(&blob, pos, &mut decomp, rev.entry)?;
+        // `szFileName` is the first 260 bytes in every revision; the three
+        // dwords after it move with the revision, which is why they come from
+        // the shared row rather than being spelled here.
         let zero = record[..260].iter().position(|&x| x == 0).unwrap_or(260);
         let (decoded, _, _) = encoding_rs::GBK.decode(&record[..zero]);
         let name = decoded.replace('\\', "/");
-        let offset = u32le(&record, 260)?;
-        let usize_ = u32le(&record, 264)?;
-        let compressed = u32le(&record, 268)?;
-        if offset as u64 + compressed as u64 > file_len
+        let offset = match rev.offset_width {
+            8 => u64le(&record, rev.offset_at)?,
+            _ => u32le(&record, rev.offset_at)? as u64,
+        };
+        let usize_ = u32le(&record, rev.size_at)?;
+        let compressed = u32le(&record, rev.compressed_at)?;
+        if offset + compressed as u64 > file_len
             || usize_ > 512 * 1024 * 1024
             || compressed > usize_
         {
@@ -169,7 +213,7 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
         }
         reversed.push(Entry {
             name,
-            offset: offset as u64,
+            offset,
             size: usize_,
             compressed,
         });
@@ -259,6 +303,54 @@ mod tests {
         assert_eq!(entries[0].compressed, stored.len() as u32);
         let payload = crate::pck::read_entry(&mut file, &entries[0]).unwrap();
         assert_eq!(payload, stored);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Both shipped guard pairs and both shipped tag words must read. The
+    /// measurements, from real archives rather than guesses: 1.5.2's
+    /// `configs.pck` (67 entries) and `grasses.pck` (103) are tag
+    /// `0x56a089b7` with guard `a508bdc4`/`853567c8`; 1.8.4's `configs.pck`
+    /// (1,057 entries) is tag **0** with guard `fdfdfeee`/`f00dbeef`.
+    ///
+    /// Accepting only the second combination refused the whole 1.5.2 client,
+    /// and accepting only the first refused 1.8.4.
+    #[test]
+    fn both_shipped_guard_pairs_and_tag_words_read() {
+        for (tag, guard0, guard1, label) in [
+            (
+                0x56a089b7u32,
+                crate::pck::ANGELICA_GUARD_0,
+                crate::pck::ANGELICA_GUARD_1,
+                "1.5.2",
+            ),
+            (0u32, crate::pck::GUARD_0, crate::pck::GUARD_1, "1.8.4"),
+        ] {
+            let mut pkg = package("configs/sky.lst", b"3\r\n0\r\n");
+            pkg[8..12].copy_from_slice(&tag.to_le_bytes());
+            let header_at = pkg.len() - 280;
+            pkg[header_at..header_at + 4].copy_from_slice(&guard0.to_le_bytes());
+            pkg[header_at + 268..header_at + 272].copy_from_slice(&guard1.to_le_bytes());
+            let path = std::env::temp_dir()
+                .join(format!("pw-angelica-{}-{tag:08x}.pck", std::process::id()));
+            std::fs::write(&path, &pkg).unwrap();
+            let mut file = File::open(&path).unwrap();
+            let entries = directory(&mut file)
+                .unwrap_or_else(|e| panic!("{label} (tag {tag:08x}) must read: {e}"));
+            assert_eq!(entries.len(), 1, "{label}");
+            std::fs::remove_file(&path).ok();
+        }
+        // A tag word from neither client is refused, and the refusal names the
+        // two that are expected rather than only the one that was checked.
+        let mut pkg = package("configs/sky.lst", b"x");
+        pkg[8..12].copy_from_slice(&0x12345678u32.to_le_bytes());
+        let path = std::env::temp_dir().join(format!("pw-angelica-tag-{}.pck", std::process::id()));
+        std::fs::write(&path, &pkg).unwrap();
+        let mut file = File::open(&path).unwrap();
+        let error = directory(&mut file).unwrap_err();
+        assert!(
+            error.contains("56a089b7") && error.contains("00000000"),
+            "{error}"
+        );
         std::fs::remove_file(&path).ok();
     }
 

@@ -113,15 +113,15 @@ pub(crate) struct Revision {
     /// record: `szFileName[260]`, `dwOffset`, `dwLength`,
     /// `dwCompressedLength`, `iAccessCnt`, plus `Zalupa0`/`Zalupa1` in the
     /// newest revision, which widens `dwOffset` to 64 bits.
-    entry: usize,
+    pub(crate) entry: usize,
     /// Where `dwOffset` starts inside an entry record.
-    offset_at: usize,
+    pub(crate) offset_at: usize,
     /// Width of `dwOffset`.
-    offset_width: usize,
+    pub(crate) offset_width: usize,
     /// Where `dwLength` starts.
-    size_at: usize,
+    pub(crate) size_at: usize,
     /// Where `dwCompressedLength` starts.
-    compressed_at: usize,
+    pub(crate) compressed_at: usize,
     /// Where `dwFlags` starts inside the trailer.
     pub(crate) flags_at: usize,
     /// Where `szDescription` starts inside the trailer.
@@ -188,14 +188,27 @@ pub(crate) const REVISIONS: [Revision; 3] = [
 /// The guard pair `guardByte0` / `guardByte1` that every revision's trailer
 /// carries.
 ///
-/// The value is the same in every revision because it is the engine's own
-/// constant, not a per-format choice, which is why one pair serves the retail
-/// reader and the `configs.pck` reader alike. Naming it once is the point: the
-/// Angelica reader used to spell `0xfdfdfeee`/`0xf00dbeef` a second time
-/// beside a pair for other builds, so a reader that accepted one and a writer
-/// that checked the other could drift apart with nothing to catch it.
+/// Retail packages from the 1.8.4 client write this pair. It is one of *two*
+/// shipped pairs, which is why it is not the only constant here: see
+/// [`ANGELICA_GUARD_0`]. The mistake to avoid is deduplicating two genuinely
+/// different values into one, not spelling the same value twice.
 pub(crate) const GUARD_0: u32 = 0xfdfdfeee;
 pub(crate) const GUARD_1: u32 = 0xf00dbeef;
+
+/// The guard pair a 1.5.2-era Angelica container writes instead.
+///
+/// This is **not** a legacy oddity to be tolerated: it is what every 1.5.2
+/// `.pck` carries. Measured on `configs.pck` (67 entries) and `grasses.pck`
+/// (103 entries), both revision `0x00020002`, both `0xa508bdc4`/`0x853567c8`
+/// at trailer `+0` and `+268`. Only the 1.8.4 pack, revision `0x00020003`,
+/// carries `0xfdfdfeee`/`0xf00dbeef`.
+///
+/// An earlier consolidation removed this pair on the grounds that "it appears
+/// in no staged archive". The archive had not been staged; the claim was
+/// really "I did not look", and it broke every 1.5.2 package. Two pairs, each
+/// measured, each named.
+pub(crate) const ANGELICA_GUARD_0: u32 = 0xa508_bdc4;
+pub(crate) const ANGELICA_GUARD_1: u32 = 0x8535_67c8;
 
 /// `dwFlags` bit 31: the package's entry records and payloads are enciphered.
 ///
@@ -236,9 +249,14 @@ pub(crate) const ENTRY_LIMIT: usize = 1_000_000;
 /// shipped archives' `0x00020002` word is a retail revision number.
 pub(crate) fn angelica_revision(version: u32) -> Option<Revision> {
     match version {
-        // `0x00020001` shares the layout byte for byte, so it is read on the
-        // word the archive states rather than refused for the one it does not.
+        // `0x00020001` shares the `0x00020002` layout byte for byte, so it is
+        // read on the word the archive states rather than refused for the one
+        // it does not. `0x00020003` is a genuinely different, longer trailer
+        // (280-byte header, 288-byte records, 8-byte offsets) and is read from
+        // its own row -- 1.8.4's `configs.pck` states it and holds 1,057
+        // entries that the 0x00020002 row would misparse.
         0x0002_0001 | 0x0002_0002 => REVISIONS.iter().find(|r| r.version == 0x0002_0002).copied(),
+        0x0002_0003 => REVISIONS.iter().find(|r| r.version == 0x0002_0003).copied(),
         _ => None,
     }
 }
@@ -1260,17 +1278,29 @@ mod tests {
             assert_eq!(rev.header + 8, 280);
             assert_eq!(rev.guard_byte1, 268);
         }
-        // The pair for other builds is gone on purpose: it was never in a
-        // staged archive and `pck` itself never accepted it.
+        // 0x00020003 is a real, different revision: 1.8.4's `configs.pck`
+        // states it, and it resolves to its own row rather than the 0x00020002
+        // one, whose 276-byte records cannot represent its 288-byte entries.
+        let v3 = angelica_revision(0x0002_0003).expect("0x00020003 is an Angelica trailer");
+        assert_eq!(v3.entry, 288);
+        assert_eq!(v3.offset_width, 8);
+        assert_eq!(v3.header + 8, 288);
+        // An unknown word is still refused.
         assert!(angelica_revision(0x0000_0000).is_none());
-        assert!(angelica_revision(0x0002_0003).is_none());
+        assert!(angelica_revision(0x0002_0004).is_none());
     }
 
-    /// And the guard pair is one constant, not two spellings of the same value.
+    /// There are two shipped guard pairs, and conflating them refused a whole
+    /// client. Both are pinned against the archives they were measured on:
+    /// 1.5.2's `configs.pck`/`grasses.pck` carry `a508bdc4`/`853567c8`, 1.8.4's
+    /// `configs.pck` carries `fdfdfeee`/`f00dbeef`.
     #[test]
-    fn the_package_guard_pair_is_the_retail_one() {
+    fn both_shipped_guard_pairs_are_distinct_and_pinned() {
         assert_eq!(GUARD_0, 0xfdfdfeee);
         assert_eq!(GUARD_1, 0xf00dbeef);
+        assert_eq!(ANGELICA_GUARD_0, 0xa508bdc4);
+        assert_eq!(ANGELICA_GUARD_1, 0x853567c8);
+        assert_ne!((GUARD_0, GUARD_1), (ANGELICA_GUARD_0, ANGELICA_GUARD_1));
         let v2 = REVISIONS.iter().find(|r| r.version == 0x0002_0002).unwrap();
         assert_eq!(v2.guard_byte1, 268);
     }

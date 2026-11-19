@@ -590,11 +590,22 @@ pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
 pub(crate) struct Revision {
     pub(crate) version: u32,
     pub(crate) header: usize,
+    /// Kept in step with the real `pck::Revision`: `angelica_pck` now reads the
+    /// record geometry from here instead of hard-coding 276.
+    pub(crate) entry: usize,
+    pub(crate) offset_at: usize,
+    pub(crate) offset_width: usize,
+    pub(crate) size_at: usize,
+    pub(crate) compressed_at: usize,
     pub(crate) guard_byte1: usize,
 }
 
 /// Mirrors `pck::ENTRY_LIMIT` so the real `angelica_pck` compiles here.
 pub(crate) const ENTRY_LIMIT: usize = 1_000_000;
+
+/// Mirrors `pck::ANGELICA_GUARD_0/1`: 1.5.2's guard pair.
+pub(crate) const ANGELICA_GUARD_0: u32 = 0xa508bdc4;
+pub(crate) const ANGELICA_GUARD_1: u32 = 0x853567c8;
 
 pub(crate) const GUARD_0: u32 = 0xfdfdfeee;
 pub(crate) const GUARD_1: u32 = 0xf00dbeef;
@@ -604,7 +615,22 @@ pub(crate) fn angelica_revision(version: u32) -> Option<Revision> {
         0x0002_0001 | 0x0002_0002 => Some(Revision {
             version: 0x0002_0002,
             header: 272,
+            entry: 276,
+            offset_at: 260,
+            offset_width: 4,
+            size_at: 264,
+            compressed_at: 268,
             guard_byte1: 268,
+        }),
+        0x0002_0003 => Some(Revision {
+            version: 0x0002_0003,
+            header: 280,
+            entry: 288,
+            offset_at: 264,
+            offset_width: 8,
+            size_at: 272,
+            compressed_at: 276,
+            guard_byte1: 272,
         }),
         _ => None,
     }

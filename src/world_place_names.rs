@@ -276,12 +276,60 @@ pub const ZONE_NAMES: &[(&str, &str)] = &[
 /// authored name, which is better than a placeholder.
 pub fn english(name: &str) -> &str {
     let trimmed = name.trim();
-    ZONE_NAMES
+    if let Some((_, en)) = ZONE_NAMES
         .iter()
         .chain(INSTANCE_NAMES.iter())
         .find(|(zh, _)| *zh == trimmed)
-        .map(|(_, en)| *en)
-        .unwrap_or(trimmed)
+    {
+        return en;
+    }
+    // A client whose `precinct.clt` spells the name differently still has to
+    // reach the English row. The differences between the shipped clients are
+    // punctuation and spacing only -- a full-width space, a trailing `区`, an
+    // ASCII tail -- never a different name, so comparing an ASCII-only,
+    // whitespace-free form catches the variants without inventing a match.
+    //
+    // 1.5.2 is the client that needs this: its zone names come from its own
+    // `precinct.clt` and the generated table was built from 1.8.4, so an exact
+    // comparison left the banner in Chinese.
+    let folded = fold(trimmed);
+    if !folded.is_empty() {
+        if let Some((_, en)) = ZONE_NAMES
+            .iter()
+            .chain(INSTANCE_NAMES.iter())
+            .find(|(zh, _)| fold(zh) == folded)
+        {
+            return en;
+        }
+    }
+    trimmed
+}
+
+/// The form two spellings of one zone name share: no whitespace (ASCII or
+/// full-width), no ASCII/full-width punctuation, and a trailing `区` dropped.
+///
+/// Deliberately conservative -- it must not merge two different places, so it
+/// only removes characters that carry no meaning in a place name.
+fn fold(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        let c = match c {
+            '\u{3000}' => continue, // ideographic space
+            c if c.is_whitespace() => continue,
+            '\u{00b7}' | '\u{2022}' => continue, // middle dot, bullet
+            '(' | ')' | '\u{ff08}' | '\u{ff09}' => continue, // ascii/full-width parens
+            '[' | ']' | '\u{3010}' | '\u{3011}' => continue,
+            '.' | ',' | '\u{3001}' | '\u{ff0c}' => continue,
+            '-' | '_' | '\u{2014}' => continue,
+            c => c,
+        };
+        out.push(c);
+    }
+    // `XX区` and `XX` are the same place in every client seen.
+    if out.ends_with('\u{533a}') {
+        out.pop();
+    }
+    out
 }
 
 // BEGIN GENERATED instance aliases -- tools/instance-aliases.py
@@ -413,6 +461,38 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for (zh, _) in INSTANCE_NAMES {
             assert!(seen.insert(*zh), "{zh} appears twice");
+        }
+    }
+
+    /// A 1.5.2 `precinct.clt` spells names with a full-width space, a trailing
+    /// `区`, or parenthetical ASCII the 1.8.4-derived table does not carry.
+    /// Those must still reach the English row -- that is the whole bug: the
+    /// banner in an instance stayed Chinese because the comparison was exact.
+    #[test]
+    fn spacing_and_punctuation_variants_reach_the_same_english_row() {
+        assert_eq!(english("万蛇岛"), "Snake Isle");
+        assert_eq!(english("万蛇岛\u{3000}"), "Snake Isle"); // ideographic space
+        assert_eq!(english(" 万蛇岛 "), "Snake Isle");
+        assert_eq!(english("万蛇岛区"), "Snake Isle");
+        assert_eq!(english("(万蛇岛)"), "Snake Isle");
+        // A parenthetical that carries a number is a *different* place -- the
+        // client's own "instance 1/2/3" spelling -- so it must NOT fold onto
+        // the plain name. Guessing here would label three maps identically.
+        assert_eq!(english("万蛇岛\u{ff08}1\u{ff09}"), "万蛇岛（1）");
+        // Nor may a genuine name variant fold.
+        assert_eq!(english("万蛇岛二"), "万蛇岛二");
+        assert_eq!(english("不存在的岛"), "不存在的岛");
+    }
+
+    /// The fold must not merge two places the tables call distinct.
+    #[test]
+    fn folding_does_not_collide_two_real_zone_names() {
+        let mut seen = std::collections::HashMap::new();
+        for (zh, _) in ZONE_NAMES.iter().chain(INSTANCE_NAMES.iter()) {
+            let key = fold(zh);
+            if let Some(other) = seen.insert(key.clone(), *zh) {
+                assert_eq!(other, *zh, "{key:?} folds {other:?} and {zh:?} together");
+            }
         }
     }
 

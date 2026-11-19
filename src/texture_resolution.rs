@@ -160,7 +160,26 @@ fn litmodel_relative(path: &str) -> String {
 
 /// Canonical in-memory key for an EC-BSD ornament path. Cache identity stays
 /// stable across the different archive layouts used by client packs.
+///
+/// A path that already names a map partition keeps it. Collapsing
+/// `litmodels/a01/1/x.bmd` to `litmodels/world/1/x.bmd` throws away the only
+/// part of the path that distinguishes one instance's models from another's --
+/// the same relative name exists under every map -- and it made every
+/// non-mainland map resolve against `world`, where the entry is not.
 pub fn litmodel_key(path: &str) -> String {
+    let normalized = normalize(path);
+    let parts: Vec<&str> = normalized
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != "." && *part != "..")
+        .collect();
+    // `litmodels/<namespace>/...` is already canonical.
+    if parts.first() == Some(&"litmodels")
+        && parts
+            .get(1)
+            .is_some_and(|id| *id != "world" && safe_map_namespace(id).is_some())
+    {
+        return parts.join("/");
+    }
     format!("litmodels/world/{}", litmodel_relative(path))
 }
 
@@ -448,6 +467,36 @@ mod tests {
         let by_basename = litmodel_basename_index(&entry_names);
         (entry_names, by_basename)
     }
+    /// A path that already names a map partition must keep it. Collapsing it
+    /// to `world` is how a non-mainland map resolved every model against the
+    /// wrong namespace and drew nothing.
+    #[test]
+    fn an_explicit_map_partition_survives_canonicalisation() {
+        assert_eq!(
+            litmodel_key("litmodels/a01/1/litmodel_5.bmd"),
+            "litmodels/a01/1/litmodel_5.bmd"
+        );
+        assert_eq!(
+            litmodel_key("litmodels/a01/b/c/litmodel_5.bmd"),
+            "litmodels/a01/b/c/litmodel_5.bmd"
+        );
+        // The main world keeps its own spelling, and a bare EC-BSD reference
+        // has no partition to keep, so it still lands in `world`.
+        assert_eq!(
+            litmodel_key("litmodels/world/1/litmodel_5.bmd"),
+            "litmodels/world/1/litmodel_5.bmd"
+        );
+        assert_eq!(
+            litmodel_key("1/litmodel_5.bmd"),
+            "litmodels/world/1/litmodel_5.bmd"
+        );
+        // A component that is not a safe namespace is not treated as one.
+        assert_eq!(
+            litmodel_key("litmodels/.. /1/x.bmd"),
+            "litmodels/world/1/x.bmd"
+        );
+    }
+
     #[test]
     fn map_scoped_litmodel_lookup_uses_the_selected_map_namespace() {
         let (entry_names, by_basename) = scenery_index(&[
