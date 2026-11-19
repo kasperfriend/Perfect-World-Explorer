@@ -1442,6 +1442,10 @@ fn lighter_live_travel_csv() {
         "lighter-fixture 12 3\n0 -2.5 5 0 0 -0.7853982\n29 2.5 5 -4 0.2 -0.5\n",
     )
     .unwrap();
+    let motion = std::env::var_os("PW_TEST_LIGHTER_TRAVEL_MOTION").is_some();
+    if motion {
+        std::fs::write(root.0.join("motion-test"), []).unwrap();
+    }
     super::super::run_viewer(fixture(&root.0), Some(&root.0)).unwrap();
     let csv = std::fs::read_to_string(root.0.join("travel.csv")).unwrap();
     for header in [
@@ -1473,6 +1477,18 @@ fn lighter_live_travel_csv() {
         !root.0.join("0.png").exists(),
         "travel must not capture a screenshot"
     );
+    if motion {
+        assert!(csv.contains("# capture_policy=motion_readback\n"));
+        for i in 0..30 {
+            assert_world_png(
+                &root.0.join("motion").join(format!("{i:06}.png")),
+                (160, 96),
+            );
+        }
+    } else {
+        assert!(csv.contains("# capture_policy=normal_present\n"));
+        assert!(!root.0.join("motion").exists());
+    }
     if let Some(path) = std::env::var_os("PW_SAVE_LIGHTER_TRAVEL") {
         std::fs::copy(root.0.join("travel.csv"), path).unwrap();
     }

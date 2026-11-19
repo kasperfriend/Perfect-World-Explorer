@@ -6066,14 +6066,18 @@ fn run_viewer(
         lighter_travel::Travel::from_env(&current_map.id, adapter.get_info(), &renderer.device)?;
     #[cfg(test)]
     if let Some(dir) = smoke_travel {
-        travel = Some(lighter_travel::Travel::open(
+        let mut fixture = lighter_travel::Travel::open(
             dir.join("travel.plan"),
             dir.join("travel.csv"),
             &current_map.id,
             (LighterMode::Off, false),
             adapter.get_info(),
             &renderer.device,
-        )?);
+        )?;
+        if dir.join("motion-test").exists() {
+            fixture.enable_motion(dir.join("motion"))?;
+        }
+        travel = Some(fixture);
     }
     let mut keys = HashSet::new();
     let mut captured = false;
@@ -6105,6 +6109,7 @@ fn run_viewer(
     let mut run_error = None;
     let mut display_extent = (config.width, config.height);
     let mut frame_capture = readback::ViewerCapture::default();
+    let mut motion_capture = readback::Ring::default();
     #[cfg(test)]
     let mut smoke_frames = 0;
     #[cfg(test)]
@@ -8473,6 +8478,20 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     renderer.lighter.profile_presented(presented_at);
                                 }
                                 if let (Some(flight), Some(pose)) = (&mut travel, drawn_pose) {
+                                    if !flight.check_provider(renderer.lighter.reconstruction_status()) {
+                                        return;
+                                    }
+                                    if let Some(path) = flight.motion_frame() {
+                                        // Opt-in image evidence only. Unlike the ordinary travel trace,
+                                        // this waits for readback and must never be used to report FPS.
+                                        let source = render_scale.texture();
+                                        let captured = read_target_pixels(&renderer, &mut motion_capture, source)
+                                            .and_then(|bytes| readback::png_rgba(&path, source.width(), source.height(), &bytes));
+                                        if let Err(error) = captured {
+                                            flight.invalidate(&format!("motion frame {}: {error}", path.display()));
+                                            return;
+                                        }
+                                    }
                                     let mut chosen = renderer.lighter.settings.effective();
                                     let (trace_extent, experiments) = if ray_world {
                                         renderer.lighter.travel_trace()
@@ -8712,8 +8731,8 @@ pub(crate) fn wait_for_capture_callback<T>(
     })
 }
 
-/// Capture mode only. The live viewer never calls this wrapper; both paths
-/// use the same copy, mapping and row-padding handling.
+/// Explicit synchronized capture only, never the ordinary viewer/benchmark.
+/// The asynchronous screenshot path uses the same copy and row handling.
 fn read_target_pixels(
     renderer: &Renderer,
     ring: &mut readback::Ring<()>,

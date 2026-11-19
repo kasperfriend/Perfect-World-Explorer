@@ -1,5 +1,6 @@
 //! Opt-in, normal-present telemetry. A path advances only after a present on
-//! the explicitly requested route. There are no GPU waits or pixel readbacks.
+//! the explicitly requested route. The normal benchmark does not read pixels
+//! or add GPU waits; separate motion-analysis mode opts into readback.
 use crate::modules::lighter::{Mode, Settings};
 use sha2::{Digest, Sha256};
 use std::{io::Write, path::PathBuf, time::Instant};
@@ -189,6 +190,8 @@ pub(super) struct Travel {
     mode: Mode,
     hybrid: bool,
     adapter: wgpu::AdapterInfo,
+    expected_provider: &'static str,
+    motion_dir: Option<PathBuf>,
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     heap: Option<Heap>,
     warm: u32,
@@ -218,15 +221,30 @@ impl Travel {
             Ok("hardware") => (Mode::Hardware, false),
             _ => return Err("PW_LIGHTER_TRAVEL_ROUTE: off, software, hardware or hybrid".into()),
         };
-        Self::open(
+        let mut travel = Self::open(
             PathBuf::from(file),
             path,
             map,
             (mode, hybrid),
             adapter,
             device,
-        )
-        .map(Some)
+        )?;
+        travel.expected_provider =
+            match (mode, std::env::var("PW_RAY_RECONSTRUCTION").as_deref()) {
+                (Mode::Off, _) | (_, Ok("off" | "") | Err(std::env::VarError::NotPresent)) => {
+                    "portable"
+                }
+                (_, Ok("fsr")) if !hybrid => "Vulkan temporal FSR",
+                (_, Ok("rr")) if !hybrid => "Vulkan DLSS Ray Reconstruction",
+                _ => return Err(
+                    "invalid travel ray reconstruction request (SDKs require full primary rays)"
+                        .into(),
+                ),
+            };
+        if let Some(dir) = std::env::var_os("PW_LIGHTER_TRAVEL_CAPTURE_DIR") {
+            travel.enable_motion(PathBuf::from(dir))?;
+        }
+        Ok(Some(travel))
     }
 
     pub(super) fn open(
@@ -255,6 +273,8 @@ impl Travel {
             mode,
             hybrid,
             adapter,
+            expected_provider: "portable",
+            motion_dir: None,
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             heap: Heap::new(device),
             warm: 0,
@@ -263,6 +283,43 @@ impl Travel {
             setup: None,
             finished: false,
         })
+    }
+
+    pub(super) fn enable_motion(&mut self, dir: PathBuf) -> Result<(), String> {
+        if self.plan.samples() > 600 {
+            return Err("motion sequences are limited to 600 frames per run".into());
+        }
+        std::fs::create_dir_all(&dir).map_err(|e| format!("travel capture directory: {e}"))?;
+        if std::fs::read_dir(&dir)
+            .map_err(|e| e.to_string())?
+            .next()
+            .is_some()
+        {
+            return Err("travel capture directory must be empty".into());
+        }
+        self.motion_dir = Some(dir);
+        Ok(())
+    }
+
+    pub(super) fn motion_frame(&self) -> Option<PathBuf> {
+        if self.finished || self.warm < self.plan.warmup {
+            return None;
+        }
+        self.motion_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{:06}.png", self.samples.len())))
+    }
+
+    pub(super) fn check_provider(&mut self, active: Option<&str>) -> bool {
+        if active.unwrap_or("portable") != self.expected_provider {
+            self.invalidate(&format!(
+                "expected {}, got {}",
+                self.expected_provider,
+                active.unwrap_or("portable")
+            ));
+            return false;
+        }
+        true
     }
 
     pub fn apply(
@@ -386,6 +443,16 @@ impl Travel {
         );
         writeln!(out,"# schema=1\n# map={}\n# plan_sha256={}\n# hour={}\n# warmup={}\n# count={}\n# hybrid={}\n# adapter={:?}",
             self.plan.map,self.plan.hash,self.plan.hour,self.plan.warmup,self.samples.len(),self.hybrid,self.adapter)?;
+        writeln!(
+            out,
+            "# ray_reconstruction={}\n# capture_policy={}",
+            self.expected_provider,
+            if self.motion_dir.is_some() {
+                "motion_readback"
+            } else {
+                "normal_present"
+            }
+        )?;
         if let Some(s) = &self.setup {
             let [(w, h), (rw, rh), (tw, th)] = s.extents;
             writeln!(out,"# display={w}x{h}\n# world={rw}x{rh}\n# trace={tw}x{th}\n# present_mode={:?}\n# ray={:?}",s.present,s.ray)?;

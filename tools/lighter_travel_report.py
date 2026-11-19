@@ -41,6 +41,8 @@ def capture(path):
             meta[key] = value
         else:
             raise ValueError(f"{path}: no frame rows")
+    if meta.get("capture_policy", "normal_present") != "normal_present":
+        raise ValueError(f"{path}: a motion/readback trace is not a normal-present performance sample")
     if (meta.get("schema") != "1" or not 30 <= len(rows) <= 30_000 or int(meta["count"]) != len(rows)
             or [int(r["frame"]) for r in rows] != list(range(len(rows)))):
         raise ValueError(f"{path}: incomplete or unexpected travel schema")
