@@ -193,7 +193,9 @@ fn rotate(log_dir: &Path) -> io::Result<PathBuf> {
     }
 
     // Otherwise create a new file with a timestamp.
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     Ok(base.with_extension(format!("{ts}.log")))
 }
 
@@ -280,11 +282,19 @@ impl Logger {
                 if let Some(v) = &h.driver { line.push_str(&format!("  driver: {v}\n")); }
                 if let Some(v) = &h.vulkan_version { line.push_str(&format!("  vulkan: {v}\n")); }
                 if let Some(v) = h.heap_size_mb { line.push_str(&format!("  heap_mb: {v}\n")); }
-                if let Some(v) = &h.graphics_upscaler { line.push_str(&format!("  graphics_upscaler: {v}\n")); }
-                if let Some(v) = &h.graphics_frame_gen { line.push_str(&format!("  graphics_frame_gen: {v}\n")); }
+                if let Some(v) = &h.graphics_upscaler {
+                    line.push_str(&format!("  graphics_upscaler: {v}\n"));
+                }
+                if let Some(v) = &h.graphics_frame_gen {
+                    line.push_str(&format!("  graphics_frame_gen: {v}\n"));
+                }
                 line.push_str(&format!("  module_settings: {}\n", h.module_settings));
                 for (k, v) in &h.env_vars {
-                    let redacted = if contains_user_segment(v) { "[redacted]".to_string() } else { v.clone() };
+                    let redacted = if contains_user_segment(v) {
+                        "[redacted]".to_string()
+                    } else {
+                        v.clone()
+                    };
                     line.push_str(&format!("  env {k}: {redacted}\n"));
                 }
             }
@@ -306,7 +316,9 @@ impl Logger {
                 line.push_str(&format!("  ray_resolution: {}\n", f.ray_resolution));
                 line.push_str(&format!("  stage_ms: {:?}\n", f.stage_ms));
                 line.push_str(&format!("  cpu_frame_ms: {}\n", f.cpu_frame_ms));
-                if let Some(r) = &f.fallback_reason { line.push_str(&format!("  fallback: {r}\n")); }
+                if let Some(r) = &f.fallback_reason {
+                    line.push_str(&format!("  fallback: {r}\n"));
+                }
             }
             LogEntry::AccelStruct(a) => {
                 line.push_str("ACCEL_STRUCT\n");
@@ -324,12 +336,20 @@ impl Logger {
                 line.push_str(&format!("  failed: {}\n", c.failed));
                 if let Some(r) = &c.fail_reason { line.push_str(&format!("  fail_reason: {r}\n")); }
                 line.push_str(&format!("  mip_fallbacks: {}\n", c.mip_fallbacks));
-                for t in &c.unavailable_textures { line.push_str(&format!("  unavailable_texture: {t}\n")); }
+                for t in &c.unavailable_textures {
+                    line.push_str(&format!("  unavailable_texture: {t}\n"));
+                }
             }
             LogEntry::Memory(m) => {
                 line.push_str("MEMORY\n");
-                line.push_str(&format!("  lighter_allocation_total: {}\n", m.lighter_allocation_total));
-                line.push_str(&format!("  driver_device_local_bytes: {}\n", m.driver_device_local_bytes));
+                line.push_str(&format!(
+                    "  lighter_allocation_total: {}\n",
+                    m.lighter_allocation_total
+                ));
+                line.push_str(&format!(
+                    "  driver_device_local_bytes: {}\n",
+                    m.driver_device_local_bytes
+                ));
             }
             LogEntry::Error(e) => {
                 line.push_str("ERROR\n");
