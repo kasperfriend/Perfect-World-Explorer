@@ -162,7 +162,11 @@ fn rotate(log_dir: &Path) -> io::Result<PathBuf> {
     if let Ok(entries) = fs::read_dir(log_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.file_name().and_then(|n| n.to_str()).map_or(false, |n| n.starts_with("lighter")) {
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map_or(false, |n| n.starts_with("lighter"))
+            {
                 if let Ok(meta) = entry.metadata() {
                     if let Ok(modified) = meta.modified() {
                         if let Ok(epoch) = modified.duration_since(UNIX_EPOCH) {
