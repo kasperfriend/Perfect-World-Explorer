@@ -266,3 +266,45 @@ as "unmeasurable" — accurate about the pack and false about the format. The
 tile-edge mistake above is the same shape from the other direction: one file
 measured, generalised to all. A survey answers the question it was pointed at,
 so the register now records *where* each measurement was taken.
+
+## The `.pck` containers measured across three clients (18 November)
+
+A report of "unsupported PCK safe header" on 1.8.4 and a 1.5.2 client with no
+buildings sent this back to the files. Three packs were read directly:
+
+| client | pack | revision | trailer | guard pair | tag word | entries |
+| --- | --- | --- | --- | --- | --- | ---: |
+| 1.5.2 | `configs.pck` | `0x00020002` | 280 | `a508bdc4`/`853567c8` | `56a089b7` | 67 |
+| 1.5.2 | `grasses.pck` | `0x00020002` | 280 | `a508bdc4`/`853567c8` | `56a089b7` | 103 |
+| 1.8.4 | `configs.pck` | `0x00020003` | 288 | `fdfdfeee`/`f00dbeef` | **0** | 1,057 |
+
+**The guard pair is the interesting one, because removing it was my own doing.**
+Item 76 consolidated `angelica_pck`'s guard constants into `pck`'s on the stated
+grounds that "`0xa508bdc4` / `0x853567c8` appears in no staged archive". It does
+— it is what *every* 1.5.2 archive carries. The claim was a statement about what
+had been looked at, made in the voice of a statement about the format, and it
+refused the whole client. Both pairs are now named constants with the archive
+each was measured on.
+
+Two further offsets also move with the revision, and each was a separate
+refusal:
+
+| | `0x00020002` | `0x00020003` |
+| --- | --- | --- |
+| trailer bytes | 280 | 288 |
+| record bytes | 276 | 288 |
+| offset field | `+260`, 32-bit | `+264`, **64-bit** |
+| `dwFlags` | `+12` | **`+16`** |
+
+The `dwFlags` row is the one that would have been a false encryption report
+rather than a refusal: reading `+12` on a `0x00020003` pack yields
+`0xffffffff`, the first bytes of `szDescription`. `tools/pck_lib.py` had exactly
+that bug, so every 1.8.4 package would have been censused as *enciphered*.
+
+### What this says about the earlier registers
+
+Two claims in `Findings/PART-3-survey-relax-2026-11-18.md` rested on the same
+error and are corrected there: the EC-BSD "unmeasurable" note and this guard
+pair. Both were produced by looking in one place and writing down a fact about
+the format. That is now the third instance in this file, which is why each row
+records where the measurement was taken.
