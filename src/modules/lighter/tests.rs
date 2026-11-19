@@ -68,7 +68,8 @@ fn naga_validates_both_paths_and_emits_native_ray_queries() {
     for src in [
         trace_source(SOFTWARE, false, false),
         trace_source(SOFTWARE, true, true),
-        [PIXELS, EASU, PRESENT].concat(),
+        [PIXELS, EASU, PRESENT, PRESENT_PORTABLE].concat(),
+        [PIXELS, EASU, PRESENT, PRESENT_TEMPORAL].concat(),
         [EASU, include_str!("../../fsr1.wgsl")].concat(),
         [PIXELS, post::SHADER].concat(),
     ] {
@@ -241,17 +242,36 @@ fn put(b: &mut Builder, mesh: u32) {
     b.place(mesh, Transform::IDENTITY).unwrap();
 }
 
-struct Harness {
-    ray: Lighter,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+pub(super) struct Harness {
+    pub ray: Lighter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
 }
 impl Harness {
-    fn new(mode: Mode, cpu_query: bool) -> Self {
+    pub(super) fn new(mode: Mode, cpu_query: bool) -> Self {
+        Self::with_device(mode, cpu_query, |adapter, desc| {
+            pollster::block_on(adapter.request_device(desc, None)).unwrap()
+        })
+    }
+
+    pub(super) fn with_device(
+        mode: Mode,
+        cpu_query: bool,
+        open: impl FnOnce(&wgpu::Adapter, &wgpu::DeviceDescriptor<'_>) -> (wgpu::Device, wgpu::Queue),
+    ) -> Self {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..Default::default()
         });
+        Self::on_instance(&instance, mode, cpu_query, open)
+    }
+
+    pub(super) fn on_instance(
+        instance: &wgpu::Instance,
+        mode: Mode,
+        cpu_query: bool,
+        open: impl FnOnce(&wgpu::Adapter, &wgpu::DeviceDescriptor<'_>) -> (wgpu::Device, wgpu::Queue),
+    ) -> Self {
         let adapter = if mode == Mode::Hardware && !cpu_query {
             instance
                 .enumerate_adapters(wgpu::Backends::VULKAN)
@@ -279,7 +299,8 @@ impl Harness {
         };
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         let features = device_features(&adapter, mode);
-        let (device, queue) = pollster::block_on(adapter.request_device(
+        let (device, queue) = open(
+            &adapter,
             &wgpu::DeviceDescriptor {
                 label: Some("Lighter test device"),
                 required_features: features
@@ -288,9 +309,7 @@ impl Harness {
                             | wgpu::Features::TEXTURE_COMPRESSION_BC)),
                 required_limits: wgpu::Limits::downlevel_defaults(),
             },
-            None,
-        ))
-        .unwrap();
+        );
         let mut ray = Lighter::new(
             Settings {
                 mode,
@@ -322,6 +341,15 @@ impl Harness {
     }
 
     fn pixels(&mut self, frame: Frame, moving: &Packet) -> Vec<([u8; 4], f32)> {
+        self.pixels_with_camera(frame, moving, None)
+    }
+
+    pub(super) fn pixels_with_camera(
+        &mut self,
+        frame: Frame,
+        moving: &Packet,
+        camera: Option<TemporalCamera>,
+    ) -> Vec<([u8; 4], f32)> {
         let e = frame.extent[2];
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let extent = wgpu::Extent3d {
@@ -351,6 +379,7 @@ impl Harness {
                 format,
                 frame,
                 moving,
+                camera,
             )
         };
         if !render().unwrap() {
@@ -3852,7 +3881,8 @@ fn exercise_chunk_scaling(h: &mut Harness) {
                     &depth,
                     format,
                     frame,
-                    &empty
+                    &empty,
+                    None,
                 )
                 .unwrap());
             let submitted = h.queue.submit(Some(encoder.finish()));

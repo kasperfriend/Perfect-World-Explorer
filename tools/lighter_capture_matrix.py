@@ -109,6 +109,8 @@ def capture_metadata(stem, mode, case, profile):
             or (meta["rain_at_eye"] == "true") != (case["condition"] == "rain")
             or (meta["lightmaps"] == "true") != case["lightmaps"]):
         raise ValueError(f"{stem.name}: capture doesn't match the case")
+    if meta.get("ray_reconstruction", "portable") != "portable":
+        raise ValueError(f"{stem.name}: matrix requires portable ray reconstruction")
     adapter = meta["adapter"]
     device = re.search(r"device_type: (\w+)", adapter)
     if not device or "backend: Vulkan" not in adapter:
@@ -189,7 +191,8 @@ def run_case(case, args):
         stem = args.output / f"{name}-{variant}"
         hour, weather = CONDITIONS[case["condition"]]
         env = {k: v for k, v in os.environ.items() if not k.startswith("PW_PREVIEW_")}
-        for key in ("PW_TEST_NO_LIGHTMAPS", "PW_RAY_COMPACT_TERRAIN", "PW_RAY_BC_TEXTURES", "PW_RAY_SCREEN_REUSE"):
+        for key in ("PW_TEST_NO_LIGHTMAPS", "PW_RAY_COMPACT_TERRAIN", "PW_RAY_BC_TEXTURES",
+                    "PW_RAY_SCREEN_REUSE", "PW_RAY_RECONSTRUCTION"):
             env.pop(key, None)
         env.update(WGPU_BACKEND="vulkan", PW_PREVIEW_COVERAGE="1", PW_PREVIEW_LIGHTER=mode,
                    PW_PREVIEW_RAY_RESOLUTION=str(args.ray_resolution), PW_PREVIEW_ANISOTROPY="8",

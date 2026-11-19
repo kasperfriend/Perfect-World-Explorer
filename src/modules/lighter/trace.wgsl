@@ -1479,6 +1479,7 @@ fn transport(first: Ray, primary: Hit, raster: bool, seed: ptr<function,u32>) ->
                     color = project_decals(s,p,ray,hit.t,color);
                     break;
                 }
+                if path.depth==1u && branch==0u { temporal_specular_block(); }
                 // Coplanar cards blend in decreasing draw-layer order. The
                 // two triangles of a card share a key, so diagonals draw once.
                 after = layer_key(hit);
@@ -1502,6 +1503,7 @@ fn transport(first: Ray, primary: Hit, raster: bool, seed: ptr<function,u32>) ->
                     path.weight *= blend.carried;
                 }
             }
+            if path.depth==1u && branch==0u { temporal_specular_hit(ray,solid); }
             if solid.instance==NIL {
                 // No exit surface was found within the streamed world.
                 if path.medium==OPEN_WATER { result += path.weight*frame.water_color.rgb; }
@@ -1522,6 +1524,7 @@ fn transport(first: Ray, primary: Hit, raster: bool, seed: ptr<function,u32>) ->
                 let clip = frame.vp*vec4<f32>(p,1.);
                 depth = max(depth,clamp(clip.z/clip.w,0.,1.));
                 guide = primary_guide(clip,s);
+                temporal_primary(s,solid,ray,p,medium.body);
                 let m = (solid.instance & DYNAMIC)!=0u;
                 owner = (hash(solid.instance ^ hash(material_addr(m,solid.primitive))) & OWNER_MASK) | 1u;
             }
@@ -1622,6 +1625,7 @@ fn transport(first: Ray, primary: Hit, raster: bool, seed: ptr<function,u32>) ->
                 path.ray = secondary(p,e.dir,s.face,ray,solid.t);
                 path.weight *= e.weight;
                 if reference() { path.previous = vec4<f32>(p,e.pdf); }
+                if path.depth==0u { temporal_specular_leg(e.specular); }
                 if path.purpose!=WATER_REFLECT && path.purpose!=WATER_TRANSMIT { path.purpose = DIFFUSE; }
                 path.depth++;
                 continue;
@@ -1659,6 +1663,7 @@ fn transport(first: Ray, primary: Hit, raster: bool, seed: ptr<function,u32>) ->
                 }
                 path.ray = secondary(p,d,s.face,ray,solid.t);
                 path.weight *= s.specular*total;
+                if path.depth==1u { temporal_specular_leg(true); }
                 if path.purpose!=WATER_REFLECT && path.purpose!=WATER_TRANSMIT { path.purpose = SPECULAR; }
             } else {
                 let d = hemisphere(s.n,seed);
@@ -1700,6 +1705,7 @@ fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool) {
     sun_cache_write = 0u;
     let at = id.y*frame.extent.x+id.x;
     screen_begin(at);
+    temporal_begin();
     if frame.sampling.z!=0u { sun_cache_read = image[at].albedo_history & SUN_CACHE; }
     var total = vec3<f32>(0.);
     var depth = 0.;
@@ -1725,6 +1731,7 @@ fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool) {
     var pixel = pack_pixel(total/f32(frame.options.z),depth,guide,owner|select(0u,DEP_MOVING,motion_dependent));
     pixel.albedo_history |= sun_cache_write;
     image[at] = pixel;
+    temporal_end(at);
     screen_end();
 }
 

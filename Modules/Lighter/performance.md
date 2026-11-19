@@ -331,14 +331,12 @@ any of these changes by default (other than the one-sample water guard).
 - The moving tests below expose a variance and cost trade-off, not a win.
   Inspect DI variance and GI bias, especially under fast flight, animation,
   and corner disocclusion on real maps before enabling the caches by default.
-- Integrate and validate temporal FSR and DLSS Ray Reconstruction. The
-  installed FidelityFX SDK binaries are DX12. NVIDIA's upstream
-  [DLSS v310.9.16 SDK](https://github.com/NVIDIA/DLSS/tree/v310.9.16/lib)
-  has Windows x86-64 and Linux x86-64 RR runtime binaries; Explorer's package
-  does **not** ship them or a Vulkan NGX RR integration. Adding a DLL is not
-  enough: adapter/device extension negotiation, coherent material/depth and
-  ray-world motion, correct texture layouts/queue ownership, SDK and driver
-  gating, and physical output/fallback tests are required.
+- The opt-in [Vulkan temporal FSR and DLSS Ray Reconstruction
+  experiment](temporal-reconstruction.md) exports ray-world motion, depth and
+  material guides and records SDK work on the same queue. SDK setup, extension
+  and version checks, and portable fallback are separate from Native DX12.
+  Actual provider dispatch, moving/material quality, and physical timings
+  remain unverified. No DLSSD or Vulkan FFX binaries are shipped with Explorer.
 - Keep Hybrid off until a repeatable raster-inclusive improvement is shown.
   [RT-17](retail-matrix.md) remains open: complete real-map image review,
   matched physical GPU modes and normal-present distributions/whole-viewer

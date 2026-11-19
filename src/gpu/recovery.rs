@@ -82,7 +82,7 @@ impl Loss {
     }
 }
 
-pub(super) fn lost_error(message: &str) -> bool {
+pub(crate) fn lost_error(message: &str) -> bool {
     message.contains("ERROR_DEVICE_LOST") || message.contains("Parent device is lost")
 }
 

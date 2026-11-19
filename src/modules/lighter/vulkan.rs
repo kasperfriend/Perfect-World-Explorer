@@ -1036,6 +1036,7 @@ impl Renderer {
         compact: bool,
         reuse: bool,
         pages: Option<&Arc<super::textures::bc_pages::Pages>>,
+        temporal: bool,
     ) -> R<Self> {
         let ctx = Context::new(device)?;
         let mut bc_pages = pages
@@ -1057,6 +1058,7 @@ impl Renderer {
                 } else {
                     ""
                 },
+                temporal,
             );
             let core = Core::new(ctx.clone(), &shader(&source)?, bc)?;
             Ok((source, core))

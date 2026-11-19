@@ -995,8 +995,9 @@ fn moving(
     cache: &mut AccelCache,
     absences: Counts,
     settings: lighter::Settings,
+    track_motion: bool,
 ) -> Result<(Packet, Inventory), String> {
-    let mut out = lighter::model_feed::Moving::for_mode(textures, settings.mode);
+    let mut out = lighter::model_feed::Moving::for_mode(textures, settings.mode, track_motion);
     out.coverage[Class::WorldModels] = absences;
     if let Some(models) = models {
         let (geometry, effects, dynamic, read) = models.ray_sources();
@@ -1162,6 +1163,7 @@ impl super::Renderer {
                 h,
                 self.lighter.settings.regional_lighting,
             );
+            let track_motion = self.lighter.reconstruction_requested();
             let world = self
                 .lighter
                 .world
@@ -1179,6 +1181,7 @@ impl super::Renderer {
                 &mut self.lighter.moving_accel,
                 self.ray_model_absences,
                 self.lighter.settings,
+                track_motion,
             )?;
             let rendered = self.lighter.render(
                 &self.device,
@@ -1189,6 +1192,16 @@ impl super::Renderer {
                 self.scene_format,
                 lights,
                 &moving,
+                track_motion.then(|| lighter::TemporalCamera {
+                    view: camera.view_matrix(),
+                    projection: camera.projection_matrix(w, h, camera.far),
+                    lens: camera.lens(),
+                    frame_ms: if camera.logic_delta_ms == 0 {
+                        1000. / 60.
+                    } else {
+                        camera.logic_delta_ms as f32
+                    },
+                }),
             )?;
             if rendered {
                 self.lighter.moving_coverage = coverage;

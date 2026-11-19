@@ -11,6 +11,7 @@ use crate::{
     model_asset::{FaceShader, ModelAsset, PosedMesh},
     skeleton_pose::{self, Pose},
 };
+use sha2::{Digest, Sha256};
 
 pub(crate) type Decode<'a> = dyn FnMut(&str) -> Result<(Vec<image::RgbaImage>, bool), String> + 'a;
 
@@ -29,21 +30,27 @@ pub(crate) struct Moving<'a> {
     effects: Mesh,
     textures: &'a mut Textures,
     layer: u32,
+    track_motion: bool,
 }
 
 impl<'a> Moving<'a> {
     #[cfg(test)]
     pub fn new(textures: &'a mut Textures) -> Self {
-        Self::for_mode(textures, super::Mode::Software)
+        Self::for_mode(textures, super::Mode::Software, false)
     }
 
-    pub(crate) fn for_mode(textures: &'a mut Textures, mode: super::Mode) -> Self {
+    pub(crate) fn for_mode(
+        textures: &'a mut Textures,
+        mode: super::Mode,
+        track_motion: bool,
+    ) -> Self {
         Self {
             builder: Builder::for_mode(mode),
             coverage: Inventory::default(),
             effects: Mesh::default(),
             textures,
             layer: 0,
+            track_motion,
         }
     }
 
@@ -83,7 +90,19 @@ impl<'a> Moving<'a> {
         // An authored zero-scale/singular bone can collapse its skin. Do
         // not invent an inverse: leave that part in the evaluated world mesh.
         let parent = attached.then(|| Attachment::new(pose.model)).flatten();
+        let mut pose_draw = self.track_motion.then(Sha256::new);
         for part in prepared {
+            let draw = self.track_motion.then(|| {
+                // Protect against a different skin occupying the same slot
+                // with the same index count. Never match by packing order.
+                let skin_path = &asset.skins[part.skin].path;
+                let mut draw = Sha256::new();
+                draw.update((skin_path.len() as u64).to_le_bytes());
+                draw.update(skin_path.as_bytes());
+                draw.update((part.skin as u64).to_le_bytes());
+                draw.update((part.mesh as u64).to_le_bytes());
+                draw
+            });
             // Match MTL_SCALED: the mesh override scales each coefficient,
             // not just the directional term. Dedicated face stages get white.
             let tint = argb_to_rgba(part.color)
@@ -197,8 +216,20 @@ impl<'a> Moving<'a> {
                         .map(|v| Vertex::new(v.position, v.normal, v.uv).tint(tint, tint)),
                 );
                 append_triangles(&mut child, &part.indices, 0, id);
+                let before = self.builder.placement_count();
                 self.builder.rigid_part(&child, placement)?;
+                if let Some(mut draw) = draw {
+                    draw.update(b"rigid");
+                    draw.update(source.rigid_bone.unwrap().to_le_bytes());
+                    self.builder.tag_motion(
+                        before,
+                        MotionOwner(namespace, owner, draw.finalize().into()),
+                    );
+                }
                 continue;
+            }
+            if let Some((combined, draw)) = pose_draw.as_mut().zip(draw) {
+                combined.update(draw.finalize());
             }
             let base = geometry.vertices.len() as u32;
             geometry.vertices.extend(part.vertices.iter().map(|v| {
@@ -209,8 +240,15 @@ impl<'a> Moving<'a> {
             }));
             append_triangles(&mut geometry, &part.indices, base, id);
         }
+        let before = self.builder.placement_count();
         self.builder
             .posed_mesh(namespace, owner, &geometry, parent)?;
+        if let Some(draw) = pose_draw {
+            self.builder.tag_motion(
+                before,
+                MotionOwner(namespace, owner, draw.finalize().into()),
+            );
+        }
         counts.loaded += 1;
         Ok(())
     }

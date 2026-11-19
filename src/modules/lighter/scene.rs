@@ -439,7 +439,6 @@ impl Attachment {
         }
     }
 
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn rows(self) -> [f32; 12] {
         let a = self.forward.transpose();
         std::array::from_fn(|i| match (i / 4, i % 4) {
@@ -497,6 +496,11 @@ pub enum MeshKey {
     Posed(&'static str, u64, Fingerprint),
     RigidPart(Fingerprint),
 }
+
+/// Identity of one draw, not a mesh or the instance index in a packed frame.
+/// Identical rigid parts can share a BLAS without sharing motion history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct MotionOwner(pub &'static str, pub u64, pub Fingerprint);
 
 pub struct MeshRange {
     pub vertex: Range<u32>,
@@ -617,6 +621,7 @@ pub struct Builder {
     material_map: std::collections::HashMap<Surface, u32>,
     meshes: Vec<MeshRange>,
     instances: Vec<Instance>,
+    motion: Vec<(u32, MotionOwner)>,
     attachments: Vec<Attachment>,
     lights: Vec<Light>,
     projectors: Vec<Projector>,
@@ -1156,7 +1161,10 @@ impl Builder {
         id: u64,
         mesh: &Mesh,
     ) -> Result<(), String> {
-        self.posed_mesh(namespace, id, mesh, None)
+        let before = self.instances.len();
+        self.posed_mesh(namespace, id, mesh, None)?;
+        self.tag_motion(before, MotionOwner(namespace, id, [0; 32]));
+        Ok(())
     }
 
     pub(super) fn posed_mesh(
@@ -1194,6 +1202,17 @@ impl Builder {
             id
         };
         self.place_model(id, Some(placement))
+    }
+
+    pub(super) fn placement_count(&self) -> usize {
+        self.instances.len()
+    }
+
+    // A degenerate/empty draw may not have emitted an instance.
+    pub(super) fn tag_motion(&mut self, before: usize, owner: MotionOwner) {
+        if self.instances.len() == before + 1 {
+            self.motion.push((before as u32, owner));
+        }
     }
 
     fn place_model(&mut self, mesh: u32, placement: Option<Attachment>) -> Result<(), String> {
@@ -1350,8 +1369,8 @@ impl Builder {
             words,
             meshes: self.meshes,
             instances: self.instances,
-            #[cfg(any(target_os = "windows", target_os = "linux"))]
             attachments: self.attachments,
+            motion: self.motion,
             triangle_count: self.triangles.len(),
             hardware_only: self.hardware_only,
         }
@@ -1362,8 +1381,8 @@ pub struct Packet {
     pub words: Vec<u32>,
     pub meshes: Vec<MeshRange>,
     pub instances: Vec<Instance>,
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
     attachments: Vec<Attachment>,
+    pub(super) motion: Vec<(u32, MotionOwner)>,
     triangle_count: usize,
     pub(super) hardware_only: bool,
 }
@@ -1371,21 +1390,33 @@ pub struct Packet {
 // Geometry-only changes can keep history at pixels which never sampled any
 // moving geometry. A light or projected decal can change a fixed receiver
 // even without a moving-triangle hit, so compare their real serialized spans.
-pub(super) fn same_moving_lighting(old: &[u32], new: &[u32]) -> bool {
-    fn span(words: &[u32], header: usize, stride: usize) -> Option<&[u32]> {
+fn light_decal_spans(words: &[u32]) -> [Option<&[u32]>; 2] {
+    let span = |header: usize, stride: usize| {
         let start = *words.get(header)? as usize;
         let count = *words.get(header + 1)? as usize;
         words.get(start..start.checked_add(count.checked_mul(stride)?)?)
-    }
-    [(9, LIGHT_WORDS), (14, 22)]
+    };
+    [span(9, LIGHT_WORDS), span(14, 22)]
+}
+
+pub(super) fn same_moving_lighting(old: &[u32], new: &[u32]) -> bool {
+    light_decal_spans(old)
         .into_iter()
-        .all(|(header, stride)| {
-            span(old, header, stride).is_some_and(|a| span(new, header, stride) == Some(a))
-        })
+        .zip(light_decal_spans(new))
+        .all(|(a, b)| a.is_some() && a == b)
+}
+
+pub(super) fn moving_lighting_key(packet: &Packet) -> Fingerprint {
+    let mut hash = Sha256::new();
+    for span in light_decal_spans(&packet.words) {
+        let words = span.unwrap_or_default();
+        hash.update((words.len() as u64).to_le_bytes());
+        hash.update(bytemuck::cast_slice::<u32, u8>(words));
+    }
+    hash.finalize().into()
 }
 
 impl Packet {
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
     pub(super) fn placement_rows(&self, instance: &Instance) -> [f32; 12] {
         instance.attachment.map_or_else(
             || instance.transform.rows(),

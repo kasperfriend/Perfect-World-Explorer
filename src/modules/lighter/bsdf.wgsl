@@ -4,7 +4,7 @@
 const BSDF_PI: f32 = 3.141592653589793;
 struct Bsdf { diffuse: vec3<f32>, f0: vec3<f32>, alpha: f32 }
 struct BsdfEval { f: vec3<f32>, pdf: f32 }
-struct BsdfSample { dir: vec3<f32>, weight: vec3<f32>, pdf: f32 }
+struct BsdfSample { dir: vec3<f32>, weight: vec3<f32>, pdf: f32, specular: bool }
 struct Optics { transmitted: vec3<f32>, fresnel: f32 }
 
 fn fresnel_rgb(f0: vec3<f32>, cosine: f32) -> vec3<f32> {
@@ -69,7 +69,8 @@ fn ggx_visible_normal(v: vec3<f32>, alpha: f32, u: vec2<f32>) -> vec3<f32> {
 fn bsdf_sample(b: Bsdf, n: vec3<f32>, wo: vec3<f32>, u: vec3<f32>) -> BsdfSample {
     let basis = bsdf_basis(n);
     var wi: vec3<f32>;
-    if u.x<ggx_probability(b,clamp(dot(n,wo),0.,1.)) {
+    let specular = u.x<ggx_probability(b,clamp(dot(n,wo),0.,1.));
+    if specular {
         let h = basis*ggx_visible_normal(transpose(basis)*wo,b.alpha,u.yz);
         wi = reflect(-wo,h);
     } else {
@@ -78,6 +79,6 @@ fn bsdf_sample(b: Bsdf, n: vec3<f32>, wo: vec3<f32>, u: vec3<f32>) -> BsdfSample
         wi = basis*vec3<f32>(r*cos(phi),r*sin(phi),sqrt(1.-u.y));
     }
     let e = bsdf_eval(b,n,wo,wi);
-    if e.pdf<=0. { return BsdfSample(wi,vec3<f32>(0.),0.); }
-    return BsdfSample(wi,e.f*(max(dot(n,wi),0.)/e.pdf),e.pdf);
+    if e.pdf<=0. { return BsdfSample(wi,vec3<f32>(0.),0.,specular); }
+    return BsdfSample(wi,e.f*(max(dot(n,wi),0.)/e.pdf),e.pdf,specular);
 }

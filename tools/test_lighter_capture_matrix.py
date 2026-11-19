@@ -76,6 +76,10 @@ class CaptureMatrixTests(unittest.TestCase):
             paper = sidecar.read_text(encoding="utf-8").replace("Cpu", "DiscreteGpu")
             sidecar.write_text(paper, encoding="utf-8")
             matrix.capture_metadata(stem, "hardware", case, "physical")
+            sidecar.write_text(paper + "ray_reconstruction=Vulkan DLSS Ray Reconstruction\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "requires portable ray reconstruction"):
+                matrix.capture_metadata(stem, "hardware", case, "physical")
+            sidecar.write_text(paper, encoding="utf-8")
             image.putpixel((3, 2), (255, 0, 0, 255))
             image.save(path)
             with self.assertRaisesRegex(ValueError, "RGBA8 hash disagrees"):

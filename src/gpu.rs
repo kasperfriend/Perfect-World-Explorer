@@ -20,6 +20,8 @@ pub(crate) use lighter_host::tests::{
     fine_far_terrain_scene, joined_bmd_packets, ray_test_wet_grid, stitched_terrain_scene,
     streamed_bmd_scenes,
 };
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub(crate) use recovery::lost_error as reconstruction_device_lost;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
@@ -3883,6 +3885,9 @@ impl Renderer {
         reset_history: bool,
     ) -> bool {
         let ray_world = self.renders_rays();
+        if !ray_world {
+            self.lighter.reset_reconstruction();
+        }
         // Where this frame's CPU time goes, stage by stage. One line a second on
         // the `TimingFrame` channel; see `FrameBudget`.
         let mut stage_ms = [0f64; STAGE_COUNT];
@@ -5218,6 +5223,7 @@ fn instance_backends(lighter: LighterMode) -> wgpu::Backends {
     }
 }
 
+#[cfg(test)]
 fn make_instance(lighter: LighterMode) -> wgpu::Instance {
     wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: instance_backends(lighter),
@@ -5225,10 +5231,21 @@ fn make_instance(lighter: LighterMode) -> wgpu::Instance {
     })
 }
 
+#[cfg(test)]
 async fn adapter(
     instance: &wgpu::Instance,
     surface: Option<&wgpu::Surface<'_>>,
     lighter: LighterMode,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
+    let mut ordinary = crate::modules::lighter::reconstruction::Startup::new(LighterMode::Off);
+    open_adapter(instance, surface, lighter, &mut ordinary).await
+}
+
+async fn open_adapter(
+    instance: &wgpu::Instance,
+    surface: Option<&wgpu::Surface<'_>>,
+    lighter: LighterMode,
+    reconstruction: &mut crate::modules::lighter::reconstruction::Startup,
 ) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
     let a = if let Ok(name) = std::env::var("WGPU_ADAPTER_NAME") {
         let query = name.to_lowercase();
@@ -5288,6 +5305,9 @@ async fn adapter(
         required_features,
         required_limits: limits.clone(),
     };
+    if let Some((d, q)) = reconstruction.device(&a, &request(native | rt)) {
+        return Ok((a, d, q));
+    }
     let (d, q) = match a.request_device(&request(native | rt), None).await {
         Ok(device) => device,
         Err(error) if !rt.is_empty() => {
@@ -5440,11 +5460,18 @@ fn run_viewer(
             saved_lighter.mode.label()
         ));
     }
-    let try_surface = |instance: &wgpu::Instance| {
+    let mut reconstruction =
+        crate::modules::lighter::reconstruction::Startup::new(lighter_settings.mode);
+    let try_surface = |instance: &wgpu::Instance, reconstruction: &mut _| {
         let surface = instance
             .create_surface(window.clone())
             .map_err(|e| e.to_string())?;
-        let gpu = pollster::block_on(adapter(instance, Some(&surface), lighter_settings.mode))?;
+        let gpu = pollster::block_on(open_adapter(
+            instance,
+            Some(&surface),
+            lighter_settings.mode,
+            reconstruction,
+        ))?;
         Ok::<_, String>((surface, gpu))
     };
     startup_progress(&format!(
@@ -5452,11 +5479,9 @@ fn run_viewer(
         current_map.id,
         lighter_settings.mode.label()
     ));
-    let mut instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: viewer_backends(lighter_settings.mode),
-        ..Default::default()
-    });
-    let (mut surface, (adapter, device, queue)) = match try_surface(&instance) {
+    let mut instance = reconstruction.instance(viewer_backends(lighter_settings.mode));
+    let (mut surface, (adapter, device, queue)) = match try_surface(&instance, &mut reconstruction)
+    {
         Ok(startup) => startup,
         Err(error) if std::env::var_os("WGPU_BACKEND").is_none() => {
             let fallback = if cfg!(windows) && lighter_settings.mode == LighterMode::Software {
@@ -5471,7 +5496,8 @@ fn run_viewer(
                 backends: fallback,
                 ..Default::default()
             });
-            try_surface(&instance)?
+            reconstruction.disable(&error);
+            try_surface(&instance, &mut reconstruction)?
         }
         Err(error) => return Err(error),
     };
@@ -5575,6 +5601,7 @@ fn run_viewer(
     // The whole-world preload has not started either, so the local scenery is
     // part of this first mesh (`skip_local_scenery: false`).
     let mut lighter = Lighter::new(lighter_settings, &adapter, &device);
+    reconstruction.install(&mut lighter, &device);
     let saved_mode = if saved_lighter.mode == LighterMode::Off
         && restoring
             .as_ref()
@@ -8664,8 +8691,14 @@ fn preview_frame(
 type PreviewDevice = (wgpu::AdapterInfo, wgpu::Device, wgpu::Queue, Lighter);
 
 fn preview_device(settings: LighterSettings) -> Result<PreviewDevice, String> {
-    let mut instance = make_instance(settings.mode);
-    let mut result = pollster::block_on(adapter(&instance, None, settings.mode));
+    let mut reconstruction = crate::modules::lighter::reconstruction::Startup::new(settings.mode);
+    let mut instance = reconstruction.instance(instance_backends(settings.mode));
+    let mut result = pollster::block_on(open_adapter(
+        &instance,
+        None,
+        settings.mode,
+        &mut reconstruction,
+    ));
     if let Err(error) = &result {
         if std::env::var_os("WGPU_BACKEND").is_none() {
             eprintln!("Perfect World Explorer preview: no D3D12 adapter ({error}); falling back to all backends");
@@ -8673,11 +8706,18 @@ fn preview_device(settings: LighterSettings) -> Result<PreviewDevice, String> {
                 backends: wgpu::Backends::all(),
                 ..Default::default()
             });
-            result = pollster::block_on(adapter(&instance, None, settings.mode));
+            reconstruction.disable(error);
+            result = pollster::block_on(open_adapter(
+                &instance,
+                None,
+                settings.mode,
+                &mut reconstruction,
+            ));
         }
     }
     let (adapter, device, queue) = result?;
-    let lighter = Lighter::new(settings, &adapter, &device).for_capture();
+    let mut lighter = Lighter::new(settings, &adapter, &device).for_capture();
+    reconstruction.install(&mut lighter, &device);
     Ok((adapter.get_info(), device, queue, lighter))
 }
 
@@ -9140,9 +9180,13 @@ fn preview_frame_using(
         // These describe the saved PNG, not the later instrumented draws.
         writeln!(
             meta,
-            "raster_primary={}\nscreen_reuse_flags={}",
+            "raster_primary={}\nscreen_reuse_flags={}\nray_reconstruction={}",
             renderer.lighter.raster_active(),
-            renderer.lighter.screen_reuse_flags()
+            renderer.lighter.screen_reuse_flags(),
+            renderer
+                .lighter
+                .reconstruction_status()
+                .unwrap_or("portable")
         )
         .unwrap();
         // Capture timing is optional and is deliberately distinct from GPU

@@ -28,6 +28,7 @@ egui-wgpu = { version = "0.27", default-features = false }
 # The viewer keeps wgpu 0.19.
 [target.'cfg(any(target_os = "windows", target_os = "linux"))'.dependencies]
 ash = "0.37.3"
+libloading = "0.8.9"
 naga-rt = { package = "naga", version = "26.0.0", features = ["wgsl-in", "spv-out", "termcolor"] }
 
 [target.'cfg(windows)'.dependencies]

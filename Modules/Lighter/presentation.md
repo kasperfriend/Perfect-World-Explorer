@@ -4,9 +4,9 @@
 | --- | --- |
 | World shadows, reflections, refraction and fog | Trace paths. Do not run the Native water-reflection or underwater tint a second time. |
 | Temporal accumulation and spatial filtering | Lighter's linear radiance and guides. Current reverse-Z is preserved. Reference bypasses both. |
-| Resolution reconstruction | Lighter resolves its ray image into a full-size scene target **before** scene post. The guide-aware resolve is the default; opt-in FSR 1 EASU reconstructs color only at sub-native ray resolution. Both return the nearest current reverse-Z sample. Reference bypasses the EASU option. |
+| Resolution reconstruction | Lighter resolves its ray image into a full-size scene target **before** scene post. The guide-aware resolve is the default; opt-in FSR 1 EASU reconstructs color only at sub-native ray resolution. Both return the nearest current reverse-Z sample. The [experimental Vulkan temporal path](temporal-reconstruction.md) can replace the portable color reconstruction using raw ray inputs. Reference bypasses both EASU and the temporal SDK. |
 | Bloom, sharpen, scene gamma and final display encoding | The viewer's existing post/present stages, after ray reconstruction. No ray-world dependence for HUD or menus. |
-| Native upscalers and generated frames | The Native upscale/FG settings remain saved, but their pipelines are paused on the ray route. Do not feed them stale Native motion, exposure or depth. The Lighter EASU option reuses the portable FSR 1 kernel; it does not run the Native RCAS pass, temporal FidelityFX SDK, DLSS Ray Reconstruction or frame generation. |
+| Native upscalers and generated frames | The Native upscale/FG settings remain saved, but their pipelines are paused on the ray route. Do not feed them stale Native motion, exposure or depth. The Lighter EASU option reuses the portable FSR 1 kernel without Native RCAS or frame generation. The separate [experimental Vulkan SDKs](temporal-reconstruction.md) use ray-world inputs and not Native motion, contexts or generated frames. |
 | Minimap, full map and Librarian preview | Independent Native/artwork cameras and offscreen passes. They do not reuse the main ray buffer or evict its scene. |
 
 The window handles both wgpu loss notifications and explicitly reported

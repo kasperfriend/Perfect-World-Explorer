@@ -23,7 +23,7 @@ fn load_texel(pos: vec2<i32>) -> vec3<f32> {
     return color_of(pixels[index(pos)]);
 }
 struct Output { @location(0) color: vec4<f32>, @builtin(frag_depth) depth: f32 }
-@fragment fn fragment(@builtin(position) coord: vec4<f32>) -> Output {
+fn resolve(coord: vec4<f32>) -> Output {
     let extent = present.extent;
     if all(extent.xy==extent.zw) {
         let c = pixels[index(vec2<i32>(coord.xy))];

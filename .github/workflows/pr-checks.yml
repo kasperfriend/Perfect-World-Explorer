@@ -271,7 +271,7 @@ jobs:
           # Run the cold variants in separate processes so their JIT memory
           # does not stack. Leave lavapipe's SIMD/thread choice at the runner
           # default; forcing a narrow vector width can crash CPU ray queries.
-          for suite in lighter_software_pixels lighter_streamed_world_pixels lighter_paced_residency_software lighter_paced_residency_interop lighter_vulkan_interop_on_cpu lighter_raster_primary_parity lighter_compact_terrain_pixels lighter_compact_terrain_interop lighter_bc_texture_pages_interop lighter_screen_reuse_pixels lighter_screen_reuse_interop; do
+          for suite in lighter_software_pixels lighter_streamed_world_pixels lighter_paced_residency_software lighter_paced_residency_interop lighter_vulkan_interop_on_cpu lighter_raster_primary_parity lighter_compact_terrain_pixels lighter_compact_terrain_interop lighter_bc_texture_pages_interop lighter_screen_reuse_pixels lighter_screen_reuse_interop lighter_temporal_software_vulkan lighter_temporal_fsr_masks_and_fallback; do
             status=0
             (set -o pipefail; cargo test --locked --bin perfect-world-explorer "$suite" -- --ignored --nocapture \
               2>&1 | tee /tmp/lighter-pixels.log) || status=$?

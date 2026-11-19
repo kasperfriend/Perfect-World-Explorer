@@ -6,9 +6,37 @@ pub(crate) mod coverage;
 pub(crate) mod model_feed;
 mod post;
 mod profile;
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub(crate) mod reconstruction;
 mod residency;
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub(crate) mod reconstruction {
+    pub(crate) struct Startup;
+    impl Startup {
+        pub(crate) fn new(_: super::Mode) -> Self {
+            Self
+        }
+        pub(crate) fn instance(&mut self, backends: wgpu::Backends) -> wgpu::Instance {
+            wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends,
+                ..Default::default()
+            })
+        }
+        pub(crate) fn device(
+            &mut self,
+            _: &wgpu::Adapter,
+            _: &wgpu::DeviceDescriptor<'_>,
+        ) -> Option<(wgpu::Device, wgpu::Queue)> {
+            None
+        }
+        pub(crate) fn disable(&mut self, _: &str) {}
+        pub(crate) fn install(self, _: &mut super::Lighter, _: &wgpu::Device) {}
+    }
+}
 pub(crate) mod scene;
 mod settings;
+mod temporal;
+pub(crate) use temporal::Camera as TemporalCamera;
 pub(crate) mod sky;
 pub(crate) mod textures;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -27,6 +55,12 @@ const MEDIA: &str = include_str!("media.wgsl");
 const BASE: &str = include_str!("trace.wgsl");
 const EASU: &str = include_str!("../../fsr1_easu.wgsl");
 const PRESENT: &str = include_str!("present.wgsl");
+const PRESENT_PORTABLE: &str = r#"
+@fragment fn fragment(@builtin(position) coord: vec4<f32>) -> Output {
+    return resolve(coord);
+}
+"#;
+const PRESENT_TEMPORAL: &str = include_str!("temporal_present.wgsl");
 const SOFTWARE: &str = include_str!("software.wgsl");
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 const HARDWARE: &str = include_str!("hardware.wgsl");
@@ -78,7 +112,7 @@ pub(crate) fn wants_screen_reuse() -> bool {
 }
 
 fn trace_source(backend: &str, compact_terrain: bool, screen_reuse: bool) -> String {
-    trace_source_with_pages(backend, compact_terrain, screen_reuse, "")
+    trace_source_with_pages(backend, compact_terrain, screen_reuse, "", false)
 }
 
 fn trace_source_with_pages(
@@ -86,6 +120,7 @@ fn trace_source_with_pages(
     compact_terrain: bool,
     screen_reuse: bool,
     pages: &str,
+    temporal: bool,
 ) -> String {
     let (terrain, load) = if !pages.is_empty() {
         (BC_TERRAIN, pages)
@@ -99,8 +134,13 @@ fn trace_source_with_pages(
     } else {
         SCREEN_OFF
     };
+    let inputs = if temporal {
+        temporal::TRACE
+    } else {
+        temporal::TRACE_OFF
+    };
     [
-        PIXELS, BSDF, MEDIA, REFERENCE, BASE, terrain, load, reuse, backend,
+        PIXELS, BSDF, MEDIA, REFERENCE, BASE, terrain, load, reuse, inputs, backend,
     ]
     .concat()
 }
@@ -385,7 +425,12 @@ struct Software {
 }
 
 impl Software {
-    fn new(device: &wgpu::Device, compact_terrain: bool, screen_reuse: bool) -> Self {
+    fn new(
+        device: &wgpu::Device,
+        compact_terrain: bool,
+        screen_reuse: bool,
+        temporal: bool,
+    ) -> Self {
         let stage = wgpu::ShaderStages::COMPUTE;
         let read = wgpu::BufferBindingType::Storage { read_only: true };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -410,7 +455,8 @@ impl Software {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Lighter software BVH"),
             source: wgpu::ShaderSource::Wgsl(
-                trace_source(SOFTWARE, compact_terrain, screen_reuse).into(),
+                trace_source_with_pages(SOFTWARE, compact_terrain, screen_reuse, "", temporal)
+                    .into(),
             ),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -601,25 +647,41 @@ impl Software {
     }
 }
 
+type ResolvedBindings = (
+    (
+        wgpu::Id<wgpu::Buffer>,
+        wgpu::Id<wgpu::TextureView>,
+        wgpu::Id<wgpu::TextureView>,
+    ),
+    wgpu::BindGroup,
+);
 struct Present {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     extent: wgpu::Buffer,
     binds: Bindings<2, 2>,
+    resolved: Option<ResolvedBindings>,
 }
 impl Present {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat, temporal_output: bool) -> Self {
         let fragment = wgpu::ShaderStages::FRAGMENT;
+        let mut entries = vec![
+            binding(
+                0,
+                fragment,
+                wgpu::BufferBindingType::Storage { read_only: true },
+            ),
+            binding(1, fragment, wgpu::BufferBindingType::Uniform),
+        ];
+        if temporal_output {
+            entries.extend([
+                temporal::sampled(2, fragment),
+                temporal::sampled(3, fragment),
+            ]);
+        }
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Lighter composition bindings"),
-            entries: &[
-                binding(
-                    0,
-                    fragment,
-                    wgpu::BufferBindingType::Storage { read_only: true },
-                ),
-                binding(1, fragment, wgpu::BufferBindingType::Uniform),
-            ],
+            entries: &entries,
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Lighter composition layout"),
@@ -628,7 +690,20 @@ impl Present {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Lighter scene and depth blit"),
-            source: wgpu::ShaderSource::Wgsl([PIXELS, EASU, PRESENT].concat().into()),
+            source: wgpu::ShaderSource::Wgsl(
+                [
+                    PIXELS,
+                    EASU,
+                    PRESENT,
+                    if temporal_output {
+                        PRESENT_TEMPORAL
+                    } else {
+                        PRESENT_PORTABLE
+                    },
+                ]
+                .concat()
+                .into(),
+            ),
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Lighter scene and depth output"),
@@ -669,6 +744,7 @@ impl Present {
             pipeline,
             extent,
             binds: Bindings::default(),
+            resolved: None,
         }
     }
 
@@ -684,18 +760,39 @@ impl Present {
         fsr1_easu: bool,
         target: &wgpu::TextureView,
         depth: &wgpu::TextureView,
+        temporal_output: Option<(&wgpu::TextureView, &wgpu::TextureView)>,
     ) {
         queue.write_buffer(
             &self.extent,
             0,
             bytemuck::bytes_of(&[extent, [u32::from(guided), u32::from(fsr1_easu), 0, 0]]),
         );
-        let bind = self.binds.get(
-            device,
-            "Lighter composition",
-            &self.layout,
-            [image, &self.extent],
-        );
+        let bind = if let Some((color, mask)) = temporal_output {
+            let key = (image.global_id(), color.global_id(), mask.global_id());
+            if self.resolved.as_ref().is_none_or(|entry| entry.0 != key) {
+                self.resolved = Some((
+                    key,
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Lighter reconstructed scene"),
+                        layout: &self.layout,
+                        entries: &[
+                            resource(0, image),
+                            resource(1, &self.extent),
+                            temporal::texture(2, color),
+                            temporal::texture(3, mask),
+                        ],
+                    }),
+                ));
+            }
+            &self.resolved.as_ref().unwrap().1
+        } else {
+            self.binds.get(
+                device,
+                "Lighter composition",
+                &self.layout,
+                [image, &self.extent],
+            )
+        };
         let mut pass = output_pass(encoder, target, depth);
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind, &[]);
@@ -732,6 +829,11 @@ fn output_pass<'a>(
 }
 
 pub struct Lighter {
+    // Retire SDK work before releasing imported ray buffers or the device.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    reconstruction: Option<reconstruction::Session>,
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    vendor_present: Option<Present>,
     // Must be dropped before the wgpu Device (owns native Vulkan objects).
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     hardware: Option<vulkan::Renderer>,
@@ -779,6 +881,10 @@ pub struct Lighter {
 impl Default for Lighter {
     fn default() -> Self {
         Self {
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            reconstruction: None,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            vendor_present: None,
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             hardware: None,
             software: None,
@@ -1110,7 +1216,42 @@ impl Lighter {
         self.cadence.present(now);
     }
 
+    pub(crate) fn reset_reconstruction(&mut self) {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(session) = &mut self.reconstruction {
+            session.reset();
+        }
+        self.release_reconstruction_bind();
+    }
+
+    fn release_reconstruction_bind(&mut self) {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(present) = &mut self.vendor_present {
+            present.resolved = None;
+        }
+    }
+
+    pub(crate) fn reconstruction_requested(&self) -> bool {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            self.reconstruction.is_some()
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn reconstruction_status(&self) -> Option<&'static str> {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(session) = &self.reconstruction {
+            return session.status();
+        }
+        None
+    }
+
     pub(crate) fn reset_history(&mut self) {
+        self.reset_reconstruction();
         self.history.reset();
         self.screen_written = false;
         self.screen_last_flags = 0;
@@ -1214,9 +1355,27 @@ impl Lighter {
         )
     }
 
+    fn frame_image_layout(&self, device: &wgpu::Device, extent: [u32; 4]) -> (u64, u32) {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(session) = self
+            .reconstruction
+            .as_ref()
+            .filter(|s| s.extent_ready(extent))
+        {
+            return (session.bytes(extent), 0);
+        }
+        self.trace_image_layout(device, extent[0], extent[1])
+    }
+
     /// Swapchain recreation may idle the native device, not just the wgpu
     /// queue. A raw image fill is not visible to wgpu's lifetime tracker.
     pub(crate) fn poll_hardware(&mut self) -> Result<bool, String> {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(session) = &mut self.reconstruction {
+            if !session.poll()? {
+                return Ok(false);
+            }
+        }
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         if let Some(rt) = &mut self.hardware {
             let trace_idle = rt.poll_frame()?;
@@ -1235,28 +1394,84 @@ impl Lighter {
         w: u32,
         h: u32,
     ) -> Result<bool, String> {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let temporal_capable = if self.reconstruction.is_some() {
+            let (rw, rh) = self.ray_extent(device, w, h)?;
+            let settings = self.settings.effective();
+            let extent = [rw, rh, w, h];
+            if !self.reconstruction.as_ref().unwrap().extent_ready(extent) {
+                self.release_reconstruction_bind();
+            }
+            let session = self.reconstruction.as_mut().unwrap();
+            let mut prepare = || session.prepare(device, extent, settings);
+            let ready = if self.capture {
+                crate::gpu::wait_for_capture(device, || prepare().map(|b| b.then_some(true)))?
+            } else {
+                prepare()?
+            };
+            if !ready {
+                return Ok(false);
+            }
+            true
+        } else {
+            false
+        };
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        let temporal_capable = false;
         if self.settings.mode == Mode::Software && self.software.is_none() {
-            // Start the cold compute pipeline in the same preflight as Hardware,
-            // before acquiring a swapchain image or starting scene submission.
-            self.software = Some(checked_pipeline(device, || {
-                Software::new(device, self.compact_terrain, self.screen_reuse != 0)
-            })?);
+            // Start the cold compute pipeline before acquiring a surface.
+            let build = |temporal| {
+                checked_pipeline(device, || {
+                    Software::new(
+                        device,
+                        self.compact_terrain,
+                        self.screen_reuse != 0,
+                        temporal,
+                    )
+                })
+            };
+            self.software = Some(match build(temporal_capable) {
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                Err(error) if temporal_capable => {
+                    eprintln!(
+                        "Lighter temporal tracer unavailable; using portable resolve: {error}"
+                    );
+                    self.reconstruction = None;
+                    build(false)?
+                }
+                built => built?,
+            });
         }
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         if self.settings.mode == Mode::Hardware && self.unavailable().is_none() {
             let (rw, rh) = self.ray_extent(device, w, h)?;
-            let (bytes, _) = self.trace_image_layout(device, rw, rh);
             if self.hardware.is_none() {
-                self.hardware = Some(vulkan::Renderer::new(
-                    device,
-                    self.compact_terrain,
-                    self.screen_reuse != 0,
-                    self.world
-                        .as_ref()
-                        .and_then(|w| w.textures.bc_pages.as_ref())
-                        .filter(|_| self.bc_pages),
-                )?);
+                let build = |temporal| {
+                    vulkan::Renderer::new(
+                        device,
+                        self.compact_terrain,
+                        self.screen_reuse != 0,
+                        self.world
+                            .as_ref()
+                            .and_then(|w| w.textures.bc_pages.as_ref())
+                            .filter(|_| self.bc_pages),
+                        temporal,
+                    )
+                };
+                self.hardware = Some(match build(temporal_capable) {
+                    Err(error)
+                        if temporal_capable && !crate::gpu::reconstruction_device_lost(&error) =>
+                    {
+                        eprintln!(
+                            "Lighter temporal tracer unavailable; using portable resolve: {error}"
+                        );
+                        self.reconstruction = None;
+                        build(false)?
+                    }
+                    built => built?,
+                });
             }
+            let (bytes, _) = self.frame_image_layout(device, [rw, rh, w, h]);
             let rt = self.hardware.as_mut().unwrap();
             if self.settings.hybrid_primary {
                 // The UI stages this only through Reload World. Prewarm even
@@ -1292,6 +1507,7 @@ impl Lighter {
         format: wgpu::TextureFormat,
         mut frame: Frame,
         moving: &Packet,
+        camera: Option<temporal::Camera>,
     ) -> Result<bool, String> {
         if let Some(reason) = self.unavailable() {
             return Err(reason.into());
@@ -1357,14 +1573,43 @@ impl Lighter {
         frame.options[1] = settings.bounces;
         frame.options[2] = settings.samples;
         frame.material_time[3] = settings.diffuse_distance as f32;
-        let (bytes, screen) = self.trace_image_layout(device, rw, rh);
+        let (bytes, screen) = self.frame_image_layout(device, frame.extent);
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let unjittered = frame;
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let temporal_frame = if let Some(session) = &mut self.reconstruction {
+            let prepared = session.begin(&mut frame, camera, world, moving, settings.mode, device);
+            if prepared.is_some() && self.vendor_present.is_none() {
+                match checked_pipeline(device, || Present::new(device, format, true)) {
+                    Ok(present) => self.vendor_present = Some(present),
+                    Err(error) => {
+                        // No frame or vendor work has been submitted yet.
+                        eprintln!("Lighter temporal composition unavailable; using portable resolve: {error}");
+                        self.reconstruction = None;
+                        frame = unjittered;
+                    }
+                }
+            }
+            prepared.filter(|_| self.reconstruction.is_some())
+        } else {
+            None
+        };
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let vendor_frame = temporal_frame.is_some();
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        let vendor_frame = {
+            let _ = camera;
+            false
+        };
         if self.present.is_none() {
-            self.present = Some(checked_pipeline(device, || Present::new(device, format))?);
+            self.present = Some(checked_pipeline(device, || {
+                Present::new(device, format, false)
+            })?);
         }
-        if (settings.denoiser || settings.progressive) && self.post.is_none() {
-            self.post = Some(checked_pipeline(device, || post::Post::new(device))?);
-        }
-        let history = if settings.progressive {
+        let history = if vendor_frame {
+            self.history.reset();
+            None
+        } else if settings.progressive {
             let moving_unchanged = match settings.mode {
                 Mode::Software => self
                     .software
@@ -1474,37 +1719,80 @@ impl Lighter {
             }
         }
 
-        let image = if let Some(post) = &mut self.post {
-            post.process(
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let reconstructed = if let Some(prepared) = temporal_frame {
+            self.reconstruction
+                .as_mut()
+                .unwrap()
+                .resolve(device, queue, encoder, image, prepared)?
+        } else {
+            false
+        };
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        let reconstructed = false;
+        if reconstructed {
+            if let Some(t) = timed {
+                // Timestamp the whole reconstruction/packing step, not just
+                // the portable guide pass. The SDK records between submissions.
+                t.stamp(encoder, 2);
+                t.stamp(encoder, 3);
+            }
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            self.vendor_present.as_mut().unwrap().draw(
                 device,
                 queue,
                 encoder,
                 image,
                 frame.extent,
-                history,
                 settings.denoiser,
-                timed,
-            )
+                settings.fsr1_easu,
+                target,
+                depth,
+                Some(self.reconstruction.as_ref().unwrap().output()),
+            );
         } else {
-            if let Some(t) = timed {
-                t.stamp(encoder, 2);
+            // A cached composition binding owns the old SDK output view.
+            // Retire it after a rejection instead of holding an extra extent.
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            if let Some(present) = &mut self.vendor_present {
+                present.resolved = None;
             }
-            image
-        };
-        if let Some(t) = timed {
-            t.stamp(encoder, 3);
+            if (settings.denoiser || history.is_some()) && self.post.is_none() {
+                self.post = Some(checked_pipeline(device, || post::Post::new(device))?);
+            }
+            let image = if let Some(post) = &mut self.post {
+                post.process(
+                    device,
+                    queue,
+                    encoder,
+                    image,
+                    frame.extent,
+                    history,
+                    settings.denoiser,
+                    timed,
+                )
+            } else {
+                if let Some(t) = timed {
+                    t.stamp(encoder, 2);
+                }
+                image
+            };
+            if let Some(t) = timed {
+                t.stamp(encoder, 3);
+            }
+            self.present.as_mut().unwrap().draw(
+                device,
+                queue,
+                encoder,
+                image,
+                frame.extent,
+                settings.denoiser,
+                settings.fsr1_easu,
+                target,
+                depth,
+                None,
+            );
         }
-        self.present.as_mut().unwrap().draw(
-            device,
-            queue,
-            encoder,
-            image,
-            frame.extent,
-            settings.denoiser,
-            settings.fsr1_easu,
-            target,
-            depth,
-        );
         if let Some(t) = timed {
             t.stamp(encoder, 4);
             #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -1543,6 +1831,11 @@ impl Lighter {
         if self.status.is_none() {
             eprintln!("Lighter: {message}");
         }
+        let message = if let Some(upscaler) = self.reconstruction_status() {
+            format!("{message} · {upscaler}")
+        } else {
+            message
+        };
         self.status = Some(message);
         self.log_allocations();
         Ok(true)

@@ -47,7 +47,9 @@ ray-traced scene and its reverse-Z depth.
    also gives a deterministic first split at glass.
    **FSR 1 spatial upscale (EASU)** is opt-in. Below full ray resolution it
    reconstructs color from the filtered ray image, without changing current
-   depth or enabling any vendor temporal SDK.
+   depth or enabling any vendor temporal SDK. The separate, launch-only
+   [experimental Vulkan FSR and DLSS-RR paths](temporal-reconstruction.md)
+   require explicit SDK setup and are not part of the default renderer.
    **Automatic ray resolution** is opt-in and targets completed ray and
    reconstruction GPU time, not total frame time; the slider seeds its
    50–100% range. Start with a fixed scale when comparing renderers.

@@ -6,9 +6,9 @@ use glam::{Mat4, Vec4};
 
 pub(super) const SHADER: &str = include_str!("post.wgsl");
 // Match pixels.wgsl. These bits describe which animation inputs a ray used.
-const ANIM_WAVES: u32 = 32;
-const ANIM_SCROLL: u32 = 64;
-const ANIM_SKY: u32 = 128;
+pub(super) const ANIM_WAVES: u32 = 32;
+pub(super) const ANIM_SCROLL: u32 = 64;
+pub(super) const ANIM_SKY: u32 = 128;
 pub(super) const ANIM_GEOMETRY: u32 = 256;
 
 pub(super) struct HistoryUse {
@@ -28,7 +28,7 @@ struct Params {
 /// Test the step, not the total travel since a cut. Near-plane corners move
 /// dramatically even for small translations; reject a near silhouette using
 /// the per-pixel reprojection instead of invalidating the whole screen.
-fn camera_continuous(previous_from_current: Mat4, delta_eye: glam::Vec3) -> bool {
+pub(super) fn camera_continuous(previous_from_current: Mat4, delta_eye: glam::Vec3) -> bool {
     // Default free flight is 240 units/s (4 at 60 Hz). Let ordinary
     // flight at lower frame rates use per-pixel validation too; a jump
     // beyond this is a cut even when the far frustum barely changes.
