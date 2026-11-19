@@ -1645,10 +1645,10 @@ impl Lighter {
                     .as_ref()
                     .filter(|_| self.bc_pages)
                     .map(|w| w.textures.bc_pages.clone());
-                let mut stage: u64 = 0;
+                let stage: u64 = 0;
                 self.cold_ray_deadline = Some(Instant::now() + Duration::from_secs(30));
                 std::thread::Builder::new().name("lighter-pipeline-startup".into()).spawn(move || {
-                    let progress = |step| { stage += 1; let _ = tx.send(ColdRayBuild::Progress(stage, step)); };
+                    let progress = |step| { let _ = tx.send(ColdRayBuild::Progress(stage, step)); };
                     let build = |temporal| vulkan::Renderer::new(&device, compact, reuse, pages.as_ref(), temporal, game, &progress);
                     let made = match build(temporal) {
                         Err(error) if temporal && !crate::gpu::reconstruction_device_lost(&error) => {
