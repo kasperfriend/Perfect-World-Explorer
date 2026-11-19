@@ -137,7 +137,12 @@ pub(crate) struct Revision {
     /// Width of `dwEntryOffset` in the trailer, in bytes.
     pub(crate) table_offset_width: usize,
     /// Where `dwFlags` starts inside the trailer.
-    pub(crate) flags_at: usize,
+    ///
+    /// `None` for a layout that has no flags field at all: 1.8.4's `trees.pck`
+    /// puts `szDescription` at `+16` and nothing between the table offset and
+    /// it. A sentinel offset would have to point at *something* and would be
+    /// read as a flag word, so the absence is spelled as an absence.
+    pub(crate) flags_at: Option<usize>,
     /// Where `szDescription` starts inside the trailer.
     description_at: usize,
     /// Where `guardByte1` starts inside the trailer.
@@ -160,6 +165,20 @@ pub(crate) struct Revision {
 /// The count is *not* a trailer field in any revision: the client reads it from
 /// `end - 8`, the four bytes between the trailer and the version word at
 /// `end - 4`.
+///
+/// **The version word does not identify a layout.** 1.8.4's `litmodels.pck` and
+/// its `trees.pck` both say `0x00020003`, yet the first writes `dwEntryOffset`
+/// as `UINT64` and the second as `DWORD` with no `dwFlags` field at all (its
+/// description starts at `+16`). A small package cannot name its table above
+/// 4 GiB, so the compiler emitting it for a wide revision narrowed the field
+/// instead of enlarging the package -- which means the layout has to be
+/// *probed* against the trailer's own guards, not looked up by version.
+///
+/// So this table lists the layout that the version word promises, and
+/// [`TRAILER_PROBES`] is tried when its geometry does not fit. Each candidate
+/// is still checked against the guard pair, the description tag and the entry
+/// table itself, so a probe that guesses wrong is refused rather than
+/// mis-parsed.
 pub(crate) const REVISIONS: [Revision; 3] = [
     Revision {
         version: 0x2_0003,
@@ -171,7 +190,7 @@ pub(crate) const REVISIONS: [Revision; 3] = [
         compressed_at: 276,
         table_offset_at: 8,
         table_offset_width: 8,
-        flags_at: 16,
+        flags_at: Some(16),
         description_at: 20,
         guard_byte1: 272,
     },
@@ -185,7 +204,7 @@ pub(crate) const REVISIONS: [Revision; 3] = [
         compressed_at: 268,
         table_offset_at: 8,
         table_offset_width: 4,
-        flags_at: 12,
+        flags_at: Some(12),
         description_at: 16,
         guard_byte1: 268,
     },
@@ -199,11 +218,46 @@ pub(crate) const REVISIONS: [Revision; 3] = [
         compressed_at: 268,
         table_offset_at: 8,
         table_offset_width: 4,
-        flags_at: 12,
+        flags_at: Some(12),
         description_at: 16,
         guard_byte1: 268,
     },
 ];
+
+/// Trailer layouts that do not match what their version word promises.
+///
+/// 1.8.4's `trees.pck` is the case that forced this: it declares
+/// `0x00020003` but writes the *narrow* trailer -- a 32-bit `dwEntryOffset` at
+/// `+8`, no `dwFlags` at all, and `szDescription` at `+16`, i.e. the
+/// `0x00020002` field order inside a 280-byte struct whose tail still reaches
+/// `guardByte1` at `+272`. Measured on the shipped file: 326 entries, table at
+/// 26,203,745, 23,911 bytes, and the description reads
+/// `"Angelica File Package, Perfect World Co. Ltd. 2002~2008."` from `+16`.
+///
+/// It is tried only when the version's own layout fails, and it has to pass
+/// the same guard, description and table checks as everything else. Listing it
+/// here rather than branching on "if version == 0x00020003 and size < ..." is
+/// the point: the condition that separates it from the wide trailer is the
+/// trailer's own bytes, not the package's size on disk.
+pub(crate) const TRAILER_PROBES: [Revision; 1] = [Revision {
+    // Matched against any declared version that has no resolved layout of its
+    // own; the guard pair is what actually admits it.
+    version: 0,
+    header: 280,
+    entry: 288,
+    offset_at: 264,
+    offset_width: 8,
+    size_at: 272,
+    compressed_at: 276,
+    table_offset_at: 8,
+    table_offset_width: 4,
+    // `0x00020002`'s field order: no dwFlags, description at `+16`. `+12` holds
+    // `0xffffffff` in the shipped file, which is *not* a flag word -- reading
+    // it as one would refuse a package whose table decodes perfectly.
+    flags_at: None,
+    description_at: 16,
+    guard_byte1: 272,
+}];
 
 /// The guard pair `guardByte0` / `guardByte1` that every revision's trailer
 /// carries.
@@ -484,11 +538,27 @@ fn package_end(f: &mut File) -> Result<u64, String> {
 /// large the trailer is, then reads the trailer at `end - (header + 4 + 4)`
 /// because the file count sits between the trailer and the version word. The
 /// two reads are reproduced here in that order.
-fn read_trailer(f: &File, end: u64) -> Result<(Revision, usize, Vec<u8>), String> {
-    let version = u32le(&at_shared(f, end - 4, 4)?, 0)?;
-    let Some(rev) = REVISIONS.iter().find(|r| r.version == version) else {
-        return Err(format!("unsupported PCK version {version:08x}"));
-    };
+fn trailer_candidates(version: u32) -> Vec<Revision> {
+    let mut candidates: Vec<Revision> = REVISIONS
+        .iter()
+        .filter(|r| r.version == version)
+        .copied()
+        .collect();
+    // The version word orders the candidates; it does not select one. 1.8.4
+    // ships two packages that both declare `0x00020003` and disagree about the
+    // trailer (see `TRAILER_PROBES`), so the version's own layout is tried
+    // first and the narrow one after it. A probe is never trusted on its
+    // guards alone: `read_directory` has to walk the table it names, which is
+    // the check that actually separates the two.
+    candidates.extend(TRAILER_PROBES.iter().copied());
+    candidates
+}
+
+/// Read `rev`'s trailer and check the two things every layout must satisfy.
+///
+/// Split out so the same checks guard the version's own layout and every probe:
+/// a probe that skips them is a different reader wearing the same name.
+fn read_named_trailer(f: &File, end: u64, rev: &Revision) -> Result<Vec<u8>, String> {
     // The client reads the trailer at `nOffset - (sizeof(header) + 4 + 4)` and
     // the count at `nOffset - 8`: the two reads overlap the same eight bytes
     // only when the struct's tail padding is counted, so both are done from the
@@ -496,7 +566,6 @@ fn read_trailer(f: &File, end: u64) -> Result<(Revision, usize, Vec<u8>), String
     let header_start = end
         .checked_sub((rev.header + 8) as u64)
         .ok_or("bad package end offset")?;
-    let count = u32le(&at_shared(f, end - 8, 4)?, 0)? as usize;
     let header = at_shared(f, header_start, rev.header)?;
     if u32le(&header, 0)? != 0xfdfdfeee || u32le(&header, rev.guard_byte1)? != 0xf00dbeef {
         return Err("unsupported PCK guard keys".into());
@@ -506,7 +575,8 @@ fn read_trailer(f: &File, end: u64) -> Result<(Revision, usize, Vec<u8>), String
     // file that passes the guards but not this is not a package at all. Saying
     // "unsupported version" for it would send the reader after a version that
     // does not exist.
-    let description = &header[rev.description_at..rev.description_at + 252];
+    let stop_at = (rev.description_at + 252).min(header.len());
+    let description = &header[rev.description_at.min(stop_at)..stop_at];
     let stop = description
         .iter()
         .position(|&b| b == 0)
@@ -515,8 +585,30 @@ fn read_trailer(f: &File, end: u64) -> Result<(Revision, usize, Vec<u8>), String
     if !description.contains("lica File Package") {
         return Err("not an Angelica file package (description tag missing)".into());
     }
-    Ok((*rev, count, header))
+    Ok(header)
 }
+
+/// Read the trailer the version word implies. Kept for callers that only want
+/// the revision and the count (tests, the Angelica cross-check); the entry
+/// table itself is read by [`read_directory`], which is where a probe is
+/// proven or refused.
+fn read_trailer(f: &File, end: u64) -> Result<(Revision, usize, Vec<u8>), String> {
+    let version = u32le(&at_shared(f, end - 4, 4)?, 0)?;
+    let mut candidates = trailer_candidates(version);
+    if candidates.is_empty() {
+        return Err(format!("unsupported PCK version {version:08x}"));
+    }
+    let count = u32le(&at_shared(f, end - 8, 4)?, 0)? as usize;
+    let mut refused = Vec::new();
+    for rev in candidates.drain(..) {
+        match read_named_trailer(f, end, &rev) {
+            Ok(header) => return Ok((rev, count, header)),
+            Err(e) => refused.push(format!("{:08x}: {e}", rev.version)),
+        }
+    }
+    Err(refused.join("; "))
+}
+
 pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     let size = f.metadata().map_err(|e| e.to_string())?.len();
     if size < 292 {
@@ -562,19 +654,12 @@ fn read_directory(
     // The trailer is written in the last file of the package.
     let reader: &File = &files.last().ok_or("package holds no file")?.0;
     let part_end = end - base;
-    let (rev, count, header) = read_trailer(reader, part_end)?;
-    let flags = u32le(&header, rev.flags_at)?;
-    if flags & ENCRYPTED_FLAG != 0 {
-        // Name the revision and the flag word: "unsupported" without the
-        // revision leaves a reader unable to tell an enciphered package from a
-        // truncated one, and the version is the thing that would have to be
-        // supported next.
-        return Err(format!(
-            "{ENCRYPTED_REFUSAL}: revision {:08x} sets dwFlags {flags:08x} \
-             (bit 31); this build reads the directory only in the clear",
-            rev.version
-        ));
+    let version = u32le(&at_shared(reader, part_end - 4, 4)?, 0)?;
+    let mut candidates = trailer_candidates(version);
+    if candidates.is_empty() {
+        return Err(format!("unsupported PCK version {version:08x}"));
     }
+    let count = u32le(&at_shared(reader, part_end - 8, 4)?, 0)? as usize;
     // Measured maxima, largest staged pack first: `gfx.pck` 3,499 entries,
     // `grasses.pck` 1,453, `textures.pck` 943, `trees.pck` 326, `configs.pck`
     // 58. The limit is two orders of magnitude above the largest of those and
@@ -583,38 +668,85 @@ fn read_directory(
     if count > ENTRY_LIMIT {
         return Err(format!("entry count {count} exceeds limit {ENTRY_LIMIT}"));
     }
-    // The client unmasks the entry offset in place (`dwEntryOffset ^=
-    // AFPCK_MASKDWORD`) and seeks there; the trailer follows the table, so a
-    // table that starts at or past it is not in this package.
-    //
-    // The word is 32 bits, so it cannot address a package longer than 4 GiB.
-    // A split package therefore has to mean one of two things by it, and the
-    // shipped clients differ:
-    //
-    //   * package-absolute, as every entry's `dwOffset` in this revision is:
-    //     the table's position counted from the start of the first file. This
-    //     is the only reading that works for a package under 4 GiB, so it is
-    //     tried first.
-    //   * piece-local, counted from the start of the file holding the trailer.
-    //     A package of 1.5.2's `litmodels` is 2,859,188,412 bytes, and its
-    //     `.pkx` holds the last 711,705,020 of them, so a package-absolute
-    //     32-bit word cannot name its table at all. That client must be writing
-    //     the offset from the start of the piece.
-    //
-    // Reading only the package-absolute way rejected that archive as "entry
-    // table overlaps footer" -- a 32-bit position was compared against the
-    // piece's length -- which is why 1.5.2 resolved none of its 22,981 scenery
-    // models. Both readings are attempted, in that order, and the first one
-    // that yields a well-formed table wins.
-    //
-    // `dwEntryOffset` is `UINT64` in `0x00020003`, and that width is not
-    // cosmetic: 1.8.4's `litmodels` is a 9.4 GiB package whose table starts at
-    // 10,107,744,597, above 4 GiB, so its 32 bits cannot name it. Reading only
-    // the low half yielded 1,517,810,005 -- a position inside the package but
-    // two gibibytes short of the table, which is exactly the "declares its
-    // table at 1517810005 but only 3681422201 bytes precede the footer" line.
-    // The mask is applied at the revision's width for the same reason.
-    let pos = table_offset(&header, &rev)?;
+    // Each candidate is proven by walking the table it names, not by its
+    // guard words alone: two shipped 1.8.4 packages share the version word and
+    // differ in exactly this layout, and only one of the two readings yields a
+    // table that decodes to `count` records. The last refusal is reported, and
+    // a candidate with no `dwFlags` cannot be enciphered.
+    let mut refusals: Vec<String> = Vec::new();
+    for rev in candidates.drain(..) {
+        let header = match read_named_trailer(reader, part_end, &rev) {
+            Ok(header) => header,
+            Err(e) => {
+                refusals.push(format!("{:08x}: {e}", rev.version));
+                continue;
+            }
+        };
+        let flags = match rev.flags_at {
+            Some(at) => u32le(&header, at)?,
+            None => 0,
+        };
+        if flags & ENCRYPTED_FLAG != 0 {
+            // Name the revision and the flag word: "unsupported" without the
+            // revision leaves a reader unable to tell an enciphered package
+            // from a truncated one, and the version is the thing that would
+            // have to be supported next.
+            return Err(format!(
+                "{ENCRYPTED_REFUSAL}: revision {:08x} sets dwFlags {flags:08x} \
+                 (bit 31); this build reads the directory only in the clear",
+                rev.version
+            ));
+        }
+        match entries_from_trailer(files, layout, end, base, part_end, count, &rev, &header) {
+            Ok(entries) => return Ok(entries),
+            Err(e) => refusals.push(format!("{:08x}: {e}", rev.version)),
+        }
+    }
+    Err(refusals.join("; "))
+}
+
+/// Walk the entry table a single trailer names.
+///
+/// The client unmasks the entry offset in place (`dwEntryOffset ^=
+/// AFPCK_MASKDWORD`) and seeks there; the trailer follows the table, so a table
+/// that starts at or past it is not in this package.
+///
+/// The offset is 32 bits in the older revisions and 64 in the newest, which
+/// decides what a split package can mean by it, and the shipped clients differ:
+///
+///   * package-absolute, as every entry's `dwOffset` in this revision is: the
+///     table's position counted from the start of the first file. This is the
+///     only reading that works for a package under 4 GiB, so it is tried first.
+///   * piece-local, counted from the start of the file holding the trailer. A
+///     package of 1.5.2's `litmodels` is 2,859,188,412 bytes, and its `.pkx`
+///     holds the last 711,705,020 of them, so a package-absolute 32-bit word
+///     cannot name its table at all. That client must be writing the offset
+///     from the start of the piece.
+///
+/// Reading only the package-absolute way rejected that archive as "entry table
+/// overlaps footer" -- a 32-bit position was compared against the piece's
+/// length -- which is why 1.5.2 resolved none of its 22,981 scenery models.
+/// Both readings are attempted, in that order, and the first one that yields a
+/// well-formed table wins.
+///
+/// `dwEntryOffset` is `UINT64` in the wide trailer, and that width is not
+/// cosmetic: 1.8.4's `litmodels` is a 9.4 GiB package whose table starts at
+/// 10,107,744,597, above 4 GiB, so 32 bits cannot name it. Reading only the low
+/// half yielded 1,517,810,005 -- a position inside the package but two
+/// gibibytes short of the table, which is exactly the "declares its table at
+/// 1517810005 but only 3681422201 bytes precede the footer" line.
+#[allow(clippy::too_many_arguments)]
+fn entries_from_trailer(
+    files: &[(File, u64)],
+    layout: &Layout,
+    end: u64,
+    base: u64,
+    part_end: u64,
+    count: usize,
+    rev: &Revision,
+    header: &[u8],
+) -> Result<Vec<Entry>, String> {
+    let pos = table_offset(header, rev)?;
     let table_end = part_end - (rev.header + 8) as u64;
     let mut tried = Vec::new();
     for (label, local) in [
@@ -627,7 +759,7 @@ fn read_directory(
         // The entry table may also straddle the split, so it is walked through
         // the two-part reader rather than one file.
         let table = read_package_range(files, layout, base + local, table_end - local)?;
-        match read_entry_table(&table, count, &rev, end, layout.total()) {
+        match read_entry_table(&table, count, rev, end, layout.total()) {
             Ok(entries) => return Ok(entries),
             Err(e) => tried.push(format!("{label} {local}: {e}")),
         }
@@ -642,7 +774,9 @@ fn read_directory(
          {base}, count {count}, flags {:#010x}); {}",
         if base == 0 { "file" } else { "piece" },
         part_end,
-        u32le(&header, rev.flags_at).unwrap_or(0),
+        rev.flags_at
+            .and_then(|at| u32le(header, at).ok())
+            .unwrap_or(0),
         if tried.is_empty() {
             "neither reading fits inside the footer".to_string()
         } else {
@@ -1363,6 +1497,79 @@ mod tests {
         assert!(error.contains("safe header"), "{error}");
     }
 
+    /// 1.8.4 writes `0x00020003` with two different trailers, and the narrow
+    /// one has no `dwFlags` field at all.
+    ///
+    /// `trees.pck` from that client declares `0x00020003` and puts a 32-bit
+    /// `dwEntryOffset` at `+8`, `0xffffffff` at `+12`, and `szDescription` from
+    /// `+16`, with `guardByte1` still at `+272` and the struct still 280 bytes.
+    /// The wide reading looks at `+8` as a u64, so its high half becomes the
+    /// `0xffffffff` and the offset lands nowhere; the flags reading at `+16`
+    /// finds the first four bytes of "Angelica File Package" (`0x65676e41`,
+    /// "Ange"), which would be reported as an encrypted package. Measured on
+    /// the shipped file: 326 entries, table at 26,203,745, 23,911 bytes.
+    ///
+    /// This is the case that proves the version word cannot select a layout.
+    #[test]
+    fn a_narrow_trailer_inside_the_new_version_is_found_by_probing() {
+        let narrow = TRAILER_PROBES[0];
+        assert_eq!(narrow.header, 280, "the struct is still the wide one");
+        assert_eq!(narrow.table_offset_width, 4, "but the field is a DWORD");
+        assert_eq!(
+            narrow.flags_at, None,
+            "there is no dwFlags field, so there is no offset to read one at"
+        );
+        assert_eq!(narrow.description_at, 16, "the description starts early");
+
+        // The version word promises the wide trailer, so the narrow one has to
+        // come from the probe list -- and the probe must still be reachable for
+        // that version.
+        let candidates = trailer_candidates(0x0002_0003);
+        assert_eq!(candidates.len(), 2, "wide first, narrow second");
+        assert_eq!(candidates[0].table_offset_width, 8);
+        assert_eq!(candidates[1].table_offset_width, 4);
+
+        // Read against the shipped numbers: the trailer's own bytes decide.
+        let table_at = 26_203_745u64;
+        let end = 26_227_944u64;
+        let mut header = vec![0u8; narrow.header];
+        header[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
+        header[4..8].copy_from_slice(&0x0002_0003u32.to_le_bytes());
+        header[8..12].copy_from_slice(&((table_at as u32) ^ MASK).to_le_bytes());
+        header[12..16].copy_from_slice(&0xffffffffu32.to_le_bytes());
+        let tag = b"Angelica File Package, Perfect World Co. Ltd. 2002~2008.";
+        header[16..16 + tag.len()].copy_from_slice(tag);
+        header[272..276].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
+
+        // The narrow reading locates the table exactly.
+        assert_eq!(table_offset(&header, &narrow).unwrap(), table_at);
+        let trailer_start = end - (narrow.header + 8) as u64;
+        assert_eq!(trailer_start - table_at, 23_911, "the table's real span");
+
+        // The wide reading of the same bytes is the one that fails: its u64
+        // half-words are the offset and the `0xffffffff` behind it.
+        let wide = REVISIONS
+            .iter()
+            .find(|r| r.version == 0x0002_0003)
+            .copied()
+            .unwrap();
+        let wide_pos = table_offset(&header, &wide).unwrap();
+        assert_ne!(wide_pos, table_at);
+        assert!(
+            wide_pos > end,
+            "the wide reading names a position past the file"
+        );
+
+        // And the byte the widest reading calls dwFlags is really the
+        // description's first four characters, which is why a flags check
+        // there would refuse a package that decodes perfectly.
+        assert_eq!(u32le(&header, wide.flags_at.unwrap()).unwrap(), 0x6567_6e41);
+        assert_eq!(
+            &header[wide.description_at..wide.description_at + 4],
+            b"lica"
+        );
+    }
+
     /// 1.8.4's `litmodels` names its entry table with the full 64-bit
     /// `dwEntryOffset`, and only the full word locates it.
     ///
@@ -1827,7 +2034,7 @@ mod tests {
                 v3.description_at,
                 v3.guard_byte1
             ),
-            (280, 288, 264, 8, 272, 276, 16, 20, 272),
+            (280, 288, 264, 8, 272, 276, Some(16), 20, 272),
             "FILEHEADER/FILEENTRY_0x00020003"
         );
         for v2 in REVISIONS.iter().filter(|r| r.version != 0x2_0003) {
@@ -1843,7 +2050,7 @@ mod tests {
                     v2.description_at,
                     v2.guard_byte1
                 ),
-                (272, 276, 260, 4, 264, 268, 12, 16, 268),
+                (272, 276, 260, 4, 264, 268, Some(12), 16, 268),
                 "FILEHEADER/FILEENTRY for {:#08x}",
                 v2.version
             );
