@@ -31,8 +31,9 @@ fn resolve(coord: vec4<f32>) -> Output {
     let nearest = index(vec2<i32>(floor(source+0.5)));
     let center = pixels[nearest];
     if present.options.y!=0u {
-        // EASU upscaler was removed (P1); fall back to nearest texel.
-        return Output(vec4<f32>(color_of(center),1.),center.depth);
+        // EASU upscaler was removed (P1); fall back to direct texel fetch.
+        let c = pixels[index(vec2<i32>(coord.xy))];
+        return Output(vec4<f32>(color_of(c),1.),c.depth);
     }
     let p = vec2<i32>(floor(source));
     let f = fract(source);
