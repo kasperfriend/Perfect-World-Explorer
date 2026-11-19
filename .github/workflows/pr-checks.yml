@@ -450,6 +450,9 @@ jobs:
     name: Windows executable (x64)
     runs-on: windows-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -576,17 +579,37 @@ jobs:
             -Modules Modules `
             -OutputDirectory artifact `
             -ArchivePath "$env:RUNNER_TEMP/Perfect-World-Explorer-package-test.zip"
-      - uses: actions/upload-artifact@v4
+      - name: Upload the portable artifact
+        uses: actions/upload-artifact@v4
+        id: portable
         with:
           name: Perfect-World-Explorer-Windows-x64
           path: artifact/
           if-no-files-found: error
           retention-days: 14
       - name: Download the uploaded portable artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: Perfect-World-Explorer-Windows-x64
-          path: ${{ runner.temp }}/uploaded-viewer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.portable.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.portable.outputs.artifact-digest }}
+        run: |
+          # Audit the exact upload, not a name lookup that can lag behind a
+          # successful upload (or select a previous attempt's artifact).
+          $id = $env:ARTIFACT_ID
+          $expected = $env:ARTIFACT_DIGEST -replace '^sha256:', ''
+          if ($id -notmatch '^\d+$' -or $expected -notmatch '^[a-f0-9]{64}$') {
+            throw 'The portable upload did not return an artifact ID and SHA-256.'
+          }
+          $zip = Join-Path $env:RUNNER_TEMP 'uploaded-viewer.zip'
+          $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/artifacts/$id/zip"
+          Invoke-WebRequest -Uri $uri -Authentication Bearer `
+            -Token (ConvertTo-SecureString $env:GH_TOKEN -AsPlainText -Force) `
+            -OutFile $zip -TimeoutSec 180 -MaximumRetryCount 4 -RetryIntervalSec 5
+          if ((Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash -ne $expected) {
+            throw "The downloaded archive does not match the SHA-256 of upload $id."
+          }
+          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'uploaded-viewer')
       - name: Audit the uploaded artifact layout
         shell: pwsh
         run: |
