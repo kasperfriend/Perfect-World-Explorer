@@ -4080,8 +4080,11 @@ fn lighter_a07_authored_medium() {
     let eye = Vec3::new(80., 329., -144.);
     let dry = Vec3::new(80., 332.66, -144.);
     let wet = crate::gpu::ray_test_wet_grid(&mut bank, &areas, eye);
-    let air = crate::gpu::ray_test_wet_grid(&mut Textures::default(), &areas, dry);
-    assert_eq!((wet[1], air[1]), (1, 0));
+    assert_eq!(wet[1], 1);
+    // At z=-144 the authored wet cell centered at -80 ends at x=-64.
+    // The adjacent cell centered at -48 is dry, inside the same grid.
+    assert!(area.contains_xz(-66., -144.));
+    assert!(!area.contains_xz(-60., -144.));
     // Isolate extinction from Fresnel, surface refraction, art, and other
     // lighting. The white receiver is diagnostic geometry at the independently
     // sampled a07 source-height Y at this wet cell center.
@@ -4102,6 +4105,21 @@ fn lighter_a07_authored_medium() {
         u32::MAX,
     );
     put(&mut b, patch);
+    let shore_receiver = |dy, dz| [-58., eye.y + dy, eye.z + dz];
+    let patch = quad(
+        &mut b,
+        [
+            shore_receiver(-8., 8.),
+            shore_receiver(8., 8.),
+            shore_receiver(-8., -8.),
+            shore_receiver(8., -8.),
+        ],
+        [-1., 0., 0.],
+        0,
+        EMISSIVE,
+        u32::MAX,
+    );
+    put(&mut b, patch);
     h.ray.install(Ok((b.finish(), bank)));
     let empty = Builder::default().finish();
     let from_srgb = |v: f32| {
@@ -4111,35 +4129,59 @@ fn lighter_a07_authored_medium() {
             ((v + 0.055) / 1.055).powf(2.4)
         }
     };
-    let dist = eye.y - bed_y;
+    let probes = [
+        ("above", dry, -Vec3::Y, 0., 0),
+        (
+            "surface",
+            Vec3::new(eye.x, area.height, eye.z),
+            -Vec3::Y,
+            0.,
+            0,
+        ),
+        (
+            "just-below",
+            Vec3::new(eye.x, area.height - 0.125, eye.z),
+            -Vec3::Y,
+            area.height - 0.125 - bed_y,
+            1,
+        ),
+        ("submerged", eye, -Vec3::Y, eye.y - bed_y, 1),
+        ("resurface", dry, -Vec3::Y, 0., 0),
+        ("wet-to-dry", Vec3::new(-66., eye.y, eye.z), Vec3::X, 2., 1),
+        ("dry-gap", Vec3::new(-60., eye.y, eye.z), Vec3::X, 0., 0),
+    ];
     for hour in [12., 0.] {
-        let fog = env.underwater(eye.to_array(), hour);
-        let hue = Vec3::from_array(fog.color.map(from_srgb));
-        let bias = Vec3::ONE + 0.5 * (Vec3::ONE - hue / hue.max_element().max(1e-5));
-        let tr = Vec3::from_array(
-            (bias * (-4.321928 * dist / (fog.end - fog.start).max(0.01)))
-                .to_array()
-                .map(f32::exp2),
-        );
-        assert!(tr.max_element() < 1. && tr.min_element() > 0.);
-        let mut frame = test_frame(eye, -Vec3::Y, 3);
-        frame.resident_bounds = [-512., 512., -512., 512.];
-        frame.water_effects = wet;
-        frame.water = [fog.start, fog.end, 1., 0.];
-        frame.water_color = hue.extend(0.).to_array();
-        let actual = h.pixel(frame, &empty);
-        let expected = hue * (Vec3::ONE - tr) + tr;
-        assert_radiance("a07 wet-cell attenuation", actual, expected.to_array());
-        frame.water[2] = 0.;
-        let unattenuated = h.pixel(frame, &empty);
-        assert_radiance(
-            "a07 identical ray with extinction disabled",
-            unattenuated,
-            [1.; 3],
-        );
-        assert_eq!(actual.1, unattenuated.1);
-        assert_ne!(actual.0, unattenuated.0);
-        eprintln!("a07 water {} hour {hour}: eye depth {:.5}, wet path {dist:.5}, fog range [{}, {}], linear hue {hue}, expected RGB transmittance {tr}, actual linear UNORM8 {:?} vs dry media-control {:?} at reverse-Z {}", area.export_id, area.height - eye.y, fog.start, fog.end, actual.0, unattenuated.0, actual.1);
+        for (label, position, direction, dist, body) in probes {
+            let fog = env.underwater(position.to_array(), hour);
+            let hue = Vec3::from_array(fog.color.map(from_srgb));
+            let bias = Vec3::ONE + 0.5 * (Vec3::ONE - hue / hue.max_element().max(1e-5));
+            let tr = Vec3::from_array(
+                (bias * (-4.321928 * dist / (fog.end - fog.start).max(0.01)))
+                    .to_array()
+                    .map(f32::exp2),
+            );
+            let mut frame = test_frame(position, direction, 3);
+            frame.resident_bounds = [-512., 512., -512., 512.];
+            frame.water_effects =
+                crate::gpu::ray_test_wet_grid(&mut Textures::default(), &areas, position);
+            assert_eq!(frame.water_effects, [0, body, wet[2], wet[3]], "{label}");
+            frame.water = [fog.start, fog.end, 1., 0.];
+            frame.water_color = hue.extend(0.).to_array();
+            let actual = h.pixel(frame, &empty);
+            let expected = hue * (Vec3::ONE - tr) + tr;
+            assert_radiance(label, actual, expected.to_array());
+            frame.water[2] = 0.;
+            let unattenuated = h.pixel(frame, &empty);
+            assert_radiance(
+                "a07 identical ray with extinction disabled",
+                unattenuated,
+                [1.; 3],
+            );
+            assert_eq!(actual.1, unattenuated.1);
+            assert_eq!(actual.0 == unattenuated.0, dist == 0.);
+            eprintln!("a07 water {} hour {hour} {label}: eye={position} body={body} wet_path={dist:.5} fog=[{},{}] tr={tr} rgba8={:?} control={:?} reverse_z={}",
+                area.export_id, fog.start, fog.end, actual.0, unattenuated.0, actual.1);
+        }
     }
 }
 

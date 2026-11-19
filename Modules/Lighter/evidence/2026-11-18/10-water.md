@@ -72,3 +72,33 @@ The connected Drive supplied the small records, but the matching
 pixels are in the [hosted CPU receipt](09-retail.md); transfer status in
 [delivery](14-delivery.md). The existing [analytic transmission tests](../../media.md)
 measure RGB attenuation on synthetic segments, not the a07 retail view.
+
+## Ordered follow-up: surface and dry-cell controls (S)
+
+The expanded recorded-water probe checks the real a07 footprint at hours
+12 and 0 through **above → at the surface → just below → submerged →
+resurfaced**, and adds a horizontal crossing to a dry neighbor. This is a
+sequence of shader probes, **not** a live, refracted surface capture. The
+vertical white receiver omits the interface on purpose so the result isolates
+origin medium and extinction; the horizontal white receiver is diagnostic
+geometry, not the retail bed. A no-extinction draw at the same pose is the
+control in each pair.
+
+| Probe, both hours | Selected water | Expected wet ray length | Linear RGBA8 / no-extinction control |
+| --- | ---: | ---: | --- |
+| Above, exact surface, returned above | None | 0.00000 | `[255,255,255,255]` / same |
+| 0.125 units below | 381 | 3.74277 | `[220,223,229,255]` / white |
+| Eye Y329, down | 381 | 2.03726 | `[235,237,241,255]` / white |
+| X−66 toward X−58 at Z−144, Y329 | 381 | 2.00000 of 8.0 | `[235,237,241,255]` / white |
+| X−60 toward X−58 at Z−144, Y329 | None (dry cell below plane) | 0.00000 | `[255,255,255,255]` / same |
+
+All 14 probe/control pairs preserved reverse-Z at a fixed pose and matched
+predicted RGB within linear UNORM8 tolerance. The horizontal probe verifies
+attenuation stops at the authored X−64 wet-cell edge rather than carrying
+through all 8 units. Retain `10-water/a07-authored-crossing.log` and the
+listed input hashes. For live captures, keep XZ `(80,-144)` and interpolate
+Y `332.66 → 329 → 332.66` with fixed yaw/pitch and holds before and after.
+The new motion CSV records `eye_underwater_depth` per frame; bind it to the
+PNG and review the refraction/medium boundary before drawing any parity
+conclusion. The lightmaps-on Native shoreline comparisons and transition
+verdicts remain **not measured on target**.
