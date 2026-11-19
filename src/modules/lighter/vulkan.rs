@@ -975,7 +975,11 @@ impl Drop for Output {
     }
 }
 
-type ResidentKey = (u32, MeshKey);
+type ResidentKey = (u32, MeshKey, u32);
+
+fn resident_key(bit: u32, mesh: &MeshRange) -> ResidentKey {
+    (bit, mesh.key, mesh.rt_triangles)
+}
 
 #[derive(Default)]
 struct ResidentBlas {
@@ -1008,6 +1012,7 @@ pub struct Renderer {
     textures: Option<Upload>,
     instances: Option<Upload>,
     blas: HashMap<ResidentKey, ResidentBlas>,
+    rt_triangles: u64,
     tlas: Option<Structure>,
     members: Vec<ResidentKey>,
     instance_data: Vec<TlasInstance>,
@@ -1123,6 +1128,7 @@ impl Renderer {
             blas: HashMap::new(),
             tlas: None,
             members: Vec::new(),
+            rt_triangles: 0,
             instance_data: Vec::new(),
             last_moving_keys: Vec::new(),
             scratch: None,
@@ -1194,7 +1200,7 @@ impl Renderer {
     }
 
     fn blas(ctx: &Context, packet: &Packet, m: &MeshRange, base: u64, update: bool) -> R<Build> {
-        let count = m.triangle.len() as u32;
+        let count = m.rt_triangles;
         if u64::from(count) > ctx.max_primitives {
             return Err("Lighter mesh exceeds Vulkan BLAS primitive limit".into());
         }
@@ -1237,9 +1243,10 @@ impl Renderer {
             tlas: None,
             scratch_bytes: 0,
         };
-        plan.live.extend(world.meshes.iter().map(|m| (0, m.key)));
         plan.live
-            .extend(moving.meshes.iter().map(|m| (DYNAMIC_BIT, m.key)));
+            .extend(world.meshes.iter().map(|m| resident_key(0, m)));
+        plan.live
+            .extend(moving.meshes.iter().map(|m| resident_key(DYNAMIC_BIT, m)));
         // The previous fence retired. Evict departed chunks before growing
         // storage for their replacements, rather than peaking at both sets.
         self.blas.retain(|key, _| plan.live.contains(key));
@@ -1251,7 +1258,7 @@ impl Renderer {
         ] {
             let base = upload.gpu.address();
             for m in &packet.meshes {
-                let key = (bit, m.key);
+                let key = resident_key(bit, m);
                 if !packed.insert(key) {
                     continue;
                 }
@@ -1267,7 +1274,7 @@ impl Renderer {
             }
             for (id, i) in packet.instances.iter().enumerate() {
                 let m = &packet.meshes[i.mesh as usize];
-                let key = (bit, m.key);
+                let key = resident_key(bit, m);
                 instances.push((
                     key,
                     TlasInstance {
@@ -1323,6 +1330,10 @@ impl Renderer {
             plan.tlas = Some(tlas);
         }
         Ok(plan)
+    }
+
+    pub(super) fn rt_counts(&self) -> [u64; 2] {
+        [self.rt_triangles, self.members.len() as u64]
     }
 
     pub(super) fn gpu_stages(&self) -> Option<([u32; 4], [f64; 3])> {
@@ -1863,6 +1874,7 @@ impl Renderer {
                 .extend(moving.meshes.iter().map(|m| m.key));
         }
         if let Some(plan) = plan {
+            self.rt_triangles = plan.live.iter().map(|key| u64::from(key.2)).sum();
             for (key, shape, build) in plan.blas {
                 self.blas.get_mut(&key).unwrap().shape = Some(shape);
                 let slot = usize::from(key.0 == DYNAMIC_BIT);

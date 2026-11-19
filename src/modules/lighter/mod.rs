@@ -1083,6 +1083,14 @@ impl Lighter {
         self.last_primary
     }
 
+    pub(crate) fn travel_rt_counts(&self) -> Option<[u64; 2]> {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if self.settings.mode == Mode::Hardware {
+            return self.hardware.as_ref().map(vulkan::Renderer::rt_counts);
+        }
+        None
+    }
+
     pub(crate) fn travel_trace(&self) -> ((u32, u32), (u32, bool, bool)) {
         (
             self.last_trace_extent,

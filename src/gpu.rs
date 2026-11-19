@@ -8604,6 +8604,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     };
                                     let ray = actual_rays.then(|| lighter_travel::RaySample {
                                         primary: renderer.lighter.travel_primary(),
+                                        acceleration: renderer.lighter.travel_rt_counts(),
                                         textures: renderer.lighter.travel_textures(),
                                         pacing: if committed { renderer.lighter.travel_pacing() } else { None },
                                     });

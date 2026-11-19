@@ -502,9 +502,58 @@ pub enum MeshKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct MotionOwner(pub &'static str, pub u64, pub Fingerprint);
 
+fn exact_prefix(triangles: &[[u32; 3]]) -> usize {
+    if triangles.len() < 20 {
+        return triangles.len();
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut end = 0;
+    for (i, &triangle) in triangles.iter().enumerate() {
+        // Use ordered indices, not positions: UVs, authored normals, tints
+        // and orientation must be identical. No welding across a seam.
+        if seen.insert(triangle) {
+            end = i + 1;
+        }
+    }
+    end
+}
+
+#[cfg(test)]
+#[test]
+fn exact_rt_proxy_leaves_distinct_faces_and_materials_intact() {
+    let mut b = Builder {
+        hardware_only: true,
+        exact_proxy: true,
+        ..Default::default()
+    };
+    let a = b.surface(Surface::new(0, 0, 0., 0.));
+    let cutout = b.surface(Surface::new(0, CUTOUT, 0.5, 0.));
+    let mut mesh = Mesh::default();
+    mesh.vertices = vec![Vertex::new([0.; 3], [0., 1., 0.], [0.; 2]); 4];
+    mesh.tri([0, 1, 2], a);
+    mesh.tri([2, 3, 0], a);
+    for _ in 2..20 {
+        mesh.tri([0, 1, 2], a);
+    }
+    let first = b.mesh(&mesh).unwrap().unwrap();
+    mesh.surfaces[19] = cutout;
+    let mixed = b.mesh(&mesh).unwrap().unwrap();
+    mesh.surfaces[19] = a;
+    mesh.triangles[19] = [2, 1, 0];
+    let flipped = b.mesh(&mesh).unwrap().unwrap();
+    let p = b.finish();
+    let counts = [first, mixed, flipped].map(|id| p.meshes[id as usize].rt_triangles);
+    assert_eq!(counts, [2, 20, 20]);
+    assert_eq!(p.triangles(), 60);
+    eprintln!(
+        "S duplicate-tail fixture: {counts:?} actual build slots; 60 source triangles retained"
+    );
+}
+
 pub struct MeshRange {
     pub vertex: Range<u32>,
     pub triangle: Range<u32>,
+    pub(super) rt_triangles: u32,
     pub mask: u8,
     pub opaque: bool,
     emitters: Vec<u32>,
@@ -612,6 +661,7 @@ impl From<Surface> for RayMaterial {
 #[derive(Default)]
 pub struct Builder {
     hardware_only: bool,
+    exact_proxy: bool,
     rigid_parts: HashMap<Fingerprint, u32>,
     vertices: Vec<Vertex>,
     triangles: Vec<[u32; 3]>,
@@ -809,6 +859,8 @@ impl Builder {
     pub(crate) fn for_mode(mode: super::Mode) -> Self {
         Self {
             hardware_only: mode == super::Mode::Hardware,
+            exact_proxy: mode == super::Mode::Hardware
+                && std::env::var("PW_RAY_EXACT_PROXY").as_deref() == Ok("1"),
             ..Self::default()
         }
     }
@@ -1010,6 +1062,20 @@ impl Builder {
             mask |= material.mask;
             opaque &= material.mask == first_mask && material.unconditional;
         }
+        // Only remove an exact redundant suffix. Retain the original indices
+        // used by Hit, all material bindings and the full raster packet.
+        let rt_triangles = if self.exact_proxy
+            && matches!(key, MeshKey::Static(None | Some(ChunkKey::Scenery(..)), _))
+            && opaque
+            && mask == MASK_SOLID | MASK_SECONDARY | MASK_BLOCKER
+            && emitters.is_empty()
+            && mesh.layers.is_empty()
+            && mesh.surfaces.iter().all(|&id| id == mesh.surfaces[0])
+        {
+            exact_prefix(&mesh.triangles)
+        } else {
+            mesh.triangles.len()
+        } as u32;
         // Don't leave partial ranges behind if validation rejected this draw.
         self.triangles.extend_from_slice(&mesh.triangles);
         self.material_layers
@@ -1031,6 +1097,7 @@ impl Builder {
         self.meshes.push(MeshRange {
             vertex: vertex_start..self.vertices.len() as u32,
             triangle: tri_start..self.triangles.len() as u32,
+            rt_triangles,
             mask,
             opaque,
             emitters,

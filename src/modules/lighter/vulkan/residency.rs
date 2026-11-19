@@ -327,7 +327,7 @@ impl ResidentUpload {
         let end = (self.mesh_at + MESHES_PER_POLL).min(packet.meshes.len());
         while self.mesh_at < end {
             let mesh = &packet.meshes[self.mesh_at];
-            let key = (0, mesh.key);
+            let key = resident_key(0, mesh);
             if self
                 .blas
                 .get(&key)
@@ -337,7 +337,7 @@ impl ResidentUpload {
                 self.mesh_at += 1;
                 continue;
             }
-            let count = mesh.triangle.len();
+            let count = mesh.rt_triangles as usize;
             // A single indivisible BLAS may exceed the triangle target.
             if !builds.is_empty()
                 && (self.startup

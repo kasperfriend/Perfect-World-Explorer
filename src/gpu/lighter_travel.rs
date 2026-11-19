@@ -251,6 +251,7 @@ pub(super) struct MotionSample {
 
 pub(super) struct RaySample {
     pub(super) primary: [u64; 2],
+    pub(super) acceleration: Option<[u64; 2]>,
     pub(super) textures: [u64; 5],
     pub(super) pacing: Option<[u64; 6]>,
 }
@@ -646,7 +647,7 @@ impl Travel {
             )?;
         }
         if self.mode != Mode::Off {
-            write!(out, ",primary_solid_queries_traced,primary_solid_queries_skipped,ray_texture_bank_bytes,ray_bc_tiles,ray_bc5_tiles,ray_bc7_tiles,ray_bc_image_allocated_bytes,resident_copy_batches,resident_host_bytes,resident_reused_bytes,resident_max_batch_bytes,resident_blas_batches,resident_blas_builds")?;
+            write!(out, ",primary_solid_queries_traced,primary_solid_queries_skipped,rt_unique_blas_triangles,rt_tlas_instances,ray_texture_bank_bytes,ray_bc_tiles,ray_bc5_tiles,ray_bc7_tiles,ray_bc_image_allocated_bytes,resident_copy_batches,resident_host_bytes,resident_reused_bytes,resident_max_batch_bytes,resident_blas_batches,resident_blas_builds")?;
         }
         writeln!(out)?;
         for (i, s) in self.samples.iter().enumerate() {
@@ -695,7 +696,15 @@ impl Travel {
                 )?;
             }
             if let Some(ray) = &s.ray {
-                for counter in ray.primary.into_iter().chain(ray.textures) {
+                for counter in ray.primary {
+                    write!(out, ",{counter}")?;
+                }
+                if let Some([triangles, instances]) = ray.acceleration {
+                    write!(out, ",{triangles},{instances}")?;
+                } else {
+                    write!(out, ",,")?;
+                }
+                for counter in ray.textures {
                     write!(out, ",{counter}")?;
                 }
                 if let Some(pacing) = ray.pacing {
