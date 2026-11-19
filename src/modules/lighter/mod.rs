@@ -1913,8 +1913,16 @@ impl Lighter {
         frame.options[0] |= u32::from(settings.lighting)
             | u32::from(settings.shadows) << 1
             | u32::from(settings.reflections) << 2
-            | if settings.ray_lighting { RAY_LIGHTING_OVERLAY } else { 0 }
-            | if settings.single_path { SINGLE_PATH } else { 0 }
+            | if settings.ray_lighting {
+                RAY_LIGHTING_OVERLAY
+            } else {
+                0
+            }
+            | if settings.single_path {
+                SINGLE_PATH
+            } else {
+                0
+            }
             | if settings.physical_bsdf {
                 PHYSICAL_BSDF
             } else {
