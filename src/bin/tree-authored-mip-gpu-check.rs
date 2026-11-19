@@ -118,6 +118,9 @@ fn main() {
             tree_type: 0,
             position: [0., 0., 0.],
         }],
+        // These trees are here because the check put them here: the map did not
+        // switch them off, so there is no reason to show.
+        off_reason: None,
     };
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();

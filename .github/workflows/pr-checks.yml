@@ -116,6 +116,11 @@ jobs:
               echo "::error file=$binary::declares no module for: $missing"
               exit 1
             fi
+            short="$(python3 tools/binary-field-closure.py "$binary")" || exit 1
+            if [ -n "$short" ]; then
+              echo "::error file=$binary::$short"
+              exit 1
+            fi
           done
       - name: Test requirement status audits
         run: |

@@ -766,8 +766,18 @@ case "${1:-test}" in
                 echo "FAIL $name: declares no module for: $missing"
                 holes=$((holes + 1))
             fi
+            # And the other half of the same blind spot: a field added to a
+            # shared struct is a latent compile error in every hand-built
+            # fixture here, and `Trees::off_reason` stopped two GPU targets
+            # without this mode seeing it.
+            short="$(python3 "$REPO"/tools/binary-field-closure.py "$path")" || {
+                failed=$((failed + 1)); holes=$((holes + 1)); continue; }
+            if [ -n "$short" ]; then
+                echo "$short" | sed "s|^|FAIL $name: |"
+                holes=$((holes + 1))
+            fi
         done
-        echo "bins: $((total - failed))/$total type-check clean, $holes missing module declaration(s)"
+        echo "bins: $((total - failed))/$total type-check clean, $holes closure finding(s)"
         [ "$failed" -eq 0 ] && [ "$holes" -eq 0 ] ;;
     test)  toolchain; sysroot; deps; real_deps
         # `angelica_pck` is in the closure and it really decompresses, so the

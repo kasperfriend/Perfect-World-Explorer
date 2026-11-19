@@ -118,6 +118,9 @@ pub fn run(authored_mips: bool) {
             tree_type: 0,
             position: [0., 0., 0.],
         }],
+        // These trees are here because the check put them here: the map did not
+        // switch them off, so there is no reason to show.
+        off_reason: None,
     };
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
@@ -530,7 +533,11 @@ fn multi_group(device: &wgpu::Device, queue: &wgpu::Queue) {
             position: [0., 0., 0.],
         })
         .collect();
-    let trees = trees::Trees { types, placements };
+    let trees = trees::Trees {
+        types,
+        placements,
+        off_reason: None,
+    };
     // The LOD pass never reads the camera uniform; the forest only has to bind
     // one, so nothing here is drawn through it.
     let camera = device.create_buffer(&wgpu::BufferDescriptor {
