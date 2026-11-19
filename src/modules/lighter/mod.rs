@@ -3,6 +3,7 @@
 //! writes the scene and reverse-Z depth target, never both.
 mod bvh;
 pub(crate) mod coverage;
+mod game_profile;
 pub(crate) mod model_feed;
 mod post;
 mod profile;
@@ -228,6 +229,7 @@ pub struct Frame {
     pub water_effects: [u32; 4],   // simple tile, initial body, wet-cell table, body count
     pub sky_cdf: [u32; 4],         // current and next sky CDF offsets
     pub previous_screen_vp: [[f32; 4]; 4],
+    pub ray_effects: [f32; 4], // opt-in specular/sun/diffuse length limits and active tag
 }
 
 // Matches Pixel in pixels.wgsl. Includes padding-free guide storage.
@@ -898,6 +900,8 @@ pub struct Lighter {
     screen_last_flags: u32,
     last_trace_extent: (u32, u32),
     last_primary: [u64; 2],
+    game_profile: Option<[f32; 4]>,
+    game_profile_active: bool,
     adapter_supports_compute: bool,
     has_hardware_device: bool,
     native_backend: wgpu::Backend,
@@ -958,6 +962,8 @@ impl Default for Lighter {
             screen_last_flags: 0,
             last_trace_extent: (0, 0),
             last_primary: [0, 0],
+            game_profile: game_profile::requested(),
+            game_profile_active: false,
             adapter_supports_compute: false,
             has_hardware_device: false,
             native_backend: wgpu::Backend::Empty,
@@ -1081,6 +1087,10 @@ impl Lighter {
     /// of ray-box/triangle tests or later ordered/secondary traversals.
     pub(crate) fn travel_primary(&self) -> [u64; 2] {
         self.last_primary
+    }
+
+    pub(crate) fn game_profile_active(&self) -> bool {
+        self.game_profile_active
     }
 
     pub(crate) fn travel_rt_counts(&self) -> Option<[u64; 2]> {
@@ -1574,6 +1584,7 @@ impl Lighter {
                 let reuse = self.screen_reuse != 0;
                 let temporal = self.reconstruction.is_some();
                 let hybrid = self.settings.hybrid_primary;
+                let game = self.game_profile.is_some() && hybrid;
                 let pages = self
                     .world
                     .as_ref()
@@ -1581,7 +1592,7 @@ impl Lighter {
                     .map(|w| w.textures.bc_pages.clone());
                 std::thread::Builder::new().name("lighter-pipeline-startup".into()).spawn(move || {
                     let progress = |step| { let _ = tx.send(ColdRayBuild::Progress(step)); };
-                    let build = |temporal| vulkan::Renderer::new_tracked(&device, compact, reuse, pages.as_ref(), temporal, progress);
+                    let build = |temporal| vulkan::Renderer::new_tracked(&device, compact, reuse, pages.as_ref(), temporal, game, progress);
                     let made = match build(temporal) {
                         Err(error) if temporal && !crate::gpu::reconstruction_device_lost(&error) => {
                             eprintln!("Lighter temporal tracer unavailable; using portable resolve: {error}");
@@ -1718,6 +1729,7 @@ impl Lighter {
                             .map(|w| &w.textures.bc_pages)
                             .filter(|_| self.bc_pages),
                         temporal,
+                        self.game_profile.is_some() && self.settings.hybrid_primary,
                     )
                 };
                 self.hardware = Some(match build(temporal_capable) {
@@ -1835,6 +1847,21 @@ impl Lighter {
         frame.options[1] = settings.bounces;
         frame.options[2] = settings.samples;
         frame.material_time[3] = settings.diffuse_distance as f32;
+        frame.ray_effects = [0.; 4];
+        if settings.mode == Mode::Hardware
+            && settings.hybrid_primary
+            && settings.samples == 1
+            && !settings.reference
+            && !settings.progressive
+            && settings.bounces == 1
+            && (settings.lighting || settings.reflections)
+            && rw <= w.div_ceil(2)
+            && rh <= h.div_ceil(2)
+        {
+            if let Some(flags) = self.game_profile {
+                frame.ray_effects = flags;
+            }
+        }
         let (bytes, screen) = self.frame_image_layout(device, frame.extent);
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         let unjittered = frame;
@@ -1863,6 +1890,9 @@ impl Lighter {
             let _ = camera;
             false
         };
+        if vendor_frame {
+            frame.ray_effects = [0.; 4];
+        }
         if self.present.is_none() {
             self.present = Some(checked_pipeline(device, || {
                 Present::new(device, format, false)
@@ -2088,6 +2118,7 @@ impl Lighter {
         }
         self.frame_error = None;
         self.last_trace_extent = (rw, rh);
+        self.game_profile_active = frame.ray_effects[3] != 0. && self.raster_active();
         let solid_slots =
             if (world.packet.words[11] | moving.words[11]) & u32::from(scene::MASK_SOLID) != 0 {
                 u64::from(rw) * u64::from(rh) * u64::from(settings.samples)

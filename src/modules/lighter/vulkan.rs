@@ -1044,8 +1044,9 @@ impl Renderer {
         reuse: bool,
         pages: Option<&super::textures::bc_pages::Plans>,
         temporal: bool,
+        game: bool,
     ) -> R<Self> {
-        Self::new_tracked(device, compact, reuse, pages, temporal, |_| {})
+        Self::new_tracked(device, compact, reuse, pages, temporal, game, |_| {})
     }
 
     pub(super) fn new_tracked(
@@ -1054,6 +1055,7 @@ impl Renderer {
         reuse: bool,
         pages: Option<&super::textures::bc_pages::Plans>,
         temporal: bool,
+        game: bool,
         progress: impl Fn(&'static str),
     ) -> R<Self> {
         let ctx = Context::new(device)?;
@@ -1090,7 +1092,13 @@ impl Renderer {
                 &bc_pages::material_source(bc),
                 temporal,
             );
+            // Keep the full-ray fallback unchanged, even in a game profile.
             let spirv = shader(&source)?;
+            let source = if game {
+                super::game_profile::specialize(source)?
+            } else {
+                source
+            };
             progress("Ray shader validated and lowered; creating compute pipeline");
             let core = Core::new(ctx.clone(), &spirv, bc.len())?;
             progress("Ray compute pipelines compiled: 1");

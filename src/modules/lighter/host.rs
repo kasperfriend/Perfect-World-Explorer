@@ -700,6 +700,7 @@ impl Feed {
         let [water_table, body_count] = self.source.water.table();
         lighter::Frame {
             previous_screen_vp: [[0.; 4]; 4],
+            ray_effects: [0.; 4],
             vp: matrix.to_cols_array_2d(),
             inv_vp: matrix.inverse().to_cols_array_2d(),
             eye: camera.pos.extend(camera.far).to_array(),
