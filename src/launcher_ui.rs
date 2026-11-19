@@ -250,6 +250,19 @@ pub fn set_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `LOCALAPPDATA` is process-global and libtest runs tests in parallel
+    /// threads, so the three that set, remove and depend on it would race. This
+    /// is not theoretical: the launcher suite passed on this machine and failed
+    /// in CI on this exact step, because the ordering that happened to hold here
+    /// did not hold there. One lock, taken by every test that touches the
+    /// variable, makes the ordering explicit.
+    static ENV: Mutex<()> = Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// The stored form is exactly `1` or `0`, and nothing else is a value.
     #[test]
@@ -278,6 +291,7 @@ mod tests {
     /// the value in memory before it.
     #[test]
     fn a_toggle_writes_the_new_value_and_updates_the_state() {
+        let _guard = env_guard();
         let mut state = State::default();
         assert!(!state.low_memory);
         // `save_low_memory` needs `LOCALAPPDATA`; point it at a temp directory
@@ -303,6 +317,7 @@ mod tests {
     /// every click and still start unchecked.
     #[test]
     fn initialize_restores_the_stored_toggle() {
+        let _guard = env_guard();
         let dir = std::env::temp_dir().join("pw-launcher-restore-test");
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
@@ -331,6 +346,7 @@ mod tests {
 
     #[test]
     fn a_missing_environment_is_an_error_not_a_silent_default() {
+        let _guard = env_guard();
         unsafe { std::env::remove_var("LOCALAPPDATA") };
         assert!(save_low_memory(true).is_err());
         assert_eq!(load_low_memory(), None);
