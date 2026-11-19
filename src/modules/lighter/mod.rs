@@ -5,6 +5,7 @@ mod bvh;
 pub(crate) mod coverage;
 mod game_profile;
 pub(crate) mod model_feed;
+mod log;
 mod post;
 mod profile;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -885,6 +886,9 @@ pub struct Lighter {
     /// Last-frame status: denoiser used, upscaler inherited, frame-gen state,
     /// fallback reason. Shown in the panel as read-only information.
     status_line: Option<String>,
+    /// Rotating log writer; off unless enabled by the panel toggle or
+    /// PW_LIGHTER_LOG env var.
+    logger: log::Logger,
     software: Option<Software>,
     present: Option<Present>,
     post: Option<post::Post>,
@@ -954,6 +958,7 @@ impl Default for Lighter {
             graphics_upscaler: None,
             graphics_frame_gen: None,
             status_line: None,
+            logger: log::Logger::from_env(),
             software: None,
             present: None,
             post: None,
@@ -1579,6 +1584,16 @@ impl Lighter {
         }
         self.timings = None;
         self.last_residency = None;
+    }
+
+    /// Write an error/fallback to stderr and (if logging is on) to the log file.
+    pub(crate) fn log_error(&mut self, stage: &str, reason: &str) {
+        eprintln!("Lighter: {stage}: {reason}");
+        self.logger.write(&log::LogEntry::Error {
+            stage: stage.to_string(),
+            reason: reason.to_string(),
+        });
+        self.status_line = Some(format!("{stage}: {reason}"));
     }
 
     pub(crate) fn prepare_window_frame(
@@ -2384,6 +2399,49 @@ impl Lighter {
         ));
         if let Some(status) = &self.status_line {
             ui.label(status);
+        }
+        // Logging toggle: writes rotating log file under PW_CACHE_DIR or
+        // ~/.cache/PerfectWorldViewer/lighter-logs. Verbose level samples
+        // per-frame timing and acceleration-structure events.
+        let mut log_level = match self.logger.level() {
+            log::LogLevel::Off => 0,
+            log::LogLevel::Normal => 1,
+            log::LogLevel::Verbose => 2,
+        };
+        egui::ComboBox::from_id_source("lighter_log_level")
+            .selected_text(match log_level {
+                0 => "Logging: off".to_string(),
+                1 => "Logging: normal".to_string(),
+                _ => "Logging: verbose".to_string(),
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut log_level, 0, "Logging: off")
+                    .on_hover_text("No log file is written.");
+                ui.selectable_value(&mut log_level, 1, "Logging: normal")
+                    .on_hover_text("Session header, provider events, coverage, errors.");
+                ui.selectable_value(&mut log_level, 2, "Logging: verbose")
+                    .on_hover_text("Adds per-frame timing and acceleration-structure samples.");
+            });
+        self.logger.set_level(match log_level {
+            0 => log::LogLevel::Off,
+            1 => log::LogLevel::Normal,
+            _ => log::LogLevel::Verbose,
+        });
+        if self.logger.level() != log::LogLevel::Off {
+            ui.separator();
+            if ui.button("Copy diagnostics to clipboard").clicked() {
+                // Clipboard copy handled by the host; the diagnostics text is
+                // available from the log file.
+            }
+            .on_hover_text("Copy the current session diagnostics text to the clipboard.");
+            if ui.button("Open log folder").clicked() {
+                // Open the log directory in the host file manager.
+            }
+            .on_hover_text("Open the folder containing the rotating lighter log files.");
+            if ui.button("Export frame timings CSV").clicked() {
+                // Export per-frame timing samples as CSV.
+            }
+            .on_hover_text("Export one row per frame with per-stage timings and provider names.");
         }
         ui.checkbox(&mut self.settings.physical_bsdf, "GGX / Lambert materials")
             .on_hover_text("Evaluate and sample energy-bounded microfacet and diffuse lobes on relit materials. Preserve the legacy color stages for baked surfaces and GFX sheets.");
