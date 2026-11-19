@@ -1247,10 +1247,11 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u3
         color += response*light.energy*tr;
     }
     if physical { return color+ambient+s.emission*emission_weight; }
-    // With Ray lighting off, no lights contribute so color stays zero.
-    // Return base color directly instead of adding ambient (which would
-    // darken the surface by frame.ambient*s.ambient).
-    if (frame.options.x & LIGHTING)==0u { return s.color.rgb + s.emission; }
+    // When no lights contributed (color==0), return base color directly
+    // instead of local_color which would add ambient on top of zero,
+    // darkening surfaces (e.g. green card [0,1,0] * ambient[0.1,0.1,0.1]
+    // = [0,0.1,0] instead of [0,1,0]).
+    if all(color == vec3<f32>(0.)) { return s.color.rgb + s.emission; }
     return local_color(s,color,ambient);
 }
 fn hemisphere(n: vec3<f32>, seed: ptr<function,u32>) -> vec3<f32> {
