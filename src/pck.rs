@@ -197,6 +197,29 @@ pub(crate) const REVISIONS: [Revision; 3] = [
 pub(crate) const GUARD_0: u32 = 0xfdfdfeee;
 pub(crate) const GUARD_1: u32 = 0xf00dbeef;
 
+/// `dwFlags` bit 31: the package's entry records and payloads are enciphered.
+///
+/// Named rather than spelled `0x80000000` at the refusal, because the *bit* is
+/// a fact about the format and the refusal is a fact about this build. The
+/// client clears this bit itself when it opens such a package; this reader has
+/// no deciphering step, so it stops here -- but it stops by *name*.
+pub(crate) const ENCRYPTED_FLAG: u32 = 0x8000_0000;
+
+/// The package is a well-formed retail package that this build cannot read.
+///
+/// It is deliberately distinguishable from a corrupt archive. Every other
+/// rejection says "these bytes are not a package"; this one says "these bytes
+/// are a package, and here is the feature the reader lacks". A survey that
+/// cannot tell the two apart reports a shipped archive as broken, which is how
+/// an unsupported feature hides for years -- so the census and the harnesses
+/// match this text and count it as a skip, not a failure.
+pub(crate) const ENCRYPTED_REFUSAL: &str = "encrypted package unsupported";
+
+/// Whether a reader error is [`ENCRYPTED_REFUSAL`] rather than a parse failure.
+pub fn is_encrypted_refusal(err: &str) -> bool {
+    err.starts_with(ENCRYPTED_REFUSAL)
+}
+
 /// The revision whose trailer *is* an Angelica package trailer.
 ///
 /// `configs.pck` and `shaders.pck` carry the same 280-byte tail as the retail
@@ -458,8 +481,17 @@ fn read_directory(
     let reader: &File = &files.last().ok_or("package holds no file")?.0;
     let part_end = end - base;
     let (rev, count, header) = read_trailer(reader, part_end)?;
-    if u32le(&header, rev.flags_at)? & 0x80000000 != 0 {
-        return Err("encrypted package unsupported".into());
+    let flags = u32le(&header, rev.flags_at)?;
+    if flags & ENCRYPTED_FLAG != 0 {
+        // Name the revision and the flag word: "unsupported" without the
+        // revision leaves a reader unable to tell an enciphered package from a
+        // truncated one, and the version is the thing that would have to be
+        // supported next.
+        return Err(format!(
+            "{ENCRYPTED_REFUSAL}: revision {:08x} sets dwFlags {flags:08x} \
+             (bit 31); this build reads the directory only in the clear",
+            rev.version
+        ));
     }
     if count > 1_000_000 {
         return Err("entry count exceeds limit".into());
@@ -1165,6 +1197,34 @@ pub fn skipped_corpus_tests() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An enciphered package must be refused by *name*, not as corruption.
+    ///
+    /// A census that cannot tell "feature this build lacks" from "archive is
+    /// damaged" reports a shipped pack as broken. `is_encrypted_refusal` is the
+    /// predicate the survey tools use to count it as a skip instead, so it has
+    /// to be true for the refusal this reader actually produces and false for
+    /// every other one.
+    #[test]
+    fn the_encrypted_refusal_is_named_and_recognisable() {
+        assert!(is_encrypted_refusal(ENCRYPTED_REFUSAL));
+        assert!(is_encrypted_refusal(&format!(
+            "{ENCRYPTED_REFUSAL}: revision 00020002 sets dwFlags 80000000 (bit 31)"
+        )));
+        // The neighbouring refusals must not read as an encrypted package.
+        for other in [
+            "unsupported PCK version 00020009",
+            "unsupported PCK guard keys",
+            "entry count exceeds limit",
+            "not an Angelica file package (description tag missing)",
+        ] {
+            assert!(
+                !is_encrypted_refusal(other),
+                "{other:?} must not be mistaken for an encrypted package"
+            );
+        }
+        assert_eq!(ENCRYPTED_FLAG, 1 << 31);
+    }
 
     /// The Angelica readers and the retail reader must agree on the trailer.
     ///

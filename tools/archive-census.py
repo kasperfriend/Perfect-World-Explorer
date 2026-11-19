@@ -126,7 +126,15 @@ def ext_of(name):
 
 
 def census(path):
-    version, entries = pck.directory(path)
+    try:
+        version, entries = pck.directory(path)
+    except pck.EncryptedPackage as e:
+        # Not a parse failure and not a gap in the parser table: this archive
+        # uses a feature the reader lacks. Saying so by name keeps the census
+        # from reporting a shipped pack as damaged, and keeps it out of the
+        # "unsupported members" list, which is about formats, not containers.
+        print(f"SKIPPED: {path}: {e}")
+        return None, []
     rows = []
     for name, offset, size, flag in entries:
         ext = ext_of(name)
@@ -180,6 +188,10 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     version, rows = census(args.pack)
+    if version is None:
+        # `census` already said why. Exit 0: the pack is out of this reader's
+        # reach, which is not a failed census.
+        return 0
     counts, by_ext = summarize(rows)
     print(f"{args.pack}  version {version:#x}  members {len(rows)}")
     for status in ("supported", "out-of-scope", "unsupported"):

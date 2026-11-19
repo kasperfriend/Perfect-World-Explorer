@@ -55,6 +55,49 @@ class ClassificationTests(unittest.TestCase):
         for ext in census.SUPPORTED:
             self.assertIn(ext, census.HANDLED, ext)
 
+    def test_an_enciphered_package_is_skipped_not_reported_damaged(self):
+        """A sealed archive is a feature gap, not a broken file.
+
+        `pck_lib` raises `EncryptedPackage` for `dwFlags` bit 31 so a survey can
+        say "this build lacks the feature" instead of blaming the archive.
+        """
+        import io
+        import struct
+        import tempfile
+
+        pck_lib = census.pck
+        # A trailer that passes the guards and states 0x00020002, with bit 31 set
+        # in `dwFlags` (+12 for that revision).
+        trailer = bytearray(280)
+        struct.pack_into("<I", trailer, 0, 0xFDFDFEEE)
+        struct.pack_into("<I", trailer, 12, 0x84030201)
+        struct.pack_into("<I", trailer, 268, 0xF00DBEEF)
+        struct.pack_into("<I", trailer, 272, 0)
+        struct.pack_into("<I", trailer, 276, 0x00020002)
+        body = struct.pack("<III", 0x4DCA23EF, 0, 0x56A089B7) + bytes(trailer)
+        body = body[:4] + struct.pack("<I", len(body)) + body[8:]
+
+        with tempfile.NamedTemporaryFile(suffix=".pck", delete=False) as fh:
+            fh.write(body)
+            path = fh.name
+        try:
+            with self.assertRaises(pck_lib.EncryptedPackage) as caught:
+                pck_lib.directory(path)
+            self.assertIn("encrypted package unsupported", str(caught.exception))
+            # And the census turns it into a skip with no rows, not a crash.
+            version, rows = census.census(path)
+            self.assertIsNone(version)
+            self.assertEqual(rows, [])
+        finally:
+            Path(path).unlink()
+
+    def test_the_encrypted_error_is_distinct_from_a_parse_failure(self):
+        # `EncryptedPackage` must not be a subclass whose `except Exception`
+        # handler would swallow it somewhere it should surface; it is a plain
+        # Exception and surveys catch it by name.
+        self.assertTrue(issubclass(census.pck.EncryptedPackage, Exception))
+        self.assertFalse(issubclass(census.pck.EncryptedPackage, AssertionError))
+
 
 if __name__ == "__main__":
     unittest.main()
