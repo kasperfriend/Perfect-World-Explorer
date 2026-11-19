@@ -16,3 +16,7 @@ Linux retain their original assertions. The SDK branches require a real
 Windows session with the SDK settings and Vulkan; set
 `PW_SAVE_LIGHTER_WINDOW` to an empty evidence directory per provider/route.
 No device, chunk or feature recreation was observed on the requested host.
+
+**S:** The headless `lighter_device_recovery_fixture` passed on `7148232`
+with two CPU Vulkan devices and an injected destroy callback (6.50 s;
+`04-window/device-recovery-cpu.log`). Neither new SDK window path ran here.

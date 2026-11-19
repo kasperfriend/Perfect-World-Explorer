@@ -51,3 +51,8 @@ The inject/readback tests do not execute FSR/DLSSD. Positive smoke on both
 routes, driver-side adapter/extent/command refusal on the requested system,
 and validation-layer messages remain blocked by host access. No portable or
 stand-in output is accepted by the positive vendor assertion.
+
+Hosted **build only:** The MSVC link/export step passed on
+[run 44519481366](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44519481366)
+at `fcfb2a6`. The remaining jobs were superseded by a newer branch push;
+this is not a green workflow or a physical dispatch.
