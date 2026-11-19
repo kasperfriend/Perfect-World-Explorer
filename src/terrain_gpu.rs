@@ -1397,10 +1397,13 @@ fn load_lightmaps(
                 // same fact; requiring them to agree catches a file that was
                 // repacked at one size but retiled at another.
                 let edge = tiles.side();
+                // `Mip` holds `u32`; the tile edge is a `usize` because it also
+                // sizes CPU buffers.
+                let edge_u32 = edge as u32;
                 if dds.format != crate::model_dds::Format::Dxt1
                     || dds.mips.len() != 1
-                    || dds.mips[0].width != edge
-                    || dds.mips[0].height != edge
+                    || dds.mips[0].width != edge_u32
+                    || dds.mips[0].height != edge_u32
                 {
                     return Err(format!(
                         "Unsupported lightmap DDS in {}: expected one {}x{} DXT1 mip, got {}x{}",
