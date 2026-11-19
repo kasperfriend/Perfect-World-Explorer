@@ -211,6 +211,7 @@ impl Logger {
     pub fn from_env() -> Self {
         let mut log = Self::new();
         let level = std::env::var("PW_LIGHTER_LOG")
+            .ok()
             .as_deref()
             .and_then(LogLevel::parse)
             .unwrap_or(LogLevel::Off);
