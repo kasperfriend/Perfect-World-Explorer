@@ -1142,6 +1142,127 @@ EOF
             "$OUT/music/lib.rs" -o "$OUT/musictest"
         shift || true
         (cd "$REPO" && exec "$OUT/musictest" "$@") ;;
+    settings) toolchain; sysroot; deps
+        # `src/view_settings.rs`'s 33 tests, which are the whole of P8.07 --
+        # "all settings are persistent, have clear defaults and apply
+        # consistently". They only ever ran inside the viewer binary in CI,
+        # because the module names `FrameGenMethod`, `FrameMultiplier`,
+        # `LatencyMode`, `UpscaleMethod` and `UpscaleQuality`, which live in
+        # `main.rs`, and names `egui` through the GUI. Both are stubbed here at
+        # the persist boundary: the enums are copied with their `token`/`parse`
+        # spellings (that spelling IS the file format), and no `egui` type is
+        # touched by the tests.
+        #
+        # The stubs are a second copy of those five enums, which is a thing to be
+        # suspicious of -- so the test below asserts that every variant the real
+        # `main.rs` declares also exists in the stub's `ALL`, by parsing
+        # `main.rs`. If a variant is added upstream and not here, this mode says
+        # so instead of quietly passing over a spelling it never saw.
+        mkdir -p "$OUT/settings"
+        python3 "tools/stub-upscale-enums.py" "$REPO/src/main.rs" \
+            "$REPO/tools/fixtures/fps_enums.rs" --check
+        cp "$REPO/tools/fixtures/fps_enums.rs" "$OUT/settings/fps.rs"
+        cat > "$OUT/settings/lib.rs" <<EOF
+#[path = "$OUT/settings/fps.rs"]
+pub mod fps;
+pub use fps::{FrameGenMethod, FrameMultiplier, LatencyMode, UpscaleMethod, UpscaleQuality};
+#[path = "$OUT/pck_stub.rs"]
+pub mod pck;
+#[path = "$REPO/src/client_weather.rs"]
+pub mod client_weather;
+#[path = "$REPO/src/sky_transition.rs"]
+pub mod sky_transition;
+// The provider x quality matrix, which is where the sanitise step gets its
+// answer from. Including the real module is the point: a stubbed clamp would
+// make the round-trip test pass while the real one did something else.
+#[path = "$REPO/src/modes.rs"]
+pub mod modes;
+pub use modes::{internal_factor, nearest_available, quality_available};
+#[path = "$REPO/src/angelica_pck.rs"]
+pub mod angelica_pck;
+#[path = "$REPO/src/world_place_names.rs"]
+pub mod world_place_names;
+#[path = "$REPO/src/world_catalog.rs"]
+pub mod world_catalog;
+/// The one piece of main.rs that the settings file depends on and that is not
+/// in a module: it folds an illegal provider/quality/frame-generation choice to
+/// the nearest legal one instead of trusting the file. Copied, not inferred --
+/// the pairing table is asserted against main.rs's own.
+pub mod sanitise_impl {
+    use crate::{FrameGenMethod, UpscaleMethod, UpscaleQuality};
+    pub fn pairing_supported(upscale: UpscaleMethod, fg: FrameGenMethod) -> bool {
+        match fg {
+            FrameGenMethod::Off | FrameGenMethod::Dlss | FrameGenMethod::Fsr => true,
+            FrameGenMethod::Xess => {
+                matches!(upscale, UpscaleMethod::Off | UpscaleMethod::Xess)
+            }
+        }
+    }
+    pub fn sanitise(
+        upscale: UpscaleMethod,
+        quality: UpscaleQuality,
+        frame_generation: FrameGenMethod,
+    ) -> (UpscaleMethod, UpscaleQuality, FrameGenMethod) {
+        let quality = crate::nearest_available(upscale, quality);
+        let frame_generation = if pairing_supported(upscale, frame_generation) {
+            frame_generation
+        } else {
+            FrameGenMethod::Off
+        };
+        (upscale, quality, frame_generation)
+    }
+}
+pub use sanitise_impl::sanitise;
+// view_settings re-exports EffectShaft from gfx_player, so the enum is copied
+// here rather than pulling in a 4,500-line module that needs glam.
+pub mod gfx_player {
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub enum EffectShaft {
+        #[default]
+        Client,
+        RootDir,
+        WorldUp,
+        Horizontal,
+    }
+    impl EffectShaft {
+        pub const ALL: [Self; 4] = [Self::Client, Self::RootDir, Self::WorldUp, Self::Horizontal];
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::Client => "Client (placement Z)",
+                Self::RootDir => "Root direction",
+                Self::WorldUp => "World up",
+                Self::Horizontal => "Horizontal",
+            }
+        }
+        pub fn token(self) -> &'static str {
+            match self {
+                Self::Client => "client",
+                Self::RootDir => "root",
+                Self::WorldUp => "up",
+                Self::Horizontal => "flat",
+            }
+        }
+        pub(crate) fn parse(text: &str) -> Option<Self> {
+            match text {
+                "client" => Some(Self::Client),
+                "root" => Some(Self::RootDir),
+                "up" => Some(Self::WorldUp),
+                "flat" => Some(Self::Horizontal),
+                _ => None,
+            }
+        }
+    }
+}
+#[path = "$REPO/src/view_settings.rs"]
+pub mod view_settings;
+EOF
+        "$RUSTC" --test --crate-name settingstest --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 -L "$OUT" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern flate2="$OUT/libflate2.rlib" \
+            "$OUT/settings/lib.rs" -o "$OUT/settingstest"
+        shift || true
+        (cd "$REPO" && exec "$OUT/settingstest" "$@") ;;
     diagnostics) toolchain; sysroot; deps
         # `src/diagnostics.rs` on its own, against `tools/fixtures/egui_stub.rs`.
         # Its 18 tests had never run anywhere: the module has no GPU dependency,
@@ -1851,4 +1972,4 @@ EOF
             -o "$OUT/matrix-maps" "$OUT/mm/run.rs"
         shift || true
         (cd "$REPO" && exec "$OUT/matrix-maps" "${1:-$REPO/google_drive/clients}") ;;
-    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|precinct|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|precinct|settings|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac

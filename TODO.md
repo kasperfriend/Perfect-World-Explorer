@@ -67,4 +67,65 @@ soft "not established".
       `matrix` had stopped compiling because `src/water.rs` reports through
       `crate::diag!` and that gate had no stub for it.
 
+## Second pass — the CI streak, and the numbers nobody re-measured
+
+R1–R5 were closed, but the branch was still red. Working the CI failures to
+green uncovered a second class of defect: **checks that named a thing without
+being that thing**, and **measurements of files this checkout does not have**.
+
+- [x] **R6. Get CI green after B-12.** Four failures, each hiding the next:
+      modules a GPU check declares by hand (`effect_census`, `sky_time`,
+      `loading_graph`), a struct field two hand-built fixtures omitted
+      (`Trees::off_reason`), a walker-audio suite no local mode compiled (it had
+      been asserting the wrong event ids since it was written), and three
+      unformatted files the `fmt` mode never looked at. Fixed by deriving each
+      check's scope from the source instead of restating it:
+      `tools/binary-module-closure.py` and `tools/binary-field-closure.py`
+      follow each binary's `#[path]` graph; `fmt` walks `src/**/*.rs` with
+      `find` instead of twenty named modules; `player` compiles the walker's
+      audio module. First green run since `6a8f2ec`: Linux 2m45s, Windows 7m38s.
+
+- [x] **R7. The fixture that was a paraphrase.** `SHIPPED_ROWS` held 11 of the
+      real `configs/sound.txt`'s 67 rows and was missing 105, the id the rule
+      produces for a walking female Psychic, so a real lookup returned `None`
+      and the test unwrapped it. The fixture is now the member decoded out of
+      the staged `configs.pck`, and three assertions changed to match the client:
+      length 67, the table's own path casing, and the no-table fallback id 100
+      (106 is a different, silent slot).
+
+- [x] **R8. "The 1.8.4 precinct is 383 zones, 783 tracks, 347 ambience paths"**
+      is true of the **world** map's 885 KB file and false of the 78,858 B one
+      this checkout stages (29 zones, 29 tracks, no ambience). Both are now
+      measured by `src/bin/precinct-check.rs`, which runs in CI and in
+      `tools/offline_harness.sh precinct`. Three register rows corrected against
+      it; `Native audio and environmental sound` no longer contradicts
+      `Audio codec coverage`; `Instance aliases` said 68 rows/65 folders where
+      the generator reports 65/60.
+
+- [x] **R9. A skip that was three skips, unnamed.** One malformed precinct zone
+      was reported as three, all as `Precinct zone "":` -- the zone with a real
+      name was never mentioned. `Zones` now carries `malformed`, the walker
+      resumes at the next line that looks like a zone, and the test pins the
+      count instead of ignoring it. `instance` printed `outside 0` beside
+      `extent no trn2`, a pass for a check that could not run; it prints `--`.
+
+### Still open, and why each one is
+
+The register's remaining rows are blocked on inputs or evidence this
+environment cannot supply, and each now says which:
+
+| row | what would close it |
+|---|---|
+| `Native terrain level thresholds` | more of the 1.4.2 `.text` than the staged 6,000,640 B image exposes at those addresses |
+| `Precinct ambience priority` | modelling each callee's arity in the stdcall parse loop, or a build whose index 8 is not constant |
+| `Precinct ambience randomisation` | client evidence for a crossfade; the format offers no second variant to pick |
+| `Complete fog variants`, `Terrain layer type byte`, `Controller-108 LUT` | a consumer in the disassembly, or authored data that varies |
+| `Visual GFX graph`, `Every effect`, `Whole-world GPU residency` | a GPU, and the 40+ GB effect corpus |
+| `elements.data` beyond v27, `tasks.data` beyond v75 | a client shipping a newer revision |
+| `Native audio ... physical-device behavior` | the client's device enumeration, which is not in the staged code |
+
+Do not close a row by rewording it. The ones closed above were closed by
+implementing behaviour (R7, R9) or by measuring the file the claim was about
+(R8).
+
 ## Notes taken while working

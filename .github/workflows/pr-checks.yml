@@ -129,6 +129,14 @@ jobs:
       # this mode prints what a file actually holds, so a number in prose has
       # something to be checked against. It runs on whatever the workspace has
       # and is skipped, loudly, when nothing is staged.
+      # `src/view_settings.rs`'s tests are P8.07 -- "all settings are
+      # persistent, have clear defaults and apply consistently". They live in
+      # `src/bin/...`-less module space and were only ever compiled by the
+      # viewer binary, so no gate ran them. `settings` runs them, and its stub of
+      # the five fps enums is generated from `main.rs` and checked for staleness,
+      # because those enums ARE the persisted spellings.
+      - name: Settings persistence
+        run: bash tools/offline_harness.sh settings
       - name: Measure staged precinct files
         run: |
           # An array, not a newline-joined string: `$roots` unquoted from
