@@ -31,6 +31,13 @@ ray-traced scene and its reverse-Z depth.
    indirect light. The **Edge-aware denoiser**, **Progressive sampling while
    still** and **Soft sun shadows** are on by default and can be toggled
    independently. Leave the camera still to accumulate lighting samples.
+   **Diffuse bounce distance** defaults to 256 world units. Only indirect
+   diffuse rays in air are shortened; primary visibility, direct shadows,
+   mirrors and refraction keep their range. Select **Full view distance**
+   to compare, or enable **Reference** for the full-range reference transport.
+   With **Follow local region lighting** off (default), the sun, ambient and
+   sky palette follow the map and clock, not the local box under the camera.
+   Regional fog and weather still apply. See the [optimized renderer](performance.md#interactive-hardware-rt-pass).
 4. Select **Off** and reload to leave Lighter off and save Native as the
    preference. In a running ray world, an unavailable backend or an unfittable
    scene falls back to Native with the reason in the HUD and Lighter menu. It

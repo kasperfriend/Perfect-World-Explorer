@@ -1,13 +1,19 @@
 # Segmented air/water transport (Step 17)
 
-Each path carries the current water export's medium ID, or air. Intersections
-with the shared wet surface choose the medium on each transmitted branch;
-reflection keeps the incident side. A submerged camera starts in the
-nearest wet surface above it. The shader walks that body's packed cell grid
-until the ray reaches the top, cutoff, or its first dry cell, so an underwater
-ray can illuminate or see a dry wall without applying water absorption over
-the rest of the path. This uses the actual wet-cell footprint, not a box
-that fills holes in it. Untagged test sheets use an explicit open medium.
+Each path carries a water export's medium ID, or air. Intersections with
+wet surfaces choose the medium on transmission; reflection keeps the
+incident side. A submerged camera starts beneath the nearest wet surface
+above it. Wet cells use half-open ownership so two adjacent exports do not
+both reject the camera on their common edge. The shader walks the packed
+cell grid until the top, cutoff or dry gap. At a grid exit it can continue
+into a touching coplanar wet grid, even if that grid uses a different cell
+size, and passes the new owner to the next path segment. A fully wet grid
+uses one rectangular exit test instead of visiting every cell. Traversal
+bounds work to 64 export handoffs per leg; traversal ends conservatively
+at the last confirmed wet distance if that guard is reached. Real dry
+holes and different surface elevations still break the medium. Top
+triangles and export IDs for art/streaming are unchanged. Untagged test
+sheets use an explicit open medium.
 
 The authored underwater fog span maps to 5% Beer–Lambert transmission in
 the clearest RGB channel after one span. The normalized linear fog color
@@ -19,7 +25,7 @@ includes haze and is not replaced by a second air ramp on a miss.
 
 The **sun-to-water specular link** is separate from the camera BSDF. For an
 underwater receiver it computes the inverse Snell direction for the flat
-interface, validates a wet exit within the same body, attenuates the water
+interface, validates the connected wet leg, attenuates the water
 leg with Fresnel/RGB extinction, and checks occlusion on both sides. Thus a
 blocker above the surface can shadow the bed without being visible to the
 camera. It does not project an animated caustic texture. This is the

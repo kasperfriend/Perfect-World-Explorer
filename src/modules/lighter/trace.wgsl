@@ -62,8 +62,12 @@ const ORDERED_GFX: u32 = 536870912u;
 const GLASS: u32 = 1073741824u;
 const SOLID_MASK: u32 = 1u;
 const BLEND_MASK: u32 = 2u;
-const SHADOW_MASK: u32 = 4u;
+const BLOCKER_MASK: u32 = 4u;
 const GFX_MASK: u32 = 8u;
+const SECONDARY_MASK: u32 = 16u;
+const TRANSMISSIVE_MASK: u32 = 32u;
+const GFX_OVERLAY_MASK: u32 = 64u;
+const GFX_MASKS: u32 = GFX_MASK | GFX_OVERLAY_MASK;
 const LIGHTING: u32 = 1u;
 const SHADOWS: u32 = 2u;
 const REFLECTIONS: u32 = 4u;
@@ -103,6 +107,7 @@ struct Surface {
 // coplanar sheets. A cursor excludes exactly the layers already composited,
 // not all geometry at that depth. NIL sorts after all real keys.
 struct Query { purpose: u32, mask: u32, ordered: bool, before: vec2<u32> }
+fn solid_mask(purpose: u32) -> u32 { return select(SECONDARY_MASK,SOLID_MASK,purpose==VIEW); }
 struct Path { ray: Ray, weight: vec3<f32>, depth: u32, purpose: u32, medium: u32, previous: vec4<f32> }
 
 fn word(dynamic: bool, i: u32) -> u32 {
@@ -161,10 +166,8 @@ fn sample_word(word_value: u32, fmt: u32) -> vec4<f32> {
     if (fmt & LINEAR_DATA)!=0u { return c; }
     return vec4<f32>(linear(c.rgb)*select(c.a,1.,(fmt & ALPHA_IS_DATA)!=0u),c.a);
 }
-fn level(addr: u32, uv: vec2<f32>, edge: bool, mip: u32, fmt: u32) -> vec4<f32> {
-    let base = addr + texels[addr+4u+mip];
-    let dims = vec2<i32>(max(vec2<u32>(1u),vec2<u32>(texels[addr],texels[addr+1u])>>vec2<u32>(mip)));
-    if all(dims==vec2<i32>(1)) { return sample_word(texels[base],fmt); }
+struct QuadTap { index: vec4<u32>, weight: vec4<f32> }
+fn bilinear(base: u32, dims: vec2<i32>, uv: vec2<f32>, edge: bool) -> QuadTap {
     let xy = select(fract(uv),clamp(uv,vec2<f32>(0.),vec2<f32>(1.)),edge)*vec2<f32>(dims)-0.5;
     let p = vec2<i32>(floor(xy));
     let q = p+1;
@@ -175,11 +178,22 @@ fn level(addr: u32, uv: vec2<f32>, edge: bool, mip: u32, fmt: u32) -> vec4<f32> 
     let a = select(select(p,dims-1,p<vec2<i32>(0)),max(p,vec2<i32>(0)),edge);
     let b = select(select(q,vec2<i32>(0),q>=dims),min(q,dims-1),edge);
     let row = vec2<u32>(vec2<i32>(a.y,b.y))*u32(dims.x)+base;
-    let c0 = rgba(texels[row.x+u32(a.x)]);
-    let c1 = rgba(texels[row.x+u32(b.x)]);
-    let c2 = rgba(texels[row.y+u32(a.x)]);
-    let c3 = rgba(texels[row.y+u32(b.x)]);
-    let weights = vec4<f32>((1.-f.x)*(1.-f.y),f.x*(1.-f.y),(1.-f.x)*f.y,f.x*f.y);
+    return QuadTap(row.xxyy+vec2<u32>(u32(a.x),u32(b.x)).xyxy,
+        vec4<f32>((1.-f.x)*(1.-f.y),f.x*(1.-f.y),(1.-f.x)*f.y,f.x*f.y));
+}
+fn rgba_mip_dims(addr: u32, mip: u32) -> vec2<i32> {
+    return vec2<i32>(max(vec2<u32>(1u),vec2<u32>(texels[addr],texels[addr+1u])>>vec2<u32>(mip)));
+}
+fn level(addr: u32, uv: vec2<f32>, edge: bool, mip: u32, fmt: u32) -> vec4<f32> {
+    let base = addr + texels[addr+4u+mip];
+    let dims = rgba_mip_dims(addr,mip);
+    if all(dims==vec2<i32>(1)) { return sample_word(texels[base],fmt); }
+    let tap = bilinear(base,dims,uv,edge);
+    let c0 = rgba(texels[tap.index.x]);
+    let c1 = rgba(texels[tap.index.y]);
+    let c2 = rgba(texels[tap.index.z]);
+    let c3 = rgba(texels[tap.index.w]);
+    let weights = tap.weight;
     let alpha = vec4<f32>(c0.a,c1.a,c2.a,c3.a);
     var r = vec4<f32>(c0.r,c1.r,c2.r,c3.r);
     var g = vec4<f32>(c0.g,c1.g,c2.g,c3.g);
@@ -205,13 +219,17 @@ fn one_tap() -> Taps { return Taps(vec2<f32>(0.),0.,1u); }
 // The 2x2 Gram matrix in texel space gives major/minor footprint axes. Use
 // minor-axis LOD and integrate along the major axis, clamping anisotropy by
 // widening the minor filter rather than dropping coverage at grazing angles.
-fn footprint_taps(addr: u32, dir: vec3<f32>, n: vec3<f32>, gu: vec3<f32>, gv: vec3<f32>, width: f32) -> Taps {
-    let dims = vec2<f32>(f32(texels[addr]),f32(texels[addr+1u]));
-    if all(dims==vec2<f32>(1.)) { return one_tap(); }
+struct UvFootprint { u: vec3<f32>, v: vec3<f32> }
+fn project_footprint(dir: vec3<f32>, n: vec3<f32>, gu: vec3<f32>, gv: vec3<f32>, width: f32) -> UvFootprint {
     let nd = dot(n,dir);
     let inv = select(-1.,1.,nd>=0.)/max(abs(nd),0.002);
-    let u = (gu-n*(dot(gu,dir)*inv))*(width*dims.x);
-    let v = (gv-n*(dot(gv,dir)*inv))*(width*dims.y);
+    return UvFootprint((gu-n*(dot(gu,dir)*inv))*width,(gv-n*(dot(gv,dir)*inv))*width);
+}
+fn uv_taps(addr: u32, ellipse: UvFootprint) -> Taps {
+    let dims = vec2<f32>(f32(texels[addr]),f32(texels[addr+1u]));
+    if all(dims==vec2<f32>(1.)) { return one_tap(); }
+    let u = ellipse.u*dims.x;
+    let v = ellipse.v*dims.y;
     let uu = dot(u,u);
     let vv = dot(v,v);
     let uv = dot(u,v);
@@ -234,23 +252,29 @@ fn footprint_taps(addr: u32, dir: vec3<f32>, n: vec3<f32>, gu: vec3<f32>, gv: ve
     }
     return Taps(axis*(major/f32(count))/dims,lod,count);
 }
-fn mesh_taps(addr: u32, ray: Ray, hit: Hit, m: bool, inst: u32, v: vec3<u32>, uv_scale: vec2<f32>) -> Taps {
+fn footprint_taps(addr: u32, dir: vec3<f32>, n: vec3<f32>, gu: vec3<f32>, gv: vec3<f32>, width: f32) -> Taps {
     if texels[addr]==1u && texels[addr+1u]==1u { return one_tap(); }
+    return uv_taps(addr,project_footprint(dir,n,gu,gv,width));
+}
+fn mesh_footprint(ray: Ray, hit: Hit, m: bool, inst: u32, v: vec3<u32>, uv_scale: vec2<f32>) -> UvFootprint {
     let a = floats(m,v.x);
     let e = instance_vector(m,inst,floats(m,v.y)-a);
     let f = instance_vector(m,inst,floats(m,v.z)-a);
     let n = cross(e,f);
     let n2 = dot(n,n);
-    if n2<1.e-20 { return one_tap(); }
+    if n2<1.e-20 { return UvFootprint(vec3<f32>(0.),vec3<f32>(0.)); }
     let b = vertex_uv(m,v.x);
     let du = vertex_uv(m,v.y)-b;
     let dv = vertex_uv(m,v.z)-b;
     let g0 = cross(f,n)/n2;
     let g1 = cross(n,e)/n2;
-    return footprint_taps(addr,ray.dir,n*inverseSqrt(n2),(du.x*g0+dv.x*g1)*uv_scale.x,(du.y*g0+dv.y*g1)*uv_scale.y,footprint(ray,hit.t));
+    return project_footprint(ray.dir,n*inverseSqrt(n2),(du.x*g0+dv.x*g1)*uv_scale.x,(du.y*g0+dv.y*g1)*uv_scale.y,footprint(ray,hit.t));
 }
-fn tap_average(addr: u32, uv: vec2<f32>, edge: bool, taps: Taps, fmt: u32,
-               threshold_top: bool, reference: f32, flags: u32) -> vec4<f32> {
+fn mesh_taps(addr: u32, ray: Ray, hit: Hit, m: bool, inst: u32, v: vec3<u32>, scale: vec2<f32>) -> Taps {
+    if texels[addr]==1u && texels[addr+1u]==1u { return one_tap(); }
+    return uv_taps(addr,mesh_footprint(ray,hit,m,inst,v,scale));
+}
+fn tap_average(addr: u32, uv: vec2<f32>, edge: bool, taps: Taps, fmt: u32) -> vec4<f32> {
     let mip = u32(taps.lod);
     let part = fract(taps.lod);
     var sum = vec4<f32>(0.);
@@ -258,17 +282,39 @@ fn tap_average(addr: u32, uv: vec2<f32>, edge: bool, taps: Taps, fmt: u32,
         let p = uv+(f32(i)+0.5-0.5*f32(taps.count))*taps.step;
         let levels = select(1u,2u,part>0.);
         for (var l=0u; l<levels; l++) {
-            let j = mip+l;
-            var c = level(addr,p,edge,j,fmt);
-            if threshold_top && j==0u { c.a = select(0.,1.,alpha_test(c.a,reference,flags)); }
-            sum += c*select(1.-part,part,l!=0u);
+            sum += level(addr,p,edge,mip+l,fmt)*select(1.-part,part,l!=0u);
         }
     }
     return sum/f32(taps.count);
 }
 fn filtered_tile(addr: u32, uv: vec2<f32>, edge: bool, taps: Taps) -> vec4<f32> {
     let fmt = texels[addr+3u];
-    return unassociate(tap_average(addr,uv,edge,taps,fmt,false,0.,0u),fmt);
+    return unassociate(tap_average(addr,uv,edge,taps,fmt),fmt);
+}
+fn alpha_level(addr: u32, uv: vec2<f32>, edge: bool, mip: u32) -> f32 {
+    let base = addr+texels[addr+4u+mip];
+    let dims = rgba_mip_dims(addr,mip);
+    if all(dims==vec2<i32>(1)) { return f32(texels[base]>>24u)/255.; }
+    let tap = bilinear(base,dims,uv,edge);
+    let packed = vec4<u32>(texels[tap.index.x],texels[tap.index.y],texels[tap.index.z],texels[tap.index.w]);
+    return dot(vec4<f32>(packed>>vec4<u32>(24u))/255.,tap.weight);
+}
+fn alpha_average(addr: u32, uv: vec2<f32>, edge: bool, taps: Taps,
+                 threshold_top: bool, cutoff: f32, flags: u32) -> f32 {
+    let mip = u32(taps.lod);
+    let part = fract(taps.lod);
+    let levels = select(1u,2u,part>0.);
+    var sum = 0.;
+    for (var i=0u; i<taps.count; i++) {
+        let p = uv+(f32(i)+0.5-0.5*f32(taps.count))*taps.step;
+        for (var l=0u; l<levels; l++) {
+            let j = mip+l;
+            var a = alpha_level(addr,p,edge,j);
+            if threshold_top && j==0u { a = select(0.,1.,alpha_test(a,cutoff,flags)); }
+            sum += a*select(1.-part,part,l!=0u);
+        }
+    }
+    return sum/f32(taps.count);
 }
 // Keep packed scalar fetches out of the general material sampler. Mip starts
 // are word aligned, with four consecutive R8 weights per word.
@@ -335,9 +381,21 @@ fn terrain_color(p: vec3<f32>, face: vec3<f32>, ray: Ray, t: f32, baked: vec4<f3
     let count = texels[area+1u];
     let width = footprint(ray,t);
     let fallback = vec3<f32>(0.30,0.33,0.24);
-    var rgb = select(linear(fallback),fallback,baked.a>0.);
-    for (var j=0u; j<count; j++) {
-        let at = start + j*5u;
+    var rgb = vec3<f32>(0.);
+    if count==0u { rgb = select(linear(fallback),fallback,baked.a>0.); }
+    var left = 1.;
+    let s = 1./(frame.terrain.z*frame.terrain.w);
+    let mask_uv = project_footprint(ray.dir,face,vec3<f32>(s,0.,0.),vec3<f32>(0.,0.,-s),width);
+    // The front-to-back form of the same stack of lerps. A transparent
+    // layer costs only its R8 mask; a fully covering layer hides all below.
+    for (var j=count; j>0u && left>0.; j--) {
+        let at = start+(j-1u)*5u;
+        var weight = 1.;
+        if j>1u {
+            let mask = texels[at+1u];
+            weight = terrain_mask(mask,fract(coord),uv_taps(mask,mask_uv));
+            if weight<=0. { continue; }
+        }
         var gu = vec3<f32>(1.,0.,0.);
         var gv = vec3<f32>(0.,0.,-1.);
         switch texels[at+2u] {
@@ -351,15 +409,8 @@ fn terrain_color(p: vec3<f32>, face: vec3<f32>, ray: Ray, t: f32, baked: vec4<f3
         let addr = texels[at];
         let c = filtered_tile(addr,vec2<f32>(dot(gu,p),dot(gv,p)),false,
             footprint_taps(addr,ray.dir,face,gu,gv,width)).rgb;
-        let layer_rgb = select(c,encoded(c),baked.a>0.);
-        if j==0u { rgb = layer_rgb; }
-        else {
-            let mask = texels[at+1u];
-            let s = 1./(frame.terrain.z*frame.terrain.w);
-            let weight = terrain_mask(mask,fract(coord),
-                footprint_taps(mask,ray.dir,face,vec3<f32>(s,0.,0.),vec3<f32>(0.,0.,-s),width));
-            rgb = mix(rgb,layer_rgb,weight);
-        }
+        rgb += (left*weight)*select(c,encoded(c),baked.a>0.);
+        left *= 1.-weight;
     }
     if baked.a>0. { rgb = linear(min(vec3<f32>(1.), rgb*baked.rgb)); }
     return rgb;
@@ -386,7 +437,7 @@ fn closer(hit: Hit, best: Hit, q: Query) -> bool {
         let key = layer_key(hit);
         // GFX follows the native forward draw order (including write-Z).
         // Other blend sheets reverse only the current coplanar band.
-        let forward = q.mask==GFX_MASK;
+        let forward = (q.mask & GFX_MASKS)!=0u;
         if !select(key_less(key,q.before),key_less(q.before,key),forward) { return false; }
         if best.instance==NIL { return true; }
         let other = layer_key(best);
@@ -491,13 +542,20 @@ fn accepts(hit: Hit, ray: Ray, q: Query) -> bool {
     let flags = word(m,mat+1u);
     let blend = (flags & BLEND)!=0u;
     let gfx = (flags & ORDERED_GFX)!=0u;
-    if (q.mask==GFX_MASK && !gfx) || (q.mask==SOLID_MASK && blend) || (q.mask==BLEND_MASK && (!blend || gfx))
+    if ((q.mask & GFX_MASKS)!=0u && (!blend || !gfx || ((flags & OVERLAY)!=0u && (q.mask & GFX_OVERLAY_MASK)==0u)
+            || ((flags & OVERLAY)==0u && (q.mask & GFX_MASK)==0u)))
+        || ((q.mask & (SOLID_MASK|SECONDARY_MASK))!=0u && blend) || (q.mask==BLEND_MASK && (!blend || gfx))
         || ((flags & CLOUD)!=0u && (frame.options.x & CLOUD_DETAIL)==0u)
         || (q.purpose==VIEW && (flags & HIDE_PRIMARY)!=0u)
         || (q.purpose!=VIEW && (flags & PRIMARY_ONLY)!=0u)
         || (q.purpose==SHADOW && (flags & (BLEND|WATER))!=0u && (flags & (WRITE_DEPTH|CLOUD))==0u)
         || (q.purpose==WATER_REFLECT && (flags & NO_REFLECT)!=0u)
         || (q.purpose==WATER_TRANSMIT && (flags & NO_REFRACT)!=0u) { return false; }
+    if q.purpose==SHADOW {
+        let thin = (flags & (FOLIAGE|CLOUD))!=0u
+            || ((flags & GLASS)!=0u && (word(m,mat+23u) & 0x80000000u)==0u);
+        if thin!=(q.mask==TRANSMISSIVE_MASK) { return false; }
+    }
     let cull = (flags & SINGLE_SIDED)!=0u ||
         (q.purpose==VIEW && (frame.options.x & CULL_BUILDINGS)!=0u && (flags & CULL_BACK)!=0u);
     if (flags & SHORE)!=0u {
@@ -528,9 +586,8 @@ fn accepts(hit: Hit, ray: Ray, q: Query) -> bool {
             cut = native_cut/fade;
         }
         let taps = mesh_taps(addr,ray,hit,m,inst,v,words2(m,mat+11u));
-        // Only alpha is inspected here. Skip the RGB transfer function on
-        // rejected candidates, regardless of the material colour space.
-        a = tap_average(addr,uv,edge,taps,LINEAR_DATA,area && (tile_flags & AREA_TOP)==0u,cut,flags).a;
+        // No RGB unpack, weighting or transfer function in the ray-query loop.
+        a = alpha_average(addr,uv,edge,taps,area && (tile_flags & AREA_TOP)==0u,cut,flags);
         if area {
             // Fixed per-pixel/per-sample stratification, never seeded by time.
             if a<=0. || (a<1. && a<=coverage_sample(ray,m,inst,v)) { return false; }
@@ -608,8 +665,14 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
     // align to the actual affine triangle plane on back/grazing faces.
     let at = word(m,inst+4u);
     var n = raw*2.-1.;
-    if word(m,inst+3u)==0u { n = norm(instance_basis(m,at)*n); }
-    else { n = norm(rotate(n,bitcast<f32>(at),bitcast<f32>(word(m,inst+5u)))); }
+    if word(m,inst+3u)==0u {
+        if (flags & GRASS_MATERIAL)!=0u {
+            // Native wind bends positions, not the authored normals. The
+            // shear leaves the original scaled X basis intact.
+            let x = norm(floats(m,at));
+            n = norm(rotate(n,x.x,x.z));
+        } else { n = norm(instance_basis(m,at)*n); }
+    } else { n = norm(rotate(n,bitcast<f32>(at),bitcast<f32>(word(m,inst+5u)))); }
     if dot(n,face)<0. { n = -n; }
     // Bad/sufficiently grazing interpolated normals must not face away from
     // the incident ray. They never decide which side of the triangle we enter.
@@ -657,13 +720,20 @@ fn surface(hit: Hit, ray: Ray) -> Surface {
                           word(m,mat+18u),word(m,mat+19u));
     let present = select(vec4<u32>(0u),vec4<u32>(1u,2u,4u,8u),tiles!=vec4<u32>(0u));
     var stages = present.x | present.y | present.z | present.w;
+    var projected: UvFootprint;
+    var ready = false;
     while stages!=0u {
         let stage = firstTrailingBit(stages);
         stages &= stages-1u;
         let addr = tiles[stage];
         var taps = one_tap();
-        if stage!=0u || !reference() || !reference_emitter(word(m,mat+1u),word(m,mat+15u),word(m,mat+19u),floats(m,mat+7u)) {
-            taps = mesh_taps(addr,ray,hit,m,inst,v,scale);
+        if (texels[addr]!=1u || texels[addr+1u]!=1u) &&
+            (stage!=0u || !reference() || !reference_emitter(word(m,mat+1u),word(m,mat+15u),word(m,mat+19u),floats(m,mat+7u))) {
+            if !ready {
+                projected = mesh_footprint(ray,hit,m,inst,v,scale);
+                ready = true;
+            }
+            taps = uv_taps(addr,projected);
         }
         let value = filtered_tile(addr,uv,edge,taps);
         switch stage {
@@ -750,17 +820,29 @@ fn visibility(p: vec3<f32>, face: vec3<f32>, light: LightRay, width: f32, source
     var throughput = vec3<f32>(1.);
     var tail = dot(light.tail,light.tail)>0.;
     let sample = light.purpose!=VIEW;
-    let q = Query(select(SHADOW,light.purpose,sample),select(SHADOW_MASK,SOLID_MASK,sample),false,vec2<u32>(NIL));
-    for (var layer=0u; layer<17u; layer++) {
-        let hit = trace(r,q);
+    // An accepted opaque blocker anywhere on the leg makes transmittance
+    // zero. Test it with an any-hit query before walking colored layers;
+    // NEE still requires the closest hit to verify the sampled endpoint.
+    var blocker = !sample;
+    var layer = 0u;
+    while layer<17u {
+        let mask = select(select(TRANSMISSIVE_MASK,BLOCKER_MASK,blocker),solid_mask(light.purpose),sample);
+        let hit = trace(r,Query(select(SHADOW,light.purpose,sample),mask,false,vec2<u32>(NIL)));
         if sample {
             // Delta interfaces aren't connected by a straight NEE ray. Their
             // continuations get full weight once their direction has changed.
             return vec3<f32>(select(0.,1.,hit.instance==NIL || (hit.instance==light.key.x && hit.primitive==light.key.y)));
         }
+        if blocker {
+            if hit.instance!=NIL { return vec3<f32>(0.); }
+            blocker = false;
+            continue;
+        }
         if hit.instance==NIL {
             if tail {
                 tail = false;
+                blocker = true;
+                layer++;
                 let up = vec3<f32>(0.,1.,0.);
                 r = Ray(offset_origin(entry,light.tail,up),light.tail,0.,frame.eye.w,width,0.,source.coverage,source.pixel_seed);
                 continue;
@@ -771,7 +853,6 @@ fn visibility(p: vec3<f32>, face: vec3<f32>, light: LightRay, width: f32, source
         let m = (hit.instance & DYNAMIC)!=0u;
         let mat = material_addr(m,hit.primitive);
         let flags = word(m,mat+1u);
-        if (flags & (FOLIAGE|CLOUD|GLASS))==0u { return vec3<f32>(0.); }
         let inst = inst_addr(hit.instance);
         let v = vertex_addresses(m,inst,hit.primitive);
         if (flags & GLASS)!=0u {
@@ -793,6 +874,7 @@ fn visibility(p: vec3<f32>, face: vec3<f32>, light: LightRay, width: f32, source
         }
         if strongest(throughput)<0.002 { break; }
         r.low = advance(hit.t);
+        layer++;
     }
     return vec3<f32>(0.);
 }
@@ -1087,8 +1169,9 @@ fn wave(s: Surface, ray: Ray, hit: Hit) -> vec3<f32> {
         let v = vertex_addresses(m,inst,hit.primitive);
         let a = frame.waves.x;
         let b = frame.waves.y;
-        let raw = mix(filtered_tile(a,uv,false,mesh_taps(a,ray,hit,m,inst,v,vec2<f32>(2.))).rgb,
-                      filtered_tile(b,uv,false,mesh_taps(b,ray,hit,m,inst,v,vec2<f32>(2.))).rgb,
+        let projected = mesh_footprint(ray,hit,m,inst,v,vec2<f32>(2.));
+        let raw = mix(filtered_tile(a,uv,false,uv_taps(a,projected)).rgb,
+                      filtered_tile(b,uv,false,uv_taps(b,projected)).rgb,
                       bitcast<f32>(frame.waves.z))*2.-1.;
         n = norm(vec3<f32>(raw.x*0.42,max(abs(raw.y),0.45),raw.z*0.42));
     }
@@ -1170,6 +1253,8 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
     var depth = 0.;
     var guide = vec4<u32>(0u);
     var layered = false;
+    let categories = world[11u]|moving[11u];
+    let blend_present = (categories & BLEND_MASK)!=0u;
     var start_medium = frame.water_effects.y;
     if start_medium==0u && (frame.options.x & UNDERWATER)!=0u { start_medium = OPEN_WATER; }
     var path = Path(first,vec3<f32>(1.),0u,VIEW,start_medium,vec4<f32>(0.));
@@ -1179,11 +1264,20 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
         for (var segment=0u; segment<=frame.options.y; segment++) {
             let minimum = select(0.002,1.e-12,reference());
             if strongest(abs(path.weight))<minimum { break; }
-            let ray = path.ray;
+            var ray = path.ray;
+            // Budget only dry diffuse transport. Primary, shadow, mirrors
+            // and both water/glass interface directions keep their ranges.
+            if path.purpose==DIFFUSE && path.medium==0u && frame.material_time.w>0. && !reference() {
+                ray.high = min(ray.high,frame.material_time.w);
+            }
             let terminal = path.depth==frame.options.y;
             var solid = none(ray);
             var scan = ray;
-            var mask = SOLID_MASK;
+            let solid_bit = solid_mask(path.purpose);
+            let gfx_bits = select(GFX_MASK,GFX_MASKS,path.purpose==VIEW);
+            let gfx_present = (categories & gfx_bits)!=0u;
+            let overlays = (categories & gfx_bits & GFX_OVERLAY_MASK)!=0u;
+            var mask = solid_bit;
             var after = vec2<u32>(NIL);
             var group_end = -1.;
             var gfx_depth = ray.high;
@@ -1195,23 +1289,32 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
             loop {
                 // Resolve solid visibility once, then process sheets in front
                 // of it. Keep one traversal site for both kinds of hit.
-                let gfx = mask==GFX_MASK;
+                let gfx = mask==gfx_bits;
                 let has_weight = strongest(abs(path.weight))>=minimum;
                 let ordered = gfx || (mask==BLEND_MASK && has_weight && group_end>=0.);
                 var r = scan;
-                if gfx { r = ray; }
+                if gfx {
+                    r = ray;
+                    // Preserve author-ordered overlays at any distance. When
+                    // absent, the current Z limit can prune whole BVH branches.
+                    if !overlays { r.high = gfx_depth; }
+                }
                 else if ordered { r.high = group_end; }
                 let query_mask = select(mask,0u,mask==BLEND_MASK && !has_weight);
                 var hit = trace(r,Query(path.purpose,query_mask,ordered,after));
-                if mask==SOLID_MASK {
+                if mask==solid_bit {
                     solid = hit;
-                    mask = GFX_MASK;
-                    after = vec2<u32>(0u);
-                    if hit.instance!=NIL { scan.high = min(ray.high,hit.t+band(hit.t)); }
-                    gfx_depth = scan.high;
-                    continue;
+                    // A solid-only scene can shade its hit immediately. Skip
+                    // the empty ordered/blend passes, not just their BVHs.
+                    if gfx_present || blend_present {
+                        mask = select(BLEND_MASK,gfx_bits,gfx_present);
+                        after = vec2<u32>(select(NIL,0u,gfx_present));
+                        if hit.instance!=NIL { scan.high = min(ray.high,hit.t+band(hit.t)); }
+                        gfx_depth = scan.high;
+                        continue;
+                    }
                 }
-                let sheet = hit.instance!=NIL;
+                let sheet = mask!=solid_bit && hit.instance!=NIL;
                 if !sheet {
                     if gfx {
                         result += path.weight*gfx_color;
@@ -1388,9 +1491,10 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
             let glossy = !terminal && (s.flags & EMISSIVE)==0u && (frame.options.x & REFLECTIONS)!=0u;
             let specular = select(0.,s.reflectance,glossy);
             let specular_rgb = specular*s.specular;
-            let thin_leaf = !terminal && (s.flags & FOLIAGE)!=0u;
-            let transmission = select(vec3<f32>(0.),leaf_transmission(s.color.rgb),thin_leaf);
-            let diffuse = vec3<f32>(1.)-specular_rgb-transmission;
+            // A covered leaf is a surface, not tinted glass. Pigment
+            // transmission is used for light visibility only, not to carry
+            // a camera/specular ray straight through into the sky.
+            let diffuse = vec3<f32>(1.)-specular_rgb;
             // Partition the material response instead of adding a full-strength
             // local diffuse response to a mirror. Cosine-weighted sampling
             // cancels Lambert's cos/pi against its PDF; throughput is albedo.
@@ -1398,17 +1502,9 @@ fn transport(first: Ray, seed: ptr<function,u32>) -> Pixel {
             let bounce = !terminal && (s.flags & (EMISSIVE|BAKED))==0u && (frame.options.x & LIGHTING)!=0u;
             let albedo = select(vec3<f32>(0.),s.color.rgb*diffuse,bounce);
             let matte = strongest(albedo);
-            let transmitted = strongest(transmission);
-            let total = specular + matte + transmitted;
+            let total = specular + matte;
             if total<=0. { break; }
             path.depth++;
-            // Forward thin-surface transport is independent of leaf winding.
-            if transmitted>0. && random(seed)*total<transmitted {
-                path.ray = secondary(p,ray.dir,s.face,ray,solid.t);
-                path.weight *= transmission*(total/transmitted);
-                path.purpose = select(path.purpose,DIFFUSE,path.purpose==VIEW);
-                continue;
-            }
             if matte==0. || (specular>0. && random(seed)*(specular+matte)<specular) {
                 var d = norm(reflect(ray.dir,s.n));
                 if dot(d,s.face)<=0. { d = norm(reflect(ray.dir,s.face)); }

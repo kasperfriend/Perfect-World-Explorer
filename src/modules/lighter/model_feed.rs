@@ -32,9 +32,14 @@ pub(crate) struct Moving<'a> {
 }
 
 impl<'a> Moving<'a> {
+    #[cfg(test)]
     pub fn new(textures: &'a mut Textures) -> Self {
+        Self::for_mode(textures, super::Mode::Software)
+    }
+
+    pub(crate) fn for_mode(textures: &'a mut Textures, mode: super::Mode) -> Self {
         Self {
-            builder: Builder::default(),
+            builder: Builder::for_mode(mode),
             coverage: Inventory::default(),
             effects: Mesh::default(),
             textures,
@@ -192,13 +197,7 @@ impl<'a> Moving<'a> {
                         .map(|v| Vertex::new(v.position, v.normal, v.uv).tint(tint, tint)),
                 );
                 append_triangles(&mut child, &part.indices, 0, id);
-                self.builder.rigid_part(
-                    namespace,
-                    owner,
-                    (part.skin, part.mesh),
-                    &child,
-                    placement,
-                )?;
+                self.builder.rigid_part(&child, placement)?;
                 continue;
             }
             let base = geometry.vertices.len() as u32;
@@ -531,17 +530,20 @@ mod tests {
         };
         let solid = pack(&quad, false);
         let material = solid[3] as usize;
-        assert_eq!(solid[11], u32::from(MASK_SOLID | MASK_SHADOW));
+        assert_eq!(
+            solid[11],
+            u32::from(MASK_SOLID | MASK_SECONDARY | MASK_BLOCKER)
+        );
         assert_eq!(f32::from_bits(solid[material + 3]), 0.25);
         assert_eq!(f32::from_bits(solid[material + 4]), 37.);
         assert_eq!(solid[material + 10], rgba([0.5; 4]));
         assert_eq!(solid[material + 20], rgba([0.8, 1., 1., 1.]));
         assert_eq!(f32::from_bits(solid[material + 7]), 0.125);
         let alpha = pack(&quad, true);
-        assert_eq!(alpha[11], u32::from(MASK_GFX | MASK_SHADOW));
+        assert_eq!(alpha[11], u32::from(MASK_GFX | MASK_BLOCKER));
         quad.color[3] = 0.5;
         let sheet = pack(&quad, false);
-        assert_eq!(sheet[11], u32::from(MASK_GFX | MASK_SHADOW));
+        assert_eq!(sheet[11], u32::from(MASK_GFX | MASK_BLOCKER));
         assert_ne!(sheet[sheet[3] as usize + 1] & WRITE_DEPTH, 0);
     }
 }

@@ -16,7 +16,8 @@ use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 #[cfg(test)]
 pub(crate) use lighter_host::tests::{
-    fine_far_terrain_scene, joined_bmd_packets, stitched_terrain_scene, streamed_bmd_scenes,
+    fine_far_terrain_scene, joined_bmd_packets, ray_test_wet_grid, stitched_terrain_scene,
+    streamed_bmd_scenes,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -2905,7 +2906,9 @@ impl Renderer {
         // Disc placement follows the render path 0x4b3e00: each object uses its
         // own recovered elevation curve and the shared regional azimuth.
         // `sun_dir` is a light direction, which 0x4b60b0 stores negated.
-        let (sun, moon) = match crate::sky_time::evaluate(camera.time_of_day, authored) {
+        // These are disc fade, elevation, azimuth and shine, not the
+        // world-space material light vector above.
+        let (sky_sun, sky_moon) = match crate::sky_time::evaluate(camera.time_of_day, authored) {
             Some(state) => {
                 let fade = |sun: bool| {
                     if camera.celestial_discs {
@@ -3023,8 +3026,8 @@ impl Renderer {
         let frame = crate::sky_gpu::SkyFrame {
             hour: camera.time_of_day,
             night_weight,
-            sun,
-            moon,
+            sun: sky_sun,
+            moon: sky_moon,
             // The 38.16-72.5 degree band has no native mesh; the client covers it
             // with something drawn at 0x799f88 that this build does not, so the
             // viewer blends the frame's atmospheric fog into the cap's own rim

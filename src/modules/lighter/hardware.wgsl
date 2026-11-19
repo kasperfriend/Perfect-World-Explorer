@@ -11,7 +11,8 @@ fn triangle_hit(h: RayIntersection) -> Hit {
 // Do not confirm ordered blend hits: committing one would hide its peers at t.
 fn intersect(ray: Ray, q: Query) -> Hit {
     var query: ray_query;
-    rayQueryInitialize(&query, acceleration, RayDesc(0u, q.mask, ray.low, ray.high, ray.origin, ray.dir));
+    let flags = select(0u,RAY_FLAG_TERMINATE_ON_FIRST_HIT,q.mask==BLOCKER_MASK);
+    rayQueryInitialize(&query, acceleration, RayDesc(flags, q.mask, ray.low, ray.high, ray.origin, ray.dir));
     var best = none(ray);
     while rayQueryProceed(&query) {
         let h = rayQueryGetCandidateIntersection(&query);

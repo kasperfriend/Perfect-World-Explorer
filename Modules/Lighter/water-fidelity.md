@@ -35,8 +35,11 @@ CPU Vulkan ray-query and streamed pixel suites passed on Mesa 25.0.7
 formula and shoreline formula with known inputs, including a dry gap
 between equal-height bodies and reverse-Z depth that remains on the bed
 when the shoreline is present or clipped. The earlier archive fixture
-still covers reflected and refracted BMD geometry. A physical-GPU comparison
-is separate.
+still covers reflected and refracted BMD geometry. The interactive RT pass
+also checks equal extinction and depth across the production near/far stitch
+under one owner, plus matching lit-bed pixels across coplanar wet exports.
+See the [regression scope](performance.md#visual-regressions-covered). A
+physical-GPU comparison is separate.
 
 Matching v12 retail `a07` has one water owner (export 381, referenced in 26
 blocks): 32 drawable cells of 1024, height 330.8305, 32-unit cells and 18

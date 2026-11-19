@@ -6,6 +6,7 @@ use crate::modules::lighter::{
     textures::{Filter, Textures},
 };
 use glam::Vec3;
+use std::collections::HashMap;
 
 struct WetBody {
     export: u32,
@@ -17,20 +18,25 @@ struct WetBody {
     // Match the triangle predicate (mask bit 0), not the native fog query's
     // nonzero test. A dry/flag-only cell cannot provide an exit intersection.
     wet: Vec<u32>,
+    full: bool,
 }
 
 impl WetBody {
     fn new(a: &crate::water::WaterArea) -> Self {
-        let wet = a
-            .mask
-            .chunks(32)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .enumerate()
-                    .fold(0, |w, (i, flag)| w | (u32::from(flag & 1) << i))
-            })
-            .collect();
+        let full = a.mask.len() == a.columns * a.rows && a.mask.iter().all(|m| m & 1 != 0);
+        let wet = if full {
+            Vec::new()
+        } else {
+            a.mask
+                .chunks(32)
+                .map(|chunk| {
+                    chunk
+                        .iter()
+                        .enumerate()
+                        .fold(0, |w, (i, flag)| w | (u32::from(flag & 1) << i))
+                })
+                .collect()
+        };
         Self {
             export: a.export_id,
             center: a.center,
@@ -39,14 +45,35 @@ impl WetBody {
             rows: a.rows,
             grid: a.grid_size,
             wet,
+            full,
         }
     }
 
-    fn pack(&self, bank: &mut Textures, at: usize) -> Result<(), String> {
-        let mask = bank.reserve(self.wet.len())?;
-        bank.write_words(mask, &self.wet);
-        let x0 = self.center[0] - 0.5 * self.cols as f32 * self.grid;
-        let z0 = self.center[2] + 0.5 * self.rows as f32 * self.grid;
+    fn bounds(&self) -> [f32; 4] {
+        let x = self.cols as f32 * self.grid;
+        let z = self.rows as f32 * self.grid;
+        let x0 = self.center[0] - x * 0.5;
+        let z1 = self.center[2] + z * 0.5;
+        [x0, x0 + x, z1 - z, z1]
+    }
+
+    fn pack(&self, bank: &mut Textures, at: usize, neighbors: &[u32]) -> Result<(), String> {
+        let mask = if self.full {
+            0
+        } else {
+            let mask = bank.reserve(self.wet.len())?;
+            bank.write_words(mask, &self.wet);
+            mask
+        };
+        let links = if neighbors.is_empty() {
+            0
+        } else {
+            let table = bank.reserve(1 + neighbors.len())?;
+            bank.write_words(table, &[neighbors.len() as u32]);
+            bank.write_words(table + 1, neighbors);
+            table
+        };
+        let [x0, _, _, z0] = self.bounds();
         bank.write_words(
             at,
             &[
@@ -57,34 +84,90 @@ impl WetBody {
                 self.cols as u32,
                 self.rows as u32,
                 mask as u32,
-                0,
+                links as u32,
             ],
         );
         Ok(())
     }
 
     fn contains(&self, eye: Vec3) -> bool {
-        eye.y < self.height
-            && crate::water::cell_at(eye.x, eye.z, self.center, self.grid, self.cols, self.rows)
-                .is_some_and(|i| self.wet[i / 32] & (1 << (i % 32)) != 0)
+        if !eye.is_finite() || eye.y >= self.height {
+            return false;
+        }
+        // Unlike the legacy fog test, don't exclude both sides of an exact
+        // export boundary. Use the shader's half-open ownership convention.
+        let [x0, _, _, z1] = self.bounds();
+        let x = ((eye.x - x0) / self.grid).floor() as i32;
+        let z = ((z1 - eye.z) / self.grid).floor() as i32;
+        if x < 0 || x >= self.cols as i32 || z < 0 || z >= self.rows as i32 {
+            return false;
+        }
+        let i = x as usize + z as usize * self.cols;
+        self.full || self.wet[i / 32] & (1 << (i % 32)) != 0
     }
 }
 
 #[derive(Default)]
 pub(super) struct Water {
     bodies: Vec<WetBody>,
+    exports: HashMap<u32, u32>,
     table: u32,
     simple: Vec<u32>,
     shore: Option<(Mesh, Surface)>,
 }
 
 impl Water {
-    pub(super) fn load(t: &Terrain, tex: &mut Textures) -> Result<Self, String> {
-        let bodies: Vec<_> = t.water.iter().map(WetBody::new).collect();
-        let table = tex.reserve(bodies.len() * 8)?;
-        for (i, body) in bodies.iter().enumerate() {
-            body.pack(tex, table + i * 8)?;
+    pub(super) fn pack(
+        areas: &[crate::water::WaterArea],
+        tex: &mut Textures,
+    ) -> Result<Self, String> {
+        let bodies: Vec<_> = areas.iter().map(WetBody::new).collect();
+        let bounds: Vec<_> = bodies.iter().map(WetBody::bounds).collect();
+        let mut order: Vec<_> = (0..bodies.len()).collect();
+        order.sort_unstable_by(|&i, &j| {
+            bodies[i]
+                .height
+                .total_cmp(&bodies[j].height)
+                .then(bounds[i][0].total_cmp(&bounds[j][0]))
+        });
+        let mut links = vec![Vec::new(); bodies.len()];
+        // Only coplanar touching/overlapping grids can continue a wet path.
+        // Preserve the original grids (even different pitches) and dry holes.
+        for (k, &i) in order.iter().enumerate() {
+            let [_, x1, z0, z1] = bounds[i];
+            for &j in &order[k + 1..] {
+                if bodies[i].height != bodies[j].height {
+                    break;
+                }
+                let [x0, _, other_lo, other_hi] = bounds[j];
+                let tolerance = |a: f32, b: f32| a.abs().max(b.abs()).max(1.) * 4. * f32::EPSILON;
+                if x0 - x1 > tolerance(x0, x1) {
+                    break;
+                }
+                if other_lo - z1 <= tolerance(other_lo, z1)
+                    && z0 - other_hi <= tolerance(z0, other_hi)
+                {
+                    links[i].push(j as u32 + 1);
+                    links[j].push(i as u32 + 1);
+                }
+            }
         }
+        let table = tex.reserve(bodies.len() * 8)?;
+        let mut exports = HashMap::with_capacity(bodies.len());
+        for (i, body) in bodies.iter().enumerate() {
+            body.pack(tex, table + i * 8, &links[i])?;
+            exports.insert(body.export, i as u32 + 1);
+        }
+        Ok(Self {
+            bodies,
+            exports,
+            table: table as u32,
+            ..Self::default()
+        })
+    }
+
+    pub(super) fn load(t: &Terrain, tex: &mut Textures) -> Result<Self, String> {
+        let mut water = Self::pack(&t.water, tex)?;
         let mut simple = Vec::new();
         if t.water.iter().any(|a| a.simple) {
             for frame in &t.water_simple_frames {
@@ -132,12 +215,9 @@ impl Water {
                 }
             }
         };
-        Ok(Self {
-            bodies,
-            table: table as u32,
-            simple,
-            shore,
-        })
+        water.simple = simple;
+        water.shore = shore;
+        Ok(water)
     }
 
     pub(super) fn at(&self, eye: Vec3, bounds: Option<[f32; 4]>) -> u32 {
@@ -154,14 +234,13 @@ impl Water {
 
     pub(super) fn append(&self, m: &MeshData, b: &mut Builder) -> Result<(), String> {
         for &(export, lo, hi, simple) in &m.ray_water {
-            let id = self
-                .bodies
-                .iter()
-                .position(|b| b.export == export)
+            let &id = self
+                .exports
+                .get(&export)
                 .ok_or_else(|| format!("missing Lighter medium for water export {export}"))?;
             let surface = b.surface(
                 Surface::new(0, WATER | if simple { SIMPLE_WATER } else { 0 }, 0., 0.)
-                    .with_water_body(id as u32 + 1),
+                    .with_water_body(id),
             );
             let mesh = span(
                 &m.vertices,

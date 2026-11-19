@@ -10,14 +10,18 @@ proxy is an approximation: it sees both sides, shares the same texture and
 rocking, and doesn't rotate with the camera. It isn't an extra leaf for the
 same ray. The native SpeedTree code does not supply an optical transmission
 coefficient; Lighter uses a bounded RGB transmission based on the leaf
-pigment. Cutout holes pass the light without that tint, and opaque trunks
-remain blockers.
+pigment. Cutout holes pass light without tint, and trunks remain blockers. An
+accepted leaf occludes the background in camera and other image paths, rather
+than forwarding light from the sky straight through the leaf.
 
 LOD selection uses the native 3D distance, LOD-0 height and detail scale.
 Both levels in a transition use complementary 4×4 thresholds; a missing or
-budgeted partner keeps full coverage at the retained level. Trees share one
-mesh per type/LOD. The moving leaf positions use the posed cache rather
-than a separate topology per tree. A change in selected LOD membership can
+budgeted partner keeps full coverage at the retained level. Trees share stem, camera-card and secondary-proxy templates by type/LOD.
+The acceleration-instance masks keep camera cards out of secondary rays and
+proxies out of primary rays. Camera motion only changes the templates that
+track the view; bark/fronds are not copied into every animated proxy build.
+Near either end of a blend, the level that can't win any Bayer threshold is
+not submitted. A change in selected LOD membership can
 still rebuild a TLAS. The dither is in ray-pixel space, so reduced ray
 resolution is not the same as a native full-resolution dissolve.
 
@@ -25,10 +29,13 @@ Grass uses the native instance yaw, scale, area center, 80-slot world-space
 wind history and per-vertex bend weights. Fade is interpolated from unbent
 vertices for the main view; changing the viewer's range never makes an
 otherwise-present off-camera grass shadow disappear. Grass uses the same
-ray area lightmap and authored lower mip chains as before. Exact wind copies
-have a 4 MiB extra geometry budget per frame; further blades keep rigid
-instanced coverage and emit a diagnostic. This is an admission estimate,
-not a measured VRAM cap.
+ray area lightmap and authored lower mip chains as before. A blade whose bend weights are affine in height reuses one rest mesh and
+uses a sheared instance transform per placement, preserving original
+normals. Interactive Hardware also does this for complex blades when the
+maximum predicted vertex error is at most 0.02 world units. Otherwise the
+existing exact bend path is used, with the 4 MiB extra geometry budget;
+further blades keep rigid coverage and emit a diagnostic. The budget is
+an admission estimate, not a measured VRAM cap.
 
 ## Validation scope (2026-11-18)
 

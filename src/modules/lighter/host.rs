@@ -38,6 +38,7 @@ pub(super) struct Feed {
     terrain_ids: Vec<u32>,
     lightmaps: Vec<[u32; 2]>,
     static_lights: Vec<Light>,
+    light_cycle: Option<crate::environment::LightCycle>,
     mask_bank: Option<Textures>,
     terrain: [f32; 4],
     area_table: u32,
@@ -68,6 +69,7 @@ impl Feed {
         let mut result = Self {
             base: Textures::with_limit(storage),
             authored_mips,
+            light_cycle: t.environments.light_cycle(),
             static_lights: t
                 .scene_lights
                 .lights
@@ -278,7 +280,7 @@ impl Feed {
             // superseded textures or replace the cause with a generic error.
             return;
         }
-        let result = self.snapshot(m, lighter::storage_limit(device));
+        let result = self.snapshot_for(m, lighter::storage_limit(device), ray.settings.mode);
         ray.scenery_coverage = result
             .as_ref()
             .ok()
@@ -290,10 +292,20 @@ impl Feed {
         ray.install(packet);
     }
 
+    #[cfg(test)]
     fn snapshot(
         &mut self,
         m: &MeshData,
         storage: usize,
+    ) -> Result<(Packet, Textures, Inventory, scenery::Coverage), String> {
+        self.snapshot_for(m, storage, lighter::Mode::Software)
+    }
+
+    fn snapshot_for(
+        &mut self,
+        m: &MeshData,
+        storage: usize,
+        mode: lighter::Mode,
     ) -> Result<(Packet, Textures, Inventory, scenery::Coverage), String> {
         if let Some(upload) = &m.terrain_upload {
             self.terrain_masks(&upload.materials)?;
@@ -319,7 +331,7 @@ impl Feed {
             self.terrain[1] as usize,
             self.terrain[2],
         );
-        let mut builder = Builder::default();
+        let mut builder = Builder::for_mode(mode);
         for &light in &self.static_lights {
             builder.light(light);
         }
@@ -464,17 +476,34 @@ impl Feed {
         f: &FrameSnapshot,
         w: u32,
         h: u32,
+        regional_lighting: bool,
     ) -> lighter::Frame {
         let mut direction = Vec3::from_slice(&f.sun).normalize_or_zero();
         if direction.length_squared() < 0.5 {
             direction = Vec3::Y;
         }
-        let ambient = camera
-            .regional_light
-            .map_or([0.08 + f.daylight * 0.24; 3], |l| l.ambient.map(srgb));
-        let diffuse = camera
-            .regional_light
-            .map_or([0.68; 3], |l| l.diffuse.map(srgb));
+        // Don't relight every world-space surface when the eye crosses a
+        // local fog/lighting box. Use the map's default day/night palette;
+        // matching the legacy camera-local tint is an explicit choice.
+        let hour = camera.time_of_day;
+        let sky_shade = 1.
+            - 0.72
+                * crate::sky_time::night_weight(hour)
+                    .unwrap_or(0.)
+                    .clamp(0., 1.);
+        let [ambient, diffuse, sky_tint] =
+            if let Some(l) = camera.regional_light.filter(|_| regional_lighting) {
+                [l.ambient.map(srgb), l.diffuse.map(srgb), f.sky_tint]
+            } else if let Some(cycle) = self.light_cycle {
+                let (a, d) = cycle.colors(hour);
+                [
+                    a.map(srgb),
+                    d.map(srgb),
+                    std::array::from_fn(|i| a[i].max(d[i]) * sky_shade),
+                ]
+            } else {
+                [[0.08 + f.daylight * 0.24; 3], [0.68; 3], [sky_shade; 3]]
+            };
         let phase = crate::water_gpu::normal_phase(f.elapsed64);
         let wave_angle = crate::water_gpu::normal_offset_angle(f.elapsed64).to_bits();
         let waves = if self.waves.is_empty() {
@@ -504,11 +533,9 @@ impl Feed {
         };
         let air = camera.air_fog;
         let water = camera.underwater_fog;
-        let air_range = if camera.underwater_depth <= 0. {
-            f.active_fog_range
-        } else {
-            [air.start, air.end, 1., 0.]
-        };
+        // Lighter evaluates both media along the ray. The Native camera
+        // fog switch (and its nearest-window-edge cap) changes all pixels
+        // at once; never use it as the air coefficients of a ray path.
         let cutoff = self.cutoff.then_some(self.near_bounds);
         let current_body = self.water.at(camera.pos, cutoff);
         let [water_table, body_count] = self.water.table();
@@ -522,13 +549,9 @@ impl Feed {
                 .extend(0.)
                 .to_array(),
             air: [
-                air_range[0],
-                air_range[1],
-                if camera.atmospheric_fog && air_range[2] > 0.5 {
-                    1.
-                } else {
-                    0.
-                },
+                air.start,
+                air.end,
+                u32::from(camera.atmospheric_fog) as f32,
                 f.grass_wind[0],
             ],
             air_color: Vec3::from_array(air.color.map(srgb)).extend(0.).to_array(),
@@ -572,7 +595,7 @@ impl Feed {
             sky0: self.sky.layers(f.sky_sets.0, f.sky_sets.2.to_bits()),
             sky1: self.sky.layers(f.sky_sets.1, 0),
             sky_cdf: self.sky.distributions(f.sky_sets.0, f.sky_sets.1),
-            sky_tint: Vec3::from_array(f.sky_tint).extend(0.).to_array(),
+            sky_tint: Vec3::from_array(sky_tint).extend(0.).to_array(),
             sky_uv: [
                 f.sky_drift[0],
                 f.sky_drift[1],
@@ -831,8 +854,9 @@ fn moving(
     matrix: Mat4,
     cache: &mut AccelCache,
     absences: Counts,
+    settings: lighter::Settings,
 ) -> Result<(Packet, Inventory), String> {
-    let mut out = lighter::model_feed::Moving::new(textures);
+    let mut out = lighter::model_feed::Moving::for_mode(textures, settings.mode);
     out.coverage[Class::WorldModels] = absences;
     if let Some(models) = models {
         let (geometry, effects, dynamic, read) = models.ray_sources();
@@ -882,6 +906,7 @@ fn moving(
         &mut out.builder,
         &mut out.coverage[Class::Grass],
         &mut budget,
+        settings.mode == lighter::Mode::Hardware && !settings.reference,
     )?;
     if camera.underwater_depth <= 0. {
         feed.weather
@@ -984,7 +1009,14 @@ impl super::Renderer {
                 .lighter_feed
                 .as_ref()
                 .ok_or("Lighter scene feed is unavailable")?;
-            let lights = feed.frame(matrix, camera, frame, w, h);
+            let lights = feed.frame(
+                matrix,
+                camera,
+                frame,
+                w,
+                h,
+                self.lighter.settings.regional_lighting,
+            );
             let world = self
                 .lighter
                 .world
@@ -1001,6 +1033,7 @@ impl super::Renderer {
                 matrix,
                 &mut self.lighter.moving_accel,
                 self.ray_model_absences,
+                self.lighter.settings,
             )?;
             let rendered = self.lighter.render(
                 &self.device,

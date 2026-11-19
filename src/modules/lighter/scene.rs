@@ -49,8 +49,13 @@ pub const GRASS_WIND_SLOTS: usize = 80;
 // are then tested by the shared coverage predicate.
 pub const MASK_SOLID: u8 = 1;
 pub const MASK_BLEND: u8 = 2;
-pub const MASK_SHADOW: u8 = 4;
+pub const MASK_BLOCKER: u8 = 4;
 pub const MASK_GFX: u8 = 8;
+pub const MASK_SECONDARY: u8 = 16;
+pub const MASK_TRANSMISSIVE: u8 = 32;
+// Secondary blend and ordered passes still filter their families separately.
+// The last mask isolates GFX that must compose even behind an opaque hit.
+pub const MASK_GFX_OVERLAY: u8 = 64;
 pub const INSTANCE_WORDS: u32 = 14;
 const HEADER_WORDS: usize = 19;
 const MAX_EMITTERS: usize = 8192;
@@ -298,18 +303,30 @@ impl Surface {
     }
 
     fn ray_mask(self) -> u8 {
-        let blend = self.flags & BLEND != 0;
+        let f = self.flags;
+        let blend = f & BLEND != 0;
         let mut mask = if !blend {
-            MASK_SOLID
-        } else if self.flags & ORDERED_GFX != 0 {
-            MASK_GFX
+            (if f & HIDE_PRIMARY == 0 { MASK_SOLID } else { 0 })
+                | (if f & PRIMARY_ONLY == 0 {
+                    MASK_SECONDARY
+                } else {
+                    0
+                })
+        } else if f & ORDERED_GFX != 0 {
+            if f & OVERLAY != 0 {
+                MASK_GFX_OVERLAY
+            } else {
+                MASK_GFX
+            }
         } else {
             MASK_BLEND
         };
-        if self.flags & PRIMARY_ONLY == 0
-            && (self.flags & (WRITE_DEPTH | CLOUD) != 0 || (!blend && self.flags & WATER == 0))
-        {
-            mask |= MASK_SHADOW;
+        if f & PRIMARY_ONLY == 0 && (f & (WRITE_DEPTH | CLOUD) != 0 || (!blend && f & WATER == 0)) {
+            mask |= if f & (FOLIAGE | CLOUD) != 0 || (f & GLASS != 0 && self.glass[1] >> 31 == 0) {
+                MASK_TRANSMISSIVE
+            } else {
+                MASK_BLOCKER
+            };
         }
         mask
     }
@@ -371,14 +388,14 @@ impl Transform {
 /// Optional general affine placement for a bone/hook relative child. Most
 /// instances (important for grass) keep the old six-word scale/yaw transform.
 #[derive(Clone, Copy)]
-pub(super) struct Attachment {
+pub(crate) struct Attachment {
     position: Vec3,
     forward: Mat3,
     inverse: Mat3,
 }
 
 impl Attachment {
-    pub(super) fn new(matrix: Mat4) -> Option<Self> {
+    pub(crate) fn new(matrix: Mat4) -> Option<Self> {
         let forward = Mat3::from_mat4(matrix);
         if !matrix.is_finite()
             || [
@@ -478,7 +495,7 @@ pub type Fingerprint = [u8; 32];
 pub enum MeshKey {
     Static(Option<ChunkKey>, Fingerprint),
     Posed(&'static str, u64, Fingerprint),
-    RigidPart(&'static str, u64, usize, usize, Fingerprint),
+    RigidPart(Fingerprint),
 }
 
 pub struct MeshRange {
@@ -557,12 +574,46 @@ struct Projector {
 }
 const _: () = assert!(std::mem::size_of::<Projector>() == 22 * 4);
 
+#[derive(Clone, Copy)]
+struct RayMaterial {
+    mask: u8,
+    unconditional: bool,
+    emitter: bool,
+}
+
+impl From<Surface> for RayMaterial {
+    fn from(material: Surface) -> Self {
+        Self {
+            mask: material.ray_mask(),
+            unconditional: material.flags
+                & (CUTOUT
+                    | BLEND
+                    | NO_REFLECT
+                    | NO_REFRACT
+                    | CULL_BACK
+                    | WRITE_DEPTH
+                    | HIDE_PRIMARY
+                    | SINGLE_SIDED
+                    | FOLIAGE
+                    | PRIMARY_ONLY
+                    | TREE_MATERIAL
+                    | OVERLAY
+                    | CLOUD)
+                == 0,
+            emitter: material.emitter(),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Builder {
+    hardware_only: bool,
+    rigid_parts: HashMap<Fingerprint, u32>,
     vertices: Vec<Vertex>,
     triangles: Vec<[u32; 3]>,
     material_layers: Vec<[u32; 2]>,
     materials: Vec<Surface>,
+    ray_materials: Vec<RayMaterial>,
     material_map: std::collections::HashMap<Surface, u32>,
     meshes: Vec<MeshRange>,
     instances: Vec<Instance>,
@@ -620,6 +671,35 @@ pub(crate) struct AccelCache {
 impl AccelCache {
     fn pack(&mut self, builder: &mut Builder) -> (Bvh, (u32, u32), (u32, u32)) {
         let mut bvh = Bvh::default();
+        let scene = if builder.hardware_only {
+            // Vulkan builds these on the device. Keep the light-volume BVH
+            // (used by both shaders), not a second copy of the triangle trees.
+            (0, 0)
+        } else {
+            self.pack_geometry(builder, &mut bvh)
+        };
+        // A pulsing intensity doesn't move the light volumes or their nodes.
+        self.lights.update(
+            (0..builder.lights.len()).collect(),
+            builder
+                .lights
+                .iter()
+                .map(|l| {
+                    let [x, y, z, r] = l.position_range;
+                    let center = Vec3::new(x, y, z);
+                    let extent = Vec3::splat(r);
+                    Bounds {
+                        min: center - extent,
+                        max: center + extent,
+                    }
+                })
+                .collect(),
+        );
+        let light = bvh.append(&self.lights.tree, |id| id);
+        (bvh, scene, light)
+    }
+
+    fn pack_geometry(&mut self, builder: &mut Builder, bvh: &mut Bvh) -> (u32, u32) {
         let mut live = HashSet::with_capacity(builder.meshes.len());
         for mesh in &mut builder.meshes {
             live.insert(mesh.key);
@@ -675,26 +755,7 @@ impl AccelCache {
         let [builds, refits] = self.instances.update(keys, bounds);
         self.builds[1] += builds;
         self.refits[1] += refits;
-        let scene = bvh.append(&self.instances.tree, |id| order[id as usize] as u32);
-        // A pulsing intensity doesn't move the light volumes or their nodes.
-        self.lights.update(
-            (0..builder.lights.len()).collect(),
-            builder
-                .lights
-                .iter()
-                .map(|l| {
-                    let [x, y, z, r] = l.position_range;
-                    let center = Vec3::new(x, y, z);
-                    let extent = Vec3::splat(r);
-                    Bounds {
-                        min: center - extent,
-                        max: center + extent,
-                    }
-                })
-                .collect(),
-        );
-        let light = bvh.append(&self.lights.tree, |id| id);
-        (bvh, scene, light)
+        bvh.append(&self.instances.tree, |id| order[id as usize] as u32)
     }
 }
 
@@ -703,6 +764,7 @@ impl AccelCache {
 /// item, so this bounds rather than guesses the final storage binding size.
 #[derive(Clone, Copy)]
 pub(crate) struct MeshBudget {
+    pub software_bvh: bool,
     pub vertices: usize,
     pub triangles: usize,
     pub bytes: usize,
@@ -712,11 +774,12 @@ impl MeshBudget {
     pub fn debit(&mut self, mesh: &Mesh, surfaces: usize) -> bool {
         let v = mesh.vertices.len();
         let t = mesh.triangles.len();
+        let bvh = usize::from(self.software_bvh) * (2 * super::bvh::NODE_WORDS as usize + 1);
         let bytes = v * std::mem::size_of::<Vertex>()
-            + t * (6 + 2 * super::bvh::NODE_WORDS as usize) * 4
+            + t * (5 + bvh) * 4
             + surfaces * std::mem::size_of::<Surface>()
             // At most one new top-level entry per optional item.
-            + (INSTANCE_WORDS + 2 * super::bvh::NODE_WORDS + 1) as usize * 4;
+            + (INSTANCE_WORDS as usize + bvh) * 4;
         if v > self.vertices || t > self.triangles || bytes > self.bytes {
             return false;
         }
@@ -728,19 +791,31 @@ impl MeshBudget {
 }
 
 impl Builder {
+    pub(crate) fn for_mode(mode: super::Mode) -> Self {
+        Self {
+            hardware_only: mode == super::Mode::Hardware,
+            ..Self::default()
+        }
+    }
+
     /// Reserve space for the static TLAS and light BVH, which are only appended
     /// by `finish`. An optional extension must not overflow a binding when
     /// the ordinary resident scene fits on its own.
     pub fn optional_mesh_budget(&self, storage_bytes: usize) -> MeshBudget {
         let instances = self.instances.len();
-        let nodes: usize = self
-            .meshes
-            .iter()
-            .map(|m| Bvh::node_count(m.triangle.len()))
-            .sum();
-        let bvh_words = nodes * super::bvh::NODE_WORDS as usize
-            + self.triangles.len()
-            + (instances + self.lights.len()) * (2 * super::bvh::NODE_WORDS as usize + 1);
+        let per_item = 2 * super::bvh::NODE_WORDS as usize + 1;
+        let bvh_words = if self.hardware_only {
+            self.lights.len() * per_item
+        } else {
+            let nodes: usize = self
+                .meshes
+                .iter()
+                .map(|m| Bvh::node_count(m.triangle.len()))
+                .sum();
+            nodes * super::bvh::NODE_WORDS as usize
+                + self.triangles.len()
+                + (instances + self.lights.len()) * per_item
+        };
         let fixed = (HEADER_WORDS
             + self.vertices.len() * VERTEX_WORDS as usize
             + self.triangles.len() * 5
@@ -752,6 +827,7 @@ impl Builder {
             + bvh_words)
             * 4;
         MeshBudget {
+            software_bvh: !self.hardware_only,
             vertices: MAX_ITEMS.saturating_sub(self.vertices.len()),
             triangles: MAX_ITEMS.saturating_sub(self.triangles.len()),
             bytes: storage_bytes.saturating_sub(fixed),
@@ -821,6 +897,7 @@ impl Builder {
         *self.material_map.entry(surface).or_insert_with(|| {
             let id = self.materials.len() as u32;
             self.materials.push(surface);
+            self.ray_materials.push(surface.into());
             id
         })
     }
@@ -871,55 +948,52 @@ impl Builder {
         let tri_start = self.triangles.len() as u32;
         let mut bounds = Bounds::EMPTY;
         let mut mask = 0;
-        let first_mask = self.materials[material_id(mesh.surfaces[0]).unwrap() as usize].ray_mask();
+        let first_mask = self.ray_materials[material_id(mesh.surfaces[0]).unwrap() as usize].mask;
         let mut opaque = true;
         let mut emitters = Vec::new();
         let mut topology = Sha256::new();
         topology.update((mesh.vertices.len() as u32).to_le_bytes());
         topology.update(bytemuck::cast_slice::<_, u8>(&mesh.triangles));
         let topology: Fingerprint = topology.finalize().into();
+        let valid = |p: Vec3| p.is_finite() && p.abs().max_element() <= 1.0e7;
         let mut shape = Sha256::new();
         shape.update(topology);
+        let mut indices_only = self.hardware_only;
         for v in &mesh.vertices {
             shape.update(bytemuck::bytes_of(&v.pos));
+            // Check each position once while it is hot. If an unused vertex
+            // is invalid, fall back to validating only the referenced ones.
+            indices_only = indices_only && valid(Vec3::from_array(v.pos));
         }
         let shape: Fingerprint = shape.finalize().into();
         let key = key(topology, shape);
         for (i, (&tri, &mat)) in mesh.triangles.iter().zip(&mesh.surfaces).enumerate() {
-            for i in tri {
-                let p = Vec3::from_array(
-                    mesh.vertices
-                        .get(i as usize)
-                        .ok_or("invalid ray mesh index")?
-                        .pos,
-                );
-                if !p.is_finite() || p.abs().max_element() > 1.0e7 {
-                    return Err("invalid ray mesh position".into());
+            if indices_only {
+                if tri[0].max(tri[1]).max(tri[2]) as usize >= mesh.vertices.len() {
+                    return Err("invalid ray mesh index".into());
                 }
-                bounds = bounds.union(Bounds::point(p));
+            } else {
+                for i in tri {
+                    let p = Vec3::from_array(
+                        mesh.vertices
+                            .get(i as usize)
+                            .ok_or("invalid ray mesh index")?
+                            .pos,
+                    );
+                    if !valid(p) {
+                        return Err("invalid ray mesh position".into());
+                    }
+                    if !self.hardware_only {
+                        bounds = bounds.union(Bounds::point(p));
+                    }
+                }
             }
-            let material = self.materials[material_id(mat).unwrap() as usize];
-            if material.emitter() {
+            let material = self.ray_materials[material_id(mat).unwrap() as usize];
+            if material.emitter {
                 emitters.push(tri_start + i as u32);
             }
-            let bits = material.ray_mask();
-            mask |= bits;
-            opaque &= bits == first_mask
-                && material.flags
-                    & (CUTOUT
-                        | BLEND
-                        | NO_REFLECT
-                        | NO_REFRACT
-                        | CULL_BACK
-                        | WRITE_DEPTH
-                        | HIDE_PRIMARY
-                        | SINGLE_SIDED
-                        | FOLIAGE
-                        | PRIMARY_ONLY
-                        | TREE_MATERIAL
-                        | OVERLAY
-                        | CLOUD)
-                    == 0;
+            mask |= material.mask;
+            opaque &= material.mask == first_mask && material.unconditional;
         }
         // Don't leave partial ranges behind if validation rejected this draw.
         self.triangles.extend_from_slice(&mesh.triangles);
@@ -990,6 +1064,18 @@ impl Builder {
         slot: u32,
     ) -> Result<(), String> {
         self.place(mesh, transform)?;
+        self.instances.last_mut().unwrap().aux = [area[0].to_bits(), area[1].to_bits(), slot];
+        Ok(())
+    }
+
+    pub(crate) fn place_grass_affine(
+        &mut self,
+        mesh: u32,
+        attachment: Attachment,
+        area: [f32; 2],
+        slot: u32,
+    ) -> Result<(), String> {
+        self.place_model(mesh, Some(attachment))?;
         self.instances.last_mut().unwrap().aux = [area[0].to_bits(), area[1].to_bits(), slot];
         Ok(())
     }
@@ -1078,20 +1164,26 @@ impl Builder {
         Ok(())
     }
 
-    pub(super) fn rigid_part(
-        &mut self,
-        namespace: &'static str,
-        owner: u64,
-        part: (usize, usize),
-        mesh: &Mesh,
-        placement: Attachment,
-    ) -> Result<(), String> {
-        if let Some(id) = self.mesh_keyed(mesh, Some, |_, shape| {
-            MeshKey::RigidPart(namespace, owner, part.0, part.1, shape)
-        })? {
-            self.place_model(id, Some(placement))?;
-        }
-        Ok(())
+    pub(super) fn rigid_part(&mut self, mesh: &Mesh, placement: Attachment) -> Result<(), String> {
+        let mut draw = Sha256::new();
+        draw.update((mesh.vertices.len() as u32).to_le_bytes());
+        draw.update((mesh.triangles.len() as u32).to_le_bytes());
+        draw.update(bytemuck::cast_slice::<_, u8>(&mesh.vertices));
+        draw.update(bytemuck::cast_slice::<_, u8>(&mesh.triangles));
+        draw.update(bytemuck::cast_slice::<_, u8>(&mesh.surfaces));
+        draw.update(bytemuck::cast_slice::<_, u8>(&mesh.layers));
+        let draw: Fingerprint = draw.finalize().into();
+        let id = if let Some(&id) = self.rigid_parts.get(&draw) {
+            id
+        } else {
+            let Some(id) = self.mesh_keyed(mesh, Some, |_, shape| MeshKey::RigidPart(shape))?
+            else {
+                return Ok(());
+            };
+            self.rigid_parts.insert(draw, id);
+            id
+        };
+        self.place_model(id, Some(placement))
     }
 
     fn place_model(&mut self, mesh: u32, placement: Option<Attachment>) -> Result<(), String> {
@@ -1251,6 +1343,7 @@ impl Builder {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             attachments: self.attachments,
             triangle_count: self.triangles.len(),
+            hardware_only: self.hardware_only,
         }
     }
 }
@@ -1262,6 +1355,7 @@ pub struct Packet {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     attachments: Vec<Attachment>,
     triangle_count: usize,
+    pub(super) hardware_only: bool,
 }
 
 impl Packet {

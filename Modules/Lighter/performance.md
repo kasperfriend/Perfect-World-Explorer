@@ -103,3 +103,65 @@ same pixels. The fixture covers synthetic assets, not full retail map captures.
 Steps 5 and 6 also passed the Windows standalone build and portable upload,
 re-download and layout audit in those same runs. This packaging verification
 is not a Windows ray-rendering or performance test.
+
+## Interactive Hardware RT pass
+
+This pass keeps ordinary primary and secondary queries against actual
+world-space terrain, scenery, water, vegetation and actors. The default
+Native launch, explicit same-map reload, and Software fallback route are
+unchanged; Hardware does not silently become Software. Reference bypasses
+the diffuse distance cap and the approximate grass bend. It still benefits
+from exact batching, uploads and traversal changes.
+
+| # | Work removed | Scope / trade-off |
+|---:|---|---|
+| 1 | **No duplicate CPU geometry BVHs in Vulkan packets** | Hardware builds its triangle BLAS/TLAS on the device. CPU packing skips software geometry bounds, checks each position once and retains the point-light BVH, materials, indices and transforms. Software still builds its stackless geometry trees. |
+| 2 | **Dirty-range moving geometry and instance uploads** | Compare with the last submitted bytes, copy only changed ranges, and coalesce highly fragmented updates. Growth still copies the complete payload; retain Vulkan visibility barriers and fence ownership. `moving_copy_bytes` and `instance_copy_bytes` identify the sampled transfer costs. |
+| 3 | **Instance identical rigid model parts across owners** | Matching bind-space vertices/topology/materials share one packet mesh. Different material/visibility records can still share the same native BLAS when shape matches. Weighted skins remain truly posed. Static BMD chunk reuse is existing behavior, not a new optimization. |
+| 4 | **Animate grass in instance transforms** | Independently scaled and yawed two-height cards can share one rest BLAS. The bounded affine shortcut avoids per-blade vertex copies and rebuild/refit work; retain the exact path for larger errors. |
+| 5 | **Split tree canopy geometry by ray purpose** | Share stem/frond, camera leaf and secondary proxy templates per type/LOD. Keep the camera and proxy triangles out of each other's queries; omit the unused level at the endpoints of the Bayer transition. Separate masks can add TLAS entries where both card types exist. |
+| 6 | **Terminate shadow traversal on an accepted blocker** | Classify each distinct material once. Only clear legs walk tinted leaf/cloud/thin-glass layers; emitter endpoint and two-leg underwater visibility remain real queries. Empty sheet passes are skipped; GFX without overlays stops at the solid/depth-write limit. |
+| 7 | **Scalar alpha filtering for ray candidates** | Filter alpha directly, not unpacked RGB, keeping the same threshold, area-mip, anisotropic footprint, wrap/clamp and alpha holes. |
+| 8 | **Reuse projected UV footprints across texture stages** | Compute geometry/UV derivatives once for albedo, normal and face stages or for both animated wave maps; different texture sizes still choose their own mip and taps. |
+| 9 | **Check terrain masks before fetching layer colors** | Composite top-down using the equivalent weights, skipping zero-weight layers and everything below an opaque mask. Keep baked light and authored paint. |
+| 10 | **Limit only dry diffuse bounce distance** | Default 256 world units, configurable up to full range. More distant diffuse paths use sky instead of distant geometry. Primary, shadow and specular/water rays keep their range. |
+
+### Visual regressions covered
+
+- A foliage fragment that passed coverage no longer acts like glass. A
+  genuinely transparent texel still shows sky at sky depth, and leaves still
+  tint direct shadows.
+- The shared frame snapshot now keeps the material light vector separate
+  from celestial billboard data. By default, Lighter uses a stable map
+  palette evaluated at the current hour; translating the camera into another
+  regional record does not dim global surface/sky light. **Follow local
+  region lighting** restores intentional local recoloring. Ray air fog uses
+  its own coefficients rather than swapping with the Native camera medium.
+- Coplanar wet exports no longer stop extinction at an ownership edge.
+  The fixtures compare split and unsplit pools through the same geometry,
+  including a camera exactly at the join, bitmap-backed cells and sun rays
+  crossing the seam. They also check that a real dry gap or another water
+  height does not become wet. A separate fixture puts the stitched near/far
+  terrain join under a single water owner and checks a known extinction and
+  unchanged reverse-Z on both sides and exactly at the edge.
+
+### Measurements and limits
+
+`lighter_vulkan_interop_on_cpu` reports packet bytes, CPU pack time and
+warmed synchronized frame time for the matched 96×96 static sweep. At
+8,192 triangles the Hardware packet is **702,648 bytes** rather than the
+**879,252 bytes** of the corresponding packet with Software BVHs. The
+spread of CPU Vulkan frame times on this small sweep is not an RTX 3080 FPS
+estimate. It has no forest, animated models, or water in the timed frames.
+
+The affine wind fixture keeps **1 BLAS template for 64 independently bent
+placements**, versus 64 bent copies plus the rest template on the old path.
+The sparse upload fixture changes two 1 KiB pages in a 1 MiB payload and
+emits **2 KiB**, not 1 MiB, of copies. Entirely changed payloads still need
+copies. Shader and traversal costs depend on the scene mix, driver, ray
+resolution and enabled effects. For physical A/B, use the same map, camera
+and hour, and hold resolution, ray settings, view distance and weather fixed.
+Use the capture tooling in [retail validation](retail-matrix.md) to retain
+GPU build/traversal samples and wall times separately. The synthetic
+submerged check is not a reproduction of the reported retail seam; retail
+screenshots and the physical GPU comparison are still needed.

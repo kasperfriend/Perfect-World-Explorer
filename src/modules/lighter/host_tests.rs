@@ -9,6 +9,16 @@ use glam::Vec3;
 
 const SKY: [u8; 4] = [25, 75, 175, 255];
 
+pub(crate) fn ray_test_wet_grid(
+    bank: &mut super::Textures,
+    areas: &[crate::water::WaterArea],
+    eye: Vec3,
+) -> [u32; 4] {
+    let water = super::water_feed::Water::pack(areas, bank).unwrap();
+    let [table, count] = water.table();
+    [0, water.at(eye, None), table, count]
+}
+
 struct FixtureRoot(std::path::PathBuf);
 impl FixtureRoot {
     fn new() -> Self {
@@ -929,6 +939,73 @@ fn lighter_streamed_world_pixels() {
         assert_eq!(r.lighter.error(), None);
         pixel
     };
+    // Fixed clock, moving eye and a much darker region record. The
+    // camera can change fog/weather without changing world radiance.
+    let mut sky_camera = Camera::new(&terrain);
+    sky_camera.pos = Vec3::new(0., 20., 0.);
+    sky_camera.yaw = 0.;
+    sky_camera.pitch = 0.65;
+    sky_camera.far = 40.;
+    sky_camera.time_of_day = 12.;
+    sky_camera.celestial_discs = false;
+    sky_camera.world_effects = false;
+    sky_camera.bloom = false;
+    sky_camera.logic_delta_ms = 0;
+    let region = |v, toward_sun| crate::environment::RegionalLight {
+        ambient: [v; 3],
+        diffuse: [v; 3],
+        specular: [v; 3],
+        toward_sun,
+        celestial_flags: 0x18,
+    };
+    sky_camera.regional_light = Some(region(0.9, [0., 1., 0.]));
+    let same_hour = |r: &mut Renderer, c: &Camera| {
+        let snap = r.begin_frame(c, SIZE, SIZE);
+        r.lighter_feed.as_ref().unwrap().frame(
+            c.matrix(SIZE, SIZE, c.far),
+            c,
+            &snap,
+            SIZE,
+            SIZE,
+            false,
+        )
+    };
+    let before = same_hour(&mut r, &sky_camera);
+    assert!(
+        (Vec3::from_slice(&before.sun) - Vec3::new(0., 1., 0.46).normalize()).length() < 1e-6,
+        "noon light used disc fade/elevation instead of a direction"
+    );
+    let bright_sky = at_center(&mut r, &sky_camera);
+    assert_eq!(bright_sky.1, 0.);
+    sky_camera.pos.x += 3.;
+    sky_camera.regional_light = Some(region(0.07, [1., 0., 0.]));
+    let after = same_hour(&mut r, &sky_camera);
+    assert_eq!(
+        (
+            before.sun,
+            before.sun_color,
+            before.ambient,
+            before.sky_tint
+        ),
+        (after.sun, after.sun_color, after.ambient, after.sky_tint)
+    );
+    assert_eq!(at_center(&mut r, &sky_camera), bright_sky);
+    // The override explicitly retains the legacy local palette, not the bug.
+    r.lighter.settings.regional_lighting = true;
+    let local_sky = at_center(&mut r, &sky_camera);
+    assert!(local_sky.0[2] + 70 < bright_sky.0[2]);
+    r.lighter.settings.regional_lighting = false;
+    sky_camera.time_of_day = 0.;
+    let night = same_hour(&mut r, &sky_camera);
+    assert_eq!(night.sun[3], 0.);
+    assert!((night.sky_tint[0] + 0.5) < before.sky_tint[0]);
+    let night_sky = at_center(&mut r, &sky_camera);
+    assert!(night_sky.0[2] + 60 < bright_sky.0[2]);
+    // Return sky state to the day before the material-specific probes.
+    for _ in 0..2 {
+        let _ = same_hour(&mut r, &camera);
+    }
+
     let wet = at_center(&mut r, &camera);
     assert!(
         wet.0[2] > wet.0[1] && wet.0[1] > 0,

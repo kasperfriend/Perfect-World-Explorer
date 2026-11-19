@@ -1,3 +1,6 @@
+#[path = "optimization_tests.rs"]
+mod optimizations;
+
 use super::*;
 use glam::{Mat4, Vec3};
 use scene::*;
@@ -739,6 +742,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_dielectric_and_metal(&mut h);
     exercise_media_segments(&mut h);
     exercise_reference_lighting(&mut h);
+    optimizations::exercise(&mut h);
     if let Some(t) = &h.ray.timings {
         assert!(t.collected > 0);
     }
@@ -2876,7 +2880,7 @@ fn exercise_streamed_bmds(h: &mut Harness) {
         anisotropy: 8,
         relight_baked: false,
         physical_bsdf: false,
-        reference: false,
+        ..Settings::default()
     };
     let sample = |h: &mut Harness| {
         h.ray.settings.bounces = 0;
@@ -3199,10 +3203,7 @@ fn exercise_rigid_hanger(h: &mut Harness) {
         )
         .unwrap();
         let packet = out.finish_cached(&mut cache).unwrap();
-        assert!(matches!(
-            packet.meshes[0].key,
-            MeshKey::RigidPart("walker", 1, 0, 0, _)
-        ));
+        assert!(matches!(packet.meshes[0].key, MeshKey::RigidPart(_)));
         packet
     };
     let frame = test_frame(Vec3::ZERO, Vec3::NEG_Z, 3);
@@ -3405,7 +3406,7 @@ fn exercise_chunk_scaling(h: &mut Harness) {
         let mut pack_ms = Vec::new();
         for _ in 0..5 {
             let start = Instant::now();
-            let mut builder = Builder::default();
+            let mut builder = Builder::for_mode(h.ray.settings.mode);
             builder.surface(Surface::new(tile, 0, 0., 0.));
             for (i, mesh) in meshes[..count].iter().enumerate() {
                 builder.chunk(ChunkKey::Scenery(i as i32, 0), mesh).unwrap();
@@ -3418,6 +3419,7 @@ fn exercise_chunk_scaling(h: &mut Harness) {
         let pixel = h.pixel(frame, &empty);
         assert_eq!(pixel.0, [0, 255, 0, 255]);
         assert!((pixel.1 - depth_at(frame, Vec3::NEG_Z * 4.)).abs() < 1e-5);
+        let packet_bytes = h.ray.world.as_ref().unwrap().packet.bytes().len();
         let before = h.ray.allocation_counts();
         let mut frame_ms = Vec::new();
         for _ in 0..9 {
@@ -3449,7 +3451,7 @@ fn exercise_chunk_scaling(h: &mut Harness) {
         } else {
             ""
         };
-        eprintln!("{notice}Lighter {:?}, {count} chunks ({} triangles), {SIDE}x{SIDE}: median CPU pack {:.3} ms, synchronized frame {:.3} ms", h.ray.settings.mode, count * 32, pack_ms[2], frame_ms[4]);
+        eprintln!("{notice}Lighter {:?}, {count} chunks ({} triangles), {SIDE}x{SIDE}: {packet_bytes} packet bytes, median CPU pack {:.3} ms, synchronized frame {:.3} ms", h.ray.settings.mode, count * 32, pack_ms[2], frame_ms[4]);
     }
 }
 
@@ -3602,12 +3604,29 @@ fn exercise_terrain_seam(h: &mut Harness) {
         assert_eq!(pixel, color, "grazing ray crossed a terrain seam at x={x}");
         assert!((depth - depth_at(frame, Vec3::new(hit_x, 2., 4.))).abs() < 1e-5);
     }
-    h.ray.install(Ok((
-        crate::gpu::fine_far_terrain_scene(),
-        Textures::default(),
-    )));
+    let mut bank = Textures::default();
+    // One wet owner spans the actual near/far geometry join. It is not a
+    // medium boundary: each bed hit should receive the same 4-unit extinction.
+    let wet = crate::gpu::ray_test_wet_grid(
+        &mut bank,
+        &[crate::water::WaterArea {
+            export_id: 1,
+            color: u32::MAX,
+            simple: false,
+            height: 8.,
+            grid_size: 16.,
+            columns: 1,
+            rows: 1,
+            center: [0., 8., 2.],
+            mask: vec![1],
+            shore_waves: vec![],
+        }],
+        Vec3::new(0., 5., 2.),
+    );
+    h.ray
+        .install(Ok((crate::gpu::fine_far_terrain_scene(), bank)));
     for x in [-0.125, 0., 0.125] {
-        let frame = test_frame(Vec3::new(x, 5., 2.), -Vec3::Y, 3);
+        let mut frame = test_frame(Vec3::new(x, 5., 2.), -Vec3::Y, 3);
         let (color, depth) = h.pixel(frame, &empty);
         let red = [255, 0, 0, 255];
         let blue = [0, 0, 255, 255];
@@ -3622,6 +3641,22 @@ fn exercise_terrain_seam(h: &mut Harness) {
             "gap at the finer far grid join x={x}: {color:?}"
         );
         assert!((depth - depth_at(frame, Vec3::new(x, 1., 2.))).abs() < 1e-5);
+
+        frame.water_effects = wet;
+        frame.resident_bounds = [-50., 50., -50., 50.];
+        frame.water = [0., 12., 1., 0.];
+        let hue = Vec3::from_slice(&frame.water_color);
+        let strength = Vec3::ONE + 0.5 * (Vec3::ONE - hue / hue.max_element());
+        let tr = Vec3::from_array(
+            (strength * (-4.321928 * 4. / 12.))
+                .to_array()
+                .map(f32::exp2),
+        );
+        let bed = Vec3::new(color[0] as f32, color[1] as f32, color[2] as f32) / 255.;
+        let expected = hue * (Vec3::ONE - tr) + tr * bed;
+        let hit = h.pixel(frame, &empty);
+        assert_radiance("submerged near/far terrain join", hit, expected.to_array());
+        assert!((hit.1 - depth).abs() < 1e-5, "wet join at x={x}: {hit:?}");
     }
 }
 

@@ -416,6 +416,7 @@ impl SceneryStream {
         order.truncate(EXTRA_PLACEMENTS);
         let mut budget = Budget {
             geometry: MeshBudget {
+                software_bvh: true,
                 vertices: usize::MAX,
                 triangles: usize::MAX,
                 bytes: EXTRA_GEOMETRY_BYTES,
@@ -590,6 +591,7 @@ mod tests {
         };
         let mut budget = Budget {
             geometry: MeshBudget {
+                software_bvh: true,
                 vertices: 6,
                 triangles: 2,
                 bytes: 1024,

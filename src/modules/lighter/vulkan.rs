@@ -328,21 +328,86 @@ impl Drop for Buffer {
     }
 }
 
+// Dirty pages amortize decisions over wide comparisons/memcpy. Coalesce
+// nearby changes and fall back to one span for very fragmented animation.
+const DIRTY_PAGE: usize = 1024;
+const MAX_DIRTY_SPANS: usize = 128;
+fn copy_range(offset: usize, bytes: usize) -> vk::BufferCopy {
+    debug_assert!(offset % 4 == 0 && bytes % 4 == 0);
+    vk::BufferCopy {
+        src_offset: offset as u64,
+        dst_offset: offset as u64,
+        size: bytes as u64,
+    }
+}
+
+fn dirty_copies(before: &[u8], after: &[u8], copies: &mut Vec<vk::BufferCopy>) {
+    copies.clear();
+    let mut overflow = false;
+    for (i, page) in after.chunks(DIRTY_PAGE).enumerate() {
+        let at = i * DIRTY_PAGE;
+        if before.get(at..at + page.len()) == Some(page) {
+            continue;
+        }
+        if let Some(last) = copies.last_mut() {
+            if at as u64 <= last.dst_offset + last.size + DIRTY_PAGE as u64 || overflow {
+                last.size = (at + page.len()) as u64 - last.dst_offset;
+                continue;
+            }
+        }
+        copies.push(copy_range(at, page.len()));
+        if copies.len() == MAX_DIRTY_SPANS {
+            let first = copies[0].dst_offset as usize;
+            copies.clear();
+            copies.push(copy_range(first, at + page.len() - first));
+            overflow = true;
+        }
+    }
+}
+
 struct Upload {
     gpu: Buffer,
     staging: Buffer,
-    bytes: u64,
-    offset: u64,
+    copies: Vec<vk::BufferCopy>,
 }
 impl Upload {
+    fn reserve(
+        slot: &mut Option<Self>,
+        ctx: &Arc<Context>,
+        bytes: usize,
+        usage: vk::BufferUsageFlags,
+    ) -> R<bool> {
+        let needed = (bytes as u64).max(16);
+        let old = slot.as_ref().map_or(0, |b| b.gpu.size);
+        if old >= needed {
+            return Ok(false);
+        }
+        let limit = if usage.contains(STORAGE) {
+            ctx.storage_limit
+        } else {
+            u64::MAX
+        };
+        let capacity = grown_capacity(needed, old, limit);
+        *slot = Some(Self {
+            gpu: Buffer::new(
+                ctx,
+                capacity,
+                usage | vk::BufferUsageFlags::TRANSFER_DST,
+                LOCAL,
+            )?,
+            staging: Buffer::new(ctx, capacity, vk::BufferUsageFlags::TRANSFER_SRC, HOST)?,
+            copies: Vec::new(),
+        });
+        Ok(true)
+    }
+
     fn set(
         slot: &mut Option<Self>,
         ctx: &Arc<Context>,
         data: &[u8],
         usage: vk::BufferUsageFlags,
-        retained_prefix: usize,
     ) -> R<()> {
-        Self::set_segments(slot, ctx, [data], data.len(), usage, retained_prefix)
+        Self::set_segments(slot, ctx, [data], data.len(), usage, 0)
     }
 
     fn set_segments<'a>(
@@ -353,58 +418,60 @@ impl Upload {
         usage: vk::BufferUsageFlags,
         retained_prefix: usize,
     ) -> R<()> {
-        let needed = (bytes as u64).max(16);
-        let old = slot.as_ref().map_or(0, |b| b.gpu.size);
-        let grew = old < needed;
-        if grew {
-            let limit = if usage.contains(STORAGE) {
-                ctx.storage_limit
-            } else {
-                u64::MAX
-            };
-            let capacity = grown_capacity(needed, old, limit);
-            *slot = Some(Self {
-                gpu: Buffer::new(
-                    ctx,
-                    capacity,
-                    usage | vk::BufferUsageFlags::TRANSFER_DST,
-                    LOCAL,
-                )?,
-                staging: Buffer::new(ctx, capacity, vk::BufferUsageFlags::TRANSFER_SRC, HOST)?,
-                bytes: 0,
-                offset: 0,
-            });
-        }
+        let grew = Self::reserve(slot, ctx, bytes, usage)?;
         let buffer = slot.as_mut().unwrap();
-        buffer.bytes = bytes as u64;
         let prefix = if grew || retained_prefix > bytes {
             0
         } else {
             retained_prefix
         };
-        buffer.offset = prefix as u64;
+        buffer.copies.clear();
+        buffer.copies.extend(
+            (prefix..bytes)
+                .step_by(UPLOAD_PAGE_BYTES)
+                .map(|at| copy_range(at, (bytes - at).min(UPLOAD_PAGE_BYTES))),
+        );
         buffer
             .staging
             .write_segments(suffix_segments(segments, prefix))
     }
 
+    fn set_changed(
+        slot: &mut Option<Self>,
+        ctx: &Arc<Context>,
+        data: &[u8],
+        usage: vk::BufferUsageFlags,
+        previous: &[u8],
+    ) -> R<()> {
+        let grew = Self::reserve(slot, ctx, data.len(), usage)?;
+        let buffer = slot.as_mut().unwrap();
+        if grew {
+            buffer.copies.clear();
+            if !data.is_empty() {
+                buffer.copies.push(copy_range(0, data.len()));
+            }
+        } else {
+            dirty_copies(previous, data, &mut buffer.copies);
+        }
+        buffer
+            .staging
+            .write_segments(buffer.copies.iter().map(|copy| {
+                let at = copy.dst_offset as usize;
+                (at, &data[at..at + copy.size as usize])
+            }))
+    }
+
+    fn copied_bytes(&self) -> u64 {
+        self.copies.iter().map(|r| r.size).sum()
+    }
+
     unsafe fn encode(&self, cmd: vk::CommandBuffer) {
-        if self.bytes > self.offset {
-            // A replaced bank publishes only after its pages and geometry
-            // have arrived in queue order. No render-thread device wait.
-            let regions: Vec<_> = (self.offset..self.bytes)
-                .step_by(UPLOAD_PAGE_BYTES)
-                .map(|offset| vk::BufferCopy {
-                    src_offset: offset,
-                    dst_offset: offset,
-                    size: (self.bytes - offset).min(UPLOAD_PAGE_BYTES as u64),
-                })
-                .collect();
+        if !self.copies.is_empty() {
             self.gpu.ctx.device.cmd_copy_buffer(
                 cmd,
                 self.staging.handle,
                 self.gpu.handle,
-                &regions,
+                &self.copies,
             );
         }
     }
@@ -809,7 +876,8 @@ pub struct Renderer {
     frame: Buffer,
     output: Option<Output>,
     submitted: bool,
-    timing_pending: Option<bool>,
+    scene_upload_pending: bool,
+    timing_pending: Option<(bool, u64, u64)>,
     last_timing: Option<Instant>,
     revision: Option<u64>,
     texture_len: usize,
@@ -845,6 +913,7 @@ impl Renderer {
             frame,
             output: None,
             submitted: false,
+            scene_upload_pending: false,
             timing_pending: None,
             last_timing: None,
             revision: None,
@@ -965,12 +1034,12 @@ impl Renderer {
             if plan.instance_data.len() as u64 > ctx.max_instances {
                 return Err("Lighter scene exceeds Vulkan TLAS instance limit".into());
             }
-            Upload::set(
+            Upload::set_changed(
                 &mut self.instances,
                 ctx,
                 bytemuck::cast_slice(&plan.instance_data),
                 BUILD_INPUT | ADDRESS,
-                0,
+                bytemuck::cast_slice(&self.instance_data),
             )?;
             let tlas = Build {
                 ty: vk::AccelerationStructureTypeKHR::TOP_LEVEL,
@@ -998,7 +1067,7 @@ impl Renderer {
     }
 
     pub(super) fn moving_unchanged(&self, moving: &Packet) -> bool {
-        self.last_moving == moving.words
+        !self.scene_upload_pending && self.last_moving == moving.words
     }
 
     /// Later-frame probe for the single command pool/fence/descriptor set and
@@ -1009,7 +1078,7 @@ impl Renderer {
                 .map_err(vkerr("poll ray frame"))?;
             self.submitted = !ready;
             if ready {
-                if let Some(built) = self.timing_pending.take() {
+                if let Some((built, moving_bytes, instance_bytes)) = self.timing_pending.take() {
                     let ctx = &self.core.ctx;
                     let mut ticks = [0u64; 4];
                     let result = unsafe {
@@ -1032,7 +1101,7 @@ impl Renderer {
                         };
                         let build = if built { duration(0) } else { 0. };
                         let bytes = ctx.budget.held.load(Ordering::Relaxed);
-                        eprintln!("Lighter gpu stage Vulkan: build_ms={build:.3} traversal_ms={:.3} allocation_bytes={bytes} budget_bytes={}",duration(2),ctx.budget.limit);
+                        eprintln!("Lighter gpu stage Vulkan: build_ms={build:.3} traversal_ms={:.3} allocation_bytes={bytes} budget_bytes={} moving_copy_bytes={moving_bytes} instance_copy_bytes={instance_bytes}",duration(2),ctx.budget.limit);
                     }
                 }
             }
@@ -1120,12 +1189,24 @@ impl Renderer {
         // Raw submit and wgpu composition both run on the render thread on
         // the same VkQueue. `try_prepare_image` has observed the native fence.
         assert!(!self.submitted);
+        if self.scene_upload_pending {
+            // An earlier attempt failed before submitting. It may have
+            // replaced buffers or evicted ASes. A retry cannot compare
+            // against those resources as if the previous bytes survived.
+            self.revision = None;
+            self.texture_prefix = TexelPrefix::default();
+            self.last_moving.clear();
+            self.instance_data.clear();
+            self.blas.clear();
+            self.tlas = None;
+        }
+        self.scene_upload_pending = true;
         let static_changed = self.revision != Some(revision);
         let textures_changed = static_changed || self.texture_len != texels.byte_len();
         let input = STORAGE | BUILD_INPUT | ADDRESS;
         let ctx = &self.core.ctx;
         if static_changed {
-            Upload::set(&mut self.world, ctx, world.bytes(), input, 0)?;
+            Upload::set(&mut self.world, ctx, world.bytes(), input)?;
         }
         if textures_changed {
             let prefix = if static_changed {
@@ -1149,7 +1230,13 @@ impl Renderer {
             .copied()
             .eq(moving.meshes.iter().map(|m| m.key));
         if moving_changed {
-            Upload::set(&mut self.moving, ctx, moving.bytes(), input, 0)?;
+            Upload::set_changed(
+                &mut self.moving,
+                ctx,
+                moving.bytes(),
+                input,
+                bytemuck::cast_slice(&self.last_moving),
+            )?;
         }
         let plan = if static_changed || moving_changed || moving_keys_changed {
             Some(self.prepare_accel(world, moving)?)
@@ -1328,12 +1415,24 @@ impl Renderer {
         }
         self.core.submit()?;
         self.submitted = true;
+        self.scene_upload_pending = false;
         if timing {
             self.last_timing = Some(Instant::now());
-            self.timing_pending = Some(built);
+            let moving_bytes = if moving_changed { m.copied_bytes() } else { 0 };
+            let instance_bytes = if plan.as_ref().is_some_and(|p| p.tlas.is_some()) {
+                self.instances.as_ref().unwrap().copied_bytes()
+            } else {
+                0
+            };
+            self.timing_pending = Some((built, moving_bytes, instance_bytes));
         }
         if moving_changed {
-            self.last_moving.clone_from(&moving.words);
+            self.last_moving.resize(moving.words.len(), 0);
+            for copy in &m.copies {
+                let at = copy.dst_offset as usize / 4;
+                let end = at + copy.size as usize / 4;
+                self.last_moving[at..end].copy_from_slice(&moving.words[at..end]);
+            }
         }
         if moving_keys_changed {
             self.last_moving_keys.clear();
@@ -1383,6 +1482,41 @@ impl Drop for Renderer {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn dirty_uploads_copy_only_changed_pages_and_bound_fragmentation() {
+        let mut copies = Vec::new();
+        let before = vec![0u8; 1024 * 1024];
+        let mut after = before.clone();
+        for offset in [3 * DIRTY_PAGE + 4, 802 * DIRTY_PAGE + 80] {
+            after[offset] = 1;
+        }
+        dirty_copies(&before, &after, &mut copies);
+        assert_eq!(copies.len(), 2);
+        assert_eq!(
+            copies.iter().map(|c| c.size).sum::<u64>(),
+            2 * DIRTY_PAGE as u64
+        );
+        let replay = |a: &mut Vec<u8>, b: &[u8], copies: &[vk::BufferCopy]| {
+            a.resize(b.len(), 9);
+            for c in copies {
+                let at = c.dst_offset as usize;
+                a[at..at + c.size as usize].copy_from_slice(&b[at..at + c.size as usize]);
+            }
+            assert_eq!(a, b);
+        };
+        replay(&mut before.clone(), &after, &copies);
+        after.extend([255; 4]);
+        for offset in (0..before.len()).step_by(4 * DIRTY_PAGE) {
+            after[offset] = 2;
+        }
+        dirty_copies(&before, &after, &mut copies);
+        assert_eq!(copies.len(), 1);
+        replay(&mut before.clone(), &after, &copies);
+        dirty_copies(&before, &before[..50004], &mut copies);
+        assert!(copies.is_empty());
+    }
+
     #[test]
     fn budget_releases_evictions_and_rejects_transient_overrun() {
         let budget = AllocationBudget {

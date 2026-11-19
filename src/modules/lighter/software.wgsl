@@ -84,6 +84,7 @@ fn mesh_hit(m: bool, instance: u32, ray: Ray, old: Hit, q: Query) -> Hit {
             if t.x>=ray.low && t.x<=ray.high {
                 let hit = Hit(t.x,instance,prim,t.yz);
                 if closer(hit,best,q) && accepts(hit,ray,q) {
+                    if q.mask==BLOCKER_MASK { return hit; }
                     best = hit;
                 }
             }
@@ -110,6 +111,7 @@ fn scene_hit(m: bool, ray: Ray, old: Hit, q: Query) -> Hit {
         let count = word(m,n+8u);
         for (var j=0u; j<count; j++) {
             best = mesh_hit(m,word(m,refs+first+j)+select(0u,DYNAMIC,m),ray,best,q);
+            if q.mask==BLOCKER_MASK && best.instance!=NIL { return best; }
         }
         i++;
     }
@@ -119,6 +121,7 @@ fn intersect(ray: Ray, q: Query) -> Hit {
     var best = none(ray);
     for (var feed=0u; feed<2u; feed++) {
         best = scene_hit(feed!=0u,ray,best,q);
+        if q.mask==BLOCKER_MASK && best.instance!=NIL { return best; }
     }
     return best;
 }

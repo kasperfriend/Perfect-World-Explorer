@@ -38,10 +38,12 @@ pub struct Settings {
     pub shadows: bool,
     pub soft_sun: bool,
     pub lighting: bool,
+    pub regional_lighting: bool,
     pub reflections: bool,
     pub denoiser: bool,
     pub progressive: bool,
     pub bounces: u32,
+    pub diffuse_distance: u32,
     pub samples: u32,
     pub resolution: u32,
     pub anisotropy: u32,
@@ -57,10 +59,12 @@ impl Default for Settings {
             shadows: true,
             soft_sun: true,
             lighting: true,
+            regional_lighting: false,
             reflections: true,
             denoiser: true,
             progressive: true,
             bounces: 1,
+            diffuse_distance: 256,
             samples: 1,
             resolution: 50,
             anisotropy: 8,
@@ -87,6 +91,7 @@ impl Settings {
             progressive: false,
             denoiser: false,
             bounces: 8,
+            diffuse_distance: 0,
             samples: 32,
             resolution: 100,
             ..self
@@ -115,10 +120,16 @@ impl Settings {
                 "shadows" => settings.shadows = toggle(settings.shadows),
                 "soft_sun" => settings.soft_sun = toggle(settings.soft_sun),
                 "lighting" => settings.lighting = toggle(settings.lighting),
+                "regional_lighting" => {
+                    settings.regional_lighting = toggle(settings.regional_lighting)
+                }
                 "reflections" => settings.reflections = toggle(settings.reflections),
                 "denoiser" => settings.denoiser = toggle(settings.denoiser),
                 "progressive" => settings.progressive = toggle(settings.progressive),
                 "bounces" => settings.bounces = number(settings.bounces, 0, 4),
+                "diffuse_distance" => {
+                    settings.diffuse_distance = number(settings.diffuse_distance, 0, 24000)
+                }
                 "samples" => settings.samples = number(settings.samples, 1, 4),
                 "resolution" => settings.resolution = number(settings.resolution, 25, 100),
                 "reference" => settings.reference = toggle(settings.reference),
@@ -137,9 +148,9 @@ impl Settings {
 
     pub(crate) fn encode(self) -> String {
         format!(
-            "# Lighter settings\nmode={}\nlighting={}\nshadows={}\nsoft_sun={}\nreflections={}\ndenoiser={}\nprogressive={}\nbounces={}\nsamples={}\nresolution={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\nreference={}\n",
-            self.mode.token(), self.lighting, self.shadows, self.soft_sun, self.reflections, self.denoiser, self.progressive, self.bounces,
-            self.samples, self.resolution, self.anisotropy, self.relight_baked, self.physical_bsdf, self.reference,
+            "# Lighter settings\nmode={}\nlighting={}\nregional_lighting={}\nshadows={}\nsoft_sun={}\nreflections={}\ndenoiser={}\nprogressive={}\nbounces={}\ndiffuse_distance={}\nsamples={}\nresolution={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\nreference={}\n",
+            self.mode.token(), self.lighting, self.regional_lighting, self.shadows, self.soft_sun, self.reflections, self.denoiser, self.progressive, self.bounces,
+            self.diffuse_distance, self.samples, self.resolution, self.anisotropy, self.relight_baked, self.physical_bsdf, self.reference,
         )
     }
 
@@ -183,9 +194,13 @@ mod tests {
             [1, 1, 50]
         );
         assert!(defaults.progressive && defaults.denoiser);
+        assert_eq!(defaults.diffuse_distance, 256);
+        assert!(!defaults.regional_lighting);
         let s = Settings::decode(
-            "mode=hardware\nbounces=99\nshadows=false\nsoft_sun=false\ndenoiser=false\nprogressive=false\nsamples=0\nresolution=bad\nanisotropy=16\nphysical_bsdf=true",
+            "mode=hardware\nbounces=99\nshadows=false\nsoft_sun=false\ndenoiser=false\nprogressive=false\nsamples=0\nresolution=bad\nanisotropy=16\nphysical_bsdf=true\ndiffuse_distance=512\nregional_lighting=true",
         );
+        assert_eq!(s.diffuse_distance, 512);
+        assert!(s.regional_lighting);
         assert_eq!(s.mode, Mode::Hardware);
         assert_eq!(s.bounces, 4);
         assert_eq!(s.samples, 1);
@@ -203,5 +218,6 @@ mod tests {
         assert_eq!([e.samples, e.bounces, e.resolution], [32, 8, 100]);
         assert!(e.physical_bsdf && e.shadows && e.relight_baked);
         assert!(!e.progressive && !e.denoiser && reference.progressive);
+        assert_eq!(e.diffuse_distance, 0);
     }
 }

@@ -73,7 +73,7 @@ pub struct Frame {
     pub sun_disc: [f32; 4],
     pub moon_disc: [f32; 4],
     pub sampling: [u32; 4],
-    pub material_time: [f32; 4], // terrain night weight, grass fade, static light night factor, reserved
+    pub material_time: [f32; 4], // terrain night weight, grass fade, static light night factor, diffuse distance
     pub grass_history: [[f32; 4]; scene::GRASS_WIND_SLOTS],
     pub shore_offsets: [f32; 4],
     pub resident_bounds: [f32; 4], // x min/max, z min/max
@@ -915,6 +915,11 @@ impl Lighter {
             .world
             .as_ref()
             .ok_or("Lighter has no resident ray scene")?;
+        if self.settings.mode == Mode::Software
+            && (world.packet.hardware_only || moving.hardware_only)
+        {
+            return Err("Reload World to build Lighter's software acceleration data".into());
+        }
         let storage = storage_limit(device) as u64;
         for (label, len) in [
             ("resident world", world.packet.bytes().len()),
@@ -957,6 +962,7 @@ impl Lighter {
             };
         frame.options[1] = settings.bounces;
         frame.options[2] = settings.samples;
+        frame.material_time[3] = settings.diffuse_distance as f32;
         let bytes = u64::from(rw) * u64::from(rh) * PIXEL_BYTES;
         if self.present.is_none() {
             self.present = Some(checked_pipeline(device, || Present::new(device, format))?);
@@ -1101,6 +1107,8 @@ impl Lighter {
             &mut self.settings.lighting,
             "Ray-traced lighting / indirect bounce",
         );
+        ui.checkbox(&mut self.settings.regional_lighting, "Follow local region lighting")
+            .on_hover_text("Allow the region under the camera to recolor the whole ray-lit world. Off keeps sun, ambient and sky brightness tied to the map and time of day. Regional fog and weather remain active.");
         ui.checkbox(&mut self.settings.shadows, "Ray-traced shadows");
         ui.add_enabled(
             self.settings.shadows,
@@ -1120,6 +1128,17 @@ impl Lighter {
             .on_hover_text("Reuse lighting samples in stable scenes. Reproject tiny view changes; camera movement, changed lighting or incompatible surfaces discard history.");
         ui.add(egui::Slider::new(&mut self.settings.bounces,0..=4).text("Secondary bounces"))
             .on_hover_text("0 traces primary visibility and direct shadows only. Reflection and water transmission need at least one bounce.");
+        egui::ComboBox::from_label("Diffuse bounce distance")
+            .selected_text(match self.settings.diffuse_distance {
+                0 => "Full view distance".to_string(),
+                n => format!("{n} world units"),
+            })
+            .show_ui(ui, |ui| {
+                for (n, label) in [(128, "128 (fast)"), (256, "256 (default)"), (512, "512"), (1024, "1024"), (0, "Full view distance")] {
+                    ui.selectable_value(&mut self.settings.diffuse_distance, n, label);
+                }
+            })
+            .response.on_hover_text("Limit diffuse rays in air; farther indirect geometry falls back to sky lighting. Does not limit primary visibility, shadows, mirrors, refraction or Reference.");
         ui.add(egui::Slider::new(&mut self.settings.samples, 1..=4).text("Samples per pixel"));
         ui.add(
             egui::Slider::new(&mut self.settings.resolution, 25..=100)
