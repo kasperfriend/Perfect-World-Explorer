@@ -185,7 +185,9 @@ fn rotate(log_dir: &Path) -> io::Result<PathBuf> {
     }
 
     // Find the active log file (newest one under the size limit).
-    let active = candidates.iter().find(|(_, size, _)| *size < MAX_FILE_BYTES);
+    let active = candidates
+        .iter()
+        .find(|(_, size, _)| *size < MAX_FILE_BYTES);
     if let Some((path, _, _)) = active {
         return Ok(path.clone());
     }
