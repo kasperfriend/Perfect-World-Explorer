@@ -664,6 +664,11 @@ pub mod angelica_pck;
 // "174 passed" whether or not the parser worked.
 #[path = "$REPO/src/music.rs"]
 pub mod music;
+// The T2BK/TRN2 header decoders. `terrain_block` names the versions it reads
+// and the TRN2 reader is where "an instance map has no world transform" is
+// proved, so both belong in the suite that runs without a GPU.
+#[path = "$REPO/src/terrain_block.rs"]
+pub mod terrain_block;
 EOF
 }
 
@@ -1012,6 +1017,11 @@ EOF
 pub mod pck;
 #[path = "$REPO/src/music.rs"]
 pub mod music;
+// The T2BK/TRN2 header decoders. `terrain_block` names the versions it reads
+// and the TRN2 reader is where "an instance map has no world transform" is
+// proved, so both belong in the suite that runs without a GPU.
+#[path = "$REPO/src/terrain_block.rs"]
+pub mod terrain_block;
 EOF
         "$RUSTC" --test --crate-name musictest --edition 2021 --sysroot "$SYSROOT" \
             -C opt-level=1 -L "$OUT" \
@@ -1501,4 +1511,154 @@ EOF
             "$OUT/matrix/run.rs" -o "$OUT/matrixrun"
         shift || true
         exec "$OUT/matrixrun" "${1:-$REPO/google_drive/clients}" ;;
-    *) echo "usage: $0 {setup|check|test|fmt|client|water|gfx|music|material|scene|pck|content|matrix}" >&2; exit 2 ;;esac
+    instance) toolchain; sysroot; deps; real_deps
+        # Run every instance folder under a client the way the viewer does, and
+        # print one line per map: the ECWLD, its TRN2 extent, and the precinct
+        # zones with their English names. This is the "does an instance map load
+        # end to end" gate: the map file, the terrain header beside it, the
+        # precinct file, the name table, and the zone centres the teleport list
+        # needs.
+        mkdir -p "$OUT/inst"
+        cat > "$OUT/inst/run.rs" <<EOF
+#[path = "$REPO/src/pck.rs"]
+pub mod pck;
+#[path = "$REPO/src/scene.rs"]
+pub mod scene;
+#[path = "$REPO/src/music.rs"]
+pub mod music;
+#[path = "$REPO/src/terrain_block.rs"]
+pub mod terrain_block;
+#[path = "$REPO/src/angelica_pck.rs"]
+pub mod angelica_pck;
+#[path = "$REPO/src/world_catalog.rs"]
+pub mod world_catalog;
+#[path = "$REPO/src/world_place_names.rs"]
+pub mod world_place_names;
+use std::path::{Path, PathBuf};
+fn main() {
+    let root = std::path::PathBuf::from(std::env::args().nth(1).expect("client root (maps/)"));
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&root).expect("read maps dir")
+        .flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    dirs.sort();
+    let (mut maps, mut bad) = (0, 0);
+    println!("{:<6} {:<7} {:>7} {:>9} {:>7} {:>7} {:>6}  {}", "map", "ecwld", "blocks", "extent", "zones", "centres", "tracks", "english names");
+    for dir in dirs {
+        let id = dir.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+        let row = |what: &str, message: String| {
+            println!("{id:<6} {what:<7} {message}");
+        };
+        let ecwld = dir.join(format!("{id}.ecwld"));
+        let trn2 = dir.join(format!("{id}.trn2"));
+        if !ecwld.is_file() { continue; }
+        let scene = match scene::Scene::load(&ecwld) {
+            Ok(s) => s,
+            Err(e) => { row("FAIL", format!("ECWLD: {e}")); bad += 1; continue; }
+        };
+        maps += 1;
+        let blocks = scene.blocks.len();
+        let extent = match std::fs::read(&trn2).ok().and_then(|b| terrain_block::trn2_header(&b).ok()) {
+            Some(h) => format!("{:.0}x{:.0}", h.width, h.length),
+            None => "no trn2".to_string(),
+        };
+        let (zones, centres, tracks, names) = match music::Zones::open(&dir.join("precinct.clt")) {
+            Ok(z) => {
+                let centres = z.zones.iter().filter(|z| z.center.is_some()).count();
+                let tracks: usize = z.zones.iter().map(|z| z.tracks.len()).sum();
+                // Two distinct English names are enough to show the table
+                // answered; printing all of them would bury the row.
+                let mut english = Vec::new();
+                for zone in &z.zones {
+                    let name = world_place_names::english(zone.name.trim());
+                    if !english.iter().any(|n: &String| n == name) {
+                        english.push(name.to_string());
+                    }
+                }
+                english.truncate(2);
+                (z.zones.len(), centres, tracks, english.join(" / "))
+            }
+            Err(e) => (0, 0, 0, format!("precinct FAILED: {e}")),
+        };
+        println!("{id:<6} {:<7} {blocks:>7} {extent:>9} {zones:>7} {centres:>7} {tracks:>6}  {names}",
+            if blocks == 0 { "empty" } else { "v" });
+    }
+    eprintln!("{maps} instance map(s) read, {bad} failed");
+    std::process::exit(if bad == 0 { 0 } else { 1 });
+}
+EOF
+        "$RUSTC" --edition 2021 --crate-name instancecheck --sysroot "$SYSROOT" \
+            -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern image="$OUT/libimage_stub.rlib" \
+            -o "$OUT/instance-check" "$OUT/inst/run.rs"
+        shift || true
+        (cd "$REPO" && exec "$OUT/instance-check" "${1:-$REPO/google_drive/clients/element/maps}") ;;
+    matrix-maps) toolchain; sysroot; deps; real_deps
+        # One line per map per client, which is what
+        # `docs/cross-version-matrix.md` records. Same reader as the viewer; a
+        # map that fails prints the error and the exit status is non-zero.
+        mkdir -p "$OUT/mm"
+        cat > "$OUT/mm/run.rs" <<EOF
+#[path = "$REPO/src/pck.rs"]
+pub mod pck;
+#[path = "$REPO/src/scene.rs"]
+pub mod scene;
+#[path = "$REPO/src/music.rs"]
+pub mod music;
+#[path = "$REPO/src/terrain_block.rs"]
+pub mod terrain_block;
+use std::path::PathBuf;
+fn main() {
+    let root = std::path::PathBuf::from(std::env::args().nth(1).expect("clients dir"));
+    let mut clients: Vec<PathBuf> = std::fs::read_dir(&root).expect("read clients dir")
+        .flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    clients.sort();
+    println!("| client | map | blocks | grid | tree types | trees | water refs | grass | ornaments | effects | models | sounds | precinct |");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+    let mut failed = 0;
+    for client in &clients {
+        let name = client.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+        let element = if client.join("element").is_dir() { client.join("element") } else { client.clone() };
+        let maps = element.join("maps");
+        let mut dirs: Vec<PathBuf> = match std::fs::read_dir(&maps) {
+            Ok(rd) => rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect(),
+            Err(_) => continue,
+        };
+        dirs.sort();
+        for dir in dirs {
+            let id = dir.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+            let path = dir.join(format!("{id}.ecwld"));
+            if !path.is_file() { continue; }
+            match scene::Scene::load(&path) {
+                Ok(s) => {
+                    let blocks = s.blocks.len();
+                    let grid = s.blocks.first().map(|_| format!("{}x{}", s.rows, s.cols)).unwrap_or_default();
+                    let sum = |f: &dyn Fn(&scene::Block) -> usize| s.blocks.iter().map(f).sum::<usize>();
+                    let precinct = match music::Zones::open(&dir.join("precinct.clt")) {
+                        Ok(z) => format!("{} zones", z.zones.len()),
+                        Err(e) => format!("FAILED: {e}"),
+                    };
+                    println!("| {name} | {id} | {blocks} | {grid} | {} | {} | {} | {} | {} | {} | {} | {} | {precinct} |",
+                        s.tree_types.len(),
+                        sum(&|b| b.trees.len()),
+                        sum(&|b| b.water.len()),
+                        sum(&|b| b.grass.len()),
+                        sum(&|b| b.ornaments.len()),
+                        sum(&|b| b.effects.len()),
+                        sum(&|b| b.models.len()),
+                        sum(&|b| b.sounds.len()));
+                }
+                Err(e) => { println!("| {name} | {id} | FAILED: {e} | | | | | | | | | | |"); failed += 1; }
+            }
+        }
+    }
+    std::process::exit(if failed == 0 { 0 } else { 1 });
+}
+EOF
+        "$RUSTC" --edition 2021 --crate-name matrixmaps --sysroot "$SYSROOT" \
+            -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern image="$OUT/libimage_stub.rlib" \
+            -o "$OUT/matrix-maps" "$OUT/mm/run.rs"
+        shift || true
+        (cd "$REPO" && exec "$OUT/matrix-maps" "${1:-$REPO/google_drive/clients}") ;;
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|gfx|music|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac

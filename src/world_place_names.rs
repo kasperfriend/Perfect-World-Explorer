@@ -278,10 +278,88 @@ pub fn english(name: &str) -> &str {
     let trimmed = name.trim();
     ZONE_NAMES
         .iter()
+        .chain(INSTANCE_NAMES.iter())
         .find(|(zh, _)| *zh == trimmed)
         .map(|(_, en)| *en)
         .unwrap_or(trimmed)
 }
+
+// BEGIN GENERATED instance aliases -- tools/instance-aliases.py
+/// `(Chinese instance name, the English label for that folder)`.
+///
+/// Generated from the client's own `configs/instance.txt` joined with
+/// `world_catalog::english_name`, so the Chinese is the client's text and the
+/// English is the table the map picker already shows. Regenerate with
+/// `python3 tools/instance-aliases.py <configs.pck> --write`.
+pub const INSTANCE_NAMES: &[(&str, &str)] = &[
+    ("万化城竞技场", "Lost Arena"),
+    ("万蛇岛", "Snake Isle"),
+    ("不赦堂", "Unyielding Hall"),
+    ("丛林遗迹", "Forest Ruins"),
+    ("五帝争霸", "Nation Wars Base Camp"),
+    ("人界", "Primal World"),
+    ("人界故事模式", "Home of Stealth"),
+    ("仙", "Lothranis (Heaven)"),
+    ("仙幻天", "Eden"),
+    ("伏波堂", "Snowfall Valley"),
+    ("凤鸣谷", "Phoenix Valley"),
+    ("剑仙城竞技场", "Etherblade Arena"),
+    ("土蝼洞穴", "Earth Cave"),
+    ("城战1", "Territory War"),
+    ("城战2", "Territory War"),
+    ("城战3", "Territory War"),
+    ("城战4", "Territory War"),
+    ("城战5", "Territory War"),
+    ("城战6", "Territory War"),
+    ("天劫谷", "Valley of Disaster"),
+    ("天怒神罚", "Chrono City"),
+    ("天界炼狱", "Seat of Torment"),
+    ("完美大陆", "Perfect World — Mainland"),
+    ("履霜城", "Frostcover City"),
+    ("履霜秘境", "Secret Frostcover Grounds"),
+    ("帮派基地", "Faction Base"),
+    ("幻沙蜃境", "Random Map 03"),
+    ("幽冥居", "Gate of Delirium"),
+    ("怨灵之门", "Wraithgate"),
+    ("战神谷", "Wargod Gulch"),
+    ("挂机岛", "Realm of Reflection"),
+    ("新手村", "Celestial Vale"),
+    ("无定宙", "Endless Universe"),
+    ("楼兰古都", "Hallucinatory Trench"),
+    ("流银宫", "Flowsilver Palace"),
+    ("测试场景", "Nation Wars Capture the Flag"),
+    ("海盗岛", "Nightscream Island"),
+    ("火岩洞穴", "Firecrag Grotto"),
+    ("狂狼巢穴", "Den of Rabid Wolves"),
+    ("盘丝洞", "Silk Cave"),
+    ("祖龙城竞技场", "Archosaur Arena"),
+    ("神威狱", "Palace of Nirvana"),
+    ("神无谷", "Valley of Reciprocity"),
+    ("神月谷", "Lunar Glade"),
+    ("积羽村竞技场", "Plume Arena"),
+    ("穹世界", "Place of Origination"),
+    ("结婚场景", "Perfect Chapel"),
+    ("英雄冢", "Hero's Tomb / Secret Passage"),
+    ("落日谷", "Sunset Valley"),
+    ("蓬明洞", "Nightfall Hall"),
+    ("蓬莱世界", "Morai"),
+    ("蓬莱地宫", "Blighted Chamber"),
+    ("蛇蝎洞", "Cave of the Vicious"),
+    ("蜂巢密室", "Cube of Fate"),
+    ("迷沙幻境", "Random Map 03"),
+    ("青衣冢", "Hall of Deception"),
+    ("飘渺城", "Warsong City"),
+    ("高级无定宙", "Advanced Endless Universe"),
+    ("鬼城", "City of Abominations / Ghost City"),
+    ("鬼狱幻境", "Cave of Sadistic Glee"),
+    ("魔", "Momaganon (Hell)"),
+    ("魔域桃源", "Abaddon"),
+    ("魔幻天", "Brimstone Pit"),
+    ("黄昏圣殿", "Twilight Temple"),
+    ("龙宫", "Temple of the Dragon"),
+    ("龙隐窟", "Hidden Dragon Den"),
+];
+// END GENERATED instance aliases
 
 /// Whether the name has anything to localise: cheap check for the caller so a
 /// mostly-ASCII file costs no lookups.
@@ -316,6 +394,40 @@ mod tests {
         // A name the English file never carried stays as authored rather than
         // becoming a placeholder.
         assert_eq!(english("祖龙城"), "祖龙城");
+    }
+
+    /// An instance map's zone names come from its own `precinct.clt`, which is
+    /// Chinese in a Chinese client. They must reach English through the instance
+    /// table, not just the world one.
+    #[test]
+    fn instance_zone_names_are_localised() {
+        // Every instance row whose folder `world_catalog::english_name` knows,
+        // which the generator reports as all of them.
+        assert!(INSTANCE_NAMES.len() >= 60, "{}", INSTANCE_NAMES.len());
+        assert_eq!(english("万蛇岛"), "Snake Isle");
+        assert_eq!(english("不赦堂"), "Unyielding Hall");
+        assert_eq!(english("蛇蝎洞"), "Cave of the Vicious");
+        // The world table still answers, and the two do not collide.
+        assert_eq!(english("刺骨之地"), "The Harshlands");
+        // No instance name may map to two labels.
+        let mut seen = std::collections::HashSet::new();
+        for (zh, _) in INSTANCE_NAMES {
+            assert!(seen.insert(*zh), "{zh} appears twice");
+        }
+    }
+
+    /// The final bar: a zone name that carries non-ASCII and has an English
+    /// entry must not be shown as authored. This is the test that fails when a
+    /// new client's names are added to the data but not to a table.
+    #[test]
+    fn every_localisable_zone_name_has_english() {
+        let mut missing = Vec::new();
+        for (zh, _) in ZONE_NAMES.iter().chain(INSTANCE_NAMES.iter()) {
+            if is_localized(zh) && english(zh) == *zh {
+                missing.push(*zh);
+            }
+        }
+        assert!(missing.is_empty(), "no English entry for: {missing:?}");
     }
 
     #[test]

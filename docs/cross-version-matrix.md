@@ -268,3 +268,33 @@ resurrect the mistake.
   reported with their version and the sections that need the v27 layout stop
   there; that is a viewer limitation, and the matrix says so rather than
   pretending the file is unreadable.
+
+## Map matrix (`matrix-maps`, 18 November 2026)
+
+One line per map per client, produced by `tools/offline_harness.sh matrix-maps
+<clients dir>` with the same readers the viewer uses. A map that fails prints its
+error and the mode exits non-zero.
+
+| client | map | blocks | grid | tree types | trees | water refs | grass | ornaments | effects | models | sounds | precinct |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1.8.4 | `a37` | 4608 | 48x96 | 0 | 0 | 148 | 2704 | 8441 | 362 | 0 | 0 | 383 zones |
+| 1.8.4 | `world` | 22528 | 176x128 | 59 | 3646 | 9237 | 38240 | 39179 | 2971 | 76 | 1044 | 383 zones |
+
+`a37`'s 148 water references are the number the water classifier is required to
+account for, and they are all read: 3 areas, 18 shoreline waves, 3,146 points.
+
+### Instance maps (`instance`, 18 November 2026)
+
+`tools/offline_harness.sh instance <maps dir>` loads every instance folder the way
+the viewer does and prints one row per map. For the 1.8.4 `a37`, whose files are
+staged:
+
+```
+map    ecwld    blocks    extent   zones centres tracks  english names
+a37    v          4608 6144x3072     383     383    783  Upcoming / The Harshlands
+```
+
+Every one of the 383 zones has a centre, all 783 playlist tracks survive, and
+the zone names reach English. `extent` is the map's own `.trn2` header, which
+carries no world transform; see `Findings/Unsupported-client-paths.md` for the
+one part of that question still open (the shared coordinate frame).

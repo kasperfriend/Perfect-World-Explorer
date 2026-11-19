@@ -405,7 +405,12 @@ fn first_zone_name(dir: &Path) -> Option<String> {
                 // Many instance precincts name sub-zones as "Map - Quarter".
                 // The common prefix is a better map label than one quarter.
                 let short = name.split(" - ").next().unwrap_or(&name).trim();
-                return Some(short.to_string());
+                // The map picker draws with egui's Latin faces, so an instance
+                // whose first zone is Chinese would show a label nobody can
+                // read. The instance alias table answers where the world zone
+                // table has no row; an unknown name still stays as authored
+                // because the tooltip is better than a blank.
+                return Some(crate::world_place_names::english(short).to_string());
             }
         }
     }
@@ -459,7 +464,7 @@ fn pretty_id(id: &str) -> String {
 /// Well-known English map labels. The client name is still retained in `name`
 /// and shown in the tooltip; this table only keeps the combo box legible when a
 /// client's instance names use glyphs the default egui font does not embed.
-fn english_name(id: &str) -> Option<&'static str> {
+pub fn english_name(id: &str) -> Option<&'static str> {
     Some(match id.to_ascii_lowercase().as_str() {
         "world" => "Perfect World — Mainland",
         "login" => "Character Selection",
