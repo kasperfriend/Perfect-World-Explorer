@@ -4,8 +4,8 @@
 mod bvh;
 pub(crate) mod coverage;
 mod game_profile;
-pub(crate) mod model_feed;
 mod log;
+pub(crate) mod model_feed;
 mod post;
 mod profile;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
