@@ -703,16 +703,7 @@ impl World {
                     Some(mode) => crate::scene::effect_visible(mode, night),
                     None => true,
                 };
-                // First refusal wins, so a root is counted once.
-                if !near {
-                    census[1] += 1;
-                } else if !resident {
-                    census[2] += 1;
-                } else if !visible {
-                    census[3] += 1;
-                } else {
-                    census[0] += 1;
-                }
+                crate::effect_census::record(&mut census, near, resident, visible);
                 (producer.identity, near && resident && visible)
             })
             .collect();

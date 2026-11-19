@@ -1967,3 +1967,29 @@ Not wired to playback: `world_audio` resolves paths under an `sfx/` prefix
 against `sfx.pck`, and no `sfx.pck` is staged here, so whether these authored
 paths use the same base is unverified. Guessing the base and shipping silence
 would be worse than a named gap.
+
+**Guard widened, and it found two more.** `tools/check-harness.py` (renamed from
+`check-harness-arms.py`) now also parses every *unquoted* heredoc body and fails
+on an unescaped backtick, quoting the line. It found two live instances beyond
+the one that started this: a comment in the `content` sweep mentioning
+`` `image` `` and one naming `` `interfaces/iconlist_guild.dds` ``. Both were
+being command-substituted away in the generated Rust. Quoted heredocs
+(`<<'EOF'`) are exempt, because nothing expands in them; a test proves both
+directions.
+
+## B-32: a test that existed but was never compiled
+
+The activation-census partition was first tested inside `world_models_gpu`, and
+`grep world_models_gpu tools/offline_harness.sh` returned nothing: no mode
+compiles that file, so the test would have been dead on arrival and the suite
+would have stayed green without it. The decision is now `src/effect_census.rs`
+— a pure function over the three gate booleans, with `record`, `plays` and the
+four bucket labels — and `world_models_gpu` calls it. Four tests run under
+`test` (207 total): the buckets partition all eight gate combinations, `plays`
+is exactly bucket 0, first refusal names the bucket in the printed order, and
+every bucket has a label.
+
+The general lesson, and the third instance of it in this stretch: a green suite
+says nothing about a file no mode compiles. `src/diagnostics.rs` was stubbed,
+`src/gfx_player.rs` was left out of `test`, and `world_models_gpu` was in no mode
+at all. Each was found by reading the module list, not by a failing test.

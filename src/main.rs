@@ -43,16 +43,16 @@ mod cloud_gpu;
 mod cloud_surface;
 mod color_chain;
 mod diagnostics;
+// The effect activation census: which gate leaves a root out, as a partition.
+mod effect_census;
 // A preview is a test-only harness. The skip is on the module: its literals
 // are authored GFX text and its tables are read top to bottom, neither of
 // which formatting improves, and every other module stays checked.
-#[cfg(test)]
-#[rustfmt::skip]
-mod effect_preview;
 mod display_gamma;
 mod dlss;
 mod dxt;
 mod ecmodel;
+mod effect_preview;
 mod environment;
 mod far_trees_gpu;
 mod fog_matrix;
@@ -140,6 +140,7 @@ mod world_audio;
 // are kept public and unreferenced here, like `client_sun`.
 #[allow(dead_code)]
 mod sky_transition;
+mod speedtree_version;
 mod terrain_block;
 mod terrain_cutoff;
 mod terrain_gpu;
@@ -154,7 +155,6 @@ mod terrain_store;
 mod terrain_upload;
 mod texture_atlas;
 mod texture_resolution;
-mod speedtree_version;
 mod tree_lod;
 #[cfg(windows)]
 mod tree_source;

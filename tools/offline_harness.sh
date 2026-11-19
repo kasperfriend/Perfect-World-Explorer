@@ -669,6 +669,11 @@ pub mod music;
 // proved, so both belong in the suite that runs without a GPU.
 #[path = "$REPO/src/terrain_block.rs"]
 pub mod terrain_block;
+// The effect activation census. \`world_models_gpu\` needs a GPU, so the decision
+// lives in its own module and is tested here: the status line claims its four
+// refusal counts add up, and that is only true if the buckets partition.
+#[path = "$REPO/src/effect_census.rs"]
+pub mod effect_census;
 EOF
 }
 
@@ -680,7 +685,7 @@ case "${1:-test}" in
         # A shell `case` takes its first match, so a duplicated label silently
         # makes the later arm dead code. That happened: two arms were labelled
         # `music`, and for as long as it lasted `music` ran a probe binary and
-        # the 27-test precinct suite behind it never ran at all. `tools/check-harness-arms.py`
+        # the 27-test precinct suite behind it never ran at all. `tools/check-harness.py`
         # reads this list and fails on a duplicate.
         sed -n 's/^    \([a-z][a-z_|-]*\)) .*/\1/p' "$0" | tr '|' '\n' ;;
     check) toolchain; sysroot; deps; real_deps
@@ -689,7 +694,7 @@ case "${1:-test}" in
         # `music`, so that mode ran a probe and the 27-test precinct suite behind
         # it never ran -- a whole suite reported as passing because nothing
         # executed it. This gate is what would have caught it.
-        python3 "$REPO/tools/check-harness-arms.py" "$0"
+        python3 "$REPO/tools/check-harness.py" "$0"
         # Type-check the modules that only need the dependencies this offline
         # toolchain has. `gfx_player`, `gfx_owner`, `view_settings` and
         # `diagnostics` are left out because they reach for `egui` and the fps
@@ -1352,7 +1357,7 @@ fn main() {
                     });
                 }
                 // Images are the largest group here (226 MB of DDS alone) and
-                // the offline toolchain has only a stub `image`, so the header
+                // the offline toolchain has only a stub \`image\`, so the header
                 // is validated rather than the pixels. A truncated file still
                 // fails, which is the failure that actually happens.
                 "dds" => {
@@ -1420,7 +1425,7 @@ fn main() {
     // -- so a reader cannot parse it and that is the archive's content, not a
     // failure. It is reported above and excluded from the exit status; any
     // other failure fails the run.
-    // Likewise `interfaces/iconlist_guild.dds` in the 1.5.2 interfaces pack:
+    // Likewise \`interfaces/iconlist_guild.dds\` in the 1.5.2 interfaces pack:
     // 1158 entries, 0 overlapping spans, and this one member is x86 code with
     // runs of '$' and three embedded, bogus "DDS " strings. 3020 of the 3021
     // staged .dds members carry a valid header, so this is the archive's
