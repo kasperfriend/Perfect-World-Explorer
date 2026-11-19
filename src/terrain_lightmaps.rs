@@ -90,6 +90,7 @@ impl Pair {
 pub const TILES: usize = 16;
 pub struct Tiles<'a> {
     bytes: &'a [u8],
+    side: usize,
     ranges: [(usize, usize); TILES],
 }
 impl<'a> Tiles<'a> {
@@ -104,8 +105,14 @@ impl<'a> Tiles<'a> {
                     .unwrap(),
             ) as usize)
         };
-        if u(0)? != 0x54324c4d || u(4)? != 2 || u(8)? != TILES || u(12)? != 256 || u(16)? != 1 {
-            return Err("unsupported T2LM version, tile geometry or DDS flags".into());
+        let [magic, version, count, side, flags] = [u(0)?, u(4)?, u(8)?, u(12)?, u(16)?];
+        if magic != 0x54324c4d {
+            return Err("invalid T2LM magic".into());
+        }
+        if version != 2 || count != TILES || !matches!(side, 128 | 256) || flags != 1 {
+            return Err(format!(
+                "unsupported T2LM version={version} tiles={count} side={side} flags=0x{flags:x}"
+            ));
         }
         let size = u(20)?;
         if size == 0 {
@@ -123,12 +130,53 @@ impl<'a> Tiles<'a> {
             }
             ranges[i] = (start, end);
         }
-        Ok(Self { bytes, ranges })
+        Ok(Self {
+            bytes,
+            side,
+            ranges,
+        })
     }
+    pub fn side(&self) -> usize {
+        self.side
+    }
+
     pub fn tile(&self, i: usize) -> Option<&'a [u8]> {
         self.ranges.get(i).map(|&(a, b)| &self.bytes[a..b])
     }
 }
+/// Place a 128² BC1 tile in the legacy 256² atlas slot without re-encoding
+/// endpoints. Each selector is repeated over a 2×2 texel neighbourhood.
+/// This is storage expansion, not authored higher-resolution lighting.
+pub fn expand_bc1_128(src: &[u8]) -> Result<Vec<u8>, String> {
+    const BLOCKS: usize = 32;
+    if src.len() != BLOCKS * BLOCKS * 8 {
+        return Err("wrong BC1 byte count for 128px T2LM tile".into());
+    }
+    let mut dst = vec![0; 4 * src.len()];
+    for by in 0..BLOCKS {
+        for bx in 0..BLOCKS {
+            let here = (by * BLOCKS + bx) * 8;
+            let block = &src[here..here + 8];
+            let selectors = u32::from_le_bytes(block[4..8].try_into().unwrap());
+            for jy in 0..2 {
+                for jx in 0..2 {
+                    let there = ((by * 2 + jy) * BLOCKS * 2 + bx * 2 + jx) * 8;
+                    let mut expanded = 0u32;
+                    for y in 0..4 {
+                        for x in 0..4 {
+                            let source = (2 * jy + y / 2) * 4 + 2 * jx + x / 2;
+                            expanded |= ((selectors >> (source * 2)) & 3) << ((y * 4 + x) * 2);
+                        }
+                    }
+                    dst[there..there + 4].copy_from_slice(&block[..4]);
+                    dst[there + 4..there + 8].copy_from_slice(&expanded.to_le_bytes());
+                }
+            }
+        }
+    }
+    Ok(dst)
+}
+
 #[derive(Debug)]
 pub struct Layout {
     areas_x: usize,
@@ -260,7 +308,7 @@ mod tests {
             (0, 0),
             (4, 3),
             (8, 15),
-            (12, 128),
+            (12, 64),
             (16, 0),
             (16, 3),
             (20, 0),
@@ -273,6 +321,30 @@ mod tests {
             b[p..p + 4].copy_from_slice(&v.to_le_bytes());
             assert!(Tiles::parse(&b).is_err(), "{p}/{v}");
         }
+    }
+    #[test]
+    fn accepts_retail_128_header_and_expands_bc1_selectors_without_encoding() {
+        let mut record = fixture();
+        record[12..16].copy_from_slice(&128u32.to_le_bytes());
+        assert_eq!(Tiles::parse(&record).unwrap().side(), 128);
+        let src: Vec<_> = (0..32u32 * 32)
+            .flat_map(|i| [i.to_le_bytes(), (0x6e1839e4u32 ^ i).to_le_bytes()].concat())
+            .collect();
+        let dst = super::expand_bc1_128(&src).unwrap();
+        let read = |bytes: &[u8], side: usize, x: usize, y: usize| {
+            let i = ((y / 4) * side / 4 + x / 4) * 8;
+            let bits = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap());
+            (
+                bytes[i..i + 4].to_vec(),
+                (bits >> ((y % 4 * 4 + x % 4) * 2)) & 3u32,
+            )
+        };
+        for y in 0..256 {
+            for x in 0..256 {
+                assert_eq!(read(&src, 128, x / 2, y / 2), read(&dst, 256, x, y));
+            }
+        }
+        assert!(super::expand_bc1_128(&src[1..]).is_err());
     }
     #[test]
     fn rectangular_world_layout_is_bijective() {

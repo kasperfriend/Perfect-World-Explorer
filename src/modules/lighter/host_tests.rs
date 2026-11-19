@@ -550,6 +550,50 @@ fn ray_lightmaps_keep_day_only_and_distinct_night_bindings() {
 }
 
 #[test]
+#[ignore = "requires Vulkan and the two checksum-pinned a07 lightmap records; synthetic geometry"]
+fn lighter_retail_t2lm_record_fixture() {
+    use sha2::{Digest, Sha256};
+    let root = FixtureRoot::new();
+    let source = std::path::PathBuf::from(
+        std::env::var_os("PW_TEST_A07_LIGHTMAP_DIR").expect("set PW_TEST_A07_LIGHTMAP_DIR"),
+    );
+    for (ext, expected) in [
+        (
+            "t2lm",
+            "e7b1830026d15fc58775c510ec23cb6d82113de99423bc26a7b395d7ba2ad009",
+        ),
+        (
+            "t2lm1",
+            "6f92f831a0c7830aea97240ecd1a4f019b8fbecd34051f3306894b225c8e23de",
+        ),
+    ] {
+        let bytes = std::fs::read(source.join(format!("a07_1.{ext}"))).unwrap();
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), expected);
+        std::fs::write(root.0.join(format!("fixture.{ext}")), bytes).unwrap();
+    }
+    let out = std::env::var_os("PW_SAVE_LIGHTER_T2LM")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.0.clone());
+    std::fs::create_dir_all(&out).unwrap();
+    for (mode, label) in [(Mode::Off, "native"), (Mode::Software, "software")] {
+        let path = out.join(format!("a07-record-fixture-{label}.png"));
+        super::super::preview_frame(
+            fixture(&root.0),
+            &path,
+            Some([-2.5, 5., 0., 0., -std::f32::consts::FRAC_PI_4]),
+            mode,
+            Some(2),
+        )
+        .unwrap();
+        assert_world_png(&path, (960, 720));
+        let sidecar = std::fs::read_to_string(path.with_extension("coverage.txt")).unwrap();
+        assert!(sidecar.contains("lightmaps=true\n"));
+        assert!(sidecar.contains("native_lightmap_areas_day_night=16\n"));
+        assert!(sidecar.contains("native_lightmap_areas_unbound=0\n"));
+    }
+}
+
+#[test]
 fn ray_grass_tiles_reuse_authored_rectangles_without_native_atlas_pixels() {
     use crate::modules::lighter::textures::Textures;
     use std::sync::Arc;

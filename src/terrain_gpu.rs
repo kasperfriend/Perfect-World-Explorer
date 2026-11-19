@@ -41,6 +41,7 @@ pub struct TerrainGpu {
     resources: MaterialBindings,
     tex_map: Vec<u32>,
     mask_bytes: usize,
+    pub(crate) lightmap_areas: [usize; 3], // day+night, day-only, unbound
     mask_upload: Option<MaskUpload>,
     pub grass_light_layout: wgpu::BindGroupLayout,
     pub grass_light_bind: wgpu::BindGroup,
@@ -543,6 +544,8 @@ impl TerrainGpu {
         let masks = upload_startup_masks(device, queue, m, &tex_map)?;
         let (lighttex, light_side, light_per_row, light_per_page, light_pages, availability) =
             load_lightmaps(device, queue, t, m, mask_side)?;
+        let lightmap_areas =
+            [3, 1, 0].map(|state| availability.iter().filter(|&&a| a == state).count());
         let settings = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("terrain world settings"),
             contents: bytemuck::bytes_of(&Settings {
@@ -825,6 +828,7 @@ impl TerrainGpu {
             resources,
             tex_map,
             mask_bytes: masks.bytes,
+            lightmap_areas,
             mask_upload: None,
             grass_light_layout,
             grass_light_bind,
@@ -1399,7 +1403,8 @@ fn load_lightmaps(
     let mut availability = vec![crate::terrain_lightmaps::Availability::Unbound; m.areas.len()];
     let mut unbound = Vec::new();
     for (si, name) in t.subterrain_names.iter().enumerate() {
-        let base = t.element.join("maps/world");
+        // Instance recipes must not borrow lightmaps from a different world.
+        let base = &t.map_dir;
         let pair = match crate::terrain_lightmaps::Pair::read_optional(
             &base.join(format!("{name}.t2lm")),
             &base.join(format!("{name}.t2lm1")),
@@ -1413,7 +1418,7 @@ fn load_lightmaps(
             }
         };
         for (which, ext) in ["t2lm", "t2lm1"].iter().enumerate() {
-            let path = t.element.join("maps/world").join(format!("{name}.{ext}"));
+            let path = base.join(format!("{name}.{ext}"));
             let tiles = crate::terrain_lightmaps::Tiles::parse(pair.bytes(which == 1))
                 .map_err(|e| format!("lightmap {}: {e}", path.display()))?;
             for j in 0..crate::terrain_lightmaps::TILES {
@@ -1453,22 +1458,30 @@ fn load_lightmaps(
                     .map_err(|e| format!("lightmap {}: {e}", path.display()))?;
                 if dds.format != crate::model_dds::Format::Dxt1
                     || dds.mips.len() != 1
-                    || dds.mips[0].width != 256
-                    || dds.mips[0].height != 256
+                    || dds.mips[0].width as usize != tiles.side()
+                    || dds.mips[0].height as usize != tiles.side()
                 {
                     return Err(format!("Unsupported lightmap DDS in {}", path.display()));
                 }
                 // Both upload backends must accept exactly the same records.
                 if bc {
-                    write_tile(dds.mips[0].bytes, (side / 4 * 8) as u32, (side / 4) as u32);
+                    let expanded;
+                    let payload = if tiles.side() == 128 {
+                        expanded = crate::terrain_lightmaps::expand_bc1_128(dds.mips[0].bytes)?;
+                        &expanded[..]
+                    } else {
+                        dds.mips[0].bytes
+                    };
+                    write_tile(payload, (side / 4 * 8) as u32, (side / 4) as u32);
                 } else {
                     let img = image::load_from_memory_with_format(raw, image::ImageFormat::Dds)
                         .map_err(|e| format!("lightmap {}: {e}", path.display()))?
                         .to_rgba8();
-                    if img.width() != 256 || img.height() != 256 {
+                    if img.width() as usize != tiles.side() || img.height() as usize != tiles.side()
+                    {
                         return Err("unexpected lightmap dimensions".into());
                     }
-                    let img = if side == 256 {
+                    let img = if side == tiles.side() {
                         img
                     } else {
                         image::imageops::resize(

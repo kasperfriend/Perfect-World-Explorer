@@ -126,7 +126,7 @@
         -0.6
       ],
       "warmup": 12,
-      "lightmaps": false,
+      "lightmaps": true,
       "min_loaded": {
         "water": 1
       },
@@ -149,7 +149,7 @@
         -0.6
       ],
       "warmup": 12,
-      "lightmaps": false,
+      "lightmaps": true,
       "min_loaded": {
         "water": 1
       },
@@ -172,7 +172,7 @@
         -0.6
       ],
       "warmup": 12,
-      "lightmaps": false,
+      "lightmaps": true,
       "min_loaded": {
         "water": 1
       },

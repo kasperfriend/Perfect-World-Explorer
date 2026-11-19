@@ -10,6 +10,21 @@ use std::{fs, path::Path};
 fn u(b: &[u8], p: usize) -> Result<usize, String> {
     Ok(u32::from_le_bytes(b.get(p..p + 4).ok_or("truncated TRN2")?.try_into().unwrap()) as usize)
 }
+fn check_record(bytes: &[u8]) -> Result<(usize, usize), String> {
+    let t = terrain_lightmaps::Tiles::parse(bytes)?;
+    for tile in 0..terrain_lightmaps::TILES {
+        let d = model_dds::Dds::parse(t.tile(tile).unwrap())?;
+        if d.format != model_dds::Format::Dxt1
+            || d.mips.len() != 1
+            || d.mips[0].width as usize != t.side()
+            || d.mips[0].height as usize != t.side()
+        {
+            return Err(format!("unsupported or header-mismatched DDS tile {tile}"));
+        }
+    }
+    Ok((terrain_lightmaps::TILES, t.side()))
+}
+
 fn run(dir: &Path) -> Result<(), String> {
     let b = fs::read(dir.join("world.trn2")).map_err(|e| e.to_string())?;
     if u(&b, 0)? != 0x54524e32 || u(&b, 4)? > 1 {
@@ -72,22 +87,8 @@ fn run(dir: &Path) -> Result<(), String> {
                     continue;
                 }
             };
-            let check = || -> Result<usize, String> {
-                let t = terrain_lightmaps::Tiles::parse(&bytes)?;
-                for tile in 0..terrain_lightmaps::TILES {
-                    let d = model_dds::Dds::parse(t.tile(tile).unwrap())?;
-                    if d.format != model_dds::Format::Dxt1
-                        || d.mips.len() != 1
-                        || d.mips[0].width != 256
-                        || d.mips[0].height != 256
-                    {
-                        return Err(format!("unsupported DDS tile {tile}"));
-                    }
-                }
-                Ok(terrain_lightmaps::TILES)
-            };
-            match check() {
-                Ok(n) => {
+            match check_record(&bytes) {
+                Ok((n, _side)) => {
                     files += 1;
                     tiles += n;
                     for tile in 0..n {
@@ -112,11 +113,31 @@ fn run(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 fn main() {
-    let Some(dir) = std::env::args_os().nth(1) else {
-        eprintln!("usage: validate-lightmaps MAP_DIRECTORY");
+    let mut args = std::env::args_os().skip(1);
+    let Some(dir) = args.next() else {
+        eprintln!("usage: validate-lightmaps MAP_DIRECTORY | --records FILE [FILE ...]");
         std::process::exit(2);
     };
-    if let Err(e) = run(Path::new(&dir)) {
+    let result = if dir == "--records" {
+        let records: Vec<_> = args.collect();
+        if records.is_empty() {
+            Err("--records needs at least one file".into())
+        } else {
+            records.iter().try_for_each(|path| -> Result<(), String> {
+                let bytes = fs::read(path).map_err(|e| e.to_string())?;
+                let (count, side) = check_record(&bytes)?;
+                println!(
+                    "{}: {count} single-mip BC1 tiles, {side}x{side}, {} bytes",
+                    Path::new(path).display(),
+                    bytes.len()
+                );
+                Ok(())
+            })
+        }
+    } else {
+        run(Path::new(&dir))
+    };
+    if let Err(e) = result {
         eprintln!("{e}");
         std::process::exit(1);
     }

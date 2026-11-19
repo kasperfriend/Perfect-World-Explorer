@@ -9324,6 +9324,8 @@ fn preview_frame_using(
             )
             .unwrap();
         }
+        let [both, day, unbound] = renderer.terrain_gpu.lightmap_areas;
+        writeln!(meta, "native_lightmap_areas_day_night={both}\nnative_lightmap_areas_day_only={day}\nnative_lightmap_areas_unbound={unbound}").unwrap();
         if mode == LighterMode::Off {
             let effects = renderer
                 .models
