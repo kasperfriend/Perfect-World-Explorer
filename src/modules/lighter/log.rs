@@ -277,13 +277,27 @@ impl Logger {
         match entry {
             LogEntry::Session(h) => {
                 line.push_str("SESSION\n");
-                if let Some(v) = &h.commit { line.push_str(&format!("  commit: {v}\n")); }
-                if let Some(v) = &h.build_date { line.push_str(&format!("  build_date: {v}\n")); }
-                if let Some(v) = &h.os_version { line.push_str(&format!("  os: {v}\n")); }
-                if let Some(v) = &h.gpu { line.push_str(&format!("  gpu: {v}\n")); }
-                if let Some(v) = &h.driver { line.push_str(&format!("  driver: {v}\n")); }
-                if let Some(v) = &h.vulkan_version { line.push_str(&format!("  vulkan: {v}\n")); }
-                if let Some(v) = h.heap_size_mb { line.push_str(&format!("  heap_mb: {v}\n")); }
+                if let Some(v) = &h.commit {
+                    line.push_str(&format!("  commit: {v}\n"));
+                }
+                if let Some(v) = &h.build_date {
+                    line.push_str(&format!("  build_date: {v}\n"));
+                }
+                if let Some(v) = &h.os_version {
+                    line.push_str(&format!("  os: {v}\n"));
+                }
+                if let Some(v) = &h.gpu {
+                    line.push_str(&format!("  gpu: {v}\n"));
+                }
+                if let Some(v) = &h.driver {
+                    line.push_str(&format!("  driver: {v}\n"));
+                }
+                if let Some(v) = &h.vulkan_version {
+                    line.push_str(&format!("  vulkan: {v}\n"));
+                }
+                if let Some(v) = h.heap_size_mb {
+                    line.push_str(&format!("  heap_mb: {v}\n"));
+                }
                 if let Some(v) = &h.graphics_upscaler {
                     line.push_str(&format!("  graphics_upscaler: {v}\n"));
                 }
@@ -305,9 +319,13 @@ impl Logger {
                 line.push_str(&format!("  sdk: {}\n", p.sdk));
                 line.push_str(&format!("  path: {}\n", redact_path(&p.path)));
                 line.push_str(&format!("  size: {}\n", p.size_bytes));
-                if let Some(h) = &p.sha256 { line.push_str(&format!("  sha256: {h}\n")); }
+                if let Some(h) = &p.sha256 {
+                    line.push_str(&format!("  sha256: {h}\n"));
+                }
                 line.push_str(&format!("  result: {}\n", p.result));
-                if let Some(e) = &p.error_text { line.push_str(&format!("  error: {e}\n")); }
+                if let Some(e) = &p.error_text {
+                    line.push_str(&format!("  error: {e}\n"));
+                }
             }
             LogEntry::Frame(f) => {
                 *self.frame_count.lock().unwrap() += 1;
@@ -336,7 +354,9 @@ impl Logger {
                 line.push_str(&format!("  loaded: {}\n", c.loaded));
                 line.push_str(&format!("  skipped: {}\n", c.skipped));
                 line.push_str(&format!("  failed: {}\n", c.failed));
-                if let Some(r) = &c.fail_reason { line.push_str(&format!("  fail_reason: {r}\n")); }
+                if let Some(r) = &c.fail_reason {
+                    line.push_str(&format!("  fail_reason: {r}\n"));
+                }
                 line.push_str(&format!("  mip_fallbacks: {}\n", c.mip_fallbacks));
                 for t in &c.unavailable_textures {
                     line.push_str(&format!("  unavailable_texture: {t}\n"));
