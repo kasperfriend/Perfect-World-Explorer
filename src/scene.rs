@@ -34,6 +34,11 @@ pub struct SceneModel {
     pub position: [f32; 3],
     pub direction: [f32; 3],
     pub up: [f32; 3],
+    /// The record's own scale (`fScale`). Version 12 has no such field and
+    /// every model is 1.0; a later layout inserts it between `vUp` and the
+    /// model's path, so a reader that stops at `vUp` takes the scale for a
+    /// string length and reads the rest of the block as garbage.
+    pub scale: f32,
     pub path: String,
     pub action: String,
 }
@@ -226,6 +231,15 @@ fn refs(b: &[u8], p: &mut usize, n: usize) -> Result<Vec<Reference>, String> {
     }
     Ok(out)
 }
+/// First ECWLD version whose static-model record carries a scale between its
+/// up vector and its path strings.
+///
+/// The client header this recovery works from documents the field only from
+/// `ECWDFILEECMODEL` onward, and the shipped files place the boundary above 12:
+/// 1.8.4 writes version 17, which has the field, and a 1.5.2-era map writes 12,
+/// which does not.
+pub const MODEL_SCALE_VERSION: u32 = 13;
+
 impl Scene {
     pub fn load(path: &Path) -> Result<Self, String> {
         let b = fs::read(path).map_err(|e| e.to_string())?;
@@ -327,6 +341,11 @@ impl Scene {
                 b.len() - gp
             ));
         }
+        // Which model record layout this file uses. The scale field arrived
+        // after version 12; 12 itself has none, which the corpus proves both
+        // ways (1.8.4's v17 needs it in 65 blocks and reads in all 22,528,
+        // while a v12 map misreads 34 blocks if it is added there).
+        let model_has_scale = version >= MODEL_SCALE_VERSION;
         let mut blocks = Vec::with_capacity(count);
         let mut coords = HashSet::with_capacity(offsets.len());
         for off in offsets {
@@ -374,6 +393,18 @@ impl Scene {
                 let direction = vec3(data, p + 16)?;
                 let up = vec3(data, p + 28)?;
                 p += 40;
+                // The scale sits between `vUp` and the two strings from the
+                // layout that added it, and it is the difference between a
+                // readable block and a bogus string length: on 1.8.4's v17
+                // `world.ecwld` every one of the 65 blocks holding a model
+                // misreads without it, and all 22,528 read exactly with it.
+                let scale = if model_has_scale {
+                    let scale = f32at(data, p)?;
+                    p += 4;
+                    scale
+                } else {
+                    1.0
+                };
                 let path = string(data, &mut p)?;
                 let action = string(data, &mut p)?;
                 models.push(SceneModel {
@@ -381,6 +412,7 @@ impl Scene {
                     position,
                     direction,
                     up,
+                    scale,
                     path,
                     action,
                 })
@@ -662,6 +694,132 @@ mod tests {
         assert_eq!(ids.len(), total, "every placement carries its own id");
         assert_eq!(modes, [154, 676, 1_445], "authored day/night split");
         assert_eq!((bad_speed, bad_scale, bad_basis), (0, 0, 0));
+    }
+    /// A static-model record is `vUp` then a scale then the path: the scale is
+    /// read from the layout that added it, and leaving it out shifts every
+    /// string after it by four bytes.
+    ///
+    /// The fixture is a minimal block carrying one model, built twice, with and
+    /// without the field, so each version reads the one meant for it and the
+    /// wrong one is caught. On the shipped files the difference is not subtle:
+    /// 1.8.4's v17 `world.ecwld` misreads 65 of its 22,528 blocks without the
+    /// field, and a v12 map misreads 34 of its blocks with it.
+    fn world_with_a_model(version: u32, with_scale: bool) -> Vec<u8> {
+        let mut block = Vec::new();
+        block.extend_from_slice(&0u16.to_le_bytes()); // row
+        block.extend_from_slice(&0u16.to_le_bytes()); // col
+        let counts = [0u32, 0, 0, 0, 0, 0, 1, 0, 0, 0]; // one EC model
+        for c in counts {
+            block.extend_from_slice(&c.to_le_bytes());
+        }
+        block.extend_from_slice(&7u32.to_le_bytes()); // export id
+        for v in [1.5f32, 2.5, 3.5, 0., 1., 0., 0., 0., 1.] {
+            block.extend_from_slice(&v.to_le_bytes());
+        }
+        if with_scale {
+            block.extend_from_slice(&1.75f32.to_le_bytes());
+        }
+        let path = b"Models\\tree.ecm";
+        block.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        block.extend_from_slice(path);
+        block.extend_from_slice(&0u32.to_le_bytes()); // empty action
+        let nblocks = 1usize;
+        let block_off = 116 + 4 * nblocks;
+        let tree_off = block_off + block.len();
+        let mut b = Vec::new();
+        b.extend_from_slice(&0x45435744u32.to_le_bytes());
+        b.extend_from_slice(&version.to_le_bytes());
+        for v in [64.0f32, 64.0, 64.0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [32u32, nblocks as u32, 1, 1] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        // Tree and grass tables: both empty, so both offsets point at the end.
+        b.extend_from_slice(&(tree_off as u32).to_le_bytes());
+        b.extend_from_slice(&(tree_off as u32).to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.resize(116, 0);
+        b.extend_from_slice(&(block_off as u32).to_le_bytes());
+        b.extend_from_slice(&block);
+        b
+    }
+    #[test]
+    fn a_model_scale_is_read_from_the_version_that_has_one() {
+        for (version, with_scale) in [(12u32, false), (17u32, true)] {
+            let scene = Scene::parse(&world_with_a_model(version, with_scale))
+                .unwrap_or_else(|e| panic!("version {version}: {e}"));
+            let model = &scene.blocks[0].models[0];
+            assert_eq!(model.path, "Models/tree.ecm");
+            assert_eq!(model.action, "");
+            assert_eq!(model.export_id, 7);
+            assert_eq!(
+                model.scale,
+                if with_scale { 1.75 } else { 1.0 },
+                "version {version}"
+            );
+        }
+        // The mismatches are refused rather than silently accepted, which is
+        // what "the block does not add up" has to mean.
+        assert!(Scene::parse(&world_with_a_model(17, false)).is_err());
+        assert!(Scene::parse(&world_with_a_model(12, true)).is_err());
+    }
+    /// Every staged `.ecwld` parses, whatever version wrote it.
+    ///
+    /// A block that does not add up is refused by the per-block length check,
+    /// so a file that parses has had every record of every block walked at the
+    /// right stride. That is exactly the check the model-scale field needs: one
+    /// wrong stride turns a scale into a string length and the block stops
+    /// adding up. The staged corpus is the real thing — the reported failure
+    /// came from a version-17 file, which the model-scale fix has to read.
+    #[test]
+    fn every_staged_world_file_parses() {
+        let dir = std::path::Path::new("google_drive/scenecorpus");
+        let mut files: Vec<_> = match std::fs::read_dir(dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("ecwld"))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        if files.is_empty() {
+            crate::pck::corpus_absent("a staged `google_drive/scenecorpus`");
+            return;
+        }
+        files.sort();
+        let mut versions = std::collections::BTreeSet::new();
+        let mut models = 0usize;
+        for path in &files {
+            let scene = Scene::load(path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.file_name().unwrap().to_string_lossy()));
+            let version = u32at(&std::fs::read(path).unwrap(), 4).unwrap();
+            versions.insert(version);
+            assert!(!scene.blocks.is_empty());
+            for block in &scene.blocks {
+                for model in &block.models {
+                    models += 1;
+                    // The scale is a real authored number, which a misread
+                    // string length would not be. The first shipped value is
+                    // exactly 1.0, so the bound has to be inclusive.
+                    assert!(
+                        model.scale.is_finite() && model.scale >= 0.05 && model.scale <= 100.,
+                        "{}: model scale {}",
+                        path.display(),
+                        model.scale
+                    );
+                }
+            }
+        }
+        assert!(
+            versions.len() >= 2,
+            "the corpus is only one version; it proves nothing about the boundary: {versions:?}"
+        );
+        assert!(
+            models > 0,
+            "no models were staged to check the stride against"
+        );
     }
     #[test]
     fn rejects_bad_header() {

@@ -442,7 +442,19 @@ fn read_directory(
     let pos = (u32le(&header, 8)? ^ MASK) as u64;
     let table_end = part_end - (rev.header + 8) as u64;
     if pos >= table_end {
-        return Err("entry table overlaps footer".into());
+        // The masked offset in the trailer's header is either a position inside
+        // this file or the client's "no table here" sentinel. A package split
+        // over several files carries one trailer, in its last file, so the size
+        // word and the offset word are the only evidence of what went wrong;
+        // "overlaps footer" alone cannot be acted on.
+        return Err(format!(
+            "entry table overlaps footer: the trailer declares its table at {pos} but only \
+             {table_end} bytes of this {} (len {}) precede it (declared end {end}, base {base}, \
+             count {count}, flags {:#010x})",
+            if base == 0 { "file" } else { "piece" },
+            part_end,
+            u32le(&header, rev.flags_at).unwrap_or(0)
+        ));
     }
     // The entry table may sit either side of the split, so it is walked through
     // the two-part reader rather than one file.

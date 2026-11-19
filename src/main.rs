@@ -175,6 +175,7 @@ mod world_models;
 mod world_models_gpu;
 mod world_objects;
 mod world_page_cache;
+mod world_place_names;
 mod xess;
 struct Terrain {
     element: PathBuf,

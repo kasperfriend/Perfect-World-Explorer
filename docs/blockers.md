@@ -1822,3 +1822,53 @@ only when every piece is open; the pieces are the evidence.
   is version 12; the file has not been read here. If it is, the gate now admits
   it and any remaining failure will name the block, the offset and the count
   instead of the version.
+
+## B-13: three separate faults, each named by the evidence
+
+The census line added in B-12 answered the 1.5.2 report on its first run, and
+the 1.8.4 string error turned out to be a version-layout field. The three are
+unrelated; what they share is that the tree was reading the wrong file or the
+wrong stride, not that the clients are unusual.
+
+**1.5.2 has no buildings because its scenery archive is not readable.
+`litmodels.pck` fails with `entry table overlaps footer`.** The census line
+reported `22981 ornament placement(s) in the map, 272 selected here, 0 drawable,
+22981 names this client cannot resolve`, with
+`litmodels/world/44/litmodel_1125.bmd: litmodels.pck was not indexed`. The map
+authors 22,981 ornaments — the world is untouched — and not one model resolves
+because the archive directory cannot be walked. This is not the split-package
+bug from B-12: the package opens, and its *trailer* disagrees with itself. The
+message used to be the two words "overlaps footer"; it now reports where the
+trailer says its table is, how many bytes precede that point, which piece it is,
+the declared end, the base and the count.
+
+*Open*: the 1.5.2 `litmodels` is 2,147,483,392 + 711,705,020 bytes in its
+`.pck`/`.pkx`, and its trailer is rejected. The next run's message carries the
+numbers needed to see whether the table sits in the other piece, whether the
+count is wrong, or whether this revision's entry records are a different size.
+
+**1.8.4's `oversized ECWLD string` is a static-model record that grew a scale.**
+The reported number was `1065353216` = `0x3F800000` — the float `1.0` read as a
+length. The model record was read as `export id, position, direction, up` and
+then two strings; from the layout that added `fScale`, a `float` sits between
+`up` and the path, so the reader took the scale for a string length and lost the
+rest of the block. Measured on the real files, not guessed:
+
+| file | version | blocks that misread without the field | with it |
+|---|---|---|---|
+| 1.8.4 `world.ecwld` (2.85 MB) | 17 | 65 | **0 of 22,528** |
+| 1.5.2 `world.ecwld` (2.32 MB) | 12 | **0 of 22,528** | 34 |
+
+So the field is read from version 13 onward (`MODEL_SCALE_VERSION`), where the
+next layout revision puts it, and version 12 keeps its old stride. The scale is
+carried on `SceneModel` rather than discarded, because a value in 0.5–2.8 on a
+static model is what the client scales it by.
+
+**Zone names were Chinese, not a font fault.** `precinct.clt` stores names in
+the client's localisation, so a Chinese 1.5.2 world shows `刺骨之地` and no CJK
+font renders it. `src/world_place_names.rs` carries 243 English names derived by
+joining the two shipped files for the same map — the Chinese `precinct.clt` from
+1.5.2 and the English one from 1.8.4 — on their polygon vertices: 382 zones in
+the Chinese file, 378 found in the English file, all 378 agreeing on one English
+name, 243 distinct, no conflicts. Four zones the English file does not carry are
+left as authored rather than guessed, and the teleport list uses the same table.

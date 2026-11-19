@@ -5370,7 +5370,7 @@ pub fn run(
                             }
                             list.push(crate::navigation::Destination {
                                 id: fallback_id,
-                                name: name.to_string(),
+                                name: crate::world_place_names::english(name).to_string(),
                                 position,
                             });
                             fallback_id += 1;
@@ -6371,7 +6371,7 @@ pub fn run(
                     world_audio.update(settings.effects_enabled,settings.effects_volume,camera.pos.to_array(),camera.yaw,crate::environment::night_factor(settings.time_of_day));
                     if zone_check.elapsed()>=std::time::Duration::from_millis(350){
                         zone_check=Instant::now();let zone=ui_zones.as_ref().and_then(|z|z.find(camera.pos.x,camera.pos.z));
-                        if (!zone_initialized || zone!=last_zone) && settings.show_zone_entry {if let Some(i)=zone {if let Some(db)=&ui_zones {let name=db.zones[i].name.trim();if !name.is_empty(){zone_banner=Some((name.to_string(),Instant::now()));}}}}
+                        if (!zone_initialized || zone!=last_zone) && settings.show_zone_entry {if let Some(i)=zone {if let Some(db)=&ui_zones {let name=crate::world_place_names::english(db.zones[i].name.trim());if !name.is_empty(){zone_banner=Some((name.to_string(),Instant::now()));}}}}
                         zone_initialized=true;last_zone=zone;
                     }
                     if !settings.show_zone_entry {zone_banner=None;}

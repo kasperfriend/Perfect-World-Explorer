@@ -635,6 +635,10 @@ pub mod model_playback;
 pub mod world_catalog;
 #[path = "$OUT/pck_stub.rs"]
 pub mod pck;
+// The zone-name table: its own tests, and its data must keep matching the
+// shapes it claims.
+#[path = "$REPO/src/world_place_names.rs"]
+pub mod world_place_names;
 // \`model_playback\`'s tests build their asset from the same fixture the
 // shipped binary mounts under \`#[cfg(test)]\`; without it this suite stopped at
 // "could not find \`model_draw_fixture\` in the crate root" before running a
