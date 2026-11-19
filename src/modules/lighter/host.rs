@@ -84,6 +84,17 @@ pub(super) struct PreparedScene {
     resident: ResidentScene,
 }
 
+impl PreparedScene {
+    pub(super) fn poll_upload(
+        &self,
+        ray: &mut Lighter,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<bool, String> {
+        ray.stage_resident(device, queue, &self.packet, &self.bank)
+    }
+}
+
 pub(super) struct Feed {
     source: Arc<FeedSource>,
     resident: ResidentScene,

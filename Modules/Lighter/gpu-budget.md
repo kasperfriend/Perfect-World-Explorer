@@ -12,8 +12,8 @@ from its synchronized draw-plus-readback wall time.
 The raw Vulkan allocator's ceiling is **6.5 GB** or the largest reported
 local heap, whichever is smaller. It charges Vulkan memory requirements for
 BLAS/TLAS, scratch, uploads and staging, the shared image and optional raster
-attachments, including transient growth. Departed BLAS retire before new
-chunks claim that space. Where `VK_EXT_memory_budget` is advertised, the menu
+attachments, including transient growth and an incoming resident scene.
+The active scene's BLAS remain live until the pending replacement is ready. Where `VK_EXT_memory_budget` is advertised, the menu
 also shows the driver's device-local usage estimate and warns at 7 GB. The
 raw limit is **not** a hard 7 GB cap on the whole application or the adapter.
 Tracked allocations exclude Native scene/UI/swapchain resources and opaque
@@ -47,17 +47,42 @@ frame. Device loss still triggers device recovery, not a render-mode fallback.
 The streaming loader keeps 128 recently used decoded BMD tiles on top of the
 live set. Higher-ranked placements and local assets are touched last. Lower
 rank optional owners are omitted first when geometry or texel admission is
-exhausted; their coverage rows retain the budget reason. Static texture
-suffixes upload in pages of at most 4 MiB, leaving the shared prefix intact.
-The loader handles archive decode; device page copies are asynchronous. A ray
-packet publishes atomically with its uploads, not with partially readable
-texture pages. This is not shader-driven demand paging.
+exhausted; their coverage rows retain the budget reason. This is not
+shader-driven demand paging.
 
-The wgpu device exposes one created Vulkan queue. A separately enumerated
-queue family cannot be used without provisioning it when opening the device.
-Uploads and AS work are submitted with the trace before composition; explicit
-transfer/build/read barriers and later-frame fence polling cover only the
-resources that are reused. No extra queue idle is inserted on steady frames.
+## Paced world crossings
+
+The streaming worker packs the replacement ray scene. The draw thread stages
+it in separate static GPU buffers, at most one batch per redraw. A batch has
+at most **4 MiB** of packet/texel copies (and at most 32 copy spans); shared
+sealed texel bytes are copied device-to-device, not re-uploaded from the
+host. The active and pending banks can overlap in memory. Native's separately
+paged mask atlas is also kept unpublished until the ray candidate is ready.
+A failed admission still publishes Native with an explicit ray error, not a
+ray render with partially updated inputs.
+
+Vulkan builds up to **8 new static BLAS** per batch, targeting **32,768
+triangles** (one indivisible BLAS can exceed this target). Existing BLAS
+with matching geometry and key are retained. A fence retires each batch
+before staging or scratch can be reused. The live TLAS is left alone; at
+publication the first ray draw assembles its new membership with the latest
+moving geometry. TLAS work, dynamic uploads/refits, a cold first scene and
+Native's non-mask geometry uploads are **not** split by this change.
+
+The wgpu device exposes one created Vulkan queue. A separate command pool and
+fence are **not** an independent queue or concurrent compute. Native/Software
+and raw Vulkan work are submitted on the render thread. Draws can continue
+on the old buffers between batches; actual present cadence still depends on
+shared-queue contention. At a committed crossing the diagnostic records
+transfer batches, host and retained bytes, maximum batch size and BLAS
+batches. No interactive queue-idle wait is needed to publish.
+
+Synthetic 9×9 crossing on Mesa 25.0.7 CPU Vulkan, with a test-only 8 KiB cap:
+**5** copies (27,708 B host, 5,524 B retained), **5** unchanged Software
+redraws, and **8** unchanged raw Vulkan redraws including 18 new BLAS across
+3 batches. The retained BLAS was not rebuilt. The replacement's RGB and
+reverse-Z appeared together; Software and raw Vulkan both passed a cancelled
+copy/retry. This checks ordering and bounds, not latency on a physical GPU.
 
 ## Validation (2026-11-18)
 

@@ -271,8 +271,9 @@ still traces RGB transmittance.
   the next draw route. Failed mask admission clears the ray scene and is
   carried through LOD-only updates; those updates cannot read an old mask
   table with a new mesh. Initial setup still prepares the first packet in
-  the watched startup. GPU upload submission, per-frame moving data and
-  raw Vulkan AS recording remain on the draw path.
+  the watched startup. GPU submission stays on the draw thread, but streamed
+  static ray copies and new BLAS builds now span redraws. See the
+  [crossing bounds and test](gpu-budget.md#paced-world-crossings).
 - **One-sample water:** the first water interface restores its deterministic
   two-leg split at 1 spp. Higher-sample water, other dielectrics and roulette
   retain Single-path's bounded behavior. This is a variance/quality choice,

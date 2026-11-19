@@ -6,6 +6,7 @@ pub(crate) mod coverage;
 pub(crate) mod model_feed;
 mod post;
 mod profile;
+mod residency;
 pub(crate) mod scene;
 mod settings;
 pub(crate) mod sky;
@@ -354,6 +355,7 @@ struct Software {
     moving: Storage,
     textures: Storage,
     output: Storage,
+    staged: Option<residency::SoftwareScene>,
     binds: Bindings<5>,
     buffers_created: u64,
     revision: Option<u64>,
@@ -412,13 +414,19 @@ impl Software {
             frame,
             world: upload("Lighter world"),
             moving: upload("Lighter moving geometry"),
-            textures: upload("Lighter texels"),
+            textures: Storage::new(
+                device,
+                "Lighter texels",
+                16,
+                wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            ),
             output: Storage::new(
                 device,
                 "Lighter image",
                 PIXEL_BYTES,
                 wgpu::BufferUsages::empty(),
             ),
+            staged: None,
             binds: Bindings::default(),
             buffers_created: 5,
             revision: None,
@@ -428,6 +436,62 @@ impl Software {
             #[cfg(test)]
             moving_uploads: 0,
         }
+    }
+
+    fn stage_resident(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        revision: u64,
+        packet: &Packet,
+        texels: &Textures,
+        limit: usize,
+    ) -> Result<bool, String> {
+        if self.staged.is_none() {
+            let prefix = texels.shared_bytes(&self.texture_prefix);
+            let capacity = residency::texel_capacity(texels).min(storage_limit(device));
+            self.staged = Some(residency::SoftwareScene::new(
+                device,
+                revision,
+                packet.bytes().len(),
+                capacity,
+                prefix,
+            )?);
+            self.buffers_created += 2;
+        }
+        let stage = self.staged.as_mut().unwrap();
+        assert_eq!(stage.revision, revision, "one resident candidate at a time");
+        match stage.poll(
+            device,
+            queue,
+            packet.bytes(),
+            texels,
+            &self.textures.0,
+            limit,
+        ) {
+            Ok(ready) => Ok(ready),
+            Err(error) => {
+                self.staged = None;
+                Err(error)
+            }
+        }
+    }
+
+    fn publish_resident(&mut self, revision: u64, texels: &Textures) -> Option<residency::Stats> {
+        if !self
+            .staged
+            .as_ref()
+            .is_some_and(|stage| stage.ready(revision))
+        {
+            return None;
+        }
+        let stage = self.staged.take().unwrap();
+        self.world = stage.world;
+        self.textures = stage.texels;
+        self.revision = Some(revision);
+        self.texture_len = texels.byte_len();
+        texels.remember_prefix(&mut self.texture_prefix);
+        Some(stage.stats)
     }
 
     fn trace(
@@ -679,6 +743,9 @@ pub struct Lighter {
     native_backend: wgpu::Backend,
     pub world: Option<World>,
     revision: u64,
+    last_residency: Option<residency::Stats>,
+    #[cfg(test)]
+    residency_transfer_bytes: usize,
     scene_error: Option<String>,
     frame_error: Option<String>,
     persistence_error: Option<String>,
@@ -720,6 +787,9 @@ impl Default for Lighter {
             native_backend: wgpu::Backend::Empty,
             world: None,
             revision: 0,
+            last_residency: None,
+            #[cfg(test)]
+            residency_transfer_bytes: residency::TRANSFER_BYTES,
             scene_error: None,
             frame_error: None,
             persistence_error: None,
@@ -817,11 +887,67 @@ impl Lighter {
         self.settings.mode != Mode::Off
     }
 
+    /// The host holds one candidate until both the Native and ray bindings
+    /// are ready. Do not publish these buffers, coverage or a new revision
+    /// while an old frame can still read them.
+    pub(crate) fn stage_resident(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        packet: &Packet,
+        texels: &Textures,
+    ) -> Result<bool, String> {
+        if !self.armed || !self.requested() || self.unavailable().is_some() {
+            return Ok(true);
+        }
+        if packet.bytes().len().max(texels.byte_len()) > storage_limit(device) {
+            return Err("Lighter candidate exceeds adapter storage limit".into());
+        }
+        let revision = self.revision.wrapping_add(1);
+        #[cfg(not(test))]
+        let limit = residency::TRANSFER_BYTES;
+        #[cfg(test)]
+        let limit = self.residency_transfer_bytes;
+        match self.settings.mode {
+            Mode::Software => {
+                if let Some(software) = &mut self.software {
+                    return software.stage_resident(device, queue, revision, packet, texels, limit);
+                }
+            }
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            Mode::Hardware => {
+                if let Some(rt) = &mut self.hardware {
+                    return rt.stage_resident(revision, packet, texels, limit);
+                }
+            }
+            _ => {}
+        }
+        // A ray error during first open may not have created a GPU pipeline.
+        // Its later recovery takes the watched first-use path as before.
+        Ok(true)
+    }
+
     pub fn install(&mut self, scene: Result<(Packet, Textures), String>) {
         self.revision = self.revision.wrapping_add(1);
         self.frame_error = None;
         match scene {
             Ok((packet, textures)) => {
+                self.last_residency = match self.settings.mode {
+                    Mode::Software => self
+                        .software
+                        .as_mut()
+                        .and_then(|rt| rt.publish_resident(self.revision, &textures)),
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    Mode::Hardware => self
+                        .hardware
+                        .as_mut()
+                        .and_then(|rt| rt.publish_resident(self.revision, &textures)),
+                    _ => None,
+                };
+                if let Some(s) = self.last_residency {
+                    crate::diag!(TimingLoad, "Lighter staged residency: {} transfer batch(es), host {} B, reused GPU {} B, peak batch {} B; {} BLAS in {} batch(es)",
+                        s.batches, s.host_bytes, s.resident_bytes, s.max_batch_bytes, s.blas_builds, s.blas_batches);
+                }
                 self.world = Some(World {
                     packet,
                     textures,
@@ -834,10 +960,20 @@ impl Lighter {
                     eprintln!("Lighter: {error}");
                 }
                 self.world = None;
+                self.last_residency = None;
                 self.scene_error = Some(error);
                 self.reset_history();
                 self.status = None;
             }
+        }
+        // A failed or bypassed candidate must not be mistaken for the next
+        // revision. wgpu owns submitted buffer lifetimes; raw Vulkan polls.
+        if let Some(rt) = &mut self.software {
+            rt.staged = None;
+        }
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(rt) = &mut self.hardware {
+            rt.abandon_residency();
         }
     }
 
@@ -1031,7 +1167,9 @@ impl Lighter {
     pub(crate) fn poll_hardware(&mut self) -> Result<bool, String> {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         if let Some(rt) = &mut self.hardware {
-            return rt.poll_frame();
+            let trace_idle = rt.poll_frame()?;
+            let resident_idle = rt.poll_resident_upload()?;
+            return Ok(trace_idle && resident_idle);
         }
         Ok(true)
     }
@@ -1363,6 +1501,15 @@ impl Lighter {
             .iter()
             .map(|s| s.0.size())
             .sum::<u64>();
+        }
+        if let Some(staged) = self.software.as_ref().and_then(|s| s.staged.as_ref()) {
+            known += staged.world.0.size() + staged.texels.0.size();
+        }
+        if let Some(s) = self.last_residency {
+            ui.label(format!(
+                "Last streamed ray scene: {} copy batches, {} static BLAS in {} batches",
+                s.batches, s.blas_builds, s.blas_batches
+            ));
         }
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         if let Some(hardware) = &self.hardware {

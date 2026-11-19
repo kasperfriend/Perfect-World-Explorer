@@ -264,7 +264,17 @@ fn install_streamed_fixture(r: &mut super::super::Renderer, native: super::MeshD
     if let Some(feed) = &mut r.lighter_feed {
         feed.packer = packer;
     }
-    assert!(r.update_mesh(&mut Some(mesh)).unwrap());
+    let mut pending = Some(mesh);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !r.update_mesh(&mut pending).unwrap() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "staged scene did not complete"
+        );
+        r.device.poll(wgpu::Maintain::Poll);
+        std::thread::yield_now();
+    }
+    assert!(pending.is_none());
 }
 
 fn fixture(element: &std::path::Path) -> Terrain {

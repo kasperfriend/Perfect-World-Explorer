@@ -1,5 +1,7 @@
 #[path = "optimization_tests.rs"]
 mod optimizations;
+#[path = "residency_tests.rs"]
+mod residency_tests;
 
 use super::*;
 use glam::{Mat4, Vec3};

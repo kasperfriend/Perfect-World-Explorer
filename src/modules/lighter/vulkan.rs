@@ -21,6 +21,7 @@ use wgpu::hal::{api::Vulkan, vulkan::Device as HalDevice};
 
 mod cache;
 mod primary;
+mod residency;
 
 pub const FEATURES: wgpu::Features =
     wgpu::Features::RAY_QUERY.union(wgpu::Features::RAY_TRACING_ACCELERATION_STRUCTURE);
@@ -422,8 +423,8 @@ fn dirty_copies(before: &[u8], after: &[u8], copies: &mut Vec<vk::BufferCopy>) {
 }
 
 struct Upload {
-    gpu: Buffer,
-    staging: Buffer,
+    gpu: Arc<Buffer>,
+    staging: Option<Buffer>,
     copies: Vec<vk::BufferCopy>,
 }
 impl Upload {
@@ -444,17 +445,35 @@ impl Upload {
             u64::MAX
         };
         let capacity = grown_capacity(needed, old, limit);
-        *slot = Some(Self {
-            gpu: Buffer::new(
+        *slot = Some(Self::device_local(ctx, capacity, usage)?);
+        Ok(true)
+    }
+
+    fn device_local(ctx: &Arc<Context>, capacity: u64, usage: vk::BufferUsageFlags) -> R<Self> {
+        Ok(Self {
+            gpu: Arc::new(Buffer::new(
                 ctx,
                 capacity,
-                usage | vk::BufferUsageFlags::TRANSFER_DST,
+                usage | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
                 LOCAL,
-            )?,
-            staging: Buffer::new(ctx, capacity, vk::BufferUsageFlags::TRANSFER_SRC, HOST)?,
+            )?),
+            staging: None,
             copies: Vec::new(),
-        });
-        Ok(true)
+        })
+    }
+
+    fn stage(&mut self, ctx: &Arc<Context>, bytes: u64) -> R<&Buffer> {
+        if self.staging.as_ref().is_none_or(|buf| buf.size < bytes) {
+            let old = self.staging.as_ref().map_or(0, |buf| buf.size);
+            let capacity = grown_capacity(bytes, old, self.gpu.size);
+            self.staging = Some(Buffer::new(
+                ctx,
+                capacity,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                HOST,
+            )?);
+        }
+        Ok(self.staging.as_ref().unwrap())
     }
 
     fn set(
@@ -482,14 +501,25 @@ impl Upload {
             retained_prefix
         };
         buffer.copies.clear();
-        buffer.copies.extend(
-            (prefix..bytes)
-                .step_by(UPLOAD_PAGE_BYTES)
-                .map(|at| copy_range(at, (bytes - at).min(UPLOAD_PAGE_BYTES))),
-        );
-        buffer
-            .staging
-            .write_segments(suffix_segments(segments, prefix))
+        if prefix < bytes {
+            // The published static bank has no full-size host mirror. If
+            // the moving feed adds a suffix, stage just its new bytes.
+            buffer.stage(ctx, (bytes - prefix) as u64)?.write_segments(
+                suffix_segments(segments, prefix).map(|(at, part)| (at - prefix, part)),
+            )?;
+            buffer
+                .copies
+                .extend(
+                    (prefix..bytes)
+                        .step_by(UPLOAD_PAGE_BYTES)
+                        .map(|at| vk::BufferCopy {
+                            src_offset: (at - prefix) as u64,
+                            dst_offset: at as u64,
+                            size: (bytes - at).min(UPLOAD_PAGE_BYTES) as u64,
+                        }),
+                );
+        }
+        Ok(())
     }
 
     fn set_changed(
@@ -509,12 +539,20 @@ impl Upload {
         } else {
             dirty_copies(previous, data, &mut buffer.copies);
         }
-        buffer
-            .staging
-            .write_segments(buffer.copies.iter().map(|copy| {
-                let at = copy.dst_offset as usize;
-                (at, &data[at..at + copy.size as usize])
-            }))
+        if let Some(end) = buffer.copies.last().map(|c| c.src_offset + c.size) {
+            // Reserve before borrowing the dirty-span list. A moving buffer
+            // can grow when a changed span extends past its former tail.
+            buffer.stage(ctx, end)?;
+            buffer
+                .staging
+                .as_ref()
+                .unwrap()
+                .write_segments(buffer.copies.iter().map(|copy| {
+                    let at = copy.dst_offset as usize;
+                    (at, &data[at..at + copy.size as usize])
+                }))?;
+        }
+        Ok(())
     }
 
     fn copied_bytes(&self) -> u64 {
@@ -525,7 +563,7 @@ impl Upload {
         if !self.copies.is_empty() {
             self.gpu.ctx.device.cmd_copy_buffer(
                 cmd,
-                self.staging.handle,
+                self.staging.as_ref().unwrap().handle,
                 self.gpu.handle,
                 &self.copies,
             );
@@ -972,6 +1010,8 @@ pub struct Renderer {
     output: Option<Output>,
     submitted: bool,
     scene_upload_pending: bool,
+    resident_dirty: bool,
+    resident_upload: Option<residency::ResidentUpload>,
     timing_pending: Option<([u32; 4], bool, bool, u64, u64)>,
     last_gpu: Option<([u32; 4], [f64; 3])>,
     heap_usage: Option<u64>,
@@ -1016,6 +1056,8 @@ impl Renderer {
             output: None,
             submitted: false,
             scene_upload_pending: false,
+            resident_dirty: false,
+            resident_upload: None,
             timing_pending: None,
             last_gpu: None,
             heap_usage: None,
@@ -1276,6 +1318,9 @@ impl Renderer {
     }
 
     pub(super) fn try_prepare_image(&mut self, device: &wgpu::Device, size: u64) -> R<bool> {
+        // Retire a cancelled candidate, but live frames read independent
+        // buffers and needn't wait on the residency fence to record/submit.
+        self.poll_resident_upload()?;
         if !self.poll_frame()? {
             return Ok(false);
         }
@@ -1404,7 +1449,8 @@ impl Renderer {
                 bytemuck::cast_slice(&self.last_moving),
             )?;
         }
-        let plan = if static_changed || moving_changed || moving_keys_changed {
+        let plan = if self.resident_dirty || static_changed || moving_changed || moving_keys_changed
+        {
             Some(self.prepare_accel(world, moving)?)
         } else {
             None
@@ -1642,6 +1688,7 @@ impl Renderer {
         self.last_raster = raster.is_some();
         self.submitted = true;
         self.scene_upload_pending = false;
+        self.resident_dirty = false;
         if timing {
             let moving_bytes = if moving_changed { m.copied_bytes() } else { 0 };
             let instance_bytes = if plan.as_ref().is_some_and(|p| p.tlas.is_some()) {

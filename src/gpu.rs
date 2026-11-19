@@ -3196,8 +3196,23 @@ impl Renderer {
     /// Advance any staged terrain upload. `pending` remains owned by the
     /// viewer until the replacement mesh and all of its atlas pages are ready.
     fn update_mesh(&mut self, pending: &mut Option<StreamedMesh>) -> Result<bool, String> {
-        let Some(mesh) = pending.as_ref() else {
+        let Some(mesh) = pending.as_mut() else {
             return Ok(false);
+        };
+        let ready = match mesh.rays.as_ref() {
+            Some(Ok(candidate)) => {
+                match candidate.poll_upload(&mut self.lighter, &self.device, &self.queue) {
+                    Ok(ready) => ready,
+                    Err(error) if recovery::lost_error(&error) => return Err(error),
+                    Err(error) => {
+                        // Publish the Native snapshot and its explicit ray error
+                        // as a pair. Never block terrain on an over-budget ray scene.
+                        mesh.rays = Some(Err(error));
+                        true
+                    }
+                }
+            }
+            _ => true,
         };
         if let Some(upload) = &mesh.native.terrain_upload {
             if !self.terrain_gpu.poll_residency(
@@ -3206,9 +3221,12 @@ impl Renderer {
                 &self.uniform,
                 &self.reflected_uniform,
                 upload,
+                ready,
             )? {
                 return Ok(false);
             }
+        } else if !ready {
+            return Ok(false);
         }
         let StreamedMesh {
             native: mut m,
@@ -6387,6 +6405,10 @@ fn run_viewer(
                         match renderer.update_mesh(&mut pending_mesh) {
                             Ok(true) => streaming = false,
                             Ok(false) => {},
+                            Err(e) if recovery::lost_error(&e) => {
+                                gpu_loss.report(e);
+                                return;
+                            }
                             Err(e) => {
                                 eprintln!("Terrain residency upload failed: {e}");
                                 target.exit(); return;

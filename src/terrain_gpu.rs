@@ -872,6 +872,7 @@ impl TerrainGpu {
     /// Stage at most two atlas pages per submission. Keep the old terrain
     /// bindings and mesh installed until all pages of the replacement retire.
     /// `upload` is the same pending mesh on every call, until this returns true.
+    /// `publish` gates the swap: a companion ray transfer can still be pending.
     pub fn poll_residency(
         &mut self,
         device: &wgpu::Device,
@@ -879,6 +880,7 @@ impl TerrainGpu {
         normal: &wgpu::Buffer,
         reflection: &wgpu::Buffer,
         upload: &TerrainUpload,
+        publish: bool,
     ) -> Result<bool, String> {
         if self.mask_upload.is_none() {
             self.mask_upload = Some(MaskUpload::new(device, &upload.materials, &self.tex_map)?);
@@ -888,6 +890,7 @@ impl TerrainGpu {
             .as_mut()
             .unwrap()
             .advance(queue, &upload.materials)?
+            || !publish
         {
             return Ok(false);
         }
