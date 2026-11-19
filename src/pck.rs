@@ -1076,6 +1076,47 @@ pub fn corpus_member_absent(name: &str) {
     );
 }
 
+/// Report a *file* of a staged client that this machine does not carry, and
+/// skip.
+///
+/// This is [`corpus_absent`] for a path rather than a bare name, and it exists
+/// because the tests that lean on a staged client used to guard themselves with
+/// a bare `return`:
+///
+/// ```ignore
+/// if !element.join("models.pck").exists() {
+///     return;
+/// }
+/// ```
+///
+/// A `return` from a `#[test]` *passes* it. On a machine with no staged client
+/// those tests therefore reported success while never opening a single archive
+/// -- the suite claimed coverage of the shipped data that it did not have, which
+/// is the one thing a corpus test must not do. The count is printed at the end
+/// of the run, so "211 passed" cannot quietly mean "180 passed and 31 looked at
+/// nothing".
+#[cfg(test)]
+pub fn corpus_file_absent(path: &std::path::Path) {
+    corpus_file_absent_with(corpus_required(), path);
+}
+
+/// [`corpus_file_absent`] with the decision already made.
+#[cfg(test)]
+pub fn corpus_file_absent_with(required: bool, path: &std::path::Path) {
+    if required {
+        panic!(
+            "{CORPUS_ENV}=require, but this machine has no {}",
+            path.display()
+        );
+    }
+    SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "SKIPPED: no {} on this machine; this test proves nothing about the shipped data \
+         (set {CORPUS_ENV}=require to make this a failure)",
+        path.display()
+    );
+}
+
 /// How many corpus tests skipped for a missing archive so far.
 ///
 /// A skip is not a pass, and a suite of 282 passes reads as full coverage even
@@ -1096,6 +1137,32 @@ pub fn skipped_corpus_tests() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A missing staged-client file must count as a skip, not as a pass.
+    ///
+    /// The tests this helper replaced guarded themselves with `return;`, which
+    /// libtest reads as success. That is the whole defect: 28 tests across eight
+    /// modules reported "ok" on a machine with no client staged.
+    #[test]
+    fn a_missing_client_file_is_counted_not_silently_passed() {
+        let before = SKIPPED.load(std::sync::atomic::Ordering::Relaxed);
+        // Not a path this repository ships, so it is absent on every machine.
+        let absent = std::path::Path::new("google_drive/pw142/element/models.pck");
+        corpus_file_absent_with(false, absent);
+        assert_eq!(
+            SKIPPED.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "the skip must be counted, or a run cannot tell it from a pass"
+        );
+    }
+
+    /// And with the gate on it must fail, not skip: CI sets `PWE_CORPUS=require`
+    /// precisely so a machine without the corpus cannot report success.
+    #[test]
+    #[should_panic(expected = "PWE_CORPUS=require")]
+    fn a_missing_client_file_fails_when_the_corpus_is_required() {
+        corpus_file_absent_with(true, std::path::Path::new("google_drive/pw142/element"));
+    }
 
     /// The default has to be "off": CI stages no archives, so a corpus test that
     /// failed there would fail every run for a reason the change cannot fix.

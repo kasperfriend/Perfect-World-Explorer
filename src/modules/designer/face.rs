@@ -1265,6 +1265,7 @@ mod tests {
 
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("facedata.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("facedata.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1350,6 +1351,7 @@ mod tests {
 
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("facedata.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("facedata.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1418,6 +1420,7 @@ mod tests {
 
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("facedata.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("facedata.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();

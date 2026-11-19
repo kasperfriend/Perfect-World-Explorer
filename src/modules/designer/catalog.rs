@@ -1219,6 +1219,7 @@ mod tests {
     fn parses_authentic_v27_to_the_exact_last_byte() {
         let path = std::path::Path::new("google_drive/pw142/element/data/elements.data");
         if !path.exists() {
+            crate::pck::corpus_file_absent(&path);
             return;
         }
         let bytes = std::fs::read(path).unwrap();

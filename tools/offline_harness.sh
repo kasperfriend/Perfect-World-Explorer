@@ -583,7 +583,26 @@ pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-pub fn corpus_absent(_what: &str) {}
+/// Mirrors the counted skip in the real `pck`: the offline stand-in must not be
+/// quieter than the thing it stands in for, or an offline run reports a corpus
+/// test as a pass when it looked at nothing. (Same defect as the bare
+/// `return;` guards in the tests: item 82 of the PART 3 list.)
+static SKIPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn corpus_absent(what: &str) {
+    SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    eprintln!("SKIPPED: no {what} on this machine; this test proves nothing about the shipped data");
+}
+
+/// Mirrors the real helper in `pck`: a `#[test]` that `return`s over a missing
+/// staged client *passes*, so the count is what keeps that honest.
+pub fn corpus_file_absent(path: &std::path::Path) {
+    SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "SKIPPED: no {} on this machine; this test proves nothing about the shipped data",
+        path.display()
+    );
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {

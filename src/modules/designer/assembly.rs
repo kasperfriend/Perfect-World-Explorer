@@ -1516,6 +1516,7 @@ mod tests {
     fn authentic_default_characters_assemble_and_deform() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1582,6 +1583,7 @@ mod tests {
     fn zero_armor_and_fashion_are_empty_not_native_default_skins() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1616,6 +1618,7 @@ mod tests {
     fn authentic_male_human_and_elf_faces_use_native_skin_shaders() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1702,6 +1705,7 @@ mod tests {
     fn authentic_brows_keep_highlight_and_separate_skin_color() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1764,6 +1768,7 @@ mod tests {
     fn authentic_eye_and_eyeball_use_their_dedicated_two_and_three_stage_shaders() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1825,6 +1830,7 @@ mod tests {
     fn authentic_body_uses_dedicated_color_mask_shader() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1873,6 +1879,7 @@ mod tests {
     fn authentic_one_handed_weapon_skips_zero_placeholder_and_loads_real_model() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1920,6 +1927,7 @@ mod tests {
     fn authentic_weapons_use_native_material_and_diffuse_only_alpha() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -1961,6 +1969,7 @@ mod tests {
     fn authentic_mount_parents_rider_and_hides_weapons() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();
@@ -2007,6 +2016,7 @@ mod tests {
     fn authentic_wing_and_fly_sword_use_their_native_hangers() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();

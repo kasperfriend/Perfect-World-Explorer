@@ -370,6 +370,7 @@ mod tests {
     fn the_shipped_client_archive_names_the_same_overhead_font() {
         let element = Path::new("google_drive/pw142/element");
         if !element.join("configs.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("configs.pck"));
             return;
         }
         let (family, size) = read_font_table(element).expect("configs/fonts.txt parses");

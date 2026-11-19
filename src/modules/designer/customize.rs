@@ -890,6 +890,7 @@ mod tests {
         let path =
             std::path::Path::new("google_drive/pw142/element/userdata/character/character00.ini");
         if !path.exists() {
+            crate::pck::corpus_file_absent(&path);
             return;
         }
         let bytes = std::fs::read(path).unwrap();
