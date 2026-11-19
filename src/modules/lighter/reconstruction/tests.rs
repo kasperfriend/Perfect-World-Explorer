@@ -1,7 +1,7 @@
 //! CPU Vulkan tests for the *real* trace/pack/submit/composite protocol. Probe
 //! writes a known VkImage color: this is not a test of either SDK's algorithms.
 use super::*;
-use crate::modules::lighter::{scene::*, tests::Harness, Frame};
+use crate::modules::lighter::{scene::*, tests::Harness, Denoiser, Frame};
 use bytemuck::Zeroable;
 use glam::{Mat4, Vec3};
 
