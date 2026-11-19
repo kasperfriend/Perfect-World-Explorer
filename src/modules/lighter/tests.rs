@@ -4709,3 +4709,37 @@ fn lighter_raster_primary_parity() {
         "multisample fell back to a single raster sample"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires Vulkan ray query (lavapipe is sufficient)"]
+fn lighter_raster_ambient_fallback() {
+    let mut h = Harness::new(Mode::Hardware, true);
+    let mut world = Builder::for_mode(Mode::Hardware);
+    let receiver = upright(&mut world, -3., [1.; 4], 0, 0);
+    put(&mut world, receiver);
+    h.ray.install(Ok((world.finish(), Textures::default())));
+    h.ray.settings.bounces = 0;
+    h.ray.settings.lighting = true;
+    h.ray.settings.shadows = false;
+    let mut frame = test_frame(Vec3::ZERO, Vec3::NEG_Z, 19);
+    frame.sun_color = [0.; 4];
+    frame.ambient = [0.35, 0.2, 0.1, 0.];
+    let moving = Builder::for_mode(Mode::Hardware).finish();
+    let full = h.pixel(frame, &moving);
+    assert_radiance("full-primary ambient-only receiver", full, [0.35, 0.2, 0.1]);
+    assert!((full.1 - depth_at(frame, -3. * Vec3::Z)).abs() < 1e-5);
+    h.ray.settings.hybrid_primary = true;
+    h.ray
+        .hardware
+        .as_mut()
+        .unwrap()
+        .simulate_primary_allocation_failure([19; 4]);
+    let fallback = h.pixel(frame, &moving);
+    assert_eq!(
+        full, fallback,
+        "unavailable raster must retain ambient color and depth"
+    );
+    assert!(!h.ray.raster_active());
+    eprintln!("Hybrid unavailable: full-ray ambient RGBA/depth {fallback:?}");
+}
