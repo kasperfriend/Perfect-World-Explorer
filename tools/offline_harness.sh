@@ -1717,8 +1717,30 @@ fn main() {
                     let blocks = s.blocks.len();
                     let grid = s.blocks.first().map(|_| format!("{}x{}", s.rows, s.cols)).unwrap_or_default();
                     let sum = |f: &dyn Fn(&scene::Block) -> usize| s.blocks.iter().map(f).sum::<usize>();
+                    // A precinct file beside a map must describe that map. A
+                    // whole-world precinct copied into an instance folder
+                    // parses perfectly and reports the world's zone count --
+                    // that is exactly how \`a37\` came to be listed with 383
+                    // zones instead of 29. Check every anchored centre against
+                    // the map's own centred extent and report the outliers.
+                    let header = std::fs::read(dir.join(format!("{id}.trn2"))).ok()
+                        .and_then(|b| terrain_block::trn2_header(&b).ok());
                     let precinct = match music::Zones::open(&dir.join("precinct.clt")) {
-                        Ok(z) => format!("{} zones", z.zones.len()),
+                        Ok(z) => {
+                            let outside = match &header {
+                                Some(h) => z.zones.iter()
+                                    .filter(|z| z.center.is_some())
+                                    .filter_map(|z| z.fallback_position())
+                                    .filter(|p| !terrain_block::contains_world_point(h, p[0], p[2]))
+                                    .count(),
+                                None => 0,
+                            };
+                            if outside > 0 {
+                                format!("{} zones, {outside} OUTSIDE the map", z.zones.len())
+                            } else {
+                                format!("{} zones", z.zones.len())
+                            }
+                        }
                         Err(e) => format!("FAILED: {e}"),
                     };
                     println!("| {name} | {id} | {blocks} | {grid} | {} | {} | {} | {} | {} | {} | {} | {} | {precinct} |",

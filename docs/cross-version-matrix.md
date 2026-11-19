@@ -285,8 +285,11 @@ account for, and they are all read: 3 areas, 18 shoreline waves, 3,146 points.
 
 `a37` shows **29 zones**, not 383: 383 is the *world* map's count. The two rows
 agreed at 383 for as long as a37's folder was being read with the world's
-`precinct.clt` copied into it. That is now caught — `instance` prints an
-`outside` column and the number was 240 before the file was corrected.
+`precinct.clt` copied into it. Both modes now catch that — `instance` prints an
+`outside` column, and `matrix-maps` appends `N OUTSIDE the map` to the precinct
+cell when any anchored zone centre falls outside the map's own centred extent.
+With the world's file in a37's folder the row reads
+`383 zones, 240 OUTSIDE the map`.
 
 ### Instance maps (`instance`, 18 November 2026)
 

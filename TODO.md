@@ -55,10 +55,24 @@ item says so and lands as a named gap instead of a guess.
       `Every-effect-2026-11-08.md` keep 2,275 — that is what was measured on that
       build, and rewriting a dated record would be worse than the stale number.
 
-- [ ] **5. Close out: full gate sweep, benchmark the numbers, push, refresh the
+- [x] **5. Close out: full gate sweep, benchmark the numbers, push, refresh the
       PR body.**
-      *Done when:* every mode is green at HEAD, the tree is clean, branch and
-      origin match, and the PR body carries the measured numbers.
+      *Done:* every mode green at HEAD (below), tree clean, branch and origin
+      identical, PR #50 body carries the measured numbers.
+
+      | mode | result |
+      |---|---|
+      | `check` | type-check clean |
+      | `test` | 211 passed |
+      | `player` | 286 passed |
+      | `diagnostics` | 18 passed |
+      | `music` | 27 passed |
+      | `gfx` | 94 passed |
+      | `water` | 20 passed |
+      | `material` | 25 passed |
+      | `bins` | 38/38 |
+      | `instance` | 1 map, 0 failed, a37 29 zones 0 outside |
+      | `matrix-maps` | a37 29 zones, world 383 zones |
 
 ## Notes taken while working
 
