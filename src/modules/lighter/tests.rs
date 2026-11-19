@@ -7,7 +7,9 @@ fn reload_world_button_applies_pending_mode_without_changing_the_live_renderer()
     let ctx = egui::Context::default();
     let mut lighter = Lighter::default();
     lighter.settings.resolution = 61;
-    lighter.pending_mode = Some(Mode::Hardware);
+    lighter.stage_saved_mode(Mode::Hardware);
+    assert_eq!(lighter.settings_for_disk().mode, Mode::Hardware);
+    assert_eq!(lighter.settings_for_disk().resolution, 61);
     let mut draw = |events| {
         let mut result = None;
         let output = ctx.run(
@@ -48,6 +50,7 @@ fn reload_world_button_applies_pending_mode_without_changing_the_live_renderer()
     assert_eq!(next.mode, Mode::Hardware);
     assert_eq!(next.resolution, 61);
     assert_eq!(lighter.settings.mode, Mode::Off);
+    assert_eq!(lighter.settings_for_disk().mode, Mode::Hardware);
 }
 
 #[cfg(any(target_os = "windows", target_os = "linux"))]

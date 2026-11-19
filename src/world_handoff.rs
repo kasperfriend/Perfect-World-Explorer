@@ -24,6 +24,7 @@ const STATUS_ENV: &str = "PWE_WORLD_HANDOFF_STATUS_FILE";
 const FOCUS_ENV: &str = "PWE_WORLD_HANDOFF_FOCUS_FILE";
 const HWND_ENV: &str = "PWE_WORLD_HANDOFF_HWND_FILE";
 const FAILED_PREFIX: &str = "error:";
+const FIRST_FRAME_PREFIX: &str = "first-frame:";
 
 #[cfg(windows)]
 #[link(name = "user32")]
@@ -37,7 +38,37 @@ extern "system" {
 /// Default upper bound for a replacement world to become visible. A driver
 /// stall, a dead child or a missing readiness signal must never leave the old
 /// viewer on an unbounded, non-interactive loading overlay.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+const WORLD_LOAD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+pub(crate) const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Copy)]
+pub(crate) struct Timeouts {
+    pub(crate) load: Duration,
+    pub(crate) first_frame: Duration,
+}
+
+impl Timeouts {
+    pub(crate) fn configured() -> Self {
+        let seconds = |name, default| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|seconds| (1..=7200).contains(seconds))
+                .map(Duration::from_secs)
+                .unwrap_or(default)
+        };
+        Self {
+            load: seconds("PWE_WORLD_HANDOFF_TIMEOUT_SECS", WORLD_LOAD_TIMEOUT),
+            first_frame: seconds("PWE_WORLD_HANDOFF_FIRST_FRAME_SECS", FIRST_FRAME_TIMEOUT),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Deadline {
+    WorldLoad,
+    FirstFrame,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
@@ -62,20 +93,20 @@ pub enum Decision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WatchSnapshot {
+struct WatchSnapshot {
     pub ready: bool,
     pub focused: bool,
     pub hwnd: Option<u64>,
     pub status: Option<String>,
     pub child_exit: Option<String>,
-    pub timed_out: bool,
+    timeout: Option<Deadline>,
 }
 
 /// Decide the next handoff action. An explicit child error, a child that exits
 /// early, and a bounded timeout are all recoverable failures; only a ready file
 /// ends the overlay successfully. The old process activates the replacement
 /// only while it still owns foreground and the child published a real HWND.
-pub fn decide(snapshot: &WatchSnapshot) -> Decision {
+fn decide(snapshot: &WatchSnapshot) -> Decision {
     if let Some(status) = snapshot.status.as_deref() {
         if let Some(reason) = status.strip_prefix(FAILED_PREFIX) {
             return Decision::Fail(reason.trim().to_string());
@@ -94,12 +125,15 @@ pub fn decide(snapshot: &WatchSnapshot) -> Decision {
             "The new world process exited before it was ready ({exit})."
         ));
     }
-    if snapshot.timed_out {
-        return Decision::Fail(
-            "The new world did not become ready within the loading timeout.".into(),
-        );
+    match snapshot.timeout {
+        Some(Deadline::FirstFrame) => {
+            Decision::Fail("The new world timed out waiting for its first frame.".into())
+        }
+        Some(Deadline::WorldLoad) => {
+            Decision::Fail("The new world did not become ready within the loading timeout.".into())
+        }
+        None => Decision::Wait,
     }
-    Decision::Wait
 }
 
 #[derive(Clone, Debug)]
@@ -179,7 +213,12 @@ impl Files {
     /// Watch a replacement process from the old foreground owner. All temporary
     /// files are removed on success, failure and timeout; a stalled or failed
     /// child is killed so no orphan keeps the handoff alive.
-    pub fn watch(self, child: Child, tx: Sender<Message>, timeout: Duration) -> Result<(), String> {
+    pub(crate) fn watch(
+        self,
+        child: Child,
+        tx: Sender<Message>,
+        timeouts: Timeouts,
+    ) -> Result<(), String> {
         // This call is made on the old process's foreground thread, immediately
         // after spawning the child. The child itself does not rely on inheriting
         // this short-lived permission.
@@ -201,6 +240,7 @@ impl Files {
                     .expect("world handoff child lock poisoned");
                 let mut previous_status = String::new();
                 let started = Instant::now();
+                let mut first_frame_started = None::<Instant>;
                 loop {
                     if files.is_cancelled() {
                         let _ = child.kill();
@@ -210,23 +250,37 @@ impl Files {
                         return;
                     }
                     let status = fs::read_to_string(&files.status).ok();
-                    if let Some(status) = status.as_ref() {
-                        if status != &previous_status && !status.starts_with(FAILED_PREFIX) {
-                            previous_status.clone_from(status);
-                            let _ = tx.send(Message::Progress(status.clone()));
+                    if let Some(status) = status.as_deref().filter(|s| !s.starts_with(FAILED_PREFIX)) {
+                        let progress = if let Some(stage) = status.strip_prefix(FIRST_FRAME_PREFIX) {
+                            // Count from entry to the first-frame path, independent
+                            // of whether the driver's compile/poll ever returns.
+                            first_frame_started.get_or_insert_with(Instant::now);
+                            stage
+                        } else {
+                            status
+                        };
+                        if progress != previous_status {
+                            progress.clone_into(&mut previous_status);
+                            let _ = tx.send(Message::Progress(previous_status.clone()));
                         }
                     }
                     let snapshot = WatchSnapshot {
                         ready: files.ready.is_file(),
                         focused: files.focused(),
                         hwnd: files.published_hwnd(),
-                        status: status.clone(),
+                        status,
                         child_exit: match child.try_wait() {
                             Ok(Some(exit)) => Some(exit.to_string()),
                             Ok(None) => None,
                             Err(error) => Some(format!("monitor error: {error}")),
                         },
-                        timed_out: started.elapsed() >= timeout,
+                        timeout: if first_frame_started.is_some_and(|start| start.elapsed() >= timeouts.first_frame) {
+                            Some(Deadline::FirstFrame)
+                        } else if started.elapsed() >= timeouts.load {
+                            Some(Deadline::WorldLoad)
+                        } else {
+                            None
+                        },
                     };
                     match decide(&snapshot) {
                         Decision::Wait => {}
@@ -244,7 +298,7 @@ impl Files {
                             return;
                         }
                         Decision::Fail(mut reason) => {
-                            if snapshot.timed_out && !previous_status.is_empty() {
+                            if snapshot.timeout.is_some() && !previous_status.is_empty() {
                                 reason.push_str(&format!(" Last stage: {previous_status}"));
                             }
                             let _ = child.kill();
@@ -269,17 +323,6 @@ impl Files {
     }
 }
 
-/// Bounded timeout. An environment override lets CI exercise the failure path
-/// without waiting twenty minutes; production has a generous tree-bake budget.
-pub fn timeout() -> Duration {
-    std::env::var("PWE_WORLD_HANDOFF_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|seconds| (1..=7200).contains(seconds))
-        .map(Duration::from_secs)
-        .unwrap_or(DEFAULT_TIMEOUT)
-}
-
 pub fn is_handoff_child() -> bool {
     std::env::var_os(READY_ENV).is_some()
 }
@@ -298,6 +341,12 @@ pub fn publish_progress(message: &str) {
     if let Some(path) = std::env::var_os(STATUS_ENV).map(PathBuf::from) {
         let _ = fs::write(path, message.as_bytes());
     }
+}
+
+/// Start (or report progress within) the first-frame watchdog. The prefix is
+/// stripped by the parent before showing the status to the user.
+pub(crate) fn publish_first_frame_progress(message: &str) {
+    publish_progress(&format!("{FIRST_FRAME_PREFIX}{message}"));
 }
 
 /// Report a child-side load error or caught panic. The parent watcher treats
@@ -361,7 +410,7 @@ mod tests {
             hwnd: Some(0x1234),
             status: None,
             child_exit: None,
-            timed_out: false,
+            timeout: None,
         }
     }
 
@@ -417,8 +466,14 @@ mod tests {
             matches!(decide(&state), Decision::Fail(reason) if reason.contains("exited before"))
         );
         state.child_exit = None;
-        state.timed_out = true;
-        assert!(matches!(decide(&state), Decision::Fail(reason) if reason.contains("timeout")));
+        state.timeout = Some(Deadline::WorldLoad);
+        assert!(
+            matches!(decide(&state), Decision::Fail(reason) if reason.contains("loading timeout"))
+        );
+        state.timeout = Some(Deadline::FirstFrame);
+        assert!(matches!(decide(&state), Decision::Fail(reason) if reason.contains("first frame")));
+        state.ready = true;
+        assert!(matches!(decide(&state), Decision::Ready { .. }));
     }
 
     #[test]
@@ -436,7 +491,14 @@ mod tests {
         let child = Command::new("sleep").arg("30").spawn().unwrap();
         files
             .clone()
-            .watch(child, tx, Duration::from_secs(5))
+            .watch(
+                child,
+                tx,
+                Timeouts {
+                    load: Duration::from_secs(5),
+                    first_frame: Duration::from_secs(4),
+                },
+            )
             .unwrap();
         files.cancel();
         assert_eq!(
@@ -444,6 +506,40 @@ mod tests {
             Ok(Message::Cancelled)
         );
         assert!(!files.focus.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_frame_watchdog_reaps_a_child_that_cannot_poll() {
+        let files = Files::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        fs::write(
+            &files.status,
+            format!("{FIRST_FRAME_PREFIX}Preparing the ray pipeline…"),
+        )
+        .unwrap();
+        files
+            .clone()
+            .watch(
+                child,
+                tx,
+                Timeouts {
+                    load: Duration::from_secs(10),
+                    first_frame: Duration::from_millis(40),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Message::Progress("Preparing the ray pipeline…".into()))
+        );
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(2)), Ok(Message::Failed(reason))
+            if reason.contains("first frame") && reason.contains("Last stage: Preparing the ray pipeline"))
+        );
+        assert!(!files.focus.exists());
+        assert!(!files.status.exists());
     }
 
     #[test]

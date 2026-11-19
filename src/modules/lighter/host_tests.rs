@@ -1323,11 +1323,16 @@ fn lighter_live_world_reload() {
     let root = FixtureRoot::new();
     std::fs::write(
         root.0.join("reload-test"),
-        b"native => hardware rejection => software",
+        b"saved software => native => unsupported hardware => stalled software => software",
     )
     .unwrap();
     super::super::run_viewer(fixture(&root.0), Some(&root.0)).unwrap();
-    for file in ["0.png", "after-failed-reload.png", "reload-software.png"] {
+    for file in [
+        "0.png",
+        "after-failed-reload.png",
+        "after-stalled-reload.png",
+        "reload-software.png",
+    ] {
         assert_world_png(&root.0.join(file), (160, 96));
     }
     let child_pid: u32 = std::fs::read_to_string(root.0.join("restored-present"))

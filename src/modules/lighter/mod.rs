@@ -42,7 +42,7 @@ pub fn supports_hardware(adapter: &wgpu::Adapter) -> bool {
 
 pub fn device_features(adapter: &wgpu::Adapter, startup: Mode) -> wgpu::Features {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
-    if startup != Mode::Off && supports_hardware(adapter) {
+    if startup == Mode::Hardware && supports_hardware(adapter) {
         return vulkan::FEATURES;
     }
     let _ = (adapter, startup);
@@ -587,6 +587,7 @@ pub struct Lighter {
     allocation_sample: Option<(Instant, [u64; 3], u64)>,
     pub(crate) moving_accel: scene::AccelCache,
     pub settings: Settings,
+    saved_mode: Mode,
     pending_mode: Option<Mode>,
     armed: bool,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -619,6 +620,7 @@ impl Default for Lighter {
             allocation_sample: None,
             moving_accel: Default::default(),
             settings: Settings::default(),
+            saved_mode: Mode::Off,
             pending_mode: None,
             armed: false,
             #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -649,12 +651,26 @@ impl Lighter {
                 .then(|| profile::Timings::new(device))
                 .flatten(),
             settings,
+            saved_mode: settings.mode,
             native_backend: adapter.get_info().backend,
             adapter_supports_compute: adapter.get_downlevel_capabilities().flags.contains(
                 wgpu::DownlevelFlags::COMPUTE_SHADERS | wgpu::DownlevelFlags::FRAGMENT_STORAGE,
             ),
             has_hardware_device: !rt.is_empty() && device.features().contains(rt),
             ..Self::default()
+        }
+    }
+
+    /// Booting Native doesn't discard the last committed ray selection.
+    pub(crate) fn stage_saved_mode(&mut self, mode: Mode) {
+        self.saved_mode = mode;
+        self.pending_mode = (mode != self.settings.mode).then_some(mode);
+    }
+
+    fn settings_for_disk(&self) -> Settings {
+        Settings {
+            mode: self.saved_mode,
+            ..self.settings
         }
     }
 
@@ -842,6 +858,11 @@ impl Lighter {
         w: u32,
         h: u32,
     ) -> Result<bool, String> {
+        if self.settings.mode == Mode::Software && self.software.is_none() {
+            // Start the cold compute pipeline in the same preflight as Hardware,
+            // before acquiring a swapchain image or starting scene submission.
+            self.software = Some(checked_pipeline(device, || Software::new(device))?);
+        }
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         if self.settings.mode == Mode::Hardware && self.unavailable().is_none() {
             let (rw, rh) = self.ray_extent(device, w, h)?;
@@ -974,9 +995,6 @@ impl Lighter {
         let timed = self.timings.as_mut().filter(|t| t.due());
         let image = match settings.mode {
             Mode::Software => {
-                if self.software.is_none() {
-                    self.software = Some(checked_pipeline(device, || Software::new(device))?);
-                }
                 if let Some(t) = &timed {
                     t.stamp(encoder, 0);
                 }
@@ -1121,7 +1139,7 @@ impl Lighter {
             .on_hover_text("Use authored reflectance rather than baked building vertex light or terrain/grass lightmaps. Ray lighting replaces the bake; the two are not multiplied together.");
         if self.settings != old {
             self.reset_history();
-            self.persistence_error = self.settings.save().err();
+            self.persistence_error = self.settings_for_disk().save().err();
             self.frame_error = None;
             self.status = None;
         }

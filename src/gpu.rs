@@ -4952,12 +4952,26 @@ fn selected_map_label(catalog: &crate::world_catalog::Catalog, id: &str) -> Stri
 /// Keep the startup stage in the always-on session log, even if the driver
 /// never returns from work in that stage. Windows' loader has its own pump.
 fn startup_progress(message: &str) {
+    report_startup(message, false);
+}
+
+fn first_frame_progress(message: &str) {
+    report_startup(message, true);
+}
+
+fn report_startup(message: &str, first_frame: bool) {
     crate::diagnostics::session(format!("Viewer startup: {message}"));
     eprintln!("Viewer startup: {message}");
-    #[cfg(windows)]
-    crate::windows_setup::loading_progress(message.into());
-    #[cfg(not(windows))]
-    crate::world_handoff::publish_progress(message);
+    if crate::world_handoff::is_handoff_child() {
+        if first_frame {
+            crate::world_handoff::publish_first_frame_progress(message);
+        } else {
+            crate::world_handoff::publish_progress(message);
+        }
+    } else {
+        #[cfg(windows)]
+        crate::windows_setup::loading_progress(message.into());
+    }
 }
 
 /// Steps the old process must take as soon as a replacement world is ready.
@@ -5050,10 +5064,19 @@ fn spawn_world_handoff(
         }
     };
     let (tx, rx) = std::sync::mpsc::channel();
-    if let Err(error) = files
-        .clone()
-        .watch(child, tx, crate::world_handoff::timeout())
+    let timeouts = crate::world_handoff::Timeouts::configured();
+    #[cfg(test)]
+    let timeouts = if smoke_dir.is_some_and(|dir| dir.join("stall-ray-reload").exists())
+        && snapshot.is_some_and(|s| s.lighter.mode == LighterMode::Software)
     {
+        crate::world_handoff::Timeouts {
+            first_frame: Duration::from_secs(2),
+            ..timeouts
+        }
+    } else {
+        timeouts
+    };
+    if let Err(error) = files.clone().watch(child, tx, timeouts) {
         files.cleanup();
         return Err(error);
     }
@@ -5235,7 +5258,30 @@ async fn adapter(
     Ok((a, d, q))
 }
 const GPU_RETRY_DELAY: Duration = Duration::from_millis(2);
-const FIRST_PRESENT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Opening a world must not depend on optional ray pipeline compilation. Only
+/// watched reload/recovery children may start directly in a ray mode.
+fn initial_viewer_lighter(saved: LighterSettings, restored: bool) -> LighterSettings {
+    if restored {
+        saved
+    } else {
+        LighterSettings {
+            mode: LighterMode::Off,
+            ..saved
+        }
+    }
+}
+
+/// Software RT does not need RT cores. Prefer Vulkan for its interactive
+/// reload on Windows to avoid optimizing the full compute shader in FXC.
+/// Native and explicit capture backend selection remain unchanged.
+fn viewer_backends(mode: LighterMode) -> wgpu::Backends {
+    if cfg!(windows) && mode == LighterMode::Software {
+        wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::VULKAN)
+    } else {
+        instance_backends(mode)
+    }
+}
 
 pub(crate) fn same_world_handoff() -> Option<&'static str> {
     recovery::is_child().then(|| recovery::kind().label())
@@ -5316,7 +5362,7 @@ fn run_viewer(
             .build(&event_loop)
             .map_err(|e| e.to_string())?,
     );
-    let lighter_settings = if let Some(snapshot) = &restoring {
+    let saved_lighter = if let Some(snapshot) = &restoring {
         snapshot.lighter
     } else if crate::modules::lighter_installed() {
         LighterSettings::load()
@@ -5324,13 +5370,9 @@ fn run_viewer(
         LighterSettings::default()
     };
     #[cfg(test)]
-    let lighter_settings = if smoke_dir.is_some() && restoring.is_none() {
+    let saved_lighter = if smoke_dir.is_some() && restoring.is_none() {
         LighterSettings {
-            mode: if smoke_reload {
-                LighterMode::Off
-            } else {
-                LighterMode::Software
-            },
+            mode: LighterMode::Software,
             lighting: false,
             shadows: false,
             denoiser: false,
@@ -5338,8 +5380,20 @@ fn run_viewer(
             ..LighterSettings::default()
         }
     } else {
-        lighter_settings
+        saved_lighter
     };
+    let restore_renderer = restoring.is_some();
+    // The resize/device-loss fixture explicitly exercises a ray-first child.
+    // The reload fixture starts with the same saved mode, but via normal boot.
+    #[cfg(test)]
+    let restore_renderer = restore_renderer || smoke_dir.is_some() && !smoke_reload;
+    let lighter_settings = initial_viewer_lighter(saved_lighter, restore_renderer);
+    if lighter_settings.mode != saved_lighter.mode {
+        crate::diagnostics::session(format!(
+            "Lighter: kept {} as a saved choice; opening Native before any ray reload",
+            saved_lighter.mode.label()
+        ));
+    }
     let try_surface = |instance: &wgpu::Instance| {
         let surface = instance
             .create_surface(window.clone())
@@ -5352,13 +5406,23 @@ fn run_viewer(
         current_map.id,
         lighter_settings.mode.label()
     ));
-    let mut instance = make_instance(lighter_settings.mode);
+    let mut instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: viewer_backends(lighter_settings.mode),
+        ..Default::default()
+    });
     let (mut surface, (adapter, device, queue)) = match try_surface(&instance) {
         Ok(startup) => startup,
         Err(error) if std::env::var_os("WGPU_BACKEND").is_none() => {
-            eprintln!("Perfect World Explorer: preferred adapter unavailable ({error}); checking all backends");
+            let fallback = if cfg!(windows) && lighter_settings.mode == LighterMode::Software {
+                wgpu::Backends::DX12
+            } else {
+                wgpu::Backends::all()
+            };
+            startup_progress(&format!(
+                "Preferred adapter unavailable ({error}); trying {fallback:?}…"
+            ));
             instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
+                backends: fallback,
                 ..Default::default()
             });
             try_surface(&instance)?
@@ -5464,7 +5528,18 @@ fn run_viewer(
     // Nothing is uploaded yet, so the first build always materialises the atlas.
     // The whole-world preload has not started either, so the local scenery is
     // part of this first mesh (`skip_local_scenery: false`).
-    let lighter = Lighter::new(lighter_settings, &adapter, &device);
+    let mut lighter = Lighter::new(lighter_settings, &adapter, &device);
+    let saved_mode = if saved_lighter.mode == LighterMode::Off
+        && restoring
+            .as_ref()
+            .is_some_and(|s| s.kind == recovery::RestoreKind::DeviceRecovery)
+        && crate::modules::lighter_installed()
+    {
+        LighterSettings::load().mode
+    } else {
+        saved_lighter.mode
+    };
+    lighter.stage_saved_mode(saved_mode);
     let mut ray_scenery = lighter.armed().then(lighter_host::SceneryStream::default);
     let m = build(
         &mut t,
@@ -5881,6 +5956,8 @@ fn run_viewer(
     let mut surface_needs_config = true;
     let mut first_composition: Option<(Instant, LighterMode)> = None;
     let mut viewer_shown = false;
+    let mut first_ray_preflight = false;
+    let mut first_draw_started = false;
     let mut run_error = None;
     let mut display_extent = (config.width, config.height);
     let mut frame_capture = readback::ViewerCapture::default();
@@ -5890,7 +5967,10 @@ fn run_viewer(
     let smoke_deadline = Instant::now() + Duration::from_secs(185);
     let mut region_tick_ms = renderer.started.elapsed().as_millis() as u64;
     let mut last_minimap_key: Option<MinimapKey> = None;
-    startup_progress("Rendering the first world frame (including any cold shader compilation)…");
+    first_frame_progress(&format!(
+        "Preparing the first world frame — {}…",
+        lighter_settings.mode.label()
+    ));
     event_loop
         .run(|event, target| {
             // Hidden HWNDs need not receive WM_PAINT. Drive startup from a
@@ -6030,7 +6110,7 @@ fn run_viewer(
                     if gpu_loss.pending() { return; }
                     frame_capture.collect();
                     if let Some((submitted, drawn_mode)) = first_composition {
-                        if submitted.elapsed() >= FIRST_PRESENT_TIMEOUT {
+                        if submitted.elapsed() >= crate::world_handoff::FIRST_FRAME_TIMEOUT {
                             run_error = Some("Timed out waiting to present the first world frame. See the last Viewer startup stage in session.log.".into());
                             target.set_control_flow(winit::event_loop::ControlFlow::Poll);
                             target.exit();
@@ -6057,7 +6137,7 @@ fn run_viewer(
                                 if smoke_dir.is_some() {
                                     assert_ne!(window.is_visible(), Some(true), "viewer was exposed before its first frame");
                                 }
-                                startup_progress("First frame finished on the GPU; opening the swapchain…");
+                                first_frame_progress("First frame finished on the GPU; opening the swapchain…");
                                 window.set_visible(true);
                                 viewer_shown = true;
                             }
@@ -6139,6 +6219,7 @@ fn run_viewer(
                         if smoke_reload && restoring.is_none() && presented_once {
                             if smoke_frames == 1 && image::open(dir.join("0.png")).is_ok() {
                                 assert_eq!(renderer.lighter.settings.mode, LighterMode::Off);
+                                assert!(!renderer.lighter.armed(), "normal opening compiled the saved ray renderer");
                                 camera.yaw = 0.1;
                                 settings.time_of_day = 7.5;
                                 camera.time_of_day = settings.time_of_day;
@@ -6158,8 +6239,23 @@ fn run_viewer(
                                 smoke_frames = 3;
                             }
                             if smoke_frames == 3 && image::open(dir.join("after-failed-reload.png")).is_ok() {
+                                std::fs::write(dir.join("stall-ray-reload"), []).unwrap();
                                 reload_requested = Some(LighterSettings { mode: LighterMode::Software, resolution: 61, ..renderer.lighter.settings });
                                 smoke_frames = 4;
+                                return;
+                            }
+                            if smoke_frames == 4 && !world_loading_active {
+                                let reason = world_change_error.as_deref().expect("blocked ray reload was not timed out");
+                                assert!(reason.contains("timed out waiting for its first frame") && reason.contains("ray pipeline"), "{reason}");
+                                assert_eq!(renderer.lighter.settings.mode, LighterMode::Off);
+                                assert!(!dir.join("restored-present").exists());
+                                std::fs::remove_file(dir.join("stall-ray-reload")).unwrap();
+                                frame_capture.requested = Some(dir.join("after-stalled-reload.png"));
+                                smoke_frames = 5;
+                            }
+                            if smoke_frames == 5 && image::open(dir.join("after-stalled-reload.png")).is_ok() {
+                                reload_requested = Some(LighterSettings { mode: LighterMode::Software, resolution: 61, ..renderer.lighter.settings });
+                                smoke_frames = 6;
                                 return;
                             }
                         }
@@ -6268,6 +6364,20 @@ fn run_viewer(
                     if gpu_loss.pending() { return; }
                     let rt_extent = (config.width.min(max_texture_dimension), config.height.min(max_texture_dimension));
                     if renderer.renders_rays() {
+                        if !presented_once && !first_ray_preflight {
+                            first_ray_preflight = true;
+                            first_frame_progress(&format!("Preparing Lighter ray pipeline and buffers — {}…", renderer.lighter.settings.mode.label()));
+                            #[cfg(test)]
+                            if smoke_dir.is_some_and(|dir| dir.join("stall-ray-reload").exists())
+                                && restoring.is_some()
+                                && renderer.lighter.settings.mode == LighterMode::Software
+                            {
+                                // Simulate a synchronous driver call. Only the
+                                // parent watcher can time this out; no events run here.
+                                std::thread::sleep(Duration::from_secs(90));
+                                panic!("the parent should have killed the stalled reload");
+                            }
+                        }
                         match renderer.lighter.prepare_frame(&renderer.device, rt_extent.0, rt_extent.1) {
                             Ok(true) => {}
                             Ok(false) => {
@@ -6940,7 +7050,7 @@ fn run_viewer(
                     // ray-enabled local mesh is still on the streaming worker.
                     // Keep the resident Native fallback available thereafter.
                     let keep_world_pages = renderer.world_done && renderer.local_scenery_skipped;
-                    let want_world=settings.whole_world && (!wants_rays || keep_world_pages)
+                    let want_world=presented_once && settings.whole_world && (!wants_rays || keep_world_pages)
                         && !settings.detail.terrain_cutoff && !renderer.detail.terrain_cutoff;
                     if want_world != world_enabled {
                         world_enabled=want_world;
@@ -7139,7 +7249,8 @@ fn run_viewer(
                         std::thread::spawn(move || {let _=tx.send(crate::navigation::original_map_for_map(&root,&zone));});
                         original_map_rx=Some(rx);
                     }
-                    if settings.minimap_style==MapStyle::Original && !original_minimap_requested {
+                    let show_minimap = presented_once && settings.show_minimap;
+                    if presented_once && settings.minimap_style==MapStyle::Original && !original_minimap_requested {
                         original_minimap_requested=true;
                         let root=whole_element.clone();let zone=map_zone.clone();let (tx,rx)=std::sync::mpsc::channel();
                         std::thread::spawn(move || {let _=tx.send(crate::navigation::original_minimap_for_map(&root,&zone));});
@@ -7295,6 +7406,10 @@ fn run_viewer(
                                 .or_else(|| xess_upscaler.as_ref().map(|xess| xess.jitter()))
                                 .or_else(|| dlss_upscaler.as_ref().map(|dlss| dlss.jitter()))
                                 .unwrap_or((0.0, 0.0));
+                            if !presented_once && !first_draw_started {
+                                first_draw_started = true;
+                                first_frame_progress(if renderer.renders_rays() { "Drawing the first ray-traced world frame…" } else { "Drawing the first Native world frame…" });
+                            }
                             let world_ready = renderer.render(
                                 &world_view,
                                 &world_raw_view,
@@ -7325,6 +7440,9 @@ fn run_viewer(
                                 if let Some(session) = latency.as_mut() { session.render_submit_end(); }
                                 gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
                                 return;
+                            }
+                            if !presented_once {
+                                first_frame_progress("Compositing the first world frame and interface…");
                             }
                             #[cfg(test)]
                             if let Some(dir) = smoke_dir {
@@ -7506,7 +7624,7 @@ fn run_viewer(
                             // original style draws client artwork instead, so the
                             // overhead pass is skipped rather than rendered and
                             // hidden.
-                            if settings.show_minimap && settings.minimap_style==MapStyle::Realistic {
+                            if show_minimap && settings.minimap_style==MapStyle::Realistic {
                               let minimap_key = MinimapKey::new(
                                   camera.pos.x,
                                   camera.pos.z,
@@ -7694,7 +7812,7 @@ fn run_viewer(
                                 || fg_failed
                                 || xess_fg_failed
                                 || dlss_fg_failed;
-                            if menu_page.is_open() || renderer.lighter.error().is_some() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
+                            if menu_page.is_open() || renderer.lighter.error().is_some() || show_minimap || renderer.modules.overlay_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
                                 let input=egui_state.take_egui_input(&window);
                                 let output=egui_ctx.run(input,|ctx| {
                                     if world_loading_active {
@@ -7914,7 +8032,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                             ui.separator();ui.horizontal_wrapped(|ui|{ui.checkbox(&mut map_click_teleport,"Click to teleport");marked_slider(ui,egui::Slider::new(&mut map_zoom,1.0..=4.0),"Zoom",1.,1.,4.,false,true);ui.label(egui::RichText::new(format!("{} style — change in Settings ▸ Interface",settings.world_map_style.label())).small().weak());});
                                         });
                                     }
-                                    if settings.show_minimap {egui::Area::new(egui::Id::new("minimap-hud")).anchor(egui::Align2::RIGHT_TOP,egui::vec2(-16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.).rounding(match settings.minimap_shape { MinimapShape::Circular => 256.*0.5+5., MinimapShape::Square => 0.0 }).show(ui,|ui|{
+                                    if show_minimap {egui::Area::new(egui::Id::new("minimap-hud")).anchor(egui::Align2::RIGHT_TOP,egui::vec2(-16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.).rounding(match settings.minimap_shape { MinimapShape::Circular => 256.*0.5+5., MinimapShape::Square => 0.0 }).show(ui,|ui|{
                                         // Original: crop the client's own minimap around the camera.
                                         // The crop keeps a fixed scale and slides inside the image at the
                                         // world edge, so the artwork never stretches.
@@ -8062,7 +8180,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 } else {
                                     let drawn_mode = if renderer.renders_rays() { renderer.lighter.settings.mode } else { LighterMode::Off };
                                     first_composition = Some((Instant::now(), drawn_mode));
-                                    startup_progress("First frame submitted; waiting for GPU completion…");
+                                    first_frame_progress("First frame submitted; waiting for GPU completion…");
                                     return;
                                 }
                             } else if let Some(gamma) = display_gamma.as_ref() {

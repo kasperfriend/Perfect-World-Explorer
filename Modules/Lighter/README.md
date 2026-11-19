@@ -8,17 +8,21 @@ ray-traced scene and its reverse-Z depth.
 
 ## Use it
 
-1. Open **Escape → Modules → Lighter**, choose **World renderer**, and click
-   **Reload World**. Explorer opens the same map at your current camera and
-   time with the chosen renderer. The old world stays open with progress and
-   **Cancel Reload** until the replacement presents its first usable frame.
-   A failed or cancelled reload keeps the old world and its saved renderer.
+1. Explorer starts with **Native** so a saved ray setting cannot hold up the
+   first window. Your saved choice is still selected in **Escape → Modules →
+   Lighter**. Choose **World renderer** and click **Reload World** to apply it
+   to the same map, camera and time. The old world stays open with progress
+   and **Cancel Reload**. If the replacement does not present within two
+   minutes of starting its first-frame work, or if it fails or is cancelled,
+   Explorer keeps the current world and does not overwrite the saved mode.
 2. **Software RT** uses a stackless BVH in a GPU compute shader. It does not
    require RT cores. **Hardware RT** requires a physical Vulkan 1.2+ GPU and a
    driver exposing acceleration structures and `VK_KHR_ray_query`. It builds
    BLAS/TLAS and dispatches native ray queries on the same device as the viewer.
-   On Windows, reloading with Hardware selected opens a Vulkan device instead
-   of the default D3D12 device.
+   On Windows, interactive Software RT also tries Vulkan first to avoid the
+   legacy D3D12 shader compiler; if it cannot open a Vulkan adapter/device it
+   tries D3D12. Native still prefers D3D12. An explicit `WGPU_BACKEND` overrides
+   the default API choice.
 3. Adjust ray resolution, samples per pixel and bounces. At zero bounces you
    still get camera rays, local lighting and optional shadow rays. Water
    transmission, glossy reflections and indirect lighting require at least
@@ -27,8 +31,8 @@ ray-traced scene and its reverse-Z depth.
    indirect light. The **Edge-aware denoiser**, **Progressive sampling while
    still** and **Soft sun shadows** are on by default and can be toggled
    independently. Leave the camera still to accumulate lighting samples.
-4. Select **Off** and reload to use the Native world renderer. On normal
-   startup and in a running world, an unavailable ray backend or an unfittable
+4. Select **Off** and reload to leave Lighter off and save Native as the
+   preference. In a running ray world, an unavailable backend or an unfittable
    scene falls back to Native with the reason in the HUD and Lighter menu. It
    neither rewrites your selected mode nor switches to the other ray backend.
    A healthy streamed scene or a changed ray setting can retry it. An explicit
@@ -38,11 +42,11 @@ ray-traced scene and its reverse-Z depth.
 For a source-tree build, set `PW_MODULES_DIR` to the folder containing the
 installed manifests (the repository's `Modules` directory). Settings live in
 `PerfectWorldViewer/lighter.ini` under `%LOCALAPPDATA%`, `$XDG_CONFIG_HOME`, or
-`~/.config`. If the Vulkan selection cannot open a window on your system, set
-`mode=off` in that file to recover the original backend. During Windows startup
-use **Cancel startup** to quit a stalled load. If it stalls, check the last
-`Viewer startup:` line in `pwe-logs/session.log` (or your configured log folder)
-for the adapter, renderer and last reached stage.
+`~/.config`. During Windows startup use **Cancel startup** to quit a stalled
+load. The last few `Viewer startup:` lines in `pwe-logs/session.log` (or your
+configured log folder) name the renderer, graphics device and last reached
+stage. First-frame pipeline preparation, drawing, interface composition,
+GPU completion and swapchain opening are logged separately.
 
 ## What is traced
 

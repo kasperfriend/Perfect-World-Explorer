@@ -23,13 +23,22 @@ does not take this path.
 **Reload World** uses the same snapshot and watched handoff without marking the
 old device lost. The Lighter menu stages renderer changes until Reload World
 is pressed. The old world continues drawing with its last active renderer and
-can cancel a stalled replacement. The saved renderer is updated on a successful
-same-map handoff, not when choosing a dropdown entry or on child launch.
+can cancel a stalled replacement. A separate parent-side deadline begins when
+first-frame work starts, so a blocking compile call cannot defeat the timeout
+by preventing the child from polling its event loop. The old world is kept on
+failure or timeout. The saved renderer is updated on a successful same-map
+handoff, not when choosing a dropdown entry or on child launch.
+
+An ordinary world open uses Native first, even with a ray renderer saved. The
+saved renderer remains selected for an explicit **Reload World**; no ray work
+starts automatically. This does not affect explicit headless captures or the
+mode restored by a watched device-loss replacement.
 
 At startup, Explorer builds and submits the first world and menu offscreen,
 then polls for GPU completion before opening the standard swapchain. The first
 swapchain pass copies that finished composition (sRGB or UNORM), and only then
-are audio and the optional temporal/FG paths allowed to start. On Windows the
+are audio, minimap drawing, whole-world preload and the optional temporal/FG
+paths allowed to start. On Windows the
 separate loading UI remains available up to first present. This does not make
 all synchronous calls inside a graphics driver interruptible; the loading UI
 can still quit, or the old viewer can cancel a replacement.
