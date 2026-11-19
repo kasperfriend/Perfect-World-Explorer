@@ -1842,10 +1842,19 @@ message used to be the two words "overlaps footer"; it now reports where the
 trailer says its table is, how many bytes precede that point, which piece it is,
 the declared end, the base and the count.
 
-*Open*: the 1.5.2 `litmodels` is 2,147,483,392 + 711,705,020 bytes in its
-`.pck`/`.pkx`, and its trailer is rejected. The next run's message carries the
-numbers needed to see whether the table sits in the other piece, whether the
-count is wrong, or whether this revision's entry records are a different size.
+*Cause*: 2,147,483,392 + 711,705,020 bytes in the `.pck`/`.pkx` is a package
+longer than four gigabytes, and this revision's table word in the trailer is
+only 32 bits. The reader treated it as a position in the whole package and then
+compared it against the length of the *piece* holding the footer, which no
+32-bit value can survive: 2,859,188,412 was checked against 711,704,732 and
+refused. The word can only be meaningful when it counts from the start of the
+piece that holds the footer, so the table is now looked for both ways -- package
+absolute first, which is what every entry offset in this revision means and the
+only reading that works below four gigabytes, then piece local -- and the first
+well-formed table wins. A test builds that exact shape from a sparse `.pkx`.
+
+The message still reports every number when neither reading parses, so a run
+that fails again says which of the two was tried and how each one failed.
 
 **1.8.4's `oversized ECWLD string` is a static-model record that grew a scale.**
 The reported number was `1065353216` = `0x3F800000` — the float `1.0` read as a

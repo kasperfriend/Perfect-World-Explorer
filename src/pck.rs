@@ -438,28 +438,62 @@ fn read_directory(
     }
     // The client unmasks the entry offset in place (`dwEntryOffset ^=
     // AFPCK_MASKDWORD`) and seeks there; the trailer follows the table, so a
-    // table that starts at or past it is corrupt.
+    // table that starts at or past it is not in this package.
+    //
+    // The word is 32 bits, so it cannot address a package longer than 4 GiB.
+    // A split package therefore has to mean one of two things by it, and the
+    // shipped clients differ:
+    //
+    //   * package-absolute, as every entry's `dwOffset` in this revision is:
+    //     the table's position counted from the start of the first file. This
+    //     is the only reading that works for a package under 4 GiB, so it is
+    //     tried first.
+    //   * piece-local, counted from the start of the file holding the trailer.
+    //     A package of 1.5.2's `litmodels` is 2,859,188,412 bytes, and its
+    //     `.pkx` holds the last 711,705,020 of them, so a package-absolute
+    //     32-bit word cannot name its table at all. That client must be writing
+    //     the offset from the start of the piece.
+    //
+    // Reading only the package-absolute way rejected that archive as "entry
+    // table overlaps footer" -- a 32-bit position was compared against the
+    // piece's length -- which is why 1.5.2 resolved none of its 22,981 scenery
+    // models. Both readings are attempted, in that order, and the first one
+    // that yields a well-formed table wins.
     let pos = (u32le(&header, 8)? ^ MASK) as u64;
     let table_end = part_end - (rev.header + 8) as u64;
-    if pos >= table_end {
-        // The masked offset in the trailer's header is either a position inside
-        // this file or the client's "no table here" sentinel. A package split
-        // over several files carries one trailer, in its last file, so the size
-        // word and the offset word are the only evidence of what went wrong;
-        // "overlaps footer" alone cannot be acted on.
-        return Err(format!(
-            "entry table overlaps footer: the trailer declares its table at {pos} but only \
-             {table_end} bytes of this {} (len {}) precede it (declared end {end}, base {base}, \
-             count {count}, flags {:#010x})",
-            if base == 0 { "file" } else { "piece" },
-            part_end,
-            u32le(&header, rev.flags_at).unwrap_or(0)
-        ));
+    let mut tried = Vec::new();
+    for (label, local) in [
+        ("package-absolute", pos.checked_sub(base)),
+        ("piece-local", Some(pos)),
+    ] {
+        let Some(local) = local.filter(|local| *local <= table_end) else {
+            continue;
+        };
+        // The entry table may also straddle the split, so it is walked through
+        // the two-part reader rather than one file.
+        let table = read_package_range(files, layout, base + local, table_end - local)?;
+        match read_entry_table(&table, count, &rev, end, layout.total()) {
+            Ok(entries) => return Ok(entries),
+            Err(e) => tried.push(format!("{label} {local}: {e}")),
+        }
     }
-    // The entry table may sit either side of the split, so it is walked through
-    // the two-part reader rather than one file.
-    let table = read_package_range(files, layout, base + pos, table_end - pos)?;
-    read_entry_table(&table, count, &rev, end, layout.total())
+    // Nothing parsed. The masked offset in the trailer's header is then either
+    // a position past the end or the client's "no table here" sentinel, and
+    // "overlaps footer" alone cannot say which; the size word and the offset
+    // word are the only evidence there is.
+    Err(format!(
+        "entry table overlaps footer: the trailer declares its table at {pos} but only \
+         {table_end} bytes of this {} (len {}) precede the footer (declared end {end}, base \
+         {base}, count {count}, flags {:#010x}); {}",
+        if base == 0 { "file" } else { "piece" },
+        part_end,
+        u32le(&header, rev.flags_at).unwrap_or(0),
+        if tried.is_empty() {
+            "neither reading fits inside the footer".to_string()
+        } else {
+            tried.join("; ")
+        }
+    ))
 }
 
 /// A whole package, which is one file unless it was split at
@@ -1790,6 +1824,93 @@ mod tests {
             data, straddler,
             "the payload was not reassembled across the split"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 1.5.2's `litmodels` shape: the package is longer than a 32-bit offset
+    /// can address from its own start, so the trailer's table word has to be
+    /// read from the start of the piece that holds it.
+    ///
+    /// The `.pck` holds the first `MAX_FILE_PACKAGE` bytes and has no trailer;
+    /// everything after the split is in the `.pkx`, including the table and the
+    /// footer. A package-absolute reading of the word would name a position
+    /// past four gigabytes, so only the piece-local reading can work -- and
+    /// reading the word as absolute is exactly what rejected the retail archive
+    /// with "entry table overlaps footer".
+    ///
+    /// The `.pkx` is made sparse: `set_len` reserves the length without writing
+    /// 711 MB, so this costs nothing on disk and still exercises the real
+    /// offsets.
+    #[test]
+    fn a_table_word_past_four_gigabytes_reads_from_its_own_piece() {
+        use std::io::{Seek, SeekFrom};
+        let dir = std::env::temp_dir().join(format!(
+            "pw-pck-split-retail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pck = dir.join("litmodels.pck");
+        let pkx = dir.join("litmodels.pkx");
+        let split = MAX_FILE_PACKAGE;
+        let tail_len: u64 = 64 * 1024 * 1024;
+        // A package offset at or past the split addresses the `.pkx`: package
+        // position `split` is that file's first byte.
+        let payload_at = split;
+        let payload = b"retail scenery model bytes";
+
+        let mut first = std::fs::File::create(&pck).unwrap();
+        first.write_all(&0x4dca23efu32.to_le_bytes()).unwrap();
+        let declared = split + tail_len;
+        first.write_all(&(declared as u32).to_le_bytes()).unwrap();
+        first.write_all(&0x56a089b7u32.to_le_bytes()).unwrap();
+        first.set_len(split).unwrap();
+        drop(first);
+
+        // Everything after the split, sparse except where it matters.
+        let mut tail = std::fs::File::create(&pkx).unwrap();
+        let table_at = tail_len - 8 - 288 - 280 - 8;
+        let mut record = vec![0u8; 288];
+        let name = b"litmodels/world/44/litmodel_1125.bmd";
+        record[..name.len()].copy_from_slice(name);
+        record[264..272].copy_from_slice(&payload_at.to_le_bytes());
+        record[272..276].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        record[276..280].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        let masked = (record.len() as u32) ^ MASK;
+        let mut at_table = Vec::new();
+        at_table.extend_from_slice(&masked.to_le_bytes());
+        at_table.extend_from_slice(&(masked ^ CHECK).to_le_bytes());
+        at_table.extend_from_slice(&record);
+        // The word is the table's position in *this piece*, not in the package.
+        let word = (table_at as u32) ^ MASK;
+        let mut header = vec![0u8; 280];
+        header[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
+        header[4..8].copy_from_slice(&0x0002_0003u32.to_le_bytes());
+        header[8..12].copy_from_slice(&word.to_le_bytes());
+        let tag = b"Angelica File Package, Perfect World Co. Ltd.";
+        header[20..20 + tag.len()].copy_from_slice(tag);
+        header[272..276].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
+        // The payload lives in this piece, addressed by a package offset that
+        // begins where the split does.
+        tail.write_all(payload).unwrap();
+        tail.seek(SeekFrom::Start(table_at)).unwrap();
+        tail.write_all(&at_table).unwrap();
+        tail.write_all(&header).unwrap();
+        tail.write_all(&1u32.to_le_bytes()).unwrap();
+        tail.write_all(&0x0002_0003u32.to_le_bytes()).unwrap();
+        tail.set_len(tail_len).unwrap();
+        drop(tail);
+
+        let mut package = Package::open(&pck).unwrap();
+        assert!(package.is_split());
+        assert_eq!(package.len(), declared, "the two pieces add up");
+        let entries = package.directory().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "litmodels/world/44/litmodel_1125.bmd");
+        assert_eq!(package.read(&entries[0]).unwrap(), payload);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
