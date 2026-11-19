@@ -24,6 +24,15 @@ fn ecbsd_path(dir: &Path) -> PathBuf {
     }
 }
 
+/// The EC-BSD manifest a map folder holds, for callers outside this module.
+///
+/// Diagnostic binaries need the same `<map id>.ecbsd`-then-`world.ecbsd`
+/// resolution the loader uses; keeping one resolver means a survey cannot
+/// disagree with the viewer about which file a map carries.
+pub fn ecbsd_path_for_survey(dir: &Path) -> PathBuf {
+    ecbsd_path(dir)
+}
+
 /// Authored shoreline control points and per-vertex day/night ARGB colors.
 /// Version 0x10003000 serialization is read by client routine 0x782680.
 #[derive(Debug, Clone)]
@@ -195,21 +204,45 @@ impl WaterArea {
         export_id: u32,
         version: u32,
     ) -> Result<(Self, usize), String> {
-        let v3 = version == 0x10003000;
+        // Only a revision whose layout was recovered can be walked; the caller
+        // reports anything else by version instead of guessing at the mask
+        // offset and silently reading a shifted grid.
+        let v3 = match WaterLayout::of(version) {
+            WaterLayout::V3 => true,
+            WaterLayout::V2 => false,
+            WaterLayout::Unknown(other) => {
+                return Err(format!(
+                    "A3DWaterArea version {other:#x} has no recovered layout \
+                     (this build reads 0x10002000 and 0x10003000)"
+                ))
+            }
+        };
         let color = u(b, fb)?;
         let height = f(b, fb + 4)?;
         let columns = u(b, fb + 12)? as usize;
         let rows = u(b, fb + 16)? as usize;
         let grid_size = f(b, fb + 20)?;
         let center = [f(b, fb + 24)?, f(b, fb + 28)?, f(b, fb + 32)?];
+        // Bounds measured across every water patch staged for 1.5.2, 1.4.4 and
+        // 1.8.4 (a07, a37 and the 1.8.4 world): at most 50 columns, 32 rows and
+        // a cell size of 32 metres. The limits below leave headroom over each
+        // and exist only to stop a damaged record reserving memory; a record
+        // rejected here costs its own area, never the map.
+        const MAX_WATER_COLUMNS: usize = 4096;
+        const MAX_WATER_ROWS: usize = 4096;
+        const MAX_WATER_CELL_SIZE: f32 = 4096.;
         if columns == 0
             || rows == 0
-            || columns > 4096
-            || rows > 4096
+            || columns > MAX_WATER_COLUMNS
+            || rows > MAX_WATER_ROWS
             || grid_size <= 0.
-            || grid_size > 10000.
+            || grid_size > MAX_WATER_CELL_SIZE
         {
-            return Err("invalid water grid".into());
+            return Err(format!(
+                "invalid water grid: {columns}x{rows} cells of {grid_size} m \
+                 (limits {MAX_WATER_COLUMNS} x {MAX_WATER_ROWS} cells, \
+                 {MAX_WATER_CELL_SIZE} m)"
+            ));
         }
         // The older v2 area has no simple-water flag byte: its mask begins
         // immediately after the centre vector, and v3 inserts the flag first.
@@ -222,7 +255,11 @@ impl WaterArea {
             .to_vec();
         let wave_start = start.checked_add(n).ok_or("wave offset overflow")?;
         // The walk over `count` areas continues past the shoreline arrays, so
-        // the reader reports where it stopped even when it gave up early.
+        // the reader reports where it stopped even when it gave up early. A
+        // wave that cannot be read costs that wave only: the grid above is the
+        // water surface, and losing it because one shoreline record named a
+        // newer version is the "water is lost" failure this reader exists to
+        // avoid.
         let (shore_waves, next) = match parse_shore_waves(b, wave_start) {
             Ok((waves, next)) => (waves, next),
             Err(error) => {
@@ -230,7 +267,13 @@ impl WaterArea {
                     SceneWater,
                     "water {export_id}: shoreline data unavailable: {error}"
                 );
-                (Vec::new(), b.len())
+                let kept = parse_shore_waves_lenient(b, wave_start);
+                crate::diag!(
+                    SceneWater,
+                    "water {export_id}: kept {} of the shoreline waves it could read",
+                    kept.len()
+                );
+                (kept, b.len())
             }
         };
         Ok((
@@ -251,8 +294,50 @@ impl WaterArea {
     }
 }
 
-/// Water version words that may open a record.
+/// Water version words whose record layout this reader can decode.
+///
+/// A `0x100SSSSS` word carries its own layout revision in the low half, and the
+/// client's `A3DWaterArea` loader (`0x780d30`) changes what it reads per
+/// revision, so accepting a word it has never been shown would be a guess.
+/// `water-record-survey` has found only these two in shipped data: 1.3.1,
+/// 1.3.6, 1.4.2, 1.4.4, 1.5.2 and 1.8.4 all write `0x10003000`, and the older
+/// `0x10002000` layout is the one the client still reads. Anything else is
+/// named rather than dropped silently, and `parse_record` falls back to a
+/// version-agnostic scan so a record carrying an unknown revision still has a
+/// chance to yield its areas.
 const WATER_VERSIONS: [u32; 2] = [0x10002000, 0x10003000];
+
+/// Layout revision `WaterArea::parse_fields` decodes, derived from a version word.
+///
+/// The mask is the only field the two revisions place differently: v2's cell
+/// mask begins at +36 and v3 inserts its `simple` flag byte at +36, pushing the
+/// mask to +37. Both revisions therefore decode through one routine, keyed on
+/// the revision's *high* word rather than on an equality list, so the day a
+/// client writes `0x10004000` the reader can still attempt it and report what
+/// it found instead of refusing on the first four bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaterLayout {
+    /// `0x10002000`: mask at +36, no `simple` flag.
+    V2,
+    /// `0x10003000`: `simple` flag at +36, mask at +37.
+    V3,
+    /// A revision with no recovered layout. Never guessed; the reader reports it.
+    Unknown(u32),
+}
+
+impl WaterLayout {
+    pub fn of(version: u32) -> Self {
+        match version {
+            0x10002000 => Self::V2,
+            0x10003000 => Self::V3,
+            other => Self::Unknown(other),
+        }
+    }
+    /// Whether this reader knows how to walk the revision's fields.
+    pub fn is_decodable(self) -> bool {
+        matches!(self, Self::V2 | Self::V3)
+    }
+}
 
 /// Decode every `A3DWaterArea` stored in one BSData record.
 ///
@@ -268,16 +353,37 @@ pub(crate) fn parse_record(record: &[u8], export_id: u32) -> Result<Vec<WaterAre
     if WATER_VERSIONS.contains(&first) {
         return decode_areas(record, export_id);
     }
+    // A word in the water version family that this reader has no layout for.
+    // Scanning the record for a revision it *does* know beats refusing the
+    // whole record on its first four bytes: a record that opens with a newer
+    // revision may still carry an older one further in, and the scan costs a
+    // walk over at most one record.
+    if (first & 0xffff_0000) == 0x1000_0000 {
+        let mut from = 4usize;
+        while let Some(offset) = find_version_word(record, from) {
+            if let Ok(areas) = decode_areas(&record[offset..], export_id) {
+                return Ok(areas);
+            }
+            from = offset + 4;
+        }
+        return Err(format!(
+            "unsupported A3DWaterArea version {first:#x} (no recovered layout; \
+             this build reads 0x10002000 and 0x10003000)"
+        ));
+    }
     let stored = first as usize;
     let raw = u(record, 4)? as usize;
-    // Shipped records declare the 32768-byte window; a wild word is a version
+    // Shipped records declare the 32768-byte window; a wild word is a framing
     // this reader does not know, not a size worth trusting.
     if raw == 0 || raw > 1024 * 1024 || stored > record.len().saturating_sub(8) {
-        return Err(format!("unsupported A3DWaterArea version {first:#x}"));
+        return Err(format!(
+            "not a water record: the first word is {first:#x}, which is neither a \
+             known A3DWaterArea version nor a plausible zlib frame"
+        ));
     }
     let payload = &record[8..8 + stored];
     let plain = crate::pck::inflate(payload, raw)
-        .map_err(|e| format!("unsupported A3DWaterArea version {first:#x}: {e}"))?;
+        .map_err(|e| format!("not a water record: the zlib frame does not inflate: {e}"))?;
     // Records are shared with the other BSData tables, so a water area can sit
     // anywhere in the window; find the first run that actually decodes.
     let mut from = 0usize;
@@ -287,7 +393,15 @@ pub(crate) fn parse_record(record: &[u8], export_id: u32) -> Result<Vec<WaterAre
         }
         from = offset + 4;
     }
-    Err(format!("unsupported A3DWaterArea version {first:#x}"))
+    // The frame inflated, so this is a readable record — it simply carries no
+    // water area. That is a fact about the patch, not a fault in a version, and
+    // saying "unsupported version 0x1af" here (431 was the *stored length*)
+    // sent a whole investigation after a version that never existed.
+    Err(format!(
+        "no A3DWaterArea record in this patch: it inflates to {} bytes with no water \
+         version word",
+        plain.len()
+    ))
 }
 
 /// First offset at or after `from` holding a water version word on a 4-byte
@@ -352,12 +466,64 @@ fn decode_areas(b: &[u8], export_id: u32) -> Result<Vec<WaterArea>, String> {
         // either way the outer walk decides.
     }
     if areas.is_empty() {
-        return Err(format!(
-            "unsupported A3DWaterArea version {:#x}",
-            u(b, 0).unwrap_or(0)
-        ));
+        // Name the word that was actually there rather than the first four
+        // bytes: a zlib-framed record's first dword is a stored length, and
+        // "unsupported A3DWaterArea version 0x1af" mislabelled a framing
+        // problem as a version problem for a long time. A word in the water
+        // version family is quoted as a version; anything else is reported as
+        // not being a water record at all.
+        let first = u(b, 0).unwrap_or(0);
+        return Err(if (first & 0xffff_0000) == 0x1000_0000 {
+            format!(
+                "unsupported A3DWaterArea version {first:#x} (no recovered layout; \
+                 this build reads 0x10002000 and 0x10003000)"
+            )
+        } else {
+            format!("no A3DWaterArea record found; the first word is {first:#x}")
+        });
     }
     Ok(areas)
+}
+
+/// Shoreline wave version words this reader has a recovered layout for.
+///
+/// The word's low half is the layout revision: v1 stores positions only and
+/// lights both arrays to `0x80808080`, v2 stores the day ARGB array and derives
+/// night as 0.3x it, v3 stores both arrays. All three are read from the client
+/// at `0x782680`. A later revision is reported by version, and the wave — not
+/// the whole map — is skipped.
+const SHORE_WAVE_VERSIONS: [u32; 3] = [0x10001000, 0x10002000, 0x10003000];
+
+/// Vertex ceiling for one wave: three vertices per control point, and the
+/// viewer uploads u32 indices (`shore_gpu.rs`), so the client's u16 limit of
+/// 21,845 points is not this reader's limit. This bound only stops a damaged
+/// point count from reserving unbounded memory.
+const SHORE_WAVE_MAX_POINTS: usize = 1 << 20;
+
+/// Read every shoreline wave that can be read, stopping at the first that
+/// cannot.
+///
+/// [`parse_shore_waves`] stops at the first bad wave because it has to report
+/// where the array ended; this variant exists for the case where it did, so the
+/// good waves before the bad one are still drawn. The two share one loop so a
+/// change to the layout cannot make them disagree.
+fn parse_shore_waves_lenient(b: &[u8], offset: usize) -> Vec<ShoreWave> {
+    let mut cursor = offset;
+    let Ok(count) = u(b, cursor) else {
+        return Vec::new();
+    };
+    cursor += 4;
+    let mut out = Vec::new();
+    for _ in 0..count.min(65536) {
+        match parse_one_shore_wave(b, cursor) {
+            Ok((wave, next)) => {
+                out.push(wave);
+                cursor = next;
+            }
+            Err(_) => break,
+        }
+    }
+    out
 }
 
 fn parse_shore_waves(b: &[u8], offset: usize) -> Result<(Vec<ShoreWave>, usize), String> {
@@ -369,79 +535,106 @@ fn parse_shore_waves(b: &[u8], offset: usize) -> Result<(Vec<ShoreWave>, usize),
     }
     let mut shore_waves = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
-        let version = u(b, cursor)?;
-        if !matches!(version, 0x10001000 | 0x10002000 | 0x10003000) {
-            return Err(format!("unsupported shoreline wave version {version:#x}"));
-        }
-        let capacity = u(b, cursor + 4)? as usize;
-        let width = f(b, cursor + 8)?;
-        let points_count = u(b, cursor + 12)? as usize;
-        cursor = cursor.checked_add(16).ok_or("wave offset overflow")?;
-        // The client's indices are u16 and each point creates three vertices.
-        if points_count > capacity || capacity > 21845 || width < 0.0 {
-            return Err("invalid shoreline wave dimensions".into());
-        }
-        let bytes = points_count.checked_mul(12).ok_or("wave size overflow")?;
-        let arrays = match version {
-            0x10001000 => 1,
-            0x10002000 => 2,
-            _ => 3,
-        };
-        let end = cursor
-            .checked_add(bytes.checked_mul(arrays).ok_or("wave size overflow")?)
-            .ok_or("wave offset overflow")?;
-        if end > b.len() {
-            return Err("truncated shoreline wave".into());
-        }
-        let mut points = Vec::with_capacity(points_count);
-        for i in 0..points_count {
-            let pos = cursor + i * 12;
-            points.push([f(b, pos)?, f(b, pos + 4)?, f(b, pos + 8)?]);
+        let (wave, next) = parse_one_shore_wave(b, cursor)?;
+        cursor = next;
+        shore_waves.push(wave);
+    }
+    Ok((shore_waves, cursor))
+}
+
+/// Decode one shoreline wave at `cursor`, returning it and the offset of the
+/// next wave.
+fn parse_one_shore_wave(b: &[u8], mut cursor: usize) -> Result<(ShoreWave, usize), String> {
+    let version = u(b, cursor)?;
+    if !SHORE_WAVE_VERSIONS.contains(&version) {
+        return Err(format!(
+            "unsupported shoreline wave version {version:#x} (this build reads \
+             0x10001000, 0x10002000 and 0x10003000)"
+        ));
+    }
+    let capacity = u(b, cursor + 4)? as usize;
+    let width = f(b, cursor + 8)?;
+    let points_count = u(b, cursor + 12)? as usize;
+    cursor = cursor.checked_add(16).ok_or("wave offset overflow")?;
+    // `capacity` is the client's authored buffer size and is not a bound
+    // this reader may enforce beyond sanity: the arrays are read by point
+    // count, and `points_count > capacity` only means the author grew the
+    // wave after the capacity was written.
+    if points_count > SHORE_WAVE_MAX_POINTS || width < 0.0 {
+        return Err(format!(
+            "invalid shoreline wave dimensions: {} points (limit {SHORE_WAVE_MAX_POINTS}) \
+             at capacity {capacity}",
+            points_count
+        ));
+    }
+    let bytes = points_count.checked_mul(12).ok_or("wave size overflow")?;
+    let arrays = match version {
+        0x10001000 => 1,
+        0x10002000 => 2,
+        _ => 3,
+    };
+    let end = cursor
+        .checked_add(bytes.checked_mul(arrays).ok_or("wave size overflow")?)
+        .ok_or("wave offset overflow")?;
+    if end > b.len() {
+        return Err("truncated shoreline wave".into());
+    }
+    let mut points = Vec::with_capacity(points_count);
+    for i in 0..points_count {
+        let pos = cursor + i * 12;
+        points.push([f(b, pos)?, f(b, pos + 4)?, f(b, pos + 8)?]);
+    }
+    cursor += bytes;
+    let mut day_colors = vec![0x80808080; points_count * 3];
+    let mut night_colors = vec![0x80808080; points_count * 3];
+    if version >= 0x10002000 {
+        for (i, color) in day_colors.iter_mut().enumerate() {
+            *color = u(b, cursor + i * 4)?;
         }
         cursor += bytes;
-        let mut day_colors = vec![0x80808080; points_count * 3];
-        let mut night_colors = vec![0x80808080; points_count * 3];
-        if version >= 0x10002000 {
-            for (i, color) in day_colors.iter_mut().enumerate() {
+        if version == 0x10003000 {
+            for (i, color) in night_colors.iter_mut().enumerate() {
                 *color = u(b, cursor + i * 4)?;
             }
             cursor += bytes;
-            if version == 0x10003000 {
-                for (i, color) in night_colors.iter_mut().enumerate() {
-                    *color = u(b, cursor + i * 4)?;
+        } else {
+            // 0x782863-0x7828b2 converts all ARGB components to floats,
+            // scales by 0.3, and packs them back for the night array.
+            for (dst, src) in night_colors.iter_mut().zip(&day_colors) {
+                let mut out = 0u32;
+                for shift in [0, 8, 16, 24] {
+                    let v = ((src >> shift) & 255) as f32;
+                    out |= ((v * 0.3) as u32) << shift;
                 }
-                cursor += bytes;
-            } else {
-                // 0x782863-0x7828b2 converts all ARGB components to floats,
-                // scales by 0.3, and packs them back for the night array.
-                for (dst, src) in night_colors.iter_mut().zip(&day_colors) {
-                    let mut out = 0u32;
-                    for shift in [0, 8, 16, 24] {
-                        let v = ((src >> shift) & 255) as f32;
-                        out |= ((v * 0.3) as u32) << shift;
-                    }
-                    *dst = out;
-                }
+                *dst = out;
             }
         }
-        shore_waves.push(ShoreWave {
+    }
+    Ok((
+        ShoreWave {
             capacity,
             width,
             points,
             day_colors,
             night_colors,
-        });
-    }
-    Ok((shore_waves, cursor))
+        },
+        cursor,
+    ))
 }
 pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
     let b = fs::read(ecbsd_path(dir)).map_err(|e| e.to_string())?;
     // One check owns the EC-BSD identity and revision, so water, scenery and
     // grass cannot disagree about which revisions a map may carry.
     crate::scene::ecbsd_header(&b)?;
+    // Measured: the largest manifest staged is the 1.8.4 world's, with 88
+    // BSData paths. The limit leaves two orders of magnitude of headroom and
+    // only stops a damaged header reserving memory.
+    const MAX_BSDATA_FILES: usize = 10_000;
     let count = u(&b, 12)? as usize;
-    if count > 10000 {
-        return Err("invalid BSData file count".into());
+    if count > MAX_BSDATA_FILES {
+        return Err(format!(
+            "invalid BSData file count: {count} paths (limit {MAX_BSDATA_FILES})"
+        ));
     }
     // The name block starts at 0x4c with the *length* of the first name, not
     // with the name: every entry is `u32 length` then `length` bytes of GBK
@@ -571,11 +764,14 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
         // every other area on the map with it.
         match parse_record(&data[rec..end], r.export_id) {
             Ok(batch) => areas.extend(batch.into_iter().map(|area| (order, area))),
+            // Name the patch as well as its index: a report that says
+            // "BSData 7 record 31" cannot be acted on without the manifest,
+            // and the manifest entry is what the author would fix.
             Err(error) => crate::diag!(
                 SceneWater,
-                "water {}: BSData {} record {record} skipped: {error}",
+                "water {}: BSData {index} ({name}) record {record} skipped: {error}",
                 r.export_id,
-                index
+                name = files.get(index).map(String::as_str).unwrap_or("<no name>")
             ),
         }
     }
@@ -729,6 +925,132 @@ mod tests {
         assert_eq!(wave.day_colors, [0x80808080; 3]);
         assert_eq!(wave.night_colors, [0x80808080; 3]);
     }
+
+    /// Build one v3 area followed by `waves` shoreline entries.
+    fn area_with_waves(waves: &[(u32, usize)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&0x10003000u32.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        // Fields start eight bytes past the version word. Offsets within the
+        // field block: color +0, height +4, an unused dword at +8, columns +12,
+        // rows +16, grid size +20, centre +24..+36, v3 flag +36, mask +37.
+        for v in [
+            0u32,             // color
+            1.0f32.to_bits(), // height
+            0,                // unused
+            1,                // columns
+            1,                // rows
+            2.0f32.to_bits(), // grid size
+            0,                // centre x
+            0,                // centre y
+            0,                // centre z
+        ] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.push(0); // v3 simple flag
+        b.push(1); // one 1x1 cell, wet
+        b.extend_from_slice(&(waves.len() as u32).to_le_bytes());
+        for (version, points) in waves {
+            b.extend_from_slice(&version.to_le_bytes());
+            b.extend_from_slice(&(*points as u32).to_le_bytes());
+            b.extend_from_slice(&2.0f32.to_le_bytes());
+            b.extend_from_slice(&(*points as u32).to_le_bytes());
+            for i in 0..*points {
+                for k in 0..3 {
+                    b.extend_from_slice(&((i + k) as f32).to_le_bytes());
+                }
+            }
+            // `arrays` counts the position array too, so the colour arrays are
+            // one fewer: v1 has none, v2 the day array, v3 day and night.
+            let arrays = match version {
+                0x10001000 => 1usize,
+                0x10002000 => 2,
+                _ => 3,
+            };
+            for _ in 0..((arrays - 1) * points * 3) {
+                b.extend_from_slice(&0xff112233u32.to_le_bytes());
+            }
+        }
+        b
+    }
+
+    /// The surface survives a shoreline record this build cannot read.
+    ///
+    /// `parse_shore_waves` used to abandon the whole array on the first
+    /// unreadable entry, and the caller then dropped every wave on the area.
+    /// A newer wave revision is a reason to skip that wave and say so, never a
+    /// reason to take the water away.
+    #[test]
+    fn a_newer_shoreline_version_keeps_the_surface_and_the_other_waves() {
+        let b = area_with_waves(&[(0x10003000, 2), (0x10009000, 1), (0x10003000, 2)]);
+        let area = WaterArea::parse(&b, 0, 1).expect("the grid still decodes");
+        // The first wave is kept; the unknown revision stops the strict walk,
+        // and the lenient walk hands back what it read.
+        assert_eq!(area.shore_waves.len(), 1, "the first wave is kept");
+        assert_eq!(area.shore_waves[0].points.len(), 2);
+        // The waves begin after the header, the flag byte and the 1x1 cell mask:
+        // 8 (version + count) + 36 (fields) + 1 (flag) + 1 (mask) = 46.
+        let kept = parse_shore_waves_lenient(&b, 46);
+        assert_eq!(kept.len(), 1, "a bad wave does not remove the good ones");
+        // And the revision is named, not dropped silently.
+        let err = parse_shore_waves(&b, 46).expect_err("the strict walk reports");
+        assert!(err.contains("0x10009000"), "{err}");
+    }
+
+    /// An unknown water revision is reported by version, not by first dword.
+    #[test]
+    fn an_unknown_water_version_is_named_as_a_version() {
+        let mut b = vec![0u8; 64];
+        b[..4].copy_from_slice(&0x10004000u32.to_le_bytes());
+        let err = decode_areas(&b, 1).expect_err("no layout for 0x10004000");
+        assert!(err.contains("0x10004000"), "{err}");
+        assert!(err.contains("no recovered layout"), "{err}");
+        // A record that does not start with a water word says so instead of
+        // pretending the word was a version.
+        let err = decode_areas(&[0u8; 64], 1).expect_err("not a water record");
+        assert!(err.contains("no A3DWaterArea record found"), "{err}");
+    }
+
+    /// A record that opens with a newer revision still yields an older run.
+    #[test]
+    fn an_unknown_opening_version_does_not_hide_a_known_run_inside() {
+        let mut b = 0x10004000u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&[0u8; 12]);
+        let area = area_with_waves(&[]);
+        b.extend_from_slice(&area);
+        let areas = parse_record(&b, 7).expect("the v3 run inside is found");
+        assert_eq!(areas.len(), 1);
+        assert_eq!(areas[0].export_id, 7);
+    }
+
+    /// The version word decides the layout, and only known ones are guessed at.
+    #[test]
+    fn the_layout_follows_the_version_word() {
+        assert_eq!(WaterLayout::of(0x10002000), WaterLayout::V2);
+        assert_eq!(WaterLayout::of(0x10003000), WaterLayout::V3);
+        assert_eq!(
+            WaterLayout::of(0x10004000),
+            WaterLayout::Unknown(0x10004000)
+        );
+        assert!(WaterLayout::V2.is_decodable() && WaterLayout::V3.is_decodable());
+        assert!(!WaterLayout::of(0x10004000).is_decodable());
+    }
+
+    /// A wave larger than the client's u16 index range is read, not refused.
+    ///
+    /// The old cap was 21,845 points because the client indexes its triangles
+    /// with u16 and each point makes three vertices. The viewer uploads u32
+    /// indices, so that limit only ever dropped real data.
+    #[test]
+    fn a_wave_larger_than_the_u16_index_limit_still_parses() {
+        let points = 22_000usize;
+        let b = area_with_waves(&[(0x10003000, points)]);
+        let area = WaterArea::parse(&b, 0, 1).expect("a 22,000-point wave is not a fault");
+        assert_eq!(area.shore_waves.len(), 1);
+        assert_eq!(area.shore_waves[0].points.len(), points);
+        assert_eq!(area.shore_waves[0].capacity, points);
+    }
+
     #[test]
     fn actual_69_water_if_available() {
         let Ok(path) = std::env::var("PW_WATER_SAMPLE_69") else {

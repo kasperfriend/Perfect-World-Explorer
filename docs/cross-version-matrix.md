@@ -203,6 +203,53 @@ An empty `bsdata` record is 16 bytes — `MOXB`, version 2, one entry, offset 0 
 which is an authored-empty record rather than a truncated one. Several of the
 18 `a37` records are exactly that.
 
+### Every water reference, bucketed
+
+"3 areas out of 148 references" looks like a fault until the references are
+counted by what happened to them. `water-record-survey --classify` puts every
+reference in exactly one bucket and fails if the buckets do not add up, so the
+question "where did the other 145 go" is answered rather than asked.
+
+```
+tools/offline_harness.sh water-record-survey --classify <element/maps>
+```
+
+| map | refs | unique | areas | empty record | unknown version | unknown format | read OK |
+|---|---|---|---|---|---|---|---|
+| `a07` (1.5.2) | 26 | 1 | 1 | 0 | 0 | 0 | 26 |
+| `a37` (1.4.4) | 148 | 3 | 3 | 0 | 0 | 0 | 148 |
+| `world` (1.8.4) | 9237 | 111 | 109 | 0 | 0 | 256 | 8981 |
+
+The refs collapse because a map names every water area once per block that can
+see it: `a37`'s 148 references are 3 unique `(export id, offset)` pairs and
+`world`'s 9237 are 111. Every reference decodes; nothing is lost.
+
+### 1.8.4, the first time it was measured
+
+The 1.8.4 world is the first client whose water was measured rather than
+assumed. Its 88 `bsdata/*.dat` patches and its `world.ecbsd` (2.2 MB, 111
+records) were staged and run through the classifier:
+
+- **0 unknown versions.** All 112 water records outside the framed patches open
+  with `0x10003000`, the layout this reader decodes.
+- **0 empty records.** Unlike 1.5.2's maps, no 1.8.4 patch is the authored-empty
+  16-byte stub.
+- **256 references (2 patches) are not water records at all.** `bsdata/32.dat`
+  record 0 and `bsdata/45.dat` record 59 inflate cleanly to 32,768 bytes and
+  contain no `0x1000xxxx` version word anywhere, so the record carries other
+  BSData data and names a water record index that is not water.
+- **109 areas decoded.** The gap between 111 unique refs and 109 areas is the
+  two patches above.
+
+The first pass reported those 256 references as *unknown version*, and the error
+that produced it was `unsupported A3DWaterArea version 0x1af`. `0x1af` is 431 —
+the record's **zlib stored length**, not a version. The reader had been
+reporting a framing word as a version since the original 1.3.1 investigation.
+That is fixed: a record that inflates but holds no water now says so, and only a
+real `0x1000xxxx` revision word this build has no layout for is reported as a
+version. The bucket names follow the same rule, so a future survey cannot
+resurrect the mistake.
+
 ## Known gaps, stated plainly
 
 - **1.5.2 `gfx.pck` (256 MB) is not in the corpus.** Upload/download caps make it

@@ -735,9 +735,10 @@ case "${1:-test}" in
             "$OUT/cd/harness.rs" -o "$OUT/cdtest"
         (cd "$REPO" && exec "$OUT/cdtest" "$@") ;;
     water) toolchain; sysroot; deps
-        # `water` needs flate2 (BSData records are zlib-framed) and the parse
-        # path does not touch `image`, so a small shim stands in for it.
-        real_deps
+        # `water` needs flate2 (BSData records are zlib-framed). The parse path
+        # now also names `image` for the simple-water frames, so the shim
+        # `bins` builds has to exist here too.
+        real_deps; image_stub
         mkdir -p "$OUT/water"
         # The reader reports its per-record failures through `crate::diag!`, so
         # the shim has to carry it: a stub that dropped the lines would make the
@@ -770,6 +771,25 @@ pub mod scene {
     pub struct WaterRef { pub export_id: u32, pub offset: u32 }
     pub struct Block { pub water: Vec<WaterRef> }
     pub struct Scene { pub blocks: Vec<Block> }
+    /// The real identity check, so the harness refuses what the viewer refuses.
+    /// The water reader never looks below the revision word, so the revision is
+    /// accepted whatever it is -- the same contract as the viewer's.
+    pub const ECBSD_IDENTITY: (u32, u32) = (0x42584f4d, 0x42534446);
+    pub fn ecbsd_header(b: &[u8]) -> Result<u32, String> {
+        let at = |p: usize| -> Result<u32, String> {
+            b.get(p..p + 4)
+                .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+                .ok_or_else(|| "truncated EC-BSD header".to_string())
+        };
+        let identity = (at(0)?, at(4)?);
+        if identity != ECBSD_IDENTITY {
+            return Err(format!(
+                "this is not an EC-BSD file: it starts with {:#010x} {:#010x}",
+                identity.0, identity.1
+            ));
+        }
+        at(8)
+    }
 }
 #[path = "$OUT/water/pck.rs"]
 pub mod pck;
@@ -805,6 +825,21 @@ EOF
             "$OUT/water/lib.rs" -o "$OUT/watertest"
         shift || true
         (cd "$REPO" && exec "$OUT/watertest" "$@") ;;
+    water-record-survey) toolchain; sysroot; deps; real_deps; image_stub
+        # The water reference classifier, built from the real readers. Its
+        # `--classify` mode buckets every water reference under a client's
+        # `element/maps` and exits non-zero if the buckets do not add up, which
+        # is what keeps "148 references, 3 areas" an answered question.
+        mkdir -p "$OUT/survey"
+        "$RUSTC" --edition 2021 --crate-name wrsurvey --sysroot "$SYSROOT" \
+            -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern image="$OUT/libimage_stub.rlib" \
+            -o "$OUT/survey/water-record-survey" \
+            "$REPO/src/bin/water-record-survey.rs"
+        shift || true
+        [ $# -gt 0 ] || set -- "$REPO/google_drive"
+        (cd "$REPO" && exec "$OUT/survey/water-record-survey" "$@") ;;
     gfx)   toolchain; sysroot; deps; real_deps
         # The GFX containers on their own: `gfx_file`, `gfx_decal`, `gfx_light`
         # and the `pck` they read from, without the renderer or the `main.rs`
