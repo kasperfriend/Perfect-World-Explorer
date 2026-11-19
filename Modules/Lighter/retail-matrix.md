@@ -21,8 +21,10 @@ camera's frame.
 
 Use the optional **Lighter retail capture matrix** GitHub Actions workflow
 for the checksum-pinned CPU Vulkan subset. It collects PNGs, Step 9 counts,
-metadata, absolute-difference PNGs and `matrix.json` (including any failed
-cases). No game packages are uploaded. New `a07` captures require **lightmaps
+metadata, absolute-difference PNGs, `matrix.json` (including any failed
+cases), and a compact `capture-summary.json` with per-case RGB/timing and
+admission results. Per-map CI notices keep those results readable when a
+signed artifact cannot be retrieved here. No game packages are uploaded. New `a07` captures require **lightmaps
 on and 16 day/night areas bound**. Its pinned 128² BC1 tiles now load; the
 older lightmaps-off matrix below is a different setup. An optional asset
 missing from an input tree remains an omission, not a parity pass. See the
@@ -45,15 +47,16 @@ object masks.
 python3 -m pip install Pillow==11.3.0
 python3 tools/lighter_capture_matrix.py \
   --profile physical --device 'NVIDIA GeForce RTX 3080' --require-complete --timed-frames 30 \
-  --manifest /path/to/verified-cameras.json \
+  --manifest /path/to/verified-cameras.json --input-manifest /path/to/verified-inputs.txt \
   --viewer target/release/perfect-world-explorer --client /path/to/client \
   --output target/lighter-retail-physical
 ```
 
 For the PR #51 acceptance run, use Windows x64 and the specified 10 GB RTX
-3080. `--require-complete` will report a missing cell until a full Native
-loaded/skipped/failed inventory is recorded; Native's current submission
-counters cannot close that gate. See the [54-cell status](evidence/2026-11-18/09-retail.md).
+3080. `--require-complete` needs explicit reviewed camera evidence, verified
+input pins, actual 480×360 rays, timed draws and a hash-bound census for each
+cell. The Native census is scoped to main-scene submission; it does not count
+per-subpass or per-pixel visibility. See the [54-cell status](evidence/2026-11-18/09-retail.md).
 
 Add `--hybrid-ab` to the physical run to render a fourth path: the same
 Hardware settings with raster primary visibility enabled. The tool rejects a
@@ -106,6 +109,30 @@ For matched movement and residency tails, follow the separate
 [normal-present travel procedure](travel.md). Keep these logs separate from
 pixel-diff timing: the travel capture doesn't read back pixels and its
 present timestamps are CPU API calls, not physical scanout timestamps.
+
+## Lightmaps-on CPU rerun
+
+[Run `44538569462` on `d6c5c37`](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44538569462)
+validated **12** matched Native/Software case pairs, no failures. Same
+960×720 display, 240×180 rays, deterministic clock and three synchronized
+draw/readbacks on Mesa 25.0.7 llvmpipe / LLVM 19.1.7. The artifact includes
+`capture-summary.json`, all images, diffs, bound inventories and detailed
+sidecars. Its signed transfer failed in this workspace. Case-level numbers
+below are from GitHub check receipts and are **not** visual verdicts.
+
+| Day / night / rain camera | Day whole MAE / max | Night whole MAE / max | Rain whole MAE / max |
+| --- | ---: | ---: | ---: |
+| `a01` | 69.388 / 181 | 43.445 / 107 | 69.405 / 181 |
+| `a02` | 50.824 / 167 | 38.513 / 155 | 50.827 / 167 |
+| `a07` shoreline | 5.619 / 103 | 5.061 / 88 | 5.654 / 104 |
+
+The runner also validated `a07-above-water`, `a07-submerged` and
+`a07-submerged-rain` with 16 matched lightmap pairs and checked the eye's
+side of the surface. The original API truncated the six-case a07 notice;
+[water results](evidence/2026-11-18/10-water.md) distinguish measured scopes.
+The new workflow splits notices into bounded groups. The full artifact
+remains the source for water ROIs and individual timing, root, and scene
+submission decisions. For the rain A/B counts, see [inventory](evidence/2026-11-18/12-inventory.md).
 
 ## Completed CPU Vulkan matrix — run started 2026-11-18 UTC
 

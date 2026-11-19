@@ -108,8 +108,28 @@ jobs:
           if path.is_file():
               report = json.loads(path.read_text(encoding='utf-8'))
               maps = report.pop('maps')
-              for label, data in [('Lighter capture index', report), *[(m, v) for m, v in maps.items()]]:
-                  print(f"::notice title={label}::{json.dumps(data, separators=(',', ':')).replace('%', '%25')}")
+              def encode(data):
+                  return json.dumps(data, separators=(',', ':')).replace('%', '%25')
+
+              def notice(label, data):
+                  print(f"::notice title={label}::{encode(data)}")
+
+              notice('Lighter capture index', report)
+              # Check-run annotation text truncates at 4,096 characters.
+              # Keep whole case records in each batch, with some headroom.
+              for name, rows in maps.items():
+                  part, batch = 1, []
+                  for row in rows:
+                      if batch and len(encode([*batch, row])) > 3800:
+                          notice(f'Lighter {name}/{part}', batch)
+                          part, batch = part + 1, []
+                      if len(encode([row])) > 3800:
+                          notice(f'Lighter {name}/{part}', {'artifact_only': row['id']})
+                          part += 1
+                      else:
+                          batch.append(row)
+                  if batch:
+                      notice(f'Lighter {name}/{part}', batch)
           PY
       - uses: actions/upload-artifact@v4
         if: always()

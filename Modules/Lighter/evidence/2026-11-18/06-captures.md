@@ -20,7 +20,7 @@ identical and test refinement against a predeclared tolerance. The higher
 budgets can be expensive and need a physical run to establish reliability.
 
 `tools/lighter_temporal_compare.py --help` checks the matched schema-3
-sidecars, decoded RGBA8 hashes, Windows RTX 3080 Vulkan adapter, exact active
+sidecars, decoded RGBA8 hashes, Windows x64 RTX 3080 10 GB Vulkan device, exact active
 provider and intended ray settings, and reports per-region RGB8 mean/max
 error vs portable and the higher-budget Reference. It fails a silent
 fallback and reports any Reference refinement threshold violation. These

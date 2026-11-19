@@ -49,7 +49,10 @@ parsed weather selection in both backends. `PW_PREVIEW_HOUR` and explicit
 unavailable native rain texture is not authored parity.
 
 Preview receipts expose root states, Warp omissions, destination-color
-candidates, rain art fallback and admitted ray rain cards. See the
+candidates and `rain_mask_source` (authored, archive/member failure, or
+decode failure). Native and ray paths use the same mask loader, including
+explicit TGA support when the signature is ambiguous. Native slot selection
+and admitted ray cards are not surviving fragments. See the
 [per-map census and scope](evidence/2026-11-18/12-inventory.md); none of
 these counts prove how many effect or rain pixels are visible.
 

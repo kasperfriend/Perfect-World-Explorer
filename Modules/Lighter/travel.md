@@ -80,6 +80,10 @@ python3 tools/lighter_travel_report.py --physical --device 'RTX 3080' \
   argument is a substring). `--require-commit` rejects a run without a
   resident window publication. It does not assert the same number of
   successful uploads; asynchronously built windows may be coalesced.
+  A synchronized `--require-sdk-matrix` further requires Windows x64,
+  the RTX 3080 10 GB discrete Vulkan device, per-frame heap/stage samples,
+  and all seven routes. CSVs report architecture and largest device-local
+  heap capacity separately from sampled heap usage.
 - `interval_ms` is time between returns from `present()`. The report gives
   p50/p95/p99, worst interval and `1000 / mean(slowest 1% of intervals)`.
   It splits intervals observed during streaming/publication from the rest.

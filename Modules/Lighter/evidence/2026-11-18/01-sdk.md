@@ -58,3 +58,12 @@ Hosted **build only:** The MSVC link/export step passed on
 [run 44519481366](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44519481366)
 at `fcfb2a6`. The remaining jobs were superseded by a newer branch push;
 this is not a green workflow or a physical dispatch.
+
+**Next physical run:** use the [pinned SDK setup](../../temporal-reconstruction.md)
+on the target. Save the tested commit, executable digest, adapter, driver,
+Windows architecture, Vulkan validation output and SDK file hashes before
+evaluating either provider. Run `lighter_temporal_vendor_dispatch` once per
+route/provider at the required extents, retaining its raw-image assertions.
+Do not delete a failed run or substitute a portable PNG. Then run the
+[window/recovery fixture and retail reload](04-window.md) on the same machine
+before the longer motion/performance/matrix runs.

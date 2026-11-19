@@ -186,7 +186,7 @@ multiple samples, or failed optional raster attachment admission.
 | History and filtering | **Added:** 28 B/pixel instead of 32 B (12.5% less at equal extent), FP32 depth, packed guides, half RGB/log variance, owner/depth checks, bounded variance-adaptive history. Reject moving-path, water-wave and scrolling dependencies selectively; reset for changed light/decal records or scene revision. Two local à-trous passes on a fresh image; three wider passes when usable history exists. Reuse dead trace output and one scratch, with no extra full-resolution history. |
 | Software BVH | **Added:** 2–4 child stackless layout with 12-bin SAH for larger partitions, and sparse leaf/ancestor refits with a dense fallback. No change to the WGSL escape ABI. Immediate CPU partition cost can increase; no hardware BLAS layout claim. |
 | Sky and medium | **Alternative:** bilinearly reuse the precomputed sky table only on interactive diffuse misses; primary, mirrors and refraction retain the authored filtered art. No screen-space GI cache. Water keeps exact per-leg exponential extinction (with a zero-length fast path), not a new fog LUT. |
-| Texture and streaming work | **Existing/partial:** authored mips, ray-side packed mask bytes and budgets, rank/reuse of decoded scenery, dirty upload ranges and retired ASes. Ray material texels are still decoded into a storage bank; no BC1/3/5/7 hardware-sampled ray texture array. No new residency cap or loader-thread packet pacing here: mask admission and packet assembly still happen during install. |
+| Texture and streaming work | **Existing/partial:** authored mips, ray-side packed mask bytes and budgets, rank/reuse of decoded scenery, dirty upload ranges and retired ASes. Default ray material texels are decoded into a storage bank. Optional BC1/5/7 arrays retain a buffer fallback. No new residency cap or loader-thread packet pacing here: mask admission and packet assembly still happen during install. |
 | Pipeline startup | **Added:** validate and compact individual Vulkan entry points; best-effort bounded driver cache keyed by adapter/driver UUID. No guaranteed cache hit or physical cold-start reduction. |
 | Upscaling / SDKs | **Alternative:** built-in guide-aware composition and opt-in 50–100% adaptive ray scale with hysteresis. The bundled FidelityFX integration is DX12, and the NVIDIA Ray Reconstruction headers do not supply an integrated Vulkan runtime path. Neither FSR nor DLSS RR handles ray-world reconstruction here. |
 | Measurement | **Added:** nonblocking AS/raster/trace, reprojection, denoise and upscale/compose timing; normal-present 1% low; tracked ray allocations and optional driver heap usage. See [the limits and 7 GB warning](gpu-budget.md). A physical RTX 3080 FPS, tail latency or whole-viewer VRAM target is not verified. |
@@ -310,7 +310,7 @@ bit-exact. This proves the sampled fixtures and logical storage bytes, not
 physical GPU memory or performance. BC5/BC7 DDS sources can now use the
 decoded ray path and the Native model texture uploader's corresponding BC
 formats on capable devices. BMD BC5 normal maps reconstruct tangent Z from
-filtered RG. Ray BC5/7 are still expanded, not compressed or bound as arrays.
+filtered RG. BC5/7 use the decoded bank by default; an opt-in Hardware atlas can sample compatible authored material mips.
 Model DDS does not accept arrays, cubes, signed BC5 or premultiplied alpha.
 DXGI sRGB entries preserve encoded channel values for the material pipeline;
 the sampler does not apply an implicit second transfer function.
@@ -328,9 +328,10 @@ for the latest separated CPU and physical status.
 - [Paced GPU copies and static BLAS](gpu-budget.md#paced-world-crossings) and
   the sampled BC terrain experiment below passed their synthetic admission
   and pixel checks. Measure map-travel tails and whole-viewer memory on a
-  physical GPU with the [normal-present travel capture](travel.md). BC5/7
-  sampled ray pages, a physical sampling-speed comparison and a memory win
-  versus the buffer-BC route remain open.
+  physical GPU with the [normal-present travel capture](travel.md).
+  Decoding/filtering conformance for opt-in BC5/7 has a small CPU Vulkan
+  test. A physical sampling-speed comparison and memory win vs buffer BC
+  remain unmeasured.
 - The moving tests below expose a variance and cost trade-off, not a win.
   Inspect DI variance and GI bias, especially under fast flight, animation,
   and corner disocclusion on real maps before enabling the caches by default.
@@ -358,8 +359,9 @@ weights are still explicit at the ray footprint. `textureLoad` runs BC and
 sRGB decode through the texture unit and cannot filter across a page boundary.
 This is not hardware anisotropic filtering or demand paging. Large tiles,
 full pages and unsupported/failed image admission fall back to the portable
-buffer path. Masks, alpha cutouts, moving materials and BC5/7 model maps are
-not in this atlas. The atlas persists across world crossings, and its copy
+buffer path. Masks and moving materials are not in this atlas. Compatible
+static BMD BC5/7 material mips can use separate sampled arrays; see the
+[material sampling receipt and limits](evidence/2026-11-18/13-renderer.md). The atlas persists across world crossings, and its copy
 uses the existing texel bank as the source; the compressed buffer remains
 resident for fallback. The initial atlas copy runs during the watched first
 ray frame. Hardware is unchanged unless the experiment is requested.

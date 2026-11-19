@@ -42,7 +42,8 @@ and independent four-unit water-leg attenuation of bed lighting. Adding a
 blocker above the flat interface removes the sun term at unchanged bed depth.
 These are synthetic tests, not a retail caustic or fog match.
 
-The [a07 input and water audit](evidence/2026-11-18/10-water.md) records the
-verified 128² baked-lightmap format, synthetic day/night bindings and
-scouted retail water heights. It does not establish visible retail water
-parity or transmission on the target GPU.
+The [a07 input and water audit](evidence/2026-11-18/10-water.md) also checks
+the authored wet grid and day/night fog on a Software diagnostic receiver:
+a 2.03726-unit segment attenuates RGB differently without changing depth.
+The full retail comparison, including shoreline reflection/refraction and
+the transition on the specified physical GPU, is still open.

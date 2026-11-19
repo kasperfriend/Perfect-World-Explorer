@@ -50,6 +50,16 @@ rank optional owners are omitted first when geometry or texel admission is
 exhausted; their coverage rows retain the budget reason. This is not
 shader-driven demand paging.
 
+## Sampled texture experiment
+
+`PW_RAY_BC_TEXTURES=1` is opt-in Hardware Vulkan. Track the logical fallback
+bank and actual Vulkan image allocation sizes separately. The immutable
+BC1/BC5/BC7 images can remain allocated when an unrelated replacement bank
+uses buffer decoding; the `bc_image_allocated_bytes` receipt includes them
+while sampled tile/page counts go to zero. Physical A/B still needs the
+whole-viewer driver-heap estimate and matched draw/flight measurements,
+not just a sum of compressed mips. See [Step 13](evidence/2026-11-18/13-renderer.md).
+
 ## Paced world crossings
 
 The streaming worker packs the replacement ray scene. The draw thread stages

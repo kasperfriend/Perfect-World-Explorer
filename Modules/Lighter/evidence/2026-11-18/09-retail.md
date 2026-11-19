@@ -17,17 +17,32 @@ instance capture or from generic screenspace regions.
 | Cave / instance | All missing | All missing | All missing |
 | Effects-heavy | All missing | All missing | All missing |
 
-**S:** [44424106472](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44424106472)
-remains a separate nine-pair CPU Vulkan artifact (25%, schema 3, fixed
-elapsed-animation clock and three synchronized draw/readbacks). It replaces
-older schema-2 receipts for clock/timing comparisons, not any physical cell.
-It did not run Hardware and `a07` lightmaps were disabled.
+The [optional CPU run `44534622432`](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44534622432)
+passed 11 Native/Software pairs on `349b681`: 960×720 pictures, 240×180
+rays, three synchronized draw/readbacks, and a fixed animation clock.
+Unlike [the earlier nine-pair run](../../retail-matrix.md#completed-cpu-vulkan-matrix--run-started-2026-11-18-utc),
+`a07` lightmaps were on and the manifest checked both dry and wet eye
+positions. It did not run the Hardware path or fill any physical cell.
 
-The matrix runner now records every missing RT-17 route with its reason,
-retains receipts when a later variant fails, checks reason totals and
-verifies the **actual** ray extent. `--require-complete` rejects schema 2,
-resolution other than 50%, insufficient timings and incomplete inventories.
-The current Native audit does not yet provide exhaustive per-class
-loaded/skipped/failed counts; it is reported incomplete rather than
-borrowing ray counts. The per-route list is also in
-`09-retail/physical-missing.json` in the [bundle](14-delivery.md). See [matrix procedure and CPU results](../../retail-matrix.md).
+The [new CPU run `44538569462`](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44538569462)
+passed **12 matched** pairs on `d6c5c37`, including day/night/rain shoreline,
+above-water and submerged captures, and a submerged Rain control. Both
+routes loaded the authored rain mask from the pinned texture package.
+See the [CPU results](../../retail-matrix.md#lightmaps-on-cpu-rerun) for
+per-region/whole-image scope. The physical count is still **0/54**.
+
+The runner verifies the actual ray extent, poses, decoded image hashes,
+coverage hashes, exclusive reasons and trusted client inputs. Native can
+now supply an accountable `main_streamed_v1` inventory; historical summary
+counters or schema-2 sidecars do not suffice. This inventory describes main
+scene submission, not water subpass raster visibility, complete world asset
+ownership, or successful shaded pixels. Each route still requires verified
+camera evidence and the exact physical target. `--require-complete` checks
+all 54 declared cells, 50% ray extent and at least three timings per cell.
+
+`09-retail/physical-missing.json` lists each missing route and its blocker.
+The follow-up workflow emits `capture-summary.json` and compact per-map
+notices for validated cases (including late a07 views) and retains partial
+receipts on failure. See [CPU results and reproduction](../../retail-matrix.md)
+and the [delivery record](14-delivery.md). Numeric region errors are not
+verdicts about the intended subject when the PNGs have not been inspected.

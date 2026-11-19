@@ -39,15 +39,16 @@ A required load/build failure ends the command with an error; it does **not** pu
 - **Step 9 fixture:** `tools/fixtures/lighter-coverage.csv` is the expected inventory for `lighter_coverage_fixture_capture`. It renders a real 960×720 offscreen PNG through the main streamed Software path, verifies the counts against the saved CSV and binds them to the capture's pixel hash. [Linux CI on `c19e10e`](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44403096687) passed the comparison and keeps the synthetic files in its `lighter-coverage-fixture` artifact. The streamed BMD regression separately checks that an optional asset denied by the GPU packet budget increments `budget` without packing part of its geometry.
 - **Incompatible inputs:** the S38/S40 heights in the terrain report came from *Forsaken World 0.525*. The actual scene headers on both maps are **ECWLD v14 / EC-BSD v15**; the current Explorer scene and water loaders accept **v12 / v12**. Those height checks cannot serve as retail world captures. No full map capture or unsupported-SKI total is claimed for S38/S40.
 
-For compatible inputs, a separate read-only ECWLD/EC-BSD catalog check walked
-and checked the block boundaries and validated ornament export offsets and BMD
-path suffixes for `a01` and `a02` (both v12). See
-[header checks, counts and file hashes](scene-catalog-2026-11-18.json).
-`a01` authors 328 unique ornaments and 304 placed effect roots; `a02` has 32 and
-42. Neither has water, trees, grass, EC models or critters in these scene files.
-These numbers are **authored**, not admitted or rendered. The two instances
-are useful BMD/GFX capture targets but are not a substitute for the map mix in
-RT-17.
+For compatible inputs, the [dated catalog](scene-catalog-2026-11-18.json)
+records six v12 scene headers and file hashes for `a01`, `a02` and `a07`.
+They author respectively 328/32/116 BMD refs and 304/42/22 direct GFX
+placements, and only `a07` has a water area (381). There are no authored
+actor or vegetation placements in those map records. They are not a
+substitute for the full RT-17 map mix or an active GFX child graph census.
+The Native CSV now accounts for the main scene's submitted geometry and
+omission reasons under `main_streamed_v1`; reflection/refraction are
+not counted as additional owners. Compare scope and reason totals, not
+just `loaded`: a packed ray object can be outside the front raster view.
 
 ### Retail Software captures — 2026-11-18
 
@@ -75,9 +76,8 @@ Decoded RGBA8 SHA-256:
 - `a01`: `73403e084cdd9adfbac7979fba445441cd31688e65d718fc4afec619bf1a1e90`
 - `a02`: `3a27f4d6e60a18a3fbb2380973f0aec785a25029b2429bc555001231ba18559e`
 
-Coverage does not establish geometric accuracy. The independent height-only
-audit found `a02` flat but `a01` exceeded the 0.5-unit tolerance at both strides
-4 and 2 (peak **100.3922** in both; **29,807** and **12,797** of 523,265 samples
-over tolerance). Stride 1 on those 512² fields needs 1,566,726 indices, above
-the current 600,000-index regular-grid refinement ceiling. This is additional
-RT-02b evidence, not a streamed silhouette comparison.
+Coverage does not establish geometric accuracy. Regular stride four missed
+`a01` height features; the [updated RT-02b report](evidence/2026-11-18/11-terrain.md)
+records how the production local-refinement plan corrects the error, and
+which streamed geometry probes passed. It does not certify retail GPU
+silhouettes or secondary shading.

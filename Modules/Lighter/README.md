@@ -83,9 +83,10 @@ GPU completion and swapchain opening are logged separately.
 - The resident terrain mesh and layer masks, plus a lower-detail mesh of the
   native far heightfield when terrain cutoff is off. Lighter omits overlapping
   far triangles and stitches to the installed near boundary in either LOD
-  direction. On small maps, the ray feed refines to stride 2 or 1 if needed
-  within the budget. Large maps keep a coarser stride-16 grid, whose fidelity
-  is not guaranteed. See the [S38/S40 height and grazing-view audit](terrain-fidelity-2026-11-18.md).
+  direction. On smaller maps, the ray feed compares regular grids and can
+  refine only the tiles that need it within the index budget. Large maps can
+  keep the coarser stride-16 fallback, whose fidelity is not guaranteed.
+  See the [PW 1.4.2 height, grazing, and seam audit](evidence/2026-11-18/11-terrain.md).
 - BMD buildings, SpeedTree geometry, instanced grass, posed world models,
   world effect sheets and posed effect meshes. Walker and Populator poses are
   included if active. Rigid SKI parts follow their bone or hook as instances;

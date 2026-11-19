@@ -30,3 +30,10 @@ table again, including the Native SDK-ignore controls. See
 `05-regression/current/`, `05-regression/CURRENT-PNG-SHA256SUMS.txt` and the
 new tested-commit receipt. Native FSR/NGX/XeSS provider source is still
 unchanged relative to `6f97ea6`; no DX12 GPU test is claimed.
+
+**S repeat on `d6c5c37`:** all five SHA-256 values in the table matched
+again after terrain/census, weather and opt-in sampled BC changes. Same
+Clear/noon, 25% ray extent and warm-up, with the narrow full-query control.
+Current files: `05-regression/final/` and `05-regression/final-png.txt`.
+An initial Auto/50% attempt is not used for the comparison; the matched
+run explicitly pins Clear and 25%.

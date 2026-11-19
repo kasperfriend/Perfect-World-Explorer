@@ -1,29 +1,56 @@
 # 13 — Renderer controls stay opt-in
 
-There is no [physical RTX 3080 execution](01-sdk.md) for this pass. Driver-heap
-estimates and synchronized/normal-present timing must be collected on that
-host. Do not treat logical byte budgets, lavapipe timings or thumbnail
-readback cadence as retail VRAM use or FPS.
+No [physical RTX 3080 execution](01-sdk.md) was available. Logical byte
+budgets, sampled allocation requirements and lavapipe captures are not
+retail VRAM or normal-present frame time.
 
-| Gate | What is supported or measured | Remaining |
+| Gate | Verified scope (S) | Remaining on the target |
 | --- | --- | --- |
-| Paced copies and static BLAS | Bounded batch allocator and CPU Vulkan publication fixtures; a previous resident snapshot remains visible until its replacement is ready. | Matched live resident-crossing tails, publication counts and driver-heap peak on the specified GPU. |
-| Sampled vs buffer BC | Opt-in sampled BC1 terrain on raw Vulkan; nonadmitted pages use the buffer fallback. Native's DDS support is separate. | Matched sampled-vs-buffer physical allocation, whole-viewer heap and timing A/B. Ray BC5 normal and BC7 material sampling are **not implemented** in the sampled terrain atlas; those inputs still decode to the portable bank. |
-| DI variance / GI bias | Prior four-seed synthetic pan showed **higher** repeat variance and cost with reuse on both routes. The moving fixture checks local cache rejection; it doesn't quantify converge-to-Reference bias. | Repeat on fast retail flight, animated occlusion and reveal, with fixed ROI, separated seeds, converged Reference and matched timings. |
-| Hybrid primary | Prior CPU A/B had inconsistent raster-inclusive performance. The focused unavailable-raster fixture uses an ambient-only white receiver with no direct light or bounce; a forced target refusal falls back to full primary rays with identical color and reverse-Z. | Physical raster-inclusive A/B/A/B on the same captures with normal-present tails and no silent fallback. |
+| Paced uploads/static BLAS | CPU Vulkan publication fixtures keep the old resident snapshot until its replacement is ready. Hardware recorded eight old-scene redraws, five copy batches (max 8,192 B) and 18 BLAS builds in three batches. | Resident-crossing tails, publication counts and whole-viewer driver heap. |
+| Sampled BC | Opt-in BC1 terrain plus compatible authored **BC5 UNORM RG normals** and **BC7 sRGB cutout/opacity** static BMD tiles. Test details below. | Matched sampled-vs-buffer allocation, full-view speed and heap A/B on the installed client. |
+| DI/GI reuse | Four seeds × eight moving poses, 43² trace: DI repeat variance 131.41 → 155.90; DI+GI 562.86 → 583.50; mean-image RMS 4.944/4.888 RGB8 vs finite controls. Reuse cost more on both routes. | Fast retail flight, animated occlusion/reveal, and convergence-to-Reference comparisons of GI bias, with separated seeds and matched timings. |
+| Hybrid primary | A forced unavailable-raster test with no direct light or bounce returned identical fallback color `[89,51,25,255]` and reverse-Z `0.32275134`. No repeatable raster-inclusive gain. | Matched Hardware–Hybrid–Hardware–Hybrid travel, counting raster plus traversal and rejecting silent fallback. |
 
-No change to default Hybrid enablement, BC sampling or DI/GI reuse was made.
-See [performance and prior results](../../performance.md#still-open),
-[pacing and logical limits](../../gpu-budget.md), and the separate
-[synchronized and normal-present recipes](../../travel.md).
+## Sampled BC admission and readback
 
-**Local S on `31bfeef`:** both paced publication suites passed. The narrow
-CPU Vulkan Hardware fixture kept the old scene through eight redraws and
-published five copy batches (maximum 8,192 B), with 18 static BLAS builds in
-three batches. The forced unavailable-raster ambient probe matched
-`[89, 51, 25, 255]` and reverse-Z `0.32275134` exactly. The local **sampled BC**
-interop fixture exited **139** on the narrow lavapipe process, so there is
-no fresh local success or sampled-vs-buffer comparison. Keep this result
-separate from [the hosted Linux run](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44523578638/job/135558183606), where the BC,
-water and raster parity fixtures passed using the runner's stock Mesa
-settings. Raw local logs: `13-renderer/`. Neither run measures a physical GPU.
+`PW_RAY_BC_TEXTURES=1` applies to Vulkan **Hardware** only. Each supported
+format gets a separate 256²-image array with block-aligned mip rectangles.
+BC5 samples RG as linear data; shader reconstruction of the normal's Z
+follows filtering. BC7 hardware linearizes RGB but keeps alpha linear;
+filtering premultiplies the taps and unassociates the result. Authored mips,
+wrap/clamp and explicit fractional-LOD weights are retained. Alpha-test
+coverage can still read the associated decoded mip tree. Materials that
+need generated/reduced mips, are not compatible with the stored channels,
+or arrive after the immutable prefix was assembled can use decoded tiles.
+The prepacked material prefix is capped to the smaller of 8 MiB and 1/8 of
+remaining texture-bank bytes. Unsupported device/format, failed allocation,
+or a changed bank identity uses the buffer fallback; fallback allocation
+cannot be counted as an optimization. Changed bank identity disables atlas
+access without freeing the images, so their charged bytes remain reported.
+
+The small Vulkan compute fixture ran on `d6c5c37`: **16 NPOT mip/wrap/clamp
+samples**, maximum absolute linear RGBA difference **0.0000002**. It uses
+real buffer uploads, BC image copies, sampled-image descriptors and shader
+filtering. Corrupting only the decoded BC7 level confirms the sampled path
+is actually accessed. It charges **592 B** for the mixed logical bank and
+**131,072 B** for the allocated image arrays. It is not a full-frame ray
+traversal success, nor a memory or speed win. Earlier full-ray attempts on
+this CPU driver exited 137/139 during cold compilation; the old BC1
+interop passed on hosted stock Mesa and failed in the local narrow run.
+Individual receipts are in `13-renderer/` in the [bundle](14-delivery.md).
+The repeated reuse test on `31bfeef` reports synchronized draw/readback p50
+for DI of **68.04 → 94.79 ms** (Software) and **43.07 → 65.45 ms** (CPU query),
+and for DI+GI **90.66 → 136.34** and **74.61 → 92.64 ms** respectively. That
+extra readback-bound evidence also supplies no reason to enable reuse.
+
+For a target A/B, run the same portable Hardware capture/travel with
+`PW_RAY_COMPACT_TERRAIN=1` in both and `PW_RAY_BC_TEXTURES=1` only in B.
+Confirm nonzero sampled counts (per format for material controls), comparable
+settings/poses/coverage, and no fallback. Record `bc_image_allocated_bytes`,
+render allocation logs, current AS/trace/filter spans and synchronized plus
+normal-present tails. Whole-viewer heap is a separate driver estimate, not
+the sum of tile payloads. If the admissions change, report those changes
+rather than attributing the entire delta to filtering. Keep **Hybrid,
+sampled BC and DI/GI reuse off by default** until physical measurements
+justify changing policy. See [performance](../../performance.md),
+[budgets](../../gpu-budget.md) and [travel](../../travel.md).

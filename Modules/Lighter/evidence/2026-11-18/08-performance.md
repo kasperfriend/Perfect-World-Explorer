@@ -24,7 +24,7 @@ compositor time. GPU ray composition is not whole-viewer GPU presentation.
 The synchronization and polling themselves alter cadence, so retain a
 separate normal-present run. Motion PNG readback cannot be combined with
 this audit. `lighter_travel_report.py --require-sdk-matrix` requires all
-seven provider/route receipts on the exact Windows RTX 3080 Vulkan adapter
+seven provider/route receipts on the exact Windows x64 RTX 3080 10 GB Vulkan device
 and per-frame heap/trace/SDK samples.
 
 Sample Vulkan process **device-local heap** usage each measured synced

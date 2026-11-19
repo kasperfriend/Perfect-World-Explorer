@@ -35,14 +35,19 @@ from an empty ray draw list. Ray preview receipts label the scope
 Historical [CPU captures on `7a71750`](../../scene-coverage.md#retail-software-captures--2026-11-18),
 24 warm-up frames at noon, had `a01` **25 playing / 195 queued / 84
 inactive / 0 failed**, and `a02` **25 / 14 / 3 / 0**. These are from those
-frames only; `a07` and the current build lack a matching retail runtime census.
-There are no physical per-map counts in this delivery.
+frames only. New CPU receipts add a Native main-stream census and
+case-level counters for each route and weather. See the [CPU
+matrix](../../retail-matrix.md). There are no physical per-map counts.
 
 New schema-3 receipts expose `world_effect_roots_*` for playing, queued,
 inactive, rejected, unreadable, no package and unsupported in **both**
 routes. These count actual world and model-event owners sampled at the
-saved frame. They do not make the rest of Native's geometry inventory
-exhaustive. Warp counts are the elements omitted by the shared player at
+saved frame. Native `main_streamed_v1` reconciles authored BMD, water owners,
+trees, EC actors and grass areas with main-stream draw decisions/reasons.
+It excludes reflection/refraction subpass visibility. `native_last_scene_passes`
+may be three even though the census counts scene owners once. In the
+fixture, one BMD loads, one is out of range and one is unavailable, with one
+texture fallback. Warp counts are the elements omitted by the shared player at
 that tick, separately from roots. `Warp:1` requires a framebuffer distortion
 pass which neither viewer route implements; it isn't glass or an alpha card.
 
@@ -54,15 +59,43 @@ are omitted by the ray route; the `effect_draws.unsupported` total includes
 other unsupported blend pairs too. These are **not** visibility or parity
 counts. Compare matched PNGs if any candidates are present.
 
-`rain_mask_authored` distinguishes decoded `textures/rain.tga` from the
-procedural fallback. `rain_at_eye` is selection with the main-eye wet guard;
-`ray_rain_cards` counts cards actually inserted into the ray packet (320
-when selected, dry and admitted; otherwise 0). On Native, selection is not
-a count of surviving fragments. The synthetic fixture pack lacks authored
-rain art; its Software Rain run confirms `rain_at_eye=true`,
-`rain_mask_authored=false` and `ray_rain_cards=320`
-(`12-inventory/rain-fixture/`). We could not load the matching
-`textures.pck` on this host, so
-retail rain-art availability and Native-vs-ray visible parity are **not
-verified**, even though the historical CPU matrix selected Rain. See
-[weather behavior](../../effects-weather.md).
+Both routes read `textures/rain.tga` with an explicit TGA decoder when
+signature detection fails, instead of treating a valid TGA as missing.
+`rain_mask_source` is `authored`, `package_missing`, `package_unreadable`,
+`member_missing`, `member_unreadable`, or `decode_failed`;
+`rain_mask_authored` is the compatibility flag. The unit fixture loads a
+real encoded TGA and covers missing archive, missing member, invalid art
+and unreadable directory. A historical `false` cannot identify which case
+occurred. `rain_at_eye` includes the main-eye wet guard.
+`native_rain_slots_selected` counts slots before shader wet-mask/clip/depth
+checks; `ray_rain_cards` counts packed cards. Neither measures visible
+pixels. Use controlled clear-vs-rain deltas and inspect the affected regions.
+
+On the latest matched synthetic dry-eye fixture, toggling only Clear to
+Rain changed **164 / 691,200** Native pixels and **3,034 / 691,200** Software
+pixels in encoded RGB8. Both selected **320** submitted slots/cards and
+reported `member_missing` from the same fixture package. This is a weather
+A/B, not a counted rain-fragment mask or parity result. The Native frame
+had three scene passes. See `12-inventory/final-matched-rain.json` and the
+PNGs/hash-bound sidecars. These counts are not retail.
+
+### Pinned client CPU captures on `d6c5c37`
+
+Both routes reported **`rain_mask_source=authored`** in the hosted subset;
+the fix did not merely change the fallback label. In the dry-eye views,
+Rain selected 320 Native slots and 320 Software cards. Controlled deltas
+are whole pre-UI pixels that changed from Clear, not surviving-fragment
+counts or evidence that the two masks/appearances match pixel by pixel.
+
+| Map (fixed daylight camera) | Native / Software changed RGB8 pixels (of 691,200) | Native / Software BMD loaded / skipped / failed | Playing / queued / inactive roots, each route | Warp omissions, each route |
+| --- | ---: | --- | --- | ---: |
+| `a01` | 1,399 / 6,492 | 0/328/0 · 316/12/0 | 25/195/84 | 11 |
+| `a02` | 1,316 / 5,754 | 0/32/0 · 22/10/0 | 25/14/3 | 23 |
+| `a07` shoreline | 824 / 15,168 | 6/110/0 · 116/0/0 | 13/9/0 | 5 |
+
+No failed roots or destination-color candidates were reported in these
+frames. These are view/tick-specific counts of a different scope than the
+placement-weighted Warp census. No complete matching texture package was
+downloaded locally. See [capture diagnostics](../../retail-matrix.md#lightmaps-on-cpu-rerun)
+and [weather behavior](../../effects-weather.md). Physical visible parity,
+including a camera with a destination-color subject, still needs review.
