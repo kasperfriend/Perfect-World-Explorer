@@ -25,6 +25,14 @@
 
 const MAGIC: u32 = 0x5442_4b42;
 
+/// T2BK layout revisions this reader implements.
+///
+/// The header grows at 3, 4 and 6, and the pre-v5 flag byte is read as a
+/// has-data byte. Every `.t2bk` surveyed across all six staged clients is
+/// version 6 (`tools/version-gates.py`), so the top of the range is what
+/// shipped data uses.
+pub const KNOWN_VERSIONS: std::ops::RangeInclusive<u32> = 2..=6;
+
 /// Per-vertex RGBA section present after the normals.
 pub const FLAG_VERTEX_COLOUR: u8 = 0x1;
 /// Heights and normals are zlib-compressed.
@@ -75,8 +83,24 @@ pub fn layout(data: &[u8], grid: usize) -> Result<Layout, String> {
         return Err("invalid T2BK".into());
     }
     let version = u32at(data, 4)?;
-    if !(2..=6).contains(&version) {
-        return Err(format!("unsupported T2BK version {version}"));
+    // Versions 2..=6 are the layout revisions this reader was built against:
+    // the header grows at 3, 4 and 6, and the pre-v5 flag byte is read as a
+    // has-data byte. Above 6 there is no recovered layout, and guessing one
+    // would silently shift every section offset below.
+    //
+    // Surveyed, not assumed: every `.t2bk` staged from the 1.3.1, 1.3.6, 1.4.2,
+    // 1.4.4, 1.5.2 and 1.8.4 installs is version 6
+    // (`tools/version-gates.py`). So the top of the range is what shipped data
+    // uses, and a version above it is a client this reader has never seen
+    // rather than a client it ought to handle. `main.rs` consults the same
+    // range, so the scan and the loader cannot disagree about a block.
+    if !KNOWN_VERSIONS.contains(&version) {
+        return Err(format!(
+            "unsupported T2BK version {version} (this build reads {}..={}); \
+             the block is skipped by name, not the map",
+            KNOWN_VERSIONS.start(),
+            KNOWN_VERSIONS.end()
+        ));
     }
     let count = u32at(data, 8)? as usize;
     let flags = if version < 5 {

@@ -714,14 +714,28 @@ fn terrain(
             if name.contains('/') || name.contains('\\') || name.contains("..") {
                 return Err("unsafe subterrain path".into());
             }
-            let data =
-                fs::read(dir.join(format!("{name}.t2bk"))).map_err(|e| format!("{name}: {e}"))?;
+            // A terrain block that cannot be read costs that block, not the
+            // map: the rest of the terrain, the scenery, the water and the
+            // effects are all still worth showing, and a named block is
+            // something an author can act on. The version check and the layout
+            // check below both report by block name.
+            let Ok(data) = fs::read(dir.join(format!("{name}.t2bk"))) else {
+                eprintln!("terrain block {name}: missing or unreadable, skipped");
+                continue;
+            };
             if u32at(&data, 0)? != 0x54424b42 {
-                return Err(format!("{name}: invalid T2BK"));
+                eprintln!("terrain block {name}: not a T2BK, skipped");
+                continue;
             };
             let v = u32at(&data, 4)?;
-            if !(2..=6).contains(&v) {
-                return Err(format!("{name}: unsupported version {v}"));
+            if !terrain_block::KNOWN_VERSIONS.contains(&v) {
+                eprintln!(
+                    "terrain block {name}: unsupported T2BK version {v} \
+                     (this build reads {}..={}), skipped",
+                    terrain_block::KNOWN_VERSIONS.start(),
+                    terrain_block::KNOWN_VERSIONS.end()
+                );
+                continue;
             }
             let n = u32at(&data, 8)? as usize;
             if n < per * per {
