@@ -2388,7 +2388,7 @@ impl Lighter {
                     };
                     match d.unavailable_reason() {
                         Some(reason) => {
-                            ui.add(egui::Label::new(text).text_color(egui::Color32::GRAY))
+                            ui.add(egui::Label::new(egui::RichText::new(text).color(egui::Color32::GRAY)))
                                 .on_hover_text(reason);
                         }
                         None => {
@@ -2451,7 +2451,6 @@ impl Lighter {
             if export_btn.clicked() {
                 // Export per-frame timing samples as CSV.
             }
-            .on_hover_text("Export one row per frame with per-stage timings and provider names.");
         }
         ui.checkbox(&mut self.settings.physical_bsdf, "GGX / Lambert materials")
             .on_hover_text("Evaluate and sample energy-bounded microfacet and diffuse lobes on relit materials. Preserve the legacy color stages for baked surfaces and GFX sheets.");
