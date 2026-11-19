@@ -1,7 +1,8 @@
 //! Experimental GPU world renderer: actual client terrain, static BMDs and water masks.
 //! Baked terrain material atlas, fixed lighting and flat water are not client parity.
 use crate::modules::lighter::{
-    coverage::Counts as RayCounts, Denoiser, Lighter, Mode as LighterMode, Settings as LighterSettings,
+    coverage::Counts as RayCounts, Denoiser, Lighter, Mode as LighterMode,
+    Settings as LighterSettings,
 };
 use crate::scenery_visibility::{
     allows_class_with_context, lod_scale, Class, ModelClass, Pass, RenderContext, Visibility,
