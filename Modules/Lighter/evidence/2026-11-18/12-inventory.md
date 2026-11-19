@@ -10,10 +10,10 @@ rendered or as broken PW 1.4.2 assets.
 ## Read-only census on pinned PW 1.4.2 inputs
 
 `cargo run --locked --bin lighter-scene-audit -- ELEMENT/gfx.pck ELEMENT/maps/a01 ELEMENT/maps/a02 ELEMENT/maps/a07`
-uses the production scene, GFX container and water readers. It inspects
-**direct placed roots only**. It does not resolve child GFX, bind textures,
-activate a player or visit model-event owners. Checksums of the obtained
-inputs and the raw census are in `12-inventory/` in the [bundle](14-delivery.md).
+uses the production scene, GFX container and water readers. The first census
+below covered **direct placed roots**. The follow-up traverses their authored
+child references too. Neither binds textures, activates a player or visits
+model-event owners. Checksums and raw census receipts are in `12-inventory/`.
 
 | Map | Ornaments | Direct placed roots (unique paths) | Readable / unreadable / rejected / unsupported | Authored Warp elements (placement-weighted) | DstColor or InvDstColor source / destination elements | Grass area refs |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -99,3 +99,26 @@ placement-weighted Warp census. No complete matching texture package was
 downloaded locally. See [capture diagnostics](../../retail-matrix.md#lightmaps-on-cpu-rerun)
 and [weather behavior](../../effects-weather.md). Physical visible parity,
 including a camera with a destination-color subject, still needs review.
+
+## Ordered follow-up: authored descendant census
+
+The census now follows element-200–204 `GfxPath` references through the
+pinned GFX pack, with the same member normalization and depth bound as the
+player. It weights repeated edges by placement count, counts unreadable,
+rejected, unsupported, invalid-path, cycle or depth omissions separately,
+and refuses to report a truncated graph when its audit budget is exhausted.
+In an authored graph, a cycle is stopped on the first return to its root;
+this is not a record of the runtime player's attempted loads.
+
+On the pinned `a01`, `a02`, `a07`, all **368** direct placements were
+readable and authored **0 child references**. The prior Warp totals
+**96 / 38 / 5** and destination-color zeros therefore also describe those
+particular placed text graphs. The new unit fixture checks weighted counts,
+case/prefix matching, and bad path/cycle outcomes. See
+`12-inventory/authored-graph-census.log`, its input SHA-256 file and test log.
+
+**Remaining:** the pinned graphs do not cover mainland grass, ECM
+model-event effects, screen-visible Warp/destination-color subjects, or
+post-clip rain fragments. The effect roots/candidates and Clear-vs-Rain
+picture deltas above retain their narrower scope. S38/S40 remain correctly
+excluded; no physical inventory or visible-parity gate was closed.

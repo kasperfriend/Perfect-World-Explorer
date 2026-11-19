@@ -100,15 +100,10 @@ use crate::{
     gfx_color_track::ColorTrack,
     gfx_file::{
         Child, Common, Control, ControlData, Curve, Cylinder, Element, Grid, KeyPoint, Lightning,
-        NoiseKind, Particle, Root, Spec, Sprite, Trail, Wave,
+        NoiseKind, Particle, Root, Spec, Sprite, Trail, Wave, MAX_CHILD_DEPTH,
     },
 };
 use glam::{Mat4, Quat, Vec3, Vec4};
-
-/// Nesting limit for element-200 children. The client resolves child paths at
-/// load time and has no cycle guard, so a self-referencing root would recurse
-/// until the stack goes.
-pub const MAX_CHILD_DEPTH: usize = 6;
 
 /// Per-emitter particle ceiling. `Quota` is authoritative when smaller; this
 /// only bounds a malformed value.
@@ -3454,15 +3449,7 @@ pub fn texture_path(texture: &str) -> Result<String, String> {
 
 /// Archive path of a child root (`GfxPath`), relative to the `gfx` root.
 pub fn child_path(path: &str) -> Result<String, String> {
-    let normalized = ecmodel::normalize(path);
-    if normalized.is_empty() || !is_safe(&normalized) {
-        return Err(format!("unsafe GFX child path: {path}"));
-    }
-    Ok(if normalized.starts_with("gfx/") {
-        normalized
-    } else {
-        format!("gfx/{normalized}")
-    })
+    crate::gfx_file::child_member_path(path)
 }
 
 fn is_safe(path: &str) -> bool {
