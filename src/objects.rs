@@ -242,8 +242,8 @@ pub struct Objects {
     resolver: TextureResolver,
     /// Scenery archives are optional: an instance map can still show terrain,
     /// water, trees and the models it does have when one package is absent.
-    litfile: Option<pck::Package>,
-    texfile: Option<pck::Package>,
+    litfile: Option<SceneryArchive>,
+    texfile: Option<SceneryArchive>,
     lit_archive_error: Option<String>,
     lit_archive_entries: usize,
     litmodel_map_id: String,
@@ -285,26 +285,99 @@ pub fn set_unbounded_textures(on: bool) {
 pub fn unbounded_textures() -> bool {
     UNBOUNDED_TEXTURES.load(std::sync::atomic::Ordering::Relaxed)
 }
+/// Open a scenery archive in whichever container this client shipped it.
+///
+/// `litmodels.pck` and `building.pck` are retail v2 packages in 1.8.4. The
+/// 1.5.2 client files them in the Angelica container instead -- the same one
+/// `configs.pck` and `grasses.pck` use, which is why every other 1.5.2 loader
+/// already falls back to `angelica_pck::directory` (`grass.rs`,
+/// `environment.rs`, `world_catalog.rs`, `sky_gpu.rs`). This one did not, so a
+/// 1.5.2 map loaded its terrain, grass and effects and drew no buildings at all:
+/// both scenery archives were reported unavailable before a single model was
+/// asked for.
+fn open_scenery_package(path: &Path) -> Result<SceneryArchive, String> {
+    let mut package = pck::Package::open(path)?;
+    match package.directory() {
+        Ok(entries) => return Ok(SceneryArchive::Retail { package, entries }),
+        Err(retail) => {
+            // `angelica_pck::directory` positions the file itself, but state the
+            // precondition rather than inherit the cursor the failed retail read
+            // left behind.
+            if let Err(error) = std::io::Seek::rewind(package.first_file_mut()) {
+                return Err(format!("{}: {error}", path.display()));
+            }
+            match crate::angelica_pck::directory(package.first_file_mut()) {
+                Ok(entries) => {
+                    eprintln!(
+                        "Scenery archive {} is an Angelica package (retail read said: {retail})",
+                        path.display()
+                    );
+                    Ok(SceneryArchive::Angelica { package, entries })
+                }
+                Err(angelica) => Err(format!(
+                    "{}: neither container; retail: {retail}; Angelica: {angelica}",
+                    path.display()
+                )),
+            }
+        }
+    }
+}
+
+/// A scenery archive, in whichever container the client shipped it.
+///
+/// Only the *directory* differs between the two: entries carry absolute file
+/// offsets and zlib payloads in both, so `read` is one implementation.
+enum SceneryArchive {
+    Retail {
+        package: pck::Package,
+        entries: Vec<pck::Entry>,
+    },
+    Angelica {
+        package: pck::Package,
+        entries: Vec<pck::Entry>,
+    },
+}
+
+impl SceneryArchive {
+    fn package(&self) -> &pck::Package {
+        match self {
+            Self::Retail { package, .. } | Self::Angelica { package, .. } => package,
+        }
+    }
+
+    fn container(&self) -> &'static str {
+        match self {
+            Self::Retail { .. } => "retail",
+            Self::Angelica { .. } => "Angelica",
+        }
+    }
+
+    fn directory(&self) -> &[pck::Entry] {
+        match self {
+            Self::Retail { entries, .. } | Self::Angelica { entries, .. } => entries,
+        }
+    }
+}
+
 fn open_optional_archive(
     path: &Path,
 ) -> (
-    Option<pck::Package>,
+    Option<SceneryArchive>,
     HashMap<String, pck::Entry>,
     Option<String>,
 ) {
     // A package cut at `MAX_FILE_PACKAGE` keeps the rest of itself in the `.pkx`
     // of the same stem; opening only the `.pck` rejected `litmodels.pck` outright
     // in the 1.5.2 client and left every scenery model unavailable.
-    let mut package = match pck::Package::open(path) {
-        Ok(package) => package,
-        Err(error) => {
-            let reason = format!("{}: {error}", path.display());
+    let archive = match open_scenery_package(path) {
+        Ok(archive) => archive,
+        Err(reason) => {
             eprintln!("Optional scenery archive unavailable: {reason}");
             return (None, HashMap::new(), Some(reason));
         }
     };
-    if package.is_split() {
-        if let Some(pkx) = package.continuation() {
+    if archive.package().is_split() {
+        if let Some(pkx) = archive.package().continuation() {
             eprintln!(
                 "Scenery archive {} is split at MAX_FILE_PACKAGE; reading it with {}",
                 path.display(),
@@ -312,27 +385,20 @@ fn open_optional_archive(
             );
         }
     }
-    match package.directory() {
-        Ok(entries) => {
-            let indexed: HashMap<_, _> = entries
-                .into_iter()
-                .map(|entry| (normalize(&entry.name), entry))
-                .collect();
-            let bmd_count = indexed.keys().filter(|name| name.ends_with(".bmd")).count();
-            eprintln!(
-                "Indexed scenery archive {}: {} members, {} BMDs",
-                path.display(),
-                indexed.len(),
-                bmd_count
-            );
-            (Some(package), indexed, None)
-        }
-        Err(error) => {
-            let reason = format!("{}: {error}", path.display());
-            eprintln!("Optional scenery archive could not be read: {reason}");
-            (None, HashMap::new(), Some(reason))
-        }
-    }
+    let indexed: HashMap<_, _> = archive
+        .directory()
+        .iter()
+        .map(|entry| (normalize(&entry.name), entry.clone()))
+        .collect();
+    let bmd_count = indexed.keys().filter(|name| name.ends_with(".bmd")).count();
+    eprintln!(
+        "Indexed scenery archive {} as {}: {} members, {} BMDs",
+        path.display(),
+        archive.container(),
+        indexed.len(),
+        bmd_count
+    );
+    (Some(archive), indexed, None)
 }
 
 fn tex_budget_bytes() -> usize {
@@ -539,8 +605,8 @@ impl Objects {
                 // Every piece of the package, so a model stored past the first
                 // continuation still reads. A batch is shared by reference and
                 // the reads are positioned, so the threads do not interfere.
-                let parts = litfile.part_list();
-                let layout = litfile.layout().clone();
+                let parts = litfile.package().part_list();
+                let layout = litfile.package().layout().clone();
                 std::thread::scope(|s| {
                     let handles: Vec<_> = missing_models
                         .chunks(chunk_size)
@@ -735,8 +801,8 @@ impl Objects {
                                                 .map(|(_, entry)| entry)
                                                 .collect();
                                             pck::read_entries_in(
-                                                &file.part_list(),
-                                                file.layout(),
+                                                &file.package().part_list(),
+                                                file.package().layout(),
                                                 &entries,
                                             )
                                         };
@@ -948,7 +1014,7 @@ impl Objects {
                 .litfile
                 .as_ref()
                 .ok_or_else(|| "litmodels.pck unavailable".to_string())?;
-            package.read(&entry)?
+            package.package().read(&entry)?
         } else {
             let entry = self
                 .texentries
@@ -959,7 +1025,7 @@ impl Objects {
                 .texfile
                 .as_ref()
                 .ok_or_else(|| "building.pck unavailable".to_string())?;
-            package.read(&entry)?
+            package.package().read(&entry)?
         };
         self.decode_and_store(key, &data)
     }
@@ -1053,6 +1119,98 @@ impl Objects {
     }
     pub fn resolver_stats(&self) -> crate::texture_resolution::ResolverStats {
         self.resolver.stats
+    }
+}
+
+#[cfg(test)]
+mod container_tests {
+    use super::*;
+
+    /// Build an Angelica package holding one stored member.
+    ///
+    /// This is the container the 1.5.2 client files `litmodels.pck` and
+    /// `building.pck` in, and the one a scenery archive used to be refused for:
+    /// the retail read fails, `open_optional_archive` returned `None`, and the
+    /// map drew no buildings while its terrain and effects loaded normally.
+    fn angelica(name: &str, payload: &[u8]) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+        let mut record = vec![0u8; 276];
+        record[..name.len()].copy_from_slice(name.as_bytes());
+        record[260..264].copy_from_slice(&12u32.to_le_bytes());
+        record[264..268].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        record[268..272].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        let mut encoder = ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&record).unwrap();
+        let stream = encoder.finish().unwrap();
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x4dca23efu32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0x56a089b7u32.to_le_bytes());
+        // The member lives at offset 12, straight after the prefix.
+        out.extend_from_slice(payload);
+        out.extend_from_slice(&[0u8; 8]);
+        out.extend_from_slice(&stream);
+        let mut header = vec![0u8; 280];
+        header[0..4].copy_from_slice(&crate::pck::ANGELICA_GUARD_0.to_le_bytes());
+        header[268..272].copy_from_slice(&crate::pck::ANGELICA_GUARD_1.to_le_bytes());
+        header[272..276].copy_from_slice(&1u32.to_le_bytes());
+        header[276..280].copy_from_slice(&0x0002_0002u32.to_le_bytes());
+        out.extend_from_slice(&header);
+        let size = out.len() as u32;
+        out[4..8].copy_from_slice(&size.to_le_bytes());
+        out
+    }
+
+    fn temp_package(bytes: &[u8], name: &str) -> std::path::PathBuf {
+        static UNIQUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "pwe-scenery-{}-{}-{name}",
+            std::process::id(),
+            UNIQUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn an_angelica_scenery_archive_opens_and_reads() {
+        let payload = b"MOXFBRAME: scenery";
+        let path = temp_package(
+            &angelica("litmodels/a01/1/litmodel_7.bmd", payload),
+            "litmodels.pck",
+        );
+        let archive = open_scenery_package(&path).expect("Angelica scenery archive must open");
+        assert_eq!(archive.container(), "Angelica");
+        assert_eq!(archive.directory().len(), 1);
+        // The whole point: the member is readable, not just listed.
+        let entry = &archive.directory()[0];
+        assert_eq!(entry.name, "litmodels/a01/1/litmodel_7.bmd");
+        assert_eq!(archive.package().read(entry).unwrap(), payload);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn open_optional_archive_indexes_an_angelica_scenery_archive() {
+        let path = temp_package(&angelica("textures/a/beam.dds", b"DDS "), "building.pck");
+        let (archive, indexed, error) = open_optional_archive(&path);
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(archive.as_ref().unwrap().container(), "Angelica");
+        assert!(indexed.contains_key("textures/a/beam.dds"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_neither_container_archive_names_both_readers() {
+        let path = temp_package(&[0x11; 4096], "litmodels.pck");
+        let reason = match open_scenery_package(&path) {
+            Ok(_) => panic!("a garbage archive must not open"),
+            Err(reason) => reason,
+        };
+        assert!(reason.contains("retail"), "{reason}");
+        assert!(reason.contains("Angelica"), "{reason}");
+        std::fs::remove_file(path).unwrap();
     }
 }
 #[cfg(test)]

@@ -1382,6 +1382,8 @@ EOF
 pub mod bmd;
 #[path = "$REPO/src/pck.rs"]
 pub mod pck;
+#[path = "$REPO/src/angelica_pck.rs"]
+pub mod angelica_pck;
 #[path = "$REPO/src/scene.rs"]
 pub mod scene;
 #[path = "$REPO/src/texture_resolution.rs"]

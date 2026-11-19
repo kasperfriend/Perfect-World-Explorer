@@ -691,6 +691,11 @@ impl Package {
         &self.first
     }
 
+    /// A positioned handle for the Angelica directory walk, which seeks.
+    pub fn first_file_mut(&mut self) -> &mut File {
+        &mut self.first
+    }
+
     /// The first continuation's file, for code that reads the pieces itself.
     pub fn second_file(&self) -> Option<&File> {
         self.continuations.first().map(|(file, _)| file)

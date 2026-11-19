@@ -183,11 +183,19 @@ pub fn litmodel_key(path: &str) -> String {
     format!("litmodels/world/{}", litmodel_relative(path))
 }
 
-fn litmodel_entry_candidates(canonical: &str) -> [String; 4] {
+/// Archive spellings to try for one canonical key, in order of preference.
+///
+/// `litmodels/world/...` is included even when the canonical key names another
+/// partition: keeping a map's own namespace must *add* a lookup, never replace
+/// the main-world one. An EC-BSD that spells a partition the archive does not
+/// use still finds the world copy, which is what it resolved to before the
+/// partition was preserved.
+fn litmodel_entry_candidates(canonical: &str) -> [String; 5] {
     let relative = litmodel_relative(canonical);
     [
         canonical.to_string(),
         format!("litmodels/{relative}"),
+        format!("litmodels/world/{relative}"),
         format!("world/{relative}"),
         relative,
     ]
