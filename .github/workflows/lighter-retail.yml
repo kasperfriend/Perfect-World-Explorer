@@ -4,10 +4,6 @@ name: Lighter retail capture matrix
 # for maps and packages; never cache or upload client asset bytes.
 on:
   workflow_dispatch:
-  push:
-    branches: [arena/69c8ea78-perfect-world-explorer]
-    paths:
-      - '.github/workflows/lighter-retail.yml'
 
 permissions:
   contents: read

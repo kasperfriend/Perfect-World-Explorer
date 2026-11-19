@@ -78,6 +78,66 @@ it does not inspect the artistic subject or assert pixel parity.
   collected separately from the logs. Keep [synthetic GPU budget results](gpu-budget.md)
   separate from these retail captures.
 
+## Completed CPU Vulkan matrix — run started 2026-11-18 UTC
+
+[Run 44424106472 (`7c57586`)](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44424106472)
+passed all nine Native/Software pairs. The
+[`lighter-retail-matrix` artifact](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44424106472/artifacts/14483069898)
+contains 18 captures, nine absolute-difference images, and the inventories,
+metadata, logs and structured measurements. The runner calculated the values
+below from the decoded PNGs on **llvmpipe, Mesa 25.0.7 / LLVM 19.1.7**. Signed
+blob downloads were unavailable in this workspace, so the region metrics are
+reported from CI, not from visual inspection here.
+
+Both modes used 960×720 captures with a fixed animation clock. Software
+traced 240×180 rays. Noon at hour 12 is used for clear day and forced rain;
+night is hour 0/clear. Warm-up was 24 steps for `a01`/`a02` and 12 for `a07`.
+Terrain lightmaps are on for `a01`/`a02` and off for `a07` in both modes.
+
+| Camera / condition | Whole | Upper third | Middle third | Lower third | Center |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `a01-day` | 29.732 | 1.475 | 1.945 | 85.776 | 1.771 |
+| `a01-night` | 56.248 | 31.965 | 51.533 | 85.246 | 51.487 |
+| `a01-rain` | 29.713 | 1.489 | 1.960 | 85.691 | 1.805 |
+| `a02-day` | 15.829 | 1.239 | 4.238 | 42.011 | 2.565 |
+| `a02-night` | 40.314 | 32.095 | 46.834 | 42.011 | 47.721 |
+| `a02-rain` | 15.834 | 1.259 | 4.252 | 41.992 | 2.592 |
+| `a07-day` | 6.751 | 4.811 | 7.459 | 7.984 | 7.746 |
+| `a07-night` | 5.877 | 4.125 | 6.677 | 6.830 | 7.305 |
+| `a07-rain` | 6.798 | 4.893 | 7.513 | 7.989 | 7.840 |
+
+| Map | Eye XYZ | Yaw / pitch | Ray buildings loaded / skipped / failed | GFX roots loaded / skipped / failed |
+| --- | --- | --- | ---: | ---: |
+| `a01` | `(0,260.39215,0)` | `0 / −0.15` | `316 / 12 / 0` | `25 / 279 / 0` |
+| `a02` | `(0,332.56122,0)` | `0 / −0.10` | `22 / 10 / 0` | `25 / 17 / 0` |
+| `a07` | `(16,356,84)` | `0 / −0.60` | `116 / 0 / 0` | `13 / 9 / 0` |
+
+Counts were unchanged among the three conditions of each view. `a07` had
+one authored water owner and admitted it under each condition. The large
+lower-band daylight differences in `a01`/`a02` and the broader differences
+at night need visual investigation. The smaller `a07` errors are **not** a
+shoreline parity result. The measured regions do not isolate individual
+surfaces or particular reflection/refraction and shadow paths.
+
+| Camera / condition | Native p50 / p95 (ms) | Software p50 / p95 (ms) |
+| --- | ---: | ---: |
+| `a01-day` | 149.3/151.4 | 669.6/674.8 |
+| `a01-night` | 113.8/115.9 | 654.2/655.8 |
+| `a01-rain` | 115.9/116.8 | 1193.8/1201.8 |
+| `a02-day` | 112.3/114.9 | 484.0/499.7 |
+| `a02-night` | 111.8/115.9 | 476.8/478.9 |
+| `a02-rain` | 114.1/115.4 | 989.8/991.5 |
+| `a07-day` | 1639.3/1648.9 | 4381.2/4437.2 |
+| `a07-night` | 1651.7/1674.2 | 3709.9/3717.9 |
+| `a07-rain` | 1647.5/1653.8 | 5039.6/5123.6 |
+
+Three warmed draw-plus-readback samples per mode; with three samples the
+nearest-rank p95 is the maximum. These are CPU Vulkan capture diagnostics,
+not live viewer frame times or estimates of physical GPU performance.
+[Linux and Windows PR checks on the same code revision](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44424114678)
+passed separately, including the synthetic ray pixels, inventory and live
+recovery fixture. They do not add retail Hardware evidence.
+
 ## Earlier retail evidence (2026-11-18)
 
 - [Run 44406210481](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44406210481),
@@ -91,3 +151,9 @@ it does not inspect the artistic subject or assert pixel parity.
   water body, lightmaps off, in `lighter-retail-coverage`. The signed artifact
   download was unavailable in this workspace; no visual parity or regional
   error conclusion from that artifact alone.
+- [Run 44422660964](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44422660964),
+  `bfeee2d`: all nine Native/Software pairs at 50% ray resolution in an
+  [earlier matrix artifact](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44422660964/artifacts/14483193403).
+  It used schema 2, before the fixed elapsed-animation clock, and did not
+  request synchronized timings. Do not treat differences between these two
+  runs as a single-variable quality or performance comparison.
