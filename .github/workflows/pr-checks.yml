@@ -253,6 +253,24 @@ jobs:
           # Writing the manifest here is what the loader needs and what an
           # installed driver already provides, so it adds no assumption about
           # the driver itself — only the path to it.
+          # The install step above can succeed against a mirror that serves an
+          # empty package, and it can also be skipped as "already installed" on
+          # an image whose driver was stripped. Both leave this step with no
+          # driver, which is not a code failure: install it here once more
+          # before deciding that.
+          if [ -z "$icd" ]; then
+            for attempt in 1 2 3; do
+              sudo apt-get install -y --no-install-recommends --reinstall \
+                mesa-vulkan-drivers >/dev/null 2>&1 || true
+              for dir in /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d /etc/vulkan/icd.d; do
+                found="$(find "$dir" -maxdepth 1 -name '*lvp*' -print -quit 2>/dev/null || true)"
+                if [ -n "$found" ]; then icd="$found"; break; fi
+              done
+              [ -n "$icd" ] && break
+              echo "no lavapipe ICD after install attempt ${attempt}" >&2
+              sleep 10
+            done
+          fi
           if [ -z "$icd" ]; then
             driver="$(find /usr/lib /lib -name 'libvulkan_lvp.so*' -print -quit 2>/dev/null || true)"
             if [ -n "$driver" ]; then
