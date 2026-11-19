@@ -277,27 +277,41 @@ error and the mode exits non-zero.
 
 | client | map | blocks | grid | tree types | trees | water refs | grass | ornaments | effects | models | sounds | precinct |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 1.8.4 | `a37` | 4608 | 48x96 | 0 | 0 | 148 | 2704 | 8441 | 362 | 0 | 0 | 383 zones |
+| 1.8.4 | `a37` | 4608 | 48x96 | 0 | 0 | 148 | 2704 | 8441 | 362 | 0 | 0 | 29 zones |
 | 1.8.4 | `world` | 22528 | 176x128 | 59 | 3646 | 9237 | 38240 | 39179 | 2971 | 76 | 1044 | 383 zones |
 
 `a37`'s 148 water references are the number the water classifier is required to
 account for, and they are all read: 3 areas, 18 shoreline waves, 3,146 points.
 
+`a37` shows **29 zones**, not 383: 383 is the *world* map's count. The two rows
+agreed at 383 for as long as a37's folder was being read with the world's
+`precinct.clt` copied into it. That is now caught — `instance` prints an
+`outside` column and the number was 240 before the file was corrected.
+
 ### Instance maps (`instance`, 18 November 2026)
 
 `tools/offline_harness.sh instance <maps dir>` loads every instance folder the way
-the viewer does and prints one row per map. For the 1.8.4 `a37`, whose files are
-staged:
+the viewer does and prints one row per map. For the 1.8.4 `a37`, whose own files
+are staged:
 
 ```
-map    ecwld    blocks    extent   zones centres tracks  english names
-a37    v          4608 6144x3072     383     383    783  Upcoming / The Harshlands
+map    ecwld    blocks    extent   zones centres tracks  outside  english names
+a37    v          4608 6144x3072      29      29     29        0  Celestial Lake / Candlelight Village
 ```
 
-Every one of the 383 zones has a centre, all 783 playlist tracks survive, and
-the zone names reach English. `extent` is the map's own `.trn2` header, which
-carries no world transform; see `Findings/Unsupported-client-paths.md` for the
-one part of that question still open (the shared coordinate frame).
+Every one of the 29 zones has a centre, all 29 playlist tracks survive, the zone
+names reach English, and **`outside` is 0**: every zone centre falls inside the
+map's own centred extent. `extent` is the map's own `.trn2` header, which carries
+no world transform — the frame is the centred one, proved by a37's own precinct
+(see `Findings/Unsupported-client-paths.md`).
+
+**A correction worth keeping.** An earlier version of this section reported
+*383 zones, 783 tracks* for `a37` and cited `Upcoming / The Harshlands`. Those
+are the **world** map's numbers: the file staged as `a37/precinct.clt` was
+byte-identical to the one beside `world.ecwld`. Under that mix-up 240 of the 383
+centres fell outside a37's extent, which is what exposed it — a whole-map
+precinct beside an instance map does not fit, and the `outside` column now says
+so instead of the row looking healthy.
 
 ### GFX container versions in one pack (18 November 2026)
 

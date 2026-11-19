@@ -169,11 +169,23 @@ pub fn trn2_header(data: &[u8]) -> Result<Trn2Header, String> {
 
 /// Whether a world-space point lies inside a map's own terrain extent.
 ///
-/// Used by the instance-folder harness: a precinct zone centre outside its
-/// map's extent means the two files disagree about which map they describe,
-/// which is exactly what a missing world transform would look like.
+/// **The frame is centred on the origin, and this was measured, not assumed.**
+/// The extent words are sizes, not a corner: a map `width` x `length` covers
+/// `-width/2 ..= width/2` in x and the same in z. The measurement that settles
+/// it is `world.ecwld`, whose 7,737 placed records fill the centred box to
+/// 99.5 % in x and 97.5 % in z with **0** points outside it; if the box were
+/// anchored at a corner, every one of the 5,461 world units of negative z would
+/// be outside. The same holds for the `a37` and `a07` instances (0 outside) and
+/// for the 383 zone centres of the world's `precinct.clt` (0 outside, 92.3 % of
+/// half-width). See `Findings/Unsupported-client-paths.md`.
+///
+/// An earlier version of this function tested `0.0..=width`, which made every
+/// genuinely-placed point in the negative half fail. Nothing caught it because
+/// the only caller was a test asserting a point that happened to be positive.
 pub fn contains_world_point(header: &Trn2Header, x: f32, z: f32) -> bool {
-    (0.0..=header.width).contains(&x) && (0.0..=header.length).contains(&z)
+    let half_width = header.width / 2.0;
+    let half_length = header.length / 2.0;
+    (-half_width..=half_width).contains(&x) && (-half_length..=half_length).contains(&z)
 }
 
 /// Parse the offset table and derive every block's section ranges.
@@ -329,14 +341,24 @@ mod tests {
         assert_eq!(header.length, 3072.0);
         assert_eq!((header.rows, header.columns, header.blocks), (48, 96, 4608));
         assert_eq!(header.grid, 32);
-        // The header describes the map's own extent and nothing else: the
-        // tail words are zero, so there is no matrix hidden in it. Whether the
-        // precinct polygons share this origin is a separate, still-open
-        // question -- they do not fall inside this box -- so the test asserts
-        // the extent and the absence of a transform, not the frame.
+        // The header describes the map's own extent and nothing else: the tail
+        // words are zero, so there is no matrix hidden in it. The frame is
+        // centred on the origin, which is measured on the neighbouring
+        // `world.ecwld` rather than read out of this header -- see
+        // `contains_world_point`.
         assert_eq!(header.width * header.length, 6144.0 * 3072.0);
+        // Inside, on both sides of the origin.
         assert!(contains_world_point(&header, 3070.3, 1500.0));
-        assert!(!contains_world_point(&header, 3070.3, 4606.7));
+        assert!(contains_world_point(&header, -3070.3, -1500.0));
+        assert!(contains_world_point(&header, 0.0, 0.0));
+        assert!(contains_world_point(&header, -3072.0, -1536.0), "the corner is inside");
+        // Outside by a hair, in each direction.
+        assert!(!contains_world_point(&header, 3072.1, 0.0));
+        assert!(!contains_world_point(&header, 0.0, -1536.1));
+        // The mistake the old corner-anchored version made: a point a precinct
+        // polygon really names on the neighbouring world must not read as
+        // "outside this map's extent".
+        assert!(contains_world_point(&header, -1936.0, -428.3), "a37's own placement");
         let bytes = a37_header();
         assert_eq!(
             &bytes[84..96],

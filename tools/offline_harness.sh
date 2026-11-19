@@ -1603,7 +1603,7 @@ fn main() {
         .flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
     dirs.sort();
     let (mut maps, mut bad) = (0, 0);
-    println!("{:<6} {:<7} {:>7} {:>9} {:>7} {:>7} {:>6}  {}", "map", "ecwld", "blocks", "extent", "zones", "centres", "tracks", "english names");
+    println!("{:<6} {:<7} {:>7} {:>9} {:>7} {:>7} {:>6} {:>8}  {}", "map", "ecwld", "blocks", "extent", "zones", "centres", "tracks", "outside", "english names");
     for dir in dirs {
         let id = dir.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
         let row = |what: &str, message: String| {
@@ -1622,9 +1622,25 @@ fn main() {
             Some(h) => format!("{:.0}x{:.0}", h.width, h.length),
             None => "no trn2".to_string(),
         };
-        let (zones, centres, tracks, names) = match music::Zones::open(&dir.join("precinct.clt")) {
+        // Zone centres against the map's own extent, in the centred frame. This
+        // is the check that would have caught the corner-anchored
+        // `contains_world_point`: a precinct file and its world describing
+        // different frames shows up here as centres outside the box.
+        let header = std::fs::read(&trn2).ok().and_then(|b| terrain_block::trn2_header(&b).ok());
+        let (zones, centres, tracks, outside, names) = match music::Zones::open(&dir.join("precinct.clt")) {
             Ok(z) => {
                 let centres = z.zones.iter().filter(|z| z.center.is_some()).count();
+                // Anchored zones only: a polygon centroid is a derived value, and
+                // a derived point outside the box would be this reader's fault
+                // rather than the map's.
+                let outside = match &header {
+                    Some(h) => z.zones.iter()
+                        .filter(|z| z.center.is_some())
+                        .filter_map(|z| z.fallback_position())
+                        .filter(|p| !terrain_block::contains_world_point(h, p[0], p[2]))
+                        .count(),
+                    None => 0,
+                };
                 let tracks: usize = z.zones.iter().map(|z| z.tracks.len()).sum();
                 // Two distinct English names are enough to show the table
                 // answered; printing all of them would bury the row.
@@ -1636,11 +1652,11 @@ fn main() {
                     }
                 }
                 english.truncate(2);
-                (z.zones.len(), centres, tracks, english.join(" / "))
+                (z.zones.len(), centres, tracks, outside, english.join(" / "))
             }
-            Err(e) => (0, 0, 0, format!("precinct FAILED: {e}")),
+            Err(e) => (0, 0, 0, 0, format!("precinct FAILED: {e}")),
         };
-        println!("{id:<6} {:<7} {blocks:>7} {extent:>9} {zones:>7} {centres:>7} {tracks:>6}  {names}",
+        println!("{id:<6} {:<7} {blocks:>7} {extent:>9} {zones:>7} {centres:>7} {tracks:>6} {outside:>8}  {names}",
             if blocks == 0 { "empty" } else { "v" });
     }
     eprintln!("{maps} instance map(s) read, {bad} failed");
