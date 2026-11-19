@@ -125,6 +125,15 @@ pub(crate) enum RayActor<'a> {
     Invalid,
 }
 
+#[allow(dead_code)]
+pub(crate) enum NativeModelDraw {
+    Submitted,
+    Cutoff,
+    Culled,
+    Invalid,
+    Empty,
+}
+
 pub struct World {
     assets: Assets,
     keep_unbounded: bool,
@@ -161,6 +170,8 @@ pub struct World {
     catalog: crate::gfx_catalog::Catalog,
     /// Identities handed out to on-demand catalogue spawns.
     catalog_spawns: u64,
+    model_event_roots: usize,
+    rejected_model_events: usize,
     /// Explorer position and effect activation radius in world units.
     view: Option<(f32, f32, f32)>,
     /// Retail `SCNRES_EFFECT` distance in world units; 0 disables the fade and
@@ -266,6 +277,8 @@ impl World {
             effect_quads: Vec::new(),
             catalog: crate::gfx_catalog::Catalog::default(),
             catalog_spawns: 0,
+            model_event_roots: 0,
+            rejected_model_events: 0,
             view: None,
             effect_distance: 0.,
             census: [0; 3],
@@ -493,8 +506,16 @@ impl World {
     /// hook record is an explicit failure, never the model origin.
     pub fn install_model_events(&mut self) -> usize {
         let mut installed = 0;
+        let mut authored = 0;
         for (index, instance) in self.assets.instances.iter().enumerate() {
             let asset = &self.assets.assets[instance.asset];
+            let events = asset
+                .descriptor
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| event.kind == 100);
+            authored += events.clone().count();
             let transform = match self.slots[index].transform.as_ref() {
                 Ok(transform) => *transform,
                 Err(error) => {
@@ -503,14 +524,16 @@ impl World {
                     continue;
                 }
             };
-            for (event_index, event) in asset.descriptor.events.iter().enumerate() {
-                let Some(path) = event.gfx_path() else {
-                    continue;
-                };
+            for (event_index, event) in events {
                 let described = format!(
                     "{} export {} event {event_index}",
                     instance.placement.path, instance.placement.export_id
                 );
+                let Some(path) = event.gfx_path() else {
+                    self.reported
+                        .push(format!("{described}: GFX event is missing FxFilePath"));
+                    continue;
+                };
                 let record = match model_attachment::from_fields(&event.fields) {
                     Ok(record) => record,
                     Err(error) => {
@@ -581,7 +604,16 @@ impl World {
                 installed += 1;
             }
         }
+        self.model_event_roots += authored;
+        self.rejected_model_events += authored - installed;
         installed
+    }
+
+    /// Event census covers descriptors that decoded, not the event lists of
+    /// absent or unsupported models. Detached hook owners stay in the total.
+    #[allow(dead_code)]
+    pub(crate) fn model_event_census(&self) -> (usize, usize) {
+        (self.model_event_roots, self.rejected_model_events)
     }
     /// Release receiving-model geometry and poses outside the installed terrain
     /// window, rather than merely disabling their effect-light producers.
@@ -1104,6 +1136,49 @@ impl World {
         self.owners.player_clocks()
     }
 
+    /// Main-view slots after pose/material preparation and the alpha queue.
+    #[allow(dead_code)]
+    pub(crate) fn native_model_draws(&self) -> impl Iterator<Item = NativeModelDraw> + '_ {
+        use NativeModelDraw::*;
+        let alpha_slots: std::collections::HashSet<_> =
+            self.alpha.iter().map(|entry| entry.slot).collect();
+        self.assets
+            .instances
+            .iter()
+            .zip(&self.slots)
+            .enumerate()
+            .map(move |(i, (instance, slot))| {
+                if !cutoff_residency::contains(self.resident_bounds, instance.placement.position) {
+                    Cutoff
+                } else if slot.failed {
+                    Invalid
+                } else if !slot.visible {
+                    Culled
+                } else if let Some(draw) = &slot.draw {
+                    if draw.mesh_count() > draw.alpha_meshes().len() || alpha_slots.contains(&i) {
+                        Submitted
+                    } else if draw.mesh_count() > 0 {
+                        Invalid
+                    } else {
+                        Empty
+                    }
+                } else {
+                    Empty
+                }
+            })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn native_effect_draws(&self) -> gfx_effect_gpu::Admission {
+        self.effects.as_ref().map_or_else(
+            || gfx_effect_gpu::Admission {
+                unavailable: self.effect_quads.len(),
+                ..Default::default()
+            },
+            |draw| draw.admission(&self.effect_quads),
+        )
+    }
+
     /// Quads the world's animated effects produced this frame.
     pub fn effect_quad_count(&self) -> usize {
         self.effect_quads.len()
@@ -1309,6 +1384,7 @@ impl World {
         }
         // A producer whose owner is gone or whose hook cannot be resolved is
         // dropped instead of retrying against a stale parent every frame.
+        self.rejected_model_events += detached.len();
         self.producers.retain(|p| !detached.contains(&p.identity));
     }
     /// Upload this frame's already-evaluated poses. Runs for every pass without

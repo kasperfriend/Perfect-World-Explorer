@@ -1329,39 +1329,6 @@ fn lighter_coverage_fixture_capture() {
     // One available façade with a missing texture, one absent member and an
     // out-of-range placement. These are mutually exclusive placement results.
     std::fs::remove_file(root.0.join("building.pck")).unwrap();
-    let mut terrain = fixture(&root.0);
-    terrain.objects = crate::objects::Objects::open(
-        &root.0,
-        vec![
-            ornament_record(),
-            crate::scene::Ornament {
-                export_id: 124,
-                path: "not-installed.bmd".into(),
-                ..ornament_record()
-            },
-            crate::scene::Ornament {
-                export_id: 125,
-                position: [3000., 0., 0.],
-                ..ornament_record()
-            },
-        ],
-    )
-    .unwrap();
-    terrain.trees.types.push(None);
-    terrain.trees.placements.push(crate::scene::Tree {
-        tree_type: 1,
-        position: [-8., 0., 0.],
-    });
-    let dry = crate::water::WaterArea {
-        export_id: 2,
-        mask: vec![0, 0],
-        shore_waves: Vec::new(),
-        ..terrain.water[0].clone()
-    };
-    terrain.water.push(dry);
-    let effects = &mut std::sync::Arc::get_mut(&mut terrain.scene).unwrap().blocks[0].effects;
-    effects.truncate(1);
-    effects.push(placement(1, "scene/binary.gfx", [-6., 2., 0.]));
     let sprite = gfx_header() + SPRITE;
     let glow = encode(
         &image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 32, 0, 128])),
@@ -1375,43 +1342,116 @@ fn lighter_coverage_fixture_capture() {
             ("gfx/textures/lighter-glow.png", &glow),
         ],
     );
-    let actor = crate::scene::SceneModel {
-        export_id: 1,
-        position: [0., 2., -4.],
-        direction: [0., 0., 1.],
-        up: [0., 1., 0.],
-        path: "models/a/a.ecm".into(),
-        action: String::new(),
-    };
-    let (mut asset, _) = crate::model_draw_fixture::fixture();
-    asset.skins[0].data.meshes[0].vertices[1].position[1] = 1.;
-    let playback = crate::model_playback::Playback::new(&asset, None);
-    terrain.models = crate::world_models::Assets::load_with(
-        vec![crate::scene::SceneModel {
-            export_id: 2,
-            path: "models/missing.ecm".into(),
-            ..actor.clone()
-        }],
-        |_| Err("synthetic absent archive member".into()),
-    );
-    terrain
-        .models
-        .instances
-        .push(crate::world_models::Instance {
-            placement: actor,
-            asset: 0,
-            action: None,
-            playback,
+    let make_terrain = || {
+        let mut terrain = fixture(&root.0);
+        terrain.objects = crate::objects::Objects::open(
+            &root.0,
+            vec![
+                ornament_record(),
+                crate::scene::Ornament {
+                    export_id: 124,
+                    path: "not-installed.bmd".into(),
+                    ..ornament_record()
+                },
+                crate::scene::Ornament {
+                    export_id: 125,
+                    position: [3000., 0., 0.],
+                    ..ornament_record()
+                },
+            ],
+        )
+        .unwrap();
+        terrain.trees.types.push(None);
+        terrain.trees.placements.push(crate::scene::Tree {
+            tree_type: 1,
+            position: [-8., 0., 0.],
         });
-    terrain.models.assets.push(asset);
-    crate::pck::write_test_archive(
-        &root.0.join("models.pck"),
-        &[("fixture-placeholder", b"no textures")],
-    );
+        let dry = crate::water::WaterArea {
+            export_id: 2,
+            mask: vec![0, 0],
+            shore_waves: Vec::new(),
+            ..terrain.water[0].clone()
+        };
+        terrain.water.push(dry);
+        let block = &mut std::sync::Arc::get_mut(&mut terrain.scene).unwrap().blocks[0];
+        block
+            .ornaments
+            .extend([124, 125].map(|export_id| crate::scene::Reference {
+                export_id,
+                offset: 0,
+            }));
+        block.effects.truncate(1);
+        block
+            .effects
+            .push(placement(1, "scene/binary.gfx", [-6., 2., 0.]));
+        let actor = crate::scene::SceneModel {
+            export_id: 1,
+            position: [0., 2., -4.],
+            direction: [0., 0., 1.],
+            up: [0., 1., 0.],
+            path: "models/a/a.ecm".into(),
+            action: String::new(),
+        };
+        let (mut asset, _) = crate::model_draw_fixture::fixture();
+        asset.skins[0].data.meshes[0].vertices[1].position[1] = 1.;
+        let playback = crate::model_playback::Playback::new(&asset, None);
+        terrain.models = crate::world_models::Assets::load_with(
+            vec![crate::scene::SceneModel {
+                export_id: 2,
+                path: "models/missing.ecm".into(),
+                ..actor.clone()
+            }],
+            |_| Err("synthetic absent archive member".into()),
+        );
+        terrain
+            .models
+            .instances
+            .push(crate::world_models::Instance {
+                placement: actor,
+                asset: 0,
+                action: None,
+                playback,
+            });
+        terrain.models.assets.push(asset);
+        crate::pck::write_test_archive(
+            &root.0.join("models.pck"),
+            &[("fixture-placeholder", b"no textures")],
+        );
+
+        terrain
+    };
+    let native = root.0.join("native-coverage.png");
+    super::super::preview_frame(
+        make_terrain(),
+        &native,
+        Some([-2.5, 5., 0., 0., -std::f32::consts::FRAC_PI_4]),
+        Mode::Off,
+        Some(2),
+    )
+    .unwrap();
+    assert_world_png(&native, (960, 720));
+    let csv = std::fs::read_to_string(native.with_extension("coverage.csv")).unwrap();
+    for expected in [
+        // Authored 3 BMD placements: submitted with missing texture, one out
+        // of range, one unresolved. Tree cache lacks the referenced type 1.
+        "buildings,1,1,1,1,0,0,0,0,0,0,0,1,0,0,1\n",
+        "trees,1,0,1,0,0,0,0,0,0,0,0,1,0,0,0\n",
+        "water,1,1,0,0,0,0,0,0,0,1,0,0,0,0,0\n",
+        "effect_roots,1,0,1,0,0,0,0,0,0,0,0,0,0,1,0\n",
+    ] {
+        assert!(csv.contains(expected), "expected {expected} in {csv}");
+    }
+    let meta = std::fs::read_to_string(native.with_extension("coverage.txt")).unwrap();
+    use sha2::{Digest, Sha256};
+    assert!(meta.contains("native_inventory_scope=main_streamed_v1\n"));
+    assert!(meta.contains(&format!(
+        "inventory_sha256={:x}\n",
+        Sha256::digest(csv.as_bytes())
+    )));
 
     let path = root.0.join("coverage.png");
     super::super::preview_frame(
-        terrain,
+        make_terrain(),
         &path,
         Some([-2.5, 5., 0., 0., -std::f32::consts::FRAC_PI_4]),
         Mode::Software,
@@ -1439,16 +1479,17 @@ fn lighter_coverage_fixture_capture() {
             .and_then(|s| s.parse::<usize>().ok());
         assert!(value.is_some(), "invalid mip audit field: {field}");
     }
-    use sha2::{Digest, Sha256};
     let rgba = image::open(&path).unwrap().into_rgba8();
     let digest = Sha256::digest(rgba.as_raw());
     assert!(meta.contains(&format!("rgba8_sha256={digest:x}\n")));
     if let Some(dir) = std::env::var_os("PW_SAVE_LIGHTER_COVERAGE") {
         let dir = std::path::PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for ext in ["png", "coverage.csv", "coverage.txt"] {
-            let src = path.with_extension(ext);
-            std::fs::copy(&src, dir.join(src.file_name().unwrap())).unwrap();
+        for capture in [&native, &path] {
+            for ext in ["png", "coverage.csv", "coverage.txt"] {
+                let src = capture.with_extension(ext);
+                std::fs::copy(&src, dir.join(src.file_name().unwrap())).unwrap();
+            }
         }
     }
 }

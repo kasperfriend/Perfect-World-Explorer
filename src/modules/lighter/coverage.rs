@@ -53,6 +53,10 @@ pub(crate) struct Counts {
 }
 
 impl Counts {
+    pub fn total(self) -> usize {
+        self.loaded + self.skipped() + self.failed()
+    }
+
     pub fn skipped(self) -> usize {
         self.range
             + self.cutoff

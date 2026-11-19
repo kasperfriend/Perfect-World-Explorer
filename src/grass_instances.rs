@@ -40,6 +40,12 @@ impl<'a> Builder<'a> {
     pub fn contains(&self, key: (usize, usize)) -> bool {
         self.groups.contains_key(&key)
     }
+    #[allow(dead_code)] // Viewer coverage; standalone checks use the builder directly.
+    pub(crate) fn instance_count(&self, key: (usize, usize)) -> usize {
+        self.groups
+            .get(&key)
+            .map_or(0, |group| group.instances.len())
+    }
     pub fn mesh(&mut self, key: (usize, usize), vertices: Vec<Vertex>, indices: Vec<u32>) {
         let scale_y = vertices.first().map_or(0., |v| v.color[2]);
         self.mesh_with_scale_y(key, vertices, indices, scale_y);

@@ -360,6 +360,11 @@ pub(crate) fn weather_images(element: &Path) -> ([image::RgbaImage; 2], [bool; 2
     ([rain, snow], [rain_authored, snow_authored])
 }
 
+// Keep in sync with the split in `vs`; the two routes report generated cards,
+// not fragments surviving alpha or depth tests.
+pub(crate) const RAIN_INSTANCES: u32 = 320;
+const SNOW_INSTANCES: u32 = 160;
+
 pub struct WeatherGpu {
     pub(crate) rain_mask_authored: bool,
     pipeline: wgpu::RenderPipeline,
@@ -771,7 +776,7 @@ impl WeatherGpu {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind, &[]);
-        pass.draw(0..6, 0..480);
+        pass.draw(0..6, 0..RAIN_INSTANCES + SNOW_INSTANCES);
         drop(pass);
         if !coverage {
             return;
@@ -802,7 +807,7 @@ impl WeatherGpu {
         });
         pass.set_pipeline(&self.motion_pipeline);
         pass.set_bind_group(0, &self.bind, &[]);
-        pass.draw(0..6, 0..480);
+        pass.draw(0..6, 0..RAIN_INSTANCES + SNOW_INSTANCES);
     }
 }
 

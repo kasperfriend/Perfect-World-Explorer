@@ -200,6 +200,42 @@ pub struct Draw {
     failed: Vec<String>,
 }
 
+// Native capture uses the submitted bucket list, not just generated cards.
+#[derive(Default)]
+#[allow(dead_code)]
+pub(crate) struct Admission {
+    pub submitted: usize,
+    pub unavailable: usize,
+    pub unsupported: usize,
+    pub empty: usize,
+    pub fallback: usize,
+    pub dest_color_submitted: usize,
+}
+
+impl BucketKey {
+    fn for_quad(quad: &EffectQuad, pipeline: PipelineKey) -> Self {
+        Self {
+            layer: quad.layer,
+            pipeline,
+            priority: quad.priority,
+            tile: quad.tile,
+            texture: quad.texture.clone(),
+        }
+    }
+}
+
+impl PipelineKey {
+    fn for_quad(quad: &EffectQuad) -> Self {
+        Self {
+            source: quad.source_blend,
+            destination: quad.destination_blend,
+            depth_test: quad.depth_test,
+            write_depth: quad.mesh.as_ref().is_some_and(|mesh| mesh.write_depth),
+            motion: false,
+        }
+    }
+}
+
 fn blend_factor(code: u32) -> Result<wgpu::BlendFactor, String> {
     Ok(match model_queue::blend_factor(code)? {
         model_queue::Factor::Zero => wgpu::BlendFactor::Zero,
@@ -464,6 +500,39 @@ impl Draw {
         self.order.iter().map(|(_, count)| *count as usize).sum()
     }
 
+    #[allow(dead_code)] // Viewer capture only.
+    pub(crate) fn admission(&self, quads: &[EffectQuad]) -> Admission {
+        let mut census = Admission::default();
+        let submitted: std::collections::HashSet<_> =
+            self.order.iter().map(|(key, _)| key).collect();
+        for quad in quads {
+            let key = BucketKey::for_quad(quad, PipelineKey::for_quad(quad));
+            let [src, dst] = [key.pipeline.source, key.pipeline.destination];
+            if quad
+                .mesh
+                .as_ref()
+                .is_some_and(|mesh| mesh.vertices.is_empty())
+            {
+                census.empty += 1;
+            } else if submitted.contains(&key) {
+                census.submitted += 1;
+                if !key.texture.is_empty() && self.buckets[&key].bound_fallback {
+                    census.fallback += 1;
+                }
+                if matches!(src, 9 | 10) || matches!(dst, 9 | 10) {
+                    census.dest_color_submitted += 1;
+                }
+            } else if blend_factor(src).is_err() || blend_factor(dst).is_err() {
+                census.unsupported += 1;
+            } else {
+                // E.g. a prior unsupported bucket stopped this prepare before
+                // the later one was admitted. Don't count it as a draw.
+                census.unavailable += 1;
+            }
+        }
+        census
+    }
+
     /// Refill every group from this frame's quads. `read` resolves an archive
     /// path to bytes and is only called for textures the pass has not seen.
     pub fn update(
@@ -526,13 +595,7 @@ impl Draw {
         let mut groups: Vec<(BucketKey, Vec<Vertex>)> = Vec::new();
         self.scratch_index.clear();
         for quad in quads {
-            let pipeline = PipelineKey {
-                source: quad.source_blend,
-                destination: quad.destination_blend,
-                depth_test: quad.depth_test,
-                write_depth: quad.mesh.as_ref().is_some_and(|mesh| mesh.write_depth),
-                motion: false,
-            };
+            let pipeline = PipelineKey::for_quad(quad);
             let position = if groups.last_mut().is_some_and(|(last_key, _)| {
                 last_key.layer == quad.layer
                     && last_key.pipeline == pipeline
@@ -542,13 +605,7 @@ impl Draw {
             }) {
                 groups.len() - 1
             } else {
-                let key = BucketKey {
-                    layer: quad.layer,
-                    pipeline,
-                    priority: quad.priority,
-                    tile: quad.tile,
-                    texture: quad.texture.clone(),
-                };
+                let key = BucketKey::for_quad(quad, pipeline);
                 match self.scratch_index.get(&key) {
                     Some(position) => *position,
                     None => {

@@ -1025,6 +1025,10 @@ impl Objects {
     pub fn get(&self, idx: usize) -> Option<&bmd::Model> {
         self.models.get(self.model_names.get(idx)?)
     }
+    #[allow(dead_code)] // Native preview census.
+    pub(crate) fn has_lit_archive(&self) -> bool {
+        self.litfile.is_some()
+    }
     /// Distinct BMDs that could not be resolved or parsed for this map.
     pub fn unavailable_model_count(&self) -> usize {
         self.unavailable_models.len()

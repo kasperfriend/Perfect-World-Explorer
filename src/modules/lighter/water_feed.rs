@@ -233,7 +233,7 @@ impl Water {
     }
 
     pub(super) fn append(&self, m: &MeshData, b: &mut Builder) -> Result<(), String> {
-        for &(export, lo, hi, simple) in &m.ray_water {
+        for &(export, lo, hi, simple) in &m.water_areas {
             let &id = self
                 .exports
                 .get(&export)

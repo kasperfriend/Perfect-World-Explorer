@@ -1145,7 +1145,7 @@ impl super::Renderer {
         let mut warp = 0;
         if let Some(models) = &self.models {
             let status = models.ray_effect_status();
-            roots.invalid = self.ray_rejected_scene_effects;
+            roots.invalid = self.ray_rejected_scene_effects + models.model_event_census().1;
             if self.ray_gfx_archive_unavailable {
                 roots.package = status.total();
             } else {

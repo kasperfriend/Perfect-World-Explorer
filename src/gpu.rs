@@ -11,6 +11,7 @@ use crate::Terrain;
 #[path = "modules/lighter/host.rs"]
 mod lighter_host;
 mod lighter_travel;
+mod native_inventory;
 mod readback;
 mod recovery;
 use bytemuck::{Pod, Zeroable};
@@ -549,6 +550,7 @@ struct MeshData {
     /// unchanged page is a page whose atlas and geometry the renderer can keep.
     local_page_keys: Vec<u64>,
     grass: crate::grass_instances::Data,
+    grass_area_coverage: RayCounts,
     center: (isize, isize),
     tree_center: (f32, f32),
     detail: DetailSettings,
@@ -559,7 +561,7 @@ struct MeshData {
     object_start: u32,
     water_start: u32,
     water_batches: Vec<WaterBatch>,
-    ray_water: Vec<(u32, u32, u32, bool)>, // export id, first/end indices, simple style
+    water_areas: Vec<(u32, u32, u32, bool)>, // export id, first/end indices, simple style
     water_coverage: RayCounts,
     local_pages: Vec<crate::world_objects::Page>,
     /// Optional ray feed prepared on the same loader as the native pages.
@@ -1027,11 +1029,13 @@ fn build(
     // than inventing a depth; `density_step` stays the single place that will
     // consume the recovered value.
     let grass_step = crate::grass_wind::density_step(None);
+    let mut grass_area_coverage = RayCounts::default();
     for area in &t.grass.areas {
         let half_x = area.width as f32 * area.grid * 0.5;
         let half_z = area.height as f32 * area.grid * 0.5;
         // A recovered step of 5 is the native "no grass" early-out.
         let Some(step) = grass_step else {
+            grass_area_coverage.disabled = t.grass.areas.len();
             break;
         };
         // `0x653a30` only keeps cells whose mask bit is set; distances use the
@@ -1039,14 +1043,18 @@ fn build(
         if (area.center[0] - cx).abs() > half_x + t.scene.block_size
             || (area.center[2] - cz).abs() > half_z + t.scene.block_size
         {
+            grass_area_coverage.range += 1;
             continue;
         }
         let Some(Some(model)) = t.grass.models.get(area.type_id) else {
+            grass_area_coverage.unavailable += 1;
             continue;
         };
         let typ = &t.grass.types[area.type_id];
+        let (mut emitted, mut missing, mut budget, mut clipped) = (false, false, false, false);
         for (mesh_index, mesh) in model.meshes.iter().enumerate() {
             let Some(img) = t.grass.textures.get(&mesh.texture) else {
+                missing = true;
                 continue;
             };
             let alpha_ref = 84u8;
@@ -1105,6 +1113,7 @@ fn build(
                         .clamp(TEX, ATLAS);
                     let Some(slot) = atlas_allocator.allocate(n, n, reserve, true) else {
                         eprintln!("Grass atlas full: {}", mesh.texture);
+                        budget = true;
                         continue;
                     };
                     slot
@@ -1169,6 +1178,7 @@ fn build(
                     scale_y,
                 );
             }
+            let before = grass_builder.instance_count(key);
             for placement in area.placements(typ)? {
                 let x = area.center[0] - half_x
                     + (placement.col as f32 + placement.jitter_x) * area.grid;
@@ -1187,6 +1197,7 @@ fn build(
                     continue;
                 }
                 if !crate::terrain_cutoff::contains(resident_bounds, [x, 0., z]) {
+                    clipped = true;
                     continue;
                 }
                 let gx = x / t.grid_spacing + t.width as f32 * 0.5;
@@ -1230,6 +1241,20 @@ fn build(
                     area.center,
                 );
             }
+            emitted |= !mesh.indices.is_empty() && grass_builder.instance_count(key) > before;
+        }
+        // Area tally, not an inferred number of off-stream blades. An area
+        // with some valid groups still contributes its actual instances.
+        if emitted {
+            grass_area_coverage.loaded += 1;
+        } else if missing {
+            grass_area_coverage.unavailable += 1;
+        } else if budget {
+            grass_area_coverage.budget += 1;
+        } else if clipped {
+            grass_area_coverage.cutoff += 1;
+        } else {
+            grass_area_coverage.empty += 1;
         }
     }
     // Materialise the grass atlas only when the renderer's copy is stale.
@@ -1569,7 +1594,7 @@ fn build(
     // Keep opaque indices separate so water can sample reflected/refracted scene passes.
     let water_start = indices.len() as u32;
     let mut water_batches: Vec<WaterBatch> = Vec::new();
-    let mut ray_water = Vec::new();
+    let mut water_areas = Vec::new();
     let mut water_coverage = RayCounts::default();
     let mut areas: Vec<_> = t.water.iter().collect();
     areas.sort_by(|a, b| a.height.total_cmp(&b.height));
@@ -1684,9 +1709,7 @@ fn build(
             }
         } else {
             water_coverage.loaded += 1;
-            if ray_scenery.is_some() {
-                ray_water.push((a.export_id, start, end, a.simple));
-            }
+            water_areas.push((a.export_id, start, end, a.simple));
             if let Some(last) = water_batches.last_mut().filter(|last| {
                 last.height == a.height && last.simple == a.simple && last.end == start
             }) {
@@ -1753,6 +1776,7 @@ fn build(
         indices,
         grass_mips,
         grass,
+        grass_area_coverage,
         atlas,
         grass_atlas_key,
         grass_atlas_changed,
@@ -1769,7 +1793,7 @@ fn build(
         object_start,
         water_start,
         water_batches,
-        ray_water,
+        water_areas,
         water_coverage,
         local_pages,
         ray_scenery,
@@ -9085,6 +9109,8 @@ fn preview_frame_using(
         ray_scenery.as_mut(),
     )?;
     let (width, height) = (960u32, 720u32);
+    let native_inventory = (audit.is_some() && mode == LighterMode::Off)
+        .then(|| native_inventory::capture_scene(&t, &mesh, cam.matrix(width, height, cam.far)));
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut renderer = Renderer::new(
         device, queue, fmt, width, height, mesh, &mut t, false, lighter,
@@ -9316,6 +9342,9 @@ fn preview_frame_using(
             cam.bloom, cam.terrain_lightmaps, cam.area_grass_lightmaps,
             renderer.frame.weather.rain && cam.underwater_depth <= 0., renderer.frame.weather_ticks,
         );
+        if let Some(bytes) = native_inventory::device_local_heap(&renderer.device) {
+            writeln!(meta, "vulkan_largest_device_local_heap_bytes={bytes}").unwrap();
+        }
         if let Some(plan) = &flight {
             writeln!(
                 meta,
@@ -9327,6 +9356,14 @@ fn preview_frame_using(
         let [both, day, unbound] = renderer.terrain_gpu.lightmap_areas;
         writeln!(meta, "native_lightmap_areas_day_night={both}\nnative_lightmap_areas_day_only={day}\nnative_lightmap_areas_unbound={unbound}").unwrap();
         let (roots, warp) = renderer.effect_root_coverage();
+        let (model_events, rejected_model_events) = renderer
+            .models
+            .as_ref()
+            .map_or((0, 0), |world| world.model_event_census());
+        writeln!(meta,
+            "world_effect_authored_scene_roots={}\nworld_effect_decoded_model_event_roots={model_events}\nworld_effect_rejected_model_event_roots={rejected_model_events}",
+            renderer.ray_scene_effects,
+        ).unwrap();
         let (mut dest_affine, mut dest_unsupported) = (0, 0);
         if let Some(models) = &renderer.models {
             for q in models.effect_quads() {
@@ -9341,25 +9378,17 @@ fn preview_frame_using(
             }
         }
         writeln!(meta,
-            "platform={}\neye_underwater_depth={}\nrain_mask_authored={}\nworld_effect_roots_playing={}\nworld_effect_roots_queued={}\nworld_effect_roots_inactive={}\nworld_effect_roots_rejected={}\nworld_effect_roots_unreadable={}\nworld_effect_roots_no_package={}\nworld_effect_roots_unsupported={}\nworld_effect_warp_omitted_elements={warp}\nworld_effect_dest_color_affine_candidates={dest_affine}\nworld_effect_dest_color_unsupported_candidates={dest_unsupported}",
-            std::env::consts::OS, cam.underwater_depth, renderer.weather.rain_mask_authored,
+            "platform={}\narchitecture={}\neye_underwater_depth={}\nrain_mask_authored={}\nworld_effect_roots_playing={}\nworld_effect_roots_queued={}\nworld_effect_roots_inactive={}\nworld_effect_roots_rejected={}\nworld_effect_roots_unreadable={}\nworld_effect_roots_no_package={}\nworld_effect_roots_unsupported={}\nworld_effect_warp_omitted_elements={warp}\nworld_effect_dest_color_affine_candidates={dest_affine}\nworld_effect_dest_color_unsupported_candidates={dest_unsupported}",
+            std::env::consts::OS, std::env::consts::ARCH, cam.underwater_depth, renderer.weather.rain_mask_authored,
             roots.loaded, roots.pending, roots.disabled, roots.invalid, roots.unavailable, roots.package, roots.unsupported,
         ).unwrap();
-        if mode == LighterMode::Off {
-            let effects = renderer
-                .models
-                .as_ref()
-                .map_or(0, |models| models.effect_quad_count());
-            writeln!(meta,"native_inventory_scope=partial\nnative_local_scenery_pages={}\nnative_last_scene_passes={}\nnative_effect_quads={effects}\nnative_visible_water_batches={}",
-                renderer.local_pages.len(),renderer.scene_passes,renderer.visible_water_batches.len()).unwrap();
+        let inventory = if let Some(mut native) = native_inventory {
+            native.finish(&renderer, &cam, &mut meta)?
         } else {
-            let inventory = renderer.ray_inventory();
             let ray_bound = renderer.ray_lightmap_areas_bound();
+            let inventory = renderer.ray_inventory();
             writeln!(meta, "grass_inventory_scope=native_stream_only\nray_rain_cards={}\nray_lightmap_areas_bound={ray_bound}\nray_lightmap_areas_unbound={}",
                 inventory.ray_rain_cards, (both+day+unbound).saturating_sub(ray_bound)).unwrap();
-            let counts_path = path.with_extension("coverage.csv");
-            std::fs::write(&counts_path, inventory.csv())
-                .map_err(|e| format!("{}: {e}", counts_path.display()))?;
             for (name, count) in ["world", "walker", "populator"]
                 .into_iter()
                 .zip(renderer.lighter.skin_omissions)
@@ -9379,7 +9408,17 @@ fn preview_frame_using(
             if let Some(bmd) = &renderer.lighter.scenery_coverage {
                 writeln!(meta, "{bmd}").unwrap();
             }
-        }
+            inventory
+        };
+        let counts_path = path.with_extension("coverage.csv");
+        let csv = inventory.csv();
+        writeln!(
+            meta,
+            "inventory_sha256={:x}",
+            Sha256::digest(csv.as_bytes())
+        )
+        .unwrap();
+        std::fs::write(&counts_path, csv).map_err(|e| format!("{}: {e}", counts_path.display()))?;
         let ((trace_w, trace_h), _) = renderer.lighter.travel_trace();
         writeln!(meta, "trace_image={trace_w}x{trace_h}").unwrap();
         // These describe the saved PNG, not the later instrumented draws.

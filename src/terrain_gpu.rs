@@ -868,6 +868,10 @@ impl TerrainGpu {
             None => out.clear(),
         }
     }
+    #[allow(dead_code)] // The Native preview compares these with its submitted runs.
+    pub(crate) fn far_spans(&self) -> &[crate::terrain_residency::Span] {
+        self.far.as_ref().map_or(&[], |far| far.spans.as_slice())
+    }
     pub fn edge_mesh(&self) -> Option<(&wgpu::Buffer, &wgpu::Buffer, u32)> {
         self.far
             .as_ref()
