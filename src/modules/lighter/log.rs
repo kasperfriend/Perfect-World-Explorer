@@ -139,10 +139,18 @@ fn redact_path(path: &str) -> String {
             }
         }
     }
-    parts.iter()
-        .filter(|s| !s.as_os_str().is_empty())
-        .collect::<Vec<_>>()
-        .join(std::path::MAIN_SEPARATOR.to_string().as_str())
+    let mut result = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        let s = part.to_string_lossy();
+        if s.is_empty() {
+            continue;
+        }
+        if i > 0 {
+            result.push(std::path::MAIN_SEPARATOR);
+        }
+        result.push_str(&s);
+    }
+    result
 }
 
 /// Rotate log files: keep at most MAX_FILES files, each at most MAX_FILE_BYTES.
