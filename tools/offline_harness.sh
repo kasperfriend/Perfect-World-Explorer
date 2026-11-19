@@ -674,6 +674,12 @@ pub mod terrain_block;
 // refusal counts add up, and that is only true if the buckets partition.
 #[path = "$REPO/src/effect_census.rs"]
 pub mod effect_census;
+// How an authored sound path becomes an \`sfx.pck\` key. Both record types that
+// name a sound -- \`configs/sound.txt\` and a GFX element-170 element -- go
+// through it, and \`world_audio\` is not compiled by any mode, so the rule is its
+// own module and is tested here.
+#[path = "$REPO/src/sound_key.rs"]
+pub mod sound_key;
 EOF
 }
 
@@ -1624,7 +1630,7 @@ fn main() {
         };
         // Zone centres against the map's own extent, in the centred frame. This
         // is the check that would have caught the corner-anchored
-        // `contains_world_point`: a precinct file and its world describing
+        // \`contains_world_point\`: a precinct file and its world describing
         // different frames shows up here as centres outside the box.
         let header = std::fs::read(&trn2).ok().and_then(|b| terrain_block::trn2_header(&b).ok());
         let (zones, centres, tracks, outside, names) = match music::Zones::open(&dir.join("precinct.clt")) {

@@ -1993,3 +1993,19 @@ The general lesson, and the third instance of it in this stretch: a green suite
 says nothing about a file no mode compiles. `src/diagnostics.rs` was stubbed,
 `src/gfx_player.rs` was left out of `test`, and `world_models_gpu` was in no mode
 at all. Each was found by reading the module list, not by a failing test.
+
+**Narrowed.** The key rule was the suspicious part and it is now tested:
+`src/sound_key.rs` (4 tests, new) proves the two record types that name a sound
+agree — `configs/sound.txt` writes `SFX\Item\EquipSound\DownGem.wav`, a GFX
+element-170 record writes `Item\EquipSound\DownGem.wav`, and both key to
+`sfx/item/equipsound/downgem.wav`. It also proves the five authored roots
+(`Skill`, `Effect`, `Creature`, `Item`, `Ambience`) all key under `sfx/`, and that
+traversal and absolute paths are refused.
+
+`sfx.pck` cannot be staged: all nine copies in the Drive folder are 123–880 MB,
+above the 100 MiB transfer limit. So the remaining question is "does this archive
+contain those members", not "is the path base right". Recorded as that, because
+the two are not the same gap and only one of them is a reader problem.
+
+`world_audio` is in no harness mode, which is why its key logic could be wrong
+without anything noticing — the fourth module found that way in this stretch.

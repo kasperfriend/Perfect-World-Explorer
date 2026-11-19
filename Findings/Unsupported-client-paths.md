@@ -16,8 +16,17 @@ printed: diagnostic channel `effect-sounds` names each one with its authored
 paths, volume, `Force2D` and `IsLoop`. Measured over the staged 1.3.1 pack: 355
 element-170 records in 340 roots, one path each, 139 distinct paths under
 `Skill\` (77), `Effect\` (33), `Creature\` (19), `Item\` (8) and `Ambience\` (2).
-Playback is not wired: `world_audio` resolves under an `sfx/` prefix against
-`sfx.pck`, which is not staged here, so the path base for these is unverified. | P7.04–05 |
+Playback is not wired, and the reason is now narrowed to one missing file. The
+key rule itself is **settled**: `crate::sound_key::asset_key` adds the `sfx/`
+prefix when it is missing and leaves it when present, and the two record types
+that name a sound meet at the same key — `configs/sound.txt` writes
+`SFX\Item\EquipSound\DownGem.wav` and a GFX element-170 record writes
+`Item\EquipSound\DownGem.wav`, and both key to `sfx/item/equipsound/downgem.wav`
+(tested in `src/sound_key.rs`, 4 tests). What remains is the archive: every
+`sfx.pck` in the Drive folder is 123–880 MB, above the 100 MiB staging limit, so
+no member of it has been listed and it is not established whether these paths
+exist inside. The gap is therefore "no staged `sfx.pck`", not "unknown path
+base". | P7.04–05 |
 | Manager light-priority limit value | The gate and its state are traced and implemented (`0x70ba3c..0x70ba44`: `[element+0xdc] > [manager+0x134]` suppresses publication only, the element keeps progressing and returns alive; the limit is manager-wide, written by `0x40dc97`/`0x40e394`, and survives owner churn/region unload). What is not decoded is the *authored byte* that fills the limit: it arrives through a scene/environment record (`+0xce`, copied from `+0xca` at `0x59af52..0x59af76`) whose file format this reader does not parse, so `Manager::set_priority_limit` defaults to "no suppression" - the client at its highest light setting - instead of an invented threshold that would silently drop authored lights. | P1.01 |
 | Controller-108 LUT construction precision | Resolved to PC24. The executable never creates a thread: no `_beginthreadex`/`_beginthread` IAT slot (`0x4d54ec`/`0x4d54f0`) is referenced anywhere in `.text` and `CreateThread` is not imported, so loading is frame-budgeted on the update thread (`0x5b1a00` returns after one root) and construction shares the sampling thread. That thread never changes the x87 control word - `_controlfp` (`0x4d5564`) has no call site and the only `fldcw`/`fnstcw` instructions in the image belong to static CRT math helpers (`0x7fdcb7`, `0x8001e5`, `0x80c878`, `0x863350`) that restore the caller's word - so the device's PC24 word applies. `0x6ec5dd` builds the table with x87 `fmul`/`fsub` only, which under PC24 rounds every intermediate to a 24-bit mantissa; production therefore builds the PC24 table (`gfx_color_track::CONSTRUCTION = Precision::Pc24`). `tools/analyze-color-track-construction.py` still records that the two modes differ (17,790 / 16,332 interior entries of 8,257,536), which bounds the exposure of any root loaded before the device exists (that path would use the startup extended word). | P1.01 |
 | Alpha-list depth state | Recovered, no longer an assumption: the alpha/overlay submit path `0x436720` -> `0x436984` -> `0x7844d0` sets SRCBLEND 5 (`0x77a2c0`), DESTBLEND 6 (`0x77a2f0`), **ZWRITEENABLE off** (`0x77a230(0)`), CULLMODE 1 (`0x77a540(1)`) before `0x779ca0(mesh, 1)` submits at `0x78452b`; the tail restores ZWRITE 1 (`0x784678`), CULLMODE 3 (`0x784684`) and the material block (`0x779fc0(0,4)`). ZENABLE is never written in the bracket, so the alpha list keeps the depth **test** and only drops the write; `0x7a76a0`/`0x7a6c30` only override the blend pair and alpha test, and `0x7a7c60` never issues a ZWRITE call, so no blended mesh writes depth. `model_queue` implements this and a regression pins both directions. | P1.02–03 |

@@ -42,6 +42,7 @@ mod cloud_gpu;
 #[allow(dead_code)]
 mod cloud_surface;
 mod color_chain;
+mod sound_key;
 mod diagnostics;
 // The effect activation census: which gate leaves a root out, as a partition.
 mod effect_census;

@@ -21,12 +21,16 @@ item says so and lands as a named gap instead of a guess.
       240 of 383 centres fell outside a37's extent, which is what exposed it.
       `instance` now prints an `outside` column.
 
-- [ ] **2. Stage `sfx.pck` and settle whether element-170 paths resolve.**
+- [x] **2. Stage `sfx.pck` and settle whether element-170 paths resolve.**
       `world_audio` resolves under an `sfx/` prefix; the 355 authored 170 paths
       are `Skill\…`, `Effect\…`, `Creature\…`, `Item\…`, `Ambience\…`.
-      *Done when:* the archive is staged and the outcome is recorded — either
-      the base is confirmed and the gap becomes "a resolver, not a mystery",
-      or the archive is not obtainable and B-31 says so explicitly.
+      *Done:* the **key rule is settled** — `configs/sound.txt` writes
+      `SFX\Item\EquipSound\DownGem.wav`, a 170 record writes
+      `Item\EquipSound\DownGem.wav`, and both key to
+      `sfx/item/equipsound/downgem.wav` (`src/sound_key.rs`, 4 tests).
+      **`sfx.pck` is not obtainable**: all nine copies are 123–880 MB, over the
+      100 MiB transfer limit. So the gap is "no staged archive", not "unknown
+      path base", and B-31 now says exactly that.
 
 - [ ] **3. Run the silent-failure guard in CI, not just locally.**
       `tools/check-harness.py` currently runs only inside `harness.sh check`.
