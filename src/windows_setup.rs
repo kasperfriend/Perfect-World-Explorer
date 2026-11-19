@@ -441,6 +441,7 @@ pub(crate) fn directstorage_state(stats: crate::pck::direct_storage::ReadStats) 
 }
 
 use crate::launcher_ui;
+use crate::launcher_ui::BitmapInfo;
 
 /// Rectangle in client coordinates (`RECT`).
 #[repr(C)]
@@ -595,14 +596,18 @@ fn paint_loading_art(dc: *mut c_void, art: &LoadingArt) {
 /// The dark strip behind these rows is already blended into the artwork bitmap,
 /// so this only draws text and the bar.
 fn paint_loading_overlay(dc: *mut c_void, width: u32, height: u32, state: &LoadingWindowState) {
-    const MARGIN: i32 = 28;
     let width = width as i32;
     let height = height as i32;
-    let text_top = height - OVERLAY_STRIP_HEIGHT as i32 + 22;
+    // A 178-pixel strip would cover a tiny window entirely and put its text
+    // above the client area, so the strip follows the window on small sizes
+    // and keeps its designed height on any ordinary screen.
+    let strip = (height / 3).min(OVERLAY_STRIP_HEIGHT as i32).max(64);
+    let margin = (width / 40).clamp(10, 28);
+    let text_top = height - strip + 22;
     unsafe {
         launcher_ui::draw_text(
             dc,
-            MARGIN,
+            margin,
             text_top,
             "PERFECT WORLD EXPLORER  —  LOADING WORLD",
             15,
@@ -611,7 +616,7 @@ fn paint_loading_overlay(dc: *mut c_void, width: u32, height: u32, state: &Loadi
         );
         launcher_ui::draw_text(
             dc,
-            MARGIN,
+            margin,
             text_top + 26,
             &state.status,
             13,
@@ -620,7 +625,7 @@ fn paint_loading_overlay(dc: *mut c_void, width: u32, height: u32, state: &Loadi
         );
         launcher_ui::draw_text(
             dc,
-            MARGIN,
+            margin,
             text_top + 48,
             &state.ds_state,
             12,
@@ -629,7 +634,7 @@ fn paint_loading_overlay(dc: *mut c_void, width: u32, height: u32, state: &Loadi
         );
         launcher_ui::draw_text(
             dc,
-            MARGIN,
+            margin,
             text_top + 68,
             &state.graph,
             12,
@@ -638,7 +643,7 @@ fn paint_loading_overlay(dc: *mut c_void, width: u32, height: u32, state: &Loadi
         );
         launcher_ui::draw_text(
             dc,
-            MARGIN,
+            margin,
             text_top + 88,
             &state.totals,
             11,
@@ -648,10 +653,10 @@ fn paint_loading_overlay(dc: *mut c_void, width: u32, height: u32, state: &Loadi
         // Indeterminate bar: the fill sweeps forward and back, so the load is
         // visibly alive without claiming a percentage the loader does not have.
         let bar_top = height - 26;
-        let bar_width = (width - MARGIN * 2).max(120);
+        let bar_width = (width - margin * 2).max(120);
         launcher_ui::fill_rect(
             dc,
-            MARGIN,
+            margin,
             bar_top,
             bar_width,
             6,
@@ -662,7 +667,7 @@ fn paint_loading_overlay(dc: *mut c_void, width: u32, height: u32, state: &Loadi
         let position = ((state.phase.sin() * 0.5 + 0.5) * travel) as i32;
         launcher_ui::fill_rect(
             dc,
-            MARGIN + position,
+            margin + position,
             bar_top,
             sweep,
             6,
@@ -675,7 +680,7 @@ fn paint_loading_overlay(dc: *mut c_void, width: u32, height: u32, state: &Loadi
             let note_width = launcher_ui::text_width(dc, &state.note, 10);
             launcher_ui::draw_text(
                 dc,
-                (width - MARGIN - note_width).max(MARGIN),
+                (width - margin - note_width).max(margin),
                 height - 48,
                 &state.note,
                 10,
@@ -768,13 +773,14 @@ unsafe extern "system" fn loading_window_proc(
             0
         }
         0x0113 => {
-            // WM_TIMER: advance the bar sweep and repaint.
+            // WM_TIMER: advance the bar sweep. The repaint request comes from
+            // the loading thread's own pump, which also owns the status text, so
+            // the window never depends on this timer being delivered to animate.
             if let Some(mut guard) = lock_loading_state() {
                 if let Some(state) = guard.as_mut() {
                     state.phase = (state.phase + 0.10) % std::f32::consts::TAU;
                 }
             }
-            InvalidateRect(hwnd, std::ptr::null(), 0);
             0
         }
         0x0002 => {
@@ -792,10 +798,6 @@ unsafe extern "system" fn loading_window_proc(
 const OVERLAY_STRIP_HEIGHT: u32 = 178;
 const OVERLAY_FADE_HEIGHT: u32 = 72;
 const OVERLAY_MAX_ALPHA: f32 = 0.78;
-/// Owner-drawn windows repaint on demand; this timer keeps the indeterminate
-/// bar moving while the loader writes its progress to the window.
-const OVERLAY_TIMER_MS: u32 = 30;
-const OVERLAY_TIMER_ID: usize = 1;
 /// `PWE_LOADING_WINDOWED=1` keeps the loading window in its framed size instead
 /// of maximising it. It exists for diagnostics on multi-monitor desktops, not to
 /// change the default: the picture fills the screen by default.
@@ -938,12 +940,13 @@ impl LoadingWindow {
             // happens; a synchronous UpdateWindow here would paint before the
             // state below is observed by the message loop.
             ShowWindow(hwnd, if windowed { 5 } else { 3 }); // SW_SHOW / SW_MAXIMIZE
-            SetTimer(hwnd, OVERLAY_TIMER_ID, OVERLAY_TIMER_MS, std::ptr::null());
+
             let _ = ready_tx.send(());
 
             let mut samples = std::collections::VecDeque::<f64>::with_capacity(32);
             let mut previous_bytes = 0u64;
             let mut last_sample = std::time::Instant::now();
+            let mut last_repaint = std::time::Instant::now();
             while !flag.load(std::sync::atomic::Ordering::Relaxed) {
                 let mut msg: WinMessage = std::mem::zeroed();
                 while PeekMessageW(&mut msg, hwnd, 0, 0, 1) != 0 {
@@ -1009,9 +1012,19 @@ impl LoadingWindow {
                 if changed {
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
+                // The bar's sweep lives in the state, so the window repaints on
+                // its own cadence as well as when a message arrives.
+                if now.duration_since(last_repaint) >= std::time::Duration::from_millis(40) {
+                    last_repaint = now;
+                    if let Some(mut guard) = lock_loading_state() {
+                        if let Some(state) = guard.as_mut() {
+                            state.phase = (state.phase + 0.10) % std::f32::consts::TAU;
+                        }
+                    }
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
                 std::thread::sleep(std::time::Duration::from_millis(40));
             }
-            KillTimer(hwnd, OVERLAY_TIMER_ID);
             DestroyWindow(hwnd);
         });
         let _ = ready_rx.recv_timeout(std::time::Duration::from_secs(5));

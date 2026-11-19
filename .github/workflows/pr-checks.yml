@@ -263,7 +263,7 @@ jobs:
           # lavapipe ICD rather than silently disabling Vulkan with a stale path.
           export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
           test -n "$VK_ICD_FILENAMES"
-          # Name the binary that failed: this step runs 22 checks and a bare
+          # Name the binary that failed: this step runs 25 checks and a bare
           # exit code does not say which one broke.
           run_check() {
             # `if ! cmd | tee` tests *tee's* status, which is always 0, so the
