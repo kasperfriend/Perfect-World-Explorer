@@ -45,5 +45,6 @@ fn render_hybrid(@builtin(global_invocation_id) id: vec3<u32>) {
     let key = textureLoad(primary_keys,vec2<i32>(id.xy),0);
     var bary = unpack2x16unorm(key.w);
     bary /= max(1.,bary.x+bary.y);
-    render_pixel(id.xy,Hit(bitcast<f32>(key.z),key.x,key.y,bary),true);
+    let overlay = (frame.options.x & RAY_LIGHTING_OVERLAY)!=0u;
+    render_pixel(id.xy,Hit(bitcast<f32>(key.z),key.x,key.y,bary),true,overlay);
 }
