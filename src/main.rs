@@ -88,6 +88,10 @@ mod launcher_ui;
 mod light_consumers;
 #[cfg(any(windows, test))]
 mod loading_graph;
+// The client's own loading artwork: the Windows loading window fills itself from
+// `surfaces.pck`, and the headless fixture check exercises the same lookup and
+// decode. Declared unconditionally so the path stays tested on every host.
+mod loading_screen;
 mod material;
 mod model_asset;
 mod model_attachment;
@@ -3707,11 +3711,22 @@ fn main() {
     // The old process's non-interactive overlay is the only loading UI for a
     // handoff child. Create the standalone loading window once, before terrain
     // fallback, so a second attempt never opens another Win32 window.
+    //
+    // The window opens before the map resolves, so no `Terrain` exists yet to
+    // name the client's `element` folder: the user's selection is resolved here
+    // instead, because `surfaces.pck` - the archive the loading-screen pictures
+    // come from - lives in `element`. A folder that cannot be resolved leaves
+    // the window on its plain background and says so, instead of failing the
+    // load over artwork.
     #[cfg(windows)]
     let loading = if world_handoff::is_handoff_child() {
         None
     } else {
-        Some(windows_setup::LoadingWindow::start())
+        let element = world_catalog::resolve(&path, Some(&selected_world))
+            .ok()
+            .map(|map| map.element.clone())
+            .unwrap_or_else(|| loading_screen::element_folder(&path));
+        Some(windows_setup::LoadingWindow::start(Some(&element)))
     };
     // Loading terrain is the only operation that can be retried in-process.
     // PR #40 showed that retrying `gpu::run` after a visible window has been
@@ -3750,6 +3765,8 @@ fn main() {
                 // readiness signal that will never arrive.
                 world_handoff::publish_failure(&error);
                 eprintln!("Error: {error}");
+                #[cfg(windows)]
+                drop(loading);
                 #[cfg(windows)]
                 if !world_handoff::is_handoff_child() {
                     windows_setup::show_error(&error);

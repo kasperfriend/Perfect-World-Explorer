@@ -318,6 +318,12 @@ jobs:
           run_check tree-lod-gpu-check
           run_check grass-gpu-mip-check
           run_check tree-authored-mip-gpu-check
+          # The client's own loading-screen artwork: a synthetic surfaces.pck
+          # (JPEG, BMP, a corrupt JPEG and nested art that must not be chosen)
+          # through the production lookup, decode, cover fit and darkened status
+          # strip, then the BGRA bytes the Windows blit consumes uploaded to a
+          # texture and read back row for row.
+          run_check loading-screen-gpu-check
       # The headless effect preview is the only place the effect pass is
       # rendered without a window. Its smoke case authors one sprite root and
       # asserts the card reaches the pass and covers pixels, so a change that

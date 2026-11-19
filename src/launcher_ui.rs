@@ -11,39 +11,48 @@ struct Rect {
     right: i32,
     bottom: i32,
 }
+/// `PAINTSTRUCT`, shared with the loading window's paint handler.
 #[repr(C)]
-struct Paint {
-    dc: Handle,
-    erase: i32,
-    rect: Rect,
-    restore: i32,
-    update: i32,
-    reserved: [u8; 32],
+pub(crate) struct Paint {
+    pub(crate) dc: Handle,
+    pub(crate) erase: i32,
+    pub(crate) rect: Rect,
+    pub(crate) restore: i32,
+    pub(crate) update: i32,
+    pub(crate) reserved: [u8; 32],
 }
+/// `BITMAPINFOHEADER`, the header the loading window prepends to its pixels.
 #[repr(C)]
-struct BitmapInfo {
-    size: u32,
-    width: i32,
-    height: i32,
-    planes: u16,
-    bits: u16,
-    compression: u32,
-    image_size: u32,
-    xppm: i32,
-    yppm: i32,
-    colors: u32,
-    important: u32,
+pub(crate) struct BitmapInfo {
+    pub(crate) size: u32,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) planes: u16,
+    pub(crate) bits: u16,
+    pub(crate) compression: u32,
+    pub(crate) image_size: u32,
+    pub(crate) xppm: i32,
+    pub(crate) yppm: i32,
+    pub(crate) colors: u32,
+    pub(crate) important: u32,
 }
 #[link(name = "user32")]
 extern "system" {
-    fn BeginPaint(hwnd: Handle, ps: *mut Paint) -> Handle;
-    fn EndPaint(hwnd: Handle, ps: *const Paint) -> i32;
+    pub(crate) fn BeginPaint(hwnd: Handle, ps: *mut Paint) -> Handle;
+    pub(crate) fn EndPaint(hwnd: Handle, ps: *const Paint) -> i32;
     fn FillRect(dc: Handle, rect: *const Rect, brush: Handle) -> i32;
     fn InvalidateRect(hwnd: Handle, rect: *const Rect, erase: i32) -> i32;
 }
+/// GDI text extent, in pixels.
+#[repr(C)]
+struct Size {
+    cx: i32,
+    cy: i32,
+}
 #[link(name = "gdi32")]
 extern "system" {
-    fn StretchDIBits(
+    fn GetTextExtentPoint32W(dc: Handle, text: *const u16, count: i32, size: *mut Size) -> i32;
+    pub(crate) fn StretchDIBits(
         dc: Handle,
         x: i32,
         y: i32,
@@ -80,9 +89,6 @@ extern "system" {
         pitch: u32,
         face: *const u16,
     ) -> Handle;
-}
-fn rgb(r: u8, g: u8, b: u8) -> u32 {
-    u32::from(r) | (u32::from(g) << 8) | (u32::from(b) << 16)
 }
 struct Art {
     pixels: Vec<u8>,
@@ -224,6 +230,46 @@ pub fn key(hwnd: Handle, k: usize) -> usize {
         }
     }
     0
+}
+/// The launcher's accent colour, shared with the loading window's overlay.
+pub fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    r as u32 | (g as u32) << 8 | (b as u32) << 16
+}
+/// Fill one rectangle in a device context. The loading window paints its
+/// status strip with the launcher's own GDI helpers so both native windows use
+/// one text and rectangle path.
+pub unsafe fn fill_rect(dc: Handle, x: i32, y: i32, w: i32, h: i32, color: u32) {
+    rect(dc, x, y, w, h, color)
+}
+/// Draw one line of text and return its pixel width.
+pub unsafe fn draw_text(
+    dc: Handle,
+    x: i32,
+    y: i32,
+    s: &str,
+    size: i32,
+    weight: i32,
+    color: u32,
+) -> i32 {
+    let width = text_width(dc, s, size);
+    text(dc, x, y, s, size, weight, color);
+    width
+}
+/// Width of `s` at `size` points in the launcher font.
+pub unsafe fn text_width(dc: Handle, s: &str, size: i32) -> i32 {
+    let face: Vec<u16> = "Segoe UI".encode_utf16().chain(Some(0)).collect();
+    let font = CreateFontW(-size, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
+    let old = SelectObject(dc, font);
+    let mut extent = Size { cx: 0, cy: 0 };
+    let data: Vec<u16> = s.encode_utf16().collect();
+    let measured = GetTextExtentPoint32W(dc, data.as_ptr(), data.len() as i32, &mut extent);
+    SelectObject(dc, old);
+    DeleteObject(font);
+    if measured == 0 {
+        0
+    } else {
+        extent.cx
+    }
 }
 unsafe fn rect(dc: Handle, x: i32, y: i32, w: i32, h: i32, color: u32) {
     let r = Rect {
