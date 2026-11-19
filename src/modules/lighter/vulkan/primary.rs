@@ -447,42 +447,41 @@ unsafe fn create_graphics(
     let attachments = [vk::PipelineColorBlendAttachmentState::builder()
         .color_write_mask(vk::ColorComponentFlags::RGBA)
         .build()];
+    // Ash builder methods consume `&self` and hand out references to temporary
+    // structures, so every state must stay alive for the whole driver call;
+    // otherwise Vulkan reads stack memory that has already gone out of scope.
+    let _builders = (
+        vk::PipelineVertexInputStateCreateInfo::default(),
+        vk::PipelineInputAssemblyStateCreateInfo::builder()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
+        vk::PipelineViewportStateCreateInfo::builder()
+            .viewport_count(1)
+            .scissor_count(1),
+        vk::PipelineRasterizationStateCreateInfo::builder()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .line_width(1.),
+        vk::PipelineMultisampleStateCreateInfo::builder()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1),
+        vk::PipelineDepthStencilStateCreateInfo::builder()
+            .depth_test_enable(true)
+            .depth_write_enable(true)
+            .depth_compare_op(vk::CompareOp::GREATER_OR_EQUAL),
+        vk::PipelineColorBlendStateCreateInfo::builder().attachments(&attachments),
+        vk::PipelineDynamicStateCreateInfo::builder()
+            .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]),
+    );
     let info = vk::GraphicsPipelineCreateInfo::builder()
         .layout(layout)
         .render_pass(render)
         .stages(&stages)
-        .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
-        .input_assembly_state(
-            &vk::PipelineInputAssemblyStateCreateInfo::builder()
-                .topology(vk::PrimitiveTopology::TRIANGLE_LIST),
-        )
-        .viewport_state(
-            &vk::PipelineViewportStateCreateInfo::builder()
-                .viewport_count(1)
-                .scissor_count(1),
-        )
-        .rasterization_state(
-            &vk::PipelineRasterizationStateCreateInfo::builder()
-                .polygon_mode(vk::PolygonMode::FILL)
-                .line_width(1.),
-        )
-        .multisample_state(
-            &vk::PipelineMultisampleStateCreateInfo::builder()
-                .rasterization_samples(vk::SampleCountFlags::TYPE_1),
-        )
-        .depth_stencil_state(
-            &vk::PipelineDepthStencilStateCreateInfo::builder()
-                .depth_test_enable(true)
-                .depth_write_enable(true)
-                .depth_compare_op(vk::CompareOp::GREATER_OR_EQUAL),
-        )
-        .color_blend_state(
-            &vk::PipelineColorBlendStateCreateInfo::builder().attachments(&attachments),
-        )
-        .dynamic_state(
-            &vk::PipelineDynamicStateCreateInfo::builder()
-                .dynamic_states(&[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR]),
-        )
+        .vertex_input_state(&_builders.0)
+        .input_assembly_state(&_builders.1)
+        .viewport_state(&_builders.2)
+        .rasterization_state(&_builders.3)
+        .multisample_state(&_builders.4)
+        .depth_stencil_state(&_builders.5)
+        .color_blend_state(&_builders.6)
+        .dynamic_state(&_builders.7)
         .build();
     let result = d.create_graphics_pipelines(cache, &[info], None);
     d.destroy_shader_module(vertex, None);
