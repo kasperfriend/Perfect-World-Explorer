@@ -5262,13 +5262,14 @@ async fn adapter(
     lighter: LighterMode,
 ) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
     let mut ordinary = crate::modules::lighter::reconstruction::Startup::new(LighterMode::Off);
-    open_adapter(instance, surface, lighter, &mut ordinary).await
+    open_adapter(instance, surface, lighter, false, &mut ordinary).await
 }
 
 async fn open_adapter(
     instance: &wgpu::Instance,
     surface: Option<&wgpu::Surface<'_>>,
     lighter: LighterMode,
+    native_stage_timestamps: bool,
     reconstruction: &mut crate::modules::lighter::reconstruction::Startup,
 ) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
     let a = if let Ok(name) = std::env::var("WGPU_ADAPTER_NAME") {
@@ -5318,7 +5319,7 @@ async fn open_adapter(
         limits.max_storage_buffer_binding_size =
             a.limits().max_storage_buffer_binding_size.min(256 << 20);
     }
-    let timestamps = if lighter != LighterMode::Off {
+    let timestamps = if lighter != LighterMode::Off || native_stage_timestamps {
         a.features() & wgpu::Features::TIMESTAMP_QUERY
     } else {
         wgpu::Features::empty()
@@ -5534,6 +5535,11 @@ fn run_viewer(
     }
     let mut reconstruction =
         crate::modules::lighter::reconstruction::Startup::new(lighter_settings.mode);
+    let sync_travel_requested = std::env::var_os("PW_LIGHTER_TRAVEL_PLAN").is_some()
+        && std::env::var("PW_LIGHTER_TRAVEL_SYNC").as_deref() == Ok("1");
+    #[cfg(test)]
+    let sync_travel_requested =
+        sync_travel_requested || smoke_travel.is_some_and(|dir| dir.join("sync-test").is_file());
     let try_surface = |instance: &wgpu::Instance, reconstruction: &mut _| {
         let surface = instance
             .create_surface(window.clone())
@@ -5542,6 +5548,7 @@ fn run_viewer(
             instance,
             Some(&surface),
             lighter_settings.mode,
+            sync_travel_requested,
             reconstruction,
         ))?;
         Ok::<_, String>((surface, gpu))
@@ -6139,6 +6146,10 @@ fn run_viewer(
     let mut run_error = None;
     let mut display_extent = (config.width, config.height);
     let mut frame_capture = readback::ViewerCapture::default();
+    let native_travel_timer = travel
+        .as_ref()
+        .filter(|flight| flight.synchronized())
+        .and_then(|_| lighter_travel::NativeWorldTimer::new(&renderer.device));
     let mut motion_capture = readback::Ring::default();
     #[cfg(test)]
     let mut smoke_frames = 0;
@@ -7644,6 +7655,13 @@ fn run_viewer(
                                 first_frame_progress(if renderer.renders_rays() { "Drawing the first ray-traced world frame…" } else { "Drawing the first Native world frame…" });
                             }
                             let drawn_pose = travel_pose.map(|_| [camera.pos.x,camera.pos.y,camera.pos.z,camera.yaw,camera.pitch]);
+                            let native_timer = native_travel_timer.as_ref().filter(|_| {
+                                !ray_world && drawn_pose.is_some()
+                                    && travel.as_ref().is_some_and(|flight| flight.synchronized())
+                            });
+                            if let Some(timer) = native_timer {
+                                timer.stamp(&renderer.device, &renderer.queue, false);
+                            }
                             let world_ready = renderer.render(
                                 &world_view,
                                 &world_raw_view,
@@ -7674,6 +7692,9 @@ fn run_viewer(
                                 if let Some(session) = latency.as_mut() { session.render_submit_end(); }
                                 gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
                                 return;
+                            }
+                            if let Some(timer) = native_timer {
+                                timer.stamp(&renderer.device, &renderer.queue, true);
                             }
                             if !presented_once {
                                 first_frame_progress("Compositing the first world frame and interface…");
@@ -8504,6 +8525,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 let sync = if drawn_pose.is_some() && travel.as_ref().is_some_and(|v| v.synchronized()) {
                                     // Explicit capture mode. Count only actual completed frames,
                                     // including raw Vulkan work, not merely a present call.
+                                    let native_map = native_timer.map(lighter_travel::NativeWorldTimer::map);
                                     let start = Instant::now();
                                     let completed = wait_for_capture(&renderer.device, || {
                                         let idle = renderer.device.poll(wgpu::Maintain::Poll).is_queue_empty();
@@ -8517,10 +8539,22 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         return;
                                     }
                                     let wait_ms = start.elapsed().as_secs_f64() * 1000.;
+                                    let native_world_span_ms = if let (Some(timer), Some(mapped)) = (native_timer, native_map) {
+                                        // The synchronized queue drain polls the map callback. No
+                                        // additional wait or stale same-size result is admitted.
+                                        match mapped.try_recv() {
+                                            Ok(Ok(())) => timer.elapsed_ms(&renderer.queue),
+                                            _ => {
+                                                travel.as_mut().unwrap().invalidate("Native GPU timestamps not mapped after queue drain");
+                                                return;
+                                            }
+                                        }
+                                    } else { None };
                                     Some(lighter_travel::SyncSample {
                                         wait_ms,
                                         ray_stages: renderer.lighter.capture_stage_sample(&renderer.queue),
                                         sdk_ms: renderer.lighter.capture_sdk_ms(),
+                                        native_world_span_ms,
                                     })
                                 } else { None };
                                 window.pre_present_notify();
@@ -8538,6 +8572,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     let motion = if let Some(path) = flight.motion_frame() {
                                         // Opt-in image evidence only. Unlike the ordinary travel trace,
                                         // this waits for readback and must never be used to report FPS.
+                                        use sha2::{Digest, Sha256};
                                         let source = render_scale.texture();
                                         let captured = read_target_pixels(&renderer, &mut motion_capture, source)
                                             .and_then(|bytes| {
@@ -8854,6 +8889,7 @@ fn preview_device(settings: LighterSettings) -> Result<PreviewDevice, String> {
         &instance,
         None,
         settings.mode,
+        false,
         &mut reconstruction,
     ));
     if let Err(error) = &result {
@@ -8868,6 +8904,7 @@ fn preview_device(settings: LighterSettings) -> Result<PreviewDevice, String> {
                 &instance,
                 None,
                 settings.mode,
+                false,
                 &mut reconstruction,
             ));
         }

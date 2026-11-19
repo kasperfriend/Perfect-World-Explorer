@@ -2,7 +2,7 @@ import tempfile
 from pathlib import Path
 import unittest
 
-from lighter_travel_report import PROVIDERS, STAGES, capture, summarize, validate_pair, validate_suite
+from lighter_travel_report import PROVIDERS, STAGES, capture, matched_normal_companions, summarize, validate_pair, validate_suite
 
 
 class TravelTest(unittest.TestCase):
@@ -28,7 +28,7 @@ class TravelTest(unittest.TestCase):
             memory = "12345" if i % 10 == 0 else ""
             row = f"{i},{interval},6,0.2,0.1,{i+pose_shift},2,3,0,-0.4,0,0,{int(i == 19)},{int(i == 20)},{memory}"
             if sync:
-                row += ",1.5,,,8,,,0.2," + ("2" if provider != "portable" else "")
+                row += ",1.5,,,8,,,0.2," + ("2" if provider != "portable" else "") + ","
             data.append(row + "\n")
         file.write_text(''.join(data), encoding="utf-8")
         return file
@@ -73,13 +73,31 @@ class TravelTest(unittest.TestCase):
         routes = [("Off", PROVIDERS[0])] + [(mode, provider) for mode in ("Software", "Hardware") for provider in PROVIDERS]
         meta = {"platform": "windows", "architecture": "x86_64", "vulkan_largest_device_local_heap_bytes": str(10 << 30),
                 "adapter": 'name: "NVIDIA GeForce RTX 3080", vendor: 4318, device_type: DiscreteGpu, backend: Vulkan'}
-        records = [(meta | {"ray_reconstruction": provider}, mode, [],
-                    [(0, 0, False, False, 1, 0, 0, (1, None, None, 1, None, None, None, 1))])
-                   for mode, provider in routes]
+        def record(mode, provider):
+            sdk = provider != "portable"
+            stages = (1, 0 if mode == "Hardware" else None, None, 1 if mode != "Off" else None,
+                      0.1 if mode != "Off" and not sdk else None, 0.2 if mode != "Off" and not sdk else None,
+                      0.1 if mode != "Off" else None, 1 if sdk else None, 2 if mode == "Off" else None)
+            receipt = dict.fromkeys(("map", "hour", "plan_sha256", "display", "world", "present_mode", "view_sha256",
+                                    "view", "warmup", "trace", "screen_cache_mask", "compact_terrain", "sampled_bc"), "control")
+            receipt |= meta | {"ray_reconstruction": provider, "ray": f"Settings {{ mode: {mode}, fixed: true }}",
+                               "peak_sampled_device_local_heap_estimate_bytes": "7100000000", "heap_at_or_above_7_gb": "true"}
+            return receipt, mode, [(0, 0, 0, 0, 0)], [(16, 1, False, False, 1, 0, 0, stages)]
+        records = [record(mode, provider) for mode, provider in routes]
         validate_suite(records)
-        altered = meta | {"ray_reconstruction": "portable", "vulkan_largest_device_local_heap_bytes": str(12 << 30)}
+        self.assertEqual(matched_normal_companions(records, list(reversed(records))), records)
+        changed = records[0][0] | {"vulkan_largest_device_local_heap_bytes": str(12 << 30)}
         with self.assertRaisesRegex(ValueError, "RTX 3080 10 GB"):
-            validate_suite([(altered, *records[0][1:]), *records[1:]])
+            validate_suite([(changed, *records[0][1:]), *records[1:]])
+        changed = records[0][0] | {"heap_at_or_above_7_gb": "false"}
+        with self.assertRaisesRegex(ValueError, "heap peak or warning"):
+            validate_suite([(changed, *records[0][1:]), *records[1:]])
+        with self.assertRaisesRegex(ValueError, "gpu_native_world_span_ms"):
+            row = records[0][3][0]
+            missing = (*row[:7], (*row[7][:8], None))
+            validate_suite([(*records[0][:3], [missing]), *records[1:]])
+        with self.assertRaisesRegex(ValueError, "camera paths disagree"):
+            matched_normal_companions(records, [(*records[0][:2], [(0, 1, 0, 0, 0)], records[0][3]), *records[1:]])
 
     def test_motion_receipt_binds_pixels_and_review_to_rendered_cut(self):
         import hashlib

@@ -2,6 +2,7 @@
 """Summarize normal-present Lighter travel CSVs without treating them as GPU/display latency."""
 import argparse
 import csv
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -14,7 +15,7 @@ MATCH = ("map", "hour", "plan_sha256", "adapter", "display", "world", "present_m
 RAY_MATCH = ("trace", "screen_cache_mask", "compact_terrain", "sampled_bc")
 POSE = ("x", "y", "z", "yaw", "pitch")
 STAGES = ("queue_drain_wall_ms", "gpu_as_ms", "gpu_raster_primary_ms", "gpu_trace_ms", "gpu_reproject_ms",
-          "gpu_filter_ms", "gpu_ray_composite_ms", "gpu_sdk_ms")
+          "gpu_filter_ms", "gpu_ray_composite_ms", "gpu_sdk_ms", "gpu_native_world_span_ms")
 PROVIDERS = ("portable", "Vulkan temporal FSR", "Vulkan DLSS Ray Reconstruction")
 
 
@@ -61,6 +62,8 @@ def validate_rows(path, meta, rows, policy):
     motion = policy == "motion_readback"
     if meta.get("capture_policy", "normal_present") != policy:
         raise ValueError(f"{path}: expected a {policy} performance sample; exclude motion/readback")
+    if rows and not synchronized and any(stage in rows[0] for stage in STAGES):
+        raise ValueError(f"{path}: GPU stage fields in a non-synchronized sample")
     provider = meta.get("ray_reconstruction", "portable")
     if provider not in PROVIDERS or ((synchronized or motion) and "ray_reconstruction" not in meta):
         raise ValueError(f"{path}: invalid or missing provider receipt")
@@ -95,11 +98,13 @@ def validate_rows(path, meta, rows, policy):
         poses.append(pose)
         stages = None
         if synchronized:
-            stages = tuple(float(row[k]) if row[k] else None for k in STAGES)
+            stages = tuple(float(row[k]) if row.get(k) else None for k in STAGES)
             if stages[0] is None or any(x is not None and (not math.isfinite(x) or x < 0) for x in stages):
                 raise ValueError(f"{path}: invalid synchronized stages in frame {row['frame']}")
-            if provider == "portable" and stages[-1] is not None:
+            if provider == "portable" and stages[7] is not None:
                 raise ValueError(f"{path}: portable route reported an SDK timestamp")
+            if mode != "Off" and stages[8] is not None:
+                raise ValueError(f"{path}: ray route reported a Native world timestamp")
         result.append((d, redraw, row["streaming"] == "1", row["committed"] == "1", heap, acquire, present, stages))
     return meta, mode, poses, result
 
@@ -161,21 +166,59 @@ def summarize(data, require_commit=False, require_heap=False, physical=False, de
             "heap_at_or_above_7_gb": None if peak is None else peak >= 7_000_000_000}
 
 
-def validate_suite(records):
+def route_key(record):
+    return record[1], record[0].get("ray_reconstruction", "portable")
+
+
+def validate_suite(records, *, synchronized=True):
     required = {("Off", "portable")} | {(mode, provider) for mode in ("Software", "Hardware") for provider in PROVIDERS}
-    pairs = [(mode, meta["ray_reconstruction"]) for meta, mode, _, _ in records]
+    pairs = list(map(route_key, records))
     if len(pairs) != len(required) or set(pairs) != required:
-        raise ValueError(f"missing or duplicate synchronized routes: {sorted(required - set(pairs))}")
+        raise ValueError(f"missing or duplicate {'synchronized' if synchronized else 'normal-present'} routes: {sorted(required - set(pairs))}")
     for meta, mode, _, rows in records:
         if not requested_target(meta):
             raise ValueError("SDK matrix needs Windows x64 RTX 3080 10 GB Vulkan evidence")
         provider = meta["ray_reconstruction"]
-        if any(r[4] is None or r[4] <= 0 for r in rows):
+        heap = [r[4] for r in rows if r[4] is not None]
+        if not heap or min(heap) <= 0 or (synchronized and len(heap) != len(rows)):
             raise ValueError(f"{mode}/{provider}: whole-viewer heap samples are missing")
-        if mode != "Off" and any(r[7][3] is None for r in rows):
-            raise ValueError(f"{mode}/{provider}: missing current-frame GPU trace measure")
-        if provider != "portable" and any(r[7][-1] is None for r in rows):
-            raise ValueError(f"{mode}/{provider}: missing current-frame GPU SDK measure")
+        peak = int(meta.get("peak_sampled_device_local_heap_estimate_bytes", "0"))
+        if peak < max(heap) or meta.get("heap_at_or_above_7_gb") != str(peak >= 7_000_000_000).lower():
+            raise ValueError(f"{mode}/{provider}: inconsistent sampled heap peak or warning receipt")
+        if not synchronized:
+            continue
+        required_stages = ({8} if mode == "Off" else {3, 6})
+        if mode == "Hardware":
+            required_stages.add(1)
+        if mode != "Off":
+            required_stages.update((4, 5) if provider == "portable" else (7,))
+        for row in rows:
+            sample = row[7]
+            if sample is None:
+                raise ValueError(f"{mode}/{provider}: no synchronized stage sample")
+            for stage in required_stages:
+                v = sample[stage]
+                if v is None or (stage in (3, 7, 8) and v <= 0):
+                    raise ValueError(f"{mode}/{provider}: missing current-frame {STAGES[stage]}")
+
+
+def validate_matched(captures, *, reuse_ab=False):
+    groups = (captures, [r for r in captures if r[1] != "Off"])
+    for group in groups:
+        for b in group[1:]:
+            validate_pair(group[0], b, reuse_ab=reuse_ab)
+
+
+def matched_normal_companions(synchronized, normal):
+    validate_suite(normal, synchronized=False)
+    controls = {route_key(r): r for r in normal}
+    for r in synchronized:
+        validate_pair(r, controls[route_key(r)])
+    return [controls[route_key(r)] for r in synchronized]
+
+
+def receipt_summary(path, record, **kwargs):
+    return summarize(record, **kwargs) | {"csv": str(path), "csv_sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
 def main():
@@ -184,6 +227,8 @@ def main():
     parser.add_argument("--physical", action="store_true")
     parser.add_argument("--synchronized", action="store_true", help="read separate >=500-frame queue-completion runs")
     parser.add_argument("--require-sdk-matrix", action="store_true", help="require all seven RTX 3080 synchronized routes")
+    parser.add_argument("--normal-companions", nargs="+", type=Path, metavar="CSV",
+                        help="validate separate, exactly matched normal-present CSVs for the seven synchronized routes")
     parser.add_argument("--reuse-ab", action="store_true", help="allow only a matched default/both cache A/B pair")
     parser.add_argument("--require-commit", action="store_true")
     parser.add_argument("--require-heap", action="store_true")
@@ -199,21 +244,27 @@ def main():
                     or any(r[0].get("ray_reconstruction", "portable") != "portable" for r in captures)
                     or {int(r[0]["screen_cache_mask"]) & 3 for r in captures} != {0, 3}):
                 raise ValueError("reuse A/B requires two matched portable ray runs, one default and one both")
-        for b in captures[1:]:
-            validate_pair(captures[0], b, reuse_ab=args.reuse_ab)
-        # Also compare all ray runs, even if the first capture was Native.
-        rays = [r for r in captures if r[1] != "Off"]
-        for b in rays[1:]:
-            validate_pair(rays[0], b, reuse_ab=args.reuse_ab)
+        validate_matched(captures, reuse_ab=args.reuse_ab)
         device = TARGET_ADAPTER if args.require_sdk_matrix else args.device
-        result = [summarize(r, args.require_commit, args.require_heap, args.physical or args.require_sdk_matrix, device) for r in captures]
+        options = dict(require_commit=args.require_commit, require_heap=args.require_heap,
+                       physical=args.physical or args.require_sdk_matrix, device=device)
+        result = [receipt_summary(p, r, **options) for p, r in zip(args.csv, captures, strict=True)]
+        companions = None
+        if args.normal_companions:
+            if not args.require_sdk_matrix:
+                raise ValueError("--normal-companions requires --require-sdk-matrix")
+            normal = [capture(path) for path in args.normal_companions]
+            ordered = matched_normal_companions(captures, normal)
+            paths = {route_key(r): p for p, r in zip(args.normal_companions, normal, strict=True)}
+            companions = [receipt_summary(paths[route_key(r)], r, **options) for r in ordered]
     except (OSError, ValueError, TypeError, KeyError, ZeroDivisionError) as exc:
         parser.error(str(exc))
     timing = ("queue drained before each wgpu present; wall time includes completion polling, not display latency"
               if sync else "normal wgpu present calls, not display latency")
     print(json.dumps({"timing_scope": timing,
                       "memory_scope": "sampled Vulkan process device-local heap estimate, not exact VRAM residency",
-                      "captures": result}, indent=2))
+                      "native_gpu_scope": "world queue timestamp span; may include queue idle, excludes UI/present/scanout",
+                      "captures": result, "normal_present_companions": companions}, indent=2))
 
 
 if __name__ == "__main__":

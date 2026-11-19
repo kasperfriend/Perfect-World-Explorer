@@ -1567,7 +1567,7 @@ fn lighter_live_travel_csv() {
         assert_eq!(
             columns.len(),
             if sync {
-                23
+                24
             } else if motion {
                 19
             } else {
@@ -1578,7 +1578,10 @@ fn lighter_live_travel_csv() {
             assert!(columns[15]
                 .parse::<f64>()
                 .is_ok_and(|v| v.is_finite() && v >= 0.));
-            assert!(columns[16..].iter().all(|column| column.is_empty()));
+            assert!(columns[16..23].iter().all(|column| column.is_empty()));
+            assert!(columns[23]
+                .parse::<f64>()
+                .is_ok_and(|v| v.is_finite() && v > 0.));
         }
         if motion {
             use sha2::{Digest, Sha256};

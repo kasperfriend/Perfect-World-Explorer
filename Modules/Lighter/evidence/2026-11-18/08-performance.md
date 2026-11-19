@@ -49,3 +49,23 @@ not the 500-present benchmark. See `08-performance/` and `10-water/`.
 Native synthetic fixture** (synchronized, 160×96, no ray or SDK stages)
 and the 30-frame normal-present control. It tested CPU queue-drain receipt
 shape, not process heap sampling on RTX or any of the seven physical routes.
+
+## Ordered follow-up: validate both seven-route sets
+
+Synchronized Native now records `gpu_native_world_span_ms` with Vulkan
+queue timestamp markers bracketing world submission, including water and
+post when enabled. Since the world has multiple submissions, the span can
+include GPU queue idle; it excludes UI, present and scanout. Only the
+explicit synchronized Native route uses these extra submissions. No Native
+GPU timestamps are claimed for the earlier CPU flight.
+
+Pass `--normal-companions` followed by the seven separate normal-present
+CSVs to `lighter_travel_report.py --require-sdk-matrix`. It matches each
+route/provider across policies and keeps the reports separate. The strict
+sync check now needs Native world, the applicable ray/SDK spans, and
+consistent per-frame heap, peak and ≥7 GB warning receipts. A missing stage
+is not a zero, and there is no stage from which to infer display latency.
+The parser fixtures reject swapped poses, stale stage omissions, an invalid
+heap warning and the same-name 12 GB GPU. S fixtures do not supply any of
+the **0/7 target timing routes**. The separate `both`/default time-and-noise
+A/B remains to be run on the target.
