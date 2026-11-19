@@ -1092,18 +1092,22 @@ fn exercise_material_channels(h: &mut Harness) {
             h.pixel(frame, &empty)
         };
         probes.push([
-            trace(Vec3::new(-0.73, 1., 0.33), -Vec3::Y),
-            trace(Vec3::new(0., 25., 0.), -Vec3::Y),
+            // Keep probes strictly beyond the near plane and off the
+            // shared triangle edge; this test is about blend sampling.
+            trace(Vec3::new(-0.73, 2., 0.33), -Vec3::Y),
+            trace(Vec3::new(0.32, 25., -0.14), -Vec3::Y),
             trace(
                 Vec3::new(-12., 1., -0.63),
                 Vec3::new(12., -1., 0.).normalize(),
             ),
         ]);
     }
-    for ((old, depth), (packed, packed_depth)) in probes[0].into_iter().zip(probes[1]) {
+    for (probe, ((old, depth), (packed, packed_depth))) in
+        probes[0].into_iter().zip(probes[1]).enumerate()
+    {
         assert!(
             old[0] > 0 && old[1] > 0 && old[2] == 0 && depth > 0.,
-            "expected blended terrain: {old:?}, {depth}"
+            "expected blended terrain at probe {probe}: {old:?}, {depth}"
         );
         assert_eq!(depth, packed_depth);
         assert!(
