@@ -241,19 +241,9 @@ pub fn rgb(r: u8, g: u8, b: u8) -> u32 {
 pub unsafe fn fill_rect(dc: Handle, x: i32, y: i32, w: i32, h: i32, color: u32) {
     rect(dc, x, y, w, h, color)
 }
-/// Draw one line of text and return its pixel width.
-pub unsafe fn draw_text(
-    dc: Handle,
-    x: i32,
-    y: i32,
-    s: &str,
-    size: i32,
-    weight: i32,
-    color: u32,
-) -> i32 {
-    let width = text_width(dc, s, size);
+/// Draw one line of text with the launcher's font and colours.
+pub unsafe fn draw_text(dc: Handle, x: i32, y: i32, s: &str, size: i32, weight: i32, color: u32) {
     text(dc, x, y, s, size, weight, color);
-    width
 }
 /// Width of `s` at `size` points in the launcher font.
 pub unsafe fn text_width(dc: Handle, s: &str, size: i32) -> i32 {
@@ -265,10 +255,12 @@ pub unsafe fn text_width(dc: Handle, s: &str, size: i32) -> i32 {
     let measured = GetTextExtentPoint32W(dc, data.as_ptr(), data.len() as i32, &mut extent);
     SelectObject(dc, old);
     DeleteObject(font);
+    // A failed measurement must not turn a right-aligned label into a negative
+    // offset; 0 keeps it at the caller's left margin.
     if measured == 0 {
         0
     } else {
-        extent.cx
+        extent.cx.max(0)
     }
 }
 unsafe fn rect(dc: Handle, x: i32, y: i32, w: i32, h: i32, color: u32) {

@@ -467,12 +467,12 @@ extern "system" {
 struct LoadingArt {
     /// `BITMAPINFOHEADER` followed by top-down 32-bit BGRA pixels.
     bits: Vec<u8>,
+    /// The same pixels blended with the status strip, in RGBA. A window resize
+    /// refits and re-blends from here, so the source picture does not have to be
+    /// decoded or cloned a second time.
+    rgba: Vec<u8>,
     width: u32,
     height: u32,
-    /// Decoded source, retained so a window resize can refit rather than
-    /// stretch. It is small next to the fitted surface and lets the picture keep
-    /// covering the window after the user moves to another monitor.
-    source: Option<image::RgbaImage>,
     /// Archive path of the picture, shown in the window so a screenshot names
     /// which loading screen the client's archive produced.
     label: String,
@@ -510,9 +510,9 @@ impl LoadingArt {
         bits.extend_from_slice(&crate::loading_screen::to_bgra(&blended));
         Ok(Self {
             bits,
+            rgba: blended,
             width,
             height,
-            source: Some(image.clone()),
             label,
         })
     }
@@ -535,19 +535,17 @@ impl LoadingArt {
         }
     }
 
-    /// Re-fit the retained source to a new client size.
+    /// Re-fit the retained pixels to a new client size.
     fn refit(&mut self, width: u32, height: u32) -> Result<(), String> {
-        let source = match self.source.as_ref() {
-            Some(source) => source,
-            None => return Ok(()),
-        };
         let width = width.max(320);
         let height = height.max(240);
         if width == self.width && height == self.height {
             return Ok(());
         }
-        let replacement = Self::new(source, width, height, self.label.clone())?;
-        *self = replacement;
+        let source =
+            image::RgbaImage::from_raw(self.width, self.height, std::mem::take(&mut self.rgba))
+                .ok_or_else(|| "fitted loading artwork no longer matches its size".to_string())?;
+        *self = Self::new(&source, width, height, self.label.clone())?;
         Ok(())
     }
 }
@@ -935,8 +933,11 @@ impl LoadingWindow {
                 let _ = ready_tx.send(());
                 return;
             }
+            // The first WM_PAINT the show below queues draws the artwork, so the
+            // measurement loop is running before any decode-sized GDI work
+            // happens; a synchronous UpdateWindow here would paint before the
+            // state below is observed by the message loop.
             ShowWindow(hwnd, if windowed { 5 } else { 3 }); // SW_SHOW / SW_MAXIMIZE
-            UpdateWindow(hwnd);
             SetTimer(hwnd, OVERLAY_TIMER_ID, OVERLAY_TIMER_MS, std::ptr::null());
             let _ = ready_tx.send(());
 

@@ -122,6 +122,22 @@ fn dds() -> Vec<u8> {
     out
 }
 
+/// Every picture-shaped entry in the fixture archive, root and nested, so the
+/// nested DDS can be fed to `loading_screen::decode` as well. Production only
+/// ever offers root entries through `loading_screen::list`.
+fn pck_entries_for(element: &std::path::Path) -> Vec<loading_screen::Picture> {
+    let mut file = std::fs::File::open(element.join(loading_screen::ARCHIVE_NAME)).unwrap();
+    pck::directory(&mut file)
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.name.contains('.'))
+        .map(|entry| loading_screen::Picture {
+            path: entry.name.to_ascii_lowercase().replace('\\', "/"),
+            size: entry.size,
+        })
+        .collect()
+}
+
 fn main() {
     let mut failures: Vec<String> = Vec::new();
     let root =
@@ -156,7 +172,21 @@ fn main() {
         failures.push("pick(word 2) did not wrap to the third picture".into());
     }
 
-    // 2. Decode every picture that must work, and pin the corrupt one.
+    // 2. Decode every picture that must work, and pin the corrupt one. The DDS
+    //    lives in a subfolder and so is not a loading screen, but it is decoded
+    //    here through the same path a modified client's root DDS would use.
+    let nested = pck_entries_for(&element)
+        .into_iter()
+        .find(|picture| picture.path == "surfaces/maps/000.dds")
+        .expect("the nested DDS is in the archive index");
+    match loading_screen::decode(&element, &nested) {
+        Ok(image) if image.dimensions() == (16, 16) => {}
+        Ok(image) => failures.push(format!(
+            "surfaces/maps/000.dds decoded as {:?}, expected (16, 16)",
+            image.dimensions()
+        )),
+        Err(error) => failures.push(format!("surfaces/maps/000.dds did not decode: {error}")),
+    }
     for (name, expected) in [
         ("surfaces/background.jpg", (64u32, 40u32)),
         ("surfaces/loading03.bmp", (48, 64)),
