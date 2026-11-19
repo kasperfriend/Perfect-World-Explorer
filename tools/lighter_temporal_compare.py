@@ -12,7 +12,7 @@ import math
 from pathlib import Path
 import re
 
-from lighter_capture_matrix import MATCH_KEYS, compare, metadata, validate_match, verified_image
+from lighter_capture_matrix import MATCH_KEYS, compare, metadata, sha256_file, validate_match, verified_image
 from lighter_host_evidence import requested_target
 
 PROVIDERS = {
@@ -42,6 +42,9 @@ def validate_temporal(metas, scene):
             raise ValueError(f"{label}: expected Windows x64 RTX 3080 10 GB Vulkan evidence")
         if meta.get("ray_reconstruction") != expected:
             raise ValueError(f"{label}: requested {expected}, got {meta.get('ray_reconstruction')}")
+        if (meta.get("required_ray_reconstruction") != expected
+                or int(meta.get("provider_checked_draws", "0")) < 49):
+            raise ValueError(f"{label}: missing provider check on all 48 warm-ups and final draw")
         if meta["mode"] != off["mode"]:
             raise ValueError(f"{label}: ray route changed")
         is_reference = label.startswith("reference")
@@ -62,6 +65,10 @@ def validate_temporal(metas, scene):
             if settings_field(meta, "samples") != "1":
                 raise ValueError(f"{label}: expected 1 spp")
             validate_match(off, meta)
+        w, h = map(int, meta["image"].split("x"))
+        scale = int(settings_field(meta, "resolution"))
+        if not 25 <= scale <= 100 or min(w, h) < 64 or meta.get("trace_image") != f"{w*scale//100}x{h*scale//100}":
+            raise ValueError(f"{label}: unexpected actual trace extent")
         for key in (*MATCH_KEYS, "platform", "architecture", "vulkan_largest_device_local_heap_bytes", "camera_path_sha256"):
             if meta.get(key) != off.get(key):
                 raise ValueError(f"{label}: unmatched {key}")
@@ -75,6 +82,27 @@ def validate_temporal(metas, scene):
         raise ValueError("Reference refinement changed more than the sample budget")
 
 
+def compare_temporal(stems, scene, regions, reference_mae_limit):
+    if not math.isfinite(reference_mae_limit) or not 0 <= reference_mae_limit <= 255:
+        raise ValueError("Reference MAE limit must be in [0, 255]")
+    metas = {label: metadata(stem.with_suffix(".coverage.txt")) for label, stem in stems.items()}
+    validate_temporal(metas, scene)
+    images = {label: verified_image(stem, metas[label]) for label, stem in stems.items()}
+    pairs = [("reference_low", "reference"), ("off", "reference")]
+    pairs += [(sdk, control) for sdk in ("fsr", "rr") for control in ("off", "reference")]
+    comparisons = {f"{a}-vs-{b}": compare(images[a], images[b], regions)[0] for a, b in pairs}
+    bad = [k for k, m in comparisons["reference_low-vs-reference"].items()
+           if m["mean_abs_rgb8"] > reference_mae_limit]
+    return {"scene": scene, "mode": metas["off"]["mode"], "adapter": metas["off"]["adapter"],
+            "evidence_scope": "sidecar consistency and encoded RGB8 differences; verify physical dispatch separately",
+            "captures": {label: {"stem": str(stem), "meta": metas[label],
+                                 "sha256": {suffix: sha256_file(stem.with_suffix(suffix))
+                                            for suffix in (".png", ".coverage.txt")}}
+                         for label, stem in stems.items()},
+            "reference_mae_limit": reference_mae_limit, "reference_refinement_failed_regions": bad,
+            "comparisons": comparisons}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for label in PROVIDERS:
@@ -85,25 +113,13 @@ def main():
                         help="predeclared cap on Reference low-vs-high mean absolute RGB8 per region")
     args = parser.parse_args()
     try:
-        if not math.isfinite(args.reference_mae_limit) or not 0 <= args.reference_mae_limit <= 255:
-            raise ValueError("Reference MAE limit must be in [0, 255]")
         custom = json.loads(args.regions.read_text(encoding="utf-8")) if args.regions else None
-        metas = {label: metadata(getattr(args, label).with_suffix(".coverage.txt")) for label in PROVIDERS}
-        validate_temporal(metas, args.scene)
-        images = {label: verified_image(getattr(args, label), meta) for label, meta in metas.items()}
-        pairs = [("reference_low", "reference"), ("off", "reference")]
-        pairs += [(sdk, control) for sdk in ("fsr", "rr") for control in ("off", "reference")]
-        comparisons = {f"{a}-vs-{b}": compare(images[a], images[b], custom)[0] for a, b in pairs}
-        bad = [k for k, m in comparisons["reference_low-vs-reference"].items()
-               if m["mean_abs_rgb8"] > args.reference_mae_limit]
+        report = compare_temporal({label: getattr(args, label) for label in PROVIDERS},
+                                  args.scene, custom, args.reference_mae_limit)
     except (KeyError, OSError, TypeError, ValueError) as exc:
         parser.error(str(exc))
-    print(json.dumps({"scene": args.scene, "mode": metas["off"]["mode"], "adapter": metas["off"]["adapter"],
-                      "evidence_scope": "sidecar consistency and encoded RGB8 differences; verify physical dispatch separately",
-                      "captures": {label: {"stem": str(getattr(args, label)), "meta": meta} for label, meta in metas.items()},
-                      "reference_mae_limit": args.reference_mae_limit, "reference_refinement_failed_regions": bad,
-                      "comparisons": comparisons}, indent=2))
-    return int(bool(bad))
+    print(json.dumps(report, indent=2))
+    return bool(report["reference_refinement_failed_regions"])
 
 
 if __name__ == "__main__":

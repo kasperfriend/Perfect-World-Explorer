@@ -8862,6 +8862,31 @@ fn preview_device(settings: LighterSettings) -> Result<PreviewDevice, String> {
     Ok((adapter.get_info(), device, queue, lighter))
 }
 
+// Allow a small matched audit to exercise high-sample Reference readback on
+// a CPU driver without changing ordinary previews or the retail matrix.
+fn preview_extent(audit: Option<u32>) -> Result<(u32, u32), String> {
+    match std::env::var("PW_PREVIEW_SIZE") {
+        Err(std::env::VarError::NotPresent) => Ok((960, 720)),
+        Ok(size) if audit.is_some() => size
+            .split_once('x')
+            .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+            .filter(|(w, h)| (64..=1920).contains(w) && (64..=1080).contains(h))
+            .ok_or("PW_PREVIEW_SIZE must be WIDTHxHEIGHT within 64x64 to 1920x1080".into()),
+        Ok(_) => Err("PW_PREVIEW_SIZE requires PW_PREVIEW_COVERAGE".into()),
+        Err(e) => Err(format!("PW_PREVIEW_SIZE: {e}")),
+    }
+}
+
+fn assert_preview_provider(expected: Option<&str>, active: Option<&str>) -> Result<(), String> {
+    let actual = active.unwrap_or("portable");
+    if let Some(want) = expected.filter(|&want| want != actual) {
+        return Err(format!(
+            "Lighter capture requires {want} on every draw; got {actual}"
+        ));
+    }
+    Ok(())
+}
+
 fn preview_frame_using(
     mut t: Terrain,
     path: &std::path::Path,
@@ -8870,6 +8895,16 @@ fn preview_frame_using(
     audit: Option<u32>,
     open: impl FnOnce(LighterSettings) -> Result<PreviewDevice, String>,
 ) -> Result<(), String> {
+    let (width, height) = preview_extent(audit)?;
+    let required_provider = match std::env::var("PW_PREVIEW_REQUIRE_PROVIDER").as_deref() {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok("portable") if audit.is_some() => Some("portable"),
+        Ok("fsr") if audit.is_some() && mode != LighterMode::Off => Some("Vulkan temporal FSR"),
+        Ok("rr") if audit.is_some() && mode != LighterMode::Off => {
+            Some("Vulkan DLSS Ray Reconstruction")
+        }
+        _ => return Err("PW_PREVIEW_REQUIRE_PROVIDER needs a coverage audit and portable, fsr or rr (SDKs require rays)".into()),
+    };
     // Never read interactive Lighter settings for an ordinary headless preview.
     let mut lighter_settings = LighterSettings {
         mode,
@@ -9108,7 +9143,6 @@ fn preview_frame_using(
         false,
         ray_scenery.as_mut(),
     )?;
-    let (width, height) = (960u32, 720u32);
     let native_inventory = (audit.is_some() && mode == LighterMode::Off)
         .then(|| native_inventory::capture_scene(&t, &mesh, cam.matrix(width, height, cam.far)));
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
@@ -9232,7 +9266,7 @@ fn preview_frame_using(
         if !ready || (mode != LighterMode::Off && !r.renders_rays()) {
             return Err("Lighter capture did not render the requested frame".into());
         }
-        Ok(())
+        assert_preview_provider(required_provider, r.lighter.reconstruction_status())
     };
     // An A/B of the world-effect pass, so "no effects" can be answered rather
     // than argued. The same camera and the same frame are rendered twice, the
@@ -9453,6 +9487,14 @@ fn preview_frame_using(
                 gpu_ms.push(stages);
             }
         }
+        if let Some(provider) = required_provider {
+            let draws = 1 + warmup + timed_frames;
+            writeln!(
+                meta,
+                "required_ray_reconstruction={provider}\nprovider_checked_draws={draws}"
+            )
+            .unwrap();
+        }
         if !capture_ms.is_empty() {
             writeln!(meta, "synchronized_capture_ms={capture_ms:?}").unwrap();
         }
@@ -9462,6 +9504,21 @@ fn preview_frame_using(
         std::fs::write(&meta_path, meta).map_err(|e| format!("{}: {e}", meta_path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn preview_provider_guard_rejects_even_a_single_portable_draw() {
+    assert!(assert_preview_provider(Some("Vulkan temporal FSR"), None).is_err());
+    assert!(assert_preview_provider(
+        Some("Vulkan DLSS Ray Reconstruction"),
+        Some("Vulkan temporal FSR")
+    )
+    .is_err());
+    assert!(assert_preview_provider(Some("portable"), None).is_ok());
+    assert!(
+        assert_preview_provider(Some("Vulkan temporal FSR"), Some("Vulkan temporal FSR")).is_ok()
+    );
 }
 
 #[cfg(test)]

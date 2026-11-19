@@ -33,3 +33,36 @@ are encoded RGB differences, not optical or temporal quality verdicts.
 The final PNGs byte-match one another (`06e71efd…`). This tests path parsing,
 matching and final capture on a synthetic view, not SDK temporal quality or
 Reference convergence. See `06-captures/path/` and `06-captures/still/`.
+
+## Ordered follow-up
+
+`PW_PREVIEW_REQUIRE_PROVIDER=portable|fsr|rr` guards **every** draw,
+not just the saved image. The sidecar records the expected provider and
+checked draw count; the comparator requires at least 49 verified draws
+and the actual trace extent. The ordinary preview path is unchanged.
+`tools/lighter_temporal_capture.py --help` runs the seven named scenes in
+order on each ray route, preserves all attempted variant logs, and binds
+the input pins, executable, paths, and comparison receipts by hash. Its
+JSON manifest has a `cases` array; each case needs `scene`, `map`, a
+five-number `camera`, `hour`, named normalized `regions`,
+`reference_mae_limit`, and `camera_evidence` (a retained scout file relative
+to the manifest). `weather` defaults to `Clear`. `path` and `reveal` need a
+`path` pointing to a moving 0–48 plan in the same terrain block. Scout the
+subjects and choose the tolerances before running. The runner checks receipt
+consistency, not whether the subject is visibly present or the SDK is authentic.
+
+Example target command (trusted pins must cover every selected map):
+
+```powershell
+py tools/lighter_temporal_capture.py --manifest C:\bench\previews.json `
+  --input-manifest C:\bench\client-pins.txt --viewer C:\bench\perfect-world-explorer.exe `
+  --client E:\pw142 --output C:\bench\06-captures --source-sha $testedCommit
+```
+
+**New S evidence:** `06-captures/reference-32-vs-64.json` in the ordered
+bundle compares two 96×72, 8-bounce Software fixture PNGs after one 16 ms
+warm-up and a final draw each. Both are decoded-hash verified; the whole
+RGB8 MAE is **0.58435** (max **29**), center MAE **1.03896**. This smaller
+`PW_PREVIEW_SIZE` audit exercises refinement and is **not** the 48-step
+retail convergence gate. Requiring FSR with only portable available
+failed on the first draw and wrote no image. No P/V preview was recorded.

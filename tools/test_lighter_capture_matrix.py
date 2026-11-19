@@ -1,4 +1,5 @@
 import hashlib
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -6,6 +7,7 @@ import unittest
 from PIL import Image
 
 import lighter_capture_matrix as matrix
+import lighter_temporal_capture as temporal_runner
 import lighter_temporal_compare as temporal
 
 
@@ -131,25 +133,50 @@ class CaptureMatrixTests(unittest.TestCase):
         shared = dict.fromkeys(matrix.MATCH_KEYS, "fixed") | {
             "platform": "windows", "architecture": "x86_64", "vulkan_largest_device_local_heap_bytes": str(10 << 30),
             "adapter": 'name: "NVIDIA GeForce RTX 3080", vendor: 4318, device_type: DiscreteGpu, backend: Vulkan',
-            "mode": "Software", "warmup_frames": "48", "warmup_step_ms": "16", "animation_elapsed_ms": "768",
+            "mode": "Software", "image": "960x720", "trace_image": "480x360", "warmup_frames": "48", "warmup_step_ms": "16", "animation_elapsed_ms": "768",
             "raster_primary": "false", "screen_reuse_flags": "0", "camera_path_sha256": "a" * 64,
         }
-        rays = "Settings { mode: Software, samples: 1, reference: false, dynamic_resolution: false }"
+        rays = "Settings { mode: Software, samples: 1, reference: false, dynamic_resolution: false, resolution: 50 }"
         ref = ("Settings { mode: Software, samples: %d, reference: true, dynamic_resolution: false, "
                "bounces: 8, resolution: 100, progressive: false, denoiser: false }")
-        metas = {key: shared | {"ray_reconstruction": provider, "settings_effective": rays}
+        metas = {key: shared | {"ray_reconstruction": provider, "settings_effective": rays,
+                                "provider_checked_draws": "49", "required_ray_reconstruction": provider}
                  for key, provider in temporal.PROVIDERS.items()}
         metas["reference_low"]["settings_effective"] = ref % 32
         metas["reference"]["settings_effective"] = ref % 64
+        for label in ("reference_low", "reference"):
+            metas[label]["trace_image"] = "960x720"
         temporal.validate_temporal(metas, "reveal")
         with self.assertRaisesRegex(ValueError, "RTX 3080 10 GB"):
             temporal.validate_temporal(metas | {"rr": metas["rr"] | {"vulkan_largest_device_local_heap_bytes": str(12 << 30)}}, "reveal")
         with self.assertRaisesRegex(ValueError, "requested.*got portable"):
             temporal.validate_temporal(metas | {"rr": metas["rr"] | {"ray_reconstruction": "portable"}}, "reveal")
+        with self.assertRaisesRegex(ValueError, "unexpected actual trace extent"):
+            temporal.validate_temporal(metas | {"fsr": metas["fsr"] | {"trace_image": "960x720"}}, "reveal")
+        with self.assertRaisesRegex(ValueError, "missing provider check"):
+            temporal.validate_temporal(metas | {"rr": metas["rr"] | {"provider_checked_draws": "1"}}, "reveal")
         with self.assertRaisesRegex(ValueError, "unmatched camera_path_sha256"):
             temporal.validate_temporal(metas | {"fsr": metas["fsr"] | {"camera_path_sha256": "b" * 64}}, "reveal")
         with self.assertRaisesRegex(ValueError, "doubled budget"):
             temporal.validate_temporal(metas | {"reference": metas["reference"] | {"settings_effective": ref % 32}}, "reveal")
+
+    def test_temporal_plan_scouts_all_scenes_and_requires_matching_path_endpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scout.txt").write_text("reviewed", encoding="utf-8")
+            path = root / "flight.txt"
+            path.write_text("a07 12 48\n0 0 350 0 0 -.6\n48 16 356 84 0 -.6\n", encoding="utf-8")
+            base = {"map": "a07", "camera": [16, 356, 84, 0, -0.6], "hour": 12,
+                    "camera_evidence": "scout.txt", "reference_mae_limit": 1.25,
+                    "regions": {"subject": [.1, .2, .4, .8]}}
+            cases = [base | {"scene": name} | ({"path": path.name} if name in ("path", "reveal") else {})
+                     for name in reversed(temporal.SCENES)]
+            manifest = root / "previews.json"
+            manifest.write_text(json.dumps({"cases": cases}), encoding="utf-8")
+            self.assertEqual(tuple(c[0]["scene"] for c in temporal_runner.read_cases(manifest)), temporal.SCENES)
+            path.write_text("a07 12 48\n0 0 350 0 0 -.6\n48 16 356 80 0 -.6\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "ending at the scouted pose"):
+                temporal_runner.read_cases(manifest)
 
     def test_capture_index_reports_matched_and_failed_cases_separately(self):
         meta = {"adapter": "CPU Vulkan", "image": "960x720", "trace_image": "240x180", "eye": "[80,329,-144]",

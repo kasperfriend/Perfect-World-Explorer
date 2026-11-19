@@ -3759,7 +3759,7 @@ fn main() {
             world_handoff::publish_failure(&error);
             eprintln!("Error: {error}");
             #[cfg(windows)]
-            if !world_handoff::is_handoff_child() {
+            if !audit && !world_handoff::is_handoff_child() {
                 windows_setup::show_error(&error);
             }
             std::process::exit(1);
@@ -3876,7 +3876,7 @@ fn main() {
         diagnostics::session(format!("Viewer failed: {error}"));
         eprintln!("Error: {error}");
         #[cfg(windows)]
-        if !world_handoff::is_handoff_child() {
+        if !audit && !world_handoff::is_handoff_child() {
             windows_setup::show_error(&error);
         }
         std::process::exit(1);

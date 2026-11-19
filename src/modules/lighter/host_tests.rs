@@ -2089,7 +2089,7 @@ fn lighter_matched_fixture_capture() {
             },
         )
         .unwrap();
-        assert_world_png(&path, (960, 720));
+        assert_world_png(&path, super::super::preview_extent(Some(warmup)).unwrap());
         captures += 1;
     }
     assert!(captures != 0, "unknown PW_LIGHTER_FIXTURE_ONLY draw route");
