@@ -1279,6 +1279,33 @@ EOF
             -C opt-level=1 "$REPO/src/bmd_baked.rs" -o "$OUT/bmdbakedtest"
         shift || true
         (cd "$REPO" && exec "$OUT/bmdbakedtest" "$@") ;;
+    objects) toolchain; sysroot; deps; image_stub
+        # `src/objects.rs` -- the decoded-texture cache, its byte-budgeted LRU
+        # and the world's model list -- with the four modules it needs. It has 64
+        # tests, including the eviction test P3.08 cites as its residency proof
+        # (`lru_eviction_keeps_residency_inside_the_byte_budget`), and no gate in
+        # this harness compiled it: like `bmd_baked`, its tests were reachable
+        # only from the viewer target and the GPU binaries.
+        mkdir -p "$OUT/objects"
+        cat > "$OUT/objects/lib.rs" <<EOF
+#[path = "$REPO/src/bmd.rs"]
+pub mod bmd;
+#[path = "$REPO/src/pck.rs"]
+pub mod pck;
+#[path = "$REPO/src/scene.rs"]
+pub mod scene;
+#[path = "$REPO/src/texture_resolution.rs"]
+pub mod texture_resolution;
+#[path = "$REPO/src/objects.rs"]
+pub mod objects;
+EOF
+        "$RUSTC" --test --crate-name objectstest --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            --extern image="$OUT/libimage_stub.rlib" \
+            "$OUT/objects/lib.rs" -o "$OUT/objectstest"
+        shift || true
+        (cd "$REPO" && exec "$OUT/objectstest" "$@") ;;
     diagnostics) toolchain; sysroot; deps
         # `src/diagnostics.rs` on its own, against `tools/fixtures/egui_stub.rs`.
         # Its 18 tests had never run anywhere: the module has no GPU dependency,
@@ -1988,4 +2015,4 @@ EOF
             -o "$OUT/matrix-maps" "$OUT/mm/run.rs"
         shift || true
         (cd "$REPO" && exec "$OUT/matrix-maps" "${1:-$REPO/google_drive/clients}") ;;
-    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|precinct|settings|bmd-baked|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|precinct|settings|bmd-baked|objects|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac

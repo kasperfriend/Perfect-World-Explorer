@@ -143,6 +143,11 @@ jobs:
       # whole viewer binary; this runs them alone, so a failure names the table.
       - name: Baked draw-state table
         run: bash tools/offline_harness.sh bmd-baked
+      # The decoded-texture cache, its byte-budgeted LRU and the world model
+      # list. P3.08 cites the eviction test as its residency proof, and until
+      # now nothing outside the viewer target compiled it.
+      - name: Texture cache and world model list
+        run: bash tools/offline_harness.sh objects
       - name: Measure staged precinct files
         run: |
           # An array, not a newline-joined string: `$roots` unquoted from
