@@ -77,7 +77,8 @@ pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub name: String,
-    pub offset: u32,
+    /// Byte offset from the start of the package, not of one file.
+    pub offset: u64,
     pub size: u32,
     pub compressed: u32,
 }
@@ -242,59 +243,90 @@ fn safe_header(safe: &[u8], size: u64, whole: Option<u64>) -> Result<(), String>
 
 /// The size the client's `MAX_FILE_PACKAGE` splits a package at.
 ///
-/// `AFilePackage` never writes more than this into one file: past it the next
-/// package is opened, which is why a 2.86 GB `litmodels.pck` sits on disk as a
-/// 2,147,483,392-byte `litmodels.pck` (`0x7fffff00` = this constant) plus the
-/// remainder in `litmodels.pkx`.
+/// `AFilePackage` starts a new file once a package has written this much, which
+/// is why a 2.86 GB `litmodels.pck` sits on disk as a 2,147,483,392-byte
+/// `litmodels.pck` (`0x7fffff00` = this constant) plus the remainder in
+/// `litmodels.pkx`.
+///
+/// A file is *not* capped at this size: the 1.8.4 client ships a
+/// `building.pkx` of 4,294,966,784 bytes, two splits' worth in one file. Piece
+/// lengths therefore have to be measured, not assumed.
 pub const MAX_FILE_PACKAGE: u64 = 0x7fff_ff00;
 
-/// The two files that make up one package.
+/// Where each file of one package sits in the logical byte stream.
 ///
-/// An unsplit package is just the `.pck`. A split package is the `.pck` cut at
-/// [`MAX_FILE_PACKAGE`] with the rest in the `.pkx` of the same stem, and an
-/// entry's `dwOffset` is measured from the start of the *first* file, so it
-/// continues past the split point rather than restarting at zero.
-#[derive(Clone, Copy)]
+/// An unsplit package is just the `.pck`. Otherwise the client appends files of
+/// the same stem — `.pkx`, `.pkx1`, … — and every entry offset is measured from
+/// the start of the *first* file, so a package is one continuous address space
+/// spread over the pieces.
+///
+/// The pieces are not all [`MAX_FILE_PACKAGE`] long. The 1.8.4 client ships
+/// `building.pck` (2,147,483,392) + `building.pkx` (4,294,966,784) +
+/// `building.pkx1` (1,733,966,474), and that middle file is two splits' worth in
+/// one file, which is why the lengths are recorded as they are on disk rather
+/// than derived from a split count.
+#[derive(Clone)]
 pub struct Layout {
-    /// Bytes of `part0` (the `.pck`) that belong to the package. Equals the
-    /// whole file for an unsplit package.
+    /// `(logical start, length)` for each file, in order. Empty only for a
+    /// layout built by hand.
+    pieces: Vec<(u64, u64)>,
+    /// Bytes of the `.pck` (`pieces[0]`), or the whole file when unsplit.
     pub part0: u64,
-    /// Bytes of the last continuation file, or zero when there is none.
-    ///
-    /// The files between the prefix and the last one are all exactly
-    /// [`MAX_FILE_PACKAGE`] long, which is what the client writes, so the last
-    /// one is the only length that is not already known.
-    pub part1: u64,
-    /// Continuation files opened after the `.pck`, in order.
-    pub continuations: usize,
+    /// Total bytes the package spans.
+    span: u64,
 }
 
 impl Layout {
     /// Every byte of one file.
     pub fn single(len: u64) -> Self {
         Self {
+            pieces: vec![(0, len)],
             part0: len,
-            part1: 0,
-            continuations: 0,
+            span: len,
+        }
+    }
+
+    /// A package spread over `lens`, in order.
+    fn of_pieces(lens: &[u64]) -> Self {
+        let mut pieces = Vec::with_capacity(lens.len());
+        let mut start = 0u64;
+        for len in lens {
+            pieces.push((start, *len));
+            start = start.saturating_add(*len);
+        }
+        Self {
+            pieces,
+            part0: lens.first().copied().unwrap_or(0),
+            span: start,
         }
     }
 
     /// The package as a single logical byte range, so a caller can check an
     /// entry's span against one number.
     pub fn total(&self) -> u64 {
-        if self.continuations == 0 {
-            return self.part0;
-        }
-        // n continuation files: the first n-1 are exactly MAX_FILE_PACKAGE.
-        let middle = (self.continuations as u64 - 1).saturating_mul(MAX_FILE_PACKAGE);
-        self.part0.saturating_add(middle).saturating_add(self.part1)
+        self.span
+    }
+
+    /// The logical start of piece `index`.
+    fn start_of(&self, index: usize) -> Option<u64> {
+        self.pieces.get(index).map(|(start, _)| *start)
+    }
+
+    /// The logical start of the last piece, where the trailer is written.
+    fn last_start(&self) -> u64 {
+        self.pieces.last().map(|(start, _)| *start).unwrap_or(0)
+    }
+
+    /// How many pieces the package holds.
+    fn len(&self) -> usize {
+        self.pieces.len()
     }
 }
 
-/// The logical package position at which continuation file `n` begins.
-fn continuation_base(n: usize) -> u64 {
-    // `n` is 1-based: continuation 1 starts right after the `.pck`.
-    (n as u64).saturating_mul(MAX_FILE_PACKAGE)
+impl std::fmt::Debug for Layout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Layout{:?} total={}", self.pieces, self.span)
+    }
 }
 
 /// Open the `.pkx` that continues a `.pck` cut at [`MAX_FILE_PACKAGE`].
@@ -378,7 +410,7 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
     safe_header(&safe, size, None)?;
     let end = package_end(f)?;
     let file = f.try_clone().map_err(|e| e.to_string())?;
-    read_directory(&[(file, size)], Layout::single(size), end, 0)
+    read_directory(&[(file, size)], &Layout::single(size), end, 0)
 }
 
 /// Read the trailer and the entry table.
@@ -390,7 +422,7 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
 /// numbers are needed.
 fn read_directory(
     files: &[(File, u64)],
-    layout: Layout,
+    layout: &Layout,
     end: u64,
     base: u64,
 ) -> Result<Vec<Entry>, String> {
@@ -414,20 +446,20 @@ fn read_directory(
     }
     // The entry table may sit either side of the split, so it is walked through
     // the two-part reader rather than one file.
-    let table = read_package_range(files, &layout, base + pos, table_end - pos)?;
+    let table = read_package_range(files, layout, base + pos, table_end - pos)?;
     read_entry_table(&table, count, &rev, end, layout.total())
 }
 
 /// A whole package, which is one file unless it was split at
 /// [`MAX_FILE_PACKAGE`].
 ///
-/// The client never writes more than [`MAX_FILE_PACKAGE`] bytes into one file:
-/// it starts the next file of the same stem with the `.pkx` extension and keeps
-/// writing, and an entry's `dwOffset` is measured from the start of the *first*
-/// file, so it runs past the split point instead of restarting at zero. The
-/// 1.5.2 client ships `litmodels.pck` exactly that way — a 2,147,483,392-byte
-/// `.pck` holding the first half of a 2,859,188,412-byte package, with the rest
-/// in `litmodels.pkx`.
+/// Once a package reaches [`MAX_FILE_PACKAGE`] the client starts the next file
+/// of the same stem with the `.pkx` extension and keeps writing, and an entry's
+/// `dwOffset` is measured from the start of the *first* file, so it runs past
+/// the split point instead of restarting at zero. The 1.5.2 client ships
+/// `litmodels.pck` exactly that way — a 2,147,483,392-byte `.pck` holding the
+/// first half of a 2,859,188,412-byte package, with the rest in
+/// `litmodels.pkx` — and 1.8.4's `building` goes on to a `.pkx1`.
 ///
 /// Reading one half alone rejected the archive as corrupt and left every
 /// scenery model in the map unavailable, so the pair is opened and read as the
@@ -448,16 +480,15 @@ impl Package {
     pub fn open(path: &Path) -> Result<Self, String> {
         let first = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let size = first.metadata().map_err(|e| e.to_string())?.len();
+        let mut lengths = vec![size];
         let mut continuations = Vec::new();
-        let mut layout = Layout::single(size);
         if size == MAX_FILE_PACKAGE {
-            // `.pkx`, then `.pkx1`, `.pkx2` ... while each file is exactly the
-            // size the client writes at a split. A package larger than two
-            // `MAX_FILE_PACKAGE` pieces needs those extra files: the 1.8.4
-            // client ships `building.pck` (2,147,483,392) + `building.pkx`
-            // (4,294,966,784) + `building.pkx1`, which is four pieces in total,
-            // and reading only the first two leaves every entry past the second
-            // split unreadable.
+            // `.pkx`, then `.pkx1`, `.pkx2` ... until one is missing. Every
+            // piece's own length is recorded: they are not all a split wide.
+            // The 1.8.4 client ships `building.pck` (2,147,483,392) +
+            // `building.pkx` (4,294,966,784) + `building.pkx1` (1,733,966,474),
+            // and reading only where a split count says the files begin leaves
+            // every entry past the first file unreadable.
             let stem = path.file_stem().ok_or("package has no stem")?;
             let mut index = 0usize;
             loop {
@@ -469,23 +500,8 @@ impl Package {
                 let next = path.with_file_name(name);
                 let Ok(file) = File::open(&next) else { break };
                 let len = file.metadata().map_err(|e| e.to_string())?.len();
-                if len != MAX_FILE_PACKAGE {
-                    // The last piece, and the only one whose length is not
-                    // already known.
-                    continuations.push((file, len));
-                    layout = Layout {
-                        part0: size,
-                        part1: len,
-                        continuations: index + 1,
-                    };
-                    break;
-                }
+                lengths.push(len);
                 continuations.push((file, len));
-                layout = Layout {
-                    part0: size,
-                    part1: 0,
-                    continuations: index + 1,
-                };
                 index += 1;
             }
         }
@@ -493,18 +509,18 @@ impl Package {
             path: path.to_path_buf(),
             first,
             continuations,
-            layout,
+            layout: Layout::of_pieces(&lengths),
         })
     }
 
     /// Whether the package is stored as a `.pck` plus continuations.
     pub fn is_split(&self) -> bool {
-        self.layout.continuations > 0
+        !self.continuations.is_empty()
     }
 
     /// How many continuation files complete this package.
     pub fn continuation_count(&self) -> usize {
-        self.layout.continuations
+        self.continuations.len()
     }
 
     /// The first continuation (`.pkx`) that completes this package, when split.
@@ -514,7 +530,7 @@ impl Package {
 
     /// Continuation file `n`, 1-based, whether or not it exists on disk.
     pub fn continuation_path(&self, n: usize) -> Option<PathBuf> {
-        if n == 0 || n > self.layout.continuations {
+        if n == 0 || n > self.continuations.len() {
             return None;
         }
         let mut name = self.path.file_stem().unwrap_or_default().to_os_string();
@@ -544,13 +560,9 @@ impl Package {
         self.continuations.first().map(|(file, _)| file)
     }
 
-    /// Every file of the package in order, with its length.
+    /// The continuation files in order, with their lengths.
     pub fn files(&self) -> Vec<&(File, u64)> {
-        let mut all: Vec<&(File, u64)> = Vec::with_capacity(1 + self.continuations.len());
-        // The prefix has no stored length in this list, so it is reported
-        // through `layout().part0` instead; readers use `read_range`.
-        all.extend(self.continuations.iter());
-        all
+        self.continuations.iter().collect()
     }
 
     /// The pieces' sizes, for code that reads them itself.
@@ -593,10 +605,10 @@ impl Package {
         if self.is_split() {
             // The trailer lives in the last file, whose own logical base is
             // where its length begins counting.
-            return read_directory(&parts, self.layout, self.len(), self.last_part_base());
+            return read_directory(&parts, &self.layout, self.len(), self.last_part_base());
         }
         let end = package_end(&mut self.first)?;
-        read_directory(&parts, self.layout, end, 0)
+        read_directory(&parts, &self.layout, end, 0)
     }
 
     /// One entry's bytes, spanning the split when the payload does.
@@ -614,9 +626,20 @@ impl Package {
         }
     }
 
+    /// Read a batch of entries, across however many files the package spans.
+    pub fn read_many(&self, entries: &[&Entry]) -> Result<Vec<Vec<u8>>, String> {
+        read_entries_in(&self.parts(), &self.layout, entries).map_err(|error| error.to_string())
+    }
+
+    /// The pieces in order with their logical lengths, for a caller that reads
+    /// batches in its own threads.
+    pub fn part_list(&self) -> Vec<(File, u64)> {
+        self.parts()
+    }
+
     /// The logical position where the last file of a split package begins.
     fn last_part_base(&self) -> u64 {
-        continuation_base(self.layout.continuations)
+        self.layout.last_start()
     }
 }
 
@@ -632,30 +655,23 @@ fn read_package_range(
     let mut left = len;
     let mut cursor = pos;
     while left > 0 {
-        // Which opened file holds `cursor`, and how far into it.
-        let mut index = 0usize;
-        let mut local = cursor;
-        for (n, at) in (1..=layout.continuations)
-            .map(|n| continuation_base(n))
-            .enumerate()
-        {
-            if cursor >= at {
-                index = n + 1;
-                local = cursor - at;
-            }
-        }
-        let end_of_file = match index {
-            0 => layout.part0,
-            n if n == files.len() - 1 => layout.part1,
-            _ => MAX_FILE_PACKAGE,
-        };
-        let take = left.min(end_of_file.saturating_sub(local));
+        // Which opened file holds `cursor`, and how far into it. The starts come
+        // from the layout, so a piece that is wider than one split is just a
+        // piece.
+        let index = (0..layout.len())
+            .rev()
+            .find(|&i| layout.start_of(i).is_some_and(|start| cursor >= start))
+            .unwrap_or(0);
+        let start = layout.start_of(index).unwrap_or(0);
+        let local = cursor - start;
+        let file_len = files.get(index).map(|(_, len)| *len).unwrap_or(0);
+        let take = left.min(file_len.saturating_sub(local));
         if take == 0 {
             return Err(match index {
                 0 => "split package range is empty".to_string(),
                 n => format!(
                     "entry runs past the end of continuation file {n} of {}",
-                    layout.continuations
+                    layout.len() - 1
                 ),
             });
         }
@@ -664,7 +680,7 @@ fn read_package_range(
         let (file, _) = files.get(index).ok_or_else(|| {
             format!(
                 "entry continues into a missing continuation file {index} of {}",
-                layout.continuations
+                layout.len() - 1
             )
         })?;
         out.extend_from_slice(&at_shared(file, local, take as usize)?);
@@ -726,30 +742,20 @@ fn read_entry_table(
         let (decoded, _, _) = encoding_rs::GBK.decode(&data[..zero]);
         let name = decoded.replace('\\', "/");
         // `dwOffset` is `DWORD` in the older revisions and `UINT64` in
-        // `0x00020003`. The client copies it into a `FILEENTRY` whose field is
-        // only a `DWORD`, so it truncates — but truncating here would turn a
-        // far-away entry into a near one and read the wrong bytes out of a
-        // perfectly good payload. Only an archive past 4 GiB can carry such an
-        // offset, and none does (`MAX_FILE_PACKAGE` is 2 GiB), so the honest
-        // answer is to name the entry and refuse it.
+        // `0x00020003`. It is kept 64 bits wide here because a package can be
+        // longer than 4 GiB and its far entries are addressed by their real
+        // offset: 1.8.4's `building.pck` is 2 GiB + 4 GiB + 1.7 GiB, and
+        // narrowing the word would turn an entry past the fourth split into a
+        // near one and read somebody else's bytes.
         let offset = if rev.offset_width == 8 {
-            let wide =
-                u64::from_le_bytes(data[rev.offset_at..rev.offset_at + 8].try_into().unwrap());
-            match u32::try_from(wide) {
-                Ok(offset) => offset,
-                Err(_) => {
-                    return Err(format!(
-                        "entry {name} starts at {wide}, past the 4 GiB an entry offset can address"
-                    ))
-                }
-            }
+            u64::from_le_bytes(data[rev.offset_at..rev.offset_at + 8].try_into().unwrap())
         } else {
-            u32le(data, rev.offset_at)?
+            u32le(data, rev.offset_at)? as u64
         };
         let file_size = u32le(data, rev.size_at)?;
         let compressed = u32le(data, rev.compressed_at)?;
-        if offset as u64 + compressed as u64 > end
-            || offset as u64 + compressed as u64 > size
+        if offset + compressed as u64 > end
+            || offset + compressed as u64 > size
             || file_size > 512 * 1024 * 1024
             || compressed > file_size
         {
@@ -802,9 +808,34 @@ pub fn read_entries_at(
 /// Everything is positioned I/O, so the same batch can span both halves without
 /// disturbing any cursor; an entry that starts in `first` and ends in `second`
 /// is simply read twice.
+///
+/// A package split into *more* than two files cannot be read through this
+/// signature: `second` is one file, and the third piece has nowhere to go.
+/// `read_entries_in` takes the whole list and is what a `Package` uses.
 pub fn read_entries_parts(
     first: &File,
     second: Option<&File>,
+    layout: &Layout,
+    entries: &[&Entry],
+) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
+    // `layout.part0` is the `.pck`, and the caller passes the single
+    // continuation it claims to have; the pair must still describe the whole
+    // package for the piece starts in `layout` to line up with this list.
+    let mut files: Vec<(File, u64)> = vec![(first.try_clone()?, layout.part0)];
+    if let Some(second) = second {
+        let len = layout.total().saturating_sub(layout.part0);
+        files.push((second.try_clone()?, len));
+    }
+    read_entries_in(&files, layout, entries)
+}
+
+/// Read a batch of entries out of a package's own files, however many there are.
+///
+/// `files` is the package in order with each piece's logical length, the same
+/// list `read_package_range` takes. Every read is positioned, so one batch can
+/// cross any number of piece boundaries.
+pub fn read_entries_in(
+    first_and_rest: &[(File, u64)],
     layout: &Layout,
     entries: &[&Entry],
 ) -> Result<Vec<Vec<u8>>, Box<dyn std::error::Error>> {
@@ -826,16 +857,16 @@ pub fn read_entries_parts(
             if bytes.len() < DIRECT_STORAGE_MIN {
                 continue;
             }
-            // A split package lives in two files and this queue is opened on
-            // one, so a split never takes the DirectStorage path; the
-            // positioned read below handles both halves.
-            if second.is_some() {
+            // A split package lives in several files and this queue is opened
+            // on one, so a split never takes the DirectStorage path; the
+            // positioned read below handles every piece.
+            if first_and_rest.len() > 1 {
                 continue;
             }
             ranges.push((entry.offset as u64, bytes.as_mut_slice()));
             range_indices.push(index);
             if ranges.len() == BATCH_CAPACITY {
-                if direct_storage::read_ranges(first, &mut ranges) {
+                if direct_storage::read_ranges(&first_and_rest[0].0, &mut ranges) {
                     for &index in &range_indices {
                         direct_storage_done[index] = true;
                     }
@@ -844,7 +875,7 @@ pub fn read_entries_parts(
                 range_indices.clear();
             }
         }
-        if !ranges.is_empty() && direct_storage::read_ranges(first, &mut ranges) {
+        if !ranges.is_empty() && direct_storage::read_ranges(&first_and_rest[0].0, &mut ranges) {
             for &index in &range_indices {
                 direct_storage_done[index] = true;
             }
@@ -858,28 +889,31 @@ pub fn read_entries_parts(
             continue;
         }
         let mut read = 0usize;
+        // Walk the pieces in order, so an entry that begins in one and ends in
+        // another is read from each in turn -- with any number of continuations,
+        // not just one.
         while read < bytes.len() {
             let cursor = entry.offset as u64 + read as u64;
-            // An entry that begins in the first half and ends in the `.pkx`
-            // continuation is read from each half in turn.
-            let (file, off) = if cursor < layout.part0 {
-                (first, cursor)
-            } else {
-                (
-                    second.ok_or_else(|| {
-                        format!(
-                            "PCK entry {} continues past the split into a missing .pkx half",
-                            entry.name
-                        )
-                    })?,
-                    cursor - layout.part0,
-                )
-            };
-            let room = if cursor < layout.part0 {
-                (layout.part0 - cursor).min((bytes.len() - read) as u64) as usize
-            } else {
-                bytes.len() - read
-            };
+            // The piece whose logical range holds this position. Starts come from
+            // the layout, so a file wider than one split needs no special case.
+            let piece = (0..layout.len())
+                .rev()
+                .find(|&i| {
+                    layout.start_of(i).is_some_and(|start| {
+                        cursor >= start && cursor < start + first_and_rest[i].1
+                    })
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "PCK entry {} runs past the last piece of the package",
+                        entry.name
+                    )
+                })?;
+            let start = layout.start_of(piece).unwrap_or(0);
+            let (file, file_len) = &first_and_rest[piece];
+            let off = cursor - start;
+            let remaining = start + *file_len - cursor;
+            let room = remaining.min((bytes.len() - read) as u64) as usize;
             #[cfg(windows)]
             let n =
                 std::os::windows::fs::FileExt::seek_read(file, &mut bytes[read..read + room], off)?;
@@ -1059,19 +1093,19 @@ mod tests {
         let entries = [
             Entry {
                 name: "first".into(),
-                offset: first_offset,
+                offset: first_offset as u64,
                 size: first.len() as u32,
                 compressed: first.len() as u32,
             },
             Entry {
                 name: "second".into(),
-                offset: second_offset,
+                offset: second_offset as u64,
                 size: second.len() as u32,
                 compressed: packed_second.len() as u32,
             },
             Entry {
                 name: "third".into(),
-                offset: third_offset,
+                offset: third_offset as u64,
                 size: third.len() as u32,
                 compressed: third.len() as u32,
             },
@@ -1227,7 +1261,7 @@ mod tests {
     /// payload. An archive that can hold such an offset is past 4 GiB, which no
     /// shipped pack reaches, so the entry is named and refused instead.
     #[test]
-    fn an_entry_offset_past_four_gibibytes_is_refused_not_truncated() {
+    fn an_entry_offset_past_four_gibibytes_is_kept_wide_not_truncated() {
         let mut bytes = package(0x0002_0003, &[("far.bin", b"payload")], false);
         // The entry table starts where the trailer's `dwEntryOffset` says, after
         // the mask is removed; the record itself begins 8 bytes later (the
@@ -1236,8 +1270,11 @@ mod tests {
         let table =
             u32::from_le_bytes(bytes[header_at + 8..header_at + 12].try_into().unwrap()) ^ MASK;
         let record_start = table as usize + 8;
-        // Rewrite the record's 64-bit dwOffset to 2^32, which truncates to 0 —
-        // the *start of the package* — if the reader is careless.
+        // Rewrite the record's 64-bit dwOffset to 2^32, which truncates to 0 --
+        // the *start of the package* -- if the reader is careless. The 1.8.4
+        // client ships a 8.2 GB `building.pck`, so an offset this large is not
+        // hypothetical: it is what its far entries carry. The offset must be
+        // kept, and the run past the package's end is what refuses it.
         bytes[record_start + 264..record_start + 272].copy_from_slice(&(1u64 << 32).to_le_bytes());
         let path = write_temp(&bytes, "far");
         let mut file = std::fs::File::open(&path).unwrap();
@@ -1245,8 +1282,9 @@ mod tests {
         drop(file);
         std::fs::remove_file(path).unwrap();
         assert!(
-            error.contains("past the 4 GiB"),
-            "must name the offset rather than truncate it: {error}"
+            error.contains("invalid entry bounds"),
+            "the far offset must be bounds-checked, not truncated to the start of the \
+             package: {error}"
         );
     }
 
@@ -1621,6 +1659,100 @@ mod tests {
         assert_eq!(
             data, payload,
             "the payload did not come back from the third file"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The 1.8.4 shipment, in which the **middle** file is two splits wide.
+    ///
+    /// `building.pck` is 2,147,483,392 bytes, `building.pkx` is 4,294,966,784
+    /// (exactly two `MAX_FILE_PACKAGE`) and `building.pkx1` is 1,733,966,474.
+    /// Every continuation therefore starts two splits after the previous one,
+    /// not one, and a reader that places pieces at `n * MAX_FILE_PACKAGE` reads
+    /// the third file's bytes as the second's -- or, past the fourth split,
+    /// refuses the entry entirely. This fixture puts its payload inside the
+    /// third file only, so a reader that misplaces the pieces cannot find it.
+    #[test]
+    fn a_continuation_that_is_two_splits_wide_still_reads_from_the_right_file() {
+        use std::io::{Seek, SeekFrom};
+        let dir = std::env::temp_dir().join(format!(
+            "pw-pck-widecont-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pck = dir.join("building.pck");
+        let pkx = dir.join("building.pkx");
+        let pkx1 = dir.join("building.pkx1");
+        let split = MAX_FILE_PACKAGE as usize;
+        let wide = 2 * split;
+        let payload = b"payload-stored-in-the-fourth-split";
+
+        let mut head = Vec::new();
+        head.extend_from_slice(&0x4dca23efu32.to_le_bytes());
+        head.extend_from_slice(&0u32.to_le_bytes());
+        head.extend_from_slice(&0x56a089b7u32.to_le_bytes());
+        let mut first = std::fs::File::create(&pck).unwrap();
+        first.write_all(&head).unwrap();
+        first.set_len(split as u64).unwrap();
+        drop(first);
+
+        // Sparse, so two splits of doorstop cost nothing.
+        let middle = std::fs::File::create(&pkx).unwrap();
+        middle.set_len(wide as u64).unwrap();
+        drop(middle);
+
+        // The payload starts at the third split, four bytes in: wholly inside
+        // `.pkx1`, whose logical start is three splits because the `.pkx`
+        // before it is two wide.
+        let payload_at = 3 * split + 4;
+        let mut tail = vec![0u8; 4];
+        tail.extend_from_slice(payload);
+        let table_at = tail.len();
+        let mut record = vec![0u8; 288];
+        let name = b"litmodels/building/b.bmd";
+        record[..name.len()].copy_from_slice(name);
+        record[264..272].copy_from_slice(&(payload_at as u64).to_le_bytes());
+        record[272..276].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        record[276..280].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        let masked = (record.len() as u32) ^ MASK;
+        tail.extend_from_slice(&masked.to_le_bytes());
+        tail.extend_from_slice(&(masked ^ CHECK).to_le_bytes());
+        tail.extend_from_slice(&record);
+        let mut header = vec![0u8; 280];
+        header[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
+        header[4..8].copy_from_slice(&0x0002_0003u32.to_le_bytes());
+        header[8..12].copy_from_slice(&((table_at as u32) ^ MASK).to_le_bytes());
+        let tag = b"Angelica File Package, Perfect World Co. Ltd.";
+        header[20..20 + tag.len()].copy_from_slice(tag);
+        header[272..276].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
+        tail.extend_from_slice(&header);
+        tail.extend_from_slice(&1u32.to_le_bytes());
+        tail.extend_from_slice(&0x0002_0003u32.to_le_bytes());
+        std::fs::write(&pkx1, &tail).unwrap();
+
+        // The package is over 4 GiB, so the declared size word is the total
+        // truncated -- exactly the 1.8.4 situation.
+        // The `.pck` is one split, the wide `.pkx` two, and `.pkx1` the tail.
+        let total = 3 * split as u64 + tail.len() as u64;
+        assert!(total > u32::MAX as u64);
+        let mut file = std::fs::OpenOptions::new().write(true).open(&pck).unwrap();
+        file.seek(SeekFrom::Start(4)).unwrap();
+        file.write_all(&(total as u32).to_le_bytes()).unwrap();
+        drop(file);
+
+        let mut package = Package::open(&pck).unwrap();
+        assert_eq!(package.continuation_count(), 2);
+        assert_eq!(package.len(), total);
+        let entries = package.directory().unwrap();
+        assert_eq!(entries.len(), 1);
+        let data = package.read(&entries[0]).unwrap();
+        assert_eq!(
+            data, payload,
+            "the entry was not read from the file that holds it"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

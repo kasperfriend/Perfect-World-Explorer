@@ -139,7 +139,7 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
         }
         reversed.push(Entry {
             name,
-            offset,
+            offset: offset as u64,
             size: usize_,
             compressed,
         });

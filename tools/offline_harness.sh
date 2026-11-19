@@ -146,6 +146,8 @@ PY
 # item is not left stale for every other target that never rebuilds it.
 image_stub() {
     [ -f "$OUT/libimage_stub.rlib" ] && return 0
+    # `bins` can run before `water` has ever created this directory.
+    mkdir -p "$OUT/water"
     cat > "$OUT/water/image.rs" <<'EOF'
 //! The few `image` items `src/water.rs` names outside the decode path.
 #[derive(Clone)]
@@ -544,8 +546,18 @@ EOF
 //! Offline stand-in for `crate::pck`; see the note at the top of the script.
 use std::fs::File;
 
-pub(crate) fn inflate(_raw: &[u8], _expected: usize) -> Result<Vec<u8>, String> {
-    Err("offline harness: no zlib backend".to_string())
+/// The real `pck::inflate`, against the real `flate2`. `angelica_pck` decodes
+/// its payloads through this, so a stand-in that refuses made its own test fail
+/// for a reason that had nothing to do with it.
+pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
+    use flate2::{Decompress, FlushDecompress};
+    let mut out = vec![0u8; expected];
+    let mut decomp = Decompress::new(true);
+    decomp
+        .decompress(raw, &mut out, FlushDecompress::Finish)
+        .map_err(|e| e.to_string())?;
+    out.truncate(decomp.total_out() as usize);
+    Ok(out)
 }
 
 pub fn corpus_absent(_what: &str) {}
@@ -553,7 +565,9 @@ pub fn corpus_absent(_what: &str) {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub name: String,
-    pub offset: u32,
+    /// Offset from the start of the package, not of one file; a package may be
+    /// longer than 4 GiB.
+    pub offset: u64,
     pub size: u32,
     pub compressed: u32,
 }
@@ -562,8 +576,16 @@ pub fn directory(_f: &mut File) -> Result<Vec<Entry>, String> {
     Err("offline harness: no zlib backend".to_string())
 }
 
-pub fn read_entry(_f: &mut File, _e: &Entry) -> Result<Vec<u8>, String> {
-    Err("offline harness: no zlib backend".to_string())
+pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(e.offset)).map_err(|x| x.to_string())?;
+    let mut raw = vec![0u8; e.compressed as usize];
+    f.read_exact(&mut raw).map_err(|x| x.to_string())?;
+    if e.compressed < e.size {
+        inflate(&raw, e.size as usize)
+    } else {
+        Ok(raw)
+    }
 }
 EOF
     cat > "$OUT/lib.rs" <<EOF
@@ -613,6 +635,13 @@ pub mod model_playback;
 pub mod world_catalog;
 #[path = "$OUT/pck_stub.rs"]
 pub mod pck;
+// \`model_playback\`'s tests build their asset from the same fixture the
+// shipped binary mounts under \`#[cfg(test)]\`; without it this suite stopped at
+// "could not find \`model_draw_fixture\` in the crate root" before running a
+// single test.
+#[cfg(test)]
+#[path = "$REPO/tools/fixtures/model_draw.rs"]
+pub mod model_draw_fixture;
 // \`client_detect\` dispatches to the Angelica reader for the config and shader
 // packs, so the harness needs it or the whole set fails to type-check.
 #[path = "$REPO/src/angelica_pck.rs"]
@@ -674,9 +703,13 @@ case "${1:-test}" in
         done
         echo "bins: $((total - failed))/$total type-check clean"
         [ "$failed" -eq 0 ] ;;
-    test)  toolchain; sysroot; deps
+    test)  toolchain; sysroot; deps; real_deps
+        # `angelica_pck` is in the closure and it really decompresses, so the
+        # real `flate2` is required here; without it the whole suite failed to
+        # build on a missing crate rather than on its own code.
         "$RUSTC" --test --crate-name harness --edition 2021 --sysroot "$SYSROOT" \
-            $EXT -C opt-level=1 "$OUT/lib.rs" -o "$OUT/gfxtest"
+            $EXT -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
+            -C opt-level=1 "$OUT/lib.rs" -o "$OUT/gfxtest"
         shift || true
         (cd "$REPO" && exec "$OUT/gfxtest" "$@") ;;
     client) toolchain; sysroot; deps

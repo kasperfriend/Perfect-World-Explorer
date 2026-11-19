@@ -1788,13 +1788,30 @@ The ECWDFILEHEADER is 14 fixed fields plus 60 reserved bytes from v12 onward
 the per-block length check still rejects a file that does not add up. Below 12 is
 refused by number, naming both. A file that is not an ECWLD says so.
 
-**1.8.4 ships a three-file package.** The client writes at most
-`MAX_FILE_PACKAGE` (0x7fffff00) per file and then continues in `.pkx`, `.pkx1`,
-`.pkx2` … `element/building.pck` is 2,147,483,392 bytes, `building.pkx` is
-exactly `MAX_FILE_PACKAGE`, and `building.pkx1` holds the remainder — four pieces
-in total. The reader opened the first two, so every entry past the second split
-was unreadable. `Package` now opens continuations until the first short piece and
-reads every range through the ordered list.
+**1.8.4 ships a three-file package, and its middle file is two splits wide.**
+`element/building.pck` is 2,147,483,392 bytes (`MAX_FILE_PACKAGE`),
+`building.pkx` is **4,294,966,784** — exactly two `MAX_FILE_PACKAGE` — and
+`building.pkx1` is 1,733,966,474. The sizes come from the Drive upload of the
+1.8.4 client, which is the only evidence available: the CDN is unreachable from
+this sandbox.
+
+Two assumptions fell with those numbers.
+
+* *A continuation is one split wide.* It is not. Piece starts are cumulative,
+  so `pkx1` begins three splits in, not two. `Layout` now records each file's own
+  length and derives the starts by adding them up (`Layout::of_pieces`), where it
+  previously computed `n * MAX_FILE_PACKAGE`.
+* *An entry offset fits in 32 bits.* It does not. The reader refused any 64-bit
+  `dwOffset` above 4 GiB on the grounds that no archive is that long; an 8.2 GB
+  package makes offsets past 4 GiB ordinary. `Entry::offset` is `u64` end to end
+  now, and a far offset is bounds-checked against the package rather than
+  narrowed to a near one.
+
+`Package` opens continuations until the first name that is missing, and every
+range -- directory table, BMDs, textures -- is read through the ordered piece
+list. `objects.rs` used to read through a two-file entry point
+(`first_file`/`second_file`), which silently ignored the third file; it now uses
+`read_entries_in` with the package's own piece list.
 
 The size word is a `DWORD`, so that package's total (2 GiB + 4 GiB + remainder)
 cannot be stated and the word is it truncated. `safe_header` accepts the wrap

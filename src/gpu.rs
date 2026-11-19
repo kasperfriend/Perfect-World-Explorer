@@ -1264,7 +1264,17 @@ fn build(
                 && crate::terrain_cutoff::contains(resident_bounds, t.objects.ornaments[i].position)
         })
         .collect();
-    t.objects.load_ids(&ornament_ids)?;
+    // One unreadable prop must not blank the map. `load_ids` already resolves
+    // each model independently and negative-caches the ones it cannot, so an
+    // error here is about the set, not about one model; report it and draw what
+    // did load.
+    if let Err(error) = t.objects.load_ids(&ornament_ids) {
+        crate::diag!(
+            TimingLoad,
+            "Local scenery object load stopped early: {error}"
+        );
+        eprintln!("Local scenery object load stopped early: {error}");
+    }
     let tree_lod_scale = lod_scale(detail.scenery_quality, Class::Trees);
     if skip_local_scenery {
         crate::diag!(
@@ -1369,12 +1379,32 @@ fn build(
         }
         texture_slots.insert(key.clone(), (i, slot));
     }
+    let (available, unavailable, first_problems) = t.objects.model_census();
     crate::diag!(
         TimingLoad,
-        "Local scenery: {} source-resolution textures in {} GPU pages",
+        "Local scenery: {} source-resolution textures in {} GPU pages; {} ornament placement(s) in the map, {} selected here, {} drawable, {} names this client cannot resolve",
         requested.len(),
-        pages.len()
+        pages.len(),
+        t.objects.ornaments.len(),
+        ornament_ids.len(),
+        available,
+        unavailable
     );
+    // Name what is missing. A map whose buildings are absent because its archive
+    // is not indexed, or because every name resolves nowhere, reads exactly like
+    // a map that authors no buildings -- and this line is the difference.
+    for example in first_problems {
+        crate::diag!(TimingLoad, "Local scenery unresolved: {example}");
+    }
+    if !ornament_ids.is_empty() && available == 0 {
+        let line = format!(
+            "{} ornament placements are in view but none of their models resolved: {} distinct names unavailable",
+            ornament_ids.len(),
+            unavailable
+        );
+        crate::diag!(TimingLoad, "Local scenery: {line}");
+        eprintln!("{line}");
+    }
     for id in ornament_ids {
         let Some(model) = t.objects.get(id) else {
             continue;

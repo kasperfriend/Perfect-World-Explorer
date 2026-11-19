@@ -536,21 +536,26 @@ impl Objects {
                     .litfile
                     .as_ref()
                     .ok_or_else(|| "litmodels.pck unavailable".to_string())?;
+                // Every piece of the package, so a model stored past the first
+                // continuation still reads. A batch is shared by reference and
+                // the reads are positioned, so the threads do not interfere.
+                let parts = litfile.part_list();
+                let layout = litfile.layout().clone();
                 std::thread::scope(|s| {
                     let handles: Vec<_> = missing_models
                         .chunks(chunk_size)
                         .map(|chunk| {
+                            // Borrowed for the whole scope: each batch is read
+                            // by reference, so no worker takes ownership of the
+                            // piece list.
+                            let parts = &parts;
+                            let layout = &layout;
                             s.spawn(move || {
                                 let mut out = Vec::with_capacity(chunk.len());
                                 for batch in chunk.chunks(16) {
                                     let entries: Vec<&pck::Entry> =
                                         batch.iter().map(|(_, _, entry)| entry).collect();
-                                    match pck::read_entries_parts(
-                                        litfile.first_file(),
-                                        litfile.second_file(),
-                                        litfile.layout(),
-                                        &entries,
-                                    ) {
+                                    match pck::read_entries_in(parts, layout, &entries) {
                                         Ok(data) => {
                                             for ((index, name, _), data) in batch.iter().zip(data) {
                                                 let result = bmd::Model::parse(&data)
@@ -729,9 +734,8 @@ impl Objects {
                                                 .iter()
                                                 .map(|(_, entry)| entry)
                                                 .collect();
-                                            pck::read_entries_parts(
-                                                file.first_file(),
-                                                file.second_file(),
+                                            pck::read_entries_in(
+                                                &file.part_list(),
                                                 file.layout(),
                                                 &entries,
                                             )
@@ -991,6 +995,31 @@ impl Objects {
         self.models
             .get(&litmodel_key(&self.ornaments.get(idx)?.path))
     }
+    /// How the ornament set resolved: models that can draw, names this client
+    /// cannot resolve, and the first few reasons.
+    ///
+    /// A map with no visible buildings has three very different causes -- it
+    /// authors none, its archive is not indexed, or every name misses -- and
+    /// they read identically on screen. This is what tells them apart, without
+    /// needing the ModelLoads channel switched on.
+    pub fn model_census(&self) -> (usize, usize, Vec<String>) {
+        let mut available = 0usize;
+        let mut unavailable = 0usize;
+        let mut seen = std::collections::HashSet::new();
+        for ornament in self.ornaments.iter() {
+            let name = litmodel_key(&ornament.path);
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if self.models.contains_key(&name) {
+                available += 1;
+            } else {
+                unavailable += 1;
+            }
+        }
+        (available, unavailable, self.unavailable_examples.clone())
+    }
+
     /// Distinct BMDs that could not be resolved or parsed for this map.
     pub fn unavailable_model_count(&self) -> usize {
         self.unavailable_models.len()
@@ -1130,6 +1159,28 @@ mod tests {
         objects.load_ids(&[0]).unwrap();
         assert!(objects.get(0).is_some());
         assert_eq!(objects.unavailable_model_count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn the_census_counts_drawable_and_unresolvable_placements_separately() {
+        let root = fixture_root("census-partition");
+        let bmd = empty_bmd();
+        write_pck(
+            &root.join("litmodels.pck"),
+            &[("litmodels/a01/1/litmodel_1399.bmd", &bmd)],
+        );
+        write_pck(&root.join("building.pck"), &[]);
+        let mut missing = ornament("a01");
+        missing.path = "1/litmodel_1400.bmd".into();
+        let ornaments = vec![ornament("a01"), missing, ornament("a01")];
+        let mut objects = Objects::open(&root, ornaments).unwrap();
+        objects.load_ids(&[0, 1, 2]).unwrap();
+        // Three placements, two distinct names: 1399 resolves inside this map's
+        // namespace, 1400 does not. Duplicates are counted once, so the numbers
+        // describe the map rather than how often a prop repeats.
+        let (available, unavailable, examples) = objects.model_census();
+        assert_eq!((available, unavailable), (1, 1));
+        assert!(examples.iter().any(|e| e.contains("litmodel_1400")));
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]

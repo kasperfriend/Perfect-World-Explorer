@@ -186,12 +186,21 @@ fn f32at(b: &[u8], p: usize) -> Result<f32, String> {
 }
 fn string(b: &[u8], p: &mut usize) -> Result<String, String> {
     let n = u32at(b, *p)? as usize;
+    let at = *p;
     *p += 4;
     if n > 4096 {
-        return Err("oversized ECWLD string".into());
+        // A length word this size is almost never a string: it is the reader
+        // standing in the wrong field, which happens when a newer client's
+        // record carries a field this layout does not know about. Report where,
+        // because "oversized ECWLD string" alone cannot be acted on.
+        return Err(format!(
+            "oversized ECWLD string: a {n}-byte length at offset {at} (this build's record layout does not match the file)"
+        ));
     }
     let e = p.checked_add(n).ok_or("string overflow")?;
-    let bytes = b.get(*p..e).ok_or("truncated ECWLD string")?;
+    let bytes = b
+        .get(*p..e)
+        .ok_or_else(|| format!("truncated ECWLD string of {n} bytes at offset {at}"))?;
     *p = e;
     let (s, _, bad) = encoding_rs::GBK.decode(bytes);
     if bad {
