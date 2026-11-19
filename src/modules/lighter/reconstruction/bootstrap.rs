@@ -94,8 +94,10 @@ pub(super) fn instance(required: &[CString], flags: wgpu::InstanceFlags) -> R<wg
                 None,
             )
             .map_err(vkerr("create reconstruction instance"))?;
+        // Keep our loader reference until error cleanup has destroyed the
+        // raw instance. An ash::Instance alone does not own the loader DLL.
         let hal = HalInstance::from_raw(
-            entry,
+            entry.clone(),
             raw.clone(),
             version,
             0,
@@ -121,6 +123,10 @@ pub(super) fn device(
     // Do not use another device, hidden queue, or a separately selected GPU;
     // the swapchain, ray buffers, SDK and compositor use the same queue.
     let features = desc.required_features;
+    // Unlike request_device, the raw HAL import relies on the caller to
+    // supply a subset of the adapter's features/limits. Check before any FFI
+    // or SDK extension discovery, not after constructing an owned VkDevice.
+    check_descriptor(desc, adapter.features(), &adapter.limits())?;
     let hal = unsafe {
         adapter.as_hal::<Vulkan, _, _>(|a| {
             let a = a.ok_or("adapter is not Vulkan")?;
@@ -292,4 +298,33 @@ pub(super) fn device(
     };
     // `hal` came from this adapter with the required features and HAL defaults.
     unsafe { adapter.create_device_from_hal::<Vulkan>(hal, desc, None) }.map_err(|e| e.to_string())
+}
+
+fn check_descriptor(
+    desc: &wgpu::DeviceDescriptor<'_>,
+    features: wgpu::Features,
+    limits: &wgpu::Limits,
+) -> R<()> {
+    if !features.contains(desc.required_features) {
+        return Err("raw reconstruction device requested unsupported wgpu features".into());
+    }
+    if !desc.required_limits.check_limits(limits) {
+        return Err("raw reconstruction device requested unsupported wgpu limits".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn rejects_excessive_raw_device_features_and_limits() {
+    let limits = wgpu::Limits::downlevel_defaults();
+    let mut desc = wgpu::DeviceDescriptor {
+        required_features: wgpu::Features::TIMESTAMP_QUERY,
+        required_limits: limits.clone(),
+        ..Default::default()
+    };
+    assert!(check_descriptor(&desc, wgpu::Features::empty(), &limits).is_err());
+    assert!(check_descriptor(&desc, wgpu::Features::TIMESTAMP_QUERY, &limits).is_ok());
+    desc.required_limits.max_texture_dimension_2d += 1;
+    assert!(check_descriptor(&desc, wgpu::Features::TIMESTAMP_QUERY, &limits).is_err());
 }

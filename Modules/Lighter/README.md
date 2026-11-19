@@ -360,3 +360,21 @@ choice and does not change your saved settings. Ordinary previews remain native.
 On a supported GPU, compare the same location on land, over shallow water and
 underwater in both modes, with the reflection/shadow switches on and off. Use a
 location with authored effects and an off-camera building near the water.
+
+## Reconstruction crash diagnostics (opt-in)
+
+For a repeatable crash with `PW_RAY_RECONSTRUCTION=fsr` or `rr`, first
+record the failure with no skip. Then set **one** value of
+`PW_RAY_RECONSTRUCTION_SKIP` for a new process:
+
+| Value | Stop before |
+| --- | --- |
+| `bootstrap` | Any reconstruction-specific path or library lookup. |
+| `ffx-loader` | The requested FSR DLL lookup/load. RR is unchanged. |
+| `ngx-loader` | The requested RR bridge/feature lookup/load. FSR is unchanged. |
+| `raw-device` | Both raw Vulkan HAL imports. The requested library can still load, but the ordinary wgpu device is used. |
+| `interop` | Reconstruction images, their raw views, and bind/descriptor setup, **after** opening the provider. The provider's internal descriptor work at context creation is not bypassed. |
+
+Unset the variable to restore normal behavior. An intentional skip never
+counts as successful SDK dispatch. Native ignores these flags. See
+[the S audit](evidence/perf/S-A1.md) and [the performance plan](PERF-PLAN.md).

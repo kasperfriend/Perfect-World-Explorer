@@ -67,24 +67,90 @@ pub(super) enum Request {
     },
 }
 
+/// One stage per process so two captures differ by exactly one omission.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Bisect {
+    #[default]
+    None,
+    Bootstrap,
+    RawDevice,
+    FfxLoader,
+    NgxLoader,
+    Interop,
+}
+
+impl Bisect {
+    fn parse(value: &str) -> R<Self> {
+        match value {
+            "" | "off" => Ok(Self::None),
+            "bootstrap" => Ok(Self::Bootstrap),
+            "raw-device" => Ok(Self::RawDevice),
+            "ffx-loader" => Ok(Self::FfxLoader),
+            "ngx-loader" => Ok(Self::NgxLoader),
+            "interop" => Ok(Self::Interop),
+            _ => Err("PW_RAY_RECONSTRUCTION_SKIP must name a single diagnostic stage".into()),
+        }
+    }
+
+    fn from_env() -> R<Self> {
+        match std::env::var("PW_RAY_RECONSTRUCTION_SKIP") {
+            Ok(value) => Self::parse(&value),
+            Err(std::env::VarError::NotPresent) => Ok(Self::None),
+            Err(_) => Err("invalid PW_RAY_RECONSTRUCTION_SKIP".into()),
+        }
+    }
+
+    fn before_load(self, provider: &str) -> R<()> {
+        if self == Self::Bootstrap
+            || matches!(
+                (self, provider),
+                (Self::FfxLoader, "fsr") | (Self::NgxLoader, "rr")
+            )
+        {
+            Err(format!(
+                "diagnostic skipped {self:?} before loading {provider}"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl Request {
-    fn load() -> R<Option<Self>> {
+    fn load(skip: Bisect) -> R<Option<Self>> {
         let path = |var: &str| {
             std::env::var_os(var)
                 .map(PathBuf::from)
                 .ok_or_else(|| format!("set {var} to enable the requested Vulkan SDK"))
         };
-        Ok(match std::env::var("PW_RAY_RECONSTRUCTION").as_deref() {
-            Ok("fsr") => Some(Self::Fsr(Arc::new(ffx::Api::load(&path(
+        Self::load_with(
+            skip,
+            std::env::var("PW_RAY_RECONSTRUCTION").as_deref(),
+            path,
+        )
+    }
+
+    fn load_with(
+        skip: Bisect,
+        provider: Result<&str, &std::env::VarError>,
+        path: impl Fn(&str) -> R<PathBuf>,
+    ) -> R<Option<Self>> {
+        let provider = match provider {
+            Ok("" | "off") | Err(std::env::VarError::NotPresent) => return Ok(None),
+            Ok(value @ ("fsr" | "rr")) => value,
+            _ => return Err("PW_RAY_RECONSTRUCTION must be off, fsr or rr".into()),
+        };
+        skip.before_load(provider)?;
+        if provider == "fsr" {
+            Ok(Some(Self::Fsr(Arc::new(ffx::Api::load(&path(
                 "PW_RAY_FSR_VK_DLL",
-            )?)?))),
-            Ok("rr") => Some(Self::Rr(Arc::new(ngx::Api::load(
+            )?)?))))
+        } else {
+            Ok(Some(Self::Rr(Arc::new(ngx::Api::load(
                 &path("PW_RAY_RR_BRIDGE")?,
                 &path("PW_RAY_RR_SDK_DIR")?,
-            )?))),
-            Ok("" | "off") | Err(std::env::VarError::NotPresent) => None,
-            _ => return Err("PW_RAY_RECONSTRUCTION must be off, fsr or rr".into()),
-        })
+            )?))))
+        }
     }
 
     fn label(&self) -> &'static str {
@@ -143,7 +209,7 @@ impl Request {
 /// Owned by startup, not global; a failed optional path leaves ordinary wgpu
 /// device selection and reload/recovery available.
 #[derive(Default)]
-pub(crate) struct Startup(Option<Request>);
+pub(crate) struct Startup(Option<Request>, Bisect);
 
 impl Startup {
     pub(crate) fn new(mode: Mode) -> Self {
@@ -156,8 +222,8 @@ impl Startup {
             }
             return Self::default();
         }
-        match Request::load() {
-            Ok(req) => Self(req),
+        match Bisect::from_env().and_then(|skip| Ok(Self(Request::load(skip)?, skip))) {
+            Ok(startup) => startup,
             Err(error) => {
                 eprintln!("Lighter reconstruction unavailable; using portable resolve: {error}");
                 Self::default()
@@ -177,6 +243,9 @@ impl Startup {
         };
         if self.0.is_some() {
             desc.flags = desc.flags.with_env();
+        }
+        if self.1 == Bisect::RawDevice {
+            self.disable("diagnostic skipped raw-device (instance and device import)");
         }
         if let Some(Request::Rr(api)) = &self.0 {
             if bits.contains(wgpu::Backends::VULKAN) {
@@ -209,6 +278,9 @@ impl Startup {
         adapter: &wgpu::Adapter,
         desc: &wgpu::DeviceDescriptor<'_>,
     ) -> Option<(wgpu::Device, wgpu::Queue)> {
+        if self.1 == Bisect::RawDevice {
+            self.disable("diagnostic skipped raw-device (device import)");
+        }
         let request = self.0.as_ref()?;
         match bootstrap::device(adapter, desc, request) {
             Ok(device) => Some(device),
@@ -222,7 +294,7 @@ impl Startup {
     pub(crate) fn install(self, lighter: &mut super::Lighter, device: &wgpu::Device) {
         if let Some(req) = self.0 {
             match Raw::new(device) {
-                Ok(raw) => lighter.reconstruction = Some(Session::new(req, raw)),
+                Ok(raw) => lighter.reconstruction = Some(Session::new(req, raw, self.1)),
                 Err(error) => eprintln!(
                     "Lighter: {} unavailable; using portable resolve: {error}",
                     req.label()
@@ -561,7 +633,13 @@ struct Epoch {
 }
 
 impl Epoch {
-    fn new(device: &wgpu::Device, raw: &Raw, req: &Request, extent: [u32; 4]) -> R<Self> {
+    fn new(
+        device: &wgpu::Device,
+        raw: &Raw,
+        req: &Request,
+        extent: [u32; 4],
+        skip: Bisect,
+    ) -> R<Self> {
         let (render, display) = extent2(extent);
         let rr = req.is_rr();
         let context = match req {
@@ -570,6 +648,11 @@ impl Epoch {
             #[cfg(test)]
             Request::Probe { .. } => Context::Probe,
         };
+        if skip == Bisect::Interop {
+            // Drop the just-opened provider before any image, sampled view, bind
+            // group or command allocation. Never pass a dummy Vulkan handle.
+            return Err("diagnostic skipped SDK image/view and descriptor setup".into());
+        }
         device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let made = checked_pipeline(device, || {
             (
@@ -764,10 +847,11 @@ pub(super) struct Session {
     history: temporal::History,
     rejected: Option<[u32; 4]>,
     active: bool,
+    skip: Bisect,
 }
 
 impl Session {
-    fn new(request: Request, raw: Raw) -> Self {
+    fn new(request: Request, raw: Raw, skip: Bisect) -> Self {
         Self {
             epoch: None,
             request,
@@ -775,6 +859,7 @@ impl Session {
             history: temporal::History::default(),
             rejected: None,
             active: false,
+            skip,
         }
     }
     pub(super) fn poll(&mut self) -> R<bool> {
@@ -857,7 +942,7 @@ impl Session {
             );
             return Ok(true);
         }
-        match Epoch::new(device, &self.raw, &self.request, extent) {
+        match Epoch::new(device, &self.raw, &self.request, extent, self.skip) {
             Ok(epoch) => {
                 self.epoch = Some(epoch);
                 self.rejected = None;

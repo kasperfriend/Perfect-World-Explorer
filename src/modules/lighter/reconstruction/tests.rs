@@ -169,7 +169,7 @@ fn make(mode: Mode, cpu_query: bool, rr: bool) -> Harness {
     let mut h = Harness::on_instance(&instance, mode, cpu_query, |adapter, desc| {
         bootstrap::device(adapter, desc, &request).unwrap()
     });
-    Startup(Some(request)).install(&mut h.ray, &h.device);
+    Startup(Some(request), Bisect::None).install(&mut h.ray, &h.device);
     h.ray.install(Ok((
         world(mode),
         super::super::textures::Textures::default(),
@@ -500,6 +500,51 @@ fn check_sdk_radiance(
         return Err("missing SDK output on supported opaque pixels".into());
     }
     Ok((nonzero, checked))
+}
+
+#[test]
+fn reconstruction_bisect_gates_opt_in_loads_before_path_lookup() {
+    assert!(Bisect::parse("ffx-loader,ngx-loader").is_err());
+    for (mode, skip) in [
+        ("fsr", Bisect::Bootstrap),
+        ("rr", Bisect::Bootstrap),
+        ("fsr", Bisect::FfxLoader),
+        ("rr", Bisect::NgxLoader),
+    ] {
+        let result = Request::load_with(skip, Ok(mode), |_| panic!("loader was reached"));
+        assert!(matches!(result, Err(reason) if reason.contains("diagnostic skipped")));
+    }
+    assert!(matches!(
+        Request::load_with(Bisect::None, Ok("off"), |_| panic!("off must not load")),
+        Ok(None)
+    ));
+    assert!(
+        matches!(Request::load_with(Bisect::NgxLoader, Ok("fsr"), |key| Err(key.into())), Err(key) if key=="PW_RAY_FSR_VK_DLL")
+    );
+}
+
+#[test]
+#[ignore = "requires Vulkan CPU; no SDK DLL is loaded"]
+fn lighter_reconstruction_bisect_uses_valid_portable_draws() {
+    let mut startup = Startup(Some(Request::Probe { rr: true }), Bisect::RawDevice);
+    let _instance = startup.instance(wgpu::Backends::VULKAN);
+    assert!(startup.0.is_none());
+    let mode = Mode::Software;
+    let mut probe = make(mode, false, true);
+    probe.ray.reconstruction.as_mut().unwrap().skip = Bisect::Interop;
+    let (frame, lens) = camera(Vec3::ZERO, 32);
+    let actors = moving(mode, false);
+    let blocked = probe.pixels_with_camera(frame, &actors, Some(lens));
+    let session = probe.ray.reconstruction.as_ref().unwrap();
+    assert!(session.epoch.is_none() && session.rejected == Some([16, 16, 32, 32]));
+    assert!(probe.ray.reconstruction_status().is_none());
+    let mut control = Harness::new(mode, false);
+    control.ray.settings = probe.ray.settings;
+    control.ray.install(Ok((world(mode), Default::default())));
+    assert_eq!(
+        blocked,
+        control.pixels_with_camera(frame, &actors, Some(lens))
+    );
 }
 
 #[test]
