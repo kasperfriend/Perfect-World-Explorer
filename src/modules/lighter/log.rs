@@ -228,9 +228,11 @@ impl Logger {
             log.log_dir = std::env::var_os("PW_CACHE_DIR")
                 .map(PathBuf::from)
                 .or_else(|| {
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .map(|p| p.join(".cache").join("PerfectWorldViewer").join("lighter-logs"))
+                    std::env::var_os("HOME").map(PathBuf::from).map(|p| {
+                        p.join(".cache")
+                            .join("PerfectWorldViewer")
+                            .join("lighter-logs")
+                    })
                 });
         }
         log
