@@ -889,6 +889,8 @@ pub struct Lighter {
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     capture: bool,
     capture_reference_samples: Option<u32>,
+    #[cfg(test)]
+    fail_start_after_prepare: bool,
     compact_terrain: bool,
     bc_pages: bool,
     screen_reuse: u32,
@@ -946,6 +948,8 @@ impl Default for Lighter {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             capture: false,
             capture_reference_samples: None,
+            #[cfg(test)]
+            fail_start_after_prepare: false,
             compact_terrain: false,
             bc_pages: false,
             screen_reuse: 0,
@@ -1490,10 +1494,50 @@ impl Lighter {
         Ok(true)
     }
 
+    /// Keep the original failure and renderer choice. Release failed optional
+    /// GPU state while the owning device and queue still exist; the failed
+    /// viewer/handoff then exits or takes the existing recovery path.
+    pub(crate) fn retire_failed_start(&mut self) {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            self.cold_ray = None;
+            self.vendor_present = None;
+            self.reconstruction = None;
+        }
+        self.present = None;
+        self.post = None;
+        self.software = None;
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            self.hardware = None;
+        }
+        self.timings = None;
+        self.last_residency = None;
+    }
+
+    pub(crate) fn prepare_window_frame(
+        &mut self,
+        device: &std::sync::Arc<wgpu::Device>,
+        w: u32,
+        h: u32,
+        first: bool,
+    ) -> Result<bool, String> {
+        #[allow(unused_mut)]
+        let mut result = self.prepare_window_inner(device, w, h, first);
+        #[cfg(test)]
+        if first && self.fail_start_after_prepare && matches!(result, Ok(true)) {
+            result = Err("injected Lighter failure after GPU startup allocation".into());
+        }
+        if first && result.is_err() {
+            self.retire_failed_start();
+        }
+        result
+    }
+
     /// First-use Hardware route only. The worker creates pipelines and static
     /// handles but never submits queue work. An Arc keeps the parent Vulkan
     /// device alive if recovery or window close abandons the worker.
-    pub(crate) fn prepare_window_frame(
+    fn prepare_window_inner(
         &mut self,
         device: &std::sync::Arc<wgpu::Device>,
         w: u32,

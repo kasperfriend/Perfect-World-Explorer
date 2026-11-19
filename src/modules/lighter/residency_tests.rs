@@ -122,6 +122,42 @@ fn crossing(mode: Mode, cpu_query: bool) {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires Vulkan CPU query features; injects two first-use failures"]
+fn lighter_failed_start_releases_owned_allocations_twice() {
+    for attempt in 1..=2 {
+        let mode = Mode::Hardware;
+        let mut h = Harness::new(mode, true);
+        let mut b = Builder::for_mode(mode);
+        let mesh = upright(&mut b, -3., [1.; 4], 0, 0);
+        put(&mut b, mesh);
+        h.ray.install(Ok((b.finish(), Textures::default())));
+        assert!(h.ray.prepare_frame(&h.device, 9, 9).unwrap());
+        let stats = h.ray.hardware.as_ref().unwrap().live_probe();
+        assert!(stats().0 > 0 && stats().1 > 0);
+        h.ray.fail_start_after_prepare = true;
+        let device = std::sync::Arc::new(h.device);
+        let weak = std::sync::Arc::downgrade(&device);
+        let error = h.ray.prepare_window_frame(&device, 9, 9, true).unwrap_err();
+        assert!(error.contains("injected Lighter failure"));
+        assert_eq!(
+            stats(),
+            (0, 0),
+            "failed start still owns Vulkan allocations"
+        );
+        assert!(h.ray.hardware.is_none());
+        drop(h.ray);
+        drop(h.queue);
+        drop(device);
+        assert!(
+            weak.upgrade().is_none(),
+            "failed viewer retained the device owner"
+        );
+        eprintln!("S failed start {attempt}: charged VkDeviceMemory bytes and resource Context owners returned to zero");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 #[ignore = "requires Vulkan CPU query features; opt-in first-frame pipeline and BLAS"]
 fn lighter_paced_cold_startup() {
     let mode = Mode::Hardware;

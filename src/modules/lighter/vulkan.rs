@@ -1151,6 +1151,17 @@ impl Renderer {
         self.primary_error_extent = Some(extent);
     }
 
+    #[cfg(test)]
+    pub(super) fn live_probe(&self) -> impl Fn() -> (u64, usize) {
+        let ctx = self.core.ctx.clone();
+        move || {
+            (
+                ctx.budget.held.load(Ordering::Relaxed),
+                Arc::strong_count(&ctx) - 1,
+            )
+        }
+    }
+
     pub(super) fn initial_residency(
         &mut self,
         revision: u64,

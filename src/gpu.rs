@@ -7681,6 +7681,7 @@ fn run_viewer(
                                 let fallback = snapshot.lighter.mode != LighterMode::Off && !renderer.renders_rays();
                                 if let Some(error) = renderer.lighter.error().or_else(|| fallback.then_some("The requested ray renderer did not draw the world.")) {
                                     run_error = Some(format!("{}: {error}", snapshot.kind.label()));
+                                    renderer.lighter.retire_failed_start();
                                     target.set_control_flow(winit::event_loop::ControlFlow::Poll);
                                     target.exit();
                                     return;
