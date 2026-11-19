@@ -1,21 +1,37 @@
 //! Experimental GPU world renderer: actual client terrain, static BMDs and water masks.
 //! Baked terrain material atlas, fixed lighting and flat water are not client parity.
+use crate::modules::lighter::{
+    coverage::Counts as RayCounts, Denoiser, Lighter, Mode as LighterMode, Settings as LighterSettings,
+};
 use crate::scenery_visibility::{
     allows_class_with_context, lod_scale, Class, ModelClass, Pass, RenderContext, Visibility,
     NATIVE_DEFAULT_WATER_EFFECT,
 };
 use crate::Terrain;
+#[path = "modules/lighter/host.rs"]
+mod lighter_host;
+mod lighter_travel;
+mod native_inventory;
+mod readback;
+mod recovery;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
+#[cfg(test)]
+pub(crate) use lighter_host::tests::{
+    fine_far_terrain_scene, joined_bmd_packets, ray_test_wet_grid, stitched_terrain_scene,
+    streamed_bmd_scenes,
+};
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub(crate) use recovery::lost_error as reconstruction_device_lost;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use wgpu::util::DeviceExt;
 use winit::{
     event::{DeviceEvent, ElementState, Event, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::EventLoop,
+    event_loop::EventLoopBuilder,
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Fullscreen, WindowBuilder},
 };
@@ -93,8 +109,15 @@ struct FrameSnapshot {
     celestial_alpha: f32,
     authored: [f32; 3],
     celestial: [f32; 3],
+    sky_sets: (i32, i32, f32),
+    sky_tint: [f32; 3],
+    sky_drift: [f32; 2],
+    sky_sun: [f32; 4],
+    sky_moon: [f32; 4],
     time_advances: u32,
     light_publications: u32,
+    weather: crate::client_weather::WeatherSelection,
+    weather_ticks: u32,
 }
 impl Default for FrameSnapshot {
     fn default() -> Self {
@@ -124,8 +147,15 @@ impl Default for FrameSnapshot {
             celestial_alpha: 0.,
             authored: [0.; 3],
             celestial: [0.; 3],
+            sky_sets: (0, 0, 0.),
+            sky_tint: [1.; 3],
+            sky_drift: [0.; 2],
+            sky_sun: [0.; 4],
+            sky_moon: [0.; 4],
             time_advances: 0,
             light_publications: 0,
+            weather: Default::default(),
+            weather_ticks: 0,
         }
     }
 }
@@ -520,6 +550,7 @@ struct MeshData {
     /// unchanged page is a page whose atlas and geometry the renderer can keep.
     local_page_keys: Vec<u64>,
     grass: crate::grass_instances::Data,
+    grass_area_coverage: RayCounts,
     center: (isize, isize),
     tree_center: (f32, f32),
     detail: DetailSettings,
@@ -530,13 +561,35 @@ struct MeshData {
     object_start: u32,
     water_start: u32,
     water_batches: Vec<WaterBatch>,
+    water_areas: Vec<(u32, u32, u32, bool)>, // export id, first/end indices, simple style
+    water_coverage: RayCounts,
     local_pages: Vec<crate::world_objects::Page>,
+    /// Optional ray feed prepared on the same loader as the native pages.
+    ray_scenery: Option<Result<lighter_host::ScenerySnapshot, String>>,
+    ray_grass: lighter_host::GrassTiles,
     /// True when this build left the locally streamed scenery out because the
     /// whole-world preload owns it. The renderer compares it against the state
     /// it is drawing with, the same way `lod` is compared, so a crossing into
     /// or out of the whole-world mode rebuilds instead of drawing the wrong
     /// half of the world.
     local_scenery_skipped: bool,
+}
+/// A native residency update and the ray snapshot from those exact assets.
+/// Both stay pending until the existing paced native upload is complete.
+struct StreamedMesh {
+    native: MeshData,
+    rays: Option<Result<lighter_host::PreparedScene, String>>,
+}
+impl StreamedMesh {
+    fn prepare(
+        native: MeshData,
+        packer: Option<&mut lighter_host::StreamPacker>,
+        storage: usize,
+        mode: LighterMode,
+    ) -> Self {
+        let rays = packer.map(|p| p.prepare(&native, storage, mode));
+        Self { native, rays }
+    }
 }
 /// Which view's indirect terrain records the next submit draws. The records
 /// live in one buffer, so every pass re-queues the view it draws through: the
@@ -607,6 +660,18 @@ fn push_quad(v: &mut Vec<Vertex>, i: &mut Vec<u32>, points: [[f32; 3]; 4], color
     }
     i.extend_from_slice(&[n, n + 1, n + 2, n + 1, n + 3, n + 2]);
 }
+fn block_coordinates(width: usize, height: usize, spacing: f32, cam: [f32; 2]) -> [f32; 2] {
+    [
+        (cam[0] / spacing + width as f32 * 0.5) / TILE as f32,
+        (height as f32 * 0.5 - cam[1] / spacing) / TILE as f32,
+    ]
+}
+
+fn camera_block(width: usize, height: usize, spacing: f32, cam: [f32; 2]) -> (isize, isize) {
+    let [x, y] = block_coordinates(width, height, spacing, cam);
+    (x.floor() as isize, y.floor() as isize)
+}
+
 /// Recovered block window and per-block levels (`src/terrain_lod.rs`). The client
 /// re-evaluates `0x77e360` for every resident block on every frame, so the viewer
 /// re-runs the same rule per frame and rebuilds geometry only when the answer
@@ -627,8 +692,6 @@ fn lod_setup(
     let cols = width / TILE;
     let rows = height / TILE;
     let block_world = TILE as f32 * spacing;
-    let gx = cam[0] / spacing + width as f32 * 0.5;
-    let gy = height as f32 * 0.5 - cam[1] / spacing;
     let lod = crate::terrain_lod::LodConfig {
         block_size: block_world,
         ..Default::default()
@@ -636,7 +699,7 @@ fn lod_setup(
     // `world+0x1bc`: draw range in world units, one slider step = one block.
     let range = radius.max(1) as f32 * block_world;
     let win = crate::terrain_lod::window(
-        [gx / TILE as f32, gy / TILE as f32],
+        block_coordinates(width, height, spacing, cam),
         [cols, rows],
         range,
         block_world,
@@ -730,7 +793,7 @@ fn reserve_page_atlas_rows(page: &mut crate::world_objects::Page, rows: usize) {
 /// atlas each one owns) and from the frozen ornament placements. Both are in the
 /// key, so an equal key means the page the renderer already holds is the page
 /// this rebuild produced.
-fn local_page_key(page: &crate::world_objects::Page, textures: &[(String, u64)]) -> u64 {
+fn local_page_key(page: &crate::world_objects::Page, textures: &[(&str, u64)]) -> u64 {
     let mut key = crate::texture_atlas::LayoutKey::new();
     key.usize(textures.len());
     for (texture, layout) in textures {
@@ -779,7 +842,11 @@ fn build(
     // between a crossing that rebuilds a terrain mesh and one that also uploads
     // tens of megabytes of unused atlas.
     skip_local_scenery: bool,
+    mut ray_scenery: Option<&mut lighter_host::SceneryStream>,
 ) -> Result<MeshData, String> {
+    if ray_scenery.is_some() {
+        t.objects.retain_ray_dds();
+    }
     if vegetation_authored_mips {
         static WARN: std::sync::Once = std::sync::Once::new();
         WARN.call_once(|| {
@@ -799,11 +866,9 @@ fn build(
         });
     }
     let rad = detail.radius;
-    let gx = cx / t.grid_spacing + t.width as f32 * 0.5;
-    let gy = t.height as f32 * 0.5 - cz / t.grid_spacing;
-    // Camera block, used as the rebuild anchor compared against `self.center`.
-    let bx = (gx / TILE as f32).floor() as isize;
-    let by = (gy / TILE as f32).floor() as isize;
+    // Camera block, also the ray stream's rebuild anchor. The block is not
+    // clamped to the terrain window: rays can reach outside a small map.
+    let (bx, by) = camera_block(t.width, t.height, t.grid_spacing, [cx, cz]);
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     // Recovered block residency, resolution levels and block-edge rule
@@ -839,10 +904,6 @@ fn build(
             t.grid_spacing,
         )
     });
-    let lod_state = LodState {
-        window: win,
-        levels: levels.levels.clone(),
-    };
     // The loader stores `grid` cells per block and drops each block's last row
     // and column (the neighbour re-supplies them), so a block's offset-`TILE`
     // vertex clamps to the last stored cell at the world border.
@@ -922,17 +983,17 @@ fn build(
     // radius are provisional until the game's randomization and fade are ported.
     let mut grass_builder = crate::grass_instances::Builder::default();
     let mut grass_sample = None;
-    let mut grass_slots: HashMap<(String, u8), crate::texture_atlas::Slot> = HashMap::new();
+    let mut grass_slots: HashMap<(&str, u8), crate::texture_atlas::Slot> = HashMap::new();
     // Materials whose atlas rectangle keeps a native-size authored chain. Only
     // membership matters here; the chain itself travels with the mip tiles, so
     // storing it twice would copy every authored level on every rebuild.
-    let mut grass_authored: HashSet<(String, u8)> = HashSet::new();
+    let mut grass_authored: HashSet<(&str, u8)> = HashSet::new();
     let mut grass_mips = Vec::new();
     // Atlas rectangles in packing order, copied into the pixel buffer only once
     // the layout signature says the renderer's copy is stale. A rebuild is
     // dominated by the 4096² atlas, and almost every block-window update leaves
     // it identical.
-    let mut grass_copies: Vec<(crate::texture_atlas::Slot, String, bool)> = Vec::new();
+    let mut grass_copies: Vec<(crate::texture_atlas::Slot, &str, bool)> = Vec::new();
     let mut grass_layout = crate::texture_atlas::LayoutKey::new();
     // Reserve at least one 128px slot for every distinct nearby material, so
     // a few large textures cannot starve all later grass types.
@@ -949,7 +1010,7 @@ fn build(
             let alpha = 84u8;
             for mesh in &model.meshes {
                 if t.grass.textures.contains_key(&mesh.texture) {
-                    grass_pending.insert((mesh.texture.clone(), alpha));
+                    grass_pending.insert((mesh.texture.as_str(), alpha));
                 }
             }
         }
@@ -968,11 +1029,13 @@ fn build(
     // than inventing a depth; `density_step` stays the single place that will
     // consume the recovered value.
     let grass_step = crate::grass_wind::density_step(None);
+    let mut grass_area_coverage = RayCounts::default();
     for area in &t.grass.areas {
         let half_x = area.width as f32 * area.grid * 0.5;
         let half_z = area.height as f32 * area.grid * 0.5;
         // A recovered step of 5 is the native "no grass" early-out.
         let Some(step) = grass_step else {
+            grass_area_coverage.disabled = t.grass.areas.len();
             break;
         };
         // `0x653a30` only keeps cells whose mask bit is set; distances use the
@@ -980,18 +1043,22 @@ fn build(
         if (area.center[0] - cx).abs() > half_x + t.scene.block_size
             || (area.center[2] - cz).abs() > half_z + t.scene.block_size
         {
+            grass_area_coverage.range += 1;
             continue;
         }
         let Some(Some(model)) = t.grass.models.get(area.type_id) else {
+            grass_area_coverage.unavailable += 1;
             continue;
         };
         let typ = &t.grass.types[area.type_id];
+        let (mut emitted, mut missing, mut budget, mut clipped) = (false, false, false, false);
         for (mesh_index, mesh) in model.meshes.iter().enumerate() {
             let Some(img) = t.grass.textures.get(&mesh.texture) else {
+                missing = true;
                 continue;
             };
             let alpha_ref = 84u8;
-            let material_key = (mesh.texture.clone(), alpha_ref);
+            let material_key = (mesh.texture.as_str(), alpha_ref);
             let slot = if let Some(&slot) = grass_slots.get(&material_key) {
                 slot
             } else {
@@ -1046,22 +1113,23 @@ fn build(
                         .clamp(TEX, ATLAS);
                     let Some(slot) = atlas_allocator.allocate(n, n, reserve, true) else {
                         eprintln!("Grass atlas full: {}", mesh.texture);
+                        budget = true;
                         continue;
                     };
                     slot
                 };
-                grass_copies.push((slot, mesh.texture.clone(), authored.is_some()));
+                grass_copies.push((slot, mesh.texture.as_str(), authored.is_some()));
                 grass_layout.slot(&mesh.texture, slot);
                 grass_layout.usize(authored.as_ref().map_or(0, |chain| chain.len()));
                 if let Some(chain) = authored {
                     if !chain.is_empty() {
-                        grass_authored.insert(material_key.clone());
+                        grass_authored.insert(material_key);
                     }
                     grass_mips.push((slot, alpha_ref, Some(chain)));
                 } else {
                     grass_mips.push((slot, alpha_ref, None));
                 }
-                grass_slots.insert(material_key.clone(), slot);
+                grass_slots.insert(material_key, slot);
                 slot
             };
             let ox = slot.x as f32 / ATLAS as f32;
@@ -1103,8 +1171,14 @@ fn build(
                             .to_bits(),
                     })
                     .collect();
-                grass_builder.mesh_with_scale_y(key, mesh_vertices, mesh.indices.clone(), scale_y);
+                grass_builder.mesh_with_scale_y(
+                    key,
+                    mesh_vertices,
+                    mesh.indices.as_slice(),
+                    scale_y,
+                );
             }
+            let before = grass_builder.instance_count(key);
             for placement in area.placements(typ)? {
                 let x = area.center[0] - half_x
                     + (placement.col as f32 + placement.jitter_x) * area.grid;
@@ -1123,6 +1197,7 @@ fn build(
                     continue;
                 }
                 if !crate::terrain_cutoff::contains(resident_bounds, [x, 0., z]) {
+                    clipped = true;
                     continue;
                 }
                 let gx = x / t.grid_spacing + t.width as f32 * 0.5;
@@ -1166,6 +1241,20 @@ fn build(
                     area.center,
                 );
             }
+            emitted |= !mesh.indices.is_empty() && grass_builder.instance_count(key) > before;
+        }
+        // Area tally, not an inferred number of off-stream blades. An area
+        // with some valid groups still contributes its actual instances.
+        if emitted {
+            grass_area_coverage.loaded += 1;
+        } else if missing {
+            grass_area_coverage.unavailable += 1;
+        } else if budget {
+            grass_area_coverage.budget += 1;
+        } else if clipped {
+            grass_area_coverage.cutoff += 1;
+        } else {
+            grass_area_coverage.empty += 1;
         }
     }
     // Materialise the grass atlas only when the renderer's copy is stale.
@@ -1181,7 +1270,7 @@ fn build(
     let (atlas, grass_mips) = if grass_atlas_changed {
         let mut atlas = vec![0u8; ATLAS * ATLAS * 4];
         for (slot, texture, authored) in &grass_copies {
-            let Some(img) = t.grass.textures.get(texture) else {
+            let Some(img) = t.grass.textures.get(*texture) else {
                 continue;
             };
             let ox = slot.x;
@@ -1209,6 +1298,10 @@ fn build(
         (atlas, mips)
     } else {
         (Vec::new(), Vec::new())
+    };
+    let ray_grass = match ray_scenery.as_deref_mut() {
+        Some(stream) => lighter_host::grass_tiles(stream, &t.grass, &grass_copies)?,
+        None => lighter_host::GrassTiles::default(),
     };
     let grass = grass_builder.finish();
     if grass_debug() {
@@ -1288,33 +1381,43 @@ fn build(
     }
     // Sort largest rectangles first, then use as many atlas pages as needed.
     // Unlike the legacy 128px atlas, local BMDs keep their source dimensions.
-    let mut requested: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut texture_names = HashMap::<&str, String>::new();
     for &id in &ornament_ids {
         if let Some(model) = t.objects.get(id) {
             for mesh in &model.meshes {
-                let key = mesh.texture.to_lowercase();
-                // A reference the client resolves nowhere is an explicit
-                // registered row (texture_resolution), not a skipped mesh: give
-                // it a 1x1 white atlas slot and draw the actual geometry.
-                let dims = t
-                    .objects
-                    .texture(&key)
-                    .map(|tex| (tex.width, tex.height))
-                    .unwrap_or((1, 1));
-                requested.insert(key, dims);
+                texture_names
+                    .entry(&mesh.texture)
+                    .or_insert_with(|| mesh.texture.to_lowercase());
             }
         }
     }
-    let mut requested: Vec<_> = requested.into_iter().collect();
-    requested.sort_by_key(|(_, (w, h))| {
-        std::cmp::Reverse(w.next_power_of_two().max(TEX) * h.next_power_of_two().max(TEX))
+    let mut requested: Vec<_> = texture_names.values().map(String::as_str).collect();
+    requested.sort_unstable();
+    requested.dedup();
+    let mut requested: Vec<_> = requested
+        .into_iter()
+        .map(|key| {
+            // Keep unresolved references as a white slot without skipping geometry.
+            let tex = t.objects.texture(key);
+            (
+                key,
+                tex.map(|tex| (tex.width, tex.height)).unwrap_or((1, 1)),
+                tex,
+            )
+        })
+        .collect();
+    requested.sort_by_key(|(key, (w, h), _)| {
+        (
+            std::cmp::Reverse(w.next_power_of_two().max(TEX) * h.next_power_of_two().max(TEX)),
+            *key,
+        )
     });
-    let mut texture_slots: HashMap<String, (usize, crate::texture_atlas::Slot)> = HashMap::new();
+    let mut texture_slots: HashMap<&str, (usize, crate::texture_atlas::Slot)> = HashMap::new();
     let mut pages: Vec<(crate::texture_atlas::Atlas, crate::world_objects::Page)> = Vec::new();
-    for (key, (w, h)) in &requested {
+    for &(key, (w, h), tex) in &requested {
         let mut chosen = None;
         for (i, (packing, _)) in pages.iter_mut().enumerate() {
-            if let Some(slot) = packing.allocate(*w, *h, 0, false) {
+            if let Some(slot) = packing.allocate(w, h, 0, false) {
                 chosen = Some((i, slot));
                 break;
             }
@@ -1324,7 +1427,7 @@ fn build(
         } else {
             let mut packing = crate::texture_atlas::Atlas::new();
             let slot = packing
-                .allocate(*w, *h, 0, false)
+                .allocate(w, h, 0, false)
                 .ok_or("local scenery texture exceeds maximum atlas size")?;
             let i = pages.len();
             pages.push((
@@ -1352,7 +1455,6 @@ fn build(
         };
         pages[i].1.used_height = pages[i].1.used_height.max(slot.y + slot.h);
         reserve_page_atlas_rows(&mut pages[i].1, slot.y + slot.h);
-        let tex = t.objects.texture(key);
         for py in 0..slot.h {
             for px in 0..slot.w {
                 let sample = if let Some(tex) = tex {
@@ -1367,7 +1469,7 @@ fn build(
                 pages[i].1.atlas[o..o + 4].copy_from_slice(&sample);
             }
         }
-        texture_slots.insert(key.clone(), (i, slot));
+        texture_slots.insert(key, (i, slot));
     }
     crate::diag!(
         TimingLoad,
@@ -1375,7 +1477,7 @@ fn build(
         requested.len(),
         pages.len()
     );
-    for id in ornament_ids {
+    for &id in &ornament_ids {
         let Some(model) = t.objects.get(id) else {
             continue;
         };
@@ -1387,8 +1489,8 @@ fn build(
         let y = basis(model.up);
         let x = y.cross(z).normalize_or_zero();
         for mesh in &model.meshes {
-            let key = mesh.texture.to_lowercase();
-            let Some((page_id, slot)) = texture_slots.get(&key).copied() else {
+            let key = texture_names[mesh.texture.as_str()].as_str();
+            let Some((page_id, slot)) = texture_slots.get(key).copied() else {
                 continue;
             };
             // v5 stores the client's no-cull flag in the material; the draw
@@ -1453,12 +1555,12 @@ fn build(
     // and submission metadata `Page::finish` froze. The renderer keeps a page
     // whose signature it already uploaded and re-uploads only the rest, so a
     // block-window update no longer re-sends every scenery atlas and buffer.
-    let mut page_textures: Vec<Vec<(String, u64)>> = Vec::new();
+    let mut page_textures: Vec<Vec<(&str, u64)>> = Vec::new();
     page_textures.resize_with(pages.len(), Vec::new);
     for (key, (page_index, slot)) in &texture_slots {
         let mut key_layout = crate::texture_atlas::LayoutKey::new();
         key_layout.slot(key, *slot);
-        page_textures[*page_index].push((key.clone(), key_layout.value()));
+        page_textures[*page_index].push((*key, key_layout.value()));
     }
     for list in &mut page_textures {
         list.sort();
@@ -1473,9 +1575,27 @@ fn build(
         local_page_keys.push(local_page_key(&page, &page_textures[index]));
         local_pages.push(page);
     }
+    // Snap the independent ray region to the same block that drives stream
+    // requests. Rotating or moving within an unchanged block cannot change it.
+    let ray_scenery = ray_scenery.map(|stream| {
+        let center = [
+            ((bx as f32 + 0.5) * TILE as f32 - t.width as f32 * 0.5) * t.grid_spacing,
+            (t.height as f32 * 0.5 - (by as f32 + 0.5) * TILE as f32) * t.grid_spacing,
+        ];
+        stream.prepare(
+            &mut t.objects,
+            &ornament_ids,
+            center,
+            crate::scenery_visibility::ornament_distance(detail.scenery_quality),
+            resident_bounds,
+            &t.scene_lights.lights,
+        )
+    });
     // Keep opaque indices separate so water can sample reflected/refracted scene passes.
     let water_start = indices.len() as u32;
     let mut water_batches: Vec<WaterBatch> = Vec::new();
+    let mut water_areas = Vec::new();
+    let mut water_coverage = RayCounts::default();
     let mut areas: Vec<_> = t.water.iter().collect();
     areas.sort_by(|a, b| a.height.total_cmp(&b.height));
     // The water records had no channel of their own: `SceneWater` and
@@ -1581,7 +1701,15 @@ fn build(
             }
         }
         let end = indices.len() as u32;
-        if end > start {
+        if start == end {
+            if resident_bounds.is_some() && a.mask.iter().any(|&cell| cell & 1 != 0) {
+                water_coverage.cutoff += 1;
+            } else {
+                water_coverage.empty += 1;
+            }
+        } else {
+            water_coverage.loaded += 1;
+            water_areas.push((a.export_id, start, end, a.simple));
             if let Some(last) = water_batches.last_mut().filter(|last| {
                 last.height == a.height && last.simple == a.simple && last.end == start
             }) {
@@ -1618,11 +1746,11 @@ fn build(
         let materials = if t.terrain_material_window.is_none() {
             t.materials.take_window(mask_window)
         } else {
-            let dir = t.map_dir.clone();
-            let trn = std::fs::read(crate::world_catalog::data_file(&dir, "trn2"))
+            let dir = t.map_dir.as_path();
+            let trn = std::fs::read(crate::world_catalog::data_file(dir, "trn2"))
                 .map_err(|e| e.to_string())?;
             crate::material::Materials::load_window(
-                &dir,
+                dir,
                 &trn,
                 &t.subterrain_names,
                 t.width,
@@ -1648,6 +1776,7 @@ fn build(
         indices,
         grass_mips,
         grass,
+        grass_area_coverage,
         atlas,
         grass_atlas_key,
         grass_atlas_changed,
@@ -1655,13 +1784,20 @@ fn build(
         center: (bx, by),
         tree_center: (cx, cz),
         detail,
-        lod: lod_state,
+        lod: LodState {
+            window: win,
+            levels: levels.levels,
+        },
         spans,
         terrain_end,
         object_start,
         water_start,
         water_batches,
+        water_areas,
+        water_coverage,
         local_pages,
+        ray_scenery,
+        ray_grass,
         local_scenery_skipped: skip_local_scenery,
     })
 }
@@ -1712,13 +1848,21 @@ fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || 
 @fragment fn fs_sdr(i:VOut, @builtin(front_facing) front:bool)->@location(0) vec4<f32> { if !sdr_blend_band(i.kind) { discard; } return fs_body(i,front); }
 "#;
 struct Renderer {
+    // Drop the Vulkan interop resources before the device they borrow.
+    lighter: Lighter,
+    lighter_feed: Option<lighter_host::Feed>,
+    scene_format: wgpu::TextureFormat,
     /// Optional add-ons; default-disabled and absent from headless previews.
     modules: crate::modules::Modules,
     module_format: wgpu::TextureFormat,
     models: Option<crate::world_models_gpu::World>,
+    ray_model_absences: RayCounts,
+    ray_scene_effects: usize,
+    ray_rejected_scene_effects: usize,
+    ray_gfx_archive_unavailable: bool,
     model_lights: std::sync::Arc<crate::scene_lights::SceneLights>,
     model_scene: std::sync::Arc<crate::scene::Scene>,
-    device: wgpu::Device,
+    device: std::sync::Arc<wgpu::Device>,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     scenery_pipeline: wgpu::RenderPipeline,
@@ -1766,9 +1910,9 @@ struct Renderer {
     /// Whole-world page commands, one list per view slot (`GpuPage::world_view_slot`).
     world_draw_cmds: [crate::world_objects::WorldDrawList; crate::world_objects::WORLD_VIEWS],
     world_done: bool,
-    /// The scenery half of the drawn mesh was left out because the whole-world
-    /// preload owns it. Unlike `world_done` this describes the *mesh*, so the
-    /// streamer and the renderer can agree on what a rebuild should contain.
+    /// Local scenery is absent: the streamer omitted it or the whole-world
+    /// preload took over and released the local pages. Clearing the preload
+    /// while Lighter is selected must wait for a rebuild that restores these.
     local_scenery_skipped: bool,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -1776,6 +1920,9 @@ struct Renderer {
     water_batches: Vec<WaterBatch>,
     visible_water_batches: Vec<WaterBatch>,
     started: Instant,
+    // Audited headless runs advance only by the fixed logic step; water and
+    // preview wind must not depend on renderer speed when comparing modes.
+    capture_elapsed_ms: Option<u64>,
     wind_last: Instant,
     /// Snapshot computed once by `render()`; secondary views reuse it.
     frame: FrameSnapshot,
@@ -1784,6 +1931,8 @@ struct Renderer {
     /// World renders this frame will submit: the main view plus a mirror and a
     /// refraction pass for every visible water plane.
     scene_passes: u32,
+    #[cfg(test)]
+    native_opaque_draws: std::cell::Cell<u64>,
     /// Water views this frame that were scissored, and their mean share of the
     /// target. Reported once a second so the saving is visible in the log.
     water_scissored: u32,
@@ -1994,6 +2143,7 @@ impl Renderer {
         mut m: MeshData,
         t: &mut Terrain,
         vegetation_authored_mips: bool,
+        mut lighter: Lighter,
     ) -> Result<Self, String> {
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera"),
@@ -2170,6 +2320,28 @@ impl Renderer {
             &reflected_uniform,
             vegetation_authored_mips,
         );
+        // Both paths consume the same loaded sources. The native path has
+        // finished borrowing them; transfer the placement list to Lighter.
+        let lighter_feed = if lighter.armed() {
+            match lighter_host::Feed::new(
+                t,
+                &m,
+                vegetation_authored_mips,
+                crate::modules::lighter::storage_limit(&device),
+                lighter.uses_bc_pages(),
+            ) {
+                Ok(mut feed) => {
+                    feed.install_initial(&mut lighter, &m, &device);
+                    Some(feed)
+                }
+                Err(error) => {
+                    lighter.install(Err(error));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // Immutable tree meshes/motion samples and water frames now live on
         // the GPU. The streaming worker never reads these sources again.
         t.trees.types.clear();
@@ -2427,8 +2599,28 @@ impl Renderer {
         // model assets. Only the opt-out and a genuinely missing archive decide
         // whether the object is built; the model queue inside it is skipped
         // lazily when there are no instances.
+        let mut ray_model_absences = RayCounts::default();
+        let ray_scene_effects = t
+            .scene
+            .blocks
+            .iter()
+            .map(|block| block.effects.len())
+            .sum::<usize>();
+        let mut ray_rejected_scene_effects = 0;
+        let mut ray_gfx_archive_unavailable = false;
+        // Preserve the SKI census even if reopening the GPU-side texture pack
+        // fails and the model queue cannot be installed.
+        lighter.skin_omissions[0] = t.models.skin_omissions.totals();
         let models = if std::env::var_os("PW_DISABLE_WORLD_MODELS").is_none() {
             let assets = std::mem::take(&mut t.models);
+            let loaded = assets.instances.len();
+            if assets.archive_unavailable {
+                ray_model_absences.package = assets.unloaded.len();
+            } else {
+                ray_model_absences.unsupported = assets.unloaded_unsupported;
+                ray_model_absences.unavailable =
+                    assets.unloaded.len() - assets.unloaded_unsupported;
+            }
             // `models.pck` holds the model textures; the effect roots come from
             // `gfx.pck` below. A map that ships no EC model still gets its
             // effects, so a missing model archive costs the model queue and
@@ -2437,6 +2629,7 @@ impl Renderer {
                 match crate::world_models_gpu::World::new(&device, format, assets, &t.element) {
                     Ok(world) => world,
                     Err(error) => {
+                        ray_model_absences.unavailable += loaded;
                         eprintln!("World models unavailable ({error}); world effects continue");
                         crate::world_models_gpu::World::without_models(&device, format)
                     }
@@ -2449,11 +2642,15 @@ impl Renderer {
             // silent removal of either half.
             match world.attach_gfx_archive(&t.element) {
                 Ok(()) => {}
-                Err(e) => eprintln!("World FX light roots unavailable: {e}"),
+                Err(e) => {
+                    ray_gfx_archive_unavailable = true;
+                    eprintln!("World FX light roots unavailable: {e}");
+                }
             }
             // A placement the reader or the owner queue rejects is a reported
             // absence on the status line, not a refused world.
             let effects = world.install_scene_effects(&t.scene);
+            ray_rejected_scene_effects = ray_scene_effects - effects;
             let events = world.install_model_events();
             eprintln!(
                 "Installed {effects} scene effects and {events} model events (light producers and animated roots)"
@@ -2463,6 +2660,7 @@ impl Renderer {
             }
             Some(world)
         } else {
+            ray_model_absences.disabled = t.models.instances.len() + t.models.unloaded.len();
             None
         };
         // Install the day/night pair the client's own `autoscene.cfg` names
@@ -2477,9 +2675,16 @@ impl Renderer {
             crate::sky_transition::Triple(sky.night_set().min(2) as u8),
         );
         Ok(Self {
+            lighter,
+            lighter_feed,
+            scene_format: format,
             modules: crate::modules::Modules::default(),
             module_format: format.remove_srgb_suffix(),
             models,
+            ray_model_absences,
+            ray_scene_effects,
+            ray_rejected_scene_effects,
+            ray_gfx_archive_unavailable,
             model_lights: t.scene_lights.clone(),
             model_scene: t.scene.clone(),
             terrain_gpu,
@@ -2494,7 +2699,7 @@ impl Renderer {
             world_width: t.width,
             world_height: t.height,
             world_spacing: t.grid_spacing,
-            device,
+            device: std::sync::Arc::new(device),
             queue,
             pipeline,
             scenery_pipeline,
@@ -2522,9 +2727,12 @@ impl Renderer {
             water_batches: m.water_batches,
             visible_water_batches: Vec::new(),
             started: Instant::now(),
+            capture_elapsed_ms: None,
             frame: FrameSnapshot::default(),
             frame_budget: FrameBudget::default(),
             scene_passes: 1,
+            #[cfg(test)]
+            native_opaque_draws: std::cell::Cell::new(0),
             water_scissored: 0,
             water_scissor_cover: 0.,
             world_glow: crate::post_gpu::WorldGlow::default(),
@@ -2560,9 +2768,6 @@ impl Renderer {
             map_far_runs: Vec::new(),
         })
     }
-    /// Sample time and publish the frame's lighting/playback state exactly
-    /// once. Every secondary view reuses the returned snapshot with a zero
-    /// logic delta; no secondary submission calls this method.
     /// Explicit celestial state report: which disc is drawable and, when it is
     /// not, which native condition failed. Shown next to the sky settings so an
     /// unsupported state is visible instead of silently missing.
@@ -2663,6 +2868,9 @@ impl Renderer {
         }
         out
     }
+    /// Sample time and publish the frame's lighting/playback state exactly
+    /// once. Every secondary view reuses the returned snapshot with a zero
+    /// logic delta; no secondary submission calls this method.
     fn begin_frame(&mut self, camera: &Camera, w: u32, h: u32) -> FrameSnapshot {
         let now = Instant::now();
         let dt = now.duration_since(self.wind_last).as_secs_f32();
@@ -2693,8 +2901,13 @@ impl Renderer {
             self.world_glow.brightness_fade(),
             camera.bloom_opacity_fade,
         );
-        let elapsed = self.started.elapsed().as_secs_f32();
-        let elapsed64 = self.started.elapsed().as_secs_f64();
+        let elapsed64 = if let Some(ms) = &mut self.capture_elapsed_ms {
+            *ms += u64::from(camera.logic_delta_ms);
+            *ms as f64 / 1_000.
+        } else {
+            self.started.elapsed().as_secs_f64()
+        };
+        let elapsed = elapsed64 as f32;
         let direction = camera.direction();
         let daylight = crate::environment::daylight(camera.time_of_day);
         let angle = (camera.time_of_day - 6.0) * std::f32::consts::PI / 12.0;
@@ -2738,7 +2951,9 @@ impl Renderer {
         // Disc placement follows the render path 0x4b3e00: each object uses its
         // own recovered elevation curve and the shared regional azimuth.
         // `sun_dir` is a light direction, which 0x4b60b0 stores negated.
-        let (sun, moon) = match crate::sky_time::evaluate(camera.time_of_day, authored) {
+        // These are disc fade, elevation, azimuth and shine, not the
+        // world-space material light vector above.
+        let (sky_sun, sky_moon) = match crate::sky_time::evaluate(camera.time_of_day, authored) {
             Some(state) => {
                 let fade = |sun: bool| {
                     if camera.celestial_discs {
@@ -2856,8 +3071,8 @@ impl Renderer {
         let frame = crate::sky_gpu::SkyFrame {
             hour: camera.time_of_day,
             night_weight,
-            sun,
-            moon,
+            sun: sky_sun,
+            moon: sky_moon,
             // The 38.16-72.5 degree band has no native mesh; the client covers it
             // with something drawn at 0x799f88 that this build does not, so the
             // viewer blends the frame's atmospheric fog into the cap's own rim
@@ -2987,21 +3202,68 @@ impl Renderer {
             celestial_alpha,
             authored,
             celestial,
+            sky_sets: main_sets,
+            sky_tint: frame.tint,
+            sky_drift: frame.drift,
+            sky_sun: frame.sun,
+            sky_moon: frame.moon,
             time_advances: 1,
             light_publications: 1,
+            weather: camera.weather_override.apply(
+                camera
+                    .regional_light
+                    .map_or_else(crate::client_weather::WeatherSelection::default, |light| {
+                        light.weather_selection()
+                    }),
+            ),
+            weather_ticks: self.weather.wrapped_ticks(),
         };
         self.frame = snapshot;
         snapshot
     }
-    fn update_mesh(&mut self, mut m: MeshData) -> Result<(), String> {
-        if let Some(mut upload) = m.terrain_upload.take() {
-            self.terrain_gpu.update_residency(
+    /// Advance any staged terrain upload. `pending` remains owned by the
+    /// viewer until the replacement mesh and all of its atlas pages are ready.
+    fn update_mesh(&mut self, pending: &mut Option<StreamedMesh>) -> Result<bool, String> {
+        let Some(mesh) = pending.as_mut() else {
+            return Ok(false);
+        };
+        let ready = match mesh.rays.as_ref() {
+            Some(Ok(candidate)) => {
+                match candidate.poll_upload(&mut self.lighter, &self.device, &self.queue) {
+                    Ok(ready) => ready,
+                    Err(error) if recovery::lost_error(&error) => return Err(error),
+                    Err(error) => {
+                        // Publish the Native snapshot and its explicit ray error
+                        // as a pair. Never block terrain on an over-budget ray scene.
+                        mesh.rays = Some(Err(error));
+                        true
+                    }
+                }
+            }
+            _ => true,
+        };
+        if let Some(upload) = &mesh.native.terrain_upload {
+            if !self.terrain_gpu.poll_residency(
                 &self.device,
                 &self.queue,
                 &self.uniform,
                 &self.reflected_uniform,
-                &upload,
-            )?;
+                upload,
+                ready,
+            )? {
+                return Ok(false);
+            }
+        } else if !ready {
+            return Ok(false);
+        }
+        let StreamedMesh {
+            native: mut m,
+            rays,
+        } = pending.take().unwrap();
+        if let (Some(feed), Some(rays)) = (&mut self.lighter_feed, rays) {
+            feed.install_prepared(&mut self.lighter, rays);
+        }
+        if let Some(mut upload) = m.terrain_upload.take() {
             upload.materials.release_gpu_source();
         }
         self.grass.update(&self.device, &self.queue, m.grass);
@@ -3069,7 +3331,7 @@ impl Renderer {
             crate::grass_mips::upload(&self.queue, &self.atlas, &m.atlas, &m.grass_mips, ATLAS);
             self.grass_atlas_key = m.grass_atlas_key;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Upload the rebuilt near-world geometry, growing the two buffers only when
@@ -3128,6 +3390,9 @@ impl Renderer {
         // `water_view_scissor`'s rectangle. `None` draws the whole attachment.
         scissor: Option<[u32; 4]>,
     ) {
+        #[cfg(test)]
+        self.native_opaque_draws
+            .set(self.native_opaque_draws.get() + 1);
         let mut p = e.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3623,6 +3888,12 @@ impl Renderer {
             Some(&self.reflected_far_runs),
         );
     }
+    fn renders_rays(&self) -> bool {
+        // A Native whole-world mesh can omit local geometry. Keep its Native
+        // pages drawing until a stream with local scenery has arrived.
+        !self.local_scenery_skipped && self.lighter.replaces_world()
+    }
+
     fn render(
         &mut self,
         target: &wgpu::TextureView,
@@ -3636,39 +3907,47 @@ impl Renderer {
         // obey the same cut or they hand the motion-vector pass a vector built
         // against a view that no longer exists.
         reset_history: bool,
-    ) {
+    ) -> bool {
+        let ray_world = self.renders_rays();
+        if !ray_world {
+            self.lighter.reset_reconstruction();
+        }
         // Where this frame's CPU time goes, stage by stage. One line a second on
         // the `TimingFrame` channel; see `FrameBudget`.
         let mut stage_ms = [0f64; STAGE_COUNT];
         let mut lap_at = Instant::now();
-        self.scene_passes = 1;
+        self.scene_passes = u32::from(!ray_world);
         self.water_scissored = 0;
         self.water_scissor_cover = 0.;
-        // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
-        // the same block walk the client runs before the level rule.
-        // Both buffers are reused: this runs for every view of every frame.
-        let spans = &self.spans;
-        let terrain_runs = &mut self.terrain_runs;
-        let terrain_gpu = &self.terrain_gpu;
-        let far_terrain_runs = &mut self.far_terrain_runs;
-        std::thread::scope(|s| {
-            s.spawn(|| crate::terrain_residency::visible_runs_into(spans, matrix, terrain_runs));
-            s.spawn(|| terrain_gpu.visible_far_runs_into(matrix, far_terrain_runs));
-        });
-        // One indirect record per run, so the terrain itself is one call per mesh
-        // instead of one call per run.
-        self.queue_main_runs();
-        lap(STAGE_VISIBILITY, &mut stage_ms, &mut lap_at);
-        let frame = self.begin_frame(camera, w, h);
+        if !ray_world {
+            // Per-frame, per-view visibility of the resident terrain (`0x77e250`):
+            // the same block walk the client runs before the level rule.
+            // Both buffers are reused: this runs for every view of every frame.
+            let spans = &self.spans;
+            let terrain_runs = &mut self.terrain_runs;
+            let terrain_gpu = &self.terrain_gpu;
+            let far_terrain_runs = &mut self.far_terrain_runs;
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    crate::terrain_residency::visible_runs_into(spans, matrix, terrain_runs)
+                });
+                s.spawn(|| terrain_gpu.visible_far_runs_into(matrix, far_terrain_runs));
+            });
+            // One indirect record per run, so the terrain itself is one call per mesh
+            // instead of one call per run.
+            self.queue_main_runs();
+            lap(STAGE_VISIBILITY, &mut stage_ms, &mut lap_at);
+        }
+        // Main, reflection and refraction share one authored state/tick.
         self.weather.advance(camera.logic_delta_ms);
-        let selected_weather = camera.regional_light.map_or(
-            crate::client_weather::WeatherSelection::default(),
-            |light| light.weather_selection(),
-        );
-        // The World tab's override replaces the area's own flag bits before any
-        // view consumes them, so the main, reflection and above-water passes all
-        // see one selection. `Auto` is the client's `0x421520` answer.
-        let selected_weather = camera.weather_override.apply(selected_weather);
+        let frame = self.begin_frame(camera, w, h);
+        let selected_weather = frame.weather;
+        if ray_world {
+            if reset_history {
+                self.lighter.reset_history();
+            }
+            return self.render_lighter(target, matrix, camera, &frame, w, h);
+        }
         let main_weather = if camera.underwater_depth > 0.0 {
             crate::client_weather::WeatherSelection::default()
         } else {
@@ -3932,7 +4211,7 @@ impl Renderer {
                 );
             }
             self.end_frame(stage_ms, lap_at);
-            return;
+            return true;
         }
 
         // The reflection texture is reused only after its previous water draw is
@@ -4028,7 +4307,7 @@ impl Renderer {
             self.visible_water_batches = visible;
             lap(STAGE_POST, &mut stage_ms, &mut lap_at);
             self.end_frame(stage_ms, lap_at);
-            return;
+            return true;
         }
         // How far the water surface samples away from itself, in UV: the shader
         // displaces by `n.xz * edge * edge * 0.25`, and `|n.xz|` is bounded by
@@ -4443,6 +4722,7 @@ impl Renderer {
         }
         lap(STAGE_POST, &mut stage_ms, &mut lap_at);
         self.end_frame(stage_ms, lap_at);
+        true
     }
 
     /// Close one frame's stage samples: whatever the last stage did not claim is
@@ -4537,6 +4817,17 @@ struct Camera {
     logic_delta_ms: u32,
 }
 impl Camera {
+    fn handoff_view(&self) -> [f32; 6] {
+        [
+            self.pos.x,
+            self.pos.y,
+            self.pos.z,
+            self.yaw,
+            self.pitch,
+            self.time_of_day,
+        ]
+    }
+
     fn new(t: &Terrain) -> Self {
         let x = t.width / 2;
         let y = t.height / 2;
@@ -4730,15 +5021,32 @@ fn selected_map_label(catalog: &crate::world_catalog::Catalog, id: &str) -> Stri
         .unwrap_or_else(|| "(metadata unavailable)".into())
 }
 
-/// A child signals readiness only after its visible window has presented a
-/// usable frame, not when its data structures merely exist in memory.
-fn signal_handoff_first_frame(signaled: &mut bool) {
-    if *signaled || !crate::world_handoff::is_handoff_child() {
-        return;
+/// Keep the startup stage in the always-on session log, even if the driver
+/// never returns from work in that stage. Windows' loader has its own pump.
+fn startup_progress(message: &str) {
+    report_startup(message, false);
+}
+
+pub(crate) fn first_frame_progress(message: &str) {
+    report_startup(message, true);
+}
+
+fn report_startup(message: &str, first_frame: bool) {
+    crate::diagnostics::session(format!(
+        "Viewer startup: [pid={}] {message}",
+        std::process::id()
+    ));
+    eprintln!("Viewer startup: {message}");
+    if crate::world_handoff::is_handoff_child() {
+        if first_frame {
+            crate::world_handoff::publish_first_frame_progress(message);
+        } else {
+            crate::world_handoff::publish_progress(message);
+        }
+    } else {
+        #[cfg(windows)]
+        crate::windows_setup::loading_progress(message.into());
     }
-    *signaled = true;
-    crate::world_handoff::publish_progress("First world frame is ready.");
-    crate::world_handoff::signal_ready();
 }
 
 /// Steps the old process must take as soon as a replacement world is ready.
@@ -4775,28 +5083,46 @@ fn close_old_window_after_handoff_ready<T: 'static>(
     }
 }
 
-/// Launch a replacement process for another map. The old process remains the
-/// foreground owner and keeps its own files/focus state; the child only
-/// publishes progress, its HWND, and readiness after a usable frame.
+struct WorldHandoff {
+    files: crate::world_handoff::Files,
+    messages: std::sync::mpsc::Receiver<crate::world_handoff::Message>,
+    // Commit the selected mode only when the same-map replacement is ready.
+    reload: Option<LighterSettings>,
+}
+
+/// Launch a replacement without touching the live renderer/device.
 fn spawn_world_handoff(
     client_root: &std::path::Path,
     map_id: &str,
     focused: bool,
-) -> Result<
-    (
-        crate::world_handoff::Files,
-        std::sync::mpsc::Receiver<crate::world_handoff::Message>,
-    ),
-    String,
-> {
+    snapshot: Option<&recovery::Snapshot>,
+    #[cfg(test)] smoke_dir: Option<&std::path::Path>,
+) -> Result<WorldHandoff, String> {
     let validated = crate::world_catalog::validate_selection(map_id)?;
     let id = validated.to_ascii_lowercase();
     let exe = std::env::current_exe().map_err(|e| format!("cannot find viewer executable: {e}"))?;
     let files = crate::world_handoff::Files::new();
     files.set_focused(focused);
     let mut command = std::process::Command::new(exe);
+    #[cfg(test)]
+    if let Some(dir) = smoke_dir {
+        // The test binary regenerates the synthetic Terrain in a separate
+        // process. It still exercises the production snapshot and watcher.
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "gpu::lighter_host::tests::lighter_live_handoff_child",
+                "--nocapture",
+            ])
+            .env("PW_TEST_LIGHTER_VIEWER_DIR", dir);
+    } else {
+        command.arg(client_root).arg("--world").arg(&id);
+    }
+    #[cfg(not(test))]
     command.arg(client_root).arg("--world").arg(&id);
     files.configure(&mut command);
+    recovery::Snapshot::configure(&mut command, snapshot);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -4812,15 +5138,38 @@ fn spawn_world_handoff(
             ));
         }
     };
+    let request = snapshot.map_or_else(
+        || format!("World change to {id}"),
+        |s| format!("{} for {id} ({})", s.kind.label(), s.lighter.mode.label()),
+    );
+    crate::diagnostics::session(format!(
+        "{request}: starting replacement PID {}",
+        child.id()
+    ));
     let (tx, rx) = std::sync::mpsc::channel();
-    if let Err(error) = files
-        .clone()
-        .watch(child, tx, crate::world_handoff::timeout())
+    let timeouts = crate::world_handoff::Timeouts::configured();
+    #[cfg(test)]
+    let timeouts = if smoke_dir.is_some_and(|dir| dir.join("stall-ray-reload").exists())
+        && snapshot.is_some_and(|s| s.lighter.mode == LighterMode::Software)
     {
+        crate::world_handoff::Timeouts {
+            first_frame: Duration::from_secs(2),
+            ..timeouts
+        }
+    } else {
+        timeouts
+    };
+    if let Err(error) = files.clone().watch(child, tx, timeouts) {
         files.cleanup();
         return Err(error);
     }
-    Ok((files, rx))
+    Ok(WorldHandoff {
+        files,
+        messages: rx,
+        reload: snapshot
+            .filter(|s| s.kind == recovery::RestoreKind::Reload)
+            .map(|s| s.lighter),
+    })
 }
 
 /// The neutral light a map gets when no environment record answers: full white
@@ -4901,16 +5250,38 @@ fn preferred_backends() -> wgpu::Backends {
     })
 }
 
-fn make_instance() -> wgpu::Instance {
+fn instance_backends(lighter: LighterMode) -> wgpu::Backends {
+    if lighter == LighterMode::Hardware && cfg!(any(target_os = "windows", target_os = "linux")) {
+        wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::VULKAN)
+    } else {
+        preferred_backends()
+    }
+}
+
+#[cfg(test)]
+fn make_instance(lighter: LighterMode) -> wgpu::Instance {
     wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: preferred_backends(),
+        backends: instance_backends(lighter),
         ..Default::default()
     })
 }
 
+#[cfg(test)]
 async fn adapter(
     instance: &wgpu::Instance,
     surface: Option<&wgpu::Surface<'_>>,
+    lighter: LighterMode,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
+    let mut ordinary = crate::modules::lighter::reconstruction::Startup::new(LighterMode::Off);
+    open_adapter(instance, surface, lighter, false, &mut ordinary).await
+}
+
+async fn open_adapter(
+    instance: &wgpu::Instance,
+    surface: Option<&wgpu::Surface<'_>>,
+    lighter: LighterMode,
+    native_stage_timestamps: bool,
+    reconstruction: &mut crate::modules::lighter::reconstruction::Startup,
 ) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), String> {
     let a = if let Ok(name) = std::env::var("WGPU_ADAPTER_NAME") {
         let query = name.to_lowercase();
@@ -4922,6 +5293,18 @@ async fn adapter(
                     && surface.map_or(true, |s| a.is_surface_supported(s))
             })
             .ok_or_else(|| format!("No compatible GPU adapter contains {name:?}"))?
+    } else if let Some(rt) = (lighter == LighterMode::Hardware)
+        .then(|| {
+            instance
+                .enumerate_adapters(wgpu::Backends::VULKAN)
+                .into_iter()
+                .filter(|adapter| surface.map_or(true, |s| adapter.is_surface_supported(s)))
+                .filter(crate::modules::lighter::supports_hardware)
+                .max_by_key(|a| a.get_info().device_type == wgpu::DeviceType::DiscreteGpu)
+        })
+        .flatten()
+    {
+        rt
     } else {
         instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -4933,34 +5316,154 @@ async fn adapter(
             .await
             .ok_or("No compatible GPU adapter")?
     };
-    eprintln!("GPU adapter: {:?}", a.get_info());
-    let (d, q) = a
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                label: None,
-                // The tree batches are one `multi_draw_indexed_indirect` call
-                // when the adapter has these; `FarTrees` falls back to one
-                // indirect draw per batch when it does not.
-                required_features: a.features()
-                    & (wgpu::Features::TEXTURE_COMPRESSION_BC
-                        | wgpu::Features::MULTI_DRAW_INDIRECT
-                        | wgpu::Features::INDIRECT_FIRST_INSTANCE),
-                required_limits: wgpu::Limits::downlevel_defaults().using_resolution(a.limits()),
-            },
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+    let info = a.get_info();
+    eprintln!("GPU adapter: {info:?}");
+    if surface.is_some() && lighter != LighterMode::Off {
+        crate::diagnostics::session(format!(
+            "Ray adapter [pid={}]: {info:?}",
+            std::process::id()
+        ));
+        startup_progress(&format!(
+            "Requesting a {} device on {} ({:?})…",
+            lighter.label(),
+            info.name,
+            info.backend
+        ));
+    }
+    // Request RT bits only for an opted-in scene and only on a physical
+    // Vulkan device which advertised actual acceleration-structure features.
+    let rt = crate::modules::lighter::device_features(&a, lighter);
+    let native = a.features()
+        & (wgpu::Features::TEXTURE_COMPRESSION_BC
+            | wgpu::Features::MULTI_DRAW_INDIRECT
+            | wgpu::Features::INDIRECT_FIRST_INSTANCE);
+    let mut limits = wgpu::Limits::downlevel_defaults().using_resolution(a.limits());
+    if lighter != LighterMode::Off {
+        limits.max_buffer_size = a.limits().max_buffer_size.min(512 << 20);
+        limits.max_storage_buffer_binding_size =
+            a.limits().max_storage_buffer_binding_size.min(256 << 20);
+    }
+    let timestamps = if lighter != LighterMode::Off || native_stage_timestamps {
+        a.features() & wgpu::Features::TIMESTAMP_QUERY
+    } else {
+        wgpu::Features::empty()
+    };
+    let native = native | timestamps;
+    let request = |required_features| wgpu::DeviceDescriptor {
+        label: None,
+        required_features,
+        required_limits: limits.clone(),
+    };
+    if let Some((d, q)) = reconstruction.device(&a, &request(native | rt)) {
+        return Ok((a, d, q));
+    }
+    let (d, q) = match a.request_device(&request(native | rt), None).await {
+        Ok(device) => device,
+        Err(error) if !rt.is_empty() => {
+            eprintln!("Lighter: Vulkan RT device creation refused ({error}); hardware mode will be unavailable");
+            a.request_device(&request(native), None)
+                .await
+                .map_err(|e| e.to_string())?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     Ok((a, d, q))
 }
+const GPU_RETRY_DELAY: Duration = Duration::from_millis(2);
+
+/// Opening a world must not depend on optional ray pipeline compilation. Only
+/// watched reload/recovery children may start directly in a ray mode.
+fn initial_viewer_lighter(saved: LighterSettings, restored: bool) -> LighterSettings {
+    if restored {
+        saved
+    } else {
+        LighterSettings {
+            mode: LighterMode::Off,
+            ..saved
+        }
+    }
+}
+
+/// Software RT does not need RT cores. Prefer Vulkan for its interactive
+/// reload on Windows to avoid optimizing the full compute shader in FXC.
+/// Native and explicit capture backend selection remain unchanged.
+fn viewer_backends(mode: LighterMode) -> wgpu::Backends {
+    if cfg!(windows) && mode == LighterMode::Software {
+        wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::VULKAN)
+    } else {
+        instance_backends(mode)
+    }
+}
+
+pub(crate) fn same_world_handoff() -> Option<&'static str> {
+    recovery::is_child().then(|| recovery::kind().label())
+}
+
 pub fn run(
-    mut t: Terrain,
+    t: Terrain,
     #[cfg(windows)] loading: Option<crate::windows_setup::LoadingWindow>,
 ) -> Result<(), String> {
+    run_viewer(
+        t,
+        #[cfg(windows)]
+        loading,
+        #[cfg(test)]
+        None,
+    )
+}
+
+fn run_viewer(
+    mut t: Terrain,
+    #[cfg(windows)] loading: Option<crate::windows_setup::LoadingWindow>,
+    #[cfg(test)] smoke_dir: Option<&std::path::Path>,
+) -> Result<(), String> {
+    // Retain the platform loader even if teardown must wait on a driver.
+    #[cfg(windows)]
+    let mut loading = loading;
+    #[cfg(test)]
+    let smoke_reload = smoke_dir.is_some_and(|dir| dir.join("reload-test").exists());
+    #[cfg(test)]
+    let smoke_travel = smoke_dir.filter(|dir| dir.join("travel.plan").is_file());
+    #[cfg(test)]
+    let smoke_sdk = if smoke_dir.is_some()
+        && smoke_travel.is_none()
+        && (cfg!(windows) || std::env::var_os("PW_TEST_LIGHTER_WINDOW_SDK").is_some())
+    {
+        Some(match std::env::var("PW_RAY_RECONSTRUCTION").as_deref() {
+            Ok("fsr") => "Vulkan temporal FSR",
+            Ok("rr") => "Vulkan DLSS Ray Reconstruction",
+            _ => {
+                return Err(
+                    "the windowed SDK fixture requires PW_RAY_RECONSTRUCTION=fsr or rr".into(),
+                )
+            }
+        })
+    } else {
+        None
+    };
+    #[cfg(test)]
+    let (smoke_start_extent, smoke_resize_extent, smoke_resolution) = if smoke_sdk.is_some() {
+        let scale = match std::env::var("PW_TEST_RAY_RESOLUTION").as_deref() {
+            Ok("100") => 100,
+            Ok("50") | Err(std::env::VarError::NotPresent) => 50,
+            _ => return Err("PW_TEST_RAY_RESOLUTION must be 50 or 100".into()),
+        };
+        ((512, 512), (640, 640), scale)
+    } else {
+        ((160, 96), (192, 112), 61)
+    };
+    #[cfg(test)]
+    let smoke_mode =
+        if smoke_sdk.is_some() && std::env::var("PW_TEST_RAY_QUERY").as_deref() == Ok("1") {
+            LighterMode::Hardware
+        } else {
+            LighterMode::Software
+        };
     let current_map = t.map.clone();
     let map_dir = t.map_dir.clone();
     let client_root = t.client_root.clone();
     let startup_notice = t.startup_notice.clone();
+    let restoring = recovery::Snapshot::from_child(&current_map.id)?;
     let mut catalog = crate::world_catalog::discover(&t.element);
     // Only safe single-folder IDs can be persisted or passed to a replacement
     // process. A raw directory name with spaces/slashes stays loadable as the
@@ -4979,43 +5482,151 @@ pub fn run(
     if let Some(warning) = &catalog.warning {
         eprintln!("World catalog: {warning}");
     }
-    crate::world_handoff::publish_progress(&format!(
-        "Preparing {} ({}) GPU world...",
-        current_map.display_name, current_map.id
+    let handoff_child = crate::world_handoff::is_handoff_child();
+    startup_progress(&format!(
+        "Creating the viewer window for {}…",
+        current_map.id
     ));
-    #[cfg(windows)]
-    crate::windows_setup::loading_progress("Preparing GPU world and textures...".into());
-    let event_loop = EventLoop::new().map_err(|e| e.to_string())?;
+    let mut event_loop = EventLoopBuilder::<()>::with_user_event();
+    #[cfg(all(test, target_os = "linux"))]
+    if smoke_dir.is_some() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        event_loop.with_x11().with_any_thread(true);
+    }
+    #[cfg(all(test, windows))]
+    if smoke_dir.is_some() {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        event_loop.with_any_thread(true);
+    }
+    let event_loop = event_loop.build().map_err(|e| e.to_string())?;
+    let startup_redraw = event_loop.create_proxy();
+    let window_builder = WindowBuilder::new()
+        .with_title("Perfect World Explorer — WASD fly, E/Q altitude, arrows look, Shift speed")
+        // Win32's SW_MAXIMIZE can show/activate even a hidden HWND. Defer it
+        // until a frame exists and a replacement actually owns focus.
+        .with_maximized(!cfg!(windows))
+        .with_active(!handoff_child)
+        .with_visible(false);
+    #[cfg(test)]
+    let window_builder = if smoke_dir.is_some() {
+        window_builder
+            .with_maximized(false)
+            .with_inner_size(winit::dpi::PhysicalSize::new(
+                smoke_start_extent.0,
+                smoke_start_extent.1,
+            ))
+    } else {
+        window_builder
+    };
     let window = Arc::new(
-        WindowBuilder::new()
-            .with_title("Perfect World Explorer — WASD fly, E/Q altitude, arrows look, Shift speed")
-            .with_maximized(true)
-            .with_visible(false)
+        window_builder
             .build(&event_loop)
             .map_err(|e| e.to_string())?,
     );
-    let mut instance = make_instance();
-    let mut surface = instance
-        .create_surface(window.clone())
-        .map_err(|e| e.to_string())?;
-    let mut adapter_result = pollster::block_on(adapter(&instance, Some(&surface)));
-    if let Err(error) = &adapter_result {
-        if std::env::var_os("WGPU_BACKEND").is_none() {
-            eprintln!(
-                "Perfect World Explorer: no D3D12 adapter ({error}); falling back to all backends"
-            );
-            let fallback = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
+    let saved_lighter = if let Some(snapshot) = &restoring {
+        snapshot.lighter
+    } else if crate::modules::lighter_installed() {
+        LighterSettings::load()
+    } else {
+        LighterSettings::default()
+    };
+    #[cfg(test)]
+    let saved_lighter = if smoke_dir.is_some() && smoke_travel.is_none() && restoring.is_none() {
+            LighterSettings {
+            mode: smoke_mode,
+            lighting: false,
+            shadows: false,
+            denoiser: Denoiser::Svgf,
+            progressive: false,
+            resolution: if smoke_sdk.is_some() {
+                smoke_resolution
+            } else {
+                LighterSettings::default().resolution
+            },
+            ..LighterSettings::default()
+        }
+    } else {
+        saved_lighter
+    };
+    let restore_renderer = restoring.is_some();
+    // The resize/device-loss fixture explicitly exercises a ray-first child.
+    // The reload fixture starts with the same saved mode, but via normal boot.
+    #[cfg(test)]
+    let restore_renderer =
+        restore_renderer || smoke_dir.is_some() && !smoke_reload && smoke_travel.is_none();
+    let lighter_settings = initial_viewer_lighter(saved_lighter, restore_renderer);
+    if lighter_settings.mode != saved_lighter.mode {
+        crate::diagnostics::session(format!(
+            "Lighter: kept {} as a saved choice; opening Native before any ray reload",
+            saved_lighter.mode.label()
+        ));
+    }
+    if lighter_settings.mode != LighterMode::Off {
+        let provider = match std::env::var("PW_RAY_RECONSTRUCTION").as_deref() {
+            Ok("fsr") => "Vulkan FSR requested",
+            Ok("rr") => "Vulkan DLSS Ray Reconstruction requested",
+            _ => "portable reconstruction",
+        };
+        startup_progress(&format!(
+            "Preparing {} — {provider}…",
+            lighter_settings.mode.label()
+        ));
+    }
+    let mut reconstruction =
+        crate::modules::lighter::reconstruction::Startup::new(lighter_settings.mode);
+    let sync_travel_requested = std::env::var_os("PW_LIGHTER_TRAVEL_PLAN").is_some()
+        && std::env::var("PW_LIGHTER_TRAVEL_SYNC").as_deref() == Ok("1");
+    #[cfg(test)]
+    let sync_travel_requested =
+        sync_travel_requested || smoke_travel.is_some_and(|dir| dir.join("sync-test").is_file());
+    let try_surface = |instance: &wgpu::Instance, reconstruction: &mut _| {
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|e| e.to_string())?;
+        let gpu = pollster::block_on(open_adapter(
+            instance,
+            Some(&surface),
+            lighter_settings.mode,
+            sync_travel_requested,
+            reconstruction,
+        ))?;
+        Ok::<_, String>((surface, gpu))
+    };
+    startup_progress(&format!(
+        "Opening graphics device for {} — {}",
+        current_map.id,
+        lighter_settings.mode.label()
+    ));
+    let mut instance = reconstruction.instance(viewer_backends(lighter_settings.mode));
+    let (mut surface, (adapter, device, queue)) = match try_surface(&instance, &mut reconstruction)
+    {
+        Ok(startup) => startup,
+        Err(error) if std::env::var_os("WGPU_BACKEND").is_none() => {
+            let fallback = if cfg!(windows) && lighter_settings.mode == LighterMode::Software {
+                wgpu::Backends::DX12
+            } else {
+                wgpu::Backends::all()
+            };
+            startup_progress(&format!(
+                "Preferred adapter unavailable ({error}); trying {fallback:?}…"
+            ));
+            instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: fallback,
                 ..Default::default()
             });
-            surface = fallback
-                .create_surface(window.clone())
-                .map_err(|e| format!("surface unavailable on the fallback backend: {e}"))?;
-            instance = fallback;
-            adapter_result = pollster::block_on(adapter(&instance, Some(&surface)));
+            reconstruction.disable(&error);
+            try_surface(&instance, &mut reconstruction)?
         }
-    }
-    let (adapter, device, queue) = adapter_result?;
+        Err(error) => return Err(error),
+    };
+    let gpu_loss = recovery::Loss::default();
+    let wake = startup_redraw.clone();
+    gpu_loss.register(&device, move || {
+        // A driver may report Destroyed while dropping the device after the
+        // event loop has already exited. X11 request_redraw panics then, but
+        // waking by proxy is fallible and never needs the window to be visible.
+        let _ = wake.send_event(());
+    });
     let software_adapter = adapter.get_info().device_type == wgpu::DeviceType::Cpu;
     window.set_title(&format!(
         "Perfect World Explorer — {} — click mouse to look, Esc menu, WASD fly",
@@ -5026,7 +5637,8 @@ pub fn run(
         .formats
         .iter()
         .find(|x| x.is_srgb())
-        .unwrap_or(&caps.formats[0]);
+        .or(caps.formats.first())
+        .ok_or("The graphics device offers no surface formats")?;
     // Every material shader returns linear color and the render target performs
     // the single encode. When the swapchain has no sRGB format, composition
     // happens in an sRGB intermediate that is encoded once at presentation
@@ -5047,8 +5659,19 @@ pub fn run(
             .view_formats
             .push(surface_format.remove_srgb_suffix());
     }
-    surface.configure(&device, &config);
+    startup_progress(&format!(
+        "Building GPU world and textures on {} ({:?})…",
+        adapter.get_info().name,
+        adapter.get_info().backend
+    ));
     let mut camera = Camera::new(&t);
+    if let Some(snapshot) = &restoring {
+        let [x, y, z, yaw, pitch, hour] = snapshot.view;
+        camera.pos = Vec3::new(x, y, z);
+        camera.yaw = yaw;
+        camera.pitch = pitch;
+        camera.time_of_day = hour;
+    }
     camera.underwater_fog = t
         .environments
         .underwater(camera.pos.to_array(), camera.time_of_day);
@@ -5056,6 +5679,26 @@ pub fn run(
         .environments
         .atmosphere(camera.pos.to_array(), camera.time_of_day);
     let mut settings = ViewSettings::load_with_default_fog(t.environments.auto_fog_enabled());
+    if restoring.is_some() {
+        settings.selected_world = current_map.id.clone();
+        settings.time_of_day = camera.time_of_day;
+    }
+    #[cfg(test)]
+    if smoke_dir.is_some() {
+        if restoring.is_none() {
+            camera.pos = Vec3::new(-2.5, 5., 0.);
+            camera.yaw = 0.;
+            camera.pitch = -std::f32::consts::FRAC_PI_4;
+        }
+        settings = ViewSettings::default();
+        settings.selected_world = current_map.id.clone();
+        settings.time_of_day = camera.time_of_day;
+        settings.time_pass_enabled = false;
+        settings.show_minimap = false;
+        settings.music_enabled = false;
+        settings.ambience_enabled = false;
+        settings.world_effects = false;
+    }
     // Facts for the Graphics-tab upscaler gating. The adapter is not moved
     // into the renderer, so it is still available here.
     let gpu_facts = crate::GpuFacts::from_parts(
@@ -5075,6 +5718,20 @@ pub fn run(
     // Nothing is uploaded yet, so the first build always materialises the atlas.
     // The whole-world preload has not started either, so the local scenery is
     // part of this first mesh (`skip_local_scenery: false`).
+    let mut lighter = Lighter::new(lighter_settings, &adapter, &device);
+    reconstruction.install(&mut lighter, &device);
+    let saved_mode = if saved_lighter.mode == LighterMode::Off
+        && restoring
+            .as_ref()
+            .is_some_and(|s| s.kind == recovery::RestoreKind::DeviceRecovery)
+        && crate::modules::lighter_installed()
+    {
+        LighterSettings::load().mode
+    } else {
+        saved_lighter.mode
+    };
+    lighter.stage_saved_mode(saved_mode);
+    let mut ray_scenery = lighter.armed().then(lighter_host::SceneryStream::default);
     let m = build(
         &mut t,
         camera.pos.x,
@@ -5084,6 +5741,7 @@ pub fn run(
         vegetation_authored_mips,
         0,
         false,
+        ray_scenery.as_mut(),
     )?;
     let mut renderer = Renderer::new(
         device,
@@ -5094,6 +5752,7 @@ pub fn run(
         m,
         &mut t,
         vegetation_authored_mips,
+        lighter,
     )?;
     // Resolution scaling: the world renders into an offscreen target at a
     // scaled extent and is bilinearly blitted to the full-size composition
@@ -5206,33 +5865,25 @@ pub fn run(
     // that wgpu has presented on it at least once.
     let mut presented_once = false;
     let mut display_gamma: Option<crate::display_gamma::DisplayGamma> = None;
-    // Only allocated for UNORM-only swapchains; None is the normal sRGB route.
-    let mut present_encode: Option<crate::present_encode::PresentEncode> =
-        if crate::color_chain::present_encode_required(surface_format.is_srgb()) {
-            Some(crate::present_encode::PresentEncode::new(
-                &renderer.device,
-                surface_format,
-                config.width,
-                config.height,
-            ))
-        } else {
-            None
-        };
+    // Stage the entire first frame (including the menu) offscreen. After the
+    // first present, only a UNORM swapchain still needs the intermediate.
+    let mut present_encode = Some(crate::present_encode::PresentEncode::new(
+        &renderer.device,
+        surface_format,
+        config.width,
+        config.height,
+    ));
+    startup_progress("Preparing the viewer interface and world audio…");
     let zones_path = crate::world_catalog::named_file(&map_dir, "precinct.clt");
     let ui_zones = crate::music::Zones::open(&zones_path).ok();
     let mut music = crate::music::MusicPlayer::new_for_map(&t.element, &zones_path);
     let mut ambience = crate::music::AmbiencePlayer::new_for_map(&t.element, &zones_path);
     let mut world_audio = crate::world_audio::WorldAudio::new(&t.element, &t.scene);
     #[cfg(windows)]
-    drop(loading);
-    window.set_visible(true);
-    if crate::world_handoff::is_handoff_child() {
-        // The child publishes its HWND; only the old foreground process may
-        // activate it. This process must not call SetForegroundWindow itself.
-        if let Ok(hwnd) = window_hwnd(&window) {
-            crate::world_handoff::publish_window_handle(hwnd as usize);
-        }
-        crate::world_handoff::publish_progress("Preparing the first visible frame...");
+    let mut maximize_after_startup = true;
+    #[cfg(all(windows, test))]
+    if smoke_dir.is_some() {
+        maximize_after_startup = false;
     }
     let water_areas = t.water.clone();
     let environments = t.environments.clone();
@@ -5260,7 +5911,7 @@ pub fn run(
         map_space.clone(),
         water_areas.clone(),
         &t.scene,
-        whole_ornaments.to_vec(),
+        &whole_ornaments,
     );
     // Add-ons get read access to the world's effect catalogue the moment the
     // world has one: the same grouped index the World tab's census uses, so a
@@ -5333,7 +5984,13 @@ pub fn run(
     // the worker can leave the local half of the mesh out (see `build`).
     let (request_tx, request_rx) =
         std::sync::mpsc::channel::<(f32, f32, DetailSettings, u64, bool)>();
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<MeshData, String>>(1);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<StreamedMesh, String>>(1);
+    let mut ray_packer = renderer
+        .lighter_feed
+        .as_mut()
+        .and_then(lighter_host::Feed::take_packer);
+    let ray_storage = crate::modules::lighter::storage_limit(&renderer.device);
+    let ray_mode = renderer.lighter.settings.mode;
     std::thread::Builder::new()
         .name("world-streaming".into())
         .spawn(move || {
@@ -5349,10 +6006,14 @@ pub fn run(
                     vegetation_authored_mips,
                     grass_atlas_key,
                     skip_local_scenery,
-                );
+                    ray_scenery.as_mut(),
+                )
+                .map(|native| {
+                    StreamedMesh::prepare(native, ray_packer.as_mut(), ray_storage, ray_mode)
+                });
                 crate::diag!(
                     TimingLoad,
-                    "Background terrain build at ({x:.1},{z:.1}) took {:.2}s",
+                    "Background terrain and ray build at ({x:.1},{z:.1}) took {:.2}s",
                     started.elapsed().as_secs_f32()
                 );
                 if result_tx.send(result).is_err() {
@@ -5469,27 +6130,89 @@ pub fn run(
     let mut fullscreen_applied = false;
     let mut menu_page = MenuPage::Main;
     let mut streaming = false;
+    let mut pending_mesh = None;
+    let mut stream_commit_pending = false;
+    let mut travel =
+        lighter_travel::Travel::from_env(&current_map.id, adapter.get_info(), &renderer.device)?;
+    // A surface retry must not consume a replay cut before it reaches a
+    // completed present. Normal interactive jump detection is unchanged.
+    let mut travel_cut_pending = false;
+    #[cfg(test)]
+    if let Some(dir) = smoke_travel {
+        let mut fixture = lighter_travel::Travel::open(
+            dir.join("travel.plan"),
+            dir.join("travel.csv"),
+            &current_map.id,
+            (LighterMode::Off, false),
+            adapter.get_info(),
+            &renderer.device,
+        )?;
+        if dir.join("motion-test").exists() {
+            fixture.enable_motion(dir.join("motion"))?;
+        }
+        if dir.join("sync-test").exists() {
+            fixture.enable_sync()?;
+        }
+        travel = Some(fixture);
+    }
     let mut keys = HashSet::new();
     let mut captured = false;
     // Winit sends Focused(true) when the visible window actually gains focus.
     // Start conservatively so input cannot move the camera before that event.
     let mut window_focused = false;
-    let mut world_loading_active = false;
     let mut world_loading_status = String::from("Preparing the selected world...");
     let mut world_change_notice = startup_notice;
     let mut world_change_error: Option<String> = None;
     let mut selected_world_ui = current_map.id.clone();
     let map_zone = current_map.id.clone();
-    let mut handoff_files: Option<crate::world_handoff::Files> = None;
-    let mut handoff_rx: Option<std::sync::mpsc::Receiver<crate::world_handoff::Message>> = None;
-    let mut handoff_ready_signaled = false;
+    let mut handoff: Option<WorldHandoff> = None;
+    let mut reload_requested = None;
+    let mut close_after_handoff = false;
+    let mut gpu_recovering = false;
+    #[cfg(test)]
+    let persist_reload = smoke_dir.is_none();
+    #[cfg(not(test))]
+    let persist_reload = true;
     let mut saved_settings = settings.clone();
     let mut last_settings_save = Instant::now();
     let mut last = Instant::now();
+    let mut gpu_retry_at = None;
+    let mut surface_needs_config = true;
+    let mut first_composition: Option<(Instant, LighterMode)> = None;
+    let mut viewer_shown = false;
+    let mut first_ray_preflight = false;
+    let mut first_draw_started = false;
+    let mut run_error = None;
+    let mut display_extent = (config.width, config.height);
+    let mut frame_capture = readback::ViewerCapture::default();
+    let native_travel_timer = travel
+        .as_ref()
+        .filter(|flight| flight.synchronized())
+        .and_then(|_| lighter_travel::NativeWorldTimer::new(&renderer.device));
+    let mut motion_capture = readback::Ring::default();
+    #[cfg(test)]
+    let mut smoke_frames = 0;
+    #[cfg(test)]
+    let smoke_deadline = Instant::now() + Duration::from_secs(185);
     let mut region_tick_ms = renderer.started.elapsed().as_millis() as u64;
     let mut last_minimap_key: Option<MinimapKey> = None;
+    first_frame_progress(&format!(
+        "Preparing the first world frame — {}…",
+        lighter_settings.mode.label()
+    ));
     event_loop
-        .run(move |event, target| match event {
+        .run(|event, target| {
+            // Hidden HWNDs need not receive WM_PAINT. Drive startup from a
+            // proxy wake until the first presentation, not a synthetic paint.
+            let event = match event {
+                Event::UserEvent(()) if !presented_once => Event::WindowEvent {
+                    window_id: window.id(),
+                    event: WindowEvent::RedrawRequested,
+                },
+                event => event,
+            };
+            let world_loading_active = handoff.is_some() || gpu_recovering;
+            match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => {
                 if world_loading_active && matches!(&event, WindowEvent::KeyboardInput { .. }) {
                     keys.clear();
@@ -5504,6 +6227,12 @@ pub fn run(
                     }
                 }
                 if let WindowEvent::KeyboardInput {ref event,..}=event {
+                    // F12 requests the next world image at the current render
+                    // extent (no UI). No readback is submitted by this event.
+                    if event.physical_key == PhysicalKey::Code(KeyCode::F12) && event.state == ElementState::Pressed && !event.repeat {
+                        let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                        frame_capture.requested = Some(crate::diagnostics::default_log_dir().join("screenshots").join(format!("world-{}-{}.png", std::process::id(), time.as_millis())));
+                    }
                     // F8 marks the spot: the pose goes into session.log and into
                     // every channel that is on, so a report has a position and a
                     // time instead of a description of one.
@@ -5542,7 +6271,15 @@ pub fn run(
                     if menu_page.is_open() && (response.consumed || matches!(event,WindowEvent::KeyboardInput{..})) && !matches!(event, WindowEvent::RedrawRequested | WindowEvent::Resized(_) | WindowEvent::CloseRequested | WindowEvent::Focused(_)) {return;}
                 }
                 match event {
-                WindowEvent::CloseRequested => { if let Err(e)=settings.save(){eprintln!("Settings save: {e}");} target.exit(); },
+                WindowEvent::CloseRequested => {
+                    if let Some(task) = &handoff {
+                        close_after_handoff = true;
+                        task.files.cancel();
+                    } else {
+                        if let Err(e) = settings.save() { eprintln!("Settings save: {e}"); }
+                        target.exit();
+                    }
+                }
                 WindowEvent::KeyboardInput { .. } => {}
                 WindowEvent::MouseWheel { delta, .. } if normal_input_allowed(window_focused, menu_page.is_open(), world_loading_active) && captured => {
                     let steps = match delta {
@@ -5571,6 +6308,11 @@ pub fn run(
                 }
                 WindowEvent::Focused(focused) => {
                     window_focused = focused;
+                    #[cfg(windows)]
+                    if focused && presented_once && maximize_after_startup {
+                        maximize_after_startup = false;
+                        if !settings.fullscreen { window.set_maximized(true); }
+                    }
                     // Clear on both gain and loss: a key released in another
                     // application never sends us its KeyUp event.
                     keys.clear();
@@ -5579,22 +6321,218 @@ pub fn run(
                         window.set_cursor_visible(true);
                         captured = false;
                     }
-                    if let Some(files) = &handoff_files {
-                        files.set_focused(focused);
+                    if let Some(task) = &handoff {
+                        task.files.set_focused(focused);
                     }
                 }
                 WindowEvent::Resized(s) if s.width > 0 && s.height > 0 => {
                     config.width = s.width;
                     config.height = s.height;
-                    if let Some(surface) = surface.as_ref() {
-                        surface.configure(&renderer.device, &config);
-                    }
-                    // Scaled world targets are reallocated by the next redraw,
-                    // which notices the new window extent (see below).
-                    if let Some(gamma)=display_gamma.as_mut() {gamma.resize(&renderer.device,s.width,s.height);}
-                    if let Some(encode)=present_encode.as_mut() {encode.resize(&renderer.device,s.width,s.height);}
+                    surface_needs_config = true;
+                    // Defer even the display targets to the guarded redraw.
+                    // A resize event can arrive on an already-lost device.
                 }
                 WindowEvent::RedrawRequested => {
+                    if gpu_recovering || gpu_loss.pending() || gpu_retry_at.is_some_and(|at| Instant::now() < at) { return; }
+                    gpu_loss.guard_frame(|| {
+                    let redraw_started = Instant::now();
+                    let queue_idle = renderer.device.poll(wgpu::Maintain::Poll).is_queue_empty();
+                    if gpu_loss.pending() { return; }
+                    frame_capture.collect();
+                    if let Some((submitted, drawn_mode)) = first_composition {
+                        if submitted.elapsed() >= crate::world_handoff::FIRST_FRAME_TIMEOUT {
+                            run_error = Some("Timed out waiting to present the first world frame. See the last Viewer startup stage in session.log.".into());
+                            target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                            target.exit();
+                            return;
+                        }
+                        if !queue_idle {
+                            gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                            return;
+                        }
+                        #[cfg(test)]
+                        if let Some(dir) = smoke_dir.filter(|_| (smoke_reload || smoke_sdk.is_some()) && restoring.is_some()) {
+                            let capture = if smoke_reload { "reload-software.png" } else { "recovered-sdk.png" };
+                            if image::open(dir.join(capture)).is_err() {
+                                gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                return;
+                            }
+                        }
+                        if display_extent != (config.width, config.height) {
+                            // A resize before the first present invalidates the
+                            // one-to-one copy. Recompose with the new extent.
+                            first_composition = None;
+                        } else {
+                            if !viewer_shown {
+                                #[cfg(test)]
+                                if smoke_dir.is_some() {
+                                    assert_ne!(window.is_visible(), Some(true), "viewer was exposed before its first frame");
+                                }
+                                first_frame_progress("First frame finished on the GPU; opening the swapchain…");
+                                window.set_visible(true);
+                                viewer_shown = true;
+                            }
+                            let active_surface = surface.as_ref().expect("startup uses the standard swapchain");
+                            if surface_needs_config {
+                                active_surface.configure(&renderer.device, &config);
+                                surface_needs_config = false;
+                            }
+                            let frame = match active_surface.get_current_texture() {
+                                Ok(frame) => frame,
+                                Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                                    surface_needs_config = true;
+                                    gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                    return;
+                                }
+                                Err(wgpu::SurfaceError::Timeout) => {
+                                    gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                    return;
+                                }
+                                Err(wgpu::SurfaceError::OutOfMemory) => {
+                                    run_error = Some("Out of memory acquiring the first world frame.".into());
+                                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                                    target.exit();
+                                    return;
+                                }
+                            };
+                            let view = frame.texture.create_view(&Default::default());
+                            present_encode.as_ref().unwrap().present(&renderer.device, &renderer.queue, &view);
+                            window.pre_present_notify();
+                            frame.present();
+                            if gpu_loss.pending() { return; }
+                            first_composition = None;
+                            presented_once = true;
+                            last = Instant::now();
+                            if !crate::color_chain::present_encode_required(surface_format.is_srgb()) { present_encode = None; }
+                            #[cfg(windows)]
+                            {
+                                drop(loading.take());
+                                if maximize_after_startup && (!handoff_child || window_focused) {
+                                    maximize_after_startup = false;
+                                    if !settings.fullscreen { window.set_maximized(true); }
+                                }
+                            }
+                            startup_progress(&format!("Presented the first world frame — {} ({})", current_map.id, drawn_mode.label()));
+                            if handoff_child {
+                                // The old process may activate this HWND only
+                                // after a real world frame, never during boot.
+                                if let Ok(hwnd) = window_hwnd(&window) {
+                                    crate::world_handoff::publish_window_handle(hwnd as usize);
+                                }
+                            }
+                            #[cfg(test)]
+                            if let (Some(dir), Some(snapshot)) = (smoke_dir, restoring.as_ref()) {
+                                assert_eq!(snapshot.view[5], 7.5);
+                                assert_eq!(snapshot.lighter.resolution, smoke_resolution);
+                                assert_eq!(snapshot.lighter.mode, smoke_mode);
+                                assert_eq!(snapshot.view, [camera.pos.x, camera.pos.y, camera.pos.z, camera.yaw, camera.pitch, camera.time_of_day]);
+                                assert_eq!(snapshot.lighter, renderer.lighter.settings);
+                                assert_eq!(snapshot.lighter.mode, drawn_mode);
+                                assert_eq!(smoke_reload, snapshot.kind == recovery::RestoreKind::Reload);
+                                if let Some(provider) = smoke_sdk {
+                                    assert_eq!(renderer.lighter.reconstruction_status(), Some(provider), "restored window fell back from SDK");
+                                    std::fs::write(dir.join("restored-provider"), provider).unwrap();
+                                }
+                                std::fs::write(dir.join("restored-present"), std::process::id().to_string()).unwrap();
+                            }
+                            if handoff_child { crate::world_handoff::signal_ready(); }
+                            #[cfg(test)]
+                            if smoke_dir.is_some() && smoke_travel.is_none() {
+                                if restoring.is_some() {
+                                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                                    target.exit();
+                                } else if !smoke_reload {
+                                    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(smoke_resize_extent.0, smoke_resize_extent.1));
+                                }
+                            }
+                            return;
+                        }
+                    }
+                    #[cfg(test)]
+                    if smoke_travel.is_some() {
+                        assert!(Instant::now() < smoke_deadline, "viewer did not finish travel capture");
+                    }
+                    #[cfg(test)]
+                    if let Some(dir) = smoke_dir.filter(|_| smoke_travel.is_none()) {
+                        assert!(Instant::now() < smoke_deadline, "viewer did not finish live frame checks");
+                        if smoke_reload && restoring.is_none() && presented_once {
+                            if smoke_frames == 1 && image::open(dir.join("0.png")).is_ok() {
+                                assert_eq!(renderer.lighter.settings.mode, LighterMode::Off);
+                                assert!(!renderer.lighter.armed(), "normal opening compiled the saved ray renderer");
+                                camera.yaw = 0.1;
+                                settings.time_of_day = 7.5;
+                                camera.time_of_day = settings.time_of_day;
+                                if smoke_sdk.is_some() {
+                                    reload_requested = Some(LighterSettings { mode: smoke_mode, resolution: smoke_resolution, ..renderer.lighter.settings });
+                                    smoke_frames = 6;
+                                } else {
+                                    reload_requested = Some(LighterSettings { mode: LighterMode::Hardware, resolution: 61, ..renderer.lighter.settings });
+                                    smoke_frames = 2;
+                                }
+                                menu_page = MenuPage::Modules;
+                                return;
+                            }
+                            if smoke_frames == 2 && !world_loading_active {
+                                let reason = world_change_error.as_deref().expect("unsupported hardware reload was not rejected");
+                                assert!(reason.contains("ray-query support"), "{reason}");
+                                assert_eq!(settings.selected_world, current_map.id);
+                                assert_eq!(menu_page, MenuPage::Modules);
+                                assert_eq!(renderer.lighter.settings.mode, LighterMode::Off);
+                                assert!(!dir.join("restored-present").exists());
+                                frame_capture.requested = Some(dir.join("after-failed-reload.png"));
+                                smoke_frames = 3;
+                            }
+                            if smoke_frames == 3 && image::open(dir.join("after-failed-reload.png")).is_ok() {
+                                std::fs::write(dir.join("stall-ray-reload"), []).unwrap();
+                                reload_requested = Some(LighterSettings { mode: LighterMode::Software, resolution: 61, ..renderer.lighter.settings });
+                                smoke_frames = 4;
+                                return;
+                            }
+                            if smoke_frames == 4 && !world_loading_active {
+                                let reason = world_change_error.as_deref().expect("blocked ray reload was not timed out");
+                                assert!(reason.contains("timed out waiting for its first frame") && reason.contains("ray pipeline"), "{reason}");
+                                assert_eq!(renderer.lighter.settings.mode, LighterMode::Off);
+                                assert!(!dir.join("restored-present").exists());
+                                std::fs::remove_file(dir.join("stall-ray-reload")).unwrap();
+                                frame_capture.requested = Some(dir.join("after-stalled-reload.png"));
+                                smoke_frames = 5;
+                            }
+                            if smoke_frames == 5 && image::open(dir.join("after-stalled-reload.png")).is_ok() {
+                                reload_requested = Some(LighterSettings { mode: LighterMode::Software, resolution: 61, ..renderer.lighter.settings });
+                                smoke_frames = 6;
+                                return;
+                            }
+                        }
+                        if !smoke_reload && restoring.is_none() && smoke_frames == 4 && (0..4).all(|i| image::open(dir.join(format!("{i}.png"))).is_ok()) {
+                            assert!(presented_once);
+                            assert!(renderer.lighter.error().is_none(), "{:?}", renderer.lighter.error());
+                            if !queue_idle {
+                                gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                return;
+                            }
+                            // Distinct from both the startup camera and saved
+                            // defaults so a child ignoring the snapshot fails.
+                            camera.time_of_day = 7.5;
+                            if smoke_sdk.is_some() {
+                                // The raw SDK queue work isn't owned by wgpu's fence tracker.
+                                if !renderer.lighter.poll_hardware().unwrap() {
+                                    gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                    return;
+                                }
+                            }
+                            renderer.lighter.settings.resolution = smoke_resolution;
+                            renderer.device.destroy();
+                            renderer.device.poll(wgpu::Maintain::Poll);
+                            assert!(gpu_loss.pending(), "explicit destroy missed device-loss callback");
+                            return;
+                        }
+                    }
+                    // Keep the CPU adapter's queue bounded, without holding
+                    // the event loop until the previous present finishes.
+                    if software_adapter && !queue_idle {
+                        gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                        return;
+                    }
                     // Reflex pacing first: everything below belongs to the
                     // frame the CPU is only allowed to start now.
                     if let Some(pacer) = reflex.as_mut() {
@@ -5617,8 +6555,97 @@ pub fn run(
                     let wanted_present_mode = settings.latency.present_mode();
                     if config.present_mode != wanted_present_mode {
                         config.present_mode = wanted_present_mode;
+                        surface_needs_config = true;
+                    }
+                    if surface_needs_config && presented_once {
                         if let Some(active_surface) = surface.as_ref() {
+                            // wgpu may synchronously drain outstanding work
+                            // inside configure. Defer rather than stall for it.
+                            let native_idle = match renderer.lighter.poll_hardware() {
+                                Ok(idle) => idle,
+                                Err(error) => {
+                                    if recovery::lost_error(&error) {
+                                        gpu_loss.report(error);
+                                        return;
+                                    }
+                                    renderer.lighter.fail_frame(error);
+                                    true
+                                }
+                            };
+                            if !queue_idle || !native_idle {
+                                gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                return;
+                            }
                             active_surface.configure(&renderer.device, &config);
+                        }
+                        surface_needs_config = false;
+                    }
+                    if display_extent != (config.width, config.height) {
+                        display_extent = (config.width, config.height);
+                        if let Some(gamma) = display_gamma.as_mut() { gamma.resize(&renderer.device, config.width, config.height); }
+                        if let Some(encode) = present_encode.as_mut() { encode.resize(&renderer.device, config.width, config.height); }
+                    }
+                    // Install Native and ray snapshots together before choosing
+                    // the route, so failure or recovery cannot disagree with
+                    // the swapchain, upscaler or geometry used by this redraw.
+                    if streaming {
+                        if pending_mesh.is_none() {
+                            match result_rx.try_recv() {
+                                Ok(Ok(mesh)) => pending_mesh = Some(mesh),
+                                Ok(Err(e)) => {
+                                    eprintln!("Streaming error: {e}");
+                                    target.exit(); return;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    eprintln!("World streaming worker exited");
+                                    target.exit(); return;
+                                }
+                            }
+                        }
+                        match renderer.update_mesh(&mut pending_mesh) {
+                            Ok(true) => { streaming = false; stream_commit_pending = travel.is_some(); }
+                            Ok(false) => {},
+                            Err(e) if recovery::lost_error(&e) => {
+                                gpu_loss.report(e);
+                                return;
+                            }
+                            Err(e) => {
+                                eprintln!("Terrain residency upload failed: {e}");
+                                target.exit(); return;
+                            }
+                        }
+                    }
+                    if gpu_loss.pending() { return; }
+                    let rt_extent = (config.width.min(max_texture_dimension), config.height.min(max_texture_dimension));
+                    if renderer.renders_rays() {
+                        if !presented_once && !first_ray_preflight {
+                            first_ray_preflight = true;
+                            first_frame_progress(&format!("Preparing Lighter ray pipeline and buffers — {}…", renderer.lighter.settings.mode.label()));
+                            #[cfg(test)]
+                            if smoke_dir.is_some_and(|dir| dir.join("stall-ray-reload").exists())
+                                && restoring.is_some()
+                                && renderer.lighter.settings.mode == LighterMode::Software
+                            {
+                                // Simulate a synchronous driver call. Only the
+                                // parent watcher can time this out; no events run here.
+                                std::thread::sleep(Duration::from_secs(90));
+                                panic!("the parent should have killed the stalled reload");
+                            }
+                        }
+                        match renderer.lighter.prepare_window_frame(&renderer.device, rt_extent.0, rt_extent.1, !presented_once) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                return;
+                            }
+                            Err(error) => {
+                                if recovery::lost_error(&error) {
+                                    gpu_loss.report(error);
+                                    return;
+                                }
+                                renderer.lighter.fail_frame(error);
+                            }
                         }
                     }
                     // One place handles both a window resize and a Graphics-tab
@@ -5626,7 +6653,13 @@ pub fn run(
                     let slider_extent = crate::render_scale::scaled_extent(config.width, config.height, settings.resolution_scale, max_texture_dimension);
                     settings.upscale_quality =
                         crate::nearest_available(settings.upscaling, settings.upscale_quality);
-                    let wanted_extent = crate::render_extent(slider_extent, (config.width, config.height), max_texture_dimension, settings.upscaling, settings.upscale_quality, &gpu_facts, &sdk_report);
+                    let ray_world = renderer.renders_rays();
+                    let wants_rays = renderer.lighter.armed() && renderer.lighter.requested()
+                        && renderer.lighter_feed.is_some();
+                    let extent_upscaling = if ray_world {
+                        crate::UpscaleMethod::Off
+                    } else { settings.upscaling };
+                    let wanted_extent = crate::render_extent(slider_extent, (config.width, config.height), max_texture_dimension, extent_upscaling, settings.upscale_quality, &gpu_facts, &sdk_report);
                     applied_extent = wanted_extent;
                     // Recreate the FSR context lazily; a pure window resize
                     // can move the display extent even when the render
@@ -5640,7 +6673,7 @@ pub fn run(
                             fsr_upscaler = None;
                         }
                     }
-                    let want_fsr = settings.upscaling.is_ffx_fsr()
+                    let want_fsr = presented_once && !ray_world && settings.upscaling.is_ffx_fsr()
                         && !fsr_failed
                         && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
                     if want_fsr && fsr_upscaler.is_none() {
@@ -5683,7 +6716,7 @@ pub fn run(
                         dlss_failed = false;
                         dlss_fail_reason = None;
                     }
-                    let want_xess = settings.upscaling == crate::UpscaleMethod::Xess
+                    let want_xess = presented_once && !ray_world && settings.upscaling == crate::UpscaleMethod::Xess
                         && !xess_failed
                         && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
                     if want_xess && xess_upscaler.is_none() {
@@ -5720,7 +6753,7 @@ pub fn run(
                     // spend the retry budget or to record a failure the user
                     // would then read in the Graphics tab.
                     let dlss_window_big_enough = config.width >= 32 && config.height >= 32;
-                    let want_dlss = settings.upscaling == crate::UpscaleMethod::Dlss
+                    let want_dlss = presented_once && !ray_world && settings.upscaling == crate::UpscaleMethod::Dlss
                         && !dlss_failed
                         && dlss_window_big_enough
                         && crate::support(settings.upscaling, &gpu_facts, &sdk_report).is_available();
@@ -5750,7 +6783,7 @@ pub fn run(
                     let upscaler_running = fsr_upscaler.is_some()
                         || xess_upscaler.is_some()
                         || dlss_upscaler.is_some()
-                        || (settings.upscaling == crate::UpscaleMethod::Fsr1
+                        || (extent_upscaling == crate::UpscaleMethod::Fsr1
                             && crate::fsr1_eligible(applied_extent, (config.width, config.height)));
                     // DLSS evaluates at the render size NGX's optimal settings
                     // returned, which is not necessarily the settings table's
@@ -5760,7 +6793,9 @@ pub fn run(
                         .as_ref()
                         .map(|dlss| dlss.render_extent())
                         .unwrap_or(applied_extent);
-                    let wanted_world = if upscaler_running {
+                    let wanted_world = if ray_world {
+                        rt_extent
+                    } else if upscaler_running {
                         live_extent
                     } else {
                         slider_extent
@@ -5843,7 +6878,7 @@ pub fn run(
                     };
                     // Frame generation transitions (enable / disable / extent
                     // change). Runs before any surface access this frame.
-                    let want_fg = settings.frame_generation == crate::FrameGenMethod::Fsr
+                    let want_fg = !ray_world && settings.frame_generation == crate::FrameGenMethod::Fsr
                         && presented_once
                         && !fg_failed
                         && crate::support_framegen(
@@ -5870,7 +6905,7 @@ pub fn run(
                     }
                     // XeSS Frame Generation transitions (enable / disable /
                     // extent change). Same one-swapchain-per-hwnd rule.
-                    let want_xess_fg = settings.frame_generation == crate::FrameGenMethod::Xess
+                    let want_xess_fg = !ray_world && settings.frame_generation == crate::FrameGenMethod::Xess
                         && presented_once
                         && !xess_fg_failed
                         && crate::support_framegen(
@@ -5940,7 +6975,7 @@ pub fn run(
                     }
                     // DLSS Frame Generation. Same one-swapchain-per-hwnd rule as
                     // the other two: the wgpu surface is dropped first.
-                    let want_dlss_fg = settings.frame_generation
+                    let want_dlss_fg = !ray_world && settings.frame_generation
                         == crate::FrameGenMethod::Dlss
                         && presented_once
                         && !dlss_fg_failed
@@ -6058,7 +7093,7 @@ pub fn run(
                     // Generation, or does not run it at all.
                     // Only XeLL creates a context; Reflex is the viewer's own
                     // pacer and never touches `libxell.dll`.
-                    let want_latency = matches!(
+                    let want_latency = presented_once && matches!(
                         crate::latency_owner(settings.latency, settings.frame_generation),
                         crate::LatencyOwner::Independent
                     ) && settings.latency == crate::LatencyMode::Xell
@@ -6073,7 +7108,7 @@ pub fn run(
                     // Graphics -> Latency -> Reflex: pure CPU pacing, so it is
                     // created whenever the mode is selected and needs no
                     // capability probe or failure path.
-                    if settings.latency == crate::LatencyMode::Reflex {
+                    if presented_once && settings.latency == crate::LatencyMode::Reflex {
                         if reflex.is_none() {
                             // Seeded at 60 Hz and re-learned from the present
                             // timestamps within a few frames, so this needs no
@@ -6093,6 +7128,13 @@ pub fn run(
                         // swapchain is untouched, so nothing else changes.
                         latency = None;
                     } else if latency.is_none() {
+                        // XeLL's one-time initialization requires an idle
+                        // device. Stop feeding frames until a later poll says
+                        // it is idle, rather than waiting inside the SDK setup.
+                        if !renderer.device.poll(wgpu::Maintain::Poll).is_queue_empty() {
+                            gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                            return;
+                        }
                         match crate::latency::LatencySession::new(
                             &renderer.device,
                             &settings.upscale_sdk_dir,
@@ -6107,6 +7149,29 @@ pub fn run(
                             }
                         }
                     }
+                    let travel_pose = travel.as_mut().and_then(|flight| {
+                        let selected = renderer.lighter.settings.mode;
+                        let drawn = if ray_world { selected } else { LighterMode::Off };
+                        let pose = flight.apply(presented_once, drawn, selected)?;
+                        if settings.upscaling != crate::UpscaleMethod::Off || settings.frame_generation != crate::FrameGenMethod::Off {
+                            flight.invalidate("disable the Graphics-tab upscaler and frame generation for a normal-present trace");
+                            return None;
+                        }
+                        if ray_world && renderer.lighter.settings.dynamic_resolution {
+                            flight.invalidate("disable Lighter adaptive resolution for a matched travel trace");
+                            return None;
+                        }
+                        Some(pose)
+                    });
+                    if let Some(([x,y,z,yaw,pitch], _)) = travel_pose {
+                        camera.pos = Vec3::new(x,y,z);
+                        camera.yaw = yaw;
+                        camera.pitch = pitch;
+                        menu_page = MenuPage::Closed;
+                        renderer.capture_elapsed_ms.get_or_insert(0);
+                    } else if travel.is_some() {
+                        renderer.capture_elapsed_ms = None;
+                    }
                     // Any discontinuous camera move invalidates the upscaler
                     // history. Position alone is not enough: a respawn that keeps
                     // the position, a look-behind snap or a cut that turns the
@@ -6119,7 +7184,8 @@ pub fn run(
                     // without resetting on ordinary fast play.
                     let turned = last_fsr_camera_dir.dot(camera.direction()) < 0.866_025_4;
                     let camera_jumped = camera.pos.distance_squared(last_fsr_camera_pos) > 64.0 * 64.0
-                        || turned;
+                        || turned || (travel_pose.is_some() && travel_cut_pending);
+                    travel_cut_pending = travel_pose.is_some() && camera_jumped;
                     if camera_jumped {
                         if let Some(fsr) = fsr_upscaler.as_mut() {
                             fsr.reset_history();
@@ -6133,7 +7199,7 @@ pub fn run(
                     }
                     last_fsr_camera_pos = camera.pos;
                     last_fsr_camera_dir = camera.direction();
-                    if settings != saved_settings && last_settings_save.elapsed().as_secs_f32() >= 1. {
+                    if persist_reload && presented_once && !world_loading_active && settings != saved_settings && last_settings_save.elapsed().as_secs_f32() >= 1. {
                         if let Err(e)=settings.save(){eprintln!("Settings save: {e}");} else {saved_settings=settings.clone();}
                         last_settings_save=Instant::now();
                     }
@@ -6141,8 +7207,8 @@ pub fn run(
                     last = Instant::now();
                     // Add-ons get an optional camera-owner hook. `None` leaves
                     // the original free-flight controls completely untouched.
-                    let input_allowed = normal_input_allowed(
-                        window_focused,
+                    let input_allowed = travel_pose.is_none() && normal_input_allowed(
+                        presented_once && window_focused,
                         menu_page.is_open(),
                         world_loading_active,
                     );
@@ -6150,7 +7216,7 @@ pub fn run(
                     let active_keys: &HashSet<KeyCode> =
                         if input_allowed { &keys } else { &empty_keys };
                     let addon_camera = renderer.modules.update(dt, input_allowed, active_keys, camera.yaw, camera.pitch, camera.pos);
-                    renderer.modules.update_walker_audio(settings.effects_enabled, settings.effects_volume);
+                    if presented_once { renderer.modules.update_walker_audio(settings.effects_enabled, settings.effects_volume); }
                     if input_allowed && addon_camera.is_some() {
                         camera.pos = addon_camera.unwrap();
                     } else if input_allowed {
@@ -6193,28 +7259,6 @@ pub fn run(
                     if active_keys.contains(&KeyCode::ArrowDown) {
                         camera.pitch = (camera.pitch - dt).max(-1.5)
                     }
-                    if streaming {
-                        match result_rx.try_recv() {
-                            Ok(Ok(mesh)) => {
-                                if let Err(e) = renderer.update_mesh(mesh) {
-                                    eprintln!("Terrain residency upload failed: {e}");
-                                    target.exit(); return;
-                                }
-                                streaming = false;
-                            }
-                            Ok(Err(e)) => {
-                                eprintln!("Streaming error: {e}");
-                                target.exit();
-                                return;
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                eprintln!("World streaming worker exited");
-                                target.exit();
-                                return;
-                            }
-                        }
-                    }
                     // `0x77e360` runs for every resident block on every frame and
                     // the window origin follows the camera's block, so re-select
                     // both per frame and rebuild only when the drawn mesh would
@@ -6240,12 +7284,16 @@ pub fn run(
                     // atlases nothing samples. Crossing into or out of that
                     // state changes what the mesh should contain, so it is part
                     // of the staleness test and not just of the request.
-                    let skip_local_scenery = renderer.world_done;
+                    let skip_local_scenery = renderer.world_done && !wants_rays;
                     let stale = match &aim {
                         Some(aim) => {
                             aim != &renderer.lod
                                 || renderer.detail != settings.detail
                                 || renderer.local_scenery_skipped != skip_local_scenery
+                                // A clamped terrain window and its LODs may
+                                // hold steady across a block crossing. The ray
+                                // scenery range still has to follow the eye.
+                                || (wants_rays && renderer.center != camera_block(width, height, spacing, [camera.pos.x, camera.pos.z]))
                         }
                         None => false,
                     };
@@ -6264,18 +7312,25 @@ pub fn run(
                         }
                         streaming = true;
                     }
-                    music.update(settings.music_enabled,settings.music_volume,camera.pos.x,camera.pos.z);
-                    ambience.update(settings.ambience_enabled,settings.sound_volume,camera.pos.x,camera.pos.z,crate::environment::daylight(settings.time_of_day)<0.5);
-                    world_audio.update(settings.effects_enabled,settings.effects_volume,camera.pos.to_array(),camera.yaw,crate::environment::night_factor(settings.time_of_day));
+                    if presented_once {
+                        music.update(settings.music_enabled,settings.music_volume,camera.pos.x,camera.pos.z);
+                        ambience.update(settings.ambience_enabled,settings.sound_volume,camera.pos.x,camera.pos.z,crate::environment::daylight(settings.time_of_day)<0.5);
+                        world_audio.update(settings.effects_enabled,settings.effects_volume,camera.pos.to_array(),camera.yaw,crate::environment::night_factor(settings.time_of_day));
+                    }
                     if zone_check.elapsed()>=std::time::Duration::from_millis(350){
                         zone_check=Instant::now();let zone=ui_zones.as_ref().and_then(|z|z.find(camera.pos.x,camera.pos.z));
                         if (!zone_initialized || zone!=last_zone) && settings.show_zone_entry {if let Some(i)=zone {if let Some(db)=&ui_zones {let name=db.zones[i].name.trim();if !name.is_empty(){zone_banner=Some((name.to_string(),Instant::now()));}}}}
                         zone_initialized=true;last_zone=zone;
                     }
                     if !settings.show_zone_entry {zone_banner=None;}
-                    if settings.fullscreen!=fullscreen_applied {window.set_fullscreen(if settings.fullscreen{Some(Fullscreen::Borderless(window.current_monitor()))}else{None});fullscreen_applied=settings.fullscreen;}
+                    if presented_once && (!handoff_child || window_focused) && settings.fullscreen!=fullscreen_applied {window.set_fullscreen(if settings.fullscreen{Some(Fullscreen::Borderless(window.current_monitor()))}else{None});fullscreen_applied=settings.fullscreen;}
 
-                    let want_world=settings.whole_world && !settings.detail.terrain_cutoff && !renderer.detail.terrain_cutoff;
+                    // Don't tear down the only copy of the scenery while a
+                    // ray-enabled local mesh is still on the streaming worker.
+                    // Keep the resident Native fallback available thereafter.
+                    let keep_world_pages = renderer.world_done && renderer.local_scenery_skipped;
+                    let want_world=presented_once && settings.whole_world && (!wants_rays || keep_world_pages)
+                        && !settings.detail.terrain_cutoff && !renderer.detail.terrain_cutoff;
                     if want_world != world_enabled {
                         world_enabled=want_world;
                         if let Some(c)=world_cancel.take(){c.store(true,std::sync::atomic::Ordering::Relaxed);}
@@ -6288,7 +7343,7 @@ pub fn run(
                             let c=cancel.clone();let root=whole_element.clone();let ornaments=whole_ornaments.clone();
                             std::thread::Builder::new().name("whole-world-objects".into()).spawn(move ||crate::world_objects::build(root,ornaments,tx,c)).expect("world preload thread");
                             world_rx=Some(rx);world_cancel=Some(cancel);world_started_at=Some(std::time::Instant::now());world_last_log_at=std::time::Instant::now();world_last_logged_pages=0;world_status=String::from("Loading world objects...");
-                        } else {world_started_at=None;world_status=String::from("Off");}
+                        } else {world_started_at=None;world_status=String::from(if wants_rays { "Paused by Lighter (separate ray residency)" } else { "Off" });}
                     }
                 if let Some(rx) = &world_rx {
                     // Favor completing the explicitly requested whole-world
@@ -6352,6 +7407,7 @@ pub fn run(
                                 renderer.local_pages.shrink_to_fit();
                                 renderer.local_page_keys.clear();
                                 renderer.world_done = true;
+                                renderer.local_scenery_skipped = true;
                                 let elapsed = world_started_at
                                     .take()
                                     .map(|started| started.elapsed().as_secs_f64());
@@ -6397,7 +7453,7 @@ pub fn run(
                     // time. `sky_time::advance` is 1/600 authored hour per real
                     // second at 1x, which is `CECSunMoon::Tick`'s
                     // 1/14,400,000-per-millisecond day fraction.
-                    if settings.time_pass_enabled {
+                    if presented_once && !world_loading_active && settings.time_pass_enabled && travel_pose.is_none() {
                         settings.time_of_day = crate::sky_time::advance(
                             settings.time_of_day,
                             dt,
@@ -6410,7 +7466,7 @@ pub fn run(
                     // without a restart. (The terrain half is decided when the
                     // world loads.)
                     crate::objects::set_unbounded_textures(settings.all_to_vram);
-                    camera.time_of_day = settings.time_of_day;
+                    camera.time_of_day = travel_pose.map_or(settings.time_of_day, |(_, hour)| hour);
                     camera.tree_wind_strength=settings.tree_wind_strength;camera.client_tree_wind_preview=settings.client_tree_wind_preview;camera.grass_wind_enabled=settings.grass_wind_enabled;camera.grass_wind_amplitude=settings.grass_wind_amplitude;
                     camera.regional_tree_lighting=settings.regional_tree_lighting;
                     camera.grass_distance_fade=settings.grass_distance_fade;
@@ -6451,7 +7507,9 @@ pub fn run(
                     camera.model_backface_culling=settings.model_backface_culling;
                     camera.underwater_depth=water_depth(&water_areas,camera.pos);
                     let region_tick = renderer.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                    let region_delta = crate::environment::frame_ms(region_tick.saturating_sub(region_tick_ms));
+                    let region_delta = if travel_pose.is_some() { 16 } else {
+                        crate::environment::frame_ms(region_tick.saturating_sub(region_tick_ms))
+                    };
                     region_tick_ms = region_tick;
                     camera.logic_delta_ms = region_delta;
                     let legacy_fog=fog_transition.update_ms(&environments,camera.pos.to_array(),camera.time_of_day,region_delta);
@@ -6472,7 +7530,8 @@ pub fn run(
                         std::thread::spawn(move || {let _=tx.send(crate::navigation::original_map_for_map(&root,&zone));});
                         original_map_rx=Some(rx);
                     }
-                    if settings.minimap_style==MapStyle::Original && !original_minimap_requested {
+                    let show_minimap = presented_once && settings.show_minimap;
+                    if presented_once && settings.minimap_style==MapStyle::Original && !original_minimap_requested {
                         original_minimap_requested=true;
                         let root=whole_element.clone();let zone=map_zone.clone();let (tx,rx)=std::sync::mpsc::channel();
                         std::thread::spawn(move || {let _=tx.send(crate::navigation::original_minimap_for_map(&root,&zone));});
@@ -6489,7 +7548,8 @@ pub fn run(
                     // Acquire the frame. Frame generation owns presentation:
                     // no wgpu swapchain exists in that mode, so there is
                     // nothing to acquire — the pipeline presents instead.
-                    let frame = if framegen.is_some()
+                    let acquire_started = travel_pose.map(|_| Instant::now());
+                    let frame = if !presented_once || framegen.is_some()
                         || xess_framegen.is_some()
                         || dlss_framegen.is_some()
                     {
@@ -6498,7 +7558,7 @@ pub fn run(
                         match active_surface.get_current_texture() {
                             Ok(frame) => Some(frame),
                             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                                active_surface.configure(&renderer.device, &config);
+                                surface_needs_config = true;
                                 None
                             }
                             Err(wgpu::SurfaceError::OutOfMemory) => {
@@ -6514,7 +7574,8 @@ pub fn run(
                         eprintln!("surface: presentation unavailable (no swapchain)");
                         None
                     };
-                    if framegen.is_some() || xess_framegen.is_some() || dlss_framegen.is_some() || frame.is_some() {
+                    let acquire_ms = acquire_started.map_or(0., |t| t.elapsed().as_secs_f64() * 1000.);
+                    if !presented_once || framegen.is_some() || xess_framegen.is_some() || dlss_framegen.is_some() || frame.is_some() {
                             let surface_view = frame
                                 .as_ref()
                                 .map(|frame| frame.texture.create_view(&Default::default()));
@@ -6572,19 +7633,14 @@ pub fn run(
                             let ui_only_view = dlss_framegen
                                 .as_ref()
                                 .and_then(|fg| fg.ui_only_view());
-                            let final_view: &wgpu::TextureView = match fg_views.as_ref() {
-                                Some((compose, _)) => compose,
-                                None => surface_view
-                                    .as_ref()
-                                    .expect("a frame exists whenever the frame generation pipeline does not"),
-                            };
+                            let final_view = fg_views.as_ref().map(|(compose, _)| compose).or(surface_view.as_ref());
                             let mut ui_visible = false;
                             // Composition target: the whole-frame gamma intermediate, else the
                             // present-encode intermediate, else the final target. This is
                             // always the full window resolution: UI and the final present chain
                             // stay sharp regardless of the 3D resolution scale.
                             let composed_view=if whole_frame_gamma {Some(display_gamma.as_ref().unwrap().view())} else if let Some(encode)=present_encode.as_ref() {Some(encode.view())} else {None};
-                            let scene_view=composed_view.as_ref().unwrap_or(final_view);
+                            let scene_view=composed_view.as_ref().or(final_view).expect("a composition target");
                             // Draw the world into the scaled offscreen target, then bilinearly
                             // present it into `scene_view` before the UI pass loads that result.
                             let world_view = render_scale.view();
@@ -6633,7 +7689,19 @@ pub fn run(
                                 .or_else(|| xess_upscaler.as_ref().map(|xess| xess.jitter()))
                                 .or_else(|| dlss_upscaler.as_ref().map(|dlss| dlss.jitter()))
                                 .unwrap_or((0.0, 0.0));
-                            renderer.render(
+                            if !presented_once && !first_draw_started {
+                                first_draw_started = true;
+                                first_frame_progress(if renderer.renders_rays() { "Drawing the first ray-traced world frame…" } else { "Drawing the first Native world frame…" });
+                            }
+                            let drawn_pose = travel_pose.map(|_| [camera.pos.x,camera.pos.y,camera.pos.z,camera.yaw,camera.pitch]);
+                            let native_timer = native_travel_timer.as_ref().filter(|_| {
+                                !ray_world && drawn_pose.is_some()
+                                    && travel.as_ref().is_some_and(|flight| flight.synchronized())
+                            });
+                            if let Some(timer) = native_timer {
+                                timer.stamp(&renderer.device, &renderer.queue, false);
+                            }
+                            let world_ready = renderer.render(
                                 &world_view,
                                 &world_raw_view,
                                 world_matrix,
@@ -6642,6 +7710,55 @@ pub fn run(
                                 world_extent.1,
                                 camera_jumped,
                             );
+                            if let Some(error) = renderer.lighter.error().filter(|e| recovery::lost_error(e)) {
+                                gpu_loss.report(error.to_owned());
+                            }
+                            if gpu_loss.pending() { return; }
+                            if let Some(snapshot) = restoring.as_ref().filter(|s| !presented_once && s.kind == recovery::RestoreKind::Reload) {
+                                // Native is usable on startup or device recovery,
+                                // but cannot satisfy an explicit ray reload.
+                                let fallback = snapshot.lighter.mode != LighterMode::Off && !renderer.renders_rays();
+                                if let Some(error) = renderer.lighter.error().or_else(|| fallback.then_some("The requested ray renderer did not draw the world.")) {
+                                    run_error = Some(format!("{}: {error}", snapshot.kind.label()));
+                                    renderer.lighter.retire_failed_start();
+                                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                                    target.exit();
+                                    return;
+                                }
+                            }
+                            if !world_ready {
+                                // Drop this swapchain image rather than passing
+                                // an unwritten/stale target to capture or present.
+                                if let Some(session) = latency.as_mut() { session.render_submit_end(); }
+                                gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                return;
+                            }
+                            if let Some(timer) = native_timer {
+                                timer.stamp(&renderer.device, &renderer.queue, true);
+                            }
+                            if !presented_once {
+                                first_frame_progress("Compositing the first world frame and interface…");
+                            }
+                            #[cfg(test)]
+                            if let Some(dir) = smoke_dir.filter(|_| smoke_travel.is_none()) {
+                                if let Some(provider) = smoke_sdk.filter(|_| !smoke_reload || restoring.is_some()) {
+                                    assert!(renderer.renders_rays(), "SDK fixture did not draw rays");
+                                    assert_eq!(renderer.lighter.reconstruction_status(), Some(provider), "fixture requires real windowed SDK dispatch");
+                                }
+                                if restoring.is_none() && (smoke_frames == 0 || !smoke_reload && (1..4).contains(&smoke_frames) && world_extent == smoke_resize_extent) {
+                                    frame_capture.requested = Some(dir.join(format!("{smoke_frames}.png")));
+                                    smoke_frames += 1;
+                                } else if restoring.is_some() && !presented_once {
+                                    if smoke_reload {
+                                        assert_eq!(renderer.lighter.settings.mode, smoke_mode);
+                                        assert!(renderer.renders_rays());
+                                        frame_capture.requested = Some(dir.join("reload-software.png"));
+                                    } else if smoke_sdk.is_some() {
+                                        frame_capture.requested = Some(dir.join("recovered-sdk.png"));
+                                    }
+                                }
+                            }
+                            frame_capture.submit(&renderer.device, &renderer.queue, render_scale.texture());
                             if let Some(fsr) = fsr_upscaler.as_mut() {
                                 match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {
                                     Ok(()) => fsr.composite(&renderer.device, &renderer.queue, scene_view),
@@ -6650,7 +7767,7 @@ pub fn run(
                                         fsr_fail_reason = Some(error);
                                         fsr_upscaler = None;
                                         fsr_failed = true;
-                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, extent_upscaling, settings.fsr1_sharpness);
                                     }
                                 }
                             } else if let Some(xess) = xess_upscaler.as_mut() {
@@ -6661,7 +7778,7 @@ pub fn run(
                                         xess_fail_reason = Some(error);
                                         xess_upscaler = None;
                                         xess_failed = true;
-                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, extent_upscaling, settings.fsr1_sharpness);
                                     }
                                 }
                             } else if let Some(dlss) = dlss_upscaler.as_mut() {
@@ -6679,17 +7796,18 @@ pub fn run(
                                         dlss_fail_reason = Some(error);
                                         dlss_upscaler = None;
                                         dlss_failed = true;
-                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                        render_scale.blit(&renderer.device, &renderer.queue, scene_view, extent_upscaling, settings.fsr1_sharpness);
                                     }
                                 }
                             } else {
-                                render_scale.blit(&renderer.device, &renderer.queue, scene_view, settings.upscaling, settings.fsr1_sharpness);
+                                render_scale.blit(&renderer.device, &renderer.queue, scene_view, extent_upscaling, settings.fsr1_sharpness);
                             }
                             // When frame generation separates the UI from the scene,
                             // finish any gamma ramp / UNORM encode into `final_view`
                             // (`fg.compose_view()`) *before* `fg.prepare` copies it to
                             // `ui_view()`, otherwise `compose` is still empty/stale.
                             if fg_views.is_some() && !xefg_ui_in_composition {
+                                let final_view = final_view.expect("frame generation target");
                                 if let Some(encode) = present_encode.as_ref() {
                                     let ramp_target = encode.view();
                                     if let Some(gamma) = display_gamma.as_ref() {
@@ -6809,7 +7927,7 @@ pub fn run(
                             // original style draws client artwork instead, so the
                             // overhead pass is skipped rather than rendered and
                             // hidden.
-                            if settings.show_minimap && settings.minimap_style==MapStyle::Realistic {
+                            if show_minimap && settings.minimap_style==MapStyle::Realistic {
                               let minimap_key = MinimapKey::new(
                                   camera.pos.x,
                                   camera.pos.z,
@@ -6997,17 +8115,14 @@ pub fn run(
                                 || fg_failed
                                 || xess_fg_failed
                                 || dlss_fg_failed;
-                            if menu_page.is_open() || settings.show_minimap || renderer.modules.overlay_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
+                            if menu_page.is_open() || renderer.lighter.error().is_some() || show_minimap || renderer.modules.overlay_active() || show_status_badge || world_loading_active || world_change_error.is_some() || world_change_notice.is_some() || zone_banner.as_ref().is_some_and(|(_,t)|t.elapsed().as_secs_f32()<4.) {
                                 let input=egui_state.take_egui_input(&window);
                                 let output=egui_ctx.run(input,|ctx| {
-                                    // A replacement-process handoff leaves this
-                                    // window alive but completely non-interactive.
-                                    // Recovery events are polled by the event loop,
-                                    // never by this overlay.
                                     if world_loading_active {
+                                        let reloading = handoff.as_ref().filter(|task| task.reload.is_some());
                                         egui::Area::new(egui::Id::new("world-handoff-loading"))
                                             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.))
-                                            .interactable(false)
+                                            .interactable(reloading.is_some())
                                             .show(ctx, |ui| {
                                                 egui::Frame::none()
                                                     .fill(egui::Color32::from_black_alpha(225))
@@ -7015,11 +8130,18 @@ pub fn run(
                                                     .rounding(8.)
                                                     .show(ui, |ui| {
                                                         ui.set_min_width(360.);
-                                                        ui.heading("Changing world…");
+                                                        ui.heading(if reloading.is_some() { "Reloading world…" } else { "Changing world…" });
                                                         ui.add_space(8.);
                                                         ui.label(&world_loading_status);
                                                         ui.add_space(4.);
                                                         ui.label(egui::RichText::new("This window will close when the new world is ready.").small().weak());
+                                                        if let Some(task) = reloading {
+                                                            if task.files.is_cancelled() {
+                                                                ui.label("Cancelling reload…");
+                                                            } else if ui.button("Cancel Reload").clicked() {
+                                                                task.files.cancel();
+                                                            }
+                                                        }
                                                     });
                                             });
                                         return;
@@ -7028,16 +8150,21 @@ pub fn run(
                                     // Dismiss button needs a mutable borrow of the
                                     // Option while the label is displayed.
                                     if let Some(reason) = world_change_error.clone() {
-                                        egui::Window::new("WORLD CHANGE FAILED")
+                                        egui::Window::new("WORLD LOAD FAILED")
                                             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.))
                                             .collapsible(false)
                                             .resizable(false)
                                             .show(ctx, |ui| {
                                                 ui.colored_label(egui::Color32::LIGHT_RED, reason.as_str());
-                                                ui.label("The viewer stayed on the current world and restored a safe saved setting.");
-                                                if ui.button("Dismiss").clicked() {
-                                                    world_change_error = None;
-                                                }
+                                                ui.label("The current world is still open.");
+                                                ui.horizontal(|ui| {
+                                                    if ui.button("Copy details").clicked() {
+                                                        ui.output_mut(|output| output.copied_text = reason.clone());
+                                                    }
+                                                    if ui.button("Dismiss").clicked() {
+                                                        world_change_error = None;
+                                                    }
+                                                });
                                             });
                                     }
                                     if let Some(reason) = world_change_notice.clone() {
@@ -7077,7 +8204,11 @@ pub fn run(
                                             });
                                     }
                                     if menu_page==MenuPage::Modules {
-                                        if renderer.modules.menu_ui(ctx,camera.pos,camera.yaw){menu_page=MenuPage::Main;}
+                                        match renderer.modules.menu_ui(ctx, camera.pos, camera.yaw, &mut renderer.lighter) {
+                                            Some(crate::modules::MenuAction::Back) => menu_page = MenuPage::Main,
+                                            Some(crate::modules::MenuAction::ReloadWorld(settings)) => reload_requested = Some(settings),
+                                            None => {}
+                                        }
                                     }
                                     if menu_page==MenuPage::Settings {
                                         egui::Window::new("SETTINGS  |  ESC to go back")
@@ -7144,17 +8275,15 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                 if selected_world_ui.eq_ignore_ascii_case(&current_map.id) {
                                                     world_change_error = Some(format!("{} is already the active world.", current_map.display_name));
                                                 } else {
-                                                    match spawn_world_handoff(&client_root, &selected_world_ui, window_focused) {
-                                                        Ok((files, rx)) => {
+                                                    match spawn_world_handoff(&client_root, &selected_world_ui, window_focused, None, #[cfg(test)] None) {
+                                                        Ok(task) => {
                                                             settings.selected_world = selected_world_ui.to_ascii_lowercase();
                                                             if let Err(error) = settings.save() {
                                                                 eprintln!("Settings save before world handoff: {error}");
                                                             } else {
                                                                 saved_settings = settings.clone();
                                                             }
-                                                            handoff_files = Some(files);
-                                                            handoff_rx = Some(rx);
-                                                            world_loading_active = true;
+                                                            handoff = Some(task);
                                                             world_change_error = None;
                                                             world_change_notice = None;
                                                             world_loading_status = format!("Starting {}...", selected_world_ui);
@@ -7211,7 +8340,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                             ui.separator();ui.horizontal_wrapped(|ui|{ui.checkbox(&mut map_click_teleport,"Click to teleport");marked_slider(ui,egui::Slider::new(&mut map_zoom,1.0..=4.0),"Zoom",1.,1.,4.,false,true);ui.label(egui::RichText::new(format!("{} style — change in Settings ▸ Interface",settings.world_map_style.label())).small().weak());});
                                         });
                                     }
-                                    if settings.show_minimap {egui::Area::new(egui::Id::new("minimap-hud")).anchor(egui::Align2::RIGHT_TOP,egui::vec2(-16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.).rounding(match settings.minimap_shape { MinimapShape::Circular => 256.*0.5+5., MinimapShape::Square => 0.0 }).show(ui,|ui|{
+                                    if show_minimap {egui::Area::new(egui::Id::new("minimap-hud")).anchor(egui::Align2::RIGHT_TOP,egui::vec2(-16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.).rounding(match settings.minimap_shape { MinimapShape::Circular => 256.*0.5+5., MinimapShape::Square => 0.0 }).show(ui,|ui|{
                                         // Original: crop the client's own minimap around the camera.
                                         // The crop keeps a fixed scale and slides inside the image at the
                                         // world edge, so the artwork never stretches.
@@ -7228,6 +8357,16 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         } else { ui.add(egui::Image::new((map_id,egui::vec2(MINIMAP_HUD,MINIMAP_HUD))).rounding(round)) };
                                         let center=image.rect.center();let dir=egui::vec2(camera.yaw.sin(),camera.yaw.cos());let side=egui::vec2(-dir.y,dir.x);let points=vec![center+dir*10.,center-dir*7.+side*5.,center-dir*7.-side*5.];ui.painter().add(egui::Shape::convex_polygon(points,egui::Color32::from_rgb(255,225,130),egui::Stroke::new(1.0f32,egui::Color32::BLACK)));ui.painter().text(image.rect.left_top()+egui::vec2(5.,5.),egui::Align2::LEFT_TOP,"N",egui::FontId::proportional(14.),egui::Color32::WHITE);});});}
                                     if show_status_badge {egui::Area::new(egui::Id::new("fsr-status-hud")).anchor(egui::Align2::LEFT_TOP,egui::vec2(16.,16.)).interactable(false).show(ctx,|ui|{egui::Frame::none().fill(egui::Color32::from_black_alpha(175)).inner_margin(5.0).show(ui,|ui|{if let Some(label)=&fsr_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&xess_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,210,255)));}if let Some(label)=&dlss_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,150)));}if let Some(label)=&fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&xess_fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&dlss_fg_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(150,255,170)));}if let Some(label)=&latency_badge {ui.label(egui::RichText::new(label).small().color(egui::Color32::from_rgb(190,255,140)));}if latency_failed_note {ui.label(egui::RichText::new("XeLL failed -> VSync pacing").small().color(egui::Color32::LIGHT_RED));}if fsr_failed_note {ui.label(egui::RichText::new("FSR failed -> native render, no upscaling").small().color(egui::Color32::LIGHT_RED));}if xess_failed_note {ui.label(egui::RichText::new("XeSS failed -> native render, no upscaling").small().color(egui::Color32::LIGHT_RED));}if dlss_failed_note {ui.label(egui::RichText::new("DLSS failed -> native render, no upscaling").small().color(egui::Color32::LIGHT_RED));}if fsr_failed_note {if let Some(reason)=&fsr_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}}if fg_failed {ui.label(egui::RichText::new("FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if xess_fg_failed {ui.label(egui::RichText::new("XeSS FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if dlss_fg_failed {ui.label(egui::RichText::new("DLSS FG failed -> standard present").small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&dlss_fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"\u{2026}";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if let Some(reason)=&xess_fg_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}if xess_failed_note {if let Some(reason)=&xess_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}}if dlss_failed_note {if let Some(reason)=&dlss_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}}if let Some(reason)=&latency_fail_reason {let mut short=reason.clone();if short.chars().count()>140 {short=short.chars().take(140).collect::<String>()+"…";}ui.label(egui::RichText::new(short).small().color(egui::Color32::LIGHT_RED));}});});}
+                                    if let Some(error)=renderer.lighter.error() {
+                                        egui::Area::new(egui::Id::new("lighter-error")).anchor(egui::Align2::RIGHT_TOP,egui::vec2(-16.,16.)).interactable(false).show(ctx,|ui| {
+                                            egui::Frame::popup(ui.style()).show(ui,|ui| {
+                                                ui.set_max_width(360.);
+                                                ui.label("Showing the Native renderer");
+                                                ui.colored_label(egui::Color32::LIGHT_RED,error);
+                                                ui.label("Change renderer in Esc → Modules → Lighter.");
+                                            });
+                                        });
+                                    }
                                     if menu_page.is_open(){renderer.modules.settings_panel(ctx,config.width as f32/window.scale_factor() as f32);}
                                     if renderer.modules.overlay_active() {
                                         // Overhead names: the same view-projection the world
@@ -7344,12 +8483,19 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                         frame_gamma_setting,
                                     );
                                 }
-                                encode.present(&renderer.device, &renderer.queue, final_view);
+                                if let Some(view) = final_view {
+                                    encode.present(&renderer.device, &renderer.queue, view);
+                                } else {
+                                    let drawn_mode = if renderer.renders_rays() { renderer.lighter.settings.mode } else { LighterMode::Off };
+                                    first_composition = Some((Instant::now(), drawn_mode));
+                                    first_frame_progress("First frame submitted; waiting for GPU completion…");
+                                    return;
+                                }
                             } else if let Some(gamma) = display_gamma.as_ref() {
                                 gamma.present(
                                     &renderer.device,
                                     &renderer.queue,
-                                    final_view,
+                                    final_view.expect("standard present target"),
                                     frame_gamma_setting,
                                 );
                                 }
@@ -7421,13 +8567,114 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     }
                                 }
                             } else if let Some(frame) = frame {
+                                let sync = if drawn_pose.is_some() && travel.as_ref().is_some_and(|v| v.synchronized()) {
+                                    // Explicit capture mode. Count only actual completed frames,
+                                    // including raw Vulkan work, not merely a present call.
+                                    let native_map = native_timer.map(lighter_travel::NativeWorldTimer::map);
+                                    let start = Instant::now();
+                                    let completed = wait_for_capture(&renderer.device, || {
+                                        let idle = renderer.device.poll(wgpu::Maintain::Poll).is_queue_empty();
+                                        if gpu_loss.pending() {
+                                            return Err("device lost during synchronized travel".into());
+                                        }
+                                        Ok((idle && renderer.lighter.poll_hardware()?).then_some(()))
+                                    });
+                                    if let Err(error) = completed {
+                                        travel.as_mut().unwrap().invalidate(&error);
+                                        return;
+                                    }
+                                    let wait_ms = start.elapsed().as_secs_f64() * 1000.;
+                                    let native_world_span_ms = if let (Some(timer), Some(mapped)) = (native_timer, native_map) {
+                                        // The synchronized queue drain polls the map callback. No
+                                        // additional wait or stale same-size result is admitted.
+                                        match mapped.try_recv() {
+                                            Ok(Ok(())) => timer.elapsed_ms(&renderer.queue),
+                                            _ => {
+                                                travel.as_mut().unwrap().invalidate("Native GPU timestamps not mapped after queue drain");
+                                                return;
+                                            }
+                                        }
+                                    } else { None };
+                                    Some(lighter_travel::SyncSample {
+                                        wait_ms,
+                                        ray_stages: renderer.lighter.capture_stage_sample(&renderer.queue),
+                                        sdk_ms: renderer.lighter.capture_sdk_ms(),
+                                        native_world_span_ms,
+                                    })
+                                } else { None };
+                                window.pre_present_notify();
+                                let present_started = drawn_pose.map(|_| Instant::now());
                                 frame.present();
-                                // The window now has a presentation history, so
-                                // frame generation may take the swapchain over.
-                                presented_once = true;
-                            }
-                            if presented_once {
-                                signal_handoff_first_frame(&mut handoff_ready_signaled);
+                                let presented_at = Instant::now();
+                                if renderer.renders_rays() {
+                                    renderer.lighter.profile_presented(presented_at);
+                                }
+                                if let (Some(flight), Some(pose)) = (&mut travel, drawn_pose) {
+                                    travel_cut_pending = false;
+                                    if !flight.check_provider(renderer.lighter.reconstruction_status()) {
+                                        return;
+                                    }
+                                    let motion = if let Some(path) = flight.motion_frame() {
+                                        // Opt-in image evidence only. Unlike the ordinary travel trace,
+                                        // this waits for readback and must never be used to report FPS.
+                                        use sha2::{Digest, Sha256};
+                                        let source = render_scale.texture();
+                                        let captured = read_target_pixels(&renderer, &mut motion_capture, source)
+                                            .and_then(|bytes| {
+                                                readback::png_rgba(&path, source.width(), source.height(), &bytes)?;
+                                                Ok(format!("{:x}", Sha256::digest(&bytes)))
+                                            });
+                                        match captured {
+                                            Ok(rgba8_sha256) => Some(lighter_travel::MotionSample {
+                                                rgba8_sha256,
+                                                elapsed_ms: renderer.capture_elapsed_ms.unwrap_or_default(),
+                                                camera_cut: camera_jumped,
+                                                underwater_depth: camera.underwater_depth,
+                                            }),
+                                            Err(error) => {
+                                                flight.invalidate(&format!("motion frame {}: {error}", path.display()));
+                                                return;
+                                            }
+                                        }
+                                    } else { None };
+                                    let mut chosen = renderer.lighter.settings.effective();
+                                    let committed = std::mem::take(&mut stream_commit_pending);
+                                    let actual_rays = renderer.renders_rays();
+                                    let (trace_extent, experiments) = if actual_rays {
+                                        renderer.lighter.travel_trace()
+                                    } else {
+                                        chosen.mode = LighterMode::Off;
+                                        ((0,0),(0,false,false))
+                                    };
+                                    let ray = actual_rays.then(|| lighter_travel::RaySample {
+                                        primary: renderer.lighter.travel_primary(),
+                                        acceleration: renderer.lighter.travel_rt_counts(),
+                                        game_profile_active: renderer.lighter.game_profile_active(),
+                                        provider: renderer.lighter.reconstruction_status().unwrap_or("portable"),
+                                        textures: renderer.lighter.travel_textures(),
+                                        pacing: if committed { renderer.lighter.travel_pacing() } else { None },
+                                    });
+                                    let present_ms = (presented_at-present_started.unwrap()).as_secs_f64() * 1000.;
+                                    flight.presented(presented_at, redraw_started, [acquire_ms,present_ms], chosen, renderer.lighter.raster_active(),
+                                        [(config.width,config.height),world_extent, trace_extent],config.present_mode,pose,renderer.center,
+                                        streaming,committed,&settings,experiments,sync,motion,ray);
+                                    #[cfg(test)]
+                                    if smoke_travel.is_some() && flight.recorded() {
+                                        target.exit();
+                                    }
+                                }
+                                #[cfg(test)]
+                                if smoke_dir.is_some() && smoke_travel.is_none() && !smoke_reload && smoke_sdk.is_none() {
+                                    let mode = match smoke_frames {
+                                        2 => Some(LighterMode::Off),
+                                        3 => Some(LighterMode::Software),
+                                        _ => None,
+                                    };
+                                    if let Some(mode) = mode {
+                                        renderer.lighter.settings.mode = mode;
+                                        renderer.lighter.reset_history();
+                                    }
+                                }
                             }
                             if let Some(session) = latency.as_mut() {
                                 session.present_end();
@@ -7437,8 +8684,8 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                             if let Some(pacer) = reflex.as_mut() {
                                 pacer.present();
                             }
-                            if software_adapter { renderer.device.poll(wgpu::Maintain::Wait); }
                         }
+                    });
                 }
                 _ => {}
             }
@@ -7454,159 +8701,431 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                 camera.pitch = (camera.pitch - delta.1 as f32 * settings.sensitivity).clamp(-1.5, 1.5);
             }
             Event::AboutToWait => {
-                // Handoff/recovery messages are polled outside egui, so the
-                // non-interactive loading overlay cannot swallow them.
-                if let Some(rx) = handoff_rx.take() {
-                    let mut keep_receiver = false;
-                    loop {
-                        match rx.try_recv() {
-                            Ok(crate::world_handoff::Message::Progress(status)) => {
-                                world_loading_status = status;
-                            }
-                            Ok(crate::world_handoff::Message::Ready { activated }) => {
-                                // The replacement is visible and has presented
-                                // a usable frame. Exit this old process without
-                                // forcing focus if the user Alt-Tabbed away.
-                                if !activated {
-                                    eprintln!("Replacement world is ready; leaving it visible without forced activation.");
+                if !gpu_recovering {
+                    let reason = gpu_loss.take().or_else(|| renderer.lighter.error().filter(|m| recovery::lost_error(m)).map(str::to_owned));
+                    if let Some(reason) = reason {
+                        eprintln!("Graphics device lost: {reason}");
+                        if handoff_child && !presented_once {
+                            run_error = Some(format!("The replacement graphics device was lost before its first frame: {reason}"));
+                            target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                            target.exit();
+                            return;
+                        }
+                        gpu_recovering = true;
+                        captured = false;
+                        keys.clear();
+                        let _ = window.set_cursor_grab(CursorGrabMode::None);
+                        window.set_cursor_visible(true);
+                        window.set_title("Perfect World Explorer — restoring graphics device…");
+                        if handoff.is_none() {
+                            let snapshot = recovery::Snapshot {
+                                kind: recovery::RestoreKind::DeviceRecovery,
+                                map: current_map.id.clone(),
+                                view: camera.handoff_view(),
+                                lighter: renderer.lighter.settings,
+                            };
+                            match spawn_world_handoff(&client_root, &snapshot.map, window_focused, Some(&snapshot), #[cfg(test)] smoke_dir) {
+                                Ok(task) => handoff = Some(task),
+                                Err(error) => {
+                                    let message = format!("Graphics recovery could not start: {error}");
+                                    eprintln!("{message}");
+                                    crate::diagnostics::session(message);
+                                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                                    target.exit();
+                                    return;
                                 }
-                                // The replacement owns persistence now: it may
-                                // have fallen back to the main world after the
-                                // old process selected an instance. Saving the
-                                // old selection here would undo that recovery.
-                                world_loading_active = false;
-                                handoff_files = None;
-                                keys.clear();
-                                close_old_window_after_handoff_ready(target, &window);
-                                return;
-                            }
-                            Ok(crate::world_handoff::Message::Failed(reason)) => {
-                                settings.selected_world = "world".into();
-                                if let Err(error) = settings.save() {
-                                    eprintln!("Settings save after world handoff failure: {error}");
-                                } else {
-                                    saved_settings = settings.clone();
-                                }
-                                selected_world_ui = current_map.id.clone();
-                                world_change_error = Some(reason);
-                                world_change_notice = None;
-                                world_loading_active = false;
-                                if let Some(files) = handoff_files.take() {
-                                    files.cleanup();
-                                }
-                                menu_page = MenuPage::Main;
-                                keys.clear();
-                                break;
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                keep_receiver = true;
-                                break;
-                            }
-                            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                settings.selected_world = "world".into();
-                                if let Err(error) = settings.save() {
-                                    eprintln!("Settings save after world handoff failure: {error}");
-                                } else {
-                                    saved_settings = settings.clone();
-                                }
-                                selected_world_ui = current_map.id.clone();
-                                world_change_error = Some(
-                                    "The world handoff watcher stopped without a result.".into(),
-                                );
-                                world_change_notice = None;
-                                world_loading_active = false;
-                                if let Some(files) = handoff_files.take() {
-                                    files.cleanup();
-                                }
-                                menu_page = MenuPage::Main;
-                                keys.clear();
-                                break;
                             }
                         }
                     }
-                    if keep_receiver {
-                        handoff_rx = Some(rx);
+                }
+                if let Some(lighter) = reload_requested.take().filter(|_| presented_once && handoff.is_none() && !gpu_recovering) {
+                    let snapshot = recovery::Snapshot {
+                        kind: recovery::RestoreKind::Reload,
+                        map: current_map.id.clone(),
+                        view: camera.handoff_view(),
+                        lighter,
+                    };
+                    // Flush current viewer preferences before the child loads
+                    // them. The map, renderer and exact view are in the snapshot.
+                    if persist_reload && settings != saved_settings {
+                        match settings.save() {
+                            Ok(()) => saved_settings = settings.clone(),
+                            Err(error) => eprintln!("Settings save before reload: {error}"),
+                        }
+                    }
+                    match spawn_world_handoff(&client_root, &snapshot.map, window_focused, Some(&snapshot), #[cfg(test)] smoke_dir) {
+                        Ok(task) => {
+                            handoff = Some(task);
+                            world_loading_status = format!("Starting {} with {}…", current_map.display_name, lighter.mode.label());
+                            world_change_error = None;
+                            keys.clear();
+                            if captured {
+                                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                                window.set_cursor_visible(true);
+                                captured = false;
+                            }
+                        }
+                        Err(error) => world_change_error = Some(format!("World reload could not start: {error}")),
                     }
                 }
-                window.request_redraw();
+                // Poll even when no frame is drawn (e.g. minimised or device
+                // lost). Both failure and cancellation leave the old map open.
+                while let Some(task) = handoff.as_ref() {
+                    use crate::world_handoff::Message;
+                    use std::sync::mpsc::TryRecvError;
+                    let message = match task.messages.try_recv() {
+                        Ok(message) => message,
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => Message::Failed("The world handoff watcher stopped without a result.".into()),
+                    };
+                    if let Message::Progress(status) = message {
+                        world_loading_status = status;
+                        continue;
+                    }
+                    let task = handoff.take().unwrap();
+                    task.files.cleanup();
+                    if let Message::Ready { activated } = message {
+                        if !activated {
+                            eprintln!("Replacement world is ready; leaving it visible without forced activation.");
+                        }
+                        if let Some(lighter) = task.reload.filter(|_| persist_reload) {
+                            if let Err(error) = lighter.save() { eprintln!("Lighter settings save after reload: {error}"); }
+                            settings.selected_world = current_map.id.clone();
+                            if let Err(error) = settings.save() { eprintln!("Settings save after reload: {error}"); }
+                        }
+                        close_old_window_after_handoff_ready(target, &window);
+                        return;
+                    }
+                    if gpu_recovering || close_after_handoff {
+                        if let Message::Failed(reason) = message {
+                            let message = format!("Replacement world failed: {reason}");
+                            eprintln!("{message}");
+                            crate::diagnostics::session(message);
+                        }
+                        target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                        target.exit();
+                        return;
+                    }
+                    if let Message::Failed(reason) = message {
+                        let reason = if let Some(lighter) = task.reload {
+                            format!("Reload {} with {} failed.\n{reason}", current_map.id, lighter.mode.label())
+                        } else {
+                            reason
+                        };
+                        crate::diagnostics::session(format!("Replacement world failed: {reason}"));
+                        world_change_error = Some(reason);
+                    }
+                    if task.reload.is_none() {
+                        // Keep the original map-change failure policy. A
+                        // failed reload must not reset the map or ray settings.
+                        settings.selected_world = "world".into();
+                        match settings.save() {
+                            Ok(()) => saved_settings = settings.clone(),
+                            Err(error) => eprintln!("Settings save after world handoff failure: {error}"),
+                        }
+                        selected_world_ui = current_map.id.clone();
+                        world_change_notice = None;
+                        menu_page = MenuPage::Main;
+                    }
+                    keys.clear();
+                }
+                if gpu_recovering {
+                    target.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(Instant::now()+Duration::from_millis(100)));
+                    return;
+                }
+                if let Some(at) = gpu_retry_at {
+                    if Instant::now() < at {
+                        // Don't spin through redraws while the GPU is busy;
+                        // ordinary input and close events still get dispatched.
+                        target.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(at));
+                        return;
+                    }
+                    gpu_retry_at = None;
+                    target.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                }
+                if handoff.is_some() {
+                    target.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(100)));
+                } else {
+                    target.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                }
+                if presented_once {
+                    window.request_redraw();
+                } else {
+                    let _ = startup_redraw.send_event(());
+                }
             }
             _ => {}
-        })
-        .map_err(|e| e.to_string())
-}
-/// Render one frame without a window. Useful for validation on headless systems.
-/// Read a rendered target back to CPU bytes, one `RGBA` word per pixel.
-///
-/// The preview path needs the pixels themselves to answer questions that a
-/// screenshot cannot: whether a pass changed anything, and by how much.
-fn read_target_pixels(
-    renderer: &Renderer,
-    target: &wgpu::Texture,
-    width: u32,
-    height: u32,
-) -> Result<Vec<u8>, String> {
-    let row = width * 4;
-    let buffer = renderer.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback"),
-        size: (row as u64) * (height as u64),
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut e = renderer.device.create_command_encoder(&Default::default());
-    e.copy_texture_to_buffer(
-        wgpu::ImageCopyTexture {
-            texture: target,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::ImageCopyBuffer {
-            buffer: &buffer,
-            layout: wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(row),
-                rows_per_image: Some(height),
-            },
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    renderer.queue.submit(Some(e.finish()));
-    let (tx, rx) = std::sync::mpsc::channel();
-    buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    renderer.device.poll(wgpu::Maintain::Wait);
-    rx.recv()
-        .map_err(|e| e.to_string())?
+        }})
         .map_err(|e| e.to_string())?;
-    let bytes = buffer.slice(..).get_mapped_range().to_vec();
-    Ok(bytes)
+    run_error.map_or(Ok(()), Err)
+}
+/// Explicit blocking capture/test path only. wgpu 0.19's blocking poll can
+/// retire submissions after its 5-second fence timeout. Instead poll and wait
+/// for observed GPU completion (including cold software shader compilation).
+pub(crate) fn wait_for_capture<T>(
+    device: &wgpu::Device,
+    mut check: impl FnMut() -> Result<Option<T>, String>,
+) -> Result<T, String> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        device.poll(wgpu::Maintain::Poll);
+        if let Some(result) = check()? {
+            return Ok(result);
+        }
+        if Instant::now() >= deadline {
+            return Err("GPU capture did not complete within 120 seconds".into());
+        }
+        std::thread::sleep(GPU_RETRY_DELAY);
+    }
 }
 
-pub fn preview(
-    mut t: Terrain,
+#[cfg(test)]
+pub(crate) fn wait_for_capture_callback<T>(
+    device: &wgpu::Device,
+    completion: std::sync::mpsc::Receiver<T>,
+) -> Result<T, String> {
+    wait_for_capture(device, || match completion.try_recv() {
+        Ok(value) => Ok(Some(value)),
+        Err(std::sync::mpsc::TryRecvError::Empty) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    })
+}
+
+/// Explicit synchronized capture only, never the ordinary viewer/benchmark.
+/// The asynchronous screenshot path uses the same copy and row handling.
+fn read_target_pixels(
+    renderer: &Renderer,
+    ring: &mut readback::Ring<()>,
+    target: &wgpu::Texture,
+) -> Result<Vec<u8>, String> {
+    if !ring.submit(&renderer.device, &renderer.queue, target, ())? {
+        return Err("headless readback staging ring is busy".into());
+    }
+    wait_for_capture(&renderer.device, || {
+        ring.try_read()
+            .map(|(_, result)| result.map(|image| image.rgba))
+            .transpose()
+    })
+}
+
+/// Render one frame without a window. Useful for validation on headless systems.
+pub fn preview(t: Terrain, path: &std::path::Path, camera: Option<[f32; 5]>) -> Result<(), String> {
+    let mode = match std::env::var("PW_PREVIEW_LIGHTER") {
+        Ok(mode) => LighterMode::parse(&mode)
+            .ok_or("PW_PREVIEW_LIGHTER must be off, software or hardware")?,
+        Err(_) => LighterMode::Off,
+    };
+    let audit = if std::env::var_os("PW_PREVIEW_COVERAGE").is_some() {
+        let warmup = std::env::var("PW_PREVIEW_WARMUP").unwrap_or_else(|_| "0".into());
+        Some(
+            warmup
+                .parse::<u32>()
+                .ok()
+                .filter(|&n| n <= 120)
+                .ok_or("PW_PREVIEW_WARMUP must be an integer from 0 through 120")?,
+        )
+    } else {
+        None
+    };
+    preview_frame(t, path, camera, mode, audit)
+}
+
+fn preview_frame(
+    t: Terrain,
     path: &std::path::Path,
     camera: Option<[f32; 5]>,
+    mode: LighterMode,
+    audit: Option<u32>,
 ) -> Result<(), String> {
-    let mut instance = make_instance();
-    let mut adapter_result = pollster::block_on(adapter(&instance, None));
-    if let Err(error) = &adapter_result {
+    preview_frame_using(t, path, camera, mode, audit, preview_device)
+}
+
+type PreviewDevice = (wgpu::AdapterInfo, wgpu::Device, wgpu::Queue, Lighter);
+
+fn preview_device(settings: LighterSettings) -> Result<PreviewDevice, String> {
+    let mut reconstruction = crate::modules::lighter::reconstruction::Startup::new(settings.mode);
+    let mut instance = reconstruction.instance(instance_backends(settings.mode));
+    let mut result = pollster::block_on(open_adapter(
+        &instance,
+        None,
+        settings.mode,
+        false,
+        &mut reconstruction,
+    ));
+    if let Err(error) = &result {
         if std::env::var_os("WGPU_BACKEND").is_none() {
-            eprintln!(
-                "Perfect World Explorer preview: no D3D12 adapter ({error}); falling back to all backends"
-            );
+            eprintln!("Perfect World Explorer preview: no D3D12 adapter ({error}); falling back to all backends");
             instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                 backends: wgpu::Backends::all(),
                 ..Default::default()
             });
-            adapter_result = pollster::block_on(adapter(&instance, None));
+            reconstruction.disable(error);
+            result = pollster::block_on(open_adapter(
+                &instance,
+                None,
+                settings.mode,
+                false,
+                &mut reconstruction,
+            ));
         }
     }
-    let (_adapter, device, queue) = adapter_result?;
+    let (adapter, device, queue) = result?;
+    let mut lighter = Lighter::new(settings, &adapter, &device).for_capture();
+    reconstruction.install(&mut lighter, &device);
+    Ok((adapter.get_info(), device, queue, lighter))
+}
+
+// Allow a small matched audit to exercise high-sample Reference readback on
+// a CPU driver without changing ordinary previews or the retail matrix.
+fn preview_extent(audit: Option<u32>) -> Result<(u32, u32), String> {
+    match std::env::var("PW_PREVIEW_SIZE") {
+        Err(std::env::VarError::NotPresent) => Ok((960, 720)),
+        Ok(size) if audit.is_some() => size
+            .split_once('x')
+            .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+            .filter(|(w, h)| (64..=1920).contains(w) && (64..=1080).contains(h))
+            .ok_or("PW_PREVIEW_SIZE must be WIDTHxHEIGHT within 64x64 to 1920x1080".into()),
+        Ok(_) => Err("PW_PREVIEW_SIZE requires PW_PREVIEW_COVERAGE".into()),
+        Err(e) => Err(format!("PW_PREVIEW_SIZE: {e}")),
+    }
+}
+
+fn assert_preview_provider(expected: Option<&str>, active: Option<&str>) -> Result<(), String> {
+    let actual = active.unwrap_or("portable");
+    if let Some(want) = expected.filter(|&want| want != actual) {
+        return Err(format!(
+            "Lighter capture requires {want} on every draw; got {actual}"
+        ));
+    }
+    Ok(())
+}
+
+fn preview_frame_using(
+    mut t: Terrain,
+    path: &std::path::Path,
+    camera: Option<[f32; 5]>,
+    mode: LighterMode,
+    audit: Option<u32>,
+    open: impl FnOnce(LighterSettings) -> Result<PreviewDevice, String>,
+) -> Result<(), String> {
+    let (width, height) = preview_extent(audit)?;
+    let required_provider = match std::env::var("PW_PREVIEW_REQUIRE_PROVIDER").as_deref() {
+        Err(std::env::VarError::NotPresent) => None,
+        Ok("portable") if audit.is_some() => Some("portable"),
+        Ok("fsr") if audit.is_some() && mode != LighterMode::Off => Some("Vulkan temporal FSR"),
+        Ok("rr") if audit.is_some() && mode != LighterMode::Off => {
+            Some("Vulkan DLSS Ray Reconstruction")
+        }
+        _ => return Err("PW_PREVIEW_REQUIRE_PROVIDER needs a coverage audit and portable, fsr or rr (SDKs require rays)".into()),
+    };
+    // Never read interactive Lighter settings for an ordinary headless preview.
+    let mut lighter_settings = LighterSettings {
+        mode,
+        ..LighterSettings::default()
+    };
+    if let Ok(value) = std::env::var("PW_PREVIEW_REFERENCE") {
+        lighter_settings.reference = match value.as_str() {
+            "0" => false,
+            "1" => true,
+            _ => return Err("PW_PREVIEW_REFERENCE must be 0 or 1".into()),
+        };
+    }
+    let reference_samples = match std::env::var("PW_PREVIEW_REFERENCE_SPP").as_deref() {
+        Ok(value) if audit.is_some() && mode != LighterMode::Off && lighter_settings.reference => {
+            match value {
+                "32" => Some(32),
+                "64" => Some(64),
+                "128" => Some(128),
+                _ => return Err("PW_PREVIEW_REFERENCE_SPP must be 32, 64 or 128".into()),
+            }
+        }
+        Ok(_) => {
+            return Err("PW_PREVIEW_REFERENCE_SPP requires a Reference ray coverage audit".into())
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => return Err(format!("PW_PREVIEW_REFERENCE_SPP: {e}")),
+    };
+    if let Ok(value) = std::env::var("PW_PREVIEW_PHYSICAL_BSDF") {
+        lighter_settings.physical_bsdf = match value.as_str() {
+            "0" => false,
+            "1" => true,
+            _ => return Err("PW_PREVIEW_PHYSICAL_BSDF must be 0 or 1".into()),
+        };
+    }
+    if let Ok(value) = std::env::var("PW_PREVIEW_RELIGHT_BAKED") {
+        lighter_settings.relight_baked = match value.as_str() {
+            "0" => false,
+            "1" => true,
+            _ => return Err("PW_PREVIEW_RELIGHT_BAKED must be 0 or 1".into()),
+        };
+    }
+    if let Ok(value) = std::env::var("PW_PREVIEW_ANISOTROPY") {
+        lighter_settings.anisotropy = value
+            .parse::<u32>()
+            .ok()
+            .filter(|n| matches!(n, 1 | 8 | 16))
+            .ok_or("PW_PREVIEW_ANISOTROPY must be 1, 8 or 16")?;
+    }
+    if let Ok(value) = std::env::var("PW_PREVIEW_RAY_RESOLUTION") {
+        lighter_settings.resolution = value
+            .parse::<u32>()
+            .ok()
+            .filter(|n| (25..=100).contains(n))
+            .ok_or("PW_PREVIEW_RAY_RESOLUTION must be an integer from 25 through 100")?;
+    }
+    for (key, option) in [
+        ("PW_PREVIEW_SINGLE_PATH", &mut lighter_settings.single_path),
+        ("PW_PREVIEW_FSR1_EASU", &mut lighter_settings.fsr1_easu),
+        (
+            "PW_PREVIEW_HYBRID_PRIMARY",
+            &mut lighter_settings.hybrid_primary,
+        ),
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            *option = match value.as_str() {
+                "0" => false,
+                "1" => true,
+                _ => return Err(format!("{key} must be 0 or 1")),
+            };
+        }
+    }
+    if lighter_settings.hybrid_primary
+        && (mode != LighterMode::Hardware || lighter_settings.reference)
+    {
+        return Err("PW_PREVIEW_HYBRID_PRIMARY requires non-Reference Hardware mode".into());
+    }
+    let timed_frames = match std::env::var("PW_PREVIEW_TIMED_FRAMES") {
+        Ok(value) if audit.is_some() => value
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n <= 120)
+            .ok_or("PW_PREVIEW_TIMED_FRAMES must be an integer from 0 through 120")?,
+        Ok(_) => return Err("PW_PREVIEW_TIMED_FRAMES requires PW_PREVIEW_COVERAGE".into()),
+        Err(_) => 0,
+    };
+    if audit.is_some() {
+        if let Some(notice) = t.startup_notice.as_deref() {
+            return Err(format!("Coverage capture refused a fallback map: {notice}"));
+        }
+        // Normally report this frame, not a mixture of warm-up radiance.
+        // The explicit screen-reuse experiment needs progressive history.
+        lighter_settings.progressive =
+            mode != LighterMode::Off && crate::modules::lighter::wants_screen_reuse();
+    }
+    match std::env::var("PW_PREVIEW_PROGRESSIVE").as_deref() {
+        Ok("0") => lighter_settings.progressive = false,
+        Ok("1") if mode != LighterMode::Off => lighter_settings.progressive = true,
+        _ => {}
+    }
+    if (audit.is_some() || mode != LighterMode::Off)
+        && (std::env::var_os("PW_PREVIEW_WORLD_TEST").is_some()
+            || std::env::var_os("PW_PREVIEW_MINIMAP").is_some()
+            || (audit.is_some() && std::env::var_os("PW_PREVIEW_EFFECT_AB").is_some()))
+    {
+        return Err("Matched previews require the main streamed world, not preload, minimap or an effect A/B".into());
+    }
+    let (adapter_info, device, queue, mut lighter) = open(lighter_settings)?;
+    lighter.set_capture_reference_samples(reference_samples);
     let mut cam = if let Some([x, y, z, yaw, pitch]) = camera {
         if ![x, y, z, yaw, pitch].iter().all(|x| x.is_finite()) {
             return Err("non-finite camera".into());
@@ -7685,15 +9204,45 @@ pub fn preview(
     if std::env::var_os("PW_PREVIEW_NO_REFLECTION").is_some() {
         cam.water_reflections = false;
     }
+    if let Ok(weather) = std::env::var("PW_PREVIEW_WEATHER") {
+        cam.weather_override = crate::client_weather::WeatherOverride::parse(&weather)
+            .ok_or("PW_PREVIEW_WEATHER must be Auto, Clear, Rain or Snow")?;
+    }
     if let Ok(hour) = std::env::var("PW_PREVIEW_HOUR") {
         if let Ok(h) = hour.parse::<f32>() {
             cam.time_of_day = h.clamp(0., 24.);
         }
     }
+    cam.terrain_day_night = crate::terrain_shading::viewer_day_night_factor(
+        crate::environment::daylight(cam.time_of_day),
+    );
     cam.underwater_fog = t
         .environments
         .underwater(cam.pos.to_array(), cam.time_of_day);
+    // Keep this headless comparison on a single prebuilt terrain window.
+    // For actual window publications and long travel use the live path instead.
+    let flight = if let Some(file) = std::env::var_os("PW_PREVIEW_PATH_PLAN") {
+        let warmup = audit.ok_or("PW_PREVIEW_PATH_PLAN requires a coverage audit")?;
+        let final_pose = camera.ok_or("PW_PREVIEW_PATH_PLAN requires --gpu-preview-at")?;
+        let plan = lighter_travel::Plan::parse(
+            &std::fs::read_to_string(file).map_err(|e| e.to_string())?,
+        )?;
+        plan.preview_path(&t.map.id, cam.time_of_day, warmup)?;
+        let block =
+            |[x, _, z, _, _]: [f32; 5]| camera_block(t.width, t.height, t.grid_spacing, [x, z]);
+        if plan.pose(warmup) != final_pose
+            || (0..warmup).any(|i| block(plan.pose(i)) != block(final_pose))
+        {
+            return Err(
+                "preview path must end at --gpu-preview-at and stay in its terrain block".into(),
+            );
+        }
+        Some(plan)
+    } else {
+        None
+    };
     let mut residency = crate::terrain_residency::Residency::default();
+    let mut ray_scenery = lighter.armed().then(lighter_host::SceneryStream::default);
     let mesh = build(
         &mut t,
         cam.pos.x,
@@ -7705,10 +9254,18 @@ pub fn preview(
         // The preview renders one frame of the local window; it never runs the
         // whole-world preload, so the scenery half stays in the mesh.
         false,
+        ray_scenery.as_mut(),
     )?;
-    let (width, height) = (960u32, 720u32);
+    let native_inventory = (audit.is_some() && mode == LighterMode::Off)
+        .then(|| native_inventory::capture_scene(&t, &mesh, cam.matrix(width, height, cam.far)));
     let fmt = wgpu::TextureFormat::Rgba8UnormSrgb;
-    let mut renderer = Renderer::new(device, queue, fmt, width, height, mesh, &mut t, false)?;
+    let mut renderer = Renderer::new(
+        device, queue, fmt, width, height, mesh, &mut t, false, lighter,
+    )?;
+    renderer.capture_elapsed_ms = audit.map(|_| 0);
+    if let Some(error) = renderer.lighter.error() {
+        return Err(error.into());
+    }
     if std::env::var_os("PW_PREVIEW_WORLD_TEST").is_some() {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let root = t.element.clone();
@@ -7795,6 +9352,35 @@ pub fn preview(
             &[]
         },
     });
+    let mut captures = readback::Ring::default();
+    let view = target.create_view(&Default::default());
+    let raw = target.create_view(&wgpu::TextureViewDescriptor {
+        format: Some(fmt.remove_srgb_suffix()),
+        ..Default::default()
+    });
+    let draw = |r: &mut Renderer, cam: &Camera, cut: bool| -> Result<(), String> {
+        let ready = r.render(
+            &view,
+            &raw,
+            cam.matrix(width, height, cam.far),
+            cam,
+            width,
+            height,
+            cut,
+        );
+        if let Some(error) = r.lighter.error() {
+            return Err(error.into());
+        }
+        if r.lighter.settings.effective().hybrid_primary && !r.lighter.raster_active() {
+            return Err(
+                "Lighter capture requested raster primary visibility but used full rays".into(),
+            );
+        }
+        if !ready || (mode != LighterMode::Off && !r.renders_rays()) {
+            return Err("Lighter capture did not render the requested frame".into());
+        }
+        assert_preview_provider(required_provider, r.lighter.reconstruction_status())
+    };
     // An A/B of the world-effect pass, so "no effects" can be answered rather
     // than argued. The same camera and the same frame are rendered twice, the
     // only difference being the map's own effect roots, and the two images are
@@ -7807,26 +9393,10 @@ pub fn preview(
         // reaching this target at all; if they differ, the effects are on screen
         // and what remains is a question of what was authored where.
         cam.world_effects = true;
-        let draw = |r: &mut Renderer, cam: &Camera| {
-            let view = target.create_view(&Default::default());
-            let raw = target.create_view(&wgpu::TextureViewDescriptor {
-                format: Some(fmt.remove_srgb_suffix()),
-                ..Default::default()
-            });
-            r.render(
-                &view,
-                &raw,
-                cam.matrix(width, height, cam.far),
-                cam,
-                width,
-                height,
-                false,
-            );
-        };
         // Drain the one-root-per-frame queue first: an effect still waiting for
         // its player must not be mistaken for one that never drew.
         for _ in 0..60 {
-            draw(&mut renderer, &cam);
+            draw(&mut renderer, &cam, false)?;
         }
         let report = renderer
             .models
@@ -7843,10 +9413,10 @@ pub fn preview(
                 )
             })
             .unwrap_or_else(|| "no world".into());
-        let on = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();
+        let on = read_target_pixels(&renderer, &mut captures, &target).unwrap_or_default();
         cam.world_effects = false;
-        draw(&mut renderer, &cam);
-        let off = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();
+        draw(&mut renderer, &cam, false)?;
+        let off = read_target_pixels(&renderer, &mut captures, &target).unwrap_or_default();
         cam.world_effects = true;
         let differing = on
             .chunks_exact(4)
@@ -7858,18 +9428,30 @@ pub fn preview(
             on.len() / 4
         );
     }
-    renderer.render(
-        &target.create_view(&Default::default()),
-        &target.create_view(&wgpu::TextureViewDescriptor {
-            format: Some(fmt.remove_srgb_suffix()),
-            ..Default::default()
-        }),
-        cam.matrix(width, height, cam.far),
-        &cam,
-        width,
-        height,
-        false,
-    );
+    let set_pose = |i, cam: &mut Camera| {
+        let old_pos = cam.pos;
+        let old_dir = cam.direction();
+        if let Some(plan) = &flight {
+            let [x, y, z, yaw, pitch] = plan.pose(i);
+            cam.pos = Vec3::new(x, y, z);
+            cam.yaw = yaw;
+            cam.pitch = pitch;
+            cam.underwater_depth = water_depth(&t.water, cam.pos);
+            cam.underwater_fog = t
+                .environments
+                .underwater(cam.pos.to_array(), cam.time_of_day);
+        }
+        cam.logic_delta_ms = if audit.is_some_and(|w| i < w) { 16 } else { 0 };
+        flight.is_some()
+            && (i == 0
+                || old_pos.distance_squared(cam.pos) > 64. * 64.
+                || old_dir.dot(cam.direction()) < 0.866_025_4)
+    };
+    // Apply the requested camera before drawing each exact clock step.
+    for i in 0..=audit.unwrap_or(0) {
+        let cut = set_pose(i, &mut cam);
+        draw(&mut renderer, &cam, cut)?;
+    }
     if std::env::var_os("PW_PREVIEW_MINIMAP").is_some() {
         let d = depth(&renderer.device, width, height);
         renderer.render_minimap(
@@ -7880,55 +9462,176 @@ pub fn preview(
             false,
         );
     }
-    let row = width * 4;
-    let buffer = renderer.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("image readback"),
-        size: (row * height) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut e = renderer.device.create_command_encoder(&Default::default());
-    e.copy_texture_to_buffer(
-        wgpu::ImageCopyTexture {
-            texture: &target,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        wgpu::ImageCopyBuffer {
-            buffer: &buffer,
-            layout: wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(row),
-                rows_per_image: Some(height),
-            },
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    renderer.queue.submit(Some(e.finish()));
-    let (tx, rx) = std::sync::mpsc::channel();
-    buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    renderer.device.poll(wgpu::Maintain::Wait);
-    rx.recv()
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-    let bytes = buffer.slice(..).get_mapped_range();
-    let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
-    encoder.set_color(png::ColorType::Rgba);
-    encoder.set_depth(png::BitDepth::Eight);
-    let mut out = encoder.write_header().map_err(|e| e.to_string())?;
-    out.write_image_data(&bytes).map_err(|e| e.to_string())?;
-    out.finish().map_err(|e| e.to_string())?;
-    drop(bytes);
-    buffer.unmap();
+    let bytes = read_target_pixels(&renderer, &mut captures, &target)?;
+    renderer.lighter.profile_collect(&renderer.queue);
+    readback::png_rgba(path, width, height, &bytes)?;
+    if let Some(warmup) = audit {
+        let info = adapter_info;
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write;
+        let meta_path = path.with_extension("coverage.txt");
+        let digest = Sha256::digest(&bytes);
+        let critters = t
+            .scene
+            .blocks
+            .iter()
+            .map(|block| block.critters.len())
+            .sum::<usize>();
+        let mut meta = format!(
+            "coverage_schema=3\nmap={:?}\nmode={mode:?}\nrgba8_sha256={digest:x}\nimage={width}x{height}\n\
+             eye={:?}\nyaw={}\npitch={}\nfar={}\nfov_y={}\nhour={}\nweather={}\nwarmup_frames={warmup}\nwarmup_step_ms=16\nanimation_elapsed_ms={}\n\
+             cutoff={}\nscenery_quality={}\nsettings={:?}\nsettings_effective={:?}\nadapter={info:?}\ncritters_authored_not_in_world_model_feed={critters}\n\
+             reflection={}\nfog={}\neffects={}\ncloud_detail={}\nbloom={}\nlightmaps={}\narea_grass_lightmaps={}\nrain_at_eye={}\nweather_ticks={}\n",
+            t.map.id, cam.pos.to_array(), cam.yaw, cam.pitch, cam.far, CAMERA_FOV_Y_RADIANS, cam.time_of_day,
+            cam.weather_override.token(), renderer.capture_elapsed_ms.unwrap_or_default(), renderer.detail.terrain_cutoff,
+            renderer.detail.scenery_quality, renderer.lighter.settings, renderer.lighter.effective_settings(),
+            cam.water_reflections, cam.atmospheric_fog, cam.world_effects, cam.cloud_detail,
+            cam.bloom, cam.terrain_lightmaps, cam.area_grass_lightmaps,
+            renderer.frame.weather.rain && cam.underwater_depth <= 0., renderer.frame.weather_ticks,
+        );
+        if let Some(bytes) = native_inventory::device_local_heap(&renderer.device) {
+            writeln!(meta, "vulkan_largest_device_local_heap_bytes={bytes}").unwrap();
+        }
+        if let Some(plan) = &flight {
+            writeln!(
+                meta,
+                "camera_path_sha256={}",
+                plan.preview_path(&t.map.id, cam.time_of_day, warmup)?
+            )
+            .unwrap();
+        }
+        let [both, day, unbound] = renderer.terrain_gpu.lightmap_areas;
+        writeln!(meta, "native_lightmap_areas_day_night={both}\nnative_lightmap_areas_day_only={day}\nnative_lightmap_areas_unbound={unbound}").unwrap();
+        let (roots, warp) = renderer.effect_root_coverage();
+        let (model_events, rejected_model_events) = renderer
+            .models
+            .as_ref()
+            .map_or((0, 0), |world| world.model_event_census());
+        writeln!(meta,
+            "world_effect_authored_scene_roots={}\nworld_effect_decoded_model_event_roots={model_events}\nworld_effect_rejected_model_event_roots={rejected_model_events}",
+            renderer.ray_scene_effects,
+        ).unwrap();
+        let (mut dest_affine, mut dest_unsupported) = (0, 0);
+        if let Some(models) = &renderer.models {
+            for q in models.effect_quads() {
+                let (src, dst) = (q.source_blend, q.destination_blend);
+                if matches!(src, 9 | 10) || matches!(dst, 9 | 10) {
+                    if crate::modules::lighter::model_feed::affine_blend_supported(src, dst) {
+                        dest_affine += 1;
+                    } else {
+                        dest_unsupported += 1;
+                    }
+                }
+            }
+        }
+        let rain_mask_source = renderer.weather.rain_mask_source;
+        writeln!(meta,
+            "platform={}\narchitecture={}\neye_underwater_depth={}\nrain_mask_authored={}\nrain_mask_source={}\nworld_effect_roots_playing={}\nworld_effect_roots_queued={}\nworld_effect_roots_inactive={}\nworld_effect_roots_rejected={}\nworld_effect_roots_unreadable={}\nworld_effect_roots_no_package={}\nworld_effect_roots_unsupported={}\nworld_effect_warp_omitted_elements={warp}\nworld_effect_dest_color_affine_candidates={dest_affine}\nworld_effect_dest_color_unsupported_candidates={dest_unsupported}",
+            std::env::consts::OS, std::env::consts::ARCH, cam.underwater_depth, rain_mask_source == crate::weather_gpu::MaskSource::Authored,
+            rain_mask_source.token(), roots.loaded, roots.pending, roots.disabled, roots.invalid, roots.unavailable, roots.package, roots.unsupported,
+        ).unwrap();
+        let inventory = if let Some(mut native) = native_inventory {
+            native.finish(&renderer, &cam, &mut meta)?
+        } else {
+            let ray_bound = renderer.ray_lightmap_areas_bound();
+            let inventory = renderer.ray_inventory();
+            writeln!(meta, "grass_inventory_scope=native_stream_only\nray_rain_cards={}\nray_lightmap_areas_bound={ray_bound}\nray_lightmap_areas_unbound={}",
+                inventory.ray_rain_cards, (both+day+unbound).saturating_sub(ray_bound)).unwrap();
+            for (name, count) in ["world", "walker", "populator"]
+                .into_iter()
+                .zip(renderer.lighter.skin_omissions)
+            {
+                writeln!(meta, "unsupported_ski_{name}={count}").unwrap();
+            }
+            let mips = renderer.lighter.texture_mips();
+            writeln!(
+                meta,
+                "mip_fallback={}\nmip_generated={}\nmip_reduced={}\nmip_authored_levels={}\nbc_terrain_tiles={}\nbc_terrain_saved_bytes={}",
+                mips.fallback, mips.generated, mips.reduced, mips.authored_levels,
+                mips.bc_terrain_tiles, mips.bc_terrain_saved_bytes
+            )
+            .unwrap();
+            let [tiles, pages, bytes] = renderer.lighter.bc_page_stats();
+            writeln!(meta, "bc_sampled_tiles={tiles}\nbc_sampled_pages={pages}\nbc_image_allocated_bytes={bytes}").unwrap();
+            let [bc5, bc7] = renderer.lighter.bc_material_tiles();
+            writeln!(
+                meta,
+                "bc_sampled_bc5_tiles={bc5}\nbc_sampled_bc7_tiles={bc7}"
+            )
+            .unwrap();
+            if let Some(bmd) = &renderer.lighter.scenery_coverage {
+                writeln!(meta, "{bmd}").unwrap();
+            }
+            inventory
+        };
+        let counts_path = path.with_extension("coverage.csv");
+        let csv = inventory.csv();
+        writeln!(
+            meta,
+            "inventory_sha256={:x}",
+            Sha256::digest(csv.as_bytes())
+        )
+        .unwrap();
+        std::fs::write(&counts_path, csv).map_err(|e| format!("{}: {e}", counts_path.display()))?;
+        let ((trace_w, trace_h), _) = renderer.lighter.travel_trace();
+        writeln!(meta, "trace_image={trace_w}x{trace_h}").unwrap();
+        // These describe the saved PNG, not the later instrumented draws.
+        writeln!(
+            meta,
+            "raster_primary={}\nscreen_reuse_flags={}\nray_reconstruction={}",
+            renderer.lighter.raster_active(),
+            renderer.lighter.screen_reuse_flags(),
+            renderer
+                .lighter
+                .reconstruction_status()
+                .unwrap_or("portable")
+        )
+        .unwrap();
+        // Capture timing is optional and is deliberately distinct from GPU
+        // stage timings and the live asynchronous viewer's frame rate.
+        let mut capture_ms = Vec::new();
+        let mut gpu_ms = Vec::new();
+        for _ in 0..timed_frames {
+            let start = Instant::now();
+            draw(&mut renderer, &cam, false)?;
+            read_target_pixels(&renderer, &mut captures, &target)?;
+            capture_ms.push(start.elapsed().as_secs_f64() * 1000.);
+            if let Some(stages) = renderer.lighter.capture_stage_sample(&renderer.queue) {
+                gpu_ms.push(stages);
+            }
+        }
+        if let Some(provider) = required_provider {
+            let draws = 1 + warmup + timed_frames;
+            writeln!(
+                meta,
+                "required_ray_reconstruction={provider}\nprovider_checked_draws={draws}"
+            )
+            .unwrap();
+        }
+        if !capture_ms.is_empty() {
+            writeln!(meta, "synchronized_capture_ms={capture_ms:?}").unwrap();
+        }
+        if !gpu_ms.is_empty() {
+            writeln!(meta, "gpu_timed_stages=\"build,primary,traversal,reproject,filter,upscale\"\ngpu_timed_ms={gpu_ms:?}").unwrap();
+        }
+        std::fs::write(&meta_path, meta).map_err(|e| format!("{}: {e}", meta_path.display()))?;
+    }
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn preview_provider_guard_rejects_even_a_single_portable_draw() {
+    assert!(assert_preview_provider(Some("Vulkan temporal FSR"), None).is_err());
+    assert!(assert_preview_provider(
+        Some("Vulkan DLSS Ray Reconstruction"),
+        Some("Vulkan temporal FSR")
+    )
+    .is_err());
+    assert!(assert_preview_provider(Some("portable"), None).is_ok());
+    assert!(
+        assert_preview_provider(Some("Vulkan temporal FSR"), Some("Vulkan temporal FSR")).is_ok()
+    );
 }
 
 #[cfg(test)]
@@ -8290,7 +9993,7 @@ mod world_stream_tests {
         };
         let mut layout = crate::texture_atlas::LayoutKey::new();
         layout.slot("textures/物件/石头.dds", slot);
-        let textures = vec![("textures/物件/石头.dds".to_string(), layout.value())];
+        let textures = vec![("textures/物件/石头.dds", layout.value())];
         let base = page(256, 4, 6);
         let key = local_page_key(&base, &textures);
         assert_eq!(key, local_page_key(&base, &textures), "stable for one page");
@@ -8299,7 +10002,7 @@ mod world_stream_tests {
         let moved = crate::texture_atlas::Slot { x: 0, ..slot };
         let mut other_layout = crate::texture_atlas::LayoutKey::new();
         other_layout.slot("textures/物件/石头.dds", moved);
-        let other = vec![("textures/物件/石头.dds".to_string(), other_layout.value())];
+        let other = vec![("textures/物件/石头.dds", other_layout.value())];
         assert_ne!(key, local_page_key(&base, &other));
         assert_ne!(key, local_page_key(&base, &textures[..0]));
         assert_ne!(key, local_page_key(&page(512, 4, 6), &textures));
@@ -8311,9 +10014,9 @@ mod world_stream_tests {
         first.slot("a", slot);
         let mut second = crate::texture_atlas::LayoutKey::new();
         second.slot("b", moved);
-        let a = ("a".to_string(), first.value());
-        let b = ("b".to_string(), second.value());
-        let ab = vec![a.clone(), b.clone()];
+        let a = ("a", first.value());
+        let b = ("b", second.value());
+        let ab = vec![a, b];
         let ba = vec![b, a];
         assert_ne!(
             local_page_key(&base, &ab),

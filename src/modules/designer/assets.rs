@@ -21,6 +21,7 @@ pub struct Assets {
     pub gfx: Archive,
     pub catalog: Catalog,
     pub bounds: SliderBounds,
+    pub(crate) skin_omissions: crate::skin::UnsupportedSkins,
 }
 impl Assets {
     pub fn open(element: &Path) -> Result<Self, String> {
@@ -47,10 +48,17 @@ impl Assets {
             gfx,
             catalog,
             bounds,
+            skin_omissions: Default::default(),
         })
     }
 
     pub fn read(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        let bytes = self.read_raw(path)?;
+        self.skin_omissions.observe(path, &bytes);
+        Ok(bytes)
+    }
+
+    fn read_raw(&mut self, path: &str) -> Result<Vec<u8>, String> {
         let normalized = ecmodel::normalize(path);
         if normalized.starts_with("gfx/") {
             return self.gfx.read(&normalized);

@@ -111,6 +111,33 @@ pub fn tokenize(source: &str) -> Vec<Field> {
     fields
 }
 
+/// Shared playback/audit traversal bound for nested GFX roots.
+pub const MAX_CHILD_DEPTH: usize = 6;
+
+/// Archive member referenced by an element-200…204 `GfxPath`.
+pub fn child_member_path(path: &str) -> Result<String, String> {
+    let mut normalized = String::with_capacity(path.len());
+    for segment in path.trim().split(['/', '\\']).filter(|s| !s.is_empty()) {
+        if !normalized.is_empty() {
+            normalized.push('/');
+        }
+        normalized.push_str(segment);
+    }
+    let normalized = normalized.to_lowercase();
+    if normalized.is_empty()
+        || normalized
+            .split('/')
+            .any(|part| part == "." || part == ".." || part.contains(':'))
+    {
+        return Err(format!("unsafe GFX child path: {path}"));
+    }
+    Ok(if normalized.starts_with("gfx/") {
+        normalized
+    } else {
+        format!("gfx/{normalized}")
+    })
+}
+
 /// A parsed `.gfx` root: playback settings, bounds and every element.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Root {

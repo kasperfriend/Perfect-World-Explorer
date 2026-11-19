@@ -379,6 +379,22 @@ struct BoxArea {
     sun_direction: [f32; 3],
     celestial_flags: u32,
 }
+/// Map-wide radiance palette for Lighter. It is independent of which local
+/// BC box the eye selects; the original hour arithmetic still defines it.
+#[derive(Clone, Copy)]
+pub(crate) struct LightCycle {
+    ambient: [[f32; 3]; 2],
+    diffuse: [[f32; 3]; 2],
+}
+impl LightCycle {
+    pub(crate) fn colors(self, hour: f32) -> ([f32; 3], [f32; 3]) {
+        (
+            client_regional_light::ambient(self.ambient[0], self.ambient[1], night_factor(hour)),
+            client_regional_light::evaluate(hour, self.diffuse[0], self.diffuse[1]).diffuse,
+        )
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Environments {
     areas: Vec<BoxArea>,
@@ -620,6 +636,14 @@ impl Environments {
             auto_fog,
         })
     }
+    pub(crate) fn light_cycle(&self) -> Option<LightCycle> {
+        let a = self.areas.iter().find(|a| a.global)?;
+        Some(LightCycle {
+            ambient: [a.ambient_day, a.ambient_night],
+            diffuse: [a.diffuse_day, a.diffuse_night],
+        })
+    }
+
     pub fn streaming(&self) -> Option<RegionStreaming> {
         self.streaming.clone().map(RegionStreaming::new)
     }
@@ -1118,6 +1142,25 @@ mod tests {
             celestial_flags: flags,
         }
     }
+    #[test]
+    fn world_light_cycle_uses_global_colors_even_when_local_fog_wins() {
+        let sun = [0., -1., 0.];
+        let local = area(false, [0.; 3], 0x18, sun, 7., [0.02; 3]);
+        let global = area(true, [0.; 3], 0x18, sun, 80., [0.6; 3]);
+        let env = Environments {
+            areas: vec![local, global.clone()],
+            ..Default::default()
+        };
+        let map = env.light_cycle().unwrap();
+        assert_eq!(env.atmosphere([0.; 3], 12.).start, 7.);
+        let (day, sun) = map.colors(12.);
+        assert!((day[0] - global.ambient_day[0]).abs() < 1. / 255.);
+        assert!(sun[0] > 0.5);
+        let (night, _) = map.colors(0.);
+        assert_eq!(night, [0.; 3]);
+        assert!(Environments::default().light_cycle().is_none());
+    }
+
     struct Streamed {
         env: Environments,
         active: RegionStreaming,

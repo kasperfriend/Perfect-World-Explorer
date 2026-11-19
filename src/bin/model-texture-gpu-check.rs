@@ -48,6 +48,48 @@ fn fixture(tag: &[u8; 4], transparent: bool) -> Vec<u8> {
     }
     bytes
 }
+// Author different constant blocks per mip so the DX10 header and each
+// sub-block mip offset must be correct on both upload routes.
+const BC5: [[u8; 4]; 4] = [
+    [40, 160, 0, 255],
+    [160, 40, 0, 255],
+    [20, 80, 0, 255],
+    [210, 128, 0, 255],
+];
+const BC7: [[u8; 4]; 4] = [
+    [254, 64, 32, 192],
+    [64, 254, 32, 160],
+    [32, 64, 254, 128],
+    [254, 254, 254, 0],
+];
+fn dx10_fixture(dxgi: u32, colors: [[u8; 4]; 4]) -> Vec<u8> {
+    let mut bytes = fixture(b"DXT1", false);
+    bytes.truncate(128);
+    bytes[84..88].copy_from_slice(b"DX10");
+    bytes.extend([dxgi, 3, 0, 1, 0].into_iter().flat_map(u32::to_le_bytes));
+    for (i, color) in colors.into_iter().enumerate() {
+        let block = if dxgi == 83 {
+            let mut rg = [0u8; 16];
+            rg[0] = color[0];
+            rg[8] = color[1];
+            rg
+        } else {
+            // BC7 mode 6 with equal seven-bit endpoints, P bits and indices 0.
+            let mut data = 64u128;
+            for (c, value) in color.into_iter().enumerate() {
+                let shift = 7 + c * 14;
+                let q = u128::from(value / 2);
+                data |= (q << shift) | (q << (shift + 7));
+            }
+            data.to_le_bytes()
+        };
+        for _ in 0..if i == 0 { 4 } else { 1 } {
+            bytes.extend_from_slice(&block);
+        }
+    }
+    bytes
+}
+
 fn main() {
     std::panic::set_hook(Box::new(|p| {
         eprintln!("::error::{}", p.to_string().replace('\n', "%0A"))
@@ -88,19 +130,56 @@ fn main() {
         entry_point: "main",
     });
     let mut comparisons = 0;
-    for (tag, transparent) in [
-        (b"DXT1", false),
-        (b"DXT3", false),
-        (b"DXT5", false),
-        (b"DXT1", true),
+    use wgpu::TextureFormat::*;
+    let mut cases = Vec::new();
+    for (tag, transparent, format) in [
+        (b"DXT1", false, Bc1RgbaUnorm),
+        (b"DXT3", false, Bc2RgbaUnorm),
+        (b"DXT5", false, Bc3RgbaUnorm),
+        (b"DXT1", true, Bc1RgbaUnorm),
     ] {
-        let bytes = fixture(tag, transparent);
+        let mut expected = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255; 4],
+        ];
+        if transparent {
+            expected = [[0; 4]; 4];
+        } else if tag != b"DXT1" {
+            for (p, a) in expected.iter_mut().zip([17, 85, 170, 255]) {
+                p[3] = a;
+            }
+        }
+        cases.push((
+            std::str::from_utf8(tag).unwrap(),
+            fixture(tag, transparent),
+            format,
+            expected,
+        ));
+    }
+    cases.push(("DX10 BC5", dx10_fixture(83, BC5), Bc5RgUnorm, BC5));
+    cases.push((
+        "DX10 BC7 sRGB (encoded values)",
+        dx10_fixture(99, BC7),
+        Bc7RgbaUnorm,
+        BC7,
+    ));
+    for (tag, bytes, format, expected) in cases {
         for mode in [
             model_texture_gpu::UploadMode::Auto,
             model_texture_gpu::UploadMode::Decoded,
         ] {
             let texture = model_texture_gpu::upload(&device, &queue, &bytes, mode).unwrap();
             assert_eq!(texture.mip_level_count(), 4);
+            assert_eq!(
+                texture.format(),
+                if matches!(mode, model_texture_gpu::UploadMode::Auto) && !features.is_empty() {
+                    format
+                } else {
+                    Rgba8Unorm
+                }
+            );
             let view = texture.create_view(&Default::default());
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
@@ -135,19 +214,9 @@ fn main() {
             rx.recv().unwrap().unwrap();
             let mapped = slice.get_mapped_range();
             let values: &[f32] = bytemuck::cast_slice(&mapped);
-            for (m, color) in [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [1.; 3]]
-                .into_iter()
-                .enumerate()
-            {
-                let alpha = if transparent {
-                    0.
-                } else if tag == b"DXT1" {
-                    1.
-                } else {
-                    [17., 85., 170., 255.][m] / 255.
-                };
-                let rgb = if transparent { [0.; 3] } else { color };
-                for (i, want) in [rgb[0], rgb[1], rgb[2], alpha].into_iter().enumerate() {
+            for (m, color) in expected.into_iter().enumerate() {
+                for (i, channel) in color.into_iter().enumerate() {
+                    let want = f32::from(channel) / 255.;
                     let got = values[m * 4 + i];
                     assert!(
                         got.is_finite() && (got - want).abs() < 0.00001,

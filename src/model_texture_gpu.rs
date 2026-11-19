@@ -2,102 +2,12 @@
 //! DDS keeps every authored mip; ordinary images such as TGA upload their one
 //! decoded RGBA level. Material multiplication still operates in encoded color
 //! space. This is a texture stage, not a complete model material shader.
-use crate::model_dds::{Dds, Format};
+use crate::model_dds::{append_mip, Dds, Format};
 use wgpu::util::DeviceExt;
 #[derive(Clone, Copy)]
 pub enum UploadMode {
     Auto,
     Decoded,
-}
-
-fn append_mip(
-    bytes: &[u8],
-    format: Format,
-    mip: &crate::model_dds::Mip<'_>,
-    rgba: &mut Vec<u8>,
-) -> Result<(), String> {
-    // image's block decoder expects dimensions divisible by four. Decode the
-    // complete stored blocks, then crop; tiny authored mips are not discarded.
-    // An uncompressed surface needs no decoder: the archive stores exactly the
-    // bytes a texture wants, so swap the two colour channels and hand it over.
-    // Round-tripping it through the block decoder's synthetic header is what
-    // used to fail, and a failure here becomes the draw's white placeholder.
-    if let Format::Uncompressed(layout) = format {
-        if layout.bits == 16 {
-            // RGB565: five or six bits per channel, expanded by replicating the
-            // high bits into the low ones so full scale is 255 rather than 248.
-            for pixel in mip.bytes.chunks_exact(2) {
-                let v = u16::from_le_bytes([pixel[0], pixel[1]]);
-                let r = ((v >> 11) & 0x1f) as u32;
-                let g = ((v >> 5) & 0x3f) as u32;
-                let b = (v & 0x1f) as u32;
-                rgba.extend_from_slice(&[
-                    ((r * 255 + 15) / 31) as u8,
-                    ((g * 255 + 31) / 63) as u8,
-                    ((b * 255 + 15) / 31) as u8,
-                    255,
-                ]);
-            }
-        } else if layout.bits == 24 {
-            for pixel in mip.bytes.chunks_exact(3) {
-                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
-            }
-        } else {
-            for pixel in mip.bytes.chunks_exact(4) {
-                let a = if layout.has_alpha { pixel[3] } else { 255 };
-                rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], a]);
-            }
-        }
-        return Ok(());
-    }
-    let width = (mip.width + 3) / 4 * 4;
-    let height = (mip.height + 3) / 4 * 4;
-    let mut single = Vec::with_capacity(128 + mip.bytes.len());
-    single.extend_from_slice(&bytes[..128]);
-    for (offset, value) in [
-        (12, height),
-        (16, width),
-        (20, mip.bytes.len() as u32),
-        (28, 1),
-    ] {
-        single[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-    }
-    single.extend_from_slice(mip.bytes);
-    let mut image = image::load_from_memory_with_format(&single, image::ImageFormat::Dds)
-        .map_err(|e| format!("model DDS mip decode: {e}"))?
-        .into_rgba8();
-    // Some image decoder versions expose DXT1 as RGB, losing its one-bit alpha.
-    // Restore that authored BC1 mode even when the decoded image is RGB-only.
-    if format == Format::Dxt1 {
-        let blocks_x = width / 4;
-        for (block, data) in mip.bytes.chunks_exact(8).enumerate() {
-            let c0 = u16::from_le_bytes([data[0], data[1]]);
-            let c1 = u16::from_le_bytes([data[2], data[3]]);
-            if c0 > c1 {
-                continue;
-            }
-            let selectors = u32::from_le_bytes(data[4..8].try_into().unwrap());
-            let x = (block as u32 % blocks_x) * 4;
-            let y = (block as u32 / blocks_x) * 4;
-            for p in 0..16 {
-                if (selectors >> (p * 2)) & 3 == 3 {
-                    image.get_pixel_mut(x + p % 4, y + p / 4).0[3] = 0;
-                }
-            }
-        }
-    }
-    let pixels = image.as_raw();
-    if width == mip.width {
-        rgba.extend_from_slice(&pixels[..width as usize * mip.height as usize * 4]);
-    } else {
-        for row in pixels
-            .chunks_exact(width as usize * 4)
-            .take(mip.height as usize)
-        {
-            rgba.extend_from_slice(&row[..mip.width as usize * 4]);
-        }
-    }
-    Ok(())
 }
 
 fn decode_rgba(bytes: &[u8]) -> Result<(image::RgbaImage, bool), String> {
@@ -113,6 +23,41 @@ fn decode_rgba(bytes: &[u8]) -> Result<(image::RgbaImage, bool), String> {
     };
     let alpha_texture = image.color().has_alpha();
     Ok((image.into_rgba8(), alpha_texture))
+}
+
+/// Decode the authored mip count for alternate material samplers. Non-DDS
+/// images supply a single base level; the ray texture bank can filter a tail.
+#[allow(dead_code)]
+pub(crate) fn decode_for_rays(bytes: &[u8]) -> Result<(Vec<image::RgbaImage>, bool), String> {
+    if !bytes.starts_with(b"DDS ") {
+        return decode_rgba(bytes).map(|(image, alpha)| (vec![image], alpha));
+    }
+    // If the lower chain is invalid but the base is readable, its eventual
+    // generated mip tail is a mip fallback rather than a missing texture.
+    let dds = match Dds::parse(bytes) {
+        Ok(dds) => dds,
+        Err(error) => match Dds::parse_base(bytes) {
+            Ok(base) => base,
+            Err(_) if bytes.get(84..88) == Some(b"DX10") => return Err(error),
+            Err(_) => {
+                return decode_rgba(bytes)
+                    .map(|(image, alpha)| (vec![image], alpha))
+                    .map_err(|_| error)
+            }
+        },
+    };
+    let mut images = Vec::with_capacity(dds.mips.len());
+    let mut has_alpha = dds.format.alpha_texture();
+    for mip in &dds.mips {
+        let mut rgba = Vec::new();
+        append_mip(bytes, dds.format, mip, &mut rgba)?;
+        has_alpha |= rgba.chunks_exact(4).any(|pixel| pixel[3] < 255);
+        images.push(
+            image::RgbaImage::from_raw(mip.width, mip.height, rgba)
+                .ok_or("invalid decoded model texture extent")?,
+        );
+    }
+    Ok((images, has_alpha))
 }
 
 fn upload_image(
@@ -202,6 +147,8 @@ fn upload_dds(
             Format::Dxt1 => wgpu::TextureFormat::Bc1RgbaUnorm,
             Format::Dxt3 => wgpu::TextureFormat::Bc2RgbaUnorm,
             Format::Dxt5 => wgpu::TextureFormat::Bc3RgbaUnorm,
+            Format::Bc5 => wgpu::TextureFormat::Bc5RgUnorm,
+            Format::Bc7 => wgpu::TextureFormat::Bc7RgbaUnorm,
             // Unreachable: `native` excludes uncompressed surfaces. Spelled out
             // so the match stays exhaustive if that gate is ever loosened.
             Format::Uncompressed(_) => wgpu::TextureFormat::Rgba8Unorm,
@@ -211,7 +158,7 @@ fn upload_dds(
     };
     let decoded;
     let data = if native {
-        &bytes[128..]
+        &bytes[d.data_offset..d.data_offset + d.mips.iter().map(|m| m.bytes.len()).sum::<usize>()]
     } else {
         let total: usize = d
             .mips
@@ -274,6 +221,93 @@ mod tests {
         let (image, alpha) = decode_rgba(&tga(24, &[3, 2, 1])).unwrap();
         assert!(!alpha);
         assert_eq!(image.into_raw(), [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn ray_decode_keeps_a_distinct_authored_bc1_mip() {
+        let mut bytes = vec![0; 128];
+        bytes[..4].copy_from_slice(b"DDS ");
+        for (o, v) in [
+            (4, 124u32),
+            (8, 0xa1007),
+            (12, 2),
+            (16, 4),
+            (20, 8),
+            (28, 2),
+            (76, 32),
+            (80, 4),
+            (108, 0x401008),
+        ] {
+            bytes[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        bytes[84..88].copy_from_slice(b"DXT1");
+        bytes.extend_from_slice(&[0, 248, 0, 0, 0, 0, 0, 0]); // red 4×2
+        bytes.extend_from_slice(&[224, 7, 0, 0, 0, 0, 0, 0]); // green 2×1
+        let (levels, alpha) = decode_for_rays(&bytes).unwrap();
+        assert!(!alpha);
+        assert_eq!(levels.len(), 2);
+        assert_eq!(levels[0].dimensions(), (4, 2));
+        assert_eq!(levels[1].dimensions(), (2, 1));
+        assert_eq!(levels[0].get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(levels[1].get_pixel(1, 0).0, [0, 255, 0, 255]);
+        bytes.truncate(136);
+        assert!(Dds::parse(&bytes).is_err());
+        let (fallback, _) = decode_for_rays(&bytes).unwrap();
+        assert_eq!(&fallback, &levels[..1]);
+    }
+
+    #[test]
+    fn dx10_bc5_and_bc7_have_decoded_fallbacks_for_sub_block_mips() {
+        // BC7 mode 6, equal endpoints. Endpoint p-bits and selectors are zero.
+        let fields = [
+            (64u32, 7),
+            (127, 7),
+            (127, 7),
+            (32, 7),
+            (32, 7),
+            (16, 7),
+            (16, 7),
+            (96, 7),
+            (96, 7),
+        ];
+        let (mut bc7, mut bit) = (0u128, 0);
+        for (value, n) in fields {
+            bc7 |= u128::from(value) << bit;
+            bit += n;
+        }
+        let bc5 = [40, 0, 0, 0, 0, 0, 0, 0, 160, 0, 0, 0, 0, 0, 0, 0];
+        for (dxgi, block, pixel) in [
+            (83, bc5, [40, 160, 0, 255]),
+            (98, bc7.to_le_bytes(), [254, 64, 32, 192]),
+        ] {
+            let mut bytes = vec![0; 148];
+            bytes[..4].copy_from_slice(b"DDS ");
+            bytes[84..88].copy_from_slice(b"DX10");
+            for (o, v) in [
+                (4, 124u32),
+                (12, 2),
+                (16, 2),
+                (28, 2),
+                (76, 32),
+                (80, 4),
+                (128, dxgi),
+                (132, 3),
+                (140, 1),
+            ] {
+                bytes[o..o + 4].copy_from_slice(&v.to_le_bytes());
+            }
+            bytes.extend_from_slice(&block);
+            bytes.extend_from_slice(&block);
+            let (levels, alpha) = decode_for_rays(&bytes).unwrap();
+            assert_eq!(alpha, dxgi == 98);
+            assert_eq!(
+                levels.iter().map(|m| m.dimensions()).collect::<Vec<_>>(),
+                [(2, 2), (1, 1)]
+            );
+            assert!(levels[0].pixels().all(|p| p.0 == pixel));
+            assert_eq!(levels[1].get_pixel(0, 0).0, pixel);
+            assert_eq!(crate::model_dds::decode_base(&bytes).unwrap(), levels[0]);
+        }
     }
 
     #[test]

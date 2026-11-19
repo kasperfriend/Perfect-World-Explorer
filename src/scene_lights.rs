@@ -125,6 +125,10 @@ impl LightPublications {
     pub fn unregister(&mut self, identity: u64) {
         self.entries.retain(|(id, _)| *id != identity);
     }
+    pub(crate) fn consume(&mut self, output: &mut Vec<DynamicLight>) {
+        output.clear();
+        output.extend(self.entries.drain(..).map(|(_, light)| light));
+    }
     pub fn consume_into(&mut self, grid: &mut StaticGrid) {
         let lights: Vec<_> = self.entries.drain(..).map(|(_, light)| light).collect();
         grid.update_dynamic(&lights);
@@ -156,6 +160,11 @@ impl Default for StaticGrid {
     }
 }
 impl StaticGrid {
+    #[allow(dead_code)]
+    pub(crate) fn dynamic_lights(&self) -> &[DynamicLight] {
+        &self.dynamic
+    }
+
     pub fn update(&mut self, lights: &SceneLights, center: [f32; 3]) {
         // The cheap tests come first: the retail rule is a move of one 12-unit
         // cell in X or Z, and comparing the captured corpus is a record-by-record

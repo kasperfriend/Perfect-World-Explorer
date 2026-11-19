@@ -273,6 +273,18 @@ mod tests {
     }
 
     #[test]
+    fn shipped_lighter_manifest_is_discoverable() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(MODULES_DIRECTORY);
+        let registry = Registry::discover(root);
+        let lighter = registry
+            .packages
+            .iter()
+            .find(|p| p.id == "lighter")
+            .expect("Modules/Lighter must be shipped");
+        assert_eq!(lighter.name, "Lighter");
+    }
+
+    #[test]
     fn shipped_walker_manifest_is_discoverable() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(MODULES_DIRECTORY);
         let registry = Registry::discover(root);

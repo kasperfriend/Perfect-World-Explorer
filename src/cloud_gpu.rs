@@ -22,11 +22,11 @@ use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct Instance {
-    center_width: [f32; 4],
-    height_night: [f32; 4],
-    day_color: [f32; 4],
-    atlas_uv: [f32; 4],
+pub(crate) struct Instance {
+    pub center_width: [f32; 4],
+    pub height_night: [f32; 4],
+    pub day_color: [f32; 4],
+    pub atlas_uv: [f32; 4],
 }
 
 #[repr(C)]
@@ -209,7 +209,7 @@ fn triangle_mesh(surface: &CloudSurface) -> (Vec<TriVertex>, Vec<u32>) {
     (verts, idx)
 }
 
-fn billboard_instances(surface: &CloudSurface) -> Vec<Instance> {
+pub(crate) fn billboard_instances(surface: &CloudSurface) -> Vec<Instance> {
     let mut out = Vec::new();
     for cell in surface.cells.iter().flatten() {
         for group in &cell.groups {
@@ -237,7 +237,7 @@ fn billboard_instances(surface: &CloudSurface) -> Vec<Instance> {
     out
 }
 
-fn cumulus_texture(element: &Path) -> Result<image::RgbaImage, String> {
+pub(crate) fn cumulus_texture(element: &Path) -> Result<image::RgbaImage, String> {
     let mut file = File::open(element.join("textures.pck")).map_err(|e| e.to_string())?;
     let entry = crate::pck::directory(&mut file)?
         .into_iter()

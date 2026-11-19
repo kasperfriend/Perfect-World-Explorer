@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 #[path = "../bmd.rs"]
 mod bmd;
+#[path = "../model_dds.rs"]
+mod model_dds;
 #[path = "../objects.rs"]
 mod objects;
 #[path = "../pck.rs"]

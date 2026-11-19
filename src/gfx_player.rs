@@ -100,15 +100,10 @@ use crate::{
     gfx_color_track::ColorTrack,
     gfx_file::{
         Child, Common, Control, ControlData, Curve, Cylinder, Element, Grid, KeyPoint, Lightning,
-        NoiseKind, Particle, Root, Spec, Sprite, Trail, Wave,
+        NoiseKind, Particle, Root, Spec, Sprite, Trail, Wave, MAX_CHILD_DEPTH,
     },
 };
 use glam::{Mat4, Quat, Vec3, Vec4};
-
-/// Nesting limit for element-200 children. The client resolves child paths at
-/// load time and has no cycle guard, so a self-referencing root would recurse
-/// until the stack goes.
-pub const MAX_CHILD_DEPTH: usize = 6;
 
 /// Per-emitter particle ceiling. `Quota` is authoritative when smaller; this
 /// only bounds a malformed value.
@@ -127,9 +122,20 @@ pub const MAX_SEGMENTS: usize = 512;
 /// quad instead of drawing an invisible one.
 const ALPHA_CUTOFF: f32 = 5. / 255.;
 
+/// How the ray feed should interpret the native output. Native still draws
+/// the exact same emitted vertices (including the ground drape lift).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RayPlacement {
+    #[default]
+    World,
+    Screen,
+    Ground,
+}
+
 /// One textured, blended quad in world space, ready for the effect pass.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectQuad {
+    pub ray_placement: RayPlacement,
     /// Archive path (`gfx/textures/...`), already normalized.
     pub texture: String,
     /// D3D8 `D3DBLEND` values, exactly as authored.
@@ -3443,15 +3449,7 @@ pub fn texture_path(texture: &str) -> Result<String, String> {
 
 /// Archive path of a child root (`GfxPath`), relative to the `gfx` root.
 pub fn child_path(path: &str) -> Result<String, String> {
-    let normalized = ecmodel::normalize(path);
-    if normalized.is_empty() || !is_safe(&normalized) {
-        return Err(format!("unsafe GFX child path: {path}"));
-    }
-    Ok(if normalized.starts_with("gfx/") {
-        normalized
-    } else {
-        format!("gfx/{normalized}")
-    })
+    crate::gfx_file::child_member_path(path)
 }
 
 fn is_safe(path: &str) -> bool {
@@ -3741,6 +3739,11 @@ fn push_quad(
     // and the UV channel are wired at this one funnel instead of in each class.
     log_card(context, texture, positions, uv, color, out.len());
     out.push(EffectQuad {
+        ray_placement: if context.id == 101 {
+            RayPlacement::Screen
+        } else {
+            RayPlacement::World
+        },
         texture: texture.to_string(),
         source_blend: context.common.source_blend,
         destination_blend: context.common.destination_blend,
@@ -4471,7 +4474,11 @@ fn drape_sprite(
                 positions[slot] = position;
                 uvs[slot] = corner_uv;
             }
+            let start = out.len();
             push_quad(out, context, texture, positions, uvs, color);
+            for quad in &mut out[start..] {
+                quad.ray_placement = RayPlacement::Ground;
+            }
         }
     }
     crate::diag_keyed!(
@@ -4872,6 +4879,7 @@ fn emit_model(
             continue;
         }
         out.push(EffectQuad {
+            ray_placement: RayPlacement::World,
             texture: mesh.texture.clone(),
             source_blend: context.common.source_blend,
             destination_blend: context.common.destination_blend,

@@ -180,6 +180,7 @@ fn part_visibility(
 }
 
 struct RenderModel<'a> {
+    ray_owner: u64,
     part: ModelPart,
     asset: &'a ModelAsset,
     poses: &'a [PosedMesh],
@@ -208,11 +209,13 @@ fn render_models<'a>(
     let assembly = &character.assembly;
     let mut models = Vec::with_capacity(4 + assembly.weapons.len());
     models.push(RenderModel {
+        ray_owner: 0,
         part: ModelPart::Body,
         asset: &assembly.body,
         poses: &meshes.body,
     });
     models.push(RenderModel {
+        ray_owner: 1,
         part: ModelPart::Face,
         asset: &assembly.face,
         poses: &meshes.face,
@@ -222,8 +225,10 @@ fn render_models<'a>(
             .weapons
             .iter()
             .zip(&meshes.weapons)
-            .filter(|(_, posed)| !posed.is_empty())
-            .map(|(weapon, posed)| RenderModel {
+            .enumerate()
+            .filter(|(_, (_, posed))| !posed.is_empty())
+            .map(|(index, (weapon, posed))| RenderModel {
+                ray_owner: 4 + index as u64,
                 part: ModelPart::Weapon {
                     // HH_qiu is also a native right-hand hanger (Psychic
                     // soulspheres); only the explicit left hook is left-hand.
@@ -239,6 +244,7 @@ fn render_models<'a>(
             .as_ref()
             .ok_or("flight meshes have no asset")?;
         models.push(RenderModel {
+            ray_owner: 2,
             part: ModelPart::Flight,
             asset: &flight.asset,
             poses: &meshes.flight,
@@ -250,6 +256,7 @@ fn render_models<'a>(
             .as_ref()
             .ok_or("mount meshes have no asset")?;
         models.push(RenderModel {
+            ray_owner: 3,
             part: ModelPart::Mount,
             asset: &mount.asset,
             poses: &meshes.mount,
@@ -365,10 +372,10 @@ impl Walker {
         map: MapSpace,
         water: Vec<WaterArea>,
         scene: &crate::scene::Scene,
-        ornaments: Vec<crate::scene::Ornament>,
+        ornaments: &[crate::scene::Ornament],
     ) -> Self {
         let audio = audio::CharacterAudio::new(&element);
-        let collision = collision::Collision::new(element.clone(), scene, &ornaments);
+        let collision = collision::Collision::new(element.clone(), scene, ornaments);
         Self {
             gallery: gallery::Gallery::new(element.clone()),
             element: Some(element),
@@ -1093,6 +1100,114 @@ impl Walker {
         }
     }
 
+    pub(super) fn ray_skin_omissions(&self) -> crate::skin::SkinOmissions {
+        self.assets
+            .as_ref()
+            .map_or_else(Default::default, |assets| assets.skin_omissions.totals())
+    }
+
+    pub(super) fn ray_inputs(
+        &mut self,
+        matrix: Mat4,
+        out: &mut super::lighter::model_feed::Moving<'_>,
+    ) -> Result<(), String> {
+        if !self.is_active() {
+            return Ok(());
+        }
+        let view = gfx_player::View::from_inverse_view_projection(matrix.inverse());
+        let effects = match self.advance_effects(&view) {
+            Ok(effects) => effects,
+            Err(error) => {
+                self.last_error = Some(format!("Walker effects: {error}"));
+                Vec::new()
+            }
+        };
+        let (Some(character), Some(assets)) = (self.character.as_ref(), self.assets.as_mut())
+        else {
+            return Ok(());
+        };
+        let mut decode = |path: &str| {
+            assets
+                .read(path)
+                .and_then(|b| crate::model_texture_gpu::decode_for_rays(&b))
+        };
+        let character_pose = &character.posed.pose;
+        for model in render_models(character, &character.posed.meshes)? {
+            if matches!(
+                part_visibility(&model.part, false, character.soulsphere_hidden()),
+                PartVisibility::Hidden
+            ) {
+                // Authored travel/weapon visibility is not a first-person mask.
+                out.coverage[super::lighter::coverage::Class::Walker].disabled += 1;
+                continue;
+            }
+            let primary = part_visibility(&model.part, self.settings.first_person, false);
+            let (pose, attached) = match model.part {
+                ModelPart::Body => (&character_pose.body, character_pose.mount.is_some()),
+                ModelPart::Face => (&character_pose.face, true),
+                ModelPart::Flight => (
+                    character_pose
+                        .flight
+                        .as_ref()
+                        .ok_or("flight has no hook pose")?,
+                    true,
+                ),
+                ModelPart::Mount => (
+                    character_pose.mount.as_ref().ok_or("mount has no pose")?,
+                    false,
+                ),
+                ModelPart::Weapon { .. } => (
+                    character_pose
+                        .weapons
+                        .get(model.ray_owner as usize - 4)
+                        .ok_or("weapon has no hook pose")?,
+                    true,
+                ),
+            };
+            out.model(
+                "walker",
+                model.ray_owner,
+                super::lighter::model_feed::Posed {
+                    asset: model.asset,
+                    pose,
+                    meshes: model.poses,
+                    attached,
+                },
+                |skin| match primary {
+                    PartVisibility::All => true,
+                    PartVisibility::BodyWithoutHead => skin != 1,
+                    PartVisibility::Hidden => false,
+                },
+                &mut decode,
+            )?;
+        }
+        let decals = character
+            .gfx
+            .quads(&character.assembly, &character.posed.pose)?;
+        out.decals("walker", &decals, &mut decode)?;
+        out.effects("walker", &effects, &mut decode)
+    }
+
+    fn advance_effects(
+        &mut self,
+        view: &gfx_player::View,
+    ) -> Result<Vec<gfx_player::EffectQuad>, String> {
+        let character = self.character.as_mut().ok_or("Walker character missing")?;
+        let map = self.map.as_ref();
+        // Once per world frame; reflection/refraction consume that pose, not
+        // another tick. Clamp wall time after a stall or resize.
+        let now = std::time::Instant::now();
+        let dt_ms = self.last_render.replace(now).map_or(0., |last| {
+            (now.duration_since(last).as_secs_f32() * 1000.).clamp(0., 100.)
+        });
+        let mut quads =
+            character
+                .gfx
+                .advance(&character.assembly, &character.posed.pose, view, dt_ms, map)?;
+        quads.extend(self.gallery.advance(view, dt_ms, map)?);
+        Ok(quads)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -1241,39 +1356,11 @@ impl Walker {
         // triple speed and let an emitter discharge three times the particles.
         if !pose_uploaded {
             let effects = (|| -> Result<Vec<gfx_player::EffectQuad>, String> {
-                let character = self.character.as_mut().ok_or("Walker character missing")?;
-                let assets = self.assets.as_mut().ok_or("Walker assets missing")?;
-                // Terrain for the effects' own ground query: `MatchGrnd` and
-                // `GroundHeight` are gated on an owner byte no `.gfx` file can
-                // set, so the host supplies the sample and those keys stay inert
-                // only while no map is loaded.
-                let map = self.map.as_ref();
-                // `render` carries no delta, so the wall clock supplies one,
-                // clamped: a stall (shader compile, window drag, a breakpoint)
-                // must not fast-forward an effect or let an emitter discharge a
-                // thousand particles in a single frame.
-                let now = std::time::Instant::now();
-                let dt_ms = match self.last_render {
-                    Some(last) => (now.duration_since(last).as_secs_f32() * 1000.).clamp(0., 100.),
-                    None => 0.,
-                };
-                self.last_render = Some(now);
-                // The billboards need a camera basis, and `Frame` only carries
-                // the view-projection, so the eye is recovered from its inverse.
                 let view = gfx_player::View::from_inverse_view_projection(
                     Mat4::from_cols_array_2d(&frame.matrix).inverse(),
                 );
-                let mut quads = character.gfx.advance(
-                    &character.assembly,
-                    &character.posed.pose,
-                    &view,
-                    dt_ms,
-                    map,
-                )?;
-                // The gallery shares this pass: the same draw object, the same
-                // blend buckets and the same texture resolution, so a
-                // free-standing root renders exactly like an attached one.
-                quads.extend(self.gallery.advance(&view, dt_ms, map)?);
+                let quads = self.advance_effects(&view)?;
+                let assets = self.assets.as_mut().ok_or("Walker assets missing")?;
                 if let Some(gpu) = self.gpu.as_mut() {
                     // Element 160 is a skin model like any other, so it takes this
                     // frame's `LIGHTINFO` — the same ambient and directional colour

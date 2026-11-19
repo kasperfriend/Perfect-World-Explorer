@@ -1174,47 +1174,6 @@ mod tests {
     use super::*;
     use crate::{bmd::BrushSide, modules::walker::physics};
 
-    const MASK: u32 = 0xa8937462;
-    const CHECK: u32 = 0x59374231;
-    fn put_u32(bytes: &mut Vec<u8>, value: u32) {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-    /// A minimal uncompressed v2 PCK. Only its directory matters to the
-    /// scenery-path recovery test; payloads need not be valid BMDs when the
-    /// selected map namespace rejects a cross-map match.
-    fn write_pck(path: &std::path::Path, entries: &[(&str, &[u8])]) {
-        let mut bytes = Vec::new();
-        put_u32(&mut bytes, 0x4dca23ef);
-        put_u32(&mut bytes, 0);
-        put_u32(&mut bytes, 0x56a089b7);
-        let mut records = Vec::new();
-        for (name, payload) in entries {
-            records.push((bytes.len() as u32, *name, payload.len() as u32));
-            bytes.extend_from_slice(payload);
-        }
-        let directory_at = bytes.len() as u32;
-        for (offset, name, size) in records {
-            let mut record = vec![0u8; 276];
-            assert!(name.len() <= 260);
-            record[..name.len()].copy_from_slice(name.as_bytes());
-            record[260..264].copy_from_slice(&offset.to_le_bytes());
-            record[264..268].copy_from_slice(&size.to_le_bytes());
-            record[268..272].copy_from_slice(&size.to_le_bytes());
-            put_u32(&mut bytes, 276 ^ MASK);
-            put_u32(&mut bytes, 276 ^ MASK ^ CHECK);
-            bytes.extend_from_slice(&record);
-        }
-        let end = bytes.len() as u32 + 280;
-        let mut footer = vec![0u8; 280];
-        footer[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
-        footer[8..12].copy_from_slice(&(directory_at ^ MASK).to_le_bytes());
-        footer[268..272].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
-        footer[272..276].copy_from_slice(&(entries.len() as u32).to_le_bytes());
-        footer[276..280].copy_from_slice(&0x20002u32.to_le_bytes());
-        bytes.extend_from_slice(&footer);
-        bytes[4..8].copy_from_slice(&end.to_le_bytes());
-        std::fs::write(path, &bytes).unwrap();
-    }
     fn fixture_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "pw-collision-{name}-{}-{}",
@@ -1246,7 +1205,7 @@ mod tests {
     #[test]
     fn a_missing_map_scoped_collision_model_skips_only_that_prop() {
         let root = fixture_root("missing-map-scoped");
-        write_pck(
+        crate::pck::write_test_archive(
             &root.join("litmodels.pck"),
             &[("litmodels/a11/1/litmodel_1399.bmd", b"unreadable")],
         );

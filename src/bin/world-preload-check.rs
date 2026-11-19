@@ -4,6 +4,8 @@ mod bmd;
 // The baked draw-state table is shared with the production scenery path.
 #[path = "../bmd_baked.rs"]
 mod bmd_baked;
+#[path = "../model_dds.rs"]
+mod model_dds;
 #[path = "../objects.rs"]
 mod objects;
 #[path = "../pck.rs"]

@@ -285,6 +285,17 @@ impl TextureResolver {
             stats: ResolverStats::default(),
         }
     }
+    #[allow(dead_code)] // accessed only by the ray scenery feed
+    pub(crate) fn disk_root(&self) -> &Path {
+        &self.disk_root
+    }
+    /// Append an optional archive before a ray-scene batch starts.
+    #[allow(dead_code)] // standalone archive surveys use fixed mounts
+    pub(crate) fn mount(&mut self, archive: MountedArchive) {
+        self.mounts.push(archive);
+        self.cache.clear();
+        self.path_cache.clear();
+    }
     /// Mesh-level skip test from A3DLitMesh::LoadTexture (0x7b9880): byte
     /// length <= 4 (0x7b9948) or the name contains `nrf_` (0x7b99c8).
     pub fn skips_main_load(raw: &str) -> bool {

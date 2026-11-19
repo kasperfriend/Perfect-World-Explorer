@@ -860,14 +860,7 @@ fn terrain(
                     objects::Objects::open(element, ornaments).map_err(|e| e.to_string())
                 });
                 let models_task =
-                    s.spawn(
-                        || match world_models::Assets::open(element, placements.clone()) {
-                            Ok(models) => models,
-                            Err(e) => {
-                                world_models::Assets::load_with(placements, |_| Err(e.clone()))
-                            }
-                        },
-                    );
+                    s.spawn(|| world_models::Assets::open_or_unloaded(element, placements));
                 let grass_task = s.spawn(|| {
                     grass::Grass::load(&world_scene, &dir, element).map_err(|e| e.to_string())
                 });
@@ -914,14 +907,7 @@ fn terrain(
                 })?;
             let (models, grass, trees) = std::thread::scope(|s| {
                 let models_task =
-                    s.spawn(
-                        || match world_models::Assets::open(element, placements.clone()) {
-                            Ok(models) => models,
-                            Err(e) => {
-                                world_models::Assets::load_with(placements, |_| Err(e.clone()))
-                            }
-                        },
-                    );
+                    s.spawn(|| world_models::Assets::open_or_unloaded(element, placements));
                 let grass_task = s.spawn(|| {
                     grass::Grass::load(&world_scene, &dir, element).map_err(|e| e.to_string())
                 });
@@ -3654,10 +3640,14 @@ fn main() {
     let direct_override = direct_map
         .as_deref()
         .filter(|id| world_catalog::valid_world_id(id));
+    let same_world_handoff = gpu::same_world_handoff();
     if let Some(id) = requested_world.as_deref().or(direct_override) {
         saved.selected_world = id.to_ascii_lowercase();
-        if let Err(error) = saved.save() {
-            eprintln!("Settings save: {error}");
+        // A reload may fail. Its parent commits the selection only on Ready.
+        if same_world_handoff.is_none() {
+            if let Err(error) = saved.save() {
+                eprintln!("Settings save: {error}");
+            }
         }
     }
     let direct_without_safe_id = direct_map.is_some() && direct_override.is_none();
@@ -3741,22 +3731,40 @@ fn main() {
         };
         terrain(load_root, all_to_vram, preferred, notice)
     };
-    let (t, fallback_notice) =
-        match world_load::load_with_main_world_fallback_notified(&preferred_world, load_terrain) {
-            Ok((loaded, notice)) => (loaded, notice),
-            Err(error) => {
-                // A replacement child must report failure before showing its
-                // own error; otherwise the old window would wait for a
-                // readiness signal that will never arrive.
-                world_handoff::publish_failure(&error);
-                eprintln!("Error: {error}");
-                #[cfg(windows)]
-                if !world_handoff::is_handoff_child() {
-                    windows_setup::show_error(&error);
-                }
-                std::process::exit(1);
+    // A coverage capture is evidence for one specific map. Do not save a
+    // plausible screenshot and zero failures from an automatic fallback map.
+    let audit = env::var_os("PW_PREVIEW_COVERAGE").is_some()
+        && args
+            .get(2)
+            .is_some_and(|arg| arg == "--gpu-preview" || arg == "--gpu-preview-at");
+    // A reload or device recovery is pinned to the previous map. A
+    // replacement must never signal ready in a different world.
+    let loaded = if audit || same_world_handoff.is_some() {
+        world_load::recoverable_map_operation(|| load_terrain(&preferred_world, None))
+            .and_then(|result| result)
+            .map(|terrain| (terrain, None))
+            .map_err(|error| {
+                let operation = same_world_handoff.unwrap_or("Coverage capture");
+                format!("{operation} for {preferred_world} failed before rendering: {error}")
+            })
+    } else {
+        world_load::load_with_main_world_fallback_notified(&preferred_world, load_terrain)
+    };
+    let (t, fallback_notice) = match loaded {
+        Ok((loaded, notice)) => (loaded, notice),
+        Err(error) => {
+            // A replacement child must report failure before showing its
+            // own error; otherwise the old window would wait for a
+            // readiness signal that will never arrive.
+            world_handoff::publish_failure(&error);
+            eprintln!("Error: {error}");
+            #[cfg(windows)]
+            if !audit && !world_handoff::is_handoff_child() {
+                windows_setup::show_error(&error);
             }
-        };
+            std::process::exit(1);
+        }
+    };
     if let Some(notice) = fallback_notice.as_deref() {
         preferred_world = "world".into();
         saved.selected_world = "world".into();
@@ -3813,8 +3821,11 @@ fn main() {
     })
     .and_then(|result| result);
     if let Err(error) = run_result {
-        if world_load::post_load_failure_decision(&preferred_world, viewer_mode)
-            == world_load::PostLoadDecision::RestartMainWorld
+        // The already running viewer remains available on handoff failure.
+        // Only standalone startup may start another fallback process here.
+        if !world_handoff::is_handoff_child()
+            && world_load::post_load_failure_decision(&preferred_world, viewer_mode)
+                == world_load::PostLoadDecision::RestartMainWorld
         {
             saved.selected_world = "world".into();
             if let Err(save_error) = saved.save() {
@@ -3844,16 +3855,8 @@ fn main() {
                 });
             match restarted {
                 Ok(()) => {
-                    // Publish after the fresh process exists. The parent sees a
-                    // progress notice and readiness, so it exits its overlay
-                    // instead of leaving a second window with a failure dialog.
-                    // The restart deliberately inherits no handoff files.
-                    world_handoff::publish_progress(&notice);
-                    world_handoff::signal_ready();
                     #[cfg(windows)]
-                    if !world_handoff::is_handoff_child() {
-                        windows_setup::show_error(&notice);
-                    }
+                    windows_setup::show_error(&notice);
                     return;
                 }
                 Err(restart_error) => {
@@ -3870,9 +3873,10 @@ fn main() {
             }
         }
         world_handoff::publish_failure(&error);
+        diagnostics::session(format!("Viewer failed: {error}"));
         eprintln!("Error: {error}");
         #[cfg(windows)]
-        if !world_handoff::is_handoff_child() {
+        if !audit && !world_handoff::is_handoff_child() {
             windows_setup::show_error(&error);
         }
         std::process::exit(1);
