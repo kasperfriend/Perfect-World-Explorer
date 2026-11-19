@@ -298,9 +298,8 @@ mod tests {
         assert!(s.physical_bsdf);
         assert_eq!(Settings::decode(&s.encode()), s);
         assert_eq!(Settings::decode("mode=unknown"), Settings::default());
-        let reference = Settings::decode(
-            "reference=true\nhybrid_primary=true\ndynamic_resolution=true",
-        );
+        let reference =
+            Settings::decode("reference=true\nhybrid_primary=true\ndynamic_resolution=true");
         assert_eq!(Settings::decode(&reference.encode()), reference);
         let e = reference.effective();
         assert_eq!([e.samples, e.bounces, e.resolution], [32, 8, 100]);
