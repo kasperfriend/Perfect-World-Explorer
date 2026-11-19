@@ -373,13 +373,6 @@ pub fn to_bgra(rgba: &[u8]) -> Vec<u8> {
 /// repeat every launch either. Mixing the process id, the wall clock and the
 /// address of a stack local gives a different word for practically every run
 /// without pulling in a random-number dependency.
-fn probe_compile_dump() -> u32 {
-    PROBE_COMPILE_DUMP
-}
-
-#[allow(dead_code)]
-const PROBE_COMPILE_DUMP: u32 = 1;
-
 pub fn random_word() -> u64 {
     let mut word = std::process::id() as u64;
     let now = std::time::SystemTime::now()

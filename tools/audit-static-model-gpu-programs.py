@@ -14,7 +14,6 @@ MANIFEST = ROOT / "tools/static-model-gpu-programs.txt"
 WORKFLOW = ROOT / ".github/workflows/pr-checks.yml"
 
 EXCLUDED = {
-    "loading-screen-gpu-check": "the client's loading-screen artwork path (archive lookup, decode, cover fit, status strip, BGRA upload), not a model pipeline",
     "bloom-gpu-check": "post-processing glow chain, not a static-model pipeline",
     "display-gamma-gpu-check": "display gamma ramp, not a static-model pipeline",
     "post-gpu-check": "fullscreen post chain, not a static-model pipeline",

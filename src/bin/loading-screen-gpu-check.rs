@@ -105,33 +105,19 @@ fn bmp() -> Vec<u8> {
     out
 }
 
-/// An uncompressed 32-bit DDS, the layout `model_texture_gpu::Dds` parses:
-/// 128-byte header (`DDS `, `DDSD_CAPS|HEIGHT|WIDTH|PIXELFORMAT|PITCH`,
-/// `DDPF_RGB|DDPF_ALPHAPIXELS`, 32bpp BGRA masks) then tightly packed rows.
 fn dds() -> Vec<u8> {
-    let (width, height) = (16u32, 16u32);
-    let mut out = vec![0u8; 128];
-    out[0..4].copy_from_slice(b"DDS ");
-    out[4..8].copy_from_slice(&124u32.to_le_bytes());
-    out[8..12].copy_from_slice(&0x0000_1007u32.to_le_bytes());
-    out[12..16].copy_from_slice(&height.to_le_bytes());
-    out[16..20].copy_from_slice(&width.to_le_bytes());
-    out[20..24].copy_from_slice(&(width * 4).to_le_bytes());
-    out[76..80].copy_from_slice(&32u32.to_le_bytes());
-    out[80..84].copy_from_slice(&0x41u32.to_le_bytes());
-    out[88..92].copy_from_slice(&0x00ff_0000u32.to_le_bytes());
-    out[92..96].copy_from_slice(&0x0000_ff00u32.to_le_bytes());
-    out[96..100].copy_from_slice(&0x0000_00ffu32.to_le_bytes());
-    out[100..104].copy_from_slice(&0xff00_0000u32.to_le_bytes());
-    for y in 0..height {
-        for x in 0..width {
-            out.extend_from_slice(&[
-                (x * 16) as u8,
-                (y * 16) as u8,
-                30,
-                255,
-            ]);
-        }
+    let mut source = image::RgbaImage::new(16, 16);
+    for (x, y, pixel) in source.enumerate_pixels_mut() {
+        *pixel = image::Rgba([(x * 16) as u8, (y * 16) as u8, 0, 255]);
+    }
+    let mut out = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut out);
+        let mut writer = image::codecs::dds::DdsEncoder::new(cursor);
+        writer.set_color_type(image::ExtendedColorType::Rgba8);
+        writer
+            .write_image(source.as_raw(), 16, 16, image::ExtendedColorType::Rgba8)
+            .unwrap();
     }
     out
 }

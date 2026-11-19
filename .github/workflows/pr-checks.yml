@@ -466,7 +466,11 @@ jobs:
           $status = $LASTEXITCODE
           if ($status -ne 0) {
             Write-Host "::error::Windows viewer build failed (exit $status); diagnostic tail follows"
-            Get-Content -LiteralPath $log -Tail 100 | ForEach-Object { Write-Host "::error::$_" }
+            # PROBE: errors only, so the truncated annotation stream carries the
+            # compiler's own explanation rather than a wall of warnings.
+            Select-String -LiteralPath $log -Pattern '^error' -Context 0,6 |
+              ForEach-Object { $_.Line; $_.Context.PostContext } |
+              ForEach-Object { Write-Host "::error::$_" }
           }
           exit $status
       - name: Build audio corpus and scene diagnostics
