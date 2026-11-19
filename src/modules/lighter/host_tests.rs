@@ -1437,19 +1437,26 @@ fn lighter_live_viewer_frames() {
 #[ignore = "requires an X11 display (e.g. xvfb-run) and Vulkan"]
 fn lighter_live_travel_csv() {
     let root = FixtureRoot::new();
+    let motion = std::env::var_os("PW_TEST_LIGHTER_TRAVEL_MOTION").is_some();
+    let sync = std::env::var_os("PW_TEST_LIGHTER_TRAVEL_SYNC").is_some();
+    let count = if sync { 500 } else { 30 };
     std::fs::write(
         root.0.join("travel.plan"),
-        "lighter-fixture 12 3\n0 -2.5 5 0 0 -0.7853982\n29 2.5 5 -4 0.2 -0.5\n",
+        format!(
+            "lighter-fixture 12 3\n0 -2.5 5 0 0 -0.7853982\n{} 2.5 5 -4 0.2 -0.5\n",
+            count - 1
+        ),
     )
     .unwrap();
-    let motion = std::env::var_os("PW_TEST_LIGHTER_TRAVEL_MOTION").is_some();
     if motion {
         std::fs::write(root.0.join("motion-test"), []).unwrap();
+    }
+    if sync {
+        std::fs::write(root.0.join("sync-test"), []).unwrap();
     }
     super::super::run_viewer(fixture(&root.0), Some(&root.0)).unwrap();
     let csv = std::fs::read_to_string(root.0.join("travel.csv")).unwrap();
     for header in [
-        "# count=30\n",
         "# display=160x96\n",
         "# trace=0x0\n",
         "# ray=Settings { mode: Off,",
@@ -1461,10 +1468,17 @@ fn lighter_live_travel_csv() {
         .filter(|s| !s.starts_with("# "))
         .skip(1)
         .collect::<Vec<_>>();
-    assert_eq!(rows.len(), 30);
+    assert!(csv.contains(&format!("# count={count}\n")));
+    assert_eq!(rows.len(), count);
     for (i, row) in rows.iter().enumerate() {
         let columns = row.split(',').collect::<Vec<_>>();
-        assert_eq!(columns.len(), 15);
+        assert_eq!(columns.len(), if sync { 23 } else { 15 });
+        if sync {
+            assert!(columns[15]
+                .parse::<f64>()
+                .is_ok_and(|v| v.is_finite() && v >= 0.));
+            assert!(columns[16..].iter().all(|column| column.is_empty()));
+        }
         assert_eq!(columns[0].parse::<usize>().unwrap(), i);
         for field in &columns[1..5] {
             let ms: f64 = field.parse().unwrap();
@@ -1472,7 +1486,7 @@ fn lighter_live_travel_csv() {
         }
     }
     assert!(rows[0].contains(",-2.5,5,0,0,-0.7853982,"));
-    assert!(rows[29].contains(",2.5,5,-4,0.2,-0.5,"));
+    assert!(rows[count - 1].contains(",2.5,5,-4,0.2,-0.5,"));
     assert!(
         !root.0.join("0.png").exists(),
         "travel must not capture a screenshot"
@@ -1486,7 +1500,12 @@ fn lighter_live_travel_csv() {
             );
         }
     } else {
-        assert!(csv.contains("# capture_policy=normal_present\n"));
+        let policy = if sync {
+            "synchronized"
+        } else {
+            "normal_present"
+        };
+        assert!(csv.contains(&format!("# capture_policy={policy}\n")));
         assert!(!root.0.join("motion").exists());
     }
     if let Some(path) = std::env::var_os("PW_SAVE_LIGHTER_TRAVEL") {

@@ -374,11 +374,12 @@ struct Commands {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     pending: bool,
+    timer: Option<(vk::QueryPool, u32, f32)>,
     #[cfg(test)]
     fail_submit: bool,
 }
 impl Commands {
-    fn new(raw: &Raw) -> R<Self> {
+    fn new(raw: &Raw, measure: bool) -> R<Self> {
         let device = raw.device.clone();
         let pool = unsafe {
             device.create_command_pool(
@@ -394,6 +395,7 @@ impl Commands {
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
             pending: false,
+            timer: None,
             #[cfg(test)]
             fail_submit: false,
         };
@@ -412,6 +414,27 @@ impl Commands {
                 .create_fence(&vk::FenceCreateInfo::default(), None)
         }
         .map_err(vkerr("fence"))?;
+        if measure {
+            let queues = unsafe {
+                raw.instance
+                    .get_physical_device_queue_family_properties(raw.physical)
+            };
+            let props = unsafe { raw.instance.get_physical_device_properties(raw.physical) };
+            let bits = queues[raw.family as usize].timestamp_valid_bits;
+            if bits != 0 {
+                // Timestamp availability is not required for SDK admission.
+                owned.timer = unsafe {
+                    owned.device.create_query_pool(
+                        &vk::QueryPoolCreateInfo::builder()
+                            .query_type(vk::QueryType::TIMESTAMP)
+                            .query_count(2),
+                        None,
+                    )
+                }
+                .ok()
+                .map(|pool| (pool, bits, props.limits.timestamp_period));
+            }
+        }
         Ok(owned)
     }
     fn idle(&mut self) -> R<bool> {
@@ -433,11 +456,44 @@ impl Commands {
                     &vk::CommandBufferBeginInfo::builder()
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )
-                .map_err(vkerr("begin"))
+                .map_err(vkerr("begin"))?;
+            if let Some((pool, _, _)) = self.timer {
+                self.device.cmd_reset_query_pool(self.cmd, pool, 0, 2);
+                self.device.cmd_write_timestamp(
+                    self.cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    pool,
+                    0,
+                );
+            }
         }
+        Ok(())
+    }
+    fn elapsed_ms(&self) -> Option<f64> {
+        let (pool, bits, period) = self.timer?;
+        if self.pending {
+            return None;
+        }
+        let mut stamps = [0u64; 2];
+        unsafe {
+            self.device
+                .get_query_pool_results(pool, 0, 2, &mut stamps, vk::QueryResultFlags::TYPE_64)
+                .ok()?;
+        }
+        Some(super::vulkan::timestamp_ms(
+            stamps[0], stamps[1], bits, period,
+        ))
     }
     fn submit(&mut self) -> R<()> {
         unsafe {
+            if let Some((pool, _, _)) = self.timer {
+                self.device.cmd_write_timestamp(
+                    self.cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    pool,
+                    1,
+                );
+            }
             self.device
                 .end_command_buffer(self.cmd)
                 .map_err(vkerr("end"))?;
@@ -469,6 +525,9 @@ impl Drop for Commands {
         unsafe {
             if self.pending {
                 let _ = self.device.wait_for_fences(&[self.fence], true, u64::MAX);
+            }
+            if let Some((pool, _, _)) = self.timer {
+                self.device.destroy_query_pool(pool, None);
             }
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.pool, None);
@@ -565,7 +624,10 @@ impl Epoch {
             depth: views.image(&input.depth, rr)?,
         };
         Ok(Self {
-            commands: Commands::new(raw)?,
+            commands: Commands::new(
+                raw,
+                std::env::var("PW_LIGHTER_TRAVEL_SYNC").as_deref() == Ok("1"),
+            )?,
             context,
             _views: views,
             input,
@@ -723,6 +785,10 @@ impl Session {
     pub(super) fn reset(&mut self) {
         self.history.reset();
         self.active = false;
+    }
+    pub(super) fn sdk_ms(&self) -> Option<f64> {
+        self.active.then_some(())?;
+        self.epoch.as_ref()?.commands.elapsed_ms()
     }
     pub(super) fn status(&self) -> Option<&'static str> {
         self.active.then(|| self.request.label())

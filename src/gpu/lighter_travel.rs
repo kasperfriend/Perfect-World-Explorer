@@ -165,6 +165,12 @@ impl Heap {
     }
 }
 
+pub(super) struct SyncSample {
+    pub(super) wait_ms: f64,
+    pub(super) ray_stages: Option<[f64; 6]>,
+    pub(super) sdk_ms: Option<f64>,
+}
+
 struct Sample {
     interval_ms: f64,
     redraw_ms: f64,
@@ -174,6 +180,7 @@ struct Sample {
     streaming: bool,
     committed: bool,
     heap_bytes: Option<u64>,
+    sync: Option<SyncSample>,
 }
 
 struct Setup {
@@ -192,6 +199,9 @@ pub(super) struct Travel {
     adapter: wgpu::AdapterInfo,
     expected_provider: &'static str,
     motion_dir: Option<PathBuf>,
+    sync: bool,
+    heap_peak: Option<u64>,
+    heap_warned: bool,
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     heap: Option<Heap>,
     warm: u32,
@@ -244,6 +254,11 @@ impl Travel {
         if let Some(dir) = std::env::var_os("PW_LIGHTER_TRAVEL_CAPTURE_DIR") {
             travel.enable_motion(PathBuf::from(dir))?;
         }
+        match std::env::var("PW_LIGHTER_TRAVEL_SYNC").as_deref() {
+            Ok("1") => travel.enable_sync()?,
+            Ok("0") | Err(std::env::VarError::NotPresent) => (),
+            _ => return Err("PW_LIGHTER_TRAVEL_SYNC must be 0 or 1".into()),
+        }
         Ok(Some(travel))
     }
 
@@ -275,6 +290,9 @@ impl Travel {
             adapter,
             expected_provider: "portable",
             motion_dir: None,
+            sync: false,
+            heap_peak: None,
+            heap_warned: false,
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             heap: Heap::new(device),
             warm: 0,
@@ -299,6 +317,21 @@ impl Travel {
         }
         self.motion_dir = Some(dir);
         Ok(())
+    }
+
+    pub(super) fn enable_sync(&mut self) -> Result<(), String> {
+        if self.motion_dir.is_some() || self.plan.samples() < 500 {
+            return Err(
+                "synchronized travel needs at least 500 measured frames and no motion readback"
+                    .into(),
+            );
+        }
+        self.sync = true;
+        Ok(())
+    }
+
+    pub(super) fn synchronized(&self) -> bool {
+        self.sync && !self.finished
     }
 
     pub(super) fn motion_frame(&self) -> Option<PathBuf> {
@@ -361,6 +394,7 @@ impl Travel {
         committed: bool,
         view: &crate::view_settings::ViewSettings,
         experiments: (u32, bool, bool),
+        sync: Option<SyncSample>,
     ) {
         if self.finished {
             return;
@@ -368,6 +402,23 @@ impl Travel {
         if settings.mode != self.mode || raster != self.hybrid {
             self.invalidate("drawn route does not match travel experiment");
             return;
+        }
+        if self.sync != sync.is_some() {
+            self.invalidate("missing synchronized completion sample");
+            return;
+        }
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        let heap_bytes = (self.sync || committed || self.samples.len() % 30 == 0)
+            .then(|| self.heap.as_ref().map(Heap::bytes))
+            .flatten();
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        let heap_bytes = None;
+        if let Some(bytes) = heap_bytes {
+            self.heap_peak = Some(self.heap_peak.unwrap_or(0).max(bytes));
+            if !self.heap_warned && bytes >= 7_000_000_000 {
+                self.heap_warned = true;
+                eprintln!("Lighter travel: sampled driver device-local heap use {bytes} bytes (at or above 7 GB)");
+            }
         }
         if self.warm < self.plan.warmup {
             // Warm up at a fixed pose. If loading is underway at its end,
@@ -400,12 +451,6 @@ impl Travel {
         let Some(previous) = self.last.replace(now) else {
             return;
         };
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
-        let heap_bytes = (committed || self.samples.len() % 30 == 0)
-            .then(|| self.heap.as_ref().map(Heap::bytes))
-            .flatten();
-        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-        let heap_bytes = None;
         self.samples.push(Sample {
             interval_ms: (now - previous).as_secs_f64() * 1000.,
             redraw_ms: (now - started).as_secs_f64() * 1000.,
@@ -415,6 +460,7 @@ impl Travel {
             streaming,
             committed,
             heap_bytes,
+            sync,
         });
         if self.samples.len() == self.plan.samples() as usize {
             self.finished = true;
@@ -474,11 +520,18 @@ impl Travel {
                 Sha256::digest(stamp.as_bytes())
             )?;
         }
-        writeln!(out,"frame,interval_ms,redraw_ms,acquire_ms,present_call_ms,x,y,z,yaw,pitch,chunk_x,chunk_z,streaming,committed,device_local_heap_estimate_bytes")?;
+        if let Some(peak) = self.heap_peak {
+            writeln!(out, "# peak_sampled_device_local_heap_estimate_bytes={peak}\n# heap_at_or_above_7_gb={}", self.heap_warned)?;
+        }
+        write!(out,"frame,interval_ms,redraw_ms,acquire_ms,present_call_ms,x,y,z,yaw,pitch,chunk_x,chunk_z,streaming,committed,device_local_heap_estimate_bytes")?;
+        if self.sync {
+            write!(out, ",queue_drain_wall_ms,gpu_as_ms,gpu_raster_primary_ms,gpu_trace_ms,gpu_reproject_ms,gpu_filter_ms,gpu_ray_composite_ms,gpu_sdk_ms")?;
+        }
+        writeln!(out)?;
         for (i, s) in self.samples.iter().enumerate() {
             let [x, y, z, yaw, pitch] = s.pose;
             let [acquire, present] = s.surface_ms;
-            writeln!(
+            write!(
                 out,
                 "{i},{:.6},{:.6},{acquire:.6},{present:.6},{x},{y},{z},{yaw},{pitch},{},{},{},{},{}",
                 s.interval_ms,
@@ -489,6 +542,26 @@ impl Travel {
                 u8::from(s.committed),
                 s.heap_bytes.map_or_else(String::new, |n| n.to_string())
             )?;
+            if let Some(sync) = &s.sync {
+                write!(out, ",{:.6}", sync.wait_ms)?;
+                for j in 0..6 {
+                    let meaningful = (j != 0 || self.mode == Mode::Hardware)
+                        && (j != 1 || self.hybrid)
+                        && (!(j == 3 || j == 4) || self.expected_provider == "portable");
+                    let ms = sync.ray_stages.filter(|_| meaningful).map(|v| v[j]);
+                    write!(
+                        out,
+                        ",{}",
+                        ms.map_or_else(String::new, |v| format!("{v:.6}"))
+                    )?;
+                }
+                write!(
+                    out,
+                    ",{}",
+                    sync.sdk_ms.map_or_else(String::new, |v| format!("{v:.6}"))
+                )?;
+            }
+            writeln!(out)?;
         }
         out.flush()
     }

@@ -159,7 +159,7 @@ impl AllocationBudget {
     }
 }
 
-fn timestamp_ms(start: u64, end: u64, valid_bits: u32, period: f32) -> f64 {
+pub(super) fn timestamp_ms(start: u64, end: u64, valid_bits: u32, period: f32) -> f64 {
     let mask = u64::MAX >> (64 - valid_bits.clamp(1, 64));
     (end.wrapping_sub(start) & mask) as f64 * f64::from(period) / 1.0e6
 }

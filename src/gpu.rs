@@ -6077,6 +6077,9 @@ fn run_viewer(
         if dir.join("motion-test").exists() {
             fixture.enable_motion(dir.join("motion"))?;
         }
+        if dir.join("sync-test").exists() {
+            fixture.enable_sync()?;
+        }
         travel = Some(fixture);
     }
     let mut keys = HashSet::new();
@@ -8470,6 +8473,28 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     }
                                 }
                             } else if let Some(frame) = frame {
+                                let sync = if drawn_pose.is_some() && travel.as_ref().is_some_and(|v| v.synchronized()) {
+                                    // Explicit capture mode. Count only actual completed frames,
+                                    // including raw Vulkan work, not merely a present call.
+                                    let start = Instant::now();
+                                    let completed = wait_for_capture(&renderer.device, || {
+                                        let idle = renderer.device.poll(wgpu::Maintain::Poll).is_queue_empty();
+                                        if gpu_loss.pending() {
+                                            return Err("device lost during synchronized travel".into());
+                                        }
+                                        Ok((idle && renderer.lighter.poll_hardware()?).then_some(()))
+                                    });
+                                    if let Err(error) = completed {
+                                        travel.as_mut().unwrap().invalidate(&error);
+                                        return;
+                                    }
+                                    let wait_ms = start.elapsed().as_secs_f64() * 1000.;
+                                    Some(lighter_travel::SyncSample {
+                                        wait_ms,
+                                        ray_stages: renderer.lighter.capture_stage_sample(&renderer.queue),
+                                        sdk_ms: renderer.lighter.capture_sdk_ms(),
+                                    })
+                                } else { None };
                                 window.pre_present_notify();
                                 let present_started = drawn_pose.map(|_| Instant::now());
                                 frame.present();
@@ -8502,7 +8527,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     let present_ms = (presented_at-present_started.unwrap()).as_secs_f64() * 1000.;
                                     flight.presented(presented_at, redraw_started, [acquire_ms,present_ms], chosen, renderer.lighter.raster_active(),
                                         [(config.width,config.height),world_extent, trace_extent],config.present_mode,pose,renderer.center,
-                                        streaming,std::mem::take(&mut stream_commit_pending),&settings,experiments);
+                                        streaming,std::mem::take(&mut stream_commit_pending),&settings,experiments,sync);
                                     #[cfg(test)]
                                     if smoke_travel.is_some() && flight.recorded() {
                                         target.exit();

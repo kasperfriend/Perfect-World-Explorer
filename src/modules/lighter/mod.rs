@@ -1229,6 +1229,14 @@ impl Lighter {
         stages.iter().all(|s| s.is_finite()).then_some(stages)
     }
 
+    pub(crate) fn capture_sdk_ms(&self) -> Option<f64> {
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(session) = &self.reconstruction {
+            return session.sdk_ms();
+        }
+        None
+    }
+
     pub(crate) fn profile_presented(&mut self, now: Instant) {
         self.cadence.present(now);
     }
