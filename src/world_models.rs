@@ -130,6 +130,7 @@ mod tests {
             position: [10., 2., -3.],
             direction: [0., 0., 2.],
             up: [0., 2., 2.],
+            scale: 1.0,
             path: String::new(),
             action: String::new(),
         };
@@ -155,6 +156,7 @@ mod tests {
             position: [0.; 3],
             direction: [0., 0., 1.],
             up: [0., 1., 0.],
+            scale: 1.0,
             path: "Models\\missing.ecm".into(),
             action: "visible".into(),
         };

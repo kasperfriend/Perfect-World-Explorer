@@ -499,6 +499,7 @@ fn main() {
                 position: [0.; 3],
                 direction: [0., 0., 1.],
                 up: [0., 1., 0.],
+                scale: 1.0,
                 path: "models/a/a.ecm".into(),
                 action: "absent".into(),
             },

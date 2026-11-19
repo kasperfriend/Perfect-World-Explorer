@@ -631,6 +631,11 @@ pub mod sky_transition;
 // "could not find \`diag_keyed\` in the crate root" errors and could not be used.
 #[path = "$REPO/src/model_playback.rs"]
 pub mod model_playback;
+// `world_models` constructs `SceneModel` in its tests, so a field added to that
+// struct breaks it -- which is exactly what CI's `--bins` caught while this
+// module set did not contain `world_models` at all.
+#[path = "$REPO/src/world_models.rs"]
+pub mod world_models;
 #[path = "$REPO/src/world_catalog.rs"]
 pub mod world_catalog;
 #[path = "$OUT/pck_stub.rs"]
