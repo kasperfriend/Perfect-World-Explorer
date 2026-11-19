@@ -9356,6 +9356,8 @@ fn preview_frame_using(
                 writeln!(meta, "{bmd}").unwrap();
             }
         }
+        let ((trace_w, trace_h), _) = renderer.lighter.travel_trace();
+        writeln!(meta, "trace_image={trace_w}x{trace_h}").unwrap();
         // These describe the saved PNG, not the later instrumented draws.
         writeln!(
             meta,

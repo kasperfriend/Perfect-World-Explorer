@@ -110,6 +110,19 @@ class CaptureMatrixTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "doubled budget"):
             temporal.validate_temporal(metas | {"reference": metas["reference"] | {"settings_effective": ref % 32}}, "reveal")
 
+    def test_rt17_ignores_cpu_pairs_and_identifies_incomplete_native_counts(self):
+        cases = [{"id": "wet", "classes": ["water"], "condition": "day"}]
+        timing = {"samples": [1, 2, 3]}
+        captures = {"off": {"inventory": None, "synchronized_capture_ms": timing},
+                    "software": {"inventory": {"water": {}}, "synchronized_capture_ms": timing},
+                    "hardware": {"inventory": {"water": {}}, "synchronized_capture_ms": timing}}
+        report = {"profile": "physical", "cases": [{"case": cases[0], "captures": captures}], "errors": {}}
+        physical = matrix.missing_rt17_cells(cases, report)
+        self.assertEqual(len(physical), 52)
+        self.assertTrue(any(c["route"] == "off" and c["scene_class"] == "water"
+                            and "Native" in c["reason"] for c in physical))
+        self.assertEqual(len(matrix.missing_rt17_cells(cases, report | {"profile": "cpu"})), 54)
+
     def test_gpu_stages_keep_gpu_time_separate_from_capture_wall_time(self):
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "capture.log"

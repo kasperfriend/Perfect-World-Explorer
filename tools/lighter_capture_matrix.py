@@ -45,8 +45,9 @@ REGIONS = {
 
 def metadata(path):
     fields = dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines() if "=" in line)
-    if fields.get("coverage_schema") != "3":
-        raise ValueError(f"{path}: expected matched capture schema 3")
+    schema = fields.get("coverage_schema", "")
+    if not schema.isdecimal() or int(schema) < 3:
+        raise ValueError(f"{path}: expected matched capture schema 3 or newer")
     return fields
 
 
@@ -142,6 +143,11 @@ def verified_image(stem, meta):
 def inventory_for(stem, case):
     with stem.with_suffix(".coverage.csv").open(newline="", encoding="utf-8") as stream:
         rows = {r["class"]: {key: int(value) for key, value in r.items() if key != "class"} for r in csv.DictReader(stream)}
+    for cls, row in rows.items():
+        skipped = sum(row[k] for k in ("range", "cutoff", "replaced", "budget", "pending", "disabled", "empty"))
+        failed = sum(row[k] for k in ("package", "unavailable", "invalid", "unsupported"))
+        if any(v < 0 for v in row.values()) or row["skipped"] != skipped or row["failed"] != failed:
+            raise ValueError(f"{stem.name}: {cls} counts do not match exclusive reasons")
     if rows["near_terrain"]["loaded"] <= 0:
         raise ValueError(f"{stem.name}: no near terrain")
     for cls, expected in case.get("authored_totals", {}).items():
@@ -185,7 +191,7 @@ def completed_stages(meta, count):
             "p50": dict(zip(STAGES, map(statistics.median, zip(*values, strict=True)), strict=True))}
 
 
-def run_case(case, args):
+def run_case(case, args, attempts):
     name = case["id"]
     if not re.fullmatch(r"[a-z0-9-]+", name):
         raise ValueError(f"unsafe case ID {name!r}")
@@ -235,12 +241,23 @@ def run_case(case, args):
             tail = "\n".join(path.read_text(errors="replace").splitlines()[-12:])
             raise RuntimeError(f"{stem.name}: {error}\n{tail}") from error
         meta, images[variant] = capture_metadata(stem, mode, case, profile)
+        if profile == "physical" and args.device and f'name: "{args.device}"' not in meta["adapter"]:
+            raise ValueError(f"{stem.name}: capture did not use {args.device}")
+        if mode != "off":
+            width, height = [int(n) for n in meta["image"].split("x")]
+            expected = f"{width * args.ray_resolution // 100}x{height * args.ray_resolution // 100}"
+            if meta.get("trace_image") != expected:
+                raise ValueError(f"{stem.name}: expected actual ray extent {expected}, got {meta.get('trace_image')}")
         if meta.get("raster_primary", "false") != str(raster).lower():
             raise ValueError(f"{stem.name}: requested and recorded primary path differ")
         requested_reuse = REUSE[args.screen_reuse] if mode != "off" else 0
         if (int(meta.get("screen_reuse_flags", "0")) & 3) != requested_reuse:
             raise ValueError(f"{stem.name}: requested screen reuse not admitted")
-        rows = inventory_for(stem, case) if mode != "off" else None
+        # Native and ray inventories count different units; do not borrow
+        # the ray manifest's expected placement counts for Native.
+        rows = inventory_for(stem, case) if mode != "off" else (
+            inventory_for(stem, {}) if meta.get("native_inventory_scope") == "complete" else None)
+        attempts[variant] = {"files": stem.name, "metadata": meta, "inventory_complete": rows is not None}
         timings = json.loads(meta.get("synchronized_capture_ms", "[]"))
         if len(timings) != args.timed_frames or any(not math.isfinite(t) or t < 0 for t in timings):
             raise ValueError(f"{stem.name}: invalid synchronized timing samples")
@@ -267,6 +284,37 @@ def run_case(case, args):
     return {"case": case, "captures": mode_results, "comparisons": comparisons}
 
 
+def missing_rt17_cells(cases, report):
+    matched = {result["case"]["id"]: result["captures"] for result in report["cases"]}
+    missing = []
+    for subject in sorted(CLASSES):
+        for condition in CONDITIONS:
+            declared = [c for c in cases if subject in c["classes"] and c["condition"] == condition]
+            for route in PROFILES["physical"]:
+                if report["profile"] != "physical":
+                    reason = "CPU subset is not a physical renderer sample"
+                elif not declared:
+                    reason = "no camera declared for this scene class and condition"
+                else:
+                    reason = "no matched capture"
+                    passed = False
+                    for c in declared:
+                        capture = matched.get(c["id"], {}).get(route)
+                        if capture is None:
+                            error = report["errors"].get(c["id"])
+                            reason = f"{c['id']}: {error}" if error else reason
+                        elif capture["inventory"] is None:
+                            reason = f"{c['id']}: full Native loaded/skipped/failed inventory not recorded"
+                        elif not capture["synchronized_capture_ms"] or len(capture["synchronized_capture_ms"]["samples"]) < 3:
+                            reason = f"{c['id']}: fewer than three synchronized draws"
+                        else:
+                            passed = True
+                    if passed:
+                        continue
+                missing.append({"scene_class": subject, "condition": condition, "route": route, "reason": reason})
+    return missing
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("manifest", "viewer", "client", "output"):
@@ -275,6 +323,7 @@ def main():
     parser.add_argument("--ray-resolution", type=int, default=50, choices=range(25, 101), metavar="25..100")
     parser.add_argument("--timed-frames", type=int, choices=range(121), default=0, metavar="0..120")
     parser.add_argument("--timeout", type=int, default=360, help="seconds per capture")
+    parser.add_argument("--device", help="require the recorded Vulkan adapter's exact name for physical runs")
     parser.add_argument("--hybrid-ab", action="store_true", help="also capture Hardware with rasterized 1-spp primary visibility")
     parser.add_argument("--compact-terrain", action="store_true", help="use the experimental buffer-backed BC terrain path")
     parser.add_argument("--fsr1-easu", action="store_true", help="use the spatial EASU color resolve on the ray modes")
@@ -293,8 +342,8 @@ def main():
     if args.require_complete:
         if not complete:
             parser.error(f"physical matrix is incomplete: profile={args.profile}, missing cells={missing}")
-        if args.timed_frames < 3:
-            parser.error("complete physical runs need at least three --timed-frames per mode")
+        if args.timed_frames < 3 or args.ray_resolution != 50:
+            parser.error("complete physical runs need at least three timed frames per mode and 50% ray resolution")
     args.output.mkdir(parents=True, exist_ok=True)
     if any(args.output.iterdir()):
         parser.error(f"use a fresh output directory: {args.output}")
@@ -306,10 +355,12 @@ def main():
               "metric": "mean absolute difference of encoded RGB8 pixel channels (lower is closer, not a pass threshold)",
               "cases": []}
     report["errors"] = {}
+    report["capture_attempts"] = {}
     prefix = "::notice::" if os.environ.get("GITHUB_ACTIONS") == "true" else ""
     for case in cases:
+        attempts = report["capture_attempts"][case["id"]] = {}
         try:
-            result = run_case(case, args)
+            result = run_case(case, args, attempts)
         except (ValueError, RuntimeError, OSError, KeyError) as error:
             report["errors"][case["id"]] = str(error)
             print(f"{case['id']}: {error}", flush=True)
@@ -329,12 +380,16 @@ def main():
               f"{timing or 'no synchronized timing requested'}", flush=True)
         if len(report["cases"]) == 1:
             print(f"{prefix}{software['meta']['adapter']}", flush=True)
-    report["declared_physical_matrix_complete"] = complete and not report["errors"] and args.timed_frames >= 3
+    report["missing_rt17_cells"] = missing_rt17_cells(cases, report)
+    report["declared_physical_matrix_complete"] = (complete and not report["errors"] and not report["missing_rt17_cells"]
+                                                    and args.ray_resolution == 50)
     (args.output / "matrix.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     if report["errors"]:
         message = f"Failed capture cases: {', '.join(report['errors'])}; retained partial evidence in matrix.json"
         print(f"{'::error::' if prefix else ''}{message}", flush=True)
         raise SystemExit(1)
+    if args.require_complete and not report["declared_physical_matrix_complete"]:
+        raise SystemExit(f"RT-17 remains incomplete; see {args.output / 'matrix.json'} for per-route reasons")
 
 
 if __name__ == "__main__":
