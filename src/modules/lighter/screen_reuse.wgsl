@@ -6,6 +6,7 @@ const SCREEN_DI: u32 = 1u;
 const SCREEN_GI: u32 = 2u;
 const SCREEN_PREVIOUS: u32 = 4u;
 const SCREEN_GI_PREVIOUS: u32 = 8u;
+const SCREEN_REPROJECTED: u32 = 16u;
 var<private> screen_pixel: u32;
 var<private> screen_read: u32;
 var<private> screen_write: u32;
@@ -58,6 +59,21 @@ fn replay_light(anchor: Anchor, tag: vec2<u32>) -> LightRay {
     return local_light(anchor.p,anchor.n,anchor.face,tag.x,&seed);
 }
 
+fn previous_clip(p: vec3<f32>) -> vec4<f32> {
+    if (frame.sampling.w & SCREEN_REPROJECTED)!=0u { return frame.previous_screen_vp*vec4<f32>(p,1.); }
+    return frame.vp*vec4<f32>(p,1.);
+}
+
+fn previous_uv(clip: vec4<f32>) -> vec3<f32> {
+    if clip.w<=0. { return vec3<f32>(-1.); }
+    let ndc = clip.xyz/clip.w;
+    return vec3<f32>(ndc.xy*vec2<f32>(0.5,-0.5)+0.5,ndc.z);
+}
+
+fn screen_inside(uv: vec3<f32>) -> bool {
+    return all(uv.xy>=vec2<f32>(0.)) && all(uv.xy<vec2<f32>(1.)) && uv.z>0. && uv.z<=1.;
+}
+
 fn screen_lights(p: vec3<f32>, s: Surface, tag: vec2<u32>, inv_pmf: f32, fresh: LightRay, seed: ptr<function,u32>) -> LightRay {
     var only_fresh = fresh;
     only_fresh.energy *= inv_pmf;
@@ -67,11 +83,20 @@ fn screen_lights(p: vec3<f32>, s: Surface, tag: vec2<u32>, inv_pmf: f32, fresh: 
         bitcast<u32>(s.n.y),bitcast<u32>(s.n.z),tag.x);
     image[screen_write+1u] = Pixel(bitcast<u32>(s.face.x),bitcast<u32>(s.face.y),s.face.z,inv_pmf,tag.y,0u,1u);
     if (frame.sampling.w & SCREEN_PREVIOUS)==0u { return only_fresh; }
+    var xy = vec2<i32>(i32(screen_pixel%frame.extent.x),i32(screen_pixel/frame.extent.x));
+    if (frame.sampling.w & SCREEN_REPROJECTED)!=0u {
+        let uv = previous_uv(previous_clip(p));
+        if !screen_inside(uv) { return only_fresh; }
+        let px = uv.xy*vec2<f32>(frame.extent.xy);
+        let travel = abs(px-vec2<f32>(xy)-0.5);
+        if max(travel.x,travel.y)>32. { return only_fresh; }
+        xy = vec2<i32>(px);
+        if any(xy>=vec2<i32>(frame.extent.xy)) { return only_fresh; }
+    }
     var proposals: array<Reservoir,3>;
     proposals[0] = Reservoir(anchor,tag,inv_pmf,true);
-    proposals[1] = previous_reservoir(screen_read+3u*screen_pixel,anchor);
+    proposals[1] = previous_reservoir(screen_read+3u*(u32(xy.y)*frame.extent.x+u32(xy.x)),anchor);
     // Rotate across cardinal neighbors without selecting on sample radiance.
-    let xy = vec2<i32>(i32(screen_pixel%frame.extent.x),i32(screen_pixel/frame.extent.x));
     let side = (hash(screen_pixel)^frame.sampling.x)&3u;
     let pos = xy + select(vec2<i32>(select(-1,1,side==0u),0),vec2<i32>(0,select(-1,1,side==2u)),side>=2u);
     if all(pos>=vec2<i32>(0)) && all(pos<vec2<i32>(frame.extent.xy)) {
@@ -121,16 +146,13 @@ fn screen_gi_allowed(s: Surface, hit: Hit) -> bool {
 
 fn screen_gi_read(p: vec3<f32>, s: Surface, hit: Hit) -> vec4<f32> {
     if (frame.sampling.w & SCREEN_GI_PREVIOUS)==0u || !screen_gi_allowed(s,hit) { return vec4<f32>(0.); }
-    let clip = frame.vp*vec4<f32>(p,1.);
-    if clip.w<=0. { return vec4<f32>(0.); }
-    let ndc = clip.xyz/clip.w;
-    let uv = ndc.xy*vec2<f32>(0.5,-0.5)+0.5;
-    if any(uv<vec2<f32>(0.)) || any(uv>=vec2<f32>(1.)) || ndc.z<=0. || ndc.z>1. { return vec4<f32>(0.); }
-    let ij = vec2<u32>(uv*vec2<f32>(frame.extent.xy));
+    let uv = previous_uv(previous_clip(p));
+    if !screen_inside(uv) { return vec4<f32>(0.); }
+    let ij = vec2<u32>(uv.xy*vec2<f32>(frame.extent.xy));
     if any(ij>=frame.extent.xy) { return vec4<f32>(0.); }
     let old = image[screen_read+3u*(ij.y*frame.extent.x+ij.x)+2u];
     if old.depth<=0. || old.owner!=hit.primitive || old.view_depth!=f32(hit.instance) ||
-        abs(old.depth-ndc.z)>0.002*ndc.z+0.00001 ||
+        abs(old.depth-uv.z)>0.002*uv.z+0.00001 ||
         (((old.albedo_history>>24u) & (frame.sampling.w>>8u)) & ANIM_MASK)!=0u { return vec4<f32>(0.); }
     if dot(unpack4x8snorm(old.normal_flags).xyz,s.n)<0.99 ||
         strongest(abs(unpack4x8unorm(old.albedo_history).rgb-s.color.rgb))>0.015 { return vec4<f32>(0.); }

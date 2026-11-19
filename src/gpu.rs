@@ -10,6 +10,7 @@ use crate::scenery_visibility::{
 use crate::Terrain;
 #[path = "modules/lighter/host.rs"]
 mod lighter_host;
+mod lighter_travel;
 mod readback;
 mod recovery;
 use bytemuck::{Pod, Zeroable};
@@ -5352,6 +5353,8 @@ fn run_viewer(
     let mut loading = loading;
     #[cfg(test)]
     let smoke_reload = smoke_dir.is_some_and(|dir| dir.join("reload-test").exists());
+    #[cfg(test)]
+    let smoke_travel = smoke_dir.filter(|dir| dir.join("travel.plan").is_file());
     let current_map = t.map.clone();
     let map_dir = t.map_dir.clone();
     let client_root = t.client_root.clone();
@@ -5412,7 +5415,7 @@ fn run_viewer(
         LighterSettings::default()
     };
     #[cfg(test)]
-    let saved_lighter = if smoke_dir.is_some() && restoring.is_none() {
+    let saved_lighter = if smoke_dir.is_some() && smoke_travel.is_none() && restoring.is_none() {
         LighterSettings {
             mode: LighterMode::Software,
             lighting: false,
@@ -5428,7 +5431,8 @@ fn run_viewer(
     // The resize/device-loss fixture explicitly exercises a ray-first child.
     // The reload fixture starts with the same saved mode, but via normal boot.
     #[cfg(test)]
-    let restore_renderer = restore_renderer || smoke_dir.is_some() && !smoke_reload;
+    let restore_renderer =
+        restore_renderer || smoke_dir.is_some() && !smoke_reload && smoke_travel.is_none();
     let lighter_settings = initial_viewer_lighter(saved_lighter, restore_renderer);
     if lighter_settings.mode != saved_lighter.mode {
         crate::diagnostics::session(format!(
@@ -5982,6 +5986,20 @@ fn run_viewer(
     let mut menu_page = MenuPage::Main;
     let mut streaming = false;
     let mut pending_mesh = None;
+    let mut stream_commit_pending = false;
+    let mut travel =
+        lighter_travel::Travel::from_env(&current_map.id, adapter.get_info(), &renderer.device)?;
+    #[cfg(test)]
+    if let Some(dir) = smoke_travel {
+        travel = Some(lighter_travel::Travel::open(
+            dir.join("travel.plan"),
+            dir.join("travel.csv"),
+            &current_map.id,
+            (LighterMode::Off, false),
+            adapter.get_info(),
+            &renderer.device,
+        )?);
+    }
     let mut keys = HashSet::new();
     let mut captured = false;
     // Winit sends Focused(true) when the visible window actually gains focus.
@@ -6157,6 +6175,7 @@ fn run_viewer(
                 WindowEvent::RedrawRequested => {
                     if gpu_recovering || gpu_loss.pending() || gpu_retry_at.is_some_and(|at| Instant::now() < at) { return; }
                     gpu_loss.guard_frame(|| {
+                    let redraw_started = Instant::now();
                     let queue_idle = renderer.device.poll(wgpu::Maintain::Poll).is_queue_empty();
                     if gpu_loss.pending() { return; }
                     frame_capture.collect();
@@ -6253,7 +6272,7 @@ fn run_viewer(
                             }
                             if handoff_child { crate::world_handoff::signal_ready(); }
                             #[cfg(test)]
-                            if smoke_dir.is_some() {
+                            if smoke_dir.is_some() && smoke_travel.is_none() {
                                 if restoring.is_some() {
                                     target.set_control_flow(winit::event_loop::ControlFlow::Poll);
                                     target.exit();
@@ -6265,7 +6284,11 @@ fn run_viewer(
                         }
                     }
                     #[cfg(test)]
-                    if let Some(dir) = smoke_dir {
+                    if smoke_travel.is_some() {
+                        assert!(Instant::now() < smoke_deadline, "viewer did not finish travel capture");
+                    }
+                    #[cfg(test)]
+                    if let Some(dir) = smoke_dir.filter(|_| smoke_travel.is_none()) {
                         assert!(Instant::now() < smoke_deadline, "viewer did not finish live frame checks");
                         if smoke_reload && restoring.is_none() && presented_once {
                             if smoke_frames == 1 && image::open(dir.join("0.png")).is_ok() {
@@ -6404,7 +6427,7 @@ fn run_viewer(
                             }
                         }
                         match renderer.update_mesh(&mut pending_mesh) {
-                            Ok(true) => streaming = false,
+                            Ok(true) => { streaming = false; stream_commit_pending = travel.is_some(); }
                             Ok(false) => {},
                             Err(e) if recovery::lost_error(&e) => {
                                 gpu_loss.report(e);
@@ -6949,6 +6972,29 @@ fn run_viewer(
                             }
                         }
                     }
+                    let travel_pose = travel.as_mut().and_then(|flight| {
+                        let selected = renderer.lighter.settings.mode;
+                        let drawn = if ray_world { selected } else { LighterMode::Off };
+                        let pose = flight.apply(presented_once, drawn, selected)?;
+                        if settings.upscaling != crate::UpscaleMethod::Off || settings.frame_generation != crate::FrameGenMethod::Off {
+                            flight.invalidate("disable the Graphics-tab upscaler and frame generation for a normal-present trace");
+                            return None;
+                        }
+                        if ray_world && renderer.lighter.settings.dynamic_resolution {
+                            flight.invalidate("disable Lighter adaptive resolution for a matched travel trace");
+                            return None;
+                        }
+                        Some(pose)
+                    });
+                    if let Some(([x,y,z,yaw,pitch], _)) = travel_pose {
+                        camera.pos = Vec3::new(x,y,z);
+                        camera.yaw = yaw;
+                        camera.pitch = pitch;
+                        menu_page = MenuPage::Closed;
+                        renderer.capture_elapsed_ms.get_or_insert(0);
+                    } else if travel.is_some() {
+                        renderer.capture_elapsed_ms = None;
+                    }
                     // Any discontinuous camera move invalidates the upscaler
                     // history. Position alone is not enough: a respawn that keeps
                     // the position, a look-behind snap or a cut that turns the
@@ -6983,7 +7029,7 @@ fn run_viewer(
                     last = Instant::now();
                     // Add-ons get an optional camera-owner hook. `None` leaves
                     // the original free-flight controls completely untouched.
-                    let input_allowed = normal_input_allowed(
+                    let input_allowed = travel_pose.is_none() && normal_input_allowed(
                         presented_once && window_focused,
                         menu_page.is_open(),
                         world_loading_active,
@@ -7229,7 +7275,7 @@ fn run_viewer(
                     // time. `sky_time::advance` is 1/600 authored hour per real
                     // second at 1x, which is `CECSunMoon::Tick`'s
                     // 1/14,400,000-per-millisecond day fraction.
-                    if presented_once && !world_loading_active && settings.time_pass_enabled {
+                    if presented_once && !world_loading_active && settings.time_pass_enabled && travel_pose.is_none() {
                         settings.time_of_day = crate::sky_time::advance(
                             settings.time_of_day,
                             dt,
@@ -7242,7 +7288,7 @@ fn run_viewer(
                     // without a restart. (The terrain half is decided when the
                     // world loads.)
                     crate::objects::set_unbounded_textures(settings.all_to_vram);
-                    camera.time_of_day = settings.time_of_day;
+                    camera.time_of_day = travel_pose.map_or(settings.time_of_day, |(_, hour)| hour);
                     camera.tree_wind_strength=settings.tree_wind_strength;camera.client_tree_wind_preview=settings.client_tree_wind_preview;camera.grass_wind_enabled=settings.grass_wind_enabled;camera.grass_wind_amplitude=settings.grass_wind_amplitude;
                     camera.regional_tree_lighting=settings.regional_tree_lighting;
                     camera.grass_distance_fade=settings.grass_distance_fade;
@@ -7283,7 +7329,9 @@ fn run_viewer(
                     camera.model_backface_culling=settings.model_backface_culling;
                     camera.underwater_depth=water_depth(&water_areas,camera.pos);
                     let region_tick = renderer.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                    let region_delta = crate::environment::frame_ms(region_tick.saturating_sub(region_tick_ms));
+                    let region_delta = if travel_pose.is_some() { 16 } else {
+                        crate::environment::frame_ms(region_tick.saturating_sub(region_tick_ms))
+                    };
                     region_tick_ms = region_tick;
                     camera.logic_delta_ms = region_delta;
                     let legacy_fog=fog_transition.update_ms(&environments,camera.pos.to_array(),camera.time_of_day,region_delta);
@@ -7322,6 +7370,7 @@ fn run_viewer(
                     // Acquire the frame. Frame generation owns presentation:
                     // no wgpu swapchain exists in that mode, so there is
                     // nothing to acquire — the pipeline presents instead.
+                    let acquire_started = travel_pose.map(|_| Instant::now());
                     let frame = if !presented_once || framegen.is_some()
                         || xess_framegen.is_some()
                         || dlss_framegen.is_some()
@@ -7347,6 +7396,7 @@ fn run_viewer(
                         eprintln!("surface: presentation unavailable (no swapchain)");
                         None
                     };
+                    let acquire_ms = acquire_started.map_or(0., |t| t.elapsed().as_secs_f64() * 1000.);
                     if !presented_once || framegen.is_some() || xess_framegen.is_some() || dlss_framegen.is_some() || frame.is_some() {
                             let surface_view = frame
                                 .as_ref()
@@ -7465,6 +7515,7 @@ fn run_viewer(
                                 first_draw_started = true;
                                 first_frame_progress(if renderer.renders_rays() { "Drawing the first ray-traced world frame…" } else { "Drawing the first Native world frame…" });
                             }
+                            let drawn_pose = travel_pose.map(|_| [camera.pos.x,camera.pos.y,camera.pos.z,camera.yaw,camera.pitch]);
                             let world_ready = renderer.render(
                                 &world_view,
                                 &world_raw_view,
@@ -7500,7 +7551,7 @@ fn run_viewer(
                                 first_frame_progress("Compositing the first world frame and interface…");
                             }
                             #[cfg(test)]
-                            if let Some(dir) = smoke_dir {
+                            if let Some(dir) = smoke_dir.filter(|_| smoke_travel.is_none()) {
                                 if restoring.is_none() && (smoke_frames == 0 || !smoke_reload && (1..4).contains(&smoke_frames) && world_extent == (192, 112)) {
                                     frame_capture.requested = Some(dir.join(format!("{smoke_frames}.png")));
                                     smoke_frames += 1;
@@ -8315,12 +8366,31 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 }
                             } else if let Some(frame) = frame {
                                 window.pre_present_notify();
+                                let present_started = drawn_pose.map(|_| Instant::now());
                                 frame.present();
+                                let presented_at = Instant::now();
                                 if renderer.renders_rays() {
-                                    renderer.lighter.profile_presented(Instant::now());
+                                    renderer.lighter.profile_presented(presented_at);
+                                }
+                                if let (Some(flight), Some(pose)) = (&mut travel, drawn_pose) {
+                                    let mut chosen = renderer.lighter.settings.effective();
+                                    let (trace_extent, experiments) = if ray_world {
+                                        renderer.lighter.travel_trace()
+                                    } else {
+                                        chosen.mode = LighterMode::Off;
+                                        ((0,0),(0,false,false))
+                                    };
+                                    let present_ms = (presented_at-present_started.unwrap()).as_secs_f64() * 1000.;
+                                    flight.presented(presented_at, redraw_started, [acquire_ms,present_ms], chosen, renderer.lighter.raster_active(),
+                                        [(config.width,config.height),world_extent, trace_extent],config.present_mode,pose,renderer.center,
+                                        streaming,std::mem::take(&mut stream_commit_pending),&settings,experiments);
+                                    #[cfg(test)]
+                                    if smoke_travel.is_some() && flight.recorded() {
+                                        target.exit();
+                                    }
                                 }
                                 #[cfg(test)]
-                                if smoke_dir.is_some() && !smoke_reload {
+                                if smoke_dir.is_some() && smoke_travel.is_none() && !smoke_reload {
                                     let mode = match smoke_frames {
                                         2 => Some(LighterMode::Off),
                                         3 => Some(LighterMode::Software),

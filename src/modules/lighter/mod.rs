@@ -61,6 +61,7 @@ const SCREEN_DI: u32 = 1;
 const SCREEN_GI: u32 = 2;
 const SCREEN_PREVIOUS: u32 = 4;
 const SCREEN_GI_PREVIOUS: u32 = 8;
+const SCREEN_REPROJECTED: u32 = 16;
 const SCREEN_IMAGE_PLANES: u64 = 7;
 
 fn screen_reuse_requested() -> u32 {
@@ -164,6 +165,7 @@ pub struct Frame {
     pub resident_bounds: [f32; 4], // x min/max, z min/max
     pub water_effects: [u32; 4],   // simple tile, initial body, wet-cell table, body count
     pub sky_cdf: [u32; 4],         // current and next sky CDF offsets
+    pub previous_screen_vp: [[f32; 4]; 4],
 }
 
 // Matches Pixel in pixels.wgsl. Includes padding-free guide storage.
@@ -755,6 +757,7 @@ pub struct Lighter {
     screen_reuse: u32,
     screen_written: bool,
     screen_last_flags: u32,
+    last_trace_extent: (u32, u32),
     adapter_supports_compute: bool,
     has_hardware_device: bool,
     native_backend: wgpu::Backend,
@@ -800,6 +803,7 @@ impl Default for Lighter {
             screen_reuse: 0,
             screen_written: false,
             screen_last_flags: 0,
+            last_trace_extent: (0, 0),
             adapter_supports_compute: false,
             has_hardware_device: false,
             native_backend: wgpu::Backend::Empty,
@@ -897,7 +901,19 @@ impl Lighter {
     }
 
     pub(crate) fn screen_reuse_flags(&self) -> u32 {
-        self.screen_last_flags & 15
+        self.screen_last_flags
+            & (SCREEN_DI | SCREEN_GI | SCREEN_PREVIOUS | SCREEN_GI_PREVIOUS | SCREEN_REPROJECTED)
+    }
+
+    pub(crate) fn travel_trace(&self) -> ((u32, u32), (u32, bool, bool)) {
+        (
+            self.last_trace_extent,
+            (
+                self.screen_reuse_flags() & (SCREEN_DI | SCREEN_GI),
+                self.compact_terrain,
+                self.bc_page_stats()[0] > 0,
+            ),
+        )
     }
 
     pub fn armed(&self) -> bool {
@@ -1392,12 +1408,13 @@ impl Lighter {
                     && history.previous_from_current.is_none(),
             );
             if screen != 0 {
-                let same_view =
-                    history.reuse && history.previous_from_current.is_none() && self.screen_written;
+                let reuse = history.reuse && self.screen_written;
                 frame.sampling[3] = screen
-                    | (u32::from(same_view) * SCREEN_PREVIOUS)
+                    | (u32::from(reuse) * SCREEN_PREVIOUS)
+                    | (u32::from(reuse && history.previous_from_current.is_some())
+                        * SCREEN_REPROJECTED)
                     | (u32::from(
-                        same_view
+                        reuse
                             && screen & SCREEN_GI != 0
                             && history.changed_animations & post::ANIM_GEOMETRY == 0,
                     ) * SCREEN_GI_PREVIOUS)
@@ -1520,6 +1537,7 @@ impl Lighter {
             }
         }
         self.frame_error = None;
+        self.last_trace_extent = (rw, rh);
         let message = format!("{} active{} · {rw}×{rh} rays · {} unique resident / {} moving triangles · {} instances · {} unavailable texture(s) · mip_fallback {} ({} reduced)",
             self.settings.mode.label(),if self.raster_active() { " (raster primary)" } else { "" },world.packet.triangles(),moving.triangles(),world.packet.instances.len(),world.textures.missing,world.textures.mips.fallback,world.textures.mips.reduced);
         if self.status.is_none() {

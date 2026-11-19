@@ -22,6 +22,29 @@ fn same_history(old: Pixel, current: Pixel, expected_w: f32, reproject: bool) ->
         && guide_weight(vec4<u32>(a.x,b.yzw),a)>=0.5;
 }
 
+// Clamp only a reprojected sample, and only from a usable neighborhood.
+// Per-channel bounds catch old disoccluded color without eroding the mean
+// of a stationary, high-variance light estimate. Depth is never averaged.
+fn clipped_history(old: vec3<f32>, current: Pixel, coord: vec2<u32>) -> vec3<f32> {
+    let here = color_of(current);
+    var hi = here;
+    var lo = here;
+    var count = 0u;
+    for (var i=0u; i<4u; i++) {
+        let d = select(-1,1,(i & 1u)!=0u);
+        let pos = vec2<i32>(coord) + select(vec2<i32>(d,0),vec2<i32>(0,d),i>=2u);
+        if any(pos<vec2<i32>(0)) || any(pos>=vec2<i32>(params.extent.xy)) { continue; }
+        let neighbor = input_pixels[u32(pos.y)*params.extent.x+u32(pos.x)];
+        if (neighbor.owner & OWNER_MASK)!=(current.owner & OWNER_MASK)
+            || guide_weight(guide_of(neighbor),guide_of(current))<0.5 { continue; }
+        let c = color_of(neighbor);
+        hi = max(hi,c);
+        lo = min(lo,c);
+        count++;
+    }
+    return select(old,clamp(old,lo,hi),count>=2u);
+}
+
 fn temporal(current: Pixel, coord: vec2<u32>, i: u32) -> Pixel {
     let reproject = params.history.z!=0u;
     var at = i;
@@ -37,15 +60,20 @@ fn temporal(current: Pixel, coord: vec2<u32>, i: u32) -> Pixel {
         let p = previous.xyz/previous.w;
         let uv = p.xy*vec2<f32>(0.5,-0.5)+0.5;
         if any(uv<vec2<f32>(0.)) || any(uv>=vec2<f32>(1.)) || p.z<0. || p.z>1. { return current; }
-        let sample = vec2<u32>(uv*vec2<f32>(params.extent.xy));
+        let pos = uv*vec2<f32>(params.extent.xy);
+        let travel = abs(pos-vec2<f32>(coord)-0.5);
+        if max(travel.x,travel.y)>32. { return current; }
+        let sample = vec2<u32>(pos);
+        if any(sample>=params.extent.xy) { return current; }
         at = sample.x + sample.y*params.extent.x;
         expected_w = previous.w*current.view_depth;
     }
     let old = previous_pixels[at];
     if !same_history(old,current,expected_w,reproject) { return current; }
     let count = min(MAX_HISTORY,((old.albedo_history >> HISTORY_SHIFT) & HISTORY_COUNT)+1u);
-    let a = color_of(old);
     let b = color_of(current);
+    var a = color_of(old);
+    if reproject { a = clipped_history(a,current,coord); }
     let old_mean = luminance(a);
     let old_variance = max(0.,variance_of(old));
     let noise = sqrt(old_variance)/max(0.04,old_mean);

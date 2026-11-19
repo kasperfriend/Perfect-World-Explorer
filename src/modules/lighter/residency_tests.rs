@@ -293,3 +293,84 @@ fn lighter_bc_texture_pages_interop() {
     eprintln!("Lighter BC sampled atlas: {stats:?}; RGB8 MAE {:.4}, max {max}; expanded {expanded}, compact {compact}, paged buffer {paged_payload} bytes", sum as f64/count as f64);
     assert!(max <= 4, "unexpected BC/sRGB discrepancy {max} RGB8");
 }
+
+pub(super) fn moving_occluder_history(h: &mut Harness) {
+    let saved = h.ray.settings;
+    h.ray.settings.samples = 1;
+    h.ray.settings.resolution = 100;
+    h.ray.settings.denoiser = false;
+    h.ray.settings.bounces = 0;
+    h.ray.settings.lighting = false;
+    h.ray.settings.shadows = false;
+    h.ray.settings.progressive = true;
+    let mode = h.ray.settings.mode;
+    let mut b = Builder::for_mode(mode);
+    let far = quad(
+        &mut b,
+        [
+            [-8., 8., -6.],
+            [8., 8., -6.],
+            [-8., -8., -6.],
+            [8., -8., -6.],
+        ],
+        [0., 0., 1.],
+        0,
+        0,
+        rgba([0., 1., 0., 1.]),
+    );
+    put(&mut b, far);
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let mut red = Mesh::default();
+    for pos in [
+        [-0.42, 0.9, -3.],
+        [0.42, 0.9, -3.],
+        [-0.42, -0.9, -3.],
+        [0.42, -0.9, -3.],
+    ] {
+        red.vertices
+            .push(Vertex::new(pos, [0., 0., 1.], [0.; 2]).tint(0xff00_00ff, 0xff00_00ff));
+    }
+    red.tri([0, 2, 1], 0);
+    red.tri([1, 2, 3], 0);
+    let poses: Vec<_> = (0..7)
+        .map(|i| {
+            let mut moving = Builder::for_mode(mode);
+            let material = moving.surface(Surface::new(0, 0, 0., 0.));
+            assert_eq!(material, 0);
+            let mut posed = red.clone();
+            for v in &mut posed.vertices {
+                v.pos[0] += 0.37 * (i as f32 - 2.0);
+            }
+            moving
+                .posed_world_mesh("motion-fixture", 2, &posed)
+                .unwrap();
+            let frame = test_frame(Vec3::X * (0.058 * i as f32), Vec3::NEG_Z, 21);
+            (frame, moving.finish())
+        })
+        .collect();
+    let progressive: Vec<_> = poses.iter().map(|(f, m)| h.pixels(*f, m)).collect();
+    let retained = ((h.history_state(21 * 10 + 3).0 >> 24) & 63) as usize;
+    assert!(
+        retained >= 4,
+        "the static background did not keep history during travel: {retained}"
+    );
+    h.ray.settings.progressive = false;
+    let mut revealed = 0;
+    for (i, ((frame, moving), got)) in poses.iter().zip(&progressive).enumerate() {
+        let fresh = h.pixels(*frame, moving);
+        assert_eq!(
+            *got, fresh,
+            "posed foreground left a history trail at travel step {i}"
+        );
+        if i > 0 {
+            revealed += got
+                .iter()
+                .zip(&progressive[i - 1])
+                .filter(|(a, b)| a.1 < b.1)
+                .count();
+        }
+    }
+    assert!(revealed > 100);
+    eprintln!("Lighter {mode:?} camera + posed travel: {revealed} disoccluded samples match fresh RGB/depth; static history count {retained}");
+    h.ray.settings = saved;
+}

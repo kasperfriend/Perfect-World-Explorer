@@ -286,6 +286,8 @@ jobs:
               exit "$status"
             fi
           done
+      - name: Check the Lighter travel report parser
+        run: python3 -m unittest discover -s tools -p test_lighter_travel_report.py
       - name: Exercise nonblocking viewer and explicit headless capture
         env:
           WGPU_BACKEND: vulkan
@@ -296,11 +298,12 @@ jobs:
           PW_UI_TEST: "1"
           PW_PREVIEW_LIGHTER: software
           CARGO_TERM_COLOR: never
+          PW_SAVE_LIGHTER_TRAVEL: target/lighter-travel-fixture.csv
         run: |
           export VK_ICD_FILENAMES="$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)"
           test -n "$VK_ICD_FILENAMES"
           export XDG_CONFIG_HOME="$(mktemp -d)"
-          for suite in live_readback_ring_pixels cutoff_gpu_residency_repacking lighter_headless_preview_png lighter_device_recovery_fixture lighter_live_viewer_frames lighter_live_world_reload; do
+          for suite in live_readback_ring_pixels cutoff_gpu_residency_repacking lighter_headless_preview_png lighter_device_recovery_fixture lighter_live_viewer_frames lighter_live_world_reload lighter_live_travel_csv; do
             runner=()
             if [[ "$suite" == lighter_live_* ]]; then runner=(xvfb-run -a); fi
             status=0
@@ -315,6 +318,15 @@ jobs:
               exit "$status"
             fi
           done
+          python3 tools/lighter_travel_report.py target/lighter-travel-fixture.csv > target/lighter-travel-fixture.json
+      - name: Keep the synthetic live travel capture
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighter-travel-fixture
+          path: |
+            target/lighter-travel-fixture.csv
+            target/lighter-travel-fixture.json
+          if-no-files-found: error
       - name: Check saved Lighter inventory and matching PNG
         env:
           WGPU_BACKEND: vulkan

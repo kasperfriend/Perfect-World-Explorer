@@ -95,6 +95,11 @@ it does not inspect the artistic subject or assert pixel parity.
   Keep [synthetic GPU budget results](gpu-budget.md)
   separate from these retail captures.
 
+For matched movement and residency tails, follow the separate
+[normal-present travel procedure](travel.md). Keep these logs separate from
+pixel-diff timing: the travel capture doesn't read back pixels and its
+present timestamps are CPU API calls, not physical scanout timestamps.
+
 ## Completed CPU Vulkan matrix — run started 2026-11-18 UTC
 
 [Run 44424106472 (`7c57586`)](https://github.com/kasperfriend/Perfect-World-Explorer/actions/runs/44424106472)

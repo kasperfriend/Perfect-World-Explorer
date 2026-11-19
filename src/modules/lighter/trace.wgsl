@@ -21,6 +21,7 @@ struct Frame {
     resident_bounds: vec4<f32>,
     water_effects: vec4<u32>,
     sky_cdf: vec4<u32>,
+    previous_screen_vp: mat4x4<f32>,
 }
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage,read> world: array<u32>;

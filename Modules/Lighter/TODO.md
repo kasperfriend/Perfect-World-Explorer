@@ -16,7 +16,7 @@ it does not set execution order.
 2. [x] Cache BLAS by stable chunk and geometry identity; admit/evict with residency. Update posed positions in place and refit their BLAS. Dirty TLAS only for instance membership/transforms, and rebuild software BVH topology only when the set changes. Camera-only movement in a static scene must trigger zero rebuilds. See [the synthetic residency/refit results](performance.md#resident-acceleration-structures-step-2).
 3. [x] Retain buffers, texture storage and bind groups across frames. Grow to `max(needed, capacity * 2)` within adapter limits, preserve contents when needed, and otherwise write in place. Log zero Lighter-owned resource creation in steady frames. See [the synthetic reuse test](performance.md#resident-gpu-storage-step-3).
 4. [x] Audit `gpu.rs`, `lighter/scenery.rs` and `lighter/host.rs` clones. Borrow read-only data, share lifetimes with `Arc`, and use cached asset IDs. See [the 16/64/256-chunk timing sweep](performance.md#streaming-copy-audit-step-4).
-5. [x] Default to 1 spp, 1 bounce and half ray resolution. Reproject and blend about 0.1 new / 0.9 history with a camera-movement reset; bilinear or edge-aware upscale in presentation. Higher quality is opt-in. See [the reprojection checks](performance.md#interactive-reprojection-step-5).
+5. [x] Default to 1 spp, 1 bounce and half ray resolution. Reproject and blend about 0.1 new / 0.9 history with camera cuts and disocclusion rejected; bilinear or edge-aware upscale in presentation. Higher quality is opt-in. See [the reprojection checks](performance.md#interactive-reprojection-step-5).
 
 ### Phase 1 — Coverage
 

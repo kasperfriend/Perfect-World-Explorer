@@ -787,6 +787,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     exercise_stable_primary_water(&mut h);
     exercise_sun_and_history(&mut h);
     exercise_temporal_animation(&mut h);
+    residency_tests::moving_occluder_history(&mut h);
     exercise_gloss(&mut h);
     exercise_streamed_bmds(&mut h);
     exercise_bmd_chunk_join(&mut h);
@@ -4313,16 +4314,122 @@ fn exercise_screen_reuse(mode: Mode) {
         marks.into_iter().all(|x| x > 0),
         "{mode:?}: temporal/spatial/GI hit counts {marks:?}"
     );
-    let shifted = test_frame(Vec3::new(0.2, 1.8, 2.), Vec3::new(0., -0.24, -1.), SIDE);
+    // Pan by multiple cumulative pixels, without a cut. Replay the same
+    // poses and seed indices with caches off, using the same GPU pipeline.
+    let travel = |mut frame: Frame, i| {
+        let shifted = test_frame(
+            Vec3::new(0.065 * (i + 1) as f32, 1.8, 2.),
+            Vec3::new(0., -0.24, -1.),
+            SIDE,
+        );
+        frame.vp = shifted.vp;
+        frame.inv_vp = shifted.inv_vp;
+        frame.eye = shifted.eye;
+        frame
+    };
+    // Four separated RNG subsequences at the same eight poses. Compare
+    // per-pixel repeat variance (not variance over different scene content),
+    // against an otherwise identical progressive, no-cache pipeline.
+    const STEPS: usize = 8;
+    const SEEDS: [u32; 4] = [0, 96, 208, 512];
+    let median = |mut ms: Vec<f64>| {
+        ms.sort_by(f64::total_cmp);
+        0.5 * (ms[(ms.len() - 1) / 2] + ms[ms.len() / 2])
+    };
+    for bounces in 0..=1 {
+        h.ray.settings.bounces = bounces;
+        let requested = SCREEN_DI | u32::from(bounces == 1) * SCREEN_GI;
+        let mut durations = [Vec::new(), Vec::new()];
+        let mut trials = [Vec::new(), Vec::new()];
+        let mut counts = [0; 3];
+        for (trial, start) in SEEDS.into_iter().enumerate() {
+            // Alternate A/B order. Keep marker readback outside the draw timer.
+            for k in 0..2 {
+                let route = (k + usize::from(trial == 1 || trial == 2)) % 2;
+                let reuse = route == 1;
+                h.ray.screen_reuse = if reuse { requested } else { 0 };
+                h.ray.history = post::History::from_sequence(start);
+                h.ray.reset_history();
+                let mut sequence = Vec::new();
+                for i in 0..STEPS {
+                    let t = Instant::now();
+                    let pixels = h.pixels(travel(f, i), &empty);
+                    if i != 0 {
+                        durations[route].push(t.elapsed().as_secs_f64() * 1e3);
+                    }
+                    let previous = SCREEN_PREVIOUS
+                        | SCREEN_REPROJECTED
+                        | u32::from(bounces == 1) * SCREEN_GI_PREVIOUS;
+                    assert_eq!(
+                        h.ray.screen_reuse_flags(),
+                        if reuse {
+                            requested | if i == 0 { 0 } else { previous }
+                        } else {
+                            0
+                        }
+                    );
+                    if reuse && trial == 0 && i > 0 {
+                        for (total, n) in
+                            counts
+                                .iter_mut()
+                                .zip(screen_markers(&h, SIDE, (start + i as u32) & 1))
+                        {
+                            *total += n;
+                        }
+                    }
+                    sequence.extend(pixels);
+                }
+                trials[route].push(sequence);
+            }
+        }
+        assert!(
+            counts[..(2 + bounces as usize)].iter().all(|&n| n > 0),
+            "missing moving cache reuse: {counts:?}"
+        );
+        let mut signed = [0i64; 3];
+        let mut squared = 0f64;
+        let mut variance = [0.; 2];
+        let n = SEEDS.len() as f64;
+        let count = trials[0][0].len() as f64;
+        for px in 0..trials[0][0].len() {
+            for trial in 0..SEEDS.len() {
+                assert_eq!(
+                    trials[0][trial][px].1, trials[1][trial][px].1,
+                    "pan changed current reverse-Z"
+                );
+            }
+            for c in 0..3 {
+                let samples = trials
+                    .each_ref()
+                    .map(|seqs| seqs.iter().map(|seq| f64::from(seq[px].0[c])));
+                let sum = samples.clone().map(|values| values.sum::<f64>());
+                for (v, (samples, sum)) in variance.iter_mut().zip(samples.into_iter().zip(sum)) {
+                    *v += samples.map(|x| (x - sum / n).powi(2)).sum::<f64>() / (n - 1.);
+                }
+                signed[c] += (sum[1] - sum[0]) as i64;
+                squared += (sum[1] - sum[0]).powi(2) / (n * n);
+            }
+        }
+        let bias = signed.map(|x| x as f64 / (count * n));
+        let variance = variance.map(|v| v / (3. * count));
+        let [no_cache_ms, cache_ms] = durations.map(median);
+        eprintln!("Lighter {mode:?} moving, {bounces} bounces, 4×8 frames: mean delta {bias:?} RGB8, RMS of local means {:.4}, repeat variance {variance:?} RGB8², picks {counts:?}, sync draw/readback p50 {no_cache_ms:.2}/{cache_ms:.2} ms", (squared/(3.*count)).sqrt());
+        assert!(
+            bias.iter().all(|v| v.abs() < 2.),
+            "moving cache mean delta: {bias:?}"
+        );
+    }
+    // A teleport invalidates the pages, not the requested feature.
+    let shifted = test_frame(Vec3::new(64., 1.8, 2.), Vec3::new(0., -0.24, -1.), SIDE);
     f.vp = shifted.vp;
     f.inv_vp = shifted.inv_vp;
     f.eye = shifted.eye;
     let _ = h.pixels(f, &empty);
     assert_eq!(h.ray.screen_reuse_flags(), SCREEN_DI | SCREEN_GI);
     assert_eq!(
-        screen_markers(&h, SIDE, 1),
+        screen_markers(&h, SIDE, (SEEDS[SEEDS.len() - 1] + STEPS as u32) & 1),
         [0; 3],
-        "camera move must reject both old pages"
+        "camera cut must reject both old pages"
     );
     h.ray.settings.progressive = false;
     let _ = h.pixels(f, &empty);

@@ -25,24 +25,30 @@ struct Params {
     previous_from_current: [[f32; 4]; 4],
 }
 
-/// Keep reprojection local to roughly one ray pixel, even after many tiny
-/// changes. Project the current clip volume into the view at the last reset.
-/// Looking at the full frustum (including near Z) also catches zoom changes.
-fn camera_continuous(anchor_from_current: Mat4, [width, height, ..]: [u32; 4]) -> bool {
-    for z in [0., 1.] {
-        for y in [-1., 1.] {
-            for x in [-1., 1.] {
-                let p = anchor_from_current * Vec4::new(x, y, z, 1.);
-                if p.w <= 0. || !p.is_finite() {
-                    return false;
-                }
-                let p = p / p.w;
-                if (p.x - x).abs() * width as f32 * 0.5 > 1.
-                    || (p.y - y).abs() * height as f32 * 0.5 > 1.
-                    || (p.z - z).abs() > 0.02
-                {
-                    return false;
-                }
+/// Test the step, not the total travel since a cut. Near-plane corners move
+/// dramatically even for small translations; reject a near silhouette using
+/// the per-pixel reprojection instead of invalidating the whole screen.
+fn camera_continuous(previous_from_current: Mat4, delta_eye: glam::Vec3) -> bool {
+    // Default free flight is 240 units/s (4 at 60 Hz). Let ordinary
+    // flight at lower frame rates use per-pixel validation too; a jump
+    // beyond this is a cut even when the far frustum barely changes.
+    const MAX_EYE_STEP: f32 = 16.0;
+    const MAX_FAR_NDC_SHIFT: f32 = 0.10;
+    if !delta_eye.is_finite() || delta_eye.length_squared() > MAX_EYE_STEP * MAX_EYE_STEP {
+        return false;
+    }
+    for y in [-1., 1.] {
+        for x in [-1., 1.] {
+            let p = previous_from_current * Vec4::new(x, y, 0., 1.);
+            if p.w <= 0. || !p.is_finite() {
+                return false;
+            }
+            let p = p / p.w;
+            if (p.x - x).abs() > MAX_FAR_NDC_SHIFT
+                || (p.y - y).abs() > MAX_FAR_NDC_SHIFT
+                || p.z.abs() > 0.02
+            {
+                return false;
             }
         }
     }
@@ -54,7 +60,6 @@ struct Stamp {
     vp: Mat4,
     inv_vp: Mat4,
     eye: [f32; 3],
-    camera_anchor: Mat4,
     revision: u64,
     texture_len: usize,
     mode: Mode,
@@ -72,6 +77,14 @@ pub(super) struct History {
 }
 
 impl History {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn from_sequence(sequence: u32) -> Self {
+        Self {
+            previous: None,
+            sequence,
+        }
+    }
+
     pub(super) fn reset(&mut self) {
         self.previous = None;
     }
@@ -88,6 +101,7 @@ impl History {
         // secondary hits. Do not reproject a changed light/decal snapshot.
         let mut stable = *frame;
         stable.vp = [[0.; 4]; 4];
+        stable.previous_screen_vp = [[0.; 4]; 4];
         stable.inv_vp = [[0.; 4]; 4];
         stable.eye[..3].fill(0.);
         stable.waves = [0; 4];
@@ -105,7 +119,6 @@ impl History {
             vp,
             inv_vp,
             eye,
-            camera_anchor: vp,
             revision,
             texture_len,
             mode,
@@ -122,6 +135,7 @@ impl History {
         };
         let mut changed_animations = 0;
         let mut previous_from_current = None;
+        frame.previous_screen_vp = [[0.; 4]; 4];
         let reuse = lighting_unchanged
             && self.previous.as_ref().is_some_and(|old| {
                 if old.revision != revision
@@ -134,14 +148,14 @@ impl History {
                 if old.vp != vp || old.inv_vp != inv_vp || old.eye != eye {
                     // Multi-sample primary depth can come from a jittered hit,
                     // not the center used by reprojection. Reset for motion.
-                    if frame.options[2] != 1
-                        || !camera_continuous(old.camera_anchor * inv_vp, frame.extent)
-                    {
+                    let reprojection = old.vp * inv_vp;
+                    let step = glam::Vec3::from_array(eye) - glam::Vec3::from_array(old.eye);
+                    if frame.options[2] != 1 || !camera_continuous(reprojection, step) {
                         return false;
                     }
-                    previous_from_current = Some(old.vp * inv_vp);
+                    previous_from_current = Some(reprojection);
+                    frame.previous_screen_vp = old.vp.to_cols_array_2d();
                 }
-                stamp.camera_anchor = old.camera_anchor;
                 if old.waves != stamp.waves || old.water_art != stamp.water_art {
                     changed_animations |= ANIM_WAVES;
                 }
@@ -405,7 +419,7 @@ mod tests {
     use bytemuck::Zeroable;
 
     #[test]
-    fn camera_reprojects_subpixel_drift_but_resets_relative_to_last_cut() {
+    fn continuous_camera_compares_each_step_and_detects_cuts() {
         let mut history = History::default();
         let mut frame = Frame {
             vp: Mat4::IDENTITY.to_cols_array_2d(),
@@ -425,10 +439,20 @@ mod tests {
         let sample = step(&mut history, &mut frame);
         assert!(sample.reuse);
         assert!((sample.previous_from_current.unwrap().w_axis.x + 0.014).abs() < 1e-7);
-        set_view(&mut frame, 0.028);
-        assert!(!step(&mut history, &mut frame).reuse);
+        for i in 2..=20 {
+            set_view(&mut frame, 0.014 * i as f32);
+            assert!(
+                step(&mut history, &mut frame).reuse,
+                "reset after accumulated travel at {i}"
+            );
+        }
+        set_view(&mut frame, 0.5);
+        assert!(!step(&mut history, &mut frame).reuse, "rapid turn or zoom");
         let parked = step(&mut history, &mut frame);
         assert!(parked.reuse && parked.previous_from_current.is_none());
+        assert!(camera_continuous(Mat4::IDENTITY, glam::Vec3::X * 8.));
+        frame.eye[2] += 32.;
+        assert!(!step(&mut history, &mut frame).reuse, "position cut");
         frame.options[2] = 2;
         assert!(!step(&mut history, &mut frame).reuse);
         set_view(&mut frame, 0.029);

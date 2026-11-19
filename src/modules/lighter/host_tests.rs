@@ -1424,6 +1424,52 @@ fn lighter_live_viewer_frames() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires an X11 display (e.g. xvfb-run) and Vulkan"]
+fn lighter_live_travel_csv() {
+    let root = FixtureRoot::new();
+    std::fs::write(
+        root.0.join("travel.plan"),
+        "lighter-fixture 12 3\n0 -2.5 5 0 0 -0.7853982\n29 2.5 5 -4 0.2 -0.5\n",
+    )
+    .unwrap();
+    super::super::run_viewer(fixture(&root.0), Some(&root.0)).unwrap();
+    let csv = std::fs::read_to_string(root.0.join("travel.csv")).unwrap();
+    for header in [
+        "# count=30\n",
+        "# display=160x96\n",
+        "# trace=0x0\n",
+        "# ray=Settings { mode: Off,",
+    ] {
+        assert!(csv.contains(header), "missing {header:?} from {csv}");
+    }
+    let rows = csv
+        .lines()
+        .filter(|s| !s.starts_with("# "))
+        .skip(1)
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 30);
+    for (i, row) in rows.iter().enumerate() {
+        let columns = row.split(',').collect::<Vec<_>>();
+        assert_eq!(columns.len(), 15);
+        assert_eq!(columns[0].parse::<usize>().unwrap(), i);
+        for field in &columns[1..5] {
+            let ms: f64 = field.parse().unwrap();
+            assert!(ms.is_finite() && ms >= 0.);
+        }
+    }
+    assert!(rows[0].contains(",-2.5,5,0,0,-0.7853982,"));
+    assert!(rows[29].contains(",2.5,5,-4,0.2,-0.5,"));
+    assert!(
+        !root.0.join("0.png").exists(),
+        "travel must not capture a screenshot"
+    );
+    if let Some(path) = std::env::var_os("PW_SAVE_LIGHTER_TRAVEL") {
+        std::fs::copy(root.0.join("travel.csv"), path).unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 #[ignore = "requires an X11 display and a CPU Vulkan adapter without hardware RT"]
 fn lighter_live_world_reload() {
     let root = FixtureRoot::new();

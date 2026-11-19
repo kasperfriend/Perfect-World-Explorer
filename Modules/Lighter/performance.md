@@ -293,7 +293,7 @@ still traces RGB transmittance.
 |---|---|---|
 | `PW_RAY_COMPACT_TERRAIN=1` | Keep eligible authored BC1/2/3 terrain-color mips in the texel buffer. Decode the RGB palette at filter taps with the same integer arithmetic as the expanded control. | Added decode work may outweigh upload/VRAM savings. Generated, tiny or unprofitable chains stay expanded. Same admission ceiling. Not a native BC texture-unit path, nor compression for ray models, cutouts or linear data. |
 | `PW_RAY_SCREEN_REUSE=di` | At eligible primary receivers with >4 local lights, merge the fresh one-light reservoir with fresh-only reservoirs from the prior pixel and one prior cardinal neighbor. Re-evaluate the picked sample at the receiver, with support-aware MIS across the source receivers; trace current visibility once. | Requires Single-path, progressive 1 spp, lighting/shadows and a stationary compatible snapshot. Not iterative ReSTIR: no propagation of a merged reservoir, no shadow reuse and no skipped fresh light search. |
-| `PW_RAY_SCREEN_REUSE=gi` | At the first **terminal** diffuse hit, project the traced hit to the prior ray image. Try its stored primary direct radiance (plus current terminal ambient), before current media and decals. | Approximate and limited to one bounce, legacy diffuse opaque static surfaces, compatible depth/normal/albedo and the same triangle/instance. Excludes motion and incompatible animations. Off-screen/mismatched hits shade normally. Not a replacement for tracing indirect visibility, and may blur lighting at shadow boundaries. |
+| `PW_RAY_SCREEN_REUSE=gi` | At the first **terminal** diffuse hit, project the traced hit to the prior ray image. Try its stored primary direct radiance (plus current terminal ambient), before current media and decals. | Approximate and limited to one bounce, legacy diffuse opaque static surfaces, compatible depth/normal/albedo and the same triangle/instance. Excludes moving geometry and incompatible animations; short camera steps can reproject static hits. Off-screen/mismatched hits shade normally. Not a replacement for tracing indirect visibility, and may blur lighting at shadow boundaries. |
 | `PW_RAY_SCREEN_REUSE=both` | Shares the same two previous/current cache pages for DI and GI. | Same individual admission gates. Each ray needs 196 B in the trace allocation instead of 28 B: six extra 28 B records per ray. The feature falls back when it cannot fit the existing trace-image reservation; it doesn't lower resolution or relax the cap. |
 
 Both experiments leave the stock pipelines/defaults unchanged and are
@@ -322,13 +322,15 @@ any of these changes by default (other than the one-sample water guard).
 
 ### Still open
 
-- Pace wgpu/Vulkan **GPU** scene uploads/AS submission independently of
-  render-thread work; measure map-travel tails and a complete viewer VRAM
-  budget, not just ray allocations. Compare the compact BC experiment with
-  actual native BC1/3/5/7 sampling/paging on eligible GPUs.
-- Measure DI variance and GI bias, cache hit rate and frame-time trade-offs
-  on moving and stationary real scenes. The experimental caches don't
-  certify temporal stability or a production noise/performance win.
+- [Paced GPU copies and static BLAS](gpu-budget.md#paced-world-crossings) and
+  the sampled BC terrain experiment below passed their synthetic admission
+  and pixel checks. Measure map-travel tails and whole-viewer memory on a
+  physical GPU with the [normal-present travel capture](travel.md). BC5/7
+  sampled ray pages, a physical sampling-speed comparison and a memory win
+  versus the buffer-BC route remain open.
+- The moving tests below expose a variance and cost trade-off, not a win.
+  Inspect DI variance and GI bias, especially under fast flight, animation,
+  and corner disocclusion on real maps before enabling the caches by default.
 - Integrate and validate temporal FSR and DLSS Ray Reconstruction. The
   installed FidelityFX SDK binaries are DX12. NVIDIA's upstream
   [DLSS v310.9.16 SDK](https://github.com/NVIDIA/DLSS/tree/v310.9.16/lib)
@@ -372,3 +374,43 @@ checked the buffer fallback. `bc_sampled_tiles`, `bc_sampled_pages` and
 `bc_image_allocated_bytes` in a pictured-frame sidecar distinguish actual
 admission from the request. This test does not establish a sampling speedup
 or a whole-viewer memory reduction on a physical GPU.
+
+### Moving camera and posed history
+
+Progressive 1-spp history now compares consecutive cameras rather than the
+view at the last reset. A cut, extent/lighting or resident revision change
+still rejects old history. Ordinary steps up to 16 units and bounded far
+frustum change can reproject; radiance also rejects old-color samples more
+than 32 ray pixels away and clips compatible reprojected color to current
+neighbors. Unsupported sheets, unstable animated dependencies and changed
+posed paths still reject history. Screen DI and GI project static hits into
+**the previous view**; GI never takes its previous page after a geometry
+change. The current reverse-Z is not accumulated or color-clipped.
+
+Matched synthetic pan on **llvmpipe 25.0.7 / LLVM 19.1.7**, 43×43 rays,
+four separated RNG subsequences × eight camera poses, progressive 1 spp at
+zero or one bounce. The control runs the same renderer, seeds, camera and
+radiance history with no DI/GI cache. A/B order is counterbalanced. Repeat
+variance is computed across runs at the same pixel and pose (encoded RGB8²),
+not spatial variation over the image. RMS compares local mean encoded colors;
+the mean differences are relative to the finite no-cache control, **not**
+an estimate against converged reference transport. Screen markers are counted
+on the first seed only, outside the timing interval.
+
+| Ray route | Cache | Max absolute mean delta / RMS (RGB8) | Repeat variance off / on | Synchronized draw + readback p50 off / on (ms) |
+|---|---|---:|---:|---:|
+| Software | DI, 0 bounces | 0.557 / 4.944 | 131.41 / 155.90 | 29.77 / 32.62 |
+| Software | DI + GI, 1 bounce | 0.122 / 4.888 | 562.86 / 583.50 | 49.82 / 52.42 |
+| Vulkan CPU ray queries | DI, 0 bounces | 0.557 / 4.944 | 131.41 / 155.91 | 43.89 / 59.92 |
+| Vulkan CPU ray queries | DI + GI, 1 bounce | 0.122 / 4.888 | 562.86 / 583.50 | 68.46 / 83.73 |
+
+Both traced **4,566 temporal and 3,526 spatial DI picks**, plus **904 GI
+uses** at one bounce. All paired current depths matched bit for bit. A camera
+cut discarded both previous pages. A separate moving-camera/posed-occluder
+fixture compared disoccluded pixels to a fresh draw (774 Software and 372
+Vulkan samples), while a static region continued to a history count of five. The Vulkan reuse cost above is from the local
+isolated narrow llvmpipe process (128-bit, one thread); a default-width local
+process was killed during cold compilation. Hosted tests use stock Mesa
+settings. Neither experiment measures live frame time or a physical GPU.
+These results do **not** support enabling screen reuse by default: repeat
+variance rose, and the median synchronized draw was slower in this run.
