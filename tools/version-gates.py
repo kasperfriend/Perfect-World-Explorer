@@ -22,6 +22,7 @@ known offset:
     .clt   precinct/region      ASCII text header line (src/music.rs)
     .spt   SpeedTree            ASCII text header line
     .dat   BSData               magic+version dwords @0/@4
+    .data  elements/task table  dword @0, read as (family << 16) | version
 
 GFX and package versions are inside containers, so `offline_harness.sh gfx` and
 `pck` report those where the real readers run.
@@ -42,6 +43,10 @@ DWORD_FORMATS = {
     ".ecwld": ("world", 4, (0, 0x45435744)),
     ".ecbsd": ("EC-BSD manifest", 8, (0, 0x42584F4D)),
     ".dat": ("BSData", 4, (0, 0x42584F4D)),
+    # `elements.data` and `task_npc.data` put `(family << 16) | version` at 0,
+    # which is what `designer::catalog::unsupported_layout` decodes. No magic to
+    # check, so every `.data` that is not a BSData table lands here.
+    ".data": ("elements/task data", 0, None),
 }
 
 TEXT_FORMATS = {
@@ -103,7 +108,16 @@ def render(label, counter, total):
         return
     print(f"  {label}: {total} file(s)")
     for version, count in counter.most_common():
-        if isinstance(version, int):
+        if isinstance(version, int) and label.startswith("elements"):
+            # The word is `(family << 16) | version`. Printing only the word
+            # makes a newer client's v70 look like an unknown format instead of
+            # a newer revision of the family the reader already handles, which
+            # is the exact mistake `unsupported_layout` was written to avoid.
+            print(
+                f"    family 0x{version >> 16:04x}  version {version & 0xffff:<6} "
+                f"0x{version:08x}  x{count}"
+            )
+        elif isinstance(version, int):
             print(f"    version {version:<6} 0x{version:08x}  x{count}")
         else:
             print(f"    {version!r}  x{count}")
