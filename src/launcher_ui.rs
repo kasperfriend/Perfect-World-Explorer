@@ -1,6 +1,8 @@
 //! Custom-painted native Windows launcher. Artwork is embedded in the executable.
 use std::{
     ffi::c_void,
+    fs,
+    path::PathBuf,
     sync::{Mutex, OnceLock},
 };
 type Handle = *mut c_void;
@@ -104,6 +106,63 @@ struct State {
     /// room for.
     rows: Vec<(String, String)>,
 }
+/// Where the launcher remembers its checkbox.
+///
+/// `windows_setup::settings_file` already owns `%LOCALAPPDATA%\PerfectWorldViewer`
+/// for the remembered client folder; the toggle lives beside it in its own
+/// file so neither write can truncate the other.
+fn settings_file() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .map(|p| p.join("PerfectWorldViewer").join("low-memory"))
+}
+
+/// The stored form of the toggle: exactly `b"1"` or `b"0"`.
+///
+/// Anything else is not a value this code wrote, so it reads as "not set"
+/// rather than as false — the difference between a fresh install and a user
+/// who deliberately turned the option off is what `None` is for, and a
+/// half-written or hand-edited file must not silently pick one.
+fn decode(raw: &[u8]) -> Option<bool> {
+    match raw {
+        b"1" => Some(true),
+        b"0" => Some(false),
+        _ => None,
+    }
+}
+
+fn encode(value: bool) -> &'static [u8] {
+    if value {
+        b"1"
+    } else {
+        b"0"
+    }
+}
+
+fn load_low_memory() -> Option<bool> {
+    decode(&fs::read(settings_file()?).ok()?)
+}
+
+fn save_low_memory(value: bool) -> Result<(), String> {
+    let file = settings_file().ok_or("LOCALAPPDATA is not set")?;
+    fs::create_dir_all(file.parent().ok_or("Invalid settings path")?)
+        .map_err(|e| format!("Unable to save the low-memory setting: {e}"))?;
+    fs::write(file, encode(value))
+        .map_err(|e| format!("Unable to save the low-memory setting: {e}"))
+}
+
+/// Flip the toggle and persist it.
+///
+/// The in-memory state is updated first and the write failure is returned
+/// rather than swallowed, so the caller can say the checkbox did not stick
+/// instead of showing a tick that will be gone next launch.
+fn toggle_low_memory(state: &mut State) -> Result<(), String> {
+    let next = !state.low_memory;
+    save_low_memory(next)?;
+    state.low_memory = next;
+    Ok(())
+}
+
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| Mutex::new(State::default()))
@@ -131,10 +190,21 @@ pub fn initialize() {
             h,
         }
     });
+    restore_state();
+}
+
+/// The part of [`initialize`] that does not decode the artwork: reset the
+/// status and focus, and restore the persisted toggle.
+///
+/// Split out so the restore is testable without the embedded JPEG, which needs
+/// a real decoder (`image` is a stub in the offline harness); `initialize` is
+/// just this plus `ART`.
+fn restore_state() {
     if let Ok(mut s) = state().lock() {
         *s = State {
             status: "No client selected".into(),
             focus: 1,
+            low_memory: load_low_memory().unwrap_or(false),
             ..Default::default()
         };
     }
@@ -177,6 +247,96 @@ pub fn set_scan(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stored form is exactly `1` or `0`, and nothing else is a value.
+    #[test]
+    fn only_the_two_written_bytes_decode() {
+        assert_eq!(decode(b"1"), Some(true));
+        assert_eq!(decode(b"0"), Some(false));
+        assert_eq!(encode(true), b"1");
+        assert_eq!(encode(false), b"0");
+        // A fresh install has no file; a truncated or hand-edited one is not
+        // evidence of a choice either way.
+        assert_eq!(decode(b""), None);
+        assert_eq!(decode(b"true"), None);
+        assert_eq!(decode(b"01"), None);
+        assert_eq!(decode(b"1\n"), None);
+        assert_eq!(decode(b"\x00"), None);
+    }
+
+    #[test]
+    fn every_written_value_reads_back_as_itself() {
+        for value in [true, false] {
+            assert_eq!(decode(encode(value)), Some(value), "{value}");
+        }
+    }
+
+    /// Toggling persists: the value on disk after one click is the opposite of
+    /// the value in memory before it.
+    #[test]
+    fn a_toggle_writes_the_new_value_and_updates_the_state() {
+        let mut state = State::default();
+        assert!(!state.low_memory);
+        // `save_low_memory` needs `LOCALAPPDATA`; point it at a temp directory
+        // so the test never touches the real profile.
+        let dir = std::env::temp_dir().join("pw-launcher-toggle-test");
+        fs::create_dir_all(&dir).unwrap();
+        // SAFETY: this test is the only reader of the variable in this binary.
+        unsafe { std::env::set_var("LOCALAPPDATA", &dir) };
+        toggle_low_memory(&mut state).unwrap();
+        assert!(state.low_memory);
+        assert_eq!(load_low_memory(), Some(true));
+        toggle_low_memory(&mut state).unwrap();
+        assert!(!state.low_memory);
+        assert_eq!(load_low_memory(), Some(false));
+        // A fresh read from the same file agrees with the surviving state.
+        assert_eq!(load_low_memory().unwrap(), state.low_memory);
+        unsafe { std::env::remove_var("LOCALAPPDATA") };
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `initialize()` is what puts the stored value back into the state, and it
+    /// is the half a toggle test cannot see: a build could write the file on
+    /// every click and still start unchecked.
+    #[test]
+    fn initialize_restores_the_stored_toggle() {
+        let dir = std::env::temp_dir().join("pw-launcher-restore-test");
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("LOCALAPPDATA", &dir) };
+
+        // Nothing stored yet: the checkbox starts clear.
+        restore_state();
+        assert!(!low_memory());
+
+        save_low_memory(true).unwrap();
+        restore_state();
+        assert!(low_memory(), "a stored 1 must come back ticked");
+
+        save_low_memory(false).unwrap();
+        restore_state();
+        assert!(!low_memory());
+
+        // An unreadable value is not a choice, so it reads as clear.
+        fs::write(settings_file().unwrap(), b"garbage").unwrap();
+        restore_state();
+        assert!(!low_memory());
+
+        unsafe { std::env::remove_var("LOCALAPPDATA") };
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_environment_is_an_error_not_a_silent_default() {
+        unsafe { std::env::remove_var("LOCALAPPDATA") };
+        assert!(save_low_memory(true).is_err());
+        assert_eq!(load_low_memory(), None);
+    }
+}
+
 pub fn low_memory() -> bool {
     state().lock().map(|s| s.low_memory).unwrap_or(false)
 }
@@ -210,7 +370,11 @@ pub fn click(hwnd: Handle, x: i32, y: i32) -> usize {
             1 => return 1,
             2 => return 2,
             3 => {
-                s.low_memory = !s.low_memory;
+                // A failed write must not leave the tick showing: the toggle
+                // reverts and the status line says why.
+                if let Err(e) = toggle_low_memory(&mut s) {
+                    s.status = e;
+                }
                 unsafe {
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
@@ -243,7 +407,9 @@ pub fn key(hwnd: Handle, k: usize) -> usize {
                 1 => return 1,
                 2 if s.ready => return 2,
                 3 => {
-                    s.low_memory = !s.low_memory;
+                    if let Err(e) = toggle_low_memory(&mut s) {
+                        s.status = e;
+                    }
                     unsafe {
                         InvalidateRect(hwnd, std::ptr::null(), 0);
                     }

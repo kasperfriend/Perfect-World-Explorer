@@ -148,6 +148,12 @@ jobs:
       # now nothing outside the viewer target compiled it.
       - name: Texture cache and world model list
         run: bash tools/offline_harness.sh objects
+      # The launcher's own tests. `src/launcher_ui.rs` is `#[cfg(windows)]`, so
+      # nothing on this job compiled it; the mode strips its two `#[link]`
+      # attributes into a copy and runs the module's five tests, including the
+      # persistence of its low-memory checkbox.
+      - name: Launcher settings
+        run: bash tools/offline_harness.sh launcher
       - name: Measure staged precinct files
         run: |
           # An array, not a newline-joined string: `$roots` unquoted from

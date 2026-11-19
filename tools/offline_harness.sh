@@ -181,8 +181,26 @@ impl RgbaImage {
     pub fn from_pixel(w: u32, h: u32, p: Rgba<u8>) -> Self {
         Self { w, h, pixels: p.0.iter().copied().cycle().take((w as usize) * (h as usize) * 4).collect() }
     }
+    /// Needed by `src/launcher_ui.rs`, which recolours the artwork it embeds.
+    pub fn enumerate_pixels_mut(&mut self) -> PixIterMut<'_> {
+        PixIterMut { w: self.w, next: 0, buf: &mut self.pixels }
+    }
+}
+pub struct PixIterMut<'a> { w: u32, next: u32, buf: &'a mut [u8] }
+impl<'a> Iterator for PixIterMut<'a> {
+    type Item = (u32, u32, &'a mut Rgba<u8>);
+    fn next(&mut self) -> Option<Self::Item> {
+        let i = self.next;
+        if i >= self.w * (self.buf.len() as u32 / 4 / self.w.max(1)) { return None; }
+        let at = (i as usize) * 4;
+        let px = &mut self.buf[at..at + 4];
+        let rgba = unsafe { &mut *(px.as_mut_ptr() as *mut Rgba<u8>) };
+        self.next += 1;
+        Some((i % self.w.max(1), i / self.w.max(1), rgba))
+    }
 }
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct Rgba<T>(pub [T; 4]);
 impl Rgba<u8> {
     pub fn channels(&self) -> [u8; 4] { self.0 }
@@ -1306,6 +1324,25 @@ EOF
             "$OUT/objects/lib.rs" -o "$OUT/objectstest"
         shift || true
         (cd "$REPO" && exec "$OUT/objectstest" "$@") ;;
+    launcher) toolchain; sysroot; deps; image_stub
+        # `src/launcher_ui.rs` is `#[cfg(windows)]`, and the two things that make
+        # it untestable here are the Win32 `#[link]` attributes and nothing else:
+        # the drawing code is all `extern` declarations that never run in a test.
+        # Strip the link attributes into a copy under `$OUT` and the module's own
+        # tests compile and run on any host. Without this the launcher had *no*
+        # test anywhere on Linux, and its settings persistence was assert-by-
+        # inspection -- which is how "not demonstrated persisted" stayed true.
+        mkdir -p "$OUT/launcher"
+        sed -e '/#\[link(name = "user32")\]/d' -e '/#\[link(name = "gdi32")\]/d' \
+            "$REPO/src/launcher_ui.rs" > "$OUT/launcher/launcher_ui.rs"
+        # The artwork path is relative to `src/`, so it has to be re-anchored.
+        sed -i "s|include_bytes!(\"../tools/launcher-art.jpg\")|include_bytes!(\"$REPO/tools/launcher-art.jpg\")|" \
+            "$OUT/launcher/launcher_ui.rs"
+        "$RUSTC" --test --crate-name launchertest --edition 2021 --sysroot "$SYSROOT" \
+            -C opt-level=1 -L "$OUT" --extern image="$OUT/libimage_stub.rlib" \
+            "$OUT/launcher/launcher_ui.rs" -o "$OUT/launchertest"
+        shift || true
+        (cd "$REPO" && exec "$OUT/launchertest" "$@") ;;
     diagnostics) toolchain; sysroot; deps
         # `src/diagnostics.rs` on its own, against `tools/fixtures/egui_stub.rs`.
         # Its 18 tests had never run anywhere: the module has no GPU dependency,
@@ -2015,4 +2052,4 @@ EOF
             -o "$OUT/matrix-maps" "$OUT/mm/run.rs"
         shift || true
         (cd "$REPO" && exec "$OUT/matrix-maps" "${1:-$REPO/google_drive/clients}") ;;
-    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|precinct|settings|bmd-baked|objects|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|precinct|settings|bmd-baked|objects|launcher|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
