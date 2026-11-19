@@ -165,10 +165,13 @@ impl Startup {
         } else {
             backends
         };
-        let desc = wgpu::InstanceDescriptor {
+        let mut desc = wgpu::InstanceDescriptor {
             backends: bits,
             ..Default::default()
         };
+        if self.0.is_some() {
+            desc.flags = desc.flags.with_env();
+        }
         if let Some(Request::Rr(api)) = &self.0 {
             if bits.contains(wgpu::Backends::VULKAN) {
                 let optional = api
@@ -852,6 +855,12 @@ impl Session {
                         self.request.label(),
                         epoch.extent
                     );
+                    if let Context::Fsr(ctx) = &epoch.context {
+                        let (name, id) = ctx.provider;
+                        eprintln!(
+                            "Lighter Vulkan FSR evaluation submitted: {name} (provider {id:#x})"
+                        );
+                    }
                 }
                 self.active = true;
                 Ok(true)

@@ -80,6 +80,9 @@ pub(super) fn instance(required: &[CString], flags: wgpu::InstanceFlags) -> R<wg
                 .any(|p| CStr::from_ptr(p.layer_name.as_ptr()) == layer)
             {
                 layers.push(layer.as_ptr());
+                eprintln!("Lighter Vulkan instance: VK_LAYER_KHRONOS_validation enabled");
+            } else if std::env::var("WGPU_VALIDATION").as_deref() == Ok("1") {
+                eprintln!("Lighter Vulkan instance: VK_LAYER_KHRONOS_validation requested but unavailable");
             }
         }
         let raw = entry

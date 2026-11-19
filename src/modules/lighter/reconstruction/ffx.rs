@@ -176,6 +176,7 @@ pub(super) struct Context {
     api: Arc<Api>,
     handle: *mut c_void,
     extent: [u32; 4],
+    pub(super) provider: (&'static str, u64),
 }
 
 fn checked(op: &str, rc: u32) -> R<()> {
@@ -217,6 +218,7 @@ impl Context {
             api: Arc::clone(api),
             handle,
             extent,
+            provider: (name, id),
         };
         let mut info = ProviderVersion(Header(6, ptr::null_mut()), 0, ptr::null());
         checked("ffxQuery(active Vulkan provider)", unsafe {
