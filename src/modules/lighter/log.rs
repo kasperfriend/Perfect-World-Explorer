@@ -71,7 +71,7 @@ pub struct SessionHeader {
 #[derive(Clone, Debug)]
 pub struct ProviderEvent {
     pub sdk: String,
-    pub path: String,   // redacted if it contains a user-name segment
+    pub path: String, // redacted if it contains a user-name segment
     pub size_bytes: u64,
     pub sha256: Option<String>,
     pub result: String, // "loaded" | "rejected" | "missing" | "bad_hash" | ...
