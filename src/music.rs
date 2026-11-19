@@ -26,6 +26,21 @@ pub struct Zone {
 }
 pub struct Zones {
     pub zones: Vec<Zone>,
+    /// Candidate zone slots the walker stepped over because their block did not
+    /// parse. Carried on the result rather than only printed, because a count
+    /// that is only `eprintln!` cannot be asserted by a test and is invisible
+    /// unless someone is watching stderr. A file read with this `> 0` is a
+    /// partly-read file and should say so where the count is shown.
+    pub malformed: usize,
+}
+/// A zone header is a line of numbers; at least six of them are read.
+fn header_numbers(line: &str) -> Option<Vec<usize>> {
+    let nums = line
+        .split_whitespace()
+        .map(str::parse::<usize>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (nums.len() >= 6).then_some(nums)
 }
 fn quoted(s: &str) -> Result<String, String> {
     let s = s.trim();
@@ -115,9 +130,9 @@ impl Zones {
         // walker. Versions 6 and 7 differ in exactly one thing: a 7 states the
         // zone centre on its own line before the polygon, a 6 does not. They do
         // not differ in their sound block -- a 1.8.4 version-7 `precinct.clt`
-        // holds 383 zones, 783 playlist tracks and two stereo ambience paths,
-        // and treating 7 as an instance-only format with no audio threw all of
-        // it away. A future version is read the same way rather than refused,
+        // holds 383 zones and 783 playlist tracks (the world map's, 885,012 B;
+        // the one staged beside `a37` is 29 zones and 29 tracks), and treating
+        // 7 as an instance-only format with no audio threw all of it away. A future version is read the same way rather than refused,
         // because the walker is structure-driven: it counts headers, labels and
         // tracks from each zone's own numbers, so a version that changed
         // nothing here cannot break it, and one that did breaks loudly on a
@@ -142,31 +157,53 @@ impl Zones {
         // retired zone is one missing polygon, and the count is reported once at
         // the end.
         let mut skipped = 0usize;
+        let mut malformed = 0usize;
         while i < lines.len() {
             let Ok(name) = quoted(lines[i]) else {
                 i += 1;
                 continue;
             };
-            let head = lines.get(i + 1).map(|l| {
-                l.split_whitespace()
-                    .map(str::parse::<usize>)
-                    .collect::<Result<Vec<_>, _>>()
-            });
-            let nums = match head {
-                // Only three of the header's numbers are used: vertex count,
-                // label count and track count, at indices 1, 2 and 5. The rest
-                // are the zone's playback flags, and different builds write a
-                // different number of them -- 11 in the measured 1.8.4 file,
-                // 10 and 9 elsewhere -- so the length is not a format gate.
-                Some(Ok(nums)) if nums.len() >= 6 => nums,
-                _ => {
-                    if skipped < 8 {
-                        eprintln!("Precinct zone {name:?}: no numeric header; zone skipped");
-                    }
-                    skipped += 1;
-                    i += 1;
-                    continue;
+            let head = lines.get(i + 1).and_then(|l| header_numbers(l));
+            // A quoted line with no numeric header after it is not a zone name:
+            // it is a playlist or ambience string inside a block that already
+            // failed to parse. Counting each one as a skipped zone reported one
+            // malformed zone as three, which is why the resume below jumps to
+            // the next line that does look like a zone rather than stepping one.
+            let plausible = |k: usize| {
+                quoted(lines[k]).is_ok()
+                    && lines
+                        .get(k + 1)
+                        .is_some_and(|l| header_numbers(l).is_some())
+            };
+            if head.is_none() {
+                let resume = (i + 1..lines.len()).find(|&k| plausible(k));
+                if malformed < 8 {
+                    // Name the line and the quoted text found there. It is a
+                    // sound string inside a block that has already failed, not a
+                    // zone name -- saying `Precinct zone "":` about it named a
+                    // zone that does not exist and never named the one that did.
+                    eprintln!(
+                        "Precinct: line {} ({name:?}) has no numeric header after it; \
+                         that zone skipped, resuming at the next one",
+                        i + 1
+                    );
                 }
+                malformed += 1;
+                match resume {
+                    Some(k) => {
+                        i = k;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            // Only three of the header's numbers are used: vertex count, label
+            // count and track count, at indices 1, 2 and 5. The rest are the
+            // zone's playback flags, and different builds write a different
+            // number of them -- 11 in the measured 1.8.4 file, 10 and 9
+            // elsewhere -- so the length is not a format gate.
+            let Some(nums) = head else {
+                unreachable!("checked above")
             };
             if nums[1] < 3 || nums[1] > 10000 || nums[2] > 10000 || nums[5] > 1000 {
                 if skipped < 8 {
@@ -177,6 +214,7 @@ impl Zones {
                     );
                 }
                 skipped += 1;
+                malformed += 1;
                 i += 1;
                 continue;
             }
@@ -194,6 +232,7 @@ impl Zones {
                      tracks but the file ends first; zone skipped"
                 );
                 skipped += 1;
+                malformed += 1;
                 break;
             }
             let mut poly = Vec::with_capacity(n);
@@ -216,6 +255,7 @@ impl Zones {
                     eprintln!("Precinct zone {name:?}: {e}; zone skipped");
                 }
                 skipped += 1;
+                malformed += 1;
                 i += 1;
                 continue;
             }
@@ -304,15 +344,16 @@ impl Zones {
                 lines[0].split_whitespace().nth(1).unwrap_or("?")
             ));
         }
-        Ok(Self { zones })
+        Ok(Self { zones, malformed })
     }
     /// The retired version-7 walker.
     ///
     /// It assumed a version-7 file was an instance map with no audio at all:
     /// zone name, numeric header, one centre line, a polygon, and two empty
-    /// sound strings -- no playlist tracks and no stereo ambience. A 1.8.4
-    /// version-7 `precinct.clt` is 383 zones with 783 tracks, so that assumption
-    /// cost the whole map its music. Kept under `cfg(test)` so the regression
+    /// sound strings -- no playlist tracks and no stereo ambience. The world's
+    /// 1.8.4 version-7 `precinct.clt` is 383 zones with 783 tracks (the smaller
+    /// file beside `a37` is 29 and 29), so that assumption cost a whole map its
+    /// music. Kept under `cfg(test)` so the regression
     /// can assert the old walker gets it wrong, not just that the new one gets
     /// it right.
     #[cfg(test)]
@@ -378,7 +419,10 @@ impl Zones {
         if zones.is_empty() {
             return Err("no instance precinct zones".into());
         }
-        Ok(Self { zones })
+        Ok(Self {
+            zones,
+            malformed: 0,
+        })
     }
     pub fn find(&self, x: f32, z: f32) -> Option<usize> {
         self.zones
@@ -768,7 +812,25 @@ impl AmbiencePlayer {
     pub fn new_for_map(element: &Path, zones_path: &Path) -> Self {
         let zones = Zones::open(zones_path);
         let status = match &zones {
-            Ok(z) => format!("{} ambience zones loaded", z.zones.len()),
+            Ok(z) => {
+                let with_sound = z
+                    .zones
+                    .iter()
+                    .filter(|q| !q.ambience_day.is_empty() || !q.ambience_night.is_empty())
+                    .count();
+                // Say what the file actually gave: zones, how many carry a
+                // stereo path, and whether any block was skipped. A map whose
+                // precinct ships no ambience at all is not a failure, and
+                // saying "0 of 29" is the honest version of "loaded".
+                let mut line = format!(
+                    "{} ambience zones loaded ({with_sound} with a stereo path)",
+                    z.zones.len()
+                );
+                if z.malformed > 0 {
+                    line.push_str(&format!(", {} zone(s) skipped", z.malformed));
+                }
+                line
+            }
             Err(e) => format!("Ambience zones unavailable: {e}"),
         };
         let zone_error = zones.as_ref().err().cloned();
@@ -1124,8 +1186,11 @@ mod tests {
     /// A version-7 precinct carries a full sound block, and reading it as the
     /// old instance walker did threw all of it away.
     ///
-    /// The measured 1.8.4 file is 383 zones, 783 playlist tracks and 347 zones
-    /// with a stereo ambience path. The fixture below is that file's shape:
+    /// The measured world file is 383 zones, 783 playlist tracks and 347 zones
+    /// with a day ambience path (345 with a night one, 60 distinct files). The
+    /// file staged beside the maps in this checkout is a different, smaller one:
+    /// 29 zones, 29 tracks and no ambience at all. `tools/offline_harness.sh
+    /// precinct` prints both sets of numbers so a claim can be checked. The fixture below is that file's shape:
     /// header line, a number, then name / header / centre / polygon / day
     /// ambience / tracks / night ambience.
     #[test]
@@ -1184,6 +1249,15 @@ mod tests {
         let zones = Zones::parse(text).unwrap();
         let names: Vec<_> = zones.zones.iter().map(|z| z.name.as_str()).collect();
         assert_eq!(names, ["good", "also good"]);
+        // The skip is counted on the result, not only printed: a partly-read
+        // file has to be able to say so to a caller that never sees stderr.
+        // It is one zone, not three: before the resume was added, each quoted
+        // line left inside the broken block was counted as its own skipped
+        // zone, and each was reported as `Precinct zone "":`.
+        assert_eq!(zones.malformed, 1);
+        // The good zones keep every field a reader downstream depends on.
+        assert_eq!(zones.zones[0].tracks, ["Music\\a.mp3"]);
+        assert_eq!(zones.zones[1].polygon.len(), 4);
     }
 
     #[test]

@@ -283,13 +283,36 @@ error and the mode exits non-zero.
 `a37`'s 148 water references are the number the water classifier is required to
 account for, and they are all read: 3 areas, 18 shoreline waves, 3,146 points.
 
-`a37` shows **29 zones**, not 383: 383 is the *world* map's count. The two rows
-agreed at 383 for as long as a37's folder was being read with the world's
-`precinct.clt` copied into it. Both modes now catch that — `instance` prints an
-`outside` column, and `matrix-maps` appends `N OUTSIDE the map` to the precinct
-cell when any anchored zone centre falls outside the map's own centred extent.
-With the world's file in a37's folder the row reads
-`383 zones, 240 OUTSIDE the map`.
+`a37` shows **29 zones**, not 383: 383 is the *world* map's count. What makes
+that more than an assertion is that the 383-zone file exists separately
+(885,012 B) and does **not** belong to `a37`: put it in a37's folder and
+`matrix-maps` reads `383 zones, 240 OUTSIDE the map`, while in `world`'s folder
+it reads `383 zones` with nothing outside. Both modes catch the mix-up —
+`instance` prints an `outside` column, and `matrix-maps` appends
+`N OUTSIDE the map` to the precinct cell when any anchored zone centre falls
+outside the map's own centred extent.
+
+The file this checkout stages, `google_drive/precinct.clt` (78,858 B), is a
+**third** thing: byte-identical to the one beside both `world` and `a37` in the
+staged 1.8.4 client, and 29 zones with **no stereo ambience at all**. The
+numbers quoted for "the 1.8.4 precinct" — 383 zones, 783 tracks, 347 zones with
+a day ambience path, 345 with a night one, from 43 distinct day files and 43
+distinct night files — are the 885 KB world file's. Both are measured, side by
+side, by `tools/offline_harness.sh precinct`:
+
+```
+file                                                  ver  zones  tracks     day   night  paths      bad
+google_drive/precinct.clt                               7     29      29       0       0      0        0
+/tmp/cl1element/maps/a37/precinct.clt                   7    383     783     347     345     60        0
+```
+
+An earlier version of this paragraph said the file had been "copied into" a37's
+folder from the world map's own directory. That was wrong about the mechanism
+and right about the symptom: the directory holding the 383-zone file is named
+`a37` too, and the two clients' `a37` folders differ in exactly this one member.
+The extent test is what settles which map a precinct describes, and it was
+always the right test — the provenance story around it was the part that was
+invented.
 
 ### Instance maps (`instance`, 18 November 2026)
 

@@ -27,6 +27,8 @@
 #   tools/offline_harness.sh player   build+test `src/gfx_player.rs` and the model
 #                                     stack it links, so an edit to the player is
 #                                     compiled outside CI too
+#   tools/offline_harness.sh precinct what a `precinct.clt` really holds: zones, tracks,
+#                                     ambience paths, malformed blocks
 #   tools/offline_harness.sh music    build+test `src/music.rs` (precinct zones and
 #                                     the teleport fallback points)
 #   tools/offline_harness.sh material build+test the terrain material set and the
@@ -918,6 +920,86 @@ EOF
         shift || true
         [ $# -gt 0 ] || set -- "$REPO/google_drive"
         (cd "$REPO" && exec "$OUT/survey/water-record-survey" "$@") ;;
+    precinct) toolchain; sysroot; deps; real_deps
+        # What a `precinct.clt` actually contains, per file. This exists because
+        # the register and the code comments both state "the 1.8.4 precinct is
+        # 383 zones, 783 tracks and 347 stereo ambience paths" -- and the file
+        # staged beside the world map is 29 zones with no ambience at all. Both
+        # statements were measured somewhere, of *different files*, and nothing
+        # in the tree could tell them apart. This mode prints the facts a claim
+        # has to be checked against: zones, playlist tracks, zones with a day or
+        # night path, distinct paths, and whether the zone centres fit the map
+        # that ships beside the file.
+        mkdir -p "$OUT/prec"
+        cat > "$OUT/prec/run.rs" <<EOF
+#[path = "$REPO/src/pck.rs"]
+pub mod pck;
+#[path = "$REPO/src/music.rs"]
+pub mod music;
+#[path = "$REPO/src/terrain_block.rs"]
+pub mod terrain_block;
+fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() { walk(&p, out); }
+        else if p.file_name().and_then(|n| n.to_str())
+            .map(|n| n.eq_ignore_ascii_case("precinct.clt")).unwrap_or(false) { out.push(p); }
+    }
+}
+fn main() {
+    let mut files = Vec::new();
+    for root in std::env::args().skip(1) { walk(std::path::Path::new(&root), &mut files); }
+    if files.is_empty() { eprintln!("no precinct.clt under the given roots"); std::process::exit(2); }
+    println!("{:<52} {:>4} {:>6} {:>7} {:>7} {:>7} {:>6} {:>8}",
+             "file", "ver", "zones", "tracks", "day", "night", "paths", "bad");
+    let mut bad = 0;
+    for f in &files {
+        match music::Zones::open(f) {
+            Ok(z) => {
+                let tracks: usize = z.zones.iter().map(|x| x.tracks.len()).sum();
+                let day = z.zones.iter().filter(|x| !x.ambience_day.is_empty()).count();
+                let night = z.zones.iter().filter(|x| !x.ambience_night.is_empty()).count();
+                let mut paths: Vec<&str> = z.zones.iter()
+                    .flat_map(|x| [x.ambience_day.as_str(), x.ambience_night.as_str()])
+                    .filter(|p| !p.is_empty()).collect();
+                paths.sort_unstable(); paths.dedup();
+                println!("{:<52} {:>4} {:>6} {:>7} {:>7} {:>7} {:>6} {:>8}",
+                         f.display().to_string(), "7", z.zones.len(), tracks, day, night,
+                         paths.len(), z.malformed);
+                // The codec census a decoder list has to cover. The decodable
+                // list claims mp3, ogg and wav cover the corpus; that is a
+                // statement about these counts, so print them.
+                let mut ext: std::collections::BTreeMap<&str, usize> =
+                    std::collections::BTreeMap::new();
+                for p in z.zones.iter().flat_map(|x| x.tracks.iter())
+                    .chain(z.zones.iter().flat_map(|x| [&x.ambience_day, &x.ambience_night]))
+                    .filter(|p| !p.is_empty())
+                {
+                    let e = p.rsplit_once('.').map(|(_, e)| e).unwrap_or("?");
+                    *ext.entry(e).or_default() += 1;
+                }
+                let list: Vec<String> = ext.iter()
+                    .map(|(e, n)| format!("{n} {e}")).collect();
+                println!("{:>60} {}", "", list.join(", "));
+                let unknown: Vec<&&str> = ext.keys()
+                    .filter(|e| !crate::music::DECODABLE_EXTENSIONS
+                        .iter().any(|d| d.eq_ignore_ascii_case(e))).collect();
+                if !unknown.is_empty() { bad += 1; }
+            }
+            Err(e) => { println!("{:<52} FAILED: {e}", f.display().to_string()); bad += 1; }
+        }
+    }
+    std::process::exit(if bad == 0 { 0 } else { 1 });
+}
+EOF
+        "$RUSTC" --edition 2021 --crate-name prec --sysroot "$SYSROOT" \
+            -L "$OUT" --extern flate2="$OUT/libflate2.rlib" \
+            --extern encoding_rs="$OUT/libencoding_rs.rlib" \
+            -o "$OUT/precinct" "$OUT/prec/run.rs"
+        shift || true
+        [ $# -gt 0 ] || set -- "$REPO/google_drive"
+        (cd "$REPO" && exec "$OUT/precinct" "$@") ;;
     music-probe) toolchain; sysroot; deps; real_deps
         # Probe: read every `precinct.clt` under the given roots with the real
         # reader. The map's music, its stereo ambience and its teleport list all
@@ -1701,6 +1783,10 @@ fn main() {
                 // Anchored zones only: a polygon centroid is a derived value, and
                 // a derived point outside the box would be this reader's fault
                 // rather than the map's.
+                // No trn2 means the extent test cannot be run at all, which is
+                // not the same as "0 outside". A world map ships no trn2 and
+                // used to print "outside 0" beside "extent no trn2" -- a pass
+                // for a check that never happened.
                 let outside = match &header {
                     Some(h) => z.zones.iter()
                         .filter(|z| z.center.is_some())
@@ -1724,6 +1810,9 @@ fn main() {
             }
             Err(e) => (0, 0, 0, 0, format!("precinct FAILED: {e}")),
         };
+        // The outside column prints "--" when there is no extent to measure
+        // against, so it never claims a check that did not run.
+        let outside = if header.is_some() { outside.to_string() } else { "--".to_string() };
         println!("{id:<6} {:<7} {blocks:>7} {extent:>9} {zones:>7} {centres:>7} {tracks:>6} {outside:>8}  {names}",
             if blocks == 0 { "empty" } else { "v" });
     }
@@ -1829,4 +1918,4 @@ EOF
             -o "$OUT/matrix-maps" "$OUT/mm/run.rs"
         shift || true
         (cd "$REPO" && exec "$OUT/matrix-maps" "${1:-$REPO/google_drive/clients}") ;;
-    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
+    *) echo "usage: $0 {setup|check|test|fmt|client|water|music|music-probe|precinct|gfx|player|bins|diagnostics|material|scene|pck|content|matrix|matrix-maps|instance}" >&2; exit 2 ;;esac
