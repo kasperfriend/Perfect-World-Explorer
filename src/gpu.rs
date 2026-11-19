@@ -5375,6 +5375,41 @@ fn run_viewer(
     let smoke_reload = smoke_dir.is_some_and(|dir| dir.join("reload-test").exists());
     #[cfg(test)]
     let smoke_travel = smoke_dir.filter(|dir| dir.join("travel.plan").is_file());
+    #[cfg(test)]
+    let smoke_sdk = if smoke_dir.is_some()
+        && smoke_travel.is_none()
+        && (cfg!(windows) || std::env::var_os("PW_TEST_LIGHTER_WINDOW_SDK").is_some())
+    {
+        Some(match std::env::var("PW_RAY_RECONSTRUCTION").as_deref() {
+            Ok("fsr") => "Vulkan temporal FSR",
+            Ok("rr") => "Vulkan DLSS Ray Reconstruction",
+            _ => {
+                return Err(
+                    "the windowed SDK fixture requires PW_RAY_RECONSTRUCTION=fsr or rr".into(),
+                )
+            }
+        })
+    } else {
+        None
+    };
+    #[cfg(test)]
+    let (smoke_start_extent, smoke_resize_extent, smoke_resolution) = if smoke_sdk.is_some() {
+        let scale = match std::env::var("PW_TEST_RAY_RESOLUTION").as_deref() {
+            Ok("100") => 100,
+            Ok("50") | Err(std::env::VarError::NotPresent) => 50,
+            _ => return Err("PW_TEST_RAY_RESOLUTION must be 50 or 100".into()),
+        };
+        ((512, 512), (640, 640), scale)
+    } else {
+        ((160, 96), (192, 112), 61)
+    };
+    #[cfg(test)]
+    let smoke_mode =
+        if smoke_sdk.is_some() && std::env::var("PW_TEST_RAY_QUERY").as_deref() == Ok("1") {
+            LighterMode::Hardware
+        } else {
+            LighterMode::Software
+        };
     let current_map = t.map.clone();
     let map_dir = t.map_dir.clone();
     let client_root = t.client_root.clone();
@@ -5405,6 +5440,11 @@ fn run_viewer(
         use winit::platform::x11::EventLoopBuilderExtX11;
         event_loop.with_x11().with_any_thread(true);
     }
+    #[cfg(all(test, windows))]
+    if smoke_dir.is_some() {
+        use winit::platform::windows::EventLoopBuilderExtWindows;
+        event_loop.with_any_thread(true);
+    }
     let event_loop = event_loop.build().map_err(|e| e.to_string())?;
     let startup_redraw = event_loop.create_proxy();
     let window_builder = WindowBuilder::new()
@@ -5418,7 +5458,10 @@ fn run_viewer(
     let window_builder = if smoke_dir.is_some() {
         window_builder
             .with_maximized(false)
-            .with_inner_size(winit::dpi::PhysicalSize::new(160, 96))
+            .with_inner_size(winit::dpi::PhysicalSize::new(
+                smoke_start_extent.0,
+                smoke_start_extent.1,
+            ))
     } else {
         window_builder
     };
@@ -5437,11 +5480,16 @@ fn run_viewer(
     #[cfg(test)]
     let saved_lighter = if smoke_dir.is_some() && smoke_travel.is_none() && restoring.is_none() {
         LighterSettings {
-            mode: LighterMode::Software,
+            mode: smoke_mode,
             lighting: false,
             shadows: false,
             denoiser: false,
             progressive: false,
+            resolution: if smoke_sdk.is_some() {
+                smoke_resolution
+            } else {
+                LighterSettings::default().resolution
+            },
             ..LighterSettings::default()
         }
     } else {
@@ -6218,8 +6266,9 @@ fn run_viewer(
                             return;
                         }
                         #[cfg(test)]
-                        if let Some(dir) = smoke_dir.filter(|_| smoke_reload && restoring.is_some()) {
-                            if image::open(dir.join("reload-software.png")).is_err() {
+                        if let Some(dir) = smoke_dir.filter(|_| (smoke_reload || smoke_sdk.is_some()) && restoring.is_some()) {
+                            let capture = if smoke_reload { "reload-software.png" } else { "recovered-sdk.png" };
+                            if image::open(dir.join(capture)).is_err() {
                                 gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
                                 return;
                             }
@@ -6289,12 +6338,16 @@ fn run_viewer(
                             #[cfg(test)]
                             if let (Some(dir), Some(snapshot)) = (smoke_dir, restoring.as_ref()) {
                                 assert_eq!(snapshot.view[5], 7.5);
-                                assert_eq!(snapshot.lighter.resolution, 61);
-                                assert_eq!(snapshot.lighter.mode, LighterMode::Software);
+                                assert_eq!(snapshot.lighter.resolution, smoke_resolution);
+                                assert_eq!(snapshot.lighter.mode, smoke_mode);
                                 assert_eq!(snapshot.view, [camera.pos.x, camera.pos.y, camera.pos.z, camera.yaw, camera.pitch, camera.time_of_day]);
                                 assert_eq!(snapshot.lighter, renderer.lighter.settings);
                                 assert_eq!(snapshot.lighter.mode, drawn_mode);
                                 assert_eq!(smoke_reload, snapshot.kind == recovery::RestoreKind::Reload);
+                                if let Some(provider) = smoke_sdk {
+                                    assert_eq!(renderer.lighter.reconstruction_status(), Some(provider), "restored window fell back from SDK");
+                                    std::fs::write(dir.join("restored-provider"), provider).unwrap();
+                                }
                                 std::fs::write(dir.join("restored-present"), std::process::id().to_string()).unwrap();
                             }
                             if handoff_child { crate::world_handoff::signal_ready(); }
@@ -6304,7 +6357,7 @@ fn run_viewer(
                                     target.set_control_flow(winit::event_loop::ControlFlow::Poll);
                                     target.exit();
                                 } else if !smoke_reload {
-                                    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(192, 112));
+                                    let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(smoke_resize_extent.0, smoke_resize_extent.1));
                                 }
                             }
                             return;
@@ -6324,8 +6377,13 @@ fn run_viewer(
                                 camera.yaw = 0.1;
                                 settings.time_of_day = 7.5;
                                 camera.time_of_day = settings.time_of_day;
-                                reload_requested = Some(LighterSettings { mode: LighterMode::Hardware, resolution: 61, ..renderer.lighter.settings });
-                                smoke_frames = 2;
+                                if smoke_sdk.is_some() {
+                                    reload_requested = Some(LighterSettings { mode: smoke_mode, resolution: smoke_resolution, ..renderer.lighter.settings });
+                                    smoke_frames = 6;
+                                } else {
+                                    reload_requested = Some(LighterSettings { mode: LighterMode::Hardware, resolution: 61, ..renderer.lighter.settings });
+                                    smoke_frames = 2;
+                                }
                                 menu_page = MenuPage::Modules;
                                 return;
                             }
@@ -6370,7 +6428,14 @@ fn run_viewer(
                             // Distinct from both the startup camera and saved
                             // defaults so a child ignoring the snapshot fails.
                             camera.time_of_day = 7.5;
-                            renderer.lighter.settings.resolution = 61;
+                            if smoke_sdk.is_some() {
+                                // The raw SDK queue work isn't owned by wgpu's fence tracker.
+                                if !renderer.lighter.poll_hardware().unwrap() {
+                                    gpu_retry_at = Some(Instant::now() + GPU_RETRY_DELAY);
+                                    return;
+                                }
+                            }
+                            renderer.lighter.settings.resolution = smoke_resolution;
                             renderer.device.destroy();
                             renderer.device.poll(wgpu::Maintain::Poll);
                             assert!(gpu_loss.pending(), "explicit destroy missed device-loss callback");
@@ -7579,13 +7644,21 @@ fn run_viewer(
                             }
                             #[cfg(test)]
                             if let Some(dir) = smoke_dir.filter(|_| smoke_travel.is_none()) {
-                                if restoring.is_none() && (smoke_frames == 0 || !smoke_reload && (1..4).contains(&smoke_frames) && world_extent == (192, 112)) {
+                                if let Some(provider) = smoke_sdk.filter(|_| !smoke_reload || restoring.is_some()) {
+                                    assert!(renderer.renders_rays(), "SDK fixture did not draw rays");
+                                    assert_eq!(renderer.lighter.reconstruction_status(), Some(provider), "fixture requires real windowed SDK dispatch");
+                                }
+                                if restoring.is_none() && (smoke_frames == 0 || !smoke_reload && (1..4).contains(&smoke_frames) && world_extent == smoke_resize_extent) {
                                     frame_capture.requested = Some(dir.join(format!("{smoke_frames}.png")));
                                     smoke_frames += 1;
-                                } else if smoke_reload && restoring.is_some() && !presented_once {
-                                    assert_eq!(renderer.lighter.settings.mode, LighterMode::Software);
-                                    assert!(renderer.renders_rays());
-                                    frame_capture.requested = Some(dir.join("reload-software.png"));
+                                } else if restoring.is_some() && !presented_once {
+                                    if smoke_reload {
+                                        assert_eq!(renderer.lighter.settings.mode, smoke_mode);
+                                        assert!(renderer.renders_rays());
+                                        frame_capture.requested = Some(dir.join("reload-software.png"));
+                                    } else if smoke_sdk.is_some() {
+                                        frame_capture.requested = Some(dir.join("recovered-sdk.png"));
+                                    }
                                 }
                             }
                             frame_capture.submit(&renderer.device, &renderer.queue, render_scale.texture());
@@ -8417,7 +8490,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     }
                                 }
                                 #[cfg(test)]
-                                if smoke_dir.is_some() && smoke_travel.is_none() && !smoke_reload {
+                                if smoke_dir.is_some() && smoke_travel.is_none() && !smoke_reload && smoke_sdk.is_none() {
                                     let mode = match smoke_frames {
                                         2 => Some(LighterMode::Off),
                                         3 => Some(LighterMode::Software),

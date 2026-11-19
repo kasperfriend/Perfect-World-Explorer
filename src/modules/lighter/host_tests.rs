@@ -1405,15 +1405,25 @@ fn lighter_coverage_fixture_capture() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[test]
-#[ignore = "requires an X11 display (e.g. xvfb-run) and Vulkan"]
+#[ignore = "requires a real Win32 display and SDK, or X11 and Vulkan for the portable control"]
 fn lighter_live_viewer_frames() {
     let root = FixtureRoot::new();
-    super::super::run_viewer(fixture(&root.0), Some(&root.0)).unwrap();
-    assert_world_png(&root.0.join("0.png"), (160, 96));
+    run_live_fixture(&root.0, &root.0).unwrap();
+    let sdk = window_sdk_fixture();
+    let (base, resized) = if sdk {
+        ((512, 512), (640, 640))
+    } else {
+        ((160, 96), (192, 112))
+    };
+    assert_world_png(&root.0.join("0.png"), base);
     for i in 1..4 {
-        assert_world_png(&root.0.join(format!("{i}.png")), (192, 112));
+        assert_world_png(&root.0.join(format!("{i}.png")), resized);
+    }
+    if sdk {
+        assert_world_png(&root.0.join("recovered-sdk.png"), base);
+        save_window_sdk_fixture(&root.0, "recovery");
     }
     let child_pid: u32 = std::fs::read_to_string(root.0.join("restored-present"))
         .expect("replacement did not present")
@@ -1468,9 +1478,9 @@ fn lighter_live_travel_csv() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[test]
-#[ignore = "requires an X11 display and a CPU Vulkan adapter without hardware RT"]
+#[ignore = "requires a real Win32 display and SDK, or X11 and a CPU Vulkan adapter for the portable control"]
 fn lighter_live_world_reload() {
     let root = FixtureRoot::new();
     std::fs::write(
@@ -1478,14 +1488,21 @@ fn lighter_live_world_reload() {
         b"saved software => native => unsupported hardware => stalled software => software",
     )
     .unwrap();
-    super::super::run_viewer(fixture(&root.0), Some(&root.0)).unwrap();
-    for file in [
-        "0.png",
-        "after-failed-reload.png",
-        "after-stalled-reload.png",
-        "reload-software.png",
-    ] {
-        assert_world_png(&root.0.join(file), (160, 96));
+    run_live_fixture(&root.0, &root.0).unwrap();
+    if window_sdk_fixture() {
+        for file in ["0.png", "reload-software.png"] {
+            assert_world_png(&root.0.join(file), (512, 512));
+        }
+        save_window_sdk_fixture(&root.0, "reload");
+    } else {
+        for file in [
+            "0.png",
+            "after-failed-reload.png",
+            "after-stalled-reload.png",
+            "reload-software.png",
+        ] {
+            assert_world_png(&root.0.join(file), (160, 96));
+        }
     }
     let child_pid: u32 = std::fs::read_to_string(root.0.join("restored-present"))
         .expect("same-world reload did not present")
@@ -1494,19 +1511,53 @@ fn lighter_live_world_reload() {
     assert_ne!(child_pid, std::process::id());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 #[test]
-#[ignore = "entrypoint for an Xvfb handoff subprocess"]
+#[ignore = "entrypoint for a window fixture handoff subprocess"]
 fn lighter_live_handoff_child() {
     let Some(dir) = std::env::var_os("PW_TEST_LIGHTER_VIEWER_DIR") else {
         return;
     };
     assert!(super::super::same_world_handoff().is_some());
     let root = FixtureRoot::new();
-    if let Err(error) = super::super::run_viewer(fixture(&root.0), Some(std::path::Path::new(&dir)))
-    {
+    if let Err(error) = run_live_fixture(&root.0, std::path::Path::new(&dir)) {
         crate::world_handoff::publish_failure(&error);
         panic!("replacement viewer: {error}");
+    }
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn window_sdk_fixture() -> bool {
+    cfg!(windows) || std::env::var_os("PW_TEST_LIGHTER_WINDOW_SDK").is_some()
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn run_live_fixture(root: &std::path::Path, smoke: &std::path::Path) -> Result<(), String> {
+    super::super::run_viewer(
+        fixture(root),
+        #[cfg(windows)]
+        None,
+        Some(smoke),
+    )
+}
+
+#[cfg(any(target_os = "linux", windows))]
+fn save_window_sdk_fixture(root: &std::path::Path, report: &str) {
+    assert!(std::fs::read_to_string(root.join("restored-provider"))
+        .unwrap()
+        .starts_with("Vulkan "));
+    if let Some(dir) = std::env::var_os("PW_SAVE_LIGHTER_WINDOW") {
+        let dir = std::path::PathBuf::from(dir).join(report);
+        std::fs::create_dir_all(&dir).unwrap();
+        for entry in std::fs::read_dir(root).unwrap().map(Result::unwrap) {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "png")
+                || entry.file_name() == "restored-provider"
+                || entry.file_name() == "restored-present"
+            {
+                std::fs::copy(&path, dir.join(entry.file_name())).unwrap();
+            }
+        }
     }
 }
 
