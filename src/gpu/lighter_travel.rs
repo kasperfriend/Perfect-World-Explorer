@@ -6,7 +6,7 @@ use std::{io::Write, path::PathBuf, time::Instant};
 
 const MAX_FRAMES: u32 = 30_000;
 
-struct Plan {
+pub(super) struct Plan {
     map: String,
     hour: f32,
     warmup: u32,
@@ -14,7 +14,7 @@ struct Plan {
     hash: String,
 }
 impl Plan {
-    fn parse(text: &str) -> Result<Self, String> {
+    pub(super) fn parse(text: &str) -> Result<Self, String> {
         let mut lines = text
             .lines()
             .map(|s| s.split('#').next().unwrap().trim())
@@ -75,10 +75,23 @@ impl Plan {
             hash: format!("{:x}", Sha256::digest(text.as_bytes())),
         })
     }
-    fn samples(&self) -> u32 {
+    pub(super) fn preview_path(&self, map: &str, hour: f32, warmup: u32) -> Result<&str, String> {
+        if self.map != map
+            || self.hour != hour
+            || self.warmup != warmup
+            || self.samples() != warmup + 1
+        {
+            return Err(
+                "preview path must match map/hour/warm-up and end at the capture frame".into(),
+            );
+        }
+        Ok(&self.hash)
+    }
+
+    pub(super) fn samples(&self) -> u32 {
         self.nodes.last().unwrap().0 + 1
     }
-    fn pose(&self, at: u32) -> [f32; 5] {
+    pub(super) fn pose(&self, at: u32) -> [f32; 5] {
         let upper = self.nodes.partition_point(|&(index, _)| index <= at);
         let (start, a) = self.nodes[upper - 1];
         let Some(&(end, b)) = self.nodes.get(upper) else {

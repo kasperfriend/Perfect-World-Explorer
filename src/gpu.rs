@@ -8814,6 +8814,21 @@ fn preview_frame_using(
             _ => return Err("PW_PREVIEW_REFERENCE must be 0 or 1".into()),
         };
     }
+    let reference_samples = match std::env::var("PW_PREVIEW_REFERENCE_SPP").as_deref() {
+        Ok(value) if audit.is_some() && mode != LighterMode::Off && lighter_settings.reference => {
+            match value {
+                "32" => Some(32),
+                "64" => Some(64),
+                "128" => Some(128),
+                _ => return Err("PW_PREVIEW_REFERENCE_SPP must be 32, 64 or 128".into()),
+            }
+        }
+        Ok(_) => {
+            return Err("PW_PREVIEW_REFERENCE_SPP requires a Reference ray coverage audit".into())
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => return Err(format!("PW_PREVIEW_REFERENCE_SPP: {e}")),
+    };
     if let Ok(value) = std::env::var("PW_PREVIEW_PHYSICAL_BSDF") {
         lighter_settings.physical_bsdf = match value.as_str() {
             "0" => false,
@@ -8893,7 +8908,8 @@ fn preview_frame_using(
     {
         return Err("Matched previews require the main streamed world, not preload, minimap or an effect A/B".into());
     }
-    let (adapter_info, device, queue, lighter) = open(lighter_settings)?;
+    let (adapter_info, device, queue, mut lighter) = open(lighter_settings)?;
+    lighter.set_capture_reference_samples(reference_samples);
     let mut cam = if let Some([x, y, z, yaw, pitch]) = camera {
         if ![x, y, z, yaw, pitch].iter().all(|x| x.is_finite()) {
             return Err("non-finite camera".into());
@@ -8987,6 +9003,27 @@ fn preview_frame_using(
     cam.underwater_fog = t
         .environments
         .underwater(cam.pos.to_array(), cam.time_of_day);
+    // Keep this headless comparison on a single prebuilt terrain window.
+    // For actual window publications and long travel use the live path instead.
+    let flight = if let Some(file) = std::env::var_os("PW_PREVIEW_PATH_PLAN") {
+        let warmup = audit.ok_or("PW_PREVIEW_PATH_PLAN requires a coverage audit")?;
+        let final_pose = camera.ok_or("PW_PREVIEW_PATH_PLAN requires --gpu-preview-at")?;
+        let plan = lighter_travel::Plan::parse(
+            &std::fs::read_to_string(file).map_err(|e| e.to_string())?,
+        )?;
+        plan.preview_path(&t.map.id, cam.time_of_day, warmup)?;
+        let block = |[x, _, z, _, _]| camera_block(t.width, t.height, t.grid_spacing, [x, z]);
+        if plan.pose(warmup) != final_pose
+            || (0..warmup).any(|i| block(plan.pose(i)) != block(final_pose))
+        {
+            return Err(
+                "preview path must end at --gpu-preview-at and stay in its terrain block".into(),
+            );
+        }
+        Some(plan)
+    } else {
+        None
+    };
     let mut residency = crate::terrain_residency::Residency::default();
     let mut ray_scenery = lighter.armed().then(lighter_host::SceneryStream::default);
     let mesh = build(
@@ -9103,7 +9140,7 @@ fn preview_frame_using(
         format: Some(fmt.remove_srgb_suffix()),
         ..Default::default()
     });
-    let draw = |r: &mut Renderer, cam: &Camera| -> Result<(), String> {
+    let draw = |r: &mut Renderer, cam: &Camera, cut: bool| -> Result<(), String> {
         let ready = r.render(
             &view,
             &raw,
@@ -9111,7 +9148,7 @@ fn preview_frame_using(
             cam,
             width,
             height,
-            false,
+            cut,
         );
         if let Some(error) = r.lighter.error() {
             return Err(error.into());
@@ -9141,7 +9178,7 @@ fn preview_frame_using(
         // Drain the one-root-per-frame queue first: an effect still waiting for
         // its player must not be mistaken for one that never drew.
         for _ in 0..60 {
-            draw(&mut renderer, &cam)?;
+            draw(&mut renderer, &cam, false)?;
         }
         let report = renderer
             .models
@@ -9160,7 +9197,7 @@ fn preview_frame_using(
             .unwrap_or_else(|| "no world".into());
         let on = read_target_pixels(&renderer, &mut captures, &target).unwrap_or_default();
         cam.world_effects = false;
-        draw(&mut renderer, &cam)?;
+        draw(&mut renderer, &cam, false)?;
         let off = read_target_pixels(&renderer, &mut captures, &target).unwrap_or_default();
         cam.world_effects = true;
         let differing = on
@@ -9173,14 +9210,30 @@ fn preview_frame_using(
             on.len() / 4
         );
     }
-    if let Some(warmup) = audit {
-        for _ in 0..warmup {
-            cam.logic_delta_ms = 16;
-            draw(&mut renderer, &cam)?;
+    let set_pose = |i, cam: &mut Camera| {
+        let old_pos = cam.pos;
+        let old_dir = cam.direction();
+        if let Some(plan) = &flight {
+            let [x, y, z, yaw, pitch] = plan.pose(i);
+            cam.pos = Vec3::new(x, y, z);
+            cam.yaw = yaw;
+            cam.pitch = pitch;
+            cam.underwater_depth = water_depth(&t.water, cam.pos);
+            cam.underwater_fog = t
+                .environments
+                .underwater(cam.pos.to_array(), cam.time_of_day);
         }
-        cam.logic_delta_ms = 0;
+        cam.logic_delta_ms = if audit.is_some_and(|w| i < w) { 16 } else { 0 };
+        flight.is_some()
+            && (i == 0
+                || old_pos.distance_squared(cam.pos) > 64. * 64.
+                || old_dir.dot(cam.direction()) < 0.866_025_4)
+    };
+    // Apply the requested camera before drawing each exact clock step.
+    for i in 0..=audit.unwrap_or(0) {
+        let cut = set_pose(i, &mut cam);
+        draw(&mut renderer, &cam, cut)?;
     }
-    draw(&mut renderer, &cam)?;
     if std::env::var_os("PW_PREVIEW_MINIMAP").is_some() {
         let d = depth(&renderer.device, width, height);
         renderer.render_minimap(
@@ -9213,11 +9266,19 @@ fn preview_frame_using(
              reflection={}\nfog={}\neffects={}\ncloud_detail={}\nbloom={}\nlightmaps={}\narea_grass_lightmaps={}\nrain_at_eye={}\nweather_ticks={}\n",
             t.map.id, cam.pos.to_array(), cam.yaw, cam.pitch, cam.far, CAMERA_FOV_Y_RADIANS, cam.time_of_day,
             cam.weather_override.token(), renderer.capture_elapsed_ms.unwrap_or_default(), renderer.detail.terrain_cutoff,
-            renderer.detail.scenery_quality, renderer.lighter.settings, renderer.lighter.settings.effective(),
+            renderer.detail.scenery_quality, renderer.lighter.settings, renderer.lighter.effective_settings(),
             cam.water_reflections, cam.atmospheric_fog, cam.world_effects, cam.cloud_detail,
             cam.bloom, cam.terrain_lightmaps, cam.area_grass_lightmaps,
             renderer.frame.weather.rain && cam.underwater_depth <= 0., renderer.frame.weather_ticks,
         );
+        if let Some(plan) = &flight {
+            writeln!(
+                meta,
+                "camera_path_sha256={}",
+                plan.preview_path(&t.map.id, cam.time_of_day, warmup)?
+            )
+            .unwrap();
+        }
         if mode == LighterMode::Off {
             let effects = renderer
                 .models
@@ -9268,7 +9329,7 @@ fn preview_frame_using(
         let mut gpu_ms = Vec::new();
         for _ in 0..timed_frames {
             let start = Instant::now();
-            draw(&mut renderer, &cam)?;
+            draw(&mut renderer, &cam, false)?;
             read_target_pixels(&renderer, &mut captures, &target)?;
             capture_ms.push(start.elapsed().as_secs_f64() * 1000.);
             if let Some(stages) = renderer.lighter.capture_stage_sample(&renderer.queue) {

@@ -90,11 +90,14 @@ def compare(a, b, custom=None):
         pixels = (box[2] - box[0]) * (box[3] - box[1])
         hist = diff.crop(box).histogram()
         channel_mae = [sum(i * n for i, n in enumerate(hist[j:j + 256])) / pixels for j in (0, 256, 512)]
+        channel_max = [max((i for i, n in enumerate(hist[j:j + 256]) if n), default=0) for j in (0, 256, 512)]
         summary[name] = {
             "box_xyxy": box,
             "pixels": pixels,
             "mean_abs_rgb8": round(statistics.mean(channel_mae), 5),
             "channel_mean_abs_rgb8": [round(v, 5) for v in channel_mae],
+            "max_abs_rgb8": max(channel_max),
+            "channel_max_abs_rgb8": channel_max,
         }
     return summary, diff
 
@@ -123,13 +126,17 @@ def capture_metadata(stem, mode, case, profile):
         pose = json.loads(meta["eye"]) + [float(meta["yaw"]), float(meta["pitch"])]
         if not all(math.isclose(a, b, abs_tol=0.0001, rel_tol=1e-7) for a, b in zip(pose, case["camera"], strict=True)):
             raise ValueError(f"{stem.name}: captured the wrong camera")
+    return meta, verified_image(stem, meta)
+
+
+def verified_image(stem, meta):
     with Image.open(stem.with_suffix(".png")) as source:
         image = source.convert("RGBA")
     if f"{image.width}x{image.height}" != meta["image"]:
         raise ValueError(f"{stem.name}: extent disagrees with metadata")
     if hashlib.sha256(image.tobytes()).hexdigest() != meta["rgba8_sha256"]:
         raise ValueError(f"{stem.name}: decoded RGBA8 hash disagrees with metadata")
-    return meta, image
+    return image
 
 
 def inventory_for(stem, case):

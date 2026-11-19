@@ -1845,6 +1845,12 @@ fn lighter_matched_fixture_capture() {
     std::fs::create_dir_all(&save).unwrap();
     let only = std::env::var("PW_LIGHTER_FIXTURE_ONLY").ok();
     let authored = std::env::var("PW_LIGHTER_FIXTURE_AUTHORED_BC").as_deref() == Ok("1");
+    let warmup = std::env::var("PW_LIGHTER_FIXTURE_WARMUP").map_or(4, |n| {
+        n.parse::<u32>()
+            .ok()
+            .filter(|n| (1..=600).contains(n))
+            .expect("invalid fixture warm-up")
+    });
     let mut captures = 0;
     let mut adapter_name = None;
     for (name, mode, raster) in [
@@ -1896,7 +1902,7 @@ fn lighter_matched_fixture_capture() {
             &path,
             Some([-2.5, 5., 0., 0., -std::f32::consts::FRAC_PI_4]),
             mode,
-            Some(4),
+            Some(warmup),
             |mut settings| {
                 settings.hybrid_primary = raster;
                 let context = if mode != Mode::Hardware {

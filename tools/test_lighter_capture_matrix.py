@@ -6,6 +6,7 @@ import unittest
 from PIL import Image
 
 import lighter_capture_matrix as matrix
+import lighter_temporal_compare as temporal
 
 
 class CaptureMatrixTests(unittest.TestCase):
@@ -16,6 +17,9 @@ class CaptureMatrixTests(unittest.TestCase):
             report, _ = matrix.compare(a, b)
         self.assertEqual(report["upper"]["mean_abs_rgb8"], 20)
         self.assertEqual(report["upper"]["channel_mean_abs_rgb8"], [30, 20, 10])
+        self.assertEqual(report["whole"]["max_abs_rgb8"], 30)
+        self.assertEqual(report["whole"]["channel_max_abs_rgb8"], [30, 20, 10])
+        self.assertEqual(report["lower"]["max_abs_rgb8"], 0)
         self.assertEqual(report["whole"]["mean_abs_rgb8"], 6.66667)
         self.assertEqual(report["lower"]["mean_abs_rgb8"], 0)
         with self.assertRaisesRegex(ValueError, "invalid region"):
@@ -84,6 +88,27 @@ class CaptureMatrixTests(unittest.TestCase):
             image.save(path)
             with self.assertRaisesRegex(ValueError, "RGBA8 hash disagrees"):
                 matrix.capture_metadata(stem, "hardware", case, "physical")
+
+    def test_temporal_receipts_reject_fallback_unmatched_path_and_unrefined_reference(self):
+        shared = dict.fromkeys(matrix.MATCH_KEYS, "fixed") | {
+            "adapter": 'name: "NVIDIA GeForce RTX 3080", vendor: 4318, device_type: DiscreteGpu, backend: Vulkan',
+            "mode": "Software", "warmup_frames": "48", "warmup_step_ms": "16", "animation_elapsed_ms": "768",
+            "raster_primary": "false", "screen_reuse_flags": "0", "camera_path_sha256": "a" * 64,
+        }
+        rays = "Settings { mode: Software, samples: 1, reference: false, dynamic_resolution: false }"
+        ref = ("Settings { mode: Software, samples: %d, reference: true, dynamic_resolution: false, "
+               "bounces: 8, resolution: 100, progressive: false, denoiser: false }")
+        metas = {key: shared | {"ray_reconstruction": provider, "settings_effective": rays}
+                 for key, provider in temporal.PROVIDERS.items()}
+        metas["reference_low"]["settings_effective"] = ref % 32
+        metas["reference"]["settings_effective"] = ref % 64
+        temporal.validate_temporal(metas, "reveal")
+        with self.assertRaisesRegex(ValueError, "requested.*got portable"):
+            temporal.validate_temporal(metas | {"rr": metas["rr"] | {"ray_reconstruction": "portable"}}, "reveal")
+        with self.assertRaisesRegex(ValueError, "unmatched camera_path_sha256"):
+            temporal.validate_temporal(metas | {"fsr": metas["fsr"] | {"camera_path_sha256": "b" * 64}}, "reveal")
+        with self.assertRaisesRegex(ValueError, "doubled budget"):
+            temporal.validate_temporal(metas | {"reference": metas["reference"] | {"settings_effective": ref % 32}}, "reveal")
 
     def test_gpu_stages_keep_gpu_time_separate_from_capture_wall_time(self):
         with tempfile.TemporaryDirectory() as tmp:

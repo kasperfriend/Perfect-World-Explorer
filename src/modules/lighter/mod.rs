@@ -854,6 +854,7 @@ pub struct Lighter {
     armed: bool,
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     capture: bool,
+    capture_reference_samples: Option<u32>,
     compact_terrain: bool,
     bc_pages: bool,
     screen_reuse: u32,
@@ -904,6 +905,7 @@ impl Default for Lighter {
             armed: false,
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             capture: false,
+            capture_reference_samples: None,
             compact_terrain: false,
             bc_pages: false,
             screen_reuse: 0,
@@ -980,6 +982,21 @@ impl Lighter {
         };
         #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         self
+    }
+
+    /// Headless audit only. Keep the interactive Reference preset at 32 spp.
+    pub(crate) fn set_capture_reference_samples(&mut self, samples: Option<u32>) {
+        self.capture_reference_samples = samples;
+    }
+
+    pub(crate) fn effective_settings(&self) -> Settings {
+        let mut settings = self.settings.effective();
+        if settings.reference {
+            if let Some(samples) = self.capture_reference_samples {
+                settings.samples = samples;
+            }
+        }
+        settings
     }
 
     pub(crate) fn raster_active(&self) -> bool {
@@ -1540,7 +1557,7 @@ impl Lighter {
         }
         let (rw, rh) = self.ray_extent(device, w, h)?;
         frame.extent = [rw, rh, w, h];
-        let settings = self.settings.effective();
+        let settings = self.effective_settings();
         frame.options[0] |= u32::from(settings.lighting)
             | u32::from(settings.shadows) << 1
             | u32::from(settings.reflections) << 2
