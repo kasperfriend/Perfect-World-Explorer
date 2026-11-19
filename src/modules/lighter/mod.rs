@@ -2387,11 +2387,8 @@ impl Lighter {
                         Some(reason) => format!("{} — {}", d.label(), reason),
                         None => d.label().to_string(),
                     };
-                    let mut response = ui.selectable_value(&mut self.settings.denoiser, d, text);
-                    if disabled {
-                        response = response.disabled();
-                    }
-                    response.on_hover_text(d.unavailable_reason().unwrap_or("Always available portable denoiser."));
+                    ui.add_enabled(!disabled, egui::SelectableValue::new(&mut self.settings.denoiser, d, text))
+                        .on_hover_text(d.unavailable_reason().unwrap_or("Always available portable denoiser."));
                 }
             });
         let upscale = self.graphics_upscaler.as_deref().unwrap_or("not yet reported");
@@ -2431,16 +2428,20 @@ impl Lighter {
         });
         if self.logger.level() != log::LogLevel::Off {
             ui.separator();
-            if ui.button("Copy diagnostics to clipboard").clicked() {
+            let copy_btn = ui.button("Copy diagnostics to clipboard");
+            copy_btn.on_hover_text("Copy the current session diagnostics text to the clipboard.");
+            if copy_btn.clicked() {
                 // Clipboard copy handled by the host; the diagnostics text is
                 // available from the log file.
             }
-            .on_hover_text("Copy the current session diagnostics text to the clipboard.");
-            if ui.button("Open log folder").clicked() {
+            let open_btn = ui.button("Open log folder");
+            open_btn.on_hover_text("Open the folder containing the rotating lighter log files.");
+            if open_btn.clicked() {
                 // Open the log directory in the host file manager.
             }
-            .on_hover_text("Open the folder containing the rotating lighter log files.");
-            if ui.button("Export frame timings CSV").clicked() {
+            let export_btn = ui.button("Export frame timings CSV");
+            export_btn.on_hover_text("Export per-frame timing samples as CSV.");
+            if export_btn.clicked() {
                 // Export per-frame timing samples as CSV.
             }
             .on_hover_text("Export one row per frame with per-stage timings and provider names.");
