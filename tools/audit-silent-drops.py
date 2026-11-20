@@ -25,6 +25,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ALLOW = os.path.join(ROOT, "tools", "silent_drop_allowances.txt")
+CHECK = "--check" in sys.argv
 
 # The site patterns. Each is (name, regex, description).
 PATTERNS = [
@@ -201,14 +202,47 @@ def main():
         out.append(f"| `{rel}` | {ln} | `{kind}` | **{cat}** | `{code}` |")
 
     report = os.path.join(ROOT, "docs", "silent-drops.md")
-    with open(report, "w", encoding="utf-8") as f:
-        f.write("\n".join(out) + "\n")
+    text = "\n".join(out) + "\n"
+    if CHECK:
+        # Verify, do not rewrite. Regenerating in CI would pass whatever the tree
+        # happened to say and leave the committed report permanently behind the
+        # code it describes, which is what had already happened here.
+        try:
+            with open(report, encoding="utf-8") as f:
+                if f.read() != text:
+                    print(
+                        "docs/silent-drops.md is stale -- run "
+                        "`python3 tools/audit-silent-drops.py` and commit it",
+                        file=sys.stderr,
+                    )
+                    return 1
+        except FileNotFoundError:
+            print("docs/silent-drops.md is missing", file=sys.stderr)
+            return 1
+    else:
+        with open(report, "w", encoding="utf-8") as f:
+            f.write(text)
 
     print(f"{len(rows)} sites, {counts}")
     if unclassified:
         print(f"{len(unclassified)} UNCLASSIFIED site(s) -- each needs an allowance:", file=sys.stderr)
         for rel, ln, kind, code in unclassified:
             print(f"  {rel}:{ln}  {kind}  {code}", file=sys.stderr)
+        return 1
+    # An allowance whose line no longer holds a site is stale, and a stale
+    # allowance is a claim about code that has moved or gone. Silently keeping it
+    # means the next real site at that path:line inherits a justification written
+    # for something else -- which is how this file lost track twice while being
+    # edited above the line it named.
+    used = {f"{r[0]}:{r[1]}" for r in rows}
+    stale = sorted(key for key in allowances if key not in used)
+    if stale:
+        print(
+            f"{len(stale)} STALE allowance(s) -- no site at that path:line any more:",
+            file=sys.stderr,
+        )
+        for key in stale:
+            print(f"  {key}", file=sys.stderr)
         return 1
     fixes = [r for r in rows if r[3] == "fix"]
     if fixes:

@@ -87,7 +87,6 @@ src/weather_gpu.rs:313 unreachable an absent field is the documented default of 
 src/terrain_store.rs:386 unreachable a clock that predates 1970 gives zero nanoseconds; the nonce also carries a counter
 src/terrain_store.rs:581 unreachable a counter default for a fresh store; nothing is read
 src/world_page_cache.rs:130 unreachable a clock that predates 1970 gives zero; the temp name also carries a counter
-src/pck.rs:865 unreachable a path with no file stem cannot name a .pkx; the caller already required a stem
 src/dlss/imp.rs:912 unreachable an absent SDK frame-generation option is the documented default value
 src/dlss/loader.rs:480 unreachable an absent SDK option block is the documented default value
 src/dlss/loader.rs:1018 unreachable an absent SDK option block is the documented default value
@@ -128,9 +127,8 @@ src/world_catalog.rs:90 unreachable an absent record set is the documented defau
 src/grass_random.rs:144 unreachable else-continue over a hash seed selection; every branch produces a seed
 src/gfx_effect_gpu.rs:744 unreachable else-continue over an element kind this pass does not draw; the owner names it
 src/gfx_effect_gpu.rs:821 unreachable else-continue over an element kind this pass does not draw; the owner names it
-src/water.rs:725 unreachable else-continue over a record that fails its own bounds check; each branch diags via SceneWater
 # `continuation_path` returns None when there is no such continuation, and that
 # is the caller's answer, not a loss: the name is only built after the range
 # check above has already proven `n` is in range. A stem-less path cannot occur
 # because a package rejected every path without a file stem when it opened.
-src/pck.rs:918 unreachable caller already range-checked n; the stem exists because Package::open rejects a path without one
+src/pck.rs:890 unreachable caller already range-checked n; the stem exists because Package::open rejects a path without one

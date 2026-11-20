@@ -206,6 +206,13 @@ jobs:
           # total the docs claim stops matching.
           python3 tools/count-register.py 61
           python3 tools/audit-static-model-gpu-programs.py
+          # Every site that drops a load result must be classified, and every
+          # allowance must still name a real site. The second half was missing:
+          # the file is keyed path:line, so editing anything above an allowance
+          # silently retargeted it to whatever line moved into its place, and a
+          # stale one kept justifying code that had gone. It found two the first
+          # time it ran.
+          python3 tools/audit-silent-drops.py --check
           rustc --edition=2021 --test src/scenery_visibility.rs -o /tmp/scenery-visibility-tests
           /tmp/scenery-visibility-tests
           # Phase 5 sky-swap machine: standalone, so a failure names the recovered
