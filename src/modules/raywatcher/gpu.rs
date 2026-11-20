@@ -244,6 +244,10 @@ struct Material {
 @group(0) @binding(6) var out_guide: texture_storage_2d<rgba16float, write>;
 // rgb reflection radiance, a: reflection hit distance normalised.
 @group(0) @binding(7) var out_reflection: texture_storage_2d<rgba16float, write>;
+// xyz world normal, w roughness (packed for DLSS Ray Reconstruction).
+@group(0) @binding(8) var out_normals: texture_storage_2d<rgba16float, write>;
+// rgb diffuse albedo, a specular F0.
+@group(0) @binding(9) var out_albedo: texture_storage_2d<rgba16float, write>;
 
 const PI: f32 = 3.14159265;
 
@@ -481,6 +485,8 @@ struct Surface {
     depth: f32,
     reflection_distance: f32,
     normal: vec3<f32>,
+    roughness: f32,
+    albedo: vec3<f32>,
 };
 
 fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surface {
@@ -490,7 +496,9 @@ fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surfac
     surface.visibility = 1.0;
     surface.reflection_distance = params.lens.y;
     surface.depth = params.lens.y;
-    surface.normal = vec3<f32>(0.0);
+    surface.normal = vec3<f32>(0.0, 1.0, 0.0);
+    surface.roughness = 1.0;
+    surface.albedo = vec3<f32>(0.0);
     let hit = closest_hit(origin, dir, params.effects.z, params.lens.y);
     if (hit.index == 0xffffffffu) {
         let fog_start = params.fog.x;
@@ -509,6 +517,8 @@ fn shade(origin: vec3<f32>, dir: vec3<f32>, state: ptr<function, u32>) -> Surfac
     let roughness = material.surface.x;
     surface.depth = hit.t;
     surface.normal = hit.normal;
+    surface.roughness = roughness;
+    surface.albedo = albedo;
 
     let effects = u32(round(params.effects.y));
     let bits_shadows = (effects & 1u) != 0u;
@@ -616,6 +626,9 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var accum_visibility = 0.0;
     var accum_depth = 0.0;
     var accum_reflection_distance = 0.0;
+    var accum_normal = vec3<f32>(0.0);
+    var accum_roughness = 0.0;
+    var accum_albedo = vec3<f32>(0.0);
     var state = id.x * 0x9e3779b9u ^ id.y * 0x85ebca6bu ^ u32(params.frame.x) * 0xc2b2ae35u;
     for (var s = 0u; s < samples; s = s + 1u) {
         // Jitter rotates across frames; each sample sits at a stratified offset
@@ -637,11 +650,21 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         accum_visibility = accum_visibility + surface.visibility;
         accum_depth = accum_depth + surface.depth;
         accum_reflection_distance = accum_reflection_distance + surface.reflection_distance;
+        accum_normal = accum_normal + surface.normal;
+        accum_roughness = accum_roughness + surface.roughness;
+        accum_albedo = accum_albedo + surface.albedo;
     }
     let inv = 1.0 / f32(samples);
+    let raw_n = accum_normal * inv;
+    let avg_n = select(vec3<f32>(0.0, 1.0, 0.0), normalize(raw_n), length(raw_n) > 1e-4);
+    let avg_rough = clamp(accum_roughness * inv, 0.02, 1.0);
+    let avg_albedo = accum_albedo * inv;
+    let spec_f0 = 0.04 + 0.06 * (1.0 - avg_rough);
     textureStore(out_colour, vec2<i32>(id.xy), vec4<f32>(accum * inv, 1.0));
     textureStore(out_guide, vec2<i32>(id.xy), vec4<f32>(accum_visibility * inv, (accum_depth * inv) / params.lens.y, 0.0, 0.0));
     textureStore(out_reflection, vec2<i32>(id.xy), vec4<f32>(accum_reflection * inv, (accum_reflection_distance * inv) / params.lens.y));
+    textureStore(out_normals, vec2<i32>(id.xy), vec4<f32>(avg_n, avg_rough));
+    textureStore(out_albedo, vec2<i32>(id.xy), vec4<f32>(avg_albedo, spec_f0));
 }
 "#;
 
@@ -660,7 +683,7 @@ struct Params {
 @group(0) @binding(2) var src_guide: texture_2d<f32>;
 @group(0) @binding(3) var src_reflection: texture_2d<f32>;
 @group(0) @binding(4) var src_motion: texture_2d<f32>;
-@group(0) @binding(5) var src_depth: texture_2d<f32>;
+@group(0) @binding(5) var src_depth: texture_depth_2d;
 // History: accumulated colour and moments. The moments carry `depth` in `.z`
 // and the history length in `.w`, so the temporal and atrous passes need only
 // one history pair each.
@@ -684,7 +707,7 @@ fn reproject(pixel: vec2<i32>, size: vec2<i32>) -> vec3<f32> {
     }
     let index = vec2<i32>(source);
     let previous_depth = textureLoad(history_moments, index, 0).w;
-    let current_depth = textureLoad(src_depth, pixel, 0).r;
+    let current_depth = textureLoad(src_depth, pixel, 0);
     let both = previous_depth > 0.0 && current_depth > 0.0;
     if (both) {
         if (abs(previous_depth - current_depth) / max(current_depth, 1e-3) > 0.1) {
@@ -745,7 +768,7 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         m1 = mix(previous_moments.x, lum, alpha);
         m2 = mix(previous_moments.y, lum * lum, alpha);
     }
-    let depth = textureLoad(src_depth, pixel, 0).r;
+    let depth = textureLoad(src_depth, pixel, 0);
     textureStore(out_colour, pixel, vec4<f32>(blended, 1.0));
     textureStore(out_moments, pixel, vec4<f32>(m1, m2, depth, length));
 }
@@ -863,6 +886,35 @@ fn compose_pass(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// Intermediate formats. Half-float keeps the guide in a range where
 /// normal-space encoding stays precise, and matches what the upscalers accept.
+const BLIT_SHADER: &str = r#"
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var src_samp: sampler;
+
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) idx: u32) -> VOut {
+    var p = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(3.0, 1.0),
+        vec2<f32>(-1.0, 1.0),
+    );
+    var out: VOut;
+    let xy = p[idx];
+    out.pos = vec4<f32>(xy, 0.0, 1.0);
+    out.uv = vec2<f32>(xy.x * 0.5 + 0.5, 0.5 - xy.y * 0.5);
+    return out;
+}
+
+@fragment
+fn fs(i: VOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(textureSampleLevel(src_tex, src_samp, i.uv, 0.0).rgb, 1.0);
+}
+"#;
+
 pub const COLOUR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// `Rg16Float` would be smaller, but storage textures cannot be 16-bit
 /// single/dual channel on every backend, so the guide is RGBA like the rest.
@@ -903,6 +955,9 @@ struct Pipelines {
     denoise_layout: wgpu::BindGroupLayout,
     compose: wgpu::ComputePipeline,
     compose_layout: wgpu::BindGroupLayout,
+    blit_module: wgpu::ShaderModule,
+    blit_layout: wgpu::BindGroupLayout,
+    blit_sampler: wgpu::Sampler,
 }
 
 impl Pipelines {
@@ -975,6 +1030,8 @@ impl Pipelines {
                 storage_texture_entry(5, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
                 storage_texture_entry(6, wgpu::StorageTextureAccess::WriteOnly, GUIDE_FORMAT),
                 storage_texture_entry(7, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
+                storage_texture_entry(8, wgpu::StorageTextureAccess::WriteOnly, GUIDE_FORMAT),
+                storage_texture_entry(9, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
             ],
         });
         let denoise_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -994,13 +1051,11 @@ impl Pipelines {
                 texture_entry(2, wgpu::TextureSampleType::Float { filterable: true }),
                 texture_entry(3, wgpu::TextureSampleType::Float { filterable: true }),
                 texture_entry(4, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(5, wgpu::TextureSampleType::Float { filterable: true }),
+                texture_entry(5, wgpu::TextureSampleType::Depth),
                 texture_entry(6, wgpu::TextureSampleType::Float { filterable: true }),
                 texture_entry(7, wgpu::TextureSampleType::Float { filterable: true }),
-                texture_entry(8, wgpu::TextureSampleType::Float { filterable: true }),
                 storage_texture_entry(9, wgpu::StorageTextureAccess::WriteOnly, COLOUR_FORMAT),
                 storage_texture_entry(10, wgpu::StorageTextureAccess::WriteOnly, GUIDE_FORMAT),
-                storage_texture_entry(11, wgpu::StorageTextureAccess::WriteOnly, GUIDE_FORMAT),
             ],
         });
         let trace_pipeline = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1072,6 +1127,37 @@ impl Pipelines {
             denoise_layout,
             compose,
             compose_layout,
+            blit_module: device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("raywatcher blit"),
+                source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
+            }),
+            blit_layout: device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("raywatcher blit"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            }),
+            blit_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("raywatcher blit sampler"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }),
         }
     }
 }
@@ -1160,9 +1246,13 @@ struct GridTargets {
     colour: wgpu::Texture,
     guide: wgpu::Texture,
     reflection: wgpu::Texture,
+    normals: wgpu::Texture,
+    albedo: wgpu::Texture,
     colour_view: wgpu::TextureView,
     guide_view: wgpu::TextureView,
     reflection_view: wgpu::TextureView,
+    normals_view: wgpu::TextureView,
+    albedo_view: wgpu::TextureView,
 }
 
 impl GridTargets {
@@ -1170,16 +1260,24 @@ impl GridTargets {
         let colour = storage_texture(device, "raywatcher rays", w, h, COLOUR_FORMAT);
         let guide = storage_texture(device, "raywatcher guide", w, h, GUIDE_FORMAT);
         let reflection = storage_texture(device, "raywatcher reflection", w, h, COLOUR_FORMAT);
+        let normals = storage_texture(device, "raywatcher normals", w, h, GUIDE_FORMAT);
+        let albedo = storage_texture(device, "raywatcher albedo", w, h, COLOUR_FORMAT);
         let colour_view = colour.create_view(&Default::default());
         let guide_view = guide.create_view(&Default::default());
         let reflection_view = reflection.create_view(&Default::default());
+        let normals_view = normals.create_view(&Default::default());
+        let albedo_view = albedo.create_view(&Default::default());
         Self {
             colour,
             guide,
             reflection,
+            normals,
+            albedo,
             colour_view,
             guide_view,
             reflection_view,
+            normals_view,
+            albedo_view,
         }
     }
 }
@@ -1201,12 +1299,41 @@ fn plane(
     (texture, view)
 }
 
+fn depth_plane(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("raywatcher depth"),
+        size: wgpu::Extent3d {
+            width: w.max(1),
+            height: h.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        aspect: wgpu::TextureAspect::DepthOnly,
+        ..Default::default()
+    });
+    (texture, view)
+}
+
 /// Everything Raywatcher owns on the GPU.
 pub struct RaywatcherGpu {
     pipelines: Pipelines,
     uniforms: wgpu::Buffer,
-    denoise_uniforms: wgpu::Buffer,
+    temporal_uniforms: wgpu::Buffer,
+    atrous_uniforms: Vec<wgpu::Buffer>,
     scene: SceneBuffers,
+    scene_geom: Arc<super::bvh::SceneGeometry>,
+    dxr: Option<super::dxr::DxrTracer>,
+    dxr_failed: bool,
+    dlss_rr: Option<super::reconstruct::DlssRayReconstructor>,
+    dlss_rr_failed: bool,
+    blit_pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     grid: GridTargets,
     grid_extent: (u32, u32),
     render_extent: (u32, u32),
@@ -1216,7 +1343,7 @@ pub struct RaywatcherGpu {
     filter_moments: [wgpu::TextureView; 2],
     temporal_bind_group: wgpu::BindGroup,
     atrous_bind_groups: Vec<wgpu::BindGroup>,
-    compose_bind_group: wgpu::BindGroup,
+    compose_bind_groups: [wgpu::BindGroup; 2],
     compose_uniforms: wgpu::Buffer,
     filter_colour_tex: [wgpu::Texture; 2],
     filter_moments_tex: [wgpu::Texture; 2],
@@ -1256,12 +1383,19 @@ impl RaywatcherGpu {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let denoise_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("raywatcher denoise params"),
-            size: std::mem::size_of::<DenoiseParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let mk_denoise_buf = |label: &str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<DenoiseParams>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let temporal_uniforms = mk_denoise_buf("raywatcher temporal params");
+        let atrous_uniforms: Vec<wgpu::Buffer> = (0..MAX_PASSES)
+            .map(|_| mk_denoise_buf("raywatcher atrous params"))
+            .collect();
+        let scene_geom = scene.clone();
         let scene_buffers = SceneBuffers::upload(device, scene);
         let grid = GridTargets::new(device, grid_extent.0, grid_extent.1);
         let (w, h) = (render_extent.0.max(1), render_extent.1.max(1));
@@ -1280,13 +1414,7 @@ impl RaywatcherGpu {
         let (temporal_moments_tex, temporal_moments) =
             plane(device, "raywatcher temporal moments", w, h, GUIDE_FORMAT);
         let (motion_tex, motion) = plane(device, "raywatcher motion", w, h, COLOUR_FORMAT);
-        let (depth_tex, depth) = plane(
-            device,
-            "raywatcher depth",
-            w,
-            h,
-            wgpu::TextureFormat::R32Float,
-        );
+        let (depth_tex, depth) = depth_plane(device, w, h);
         let (output, output_view) = plane(device, "raywatcher output", w, h, COLOUR_FORMAT);
         let (guide, guide_view) = plane(device, "raywatcher output guide", w, h, GUIDE_FORMAT);
         let compose_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1301,7 +1429,7 @@ impl RaywatcherGpu {
         let temporal_bind_group = Self::temporal_binding(
             device,
             &pipelines,
-            &denoise_uniforms,
+            &temporal_uniforms,
             &grid,
             &motion,
             &depth,
@@ -1313,7 +1441,7 @@ impl RaywatcherGpu {
         let atrous_bind_groups = Self::atrous_bindings(
             device,
             &pipelines,
-            &denoise_uniforms,
+            &atrous_uniforms,
             &grid,
             &depth,
             &motion,
@@ -1322,21 +1450,40 @@ impl RaywatcherGpu {
             &temporal_colour,
             &temporal_moments,
         );
-        let compose_bind_group = Self::compose_binding(
-            device,
-            &pipelines,
-            &compose_uniforms,
-            &grid,
-            &filter_colour[0],
-            &filter_moments[0],
-            &output_view,
-            &guide_view,
-        );
+        let compose_bind_groups = [
+            Self::compose_binding(
+                device,
+                &pipelines,
+                &compose_uniforms,
+                &grid,
+                &filter_colour[0],
+                &filter_moments[0],
+                &output_view,
+                &guide_view,
+            ),
+            Self::compose_binding(
+                device,
+                &pipelines,
+                &compose_uniforms,
+                &grid,
+                &filter_colour[1],
+                &filter_moments[1],
+                &output_view,
+                &guide_view,
+            ),
+        ];
         Self {
             pipelines,
             uniforms,
-            denoise_uniforms,
+            temporal_uniforms,
+            atrous_uniforms,
             scene: scene_buffers,
+            scene_geom,
+            dxr: None,
+            dxr_failed: false,
+            dlss_rr: None,
+            dlss_rr_failed: false,
+            blit_pipeline: None,
             grid,
             grid_extent,
             render_extent: (w, h),
@@ -1345,7 +1492,7 @@ impl RaywatcherGpu {
             filter_moments,
             temporal_bind_group,
             atrous_bind_groups,
-            compose_bind_group,
+            compose_bind_groups,
             compose_uniforms,
             filter_colour_tex,
             filter_moments_tex,
@@ -1408,6 +1555,14 @@ impl RaywatcherGpu {
                 wgpu::BindGroupEntry {
                     binding: 7,
                     resource: wgpu::BindingResource::TextureView(&grid.reflection_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::TextureView(&grid.normals_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 9,
+                    resource: wgpu::BindingResource::TextureView(&grid.albedo_view),
                 },
             ],
         })
@@ -1481,7 +1636,7 @@ impl RaywatcherGpu {
     fn atrous_bindings(
         device: &wgpu::Device,
         pipelines: &Pipelines,
-        uniforms: &wgpu::Buffer,
+        uniforms: &[wgpu::Buffer],
         grid: &GridTargets,
         depth: &wgpu::TextureView,
         motion: &wgpu::TextureView,
@@ -1508,7 +1663,7 @@ impl RaywatcherGpu {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: uniforms.as_entire_binding(),
+                        resource: uniforms[i].as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
@@ -1632,13 +1787,7 @@ impl RaywatcherGpu {
         let (temporal_moments_tex, temporal_moments) =
             plane(device, "raywatcher temporal moments", w, h, GUIDE_FORMAT);
         let (motion_tex, motion) = plane(device, "raywatcher motion", w, h, COLOUR_FORMAT);
-        let (depth_tex, depth) = plane(
-            device,
-            "raywatcher depth",
-            w,
-            h,
-            wgpu::TextureFormat::R32Float,
-        );
+        let (depth_tex, depth) = depth_plane(device, w, h);
         let (output, output_view) = plane(device, "raywatcher output", w, h, COLOUR_FORMAT);
         let (guide, guide_view) = plane(device, "raywatcher output guide", w, h, GUIDE_FORMAT);
         self.trace_bind_group =
@@ -1646,7 +1795,7 @@ impl RaywatcherGpu {
         self.temporal_bind_group = Self::temporal_binding(
             device,
             pipelines,
-            &self.denoise_uniforms,
+            &self.temporal_uniforms,
             &self.grid,
             &motion,
             &depth,
@@ -1658,7 +1807,7 @@ impl RaywatcherGpu {
         self.atrous_bind_groups = Self::atrous_bindings(
             device,
             pipelines,
-            &self.denoise_uniforms,
+            &self.atrous_uniforms,
             &self.grid,
             &depth,
             &motion,
@@ -1667,16 +1816,40 @@ impl RaywatcherGpu {
             &temporal_colour,
             &temporal_moments,
         );
-        self.compose_bind_group = Self::compose_binding(
-            device,
-            pipelines,
-            &self.compose_uniforms,
-            &self.grid,
-            &filter_colour[0],
-            &filter_moments[0],
-            &output_view,
-            &guide_view,
-        );
+        self.compose_bind_groups = [
+            Self::compose_binding(
+                device,
+                pipelines,
+                &self.compose_uniforms,
+                &self.grid,
+                &filter_colour[0],
+                &filter_moments[0],
+                &output_view,
+                &guide_view,
+            ),
+            Self::compose_binding(
+                device,
+                pipelines,
+                &self.compose_uniforms,
+                &self.grid,
+                &filter_colour[1],
+                &filter_moments[1],
+                &output_view,
+                &guide_view,
+            ),
+        ];
+        if let Some(dxr) = self.dxr.as_mut() {
+            if let Err(err) = dxr.resize(device, self.grid_extent) {
+                eprintln!("[Raywatcher] DXR resize failed ({err}); falling back to Software");
+                self.dxr = None;
+                self.dxr_failed = true;
+            }
+        }
+        if let Some(rr) = self.dlss_rr.as_ref() {
+            if rr.extent() != (w, h) {
+                self.dlss_rr = None;
+            }
+        }
         self.filter_colour = filter_colour;
         self.filter_moments = filter_moments;
         self.filter_colour_tex = filter_colour_tex;
@@ -1701,7 +1874,15 @@ impl RaywatcherGpu {
     /// Replace the scene. Called when the resident terrain set, tree set or
     /// water areas change.
     pub fn set_scene(&mut self, device: &wgpu::Device, scene: Arc<super::bvh::SceneGeometry>) {
+        self.scene_geom = scene.clone();
         self.scene = SceneBuffers::upload(device, scene);
+        if let Some(dxr) = self.dxr.as_mut() {
+            if let Err(err) = dxr.set_scene(&self.scene_geom) {
+                eprintln!("[Raywatcher] DXR acceleration structure rebuild failed ({err}); falling back to Software");
+                self.dxr = None;
+                self.dxr_failed = true;
+            }
+        }
         self.trace_bind_group = Self::trace_bindings(
             device,
             &self.pipelines,
@@ -1719,10 +1900,12 @@ impl RaywatcherGpu {
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         params: &FrameParams,
         plan: &super::plan::Plan,
+        hardware_mode: bool,
         transport: &super::shade::TransportConfig,
         config: &DenoiseConfig,
         motion: &wgpu::Texture,
@@ -1732,21 +1915,55 @@ impl RaywatcherGpu {
             self.traced_last_frame = false;
             return;
         }
-        queue.write_buffer(
-            &self.uniforms,
-            0,
-            bytemuck::bytes_of(&RayParams::pack(
-                params,
-                plan,
-                transport,
-                [
-                    self.scene.counts.triangles,
-                    self.scene.counts.nodes,
-                    self.scene.counts.materials,
-                ],
-            )),
+        let packed = RayParams::pack(
+            params,
+            plan,
+            transport,
+            [
+                self.scene.counts.triangles,
+                self.scene.counts.nodes,
+                self.scene.counts.materials,
+            ],
         );
-        {
+
+        let mut traced_hw = false;
+        if hardware_mode && !self.dxr_failed {
+            if self.dxr.is_none() {
+                match super::dxr::DxrTracer::new(device, &self.scene_geom, self.grid_extent) {
+                    Ok(tracer) => self.dxr = Some(tracer),
+                    Err(err) => {
+                        eprintln!(
+                            "[Raywatcher] DXR 1.1 init failed ({err}); falling back to Software"
+                        );
+                        self.dxr_failed = true;
+                    }
+                }
+            }
+            if let Some(dxr) = self.dxr.as_mut() {
+                match dxr.trace(
+                    encoder,
+                    &packed,
+                    plan.grid,
+                    &self.grid.colour,
+                    &self.grid.guide,
+                    &self.grid.reflection,
+                    &self.grid.normals,
+                    &self.grid.albedo,
+                ) {
+                    Ok(()) => traced_hw = true,
+                    Err(err) => {
+                        eprintln!(
+                            "[Raywatcher] DXR 1.1 trace failed ({err}); falling back to Software"
+                        );
+                        self.dxr = None;
+                        self.dxr_failed = true;
+                    }
+                }
+            }
+        }
+
+        if !traced_hw {
+            queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&packed));
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("raywatcher trace"),
                 timestamp_writes: None,
@@ -1756,6 +1973,7 @@ impl RaywatcherGpu {
             let (w, h) = plan.grid;
             pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
         }
+
         // The denoiser's guide inputs are the scene's own motion and depth.
         // They are copied rather than aliased because the filter samples them at
         // arbitrary reprojected positions.
@@ -1790,7 +2008,7 @@ impl RaywatcherGpu {
                 texture: &self._depth_tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
+                aspect: wgpu::TextureAspect::DepthOnly,
             },
             wgpu::Extent3d {
                 width: rw.min(depth.width()),
@@ -1798,9 +2016,10 @@ impl RaywatcherGpu {
                 depth_or_array_layers: 1,
             },
         );
+
         // Temporal accumulation.
         queue.write_buffer(
-            &self.denoise_uniforms,
+            &self.temporal_uniforms,
             0,
             bytemuck::bytes_of(&DenoiseParams::pack(self.render_extent, 0, config, params)),
         );
@@ -1813,11 +2032,12 @@ impl RaywatcherGpu {
             pass.set_bind_group(0, &self.temporal_bind_group, &[]);
             pass.dispatch_workgroups(rw.div_ceil(8), rh.div_ceil(8), 1);
         }
-        // One pass per iteration; each pass's uniform carries its own tap step.
+        // One pass per iteration; each pass has its own uniform buffer so
+        // `queue.write_buffer` never overwrites an earlier iteration's step.
         let iterations = config.iterations.clamp(1, MAX_PASSES as u32);
         for iteration in 0..iterations {
             queue.write_buffer(
-                &self.denoise_uniforms,
+                &self.atrous_uniforms[iteration as usize],
                 0,
                 bytemuck::bytes_of(&DenoiseParams::pack(
                     self.render_extent,
@@ -1834,7 +2054,9 @@ impl RaywatcherGpu {
             pass.set_bind_group(0, &self.atrous_bind_groups[iteration as usize], &[]);
             pass.dispatch_workgroups(rw.div_ceil(8), rh.div_ceil(8), 1);
         }
-        // Resample to the render extent.
+        // Resample to the render extent, reading whichever ping-pong plane the
+        // final à-trous pass wrote.
+        let final_plane = ((iterations - 1) % 2) as usize;
         queue.write_buffer(
             &self.compose_uniforms,
             0,
@@ -1851,11 +2073,177 @@ impl RaywatcherGpu {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipelines.compose);
-            pass.set_bind_group(0, &self.compose_bind_group, &[]);
+            pass.set_bind_group(0, &self.compose_bind_groups[final_plane], &[]);
             pass.dispatch_workgroups(rw.div_ceil(8), rh.div_ceil(8), 1);
         }
         self.frames = self.frames.saturating_add(1);
         self.traced_last_frame = true;
+    }
+
+    /// Run NVIDIA DLSS Ray Reconstruction (`nvngx_dlssd.dll`) over the freshly
+    /// traced ray grid, overwriting `self.output` with the reconstructed image.
+    /// Returns `true` when DLSS RR ran; falls back silently to the in-house
+    /// denoiser output already in `self.output` on failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reconstruct_dlss_rr(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        sdk_dir: &std::path::Path,
+        params: &FrameParams,
+        motion: &wgpu::Texture,
+        reset: bool,
+        world_to_view: [[f32; 4]; 4],
+        view_to_clip: [[f32; 4]; 4],
+    ) -> bool {
+        if self.dlss_rr_failed {
+            return false;
+        }
+        if self.dlss_rr.is_none() {
+            match super::reconstruct::DlssRayReconstructor::new(device, sdk_dir, self.render_extent)
+            {
+                Ok(rr) => self.dlss_rr = Some(rr),
+                Err(err) => {
+                    eprintln!("[Raywatcher] DLSS Ray Reconstruction init failed ({err}); keeping in-house denoiser");
+                    self.dlss_rr_failed = true;
+                    return false;
+                }
+            }
+        }
+        let Some(rr) = self.dlss_rr.as_mut() else {
+            return false;
+        };
+        let inputs = super::reconstruct::DlssRrInputs {
+            grid_colour: &self.grid.colour_view,
+            grid_reflection: &self.grid.reflection_view,
+            grid_normals: &self.grid.normals_view,
+            grid_albedo: &self.grid.albedo_view,
+            depth: &self.depth,
+            motion,
+            jitter: params.jitter,
+            reset,
+            world_to_view,
+            view_to_clip,
+        };
+        match rr.evaluate(device, queue, &inputs, &self.output) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!("[Raywatcher] DLSS Ray Reconstruction evaluate failed ({err}); falling back to in-house denoiser");
+                self.dlss_rr = None;
+                self.dlss_rr_failed = true;
+                false
+            }
+        }
+    }
+
+    /// Copy or blit `self.output` (`Rgba16Float`) into `destination`, converting
+    /// pixel formats cleanly when `destination` uses a swapchain format such as
+    /// `Bgra8UnormSrgb`.
+    pub fn blit_to(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        destination: &wgpu::Texture,
+    ) {
+        let (w, h) = (
+            destination.width().min(self.output.width()),
+            destination.height().min(self.output.height()),
+        );
+        if w == 0 || h == 0 {
+            return;
+        }
+        if destination.format() == COLOUR_FORMAT {
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.output,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: destination,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            return;
+        }
+        let target_format = destination.format();
+        if self
+            .blit_pipeline
+            .as_ref()
+            .is_none_or(|(fmt, _)| *fmt != target_format)
+        {
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("raywatcher blit"),
+                bind_group_layouts: &[&self.pipelines.blit_layout],
+                push_constant_ranges: &[],
+            });
+            let pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("raywatcher blit"),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &self.pipelines.blit_module,
+                    entry_point: "vs",
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &self.pipelines.blit_module,
+                    entry_point: "fs",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: target_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
+            self.blit_pipeline = Some((target_format, pipe));
+        }
+        let Some((_, ref pipe)) = self.blit_pipeline else {
+            return;
+        };
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raywatcher blit"),
+            layout: &self.pipelines.blit_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.output_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.pipelines.blit_sampler),
+                },
+            ],
+        });
+        let dst_view = destination.create_view(&Default::default());
+        let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("raywatcher blit"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &dst_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        rp.set_pipeline(pipe);
+        rp.set_bind_group(0, &bg, &[]);
+        rp.draw(0..3, 0..1);
     }
 
     /// Number of history frames accumulated. Zero after [`Self::reset`].

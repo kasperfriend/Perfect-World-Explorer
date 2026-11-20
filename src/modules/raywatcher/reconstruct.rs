@@ -93,6 +93,812 @@ pub fn probe_offline(sdk_dir: &Path, platform_supported: bool) -> (Probe, Probe)
     (dlss, fsr)
 }
 
+/// Per-frame inputs for [`DlssRayReconstructor::evaluate`].
+pub struct DlssRrInputs<'a> {
+    pub grid_colour: &'a wgpu::TextureView,
+    pub grid_reflection: &'a wgpu::TextureView,
+    pub grid_normals: &'a wgpu::TextureView,
+    pub grid_albedo: &'a wgpu::TextureView,
+    pub depth: &'a wgpu::TextureView,
+    pub motion: &'a wgpu::Texture,
+    pub jitter: (f32, f32),
+    pub reset: bool,
+    pub world_to_view: [[f32; 4]; 4],
+    pub view_to_clip: [[f32; 4]; 4],
+}
+
+#[cfg(windows)]
+mod dlss_rr {
+    //! NVIDIA DLSS Ray Reconstruction (`nvngx_dlssd.dll`, NGX feature
+    //! `NVSDK_NGX_Feature_RayReconstruction = 13`) on DX12.
+
+    use std::ffi::c_void;
+    use std::mem::zeroed;
+    use std::path::Path;
+    use std::time::Instant;
+
+    use winapi::shared::dxgiformat::{DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32_FLOAT};
+    use winapi::um::d3d12 as d12;
+
+    use super::{DlssRrInputs, DLSS_RR_DLL};
+    use crate::dlss::loader::{NgxApi, NGX_FEATURE_RAY_RECONSTRUCTION};
+    use crate::dlss::params::{resource_slot_ladder, NgxParams, NGX_FAIL};
+    use crate::fsr::{raw_dx12, NativeCommandRing, NativeTexture2D};
+
+    // NGX DLSS-D parameter names from `sdk/include/nvidia/nvsdk_ngx_defs.h` and
+    // `sdk/include/nvidia/nvsdk_ngx_defs_dlssd.h`.
+    const P_CREATION_NODE_MASK: &str = "CreationNodeMask";
+    const P_VISIBILITY_NODE_MASK: &str = "VisibilityNodeMask";
+    const P_WIDTH: &str = "Width";
+    const P_HEIGHT: &str = "Height";
+    const P_OUT_WIDTH: &str = "OutWidth";
+    const P_OUT_HEIGHT: &str = "OutHeight";
+    const P_RESOURCE_WIDTH: &str = "ResourceWidth";
+    const P_RESOURCE_HEIGHT: &str = "ResourceHeight";
+    const P_RESOURCE_OUT_WIDTH: &str = "ResourceOutWidth";
+    const P_RESOURCE_OUT_HEIGHT: &str = "ResourceOutHeight";
+    const P_PERF_QUALITY: &str = "PerfQualityValue";
+    const P_CREATE_FLAGS: &str = "DLSS.Feature.Create.Flags";
+    const P_OUTPUT_SUBRECTS: &str = "DLSS.Enable.Output.Subrects";
+    const P_DENOISE_MODE: &str = "DLSS.Denoise.Mode";
+    const P_ROUGHNESS_MODE: &str = "DLSS.Roughness.Mode";
+    const P_USE_HW_DEPTH: &str = "DLSS.Use.HW.Depth";
+
+    const P_COLOR: &str = "Color";
+    const P_OUTPUT: &str = "Output";
+    const P_DEPTH: &str = "Depth";
+    const P_MOTION_VECTORS: &str = "MotionVectors";
+    const P_DIFFUSE_ALBEDO: &str = "DLSS.Input.DiffuseAlbedo";
+    const P_SPECULAR_ALBEDO: &str = "DLSS.Input.SpecularAlbedo";
+    const P_GBUFFER_NORMALS: &str = "GBuffer.Normals";
+    const P_HIT_DISTANCE: &str = "RayTracingHitDistance";
+    const P_WORLD_TO_VIEW: &str = "WorldToViewMatrix";
+    const P_VIEW_TO_CLIP: &str = "ViewToClipMatrix";
+
+    const P_JITTER_X: &str = "Jitter.Offset.X";
+    const P_JITTER_Y: &str = "Jitter.Offset.Y";
+    const P_RESET: &str = "Reset";
+    const P_MV_SCALE_X: &str = "MV.Scale.X";
+    const P_MV_SCALE_Y: &str = "MV.Scale.Y";
+    const P_FRAME_TIME_MS: &str = "FrameTimeDeltaInMsec";
+    const P_PRE_EXPOSURE: &str = "DLSS.Pre.Exposure";
+    const P_EXPOSURE_SCALE: &str = "DLSS.Exposure.Scale";
+    const P_TONEMAPPER_TYPE: &str = "TonemapperType";
+    const P_INDICATOR_INVERT_X: &str = "DLSS.Indicator.Invert.X.Axis";
+    const P_INDICATOR_INVERT_Y: &str = "DLSS.Indicator.Invert.Y.Axis";
+    const P_RENDER_WIDTH: &str = "DLSS.Render.Subrect.Dimensions.Width";
+    const P_RENDER_HEIGHT: &str = "DLSS.Render.Subrect.Dimensions.Height";
+
+    const P_ZERO_SUBRECTS: &[&str] = &[
+        "DLSS.Input.Color.Subrect.Base.X",
+        "DLSS.Input.Color.Subrect.Base.Y",
+        "DLSS.Input.Depth.Subrect.Base.X",
+        "DLSS.Input.Depth.Subrect.Base.Y",
+        "DLSS.Input.MV.Subrect.Base.X",
+        "DLSS.Input.MV.Subrect.Base.Y",
+        "DLSS.Output.Subrect.Base.X",
+        "DLSS.Output.Subrect.Base.Y",
+        "DLSS.Input.DiffuseAlbedo.Subrect.Base.X",
+        "DLSS.Input.DiffuseAlbedo.Subrect.Base.Y",
+        "DLSS.Input.SpecularAlbedo.Subrect.Base.X",
+        "DLSS.Input.SpecularAlbedo.Subrect.Base.Y",
+        "DLSS.Input.Normals.Subrect.Base.X",
+        "DLSS.Input.Normals.Subrect.Base.Y",
+        "DLSS.Input.Roughness.Subrect.Base.X",
+        "DLSS.Input.Roughness.Subrect.Base.Y",
+    ];
+
+    // `NVSDK_NGX_PerfQuality_Value_DLAA = 5` (1:1 ray reconstruction at render extent).
+    const NGX_PERF_QUALITY_DLAA: i32 = 5;
+    // `IsHDR (1 << 0) | MVLowRes (1 << 1) | DepthInverted (1 << 3)`
+    const NGX_DLSSD_CREATE_FLAGS: i32 = (1 << 0) | (1 << 1) | (1 << 3);
+    // `NVSDK_NGX_DLSS_Denoise_Mode_DLUnified = 1`
+    const NGX_DENOISE_MODE_DL_UNIFIED: i32 = 1;
+    // `NVSDK_NGX_DLSS_Roughness_Mode_Packed = 1` (roughness in `GBuffer.Normals.w`)
+    const NGX_ROUGHNESS_MODE_PACKED: u32 = 1;
+    // `NVSDK_NGX_DLSS_Depth_Type_HW = 1`
+    const NGX_DEPTH_TYPE_HW: u32 = 1;
+
+    /// Fullscreen MRT prep pass: resamples the ray grid's noisy radiance,
+    /// packed normals+roughness, diffuse/specular albedo, hit distance, and
+    /// copies hardware `Depth32Float` into `R32Float` for DLSS-D in one pass.
+    const PREP_SHADER: &str = r#"
+@group(0) @binding(0) var src_colour: texture_2d<f32>;
+@group(0) @binding(1) var src_reflection: texture_2d<f32>;
+@group(0) @binding(2) var src_normals: texture_2d<f32>;
+@group(0) @binding(3) var src_albedo: texture_2d<f32>;
+@group(0) @binding(4) var src_depth: texture_depth_2d;
+@group(0) @binding(5) var lin_samp: sampler;
+
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs(@builtin(vertex_index) idx: u32) -> VOut {
+    var p = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -3.0),
+        vec2<f32>(3.0, 1.0),
+        vec2<f32>(-1.0, 1.0),
+    );
+    var out: VOut;
+    let xy = p[idx];
+    out.pos = vec4<f32>(xy, 0.0, 1.0);
+    out.uv = vec2<f32>(xy.x * 0.5 + 0.5, 0.5 - xy.y * 0.5);
+    return out;
+}
+
+struct FOut {
+    @location(0) color: vec4<f32>,
+    @location(1) depth: f32,
+    @location(2) normals: vec4<f32>,
+    @location(3) diffuse_albedo: vec4<f32>,
+    @location(4) specular_albedo: vec4<f32>,
+    @location(5) hit_distance: f32,
+};
+
+@fragment
+fn fs(i: VOut) -> FOut {
+    let c = textureSampleLevel(src_colour, lin_samp, i.uv, 0.0).rgb;
+    let r = textureSampleLevel(src_reflection, lin_samp, i.uv, 0.0);
+    let n = textureSampleLevel(src_normals, lin_samp, i.uv, 0.0);
+    let a = textureSampleLevel(src_albedo, lin_samp, i.uv, 0.0);
+    let depth_dim = vec2<f32>(textureDimensions(src_depth));
+    let dcoord = vec2<i32>(clamp(i.uv * depth_dim, vec2<f32>(0.0), depth_dim - vec2<f32>(1.0)));
+    let d = textureLoad(src_depth, dcoord, 0);
+
+    var out: FOut;
+    out.color = vec4<f32>(c + r.rgb, 1.0);
+    out.depth = d;
+    out.normals = n;
+    out.diffuse_albedo = vec4<f32>(a.rgb, 1.0);
+    out.specular_albedo = vec4<f32>(a.a, a.a, a.a, 1.0);
+    out.hit_distance = r.a;
+    return out;
+}
+"#;
+
+    struct PrepPipeline {
+        layout: wgpu::BindGroupLayout,
+        pipeline: wgpu::RenderPipeline,
+        sampler: wgpu::Sampler,
+    }
+
+    impl PrepPipeline {
+        fn new(device: &wgpu::Device) -> Self {
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("raywatcher dlss-rr prep"),
+                source: wgpu::ShaderSource::Wgsl(PREP_SHADER.into()),
+            });
+            let tex = |binding: u32| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            };
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("raywatcher dlss-rr prep"),
+                entries: &[
+                    tex(0),
+                    tex(1),
+                    tex(2),
+                    tex(3),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("raywatcher dlss-rr prep"),
+                bind_group_layouts: &[&layout],
+                push_constant_ranges: &[],
+            });
+            let target = |fmt: wgpu::TextureFormat| {
+                Some(wgpu::ColorTargetState {
+                    format: fmt,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })
+            };
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("raywatcher dlss-rr prep"),
+                layout: Some(&pl),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: "vs",
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: "fs",
+                    targets: &[
+                        target(wgpu::TextureFormat::Rgba16Float),
+                        target(wgpu::TextureFormat::R32Float),
+                        target(wgpu::TextureFormat::Rgba16Float),
+                        target(wgpu::TextureFormat::Rgba16Float),
+                        target(wgpu::TextureFormat::Rgba16Float),
+                        target(wgpu::TextureFormat::R32Float),
+                    ],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
+            let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("raywatcher dlss-rr linear"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            });
+            Self {
+                layout,
+                pipeline,
+                sampler,
+            }
+        }
+    }
+
+    struct RrNatives {
+        color: NativeTexture2D,
+        depth: NativeTexture2D,
+        mv: NativeTexture2D,
+        normals: NativeTexture2D,
+        diffuse_albedo: NativeTexture2D,
+        specular_albedo: NativeTexture2D,
+        hit_distance: NativeTexture2D,
+        output: NativeTexture2D,
+        color_view: wgpu::TextureView,
+        depth_view: wgpu::TextureView,
+        normals_view: wgpu::TextureView,
+        diffuse_view: wgpu::TextureView,
+        specular_view: wgpu::TextureView,
+        hit_view: wgpu::TextureView,
+    }
+
+    impl RrNatives {
+        fn new(
+            device: &wgpu::Device,
+            raw_device: &d3d12::Device,
+            extent: (u32, u32),
+        ) -> Result<Self, String> {
+            let rt_flags = d12::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            let rt_usage = wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST;
+            let mk_rt = |label: &str, fmt: wgpu::TextureFormat, dxgi: u32| unsafe {
+                NativeTexture2D::create(
+                    device,
+                    raw_device,
+                    label,
+                    fmt,
+                    dxgi,
+                    extent,
+                    rt_flags,
+                    rt_usage,
+                    d12::D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    false,
+                )
+            };
+            let color = mk_rt(
+                "dlss-rr color",
+                wgpu::TextureFormat::Rgba16Float,
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+            )?;
+            let depth = mk_rt(
+                "dlss-rr depth",
+                wgpu::TextureFormat::R32Float,
+                DXGI_FORMAT_R32_FLOAT,
+            )?;
+            let mv = unsafe {
+                NativeTexture2D::create(
+                    device,
+                    raw_device,
+                    "dlss-rr mv",
+                    wgpu::TextureFormat::Rgba16Float,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    extent,
+                    d12::D3D12_RESOURCE_FLAG_NONE,
+                    wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                    d12::D3D12_RESOURCE_STATE_COPY_DEST,
+                    false,
+                )?
+            };
+            let normals = mk_rt(
+                "dlss-rr normals",
+                wgpu::TextureFormat::Rgba16Float,
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+            )?;
+            let diffuse_albedo = mk_rt(
+                "dlss-rr diffuse albedo",
+                wgpu::TextureFormat::Rgba16Float,
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+            )?;
+            let specular_albedo = mk_rt(
+                "dlss-rr specular albedo",
+                wgpu::TextureFormat::Rgba16Float,
+                DXGI_FORMAT_R16G16B16A16_FLOAT,
+            )?;
+            let hit_distance = mk_rt(
+                "dlss-rr hit distance",
+                wgpu::TextureFormat::R32Float,
+                DXGI_FORMAT_R32_FLOAT,
+            )?;
+            let output = unsafe {
+                NativeTexture2D::create(
+                    device,
+                    raw_device,
+                    "dlss-rr output",
+                    wgpu::TextureFormat::Rgba16Float,
+                    DXGI_FORMAT_R16G16B16A16_FLOAT,
+                    extent,
+                    d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::STORAGE_BINDING,
+                    d12::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    false,
+                )?
+            };
+            let color_view = color.texture.create_view(&Default::default());
+            let depth_view = depth.texture.create_view(&Default::default());
+            let normals_view = normals.texture.create_view(&Default::default());
+            let diffuse_view = diffuse_albedo.texture.create_view(&Default::default());
+            let specular_view = specular_albedo.texture.create_view(&Default::default());
+            let hit_view = hit_distance.texture.create_view(&Default::default());
+            Ok(Self {
+                color,
+                depth,
+                mv,
+                normals,
+                diffuse_albedo,
+                specular_albedo,
+                hit_distance,
+                output,
+                color_view,
+                depth_view,
+                normals_view,
+                diffuse_view,
+                specular_view,
+                hit_view,
+            })
+        }
+    }
+
+    /// Live NVIDIA DLSS Ray Reconstruction (`nvngx_dlssd.dll`) session.
+    pub struct DlssRayReconstructor {
+        api: NgxApi,
+        params: Box<NgxParams>,
+        handle: *mut c_void,
+        queue: d3d12::CommandQueue,
+        ring: NativeCommandRing,
+        extent: (u32, u32),
+        natives: RrNatives,
+        prep: PrepPipeline,
+        frame_index: u64,
+        param_slot: usize,
+        last_instant: Instant,
+    }
+
+    impl Drop for DlssRayReconstructor {
+        fn drop(&mut self) {
+            self.ring.wait_idle();
+            if !self.handle.is_null() {
+                unsafe {
+                    (self.api.release_feature)(self.handle);
+                }
+            }
+        }
+    }
+
+    impl DlssRayReconstructor {
+        pub fn new(
+            device: &wgpu::Device,
+            sdk_dir: &Path,
+            extent: (u32, u32),
+        ) -> Result<Self, String> {
+            let extent = (extent.0.max(1), extent.1.max(1));
+            let (raw_device, raw_queue) = raw_dx12(device)?;
+            let sdk_str = sdk_dir.to_string_lossy();
+            let api = NgxApi::load(
+                &sdk_str,
+                DLSS_RR_DLL,
+                raw_device.as_mut_ptr() as *mut c_void,
+            )?;
+            let mut params = api.new_parameters(false);
+            params.set_u32(P_CREATION_NODE_MASK, 1);
+            params.set_u32(P_VISIBILITY_NODE_MASK, 1);
+            params.set_u32(P_WIDTH, extent.0);
+            params.set_u32(P_HEIGHT, extent.1);
+            params.set_u32(P_OUT_WIDTH, extent.0);
+            params.set_u32(P_OUT_HEIGHT, extent.1);
+            params.set_i32(P_PERF_QUALITY, NGX_PERF_QUALITY_DLAA);
+            params.set_i32(P_CREATE_FLAGS, NGX_DLSSD_CREATE_FLAGS);
+            params.set_i32(P_OUTPUT_SUBRECTS, 0);
+            params.set_i32(P_DENOISE_MODE, NGX_DENOISE_MODE_DL_UNIFIED);
+            params.set_u32(P_ROUGHNESS_MODE, NGX_ROUGHNESS_MODE_PACKED);
+            params.set_u32(P_USE_HW_DEPTH, NGX_DEPTH_TYPE_HW);
+
+            let mut ring = NativeCommandRing::new(&raw_device, "DLSS-RR")?;
+            let slot_idx = ring.acquire("DLSS-RR-Create")?;
+            let mut handle: *mut c_void = std::ptr::null_mut();
+            let result = unsafe {
+                let list = ring.slot_mut(slot_idx).list.as_mut_ptr() as *mut c_void;
+                (api.create_feature)(
+                    list,
+                    NGX_FEATURE_RAY_RECONSTRUCTION,
+                    params.as_ptr(),
+                    &mut handle,
+                )
+            };
+            ring.retire(slot_idx, &raw_queue, "DLSS-RR-Create")?;
+            ring.wait_idle();
+            if !crate::dlss::succeeded(result) || handle.is_null() {
+                return Err(format!(
+                    "DLSS Ray Reconstruction CreateFeature failed ({})",
+                    crate::dlss::result_name(result)
+                ));
+            }
+            let natives = RrNatives::new(device, &raw_device, extent)?;
+            let prep = PrepPipeline::new(device);
+            crate::dlss::diag(&format!(
+                "[DLSS-RR] initialized nvngx_dlssd.dll ({}x{}, DLUnified + packed roughness)",
+                extent.0, extent.1
+            ));
+            Ok(Self {
+                api,
+                params,
+                handle,
+                queue: raw_queue,
+                ring,
+                extent,
+                natives,
+                prep,
+                frame_index: 0,
+                param_slot: 0,
+                last_instant: Instant::now(),
+            })
+        }
+
+        pub fn extent(&self) -> (u32, u32) {
+            self.extent
+        }
+
+        pub fn evaluate(
+            &mut self,
+            device: &wgpu::Device,
+            queue: &wgpu::Queue,
+            inputs: &DlssRrInputs<'_>,
+            dst_output: &wgpu::Texture,
+        ) -> Result<(), String> {
+            let (w, h) = self.extent;
+            // 1. Resample ray grid + hardware depth into our NativeTexture2D inputs.
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("raywatcher dlss-rr prep"),
+            });
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("raywatcher dlss-rr prep"),
+                layout: &self.prep.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(inputs.grid_colour),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(inputs.grid_reflection),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(inputs.grid_normals),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(inputs.grid_albedo),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(inputs.depth),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::Sampler(&self.prep.sampler),
+                    },
+                ],
+            });
+            fn attach(view: &wgpu::TextureView) -> Option<wgpu::RenderPassColorAttachment<'_>> {
+                Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })
+            }
+            {
+                let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("raywatcher dlss-rr prep"),
+                    color_attachments: &[
+                        attach(&self.natives.color_view),
+                        attach(&self.natives.depth_view),
+                        attach(&self.natives.normals_view),
+                        attach(&self.natives.diffuse_view),
+                        attach(&self.natives.specular_view),
+                        attach(&self.natives.hit_view),
+                    ],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rp.set_pipeline(&self.prep.pipeline);
+                rp.set_bind_group(0, &bg, &[]);
+                rp.draw(0..3, 0..1);
+            }
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: inputs.motion,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &self.natives.mv.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: w.min(inputs.motion.width()),
+                    height: h.min(inputs.motion.height()),
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(encoder.finish()));
+
+            // 2. Run NVSDK_NGX_D3D12_EvaluateFeature(RayReconstruction) on DX12.
+            let now = Instant::now();
+            let frame_time_ms = now
+                .duration_since(self.last_instant)
+                .as_secs_f32()
+                .mul_add(1000.0, 0.0)
+                .clamp(0.1, 1000.0);
+            self.last_instant = now;
+
+            let slot_idx = self.ring.acquire("DLSS-RR-Eval")?;
+            let list = self.ring.slot_mut(slot_idx).list.as_mut_ptr();
+
+            let rt_inputs = [
+                self.natives.color.resource.as_mut_ptr(),
+                self.natives.depth.resource.as_mut_ptr(),
+                self.natives.normals.resource.as_mut_ptr(),
+                self.natives.diffuse_albedo.resource.as_mut_ptr(),
+                self.natives.specular_albedo.resource.as_mut_ptr(),
+                self.natives.hit_distance.resource.as_mut_ptr(),
+            ];
+            let mv_res = self.natives.mv.resource.as_mut_ptr();
+            let out_res = self.natives.output.resource.as_mut_ptr();
+
+            unsafe {
+                let mut before: [d12::D3D12_RESOURCE_BARRIER; 8] = zeroed();
+                for (i, res) in rt_inputs.into_iter().enumerate() {
+                    before[i].Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    *before[i].u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: res,
+                        Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: d12::D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        StateAfter: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    };
+                }
+                before[6].Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                *before[6].u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: mv_res,
+                    Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: d12::D3D12_RESOURCE_STATE_COPY_DEST,
+                    StateAfter: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                };
+                before[7].Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                *before[7].u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: out_res,
+                    Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: d12::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    StateAfter: d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                };
+                (*list).ResourceBarrier(before.len() as u32, before.as_ptr());
+            }
+
+            let ladder: Vec<usize> = if self.frame_index == 0 {
+                resource_slot_ladder(self.param_slot)
+            } else {
+                vec![self.param_slot]
+            };
+            let mut result = NGX_FAIL;
+            let mut winning_slot = self.param_slot;
+            let mut replacement: Option<Box<NgxParams>> = None;
+            let mut w2v = inputs.world_to_view;
+            let mut v2c = inputs.view_to_clip;
+            for (attempt, slot) in ladder.into_iter().enumerate() {
+                if attempt > 0 {
+                    replacement = Some(self.api.new_parameters(false));
+                }
+                let params = match attempt {
+                    0 => &mut self.params,
+                    _ => replacement.as_mut().expect("replacement map"),
+                };
+                params.set_resource_set_slot(slot);
+                params.set_f32(P_JITTER_X, inputs.jitter.0);
+                params.set_f32(P_JITTER_Y, inputs.jitter.1);
+                params.set_i32(P_RESET, i32::from(inputs.reset || self.frame_index == 0));
+                params.set_f32(P_MV_SCALE_X, 1.0);
+                params.set_f32(P_MV_SCALE_Y, 1.0);
+                params.set_f32(P_FRAME_TIME_MS, frame_time_ms);
+                params.set_f32(P_PRE_EXPOSURE, 1.0);
+                params.set_f32(P_EXPOSURE_SCALE, 1.0);
+                params.set_u32(P_TONEMAPPER_TYPE, 0);
+                params.set_i32(P_INDICATOR_INVERT_X, 0);
+                params.set_i32(P_INDICATOR_INVERT_Y, 0);
+                for name in P_ZERO_SUBRECTS {
+                    params.set_u32(name, 0);
+                }
+                params.set_u32(P_RENDER_WIDTH, w);
+                params.set_u32(P_RENDER_HEIGHT, h);
+                for (name, val) in [
+                    (P_WIDTH, w),
+                    (P_HEIGHT, h),
+                    (P_OUT_WIDTH, w),
+                    (P_OUT_HEIGHT, h),
+                    (P_RESOURCE_WIDTH, w),
+                    (P_RESOURCE_HEIGHT, h),
+                    (P_RESOURCE_OUT_WIDTH, w),
+                    (P_RESOURCE_OUT_HEIGHT, h),
+                ] {
+                    params.set_u32(name, val);
+                }
+                params.set_d3d12_resource(P_COLOR, rt_inputs[0] as *mut c_void);
+                params.set_d3d12_resource(P_DEPTH, rt_inputs[1] as *mut c_void);
+                params.set_d3d12_resource(P_MOTION_VECTORS, mv_res as *mut c_void);
+                params.set_d3d12_resource(P_OUTPUT, out_res as *mut c_void);
+                params.set_d3d12_resource(P_GBUFFER_NORMALS, rt_inputs[2] as *mut c_void);
+                params.set_d3d12_resource(P_DIFFUSE_ALBEDO, rt_inputs[3] as *mut c_void);
+                params.set_d3d12_resource(P_SPECULAR_ALBEDO, rt_inputs[4] as *mut c_void);
+                params.set_d3d12_resource(P_HIT_DISTANCE, rt_inputs[5] as *mut c_void);
+                params.set_void_pointer(P_WORLD_TO_VIEW, w2v.as_mut_ptr() as *mut c_void);
+                params.set_void_pointer(P_VIEW_TO_CLIP, v2c.as_mut_ptr() as *mut c_void);
+
+                result = unsafe {
+                    (self.api.evaluate_feature)(
+                        list as *mut c_void,
+                        self.handle,
+                        params.as_ptr(),
+                        std::ptr::null(),
+                    )
+                };
+                if crate::dlss::succeeded(result) {
+                    winning_slot = slot;
+                    break;
+                }
+            }
+
+            unsafe {
+                let mut after: [d12::D3D12_RESOURCE_BARRIER; 8] = zeroed();
+                for (i, res) in rt_inputs.into_iter().enumerate() {
+                    after[i].Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    *after[i].u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: res,
+                        Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        StateAfter: d12::D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    };
+                }
+                after[6].Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                *after[6].u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: mv_res,
+                    Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    StateAfter: d12::D3D12_RESOURCE_STATE_COPY_DEST,
+                };
+                after[7].Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                *after[7].u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: out_res,
+                    Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    StateAfter: d12::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                };
+                (*list).ResourceBarrier(after.len() as u32, after.as_ptr());
+            }
+
+            self.ring.retire(slot_idx, &self.queue, "DLSS-RR-Eval")?;
+
+            if !crate::dlss::succeeded(result) {
+                return Err(format!(
+                    "DLSS Ray Reconstruction EvaluateFeature failed ({})",
+                    crate::dlss::result_name(result)
+                ));
+            }
+            if let Some(map) = replacement {
+                self.params = map;
+            }
+            self.param_slot = winning_slot;
+            self.frame_index = self.frame_index.saturating_add(1);
+
+            // 3. Copy the DLSS-RR output into Raywatcher's output texture.
+            let mut copy_enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("raywatcher dlss-rr copy"),
+            });
+            copy_enc.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.natives.output.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: dst_output,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: w.min(dst_output.width()),
+                    height: h.min(dst_output.height()),
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(copy_enc.finish()));
+            Ok(())
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use dlss_rr::DlssRayReconstructor;
+
+#[cfg(not(windows))]
+pub struct DlssRayReconstructor;
+
+#[cfg(not(windows))]
+impl DlssRayReconstructor {
+    pub fn new(
+        _device: &wgpu::Device,
+        _sdk_dir: &Path,
+        _extent: (u32, u32),
+    ) -> Result<Self, String> {
+        Err("DLSS Ray Reconstruction is Windows + DX12 only".into())
+    }
+
+    pub fn extent(&self) -> (u32, u32) {
+        (0, 0)
+    }
+
+    pub fn evaluate(
+        &mut self,
+        _device: &wgpu::Device,
+        _queue: &wgpu::Queue,
+        _inputs: &DlssRrInputs<'_>,
+        _dst_output: &wgpu::Texture,
+    ) -> Result<(), String> {
+        Err("DLSS Ray Reconstruction is Windows + DX12 only".into())
+    }
+}
+
 #[cfg(windows)]
 mod ffi {
     //! The FFX denoiser API, transcribed from `sdk/include/denoisers/ffx_denoiser.h`.
@@ -108,9 +914,6 @@ mod ffi {
     use super::Probe;
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
-    // `load` and `probe` take `&Path`, and a child module does not see the
-    // parent's imports — this has to be here for the Windows build to resolve
-    // it.
     use std::path::Path;
 
     pub const FFX_DENOISER_VERSION: u32 = (1 << 22) | (2 << 12) | 1;
@@ -183,9 +986,7 @@ mod ffi {
         pub z: f32,
     }
 
-    /// `FfxApiResource` — the renderer's own texture handle plus the description
-    /// the SDK needs to interpret it. This mirrors `fsr::imp::FfxApiResource`,
-    /// which is `pub(crate)` and private to that module.
+    /// `FfxApiResource`.
     #[repr(C)]
     #[derive(Clone, Copy)]
     pub struct Resource {
@@ -256,8 +1057,6 @@ mod ffi {
         pub flags: u32,
     }
 
-    /// `FfxApiDenoiserSignal`: one input, one output, and the checkerboard
-    /// origin (zero when that signal is not checkerboarded).
     #[repr(C)]
     pub struct Signal {
         pub input: Resource,
@@ -304,9 +1103,6 @@ mod ffi {
     }
 
     impl FfxDenoiser {
-        /// Load the denoiser from `dir`. The SDK is explicit that the denoiser
-        /// DLL is loaded directly (not through the FFX loader): its exports are
-        /// the five entry points, like the upscaler's.
         pub fn load(dir: &Path) -> Result<Self, String> {
             let candidate = dir.join(super::FSR_RR_DLL);
             if !candidate.is_file() {
@@ -351,10 +1147,6 @@ mod ffi {
         }
     }
 
-    /// The signal set Raywatcher feeds the denoiser: exactly the channels it
-    /// produces. `AMBIENT_OCCLUSION` is the ray-hit visibility image,
-    /// `DIRECT_DIFFUSE`/`DIRECT_SPECULAR` are the sun terms, and the two
-    /// indirect channels are what the bounce rays gathered.
     pub fn signal_flags(effects: super::super::plan::Effects) -> u32 {
         let mut flags = 0;
         if effects.ambient_occlusion {
@@ -375,7 +1167,6 @@ mod ffi {
         flags
     }
 
-    /// Probe the DLL without creating a device.
     pub fn probe(dir: &Path) -> Probe {
         match FfxDenoiser::load(dir) {
             Ok(_) => Probe::available(format!("{} loaded", super::FSR_RR_DLL)),
@@ -387,14 +1178,11 @@ mod ffi {
 #[cfg(windows)]
 pub use ffi::FfxDenoiser;
 
-/// Non-Windows has no providers, and the module must still compile and test.
 #[cfg(not(windows))]
 mod ffi_stub {
     use super::Probe;
     use std::path::Path;
 
-    /// A placeholder with the same shape as the Windows loader so the callers
-    /// above are identical on every platform.
     #[derive(Debug)]
     pub struct FfxDenoiser {
         pub _private: (),
@@ -446,8 +1234,6 @@ mod tests {
 
     #[test]
     fn a_present_dll_is_reported_as_available() {
-        // The probe only checks presence; creating a context is the device's
-        // job. A real file in a temp folder is enough to pin that contract.
         let dir = std::env::temp_dir().join("raywatcher-reconstruct-probe-present");
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join(FSR_RR_DLL);
@@ -462,11 +1248,9 @@ mod tests {
 #[cfg(all(test, windows))]
 mod ffi_tests {
     use super::ffi::*;
-    use super::FSR_RR_DLL;
 
     #[test]
     fn the_descriptor_types_match_the_sdk_header() {
-        // `FFX_API_MAKE_EFFECT_SUB_ID(FFX_API_EFFECT_ID_DENOISER, sub)`.
         assert_eq!(CREATE_DESC_TYPE_DENOISER, 0x0005_0100);
         assert_eq!(CONFIGURE_DESC_TYPE_DENOISER_KEYVALUE, 0x0005_2100);
         assert_eq!(DISPATCH_DESC_TYPE_DENOISER, 0x0005_4100);
@@ -477,7 +1261,6 @@ mod ffi_tests {
         assert_eq!(DISPATCH_DESC_TYPE_DENOISER_INDIRECT_DIFFUSE, 0x0005_4700);
         assert_eq!(DISPATCH_DESC_TYPE_DENOISER_INDIRECT_SPECULAR, 0x0005_4800);
         assert_eq!(DISPATCH_DESC_TYPE_DENOISER_SPECULAR_OCCLUSION, 0x0005_4900);
-        // The version the SDK header demands.
         assert_eq!(FFX_DENOISER_VERSION, (1 << 22) | (2 << 12) | 1);
     }
 

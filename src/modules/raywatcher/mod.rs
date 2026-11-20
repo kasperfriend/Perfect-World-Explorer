@@ -34,6 +34,7 @@
 
 pub mod bvh;
 pub mod denoise;
+pub mod dxr;
 pub mod frame;
 pub mod harvest;
 pub mod plan;
@@ -159,17 +160,23 @@ impl Raywatcher {
     /// `sdk_present` says which reconstruction DLLs were found in
     /// [`Self::sdk_dir`]. Keeping both as arguments (rather than reading them
     /// here) is what makes the whole decision surface testable without a GPU.
+    pub fn set_hardware_note(&mut self, note: Option<String>) {
+        self.hardware_note = note;
+    }
+
     pub fn configure(&mut self, ray_queries: bool, sdk_present: (bool, bool)) {
+        let next_avail = Availability {
+            dlss_rr: sdk_present.0,
+            fsr_rr: sdk_present.1,
+        };
+        let changed = self.hardware_rays != ray_queries || self.availability != next_avail;
         self.hardware_rays = ray_queries;
         self.hardware_note = if ray_queries {
             None
         } else {
-            Some("this adapter does not expose VK_KHR_ray_query; Software mode runs instead".into())
+            Some("this adapter does not expose DXR 1.1 hardware ray tracing; Software mode runs instead".into())
         };
-        self.availability = Availability {
-            dlss_rr: sdk_present.0,
-            fsr_rr: sdk_present.1,
-        };
+        self.availability = next_avail;
         // A provider that is no longer available cannot stay selected: that
         // would leave the tab claiming DLSS RR while the denoiser ran.
         if !self.availability.get(self.settings.reconstruction) {
@@ -179,7 +186,9 @@ impl Raywatcher {
         if self.settings.mode == RayTracingMode::Hardware && !ray_queries {
             self.settings.mode = RayTracingMode::Software;
         }
-        self.pending_reset = true;
+        if changed {
+            self.pending_reset = true;
+        }
     }
 
     /// The mode the renderer should actually use: `Hardware` degrades to

@@ -1760,6 +1760,7 @@ struct Renderer {
     /// This frame's ray plan, decided before the world pass and consumed after
     /// it. `Plan::OFF` on a frame the module is not tracing.
     raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan,
+    raywatcher_hw_probe: Option<(bool, Option<String>)>,
     /// The raster effects this frame's ray pass replaces. Read by `render` so a
     /// replaced effect is not drawn, and by the tab so it can say which.
     raywatcher_overrides: crate::modules::raywatcher::frame::RasterOverrides,
@@ -1903,7 +1904,9 @@ fn object_mv_target(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wg
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());
@@ -2531,6 +2534,7 @@ impl Renderer {
             raywatcher_scene: None,
             raywatcher_harvest: crate::modules::raywatcher::harvest::Harvester::new(),
             raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan::OFF,
+            raywatcher_hw_probe: None,
             raywatcher_overrides: crate::modules::raywatcher::frame::RasterOverrides::NONE,
             module_format: format.remove_srgb_suffix(),
             models,
@@ -3701,18 +3705,17 @@ impl Renderer {
             );
             (dlss.available, fsr.available)
         };
-        // Hardware mode means tracing against acceleration structures inside
-        // the trace pipeline, and this build has no such pipeline: the trace is
-        // the software transport in `shade.rs`, which is what runs in every
-        // mode. wgpu 0.19 exposes no ray-query feature bit to ask about either
-        // (it arrived in 0.20), so there is nothing to probe — and reporting a
-        // capability the module cannot use would let the tab claim a path that
-        // does not exist. The gate is honest as `false`: `configure` then
-        // degrades Hardware to Software and says why in `hardware_note`.
-        let ray_queries = false;
+        // Probe DXR Tier 1.1 (`RayQuery`) directly on the underlying DX12
+        // device once per session so RTX 20/30/40/50, RDNA2+, and Intel Arc
+        // GPUs run Hardware mode on their RT cores.
+        let (ray_queries, hw_note) = self
+            .raywatcher_hw_probe
+            .get_or_insert_with(|| crate::modules::raywatcher::dxr::probe_hardware_rt(&self.device))
+            .clone();
         {
             let module = self.modules.raywatcher_mut();
             module.configure(ray_queries, availability);
+            module.set_hardware_note(hw_note);
             if reset_history {
                 module.reset_history();
             }
@@ -3871,60 +3874,72 @@ impl Renderer {
             iterations: plan.denoise_iterations,
             ..Default::default()
         };
+        let hardware_mode = self.modules.raywatcher().effective_mode()
+            == crate::modules::raywatcher::plan::RayTracingMode::Hardware;
         gpu.record(
+            &self.device,
             &self.queue,
             encoder,
             &params,
             &plan,
+            hardware_mode,
             &transport,
             &denoise,
             &self.object_mv,
             &self.depth,
         );
-        // The trace ran at the ray grid; the temporal and compose passes
-        // resampled it to `render_extent`, which is what the upscaler reads.
+        if plan.reconstruction
+            == crate::modules::raywatcher::plan::RayReconstruction::DlssRayReconstruction
+        {
+            // Flush the trace encoder before NGX DLSS Ray Reconstruction runs
+            // on the native DX12 command queue so it reads the freshly traced
+            // ray grid and G-buffer guides.
+            let pending = std::mem::replace(
+                encoder,
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("raywatcher post-rr"),
+                    }),
+            );
+            self.queue.submit(Some(pending.finish()));
+            let sdk_dir = self.modules.raywatcher().sdk_dir().to_path_buf();
+            let view = camera.view_matrix();
+            let proj = matrix * view.inverse();
+            if let Some(gpu) = self.raywatcher_gpu.as_mut() {
+                gpu.reconstruct_dlss_rr(
+                    &self.device,
+                    &self.queue,
+                    &sdk_dir,
+                    &params,
+                    &self.object_mv,
+                    reset_history,
+                    view.to_cols_array_2d(),
+                    proj.to_cols_array_2d(),
+                );
+            }
+        }
+        // The trace ran at the ray grid; the temporal/compose passes (or DLSS
+        // Ray Reconstruction) wrote `render_extent`, which we blit into the
+        // upscaler's world target.
         let (rw, rh) = (render_extent.0.max(1), render_extent.1.max(1));
         self.raywatcher_copy_out(encoder, (rw, rh), destination);
         self.modules.raywatcher_mut().take_history_reset();
         self.modules.raywatcher_mut().next_frame();
     }
 
-    /// Copy Raywatcher's filtered image into the world target the upscaler reads.
+    /// Copy or blit Raywatcher's filtered image into the world target the
+    /// upscaler reads (handling format conversion such as `Rgba16Float` to
+    /// `Bgra8UnormSrgb`).
     fn raywatcher_copy_out(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
-        extent: (u32, u32),
+        _extent: (u32, u32),
         destination: &wgpu::Texture,
     ) {
-        let Some(gpu) = self.raywatcher_gpu.as_ref() else {
+        let Some(gpu) = self.raywatcher_gpu.as_mut() else {
             return;
         };
-        let (w, h) = (
-            extent.0.min(gpu.output.width()),
-            extent.1.min(gpu.output.height()),
-        );
-        if w == 0 || h == 0 {
-            return;
-        }
-        encoder.copy_texture_to_texture(
-            wgpu::ImageCopyTexture {
-                texture: &gpu.output,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::ImageCopyTexture {
-                texture: destination,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-        );
+        gpu.blit_to(&self.device, encoder, destination);
     }
 
     fn render(
