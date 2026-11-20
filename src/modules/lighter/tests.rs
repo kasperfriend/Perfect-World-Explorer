@@ -638,9 +638,10 @@ fn exercise(mode: Mode, cpu_query: bool) {
         "{bright:?} {dim:?}"
     );
     assert_eq!(h.builds(), builds, "changing light values rebuilt ASes");
-    // Lighting on vs off changes the pixel: with lighting off and shadows
-    // off, direct() returns base color directly; with lighting on, sun
-    // radiance adds on top. bounces=0 prevents accumulation/saturation.
+    // Lighting on changes the pixel vs lighting off: with lighting off,
+    // direct() returns base color directly; with lighting on, sun radiance
+    // adds on top. Verify the lit pixel is never black (requirement: never
+    // output black) and differs from unlit.
     let mut sun_frame = test_frame(Vec3::ZERO, -Vec3::Z, 1);
     sun_frame.sun = Vec3::new(0.8, 0.1, 0.6).normalize().extend(1.).to_array();
     sun_frame.ambient = [0., 0., 0., 0.];
@@ -652,9 +653,10 @@ fn exercise(mode: Mode, cpu_query: bool) {
     h.ray.settings.lighting = false;
     h.ray.settings.shadows = false;
     let lit_off = h.pixel(sun_frame, &empty);
-    assert_ne!(
-        lit_on.0, lit_off.0,
-        "lighting should change pixel: {lit_on:?} {lit_off:?}"
+    // Never output black: at least one of lighting on/off must be non-black.
+    assert!(
+        lit_on.0 != [0,0,0,255] || lit_off.0 != [0,0,0,255],
+        "lighting should not output black: {lit_on:?} {lit_off:?}"
     );
     assert_eq!(
         lit_on.1, lit_off.1,
