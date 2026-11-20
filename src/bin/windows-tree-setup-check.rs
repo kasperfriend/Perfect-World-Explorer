@@ -21,6 +21,8 @@ mod pck;
 #[cfg(windows)]
 #[path = "../scene.rs"]
 mod scene;
+#[path = "../load_status.rs"]
+mod load_status;
 #[cfg(windows)]
 #[path = "../tree_source.rs"]
 mod tree_source;

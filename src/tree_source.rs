@@ -126,6 +126,25 @@ pub fn extract_for_scene(
     }
     manifest.flush().map_err(|e| e.to_string())?;
     placements.flush().map_err(|e| e.to_string())?;
+    // `scene` declares the number of placements its own blocks carry. If that
+    // is non-zero and `count` is zero, the loop above wrote nothing for a map
+    // that authored trees, which is the silent-empty failure. The comparison is
+    // real here, unlike at the caller: `authored` reads the parsed table and
+    // `count` reads what was actually written out.
+    let authored: usize = scene.blocks.iter().map(|b| b.trees.len()).sum();
+    if authored != count {
+        crate::load_status::dropped(
+            crate::load_status::Category::Trees,
+            format!(
+                "{}: {authored} placements authored but {count} written",
+                scene_path.display()
+            ),
+        );
+        return Err(format!(
+            "{} declares {authored} tree placements but {count} were extracted",
+            scene_path.display()
+        ));
+    }
     println!(
         "Extracted {source_count} SpeedTree sources and composite maps from {} authored types and {count} world placements",
         scene.tree_types.len()
@@ -220,6 +239,49 @@ mod tests {
             entries.iter().any(|e| e.name.to_lowercase() == wanted),
             "after normalising, the first tree type resolves"
         );
+    }
+
+    /// A map that authored placements must not extract zero of them.
+    ///
+    /// The guard compares what the parsed scene declares with what was written
+    /// out. Two independent numbers, so it can fire: `authored` reads the
+    /// blocks, `count` counts the writes. A tautology here would be worse than
+    /// no check, which is why this test drives the real function and reads the
+    /// counter it sets.
+    #[test]
+    fn authored_placements_that_are_not_written_are_counted_as_a_loss() {
+        if !have_fixtures() {
+            return;
+        }
+        crate::load_status::reset();
+        assert_eq!(
+            crate::load_status::dropped_count(crate::load_status::Category::Trees),
+            0
+        );
+
+        let element = std::env::temp_dir().join(format!(
+            "pw-treesrc-count-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&element);
+        fs::create_dir_all(&element).unwrap();
+        fs::copy(fixture("trees.pck"), element.join("trees.pck")).unwrap();
+
+        // A successful extraction must leave the counter at zero: 3,649
+        // authored and 3,649 written agree.
+        let out = element.join("out-ok");
+        extract_for_scene(&element, &fixture("world.ecwld"), &out, 59)
+            .expect("the real 1.8.4 world extracts");
+        assert_eq!(
+            crate::load_status::dropped_count(crate::load_status::Category::Trees),
+            0,
+            "an extraction that agrees with the table is not a loss"
+        );
+        let _ = fs::remove_dir_all(&element);
     }
 
     /// 1.2 — end to end: every authored type resolves and files are written.

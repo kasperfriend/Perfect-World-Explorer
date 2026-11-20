@@ -277,3 +277,87 @@ mod tests {
         reset();
     }
 }
+
+/// A loader returned no items and counted no loss: the defect this module exists
+/// to catch.
+///
+/// The rule is one sentence: **an empty result and a zero counter cannot both be
+/// true.** If a loader hands back nothing, either the client genuinely authored
+/// nothing — in which case the caller knows because the input said so — or
+/// something was lost, in which case `dropped` must have been called. This
+/// function is the assertion, so every loader test can make the same claim
+/// instead of each inventing its own.
+///
+/// `authored` is the caller's own evidence that the input named nothing: the
+/// count in the file's header, or `None` when the caller has no such evidence.
+/// Passing `Some(0)` says "the input declared zero items", which is the only
+/// clean way to return empty.
+pub fn assert_not_silently_empty(
+    category: Category,
+    returned: usize,
+    authored: Option<usize>,
+) -> Result<(), String> {
+    if returned > 0 {
+        return Ok(());
+    }
+    if dropped_count(category) > 0 {
+        // Empty is honest here: something was lost and the caller can read why.
+        return Ok(());
+    }
+    if authored == Some(0) {
+        // Empty is honest here too: the input itself declared nothing.
+        return Ok(());
+    }
+    Err(format!(
+        "{} returned 0 items, recorded no reason, and the input did not declare \
+         zero authored items{}: a loader may not be empty and silent at once",
+        category.key(),
+        authored.map_or(String::new(), |a| format!(" (it declares {a})"))
+    ))
+}
+
+#[cfg(test)]
+mod empty_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn empty_and_silent_is_refused() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        let err = assert_not_silently_empty(Category::Water, 0, None).unwrap_err();
+        assert!(err.contains("water"), "{err}");
+        assert!(err.contains("silent-drop"), "{err}");
+    }
+
+    #[test]
+    fn empty_with_a_recorded_reason_is_allowed() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        dropped(Category::Water, "record 6 of 8.dat: unsupported version 0x1af");
+        assert!(assert_not_silently_empty(Category::Water, 0, Some(8)).is_ok());
+        reset();
+    }
+
+    #[test]
+    fn empty_because_the_input_declares_zero_is_allowed() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        // a91 and a64 are this case: their ECWLD declares zero tree types, so a
+        // tree loader may legitimately return nothing for them.
+        assert!(assert_not_silently_empty(Category::Trees, 0, Some(0)).is_ok());
+        // But an input that declares 59 and yields 0 is the defect.
+        let err = assert_not_silently_empty(Category::Trees, 0, Some(59)).unwrap_err();
+        assert!(err.contains("declares 59"), "{err}");
+    }
+
+    #[test]
+    fn a_non_empty_result_is_always_fine() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        assert!(assert_not_silently_empty(Category::Trees, 3649, None).is_ok());
+        assert!(assert_not_silently_empty(Category::Trees, 1, Some(3679)).is_ok());
+    }
+}
