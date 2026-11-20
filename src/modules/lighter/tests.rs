@@ -639,8 +639,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     let mut b3 = Builder::default();
     let dark_green = upright(&mut b3, -2., [0., 0.3, 0., 1.], 0, 0);
     put(&mut b3, dark_green);
-    h.ray
-        .install(Ok((b3.finish(), bank.clone())));
+    h.ray.install(Ok((b3.finish(), bank.clone())));
     let bright = h.pixel(frame, &local_light([3.; 4], false));
     let builds = h.builds();
     let dim = h.pixel(frame, &local_light([0.5; 4], false));
