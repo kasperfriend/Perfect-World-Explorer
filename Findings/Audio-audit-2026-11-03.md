@@ -1,0 +1,37 @@
+# Audio audit — 2026-11-03
+
+## Scope and evidence
+
+The supplied `Games/pw142` client was inspected. Its `element/userdata/SystemSettings.ini` contains separate `SoundVol` and `MusicVol` values. These are evidence of two controls, not proof of the client's gain curves or defaults. Explorer persists its own settings; it does not read or write the game's configuration.
+
+The actual `sfx.pck` was reconstructed locally from the three supplied ZIP parts. The v2 package directory contains 1,999 entries: 1,907 WAV, 48 OGG, one MP3, 28 PK, five SFK, two TXT and eight extensionless entries. All 1,956 files with audio extensions were read and fully decoded without reported errors by an **independent FFmpeg 9.0.2 decoder**, using `tools/audio-census.py --ffmpeg ...`. This is not a test of Explorer's rodio decoder. WAV headers comprise 1,894 mono 16-bit PCM at 22,050/44,100/48,000 Hz, 12 stereo 16-bit PCM at 22,050 Hz, and one mono 32-bit IEEE-float file at 22,050 Hz. OGG is a container; the previous investigation verified a client track as Vorbis, but this audit did not separately verify the codec in every OGG. Metadata PK/SFK entries were not treated as playable audio.
+
+Drive metadata also shows 36 loose MP3 files in `element/music` and 75 loose WAV files in `element/music/ambiencestereo`, plus a zero-length extensionless marker in the latter. Three loose samples (two WAV and one MP3) were independently decoded with FFmpeg, not the full loose set. No assumption is made that these counts cover every folder in the client. Assets are not included in the repository.
+
+The supplied UTF-16 `maps/world/precinct.clt` parses as 332 zones, with ambience filenames before and after each music playlist; filenames strongly suggest day/night use, but native selection logic and transitions are not established. Explorer now retains both fields, offers independently enabled experimental stereo zone ambience and an independent sound volume slider, and uses the viewer's existing daylight threshold and smallest-polygon heuristic. It stops/restarts on selection changes rather than crossfading. The existing music slider controls only music. At the time of this first audit both channels were off by default. These approximations are **not** full native audio parity.
+
+Music archive lookup now tries the requested extension first and only then substitutes OGG for missing MP3. Tests cover that preference and path traversal rejection. At the time of the first audit, zone ambience played only loose `music/ambiencestereo` assets and world sounds were not implemented; see the follow-up below. The archive census does not establish that Explorer can select or play those files.
+
+## Verification and remaining gates
+
+- Standalone Rust tests passed for settings persistence/bounds and music/ambience parser, lookup, day/night selection and disable behavior. The music tests used a stub PCK module; a separate test parsed the supplied real precinct file. They do not exercise the Windows backend.
+- Full `cargo check` could not run: this sandbox cannot reach `index.crates.io` and had no cached dependencies. The new Windows-only `audio-corpus-check` can exercise rodio against `sfx.pck` and the loose music tree, but has not been run here; its iterator can still stop silently on some mid-stream errors. The subsequent CI build compiled on Windows and tested synthetic MP3, Vorbis and PCM/float WAV fixtures. Rodio decoding of every real file, real audio device playback, output-device recovery, gain laws, timing and crossfades remain unverified.
+- To claim full correctness, test all loose and packed audio using the actual Windows decoder and native hardware, resolve client source/region/priority and timing behavior, implement positional/gameplay events, and compare against the real client. Do not interpret the FFmpeg census as completion of those gates.
+
+## World sound placement follow-up
+
+The supplied `world.ecwld` (SHA-256 `6a763c0ea0ac5717adf0a806cc2d2c09e86a4e4a809df60fc8ed0f9a5c319fc8`) has 827 sound placements across 62 distinct case-normalized paths. All 62 resolve against the supplied `sfx.pck` (SHA-256 `712cb6b1880bd2b476654240937f46277517ae6df74d1b1aa93c2d1ae632242d`). The version-12 32-byte sound records have two float distance parameters, a reserved word and a mode after the position; the prior scene reader discarded them. The native loader at `0x5b416e` reads 32 bytes; `0x5b41ef..0x5b4204` copies the two distances and mode into the owner, and `0x5b44e8..0x5b44fc` forwards the distances to the 3D sound buffer. All 827 have zero reserved words and finite, ordered nonnegative distances; near values range 1.5–50 and far values 10–350. Modes occur as 0: 63, 1: 218, 2: 546; their full semantics and event scheduling are not yet proven. They are retained, not interpreted.
+
+`scene-sound-check <element directory>` can reproduce the path, mode and distance census using the Rust scene and PCK readers. An independent Python census checked the supplied files; a standalone Rust harness also parsed all 827 records, but used a stub for GBK decoding and is not a replacement for the full dependency-backed test. World sound playback was not implemented at that stage; see the follow-up below.
+
+The 332-zone precinct file contains 733 quoted `Music` references (52 unique spellings). Comparing their names with the Drive listing of the 36 loose MP3s and the PCK directory found 618 references matching loose MP3s, 57 matching packed OGG fallback names, and 58 unresolved references covering 12 names. This is filename resolution only, not a decode or polygon-coverage test. The missing names include three Chinese generic tracks and nine numbered common variants. The viewer now reports unresolved tracks and PCK catalog errors separately from playback status instead of silently hiding them; it does not guess replacements.
+
+Among the 584 nonempty ambience references (52 distinct names), the first/day field for Flag Hill spells `generaldaqy.wav`; the supplied loose ambience directory lists `generalday.wav` but not that misspelling. The player reports the unresolved filename instead of silently substituting a presumed correction. Other filename comparisons for the entire loose set have not been independently automated here.
+
+## Follow-up — experimental world sound playback
+
+The viewer now plays resolved ECWLD sound placements from `sfx.pck` (or a loose `sfx` tree if an archive entry is absent). It uses an independent effects slider, in addition to ambience and music. New settings enable all three channels by default; existing saved enable choices remain in effect. Stereo precinct ambience now loops continuously rather than reopening on each loop.
+
+Native client code `0x5b16e2..0x5b1715` gates owner modes 0, 1 and 2 using the same strict half-day factor comparison as scene effects; `0x5b1728..0x5b1776` checks 3D distance against the far distance. The viewer uses those fields and the existing day/night factor, but its linear distance attenuation, stereo approximation, 16-voice limit and two-second replay gap are viewer choices, not established native behavior. It does not yet implement creature/combat, weather, interface or other gameplay-triggered sounds.
+
+Unit tests cover distance and boundary selection, safe paths, pan orientation, and voice caps; the Windows audio worker still requires native device testing with the actual client. This follow-up does not change the earlier FFmpeg/rodio corpus limitations or prove native audio parity.
