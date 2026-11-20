@@ -120,7 +120,7 @@ impl Default for Settings {
             single_path: true,
             hybrid_primary: false,
             denoiser: Denoiser::Svgf,
-            guided: true,
+            guided: false,
             ray_lighting: true,
             progressive: true,
             bounces: 1,
