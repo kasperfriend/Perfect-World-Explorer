@@ -225,16 +225,16 @@ impl Raywatcher {
         let mut effective = self.settings.clone();
         effective.mode = mode;
         let availability = self.availability;
-        let plan = Plan::decide(&effective, render_extent, self.hardware_rays, |provider| {
+        // `history_valid` deliberately does not change the plan: a frame with
+        // no history still traces at the same extent and the same sample count,
+        // it just starts the accumulator over. That is expressed in the frame
+        // parameters (`history_valid`), not by changing what the plan asks for,
+        // so switching a provider on or off never also moves the render
+        // extent underneath the upscaler.
+        let _ = history_valid;
+        Plan::decide(&effective, render_extent, self.hardware_rays, |provider| {
             availability.get(provider)
-        });
-        if plan.trace && !history_valid {
-            // A plan without history still traces; it just starts the
-            // accumulator over, which `Plan` expresses through the frame
-            // parameters, not by changing the extent.
-            return plan;
-        }
-        plan
+        })
     }
 
     /// Build this frame's status and remember it for the tab.

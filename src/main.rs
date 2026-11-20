@@ -1262,14 +1262,22 @@ pub struct SdkReport {
     /// `libxell.dll` — Intel Xe Low Latency. Mandatory for XeSS Frame
     /// Generation: the proxy swapchain refuses to initialize without it.
     pub xell: bool,
+    /// `nvngx_dlssd.dll` — DLSS Ray Reconstruction, the NGX snippet Core loads
+    /// for Raywatcher's DLSS RR option.
+    pub dlss_ray_reconstruction: bool,
+    /// `amd_fidelityfx_denoiser_dx12.dll` — the FFX denoiser the SDK documents
+    /// as "AMD FSR Ray Regeneration", behind Raywatcher's FSR RR option.
+    pub fsr_ray_regeneration: bool,
 }
 
 const DLSS_SR_NAMES: [&str; 1] = ["nvngx_dlss.dll"];
 const DLSS_FG_NAMES: [&str; 1] = ["nvngx_dlssg.dll"];
+const DLSS_RR_NAMES: [&str; 1] = ["nvngx_dlssd.dll"];
 const STREAMLINE_NAMES: [&str; 1] = ["sl.interposer.dll"];
 const FSR_LOADER_NAMES: [&str; 1] = ["amd_fidelityfx_loader_dx12.dll"];
 const FSR_UPSCALE_NAMES: [&str; 1] = ["amd_fidelityfx_upscaler_dx12.dll"];
 const FSR_FG_NAMES: [&str; 1] = ["amd_fidelityfx_framegeneration_dx12.dll"];
+const FSR_RR_NAMES: [&str; 1] = ["amd_fidelityfx_denoiser_dx12.dll"];
 const XESS_NAMES: [&str; 1] = ["libxess.dll"];
 const XESS_FG_NAMES: [&str; 1] = ["libxess_fg.dll"];
 const XELL_NAMES: [&str; 1] = ["libxell.dll"];
@@ -1325,6 +1333,8 @@ pub fn probe_sdk(settings_dir: &str) -> SdkReport {
     let xess = probe(&XESS_NAMES);
     let xess_frame_generation = probe(&XESS_FG_NAMES);
     let xell = probe(&XELL_NAMES);
+    let dlss_ray_reconstruction = probe(&DLSS_RR_NAMES);
+    let fsr_ray_regeneration = probe(&FSR_RR_NAMES);
     SdkReport {
         dir,
         source,
@@ -1338,6 +1348,8 @@ pub fn probe_sdk(settings_dir: &str) -> SdkReport {
         xess,
         xess_frame_generation,
         xell,
+        dlss_ray_reconstruction,
+        fsr_ray_regeneration,
     }
 }
 
@@ -1371,6 +1383,12 @@ impl SdkReport {
         }
         if self.xell {
             found.push("XeLL");
+        }
+        if self.dlss_ray_reconstruction {
+            found.push("DLSS RR");
+        }
+        if self.fsr_ray_regeneration {
+            found.push("FSR RR");
         }
         match &self.dir {
             Some(dir) if !self.dir_is_dir => format!(
@@ -2401,6 +2419,8 @@ mod tests {
             xess: true,
             xess_frame_generation: true,
             xell: true,
+            dlss_ray_reconstruction: true,
+            fsr_ray_regeneration: true,
         }
     }
 
@@ -3345,16 +3365,18 @@ fn diagnose_upscale(args: &[String]) -> i32 {
     let sdk = probe_sdk(&parsed.sdk_dir);
     println!("SDK probe: {}", sdk.summary());
     println!(
-        "  nvngx_dlss.dll: {}   nvngx_dlssg.dll: {}   sl.interposer.dll: {}",
+        "  nvngx_dlss.dll: {}   nvngx_dlssg.dll: {}   nvngx_dlssd.dll: {}   sl.interposer.dll: {}",
         yes_no(sdk.dlss),
         yes_no(sdk.dlss_frame_generation),
+        yes_no(sdk.dlss_ray_reconstruction),
         yes_no(sdk.streamline)
     );
     println!(
-        "  FSR loader: {}   FSR upscaler: {}   FSR frame generation: {}",
+        "  FSR loader: {}   FSR upscaler: {}   FSR frame generation: {}   FSR denoiser: {}",
         yes_no(sdk.fsr_loader),
         yes_no(sdk.fsr_upscale),
-        yes_no(sdk.fsr_frame_generation)
+        yes_no(sdk.fsr_frame_generation),
+        yes_no(sdk.fsr_ray_regeneration)
     );
     println!(
         "  libxess.dll: {}   libxess_fg.dll: {}   libxell.dll: {}",

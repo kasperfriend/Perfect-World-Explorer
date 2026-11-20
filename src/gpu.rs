@@ -3871,7 +3871,7 @@ impl Renderer {
             &plan,
             &transport,
             &denoise,
-            &self.object_mv_view,
+            &self.object_mv,
             &self.depth,
         );
         // The trace ran at the ray grid; the temporal and compose passes
