@@ -108,6 +108,10 @@ mod ffi {
     use super::Probe;
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
+    // `load` and `probe` take `&Path`, and a child module does not see the
+    // parent's imports — this has to be here for the Windows build to resolve
+    // it.
+    use std::path::Path;
 
     pub const FFX_DENOISER_VERSION: u32 = (1 << 22) | (2 << 12) | 1;
     pub const FFX_API_EFFECT_ID_DENOISER: u64 = 0x0005_0000;
@@ -374,7 +378,7 @@ mod ffi {
     /// Probe the DLL without creating a device.
     pub fn probe(dir: &Path) -> Probe {
         match FfxDenoiser::load(dir) {
-            Ok(_) => Probe::available(format!("{FSR_RR_DLL} loaded")),
+            Ok(_) => Probe::available(format!("{} loaded", super::FSR_RR_DLL)),
             Err(error) => Probe::unavailable(error),
         }
     }
@@ -458,6 +462,7 @@ mod tests {
 #[cfg(all(test, windows))]
 mod ffi_tests {
     use super::ffi::*;
+    use super::FSR_RR_DLL;
 
     #[test]
     fn the_descriptor_types_match_the_sdk_header() {
