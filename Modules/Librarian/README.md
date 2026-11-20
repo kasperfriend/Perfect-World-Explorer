@@ -14,9 +14,25 @@ the item name returns to its details. Add-on weights are the authored pool
 weights, not necessarily final in-game probabilities. Comparison columns have
 explicit Left, Right and Remove controls.
 
+## Effects
+
+Search the installed client's `gfx.pck` and loose `element/gfx/` tree by English name or original path. The file list and animation selector show English labels; hover to see the original identifiers. Names are local display data, never replacements for paths or animation bindings. See the [translation sources and coverage](names/README.md).
+Select a file to load it and its dependencies. **Animation** plays the whole
+composition or isolates a named element while preserving its binding targets.
+Drag the 3D view to orbit, adjust Zoom, or scrub **Animation cycle** to pause
+on a frame. The slider includes start offsets, repeated plays and their gaps.
+Forever holds and indefinite loops have a labelled inspection interval instead
+of a fictitious end time. Going backwards replays the simulation from its seed.
+
+Details show file size, group, GFX version, keypoints, playback speed and live
+geometry/particle counts. The preview uses the shared GFX player and renderer;
+it does not play sounds, distort the world or light surrounding scenery.
+Unsupported containers remain browsable and missing dependencies are reported.
+No client assets are copied into the module or needed at build time.
+
 ## NPCs
 
-The highlighted tab row carries **All Items**, **Comparison** and **NPCs**. It
+The highlighted tab row carries **All Items**, **Comparison**, **NPCs** and **Effects**. It
 reads the same `elements.data`: the 2,838 `NPC_ESSENCE` records and the 4,208
 `MONSTER_ESSENCE` records, switched between with the NPCs/Monsters buttons.
 Search matches names and IDs, and selecting a template opens its details.
