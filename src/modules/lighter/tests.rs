@@ -2416,11 +2416,11 @@ fn exercise_spatial_upscale(h: &mut Harness) {
     h.ray.install(Ok((b.finish(), Textures::default())));
     let f = test_frame(Vec3::ZERO, Vec3::NEG_Z, 47);
     let empty = Builder::for_mode(saved.mode).finish();
-    // linear: bilinear upscale filter (guided=false), same ray trace as spatial
-    h.ray.settings.guided = false;
+    // linear: denoiser=None -> bilinear upscale (guided=false)
+    h.ray.settings.denoiser = Denoiser::None;
     let linear = h.pixels(f, &empty);
-    // spatial: guided upscale filter (guided=true), same ray trace as linear
-    h.ray.settings.guided = true;
+    // spatial: denoiser=Svgf -> guided upscale (guided=true), same ray trace
+    h.ray.settings.denoiser = Denoiser::Svgf;
     let spatial = h.pixels(f, &empty);
     assert!(linear.iter().zip(&spatial).all(|(a, b)| a.1 == b.1));
     assert!(linear.iter().zip(&spatial).any(|(a, b)| a.0 != b.0));
@@ -2983,14 +2983,12 @@ fn exercise_denoiser_edges(h: &mut Harness) {
         frame.air = [6., 7., 1., 0.];
         frame.extent = [0, 0, 7, 7];
         h.ray.settings.denoiser = Denoiser::None;
-        h.ray.settings.guided = false;
         h.ray.settings.resolution = 100;
         let raw = h.pixels(frame, &empty);
         let left = small(&raw, 3);
         let right = small(&raw, 4);
         assert!(left.0[0] > right.0[0] + 80, "{label}: {left:?} {right:?}");
         h.ray.settings.denoiser = Denoiser::Svgf;
-        h.ray.settings.guided = true;
         let filtered = h.pixels(frame, &empty);
         assert_eq!(small(&filtered, 3), left, "{label}: left edge filtered");
         assert_eq!(small(&filtered, 4), right, "{label}: right edge filtered");
@@ -3000,7 +2998,6 @@ fn exercise_denoiser_edges(h: &mut Harness) {
         h.ray.settings.resolution = 50;
         let guided = h.pixels(frame, &empty);
         h.ray.settings.denoiser = Denoiser::None;
-        h.ray.settings.guided = false;
         let bilinear = h.pixels(frame, &empty);
         let at = 7 * 14 + 7; // exactly between source texels 3 and 4
         assert_eq!(guided[at], left, "{label}: upscale bled into left");
@@ -3061,7 +3058,6 @@ fn exercise_sun_and_history(h: &mut Harness) {
     h.ray.settings.shadows = true;
     let column = |y| y * SIDE + SIDE / 2;
     let center = column(SIDE / 2);
-    h.ray.settings.guided = false;
     let hard = h.pixels(frame, &empty);
     let full = hard[center + 5].0[0];
     assert!(full > 100);
@@ -3069,7 +3065,6 @@ fn exercise_sun_and_history(h: &mut Harness) {
     h.ray.settings.soft_sun = true;
     let grain = h.pixels(frame, &empty);
     h.ray.settings.denoiser = Denoiser::Svgf;
-    h.ray.settings.guided = true;
     let smooth = h.pixels(frame, &empty);
     let stats = |pixels: &[([u8; 4], f32)]| {
         let row = (2..SIDE - 2).map(|y| f32::from(pixels[column(y)].0[0]) / f32::from(full));

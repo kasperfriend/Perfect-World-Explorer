@@ -2184,7 +2184,7 @@ impl Lighter {
                 encoder,
                 image,
                 frame.extent,
-                settings.guided,
+                settings.denoiser == Denoiser::Svgf,
                 target,
                 depth,
                 None,
