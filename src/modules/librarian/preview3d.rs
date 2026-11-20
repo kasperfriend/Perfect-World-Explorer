@@ -1,5 +1,5 @@
 //! Offscreen item-model preview. The target is independent of the world depth
-//! buffer and follows the viewer's mirrored, reversed-depth camera convention.
+//! buffer and uses an unmirrored, reversed-depth camera (screen right is world right).
 use super::archive::LibrarianAssets;
 use crate::{
     model_asset::ModelAsset,
@@ -134,9 +134,37 @@ fn apply_preview_dye(asset: &mut ModelAsset, color: [u8; 3]) {
     }
 }
 
-fn pan_offset(yaw: f32, radius: f32, zoom: f32, delta: egui::Vec2) -> Vec3 {
+/// Pointer drags move the view: the orbit angle or the look-at point.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Drag {
+    Orbit,
+    Pan,
+}
+
+/// Right-button drags (or Shift+left) pan; plain left drags orbit. Dragging
+/// on the preview is otherwise ignored.
+pub fn drag_mode(response: &egui::Response, shift: bool) -> Option<Drag> {
+    if !response.dragged() {
+        return None;
+    }
+    Some(
+        if response.dragged_by(egui::PointerButton::Secondary) || shift {
+            Drag::Pan
+        } else {
+            Drag::Orbit
+        },
+    )
+}
+
+/// Moves the look-at point so the model follows the pointer.
+pub fn pan_offset(yaw: f32, radius: f32, zoom: f32, delta: egui::Vec2) -> Vec3 {
     let right = Vec3::new(yaw.cos(), 0., -yaw.sin());
-    (right * delta.x + Vec3::Y * delta.y) * radius * zoom * 0.004
+    (-right * delta.x + Vec3::Y * delta.y) * radius * zoom * 0.004
+}
+
+/// Dragging right turns the model so its front follows the pointer.
+pub fn orbit_yaw(yaw: f32, horizontal_drag: f32) -> f32 {
+    yaw - horizontal_drag * 0.01
 }
 
 pub fn orbit_pitch(pitch: f32, vertical_drag: f32) -> f32 {
@@ -669,7 +697,7 @@ impl Preview {
             fog_color: [0.; 4],
             fog_range: [0.; 4],
             clip_plane: [0.; 4],
-            reverse_front: true,
+            reverse_front: false,
             alpha_compare: 5,
             alpha_reference: 84. / 255.,
             // The librarian preview draws a single model into its own target:
@@ -719,6 +747,7 @@ fn preview_pose(
     Ok((asset.meshes_from_pose(&pose)?, approximate))
 }
 
+/// Right-handed, unmirrored: a point to the viewer's right is at +X on screen.
 pub(super) fn camera_matrix(target: Vec3, radius: f32, zoom: f32, yaw: f32, pitch: f32) -> Mat4 {
     let distance = radius * 3.5 * zoom;
     let eye = target
@@ -729,9 +758,7 @@ pub(super) fn camera_matrix(target: Vec3, radius: f32, zoom: f32, yaw: f32, pitc
         ) * distance;
     let near = (distance * 0.01).max(0.001);
     let far = distance + radius * 10.;
-    Mat4::from_scale(Vec3::new(-1., 1., 1.))
-        * Mat4::perspective_rh(45f32.to_radians(), 1., far, near)
-        * Mat4::look_at_rh(eye, target, Vec3::Y)
+    Mat4::perspective_rh(45f32.to_radians(), 1., far, near) * Mat4::look_at_rh(eye, target, Vec3::Y)
 }
 
 #[cfg(test)]
@@ -861,10 +888,18 @@ mod tests {
 
     #[test]
     fn drag_directions_follow_pointer_and_weapon_animation_is_disabled() {
+        // Panning right moves the model right on screen.
         let delta = pan_offset(0., 1., 1., egui::vec2(10., 0.));
         let before = camera_matrix(Vec3::ZERO, 1., 1., 0., 0.) * Vec3::ZERO.extend(1.);
         let after = camera_matrix(delta, 1., 1., 0., 0.) * Vec3::ZERO.extend(1.);
         assert!(after.x / after.w > before.x / before.w);
+        // Orbiting right turns the front toward the right on screen.
+        let front = Vec3::new(0., 0., 1.);
+        let screen_x = |yaw: f32| {
+            let p = camera_matrix(Vec3::ZERO, 1., 1., yaw, 0.) * front.extend(1.);
+            p.x / p.w
+        };
+        assert!(screen_x(orbit_yaw(0., 10.)) > screen_x(0.));
         assert!(orbit_pitch(0., 10.) > 0.);
         assert_eq!(animation_index(false, 2), None);
         assert_eq!(animation_index(true, 2), Some(2));
@@ -911,8 +946,8 @@ mod tests {
         let preview = Preview::new(&device, &mut renderer, wgpu::TextureFormat::Bgra8UnormSrgb);
         assert_eq!(preview.target.color.format(), PREVIEW_FORMAT);
         assert!(
-            preview.frame().reverse_front,
-            "mirrored preview must keep the native front faces"
+            !preview.frame().reverse_front,
+            "the preview is unmirrored, so front faces keep their native winding"
         );
         let (asset, poses) = crate::model_draw_fixture::fixture();
         let sampler = device.create_sampler(&Default::default());
@@ -1084,13 +1119,13 @@ mod tests {
     }
 
     #[test]
-    fn preview_camera_mirrors_x_and_uses_reversed_depth() {
+    fn preview_camera_is_unmirrored_and_uses_reversed_depth() {
         let matrix = camera_matrix(Vec3::ZERO, 1., 1., 0., 0.);
         let projected = |p: Vec3| {
             let p = matrix * p.extend(1.);
             p.truncate() / p.w
         };
-        assert!(projected(Vec3::X).x < 0.);
+        assert!(projected(Vec3::X).x > 0.);
         assert!(projected(Vec3::new(0., 0., 2.)).z > projected(Vec3::new(0., 0., -2.)).z);
     }
 }

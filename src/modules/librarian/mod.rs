@@ -814,23 +814,18 @@ impl State {
                                 }
                                 let size = ui.available_width().min(300.);
                                 let response = preview_image(ui, preview.target.texture_id, size, preview.flip_vertical);
-                                if response.dragged() {
-                                    let (mut delta, pan) = ui.input(|i| {
-                                        (
-                                            i.pointer.delta(),
-                                            i.pointer.button_down(egui::PointerButton::Secondary)
-                                                || i.modifiers.shift,
-                                        )
-                                    });
+                                let shift = ui.input(|i| i.modifiers.shift);
+                                if let Some(mode) = preview3d::drag_mode(&response, shift) {
+                                    let mut delta = ui.input(|i| i.pointer.delta());
                                     if preview.flip_vertical {
                                         delta.y = -delta.y;
                                     }
-                                    if pan {
-                                        preview.pan_by(delta);
-                                    } else {
-                                        preview.yaw += delta.x * 0.01;
-                                        preview.pitch =
-                                            preview3d::orbit_pitch(preview.pitch, delta.y);
+                                    match mode {
+                                        preview3d::Drag::Pan => preview.pan_by(delta),
+                                        preview3d::Drag::Orbit => {
+                                            preview.yaw = preview3d::orbit_yaw(preview.yaw, delta.x);
+                                            preview.pitch = preview3d::orbit_pitch(preview.pitch, delta.y);
+                                        }
                                     }
                                 }
                                 let mut magnification = 1. / preview.zoom;
@@ -1138,22 +1133,18 @@ impl State {
                 let size = ui.available_width().min(300.);
                 let response =
                     preview_image(ui, preview.target.texture_id, size, preview.flip_vertical);
-                if response.dragged() {
-                    let (mut delta, pan) = ui.input(|i| {
-                        (
-                            i.pointer.delta(),
-                            i.pointer.button_down(egui::PointerButton::Secondary)
-                                || i.modifiers.shift,
-                        )
-                    });
+                let shift = ui.input(|i| i.modifiers.shift);
+                if let Some(mode) = preview3d::drag_mode(&response, shift) {
+                    let mut delta = ui.input(|i| i.pointer.delta());
                     if preview.flip_vertical {
                         delta.y = -delta.y;
                     }
-                    if pan {
-                        preview.pan_by(delta);
-                    } else {
-                        preview.yaw += delta.x * 0.01;
-                        preview.pitch = preview3d::orbit_pitch(preview.pitch, delta.y);
+                    match mode {
+                        preview3d::Drag::Pan => preview.pan_by(delta),
+                        preview3d::Drag::Orbit => {
+                            preview.yaw = preview3d::orbit_yaw(preview.yaw, delta.x);
+                            preview.pitch = preview3d::orbit_pitch(preview.pitch, delta.y);
+                        }
                     }
                 }
                 let mut magnification = 1. / preview.zoom;

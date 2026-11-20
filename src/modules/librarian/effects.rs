@@ -68,8 +68,9 @@ struct Clip {
     cursor: f32,
     simulated: f32,
     playing: bool,
-    camera: [f32; 3], // yaw, pitch, zoom
-    rendered_camera: Option<[f32; 3]>,
+    camera: [f32; 3], // yaw, pitch, zoom distance
+    pan: glam::Vec3,  // look-at offset, in authored units
+    rendered_view: Option<([f32; 3], glam::Vec3)>,
 }
 impl Clip {
     fn new(path: String, root: gfx_file::Root) -> Self {
@@ -83,7 +84,8 @@ impl Clip {
             simulated: 0.,
             playing,
             camera: [0.6, 0.25, 1.],
-            rendered_camera: None,
+            pan: glam::Vec3::ZERO,
+            rendered_view: None,
         }
     }
     fn select(&mut self, solo: Option<usize>) {
@@ -129,7 +131,7 @@ impl Clip {
             self.simulated = 0.;
         }
         let player = self.player.as_mut().unwrap();
-        let mut changed = rebuild || self.rendered_camera != Some(self.camera);
+        let mut changed = rebuild || self.rendered_view != Some((self.camera, self.pan));
         if changed {
             player.advance(0., view, Mat4::IDENTITY, 1., 1.)?;
         }
@@ -142,7 +144,7 @@ impl Clip {
             self.simulated = next;
             changed = true;
         }
-        self.rendered_camera = Some(self.camera);
+        self.rendered_view = Some((self.camera, self.pan));
         Ok(changed)
     }
 }
@@ -179,7 +181,7 @@ impl Browser {
             let [yaw, pitch, zoom] = clip.camera;
             let scale = clip.root.default_scale;
             let matrix = preview3d::camera_matrix(
-                clip.root.aabb_center * scale,
+                clip.root.aabb_center * scale + clip.pan,
                 (clip.root.bounds_radius() * scale).max(1.),
                 zoom,
                 yaw,
@@ -376,14 +378,36 @@ fn clip_ui(
     }
     if let (Some(target), Some(_)) = (target, &clip.player) {
         let response = preview_image(ui, target.texture_id, ui.available_width().min(360.), false);
-        if response.dragged() {
-            let d = ui.input(|i| i.pointer.delta());
-            clip.camera[0] -= d.x * 0.01;
-            clip.camera[1] = (clip.camera[1] + d.y * 0.01).clamp(-1.5, 1.5);
+        let shift = ui.input(|i| i.modifiers.shift);
+        if let Some(mode) = preview3d::drag_mode(&response, shift) {
+            let delta = ui.input(|i| i.pointer.delta());
+            match mode {
+                preview3d::Drag::Pan => {
+                    let scale = clip.root.default_scale;
+                    let radius = (clip.root.bounds_radius() * scale).max(1.);
+                    clip.pan +=
+                        preview3d::pan_offset(clip.camera[0], radius, clip.camera[2], delta);
+                }
+                preview3d::Drag::Orbit => {
+                    clip.camera[0] = preview3d::orbit_yaw(clip.camera[0], delta.x);
+                    clip.camera[1] = (clip.camera[1] + delta.y * 0.01).clamp(-1.5, 1.5);
+                }
+            }
         }
     }
-    ui.add(egui::Slider::new(&mut clip.camera[2], 0.1..=4.).text("Zoom"));
-    ui.small("Drag the preview to orbit.");
+    // Same convention as the item preview: a larger magnification zooms in.
+    let mut magnification = 1. / clip.camera[2];
+    if ui
+        .add(
+            egui::Slider::new(&mut magnification, 0.25..=10.)
+                .logarithmic(true)
+                .text("Zoom"),
+        )
+        .changed()
+    {
+        clip.camera[2] = 1. / magnification;
+    }
+    ui.small("Left-drag to orbit; right-drag to move; use the slider to zoom.");
     let (end, open) = timeline(&clip.root, clip.solo);
     ui.horizontal(|ui| {
         ui.add_enabled_ui(clip.root.play_speed > 0., |ui| {
