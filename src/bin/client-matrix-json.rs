@@ -241,10 +241,7 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
             let bytes = std::fs::read(&elements_data).unwrap_or_default();
             match client_detect::ElementsHeader::parse(&bytes) {
                 Some(h) => {
-                    facts.push((
-                        "elementsVersion",
-                        format!("{}", h.version()),
-                    ));
+                    facts.push(("elementsVersion", format!("{}", h.version())));
                     facts.push(("elementsWord", format!("{:#010x}", h.canonical())));
                     facts.push(("elementsFamily", format!("{:#06x}", h.family())));
                     cells.push(Cell::ok(
