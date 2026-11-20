@@ -46,11 +46,18 @@ fn record(name: &str, offset: u32, size: u32, compressed: u32) -> Vec<u8> {
 }
 
 /// Assemble a v2 PCK from `(name, payload)` pairs, all stored uncompressed.
+///
+/// Layout: the 12-byte safe header, then the payloads, then the entry table,
+/// then the 280-byte footer. Every offset the reader consumes is absolute from
+/// the start of the file, and the `end` field **is** the file length (the reader
+/// reads the footer from `end - 280`), so offsets are measured after the safe
+/// header and `end` is only known once the footer is appended.
 fn build_pck(files: &[(String, Vec<u8>)]) -> Vec<u8> {
+    const SAFE_HEADER: usize = 12;
     let mut data = Vec::new();
     let mut table: Vec<u8> = Vec::new();
     for (name, payload) in files {
-        let offset = data.len() as u32;
+        let offset = (SAFE_HEADER + data.len()) as u32;
         data.extend_from_slice(payload);
         table.extend_from_slice(&record(
             name,
@@ -59,21 +66,25 @@ fn build_pck(files: &[(String, Vec<u8>)]) -> Vec<u8> {
             payload.len() as u32,
         ));
     }
-    let table_pos = data.len() as u32;
+    // An entry is only valid while its data ends before `end`, and the entry
+    // table begins right here.
+    let table_pos = (SAFE_HEADER + data.len()) as u32;
     data.extend_from_slice(&table);
-    let end = data.len() as u32 + 280;
-    let mut header = vec![0u8; 280];
-    header[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
-    header[8..12].copy_from_slice(&((table_pos) ^ MASK).to_le_bytes());
-    header[268..272].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
-    header[272..276].copy_from_slice(&(files.len() as u32).to_le_bytes());
-    header[276..280].copy_from_slice(&0x20002u32.to_le_bytes());
-    data.extend_from_slice(&header);
-    let mut pck = Vec::new();
+    // The footer sits directly after the table; `end` counts it.
+    let end = (SAFE_HEADER + data.len() + 280) as u32;
+    let mut footer = vec![0u8; 280];
+    footer[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
+    footer[8..12].copy_from_slice(&(table_pos ^ MASK).to_le_bytes());
+    footer[268..272].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
+    footer[272..276].copy_from_slice(&(files.len() as u32).to_le_bytes());
+    footer[276..280].copy_from_slice(&0x20002u32.to_le_bytes());
+    let mut pck = Vec::with_capacity(end as usize);
     pck.extend_from_slice(&0x4dca23efu32.to_le_bytes());
     pck.extend_from_slice(&end.to_le_bytes());
     pck.extend_from_slice(&0x56a089b7u32.to_le_bytes());
     pck.extend_from_slice(&data);
+    pck.extend_from_slice(&footer);
+    debug_assert_eq!(pck.len(), end as usize);
     pck
 }
 
