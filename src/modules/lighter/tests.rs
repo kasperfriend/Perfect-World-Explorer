@@ -614,11 +614,22 @@ fn exercise(mode: Mode, cpu_query: bool) {
         "still geometry re-uploaded"
     );
 
-    // Lighting tests need a surface for lights to illuminate. Install a
-    // mid-gray world (green_front at [0,1,0] maxes the channel).
+    // Lighting tests need a surface for lights to illuminate. `upright()`
+    // leaves surface diffuse at u32::MAX (white), which saturates. Build a
+    // gray surface [0.5] with with_lighting() so lighting on/off produce
+    // distinguishable values.
     let mut b3 = Builder::default();
-    let gray = upright(&mut b3, -2., [0.9, 0.9, 0.9, 1.], 0, 0);
-    put(&mut b3, gray);
+    let mut surf = Surface::new(0, 0, 0.5, 0.);
+    surf = surf.with_lighting([0.5, 0.5, 0.5, 1.], [0., 0., 0., 0.], [0., 0., 0., 0.]);
+    let sid = b3.surface(surf);
+    let mut mesh = Mesh::default();
+    for p in [[-1., 1., -2.], [1., 1., -2.], [-1., -1., -2.], [1., -1., -2.]] {
+        mesh.vertices.push(Vertex::new(p, [0., 0., 1.], [0., 0.]).tint(0, 0));
+    }
+    mesh.tri([0, 2, 1], sid);
+    mesh.tri([1, 2, 3], sid);
+    let mid = b3.mesh(&mesh).unwrap().unwrap();
+    b3.place(mid, Transform::IDENTITY).unwrap();
     h.ray.install(Ok((b3.finish(), bank.clone())));
     // Bright vs dim sun: lighting on, sun contributes. Bright sun saturates,
     // dim sun contributes little. Difference > 30 in u8.
@@ -639,12 +650,11 @@ fn exercise(mode: Mode, cpu_query: bool) {
     assert_eq!(h.builds(), builds, "changing light values rebuilt ASes");
     // Lighting on vs off changes the pixel: with lighting off and shadows
     // off, direct() returns base color directly; with lighting on, sun
-    // radiance adds on top. Use bounces=0 for a single segment so values
-    // don't accumulate/saturate, and a bright sun for maximum separation.
+    // radiance adds on top. bounces=0 prevents accumulation/saturation.
     let mut sun_frame = test_frame(Vec3::ZERO, -Vec3::Z, 1);
     sun_frame.sun = Vec3::new(0.8, 0.1, 0.6).normalize().extend(1.).to_array();
     sun_frame.ambient = [0., 0., 0., 0.];
-    sun_frame.sun_color = [10., 10., 10., 1.0];
+    sun_frame.sun_color = [1., 1., 1., 1.0];
     h.ray.settings.lighting = true;
     h.ray.settings.shadows = false;
     h.ray.settings.bounces = 0;
