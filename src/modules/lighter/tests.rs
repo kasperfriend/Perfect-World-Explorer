@@ -615,8 +615,12 @@ fn exercise(mode: Mode, cpu_query: bool) {
     );
 
     // Lighting tests need a surface for lights to illuminate, and a frame
-    // without ambient/sun so light differences are visible. green_front at
-    // [0,1,0] maxes the green channel and hides light differences.
+    // without ambient/sun so light differences are visible. Install a fresh
+    // gray world (green_front at [0,1,0] from earlier maxes the channel).
+    let mut b3 = Builder::default();
+    let gray = upright(&mut b3, -2., [0.1, 0.1, 0.1, 1.], 0, 0);
+    put(&mut b3, gray);
+    h.ray.install(Ok((b3.finish(), bank.clone())));
     let mut light_frame = test_frame(Vec3::ZERO, -Vec3::Z, 3);
     light_frame.ambient = [0., 0., 0., 0.];
     light_frame.sun_color = [0., 0., 0., 0.];
@@ -637,8 +641,6 @@ fn exercise(mode: Mode, cpu_query: bool) {
         );
         b.place(block, Transform::translation([3., 0., -3.5]))
             .unwrap();
-        let surface = upright(&mut b, -2., [0.1, 0.1, 0.1, 1.], 0, 0);
-        put(&mut b, surface);
         b.finish()
     };
     h.ray.settings.lighting = true;
