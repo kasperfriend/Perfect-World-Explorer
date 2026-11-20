@@ -329,7 +329,20 @@ jobs:
               > ci-results/none.json
             echo "::notice::no client files staged; ci-results/none.json records that"
           else
-            cargo run --locked --bin client-matrix-json -- ci-results "${args[@]}"
+            # Surface the tool's own failure as an annotation: the raw step log
+            # is not retrievable, so an unannotated non-zero exit is invisible.
+            # `PIPESTATUS`, not `if ! cmd | tee`: the pipe's status is tee's,
+            # which succeeds even when the tool failed.
+            set +e
+            CARGO_TERM_COLOR=never cargo run --locked --bin client-matrix-json \
+              -- ci-results "${args[@]}" 2>&1 | tee /tmp/matrix.log
+            tool_status=${PIPESTATUS[0]}
+            set -e
+            if [ "$tool_status" -ne 0 ]; then
+              grep -E "^error|panicked|SILENT|cannot|-->" /tmp/matrix.log | head -20 \
+                | while IFS= read -r line; do echo "::error::$line"; done
+              exit 1
+            fi
           fi
           # A missing file per client is a failed measurement, not a zero.
           for f in ci-results/*.json; do

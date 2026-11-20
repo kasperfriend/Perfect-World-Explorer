@@ -766,6 +766,8 @@ pub mod model_playback;
 // while this module set did not contain this module at all.
 #[path = "$REPO/src/world_models.rs"]
 pub mod world_models;
+#[path = "$REPO/src/load_status.rs"]
+pub mod load_status;
 #[path = "$REPO/src/world_catalog.rs"]
 pub mod world_catalog;
 #[path = "$OUT/pck_stub.rs"]
@@ -1307,6 +1309,8 @@ pub use modes::{internal_factor, nearest_available, quality_available};
 pub mod angelica_pck;
 #[path = "$REPO/src/world_place_names.rs"]
 pub mod world_place_names;
+#[path = "$REPO/src/load_status.rs"]
+pub mod load_status;
 #[path = "$REPO/src/world_catalog.rs"]
 pub mod world_catalog;
 /// The one piece of main.rs that the settings file depends on and that is not
@@ -2010,6 +2014,8 @@ pub mod music;
 pub mod terrain_block;
 #[path = "$REPO/src/angelica_pck.rs"]
 pub mod angelica_pck;
+#[path = "$REPO/src/load_status.rs"]
+pub mod load_status;
 #[path = "$REPO/src/world_catalog.rs"]
 pub mod world_catalog;
 #[path = "$REPO/src/world_place_names.rs"]

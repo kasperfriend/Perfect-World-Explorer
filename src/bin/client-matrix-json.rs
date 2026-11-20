@@ -180,9 +180,56 @@ fn main() {
 
     let mut any_silent = false;
     for (name, root) in &clients {
+        // One client must not be able to destroy the whole run. A panic inside a
+        // reader would otherwise leave ci-results empty with no explanation,
+        // which is exactly what happened to the first attempt at this step.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            measure_client(name, root)
+        }));
+        let (cells, facts) = match outcome {
+            Ok(pair) => pair,
+            Err(payload) => {
+                let detail = payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "panic with no message".into());
+                eprintln!("{name}: PANIC while measuring: {detail}");
+                // Node: recorded as a refusal, so the file still exists and the
+                // failure is visible in the JSON rather than in a missing file.
+                let cells = vec![Cell::refused(
+                    "measurement",
+                    format!("the tool panicked while reading this client: {detail}"),
+                )];
+                (cells, Vec::new())
+            }
+        };
+        any_silent |= cells.iter().any(|c| c.status == "silent");
+        write_client(&out_dir, name, root, &cells, &facts);
+        let silent = cells.iter().filter(|c| c.status == "silent").count();
+        println!(
+            "{}: {} cells, {} ok, {} refused, {} absent, {} SILENT",
+            name,
+            cells.len(),
+            cells.iter().filter(|c| c.status == "ok").count(),
+            cells.iter().filter(|c| c.status == "named-refusal").count(),
+            cells.iter().filter(|c| c.status == "absent").count(),
+            silent
+        );
+    }
+    if any_silent {
+        eprintln!("SILENT cells present: a reader returned nothing without a reason");
+        std::process::exit(1);
+    }
+}
+
+/// Measure one client and return its cells and facts.
+fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, String)>) {
+    let _ = name;
+    {
         let element = element_of(root);
         let mut cells: Vec<Cell> = Vec::new();
-        let mut facts: Vec<(&str, String)> = Vec::new();
+        let mut facts: Vec<(&'static str, String)> = Vec::new();
 
         // --- the client's declared data version
         let elements_data = element.join("elements.data");
@@ -592,55 +639,49 @@ fn main() {
             Cell::ok("lightmaps T2LM", format!("{} files staged", t2lm.len()))
         });
 
-        // --- write the client's JSON
-        for c in &cells {
-            if c.status == "silent" {
-                any_silent = true;
-            }
-        }
-        let mut doc = String::new();
-        doc.push_str("{\n");
-        doc.push_str(&format!("  \"client\": \"{}\",\n", esc(name)));
-        doc.push_str(&format!("  \"root\": \"{}\",\n", esc(&root.display().to_string())));
-        doc.push_str("  \"facts\": {");
-        for (i, (k, v)) in facts.iter().enumerate() {
-            if i > 0 {
-                doc.push(',');
-            }
-            let value = if v.chars().all(|c| c.is_ascii_digit() || c == '-') && !v.is_empty() {
-                v.clone()
-            } else {
-                format!("\"{}\"", esc(v))
-            };
-            doc.push_str(&format!("\n    \"{k}\": {value}"));
-        }
-        doc.push_str("\n  },\n  \"cells\": [\n");
-        for (i, c) in cells.iter().enumerate() {
-            doc.push_str(&format!(
-                "    {{\"category\": \"{}\", \"status\": \"{}\", \"detail\": \"{}\"}}{}\n",
-                esc(c.category),
-                c.status,
-                esc(&c.detail),
-                if i + 1 < cells.len() { "," } else { "" }
-            ));
-        }
-        doc.push_str("  ]\n}\n");
-        let path = out_dir.join(format!("{name}.json"));
-        std::fs::write(&path, &doc).expect("write json");
-        let silent = cells.iter().filter(|c| c.status == "silent").count();
-        println!(
-            "{}: {} cells, {} ok, {} refused, {} absent, {} SILENT -> {}",
-            name,
-            cells.len(),
-            cells.iter().filter(|c| c.status == "ok").count(),
-            cells.iter().filter(|c| c.status == "named-refusal").count(),
-            cells.iter().filter(|c| c.status == "absent").count(),
-            silent,
-            path.display()
-        );
+        (cells, facts)
     }
-    if any_silent {
-        eprintln!("SILENT cells present: a reader returned nothing without a reason");
-        std::process::exit(1);
+}
+
+/// Write one client's JSON, and say what it holds.
+fn write_client(
+    out_dir: &Path,
+    name: &str,
+    root: &Path,
+    cells: &[Cell],
+    facts: &[(&'static str, String)],
+) {
+    let mut doc = String::new();
+    doc.push_str("{\n");
+    doc.push_str(&format!("  \"client\": \"{}\",\n", esc(name)));
+    doc.push_str(&format!(
+        "  \"root\": \"{}\",\n",
+        esc(&root.display().to_string())
+    ));
+    doc.push_str("  \"facts\": {");
+    for (i, (k, v)) in facts.iter().enumerate() {
+        if i > 0 {
+            doc.push(',');
+        }
+        let value = if !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            v.clone()
+        } else {
+            format!("\"{}\"", esc(v))
+        };
+        doc.push_str(&format!("\n    \"{k}\": {value}"));
     }
+    doc.push_str("\n  },\n  \"cells\": [\n");
+    for (i, c) in cells.iter().enumerate() {
+        doc.push_str(&format!(
+            "    {{\"category\": \"{}\", \"status\": \"{}\", \"detail\": \"{}\"}}{}\n",
+            esc(c.category),
+            c.status,
+            esc(&c.detail),
+            if i + 1 < cells.len() { "," } else { "" }
+        ));
+    }
+    doc.push_str("  ]\n}\n");
+    let path = out_dir.join(format!("{name}.json"));
+    std::fs::write(&path, &doc).expect("write json");
+    println!("  wrote {}", path.display());
 }
