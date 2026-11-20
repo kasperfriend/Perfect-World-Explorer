@@ -432,7 +432,15 @@ fn temporal(
                 None => (Vec3::ZERO, 0.),
             };
             let (box_mean, box_variance) = local_moments(current, frame.depth.get(x, y), x, y);
-            let box_stddev = box_variance.max(Vec3::ZERO).sqrt() * config.variance_gamma;
+            // Per-channel square root rather than `Vec3::sqrt`: that method is
+            // gated behind glam's `libm` feature when `std` is off, and this
+            // loop must build the same way in every profile.
+            let variance = box_variance.max(Vec3::ZERO);
+            let box_stddev = Vec3::new(
+                variance.x.max(0.).sqrt(),
+                variance.y.max(0.).sqrt(),
+                variance.z.max(0.).sqrt(),
+            ) * config.variance_gamma;
             // Per-channel clamp: each colour channel is bounded by its own
             // local mean plus or minus the local standard deviation.
             let low = box_mean - box_stddev;
