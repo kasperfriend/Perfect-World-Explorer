@@ -552,19 +552,34 @@ fn exercise(mode: Mode, cpu_query: bool) {
         (z - depth_at(frame, Vec3::new(0., 0., -3.))).abs() < 1e-5,
         "{z}"
     );
+    // World surface in front of moving card: nearer world surface must win.
+    // Green card at z=-2 is closer than red moving card at z=-3.
+    let mut b2 = Builder::default();
+    let green_front = upright(&mut b2, -2., [0., 1., 0., 1.], 0, 0);
+    put(&mut b2, green_front);
+    h.ray.install(Ok((b2.finish(), bank.clone())));
+    let (c2, z2) = h.pixel(frame, &red);
+    assert_eq!(c2, [0, 255, 0, 255]);
+    assert!(
+        (z2 - depth_at(frame, Vec3::new(0., 0., -2.))).abs() < 1e-5,
+        "{z2}"
+    );
+    // Sheet at z=-3 is behind green at z=-2. With per-pixel depth testing,
+    // the nearer green surface wins and the read-only sheet contributes
+    // neither color nor depth. Output is pure green at green's depth.
     let mut effects = Builder::default();
     let sheet = upright(&mut effects, -3., [1., 0., 0., 0.25], BLEND | EMISSIVE, 0);
     put(&mut effects, sheet);
     let (c, z) = h.pixel(frame, &effects.finish());
+    assert_eq!(c, [0, 255, 0, 255]);
     assert!(
-        (63..=65).contains(&c[0]) && (190..=192).contains(&c[1]),
-        "{c:?}"
-    );
-    assert!(
-        (z - depth_at(frame, Vec3::new(0., 0., -5.))).abs() < 1e-5,
+        (z - depth_at(frame, Vec3::new(0., 0., -2.))).abs() < 1e-5,
         "a read-only effect overwrote the depth: {z}"
     );
 
+    // Coplanar sheets at z=-3 are behind green at z=-2. With depth testing,
+    // the nearer green surface wins and the read-only sheets contribute
+    // neither color nor depth.
     let mut effects = Builder::default();
     let red = upright(&mut effects, -3., [1., 0., 0., 0.25], BLEND | EMISSIVE, 0);
     let blue = upright(&mut effects, -3., [0., 0., 1., 0.25], BLEND | EMISSIVE, 0);
@@ -574,8 +589,12 @@ fn exercise(mode: Mode, cpu_query: bool) {
     let center = h.pixel(frame, &coplanar);
     assert_eq!(
         center.0,
-        [48, 143, 64, 255],
-        "distinct coincident cards (two triangles each)"
+        [0, 255, 0, 255],
+        "distinct coincident cards behind nearer surface"
+    );
+    assert!(
+        (center.1 - depth_at(frame, Vec3::new(0., 0., -2.))).abs() < 1e-5,
+        "depth should stay at nearer green surface"
     );
     let builds = h.builds();
     if mode == Mode::Hardware {
@@ -619,7 +638,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     let builds = h.builds();
     let dim = h.pixel(frame, &local_light([0.5; 4], false));
     assert!(
-        bright.0[1] > dim.0[1] + 30 && bright.1 == dim.1,
+        bright.0[1] as u32 > dim.0[1] as u32 + 30 && bright.1 == dim.1,
         "{bright:?} {dim:?}"
     );
     assert_eq!(h.builds(), builds, "changing light values rebuilt ASes");
@@ -627,7 +646,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     let dark = h.pixel(frame, &local_light([3.; 4], false));
     let through = h.pixel(frame, &local_light([3.; 4], true));
     assert!(
-        dark.0[1] + 30 < bright.0[1] && dark.1 == bright.1,
+        dark.0[1] as u32 + 30 < bright.0[1] as u32 && dark.1 == bright.1,
         "{dark:?} {bright:?}"
     );
     assert_eq!(through, bright, "alpha hole cast a solid point shadow");

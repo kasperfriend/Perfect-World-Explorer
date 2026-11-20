@@ -1719,6 +1719,10 @@ fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool, overlay: bool) {
     screen_begin(at);
     temporal_begin();
     if frame.sampling.z!=0u { sun_cache_read = image[at].albedo_history & SUN_CACHE; }
+    // Clear the output pixel after reading sun cache so the overlay path
+    // starts with a zero raster color instead of stale data from a previous
+    // render call.
+    image[at] = pack_pixel(vec3<f32>(0.), 0., vec4<u32>(0u), 0u);
     var total = vec3<f32>(0.);
     var depth = 0.;
     var guide = vec4<u32>(0u);
@@ -1761,7 +1765,15 @@ fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool, overlay: bool) {
             image[at] = existing;
         }
     } else {
-        image[at] = pixel;
+        // Per-pixel depth test between world and moving geometry:
+        // keep the nearer surface (higher reverse-Z depth wins).
+        // The ray pass traces both feeds in intersect(), but depth-testing
+        // at output ensures the nearer surface always wins even when both
+        // feeds contribute to the same pixel.
+        let existing = image[at];
+        if existing.depth == 0. || pixel.depth > existing.depth {
+            image[at] = pixel;
+        }
     }
     temporal_end(at);
     screen_end();
