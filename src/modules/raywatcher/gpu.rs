@@ -1018,8 +1018,6 @@ impl Pipelines {
             layout: Some(&trace_pipeline),
             module: &trace_module,
             entry_point: "trace_pass",
-            compilation_options: Default::default(),
-            cache: None,
         });
         let compose_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("raywatcher compose"),
@@ -1053,24 +1051,18 @@ impl Pipelines {
             layout: Some(&compose_pipeline_layout),
             module: &compose_module,
             entry_point: "compose_pass",
-            compilation_options: Default::default(),
-            cache: None,
         });
         let temporal = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("raywatcher temporal"),
             layout: Some(&denoise_pipeline),
             module: &denoise_module,
             entry_point: "temporal_pass",
-            compilation_options: Default::default(),
-            cache: None,
         });
         let atrous = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("raywatcher atrous"),
             layout: Some(&denoise_pipeline),
             module: &denoise_module,
             entry_point: "atrous_pass",
-            compilation_options: Default::default(),
-            cache: None,
         });
         Self {
             trace,
