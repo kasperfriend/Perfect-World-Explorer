@@ -3103,7 +3103,8 @@ fn exercise_sun_and_history(h: &mut Harness) {
         h.ray.reset_history();
         let frame_pixels = h.pixels(frame, &empty);
         raw_frames.push(frame_pixels);
-        for ((mean, variance), pixel) in expected.iter_mut().zip(raw_frames.last().unwrap().iter()) {
+        for ((mean, variance), pixel) in expected.iter_mut().zip(raw_frames.last().unwrap().iter())
+        {
             let noise = f32::sqrt(*variance) / f32::max(0.04, *mean);
             let t = ((noise - 0.05) / 0.35).clamp(0., 1.);
             let alpha = f32::max(1. / i as f32, 0.10 - 0.065 * t * t * (3. - 2. * t));
