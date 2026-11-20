@@ -65,19 +65,37 @@ def test_module_start(lines):
 
 
 def load_allowances():
+    """`path:line category [note]`, or `path category [note] code: <snippet>`.
+
+    The second form keys on the code itself, so the allowance follows an edit that
+    moves it up or down the file. Both are returned; `by_code` maps
+    `(path, snippet)` to the set of allowance keys claiming it.
+    """
     out = {}
+    by_code = {}
     if not os.path.exists(ALLOW):
-        return out
+        return out, by_code
     for n, line in enumerate(open(ALLOW, encoding="utf-8"), 1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         parts = line.split(None, 2)
         if len(parts) < 2:
-            print(f"{ALLOW}:{n}: a line needs 'path:line category [note]'", file=sys.stderr)
+            print(
+                f"{ALLOW}:{n}: a line needs 'path:line category [note]' or "
+                "'path category [note] code: <snippet>'",
+                file=sys.stderr,
+            )
             sys.exit(2)
-        out[parts[0]] = (parts[1], parts[2] if len(parts) > 2 else "")
-    return out
+        key, cat, note = parts[0], parts[1], parts[2] if len(parts) > 2 else ""
+        out[key] = (cat, note)
+        if "code:" in note:
+            snippet = note.split("code:", 1)[1].strip()
+            if not snippet:
+                print(f"{ALLOW}:{n}: 'code:' needs a snippet after it", file=sys.stderr)
+                sys.exit(2)
+            by_code.setdefault((key, snippet), set()).add(key)
+    return out, by_code
 
 
 def enclosing_fn(lines, index):
@@ -108,11 +126,24 @@ def enclosing_fn(lines, index):
     return ""
 
 
-def classify(path, lineno, kind, line, context, allowances, enclosing_returns_option=False):
+def classify(
+    path, lineno, kind, line, context, allowances, enclosing_returns_option=False, by_code=None
+):
     """The category for one site: `named`, `fix`, `unreachable` or None."""
     key = f"{os.path.relpath(path, ROOT)}:{lineno}"
     if key in allowances:
         return allowances[key][0]
+    # A line number is a poor identity for code, and this file is edited often
+    # enough (four times in one afternoon) that a site's allowance went to
+    # whatever line moved into its place. So an allowance may also be written
+    # against the *code* it covers -- `path  <category>  <note>  code: <snippet>`
+    # -- and then follows the snippet wherever it goes. The line form stays for
+    # sites whose snippet is not distinctive; the snippet form is not guessed,
+    # it is matched exactly against the trimmed source line.
+    _rel = os.path.relpath(path, ROOT)
+    code = line.strip()
+    for akey in (by_code or {}).get((_rel, code), ()):
+        return allowances[akey][0]
     # A site is `named` when the surrounding few lines log a reason. This is
     # deliberately generous about *how* it logs -- eprintln!, crate::diag!,
     # log::, a reason string -- because the property that matters is that a
@@ -150,7 +181,7 @@ def classify(path, lineno, kind, line, context, allowances, enclosing_returns_op
 
 
 def main():
-    allowances = load_allowances()
+    allowances, by_code = load_allowances()
     rows = []
     unclassified = []
     for path in rust_sources():
@@ -168,7 +199,14 @@ def main():
                     re.search(r"->\s*Option\s*<", sig)
                 )
                 cat = classify(
-                    path, i + 1, kind, line, context, allowances, enclosing_returns_option
+                    path,
+                    i + 1,
+                    kind,
+                    line,
+                    context,
+                    allowances,
+                    enclosing_returns_option,
+                    by_code,
                 )
                 rel = os.path.relpath(path, ROOT)
                 if cat is None:
@@ -235,6 +273,11 @@ def main():
     # for something else -- which is how this file lost track twice while being
     # edited above the line it named.
     used = {f"{r[0]}:{r[1]}" for r in rows}
+    # A code-keyed allowance (`path category ... code: <snippet>`) is used when
+    # some site in that file carries the snippet; it has no line to compare.
+    for (cpath, csnippet), akeys in by_code.items():
+        if any(r[0] == cpath and r[4] == csnippet for r in rows):
+            used.update(akeys)
     stale = sorted(key for key in allowances if key not in used)
     if stale:
         print(

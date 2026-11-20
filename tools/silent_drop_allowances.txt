@@ -131,4 +131,4 @@ src/gfx_effect_gpu.rs:821 unreachable else-continue over an element kind this pa
 # is the caller's answer, not a loss: the name is only built after the range
 # check above has already proven `n` is in range. A stem-less path cannot occur
 # because a package rejected every path without a file stem when it opened.
-src/pck.rs:890 unreachable caller already range-checked n; the stem exists because Package::open rejects a path without one
+src/pck.rs unreachable caller already range-checked n; the stem exists because Package::open rejects a path without one; code: let mut name = self.path.file_stem().unwrap_or_default().to_os_string();
