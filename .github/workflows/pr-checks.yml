@@ -7,7 +7,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # `contents: write` is for the `ci-results` branch only: the measurement JSON
+  # is committed there because the job log is not readable from the agent's
+  # side, so a printed number is a number nobody can check.
+  contents: write
   pull-requests: write
 
 concurrency:
@@ -293,6 +296,75 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+      # The measurement channel. The job log comes back empty through the API,
+      # so every number the compatibility matrix needs is written as JSON and
+      # committed to a branch instead of printed. The matrix tool refuses to
+      # exit zero if any category came back `silent` -- a reader that returned
+      # nothing without a reason is the failure this whole exercise targets.
+      - name: Measure every staged client into ci-results
+        run: |
+          set -euo pipefail
+          rm -rf ci-results
+          mkdir -p ci-results
+          # Each client is a directory. The workflow stages them under
+          # /tmp/clients/<name>/ when a run provides them; a checkout without
+          # them records that fact rather than silently measuring nothing.
+          args=()
+          # The committed fixtures: real client bytes, small enough to check in.
+          # These are what make every cell measurable on this runner, because a
+          # checkout has no client install and CI cannot reach Drive.
+          for d in tests/fixtures/clients/*/; do
+            [ -d "$d" ] || continue
+            args+=("$(basename "$d")=$d")
+          done
+          # A run that stages real clients under /tmp/clients/ measures those too.
+          for d in /tmp/clients/*/; do
+            [ -d "$d" ] || continue
+            args+=("$(basename "$d")=$d")
+          done
+          if [ ${#args[@]} -eq 0 ]; then
+            # Nothing staged: write the marker the fail-step below looks for, so
+            # "no clients" is a *recorded* empty run and not a silent one.
+            printf '{"client":"none","cells":[],"note":"no client files were staged on this runner"}' \
+              > ci-results/none.json
+            echo "::notice::no client files staged; ci-results/none.json records that"
+          else
+            cargo run --locked --bin client-matrix-json -- ci-results "${args[@]}"
+          fi
+          # A missing file per client is a failed measurement, not a zero.
+          for f in ci-results/*.json; do
+            [ -s "$f" ] || { echo "::error::$f is empty"; exit 1; }
+          done
+      - name: Publish ci-results
+        if: always()
+        run: |
+          set -euo pipefail
+          [ -d ci-results ] || { echo "::error::ci-results was never written"; exit 1; }
+          # One file per client, and the job fails if any is missing.
+          count=$(ls -1 ci-results/*.json 2>/dev/null | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::ci-results holds no JSON; the measurement did not run"
+            exit 1
+          fi
+          echo "::notice::$count client JSON file(s) measured"
+          {
+            echo "### Client measurements"
+            echo ""
+            echo "| file | bytes |"
+            echo "|---|---|"
+            for f in ci-results/*.json; do
+              echo "| \`$(basename "$f")\` | $(wc -c < "$f") |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Commit to a separate branch so the results survive the run without
+          # touching the PR's own history.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan ci-results-tmp 2>/dev/null || git checkout ci-results-tmp
+          git rm -r --cached . >/dev/null 2>&1 || true
+          git add -f ci-results
+          git commit -q -m "ci-results: measurements from ${GITHUB_SHA}" || echo "no change"
+          git push -f origin HEAD:ci-results
       # Formatting is checked after the unit tests and before the Vulkan
       # installs: rustfmt needs no GPU, so it must not sit behind an
       # environment-sensitive step, but it must not run *before* the tests

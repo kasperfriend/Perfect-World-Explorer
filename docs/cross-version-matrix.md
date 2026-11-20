@@ -249,6 +249,32 @@ difference between "trees do not spawn" and "trees do not spawn, and here is
 why" — and in the shipped clients the reason being printed was the one that
 mattered: the cache was never built, because source preparation aborted first.
 
+### Correction: what the separator bug actually was
+
+The first version of this section said `tree_source.rs` "indexed `trees.pck` with
+raw backslashes". **That was half wrong**, and checking it changed the story:
+
+* `pck::directory` **already folds backslashes.** It decodes each record's
+  `szFileName[260]` through GBK and then does `decoded.replace('\\', "/")` before
+  building the `Entry`. So the pack side never produced a backslash.
+* The `.ecwld` tree table **also stores backslashes** — all 59 of the 1.8.4
+  world's names do, measured from the file.
+
+So both sides were backslashed, and the reader folded exactly one of them. The
+old lookup lower-cased the world's name and compared it with the pack's
+already-folded name, and the two never met:
+
+| side | as stored | as the old code compared it |
+|---|---|---|
+| `trees.pck` (via `pck::directory`) | `trees\精简树木\雪松\x.spt` | `trees/精简树木/雪松/x.spt` |
+| `world.ecwld` tree table | `Trees\精简树木\雪松\x.spt` | `trees\精简树木\雪松\x.spt` |
+
+The fix is the same rule as before — fold on both sides — but the *diagnosis* is
+that the reader was inconsistent with itself, not that the pack was unnormalised.
+`the_pack_returns_forward_slashes_while_the_world_stores_backslashes` asserts all
+four facts above from real bytes: the pack has no backslash, the world is all
+backslashes, the old lower-case key misses, and the shared rule makes them meet.
+
 ### The lookup that stopped every tree from being baked
 
 Trees do not fail in the reader; they fail in the *source preparation* that

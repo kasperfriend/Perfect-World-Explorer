@@ -1,0 +1,620 @@
+//! Emit one JSON file per client version describing what the readers can do.
+//!
+//! The job log is not readable from the agent's side, so a printed number is a
+//! number nobody can check. This binary writes `ci-results/<client>.json`
+//! instead: every cell the compatibility matrix needs, with the status word the
+//! matrix uses (`ok`, `named-refusal`, `silent`, `absent`, `blocked`) and the
+//! reason string when it is not `ok`.
+//!
+//! `silent` is the status that must never appear. It means a reader returned
+//! nothing without saying why, which is the failure class this whole exercise
+//! exists to eliminate: a map that draws no trees and prints no reason.
+//!
+//! Usage:
+//!   client-matrix-json <out-dir> <client-name>=<client-root> [more...]
+//!
+//! A client root is a directory holding `element/` (or one that IS `element`)
+//! plus whatever the client ships beside it.
+#![allow(dead_code)]
+#[path = "../angelica_pck.rs"]
+mod angelica_pck;
+#[path = "../client_detect.rs"]
+mod client_detect;
+#[path = "../model_dds.rs"]
+mod model_dds;
+#[path = "../music.rs"]
+mod music;
+#[path = "../pck.rs"]
+mod pck;
+#[path = "../scene.rs"]
+mod scene;
+#[path = "../terrain_block.rs"]
+mod terrain_block;
+#[path = "../water.rs"]
+mod water;
+
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+/// One row of the matrix: what a category did for this client.
+struct Cell {
+    category: &'static str,
+    status: &'static str,
+    detail: String,
+}
+
+impl Cell {
+    fn ok(category: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            category,
+            status: "ok",
+            detail: detail.into(),
+        }
+    }
+    fn refused(category: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            category,
+            status: "named-refusal",
+            detail: detail.into(),
+        }
+    }
+    fn absent(category: &'static str) -> Self {
+        Self {
+            category,
+            status: "absent",
+            detail: "this client ships no such file in the staged corpus".into(),
+        }
+    }
+    fn silent(category: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            category,
+            status: "silent",
+            detail: detail.into(),
+        }
+    }
+}
+
+/// A JSON string with the characters that would break the document escaped.
+///
+/// Written by hand rather than pulling in `serde`: this binary is compiled by a
+/// job that has no network, and one escaping function is cheaper than a
+/// dependency. Control characters become `\u00XX`, which is what serde does.
+fn esc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn walk(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            walk(&p, name, out);
+        } else if p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        {
+            out.push(p);
+        }
+    }
+}
+
+/// The directory that holds `elementclient.exe`'s data: `<root>/element` when
+/// the root is a client folder, or the root itself when it is already one.
+fn element_of(root: &Path) -> PathBuf {
+    if root.join("element").is_dir() {
+        root.join("element")
+    } else {
+        root.to_path_buf()
+    }
+}
+
+/// `world.ecwld`, wherever this client keeps it.
+fn world_file(element: &Path) -> Option<PathBuf> {
+    let mut all = Vec::new();
+    walk(&element.join("maps"), "world.ecwld", &mut all);
+    all.sort();
+    // Prefer the shallowest path: `maps/world/world.ecwld`.
+    all.into_iter().next()
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut it = args.into_iter();
+    let Some(out_dir) = it.next().map(PathBuf::from) else {
+        eprintln!("usage: client-matrix-json <out-dir> <name>=<root> [...]");
+        std::process::exit(2);
+    };
+    let clients: Vec<(String, PathBuf)> = it
+        .filter_map(|a| a.split_once('=').map(|(n, p)| (n.to_string(), PathBuf::from(p))))
+        .collect();
+    if clients.is_empty() {
+        eprintln!("no clients given");
+        std::process::exit(2);
+    }
+    std::fs::create_dir_all(&out_dir).expect("create out dir");
+
+    let mut any_silent = false;
+    for (name, root) in &clients {
+        let element = element_of(root);
+        let mut cells: Vec<Cell> = Vec::new();
+        let mut facts: Vec<(&str, String)> = Vec::new();
+
+        // --- the client's declared data version
+        let elements_data = element.join("elements.data");
+        if elements_data.is_file() {
+            let bytes = std::fs::read(&elements_data).unwrap_or_default();
+            match client_detect::ElementsHeader::parse(&bytes) {
+                Some(h) => {
+                    facts.push((
+                        "elementsVersion",
+                        format!("{}", h.version()),
+                    ));
+                    facts.push(("elementsWord", format!("{:#010x}", h.canonical())));
+                    facts.push(("elementsFamily", format!("{:#06x}", h.family())));
+                    cells.push(Cell::ok(
+                        "elements data",
+                        format!(
+                            "v{} (family {:#06x}), timestamp {:#010x}",
+                            h.version(),
+                            h.family(),
+                            h.timestamp
+                        ),
+                    ));
+                }
+                None => cells.push(Cell::refused(
+                    "elements data",
+                    "shorter than its 8-byte header",
+                )),
+            }
+        } else {
+            cells.push(Cell::absent("elements data"));
+        }
+        let tasks_data = element.join("tasks.data");
+        if tasks_data.is_file() {
+            let bytes = std::fs::read(&tasks_data).unwrap_or_default();
+            let v = bytes
+                .get(0..4)
+                .map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+            match v {
+                Some(w) => cells.push(Cell::ok("tasks data", format!("version word {w}"))),
+                None => cells.push(Cell::refused("tasks data", "shorter than 4 bytes")),
+            }
+        } else {
+            cells.push(Cell::absent("tasks data"));
+        }
+
+        // --- the world file, which is where trees, terrain, water and refs live
+        let world = world_file(&element);
+        let mut scene_parsed = None;
+        match &world {
+            Some(path) => match scene::Scene::load(path) {
+                Ok(s) => {
+                    let trees: usize = s.blocks.iter().map(|b| b.trees.len()).sum();
+                    let grass: usize = s.blocks.iter().map(|b| b.grass.len()).sum();
+                    let water_refs: usize = s.blocks.iter().map(|b| b.water.len()).sum();
+                    let models: usize = s.blocks.iter().map(|b| b.models.len()).sum();
+                    let effects: usize = s.blocks.iter().map(|b| b.effects.len()).sum();
+                    let sounds: usize = s.blocks.iter().map(|b| b.sounds.len()).sum();
+                    facts.push(("ecwldBlocks", format!("{}", s.blocks.len())));
+                    facts.push(("ecwldTreeTypes", format!("{}", s.tree_types.len())));
+                    facts.push(("ecwldTreePlacements", format!("{trees}")));
+                    facts.push(("ecwldGrassTypes", format!("{}", s.grass_types.len())));
+                    facts.push(("ecwldGrassPlacements", format!("{grass}")));
+                    facts.push(("ecwldWaterRefs", format!("{water_refs}")));
+                    facts.push(("ecwldModels", format!("{models}")));
+                    facts.push(("ecwldEffects", format!("{effects}")));
+                    facts.push(("ecwldSounds", format!("{sounds}")));
+                    cells.push(Cell::ok(
+                        "world ECWLD",
+                        format!(
+                            "{} blocks, {}x{} grid, tree types {}",
+                            s.blocks.len(),
+                            s.rows,
+                            s.cols,
+                            s.tree_types.len()
+                        ),
+                    ));
+                    cells.push(Cell::ok(
+                        "trees",
+                        format!(
+                            "{} types, {trees} placements",
+                            s.tree_types.len()
+                        ),
+                    ));
+                    cells.push(Cell::ok(
+                        "grass",
+                        format!("{} types, {grass} placements", s.grass_types.len()),
+                    ));
+                    scene_parsed = Some(s);
+                }
+                Err(e) => {
+                    cells.push(Cell::refused("world ECWLD", e.clone()));
+                    cells.push(Cell::refused("trees", "the world file did not parse"));
+                    cells.push(Cell::refused("grass", "the world file did not parse"));
+                }
+            },
+            None => {
+                cells.push(Cell::absent("world ECWLD"));
+                cells.push(Cell::absent("trees"));
+                cells.push(Cell::absent("grass"));
+            }
+        }
+
+        // --- water areas, which are BSData beside the maps
+        match &scene_parsed {
+            Some(s) => match water::load(s, &element) {
+                Ok(areas) => {
+                    cells.push(Cell::ok("water (BSData)", format!("{} areas", areas.len())))
+                }
+                Err(e) => cells.push(Cell::refused("water (BSData)", e)),
+            },
+            None => cells.push(Cell::refused(
+                "water (BSData)",
+                "cannot be looked for: the world file did not parse, and water \
+                 is loaded relative to it",
+            )),
+        }
+
+        // --- every package this client ships: the trailers and the counts
+        let mut packs: Vec<PathBuf> = Vec::new();
+        if element.is_dir() {
+            if let Ok(rd) = std::fs::read_dir(&element) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension()
+                        .and_then(|x| x.to_str())
+                        .is_some_and(|x| x.eq_ignore_ascii_case("pck"))
+                    {
+                        packs.push(p);
+                    }
+                }
+            }
+        }
+        packs.sort();
+        let mut trailing = Vec::new();
+        let mut angelica = Vec::new();
+        for pack in &packs {
+            let short = pack
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+                .to_string();
+            // The retail container first; its guard pair decides.
+            match File::open(pack) {
+                Ok(mut f) => match pck::directory(&mut f) {
+                    Ok(entries) => {
+                        trailing.push(format!("{}:retail:{}", esc(&short), entries.len()))
+                    }
+                    Err(retail_err) => {
+                        // The second container, which shares the prefix but not
+                        // the directory scheme.
+                        match angelica_pck::directory(&mut f) {
+                            Ok(entries) => {
+                                angelica.push(format!("{}:angelica:{}", esc(&short), entries.len()))
+                            }
+                            Err(angelica_err) => trailing.push(format!(
+                                "{}:refused:{}",
+                                esc(&short),
+                                esc(&format!("{retail_err}; also {angelica_err}"))
+                            )),
+                        }
+                    }
+                },
+                Err(e) => trailing.push(format!(
+                    "{}:open-failed:{}",
+                    esc(&short),
+                    esc(&e.to_string())
+                )),
+            }
+        }
+        if packs.is_empty() {
+            cells.push(Cell::absent("package trailers (pck)"));
+        } else {
+            let refusals = trailing
+                .iter()
+                .filter(|s| s.contains(":refused:") || s.contains(":open-failed:"))
+                .count();
+            if refusals == 0 {
+                cells.push(Cell::ok(
+                    "package trailers (pck)",
+                    format!("{} packs, all directories read", trailing.len()),
+                ));
+            } else {
+                cells.push(Cell::refused(
+                    "package trailers (pck)",
+                    format!("{refusals} of {} packs refused", trailing.len()),
+                ));
+            }
+            facts.push(("packs", trailing.join(" ")));
+            if !angelica.is_empty() {
+                facts.push(("angelicaPacks", angelica.join(" ")));
+                cells.push(Cell::ok(
+                    "package trailers (angelica)",
+                    format!("{} packs read as the second container", angelica.len()),
+                ));
+            } else {
+                cells.push(Cell::absent("package trailers (angelica)"));
+            }
+        }
+
+        // --- GFX effects inside gfx.pck
+        let gfx = element.join("gfx.pck");
+        if gfx.is_file() {
+            match File::open(&gfx) {
+                Ok(mut f) => match pck::directory(&mut f) {
+                    Ok(entries) => {
+                        let roots = entries
+                            .iter()
+                            .filter(|e| e.name.to_lowercase().ends_with(".gfx"))
+                            .count();
+                        facts.push(("gfxEntries", format!("{}", entries.len())));
+                        facts.push(("gfxRoots", format!("{roots}")));
+                        cells.push(Cell::ok(
+                            "GFX effects",
+                            format!("{} entries, {roots} .gfx roots", entries.len()),
+                        ));
+                    }
+                    Err(e) => cells.push(Cell::refused("GFX effects", e)),
+                },
+                Err(e) => cells.push(Cell::refused("GFX effects", e.to_string())),
+            }
+        } else {
+            cells.push(Cell::absent("GFX effects"));
+        }
+
+        // --- DDS textures inside models.pck / litmodels.pck
+        let mut dds_pack = None;
+        for stem in ["models.pck", "litmodels.pck"] {
+            let p = element.join(stem);
+            if p.is_file() {
+                dds_pack = Some(p);
+                break;
+            }
+        }
+        match dds_pack {
+            Some(p) => match File::open(&p) {
+                Ok(mut f) => match pck::directory(&mut f) {
+                    Ok(entries) => {
+                        let dds: Vec<_> = entries
+                            .iter()
+                            .filter(|e| e.name.to_lowercase().ends_with(".dds"))
+                            .collect();
+                        facts.push(("ddsEntries", format!("{}", dds.len())));
+                        // Sample the formats: reading every texture would take
+                        // minutes, and the cell only needs to know which formats
+                        // are present and which the parser accepts.
+                        let mut seen = std::collections::BTreeMap::new();
+                        for e in dds.iter().take(400) {
+                            match pck::read_entry(&mut f, e) {
+                                Ok(bytes) => match model_dds::Dds::parse(&bytes) {
+                                    Ok(d) => {
+                                        *seen.entry(format!("{:?}", d.format)).or_insert(0) += 1
+                                    }
+                                    Err(err) => {
+                                        let first = err.lines().next().unwrap_or("");
+                                        *seen.entry(format!("refused: {first}")).or_insert(0) += 1
+                                    }
+                                },
+                                Err(err) => {
+                                    *seen.entry(format!("read-failed: {err}")).or_insert(0) += 1
+                                }
+                            }
+                        }
+                        let summary = seen
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        facts.push(("ddsFormats", esc(&summary)));
+                        let refused = seen.keys().filter(|k| k.starts_with("refused:")).count();
+                        if refused == 0 {
+                            cells.push(Cell::ok(
+                                "DDS textures",
+                                format!("{} DDS entries, formats {summary}", dds.len()),
+                            ));
+                        } else {
+                            cells.push(Cell::refused(
+                                "DDS textures",
+                                format!("{refused} format(s) refused: {summary}"),
+                            ));
+                        }
+                    }
+                    Err(e) => cells.push(Cell::refused("DDS textures", e)),
+                },
+                Err(e) => cells.push(Cell::refused("DDS textures", e.to_string())),
+            },
+            None => cells.push(Cell::absent("DDS textures")),
+        }
+
+        // --- music precinct
+        let mut precincts = Vec::new();
+        walk(&element.join("maps"), "precinct.clt", &mut precincts);
+        precincts.sort();
+        if precincts.is_empty() {
+            cells.push(Cell::absent("music precinct"));
+        } else {
+            let mut ok = 0;
+            let mut refused = Vec::new();
+            let mut zone_total = 0usize;
+            for p in &precincts {
+                // `Zones::open` is the reader the application uses: it decodes
+                // the UTF-16 file the client ships and then parses it.
+                match music::Zones::open(p) {
+                    Ok(v) => {
+                        ok += 1;
+                        zone_total += v.zones.len();
+                    }
+                    Err(e) => refused.push(format!("{}: {e}", p.display())),
+                }
+            }
+            if facts.iter().all(|(k, _)| *k != "precinctZones") {
+                facts.push(("precinctZones", format!("{zone_total}")));
+            }
+            if refused.is_empty() {
+                cells.push(Cell::ok(
+                    "music precinct",
+                    format!("{ok} precinct.clt files"),
+                ));
+            } else {
+                cells.push(Cell::refused("music precinct", refused.join("; ")));
+            }
+        }
+
+        // --- sounds and zone names ride on the parsed scene
+        match &scene_parsed {
+            Some(s) => {
+                let sounds: usize = s.blocks.iter().map(|b| b.sounds.len()).sum();
+                cells.push(Cell::ok("sounds", format!("{sounds} authored sound refs")));
+                cells.push(Cell::ok(
+                    "zone names",
+                    "the ECWLD carries no zone table; zone names are the precinct's \
+                     (see the music precinct row)",
+                ));
+            }
+            None => {
+                cells.push(Cell::refused("sounds", "the world file did not parse"));
+                cells.push(Cell::refused("zone names", "the world file did not parse"));
+            }
+        }
+
+        // --- instances: the other .ecwld files beside the world
+        let mut ecwlds = Vec::new();
+        walk(&element.join("maps"), "a*.ecwld", &mut ecwlds);
+        let mut instance_names: Vec<String> = Vec::new();
+        if element.join("maps").is_dir() {
+            if let Ok(rd) = std::fs::read_dir(element.join("maps")) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        if let Ok(inner) = std::fs::read_dir(&p) {
+                            for f in inner.flatten() {
+                                let q = f.path();
+                                if q.extension()
+                                    .and_then(|x| x.to_str())
+                                    .is_some_and(|x| x.eq_ignore_ascii_case("ecwld"))
+                                {
+                                    ecwlds.push(q);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ecwlds.sort();
+        ecwlds.dedup();
+        let mut inst_ok = 0;
+        let mut inst_tree_types = Vec::new();
+        for p in &ecwlds {
+            if let Ok(s) = scene::Scene::load(p) {
+                inst_ok += 1;
+                let trees: usize = s.blocks.iter().map(|b| b.trees.len()).sum();
+                let stem = p
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+                    .to_string();
+                instance_names.push(stem.clone());
+                inst_tree_types.push(format!("{stem}:{}types/{trees}trees", s.tree_types.len()));
+            }
+        }
+        if ecwlds.is_empty() {
+            cells.push(Cell::absent("instances"));
+        } else {
+            facts.push(("instances", esc(&inst_tree_types.join(" "))));
+            if inst_ok == ecwlds.len() {
+                cells.push(Cell::ok(
+                    "instances",
+                    format!("{inst_ok} instance maps: {}", inst_tree_types.join(" ")),
+                ));
+            } else {
+                cells.push(Cell::refused(
+                    "instances",
+                    format!("{} of {} instance maps refused", ecwlds.len() - inst_ok, ecwlds.len()),
+                ));
+            }
+        }
+
+        // --- terrain T2BK and lightmaps T2LM
+        let mut t2bk = Vec::new();
+        walk(&element.join("maps"), "t2bk", &mut t2bk);
+        let mut t2lm = Vec::new();
+        walk(&element.join("maps"), "t2lm", &mut t2lm);
+        cells.push(if t2bk.is_empty() {
+            Cell::absent("terrain T2BK")
+        } else {
+            Cell::ok("terrain T2BK", format!("{} files staged", t2bk.len()))
+        });
+        cells.push(if t2lm.is_empty() {
+            Cell::absent("lightmaps T2LM")
+        } else {
+            Cell::ok("lightmaps T2LM", format!("{} files staged", t2lm.len()))
+        });
+
+        // --- write the client's JSON
+        for c in &cells {
+            if c.status == "silent" {
+                any_silent = true;
+            }
+        }
+        let mut doc = String::new();
+        doc.push_str("{\n");
+        doc.push_str(&format!("  \"client\": \"{}\",\n", esc(name)));
+        doc.push_str(&format!("  \"root\": \"{}\",\n", esc(&root.display().to_string())));
+        doc.push_str("  \"facts\": {");
+        for (i, (k, v)) in facts.iter().enumerate() {
+            if i > 0 {
+                doc.push(',');
+            }
+            let value = if v.chars().all(|c| c.is_ascii_digit() || c == '-') && !v.is_empty() {
+                v.clone()
+            } else {
+                format!("\"{}\"", esc(v))
+            };
+            doc.push_str(&format!("\n    \"{k}\": {value}"));
+        }
+        doc.push_str("\n  },\n  \"cells\": [\n");
+        for (i, c) in cells.iter().enumerate() {
+            doc.push_str(&format!(
+                "    {{\"category\": \"{}\", \"status\": \"{}\", \"detail\": \"{}\"}}{}\n",
+                esc(c.category),
+                c.status,
+                esc(&c.detail),
+                if i + 1 < cells.len() { "," } else { "" }
+            ));
+        }
+        doc.push_str("  ]\n}\n");
+        let path = out_dir.join(format!("{name}.json"));
+        std::fs::write(&path, &doc).expect("write json");
+        let silent = cells.iter().filter(|c| c.status == "silent").count();
+        println!(
+            "{}: {} cells, {} ok, {} refused, {} absent, {} SILENT -> {}",
+            name,
+            cells.len(),
+            cells.iter().filter(|c| c.status == "ok").count(),
+            cells.iter().filter(|c| c.status == "named-refusal").count(),
+            cells.iter().filter(|c| c.status == "absent").count(),
+            silent,
+            path.display()
+        );
+    }
+    if any_silent {
+        eprintln!("SILENT cells present: a reader returned nothing without a reason");
+        std::process::exit(1);
+    }
+}
