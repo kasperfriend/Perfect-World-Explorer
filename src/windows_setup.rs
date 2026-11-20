@@ -15,6 +15,8 @@ use std::{
 };
 const BRIDGE: &[u8] = include_bytes!("../tools/speedtree/speedtree-bake.exe");
 type Hwnd = *mut c_void;
+/// A GDI/Win32 handle, the same pointer shape as [`Hwnd`].
+type Handle = *mut c_void;
 #[repr(C)]
 struct BrowseInfo {
     owner: Hwnd,
@@ -468,10 +470,14 @@ extern "system" {
 struct LoadingArt {
     /// `BITMAPINFOHEADER` followed by top-down 32-bit BGRA pixels.
     bits: Vec<u8>,
-    /// The same pixels blended with the status strip, in RGBA. A window resize
-    /// refits and re-blends from here, so the source picture does not have to be
-    /// decoded or cloned a second time.
-    rgba: Vec<u8>,
+    /// The picture exactly as it was decoded from the archive.
+    ///
+    /// A window resize must re-fit from this, never from the previous output:
+    /// `fill` crops the source to cover the target, so re-fitting an already
+    /// cropped frame crops it a second time and the picture looks zoomed in and
+    /// clipped on every side. The initial decode does not know the real client
+    /// area yet, so this is the only way a later fit can be correct.
+    source: image::RgbaImage,
     width: u32,
     height: u32,
     /// Archive path of the picture, shown in the window so a screenshot names
@@ -511,7 +517,7 @@ impl LoadingArt {
         bits.extend_from_slice(&crate::loading_screen::to_bgra(&blended));
         Ok(Self {
             bits,
-            rgba: blended,
+            source: image.clone(),
             width,
             height,
             label,
@@ -536,18 +542,31 @@ impl LoadingArt {
         }
     }
 
-    /// Re-fit the retained pixels to a new client size.
+    /// Re-fit the original picture to a new client size.
+    ///
+    /// Fitting from `self.source` rather than from the current `bits` is what
+    /// keeps a resize from compounding the cover crop: `fill` always crops the
+    /// source to the target's aspect, so feeding it the previous, already
+    /// cropped result would zoom in once per resize event.
     fn refit(&mut self, width: u32, height: u32) -> Result<(), String> {
-        let width = width.max(320);
-        let height = height.max(240);
-        if width == self.width && height == self.height {
+        let width = width.max(MIN_ART_WIDTH);
+        let height = height.max(MIN_ART_HEIGHT);
+        if self.matches(width, height) {
             return Ok(());
         }
-        let source =
-            image::RgbaImage::from_raw(self.width, self.height, std::mem::take(&mut self.rgba))
-                .ok_or_else(|| "fitted loading artwork no longer matches its size".to_string())?;
+        let source = self.source.clone();
         *self = Self::new(&source, width, height, self.label.clone())?;
         Ok(())
+    }
+
+    /// True when the fitted surface already covers a `width` x `height` client
+    /// area.
+    ///
+    /// The comparison applies the same floor `refit` does. Without that, a
+    /// window smaller than the floor would never compare equal and every single
+    /// paint would re-fit and re-compose the whole frame.
+    fn matches(&self, width: u32, height: u32) -> bool {
+        self.width == width.max(MIN_ART_WIDTH) && self.height == height.max(MIN_ART_HEIGHT)
     }
 }
 
@@ -571,7 +590,10 @@ unsafe fn client_size(window: Hwnd) -> (u32, u32) {
 
 fn paint_loading_art(dc: *mut c_void, art: &LoadingArt) {
     unsafe {
-        launcher_ui::fill_rect(dc, 0, 0, art.width as i32, art.height as i32, 0);
+        // No black pre-fill: `SRCCOPY` already replaces every pixel in the
+        // destination rectangle, and on a composited desktop a surface can be
+        // presented between two GDI calls, so painting black first showed up as
+        // a flash. The artwork is the first thing drawn.
         launcher_ui::StretchDIBits(
             dc,
             0,
@@ -590,12 +612,66 @@ fn paint_loading_art(dc: *mut c_void, art: &LoadingArt) {
     }
 }
 
+/// Blit only `top..bottom` of the artwork.
+///
+/// The picture is a top-down DIB, so a row slice of the source maps one-to-one
+/// onto the destination rows; `StretchDIBits` is given the sub-rectangle so a
+/// bar-only repaint does not re-upload a full-screen bitmap.
+fn paint_loading_art_band(dc: *mut c_void, art: &LoadingArt, top: i32, bottom: i32, width: u32) {
+    let top = top.max(0);
+    let bottom = bottom.min(art.height as i32);
+    if bottom <= top {
+        return;
+    }
+    let rows = bottom - top;
+    // The window can be wider than the fitted picture if it grew between the
+    // WM_SIZE that refitted it and this paint; only the overlap is copied and
+    // the remainder is the window's own background.
+    let columns = width.min(art.width) as i32;
+    if columns <= 0 {
+        return;
+    }
+    unsafe {
+        launcher_ui::StretchDIBits(
+            dc,
+            0,
+            top,
+            columns,
+            rows,
+            0,
+            top,
+            columns,
+            rows,
+            art.pixels(),
+            art.info(),
+            0,
+            0x00cc0020, // SRCCOPY
+        );
+    }
+}
+
 /// Draw the status overlay: the DirectStorage state, the throughput graph, the
 /// read totals, the current progress message and an indeterminate loading bar.
 ///
 /// The dark strip behind these rows is already blended into the artwork bitmap,
 /// so this only draws text and the bar.
 fn paint_loading_overlay(dc: *mut c_void, width: u32, height: u32, state: &LoadingWindowState) {
+    paint_loading_overlay_band(dc, width, height, state, 0, height as i32);
+}
+
+/// Draw the overlay, touching only rows `top..bottom`.
+///
+/// GDI has no per-call clip in this path, so the band is applied by skipping
+/// any primitive that lies outside it. The five text lines and the bar are
+/// independent rectangles, so this keeps a bar-only repaint to the bar.
+fn paint_loading_overlay_band(
+    dc: *mut c_void,
+    width: u32,
+    height: u32,
+    state: &LoadingWindowState,
+    top: i32,
+    bottom: i32,
+) {
     let width = width as i32;
     let height = height as i32;
     // A 178-pixel strip would cover a tiny window entirely and put its text
@@ -604,79 +680,95 @@ fn paint_loading_overlay(dc: *mut c_void, width: u32, height: u32, state: &Loadi
     let strip = (height / 3).min(OVERLAY_STRIP_HEIGHT as i32).max(64);
     let margin = (width / 40).clamp(10, 28);
     let text_top = height - strip + 22;
+    // Does a row range intersect the band being repainted? The band is either
+    // the whole window (a status change) or the bar strip (the sweep tick), so
+    // this is the only clip the overlay needs.
+    let intersects = |row_top: i32, row_bottom: i32| row_top < bottom && row_bottom > top;
     unsafe {
-        launcher_ui::draw_text(
-            dc,
-            margin,
-            text_top,
-            "PERFECT WORLD EXPLORER  —  LOADING WORLD",
-            15,
-            700,
-            launcher_ui::rgb(214, 236, 235),
-        );
-        launcher_ui::draw_text(
-            dc,
-            margin,
-            text_top + 26,
-            &state.status,
-            13,
-            400,
-            launcher_ui::rgb(233, 244, 243),
-        );
-        launcher_ui::draw_text(
-            dc,
-            margin,
-            text_top + 48,
-            &state.ds_state,
-            12,
-            400,
-            launcher_ui::rgb(176, 214, 210),
-        );
-        launcher_ui::draw_text(
-            dc,
-            margin,
-            text_top + 68,
-            &state.graph,
-            12,
-            400,
-            launcher_ui::rgb(176, 214, 210),
-        );
-        launcher_ui::draw_text(
-            dc,
-            margin,
-            text_top + 88,
-            &state.totals,
-            11,
-            400,
-            launcher_ui::rgb(150, 186, 184),
-        );
+        if intersects(text_top, text_top + 20) {
+            launcher_ui::draw_text(
+                dc,
+                margin,
+                text_top,
+                "PERFECT WORLD EXPLORER  —  LOADING WORLD",
+                15,
+                700,
+                launcher_ui::rgb(214, 236, 235),
+            );
+        }
+        if intersects(text_top + 26, text_top + 26 + 20) {
+            launcher_ui::draw_text(
+                dc,
+                margin,
+                text_top + 26,
+                &state.status,
+                13,
+                400,
+                launcher_ui::rgb(233, 244, 243),
+            );
+        }
+        if intersects(text_top + 48, text_top + 48 + 20) {
+            launcher_ui::draw_text(
+                dc,
+                margin,
+                text_top + 48,
+                &state.ds_state,
+                12,
+                400,
+                launcher_ui::rgb(176, 214, 210),
+            );
+        }
+        if intersects(text_top + 68, text_top + 68 + 20) {
+            launcher_ui::draw_text(
+                dc,
+                margin,
+                text_top + 68,
+                &state.graph,
+                12,
+                400,
+                launcher_ui::rgb(176, 214, 210),
+            );
+        }
+        if intersects(text_top + 88, text_top + 88 + 20) {
+            launcher_ui::draw_text(
+                dc,
+                margin,
+                text_top + 88,
+                &state.totals,
+                11,
+                400,
+                launcher_ui::rgb(150, 186, 184),
+            );
+        }
         // Indeterminate bar: the fill sweeps forward and back, so the load is
         // visibly alive without claiming a percentage the loader does not have.
         let bar_top = height - 26;
         let bar_width = (width - margin * 2).max(120);
-        launcher_ui::fill_rect(
-            dc,
-            margin,
-            bar_top,
-            bar_width,
-            6,
-            launcher_ui::rgb(38, 66, 74),
-        );
-        let sweep = (bar_width / 4).max(48);
-        let travel = (bar_width - sweep).max(1) as f32;
-        let position = ((state.phase.sin() * 0.5 + 0.5) * travel) as i32;
-        launcher_ui::fill_rect(
-            dc,
-            margin + position,
-            bar_top,
-            sweep,
-            6,
-            launcher_ui::rgb(122, 214, 199),
-        );
+        if intersects(bar_top, bar_top + 6) {
+            launcher_ui::fill_rect(
+                dc,
+                margin,
+                bar_top,
+                bar_width,
+                6,
+                launcher_ui::rgb(38, 66, 74),
+            );
+            let sweep = (bar_width / 4).max(48);
+            let travel = (bar_width - sweep).max(1) as f32;
+            let position = ((state.phase.sin() * 0.5 + 0.5) * travel) as i32;
+            launcher_ui::fill_rect(
+                dc,
+                margin + position,
+                bar_top,
+                sweep,
+                6,
+                launcher_ui::rgb(122, 214, 199),
+            );
+        }
         // The artwork's archive path (or the reason there is none) in the
         // corner: it names the picture, so a report of the loading screen is
         // checkable against the client's own archive.
-        if !state.note.is_empty() {
+        if !state.note.is_empty() && intersects(height - 48, height - 28) {
             let note_width = launcher_ui::text_width(dc, &state.note, 10);
             launcher_ui::draw_text(
                 dc,
@@ -720,7 +812,102 @@ fn loading_state() -> &'static std::sync::Mutex<Option<LoadingWindowState>> {
     LOADING_WINDOW_STATE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-/// `WM_PAINT`: cover the client area with the artwork, then the status overlay.
+/// The window's back buffer: one off-screen surface, resized only when the
+/// client area changes.
+///
+/// The loading window repaints about 25 times a second, and every repaint used
+/// to draw the picture, five text lines and two rectangles straight into the
+/// window's device context. A composited desktop can present that surface
+/// part-way through, so a partially drawn frame reached the screen and the
+/// window appeared to flash. Composing into a memory DC and presenting the
+/// finished frame with a single `BitBlt` makes each frame atomic: either the
+/// previous complete frame or the new complete frame is on screen, never a
+/// half-painted one.
+struct BackBuffer {
+    /// Raw handles are stored as `usize` so the type is `Send`; that is what
+    /// lets one process-wide `Mutex<BackBuffer>` hold it. GDI objects are
+    /// process-wide and used from the single window thread here.
+    memory_dc: usize,
+    bitmap: usize,
+    previous: usize,
+    width: i32,
+    height: i32,
+}
+
+impl BackBuffer {
+    const EMPTY: Self = Self {
+        memory_dc: 0,
+        bitmap: 0,
+        previous: 0,
+        width: 0,
+        height: 0,
+    };
+
+    /// A `width` x `height` memory DC compatible with `dc`, reusing the existing
+    /// surface when the size still matches.
+    ///
+    /// Returns `true` when a surface was created, because a fresh bitmap holds
+    /// undefined pixels and the caller must compose all of it rather than only
+    /// the dirty band.
+    unsafe fn resize(&mut self, dc: Handle, width: i32, height: i32) -> bool {
+        if self.memory_dc != 0 && self.width == width && self.height == height {
+            return false;
+        }
+        self.release();
+        let memory_dc = launcher_ui::CreateCompatibleDC(dc);
+        if memory_dc.is_null() {
+            return false;
+        }
+        let bitmap = launcher_ui::CreateCompatibleBitmap(dc, width, height);
+        if bitmap.is_null() {
+            launcher_ui::DeleteDC(memory_dc);
+            return false;
+        }
+        // The old bitmap comes back so it can be deleted after the DC is done
+        // with it; leaking it would exhaust GDI handles over a long load.
+        let previous = launcher_ui::SelectObject(memory_dc, bitmap);
+        self.memory_dc = memory_dc as usize;
+        self.bitmap = bitmap as usize;
+        self.previous = previous as usize;
+        self.width = width;
+        self.height = height;
+        true
+    }
+
+    /// The off-screen device context, or null when none could be created.
+    fn dc(&self) -> Handle {
+        self.memory_dc as Handle
+    }
+
+    unsafe fn release(&mut self) {
+        if self.memory_dc != 0 {
+            let memory_dc = self.memory_dc as Handle;
+            if self.previous != 0 {
+                launcher_ui::SelectObject(memory_dc, self.previous as Handle);
+            }
+            launcher_ui::DeleteDC(memory_dc);
+        }
+        if self.bitmap != 0 {
+            launcher_ui::DeleteObject(self.bitmap as Handle);
+        }
+        *self = Self::EMPTY;
+    }
+}
+
+/// The one back buffer the paint handler composes into, guarded because the
+/// window procedure is re-entered from the loading thread's message pump.
+static BACK_BUFFER: std::sync::OnceLock<std::sync::Mutex<BackBuffer>> = std::sync::OnceLock::new();
+
+fn back_buffer() -> &'static std::sync::Mutex<BackBuffer> {
+    BACK_BUFFER.get_or_init(|| std::sync::Mutex::new(BackBuffer::EMPTY))
+}
+
+/// `WM_PAINT`: compose the whole frame off-screen, then present it once.
+///
+/// The update rectangle is honoured: the animation tick invalidates only the
+/// bar strip, and repainting a full-screen bitmap for a six-pixel bar would
+/// waste the frame budget and give a composited desktop a chance to catch a
+/// half-drawn surface.
 unsafe fn paint_loading_window(hwnd: Hwnd) {
     let mut paint: launcher_ui::Paint = std::mem::zeroed();
     let dc = launcher_ui::BeginPaint(hwnd, &mut paint);
@@ -728,19 +915,118 @@ unsafe fn paint_loading_window(hwnd: Hwnd) {
         return;
     }
     let (width, height) = client_size(hwnd);
+    // `rcPaint` is in client coordinates; a zero-area rectangle means the
+    // update region was empty, so there is nothing to compose.
+    let update_top = paint.rect.top.max(0);
+    let update_bottom = paint.rect.bottom.min(height as i32);
+    // An empty update region (or one entirely outside the client area) means
+    // there is nothing to compose. Rows are what the band compositor works in,
+    // so only the vertical extent is needed; the client width is the horizontal
+    // extent for every primitive in this paint path.
+    if paint.rect.left >= width as i32 || paint.rect.right <= 0 || update_bottom <= update_top {
+        launcher_ui::EndPaint(hwnd, &paint);
+        return;
+    }
     let background = launcher_ui::rgb(12, 24, 30);
-    // A poisoned lock must never leave the window blank: fall back to a plain
-    // dark fill instead of panicking on the paint thread.
+    let mut buffer = match back_buffer().lock() {
+        Ok(buffer) => buffer,
+        Err(_) => {
+            // A poisoned back buffer must not blank the window: paint directly.
+            launcher_ui::fill_rect(dc, 0, 0, width as i32, height as i32, background);
+            launcher_ui::EndPaint(hwnd, &paint);
+            return;
+        }
+    };
+    let fresh_surface = buffer.resize(dc, width as i32, height as i32);
+    let offscreen = buffer.memory_dc != 0;
+    let target = if offscreen {
+        // The back buffer keeps the rest of the frame from the last paint, so
+        // composing only the dirty band leaves the untouched rows exactly as
+        // they were. That is what makes a bar-only repaint cheap.
+        buffer.dc()
+    } else {
+        // Without an off-screen surface the window itself is the target, and it
+        // has no memory of earlier frames: compose the whole client area or the
+        // band-only path would leave the rest of the window unpainted.
+        dc
+    };
+    // A fresh back buffer holds undefined pixels and a window target has no
+    // memory at all, so both have to be composed in full; only a reused buffer
+    // can keep the rest of the last frame.
+    let (mut band_top, mut band_bottom) = if offscreen && !fresh_surface {
+        (update_top, update_bottom)
+    } else {
+        (0, height as i32)
+    };
+    // Compose the band that is actually dirty. Redrawing a full-screen bitmap
+    // for the six-pixel bar would burn the frame budget, and because the picture
+    // blit and the text are separate GDI calls it would also give the desktop
+    // more chances to catch an incomplete frame.
+    //
+    // A poisoned state lock must never leave the window blank, so the fallback
+    // below paints a plain dark fill instead of panicking on the paint thread.
     let mut guard = lock_loading_state();
     match guard.as_mut().and_then(|state| state.as_mut()) {
         Some(state) => {
-            match state.art.as_ref() {
-                Some(art) => paint_loading_art(dc, art),
-                None => launcher_ui::fill_rect(dc, 0, 0, width as i32, height as i32, background),
+            // The client area can differ from the fitted picture between a
+            // WM_SIZE and the paint that follows it (a maximise changes the size
+            // before the message is delivered). Re-fitting here keeps the
+            // picture flush with the window instead of leaving an unpainted
+            // edge, and it is a no-op when the sizes already agree.
+            if let Some(art) = state.art.as_mut() {
+                if !art.matches(width, height) {
+                    if let Err(error) = art.refit(width, height) {
+                        eprintln!("Loading screen artwork could not be refitted: {error}");
+                    }
+                    // A refit rewrites the whole picture, so the band optimisation
+                    // cannot be used for this paint.
+                    band_top = 0;
+                    band_bottom = height as i32;
+                }
             }
-            paint_loading_overlay(dc, width, height, state);
+            match state.art.as_ref() {
+                Some(art) => paint_loading_art_band(target, art, band_top, band_bottom, width),
+                None => launcher_ui::fill_rect(
+                    target,
+                    0,
+                    band_top,
+                    width as i32,
+                    band_bottom - band_top,
+                    background,
+                ),
+            }
+            paint_loading_overlay_band(target, width, height, state, band_top, band_bottom);
         }
-        None => launcher_ui::fill_rect(dc, 0, 0, width as i32, height as i32, background),
+        None => launcher_ui::fill_rect(
+            target,
+            0,
+            band_top,
+            width as i32,
+            band_bottom - band_top,
+            background,
+        ),
+    }
+    drop(guard);
+    if target != dc {
+        // Present exactly the rows that were composed. A band-only compose is
+        // enough because the window still shows the matching rows of the
+        // previous frame; a full compose (first paint, resize, or a re-fit)
+        // replaces the whole client area at once, so no stale row survives.
+        let present_top = band_top;
+        let present_height = (band_bottom - band_top).max(0);
+        if present_height > 0 {
+            launcher_ui::BitBlt(
+                dc,
+                0,
+                present_top,
+                width as i32,
+                present_height,
+                target,
+                0,
+                present_top,
+                0x00cc0020,
+            );
+        }
     }
     launcher_ui::EndPaint(hwnd, &paint);
 }
@@ -757,11 +1043,16 @@ unsafe extern "system" fn loading_window_proc(
             paint_loading_window(hwnd);
             0
         }
-        0x0014 => 1, // WM_ERASEBKGND: the paint handler covers the whole area
+        // WM_ERASEBKGND: claim the erase and leave the background alone. Letting
+        // the class brush run would flash its black face on every resize, and
+        // returning 1 without painting is what makes that safe -- the paint
+        // handler immediately covers the whole invalid region with the composed
+        // frame.
+        0x0014 => 1,
         0x0005 => {
             // WM_SIZE: refit the artwork instead of stretching a stale bitmap.
-            let width = (lparam as u32 & 0xffff).max(320);
-            let height = ((lparam as u32 >> 16) & 0xffff).max(240);
+            let width = (lparam as u32 & 0xffff).max(MIN_ART_WIDTH);
+            let height = ((lparam as u32 >> 16) & 0xffff).max(MIN_ART_HEIGHT);
             if let Some(mut guard) = lock_loading_state() {
                 if let Some(art) = guard.as_mut().and_then(|state| state.art.as_mut()) {
                     if let Err(error) = art.refit(width, height) {
@@ -784,7 +1075,13 @@ unsafe extern "system" fn loading_window_proc(
             0
         }
         0x0002 => {
-            // WM_DESTROY
+            // WM_DESTROY: give the back buffer's DC and bitmap back before the
+            // message loop exits. Without this the two GDI handles would live
+            // until the process ends, and the loading window is created once per
+            // world load.
+            if let Ok(mut buffer) = back_buffer().lock() {
+                buffer.release();
+            }
             PostQuitMessage(0);
             0
         }
@@ -795,6 +1092,11 @@ unsafe extern "system" fn loading_window_proc(
 /// Height of the darkened status strip at the bottom of the loading window, and
 /// the fade above it. The artwork itself covers the whole window; only these
 /// rows are blended toward black so the overlay stays legible.
+/// The smallest fitted surface. Below this the window is too small for the
+/// status text to be readable anyway, so there is nothing to gain from
+/// re-fitting per pixel as a user drags a tiny window.
+const MIN_ART_WIDTH: u32 = 320;
+const MIN_ART_HEIGHT: u32 = 240;
 const OVERLAY_STRIP_HEIGHT: u32 = 178;
 const OVERLAY_FADE_HEIGHT: u32 = 72;
 const OVERLAY_MAX_ALPHA: f32 = 0.78;
@@ -940,6 +1242,19 @@ impl LoadingWindow {
             // happens; a synchronous UpdateWindow here would paint before the
             // state below is observed by the message loop.
             ShowWindow(hwnd, if windowed { 5 } else { 3 }); // SW_SHOW / SW_MAXIMIZE
+                                                            // The artwork was decoded against a placeholder size, so fit it once
+                                                            // to the real client area before the first frame is presented. The
+                                                            // WM_SIZE the show above queues would do this too, but doing it here
+                                                            // means the very first paint is already the right size instead of a
+                                                            // briefly mis-scaled picture.
+            let (client_width, client_height) = client_size(hwnd);
+            if let Some(mut guard) = lock_loading_state() {
+                if let Some(art) = guard.as_mut().and_then(|state| state.art.as_mut()) {
+                    if let Err(error) = art.refit(client_width, client_height) {
+                        eprintln!("Loading screen artwork could not be fitted: {error}");
+                    }
+                }
+            }
 
             let _ = ready_tx.send(());
 
@@ -1013,7 +1328,11 @@ impl LoadingWindow {
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
                 // The bar's sweep lives in the state, so the window repaints on
-                // its own cadence as well as when a message arrives.
+                // its own cadence as well as when a message arrives. Only the
+                // bar strip is invalidated: the artwork and the status lines do
+                // not change between messages, and repainting a full-screen
+                // bitmap 25 times a second is both wasted work and the frame a
+                // composited desktop can catch half-drawn.
                 if now.duration_since(last_repaint) >= std::time::Duration::from_millis(40) {
                     last_repaint = now;
                     if let Some(mut guard) = lock_loading_state() {
@@ -1021,7 +1340,17 @@ impl LoadingWindow {
                             state.phase = (state.phase + 0.10) % std::f32::consts::TAU;
                         }
                     }
-                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    // The bar occupies the six rows at `height - 26`; one row of
+                    // slack on each side keeps a rounding difference from
+                    // leaving a stale row behind.
+                    let (client_width, client_height) = client_size(hwnd);
+                    let bar = WindowRect {
+                        left: 0,
+                        top: client_height as i32 - 27,
+                        right: client_width as i32,
+                        bottom: client_height as i32 - 19,
+                    };
+                    InvalidateRect(hwnd, &bar as *const WindowRect as *const c_void, 0);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(40));
             }
