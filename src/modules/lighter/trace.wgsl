@@ -76,6 +76,7 @@ const GFX_MASKS: u32 = GFX_MASK | GFX_OVERLAY_MASK;
 const LIGHTING: u32 = 1u;
 const SHADOWS: u32 = 2u;
 const REFLECTIONS: u32 = 4u;
+const RAY_LIGHTING_OVERLAY: u32 = 512u;
 const WATER_MIRROR: u32 = 8u;
 const CULL_BUILDINGS: u32 = 16u;
 const UNDERWATER: u32 = 32u;
@@ -1247,15 +1248,20 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u3
         color += response*light.energy*tr;
     }
     if physical { return color+ambient+s.emission*emission_weight; }
-    // When no lights contributed (color==0), return ambient+emission for
-    // white surfaces (ambient is the intended illumination there) or base
-    // color for coloured surfaces (surface colour shows through without
-    // light). local_color(s,0,ambient) equals ambient+emission since
-    // s.color is multiplied by light (zero here).
+    // When no lights contributed (color==0): on terminal bounce, return
+    // ambient+emission for white surfaces (ambient is the intended
+    // illumination there) or base color for coloured surfaces (surface
+    // colour shows through without light); on non-terminal bounce with
+    // lighting active, return black so the secondary diffuse ray picks up
+    // indirect light (e.g. sky dome radiance) instead of the surface's own
+    // base colour. Without lighting, direct() returns earlier via the
+    // !lit branch. Emissive surfaces are handled at the EMISSIVE check.
     if all(color == vec3<f32>(0.)) {
         var result = s.color.rgb;
         if terminal && all(s.color.rgb == vec3<f32>(1.)) {
             result = ambient + s.emission * emission_weight;
+        } else if !terminal && lit {
+            result = vec3<f32>(0.);
         }
         return result;
     }
@@ -1714,7 +1720,7 @@ fn camera_ray(id: vec2<u32>, sample: u32, seed: ptr<function,u32>) -> Ray {
 /// Ray-lighting overlay flag bit in frame.options.x. When set, the ray pass
 /// adds lighting on top of the raster color instead of replacing it, and
 /// never outputs black: if the ray result is invalid, the raster color stands.
-const RAY_LIGHTING_OVERLAY: u32 = 1u;
+// Note: bit value (512u) is declared near LIGHTING/SHADOWS/REFLECTIONS above
 
 fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool, overlay: bool) {
     dependencies = 0u;
