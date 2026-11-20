@@ -972,9 +972,14 @@ fn environment(ray: Ray, seen_sun: bool) -> vec3<f32> {
     }
     // Diffuse paths already sample the analytic sun in direct(). The
     // decorative disc is visible to the eye, in mirrors and through water.
-    let sun = select(0.,smoothstep(0.9994,0.99985,dot(dir,frame.sun_disc.xyz))*frame.sun_disc.w,seen_sun);
-    let moon = smoothstep(0.9985,0.9992,dot(dir,frame.moon_disc.xyz))*frame.moon_disc.w;
-    return sky + frame.sun_color.rgb*sun*2. + vec3<f32>(0.45,0.5,0.6)*moon;
+    // Gate sun and moon behind time of day so moon never bleeds into day
+    // (dark blue noon) and sun never bleeds into night.
+    let is_day = frame.sun.w > 0.3;
+    let sun_disc = select(0.,smoothstep(0.9994,0.99985,dot(dir,frame.sun_disc.xyz))*frame.sun_disc.w,seen_sun);
+    let moon_disc = smoothstep(0.9985,0.9992,dot(dir,frame.moon_disc.xyz))*frame.moon_disc.w;
+    return sky
+        + select(vec3<f32>(0.),frame.sun_color.rgb*sun_disc*2.,is_day)
+        + select(vec3<f32>(0.),vec3<f32>(0.45,0.5,0.6)*moon_disc,!is_day);
 }
 struct LightRay {
     dir: vec3<f32>, distance: f32, energy: vec3<f32>, tail: vec3<f32>,
@@ -1377,8 +1382,13 @@ fn transport(first: Ray, primary: Hit, raster: bool, seed: ptr<function,u32>) ->
     var pending = path;
     var split = false;
     let single = (frame.options.x & SINGLE_PATH)!=0u;
+    // In overlay mode, trace only the primary hit plus direct lighting
+    // (sun, local lights). Skip secondary diffuse/reflection bounces —
+    // the raster world is the base, rays only add lighting overlays.
+    let overlay = (frame.options.x & RAY_LIGHTING_OVERLAY)!=0u;
+    let max_bounce = select(frame.options.y, 0u, overlay);
     for (var branch=0u; branch<2u; branch++) {
-        for (var segment=0u; segment<=frame.options.y; segment++) {
+        for (var segment=0u; segment<=max_bounce; segment++) {
             let minimum = select(0.002,1.e-12,reference());
             if strongest(abs(path.weight))<minimum { break; }
             if single && path.depth>=2u {

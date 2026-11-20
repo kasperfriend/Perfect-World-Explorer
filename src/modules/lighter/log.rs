@@ -222,7 +222,7 @@ impl Logger {
             .ok()
             .as_deref()
             .and_then(LogLevel::parse)
-            .unwrap_or(LogLevel::Off);
+            .unwrap_or(LogLevel::Normal);
         *log.level.lock().unwrap() = level;
         if level != LogLevel::Off {
             log.log_dir = std::env::var_os("PW_CACHE_DIR")
