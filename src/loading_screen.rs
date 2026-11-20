@@ -31,8 +31,10 @@ pub const ARCHIVE_NAME: &str = "surfaces.pck";
 
 /// File extensions the client uses for full-screen artwork in `surfaces.pck`.
 /// The census of the retail archive counted 39 root `.jpg` entries plus BMP and
-/// TGA surfaces; DDS is included because a modified client may ship one.
-const PICTURE_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "bmp", "dds"];
+/// TGA surfaces; DDS is included because a modified client may ship one. TGA has
+/// no magic bytes, which is why `decode_rgba` retries an unidentified payload as
+/// TGA after the generic sniffer.
+const PICTURE_EXTENSIONS: [&str; 5] = ["jpg", "jpeg", "bmp", "dds", "tga"];
 
 /// A decode that produced a picture larger than this is refused instead of
 /// allocated: a 16,384 x 16,384 RGBA image is 1 GiB, far past any loading
@@ -484,6 +486,7 @@ mod tests {
             "surfaces/载入1.bmp",
             "Surfaces\\loading3.dds",
             "surfaces/logo.jpeg",
+            "surfaces/loading04.tga",
         ] {
             assert!(is_root_picture(name), "{name} should be a loading screen");
         }
@@ -515,10 +518,21 @@ mod tests {
 
     #[test]
     fn random_words_vary_between_calls_and_stay_non_negative() {
-        let first = random_word();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let second = random_word();
-        assert_ne!(first, second);
+        // A single pair could in principle collide; a handful of draws must not
+        // all be equal, and the low bits `pick` uses must not be stuck.
+        let draws: Vec<u64> = (0..8).map(|_| random_word()).collect();
+        assert!(
+            draws.windows(2).any(|pair| pair[0] != pair[1]),
+            "eight draws all repeated: {draws:?}"
+        );
+        // A degenerate low bit would make `pick` land on the same picture every
+        // time. 64 draws all being even has probability 2^-64, so this cannot
+        // flake while still catching a stuck bit.
+        let wide: Vec<u64> = (0..64).map(|_| random_word()).collect();
+        assert!(
+            wide.iter().any(|word| word % 2 == 1),
+            "every draw was even, so `pick` could never select an odd index: {wide:?}"
+        );
     }
 
     #[test]
@@ -582,9 +596,13 @@ mod tests {
         // The strip's bottom row is blended to black but keeps its alpha.
         let bottom = (height as usize - 1) * width as usize * 4;
         assert_eq!(&out[bottom..bottom + 4], &[0, 0, 0, 55]);
-        // The fade row is partly darkened.
-        let fade = 8 * width as usize * 4;
-        assert!(out[fade] < source[fade] && out[fade] > 0);
+        // The last fade row is partly darkened: strip_top is 6, the two-row
+        // fade covers rows 6 and 7, and row 8 is already at full alpha. Row 6
+        // gets alpha 0 (untouched) and row 7 gets alpha 1/2.
+        let fade = 7 * width as usize * 4;
+        assert!(out[fade] < source[fade], "row 7 must be darkened");
+        assert!(out[fade] > 0, "the fade must not be fully black");
+        assert_eq!(out[fade], 100, "200 at alpha 0.5 truncates to 100");
         assert!(overlay_strip(&source[..3], width, height, 4, 2, 1.0).is_err());
     }
 
@@ -594,9 +612,13 @@ mod tests {
         assert_eq!(overlay_strip(&source, 4, 3, 0, 0, 5.0).unwrap(), source);
         let out = overlay_strip(&source, 4, 3, 9, 9, f32::NAN).unwrap();
         assert_eq!(out, source);
-        let out = overlay_strip(&source, 4, 3, 1, 1, 0.5).unwrap();
+        // A one-row strip is all fade band, so it stays at alpha 0 and changes
+        // nothing; a two-row strip with a one-row fade reaches the full 0.5 at
+        // its bottom row (strip_top = 1, fade_top = 2).
+        assert_eq!(overlay_strip(&source, 4, 3, 1, 1, 0.5).unwrap(), source);
+        let out = overlay_strip(&source, 4, 3, 2, 1, 0.5).unwrap();
         let bottom = 2 * 4 * 4;
-        assert_eq!(out[bottom], 45);
+        assert_eq!(out[bottom], 45, "90 at alpha 0.5 truncates to 45");
     }
 
     #[test]

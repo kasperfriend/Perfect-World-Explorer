@@ -14,6 +14,7 @@ See the [full 76-point plan reassessment](Findings/Eight-phase-reassessment-2026
 - Authored world effects from the map's own ECWLD records and ECM model events: waterfalls, fire, mist, glows and sun shafts, positioned from the scene, played on the scene clock and textured from `gfx.pck`. A texture that an effect names but the archive lacks draws in its authored vertex colour rather than removing the effect.
 - Client SpeedTree geometry through the client's 32-bit runtime, with sampled leaf motion and approximate LOD; locally streamed grass from client placements and meshes.
 - Experimental animated water, per-height reflections and refraction, shoreline waves, underwater effects, environmental fog, sky, time-of-day control and optional bloom.
+- A full-screen loading window filled with a randomly chosen picture from the client's own `surfaces.pck`, with the DirectStorage readout, throughput graph and an indeterminate progress bar over it. See [Loading screen](#loading-screen).
 - Searchable teleport destinations, original and rendered world maps, a minimap, zone notices, Windows zone music, experimental stereo zone ambience and experimental positional world effects.
 - Windows launcher with remembered client folder and settings, and in-app Graphics, World, Sound and Interface controls. Settings → Graphics → **Resolution scale** renders the 3D world at 10–200% of the window size (default 100%) and upscales it, while the UI stays at native resolution; lower values trade sharpness for speed, higher values supersample. The same tab has the **Upscaling** (Off / DLSS Super Resolution / FSR 1 / FSR 2 / FSR 3.1 / FSR 4.1 / XeSS), **Frame generation** and **Latency** (VSync / XeLL — Intel Xe Low Latency) selectors; resolution scale applies only when Upscaling is Off. See [Upscaling and frame generation](#upscaling-and-frame-generation-optional).
 - An optional **Modules** add-on list. **Walker** loads a clothed native player character and supports terrain walking, source-backed run/jump mechanics, and first- or third-person cameras. Its integrated **Character Designer** reads PW 1.4.2 v27 catalogs and native presets, edits body/face/equipment data, saves GBK presets, and rebuilds the same spawned Walker. The executable discovers installed module packages beside itself; modules own their state and do not change persisted core settings.
@@ -49,6 +50,50 @@ The executable resolves `Modules` relative to its own location, not the current 
 **Populator** draws the world population the client itself ships. It reads the selected client's `element/data/task_npc.data` — 1,572 task-NPC records of which 515 carry a real position and 1,057 are marked `0,0` for the server to place — resolves each placed record to its `NPC_ESSENCE` template in `elements.data`, and draws that template's real rig from `models.pck` at the authored world position and height. The settings window reports how many placements are in range and offers **Go to the nearest placement**, because the client's own placements cluster in towns. Each actor carries the template's own name overhead the way the client draws it: the family and height come from the client's own `Configs\fonts.txt` (`"Arial Unicode MS" 12 0 0`, the row that file labels 玩家和NPC头顶称谓文字 — player and NPC overhead names), the labels are fixed-size screen text and a label the camera cannot see is dropped, so no name shows through a building or a hill. Each actor plays its rig's own idle — the client's `站立` combined action, which the client itself falls back from to `休闲`, else the ordinary clip that names, else the rig's own `待机`/`站立`/`休闲`/`idle` clip — and the settings line reports how many drawn actors are actually moving, because a pose is fingerprinted each frame instead of assuming the schedule works. The 515 placements resolve to 92 distinct rigs, 86 of which ship an idle clip of 1.6–2.3 s (24–36 frames at the skeletons' 15 fps) with 100–478 rotation keys in the skeleton; the other six are scenery — chests, rocks, a furnace, a tree, an altar — that ship no idle action at all and correctly hold their authored pose. `tools/npc_idle_report.py` regenerates that per-rig table into `Findings/npc-idle-evidence.md` straight from `models.pck`, `elements.data` and `task_npc.data`. Each actor also stands on the client's own building floors — bridge decks, platforms and interior floors — or on the upward-facing top of the model it was authored onto when that model ships no collision hull, because `task_npc.data` stores no height for most placements and the terrain under a bridge is the river bed. A placement can also be *inside* a wall at the right height, which no height query fixes: the actor's own box is tested against the same hulls, and a placement authored into geometry either drops to the ground under a solid plate it was lifted onto or moves to the nearest free spot within 2.5 units that keeps its height, while one with nowhere to go keeps its authored column and is counted under `in walls` rather than being moved invisibly. Spawn distance defaults to the client's own 420-unit scene window and is adjustable together with the number of simultaneously drawn actors, the name distance and building-floor support; the settings window sits beside the Walker panel. The per-frame cost is bounded rather than proportional to the crowd the host renders the add-ons once per pass (main, reflection, refraction) and the module poses each actor once per frame and re-uploads vertices only when the pose actually changed, skips actors no pass can see, updates a retained rig's vertices without re-running the draw validation, re-skins distant actors every second or third frame, tests overhead-name occlusion a few times a second instead of every frame, reconciles the streamed set by index instead of a quadratic scan, caches the placement search until the camera moves, and stops decompressing rigs once a frame has spent 4 ms on them. Mobs load the real 4,208 `MONSTER_ESSENCE` templates but stay unspawned, because mob placement lives in the server's `gamedata/npcgen.data`, which the client does not ship; for the same reason actors move only along real navigation paths and therefore stand still without server route data. Nothing is invented to fill those gaps, and there is no combat, dialogue or other interaction.
 
 **Security:** The application executes the 32-bit `speedtreert.dll` from the selected client through an embedded helper. Only use a client you trust. Settings and the selected path are stored under `%LOCALAPPDATA%\PerfectWorldViewer`; derived tree geometry is cached in its `tree-cache` subfolder. The installation itself is not modified. Do not upload client data or the derived cache.
+
+### Loading screen
+
+While the world loads, the viewer opens a borderless full-screen window that is
+filled with a **random loading-screen picture taken from the selected client's
+own `surfaces.pck`** — nothing is bundled, generated or substituted. The
+DirectStorage status line, the read-throughput graph, the read totals and an
+indeterminate loading bar are drawn over a darkened strip at the bottom, so the
+picture fills the window while the progress UI stays legible.
+
+- Every root-level `.jpg`, `.jpeg`, `.bmp`, `.dds` (or `.tga`) entry in
+  `surfaces.pck` is a candidate; `background.jpg` and the client's date-named
+  loading art sit there, while art in subfolders (`maps`, `iconset`, `minimaps`,
+  `town`, …) is UI or map material and is not offered.
+- The choice is made fresh on every load from process id, wall clock and address
+  entropy, so a client does not show the same picture every launch.
+- The picture is scaled to **cover** the window (aspect preserved, overflow
+  cropped) rather than letterboxed, then top-down BGRA is blitted with
+  `StretchDIBits`; a window resize refits the retained pixels instead of
+  stretching a stale bitmap.
+- If the archive is missing, unreadable or holds no root picture, the window
+  keeps its plain dark background and shows the reason instead of failing the
+  load. A corrupt payload is named by archive entry.
+- `PWE_LOADING_SCREEN=surfaces/loading07.jpg` (the `surfaces/` prefix is
+  optional) pins one picture for a session; an unknown name logs and falls back
+  to the random draw.
+- `PWE_LOADING_WINDOWED=1` keeps the window framed instead of maximised.
+
+The lookup, random choice, decode and cover fit are shared with
+`loading-screen-check`, which runs the same path against a staged retail client
+without a window:
+
+```text
+loading-screen-check <client-root-or-element-folder> [output.png] [width] [height]
+```
+
+It prints every candidate, the selected picture, the decoded and fitted sizes,
+and writes a PNG with the status strip blended exactly as the window blends it.
+`loading-screen-gpu-check` is the self-contained CI counterpart: it builds a
+synthetic `surfaces.pck` in memory (a JPEG, a BMP, a corrupt JPEG, and a nested
+DDS that must not be offered as a loading screen but must still decode), runs
+the production lookup, random choice, decode, cover fit and status strip at a
+laptop, a 4K and a portrait size, then uploads the BGRA bytes to a wgpu texture
+and compares the readback row for row.
 
 ### Controls
 
@@ -109,6 +154,7 @@ The executable distributed alongside this source was rebuilt from this packaged 
 - GPU diagnostics include `water-pass-gpu-check`, `simple-water-gpu-check` and `post-gpu-check`. They require a working graphics adapter; synthetic tests do not prove in-game visual parity.
 - `python tools/audio-census.py /path/to/element/sfx.pck --ffmpeg /path/to/ffmpeg` surveys archive audio and independently decodes it; this is not a test of the Windows playback backend. On Windows, `cargo run --release --bin audio-corpus-check -- <element directory>` instead reads and decodes packed SFX and loose music with rodio; it does not test audible output or detect every possible mid-stream decoding error.
 - `cargo run --bin scene-sound-check -- /path/to/element` surveys world sound placements and checks their paths against `sfx.pck`.
+- `cargo run --bin loading-screen-check -- /path/to/element [out.png] [width] [height]` runs the loading screen's own `surfaces.pck` lookup, random choice, decode, cover fit and status strip against a real client and writes the fitted picture. `cargo run --bin loading-screen-gpu-check` is the client-free version CI runs: it synthesises a `surfaces.pck` and checks the BGRA upload on a GPU adapter.
 - Some helper binaries and research scripts assume specific test data layouts. Consult their source and [Findings](Findings/README.md) before use.
 
 See [the world-loading optimization report](Findings/World-loading-optimization-2026-11-04.md) for implementation details, regression checks and measurement limits. A 6 GB laptop has not yet been hardware-verified.
@@ -128,6 +174,7 @@ tools/package-windows.ps1 shared PR/release portable-package builder
 tools/fetch-directstorage.ps1 downloads/extracts pinned DirectStorage preview
 tools/speedtree/         bridge source, probes and embedded helper
 tools/launcher-art.jpg   embedded launcher image
+src/loading_screen.rs    client surfaces.pck loading-screen art (shared by window and checks)
 Findings/                research, evidence, assessment and roadmap
 LICENSE                  project license
 ```
