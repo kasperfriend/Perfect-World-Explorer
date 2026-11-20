@@ -3107,7 +3107,7 @@ fn exercise_sun_and_history(h: &mut Harness) {
             *mean += alpha * delta;
         }
     }
-    h.ray.history = post::History::default();
+    h.ray.reset_history();
     let mut converged = Vec::new();
     for _ in 0..FRAMES {
         converged = h.pixels(frame, &empty);
