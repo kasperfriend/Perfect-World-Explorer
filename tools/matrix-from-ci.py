@@ -225,7 +225,10 @@ def render(directory):
     lines.append(
         "- `WATER_VERSIONS [0x10002000, 0x10003000]` plus the plain revision `4`: "
         "`src/water.rs`, the area revisions the loader accepts; anything else is "
-        "refused by name."
+        "refused by name. Every one of the 160 zlib-framed water records in the "
+        "1.8.4 patches declares a length that fits inside its record and "
+        "inflates to exactly that window with a real end marker, so "
+        "`pck::inflate` is used unrelaxed."
     )
     lines.append(
         "- `terrain_block::KNOWN_VERSIONS 2..=6`: `src/terrain_block.rs`, the "

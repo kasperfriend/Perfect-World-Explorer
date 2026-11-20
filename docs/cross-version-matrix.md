@@ -579,11 +579,12 @@ the affected roots is 33–37, unchanged.)*
 **2.1 — water versions: covered, including 1.8.4's own word.** `WATER_VERSIONS`
 holds both `0x100SSSSS` words, and the reader also accepts the plain revision `4`
 that every 1.8.4 BSData water record stores; anything else is refused by name.
-The 1.8.4 records are also not zlib-framed, so they are read where they stand
-instead of being sent through an inflater. *(measured against `BSData/4.dat`,
-`7.dat`, `21.dat` and `44.dat` from the 1.8.4 client: 5 of the 7 referenced
-records decode as grids, and the other 2 are the non-water records already
-recorded below.)*
+The v4 record keeps the v2/v3 field order, so it is one more row in the offset
+table rather than a second reader: its header is four bytes instead of eight,
+and its cell mask sits at version+120 on a 32x32 grid rather than at version+37
+on a 1x1 one. *(measured against `BSData/4.dat`, `7.dat`, `21.dat` and `44.dat`
+from the 1.8.4 client: 5 of the 7 referenced records decode as grids, and the
+other 2 are the non-water records already recorded below.)*
 
 **2.2 — `gfx_light` keypoint count and interpolation: already covered.**
 `MAX_KEYPOINTS` is 8, and `InterpolateMode` is refused unless `0` — measured at
@@ -710,7 +711,7 @@ whatever is staged, so a client with bytes gets a row the same run.
 Read out of the source, not measured, and labelled as such:
 
 - `WORLD_VERSIONS` / `REVISIONS`: `src/pck.rs` (the container revision table and the byte offsets each revision uses).
-- `WATER_VERSIONS [0x10002000, 0x10003000]` plus the plain revision `4`: `src/water.rs`, the area revisions the loader accepts; anything else is refused by name.
+- `WATER_VERSIONS [0x10002000, 0x10003000]` plus the plain revision `4`: `src/water.rs`, the area revisions the loader accepts; anything else is refused by name. Every one of the 160 zlib-framed water records in the 1.8.4 patches declares a length that fits inside its record and inflates to exactly that window with a real end marker, so `pck::inflate` is used unrelaxed.
 - `terrain_block::KNOWN_VERSIONS 2..=6`: `src/terrain_block.rs`, the TRN2 header versions the reader accepts.
 - Water and terrain refusals name the file since the change to `water::load`; before it, `water (BSData)` reported a bare errno.
 

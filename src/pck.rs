@@ -81,34 +81,6 @@ pub(crate) fn inflate(raw: &[u8], expected: usize) -> Result<Vec<u8>, String> {
         Ok(out)
     })
 }
-/// Inflate as much as the input allows, for streams whose end is the end of
-/// their record rather than a `StreamEnd` marker.
-///
-/// The 1.8.4 BSData water records are stored this way: `7.dat` record 0 declares
-/// a stored length of 4 while its deflate stream runs to the last byte of the
-/// record, so [`inflate`]'s "exact size and `StreamEnd`" contract -- which is
-/// what package entries are checked against, and must stay -- refuses data that
-/// is beyond doubt a complete water area. This variant exists only for that
-/// case and only ever *adds* bytes the caller then has to parse for itself; it
-/// never relaxes [`inflate`].
-pub(crate) fn inflate_lenient(raw: &[u8], expected: usize) -> Option<Vec<u8>> {
-    thread_local! { static DECOMP: std::cell::RefCell<Decompress> = std::cell::RefCell::new(Decompress::new(true)); }
-    DECOMP.with(|cell| {
-        let mut decomp = cell.borrow_mut();
-        decomp.reset(true);
-        let mut out = Vec::with_capacity(expected.clamp(1, 1 << 22));
-        // `Finish` reports an error when the stream ends short. That is the case
-        // this function exists for, so the status is not a failure: the bytes
-        // already produced are the answer, and an empty one means the input was
-        // not a deflate stream at all.
-        match decomp.decompress_vec(raw, &mut out, FlushDecompress::Finish) {
-            Ok(_) | Err(_) if !out.is_empty() => Some(out),
-            // Nothing decoded: the caller gets no bytes rather than a silent
-            // zero-length success.
-            _ => None,
-        }
-    })
-}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub name: String,

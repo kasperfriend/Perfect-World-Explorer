@@ -350,19 +350,6 @@ fn is_water_version(word: u32) -> bool {
     WATER_VERSIONS.contains(&word) || word == WATER_VERSION_V4
 }
 
-/// The water area that starts at `offset`, if one does.
-///
-/// A candidate has to *parse* -- a grid of sane dimensions and a cell mask that
-/// fits inside the record -- which is what keeps the scan from mistaking a small
-/// integer for a version.
-fn water_at(b: &[u8], offset: usize, export_id: u32) -> Option<(WaterArea, usize)> {
-    let version = u(b, offset).ok()?;
-    if !is_water_version(version) {
-        return None;
-    }
-    WaterArea::parse_fields(b, offset + 4, export_id, version).ok()
-}
-
 /// Where a revision's fields sit, relative to the record's `dwVersion`.
 ///
 /// Keeping them in one table is the point: a revision is a set of offsets, not a
@@ -401,9 +388,19 @@ impl WaterFields {
                 simple: Some(36),
                 mask: 37,
             }),
-            // The v4 header keeps the v2/v3 field order and widens only the
-            // part after the centre vector: 84 bytes of fields the older
-            // revisions do not have, then the mask.
+            // 1.8.4 keeps the v2/v3 field order and inserts its extra fields
+            // between the centre vector and the mask, so only the mask moves:
+            // its own header is four bytes long instead of eight, but the
+            // field block that follows it starts at the same place relative to
+            // itself, and the mask sits 84 bytes past where v2 puts it.
+            //
+            // Measured on `7.dat` record 0, the basis for this row: with the
+            // block starting at the version word + 4, `dwColor` is +0,
+            // `fHeight` +4 (216.0, the same value the centre carries as its
+            // y), `dwColumns`/`dwRows` +12/+16 (32/32), `fCellSize` +20 (32.0),
+            // `vCenter` +24 (2560, 216, 5120), the cell mask +120 (533 wet of
+            // 1024) and `dwWaveCount` 46 at +1144 with the waves running to the
+            // end of the record.
             WATER_VERSION_V4 => Some(Self {
                 color: 0,
                 height: 4,
@@ -451,50 +448,26 @@ pub(crate) fn parse_record(record: &[u8], export_id: u32) -> Result<Vec<WaterAre
              this build reads 0x10002000, 0x10003000 and 4)"
         ));
     }
-    // A record whose framing this reader does not recognise may still *be* a
-    // water area. The 1.8.4 client stores its areas in BSData records that open
-    // straight into the fields with no version word in front -- `4.dat` record 1
-    // declares a 32x32 grid and 69 wet cells with no framing whatsoever -- so a
-    // record that decodes where it stands is accepted where it stands. Every
-    // area this finds has been checked field by field, which is a stronger claim
-    // than "the first word looked like a version".
-    if let Some((area, _)) = water_at(record, 0, export_id) {
-        return Ok(vec![area]);
-    }
     let stored = first as usize;
     let raw = u(record, 4)? as usize;
-    // Shipped records declare the 32768-byte window; a wild word is a framing
-    // this reader does not know, not a size worth trusting. The stored length is
-    // allowed to run past the record because the last patch in a BSData stores
-    // its deflate stream with no end marker -- `7.dat` record 0 is a complete
-    // water area ending in `shaders\\textures\\water\\wave1.dds`, and its stored
-    // length is 4 where the stream actually runs to the end of the record.
-    // Requiring the two to agree refused that area and every one like it, which
-    // is how a whole world ends up with no water. A wrong `stored` cannot make
-    // the stream lie: the inflater stops at the end of the deflate data or at
-    // the end of the input, whichever comes first.
+    // The rest of the record is the compressed payload. `stored` is the length
+    // the writer declared and `raw` the size of the window it inflates to; a
+    // wild word is a framing this reader does not know, not a size worth
+    // trusting. Measured across the 160 framed water records in the 1.8.4
+    // patches: every one declares a `stored` that fits inside its record, and
+    // every one inflates to exactly `raw` with a real end marker. So neither
+    // bound has to be widened -- refusing here costs only the records whose
+    // framing really is unknown.
     let available = record.len().saturating_sub(8);
-    if raw == 0 || raw > 1024 * 1024 || stored == 0 {
+    if raw == 0 || raw > 1024 * 1024 || stored == 0 || stored > available {
         return Err(format!(
             "not a water record: the first word is {first:#x}, which is neither a \
-             known A3DWaterArea version nor a plausible zlib frame"
+             known A3DWaterArea version nor a {available}-byte zlib frame"
         ));
     }
-    let payload = &record[8..8 + stored.min(available)];
-    let plain = match crate::pck::inflate(payload, raw) {
-        Ok(plain) => plain,
-        // Only a stream that failed *before* the end of the input is a framing
-        // fault. A truncated-but-complete stream is what the marker-less records
-        // look like, and the area it carries is worth keeping.
-        Err(error) => match crate::pck::inflate_lenient(payload, raw) {
-            Some(complete) => complete,
-            None => {
-                return Err(format!(
-                    "not a water record: the zlib frame does not inflate: {error}"
-                ))
-            }
-        },
-    };
+    let payload = &record[8..8 + stored];
+    let plain = crate::pck::inflate(payload, raw)
+        .map_err(|error| format!("not a water record: the zlib frame does not inflate: {error}"))?;
     // Records are shared with the other BSData tables, so a water area can sit
     // anywhere in the window; find the first run that actually decodes.
     let mut from = 0usize;
@@ -503,10 +476,6 @@ pub(crate) fn parse_record(record: &[u8], export_id: u32) -> Result<Vec<WaterAre
             return Ok(areas);
         }
         from = offset + 4;
-    }
-    // A record can also hold a bare area with no version word at all.
-    if let Some((area, _)) = water_at(&plain, 0, export_id) {
-        return Ok(vec![area]);
     }
     // The frame inflated, so this is a readable record — it simply carries no
     // water area. That is a fact about the patch, not a fault in a version, and
@@ -1148,15 +1117,14 @@ mod tests {
     /// shoreline waves that end the record. Two separate faults made this area
     /// unreadable and neither was a wrong offset in the old layout:
     ///
-    /// 1. the revision word is 4, so `parse_record` never recognised the record
-    ///    and reported "the first word is 0x4, which is neither a known
-    ///    A3DWaterArea version nor a plausible zlib frame";
-    /// 2. the record is not zlib-framed at all, so there was no frame to inflate
-    ///    and nothing to fall back on.
+    /// the revision word is `4`, so `parse_record` never recognised the record
+    /// and reported "the first word is 0x4, which is neither a known
+    /// A3DWaterArea version nor a plausible zlib frame". It was then read as a
+    /// zlib frame four bytes long, which is the other half of the same miss.
     ///
     /// A whole world of refs like this is why the 1.8.4 client had no water.
     #[test]
-    fn the_184_record_layout_is_read_without_a_version_prefix_or_a_frame() {
+    fn the_184_record_layout_is_read_without_a_version_prefix() {
         let mut b = Vec::new();
         b.extend_from_slice(&4u32.to_le_bytes()); // dwVersion
         b.extend_from_slice(&4u32.to_le_bytes()); // dwColor
@@ -1190,59 +1158,31 @@ mod tests {
         assert_eq!(area.export_id, 42);
     }
 
-    /// A record that puts its fields **first** carries a water area too.
+    /// A record whose framing is not water is refused, and the refusal says
+    /// what it saw and what it expected.
     ///
-    /// `BSData/4.dat` records 1 and 8 and `44.dat` record 9 hold a grid whose
-    /// `dwColumns` sits at +12 with no version word anywhere in the record.
-    /// They were refused as "not a water record", which cost their areas.
+    /// The temptation is to widen this into "try the bytes as an area anyway",
+    /// and it has been tried: a record whose first word is any small integer
+    /// then reads as a plausible grid, because a mask of zero bytes is valid,
+    /// and BSData records for unrelated tables start exactly that way. Guessing
+    /// turned `21.dat` records 15 and 25 -- which inflate to 32768 bytes with no
+    /// water word in them, because they are other tables -- into water areas.
     #[test]
-    fn a_record_that_opens_into_a_grid_is_read_even_without_a_version_word() {
-        let mut b = Vec::new();
-        b.extend_from_slice(&[0u8; 12]); // anything: the grid starts at +12
-        b.extend_from_slice(&8u32.to_le_bytes()); // dwColumns
-        b.extend_from_slice(&8u32.to_le_bytes()); // dwRows
-        b.extend_from_slice(&32.0f32.to_bits().to_le_bytes());
-        for centre in [-512.0f32, 216.0, 5120.0] {
-            b.extend_from_slice(&centre.to_bits().to_le_bytes());
-        }
-        // 84 bytes of fields, then the mask: the layout the v4 revision uses.
-        b.extend_from_slice(&[0u8; 84]);
-        let mut mask = vec![0u8; 64];
-        mask[0] = 1;
-        mask[63] = 1;
-        b.extend_from_slice(&mask);
-        b.extend_from_slice(&0u32.to_le_bytes());
-        let area = parse_record(&b, 7).expect("a bare grid is a water area").remove(0);
-        assert_eq!((area.columns, area.rows), (8, 8));
-        assert_eq!(area.mask.iter().filter(|m| **m != 0).count(), 2);
-    }
-
-    /// A stored length shorter than the deflate stream is not a fault: the last
-    /// patch in a BSData ends its stream with the record, not with a marker.
-    ///
-    /// `7.dat` record 0 declares `stored = 4` and the stream runs to the end of
-    /// the record. Requiring the declaration and the stream to agree refused a
-    /// complete area.
-    #[test]
-    fn a_markerless_stream_is_inflated_to_the_end_of_its_input() {
-        let payload = {
-            use std::io::Write;
-            let mut encoder =
-                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
-            encoder.write_all(&[7u8; 512]).unwrap();
-            encoder.finish().unwrap()
-        };
-        let mut record = Vec::new();
-        // A deliberately wrong, too-short stored length.
-        record.extend_from_slice(&4u32.to_le_bytes());
-        record.extend_from_slice(&512u32.to_le_bytes());
-        record.extend_from_slice(&payload);
-        let plain = crate::pck::inflate_lenient(&record[8..], 512).expect("bytes survive");
-        assert_eq!(plain.len(), 512);
-        assert!(plain.iter().all(|b| *b == 7));
-        // The strict reader still refuses it, which is what package entries
-        // depend on.
-        assert!(crate::pck::inflate(&record[8..], 512).is_err());
+    fn a_record_whose_framing_is_not_water_names_both_sides() {
+        // 0x1af is a stored length, not a version; this is the shape that sent
+        // an investigation after a version that never existed.
+        let mut b = 0x1afu32.to_le_bytes().to_vec();
+        b.extend_from_slice(&32768u32.to_le_bytes());
+        b.extend_from_slice(&[0u8; 16]);
+        let error = parse_record(&b, 1).expect_err("not a water record");
+        assert!(error.contains("0x1af"), "{error}");
+        assert!(error.contains("zlib frame"), "{error}");
+        // A declared length past the end of the record is the same kind of
+        // refusal, and it is the one that would read raw record bytes as cells.
+        let mut b = 4096u32.to_le_bytes().to_vec();
+        b.extend_from_slice(&32768u32.to_le_bytes());
+        b.extend_from_slice(&[0u8; 16]);
+        assert!(parse_record(&b, 1).is_err());
     }
 
     /// Build one v3 area followed by `waves` shoreline entries.
