@@ -2416,7 +2416,11 @@ fn exercise_spatial_upscale(h: &mut Harness) {
     h.ray.install(Ok((b.finish(), Textures::default())));
     let f = test_frame(Vec3::ZERO, Vec3::NEG_Z, 47);
     let empty = Builder::for_mode(saved.mode).finish();
+    // linear: primary + one indirect bounce (adds sky radiance)
+    h.ray.settings.bounces = 1;
     let linear = h.pixels(f, &empty);
+    // spatial: primary hit only (no indirect, pure surface color)
+    h.ray.settings.bounces = 0;
     let spatial = h.pixels(f, &empty);
     assert!(linear.iter().zip(&spatial).all(|(a, b)| a.1 == b.1));
     assert!(linear.iter().zip(&spatial).any(|(a, b)| a.0 != b.0));
