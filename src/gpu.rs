@@ -4775,7 +4775,275 @@ fn close_old_window_after_handoff_ready<T: 'static>(
     }
 }
 
-/// Launch a replacement process for another map. The old process remains the
+/// The loading UI the old window shows while a replacement world starts.
+///
+/// Changing worlds cannot reuse the standalone loading window: the replacement
+/// is a separate process and this window is still presenting the old world, so
+/// the picture has to be uploaded and drawn by the running viewer. Building the
+/// frame once per world change keeps the 25 fps animation cheap — only the bar
+/// and the status text change, and those are drawn over a retained texture.
+struct WorldLoadingOverlay {
+    /// The client's picture with the darkened strip already blended in.
+    picture: Option<egui::TextureHandle>,
+    /// Destination, for the title line.
+    destination: String,
+    /// Picture basename, shown so a pin can be chosen by eye.
+    picture_name: String,
+    /// Bar sweep, advanced by the animation tick.
+    phase: f32,
+    /// Last DirectStorage and totals strings, refreshed on the tick.
+    direct_storage: String,
+    totals: String,
+    graph: String,
+}
+
+/// Build the loading UI for one destination.
+///
+/// `element` is the destination's `element` folder, which is where its
+/// `surfaces.pck` lives. The picture is matched against the destination name and
+/// falls back to a random picture when the archive names nothing after it, which
+/// is the retail client's case: its loading art is the numbered `载入` family and
+/// nothing in `configs.pck` pairs it with a map. `status` is returned with the
+/// first frame's text already filled in.
+fn build_world_loading_overlay(
+    ctx: &egui::Context,
+    element: &std::path::Path,
+    destination: &crate::world_catalog::WorldMap,
+    size: (u32, u32),
+) -> (WorldLoadingOverlay, String) {
+    let (width, height) = (size.0.max(2), size.1.max(2));
+    let location = crate::loading_screen::Location::new(
+        &destination.id,
+        &destination.display_name,
+        &destination.name,
+    );
+    let word = crate::loading_screen::random_word();
+    let (picture, picture_name, note) = match crate::loading_screen::choose_for_location(
+        element,
+        &location.needles,
+        crate::loading_screen::pinned_picture().as_ref(),
+        width,
+        height,
+        word,
+    ) {
+        Ok((picture, source)) => {
+            // The log line names the reason, so a destination that fell back
+            // to a random picture is distinguishable from a real match.
+            eprintln!(
+                "Loading screen for {}: {} ({source})",
+                location.label, picture.path
+            );
+            match crate::loading_screen::decode(element, &picture)
+                .and_then(|image| crate::loading_screen::fill(&image, width, height))
+            {
+                Ok(fitted) => {
+                    let name = picture
+                        .path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&picture.path)
+                        .to_string();
+                    (Some(fitted), name, source.to_string())
+                }
+                Err(error) => {
+                    eprintln!("Loading screen picture could not be used: {error}");
+                    (None, "(none)".to_string(), "unavailable".to_string())
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!("Loading screen artwork unavailable: {error}");
+            (None, "(none)".to_string(), "unavailable".to_string())
+        }
+    };
+    let direct_storage = crate::pck::readout::state_line(crate::pck::readout::stats());
+    let totals = world_loading_totals();
+    let graph = "Read throughput (MiB/s): sampling...".to_string();
+    let texture = picture.as_ref().map(|fitted| {
+        let pixels = fitted.as_raw().clone();
+        let colour = egui::ColorImage::from_rgba_unmultiplied(
+            [fitted.width() as usize, fitted.height() as usize],
+            &pixels,
+        );
+        ctx.load_texture(
+            "world-loading-picture",
+            colour,
+            egui::TextureOptions::LINEAR,
+        )
+    });
+    let overlay = WorldLoadingOverlay {
+        picture: texture,
+        destination: location.label.clone(),
+        picture_name,
+        phase: 0.,
+        direct_storage,
+        totals,
+        graph,
+    };
+    let status = format!("Starting {} ({note})...", location.label);
+    (overlay, status)
+}
+
+/// Draw the loading UI's text and bar over the picture.
+///
+/// The layout mirrors [`crate::loading_overlay::lines`] and the bar sits at the
+/// same `height - 26` the standalone window uses, so the two paths show the same
+/// screen and can be compared in a screenshot. Text is drawn directly with the
+/// painter rather than as widgets because the overlay is non-interactive and
+/// must not affect layout of anything beneath it.
+fn draw_world_loading_text(
+    ctx: &egui::Context,
+    screen: egui::Rect,
+    overlay: &WorldLoadingOverlay,
+    status: &str,
+) {
+    let height = screen.height();
+    let strip_top = screen.top() + (height - crate::loading_overlay::STRIP_HEIGHT as f32).max(0.0);
+    egui::Area::new(egui::Id::new("world-handoff-loading-text"))
+        .fixed_pos(screen.min)
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .show(ctx, |ui| {
+            let painter = ui.painter();
+            let x = screen.left() + 18.0;
+            let row = |dy: f32| strip_top + dy;
+            let rows: [(f32, &str, egui::FontId, egui::Color32); 4] = [
+                (
+                    14.0,
+                    overlay.direct_storage.as_str(),
+                    egui::FontId::proportional(15.0),
+                    egui::Color32::from_rgb(235, 240, 245),
+                ),
+                (
+                    34.0,
+                    overlay.graph.as_str(),
+                    egui::FontId::monospace(13.0),
+                    egui::Color32::from_rgb(200, 215, 225),
+                ),
+                (
+                    54.0,
+                    overlay.totals.as_str(),
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgb(200, 215, 225),
+                ),
+                (
+                    82.0,
+                    status,
+                    egui::FontId::proportional(17.0),
+                    egui::Color32::from_rgb(255, 236, 190),
+                ),
+            ];
+            for (dy, text, font, colour) in rows {
+                painter.text(
+                    egui::pos2(x, row(dy)),
+                    egui::Align2::LEFT_TOP,
+                    text,
+                    font,
+                    colour,
+                );
+            }
+            // Destination and picture, so a session pin can be chosen by eye.
+            painter.text(
+                egui::pos2(x, screen.bottom() - 30.0),
+                egui::Align2::LEFT_TOP,
+                format!("{}  •  {}", overlay.destination, overlay.picture_name),
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(190, 205, 215),
+            );
+            painter.text(
+                egui::pos2(screen.right() - 18.0, screen.bottom() - 30.0),
+                egui::Align2::RIGHT_TOP,
+                "This window will close when the new world is ready.",
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(160, 175, 185),
+            );
+            // The indeterminate bar, on the same rows the standalone window
+            // invalidates for its animation.
+            let inset = 18.0_f32.min(screen.width() / 4.0);
+            let track = egui::Rect::from_min_size(
+                egui::pos2(screen.left() + inset, screen.bottom() - 26.0),
+                egui::vec2(
+                    (screen.width() - inset * 2.0).max(0.0),
+                    crate::loading_overlay::BAR_THICKNESS as f32,
+                ),
+            );
+            painter.rect_filled(track, 0.0, egui::Color32::from_white_alpha(38));
+            let (start, end) =
+                crate::loading_overlay::bar_segment(track.width().max(0.0) as u32, overlay.phase);
+            if end > start {
+                painter.rect_filled(
+                    egui::Rect::from_min_size(
+                        egui::pos2(track.left() + start as f32, track.top()),
+                        egui::vec2((end - start) as f32, track.height()),
+                    ),
+                    0.0,
+                    egui::Color32::from_rgb(255, 214, 120),
+                );
+            }
+        });
+}
+
+/// The DirectStorage totals line, worded exactly like the loading window's.
+fn world_loading_totals() -> String {
+    let stats = crate::pck::readout::stats();
+    format!(
+        "DirectStorage: {} reads / {:.2} MiB | attempts: {} | fallback: {} | active: {}",
+        stats.successes,
+        stats.bytes as f64 / (1024.0 * 1024.0),
+        stats.attempts,
+        stats.fallbacks,
+        stats.active
+    )
+}
+
+/// Samples DirectStorage throughput while a replacement world loads.
+///
+/// The standalone window samples on its own 500 ms tick; the in-viewer overlay
+/// runs on the viewer's frame loop, so the sampling interval is carried here
+/// instead of being implied by a timer. Keeping it a plain struct with an
+/// explicit `Instant` means the graph can be exercised in a unit test.
+struct ThroughputSampler {
+    samples: std::collections::VecDeque<f64>,
+    previous_bytes: u64,
+    last_sample: std::time::Instant,
+}
+
+impl ThroughputSampler {
+    fn new() -> Self {
+        Self {
+            samples: std::collections::VecDeque::with_capacity(32),
+            previous_bytes: 0,
+            last_sample: std::time::Instant::now(),
+        }
+    }
+
+    /// Add a sample if `interval` has passed, returning the graph line.
+    fn poll(&mut self, interval: std::time::Duration) -> Option<String> {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_sample);
+        if elapsed < interval {
+            return None;
+        }
+        let stats = crate::pck::readout::stats();
+        let rate = crate::loading_graph::mib_per_second(
+            stats.bytes.saturating_sub(self.previous_bytes),
+            elapsed.as_secs_f64(),
+        );
+        self.previous_bytes = stats.bytes;
+        self.last_sample = now;
+        if self.samples.len() == 32 {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(rate);
+        let peak = self.samples.iter().copied().fold(0.0f64, f64::max);
+        Some(format!(
+            "MiB/s (last 16s; peak {peak:.1}): {}",
+            crate::loading_graph::sparkline(self.samples.make_contiguous())
+        ))
+    }
+}
+
+/// Launch a replacement process for another map./// Launch a replacement process for another map. The old process remains the
 /// foreground owner and keeps its own files/focus state; the child only
 /// publishes progress, its HWND, and readiness after a usable frame.
 fn spawn_world_handoff(
@@ -5481,6 +5749,11 @@ pub fn run(
     let mut selected_world_ui = current_map.id.clone();
     let map_zone = current_map.id.clone();
     let mut handoff_files: Option<crate::world_handoff::Files> = None;
+    // The picture and DirectStorage readout the in-viewer loading overlay shows
+    // while a replacement world starts. Built on the change, then only the bar
+    // phase and the status text change per frame.
+    let mut world_loading_overlay: Option<WorldLoadingOverlay> = None;
+    let mut world_loading_sampler = ThroughputSampler::new();
     let mut handoff_rx: Option<std::sync::mpsc::Receiver<crate::world_handoff::Message>> = None;
     let mut handoff_ready_signaled = false;
     let mut saved_settings = settings.clone();
@@ -7005,23 +7278,56 @@ pub fn run(
                                     // Recovery events are polled by the event loop,
                                     // never by this overlay.
                                     if world_loading_active {
-                                        egui::Area::new(egui::Id::new("world-handoff-loading"))
-                                            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.))
-                                            .interactable(false)
-                                            .show(ctx, |ui| {
-                                                egui::Frame::none()
-                                                    .fill(egui::Color32::from_black_alpha(225))
-                                                    .inner_margin(18.)
-                                                    .rounding(8.)
-                                                    .show(ui, |ui| {
-                                                        ui.set_min_width(360.);
-                                                        ui.heading("Changing world…");
-                                                        ui.add_space(8.);
-                                                        ui.label(&world_loading_status);
-                                                        ui.add_space(4.);
-                                                        ui.label(egui::RichText::new("This window will close when the new world is ready.").small().weak());
-                                                    });
-                                            });
+                                        // The same UI the standalone loading window
+                                        // shows: the client's picture filling the view,
+                                        // with the DirectStorage readout, throughput
+                                        // graph, totals, an indeterminate bar and the
+                                        // status line over a darkened strip.
+                                        // `input` is the stable accessor across egui
+                                        // versions; the viewport's rect is what the
+                                        // picture has to cover.
+                                        let screen = ctx.input(|i| i.screen_rect());
+                                        if let Some(overlay) = world_loading_overlay.as_mut() {
+                                            egui::Area::new(egui::Id::new("world-handoff-loading"))
+                                                .fixed_pos(screen.min)
+                                                .order(egui::Order::Foreground)
+                                                .interactable(false)
+                                                .show(ctx, |ui| {
+                                                    ui.set_clip_rect(screen);
+                                                    if let Some(texture) = overlay.picture.as_ref() {
+                                                        // The same `(id, size)` form the
+                                                        // Librarian previews use, which is the
+                                                        // pattern already proven in this viewer.
+                                                        ui.image((texture.id(), screen.size()));
+                                                    } else {
+                                                        // No usable archive picture: the plain
+                                                        // background still has to cover the
+                                                        // old world's frame.
+                                                        ui.painter().rect_filled(
+                                                            screen,
+                                                            0.0,
+                                                            egui::Color32::from_rgb(12, 24, 30),
+                                                        );
+                                                    }
+                                                });
+                                            draw_world_loading_text(ctx, screen, overlay, &world_loading_status);
+                                        } else {
+                                            egui::Area::new(egui::Id::new("world-handoff-loading"))
+                                                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0., 0.))
+                                                .interactable(false)
+                                                .show(ctx, |ui| {
+                                                    egui::Frame::none()
+                                                        .fill(egui::Color32::from_black_alpha(225))
+                                                        .inner_margin(18.)
+                                                        .rounding(8.)
+                                                        .show(ui, |ui| {
+                                                            ui.set_min_width(360.);
+                                                            ui.heading("Changing world…");
+                                                            ui.add_space(8.);
+                                                            ui.label(&world_loading_status);
+                                                        });
+                                                });
+                                        }
                                         return;
                                     }
                                     // Clone the message before the window closure: the
@@ -7157,7 +7463,45 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                                             world_loading_active = true;
                                                             world_change_error = None;
                                                             world_change_notice = None;
-                                                            world_loading_status = format!("Starting {}...", selected_world_ui);
+                                                            // Match the loading picture to the
+                                                            // destination the user picked, before
+                                                            // the replacement process has loaded
+                                                            // anything of its own.
+                                                            world_loading_sampler = ThroughputSampler::new();
+                                                            let destination = catalog
+                                                                .maps
+                                                                .iter()
+                                                                .find(|map| {
+                                                                    map.id.eq_ignore_ascii_case(
+                                                                        &selected_world_ui,
+                                                                    )
+                                                                });
+                                                            match destination {
+                                                                Some(destination) => {
+                                                                    let element = destination
+                                                                        .element
+                                                                        .clone();
+                                                                    let size = (
+                                                                        window.inner_size().width,
+                                                                        window.inner_size().height,
+                                                                    );
+                                                                    let (overlay, status) = build_world_loading_overlay(
+                                                                        &egui_ctx,
+                                                                        &element,
+                                                                        destination,
+                                                                        size,
+                                                                    );
+                                                                    world_loading_overlay = Some(overlay);
+                                                                    world_loading_status = status;
+                                                                }
+                                                                None => {
+                                                                    world_loading_overlay = None;
+                                                                    world_loading_status = format!(
+                                                                        "Starting {}...",
+                                                                        selected_world_ui
+                                                                    );
+                                                                }
+                                                            }
                                                             menu_page = MenuPage::Closed;
                                                             keys.clear();
                                                             if captured {
@@ -7463,6 +7807,14 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                             Ok(crate::world_handoff::Message::Progress(status)) => {
                                 world_loading_status = status;
                             }
+                            Ok(crate::world_handoff::Message::WindowShown) => {
+                                // The replacement's own loading window is now on
+                                // screen with the same picture this overlay drew.
+                                // Hiding this window hands the screen over without
+                                // a visible swap, and stops two maximised loading
+                                // screens from fighting over the foreground.
+                                window.set_visible(false);
+                            }
                             Ok(crate::world_handoff::Message::Ready { activated }) => {
                                 // The replacement is visible and has presented
                                 // a usable frame. Exit this old process without
@@ -7526,6 +7878,23 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                     }
                     if keep_receiver {
                         handoff_rx = Some(rx);
+                    }
+                }
+                // Animate the in-viewer loading UI. The picture is already a
+                // texture, so only the bar phase and the DirectStorage lines
+                // change; that keeps the overlay cheap while a replacement
+                // world loads beside it.
+                if world_loading_active {
+                    if let Some(overlay) = world_loading_overlay.as_mut() {
+                        overlay.phase = (overlay.phase + 0.10) % std::f32::consts::TAU;
+                        overlay.direct_storage =
+                            crate::pck::readout::state_line(crate::pck::readout::stats());
+                        overlay.totals = world_loading_totals();
+                        if let Some(graph) =
+                            world_loading_sampler.poll(std::time::Duration::from_millis(500))
+                        {
+                            overlay.graph = graph;
+                        }
                     }
                 }
                 window.request_redraw();

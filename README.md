@@ -14,7 +14,7 @@ See the [full 76-point plan reassessment](Findings/Eight-phase-reassessment-2026
 - Authored world effects from the map's own ECWLD records and ECM model events: waterfalls, fire, mist, glows and sun shafts, positioned from the scene, played on the scene clock and textured from `gfx.pck`. A texture that an effect names but the archive lacks draws in its authored vertex colour rather than removing the effect.
 - Client SpeedTree geometry through the client's 32-bit runtime, with sampled leaf motion and approximate LOD; locally streamed grass from client placements and meshes.
 - Experimental animated water, per-height reflections and refraction, shoreline waves, underwater effects, environmental fog, sky, time-of-day control and optional bloom.
-- A full-screen loading window filled with a randomly chosen picture from the client's own `surfaces.pck`, with the DirectStorage readout, throughput graph and an indeterminate progress bar over it. See [Loading screen](#loading-screen).
+- A full-screen loading window filled with a picture from the client's own `surfaces.pck`, with the DirectStorage readout, throughput graph and an indeterminate progress bar over it. A world change from the Teleport List shows the same UI in the running viewer and then in the replacement process, with the picture matched to the destination by name where the archive names its art after a place and a random picture otherwise. See [Loading screen](#loading-screen).
 - Searchable teleport destinations, original and rendered world maps, a minimap, zone notices, Windows zone music, experimental stereo zone ambience and experimental positional world effects.
 - Windows launcher with remembered client folder and settings, and in-app Graphics, World, Sound and Interface controls. Settings → Graphics → **Resolution scale** renders the 3D world at 10–200% of the window size (default 100%) and upscales it, while the UI stays at native resolution; lower values trade sharpness for speed, higher values supersample. The same tab has the **Upscaling** (Off / DLSS Super Resolution / FSR 1 / FSR 2 / FSR 3.1 / FSR 4.1 / XeSS), **Frame generation** and **Latency** (VSync / XeLL — Intel Xe Low Latency) selectors; resolution scale applies only when Upscaling is Off. See [Upscaling and frame generation](#upscaling-and-frame-generation-optional).
 - An optional **Modules** add-on list. **Walker** loads a clothed native player character and supports terrain walking, source-backed run/jump mechanics, and first- or third-person cameras. Its integrated **Character Designer** reads PW 1.4.2 v27 catalogs and native presets, edits body/face/equipment data, saves GBK presets, and rebuilds the same spawned Walker. The executable discovers installed module packages beside itself; modules own their state and do not change persisted core settings.
@@ -77,6 +77,55 @@ picture fills the window while the progress UI stays legible.
   optional) pins one picture for a session; an unknown name logs and falls back
   to the random draw.
 - `PWE_LOADING_WINDOWED=1` keeps the window framed instead of maximised.
+
+#### Changing worlds from the Teleport List
+
+A world change is a **replacement process**, so the loading screen for it is
+shown twice from one matched picture: the running viewer draws it over its own
+last frame as soon as the change is accepted, and the replacement process opens
+its own full-screen loading window with the same picture while it loads terrain.
+The old window hides the moment the replacement publishes its window handle, so
+the swap is invisible and only one loading screen is ever visible.
+
+Both are the same UI: the picture fills the view, and the DirectStorage status
+line, throughput graph, read totals, an indeterminate bar and the status text sit
+over a darkened strip at the bottom. The replacement's status line reports what
+it is actually doing (`Loading world a01...`), and the corner names the
+destination and the picture file.
+
+**Matching the picture to the destination.** The destination's map folder
+(`a01`), its client name from `instance.txt` and its display name are matched
+against the archive's own file names as whole tokens, so a client whose
+`surfaces.pck` names art after places (`surfaces/archosaur.jpg`) shows that
+place's art. A name written the client's way (`Heaven's Tear`) matches a stem
+written the archive's way (`heavens-tear.jpg`); `b05` never matches `b050` and
+`world` never matches `underworld`.
+
+The retail client has nothing to match: its loading art is the numbered
+`载入<size>-<n>.jpg` family (eleven artworks, shipped for 1024-, 1280- and 16:9
+screens) and nothing in `configs.pck` pairs a picture with a map. A destination
+that names nothing in the archive therefore **falls back to a random picture**,
+and the log says which of the three routes was used:
+
+```
+Loading screen for Archosaur (a01): surfaces/archosaur.jpg (location name)
+Loading screen for (b05): surfaces/载入16-9-7.jpg (random)
+Loading screen for (a01): surfaces/载入16-9-3.jpg (location pin)
+```
+
+Because the numbered pictures carry no place names, the honest way to pin one by
+location is to look at them once and then pin the artwork for a session:
+
+- `PWE_LOADING_PICTURE=7` shows artwork 7 for every load, and accepts the same
+  forms a log or listing prints (`载入16-9-7`, `surfaces/载入1024-7.jpg`). The
+  number is resolution-independent, so the client's 7th artwork is shown at
+  whichever size exists.
+- The family that suits the window's aspect ratio is preferred, so a 16:9 screen
+  shows the 16:9 set and the cover fit crops nothing. A client that ships only
+  one family still works.
+
+Nothing is invented for the retail gap: the fallback is a real picture from the
+client's own archive, never a bundled or generated one.
 
 The lookup, random choice, decode and cover fit are shared with
 `loading-screen-check`, which runs the same path against a staged retail client

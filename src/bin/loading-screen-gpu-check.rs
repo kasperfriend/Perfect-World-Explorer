@@ -21,6 +21,11 @@ use wgpu::util::DeviceExt;
 #[allow(dead_code)]
 #[path = "../loading_screen.rs"]
 mod loading_screen;
+// The in-viewer overlay reuses the same strip blend and bar geometry; its frame
+// composition is checked here so the two loading UIs cannot drift apart.
+#[allow(dead_code)]
+#[path = "../loading_overlay.rs"]
+mod loading_overlay;
 #[allow(dead_code)]
 #[path = "../pck.rs"]
 mod pck;
@@ -200,6 +205,10 @@ fn main() {
         ("surfaces/background.jpg".to_string(), jpeg()),
         ("surfaces/loading03.bmp".to_string(), bmp()),
         ("surfaces/broken.jpg".to_string(), b"not a jpeg".to_vec()),
+        // A client that names its art after a place, so the location match is
+        // exercised against real file names rather than a table.
+        ("surfaces/archosaur.jpg".to_string(), jpeg()),
+        ("surfaces/载入16-9-1.jpg".to_string(), jpeg()),
         ("surfaces/maps/000.dds".to_string(), dds()),
         ("surfaces/iconset/iconlist_ivtrm.dds".to_string(), dds()),
     ];
@@ -211,10 +220,13 @@ fn main() {
     assert_eq!(
         names,
         vec![
+            "surfaces/archosaur.jpg",
             "surfaces/background.jpg",
             "surfaces/broken.jpg",
-            "surfaces/loading03.bmp"
-        ]
+            "surfaces/loading03.bmp",
+            "surfaces/载入16-9-1.jpg"
+        ],
+        "root listing changed: {names:?}"
     );
     if loading_screen::pick(&listed, 0).unwrap().path != "surfaces/background.jpg" {
         failures.push("pick(word 0) did not select the first picture".into());
@@ -269,7 +281,77 @@ fn main() {
         failures.push("the corrupt JPEG decoded instead of failing".into());
     }
 
-    // 3. Cover fit and the overlay strip at a laptop, a 4K and a portrait size.
+    // 3. Location matching. A destination whose name appears as a whole token in
+    //    the archive is matched to that picture; a destination the archive does
+    //    not name falls back to the random family instead of inventing one.
+    let archosaur = loading_screen::Location::new("a01", "Archosaur", "祖龙城");
+    match loading_screen::choose_for_location(&element, &archosaur.needles, None, 1280, 720, 0) {
+        Ok((picture, source)) => {
+            if picture.path != "surfaces/archosaur.jpg" {
+                failures.push(format!(
+                    "Archosaur matched {:?} instead of surfaces/archosaur.jpg",
+                    picture.path
+                ));
+            }
+            if source != "location name" {
+                failures.push(format!("Archosaur match reported as {source:?}"));
+            }
+        }
+        Err(error) => failures.push(format!("Archosaur did not resolve: {error}")),
+    }
+    // `world` is not a token in any fixture name, so this must fall back rather
+    // than matching `background.jpg`'s substring.
+    let unnamed = loading_screen::Location::new("zz9", "Nowhere", "Nowhere");
+    match loading_screen::choose_for_location(&element, &unnamed.needles, None, 1280, 720, 3) {
+        Ok((_, source)) if source == "random" => {}
+        Ok((picture, source)) => failures.push(format!(
+            "an unnamed destination reported {source:?} ({:?}) instead of a random fallback",
+            picture.path
+        )),
+        Err(error) => failures.push(format!("an unnamed destination failed: {error}")),
+    }
+    // A pin naming artwork 1 resolves the numbered family at the window's
+    // aspect ratio, and a pin the archive does not hold falls back instead of
+    // blanking the screen.
+    let pin = loading_screen::Pic {
+        number: 1,
+        matched: "test".into(),
+    };
+    match loading_screen::choose_for_location(&element, &unnamed.needles, Some(&pin), 16, 9, 0) {
+        Ok((picture, source)) if source == "location pin" => {
+            if picture.path != "surfaces/载入16-9-1.jpg" {
+                failures.push(format!(
+                    "pin 1 resolved {:?} instead of surfaces/载入16-9-1.jpg",
+                    picture.path
+                ));
+            }
+        }
+        Ok((picture, source)) => {
+            failures.push(format!("pin 1 reported {source:?} ({:?})", picture.path))
+        }
+        Err(error) => failures.push(format!("pin 1 was not resolved: {error}")),
+    }
+    let absent = loading_screen::Pic {
+        number: 9,
+        matched: "test".into(),
+    };
+    match loading_screen::choose_for_location(
+        &element,
+        &unnamed.needles,
+        Some(&absent),
+        640,
+        480,
+        0,
+    ) {
+        Ok((_, source)) if source == "random" => {}
+        Ok((picture, source)) => failures.push(format!(
+            "an absent pin reported {source:?} ({:?}) instead of falling back",
+            picture.path
+        )),
+        Err(error) => failures.push(format!("an absent pin failed: {error}")),
+    }
+
+    // 4. Cover fit and the overlay strip at a laptop, a 4K and a portrait size.
     let picture = listed
         .iter()
         .find(|picture| picture.path == "surfaces/background.jpg")
@@ -292,7 +374,62 @@ fn main() {
         surfaces.push((width, height, bgra));
     }
 
-    // 4. Upload the fitted BGRA bytes to a GPU texture and read them back.
+    // 5. The in-viewer overlay composes the same picture, strip and bar into an
+    //    RGBA frame. A client with no usable archive still gets the background.
+    let status = loading_overlay::Status {
+        direct_storage: "DirectStorage ready".into(),
+        graph: "Read throughput (MiB/s): -".into(),
+        totals: "DirectStorage: 0 reads".into(),
+        message: "Loading world a01...".into(),
+        phase: 0.5,
+        picture: "surfaces/background.jpg".into(),
+    };
+    // Re-decode rather than reusing the earlier `source`: that value was moved
+    // into the fit loop above, and a second decode of the same 64x40 fixture
+    // costs nothing while keeping the phases independent.
+    let overlay_source = loading_screen::decode(&element, picture).unwrap();
+    for (width, height) in [(1280u32, 720u32), (3840, 2160)] {
+        let fitted = loading_screen::fill(&overlay_source, width, height).expect("cover fit");
+        match loading_overlay::compose(Some(&fitted), width, height, &status) {
+            Ok(frame) if frame.len() == width as usize * height as usize * 4 => {
+                // The strip must actually darken the picture. Compare a whole
+                // row rather than one byte, so a single already-dark pixel
+                // cannot make a broken blend look correct.
+                let stride = width as usize * 4;
+                let last_row = (height as usize - 1) * stride;
+                let before: u64 = fitted.as_raw()[last_row..last_row + stride]
+                    .iter()
+                    .map(|byte| *byte as u64)
+                    .sum();
+                let after: u64 = frame[last_row..last_row + stride]
+                    .iter()
+                    .map(|byte| *byte as u64)
+                    .sum();
+                if after >= before {
+                    failures.push(format!(
+                        "{width}x{height}: overlay did not darken the last row ({before} -> {after})"
+                    ));
+                }
+            }
+            Ok(frame) => failures.push(format!(
+                "{width}x{height}: overlay frame was {} bytes",
+                frame.len()
+            )),
+            Err(error) => failures.push(format!("{width}x{height}: overlay failed: {error}")),
+        }
+    }
+    // A frame with no picture is still a valid, fully covered frame.
+    match loading_overlay::compose(None, 320, 200, &status) {
+        Ok(frame) if frame.len() == 320 * 200 * 4 => {
+            if &frame[0..4] != &loading_overlay::BACKGROUND {
+                failures.push("a picture-less overlay did not use the background colour".into());
+            }
+        }
+        Ok(frame) => failures.push(format!("a picture-less overlay was {} bytes", frame.len())),
+        Err(error) => failures.push(format!("a picture-less overlay failed: {error}")),
+    }
+
+    // 6. Upload the fitted BGRA bytes to a GPU texture and read them back.
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::all(),
         ..Default::default()

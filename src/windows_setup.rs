@@ -421,25 +421,9 @@ pub fn loading_progress(message: String) {
     }
 }
 pub(crate) fn directstorage_state(stats: crate::pck::direct_storage::ReadStats) -> String {
-    if !crate::pck::direct_storage::compiled_in() {
-        return "DirectStorage not built in; standard file I/O is in use".into();
-    }
-    if stats.successes > 0 {
-        return format!(
-            "Using DirectStorage in loading — ACTIVE ({} successful reads)",
-            stats.successes
-        );
-    }
-    if stats.fallbacks > 0 {
-        return format!(
-            "DirectStorage attempts fell back to standard I/O ({} so far)",
-            stats.fallbacks
-        );
-    }
-    if stats.active > 0 {
-        return format!("DirectStorage read in progress ({} active)", stats.active);
-    }
-    "DirectStorage ready; waiting for eligible archive reads (64 KiB+)".into()
+    // One implementation, shared with the in-viewer overlay: the standalone
+    // window and the overlay must never describe the same counters differently.
+    crate::pck::direct_storage::state_line(stats)
 }
 
 use crate::launcher_ui;
@@ -1111,9 +1095,43 @@ const LOADING_WINDOWED_ENV: &str = "PWE_LOADING_WINDOWED";
 /// Runs on the loading thread before the window is shown, so a corrupt archive
 /// can only cost this one step: every failure is reported and the window falls
 /// back to its plain background instead of failing the world load.
-fn loading_background(element: &Path, width: u32, height: u32) -> (Option<LoadingArt>, String) {
-    let picture = match crate::loading_screen::choose(element, crate::loading_screen::random_word())
-    {
+/// The loading picture for a destination, decoded and fitted.
+///
+/// `location` is the destination's identity when the load is switching worlds:
+/// its map id and the client's own names for it. The picture is matched against
+/// the archive by those names, then by the session pin, then falls back to a
+/// random picture from the family that suits the window's aspect ratio. A
+/// destination that names no art in the archive takes the random fallback and
+/// says so in the log; nothing is invented to fill the gap.
+fn loading_background(
+    element: &Path,
+    width: u32,
+    height: u32,
+    location: Option<&crate::loading_screen::Location>,
+) -> (Option<LoadingArt>, String) {
+    let word = crate::loading_screen::random_word();
+    let chosen = match location {
+        Some(location) => crate::loading_screen::choose_for_location(
+            element,
+            &location.needles,
+            crate::loading_screen::pinned_picture().as_ref(),
+            width,
+            height,
+            word,
+        )
+        .map(|(picture, source)| {
+            eprintln!(
+                "Loading screen for {} matched by {source}: {}",
+                location.label, picture.path
+            );
+            picture
+        }),
+        None => crate::loading_screen::choose(element, word).map(|picture| {
+            eprintln!("Loading screen: {} chosen at random", picture.path);
+            picture
+        }),
+    };
+    let picture = match chosen {
         Ok(picture) => picture,
         Err(error) => {
             eprintln!("Loading screen artwork unavailable: {error}");
@@ -1155,6 +1173,17 @@ impl LoadingWindow {
     /// maximised - the same style the viewer window uses - so the picture fills
     /// the screen rather than sitting inside a small frame.
     pub fn start(client: Option<&Path>) -> Self {
+        Self::start_for(client, None)
+    }
+
+    /// Open the loading window for a specific destination.
+    ///
+    /// [`LoadingWindow::start`] is the same call with no destination, which the
+    /// first load uses because the map has not been resolved yet.
+    pub fn start_for(
+        client: Option<&Path>,
+        location: Option<&crate::loading_screen::Location>,
+    ) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = stop.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -1166,6 +1195,7 @@ impl LoadingWindow {
             *guard = Some(status_tx);
         }
         let client = client.map(Path::to_path_buf);
+        let location = location.cloned();
         let thread = std::thread::spawn(move || unsafe {
             let class = wide("PerfectWorldExplorerLoading");
             let text = wide("Perfect World Explorer — Loading");
@@ -1194,7 +1224,7 @@ impl LoadingWindow {
             let (art, note) = match client.as_deref() {
                 Some(root) => {
                     let element = crate::loading_screen::element_folder(root);
-                    loading_background(&element, 1280, 720)
+                    loading_background(&element, 1280, 720, location.as_ref())
                 }
                 None => (
                     None,

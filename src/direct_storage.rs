@@ -40,6 +40,34 @@ pub(crate) const fn compiled_in() -> bool {
     cfg!(pwe_directstorage)
 }
 
+/// One sentence describing what DirectStorage is doing right now.
+///
+/// Lives beside the counters rather than in the Windows window so the in-viewer
+/// loading overlay, which is compiled on every host, can print the same line the
+/// standalone window prints. A divergence between the two would be a bug the
+/// screenshots would show but nothing would catch.
+pub(crate) fn state_line(stats: ReadStats) -> String {
+    if !compiled_in() {
+        return "DirectStorage not built in; standard file I/O is in use".into();
+    }
+    if stats.successes > 0 {
+        return format!(
+            "Using DirectStorage in loading — ACTIVE ({} successful reads)",
+            stats.successes
+        );
+    }
+    if stats.fallbacks > 0 {
+        return format!(
+            "DirectStorage attempts fell back to standard I/O ({} so far)",
+            stats.fallbacks
+        );
+    }
+    if stats.active > 0 {
+        return format!("DirectStorage read in progress ({} active)", stats.active);
+    }
+    "DirectStorage ready; waiting for eligible archive reads (64 KiB+)".into()
+}
+
 #[cfg(all(windows, pwe_directstorage))]
 mod enabled {
     use std::{

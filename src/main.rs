@@ -91,6 +91,7 @@ mod loading_graph;
 // The client's own loading artwork: the Windows loading window fills itself from
 // `surfaces.pck`, and the headless fixture check exercises the same lookup and
 // decode. Declared unconditionally so the path stays tested on every host.
+mod loading_overlay;
 mod loading_screen;
 mod material;
 mod model_asset;
@@ -3718,15 +3719,29 @@ fn main() {
     // come from - lives in `element`. A folder that cannot be resolved leaves
     // the window on its plain background and says so, instead of failing the
     // load over artwork.
+    //
+    // The window also opens for a handoff child, because a world change from the
+    // Teleport List used to leave nothing on screen but the old process's name.
+    // The child runs this window on its own thread while it loads terrain, so
+    // the picture and the DirectStorage readout stay live during the part of the
+    // change that actually takes the time. The old process hides its own copy as
+    // soon as the child publishes its HWND.
     #[cfg(windows)]
-    let loading = if world_handoff::is_handoff_child() {
-        None
-    } else {
-        let element = world_catalog::resolve(&path, Some(&selected_world))
-            .ok()
+    let loading = {
+        let resolved = world_catalog::resolve(&path, Some(&selected_world)).ok();
+        let element = resolved
+            .as_ref()
             .map(|map| map.element.clone())
             .unwrap_or_else(|| loading_screen::element_folder(&path));
-        Some(windows_setup::LoadingWindow::start(Some(&element)))
+        // The destination's own names, so the picture is matched to the place
+        // instead of only drawn at random.
+        let location = resolved
+            .as_ref()
+            .map(|map| loading_screen::Location::new(&map.id, &map.display_name, &map.name));
+        Some(windows_setup::LoadingWindow::start_for(
+            Some(&element),
+            location.as_ref(),
+        ))
     };
     // Loading terrain is the only operation that can be retried in-process.
     // PR #40 showed that retrying `gpu::run` after a visible window has been

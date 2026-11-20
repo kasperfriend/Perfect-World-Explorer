@@ -156,6 +156,297 @@ pub fn choose(element: &Path, random_word: u64) -> Result<Picture, String> {
         .ok_or_else(|| "no loading-screen picture available".to_string())
 }
 
+/// How many pictures the numbered `载入` family holds per resolution.
+///
+/// The retail archive ships the same eleven artworks three times, sized for a
+/// 1024-, a 1280- and a 16:9 screen. The count is fixed by the client, not read
+/// from the archive, because a modified client that adds or drops a picture must
+/// not shift which artwork a location resolves to.
+const LOADING_PICTURES: u32 = 11;
+
+/// A location the archive has (or is believed to have) its own loading art for.
+///
+/// The retail archive has no zone-named artwork: every loading screen is one of
+/// the eleven numbered `载入<size>-<n>.jpg` pictures, and nothing in
+/// `configs.pck` pairs them with a map. `Pic` therefore never selects a picture
+/// by map name; it is an explicit, user-facing pin for a client whose archive
+/// *does* name its art after a place, plus a stable way to ask for one of the
+/// numbered pictures by eye ("the mountain one", "the one with the dragon").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pic {
+    /// Picture number inside the numbered family, `1..=`[`LOADING_PICTURES`].
+    pub number: u32,
+    /// Archive file stem the location was matched on, for the log line.
+    pub matched: String,
+}
+
+/// A destination a loading screen is being shown for.
+///
+/// Built before the new world's terrain exists, so this carries only what the
+/// catalog already knows: the map folder id and the client's own names for it.
+/// `needles` is pre-computed because matching runs once per load and the
+/// priorities matter more than the raw strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Location {
+    /// Map folder id, e.g. `world`, `a01`.
+    pub id: String,
+    /// Human-readable name for the log line, e.g. `Archosaur (a01)`.
+    pub label: String,
+    /// Identifiers a picture name may contain, longest first.
+    pub needles: Vec<String>,
+}
+
+impl Location {
+    /// Build a destination from the catalog entry the Teleport List selected.
+    pub fn new(id: &str, display_name: &str, client_name: &str) -> Self {
+        let label = if display_name.trim().is_empty() {
+            id.to_string()
+        } else {
+            format!("{} ({id})", display_name.trim())
+        };
+        let needles = location_needles(id, &[display_name, client_name])
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        Self {
+            id: id.to_string(),
+            label,
+            needles,
+        }
+    }
+}
+
+/// Resolve a location name to a picture by matching the archive's *file names*.
+///
+/// `needles` are the location identifiers in priority order — map folder
+/// (`a01`), client name (`Archosaur`), display name. A picture whose file stem
+/// contains one of them as a whitespace/underscore-separated token is a match;
+/// the shortest matching needle wins so `a01` cannot be shadowed by `a010`.
+/// Matching is ASCII-case-insensitive and token-based, so `b05` does not match
+/// `b050` and `world` does not match `underworld`.
+///
+/// Returns `None` when the archive names nothing after the location, which is
+/// the retail case: the caller then falls back to a random picture. That is a
+/// real answer, not a failure — nothing is invented to fill it.
+pub fn match_location(pictures: &[Picture], needles: &[&str]) -> Option<Picture> {
+    let mut best: Option<(usize, &Picture)> = None;
+    for picture in pictures {
+        let stem = picture
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(picture.path.as_str())
+            .rsplit_once('.')
+            .map(|(stem, _)| stem)
+            .unwrap_or(picture.path.as_str());
+        // Both sides are reduced to a run of lowercase alphanumeric tokens so a
+        // name written `Heaven's Tear` matches a stem written `heavens-tear`:
+        // the client's own names use spaces and punctuation, while archives
+        // replace them with underscores and hyphens.
+        let stem_tokens = tokens(stem);
+        if stem_tokens.is_empty() {
+            continue;
+        }
+        for needle in needles {
+            let needle_tokens = tokens(needle);
+            if needle_tokens.is_empty() || needle_tokens.len() > stem_tokens.len() {
+                continue;
+            }
+            // A contiguous run of whole tokens counts, so `heavens tear` matches
+            // and a short id like `b05` still cannot match `b050`.
+            let matched = stem_tokens
+                .windows(needle_tokens.len())
+                .any(|window| window == needle_tokens.as_slice());
+            if !matched {
+                continue;
+            }
+            let length = needle_tokens.iter().map(String::len).sum::<usize>();
+            if best.map_or(true, |(best_length, _)| length > best_length) {
+                best = Some((length, picture));
+            }
+        }
+    }
+    best.map(|(_, picture)| picture.clone())
+}
+
+/// Lowercase alphanumeric tokens of a name, with every separator dropped.
+///
+/// Apostrophes are removed rather than treated as separators, so the client's
+/// `Heaven's Tear` produces `heavens`, `tear` instead of also producing a
+/// stray `s` token.
+fn tokens(name: &str) -> Vec<String> {
+    name.to_lowercase()
+        .replace(['\'', '\u{2019}'], "")
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The picture number of a numbered-family stem, if it names one.
+///
+/// `载入16-9-7` and `载入1024-7` both name artwork 7, so a location pinned to one
+/// resolution shows the same artwork at every resolution.
+fn numbered_stem(stem: &str) -> Option<u32> {
+    let (_, number) = stem.rsplit_once('-')?;
+    let number = number.parse::<u32>().ok()?;
+    (1..=LOADING_PICTURES).contains(&number).then_some(number)
+}
+
+/// Prefer the pictures that match the screen's aspect ratio.
+///
+/// The client ships the same artwork three times; showing the 16:9 set on a
+/// 16:9 screen and the 4:3 sets on a 4:3 one means the cover fit crops nothing.
+/// Every family is still a candidate, so a client that ships only one of them
+/// keeps working.
+fn prefer_aspect(pictures: &[Picture], width: u32, height: u32) -> Vec<Picture> {
+    let wide = (width as f32) / (height.max(1) as f32) >= 1.5;
+    let suffix = if wide {
+        "16-9-"
+    } else if width >= 1280 {
+        "1280-"
+    } else {
+        "1024-"
+    };
+    let preferred: Vec<Picture> = pictures
+        .iter()
+        .filter(|picture| picture.path.contains(suffix))
+        .cloned()
+        .collect();
+    if preferred.is_empty() {
+        pictures.to_vec()
+    } else {
+        preferred
+    }
+}
+
+/// Choose the picture a location should show.
+///
+/// Order: an explicit pin, then a name match against the archive, then a random
+/// picture from the family that suits the window's aspect ratio. A pin that the
+/// archive does not hold is reported and skipped rather than blanking the
+/// window, the same rule [`choose`] applies to `PWE_LOADING_SCREEN`.
+pub fn choose_for_location(
+    element: &Path,
+    needles: &[&str],
+    pin: Option<&Pic>,
+    width: u32,
+    height: u32,
+    random_word: u64,
+) -> Result<(Picture, &'static str), String> {
+    let pictures = list(element)?;
+    if pictures.is_empty() {
+        return Err(format!(
+            "{} has no root-level loading-screen pictures",
+            element.join(ARCHIVE_NAME).display()
+        ));
+    }
+    let family = prefer_aspect(&pictures, width, height);
+    if let Some(pin) = pin {
+        if let Some(found) = family.iter().find(|picture| {
+            picture
+                .path
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.rsplit_once('.').map(|(stem, _)| stem))
+                .and_then(numbered_stem)
+                == Some(pin.number)
+        }) {
+            return Ok((found.clone(), "location pin"));
+        }
+        // The pinned family may not ship at this aspect ratio; the pin still
+        // names an artwork, so look for it in every family before giving up.
+        if let Some(found) = pictures.iter().find(|picture| {
+            picture
+                .path
+                .rsplit('/')
+                .next()
+                .and_then(|name| name.rsplit_once('.').map(|(stem, _)| stem))
+                .and_then(numbered_stem)
+                == Some(pin.number)
+        }) {
+            return Ok((found.clone(), "location pin"));
+        }
+        eprintln!(
+            "Loading screen pin {} ({}) is not in {}; choosing another picture",
+            pin.number,
+            pin.matched,
+            element.join(ARCHIVE_NAME).display()
+        );
+    }
+    if let Some(found) =
+        match_location(&family, needles).or_else(|| match_location(&pictures, needles))
+    {
+        return Ok((found, "location name"));
+    }
+    let picked = pick(&family, random_word)
+        .cloned()
+        .ok_or_else(|| "no loading-screen picture available".to_string())?;
+    Ok((picked, "random"))
+}
+
+/// Environment pin that names one numbered artwork, e.g.
+/// `PWE_LOADING_PICTURE=7`.
+///
+/// This is the honest way to pick a loading screen by location on the retail
+/// client, whose eleven pictures carry no place names: the user looks at the
+/// pictures once, writes down which one each destination should show in their
+/// own notes, and pins it per session. [`Pic::matched`] says where the number
+/// came from so the log is never a bare integer.
+pub fn pinned_picture() -> Option<Pic> {
+    let raw = std::env::var("PWE_LOADING_PICTURE").ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Accept `7`, `载入16-9-7` and `surfaces/载入1024-7.jpg`, so a pin can be
+    // copied straight out of a log line or an archive listing.
+    let stem = raw
+        .rsplit('/')
+        .next()
+        .unwrap_or(raw)
+        .rsplit_once('.')
+        .map(|(stem, _)| stem)
+        .unwrap_or(raw);
+    match numbered_stem(stem).or_else(|| raw.parse::<u32>().ok()) {
+        Some(number) if (1..=LOADING_PICTURES).contains(&number) => Some(Pic {
+            number,
+            matched: raw.to_string(),
+        }),
+        _ => {
+            eprintln!(
+                "PWE_LOADING_PICTURE={raw} is not one of the {LOADING_PICTURES} numbered loading pictures (1..={LOADING_PICTURES}); ignoring it"
+            );
+            None
+        }
+    }
+}
+
+/// The location identifiers a picture name is matched against, in priority
+/// order.
+///
+/// The client's own `instance.txt` names a map in the script the client renders
+/// (`Archosaur`, `Heaven's Tear`), while the archive and the folder tree use the
+/// ASCII id (`a01`, `b05`). Both are offered, longest first, because a client
+/// that names its art after a place may have used either. Empty entries are
+/// dropped so a partially resolved catalog entry cannot match everything.
+pub fn location_needles<'a>(map_id: &'a str, names: &'a [&'a str]) -> Vec<&'a str> {
+    let mut needles: Vec<&str> = names
+        .iter()
+        .copied()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    let id = map_id.trim();
+    if !id.is_empty() {
+        needles.push(id);
+    }
+    // Longest first: `Heaven's Tear` must win over a bare `tear` in another name.
+    needles.sort_by_key(|needle| std::cmp::Reverse(needle.len()));
+    needles.dedup();
+    needles
+}
+
 /// Read and decode one picture to tightly packed RGBA8.
 ///
 /// Returns the image and its pixel dimensions. Every failure names the archive
@@ -333,15 +624,53 @@ pub fn overlay_strip(
     } else {
         0.
     };
+    let mut result = source.to_vec();
+    overlay_strip_in_place(
+        &mut result,
+        width,
+        height,
+        strip_height,
+        fade_height,
+        max_alpha,
+    )?;
+    Ok(result)
+}
+
+/// [`overlay_strip`] applied to a buffer in place.
+///
+/// The in-viewer loading overlay owns its frame and must not clone a 4K picture
+/// to darken a strip along the bottom of it, so the blend runs once here and
+/// both callers share it. The maths is identical to [`overlay_strip`]: alpha
+/// ramps linearly across `fade_height` from the top of the strip and then holds
+/// at `max_alpha`, and the alpha byte is preserved.
+pub fn overlay_strip_in_place(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    strip_height: u32,
+    fade_height: u32,
+    max_alpha: f32,
+) -> Result<(), String> {
+    let expected = width as usize * height as usize * 4;
+    if frame.len() != expected {
+        return Err(format!(
+            "RGBA frame is {} bytes, expected {expected} for {width}x{height}",
+            frame.len()
+        ));
+    }
+    let max_alpha = if max_alpha.is_finite() {
+        max_alpha.clamp(0., 1.)
+    } else {
+        0.
+    };
     let strip_height = strip_height.min(height);
     let fade_height = fade_height.min(strip_height);
+    if strip_height == 0 {
+        return Ok(());
+    }
     let strip_top = height - strip_height;
     let fade_top = strip_top + fade_height;
-    let mut result = source.to_vec();
-    for y in 0..height {
-        if y < strip_top {
-            continue;
-        }
+    for y in strip_top..height {
         let alpha = if y < fade_top && fade_height > 0 {
             max_alpha * (y - strip_top) as f32 / fade_height as f32
         } else {
@@ -352,11 +681,11 @@ pub fn overlay_strip(
         for x in 0..width as usize {
             let offset = row + x * 4;
             for channel in 0..3 {
-                result[offset + channel] = (result[offset + channel] as f32 * keep) as u8;
+                frame[offset + channel] = (frame[offset + channel] as f32 * keep) as u8;
             }
         }
     }
-    Ok(result)
+    Ok(())
 }
 
 /// BGRA8 for a Windows `BITMAPINFO`-style DIB blit with 32-bit pixels.
@@ -650,5 +979,98 @@ mod tests {
     fn a_broken_payload_is_an_error_not_a_blank_picture() {
         assert!(decode_rgba(b"not a picture").is_err());
         assert!(decode_rgba(&[]).is_err());
+    }
+
+    fn picture(path: &str) -> Picture {
+        Picture {
+            path: path.to_string(),
+            size: 1,
+        }
+    }
+
+    #[test]
+    fn a_location_matches_only_a_whole_name_token() {
+        let pictures = vec![
+            picture("surfaces/载入16-9-1.jpg"),
+            picture("surfaces/archosaur.jpg"),
+            picture("surfaces/b050.jpg"),
+            picture("surfaces/underworld.jpg"),
+        ];
+        // A whole token matches.
+        assert_eq!(
+            match_location(&pictures, &["Archosaur"]).unwrap().path,
+            "surfaces/archosaur.jpg"
+        );
+        // `b05` must not match `b050`, and `world` must not match `underworld`.
+        assert!(match_location(&pictures, &["b05"]).is_none());
+        assert!(match_location(&pictures, &["world"]).is_none());
+        // An empty needle can never match everything.
+        assert!(match_location(&pictures, &["", "  "]).is_none());
+    }
+
+    #[test]
+    fn the_longest_matching_needle_wins() {
+        let pictures = vec![
+            picture("surfaces/tear.jpg"),
+            picture("surfaces/heavens-tear.jpg"),
+        ];
+        // `heavens-tear.jpg` matches both needles and `tear.jpg` matches one, so
+        // the specific name has to win or every "Tear" destination would share
+        // a single generic picture.
+        let found = match_location(&pictures, &["heavens tear", "tear"]).unwrap();
+        assert_eq!(found.path, "surfaces/heavens-tear.jpg");
+        // A name written with the client's punctuation still matches a stem
+        // written with the archive's separators.
+        let apostrophe = vec![picture("surfaces/heavens-tear.jpg")];
+        assert_eq!(
+            match_location(&apostrophe, &["Heaven's Tear"])
+                .unwrap()
+                .path,
+            "surfaces/heavens-tear.jpg"
+        );
+    }
+
+    #[test]
+    fn a_numbered_stem_names_the_same_artwork_at_every_resolution() {
+        assert_eq!(numbered_stem("载入16-9-7"), Some(7));
+        assert_eq!(numbered_stem("载入1024-7"), Some(7));
+        assert_eq!(numbered_stem("载入1280-11"), Some(11));
+        // Out of range and non-numeric stems name no artwork.
+        assert_eq!(numbered_stem("载入1024-12"), None);
+        assert_eq!(numbered_stem("载入1024-0"), None);
+        assert_eq!(numbered_stem("background"), None);
+    }
+
+    #[test]
+    fn the_aspect_preference_never_leaves_a_client_without_pictures() {
+        let only_4x3 = vec![picture("surfaces/载入1024-1.jpg")];
+        // A 16:9 request on a client that ships only the 4:3 family still gets
+        // a picture instead of nothing.
+        assert_eq!(prefer_aspect(&only_4x3, 1920, 1080).len(), 1);
+        let both = vec![
+            picture("surfaces/载入1024-1.jpg"),
+            picture("surfaces/载入16-9-1.jpg"),
+        ];
+        let wide = prefer_aspect(&both, 1920, 1080);
+        assert_eq!(wide.len(), 1);
+        assert!(wide[0].path.contains("16-9-"));
+        let tall = prefer_aspect(&both, 1024, 768);
+        assert_eq!(tall.len(), 1);
+        assert!(tall[0].path.contains("1024-"));
+    }
+
+    #[test]
+    fn location_needles_are_deduped_longest_first_and_drop_blanks() {
+        let needles = location_needles("a01", &["Archosaur", "  ", "a01"]);
+        assert_eq!(needles, vec!["Archosaur", "a01"]);
+    }
+
+    #[test]
+    fn a_location_labels_itself_from_the_display_name() {
+        let location = Location::new("a01", "Archosaur", "祖龙城");
+        assert_eq!(location.label, "Archosaur (a01)");
+        assert_eq!(location.needles, vec!["Archosaur", "a01"]);
+        // A destination with no display name falls back to its id.
+        assert_eq!(Location::new("world", "", "").label, "world");
     }
 }
