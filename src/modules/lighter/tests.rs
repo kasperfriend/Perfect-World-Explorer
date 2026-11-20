@@ -663,14 +663,16 @@ fn exercise(mode: Mode, cpu_query: bool) {
     h.ray.settings.shadows = false;
     h.ray.settings.lighting = false;
 
-    // Off-camera blocker in the sun ray (but not in the camera ray). The
-    // caster's presence cannot be inferred from primary colour or depth.
+    // Blocker between surface and sun (but off the camera ray) casts a
+    // shadow. Sun direction ~[0.8,0.1,0.6]; from surface at z=-2 the sun ray
+    // hits z=-1 at ~[1.3,0.2,-1]. Place block at [1.1,0,-1] spanning
+    // x[0.1,2.2],y[-1,1] — catches sun ray, misses camera ray at [0,0,-1].
     let mut sun_frame = test_frame(Vec3::ZERO, -Vec3::Z, 1);
     sun_frame.sun = Vec3::new(0.8, 0.1, 0.6).normalize().extend(1.).to_array();
     let mut shadow = Builder::default();
     let block = upright(&mut shadow, 0., [1.; 4], 0, 0);
     shadow
-        .place(block, Transform::translation([2.4, 0., -3.2]))
+        .place(block, Transform::translation([1.1, 0., -1.]))
         .unwrap();
     let shadow = shadow.finish();
     let bright = h.pixel(sun_frame, &shadow);
