@@ -554,7 +554,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
     let red = animated.finish();
     // --- RED CARD ISOLATION CHECKS (temporary diagnostics) ---
     // Red only: empty world, red moving card → expect pure red [255,0,0].
-    h.ray.install(Ok((Builder::default().finish(), bank.clone())));
+    h.ray
+        .install(Ok((Builder::default().finish(), bank.clone())));
     let (red_only, red_only_z) = h.pixel(frame, &red);
     eprintln!(
         "RED-CARD-DUMP red-only: color={:?} depth={} expect=[255,0,0,255] depth≈{}",
