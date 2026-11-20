@@ -93,6 +93,7 @@ pub struct Settings {
     pub single_path: bool,
     pub hybrid_primary: bool,
     pub denoiser: Denoiser,
+    pub guided: bool,
     pub ray_lighting: bool,
     pub progressive: bool,
     pub bounces: u32,
@@ -119,6 +120,7 @@ impl Default for Settings {
             single_path: true,
             hybrid_primary: false,
             denoiser: Denoiser::Svgf,
+            guided: true,
             ray_lighting: true,
             progressive: true,
             bounces: 1,
@@ -152,6 +154,7 @@ impl Settings {
             relight_baked: true,
             progressive: false,
             denoiser: Denoiser::Svgf,
+            guided: true,
             bounces: 8,
             diffuse_distance: 0,
             samples: 32,
@@ -194,6 +197,7 @@ impl Settings {
                         settings.denoiser = d;
                     }
                 }
+                "guided" => settings.guided = toggle(settings.guided),
                 "ray_lighting" => settings.ray_lighting = toggle(settings.ray_lighting),
                 "progressive" => settings.progressive = toggle(settings.progressive),
                 "bounces" => settings.bounces = number(settings.bounces, 0, 4),
@@ -223,7 +227,7 @@ impl Settings {
     pub(crate) fn encode(self) -> String {
         format!(
             "# Lighter settings\nmode={}\nlighting={}\nregional_lighting={}\nshadows={}\nsoft_sun={}\nreflections={}\nsingle_path={}\nhybrid_primary={}\ndenoiser={}\nray_lighting={}\nprogressive={}\nbounces={}\ndiffuse_distance={}\nsamples={}\nresolution={}\ndynamic_resolution={}\ngpu_target_ms={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\nreference={}\n",
-            self.mode.token(), self.lighting, self.regional_lighting, self.shadows, self.soft_sun, self.reflections, self.single_path, self.hybrid_primary, self.denoiser.token(), self.ray_lighting, self.progressive, self.bounces,
+            self.mode.token(), self.lighting, self.regional_lighting, self.shadows, self.soft_sun, self.reflections, self.single_path, self.hybrid_primary, self.denoiser.token(), self.guided, self.ray_lighting, self.progressive, self.bounces,
             self.diffuse_distance, self.samples, self.resolution, self.dynamic_resolution, self.gpu_target_ms, self.anisotropy, self.relight_baked, self.physical_bsdf, self.reference,
         )
     }

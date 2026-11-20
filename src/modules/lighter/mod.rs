@@ -2166,7 +2166,7 @@ impl Lighter {
                     image,
                     frame.extent,
                     history,
-                    settings.denoiser == Denoiser::Svgf,
+                    settings.guided,
                     timed,
                 )
             } else {
@@ -2184,7 +2184,7 @@ impl Lighter {
                 encoder,
                 image,
                 frame.extent,
-                settings.denoiser == Denoiser::Svgf,
+                settings.guided,
                 target,
                 depth,
                 None,
