@@ -360,10 +360,34 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
         }
 
         // --- water areas, which are BSData beside the maps
+        //
+        // The count of areas is not the thing worth reporting: the 1.8.4 client
+        // shipped "0 water areas, 0 cells, 0 of them wet" and this matrix never
+        // said so, because a reference count is a number about the world file
+        // and not about whether any of it decoded. So report the cells too, and
+        // treat "the world references water and nothing decoded" as a silent
+        // empty result rather than an `ok` line.
         match &scene_parsed {
             Some(s) => match water::load(s, &element) {
                 Ok(areas) => {
-                    cells.push(Cell::ok("water (BSData)", format!("{} areas", areas.len())))
+                    let cells_wet: usize = areas
+                        .iter()
+                        .map(|a| a.mask.iter().filter(|m| **m != 0).count())
+                        .sum();
+                    let cells_total: usize = areas.iter().map(|a| a.mask.len()).sum();
+                    let refs: usize = s.blocks.iter().map(|b| b.water.len()).sum();
+                    let detail = format!(
+                        "{} areas, {cells_total} cells, {cells_wet} of them wet",
+                        areas.len()
+                    );
+                    if areas.is_empty() && refs > 0 {
+                        cells.push(Cell::silent(
+                            "water (BSData)",
+                            format!("{detail} (the world references {refs} water cells)"),
+                        ));
+                    } else {
+                        cells.push(Cell::ok("water (BSData)", detail));
+                    }
                 }
                 Err(e) => cells.push(Cell::refused("water (BSData)", e)),
             },
