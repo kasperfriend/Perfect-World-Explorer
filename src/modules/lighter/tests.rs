@@ -621,21 +621,14 @@ fn exercise(mode: Mode, cpu_query: bool) {
     let mut b3 = Builder::default();
     let mut surf = Surface::new(0, 0, 0.5, 0.);
     surf = surf.with_lighting([0.5, 0.5, 0.5, 1.], [0., 0., 0., 0.], [0., 0., 0., 0.]);
-    let sid = b3.surface(surf);
-    let mut mesh = Mesh::default();
-    for p in [
-        [-1., 1., -2.],
-        [1., 1., -2.],
-        [-1., -1., -2.],
-        [1., -1., -2.],
-    ] {
-        mesh.vertices
-            .push(Vertex::new(p, [0., 0., 1.], [0., 0.]).tint(0, 0));
-    }
-    mesh.tri([0, 2, 1], sid);
-    mesh.tri([1, 2, 3], sid);
-    let mid = b3.mesh(&mesh).unwrap().unwrap();
-    b3.place(mid, Transform::IDENTITY).unwrap();
+    let id = quad_material(
+        &mut b3,
+        [[-1., 1., -2.], [1., 1., -2.], [-1., -1., -2.], [1., -1., -2.]],
+        [0., 0., 1.],
+        surf,
+        0,
+    );
+    b3.place(id, Transform::IDENTITY).unwrap();
     h.ray.install(Ok((b3.finish(), bank.clone())));
     // Bright vs dim sun: lighting on, sun contributes. Bright sun saturates,
     // dim sun contributes little. Difference > 30 in u8.
