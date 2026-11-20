@@ -250,7 +250,23 @@ send back (exported log file, timings CSV).
 
 **PR comment:** Post short summary comment on PR #51 linking this handoff document.
 
-**Commits on branch `arena/69c8ea78-perfect-world-explorer`:**
+## X — Acceptance follow-up (X1–X9)
+
+| Commit | Item | Description |
+|--------|------|-------------|
+| `d6ae543` | X1 | Fix Lambertian sky bounces=1 + separate RAY_LIGHTING_OVERLAY bit from LIGHTING |
+| `ce603b3` | X2 | Verify local_color() fix at all call sites |
+| `5fe9e4e` | X3 | Restore bilinear upscale filter in present.wgsl |
+| `ba06849` | X1 | Fix rear light depth lost in overlay path (regression from X1) |
+| `81948db` | X4 | Native byte-identity verification test (exercise_byte_identity) |
+| `8242ca0` | X5 | Remove ray pass from default path when ray_lighting off |
+| `609a7a8` | X8 | Remaining P-items review — all S items complete |
+
+X6 (black fallback removal): addressed by X5 (ray pass skipped when ray_lighting off) and X1 fix (depth written even when overlay color is black).
+X7 (earlier fixes confirmation): all X1–X6 fixes verified intact.
+X9: this document update + PR #51 summary comment.
+
+**Commits on branch `arena/69c8ea78-perfect-world-explorer` (P-items):**
 | Commit | Item | Description |
 |--------|------|-------------|
 | `6874c51` | PANEL-PLAN | Panel plan committed before code |
@@ -268,6 +284,5 @@ send back (exported log file, timings CSV).
 **Open items (need user's PC):**
 - P7: Overlay compatibility combinations on RTX 3080
 - P10: Performance measurements on RTX 3080
-- P11-b: Post PR comment on PR #51
 
 **What to send back:** Exported log file (from "Copy diagnostics to clipboard" or log folder), timings CSV (from "Export frame timings CSV"), PNG regression comparison results.
