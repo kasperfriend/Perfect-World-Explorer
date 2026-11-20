@@ -96,10 +96,10 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/model_draw_gpu.rs` | 693 | `else-continue` | **unreachable** | `else {` |
 | `src/music.rs` | 42 | `ok-question` | **probe** | `.ok()?;` |
 | `src/objects.rs` | 272 | `let-underscore` | **unreachable** | `let _ = MODEL_LOAD_LOGGER.set(logger);` |
-| `src/pck.rs` | 541 | `ok-question` | **probe** | `let len = fs::metadata(path).ok()?.len();` |
-| `src/pck.rs` | 548 | `ok-question` | **probe** | `let file = File::open(&pkx).ok()?;` |
-| `src/pck.rs` | 549 | `ok-question` | **probe** | `let len = file.metadata().ok()?.len();` |
-| `src/pck.rs` | 935 | `unwrap_or_default` | **unreachable** | `let mut name = self.path.file_stem().unwrap_or_default().to_os_string();` |
+| `src/pck.rs` | 543 | `ok-question` | **probe** | `let len = fs::metadata(path).ok()?.len();` |
+| `src/pck.rs` | 550 | `ok-question` | **probe** | `let file = File::open(&pkx).ok()?;` |
+| `src/pck.rs` | 551 | `ok-question` | **probe** | `let len = file.metadata().ok()?.len();` |
+| `src/pck.rs` | 937 | `unwrap_or_default` | **unreachable** | `let mut name = self.path.file_stem().unwrap_or_default().to_os_string();` |
 | `src/sky_gpu.rs` | 1448 | `ok-question` | **probe** | `let mut file = File::open(element.join("configs.pck")).ok()?;` |
 | `src/sky_gpu.rs` | 1449 | `ok-question` | **probe** | `let entries = crate::angelica_pck::directory(&mut file).ok()?;` |
 | `src/sky_gpu.rs` | 1456 | `ok-question` | **probe** | `let list_bytes = pck::read_entry(&mut file, list).ok()?;` |

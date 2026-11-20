@@ -239,59 +239,61 @@ pub(crate) const REVISIONS: [Revision; 3] = [
 /// here rather than branching on "if version == 0x00020003 and size < ..." is
 /// the point: the condition that separates it from the wide trailer is the
 /// trailer's own bytes, not the package's size on disk.
-pub(crate) const TRAILER_PROBES: [Revision; 2] = [Revision {
-    // Matched against any declared version that has no resolved layout of its
-    // own; the guard pair is what actually admits it.
-    version: 0,
-    header: 280,
-    entry: 288,
-    offset_at: 264,
-    offset_width: 8,
-    size_at: 272,
-    compressed_at: 276,
-    table_offset_at: 8,
-    table_offset_width: 4,
-    // `0x00020002`'s field order: no dwFlags, description at `+16`. `+12` holds
-    // `0xffffffff` in the shipped file, which is *not* a flag word -- reading
-    // it as one would refuse a package whose table decodes perfectly.
-    flags_at: None,
-    description_at: 16,
-    guard_byte1: 272,
-},
-// The wide field order with a *32-bit* table word, which is 1.8.4's
-// `element/surfaces.pck` -- the file the minimap needs.
-//
-// Every other fact about that trailer points at the wide layout: it declares
-// `0x00020003`, its guardByte1 is at `+272`, and its `dwFlags` at `+16` reads
-// zero, which is a real flag word and not the 'A' of a description like the
-// narrow `trees.pck` writes there. Its description therefore starts at `+20`,
-// on the 280-byte struct, and its 252-byte region ends exactly at the guard.
-// Only the table word is 32 bits: read as a `u64` the field is 2^64 minus
-// 3,147,722,044, and its low half is 1,147,245,252, which leaves 1,862,559
-// bytes for the 22,269-entry table -- 83.6 bytes a record. The table decides,
-// as always, and this candidate is what lets it be walked.
-//
-// Measured from a shipped refusal, not guessed:
-//   "the trailer declares its table at 18446744070561829572 but only 1149107811
-//    bytes of this file (len 1149108099) precede the footer (declared end
-//    1149108099, base 0, count 22269, flags 0x00000000)"
-// The `flags 0x00000000` in that line is what ruled the *narrow* probe out --
-// it reads that word from `+16`, where the narrow order keeps the first four
-// bytes of `"Angelica File Package"`, so a zero there can only be `dwFlags`.
-Revision {
-    version: 0,
-    header: 280,
-    entry: 288,
-    offset_at: 264,
-    offset_width: 8,
-    size_at: 272,
-    compressed_at: 276,
-    table_offset_at: 8,
-    table_offset_width: 4,
-    flags_at: Some(16),
-    description_at: 20,
-    guard_byte1: 272,
-}];
+pub(crate) const TRAILER_PROBES: [Revision; 2] = [
+    Revision {
+        // Matched against any declared version that has no resolved layout of its
+        // own; the guard pair is what actually admits it.
+        version: 0,
+        header: 280,
+        entry: 288,
+        offset_at: 264,
+        offset_width: 8,
+        size_at: 272,
+        compressed_at: 276,
+        table_offset_at: 8,
+        table_offset_width: 4,
+        // `0x00020002`'s field order: no dwFlags, description at `+16`. `+12` holds
+        // `0xffffffff` in the shipped file, which is *not* a flag word -- reading
+        // it as one would refuse a package whose table decodes perfectly.
+        flags_at: None,
+        description_at: 16,
+        guard_byte1: 272,
+    },
+    // The wide field order with a *32-bit* table word, which is 1.8.4's
+    // `element/surfaces.pck` -- the file the minimap needs.
+    //
+    // Every other fact about that trailer points at the wide layout: it declares
+    // `0x00020003`, its guardByte1 is at `+272`, and its `dwFlags` at `+16` reads
+    // zero, which is a real flag word and not the 'A' of a description like the
+    // narrow `trees.pck` writes there. Its description therefore starts at `+20`,
+    // on the 280-byte struct, and its 252-byte region ends exactly at the guard.
+    // Only the table word is 32 bits: read as a `u64` the field is 2^64 minus
+    // 3,147,722,044, and its low half is 1,147,245,252, which leaves 1,862,559
+    // bytes for the 22,269-entry table -- 83.6 bytes a record. The table decides,
+    // as always, and this candidate is what lets it be walked.
+    //
+    // Measured from a shipped refusal, not guessed:
+    //   "the trailer declares its table at 18446744070561829572 but only 1149107811
+    //    bytes of this file (len 1149108099) precede the footer (declared end
+    //    1149108099, base 0, count 22269, flags 0x00000000)"
+    // The `flags 0x00000000` in that line is what ruled the *narrow* probe out --
+    // it reads that word from `+16`, where the narrow order keeps the first four
+    // bytes of `"Angelica File Package"`, so a zero there can only be `dwFlags`.
+    Revision {
+        version: 0,
+        header: 280,
+        entry: 288,
+        offset_at: 264,
+        offset_width: 8,
+        size_at: 272,
+        compressed_at: 276,
+        table_offset_at: 8,
+        table_offset_width: 4,
+        flags_at: Some(16),
+        description_at: 20,
+        guard_byte1: 272,
+    },
+];
 
 /// The guard pair `guardByte0` / `guardByte1` that every revision's trailer
 /// carries.
