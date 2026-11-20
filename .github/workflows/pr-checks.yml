@@ -196,13 +196,28 @@ jobs:
           # Same flaky mirror as the build dependencies above: retry the install
           # instead of failing the three Vulkan checks behind it, and print apt's
           # own diagnosis as annotations if every attempt fails.
+          # `dpkg -s` alone is not enough: an image has shipped the package
+          # marked installed with the lavapipe ICD file missing, which made this
+          # step succeed and the sRGB window test behind it fail with exit 41
+          # ("no lavapipe ICD"). Require the driver file the test actually
+          # loads, and reinstall when the package is present but the file is not.
+          icd_present() {
+            find /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d \
+              /etc/vulkan/icd.d -maxdepth 1 -name '*lvp*' -print -quit 2>/dev/null |
+              grep -q .
+          }
+          reinstall=""
           if dpkg -s mesa-vulkan-drivers >/dev/null 2>&1; then
-            echo "mesa-vulkan-drivers already installed"
-            exit 0
+            if icd_present; then
+              echo "mesa-vulkan-drivers already installed with its lavapipe ICD"
+              exit 0
+            fi
+            echo "mesa-vulkan-drivers is installed but its lavapipe ICD is missing; reinstalling"
+            reinstall="--reinstall"
           fi
           status=1
           for attempt in 1 2 3; do
-            if timeout 240 sudo apt-get install -y --no-install-recommends \
+            if timeout 240 sudo apt-get install -y --no-install-recommends $reinstall \
               mesa-vulkan-drivers 2>&1 | tee /tmp/vulkan-apt.log; then
               status=0
               break
@@ -236,6 +251,12 @@ jobs:
             found="$(find "$dir" -maxdepth 1 -name '*lvp*' -print -quit 2>/dev/null || true)"
             if [ -n "$found" ]; then icd="$found"; continue; fi
           done
+          # Some Mesa packages install the JSON nowhere the directories above
+          # look. A wider search keeps a working driver from being reported as
+          # "missing", and reports the file it found so the log says where.
+          if [ -z "$icd" ]; then
+            icd="$(find / -xdev -name '*lvp*.json' -print -quit 2>/dev/null || true)"
+          fi
           echo "VK_ICD_FILENAMES=$icd" >>"$log"
           ls -l /usr/share/vulkan/icd.d >>"$log" 2>&1 || true
           if [ -z "$icd" ]; then
