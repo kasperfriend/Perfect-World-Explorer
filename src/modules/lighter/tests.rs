@@ -718,6 +718,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     };
     h.ray.install(Ok((water_fixture(0), bank.clone())));
     h.ray.settings.lighting = false;
+    h.ray.settings.bounces = 0;
     let no_bounces = h.pixel(f, &empty);
     h.ray.settings.bounces = 1;
     h.ray.settings.reflections = false;
