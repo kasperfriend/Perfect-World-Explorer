@@ -724,11 +724,23 @@ fn read_directory(
 /// well-formed table wins.
 ///
 /// `dwEntryOffset` is `UINT64` in the wide trailer, and that width is not
-/// cosmetic: 1.8.4's `litmodels` is a 9.4 GiB package whose table starts at
-/// 10,107,744,597, above 4 GiB, so 32 bits cannot name it. Reading only the low
-/// half yielded 1,517,810,005 -- a position inside the package but two
-/// gibibytes short of the table, which is exactly the "declares its table at
-/// 1517810005 but only 3681422201 bytes precede the footer" line.
+/// cosmetic: 1.8.4's `litmodels` is a 9.4 GiB package whose table starts past
+/// 4 GiB, so 32 bits cannot name it. The refusal for that file reads
+/// "declares its table at 18446744062342459733 ... (declared end 10123872665,
+/// base 6442450176, count 237241)", and that number is 2^64 minus
+/// 11,367,091,883 -- i.e. the field is 64 bits wide but its value is not a
+/// position in any container.
+///
+/// Reading only the low half is *tried*, and it is not the same number twice:
+/// the low half is 4,075,062,583. That is below `base`, so it names a position
+/// in the first piece and `checked_sub(base)` drops it; read piece-local it
+/// exceeds this piece's `table_end`, so it is dropped too. Both widths are
+/// therefore attempted and neither yields a table, which is a statement about
+/// the file, not about the reading.
+///
+/// An earlier version of this note said the low half was 1,517,810,005 --
+/// 4,075,062,583 `^ MASK`, a value `table_offset` had already unmasked. Do not
+/// mask it again.
 #[allow(clippy::too_many_arguments)]
 fn entries_from_trailer(
     files: &[(File, u64)],
