@@ -3064,12 +3064,8 @@ fn exercise_sun_and_history(h: &mut Harness) {
     assert_eq!(hard[center].0[0], 0, "point sun did not cast a hard shadow");
     h.ray.settings.soft_sun = true;
     let grain = h.pixels(frame, &empty);
-    let saved_progressive = h.ray.settings.progressive;
     h.ray.settings.denoiser = Denoiser::Svgf;
-    h.ray.settings.progressive = true; // enables temporal denoising (post)
     let smooth = h.pixels(frame, &empty);
-    h.ray.settings.progressive = saved_progressive;
-    h.ray.reset_history();
     let stats = |pixels: &[([u8; 4], f32)]| {
         let row = (2..SIDE - 2).map(|y| f32::from(pixels[column(y)].0[0]) / f32::from(full));
         let mean = row.clone().sum::<f32>() / (SIDE - 4) as f32;
