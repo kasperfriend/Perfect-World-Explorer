@@ -565,7 +565,10 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
                 facts.push(("precinctZones", format!("{zone_total}")));
             }
             if refused.is_empty() {
-                cells.push(Cell::ok("music precinct", format!("{ok} precinct.clt files")));
+                cells.push(Cell::ok(
+                    "music precinct",
+                    format!("{ok} precinct.clt files"),
+                ));
             } else {
                 cells.push(Cell::refused("music precinct", refused.join("; ")));
             }
