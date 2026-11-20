@@ -434,6 +434,54 @@ mod tests {
         }
     }
     #[test]
+    fn browse_packed_and_loose_roots_together() {
+        // One v2 directory record with a GBK, package-relative member name.
+        // No copy of this member exists on disk: selecting it must go back
+        // through the retained PCK handle, not the loose-file fallback.
+        let files = Fixture::new("packed");
+        let source = format!("{HEADER}{SPRITE}{SPRITE}");
+        let mut pack = Vec::from_iter(0x4dca23efu32.to_le_bytes());
+        pack.extend(0u32.to_le_bytes());
+        pack.extend(0x56a089b7u32.to_le_bytes());
+        pack.extend(source.bytes());
+        let directory = pack.len() as u32;
+        let mask = 0xa8937462;
+        let mut record = [0u8; 276];
+        let (name, _, bad) = encoding_rs::GBK.encode("场景\\Glow.GFX");
+        assert!(!bad);
+        record[..name.len()].copy_from_slice(&name);
+        record[260..264].copy_from_slice(&12u32.to_le_bytes());
+        record[264..268].copy_from_slice(&(source.len() as u32).to_le_bytes());
+        record[268..272].copy_from_slice(&(source.len() as u32).to_le_bytes());
+        pack.extend((276u32 ^ mask).to_le_bytes());
+        pack.extend((276u32 ^ mask ^ 0x59374231).to_le_bytes());
+        pack.extend(record);
+        let mut footer = [0u8; 280];
+        for (offset, value) in [
+            (0, 0xfdfdfeee),
+            (8, directory ^ mask),
+            (268, 0xf00dbeef),
+            (272, 1),
+            (276, 0x20002),
+        ] {
+            footer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        pack.extend(footer);
+        let end = (pack.len() as u32).to_le_bytes();
+        pack[4..8].copy_from_slice(&end);
+        std::fs::write(files.0.join("gfx.pck"), pack).unwrap();
+        let mut assets = LibrarianAssets::open(&files.0);
+        let catalog = assets.effect_catalog().unwrap();
+        assert_eq!(catalog.len(), 3);
+        let entry = catalog.search("glow")[0];
+        assert_eq!(entry.path, "gfx/场景/Glow.GFX");
+        assert_eq!(entry.size, source.len() as u32);
+        assert_eq!(
+            read_root(&mut assets, &entry.path).unwrap().elements.len(),
+            2
+        );
+    }
+    #[test]
     fn browse_solo_and_scrub_loose_effect() {
         let files = Fixture::new("clock");
         let (mut assets, mut clip) = files.load();
