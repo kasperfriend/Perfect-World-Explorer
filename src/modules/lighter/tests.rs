@@ -3068,6 +3068,7 @@ fn exercise_sun_and_history(h: &mut Harness) {
     h.ray.settings.soft_sun = true;
     let grain = h.pixels(frame, &empty);
     h.ray.settings.denoiser = Denoiser::Svgf;
+    h.ray.settings.guided = true;
     let smooth = h.pixels(frame, &empty);
     let stats = |pixels: &[([u8; 4], f32)]| {
         let row = (2..SIDE - 2).map(|y| f32::from(pixels[column(y)].0[0]) / f32::from(full));
