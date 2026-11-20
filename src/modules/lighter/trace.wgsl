@@ -1254,7 +1254,9 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u3
     // zero anyway, so base color preserves the "visible without light"
     // behaviour for e.g. green cards under zero-bounce ambient.
     if all(color == vec3<f32>(0.)) {
-        return if terminal { ambient + s.emission * emission_weight } else { s.color.rgb };
+        var result = s.color.rgb;
+        if terminal { result = ambient + s.emission * emission_weight; }
+        return result;
     }
     return local_color(s,color,ambient);
 }
