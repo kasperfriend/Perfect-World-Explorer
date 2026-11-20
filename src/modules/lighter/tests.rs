@@ -614,16 +614,12 @@ fn exercise(mode: Mode, cpu_query: bool) {
         "still geometry re-uploaded"
     );
 
-    // Lighting tests need a surface for lights to illuminate. `upright()`
-    // leaves surface diffuse at u32::MAX (white), which saturates. Build a
-    // gray surface [0.5] with with_lighting() so lighting on/off produce
-    // distinguishable values.
+    // Lighting tests need a surface for lights to illuminate. Install a
+    // gray surface [0.5] so lighting on/off produce distinguishable values
+    // without saturating.
     let mut b3 = Builder::default();
-    let mut surf = Surface::new(0, 0, 0.5, 0.);
-    surf = surf.with_lighting([0.5, 0.5, 0.5, 1.], [0., 0., 0., 0.], [0., 0., 0., 0.]);
-    let positions = [[-1., 1., -2.], [1., 1., -2.], [-1., -1., -2.], [1., -1., -2.]];
-    let id = quad_material(&mut b3, positions, [0., 0., 1.], surf, 0);
-    b3.place(id, Transform::IDENTITY).unwrap();
+    let gray = upright(&mut b3, -2., [0.5, 0.5, 0.5, 1.], 0, 0);
+    put(&mut b3, gray);
     h.ray.install(Ok((b3.finish(), bank.clone())));
     // Bright vs dim sun: lighting on, sun contributes. Bright sun saturates,
     // dim sun contributes little. Difference > 30 in u8.
