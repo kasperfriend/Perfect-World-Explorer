@@ -239,6 +239,22 @@ pub struct Hit {
     pub normal: Vec3,
 }
 
+impl Hit {
+    /// The hit point, from the triangle and the barycentrics the traversal
+    /// already computed. Callers need it because a hit carries no position of
+    /// its own: storing one per triangle test would be a wasted write in the
+    /// shader.
+    pub fn point(&self, triangles: &[RayTriangle]) -> Vec3 {
+        let Some(tri) = triangles.get(self.triangle as usize) else {
+            return Vec3::ZERO;
+        };
+        let a = Vec3::from_slice(&tri.a);
+        let b = Vec3::new(tri.b[0], tri.b[1], tri.b[2]);
+        let c = Vec3::new(tri.c[0], tri.c[1], tri.c[2]);
+        a * self.bary[0] + b * self.bary[1] + c * self.bary[2]
+    }
+}
+
 /// Maximum leaf size before a node is split further. Four matches the
 /// traverser's unrolled leaf loop.
 pub const MAX_LEAF: usize = 4;
@@ -352,6 +368,7 @@ impl SceneGeometry {
     pub fn order(&self) -> &[u32] {
         &self.order
     }
+
 
     /// Traverse one ray. This is the reference implementation the compute
     /// shader mirrors signature for signature.
