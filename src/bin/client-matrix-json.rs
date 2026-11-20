@@ -15,7 +15,15 @@
 //!
 //! A client root is a directory holding `element/` (or one that IS `element`)
 //! plus whatever the client ships beside it.
+// `water.rs` reports through `crate::diag!`, and a `#[path]` module set is its
+// own crate root, so the stub supplies it. See `support/diag_stub.rs`.
 #![allow(dead_code)]
+#[macro_use]
+#[path = "support/diag_stub.rs"]
+mod diag_stub;
+#[allow(unused_imports)]
+pub use diag_stub::diagnostics;
+
 #[path = "../angelica_pck.rs"]
 mod angelica_pck;
 #[path = "../client_detect.rs"]

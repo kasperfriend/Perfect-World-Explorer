@@ -339,7 +339,15 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          [ -d ci-results ] || { echo "::error::ci-results was never written"; exit 1; }
+          # The measure step above is what writes this; if it failed before
+          # creating the directory we still publish a record of that, because
+          # "no measurements" is a result and a missing directory is not.
+          if [ ! -d ci-results ]; then
+            mkdir -p ci-results
+            printf '{"client":"none","cells":[],"note":"the measure step did not run"}' \
+              > ci-results/none.json
+            echo "::error::the measure step wrote no ci-results; publishing a record of that"
+          fi
           # One file per client, and the job fails if any is missing.
           count=$(ls -1 ci-results/*.json 2>/dev/null | wc -l)
           if [ "$count" -eq 0 ]; then
