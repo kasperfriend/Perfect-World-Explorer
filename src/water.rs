@@ -1402,10 +1402,11 @@ mod tests {
     /// step of that chain was broken at once for 1.8.4, and each step is a
     /// separate way to end up with "0 water areas".
     ///
-    /// The staged world is the client's own 1.8.4 `world.ecwld` with its
-    /// object tables emptied except for four blocks, one per patch, so the
-    /// fixture carries the real header, the real 22,528-entry block table and
-    /// the real manifest offsets while all 111 references resolve.
+    /// The staged world retains the client's 1.8.4 header and 22,528-block
+    /// grid. Its blocks were re-emitted to satisfy `Scene::load`'s exact-span
+    /// check, and its water list was reduced to four references, one per
+    /// selected patch. The matching manifest and referenced `BSData/N.dat`
+    /// files are staged beside the world file, as its manifest paths require.
     #[test]
     fn the_staged_184_client_loads_water_through_the_real_loader() {
         let element = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

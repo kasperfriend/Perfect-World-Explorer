@@ -368,7 +368,7 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
             }
         }
 
-        // --- water areas, which are BSData beside the maps
+        // --- water areas, whose BSData paths are relative to the world folder
         //
         // The loader wants the directory the *world file* lives in: `world.ecbsd`
         // sits beside `world.ecwld`, and `BSData/N.dat` resolves under that same
