@@ -639,11 +639,11 @@ fn exercise(mode: Mode, cpu_query: bool) {
     assert_eq!(h.builds(), builds, "changing light values rebuilt ASes");
     // Lighting on vs off changes the pixel: with lighting off and shadows
     // off, direct() returns base color directly; with lighting on, sun
-    // radiance adds on top.
+    // radiance adds on top. Use a bright sun to guarantee separation.
     let mut sun_frame = test_frame(Vec3::ZERO, -Vec3::Z, 1);
     sun_frame.sun = Vec3::new(0.8, 0.1, 0.6).normalize().extend(1.).to_array();
     sun_frame.ambient = [0., 0., 0., 0.];
-    sun_frame.sun_color = [1., 1., 1., 1.0];
+    sun_frame.sun_color = [100., 100., 100., 1.0];
     h.ray.settings.lighting = true;
     h.ray.settings.shadows = false;
     let lit_on = h.pixel(sun_frame, &empty);
