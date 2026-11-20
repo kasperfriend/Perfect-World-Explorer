@@ -8,7 +8,10 @@
 //!
 //! `silent` is the status that must never appear. It means a reader returned
 //! nothing without saying why, which is the failure class this whole exercise
-//! exists to eliminate: a map that draws no trees and prints no reason.
+//! exists to eliminate: a map that draws no trees and prints no reason. It is
+//! produced from what the reader actually returned -- a world that declares tree
+//! types but yields no placements is `silent` even though the parse succeeded --
+//! so the rule has teeth rather than being a status no code can set.
 //!
 //! Usage:
 //!   client-matrix-json <out-dir> <client-name>=<client-root> [more...]
@@ -38,6 +41,8 @@ mod pck;
 mod scene;
 #[path = "../terrain_block.rs"]
 mod terrain_block;
+#[path = "../terrain_lightmaps.rs"]
+mod terrain_lightmaps;
 #[path = "../water.rs"]
 mod water;
 
@@ -305,13 +310,34 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
                             s.tree_types.len()
                         ),
                     ));
-                    cells.push(Cell::ok(
-                        "trees",
-                        format!(
-                            "{} types, {trees} placements",
-                            s.tree_types.len()
-                        ),
-                    ));
+                    // A zero tree count is exactly the symptom this matrix
+                    // exists to find, so it may not be reported as `ok` on its
+                    // own. It is honest only when the world declares no tree
+                    // types at all (a64 and a91 do this): then there was nothing
+                    // to place and nothing could have been lost.
+                    if trees == 0 && !s.tree_types.is_empty() {
+                        cells.push(Cell::silent(
+                            "trees",
+                            format!(
+                                "the world declares {} tree types but carries 0 \
+                                 placements",
+                                s.tree_types.len()
+                            ),
+                        ));
+                    } else {
+                        cells.push(Cell::ok(
+                            "trees",
+                            format!(
+                                "{} types, {trees} placements{}",
+                                s.tree_types.len(),
+                                if trees == 0 {
+                                    " (the world declares zero tree types)"
+                                } else {
+                                    ""
+                                }
+                            ),
+                        ));
+                    }
                     cells.push(Cell::ok(
                         "grass",
                         format!("{} types, {grass} placements", s.grass_types.len()),
@@ -623,19 +649,107 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
         }
 
         // --- terrain T2BK and lightmaps T2LM
+        //
+        // These used to report `ok` from a file count alone, which says nothing:
+        // a staged T2BK that the reader refuses and a staged T2BK that decodes
+        // were the same cell. Read them, and let the reader decide.
         let mut t2bk = Vec::new();
         walk(&element.join("maps"), "t2bk", &mut t2bk);
-        let mut t2lm = Vec::new();
-        walk(&element.join("maps"), "t2lm", &mut t2lm);
+        t2bk.sort();
         cells.push(if t2bk.is_empty() {
             Cell::absent("terrain T2BK")
         } else {
-            Cell::ok("terrain T2BK", format!("{} files staged", t2bk.len()))
+            let mut decoded = 0;
+            let mut versions = std::collections::BTreeSet::new();
+            let mut refusals = Vec::new();
+            for path in &t2bk {
+                match std::fs::read(path) {
+                    Ok(bytes) => match terrain_block::trn2_header(&bytes) {
+                        Ok(header) => {
+                            decoded += 1;
+                            versions.insert(format!("v{}", header.version));
+                        }
+                        Err(e) => refusals.push(format!("{}: {e}", path.display())),
+                    },
+                    Err(e) => refusals.push(format!("{}: {e}", path.display())),
+                }
+            }
+            let seen: Vec<String> = versions.into_iter().collect();
+            facts.push((
+                "terrainVersions",
+                if seen.is_empty() {
+                    "none".to_string()
+                } else {
+                    seen.join(",")
+                },
+            ));
+            facts.push(("terrainBlocks", format!("{decoded}")));
+            if refusals.is_empty() {
+                Cell::ok(
+                    "terrain T2BK",
+                    format!("{decoded} blocks decoded, versions {}", seen.join(",")),
+                )
+            } else {
+                Cell::refused(
+                    "terrain T2BK",
+                    format!(
+                        "{} of {} blocks refused: {}",
+                        refusals.len(),
+                        t2bk.len(),
+                        refusals.join("; ")
+                    ),
+                )
+            }
         });
+
+        let mut t2lm = Vec::new();
+        walk(&element.join("maps"), "t2lm", &mut t2lm);
+        t2lm.sort();
         cells.push(if t2lm.is_empty() {
             Cell::absent("lightmaps T2LM")
         } else {
-            Cell::ok("lightmaps T2LM", format!("{} files staged", t2lm.len()))
+            let mut decoded = 0;
+            let mut sides = std::collections::BTreeSet::new();
+            let mut refusals = Vec::new();
+            for path in &t2lm {
+                match terrain_lightmaps::side_of(path) {
+                    Ok(Some(side)) => {
+                        decoded += 1;
+                        sides.insert(side.to_string());
+                    }
+                    Ok(None) => refusals.push(format!("{}: no tile grid", path.display())),
+                    Err(e) => refusals.push(format!("{}: {e}", path.display())),
+                }
+            }
+            let seen: Vec<String> = sides.into_iter().collect();
+            facts.push((
+                "lightmapSides",
+                if seen.is_empty() {
+                    "none".to_string()
+                } else {
+                    seen.join(",")
+                },
+            ));
+            facts.push(("lightmapTiles", format!("{decoded}")));
+            if refusals.is_empty() {
+                Cell::ok(
+                    "lightmaps T2LM",
+                    format!(
+                        "{decoded} lightmaps decoded, tile sides {}",
+                        seen.join(",")
+                    ),
+                )
+            } else {
+                Cell::refused(
+                    "lightmaps T2LM",
+                    format!(
+                        "{} of {} lightmaps refused: {}",
+                        refusals.len(),
+                        t2lm.len(),
+                        refusals.join("; ")
+                    ),
+                )
+            }
         });
 
         (cells, facts)
