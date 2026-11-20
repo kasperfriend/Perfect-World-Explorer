@@ -628,8 +628,7 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
     // or whether the viewer looked in the wrong place. The loader's own contract
     // is that a refusal names what it refused.
     let manifest = ecbsd_path(dir);
-    let b = fs::read(&manifest)
-        .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
+    let b = fs::read(&manifest).map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
     if let Err(why) = crate::scene::ecbsd_header(&b) {
         // Same reasoning: say which file carried the bad header.
         crate::load_status::dropped(
