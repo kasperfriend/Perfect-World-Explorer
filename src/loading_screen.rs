@@ -228,7 +228,7 @@ impl Location {
 /// Returns `None` when the archive names nothing after the location, which is
 /// the retail case: the caller then falls back to a random picture. That is a
 /// real answer, not a failure — nothing is invented to fill it.
-pub fn match_location(pictures: &[Picture], needles: &[&str]) -> Option<Picture> {
+pub fn match_location<S: AsRef<str>>(pictures: &[Picture], needles: &[S]) -> Option<Picture> {
     let mut best: Option<(usize, &Picture)> = None;
     for picture in pictures {
         let stem = picture
@@ -248,7 +248,7 @@ pub fn match_location(pictures: &[Picture], needles: &[&str]) -> Option<Picture>
             continue;
         }
         for needle in needles {
-            let needle_tokens = tokens(needle);
+            let needle_tokens = tokens(needle.as_ref());
             if needle_tokens.is_empty() || needle_tokens.len() > stem_tokens.len() {
                 continue;
             }
@@ -326,9 +326,9 @@ fn prefer_aspect(pictures: &[Picture], width: u32, height: u32) -> Vec<Picture> 
 /// picture from the family that suits the window's aspect ratio. A pin that the
 /// archive does not hold is reported and skipped rather than blanking the
 /// window, the same rule [`choose`] applies to `PWE_LOADING_SCREEN`.
-pub fn choose_for_location(
+pub fn choose_for_location<S: AsRef<str>>(
     element: &Path,
-    needles: &[&str],
+    needles: &[S],
     pin: Option<&Pic>,
     width: u32,
     height: u32,
