@@ -981,13 +981,6 @@ mod tests {
         assert!(decode_rgba(&[]).is_err());
     }
 
-    fn picture(path: &str) -> Picture {
-        Picture {
-            path: path.to_string(),
-            size: 1,
-        }
-    }
-
     #[test]
     fn a_location_matches_only_a_whole_name_token() {
         let pictures = vec![
