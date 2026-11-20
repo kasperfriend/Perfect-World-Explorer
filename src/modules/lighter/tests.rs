@@ -575,7 +575,10 @@ fn exercise(mode: Mode, cpu_query: bool) {
         depth_at(frame, Vec3::new(0., 0., -5.))
     );
     // Both: green world + red moving → expect pure red [255,0,0] (red is nearer).
-    h.ray.install(Ok((b_green.finish(), bank.clone())));
+    let mut b_both = Builder::default();
+    let green_both = upright(&mut b_both, -5., [0., 1., 0., 1.], 0, 0);
+    put(&mut b_both, green_both);
+    h.ray.install(Ok((b_both.finish(), bank.clone())));
     let (both, both_z) = h.pixel(frame, &red);
     eprintln!(
         "RED-CARD-DUMP both: color={:?} depth={} expect=[255,0,0,255] depth≈{}",
