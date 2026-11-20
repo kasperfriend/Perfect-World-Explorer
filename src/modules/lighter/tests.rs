@@ -614,9 +614,12 @@ fn exercise(mode: Mode, cpu_query: bool) {
         "still geometry re-uploaded"
     );
 
-    // Dark green surface so lights have something to illuminate, making
-    // bright/dim light differences visible (green_front at [0,1,0] maxes
-    // the green channel and hides light differences).
+    // Lighting tests need a surface for lights to illuminate, and a frame
+    // without ambient/sun so light differences are visible. green_front at
+    // [0,1,0] maxes the green channel and hides light differences.
+    let mut light_frame = test_frame(Vec3::ZERO, -Vec3::Z, 3);
+    light_frame.ambient = [0., 0., 0., 0.];
+    light_frame.sun_color = [0., 0., 0., 0.];
     let local_light = |color: [f32; 4], masked| {
         let mut b = Builder::default();
         b.light(Light::point([0., 0., -1., 120.], color));
@@ -634,22 +637,22 @@ fn exercise(mode: Mode, cpu_query: bool) {
         );
         b.place(block, Transform::translation([3., 0., -3.5]))
             .unwrap();
-        let surface = upright(&mut b, -2., [0., 0.1, 0., 1.], 0, 0);
+        let surface = upright(&mut b, -2., [0.1, 0.1, 0.1, 1.], 0, 0);
         put(&mut b, surface);
         b.finish()
     };
     h.ray.settings.lighting = true;
-    let bright = h.pixel(frame, &local_light([100.; 4], false));
+    let bright = h.pixel(light_frame, &local_light([5.; 4], false));
     let builds = h.builds();
-    let dim = h.pixel(frame, &local_light([0.5; 4], false));
+    let dim = h.pixel(light_frame, &local_light([0.5; 4], false));
     assert!(
         bright.0[1] as u32 > dim.0[1] as u32 + 30 && bright.1 == dim.1,
         "{bright:?} {dim:?}"
     );
     assert_eq!(h.builds(), builds, "changing light values rebuilt ASes");
     h.ray.settings.shadows = true;
-    let dark = h.pixel(frame, &local_light([3.; 4], false));
-    let through = h.pixel(frame, &local_light([100.; 4], true));
+    let dark = h.pixel(light_frame, &local_light([3.; 4], false));
+    let through = h.pixel(light_frame, &local_light([5.; 4], true));
     assert!(
         dark.0[1] as u32 + 30 < bright.0[1] as u32 && dark.1 == bright.1,
         "{dark:?} {bright:?}"
