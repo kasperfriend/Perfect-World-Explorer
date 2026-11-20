@@ -1773,8 +1773,12 @@ fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool, overlay: bool) {
             combined_pixel.albedo_history = existing.albedo_history | sun_cache_write;
             image[at] = combined_pixel;
         } else {
-            // No usable ray lighting — keep the raster color unchanged.
-            image[at] = existing;
+            // No usable ray lighting — keep the raster color unchanged,
+            // but record the depth/guide/owner from the ray hit so depth
+            // consumers and temporal reprojection see the correct surface.
+            var keep = pack_pixel(existing_rgb, depth, guide, owner|select(0u,DEP_MOVING,motion_dependent));
+            keep.albedo_history = existing.albedo_history | sun_cache_write;
+            image[at] = keep;
         }
     } else {
         // Per-pixel depth test between world and moving geometry:
