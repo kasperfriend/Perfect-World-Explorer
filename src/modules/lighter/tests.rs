@@ -538,6 +538,20 @@ fn exercise(mode: Mode, cpu_query: bool) {
         assert!((depth - z).abs() < 1e-6);
         h.ray.capture = true;
     }
+    let mut animated = Builder::default();
+    let red = upright(&mut animated, 0., [1., 0., 0., 1.], 0, 0);
+    animated
+        .place(
+            red,
+            Transform {
+                position: [0., 0., -3.],
+                scale: 1.7,
+                cos: 0.98,
+                sin: (1.0f32 - 0.98 * 0.98).sqrt(),
+            },
+        )
+        .unwrap();
+    let red = animated.finish();
     // --- RED CARD ISOLATION CHECKS (temporary diagnostics) ---
     // Red only: empty world, red moving card → expect pure red [255,0,0].
     h.ray.install(Ok((Builder::default().finish(), bank.clone())));
@@ -561,6 +575,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
         depth_at(frame, Vec3::new(0., 0., -5.))
     );
     // Both: green world + red moving → expect pure red [255,0,0] (red is nearer).
+    h.ray.install(Ok((b_green.finish(), bank.clone())));
     let (both, both_z) = h.pixel(frame, &red);
     eprintln!(
         "RED-CARD-DUMP both: color={:?} depth={} expect=[255,0,0,255] depth≈{}",
@@ -568,20 +583,6 @@ fn exercise(mode: Mode, cpu_query: bool) {
         both_z,
         depth_at(frame, Vec3::new(0., 0., -3.))
     );
-    let mut animated = Builder::default();
-    let red = upright(&mut animated, 0., [1., 0., 0., 1.], 0, 0);
-    animated
-        .place(
-            red,
-            Transform {
-                position: [0., 0., -3.],
-                scale: 1.7,
-                cos: 0.98,
-                sin: (1.0f32 - 0.98 * 0.98).sqrt(),
-            },
-        )
-        .unwrap();
-    let red = animated.finish();
     let (c, z) = h.pixel(frame, &red);
     assert_eq!(c, [255, 0, 0, 255]);
     assert!(
