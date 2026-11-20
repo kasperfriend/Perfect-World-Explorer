@@ -31,9 +31,9 @@ fn resolve(coord: vec4<f32>) -> Output {
     let nearest = index(vec2<i32>(floor(source+0.5)));
     let center = pixels[nearest];
     if present.options.y!=0u {
-        // EASU upscaler was removed (P1); fall back to nearest render texel.
-        // `center` is already pixels[nearest] where nearest maps source->render coords.
-        return Output(vec4<f32>(color_of(center),1.),center.depth);
+        // EASU upscaler was removed (P1); fall back to bilinear filter
+        // instead of nearest-neighbor for proper upscale quality.
+        // Fall through to the bilinear filter below.
     }
     let p = vec2<i32>(floor(source));
     let f = fract(source);
