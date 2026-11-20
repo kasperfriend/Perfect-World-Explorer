@@ -675,6 +675,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
         .place(block, Transform::translation([1.1, 0., -1.]))
         .unwrap();
     let shadow = shadow.finish();
+    h.ray.settings.lighting = true;
+    h.ray.settings.shadows = false;
     let bright = h.pixel(sun_frame, &shadow);
     h.ray.settings.shadows = true;
     let dark = h.pixel(sun_frame, &shadow);
@@ -682,11 +684,12 @@ fn exercise(mode: Mode, cpu_query: bool) {
         dark.0[0] < bright.0[0] && dark.1 == bright.1,
         "{dark:?} {bright:?}"
     );
-    h.ray.settings.lighting = true;
+    h.ray.settings.lighting = false;
     h.ray.settings.shadows = false;
     let lit = h.pixel(sun_frame, &shadow);
     assert_ne!(lit.0, bright.0);
     assert_eq!(lit.1, bright.1);
+    h.ray.settings.lighting = true;
 
     // Neither secondary destination lies on the primary ray. Verify water
     // transmission without reflections, then turn on reflected visibility.
