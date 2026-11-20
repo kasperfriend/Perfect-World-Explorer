@@ -31,7 +31,7 @@ pub struct Reference {
 /// Tree types a world file may declare. The largest staged table is 59 (1.8.4).
 pub const MAX_TREE_TYPES: usize = 4096;
 
-/// Grass types a world file may declare. The largest staged table is 244 (1.8.4).
+/// Grass types a world file may declare. The largest staged table is 254 (1.8.4).
 pub const MAX_GRASS_TYPES: usize = 4096;
 
 #[derive(Clone, Debug)]
@@ -344,7 +344,7 @@ impl Scene {
             || count > 1_000_000
             // Measured across every staged client: the largest block grid is
             // the 1.8.4 world's 22,528 blocks (176x128), its tree table holds
-            // 59 types and its grass table 244. Each limit carries headroom
+            // 59 types and its grass table 254. Each limit carries headroom
             // over those and exists to catch a damaged header, not to police
             // what a newer client may author.
             || tree_count > MAX_TREE_TYPES

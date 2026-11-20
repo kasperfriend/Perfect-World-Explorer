@@ -203,12 +203,16 @@ Six `.ecwld` files parse, from small instance maps to full world maps:
 
 | file | blocks | grid | block | tree types | trees | water | grass | ornaments | effects | critters | sounds |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| `world` (2.78 MB) | 22528 | 176×128 | 64 | 59 | 3646 | 9039 | 38796 | 41494 | 3535 | 1347 | 1044 |
+| `world` (2,848,200 B) | 22528 | 176×128 | 64 | 59 | 3649 | 9047 | 39116 | 41646 | 3542 | 1347 | 1044 |
 | `world` (2.45 MB) | 22528 | 176×128 | 64 | 59 | 3938 | 9204 | 34896 | 26647 | 2275 | 1347 | 827 |
 | `a37` (Morai, 1.4.4) | 4608 | 48×96 | 64 | 0 | 0 | 148 | 2704 | 8441 | 362 | 0 | 0 |
 | `a70` | 2304 | 48×48 | 64 | 0 | 0 | 0 | 0 | 2853 | 1908 | 0 | 0 |
 | `b01` | 256 | 16×16 | 64 | 0 | 0 | 0 | 0 | 605 | 205 | 0 | 0 |
 | `a07` (1.5.2) | 256 | 16×16 | 64 | 0 | 0 | 26 | 0 | 202 | 22 | 0 | 0 |
+
+The 2,848,200 B `world` is the original file. The checked-in fixture is
+2,775,856 B after dropping all but four water-reference occurrences; its
+non-water block payloads and both type tables are preserved.
 
 `trees = 0` on the maps where `tree types = 0` is not a parser fault: those
 clients place vegetation as **ornaments**, and a map with no tree-type table
@@ -311,18 +315,22 @@ placements in their own ECWLD, which is authored content, not a read failure
 
 ## Water
 
-Water is a two-level structure: `maps/<id>/<id>.ecbsd` is a manifest of
-`bsdata/*.dat` paths plus a per-water-ref record index, and the areas live
-inside those `.dat` files.
+Water is a two-level structure: `maps/<id>/<id>.ecbsd` (or `world.ecbsd` for
+the main world) is a manifest of `BSData/*.dat` paths plus a per-reference
+record index. The referenced patch files are resolved relative to that map
+folder, and decoded areas live inside those `.dat` records.
 
 | map | water refs | unique refs | areas |
 |---|---|---|---|
 | `a07` (1.5.2) | 26 | 1 | 1 |
 | `a37` (1.4.4) | 148 | 3 | 3 |
+| `world` (1.8.4 CI fixture) | 4 | 4 | 4 (6,144 cells; 1,549 wet) |
 
 Refs collapse to unique `(export_id, offset)` pairs before loading, which is why
-148 refs become 3 areas rather than 148. Both numbers are correct and are
-reported separately so neither hides the other.
+148 refs become 3 areas rather than 148. The original, untrimmed 1.8.4
+`world.ecwld` has 9,047 per-block water references and 111 unique pairs; the CI
+fixture keeps one occurrence of four selected pairs and reports that narrower
+scope explicitly.
 
 An empty `bsdata` record is 16 bytes — `MOXB`, version 2, one entry, offset 0 —
 which is an authored-empty record rather than a truncated one. Several of the
@@ -330,10 +338,9 @@ which is an authored-empty record rather than a truncated one. Several of the
 
 ### Every water reference, bucketed
 
-"3 areas out of 148 references" looks like a fault until the references are
-counted by what happened to them. `water-record-survey --classify` puts every
-reference in exactly one bucket and fails if the buckets do not add up, so the
-question "where did the other 145 go" is answered rather than asked.
+`water-record-survey --classify` puts every reference in its input corpus into
+exactly one bucket and fails if the buckets do not add up. For the checked-in
+1.8.4 subset, the four selected references all resolve and decode:
 
 ```
 tools/offline_harness.sh water-record-survey --classify <element/maps>
@@ -343,37 +350,40 @@ tools/offline_harness.sh water-record-survey --classify <element/maps>
 |---|---|---|---|---|---|---|---|
 | `a07` (1.5.2) | 26 | 1 | 1 | 0 | 0 | 0 | 26 |
 | `a37` (1.4.4) | 148 | 3 | 3 | 0 | 0 | 0 | 148 |
-| `world` (1.8.4) | 9237 | 111 | 109 | 0 | 0 | 256 | 8981 |
+| `world` (1.8.4 CI fixture) | 4 | 4 | 4 | 0 | 0 | 0 | 4 |
 
-The refs collapse because a map names every water area once per block that can
-see it: `a37`'s 148 references are 3 unique `(export id, offset)` pairs and
-`world`'s 9237 are 111. Every reference decodes; nothing is lost.
+The full-world 9,047-reference census is not a claim that all 111 unique
+records were decoded by CI: only four water references and their four patch
+files are staged in this fixture.
 
-### 1.8.4, the first time it was measured
+### 1.8.4, the real loader measured end to end
 
-The 1.8.4 world is the first client whose water was measured rather than
-assumed. Its 88 `bsdata/*.dat` patches and its `world.ecbsd` (2.2 MB, 111
-records) were staged and run through the classifier:
+The committed fixture keeps the original 1.8.4 header, 22,528-block grid,
+non-water block payloads and both type tables, while retaining one occurrence
+of four selected water references. Its verbatim `world.ecbsd` is 2,678,024 bytes
+and names 88 BSData paths; the four referenced patch files are staged beside the
+world file under `maps/world/BSData/`. The test calls `Scene::load` and then the
+same `water::load` path the viewer uses, so it covers the world → manifest →
+patch path rather than only calling the record parser.
 
-- **0 unknown versions.** All 112 water records outside the framed patches open
-  with `0x10003000`, the layout this reader decodes.
-- **0 empty records.** Unlike 1.5.2's maps, no 1.8.4 patch is the authored-empty
-  16-byte stub.
-- **256 references (2 patches) are not water records at all.** `bsdata/32.dat`
-  record 0 and `bsdata/45.dat` record 59 inflate cleanly to 32,768 bytes and
-  contain no `0x1000xxxx` version word anywhere, so the record carries other
-  BSData data and names a water record index that is not water.
-- **109 areas decoded.** The gap between 111 unique refs and 109 areas is the
-  two patches above.
+| patch record | revision | grid | wet cells |
+|---|---|---|---:|
+| `4.dat` record 1 | `4` | 32×32 | 17 |
+| `7.dat` record 0 | `4` | 32×32 | 533 |
+| `21.dat` record 0 | `0x10003000` | 60×64 | 900 |
+| `44.dat` record 9 | `4` | 8×32 | 99 |
+| **CI result** | **4 areas** | **6,144 cells** | **1,549** |
 
-The first pass reported those 256 references as *unknown version*, and the error
-that produced it was `unsupported A3DWaterArea version 0x1af`. `0x1af` is 431 —
-the record's **zlib stored length**, not a version. The reader had been
-reporting a framing word as a version since the original 1.3.1 investigation.
-That is fixed: a record that inflates but holds no water now says so, and only a
-real `0x1000xxxx` revision word this build has no layout for is reported as a
-version. The bucket names follow the same rule, so a future survey cannot
-resurrect the mistake.
+The fixture is a representative loader check, not a census of the 111 unique
+water references in the original world. It proves that the viewer's world
+folder is the right base for both `world.ecbsd` and the manifest's `BSData/...`
+paths, and that both the plain v4 word and `0x10003000` decode through the real
+loader.
+
+The parser also distinguishes a compressed record's stored-length word from a
+water revision: `0x1af` is 431, not an `A3DWaterArea` version. A record that
+inflates but contains no water area is reported as such rather than being
+mislabelled as an unsupported version.
 
 ## Known gaps, stated plainly
 
@@ -403,7 +413,11 @@ error and the mode exits non-zero.
 | client | map | blocks | grid | tree types | trees | water refs | grass | ornaments | effects | models | sounds | precinct |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 1.8.4 | `a37` | 4608 | 48x96 | 0 | 0 | 148 | 2704 | 8441 | 362 | 0 | 0 | 29 zones |
-| 1.8.4 | `world` | 22528 | 176x128 | 59 | 3646 | 9237 | 38240 | 39179 | 2971 | 76 | 1044 | 383 zones |
+| 1.8.4 | `world` | 22528 | 176x128 | 59 | 3649 | 9047 | 39116 | 41646 | 3542 | 95 | 1044 | 383 zones |
+
+The `world` row counts the original untrimmed file; the committed CI fixture
+preserves its non-water world data but filters the water list to four selected
+references. Its JSON therefore reports four water references, not 9,047.
 
 `a37`'s 148 water references are the number the water classifier is required to
 account for, and they are all read: 3 areas, 18 shoreline waves, 3,146 points.
@@ -578,13 +592,15 @@ the affected roots is 33–37, unchanged.)*
 
 **2.1 — water versions: covered, including 1.8.4's own word.** `WATER_VERSIONS`
 holds both `0x100SSSSS` words, and the reader also accepts the plain revision `4`
-that every 1.8.4 BSData water record stores; anything else is refused by name.
+used by several 1.8.4 BSData water records; the staged `21.dat` record 0 uses
+`0x10003000`. Anything else is refused by name.
 The v4 record keeps the v2/v3 field order, so it is one more row in the offset
 table rather than a second reader: its header is four bytes instead of eight,
 and its cell mask sits at version+120 on a 32x32 grid rather than at version+37
-on a 1x1 one. *(measured against `BSData/4.dat`, `7.dat`, `21.dat` and `44.dat`
-from the 1.8.4 client: 5 of the 7 referenced records decode as grids, and the
-other 2 are the non-water records already recorded below.)*
+on a 1x1 one. *(Measured against `BSData/4.dat`, `7.dat`, `21.dat` and `44.dat`
+from the 1.8.4 client: five of the seven examined records decode as grids;
+`21.dat` records 15 and 25 carry other BSData data. The CI chain test now
+exercises four decoded records through the real loader; see the Water section.)*
 
 **2.2 — `gfx_light` keypoint count and interpolation: already covered.**
 `MAX_KEYPOINTS` is 8, and `InterpolateMode` is refused unless `0` — measured at
@@ -614,7 +630,7 @@ the revision and the bit only when the walk fails; two tests cover both halves.
 `an_unreadable_table_with_bit_31_set_is_refused_as_encrypted`.)*
 
 **2.7 — grass limits: already covered.** The caps sit three orders of magnitude
-above the measured maximum (the 1.8.4 world's 244 grass types) and refuse by
+above the measured maximum (the 1.8.4 world's 254 grass types) and refuse by
 name rather than silently clamping. *(measured.)*
 
 **2.8 — count caps: already covered.** `MAX_TREE_TYPES` = `MAX_GRASS_TYPES` =
@@ -659,6 +675,10 @@ split-package reader (`B-9`) remains the claim that covers it, and that claim is
 unit-tested against a synthetic split rather than against the shipped 2.86 GB
 file.
 
+The `pw-184` CI JSON uses the scoped fixture described above: it preserves the
+original non-water payload but keeps four selected water references, not the
+original world's full 9,047-reference census.
+
 <!-- BEGIN GENERATED MATRIX -->
 ## Client x category, generated from the CI JSON
 
@@ -672,7 +692,7 @@ blank.
 | world ECWLD | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | 22528 blocks, 176x128 grid, tree types 59 | blocked: no `ci-results/pw-2016.json` |
 | terrain T2BK | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
 | lightmaps T2LM | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
-| water (BSData) | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | **refused**: cannot read tests/fixtures/clients/pw-184/world.ecbsd: No such file or directory (os error 2) | blocked: no `ci-results/pw-2016.json` |
+| water (BSData) | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | 4 areas, 6144 cells, 1549 of them wet | blocked: no `ci-results/pw-2016.json` |
 | trees | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | 59 types, 3649 placements | blocked: no `ci-results/pw-2016.json` |
 | GFX effects | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
 | music precinct | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | 1 precinct.clt files | blocked: no `ci-results/pw-2016.json` |
@@ -685,7 +705,7 @@ blank.
 | elements data | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
 | tasks data | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
 
-7 cells measured ok, 1 named refusals, 97 blocked, 0 SILENT.
+8 cells measured ok, 0 named refusals, 97 blocked, 0 SILENT.
 
 ### Where these numbers come from
 
@@ -738,7 +758,7 @@ always names the measurement that would close it.
 
 | item | status |
 |---|---|
-| 2.1 every candidate site classified | **measured**: `tools/audit-silent-drops.py` reports `182 sites, {'probe': 59, 'unreachable': 118, 'named': 5}`, **zero Fix**. The list is `docs/silent-drops.md`, generated, with file, line and status. |
+| 2.1 every candidate site classified | **measured**: `tools/audit-silent-drops.py` reports `184 sites, {'probe': 61, 'unreachable': 118, 'named': 5}`, **zero Fix**. The list is `docs/silent-drops.md`, generated, with file, line and status. |
 | 2.2 every Fix site fixed or counted | **measured**: the only genuine drop the audit found — `src/world_catalog.rs` losing malformed `instance.txt` lines — now calls `load_status::dropped(Category::Instances, …)` naming the line and the offending field. `water::load` also records an EC-BSD loss naming the file, and three `else { continue }` sites in the same function that discarded a whole water surface in silence now `diag!` with the patch, the BSData index and the number that did not fit. |
 | 2.3 a test that fails on an empty-and-silent loader | **measured**: `src/load_status.rs::empty_tests` (4 tests) and `src/tree_source.rs::authored_placements_that_are_not_written_are_counted_as_a_loss`, which drives the real fixture. |
 
@@ -761,14 +781,14 @@ each was a test that could not fail:
 |---|---|
 | 3.1 six clients plus the 2016 pack | **blocked** for 1.3.1, 1.3.6, 1.4.2, 1.4.4, 1.5.2 and the 2016 pack: no `ci-results/<client>.json` exists, because only the 1.8.4 fixture is staged in the repository. Closing it needs those clients' world files, `trees.pck` and instance maps committed under `tests/fixtures/clients/<name>/` (each file under 100 MiB); the measure step then writes the JSON with no code change. **measured (CI file)** for 1.8.4. |
 | 3.2 all fifteen categories | **measured (CI file)** for 1.8.4 and **blocked** for the rest, per category, in the generated table above. |
-| 3.3 OK / NAMED-REFUSAL / SILENT | **measured (CI file)**: of the fifteen named categories, 7 ok, 1 named refusal, 0 SILENT; the JSON also carries an eighth `ok` for grass, which the task's category list does not name and the table above therefore omits. Several cells are `blocked: not in the staged fixture`, which is a property of a staged subset and not a claim about the client. |
+| 3.3 OK / NAMED-REFUSAL / SILENT | **measured (CI file)**: of the fifteen named categories, 8 ok, 0 named refusals, 0 SILENT; the JSON also carries a ninth `ok` for grass, which the task's category list does not name and the table above therefore omits. Several cells are `blocked: not in the staged fixture`, which is a property of a staged subset and not a claim about the client. |
 | 3.4 written from the JSON, not from memory | **measured**: the generated block is produced by `tools/matrix-from-ci.py` from `ci-results/*.json`, and every cell carries one of the three labels. |
 
 ### 4. Standing open items
 
 | item | status |
 |---|---|
-| 4.1 `WATER_VERSIONS` | **measured (`src/water.rs`)**: `[0x10002000, 0x10003000]` plus the plain revision `4` 1.8.4 writes. The `4` layout is byte-measured against the shipped `BSData/7.dat` record 0 (32x32 grid, 533 wet cells, 46 shoreline waves ending the record); only `0x10003000` is measured green on a staged fixture, and `0x10002000` is still read from the constant rather than from a file. |
+| 4.1 `WATER_VERSIONS` | **measured (`src/water.rs`)**: `[0x10002000, 0x10003000]` plus the plain revision `4` 1.8.4 writes. The `4` layout is byte-measured against the shipped `BSData/7.dat` record 0 (32x32 grid, 533 wet cells, 46 shoreline waves ending the record); the end-to-end CI fixture exercises both v4 and `0x10003000` records, while `0x10002000` is not represented in the staged 1.8.4 files. |
 | 4.2 `gfx_light.rs:94-95` | **static (`src/gfx_light.rs`)**: still open, unchanged in this work. |
 | 4.3 `gfx_decal.rs:346-385` | **static (`src/gfx_decal.rs`)**: `StopEmitWhenFade` and `keyNumber` are **not** added, because the Drive SDK does not document them and the task says to record rather than guess. |
 | 4.4 DDS formats | **static (`src/model_dds.rs`)**: the formats accepted are the ones in that reader; the matrix samples 400 DDS entries per pack, so its row is a sample count, not a census. |
