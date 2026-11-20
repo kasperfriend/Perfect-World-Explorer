@@ -12,6 +12,8 @@ permissions:
   # side, so a printed number is a number nobody can check.
   contents: write
   pull-requests: write
+  # The Windows packaging audit downloads the artifact through the REST API.
+  actions: read
 
 concurrency:
   group: pr-checks-${{ github.event.pull_request.number || github.ref }}
@@ -833,6 +835,9 @@ jobs:
         with:
           name: Perfect-World-Explorer-Windows-x64
           path: ${{ runner.temp }}/uploaded-viewer
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
       - name: Audit the uploaded artifact layout
         shell: pwsh
         run: |
