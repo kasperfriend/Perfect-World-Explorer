@@ -732,8 +732,8 @@ always names the measurement that would close it.
 
 | item | status |
 |---|---|
-| 2.1 every candidate site classified | **measured**: `tools/audit-silent-drops.py` reports `182 sites, {'probe': 59, 'unreachable': 119, 'named': 4}`, **zero Fix**. The list is `docs/silent-drops.md`, generated, with file, line and status. |
-| 2.2 every Fix site fixed or counted | **measured**: the only genuine drop the audit found — `src/world_catalog.rs` losing malformed `instance.txt` lines — now calls `load_status::dropped(Category::Instances, …)` naming the line and the offending field. `water::load` now also records an EC-BSD loss with the file name in it. |
+| 2.1 every candidate site classified | **measured**: `tools/audit-silent-drops.py` reports `182 sites, {'probe': 59, 'unreachable': 118, 'named': 5}`, **zero Fix**. The list is `docs/silent-drops.md`, generated, with file, line and status. |
+| 2.2 every Fix site fixed or counted | **measured**: the only genuine drop the audit found — `src/world_catalog.rs` losing malformed `instance.txt` lines — now calls `load_status::dropped(Category::Instances, …)` naming the line and the offending field. `water::load` also records an EC-BSD loss naming the file, and three `else { continue }` sites in the same function that discarded a whole water surface in silence now `diag!` with the patch, the BSData index and the number that did not fit. |
 | 2.3 a test that fails on an empty-and-silent loader | **measured**: `src/load_status.rs::empty_tests` (4 tests) and `src/tree_source.rs::authored_placements_that_are_not_written_are_counted_as_a_loss`, which drives the real fixture. |
 
 Two of these tests were wrong when first written and are worth naming, because
