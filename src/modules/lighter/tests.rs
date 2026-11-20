@@ -621,16 +621,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
     let mut b3 = Builder::default();
     let mut surf = Surface::new(0, 0, 0.5, 0.);
     surf = surf.with_lighting([0.5, 0.5, 0.5, 1.], [0., 0., 0., 0.], [0., 0., 0., 0.]);
-    let id = quad_material(
-        &mut b3,
-        [[-1., 1., -2.],
-         [1., 1., -2.],
-         [-1., -1., -2.],
-         [1., -1., -2.]],
-        [0., 0., 1.],
-        surf,
-        0,
-    );
+    let positions = [[-1., 1., -2.], [1., 1., -2.], [-1., -1., -2.], [1., -1., -2.]];
+    let id = quad_material(&mut b3, positions, [0., 0., 1.], surf, 0);
     b3.place(id, Transform::IDENTITY).unwrap();
     h.ray.install(Ok((b3.finish(), bank.clone())));
     // Bright vs dim sun: lighting on, sun contributes. Bright sun saturates,
