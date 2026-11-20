@@ -791,11 +791,21 @@ fn entries_from_trailer(
     let pos = table_offset(header, rev)?;
     let table_end = part_end - (rev.header + 8) as u64;
     let mut tried = Vec::new();
+    // A word below `base` is a position in an *earlier* piece, so
+    // `checked_sub(base)` underflows and the package-absolute reading is skipped
+    // without a word. Say so: "neither reading fits inside the footer" then reads
+    // as though both were measured against the same piece, when one never applied
+    // at all. 1.8.4's `litmodels` is the case -- its low half is 4,075,062,583
+    // against a `base` of 6,442,450,176.
+    let mut below_base = None;
     for (label, local) in [
         ("package-absolute", pos.checked_sub(base)),
         ("piece-local", Some(pos)),
     ] {
         let Some(local) = local.filter(|local| *local <= table_end) else {
+            if label == "package-absolute" && pos < base && below_base.is_none() {
+                below_base = Some(pos);
+            }
             continue;
         };
         // The entry table may also straddle the split, so it is walked through
@@ -844,7 +854,14 @@ fn entries_from_trailer(
             .and_then(|at| u32le(header, at).ok())
             .unwrap_or(0),
         if tried.is_empty() {
-            "neither reading fits inside the footer".to_string()
+            match below_base {
+                Some(n) => format!(
+                    "neither reading fits inside the footer, and the table word's {n} is \
+                     below this package's base {base}, so it names a position in an \
+                     earlier piece rather than one this file can be read from"
+                ),
+                None => "neither reading fits inside the footer".to_string(),
+            }
         } else {
             tried.join("; ")
         }
