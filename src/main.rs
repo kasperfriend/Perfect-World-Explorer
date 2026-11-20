@@ -39,6 +39,7 @@ mod cloud_gpu;
 mod cloud_surface;
 mod color_chain;
 mod diagnostics;
+mod direct_storage_readout;
 // A preview is a test-only harness. The skip is on the module: its literals
 // are authored GFX text and its tables are read top to bottom, neither of
 // which formatting improves, and every other module stays checked.
@@ -86,8 +87,18 @@ mod latency;
 #[cfg(windows)]
 mod launcher_ui;
 mod light_consumers;
-#[cfg(any(windows, test))]
+// The throughput sparkline is drawn by the standalone loading window and by the
+// in-viewer overlay a world change shows, and the overlay is compiled on every
+// host, so this module is no longer Windows-only.
 mod loading_graph;
+// The loading UI's frame composition: the standalone window and the in-viewer
+// overlay a world change shows both go through it, so the two screens cannot
+// drift apart. Platform-neutral, so it is compiled and tested on every host.
+mod loading_overlay;
+// The client's own loading artwork: the Windows loading window fills itself from
+// `surfaces.pck`, and the headless fixture check exercises the same lookup and
+// decode. Declared unconditionally so the path stays tested on every host.
+mod loading_screen;
 mod material;
 mod model_asset;
 mod model_attachment;
@@ -3707,11 +3718,36 @@ fn main() {
     // The old process's non-interactive overlay is the only loading UI for a
     // handoff child. Create the standalone loading window once, before terrain
     // fallback, so a second attempt never opens another Win32 window.
+    //
+    // The window opens before the map resolves, so no `Terrain` exists yet to
+    // name the client's `element` folder: the user's selection is resolved here
+    // instead, because `surfaces.pck` - the archive the loading-screen pictures
+    // come from - lives in `element`. A folder that cannot be resolved leaves
+    // the window on its plain background and says so, instead of failing the
+    // load over artwork.
+    //
+    // The window also opens for a handoff child, because a world change from the
+    // Teleport List used to leave nothing on screen but the old process's name.
+    // The child runs this window on its own thread while it loads terrain, so
+    // the picture and the DirectStorage readout stay live during the part of the
+    // change that actually takes the time. The old process hides its own copy as
+    // soon as the child publishes its HWND.
     #[cfg(windows)]
-    let loading = if world_handoff::is_handoff_child() {
-        None
-    } else {
-        Some(windows_setup::LoadingWindow::start())
+    let loading = {
+        let resolved = world_catalog::resolve(&path, Some(&selected_world)).ok();
+        let element = resolved
+            .as_ref()
+            .map(|map| map.element.clone())
+            .unwrap_or_else(|| loading_screen::element_folder(&path));
+        // The destination's own names, so the picture is matched to the place
+        // instead of only drawn at random.
+        let location = resolved
+            .as_ref()
+            .map(|map| loading_screen::Location::new(&map.id, &map.display_name, &map.name));
+        Some(windows_setup::LoadingWindow::start_for(
+            Some(&element),
+            location.as_ref(),
+        ))
     };
     // Loading terrain is the only operation that can be retried in-process.
     // PR #40 showed that retrying `gpu::run` after a visible window has been
@@ -3750,6 +3786,8 @@ fn main() {
                 // readiness signal that will never arrive.
                 world_handoff::publish_failure(&error);
                 eprintln!("Error: {error}");
+                #[cfg(windows)]
+                drop(loading);
                 #[cfg(windows)]
                 if !world_handoff::is_handoff_child() {
                     windows_setup::show_error(&error);
