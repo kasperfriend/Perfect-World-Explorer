@@ -239,7 +239,7 @@ pub(crate) const REVISIONS: [Revision; 3] = [
 /// here rather than branching on "if version == 0x00020003 and size < ..." is
 /// the point: the condition that separates it from the wide trailer is the
 /// trailer's own bytes, not the package's size on disk.
-pub(crate) const TRAILER_PROBES: [Revision; 1] = [Revision {
+pub(crate) const TRAILER_PROBES: [Revision; 2] = [Revision {
     // Matched against any declared version that has no resolved layout of its
     // own; the guard pair is what actually admits it.
     version: 0,
@@ -256,6 +256,40 @@ pub(crate) const TRAILER_PROBES: [Revision; 1] = [Revision {
     // it as one would refuse a package whose table decodes perfectly.
     flags_at: None,
     description_at: 16,
+    guard_byte1: 272,
+},
+// The wide field order with a *32-bit* table word, which is 1.8.4's
+// `element/surfaces.pck` -- the file the minimap needs.
+//
+// Every other fact about that trailer points at the wide layout: it declares
+// `0x00020003`, its guardByte1 is at `+272`, and its `dwFlags` at `+16` reads
+// zero, which is a real flag word and not the 'A' of a description like the
+// narrow `trees.pck` writes there. Its description therefore starts at `+20`,
+// on the 280-byte struct, and its 252-byte region ends exactly at the guard.
+// Only the table word is 32 bits: read as a `u64` the field is 2^64 minus
+// 3,147,722,044, and its low half is 1,147,245,252, which leaves 1,862,559
+// bytes for the 22,269-entry table -- 83.6 bytes a record. The table decides,
+// as always, and this candidate is what lets it be walked.
+//
+// Measured from a shipped refusal, not guessed:
+//   "the trailer declares its table at 18446744070561829572 but only 1149107811
+//    bytes of this file (len 1149108099) precede the footer (declared end
+//    1149108099, base 0, count 22269, flags 0x00000000)"
+// The `flags 0x00000000` in that line is what ruled the *narrow* probe out --
+// it reads that word from `+16`, where the narrow order keeps the first four
+// bytes of `"Angelica File Package"`, so a zero there can only be `dwFlags`.
+Revision {
+    version: 0,
+    header: 280,
+    entry: 288,
+    offset_at: 264,
+    offset_width: 8,
+    size_at: 272,
+    compressed_at: 276,
+    table_offset_at: 8,
+    table_offset_width: 4,
+    flags_at: Some(16),
+    description_at: 20,
     guard_byte1: 272,
 }];
 
@@ -1710,16 +1744,20 @@ mod tests {
         );
 
         // And it must be the probe, not the version word, that picks the DWORD.
-        // Three candidates: the revision's own 64-bit reading, then the two
-        // probes. Both probes read a DWORD, and they differ only in the record
-        // size -- 276 bytes like the narrow trailer, or 288 like the wide one
-        // whose table word is still 32 bits (1.8.4's `minimap.pck`). The table
-        // walk is what separates them, so the ORDER of the two is not a claim;
-        // that the DWORD reading is tried at all, and after the 64-bit one, is.
+        // Three candidates: the revision's own 64-bit reading, then two probes
+        // that read a DWORD. The probes differ in *field order*, not record
+        // size -- the narrow `0x00020002` order with no dwFlags, and the wide
+        // order with a real `dwFlags` at `+16` and the description at `+20`,
+        // which is what 1.8.4's `surfaces.pck` writes. Each is proven by
+        // walking the table it names, so order between them is not a claim;
+        // that both are tried at all, and after the 64-bit reading, is.
         let candidates = trailer_candidates(0x0002_0003);
-        assert_eq!(candidates.len(), 2, "wide first, narrow second");
+        assert_eq!(candidates.len(), 3, "the wide layout, then both DWORD probes");
         assert_eq!(candidates[0].table_offset_width, 8);
         assert_eq!(candidates[1].table_offset_width, 4);
+        assert_eq!(candidates[2].table_offset_width, 4);
+        assert_eq!(candidates[1].description_at, 16);
+        assert_eq!(candidates[2].description_at, 20);
         // Both readings are 288-byte records, and this file proves the size: a
         // table of 326 records spans 23,911 bytes on disk with every record
         // deflated, so 276-byte records would need a 26.6% compression ratio
@@ -2967,26 +3005,37 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// `0x00020003` with 288-byte records and a **32-bit** table word is read.
+    /// 1.8.4's `surfaces.pck` trailer: wide field order, narrow table word.
     ///
-    /// The numbers come from a real refusal, not invented: 1.8.4's `minimap.pck`
-    /// reported "the trailer declares its table at 18446744070561829572 but only
-    /// 1149107811 bytes of this file (len 1149108099) precede the footer
-    /// (declared end 1149108099, base 0, count 22269)". That position is 2^64
-    /// minus 3,147,722,044, whose low 32 bits are 1,147,245,252: a position that
-    /// fits and leaves 1,862,559 bytes for 22,269 records, 83.6 bytes each.
+    /// Built from a shipped refusal, not invented. That file is 1,149,108,099
+    /// bytes and reports:
     ///
-    /// This test pins the reading that shape needs. It does **not** prove the
-    /// reading was missing -- the narrow-word probe in [`TRAILER_PROBES`] already
-    /// has exactly this geometry (280/288, table word at `+8` as a DWORD,
-    /// description at `+16`), so a package of this shape already opened. Stated
-    /// plainly because the first version of this comment claimed otherwise, and
-    /// a test that claims to fix a fault it does not touch is worse than no
-    /// test. What the real `minimap.pck` needs is still unknown: its own
-    /// refusal may come from a table that fails to decode for a reason these
-    /// numbers do not show, and that cannot be settled without the file.
+    /// > 00020003: entry table overlaps footer: the trailer declares its table
+    /// > at 18446744070561829572 but only 1149107811 bytes of this file (len
+    /// > 1149108099) precede the footer (declared end 1149108099, base 0, count
+    /// > 22269, flags 0x00000000); a 32-bit reading of the same field sees
+    /// > 1147245252 (the half above it is 0xffffffff); neither reading fits
+    /// > inside the footer; 00000000: not an Angelica file package
+    ///
+    /// Two things in that line had to be read together. The `flags
+    /// 0x00000000` is the reader's *own* flag word, so it comes from `+16`,
+    /// where the wide `0x00020003` layout keeps `dwFlags` -- and where the
+    /// narrow layout keeps the first four bytes of `"Angelica..."`, which are
+    /// `0x65676e41`, not zero. A zero there therefore says the field order is
+    /// the wide one, with `szDescription` at `+20`.
+    ///
+    /// The second is the table word: `18446744070561829572` is 2^64 minus
+    /// 3,147,722,044, and its low half is 1,147,245,252, leaving 1,862,559
+    /// bytes for 22,269 records -- 83.6 bytes each. So the struct is wide and
+    /// the word is 32 bits, a combination no candidate covered: the wide
+    /// revision read 64 bits, and the narrow probe read 32 bits but looked for
+    /// the description at `+16`, where this file has its flag word.
+    ///
+    /// This test builds exactly that trailer and asserts the narrow probe is
+    /// refused on the description -- which is what left the table unread -- and
+    /// that the package now opens through the wide-order/narrow-word probe.
     #[test]
-    fn a_wide_trailer_with_a_dword_table_word_is_read() {
+    fn surfaces_trailer_with_zero_flags_and_a_dword_word_is_read() {
         use flate2::{write::ZlibEncoder, Compression};
         use std::io::Write as _;
 
@@ -3019,16 +3068,18 @@ mod tests {
             bytes.extend_from_slice(&stored);
         }
 
-        // The wide trailer, with a DWORD table word at +8 and 0xffffffff above
-        // it -- which is what made the 64-bit reading produce a 2^64-scale
-        // position in the report.
+        // The trailer the shipped file writes: 280-byte struct, `dwFlags` a
+        // real zero at `+16`, `szDescription` at `+20` ending exactly at the
+        // guard, and a DWORD table word at `+8` with 0xffffffff above it --
+        // which is what made the 64-bit reading produce a 2^64-scale position.
         let mut header = vec![0u8; 280];
         header[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
         header[4..8].copy_from_slice(&0x0002_0003u32.to_le_bytes());
         header[8..12].copy_from_slice(&((table_at as u32) ^ MASK).to_le_bytes());
         header[12..16].copy_from_slice(&0xffffffffu32.to_le_bytes());
+        header[16..20].copy_from_slice(&0u32.to_le_bytes());
         let tag = b"Angelica File Package, Perfect World Co. Ltd.";
-        header[16..16 + tag.len()].copy_from_slice(tag);
+        header[20..20 + tag.len()].copy_from_slice(tag);
         header[272..276].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
         bytes.extend_from_slice(&header);
         bytes.extend_from_slice(&(COUNT as u32).to_le_bytes());
@@ -3047,14 +3098,48 @@ mod tests {
             as_wide > total as u64,
             "the wide reading must be the one that fails: {as_wide} against {total}"
         );
-        // And the narrow reading is the table's real position. This is the
-        // probe the shipped `trees.pck` also needs; the geometry is the same,
-        // which is why this package already opened before this test existed.
+        // The narrow `0x00020002` probe reads the same table position, and is
+        // still refused: it looks for the description at `+16`, where this file
+        // writes its zero `dwFlags`. That refusal is the "not an Angelica file
+        // package (description tag missing)" in the report, and it is why the
+        // table was never walked even though the arithmetic was right.
         let narrow = TRAILER_PROBES
             .iter()
-            .find(|r| r.entry == 288 && r.table_offset_width == 4)
-            .expect("a wide-record, narrow-word probe exists");
+            .find(|r| r.description_at == 16)
+            .copied()
+            .expect("the narrow probe exists");
         assert_eq!(table_offset(&header, narrow).unwrap(), table_at);
+
+        // The wide-order/narrow-word probe is the one that reads it.
+        let surfaces = TRAILER_PROBES
+            .iter()
+            .find(|r| r.description_at == 20 && r.table_offset_width == 4)
+            .copied()
+            .expect("the surfaces.pck probe exists");
+        assert_eq!(table_offset(&header, surfaces).unwrap(), table_at);
+        assert!(
+            surfaces.flags_at.is_some(),
+            "this trailer keeps a real dwFlags at +16"
+        );
+
+        // Both are checked against the assembled bytes, so the difference is
+        // the trailer itself and not the arithmetic: the narrow probe must be
+        // turned away by the description, the wide-order one admitted.
+        let trailer_path = write_temp(&bytes, "surfaces-narrow-refusal");
+        let whole = std::fs::File::open(&trailer_path).unwrap();
+        let end = bytes.len() as u64;
+        let refused = read_named_trailer(&whole, end, &narrow)
+            .err()
+            .unwrap_or_else(|| panic!("the narrow probe must refuse this trailer"));
+        assert!(
+            refused.contains("description"),
+            "the narrow probe must be refused on the description, got: {refused}"
+        );
+        assert!(
+            read_named_trailer(&whole, end, &surfaces).is_ok(),
+            "the wide-order/narrow-word probe must accept this trailer"
+        );
+        let _ = std::fs::remove_file(&trailer_path);
 
         let path = write_temp(&bytes, "wide-narrow-minimap");
         let mut file = std::fs::File::open(&path).unwrap();
