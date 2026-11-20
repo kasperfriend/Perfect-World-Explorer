@@ -66,11 +66,15 @@ impl Cell {
             detail: detail.into(),
         }
     }
+    /// The file is not in this fixture. Deliberately *not* "this client ships
+    /// none": a staged corpus is a subset of a client, so claiming a client
+    /// lacks a file on the strength of a fixture would be the same
+    /// overclaiming the matrix exists to prevent.
     fn absent(category: &'static str) -> Self {
         Self {
             category,
             status: "absent",
-            detail: "this client ships no such file in the staged corpus".into(),
+            detail: "not in this fixture (the fixture is a subset of the client)".into(),
         }
     }
     fn silent(category: &'static str, detail: impl Into<String>) -> Self {
@@ -101,6 +105,21 @@ fn esc(s: &str) -> String {
         }
     }
     out
+}
+
+/// Every file under `dir`, recursively.
+fn walk_all(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            walk_all(&p, out);
+        } else {
+            out.push(p);
+        }
+    }
 }
 
 fn walk(dir: &Path, name: &str, out: &mut Vec<PathBuf>) {
@@ -148,7 +167,10 @@ fn main() {
         std::process::exit(2);
     };
     let clients: Vec<(String, PathBuf)> = it
-        .filter_map(|a| a.split_once('=').map(|(n, p)| (n.to_string(), PathBuf::from(p))))
+        .filter_map(|a| {
+            a.split_once('=')
+                .map(|(n, p)| (n.to_string(), PathBuf::from(p)))
+        })
         .collect();
     if clients.is_empty() {
         eprintln!("no clients given");
@@ -500,60 +522,56 @@ fn main() {
             }
         }
 
-        // --- instances: the other .ecwld files beside the world
+        // --- instances: every `.ecwld` under `maps/` except the world itself
         let mut ecwlds = Vec::new();
-        walk(&element.join("maps"), "a*.ecwld", &mut ecwlds);
-        let mut instance_names: Vec<String> = Vec::new();
-        if element.join("maps").is_dir() {
-            if let Ok(rd) = std::fs::read_dir(element.join("maps")) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.is_dir() {
-                        if let Ok(inner) = std::fs::read_dir(&p) {
-                            for f in inner.flatten() {
-                                let q = f.path();
-                                if q.extension()
-                                    .and_then(|x| x.to_str())
-                                    .is_some_and(|x| x.eq_ignore_ascii_case("ecwld"))
-                                {
-                                    ecwlds.push(q);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        walk_all(&element.join("maps"), &mut ecwlds);
+        ecwlds.retain(|p| {
+            p.extension()
+                .and_then(|x| x.to_str())
+                .is_some_and(|x| x.eq_ignore_ascii_case("ecwld"))
+        });
+        // The world map is reported on its own row; an instance row that
+        // repeated it would double-count and hide a genuinely empty set.
+        if let Some(w) = &world {
+            ecwlds.retain(|p| p != w);
         }
         ecwlds.sort();
         ecwlds.dedup();
         let mut inst_ok = 0;
-        let mut inst_tree_types = Vec::new();
+        let mut inst_trees = Vec::new();
         for p in &ecwlds {
-            if let Ok(s) = scene::Scene::load(p) {
-                inst_ok += 1;
-                let trees: usize = s.blocks.iter().map(|b| b.trees.len()).sum();
-                let stem = p
-                    .file_stem()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("?")
-                    .to_string();
-                instance_names.push(stem.clone());
-                inst_tree_types.push(format!("{stem}:{}types/{trees}trees", s.tree_types.len()));
+            let stem = p
+                .file_stem()
+                .and_then(|n| n.to_str())
+                .unwrap_or("?")
+                .to_string();
+            match scene::Scene::load(p) {
+                Ok(s) => {
+                    inst_ok += 1;
+                    let trees: usize = s.blocks.iter().map(|b| b.trees.len()).sum();
+                    inst_trees.push(format!(
+                        "{stem}:{}types/{trees}trees",
+                        s.tree_types.len()
+                    ));
+                }
+                Err(e) => inst_trees.push(format!("{stem}:refused:{}", esc(&e))),
             }
         }
         if ecwlds.is_empty() {
             cells.push(Cell::absent("instances"));
         } else {
-            facts.push(("instances", esc(&inst_tree_types.join(" "))));
+            let detail = inst_trees.join(" ");
+            facts.push(("instances", detail.clone()));
             if inst_ok == ecwlds.len() {
-                cells.push(Cell::ok(
-                    "instances",
-                    format!("{inst_ok} instance maps: {}", inst_tree_types.join(" ")),
-                ));
+                cells.push(Cell::ok("instances", detail));
             } else {
                 cells.push(Cell::refused(
                     "instances",
-                    format!("{} of {} instance maps refused", ecwlds.len() - inst_ok, ecwlds.len()),
+                    format!(
+                        "{} of {} instance maps refused: {detail}",
+                        ecwlds.len() - inst_ok,
+                        ecwlds.len()
+                    ),
                 ));
             }
         }
