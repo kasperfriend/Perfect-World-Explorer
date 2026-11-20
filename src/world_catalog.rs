@@ -258,6 +258,14 @@ fn parse_instance_text(text: &str) -> Vec<InstanceRecord> {
             }
         }
         if fields.len() < 3 {
+            crate::load_status::dropped(
+                crate::load_status::Category::Instances,
+                format!(
+                    "instance list line {}: {} field(s) where the record needs 3",
+                    i + 1,
+                    fields.len()
+                ),
+            );
             continue;
         }
         let Some(id) = fields[0]
@@ -265,9 +273,24 @@ fn parse_instance_text(text: &str) -> Vec<InstanceRecord> {
             .next()
             .and_then(|v| v.parse::<u32>().ok())
         else {
+            // A malformed instance line used to vanish here. That is one
+            // instance the player cannot enter, reported as nothing at all, so
+            // it is counted with the line that lost it.
+            crate::load_status::dropped(
+                crate::load_status::Category::Instances,
+                format!("instance list line {}: no numeric id in {:?}", i + 1, fields[0]),
+            );
             continue;
         };
         let Some(path) = quoted(fields[1]).and_then(|p| map_id_from_path(&p)) else {
+            crate::load_status::dropped(
+                crate::load_status::Category::Instances,
+                format!(
+                    "instance list line {}: no map path in {:?}",
+                    i + 1,
+                    fields[1]
+                ),
+            );
             continue;
         };
         let (rows, cols) = parse_pair(fields[2]).unwrap_or((1, 1));

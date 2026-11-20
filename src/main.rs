@@ -88,6 +88,7 @@ mod grass_mips;
 mod grass_wind;
 mod indirect_args;
 mod latency;
+mod load_status;
 #[cfg(windows)]
 mod launcher_ui;
 mod light_consumers;
