@@ -2058,3 +2058,53 @@ needs credentials CI does not have.
 geometry, not trees. Tree geometry comes from `trees.pck`, which is checked byte
 for byte at three client versions. So the tree verdict in
 `docs/cross-version-matrix.md` stands without this.
+
+## B-34: the 1.8.4 minimap cannot be settled from the refusal it prints
+
+**What the client says.** `Original minimap: 00020003: … table at
+18446744070561829572 … (declared end 1149108099, base 0, count 22269, flags
+0x00000000); neither reading fits …; 00000000: not an Angelica file package`.
+
+**What the arithmetic says, and it is not what it first appears.** That position
+is 2^64 − 3,147,722,044. Its low 32 bits are 1,147,245,252: a position that fits,
+leaving 1,862,559 bytes for 22,269 records, or 83.6 bytes each — exactly what
+288-byte records deflate to. So the trailer's field is a **32-bit** word with
+`0xffffffff` above it, and the 64-bit reading is nonsense.
+
+This is *not* a signed-word problem. `pck::table_offset` already unmasks the value
+it returns, so reading it as `i64` double-transforms and `^ MASK`-ing it again
+produces a wrong table span. The alternative width is the value's low 32 bits,
+full stop. Both of those wrong models were tried and are recorded here so they are
+not retried.
+
+**Why that still is not a fix.** `TRAILER_PROBES[0]` already has exactly this
+geometry — 280-byte struct, 288-byte records, table word at `+8` read as a DWORD,
+description at `+16`, guard at `+272` — so a package of this shape already opens,
+and 1.8.4's `trees.pck` (which shares the geometry) is read today. A probe row
+added for the "new" shape turned out to be byte-for-byte identical to that one and
+was withdrawn.
+
+So the real `surfaces.pck` fails after the table position is found: the table
+walk, which is what proves a candidate, does not complete. The refusal prints the
+position and the count but not which record the walk stopped on, and there is no
+way to reconstruct that from a decimal in a log.
+
+**The exact measurement that would settle it.** Read the last 288 bytes of
+1.8.4's `element/surfaces.pck` and the entry count at `end - 8`, then walk that
+many 288-byte records from `table_at` and report the first record whose name
+decode or offset+size falls outside the file. That is one pass over the table, and
+it names the record rather than leaving a number to be guessed at.
+
+**How to unblock.** Place `surfaces.pck` (and its `.pkx` if split) in
+`google_drive/`, then run `tools/offline_harness.sh pck google_drive`. The file
+size is unknown — the minimap tiles of a full client may put it over the 100 MiB
+transfer cap that blocks `litmodels.pck` (B-33); if so, only the trailer and the
+table region are needed, which is a few hundred KB.
+
+**Two things the report and this build disagree about, both worth checking.**
+The error names a `minimap.pck`; `src/navigation.rs` opens
+`element/surfaces.pck` at `compose_optional`. And the message reaches the console
+through a bare `eprintln!` in `src/gpu.rs`, not a `diag!` channel, so it appears
+with no channel around it — which is why it looked like a different subsystem's
+error. If the user's build really does open `minimap.pck`, that is a second file
+this branch has never read.
