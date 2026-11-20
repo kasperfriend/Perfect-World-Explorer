@@ -181,7 +181,7 @@ impl WaterArea {
     }
     pub fn parse(b: &[u8], p: usize, export_id: u32) -> Result<Self, String> {
         let version = u(b, p)?;
-        if !WATER_VERSIONS.contains(&version) {
+        if !is_water_version(version) {
             return Err(format!("unsupported A3DWaterArea version {version:#x}"));
         }
         // The version word sits eight bytes before the area's own fields.
@@ -194,38 +194,37 @@ impl WaterArea {
     /// A run of areas shares one `version` word, so only the first area's
     /// fields follow it; the rest follow the previous area's shoreline arrays
     /// directly. The word after the version is not the number of areas (see
-    /// `decode_areas`). Every field offset here is therefore
-    /// relative to the fields, not to the version word: `color` is at +0,
-    /// `height` at +4, the flag at +36 and the cell mask at +37 for v3 and +36
-    /// for v2.
+    /// `decode_areas`). `fb` is the offset of the first field, not of the
+    /// version word, and where each field sits is [`WaterFields`]' business.
     fn parse_fields(
         b: &[u8],
         fb: usize,
         export_id: u32,
         version: u32,
     ) -> Result<(Self, usize), String> {
-        // Only a revision whose layout was recovered can be walked; the caller
-        // reports anything else by version instead of guessing at the mask
-        // offset and silently reading a shifted grid.
-        let v3 = match WaterLayout::of(version) {
-            WaterLayout::V3 => true,
-            WaterLayout::V2 => false,
-            WaterLayout::Unknown(other) => {
-                return Err(format!(
-                    "A3DWaterArea version {other:#x} has no recovered layout \
-                     (this build reads 0x10002000 and 0x10003000)"
-                ))
-            }
-        };
-        let color = u(b, fb)?;
-        let height = f(b, fb + 4)?;
-        let columns = u(b, fb + 12)? as usize;
-        let rows = u(b, fb + 16)? as usize;
-        let grid_size = f(b, fb + 20)?;
-        let center = [f(b, fb + 24)?, f(b, fb + 28)?, f(b, fb + 32)?];
+        // Only a revision whose field offsets were recovered can be walked; the
+        // caller reports anything else by version instead of guessing at the
+        // mask offset and silently reading a shifted grid.
+        let f = WaterFields::of(version).ok_or_else(|| {
+            format!(
+                "A3DWaterArea version {version:#x} has no recovered layout \
+                 (this build reads 0x10002000, 0x10003000 and 4)"
+            )
+        })?;
+        let color = u(b, fb + f.color)?;
+        let height = f(b, fb + f.height)?;
+        let columns = u(b, fb + f.columns)? as usize;
+        let rows = u(b, fb + f.rows)? as usize;
+        let grid_size = f(b, fb + f.cell_size)?;
+        let center = [
+            f(b, fb + f.center)?,
+            f(b, fb + f.center + 4)?,
+            f(b, fb + f.center + 8)?,
+        ];
         // Bounds measured across every water patch staged for 1.5.2, 1.4.4 and
         // 1.8.4 (a07, a37 and the 1.8.4 world): at most 50 columns, 32 rows and
-        // a cell size of 32 metres. The limits below leave headroom over each
+        // a cell size of 32 metres, with the 1.8.4 v4 layout reaching 60x64 and
+        // 128x128 on instance maps. The limits below leave headroom over each
         // and exist only to stop a damaged record reserving memory; a record
         // rejected here costs its own area, never the map.
         const MAX_WATER_COLUMNS: usize = 4096;
@@ -244,11 +243,15 @@ impl WaterArea {
                  {MAX_WATER_CELL_SIZE} m)"
             ));
         }
-        // The older v2 area has no simple-water flag byte: its mask begins
-        // immediately after the centre vector, and v3 inserts the flag first.
-        let simple = v3 && *b.get(fb + 36).ok_or("truncated water flag")? != 0;
+        // The older v2 area has no simple-water flag byte; v3 inserts one
+        // before the mask, which is the only difference between those two
+        // revisions. The 1.8.4 v4 layout has no flag at all.
+        let simple = match f.simple {
+            Some(at) => *b.get(fb + at).ok_or("truncated water flag")? != 0,
+            None => false,
+        };
         let n = columns.checked_mul(rows).ok_or("grid overflow")?;
-        let start = fb.checked_add(if v3 { 37 } else { 36 }).ok_or("overflow")?;
+        let start = fb.checked_add(f.mask).ok_or("overflow")?;
         let mask = b
             .get(start..start.checked_add(n).ok_or("overflow")?)
             .ok_or("truncated water cell mask")?
@@ -307,35 +310,112 @@ impl WaterArea {
 /// chance to yield its areas.
 const WATER_VERSIONS: [u32; 2] = [0x10002000, 0x10003000];
 
-/// Layout revision `WaterArea::parse_fields` decodes, derived from a version word.
+/// The `dwVersion` a **1.8.4** BSData record stores.
 ///
-/// The mask is the only field the two revisions place differently: v2's cell
-/// mask begins at +36 and v3 inserts its `simple` flag byte at +36, pushing the
-/// mask to +37. Both revisions therefore decode through one routine, keyed on
-/// the revision's *high* word rather than on an equality list, so the day a
-/// client writes `0x10004000` the reader can still attempt it and report what
-/// it found instead of refusing on the first four bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WaterLayout {
-    /// `0x10002000`: mask at +36, no `simple` flag.
-    V2,
-    /// `0x10003000`: `simple` flag at +36, mask at +37.
-    V3,
-    /// A revision with no recovered layout. Never guessed; the reader reports it.
-    Unknown(u32),
+/// It is not a `0x100SSSSS` word at all. In the shipped 1.8.4 client every water
+/// record -- `BSData/7.dat` record 0 (a 32x32 area whose shoreline waves end at
+/// `shaders\\textures\\water\\wave1.dds`), `4.dat` records 1 and 8, `44.dat`
+/// record 9 -- opens with `u32 4`, and the shoreline waves embedded in the same
+/// record still open with a `0x10003000` word. So the 431/`0x1af` incident was
+/// not the only non-conforming version in this data: the area header's own word
+/// is a plain revision number in this client.
+///
+/// Layout, measured against `7.dat` record 0 field by field, with every offset
+/// taken from the record's `dwVersion`:
+///
+/// | offset | field | measured value |
+/// |---|---|---|
+/// | +0 | `dwVersion` | `4` |
+/// | +4 | `dwColor` | `4` |
+/// | +8 | `fHeight` | `3.0` |
+/// | +16 | `dwColumns` | `32` |
+/// | +20 | `dwRows` | `32` |
+/// | +24 | `fCellSize` | `32.0` |
+/// | +28 | `vCenter` | `2560, 216, 5120` |
+/// | +124 | `byCellMask[columns*rows]` | 1024 bytes, 533 set |
+/// | +1148 | `dwWaveCount` | `46` |
+///
+/// and the 46 waves follow immediately, ending exactly at the end of the
+/// record. The 84 bytes between the centre vector and the mask are the fields
+/// the v2/v3 layouts do not have, which is why this revision needs its own
+/// offsets instead of being read as v3 with everything shifted.
+const WATER_VERSION_V4: u32 = 4;
+
+/// Whether `word` can open a water area.
+///
+/// Two spellings, because two clients write different things: the `0x100SSSSS`
+/// word an `A3DWaterArea` prefix carries in 1.3.1 through 1.5.2, and the plain
+/// revision `4` the 1.8.4 BSData records store.
+fn is_water_version(word: u32) -> bool {
+    WATER_VERSIONS.contains(&word) || word == WATER_VERSION_V4
 }
 
-impl WaterLayout {
-    pub fn of(version: u32) -> Self {
-        match version {
-            0x10002000 => Self::V2,
-            0x10003000 => Self::V3,
-            other => Self::Unknown(other),
-        }
+/// The water area that starts at `offset`, if one does.
+///
+/// A candidate has to *parse* -- a grid of sane dimensions and a cell mask that
+/// fits inside the record -- which is what keeps the scan from mistaking a small
+/// integer for a version.
+fn water_at(b: &[u8], offset: usize, export_id: u32) -> Option<(WaterArea, usize)> {
+    let version = u(b, offset).ok()?;
+    if !is_water_version(version) {
+        return None;
     }
-    /// Whether this reader knows how to walk the revision's fields.
-    pub fn is_decodable(self) -> bool {
-        matches!(self, Self::V2 | Self::V3)
+    WaterArea::parse_fields(b, offset + 4, export_id, version).ok()
+}
+
+/// Where a revision's fields sit, relative to the record's `dwVersion`.
+///
+/// Keeping them in one table is the point: a revision is a set of offsets, not a
+/// special case spread through the walker, and the next one is a row here.
+struct WaterFields {
+    color: usize,
+    height: usize,
+    columns: usize,
+    rows: usize,
+    cell_size: usize,
+    center: usize,
+    simple: Option<usize>,
+    mask: usize,
+}
+
+impl WaterFields {
+    fn of(version: u32) -> Option<Self> {
+        match version {
+            0x10002000 => Some(Self {
+                color: 0,
+                height: 4,
+                columns: 12,
+                rows: 16,
+                cell_size: 20,
+                center: 24,
+                simple: None,
+                mask: 36,
+            }),
+            0x10003000 => Some(Self {
+                color: 0,
+                height: 4,
+                columns: 12,
+                rows: 16,
+                cell_size: 20,
+                center: 24,
+                simple: Some(36),
+                mask: 37,
+            }),
+            // The v4 header keeps the v2/v3 field order and widens only the
+            // part after the centre vector: 84 bytes of fields the older
+            // revisions do not have, then the mask.
+            WATER_VERSION_V4 => Some(Self {
+                color: 0,
+                height: 4,
+                columns: 12,
+                rows: 16,
+                cell_size: 20,
+                center: 24,
+                simple: None,
+                mask: 120,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -350,7 +430,7 @@ impl WaterLayout {
 /// failure, so the framing has to be resolved before the version is trusted.
 pub(crate) fn parse_record(record: &[u8], export_id: u32) -> Result<Vec<WaterArea>, String> {
     let first = u(record, 0)?;
-    if WATER_VERSIONS.contains(&first) {
+    if is_water_version(first) {
         return decode_areas(record, export_id);
     }
     // A word in the water version family that this reader has no layout for.
@@ -368,22 +448,53 @@ pub(crate) fn parse_record(record: &[u8], export_id: u32) -> Result<Vec<WaterAre
         }
         return Err(format!(
             "unsupported A3DWaterArea version {first:#x} (no recovered layout; \
-             this build reads 0x10002000 and 0x10003000)"
+             this build reads 0x10002000, 0x10003000 and 4)"
         ));
+    }
+    // A record whose framing this reader does not recognise may still *be* a
+    // water area. The 1.8.4 client stores its areas in BSData records that open
+    // straight into the fields with no version word in front -- `4.dat` record 1
+    // declares a 32x32 grid and 69 wet cells with no framing whatsoever -- so a
+    // record that decodes where it stands is accepted where it stands. Every
+    // area this finds has been checked field by field, which is a stronger claim
+    // than "the first word looked like a version".
+    if let Some((area, _)) = water_at(record, 0, export_id) {
+        return Ok(vec![area]);
     }
     let stored = first as usize;
     let raw = u(record, 4)? as usize;
     // Shipped records declare the 32768-byte window; a wild word is a framing
-    // this reader does not know, not a size worth trusting.
-    if raw == 0 || raw > 1024 * 1024 || stored > record.len().saturating_sub(8) {
+    // this reader does not know, not a size worth trusting. The stored length is
+    // allowed to run past the record because the last patch in a BSData stores
+    // its deflate stream with no end marker -- `7.dat` record 0 is a complete
+    // water area ending in `shaders\\textures\\water\\wave1.dds`, and its stored
+    // length is 4 where the stream actually runs to the end of the record.
+    // Requiring the two to agree refused that area and every one like it, which
+    // is how a whole world ends up with no water. A wrong `stored` cannot make
+    // the stream lie: the inflater stops at the end of the deflate data or at
+    // the end of the input, whichever comes first.
+    let available = record.len().saturating_sub(8);
+    if raw == 0 || raw > 1024 * 1024 || stored == 0 {
         return Err(format!(
             "not a water record: the first word is {first:#x}, which is neither a \
              known A3DWaterArea version nor a plausible zlib frame"
         ));
     }
-    let payload = &record[8..8 + stored];
-    let plain = crate::pck::inflate(payload, raw)
-        .map_err(|e| format!("not a water record: the zlib frame does not inflate: {e}"))?;
+    let payload = &record[8..8 + stored.min(available)];
+    let plain = match crate::pck::inflate(payload, raw) {
+        Ok(plain) => plain,
+        // Only a stream that failed *before* the end of the input is a framing
+        // fault. A truncated-but-complete stream is what the marker-less records
+        // look like, and the area it carries is worth keeping.
+        Err(error) => match crate::pck::inflate_lenient(payload, raw) {
+            Some(complete) => complete,
+            None => {
+                return Err(format!(
+                    "not a water record: the zlib frame does not inflate: {error}"
+                ))
+            }
+        },
+    };
     // Records are shared with the other BSData tables, so a water area can sit
     // anywhere in the window; find the first run that actually decodes.
     let mut from = 0usize;
@@ -392,6 +503,10 @@ pub(crate) fn parse_record(record: &[u8], export_id: u32) -> Result<Vec<WaterAre
             return Ok(areas);
         }
         from = offset + 4;
+    }
+    // A record can also hold a bare area with no version word at all.
+    if let Some((area, _)) = water_at(&plain, 0, export_id) {
+        return Ok(vec![area]);
     }
     // The frame inflated, so this is a readable record — it simply carries no
     // water area. That is a fact about the patch, not a fault in a version, and
@@ -410,7 +525,7 @@ fn find_version_word(b: &[u8], from: usize) -> Option<usize> {
     let mut p = (from + 3) & !3;
     while p + 8 <= b.len() {
         let word = u32::from_le_bytes(b[p..p + 4].try_into().ok()?);
-        if WATER_VERSIONS.contains(&word) {
+        if is_water_version(word) {
             return Some(p);
         }
         p += 4;
@@ -440,14 +555,23 @@ fn decode_areas(b: &[u8], export_id: u32) -> Result<Vec<WaterArea>, String> {
     let mut p = 0usize;
     while p + 8 <= b.len() {
         let version = u(b, p)?;
-        if !WATER_VERSIONS.contains(&version) {
+        if !is_water_version(version) {
             break;
         }
         // The version word opens the run, so the first area's fields follow it
         // and every later area's fields follow the previous area's shoreline
         // arrays. Stop when the payload runs out or a word that cannot open an
         // area arrives; the declared count is not a bound.
-        let mut cursor = p + 8;
+        //
+        // How far the fields sit behind the word depends on the revision: a
+        // `0x100SSSSS` prefix reserves eight bytes before `dwColor`, while the
+        // 1.8.4 v4 word sits immediately in front of it. Reading v4 through the
+        // prefix offset shifted every field by four bytes, which turned a valid
+        // 32x32 grid into nonsense and produced no water on any map.
+        let mut cursor = match version {
+            WATER_VERSION_V4 => p + 4,
+            _ => p + 8,
+        };
         let mut parsed = 0usize;
         loop {
             match WaterArea::parse_fields(b, cursor, export_id, version) {
@@ -476,7 +600,7 @@ fn decode_areas(b: &[u8], export_id: u32) -> Result<Vec<WaterArea>, String> {
         return Err(if (first & 0xffff_0000) == 0x1000_0000 {
             format!(
                 "unsupported A3DWaterArea version {first:#x} (no recovered layout; \
-                 this build reads 0x10002000 and 0x10003000)"
+                 this build reads 0x10002000, 0x10003000 and 4)"
             )
         } else {
             format!("no A3DWaterArea record found; the first word is {first:#x}")
@@ -1016,6 +1140,111 @@ mod tests {
         assert_eq!(wave.night_colors, [0x80808080; 3]);
     }
 
+    /// The 1.8.4 water record, rebuilt byte for byte from the shipped data.
+    ///
+    /// This is `BSData/7.dat` record 0 as the client stores it: `dwVersion` 4,
+    /// no `0x100SSSSS` prefix, the v2/v3 field order, then 84 bytes of fields
+    /// the older revisions do not have, the 32x32 cell mask at +124, and 46
+    /// shoreline waves that end the record. Two separate faults made this area
+    /// unreadable and neither was a wrong offset in the old layout:
+    ///
+    /// 1. the revision word is 4, so `parse_record` never recognised the record
+    ///    and reported "the first word is 0x4, which is neither a known
+    ///    A3DWaterArea version nor a plausible zlib frame";
+    /// 2. the record is not zlib-framed at all, so there was no frame to inflate
+    ///    and nothing to fall back on.
+    ///
+    /// A whole world of refs like this is why the 1.8.4 client had no water.
+    #[test]
+    fn the_184_record_layout_is_read_without_a_version_prefix_or_a_frame() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&4u32.to_le_bytes()); // dwVersion
+        b.extend_from_slice(&4u32.to_le_bytes()); // dwColor
+        b.extend_from_slice(&3.0f32.to_bits().to_le_bytes()); // fHeight
+        b.extend_from_slice(&0u32.to_le_bytes()); // unused at +12
+        b.extend_from_slice(&32u32.to_le_bytes()); // dwColumns
+        b.extend_from_slice(&32u32.to_le_bytes()); // dwRows
+        b.extend_from_slice(&32.0f32.to_bits().to_le_bytes()); // fCellSize
+        for centre in [2560.0f32, 216.0, 5120.0] {
+            b.extend_from_slice(&centre.to_bits().to_le_bytes());
+        }
+        // The 84 bytes between the centre vector and the mask, as the real
+        // record stores them, up to the last field before the mask.
+        b.extend_from_slice(&[0u8; 84]);
+        assert_eq!(b.len(), 124, "the mask starts at +124");
+        let mut mask = vec![0u8; 32 * 32];
+        for cell in [0usize, 1, 7, 33, 1023] {
+            mask[cell] = 1;
+        }
+        b.extend_from_slice(&mask);
+        b.extend_from_slice(&0u32.to_le_bytes()); // dwWaveCount
+        let area = parse_record(&b, 42)
+            .expect("a 1.8.4 record is a water area, not a refusal")
+            .remove(0);
+        assert_eq!((area.columns, area.rows), (32, 32));
+        assert_eq!(area.height, 3.0);
+        assert_eq!(area.grid_size, 32.0);
+        assert_eq!(area.center, [2560.0, 216.0, 5120.0]);
+        assert_eq!(area.mask.iter().filter(|m| **m != 0).count(), 5);
+        assert!(!area.simple);
+        assert_eq!(area.export_id, 42);
+    }
+
+    /// A record that puts its fields **first** carries a water area too.
+    ///
+    /// `BSData/4.dat` records 1 and 8 and `44.dat` record 9 hold a grid whose
+    /// `dwColumns` sits at +12 with no version word anywhere in the record.
+    /// They were refused as "not a water record", which cost their areas.
+    #[test]
+    fn a_record_that_opens_into_a_grid_is_read_even_without_a_version_word() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&[0u8; 12]); // anything: the grid starts at +12
+        b.extend_from_slice(&8u32.to_le_bytes()); // dwColumns
+        b.extend_from_slice(&8u32.to_le_bytes()); // dwRows
+        b.extend_from_slice(&32.0f32.to_bits().to_le_bytes());
+        for centre in [-512.0f32, 216.0, 5120.0] {
+            b.extend_from_slice(&centre.to_bits().to_le_bytes());
+        }
+        // 84 bytes of fields, then the mask: the layout the v4 revision uses.
+        b.extend_from_slice(&[0u8; 84]);
+        let mut mask = vec![0u8; 64];
+        mask[0] = 1;
+        mask[63] = 1;
+        b.extend_from_slice(&mask);
+        b.extend_from_slice(&0u32.to_le_bytes());
+        let area = parse_record(&b, 7).expect("a bare grid is a water area").remove(0);
+        assert_eq!((area.columns, area.rows), (8, 8));
+        assert_eq!(area.mask.iter().filter(|m| **m != 0).count(), 2);
+    }
+
+    /// A stored length shorter than the deflate stream is not a fault: the last
+    /// patch in a BSData ends its stream with the record, not with a marker.
+    ///
+    /// `7.dat` record 0 declares `stored = 4` and the stream runs to the end of
+    /// the record. Requiring the declaration and the stream to agree refused a
+    /// complete area.
+    #[test]
+    fn a_markerless_stream_is_inflated_to_the_end_of_its_input() {
+        let payload = {
+            use std::io::Write;
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            encoder.write_all(&[7u8; 512]).unwrap();
+            encoder.finish().unwrap()
+        };
+        let mut record = Vec::new();
+        // A deliberately wrong, too-short stored length.
+        record.extend_from_slice(&4u32.to_le_bytes());
+        record.extend_from_slice(&512u32.to_le_bytes());
+        record.extend_from_slice(&payload);
+        let plain = crate::pck::inflate_lenient(&record[8..], 512).expect("bytes survive");
+        assert_eq!(plain.len(), 512);
+        assert!(plain.iter().all(|b| *b == 7));
+        // The strict reader still refuses it, which is what package entries
+        // depend on.
+        assert!(crate::pck::inflate(&record[8..], 512).is_err());
+    }
+
     /// Build one v3 area followed by `waves` shoreline entries.
     fn area_with_waves(waves: &[(u32, usize)]) -> Vec<u8> {
         let mut b = Vec::new();
@@ -1113,17 +1342,25 @@ mod tests {
         assert_eq!(areas[0].export_id, 7);
     }
 
-    /// The version word decides the layout, and only known ones are guessed at.
+    /// The version word picks the offsets, and a revision with no row is
+    /// reported rather than guessed at.
     #[test]
     fn the_layout_follows_the_version_word() {
-        assert_eq!(WaterLayout::of(0x10002000), WaterLayout::V2);
-        assert_eq!(WaterLayout::of(0x10003000), WaterLayout::V3);
+        let v2 = WaterFields::of(0x10002000).expect("v2 has a layout");
+        assert_eq!((v2.simple, v2.mask), (None, 36));
+        let v3 = WaterFields::of(0x10003000).expect("v3 has a layout");
+        assert_eq!((v3.simple, v3.mask), (Some(36), 37));
+        // 1.8.4 keeps the v2/v3 field order and moves only the mask, behind the
+        // 84 bytes of fields the older revisions do not have.
+        let v4 = WaterFields::of(WATER_VERSION_V4).expect("v4 has a layout");
+        assert_eq!((v4.simple, v4.mask), (None, 120));
         assert_eq!(
-            WaterLayout::of(0x10004000),
-            WaterLayout::Unknown(0x10004000)
+            (v4.color, v4.height, v4.columns, v4.rows),
+            (v3.color, v3.height, v3.columns, v3.rows)
         );
-        assert!(WaterLayout::V2.is_decodable() && WaterLayout::V3.is_decodable());
-        assert!(!WaterLayout::of(0x10004000).is_decodable());
+        assert!(WaterFields::of(0x10004000).is_none());
+        assert!(!is_water_version(0x10004000));
+        assert!(is_water_version(WATER_VERSION_V4));
     }
 
     /// A wave larger than the client's u16 index range is read, not refused.

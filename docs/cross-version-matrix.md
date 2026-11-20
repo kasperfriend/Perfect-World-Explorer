@@ -576,9 +576,14 @@ recorded and not guessed. No version number was added for any of them. *(measure
 from the corpus census in `Findings/World-effects-2026-11-09.md`; MOXTVersion for
 the affected roots is 33–37, unchanged.)*
 
-**2.1 — water versions: already covered.** `WATER_VERSIONS` holds both measured
-words, `0x10002000` and `0x10003000`, and refuses anything else by name. *(static,
-with the existing water harness tests.)*
+**2.1 — water versions: covered, including 1.8.4's own word.** `WATER_VERSIONS`
+holds both `0x100SSSSS` words, and the reader also accepts the plain revision `4`
+that every 1.8.4 BSData water record stores; anything else is refused by name.
+The 1.8.4 records are also not zlib-framed, so they are read where they stand
+instead of being sent through an inflater. *(measured against `BSData/4.dat`,
+`7.dat`, `21.dat` and `44.dat` from the 1.8.4 client: 5 of the 7 referenced
+records decode as grids, and the other 2 are the non-water records already
+recorded below.)*
 
 **2.2 — `gfx_light` keypoint count and interpolation: already covered.**
 `MAX_KEYPOINTS` is 8, and `InterpolateMode` is refused unless `0` — measured at
@@ -705,7 +710,7 @@ whatever is staged, so a client with bytes gets a row the same run.
 Read out of the source, not measured, and labelled as such:
 
 - `WORLD_VERSIONS` / `REVISIONS`: `src/pck.rs` (the container revision table and the byte offsets each revision uses).
-- `WATER_VERSIONS [0x10002000, 0x10003000]`: `src/water.rs`, the two EC-BSD revisions the loader accepts; anything else is refused by name.
+- `WATER_VERSIONS [0x10002000, 0x10003000]` plus the plain revision `4`: `src/water.rs`, the area revisions the loader accepts; anything else is refused by name.
 - `terrain_block::KNOWN_VERSIONS 2..=6`: `src/terrain_block.rs`, the TRN2 header versions the reader accepts.
 - Water and terrain refusals name the file since the change to `water::load`; before it, `water (BSData)` reported a bare errno.
 
@@ -762,7 +767,7 @@ each was a test that could not fail:
 
 | item | status |
 |---|---|
-| 4.1 `WATER_VERSIONS` | **static (`src/water.rs`)**: `[0x10002000, 0x10003000]`. Only the second is measured green on a staged fixture; the first is read from the constant, not from a file. |
+| 4.1 `WATER_VERSIONS` | **measured (`src/water.rs`)**: `[0x10002000, 0x10003000]` plus the plain revision `4` 1.8.4 writes. The `4` layout is byte-measured against the shipped `BSData/7.dat` record 0 (32x32 grid, 533 wet cells, 46 shoreline waves ending the record); only `0x10003000` is measured green on a staged fixture, and `0x10002000` is still read from the constant rather than from a file. |
 | 4.2 `gfx_light.rs:94-95` | **static (`src/gfx_light.rs`)**: still open, unchanged in this work. |
 | 4.3 `gfx_decal.rs:346-385` | **static (`src/gfx_decal.rs`)**: `StopEmitWhenFade` and `keyNumber` are **not** added, because the Drive SDK does not document them and the task says to record rather than guess. |
 | 4.4 DDS formats | **static (`src/model_dds.rs`)**: the formats accepted are the ones in that reader; the matrix samples 400 DDS entries per pack, so its row is a sample count, not a census. |

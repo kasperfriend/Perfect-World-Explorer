@@ -98,10 +98,10 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/model_draw_gpu.rs` | 693 | `else-continue` | **unreachable** | `else {` |
 | `src/music.rs` | 42 | `ok-question` | **probe** | `.ok()?;` |
 | `src/objects.rs` | 272 | `let-underscore` | **unreachable** | `let _ = MODEL_LOAD_LOGGER.set(logger);` |
-| `src/pck.rs` | 543 | `ok-question` | **probe** | `let len = fs::metadata(path).ok()?.len();` |
-| `src/pck.rs` | 550 | `ok-question` | **probe** | `let file = File::open(&pkx).ok()?;` |
-| `src/pck.rs` | 551 | `ok-question` | **probe** | `let len = file.metadata().ok()?.len();` |
-| `src/pck.rs` | 964 | `unwrap_or_default` | **unreachable** | `let mut name = self.path.file_stem().unwrap_or_default().to_os_string();` |
+| `src/pck.rs` | 571 | `ok-question` | **probe** | `let len = fs::metadata(path).ok()?.len();` |
+| `src/pck.rs` | 578 | `ok-question` | **probe** | `let file = File::open(&pkx).ok()?;` |
+| `src/pck.rs` | 579 | `ok-question` | **probe** | `let len = file.metadata().ok()?.len();` |
+| `src/pck.rs` | 992 | `unwrap_or_default` | **unreachable** | `let mut name = self.path.file_stem().unwrap_or_default().to_os_string();` |
 | `src/sky_gpu.rs` | 1448 | `ok-question` | **probe** | `let mut file = File::open(element.join("configs.pck")).ok()?;` |
 | `src/sky_gpu.rs` | 1449 | `ok-question` | **probe** | `let entries = crate::angelica_pck::directory(&mut file).ok()?;` |
 | `src/sky_gpu.rs` | 1456 | `ok-question` | **probe** | `let list_bytes = pck::read_entry(&mut file, list).ok()?;` |
@@ -120,8 +120,9 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/terrain_store.rs` | 808 | `let-underscore` | **unreachable** | `let _ = fs::remove_file(&temp);` |
 | `src/terrain_store.rs` | 842 | `else-continue` | **named** | `else {` |
 | `src/terrain_upload.rs` | 24 | `ok-question` | **probe** | `let info = crate::terrain_sampling::parse_terrain_dds(source).ok()?;` |
-| `src/water.rs` | 412 | `ok-question` | **probe** | `let word = u32::from_le_bytes(b[p..p + 4].try_into().ok()?);` |
-| `src/water.rs` | 744 | `else-continue` | **named** | `else {` |
+| `src/water.rs` | 359 | `ok-question` | **probe** | `let version = u(b, offset).ok()?;` |
+| `src/water.rs` | 527 | `ok-question` | **probe** | `let word = u32::from_le_bytes(b[p..p + 4].try_into().ok()?);` |
+| `src/water.rs` | 868 | `else-continue` | **named** | `else {` |
 | `src/weather_gpu.rs` | 68 | `unwrap_or_default` | **unreachable** | `rain.size_variation.unwrap_or_default(),` |
 | `src/weather_gpu.rs` | 70 | `unwrap_or_default` | **unreachable** | `snow.size_variation.unwrap_or_default(),` |
 | `src/weather_gpu.rs` | 74 | `unwrap_or_default` | **unreachable** | `rain.speed_variation.unwrap_or_default(),` |
