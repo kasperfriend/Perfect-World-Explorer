@@ -83,6 +83,31 @@ struct Signature {
     terrain: u64,
 }
 
+/// Terrain heights sampled from the caller's own ground function.
+///
+/// The renderer's terrain is a streamed block tree, which is not something this
+/// module should reach into; instead the renderer samples its own
+/// `MapSpace::ground` into this flat grid once per rebuild. The rows run along
+/// `+z` from `origin`, and `heights[z * width + x]` is the height at
+/// `origin + (x * cell, 0, z * cell)`.
+pub fn sample_heights(
+    width: u32,
+    height: u32,
+    origin: Vec3,
+    cell: f32,
+    ground: impl Fn(f32, f32) -> f32,
+) -> Vec<f32> {
+    let mut heights = vec![0f32; (width as usize).saturating_mul(height as usize)];
+    for z in 0..height {
+        let wz = origin.z + z as f32 * cell;
+        for x in 0..width {
+            let wx = origin.x + x as f32 * cell;
+            heights[(z * width + x) as usize] = ground(wx, wz);
+        }
+    }
+    heights
+}
+
 /// Terrain heights, as the harvester needs them: a dense grid plus its origin.
 ///
 /// The renderer's own terrain resource is a streamed block tree; rather than
