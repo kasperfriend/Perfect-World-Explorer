@@ -130,6 +130,7 @@ impl Default for FrameSnapshot {
             celestial: [0.; 3],
             time_advances: 0,
             light_publications: 0,
+            overrides: crate::modules::raywatcher::frame::RasterOverrides::NONE,
         }
     }
 }
