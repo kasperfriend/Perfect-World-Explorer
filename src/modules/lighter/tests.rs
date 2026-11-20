@@ -679,7 +679,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     h.ray.settings.shadows = true;
     let dark = h.pixel(sun_frame, &shadow);
     assert!(
-        dark.0[1] < bright.0[1] && dark.1 == bright.1,
+        dark.0[0] < bright.0[0] && dark.1 == bright.1,
         "{dark:?} {bright:?}"
     );
     h.ray.settings.lighting = true;
