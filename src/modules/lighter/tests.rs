@@ -3061,12 +3061,12 @@ fn exercise_sun_and_history(h: &mut Harness) {
     h.ray.settings.shadows = true;
     let column = |y| y * SIDE + SIDE / 2;
     let center = column(SIDE / 2);
+    h.ray.settings.guided = false;
     let hard = h.pixels(frame, &empty);
     let full = hard[center + 5].0[0];
     assert!(full > 100);
     assert_eq!(hard[center].0[0], 0, "point sun did not cast a hard shadow");
     h.ray.settings.soft_sun = true;
-    h.ray.settings.guided = false;
     let grain = h.pixels(frame, &empty);
     h.ray.settings.denoiser = Denoiser::Svgf;
     h.ray.settings.guided = true;
