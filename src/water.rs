@@ -1338,6 +1338,85 @@ mod tests {
         assert_eq!(area.shore_waves[0].day_colors[0], 0xff647f94);
         assert_eq!(area.shore_waves[0].night_colors[0], 0xff235175);
     }
+    /// The five 1.8.4 water records that ship in the client, decoded end to end.
+    ///
+    /// `tests/fixtures/water-184/water.dat` is a patch package rebuilt from the
+    /// client's own bytes: the five records named below, byte for byte, with a
+    /// real 4-byte offset table and trailer. Nothing about the layout is
+    /// re-implemented, so a change to the record framing breaks this test --
+    /// which is the point. It is committed rather than staged because the whole
+    /// 1.8.4 failure ("0 water areas, 0 cells, 0 of them wet") was green in CI
+    /// for as long as the only corpus test was skipped for want of a file.
+    ///
+    /// Expected: `4.dat` 1 (32x32, 17 wet), `4.dat` 8 (8x8, 39), `7.dat` 0
+    /// (32x32, 533), `21.dat` 0 (60x64, 900) and `44.dat` 9 (8x32, 99).
+    #[test]
+    fn the_shipped_184_water_records_decode() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/water-184/water.dat");
+        let data = std::fs::read(&path).expect("the committed water fixture");
+        let offsets = records_of(&data);
+        let table = table_of(&data);
+        assert_eq!(offsets.len(), 5, "the fixture holds five records");
+        let mut decoded = Vec::new();
+        for (i, &offset) in offsets.iter().enumerate() {
+            let end = offsets.get(i + 1).copied().unwrap_or(table);
+            match parse_record(&data[offset..end], 1) {
+                Ok(areas) => decoded.extend(areas),
+                Err(why) => panic!("record {i} at {offset} was refused: {why}"),
+            }
+        }
+        let shape: Vec<(usize, usize, usize)> = decoded
+            .iter()
+            .map(|a| {
+                (
+                    a.columns,
+                    a.rows,
+                    a.mask.iter().filter(|m| **m != 0).count(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (32, 32, 17),
+                (8, 8, 39),
+                (32, 32, 533),
+                (60, 64, 900),
+                (8, 32, 99)
+            ]
+        );
+        // The 1.8.4 grid is a real surface, not a bare mask: the centre and cell
+        // size have to come through too.
+        assert_eq!(decoded[2].center, [2560.0, 216.0, 5120.0]);
+        assert_eq!(decoded[2].grid_size, 32.0);
+    }
+
+    /// The record offsets a patch package's trailer table holds, sorted.
+    fn records_of(data: &[u8]) -> Vec<usize> {
+        let Some(tail) = data.len().checked_sub(4) else {
+            return Vec::new();
+        };
+        let Some(entries) = u(data, tail).ok().map(|n| n as usize) else {
+            return Vec::new();
+        };
+        let Some(table) = tail.checked_sub(entries * 4) else {
+            return Vec::new();
+        };
+        let mut offsets: Vec<usize> = (0..entries)
+            .filter_map(|i| u(data, table + i * 4).ok().map(|o| o as usize))
+            .collect();
+        offsets.sort_unstable();
+        offsets
+    }
+
+    /// Where a patch package's record table starts.
+    fn table_of(data: &[u8]) -> usize {
+        let tail = data.len().saturating_sub(4);
+        let entries = u(data, tail).unwrap_or(0) as usize;
+        tail.saturating_sub(entries * 4)
+    }
+
     /// Every water area in a real BSData file from a shipped client, when one is
     /// available. `PW_WATER_BSDATAS` is an `os.pathsep`-separated list of
     /// `.dat` files; the point is that records shipped compressed (`stored,

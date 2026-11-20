@@ -23,6 +23,7 @@ Thumbs.db
 # and the whole point of the tree fixtures is that they ARE the client's bytes.
 !/tests/fixtures/**/*.pck
 !/tests/fixtures/**/*.ecwld
+!/tests/fixtures/**/*.dat
 
 # Private client files staged by the Drive connector
 /google_drive/
