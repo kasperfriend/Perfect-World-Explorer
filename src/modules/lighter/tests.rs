@@ -618,7 +618,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     // without ambient/sun so light differences are visible. Install a fresh
     // gray world (green_front at [0,1,0] from earlier maxes the channel).
     let mut b3 = Builder::default();
-    let gray = upright(&mut b3, -2., [0.1, 0.1, 0.1, 1.], 0, 0);
+    let gray = upright(&mut b3, -2., [0.3, 0.3, 0.3, 1.], 0, 0);
     put(&mut b3, gray);
     h.ray.install(Ok((b3.finish(), bank.clone())));
     let mut light_frame = test_frame(Vec3::ZERO, -Vec3::Z, 3);
@@ -644,7 +644,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
         b.finish()
     };
     h.ray.settings.lighting = true;
-    let bright = h.pixel(light_frame, &local_light([20.; 4], false));
+    let bright = h.pixel(light_frame, &local_light([5.; 4], false));
     let builds = h.builds();
     let dim = h.pixel(light_frame, &local_light([0.5; 4], false));
     assert!(
@@ -653,8 +653,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
     );
     assert_eq!(h.builds(), builds, "changing light values rebuilt ASes");
     h.ray.settings.shadows = true;
-    let dark = h.pixel(light_frame, &local_light([3.; 4], false));
-    let through = h.pixel(light_frame, &local_light([20.; 4], true));
+    let dark = h.pixel(light_frame, &local_light([0.1; 4], false));
+    let through = h.pixel(light_frame, &local_light([5.; 4], true));
     assert!(
         dark.0[1] as u32 + 30 < bright.0[1] as u32 && dark.1 == bright.1,
         "{dark:?} {bright:?}"
