@@ -227,39 +227,58 @@ pub fn action_label(name: &str, index: usize) -> String {
     }
 }
 
-pub struct Preview {
+pub struct Target {
+    color_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+    #[cfg(test)]
     color: wgpu::Texture,
+    #[cfg(test)]
     depth: wgpu::Texture,
     pub texture_id: egui::TextureId,
-    asset: Option<ModelAsset>,
-    draw: Option<Draw>,
-    loaded_path: String,
-    pub error: Option<String>,
-    pub warnings: Vec<String>,
-    pub animation_error: Option<String>,
-    pub yaw: f32,
-    pub pitch: f32,
-    pub zoom: f32,
-    pub turntable: bool,
-    pub flip_vertical: bool,
-    pub playing: bool,
-    center: Vec3,
-    pub pan: Vec3,
-    radius: f32,
-    updated: std::time::Instant,
-    elapsed: f32,
-    pub action: usize,
-    /// Combined scene action to start on once a model loads. The client asks a
-    /// scene NPC for `站立` and falls back to `休闲`; leaving this empty keeps
-    /// the first clip, which is what an item preview wants.
-    pub idle_action: Option<String>,
 }
-impl Preview {
-    pub fn new(
-        device: &wgpu::Device,
-        renderer: &mut egui_wgpu::Renderer,
-        _format: wgpu::TextureFormat,
-    ) -> Self {
+impl Target {
+    #[cfg(test)]
+    pub(super) fn pixels(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<u8> {
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 512 * 512 * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &self.color,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(512 * 4),
+                    rows_per_image: Some(512),
+                },
+            },
+            wgpu::Extent3d {
+                width: 512,
+                height: 512,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().expect("map preview");
+        let data = slice.get_mapped_range().to_vec();
+        data
+    }
+    pub fn new(device: &wgpu::Device, renderer: &mut egui_wgpu::Renderer) -> Self {
         let texture = |label, format, usage| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
@@ -303,9 +322,77 @@ impl Preview {
             wgpu::FilterMode::Linear,
         );
         Self {
+            color_view: color.create_view(&Default::default()),
+            depth_view: depth.create_view(&Default::default()),
+            #[cfg(test)]
             color,
+            #[cfg(test)]
             depth,
             texture_id,
+        }
+    }
+    pub fn pass<'a>(&'a self, encoder: &'a mut wgpu::CommandEncoder) -> wgpu::RenderPass<'a> {
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Librarian preview"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.18,
+                        g: 0.21,
+                        b: 0.25,
+                        a: 1.,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(0.),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        })
+    }
+}
+pub struct Preview {
+    pub target: Target,
+    asset: Option<ModelAsset>,
+    draw: Option<Draw>,
+    loaded_path: String,
+    pub error: Option<String>,
+    pub warnings: Vec<String>,
+    pub animation_error: Option<String>,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub zoom: f32,
+    pub turntable: bool,
+    pub flip_vertical: bool,
+    pub playing: bool,
+    center: Vec3,
+    pub pan: Vec3,
+    radius: f32,
+    updated: std::time::Instant,
+    elapsed: f32,
+    pub action: usize,
+    /// Combined scene action to start on once a model loads. The client asks a
+    /// scene NPC for `站立` and falls back to `休闲`; leaving this empty keeps
+    /// the first clip, which is what an item preview wants.
+    pub idle_action: Option<String>,
+}
+impl Preview {
+    pub fn new(
+        device: &wgpu::Device,
+        renderer: &mut egui_wgpu::Renderer,
+        _format: wgpu::TextureFormat,
+    ) -> Self {
+        Self {
+            target: Target::new(device, renderer),
             asset: None,
             draw: None,
             loaded_path: String::new(),
@@ -521,36 +608,9 @@ impl Preview {
                 Err(error) => self.animation_error = Some(format!("Preview pose failed: {error}")),
             }
         }
-        let view = self.color.create_view(&Default::default());
-        let depth = self.depth.create_view(&Default::default());
         let mut encoder = device.create_command_encoder(&Default::default());
         {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Librarian model preview"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.18,
-                            g: 0.21,
-                            b: 0.25,
-                            a: 1.,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(0.),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
+            let mut pass = self.target.pass(&mut encoder);
             if let Some(draw) = &self.draw {
                 draw.draw(&mut pass);
             }
@@ -659,7 +719,7 @@ fn preview_pose(
     Ok((asset.meshes_from_pose(&pose)?, approximate))
 }
 
-fn camera_matrix(target: Vec3, radius: f32, zoom: f32, yaw: f32, pitch: f32) -> Mat4 {
+pub(super) fn camera_matrix(target: Vec3, radius: f32, zoom: f32, yaw: f32, pitch: f32) -> Mat4 {
     let distance = radius * 3.5 * zoom;
     let eye = target
         + Vec3::new(
@@ -849,7 +909,7 @@ mod tests {
         let mut renderer =
             egui_wgpu::Renderer::new(&device, wgpu::TextureFormat::Bgra8UnormSrgb, None, 1);
         let preview = Preview::new(&device, &mut renderer, wgpu::TextureFormat::Bgra8UnormSrgb);
-        assert_eq!(preview.color.format(), PREVIEW_FORMAT);
+        assert_eq!(preview.target.color.format(), PREVIEW_FORMAT);
         assert!(
             preview.frame().reverse_front,
             "mirrored preview must keep the native front faces"
@@ -887,8 +947,8 @@ mod tests {
             |_| Ok((texture.clone(), false)),
         )
         .expect("sRGB window must not be used as the model attachment format");
-        let color = preview.color.create_view(&Default::default());
-        let depth = preview.depth.create_view(&Default::default());
+        let color = preview.target.color.create_view(&Default::default());
+        let depth = preview.target.depth.create_view(&Default::default());
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -999,43 +1059,7 @@ mod tests {
                     preview.animation_error
                 );
             }
-            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: 512 * 512 * 4,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            let mut encoder = device.create_command_encoder(&Default::default());
-            encoder.copy_texture_to_buffer(
-                wgpu::ImageCopyTexture {
-                    texture: &preview.color,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::ImageCopyBuffer {
-                    buffer: &buffer,
-                    layout: wgpu::ImageDataLayout {
-                        offset: 0,
-                        bytes_per_row: Some(512 * 4),
-                        rows_per_image: Some(512),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: 512,
-                    height: 512,
-                    depth_or_array_layers: 1,
-                },
-            );
-            queue.submit(Some(encoder.finish()));
-            let slice = buffer.slice(..);
-            let (tx, rx) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |result| {
-                tx.send(result).unwrap();
-            });
-            device.poll(wgpu::Maintain::Wait);
-            rx.recv().unwrap().expect("map preview");
-            let data = slice.get_mapped_range();
+            let data = preview.target.pixels(&device, &queue);
             if let Some(dir) = std::env::var_os("PW_LIBRARIAN_SCREENSHOTS") {
                 image::save_buffer(
                     std::path::Path::new(&dir).join(format!("{label}.png")),
@@ -1056,7 +1080,6 @@ mod tests {
                 "{path} rendered only {changed} non-background pixels"
             );
             drop(data);
-            buffer.unmap();
         }
     }
 

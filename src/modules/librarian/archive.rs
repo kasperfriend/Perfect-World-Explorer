@@ -26,7 +26,13 @@ impl PckArchive {
             .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
         let mut by_path = HashMap::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
-            by_path.insert(normalize_archive_path(&entry.name), index);
+            let path = normalize_archive_path(&entry.name);
+            let path = if archive_name == "gfx.pck" && !path.starts_with("gfx/") {
+                format!("gfx/{path}")
+            } else {
+                path
+            };
+            by_path.insert(path, index);
         }
         Ok(Self {
             file,
@@ -92,6 +98,58 @@ impl LibrarianAssets {
             textures: None,
             facedata: None,
         }
+    }
+
+    /// Index names only. Member payloads (including dependencies) are read on selection.
+    pub fn effect_catalog(&mut self) -> Result<crate::gfx_catalog::Catalog, String> {
+        let archive = self
+            .gfx
+            .get_or_insert_with(|| PckArchive::open(&self.element_root, "gfx.pck"));
+        let mut names: Vec<(String, u32)> = Vec::new();
+        if let Ok(pack) = archive {
+            names.extend(
+                pack.entries
+                    .iter()
+                    .filter(|e| e.name.to_ascii_lowercase().ends_with(".gfx"))
+                    .map(|e| (e.name.clone(), e.size)),
+            );
+        }
+        let loose = self.element_root.join("gfx");
+        if loose.is_dir() {
+            let mut dirs = vec![loose];
+            while let Some(dir) = dirs.pop() {
+                for entry in fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+                    let entry = entry.map_err(|e| e.to_string())?;
+                    let ty = entry.file_type().map_err(|e| e.to_string())?;
+                    let path = entry.path();
+                    if ty.is_dir() {
+                        dirs.push(path);
+                    } else if ty.is_file()
+                        && path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("gfx"))
+                    {
+                        let name = path
+                            .strip_prefix(&self.element_root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned();
+                        names.push((
+                            name,
+                            entry.metadata().map_err(|e| e.to_string())?.len() as u32,
+                        ));
+                    }
+                }
+            }
+        } else if let Err(error) = archive {
+            return Err(error.clone());
+        }
+        Ok(crate::gfx_catalog::Catalog::from_directory(
+            names
+                .iter()
+                .map(|(path, size)| (path.as_str(), *size))
+                .collect(),
+        ))
     }
 
     pub fn read_elements_data(&self) -> Result<Vec<u8>, String> {

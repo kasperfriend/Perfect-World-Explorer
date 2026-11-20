@@ -4,6 +4,7 @@ mod archive;
 mod compare;
 mod database;
 mod descriptions;
+mod effects;
 mod elements;
 mod icons;
 mod npcs;
@@ -164,6 +165,14 @@ pub struct Librarian {
     error: Option<String>,
     pending_free: Vec<egui::TextureId>,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Items,
+    Comparison,
+    Npcs,
+    Effects,
+}
+
 struct State {
     assets: LibrarianAssets,
     icons: IconCache,
@@ -175,9 +184,9 @@ struct State {
     search: String,
     selected: Option<usize>,
     comparison: Vec<usize>,
-    compare_open: bool,
+    tab: Tab,
+    effects: effects::Browser,
     npc_database: npcs::Database,
-    npcs_open: bool,
     npc_kind: Option<npcs::Kind>,
     npc_search: String,
     npc_selected: Option<usize>,
@@ -212,8 +221,11 @@ impl Librarian {
     pub fn set_active(&mut self, active: bool) {
         if !active {
             if let Some(state) = self.state.take() {
+                if let Some(target) = state.effects.target {
+                    self.pending_free.push(target.texture_id);
+                }
                 if let Some(preview) = state.preview {
-                    self.pending_free.push(preview.texture_id);
+                    self.pending_free.push(preview.target.texture_id);
                 }
             }
             self.error = None;
@@ -271,9 +283,9 @@ impl Librarian {
                     search: String::new(),
                     selected: None,
                     comparison: Vec::new(),
-                    compare_open: false,
+                    tab: Tab::Items,
+                    effects: Default::default(),
                     npc_database,
-                    npcs_open: false,
                     npc_kind: Some(npcs::Kind::Npc),
                     npc_search: String::new(),
                     npc_selected: None,
@@ -306,7 +318,16 @@ impl Librarian {
             return;
         }
         let Some(state) = &mut self.state else { return };
-        if state.npcs_open {
+        if state.tab == Tab::Effects {
+            state
+                .effects
+                .prepare(&mut state.assets, device, queue, renderer);
+            return;
+        }
+        if state.tab == Tab::Comparison {
+            return;
+        }
+        if state.tab == Tab::Npcs {
             state.prepare_npc_preview(device, queue, renderer, format);
             return;
         }
@@ -404,7 +425,7 @@ impl State {
                             .color(egui::Color32::WHITE),
                     )
                     .fill(
-                        if !self.npcs_open && !self.compare_open && self.category.is_none() {
+                        if self.tab == Tab::Items && self.category.is_none() {
                             egui::Color32::from_rgb(50, 113, 165)
                         } else {
                             egui::Color32::from_rgb(40, 65, 90)
@@ -413,8 +434,7 @@ impl State {
                 )
                 .clicked()
             {
-                self.compare_open = false;
-                self.npcs_open = false;
+                self.tab = Tab::Items;
                 self.category = None;
                 self.section = None;
                 self.major = None;
@@ -423,13 +443,12 @@ impl State {
             for category in Category::ALL {
                 if ui
                     .selectable_label(
-                        !self.npcs_open && !self.compare_open && self.category == Some(category),
+                        self.tab == Tab::Items && self.category == Some(category),
                         category.name(),
                     )
                     .clicked()
                 {
-                    self.compare_open = false;
-                    self.npcs_open = false;
+                    self.tab = Tab::Items;
                     self.category = Some(category);
                     self.section = None;
                     self.major = None;
@@ -443,7 +462,7 @@ impl State {
                             .strong()
                             .color(egui::Color32::WHITE),
                     )
-                    .fill(if !self.npcs_open && self.compare_open {
+                    .fill(if self.tab == Tab::Comparison {
                         egui::Color32::from_rgb(158, 104, 35)
                     } else {
                         egui::Color32::from_rgb(95, 68, 33)
@@ -451,8 +470,7 @@ impl State {
                 )
                 .clicked()
             {
-                self.npcs_open = false;
-                self.compare_open = true;
+                self.tab = Tab::Comparison;
             }
             if ui
                 .add(
@@ -461,7 +479,7 @@ impl State {
                             .strong()
                             .color(egui::Color32::WHITE),
                     )
-                    .fill(if self.npcs_open {
+                    .fill(if self.tab == Tab::Npcs {
                         egui::Color32::from_rgb(108, 76, 155)
                     } else {
                         egui::Color32::from_rgb(66, 47, 96)
@@ -473,19 +491,39 @@ impl State {
                 )
                 .clicked()
             {
-                self.npcs_open = true;
-                self.compare_open = false;
+                self.tab = Tab::Npcs;
+            }
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("Effects")
+                            .strong()
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(if self.tab == Tab::Effects {
+                        egui::Color32::from_rgb(36, 127, 114)
+                    } else {
+                        egui::Color32::from_rgb(36, 76, 70)
+                    }),
+                )
+                .clicked()
+            {
+                self.tab = Tab::Effects;
             }
         });
         ui.separator();
+        if self.tab == Tab::Effects {
+            self.effects.ui(ui, &mut self.assets);
+            return;
+        }
         if !self.icons.has_atlas() {
             ui.colored_label(egui::Color32::YELLOW, "Inventory icon atlases could not be loaded from surfaces.pck; loose icons may still be available.");
         }
-        if self.npcs_open {
+        if self.tab == Tab::Npcs {
             self.npcs_ui(ui);
             return;
         }
-        if self.compare_open {
+        if self.tab == Tab::Comparison {
             self.comparison_ui(ui);
             return;
         }
@@ -773,7 +811,7 @@ impl State {
                                     );
                                 }
                                 let size = ui.available_width().min(300.);
-                                let response = preview_image(ui, preview.texture_id, size, preview.flip_vertical);
+                                let response = preview_image(ui, preview.target.texture_id, size, preview.flip_vertical);
                                 if response.dragged() {
                                     let (mut delta, pan) = ui.input(|i| {
                                         (
@@ -1096,7 +1134,8 @@ impl State {
                     ui.colored_label(egui::Color32::YELLOW, warning);
                 }
                 let size = ui.available_width().min(300.);
-                let response = preview_image(ui, preview.texture_id, size, preview.flip_vertical);
+                let response =
+                    preview_image(ui, preview.target.texture_id, size, preview.flip_vertical);
                 if response.dragged() {
                     let (mut delta, pan) = ui.input(|i| {
                         (
@@ -1215,7 +1254,7 @@ impl State {
                         self.section = None;
                         self.major = None;
                         self.subtype = None;
-                        self.npcs_open = false;
+                        self.tab = Tab::Items;
                     }
                 }
             }
@@ -1277,8 +1316,7 @@ impl State {
         let (remove, jump) = npc_comparison_grid(ui, &entries);
         if let Some(position) = jump {
             self.npc_selected = self.npc_comparison.get(position).copied();
-            self.npcs_open = true;
-            self.compare_open = false;
+            self.tab = Tab::Npcs;
         }
         if let Some(position) = remove {
             if position < self.npc_comparison.len() {
@@ -1399,7 +1437,7 @@ impl State {
             self.section = None;
             self.major = None;
             self.subtype = None;
-            self.compare_open = false;
+            self.tab = Tab::Items;
         }
     }
 }
@@ -1450,9 +1488,9 @@ mod tests {
             search: String::new(),
             selected: Some(0),
             comparison: vec![0],
-            compare_open: false,
+            tab: Tab::Items,
+            effects: Default::default(),
             npc_database: npcs::Database::default(),
-            npcs_open: false,
             npc_kind: Some(npcs::Kind::Npc),
             npc_search: String::new(),
             npc_selected: None,
@@ -1481,20 +1519,21 @@ mod tests {
             );
         };
         run(&mut state);
-        state.compare_open = true;
+        state.tab = Tab::Comparison;
         run(&mut state);
         assert_eq!(state.database.items[state.comparison[0]].id, 42);
 
         // The NPC tab renders from its own records.
-        state.npcs_open = true;
+        state.tab = Tab::Npcs;
         run(&mut state);
         assert!(state.npc_database.entries.is_empty() || state.npc_selected.is_none());
 
         // NPC columns belong to the shared Comparison tab, next to the items. A
         // stale index into an empty database must be dropped, not panicked on.
         state.npc_comparison.push(0);
-        state.npcs_open = false;
-        state.compare_open = true;
+        state.tab = Tab::Effects;
+        run(&mut state);
+        state.tab = Tab::Comparison;
         run(&mut state);
         assert!(state.npc_comparison.is_empty(), "stale NPC column dropped");
         assert_eq!(state.database.items[state.comparison[0]].id, 42);
