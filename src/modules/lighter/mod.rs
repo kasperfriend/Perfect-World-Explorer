@@ -1421,6 +1421,9 @@ impl Lighter {
         self.history.reset();
         self.screen_written = false;
         self.screen_last_flags = 0;
+        // Post-processing state depends on history; reset it so the next
+        // progressive render rebuilds Post with a clean history_write index.
+        self.post = None;
     }
 
     pub fn fail_frame(&mut self, error: String) {
