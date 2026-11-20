@@ -328,6 +328,31 @@ impl SceneGeometry {
         self.triangles.is_empty()
     }
 
+    /// Triangles in the tree.
+    pub fn triangle_count(&self) -> usize {
+        self.triangles.len()
+    }
+
+    /// The triangle soup, for a caller that wants to upload or inspect it.
+    pub fn triangles(&self) -> &[RayTriangle] {
+        &self.triangles
+    }
+
+    /// The material table the triangles index into.
+    pub fn materials(&self) -> &[RayMaterial] {
+        &self.materials
+    }
+
+    /// The flat node array, root first.
+    pub fn nodes(&self) -> &[BvhNode] {
+        &self.nodes
+    }
+
+    /// The leaf-ordered triangle index list.
+    pub fn order(&self) -> &[u32] {
+        &self.order
+    }
+
     /// Traverse one ray. This is the reference implementation the compute
     /// shader mirrors signature for signature.
     ///

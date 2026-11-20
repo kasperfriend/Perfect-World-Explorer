@@ -35,6 +35,7 @@
 pub mod bvh;
 pub mod denoise;
 pub mod frame;
+pub mod harvest;
 pub mod plan;
 pub mod shade;
 
