@@ -506,6 +506,10 @@ fn exercise(mode: Mode, cpu_query: bool) {
         put(&mut b, reject);
     }
     h.ray.install(Ok((b.finish(), bank.clone())));
+    // Green card test checks depth testing, not lighting. Disable lighting
+    // so direct() returns base color directly without ambient contribution.
+    h.ray.settings.lighting = false;
+    h.ray.settings.shadows = false;
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     if mode == Mode::Hardware {
         h.ray.capture = false;
@@ -516,6 +520,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
     }
     let (green, z) = h.pixel(frame, &empty);
     assert_eq!(green, [0, 255, 0, 255]);
+    h.ray.settings.lighting = true;
+    h.ray.settings.shadows = true;
     assert!(
         (z - depth_at(frame, Vec3::new(0., 0., -5.))).abs() < 1e-5,
         "{z}"
