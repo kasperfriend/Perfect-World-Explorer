@@ -303,16 +303,33 @@ fn main() {
         force_fallback_adapter: false,
     }))
     .expect("a GPU adapter for the readback check");
+    // The 4K surface below is 3840 pixels wide, past
+    // `downlevel_defaults().max_texture_dimension_2d` (2048), so the device asks
+    // for the adapter's own texture limits while keeping every other downlevel
+    // guarantee. A 4K loading screen is a real portrait-of-a-monitor case, so
+    // shrinking the test would stop it covering the size that matters.
+    let limits = wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
+    let max_texture = limits.max_texture_dimension_2d;
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor {
             label: Some("loading screen check"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::downlevel_defaults(),
+            required_limits: limits,
         },
         None,
     ))
     .expect("a device for the readback check");
+    let mut uploaded = 0usize;
     for (width, height, bgra) in &surfaces {
+        // A software adapter can cap textures below 4K; skipping that one size
+        // with a printed reason is better than failing a check whose subject is
+        // the colour path, not the adapter's maximum texture size.
+        if *width > max_texture || *height > max_texture {
+            println!(
+                "skipping the {width}x{height} upload: this adapter's largest 2D texture is {max_texture}"
+            );
+            continue;
+        }
         let texture = device.create_texture_with_data(
             &queue,
             &wgpu::TextureDescriptor {
@@ -384,12 +401,13 @@ fn main() {
         }
         drop(view);
         buffer.unmap();
+        uploaded += 1;
     }
 
     std::fs::remove_dir_all(&root).ok();
     if failures.is_empty() {
         println!(
-            "loading screen: 2 decodes, 1 pinned corrupt payload, {} fitted sizes (1280x720, 3840x2160, 1200x1920) and their BGRA uploads passed",
+            "loading screen: {} fitted sizes (1280x720, 3840x2160, 1200x1920) prepared, {uploaded} BGRA uploads read back row for row, the DDS decoded to its four corner colours, and the corrupt payload stayed an error",
             surfaces.len()
         );
         return;
