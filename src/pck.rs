@@ -239,7 +239,7 @@ pub(crate) const REVISIONS: [Revision; 3] = [
 /// here rather than branching on "if version == 0x00020003 and size < ..." is
 /// the point: the condition that separates it from the wide trailer is the
 /// trailer's own bytes, not the package's size on disk.
-pub(crate) const TRAILER_PROBES: [Revision; 2] = [Revision {
+pub(crate) const TRAILER_PROBES: [Revision; 1] = [Revision {
     // Matched against any declared version that has no resolved layout of its
     // own; the guard pair is what actually admits it.
     version: 0,
@@ -258,32 +258,7 @@ pub(crate) const TRAILER_PROBES: [Revision; 2] = [Revision {
     description_at: 16,
     guard_byte1: 272,
 },
-// The same narrow field order with the *wide* record size, for a package that
-// declares `0x00020003` but writes a 32-bit table word.
-//
-// 1.8.4's `minimap.pck` is the case: it declares `0x00020003`, writes 288-byte
-// records and guardByte1 at `+272`, but its table offset is 32 bits. Read as a
-// 64-bit word this trailer's field is 2^64 minus 3,147,722,044; its low 32 bits
-// are 1,147,245,252, which leaves 1,862,559 bytes for the 22,269-record table.
-// The table is what decides, as always.
-//
-// Kept separate from the narrow probe above because the two differ in
-// `entry`/`offset_at`, and a probe that guessed would misparse whichever one it
-// guessed wrong.
-Revision {
-    version: 0,
-    header: 280,
-    entry: 288,
-    offset_at: 264,
-    offset_width: 8,
-    size_at: 272,
-    compressed_at: 276,
-    table_offset_at: 8,
-    table_offset_width: 4,
-    flags_at: None,
-    description_at: 16,
-    guard_byte1: 272,
-}];
+];
 
 /// The guard pair `guardByte0` / `guardByte1` that every revision's trailer
 /// carries.
@@ -1731,21 +1706,17 @@ mod tests {
         // walk is what separates them, so the ORDER of the two is not a claim;
         // that the DWORD reading is tried at all, and after the 64-bit one, is.
         let candidates = trailer_candidates(0x0002_0003);
-        assert_eq!(
-            candidates.len(),
-            3,
-            "the revision's own layout, then two DWORD probes"
-        );
+        assert_eq!(candidates.len(), 2, "wide first, narrow second");
         assert_eq!(candidates[0].table_offset_width, 8);
         assert_eq!(candidates[1].table_offset_width, 4);
-        assert_eq!(candidates[2].table_offset_width, 4);
-        // The 276-byte-record probe is the one that reads this file: the
-        // shipped trailer states no record size, so the narrower one is tried
-        // first and wins before the 288-byte reading is reached.
-        assert_eq!(candidates[1].entry, 276);
-        assert_eq!(candidates[2].entry, 288);
+        // Both readings are 288-byte records, and this file proves the size: a
+        // table of 326 records spans 23,911 bytes on disk with every record
+        // deflated, so 276-byte records would need a 26.6% compression ratio
+        // and 288-byte ones 25.5%. The narrow 0x00020002 revision's 276-byte
+        // records belong to a trailer that carries a real dwFlags at `+12`,
+        // which this one does not.
+        assert_eq!(candidates[1].entry, 288);
         assert_eq!(table_offset(&header, &candidates[1]).unwrap(), 26_203_745);
-        assert_eq!(table_offset(&header, &candidates[2]).unwrap(), 26_203_745);
     }
 
     /// The 272-byte trailer of the shipped 1.5.2 `trees.pck`, verbatim.
@@ -2985,23 +2956,24 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// 1.8.4's `minimap.pck`: `0x00020003`, 288-byte records, and a **32-bit**
-    /// table word.
+    /// `0x00020003` with 288-byte records and a **32-bit** table word is read.
     ///
-    /// Every number here is from a real report, not invented. The refusal read
-    /// "the trailer declares its table at 18446744070561829572 but only
+    /// The numbers come from a real refusal, not invented: 1.8.4's `minimap.pck`
+    /// reported "the trailer declares its table at 18446744070561829572 but only
     /// 1149107811 bytes of this file (len 1149108099) precede the footer
-    /// (declared end 1149108099, base 0, count 22269)". 18446744070561829572 is
-    /// 2^64 minus 3,147,722,044, and its low 32 bits are 1,147,245,252: the
-    /// stored bytes are a *32-bit* masked offset with 0xffffffff above them, so
-    /// the 64-bit reading is nonsense while the 32-bit one lands at
-    /// 1,147,245,252 and leaves 1,862,559 bytes for 22,269 records -- 83.6
-    /// bytes a record, which is what a table of 288-byte records compresses to.
-    /// So the table fits, and the package is readable.
+    /// (declared end 1149108099, base 0, count 22269)". That position is 2^64
+    /// minus 3,147,722,044, whose low 32 bits are 1,147,245,252: a position that
+    /// fits and leaves 1,862,559 bytes for 22,269 records, 83.6 bytes each.
     ///
-    /// Fails before the wide-record/narrow-word probe exists: the only
-    /// candidate then is the revision's own 64-bit reading, and the table is
-    /// declared to start past the end of the file.
+    /// This test pins the reading that shape needs. It does **not** prove the
+    /// reading was missing -- the narrow-word probe in [`TRAILER_PROBES`] already
+    /// has exactly this geometry (280/288, table word at `+8` as a DWORD,
+    /// description at `+16`), so a package of this shape already opened. Stated
+    /// plainly because the first version of this comment claimed otherwise, and
+    /// a test that claims to fix a fault it does not touch is worse than no
+    /// test. What the real `minimap.pck` needs is still unknown: its own
+    /// refusal may come from a table that fails to decode for a reason these
+    /// numbers do not show, and that cannot be settled without the file.
     #[test]
     fn a_wide_trailer_with_a_dword_table_word_is_read() {
         use flate2::{write::ZlibEncoder, Compression};
@@ -3064,7 +3036,9 @@ mod tests {
             as_wide > total as u64,
             "the wide reading must be the one that fails: {as_wide} against {total}"
         );
-        // And the narrow reading is the table's real position.
+        // And the narrow reading is the table's real position. This is the
+        // probe the shipped `trees.pck` also needs; the geometry is the same,
+        // which is why this package already opened before this test existed.
         let narrow = TRAILER_PROBES
             .iter()
             .find(|r| r.entry == 288 && r.table_offset_width == 4)
