@@ -35,11 +35,21 @@ const CHECK: u32 = 0x59374231;
 
 /// Build one entry-table record in the shape `pck::directory` parses: length
 /// XORed with the mask, a check word, then the 260-byte name and bounds.
+///
+/// The name field is **GBK**, not UTF-8: the retail client's archive is code
+/// page 936 and `pck::directory` decodes every entry name with
+/// `encoding_rs::GBK`. Writing UTF-8 here produced a fixture whose names
+/// survived the round trip as mojibake (`载入` came back `杞藉叆`), which is a
+/// defect in the fixture rather than in the reader.
 fn record(name: &str, offset: u32, size: u32, compressed: u32) -> Vec<u8> {
     let mut data = vec![0u8; 276];
-    let bytes = name.as_bytes();
+    let (bytes, _, unmappable) = encoding_rs::GBK.encode(name);
+    assert!(
+        !unmappable,
+        "fixture name {name:?} has no GBK representation, so the reader could not return it"
+    );
     assert!(bytes.len() < 260, "fixture name must fit the record");
-    data[..bytes.len()].copy_from_slice(bytes);
+    data[..bytes.len()].copy_from_slice(&bytes);
     data[260..264].copy_from_slice(&offset.to_le_bytes());
     data[264..268].copy_from_slice(&size.to_le_bytes());
     data[268..272].copy_from_slice(&compressed.to_le_bytes());
@@ -228,11 +238,19 @@ fn main() {
         ],
         "root listing changed: {names:?}"
     );
-    if loading_screen::pick(&listed, 0).unwrap().path != "surfaces/background.jpg" {
-        failures.push("pick(word 0) did not select the first picture".into());
-    }
-    if loading_screen::pick(&listed, 2).unwrap().path != "surfaces/loading03.bmp" {
-        failures.push("pick(word 2) did not wrap to the third picture".into());
+    // The draw must be the arithmetic the documentation promises: `word % len`,
+    // checked against the listing itself so adding a fixture picture cannot
+    // silently turn this into a different assertion.
+    for word in [0u64, 2, listed.len() as u64 + 1] {
+        let expected = &listed[(word % listed.len() as u64) as usize].path;
+        match loading_screen::pick(&listed, word) {
+            Some(picture) if &picture.path == expected => {}
+            Some(picture) => failures.push(format!(
+                "pick(word {word}) selected {:?}, expected {expected:?}",
+                picture.path
+            )),
+            None => failures.push(format!("pick(word {word}) selected nothing")),
+        }
     }
 
     // 2. Decode every picture that must work, and pin the corrupt one. The DDS
