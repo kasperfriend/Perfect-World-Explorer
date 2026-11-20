@@ -808,10 +808,20 @@ fn entries_from_trailer(
             }
             continue;
         };
-        // The entry table may also straddle the split, so it is walked through
-        // the two-part reader rather than one file.
-        let table = read_package_range(files, layout, base + local, table_end - local)?;
-        match read_entry_table(&table, count, rev, end, layout.total()) {
+        // The table may straddle the split, so it is read through the
+        // multi-piece reader; and it is read in growing chunks, because the span
+        // down to the trailer is not the table's length (see
+        // `read_entry_table_chunked`).
+        match read_entry_table_chunked(
+            files,
+            layout,
+            base + local,
+            table_end - local,
+            count,
+            rev,
+            end,
+            layout.total(),
+        ) {
             Ok(entries) => return Ok(entries),
             Err(e) => tried.push(format!("{label} {local}: {e}")),
         }
@@ -1068,13 +1078,68 @@ impl Package {
 
 /// Read `len` bytes starting at `pos` inside the logical package, which spans
 /// `first` and then `second` when the package is split.
+/// Read an entry table without trusting `table_end - table_at` as its length.
+///
+/// The table's upper bound is not worth trusting. In 1.8.4's `litmodels` the
+/// span from the table's start to the trailer is 2,163,612,196 bytes, while the
+/// 237,241 records in it occupy a small fraction: reading the whole span moves
+/// gigabytes to parse seventy megabytes, and on a 32-bit host the allocation
+/// fails before a single record is read. So the read starts small and grows
+/// while the table's *own* framing says it is incomplete -- a record header that
+/// runs past the bytes read, or a record body that does -- and stops as soon as
+/// `count` records parse. That is the same "let the structure decide" rule the
+/// rest of this module follows.
+///
+/// The exact-length check is preserved: the returned bytes are exactly what the
+/// records consumed, so a table whose records do not end where the reader thinks
+/// they do is still refused by `read_entry_table`.
+fn read_entry_table_chunked(
+    files: &[(File, u64)],
+    layout: &Layout,
+    pos: u64,
+    limit: u64,
+    count: usize,
+    rev: &Revision,
+    end: u64,
+    size: u64,
+) -> Result<Vec<Entry>, String> {
+    /// A table of `count` records cannot exceed this.
+    let ceiling = (count as u64)
+        .saturating_mul(rev.entry as u64 + 8)
+        .min(limit);
+    // The first chunk is deliberately small: most tables are a fraction of their
+    // ceiling, and the common case should not read the ceiling.
+    let mut have = 256u64.saturating_mul(1024).min(ceiling).max(8);
+    let mut bytes = read_package_range(files, layout, pos, have)?;
+    loop {
+        match read_entry_table(&bytes, count, rev, end, size) {
+            Ok((entries, _used)) => return Ok(entries),
+            Err(error) => {
+                // These two mean "the bytes read stop before the records do";
+                // anything else is a real framing fault and is reported as such
+                // rather than grown past.
+                let short =
+                    error.contains("overlaps footer") || error.contains("record (length)");
+                if !short || have >= ceiling {
+                    return Err(error);
+                }
+            }
+        }
+        // Extend, do not re-read: the bytes already fetched stay fetched.
+        let more = have.saturating_mul(2).min(ceiling) - have;
+        let tail = read_package_range(files, layout, pos + have, more)?;
+        bytes.extend_from_slice(&tail);
+        have += more;
+    }
+}
+
 fn read_package_range(
     files: &[(File, u64)],
     layout: &Layout,
     pos: u64,
     len: u64,
 ) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(len as usize);
+    let mut out = Vec::with_capacity((len as usize).min(4 << 20));
     let mut left = len;
     let mut cursor = pos;
     while left > 0 {
@@ -1128,7 +1193,7 @@ fn read_entry_table(
     rev: &Revision,
     end: u64,
     size: u64,
-) -> Result<Vec<Entry>, String> {
+) -> Result<(Vec<Entry>, usize), String> {
     let mut cursor = 0usize;
     let mut decomp = Decompress::new(true);
     let mut buf = [0u8; 288];
@@ -1204,7 +1269,7 @@ fn read_entry_table(
             table.len() - cursor
         ));
     }
-    Ok(result)
+    Ok((result, cursor))
 }
 
 pub fn read_entry(f: &mut File, e: &Entry) -> Result<Vec<u8>, String> {
@@ -3026,6 +3091,73 @@ mod tests {
         assert_eq!(entries[0].name, "litmodels/world/44/litmodel_1125.bmd");
         assert_eq!(package.read(&entries[0]).unwrap(), payload);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A table that sits far from the trailer still opens, and does not drag
+    /// the whole span into memory to do it.
+    ///
+    /// 1.8.4's `litmodels.pkx1` places its 237,241-record table at 1,517,810,005
+    /// in a 3,681,422,489-byte piece. Reading everything from the table to the
+    /// trailer is 2,163,612,196 bytes -- thirty times what those records can
+    /// occupy -- and reserving that failed before a record was parsed, which is
+    /// why the 1.8.4 client had no buildings at all. This builds the same shape
+    /// at a size a test can hold: the table starts `GAP` bytes after the last
+    /// payload, and the reader must stop at the records rather than at the
+    /// trailer.
+    #[test]
+    fn a_table_far_from_the_trailer_is_read_without_dragging_the_span() {
+        const COUNT: usize = 64;
+        const GAP: usize = 8 * 1024 * 1024;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x4dca23efu32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // patched below
+        bytes.extend_from_slice(&0x56a089b7u32.to_le_bytes());
+        let payload_at = 12u64;
+        bytes.extend_from_slice(b"payload");
+        let table_at = bytes.len() as u64;
+
+        for i in 0..COUNT {
+            let name = format!("litmodels/world/44/litmodel_{i}.bmd");
+            let mut record = vec![0u8; 288];
+            record[..name.len()].copy_from_slice(name.as_bytes());
+            record[264..272].copy_from_slice(&payload_at.to_le_bytes());
+            record[272..276].copy_from_slice(&7u32.to_le_bytes());
+            record[276..280].copy_from_slice(&7u32.to_le_bytes());
+            // Stored uncompressed, so the record is exactly `entry` bytes.
+            bytes.extend_from_slice(&((288u32) ^ MASK).to_le_bytes());
+            bytes.extend_from_slice(&((288u32) ^ MASK ^ CHECK).to_le_bytes());
+            bytes.extend_from_slice(&record);
+        }
+
+        // The gap this test exists for: unread space between the last table
+        // record and the trailer, exactly where the real piece has gigabytes of
+        // it. Without it `table_end - table_at` would equal the table's own
+        // length and the old reader would never have failed.
+        bytes.resize(bytes.len() + GAP, 0);
+
+        let mut header = vec![0u8; 280];
+        header[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
+        header[4..8].copy_from_slice(&0x0002_0003u32.to_le_bytes());
+        // A 32-bit table word, zero-extended -- what `litmodels` writes.
+        header[8..12].copy_from_slice(&((table_at as u32) ^ MASK).to_le_bytes());
+        header[12..16].copy_from_slice(&0u32.to_le_bytes());
+        let tag = b"Angelica File Package, Perfect World Co. Ltd.";
+        header[20..20 + tag.len()].copy_from_slice(tag);
+        header[272..276].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&(COUNT as u32).to_le_bytes());
+        bytes.extend_from_slice(&0x0002_0003u32.to_le_bytes());
+        let total = bytes.len() as u32;
+        bytes[4..8].copy_from_slice(&total.to_le_bytes());
+
+        let path = write_temp(&bytes, "far-table");
+        let mut file = std::fs::File::open(&path).unwrap();
+        let entries = directory(&mut file).unwrap_or_else(|e| panic!("{e}"));
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(entries.len(), COUNT);
+        assert_eq!(entries[0].name, "litmodels/world/44/litmodel_0.bmd");
     }
 
     /// 1.8.4's `surfaces.pck` trailer: wide field order, narrow table word.
