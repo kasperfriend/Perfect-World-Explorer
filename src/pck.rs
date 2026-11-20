@@ -1724,11 +1724,28 @@ mod tests {
         );
 
         // And it must be the probe, not the version word, that picks the DWORD.
+        // Three candidates: the revision's own 64-bit reading, then the two
+        // probes. Both probes read a DWORD, and they differ only in the record
+        // size -- 276 bytes like the narrow trailer, or 288 like the wide one
+        // whose table word is still 32 bits (1.8.4's `minimap.pck`). The table
+        // walk is what separates them, so the ORDER of the two is not a claim;
+        // that the DWORD reading is tried at all, and after the 64-bit one, is.
         let candidates = trailer_candidates(0x0002_0003);
-        assert_eq!(candidates.len(), 2, "wide first, narrow second");
+        assert_eq!(
+            candidates.len(),
+            3,
+            "the revision's own layout, then two DWORD probes"
+        );
         assert_eq!(candidates[0].table_offset_width, 8);
         assert_eq!(candidates[1].table_offset_width, 4);
+        assert_eq!(candidates[2].table_offset_width, 4);
+        // The 276-byte-record probe is the one that reads this file: the
+        // shipped trailer states no record size, so the narrower one is tried
+        // first and wins before the 288-byte reading is reached.
+        assert_eq!(candidates[1].entry, 276);
+        assert_eq!(candidates[2].entry, 288);
         assert_eq!(table_offset(&header, &candidates[1]).unwrap(), 26_203_745);
+        assert_eq!(table_offset(&header, &candidates[2]).unwrap(), 26_203_745);
     }
 
     /// The 272-byte trailer of the shipped 1.5.2 `trees.pck`, verbatim.
