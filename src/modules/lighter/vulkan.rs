@@ -1539,6 +1539,10 @@ impl Renderer {
         }
     }
 
+    pub(super) fn output_buffer(&self) -> Option<&wgpu::Buffer> {
+        self.output.as_ref().and_then(|o| o.imported.as_ref())
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     pub(super) fn image_for_test(&self) -> &wgpu::Buffer {
         self.output.as_ref().unwrap().imported.as_ref().unwrap()
@@ -1689,7 +1693,8 @@ impl Renderer {
         } else {
             None
         };
-        let requested = frame.options[0] & HYBRID_PRIMARY != 0;
+        let requested = (frame.options[0] & HYBRID_PRIMARY != 0)
+            && (frame.options[0] & super::RASTER_OVERLAY == 0);
         let mut raster = None;
         if let Some(primary) = &mut self.primary {
             if requested && !self.primary_failed && self.primary_error_extent != Some(frame.extent)

@@ -58,6 +58,8 @@ const REFERENCE: &str = include_str!("reference.wgsl");
 const MEDIA: &str = include_str!("media.wgsl");
 const BASE: &str = include_str!("trace.wgsl");
 const PRESENT: &str = include_str!("present.wgsl");
+const EXTRACT_DEPTH: &str = include_str!("extract_depth.wgsl");
+const PRESENT_OVERLAY: &str = include_str!("present_overlay.wgsl");
 const PRESENT_PORTABLE: &str = r#"
 @fragment fn fragment(@builtin(position) coord: vec4<f32>) -> Output {
     return resolve(coord);
@@ -270,6 +272,7 @@ const SINGLE_PATH: u32 = 32768;
 const HYBRID_PRIMARY: u32 = 65536;
 const PHYSICAL_BSDF: u32 = 8192;
 const RAY_LIGHTING_OVERLAY: u32 = 512;
+pub(super) const RASTER_OVERLAY: u32 = 1 << 20;
 
 pub(crate) fn storage_limit(device: &wgpu::Device) -> usize {
     let limits = device.limits();
@@ -585,6 +588,15 @@ impl Software {
         Some(stage.stats)
     }
 
+    fn ensure_output(&mut self, device: &wgpu::Device, bytes: u64) -> &wgpu::Buffer {
+        self.buffers_created +=
+            u64::from(
+                self.output
+                    .ensure(device, "Lighter image", bytes, image_limit(device)),
+            );
+        &self.output.0
+    }
+
     fn trace(
         &mut self,
         device: &wgpu::Device,
@@ -853,6 +865,239 @@ fn output_pass<'a>(
     })
 }
 
+#[repr(C)]
+#[derive(bytemuck::Pod, bytemuck::Zeroable, Clone, Copy)]
+struct ExtractParams {
+    inv_vp: [[f32; 4]; 4],
+    eye: [f32; 4],
+    extent: [u32; 4],
+}
+
+struct ExtractDepth {
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+    params: wgpu::Buffer,
+}
+
+impl ExtractDepth {
+    fn new(device: &wgpu::Device) -> Self {
+        let stage = wgpu::ShaderStages::COMPUTE;
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Lighter raster depth extract bindings"),
+            entries: &[
+                binding(0, stage, wgpu::BufferBindingType::Uniform),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: stage,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                binding(
+                    2,
+                    stage,
+                    wgpu::BufferBindingType::Storage { read_only: false },
+                ),
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Lighter raster depth extract layout"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Lighter raster depth extract"),
+            source: wgpu::ShaderSource::Wgsl([PIXELS, EXTRACT_DEPTH].concat().into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Lighter raster depth extract pipeline"),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: "extract_depth",
+        });
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Lighter raster depth extract params"),
+            size: std::mem::size_of::<ExtractParams>() as u64,
+            mapped_at_creation: false,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        Self {
+            layout,
+            pipeline,
+            params,
+        }
+    }
+
+    fn dispatch(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &Frame,
+        raster_depth: &wgpu::TextureView,
+        out_pixels: &wgpu::Buffer,
+    ) {
+        let params = ExtractParams {
+            inv_vp: frame.inv_vp,
+            eye: frame.eye,
+            extent: frame.extent,
+        };
+        queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Lighter raster depth extract bind"),
+            layout: &self.layout,
+            entries: &[
+                resource(0, &self.params),
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(raster_depth),
+                },
+                resource(2, out_pixels),
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("Lighter extract raster depth"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.dispatch_workgroups(frame.extent[0].div_ceil(8), frame.extent[1].div_ceil(8), 1);
+    }
+}
+
+struct PresentOverlay {
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+    extent: wgpu::Buffer,
+}
+
+impl PresentOverlay {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let stage = wgpu::ShaderStages::FRAGMENT;
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Lighter overlay composite bindings"),
+            entries: &[
+                binding(
+                    0,
+                    stage,
+                    wgpu::BufferBindingType::Storage { read_only: true },
+                ),
+                binding(1, stage, wgpu::BufferBindingType::Uniform),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: stage,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Lighter overlay composite layout"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Lighter overlay composite"),
+            source: wgpu::ShaderSource::Wgsl([PIXELS, PRESENT_OVERLAY].concat().into()),
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Lighter overlay composite pipeline"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vertex",
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fragment",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState {
+                        // out_rgb = src.rgb * 1.0 + dst.rgb * src.a
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::SrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Zero,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: Default::default(),
+            multisample: Default::default(),
+            multiview: None,
+            depth_stencil: None,
+        });
+        let extent = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Lighter overlay composite params"),
+            size: 32,
+            mapped_at_creation: false,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        Self {
+            layout,
+            pipeline,
+            extent,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        image: &wgpu::Buffer,
+        extent: [u32; 4],
+        raster_depth: &wgpu::TextureView,
+        target: &wgpu::TextureView,
+    ) {
+        queue.write_buffer(&self.extent, 0, bytemuck::bytes_of(&[extent, [1, 0, 0, 0]]));
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Lighter overlay composite bind"),
+            layout: &self.layout,
+            entries: &[
+                resource(0, image),
+                resource(1, &self.extent),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(raster_depth),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Lighter RT overlay composite"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bind, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 enum ColdRayBuild {
     Progress(u64, &'static str),
@@ -891,7 +1136,16 @@ pub struct Lighter {
     logger: log::Logger,
     software: Option<Software>,
     present: Option<Present>,
+    extract_depth: Option<ExtractDepth>,
+    present_overlay: Option<PresentOverlay>,
     post: Option<post::Post>,
+    adapter_is_nvidia: bool,
+    adapter_name: String,
+    adapter_driver: String,
+    session_logged: bool,
+    frame_index: u64,
+    frame_timings: Vec<(u64, u32, f64, f64, f64)>,
+    log_notice: Option<String>,
     history: post::History,
     timings: Option<profile::Timings>,
     gpu_sample: Option<profile::GpuSample>,
@@ -961,7 +1215,16 @@ impl Default for Lighter {
             logger: log::Logger::from_env(),
             software: None,
             present: None,
+            extract_depth: None,
+            present_overlay: None,
             post: None,
+            adapter_is_nvidia: false,
+            adapter_name: String::new(),
+            adapter_driver: String::new(),
+            session_logged: false,
+            frame_index: 0,
+            frame_timings: Vec::new(),
+            log_notice: None,
             history: post::History::default(),
             timings: None,
             gpu_sample: None,
@@ -1036,6 +1299,9 @@ impl Lighter {
             .flatten(),
             settings,
             saved_mode: settings.mode,
+            adapter_is_nvidia: adapter.get_info().vendor == 0x10DE,
+            adapter_name: adapter.get_info().name,
+            adapter_driver: adapter.get_info().driver_info,
             native_backend: adapter.get_info().backend,
             adapter_supports_compute: adapter.get_downlevel_capabilities().flags.contains(
                 wgpu::DownlevelFlags::COMPUTE_SHADERS | wgpu::DownlevelFlags::FRAGMENT_STORAGE,
@@ -1174,6 +1440,37 @@ impl Lighter {
     /// Whether a usable ray scene, rather than just a requested mode, is live.
     pub fn replaces_world(&self) -> bool {
         self.armed && self.requested() && self.error().is_none()
+    }
+
+    /// True when Lighter runs as a hybrid RT overlay on top of the native
+    /// rasterized world (RT shadows, AO, GI bounce, reflections only).
+    pub fn overlays_world(&self) -> bool {
+        self.armed
+            && self.requested()
+            && self.error().is_none()
+            && self.settings.ray_lighting
+            && !self.settings.reference
+    }
+
+    fn log_session_if_needed(&mut self) {
+        if self.session_logged || self.logger.level() == log::LogLevel::Off {
+            return;
+        }
+        self.session_logged = true;
+        self.logger
+            .write(&log::LogEntry::Session(log::SessionHeader {
+                commit: option_env!("GIT_COMMIT").map(str::to_string),
+                build_date: None,
+                os_version: Some(std::env::consts::OS.to_string()),
+                gpu: (!self.adapter_name.is_empty()).then(|| self.adapter_name.clone()),
+                driver: (!self.adapter_driver.is_empty()).then(|| self.adapter_driver.clone()),
+                vulkan_version: Some(format!("{:?}", self.native_backend)),
+                heap_size_mb: None,
+                graphics_upscaler: self.graphics_upscaler.clone(),
+                graphics_frame_gen: self.graphics_frame_gen.clone(),
+                module_settings: self.settings.encode().replace('\n', "; "),
+                env_vars: Vec::new(),
+            }));
     }
     pub fn requested(&self) -> bool {
         self.settings.mode != Mode::Off
@@ -1868,6 +2165,279 @@ impl Lighter {
         }
     }
 
+    /// Hybrid raster + RT overlay: reads the native rasterizer's reverse-Z depth
+    /// buffer, traces ONLY secondary RT shadows (sun/moon), ambient occlusion,
+    /// indirect bounce lighting, and reflections using RT cores, denoises the RT
+    /// signals, and composites them onto the rasterized `target` with `LoadOp::Load`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_overlay(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        raster_depth: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        mut frame: Frame,
+        moving: &Packet,
+    ) -> Result<bool, String> {
+        if let Some(reason) = self.unavailable() {
+            return Err(reason.into());
+        }
+        let [_, _, w, h] = frame.extent;
+        if !self.prepare_frame(device, w, h)? {
+            return Ok(false);
+        }
+        self.log_session_if_needed();
+        let world = self
+            .world
+            .as_ref()
+            .ok_or("Lighter has no resident ray scene")?;
+        if self.settings.mode == Mode::Software
+            && (world.packet.hardware_only || moving.hardware_only)
+        {
+            return Err("Reload World to build Lighter's software acceleration data".into());
+        }
+        let storage = storage_limit(device) as u64;
+        for (label, len) in [
+            ("resident world", world.packet.bytes().len()),
+            ("moving geometry", moving.bytes().len()),
+            ("textures", world.textures.byte_len()),
+        ] {
+            if len as u64 > storage {
+                return Err(format!(
+                    "Lighter {label} exceeds adapter storage limit ({} MiB)",
+                    storage >> 20
+                ));
+            }
+        }
+        let (rw, rh) = self.ray_extent(device, w, h)?;
+        frame.extent = [rw, rh, w, h];
+        let settings = self.effective_settings();
+        frame.options[0] |= u32::from(settings.lighting)
+            | u32::from(settings.shadows) << 1
+            | u32::from(settings.reflections) << 2
+            | RASTER_OVERLAY
+            | if settings.soft_sun { SOFT_SUN } else { 0 }
+            | match settings.anisotropy {
+                16 => ANISO_WIDE,
+                1 => ANISO_ISOTROPIC,
+                _ => 0,
+            };
+        frame.options[1] = settings.bounces;
+        frame.options[2] = settings.samples;
+        frame.material_time[3] = settings.diffuse_distance as f32;
+        frame.ray_effects = [0.; 4];
+
+        let bytes = u64::from(rw) * u64::from(rh) * PIXEL_BYTES;
+        if self.extract_depth.is_none() {
+            self.extract_depth = Some(checked_pipeline(device, || ExtractDepth::new(device))?);
+        }
+        if self.present_overlay.is_none() {
+            self.present_overlay = Some(checked_pipeline(device, || {
+                PresentOverlay::new(device, format)
+            })?);
+        }
+
+        let history = if settings.progressive {
+            let moving_unchanged = match settings.mode {
+                Mode::Software => self
+                    .software
+                    .as_ref()
+                    .is_some_and(|s| s.last_moving == moving.words),
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                Mode::Hardware => self
+                    .hardware
+                    .as_ref()
+                    .is_some_and(|h| h.moving_unchanged(moving)),
+                _ => false,
+            };
+            let lighting_unchanged = moving_unchanged
+                || match settings.mode {
+                    Mode::Software => self.software.as_ref().is_some_and(|s| {
+                        scene::same_moving_lighting(&s.last_moving, &moving.words)
+                    }),
+                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                    Mode::Hardware => self
+                        .hardware
+                        .as_ref()
+                        .is_some_and(|h| h.same_moving_lighting(moving)),
+                    _ => false,
+                };
+            let mut h_use = self.history.prepare(
+                &mut frame,
+                world.revision,
+                world.textures.byte_len(),
+                settings.mode,
+                lighting_unchanged,
+            );
+            if !moving_unchanged {
+                h_use.changed_animations |= post::ANIM_GEOMETRY;
+            }
+            Some(h_use)
+        } else {
+            self.history.reset();
+            frame.sampling = [0; 4];
+            None
+        };
+
+        let completed = self.timings.as_mut().and_then(|t| t.collect(queue));
+        if let Some(sample) = completed {
+            self.gpu_sample = Some(sample);
+        }
+        let timed = self.timings.as_ref().filter(|t| t.due());
+
+        let image = match settings.mode {
+            Mode::Software => {
+                let sw = self.software.as_mut().unwrap();
+                let out_buf = sw.ensure_output(device, bytes);
+                self.extract_depth.as_ref().unwrap().dispatch(
+                    device,
+                    queue,
+                    encoder,
+                    &frame,
+                    raster_depth,
+                    out_buf,
+                );
+                if let Some(t) = &timed {
+                    t.stamp(encoder, 0);
+                }
+                let image = sw.trace(device, queue, encoder, &frame, bytes, world, moving);
+                if let Some(t) = &timed {
+                    t.stamp(encoder, 1);
+                }
+                image
+            }
+            Mode::Hardware => {
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                {
+                    // Extract rasterized reverse-Z depth + edge-aware normal into the
+                    // shared Vulkan output buffer on the same VkQueue before RT dispatch.
+                    let out_buf = self
+                        .hardware
+                        .as_ref()
+                        .unwrap()
+                        .output_buffer()
+                        .ok_or("Lighter Vulkan output buffer is not initialized")?;
+                    let mut depth_enc = device.create_command_encoder(&Default::default());
+                    self.extract_depth.as_ref().unwrap().dispatch(
+                        device,
+                        queue,
+                        &mut depth_enc,
+                        &frame,
+                        raster_depth,
+                        out_buf,
+                    );
+                    queue.submit(Some(depth_enc.finish()));
+                    self.hardware.as_mut().unwrap().trace(
+                        &frame,
+                        bytes,
+                        &world.packet,
+                        moving,
+                        &world.textures,
+                        world.revision,
+                    )?
+                }
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+                {
+                    return Err("Hardware RT is not implemented on this OS".into());
+                }
+            }
+            Mode::Off => return Err("Lighter render requested while off".into()),
+        };
+
+        let denoise = settings.denoiser != Denoiser::None;
+        if (history.is_some() || denoise) && self.post.is_none() {
+            self.post = Some(checked_pipeline(device, || post::Post::new(device))?);
+        }
+        let image = if let Some(post) = &mut self.post {
+            post.process(
+                device,
+                queue,
+                encoder,
+                image,
+                frame.extent,
+                history,
+                denoise,
+                true,
+                timed,
+            )
+        } else {
+            image
+        };
+
+        self.present_overlay.as_ref().unwrap().draw(
+            device,
+            queue,
+            encoder,
+            image,
+            frame.extent,
+            raster_depth,
+            target,
+        );
+
+        self.frame_error = None;
+        self.last_trace_extent = (rw, rh);
+        self.frame_index += 1;
+
+        // Record verbose frame timing sample and keep ring buffer for CSV export.
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        let (as_ms, trace_ms) = if settings.mode == Mode::Hardware {
+            self.hardware
+                .as_ref()
+                .and_then(vulkan::Renderer::gpu_stages)
+                .map_or((0.0, 0.0), |(_, [build, _, trace])| (build, trace))
+        } else {
+            (0.0, self.gpu_sample.map_or(0.0, |s| s.trace_ms))
+        };
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        let (as_ms, trace_ms) = (0.0, self.gpu_sample.map_or(0.0, |s| s.trace_ms));
+        let denoise_ms = self
+            .gpu_sample
+            .map_or(0.0, |s| s.reproject_ms + s.filter_ms);
+        if self.frame_timings.len() >= 1024 {
+            self.frame_timings.remove(0);
+        }
+        self.frame_timings.push((
+            self.frame_index,
+            settings.resolution,
+            as_ms,
+            trace_ms,
+            denoise_ms,
+        ));
+        if self.logger.level() == log::LogLevel::Verbose && self.frame_index % 30 == 0 {
+            self.logger.write(&log::LogEntry::Frame(log::FrameSample {
+                frame: self.frame_index,
+                denoiser: settings.denoiser.label().to_string(),
+                upscaler: self
+                    .graphics_upscaler
+                    .clone()
+                    .unwrap_or_else(|| "Off".into()),
+                frame_gen: self
+                    .graphics_frame_gen
+                    .clone()
+                    .unwrap_or_else(|| "Off".into()),
+                ray_resolution: settings.resolution,
+                stage_ms: [as_ms, trace_ms, denoise_ms, 0., 0., 0., 0., 0.],
+                cpu_frame_ms: 0.,
+                fallback_reason: None,
+            }));
+        }
+
+        let message = format!(
+            "{} overlay · {rw}×{rh} RT shadows/AO/GI/reflections · {} static / {} moving triangles",
+            self.settings.mode.label(),
+            world.packet.triangles(),
+            moving.triangles(),
+        );
+        if self.status.is_none() {
+            eprintln!("Lighter: {message}");
+        }
+        self.status = Some(message);
+        self.log_allocations();
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
@@ -2170,6 +2740,7 @@ impl Lighter {
                     frame.extent,
                     history,
                     settings.denoiser == Denoiser::Svgf,
+                    false,
                     timed,
                 )
             } else {
@@ -2395,20 +2966,22 @@ impl Lighter {
             .selected_text(self.settings.denoiser.label())
             .show_ui(ui, |ui| {
                 for d in Denoiser::ALL {
-                    let text = match d.unavailable_reason() {
-                        Some(reason) => format!("{} — {}", d.label(), reason),
+                    let reason =
+                        d.unavailable_reason_for(self.has_hardware_device, self.adapter_is_nvidia);
+                    let text = match reason {
+                        Some(r) => format!("{} — {}", d.label(), r),
                         None => d.label().to_string(),
                     };
-                    match d.unavailable_reason() {
-                        Some(reason) => {
+                    match reason {
+                        Some(r) => {
                             ui.add(egui::Label::new(
                                 egui::RichText::new(text).color(egui::Color32::GRAY),
                             ))
-                            .on_hover_text(reason);
+                            .on_hover_text(r);
                         }
                         None => {
                             ui.selectable_value(&mut self.settings.denoiser, d, text)
-                                .on_hover_text("Always available portable denoiser.");
+                                .on_hover_text("Available on this GPU.");
                         }
                     }
                 }
@@ -2449,31 +3022,70 @@ impl Lighter {
                 ui.selectable_value(&mut log_level, 2, "Logging: verbose")
                     .on_hover_text("Adds per-frame timing and acceleration-structure samples.");
             });
-        self.logger.set_level(match log_level {
+        let prev_level = self.logger.level();
+        let next_level = match log_level {
             0 => log::LogLevel::Off,
             1 => log::LogLevel::Normal,
             _ => log::LogLevel::Verbose,
-        });
+        };
+        self.logger.set_level(next_level);
+        if prev_level == log::LogLevel::Off && next_level != log::LogLevel::Off {
+            self.session_logged = false;
+            self.log_session_if_needed();
+        }
         if self.logger.level() != log::LogLevel::Off {
-            ui.separator();
-            let copy_btn = ui
-                .button("Copy diagnostics to clipboard")
-                .on_hover_text("Copy the current session diagnostics text to the clipboard.");
-            if copy_btn.clicked() {
-                // Clipboard copy handled by the host; the diagnostics text is
-                // available from the log file.
+            if let Some(dir) = self.logger.log_dir() {
+                ui.small(format!("Log folder: {}", dir.display()));
             }
-            let open_btn = ui
-                .button("Open log folder")
-                .on_hover_text("Open the folder containing the rotating lighter log files.");
-            if open_btn.clicked() {
-                // Open the log directory in the host file manager.
-            }
-            let export_btn = ui
-                .button("Export frame timings CSV")
-                .on_hover_text("Export per-frame timing samples as CSV.");
-            if export_btn.clicked() {
-                // Export per-frame timing samples as CSV.
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Copy diagnostics")
+                    .on_hover_text("Copy the current session diagnostics text to the clipboard.")
+                    .clicked()
+                {
+                    let diag = format!(
+                        "Lighter Diagnostics\nGPU: {} ({})\nMode: {}\nDenoiser: {}\nUpscaler: {}\nStatus: {}",
+                        self.adapter_name,
+                        self.adapter_driver,
+                        self.settings.mode.label(),
+                        self.settings.denoiser.label(),
+                        self.graphics_upscaler.as_deref().unwrap_or("Off"),
+                        self.status.as_deref().unwrap_or("idle"),
+                    );
+                    ui.output_mut(|o| o.copied_text = diag);
+                    self.log_notice = Some("Copied diagnostics to clipboard.".into());
+                }
+                if ui
+                    .button("Open log folder")
+                    .on_hover_text("Open the folder containing the rotating lighter log files.")
+                    .clicked()
+                {
+                    match self.logger.open_log_dir() {
+                        Ok(dir) => {
+                            self.log_notice = Some(format!("Opened {}", dir.display()));
+                        }
+                        Err(e) => {
+                            self.log_notice = Some(format!("Could not open log folder: {e}"));
+                        }
+                    }
+                }
+                if ui
+                    .button("Export timings CSV")
+                    .on_hover_text("Export per-frame timing samples as CSV.")
+                    .clicked()
+                {
+                    match self.logger.export_csv(&self.frame_timings) {
+                        Ok(path) => {
+                            self.log_notice = Some(format!("Exported {}", path.display()));
+                        }
+                        Err(e) => {
+                            self.log_notice = Some(format!("CSV export failed: {e}"));
+                        }
+                    }
+                }
+            });
+            if let Some(notice) = &self.log_notice {
+                ui.small(notice);
             }
         }
         ui.checkbox(&mut self.settings.physical_bsdf, "GGX / Lambert materials")
@@ -2581,8 +3193,8 @@ impl Lighter {
             }
         }
         ui.separator();
-        ui.label("Lighter traces the streamed main world, including water, vegetation, buildings and animated world effects. It uses its own ray lighting and samples the client's sky textures. Map views and UI are unchanged.");
-        ui.label("Hardware mode uses Vulkan, not DirectX 12. Lighter uses its own bounded BMD residency. Temporal upscaling/frame generation are suspended only while rays draw the world. See Modules/Lighter/README.md for compatibility notes.");
+        ui.label("Lighter runs as a hybrid RT overlay on top of the rasterized world, using RT cores for shadows (sun & moon), ambient occlusion, indirect bounce lighting, and reflections without replacing raster geometry.");
+        ui.label("Hardware mode uses Vulkan ray queries. Graphics upscaling (FSR/DLSS/XeSS) remains active on the composited world.");
         reload.then_some(Settings {
             mode,
             hybrid_primary,

@@ -303,6 +303,7 @@ impl Post {
         extent: [u32; 4],
         history: Option<HistoryUse>,
         denoise: bool,
+        overlay: bool,
         timed: Option<&super::profile::Timings>,
     ) -> &'a wgpu::Buffer {
         let needed = u64::from(extent[0]) * u64::from(extent[1]) * PIXEL_BYTES;
@@ -344,7 +345,7 @@ impl Post {
         }
         let mut params = Params {
             extent,
-            history: [0; 4],
+            history: [0, 0, 0, u32::from(overlay)],
             previous_from_current: Mat4::IDENTITY.to_cols_array_2d(),
         };
         if let Some(h) = history {
@@ -352,7 +353,7 @@ impl Post {
                 u32::from(h.reuse && !fresh),
                 h.changed_animations,
                 u32::from(h.previous_from_current.is_some()),
-                0,
+                u32::from(overlay),
             ];
             if let Some(transform) = h.previous_from_current {
                 params.previous_from_current = transform.to_cols_array_2d();
@@ -396,7 +397,13 @@ impl Post {
             let label = "Lighter à-trous radiance";
             // A fresh image cannot use the wide variance passes. Avoid
             // dispatching three full-image copies on nonprogressive frames.
-            let stages = if params.history[0] != 0 { 5 } else { 2 };
+            let stages = if params.history[0] != 0 {
+                5
+            } else if overlay {
+                4
+            } else {
+                2
+            };
             for (step, pipeline) in self.atrous[..stages].iter().enumerate() {
                 let next = if step % 2 == 0 { filtered } else { raw };
                 let bind = self.denoise_bind.get(

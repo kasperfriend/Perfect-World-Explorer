@@ -4075,6 +4075,7 @@ fn exercise_reprojection_shader(h: &Harness) {
                 previous_from_current: None,
             }),
             false,
+            false,
             None,
         );
         h.queue.submit(Some(encoder.finish()));
@@ -4098,6 +4099,7 @@ fn exercise_reprojection_shader(h: &Harness) {
             changed_animations: 0,
             previous_from_current: Some(Mat4::from_translation(Vec3::new(0.5, 0., -0.15))),
         }),
+        false,
         false,
         None,
     );
@@ -4942,4 +4944,82 @@ fn lighter_raster_ambient_fallback() {
     );
     assert!(!h.ray.raster_active());
     eprintln!("Hybrid unavailable: full-ray ambient RGBA/depth {fallback:?}");
+}
+
+#[test]
+fn hybrid_overlay_shaders_compile_and_validate() {
+    // Validate extract_depth.wgsl, present_overlay.wgsl, post.wgsl, and trace.wgsl (hardware + software)
+    let extract_src = [PIXELS, EXTRACT_DEPTH].concat();
+    let extract_spv =
+        vulkan::shader_entry(&extract_src, naga_rt::ShaderStage::Compute, "extract_depth");
+    assert!(
+        extract_spv.is_ok(),
+        "extract_depth.wgsl failed: {extract_spv:?}"
+    );
+
+    let present_src = [PIXELS, PRESENT_OVERLAY].concat();
+    let present_vert = vulkan::shader_entry(&present_src, naga_rt::ShaderStage::Vertex, "vertex");
+    assert!(
+        present_vert.is_ok(),
+        "present_overlay.wgsl vertex failed: {present_vert:?}"
+    );
+    let present_frag =
+        vulkan::shader_entry(&present_src, naga_rt::ShaderStage::Fragment, "fragment");
+    assert!(
+        present_frag.is_ok(),
+        "present_overlay.wgsl fragment failed: {present_frag:?}"
+    );
+
+    let post_src = [PIXELS, post::SHADER].concat();
+    let post_acc = vulkan::shader_entry(&post_src, naga_rt::ShaderStage::Compute, "accumulate");
+    assert!(
+        post_acc.is_ok(),
+        "post.wgsl accumulate failed: {post_acc:?}"
+    );
+    let post_f1 = vulkan::shader_entry(&post_src, naga_rt::ShaderStage::Compute, "filter_1");
+    assert!(post_f1.is_ok(), "post.wgsl filter_1 failed: {post_f1:?}");
+
+    let hw_src = trace_source(HARDWARE, false, false);
+    let hw_spv = vulkan::shader(&hw_src);
+    assert!(
+        hw_spv.is_ok(),
+        "hardware trace.wgsl with RASTER_OVERLAY failed: {hw_spv:?}"
+    );
+
+    let sw_src = trace_source(SOFTWARE, false, false);
+    let sw_spv = vulkan::shader(&sw_src);
+    assert!(
+        sw_spv.is_ok(),
+        "software trace.wgsl with RASTER_OVERLAY failed: {sw_spv:?}"
+    );
+}
+
+#[test]
+fn dlss_rr_enabled_on_nvidia_rtx_and_logger_writes_files() {
+    assert_eq!(Denoiser::DlssRr.unavailable_reason_for(true, true), None);
+    assert!(Denoiser::DlssRr
+        .unavailable_reason_for(true, false)
+        .is_some());
+    assert!(Denoiser::DlssRr
+        .unavailable_reason_for(false, true)
+        .is_some());
+
+    let logger = log::Logger::new();
+    assert!(
+        logger.log_dir().is_some(),
+        "Logger must always resolve a log directory"
+    );
+    logger.set_level(log::LogLevel::Verbose);
+    let wrote = logger.write(&log::LogEntry::Error(log::ErrorEvent {
+        stage: "test".into(),
+        reason: "smoke".into(),
+    }));
+    assert!(wrote, "Logger::write must succeed when level is Verbose");
+    let csv = logger
+        .export_csv(&[(1, 50, 0.5, 1.2, 0.4)])
+        .expect("CSV export failed");
+    let content = std::fs::read_to_string(&csv).expect("read CSV");
+    assert!(content.contains("frame,ray_resolution_pct,as_ms,trace_ms,denoise_ms"));
+    assert!(content.contains("1,50,0.500,1.200,0.400"));
+    let _ = std::fs::remove_file(csv);
 }

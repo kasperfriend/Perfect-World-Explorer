@@ -207,35 +207,101 @@ pub struct Logger {
     frame_count: Mutex<u64>,
 }
 
+fn default_log_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("PW_CACHE_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir).join("lighter-logs");
+    }
+    #[cfg(windows)]
+    if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+        return PathBuf::from(local)
+            .join("PerfectWorldViewer")
+            .join("lighter-logs");
+    }
+    #[cfg(windows)]
+    if let Some(profile) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+        return PathBuf::from(profile)
+            .join("AppData")
+            .join("Local")
+            .join("PerfectWorldViewer")
+            .join("lighter-logs");
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(xdg)
+            .join("PerfectWorldViewer")
+            .join("lighter-logs");
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("PerfectWorldViewer")
+            .join("lighter-logs");
+    }
+    std::env::temp_dir()
+        .join("PerfectWorldViewer")
+        .join("lighter-logs")
+}
+
 impl Logger {
     pub fn new() -> Self {
         Self {
             level: Mutex::new(LogLevel::Off),
-            log_dir: None,
+            log_dir: Some(default_log_dir()),
             frame_count: Mutex::new(0),
         }
     }
 
     pub fn from_env() -> Self {
-        let mut log = Self::new();
+        let log = Self::new();
         let level = std::env::var("PW_LIGHTER_LOG")
             .ok()
             .as_deref()
             .and_then(LogLevel::parse)
             .unwrap_or(LogLevel::Normal);
         *log.level.lock().unwrap() = level;
-        if level != LogLevel::Off {
-            log.log_dir = std::env::var_os("PW_CACHE_DIR")
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME").map(PathBuf::from).map(|p| {
-                        p.join(".cache")
-                            .join("PerfectWorldViewer")
-                            .join("lighter-logs")
-                    })
-                });
-        }
         log
+    }
+
+    pub fn log_dir(&self) -> Option<&Path> {
+        self.log_dir.as_deref()
+    }
+
+    pub fn open_log_dir(&self) -> io::Result<PathBuf> {
+        let dir = self.log_dir.clone().unwrap_or_else(default_log_dir);
+        fs::create_dir_all(&dir)?;
+        #[cfg(target_os = "windows")]
+        {
+            let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open").arg(&dir).spawn();
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+        }
+        Ok(dir)
+    }
+
+    pub fn export_csv(&self, rows: &[(u64, u32, f64, f64, f64)]) -> io::Result<PathBuf> {
+        let dir = self.log_dir.clone().unwrap_or_else(default_log_dir);
+        fs::create_dir_all(&dir)?;
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let path = dir.join(format!("lighter-timings-{ts}.csv"));
+        let mut out = String::from(
+            "frame,ray_resolution_pct,as_ms,trace_ms,denoise_ms
+",
+        );
+        for (frame, res, as_ms, trace_ms, denoise_ms) in rows {
+            out.push_str(&format!(
+                "{frame},{res},{as_ms:.3},{trace_ms:.3},{denoise_ms:.3}
+"
+            ));
+        }
+        fs::write(&path, out)?;
+        Ok(path)
     }
 
     pub fn set_level(&self, level: LogLevel) {

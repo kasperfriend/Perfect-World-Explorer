@@ -62,6 +62,26 @@ impl Denoiser {
         }
     }
 
+    pub fn unavailable_reason_for(
+        self,
+        has_hardware_rt: bool,
+        is_nvidia: bool,
+    ) -> Option<&'static str> {
+        match self {
+            Self::Svgf | Self::None => None,
+            Self::DlssRr => {
+                if is_nvidia && has_hardware_rt {
+                    None
+                } else if !is_nvidia {
+                    Some("requires NVIDIA RTX GPU")
+                } else {
+                    Some("requires Hardware RT (Vulkan)")
+                }
+            }
+            Self::FsrRayRegen => Some("DirectX 12 only; not available on Vulkan"),
+        }
+    }
+
     pub fn parse(token: &str) -> Option<Self> {
         match token {
             "svgf" => Some(Self::Svgf),

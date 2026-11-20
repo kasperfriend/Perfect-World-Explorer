@@ -707,7 +707,7 @@ impl Feed {
             sun: direction.extend(f.daylight).to_array(),
             ambient: Vec3::from_array(ambient).extend(0.).to_array(),
             sun_color: (Vec3::from_array(diffuse) * f.daylight * 1.3)
-                .extend(0.)
+                .extend((f.sky_moon[1] / 1.047_197_6).clamp(0., 1.) * (1. - f.daylight))
                 .to_array(),
             air: [
                 air.start,
@@ -1195,6 +1195,119 @@ impl super::Renderer {
     /// False means no current frame to present. In particular, never clear or
     /// present stale output after an error: the next redraw can render Native
     /// with its own extent, jitter, and model tick.
+
+    /// Hybrid raster + RT overlay: traces ONLY secondary RT shadows (sun/moon),
+    /// ambient occlusion, short-range GI bounce, and reflections from the
+    /// rasterizer's reverse-Z depth buffer, then composites onto `scene_target`
+    /// without replacing or clearing the rasterized world.
+    pub(super) fn render_lighter_overlay(
+        &mut self,
+        scene_target: &wgpu::TextureView,
+        matrix: Mat4,
+        camera: &Camera,
+        frame: &FrameSnapshot,
+        w: u32,
+        h: u32,
+    ) {
+        if !self.lighter.overlays_world() {
+            return;
+        }
+        let depth = self.depth.create_view(&Default::default());
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        let resident = self.resident_bounds();
+        if let Some(light) = camera.regional_light {
+            self.retained_regional_light = Some(light);
+        }
+        if let Some(models) = &mut self.models {
+            let radius = self.detail.radius.max(1) as f32 * self.model_scene.block_size.max(1.);
+            models.set_view_center(camera.pos.x, camera.pos.z, radius);
+            models.set_resident_bounds(resident);
+            models.set_effects_enabled(camera.world_effects);
+            models.set_effect_distance(camera.effect_distance);
+            let direction = frame.direction.extend(frame.daylight).to_array();
+            let normal = frame.uniform(
+                matrix,
+                direction,
+                frame.clip,
+                frame.fog_range,
+                frame.fog_color,
+                [0., 1., 0., 0.],
+            );
+            models.update_for_rays(
+                &self.device,
+                &self.queue,
+                super::receiving_model_frame(
+                    &normal,
+                    camera,
+                    camera.regional_light.or(self.retained_regional_light),
+                ),
+                camera.pos.to_array(),
+                &self.model_lights,
+                crate::environment::night_factor(camera.time_of_day),
+                camera.logic_delta_ms,
+            );
+        }
+        let [walker, populator] = self.modules.ray_skin_omissions();
+        self.lighter.skin_omissions[1..].copy_from_slice(&[walker, populator]);
+        let result = (|| -> Result<bool, String> {
+            let feed = self
+                .lighter_feed
+                .as_ref()
+                .ok_or("Lighter scene feed is unavailable")?;
+            let lights = feed.frame(
+                matrix,
+                camera,
+                frame,
+                w,
+                h,
+                self.lighter.settings.regional_lighting,
+            );
+            let world = self
+                .lighter
+                .world
+                .as_mut()
+                .ok_or("Lighter has no resident geometry")?;
+            let (moving, coverage) = moving(
+                feed,
+                frame,
+                camera,
+                lighter::storage_limit(&self.device),
+                self.models.as_mut(),
+                &mut self.modules,
+                &mut world.textures,
+                matrix,
+                &mut self.lighter.moving_accel,
+                self.ray_model_absences,
+                self.lighter.settings,
+                false,
+            )?;
+            let rendered = self.lighter.render_overlay(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                scene_target,
+                &depth,
+                self.scene_format,
+                lights,
+                &moving,
+            )?;
+            if rendered {
+                self.lighter.moving_coverage = coverage;
+            }
+            Ok(rendered)
+        })();
+        match result {
+            Ok(true) => {
+                self.queue.submit(Some(encoder.finish()));
+                self.lighter.profile_submitted();
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.lighter.fail_frame(error);
+            }
+        }
+    }
+
     pub(super) fn render_lighter(
         &mut self,
         target: &wgpu::TextureView,

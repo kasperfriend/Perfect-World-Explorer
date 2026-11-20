@@ -3890,9 +3890,12 @@ impl Renderer {
         );
     }
     fn renders_rays(&self) -> bool {
-        // A Native whole-world mesh can omit local geometry. Keep its Native
-        // pages drawing until a stream with local scenery has arrived.
-        !self.local_scenery_skipped && self.lighter.replaces_world()
+        // Standard Lighter runs as a hybrid RT overlay on top of the native
+        // rasterized world (preserving crisp raster geometry and Graphics
+        // upscalers). Only the 32-spp Reference mode replaces the world.
+        !self.local_scenery_skipped
+            && self.lighter.replaces_world()
+            && self.lighter.settings.reference
     }
 
     fn render(
@@ -4695,6 +4698,12 @@ impl Renderer {
                 frame.active_fog_range,
                 frame.active_fog_color,
             );
+        }
+        if !self.local_scenery_skipped && self.lighter.overlays_world() {
+            if reset_history {
+                self.lighter.reset_history();
+            }
+            self.render_lighter_overlay(scene_target, matrix, camera, &frame, w, h);
         }
         if use_post {
             self.post.render(

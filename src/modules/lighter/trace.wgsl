@@ -90,6 +90,7 @@ const CLOUD_DETAIL: u32 = 4096u;
 const PHYSICAL_BSDF: u32 = 8192u;
 const REFERENCE_MODE: u32 = 16384u;
 const SINGLE_PATH: u32 = 32768u;
+const RASTER_OVERLAY: u32 = 1048576u;
 const VIEW: u32 = 0u;
 const SHADOW: u32 = 1u;
 const WATER_REFLECT: u32 = 2u;
@@ -1800,9 +1801,153 @@ fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool, overlay: bool) {
     screen_end();
 }
 
+fn pack_shadow_ao(shadow: f32, ao: f32) -> u32 {
+    let s = u32(round(clamp(shadow, 0.0, 1.0) * 4095.0));
+    let a = u32(round(clamp(ao, 0.0, 1.0) * 4095.0));
+    return (s & 0xfffu) | ((a & 0xfffu) << 12u);
+}
+
+// True hybrid raster + RT overlay: never traces primary world geometry.
+// Reads rasterized reverse-Z depth and edge-aware normal from image[at]
+// (populated by extract_depth.wgsl) and traces ONLY secondary RT rays:
+//   1. Hardware RT directional shadow (Sun by day, Moon by night)
+//   2. Short-range RT ambient occlusion (RTAO)
+//   3. Short-range RT indirect bounce lighting (GI)
+//   4. Fresnel-weighted RT reflections
+fn render_overlay_pixel(id: vec2<u32>) {
+    let at = id.y * frame.extent.x + id.x;
+    let gbuf = image[at];
+    if gbuf.depth <= 0.0 {
+        // Sky pixel: 0 rays traced, neutral overlay (add=0, shadow=1, ao=1).
+        image[at] = Pixel(0u, 0u, 0.0, 0.0, 0u, 0x00ffffffu, 0u);
+        return;
+    }
+
+    let screen = (vec2<f32>(id) + 0.5) / vec2<f32>(frame.extent.xy);
+    let ndc = screen * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
+    let w4 = frame.inv_vp * vec4<f32>(ndc, gbuf.depth, 1.0);
+    let p = w4.xyz / max(abs(w4.w), 1.0e-7) * select(1.0, -1.0, w4.w < 0.0);
+
+    let raw_n = unpack4x8snorm(gbuf.normal_flags & 0x00ffffffu).xyz;
+    let to_eye = frame.eye.xyz - p;
+    let dist = max(length(to_eye), 0.001);
+    let v = to_eye / dist;
+    let n = select(v, norm(raw_n), dot(raw_n, raw_n) > 1.0e-6);
+
+    let bias = max(0.05, dist * 0.0025);
+    let origin = p + n * bias;
+
+    var seed = hash((id.x + id.y * frame.extent.x + 1u) ^ hash(frame.sampling.x * 1664525u + 1013904223u));
+
+    // Explicitly distinguish Sun (day) vs Moon (night) so 12:00 always uses
+    // sun direction/color and 24:00 uses moon direction/color consistently.
+    let is_day = frame.sun.w > 0.05;
+    let moon_strength = frame.sun_color.w;
+    let moon_dir = select(norm(vec3<f32>(0.3, 0.72, 0.45)), norm(frame.moon_disc.xyz), frame.moon_disc.y > 0.05);
+    let sun_dir = select(vec3<f32>(0.0, 1.0, 0.0), norm(frame.sun.xyz), dot(frame.sun.xyz, frame.sun.xyz) > 0.25);
+    let light_dir = select(moon_dir, sun_dir, is_day);
+    let light_strength = select(moon_strength * 0.55, frame.sun.w, is_day);
+    let day_sun_col = max(frame.sun_color.rgb, vec3<f32>(0.35, 0.33, 0.28) * frame.sun.w);
+    let night_moon_col = vec3<f32>(0.14, 0.20, 0.32) * max(moon_strength, 0.25);
+    let light_color = select(night_moon_col, day_sun_col, is_day);
+
+    // 1. Hardware RT directional shadow (TERMINATE_ON_FIRST_HIT via BLOCKER_MASK).
+    var shadow_vis = 1.0;
+    if (frame.options.x & SHADOWS) != 0u && light_strength > 0.02 && light_dir.y > 0.02 && dot(n, light_dir) > 0.02 {
+        var l_dir = light_dir;
+        if (frame.options.x & SOFT_SUN) != 0u {
+            let u = vec2<f32>(random(&seed), random(&seed));
+            let delta = u.x * (0.000038);
+            l_dir = around(light_dir, 1.0 - delta, sqrt(max(0.0, delta * (2.0 - delta))), u.y * 6.2831853);
+        }
+        let s_ray = Ray(origin, l_dir, 0.0, frame.eye.w, 0.0, 0.0, 0.5, id.x + id.y * frame.extent.x + 1u);
+        let s_hit = intersect(s_ray, Query(SHADOW, BLOCKER_MASK, false, vec2<u32>(NIL)));
+        shadow_vis = select(0.0, 1.0, s_hit.instance == NIL);
+    }
+
+    // 2. Short-range RT Ambient Occlusion (RTAO, TERMINATE_ON_FIRST_HIT).
+    var ao = 1.0;
+    if (frame.options.x & LIGHTING) != 0u {
+        let ao_radius = 10.0;
+        let ao_samples = clamp(frame.options.z, 1u, 2u);
+        var ao_sum = 0.0;
+        for (var k = 0u; k < ao_samples; k++) {
+            let d = hemisphere(n, &seed);
+            let ao_ray = Ray(origin, d, 0.0, ao_radius, 0.0, 0.0, 0.5, id.x + id.y * frame.extent.x + 1u);
+            let ao_hit = intersect(ao_ray, Query(DIFFUSE, BLOCKER_MASK, false, vec2<u32>(NIL)));
+            if ao_hit.instance != NIL {
+                let frac = clamp(ao_hit.t / ao_radius, 0.0, 1.0);
+                let occ = (1.0 - frac) * (1.0 - frac);
+                ao_sum += 1.0 - occ;
+            } else {
+                ao_sum += 1.0;
+            }
+        }
+        ao = ao_sum / f32(ao_samples);
+    }
+
+    var added_rgb = vec3<f32>(0.0);
+
+    // 3. Short-range RT indirect bounce lighting (GI).
+    if (frame.options.x & LIGHTING) != 0u && frame.options.y > 0u {
+        let gi_dist = clamp(select(96.0, frame.material_time.w, frame.material_time.w > 0.0), 16.0, 128.0);
+        let gi_dir = hemisphere(n, &seed);
+        let gi_ray = Ray(origin, gi_dir, 0.0, gi_dist, 0.0, 0.02, 0.5, id.x + id.y * frame.extent.x + 1u);
+        let gi_hit = intersect(gi_ray, Query(DIFFUSE, SECONDARY_MASK, false, vec2<u32>(NIL)));
+        if gi_hit.instance != NIL {
+            let hs = surface(gi_hit, gi_ray);
+            let h_ndotl = max(dot(hs.n, light_dir), 0.0);
+            let bounce = hs.color.rgb * (light_color * h_ndotl * 0.45 + frame.ambient.rgb * 0.25) + hs.emission * 0.35;
+            added_rgb += bounce * 0.28;
+        }
+    }
+
+    // 4. Fresnel-weighted RT reflections (water, glossy, grazing angles).
+    if (frame.options.x & REFLECTIONS) != 0u {
+        let ndotv = max(dot(n, v), 0.0);
+        let fresnel = 0.04 + 0.96 * pow(1.0 - ndotv, 5.0);
+        if fresnel > 0.07 {
+            let refl_dir = reflect(-v, n);
+            if dot(refl_dir, n) > 0.0 {
+                let refl_dist = min(frame.eye.w, 256.0);
+                let r_ray = Ray(origin, refl_dir, 0.0, refl_dist, 0.0, 0.01, 0.5, id.x + id.y * frame.extent.x + 1u);
+                let r_hit = intersect(r_ray, Query(SPECULAR, SECONDARY_MASK, false, vec2<u32>(NIL)));
+                if r_hit.instance != NIL {
+                    let rs = surface(r_hit, r_ray);
+                    let r_ndotl = max(dot(rs.n, light_dir), 0.0);
+                    let r_lit = rs.color.rgb * (light_color * r_ndotl + frame.ambient.rgb) + rs.emission;
+                    added_rgb += r_lit * (fresnel * 0.40);
+                } else {
+                    added_rgb += environment(r_ray, true) * (fresnel * 0.22);
+                }
+            }
+        }
+    }
+
+    let shadow_strength = select(0.32, 0.55, is_day) * clamp(light_strength * 1.4, 0.0, 1.0);
+    let final_shadow = mix(1.0, shadow_vis, shadow_strength);
+    let final_ao = mix(1.0, ao, 0.45);
+
+    var out = Pixel(
+        0u,
+        0u,
+        gbuf.depth,
+        gbuf.view_depth,
+        gbuf.normal_flags & 0x00ffffffu,
+        pack_shadow_ao(final_shadow, final_ao),
+        1u,
+    );
+    write_radiance(&out, max(added_rgb, vec3<f32>(0.0)), 0.0);
+    image[at] = out;
+}
+
 @compute @workgroup_size(8,8)
 fn render(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy>=frame.extent.xy) { return; }
+    if (frame.options.x & RASTER_OVERLAY)!=0u {
+        render_overlay_pixel(id.xy);
+        return;
+    }
     let overlay = (frame.options.x & RAY_LIGHTING_OVERLAY)!=0u;
     render_pixel(id.xy,Hit(0.,NIL,0u,vec2<f32>(0.)),false,overlay);
 }

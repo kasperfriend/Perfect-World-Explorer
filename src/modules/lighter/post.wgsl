@@ -8,6 +8,22 @@ struct Params {
 @group(0) @binding(2) var<storage,read_write> output_pixels: array<Pixel>;
 @group(0) @binding(3) var<storage,read> previous_pixels: array<Pixel>;
 
+fn overlay_mode() -> bool { return params.history.w != 0u; }
+fn unpack_sa(p: Pixel) -> vec2<f32> {
+    return vec2<f32>(f32(p.albedo_history & 0xfffu) / 4095.0, f32((p.albedo_history >> 12u) & 0xfffu) / 4095.0);
+}
+fn pack_sa(sa: vec2<f32>, hi: u32) -> u32 {
+    let s = u32(round(clamp(sa.x, 0.0, 1.0) * 4095.0)) & 0xfffu;
+    let a = u32(round(clamp(sa.y, 0.0, 1.0) * 4095.0)) & 0xfffu;
+    return (hi & 0xff000000u) | s | (a << 12u);
+}
+fn guide_weight_mode(a: vec4<u32>, b: vec4<u32>) -> f32 {
+    if overlay_mode() {
+        return guide_weight(vec4<u32>(a.x, a.y, 0u, a.w), vec4<u32>(b.x, b.y, 0u, b.w));
+    }
+    return guide_weight(a, b);
+}
+
 fn same_history(old: Pixel, current: Pixel, expected_w: f32, reproject: bool) -> bool {
     let a = guide_of(old);
     let b = guide_of(current);
@@ -16,10 +32,10 @@ fn same_history(old: Pixel, current: Pixel, expected_w: f32, reproject: bool) ->
         || (animations & params.history.y)!=0u || ((a.w^b.w) & GUIDE_KIND)!=0u
         || ((params.history.y & 256u)!=0u && ((old.owner|current.owner) & DEP_MOVING)!=0u) { return false; }
     if !reproject {
-        return a.x==b.x && a.y==b.y && a.z==b.z && old.depth==current.depth;
+        return a.x==b.x && a.y==b.y && (overlay_mode() || a.z==b.z) && old.depth==current.depth;
     }
-    return old.view_depth>0. && abs(old.view_depth-expected_w)<0.012*expected_w
-        && guide_weight(vec4<u32>(a.x,b.yzw),a)>=0.5;
+    return old.view_depth>0. && abs(old.view_depth-expected_w)<0.025*expected_w
+        && guide_weight_mode(vec4<u32>(a.x,b.yzw),a)>=0.5;
 }
 
 // Clamp only a reprojected sample, and only from a usable neighborhood.
@@ -36,7 +52,7 @@ fn clipped_history(old: vec3<f32>, current: Pixel, coord: vec2<u32>) -> vec3<f32
         if any(pos<vec2<i32>(0)) || any(pos>=vec2<i32>(params.extent.xy)) { continue; }
         let neighbor = input_pixels[u32(pos.y)*params.extent.x+u32(pos.x)];
         if (neighbor.owner & OWNER_MASK)!=(current.owner & OWNER_MASK)
-            || guide_weight(guide_of(neighbor),guide_of(current))<0.5 { continue; }
+            || guide_weight_mode(guide_of(neighbor),guide_of(current))<0.5 { continue; }
         let c = color_of(neighbor);
         hi = max(hi,c);
         lo = min(lo,c);
@@ -85,7 +101,12 @@ fn temporal(current: Pixel, coord: vec2<u32>, i: u32) -> Pixel {
     // Weighted central second moment; E[Y] is luminance of the stored mean RGB.
     let variance = (1.-alpha)*(old_variance+alpha*delta*delta);
     var out = current;
-    out.albedo_history |= count << HISTORY_SHIFT;
+    if overlay_mode() {
+        let sa = mix(unpack_sa(old), unpack_sa(current), alpha);
+        out.albedo_history = pack_sa(sa, count << HISTORY_SHIFT);
+    } else {
+        out.albedo_history |= count << HISTORY_SHIFT;
+    }
     out.normal_flags |= old.normal_flags & (ANIM_MASK << 24u);
     out.owner |= old.owner & DEP_MOVING;
     write_radiance(&out,mix(a,b,alpha),variance);
@@ -118,15 +139,18 @@ fn atrous(coord: vec2<u32>, step: i32) {
     let mean = luminance(radiance);
     let variance = variance_of(center);
     let n = (center.albedo_history >> HISTORY_SHIFT) & HISTORY_COUNT;
-    if step>=4 && (n<3u || variance<0.004*max(0.0025,mean*mean)) {
+    if !overlay_mode() && step>=4 && (n<3u || variance<0.004*max(0.0025,mean*mean)) {
         output_pixels[i] = center;
         return;
     }
     let sigma = sqrt(max(0.,variance));
     let phi = 2.5*sigma+max(0.025,0.15*mean);
     var sum = radiance*4.;
+    var sa_sum = unpack_sa(center)*4.;
     var total = 4.;
+    var sa_total = 4.;
     var sum_var = variance*16.;
+    let is_overlay = overlay_mode();
     for (var y=-1; y<=1; y++) {
         for (var x=-1; x<=1; x++) {
             if x==0 && y==0 { continue; }
@@ -134,17 +158,25 @@ fn atrous(coord: vec2<u32>, step: i32) {
             if any(at<vec2<i32>(0)) || any(at>=vec2<i32>(extent)) { continue; }
             let neighbor = input_pixels[u32(at.y)*extent.x+u32(at.x)];
             if (neighbor.owner & OWNER_MASK)!=(center.owner & OWNER_MASK) { continue; }
-            let geo = guide_weight(guide,guide_of(neighbor));
+            let geo = guide_weight_mode(guide,guide_of(neighbor));
             if geo<=0. { continue; }
             let c = color_of(neighbor);
+            let kernel_w = f32((2-abs(x))*(2-abs(y)))*geo;
             let photometric = select(1., exp(-abs(mean-luminance(c))/phi), n>=3u);
-            let weight = f32((2-abs(x))*(2-abs(y)))*geo*photometric;
+            let weight = kernel_w*photometric;
             sum += c*weight;
             sum_var += variance_of(neighbor)*weight*weight;
             total += weight;
+            if is_overlay {
+                sa_sum += unpack_sa(neighbor)*kernel_w;
+                sa_total += kernel_w;
+            }
         }
     }
     write_radiance(&center,sum/total,sum_var/(total*total));
+    if is_overlay {
+        center.albedo_history = pack_sa(sa_sum/sa_total, center.albedo_history);
+    }
     output_pixels[i] = center;
 }
 
