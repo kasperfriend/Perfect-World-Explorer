@@ -669,6 +669,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     // x[0.1,2.2],y[-1,1] — catches sun ray, misses camera ray at [0,0,-1].
     let mut sun_frame = test_frame(Vec3::ZERO, -Vec3::Z, 1);
     sun_frame.sun = Vec3::new(0.8, 0.1, 0.6).normalize().extend(1.).to_array();
+    sun_frame.ambient = [0.5, 0.5, 0.5, 0.];
     let mut shadow = Builder::default();
     let block = upright(&mut shadow, 0., [1.; 4], 0, 0);
     shadow
