@@ -310,7 +310,9 @@ pub fn assert_not_silently_empty(
     }
     Err(format!(
         "{} returned 0 items, recorded no reason, and the input did not declare \
-         zero authored items{}: a loader may not be empty and silent at once",
+         zero authored items{}: a loader may not be empty and silent at once. \
+         Either call load_status::dropped with the reason, or pass the count the \
+         file declares as `authored`. The audit list is docs/silent-drops.md.",
         category.key(),
         authored.map_or(String::new(), |a| format!(" (it declares {a})"))
     ))
@@ -328,8 +330,14 @@ mod empty_tests {
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let err = assert_not_silently_empty(Category::Water, 0, None).unwrap_err();
+        // The category name has to be in the message: it is what tells a reader
+        // which counter to look at.
         assert!(err.contains("water"), "{err}");
-        assert!(err.contains("silent-drop"), "{err}");
+        // And the message has to say what to do about it, because the whole
+        // point of this module is that a silent empty result is a bug someone
+        // has to go and fix.
+        assert!(err.contains("docs/silent-drops.md"), "{err}");
+        assert!(err.contains("load_status::dropped"), "{err}");
     }
 
     #[test]

@@ -307,6 +307,11 @@ jobs:
       # exit zero if any category came back `silent` -- a reader that returned
       # nothing without a reason is the failure this whole exercise targets.
       - name: Measure every staged client into ci-results
+        # Always runs. A failure in an unrelated step above used to skip this one,
+        # and the publish step then announced "the measure step did not run" as a
+        # result -- three runs in a row measured nothing. Measurement is the
+        # point of the run, so it must not sit behind anything else.
+        if: always()
         run: |
           set -euo pipefail
           rm -rf ci-results
@@ -328,11 +333,11 @@ jobs:
             args+=("$(basename "$d")=$d")
           done
           if [ ${#args[@]} -eq 0 ]; then
-            # Nothing staged: write the marker the fail-step below looks for, so
-            # "no clients" is a *recorded* empty run and not a silent one.
-            printf '{"client":"none","cells":[],"note":"no client files were staged on this runner"}' \
-              > ci-results/none.json
-            echo "::notice::no client files staged; ci-results/none.json records that"
+            # Nothing to measure is not a result, and writing a placeholder file
+            # for it is how a stale none.json survived on the ci-results branch
+            # while the real clients went unmeasured. Fail instead.
+            echo "::error::no client files were staged, so nothing was measured"
+            exit 1
           else
             # Surface the tool's own failure as an annotation: the raw step log
             # is not retrievable, so an unannotated non-zero exit is invisible.
@@ -349,9 +354,16 @@ jobs:
               exit 1
             fi
           fi
-          # A missing file per client is a failed measurement, not a zero.
-          for f in ci-results/*.json; do
-            [ -s "$f" ] || { echo "::error::$f is empty"; exit 1; }
+          # A missing file per client is a failed measurement, not a zero. The
+          # expected set is what the loop above staged, so a client that produced
+          # no JSON at all is named here rather than going unnoticed.
+          for spec in "${args[@]}"; do
+            name=${spec%%=*}
+            f="ci-results/$name.json"
+            if [ ! -s "$f" ]; then
+              echo "::error::no measurement was written for client '$name' (expected $f)"
+              exit 1
+            fi
           done
       - name: Publish ci-results
         if: always()
@@ -362,9 +374,11 @@ jobs:
           # "no measurements" is a result and a missing directory is not.
           if [ ! -d ci-results ]; then
             mkdir -p ci-results
-            printf '{"client":"none","cells":[],"note":"the measure step did not run"}' \
-              > ci-results/none.json
-            echo "::error::the measure step wrote no ci-results; publishing a record of that"
+            # Annotate the failure, but do NOT write a none.json: a file called
+            # "none.json" is indistinguishable from a real measurement once it
+            # is on the ci-results branch, and it is not one. The job is meant
+            # to fail in this case anyway.
+            echo "::error::the measure step wrote no ci-results; measurement did not run"
           fi
           # One file per client, and the job fails if any is missing.
           count=$(ls -1 ci-results/*.json 2>/dev/null | wc -l)
