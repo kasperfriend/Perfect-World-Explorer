@@ -554,7 +554,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
     let red = animated.finish();
     // --- RED CARD ISOLATION CHECKS (temporary diagnostics) ---
     // Red only: empty world, red moving card → expect pure red [255,0,0].
-    h.ray.install(Ok((Builder::default().finish(), bank.clone())));
+    h.ray
+        .install(Ok((Builder::default().finish(), bank.clone())));
     let (red_only, red_only_z) = h.pixel(frame, &red);
     eprintln!(
         "RED-CARD-DUMP red-only: color={:?} depth={} expect=[255,0,0,255] depth≈{}",
@@ -566,7 +567,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
     let mut b_green = Builder::default();
     let green_again = upright(&mut b_green, -5., [0., 1., 0., 1.], 0, 0);
     put(&mut b_green, green_again);
-    h.ray.install(Ok((b_green.finish(), bank.clone())));
+    h.ray
+        .install(Ok((b_green.finish(), bank.clone())));
     let (green_only, green_only_z) = h.pixel(frame, &empty);
     eprintln!(
         "RED-CARD-DUMP green-only: color={:?} depth={} expect=[0,255,0,255] depth≈{}",
@@ -578,7 +580,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
     let mut b_both = Builder::default();
     let green_both = upright(&mut b_both, -5., [0., 1., 0., 1.], 0, 0);
     put(&mut b_both, green_both);
-    h.ray.install(Ok((b_both.finish(), bank.clone())));
+    h.ray
+        .install(Ok((b_both.finish(), bank.clone())));
     let (both, both_z) = h.pixel(frame, &red);
     eprintln!(
         "RED-CARD-DUMP both: color={:?} depth={} expect=[255,0,0,255] depth≈{}",
