@@ -565,10 +565,7 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
                 facts.push(("precinctZones", format!("{zone_total}")));
             }
             if refused.is_empty() {
-                cells.push(Cell::ok(
-                    "music precinct",
-                    format!("{ok} precinct.clt files"),
-                ));
+                cells.push(Cell::ok("music precinct", format!("{ok} precinct.clt files")));
             } else {
                 cells.push(Cell::refused("music precinct", refused.join("; ")));
             }
@@ -618,10 +615,7 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
                 Ok(s) => {
                     inst_ok += 1;
                     let trees: usize = s.blocks.iter().map(|b| b.trees.len()).sum();
-                    inst_trees.push(format!(
-                        "{stem}:{}types/{trees}trees",
-                        s.tree_types.len()
-                    ));
+                    inst_trees.push(format!("{stem}:{}types/{trees}trees", s.tree_types.len()));
                 }
                 Err(e) => inst_trees.push(format!("{stem}:refused:{}", esc(&e))),
             }
@@ -731,10 +725,7 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
             if refusals.is_empty() {
                 Cell::ok(
                     "lightmaps T2LM",
-                    format!(
-                        "{decoded} lightmaps decoded, tile sides {}",
-                        seen.join(",")
-                    ),
+                    format!("{decoded} lightmaps decoded, tile sides {}", seen.join(",")),
                 )
             } else {
                 Cell::refused(
