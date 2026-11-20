@@ -1104,7 +1104,9 @@ fn read_entry_table_chunked(
     size: u64,
 ) -> Result<Vec<Entry>, String> {
     // A table of `count` records cannot exceed this.
-    let ceiling = (count as u64).saturating_mul(rev.entry as u64 + 8).min(limit);
+    let ceiling = (count as u64)
+        .saturating_mul(rev.entry as u64 + 8)
+        .min(limit);
     // The first chunk is deliberately small: most tables are a fraction of their
     // ceiling, and the common case should not read the ceiling.
     let mut have = 256u64.saturating_mul(1024).min(ceiling).max(8);
