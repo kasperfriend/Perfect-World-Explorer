@@ -257,8 +257,7 @@ pub(crate) const TRAILER_PROBES: [Revision; 1] = [Revision {
     flags_at: None,
     description_at: 16,
     guard_byte1: 272,
-},
-];
+}];
 
 /// The guard pair `guardByte0` / `guardByte1` that every revision's trailer
 /// carries.
