@@ -15,6 +15,8 @@ mod client_weather;
 #[path = "../environment.rs"]
 mod environment;
 #[allow(dead_code)]
+#[path = "../load_status.rs"]
+mod load_status;
 #[path = "../pck.rs"]
 mod pck;
 #[allow(dead_code)]

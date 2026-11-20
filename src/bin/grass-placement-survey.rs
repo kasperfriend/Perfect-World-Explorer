@@ -9,6 +9,8 @@ mod diag_stub;
 #[allow(unused_imports)]
 pub use diag_stub::diagnostics;
 
+#[path = "../load_status.rs"]
+mod load_status;
 #[path = "../pck.rs"]
 mod pck;
 #[path = "../grass_random.rs"]

@@ -15,6 +15,8 @@ mod angelica_pck;
 mod dxt;
 #[path = "../grass.rs"]
 mod grass;
+#[path = "../load_status.rs"]
+mod load_status;
 #[path = "../model_dds.rs"]
 mod model_dds;
 #[path = "../pck.rs"]

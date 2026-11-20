@@ -9,6 +9,8 @@ mod diag_stub;
 pub use diag_stub::diagnostics;
 
 #[allow(dead_code)]
+#[path = "../load_status.rs"]
+mod load_status;
 #[path = "../pck.rs"]
 mod pck;
 #[allow(dead_code)]

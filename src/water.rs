@@ -622,10 +622,25 @@ fn parse_one_shore_wave(b: &[u8], mut cursor: usize) -> Result<(ShoreWave, usize
     ))
 }
 pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
-    let b = fs::read(ecbsd_path(dir)).map_err(|e| e.to_string())?;
+    // Name the file. `e.to_string()` alone is "No such file or directory
+    // (os error 2)", which reached the compatibility matrix as a refusal with no
+    // path in it -- a reader cannot tell whether the map ships no water manifest
+    // or whether the viewer looked in the wrong place. The loader's own contract
+    // is that a refusal names what it refused.
+    let manifest = ecbsd_path(dir);
+    let b = fs::read(&manifest)
+        .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
+    if let Err(why) = crate::scene::ecbsd_header(&b) {
+        // Same reasoning: say which file carried the bad header.
+        crate::load_status::dropped(
+            crate::load_status::Category::Water,
+            format!("{}: {why}", manifest.display()),
+        );
+        return Err(format!("{}: {why}", manifest.display()));
+    }
     // One check owns the EC-BSD identity and revision, so water, scenery and
-    // grass cannot disagree about which revisions a map may carry.
-    crate::scene::ecbsd_header(&b)?;
+    // grass cannot disagree about which revisions a map may carry. It ran above,
+    // so that a refusal can name the file it refused.
     // Measured: the largest manifest staged is the 1.8.4 world's, with 88
     // BSData paths. The limit leaves two orders of magnitude of headroom and
     // only stops a damaged header reserving memory.
@@ -808,6 +823,41 @@ mod tests {
     #[test]
     fn rejects_invalid_version() {
         assert!(WaterArea::parse(&[0; 64], 0, 1).is_err())
+    }
+
+    /// A refusal has to name the file it refused.
+    ///
+    /// This is the defect the compatibility matrix caught: `map_err(|e|
+    /// e.to_string())` produced "No such file or directory (os error 2)" as the
+    /// whole reason, so the matrix cell said water was refused but not what was
+    /// missing or where the loader had looked for it. Fails on the old code,
+    /// which returned the bare `io::Error` text.
+    #[test]
+    fn a_missing_water_manifest_is_named_in_the_refusal() {
+        let scene = Scene {
+            width: 1.,
+            length: 1.,
+            block_size: 1.,
+            rows: 1,
+            cols: 1,
+            tree_types: Vec::new(),
+            grass_types: Vec::new(),
+            blocks: Vec::new(),
+        };
+        let dir = std::env::temp_dir().join("pwe-water-missing-manifest-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let err = load(&scene, &dir).expect_err("no manifest in an empty directory");
+        std::fs::remove_dir_all(&dir).ok();
+        // The path the loader tried, by name, in the message.
+        assert!(
+            err.contains("world.ecbsd"),
+            "the refusal must name the manifest it wanted: {err}"
+        );
+        assert!(
+            err.contains("cannot read"),
+            "the refusal must say what failed: {err}"
+        );
     }
     #[test]
     fn decodes_uncompressed_argb_normal_dds() {

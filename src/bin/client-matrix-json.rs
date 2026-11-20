@@ -31,6 +31,11 @@ pub use diag_stub::diagnostics;
 mod angelica_pck;
 #[path = "../client_detect.rs"]
 mod client_detect;
+// `water.rs` now records a loss through `crate::load_status`, and a `#[path]`
+// module set is its own crate root, so the module has to be declared here even
+// though this binary never calls it directly.
+#[path = "../load_status.rs"]
+mod load_status;
 #[path = "../model_dds.rs"]
 mod model_dds;
 #[path = "../music.rs"]
