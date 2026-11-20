@@ -1382,13 +1382,8 @@ fn transport(first: Ray, primary: Hit, raster: bool, seed: ptr<function,u32>) ->
     var pending = path;
     var split = false;
     let single = (frame.options.x & SINGLE_PATH)!=0u;
-    // In overlay mode, trace only the primary hit plus direct lighting
-    // (sun, local lights). Skip secondary diffuse/reflection bounces —
-    // the raster world is the base, rays only add lighting overlays.
-    let overlay = (frame.options.x & RAY_LIGHTING_OVERLAY)!=0u;
-    let max_bounce = select(frame.options.y, 0u, overlay);
     for (var branch=0u; branch<2u; branch++) {
-        for (var segment=0u; segment<=max_bounce; segment++) {
+        for (var segment=0u; segment<=frame.options.y; segment++) {
             let minimum = select(0.002,1.e-12,reference());
             if strongest(abs(path.weight))<minimum { break; }
             if single && path.depth>=2u {
