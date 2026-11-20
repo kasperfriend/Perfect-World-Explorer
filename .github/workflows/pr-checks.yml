@@ -254,6 +254,44 @@ jobs:
             sed -n '/^failures:$/,/^test result:/p' /tmp/cargo-test.log | head -30 \
               | while IFS= read -r line; do [ -n "$line" ] && echo "::error::$line"; done
           fi
+          # Every corpus test that could not look at the data prints SKIPPED
+          # and is counted on stderr; a run that never says so is claiming
+          # coverage it did not measure. Put the count in the job summary so a
+          # skip cannot pass as a pass, and fail if the run skipped at all
+          # without anyone saying why (2.11).
+          # `grep -c` exits 1 when it finds nothing, which `set -e` would turn
+          # into a failed job on the *good* path; the `|| true` keeps the count
+          # and drops only the exit status.
+          skipped=$(grep -c 'SKIPPED: ' /tmp/cargo-test.log || true)
+          skipped=${skipped:-0}
+          # `awk`, not `bc`: the runner image is not guaranteed to carry `bc`,
+          # and a missing calculator must not silently report zero tests.
+          # The count sits immediately before `passed;` (with the semicolon),
+          # so match the *next* field as a prefix rather than for equality.
+          passed=$(awk '/test result: ok\./ {
+              for (i = 1; i <= NF; i++)
+                  if ($(i + 1) ~ /^passed/) total += $i
+            } END { print total + 0 }' /tmp/cargo-test.log)
+          {
+            echo "### Viewer unit tests"
+            echo ""
+            echo "| | count |"
+            echo "|---|---|"
+            echo "| passed | ${passed:-0} |"
+            echo "| skipped (no corpus file) | ${skipped:-0} |"
+            echo ""
+            if [ "${skipped:-0}" -gt 0 ]; then
+              echo "A skipped corpus test proves nothing about the shipped data:"
+              echo "its archive is not staged on this runner. Each line below names"
+              echo "the file it could not open."
+              echo ""
+              echo '```'
+              grep 'SKIPPED: ' /tmp/cargo-test.log | head -40 || true
+              echo '```'
+            else
+              echo "No test skipped: every corpus assertion looked at its data."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
       # Formatting is checked after the unit tests and before the Vulkan
       # installs: rustfmt needs no GPU, so it must not sit behind an

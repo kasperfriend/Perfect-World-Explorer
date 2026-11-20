@@ -48,12 +48,43 @@ All three container revisions the client dispatches on are read:
 | revision | trailer | entry record | seen in |
 |---|---|---|---|
 | `0x00020001` | 272 B | 276 B | older packs |
-| `0x00020002` | 272 B | 276 B | 1.3.6, 1.4.4, 1.5.2 packs |
-| `0x00020003` | 280 B | 288 B, 64-bit `dwOffset` | 1.5.2 `models.pck` |
+| `0x00020002` | 272 B | 276 B | 1.3.6, 1.4.4, 1.5.2 packs; 2016 `trees.pck` |
+| `0x00020003` | 280 B **or 272 B** | 288 B, 64-bit `dwOffset` | 1.5.2 `models.pck`; **1.8.4 `trees.pck`** |
 
 `0x00020003` was refused outright before this work (`unsupported PCK version
 00020003`). Verified end to end: `gfx.pck` from 1.3.6 parses to 3499 entries and
 **all 3499** decode to the length their record claims.
+
+**The version word does not identify a trailer layout.** Measured on the shipped
+`trees.pck` files, whose trailer bytes are recorded verbatim in `src/pck.rs` as
+`TREES_184_TRAILER`, `TREES_152_TRAILER` and `TREES_2016_TRAILER` and asserted by
+three tests:
+
+| file | version word | trailer | `dwEntryOffset` | word at `+12` | entries |
+|---|---|---|---|---|---|
+| 1.8.4 `trees.pck` | `0x00020003` | **280 B** | at `+8`, **32-bit** | `0xffffffff` | 326 |
+| 1.5.2 `trees.pck` | `0x00020002` | 272 B | at `+8`, 32-bit | `0x00000000` | 325 |
+| 2016 `trees.pck` | `0x00020002` | 272 B | at `+8`, 32-bit | `0x65676e41` (`Ange`) | 326 |
+
+Two consequences, both encoded in the reader:
+
+1. **A version-keyed table cannot be complete.** `0x00020003` names the 280-byte
+   struct in `models.pck` and a narrowed 32-bit `dwEntryOffset` inside the same
+   280-byte struct in `trees.pck`. The reader therefore *probes*: the version's
+   own layout first, then `TRAILER_PROBES`, and accepts a candidate only when
+   its guards, description tag and a full walk of the entry table to `count`
+   all pass.
+2. **The word at `+12` is not reliably `dwFlags`.** 1.5.2 wrote a real zero flag
+   word there; the 2016 client wrote the ASCII start of its description
+   (`Ange`), on the *same revision word*. The reader reads that field but lets
+   the entry table decide: a package whose table walks cleanly opens whether or
+   not bit 31 is set, and the flag is only named when the walk fails. Reading
+   `trees.pck`'s `+12` as flags finds `0xffffffff` — an "encrypted" package that
+   in fact decodes perfectly.
+
+The narrowed 32-bit `dwEntryOffset` is legitimate rather than a misread: a
+package that a 32-bit field describes cannot exceed 4 GiB, and this one is
+26 MB.
 
 ### Two containers, told apart by the guard pair
 
@@ -183,6 +214,74 @@ Six `.ecwld` files parse, from small instance maps to full world maps:
 clients place vegetation as **ornaments**, and a map with no tree-type table
 cannot carry tree instances. The two world maps, which do carry 59 tree types,
 report thousands of trees — the tree path is exercised.
+
+## Trees
+
+`count_trees` in `src/main.rs` is not version-dependent: it sums
+`world_scene.blocks[*].trees.len()`, and `scene::Scene::parse` reads the tree
+table from the same fixed header layout for every ECWLD version it accepts
+(`version >= 12`, one layout). Trees are authored per block, so two maps of the
+same client can differ by thousands while the reader behaves identically.
+
+### Every point at which trees can be dropped, traced
+
+`count_trees` (`src/main.rs`) sums `blocks[*].trees.len()` and never consults a
+version. The placements are authored data, read by `scene::Scene::parse` from one
+fixed block layout for every accepted version. So a tree can only disappear at
+one of the places below, and each of them is reached *after* a map has authored
+its trees:
+
+| where | condition | effect |
+|---|---|---|
+| `trees::Trees::open` | `scene.tree_types.is_empty()` | returns no types, **no reason** — correct for `a91`/`a64`, which truly author none |
+| `trees::Trees::open` | cache directory missing | `off_reason`: "no SpeedTree cache at …" |
+| `trees::Trees::open` | `speedtreert.dll` unopenable | `off_reason` naming the DLL path and the OS error |
+| `trees::Trees::open` | `trees.pck` unopenable | `off_reason` naming the pack path and the OS error |
+| `trees::Trees::open` | `count == 0` with types authored | `off_reason`: "none of the N tree names … were found; first is …" |
+| `main.rs` | any tree type failed | hard error, not a silent drop |
+
+Note what is *not* in that list: no branch compares a version number. The
+version split the brief asked about does not exist in the reader.
+
+The five `off_reason` sites are all *visible*: each prints to stderr and is
+carried on the `Trees` value so the UI can show it. A user-visible reason is the
+difference between "trees do not spawn" and "trees do not spawn, and here is
+why" — and in the shipped clients the reason being printed was the one that
+mattered: the cache was never built, because source preparation aborted first.
+
+### The lookup that stopped every tree from being baked
+
+Trees do not fail in the reader; they fail in the *source preparation* that
+happens before the SpeedTree bridge runs, and the defect there was measured
+rather than assumed.
+
+`src/tree_source.rs` built its index of `trees.pck` with `name.to_lowercase()`
+and looked the scene's names up the same way. But every shipped `trees.pck`
+stores **backslash** paths and every `.ecwld` writes **forward slashes**:
+
+| pack | entries | names with `\` | names with `/` |
+|---|---|---|---|
+| 1.8.4 `trees.pck` | 326 | 326 | 0 |
+| 1.5.2 `trees.pck` | 325 | 325 | 0 |
+
+The pack holds `trees\精简树木\雪松\snowpinewithsnow1.spt`; the map asks for
+`Trees/精简树木/雪松/SnowPineWithSnow1.spt`. Lower-casing leaves the separator
+alone, so `contains_key` was **false for every asset in every client**, and
+`extract_for_scene` returned `tree source asset missing` before writing a single
+file. With no baked cache there was nothing for the bridge to load, so no trees
+were placed — in 1.4.2, in 1.8.4, and in every version in between.
+
+The runtime loader (`src/trees.rs`) already normalised correctly
+(`normalise_tree_name`, `\` → `/` then lower-case); only the extraction path did
+not. The rule now lives once, in `scene::normalise_tree_name`, and both readers
+call it. Three tests in `src/scene.rs` pin it, using the real spellings from the
+two shipped packs rather than names chosen to suit the code, and one of them
+asserts the *old* lower-case-only behaviour does **not** match — so the bug
+cannot come back silently.
+
+`a91` and `a64` genuinely have zero trees: both declare zero tree types and zero
+placements in their own ECWLD, which is authored content, not a read failure
+(see *Instance maps*).
 
 ## Water
 
@@ -392,3 +491,126 @@ carry at least one of each id:
 Element 123 is the most common type in the whole archive, in more than half the
 roots — a pack where it did not draw would look almost empty. Element 170 is the
 only id the player counts without performing it (`Findings/Unsupported-client-paths.md`).
+
+## Item status (18 November 2026)
+
+One line per numbered item, with what settled it. "static" means the claim was
+read out of the source and traced by hand; "measured" means a number came from
+running a reader over a file. Numbers from CI log lines are marked *CI*.
+
+**1.1 — PCK trailer layouts tested from independent fixtures: done.**
+Three shipped trailers are now recorded as literal hex — `TREES_184_TRAILER`
+(280 B), `TREES_152_TRAILER` (272 B), `TREES_2016_TRAILER` (272 B) — and the tests
+assert against those bytes, not against `TRAILER_PROBES`/`REVISIONS`. The
+previous test rebuilt its fixture from the probe table, which only proved the
+table agreed with itself. *(measured: bytes extracted from the shipped packs;
+verified byte-identical to the files before being written into `src/pck.rs`.)*
+
+**1.2 — Drive byte-check of the `trees.pck` trailers: done for 1.8.4, 1.5.2 and
+2016; blocked for `litmodels.pck`.** All three trailer structures decode and are
+pinned by tests. `litmodels.pck` is **not** checked because every copy on Drive
+is 279 MB–2 GB, past the 100 MiB limit of the only file-transfer path this
+session has, and CI has no Drive access at all — see `B-33` in
+`docs/blockers.md` for the exact measurement that would settle it. *(measured:
+1.8.4 `0x00020003`/280 B/326 entries/table 26,203,745; 1.5.2 `0x00020002`/272 B/325
+entries/table 20,159,620; 2016 `0x00020002`/272 B/326 entries/table 25,430,518.)*
+
+**1.3 — Trees, answered statically: done, and it found a real defect.**
+(a) `count_trees` is **not** version-dependent — it sums
+`blocks[*].trees.len()` from one fixed block layout. (b) Every drop point is
+traced in *Every point at which trees can be dropped* above; five live in
+`trees::Trees::open` and each carries a visible reason. (c) `a91` and `a64` truly
+declare zero tree types and zero placements. (d) Verdict: **the trees did not
+spawn because `src/tree_source.rs` lower-cased `trees.pck` names without folding
+the path separator, so every lookup missed** (326/326 pack names use `\`, every
+ECWLD uses `/`). Fixed by moving the one correct rule to
+`scene::normalise_tree_name` and calling it from both readers; three tests in
+`src/scene.rs` pin it using the real spellings. *(measured: 326/326 and 325/325
+names carry backslashes; static: the lookup trace.)*
+
+**1.4 — The four rejected GFX files: named, not dropped.**
+`zero_flag` now reports the field **and the value it carried** instead of a bare
+"unsupported", so the effect is never silently lost. `SurfaceUseParentDir` is the
+one of these that shipped clients actually set — 16 elements in 8 roots, all
+skill effects — while `keyNumber` and `GridAnimationLines` appear **zero** times
+in the staged corpus; `StopEmitWhenFade` has no SDK documentation, so it is
+recorded and not guessed. No version number was added for any of them. *(measured
+from the corpus census in `Findings/World-effects-2026-11-09.md`; MOXTVersion for
+the affected roots is 33–37, unchanged.)*
+
+**2.1 — water versions: already covered.** `WATER_VERSIONS` holds both measured
+words, `0x10002000` and `0x10003000`, and refuses anything else by name. *(static,
+with the existing water harness tests.)*
+
+**2.2 — `gfx_light` keypoint count and interpolation: already covered.**
+`MAX_KEYPOINTS` is 8, and `InterpolateMode` is refused unless `0` — measured at
+11,844 of 11,844 keypoints in the staged corpus. *(measured.)*
+
+**2.3 — DDS formats: already covered.** `DXT1`/`DXT3`/`DXT5` plus raw 32-bit BGRA
+are read; `DX10`, cube and volume surfaces are refused **by name**, with a test
+asserting `DX10` is rejected rather than mis-decoded. *(static + unit test.)*
+
+**2.4 — lightmap 256×256: already covered.** Native masks are 256² with 128
+accepted; only sources at or below 256 px are upscaled, so no 256 px mask is
+resampled from a larger one. *(static.)*
+
+**2.5 — `angelica_pck` versions, single table: already covered.** The
+container's tag word is `0x56a089b7` in 1.5.2 and **zero** in 1.8.4 (measured on
+both `configs.pck`), so it is checked as part of the family rather than as one
+exact value — which is why one reader serves both. *(measured.)*
+
+**2.6 — encrypted flag: changed from "refuse on the bit" to "the table decides".**
+Measured: the 2016 client writes `0x65676e41` (`Ange`, the start of its
+description) into the field that 1.5.2 fills with a real zero `dwFlags`, on the
+**same** revision word. Refusing on bit 31 alone would therefore reject a package
+that decodes perfectly. The reader now walks the table first and names the flag,
+the revision and the bit only when the walk fails; two tests cover both halves.
+*(measured on three shipped packs; asserted by
+`a_flag_bit_does_not_refuse_a_package_whose_table_decodes` and
+`an_unreadable_table_with_bit_31_set_is_refused_as_encrypted`.)*
+
+**2.7 — grass limits: already covered.** The caps sit three orders of magnitude
+above the measured maximum (the 1.8.4 world's 244 grass types) and refuse by
+name rather than silently clamping. *(measured.)*
+
+**2.8 — count caps: already covered.** `MAX_TREE_TYPES` = `MAX_GRASS_TYPES` =
+4096 in `scene.rs`, `ENTRY_LIMIT` = 1,000,000 in `pck.rs`, each with a comment
+naming the measurement it clears. *(measured.)*
+
+**2.9 — legacy 59-type bridge on 1.8.4: done.** 1.8.4's world declares exactly
+59 tree types, so it sits **on** the boundary and is servable by the legacy path,
+where padding is a no-op. The `> 59` comparison now uses
+`LEGACY_BRIDGE_TREE_TYPES` instead of a second literal, and four tests pin the
+boundary, the refusal at 60, the padded size and the cache key. *(measured: 59
+types in the 1.8.4 world; the tests run on the Windows job, where
+`windows_setup` is compiled.)*
+
+**2.10 — audio codecs: already covered.** The codec table is built from the
+measured container tags; nothing new was added. *(static.)*
+
+**2.11 — skipped tests say so and are counted: done.** Every corpus test that
+cannot see its file prints `SKIPPED:` with the path, increments a counter, and
+now also lands in the **job summary** with a passed/skipped table. `PWE_CORPUS=require`
+turns a skip into a failure. *(static; the workflow change was checked against
+realistic `cargo test` output locally before being committed.)*
+
+**2.12 — `elements.data` family `0x3000`: already covered.** `ElementsHeader`
+splits the word into family and version, tests the family across several
+releases, and rejects a same-version word with a different family. *(static.)*
+
+**2.13 — a failed map names the map and the error: already covered.** *(static.)*
+
+**2.14 — `terrain_block` versions 2..=6: already covered.** *(static.)*
+
+**2.15 — `music.rs` precinct non-numeric refusal: already covered.** *(static.)*
+
+### What is not done, and exactly what would settle it
+
+`litmodels.pck` is the only item above that is not closed. It is **B-33**: every
+copy on Drive is larger than the 100 MiB the session can transfer, and CI has no
+Drive access. The measurement that would settle it is one line — the 280 trailer
+bytes and the declared count of 1.8.4's `litmodels.pck` — which requires either a
+staged copy in the workspace or a CI job with the file present. Until then the
+split-package reader (`B-9`) remains the claim that covers it, and that claim is
+unit-tested against a synthetic split rather than against the shipped 2.86 GB
+file.

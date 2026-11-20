@@ -137,8 +137,8 @@ fn source_tag(bytes: &[u8]) -> Option<String> {
 /// The world file writes `Trees\\Elm\\Elm.spt`; the pack may hold
 /// `trees/elm/elm.SPT`. Both separators collapse to `/` and the whole name is
 /// lower-cased, which matches what the pack reader's own lookups do.
-fn normalise_tree_name(name: &str) -> String {
-    name.replace('\\', "/").to_lowercase()
+pub(crate) fn normalise_tree_name(name: &str) -> String {
+    scene::normalise_tree_name(name)
 }
 
 /// The nearest `trees.pck` names to one that was asked for and not found.

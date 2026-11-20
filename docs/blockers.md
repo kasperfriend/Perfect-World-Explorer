@@ -2009,3 +2009,52 @@ the two are not the same gap and only one of them is a reader problem.
 
 `world_audio` is in no harness mode, which is why its key logic could be wrong
 without anything noticing — the fourth module found that way in this stretch.
+
+## B-33: `litmodels.pck`'s trailer cannot be byte-checked from here
+
+**The claim.** The 1.8.4 `litmodels.pck` is a split package: a
+`litmodels.pck` of `MAX_FILE_PACKAGE` bytes plus a `litmodels.pkx` holding the
+entry table and the trailer. The reader treats the pair as one package
+(`B-9`), and that is unit-tested against a *synthetic* split.
+
+**What is missing.** The trailer bytes and the declared entry count of the
+**shipped** file have never been read, because every copy of the archive on
+Drive is larger than this session can move:
+
+| copy (Drive id) | size | verdict |
+|---|---|---|
+| `1_Ml5cQYH2Ju0rncDDlq_btUhV0RdG4dr` | 2,147,483,392 | too large |
+| `1XblAQ5HOKBMm7uJjfQ4HamW9Kud0kcfX` | 2,147,483,392 | too large |
+| `1LExT4iTqzAmfAVe-d0b81fo9yO_C8j8D` | 2,147,483,392 | too large |
+| `1usEpBayfP7fZPOFm5JJ2WPRMVEy6UkMV` | 1,499,648,516 | too large |
+| `1QjZ7vBOnM4mnuAhGCZ1nePoNrcjoMa-I` | 924,774,372 | too large |
+| `1_T0KQIqTrJVfHe4ubAbhoBaG0TW8cdc-` | 397,425,471 | too large |
+| `1m0Liu5bG-3KrUX23tqIb4kWVsG4cdwec` | 312,873,277 | too large |
+| `1Pntczb2wvDO1VOuSRz_cQN-kndxqC315` | 279,497,820 | too large |
+
+The transfer path caps at 100 MiB, and `ci` cannot reach Drive at all: the
+workflow stages whatever sits in `google_drive/`, and a checkout has nothing
+there.
+
+**The exact measurement that would settle it.** Read the last 288 bytes of the
+`.pkx` and the four bytes at `end - 8`:
+
+1. the 280-byte trailer, and whether `guardByte0`/`guardByte1` are
+   `0xfdfdfeee`/`0xf00dbeef`;
+2. the version word at trailer `+4` (expected `0x00020003`);
+3. `dwEntryOffset` at `+264` as a `u64`, unmasked with `0xa8937462`, and whether
+   it lands at or above `MAX_FILE_PACKAGE` (which is what makes the pair
+   necessary);
+4. the entry count at `end - 8`, and whether a full walk of that many records
+   ends exactly at the trailer.
+
+**How to unblock.** Either place a `litmodels.pck`/`.pkx` pair in the workspace
+(then `tools/offline_harness.sh pck google_drive` reads it and prints all four
+numbers), or add a CI step that fetches it. Neither is available in this
+session: the first needs a file larger than the transfer limit, and the second
+needs credentials CI does not have.
+
+**Why it does not block the trees work.** `litmodels.pck` holds scenery model
+geometry, not trees. Tree geometry comes from `trees.pck`, which is checked byte
+for byte at three client versions. So the tree verdict in
+`docs/cross-version-matrix.md` stands without this.

@@ -291,6 +291,18 @@ fn refs(b: &[u8], p: &mut usize, n: usize) -> Result<Vec<Reference>, String> {
 /// which does not.
 pub const MODEL_SCALE_VERSION: u32 = 13;
 
+/// Fold one tree asset name to the form both sides of the lookup compare.
+///
+/// The `.ecwld` tree table writes `Trees/精简树木/雪松/SnowPineWithSnow1.spt` and
+/// every shipped `trees.pck` stores `trees\精简树木\雪松\snowpinewithsnow1.spt`:
+/// separators and case both differ, in every client measured (326/326 names in
+/// 1.8.4, 325/325 in 1.5.2 use backslashes). Folding `\` to `/` and lower-casing
+/// is the whole rule, and it lives here rather than in one reader because both
+/// readers — the runtime loader and the bridge's source extractor — must agree.
+pub fn normalise_tree_name(name: &str) -> String {
+    name.replace('\\', "/").to_lowercase()
+}
+
 impl Scene {
     pub fn load(path: &Path) -> Result<Self, String> {
         let b = fs::read(path).map_err(|e| e.to_string())?;
@@ -999,5 +1011,57 @@ mod tests {
         let mut p = 0;
         let path = string(&[4, 0, 0, 0, 0xd1, 0xa9, 0xb5, 0xd8], &mut p).unwrap();
         assert_eq!(path, "雪地");
+    }
+
+    /// The pack/lookup disagreement that stopped every tree from being baked.
+    ///
+    /// Measured on the shipped archives: all 326 names in 1.8.4's `trees.pck`
+    /// and all 325 in 1.5.2's use backslashes, while the `.ecwld` tree table
+    /// writes forward slashes. These are the real strings from those files,
+    /// not spellings chosen to suit the code.
+    #[test]
+    fn one_tree_has_the_same_key_in_the_pack_and_the_map() {
+        let in_pack = "trees\\精简树木\\雪松\\snowpinewithsnow1.spt";
+        let in_ecwld = "Trees/精简树木/雪松/SnowPineWithSnow1.spt";
+        assert_eq!(
+            normalise_tree_name(in_pack),
+            normalise_tree_name(in_ecwld),
+            "a tree present in the pack must be found by the name the map asks for"
+        );
+        assert_eq!(
+            normalise_tree_name("trees\\badtree.spt"),
+            normalise_tree_name("trees/badtree.spt")
+        );
+    }
+
+    /// Lower-casing alone was the defect, so pin exactly what it got wrong.
+    #[test]
+    fn lower_casing_alone_does_not_match_the_two_spellings() {
+        let in_pack = "trees\\badtree.spt";
+        let in_ecwld = "trees/badtree.spt";
+        assert_ne!(
+            in_pack.to_lowercase(),
+            in_ecwld.to_lowercase(),
+            "this is the mismatch that aborted tree preparation with \
+             \"tree source asset missing\""
+        );
+        assert_eq!(normalise_tree_name(in_pack), normalise_tree_name(in_ecwld));
+    }
+
+    /// Case differs too, and must not matter either.
+    #[test]
+    fn the_tree_lookup_ignores_case_and_both_separators() {
+        let pack = "TREES\\Elm\\ELM.SPT";
+        for asked in [
+            "trees/elm/elm.spt",
+            "Trees\\Elm\\Elm.spt",
+            "TREES/ELM/ELM.SPT",
+        ] {
+            assert_eq!(
+                normalise_tree_name(pack),
+                normalise_tree_name(asked),
+                "{asked} must find {pack}"
+            );
+        }
     }
 }

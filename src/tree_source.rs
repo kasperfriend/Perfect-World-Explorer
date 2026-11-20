@@ -60,14 +60,21 @@ pub fn extract_for_scene(
         );
     }
     let mut pkg = File::open(element.join("trees.pck")).map_err(|e| e.to_string())?;
+    // Both sides go through `scene::normalise_tree_name`, which folds `\\` to
+    // `/` as well as lower-casing. Lower-casing alone was a real defect: every
+    // shipped `trees.pck` stores backslash paths (`trees\\精简树木\\雪松\\x.spt`)
+    // while every `.ecwld` writes forward slashes (`Trees/精简树木/雪松/x.spt`),
+    // so `contains_key` was false for every asset and preparation aborted with
+    // "tree source asset missing" -- no cache, therefore no trees, in every
+    // world and every client that stores backslash names.
     let entries: HashMap<_, _> = pck::directory(&mut pkg)?
         .into_iter()
-        .map(|e| (e.name.to_lowercase(), e))
+        .map(|e| (scene::normalise_tree_name(&e.name), e))
         .collect();
     // Check all paths before creating files; never derive an output path from a client-provided name.
     for t in &scene.tree_types {
         for name in [&t.tree, &t.composite] {
-            if !entries.contains_key(&name.to_lowercase()) {
+            if !entries.contains_key(&scene::normalise_tree_name(name)) {
                 return Err(format!("tree source asset missing: {name}"));
             }
         }
@@ -85,7 +92,7 @@ pub fn extract_for_scene(
         let spt = format!("tree-{i:03}.spt");
         let dds = format!("tree-{i:03}.dds");
         for (name, dst) in [(&t.tree, &spt), (&t.composite, &dds)] {
-            let entry = &entries[&name.to_lowercase()];
+            let entry = &entries[&scene::normalise_tree_name(name)];
             let data = pck::read_entry(&mut pkg, entry)?;
             fs::write(out.join(dst), data).map_err(|e| e.to_string())?;
         }
@@ -125,3 +132,4 @@ pub fn extract_for_scene(
     );
     Ok(())
 }
+

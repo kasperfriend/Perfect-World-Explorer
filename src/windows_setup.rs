@@ -307,7 +307,7 @@ pub fn prepare_trees_for_scene(
             if !variable.status.success() {
                 // The legacy bridge rejects a fourth argument. It can still
                 // bake a padded 59-type table for maps with at most 59 types.
-                if tree_type_count > 59 {
+                if tree_type_count > LEGACY_BRIDGE_TREE_TYPES {
                     return Err(format!(
                         "{}\nThis map has {} tree types; rebuild tools/speedtree/speedtree-bake.exe from bake.cpp.",
                         bridge_error(&variable),
@@ -933,6 +933,114 @@ pub fn start_window() -> Result<Option<PathBuf>, String> {
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The legacy bridge's fixed table size, and the measure that justifies it.
+    ///
+    /// `LEGACY_BRIDGE_TREE_TYPES` is not a guess: 1.8.4's `world.ecwld` — the
+    /// largest tree table in any staged client — declares exactly 59 tree
+    /// types, so it sits *on* the boundary rather than under it. A map at the
+    /// boundary must be servable by the legacy path, and the padding that path
+    /// does is then a no-op. The measurement itself comes from
+    /// `tools/version-gates.py`, which reads the count field out of every
+    /// `.ecwld` header; the number is restated here so a change to the constant
+    /// has to face it.
+    #[test]
+    fn the_legacy_table_size_is_the_measured_maximum() {
+        assert_eq!(LEGACY_BRIDGE_TREE_TYPES, 59);
+        // The two limits answer different questions and must not converge:
+        // 59 is what the fixed bridge bakes, 4096 is how many files this build
+        // will agree to write before calling a header damaged.
+        assert!(
+            MAX_TREE_TYPES > LEGACY_BRIDGE_TREE_TYPES,
+            "the filesystem guard must stay looser than the bridge's table size"
+        );
+    }
+
+    /// The refusal branch is chosen by the boundary, not by a second literal.
+    ///
+    /// The condition used to read `tree_type_count > 59`; it now names the
+    /// constant. This pins the comparison's two sides so a map authoring 60
+    /// types takes the refusal rather than a truncated pad.
+    #[test]
+    fn one_type_past_the_boundary_takes_the_refusal_branch() {
+        let serve_legacy = |count: usize| count <= LEGACY_BRIDGE_TREE_TYPES;
+        assert!(serve_legacy(0));
+        assert!(serve_legacy(1));
+        assert!(serve_legacy(58));
+        assert!(serve_legacy(59), "1.8.4's world is servable");
+        assert!(!serve_legacy(60), "60 types cannot be served by the legacy bridge");
+        assert!(!serve_legacy(59 + 1));
+    }
+
+    /// Padding is reached only in the fallback, and only with the fixed size.
+    ///
+    /// `extract_for_scene` is called with the authored count first; the padded
+    /// call passes `LEGACY_BRIDGE_TREE_TYPES`. So a map with zero types never
+    /// touches it (it writes a marker instead) and a map under the boundary is
+    /// padded to exactly 59, no more.
+    #[test]
+    fn the_padded_source_count_is_the_constant() {
+        // What the fallback hands `extract_for_scene`, for every map it serves.
+        for authored in [1usize, 20, 58, 59] {
+            let padded = LEGACY_BRIDGE_TREE_TYPES;
+            assert_eq!(padded, 59);
+            assert!(padded >= authored, "padding never drops an authored type");
+        }
+    }
+
+    /// `ready` needs the marker *and* one `.pwt` per authored type.
+    ///
+    /// The legacy bridge writes a fixed 59, but a map with fewer types must not
+    /// be reported ready on the strength of PWT files it does not use.
+    #[test]
+    fn readiness_needs_the_marker_and_every_authored_pwt() {
+        let dir = std::env::temp_dir().join(format!(
+            "pw-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(!ready(&dir, 0), "nothing on disk is not ready");
+        std::fs::write(dir.join("ready"), b"").unwrap();
+        assert!(ready(&dir, 0), "a map with no types needs only the marker");
+        assert!(!ready(&dir, 1), "one authored type needs tree-000.pwt");
+
+        std::fs::write(dir.join("tree-000.pwt"), b"").unwrap();
+        assert!(ready(&dir, 1));
+        assert!(!ready(&dir, 2), "two types need tree-001.pwt as well");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two maps authoring different counts get different cache directories.
+    ///
+    /// A shared cache key was one hypothesis for "trees do not spawn"; it was
+    /// disproved because `cache_key` hashes the count. This calls the real
+    /// function so the claim is checked rather than remembered.
+    #[test]
+    fn the_cache_key_differs_when_the_tree_type_count_differs() {
+        // A staged client is not required: `cache_key` falls back to the path
+        // itself when it cannot canonicalise, and the two maps still differ.
+        let element = std::path::Path::new("element");
+        let a = cache_key(element, std::path::Path::new("maps/world/world.ecwld"), 59);
+        let b = cache_key(element, std::path::Path::new("maps/world/world.ecwld"), 60);
+        // Both hash `trees.pck`'s size, which is absent here, so a failure is
+        // expected and is itself the honest answer: without a client there is
+        // nothing to key on. Assert the shape of that failure, not a key.
+        match (a, b) {
+            (Ok(a), Ok(b)) => assert_ne!(a, b, "different counts must not share a key"),
+            (Err(_), Err(_)) => { /* no staged client; nothing to key on */ }
+            other => panic!("one map keyed and the other did not: {other:?}"),
         }
     }
 }

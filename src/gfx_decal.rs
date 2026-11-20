@@ -121,9 +121,24 @@ fn optional_float(fields: &[(String, String)], key: &str, default: f32) -> Resul
     one(fields, key)?.map_or(Ok(default), |value| float(key, value))
 }
 
+/// Refuse a flag field this reader honours only at zero -- and say which value.
+///
+/// The effect these fields select is real, so dropping them silently would draw
+/// the decal wrongly without saying so. Each name is refused with the value the
+/// file actually carries, so a pack that sets one reports *what* it sets rather
+/// than a bare "unsupported". Measured in the staged `.gfx` corpus:
+/// `SurfaceUseParentDir` is set on 16 elements in 8 roots (all skill effects,
+/// none a world placement), while `keyNumber` and `GridAnimationLines` appear
+/// **zero** times anywhere -- so a file reaching this branch is new information
+/// and its value is the thing worth having.
 fn zero_flag(fields: &[(String, String)], key: &str) -> Result<(), String> {
-    if one(fields, key)?.is_some_and(|value| value.trim() != "0") {
-        return Err(format!("unsupported static 3D decal {key}"));
+    if let Some(value) = one(fields, key)? {
+        if value.trim() != "0" {
+            return Err(format!(
+                "unsupported static 3D decal: {key} is {value:?}, and this build \
+                 implements only the zero case (the non-zero effect is not drawn)"
+            ));
+        }
     }
     Ok(())
 }
@@ -660,5 +675,42 @@ mod tests {
             }
             assert!(!root.quads(Mat4::IDENTITY, 1., 1.).unwrap().is_empty());
         }
+    }
+    /// A refused flag names the field *and* the value it carried.
+    ///
+    /// `zero_flag` implements only the zero case, and the effect the non-zero
+    /// case selects is real, so the refusal must not be a bare "unsupported":
+    /// it has to say which field and what it held. `SurfaceUseParentDir` is the
+    /// one of these that shipped clients actually set (16 elements in 8 roots,
+    /// all skill effects); `keyNumber` and `GridAnimationLines` appear zero
+    /// times in the staged corpus, so a file that reaches this branch is new
+    /// information and its value is the only useful thing to report.
+    #[test]
+    fn a_refused_flag_names_the_field_and_its_value() {
+        for (field, value) in [
+            ("SurfaceUseParentDir", "1"),
+            ("keyNumber", "3"),
+            ("StopEmitWhenFade", "1"),
+        ] {
+            let fields = vec![(field.to_string(), value.to_string())];
+            let error = zero_flag(&fields, field).unwrap_err();
+            assert!(
+                error.contains(field),
+                "the refusal must name {field}: {error}"
+            );
+            assert!(
+                error.contains(value),
+                "the refusal must carry the value {value:?}: {error}"
+            );
+            assert!(
+                error.contains("zero"),
+                "and say that only the zero case is implemented: {error}"
+            );
+        }
+
+        // Zero is accepted silently, and an absent field is not a field.
+        let zero = vec![("SurfaceUseParentDir".to_string(), "0".to_string())];
+        assert!(zero_flag(&zero, "SurfaceUseParentDir").is_ok());
+        assert!(zero_flag(&[], "keyNumber").is_ok());
     }
 }

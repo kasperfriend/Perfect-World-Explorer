@@ -668,20 +668,32 @@ fn read_directory(
             Some(at) => u32le(&header, at)?,
             None => 0,
         };
-        if flags & ENCRYPTED_FLAG != 0 {
-            // Name the revision and the flag word: "unsupported" without the
-            // revision leaves a reader unable to tell an enciphered package
-            // from a truncated one, and the version is the thing that would
-            // have to be supported next.
-            return Err(format!(
-                "{ENCRYPTED_REFUSAL}: revision {:08x} sets dwFlags {flags:08x} \
-                 (bit 31); this build reads the directory only in the clear",
-                rev.version
-            ));
-        }
+        // The table decides, not the flag word. A candidate whose table walks
+        // cleanly to `count` is a readable package whatever sits at `+12`, and
+        // two shipped files prove the word there cannot be trusted on its own:
+        // the 2016 client writes `0x65676e41` (`Ange`, the start of its
+        // description) into the field that 1.5.2 fills with a real zero
+        // `dwFlags`, on the same revision word. Refusing on the bit alone would
+        // reject a package that decodes perfectly the first time a description
+        // began with a byte at or above `0x80`.
         match entries_from_trailer(files, layout, end, base, part_end, count, &rev, &header) {
             Ok(entries) => return Ok(entries),
-            Err(e) => refusals.push(format!("{:08x}: {e}", rev.version)),
+            Err(e) => {
+                // Now the flag word earns its keep: the table did not decode,
+                // and bit 31 says why. Name the revision and the word --
+                // "unsupported" alone cannot tell an enciphered package from a
+                // truncated one, and the revision is what would have to be
+                // supported next.
+                if flags & ENCRYPTED_FLAG != 0 {
+                    return Err(format!(
+                        "{ENCRYPTED_REFUSAL}: revision {:08x} sets dwFlags {flags:08x} \
+                         (bit 31) and its entry table does not decode in the clear; \
+                         this build reads the directory only in the clear",
+                        rev.version
+                    ));
+                }
+                refusals.push(format!("{:08x}: {e}", rev.version));
+            }
         }
     }
     Err(refusals.join("; "))
@@ -1492,44 +1504,114 @@ mod tests {
     /// the shipped file: 326 entries, table at 26,203,745, 23,911 bytes.
     ///
     /// This is the case that proves the version word cannot select a layout.
+    /// The 280 trailer bytes of the shipped 1.8.4 `trees.pck`, verbatim.
+    ///
+    /// Read out of the client's own file, not rebuilt from a table in this
+    /// module: a fixture assembled from `TRAILER_PROBES` would agree with
+    /// whatever the table says, which is exactly what a test must not do.
+    /// Offsets: 0 guardByte0, 4 dwVersion, 8 dwEntryOffset (a DWORD here),
+    /// 12 the glued high word, 16 szDescription, 272 guardByte1, 276 UNKNOWN.
+    const TREES_184_TRAILER: [&str; 18] = [
+        "eefefdfd0300020003a21ca9ffffffff",
+        "416e6765416e67656c6963612046696c",
+        "65205061636b6167652c205065726665",
+        "637420576f726c6420436f2e204c7464",
+        "2e20323030327e323030382e20416c6c",
+        "20526967687473205265736572766564",
+        "2e200000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "efbe0df0c0bf7712",
+    ];
+
+    /// Decode the hex literals above into the 280 bytes they spell.
+    fn shipped_trees_trailer() -> Vec<u8> {
+        let mut out = Vec::with_capacity(280);
+        for line in TREES_184_TRAILER {
+            let mut hi = None;
+            for c in line.chars() {
+                let d = c.to_digit(16).expect("hex digit") as u8;
+                match hi {
+                    None => hi = Some(d),
+                    Some(h) => {
+                        out.push((h << 4) | d);
+                        hi = None;
+                    }
+                }
+            }
+            assert!(hi.is_none(), "odd number of hex digits in {line}");
+        }
+        assert_eq!(out.len(), 280, "the 1.8.4 trailer struct");
+        out
+    }
+
+    /// The NUL-terminated bytes at `p`, which is how `szDescription` is spelled.
+    fn cstr(b: &[u8], p: usize) -> &[u8] {
+        let rest = &b[p..];
+        let end = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// 1.8.4 writes `0x00020003` with two different trailers, and the narrow
+    /// one has no `dwFlags` field at all.
+    ///
+    /// `trees.pck` from that client declares `0x00020003` and puts a 32-bit
+    /// `dwEntryOffset` at `+8`, `0xffffffff` at `+12`, and `szDescription` from
+    /// `+16`, with `guardByte1` still at `+272` and the struct still 280 bytes.
+    /// The wide reading looks at `+8` as a u64, so its high half becomes the
+    /// `0xffffffff` and the offset lands nowhere; the flags reading at `+16`
+    /// finds the first four bytes of "Angelica File Package" (`0x65676e41`,
+    /// "Ange"), which would be reported as an encrypted package.
+    ///
+    /// Every expectation below is read against the shipped bytes in
+    /// [`TREES_184_TRAILER`], so the offsets are checked against the client
+    /// rather than against the probe table that is meant to describe it.
     #[test]
-    fn a_narrow_trailer_inside_the_new_version_is_found_by_probing() {
-        let narrow = TRAILER_PROBES[0];
-        assert_eq!(narrow.header, 280, "the struct is still the wide one");
-        assert_eq!(narrow.table_offset_width, 4, "but the field is a DWORD");
+    fn the_shipped_narrow_trailer_is_read_by_a_dword_offset_and_has_no_flags() {
+        let header = shipped_trees_trailer();
+
+        // The shipped bytes say what the file is, before any table is consulted.
+        assert_eq!(u32le(&header, 0).unwrap(), GUARD_0);
+        assert_eq!(u32le(&header, 4).unwrap(), 0x0002_0003);
+        assert_eq!(u32le(&header, 272).unwrap(), GUARD_1);
+        assert_eq!(&header[16..20], b"Ange", "the description starts at +16");
+        // The shipped description is the Angelica signature with a four-byte
+        // `Ange` prefix left in front of it by the packer, trailing space and
+        // all. Recorded as the file really is; nothing in the reader depends on
+        // this text, and the entry table below is what proves the layout.
         assert_eq!(
-            narrow.flags_at, None,
-            "there is no dwFlags field, so there is no offset to read one at"
+            cstr(&header, 16),
+            b"AngeAngelica File Package, Perfect World Co. Ltd. 2002~2008. All Rights Reserved. ",
+            "the shipped 1.8.4 description, verbatim"
         );
-        assert_eq!(narrow.description_at, 16, "the description starts early");
 
-        // The version word promises the wide trailer, so the narrow one has to
-        // come from the probe list -- and the probe must still be reachable for
-        // that version.
-        let candidates = trailer_candidates(0x0002_0003);
-        assert_eq!(candidates.len(), 2, "wide first, narrow second");
-        assert_eq!(candidates[0].table_offset_width, 8);
-        assert_eq!(candidates[1].table_offset_width, 4);
-
-        // Read against the shipped numbers: the trailer's own bytes decide.
+        // The narrow layout is the one that finds the real table.
+        let narrow = TRAILER_PROBES[0];
         let table_at = 26_203_745u64;
-        let end = 26_227_944u64;
-        let mut header = vec![0u8; narrow.header];
-        header[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
-        header[4..8].copy_from_slice(&0x0002_0003u32.to_le_bytes());
-        header[8..12].copy_from_slice(&((table_at as u32) ^ MASK).to_le_bytes());
-        header[12..16].copy_from_slice(&0xffffffffu32.to_le_bytes());
-        let tag = b"Angelica File Package, Perfect World Co. Ltd. 2002~2008.";
-        header[16..16 + tag.len()].copy_from_slice(tag);
-        header[272..276].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
-
-        // The narrow reading locates the table exactly.
+        assert_eq!(
+            u32le(&header, 8).unwrap() ^ MASK,
+            table_at as u32,
+            "the shipped DWORD at +8 masks to the real table offset"
+        );
         assert_eq!(table_offset(&header, &narrow).unwrap(), table_at);
-        let trailer_start = end - (narrow.header + 8) as u64;
-        assert_eq!(trailer_start - table_at, 23_911, "the table's real span");
+        assert_eq!(narrow.header, 280);
+        assert_eq!(narrow.table_offset_width, 4);
+        assert_eq!(narrow.flags_at, None);
+        assert_eq!(narrow.description_at, 16);
 
-        // The wide reading of the same bytes is the one that fails: its u64
-        // half-words are the offset and the `0xffffffff` behind it.
+        // The table's real span, from the shipped file's own size.
+        let end = 26_227_944u64;
+        assert_eq!(end - (narrow.header + 8) as u64 - table_at, 23_911);
+
+        // The wide reading of these same bytes is the one that fails.
         let wide = REVISIONS
             .iter()
             .find(|r| r.version == 0x0002_0003)
@@ -1537,19 +1619,260 @@ mod tests {
             .unwrap();
         let wide_pos = table_offset(&header, &wide).unwrap();
         assert_ne!(wide_pos, table_at);
+        assert!(wide_pos > end, "the wide reading names a position past EOF");
+
+        // The byte the wide reading calls `dwFlags` is the description's first
+        // four characters, which is why a flags check there refuses a package
+        // that decodes perfectly.
+        assert_eq!(u32le(&header, wide.flags_at.unwrap()).unwrap(), 0x6567_6e41);
+        // That word is the description's opening `Ange`, and the wide layout's
+        // own description offset (+20) lands on the *next* `Ange` -- the tag's
+        // real first word -- which is the clearest proof that a stray four-byte
+        // prefix, not a flag word, sits at +16 of this file.
+        assert_eq!(&header[wide.flags_at.unwrap()..][..4], b"Ange");
+        assert_eq!(
+            cstr(&header, wide.description_at),
+            b"Angelica File Package, Perfect World Co. Ltd. 2002~2008. All Rights Reserved. ",
+            "the bytes after the stray prefix are the real signature"
+        );
+    }
+
+    /// The narrow trailer's `dwEntryOffset` must never be read as 64 bits.
+    ///
+    /// A u64 read at `+8` of the shipped bytes is `0xffffffff_a91ca203`: the
+    /// real table offset with `0xffffffff` glued above it. That number is
+    /// 18,446,744,071,187,967,491 -- larger than any file -- so if a reader ever
+    /// widens the field it seeks to a place that cannot exist. This test states
+    /// the glued word explicitly instead of only asserting "not equal".
+    #[test]
+    fn the_narrow_entry_offset_is_never_read_with_a_glued_high_word() {
+        let header = shipped_trees_trailer();
+
+        let narrow_u32 = u32le(&header, 8).unwrap();
+        let wide_u64 = u64le(&header, 8).unwrap();
+
+        // What each reading produces.
+        assert_eq!(narrow_u32 ^ MASK, 26_203_745);
+        assert_eq!(wide_u64, 0xffff_ffff_a91c_a203);
+        assert_eq!(
+            wide_u64 >> 32,
+            0xffff_ffff,
+            "the high word is the glued 0xffffffff, not part of an offset"
+        );
+        assert_eq!(wide_u64 >> 32, u32le(&header, 12).unwrap() as u64);
+
+        // The narrow reading is the only one inside the shipped file.
+        let file_len = 26_227_944u64;
         assert!(
-            wide_pos > end,
-            "the wide reading names a position past the file"
+            (narrow_u32 ^ MASK) as u64 + 23_911 <= file_len,
+            "the DWORD reading lands inside the file"
+        );
+        assert!(
+            wide_u64 > file_len,
+            "the u64 reading is {} > the file's {file_len} bytes",
+            wide_u64
         );
 
-        // And the byte the widest reading calls dwFlags is really the
-        // description's first four characters, which is why a flags check
-        // there would refuse a package that decodes perfectly.
-        assert_eq!(u32le(&header, wide.flags_at.unwrap()).unwrap(), 0x6567_6e41);
+        // And it must be the probe, not the version word, that picks the DWORD.
+        let candidates = trailer_candidates(0x0002_0003);
+        assert_eq!(candidates.len(), 2, "wide first, narrow second");
+        assert_eq!(candidates[0].table_offset_width, 8);
+        assert_eq!(candidates[1].table_offset_width, 4);
+        assert_eq!(table_offset(&header, &candidates[1]).unwrap(), 26_203_745);
+    }
+
+    /// The 272-byte trailer of the shipped 1.5.2 `trees.pck`, verbatim.
+    ///
+    /// Its description sits at `+16`, exactly where the narrow 1.8.4 trailer
+    /// keeps it, and it carries a genuine `dwFlags` at `+12` holding zero. So
+    /// `szDescription` at `+16` cannot be what tells the two layouts apart --
+    /// the missing flags field and the smaller struct do.
+    const TREES_152_TRAILER: [&str; 17] = [
+        "eefefdfd02000200e6e8a0a900000000",
+        "416e67656c6963612046696c65205061",
+        "636b6167652c20506572666563742057",
+        "6f726c642e0000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "000000000000000000000000efbe0df0",
+    ];
+
+    fn shipped_152_trailer() -> Vec<u8> {
+        let mut out = Vec::with_capacity(272);
+        for line in TREES_152_TRAILER {
+            let mut hi = None;
+            for c in line.chars() {
+                let d = c.to_digit(16).expect("hex digit") as u8;
+                match hi {
+                    None => hi = Some(d),
+                    Some(h) => {
+                        out.push((h << 4) | d);
+                        hi = None;
+                    }
+                }
+            }
+        }
+        assert_eq!(out.len(), 272, "the 1.5.2 trailer struct");
+        out
+    }
+
+    /// The other shipped trailer, read the same way: from literal bytes.
+    ///
+    /// This one keeps the 272-byte struct, carries a real `dwFlags` at `+12`
+    /// that is zero, and still puts `szDescription` at `+16`. So neither the
+    /// tag position nor the version word separates the layouts; only reading a
+    /// candidate and validating it against the entry table does.
+    #[test]
+    fn the_shipped_152_trailer_keeps_its_flags_and_shares_the_tag_offset() {
+        let header = shipped_152_trailer();
+
+        // What the shipped bytes say, before any table is consulted.
+        assert_eq!(u32le(&header, 0).unwrap(), GUARD_0);
+        assert_eq!(u32le(&header, 4).unwrap(), 0x0002_0002);
         assert_eq!(
-            &header[wide.description_at..wide.description_at + 4],
-            b"lica"
+            u32le(&header, 12).unwrap(),
+            0,
+            "1.5.2 really does have a zero dwFlags here"
         );
+        assert_eq!(&header[16..20], b"Ange");
+        // This client's signature is the shorter `Angelica File Package,
+        // Perfect World.` -- no `Ange` prefix and no `Ltd.` tail, unlike
+        // 1.8.4's. Two clients, two strings, one offset.
+        assert_eq!(
+            cstr(&header, 16),
+            b"Angelica File Package, Perfect World.",
+            "the shipped 1.5.2 description, verbatim"
+        );
+        assert_eq!(
+            u32le(&header, 268).unwrap(),
+            GUARD_1,
+            "the 272-byte struct keeps guardByte1 at +268, not +272"
+        );
+
+        // Its own revision locates the table.
+        let rev_152 = REVISIONS
+            .iter()
+            .find(|r| r.version == 0x0002_0002)
+            .copied()
+            .unwrap();
+        let table_at = 20_159_620u64;
+        assert_eq!(
+            u32le(&header, 8).unwrap() ^ MASK,
+            table_at as u32,
+            "the shipped DWORD at +8 masks to this file's table offset"
+        );
+        assert_eq!(table_offset(&header, &rev_152).unwrap(), table_at);
+        assert_eq!(rev_152.header, 272);
+        assert_eq!(rev_152.guard_byte1, 268);
+        assert_eq!(rev_152.table_offset_width, 4);
+
+        // Same description offset as the narrow 1.8.4 trailer, different struct
+        // size -- so the two are told apart by the struct, not by the tag.
+        assert_eq!(rev_152.description_at, TRAILER_PROBES[0].description_at);
+        assert_ne!(rev_152.header, TRAILER_PROBES[0].header);
+        assert_eq!(rev_152.flags_at, Some(12));
+        assert_eq!(TRAILER_PROBES[0].flags_at, None);
+    }
+
+    /// The 272-byte trailer of the shipped 2016-client `trees.pck`, verbatim.
+    ///
+    /// The **same version word** as 1.5.2's (`0x00020002`) and the same struct
+    /// size, but `+12` holds `0x65676e41` -- the ASCII `Ange` -- where 1.5.2
+    /// holds a real zero `dwFlags`. So even inside one revision, the word at
+    /// `+12` cannot be read as a flag field: on this file `& ENCRYPTED_FLAG`
+    /// happens to be clear, but the *value* is text, not flags, and on any file
+    /// whose description began with a byte above `0x7f` it would not be.
+    const TREES_2016_TRAILER: [&str; 17] = [
+        "eefefdfd02000200947d17a9416e6765",
+        "416e67656c6963612046696c65205061",
+        "636b6167652c20506572666563742057",
+        "6f726c6420436f2e204c74642e203230",
+        "30327e323030382e20416c6c20526967",
+        "6874732052657365727665642e200000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "00000000000000000000000000000000",
+        "000000000000000000000000efbe0df0",
+    ];
+
+    fn shipped_2016_trailer() -> Vec<u8> {
+        let mut out = Vec::with_capacity(272);
+        for line in TREES_2016_TRAILER {
+            let mut hi = None;
+            for c in line.chars() {
+                let d = c.to_digit(16).expect("hex digit") as u8;
+                match hi {
+                    None => hi = Some(d),
+                    Some(h) => {
+                        out.push((h << 4) | d);
+                        hi = None;
+                    }
+                }
+            }
+        }
+        assert_eq!(out.len(), 272, "the 2016 trailer struct");
+        out
+    }
+
+    /// One revision word, two meanings for the word at `+12`.
+    ///
+    /// Both files declare `0x00020002` and carry a 272-byte trailer, but 1.5.2
+    /// wrote a zero flags field there while the 2016 client wrote the first
+    /// four bytes of its description. The reader must therefore not treat `+12`
+    /// as flags for every `0x00020002` file; it reads the field and then has to
+    /// decide, which is why a value that is not a plausible flag word is
+    /// reported rather than acted on.
+    #[test]
+    fn the_same_revision_does_not_always_carry_a_flags_word() {
+        let y2016 = shipped_2016_trailer();
+        let y152 = shipped_152_trailer();
+
+        // Identical version word and struct size.
+        assert_eq!(u32le(&y2016, 4).unwrap(), 0x0002_0002);
+        assert_eq!(u32le(&y152, 4).unwrap(), 0x0002_0002);
+        assert_eq!(y2016.len(), y152.len());
+
+        // The word at +12 means different things.
+        assert_eq!(u32le(&y152, 12).unwrap(), 0, "1.5.2 wrote real flags");
+        assert_eq!(
+            u32le(&y2016, 12).unwrap(),
+            0x6567_6e41,
+            "2016 wrote the ASCII 'Ange' of its description here"
+        );
+        assert_eq!(&y2016[12..16], b"Ange");
+
+        // Both still decode: the table offset and both guards agree.
+        let rev = REVISIONS
+            .iter()
+            .find(|r| r.version == 0x0002_0002)
+            .copied()
+            .unwrap();
+        assert_eq!(table_offset(&y2016, &rev).unwrap(), 25_430_518);
+        assert_eq!(u32le(&y2016, 0).unwrap(), GUARD_0);
+        assert_eq!(u32le(&y2016, 268).unwrap(), GUARD_1);
+        assert_eq!(u32le(&y152, 268).unwrap(), GUARD_1);
+
+        // And the 2016 word, read as flags, is not an encrypted package --
+        // but the next 2016-class file to put a high byte there would report
+        // otherwise, which is exactly the trap this test names.
+        assert_eq!(u32le(&y2016, 12).unwrap() & ENCRYPTED_FLAG, 0);
     }
 
     /// 1.8.4's `litmodels` names its entry table with the full 64-bit
@@ -1904,6 +2227,69 @@ mod tests {
         let total = bytes.len() as u32;
         bytes[4..8].copy_from_slice(&total.to_le_bytes());
         bytes
+    }
+
+    /// A set bit 31 must not by itself refuse a package whose table reads.
+    ///
+    /// The 2016 client puts the ASCII `Ange` (`0x65676e41`) where 1.5.2 puts a
+    /// zero `dwFlags`, on the same revision word, so `+12` is not reliably a
+    /// flag field. The guard is therefore the entry table: a package that walks
+    /// to `count` is readable even if the word at `+12` has bit 31 set. This
+    /// builds such a package and requires the reader to open it.
+    #[test]
+    fn a_flag_bit_does_not_refuse_a_package_whose_table_decodes() {
+        for rev in [0x0002_0002u32, 0x0002_0003] {
+            let mut bytes = package(rev, &[("readable.bin", b"payload")], false);
+            let header_size = if rev == 0x0002_0003 { 280 } else { 272 };
+            let header_at = bytes.len() - header_size - 8;
+            let flags_at = if header_size == 280 { 16 } else { 12 };
+            bytes[header_at + flags_at..header_at + flags_at + 4]
+                .copy_from_slice(&ENCRYPTED_FLAG.to_le_bytes());
+
+            let path = write_temp(&bytes, "flag-but-readable");
+            let mut file = std::fs::File::open(&path).unwrap();
+            let opened = directory(&mut file);
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+            let entries = opened.unwrap_or_else(|e| {
+                panic!("revision {rev:08x} with bit 31 set must still open: {e}")
+            });
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name, "readable.bin");
+        }
+    }
+
+    /// When the table does *not* decode and bit 31 is set, say so by name.
+    ///
+    /// This is the half of the rule that earns the refusal: an enciphered
+    /// package's directory genuinely cannot be walked, and calling that
+    /// "corrupt" would report a shipped pack as broken.
+    #[test]
+    fn an_unreadable_table_with_bit_31_set_is_refused_as_encrypted() {
+        let mut bytes = package(0x0002_0002, &[("secret.bin", b"payload")], false);
+        let header_at = bytes.len() - 272 - 8;
+        bytes[header_at + 12..header_at + 16].copy_from_slice(&ENCRYPTED_FLAG.to_le_bytes());
+        // Break the table offset so the walk cannot succeed.
+        bytes[header_at + 8..header_at + 12]
+            .copy_from_slice(&(0x0fff_ffffu32 ^ MASK).to_le_bytes());
+
+        let path = write_temp(&bytes, "flag-unreadable");
+        let mut file = std::fs::File::open(&path).unwrap();
+        let error = directory(&mut file).unwrap_err();
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            is_encrypted_refusal(&error),
+            "expected the named encrypted refusal, got {error:?}"
+        );
+        assert!(
+            error.contains("80000000"),
+            "the message must name the flag word: {error}"
+        );
+        assert!(
+            error.contains("bit 31"),
+            "and the bit, so a reader knows what to support: {error}"
+        );
     }
 
     fn write_temp(bytes: &[u8], tag: &str) -> std::path::PathBuf {
