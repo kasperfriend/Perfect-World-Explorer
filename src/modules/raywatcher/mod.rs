@@ -279,7 +279,6 @@ impl Raywatcher {
         status
     }
 
-
     /// The module's settings tab, drawn in the Modules page beside Walker and
     /// Populator. It edits `self.settings` in place and reports what the last
     /// frame actually did, so a provider that silently fell back is visible
@@ -340,18 +339,12 @@ impl Raywatcher {
         ui.separator();
         ui.heading("Quality");
         ui.add(
-            egui::Slider::new(
-                &mut settings.bounces,
-                BOUNCES_RANGE.0..=BOUNCES_RANGE.1,
-            )
-            .text("light bounces"),
+            egui::Slider::new(&mut settings.bounces, BOUNCES_RANGE.0..=BOUNCES_RANGE.1)
+                .text("light bounces"),
         );
         ui.add(
-            egui::Slider::new(
-                &mut settings.samples,
-                SAMPLES_RANGE.0..=SAMPLES_RANGE.1,
-            )
-            .text("rays per pixel"),
+            egui::Slider::new(&mut settings.samples, SAMPLES_RANGE.0..=SAMPLES_RANGE.1)
+                .text("rays per pixel"),
         );
         ui.add(
             egui::Slider::new(
@@ -392,7 +385,10 @@ impl Raywatcher {
                 let available = self.availability.get(provider);
                 let response = ui.add_enabled(
                     available || provider == RayReconstruction::Off,
-                    egui::SelectableLabel::new(settings.reconstruction == provider, provider.label()),
+                    egui::SelectableLabel::new(
+                        settings.reconstruction == provider,
+                        provider.label(),
+                    ),
                 );
                 if response.clicked() {
                     settings.reconstruction = provider;
@@ -410,8 +406,16 @@ impl Raywatcher {
             egui::RichText::new(format!(
                 "SDK folder: {}. DLLs present: DLSS RR {}, FSR RR {}.",
                 self.sdk_dir.display(),
-                if self.availability.dlss_rr { "yes" } else { "no" },
-                if self.availability.fsr_rr { "yes" } else { "no" },
+                if self.availability.dlss_rr {
+                    "yes"
+                } else {
+                    "no"
+                },
+                if self.availability.fsr_rr {
+                    "yes"
+                } else {
+                    "no"
+                },
             ))
             .small()
             .weak(),
@@ -422,7 +426,11 @@ impl Raywatcher {
         ui.separator();
         let status = self.last.clone();
         ui.label(egui::RichText::new(format!("Last frame: {}", status.summary)).strong());
-        ui.label(egui::RichText::new(status.overrides.summary()).small().weak());
+        ui.label(
+            egui::RichText::new(status.overrides.summary())
+                .small()
+                .weak(),
+        );
         if let Some(note) = status.note {
             ui.colored_label(egui::Color32::YELLOW, note);
         }

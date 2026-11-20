@@ -82,7 +82,11 @@ impl TransportConfig {
             ambient_strength: ambient_strength.max(0.),
             bounce_strength: bounce_strength.max(0.),
             reflection_roughness_cutoff: reflection_roughness_cutoff.clamp(0., 1.),
-            bias: if bias.is_finite() && bias > 0. { bias } else { 2e-3 },
+            bias: if bias.is_finite() && bias > 0. {
+                bias
+            } else {
+                2e-3
+            },
         }
     }
 
@@ -137,8 +141,7 @@ impl TransportConfig {
         let incident = reflect(view, normal);
         let sharpness = 1. - roughness;
         let direction = (normal * (1. - sharpness) + incident * sharpness).normalize_or_zero();
-        let albedo_mean =
-            (material.albedo[0] + material.albedo[1] + material.albedo[2]) / 3.;
+        let albedo_mean = (material.albedo[0] + material.albedo[1] + material.albedo[2]) / 3.;
         let f0 = 0.04 * (1. - metalness) + albedo_mean * metalness;
         let cos = normal.dot(incident).abs().clamp(0., 1.);
         let fresnel = f0 + (1. - f0) * (1. - cos).powi(5);
@@ -220,7 +223,8 @@ pub fn trace(
         let environment = params.lighting.environment();
         return PixelSample::sky(environment, far);
     };
-    let seed = pixel.1.wrapping_mul(params.grid.0.max(1)) ^ pixel.0 ^ params.frame.wrapping_mul(977);
+    let seed =
+        pixel.1.wrapping_mul(params.grid.0.max(1)) ^ pixel.0 ^ params.frame.wrapping_mul(977);
     let mut colour = shade_hit(scene, params, config, sampler, &hit, direction, seed);
     // The primary ray's own fog: a hit at distance `d` is seen through
     // `exp(-d * density)` of air, exactly as the raster path's per-material fog
@@ -354,8 +358,7 @@ fn shade_hit(
             if direction.length_squared() < 0.5 {
                 break;
             }
-            let Some(next) =
-                scene.closest_hit(origin, direction, config.bias, params.far.max(1.))
+            let Some(next) = scene.closest_hit(origin, direction, config.bias, params.far.max(1.))
             else {
                 indirect += throughput * lighting.environment();
                 break;
@@ -457,11 +460,7 @@ fn material_of(scene: &SceneGeometry, triangle: u32) -> RayMaterial {
         .get(triangle as usize)
         .map(|tri| tri.material() as usize)
         .unwrap_or(0);
-    scene
-        .materials()
-        .get(index)
-        .copied()
-        .unwrap_or_default()
+    scene.materials().get(index).copied().unwrap_or_default()
 }
 
 fn point_of(scene: &SceneGeometry, hit: &Hit) -> Vec3 {
@@ -496,9 +495,9 @@ fn hash01(seed: u32, salt: u32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::bvh::RayTriangle;
     use super::super::frame::{FrameParams, Sun};
+    use super::*;
 
     fn plane_scene() -> SceneGeometry {
         // A 200x200 ground plane at y = 0, plus an 8-unit cube whose base sits
@@ -777,11 +776,7 @@ mod tests {
         );
         assert!(sample.sky);
         assert_eq!(sample.visibility, 1.);
-        assert!(
-            sample.colour.max_element() > 0.1,
-            "{:?}",
-            sample.colour
-        );
+        assert!(sample.colour.max_element() > 0.1, "{:?}", sample.colour);
     }
 
     #[test]
@@ -894,9 +889,30 @@ mod tests {
         let params = params((64, 64));
         let config = TransportConfig::default();
         let pixel = (2u32, 40u32);
-        let direct = trace(&scene, &params, &config, Sampler::new(4, 0), pixel, (0., 0.));
-        let one = trace(&scene, &params, &config, Sampler::new(4, 1), pixel, (0., 0.));
-        let two = trace(&scene, &params, &config, Sampler::new(4, 2), pixel, (0., 0.));
+        let direct = trace(
+            &scene,
+            &params,
+            &config,
+            Sampler::new(4, 0),
+            pixel,
+            (0., 0.),
+        );
+        let one = trace(
+            &scene,
+            &params,
+            &config,
+            Sampler::new(4, 1),
+            pixel,
+            (0., 0.),
+        );
+        let two = trace(
+            &scene,
+            &params,
+            &config,
+            Sampler::new(4, 2),
+            pixel,
+            (0., 0.),
+        );
         assert!(one.colour.x >= direct.colour.x, "{one:?} vs {direct:?}");
         assert!(two.colour.x >= one.colour.x, "{two:?} vs {one:?}");
         // Without bounces the indirect term is exactly absent, not merely small.

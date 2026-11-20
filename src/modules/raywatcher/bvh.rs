@@ -369,7 +369,6 @@ impl SceneGeometry {
         &self.order
     }
 
-
     /// Traverse one ray. This is the reference implementation the compute
     /// shader mirrors signature for signature.
     ///

@@ -3717,7 +3717,10 @@ impl Renderer {
                 module.reset_history();
             }
         }
-        let plan = self.modules.raywatcher().plan(render_extent, !reset_history);
+        let plan = self
+            .modules
+            .raywatcher()
+            .plan(render_extent, !reset_history);
         if !plan.trace {
             // Holding the GPU state would keep a BVH and a dozen targets alive
             // for a module the user turned off.
@@ -3896,7 +3899,10 @@ impl Renderer {
         let Some(gpu) = self.raywatcher_gpu.as_ref() else {
             return;
         };
-        let (w, h) = (extent.0.min(gpu.output.width()), extent.1.min(gpu.output.height()));
+        let (w, h) = (
+            extent.0.min(gpu.output.width()),
+            extent.1.min(gpu.output.height()),
+        );
         if w == 0 || h == 0 {
             return;
         }
