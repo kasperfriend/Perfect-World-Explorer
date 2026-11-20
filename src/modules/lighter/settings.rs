@@ -226,7 +226,7 @@ impl Settings {
 
     pub(crate) fn encode(self) -> String {
         format!(
-            "# Lighter settings\nmode={}\nlighting={}\nregional_lighting={}\nshadows={}\nsoft_sun={}\nreflections={}\nsingle_path={}\nhybrid_primary={}\ndenoiser={}\nray_lighting={}\nprogressive={}\nbounces={}\ndiffuse_distance={}\nsamples={}\nresolution={}\ndynamic_resolution={}\ngpu_target_ms={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\nreference={}\n",
+            "# Lighter settings\nmode={}\nlighting={}\nregional_lighting={}\nshadows={}\nsoft_sun={}\nreflections={}\nsingle_path={}\nhybrid_primary={}\ndenoiser={}\nguided={}\nray_lighting={}\nprogressive={}\nbounces={}\ndiffuse_distance={}\nsamples={}\nresolution={}\ndynamic_resolution={}\ngpu_target_ms={}\nanisotropy={}\nrelight_baked={}\nphysical_bsdf={}\nreference={}\n",
             self.mode.token(), self.lighting, self.regional_lighting, self.shadows, self.soft_sun, self.reflections, self.single_path, self.hybrid_primary, self.denoiser.token(), self.guided, self.ray_lighting, self.progressive, self.bounces,
             self.diffuse_distance, self.samples, self.resolution, self.dynamic_resolution, self.gpu_target_ms, self.anisotropy, self.relight_baked, self.physical_bsdf, self.reference,
         )
