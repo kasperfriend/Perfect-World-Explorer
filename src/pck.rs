@@ -1754,7 +1754,11 @@ mod tests {
         // walking the table it names, so order between them is not a claim;
         // that both are tried at all, and after the 64-bit reading, is.
         let candidates = trailer_candidates(0x0002_0003);
-        assert_eq!(candidates.len(), 3, "the wide layout, then both DWORD probes");
+        assert_eq!(
+            candidates.len(),
+            3,
+            "the wide layout, then both DWORD probes"
+        );
         assert_eq!(candidates[0].table_offset_width, 8);
         assert_eq!(candidates[1].table_offset_width, 4);
         assert_eq!(candidates[2].table_offset_width, 4);
