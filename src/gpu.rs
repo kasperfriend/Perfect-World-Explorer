@@ -3701,12 +3701,15 @@ impl Renderer {
             );
             (dlss.available, fsr.available)
         };
-        // Ray queries need a Vulkan device advertising the feature; every DX12
-        // device reports Software, which is what the tab must say.
-        let ray_queries = self
-            .device
-            .features()
-            .contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
+        // Hardware mode means tracing against acceleration structures inside
+        // the trace pipeline, and this build has no such pipeline: the trace is
+        // the software transport in `shade.rs`, which is what runs in every
+        // mode. wgpu 0.19 exposes no ray-query feature bit to ask about either
+        // (it arrived in 0.20), so there is nothing to probe — and reporting a
+        // capability the module cannot use would let the tab claim a path that
+        // does not exist. The gate is honest as `false`: `configure` then
+        // degrades Hardware to Software and says why in `hardware_note`.
+        let ray_queries = false;
         {
             let module = self.modules.raywatcher_mut();
             module.configure(ray_queries, availability);
