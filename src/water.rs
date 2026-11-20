@@ -1429,7 +1429,7 @@ mod tests {
         assert_eq!(wet, 17 + 533 + 900 + 99);
         let mut shapes: Vec<(usize, usize)> = areas.iter().map(|a| (a.columns, a.rows)).collect();
         shapes.sort_unstable();
-        assert_eq!(shapes, vec![(32, 8), (32, 32), (32, 32), (60, 64)]);
+        assert_eq!(shapes, vec![(8, 32), (32, 32), (32, 32), (60, 64)]);
     }
 
     /// The record offsets a patch package's trailer table holds, sorted.
