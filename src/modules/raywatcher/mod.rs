@@ -279,6 +279,156 @@ impl Raywatcher {
         status
     }
 
+
+    /// The module's settings tab, drawn in the Modules page beside Walker and
+    /// Populator. It edits `self.settings` in place and reports what the last
+    /// frame actually did, so a provider that silently fell back is visible
+    /// here rather than inferred from the image.
+    pub fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        let mut settings = self.settings.clone();
+        ui.horizontal(|ui| {
+            ui.label("Mode");
+            for mode in RayTracingMode::ALL {
+                let enabled = mode != RayTracingMode::Hardware || self.hardware_rays;
+                let response = ui.add_enabled(
+                    enabled,
+                    egui::SelectableLabel::new(settings.mode == mode, mode.label()),
+                );
+                if response.clicked() {
+                    settings.mode = mode;
+                }
+                if mode == RayTracingMode::Hardware && !self.hardware_rays {
+                    response.on_hover_text(
+                        self.hardware_note
+                            .as_deref()
+                            .unwrap_or("this adapter does not expose ray queries"),
+                    );
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Software builds the BVH on the CPU and walks it in a compute shader; Hardware uses the adapter's ray-query units. Both feed the same denoiser, reconstruction and upscaler.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.separator();
+        ui.heading("Replaced effects");
+        ui.label(
+            egui::RichText::new(
+                "Every effect ticked here has its raster version switched off and its ray-traced version drawn instead — there is no state where both run.",
+            )
+            .small()
+            .weak(),
+        );
+        let mut effects = settings.effects;
+        let mut changed_effects = false;
+        for (label, slot) in [
+            ("Shadows", &mut effects.shadows),
+            ("Lighting", &mut effects.lighting),
+            ("Reflections", &mut effects.reflections),
+            ("Ambient occlusion", &mut effects.ambient_occlusion),
+            ("Global illumination", &mut effects.global_illumination),
+            ("Water refraction", &mut effects.refraction),
+        ] {
+            changed_effects |= ui.checkbox(slot, label).changed();
+        }
+        if changed_effects {
+            settings.effects = effects;
+        }
+        ui.separator();
+        ui.heading("Quality");
+        ui.add(
+            egui::Slider::new(
+                &mut settings.bounces,
+                BOUNCES_RANGE.0..=BOUNCES_RANGE.1,
+            )
+            .text("light bounces"),
+        );
+        ui.add(
+            egui::Slider::new(
+                &mut settings.samples,
+                SAMPLES_RANGE.0..=SAMPLES_RANGE.1,
+            )
+            .text("rays per pixel"),
+        );
+        ui.add(
+            egui::Slider::new(
+                &mut settings.denoise_iterations,
+                DENOISE_RANGE.0..=DENOISE_RANGE.1,
+            )
+            .text("denoiser iterations"),
+        );
+        ui.add(
+            egui::Slider::new(&mut settings.sun_radius_degrees, 0.0..=10.0)
+                .text("sun radius")
+                .suffix("°"),
+        );
+        ui.add(
+            egui::Slider::new(&mut settings.ray_length, 0.0..=64000.0)
+                .text("ray length")
+                .suffix(" u")
+                .logarithmic(true),
+        );
+        ui.add(egui::Slider::new(&mut settings.ambient_strength, 0.0..=2.0).text("ambient"));
+        ui.add(egui::Slider::new(&mut settings.bounce_strength, 0.0..=2.0).text("bounce strength"));
+        ui.add(
+            egui::Slider::new(&mut settings.reflection_roughness_cutoff, 0.0..=1.0)
+                .text("reflection roughness cutoff"),
+        );
+        ui.checkbox(&mut settings.show_denoiser_input, "Show denoiser input")
+            .on_hover_text(
+                "Draws the raw one-sample-per-pixel ray image instead of the filtered one. A debug switch: it makes the denoiser's work visible.",
+            );
+        ui.separator();
+        ui.heading("Ray reconstruction");
+        ui.horizontal(|ui| {
+            for provider in [
+                RayReconstruction::Off,
+                RayReconstruction::DlssRayReconstruction,
+                RayReconstruction::FsrRayRegeneration,
+            ] {
+                let available = self.availability.get(provider);
+                let response = ui.add_enabled(
+                    available || provider == RayReconstruction::Off,
+                    egui::SelectableLabel::new(settings.reconstruction == provider, provider.label()),
+                );
+                if response.clicked() {
+                    settings.reconstruction = provider;
+                }
+                if !available && provider != RayReconstruction::Off {
+                    let file = provider.sdk_file().unwrap_or("the vendor DLL");
+                    response.on_hover_text(format!(
+                        "{file} was not found in {}",
+                        self.sdk_dir.display()
+                    ));
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!(
+                "SDK folder: {}. DLLs present: DLSS RR {}, FSR RR {}.",
+                self.sdk_dir.display(),
+                if self.availability.dlss_rr { "yes" } else { "no" },
+                if self.availability.fsr_rr { "yes" } else { "no" },
+            ))
+            .small()
+            .weak(),
+        );
+        if let Some(note) = &self.hardware_note {
+            ui.colored_label(egui::Color32::YELLOW, note);
+        }
+        ui.separator();
+        let status = self.last.clone();
+        ui.label(egui::RichText::new(format!("Last frame: {}", status.summary)).strong());
+        ui.label(egui::RichText::new(status.overrides.summary()).small().weak());
+        if let Some(note) = status.note {
+            ui.colored_label(egui::Color32::YELLOW, note);
+        }
+        self.set_settings(settings);
+    }
+
     /// The status of the frame that was last recorded.
     pub fn last_status(&self) -> &Status {
         &self.last

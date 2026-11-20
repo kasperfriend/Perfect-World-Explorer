@@ -254,6 +254,13 @@ pub struct ViewSettings {
     /// `PW_UPSCALER_SDK_DIR`, or `<exe>\sdk\` beside the viewer. The SDKs are
     /// not shipped with the viewer and are never committed to the repository.
     pub upscale_sdk_dir: String,
+    /// Modules/Raywatcher: the module's whole `[raywatcher]` section body.
+    ///
+    /// Add-on settings belong to the add-on, so this carries the section text
+    /// rather than mirroring its twenty-odd fields here where they would drift.
+    /// The module parses it with its own `decode`, and its own tests pin the
+    /// round-trip; this file only has to not lose it.
+    pub raywatcher: String,
     /// World tab: force one precipitation effect instead of the area flags.
     pub weather_override: WeatherOverride,
     /// World tab: pin one `sky.lst` row instead of the day/night ladder.
@@ -343,6 +350,7 @@ impl Default for ViewSettings {
             dlss_sharpness: 0.35,
             xess_sharpness: 0.35,
             upscale_sdk_dir: String::new(),
+            raywatcher: String::new(),
             latency: LatencyMode::Vsync,
             // Both overrides default to the client's own behaviour; the World
             // tab offers them only so the recovered sets and particle
@@ -492,6 +500,12 @@ impl ViewSettings {
                     // it is stored rather than ignored.
                     s.upscale_sdk_dir = v.to_string();
                 }
+                "raywatcher" => {
+                    // The whole `[raywatcher]` body on one line, with newlines
+                    // escaped: the file is line-oriented and the section has to
+                    // survive as a single key. `\n` is the only escape used.
+                    s.raywatcher = v.replace("\\n", "\n");
+                }
                 "latency" => {
                     // Unknown spellings keep VSync: a settings file written by
                     // a newer build must not silently change the present
@@ -599,12 +613,12 @@ impl ViewSettings {
             "radius={}\nterrain_cutoff={}\ntree_lod_scale={}\nscenery_quality={}\ncamera_speed={}\nboost={}\nsensitivity={}\nfar={}\ntime_of_day={}\ntime_pass_enabled={}\ntime_pass_speed={}\nall_to_vram={}\n",
             "whole_world={}\nwater_reflections={}\nworld_effects={}\natmospheric_fog={}\nbloom={}\nbloom_strength={}\nbloom_mode={}\nbloom_tint={}\nbloom_brightness_fade={}\nbloom_opacity_fade={}\nclient_gamma={}\ngamma_setting={}\n",
             "terrain_lightmaps={}\nmodel_backface_culling={}\nmusic_enabled={}\nmusic_volume={}\nambience_enabled={}\nsound_volume={}\neffects_enabled={}\neffects_volume={}\nfullscreen={}\nshow_zone_entry={}\n",
-            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nframe_multiplier={}\nfsr1_sharpness={}\nfsr3_sharpness={}\ndlss_sharpness={}\nxess_sharpness={}\nupscale_sdk_dir={}\nlatency={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\nselected_world={}\n"),
+            "show_minimap={}\nminimap_range={}\ntree_wind_strength={}\nclient_tree_wind_preview={}\nregional_tree_lighting={}\ngrass_distance_fade={}\ngrass_wind_enabled={}\ngrass_wind_amplitude={}\nstreamed_regions={}\narea_grass_lightmaps={}\nvegetation_authored_mips={}\ncelestial_discs={}\ncelestial_brightness={}\nignore_celestial_flags={}\ncloud_detail={}\nsharpen={}\nresolution_scale={}\nupscaling={}\nupscale_quality={}\nframe_generation={}\nframe_multiplier={}\nfsr1_sharpness={}\nfsr3_sharpness={}\ndlss_sharpness={}\nxess_sharpness={}\nupscale_sdk_dir={}\nraywatcher={}\nlatency={}\nworld_map_style={}\nminimap_style={}\nminimap_shape={}\nweather_override={}\nsky_override={}\neffect_shaft={}\neffect_distance={}\nlogging_mask={}\nlogging_dir={}\nselected_world={}\n"),
             self.detail.radius,self.detail.terrain_cutoff,self.detail.tree_lod_scale,self.detail.scenery_quality,self.camera_speed,self.boost,self.sensitivity,self.far,self.time_of_day,self.time_pass_enabled,self.time_pass_speed,self.all_to_vram,
             self.whole_world,self.water_reflections,self.world_effects,self.atmospheric_fog,self.bloom,self.bloom_strength,self.bloom_mode,self.bloom_tint,self.bloom_brightness_fade,self.bloom_opacity_fade,self.client_gamma,self.gamma_setting,
             self.terrain_lightmaps,self.model_backface_culling,self.music_enabled,self.music_volume,self.ambience_enabled,self.sound_volume,self.effects_enabled,self.effects_volume,self.fullscreen,self.show_zone_entry,
             self.show_minimap,self.minimap_range,self.tree_wind_strength,self.client_tree_wind_preview,self.regional_tree_lighting,self.grass_distance_fade,self.grass_wind_enabled,self.grass_wind_amplitude,self.streamed_regions,self.area_grass_lightmaps,self.vegetation_authored_mips,self.celestial_discs,self.celestial_brightness,self.ignore_celestial_flags,self.cloud_detail,self.sharpen,self.resolution_scale,
-            self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.frame_multiplier.token(),self.fsr1_sharpness,self.fsr3_sharpness,self.dlss_sharpness,self.xess_sharpness,self.upscale_sdk_dir,self.latency.token(),
+            self.upscaling.token(),self.upscale_quality.token(),self.frame_generation.token(),self.frame_multiplier.token(),self.fsr1_sharpness,self.fsr3_sharpness,self.dlss_sharpness,self.xess_sharpness,self.upscale_sdk_dir,self.raywatcher.replace('\n', "\\n"),self.latency.token(),
             self.world_map_style.label(),self.minimap_style.label(),
             self.minimap_shape.label(),
             self.weather_override.token(),self.sky_override.token(),self.effect_shaft.token(),self.effect_distance,self.logging_mask,self.logging_dir,self.selected_world)
@@ -678,6 +692,22 @@ mod tests {
                 "world"
             );
         }
+    }
+
+    #[test]
+    fn a_raywatcher_section_survives_the_settings_file_round_trip() {
+        // The module owns its own keys; this file's only job is to carry the
+        // section body through a save/load cycle without losing a line.
+        let section = "[raywatcher]\nmode=software\nbounces=3\nshadows=1\nreconstruction=fsrrr\n";
+        let mut s = ViewSettings::default();
+        s.raywatcher = section.to_string();
+        let text = s.encode();
+        assert!(
+            !text.contains("[raywatcher]\nmode"),
+            "the section must not be written as raw newlines: {text}"
+        );
+        let loaded = ViewSettings::decode(&text);
+        assert_eq!(loaded.raywatcher, section);
     }
 
     #[test]

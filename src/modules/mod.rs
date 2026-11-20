@@ -6,12 +6,14 @@ mod designer;
 mod librarian;
 mod package;
 mod populator;
+pub mod raywatcher;
 mod walker;
 
 use crate::{model_draw_gpu, navigation::MapSpace, water::WaterArea};
 use glam::Vec3;
 use package::{Package, Registry};
 use populator::Populator;
+use raywatcher::Raywatcher;
 use std::{collections::HashSet, path::PathBuf};
 use walker::Walker;
 use winit::keyboard::KeyCode;
@@ -40,6 +42,10 @@ pub struct Modules {
     /// `World::spawn_catalog_effect`, which this handle deliberately does not
     /// reach yet — access first, wiring later.
     effect_catalog: Option<crate::gfx_catalog::Catalog>,
+    /// The ray tracer. It owns its settings and its GPU state; the renderer
+    /// asks it for a plan once per frame and records its passes into the
+    /// world's own command encoder.
+    raywatcher: Raywatcher,
 }
 
 impl Default for Modules {
@@ -51,6 +57,7 @@ impl Default for Modules {
             packages: Registry::discover(package::default_root()),
             selected: 0,
             effect_catalog: None,
+            raywatcher: Raywatcher::default(),
         }
     }
 }
@@ -67,6 +74,12 @@ impl Modules {
         // The add-ons each own their state; the host only clones the two
         // handles they need (client root and the loaded world space).
         let populator = Populator::new(element.clone(), map.clone(), map_dir);
+        // Raywatcher resolves its SDK folder from the executable's directory,
+        // which is the element's parent: the same rule the upscalers use.
+        let exe_dir = element
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| element.clone());
         Self {
             walker: Walker::with_host(element.clone(), map, water, scene, ornaments),
             librarian: librarian::Librarian::new(element),
@@ -74,7 +87,17 @@ impl Modules {
             packages: Registry::discover(package::default_root()),
             selected: 0,
             effect_catalog: None,
+            raywatcher: Raywatcher::new(&exe_dir),
         }
+    }
+
+    /// The ray tracer, for the renderer and the menu.
+    pub fn raywatcher(&self) -> &Raywatcher {
+        &self.raywatcher
+    }
+
+    pub fn raywatcher_mut(&mut self) -> &mut Raywatcher {
+        &mut self.raywatcher
     }
 
     pub fn prepare_librarian_preview(
@@ -96,6 +119,7 @@ impl Modules {
             "walker" => self.walker.is_active(),
             "populator" => self.populator.is_active(),
             "librarian" => self.librarian.active(),
+            "raywatcher" => self.raywatcher.settings().mode.enabled(),
             _ => false,
         }
     }
@@ -274,6 +298,7 @@ impl Modules {
                 }
                 ui.label(self.librarian.status());
             }
+            "raywatcher" => self.raywatcher.settings_ui(ui),
             _ => {
                 ui.label(
                     egui::RichText::new(format!(
