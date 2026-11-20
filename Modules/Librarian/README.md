@@ -16,7 +16,7 @@ explicit Left, Right and Remove controls.
 
 ## Effects
 
-Search the installed client's `gfx.pck` and loose `element/gfx/` tree by path.
+Search the installed client's `gfx.pck` and loose `element/gfx/` tree by English name or original path. The file list and animation selector show English labels; hover to see the original identifiers. Names are local display data, never replacements for paths or animation bindings. See the [translation sources and coverage](names/README.md).
 Select a file to load it and its dependencies. **Animation** plays the whole
 composition or isolates a named element while preserving its binding targets.
 Drag the 3D view to orbit, adjust Zoom, or scrub **Animation cycle** to pause

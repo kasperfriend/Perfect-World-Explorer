@@ -4,6 +4,7 @@ mod archive;
 mod compare;
 mod database;
 mod descriptions;
+mod effect_names;
 mod effects;
 mod elements;
 mod icons;
@@ -513,7 +514,8 @@ impl State {
         });
         ui.separator();
         if self.tab == Tab::Effects {
-            self.effects.ui(ui, &mut self.assets);
+            self.effects
+                .ui(ui, &mut self.assets, &self.database.skill_names);
             return;
         }
         if !self.icons.has_atlas() {

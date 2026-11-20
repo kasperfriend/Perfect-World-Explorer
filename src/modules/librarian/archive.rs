@@ -81,6 +81,7 @@ pub struct LibrarianAssets {
     surfaces: Option<PckArchive>,
     models: Option<Result<PckArchive, String>>,
     gfx: Option<Result<PckArchive, String>>,
+    loose_gfx: HashMap<String, PathBuf>,
     textures: Option<Result<PckArchive, String>>,
     facedata: Option<Result<PckArchive, String>>,
 }
@@ -95,6 +96,7 @@ impl LibrarianAssets {
             surfaces,
             models: None,
             gfx: None,
+            loose_gfx: HashMap::new(),
             textures: None,
             facedata: None,
         }
@@ -114,7 +116,24 @@ impl LibrarianAssets {
                     .map(|e| (e.name.clone(), e.size)),
             );
         }
+        // GFX dependencies are normalized by the player, but an extracted
+        // Windows client's file names retain their case on Linux.
+        self.loose_gfx.clear();
         let loose = self.element_root.join("gfx");
+        let loose = if loose.is_dir() {
+            loose
+        } else {
+            fs::read_dir(&self.element_root)
+                .ok()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .find(|e| {
+                    e.file_name().eq_ignore_ascii_case("gfx")
+                        && e.file_type().is_ok_and(|t| t.is_dir())
+                })
+                .map_or(loose, |e| e.path())
+        };
         if loose.is_dir() {
             let mut dirs = vec![loose];
             while let Some(dir) = dirs.pop() {
@@ -124,16 +143,25 @@ impl LibrarianAssets {
                     let path = entry.path();
                     if ty.is_dir() {
                         dirs.push(path);
-                    } else if ty.is_file()
-                        && path
-                            .extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("gfx"))
-                    {
+                    } else if ty.is_file() {
                         let name = path
                             .strip_prefix(&self.element_root)
                             .unwrap()
                             .to_string_lossy()
                             .into_owned();
+                        self.loose_gfx
+                            .insert(normalize_archive_path(&name), path.clone());
+                        if !path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("gfx"))
+                        {
+                            continue;
+                        }
+                        // The reader gives a packed member precedence. Do not
+                        // advertise its loose shadow with a different byte size.
+                        if archive.as_ref().is_ok_and(|p| p.contains(&name)) {
+                            continue;
+                        }
                         names.push((
                             name,
                             entry.metadata().map_err(|e| e.to_string())?.len() as u32,
@@ -225,7 +253,11 @@ impl LibrarianAssets {
     fn loose_resource(&self, path: &str) -> Option<Vec<u8>> {
         let path = path.replace('\\', "/");
         let disk = safe_join(&self.element_root, &path)?;
-        std::fs::read(disk).ok()
+        std::fs::read(&disk).ok().or_else(|| {
+            self.loose_gfx
+                .get(&normalize_archive_path(&path))
+                .and_then(|p| fs::read(p).ok())
+        })
     }
 
     pub fn model_exists(&mut self, path: &str) -> bool {

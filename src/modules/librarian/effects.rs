@@ -1,6 +1,10 @@
 //! A private, offscreen instance of the game's GFX player. A .gfx authors
 //! concurrent element timelines, not the named skeleton clips an ECM authors.
-use super::{archive::LibrarianAssets, preview3d, preview_image};
+use super::{
+    archive::LibrarianAssets,
+    effect_names::{Label, Names},
+    preview3d, preview_image,
+};
 use crate::{
     gfx_catalog::Catalog,
     gfx_effect_gpu::Draw,
@@ -8,6 +12,7 @@ use crate::{
     gfx_player::{self, Player, View},
 };
 use glam::Mat4;
+use std::collections::HashMap;
 
 fn read_root(assets: &mut LibrarianAssets, path: &str) -> Result<gfx_file::Root, String> {
     let bytes = assets.read_model_resource(path)?;
@@ -68,6 +73,7 @@ struct Clip {
 }
 impl Clip {
     fn new(path: String, root: gfx_file::Root) -> Self {
+        let playing = root.play_speed > 0.;
         Self {
             path,
             root,
@@ -75,7 +81,7 @@ impl Clip {
             player: None,
             cursor: 0.,
             simulated: 0.,
-            playing: true,
+            playing,
             camera: [0.6, 0.25, 1.],
             rendered_camera: None,
         }
@@ -109,9 +115,11 @@ impl Clip {
     /// work per GUI frame so scrubbing through a particle system stays usable.
     fn update(&mut self, assets: &mut LibrarianAssets, view: &View) -> Result<bool, String> {
         let (end, _) = timeline(&self.root, self.solo);
-        let step = 16f32.max(end / 65536.);
-        let goal = if self.cursor >= end {
-            end
+        // Preserve sub-frame flashes while playing. Paused scrubs, unlike
+        // playback ticks, must land at the exact requested instant.
+        let step = (end / 16.).min(16.).max(end / 65536.);
+        let goal = if !self.playing || self.cursor >= end {
+            self.cursor
         } else {
             (self.cursor / step).floor() * step
         };
@@ -142,6 +150,9 @@ impl Clip {
 #[derive(Default)]
 pub struct Browser {
     catalog: Option<Result<Catalog, String>>,
+    names: Option<Names>,
+    labels: Vec<Label>,
+    tracks: Vec<Label>,
     query: String,
     matches: Vec<usize>,
     selected: Option<usize>,
@@ -210,7 +221,12 @@ impl Browser {
         })();
         self.error = result.err();
     }
-    pub fn ui(&mut self, ui: &mut egui::Ui, assets: &mut LibrarianAssets) {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        assets: &mut LibrarianAssets,
+        skill_names: &HashMap<u32, String>,
+    ) {
         let first = self.catalog.is_none();
         let catalog = match self.catalog.get_or_insert_with(|| assets.effect_catalog()) {
             Ok(c) => c,
@@ -219,6 +235,14 @@ impl Browser {
                 return;
             }
         };
+        let names = self.names.get_or_insert_with(|| Names::new(skill_names));
+        if first {
+            self.labels = catalog
+                .entries()
+                .iter()
+                .map(|e| names.label(&e.path, Names::is_skill_path(&e.path)))
+                .collect();
+        }
         let changed = ui
             .horizontal(|ui| {
                 ui.label("Search effects:");
@@ -231,7 +255,10 @@ impl Browser {
                 .entries()
                 .iter()
                 .enumerate()
-                .filter(|(_, e)| e.path.to_lowercase().contains(&q))
+                .filter(|(i, e)| {
+                    self.labels[*i].text.to_lowercase().contains(&q)
+                        || e.path.to_lowercase().contains(&q)
+                })
                 .map(|(i, _)| i)
                 .collect();
         }
@@ -240,9 +267,18 @@ impl Browser {
             self.matches.len(),
             catalog.len()
         ));
+        if self.matches.is_empty() {
+            ui.weak(if catalog.is_empty() {
+                "No .gfx files in gfx.pck or the loose gfx folder."
+            } else {
+                "No effects match this search."
+            });
+        }
         ui.columns(2, |cols| {
-            let height = cols[0].text_style_height(&egui::TextStyle::Body);
-            egui::ScrollArea::vertical()
+            let height = cols[0]
+                .text_style_height(&egui::TextStyle::Body)
+                .max(cols[0].spacing().interact_size.y);
+            egui::ScrollArea::both()
                 .id_source("librarian_effect_list")
                 .show_rows(&mut cols[0], height, self.matches.len(), |ui, rows| {
                     ui.style_mut().wrap = Some(false);
@@ -252,9 +288,9 @@ impl Browser {
                         if ui
                             .add(egui::SelectableLabel::new(
                                 self.selected == Some(i),
-                                e.path.as_str(),
+                                self.labels[i].text.as_str(),
                             ))
-                            .on_hover_text(&e.path)
+                            .on_hover_text(format!("{}\n{}", self.labels[i].text, e.path))
                             .clicked()
                         {
                             self.selected = Some(i);
@@ -262,6 +298,12 @@ impl Browser {
                             self.clip = None;
                             self.error = match read_root(assets, &e.path) {
                                 Ok(root) => {
+                                    let skill = Names::is_skill_path(&e.path);
+                                    self.tracks = root
+                                        .elements
+                                        .iter()
+                                        .map(|el| names.label(&el.common.name, skill))
+                                        .collect();
                                     self.clip = Some(Clip::new(e.path.clone(), root));
                                     None
                                 }
@@ -278,7 +320,12 @@ impl Browser {
                         return;
                     };
                     let e = &catalog.entries()[i];
-                    ui.heading(&e.path);
+                    let label = &self.labels[i];
+                    ui.heading(label.text.rsplit('/').next().unwrap_or(&label.text));
+                    ui.small(&e.path);
+                    if label.untranslated {
+                        ui.small("Some terms in this path have no known translation.");
+                    }
                     ui.small(format!("{} · {} bytes", e.group.label(), e.size));
                     if let Some(error) = &self.error {
                         ui.colored_label(egui::Color32::LIGHT_RED, error);
@@ -287,7 +334,13 @@ impl Browser {
                     let Some(clip) = self.clip.as_mut() else {
                         return;
                     };
-                    clip_ui(ui, clip, self.target.as_ref(), self.draw.as_ref());
+                    clip_ui(
+                        ui,
+                        clip,
+                        &self.tracks,
+                        self.target.as_ref(),
+                        self.draw.as_ref(),
+                    );
                 });
         });
     }
@@ -296,6 +349,7 @@ impl Browser {
 fn clip_ui(
     ui: &mut egui::Ui,
     clip: &mut Clip,
+    tracks: &[Label],
     target: Option<&preview3d::Target>,
     draw: Option<&Draw>,
 ) {
@@ -304,7 +358,7 @@ fn clip_ui(
         format!(
             "{} · {} (type {})",
             i + 1,
-            clip.root.elements[i].common.name,
+            tracks[i].text,
             clip.root.elements[i].id
         )
     };
@@ -312,8 +366,9 @@ fn clip_ui(
         .selected_text(solo.map(label).unwrap_or_else(|| "Whole effect".into()))
         .show_ui(ui, |ui| {
             ui.selectable_value(&mut solo, None, "Whole effect");
-            for i in 0..clip.root.elements.len() {
-                ui.selectable_value(&mut solo, Some(i), label(i));
+            for i in 0..tracks.len() {
+                ui.selectable_value(&mut solo, Some(i), label(i))
+                    .on_hover_text(&clip.root.elements[i].common.name);
             }
         });
     if solo != clip.solo {
@@ -331,7 +386,13 @@ fn clip_ui(
     ui.small("Drag the preview to orbit.");
     let (end, open) = timeline(&clip.root, clip.solo);
     ui.horizontal(|ui| {
-        ui.toggle_value(&mut clip.playing, "Play");
+        ui.add_enabled_ui(clip.root.play_speed > 0., |ui| {
+            ui.toggle_value(&mut clip.playing, "Play")
+        })
+        .response
+        .on_disabled_hover_text(
+            "Authored playback speed is zero. Use the slider to inspect this effect.",
+        );
         ui.label(format!("{:.2} / {:.2} s", clip.cursor / 1000., end / 1000.));
     });
     if ui
@@ -470,6 +531,10 @@ mod tests {
         let end = (pack.len() as u32).to_le_bytes();
         pack[4..8].copy_from_slice(&end);
         std::fs::write(files.0.join("gfx.pck"), pack).unwrap();
+        // A loose override with a different case must not be listed as a
+        // separately sized asset when reads actually resolve to the pack.
+        std::fs::create_dir_all(files.0.join("gfx/场景")).unwrap();
+        std::fs::write(files.0.join("gfx/场景/glow.gfx"), b"shadow").unwrap();
         let mut assets = LibrarianAssets::open(&files.0);
         let catalog = assets.effect_catalog().unwrap();
         assert_eq!(catalog.len(), 3);
@@ -481,6 +546,45 @@ mod tests {
             2
         );
     }
+    #[test]
+    fn reference_effect_names() {
+        let Ok(dir) = std::env::var("PW_LIBRARIAN_REFERENCE_EFFECT_ROOT") else {
+            return;
+        };
+        let mut assets = LibrarianAssets::open(std::path::Path::new(&dir));
+        let catalog = assets.effect_catalog().unwrap();
+        assert_eq!(
+            catalog.len(),
+            5459,
+            "expected the PW 1.4.2 reference gfx.pck"
+        );
+        let strings = assets
+            .read_config("configs/skillstr.txt")
+            .map(|b| super::super::descriptions::keyed_strings(&b))
+            .unwrap_or_default();
+        let names = Names::new(&strings);
+        let mut tracks = std::collections::HashSet::new();
+        for e in catalog.entries() {
+            let skill = Names::is_skill_path(&e.path);
+            assert!(!names.label(&e.path, skill).untranslated, "{}", e.path);
+            let bytes = assets.read_model_resource(&e.path).unwrap();
+            let (source, _) = gfx_file::decode(&bytes);
+            for track in source
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("Name:"))
+                .map(str::trim)
+            {
+                assert!(
+                    !names.label(track, skill).untranslated,
+                    "{}: {track}",
+                    e.path
+                );
+                tracks.insert(track.to_owned());
+            }
+        }
+        assert_eq!(tracks.len(), 444);
+    }
+
     #[test]
     fn browse_solo_and_scrub_loose_effect() {
         let files = Fixture::new("clock");
@@ -504,6 +608,35 @@ mod tests {
         clip.cursor = 32.;
         clip.update(&mut assets, &view).unwrap();
         assert_eq!(sample, clip.player.as_ref().unwrap().quads());
+    }
+    #[test]
+    fn paused_seek_can_show_a_flash_between_simulation_ticks() {
+        let files = Fixture::new("flash");
+        let (mut assets, mut clip) = files.load();
+        clip.root.elements[0].start_time = 1.;
+        clip.root.elements[0].keypoints[0].time_span = 4.;
+        clip.select(Some(0));
+        clip.playing = false;
+        clip.cursor = 2.;
+        clip.update(&mut assets, &View::default()).unwrap();
+        assert_eq!(clip.player.as_ref().unwrap().stats().quads, 1);
+        assert_eq!(clip.simulated, 2.);
+    }
+
+    #[test]
+    fn loose_dependencies_resolve_with_windows_case() {
+        let files = Fixture::new("case");
+        std::fs::rename(
+            files.0.join("gfx/textures/sample.png"),
+            files.0.join("gfx/textures/SpArK.PNG"),
+        )
+        .unwrap();
+        let mut assets = LibrarianAssets::open(&files.0);
+        assets.effect_catalog().unwrap();
+        assert!(assets
+            .read_model_resource("gfx/textures/spark.png")
+            .unwrap()
+            .starts_with(b"\x89PNG"));
     }
     // The repository's existing Librarian software-Vulkan job selects tests
     // containing this name; exercise the same target with the GFX pass too.
