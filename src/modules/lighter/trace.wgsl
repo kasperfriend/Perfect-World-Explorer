@@ -1247,12 +1247,17 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u3
         color += response*light.energy*tr;
     }
     if physical { return color+ambient+s.emission*emission_weight; }
-    // When no lights contributed (color==0), return base color directly
-    // instead of local_color which would add ambient on top of zero,
-    // darkening surfaces (e.g. green card [0,1,0] * ambient[0.1,0.1,0.1]
-    // = [0,0.1,0] instead of [0,1,0]). Emissive surfaces are handled
-    // earlier at the EMISSIVE flag check.
-    if all(color == vec3<f32>(0.)) { return s.color.rgb; }
+    // When no lights contributed (color==0), return ambient+emission on the
+    // terminal bounce (ambient is meaningful there), otherwise base color.
+    // local_color(s,0,ambient) equals ambient+emission since s.color is
+    // multiplied by light (zero here). On non-terminal bounces ambient is
+    // zero anyway, so base color preserves the "visible without light"
+    // behaviour for e.g. green cards under zero-bounce ambient.
+    if all(color == vec3<f32>(0.)) {
+        var result = s.color.rgb;
+        if terminal { result = ambient + s.emission * emission_weight; }
+        return result;
+    }
     return local_color(s,color,ambient);
 }
 fn hemisphere(n: vec3<f32>, seed: ptr<function,u32>) -> vec3<f32> {
