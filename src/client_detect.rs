@@ -1564,7 +1564,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("config/element")).unwrap();
         let marker = root.join("config/element/version.sw");
-        assert_eq!(release_version(&root), None, "absent marker is not reported");
+        assert_eq!(
+            release_version(&root),
+            None,
+            "absent marker is not reported"
+        );
         std::fs::write(&marker, "1.8.4\r\n").unwrap();
         assert_eq!(release_version(&root).as_deref(), Some("1.8.4"));
         // A bare build number is the other format in circulation; it is
