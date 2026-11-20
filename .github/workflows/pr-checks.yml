@@ -830,6 +830,25 @@ jobs:
           path: artifact/
           if-no-files-found: error
           retention-days: 14
+      - name: Wait for the uploaded artifact to appear in the run catalog
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $artifactName = 'Perfect-World-Explorer-Windows-x64'
+          $endpoint = "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/artifacts"
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            $names = gh api $endpoint --jq '.artifacts[].name'
+            if ($LASTEXITCODE -eq 0 -and ($names -contains $artifactName)) {
+              Write-Host "Artifact is visible after $attempt catalog check(s)."
+              exit 0
+            }
+            Write-Host "Artifact not listed yet ($attempt/12); waiting five seconds."
+            Start-Sleep -Seconds 5
+          }
+          $listed = gh api $endpoint --jq '.artifacts[] | [.name, .id] | @tsv'
+          Write-Host "Artifacts currently visible:`n$listed"
+          throw "Uploaded artifact '$artifactName' never appeared in the run catalog."
       - name: Download the uploaded portable artifact
         uses: actions/download-artifact@v4
         with:
