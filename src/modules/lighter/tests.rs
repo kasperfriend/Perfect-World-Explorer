@@ -2923,6 +2923,7 @@ fn exercise_transport(h: &mut Harness) {
 /// unlit output. Depth must still be written from the ray hit even when no
 /// lighting contributes (overlay path previously dropped depth here).
 fn exercise_byte_identity(h: &mut Harness) {
+    let saved = h.ray.settings;
     let mut b = Builder::default();
     let red = upright(&mut b, -3., [1., 0., 0., 1.], 0, 0);
     put(&mut b, red);
@@ -2943,6 +2944,7 @@ fn exercise_byte_identity(h: &mut Harness) {
         depth > 0.,
         "ray_lighting off: depth must still be written from ray hit"
     );
+    h.ray.settings = saved;
 }
 
 // The same test suite runs through the compute BVH, CPU Vulkan queries, and
