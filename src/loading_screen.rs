@@ -235,6 +235,9 @@ pub fn fill(
     let left = (source_width as f64 - crop_width) * 0.5;
     let top = (source_height as f64 - crop_height) * 0.5;
     let mut target = image::RgbaImage::new(width, height);
+    // `ImageBuffer` derefs to its sample slice; it has no `AsMut<[u8]>` impl, so
+    // the write goes through `DerefMut`.
+    let target_pixels: &mut [u8] = &mut target;
     let pixels = source.as_raw();
     let stride = source_width as usize * 4;
     for y in 0..height {
@@ -246,7 +249,7 @@ pub fn fill(
                 .min(source_width as usize - 1);
             let offset = row + source_x * 4;
             let target_offset = (y as usize * width as usize + x as usize) * 4;
-            target.as_mut()[target_offset..target_offset + 4]
+            target_pixels[target_offset..target_offset + 4]
                 .copy_from_slice(&pixels[offset..offset + 4]);
         }
     }
@@ -384,10 +387,13 @@ pub fn random_word() -> u64 {
     word = word
         .wrapping_mul(0x9e37_79b9_7f4a_7c15)
         .wrapping_add(now.subsec_nanos() as u64);
-    let local = 0u8;
+    // A boxed local's address is stable and distinct per run; taking the
+    // address of a plain `let` would be a reference the optimiser may fold, and
+    // it reads as if the address mattered more than it does.
+    let local = Box::new(0u8);
     word = word
         .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        .wrapping_add(&local as *const u8 as usize as u64);
+        .wrapping_add((&*local) as *const u8 as usize as u64);
     // A final mix so the low bits `pick` uses are not dominated by the
     // multiplication chain's low-bit structure.
     word ^= word >> 29;

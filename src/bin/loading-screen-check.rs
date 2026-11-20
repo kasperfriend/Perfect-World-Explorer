@@ -22,8 +22,12 @@
 //! retail client.
 use std::{path::Path, process::ExitCode};
 
+// The production module declares the full artwork API; a check binary uses
+// part of it, and an unused helper here is not a defect in the viewer.
+#[allow(dead_code)]
 #[path = "../loading_screen.rs"]
 mod loading_screen;
+#[allow(dead_code)]
 #[path = "../pck.rs"]
 mod pck;
 
@@ -37,18 +41,22 @@ fn main() -> ExitCode {
     };
     let root = Path::new(&root);
     let output = args.next();
-    let width = args
-        .next()
-        .map(|value| value.parse::<u32>())
-        .transpose()
-        .map_err(|error| format!("invalid width: {error}"))
-        .unwrap_or(Ok(1920));
-    let height = args
-        .next()
-        .map(|value| value.parse::<u32>())
-        .transpose()
-        .map_err(|error| format!("invalid height: {error}"))
-        .unwrap_or(Ok(1080));
+    // `parse` is fallible and the argument itself is optional, so each size is
+    // `Result<u32, String>`: absent means the default, malformed means exit 2.
+    let width = match args.next() {
+        Some(value) => match value.parse::<u32>() {
+            Ok(width) => Ok(width),
+            Err(error) => Err(format!("invalid width: {error}")),
+        },
+        None => Ok(1920),
+    };
+    let height = match args.next() {
+        Some(value) => match value.parse::<u32>() {
+            Ok(height) => Ok(height),
+            Err(error) => Err(format!("invalid height: {error}")),
+        },
+        None => Ok(1080),
+    };
     let (width, height) = match (width, height) {
         (Ok(width), Ok(height)) if width >= 64 && height >= 64 => (width, height),
         (Ok(width), Ok(height)) => {
@@ -110,7 +118,10 @@ fn run(root: &Path, output: Option<&str>, width: u32, height: u32) -> Result<boo
     let row = (height as usize - 4) * width as usize * 4;
     let fitted_row = &fitted.as_raw()[row..row + 4];
     let blended_row = &blended[row..row + 4];
-    if blended_row[..3].iter().sum::<u8>() >= fitted_row[..3].iter().sum::<u8>() {
+    // Sum in `u32`: three `u8` channels at 255 overflow `u8` and would panic in
+    // a debug build on exactly the bright artwork this check exists for.
+    let brightness = |channels: &[u8]| -> u32 { channels[..3].iter().map(|c| *c as u32).sum() };
+    if brightness(blended_row) >= brightness(fitted_row) {
         return Err("the status strip did not darken the bottom rows".into());
     }
     println!(

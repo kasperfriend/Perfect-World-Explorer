@@ -16,8 +16,12 @@
 //! client separately.
 use wgpu::util::DeviceExt;
 
+// The production module declares the full artwork API; a check binary uses
+// part of it, and an unused helper here is not a defect in the viewer.
+#[allow(dead_code)]
 #[path = "../loading_screen.rs"]
 mod loading_screen;
+#[allow(dead_code)]
 #[path = "../pck.rs"]
 mod pck;
 
@@ -77,8 +81,14 @@ fn jpeg() -> Vec<u8> {
     let mut source = image::RgbImage::new(64, 40);
     for (x, y, pixel) in source.enumerate_pixels_mut() {
         // A gradient plus a bright band, so a column or row mistake is visible.
+        // `y * 6` reaches 354 on the last row, so the sum is clamped before the
+        // `u8` cast instead of wrapping to a dark value that hides the band.
         let band = if (24..40).contains(&y) { 120 } else { 0 };
-        *pixel = image::Rgb([(x * 4) as u8, (y * 6) as u8 + band, 200 - (x * 3) as u8]);
+        *pixel = image::Rgb([
+            (x * 4) as u8,
+            (y * 6 + band).min(255) as u8,
+            200 - (x * 3) as u8,
+        ]);
     }
     let mut out = Vec::new();
     {
@@ -96,8 +106,9 @@ fn bmp() -> Vec<u8> {
     }
     let mut out = Vec::new();
     {
-        let cursor = std::io::Cursor::new(&mut out);
-        let mut writer = image::codecs::bmp::BmpEncoder::new(cursor);
+        // `BmpEncoder::new` borrows its writer, unlike `JpegEncoder::new`.
+        let mut cursor = std::io::Cursor::new(&mut out);
+        let mut writer = image::codecs::bmp::BmpEncoder::new(&mut cursor);
         writer
             .encode(source.as_raw(), 48, 64, image::ExtendedColorType::Rgba8)
             .unwrap();
@@ -105,28 +116,48 @@ fn bmp() -> Vec<u8> {
     out
 }
 
-/// An uncompressed 32-bit DDS, the layout `model_texture_gpu::Dds` parses:
-/// 128-byte header (`DDS `, `DDSD_CAPS|HEIGHT|WIDTH|PIXELFORMAT|PITCH`,
-/// `DDPF_RGB|DDPF_ALPHAPIXELS`, 32bpp BGRA masks) then tightly packed rows.
+/// A DXT1 DDS, the layout `image`'s own DDS decoder accepts.
+///
+/// The crate decodes DDS through its DXT1/DXT3/DXT5 path only (a FourCC in the
+/// pixel format with `DDPF_FOURCC` set) and rejects uncompressed formats, so the
+/// fixture is a 16x16 image in four 8x8 blocks, each one solid colour: two
+/// RGB565 endpoints and a 32-bit index word whose 16 two-bit selectors are all
+/// `0`, which is always the first endpoint.
 fn dds() -> Vec<u8> {
     let (width, height) = (16u32, 16u32);
     let mut out = vec![0u8; 128];
     out[0..4].copy_from_slice(b"DDS ");
+    // dwSize 124, dwFlags = CAPS|HEIGHT|WIDTH|PIXELFORMAT|LINEARSIZE.
     out[4..8].copy_from_slice(&124u32.to_le_bytes());
-    out[8..12].copy_from_slice(&0x0000_1007u32.to_le_bytes());
+    out[8..12].copy_from_slice(&0x0008_100fu32.to_le_bytes());
     out[12..16].copy_from_slice(&height.to_le_bytes());
     out[16..20].copy_from_slice(&width.to_le_bytes());
-    out[20..24].copy_from_slice(&(width * 4).to_le_bytes());
+    // dwPitchOrLinearSize is the top-level compressed size: 8 bytes per block.
+    let blocks = (width / 4) * (height / 4);
+    out[20..24].copy_from_slice(&(blocks * 8).to_le_bytes());
+    // ddspf.dwSize = 32, ddspf.dwFlags = DDPF_FOURCC, ddspf.dwFourCC = "DXT1".
     out[76..80].copy_from_slice(&32u32.to_le_bytes());
-    out[80..84].copy_from_slice(&0x41u32.to_le_bytes());
-    out[88..92].copy_from_slice(&0x00ff_0000u32.to_le_bytes());
-    out[92..96].copy_from_slice(&0x0000_ff00u32.to_le_bytes());
-    out[96..100].copy_from_slice(&0x0000_00ffu32.to_le_bytes());
-    out[100..104].copy_from_slice(&0xff00_0000u32.to_le_bytes());
-    for y in 0..height {
-        for x in 0..width {
-            out.extend_from_slice(&[(x * 16) as u8, (y * 16) as u8, 30, 255]);
-        }
+    out[80..84].copy_from_slice(&0x4u32.to_le_bytes());
+    out[84..88].copy_from_slice(b"DXT1");
+    // dwCaps = DDSCAPS_TEXTURE.
+    out[108..112].copy_from_slice(&0x1000u32.to_le_bytes());
+    // 4x4 blocks of 4x4 texels. A DXT1 block is two RGB565 endpoints then 16
+    // two-bit selectors; all selectors are 0, which always picks the first
+    // endpoint, so every block is one flat colour. The corner blocks are the
+    // four primaries, which the caller asserts after decoding, so a channel
+    // swap, a block-order mistake or a short data section cannot pass.
+    for index in 0..blocks {
+        let (r, g, b) = match index {
+            0 => (31u16, 0u16, 0u16),                   // red, top left
+            i if i == width / 4 - 1 => (0, 63, 0),      // green, top right
+            i if i == blocks - width / 4 => (0, 0, 31), // blue, bottom left
+            i if i == blocks - 1 => (31, 63, 31),       // white, bottom right
+            _ => (16, 32, 16),                          // mid grey everywhere else
+        };
+        let endpoint = (r << 11) | (g << 5) | b;
+        out.extend_from_slice(&endpoint.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]);
     }
     out
 }
@@ -189,10 +220,19 @@ fn main() {
         .find(|picture| picture.path == "surfaces/maps/000.dds")
         .expect("the nested DDS is in the archive index");
     match loading_screen::decode(&element, &nested) {
-        Ok(image) if image.dimensions() == (16, 16) => {}
+        // Both a size and a colour check: a block-order or channel swap in the
+        // DDS path would still produce a 16x16 image, so the corners pin the
+        // four solid colours the fixture encodes.
+        Ok(image)
+            if image.dimensions() == (16, 16)
+                && image.get_pixel(0, 0).0 == [255, 0, 0, 255]
+                && image.get_pixel(15, 0).0 == [0, 255, 0, 255]
+                && image.get_pixel(0, 15).0 == [0, 0, 255, 255]
+                && image.get_pixel(15, 15).0 == [255, 255, 255, 255] => {}
         Ok(image) => failures.push(format!(
-            "surfaces/maps/000.dds decoded as {:?}, expected (16, 16)",
-            image.dimensions()
+            "surfaces/maps/000.dds decoded as {:?} with corner {:?}, expected a 16x16 red/green/blue/white block layout",
+            image.dimensions(),
+            image.get_pixel(0, 0).0
         )),
         Err(error) => failures.push(format!("surfaces/maps/000.dds did not decode: {error}")),
     }
@@ -307,9 +347,16 @@ fn main() {
             },
         );
         queue.submit(Some(encoder.finish()));
-        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        // `get_mapped_range` returns the view itself in wgpu 0.19; the map
+        // callback is what says the copy has landed on the host side.
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
         device.poll(wgpu::Maintain::Wait);
-        let view = buffer.slice(..).get_mapped_range().unwrap();
+        rx.recv().expect("the mapping callback runs").unwrap();
+        let view = slice.get_mapped_range();
         let row = (*width * 4) as usize;
         let mut mismatches = 0usize;
         for y in 0..*height as usize {
@@ -324,6 +371,8 @@ fn main() {
                 "{width}x{height}: {mismatches} rows of the BGRA upload differ from the DIB bytes"
             ));
         }
+        drop(view);
+        buffer.unmap();
     }
 
     std::fs::remove_dir_all(&root).ok();
