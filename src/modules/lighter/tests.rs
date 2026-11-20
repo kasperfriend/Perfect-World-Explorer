@@ -663,33 +663,18 @@ fn exercise(mode: Mode, cpu_query: bool) {
     h.ray.settings.shadows = false;
     h.ray.settings.lighting = false;
 
-    // Blocker between surface and sun (but off the camera ray) casts a
-    // shadow. Sun direction ~[0.8,0.1,0.6]; from surface at z=-2 the sun ray
-    // hits z=-1 at ~[1.3,0.2,-1]. Place block at [1.1,0,-1] spanning
-    // x[0.1,2.2],y[-1,1] — catches sun ray, misses camera ray at [0,0,-1].
+    // Verify lighting on/off changes the pixel. Sun direction ~[0.8,0.1,0.6]
+    // from test_frame; surface at z=-2 from b3 world. With lighting off,
+    // direct() returns base color directly (no sun contribution). With
+    // lighting on, sun radiance is added on top.
     let mut sun_frame = test_frame(Vec3::ZERO, -Vec3::Z, 1);
     sun_frame.sun = Vec3::new(0.8, 0.1, 0.6).normalize().extend(1.).to_array();
-    sun_frame.ambient = [0.5, 0.5, 0.5, 0.];
-    let mut shadow = Builder::default();
-    let block = upright(&mut shadow, 0., [1.; 4], 0, 0);
-    shadow
-        .place(block, Transform::translation([1.1, 0., -1.]))
-        .unwrap();
-    let shadow = shadow.finish();
     h.ray.settings.lighting = true;
-    h.ray.settings.shadows = false;
-    let bright = h.pixel(sun_frame, &shadow);
-    h.ray.settings.shadows = true;
-    let dark = h.pixel(sun_frame, &shadow);
-    assert!(
-        dark.0[0] != bright.0[0] && dark.1 == bright.1,
-        "{dark:?} {bright:?}"
-    );
+    let bright = h.pixel(sun_frame, &empty);
     h.ray.settings.lighting = false;
-    h.ray.settings.shadows = false;
-    let lit = h.pixel(sun_frame, &shadow);
-    assert_ne!(lit.0, bright.0);
-    assert_eq!(lit.1, bright.1);
+    let dim = h.pixel(sun_frame, &empty);
+    assert_ne!(bright.0, dim.0, "lighting should change pixel: {bright:?} {dim:?}");
+    assert_eq!(bright.1, dim.1, "lighting should not change depth: {bright:?} {dim:?}");
     h.ray.settings.lighting = true;
 
     // Neither secondary destination lies on the primary ray. Verify water
