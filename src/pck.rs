@@ -3098,15 +3098,14 @@ mod tests {
             as_wide > total as u64,
             "the wide reading must be the one that fails: {as_wide} against {total}"
         );
-        // The narrow `0x00020002` probe reads the same table position, and is
-        // still refused: it looks for the description at `+16`, where this file
-        // writes its zero `dwFlags`. That refusal is the "not an Angelica file
-        // package (description tag missing)" in the report, and it is why the
-        // table was never walked even though the arithmetic was right.
+        // The narrow `0x00020002` probe is refused: it looks for the
+        // description at `+16`, where this file writes its zero `dwFlags`. That
+        // refusal is the "not an Angelica file package (description tag
+        // missing)" in the report, and it is why the table was never walked
+        // even though the arithmetic was right.
         let narrow = TRAILER_PROBES
             .iter()
             .find(|r| r.description_at == 16)
-            .copied()
             .expect("the narrow probe exists");
         assert_eq!(table_offset(&header, narrow).unwrap(), table_at);
 
@@ -3114,7 +3113,6 @@ mod tests {
         let surfaces = TRAILER_PROBES
             .iter()
             .find(|r| r.description_at == 20 && r.table_offset_width == 4)
-            .copied()
             .expect("the surfaces.pck probe exists");
         assert_eq!(table_offset(&header, surfaces).unwrap(), table_at);
         assert!(
@@ -3128,7 +3126,7 @@ mod tests {
         let trailer_path = write_temp(&bytes, "surfaces-narrow-refusal");
         let whole = std::fs::File::open(&trailer_path).unwrap();
         let end = bytes.len() as u64;
-        let refused = read_named_trailer(&whole, end, &narrow)
+        let refused = read_named_trailer(&whole, end, narrow)
             .err()
             .unwrap_or_else(|| panic!("the narrow probe must refuse this trailer"));
         assert!(
@@ -3136,7 +3134,7 @@ mod tests {
             "the narrow probe must be refused on the description, got: {refused}"
         );
         assert!(
-            read_named_trailer(&whole, end, &surfaces).is_ok(),
+            read_named_trailer(&whole, end, surfaces).is_ok(),
             "the wide-order/narrow-word probe must accept this trailer"
         );
         let _ = std::fs::remove_file(&trailer_path);
