@@ -205,21 +205,21 @@ impl WaterArea {
         // Only a revision whose field offsets were recovered can be walked; the
         // caller reports anything else by version instead of guessing at the
         // mask offset and silently reading a shifted grid.
-        let f = WaterFields::of(version).ok_or_else(|| {
+        let fields = WaterFields::of(version).ok_or_else(|| {
             format!(
                 "A3DWaterArea version {version:#x} has no recovered layout \
                  (this build reads 0x10002000, 0x10003000 and 4)"
             )
         })?;
-        let color = u(b, fb + f.color)?;
-        let height = f(b, fb + f.height)?;
-        let columns = u(b, fb + f.columns)? as usize;
-        let rows = u(b, fb + f.rows)? as usize;
-        let grid_size = f(b, fb + f.cell_size)?;
+        let color = u(b, fb + fields.color)?;
+        let height = f(b, fb + fields.height)?;
+        let columns = u(b, fb + fields.columns)? as usize;
+        let rows = u(b, fb + fields.rows)? as usize;
+        let grid_size = f(b, fb + fields.cell_size)?;
         let center = [
-            f(b, fb + f.center)?,
-            f(b, fb + f.center + 4)?,
-            f(b, fb + f.center + 8)?,
+            f(b, fb + fields.center)?,
+            f(b, fb + fields.center + 4)?,
+            f(b, fb + fields.center + 8)?,
         ];
         // Bounds measured across every water patch staged for 1.5.2, 1.4.4 and
         // 1.8.4 (a07, a37 and the 1.8.4 world): at most 50 columns, 32 rows and
@@ -246,12 +246,12 @@ impl WaterArea {
         // The older v2 area has no simple-water flag byte; v3 inserts one
         // before the mask, which is the only difference between those two
         // revisions. The 1.8.4 v4 layout has no flag at all.
-        let simple = match f.simple {
+        let simple = match fields.simple {
             Some(at) => *b.get(fb + at).ok_or("truncated water flag")? != 0,
             None => false,
         };
         let n = columns.checked_mul(rows).ok_or("grid overflow")?;
-        let start = fb.checked_add(f.mask).ok_or("overflow")?;
+        let start = fb.checked_add(fields.mask).ok_or("overflow")?;
         let mask = b
             .get(start..start.checked_add(n).ok_or("overflow")?)
             .ok_or("truncated water cell mask")?
