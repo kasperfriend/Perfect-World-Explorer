@@ -4759,6 +4759,19 @@ fn handoff_ready_exit_plan() -> HandoffReadyExit {
         exit_event_loop: true,
     }
 }
+/// Bring the old window back after a handoff that did not produce a world.
+///
+/// The child's loading window publishes its handle as soon as it exists, and
+/// the old window hides itself at that point so only one loading screen is on
+/// screen. When the child then fails or its watcher stops, the handoff is over
+/// but the old window is still hidden; without this the error would be reported
+/// to a window the user cannot see. Showing a window that is already visible is
+/// a no-op, and `winit` 0.29 has no `is_visible` getter to check first.
+fn restore_old_window(window: &winit::window::Window) {
+    window.set_visible(true);
+    window.focus_window();
+}
+
 fn close_old_window_after_handoff_ready<T: 'static>(
     target: &winit::event_loop::EventLoopWindowTarget<T>,
     window: &winit::window::Window,
@@ -7847,6 +7860,10 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 if let Some(files) = handoff_files.take() {
                                     files.cleanup();
                                 }
+                                // The child's own loading window may already
+                                // have pushed this one off screen; the failure
+                                // has to be readable, so bring it back.
+                                restore_old_window(&window);
                                 menu_page = MenuPage::Main;
                                 keys.clear();
                                 break;
@@ -7871,6 +7888,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 if let Some(files) = handoff_files.take() {
                                     files.cleanup();
                                 }
+                                restore_old_window(&window);
                                 menu_page = MenuPage::Main;
                                 keys.clear();
                                 break;
@@ -8929,5 +8947,81 @@ mod handoff_exit_tests {
         assert!(src.contains("window.set_visible(false);"));
         assert!(src.contains("target.set_control_flow(winit::event_loop::ControlFlow::Poll);"));
         assert!(src.contains("close_old_window_after_handoff_ready(target, &window);"));
+    }
+
+    /// Both loading windows must be fed by the same painting primitives.
+    ///
+    /// `launcher_ui::text` used to `DeleteObject` the font it had just taken
+    /// from the process-wide `FONTS` cache. `text` runs about fifteen times per
+    /// paint, so the first paint of the loading window destroyed every cached
+    /// font and every later paint selected a dead handle: the artwork appeared
+    /// but the status line, the DirectStorage readout and the bar label never
+    /// did. A cached handle is borrowed, never owned, so nothing on the paint
+    /// path may delete one.
+    #[test]
+    fn the_paint_path_never_deletes_a_cached_gdi_object() {
+        let src = include_str!("launcher_ui.rs");
+        // The extern declaration is the only allowed mention of the symbol.
+        assert_eq!(
+            src.matches("DeleteObject").count(),
+            1,
+            "only the `extern` declaration may name DeleteObject"
+        );
+        assert!(src.contains("fn DeleteObject(obj: Handle) -> i32;"));
+    }
+
+    /// The replacement's loading window is the one that has to be on screen.
+    ///
+    /// A Teleport List change spawns a separate process. That process opened
+    /// its own loading window for the world being loaded, but published only
+    /// the viewer window it builds later, so the old process kept its own
+    /// overlay on screen on top of the maximised loading window and the two
+    /// fought for the foreground. Publishing the loading window's handle as
+    /// soon as it exists hands the screen over to the window that will become
+    /// the new world.
+    #[test]
+    fn the_replacement_publishes_its_loading_window_first() {
+        let src = include_str!("windows_setup.rs");
+        // Only the code, so the assertions cannot match their own text.
+        let src = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let publish = src
+            .find("crate::world_handoff::publish_window_handle(hwnd as usize);")
+            .expect("the replacement loading window publishes its handle");
+        let show = src
+            .find("ShowWindow(hwnd, if windowed { 5 } else { 3 });")
+            .expect("the loading window is shown");
+        assert!(
+            show < publish,
+            "the handle is published only once the window is shown"
+        );
+        // And only once that window has painted, so the handover cannot show a
+        // window that is still empty.
+        let paint = src
+            .find("UpdateWindow(hwnd);")
+            .expect("the first paint is forced before the handover");
+        assert!(
+            paint < publish,
+            "the window is painted before it is handed over"
+        );
+        // Publishing must be conditional, or a normal startup would write a
+        // handle into a file no old process is watching.
+        assert!(src.contains("if crate::world_handoff::is_handoff_child() {"));
+    }
+
+    /// A failed handoff must not leave the only window invisible.
+    ///
+    /// The old window hides itself as soon as the replacement publishes a
+    /// window handle, which now happens while the replacement is still loading.
+    /// Both ways a handoff can end without a world therefore have to bring it
+    /// back, or the error is reported to a window the user cannot see.
+    #[test]
+    fn a_failed_handoff_brings_the_old_window_back() {
+        // Only the code above the tests, or these assertions would match
+        // themselves.
+        let src = include_str!("gpu.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("the test module")];
+        // One definition, used by both the `Failed` and `Disconnected` arms.
+        assert_eq!(code.matches("fn restore_old_window(").count(), 1);
+        assert_eq!(code.matches("restore_old_window(&window);").count(), 2);
     }
 }

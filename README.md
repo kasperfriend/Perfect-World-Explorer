@@ -84,8 +84,12 @@ A world change is a **replacement process**, so the loading screen for it is
 shown twice from one matched picture: the running viewer draws it over its own
 last frame as soon as the change is accepted, and the replacement process opens
 its own full-screen loading window with the same picture while it loads terrain.
-The old window hides the moment the replacement publishes its window handle, so
-the swap is invisible and only one loading screen is ever visible.
+The replacement publishes that loading window's handle as soon as the window has
+painted its first frame, and the old window hides at that point: the screen is
+handed to the window that will become the new world, so the swap is invisible and
+only one loading screen is ever on screen. The old window is brought back if the
+handoff fails, because otherwise the error would be reported to a window that is
+no longer visible.
 
 Both are the same UI: the picture fills the view, and the DirectStorage status
 line, throughput graph, read totals, an indeterminate bar and the status text sit
@@ -143,6 +147,22 @@ DDS that must not be offered as a loading screen but must still decode), runs
 the production lookup, random choice, decode, cover fit and status strip at a
 laptop, a 4K and a portrait size, then uploads the BGRA bytes to a wgpu texture
 and compares the readback row for row.
+
+### Loading-window ownership
+
+The loading window and the viewer's desktop window are both drawn with the same
+GDI helpers in `launcher_ui`. Two rules there are load-bearing and are pinned by
+tests:
+
+- **A cached GDI object is borrowed, never owned.** `font()` and `brush()` return
+  handles from process-wide caches, and only `SelectObject(old)` back is the
+  caller's job. Deleting a cached handle makes every later paint select a dead
+  object — the first paint of a loading window would then erase the fonts that
+  draw the status line, the DirectStorage readout and the bar label.
+- **Exactly one loading window is visible.** A replacement process publishes its
+  loading window's handle once that window has painted, and the old process
+  hides its own window at that point. Two maximised loading screens would fight
+  for the foreground and a world change would look as though nothing happened.
 
 ### Controls
 

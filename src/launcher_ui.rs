@@ -377,7 +377,11 @@ unsafe fn text(dc: Handle, x: i32, y: i32, s: &str, size: i32, weight: i32, colo
     let data: Vec<u16> = s.encode_utf16().collect();
     TextOutW(dc, x, y, data.as_ptr(), data.len() as i32);
     SelectObject(dc, old);
-    DeleteObject(font);
+    // The font belongs to the process-wide cache in `FONTS`, not to this call.
+    // Deleting it here destroyed the handle the first time a label was drawn,
+    // so every later paint selected a dead object and the window stopped
+    // drawing any text at all. `text_width` and `rect` already leave their
+    // cached font and brush alone for the same reason.
 }
 fn compact(path: &str) -> String {
     let cs: Vec<char> = path.chars().collect();

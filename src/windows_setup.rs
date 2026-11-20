@@ -1269,8 +1269,9 @@ impl LoadingWindow {
             }
             // The first WM_PAINT the show below queues draws the artwork, so the
             // measurement loop is running before any decode-sized GDI work
-            // happens; a synchronous UpdateWindow here would paint before the
-            // state below is observed by the message loop.
+            // happens. The one forced paint is after the state above is
+            // published, so it draws the real picture rather than the
+            // placeholder.
             ShowWindow(hwnd, if windowed { 5 } else { 3 }); // SW_SHOW / SW_MAXIMIZE
                                                             // The artwork was decoded against a placeholder size, so fit it once
                                                             // to the real client area before the first frame is presented. The
@@ -1284,6 +1285,14 @@ impl LoadingWindow {
                         eprintln!("Loading screen artwork could not be fitted: {error}");
                     }
                 }
+            }
+            // A replacement process hands this window over before anything in
+            // `gpu::run` runs: the old process reads the handle, hides its own
+            // window and stops fighting this one for the foreground. The paint
+            // is forced first, so the handover never shows an empty window.
+            if crate::world_handoff::is_handoff_child() {
+                UpdateWindow(hwnd);
+                crate::world_handoff::publish_window_handle(hwnd as usize);
             }
 
             let _ = ready_tx.send(());
