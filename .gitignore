@@ -24,6 +24,7 @@ Thumbs.db
 !/tests/fixtures/**/*.pck
 !/tests/fixtures/**/*.ecwld
 !/tests/fixtures/**/*.dat
+!/tests/fixtures/**/*.ecbsd
 
 # Private client files staged by the Drive connector
 /google_drive/

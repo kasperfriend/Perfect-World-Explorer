@@ -1392,6 +1392,42 @@ mod tests {
         assert_eq!(decoded[2].grid_size, 32.0);
     }
 
+    /// The whole path a client uses: a real world file, its `world.ecbsd`
+    /// manifest, and the patches the manifest names, loaded through `load`.
+    ///
+    /// This is the test the 1.8.4 report needed and did not have. The record
+    /// test above proves `parse_record` reads the bytes; this one proves the
+    /// loader that the viewer actually calls finds the manifest, resolves each
+    /// `BSData/N.dat` name case-insensitively, and hands back the areas. Every
+    /// step of that chain was broken at once for 1.8.4, and each step is a
+    /// separate way to end up with "0 water areas".
+    ///
+    /// The staged world is the client's own 1.8.4 `world.ecwld` with its
+    /// object tables emptied except for four blocks, one per patch, so the
+    /// fixture carries the real header, the real 22,528-entry block table and
+    /// the real manifest offsets while all 111 references resolve.
+    #[test]
+    fn the_staged_184_client_loads_water_through_the_real_loader() {
+        let element = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/clients/pw-184");
+        let world = element.join("maps/world/world.ecwld");
+        let scene = Scene::load(&world).expect("the staged 1.8.4 world parses");
+        let refs: usize = scene.blocks.iter().map(|b| b.water.len()).sum();
+        assert_eq!(refs, 4, "one water reference per staged patch");
+        let areas = load(&scene, &element).expect("the staged client's water loads");
+        assert_eq!(areas.len(), 4, "one area per reference");
+        let wet: usize = areas
+            .iter()
+            .map(|a| a.mask.iter().filter(|m| **m != 0).count())
+            .sum();
+        // 4.dat record 1 (17), 7.dat record 0 (533), 21.dat record 0 (900) and
+        // 44.dat record 9 (99).
+        assert_eq!(wet, 17 + 533 + 900 + 99);
+        let mut shapes: Vec<(usize, usize)> = areas.iter().map(|a| (a.columns, a.rows)).collect();
+        shapes.sort_unstable();
+        assert_eq!(shapes, vec![(32, 8), (32, 32), (32, 32), (60, 64)]);
+    }
+
     /// The record offsets a patch package's trailer table holds, sorted.
     fn records_of(data: &[u8]) -> Vec<usize> {
         let Some(tail) = data.len().checked_sub(4) else {
