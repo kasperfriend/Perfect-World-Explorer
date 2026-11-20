@@ -132,4 +132,3 @@ pub fn extract_for_scene(
     );
     Ok(())
 }
-
