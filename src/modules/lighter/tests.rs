@@ -506,6 +506,11 @@ fn exercise(mode: Mode, cpu_query: bool) {
         put(&mut b, reject);
     }
     h.ray.install(Ok((b.finish(), bank.clone())));
+    // Green card test checks depth testing, not lighting. Enable lighting
+    // so direct() uses the white-surface ambient path for consistency with
+    // exercise_transport; coloured surfaces still return base colour.
+    h.ray.settings.lighting = true;
+    h.ray.settings.shadows = false;
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     if mode == Mode::Hardware {
         h.ray.capture = false;
