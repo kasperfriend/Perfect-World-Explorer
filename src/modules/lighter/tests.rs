@@ -673,8 +673,14 @@ fn exercise(mode: Mode, cpu_query: bool) {
     let bright = h.pixel(sun_frame, &empty);
     h.ray.settings.lighting = false;
     let dim = h.pixel(sun_frame, &empty);
-    assert_ne!(bright.0, dim.0, "lighting should change pixel: {bright:?} {dim:?}");
-    assert_eq!(bright.1, dim.1, "lighting should not change depth: {bright:?} {dim:?}");
+    assert_ne!(
+        bright.0, dim.0,
+        "lighting should change pixel: {bright:?} {dim:?}"
+    );
+    assert_eq!(
+        bright.1, dim.1,
+        "lighting should not change depth: {bright:?} {dim:?}"
+    );
     h.ray.settings.lighting = true;
 
     // Neither secondary destination lies on the primary ray. Verify water
