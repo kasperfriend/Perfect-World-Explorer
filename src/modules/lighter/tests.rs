@@ -825,6 +825,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
         assert!((mean - expected).abs() < 0.055, "channel {i}: {mean}");
     }
     exercise_transport(&mut h);
+    exercise_byte_identity(&mut h);
     exercise_denoiser_edges(&mut h);
     exercise_spatial_upscale(&mut h);
     exercise_stable_primary_water(&mut h);
@@ -2915,6 +2916,33 @@ fn exercise_transport(h: &mut Harness) {
             [value; 3],
         );
     }
+}
+
+/// Native byte-identity: with ray_lighting off, no ray lighting is added,
+/// so output is surface color only — byte-identical to the native renderer's
+/// unlit output. Depth must still be written from the ray hit even when no
+/// lighting contributes (overlay path previously dropped depth here).
+fn exercise_byte_identity(h: &mut Harness) {
+    let mut b = Builder::default();
+    let red = upright(&mut b, -3., [1., 0., 0., 1.], 0, 0);
+    put(&mut b, red);
+    h.ray.install(Ok((b.finish(), Textures::default())));
+    let f = test_frame(Vec3::ZERO, -Vec3::Z, 3);
+    let empty = Builder::default().finish();
+    h.ray.settings.ray_lighting = false;
+    h.ray.settings.lighting = false;
+    h.ray.settings.shadows = false;
+    h.ray.settings.bounces = 0;
+    let (pixel, depth) = h.pixel(f, &empty);
+    assert_eq!(
+        pixel,
+        [255, 0, 0, 255],
+        "ray_lighting off: surface color only, no lighting added"
+    );
+    assert!(
+        depth > 0.,
+        "ray_lighting off: depth must still be written from ray hit"
+    );
 }
 
 // The same test suite runs through the compute BVH, CPU Vulkan queries, and
