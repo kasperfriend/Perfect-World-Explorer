@@ -1103,10 +1103,8 @@ fn read_entry_table_chunked(
     end: u64,
     size: u64,
 ) -> Result<Vec<Entry>, String> {
-    /// A table of `count` records cannot exceed this.
-    let ceiling = (count as u64)
-        .saturating_mul(rev.entry as u64 + 8)
-        .min(limit);
+    // A table of `count` records cannot exceed this.
+    let ceiling = (count as u64).saturating_mul(rev.entry as u64 + 8).min(limit);
     // The first chunk is deliberately small: most tables are a fraction of their
     // ceiling, and the common case should not read the ceiling.
     let mut have = 256u64.saturating_mul(1024).min(ceiling).max(8);
@@ -1118,8 +1116,7 @@ fn read_entry_table_chunked(
                 // These two mean "the bytes read stop before the records do";
                 // anything else is a real framing fault and is reported as such
                 // rather than grown past.
-                let short =
-                    error.contains("overlaps footer") || error.contains("record (length)");
+                let short = error.contains("overlaps footer") || error.contains("record (length)");
                 if !short || have >= ceiling {
                     return Err(error);
                 }
