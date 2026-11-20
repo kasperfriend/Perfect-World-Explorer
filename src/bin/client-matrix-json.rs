@@ -183,9 +183,8 @@ fn main() {
         // One client must not be able to destroy the whole run. A panic inside a
         // reader would otherwise leave ci-results empty with no explanation,
         // which is exactly what happened to the first attempt at this step.
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            measure_client(name, root)
-        }));
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| measure_client(name, root)));
         let (cells, facts) = match outcome {
             Ok(pair) => pair,
             Err(payload) => {
