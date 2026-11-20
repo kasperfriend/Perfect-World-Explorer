@@ -636,7 +636,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
     h.ray.settings.lighting = true;
     // Empty world so only light contributes to the pixel, making
     // bright/dim light differences visible (green_front maxed the channel).
-    h.ray.install(Ok((Builder::default().finish(), bank.clone())));
+    h.ray
+        .install(Ok((Builder::default().finish(), bank.clone())));
     let bright = h.pixel(frame, &local_light([3.; 4], false));
     let builds = h.builds();
     let dim = h.pixel(frame, &local_light([0.5; 4], false));
