@@ -730,6 +730,11 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
             continue;
         };
         let Ok(entries) = u(data, tail) else {
+            crate::diag!(
+                SceneWater,
+                "water {}: BSData {index} too short to hold its entry count",
+                r.export_id
+            );
             continue;
         };
         let entries = entries as usize;
@@ -737,6 +742,16 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
             .checked_mul(4)
             .and_then(|bytes| tail.checked_sub(bytes))
         else {
+            // The entry table cannot fit inside the file, so this patch is
+            // unreadable rather than empty. Say so: an unqualified `continue`
+            // here loses a whole water surface and prints nothing.
+            crate::diag!(
+                SceneWater,
+                "water {}: BSData {index} entry table of {entries} entries does not fit \
+                 in {} bytes",
+                r.export_id,
+                data.len()
+            );
             continue;
         };
         // Every bound below costs this reference only. `load` returning an
@@ -752,6 +767,11 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
             continue;
         }
         let Ok(rec) = u(data, table + record * 4) else {
+            crate::diag!(
+                SceneWater,
+                "water {}: BSData {index} has no offset for record {record}",
+                r.export_id
+            );
             continue;
         };
         let rec = rec as usize;

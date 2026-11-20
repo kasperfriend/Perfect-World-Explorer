@@ -4,8 +4,8 @@ Every place a loader can lose a value without saying so, classified. Generated b
 
 | category | sites |
 |---|---|
-| named | 4 |
-| unreachable | 119 |
+| named | 5 |
+| unreachable | 118 |
 | fix | 0 |
 | ? | 0 |
 
@@ -119,7 +119,7 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/terrain_store.rs` | 842 | `else-continue` | **named** | `else {` |
 | `src/terrain_upload.rs` | 24 | `ok-question` | **probe** | `let info = crate::terrain_sampling::parse_terrain_dds(source).ok()?;` |
 | `src/water.rs` | 412 | `ok-question` | **probe** | `let word = u32::from_le_bytes(b[p..p + 4].try_into().ok()?);` |
-| `src/water.rs` | 725 | `else-continue` | **unreachable** | `else {` |
+| `src/water.rs` | 744 | `else-continue` | **named** | `else {` |
 | `src/weather_gpu.rs` | 68 | `unwrap_or_default` | **unreachable** | `rain.size_variation.unwrap_or_default(),` |
 | `src/weather_gpu.rs` | 70 | `unwrap_or_default` | **unreachable** | `snow.size_variation.unwrap_or_default(),` |
 | `src/weather_gpu.rs` | 74 | `unwrap_or_default` | **unreachable** | `rain.speed_variation.unwrap_or_default(),` |
@@ -143,10 +143,10 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/world_catalog.rs` | 90 | `unwrap_or_default` | **unreachable** | `let records = records.get(&key).cloned().unwrap_or_default();` |
 | `src/world_catalog.rs` | 228 | `ok-question` | **probe** | `.ok()?;` |
 | `src/world_catalog.rs` | 275 | `else-continue` | **named** | `else {` |
-| `src/world_catalog.rs` | 353 | `ok-question` | **probe** | `.ok()?` |
-| `src/world_catalog.rs` | 422 | `ok-question` | **probe** | `let bytes = fs::read(dir.join("precinct.clt")).ok()?;` |
-| `src/world_catalog.rs` | 423 | `ok-question` | **probe** | `let text = decode_client_text(&bytes).ok()?;` |
-| `src/world_catalog.rs` | 457 | `ok-question` | **probe** | `let number = digits.parse::<u32>().ok()?;` |
+| `src/world_catalog.rs` | 357 | `ok-question` | **probe** | `.ok()?` |
+| `src/world_catalog.rs` | 426 | `ok-question` | **probe** | `let bytes = fs::read(dir.join("precinct.clt")).ok()?;` |
+| `src/world_catalog.rs` | 427 | `ok-question` | **probe** | `let text = decode_client_text(&bytes).ok()?;` |
+| `src/world_catalog.rs` | 461 | `ok-question` | **probe** | `let number = digits.parse::<u32>().ok()?;` |
 | `src/world_handoff.rs` | 112 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
 | `src/world_handoff.rs` | 122 | `let-underscore` | **unreachable** | `let _ = fs::write(&files.focus, b"focused");` |
 | `src/world_handoff.rs` | 123 | `let-underscore` | **unreachable** | `let _ = fs::remove_file(&files.hwnd);` |

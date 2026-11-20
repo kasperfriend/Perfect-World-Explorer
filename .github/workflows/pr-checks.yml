@@ -444,6 +444,14 @@ jobs:
           [ -s /tmp/fmt.check ] || exit 0
           { echo 'rustfmt wants these changes:'; echo '```diff'; \
             head -600 /tmp/fmt.check; echo '```'; } > /tmp/fmt.md
+          # Replace this workflow's previous comment rather than adding to it.
+          # The comment is the only readable copy of the diff, and after a few
+          # runs the thread holds diffs that were already applied, which makes a
+          # fixed one look unfixed. Deleting first means one comment, current.
+          for id in $(gh api "repos/${{ github.repository }}/issues/$PR/comments" \
+              --paginate -q '.[]|select(.user.login=="github-actions[bot]")|select(.body|startswith("rustfmt wants these changes:"))|.id'); do
+            gh api -X DELETE "repos/${{ github.repository }}/issues/comments/$id" || true
+          done
           gh pr comment "$PR" --body-file /tmp/fmt.md
       - name: Verify bounded lossless terrain RAM residency
         run: |
