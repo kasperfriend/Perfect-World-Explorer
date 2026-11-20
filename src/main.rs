@@ -38,8 +38,8 @@ mod cloud_gpu;
 #[allow(dead_code)]
 mod cloud_surface;
 mod color_chain;
+mod diagnostics;
 mod direct_storage_readout;
-mod loading_overlay;
 // A preview is a test-only harness. The skip is on the module: its literals
 // are authored GFX text and its tables are read top to bottom, neither of
 // which formatting improves, and every other module stays checked.
@@ -91,10 +91,13 @@ mod light_consumers;
 // in-viewer overlay a world change shows, and the overlay is compiled on every
 // host, so this module is no longer Windows-only.
 mod loading_graph;
+// The loading UI's frame composition: the standalone window and the in-viewer
+// overlay a world change shows both go through it, so the two screens cannot
+// drift apart. Platform-neutral, so it is compiled and tested on every host.
+mod loading_overlay;
 // The client's own loading artwork: the Windows loading window fills itself from
 // `surfaces.pck`, and the headless fixture check exercises the same lookup and
 // decode. Declared unconditionally so the path stays tested on every host.
-mod loading_overlay;
 mod loading_screen;
 mod material;
 mod model_asset;
