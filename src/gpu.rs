@@ -4856,7 +4856,8 @@ fn build_world_loading_overlay(
             (None, "(none)".to_string(), "unavailable".to_string())
         }
     };
-    let direct_storage = crate::pck::readout::state_line(crate::pck::readout::stats());
+    let direct_storage =
+        crate::direct_storage_readout::state_line(crate::direct_storage_readout::stats());
     let totals = world_loading_totals();
     let graph = "Read throughput (MiB/s): sampling...".to_string();
     let texture = picture.as_ref().map(|fitted| {
@@ -4985,7 +4986,7 @@ fn draw_world_loading_text(
 
 /// The DirectStorage totals line, worded exactly like the loading window's.
 fn world_loading_totals() -> String {
-    let stats = crate::pck::readout::stats();
+    let stats = crate::direct_storage_readout::stats();
     format!(
         "DirectStorage: {} reads / {:.2} MiB | attempts: {} | fallback: {} | active: {}",
         stats.successes,
@@ -5024,7 +5025,7 @@ impl ThroughputSampler {
         if elapsed < interval {
             return None;
         }
-        let stats = crate::pck::readout::stats();
+        let stats = crate::direct_storage_readout::stats();
         let rate = crate::loading_graph::mib_per_second(
             stats.bytes.saturating_sub(self.previous_bytes),
             elapsed.as_secs_f64(),
@@ -7888,7 +7889,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                     if let Some(overlay) = world_loading_overlay.as_mut() {
                         overlay.phase = (overlay.phase + 0.10) % std::f32::consts::TAU;
                         overlay.direct_storage =
-                            crate::pck::readout::state_line(crate::pck::readout::stats());
+                            crate::direct_storage_readout::state_line(crate::direct_storage_readout::stats());
                         overlay.totals = world_loading_totals();
                         if let Some(graph) =
                             world_loading_sampler.poll(std::time::Duration::from_millis(500))
