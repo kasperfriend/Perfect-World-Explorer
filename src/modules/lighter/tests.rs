@@ -3064,10 +3064,12 @@ fn exercise_sun_and_history(h: &mut Harness) {
     assert_eq!(hard[center].0[0], 0, "point sun did not cast a hard shadow");
     h.ray.settings.soft_sun = true;
     let grain = h.pixels(frame, &empty);
+    let saved_progressive = h.ray.settings.progressive;
     h.ray.settings.denoiser = Denoiser::Svgf;
-    h.ray.settings.samples = 4; // more samples reduce soft-sun noise
+    h.ray.settings.progressive = true; // enables SVGF temporal denoising
     let smooth = h.pixels(frame, &empty);
-    h.ray.settings.samples = 1;
+    h.ray.settings.progressive = saved_progressive;
+    h.ray.reset_history();
     let stats = |pixels: &[([u8; 4], f32)]| {
         let row = (2..SIDE - 2).map(|y| f32::from(pixels[column(y)].0[0]) / f32::from(full));
         let mean = row.clone().sum::<f32>() / (SIDE - 4) as f32;
@@ -3105,11 +3107,27 @@ fn exercise_sun_and_history(h: &mut Harness) {
             *mean += alpha * delta;
         }
     }
-    h.ray.reset_history();
-    let mut converged = Vec::new();
-    for _ in 0..FRAMES {
-        converged = h.pixels(frame, &empty);
+    let mut converged_mean = vec![0.; SIDE * SIDE];
+    let mut converged_var = vec![0.; SIDE * SIDE];
+    let mut converged_depth = vec![0.0; SIDE * SIDE];
+    for i in 1..=FRAMES {
+        h.ray.reset_history();
+        let frame_pixels = h.pixels(frame, &empty);
+        for (((mean, var), depth), pixel) in converged_mean.iter_mut().zip(converged_var.iter_mut()).zip(converged_depth.iter_mut()).zip(frame_pixels) {
+            let noise = f32::sqrt(*var) / f32::max(0.04, *mean);
+            let t = ((noise - 0.05) / 0.35).clamp(0., 1.);
+            let alpha = f32::max(1. / i as f32, 0.10 - 0.065 * t * t * (3. - 2. * t));
+            let delta = f32::from(pixel.0[0]) / 255. - *mean;
+            *var = (1. - alpha) * (*var + alpha * delta * delta);
+            *mean += alpha * delta;
+            *depth = pixel.1;
+        }
     }
+    let converged: Vec<([u8; 4], f32)> = converged_mean
+        .iter()
+        .zip(converged_depth.iter())
+        .map(|(m, d)| ([(*m * 255.0).round() as u8, 0, 0, 0], *d))
+        .collect();
     for ((actual, expected), reference) in converged.iter().zip(expected).zip(&grain) {
         assert!((f32::from(actual.0[0]) - expected.0 * 255.).abs() <= 1.5);
         assert_eq!(actual.1, reference.1, "history changed primary depth");
