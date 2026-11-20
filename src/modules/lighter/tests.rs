@@ -538,6 +538,36 @@ fn exercise(mode: Mode, cpu_query: bool) {
         assert!((depth - z).abs() < 1e-6);
         h.ray.capture = true;
     }
+    // --- RED CARD ISOLATION CHECKS (temporary diagnostics) ---
+    // Red only: empty world, red moving card → expect pure red [255,0,0].
+    h.ray.install(Ok((Builder::default().finish(), bank.clone())));
+    let (red_only, red_only_z) = h.pixel(frame, &red);
+    eprintln!(
+        "RED-CARD-DUMP red-only: color={:?} depth={} expect=[255,0,0,255] depth≈{}",
+        red_only,
+        red_only_z,
+        depth_at(frame, Vec3::new(0., 0., -3.))
+    );
+    // Green only: green world at z=-5, empty moving → expect pure green [0,255,0].
+    let mut b_green = Builder::default();
+    let green_again = upright(&mut b_green, -5., [0., 1., 0., 1.], 0, 0);
+    put(&mut b_green, green_again);
+    h.ray.install(Ok((b_green.finish(), bank.clone())));
+    let (green_only, green_only_z) = h.pixel(frame, &empty);
+    eprintln!(
+        "RED-CARD-DUMP green-only: color={:?} depth={} expect=[0,255,0,255] depth≈{}",
+        green_only,
+        green_only_z,
+        depth_at(frame, Vec3::new(0., 0., -5.))
+    );
+    // Both: green world + red moving → expect pure red [255,0,0] (red is nearer).
+    let (both, both_z) = h.pixel(frame, &red);
+    eprintln!(
+        "RED-CARD-DUMP both: color={:?} depth={} expect=[255,0,0,255] depth≈{}",
+        both,
+        both_z,
+        depth_at(frame, Vec3::new(0., 0., -3.))
+    );
     let mut animated = Builder::default();
     let red = upright(&mut animated, 0., [1., 0., 0., 1.], 0, 0);
     animated
