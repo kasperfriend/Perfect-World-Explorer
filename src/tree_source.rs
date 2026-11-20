@@ -253,6 +253,9 @@ mod tests {
         if !have_fixtures() {
             return;
         }
+        // The counters are process-global, so a test elsewhere that drops a
+        // record concurrently would be counted here as this extraction's loss.
+        let _g = crate::load_status::test_guard();
         crate::load_status::reset();
         assert_eq!(
             crate::load_status::dropped_count(crate::load_status::Category::Trees),

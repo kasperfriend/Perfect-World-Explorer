@@ -92,7 +92,7 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/grass_random.rs` | 144 | `else-continue` | **unreachable** | `else {` |
 | `src/latency.rs` | 309 | `let-underscore` | **unreachable** | `let _ = end(1);` |
 | `src/launcher_ui.rs` | 143 | `ok-question` | **probe** | `decode(&fs::read(settings_file()?).ok()?)` |
-| `src/load_status.rs` | 156 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
+| `src/load_status.rs` | 160 | `unwrap_or_default` | **unreachable** | `.unwrap_or_default()` |
 | `src/model_asset.rs` | 362 | `unwrap_or_default` | **unreachable** | `(primary, beside.unwrap_or_default())` |
 | `src/model_dds.rs` | 191 | `let-underscore` | **unreachable** | `let _ = offset;` |
 | `src/model_draw_gpu.rs` | 693 | `else-continue` | **unreachable** | `else {` |

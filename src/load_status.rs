@@ -117,9 +117,12 @@ static COUNTS: [AtomicUsize; 12] = [
     AtomicUsize::new(0),
 ];
 
-/// The recorded reason strings, capped so a broken archive cannot exhaust
-/// memory. The cap is deliberately generous: the point is that the *first*
-/// reasons are always kept, because a first reason is what identifies a bug.
+/// How many reason strings one category may record, so a broken archive cannot
+/// exhaust memory. The cap is deliberately generous, and it is **per category**:
+/// the point is that the *first* reasons are always kept, because a first reason
+/// is what identifies a bug. A single shared cap does not do that -- a category
+/// that loses a million records evicts every other category's first reason,
+/// which is exactly the reason a reader would have wanted.
 const MAX_REASONS: usize = 512;
 
 static REASONS: Mutex<Vec<(Category, String)>> = Mutex::new(Vec::new());
@@ -131,7 +134,8 @@ static REASONS: Mutex<Vec<(Category, String)>> = Mutex::new(Vec::new());
 pub fn dropped(category: Category, reason: impl Into<String>) -> bool {
     let previous = COUNTS[category.index()].fetch_add(1, Ordering::Relaxed);
     if let Ok(mut list) = REASONS.lock() {
-        if list.len() < MAX_REASONS {
+        let held = list.iter().filter(|(c, _)| *c == category).count();
+        if held < MAX_REASONS {
             list.push((category, reason.into()));
         }
     }
@@ -186,16 +190,27 @@ pub fn reset() {
     }
 }
 
+/// Serialises every test that touches the process-global counters and reasons.
+///
+/// `#[cfg(test)]` because it exists only to keep tests from reading each
+/// other's numbers. It is one lock for the whole binary rather than one per
+/// module: the state it guards is global, so a module-local lock would only
+/// serialise tests inside that module and leave every caller elsewhere racing.
+/// That race is not hypothetical -- `tree_source`'s end-to-end extraction test
+/// resets the counters and then asserts a count, and a water test running at the
+/// same time on another thread contributed 256 drops to its 537.
+#[cfg(test)]
+pub fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Serialises the tests in this module: the counters are process-global, so
-    /// two tests running at once would read each other's numbers.
-    static LOCK: Mutex<()> = Mutex::new(());
-
     fn guard() -> std::sync::MutexGuard<'static, ()> {
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        test_guard()
     }
 
     #[test]
@@ -324,13 +339,10 @@ pub fn assert_not_silently_empty(
 #[cfg(test)]
 mod empty_tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn empty_and_silent_is_refused() {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_guard();
         reset();
         let err = assert_not_silently_empty(Category::Water, 0, None).unwrap_err();
         // The category name has to be in the message: it is what tells a reader
@@ -345,7 +357,7 @@ mod empty_tests {
 
     #[test]
     fn empty_with_a_recorded_reason_is_allowed() {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_guard();
         reset();
         dropped(
             Category::Water,
@@ -357,7 +369,7 @@ mod empty_tests {
 
     #[test]
     fn empty_because_the_input_declares_zero_is_allowed() {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_guard();
         reset();
         // a91 and a64 are this case: their ECWLD declares zero tree types, so a
         // tree loader may legitimately return nothing for them.
@@ -369,7 +381,7 @@ mod empty_tests {
 
     #[test]
     fn a_non_empty_result_is_always_fine() {
-        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = test_guard();
         reset();
         assert!(assert_not_silently_empty(Category::Trees, 3649, None).is_ok());
         assert!(assert_not_silently_empty(Category::Trees, 1, Some(3679)).is_ok());

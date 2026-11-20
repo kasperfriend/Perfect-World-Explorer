@@ -104,7 +104,7 @@ src/model_asset.rs:362 unreachable an absent optional field is the documented de
 src/world_audio.rs:108 unreachable an absent optional field is the documented default of the setting
 src/world_handoff.rs:112 unreachable an absent optional field is the documented default of the handoff request
 src/gfx_effect_gpu.rs:555 unreachable the scratch pool is empty-handed a fresh Vec, which is what the pool is for
-src/load_status.rs:156 unreachable `reasons` returns Vec; unfit lock gives no reasons, which is the honest empty answer
+src/load_status.rs:160 unreachable `reasons` returns Vec; unfit lock gives no reasons, which is the honest empty answer
 src/windows_setup.rs:442 unreachable mpsc progress send to the UI: a closed receiver means the window is gone
 src/terrain_store.rs:453 unreachable a directory removal whose failure the next create reports
 src/terrain_store.rs:626 unreachable a cleanup unlink of a temp file
