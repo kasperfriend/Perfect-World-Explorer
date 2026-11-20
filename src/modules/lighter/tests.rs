@@ -614,6 +614,9 @@ fn exercise(mode: Mode, cpu_query: bool) {
         "still geometry re-uploaded"
     );
 
+    // Dark green surface so lights have something to illuminate, making
+    // bright/dim light differences visible (green_front at [0,1,0] maxes
+    // the green channel and hides light differences).
     let local_light = |color: [f32; 4], masked| {
         let mut b = Builder::default();
         b.light(Light::point([0., 0., -1., 120.], color));
@@ -631,15 +634,11 @@ fn exercise(mode: Mode, cpu_query: bool) {
         );
         b.place(block, Transform::translation([3., 0., -3.5]))
             .unwrap();
+        let surface = upright(&mut b, -2., [0., 0.1, 0., 1.], 0, 0);
+        put(&mut b, surface);
         b.finish()
     };
     h.ray.settings.lighting = true;
-    // Dark green world so lighting differences are visible (green_front at
-    // [0,1,0] maxes the green channel and hides light differences).
-    let mut b3 = Builder::default();
-    let dark_green = upright(&mut b3, -2., [0., 0.1, 0., 1.], 0, 0);
-    put(&mut b3, dark_green);
-    h.ray.install(Ok((b3.finish(), bank.clone())));
     let bright = h.pixel(frame, &local_light([100.; 4], false));
     let builds = h.builds();
     let dim = h.pixel(frame, &local_light([0.5; 4], false));
