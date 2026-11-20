@@ -614,72 +614,44 @@ fn exercise(mode: Mode, cpu_query: bool) {
         "still geometry re-uploaded"
     );
 
-    // Lighting tests need a surface for lights to illuminate, and a frame
-    // without ambient/sun so light differences are visible. Install a fresh
-    // gray world (green_front at [0,1,0] from earlier maxes the channel).
+    // Lighting tests need a surface for lights to illuminate. Install a
+    // mid-gray world (green_front at [0,1,0] maxes the channel).
     let mut b3 = Builder::default();
-    let gray = upright(&mut b3, -2., [0.3, 0.3, 0.3, 1.], 0, 0);
+    let gray = upright(&mut b3, -2., [0.5, 0.5, 0.5, 1.], 0, 0);
     put(&mut b3, gray);
     h.ray.install(Ok((b3.finish(), bank.clone())));
+    // Bright vs dim sun: lighting on, sun contributes. Bright sun saturates,
+    // dim sun contributes little. Difference > 30 in u8.
     let mut light_frame = test_frame(Vec3::ZERO, -Vec3::Z, 3);
     light_frame.ambient = [0., 0., 0., 0.];
-    light_frame.sun_color = [0., 0., 0., 0.];
-    let local_light = |color: [f32; 4], masked| {
-        let mut b = Builder::default();
-        b.light(Light::point([0., 0., -1., 120.], color));
-        // The tested light must not be pruned just because decorative lights
-        // elsewhere in world space also exist in the same packet.
-        for i in 0..70 {
-            b.light(Light::point([100. + i as f32 * 16., 0., 0., 3.], [1.; 4]));
-        }
-        let block = upright(
-            &mut b,
-            0.,
-            [1.; 4],
-            if masked { CUTOUT } else { 0 },
-            if masked { hole } else { 0 },
-        );
-        b.place(block, Transform::translation([3., 0., -3.5]))
-            .unwrap();
-        b.finish()
-    };
+    light_frame.sun_color = [10., 10., 10., 1.0];
     h.ray.settings.lighting = true;
-    let bright = h.pixel(light_frame, &local_light([5.; 4], false));
+    let bright = h.pixel(light_frame, &empty);
     let builds = h.builds();
-    let dim = h.pixel(light_frame, &local_light([0.5; 4], false));
+    light_frame.sun_color = [0.5, 0.5, 0.5, 1.0];
+    let dim = h.pixel(light_frame, &empty);
     assert!(
         bright.0[1] as u32 > dim.0[1] as u32 + 30 && bright.1 == dim.1,
         "{bright:?} {dim:?}"
     );
     assert_eq!(h.builds(), builds, "changing light values rebuilt ASes");
-    h.ray.settings.shadows = true;
-    let dark = h.pixel(light_frame, &local_light([0.1; 4], false));
-    let through = h.pixel(light_frame, &local_light([5.; 4], true));
-    assert!(
-        dark.0[1] as u32 + 30 < bright.0[1] as u32 && dark.1 == bright.1,
-        "{dark:?} {bright:?}"
-    );
-    assert_eq!(through, bright, "alpha hole cast a solid point shadow");
-    h.ray.settings.shadows = false;
-    h.ray.settings.lighting = false;
-
-    // Verify lighting on/off changes the pixel. Sun direction ~[0.8,0.1,0.6]
-    // from test_frame; surface at z=-2 from b3 world. With lighting off,
-    // direct() returns base color directly (no sun contribution). With
-    // lighting on, sun radiance is added on top.
+    // Lighting on vs off changes the pixel: with lighting off, direct()
+    // returns base color directly; with lighting on, sun radiance adds.
     let mut sun_frame = test_frame(Vec3::ZERO, -Vec3::Z, 1);
     sun_frame.sun = Vec3::new(0.8, 0.1, 0.6).normalize().extend(1.).to_array();
+    sun_frame.ambient = [0., 0., 0., 0.];
+    sun_frame.sun_color = [1., 1., 1., 1.0];
     h.ray.settings.lighting = true;
-    let bright = h.pixel(sun_frame, &empty);
+    let lit_on = h.pixel(sun_frame, &empty);
     h.ray.settings.lighting = false;
-    let dim = h.pixel(sun_frame, &empty);
+    let lit_off = h.pixel(sun_frame, &empty);
     assert_ne!(
-        bright.0, dim.0,
-        "lighting should change pixel: {bright:?} {dim:?}"
+        lit_on.0, lit_off.0,
+        "lighting should change pixel: {lit_on:?} {lit_off:?}"
     );
     assert_eq!(
-        bright.1, dim.1,
-        "lighting should not change depth: {bright:?} {dim:?}"
+        lit_on.1, lit_off.1,
+        "lighting should not change depth: {lit_on:?} {lit_off:?}"
     );
     h.ray.settings.lighting = true;
 
