@@ -3092,13 +3092,18 @@ fn exercise_sun_and_history(h: &mut Harness) {
 
     // Compare the history to independent draws of the same transport seeds.
     // Build the expected EMA on the CPU (linear target, with 8-bit rounding).
+    // Reuse the same raw frames for converged so GPU and CPU EMA are compared
+    // on identical inputs.
     const FRAMES: u32 = 12;
     h.ray.settings.denoiser = Denoiser::None;
     h.ray.settings.progressive = true;
     let mut expected = vec![(0., 0.); SIDE * SIDE];
+    let mut raw_frames = Vec::with_capacity(FRAMES as usize);
     for i in 1..=FRAMES {
         h.ray.reset_history();
-        for ((mean, variance), pixel) in expected.iter_mut().zip(h.pixels(frame, &empty)) {
+        let frame_pixels = h.pixels(frame, &empty);
+        raw_frames.push(frame_pixels);
+        for ((mean, variance), pixel) in expected.iter_mut().zip(raw_frames.last().unwrap().iter()) {
             let noise = f32::sqrt(*variance) / f32::max(0.04, *mean);
             let t = ((noise - 0.05) / 0.35).clamp(0., 1.);
             let alpha = f32::max(1. / i as f32, 0.10 - 0.065 * t * t * (3. - 2. * t));
@@ -3110,18 +3115,17 @@ fn exercise_sun_and_history(h: &mut Harness) {
     let mut converged_mean = vec![0.; SIDE * SIDE];
     let mut converged_var = vec![0.; SIDE * SIDE];
     let mut converged_depth = vec![0.0; SIDE * SIDE];
-    for i in 1..=FRAMES {
-        h.ray.reset_history();
-        let frame_pixels = h.pixels(frame, &empty);
+    for (i, frame_pixels) in raw_frames.iter().enumerate() {
+        let alpha_scale = 1. / (i as f32 + 1.);
         for (((mean, var), depth), pixel) in converged_mean
             .iter_mut()
             .zip(converged_var.iter_mut())
             .zip(converged_depth.iter_mut())
-            .zip(frame_pixels)
+            .zip(frame_pixels.iter())
         {
             let noise = f32::sqrt(*var) / f32::max(0.04, *mean);
             let t = ((noise - 0.05) / 0.35).clamp(0., 1.);
-            let alpha = f32::max(1. / i as f32, 0.10 - 0.065 * t * t * (3. - 2. * t));
+            let alpha = f32::max(alpha_scale, 0.10 - 0.065 * t * t * (3. - 2. * t));
             let delta = f32::from(pixel.0[0]) / 255. - *mean;
             *var = (1. - alpha) * (*var + alpha * delta * delta);
             *mean += alpha * delta;
