@@ -650,7 +650,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     assert_eq!(h.builds(), builds, "changing light values rebuilt ASes");
     h.ray.settings.shadows = true;
     let dark = h.pixel(frame, &local_light([3.; 4], false));
-    let through = h.pixel(frame, &local_light([3.; 4], true));
+    let through = h.pixel(frame, &local_light([100.; 4], true));
     assert!(
         dark.0[1] as u32 + 30 < bright.0[1] as u32 && dark.1 == bright.1,
         "{dark:?} {bright:?}"
