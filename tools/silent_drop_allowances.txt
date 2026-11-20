@@ -129,3 +129,8 @@ src/grass_random.rs:144 unreachable else-continue over a hash seed selection; ev
 src/gfx_effect_gpu.rs:744 unreachable else-continue over an element kind this pass does not draw; the owner names it
 src/gfx_effect_gpu.rs:821 unreachable else-continue over an element kind this pass does not draw; the owner names it
 src/water.rs:725 unreachable else-continue over a record that fails its own bounds check; each branch diags via SceneWater
+# `continuation_path` returns None when there is no such continuation, and that
+# is the caller's answer, not a loss: the name is only built after the range
+# check above has already proven `n` is in range. A stem-less path cannot occur
+# because a package rejected every path without a file stem when it opened.
+src/pck.rs:918 unreachable caller already range-checked n; the stem exists because Package::open rejects a path without one

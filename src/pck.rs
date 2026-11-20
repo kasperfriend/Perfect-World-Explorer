@@ -239,7 +239,7 @@ pub(crate) const REVISIONS: [Revision; 3] = [
 /// here rather than branching on "if version == 0x00020003 and size < ..." is
 /// the point: the condition that separates it from the wide trailer is the
 /// trailer's own bytes, not the package's size on disk.
-pub(crate) const TRAILER_PROBES: [Revision; 1] = [Revision {
+pub(crate) const TRAILER_PROBES: [Revision; 2] = [Revision {
     // Matched against any declared version that has no resolved layout of its
     // own; the guard pair is what actually admits it.
     version: 0,
@@ -254,6 +254,32 @@ pub(crate) const TRAILER_PROBES: [Revision; 1] = [Revision {
     // `0x00020002`'s field order: no dwFlags, description at `+16`. `+12` holds
     // `0xffffffff` in the shipped file, which is *not* a flag word -- reading
     // it as one would refuse a package whose table decodes perfectly.
+    flags_at: None,
+    description_at: 16,
+    guard_byte1: 272,
+},
+// The same narrow field order with the *wide* record size, for a package that
+// declares `0x00020003` but writes a 32-bit table word.
+//
+// 1.8.4's `minimap.pck` is the case: it declares `0x00020003`, writes 288-byte
+// records and guardByte1 at `+272`, but its table offset is 32 bits. Read as a
+// 64-bit word this trailer's field is 2^64 minus 3,147,722,044; its low 32 bits
+// are 1,147,245,252, which leaves 1,862,559 bytes for the 22,269-record table.
+// The table is what decides, as always.
+//
+// Kept separate from the narrow probe above because the two differ in
+// `entry`/`offset_at`, and a probe that guessed would misparse whichever one it
+// guessed wrong.
+Revision {
+    version: 0,
+    header: 280,
+    entry: 288,
+    offset_at: 264,
+    offset_width: 8,
+    size_at: 272,
+    compressed_at: 276,
+    table_offset_at: 8,
+    table_offset_width: 4,
     flags_at: None,
     description_at: 16,
     guard_byte1: 272,
@@ -762,10 +788,34 @@ fn entries_from_trailer(
     // a position past the end or the client's "no table here" sentinel, and
     // "overlaps footer" alone cannot say which; the size word and the offset
     // word are the only evidence there is.
+    //
+    // Report what each *width* would have read, not just the revision's own.
+    // The 1.8.4 `minimap.pck` refusal printed a 64-bit word of 2^64 minus
+    // 3,147,722,044, and that number alone does not say the field is 32 bits:
+    // its low half, 1,147,245,252, is a position that fits, and leaves 1,862,559
+    // bytes for a 22,269-record table -- 83.6 bytes a record. A refusal that
+    // prints only one width hides the reading that would have worked. (The
+    // first draft of this note said 1,862,847; that was the table span derived
+    // from a double-XOR, and the true span is 1,862,559.)
+    // `pos` above is already unmasked, so the alternative widths are just its
+    // halves: a 32-bit reading sees the low word, and a 64-bit reading of a
+    // 32-bit field sees the stored value with whatever follows it glued on.
+    let width_note = match rev.table_offset_width {
+        8 => format!(
+            "; a 32-bit reading of the same field sees {} (the half above it is {:#010x})",
+            pos & 0xffff_ffff,
+            (pos >> 32) as u32
+        ),
+        4 => format!(
+            "; a 64-bit reading of the same bytes sees {}",
+            u64::from(pos as u32)
+        ),
+        _ => String::new(),
+    };
     Err(format!(
         "entry table overlaps footer: the trailer declares its table at {pos} but only \
          {table_end} bytes of this {} (len {}) precede the footer (declared end {end}, base \
-         {base}, count {count}, flags {:#010x}); {}",
+         {base}, count {count}, flags {:#010x}){width_note}; {}",
         if base == 0 { "file" } else { "piece" },
         part_end,
         rev.flags_at
@@ -2916,6 +2966,102 @@ mod tests {
         assert_eq!(entries[0].name, "litmodels/world/44/litmodel_1125.bmd");
         assert_eq!(package.read(&entries[0]).unwrap(), payload);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 1.8.4's `minimap.pck`: `0x00020003`, 288-byte records, and a **32-bit**
+    /// table word.
+    ///
+    /// Every number here is from a real report, not invented. The refusal read
+    /// "the trailer declares its table at 18446744070561829572 but only
+    /// 1149107811 bytes of this file (len 1149108099) precede the footer
+    /// (declared end 1149108099, base 0, count 22269)". 18446744070561829572 is
+    /// 2^64 minus 3,147,722,044, and its low 32 bits are 1,147,245,252: the
+    /// stored bytes are a *32-bit* masked offset with 0xffffffff above them, so
+    /// the 64-bit reading is nonsense while the 32-bit one lands at
+    /// 1,147,245,252 and leaves 1,862,559 bytes for 22,269 records -- 83.6
+    /// bytes a record, which is what a table of 288-byte records compresses to.
+    /// So the table fits, and the package is readable.
+    ///
+    /// Fails before the wide-record/narrow-word probe exists: the only
+    /// candidate then is the revision's own 64-bit reading, and the table is
+    /// declared to start past the end of the file.
+    #[test]
+    fn a_wide_trailer_with_a_dword_table_word_is_read() {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write as _;
+
+        const COUNT: usize = 3;
+        const NAME: &str = "surfaces/minimaps/world/0000.dds";
+        const PAYLOAD: &[u8] = b"minimap tile";
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x4dca23efu32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // patched below
+        bytes.extend_from_slice(&0x56a089b7u32.to_le_bytes());
+        let payload_at = bytes.len() as u64;
+        bytes.extend_from_slice(PAYLOAD);
+        let table_at = bytes.len() as u64;
+
+        for _ in 0..COUNT {
+            // A record is 288 bytes, so compressing it is what a real table
+            // does; `read_entry_table` must inflate it back.
+            let mut record = vec![0u8; 288];
+            record[..NAME.len()].copy_from_slice(NAME.as_bytes());
+            record[264..272].copy_from_slice(&payload_at.to_le_bytes());
+            record[272..276].copy_from_slice(&(PAYLOAD.len() as u32).to_le_bytes());
+            record[276..280].copy_from_slice(&(PAYLOAD.len() as u32).to_le_bytes());
+            let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
+            encoder.write_all(&record).unwrap();
+            let stored = encoder.finish().unwrap();
+            assert!(stored.len() < 288, "the record must actually compress");
+            bytes.extend_from_slice(&((stored.len() as u32) ^ MASK).to_le_bytes());
+            bytes.extend_from_slice(&((stored.len() as u32) ^ MASK ^ CHECK).to_le_bytes());
+            bytes.extend_from_slice(&stored);
+        }
+
+        // The wide trailer, with a DWORD table word at +8 and 0xffffffff above
+        // it -- which is what made the 64-bit reading produce a 2^64-scale
+        // position in the report.
+        let mut header = vec![0u8; 280];
+        header[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
+        header[4..8].copy_from_slice(&0x0002_0003u32.to_le_bytes());
+        header[8..12].copy_from_slice(&((table_at as u32) ^ MASK).to_le_bytes());
+        header[12..16].copy_from_slice(&0xffffffffu32.to_le_bytes());
+        let tag = b"Angelica File Package, Perfect World Co. Ltd.";
+        header[16..16 + tag.len()].copy_from_slice(tag);
+        header[272..276].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&(COUNT as u32).to_le_bytes());
+        bytes.extend_from_slice(&0x0002_0003u32.to_le_bytes());
+        let total = bytes.len() as u32;
+        bytes[4..8].copy_from_slice(&total.to_le_bytes());
+
+        // The 64-bit reading of that field is the nonsense the report printed.
+        let wide = REVISIONS
+            .iter()
+            .find(|r| r.version == 0x0002_0003)
+            .copied()
+            .expect("0x00020003 is a revision");
+        let as_wide = table_offset(&header, &wide).unwrap();
+        assert!(
+            as_wide > total as u64,
+            "the wide reading must be the one that fails: {as_wide} against {total}"
+        );
+        // And the narrow reading is the table's real position.
+        let narrow = TRAILER_PROBES
+            .iter()
+            .find(|r| r.entry == 288 && r.table_offset_width == 4)
+            .expect("a wide-record, narrow-word probe exists");
+        assert_eq!(table_offset(&header, narrow).unwrap(), table_at);
+
+        let path = write_temp(&bytes, "wide-narrow-minimap");
+        let mut file = std::fs::File::open(&path).unwrap();
+        let entries = directory(&mut file).unwrap_or_else(|e| panic!("{e}"));
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(entries.len(), COUNT);
+        assert_eq!(entries[0].name, NAME);
+        assert_eq!(entries[0].offset, payload_at);
     }
 
     /// The same bytes with **no** `.pkx` beside them are a corrupt size word,

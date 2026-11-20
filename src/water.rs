@@ -810,7 +810,28 @@ pub fn load(scene: &Scene, dir: &Path) -> Result<Vec<WaterArea>, String> {
         }
     }
     areas.sort_by_key(|a| a.0);
-    Ok(areas.into_iter().map(|(_, area)| area).collect())
+    let areas: Vec<WaterArea> = areas.into_iter().map(|(_, area)| area).collect();
+    // A world that *references* water and yields none is a loss, not an empty
+    // map: the manifest was read, its records were found, and every one of them
+    // was skipped above. Recording the count here is what makes the difference
+    // between "this map has no water" and "this map's water did not load"
+    // visible in the status counters -- the report that started this was
+    // "0 water areas, 0 cells, 0 of them wet" with nothing beside it.
+    //
+    // A world with no water references at all is the honest empty case, and it
+    // is common: instance maps author none.
+    let referenced = scene.blocks.iter().map(|b| b.water.len()).sum::<usize>();
+    if areas.is_empty() && referenced > 0 {
+        crate::load_status::dropped(
+            crate::load_status::Category::Water,
+            format!(
+                "{} water references across {} blocks, and not one record parsed",
+                referenced,
+                scene.blocks.len()
+            ),
+        );
+    }
+    Ok(areas)
 }
 #[cfg(test)]
 mod tests {
