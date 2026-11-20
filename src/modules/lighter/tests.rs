@@ -627,6 +627,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     light_frame.sun = Vec3::new(0.8, 0.1, 0.6).normalize().extend(1.).to_array();
     light_frame.sun_color = [10., 10., 10., 1.0];
     h.ray.settings.lighting = true;
+    h.ray.settings.shadows = true;
     let bright = h.pixel(light_frame, &empty);
     let builds = h.builds();
     light_frame.sun_color = [0.5, 0.5, 0.5, 1.0];
@@ -636,15 +637,18 @@ fn exercise(mode: Mode, cpu_query: bool) {
         "{bright:?} {dim:?}"
     );
     assert_eq!(h.builds(), builds, "changing light values rebuilt ASes");
-    // Lighting on vs off changes the pixel: with lighting off, direct()
-    // returns base color directly; with lighting on, sun radiance adds.
+    // Lighting on vs off changes the pixel: with lighting off and shadows
+    // off, direct() returns base color directly; with lighting on, sun
+    // radiance adds on top.
     let mut sun_frame = test_frame(Vec3::ZERO, -Vec3::Z, 1);
     sun_frame.sun = Vec3::new(0.8, 0.1, 0.6).normalize().extend(1.).to_array();
     sun_frame.ambient = [0., 0., 0., 0.];
     sun_frame.sun_color = [1., 1., 1., 1.0];
     h.ray.settings.lighting = true;
+    h.ray.settings.shadows = false;
     let lit_on = h.pixel(sun_frame, &empty);
     h.ray.settings.lighting = false;
+    h.ray.settings.shadows = false;
     let lit_off = h.pixel(sun_frame, &empty);
     assert_ne!(
         lit_on.0, lit_off.0,
@@ -655,6 +659,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
         "lighting should not change depth: {lit_on:?} {lit_off:?}"
     );
     h.ray.settings.lighting = true;
+    h.ray.settings.shadows = true;
 
     // Neither secondary destination lies on the primary ray. Verify water
     // transmission without reflections, then turn on reflected visibility.
