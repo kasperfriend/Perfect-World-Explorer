@@ -2124,3 +2124,59 @@ a different file this branch has never read; the sizes differ (the Drive copies 
 `surfaces.pck` are 1,149,108,099 / 690,293,053 / 269,309,408 / 232,590,220 /
 120,297,427 / 100,313,426 / 93,542,325 / 74,388,626 bytes), and 1,149,108,099 is
 the one whose length appears in the refusal, so the two names are the same file.
+
+## B-35: 1.8.4 "no water too" — the area word is `4`, not `0x100SSSSS` (fixed)
+
+**What the client says** (1.8.4, from the shipped `world.ecwld` + `world.ecbsd`):
+
+> water 99: BSData 3 (BSData/4.dat) record 1 skipped: not a water record: the
+> zlib frame does not inflate: deflate decompression error
+> 0 water areas, 0 cells, 0 of them wet
+
+**The cause.** Two facts about the 1.8.4 records, both measured on the files
+rather than inferred from the loader:
+
+1. Their `dwVersion` is a plain `u32 4`. Every earlier revision writes a
+   `0x100SSSSS` word, so `parse_record` saw `4` and reported it as "neither a
+   known `A3DWaterArea` version nor a plausible zlib frame". `BSData/7.dat`
+   record 0 — a complete 32×32 area whose 46 shoreline waves end exactly at the
+   end of the record with `shaders\textures\water\wave1.dds` — is the fixture
+   that proves it, and `4.dat` records 1 and 8 and `44.dat` record 9 agree.
+2. `decode_areas` placed the first area's fields eight bytes past the version
+   word, which is right for a `0x100SSSSS` prefix and wrong for v4. That alone
+   turned a valid grid into nonsense even once the word was accepted.
+
+**The v4 field order is v2/v3's, with one change far downstream.** Measured on
+`7.dat` record 0, offsets relative to the version word + 4:
+
+| offset | field | value |
+|---|---|---|
+| +0 | `dwColor` | 4 |
+| +4 | `fHeight` | 216.0 |
+| +12 / +16 | `dwColumns` / `dwRows` | 32 / 32 |
+| +20 | `fCellSize` | 32.0 |
+| +24 | `vCenter` | 2560, 216, 5120 |
+| +120 | `byCellMask[cols*rows]` | 1024 B, **533 set** |
+| +1144 | `dwWaveCount` | 46, waves run to EOF |
+
+So the difference from v2/v3 is not a reordering: v4 inserts 84 bytes of fields
+between the centre vector and the mask, which moves the mask from +37 to +120.
+
+**Result.** 5 of the 7 water references whose patch is in hand decode as grids:
+`4.dat` 1 (32×32, 17 wet) and 8 (8×8, 39), `7.dat` 0 (32×32, 533), `21.dat` 0
+(60×64, 900), `44.dat` 9 (8×32, 99). The two that do not are `21.dat` records 15
+and 25: they inflate to 32768 bytes whose contents hold no water word at all,
+because they belong to other BSData tables that share the patch. They are refused
+by name, not counted as water.
+
+**Two things deliberately not widened**, because the data does not ask for them:
+
+- `pck::inflate` keeps its exact-size-and-`StreamEnd` contract. All 160
+  zlib-framed water records in the 1.8.4 patches declare a `stored` length that
+  fits inside their record and inflate to exactly `raw` with a real end marker.
+  A lenient variant was tried and removed: nothing needed it, and an unused
+  relaxation of a shared reader is a liability.
+- there is no "try the bytes as an area with no version word" fallback. No real
+  record needs one, and a record whose first word is a small integer reads as a
+  plausible grid (a zero-filled mask is valid), which is how the two non-water
+  `21.dat` records above would have come back as water.
