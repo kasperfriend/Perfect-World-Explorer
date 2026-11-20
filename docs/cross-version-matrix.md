@@ -496,7 +496,19 @@ only id the player counts without performing it (`Findings/Unsupported-client-pa
 
 One line per numbered item, with what settled it. "static" means the claim was
 read out of the source and traced by hand; "measured" means a number came from
-running a reader over a file. Numbers from CI log lines are marked *CI*.
+running a reader over a file — in this session that means Python over a file
+downloaded from Drive, not Rust. Numbers from CI log lines are marked *CI*.
+
+**What CI confirmed, and what it did not.** Run `44706594863` on commit
+`719c8a3` is green on both jobs: "Rust checks and tests (Linux)" and "Windows
+executable (x64)". On the Linux job, step 18 *Run viewer unit tests* and step 19
+*Check formatting* both report success, which is what makes the tests below
+compiled and passing rather than merely written. **The log text itself is not
+retrievable through this environment's API** (the log endpoint returns an empty
+body), so no pass or skip *count* in this document is quoted from CI: the counts
+here come from static reading, and the green/red verdict is from the job and step
+conclusions, which are readable. A number that is not from static reading is
+labelled *measured* and carries the file it was measured on.
 
 **1.1 — PCK trailer layouts tested from independent fixtures: done.**
 Three shipped trailers are now recorded as literal hex — `TREES_184_TRAILER`
