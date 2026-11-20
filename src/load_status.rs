@@ -206,7 +206,10 @@ mod tests {
         assert!(summary().is_empty(), "nothing lost means an empty summary");
 
         assert!(dropped(Category::Water, "record 6 of 8.dat: version 0x1af"));
-        assert!(!dropped(Category::Water, "record 7 of 8.dat: version 0x1af"));
+        assert!(!dropped(
+            Category::Water,
+            "record 7 of 8.dat: version 0x1af"
+        ));
         assert_eq!(dropped_count(Category::Water), 2);
         assert_eq!(
             reasons(Category::Water),
@@ -344,7 +347,10 @@ mod empty_tests {
     fn empty_with_a_recorded_reason_is_allowed() {
         let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset();
-        dropped(Category::Water, "record 6 of 8.dat: unsupported version 0x1af");
+        dropped(
+            Category::Water,
+            "record 6 of 8.dat: unsupported version 0x1af",
+        );
         assert!(assert_not_silently_empty(Category::Water, 0, Some(8)).is_ok());
         reset();
     }

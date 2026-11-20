@@ -12,6 +12,8 @@ mod dxt;
 #[cfg(windows)]
 #[path = "../launcher_ui.rs"]
 mod launcher_ui;
+#[path = "../load_status.rs"]
+mod load_status;
 #[cfg(windows)]
 #[path = "../model_dds.rs"]
 mod model_dds;
@@ -21,8 +23,6 @@ mod pck;
 #[cfg(windows)]
 #[path = "../scene.rs"]
 mod scene;
-#[path = "../load_status.rs"]
-mod load_status;
 #[cfg(windows)]
 #[path = "../tree_source.rs"]
 mod tree_source;

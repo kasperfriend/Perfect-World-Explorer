@@ -278,7 +278,11 @@ fn parse_instance_text(text: &str) -> Vec<InstanceRecord> {
             // it is counted with the line that lost it.
             crate::load_status::dropped(
                 crate::load_status::Category::Instances,
-                format!("instance list line {}: no numeric id in {:?}", i + 1, fields[0]),
+                format!(
+                    "instance list line {}: no numeric id in {:?}",
+                    i + 1,
+                    fields[0]
+                ),
             );
             continue;
         };
