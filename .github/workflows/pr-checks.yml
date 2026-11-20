@@ -139,24 +139,29 @@ jobs:
       # the five fps enums is generated from `main.rs` and checked for staleness,
       # because those enums ARE the persisted spellings.
       - name: Settings persistence
-        run: bash tools/offline_harness.sh settings
+        # The step log cannot be read from the agent's side, and this step has
+        # twice failed with no annotation at all, which makes the failure
+        # undiagnosable. Capture the output and republish the tail as
+        # annotations, which *are* readable. Chunked because an annotation is
+        # capped in length.
+        run: bash tools/ci-run-and-annotate.sh settings
       # The baked draw-state table: stage, alpha test, cull, blend and the
       # z-fight/winding rules, including which meshes a mirrored placement may
       # reverse. `cargo test` above does reach these, but only as part of the
       # whole viewer binary; this runs them alone, so a failure names the table.
       - name: Baked draw-state table
-        run: bash tools/offline_harness.sh bmd-baked
+        run: bash tools/ci-run-and-annotate.sh bmd-baked
       # The decoded-texture cache, its byte-budgeted LRU and the world model
       # list. P3.08 cites the eviction test as its residency proof, and until
       # now nothing outside the viewer target compiled it.
       - name: Texture cache and world model list
-        run: bash tools/offline_harness.sh objects
+        run: bash tools/ci-run-and-annotate.sh objects
       # The launcher's own tests. `src/launcher_ui.rs` is `#[cfg(windows)]`, so
       # nothing on this job compiled it; the mode strips its two `#[link]`
       # attributes into a copy and runs the module's five tests, including the
       # persistence of its low-memory checkbox.
       - name: Launcher settings
-        run: bash tools/offline_harness.sh launcher
+        run: bash tools/ci-run-and-annotate.sh launcher
       - name: Measure staged precinct files
         run: |
           # An array, not a newline-joined string: `$roots` unquoted from
