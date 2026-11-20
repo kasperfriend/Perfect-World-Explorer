@@ -672,7 +672,7 @@ blank.
 | music precinct | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | 1 precinct.clt files | blocked: no `ci-results/pw-2016.json` |
 | sounds | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | 1044 authored sound refs | blocked: no `ci-results/pw-2016.json` |
 | zone names | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | the ECWLD carries no zone table; zone names are the precinct's (see the music precinct row) | blocked: no `ci-results/pw-2016.json` |
-| instances | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | a64:0types/0trees a84:20types/417trees a91:0types/0trees | blocked: no `ci-results/pw-2016.json` |
+| instances | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | a64:0types/0trees/34grasstypes/1936grass a84:20types/417trees/57grasstypes/6720grass a91:0types/0trees/23grasstypes/13328grass | blocked: no `ci-results/pw-2016.json` |
 | DDS textures | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
 | package trailers (pck) | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | 1 packs, all directories read | blocked: no `ci-results/pw-2016.json` |
 | package trailers (angelica) | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
@@ -710,7 +710,6 @@ Read out of the source, not measured, and labelled as such:
 - Water and terrain refusals name the file since the change to `water::load`; before it, `water (BSData)` reported a bare errno.
 
 <!-- END GENERATED MATRIX -->
-
 ## Status of every item, 1 to 4
 
 One line per item, each labelled. `measured (CI file)` means the number comes
@@ -756,7 +755,7 @@ each was a test that could not fail:
 |---|---|
 | 3.1 six clients plus the 2016 pack | **blocked** for 1.3.1, 1.3.6, 1.4.2, 1.4.4, 1.5.2 and the 2016 pack: no `ci-results/<client>.json` exists, because only the 1.8.4 fixture is staged in the repository. Closing it needs those clients' world files, `trees.pck` and instance maps committed under `tests/fixtures/clients/<name>/` (each file under 100 MiB); the measure step then writes the JSON with no code change. **measured (CI file)** for 1.8.4. |
 | 3.2 all fifteen categories | **measured (CI file)** for 1.8.4 and **blocked** for the rest, per category, in the generated table above. |
-| 3.3 OK / NAMED-REFUSAL / SILENT | **measured (CI file)**: 7 ok, 1 named refusal, 0 SILENT. Several categories are `blocked: not in the staged fixture`, which is a property of a staged subset and not a claim about the client. |
+| 3.3 OK / NAMED-REFUSAL / SILENT | **measured (CI file)**: of the fifteen named categories, 7 ok, 1 named refusal, 0 SILENT; the JSON also carries an eighth `ok` for grass, which the task's category list does not name and the table above therefore omits. Several cells are `blocked: not in the staged fixture`, which is a property of a staged subset and not a claim about the client. |
 | 3.4 written from the JSON, not from memory | **measured**: the generated block is produced by `tools/matrix-from-ci.py` from `ci-results/*.json`, and every cell carries one of the three labels. |
 
 ### 4. Standing open items
@@ -770,7 +769,7 @@ each was a test that could not fail:
 | 4.5 lightmap 256x256 | **static (`src/terrain_lightmaps.rs`)**: `tile_side` decides from the file; the 256 assumption is not asserted anywhere in the new path. |
 | 4.6 `angelica_pck.rs:116` single revision table | **static (`src/angelica_pck.rs`)**: still one table. |
 | 4.7 encrypted packages | **static (`src/pck.rs`)**: `ENCRYPTED_FLAG 0x8000_0000` is recognised and the entry is refused by name; no encrypted package is staged, so it is not measured. |
-| 4.8 grass | **measured (CI file)** for the world: `ecwldGrassTypes` 254 and `ecwldGrassPlacements` 39116 in `ci-results/pw-184.json`. **Not measured**: the instance maps' grass counts, because the tool records only their tree counts in `instances`; adding `grassTypes` per instance to that fact would close it. |
+| 4.8 grass | **measured (CI file)**: the world authors 254 grass types and 39116 placements, `a84` 57/6720, `a91` 23/13328 and `a64` 34/1936, all from `ci-results/pw-184.json`. Note `a91` and `a64` author grass while authoring no trees at all, which is why a zero tree count there is authored and not lost. |
 | 4.9 count caps | **static**: `ENTRY_LIMIT 1_000_000`, `MAX_TREE_TYPES 4096`, `MAX_GRASS_TYPES 4096`, `MAX_BSDATA_FILES 10_000`, `MAX_REASONS 512` in `src/load_status.rs`. |
 | 4.10 audio codecs | **static**: unchanged in this work. |
 | 4.11 drive-dependent tests report "skipped" and are counted | **static**: the harness modes report their skip; this environment cannot run them. |
