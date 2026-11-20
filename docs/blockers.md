@@ -2059,52 +2059,68 @@ geometry, not trees. Tree geometry comes from `trees.pck`, which is checked byte
 for byte at three client versions. So the tree verdict in
 `docs/cross-version-matrix.md` stands without this.
 
-## B-34: the 1.8.4 minimap cannot be settled from the refusal it prints
+## B-34: the 1.8.4 minimap -- wide trailer, 32-bit table word (cause found)
 
-**What the client says.** `Original minimap: 00020003: … table at
-18446744070561829572 … (declared end 1149108099, base 0, count 22269, flags
-0x00000000); neither reading fits …; 00000000: not an Angelica file package`.
+**What the client says** (1.8.4, `element/surfaces.pck`, 1,149,108,099 bytes):
 
-**What the arithmetic says, and it is not what it first appears.** That position
-is 2^64 − 3,147,722,044. Its low 32 bits are 1,147,245,252: a position that fits,
-leaving 1,862,559 bytes for 22,269 records, or 83.6 bytes each — exactly what
-288-byte records deflate to. So the trailer's field is a **32-bit** word with
-`0xffffffff` above it, and the 64-bit reading is nonsense.
+> 00020003: entry table overlaps footer: the trailer declares its table at
+> 18446744070561829572 but only 1149107811 bytes of this file (len 1149108099)
+> precede the footer (declared end 1149108099, base 0, count 22269, flags
+> 0x00000000); a 32-bit reading of the same field sees 1147245252 (the half above
+> it is 0xffffffff); neither reading fits inside the footer; 00000000: not an
+> Angelica file package (description tag missing)
 
-This is *not* a signed-word problem. `pck::table_offset` already unmasks the value
-it returns, so reading it as `i64` double-transforms and `^ MASK`-ing it again
-produces a wrong table span. The alternative width is the value's low 32 bits,
-full stop. Both of those wrong models were tried and are recorded here so they are
-not retried.
+**The cause, from the two halves of that line.**
 
-**Why that still is not a fix.** `TRAILER_PROBES[0]` already has exactly this
-geometry — 280-byte struct, 288-byte records, table word at `+8` read as a DWORD,
-description at `+16`, guard at `+272` — so a package of this shape already opens,
-and 1.8.4's `trees.pck` (which shares the geometry) is read today. A probe row
-added for the "new" shape turned out to be byte-for-byte identical to that one and
-was withdrawn.
+`flags 0x00000000` is this reader's own flag word, so it was read from `+16`. In
+the **wide** `0x00020003` layout `+16` is `dwFlags`; in the **narrow**
+`0x00020002` layout it is the first four bytes of `"Angelica..."`, which are
+`0x65676e41` and never zero. A zero there can only be a real `dwFlags`, so this
+file's field order is the wide one: 280-byte struct, `dwFlags` at `+16`,
+`szDescription` at `+20`, and that 252-byte region ends exactly at `guardByte1`
+at `+272`.
 
-So the real `surfaces.pck` fails after the table position is found: the table
-walk, which is what proves a candidate, does not complete. The refusal prints the
-position and the count but not which record the walk stopped on, and there is no
-way to reconstruct that from a decimal in a log.
+The table word is the other half. `18446744070561829572` is 2^64 minus
+3,147,722,044; its low half is 1,147,245,252, leaving 1,862,559 bytes for 22,269
+records — 83.6 bytes each, which is what 288-byte records deflate to.
 
-**The exact measurement that would settle it.** Read the last 288 bytes of
-1.8.4's `element/surfaces.pck` and the entry count at `end - 8`, then walk that
-many 288-byte records from `table_at` and report the first record whose name
-decode or offset+size falls outside the file. That is one pass over the table, and
-it names the record rather than leaving a number to be guessed at.
+So the struct is wide and the table word is 32 bits, and no candidate covered
+that pair: `REVISIONS`' `0x00020003` read 64 bits, and `TRAILER_PROBES[0]` read 32
+bits but looked for the description at `+16`. The trailing *"description tag
+missing"* is that probe reaching the tag check and being turned away — the table
+was never walked, which is why the arithmetic that looked right changed nothing.
 
-**How to unblock.** Place `surfaces.pck` (and its `.pkx` if split) in
-`google_drive/`, then run `tools/offline_harness.sh pck google_drive`. The file
-size is unknown — the minimap tiles of a full client may put it over the 100 MiB
-transfer cap that blocks `litmodels.pck` (B-33); if so, only the trailer and the
-table region are needed, which is a few hundred KB.
+**Fixed:** `TRAILER_PROBES` gains the wide-order/narrow-word row, and
+`surfaces_trailer_with_zero_flags_and_a_dword_word_is_read` assembles the shipped
+shape and asserts the narrow probe is refused on the description while the new one
+is admitted and `directory()` returns the entries.
 
-**Two things the report and this build disagree about, both worth checking.**
-The error names a `minimap.pck`; `src/navigation.rs` opens
-`element/surfaces.pck` at `compose_optional`. And the message reaches the console
-through a bare `eprintln!` in `src/gpu.rs`, not a `diag!` channel, so it appears
-with no channel around it — which is why it looked like a different subsystem's
-error. If the user's build really does open `minimap.pck`, that is a second file
-this branch has never read.
+**Two wrong models, recorded so they are not retried.**
+
+1. It is *not* a signed-word problem. `pck::table_offset` already unmasks what it
+   returns, so reading the field as `i64` double-transforms it, and `^ MASK`-ing
+   the value it already returned produces a bogus table span. The alternative
+   width is the value's low 32 bits, full stop.
+2. It was *not* a missing width. A DWORD probe already existed; what was missing
+   was the *field order* to go with it.
+
+**Still unverified, and this is the remaining risk.** `surfaces.pck` is
+1,149,108,099 bytes, over the 100 MiB transfer cap, so the trailer was
+reconstructed from the refusal's own numbers rather than read. If the file's
+description actually sits at `+16` after all, the fix is aimed at the wrong field
+and the refusal will say so again.
+
+**How to confirm without transferring a gigabyte.** Only the last 288 bytes and
+the table region matter. Read the trailer at `len - 288` and print, for
+`+0`, `+4`, `+8`, `+12`, `+16`, `+20`: whether `guardByte0` is `0xfdfdfeee`,
+the version word (expect `0x00020003`), the table word, and the four bytes at each
+of `+16` and `+20`. A zero at `+16` followed by `Ange` at `+20` confirms this
+diagnosis outright; `Ange` at `+16` refutes it.
+
+**A second file, if the error came from one.** The message says "Original minimap"
+and the report names `minimap.pck`, while `src/navigation.rs` opens
+`element/surfaces.pck`. If the user's build really opens a `minimap.pck`, that is
+a different file this branch has never read; the sizes differ (the Drive copies of
+`surfaces.pck` are 1,149,108,099 / 690,293,053 / 269,309,408 / 232,590,220 /
+120,297,427 / 100,313,426 / 93,542,325 / 74,388,626 bytes), and 1,149,108,099 is
+the one whose length appears in the refusal, so the two names are the same file.
