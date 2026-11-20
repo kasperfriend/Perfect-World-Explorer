@@ -233,6 +233,9 @@ pub struct ExecutableInfo {
     pub known: Option<&'static str>,
     /// `VS_VERSIONINFO` string, when the build has one.
     pub file_version: Option<String>,
+    /// `config\element\version.sw` beside the executable, when the client
+    /// ships one. This is the release version the client labels itself with.
+    pub release_version: Option<String>,
     pub product_version: Option<String>,
     pub pe_timestamp: Option<u32>,
 }
@@ -256,6 +259,41 @@ impl ExecutableInfo {
 
     pub fn is_known(&self) -> bool {
         self.known.is_some()
+    }
+
+    /// The game build a card row shows, labelled by where the number comes
+    /// from.
+    ///
+    /// A client that ships a `config\element\version.sw` states its release
+    /// version there, and that is the only self-description that reads as a
+    /// release: 1.8.4's file holds the three numbers the client's own
+    /// `Txt_ProgramVersion` label is formatted from, and the strings beside
+    /// that path in `elementclient.exe` are literally `%.d...%.d...%.d`. When
+    /// such a file exists it wins, because it is what a player recognises.
+    ///
+    /// Without one, the `VS_VERSIONINFO` numbers are all the executable says
+    /// about itself. They are a *resource* version and look nothing like a
+    /// retail build number -- 1.8.4 declares `1,0,0,6154` in both
+    /// `VS_FIXEDFILEINFO` and its string table, and `6154` is the revision of
+    /// the resource, not of the game -- so the row names the field it came from
+    /// rather than printing a bare number that reads like a game build. The
+    /// retail engine version is not recorded anywhere in that executable and is
+    /// not invented here.
+    pub fn version_row(&self) -> String {
+        if let Some(release) = &self.release_version {
+            return release.clone();
+        }
+        let declared = if self.product_version == self.file_version {
+            self.file_version.clone()
+        } else {
+            self.product_version
+                .clone()
+                .or_else(|| self.file_version.clone())
+        };
+        match declared {
+            Some(version) => format!("{version} (resource version)"),
+            None => "unverified build".into(),
+        }
     }
 
     /// Data revisions this fingerprint was inspected with, as
@@ -378,14 +416,7 @@ impl Scan {
     pub fn game_version(&self) -> String {
         match &self.executable {
             Some(exe) if exe.is_known() => exe.label().trim_start_matches("PW ").to_string(),
-            Some(exe) => match exe
-                .file_version
-                .clone()
-                .or_else(|| exe.product_version.clone())
-            {
-                Some(version) => version,
-                None => "unverified build".into(),
-            },
+            Some(exe) => exe.version_row(),
             None => "no executable".into(),
         }
     }
@@ -462,6 +493,11 @@ impl Scan {
                             product.as_deref().unwrap_or("-")
                         ));
                     }
+                }
+                if let Some(release) = &exe.release_version {
+                    out.push_str(&format!(
+                        "  release   {release} (config\\element\\version.sw)\n"
+                    ));
                 }
                 out.push_str(&format!("  identity  {}\n", exe.label()));
                 if let Some(versions) = exe.known_data_versions() {
@@ -643,10 +679,43 @@ fn scan_executable(element: &Path) -> (Option<ExecutableInfo>, Option<String>) {
             known: known.map(|build| build.label),
             file_version,
             product_version,
+            release_version: release_version(element),
             pe_timestamp,
         }),
         None,
     )
+}
+
+/// The release version a client labels itself with, from
+/// `config\element\version.sw`.
+///
+/// This is the one number a player recognises. The client's own UI puts it on
+/// a `Txt_ProgramVersion` label formatted with `%.d...%.d...%.d` -- the three
+/// strings sit beside this exact path in the 1.8.4 `elementclient.exe` -- so
+/// the file is a real, client-read release marker and not a patcher leftover
+/// like the `<pack>\version.sw` inside a `.pck`.
+///
+/// It is read as text and reported as written, whitespace collapsed: the
+/// formats in circulation are a dotted `1.8.4` and a bare build number, and
+/// picking which digits "are" the version would be a guess. A file that is
+/// absent, empty or not text is simply not reported, and the row falls back to
+/// the executable's own resource version.
+fn release_version(element: &Path) -> Option<String> {
+    let path = find_file(element, "config/element/version.sw")?;
+    let bytes = fs::read(&path).ok()?;
+    // A release marker is a few bytes of text. Anything larger is a different
+    // file wearing the name, and reading it into a label would be noise.
+    if bytes.len() > 4096 {
+        return None;
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    let text = text
+        .trim()
+        .trim_matches('\u{feff}')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!text.is_empty()).then_some(text)
 }
 
 /// `VS_VERSIONINFO` strings. Every real Perfect World build carries them, and
@@ -1449,6 +1518,65 @@ mod tests {
             digest(b"hello"),
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
+    }
+
+    /// The `game` row: a client that ships `config\\element\\version.sw` states
+    /// its release there, and that beats the resource version; without one the
+    /// row says which field the number came from.
+    ///
+    /// 1.8.4's executable declares `1,0,0,6154` and that is all it says about
+    /// itself. Printed bare, `6154` reads like a game build and is not one --
+    /// it is the revision of the version resource -- so the row names the
+    /// field instead of inventing a release number the file does not contain.
+    #[test]
+    fn the_game_row_names_the_field_it_read() {
+        fn exe(release: Option<&str>) -> ExecutableInfo {
+            ExecutableInfo {
+                path: "elementclient.exe".into(),
+                size: 18_665_000,
+                sha256: "0".repeat(64),
+                pe32: true,
+                parsed_as_pe: true,
+                known: None,
+                file_version: Some("1,0,0,6154".into()),
+                product_version: Some("1,0,0,6154".into()),
+                release_version: release.map(str::to_string),
+                pe_timestamp: None,
+            }
+        }
+        assert_eq!(
+            exe(Some("1.8.4")).version_row(),
+            "1.8.4",
+            "a client-declared release version is what a player recognises"
+        );
+        assert_eq!(
+            exe(None).version_row(),
+            "1,0,0,6154 (resource version)",
+            "without one, the row must not present a resource revision as a game build"
+        );
+    }
+
+    /// `config\\element\\version.sw` is the client's own release marker, read as
+    /// written rather than parsed into parts it does not promise.
+    #[test]
+    fn the_release_marker_is_read_as_written() {
+        let root = std::env::temp_dir().join(format!("pw-version-sw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("config/element")).unwrap();
+        let marker = root.join("config/element/version.sw");
+        assert_eq!(release_version(&root), None, "absent marker is not reported");
+        std::fs::write(&marker, "1.8.4\r\n").unwrap();
+        assert_eq!(release_version(&root).as_deref(), Some("1.8.4"));
+        // A bare build number is the other format in circulation; it is
+        // reported as itself rather than sliced into a version triple.
+        std::fs::write(&marker, " 3300 \n").unwrap();
+        assert_eq!(release_version(&root).as_deref(), Some("3300"));
+        // Not text, or empty: no label from it.
+        std::fs::write(&marker, [0xff, 0xfe, 0x00]).unwrap();
+        assert_eq!(release_version(&root), None);
+        std::fs::write(&marker, "   \n").unwrap();
+        assert_eq!(release_version(&root), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
