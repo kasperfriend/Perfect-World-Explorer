@@ -1062,7 +1062,11 @@ mod tests {
     fn a_location_labels_itself_from_the_display_name() {
         let location = Location::new("a01", "Archosaur", "祖龙城");
         assert_eq!(location.label, "Archosaur (a01)");
-        assert_eq!(location.needles, vec!["Archosaur", "a01"]);
+        // All three identifiers are needles, longest first: the display name,
+        // then the client's own name from `instance.txt`, then the folder id.
+        // Dropping the client name would lose the only form a localized client
+        // is likely to have used in an archive.
+        assert_eq!(location.needles, vec!["Archosaur", "祖龙城", "a01"]);
         // A destination with no display name falls back to its id.
         assert_eq!(Location::new("world", "", "").label, "world");
     }
