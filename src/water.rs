@@ -1402,11 +1402,12 @@ mod tests {
     /// step of that chain was broken at once for 1.8.4, and each step is a
     /// separate way to end up with "0 water areas".
     ///
-    /// The staged world retains the client's 1.8.4 header and 22,528-block
-    /// grid. Its blocks were re-emitted to satisfy `Scene::load`'s exact-span
-    /// check, and its water list was reduced to four references, one per
-    /// selected patch. The matching manifest and referenced `BSData/N.dat`
-    /// files are staged beside the world file, as its manifest paths require.
+    /// The staged world retains the client's 1.8.4 header, 22,528-block grid,
+    /// all non-water block payloads, and both type tables. Blocks were
+    /// re-emitted after reducing the water list to four references, one per
+    /// selected patch, so the real tree and grass counts remain measurable too.
+    /// The matching manifest and referenced `BSData/N.dat` files are staged
+    /// beside the world file, as its manifest paths require.
     #[test]
     fn the_staged_184_client_loads_water_through_the_real_loader() {
         let element = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
