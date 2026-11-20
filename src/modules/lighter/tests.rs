@@ -629,7 +629,8 @@ fn exercise(mode: Mode, cpu_query: bool) {
         [-1., -1., -2.],
         [1., -1., -2.],
     ] {
-        mesh.vertices.push(Vertex::new(p, [0., 0., 1.], [0., 0.]).tint(0, 0));
+        mesh.vertices
+            .push(Vertex::new(p, [0., 0., 1.], [0., 0.]).tint(0, 0));
     }
     mesh.tri([0, 2, 1], sid);
     mesh.tri([1, 2, 3], sid);
