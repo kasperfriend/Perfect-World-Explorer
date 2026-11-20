@@ -637,7 +637,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     // Dark green world so lighting differences are visible (green_front at
     // [0,1,0] maxes the green channel and hides light differences).
     let mut b3 = Builder::default();
-    let dark_green = upright(&mut b3, -0.5., [0., 0.4, 0., 1.], 0, 0);
+    let dark_green = upright(&mut b3, -0.5f32, [0., 0.4, 0., 1.], 0, 0);
     put(&mut b3, dark_green);
     h.ray.install(Ok((b3.finish(), bank.clone())));
     let bright = h.pixel(frame, &local_light([3.; 4], false));
