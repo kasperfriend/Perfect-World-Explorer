@@ -246,16 +246,31 @@ jobs:
           : >"$log"
           # Mesa has renamed the software ICD more than once, so look for any
           # lavapipe driver description rather than one exact file name.
-          icd=""
-          for dir in /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d /etc/vulkan/icd.d; do
-            found="$(find "$dir" -maxdepth 1 -name '*lvp*' -print -quit 2>/dev/null || true)"
-            if [ -n "$found" ]; then icd="$found"; continue; fi
-          done
-          # Some Mesa packages install the JSON nowhere the directories above
-          # look. A wider search keeps a working driver from being reported as
-          # "missing", and reports the file it found so the log says where.
+          #
+          # The step above is not trusted to have left a usable driver: the
+          # runner image has twice reported the package installed with no ICD
+          # file on disk, which failed this test with exit 41 without ever
+          # running it. Repairing it here means this step depends only on
+          # itself, and the install is a no-op on an image that is already
+          # correct.
+          find_icd() {
+            local dir found
+            for dir in /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d \
+              /etc/vulkan/icd.d; do
+              found="$(find "$dir" -maxdepth 1 -name '*lvp*' -print -quit 2>/dev/null || true)"
+              if [ -n "$found" ]; then echo "$found"; return 0; fi
+            done
+            # Some Mesa packages install the JSON nowhere the directories above
+            # look; a wider search keeps a working driver from being reported
+            # as missing.
+            find / -xdev -name '*lvp*.json' -print -quit 2>/dev/null || true
+          }
+          icd="$(find_icd)"
           if [ -z "$icd" ]; then
-            icd="$(find / -xdev -name '*lvp*.json' -print -quit 2>/dev/null || true)"
+            echo "no lavapipe ICD found; reinstalling mesa-vulkan-drivers" >>"$log"
+            sudo apt-get install -y --no-install-recommends --reinstall \
+              mesa-vulkan-drivers >>"$log" 2>&1 || true
+            icd="$(find_icd)"
           fi
           echo "VK_ICD_FILENAMES=$icd" >>"$log"
           ls -l /usr/share/vulkan/icd.d >>"$log" 2>&1 || true
