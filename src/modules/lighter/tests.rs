@@ -616,7 +616,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
 
     let local_light = |color: [f32; 4], masked| {
         let mut b = Builder::default();
-        b.light(Light::point([6., 0., -2., 12.], color));
+        b.light(Light::point([0., 0., -1., 12.], color));
         // The tested light must not be pruned just because decorative lights
         // elsewhere in world space also exist in the same packet.
         for i in 0..70 {
