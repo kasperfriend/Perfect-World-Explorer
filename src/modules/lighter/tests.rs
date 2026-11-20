@@ -623,7 +623,12 @@ fn exercise(mode: Mode, cpu_query: bool) {
     surf = surf.with_lighting([0.5, 0.5, 0.5, 1.], [0., 0., 0., 0.], [0., 0., 0., 0.]);
     let sid = b3.surface(surf);
     let mut mesh = Mesh::default();
-    for p in [[-1., 1., -2.], [1., 1., -2.], [-1., -1., -2.], [1., -1., -2.]] {
+    for p in [
+        [-1., 1., -2.],
+        [1., 1., -2.],
+        [-1., -1., -2.],
+        [1., -1., -2.],
+    ] {
         mesh.vertices.push(Vertex::new(p, [0., 0., 1.], [0., 0.]).tint(0, 0));
     }
     mesh.tri([0, 2, 1], sid);
