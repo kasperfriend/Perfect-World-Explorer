@@ -655,7 +655,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
     let lit_off = h.pixel(sun_frame, &empty);
     // Never output black: at least one of lighting on/off must be non-black.
     assert!(
-        lit_on.0 != [0,0,0,255] || lit_off.0 != [0,0,0,255],
+        lit_on.0 != [0, 0, 0, 255] || lit_off.0 != [0, 0, 0, 255],
         "lighting should not output black: {lit_on:?} {lit_off:?}"
     );
     assert_eq!(
