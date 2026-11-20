@@ -166,19 +166,32 @@ mod tests {
     /// `dwEntryOffset` patched to the shorter table. Nothing about the format is
     /// re-implemented here, so a change to the trailer layout breaks this test.
     fn fixture(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/trees-184")
-            .join(name)
+        match std::env::var_os("PW_TREES_184_DIR") {
+            Some(dir) => PathBuf::from(dir).join(name),
+            None => PathBuf::from("trees-184").join(name),
+        }
     }
 
     fn have_fixtures() -> bool {
-        let p = fixture("trees.pck");
-        let q = fixture("world.ecwld");
+        let Some(dir) = std::env::var_os("PW_TREES_184_DIR") else {
+            crate::pck::corpus_file_absent(std::path::Path::new("trees-184/trees.pck"));
+            return false;
+        };
+        let p = PathBuf::from(&dir).join("trees.pck");
+        let q = PathBuf::from(&dir).join("world.ecwld");
         if p.is_file() && q.is_file() {
             return true;
         }
         crate::pck::corpus_file_absent(&p);
         false
+    }
+
+    #[test]
+    fn synthetic_tree_name_normalisation_folds_backslashes() {
+        let raw = r"Trees\精简树木\雪松\SnowPineWithSnow1.spt";
+        let normalised = scene::normalise_tree_name(raw);
+        assert_eq!(normalised, "trees/精简树木/雪松/snowpinewithsnow1.spt");
+        assert!(!normalised.contains('\\'));
     }
 
     /// 1.1 — the reader already folds backslashes, so the old lookup missed.

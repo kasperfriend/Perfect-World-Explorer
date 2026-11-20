@@ -10,7 +10,12 @@ use crate::{
     scene_lights::{DynamicLight, LightPublications, SceneLights, StaticGrid},
     world_models::Assets,
 };
-use std::{collections::HashMap, fs::File, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs::File,
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 #[path = "terrain_cutoff.rs"]
 mod cutoff_residency;
 
@@ -110,6 +115,142 @@ pub struct AlphaStatus {
     pub slots: usize,
 }
 
+/// Named counters for world-model loading, posing, culling, and drawing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorldModelStatus {
+    pub placements_in_map: usize,
+    pub selected: usize,
+    pub drawn: usize,
+    pub names_not_resolved: usize,
+    pub versions_refused: Vec<(String, usize)>,
+    pub archives_not_indexed: Vec<(String, String)>,
+    pub scene_effect_transform_errors: usize,
+    pub scene_effect_insert_errors: usize,
+    pub model_transform_errors: usize,
+    pub model_event_without_gfx: usize,
+    pub model_event_attachment_errors: usize,
+    pub model_event_timing_errors: usize,
+    pub model_event_insert_errors: usize,
+    pub producer_attenuation_off_skips: usize,
+    pub effect_runtime_errors: usize,
+    pub pose_outside_bounds_skips: usize,
+    pub pose_failed_skips: usize,
+    pub pose_playback_errors: usize,
+    pub pose_unchanged_skips: usize,
+    pub producer_unhooked_skips: usize,
+    pub draw_outside_bounds_skips: usize,
+    pub draw_failed_skips: usize,
+    pub draw_frustum_culls: usize,
+    pub draw_errors: usize,
+    pub draw_invisible_skips: usize,
+    pub alpha_invisible_skips: usize,
+    pub alpha_unready_skips: usize,
+    pub alpha_missing_bounds_skips: usize,
+    pub alpha_errors: usize,
+}
+
+impl WorldModelStatus {
+    /// Format a status line naming placements, selected, drawn, unresolved
+    /// names, refused versions (with version numbers), and unindexed archives
+    /// (with archive names).
+    pub fn status_line(&self) -> String {
+        let versions = if self.versions_refused.is_empty() {
+            "none".to_string()
+        } else {
+            self.versions_refused
+                .iter()
+                .map(|(ver, count)| format!("{ver} ({count})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let archives = if self.archives_not_indexed.is_empty() {
+            "none".to_string()
+        } else {
+            self.archives_not_indexed
+                .iter()
+                .map(|(name, reason)| format!("{name}: {reason}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let total_skips = self.model_event_without_gfx
+            + self.producer_attenuation_off_skips
+            + self.pose_outside_bounds_skips
+            + self.pose_failed_skips
+            + self.pose_unchanged_skips
+            + self.producer_unhooked_skips
+            + self.draw_outside_bounds_skips
+            + self.draw_failed_skips
+            + self.draw_frustum_culls
+            + self.draw_invisible_skips
+            + self.alpha_invisible_skips
+            + self.alpha_unready_skips
+            + self.alpha_missing_bounds_skips;
+        let total_errors = self.scene_effect_transform_errors
+            + self.scene_effect_insert_errors
+            + self.model_transform_errors
+            + self.model_event_attachment_errors
+            + self.model_event_timing_errors
+            + self.model_event_insert_errors
+            + self.effect_runtime_errors
+            + self.pose_playback_errors
+            + self.draw_errors
+            + self.alpha_errors;
+        format!(
+            "World models — placements in map: {}, selected: {}, drawn: {}, names not resolved: {}, versions refused: {}, archives not indexed: {}, skips: {}, reported errors: {}",
+            self.placements_in_map,
+            self.selected,
+            self.drawn,
+            self.names_not_resolved,
+            versions,
+            archives,
+            total_skips,
+            total_errors,
+        )
+    }
+}
+
+#[derive(Default)]
+struct AtomicWorldCounters {
+    scene_effect_transform_errors: AtomicUsize,
+    scene_effect_insert_errors: AtomicUsize,
+    model_transform_errors: AtomicUsize,
+    model_event_without_gfx: AtomicUsize,
+    model_event_attachment_errors: AtomicUsize,
+    model_event_timing_errors: AtomicUsize,
+    model_event_insert_errors: AtomicUsize,
+    producer_attenuation_off_skips: AtomicUsize,
+    effect_runtime_errors: AtomicUsize,
+    pose_outside_bounds_skips: AtomicUsize,
+    pose_failed_skips: AtomicUsize,
+    pose_playback_errors: AtomicUsize,
+    pose_unchanged_skips: AtomicUsize,
+    producer_unhooked_skips: AtomicUsize,
+    draw_outside_bounds_skips: AtomicUsize,
+    draw_failed_skips: AtomicUsize,
+    draw_frustum_culls: AtomicUsize,
+    draw_errors: AtomicUsize,
+    draw_invisible_skips: AtomicUsize,
+    alpha_invisible_skips: AtomicUsize,
+    alpha_unready_skips: AtomicUsize,
+    alpha_missing_bounds_skips: AtomicUsize,
+    alpha_errors: AtomicUsize,
+}
+
+fn extract_refused_versions(messages: &[String]) -> Vec<(String, usize)> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for msg in messages {
+        if !msg.to_ascii_lowercase().contains("version") {
+            continue;
+        }
+        for token in msg.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if token.starts_with("0x") || token.starts_with("0X") {
+                *counts.entry(token.to_ascii_lowercase()).or_insert(0) += 1;
+            }
+        }
+    }
+    counts.into_iter().collect()
+}
+
 pub struct World {
     assets: Assets,
     keep_unbounded: bool,
@@ -165,6 +306,8 @@ pub struct World {
     frustum: Option<[[f32; 4]; 6]>,
     scratch_candidates: Vec<model_queue::AlphaCandidate>,
     scratch_failures: Vec<(usize, String)>,
+    counters: AtomicWorldCounters,
+    archives_not_indexed: Vec<(String, String)>,
 }
 
 impl World {
@@ -262,6 +405,8 @@ impl World {
             frustum: None,
             scratch_candidates: Vec::new(),
             scratch_failures: Vec::new(),
+            counters: AtomicWorldCounters::default(),
+            archives_not_indexed: Vec::new(),
         })
     }
     /// A world with no model assets of its own.
@@ -299,8 +444,23 @@ impl World {
     /// `gfx.pck` now answers both questions, which is what the client's own
     /// `Gfx\` root means by a relative path.
     pub fn attach_gfx_archive(&mut self, element: &Path) -> Result<(), String> {
-        let mut pack = File::open(element.join("gfx.pck")).map_err(|e| format!("gfx.pck: {e}"))?;
-        let directory = crate::pck::directory(&mut pack)?;
+        let mut pack = match File::open(element.join("gfx.pck")) {
+            Ok(pack) => pack,
+            Err(e) => {
+                let reason = format!("gfx.pck: {e}");
+                self.archives_not_indexed
+                    .push(("gfx.pck".into(), reason.clone()));
+                return Err(reason);
+            }
+        };
+        let directory = match crate::pck::directory(&mut pack) {
+            Ok(directory) => directory,
+            Err(e) => {
+                self.archives_not_indexed
+                    .push(("gfx.pck".into(), e.clone()));
+                return Err(e);
+            }
+        };
         // The catalogue is the directory read once: names and sizes only, so
         // opening it costs nothing per member until somebody asks to play one.
         self.catalog = crate::gfx_catalog::Catalog::from_directory(
@@ -432,6 +592,9 @@ impl World {
                 ) {
                     Ok(transform) => transform,
                     Err(error) => {
+                        self.counters
+                            .scene_effect_transform_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         self.reported.push(format!("{origin}: {error}"));
                         continue;
                     }
@@ -452,6 +615,9 @@ impl World {
                     origin: origin.clone(),
                 };
                 if let Err(error) = self.owners.insert(request) {
+                    self.counters
+                        .scene_effect_insert_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     self.reported.push(format!("{origin}: {error}"));
                     continue;
                 }
@@ -485,6 +651,9 @@ impl World {
             let transform = match self.slots[index].transform.as_ref() {
                 Ok(transform) => *transform,
                 Err(error) => {
+                    self.counters
+                        .model_transform_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     self.reported
                         .push(format!("{}: {error}", instance.placement.path));
                     continue;
@@ -492,6 +661,9 @@ impl World {
             };
             for (event_index, event) in asset.descriptor.events.iter().enumerate() {
                 let Some(path) = event.gfx_path() else {
+                    self.counters
+                        .model_event_without_gfx
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
                 let described = format!(
@@ -501,6 +673,9 @@ impl World {
                 let record = match model_attachment::from_fields(&event.fields) {
                     Ok(record) => record,
                     Err(error) => {
+                        self.counters
+                            .model_event_attachment_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         self.reported.push(format!("{described}: {error}"));
                         continue;
                     }
@@ -509,6 +684,9 @@ impl World {
                     Some(record) => match record.local() {
                         Ok(local) => local,
                         Err(error) => {
+                            self.counters
+                                .model_event_attachment_errors
+                                .fetch_add(1, Ordering::Relaxed);
                             self.reported.push(format!("{described}: {error}"));
                             continue;
                         }
@@ -518,6 +696,9 @@ impl World {
                 let start_ms = match event_milliseconds(event, "StartTime") {
                     Ok(value) => value.max(0.),
                     Err(error) => {
+                        self.counters
+                            .model_event_timing_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         self.reported.push(format!("{described}: {error}"));
                         continue;
                     }
@@ -526,6 +707,9 @@ impl World {
                     Ok(value) if value < 0. => None,
                     Ok(value) => Some(value.trunc() as u32),
                     Err(error) => {
+                        self.counters
+                            .model_event_timing_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         self.reported.push(format!("{described}: {error}"));
                         continue;
                     }
@@ -550,6 +734,9 @@ impl World {
                     origin: described.clone(),
                 };
                 if let Err(error) = self.owners.insert(request) {
+                    self.counters
+                        .model_event_insert_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     self.reported.push(format!("{described}: {error}"));
                     continue;
                 }
@@ -744,6 +931,9 @@ impl World {
                     producer.fade = 1.;
                     updates.push((producer.identity, 1.));
                 }
+                self.counters
+                    .producer_attenuation_off_skips
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let target = attenuation_target(self.effect_distance, producer.position, eye);
@@ -866,6 +1056,9 @@ impl World {
         ) {
             Ok(view) => view,
             Err(error) => {
+                self.counters
+                    .effect_runtime_errors
+                    .fetch_add(1, Ordering::Relaxed);
                 if !self.reported.contains(&error) {
                     self.reported.push(error);
                 }
@@ -917,6 +1110,7 @@ impl World {
             read,
             format,
             reported,
+            counters,
             ..
         } = self;
         *effect_quads = quads;
@@ -947,6 +1141,9 @@ impl World {
             ) {
                 Ok(draw) => *effects = Some(draw),
                 Err(error) => {
+                    counters
+                        .effect_runtime_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     reported.push(format!("world effects: {error}"));
                     return;
                 }
@@ -980,6 +1177,9 @@ impl World {
             Some(light),
             &mut **read,
         ) {
+            counters
+                .effect_runtime_errors
+                .fetch_add(1, Ordering::Relaxed);
             reported.push(format!("world effects: {error}"));
         }
     }
@@ -1055,6 +1255,7 @@ impl World {
             .min(16);
         if len >= 64 && threads > 1 {
             let assets = &self.assets.assets;
+            let counters = &self.counters;
             let chunk_size = (len + threads - 1) / threads;
             std::thread::scope(|s| {
                 for (inst_chunk, slot_chunk) in self
@@ -1066,9 +1267,13 @@ impl World {
                     s.spawn(move || {
                         for (instance, slot) in inst_chunk.iter_mut().zip(slot_chunk.iter_mut()) {
                             if !cutoff_residency::contains(bounds, instance.placement.position) {
+                                counters
+                                    .pose_outside_bounds_skips
+                                    .fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
                             if slot.failed {
+                                counters.pose_failed_skips.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
                             let asset = &assets[instance.asset];
@@ -1076,6 +1281,9 @@ impl World {
                                 Ok(clock) => {
                                     if delta_ms != 0 {
                                         if let Err(e) = clock.tick(delta_ms) {
+                                            counters
+                                                .pose_playback_errors
+                                                .fetch_add(1, Ordering::Relaxed);
                                             slot.posed = Some(Err(e));
                                             continue;
                                         }
@@ -1083,12 +1291,18 @@ impl World {
                                     clock.sample()
                                 }
                                 Err(e) => {
+                                    counters
+                                        .pose_playback_errors
+                                        .fetch_add(1, Ordering::Relaxed);
                                     slot.posed = Some(Err(e.clone()));
                                     continue;
                                 }
                             };
                             if let Some(Ok(previous)) = &slot.posed {
                                 if previous.sample == sample {
+                                    counters
+                                        .pose_unchanged_skips
+                                        .fetch_add(1, Ordering::Relaxed);
                                     continue;
                                 }
                             }
@@ -1118,9 +1332,15 @@ impl World {
 
         for (instance, slot) in self.assets.instances.iter_mut().zip(&mut self.slots) {
             if !cutoff_residency::contains(bounds, instance.placement.position) {
+                self.counters
+                    .pose_outside_bounds_skips
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             if slot.failed {
+                self.counters
+                    .pose_failed_skips
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let asset = &self.assets.assets[instance.asset];
@@ -1128,6 +1348,9 @@ impl World {
                 Ok(clock) => {
                     if delta_ms != 0 {
                         if let Err(e) = clock.tick(delta_ms) {
+                            self.counters
+                                .pose_playback_errors
+                                .fetch_add(1, Ordering::Relaxed);
                             slot.posed = Some(Err(e));
                             continue;
                         }
@@ -1135,11 +1358,17 @@ impl World {
                     clock.sample()
                 }
                 Err(e) => {
+                    self.counters
+                        .pose_playback_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     slot.posed = Some(Err(e.clone()));
                     continue;
                 }
             };
             if matches!(&slot.posed, Some(Ok(previous)) if previous.sample == sample) {
+                self.counters
+                    .pose_unchanged_skips
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let result = (|| -> Result<SlotPose, String> {
@@ -1167,6 +1396,9 @@ impl World {
         let mut resolved: Vec<(u64, Result<Option<[f32; 16]>, String>)> = Vec::new();
         for producer in &self.producers {
             let Some(binding) = &producer.hook else {
+                self.counters
+                    .producer_unhooked_skips
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             };
             let origin = format!("producer {}", producer.identity);
@@ -1205,6 +1437,9 @@ impl World {
                     }
                 }
                 Err(e) => {
+                    self.counters
+                        .effect_runtime_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     self.reported.push(e);
                     self.owners.remove(identity, &mut self.publications);
                     detached.push(identity);
@@ -1237,6 +1472,7 @@ impl World {
             format,
             grid,
             reported,
+            counters,
             ..
         } = self;
         for (instance, slot) in assets.instances.iter().zip(slots.iter_mut()) {
@@ -1246,15 +1482,20 @@ impl World {
                     slot.draw = None;
                     slot.posed = None;
                 }
+                counters
+                    .draw_outside_bounds_skips
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             if slot.failed {
                 slot.visible = false;
+                counters.draw_failed_skips.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             if let Some(planes) = frustum {
                 if !sphere_in_frustum(&planes, instance.placement.position, 128.0) {
                     slot.visible = false;
+                    counters.draw_frustum_culls.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
             }
@@ -1276,6 +1517,7 @@ impl World {
                 receivers,
             );
             if let Err(e) = outcome {
+                counters.draw_errors.fetch_add(1, Ordering::Relaxed);
                 reported.push(format!(
                     "world model {} ({}): {e}",
                     instance.placement.export_id, instance.placement.path
@@ -1294,16 +1536,28 @@ impl World {
         self.scratch_failures.clear();
         for (slot, entry) in self.slots.iter().enumerate() {
             if !entry.visible {
+                self.counters
+                    .alpha_invisible_skips
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             let Some(draw) = &entry.draw else {
+                self.counters
+                    .alpha_unready_skips
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             };
             let Ok(transform) = &entry.transform else {
+                self.counters
+                    .alpha_unready_skips
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             };
             for &mesh in draw.alpha_meshes() {
                 let Some((min, max)) = draw.mesh_bounds(mesh) else {
+                    self.counters
+                        .alpha_missing_bounds_skips
+                        .fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
                 match model_queue::alpha_corner_distance(
@@ -1334,10 +1588,12 @@ impl World {
             Ok(order) => self.alpha = order,
             Err(e) => {
                 self.alpha.clear();
+                self.counters.alpha_errors.fetch_add(1, Ordering::Relaxed);
                 self.reported.push(format!("alpha queue: {e}"));
             }
         }
         for (slot, error) in &self.scratch_failures {
+            self.counters.alpha_errors.fetch_add(1, Ordering::Relaxed);
             self.reported
                 .push(format!("alpha queue slot {slot}: {error}"));
             if let Some(entry) = self.slots.get_mut(*slot) {
@@ -1358,6 +1614,83 @@ impl World {
         let failed = self.slots.iter().filter(|s| s.failed).count() + self.assets.unloaded.len();
         (ready, failed, self.slots.len() + self.assets.unloaded.len())
     }
+
+    pub fn detailed_status(&self) -> WorldModelStatus {
+        let selected = self.slots.iter().filter(|s| s.visible).count();
+        let drawn = self
+            .slots
+            .iter()
+            .filter(|s| s.visible && s.draw.is_some())
+            .count();
+        WorldModelStatus {
+            placements_in_map: self.slots.len() + self.assets.unloaded.len(),
+            selected,
+            drawn,
+            names_not_resolved: self.assets.unloaded.len(),
+            versions_refused: extract_refused_versions(&self.reported),
+            archives_not_indexed: self.archives_not_indexed.clone(),
+            scene_effect_transform_errors: self
+                .counters
+                .scene_effect_transform_errors
+                .load(Ordering::Relaxed),
+            scene_effect_insert_errors: self
+                .counters
+                .scene_effect_insert_errors
+                .load(Ordering::Relaxed),
+            model_transform_errors: self.counters.model_transform_errors.load(Ordering::Relaxed),
+            model_event_without_gfx: self
+                .counters
+                .model_event_without_gfx
+                .load(Ordering::Relaxed),
+            model_event_attachment_errors: self
+                .counters
+                .model_event_attachment_errors
+                .load(Ordering::Relaxed),
+            model_event_timing_errors: self
+                .counters
+                .model_event_timing_errors
+                .load(Ordering::Relaxed),
+            model_event_insert_errors: self
+                .counters
+                .model_event_insert_errors
+                .load(Ordering::Relaxed),
+            producer_attenuation_off_skips: self
+                .counters
+                .producer_attenuation_off_skips
+                .load(Ordering::Relaxed),
+            effect_runtime_errors: self.counters.effect_runtime_errors.load(Ordering::Relaxed),
+            pose_outside_bounds_skips: self
+                .counters
+                .pose_outside_bounds_skips
+                .load(Ordering::Relaxed),
+            pose_failed_skips: self.counters.pose_failed_skips.load(Ordering::Relaxed),
+            pose_playback_errors: self.counters.pose_playback_errors.load(Ordering::Relaxed),
+            pose_unchanged_skips: self.counters.pose_unchanged_skips.load(Ordering::Relaxed),
+            producer_unhooked_skips: self
+                .counters
+                .producer_unhooked_skips
+                .load(Ordering::Relaxed),
+            draw_outside_bounds_skips: self
+                .counters
+                .draw_outside_bounds_skips
+                .load(Ordering::Relaxed),
+            draw_failed_skips: self.counters.draw_failed_skips.load(Ordering::Relaxed),
+            draw_frustum_culls: self.counters.draw_frustum_culls.load(Ordering::Relaxed),
+            draw_errors: self.counters.draw_errors.load(Ordering::Relaxed),
+            draw_invisible_skips: self.counters.draw_invisible_skips.load(Ordering::Relaxed),
+            alpha_invisible_skips: self.counters.alpha_invisible_skips.load(Ordering::Relaxed),
+            alpha_unready_skips: self.counters.alpha_unready_skips.load(Ordering::Relaxed),
+            alpha_missing_bounds_skips: self
+                .counters
+                .alpha_missing_bounds_skips
+                .load(Ordering::Relaxed),
+            alpha_errors: self.counters.alpha_errors.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn status_line(&self) -> String {
+        self.detailed_status().status_line()
+    }
     /// Opaque meshes first, then the retail alpha list in its insertion order.
     ///
     /// The blended effect sheets close the pass. Their motion is published by
@@ -1367,6 +1700,9 @@ impl World {
     pub fn draw<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>) {
         for slot in &self.slots {
             if !slot.visible {
+                self.counters
+                    .draw_invisible_skips
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             if let Some(draw) = &slot.draw {
@@ -1431,6 +1767,9 @@ impl World {
                 status.failed += 1;
             }
             let Some(draw) = &entry.draw else {
+                self.counters
+                    .alpha_unready_skips
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             };
             for &mesh in draw.alpha_meshes() {
@@ -1593,5 +1932,33 @@ mod tests {
         assert_eq!(attenuation_target(0., ground, [9000., 0., 9000.]), 1.);
         assert_eq!(attenuation_target(60., ground, [159.9, 200., -4000.]), 1.);
         assert_eq!(attenuation_target(60., ground, [160.1, 200., -4000.]), 0.);
+    }
+
+    #[test]
+    fn world_model_status_line_reports_all_named_counters() {
+        let reported = vec![
+            "world model 7 (a.ecm): unsupported model version 0x00000010".to_string(),
+            "world model 8 (b.ecm): unsupported model version 0x00000010".to_string(),
+        ];
+        let status = WorldModelStatus {
+            placements_in_map: 50,
+            selected: 40,
+            drawn: 35,
+            names_not_resolved: 5,
+            versions_refused: extract_refused_versions(&reported),
+            archives_not_indexed: vec![("gfx.pck".into(), "missing trailer".into())],
+            draw_frustum_culls: 10,
+            draw_errors: 2,
+            ..Default::default()
+        };
+        let line = status.status_line();
+        assert!(line.contains("placements in map: 50"), "{line}");
+        assert!(line.contains("selected: 40"), "{line}");
+        assert!(line.contains("drawn: 35"), "{line}");
+        assert!(line.contains("names not resolved: 5"), "{line}");
+        assert!(line.contains("0x00000010 (2)"), "{line}");
+        assert!(line.contains("gfx.pck: missing trailer"), "{line}");
+        assert!(line.contains("skips: 10"), "{line}");
+        assert!(line.contains("reported errors: 2"), "{line}");
     }
 }

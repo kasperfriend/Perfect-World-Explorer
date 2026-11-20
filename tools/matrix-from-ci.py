@@ -197,7 +197,7 @@ def render(directory):
         for name, label in missing:
             lines.append(
                 f"- **{label}** (`ci-results/{name}.json`): stage that client's "
-                f"files under `tests/fixtures/clients/{name}/` and the measure "
+                f"files under `/tmp/clients/{name}/` (external staging only; no committed binaries) and the measure "
                 "step picks them up with no other change."
             )
         lines.append("")

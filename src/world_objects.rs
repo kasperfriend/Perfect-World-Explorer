@@ -61,6 +61,22 @@ pub struct PageSpans<'a> {
 /// placement the view hides can never be swallowed by a neighbour: it is
 /// skipped and leaves a gap the merge rule refuses to cross.
 pub fn fold_commands(pages: &[PageSpans], order: &[(usize, usize)], view: Pass) -> Vec<DrawCmd> {
+    let (cmds, _) = fold_commands_counted(pages, order, view);
+    cmds
+}
+
+/// Same as [`fold_commands`], returning named counters for every skipped or
+/// merged placement.
+pub fn fold_commands_counted(
+    pages: &[PageSpans],
+    order: &[(usize, usize)],
+    view: Pass,
+) -> (Vec<DrawCmd>, PlacementCounters) {
+    let mut counters = PlacementCounters {
+        placements_in_map: order.len(),
+        selected: order.len(),
+        ..Default::default()
+    };
     let mut cmds: Vec<DrawCmd> = Vec::with_capacity(order.len());
     for &(page, range) in order {
         let p = &pages[page];
@@ -69,19 +85,22 @@ pub fn fold_commands(pages: &[PageSpans], order: &[(usize, usize)], view: Pass) 
         } else {
             let r = &p.placements[range];
             if !allows_with_context(view, r.visibility, RenderContext::default()) {
+                counters.hidden_by_view += 1;
                 continue;
             }
             (r.start, r.end)
         };
+        counters.drawn += 1;
         if let Some(last) = cmds.last_mut() {
             if last.page == page && last.end == start {
                 last.end = end;
+                counters.merged_contiguous += 1;
                 continue;
             }
         }
         cmds.push(DrawCmd { page, start, end });
     }
-    cmds
+    (cmds, counters)
 }
 
 /// Fold one page's placements into the spans a view draws, in order.
@@ -91,10 +110,12 @@ pub fn fold_commands(pages: &[PageSpans], order: &[(usize, usize)], view: Pass) 
 /// one draw instead of one per placement. A hidden placement is skipped and its
 /// indices stay out of the spans, because a span is only extended across a
 /// neighbour that touches it.
-fn fold_page_spans(placements: &[PlacementRange], view: Pass) -> Vec<(u32, u32)> {
+fn fold_page_spans_counted(placements: &[PlacementRange], view: Pass) -> (Vec<(u32, u32)>, usize) {
     let mut spans: Vec<(u32, u32)> = Vec::with_capacity(placements.len());
+    let mut hidden_by_view = 0usize;
     for r in placements {
         if !allows_with_context(view, r.visibility, RenderContext::default()) {
+            hidden_by_view += 1;
             continue;
         }
         match spans.last_mut() {
@@ -102,7 +123,11 @@ fn fold_page_spans(placements: &[PlacementRange], view: Pass) -> Vec<(u32, u32)>
             _ => spans.push((r.start, r.end)),
         }
     }
-    spans
+    (spans, hidden_by_view)
+}
+
+fn fold_page_spans(placements: &[PlacementRange], view: Pass) -> Vec<(u32, u32)> {
+    fold_page_spans_counted(placements, view).0
 }
 
 /// One opaque scenery draw: a page and a contiguous span of its index buffer.
@@ -333,6 +358,76 @@ impl Page {
 }
 /// Measured residency and resolution outcome of one whole-world preload
 /// (P3.08: measured numbers, not estimates).
+/// Named counters for whole-world scenery placement loading and drawing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlacementCounters {
+    pub placements_in_map: usize,
+    pub selected: usize,
+    pub drawn: usize,
+    pub names_not_resolved: usize,
+    pub versions_refused: Vec<(String, usize)>,
+    pub archives_not_indexed: Vec<(String, String)>,
+    pub hidden_by_view: usize,
+    pub merged_contiguous: usize,
+    pub culled_by_sdr: usize,
+    pub culled_by_frustum: usize,
+    pub empty_span: usize,
+    pub empty_page: usize,
+    pub full_page_cmd: usize,
+}
+
+impl PlacementCounters {
+    /// Format a status line reporting placements, selection, draws, unresolved
+    /// names, refused versions (with version numbers), and unindexed archives
+    /// (with archive names).
+    pub fn status_line(&self) -> String {
+        let versions = if self.versions_refused.is_empty() {
+            "none".to_string()
+        } else {
+            self.versions_refused
+                .iter()
+                .map(|(ver, count)| format!("{ver} ({count})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let archives = if self.archives_not_indexed.is_empty() {
+            "none".to_string()
+        } else {
+            self.archives_not_indexed
+                .iter()
+                .map(|(name, reason)| format!("{name}: {reason}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        format!(
+            "placements in map: {}, selected: {}, drawn: {}, names not resolved: {}, versions refused: {}, archives not indexed: {}",
+            self.placements_in_map,
+            self.selected,
+            self.drawn,
+            self.names_not_resolved,
+            versions,
+            archives,
+        )
+    }
+}
+
+/// Extract refused version identifiers from error messages and count them.
+pub fn extract_refused_versions(messages: &[String]) -> Vec<(String, usize)> {
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for msg in messages {
+        let lower = msg.to_ascii_lowercase();
+        if !lower.contains("version") {
+            continue;
+        }
+        for token in msg.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
+            if token.starts_with("0x") || token.starts_with("0X") {
+                *counts.entry(token.to_ascii_lowercase()).or_insert(0) += 1;
+            }
+        }
+    }
+    counts.into_iter().collect()
+}
+
 #[derive(Clone, Debug)]
 pub struct DoneStats {
     pub residency: crate::objects::ResidencyStats,
@@ -352,6 +447,15 @@ pub struct DoneStats {
     pub atlas_bytes: usize,
     /// Indicates this build restored completed pages from disk.
     pub cache_hit: bool,
+    /// Named counters for placements, selection, draws, unresolved names,
+    /// refused versions, and unindexed archives.
+    pub counters: PlacementCounters,
+}
+
+impl DoneStats {
+    pub fn status_line(&self) -> String {
+        self.counters.status_line()
+    }
 }
 pub enum Message {
     Page(Page),
@@ -609,6 +713,12 @@ fn run(
                         atlas_pages: reader.atlas_pages,
                         atlas_bytes: reader.atlas_bytes,
                         cache_hit: true,
+                        counters: PlacementCounters {
+                            placements_in_map: ornaments.len(),
+                            selected: reader.processed,
+                            drawn: reader.processed,
+                            ..Default::default()
+                        },
                     },
                     world_draw_cmds,
                 });
@@ -640,6 +750,8 @@ fn run(
     let mut shared_slots: HashMap<TextureKey, SharedSlot> = HashMap::new();
     let mut shared_geometry = HashMap::<usize, Builder>::new();
     let mut skipped = 0usize;
+    let mut names_not_resolved = 0usize;
+    let mut drawn_placements = 0usize;
     let mut pages = 0usize;
     let mut atlas_pages = 0usize;
     let mut atlas_bytes = 0usize;
@@ -665,8 +777,10 @@ fn run(
                 return Ok(());
             }
             let Some(model) = objects.get(id) else {
+                names_not_resolved += 1;
                 continue;
             };
+            drawn_placements += 1;
             // EC-BSD record +36 low bytes, recovered at 0x489f0b/0x489f12.
             // Keep the flags with every index range so a hidden placement is
             // never submitted just because its page is resident.
@@ -828,6 +942,15 @@ fn run(
             atlas_pages,
             atlas_bytes,
             cache_hit: false,
+            counters: PlacementCounters {
+                placements_in_map: objects.ornaments.len(),
+                selected: limit.saturating_sub(first),
+                drawn: drawn_placements,
+                names_not_resolved,
+                versions_refused: extract_refused_versions(objects.unavailable_examples()),
+                archives_not_indexed: objects.unindexed_archives(),
+                ..Default::default()
+            },
         },
         world_draw_cmds,
     });
@@ -1141,20 +1264,26 @@ impl GpuPage {
     ) {
         let mut bound = None;
         let mut pending: Option<(usize, u32, u32)> = None;
+        let mut counters = PlacementCounters::default();
         for chunk in &list.chunks {
             if (sdr_only && !chunk.has_sdr) || !aabb_in_frustum(frustum, chunk.min, chunk.max) {
+                counters.culled_by_frustum += 1;
                 continue;
             }
             for cmd in &list.cmds[chunk.start..chunk.end] {
                 if sdr_only && !cmd.has_sdr {
+                    counters.culled_by_sdr += 1;
                     continue;
                 }
                 if !aabb_in_frustum(frustum, cmd.min, cmd.max) {
+                    counters.culled_by_frustum += 1;
                     continue;
                 }
+                counters.drawn += 1;
                 if let Some((cur_page, cur_start, cur_end)) = pending {
                     if cur_page == cmd.page && cur_end == cmd.start {
                         pending = Some((cur_page, cur_start, cmd.end));
+                        counters.merged_contiguous += 1;
                         continue;
                     }
                     if bound != Some(cur_page) {
@@ -1217,21 +1346,27 @@ impl GpuPage {
             return;
         }
         let mut cursor = None::<(u32, u32)>;
+        let mut counters = PlacementCounters::default();
         for (r, b) in self.placements.iter().zip(&self.bounds) {
             if sdr_only && !b.has_sdr {
+                counters.culled_by_sdr += 1;
                 continue;
             }
             if !allows_with_context(view, r.visibility, RenderContext::default()) {
+                counters.hidden_by_view += 1;
                 continue;
             }
             if !aabb_in_frustum(frustum, b.min, b.max) {
+                counters.culled_by_frustum += 1;
                 continue;
             }
             let start = r.start.min(self.count);
             let end = r.end.min(self.count);
             if start >= end {
+                counters.empty_span += 1;
                 continue;
             }
+            counters.drawn += 1;
             match &mut cursor {
                 Some((_, prev_end)) if *prev_end == start => *prev_end = end,
                 Some((prev_start, prev_end)) => {
@@ -1279,9 +1414,11 @@ fn world_culled_commands_from_meta(pages: &[WorldPageMeta]) -> [WorldDrawList; W
     order.sort_unstable();
     let build = |view: Pass| -> WorldDrawList {
         let mut out: Vec<WorldDrawCmd> = Vec::new();
+        let mut counters = PlacementCounters::default();
         for &(_, page_idx, range_idx) in &order {
             let page = &pages[page_idx];
             if page.count == 0 {
+                counters.empty_page += 1;
                 continue;
             }
             if range_idx == usize::MAX {
@@ -1293,17 +1430,21 @@ fn world_culled_commands_from_meta(pages: &[WorldPageMeta]) -> [WorldDrawList; W
                     max: page.page_max,
                     has_sdr: page.page_has_sdr,
                 });
+                counters.full_page_cmd += 1;
                 continue;
             }
             let range = &page.placements[range_idx];
             if !allows_with_context(view, range.visibility, RenderContext::default()) {
+                counters.hidden_by_view += 1;
                 continue;
             }
             let start = range.start.min(page.count);
             let end = range.end.min(page.count);
             if start >= end {
+                counters.empty_span += 1;
                 continue;
             }
+            counters.drawn += 1;
             let bound = page.bounds[range_idx];
             if let Some(previous) = out.last_mut() {
                 if previous.page == page_idx && previous.end == start {
@@ -1325,6 +1466,7 @@ fn world_culled_commands_from_meta(pages: &[WorldPageMeta]) -> [WorldDrawList; W
                         previous.min = min;
                         previous.max = max;
                         previous.has_sdr |= bound.has_sdr;
+                        counters.merged_contiguous += 1;
                         continue;
                     }
                 }
@@ -1726,5 +1868,31 @@ mod page_tests {
             assert!(cmds.iter().all(|c| c.start <= c.end));
             assert!(cmds.len() <= order.len());
         }
+    }
+
+    #[test]
+    fn placement_counters_status_line_reports_all_required_fields() {
+        let examples = vec![
+            "A3DLitModel::Load(), Wrong version! (model version 0x10000003)".to_string(),
+            "unsupported BMD mesh version 0x10000006 for baked draw state".to_string(),
+            "A3DLitModel::Load(), Wrong version! (model version 0x10000003)".to_string(),
+        ];
+        let counters = PlacementCounters {
+            placements_in_map: 120,
+            selected: 100,
+            drawn: 85,
+            names_not_resolved: 15,
+            versions_refused: extract_refused_versions(&examples),
+            archives_not_indexed: vec![("litmodels.pck".into(), "split tail missing".into())],
+            ..Default::default()
+        };
+        let line = counters.status_line();
+        assert!(line.contains("placements in map: 120"), "{line}");
+        assert!(line.contains("selected: 100"), "{line}");
+        assert!(line.contains("drawn: 85"), "{line}");
+        assert!(line.contains("names not resolved: 15"), "{line}");
+        assert!(line.contains("0x10000003 (2)"), "{line}");
+        assert!(line.contains("0x10000006 (1)"), "{line}");
+        assert!(line.contains("litmodels.pck: split tail missing"), "{line}");
     }
 }

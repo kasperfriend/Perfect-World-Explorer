@@ -245,6 +245,7 @@ pub struct Objects {
     litfile: Option<SceneryArchive>,
     texfile: Option<SceneryArchive>,
     lit_archive_error: Option<String>,
+    tex_archive_error: Option<String>,
     lit_archive_entries: usize,
     litmodel_map_id: String,
     litentries: HashMap<String, pck::Entry>,
@@ -459,7 +460,7 @@ impl Objects {
         }
         let (litfile, litentries, lit_archive_error) =
             open_optional_archive(&element.join("litmodels.pck"));
-        let (texfile, texentries, _tex_archive_error) =
+        let (texfile, texentries, tex_archive_error) =
             open_optional_archive(&element.join("building.pck"));
         let lit_archive_entries = litentries.len();
         let litentry_names = litentries.keys().cloned().collect::<Vec<_>>();
@@ -495,6 +496,7 @@ impl Objects {
             litfile,
             texfile,
             lit_archive_error,
+            tex_archive_error,
             lit_archive_entries,
             litmodel_map_id,
             litentries,
@@ -1099,6 +1101,17 @@ impl Objects {
         let mut names: Vec<_> = self.unavailable_models.iter().cloned().collect();
         names.sort();
         names
+    }
+
+    pub fn unindexed_archives(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        if let Some(error) = &self.lit_archive_error {
+            out.push(("litmodels.pck".into(), error.clone()));
+        }
+        if let Some(error) = &self.tex_archive_error {
+            out.push(("building.pck".into(), error.clone()));
+        }
+        out
     }
     pub fn texture(&self, path: &str) -> Option<&Texture> {
         self.cache.get(&normalize(path))

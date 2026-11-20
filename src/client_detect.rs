@@ -233,9 +233,11 @@ pub struct ExecutableInfo {
     pub known: Option<&'static str>,
     /// `VS_VERSIONINFO` string, when the build has one.
     pub file_version: Option<String>,
-    /// `config\element\version.sw` beside the executable, when the client
-    /// ships one. This is the release version the client labels itself with.
+    /// `config\element\version.sw` from the client folder, its parent, or
+    /// `configs.pck`. This is the release version the client labels itself with.
     pub release_version: Option<String>,
+    /// Where [`Self::release_version`] was found, when present.
+    pub release_version_source: Option<String>,
     pub product_version: Option<String>,
     pub pe_timestamp: Option<u32>,
 }
@@ -283,17 +285,7 @@ impl ExecutableInfo {
         if let Some(release) = &self.release_version {
             return release.clone();
         }
-        let declared = if self.product_version == self.file_version {
-            self.file_version.clone()
-        } else {
-            self.product_version
-                .clone()
-                .or_else(|| self.file_version.clone())
-        };
-        match declared {
-            Some(version) => format!("{version} (resource version)"),
-            None => "unverified build".into(),
-        }
+        "unknown game version (no config/element/version.sw in folder or configs.pck)".into()
     }
 
     /// Data revisions this fingerprint was inspected with, as
@@ -495,9 +487,11 @@ impl Scan {
                     }
                 }
                 if let Some(release) = &exe.release_version {
-                    out.push_str(&format!(
-                        "  release   {release} (config\\element\\version.sw)\n"
-                    ));
+                    let source = exe
+                        .release_version_source
+                        .as_deref()
+                        .unwrap_or("config/element/version.sw");
+                    out.push_str(&format!("  release   {release} ({source})\n"));
                 }
                 out.push_str(&format!("  identity  {}\n", exe.label()));
                 if let Some(versions) = exe.known_data_versions() {
@@ -600,15 +594,35 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
-    let exact = dir.join(name);
-    if exact.is_file() {
-        return Some(exact);
+    let components: Vec<&str> = name
+        .split(|c| c == '/' || c == '\\')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if components.is_empty() {
+        return None;
     }
-    fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .find(|e| e.file_name().to_string_lossy().eq_ignore_ascii_case(name))
-        .map(|e| e.path())
+    let mut current = dir.to_path_buf();
+    for (index, part) in components.iter().enumerate() {
+        let last = index + 1 == components.len();
+        let exact = current.join(part);
+        if (last && exact.is_file()) || (!last && exact.is_dir()) {
+            current = exact;
+            continue;
+        }
+        let matched = fs::read_dir(&current).ok()?.flatten().find(|entry| {
+            if !entry.file_name().to_string_lossy().eq_ignore_ascii_case(part) {
+                return false;
+            }
+            let path = entry.path();
+            if last {
+                path.is_file()
+            } else {
+                path.is_dir()
+            }
+        })?;
+        current = matched.path();
+    }
+    Some(current)
 }
 
 /// A client may ship only instance maps, so validate any readable
@@ -669,6 +683,10 @@ fn scan_executable(element: &Path) -> (Option<ExecutableInfo>, Option<String>) {
     let known = KNOWN_BUILDS
         .iter()
         .find(|build| build.size == bytes.len() && build.sha256 == sha256);
+    let (release_ver, release_src) = match release_version_with_source(element) {
+        Some((version, source)) => (Some(version), Some(source)),
+        None => (None, None),
+    };
     (
         Some(ExecutableInfo {
             path,
@@ -679,7 +697,8 @@ fn scan_executable(element: &Path) -> (Option<ExecutableInfo>, Option<String>) {
             known: known.map(|build| build.label),
             file_version,
             product_version,
-            release_version: release_version(element),
+            release_version: release_ver,
+            release_version_source: release_src,
             pe_timestamp,
         }),
         None,
@@ -700,15 +719,13 @@ fn scan_executable(element: &Path) -> (Option<ExecutableInfo>, Option<String>) {
 /// picking which digits "are" the version would be a guess. A file that is
 /// absent, empty or not text is simply not reported, and the row falls back to
 /// the executable's own resource version.
-fn release_version(element: &Path) -> Option<String> {
-    let path = find_file(element, "config/element/version.sw")?;
-    let bytes = fs::read(&path).ok()?;
+fn parse_release_version_bytes(bytes: &[u8]) -> Option<String> {
     // A release marker is a few bytes of text. Anything larger is a different
     // file wearing the name, and reading it into a label would be noise.
     if bytes.len() > 4096 {
         return None;
     }
-    let text = String::from_utf8(bytes).ok()?;
+    let text = String::from_utf8(bytes.to_vec()).ok()?;
     let text = text
         .trim()
         .trim_matches('\u{feff}')
@@ -716,6 +733,64 @@ fn release_version(element: &Path) -> Option<String> {
         .collect::<Vec<_>>()
         .join(" ");
     (!text.is_empty()).then_some(text)
+}
+
+fn read_release_version_from_configs_pck(element: &Path) -> Option<(String, String)> {
+    let pack_path = find_file(element, "configs.pck")?;
+    let mut file = fs::File::open(&pack_path).ok()?;
+    if let Ok(entries) = crate::pck::directory(&mut file) {
+        if let Some(entry) = entries.iter().find(|entry| {
+            entry
+                .name
+                .replace('\\', "/")
+                .eq_ignore_ascii_case("config/element/version.sw")
+        }) {
+            if let Ok(bytes) = crate::pck::read_entry(&mut file, entry) {
+                if let Some(version) = parse_release_version_bytes(&bytes) {
+                    return Some((version, "configs.pck:config/element/version.sw".into()));
+                }
+            }
+        }
+    }
+    if let Ok(entries) = crate::angelica_pck::directory(&mut file) {
+        if let Some(entry) = entries.iter().find(|entry| {
+            entry
+                .name
+                .replace('\\', "/")
+                .eq_ignore_ascii_case("config/element/version.sw")
+        }) {
+            if let Ok(bytes) = crate::angelica_pck::read_entry(&mut file, entry) {
+                if let Some(version) = parse_release_version_bytes(&bytes) {
+                    return Some((version, "configs.pck:config/element/version.sw".into()));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn release_version_with_source(element: &Path) -> Option<(String, String)> {
+    if let Some(path) = find_file(element, "config/element/version.sw") {
+        if let Ok(bytes) = fs::read(&path) {
+            if let Some(version) = parse_release_version_bytes(&bytes) {
+                return Some((version, format!("element:{}", path.display())));
+            }
+        }
+    }
+    if let Some(parent) = element.parent() {
+        if let Some(path) = find_file(parent, "config/element/version.sw") {
+            if let Ok(bytes) = fs::read(&path) {
+                if let Some(version) = parse_release_version_bytes(&bytes) {
+                    return Some((version, format!("parent:{}", path.display())));
+                }
+            }
+        }
+    }
+    read_release_version_from_configs_pck(element)
+}
+
+fn release_version(element: &Path) -> Option<String> {
+    release_version_with_source(element).map(|(version, _)| version)
 }
 
 /// `VS_VERSIONINFO` strings. Every real Perfect World build carries them, and
@@ -1541,6 +1616,7 @@ mod tests {
                 file_version: Some("1,0,0,6154".into()),
                 product_version: Some("1,0,0,6154".into()),
                 release_version: release.map(str::to_string),
+                release_version_source: release.map(|_| "element:config/element/version.sw".into()),
                 pe_timestamp: None,
             }
         }
@@ -1551,9 +1627,65 @@ mod tests {
         );
         assert_eq!(
             exe(None).version_row(),
-            "1,0,0,6154 (resource version)",
-            "without one, the row must not present a resource revision as a game build"
+            "unknown game version (no config/element/version.sw in folder or configs.pck)",
+            "without a marker, the resource version must never appear as the game version"
         );
+        assert!(
+            !exe(None).version_row().contains("6154"),
+            "resource version must not appear in game version row"
+        );
+    }
+
+    #[test]
+    fn release_version_walks_element_parent_configs_pck_and_missing() {
+        let base = std::env::temp_dir().join(format!(
+            "pw-version-locations-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // 1. Case-insensitive component walk under element/
+        let element = base.join("case-element").join("element");
+        std::fs::create_dir_all(element.join("Config/Element")).unwrap();
+        std::fs::write(element.join("Config/Element/Version.SW"), "1.8.4\r\n").unwrap();
+        let (ver, src_loc) = release_version_with_source(&element).expect("found under element");
+        assert_eq!(ver, "1.8.4");
+        assert!(src_loc.starts_with("element:"), "{src_loc}");
+
+        // 2. Case-insensitive component walk under element's parent/
+        let parent_root = base.join("case-parent");
+        let element_parent = parent_root.join("element");
+        std::fs::create_dir_all(&element_parent).unwrap();
+        std::fs::create_dir_all(parent_root.join("CONFIG/element")).unwrap();
+        std::fs::write(parent_root.join("CONFIG/element/VERSION.sw"), "1.7.2\n").unwrap();
+        let (ver, src_loc) =
+            release_version_with_source(&element_parent).expect("found under parent");
+        assert_eq!(ver, "1.7.2");
+        assert!(src_loc.starts_with("parent:"), "{src_loc}");
+
+        // 3. Inside configs.pck through the real pack reader
+        let pck_element = base.join("case-pck").join("element");
+        std::fs::create_dir_all(&pck_element).unwrap();
+        std::fs::write(
+            pck_element.join("configs.pck"),
+            angelica_test_package(&[("config\\element\\version.sw", b"1.5.2\r\n")]),
+        )
+        .unwrap();
+        let (ver, src_loc) =
+            release_version_with_source(&pck_element).expect("found in configs.pck");
+        assert_eq!(ver, "1.5.2");
+        assert_eq!(src_loc, "configs.pck:config/element/version.sw");
+
+        // 4. Folder with no marker anywhere
+        let empty_element = base.join("case-none").join("element");
+        std::fs::create_dir_all(&empty_element).unwrap();
+        assert_eq!(release_version_with_source(&empty_element), None);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// `config\\element\\version.sw` is the client's own release marker, read as

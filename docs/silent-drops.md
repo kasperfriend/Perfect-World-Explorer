@@ -16,25 +16,25 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/client_detect.rs` | 181 | `ok-question` | **probe** | `let word = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 182 | `ok-question` | **probe** | `let timestamp = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 184 | `ok-question` | **probe** | `short: u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?),` |
-| `src/client_detect.rs` | 608 | `ok-question` | **probe** | `.ok()?` |
-| `src/client_detect.rs` | 619 | `ok-question` | **probe** | `.ok()?` |
-| `src/client_detect.rs` | 705 | `ok-question` | **probe** | `let bytes = fs::read(&path).ok()?;` |
-| `src/client_detect.rs` | 711 | `ok-question` | **probe** | `let text = String::from_utf8(bytes).ok()?;` |
-| `src/client_detect.rs` | 779 | `ok-question` | **probe** | `Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))` |
-| `src/client_detect.rs` | 782 | `ok-question` | **probe** | `Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))` |
-| `src/client_detect.rs` | 851 | `ok-question` | **probe** | `blob.get(offset..offset + 2)?.try_into().ok()?,` |
-| `src/client_detect.rs` | 1137 | `ok-question` | **probe** | `bytes.get(offset..offset + 4)?.try_into().ok()?,` |
-| `src/client_detect.rs` | 1143 | `ok-question` | **probe** | `bytes.get(offset..offset + 2)?.try_into().ok()?,` |
-| `src/client_detect.rs` | 1279 | `ok-question` | **probe** | `let size = fs::metadata(&pck).ok()?.len();` |
-| `src/client_detect.rs` | 1281 | `ok-question` | **probe** | `fs::File::open(&pck).ok()?.read_exact(&mut prefix).ok()?;` |
-| `src/client_detect.rs` | 1285 | `ok-question` | **probe** | `let declared = u32::from_le_bytes(prefix[4..8].try_into().ok()?) as u64;` |
-| `src/client_detect.rs` | 1377 | `ok-question` | **probe** | `let mut file = fs::File::open(path).ok()?;` |
-| `src/client_detect.rs` | 1378 | `ok-question` | **probe** | `let size = file.seek(SeekFrom::End(0)).ok()?;` |
-| `src/client_detect.rs` | 1388 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(0)).ok()?;` |
-| `src/client_detect.rs` | 1389 | `ok-question` | **probe** | `file.read_exact(&mut prefix).ok()?;` |
-| `src/client_detect.rs` | 1390 | `ok-question` | **probe** | `let declared = u64::from(u32::from_le_bytes(prefix[4..8].try_into().ok()?));` |
-| `src/client_detect.rs` | 1407 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(end - 4)).ok()?;` |
-| `src/client_detect.rs` | 1409 | `ok-question` | **probe** | `file.read_exact(&mut word).ok()?;` |
+| `src/client_detect.rs` | 612 | `ok-question` | **probe** | `let matched = fs::read_dir(&current).ok()?.flatten().find(\|entry\| {` |
+| `src/client_detect.rs` | 633 | `ok-question` | **probe** | `.ok()?` |
+| `src/client_detect.rs` | 728 | `ok-question` | **probe** | `let text = String::from_utf8(bytes.to_vec()).ok()?;` |
+| `src/client_detect.rs` | 740 | `ok-question` | **probe** | `let mut file = fs::File::open(&pack_path).ok()?;` |
+| `src/client_detect.rs` | 854 | `ok-question` | **probe** | `Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))` |
+| `src/client_detect.rs` | 857 | `ok-question` | **probe** | `Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))` |
+| `src/client_detect.rs` | 926 | `ok-question` | **probe** | `blob.get(offset..offset + 2)?.try_into().ok()?,` |
+| `src/client_detect.rs` | 1212 | `ok-question` | **probe** | `bytes.get(offset..offset + 4)?.try_into().ok()?,` |
+| `src/client_detect.rs` | 1218 | `ok-question` | **probe** | `bytes.get(offset..offset + 2)?.try_into().ok()?,` |
+| `src/client_detect.rs` | 1354 | `ok-question` | **probe** | `let size = fs::metadata(&pck).ok()?.len();` |
+| `src/client_detect.rs` | 1356 | `ok-question` | **probe** | `fs::File::open(&pck).ok()?.read_exact(&mut prefix).ok()?;` |
+| `src/client_detect.rs` | 1360 | `ok-question` | **probe** | `let declared = u32::from_le_bytes(prefix[4..8].try_into().ok()?) as u64;` |
+| `src/client_detect.rs` | 1452 | `ok-question` | **probe** | `let mut file = fs::File::open(path).ok()?;` |
+| `src/client_detect.rs` | 1453 | `ok-question` | **probe** | `let size = file.seek(SeekFrom::End(0)).ok()?;` |
+| `src/client_detect.rs` | 1463 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(0)).ok()?;` |
+| `src/client_detect.rs` | 1464 | `ok-question` | **probe** | `file.read_exact(&mut prefix).ok()?;` |
+| `src/client_detect.rs` | 1465 | `ok-question` | **probe** | `let declared = u64::from(u32::from_le_bytes(prefix[4..8].try_into().ok()?));` |
+| `src/client_detect.rs` | 1482 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(end - 4)).ok()?;` |
+| `src/client_detect.rs` | 1484 | `ok-question` | **probe** | `file.read_exact(&mut word).ok()?;` |
 | `src/direct_storage.rs` | 167 | `let-underscore` | **unreachable** | `let _ = (file, ranges);` |
 | `src/dlss/fg.rs` | 200 | `let-underscore` | **unreachable** | `let _ = queue;` |
 | `src/dlss/fg.rs` | 305 | `let-underscore` | **unreachable** | `let _ = ring.retire(slot_index, &raw_queue, "DLSS FG");` |
@@ -82,13 +82,13 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/gpu.rs` | 2543 | `let-underscore` | **unreachable** | `let _ = sky_transition.author(` |
 | `src/gpu.rs` | 3844 | `let-underscore` | **unreachable** | `let _ = e.begin_render_pass(&wgpu::RenderPassDescriptor {` |
 | `src/gpu.rs` | 5671 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
-| `src/gpu.rs` | 6501 | `unwrap_or_default` | **named** | `elapsed.unwrap_or_default(),` |
-| `src/gpu.rs` | 7300 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
-| `src/gpu.rs` | 7455 | `let-underscore` | **unreachable** | `let _ = &mut pass;` |
-| `src/gpu.rs` | 7716 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
-| `src/gpu.rs` | 7982 | `unwrap_or_default` | **unreachable** | `let on = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();` |
-| `src/gpu.rs` | 7985 | `unwrap_or_default` | **unreachable** | `let off = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();` |
-| `src/gpu.rs` | 8051 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
+| `src/gpu.rs` | 6502 | `unwrap_or_default` | **named** | `elapsed.unwrap_or_default(),` |
+| `src/gpu.rs` | 7301 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
+| `src/gpu.rs` | 7456 | `let-underscore` | **unreachable** | `let _ = &mut pass;` |
+| `src/gpu.rs` | 7717 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
+| `src/gpu.rs` | 7983 | `unwrap_or_default` | **unreachable** | `let on = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();` |
+| `src/gpu.rs` | 7986 | `unwrap_or_default` | **unreachable** | `let off = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();` |
+| `src/gpu.rs` | 8052 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
 | `src/grass_random.rs` | 144 | `else-continue` | **unreachable** | `else {` |
 | `src/latency.rs` | 309 | `let-underscore` | **unreachable** | `let _ = end(1);` |
 | `src/launcher_ui.rs` | 143 | `ok-question` | **probe** | `decode(&fs::read(settings_file()?).ok()?)` |
@@ -97,7 +97,7 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/model_dds.rs` | 191 | `let-underscore` | **unreachable** | `let _ = offset;` |
 | `src/model_draw_gpu.rs` | 693 | `else-continue` | **unreachable** | `else {` |
 | `src/music.rs` | 42 | `ok-question` | **probe** | `.ok()?;` |
-| `src/objects.rs` | 272 | `let-underscore` | **unreachable** | `let _ = MODEL_LOAD_LOGGER.set(logger);` |
+| `src/objects.rs` | 273 | `let-underscore` | **unreachable** | `let _ = MODEL_LOAD_LOGGER.set(logger);` |
 | `src/pck.rs` | 543 | `ok-question` | **probe** | `let len = fs::metadata(path).ok()?.len();` |
 | `src/pck.rs` | 550 | `ok-question` | **probe** | `let file = File::open(&pkx).ok()?;` |
 | `src/pck.rs` | 551 | `ok-question` | **probe** | `let len = file.metadata().ok()?.len();` |
@@ -168,12 +168,12 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/world_handoff.rs` | 274 | `let-underscore` | **unreachable** | `let _ = fs::write(path, message.as_bytes());` |
 | `src/world_handoff.rs` | 282 | `let-underscore` | **unreachable** | `let _ = fs::write(path, format!("{FAILED_PREFIX}{reason}"));` |
 | `src/world_handoff.rs` | 298 | `let-underscore` | **unreachable** | `let _ = fs::write(path, b"ready");` |
-| `src/world_objects.rs` | 540 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Error(e));` |
-| `src/world_objects.rs` | 568 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
-| `src/world_objects.rs` | 583 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
-| `src/world_objects.rs` | 593 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
-| `src/world_objects.rs` | 599 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Done {` |
-| `src/world_objects.rs` | 818 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Done {` |
+| `src/world_objects.rs` | 644 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Error(e));` |
+| `src/world_objects.rs` | 672 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
+| `src/world_objects.rs` | 687 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
+| `src/world_objects.rs` | 697 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
+| `src/world_objects.rs` | 703 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Done {` |
+| `src/world_objects.rs` | 932 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Done {` |
 | `src/world_page_cache.rs` | 53 | `ok-question` | **probe** | `let root = element.canonicalize().ok()?;` |
 | `src/world_page_cache.rs` | 62 | `ok-question` | **probe** | `let metadata = fs::metadata(root.join(name)).ok()?;` |
 | `src/world_page_cache.rs` | 65 | `ok-question` | **probe** | `let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;` |

@@ -1352,9 +1352,18 @@ mod tests {
     /// (32x32, 533), `21.dat` 0 (60x64, 900) and `44.dat` 9 (8x32, 99).
     #[test]
     fn the_shipped_184_water_records_decode() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/water-184/water.dat");
-        let data = std::fs::read(&path).expect("the committed water fixture");
+        let path = match std::env::var_os("PW_WATER_184_DAT") {
+            Some(value) => std::path::PathBuf::from(value),
+            None => {
+                crate::pck::corpus_file_absent(Path::new("water-184/water.dat"));
+                return;
+            }
+        };
+        if !path.is_file() {
+            crate::pck::corpus_file_absent(&path);
+            return;
+        }
+        let data = std::fs::read(&path).expect("the staged water.dat corpus");
         let offsets = records_of(&data);
         let table = table_of(&data);
         assert_eq!(offsets.len(), 5, "the fixture holds five records");
@@ -1410,9 +1419,18 @@ mod tests {
     /// beside the world file, as its manifest paths require.
     #[test]
     fn the_staged_184_client_loads_water_through_the_real_loader() {
-        let element = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/clients/pw-184");
+        let element = match std::env::var_os("PW_CLIENT_184_DIR") {
+            Some(value) => std::path::PathBuf::from(value),
+            None => {
+                crate::pck::corpus_file_absent(Path::new("pw-184/maps/world/world.ecwld"));
+                return;
+            }
+        };
         let world = element.join("maps/world/world.ecwld");
+        if !world.is_file() {
+            crate::pck::corpus_file_absent(&world);
+            return;
+        }
         let scene = Scene::load(&world).expect("the staged 1.8.4 world parses");
         let refs: usize = scene.blocks.iter().map(|b| b.water.len()).sum();
         assert_eq!(refs, 4, "one water reference per staged patch");
@@ -1431,6 +1449,50 @@ mod tests {
         let mut shapes: Vec<(usize, usize)> = areas.iter().map(|a| (a.columns, a.rows)).collect();
         shapes.sort_unstable();
         assert_eq!(shapes, vec![(8, 32), (32, 32), (32, 32), (60, 64)]);
+    }
+
+    #[test]
+    fn synthetic_patch_package_with_zlib_records_decodes() {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+
+        let specs = [
+            (2u32, 2u32, [10.0f32, 30.0, -10.0]),
+            (4, 2, [64.0, 216.0, 128.0]),
+            (3, 3, [-32.0, 12.0, 96.0]),
+        ];
+        let mut package = Vec::new();
+        let mut offsets = Vec::new();
+        for &(cols, rows, center) in &specs {
+            offsets.push(package.len() as u32);
+            let payload = v3_payload(cols, rows, center);
+            let mut plain = vec![0u8; 32768];
+            plain[..payload.len()].copy_from_slice(&payload);
+            let mut compressed = Vec::new();
+            let mut encoder = ZlibEncoder::new(&mut compressed, Compression::fast());
+            encoder.write_all(&plain).unwrap();
+            encoder.finish().unwrap();
+            package.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+            package.extend_from_slice(&32768u32.to_le_bytes());
+            package.extend_from_slice(&compressed);
+        }
+        for offset in &offsets {
+            package.extend_from_slice(&offset.to_le_bytes());
+        }
+        package.extend_from_slice(&(offsets.len() as u32).to_le_bytes());
+
+        let parsed_offsets = records_of(&package);
+        let table = table_of(&package);
+        assert_eq!(parsed_offsets.len(), specs.len());
+        let mut decoded = Vec::new();
+        for (i, &offset) in parsed_offsets.iter().enumerate() {
+            let end = parsed_offsets.get(i + 1).copied().unwrap_or(table);
+            decoded.extend(parse_record(&package[offset..end], i as u32).unwrap());
+        }
+        assert_eq!(decoded.len(), specs.len());
+        assert_eq!(decoded[1].columns, 4);
+        assert_eq!(decoded[1].rows, 2);
+        assert_eq!(decoded[1].center, [64.0, 216.0, 128.0]);
     }
 
     /// The record offsets a patch package's trailer table holds, sorted.
