@@ -975,7 +975,10 @@ mod tests {
         assert!(serve_legacy(1));
         assert!(serve_legacy(58));
         assert!(serve_legacy(59), "1.8.4's world is servable");
-        assert!(!serve_legacy(60), "60 types cannot be served by the legacy bridge");
+        assert!(
+            !serve_legacy(60),
+            "60 types cannot be served by the legacy bridge"
+        );
         assert!(!serve_legacy(59 + 1));
     }
 
