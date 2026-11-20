@@ -623,7 +623,12 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
                 Ok(s) => {
                     inst_ok += 1;
                     let trees: usize = s.blocks.iter().map(|b| b.trees.len()).sum();
-                    inst_trees.push(format!("{stem}:{}types/{trees}trees", s.tree_types.len()));
+                    let grass: usize = s.blocks.iter().map(|b| b.grass.len()).sum();
+                    inst_trees.push(format!(
+                        "{stem}:{}types/{trees}trees/{}grasstypes/{grass}grass",
+                        s.tree_types.len(),
+                        s.grass_types.len()
+                    ));
                 }
                 Err(e) => inst_trees.push(format!("{stem}:refused:{}", esc(&e))),
             }

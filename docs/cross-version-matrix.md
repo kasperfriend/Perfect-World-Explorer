@@ -652,3 +652,129 @@ staged copy in the workspace or a CI job with the file present. Until then the
 split-package reader (`B-9`) remains the claim that covers it, and that claim is
 unit-tested against a synthetic split rather than against the shipped 2.86 GB
 file.
+
+<!-- BEGIN GENERATED MATRIX -->
+## Client x category, generated from the CI JSON
+
+Every cell below is produced by `tools/matrix-from-ci.py` from the files on
+the `ci-results` branch, which CI writes by running the shipped readers over
+real client bytes. Nothing here is typed from memory, and no cell is left
+blank.
+
+| category | 1.3.1 | 1.3.6 | 1.4.2 | 1.4.4 | 1.5.2 | 1.8.4 | 2016 pack |
+|---|---|---|---|---|---|---|---|
+| world ECWLD | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | 22528 blocks, 176x128 grid, tree types 59 | blocked: no `ci-results/pw-2016.json` |
+| terrain T2BK | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
+| lightmaps T2LM | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
+| water (BSData) | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | **refused**: cannot read tests/fixtures/clients/pw-184/world.ecbsd: No such file or directory (os error 2) | blocked: no `ci-results/pw-2016.json` |
+| trees | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | 59 types, 3649 placements | blocked: no `ci-results/pw-2016.json` |
+| GFX effects | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
+| music precinct | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | 1 precinct.clt files | blocked: no `ci-results/pw-2016.json` |
+| sounds | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | 1044 authored sound refs | blocked: no `ci-results/pw-2016.json` |
+| zone names | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | the ECWLD carries no zone table; zone names are the precinct's (see the music precinct row) | blocked: no `ci-results/pw-2016.json` |
+| instances | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | a64:0types/0trees a84:20types/417trees a91:0types/0trees | blocked: no `ci-results/pw-2016.json` |
+| DDS textures | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
+| package trailers (pck) | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | 1 packs, all directories read | blocked: no `ci-results/pw-2016.json` |
+| package trailers (angelica) | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
+| elements data | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
+| tasks data | blocked: no `ci-results/pw-131.json` | blocked: no `ci-results/pw-136.json` | blocked: no `ci-results/pw-142.json` | blocked: no `ci-results/pw-144.json` | blocked: no `ci-results/pw-152.json` | blocked: not in the staged fixture | blocked: no `ci-results/pw-2016.json` |
+
+7 cells measured ok, 1 named refusals, 97 blocked, 0 SILENT.
+
+### Where these numbers come from
+
+Measured (CI files): `ci-results/pw-184.json`.
+
+### Blocked clients
+
+These clients have no measurement, so every one of their cells is
+`blocked` rather than guessed. Each needs the file named to close it:
+
+- **1.3.1** (`ci-results/pw-131.json`): stage that client's files under `tests/fixtures/clients/pw-131/` and the measure step picks them up with no other change.
+- **1.3.6** (`ci-results/pw-136.json`): stage that client's files under `tests/fixtures/clients/pw-136/` and the measure step picks them up with no other change.
+- **1.4.2** (`ci-results/pw-142.json`): stage that client's files under `tests/fixtures/clients/pw-142/` and the measure step picks them up with no other change.
+- **1.4.4** (`ci-results/pw-144.json`): stage that client's files under `tests/fixtures/clients/pw-144/` and the measure step picks them up with no other change.
+- **1.5.2** (`ci-results/pw-152.json`): stage that client's files under `tests/fixtures/clients/pw-152/` and the measure step picks them up with no other change.
+- **2016 pack** (`ci-results/pw-2016.json`): stage that client's files under `tests/fixtures/clients/pw-2016/` and the measure step picks them up with no other change.
+
+The staging is the only thing missing. The readers themselves run on
+whatever is staged, so a client with bytes gets a row the same run.
+
+### Static facts, cited
+
+Read out of the source, not measured, and labelled as such:
+
+- `WORLD_VERSIONS` / `REVISIONS`: `src/pck.rs` (the container revision table and the byte offsets each revision uses).
+- `WATER_VERSIONS [0x10002000, 0x10003000]`: `src/water.rs`, the two EC-BSD revisions the loader accepts; anything else is refused by name.
+- `terrain_block::KNOWN_VERSIONS 2..=6`: `src/terrain_block.rs`, the TRN2 header versions the reader accepts.
+- Water and terrain refusals name the file since the change to `water::load`; before it, `water (BSData)` reported a bare errno.
+
+<!-- END GENERATED MATRIX -->
+
+## Status of every item, 1 to 4
+
+One line per item, each labelled. `measured (CI file)` means the number comes
+from a file on the `ci-results` branch, written by a reader over real client
+bytes. `static (file:line)` means it was read out of the source. `blocked`
+always names the measurement that would close it.
+
+### 1. The tree problem
+
+| item | status |
+|---|---|
+| 1.1 `pck::directory` returns `/` for a backslash name | **measured** (`tests/fixtures/trees-184/`, unit test `tree_source::tests::the_pack_returns_forward_slashes_while_the_world_stores_backslashes`). The earlier "the index kept backslashes" diagnosis is **wrong**: the fold at `src/pck.rs:1077` normalises entry names. The real asymmetry was that only one side was folded. |
+| 1.2 `tree_source::extract_for_scene` end to end | **measured** (`tests/fixtures/trees-184/`): 59 types resolve to 59 `.spt` and 59 `.dds`, and `tree-placements.tsv` holds 1 header + **3649** rows. Runs in CI. |
+| 1.3 every "Trees off" branch logs its reason | **measured (CI file)** for the branch that fired, **static** for the rest. `Trees off` reasons are in `src/trees.rs` (`no SpeedTree cache at …`, `cannot open …/speedtreert.dll`, `cannot open …/trees.pck`), each carried in `off_reason` to the UI. The cache key is `pwt09-{key}` from `src/windows_setup.rs`; the key includes the DLL hash, so a missing DLL or a stale cache names itself. |
+| 1.4 placement counts compared against the parsed ECWLD | **measured (CI file)**: `ci-results/pw-184.json` `ecwldTreePlacements` = **3649**, identical to the 3649 rows 1.2 writes. Equal counts mean the reader is not at fault and the fault was after the parse — which is what the separator fold was. |
+| 1.5 `a91` and `a64` author zero trees | **measured (CI file)**: `instances` = `a64:0types/0trees a84:20types/417trees a91:0types/0trees`. Both declare zero tree **types**, so zero placements is authored, not lost; they are excluded from the failure. |
+| 1.6 one run log from a 1.4.2 or 1.5.2 client | **blocked — requested, not blocking.** Needs a run of a 1.4.2 or 1.5.2 client on the same map with stderr saved to a text file, plus a 1.8.4 run. It cannot be taken here because no client can be launched in this environment (no Wine, no GPU path) and only GitHub is reachable from it, so the client files cannot be downloaded either. It is in the PR description as a request. |
+
+### 2. Silent-drop audit
+
+| item | status |
+|---|---|
+| 2.1 every candidate site classified | **measured**: `tools/audit-silent-drops.py` reports `182 sites, {'probe': 59, 'unreachable': 119, 'named': 4}`, **zero Fix**. The list is `docs/silent-drops.md`, generated, with file, line and status. |
+| 2.2 every Fix site fixed or counted | **measured**: the only genuine drop the audit found — `src/world_catalog.rs` losing malformed `instance.txt` lines — now calls `load_status::dropped(Category::Instances, …)` naming the line and the offending field. `water::load` now also records an EC-BSD loss with the file name in it. |
+| 2.3 a test that fails on an empty-and-silent loader | **measured**: `src/load_status.rs::empty_tests` (4 tests) and `src/tree_source.rs::authored_placements_that_are_not_written_are_counted_as_a_loss`, which drives the real fixture. |
+
+Two of these tests were wrong when first written and are worth naming, because
+each was a test that could not fail:
+
+- A guard wired into `src/main.rs` compared two numbers computed by the same
+  expression, so it was a tautology. Removed rather than shipped; the real check
+  compares parsed placements against rows actually written.
+- `empty_and_silent_is_refused` asserted the string `silent-drop` appeared in a
+  message that never contained it, and CI caught it. The message now says what to
+  do instead, and the test asserts that.
+- `Cell::silent` was never constructed, so "no SILENT cell" could never fail.
+  It is now produced by a world that declares tree types but yields no
+  placements, which is the reported symptom.
+
+### 3. Compatibility matrix
+
+| item | status |
+|---|---|
+| 3.1 six clients plus the 2016 pack | **blocked** for 1.3.1, 1.3.6, 1.4.2, 1.4.4, 1.5.2 and the 2016 pack: no `ci-results/<client>.json` exists, because only the 1.8.4 fixture is staged in the repository. Closing it needs those clients' world files, `trees.pck` and instance maps committed under `tests/fixtures/clients/<name>/` (each file under 100 MiB); the measure step then writes the JSON with no code change. **measured (CI file)** for 1.8.4. |
+| 3.2 all fifteen categories | **measured (CI file)** for 1.8.4 and **blocked** for the rest, per category, in the generated table above. |
+| 3.3 OK / NAMED-REFUSAL / SILENT | **measured (CI file)**: 7 ok, 1 named refusal, 0 SILENT. Several categories are `blocked: not in the staged fixture`, which is a property of a staged subset and not a claim about the client. |
+| 3.4 written from the JSON, not from memory | **measured**: the generated block is produced by `tools/matrix-from-ci.py` from `ci-results/*.json`, and every cell carries one of the three labels. |
+
+### 4. Standing open items
+
+| item | status |
+|---|---|
+| 4.1 `WATER_VERSIONS` | **static (`src/water.rs`)**: `[0x10002000, 0x10003000]`. Only the second is measured green on a staged fixture; the first is read from the constant, not from a file. |
+| 4.2 `gfx_light.rs:94-95` | **static (`src/gfx_light.rs`)**: still open, unchanged in this work. |
+| 4.3 `gfx_decal.rs:346-385` | **static (`src/gfx_decal.rs`)**: `StopEmitWhenFade` and `keyNumber` are **not** added, because the Drive SDK does not document them and the task says to record rather than guess. |
+| 4.4 DDS formats | **static (`src/model_dds.rs`)**: the formats accepted are the ones in that reader; the matrix samples 400 DDS entries per pack, so its row is a sample count, not a census. |
+| 4.5 lightmap 256x256 | **static (`src/terrain_lightmaps.rs`)**: `tile_side` decides from the file; the 256 assumption is not asserted anywhere in the new path. |
+| 4.6 `angelica_pck.rs:116` single revision table | **static (`src/angelica_pck.rs`)**: still one table. |
+| 4.7 encrypted packages | **static (`src/pck.rs`)**: `ENCRYPTED_FLAG 0x8000_0000` is recognised and the entry is refused by name; no encrypted package is staged, so it is not measured. |
+| 4.8 grass | **measured (CI file)** for the world: `ecwldGrassTypes` 254 and `ecwldGrassPlacements` 39116 in `ci-results/pw-184.json`. **Not measured**: the instance maps' grass counts, because the tool records only their tree counts in `instances`; adding `grassTypes` per instance to that fact would close it. |
+| 4.9 count caps | **static**: `ENTRY_LIMIT 1_000_000`, `MAX_TREE_TYPES 4096`, `MAX_GRASS_TYPES 4096`, `MAX_BSDATA_FILES 10_000`, `MAX_REASONS 512` in `src/load_status.rs`. |
+| 4.10 audio codecs | **static**: unchanged in this work. |
+| 4.11 drive-dependent tests report "skipped" and are counted | **static**: the harness modes report their skip; this environment cannot run them. |
+| 4.12 element family `0x3000` | **static (`src/client_detect.rs`)**: `family()`; no `elements.data` is staged in the 1.8.4 fixture, so the cell is `blocked: not in the staged fixture`. |
+| 4.13 terrain block `2..=6` | **static (`src/terrain_block.rs`)**: `KNOWN_VERSIONS`; no TRN2 file is staged, so `terrain T2BK` is blocked for every client. |
+| 4.14 failed-map notice | **static**: unchanged in this work. |
+| 4.15 `litmodels.pck` B-33 trailer-and-table fixture | **blocked**: the file cannot be downloaded from this environment (only GitHub is reachable), so the trailer-and-table slice cannot be staged. Closing it needs that slice committed under `tests/fixtures/`. |
