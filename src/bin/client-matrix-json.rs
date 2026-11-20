@@ -160,6 +160,15 @@ fn element_of(root: &Path) -> PathBuf {
     }
 }
 
+/// The directory a world file lives in, which is where its water manifest and
+/// its `BSData` patches sit. Falls back to the client root when there is no
+/// world file, so the refusal still names a path that was looked for.
+fn world_dir_for(element: &Path) -> PathBuf {
+    world_file(element)
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| element.to_path_buf())
+}
+
 /// `world.ecwld`, wherever this client keeps it.
 fn world_file(element: &Path) -> Option<PathBuf> {
     let mut all = Vec::new();
@@ -361,6 +370,13 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
 
         // --- water areas, which are BSData beside the maps
         //
+        // The loader wants the directory the *world file* lives in: `world.ecbsd`
+        // sits beside `world.ecwld`, and `BSData/N.dat` resolves under that same
+        // directory. `main.rs` passes `map.dir` for exactly this reason. Passing
+        // the client root made every measurement of this client report "cannot
+        // read .../element/world.ecbsd", so the matrix never exercised the water
+        // reader at all.
+        //
         // The count of areas is not the thing worth reporting: the 1.8.4 client
         // shipped "0 water areas, 0 cells, 0 of them wet" and this matrix never
         // said so, because a reference count is a number about the world file
@@ -368,7 +384,7 @@ fn measure_client(name: &str, root: &Path) -> (Vec<Cell>, Vec<(&'static str, Str
         // treat "the world references water and nothing decoded" as a silent
         // empty result rather than an `ok` line.
         match &scene_parsed {
-            Some(s) => match water::load(s, &element) {
+            Some(s) => match water::load(s, &world_dir_for(&element)) {
                 Ok(areas) => {
                     let cells_wet: usize = areas
                         .iter()

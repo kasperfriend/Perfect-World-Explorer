@@ -1414,7 +1414,10 @@ mod tests {
         let scene = Scene::load(&world).expect("the staged 1.8.4 world parses");
         let refs: usize = scene.blocks.iter().map(|b| b.water.len()).sum();
         assert_eq!(refs, 4, "one water reference per staged patch");
-        let areas = load(&scene, &element).expect("the staged client's water loads");
+        // The directory the world file lives in, which is what the viewer passes
+        // (`main.rs` hands `map.dir`). The manifest sits beside `world.ecwld`.
+        let world_dir = world.parent().expect("the world file has a directory");
+        let areas = load(&scene, world_dir).expect("the staged client's water loads");
         assert_eq!(areas.len(), 4, "one area per reference");
         let wet: usize = areas
             .iter()
