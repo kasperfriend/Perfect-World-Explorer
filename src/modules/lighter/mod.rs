@@ -2075,13 +2075,6 @@ impl Lighter {
             }
         }
         // Ray lighting off: default path is raster-only. The native
-        // renderer's output is already in the target texture; skip the
-        // ray pass entirely. The full ray pass (overlay or direct trace)
-        // only runs when ray_lighting is on.
-        if !settings.ray_lighting {
-            self.history.reset();
-            return Ok(false);
-        }
         let image = match settings.mode {
             Mode::Software => {
                 if let Some(t) = &timed {

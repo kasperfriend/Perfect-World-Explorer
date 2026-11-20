@@ -1252,6 +1252,13 @@ impl super::Renderer {
         let post_color = use_post.then(|| self.post.scene_view());
         let scene_target = post_color.as_ref().unwrap_or(target);
         let result = (|| -> Result<bool, String> {
+            // Ray lighting off: default path is raster-only. The native
+            // renderer's output is already in the target texture; skip the
+            // ray pass entirely. The full ray pass only runs when
+            // ray_lighting is on.
+            if !self.lighter.settings.ray_lighting {
+                return Ok(true);
+            }
             let feed = self
                 .lighter_feed
                 .as_ref()
