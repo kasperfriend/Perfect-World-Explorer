@@ -3113,7 +3113,12 @@ fn exercise_sun_and_history(h: &mut Harness) {
     for i in 1..=FRAMES {
         h.ray.reset_history();
         let frame_pixels = h.pixels(frame, &empty);
-        for (((mean, var), depth), pixel) in converged_mean.iter_mut().zip(converged_var.iter_mut()).zip(converged_depth.iter_mut()).zip(frame_pixels) {
+        for (((mean, var), depth), pixel) in converged_mean
+            .iter_mut()
+            .zip(converged_var.iter_mut())
+            .zip(converged_depth.iter_mut())
+            .zip(frame_pixels)
+        {
             let noise = f32::sqrt(*var) / f32::max(0.04, *mean);
             let t = ((noise - 0.05) / 0.35).clamp(0., 1.);
             let alpha = f32::max(1. / i as f32, 0.10 - 0.065 * t * t * (3. - 2. * t));
