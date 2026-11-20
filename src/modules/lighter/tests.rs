@@ -616,7 +616,7 @@ fn exercise(mode: Mode, cpu_query: bool) {
 
     let local_light = |color: [f32; 4], masked| {
         let mut b = Builder::default();
-        b.light(Light::point([0., 0., -2., 12.], color));
+        b.light(Light::point([6., 0., -2., 12.], color));
         // The tested light must not be pruned just because decorative lights
         // elsewhere in world space also exist in the same packet.
         for i in 0..70 {
@@ -634,10 +634,13 @@ fn exercise(mode: Mode, cpu_query: bool) {
         b.finish()
     };
     h.ray.settings.lighting = true;
-    // Empty world so only light contributes to the pixel, making
-    // bright/dim light differences visible (green_front maxed the channel).
+    // Dark green world so lighting differences are visible (green_front at
+    // [0,1,0] maxes the green channel and hides light differences).
+    let mut b3 = Builder::default();
+    let dark_green = upright(&mut b3, -2., [0., 0.3, 0., 1.], 0, 0);
+    put(&mut b3, dark_green);
     h.ray
-        .install(Ok((Builder::default().finish(), bank.clone())));
+        .install(Ok((b3.finish(), bank.clone())));
     let bright = h.pixel(frame, &local_light([3.; 4], false));
     let builds = h.builds();
     let dim = h.pixel(frame, &local_light([0.5; 4], false));
