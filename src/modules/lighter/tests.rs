@@ -5196,3 +5196,48 @@ fn r5_each_reload_failure_path_produces_distinct_message_and_logs() {
         );
     }
 }
+
+#[test]
+fn r6_overlay_and_reference_reload_paths_end_to_end() {
+    // 1. Reload into Hardware RT with overlay on: succeeds once overlay draws,
+    //    even though `renders_world` (reference world-replacement) is false.
+    let mut overlay = Lighter::default();
+    overlay.armed = true;
+    overlay.has_hardware_device = true;
+    overlay.adapter_supports_compute = true;
+    overlay.native_backend = wgpu::Backend::Vulkan;
+    overlay.settings.mode = Mode::Hardware;
+    overlay.settings.ray_lighting = true;
+    overlay.settings.reference = false;
+    overlay.install(Ok((Builder::default().finish(), Textures::default())));
+    assert!(overlay.overlays_world());
+    assert_eq!(overlay.check_reload_state(Mode::Hardware, false), Ok(false));
+    overlay.frame_index = 1;
+    assert_eq!(
+        overlay.check_reload_state(Mode::Hardware, false),
+        Ok(true),
+        "Hardware RT overlay reload must succeed once first overlay frame draws"
+    );
+
+    // 2. Reload into Hardware RT with Reference on: succeeds ONLY when the world
+    //    is replaced (`renders_world == true`), and fails when it is not.
+    let mut reference = Lighter::default();
+    reference.armed = true;
+    reference.has_hardware_device = true;
+    reference.adapter_supports_compute = true;
+    reference.native_backend = wgpu::Backend::Vulkan;
+    reference.settings.mode = Mode::Hardware;
+    reference.settings.ray_lighting = true;
+    reference.settings.reference = true;
+    reference.install(Ok((Builder::default().finish(), Textures::default())));
+    assert!(!reference.overlays_world());
+    assert!(
+        reference.check_reload_state(Mode::Hardware, false).is_err(),
+        "Reference reload must fail when world is not replaced"
+    );
+    assert_eq!(
+        reference.check_reload_state(Mode::Hardware, true),
+        Ok(true),
+        "Reference reload must succeed when world is replaced"
+    );
+}
