@@ -5,7 +5,7 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | category | sites |
 |---|---|
 | named | 5 |
-| unreachable | 118 |
+| unreachable | 117 |
 | fix | 0 |
 | ? | 0 |
 
@@ -101,7 +101,6 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/pck.rs` | 550 | `ok-question` | **probe** | `let len = fs::metadata(path).ok()?.len();` |
 | `src/pck.rs` | 557 | `ok-question` | **probe** | `let file = File::open(&pkx).ok()?;` |
 | `src/pck.rs` | 558 | `ok-question` | **probe** | `let len = file.metadata().ok()?.len();` |
-| `src/pck.rs` | 969 | `unwrap_or_default` | **unreachable** | `let mut name = self.path.file_stem().unwrap_or_default().to_os_string();` |
 | `src/sky_gpu.rs` | 1448 | `ok-question` | **probe** | `let mut file = File::open(element.join("configs.pck")).ok()?;` |
 | `src/sky_gpu.rs` | 1449 | `ok-question` | **probe** | `let entries = crate::angelica_pck::directory(&mut file).ok()?;` |
 | `src/sky_gpu.rs` | 1456 | `ok-question` | **probe** | `let list_bytes = pck::read_entry(&mut file, list).ok()?;` |
