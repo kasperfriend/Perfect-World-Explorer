@@ -242,10 +242,17 @@ fn extract_refused_versions(messages: &[String]) -> Vec<(String, usize)> {
         if !msg.to_ascii_lowercase().contains("version") {
             continue;
         }
+        let mut prev = "";
         for token in msg.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-            if token.starts_with("0x") || token.starts_with("0X") {
+            if token.is_empty() {
+                continue;
+            }
+            if (token.starts_with("0x") || token.starts_with("0X"))
+                && !prev.eq_ignore_ascii_case("client")
+            {
                 *counts.entry(token.to_ascii_lowercase()).or_insert(0) += 1;
             }
+            prev = token;
         }
     }
     counts.into_iter().collect()

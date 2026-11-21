@@ -83,7 +83,14 @@
 //! geometry.
 
 /// Mesh versions the reader and this draw state were inspected against.
-pub const INSPECTED_MESH_VERSIONS: [u32; 2] = [0x1000_0004, 0x1000_0005];
+pub const INSPECTED_MESH_VERSIONS: [u32; 6] = [
+    0x1000_0004,
+    0x1000_0005,
+    0x1000_0006,
+    0x1000_0300,
+    0x1000_0301,
+    0x1000_0302,
+];
 
 /// `mesh+0x2cc` value the mesh constructor installs, i.e. no alpha test.
 pub const CLIENT_MAX_MESH_ALPHA: u32 = 0xff;
@@ -225,7 +232,7 @@ pub fn classify(mesh_version: u32, textured: bool, two_sided: bool) -> Result<Dr
     Ok(match (textured, two_sided) {
         // The no-cull flag only exists on v5 materials; a v4 mesh with a
         // two-sided flag is a caller bug, not something to paper over.
-        (_, true) if mesh_version != 0x1000_0005 => {
+        (_, true) if mesh_version < 0x1000_0005 => {
             return Err("two-sided flag requires an inspected v5 material".into())
         }
         (false, false) => DrawState {
@@ -346,7 +353,9 @@ mod tests {
             classify(0x1000_0004, false, false).unwrap().stage,
             Stage::ColorOnly
         );
-        for v in [0x1000_0003, 0x1000_0006, 0] {
+        assert_eq!(classify(0x1000_0006, true, false).unwrap().kind, 2.0);
+        assert_eq!(classify(0x1000_0302, true, false).unwrap().kind, 2.0);
+        for v in [0x1000_0003, 0x1000_0007, 0] {
             assert!(classify(v, true, false).is_err(), "{v:#x}");
         }
         // v4 has no material block, so a two-sided flag cannot be honoured.

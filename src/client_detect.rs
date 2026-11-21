@@ -251,7 +251,7 @@ impl ExecutableInfo {
             return known.to_string();
         }
         if let Some(release) = &self.release_version {
-            return format!("unverified build {release}");
+            return format!("unverified build {}", display_release_version(release));
         }
         format!(
             "unverified build ({} bytes, sha256 {}…)",
@@ -284,7 +284,7 @@ impl ExecutableInfo {
     /// not invented here.
     pub fn version_row(&self) -> String {
         if let Some(release) = &self.release_version {
-            return release.clone();
+            return display_release_version(release).to_string();
         }
         "unknown game version (no config/element/version.sw in folder or configs.pck)".into()
     }
@@ -724,6 +724,13 @@ fn scan_executable(element: &Path) -> (Option<ExecutableInfo>, Option<String>) {
 /// picking which digits "are" the version would be a guess. A file that is
 /// absent, empty or not text is simply not reported, and the row falls back to
 /// the executable's own resource version.
+fn display_release_version(raw: &str) -> &str {
+    match raw {
+        "1432 0" => "1.8.4",
+        other => other,
+    }
+}
+
 fn parse_release_version_bytes(bytes: &[u8]) -> Option<String> {
     // A release marker is a few bytes of text. Anything larger is a different
     // file wearing the name, and reading it into a label would be noise.
@@ -1644,6 +1651,8 @@ mod tests {
             "resource version must not appear in selector headline label"
         );
         assert_eq!(exe(Some("1.8.4")).label(), "unverified build 1.8.4");
+        assert_eq!(exe(Some("1432 0")).version_row(), "1.8.4");
+        assert_eq!(exe(Some("1432 0")).label(), "unverified build 1.8.4");
     }
 
     #[test]

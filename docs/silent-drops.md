@@ -13,28 +13,33 @@ Every place a loader can lose a value without saying so, classified. Generated b
 
 | file | line | pattern | category | code |
 |---|---|---|---|---|
+| `src/bmd.rs` | 169 | `ok-question` | **probe** | `ambient: color(start).ok()?,` |
+| `src/bmd.rs` | 170 | `ok-question` | **probe** | `diffuse: color(start + 16).ok()?,` |
+| `src/bmd.rs` | 171 | `ok-question` | **probe** | `emissive: color(start + 32).ok()?,` |
+| `src/bmd.rs` | 172 | `ok-question` | **probe** | `specular: color(start + 48).ok()?,` |
+| `src/bmd.rs` | 173 | `ok-question` | **probe** | `power: f(tail, start + 64).ok()?,` |
 | `src/client_detect.rs` | 181 | `ok-question` | **probe** | `let word = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 182 | `ok-question` | **probe** | `let timestamp = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 184 | `ok-question` | **probe** | `short: u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?),` |
 | `src/client_detect.rs` | 613 | `ok-question` | **probe** | `let matched = fs::read_dir(&current).ok()?.flatten().find(\|entry\| {` |
 | `src/client_detect.rs` | 638 | `ok-question` | **probe** | `.ok()?` |
-| `src/client_detect.rs` | 733 | `ok-question` | **probe** | `let text = String::from_utf8(bytes.to_vec()).ok()?;` |
-| `src/client_detect.rs` | 745 | `ok-question` | **probe** | `let mut file = fs::File::open(&pack_path).ok()?;` |
-| `src/client_detect.rs` | 859 | `ok-question` | **probe** | `Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))` |
-| `src/client_detect.rs` | 862 | `ok-question` | **probe** | `Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))` |
-| `src/client_detect.rs` | 931 | `ok-question` | **probe** | `blob.get(offset..offset + 2)?.try_into().ok()?,` |
-| `src/client_detect.rs` | 1217 | `ok-question` | **probe** | `bytes.get(offset..offset + 4)?.try_into().ok()?,` |
-| `src/client_detect.rs` | 1223 | `ok-question` | **probe** | `bytes.get(offset..offset + 2)?.try_into().ok()?,` |
-| `src/client_detect.rs` | 1359 | `ok-question` | **probe** | `let size = fs::metadata(&pck).ok()?.len();` |
-| `src/client_detect.rs` | 1361 | `ok-question` | **probe** | `fs::File::open(&pck).ok()?.read_exact(&mut prefix).ok()?;` |
-| `src/client_detect.rs` | 1365 | `ok-question` | **probe** | `let declared = u32::from_le_bytes(prefix[4..8].try_into().ok()?) as u64;` |
-| `src/client_detect.rs` | 1457 | `ok-question` | **probe** | `let mut file = fs::File::open(path).ok()?;` |
-| `src/client_detect.rs` | 1458 | `ok-question` | **probe** | `let size = file.seek(SeekFrom::End(0)).ok()?;` |
-| `src/client_detect.rs` | 1468 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(0)).ok()?;` |
-| `src/client_detect.rs` | 1469 | `ok-question` | **probe** | `file.read_exact(&mut prefix).ok()?;` |
-| `src/client_detect.rs` | 1470 | `ok-question` | **probe** | `let declared = u64::from(u32::from_le_bytes(prefix[4..8].try_into().ok()?));` |
-| `src/client_detect.rs` | 1487 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(end - 4)).ok()?;` |
-| `src/client_detect.rs` | 1489 | `ok-question` | **probe** | `file.read_exact(&mut word).ok()?;` |
+| `src/client_detect.rs` | 740 | `ok-question` | **probe** | `let text = String::from_utf8(bytes.to_vec()).ok()?;` |
+| `src/client_detect.rs` | 752 | `ok-question` | **probe** | `let mut file = fs::File::open(&pack_path).ok()?;` |
+| `src/client_detect.rs` | 866 | `ok-question` | **probe** | `Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))` |
+| `src/client_detect.rs` | 869 | `ok-question` | **probe** | `Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))` |
+| `src/client_detect.rs` | 938 | `ok-question` | **probe** | `blob.get(offset..offset + 2)?.try_into().ok()?,` |
+| `src/client_detect.rs` | 1224 | `ok-question` | **probe** | `bytes.get(offset..offset + 4)?.try_into().ok()?,` |
+| `src/client_detect.rs` | 1230 | `ok-question` | **probe** | `bytes.get(offset..offset + 2)?.try_into().ok()?,` |
+| `src/client_detect.rs` | 1366 | `ok-question` | **probe** | `let size = fs::metadata(&pck).ok()?.len();` |
+| `src/client_detect.rs` | 1368 | `ok-question` | **probe** | `fs::File::open(&pck).ok()?.read_exact(&mut prefix).ok()?;` |
+| `src/client_detect.rs` | 1372 | `ok-question` | **probe** | `let declared = u32::from_le_bytes(prefix[4..8].try_into().ok()?) as u64;` |
+| `src/client_detect.rs` | 1464 | `ok-question` | **probe** | `let mut file = fs::File::open(path).ok()?;` |
+| `src/client_detect.rs` | 1465 | `ok-question` | **probe** | `let size = file.seek(SeekFrom::End(0)).ok()?;` |
+| `src/client_detect.rs` | 1475 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(0)).ok()?;` |
+| `src/client_detect.rs` | 1476 | `ok-question` | **probe** | `file.read_exact(&mut prefix).ok()?;` |
+| `src/client_detect.rs` | 1477 | `ok-question` | **probe** | `let declared = u64::from(u32::from_le_bytes(prefix[4..8].try_into().ok()?));` |
+| `src/client_detect.rs` | 1494 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(end - 4)).ok()?;` |
+| `src/client_detect.rs` | 1496 | `ok-question` | **probe** | `file.read_exact(&mut word).ok()?;` |
 | `src/direct_storage.rs` | 167 | `let-underscore` | **unreachable** | `let _ = (file, ranges);` |
 | `src/dlss/fg.rs` | 200 | `let-underscore` | **unreachable** | `let _ = queue;` |
 | `src/dlss/fg.rs` | 305 | `let-underscore` | **unreachable** | `let _ = ring.retire(slot_index, &raw_queue, "DLSS FG");` |
@@ -168,12 +173,12 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/world_handoff.rs` | 274 | `let-underscore` | **unreachable** | `let _ = fs::write(path, message.as_bytes());` |
 | `src/world_handoff.rs` | 282 | `let-underscore` | **unreachable** | `let _ = fs::write(path, format!("{FAILED_PREFIX}{reason}"));` |
 | `src/world_handoff.rs` | 298 | `let-underscore` | **unreachable** | `let _ = fs::write(path, b"ready");` |
-| `src/world_objects.rs` | 644 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Error(e));` |
-| `src/world_objects.rs` | 672 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
-| `src/world_objects.rs` | 687 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
-| `src/world_objects.rs` | 697 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
-| `src/world_objects.rs` | 703 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Done {` |
-| `src/world_objects.rs` | 938 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Done {` |
+| `src/world_objects.rs` | 651 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Error(e));` |
+| `src/world_objects.rs` | 679 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
+| `src/world_objects.rs` | 694 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
+| `src/world_objects.rs` | 704 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::CacheInvalid);` |
+| `src/world_objects.rs` | 710 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Done {` |
+| `src/world_objects.rs` | 945 | `let-underscore` | **unreachable** | `let _ = tx.send(Message::Done {` |
 | `src/world_page_cache.rs` | 53 | `ok-question` | **probe** | `let root = element.canonicalize().ok()?;` |
 | `src/world_page_cache.rs` | 62 | `ok-question` | **probe** | `let metadata = fs::metadata(root.join(name)).ok()?;` |
 | `src/world_page_cache.rs` | 65 | `ok-question` | **probe** | `let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;` |
