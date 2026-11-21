@@ -4283,6 +4283,12 @@ impl Renderer {
                     frame.active_fog_color,
                 );
             }
+            if !self.local_scenery_skipped && self.lighter.overlays_world() {
+                if reset_history {
+                    self.lighter.reset_history();
+                }
+                self.render_lighter_overlay(scene_target, matrix, camera, &frame, w, h);
+            }
             if use_post {
                 self.post.render(
                     &self.device,
@@ -6795,6 +6801,18 @@ fn run_viewer(
                         || dlss_upscaler.is_some()
                         || (extent_upscaling == crate::UpscaleMethod::Fsr1
                             && crate::fsr1_eligible(applied_extent, (config.width, config.height)));
+                    renderer.lighter.set_graphics_state(
+                        if upscaler_running {
+                            format!("{} ({})", settings.upscaling.label(), settings.upscale_quality.label())
+                        } else {
+                            "Off".into()
+                        },
+                        if framegen.is_some() || xess_framegen.is_some() || dlss_framegen.is_some() {
+                            settings.frame_generation.label().into()
+                        } else {
+                            "Off".into()
+                        },
+                    );
                     // DLSS evaluates at the render size NGX's optimal settings
                     // returned, which is not necessarily the settings table's
                     // guess; the world has to be drawn at the size the feature

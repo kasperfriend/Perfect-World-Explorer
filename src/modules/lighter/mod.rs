@@ -1452,6 +1452,11 @@ impl Lighter {
             && !self.settings.reference
     }
 
+    pub fn set_graphics_state(&mut self, upscaler: String, frame_gen: String) {
+        self.graphics_upscaler = Some(upscaler);
+        self.graphics_frame_gen = Some(frame_gen);
+    }
+
     fn log_session_if_needed(&mut self) {
         if self.session_logged || self.logger.level() == log::LogLevel::Off {
             return;
