@@ -975,16 +975,16 @@ fn push_terrain(
             };
             triangles.push(RayTriangle::with_kind(
                 p0,
-                p1,
                 p2,
+                p1,
                 n0,
                 material,
                 KIND_TERRAIN_LOD,
             ));
             triangles.push(RayTriangle::with_kind(
                 p0,
-                p2,
                 p3,
+                p2,
                 n1,
                 material,
                 KIND_TERRAIN_LOD,
@@ -1405,8 +1405,11 @@ fn push_terrain_frustum(
                     heights.push(ground(wx, wz));
                 }
             }
+            // Phase R2: Emit terrain triangles with CCW upward-facing (+Y)
+            // winding so geometric normal `(b - a).cross(c - a)` matches the
+            // stored normal on every subdivision (2-tri quads and 4-tri fans).
             let tri_normal = |a: Vec3, b: Vec3, c: Vec3| -> Vec3 {
-                let n = (c - a).cross(b - a).normalize_or_zero();
+                let n = (b - a).cross(c - a).normalize_or_zero();
                 if n.length_squared() > 0.5 {
                     n
                 } else {
@@ -1444,33 +1447,33 @@ fn push_terrain_frustum(
                         let pc = Vec3::new(wxc, hc, wzc);
                         triangles.push(RayTriangle::with_kind(
                             p0,
+                            pc,
+                            p1,
+                            tri_normal(p0, pc, p1),
+                            material,
+                            KIND_TERRAIN_LOD,
+                        ));
+                        triangles.push(RayTriangle::with_kind(
                             p1,
                             pc,
-                            tri_normal(p0, p1, pc),
-                            material,
-                            KIND_TERRAIN_LOD,
-                        ));
-                        triangles.push(RayTriangle::with_kind(
-                            p1,
                             p2,
-                            pc,
-                            tri_normal(p1, p2, pc),
+                            tri_normal(p1, pc, p2),
                             material,
                             KIND_TERRAIN_LOD,
                         ));
                         triangles.push(RayTriangle::with_kind(
                             p2,
-                            p3,
                             pc,
-                            tri_normal(p2, p3, pc),
+                            p3,
+                            tri_normal(p2, pc, p3),
                             material,
                             KIND_TERRAIN_LOD,
                         ));
                         triangles.push(RayTriangle::with_kind(
                             p3,
+                            pc,
                             p0,
-                            pc,
-                            tri_normal(p3, p0, pc),
+                            tri_normal(p3, pc, p0),
                             material,
                             KIND_TERRAIN_LOD,
                         ));
@@ -1490,17 +1493,17 @@ fn push_terrain_frustum(
                         let p3 = Vec3::new(wx0, h3 - drop, wz1);
                         triangles.push(RayTriangle::with_kind(
                             p0,
-                            p1,
                             p2,
-                            tri_normal(p0, p1, p2),
+                            p1,
+                            tri_normal(p0, p2, p1),
                             material,
                             KIND_TERRAIN_LOD,
                         ));
                         triangles.push(RayTriangle::with_kind(
                             p0,
-                            p2,
                             p3,
-                            tri_normal(p0, p2, p3),
+                            p2,
+                            tri_normal(p0, p3, p2),
                             material,
                             KIND_TERRAIN_LOD,
                         ));
@@ -2100,5 +2103,104 @@ mod tests {
             ),
             "camera move beyond hysteresis threshold must request a rebuild"
         );
+    }
+
+    #[test]
+    fn phase_r2_terrain_winding_matches_upward_normal_and_front_face_hits() {
+        let mut harvester = Harvester::new();
+        let eye = Vec3::new(10.0, 20.0, 10.0);
+        let vp = Mat4::IDENTITY;
+        let flat_ground = |_x: f32, _z: f32| -> f32 { 10.0 };
+        let scene = harvester.scene_frustum(
+            HarvestConfig {
+                radius: 64.0,
+                chunk_size: 64.0,
+                max_distance: 64.0,
+                ..HarvestConfig::default()
+            },
+            eye,
+            Vec3::NEG_Z,
+            vp,
+            64.0,
+            2.0,
+            1,
+            1,
+            Some(&flat_ground),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            !scene.triangles.is_empty(),
+            "terrain should produce triangles"
+        );
+        for tri in &scene.triangles {
+            let geo = super::super::bvh::triangle_normal(tri).normalize();
+            let stored = Vec3::new(tri.normal[0], tri.normal[1], tri.normal[2]);
+            assert!(
+                geo.y > 0.999 && stored.y > 0.999,
+                "flat terrain geometric normal {geo:?} and stored normal {stored:?} must point +Y"
+            );
+            assert!(
+                geo.dot(stored) > 0.999,
+                "terrain winding normal {geo:?} must match stored normal {stored:?}"
+            );
+        }
+        // Ray from above hits front-facing terrain triangle at t = 10.0.
+        let down_hit = scene
+            .closest_hit(Vec3::new(10.0, 20.0, 10.0), Vec3::NEG_Y, 0.01, 100.0)
+            .expect("downward ray from above must hit terrain");
+        let down_tri = &scene.triangles[down_hit.triangle as usize];
+        let down_geo = super::super::bvh::triangle_normal(down_tri);
+        assert!(
+            down_geo.dot(Vec3::NEG_Y) < 0.0,
+            "ray from above must hit the front (+Y) face of terrain"
+        );
+        assert!((down_hit.t - 10.0).abs() < 1e-3);
+
+        // Ray from below approaches from the back face (front-face test rejects it).
+        let up_hit = scene
+            .closest_hit(Vec3::new(10.0, 0.0, 10.0), Vec3::Y, 0.01, 100.0)
+            .expect("two-sided BVH intersects plane");
+        let up_tri = &scene.triangles[up_hit.triangle as usize];
+        let up_geo = super::super::bvh::triangle_normal(up_tri);
+        assert!(
+            up_geo.dot(Vec3::Y) > 0.0,
+            "ray from below must NOT hit the front face of terrain"
+        );
+
+        // Also verify concave 4-triangle fan winding matches +Y.
+        let mut valley_harvester = Harvester::new();
+        let valley_ground = |x: f32, z: f32| -> f32 {
+            // Concave bowl so lod_band == 0 triggers the 4-tri fan.
+            ((x - 10.0) * (x - 10.0) + (z - 10.0) * (z - 10.0)) * 0.05
+        };
+        let valley = valley_harvester.scene_frustum(
+            HarvestConfig {
+                radius: 64.0,
+                chunk_size: 64.0,
+                max_distance: 64.0,
+                ..HarvestConfig::default()
+            },
+            eye,
+            Vec3::NEG_Z,
+            vp,
+            64.0,
+            2.0,
+            2,
+            2,
+            Some(&valley_ground),
+            &[],
+            &[],
+            &[],
+        );
+        for tri in &valley.triangles {
+            let geo = super::super::bvh::triangle_normal(tri).normalize();
+            let stored = Vec3::new(tri.normal[0], tri.normal[1], tri.normal[2]);
+            assert!(
+                geo.y > 0.0 && stored.y > 0.0 && geo.dot(stored) > 0.999,
+                "concave fan terrain winding {geo:?} must match stored normal {stored:?} and face +Y"
+            );
+        }
     }
 }
