@@ -900,6 +900,7 @@ fn lighter_streamed_world_pixels() {
             shadows: false,
             bounces: 0,
             resolution: 100,
+            reference: true,
             ..Settings::default()
         },
         &a,
