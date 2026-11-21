@@ -2768,7 +2768,7 @@ impl Renderer {
             angle.cos() * 0.8,
             angle.sin().max(0.05),
             0.46,
-            if camera.terrain_lightmaps {
+            if camera.terrain_lightmaps && !self.raywatcher_overrides.suppress_baked_shadows {
                 daylight
             } else {
                 -1.
@@ -2991,7 +2991,11 @@ impl Renderer {
         let grass_wind = [
             self.grass_wind_state.time(),
             if camera.grass_wind_enabled { 1. } else { 0. },
-            if camera.area_grass_lightmaps { 1. } else { 0. },
+            if camera.area_grass_lightmaps && !self.raywatcher_overrides.suppress_baked_shadows {
+                1.
+            } else {
+                0.
+            },
             0.,
         ];
         let grass_history = self

@@ -38,6 +38,10 @@ pub struct RasterOverrides {
     /// Skip the raster cloud/atmosphere glow that would double the ray-traced
     /// sky lighting.
     pub atmosphere_fog: bool,
+    /// Phase 5 (single shadow source): suppress baked terrain & grass lightmap
+    /// shadows when RT sun visibility is active so each building/tree shadow
+    /// darkens the surface once instead of stacking baked + RT shadows.
+    pub suppress_baked_shadows: bool,
 }
 
 impl RasterOverrides {
@@ -49,6 +53,7 @@ impl RasterOverrides {
         reflection_pass: false,
         occlusion: false,
         atmosphere_fog: false,
+        suppress_baked_shadows: false,
     };
 
     /// The overrides a plan implies. The viewer draws three light terms
@@ -71,8 +76,14 @@ impl RasterOverrides {
     /// returns [`Self::NONE`]. Raster terms are only removed when the user
     /// explicitly opts into `replace_raster`.
     pub fn for_plan(plan: &crate::modules::raywatcher::plan::Plan) -> Self {
-        if !plan.trace || !plan.replace_raster {
+        if !plan.trace {
             return Self::NONE;
+        }
+        if !plan.replace_raster {
+            return Self {
+                suppress_baked_shadows: plan.effects.shadows,
+                ..Self::NONE
+            };
         }
         Self::for_effects(plan.effects, true)
     }
@@ -88,6 +99,7 @@ impl RasterOverrides {
             reflection_pass: effects.reflections,
             occlusion: effects.ambient_occlusion,
             atmosphere_fog: effects.shadows,
+            suppress_baked_shadows: effects.shadows,
         }
     }
 
@@ -97,6 +109,7 @@ impl RasterOverrides {
             || self.reflection_pass
             || self.occlusion
             || self.atmosphere_fog
+            || self.suppress_baked_shadows
     }
 
     /// One-line summary for the module's status line: the effects the raster
@@ -571,6 +584,30 @@ mod tests {
 
     fn lighting() -> LightingRecord {
         LightingRecord::default()
+    }
+
+    #[test]
+    fn single_shadow_source_suppresses_baked_lightmaps_only_when_rt_shadows_active() {
+        use super::super::plan::{Plan, RayTracingMode, Settings};
+        let off_plan = Plan::decide(&Settings::default(), (1920, 1080), true, |_| false);
+        let off_ov = RasterOverrides::for_plan(&off_plan);
+        assert_eq!(off_ov, RasterOverrides::NONE);
+
+        let mut s = Settings::default();
+        s.mode = RayTracingMode::Hardware;
+        s.effects.shadows = true;
+        let on_plan = Plan::decide(&s, (1920, 1080), true, |_| false);
+        let on_ov = RasterOverrides::for_plan(&on_plan);
+        assert!(on_ov.suppress_baked_shadows);
+        assert!(!on_ov.directional_light);
+        assert!(!on_ov.ambient);
+        assert!(!on_ov.reflection_pass);
+        assert!(!on_ov.atmosphere_fog);
+
+        s.effects.shadows = false;
+        let no_sh_plan = Plan::decide(&s, (1920, 1080), true, |_| false);
+        let no_sh_ov = RasterOverrides::for_plan(&no_sh_plan);
+        assert!(!no_sh_ov.suppress_baked_shadows);
     }
 
     #[test]

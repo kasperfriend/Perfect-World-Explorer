@@ -753,10 +753,23 @@ mod tests {
 
         assert!(enabled.active);
         assert_eq!(
-            enabled.overrides, disabled.overrides,
-            "default enabled Raywatcher must leave every raster term identical to disabled"
+            enabled.overrides.directional_light,
+            disabled.overrides.directional_light
         );
-        assert_eq!(enabled.overrides, frame::RasterOverrides::NONE);
+        assert_eq!(enabled.overrides.ambient, disabled.overrides.ambient);
+        assert_eq!(
+            enabled.overrides.reflection_pass,
+            disabled.overrides.reflection_pass
+        );
+        assert_eq!(enabled.overrides.occlusion, disabled.overrides.occlusion);
+        assert_eq!(
+            enabled.overrides.atmosphere_fog,
+            disabled.overrides.atmosphere_fog
+        );
+        assert!(
+            enabled.overrides.suppress_baked_shadows,
+            "Phase 5 single shadow source suppresses baked lightmaps when RT shadows are active"
+        );
         assert_eq!(enabled.plan.render, (1920, 1080));
         assert_eq!(enabled.plan.grid, (1920, 1080));
     }
@@ -770,7 +783,12 @@ mod tests {
         m.set_settings(s);
         let layered = m.status((1920, 1080), false);
         assert!(layered.active);
-        assert_eq!(layered.overrides, frame::RasterOverrides::NONE);
+        assert!(!layered.overrides.directional_light);
+        assert!(!layered.overrides.ambient);
+        assert!(!layered.overrides.reflection_pass);
+        assert!(!layered.overrides.occlusion);
+        assert!(!layered.overrides.atmosphere_fog);
+        assert!(layered.overrides.suppress_baked_shadows);
         assert_eq!(layered.plan.render, (1920, 1080));
         assert_eq!(layered.plan.grid, (960, 540));
         assert!(layered.summary.contains("Software"));
