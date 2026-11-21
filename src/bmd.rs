@@ -856,6 +856,7 @@ mod tests {
         put(&mut b, 0x10000305);
         b.extend_from_slice(&[0; 48]);
         put(&mut b, 2); // two meshes
+
         // Mesh 0: lightmap UV floats instead of vertex colors + variable dwExtraSize (30 B)
         put(&mut b, 0);
         put(&mut b, 2);
@@ -869,6 +870,7 @@ mod tests {
         put(&mut b, 1);
         put(&mut b, 2);
         b.extend_from_slice(&[0; 36]); // 3 normals
+
         // 3 lightmap (u, v) float pairs (alpha bytes 0x3e/0x3f, NOT 0xff)
         for uv in [0.25f32, 0.5, 0.75, 0.125, 0.5, 0.5] {
             put(&mut b, uv.to_bits());
@@ -878,6 +880,7 @@ mod tests {
         b.extend_from_slice(&[0; 69]); // material
         put(&mut b, 30); // dwExtraSize = 30 (> 22)
         b.extend_from_slice(&[0; 26]); // remaining 26 bytes of extra block
+
         // Mesh 1: lightmap UVs followed by real opaque day/night vertex colors
         put(&mut b, 0);
         put(&mut b, 2);
