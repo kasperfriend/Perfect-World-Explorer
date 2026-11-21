@@ -1757,6 +1757,8 @@ struct Renderer {
     raywatcher_scene: Option<std::sync::Arc<crate::modules::raywatcher::bvh::SceneGeometry>>,
     /// Builds and caches the ray scene from the resident world.
     raywatcher_harvest: crate::modules::raywatcher::harvest::Harvester,
+    /// Worst Raywatcher CPU frame time observed (ms), logged under `PWE_RT_DEBUG=1`.
+    raywatcher_worst_frame_ms: f64,
     /// This frame's ray plan, decided before the world pass and consumed after
     /// it. `Plan::OFF` on a frame the module is not tracing.
     raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan,
@@ -2533,6 +2535,7 @@ impl Renderer {
             raywatcher_gpu: None,
             raywatcher_scene: None,
             raywatcher_harvest: crate::modules::raywatcher::harvest::Harvester::new(),
+            raywatcher_worst_frame_ms: 0.0,
             raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan::OFF,
             raywatcher_hw_probe: None,
             raywatcher_overrides: crate::modules::raywatcher::frame::RasterOverrides::NONE,
@@ -3777,16 +3780,17 @@ impl Renderer {
             ^ ((self.world_pages.len() as u64) << 16)
             ^ (self.water_batches.len() as u64)
             ^ (u64::from(self.world_done) << 62);
-        let scene = if let Some(cached) = self.raywatcher_harvest.cached_if_unchanged_frustum(
+        let t_rw_frame = std::time::Instant::now();
+        // Poll any completed background BVH build without blocking the frame.
+        let _ = self.raywatcher_harvest.poll_background_build();
+        if self.raywatcher_harvest.needs_frustum_rebuild(
             config,
             camera.pos,
-            view_forward,
             view_distance,
             0,
             content_hash,
-        ) {
-            cached
-        } else {
+        ) && !self.raywatcher_harvest.is_building_in_background()
+        {
             use crate::modules::raywatcher::harvest::{
                 Frustum, InstanceProxy, MeshTriangle, WaterSurface,
             };
@@ -3930,7 +3934,7 @@ impl Renderer {
             let ground_ref: Option<&dyn Fn(f32, f32) -> f32> =
                 map_space.map(|_| &ground_closure as &dyn Fn(f32, f32) -> f32);
 
-            self.raywatcher_harvest.scene_frustum(
+            self.raywatcher_harvest.start_background_frustum_build(
                 config,
                 camera.pos,
                 view_forward,
@@ -3940,10 +3944,18 @@ impl Renderer {
                 0,
                 content_hash,
                 ground_ref,
-                &real_meshes,
-                &proxies,
-                &water,
-            )
+                real_meshes,
+                proxies,
+                water,
+            );
+        }
+        self.modules
+            .raywatcher_mut()
+            .set_scene_building(self.raywatcher_harvest.is_building_in_background());
+        let Some(scene) = self.raywatcher_harvest.cached().cloned() else {
+            // Initial BVH build is still running on the background worker; leave
+            // the untouched 1:1 raster world visible until it finishes.
+            return;
         };
         let same_world = self
             .raywatcher_scene
@@ -4022,6 +4034,17 @@ impl Renderer {
             // Phase 0 baseline check: leave the raster world target completely
             // untouched so the user can compare against RT off.
             self.modules.raywatcher_mut().next_frame();
+            if std::env::var_os("PWE_RT_DEBUG").is_some() {
+                let frame_ms = t_rw_frame.elapsed().as_secs_f64() * 1000.0;
+                if frame_ms > self.raywatcher_worst_frame_ms {
+                    self.raywatcher_worst_frame_ms = frame_ms;
+                    eprintln!(
+                        "[Raywatcher] worst_cpu_frame_ms={:.2} (bg_building={})",
+                        self.raywatcher_worst_frame_ms,
+                        self.raywatcher_harvest.is_building_in_background(),
+                    );
+                }
+            }
             return;
         }
         if params.frame == 0 {

@@ -235,10 +235,36 @@ impl HeightField<'_> {
     }
 }
 
+/// Minimum horizontal camera displacement before triggering a frustum ray-scene
+/// rebuild: at least 256 world units or 25% of `view_distance`, whichever is
+/// larger. Prevents rebuild stalls on small camera movements.
+pub fn rebuild_distance_threshold(view_distance: f32) -> f32 {
+    (view_distance * 0.25).max(256.0)
+}
+
+struct BgBuildResult {
+    sig: Signature,
+    eye: Vec3,
+    far_bucket: u32,
+    terrain_generation: u64,
+    content_hash: u64,
+    config: HarvestConfig,
+    scene: std::sync::Arc<SceneGeometry>,
+    triangles: usize,
+    instances: usize,
+    note: Option<String>,
+}
+
 /// Builds and caches the ray scene.
 #[derive(Default)]
 pub struct Harvester {
     cached: Option<(Signature, std::sync::Arc<SceneGeometry>)>,
+    last_build_eye: Option<Vec3>,
+    last_build_far_bucket: u32,
+    last_build_terrain_gen: u64,
+    last_build_content_hash: u64,
+    last_build_config: Option<HarvestConfig>,
+    pending_bg: Option<std::sync::mpsc::Receiver<BgBuildResult>>,
     /// Why the last build was refused or clipped, for the tab.
     pub note: Option<String>,
     /// Triangles in the last build.
@@ -328,17 +354,109 @@ impl Harvester {
         scene
     }
 
+    /// Whether the frustum ray scene needs to be rebuilt based on hysteresis
+    /// (`>= max(256, 0.25 * view_distance)` horizontal camera travel) or world
+    /// content/config changes.
+    pub fn needs_frustum_rebuild(
+        &self,
+        config: HarvestConfig,
+        eye: Vec3,
+        view_distance: f32,
+        terrain_generation: u64,
+        content_hash: u64,
+    ) -> bool {
+        if self.cached.is_none() {
+            return true;
+        }
+        let far_bucket = (view_distance / 128.0).round() as u32;
+        if self.last_build_config != Some(config)
+            || self.last_build_terrain_gen != terrain_generation
+            || self.last_build_content_hash != content_hash
+            || self.last_build_far_bucket != far_bucket
+        {
+            return true;
+        }
+        match self.last_build_eye {
+            Some(last) => {
+                let dist = (eye.x - last.x).hypot(eye.z - last.z);
+                dist >= rebuild_distance_threshold(view_distance)
+            }
+            None => true,
+        }
+    }
+
     /// Fast-path cache check for [`Self::scene_frustum`].
     #[allow(clippy::too_many_arguments)]
     pub fn cached_if_unchanged_frustum(
         &self,
         config: HarvestConfig,
         eye: Vec3,
-        view_forward: Vec3,
+        _view_forward: Vec3,
         view_distance: f32,
         terrain_generation: u64,
         content_hash: u64,
     ) -> Option<std::sync::Arc<SceneGeometry>> {
+        if self.needs_frustum_rebuild(config, eye, view_distance, terrain_generation, content_hash)
+        {
+            None
+        } else {
+            self.cached.as_ref().map(|(_, scene)| scene.clone())
+        }
+    }
+
+    /// True while a background BVH build thread is currently running.
+    pub fn is_building_in_background(&self) -> bool {
+        self.pending_bg.is_some()
+    }
+
+    /// Poll a background BVH build without blocking the render thread. When
+    /// ready, swaps the new scene into the cache and returns it.
+    pub fn poll_background_build(&mut self) -> Option<std::sync::Arc<SceneGeometry>> {
+        let rx = self.pending_bg.as_ref()?;
+        match rx.try_recv() {
+            Ok(result) => {
+                self.pending_bg = None;
+                self.triangles = result.triangles;
+                self.instances = result.instances;
+                self.note = result.note;
+                self.last_build_eye = Some(result.eye);
+                self.last_build_far_bucket = result.far_bucket;
+                self.last_build_terrain_gen = result.terrain_generation;
+                self.last_build_content_hash = result.content_hash;
+                self.last_build_config = Some(result.config);
+                self.cached = Some((result.sig, result.scene.clone()));
+                Some(result.scene)
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.pending_bg = None;
+                None
+            }
+        }
+    }
+
+    /// Start building the frustum ray scene on a background worker thread so
+    /// the render thread keeps drawing with the previous scene and never
+    /// stalls during camera movement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_background_frustum_build(
+        &mut self,
+        config: HarvestConfig,
+        eye: Vec3,
+        view_forward: Vec3,
+        view_projection: Mat4,
+        view_distance: f32,
+        base_cell: f32,
+        terrain_generation: u64,
+        content_hash: u64,
+        ground: Option<&dyn Fn(f32, f32) -> f32>,
+        real_meshes: Vec<MeshTriangle>,
+        instances: Vec<InstanceProxy>,
+        water: Vec<WaterSurface>,
+    ) {
+        if self.pending_bg.is_some() {
+            return;
+        }
         let sig = frustum_signature(
             config,
             eye,
@@ -347,12 +465,98 @@ impl Harvester {
             terrain_generation,
             content_hash,
         );
-        let (cached, scene) = self.cached.as_ref()?;
-        if *cached == sig {
-            Some(scene.clone())
+        let far_bucket = (view_distance / 128.0).round() as u32;
+        let far = if config.max_distance > 0.0 {
+            config.max_distance
         } else {
-            None
+            view_distance.max(config.radius)
+        };
+        let frustum = Frustum::from_view_projection(view_projection);
+
+        // Sample terrain & water on the calling thread (borrows `ground`, fast
+        // compared to real-mesh bucketing and SAH BVH construction), then hand
+        // off mesh/proxy ingestion + `SceneGeometry::build` to the worker.
+        let t_start = std::time::Instant::now();
+        let mut triangles = Vec::new();
+        let mut materials = Vec::new();
+        let before_water = triangles.len();
+        push_water(
+            &mut triangles,
+            &mut materials,
+            &water,
+            eye,
+            &frustum,
+            far,
+            ground,
+        );
+        let water_quads = (triangles.len() - before_water) / 2;
+        let mut terrain_lod_tris = [0usize; 4];
+        if let Some(ground_fn) = ground {
+            terrain_lod_tris = push_terrain_frustum(
+                &mut triangles,
+                &mut materials,
+                eye,
+                &frustum,
+                far,
+                base_cell.max(0.5),
+                config,
+                ground_fn,
+            );
         }
+
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.pending_bg = Some(rx);
+        let _ = std::thread::Builder::new()
+            .name("raywatcher-bvh".to_string())
+            .spawn(move || {
+                let before_mesh = triangles.len();
+                push_real_meshes(&mut triangles, &mut materials, &real_meshes);
+                let real_mesh_tris = triangles.len() - before_mesh;
+
+                let before_proxy = triangles.len();
+                let instance_count = push_instances_chunked(
+                    &mut triangles,
+                    &mut materials,
+                    &instances,
+                    eye,
+                    &frustum,
+                    far,
+                    config,
+                );
+                let proxy_tris = triangles.len() - before_proxy;
+
+                let total_tris = triangles.len();
+                let note = if total_tris == 0 {
+                    Some("no geometry inside the visible frustum yet".to_string())
+                } else {
+                    None
+                };
+                let t_bvh = std::time::Instant::now();
+                let scene = std::sync::Arc::new(SceneGeometry::build(triangles, materials));
+                let bvh_ms = t_bvh.elapsed().as_secs_f64() * 1000.0;
+                let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
+                if std::env::var_os("PWE_RT_DEBUG").is_some() {
+                    eprintln!(
+                        "[Raywatcher] bg_build: water_quads={water_quads} lod_terrain_tris=[near:{}, mid:{}, far:{}, vfar:{}] real_mesh_tris={real_mesh_tris} proxy_tris={proxy_tris} total_tris={total_tris} bvh_build_ms={bvh_ms:.2} total_ms={total_ms:.2}",
+                        terrain_lod_tris[0],
+                        terrain_lod_tris[1],
+                        terrain_lod_tris[2],
+                        terrain_lod_tris[3],
+                    );
+                }
+                let _ = tx.send(BgBuildResult {
+                    sig,
+                    eye,
+                    far_bucket,
+                    terrain_generation,
+                    content_hash,
+                    config,
+                    scene,
+                    triangles: total_tris,
+                    instances: instance_count,
+                    note,
+                });
+            });
     }
 
     /// Build a frustum-wide, chunked multi-LOD ray scene covering the full
@@ -395,8 +599,9 @@ impl Harvester {
             terrain_generation,
             content_hash,
         );
-        if let Some((cached, scene)) = &self.cached {
-            if *cached == sig {
+        if !self.needs_frustum_rebuild(config, eye, view_distance, terrain_generation, content_hash)
+        {
+            if let Some((_, scene)) = &self.cached {
                 return scene.clone();
             }
         }
@@ -481,6 +686,11 @@ impl Harvester {
                 self.triangles,
             );
         }
+        self.last_build_eye = Some(eye);
+        self.last_build_far_bucket = (view_distance / 128.0).round() as u32;
+        self.last_build_terrain_gen = terrain_generation;
+        self.last_build_content_hash = content_hash;
+        self.last_build_config = Some(config);
         self.cached = Some((sig, scene.clone()));
         scene
     }
@@ -488,6 +698,9 @@ impl Harvester {
     /// Forget the cache, so the next [`Self::scene`] rebuilds.
     pub fn invalidate(&mut self) {
         self.cached = None;
+        self.last_build_eye = None;
+        self.last_build_config = None;
+        self.pending_bg = None;
     }
 
     pub fn cached(&self) -> Option<&std::sync::Arc<SceneGeometry>> {
@@ -763,7 +976,7 @@ fn frustum_signature(
     // covers 360 degrees around the camera out to `view_distance`, so rotating
     // the camera never triggers a CPU BVH or DXR BLAS rebuild stall, and
     // buildings behind the camera still cast shadows into the view.
-    let snap = (config.chunk_size.max(64.0) / 4.0).max(32.0);
+    let snap = config.chunk_size.max(256.0);
     let anchor = ((eye.x / snap).round() as i32, (eye.z / snap).round() as i32);
     let far_bucket = ((view_distance / 128.0).round() as u32) as u64;
     let frustum_key = (far_bucket & 0xffff) | (1u64 << 63);
@@ -1599,6 +1812,71 @@ mod tests {
         assert!(
             !scene.occluded(origin, Vec3::Y, 0.05, 50.0),
             "harvested LOD terrain must not bridge above the valley floor and occlude upward rays"
+        );
+    }
+
+    #[test]
+    fn rebuild_hysteresis_skips_small_camera_moves_and_triggers_past_threshold() {
+        let mut harvester = Harvester::new();
+        let eye0 = Vec3::new(0.0, 10.0, 0.0);
+        let forward = Vec3::Z;
+        let vp = Mat4::perspective_infinite_reverse_rh(60.0f32.to_radians(), 16.0 / 9.0, 0.5)
+            * Mat4::look_to_rh(eye0, forward, Vec3::Y);
+        let ground = |_x: f32, _z: f32| 0.0;
+        let view_distance = 1200.0; // threshold = max(256, 300) = 300.0
+        assert!((rebuild_distance_threshold(view_distance) - 300.0).abs() < 1e-3);
+        assert!((rebuild_distance_threshold(500.0) - 256.0).abs() < 1e-3);
+
+        let first = harvester.scene_frustum(
+            HarvestConfig::default(),
+            eye0,
+            forward,
+            vp,
+            view_distance,
+            2.0,
+            1,
+            42,
+            Some(&ground),
+            &[],
+            &[],
+            &[],
+        );
+
+        // Moving 100 units (previously crossed 64u snap!) must NOT trigger a rebuild.
+        let eye_small = Vec3::new(100.0, 10.0, 50.0);
+        assert!(
+            !harvester.needs_frustum_rebuild(
+                HarvestConfig::default(),
+                eye_small,
+                view_distance,
+                1,
+                42
+            ),
+            "small camera move under threshold must reuse cached scene"
+        );
+        let reused = harvester
+            .cached_if_unchanged_frustum(
+                HarvestConfig::default(),
+                eye_small,
+                forward,
+                view_distance,
+                1,
+                42,
+            )
+            .expect("cached scene must be returned within hysteresis threshold");
+        assert!(std::sync::Arc::ptr_eq(&first, &reused));
+
+        // Moving 320 units (>= 300 threshold) MUST trigger a rebuild.
+        let eye_far = Vec3::new(320.0, 10.0, 0.0);
+        assert!(
+            harvester.needs_frustum_rebuild(
+                HarvestConfig::default(),
+                eye_far,
+                view_distance,
+                1,
+                42
+            ),
+            "camera move beyond hysteresis threshold must request a rebuild"
         );
     }
 }

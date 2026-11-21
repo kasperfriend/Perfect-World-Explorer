@@ -98,6 +98,8 @@ pub struct Raywatcher {
     pending_reset: bool,
     /// Why hardware rays are unavailable, for the tab.
     hardware_note: Option<String>,
+    /// True while the background worker thread is rebuilding the BVH.
+    scene_building: bool,
     /// The last frame's status, so the UI can show what the renderer did
     /// rather than what it was asked to do.
     last: Status,
@@ -113,6 +115,7 @@ impl Default for Raywatcher {
             frame: 0,
             pending_reset: true,
             hardware_note: None,
+            scene_building: false,
             last: Status::inactive(None),
         }
     }
@@ -151,6 +154,11 @@ impl Raywatcher {
 
     pub fn hardware_available(&self) -> bool {
         self.hardware_rays
+    }
+
+    /// Update whether the background ray-scene worker is currently rebuilding.
+    pub fn set_scene_building(&mut self, building: bool) {
+        self.scene_building = building;
     }
 
     pub fn hardware_note(&self) -> Option<&str> {
@@ -260,6 +268,8 @@ impl Raywatcher {
                 "Raywatcher is on but no effect is enabled, so the raster world is drawn unchanged."
                     .to_string(),
             )
+        } else if self.scene_building {
+            Some("updating ray scene in background...".to_string())
         } else if plan.effects.count() < self.settings.effects.count() {
             Some("Some effects could not be planned this frame.".to_string())
         } else {
