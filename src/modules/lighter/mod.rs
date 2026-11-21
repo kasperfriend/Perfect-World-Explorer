@@ -1503,11 +1503,44 @@ impl Lighter {
         self.overlays_world() && self.frame_index > 0
     }
 
+    /// Identify the specific Lighter stage that has not completed yet.
+    pub fn pending_stage(&self) -> &'static str {
+        if !self.armed {
+            return "renderer unarmed";
+        }
+        if !self.requested() {
+            return "ray renderer disabled";
+        }
+        if self.world.is_none() {
+            return "resident scene not loaded";
+        }
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if self.settings.mode == Mode::Hardware {
+            if self.cold_ray.is_some() {
+                return "pipeline compile pending";
+            }
+            if self.hardware.is_none() {
+                return "hardware pipeline not initialized";
+            }
+            if self.paced_startup && self.initial_progress[2] == 0 {
+                return "BLAS build pending";
+            }
+        }
+        if !self.settings.reference && !self.settings.ray_lighting {
+            return "ray lighting overlay disabled";
+        }
+        if self.frame_index == 0 {
+            return "frame not yet drawn";
+        }
+        "ray pass inactive"
+    }
+
     /// Evaluate a pending Reload World request against live Lighter state.
+    /// Logs any failure reason through the Lighter logger.
     /// Returns:
     /// - `Ok(true)` when the requested ray mode has drawn at least one frame
     /// - `Ok(false)` when non-blocking overlay startup is still in progress
-    /// - `Err(reason)` when Lighter failed or fell back unexpectedly
+    /// - `Err(reason)` with the specific error or pending stage
     pub fn check_reload_state(
         &self,
         requested_mode: Mode,
@@ -1517,13 +1550,23 @@ impl Lighter {
             return Ok(true);
         }
         if let Some(err) = self.error() {
-            return Err(err.to_string());
+            let reason = err.to_string();
+            self.logger.write(&log::LogEntry::Error(log::ErrorEvent {
+                stage: "reload_check".into(),
+                reason: reason.clone(),
+            }));
+            return Err(reason);
         }
         if self.settings.reference {
             return if renders_world {
                 Ok(true)
             } else {
-                Err("The requested ray renderer did not draw the world.".into())
+                let reason = format!("reference ray reload incomplete: {}", self.pending_stage());
+                self.logger.write(&log::LogEntry::Error(log::ErrorEvent {
+                    stage: "reload_check".into(),
+                    reason: reason.clone(),
+                }));
+                Err(reason)
             };
         }
         if self.overlay_ready() {
@@ -1535,7 +1578,12 @@ impl Lighter {
             // first overlay frame draws or an error occurs.
             return Ok(false);
         }
-        Err("The requested ray renderer did not draw the world.".into())
+        let reason = format!("ray reload incomplete: {}", self.pending_stage());
+        self.logger.write(&log::LogEntry::Error(log::ErrorEvent {
+            stage: "reload_check".into(),
+            reason: reason.clone(),
+        }));
+        Err(reason)
     }
 
     pub fn set_graphics_state(&mut self, upscaler: String, frame_gen: String) {

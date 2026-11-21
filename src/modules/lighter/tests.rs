@@ -5101,3 +5101,98 @@ fn r4_reload_with_overlay_error_reports_real_failure() {
         "must report real failure rather than generic fallback: {err}"
     );
 }
+
+#[test]
+fn r5_each_reload_failure_path_produces_distinct_message_and_logs() {
+    use std::collections::HashSet;
+
+    let make_base = || {
+        let mut l = Lighter::default();
+        l.armed = true;
+        l.has_hardware_device = true;
+        l.adapter_supports_compute = true;
+        l.native_backend = wgpu::Backend::Vulkan;
+        l.settings.mode = Mode::Hardware;
+        l.settings.ray_lighting = true;
+        l.settings.reference = false;
+        l.install(Ok((Builder::default().finish(), Textures::default())));
+        l
+    };
+
+    let mut messages = Vec::new();
+
+    // 1. Explicit Lighter error
+    let mut l_err = make_base();
+    l_err.fail_frame("VK_ERROR_OUT_OF_DEVICE_MEMORY".into());
+    messages.push(l_err.check_reload_state(Mode::Hardware, false).unwrap_err());
+
+    // 2. Renderer unarmed
+    let mut l_unarmed = make_base();
+    l_unarmed.armed = false;
+    messages.push(
+        l_unarmed
+            .check_reload_state(Mode::Hardware, false)
+            .unwrap_err(),
+    );
+
+    // 3. Ray lighting overlay disabled
+    let mut l_no_overlay = make_base();
+    l_no_overlay.settings.ray_lighting = false;
+    messages.push(
+        l_no_overlay
+            .check_reload_state(Mode::Hardware, false)
+            .unwrap_err(),
+    );
+
+    // 4. Reference mode: pipeline compile pending
+    let mut l_pipe = make_base();
+    l_pipe.settings.reference = true;
+    let (_tx, rx) = std::sync::mpsc::channel();
+    l_pipe.cold_ray = Some(rx);
+    messages.push(
+        l_pipe
+            .check_reload_state(Mode::Hardware, false)
+            .unwrap_err(),
+    );
+
+    // 5. Reference mode: hardware pipeline not initialized
+    let mut l_no_hw = make_base();
+    l_no_hw.settings.reference = true;
+    messages.push(
+        l_no_hw
+            .check_reload_state(Mode::Hardware, false)
+            .unwrap_err(),
+    );
+
+    // 6. Reference mode (Software): frame not yet drawn
+    let mut l_frame = make_base();
+    l_frame.settings.mode = Mode::Software;
+    l_frame.settings.reference = true;
+    messages.push(
+        l_frame
+            .check_reload_state(Mode::Software, false)
+            .unwrap_err(),
+    );
+
+    // 7. Resident scene not loaded
+    let mut l_scene = make_base();
+    l_scene.world = None;
+    messages.push(
+        l_scene
+            .check_reload_state(Mode::Hardware, false)
+            .unwrap_err(),
+    );
+
+    let unique: HashSet<&String> = messages.iter().collect();
+    assert_eq!(
+        unique.len(),
+        messages.len(),
+        "every failure path must produce a distinct message: {messages:?}"
+    );
+    for msg in &messages {
+        assert!(
+            !msg.contains("did not draw the world"),
+            "generic message must not appear: {msg}"
+        );
+    }
+}
