@@ -187,7 +187,12 @@ fn normalize_v300_colors(b: &[u8], p: &mut usize, vertices: &mut [Vertex]) -> Re
     if n == 0 {
         return Ok(());
     }
-    let opaque_day = vertices.iter().filter(|v| (v.day_diffuse >> 24) == 0xff).count();
+    let mut opaque_day = 0usize;
+    for v in vertices.iter() {
+        if (v.day_diffuse >> 24) == 0xff {
+            opaque_day += 1;
+        }
+    }
     if opaque_day * 10 < n * 9 {
         let can_peek = n
             .checked_mul(8)
@@ -220,7 +225,12 @@ fn normalize_v300_colors(b: &[u8], p: &mut usize, vertices: &mut [Vertex]) -> Re
         }
         return Ok(());
     }
-    let opaque_night = vertices.iter().filter(|v| (v.night_diffuse >> 24) == 0xff).count();
+    let mut opaque_night = 0usize;
+    for v in vertices.iter() {
+        if (v.night_diffuse >> 24) == 0xff {
+            opaque_night += 1;
+        }
+    }
     if opaque_night * 10 < n * 9 {
         for v in vertices.iter_mut() {
             v.night_diffuse = v.day_diffuse;
@@ -378,9 +388,8 @@ impl Model {
                     && &b[p + 48..p + 59] == b"MATERIAL: \0"
                 {
                     let extra_size = u(b, p + 128)? as usize;
-                    if (16..=4096).contains(&extra_size)
-                        && p.checked_add(128 + extra_size).is_some_and(|e| e <= b.len())
-                    {
+                    let tail_end = p.checked_add(128 + extra_size);
+                    if (16..=4096).contains(&extra_size) && tail_end.is_some_and(|e| e <= b.len()) {
                         material = parse_v300_tail_material(&b[p + 48..p + 128]);
                         tail_advance = Some(128 + extra_size);
                     }
@@ -885,7 +894,10 @@ mod tests {
         for uv in [0.25f32, 0.5, 0.75, 0.125, 0.5, 0.5] {
             put(&mut b, uv.to_bits());
         }
-        for c in [0xff887766u32, 0xff998877, 0xffaa9988, 0xff223344, 0xff334455, 0xff445566] {
+        for c in [0xff887766u32, 0xff998877, 0xffaa9988] {
+            put(&mut b, c);
+        }
+        for c in [0xff223344u32, 0xff334455, 0xff445566] {
             put(&mut b, c);
         }
         b.extend_from_slice(&[0; 150]);
