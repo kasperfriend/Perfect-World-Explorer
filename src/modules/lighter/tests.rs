@@ -5027,6 +5027,8 @@ fn r3_ray_lighting_active_rejects_errored_renderer() {
     let mut lighter = Lighter::default();
     lighter.armed = true;
     lighter.has_hardware_device = true;
+    lighter.native_backend = wgpu::Backend::Vulkan;
+    lighter.install(Ok((Builder::default().finish(), Textures::default())));
     lighter.adapter_supports_compute = true;
     lighter.settings.mode = Mode::Hardware;
     lighter.settings.ray_lighting = true;
