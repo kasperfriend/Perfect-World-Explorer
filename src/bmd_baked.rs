@@ -83,13 +83,16 @@
 //! geometry.
 
 /// Mesh versions the reader and this draw state were inspected against.
-pub const INSPECTED_MESH_VERSIONS: [u32; 6] = [
+pub const INSPECTED_MESH_VERSIONS: [u32; 9] = [
     0x1000_0004,
     0x1000_0005,
     0x1000_0006,
     0x1000_0300,
     0x1000_0301,
     0x1000_0302,
+    0x1000_0303,
+    0x1000_0304,
+    0x1000_0305,
 ];
 
 /// `mesh+0x2cc` value the mesh constructor installs, i.e. no alpha test.
@@ -355,6 +358,7 @@ mod tests {
         );
         assert_eq!(classify(0x1000_0006, true, false).unwrap().kind, 2.0);
         assert_eq!(classify(0x1000_0302, true, false).unwrap().kind, 2.0);
+        assert_eq!(classify(0x1000_0305, true, false).unwrap().kind, 2.0);
         for v in [0x1000_0003, 0x1000_0007, 0] {
             assert!(classify(v, true, false).is_err(), "{v:#x}");
         }
