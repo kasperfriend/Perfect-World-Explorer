@@ -17,24 +17,24 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/client_detect.rs` | 182 | `ok-question` | **probe** | `let timestamp = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 184 | `ok-question` | **probe** | `short: u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?),` |
 | `src/client_detect.rs` | 612 | `ok-question` | **probe** | `let matched = fs::read_dir(&current).ok()?.flatten().find(\|entry\| {` |
-| `src/client_detect.rs` | 633 | `ok-question` | **probe** | `.ok()?` |
-| `src/client_detect.rs` | 728 | `ok-question` | **probe** | `let text = String::from_utf8(bytes.to_vec()).ok()?;` |
-| `src/client_detect.rs` | 740 | `ok-question` | **probe** | `let mut file = fs::File::open(&pack_path).ok()?;` |
-| `src/client_detect.rs` | 854 | `ok-question` | **probe** | `Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))` |
-| `src/client_detect.rs` | 857 | `ok-question` | **probe** | `Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))` |
-| `src/client_detect.rs` | 926 | `ok-question` | **probe** | `blob.get(offset..offset + 2)?.try_into().ok()?,` |
-| `src/client_detect.rs` | 1212 | `ok-question` | **probe** | `bytes.get(offset..offset + 4)?.try_into().ok()?,` |
-| `src/client_detect.rs` | 1218 | `ok-question` | **probe** | `bytes.get(offset..offset + 2)?.try_into().ok()?,` |
-| `src/client_detect.rs` | 1354 | `ok-question` | **probe** | `let size = fs::metadata(&pck).ok()?.len();` |
-| `src/client_detect.rs` | 1356 | `ok-question` | **probe** | `fs::File::open(&pck).ok()?.read_exact(&mut prefix).ok()?;` |
-| `src/client_detect.rs` | 1360 | `ok-question` | **probe** | `let declared = u32::from_le_bytes(prefix[4..8].try_into().ok()?) as u64;` |
-| `src/client_detect.rs` | 1452 | `ok-question` | **probe** | `let mut file = fs::File::open(path).ok()?;` |
-| `src/client_detect.rs` | 1453 | `ok-question` | **probe** | `let size = file.seek(SeekFrom::End(0)).ok()?;` |
-| `src/client_detect.rs` | 1463 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(0)).ok()?;` |
-| `src/client_detect.rs` | 1464 | `ok-question` | **probe** | `file.read_exact(&mut prefix).ok()?;` |
-| `src/client_detect.rs` | 1465 | `ok-question` | **probe** | `let declared = u64::from(u32::from_le_bytes(prefix[4..8].try_into().ok()?));` |
-| `src/client_detect.rs` | 1482 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(end - 4)).ok()?;` |
-| `src/client_detect.rs` | 1484 | `ok-question` | **probe** | `file.read_exact(&mut word).ok()?;` |
+| `src/client_detect.rs` | 637 | `ok-question` | **probe** | `.ok()?` |
+| `src/client_detect.rs` | 732 | `ok-question` | **probe** | `let text = String::from_utf8(bytes.to_vec()).ok()?;` |
+| `src/client_detect.rs` | 744 | `ok-question` | **probe** | `let mut file = fs::File::open(&pack_path).ok()?;` |
+| `src/client_detect.rs` | 858 | `ok-question` | **probe** | `Some(u16::from_le_bytes(bytes.get(at..at + 2)?.try_into().ok()?))` |
+| `src/client_detect.rs` | 861 | `ok-question` | **probe** | `Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))` |
+| `src/client_detect.rs` | 930 | `ok-question` | **probe** | `blob.get(offset..offset + 2)?.try_into().ok()?,` |
+| `src/client_detect.rs` | 1216 | `ok-question` | **probe** | `bytes.get(offset..offset + 4)?.try_into().ok()?,` |
+| `src/client_detect.rs` | 1222 | `ok-question` | **probe** | `bytes.get(offset..offset + 2)?.try_into().ok()?,` |
+| `src/client_detect.rs` | 1358 | `ok-question` | **probe** | `let size = fs::metadata(&pck).ok()?.len();` |
+| `src/client_detect.rs` | 1360 | `ok-question` | **probe** | `fs::File::open(&pck).ok()?.read_exact(&mut prefix).ok()?;` |
+| `src/client_detect.rs` | 1364 | `ok-question` | **probe** | `let declared = u32::from_le_bytes(prefix[4..8].try_into().ok()?) as u64;` |
+| `src/client_detect.rs` | 1456 | `ok-question` | **probe** | `let mut file = fs::File::open(path).ok()?;` |
+| `src/client_detect.rs` | 1457 | `ok-question` | **probe** | `let size = file.seek(SeekFrom::End(0)).ok()?;` |
+| `src/client_detect.rs` | 1467 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(0)).ok()?;` |
+| `src/client_detect.rs` | 1468 | `ok-question` | **probe** | `file.read_exact(&mut prefix).ok()?;` |
+| `src/client_detect.rs` | 1469 | `ok-question` | **probe** | `let declared = u64::from(u32::from_le_bytes(prefix[4..8].try_into().ok()?));` |
+| `src/client_detect.rs` | 1486 | `ok-question` | **probe** | `file.seek(SeekFrom::Start(end - 4)).ok()?;` |
+| `src/client_detect.rs` | 1488 | `ok-question` | **probe** | `file.read_exact(&mut word).ok()?;` |
 | `src/direct_storage.rs` | 167 | `let-underscore` | **unreachable** | `let _ = (file, ranges);` |
 | `src/dlss/fg.rs` | 200 | `let-underscore` | **unreachable** | `let _ = queue;` |
 | `src/dlss/fg.rs` | 305 | `let-underscore` | **unreachable** | `let _ = ring.retire(slot_index, &raw_queue, "DLSS FG");` |
