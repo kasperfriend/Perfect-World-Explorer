@@ -180,6 +180,51 @@ float point_light_falloff(float dist, float radius) {
     return (w * w) / (dist * dist + 1.0);
 }
 
+// Phase 4: Reproject world-space hit point into current frame's 1:1 raster
+// G-buffer to fetch real textured raster colour when on-screen. Off-screen
+// hits return alpha 0 and fall back to harvested per-material baked albedo.
+float4 sample_screen_radiance(float3 world_pos, float ray_t) {
+    float4 clip = mul(params.vp, float4(world_pos, 1.0));
+    if (clip.w <= 1e-4) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    float3 ndc = clip.xyz / clip.w;
+    float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (uv.x < 0.01 || uv.x > 0.99 || uv.y < 0.01 || uv.y > 0.99) {
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+    int2 gdim = int2(int(params.extents.x), int(params.extents.y));
+    int2 hp = clamp(int2(uv * params.extents.xy), int2(0, 0), gdim - int2(1, 1));
+    float4 gpos = src_gbuf_pos.Load(int3(hp, 0));
+    if (gpos.w > 0.0 && length(gpos.xyz - world_pos) < max(2.5, ray_t * 0.08)) {
+        return float4(src_gbuf_raster.Load(int3(hp, 0)).rgb, 1.0);
+    }
+    return float4(0.0, 0.0, 0.0, 0.0);
+}
+
+// Phase 4: Sample the raster sky on reflection miss (exact raster skybox when
+// on-screen, matched horizon-to-zenith gradient + sun lobe when off-screen).
+float3 sample_sky_reflection(float3 dir) {
+    float3 far_pos = params.eye.xyz + dir * (params.lens.y * 0.9);
+    float4 clip = mul(params.vp, float4(far_pos, 1.0));
+    if (clip.w > 1e-4) {
+        float3 ndc = clip.xyz / clip.w;
+        float2 uv = float2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if (uv.x >= 0.01 && uv.x <= 0.99 && uv.y >= 0.01 && uv.y <= 0.99) {
+            int2 gdim = int2(int(params.extents.x), int(params.extents.y));
+            int2 sp = clamp(int2(uv * params.extents.xy), int2(0, 0), gdim - int2(1, 1));
+            if (src_gbuf_pos.Load(int3(sp, 0)).w <= 0.0) {
+                return src_gbuf_raster.Load(int3(sp, 0)).rgb;
+            }
+        }
+    }
+    float up_t = pow(saturate(dir.y), 0.55);
+    float3 zenith = max(params.ambient.xyz * 1.15, params.fog_colour.xyz * float3(0.70, 0.85, 1.15));
+    float3 base = lerp(params.fog_colour.xyz, zenith, up_t);
+    float sun_dot = saturate(dot(dir, params.sun_dir.xyz));
+    return max(base + params.sun_colour.xyz * (pow(sun_dot, 96.0) * 1.5), float3(0.0, 0.0, 0.0));
+}
+
 float3 ggx_sample(float3 normal, float roughness, float u1, float u2) {
     if (roughness < 0.06) {
         return normal;
@@ -335,7 +380,9 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
         accum_open += open;
 
-        // Phase 8: GGX importance-sampled rough reflections with shadowed hit shading + Fresnel.
+        // Phase 4: GGX importance-sampled rough reflections with on-screen
+        // textured raster hit colour (falling back to harvested baked albedo
+        // off-screen) and raster sky reflection on miss + Fresnel.
         float refl_dist = params.lens.y;
         if (bits_reflections && roughness <= params.effects.x) {
             float3 h = ggx_sample(normal, roughness, rand01(state), rand01(state));
@@ -343,25 +390,33 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             if (dot(reflect_dir, normal) <= 0.0) {
                 reflect_dir = reflect(view_dir, normal);
             }
+            float f0 = 0.04 + 0.16 * (1.0 - roughness);
+            float m = 1.0 - saturate(dot(-view_dir, h));
+            float m2 = m * m;
+            float fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
             Hit rhit = closest_hit(ray_origin, reflect_dir, bias, params.lens.y);
             if (rhit.index != 0xffffffffu) {
-                Material rmat = material_of(rhit.index);
-                float r_ndl = max(dot(rhit.normal, params.sun_dir.xyz), 0.0);
-                float r_shadow = 1.0;
-                if (bits_shadows && r_ndl > 0.02) {
-                    float3 rhit_pos = ray_origin + reflect_dir * rhit.t + rhit.normal * bias;
-                    if (occluded(rhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y, state ^ 0x517cc1b7u)) {
-                        r_shadow = 0.0;
+                float3 hit_pos = ray_origin + reflect_dir * rhit.t;
+                float4 screen_col = sample_screen_radiance(hit_pos, rhit.t);
+                float3 lit = screen_col.rgb;
+                if (screen_col.a < 0.5) {
+                    Material rmat = material_of(rhit.index);
+                    float r_ndl = max(dot(rhit.normal, params.sun_dir.xyz), 0.0);
+                    float r_shadow = 1.0;
+                    if (bits_shadows && r_ndl > 0.02) {
+                        float3 rhit_pos = hit_pos + rhit.normal * bias;
+                        if (occluded(rhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y, state ^ 0x517cc1b7u)) {
+                            r_shadow = 0.0;
+                        }
                     }
+                    lit = rmat.albedo.rgb * (params.ambient.xyz * params.tuning.z +
+                        params.sun_colour.xyz * (r_ndl * r_shadow));
                 }
-                float3 lit = rmat.albedo.rgb * (params.ambient.xyz * params.tuning.z +
-                    params.sun_colour.xyz * (r_ndl * r_shadow));
-                float f0 = 0.04 + 0.16 * (1.0 - roughness);
-                float m = 1.0 - saturate(dot(-view_dir, h));
-                float m2 = m * m;
-                float fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
                 accum_reflection += lit * fresnel * (1.0 - fog_t);
                 refl_dist = rhit.t;
+            } else {
+                float3 sky_col = sample_sky_reflection(reflect_dir);
+                accum_reflection += sky_col * (fresnel * 0.65 * (1.0 - fog_t));
             }
         }
         accum_refl_dist += refl_dist;

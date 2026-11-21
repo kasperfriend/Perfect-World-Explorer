@@ -214,6 +214,32 @@ pub fn point_light_falloff(distance: f32, radius: f32) -> f32 {
 /// sun visibility modulates ONLY the sun contribution and RT AO modulates ONLY
 /// the ambient contribution (no invasive MRT changes across all 12 raster
 /// pipelines, while matching `camera.light.x + camera.light.y * N·L` exactly).
+/// Phase 4 atmospheric sky colour evaluated when a reflection ray misses all
+/// geometry and its direction projects outside the on-screen raster sky.
+/// Blends smoothly from the game's horizon `fog_colour` to an overhead zenith
+/// tint derived from `ambient` + `fog_colour`, plus a soft sun-glint lobe.
+pub fn sky_reflection_colour(
+    dir: Vec3,
+    sun_dir: Vec3,
+    sun_colour: Vec3,
+    ambient: Vec3,
+    fog_colour: Vec3,
+) -> Vec3 {
+    let up_t = dir.y.clamp(0.0, 1.0).powf(0.55);
+    let zenith = (ambient * 1.15).max(Vec3::new(
+        fog_colour.x * 0.70,
+        fog_colour.y * 0.85,
+        fog_colour.z * 1.15,
+    ));
+    let base = fog_colour.lerp(zenith, up_t);
+    let sun_dot = dir
+        .normalize_or_zero()
+        .dot(sun_dir.normalize_or_zero())
+        .clamp(0.0, 1.0);
+    let sun_lobe = sun_colour * (sun_dot.powf(96.0) * 1.5);
+    (base + sun_lobe).max(Vec3::ZERO)
+}
+
 pub fn sun_ambient_split(
     sun_colour: Vec3,
     ambient: Vec3,
@@ -792,6 +818,35 @@ mod tests {
         );
         assert!(with_additives.x > raster.x);
         assert!(with_additives.z > raster.z);
+    }
+
+    #[test]
+    fn sky_reflection_on_miss_returns_non_zero_sky_gradient() {
+        let sun_dir = Vec3::new(0.0, 0.7, 0.7).normalize();
+        let sun_col = Vec3::new(1.0, 0.95, 0.85);
+        let amb = Vec3::new(0.32, 0.42, 0.58);
+        let fog = Vec3::new(0.60, 0.70, 0.82);
+
+        let horizon = sky_reflection_colour(Vec3::Z, sun_dir, sun_col, amb, fog);
+        let zenith = sky_reflection_colour(Vec3::Y, sun_dir, sun_col, amb, fog);
+        let toward_sun = sky_reflection_colour(sun_dir, sun_dir, sun_col, amb, fog);
+
+        assert!(
+            horizon.length() > 0.1,
+            "horizon sky reflection must be non-zero"
+        );
+        assert!(
+            zenith.length() > 0.1,
+            "zenith sky reflection must be non-zero"
+        );
+        assert!(
+            (horizon - fog).length() < 1e-4,
+            "horizon reflection matches raster fog/horizon colour"
+        );
+        assert!(
+            toward_sun.length() > zenith.length(),
+            "reflected sun direction includes solar highlight"
+        );
     }
 
     #[test]

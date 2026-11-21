@@ -676,6 +676,53 @@ fn point_light_falloff(dist: f32, radius: f32) -> f32 {
     return (w * w) / (dist * dist + 1.0);
 }
 
+// Phase 4: Reproject a world-space hit point into the current frame's 1:1
+// raster G-buffer to fetch real textured raster colour when on-screen.
+// Returns `vec4(rgb, 1.0)` on a valid on-screen match, or `vec4(0.0)` off-screen
+// (off-screen hits fall back to harvested per-material baked albedo).
+fn sample_screen_radiance(world_pos: vec3<f32>, ray_t: f32) -> vec4<f32> {
+    let clip = params.vp * vec4<f32>(world_pos, 1.0);
+    if (clip.w <= 1e-4) {
+        return vec4<f32>(0.0);
+    }
+    let ndc = clip.xyz / clip.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (uv.x < 0.01 || uv.x > 0.99 || uv.y < 0.01 || uv.y > 0.99) {
+        return vec4<f32>(0.0);
+    }
+    let gdim = vec2<i32>(i32(params.extents.x), i32(params.extents.y));
+    let hp = clamp(vec2<i32>(uv * params.extents.xy), vec2<i32>(0), gdim - vec2<i32>(1));
+    let gpos = textureLoad(src_gbuf_pos, hp, 0);
+    if (gpos.w > 0.0 && length(gpos.xyz - world_pos) < max(2.5, ray_t * 0.08)) {
+        return vec4<f32>(textureLoad(src_gbuf_raster, hp, 0).rgb, 1.0);
+    }
+    return vec4<f32>(0.0);
+}
+
+// Phase 4: Sample the raster sky for a missed reflection ray (on-screen sky
+// pixels read the exact raster skybox/clouds; off-screen directions use the
+// matched horizon-to-zenith gradient + sun lobe).
+fn sample_sky_reflection(dir: vec3<f32>) -> vec3<f32> {
+    let far_pos = params.eye.xyz + dir * (params.lens.y * 0.9);
+    let clip = params.vp * vec4<f32>(far_pos, 1.0);
+    if (clip.w > 1e-4) {
+        let ndc = clip.xyz / clip.w;
+        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if (uv.x >= 0.01 && uv.x <= 0.99 && uv.y >= 0.01 && uv.y <= 0.99) {
+            let gdim = vec2<i32>(i32(params.extents.x), i32(params.extents.y));
+            let sp = clamp(vec2<i32>(uv * params.extents.xy), vec2<i32>(0), gdim - vec2<i32>(1));
+            if (textureLoad(src_gbuf_pos, sp, 0).w <= 0.0) {
+                return textureLoad(src_gbuf_raster, sp, 0).rgb;
+            }
+        }
+    }
+    let up_t = pow(clamp(dir.y, 0.0, 1.0), 0.55);
+    let zenith = max(params.ambient.xyz * 1.15, params.fog_colour.xyz * vec3<f32>(0.70, 0.85, 1.15));
+    let base = mix(params.fog_colour.xyz, zenith, up_t);
+    let sun_dot = clamp(dot(dir, params.sun_dir.xyz), 0.0, 1.0);
+    return max(base + params.sun_colour.xyz * (pow(sun_dot, 96.0) * 1.5), vec3<f32>(0.0));
+}
+
 fn ggx_sample(normal: vec3<f32>, roughness: f32, u1: f32, u2: f32) -> vec3<f32> {
     if (roughness < 0.06) {
         return normal;
@@ -786,7 +833,9 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         accum_open = accum_open + open;
 
-        // Phase 8: GGX importance-sampled rough reflections with shadowed hit shading + Fresnel.
+        // Phase 4: GGX importance-sampled rough reflections with on-screen
+        // textured raster hit colour (falling back to harvested baked albedo
+        // off-screen) and raster sky reflection on miss + Fresnel.
         var refl_dist = params.lens.y;
         if (bits_reflections && roughness <= params.effects.x) {
             let h = ggx_sample(normal, roughness, next_f32(&state), next_f32(&state));
@@ -794,24 +843,32 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             if (dot(reflect_dir, normal) <= 0.0) {
                 reflect_dir = reflect(view_dir, normal);
             }
+            let f0 = 0.04 + 0.16 * (1.0 - roughness);
+            let m = 1.0 - clamp(dot(-view_dir, h), 0.0, 1.0);
+            let m2 = m * m;
+            let fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
             let rhit = closest_hit(ray_origin, reflect_dir, bias, params.lens.y);
             if (rhit.index != 0xffffffffu) {
-                let rmaterial = material_of(rhit.index);
-                let r_ndl = max(dot(rhit.normal, params.sun_dir.xyz), 0.0);
-                var r_shadow = 1.0;
-                if (bits_shadows && r_ndl > 0.02) {
-                    let rhit_pos = ray_origin + reflect_dir * rhit.t + rhit.normal * bias;
-                    if (occluded(rhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y, state ^ 0x517cc1b7u)) {
-                        r_shadow = 0.0;
+                let hit_pos = ray_origin + reflect_dir * rhit.t;
+                let screen_col = sample_screen_radiance(hit_pos, rhit.t);
+                var lit = screen_col.rgb;
+                if (screen_col.a < 0.5) {
+                    let rmaterial = material_of(rhit.index);
+                    let r_ndl = max(dot(rhit.normal, params.sun_dir.xyz), 0.0);
+                    var r_shadow = 1.0;
+                    if (bits_shadows && r_ndl > 0.02) {
+                        let rhit_pos = hit_pos + rhit.normal * bias;
+                        if (occluded(rhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y, state ^ 0x517cc1b7u)) {
+                            r_shadow = 0.0;
+                        }
                     }
+                    lit = rmaterial.albedo.rgb * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * (r_ndl * r_shadow));
                 }
-                let lit = rmaterial.albedo.rgb * (params.ambient.xyz * params.tuning.z + params.sun_colour.xyz * (r_ndl * r_shadow));
-                let f0 = 0.04 + 0.16 * (1.0 - roughness);
-                let m = 1.0 - clamp(dot(-view_dir, h), 0.0, 1.0);
-                let m2 = m * m;
-                let fresnel = f0 + (1.0 - f0) * (m2 * m2 * m);
                 accum_reflection = accum_reflection + lit * fresnel * (1.0 - fog_t);
                 refl_dist = rhit.t;
+            } else {
+                let sky_col = sample_sky_reflection(reflect_dir);
+                accum_reflection = accum_reflection + sky_col * (fresnel * 0.65 * (1.0 - fog_t));
             }
         }
         accum_refl_dist = accum_refl_dist + refl_dist;
