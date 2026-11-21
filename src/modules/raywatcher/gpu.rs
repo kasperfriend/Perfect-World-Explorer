@@ -895,9 +895,18 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     var out_rgb = vec3<f32>(0.0);
     var out_lf = 1.0;
     if (layered) {
-        let shadow_mod = select(1.0, mix(0.30, 1.0, avg_shadow), bits_shadows && n_dot_l > 0.02);
-        let ao_mod = select(1.0, mix(0.58, 1.0, avg_open), bits_ao);
-        out_lf = mix(shadow_mod * ao_mod * point_shadow_mod, 1.0, fog_t);
+        // Phase 2: Separate raster lighting into sun vs ambient fractions so
+        // V_sun modulates ONLY the sun contribution and AO modulates ONLY the
+        // ambient contribution (exact 1:1 identity at V_sun=1, AO=1; ambient
+        // never darkens in sun shadow and direct sun never darkens from AO).
+        let sun_e = max(luminance(params.sun_colour.xyz), 0.0) * n_dot_l;
+        let amb_e = max(luminance(params.ambient.xyz) * params.tuning.z, 0.05);
+        let sun_f = clamp(sun_e / max(sun_e + amb_e, 1e-4), 0.0, 1.0);
+        let amb_f = 1.0 - sun_f;
+        let v_sun = select(1.0, avg_shadow, bits_shadows);
+        let v_ao = select(1.0, avg_open, bits_ao);
+        let separated_lf = (amb_f * v_ao + sun_f * v_sun) * point_shadow_mod;
+        out_lf = mix(separated_lf, 1.0, fog_t);
         out_rgb = avg_gi;
     } else {
         let direct = select(vec3<f32>(0.0), params.sun_colour.xyz * (n_dot_l * avg_shadow), bits_lighting);

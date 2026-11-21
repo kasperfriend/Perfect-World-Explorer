@@ -447,11 +447,17 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float3 out_rgb;
     float out_lf;
     if (layered) {
-        // Modulate the 1:1 raster world by RT sun shadow, contact AO, and opt-in
-        // point-light shadow visibility (never adding double-counted point light).
-        float shadow_mod = (bits_shadows && n_dot_l > 0.02) ? lerp(0.30, 1.0, avg_shadow) : 1.0;
-        float ao_mod = bits_ao ? lerp(0.58, 1.0, avg_open) : 1.0;
-        out_lf = lerp(shadow_mod * ao_mod * point_shadow_mod, 1.0, fog_t);
+        // Phase 2: Separate raster lighting into sun vs ambient fractions so
+        // V_sun modulates ONLY the sun contribution and AO modulates ONLY the
+        // ambient contribution (exact 1:1 identity at V_sun=1, AO=1).
+        float sun_e = max(dot(params.sun_colour.xyz, float3(0.2126, 0.7152, 0.0722)), 0.0) * n_dot_l;
+        float amb_e = max(dot(params.ambient.xyz, float3(0.2126, 0.7152, 0.0722)) * params.tuning.z, 0.05);
+        float sun_f = saturate(sun_e / max(sun_e + amb_e, 1e-4));
+        float amb_f = 1.0 - sun_f;
+        float v_sun = bits_shadows ? avg_shadow : 1.0;
+        float v_ao = bits_ao ? avg_open : 1.0;
+        float separated_lf = (amb_f * v_ao + sun_f * v_sun) * point_shadow_mod;
+        out_lf = lerp(separated_lf, 1.0, fog_t);
         out_rgb = avg_gi;
     } else {
         // Opt-in replace_raster mode: keep 1:1 raster world textures/albedo

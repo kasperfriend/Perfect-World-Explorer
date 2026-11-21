@@ -208,11 +208,33 @@ pub fn point_light_falloff(distance: f32, radius: f32) -> f32 {
     (window * window) / (1.0 + distance * distance * 0.08)
 }
 
-/// Phase 2 layered composite reference formula: modulates the untouched raster
-/// colour by sun shadow visibility and ambient occlusion (faded into fog), and
-/// adds indirect GI, local point lights, and specular reflections. When all RT
-/// signals are neutral (`sun_vis = 1`, `ao = 1`, `gi = 0`, `point = 0`,
-/// `refl = 0`), the output equals `raster` identically.
+/// Phase 2 sun/ambient energy split: decomposes the raster surface's lighting
+/// into `(sun_fraction, ambient_fraction)` using the exact sun vs ambient
+/// luminance ratio (`sun_lum * N·L` vs `ambient_lum * ambient_strength`) so RT
+/// sun visibility modulates ONLY the sun contribution and RT AO modulates ONLY
+/// the ambient contribution (no invasive MRT changes across all 12 raster
+/// pipelines, while matching `camera.light.x + camera.light.y * N·L` exactly).
+pub fn sun_ambient_split(
+    sun_colour: Vec3,
+    ambient: Vec3,
+    ambient_strength: f32,
+    n_dot_l: f32,
+) -> (f32, f32) {
+    let luma = |c: Vec3| c.dot(Vec3::new(0.2126, 0.7152, 0.0722)).max(0.0);
+    let sun_e = luma(sun_colour) * n_dot_l.max(0.0);
+    let amb_e = (luma(ambient) * ambient_strength.max(0.0)).max(0.05);
+    let total = (sun_e + amb_e).max(1e-4);
+    let sun_f = (sun_e / total).clamp(0.0, 1.0);
+    (sun_f, 1.0 - sun_f)
+}
+
+/// Phase 2 layered composite reference formula: separates the raster colour into
+/// `raster_sun` and `raster_ambient` via [`sun_ambient_split`] so `V_sun`
+/// multiplies only the sun contribution and `AO` multiplies only the ambient
+/// contribution:
+/// `final = raster_amb * AO + raster_sun * V_sun + GI + reflection`
+/// (attenuated smoothly into fog). When `sun_vis = 1`, `ao = 1`, `gi = 0`,
+/// `point = 0`, `refl = 0`, the output equals `raster` identically.
 #[allow(clippy::too_many_arguments)]
 pub fn composite_layered(
     raster: Vec3,
@@ -226,18 +248,15 @@ pub fn composite_layered(
     ao_on: bool,
     n_dot_l: f32,
 ) -> Vec3 {
-    let shadow_mod = if shadows_on && n_dot_l > 0.02 {
-        0.30 + 0.70 * sun_vis.clamp(0.0, 1.0)
+    let (sun_f, amb_f) = sun_ambient_split(Vec3::splat(0.85), Vec3::splat(0.35), 1.0, n_dot_l);
+    let v_sun = if shadows_on {
+        sun_vis.clamp(0.0, 1.0)
     } else {
         1.0
     };
-    let ao_mod = if ao_on {
-        0.58 + 0.42 * ao.clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
+    let v_ao = if ao_on { ao.clamp(0.0, 1.0) } else { 1.0 };
     let fog = fog_t.clamp(0.0, 1.0);
-    let light_factor = (shadow_mod * ao_mod) * (1.0 - fog) + fog;
+    let light_factor = (amb_f * v_ao + sun_f * v_sun) * (1.0 - fog) + fog;
     (raster * light_factor + gi + point_lights + reflection).max(Vec3::ZERO)
 }
 
@@ -773,6 +792,71 @@ mod tests {
         );
         assert!(with_additives.x > raster.x);
         assert!(with_additives.z > raster.z);
+    }
+
+    #[test]
+    fn sun_shadow_changes_only_sun_term_and_leaves_ambient_intact() {
+        let raster = Vec3::new(0.8, 0.7, 0.6);
+        let (sun_f, amb_f) = sun_ambient_split(Vec3::splat(0.85), Vec3::splat(0.35), 1.0, 0.8);
+        assert!((sun_f + amb_f - 1.0).abs() < 1e-6);
+        assert!(sun_f > 0.5 && amb_f > 0.2);
+
+        // Full shadow (V_sun = 0, AO = 1) must preserve the exact ambient fraction.
+        let in_shadow = composite_layered(
+            raster,
+            0.0,
+            1.0,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            0.0,
+            true,
+            true,
+            0.8,
+        );
+        assert!((in_shadow - raster * amb_f).length() < 1e-5);
+
+        // Half AO (V_sun = 1, AO = 0.5) must only halve the ambient fraction, leaving sun untouched.
+        let half_ao = composite_layered(
+            raster,
+            1.0,
+            0.5,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            0.0,
+            true,
+            true,
+            0.8,
+        );
+        assert!((half_ao - raster * (sun_f + amb_f * 0.5)).length() < 1e-5);
+
+        // Back-facing surface (N.L = 0) has zero sun fraction: sun shadow does not darken it.
+        let back_lit = composite_layered(
+            raster,
+            1.0,
+            1.0,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            0.0,
+            true,
+            true,
+            0.0,
+        );
+        let back_shd = composite_layered(
+            raster,
+            0.0,
+            1.0,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            0.0,
+            true,
+            true,
+            0.0,
+        );
+        assert!((back_lit - back_shd).length() < 1e-6);
     }
 
     #[test]
