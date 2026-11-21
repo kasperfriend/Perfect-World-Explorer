@@ -17,11 +17,11 @@ src/latency.rs:309 unreachable an end-of-frame latency marker's return code is a
 src/objects.rs:273 unreachable OnceLock::set: a second logger would be a programming error, and the first is the one used
 src/gfx_file.rs:1395 unreachable `accurate_aabb` is intentionally unread: the flag describes a bound this build derives instead
 src/gfx_player.rs:1748 unreachable `root_path` is intentionally unread at this call site; the path is carried by the element
-src/gpu.rs:7455 unreachable `&mut pass` reborrow to end a borrow; no value is produced
+src/gpu.rs:7456 unreachable `&mut pass` reborrow to end a borrow; no value is produced
 src/gpu.rs:2542 unreachable `author()` writes into the recorder it is given; the return value carries nothing
 src/gpu.rs:3843 unreachable begin_render_pass returns the encoder-owned pass, which is then used through the handle
 src/gpu.rs:5670 unreachable cursor grab can legitimately fail in windowed mode and is retried; not content
-src/gpu.rs:7300 unreachable cursor grab can legitimately fail in windowed mode and is retried; not content
+src/gpu.rs:7301 unreachable cursor grab can legitimately fail in windowed mode and is retried; not content
 src/gfx_player.rs:3349 unreachable let-else on a control that is not a Fractal: this loop asks for the Fractal, so another kind is not a loss
 src/model_draw_gpu.rs:693 unreachable let-else on a mesh that is absent by construction: draw_alpha_mesh is only called for indices alpha_meshes lists
 src/xess/imp.rs:323 unreachable `queue` is kept alive past the call; no result
@@ -50,8 +50,8 @@ src/world_objects.rs:687 unreachable mpsc invalidate to the UI: a closed receive
 src/world_objects.rs:697 unreachable mpsc invalidate to the UI: a closed receiver means the window is gone
 src/world_objects.rs:703 unreachable mpsc done to the UI: a closed receiver means the window is gone
 src/world_objects.rs:938 unreachable mpsc done to the UI: a closed receiver means the window is gone
-src/gpu.rs:7716 unreachable mpsc send of a worker result whose receiver is the caller that already returned
-src/gpu.rs:8051 unreachable mpsc send of a worker result whose receiver is the caller that already returned
+src/gpu.rs:7717 unreachable mpsc send of a worker result whose receiver is the caller that already returned
+src/gpu.rs:8052 unreachable mpsc send of a worker result whose receiver is the caller that already returned
 src/dlss/fg.rs:200 unreachable an SDK destroy call's status: the context is being torn down
 src/dlss/fg.rs:305 unreachable an SDK destroy call's status: the context is being torn down
 src/dlss/imp.rs:415 unreachable an SDK destroy call's status: the context is being torn down
@@ -96,8 +96,8 @@ src/dlss/loader.rs:1567 unreachable a cleanup status on teardown; the context is
 src/fsr/fg.rs:568 unreachable an absent SDK option is the documented default value
 src/fsr/fg.rs:578 unreachable an absent SDK option is the documented default value
 src/fsr/imp.rs:1404 unreachable an absent SDK option is the documented default value
-src/gpu.rs:7982 unreachable an absent frame option is the documented default value
-src/gpu.rs:7985 unreachable an absent frame option is the documented default value
+src/gpu.rs:7983 unreachable an absent frame option is the documented default value
+src/gpu.rs:7986 unreachable an absent frame option is the documented default value
 src/gpu.rs:473 unreachable a write! into a String cannot fail; the result is the byte count
 src/gpu.rs:479 unreachable a write! into a String cannot fail; the result is the byte count
 src/model_asset.rs:362 unreachable an absent optional field is the documented default of the record

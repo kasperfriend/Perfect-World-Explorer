@@ -82,13 +82,13 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/gpu.rs` | 2542 | `let-underscore` | **unreachable** | `let _ = sky_transition.author(` |
 | `src/gpu.rs` | 3843 | `let-underscore` | **unreachable** | `let _ = e.begin_render_pass(&wgpu::RenderPassDescriptor {` |
 | `src/gpu.rs` | 5670 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
-| `src/gpu.rs` | 6501 | `unwrap_or_default` | **named** | `elapsed.unwrap_or_default(),` |
-| `src/gpu.rs` | 7300 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
-| `src/gpu.rs` | 7455 | `let-underscore` | **unreachable** | `let _ = &mut pass;` |
-| `src/gpu.rs` | 7716 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
-| `src/gpu.rs` | 7982 | `unwrap_or_default` | **unreachable** | `let on = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();` |
-| `src/gpu.rs` | 7985 | `unwrap_or_default` | **unreachable** | `let off = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();` |
-| `src/gpu.rs` | 8051 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
+| `src/gpu.rs` | 6502 | `unwrap_or_default` | **named** | `elapsed.unwrap_or_default(),` |
+| `src/gpu.rs` | 7301 | `let-underscore` | **unreachable** | `let _ = window.set_cursor_grab(CursorGrabMode::None);` |
+| `src/gpu.rs` | 7456 | `let-underscore` | **unreachable** | `let _ = &mut pass;` |
+| `src/gpu.rs` | 7717 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
+| `src/gpu.rs` | 7983 | `unwrap_or_default` | **unreachable** | `let on = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();` |
+| `src/gpu.rs` | 7986 | `unwrap_or_default` | **unreachable** | `let off = read_target_pixels(&renderer, &target, width, height).unwrap_or_default();` |
+| `src/gpu.rs` | 8052 | `let-underscore` | **unreachable** | `let _ = tx.send(r);` |
 | `src/grass_random.rs` | 144 | `else-continue` | **unreachable** | `else {` |
 | `src/latency.rs` | 309 | `let-underscore` | **unreachable** | `let _ = end(1);` |
 | `src/launcher_ui.rs` | 143 | `ok-question` | **probe** | `decode(&fs::read(settings_file()?).ok()?)` |
@@ -98,10 +98,10 @@ Every place a loader can lose a value without saying so, classified. Generated b
 | `src/model_draw_gpu.rs` | 693 | `else-continue` | **unreachable** | `else {` |
 | `src/music.rs` | 42 | `ok-question` | **probe** | `.ok()?;` |
 | `src/objects.rs` | 273 | `let-underscore` | **unreachable** | `let _ = MODEL_LOAD_LOGGER.set(logger);` |
-| `src/pck.rs` | 543 | `ok-question` | **probe** | `let len = fs::metadata(path).ok()?.len();` |
-| `src/pck.rs` | 550 | `ok-question` | **probe** | `let file = File::open(&pkx).ok()?;` |
-| `src/pck.rs` | 551 | `ok-question` | **probe** | `let len = file.metadata().ok()?.len();` |
-| `src/pck.rs` | 964 | `unwrap_or_default` | **unreachable** | `let mut name = self.path.file_stem().unwrap_or_default().to_os_string();` |
+| `src/pck.rs` | 550 | `ok-question` | **probe** | `let len = fs::metadata(path).ok()?.len();` |
+| `src/pck.rs` | 557 | `ok-question` | **probe** | `let file = File::open(&pkx).ok()?;` |
+| `src/pck.rs` | 558 | `ok-question` | **probe** | `let len = file.metadata().ok()?.len();` |
+| `src/pck.rs` | 969 | `unwrap_or_default` | **unreachable** | `let mut name = self.path.file_stem().unwrap_or_default().to_os_string();` |
 | `src/sky_gpu.rs` | 1448 | `ok-question` | **probe** | `let mut file = File::open(element.join("configs.pck")).ok()?;` |
 | `src/sky_gpu.rs` | 1449 | `ok-question` | **probe** | `let entries = crate::angelica_pck::directory(&mut file).ok()?;` |
 | `src/sky_gpu.rs` | 1456 | `ok-question` | **probe** | `let list_bytes = pck::read_entry(&mut file, list).ok()?;` |

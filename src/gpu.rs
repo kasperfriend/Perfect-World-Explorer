@@ -6461,7 +6461,8 @@ pub fn run(
                                     world_cancel = None;
                                     world_started_at = None;
                                     world_status = format!(
-                                        "World preload built no pages; local scenery kept ({processed} objects processed, {skipped} without a usable mesh)"
+                                        "World preload built no pages; local scenery kept ({processed} objects processed, {skipped} without a usable mesh; {})",
+                                        stats.status_line(),
                                     );
                                     crate::diag!(TimingLoad, "{world_status}");
                                     eprintln!("{world_status}");

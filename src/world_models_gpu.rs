@@ -317,8 +317,9 @@ impl World {
         assets: Assets,
         element: &Path,
     ) -> Result<Self, String> {
-        let mut pack = File::open(element.join("models.pck")).map_err(|e| e.to_string())?;
-        let entries: HashMap<String, crate::pck::Entry> = crate::pck::directory(&mut pack)?
+        let mut pack = crate::pck::Package::open(&element.join("models.pck"))?;
+        let entries: HashMap<String, crate::pck::Entry> = pack
+            .directory()?
             .into_iter()
             .map(|e| (crate::ecmodel::normalize(&e.name), e))
             .collect();
@@ -326,7 +327,7 @@ impl World {
             let entry = entries
                 .get(path)
                 .ok_or_else(|| format!("missing model texture: {path}"))?;
-            crate::pck::read_entry(&mut pack, entry)
+            pack.read(entry)
         })
     }
     pub fn with_reader(

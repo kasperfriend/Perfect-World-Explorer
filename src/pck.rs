@@ -11,6 +11,13 @@ use std::{
     path::{Path, PathBuf},
 };
 const MASK: u32 = 0xa8937462;
+/// 64-bit sign-extended `AFPCK_MASKDWORD` (`0xffff_ffff_a893_7462`).
+///
+/// In C++ `AFilePackage.cpp`, `AFPCK_MASKDWORD` (`0xa8937462`) has bit 31 set
+/// and sign-extends to `0xffff_ffff_a893_7462` when XORed with a 64-bit
+/// `dwEntryOffset` in `0x00020003` packages (`litmodels.pck`, `building.pck`,
+/// `models.pck`, `surfaces.pck`).
+const MASK_SIGN_EXT: u64 = (MASK as i32) as i64 as u64;
 const CHECK: u32 = 0x59374231;
 fn u32le(b: &[u8], p: usize) -> Result<u32, String> {
     Ok(u32::from_le_bytes(
@@ -647,13 +654,14 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
 /// full word can name it, and unmasking the low half alone produces
 /// 1,517,810,005 -- a position inside the package but two gibibytes short of
 /// the table. That is what the `entry table overlaps footer` line reported.
-fn table_offset(header: &[u8], rev: &Revision) -> Result<u64, String> {
-    let stored = if rev.table_offset_width == 8 {
-        u64le(header, rev.table_offset_at)?
+fn table_offset_candidates(header: &[u8], rev: &Revision) -> Result<Vec<u64>, String> {
+    if rev.table_offset_width == 8 {
+        let stored = u64le(header, rev.table_offset_at)?;
+        Ok(vec![stored ^ MASK_SIGN_EXT, stored ^ MASK as u64])
     } else {
-        u32le(header, rev.table_offset_at)? as u64
-    };
-    Ok(stored ^ MASK as u64)
+        let stored = u32le(header, rev.table_offset_at)? as u64;
+        Ok(vec![stored ^ MASK as u64])
+    }
 }
 
 /// Read the trailer and the entry table.
@@ -788,42 +796,39 @@ fn entries_from_trailer(
     rev: &Revision,
     header: &[u8],
 ) -> Result<Vec<Entry>, String> {
-    let pos = table_offset(header, rev)?;
+    let positions = table_offset_candidates(header, rev)?;
+    let pos = positions[0];
     let table_end = part_end - (rev.header + 8) as u64;
     let mut tried = Vec::new();
-    // A word below `base` is a position in an *earlier* piece, so
-    // `checked_sub(base)` underflows and the package-absolute reading is skipped
-    // without a word. Say so: "neither reading fits inside the footer" then reads
-    // as though both were measured against the same piece, when one never applied
-    // at all. 1.8.4's `litmodels` is the case -- its low half is 4,075,062,583
-    // against a `base` of 6,442,450,176.
     let mut below_base = None;
-    for (label, local) in [
-        ("package-absolute", pos.checked_sub(base)),
-        ("piece-local", Some(pos)),
-    ] {
-        let Some(local) = local.filter(|local| *local <= table_end) else {
-            if label == "package-absolute" && pos < base && below_base.is_none() {
-                below_base = Some(pos);
+    for candidate_pos in positions {
+        for (label, local) in [
+            ("package-absolute", candidate_pos.checked_sub(base)),
+            ("piece-local", Some(candidate_pos)),
+        ] {
+            let Some(local) = local.filter(|local| *local <= table_end) else {
+                if label == "package-absolute" && candidate_pos < base && below_base.is_none() {
+                    below_base = Some(candidate_pos);
+                }
+                continue;
+            };
+            // The table may straddle the split, so it is read through the
+            // multi-piece reader; and it is read in growing chunks, because the span
+            // down to the trailer is not the table's length (see
+            // `read_entry_table_chunked`).
+            match read_entry_table_chunked(
+                files,
+                layout,
+                base + local,
+                table_end - local,
+                count,
+                rev,
+                end,
+                layout.total(),
+            ) {
+                Ok(entries) => return Ok(entries),
+                Err(e) => tried.push(format!("{label} {local}: {e}")),
             }
-            continue;
-        };
-        // The table may straddle the split, so it is read through the
-        // multi-piece reader; and it is read in growing chunks, because the span
-        // down to the trailer is not the table's length (see
-        // `read_entry_table_chunked`).
-        match read_entry_table_chunked(
-            files,
-            layout,
-            base + local,
-            table_end - local,
-            count,
-            rev,
-            end,
-            layout.total(),
-        ) {
-            Ok(entries) => return Ok(entries),
-            Err(e) => tried.push(format!("{label} {local}: {e}")),
         }
     }
     // Nothing parsed. The masked offset in the trailer's header is then either
@@ -3343,5 +3348,25 @@ mod tests {
         std::fs::remove_file(path).unwrap();
         assert!(error.contains("split package"), "unexpected error: {error}");
         assert!(error.contains("missing"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn reads_sign_extended_64bit_table_offset_mask() {
+        let mut bytes = package(0x0002_0003, &[("models/test.bmd", b"hello-184")], false);
+        let len = bytes.len();
+        let header_at = len - 288;
+        // Flip the upper 32 bits of the 64-bit dwEntryOffset to simulate C++
+        // sign-extended `AFPCK_MASKDWORD` (`0xffff_ffff_a893_7462`).
+        let raw = u64::from_le_bytes(bytes[header_at + 8..header_at + 16].try_into().unwrap());
+        let sign_ext = raw ^ 0xffff_ffff_0000_0000u64;
+        bytes[header_at + 8..header_at + 16].copy_from_slice(&sign_ext.to_le_bytes());
+
+        let path = write_temp(&bytes, "sign-ext-mask-v3");
+        let mut f = File::open(&path).unwrap();
+        let entries = directory(&mut f).expect("sign-extended 64-bit MASK must decode");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "models/test.bmd");
+        assert_eq!(read_entry(&mut f, &entries[0]).unwrap(), b"hello-184");
+        let _ = std::fs::remove_file(&path);
     }
 }

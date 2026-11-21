@@ -1,7 +1,7 @@
 //! Retain ECWLD model placements and shared model dependencies. Loading an
 //! asset does not choose an action namespace or invent an animation schedule.
 use crate::{ecmodel, model_asset::ModelAsset, scene::SceneModel};
-use std::{collections::HashMap, fs::File, path::Path};
+use std::{collections::HashMap, path::Path};
 
 pub struct Instance {
     pub placement: SceneModel,
@@ -74,9 +74,9 @@ impl Assets {
         if placements.is_empty() {
             return Ok(Self::load_with(placements, |_| unreachable!()));
         }
-        let mut file =
-            File::open(element.join("models.pck")).map_err(|e| format!("models.pck: {e}"))?;
-        let dir = crate::pck::directory(&mut file)?;
+        let mut package = crate::pck::Package::open(&element.join("models.pck"))
+            .map_err(|e| format!("models.pck: {e}"))?;
+        let dir = package.directory()?;
         let mut entries = HashMap::with_capacity(dir.len());
         for entry in dir {
             let name = ecmodel::normalize(&entry.name);
@@ -88,7 +88,7 @@ impl Assets {
             let entry = entries
                 .get(path)
                 .ok_or_else(|| format!("missing models.pck entry: {path}"))?;
-            crate::pck::read_entry(&mut file, entry)
+            package.read(entry)
         }))
     }
 }
