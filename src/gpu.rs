@@ -7777,7 +7777,7 @@ fn run_viewer(
                             #[cfg(test)]
                             if let Some(dir) = smoke_dir.filter(|_| smoke_travel.is_none()) {
                                 if let Some(provider) = smoke_sdk.filter(|_| !smoke_reload || restoring.is_some()) {
-                                    assert!(renderer.renders_rays(), "SDK fixture did not draw rays");
+                                    assert!(renderer.ray_lighting_active(), "SDK fixture did not draw rays");
                                     assert_eq!(renderer.lighter.reconstruction_status(), Some(provider), "fixture requires real windowed SDK dispatch");
                                 }
                                 if restoring.is_none() && (smoke_frames == 0 || !smoke_reload && (1..4).contains(&smoke_frames) && world_extent == smoke_resize_extent) {
@@ -7786,7 +7786,7 @@ fn run_viewer(
                                 } else if restoring.is_some() && !presented_once {
                                     if smoke_reload {
                                         assert_eq!(renderer.lighter.settings.mode, smoke_mode);
-                                        assert!(renderer.renders_rays());
+                                        assert!(renderer.ray_lighting_active());
                                         frame_capture.requested = Some(dir.join("reload-software.png"));
                                     } else if smoke_sdk.is_some() {
                                         frame_capture.requested = Some(dir.join("recovered-sdk.png"));

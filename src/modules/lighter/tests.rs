@@ -5021,3 +5021,33 @@ fn dlss_rr_enabled_on_nvidia_rtx_and_logger_writes_files() {
     assert!(content.contains("1,50,0.500,1.200,0.400"));
     let _ = std::fs::remove_file(csv);
 }
+
+#[test]
+fn r3_ray_lighting_active_rejects_errored_renderer() {
+    let mut lighter = Lighter::default();
+    lighter.armed = true;
+    lighter.has_hardware_device = true;
+    lighter.adapter_supports_compute = true;
+    lighter.settings.mode = Mode::Hardware;
+    lighter.settings.ray_lighting = true;
+    lighter.settings.reference = false;
+    assert!(
+        lighter.overlays_world(),
+        "armed Hardware overlay with no error should be active"
+    );
+    assert!(
+        lighter.replaces_world(),
+        "armed Hardware renderer with no error should report replaces_world"
+    );
+
+    lighter.fail_frame("simulated Vulkan device error".into());
+    assert!(lighter.error().is_some());
+    assert!(
+        !lighter.overlays_world(),
+        "smoke assertion must fail when error() is set in overlay mode"
+    );
+    assert!(
+        !lighter.replaces_world(),
+        "smoke assertion must fail when error() is set in reference mode"
+    );
+}
