@@ -167,7 +167,7 @@ mod imp {
     };
 
     // Exact COM vtable indices verified against Microsoft DirectX-Headers `d3d12.h`.
-    const DEVICE5_SLOT_GET_PREBUILD_INFO: usize = 67;
+    const DEVICE5_SLOT_GET_PREBUILD_INFO: usize = 63;
     const CMDLIST4_SLOT_BUILD_AS: usize = 72;
 
     #[repr(C)]
@@ -256,6 +256,12 @@ mod imp {
         shader4_component_mapping: u32,
         u: [u64; 3],
     }
+
+    const _: () = {
+        assert!(size_of::<RawSrvDesc>() == size_of::<d12::D3D12_SHADER_RESOURCE_VIEW_DESC>());
+        assert!(size_of::<InstanceDesc>() == 64);
+        assert!(size_of::<PrebuildInfo>() == 24);
+    };
 
     #[cfg(pwe_dxr_shader)]
     const DXR_TRACE_DXIL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dxr_trace.dxil"));
@@ -432,6 +438,13 @@ mod imp {
             if bytes.is_empty() {
                 return Ok(());
             }
+            if (bytes.len() as u64) > self.size {
+                return Err(format!(
+                    "DXR upload buffer overflow ({} > {})",
+                    bytes.len(),
+                    self.size
+                ));
+            }
             let mut mapped: *mut c_void = null_mut();
             let read_range = d12::D3D12_RANGE { Begin: 0, End: 0 };
             let hr = (*self.resource).Map(0, &read_range, &mut mapped);
@@ -453,6 +466,29 @@ mod imp {
         mat_count: u32,
     }
 
+    #[inline]
+    fn align256(n: u64) -> u64 {
+        (n.max(256) + 255) & !255
+    }
+
+    /// Small RAII guard for raw COM pointers during `DxrTracer::new` so early
+    /// errors never leak D3D12 objects.
+    struct ComGuard(*mut c_void);
+
+    impl ComGuard {
+        fn take(mut self) -> *mut c_void {
+            let p = self.0;
+            self.0 = null_mut();
+            p
+        }
+    }
+
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            unsafe { com_release(self.0) };
+        }
+    }
+
     struct DxrTargets {
         colour: NativeTexture2D,
         guide: NativeTexture2D,
@@ -460,6 +496,10 @@ mod imp {
         normals: NativeTexture2D,
         albedo: NativeTexture2D,
         extent: (u32, u32),
+        /// True once `wgpu` has copied from the corresponding target, leaving
+        /// wgpu's DX12 state tracker expecting `D3D12_RESOURCE_STATE_COPY_SOURCE`
+        /// instead of the initial `D3D12_RESOURCE_STATE_COMMON`.
+        wgpu_tracked_copy_src: [bool; 5],
     }
 
     impl DxrTargets {
@@ -473,7 +513,7 @@ mod imp {
             let usage = wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::STORAGE_BINDING;
-            let state = d12::D3D12_RESOURCE_STATE_COPY_SOURCE;
+            let state = d12::D3D12_RESOURCE_STATE_COMMON;
             let mk = |label: &str, fmt: wgpu::TextureFormat| unsafe {
                 NativeTexture2D::create(
                     device,
@@ -500,6 +540,7 @@ mod imp {
                 normals,
                 albedo,
                 extent: (w, h),
+                wgpu_tracked_copy_src: [false; 5],
             })
         }
     }
@@ -554,18 +595,17 @@ mod imp {
             }
             let (raw_device, raw_queue) = raw_dx12(device)?;
             let dev_ptr = raw_device.as_mut_ptr();
-            let device5 = unsafe {
+            let device5_guard = ComGuard(unsafe {
                 com_query_interface(dev_ptr as *mut c_void, &IID_ID3D12_DEVICE5)
                     .map_err(|hr| format!("ID3D12Device5 QueryInterface failed (0x{hr:08x})"))?
-            };
+            });
             let mut ring = NativeCommandRing::new(&raw_device, "DXR")?;
-            let (root_sig, pso, desc_heap, desc_stride) = unsafe {
-                Self::create_pipeline(dev_ptr).map_err(|e| {
-                    com_release(device5);
-                    e
-                })?
-            };
-            let cbv_size = (size_of::<RayParams>() as u64 + 255) & !255;
+            let (root_sig, pso, desc_heap, desc_stride) =
+                unsafe { Self::create_pipeline(dev_ptr)? };
+            let root_sig_guard = ComGuard(root_sig as *mut c_void);
+            let pso_guard = ComGuard(pso as *mut c_void);
+            let desc_heap_guard = ComGuard(desc_heap as *mut c_void);
+            let cbv_size = align256(size_of::<RayParams>() as u64);
             let mk_cbv = || unsafe {
                 RawBuffer::create(
                     dev_ptr,
@@ -576,17 +616,18 @@ mod imp {
                 )
             };
             let cbvs = [mk_cbv()?, mk_cbv()?, mk_cbv()?];
-            let dxr_scene = Self::build_scene(dev_ptr, device5, &mut ring, &raw_queue, scene)?;
+            let dxr_scene =
+                Self::build_scene(dev_ptr, device5_guard.0, &mut ring, &raw_queue, scene)?;
             let targets = DxrTargets::new(device, &raw_device, grid_extent)?;
 
             let tracer = Self {
                 raw_device,
-                device5,
+                device5: device5_guard.take(),
                 raw_queue,
                 ring,
-                root_sig,
-                pso,
-                desc_heap,
+                root_sig: root_sig_guard.take() as *mut d12::ID3D12RootSignature,
+                pso: pso_guard.take() as *mut d12::ID3D12PipelineState,
+                desc_heap: desc_heap_guard.take() as *mut d12::ID3D12DescriptorHeap,
                 desc_stride,
                 cbvs,
                 scene: dxr_scene,
@@ -738,23 +779,25 @@ mod imp {
         ) -> Result<DxrScene, String> {
             // Ensure at least 1 degenerate triangle so BLAS/TLAS build always
             // succeeds even on an empty scene.
-            let mut tris_data: Vec<RayTriangle> = if scene.triangles.is_empty() {
-                vec![RayTriangle {
-                    a: [0.0, 0.0, 0.0, 0.0],
-                    b: [0.0, 0.0, 0.0, 0.0],
-                    c: [0.0, 0.0, 0.0, 0.0],
-                    normal: [0.0, 1.0, 0.0, 0.0],
-                }]
+            let dummy_tri = [RayTriangle {
+                a: [0.0, 0.0, 0.0, 0.0],
+                b: [0.0, 0.0, 0.0, 0.0],
+                c: [0.0, 0.0, 0.0, 0.0],
+                normal: [0.0, 1.0, 0.0, 0.0],
+            }];
+            let dummy_mat = [RayMaterial {
+                albedo: [0.5, 0.5, 0.5, 1.0],
+                surface: [0.8, 0.0, 0.0, 0.0],
+            }];
+            let tris_data: &[RayTriangle] = if scene.triangles.is_empty() {
+                &dummy_tri
             } else {
-                scene.triangles.clone()
+                &scene.triangles
             };
-            let mats_data: Vec<RayMaterial> = if scene.materials.is_empty() {
-                vec![RayMaterial {
-                    albedo: [0.5, 0.5, 0.5, 1.0],
-                    surface: [0.8, 0.0, 0.0, 0.0],
-                }]
+            let mats_data: &[RayMaterial] = if scene.materials.is_empty() {
+                &dummy_mat
             } else {
-                scene.materials.clone()
+                &scene.materials
             };
             let tri_count = tris_data.len() as u32;
             let mat_count = mats_data.len() as u32;
@@ -762,7 +805,7 @@ mod imp {
             // Pack flat [f32; 3] vertex positions (3 vertices per triangle) for
             // the DXR BLAS triangle geometry descriptor.
             let mut verts: Vec<[f32; 3]> = Vec::with_capacity(tris_data.len() * 3);
-            for t in &mut tris_data {
+            for t in tris_data {
                 verts.push([t.a[0], t.a[1], t.a[2]]);
                 verts.push([t.b[0], t.b[1], t.b[2]]);
                 verts.push([t.c[0], t.c[1], t.c[2]]);
@@ -838,9 +881,15 @@ mod imp {
                     },
                 };
                 let blas_info = device5_get_prebuild_info(device5, &blas_inputs);
+                if blas_info.result_data_max_size_in_bytes == 0 {
+                    return Err(
+                        "DXR BLAS GetRaytracingAccelerationStructurePrebuildInfo returned 0 bytes"
+                            .into(),
+                    );
+                }
                 let blas = RawBuffer::create(
                     dev_ptr,
-                    blas_info.result_data_max_size_in_bytes.max(256),
+                    align256(blas_info.result_data_max_size_in_bytes),
                     d12::D3D12_HEAP_TYPE_DEFAULT,
                     d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
@@ -879,18 +928,25 @@ mod imp {
                     },
                 };
                 let tlas_info = device5_get_prebuild_info(device5, &tlas_inputs);
+                if tlas_info.result_data_max_size_in_bytes == 0 {
+                    return Err(
+                        "DXR TLAS GetRaytracingAccelerationStructurePrebuildInfo returned 0 bytes"
+                            .into(),
+                    );
+                }
                 let tlas = RawBuffer::create(
                     dev_ptr,
-                    tlas_info.result_data_max_size_in_bytes.max(256),
+                    align256(tlas_info.result_data_max_size_in_bytes),
                     d12::D3D12_HEAP_TYPE_DEFAULT,
                     d12::D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                     D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
                 )?;
 
-                let scratch_size = blas_info
-                    .scratch_data_size_in_bytes
-                    .max(tlas_info.scratch_data_size_in_bytes)
-                    .max(256);
+                let scratch_size = align256(
+                    blas_info
+                        .scratch_data_size_in_bytes
+                        .max(tlas_info.scratch_data_size_in_bytes),
+                );
                 let scratch = RawBuffer::create(
                     dev_ptr,
                     scratch_size,
@@ -918,7 +974,8 @@ mod imp {
 
                 let mut uav_barrier: d12::D3D12_RESOURCE_BARRIER = zeroed();
                 uav_barrier.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                uav_barrier.u.UAV_mut().pResource = blas.resource;
+                // Null resource barriers both `blas` and the reused `scratch` UAV.
+                uav_barrier.u.UAV_mut().pResource = null_mut();
                 (*list_ptr).ResourceBarrier(1, &uav_barrier);
 
                 let tlas_desc = BuildAsDesc {
@@ -1123,12 +1180,20 @@ mod imp {
                     self.targets.albedo.resource.as_mut_ptr(),
                 ];
                 let mut to_uav: [d12::D3D12_RESOURCE_BARRIER; 5] = zeroed();
-                for (b, res) in to_uav.iter_mut().zip(resources.iter().copied()) {
+                for ((b, res), tracked) in to_uav
+                    .iter_mut()
+                    .zip(resources.iter().copied())
+                    .zip(self.targets.wgpu_tracked_copy_src.iter().copied())
+                {
                     b.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                     *b.u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
                         pResource: res,
                         Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                        StateBefore: d12::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        StateBefore: if tracked {
+                            d12::D3D12_RESOURCE_STATE_COPY_SOURCE
+                        } else {
+                            d12::D3D12_RESOURCE_STATE_COMMON
+                        },
                         StateAfter: d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                     };
                 }
@@ -1143,17 +1208,28 @@ mod imp {
                 (*list).SetComputeRootDescriptorTable(2, self.gpu_handle(3));
                 (*list).Dispatch(w.div_ceil(8), h.div_ceil(8), 1);
 
-                let mut to_copy: [d12::D3D12_RESOURCE_BARRIER; 5] = zeroed();
-                for (b, res) in to_copy.iter_mut().zip(resources.iter().copied()) {
+                let mut to_wgpu: [d12::D3D12_RESOURCE_BARRIER; 5] = zeroed();
+                for ((b, res), tracked) in to_wgpu
+                    .iter_mut()
+                    .zip(resources.iter().copied())
+                    .zip(self.targets.wgpu_tracked_copy_src.iter().copied())
+                {
                     b.Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                     *b.u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
                         pResource: res,
                         Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                         StateBefore: d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                        StateAfter: d12::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        // Return to whatever state wgpu's DX12 tracker expects:
+                        // COMMON until wgpu has copied from this target once,
+                        // COPY_SOURCE thereafter.
+                        StateAfter: if tracked {
+                            d12::D3D12_RESOURCE_STATE_COPY_SOURCE
+                        } else {
+                            d12::D3D12_RESOURCE_STATE_COMMON
+                        },
                     };
                 }
-                (*list).ResourceBarrier(to_copy.len() as UINT, to_copy.as_ptr());
+                (*list).ResourceBarrier(to_wgpu.len() as UINT, to_wgpu.as_ptr());
 
                 self.ring.retire(slot_idx, &self.raw_queue, "DXR-Trace")?;
             }
@@ -1164,7 +1240,7 @@ mod imp {
                 depth_or_array_layers: 1,
             };
             // Copy only the planes the active denoiser/reconstructor consumes,
-            // keeping all DXR targets strictly in COPY_SOURCE for wgpu DX12 state safety.
+            // marking each copied plane as tracked in COPY_SOURCE by wgpu.
             let pairs = [
                 (&self.targets.colour.texture, Some(dst_colour)),
                 (&self.targets.guide.texture, dst_guide),
@@ -1172,8 +1248,9 @@ mod imp {
                 (&self.targets.normals.texture, Some(dst_normals)),
                 (&self.targets.albedo.texture, dst_albedo),
             ];
-            for (src, dst_opt) in pairs {
+            for (idx, (src, dst_opt)) in pairs.into_iter().enumerate() {
                 let Some(dst) = dst_opt else { continue };
+                self.targets.wgpu_tracked_copy_src[idx] = true;
                 encoder.copy_texture_to_texture(
                     wgpu::ImageCopyTexture {
                         texture: src,

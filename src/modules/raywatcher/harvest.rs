@@ -414,65 +414,68 @@ fn push_terrain(
     // window larger than the grid is the normal case near the edge of a loaded
     // block, so this must clamp rather than give up: the harvest simply covers
     // the part of the window the heights actually describe.
-    let first = |min: f32, origin: f32, size: u32, cell: f32, stride: u32| -> u32 {
-        let spacing = (cell * stride as f32).max(1e-3);
-        let index = ((min - origin) / spacing).floor();
+    let first = |min: f32, origin: f32, size: u32, cell: f32| -> u32 {
+        let index = ((min - origin) / cell.max(1e-3)).floor();
         if index <= 0. {
             0
         } else if index >= size as f32 {
             // Entirely past the grid: report a start the loop will reject
             // immediately, by pointing at the last usable node.
-            (size - 1).max(0)
+            size.saturating_sub(1)
         } else {
             index as u32
         }
     };
-    let mut x = first(min_x, field.origin.x, field.width - 1, field.cell, stride);
-    let mut z = first(min_z, field.origin.z, field.height - 1, field.cell, stride);
+    let mut x = first(min_x, field.origin.x, field.width - 1, field.cell);
+    let mut z = first(min_z, field.origin.z, field.height - 1, field.cell);
     // Align to the stride lattice in grid space, so a camera that moves by less
     // than one harvested cell reuses every vertex and the cache still hits.
     x -= x % stride;
     z -= z % stride;
+    let width_usize = field.width as usize;
+    let step = field.cell * stride as f32;
+    let est_x = ((field.width.saturating_sub(x)) / stride) as usize;
+    let est_z = ((field.height.saturating_sub(z)) / stride) as usize;
+    triangles.reserve(est_x.saturating_mul(est_z).saturating_mul(2));
     let mut wz = z;
     while wz + stride < field.height {
         let world_z = field.origin.z + wz as f32 * field.cell;
         if world_z > max_z {
             break;
         }
+        let row0 = (wz as usize) * width_usize;
+        let row1 = ((wz + stride) as usize) * width_usize;
         let mut wx = x;
         while wx + stride < field.width {
             let world_x = field.origin.x + wx as f32 * field.cell;
             if world_x > max_x {
                 break;
             }
-            let step = field.cell * stride as f32;
-            let heights = [
-                field.sample(world_x, world_z),
-                field.sample(world_x + step, world_z),
-                field.sample(world_x + step, world_z + step),
-                field.sample(world_x, world_z + step),
-            ];
-            if let [Some(h0), Some(h1), Some(h2), Some(h3)] = heights {
-                let p = [
-                    Vec3::new(world_x, h0, world_z),
-                    Vec3::new(world_x + step, h1, world_z),
-                    Vec3::new(world_x + step, h2, world_z + step),
-                    Vec3::new(world_x, h3, world_z + step),
-                ];
-                // Wound counter-clockwise seen from above, so the shading
-                // normal is +Y and the ground reads as lit from the sky. The
-                // traversal itself is two-sided (see `intersect_triangle`), so
-                // the winding is about how the surface shades, not what it
-                // occludes.
-                let normal = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
-                let normal = if normal.length_squared() > 0.5 {
-                    normal
-                } else {
-                    Vec3::Y
-                };
-                triangles.push(RayTriangle::new(p[0], p[1], p[2], normal, material));
-                triangles.push(RayTriangle::new(p[0], p[2], p[3], normal, material));
-            }
+            let ix0 = wx as usize;
+            let ix1 = (wx + stride) as usize;
+            let h0 = field.heights[row0 + ix0];
+            let h1 = field.heights[row0 + ix1];
+            let h2 = field.heights[row1 + ix1];
+            let h3 = field.heights[row1 + ix0];
+            let p0 = Vec3::new(world_x, h0, world_z);
+            let p1 = Vec3::new(world_x + step, h1, world_z);
+            let p2 = Vec3::new(world_x + step, h2, world_z + step);
+            let p3 = Vec3::new(world_x, h3, world_z + step);
+            // Compute upward-facing (+Y) normals per triangle.
+            let n0 = (p2 - p0).cross(p1 - p0).normalize_or_zero();
+            let n0 = if n0.length_squared() > 0.5 {
+                n0
+            } else {
+                Vec3::Y
+            };
+            let n1 = (p3 - p0).cross(p2 - p0).normalize_or_zero();
+            let n1 = if n1.length_squared() > 0.5 {
+                n1
+            } else {
+                Vec3::Y
+            };
+            triangles.push(RayTriangle::new(p0, p1, p2, n0, material));
+            triangles.push(RayTriangle::new(p0, p2, p3, n1, material));
             wx += stride;
         }
         wz += stride;

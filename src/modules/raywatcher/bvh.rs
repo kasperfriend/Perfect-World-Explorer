@@ -307,28 +307,26 @@ impl SceneGeometry {
         if geometry.triangles.is_empty() {
             return geometry;
         }
+        let n = geometry.triangles.len();
+        let mut tri_bounds = Vec::with_capacity(n);
+        let mut centroids = Vec::with_capacity(n);
         for tri in &geometry.triangles {
-            geometry.bounds.extend(Vec3::from_slice(&tri.a));
-            geometry
-                .bounds
-                .extend(Vec3::new(tri.b[0], tri.b[1], tri.b[2]));
-            geometry
-                .bounds
-                .extend(Vec3::new(tri.c[0], tri.c[1], tri.c[2]));
+            let a = Vec3::new(tri.a[0], tri.a[1], tri.a[2]);
+            let b = Vec3::new(tri.b[0], tri.b[1], tri.b[2]);
+            let c = Vec3::new(tri.c[0], tri.c[1], tri.c[2]);
+            let min = a.min(b).min(c);
+            let max = a.max(b).max(c);
+            geometry.bounds.extend(min);
+            geometry.bounds.extend(max);
+            tri_bounds.push((min, max));
+            centroids.push((a + b + c) * (1.0 / 3.0));
         }
-        let centroids: Vec<Vec3> = geometry.triangles.iter().map(|t| t.centre()).collect();
-        let mut index: Vec<u32> = (0..geometry.triangles.len() as u32).collect();
-        geometry.order = index.clone();
-        // Reserve a power-of-two node array like a real builder would; the
-        // vector still grows if the tree is deeper than the guess.
-        geometry
-            .nodes
-            .reserve(geometry.triangles.len().saturating_mul(2).clamp(1, 1 << 22));
+        let mut index: Vec<u32> = (0..n as u32).collect();
         let mut state = BuildState {
-            tris: &geometry.triangles,
+            tri_bounds: &tri_bounds,
             centroids: &centroids,
-            nodes: Vec::new(),
-            order: Vec::new(),
+            nodes: Vec::with_capacity(n.saturating_mul(2).clamp(1, 1 << 22)),
+            order: Vec::with_capacity(n),
             depth: 0,
             widest: 0,
         };
@@ -493,7 +491,7 @@ impl SceneGeometry {
 }
 
 struct BuildState<'a> {
-    tris: &'a [RayTriangle],
+    tri_bounds: &'a [(Vec3, Vec3)],
     centroids: &'a [Vec3],
     nodes: Vec<BvhNode>,
     order: Vec<u32>,
@@ -509,13 +507,17 @@ impl<'a> BuildState<'a> {
     /// "left child = node + 1" holds.
     fn build_node(&mut self, partition: &mut [u32], depth: u32) -> u32 {
         let node_index = self.nodes.len() as u32;
-        let mut bounds = Bounds::EMPTY;
+        let mut bmin = Vec3::splat(f32::INFINITY);
+        let mut bmax = Vec3::splat(f32::NEG_INFINITY);
         for &i in partition.iter() {
-            let tri = &self.tris[i as usize];
-            bounds.extend(Vec3::from_slice(&tri.a));
-            bounds.extend(Vec3::new(tri.b[0], tri.b[1], tri.b[2]));
-            bounds.extend(Vec3::new(tri.c[0], tri.c[1], tri.c[2]));
+            let (lo, hi) = self.tri_bounds[i as usize];
+            bmin = bmin.min(lo);
+            bmax = bmax.max(hi);
         }
+        let bounds = Bounds {
+            min: bmin,
+            max: bmax,
+        };
         self.depth = self.depth.max(depth);
         // Placeholder; the leaf branch fills it in and the interior branch
         // rewrites it once the right child's index is known.

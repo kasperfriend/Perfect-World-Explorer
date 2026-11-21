@@ -396,7 +396,7 @@ fn fs(i: VOut) -> FOut {
                     extent,
                     rt_flags,
                     rt_usage,
-                    d12::D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    d12::D3D12_RESOURCE_STATE_COMMON,
                     false,
                 )
             };
@@ -420,7 +420,7 @@ fn fs(i: VOut) -> FOut {
                     extent,
                     d12::D3D12_RESOURCE_FLAG_NONE,
                     wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-                    d12::D3D12_RESOURCE_STATE_COPY_DEST,
+                    d12::D3D12_RESOURCE_STATE_COMMON,
                     false,
                 )?
             };
@@ -456,7 +456,7 @@ fn fs(i: VOut) -> FOut {
                     wgpu::TextureUsages::COPY_SRC
                         | wgpu::TextureUsages::TEXTURE_BINDING
                         | wgpu::TextureUsages::STORAGE_BINDING,
-                    d12::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    d12::D3D12_RESOURCE_STATE_COMMON,
                     false,
                 )?
             };
@@ -728,11 +728,16 @@ fn fs(i: VOut) -> FOut {
                     StateBefore: d12::D3D12_RESOURCE_STATE_COPY_DEST,
                     StateAfter: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                 };
+                let out_wgpu_state = if self.frame_index == 0 {
+                    d12::D3D12_RESOURCE_STATE_COMMON
+                } else {
+                    d12::D3D12_RESOURCE_STATE_COPY_SOURCE
+                };
                 before[7].Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                 *before[7].u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
                     pResource: out_res,
                     Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
-                    StateBefore: d12::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    StateBefore: out_wgpu_state,
                     StateAfter: d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 };
                 (*list).ResourceBarrier(before.len() as u32, before.as_ptr());
@@ -832,12 +837,17 @@ fn fs(i: VOut) -> FOut {
                     StateBefore: d12::D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                     StateAfter: d12::D3D12_RESOURCE_STATE_COPY_DEST,
                 };
+                let out_wgpu_state = if self.frame_index == 0 {
+                    d12::D3D12_RESOURCE_STATE_COMMON
+                } else {
+                    d12::D3D12_RESOURCE_STATE_COPY_SOURCE
+                };
                 after[7].Type = d12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                 *after[7].u.Transition_mut() = d12::D3D12_RESOURCE_TRANSITION_BARRIER {
                     pResource: out_res,
                     Subresource: d12::D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
                     StateBefore: d12::D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    StateAfter: d12::D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    StateAfter: out_wgpu_state,
                 };
                 (*list).ResourceBarrier(after.len() as u32, after.as_ptr());
             }

@@ -3760,9 +3760,7 @@ impl Renderer {
         if !plan.trace {
             return;
         }
-        if reset_history {
-            self.modules.raywatcher_mut().reset_history();
-        }
+        let reset_history = reset_history || self.modules.raywatcher_mut().take_history_reset();
         let settings = self.modules.raywatcher().settings().clone();
         // --- The scene. Rebuilt only when the world it came from changed.
         let config = crate::modules::raywatcher::harvest::HarvestConfig::default();
@@ -3934,7 +3932,6 @@ impl Renderer {
         // upscaler's world target.
         let (rw, rh) = (render_extent.0.max(1), render_extent.1.max(1));
         self.raywatcher_copy_out(encoder, (rw, rh), destination);
-        self.modules.raywatcher_mut().take_history_reset();
         self.modules.raywatcher_mut().next_frame();
     }
 

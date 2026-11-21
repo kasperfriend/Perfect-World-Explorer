@@ -326,7 +326,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         float2 offset = float2(0.0, 0.0);
         if (samples > 1u) {
             float n = float(samples);
-            offset = float2((float(s) + 0.5) / n - 0.5, (float(s % 2u) + 0.5) / 2.0) * 0.4;
+            offset = float2((float(s) + 0.5) / n - 0.5, (float(s % 2u) + 0.5) / 2.0 - 0.5) * 0.4;
         }
         float2 pixel = float2(float(id.x) + 0.5, float(id.y) + 0.5) + offset + params.tuning.xy;
         float2 ndc = float2(pixel.x / grid.x * 2.0 - 1.0, 1.0 - pixel.y / grid.y * 2.0);

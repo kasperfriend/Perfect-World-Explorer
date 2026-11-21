@@ -632,7 +632,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         var offset = vec2<f32>(0.0, 0.0);
         if (samples > 1u) {
             let n = f32(samples);
-            offset = vec2<f32>((f32(s) + 0.5) / n - 0.5, (f32(s % 2u) + 0.5) / 2.0);
+            offset = vec2<f32>((f32(s) + 0.5) / n - 0.5, (f32(s % 2u) + 0.5) / 2.0 - 0.5);
             offset = offset * 0.4;
         }
         let pixel = vec2<f32>(f32(id.x) + 0.5, f32(id.y) + 0.5) + offset + params.tuning.xy;
@@ -750,35 +750,40 @@ fn temporal_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let gmax = vec2<i32>(i32(gdim.x) - 1, i32(gdim.y) - 1);
     let gp = grid_coord(pixel, size, gdim);
     let current = textureLoad(src_colour, gp, 0).rgb + textureLoad(src_reflection, gp, 0).rgb;
-    // Local 3x3 mean and standard deviation in ray-grid space for variance clamping.
-    var sum = current;
-    var sum_sq = current * current;
-    for (var dy = -1; dy <= 1; dy = dy + 1) {
-        for (var dx = -1; dx <= 1; dx = dx + 1) {
-            if (dx == 0 && dy == 0) {
-                continue;
-            }
-            let p = clamp(gp + vec2<i32>(dx, dy), vec2<i32>(0), gmax);
-            let c = textureLoad(src_colour, p, 0).rgb + textureLoad(src_reflection, p, 0).rgb;
-            sum = sum + c;
-            sum_sq = sum_sq + c * c;
-        }
-    }
-    let count = 9.0;
-    let mean = sum / count;
-    let stddev = sqrt(max(sum_sq / count - mean * mean, vec3<f32>(0.0))) * params.weights.w;
-
+    let depth = textureLoad(src_depth, pixel, 0);
     let prev = reproject(pixel, size);
-    let history = clamp(prev.colour, mean - stddev, mean + stddev);
     let n = min(prev.length, params.misc.z);
     let valid = params.misc.w > 0.5 && n > 0.0;
-    let alpha = select(1.0, max(1.0 / (n + 1.0), params.extent.w), valid);
-    let blended = mix(history, current, alpha);
-    let length = min(select(0.0, n, valid) + 1.0, params.misc.z);
-    let lum = luminance(blended);
-    let m1 = select(lum, mix(prev.moments.x, lum, alpha), valid);
-    let m2 = select(lum * lum, mix(prev.moments.y, lum * lum, alpha), valid);
-    let depth = textureLoad(src_depth, pixel, 0);
+    var blended = current;
+    var length = 1.0;
+    var m1 = luminance(current);
+    var m2 = m1 * m1;
+    if (valid) {
+        // Local 3x3 mean and standard deviation in ray-grid space for variance clamping.
+        var sum = current;
+        var sum_sq = current * current;
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                let p = clamp(gp + vec2<i32>(dx, dy), vec2<i32>(0), gmax);
+                let c = textureLoad(src_colour, p, 0).rgb + textureLoad(src_reflection, p, 0).rgb;
+                sum = sum + c;
+                sum_sq = sum_sq + c * c;
+            }
+        }
+        let inv9 = 1.0 / 9.0;
+        let mean = sum * inv9;
+        let stddev = sqrt(max(sum_sq * inv9 - mean * mean, vec3<f32>(0.0))) * params.weights.w;
+        let history = clamp(prev.colour, mean - stddev, mean + stddev);
+        let alpha = max(1.0 / (n + 1.0), params.extent.w);
+        blended = mix(history, current, alpha);
+        length = min(n + 1.0, params.misc.z);
+        let lum = luminance(blended);
+        m1 = mix(prev.moments.x, lum, alpha);
+        m2 = mix(prev.moments.y, lum * lum, alpha);
+    }
     textureStore(out_colour, pixel, vec4<f32>(blended, 1.0));
     textureStore(out_moments, pixel, vec4<f32>(m1, m2, depth, length));
 }
@@ -846,7 +851,11 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 continue;
             }
             let n1 = normal_at_scaled(p, grid_scale, gmax);
-            let wn = pow(max(dot(centre_normal, n1), 0.0), params.weights.y);
+            let ndot = dot(centre_normal, n1);
+            if (ndot <= 0.0) {
+                continue;
+            }
+            let wn = pow(ndot, params.weights.y);
             if (wn < 1e-4) {
                 continue;
             }
@@ -1849,14 +1858,94 @@ impl RaywatcherGpu {
         grid_extent: (u32, u32),
     ) -> bool {
         let (w, h) = (render_extent.0.max(1), render_extent.1.max(1));
+        let grid_extent = (grid_extent.0.max(1), grid_extent.1.max(1));
         if (w, h) == self.render_extent && grid_extent == self.grid_extent {
             return true;
         }
-        let pipelines = &self.pipelines;
-        if grid_extent != self.grid_extent {
-            self.grid = GridTargets::new(device, grid_extent.0.max(1), grid_extent.1.max(1));
+        let grid_changed = grid_extent != self.grid_extent;
+        let render_changed = (w, h) != self.render_extent;
+        if grid_changed {
+            self.grid = GridTargets::new(device, grid_extent.0, grid_extent.1);
             self.grid_extent = grid_extent;
+            if let Some(dxr) = self.dxr.as_mut() {
+                if let Err(err) = dxr.resize(device, self.grid_extent) {
+                    eprintln!("[Raywatcher] DXR resize failed ({err}); falling back to Software");
+                    self.dxr = None;
+                    self.dxr_failed = true;
+                }
+            }
         }
+        if !render_changed {
+            let pipelines = &self.pipelines;
+            self.trace_bind_group =
+                Self::trace_bindings(device, pipelines, &self.uniforms, &self.scene, &self.grid);
+            self.temporal_bind_groups = [
+                Self::temporal_binding(
+                    device,
+                    pipelines,
+                    &self.temporal_uniforms,
+                    &self.grid,
+                    &self.motion,
+                    &self.depth,
+                    &self.filter_colour[0],
+                    &self.filter_moments[0],
+                    &self.temporal_colour,
+                    &self.temporal_moments,
+                ),
+                Self::temporal_binding(
+                    device,
+                    pipelines,
+                    &self.temporal_uniforms,
+                    &self.grid,
+                    &self.motion,
+                    &self.depth,
+                    &self.filter_colour[1],
+                    &self.filter_moments[1],
+                    &self.temporal_colour,
+                    &self.temporal_moments,
+                ),
+            ];
+            self.atrous_bind_groups = Self::atrous_bindings(
+                device,
+                pipelines,
+                &self.atrous_uniforms,
+                &self.grid,
+                &self.depth,
+                &self.motion,
+                &self.filter_colour,
+                &self.filter_moments,
+                &self.temporal_colour,
+                &self.temporal_moments,
+            );
+            self.compose_bind_groups = [
+                Self::compose_binding(
+                    device,
+                    pipelines,
+                    &self.compose_uniforms,
+                    &self.grid,
+                    &self.filter_colour[0],
+                    &self.filter_moments[0],
+                    &self.output_view,
+                    &self.guide_view,
+                ),
+                Self::compose_binding(
+                    device,
+                    pipelines,
+                    &self.compose_uniforms,
+                    &self.grid,
+                    &self.filter_colour[1],
+                    &self.filter_moments[1],
+                    &self.output_view,
+                    &self.guide_view,
+                ),
+            ];
+            if let Some(rr) = self.dlss_rr.as_mut() {
+                rr.invalidate_prep();
+            }
+            self.frames = 0;
+            return true;
+        }
+        let pipelines = &self.pipelines;
         self.render_extent = (w, h);
         let (filter_colour_tex, filter_colour) = {
             let (a, av) = plane(device, "raywatcher filter colour a", w, h, COLOUR_FORMAT);
@@ -1939,13 +2028,6 @@ impl RaywatcherGpu {
                 &guide_view,
             ),
         ];
-        if let Some(dxr) = self.dxr.as_mut() {
-            if let Err(err) = dxr.resize(device, self.grid_extent) {
-                eprintln!("[Raywatcher] DXR resize failed ({err}); falling back to Software");
-                self.dxr = None;
-                self.dxr_failed = true;
-            }
-        }
         if let Some(rr) = self.dlss_rr.as_mut() {
             if rr.extent() != (w, h) {
                 self.dlss_rr = None;
@@ -2050,8 +2132,10 @@ impl RaywatcherGpu {
             }
             if let Some(dxr) = self.dxr.as_mut() {
                 // Skip copying `albedo` when in-house denoiser runs, and skip
-                // copying `guide` when DLSS Ray Reconstruction runs.
-                let dst_guide = (!skip_inhouse).then_some(&self.grid.guide);
+                // copying `guide` once DLSS Ray Reconstruction is initialized
+                // (keep `guide` on the first probe frame for seamless fallback).
+                let dst_guide =
+                    (!skip_inhouse || self.dlss_rr.is_none()).then_some(&self.grid.guide);
                 let dst_albedo = skip_inhouse.then_some(&self.grid.albedo);
                 match dxr.trace(
                     encoder,
