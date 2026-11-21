@@ -759,7 +759,7 @@ fn read_release_version_from_configs_pck(element: &Path) -> Option<(String, Stri
                 .replace('\\', "/")
                 .eq_ignore_ascii_case("config/element/version.sw")
         }) {
-            if let Ok(bytes) = crate::angelica_pck::read_entry(&mut file, entry) {
+            if let Ok(bytes) = crate::pck::read_entry(&mut file, entry) {
                 if let Some(version) = parse_release_version_bytes(&bytes) {
                     return Some((version, "configs.pck:config/element/version.sw".into()));
                 }
