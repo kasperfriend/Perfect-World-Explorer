@@ -891,7 +891,7 @@ impl Core {
         progress("Opening the Vulkan RT pipeline cache…");
         let (vendor, device, uuid) = ctx.identity;
         let mut c = Self {
-            cache: cache::PipelineCache::new(&ctx.device, vendor, device, uuid),
+            cache: cache::PipelineCache::new(&ctx.device, vendor, device, uuid, progress),
             ctx,
             pool: vk::CommandPool::null(),
             commands: vk::CommandBuffer::null(),
@@ -1012,7 +1012,7 @@ impl Core {
             )?;
         }
         progress("Saving the Vulkan RT pipeline cache…");
-        c.cache.save();
+        c.cache.save_with_progress(progress);
         if c.ctx.timestamp_bits > 0 {
             // Profiling is optional; inability to create a query pool does not
             // make an otherwise suitable RT device unavailable.
@@ -1588,7 +1588,7 @@ impl Renderer {
         ) {
             Ok(primary) => {
                 self.primary = Some(primary);
-                self.core.cache.save();
+                self.core.cache.save_with_progress(progress);
             }
             Err(error) => {
                 self.primary_failed = true;
