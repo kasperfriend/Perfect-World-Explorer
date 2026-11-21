@@ -182,6 +182,58 @@ fn parse_v300_tail_material(tail: &[u8]) -> Option<Material> {
         two_sided: tail[start + 68] != 0,
     })
 }
+fn normalize_v300_colors(b: &[u8], p: &mut usize, vertices: &mut [Vertex]) -> Result<(), String> {
+    let n = vertices.len();
+    if n == 0 {
+        return Ok(());
+    }
+    let opaque_day = vertices
+        .iter()
+        .filter(|v| (v.day_diffuse >> 24) == 0xff)
+        .count();
+    if opaque_day * 10 < n * 9 {
+        let can_peek = n
+            .checked_mul(8)
+            .and_then(|eb| p.checked_add(eb))
+            .is_some_and(|e| e <= b.len());
+        let mut following_opaque = 0usize;
+        if can_peek {
+            for i in 0..n {
+                let d_ok = u(b, *p + i * 4).is_ok_and(|w| (w >> 24) == 0xff);
+                let n_ok = u(b, *p + n * 4 + i * 4).is_ok_and(|w| (w >> 24) == 0xff);
+                if d_ok && n_ok {
+                    following_opaque += 1;
+                }
+            }
+        }
+        if following_opaque * 10 >= n * 9 {
+            for v in vertices.iter_mut() {
+                v.day_diffuse = u(b, *p)?;
+                *p += 4;
+            }
+            for v in vertices.iter_mut() {
+                v.night_diffuse = u(b, *p)?;
+                *p += 4;
+            }
+        } else {
+            for v in vertices.iter_mut() {
+                v.day_diffuse = 0xff80_8080;
+                v.night_diffuse = 0xff80_8080;
+            }
+        }
+        return Ok(());
+    }
+    let opaque_night = vertices
+        .iter()
+        .filter(|v| (v.night_diffuse >> 24) == 0xff)
+        .count();
+    if opaque_night * 10 < n * 9 {
+        for v in vertices.iter_mut() {
+            v.night_diffuse = v.day_diffuse;
+        }
+    }
+    Ok(())
+}
 impl Model {
     /// Mirrors the retail loaders exactly:
     /// - file magic "MOXB" (u32 0x42584f4d) is the AFileImage binary marker,
@@ -323,56 +375,7 @@ impl Model {
                 // non-opaque words and either advance to the following baked
                 // day/night colour block (bSupportLightMap && !bUseLightMap)
                 // or use neutral 0xFF808080 (1.0x under MODULATE2X).
-                if !vertices.is_empty() {
-                    let opaque_day = vertices
-                        .iter()
-                        .filter(|v| (v.day_diffuse >> 24) == 0xff)
-                        .count();
-                    if opaque_day * 10 < vertices.len() * 9 {
-                        let can_peek = n
-                            .checked_mul(8)
-                            .and_then(|eb| p.checked_add(eb))
-                            .is_some_and(|e| e <= b.len());
-                        let following_opaque = if can_peek {
-                            (0..n)
-                                .filter(|&i| {
-                                    let d = u(b, p + i * 4).is_ok_and(|w| (w >> 24) == 0xff);
-                                    let t =
-                                        u(b, p + n * 4 + i * 4).is_ok_and(|w| (w >> 24) == 0xff);
-                                    d && t
-                                })
-                                .count()
-                        } else {
-                            0
-                        };
-                        let has_following_colors = following_opaque * 10 >= vertices.len() * 9;
-                        if has_following_colors {
-                            for v in &mut vertices {
-                                v.day_diffuse = u(b, p)?;
-                                p += 4;
-                            }
-                            for v in &mut vertices {
-                                v.night_diffuse = u(b, p)?;
-                                p += 4;
-                            }
-                        } else {
-                            for v in &mut vertices {
-                                v.day_diffuse = 0xff80_8080;
-                                v.night_diffuse = 0xff80_8080;
-                            }
-                        }
-                    } else {
-                        let opaque_night = vertices
-                            .iter()
-                            .filter(|v| (v.night_diffuse >> 24) == 0xff)
-                            .count();
-                        if opaque_night * 10 < vertices.len() * 9 {
-                            for v in &mut vertices {
-                                v.night_diffuse = v.day_diffuse;
-                            }
-                        }
-                    }
-                }
+                normalize_v300_colors(b, &mut p, &mut vertices)?;
                 // Tail: 48 B AABB + 80 B A3DMaterial ("MATERIAL: \0" + 69 B) +
                 // dwExtraSize (22 B when strDetailMap is empty -> 150 B total).
                 let mut tail_advance = None;
