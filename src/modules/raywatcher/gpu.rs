@@ -176,6 +176,11 @@ pub struct DenoiseParams {
     pub misc: [f32; 4],
     /// `x` jitter x, `y` jitter y, `z` frame, `w` unused.
     pub frame: [f32; 4],
+    /// Inverse of the current frame's view-projection matrix (for world-space
+    /// camera reprojection when `object_mv` has zero coverage on static world).
+    pub inv_view_projection: [[f32; 4]; 4],
+    /// Previous frame's view-projection matrix for static camera reprojection.
+    pub prev_view_projection: [[f32; 4]; 4],
 }
 
 impl DenoiseParams {
@@ -184,7 +189,10 @@ impl DenoiseParams {
         iteration: u32,
         config: &DenoiseConfig,
         params: &FrameParams,
+        prev_view_projection: Option<glam::Mat4>,
     ) -> Self {
+        let history_valid = params.history_valid > 0 && prev_view_projection.is_some();
+        let prev_vp = prev_view_projection.unwrap_or(params.view_projection);
         Self {
             extent: [
                 extent.0 as f32,
@@ -202,9 +210,11 @@ impl DenoiseParams {
                 DenoiseConfig::step(iteration) as f32,
                 config.variance_floor,
                 config.max_history,
-                if params.history_valid > 0 { 1. } else { 0. },
+                if history_valid { 1. } else { 0. },
             ],
             frame: [params.jitter.0, params.jitter.1, params.frame as f32, 0.],
+            inv_view_projection: params.inv_view_projection.to_cols_array_2d(),
+            prev_view_projection: prev_vp.to_cols_array_2d(),
         }
     }
 }
@@ -1029,6 +1039,8 @@ struct Params {
     weights: vec4<f32>,
     misc: vec4<f32>,
     frame: vec4<f32>,
+    inv_vp: mat4x4<f32>,
+    prev_vp: mat4x4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -1067,29 +1079,56 @@ struct ReprojectResult {
     length: f32,
 };
 
-// Reproject with the motion vector and validate against the previous frame's
-// depth stored in `history_moments.z`.
+// Phase 7: Reproject using explicit object motion where written (`mv.z >= 0.5`,
+// e.g. weather_gpu), and full-frame `prev_vp * inv_vp` camera reprojection for
+// all static world geometry (terrain, buildings, models, trees, water). Rejects
+// disocclusions with a strict 5% relative depth threshold against `prev_ndc.z`.
 fn reproject(pixel: vec2<i32>, size: vec2<i32>) -> ReprojectResult {
     var empty: ReprojectResult;
     empty.colour = vec3<f32>(0.0);
     empty.light_factor = 1.0;
     empty.moments = vec2<f32>(0.0);
     empty.length = 0.0;
-    let motion = textureLoad(src_motion, pixel, 0).xy;
-    let source = vec2<f32>(pixel) + vec2<f32>(0.5) - motion;
+
+    let current_depth = textureLoad(src_depth, pixel, 0);
+    if (current_depth <= 0.0) {
+        return empty;
+    }
+
+    let mv = textureLoad(src_motion, pixel, 0);
+    var source = vec2<f32>(pixel) + vec2<f32>(0.5);
+    var expected_prev_depth = current_depth;
+
+    if (mv.z >= 0.5) {
+        source = source - mv.xy;
+    } else {
+        let uv = (vec2<f32>(pixel) + vec2<f32>(0.5)) / vec2<f32>(size);
+        let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+        let world_h = params.inv_vp * vec4<f32>(ndc, current_depth, 1.0);
+        if (abs(world_h.w) <= 1e-5) {
+            return empty;
+        }
+        let world_pos = world_h.xyz / world_h.w;
+        let prev_clip = params.prev_vp * vec4<f32>(world_pos, 1.0);
+        if (prev_clip.w <= 1e-4) {
+            return empty;
+        }
+        let prev_ndc = prev_clip.xyz / prev_clip.w;
+        let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+        source = prev_uv * vec2<f32>(size);
+        expected_prev_depth = prev_ndc.z;
+    }
+
     if (source.x < 0.0 || source.y < 0.0 || source.x >= f32(size.x) || source.y >= f32(size.y)) {
         return empty;
     }
     let index = vec2<i32>(source);
     let prev_m = textureLoad(history_moments, index, 0);
     let previous_depth = prev_m.z;
-    let current_depth = textureLoad(src_depth, pixel, 0);
-    let both = previous_depth > 0.0 && current_depth > 0.0;
-    if (both) {
-        if (abs(previous_depth - current_depth) / max(current_depth, 1e-3) > 0.05) {
-            return empty;
-        }
-    } else if ((previous_depth > 0.0) != (current_depth > 0.0)) {
+    if (previous_depth <= 0.0 || expected_prev_depth <= 0.0) {
+        return empty;
+    }
+    if (abs(previous_depth - expected_prev_depth) / max(expected_prev_depth, 1e-3) > 0.05) {
         return empty;
     }
     let prev_c = textureLoad(history_colour, index, 0);
@@ -1203,14 +1242,20 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let centre = centre_raw.rgb;
     let centre_lum = luminance(centre);
 
-    // Seed accumulation with the centre tap (skipping redundant exp(0)/pow(1)).
+    // Phase 7: Separate-signal edge-stopping accumulation.
+    // - `light_factor` (sun shadow * AO) is filtered only on narrow passes
+    //   (`step <= 2`) with a tight edge-stopping kernel so hard shadow edges
+    //   stay crisp without blanket blur.
+    // - `rgb` (GI + reflections) uses full variance-guided multi-pass smoothing.
     let w0 = 0.375 * 0.375;
     var sum = centre * w0;
-    var sum_lf = centre_raw.a * w0;
     var weight_sum = w0;
+    var sum_lf = centre_raw.a * w0;
+    var weight_sum_lf = w0;
     var moment1 = centre_moments.x * w0;
     var moment2 = centre_moments.y * w0;
     let step = i32(params.misc.x);
+    let filter_lf = step <= 2;
     for (var dy = -2; dy <= 2; dy = dy + 1) {
         let wy = kernel_weight(dy);
         for (var dx = -2; dx <= 2; dx = dx + 1) {
@@ -1222,6 +1267,9 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                 continue;
             }
             let d1 = textureLoad(src_depth, p, 0);
+            if (d1 <= 0.0 || abs(centre_depth - d1) / max(centre_depth, 1e-3) > 0.05) {
+                continue;
+            }
             let wd = exp(-abs(centre_depth - d1) * inv_depth_denom);
             if (wd < 1e-4) {
                 continue;
@@ -1237,22 +1285,27 @@ fn atrous_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             let sample_raw = textureLoad(history_colour, p, 0);
             let sample = sample_raw.rgb;
-            let w_colour = exp(-abs(centre_lum - luminance(sample)) * inv_sigma);
-            let w_lf = exp(-abs(centre_raw.a - sample_raw.a) * 5.0);
-            let w = wy * kernel_weight(dx) * wn * wd * w_colour * w_lf;
-            if (w <= 1e-6) {
-                continue;
+            let base_w = wy * kernel_weight(dx) * wn * wd;
+            let w_rgb = base_w * exp(-abs(centre_lum - luminance(sample)) * inv_sigma);
+            if (w_rgb > 1e-6) {
+                sum = sum + sample * w_rgb;
+                weight_sum = weight_sum + w_rgb;
+                let moments = textureLoad(history_moments, p, 0);
+                moment1 = moment1 + moments.x * w_rgb;
+                moment2 = moment2 + moments.y * w_rgb;
             }
-            sum = sum + sample * w;
-            sum_lf = sum_lf + sample_raw.a * w;
-            weight_sum = weight_sum + w;
-            let moments = textureLoad(history_moments, p, 0);
-            moment1 = moment1 + moments.x * w;
-            moment2 = moment2 + moments.y * w;
+            if (filter_lf) {
+                let w_lf = base_w * exp(-abs(centre_raw.a - sample_raw.a) * 12.0);
+                if (w_lf > 1e-6) {
+                    sum_lf = sum_lf + sample_raw.a * w_lf;
+                    weight_sum_lf = weight_sum_lf + w_lf;
+                }
+            }
         }
     }
     let inv_w = 1.0 / weight_sum;
-    textureStore(out_colour, pixel, vec4<f32>(sum * inv_w, sum_lf * inv_w));
+    let out_lf = select(centre_raw.a, sum_lf / weight_sum_lf, filter_lf);
+    textureStore(out_colour, pixel, vec4<f32>(sum * inv_w, out_lf));
     textureStore(out_moments, pixel, vec4<f32>(moment1 * inv_w, moment2 * inv_w, centre_moments.z, centre_moments.w));
 }
 "#;
@@ -2040,6 +2093,8 @@ pub struct RaywatcherGpu {
     /// reconstruction providers and to the debug view.
     pub guide: wgpu::Texture,
     pub guide_view: wgpu::TextureView,
+    /// Previous frame's view-projection matrix for static camera reprojection.
+    prev_view_projection: Option<glam::Mat4>,
     /// Frames rendered since the last reset, saturating, for the history bit.
     frames: u32,
     /// Whether the last frame dispatched the trace pass.
@@ -2212,6 +2267,7 @@ impl RaywatcherGpu {
             output_view,
             guide,
             guide_view,
+            prev_view_projection: None,
             frames: 0,
             traced_last_frame: false,
         }
@@ -2594,6 +2650,7 @@ impl RaywatcherGpu {
             }
             self.gbuf_prep_bind_group = None;
             self.raster_copy = None;
+            self.prev_view_projection = None;
             self.frames = 0;
             return true;
         }
@@ -2708,6 +2765,7 @@ impl RaywatcherGpu {
         self.guide = guide;
         self.guide_view = guide_view;
         // A resize invalidates every reprojection.
+        self.prev_view_projection = None;
         self.frames = 0;
         true
     }
@@ -2959,10 +3017,17 @@ impl RaywatcherGpu {
                 depth_or_array_layers: 1,
             },
         );
+        let prev_vp = self.prev_view_projection;
         queue.write_buffer(
             &self.temporal_uniforms,
             0,
-            bytemuck::bytes_of(&DenoiseParams::pack(self.render_extent, 0, config, params)),
+            bytemuck::bytes_of(&DenoiseParams::pack(
+                self.render_extent,
+                0,
+                config,
+                params,
+                prev_vp,
+            )),
         );
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2983,6 +3048,7 @@ impl RaywatcherGpu {
                     iteration,
                     config,
                     params,
+                    prev_vp,
                 )),
             );
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3014,6 +3080,7 @@ impl RaywatcherGpu {
             pass.set_bind_group(0, &self.compose_bind_groups[final_plane], &[]);
             pass.dispatch_workgroups(rw.div_ceil(8), rh.div_ceil(8), 1);
         }
+        self.prev_view_projection = Some(params.view_projection);
     }
 
     /// Run NVIDIA DLSS Ray Reconstruction (`nvngx_dlssd.dll`) over the freshly
@@ -3342,6 +3409,7 @@ impl RaywatcherGpu {
     /// Forget the temporal history: a camera cut, a resize, or the module being
     /// switched off and on again.
     pub fn reset(&mut self) {
+        self.prev_view_projection = None;
         self.frames = 0;
     }
 
