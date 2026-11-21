@@ -424,6 +424,7 @@ mod tests {
     fn shipped_table_matches_the_known_counts() {
         let path = Path::new("google_drive/pw142/element/data/task_npc.data");
         if !path.exists() {
+            crate::pck::corpus_file_absent(&path);
             return;
         }
         let bytes = fs::read(path).unwrap();
@@ -458,10 +459,11 @@ mod tests {
     #[test]
     fn shipped_client_joins_every_placement_onto_an_npc_template() {
         let element = Path::new("google_drive/pw142/element");
-        if !element.join("data/elements.data").exists()
-            || !element.join("data/task_npc.data").exists()
-        {
-            return;
+        for required in ["data/elements.data", "data/task_npc.data"] {
+            if !element.join(required).exists() {
+                crate::pck::corpus_file_absent(&element.join(required));
+                return;
+            }
         }
         let population = Population::open(element).unwrap();
         assert_eq!(population.npc_templates, 2_838);

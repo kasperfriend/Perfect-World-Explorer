@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+#[path = "../angelica_pck.rs"]
+#[allow(dead_code)]
+mod angelica_pck;
 #[path = "../bmd.rs"]
 mod bmd;
 #[path = "../objects.rs"]

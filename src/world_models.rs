@@ -1,7 +1,7 @@
 //! Retain ECWLD model placements and shared model dependencies. Loading an
 //! asset does not choose an action namespace or invent an animation schedule.
 use crate::{ecmodel, model_asset::ModelAsset, scene::SceneModel};
-use std::{collections::HashMap, fs::File, path::Path};
+use std::{collections::HashMap, path::Path};
 
 pub struct Instance {
     pub placement: SceneModel,
@@ -74,9 +74,9 @@ impl Assets {
         if placements.is_empty() {
             return Ok(Self::load_with(placements, |_| unreachable!()));
         }
-        let mut file =
-            File::open(element.join("models.pck")).map_err(|e| format!("models.pck: {e}"))?;
-        let dir = crate::pck::directory(&mut file)?;
+        let mut package = crate::pck::Package::open(&element.join("models.pck"))
+            .map_err(|e| format!("models.pck: {e}"))?;
+        let dir = package.directory()?;
         let mut entries = HashMap::with_capacity(dir.len());
         for entry in dir {
             let name = ecmodel::normalize(&entry.name);
@@ -88,7 +88,7 @@ impl Assets {
             let entry = entries
                 .get(path)
                 .ok_or_else(|| format!("missing models.pck entry: {path}"))?;
-            crate::pck::read_entry(&mut file, entry)
+            package.read(entry)
         }))
     }
 }
@@ -106,6 +106,13 @@ pub fn transform(placement: &SceneModel) -> Result<glam::Mat4, String> {
     {
         return Err("invalid world model placement basis".into());
     }
+    // The version-13+ record carries a per-placement scale. It multiplies the
+    // basis, not the position: a static model stands where the map puts it and
+    // is drawn at the authored size.
+    if !placement.scale.is_finite() || placement.scale <= 0. {
+        return Err(format!("invalid world model scale {}", placement.scale));
+    }
+    let scale = placement.scale;
     let direction = direction.normalize();
     let up = up.normalize();
     let right = up.cross(direction);
@@ -113,9 +120,9 @@ pub fn transform(placement: &SceneModel) -> Result<glam::Mat4, String> {
         return Err("parallel world model placement axes".into());
     }
     Ok(glam::Mat4::from_cols(
-        right.normalize().extend(0.),
-        up.extend(0.),
-        direction.extend(0.),
+        (right.normalize() * scale).extend(0.),
+        (up * scale).extend(0.),
+        (direction * scale).extend(0.),
         position.extend(1.),
     ))
 }
@@ -130,6 +137,7 @@ mod tests {
             position: [10., 2., -3.],
             direction: [0., 0., 2.],
             up: [0., 2., 2.],
+            scale: 1.0,
             path: String::new(),
             action: String::new(),
         };
@@ -148,6 +156,48 @@ mod tests {
         assert!(transform(&p).is_err());
     }
     #[test]
+    fn the_authored_scale_sizes_the_basis_and_not_the_position() {
+        let p = SceneModel {
+            export_id: 1,
+            position: [10., 2., -3.],
+            direction: [0., 0., 1.],
+            up: [0., 1., 0.],
+            scale: 2.,
+            path: String::new(),
+            action: String::new(),
+        };
+        let m = transform(&p).unwrap();
+        // A doubled model is twice as wide, its axes twice as long, and it
+        // still stands exactly where the map placed it.
+        assert_eq!(m.w_axis.to_array(), [10., 2., -3., 1.]);
+        assert_eq!(m.x_axis.to_array(), [2., 0., 0., 0.]);
+        assert_eq!(m.y_axis.to_array(), [0., 2., 0., 0.]);
+        assert_eq!(m.z_axis.to_array(), [0., 0., 2., 0.]);
+        // The shipped values include exactly 1.0, the neutral scale, and the
+        // scale must be exactly linear in the basis: doubling it must double
+        // every axis and leave the position alone. An author who writes 2.0
+        // must get twice the model, not twice a rotation.
+        let mut p = p;
+        p.scale = 1.;
+        let one = transform(&p).unwrap();
+        assert_eq!(one.x_axis.to_array(), [1., 0., 0., 0.]);
+        p.scale = 2.;
+        let two = transform(&p).unwrap();
+        for (a, b) in one
+            .to_cols_array()
+            .into_iter()
+            .zip(two.to_cols_array().into_iter())
+        {
+            assert!((b - a * 2.).abs() < 1e-6 || (b - a).abs() < 1e-6);
+        }
+        // A scale of zero or less is not a size. Refuse it rather than
+        // collapsing the model to nothing or flipping it inside out.
+        for scale in [0., -1., f32::NAN] {
+            p.scale = scale;
+            assert!(transform(&p).is_err(), "scale {scale} was accepted");
+        }
+    }
+    #[test]
     fn failed_shared_assets_are_read_once_and_named() {
         let mut reads = 0;
         let placement = SceneModel {
@@ -155,6 +205,7 @@ mod tests {
             position: [0.; 3],
             direction: [0., 0., 1.],
             up: [0., 1., 0.],
+            scale: 1.0,
             path: "Models\\missing.ecm".into(),
             action: "visible".into(),
         };

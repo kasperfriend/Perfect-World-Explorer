@@ -18,6 +18,8 @@ mod archive;
 mod data;
 mod draw;
 mod nameplate;
+
+pub use nameplate::install_client_cjk;
 mod patrol;
 
 use self::{

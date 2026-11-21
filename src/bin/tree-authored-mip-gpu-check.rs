@@ -1,5 +1,14 @@
 //! Synthetic GPU regression: authored vegetation mip levels upload through FarTrees.
 #![allow(dead_code)]
+// `water.rs`, `far_trees_gpu.rs` and the grass loader report through
+// `crate::diag!`; a `#[path]` module set is its own crate root, so the stub
+// supplies it. See `support/diag_stub.rs`.
+#[macro_use]
+#[path = "support/diag_stub.rs"]
+mod diag_stub;
+#[allow(unused_imports)]
+pub use diag_stub::diagnostics;
+
 #[path = "../dxt.rs"]
 mod dxt;
 #[path = "../far_trees_gpu.rs"]
@@ -14,6 +23,8 @@ mod model_dds;
 mod pck;
 #[path = "../scene.rs"]
 mod scene;
+#[path = "../speedtree_version.rs"]
+mod speedtree_version;
 #[path = "../tree_lod.rs"]
 mod tree_lod;
 #[path = "../trees.rs"]
@@ -107,6 +118,9 @@ fn main() {
             tree_type: 0,
             position: [0., 0., 0.],
         }],
+        // These trees are here because the check put them here: the map did not
+        // switch them off, so there is no reason to show.
+        off_reason: None,
     };
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();

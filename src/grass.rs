@@ -85,6 +85,48 @@ pub struct Grass {
     /// The default world path ignores these; P4.07 opt-in uploads them verbatim.
     pub texture_mips: HashMap<String, Vec<image::RgbaImage>>,
 }
+impl Grass {
+    /// A map with no grass, for a map whose placement file cannot be read.
+    ///
+    /// The types still come from the scene, so the rest of the renderer sees
+    /// the same shape it always does; only `areas` is empty.
+    pub fn empty(scene: &scene::Scene) -> Self {
+        Self {
+            areas: Vec::new(),
+            types: scene.grass_types.clone(),
+            models: Vec::new(),
+            textures: HashMap::new(),
+            texture_mips: HashMap::new(),
+        }
+    }
+}
+/// Record one dropped placement without letting a bad area take the map down.
+fn note(sink: &std::sync::Mutex<Vec<String>>, message: String) {
+    if let Ok(mut notes) = sink.lock() {
+        notes.push(message);
+    }
+}
+
+/// Bounds on one MOXB mesh, from the 138 in the staged `grasses.pck`.
+///
+/// Measured maxima there are 56 vertices and 144 indices; these are set high
+/// enough that a genuine larger mesh still reads, and low enough that a damaged
+/// count cannot allocate a gigabyte.
+const MAX_MOXB_VERTICES: usize = 100_000;
+const MAX_MOXB_INDICES: usize = 300_000;
+
+/// Bound on the names a grass EC-BSD placement file declares.
+///
+/// Measured over 8 real placement files: the maximum is **88**
+/// (`world.ecbsd`, 2,678,024 B). The rest are far smaller -- `a91` 12, `a85`
+/// 9, `a64` and `login` 4, `a117`/`a79`/`a95` 1. The staged *packs* contain no
+/// EC-BSD at all; these files live under `maps/world/` in a full client, which
+/// is why the earlier note said the maximum was unavailable.
+///
+/// So the limit sits two orders of magnitude above the largest real table and
+/// is a guard against a damaged dword, not a statement about the format.
+const ECBSD_NAME_LIMIT: usize = 10_000;
+
 fn cstr<'a>(b: &'a [u8], start: usize) -> Result<(&'a [u8], usize), String> {
     let bytes = b.get(start..).ok_or("invalid MOXB string")?;
     let n = bytes
@@ -224,8 +266,23 @@ fn parse_model(b: &[u8], name: &str) -> Result<Model, String> {
         let nv = u(b, p)? as usize;
         let ni = u(b, p + 4)? as usize;
         let nf = u(b, p + 8)? as usize;
-        if nv == 0 || nv > 100_000 || ni == 0 || ni > 300_000 || ni % 3 != 0 || nf != 1 {
-            return Err("unsupported MOXB mesh".into());
+        // Measured over all 138 MOXB meshes in the staged `grasses.pck`: at most
+        // 56 vertices and 144 indices, and `nf` is exactly 1 in every one. The
+        // caps sit three orders of magnitude above those and exist to stop a
+        // damaged count from reserving memory. `nf != 1` is a different kind of
+        // check -- the mesh is one triangle-strip frame, and a file declaring
+        // more is a layout this reader has not been shown -- so it stays an
+        // equality and says so by name rather than joining the caps.
+        if nv == 0 || nv > MAX_MOXB_VERTICES || ni == 0 || ni > MAX_MOXB_INDICES || ni % 3 != 0 {
+            return Err(format!(
+                "unsupported MOXB mesh: {nv} vertices (limit {MAX_MOXB_VERTICES}), \
+                 {ni} indices (limit {MAX_MOXB_INDICES})"
+            ));
+        }
+        if nf != 1 {
+            return Err(format!(
+                "unsupported MOXB frame count {nf}; this build reads the one-frame layout"
+            ));
         }
         let tex = find(b, p, b"TEXTURE: ")?;
         let vertbytes = nv.checked_mul(32).ok_or("MOXB vertex overflow")?;
@@ -294,34 +351,119 @@ fn mask(b: &[u8], expected: usize) -> Result<Vec<u32>, String> {
     }
     Ok(out)
 }
+/// Read the EC-BSD name table, or as much of it as the file really holds.
+///
+/// A map whose placement file is missing, truncated or not a grass EC-BSD at
+/// all has no grass — but it is still a map. Returning `Err` here aborted the
+/// whole load, which reached the user as a modal box holding one internal
+/// string ("grass record index", "invalid grass compress size"). Nothing below
+/// this point needs the name table to be complete, so the failures are returned
+/// as notes and the caller decides what to keep.
+fn grass_names(
+    b: &[u8],
+    notes: &std::sync::Mutex<Vec<String>>,
+) -> Result<Vec<String>, &'static str> {
+    if b.len() < 0x4c {
+        return Err("the grass EC-BSD is shorter than its header");
+    }
+    // Same header check as the water and scenery readers: a revision other
+    // than 12 is read, not refused, because the layout below the header has
+    // not changed between the shipped revisions.
+    if crate::scene::ecbsd_header(b).is_err() {
+        return Err("the EC-BSD is not a placement file this build reads");
+    }
+    let n = u(b, 12).unwrap_or(0) as usize;
+    if n > ECBSD_NAME_LIMIT {
+        // This function returns `&'static str`, so the bound is reported by
+        // name rather than formatted. The largest real table is 88 names
+        // (`world.ecbsd`); see `ECBSD_NAME_LIMIT`.
+        return Err("the grass EC-BSD declares more names than a placement file can hold");
+    }
+    let mut p = 0x4c;
+    let mut names = Vec::new();
+    for index in 0..n {
+        match water::path_string(b, &mut p) {
+            Ok(name) => names.push(name),
+            Err(_) => {
+                note(
+                    notes,
+                    format!("grass EC-BSD name {index} of {n} is truncated"),
+                );
+                break;
+            }
+        }
+    }
+    Ok(names)
+}
+
 impl Grass {
     pub fn load(scene: &scene::Scene, dir: &Path, element: &Path) -> Result<Self, String> {
-        let b = fs::read(ecbsd_path(dir)).map_err(|e| e.to_string())?;
-        if u(&b, 0)? != 0x42584f4d || u(&b, 4)? != 0x42534446 || u(&b, 8)? != 12 {
-            return Err("unsupported grass EC-BSD".into());
-        }
-        let n = u(&b, 12)? as usize;
-        if n > 10000 {
-            return Err("invalid grass BSData count".into());
-        }
-        let mut p = 0x4c;
-        let mut names = Vec::new();
-        for _ in 0..n {
-            names.push(water::path_string(&b, &mut p)?)
-        }
+        // Diagnostics for placements that were dropped. Threads share one sink
+        // and it is summarised once, so a map with many odd areas prints a
+        // handful of lines instead of thousands. It has to exist before the
+        // header is read, because the header can fail too.
+        let notes: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let b = match fs::read(ecbsd_path(dir)) {
+            Ok(b) => b,
+            Err(error) => {
+                // No placement file at all is a map without grass, not a
+                // failure to open the map.
+                crate::diag!(
+                    TimingLoad,
+                    "Grass: no EC-BSD placement file in this map ({error}); the map loads without grass"
+                );
+                return Ok(Self::empty(scene));
+            }
+        };
+        let names = match grass_names(&b, &notes) {
+            Ok(names) => names,
+            Err(reason) => {
+                crate::diag!(TimingLoad, "Grass: {reason}; the map loads without grass");
+                return Ok(Self::empty(scene));
+            }
+        };
         let mut records = Vec::new();
         let mut seen = HashMap::new();
+        let mut skipped_blocks = 0usize;
         for block in &scene.blocks {
             for r in &block.grass {
                 if let Some(previous) = seen.insert(r.export_id, r.offset) {
                     if previous != r.offset {
-                        return Err("inconsistent grass record".into());
+                        // One export id with two offsets is a duplicated
+                        // reference. Drop the copy instead of the map.
+                        note(
+                            &notes,
+                            format!("grass export {} names two record offsets", r.export_id),
+                        );
+                        continue;
                     }
                     continue;
                 }
                 let off = r.offset as usize;
-                records.push((u(&b, off + 28)? as usize, records.len(), off));
+                // A placement offset past the end of the file costs this
+                // reference and nothing else.
+                match u(&b, off + 28) {
+                    Ok(index) => records.push((index as usize, records.len(), off)),
+                    Err(_) => {
+                        skipped_blocks += 1;
+                        if skipped_blocks <= 8 {
+                            note(
+                                &notes,
+                                format!("grass area at {off}: outside the EC-BSD placement file"),
+                            );
+                        }
+                    }
+                }
             }
+        }
+        if skipped_blocks > 8 {
+            note(
+                &notes,
+                format!(
+                    "{} more grass areas outside the EC-BSD placement file",
+                    skipped_blocks - 8
+                ),
+            );
         }
         // Read each BSData file exactly once, retaining only one at a time.
         // Restore original area order afterwards so draw order stays unchanged.
@@ -338,67 +480,155 @@ impl Grass {
             groups.push((idx, &records[g_start..g_end]));
             g_start = g_end;
         }
+        // A grass area that cannot be decoded is dropped on its own: the map
+        // still draws every other patch. Only a placement file that cannot be
+        // opened at all is reported once per group.
         let process_group = |&(index, group): &(usize, &[(usize, usize, usize)])| {
-            let name = names
-                .get(index)
-                .ok_or_else(|| "grass BSData index".to_string())?;
-            let path = water::resolve_case_insensitive(dir, name).map_err(|e| e.to_string())?;
-            let data = fs::read(path).map_err(|e| e.to_string())?;
-            if u(&data, 0).map_err(|e| e.to_string())? != 0x42584f4d
-                || u(&data, 4).map_err(|e| e.to_string())? != 2
-            {
-                return Err("unsupported grass BSData".to_string());
+            let Some(name) = names.get(index) else {
+                note(
+                    &notes,
+                    format!("BSData {index}: no name in the EC-BSD table"),
+                );
+                return Ok(Vec::new());
+            };
+            let path = match water::resolve_case_insensitive(dir, name) {
+                Ok(path) => path,
+                Err(_) => {
+                    note(&notes, format!("{name}: not in this map folder"));
+                    return Ok(Vec::new());
+                }
+            };
+            let data = match fs::read(&path) {
+                Ok(data) => data,
+                Err(error) => {
+                    note(&notes, format!("{name}: {error}"));
+                    return Ok(Vec::new());
+                }
+            };
+            // An authored-empty stub is a real file with a zero record count,
+            // not corruption: nothing was placed in this area, so there is
+            // nothing to decode.
+            if data.len() >= 16 {
+                let magic = u(&data, 0).unwrap_or(0);
+                let version = u(&data, 4).unwrap_or(0);
+                let count = u(&data, data.len() - 4).unwrap_or(u32::MAX);
+                if magic == 0x42584f4d && version == 2 && count == 0 {
+                    return Ok(Vec::new());
+                }
             }
-            let tail = data
-                .len()
-                .checked_sub(4)
-                .ok_or_else(|| "short grass BSData".to_string())?;
-            let count = u(&data, tail).map_err(|e| e.to_string())? as usize;
-            let table_len = count
+            if u(&data, 0).ok() != Some(0x42584f4d) || u(&data, 4).ok() != Some(2) {
+                note(&notes, format!("{name}: unsupported grass BSData"));
+                return Ok(Vec::new());
+            }
+            // Every bound below belongs to this one placement file. A file that
+            // does not describe a reachable record table is skipped with a note
+            // -- returning an error here is what turned one odd BSData file into
+            // a modal box over the whole map.
+            let Some(tail) = data.len().checked_sub(4) else {
+                note(&notes, format!("{name}: shorter than its own trailer"));
+                return Ok(Vec::new());
+            };
+            let count = u(&data, tail).unwrap_or(0) as usize;
+            let Some(table) = count
                 .checked_mul(4)
-                .ok_or_else(|| "grass table overflow".to_string())?;
-            let table = tail
-                .checked_sub(table_len)
-                .ok_or_else(|| "bad grass table".to_string())?;
+                .and_then(|table_len| tail.checked_sub(table_len))
+            else {
+                note(
+                    &notes,
+                    format!("{name}: record table of {count} does not fit the file"),
+                );
+                return Ok(Vec::new());
+            };
             let mut group_areas = Vec::with_capacity(group.len());
             for &(_, order, off) in group {
-                let type_id = u(&b, off).map_err(|e| e.to_string())? as usize;
+                // Every per-area read is checked and, on failure, this one area
+                // is dropped. Aborting here turned one odd area into a modal
+                // error that blanked every grass patch in the map.
+                let (Ok(type_id), Ok(cx), Ok(cy), Ok(cz)) =
+                    (u(&b, off), f(&b, off + 4), f(&b, off + 8), f(&b, off + 12))
+                else {
+                    note(
+                        &notes,
+                        format!("grass area at {off}: past the placement file"),
+                    );
+                    continue;
+                };
+                let type_id = type_id as usize;
                 if type_id >= scene.grass_types.len() {
-                    return Err("grass type index".to_string());
+                    note(&notes, format!("grass type {type_id} out of range"));
+                    continue;
                 }
-                let cx = f(&b, off + 4).map_err(|e| e.to_string())?;
-                let cy = f(&b, off + 8).map_err(|e| e.to_string())?;
-                let cz = f(&b, off + 12).map_err(|e| e.to_string())?;
                 let center = [cx, cy, cz];
-                let grid = f(&b, off + 16).map_err(|e| e.to_string())?;
-                let width = u(&b, off + 20).map_err(|e| e.to_string())? as usize;
-                let height = u(&b, off + 24).map_err(|e| e.to_string())? as usize;
+                let (Ok(grid), Ok(width), Ok(height)) =
+                    (f(&b, off + 16), u(&b, off + 20), u(&b, off + 24))
+                else {
+                    note(&notes, format!("grass area at {off}: short record"));
+                    continue;
+                };
+                let (width, height) = (width as usize, height as usize);
                 if width == 0
                     || height == 0
                     || width > 4096
                     || height > 4096
                     || width * height % 8 != 0
                 {
-                    return Err("grass mask size".to_string());
+                    note(&notes, format!("mask {width}x{height}"));
+                    continue;
                 }
-                let cells = width
-                    .checked_mul(height)
-                    .ok_or_else(|| "grass mask overflow".to_string())?;
+                let Some(cells) = width.checked_mul(height) else {
+                    note(&notes, format!("grass area at {off}: mask size overflows"));
+                    continue;
+                };
                 let bytes = cells / 8;
-                let rec = u(&b, off + 32).map_err(|e| e.to_string())? as usize;
+                let Ok(rec) = u(&b, off + 32) else {
+                    note(&notes, format!("grass area at {off}: no record index"));
+                    continue;
+                };
+                let rec = rec as usize;
+                let Some(row) = rec
+                    .checked_mul(4)
+                    .and_then(|row| table.checked_add(row))
+                    .map(|at| u(&data, at))
+                else {
+                    note(&notes, format!("area at {off}: record {rec}"));
+                    continue;
+                };
+                let Ok(start) = row.map(|s| s as usize) else {
+                    note(&notes, format!("area at {off}: record {rec}"));
+                    continue;
+                };
                 if rec >= count {
-                    return Err("grass record index".to_string());
+                    note(&notes, format!("area at {off}: record {rec} of {count}"));
+                    continue;
                 }
-                let start = u(&data, table + rec * 4).map_err(|e| e.to_string())? as usize;
-                let stored = u(&data, start).map_err(|e| e.to_string())? as usize;
-                let raw = u(&data, start + 4).map_err(|e| e.to_string())? as usize;
+                let (Ok(stored), Ok(raw)) = (u(&data, start), u(&data, start + 4)) else {
+                    note(&notes, format!("area at {off}: record {rec} header"));
+                    continue;
+                };
+                let (stored, raw) = (stored as usize, raw as usize);
+                // The record's uncompressed size must be the area's own cell
+                // count. A mismatch means the index points at a different
+                // area's row, not that the map is unreadable.
                 if raw != bytes || stored > bytes * 2 + 1024 {
-                    return Err("invalid grass compressed size".to_string());
+                    note(
+                        &notes,
+                        format!(
+                            "area at {off}: record {rec} holds {raw} bytes for a {bytes}-byte mask"
+                        ),
+                    );
+                    continue;
                 }
-                let src = data
-                    .get(start + 8..start + 8 + stored)
-                    .ok_or_else(|| "short grass compressed bitmap".to_string())?;
-                let output = crate::pck::inflate(src, bytes)?;
+                let Some(src) = data.get(start + 8..start + 8 + stored) else {
+                    note(&notes, format!("area at {off}: record {rec} is truncated"));
+                    continue;
+                };
+                let Ok(output) = crate::pck::inflate(src, bytes) else {
+                    note(
+                        &notes,
+                        format!("area at {off}: record {rec} does not inflate"),
+                    );
+                    continue;
+                };
                 let count = output.iter().map(|byte| byte.count_ones() as usize).sum();
                 let active = ActiveMask {
                     packed: src.to_vec(),
@@ -446,7 +676,35 @@ impl Grass {
         };
         let mut areas = Vec::with_capacity(records.len());
         for res in bsd_results {
-            areas.extend(res?);
+            match res {
+                Ok(group) => areas.extend(group),
+                // A group is one placement file. Failing it costs that file's
+                // areas, never the map, which is the whole point of the
+                // per-area tolerance above.
+                Err(reason) => note(&notes, reason),
+            }
+        }
+        // Name what was dropped, once per distinct reason. Silence here would
+        // hide a map whose grass is thinner than the archive says it is.
+        {
+            let notes = notes.into_inner().unwrap_or_default();
+            let mut seen = HashSet::new();
+            let mut listed = 0usize;
+            for note in &notes {
+                if !seen.insert(note.as_str()) {
+                    continue;
+                }
+                listed += 1;
+                if listed <= 8 {
+                    eprintln!("grass placement skipped: {note}");
+                }
+            }
+            if seen.len() > 8 {
+                eprintln!(
+                    "grass placement skipped: {} further reasons not listed",
+                    seen.len() - 8
+                );
+            }
         }
         areas.sort_by_key(|a| a.0);
         let areas: Vec<_> = areas.into_iter().map(|(_, area)| area).collect();
@@ -454,11 +712,52 @@ impl Grass {
         let active: usize = areas.iter().map(|a| a.active.len()).sum();
         eprintln!("Grass placement residency: {:.2} MiB compressed bitmaps; {} live cells; avoided {:.2} MiB of eager IDs/transforms", packed as f64 / 1048576., active,
             active as f64 * (4 + std::mem::size_of::<random::Placement>()) as f64 / 1048576.);
-        let mut archive = File::open(element.join("grasses.pck")).map_err(|e| e.to_string())?;
-        let entries: HashMap<_, _> = pck::directory(&mut archive)?
-            .into_iter()
-            .map(|e| (e.name.to_lowercase(), e))
-            .collect();
+        // `grasses.pck` is an Angelica container, not a retail v2 PCK: its
+        // entries sit behind the 0x4dca23ef prefix with no `fdfdfeee` guard
+        // words, so `pck::directory` rejects it outright. Both containers are
+        // tried, and a pack that fails both leaves the placements in place
+        // without geometry rather than failing the whole load.
+        let mut archive = match File::open(element.join("grasses.pck")) {
+            Ok(file) => file,
+            Err(error) => {
+                eprintln!(
+                    "grass geometry unavailable ({}): {error}",
+                    element.display()
+                );
+                return Ok(Self {
+                    areas,
+                    types: scene.grass_types.clone(),
+                    models: Vec::new(),
+                    textures: HashMap::new(),
+                    texture_mips: HashMap::new(),
+                });
+            }
+        };
+        let directory = match pck::directory(&mut archive) {
+            Ok(entries) => Ok(entries),
+            Err(v2) => match crate::angelica_pck::directory(&mut archive) {
+                Ok(entries) => Ok(entries),
+                Err(angelica) => Err(format!(
+                    "grasses.pck is neither container: v2: {v2}; Angelica: {angelica}"
+                )),
+            },
+        };
+        let entries: HashMap<_, _> = match directory {
+            Ok(entries) => entries
+                .into_iter()
+                .map(|e| (e.name.to_lowercase(), e))
+                .collect(),
+            Err(error) => {
+                eprintln!("grass geometry unavailable: {error}");
+                return Ok(Self {
+                    areas,
+                    types: scene.grass_types.clone(),
+                    models: Vec::new(),
+                    textures: HashMap::new(),
+                    texture_mips: HashMap::new(),
+                });
+            }
+        };
         let mut models = Vec::with_capacity(scene.grass_types.len());
         let mut textures = HashMap::new();
         let mut texture_mips = HashMap::new();
@@ -591,6 +890,62 @@ mod tests {
     fn bits_are_most_significant_first() {
         assert_eq!(mask(&[0x81, 0x40], 2).unwrap(), vec![0, 7, 9]);
         assert!(mask(&[0], 2).is_err())
+    }
+    /// The largest real name table is 88 (`world.ecbsd`); versions 17 and 18
+    /// both ship, and `ecbsd_header` gates on identity only, so both read.
+    /// `ECBSD_NAME_LIMIT` must stay far above the measured maximum -- a cap
+    /// that a real client trips is a refusal, not a guard.
+    #[test]
+    fn the_name_limit_is_above_every_measured_table() {
+        let notes = std::sync::Mutex::new(Vec::new());
+        for (version, count) in [(18u32, 88u32), (17, 1), (18, 12), (18, 4)] {
+            let mut b = vec![0u8; 0x4c + 64 * count as usize];
+            b[0..4].copy_from_slice(&0x42584f4du32.to_le_bytes());
+            b[4..8].copy_from_slice(&0x42534446u32.to_le_bytes());
+            b[8..12].copy_from_slice(&version.to_le_bytes());
+            b[12..16].copy_from_slice(&count.to_le_bytes());
+            let mut p = 0x4c;
+            for i in 0..count {
+                let name = format!("BSData/{}.dat", i + 1);
+                b[p..p + 4].copy_from_slice(&(name.len() as u32).to_le_bytes());
+                b[p + 4..p + 4 + name.len()].copy_from_slice(name.as_bytes());
+                p += 4 + name.len();
+            }
+            let names = grass_names(&b[..p], &notes)
+                .unwrap_or_else(|e| panic!("v{version} with {count} names must read, got {e}"));
+            assert_eq!(names.len(), count as usize, "v{version} {count} names");
+        }
+        assert!((88usize) < ECBSD_NAME_LIMIT);
+    }
+
+    #[test]
+    fn a_placement_file_that_is_not_grass_ec_bsd_costs_only_the_grass() {
+        // The reported failure was a modal box holding "grass record index":
+        // `Grass::load` returned `Err` from inside its per-group closure, and
+        // the caller's `?` took the whole map down. A header the build does not
+        // read is now a note plus an empty grass set, so this must be `Ok`.
+        let notes = std::sync::Mutex::new(Vec::new());
+        assert!(grass_names(b"", &notes).is_err());
+        assert!(grass_names(b"not an ec-bsd file at all", &notes).is_err());
+        // A well-formed header with a truncated name table keeps the names it
+        // managed to read instead of failing.
+        let mut b = Vec::new();
+        b.extend_from_slice(&0x42584f4du32.to_le_bytes());
+        b.extend_from_slice(&0x42534446u32.to_le_bytes());
+        b.extend_from_slice(&12u32.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.resize(0x4c, 0);
+        // Names are a length word followed by GBK bytes, not NUL-terminated.
+        b.extend_from_slice(&15u32.to_le_bytes());
+        b.extend_from_slice(b"grasses/one.bsd");
+        let names = grass_names(&b, &notes).unwrap();
+        assert_eq!(names, vec!["grasses/one.bsd".to_string()], "got {names:?}");
+        // A name whose length byte runs past the file is the truncation the
+        // reported modal came from: the names that did read are kept.
+        let mut cut = b.clone();
+        cut.truncate(0x4c + 4 + 5);
+        let kept = grass_names(&cut, &notes).unwrap();
+        assert!(kept.is_empty(), "got {kept:?}");
     }
     #[test]
     fn truncated_mox_fails() {

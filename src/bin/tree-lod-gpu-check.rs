@@ -1,5 +1,14 @@
 //! Synthetic GPU regression: identical LOD snapshots must not flicker or double-darken.
 #![allow(dead_code)]
+// `water.rs`, `far_trees_gpu.rs` and the grass loader report through
+// `crate::diag!`; a `#[path]` module set is its own crate root, so the stub
+// supplies it. See `support/diag_stub.rs`.
+#[macro_use]
+#[path = "support/diag_stub.rs"]
+mod diag_stub;
+#[allow(unused_imports)]
+pub use diag_stub::diagnostics;
+
 #[path = "../dxt.rs"]
 mod dxt;
 #[path = "../far_trees_gpu.rs"]
@@ -14,6 +23,8 @@ mod model_dds;
 mod pck;
 #[path = "../scene.rs"]
 mod scene;
+#[path = "../speedtree_version.rs"]
+mod speedtree_version;
 #[path = "../tree_lod.rs"]
 mod tree_lod;
 #[path = "../trees.rs"]
@@ -107,6 +118,9 @@ pub fn run(authored_mips: bool) {
             tree_type: 0,
             position: [0., 0., 0.],
         }],
+        // These trees are here because the check put them here: the map did not
+        // switch them off, so there is no reason to show.
+        off_reason: None,
     };
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&Default::default())).unwrap();
@@ -519,7 +533,11 @@ fn multi_group(device: &wgpu::Device, queue: &wgpu::Queue) {
             position: [0., 0., 0.],
         })
         .collect();
-    let trees = trees::Trees { types, placements };
+    let trees = trees::Trees {
+        types,
+        placements,
+        off_reason: None,
+    };
     // The LOD pass never reads the camera uniform; the forest only has to bind
     // one, so nothing here is drawn through it.
     let camera = device.create_buffer(&wgpu::BufferDescriptor {

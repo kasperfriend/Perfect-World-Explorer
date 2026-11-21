@@ -2,6 +2,9 @@
 #[path = "../bmd.rs"]
 mod bmd;
 // The baked draw-state table is shared with the production scenery path.
+#[path = "../angelica_pck.rs"]
+#[allow(dead_code)]
+mod angelica_pck;
 #[path = "../bmd_baked.rs"]
 mod bmd_baked;
 #[path = "../objects.rs"]

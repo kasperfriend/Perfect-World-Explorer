@@ -34,42 +34,114 @@ pub fn destinations_for_world(path: &Path, world_ids: &[u32]) -> Result<Vec<Dest
     let text = String::from_utf16(&words).map_err(|e| e.to_string())?;
     parse_destinations(text.trim_start_matches('\u{feff}'), world_ids)
 }
+/// One authored row, or `None` for a line that carries no destination.
+///
+/// The client's own tables are hand-edited text and are not uniform, which is
+/// why this tolerates more than one shape. These four rows are the real
+/// contents of 1.5.2's and 1.8.4's `world/world_targets.txt` (89 rows each):
+///
+/// ```text
+/// 1001\t雪霏村\t1\t"-2545.362,215.254,4116.355"\t1       name unquoted
+/// 1001\t"Снежная деревня"\t1\t"-2545.362,215.254,4116.355"\t1  name quoted
+/// 9047    九冕尘寰台\t161\t"-799.016,45,-282.283"\t-1        space for a tab
+/// 9048\t萝会城\t\t161\t"-162.798,36,299.386"\t-1          empty column
+/// ```
+///
+/// Fields are now found by what they hold rather than by their position:
+///
+/// * the position is the only field holding two commas;
+/// * the name is the first non-empty field before it that is not a number, so
+///   the empty column cannot be mistaken for one;
+/// * the id is the leading run of digits of the first field, which is how the
+///   row that used a space for a tab still yields `9047` rather than a name
+///   glued to its id;
+/// * the world/group column is the last integer after the name, which is the
+///   column the client filters instances on.
+///
+/// A line with a position but no name is still an error: that is a real
+/// authoring fault, and dropping it silently would hide a destination.
+///
+/// Refusing anything else made every one of 1.5.2's 89 rows invalid -- the old
+/// reader demanded five tab-separated fields, a quoted name and a numeric
+/// third -- so the main world listed no destinations at all.
+fn parse_destination(line: &str, world_ids: &[u32]) -> Result<Option<Destination>, String> {
+    let trimmed = line.trim().trim_start_matches('\u{feff}');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let unquote = |s: &str| -> String { s.trim().trim_matches('"').trim().to_string() };
+    let mut fields: Vec<String> = trimmed.split('\t').map(unquote).collect();
+    // Some rows used spaces for the tab between the id and the name, so the
+    // first field arrives as `9045    赢霄城`. Split the leading digits off it
+    // and keep the rest as the name; a name that itself contains a space
+    // survives because only the first run of whitespace is consumed.
+    let first = fields[0].clone();
+    let digits = first.len() - first.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits > 0
+        && digits < first.len()
+        && first[digits..].starts_with(|c: char| c.is_whitespace())
+    {
+        let (id, rest) = first.split_at(digits);
+        fields[0] = id.trim().to_string();
+        fields.insert(1, rest.trim().to_string());
+    }
+    let Some(at) = fields.iter().position(|f| f.matches(',').count() == 2) else {
+        // No position anywhere: a comment or a blank row, not a destination.
+        return Ok(None);
+    };
+    let position = fields[at]
+        .split(',')
+        .map(|p| p.trim().parse::<f32>())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+        .filter(|v| v.len() == 3 && v.iter().all(|x| x.is_finite()))
+        .map(|v| [v[0], v[1], v[2]])
+        .ok_or_else(|| format!("invalid destination coordinates {:?}", fields[at]))?;
+    let name_at = fields[..at]
+        .iter()
+        .position(|f| {
+            !f.is_empty() && f.parse::<f32>().is_err() && !f.chars().all(|c| c.is_ascii_digit())
+        })
+        .ok_or_else(|| format!("invalid destination name at {position:?}"))?;
+    let id = fields
+        .first()
+        .map(|f| f.trim_start_matches(|c: char| !c.is_ascii_digit()))
+        .map(|f| f.trim_end_matches(|c: char| !c.is_ascii_digit()))
+        .and_then(|f| f.parse::<u32>().ok())
+        .ok_or_else(|| format!("invalid destination ID in {line:?}"))?;
+    // The column the client filters instances on: the last integer after the
+    // name. A row that leaves it empty claims nothing and stays in every map.
+    let world_id = fields[name_at + 1..]
+        .iter()
+        .take(at - name_at - 1)
+        .filter_map(|f| f.parse::<u32>().ok())
+        .next_back()
+        .unwrap_or(0);
+    if !world_ids.is_empty() && world_id != 0 && !world_ids.contains(&world_id) {
+        return Ok(None);
+    }
+    Ok(Some(Destination {
+        id,
+        // A Chinese client authors this list in Chinese (`1001\t雪霏村\t...`).
+        // The zone banner and the precinct fallback below already translate
+        // their names; this list did not, which is why a 1.5.2 client still
+        // showed a Chinese destination list under an English interface. Doing
+        // it here rather than at the two call sites means a destination is
+        // English wherever it is displayed, including the map and the minimap.
+        name: crate::world_place_names::english(fields[name_at].trim()).to_string(),
+        position,
+    }))
+}
 fn parse_destinations(text: &str, world_ids: &[u32]) -> Result<Vec<Destination>, String> {
     let mut result = Vec::new();
     for (number, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let fields = line.split('\t').map(str::trim).collect::<Vec<_>>();
-        if fields.len() < 5 {
-            return Err(format!("invalid destination line {}", number + 1));
-        }
-        let id = fields[0]
-            .parse()
-            .map_err(|_| format!("invalid destination ID on {}", number + 1))?;
-        let name = fields[1]
-            .strip_prefix('"')
-            .and_then(|s| s.strip_suffix('"'))
-            .ok_or("invalid destination name")?
-            .to_string();
-        let coords = fields[3]
-            .trim_matches('"')
-            .split(',')
-            .map(str::parse::<f32>)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| "invalid destination coordinates")?;
-        if name.is_empty() || coords.len() != 3 || coords.iter().any(|v| !v.is_finite()) {
-            return Err(format!("invalid destination at {}", number + 1));
-        }
-        // Teleport only within the loaded world/instance: do not silently send
-        // the camera to coordinates authored for a different coordinate space.
-        let world_id = fields[2].parse::<u32>().unwrap_or(0);
-        if world_ids.is_empty() || world_ids.contains(&world_id) {
-            result.push(Destination {
-                id,
-                name,
-                position: [coords[0], coords[1], coords[2]],
-            });
+        match parse_destination(line, world_ids) {
+            Ok(Some(destination)) => result.push(destination),
+            Ok(None) => {}
+            Err(error) => return Err(format!("destination line {}: {error}", number + 1)),
         }
     }
     result.sort_by(|a, b| {
@@ -281,6 +353,87 @@ pub fn original_minimap_for_map(element: &Path, zone: &str) -> Result<image::Rgb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The row shapes the shipped `world_targets.txt` files really contain.
+    ///
+    /// Copied from the two authored tables, not invented. All four were
+    /// rejected by the reader that required five tab-separated fields and a
+    /// quoted name, which is why 1.5.2's main world listed no destinations.
+    ///
+    /// The two `雪霏村` rows are the same destination in the Chinese and the
+    /// Russian client, so they carry different ids here even though a single
+    /// client never ships both: the list is sorted by name, and two entries
+    /// with one id make `by_id` ambiguous.
+    #[test]
+    fn hand_edited_destination_rows_still_yield_a_target() {
+        let text = [
+            "1001\t雪霏村\t1\t\"-2545.362,215.254,4116.355\"\t1",
+            "1002\t\"Снежная деревня\"\t1\t\"-2545.362,215.254,4116.355\"\t1",
+            "9047    九冕尘寰台\t161\t\"-799.016,45,-282.283\"\t-1",
+            "9048\t萝会城\t\t161\t\"-162.798,36,299.386\"\t-1",
+            "9045    赢霄城\t1\t\"3545.439,282,3051.461\"\t52\t",
+        ]
+        .join("\n");
+        let list = parse_destinations(&text, &[]).unwrap();
+        assert_eq!(
+            list.len(),
+            5,
+            "every hand-edited row is a destination: {list:?}"
+        );
+        let by_id = |id: u32| list.iter().find(|d| d.id == id).unwrap().clone();
+        // A Chinese name is read and then translated; the geometry is untouched.
+        assert_eq!(by_id(1001).name, "Snowy Village");
+        assert_eq!(by_id(1001).position, [-2545.362, 215.254, 4116.355]);
+        // The quoted row keeps its text and loses only the quotes. Russian has no
+        // entry, so it is shown as authored -- better than a placeholder.
+        assert!(list.iter().any(|d| d.name == "Снежная деревня"));
+        // The space-for-tab row keeps its id as an id, not part of the name.
+        assert_eq!(by_id(9047).name, "九冕尘寰台");
+        assert_eq!(by_id(9047).position, [-799.016, 45., -282.283]);
+        // The row with the empty column finds the position, not the gap.
+        assert_eq!(by_id(9048).name, "Lorreway City");
+        assert_eq!(by_id(9048).position, [-162.798, 36., 299.386]);
+        assert_eq!(by_id(9045).position, [3545.439, 282., 3051.461]);
+    }
+
+    /// The column the client filters instances on is the one after the name,
+    /// and a row that leaves it empty belongs to whatever map is loaded.
+    #[test]
+    fn the_world_column_selects_the_map_the_row_is_authored_for() {
+        let text = [
+            "1001\t雪霏村\t1\t\"0,0,0\"\t1",
+            "9048\t萝会城\t\t161\t\"0,0,0\"\t-1",
+            "9100\t横天阙\t161\t\"0,0,0\"\t-1",
+        ]
+        .join("\n");
+        let ids = |worlds: &[u32]| {
+            let mut v = parse_destinations(&text, worlds)
+                .unwrap()
+                .into_iter()
+                .map(|d| d.id)
+                .collect::<Vec<_>>();
+            v.sort_unstable();
+            v
+        };
+        // 9048's column is the empty one before `161`, so it claims 161: the
+        // main world keeps only its own row.
+        assert_eq!(ids(&[1]), [1001]);
+        // The instance keeps both rows that name it.
+        assert_eq!(ids(&[161]), [9048, 9100]);
+        // No filter at all lists every authored row.
+        assert_eq!(ids(&[]), [1001, 9048, 9100]);
+    }
+
+    /// A position with no name is an authoring fault worth reporting, and a
+    /// line with no position is not a destination row at all.
+    #[test]
+    fn a_position_without_a_name_is_an_error_not_a_silent_drop() {
+        let error = parse_destinations("1001\t\t1\t\"1,2,3\"\t1", &[]).unwrap_err();
+        assert!(error.contains("invalid destination name"), "{error}");
+        assert!(parse_destinations("just a comment", &[])
+            .unwrap()
+            .is_empty());
+    }
 
     #[test]
     fn client_map_tile_names_follow_the_archive() {

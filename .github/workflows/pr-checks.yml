@@ -7,8 +7,13 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # `contents: write` is for the `ci-results` branch only: the measurement JSON
+  # is committed there because the job log is not readable from the agent's
+  # side, so a printed number is a number nobody can check.
+  contents: write
   pull-requests: write
+  # The Windows packaging audit downloads the artifact through the REST API.
+  actions: read
 
 concurrency:
   group: pr-checks-${{ github.event.pull_request.number || github.ref }}
@@ -84,12 +89,132 @@ jobs:
           # refuses at CreateFeature — so the table is checked against the
           # vendored headers (and the DLL exports, and the packaged layout).
           python3 tools/verify-vendor-sdks.py
+      - name: Guard the offline harness against silent failures
+        run: |
+          # Two failure modes in `tools/offline_harness.sh` are invisible when
+          # they happen, and both have already cost real test coverage:
+          #
+          #   1. A duplicated `case` label. The shell takes the first match, so
+          #      the later arm is dead code. Two arms were once both labelled
+          #      `music`, and the 27-test precinct suite behind one of them had
+          #      never run.
+          #   2. An unescaped backtick inside an unquoted heredoc body. The
+          #      harness writes generated Rust through those heredocs, so the
+          #      shell *executes* whatever sits between a pair of backticks and
+          #      writes the empty result into the file. Four instances were found
+          #      this way; the only symptom was one stray line on stderr.
+          #
+          # Neither is a compile error and neither fails a test, so this has to
+          # be its own gate. `harness.sh check` runs it too; this makes it run on
+          # a machine that has no offline toolchain.
+          python3 tools/check-harness.py
+          # Every binary reaches some `src/*.rs` module through `#[path]`, and
+          # any `crate::x` inside those files has to be declared by the binary
+          # too. `cargo check --bins` below is what really proves it, but it
+          # fails one target at a time and its log is often unretrievable; this
+          # names the file and the module without a toolchain. It is a closure
+          # check, not a compile: a module can be declared and still need
+          # `wgpu`, which is why the two are not redundant.
+          for binary in src/bin/*.rs; do
+            missing="$(python3 tools/binary-module-closure.py "$binary")" || exit 1
+            if [ -n "$missing" ]; then
+              echo "::error file=$binary::declares no module for: $missing"
+              exit 1
+            fi
+            short="$(python3 tools/binary-field-closure.py "$binary")" || exit 1
+            if [ -n "$short" ]; then
+              echo "::error file=$binary::$short"
+              exit 1
+            fi
+          done
+      # The register quotes measurements of files that are not in this
+      # checkout -- "the 1.8.4 precinct is 383 zones, 783 tracks" describes the
+      # world map's 885 KB file, while the one staged beside the maps is 29
+      # zones with no ambience. `matrix` and `instance` already read precincts;
+      # this mode prints what a file actually holds, so a number in prose has
+      # something to be checked against. It runs on whatever the workspace has
+      # and is skipped, loudly, when nothing is staged.
+      # `src/view_settings.rs`'s tests are P8.07 -- "all settings are
+      # persistent, have clear defaults and apply consistently". They live in
+      # `src/bin/...`-less module space and were only ever compiled by the
+      # viewer binary, so no gate ran them. `settings` runs them, and its stub of
+      # the five fps enums is generated from `main.rs` and checked for staleness,
+      # because those enums ARE the persisted spellings.
+      - name: Settings persistence
+        # The step log cannot be read from the agent's side, and this step has
+        # twice failed with no annotation at all, which makes the failure
+        # undiagnosable. Capture the output and republish the tail as
+        # annotations, which *are* readable. Chunked because an annotation is
+        # capped in length.
+        run: bash tools/ci-run-and-annotate.sh settings
+      # The baked draw-state table: stage, alpha test, cull, blend and the
+      # z-fight/winding rules, including which meshes a mirrored placement may
+      # reverse. `cargo test` above does reach these, but only as part of the
+      # whole viewer binary; this runs them alone, so a failure names the table.
+      - name: Baked draw-state table
+        run: bash tools/ci-run-and-annotate.sh bmd-baked
+      # The decoded-texture cache, its byte-budgeted LRU and the world model
+      # list. P3.08 cites the eviction test as its residency proof, and until
+      # now nothing outside the viewer target compiled it.
+      - name: Texture cache and world model list
+        run: bash tools/ci-run-and-annotate.sh objects
+      # The launcher's own tests. `src/launcher_ui.rs` is `#[cfg(windows)]`, so
+      # nothing on this job compiled it; the mode strips its two `#[link]`
+      # attributes into a copy and runs the module's five tests, including the
+      # persistence of its low-memory checkbox.
+      - name: Launcher settings
+        run: bash tools/ci-run-and-annotate.sh launcher
+      - name: Measure staged precinct files
+        run: |
+          # An array, not a newline-joined string: `$roots` unquoted from
+          # `ls -d` splits on the newline and hands the binary one argument
+          # that is two paths, which it then reports as a usage error.
+          roots=()
+          [ -d google_drive ] && roots+=(google_drive)
+          for d in /tmp/clients/*/element/maps; do
+            [ -d "$d" ] && roots+=("$d")
+          done
+          if [ ${#roots[@]} -eq 0 ]; then
+            echo "::notice::no staged precinct.clt; the precinct census did not run"
+            exit 0
+          fi
+          cargo run --locked --bin precinct-check -- "${roots[@]}"
       - name: Test requirement status audits
         run: |
           python3 tools/test_phase1_ready.py
           python3 tools/test_eight_phase_status.py
+          # The archive census's own classification table. It reported 2,439
+          # `.gfx`/`.sgc` effect members as unparsed because the table listed
+          # neither extension; these tests keep that from happening again.
+          python3 -m unittest tools.test_archive_census
+          # The DDS survey's format table, checked against `model_dds.rs`
+          # rather than against a pack -- its first version reported 33 members
+          # as unreadable that the parser has always accepted.
+          python3 -m unittest tools.test_dds_survey
+          # The T2LM survey. The reader demanded a 256 tile edge while three of
+          # the four staged `.t2lm` files are 128, so every login map and the
+          # 128-tile world maps were refused outright. This pins the survey to
+          # the reader for both shipped edges.
+          python3 -m unittest tools.test_lightmap_survey
+          # The EC-BSD survey measures `ECBSD_NAME_LIMIT`. The cap used to be
+          # documented as unmeasurable because the staged packs hold no EC-BSD;
+          # they live under `maps/world/` instead, and the largest real table is
+          # 88 names against a limit of 10,000.
+          python3 -m unittest tools.test_ecbsd_survey
           python3 tools/check-eight-phase-status.py
+          # The register's row count is quoted in TODO.md and the PR body. It
+          # said 62 while the file held 61, which is the kind of number nobody
+          # re-derives. This prints it, and the status audit below fails if the
+          # total the docs claim stops matching.
+          python3 tools/count-register.py 61
           python3 tools/audit-static-model-gpu-programs.py
+          # Every site that drops a load result must be classified, and every
+          # allowance must still name a real site. The second half was missing:
+          # the file is keyed path:line, so editing anything above an allowance
+          # silently retargeted it to whatever line moved into its place, and a
+          # stale one kept justifying code that had gone. It found two the first
+          # time it ran.
+          python3 tools/audit-silent-drops.py --check
           rustc --edition=2021 --test src/scenery_visibility.rs -o /tmp/scenery-visibility-tests
           /tmp/scenery-visibility-tests
           # Phase 5 sky-swap machine: standalone, so a failure names the recovered
@@ -133,7 +258,7 @@ jobs:
           exit "$status"
       - name: Run viewer unit tests
         run: |
-          CARGO_TERM_COLOR=never cargo test --locked --bin perfect-world-explorer 2>&1 | tee /tmp/cargo-test.log
+          CARGO_TERM_COLOR=never cargo test --locked --bin perfect-world-explorer -- --show-output 2>&1 | tee /tmp/cargo-test.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
             # Preserve compiler spans/help next to a test-only type error; the
@@ -146,7 +271,143 @@ jobs:
             sed -n '/^failures:$/,/^test result:/p' /tmp/cargo-test.log | head -30 \
               | while IFS= read -r line; do [ -n "$line" ] && echo "::error::$line"; done
           fi
+          # Every corpus test that could not look at the data prints SKIPPED
+          # and is counted on stderr; a run that never says so is claiming
+          # coverage it did not measure. Put the count in the job summary so a
+          # skip cannot pass as a pass, and fail if the run skipped at all
+          # without anyone saying why (2.11).
+          # `grep -c` exits 1 when it finds nothing, which `set -e` would turn
+          # into a failed job on the *good* path; the `|| true` keeps the count
+          # and drops only the exit status.
+          skipped=$(grep -c 'SKIPPED: ' /tmp/cargo-test.log || true)
+          skipped=${skipped:-0}
+          # `awk`, not `bc`: the runner image is not guaranteed to carry `bc`,
+          # and a missing calculator must not silently report zero tests.
+          # The count sits immediately before `passed;` (with the semicolon),
+          # so match the *next* field as a prefix rather than for equality.
+          passed=$(awk '/test result: ok\./ {
+              for (i = 1; i <= NF; i++)
+                  if ($(i + 1) ~ /^passed/) total += $i
+            } END { print total + 0 }' /tmp/cargo-test.log)
+          {
+            echo "### Viewer unit tests"
+            echo ""
+            echo "| | count |"
+            echo "|---|---|"
+            echo "| passed | ${passed:-0} |"
+            echo "| skipped (no corpus file) | ${skipped:-0} |"
+            echo ""
+            if [ "${skipped:-0}" -gt 0 ]; then
+              echo "A skipped corpus test proves nothing about the shipped data:"
+              echo "its archive is not staged on this runner. Each line below names"
+              echo "the file it could not open."
+              echo ""
+              echo '```'
+              grep 'SKIPPED: ' /tmp/cargo-test.log | head -40 || true
+              echo '```'
+            else
+              echo "No test skipped: every corpus assertion looked at its data."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          python3 -c 'import json, sys; p, s, log, dst = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4]; reasons = [l.strip() for l in open(log, encoding="utf-8", errors="replace") if "SKIPPED: " in l]; json.dump({"passed": p, "skipped": s, "skipped_reasons": reasons}, open(dst, "w", encoding="utf-8"), indent=2)' "${passed:-0}" "${skipped:-0}" /tmp/cargo-test.log /tmp/test-summary.json
           exit "$status"
+      # The measurement channel. The job log comes back empty through the API,
+      # so every number the compatibility matrix needs is written as JSON and
+      # committed to a branch instead of printed. The matrix tool refuses to
+      # exit zero if any category came back `silent` -- a reader that returned
+      # nothing without a reason is the failure this whole exercise targets.
+      - name: Measure every staged client into ci-results
+        # Always runs. A failure in an unrelated step above used to skip this one,
+        # and the publish step then announced "the measure step did not run" as a
+        # result -- three runs in a row measured nothing. Measurement is the
+        # point of the run, so it must not sit behind anything else.
+        if: always()
+        run: |
+          set -euo pipefail
+          rm -rf ci-results
+          mkdir -p ci-results
+          # Each client is a directory. The workflow stages them under
+          # /tmp/clients/<name>/ when a run provides them; a checkout without
+          # them records that fact rather than silently measuring nothing.
+          args=()
+          if [ -s /tmp/test-summary.json ]; then
+            cp /tmp/test-summary.json ci-results/test-summary.json
+          fi
+          # Only externally staged clients under /tmp/clients/ are measured; no
+          # client binaries are committed to the repository.
+          for d in /tmp/clients/*/; do
+            [ -d "$d" ] || continue
+            args+=("$(basename "$d")=$d")
+          done
+          if [ ${#args[@]} -eq 0 ]; then
+            echo "::notice::no external client files staged under /tmp/clients/; client matrix measurement skipped"
+          else
+            # Surface the tool's own failure as an annotation: the raw step log
+            # is not retrievable, so an unannotated non-zero exit is invisible.
+            # `PIPESTATUS`, not `if ! cmd | tee`: the pipe's status is tee's,
+            # which succeeds even when the tool failed.
+            set +e
+            CARGO_TERM_COLOR=never cargo run --locked --bin client-matrix-json \
+              -- ci-results "${args[@]}" 2>&1 | tee /tmp/matrix.log
+            tool_status=${PIPESTATUS[0]}
+            set -e
+            if [ "$tool_status" -ne 0 ]; then
+              grep -E "^error|panicked|SILENT|cannot|-->" /tmp/matrix.log | head -20 \
+                | while IFS= read -r line; do echo "::error::$line"; done
+              exit 1
+            fi
+          fi
+          # A missing file per client is a failed measurement, not a zero. The
+          # expected set is what the loop above staged, so a client that produced
+          # no JSON at all is named here rather than going unnoticed.
+          for spec in "${args[@]}"; do
+            name=${spec%%=*}
+            f="ci-results/$name.json"
+            if [ ! -s "$f" ]; then
+              echo "::error::no measurement was written for client '$name' (expected $f)"
+              exit 1
+            fi
+          done
+      - name: Publish ci-results
+        if: always()
+        run: |
+          set -euo pipefail
+          # The measure step above is what writes this; if it failed before
+          # creating the directory we still publish a record of that, because
+          # "no measurements" is a result and a missing directory is not.
+          if [ ! -d ci-results ]; then
+            mkdir -p ci-results
+            # Annotate the failure, but do NOT write a none.json: a file called
+            # "none.json" is indistinguishable from a real measurement once it
+            # is on the ci-results branch, and it is not one. The job is meant
+            # to fail in this case anyway.
+            echo "::error::the measure step wrote no ci-results; measurement did not run"
+          fi
+          # One file per client, and the job fails if any is missing.
+          count=$(ls -1 ci-results/*.json 2>/dev/null | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::ci-results holds no JSON; the measurement did not run"
+            exit 1
+          fi
+          echo "::notice::$count client JSON file(s) measured"
+          {
+            echo "### Client measurements"
+            echo ""
+            echo "| file | bytes |"
+            echo "|---|---|"
+            for f in ci-results/*.json; do
+              echo "| \`$(basename "$f")\` | $(wc -c < "$f") |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Commit to a separate branch so the results survive the run without
+          # touching the PR's own history.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan ci-results-tmp 2>/dev/null || git checkout ci-results-tmp
+          git rm -r --cached . >/dev/null 2>&1 || true
+          git add -f ci-results
+          git commit -q -m "ci-results: measurements from ${GITHUB_SHA}" || echo "no change"
+          git push -f origin HEAD:ci-results
       # Formatting is checked after the unit tests and before the Vulkan
       # installs: rustfmt needs no GPU, so it must not sit behind an
       # environment-sensitive step, but it must not run *before* the tests
@@ -186,6 +447,14 @@ jobs:
           [ -s /tmp/fmt.check ] || exit 0
           { echo 'rustfmt wants these changes:'; echo '```diff'; \
             head -600 /tmp/fmt.check; echo '```'; } > /tmp/fmt.md
+          # Replace this workflow's previous comment rather than adding to it.
+          # The comment is the only readable copy of the diff, and after a few
+          # runs the thread holds diffs that were already applied, which makes a
+          # fixed one look unfixed. Deleting first means one comment, current.
+          for id in $(gh api "repos/${{ github.repository }}/issues/$PR/comments" \
+              --paginate -q '.[]|select(.user.login=="github-actions[bot]")|select(.body|startswith("rustfmt wants these changes:"))|.id'); do
+            gh api -X DELETE "repos/${{ github.repository }}/issues/comments/$id" || true
+          done
           gh pr comment "$PR" --body-file /tmp/fmt.md
       - name: Verify bounded lossless terrain RAM residency
         run: |
@@ -196,14 +465,27 @@ jobs:
           # Same flaky mirror as the build dependencies above: retry the install
           # instead of failing the three Vulkan checks behind it, and print apt's
           # own diagnosis as annotations if every attempt fails.
-          if dpkg -s mesa-vulkan-drivers >/dev/null 2>&1; then
-            echo "mesa-vulkan-drivers already installed"
+          #
+          # `dpkg -s` is not enough evidence: an image can report the package
+          # installed while the driver file itself is absent (the step used to
+          # exit 0 on `dpkg -s` and the sRGB step behind it then reported
+          # "no lavapipe ICD"), so the actual ICD is what gets checked, and a
+          # package that claims to be installed without one is reinstalled.
+          icd_present() {
+            find /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d /etc/vulkan/icd.d \
+              -maxdepth 1 -name '*lvp*' -print -quit 2>/dev/null | grep -q .
+          }
+          if dpkg -s mesa-vulkan-drivers >/dev/null 2>&1 && icd_present; then
+            echo "mesa-vulkan-drivers already installed, lavapipe ICD present"
             exit 0
+          fi
+          if dpkg -s mesa-vulkan-drivers >/dev/null 2>&1; then
+            echo "mesa-vulkan-drivers claims to be installed but the lavapipe ICD is missing; reinstalling"
           fi
           status=1
           for attempt in 1 2 3; do
             if timeout 240 sudo apt-get install -y --no-install-recommends \
-              mesa-vulkan-drivers 2>&1 | tee /tmp/vulkan-apt.log; then
+              --reinstall mesa-vulkan-drivers 2>&1 | tee /tmp/vulkan-apt.log; then
               status=0
               break
             fi
@@ -236,6 +518,41 @@ jobs:
             found="$(find "$dir" -maxdepth 1 -name '*lvp*' -print -quit 2>/dev/null || true)"
             if [ -n "$found" ]; then icd="$found"; continue; fi
           done
+          # Some Mesa builds ship the driver library without an ICD manifest.
+          # Writing the manifest here is what the loader needs and what an
+          # installed driver already provides, so it adds no assumption about
+          # the driver itself — only the path to it.
+          # The install step above can succeed against a mirror that serves an
+          # empty package, and it can also be skipped as "already installed" on
+          # an image whose driver was stripped. Both leave this step with no
+          # driver, which is not a code failure: install it here once more
+          # before deciding that.
+          if [ -z "$icd" ]; then
+            for attempt in 1 2 3; do
+              sudo apt-get install -y --no-install-recommends --reinstall \
+                mesa-vulkan-drivers >/dev/null 2>&1 || true
+              for dir in /usr/share/vulkan/icd.d /usr/local/share/vulkan/icd.d /etc/vulkan/icd.d; do
+                found="$(find "$dir" -maxdepth 1 -name '*lvp*' -print -quit 2>/dev/null || true)"
+                if [ -n "$found" ]; then icd="$found"; break; fi
+              done
+              [ -n "$icd" ] && break
+              echo "no lavapipe ICD after install attempt ${attempt}" >&2
+              sleep 10
+            done
+          fi
+          if [ -z "$icd" ]; then
+            driver="$(find /usr/lib /lib -name 'libvulkan_lvp.so*' -print -quit 2>/dev/null || true)"
+            if [ -n "$driver" ]; then
+              icd="$RUNNER_TEMP/lvp_icd.json"
+              cat >"$icd" <<JSON
+          {
+            "file_format_version": "1.0.0",
+            "ICD": { "library_path": "$driver", "api_version": "1.3.0" }
+          }
+          JSON
+              echo "lavapipe has no ICD manifest; wrote one for $driver" >>"$log"
+            fi
+          fi
           echo "VK_ICD_FILENAMES=$icd" >>"$log"
           ls -l /usr/share/vulkan/icd.d >>"$log" 2>&1 || true
           if [ -z "$icd" ]; then
@@ -461,6 +778,17 @@ jobs:
           if ($status -ne 0) {
             Write-Host "::error::Windows viewer build failed (exit $status); diagnostic tail follows"
             Get-Content -LiteralPath $log -Tail 100 | ForEach-Object { Write-Host "::error::$_" }
+            # A warning is not the reason the build failed, and the tail is full
+            # of them, so the errors are what has to survive into the annotation
+            # list. Ten is the most the annotation API accepts.
+            $errors = Get-Content -LiteralPath $log |
+              Select-String -Pattern '^error(\[|:)' |
+              Select-Object -First 10
+            if ($errors) {
+              foreach ($line in $errors) { Write-Host ("::error::" + $line.Line) }
+            } else {
+              Write-Host "::error::the build failed without an 'error' line; see the job log"
+            }
           }
           exit $status
       - name: Build audio corpus and scene diagnostics
@@ -496,11 +824,33 @@ jobs:
           path: artifact/
           if-no-files-found: error
           retention-days: 14
+      - name: Wait for the uploaded artifact to appear in the run catalog
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $artifactName = 'Perfect-World-Explorer-Windows-x64'
+          $endpoint = "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/artifacts"
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            $names = gh api $endpoint --jq '.artifacts[].name'
+            if ($LASTEXITCODE -eq 0 -and ($names -contains $artifactName)) {
+              Write-Host "Artifact is visible after $attempt catalog check(s)."
+              exit 0
+            }
+            Write-Host "Artifact not listed yet ($attempt/12); waiting five seconds."
+            Start-Sleep -Seconds 5
+          }
+          $listed = gh api $endpoint --jq '.artifacts[] | [.name, .id] | @tsv'
+          Write-Host "Artifacts currently visible:`n$listed"
+          throw "Uploaded artifact '$artifactName' never appeared in the run catalog."
       - name: Download the uploaded portable artifact
         uses: actions/download-artifact@v4
         with:
           name: Perfect-World-Explorer-Windows-x64
           path: ${{ runner.temp }}/uploaded-viewer
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
       - name: Audit the uploaded artifact layout
         shell: pwsh
         run: |

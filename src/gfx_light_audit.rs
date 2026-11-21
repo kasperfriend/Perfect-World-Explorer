@@ -17,8 +17,11 @@ pub fn parse(text: &str) -> Result<Audit, String> {
         .and_then(|l| l.trim().strip_prefix("Version: "))
         .and_then(|s| s.parse::<u32>().ok())
         .ok_or("invalid GFX version")?;
-    if version == 0 || version > 79 {
-        return Err("unverified GFX version for light audit".into());
+    // No version cap. An audit is a dependency census over the `Key: value`
+    // lines, and `A3DGFXLight::Load` reads the same fourteen light lines at
+    // every version, so a 90 or 93 root audits exactly like a 33 one.
+    if version == 0 {
+        return Err("invalid GFX version for light audit".into());
     }
     let mut out = Audit {
         version,
@@ -105,7 +108,7 @@ mod tests {
         for s in [
             "",
             "MOXBVersion: 37",
-            "MOXTVersion: 80\nGFXELEMENTCOUNT: 0",
+            "MOXTVersion: 0\nGFXELEMENTCOUNT: 0",
             "MOXTVersion: 37\nGFXELEMENTID: 100",
             "MOXTVersion: 37\nGFXELEMENTCOUNT: 1",
             "MOXTVersion: 37\nGFXELEMENTCOUNT: 0\nGFXELEMENTCOUNT: 0",
@@ -129,5 +132,25 @@ mod tests {
             parse("MOXTVersion: 79\nGFXELEMENTCOUNT: 0").unwrap().lights,
             0
         );
+    }
+
+    /// The audit is a census over `Key: value` lines, and the light element is
+    /// version invariant (`A3DGFXLight::Load` never reads `dwVersion`), so a
+    /// version above the 1.4.2 corpus maximum audits exactly like one below it.
+    /// The audit used to cap at 79 and reject anything newer, which is one of
+    /// the three places that cost 1.5.2 every effect it shipped.
+    #[test]
+    fn a_newer_root_audits_like_any_other() {
+        for version in [79u32, 82, 84, 86, 89, 90, 93, 103] {
+            let source = format!(
+                "MOXTVersion: {version}\r\nGFXELEMENTCOUNT: 2\r\n\
+                 GFXELEMENTID: 130\r\nLightType: 1\r\nGFXELEMENTID: 200\r\n\
+                 GfxPath: scene\\child.gfx\r\n"
+            );
+            let audit = parse(&source).unwrap_or_else(|e| panic!("version {version} refused: {e}"));
+            assert_eq!(audit.version, version);
+            assert_eq!(audit.lights, 1);
+            assert_eq!(audit.children, ["scene\\child.gfx"]);
+        }
     }
 }

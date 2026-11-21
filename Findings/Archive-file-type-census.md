@@ -111,10 +111,431 @@ archive content rather than at the viewer's assumptions. Both were invisible to
 
 ## Honest scope statement
 
+## `gfx.pck` measured in this checkout (18 November)
+
+The table above predates `gfx.pck` being staged. It is now, and the same tool
+runs on it:
+
+| pack | members | supported | out of scope | unsupported |
+|---|---:|---:|---:|---:|
+| `gfx.pck` | 3499 | 3216 | 106 | **177** |
+
+The 177 are exhaustive and none is a surprise: **174** are the fireworks
+`.fw` files, a `MOXB` container of `FWGlyphText`/`FWFirework` children that no
+`src/` reader touches (fireworks are not part of the eight phases); **1** is a
+4-byte truncated `gfx/人物/技能/羽芒/翼击击中.gfx` whose whole content is the
+ASCII stub `MOXT` -- the same 4-byte stub the `content` harness mode reports as
+its single known failure; **1** is a zero-byte `gfx/场景/logs/af.log`; and **1**
+is an OLE `gfx/烟花/效果.xls`, authoring data.
+
+**What this run corrected.** The first reading of this pack said 2,616
+unsupported, because the classification table listed neither `.gfx` nor `.sgc`.
+Those two extensions are 2,439 members -- the entire reason the pack exists --
+and `src/gfx_file.rs` parses both: they start `MOXTVersion:` exactly like the
+effect graphs already in the table. The census was measuring its own table
+rather than the code. `.fw` and a signature-based fallback for members whose
+name lies (`gfx/怪物/通用/地狱狮王效果`, extensionless, holding a
+`MOXTVersion: 41` graph) are now classified too, and
+`tools/test_archive_census.py` pins the rules so the table cannot silently drift
+again.
+
 "Zero unsupported" here means: every member of these four packs is either parsed
 by the viewer or positively identified as belonging to another subsystem, with
 the reason recorded. It does **not** mean the viewer renders everything those
-parsers accept at full fidelity. Six packs are covered; `building.pck`,
-`litmodels.pck`, `surfaces.pck`, `gfx.pck` and `loddata.pck` are not staged, and
+parsers accept at full fidelity. Seven packs are covered (`gfx.pck` as of 18 November);
+`building.pck`, `litmodels.pck`, `surfaces.pck` and `loddata.pck` are not staged, and
 BMD coverage therefore rests on the existing `litmodels.pck` census rather than
 on this tool.
+
+## DDS pixel formats measured (18 November)
+
+`tools/dds-survey.py` is the survey for the one thing `model_dds.rs` dispatches
+on: the `DDS_PIXELFORMAT`. It reports each format a pack carries, whether this
+build reads it, and which accepted FourCCs no pack carries -- because a format
+the reader accepts and nothing ships is dead code that reads like coverage.
+
+Run over the four packs staged in this checkout, **1,433 DDS members**:
+
+| format | members | read |
+| --- | ---: | --- |
+| `DXT3` | 651 | yes |
+| `DXT1` | 613 | yes |
+| 32-bit `00ff0000/0000ff00/000000ff` (+ alpha mask or not) | 77 | yes |
+| 16-bit luminance (`DDPF_LUMINANCE`, flags `0x80000`) | 59 | yes, as of this change |
+| 24-bit BGR | 33 | yes |
+| `DXT5` | **0** | accepted by the reader, carried by nothing here |
+| `DX10` | **0** | no DX10 header path is needed |
+
+Two things came out of this.
+
+**The 59 luminance members were a real loss, not a cosmetic one.** They are the
+whole `textures/water/caustic/` set: 16-bit, masks `000000ff` / `0000ff00`, one
+channel with the sample in the low byte of each word. The reader refused every
+one, so each caustic light pattern drew as the flat white placeholder.
+`Uncompressed` now carries a `luminance` flag and `model_texture_gpu` widens
+the single channel into R, G and B. After the change all 1,433 parse.
+
+**No `DX10` exists in any staged pack, so adding one would be speculative.**
+Item 74 asked whether the FourCC match should grow a `DX10` case; the answer
+from the data is no, and the reader still names an unknown FourCC instead of
+dropping the member.
+
+The survey also caught a mistake in its own first table: it reported the 33
+24-bit members as unreadable, but `model_dds.rs` already accepts 24-bit BGR.
+The table was wrong, not the reader -- so `READ_RGB` is now checked against the
+parser rather than guessed from the pack. This is the same failure shape the
+`gfx.pck` census had (measuring the table instead of the code), which is why
+the two surveys live beside each other here.
+
+## T2LM lightmap tile edges measured (18 November)
+
+Item 75 asked whether `terrain_gpu.rs` should stop requiring DXT1 / one mip /
+256×256 for a lightmap. `tools/lightmap-survey.py` answers it from files
+rather than from the reader:
+
+| file | header edge | tile bytes | DDS | mips | format |
+| --- | --- | --- | --- | --- | --- |
+| `login_login.t2lm` | **128** | 8,320 | 128×128 ×16 | 0 | DXT1 ×16 |
+| `a91_6.t2lm` | **128** | 8,320 | 128×128 ×16 | 0 | DXT1 ×16 |
+| `a85_6.t2lm` | **128** | 8,320 | 128×128 ×16 | 0 | DXT1 ×16 |
+| `world_8.t2lm` | 256 | 32,896 | 256×256 ×16 | 0 | DXT1 ×16 |
+
+**The 256 was wrong for three of the four.** `Tiles::parse` asserted
+`u(12) == 256`, so it refused every login map and every 128-tile world map
+outright — not a silent misread, a hard `unsupported T2LM version, tile
+geometry or DDS flags` on files the client draws. The header at offset 12 is
+the tile edge, and two values ship, so it is now read (`tile_side`) instead of
+asserted, and anything other than 128 or 256 is refused *with the number it
+saw*.
+
+The DXT1 and one-mip parts were correct and stay enforced. The `world_8.t2lm`
+record in `Findings/Phase-1-completion-checks.md` was therefore accurate about
+the file it named and wrong as a general claim; the same 256 appears in
+`Findings/Research-log-02-rendering-and-lighting.md` ("All 88 `.t2lm` and
+`.t2lm1` files contain 16 DXT1 256² DDS images"), which the data contradicts.
+
+One thing the survey settled without being asked: in all four files the header
+edge and the DDS dimensions **agree**. `terrain_gpu` now requires that
+agreement explicitly, so a file repacked at one size but retiled at another is
+named rather than uploaded into a mismatched atlas slot.
+
+### Why the reader could not have caught this itself
+
+The offline suite compiles `terrain_lightmaps.rs` but never sees a client
+`.t2lm`; the phase-1 check ran on one 256 file and generalised. That is the
+recurring shape here — a claim measured once, written down as a rule, and then
+enforced against data that was never re-measured.
+
+## EC-BSD placement tables measured (18 November)
+
+Item 78's open half was `grasses.pck`'s `ECBSD_NAME_LIMIT`: the constant was
+documented as *unmeasurable*, because both `grasses.pck` and `trees.pck` were
+scanned for the `0x42584F4D` / `0x42534446` identity and hold no such member.
+That scan was correct and the conclusion was wrong — EC-BSD files are not pack
+members. They live under `maps/world/`, one per map, and are only reachable in
+a full client.
+
+`tools/ecbsd-survey.py` over 8 real files:
+
+| file | revision | names |
+| --- | --- | --- |
+| `a117.ecbsd` | 18 | 1 |
+| `a79.ecbsd` | 17 | 1 |
+| `a95.ecbsd` | 18 | 1 |
+| `a64.ecbsd` | 18 | 4 |
+| `login.ecbsd` | 18 | 4 |
+| `a85.ecbsd` | 18 | 9 |
+| `a91.ecbsd` | 18 | 12 |
+| `world.ecbsd` | 18 | **88** |
+
+**The measured maximum is 88**, so the limit sits 9,912 names above the largest
+real table. Every file's name table parses completely under the three rules
+`water::path_string` applies — length ≤ 1024, clean GBK, and no `..`, leading
+`/` or `:` in the result — and both shipped revisions (17 and 18) read, which
+`scene::ecbsd_header` already allowed because it gates on identity only.
+
+The non-obvious part is what the names *are*: `BSData/1.dat` … `BSData/88.dat`
+in `world.ecbsd`, and `BSData/Login.dat` first in `login.ecbsd`. The name table
+indexes terrain grass-placement blocks, not textures, which is why 88 is a
+plausible ceiling for a large world rather than an odd one.
+
+### The pattern this is the third instance of
+
+`grasses.pck` was scanned, nothing was found, and the absence was written down
+as "unmeasurable" — accurate about the pack and false about the format. The
+tile-edge mistake above is the same shape from the other direction: one file
+measured, generalised to all. A survey answers the question it was pointed at,
+so the register now records *where* each measurement was taken.
+
+## The `.pck` containers measured across three clients (18 November)
+
+A report of "unsupported PCK safe header" on 1.8.4 and a 1.5.2 client with no
+buildings sent this back to the files. Three packs were read directly:
+
+| client | pack | revision | trailer | guard pair | tag word | entries |
+| --- | --- | --- | --- | --- | --- | ---: |
+| 1.5.2 | `configs.pck` | `0x00020002` | 280 | `a508bdc4`/`853567c8` | `56a089b7` | 67 |
+| 1.5.2 | `grasses.pck` | `0x00020002` | 280 | `a508bdc4`/`853567c8` | `56a089b7` | 103 |
+| 1.8.4 | `configs.pck` | `0x00020003` | 288 | `fdfdfeee`/`f00dbeef` | **0** | 1,057 |
+
+**The guard pair is the interesting one, because removing it was my own doing.**
+Item 76 consolidated `angelica_pck`'s guard constants into `pck`'s on the stated
+grounds that "`0xa508bdc4` / `0x853567c8` appears in no staged archive". It does
+— it is what *every* 1.5.2 archive carries. The claim was a statement about what
+had been looked at, made in the voice of a statement about the format, and it
+refused the whole client. Both pairs are now named constants with the archive
+each was measured on.
+
+Two further offsets also move with the revision, and each was a separate
+refusal:
+
+| | `0x00020002` | `0x00020003` |
+| --- | --- | --- |
+| trailer bytes | 280 | 288 |
+| record bytes | 276 | 288 |
+| offset field | `+260`, 32-bit | `+264`, **64-bit** |
+| `dwFlags` | `+12` | **`+16`** |
+
+The `dwFlags` row is the one that would have been a false encryption report
+rather than a refusal: reading `+12` on a `0x00020003` pack yields
+`0xffffffff`, the first bytes of `szDescription`. `tools/pck_lib.py` had exactly
+that bug, so every 1.8.4 package would have been censused as *enciphered*.
+
+### What this says about the earlier registers
+
+Two claims in `Findings/PART-3-survey-relax-2026-11-18.md` rested on the same
+error and are corrected there: the EC-BSD "unmeasurable" note and this guard
+pair. Both were produced by looking in one place and writing down a fact about
+the format. That is now the third instance in this file, which is why each row
+records where the measurement was taken.
+
+## The destination list was never translated (18 November)
+
+The "destinations are still in Chinese" report was not a missing row in the
+zone table. `world_place_names::english` was already applied to the zone banner
+and to the precinct fallback; the list itself is built from `world_targets.txt`,
+and `navigation::parse_destinations` took the name straight out of the file. So
+a 1.5.2 client showed `雪霏村` under an English interface while 1.8.4 showed
+`Snowy Village` for the same teleport.
+
+Measured on the two real files:
+
+| client | `maps/world/world_targets.txt` | rows | names |
+| --- | --- | ---: | --- |
+| 1.5.2 | 7,670 B | 89 | all Chinese |
+| 1.8.4 | 24,408 B | 186 | all English |
+
+A row is `id  name  group  "x,y,z"  ...`. The id and the coordinate survive
+localisation and the name does not, so joining on (id, position to 0.01) pairs
+**86 of 87** rows uniquely with no ambiguity — the same invariant-matching
+principle the zone table was built on, with a different invariant.
+
+58 of the 89 were already covered. The other 28 are a **separate** table
+(`DESTINATION_NAMES`) rather than more zone rows, because a destination is often
+a point *inside* a zone — `卫戍营` ("Guardian's Watch") — which no polygon match
+reaches. Three names disagree between the two joins (`邻水镇`, `积羽城`,
+`獠牙镇`); the destination file is not allowed to override them, since the zone
+rows came from a measured polygon match and `獠牙镇` -> "Plume Officer" is not a
+town name. A test pins that so a regeneration cannot flip it silently.
+
+Coverage went 58/89 -> 86/89. The one real miss is `祖龙城南`, which has no
+same-position counterpart because 1.8.4 splits that area differently.
+
+**Checked in both directions**, because a translation table can fail by
+over-translating: all 246 real English zone names in 1.8.4's world
+`precinct.clt` pass through unchanged, and all 243 pre-existing Chinese rows
+still produce exactly the English text they had.
+
+### What this cost
+
+`navigation.rs` had no gate in the offline harness, so a module that now
+depends on `world_place_names` could not fail anything locally; CI's "Run viewer
+unit tests" caught it instead. That is the fourth time in this file that a claim
+was checkable and nothing checked it — hence the new `navigation` mode.
+
+## The client source, and what it settles (18 November)
+
+The 1.5.2 client's source is on Drive, under
+`Forsaken World 0.525 Client / ForsakenWorldv260ClientSource / SMElement`.
+`SMCommon/AFilePackage.h`, `AFilePackage.cpp` and `elementpckdir.h` are the
+container's definition, and every offset recorded above from three packs is
+confirmed field for field rather than merely consistent:
+
+```c
+struct SAFEFILEHEADER_0x00020003 { DWORD tag1; UINT64 offset; };
+struct FILEHEADER_0x00020003 {
+    DWORD guardByte0; DWORD dwVersion; UINT64 dwEntryOffset;
+    DWORD dwFlags; char szDescription[252]; DWORD guardByte1; DWORD UNKNOWN;
+};
+struct FILEENTRY_0x00020003 {
+    char szFileName[260]; DWORD Zalupa0; UINT64 dwOffset;
+    DWORD dwLength; DWORD dwCompressedLength; DWORD Zalupa1; int iAccessCnt;
+};
+```
+
+That is a 288-byte record with the 64-bit offset at +264, and a 280-byte header
+with `guardByte1` at +272 and `dwFlags` at **+16** — the three numbers that had
+to be measured out of the files. `AFPCK_GUARDBYTE0/1 = 0xfdfdfeee/0xf00dbeef`
+and `AFPCK_VERSION = 0x00020002` are literals in the source.
+
+### The prefix rule, which was wrong
+
+```c
+if      (tag1 == 0x4DCA23EF && tag2 == 0x56a089b7)      m_bHasSafeHeader = true;
+else if (tag1 == 0x4DCA23EF && tag2 != 0x56a089b7)    { re-read as
+        SAFEFILEHEADER_0x00020003;                        m_bHasSafeHeader = true; }
+else                                                      m_bHasSafeHeader = false;
+```
+
+**`tag1` is the only required word, and the word at +8 is not always a tag.** In
+the second shape the eight bytes after `tag1` are a `UINT64` offset, and the
+reason a tag comparison sees `a83e5e82` in 1.8.4's `configs.pck` is that it is
+the *low half of that offset*. Requiring `0x56a089b7` there is precisely the
+`unsupported PCK safe header` dialog.
+
+This is the same failure as the guard pair, one layer down: a check written
+against the one shape that had been seen, refusing the other. It is the fifth
+instance in this file, and the first where the answer was available in the
+shipped source all along — which is the argument for searching for the source
+before inferring a format from a handful of files.
+
+`elementpckdir.h` also confirms the layout this project already assumed:
+`configs`, `gfx`, `grasses`, `building`, `models`, `litmodels`, `textures` and
+`loddata` are all mounted from `resources\`, so a client's `element` folder is
+its archive root.
+
+## The sixth instance: a `UINT64` read as a `DWORD` (18 November)
+
+The 1.8.4 report showed no buildings and no objects in the main world or in any
+other world, with terrain and effects loading normally. The log named one cause,
+372 times over, for one file:
+
+```
+litmodels.pck was not indexed: ...\element\litmodels.pck: neither container;
+retail: entry table overlaps footer: the trailer declares its table at
+1517810005 but only 3681422201 bytes of this piece (len 3681422489) precede the
+footer (declared end 10123872665, base 6442450176, count 237241, flags 0x0000…)
+```
+
+Every one of the client's **23,068** scenery names was unreachable, so no
+`litmodel_*.bmd` resolved and 46 in-view placements drew nothing. The tree was
+never missing: the name-to-entry lookup had no table to consult.
+
+### The arithmetic
+
+`FILEHEADER_0x00020003.dwEntryOffset` is a **`UINT64`**. The reader took
+`u32le(&header, 8)` — the low half — and unmasked that alone:
+
+| quantity | value |
+|---|---|
+| stored low dword | `4075062583` (`0xf2e48537`) |
+| `^ AFPCK_MASKDWORD` of it | **`1517810005`** — the number in the log |
+| real `dwEntryOffset` (u64) | **`10107744597`** |
+| the piece holding the trailer starts at | `6442450176` (6 GiB) |
+| table ends (= trailer start) | `10123872377` |
+| span | `16127780` B for 237,241 records |
+
+`1,517,810,005` is not a nonsense value — it lies *inside* the package, in the
+piece that begins at 2 GiB — which is why the failure read as a plausible
+geometry problem rather than a decoding one. But the table was never there;
+`10,107,744,597` is two gibibytes further on, and only the full 64-bit word
+can name it. `16,127,780 / 237,241 ≈ 68` bytes per record also says the records
+are deflated on disk, so the count cannot be back-inferred from the span.
+
+The mask is applied at the revision's width for the same reason the field is
+read at that width: masking 32 bits of a 64-bit word discards the high half
+before the offset is ever formed.
+
+`0x00020001` and `0x00020002` keep their 32-bit field, so nothing about the
+1.5.2 reads changes — and 1.5.2's `litmodels` still splits at
+`MAX_FILE_PACKAGE`, which is what the *piece-local* fallback is for. The two
+mechanisms are independent: one is about which piece the trailer is in, the
+other about whether the offset can address the package at all.
+
+### The general shape
+
+This is the same mistake as the guard pair and the safe header, one field down:
+**a width recovered from the small packages and then assumed for every
+revision.** Both earlier instances were caught by reading the client's own
+header. This one could have been too — `AFilePackage.h` has said `UINT64`
+since `0x00020003` was recorded — which is the argument for checking a field's
+declared width whenever a package crosses 4 GiB, rather than noticing the
+symptom only when a big archive refuses.
+
+### Water, which was a different fault
+
+The report also said the main world had no water. Nothing in the log mentioned
+water at all — and that silence was itself the defect. `SceneWater` had nine
+emit sites across `water.rs` and `gpu.rs`, but it was **absent from
+`Channel::wired()`**, so the "Everything" preset never enabled it: the capture
+contained no `scene-water` file, and "the water is missing" could not be told
+apart from "nobody asked for water to be logged". `RenderWater` was wired and
+did not appear either.
+
+So the water claim is **not yet diagnosed**. It has a channel now, and the next
+capture with the Everything preset will say `N water areas, M cells, K of them
+wet` and list each area's export id, height and grid — which is the evidence
+needed to separate "the EC-BSD reader dropped them" from "the map's water is
+static-mesh water this loader does not read". Claiming a fix before that line
+exists would be the same error as the four above.
+
+## The seventh instance, and the one that ends the guessing (18 November)
+
+The 1.8.4 archive opened, and the next report was `trees.pck`:
+
+```
+entry table overlaps footer: the trailer declares its table at
+18446744069440788065 but only 26227656 bytes of this file (len 26227944)
+precede the footer (declared end 26227944, base 0, count 326, flags 0x65676e41)
+```
+
+**This one was mine.** The 64-bit read added for `litmodels` read `+8` as eight
+bytes on a trailer that stores four there, so the high half became the
+`0xffffffff` at `+12`. The 32-bit read before it had handled this file
+correctly. Two details in the message say so without any file:
+
+- `18446744069440788065` = `0xffff_ffff_a91c_a203`: the offset's low half with
+  `0xffffffff` glued on top, which is not a position in a 26 MB file.
+- `flags 0x65676e41` = `Ange`, the first four bytes of *"Angelica File Package"*.
+
+### The version word does not select a layout
+
+That second detail is the important one. `szDescription` starts at `+16` in this
+trailer, where the wide revision puts `dwFlags`. So this file has **no
+`dwFlags` field at all** — the `0x00020002` field order inside a 280-byte struct
+whose tail still reaches `guardByte1` at `+272`. Checked against the shipped
+bytes:
+
+| offset | `trees.pck` (1.8.4) | meaning |
+|---|---|---|
+| `+0` | `0xfdfdfeee` | `guardByte0` |
+| `+4` | `0x00020003` | `dwVersion` — **same word as `litmodels`** |
+| `+8` | `0xa91ca203` | `dwEntryOffset` u32 → `26203745` after unmask |
+| `+12` | `0xffffffff` | not a flag word (the wide layout calls it `dwFlags`) |
+| `+16` | `"Ange…"` | `szDescription` |
+| `+272` | `0xf00dbeef` | `guardByte1` |
+
+And `litmodels.pck`, same client, same version word, writes `dwEntryOffset` as
+`UINT64` with `dwFlags` at `+16` and `szDescription` at `+20`. **One version,
+two layouts.** A small package cannot name its table above 4 GiB, so the
+compiler that emitted it narrowed the field instead of enlarging the package —
+which is the client's own inconsistency, not a revision.
+
+So the fix is not another entry in a version table. `trailer_candidates` returns
+the version's layout *and* a probe list, and `read_directory` proves each by
+walking the entry table it names. A probe that guesses wrong is refused by the
+table walk rather than mis-parsed. `dwFlags` became `Option<usize>` because the
+narrow trailer has no such field, and the absence is spelled as an absence — a
+sentinel offset would have been read as `Ange` and refused as "encrypted".
+
+Verified on three shipped eras: 1.8.4 `trees.pck` 326 entries
+(`trees/badtree.spt` … `trees/version.sw`), 1.5.2 325, a 2016 pack 326, all
+decoded to the length their records claim by `tools/offline_harness.sh pck`.
+
+### What this settles about "support every version"
+
+Every defect in this file has been the same shape — a rule inferred from the
+files that happened to be staged. The durable answer is not a longer list of
+magic numbers; it is to let the container's own checks (guard pair, description
+tag, and a full walk of the table) decide, and to keep the version word as a
+hint about ordering. That is what the `pck` reader does now.

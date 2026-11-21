@@ -876,6 +876,8 @@ struct CtrlState {
     color_override: Option<u32>,
     path_override: Option<Vec3>,
     ramp: Option<ColorTrack>,
+    /// Version 81's `AlphaOnly` on the ramp that produced `ramp`.
+    ramp_alpha_only: bool,
     scale_ramp: Option<(f32, Vec<(f32, f32)>)>,
     path_points: Option<Vec<Vec3>>,
     path_direction: bool,
@@ -960,6 +962,7 @@ impl CtrlState {
             color_override: None,
             path_override: None,
             ramp: None,
+            ramp_alpha_only: false,
             scale_ramp: None,
             path_points: None,
             path_direction: false,
@@ -970,8 +973,13 @@ impl CtrlState {
     fn bind(&mut self, key: &KeyPoint) {
         for control in &key.controls {
             match &control.data {
-                ControlData::ColorRamp { original, stops } => {
+                ControlData::ColorRamp {
+                    original,
+                    stops,
+                    alpha_only,
+                } => {
                     self.ramp = color_track(control.start, control.end, *original, stops);
+                    self.ramp_alpha_only = *alpha_only;
                 }
                 ControlData::ScaleRamp { first, stops } => {
                     self.scale_ramp = Some((*first, stops.clone()));
@@ -1601,9 +1609,9 @@ impl Player {
                         .affectors
                         .iter()
                         .map(|control| match &control.data {
-                            ControlData::ColorRamp { original, stops } => {
-                                color_track(control.start, control.end, *original, stops)
-                            }
+                            ControlData::ColorRamp {
+                                original, stops, ..
+                            } => color_track(control.start, control.end, *original, stops),
                             _ => None,
                         })
                         .collect(),
@@ -2891,8 +2899,20 @@ fn apply_controls(state: &mut CtrlState, key: &KeyPoint, sampled: &Sampled, dt: 
                 // `ProcData.m_fTimeSpan * 1000` — the keypoint clock, with no
                 // StartTime subtraction (the Tick gate already decided that
                 // this controller is inside its window).
-                if let Some(track) = &state.ramp {
-                    state.color_override = track.sample(age);
+                if let (Some(track), Some(ramped)) =
+                    (&state.ramp, state.ramp.as_ref().and_then(|t| t.sample(age)))
+                {
+                    // Version 81's `AlphaOnly` keeps the colour the element is
+                    // showing and takes only the ramp's alpha, which is what
+                    // `A3DGFXCtrlColorChange::Process` does when the flag is
+                    // set: the RGB channels are preserved and only the top byte
+                    // is replaced by the table entry's.
+                    state.color_override = Some(if state.ramp_alpha_only {
+                        let base = state.color_override.unwrap_or(sampled.color);
+                        (base & 0x00FF_FFFF) | (ramped & 0xFF00_0000)
+                    } else {
+                        ramped
+                    });
                 }
             }
             ControlData::ScaleRamp { .. } => {
@@ -3951,7 +3971,31 @@ fn emit_clock(
                 context.clock
             );
         }
-        Spec::Sound(_) => stats.sounds += 1,
+        Spec::Sound(sound) => {
+            stats.sounds += 1;
+            // Not played: world audio is `world_audio.rs`, which reads the EC-BLD
+            // sound records. A 170 element is a *skill* sound -- measured over the
+            // staged `gfx.pck`, the 355 element-170 records name 139 distinct
+            // paths under `Skill\`, `Effect\`, `Creature\`, `Item\` and
+            // `Ambience\`, with volume 100, `Force2D: 0` and `IsLoop: 0` the
+            // common case. The channel prints them so the gap is named per root:
+            // `Stats::sounds` counted them and nothing said which files were
+            // dropped, which is how a whole element type stayed unnoticed.
+            crate::diag_keyed!(
+                EffectSounds,
+                at(context),
+                1000,
+                "{} id=170 paths={:?} volume={} force2d={} loop={} at ({:.2},{:.2},{:.2})",
+                context.root,
+                sound.paths,
+                sound.volume,
+                sound.force_2d,
+                sound.is_loop,
+                context.placement.w_axis.x,
+                context.placement.w_axis.y,
+                context.placement.w_axis.z
+            );
+        }
         Spec::Model(_) => stats.models += 1,
         Spec::Curve(curve) => emit_paraboloid(curve, context, out),
         Spec::Unknown { .. } => stats.unrendered += 1,
@@ -10429,6 +10473,81 @@ mod tests {
     /// are. The old branch built a ribbon along the root's `Vec:` pair instead
     /// and produced nothing at all when the file had no pair.
     #[test]
+    /// Element 170 is a sound emitter, not geometry.
+    ///
+    /// It is parsed and timed, and it is counted in `Stats::sounds` so the
+    /// status line stays honest about what the root contains. The effect
+    /// player does not play it: world audio is `world_audio.rs`, which reads
+    /// the EC-BLD sound records. A 170 element that invented a quad would put a
+    /// card where the map authored a noise.
+    #[test]
+    fn an_element_170_is_counted_as_a_sound_and_not_drawn() {
+        let sound = "GFXELEMENTID: 170\r\nName: roar\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+                     RepeatCount: 0\r\nRepeatDelay: 0\r\nTexFile: \r\nBindEle: \r\n\
+                     ZEnable: 0\r\nMatchGrnd: 0\r\nTexRow: 1\r\nTexCol: 1\r\n\
+                     TexInterval: 50\r\nPriority: 0\r\nIsDummy: 0\r\nDummyEle: \r\n\
+                     Warp: 0\r\nTileMode: 0\r\nTexSpeed: 0\r\nTexSpeed: 0\r\n\
+                     UReverse: 0\r\nVReverse: 0\r\nUVExchg: 0\r\nRenderLayer: 0\r\n\
+                     PathNum: 1\r\nPath: SFX\\monster\\roar.wav\r\nSoundVer: 1\r\n\
+                     Force2D: 0\r\nIsLoop: 0\r\nStartTime: 0\r\nKEYPOINTCOUNT: 1\r\n\
+                     InterpolateMode: 0\r\nTimeSpan: -1\r\nPosition: 0, 0, 0\r\n\
+                     Color: -1\r\nScale: 1.000000\r\nDirection: 0, 0, 0, 1\r\n\
+                     Rad_2D: 0\r\nCtrlMethodCount: 0\r\n";
+        let mut player = build(&(header79(1) + sound));
+        step(&mut player, 16.);
+        let stats = player.stats();
+        assert_eq!(stats.sounds, 1, "the sound is counted");
+        assert!(player.quads().is_empty(), "a sound draws no geometry");
+        assert_eq!(stats.unrendered, 0, "and it is not an unknown type");
+    }
+
+    /// The three stateless types a world effect most often carries are counted
+    /// apart, in the order the status line prints them: models (160), sounds
+    /// (170), curves (190). Each id reaches its own arm, so a root holding one
+    /// of each reports one of each and no quad from the two that are not
+    /// geometry.
+    #[test]
+    fn element_160_170_and_190_are_counted_by_their_own_type() {
+        let model = "GFXELEMENTID: 160\r\nName: crystal\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+                     RepeatCount: 1\r\nRepeatDelay: 0\r\nTexFile: \r\nBindEle: \r\n\
+                     ZEnable: 0\r\nMatchGrnd: 0\r\nTexRow: 1\r\nTexCol: 1\r\n\
+                     TexInterval: 50\r\nPriority: 0\r\nIsDummy: 0\r\nDummyEle: \r\n\
+                     Warp: 0\r\nTileMode: 0\r\nTexSpeed: 0\r\nTexSpeed: 0\r\n\
+                     UReverse: 0\r\nVReverse: 0\r\nUVExchg: 0\r\nRenderLayer: 0\r\n\
+                     ModelPath: 测试\\三角形.SMD\r\nModelActName: \r\nLoops: 1\r\n\
+                     AlphaCmp: 0\r\nWriteZ: 1\r\nUse3DCam: 0\r\nStartTime: 0\r\n\
+                     KEYPOINTCOUNT: 1\r\nInterpolateMode: 0\r\nTimeSpan: -1\r\n\
+                     Position: 0, 0, 0\r\nColor: -1\r\nScale: 1.000000\r\n\
+                     Direction: 0, 0, 0, 1\r\nRad_2D: 0\r\nCtrlMethodCount: 0\r\n";
+        let sound = "GFXELEMENTID: 170\r\nName: roar\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+                     RepeatCount: 0\r\nRepeatDelay: 0\r\nTexFile: \r\nBindEle: \r\n\
+                     ZEnable: 0\r\nMatchGrnd: 0\r\nTexRow: 1\r\nTexCol: 1\r\n\
+                     TexInterval: 50\r\nPriority: 0\r\nIsDummy: 0\r\nDummyEle: \r\n\
+                     Warp: 0\r\nTileMode: 0\r\nTexSpeed: 0\r\nTexSpeed: 0\r\n\
+                     UReverse: 0\r\nVReverse: 0\r\nUVExchg: 0\r\nRenderLayer: 0\r\n\
+                     PathNum: 1\r\nPath: SFX\\monster\\roar.wav\r\nSoundVer: 1\r\n\
+                     Force2D: 0\r\nIsLoop: 0\r\nStartTime: 0\r\nKEYPOINTCOUNT: 1\r\n\
+                     InterpolateMode: 0\r\nTimeSpan: -1\r\nPosition: 0, 0, 0\r\n\
+                     Color: -1\r\nScale: 1.000000\r\nDirection: 0, 0, 0, 1\r\n\
+                     Rad_2D: 0\r\nCtrlMethodCount: 0\r\n";
+        let bowl = "GFXELEMENTID: 190\r\nName: bowl\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
+                    TexFile: 物体\\water.dds\r\nTexRow: 1\r\nTexCol: 1\r\n\
+                    TexInterval: 50\r\nPriority: 2\r\nCoeff: 1\r\nheight: 0.3\r\n\
+                    StartTime: 0\r\nKEYPOINTCOUNT: 1\r\nInterpolateMode: 0\r\n\
+                    TimeSpan: -1\r\nPosition: 0, 0, 0\r\nColor: -1\r\nScale: 2\r\n\
+                    Direction: 0, 0, 0, 1\r\nRad_2D: 0\r\nCtrlMethodCount: 0\r\n";
+        let source = header79(3) + &format!("{model}{sound}{bowl}");
+        let mut player = build(&source);
+        step(&mut player, 16.);
+        let stats = player.stats();
+        assert_eq!(stats.models, 1, "160 is a model");
+        assert_eq!(stats.sounds, 1, "170 is a sound");
+        assert_eq!(stats.unrendered, 0, "neither is an unknown type");
+        // 190 is the only one of the three that is geometry, and it is the only
+        // one contributing quads.
+        assert_eq!(player.quads().len(), 3 * 24);
+    }
+
     fn an_element_190_is_a_paraboloid_bowl_of_the_authored_height() {
         let bowl = "GFXELEMENTID: 190\r\nName: bowl\r\nSrcBlend: 5\r\nDestBlend: 2\r\n\
                     TexFile: 物体\\water.dds\r\nTexRow: 1\r\nTexCol: 1\r\n\
@@ -12555,10 +12674,22 @@ mod tests {
             .replace("Position: 1, 2, 3", "Position: 0, 0, 0")
     }
 
-    /// Version 79, the newest in the corpus and one of the twelve that reads
-    /// `GroundHeight`.
+    /// Version 79, the newest in the 1.4.2 corpus and one of the twelve that
+    /// reads `GroundHeight`.
     fn header79(elements: u32) -> String {
         header37(elements).replace("MOXTVersion: 37", "MOXTVersion: 79")
+    }
+
+    /// The header a version-93 client writes: `IsAngelica3` after `Version`,
+    /// `AccurateAABB` after `UseAABB`, `ShakeDamp` after `ShakeCam`, and the
+    /// 2D/physics lines that come after it. 1.5.2 ships 86, 90 and 93 roots, so
+    /// this is the shape a real map effect has there.
+    fn header93(elements: u32) -> String {
+        header37(elements)
+            .replace("MOXTVersion: 37", "MOXTVersion: 93\r\nIsAngelica3: 0")
+            .replace("Raytrace: 0", "Raytrace: 0\r\nFaceToViewer: 0")
+            .replace("UseAABB: 0", "UseAABB: 0\r\nAccurateAABB: 0")
+            .replace("ShakeCam: 0", "ShakeCam: 0\r\nShakeDamp: 0")
     }
 
     /// A trail (element 152) at version 79, where all five trail keys are read.
@@ -12847,6 +12978,33 @@ mod tests {
     /// `acos(up·normal)` through `_CIacos` at `0x892f06`, and the up vector is
     /// the global `0x6ea170` initialises to (0.0, 1.0, 0.0). Applying the result
     /// to +Y must therefore land on the normal itself.
+    /// A version-93 root must not merely parse: it must build a player and put
+    /// its quads on screen. 1.5.2's map draws buildings and terrain but showed
+    /// no effect newer than 1.4.2, and both halves of that pipeline — the file
+    /// reader and the light decoder — refused 90/93 roots by version.
+    #[test]
+    fn a_version_93_root_builds_a_player_and_draws_its_quads() {
+        let mut player = build(&(header93(1) + SPRITE));
+        assert!(
+            player.warnings().is_empty(),
+            "a clean 93 root warns: {:?}",
+            player.warnings()
+        );
+        step(&mut player, 16.);
+        assert!(
+            !player.quads().is_empty(),
+            "a version-93 sprite drew nothing"
+        );
+        // And the same root at 90, the other version 1.5.2 introduces.
+        let at_90 = header93(1).replace("MOXTVersion: 93", "MOXTVersion: 90");
+        let mut player = build(&(at_90 + SPRITE));
+        step(&mut player, 16.);
+        assert!(
+            !player.quads().is_empty(),
+            "a version-90 sprite drew nothing"
+        );
+    }
+
     #[test]
     fn ground_alignment_takes_world_up_onto_the_normal() {
         for degrees in [0f32, 0.5, 1., 2., 3., 4.9] {
@@ -13786,7 +13944,10 @@ mod tests {
                 .iter()
                 .position(|entry| entry.name.eq_ignore_ascii_case(name))
         };
-        let index = find("gfx/场景/新种族地图/盆景水晶.gfx").expect("the root is in the pack");
+        let Some(index) = find("gfx/场景/新种族地图/盆景水晶.gfx") else {
+            crate::pck::corpus_member_absent("gfx/场景/新种族地图/盆景水晶.gfx");
+            return;
+        };
         let raw = crate::pck::read_entry(&mut file, &entries[index]).expect("read the root");
         let (text, bad) = crate::gfx_file::decode(&raw);
         assert!(!bad, "the root is not valid GBK text");
@@ -13917,14 +14078,18 @@ mod tests {
         entries: &[crate::pck::Entry],
         name: &str,
     ) -> gfx_file::Root {
-        let index = entries
-            .iter()
-            .position(|entry| entry.name.eq_ignore_ascii_case(name))
-            .unwrap_or_else(|| panic!("{name} is not in gfx.pck"));
-        let raw = crate::pck::read_entry(file, &entries[index]).expect("read the root");
-        let (text, bad) = gfx_file::decode(&raw);
-        assert!(!bad, "{name} is not valid GBK text");
-        gfx_file::parse(&text).unwrap_or_else(|error| panic!("{name}: {error}"))
+        match shipped_root_opt(file, entries, name) {
+            Some(root) => root,
+            None => {
+                // A counted skip, not a panic: the staged pack is whatever build
+                // was downloaded and an older one simply has no such record.
+                // `corpus_member_absent` panics by itself under
+                // `PWE_CORPUS=require`, so the suite cannot pass on the strength
+                // of builds it never read.
+                crate::pck::corpus_member_absent(name);
+                panic!("unreachable: corpus_member_absent returns only when the corpus is optional")
+            }
+        }
     }
 
     /// `shipped_root` for a root some pack builds do not carry. The Drive
@@ -14079,10 +14244,13 @@ mod tests {
             return;
         };
         let name = "gfx/textures/纹理/气连续03.tga";
-        let index = entries
+        let Some(index) = entries
             .iter()
             .position(|entry| entry.name.eq_ignore_ascii_case(name))
-            .unwrap_or_else(|| panic!("{name} is not in gfx.pck"));
+        else {
+            crate::pck::corpus_member_absent(name);
+            return;
+        };
         let tga = crate::pck::read_entry(&mut file, &entries[index]).expect("read the sheet");
         assert_eq!(tga[2], 2, "uncompressed true-colour TGA");
         assert_eq!(tga[16], 32, "32 bits per pixel");
@@ -14116,7 +14284,10 @@ mod tests {
             return;
         };
         let name = "gfx/场景/新种族地图/水门_瀑布.gfx";
-        let root = shipped_root(&mut file, &entries, name);
+        let Some(root) = shipped_root_opt(&mut file, &entries, name) else {
+            crate::pck::corpus_member_absent(name);
+            return;
+        };
         let ids: Vec<u32> = root.elements.iter().map(|element| element.id).collect();
         assert_eq!(
             ids,
@@ -14204,7 +14375,10 @@ mod tests {
             return;
         };
         let name = "gfx/场景/新种族地图/瀑布大.gfx";
-        let root = shipped_root(&mut file, &entries, name);
+        let Some(root) = shipped_root_opt(&mut file, &entries, name) else {
+            crate::pck::corpus_member_absent(name);
+            return;
+        };
         let ids: Vec<u32> = root.elements.iter().map(|element| element.id).collect();
         assert_eq!(
             ids,

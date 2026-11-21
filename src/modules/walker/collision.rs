@@ -1208,6 +1208,10 @@ mod tests {
         let mut footer = vec![0u8; 280];
         footer[0..4].copy_from_slice(&0xfdfdfeeeu32.to_le_bytes());
         footer[8..12].copy_from_slice(&(directory_at ^ MASK).to_le_bytes());
+        // The client refuses a package whose description lacks "lica File
+        // Package" (`strstr(m_header.szDescription, "lica File Package")`), so
+        // a fixture without it is not a package it would ever open.
+        footer[16..16 + 45].copy_from_slice(b"Angelica File Package, Perfect World Co. Ltd.");
         footer[268..272].copy_from_slice(&0xf00dbeefu32.to_le_bytes());
         footer[272..276].copy_from_slice(&(entries.len() as u32).to_le_bytes());
         footer[276..280].copy_from_slice(&0x20002u32.to_le_bytes());

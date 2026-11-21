@@ -1,6 +1,6 @@
 // Experimental component-level geometry archive. Not a shippable tree baker:
 // leaf map coordinates are recorded for one fixed camera and contain no wind
-// or material/transition state. See PWCOMP01 in the investigation notes.
+// or material/transition state. See PWCOMP02 in the investigation notes.
 // Build: zig c++ -target x86-windows-gnu -O2 -static -municode tools/speedtree/component-cache-probe.cpp -o component-cache-probe.exe
 // Usage: component-cache-probe.exe <SpeedTreeRT.dll> <one SPT> <output> <tree-type-id>
 #define wmain unused_baker_main
@@ -47,7 +47,7 @@ int wmain(int argc, wchar_t** argv) {
         Textures textures{}; a.tex(tree, &textures);
         unsigned counts[] = {branch(tree), frond(tree), leaf(tree)};
         for (unsigned count : counts) if (count > 64) throw "unsupported component LOD count";
-        Writer w; w.raw("PWCOMP01", 8); w.u(a.dll_hash);
+        Writer w; w.raw("PWCOMP02", 8); w.u(a.dll_hash);
         uint32_t hash = 2166136261u;
         for (unsigned char byte : bytes) hash = (hash ^ byte) * 16777619u;
         w.u(hash); w.u(static_cast<uint32_t>(type)); w.text(textures.branch); w.text(textures.composite);

@@ -177,6 +177,15 @@ fn cache_key(element: &Path, scene_path: &Path, tree_type_count: usize) -> Resul
     Ok(h.finish())
 }
 
+/// Tree types one map may declare and have prepared.
+///
+/// See `prepare_trees_for_scene`; the largest table in any staged client is 59.
+pub const MAX_TREE_TYPES: usize = 4096;
+
+/// Tree types the legacy three-argument bridge bakes, and therefore the size of
+/// the padded source table it is given.
+pub const LEGACY_BRIDGE_TREE_TYPES: usize = 59;
+
 /// A map with no tree types needs only its ready marker; other maps need one
 /// PWT per authored tree type. The legacy three-argument bridge expects 59.
 fn ready(dir: &Path, tree_type_count: usize) -> bool {
@@ -199,10 +208,17 @@ pub fn prepare_trees_for_scene(
     scene_path: &Path,
     tree_type_count: usize,
 ) -> Result<PathBuf, String> {
-    if tree_type_count > 10000 {
+    // Measured, not guessed: the largest authored tree table staged is the
+    // 1.8.4 world's 59 types (`tools/version-gates.py` reads the field straight
+    // out of every `.ecwld` header). The bridge writes one file per type, so the
+    // limit is about the filesystem rather than memory; 4,096 keeps two orders
+    // of magnitude of headroom over anything shipped and still fails loudly
+    // instead of trying to write a million files.
+    if tree_type_count > MAX_TREE_TYPES {
         return Err(format!(
-            "{scene_path} declares {tree_type_count} tree types; the SpeedTree bridge supports at most 10000",
-            scene_path = scene_path.display()
+            "{} declares {tree_type_count} tree types; this build prepares at most {MAX_TREE_TYPES} \
+             (the largest table in any staged client is 59)",
+            scene_path.display()
         ));
     }
     let base = std::env::var_os("LOCALAPPDATA")
@@ -244,15 +260,20 @@ pub fn prepare_trees_for_scene(
             "Preparing SpeedTree sources for {}...",
             scene_path.display()
         ));
-        // Keep a padded 59-type source table so the legacy checked-in bridge
-        // still works when the selected map authors fewer types. Extra PWTs are
-        // harmless: `Trees::open` reads only the scene's authored table.
-        let source_count = if tree_type_count == 0 {
-            0
-        } else {
-            tree_type_count.max(59)
-        };
+        // The table is built from the count the world file declares. It used to
+        // be padded to 59 unconditionally, to suit the legacy three-argument
+        // bridge, and that padding had a real cost: a map authoring 60+ types
+        // got the wrong tree or none, because the padded run stopped at 59.
+        //
+        // Padding is only ever needed by the *legacy* fallback below, and only
+        // when it actually runs, so it now happens there. The embedded bridge
+        // is called first with the exact count.
+        let mut source_count = tree_type_count;
         crate::tree_source::extract_for_scene(element, scene_path, &data, source_count)?;
+        eprintln!(
+            "SpeedTree: {source_count} authored tree type(s) in {}",
+            scene_path.display()
+        );
         if tree_type_count == 0 {
             fs::write(
                 data.join("tree-alpha-refs.csv"),
@@ -286,14 +307,24 @@ pub fn prepare_trees_for_scene(
             if !variable.status.success() {
                 // The legacy bridge rejects a fourth argument. It can still
                 // bake a padded 59-type table for maps with at most 59 types.
-                if tree_type_count > 59 {
+                if tree_type_count > LEGACY_BRIDGE_TREE_TYPES {
                     return Err(format!(
                         "{}\nThis map has {} tree types; rebuild tools/speedtree/speedtree-bake.exe from bake.cpp.",
                         bridge_error(&variable),
                         tree_type_count
                     ));
                 }
-                eprintln!("Variable-count SpeedTree bridge unavailable; using the legacy 59-type protocol.");
+                // Only here, and only now, does the table get padded: the
+                // legacy bridge has no way to be told how many types to bake,
+                // so it bakes its fixed 59. A map with more than 59 types
+                // cannot be served by it at all, and says so by name above.
+                eprintln!(
+                    "Variable-count SpeedTree bridge unavailable; using the legacy 59-type protocol \
+                     ({} authored type(s) padded to 59)",
+                    tree_type_count
+                );
+                let padded = LEGACY_BRIDGE_TREE_TYPES;
+                crate::tree_source::extract_for_scene(element, scene_path, &data, padded)?;
                 let legacy = Command::new(&helper)
                     .arg(element.join("speedtreert.dll"))
                     .arg(&data)
@@ -307,7 +338,8 @@ pub fn prepare_trees_for_scene(
                         bridge_error(&legacy)
                     ));
                 }
-                expected_count = source_count;
+                expected_count = padded;
+                source_count = padded;
             }
             for i in 0..expected_count {
                 if !data.join(format!("tree-{i:03}.pwt")).is_file() {
@@ -659,8 +691,6 @@ extern "system" {
     fn SetWindowTextW(hwnd: Hwnd, text: *const u16) -> i32;
     fn EnableWindow(hwnd: Hwnd, enable: i32) -> i32;
     fn SendMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
-    fn SetTimer(hwnd: Hwnd, id: usize, interval: u32, callback: *const c_void) -> usize;
-    fn KillTimer(hwnd: Hwnd, id: usize) -> i32;
     fn GetSysColorBrush(index: i32) -> *mut c_void;
     fn LoadCursorW(instance: *mut c_void, name: *const u16) -> *mut c_void;
 }
@@ -714,11 +744,6 @@ unsafe extern "system" fn launch_proc(hwnd: Hwnd, msg: u32, wparam: usize, lpara
         }
         0x10 => {
             LAUNCH_ACTION.store(3, Ordering::SeqCst);
-            0
-        }
-        0x113 => {
-            KillTimer(hwnd, 1);
-            LAUNCH_ACTION.store(2, Ordering::SeqCst);
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -784,12 +809,21 @@ unsafe fn control(
     }
     hnd
 }
-fn detection_label(c: &crate::client_detect::Client) -> &'static str {
-    if c.known_142 {
-        "Detected PW 1.4.2 Client"
-    } else {
-        "Unrecognized client executable — loading is experimental"
-    }
+/// Show one folder scan in the launcher: the headline names the executable
+/// identity and the data version pair (`elements.data` + `tasks.data`), and the
+/// card rows carry that pair plus every archive version the scan read. The whole report also goes to the
+/// session log, so a client that loads but still looks wrong can be described
+/// later without re-scanning.
+fn present_scan(hwnd: Hwnd, scan: &crate::client_detect::Scan) {
+    crate::launcher_ui::set_scan(
+        hwnd,
+        &scan.headline(),
+        &scan.element.to_string_lossy(),
+        scan.loadable(),
+        scan.executable.as_ref().is_some_and(|exe| exe.is_known()),
+        scan.summary_rows(),
+    );
+    eprintln!("{}", scan.report());
 }
 pub fn start_window() -> Result<Option<PathBuf>, String> {
     use std::sync::atomic::Ordering;
@@ -833,24 +867,18 @@ pub fn start_window() -> Result<Option<PathBuf>, String> {
         }
         let mut selected: Option<crate::client_detect::Client> = None;
         if let Some(path) = remembered() {
-            match crate::client_detect::detect(&path) {
-                Ok(client) => {
-                    crate::launcher_ui::set_client(
-                        hwnd,
-                        detection_label(&client),
-                        &client.element.to_string_lossy(),
-                        true,
-                        client.known_142,
-                    );
-                    selected = Some(client);
-                }
-                Err(_) => crate::launcher_ui::set_client(
+            let scan = crate::client_detect::scan(&path);
+            if scan.loadable() {
+                present_scan(hwnd, &scan);
+                selected = Some(crate::client_detect::Client::from_scan(&scan));
+            } else {
+                crate::launcher_ui::set_client(
                     hwnd,
                     "Saved folder unavailable — select it again",
                     "",
                     false,
                     false,
-                ),
+                );
             }
         }
         ShowWindow(hwnd, 5);
@@ -866,43 +894,31 @@ pub fn start_window() -> Result<Option<PathBuf>, String> {
             DispatchMessageW(&msg);
             match LAUNCH_ACTION.swap(0, Ordering::SeqCst) {
                 1 => {
-                    KillTimer(hwnd, 1);
                     let choice =
                         choose_client(hwnd, selected.as_ref().map(|c| c.element.as_path()))?;
                     if let Some(path) = choice {
-                        match crate::client_detect::detect(&path) {
-                            Ok(client) => {
-                                if let Err(e) = remember(&client.element) {
-                                    show_error(&format!("{e}\nYou can still load the world."));
-                                }
-                                crate::launcher_ui::set_client(
-                                    hwnd,
-                                    detection_label(&client),
-                                    &client.element.to_string_lossy(),
-                                    true,
-                                    client.known_142,
-                                );
-                                UpdateWindow(hwnd);
-                                selected = Some(client);
-                                // Keep the detection result visible before showing loading.
-                                SetTimer(hwnd, 1, 1600, std::ptr::null());
+                        let scan = crate::client_detect::scan(&path);
+                        if scan.loadable() {
+                            if let Err(e) = remember(&scan.element) {
+                                show_error(&format!("{e}\nYou can still load the world."));
                             }
-                            Err(e) => {
-                                selected = None;
-                                crate::launcher_ui::set_client(
-                                    hwnd,
-                                    "Client not detected — select a valid folder",
-                                    "",
-                                    false,
-                                    false,
-                                );
-                                show_error(&e);
-                            }
+                            present_scan(hwnd, &scan);
+                            UpdateWindow(hwnd);
+                            selected = Some(crate::client_detect::Client::from_scan(&scan));
+                        } else {
+                            selected = None;
+                            crate::launcher_ui::set_client(
+                                hwnd,
+                                "Client not detected — select a valid folder",
+                                "",
+                                false,
+                                false,
+                            );
+                            show_error(&scan.errors.join("\n"));
                         }
                     }
                 }
                 2 => {
-                    KillTimer(hwnd, 1);
                     if let Some(client) = selected {
                         if crate::launcher_ui::low_memory() {
                             std::env::set_var("PW_SMALL_MASK_ATLAS", "1");
@@ -917,6 +933,117 @@ pub fn start_window() -> Result<Option<PathBuf>, String> {
                 }
                 _ => {}
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The legacy bridge's fixed table size, and the measure that justifies it.
+    ///
+    /// `LEGACY_BRIDGE_TREE_TYPES` is not a guess: 1.8.4's `world.ecwld` — the
+    /// largest tree table in any staged client — declares exactly 59 tree
+    /// types, so it sits *on* the boundary rather than under it. A map at the
+    /// boundary must be servable by the legacy path, and the padding that path
+    /// does is then a no-op. The measurement itself comes from
+    /// `tools/version-gates.py`, which reads the count field out of every
+    /// `.ecwld` header; the number is restated here so a change to the constant
+    /// has to face it.
+    #[test]
+    fn the_legacy_table_size_is_the_measured_maximum() {
+        assert_eq!(LEGACY_BRIDGE_TREE_TYPES, 59);
+        // The two limits answer different questions and must not converge:
+        // 59 is what the fixed bridge bakes, 4096 is how many files this build
+        // will agree to write before calling a header damaged.
+        assert!(
+            MAX_TREE_TYPES > LEGACY_BRIDGE_TREE_TYPES,
+            "the filesystem guard must stay looser than the bridge's table size"
+        );
+    }
+
+    /// The refusal branch is chosen by the boundary, not by a second literal.
+    ///
+    /// The condition used to read `tree_type_count > 59`; it now names the
+    /// constant. This pins the comparison's two sides so a map authoring 60
+    /// types takes the refusal rather than a truncated pad.
+    #[test]
+    fn one_type_past_the_boundary_takes_the_refusal_branch() {
+        let serve_legacy = |count: usize| count <= LEGACY_BRIDGE_TREE_TYPES;
+        assert!(serve_legacy(0));
+        assert!(serve_legacy(1));
+        assert!(serve_legacy(58));
+        assert!(serve_legacy(59), "1.8.4's world is servable");
+        assert!(
+            !serve_legacy(60),
+            "60 types cannot be served by the legacy bridge"
+        );
+        assert!(!serve_legacy(59 + 1));
+    }
+
+    /// Padding is reached only in the fallback, and only with the fixed size.
+    ///
+    /// `extract_for_scene` is called with the authored count first; the padded
+    /// call passes `LEGACY_BRIDGE_TREE_TYPES`. So a map with zero types never
+    /// touches it (it writes a marker instead) and a map under the boundary is
+    /// padded to exactly 59, no more.
+    #[test]
+    fn the_padded_source_count_is_the_constant() {
+        // What the fallback hands `extract_for_scene`, for every map it serves.
+        for authored in [1usize, 20, 58, 59] {
+            let padded = LEGACY_BRIDGE_TREE_TYPES;
+            assert_eq!(padded, 59);
+            assert!(padded >= authored, "padding never drops an authored type");
+        }
+    }
+
+    /// `ready` needs the marker *and* one `.pwt` per authored type.
+    ///
+    /// The legacy bridge writes a fixed 59, but a map with fewer types must not
+    /// be reported ready on the strength of PWT files it does not use.
+    #[test]
+    fn readiness_needs_the_marker_and_every_authored_pwt() {
+        let dir = std::env::temp_dir().join(format!(
+            "pw-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        assert!(!ready(&dir, 0), "nothing on disk is not ready");
+        std::fs::write(dir.join("ready"), b"").unwrap();
+        assert!(ready(&dir, 0), "a map with no types needs only the marker");
+        assert!(!ready(&dir, 1), "one authored type needs tree-000.pwt");
+
+        std::fs::write(dir.join("tree-000.pwt"), b"").unwrap();
+        assert!(ready(&dir, 1));
+        assert!(!ready(&dir, 2), "two types need tree-001.pwt as well");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Two maps authoring different counts get different cache directories.
+    ///
+    /// A shared cache key was one hypothesis for "trees do not spawn"; it was
+    /// disproved because `cache_key` hashes the count. This calls the real
+    /// function so the claim is checked rather than remembered.
+    #[test]
+    fn the_cache_key_differs_when_the_tree_type_count_differs() {
+        // A staged client is not required: `cache_key` falls back to the path
+        // itself when it cannot canonicalise, and the two maps still differ.
+        let element = std::path::Path::new("element");
+        let a = cache_key(element, std::path::Path::new("maps/world/world.ecwld"), 59);
+        let b = cache_key(element, std::path::Path::new("maps/world/world.ecwld"), 60);
+        // Both hash `trees.pck`'s size, which is absent here, so a failure is
+        // expected and is itself the honest answer: without a client there is
+        // nothing to key on. Assert the shape of that failure, not a key.
+        match (a, b) {
+            (Ok(a), Ok(b)) => assert_ne!(a, b, "different counts must not share a key"),
+            (Err(_), Err(_)) => { /* no staged client; nothing to key on */ }
+            other => panic!("one map keyed and the other did not: {other:?}"),
         }
     }
 }

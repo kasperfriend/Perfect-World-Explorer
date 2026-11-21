@@ -218,7 +218,72 @@ done.
   and does not pretend its vendor SDKs either — this is the SDK-integration
   follow-up to #37, not a duplicate of it. Nothing from #38 or #37 was
   copied into this branch.
-- **Status:** open (PRs must be rebased/merged in order by the maintainer).
+- **Status:** resolved 2026-11-18 (both PRs closed unmerged; see the addendum).
+
+### Offline harness, corrected (2026-11-18)
+
+`tools/offline_harness.sh` used to stub `flate2` and link hand-written stand-ins
+for `goblin` and `sha2`, and claimed flate2 could not be built offline. Both
+were wrong, and the stand-in cost real time: its `goblin` exposed a
+`resource_directory` field that goblin 0.8.2 does not have
+(`pe/optional_header::DataDirectories` is a 16-slot array with
+`get_resource_table()` accessors), so the offline suite was green while
+`cargo check --locked --bins` failed on `E0609`. Fixes:
+
+- `tools/offline_harness.sh client` builds the **real** `goblin` 0.8.2, the
+  real `flate2` 1.0.35 and a correct SHA-256 from pinned sources with plain
+  `rustc` (the proc-macro chain `unicode_ident → proc_macro2 → quote → syn →
+  scroll_derive → scroll` is required by goblin's `scroll` dependency), and runs
+  the `client_detect` + `pck` + `angelica_pck` suite against them: 27 tests.
+  Only `encoding_rs` stays a stand-in, and the script says why.
+- The header comment now records the working build recipes and the fact that
+  the earlier `E0463`/`E0460` failures came from omitting `-L` for a crate's
+  own dependencies, not from the sysroot.
+- Two latent warnings that would have failed the Windows job under
+  `-D warnings` are gone: `unused_mut` on `src/dlss/loader.rs`'s NGX core and on
+  `src/pck.rs`'s DirectStorage bookkeeping (the latter is Windows-only, so it is
+  now `#[cfg_attr(not(windows), allow(unused_mut))]`), plus an unused `trailer`
+  local in `angelica_pck`'s test fixture.
+
+This is a tooling correction, not a client blocker: it is recorded here because
+"the offline suite is green" was used as evidence, and it was wrong.
+
+The same gap cost time again on 2026-11-18: `client` listed `libflate2.rlib` as
+an `--extern` but nothing ever built it, so every `client` run died on a missing
+extern. `real_deps` now clones and builds `miniz_oxide` (plus `adler2`),
+`crc32fast` (plus `cfg_if`) and `flate2` with the recipes in the script header,
+and four focused modes were added for the modules the gfx harness cannot reach:
+
+| mode | covers | tests |
+| --- | --- | --- |
+| `water` | `src/water.rs`, BSData record framing, shoreline arrays | 14 |
+| `gfx` | `gfx_file`, `gfx_decal`, `gfx_light`, `pck` | 74 |
+| `music` | `src/music.rs` precinct zones and teleport fallbacks | 12 |
+| `material` | `src/material.rs`, `dxt`, `terrain_sampling` | 25 |
+| `client` | `client_detect`, `pck`, `angelica_pck` | 27 |
+
+`PW_WATER_BSDATAS=<paths>` additionally runs the water suite against real client
+BSData files, which is how the `0x1af` framing bug was found and locked down.
+### B-6 addendum (2026-11-18) — client-version scanning
+
+`src/client_detect.rs`, `src/main.rs`, `src/launcher_ui.rs` and
+`src/windows_setup.rs` now also carry the folder scan (executable identity, the
+`(elements.data, tasks.data)` data-version pair, every `.pck` container version).
+PR **#38** touches `src/client_detect.rs`, `README.md`,
+`Findings/Unsupported-client-paths.md`, `src/main.rs` and
+`src/windows_setup.rs` as well, so while it was open the overlap was five files
+rather than four. All of it is non-algorithmic: #38 edits the
+Teleport-List/world-selection text and its own README section, while this work
+edits the "Client version scanning" section, the data rows of the launcher card
+and the `--diagnose-client` printer.
+`src/modules/librarian/{elements,database,mod}.rs`,
+`src/modules/designer/catalog.rs` and `src/bin/client-check.rs` are not touched
+by #38.
+
+**Re-checked 2026-11-18:** **#37 and #38 are both closed without being merged**
+(`mergedAt: null`). B-6 is therefore resolved for this branch — nothing is left
+to rebase against, and none of their code is present here. If either is
+reopened, the overlap above is what to expect again.
 
 ## B-7 — Frame pacing / UI input rate (Phase 4.21)
 
@@ -1448,3 +1513,670 @@ DLSS-G parameter type.
   answers — every path already writes its first successful frame
   (`[DLSS] first evaluate OK (…, DLAA)` /
   `[XeSS] first execute OK (…, Native AA)`), so one run per mode settles it.
+
+## B-29 — The six old-vs-new client bugs are one class: a version or size word read as data (fixed)
+
+The uploaded logs and the Drive clients (`Games/`: 1.3.1, 1.3.6, 1.4.2, 1.4.4,
+1.5.0, 1.5.2) describe six symptoms. Five of them are the same mistake in
+different places: a number that describes the file was treated as part of the
+file.
+
+- **`unsupported A3DWaterArea version 0x1af` (1.3.1 world, 431 = `0x1af`).**
+  Every BSData record from 1.4.x/1.5.x is stored zlib-framed as
+  `stored_len, raw_len, zlib(raw)`; 431 is a *stored length*, and the old reader
+  read it as a version word and rejected the whole map, which is what forced the
+  "no water" fallback. Verified against `8.dat` and `9.dat` from the Drive
+  `a37` folder: all 128 records carry the 32768-byte window. `water::parse_record`
+  now resolves the framing, then walks `version, count, area…` from the first
+  real version word inside the inflate window. Field offsets moved to the
+  fields-relative base (`color` at +0, mask at +37/+36) so a run of several
+  areas sharing one header walks correctly. A record that still cannot be read
+  is skipped with a diagnostic instead of failing `water::load`, which used to
+  abort the entire world load.
+- **`a37` (Morai) failing on a missing `Temp/notex.bmp`.** `material::Materials`
+  turned one absent terrain texture into `missing texture …`, which failed the
+  map. The client paints its missing-texture image and keeps the map;
+  `notex_pixels()` builds that stand-in (a 4x4 DXT1 magenta DDS, no mip chain)
+  and it is validated against the real sampler and DXT decoder in
+  `tools/offline_harness.sh material`. An authored DDS the device would reject
+  is still an error — only an absent name substitutes.
+- **1.5.2 scenery missing: `GFX version 93 is newer than the client's 79`.**
+  `gfx_file::parse` refused any `MOXTVersion` above the measured 79. The
+  container grammar is version-gated per key, so a newer root is readable; the
+  gate is now a one-line note. `gfx_decal` lost its upper bound the same way.
+  `gfx_light` keeps its 79 refusal on purpose: it validates a light layout it
+  has measured, and reading version-90 keys as 79 would publish invented lights.
+  A root refused there is retried through the animated reader, so its other
+  elements still play.
+- **1.4.4 teleport lists empty / flat.** Version-6 precinct files carry a polygon
+  but no centre line, and `music::Zone::center` was `None` for all of them, so
+  the fallback in `gpu.rs` had no position for any zone and fell through to a
+  single synthetic point at the origin. `polygon_centre` supplies the
+  area-weighted centroid (average vertex for a degenerate polygon) and the
+  authored vertex height, so each zone is a real fly-to location. The last-resort
+  destination is now 3 units above the terrain rather than 30 above y=0.
+- **Launcher card overflow + auto-launch.** The card had four version rows in a
+  96-pixel panel, so the fourth row painted over the buttons; it now draws
+  exactly the three requested versions (game, tasks, elements) in a 104-pixel
+  panel. `summary_rows` returns exactly those three. Selecting a folder armed
+  `SetTimer(hwnd, 1, 1800, …)` and launched on `WM_TIMER`; both are gone, so only
+  the **Enter world** button (id 102) launches. Guarded by
+  `selecting_a_folder_never_launches_on_a_timer` in `src/main.rs`, which scans
+  the launcher source and runs on Linux CI.
+- **`unsupported PCK version 00020003` (1.5.2).** The client dispatches on the
+  version word at `nOffset - 4` and has three revisions in use; the reader
+  handled only `0x00020002` and `0x00020001`, so a `0x00020003` pack — the one
+  the 1.5.2 client's `models.pck` uses — was refused outright. All three share
+  one shape (a trailer holding the guards and the entry offset, then a run of
+  length-prefixed entry records), and only the sizes differ, so the reader now
+  walks them from one table derived from the engine structs:
+
+  | struct | `sizeof` | fields |
+  |---|---|---|
+  | `FILEHEADER` | 272 | `dwFlags` +12, `szDescription` +16, `guardByte1` +268 |
+  | `FILEENTRY` | 276 | `dwOffset` +260, `dwLength` +264, `dwCompressedLength` +268 |
+  | `FILEHEADER_0x00020003` | 280 | `dwFlags` +16, `szDescription` +20, `guardByte1` +272 |
+  | `FILEENTRY_0x00020003` | 288 | `dwOffset` +264 (64-bit), `dwLength` +272, `dwCompressedLength` +276 |
+
+  The trailer's field offsets move in `0x00020003` because `dwEntryOffset` is
+  64-bit there, which pushes `dwFlags` and `szDescription` eight bytes along;
+  that is the part a guessed layout gets wrong first. The file count is not a
+  trailer field in any revision — the client reads it from `nOffset - 8`.
+
+  Two further mistakes this exposed, both now fixed and pinned by a test:
+  entry records are stored verbatim only when compressing them did not shrink
+  them, otherwise each is a zlib stream of itself (the old loop would have
+  desynchronised on the second record of a compressed table); and the
+  `szDescription` "lica File Package" check the client performs was not
+  reproduced, so two synthetic test fixtures were not packages the client would
+  ever open and passed only while that check was missing.
+
+  Verified against a real pack: `gfx.pck` from the 1.3.6 client parses to 3499
+  entries and **all 3499** decode to their declared length. The reader also now
+  names a split package (a prefix declaring more bytes than the file holds, with
+  a `.pkx` beside it) instead of reporting a truncated archive, and reproduces
+  the same length-prefixed record walk for both older revisions.
+
+- **Status:** fixed and unit-tested. Verified offline against real Drive BSData
+  (`water`, `gfx`, `music`, `material` harness modes, 152 tests). The remaining
+  hardware questions are the same as B-2 and B-3.
+
+## B-9: the `.pck`/`.pkx` split, and grass that aborts the whole map
+
+Two runtime failures the 1.5.2 and 1.3.1 clients reported, both caused by a
+reader treating "I do not handle this" as "the data is corrupt".
+
+**The split package.** The 1.5.2 client ships `litmodels.pck` as a
+2,147,483,392-byte file. That number is `0x7fff_ff00`, the engine's
+`MAX_FILE_PACKAGE`: `AFilePackage` never writes past it, and starts the next
+file of the same stem with a `.pkx` extension instead. The header still declares
+the size of the *whole* package (2,859,188,412 bytes here), and an entry's
+`dwOffset` is measured from the start of the first file, so it runs past the
+split point rather than restarting at zero. Both the entry table and the trailer
+land in the `.pkx` because they are written last.
+
+The reader opened only the `.pck`, saw a declared size larger than the file, and
+reported `bad package end offset`. `objects.rs` then dropped the archive, so
+every scenery model was "unavailable" — 22,981 of them in the 1.5.2 report. The
+map itself was fine.
+
+`pck::Package` now opens the pair and reads it as one package:
+
+- `Package::open` picks up `<stem>.pkx` only when the `.pck` is exactly
+  `MAX_FILE_PACKAGE` long, so a stray `.pkx` beside a small pack is never
+  mounted.
+- The trailer is read from the `.pkx`'s tail, with `end` rebased on that file
+  because its offsets are relative to *its* start.
+- `read_package_range` and `read_entries_parts` read positionally, so an entry
+  that starts in one half and ends in the other is read from both. The
+  DirectStorage batch path is skipped for a split, since its queue is opened on
+  one file.
+- A file of exactly `MAX_FILE_PACKAGE` with no `.pkx` now names the missing half
+  instead of calling the size word corrupt.
+
+Pinned by `a_split_package_is_read_through_its_pkx_continuation`, which builds a
+real split (a `.pck` at the split point, a `.pkx` holding the trailer, the table
+and the tail of a straddling payload) and checks the payload is reassembled, and
+by `a_split_package_must_have_halves_that_add_up_to_the_declared_size`.
+
+**Grass that took the map with it.** `Grass::load` returned `Err` from inside
+its per-group closure for any area it could not decode — a BSData index past the
+EC-BSD name table (`grass record index`), a record whose uncompressed size did
+not match the area's own mask (the `invalid grass compress size` guard), or a
+BSData file that is not in the map folder. One such area aborted the load for the
+whole map, which surfaced as a modal error instead of as thin grass.
+
+Each of those is now a per-area skip with one summary line naming the first eight
+distinct reasons, and an authored-empty BSData stub (`MOXB`, version 2, zero
+records) is recognised as empty rather than as corruption. Against the real 1.3.1
+`world`: 113,101 live grass cells load, where before the load failed outright.
+
+The layout itself was never wrong — the real `.ecbsd` records at the offsets the
+ECWLD references point at are well-formed 36-byte areas (`type_id` +0, centre
++4/8/12, grid +16, width +20, height +24, record +32), and all 1,120 references
+to the staged `BSData\20.dat` decode their masks exactly.
+
+**`grasses.pck` is an Angelica container.** The geometry half opened the pack with
+`pck::directory` only, and this pack has no `fdfdfeee`/`f00dbeef` guard words —
+its entries sit behind the plain `0x4dca23ef` prefix. So the reader rejected the
+archive and the whole grass load failed, taking the placements with it. Both
+containers are now tried, and a pack that opens as neither leaves the placements
+in place without geometry instead of failing:
+
+```
+Loaded 121 grass areas, 72121 active bits, 0/220 MOXB types, 0 textures
+```
+
+The `0/220` is honest: the 1.3.1 `grasses.pck` staged here is the 103-entry
+editor corpus (`帝国花草/…`), which does not contain the world's `水草02.mox` and
+friends. The loader names each missing model rather than pretending it loaded
+one.
+
+- **Status:** split reading fixed and tested (45 `client`-mode tests green). Grass
+  loads 121 areas / 72,121 live cells from the real 1.3.1 world instead of
+  failing, and degrades per area and per model. Water is still open: see B-10.
+
+## B-10: an open-water area reads 21 % dry
+
+Both the 1.3.6 and 1.5.2 runs log exactly one water area, and log it identically:
+
+```
+export=2538 colour=0xff4f889d simple=false height=216.000 grid=32.000
+cells=16x21 wet=265 of 336 centre=(1792.00,216.00,4272.00) shore_waves=10
+```
+
+32 m cells over 16x21 is a 512 m x 672 m patch centred on open water, and 71 of
+its 336 cells have a zero mask byte. The client does not use the mask the way
+this reader does: `A3DWaterArea::IsInWater` (`0x781c50`) threshold-tests a
+bilinearly interpolated height, so a zero cell is a *depth* edge, not a hole, and
+the surface still exists there. What the log then renders is a water plane with a
+fifth of it missing.
+
+`contains_xz` reproduces the client's inside test, which is right for "is the
+camera under this surface". It is the wrong function to build the drawn surface
+from.
+
+`gpu.rs` built the water mesh by skipping every cell whose mask byte was zero:
+
+```rust
+if a.mask[row * a.columns + col] & 1 == 0 {
+    continue;
+}
+```
+
+That is the bug. The mask is depth/shore data; a zero cell is a shallow cell
+inside the surface, not a hole in it, so the surface has to cover the area's whole
+`columns x rows` grid. The cell is now emitted regardless of its mask byte, which
+restores the 71 missing cells of the open-water area in both clients. The log line
+keeps reporting the authored `wet` count and now says `(all drawn)`, so the number
+reads as the mask statistic it is instead of as a coverage fraction.
+
+`WaterArea::has_surface_xz` is added next to `contains_xz` for callers that do want
+wet-vs-dry: it keeps the inside test and adds the mask, so the two questions stay
+separate instead of one function answering both wrongly.
+
+- **Status:** fixed. The mask values were always read correctly (the byte
+  distribution matches between both clients and the area's own `shore_waves=10`
+  parses); the surface was being culled from them. Confirming the rendered result
+  still needs a frame, which no sandbox path here can draw.
+
+## B-11: water records declare an area count they do not have
+
+The "water is broken in chunks" report (1.3.1, 1.4.4, 1.5.2) read as a geometry
+problem for two rounds. It is not. The walk over a water record read the word
+after the version as the number of areas in the run and then decoded that many.
+
+Every water record in the retail 1.3.1 patches that decodes at all holds exactly
+**one** area, and declares a different number:
+
+| record | declares | actually holds |
+| --- | --- | --- |
+| `bsdata/21.dat` record 0 | 3 | 1 |
+| `bsdata/4.dat` record 1 | 3 | 1 |
+| `bsdata/36.dat` record 9 | 6 | 1 |
+| `bsdata/36.dat` record 10 | 8 | 1 |
+
+In each case the single area's shoreline arrays end on the record's last byte, so
+the area was decoded correctly and then thrown away: the second iteration walked
+into the bytes past the end, failed with "truncated water data", and the whole
+record's result was discarded with it. Modelled over the real patches, the old
+walk decoded **0** areas and the new one decodes **11**.
+
+`decode_areas` now bounds itself by the payload and ignores the word. It stops
+when the bytes are exhausted, and a declared count of zero no longer suppresses a
+record that has content.
+
+The 1.5.2 log independently rules out the mask, which was the previous theory:
+its build already drew every cell of the one area it had, and the report was made
+against that build.
+
+The rest of the loader is now reference-local, so a missing `.dat`, a bad header,
+an out-of-range index or a bad record table each cost their own references and are
+named on the `SceneWater` channel. Before, one bad index aborted the map's water.
+README: `tools/offline_harness.sh water` runs the 15 tests (including
+`a_lying_area_count_does_not_discard_the_area_that_decodes`) against the real
+patch bytes.
+
+- **Status:** fixed and tested. The skipped-by-mask half of the same report is B-10.
+
+## B-12: the 1.8.4 client, and why no version would load
+
+Reported as "no version loads at all", with a modal reading
+
+    unexpected error while loading/rendering the selected map:
+    No fonts available until first call to `Context::run()`
+
+for 1.3.1, 1.3.6, 1.4.2 and 1.4.4, and
+
+    only ECWLD version 12 is supported
+
+for 1.8.4.
+
+**The font engine was a regression in this branch, not in the clients.**
+`extend_fonts` seeded itself from `ctx.fonts(|f| f.lock().fonts.definitions())`
+when no copy was stored, and the new interface font made that the first call,
+right after `Context::default()`. egui panics there — `ctx.fonts()` is only valid
+after a frame has run. The panic was raised inside `gpu::run`, so
+`recoverable_map_operation` wrapped it as a map failure and every version stopped
+on the same dialog. `extend_fonts` now seeds from `FontDefinitions::default()`,
+and the font is installed on the first frame that draws UI, where the pixels-per-
+point `set_fonts` keys its atlas by is also known.
+
+**The version gate named one number.** `Scene::parse` refused anything but 12.
+The ECWDFILEHEADER is 14 fixed fields plus 60 reserved bytes from v12 onward
+(`EC_WorldFile.h`), so versions at or above 12 share the layout and v12 logic;
+the per-block length check still rejects a file that does not add up. Below 12 is
+refused by number, naming both. A file that is not an ECWLD says so.
+
+**1.8.4 ships a three-file package, and its middle file is two splits wide.**
+`element/building.pck` is 2,147,483,392 bytes (`MAX_FILE_PACKAGE`),
+`building.pkx` is **4,294,966,784** — exactly two `MAX_FILE_PACKAGE` — and
+`building.pkx1` is 1,733,966,474. The sizes come from the Drive upload of the
+1.8.4 client, which is the only evidence available: the CDN is unreachable from
+this sandbox.
+
+Two assumptions fell with those numbers.
+
+* *A continuation is one split wide.* It is not. Piece starts are cumulative,
+  so `pkx1` begins three splits in, not two. `Layout` now records each file's own
+  length and derives the starts by adding them up (`Layout::of_pieces`), where it
+  previously computed `n * MAX_FILE_PACKAGE`.
+* *An entry offset fits in 32 bits.* It does not. The reader refused any 64-bit
+  `dwOffset` above 4 GiB on the grounds that no archive is that long; an 8.2 GB
+  package makes offsets past 4 GiB ordinary. `Entry::offset` is `u64` end to end
+  now, and a far offset is bounds-checked against the package rather than
+  narrowed to a near one.
+
+`Package` opens continuations until the first name that is missing, and every
+range -- directory table, BMDs, textures -- is read through the ordered piece
+list. `objects.rs` used to read through a two-file entry point
+(`first_file`/`second_file`), which silently ignored the third file; it now uses
+`read_entries_in` with the package's own piece list.
+
+The size word is a `DWORD`, so that package's total (2 GiB + 4 GiB + remainder)
+cannot be stated and the word is it truncated. `safe_header` accepts the wrap
+only when every piece is open; the pieces are the evidence.
+
+- **Status:** the font panic, the gate and the three-file package are fixed and
+  pinned by tests. What is *not* established is whether 1.8.4's `world.ecwld`
+  is version 12; the file has not been read here. If it is, the gate now admits
+  it and any remaining failure will name the block, the offset and the count
+  instead of the version.
+
+## B-13: three separate faults, each named by the evidence
+
+The census line added in B-12 answered the 1.5.2 report on its first run, and
+the 1.8.4 string error turned out to be a version-layout field. The three are
+unrelated; what they share is that the tree was reading the wrong file or the
+wrong stride, not that the clients are unusual.
+
+**1.5.2 has no buildings because its scenery archive is not readable.
+`litmodels.pck` fails with `entry table overlaps footer`.** The census line
+reported `22981 ornament placement(s) in the map, 272 selected here, 0 drawable,
+22981 names this client cannot resolve`, with
+`litmodels/world/44/litmodel_1125.bmd: litmodels.pck was not indexed`. The map
+authors 22,981 ornaments — the world is untouched — and not one model resolves
+because the archive directory cannot be walked. This is not the split-package
+bug from B-12: the package opens, and its *trailer* disagrees with itself. The
+message used to be the two words "overlaps footer"; it now reports where the
+trailer says its table is, how many bytes precede that point, which piece it is,
+the declared end, the base and the count.
+
+*Cause*: 2,147,483,392 + 711,705,020 bytes in the `.pck`/`.pkx` is a package
+longer than four gigabytes, and this revision's table word in the trailer is
+only 32 bits. The reader treated it as a position in the whole package and then
+compared it against the length of the *piece* holding the footer, which no
+32-bit value can survive: 2,859,188,412 was checked against 711,704,732 and
+refused. The word can only be meaningful when it counts from the start of the
+piece that holds the footer, so the table is now looked for both ways -- package
+absolute first, which is what every entry offset in this revision means and the
+only reading that works below four gigabytes, then piece local -- and the first
+well-formed table wins. A test builds that exact shape from a sparse `.pkx`.
+
+The message still reports every number when neither reading parses, so a run
+that fails again says which of the two was tried and how each one failed.
+
+**1.8.4's `oversized ECWLD string` is a static-model record that grew a scale.**
+The reported number was `1065353216` = `0x3F800000` — the float `1.0` read as a
+length. The model record was read as `export id, position, direction, up` and
+then two strings; from the layout that added `fScale`, a `float` sits between
+`up` and the path, so the reader took the scale for a string length and lost the
+rest of the block. Measured on the real files, not guessed:
+
+| file | version | blocks that misread without the field | with it |
+|---|---|---|---|
+| 1.8.4 `world.ecwld` (2.85 MB) | 17 | 65 | **0 of 22,528** |
+| 1.5.2 `world.ecwld` (2.32 MB) | 12 | **0 of 22,528** | 34 |
+
+So the field is read from version 13 onward (`MODEL_SCALE_VERSION`), where the
+next layout revision puts it, and version 12 keeps its old stride. The scale is
+carried on `SceneModel` rather than discarded, because a value in 0.5–2.8 on a
+static model is what the client scales it by.
+
+**Zone names were Chinese, not a font fault.** `precinct.clt` stores names in
+the client's localisation, so a Chinese 1.5.2 world shows `刺骨之地` and no CJK
+font renders it. `src/world_place_names.rs` carries 243 English names derived by
+joining the two shipped files for the same map — the Chinese `precinct.clt` from
+1.5.2 and the English one from 1.8.4 — on their polygon vertices: 382 zones in
+the Chinese file, 378 found in the English file, all 378 agreeing on one English
+name, 243 distinct, no conflicts. Four zones the English file does not carry are
+left as authored rather than guessed, and the teleport list uses the same table.
+
+## B-30: a duplicated `case` label hid a whole test suite (fixed)
+
+`tools/offline_harness.sh` dispatches on `${1:-test}` through one `case`. Two
+arms were labelled `music`:
+
+- the first, a `precinct.clt` **probe** binary that prints zones/tracks/ambience
+  per file;
+- the second, the **test suite** for `src/music.rs`.
+
+A shell `case` takes its first match. So `offline_harness.sh music` ran the
+probe, the suite behind it never ran, and nothing said so: `case` does not warn
+about a duplicate label, and both arms are syntactically valid. The suite it hid
+is the only place that exercises the version-7 precinct reader and the zone
+fallback points, and it is not small — **27 tests** that had never executed.
+
+This is the same shape as the earlier finding that `test` never compiled
+`gfx_player`: a gate that reports success because it never ran the thing. The
+difference is that a missing module is visible in the file, while a shadowed
+`case` arm is not visible anywhere.
+
+**Fix.** The probe is now `music-probe` (and the usage line lists both), and
+`check` runs `tools/check-harness-arms.py`, which parses the mode labels and
+fails on a duplicate with both line numbers. 19 labels, all reachable. The guard
+is tested against a two-arm duplicate and does fail on it.
+
+**Same class, second instance, also fixed.** One comment in the generated
+`lib.rs` heredoc contained a bare backtick pair (`` `terrain_block` ``), so the
+shell ran ``terrain_block`` as a command substitution while writing the file:
+`bins` printed `line 594: terrain_block: command not found`, and the comment
+line in the generated Rust was left with an empty gap. Everything after the
+backtick silently vanished. Heredocs that write Rust escape every backtick as
+`` \` ``; this one line had been added without it.
+
+**Corpus tests that skip are now counted.** A corpus test that prints `SKIPPED:`
+and returns `Ok` is a *pass* to libtest, so `286 passed` read the same whether
+or not the tests that open shipped data actually opened it. Three cases are now
+counted and printed under the summary: a missing archive, and — new — a *member*
+a staged archive does not carry. Builds differ: the staged 1.3.1 `gfx.pck` has
+no `gfx/场景/新种族地图/` tree at all, so four tests panicked with "is not in
+gfx.pck" on a pack that simply does not contain those records. That is a property
+of the staged file, not a reader regression, so `pck::corpus_member_absent` makes
+it a counted skip (`PWE_CORPUS=require` still makes it a hard failure). The
+`test` and `player` modes now end with the skip count and a line saying those
+tests prove nothing about the shipped data.
+
+Measured after the fix: `check` clean, `test` 203, `player` 286, `music` 27,
+`gfx` 94, `water` 20, `material` 25, `bins` 38/38.
+
+**Same class, third instance.** `src/diagnostics.rs` has 18 tests and the
+harness stubbed the whole module out, because it calls a dozen `egui` builder
+methods from the settings page. The tests went with the stub, so
+`every_channel_has_a_unique_key_and_fits_the_mask` — the test that requires
+`Channel::ALL` to be in discriminant order, because the discriminant *is* the
+mask bit — had never run. Adding one channel broke it and nothing said so.
+`tools/fixtures/egui_stub.rs` is the smallest `egui` that satisfies those call
+sites (builder methods return themselves, widgets do nothing), and
+`offline_harness.sh diagnostics` runs the real file against it: 18 tests. Two
+of them failed immediately on the new channel, and one of those was a
+hard-coded `36` in an assertion about the channel count, now derived from
+`CHANNELS`.
+
+## B-31: element 170 is authored but never played, and the status line hid which files were dropped
+
+`gfx_player` counted `170` sound elements in `Stats::sounds` and drew nothing,
+which is honest as far as it goes, but nothing named *which* sounds were
+dropped, so an entire element type stayed invisible. Measured over the 2,071
+`gfx.pck` roots of the staged 1.3.1 pack:
+
+- 2,070 roots parse; **0** reach `Spec::Unknown`; the one failure is a 4-byte
+  `MOXT` stub with no fields. No element id in that corpus is unhandled.
+- Element 170: **355 elements in 340 roots, 355 path rows** — one path each, so
+  `PathNum` batching is authored but never used in this pack.
+- The 355 rows name **139 distinct paths** under five roots: `Skill\` 77,
+  `Effect\` 33, `Creature\` 19, `Item\` 8, `Ambience\` 2. Volume 100,
+  `Force2D: 0` and `IsLoop: 0` in every sample.
+
+So these are skill and creature sounds, and they are *effect* audio, distinct
+from the EC-BLD sound records `world_audio.rs` already plays. New diagnostic
+channel `effect-sounds` prints each one with its root, paths, volume, 2D and
+loop flags and placed position, so the gap is per-root and measurable.
+
+Not wired to playback: `world_audio` resolves paths under an `sfx/` prefix
+against `sfx.pck`, and no `sfx.pck` is staged here, so whether these authored
+paths use the same base is unverified. Guessing the base and shipping silence
+would be worse than a named gap.
+
+**Guard widened, and it found two more.** `tools/check-harness.py` (renamed from
+`check-harness-arms.py`) now also parses every *unquoted* heredoc body and fails
+on an unescaped backtick, quoting the line. It found two live instances beyond
+the one that started this: a comment in the `content` sweep mentioning
+`` `image` `` and one naming `` `interfaces/iconlist_guild.dds` ``. Both were
+being command-substituted away in the generated Rust. Quoted heredocs
+(`<<'EOF'`) are exempt, because nothing expands in them; a test proves both
+directions.
+
+## B-32: a test that existed but was never compiled
+
+The activation-census partition was first tested inside `world_models_gpu`, and
+`grep world_models_gpu tools/offline_harness.sh` returned nothing: no mode
+compiles that file, so the test would have been dead on arrival and the suite
+would have stayed green without it. The decision is now `src/effect_census.rs`
+— a pure function over the three gate booleans, with `record`, `plays` and the
+four bucket labels — and `world_models_gpu` calls it. Four tests run under
+`test` (207 total): the buckets partition all eight gate combinations, `plays`
+is exactly bucket 0, first refusal names the bucket in the printed order, and
+every bucket has a label.
+
+The general lesson, and the third instance of it in this stretch: a green suite
+says nothing about a file no mode compiles. `src/diagnostics.rs` was stubbed,
+`src/gfx_player.rs` was left out of `test`, and `world_models_gpu` was in no mode
+at all. Each was found by reading the module list, not by a failing test.
+
+**Narrowed.** The key rule was the suspicious part and it is now tested:
+`src/sound_key.rs` (4 tests, new) proves the two record types that name a sound
+agree — `configs/sound.txt` writes `SFX\Item\EquipSound\DownGem.wav`, a GFX
+element-170 record writes `Item\EquipSound\DownGem.wav`, and both key to
+`sfx/item/equipsound/downgem.wav`. It also proves the five authored roots
+(`Skill`, `Effect`, `Creature`, `Item`, `Ambience`) all key under `sfx/`, and that
+traversal and absolute paths are refused.
+
+`sfx.pck` cannot be staged: all nine copies in the Drive folder are 123–880 MB,
+above the 100 MiB transfer limit. So the remaining question is "does this archive
+contain those members", not "is the path base right". Recorded as that, because
+the two are not the same gap and only one of them is a reader problem.
+
+`world_audio` is in no harness mode, which is why its key logic could be wrong
+without anything noticing — the fourth module found that way in this stretch.
+
+## B-33: `litmodels.pck`'s trailer cannot be byte-checked from here
+
+**The claim.** The 1.8.4 `litmodels.pck` is a split package: a
+`litmodels.pck` of `MAX_FILE_PACKAGE` bytes plus a `litmodels.pkx` holding the
+entry table and the trailer. The reader treats the pair as one package
+(`B-9`), and that is unit-tested against a *synthetic* split.
+
+**What is missing.** The trailer bytes and the declared entry count of the
+**shipped** file have never been read, because every copy of the archive on
+Drive is larger than this session can move:
+
+| copy (Drive id) | size | verdict |
+|---|---|---|
+| `1_Ml5cQYH2Ju0rncDDlq_btUhV0RdG4dr` | 2,147,483,392 | too large |
+| `1XblAQ5HOKBMm7uJjfQ4HamW9Kud0kcfX` | 2,147,483,392 | too large |
+| `1LExT4iTqzAmfAVe-d0b81fo9yO_C8j8D` | 2,147,483,392 | too large |
+| `1usEpBayfP7fZPOFm5JJ2WPRMVEy6UkMV` | 1,499,648,516 | too large |
+| `1QjZ7vBOnM4mnuAhGCZ1nePoNrcjoMa-I` | 924,774,372 | too large |
+| `1_T0KQIqTrJVfHe4ubAbhoBaG0TW8cdc-` | 397,425,471 | too large |
+| `1m0Liu5bG-3KrUX23tqIb4kWVsG4cdwec` | 312,873,277 | too large |
+| `1Pntczb2wvDO1VOuSRz_cQN-kndxqC315` | 279,497,820 | too large |
+
+The transfer path caps at 100 MiB, and `ci` cannot reach Drive at all: the
+workflow stages whatever sits in `google_drive/`, and a checkout has nothing
+there.
+
+**The exact measurement that would settle it.** Read the last 288 bytes of the
+`.pkx` and the four bytes at `end - 8`:
+
+1. the 280-byte trailer, and whether `guardByte0`/`guardByte1` are
+   `0xfdfdfeee`/`0xf00dbeef`;
+2. the version word at trailer `+4` (expected `0x00020003`);
+3. `dwEntryOffset` at `+264` as a `u64`, unmasked with `0xa8937462`, and whether
+   it lands at or above `MAX_FILE_PACKAGE` (which is what makes the pair
+   necessary);
+4. the entry count at `end - 8`, and whether a full walk of that many records
+   ends exactly at the trailer.
+
+**How to unblock.** Either place a `litmodels.pck`/`.pkx` pair in the workspace
+(then `tools/offline_harness.sh pck google_drive` reads it and prints all four
+numbers), or add a CI step that fetches it. Neither is available in this
+session: the first needs a file larger than the transfer limit, and the second
+needs credentials CI does not have.
+
+**Why it does not block the trees work.** `litmodels.pck` holds scenery model
+geometry, not trees. Tree geometry comes from `trees.pck`, which is checked byte
+for byte at three client versions. So the tree verdict in
+`docs/cross-version-matrix.md` stands without this.
+
+## B-34: the 1.8.4 minimap -- wide trailer, 32-bit table word (cause found)
+
+**What the client says** (1.8.4, `element/surfaces.pck`, 1,149,108,099 bytes):
+
+> 00020003: entry table overlaps footer: the trailer declares its table at
+> 18446744070561829572 but only 1149107811 bytes of this file (len 1149108099)
+> precede the footer (declared end 1149108099, base 0, count 22269, flags
+> 0x00000000); a 32-bit reading of the same field sees 1147245252 (the half above
+> it is 0xffffffff); neither reading fits inside the footer; 00000000: not an
+> Angelica file package (description tag missing)
+
+**The cause, from the two halves of that line.**
+
+`flags 0x00000000` is this reader's own flag word, so it was read from `+16`. In
+the **wide** `0x00020003` layout `+16` is `dwFlags`; in the **narrow**
+`0x00020002` layout it is the first four bytes of `"Angelica..."`, which are
+`0x65676e41` and never zero. A zero there can only be a real `dwFlags`, so this
+file's field order is the wide one: 280-byte struct, `dwFlags` at `+16`,
+`szDescription` at `+20`, and that 252-byte region ends exactly at `guardByte1`
+at `+272`.
+
+The table word is the other half. `18446744070561829572` is 2^64 minus
+3,147,722,044; its low half is 1,147,245,252, leaving 1,862,559 bytes for 22,269
+records — 83.6 bytes each, which is what 288-byte records deflate to.
+
+So the struct is wide and the table word is 32 bits, and no candidate covered
+that pair: `REVISIONS`' `0x00020003` read 64 bits, and `TRAILER_PROBES[0]` read 32
+bits but looked for the description at `+16`. The trailing *"description tag
+missing"* is that probe reaching the tag check and being turned away — the table
+was never walked, which is why the arithmetic that looked right changed nothing.
+
+**Fixed:** `TRAILER_PROBES` gains the wide-order/narrow-word row, and
+`surfaces_trailer_with_zero_flags_and_a_dword_word_is_read` assembles the shipped
+shape and asserts the narrow probe is refused on the description while the new one
+is admitted and `directory()` returns the entries.
+
+**Two wrong models, recorded so they are not retried.**
+
+1. It is *not* a signed-word problem. `pck::table_offset` already unmasks what it
+   returns, so reading the field as `i64` double-transforms it, and `^ MASK`-ing
+   the value it already returned produces a bogus table span. The alternative
+   width is the value's low 32 bits, full stop.
+2. It was *not* a missing width. A DWORD probe already existed; what was missing
+   was the *field order* to go with it.
+
+**Still unverified, and this is the remaining risk.** `surfaces.pck` is
+1,149,108,099 bytes, over the 100 MiB transfer cap, so the trailer was
+reconstructed from the refusal's own numbers rather than read. If the file's
+description actually sits at `+16` after all, the fix is aimed at the wrong field
+and the refusal will say so again.
+
+**How to confirm without transferring a gigabyte.** Only the last 288 bytes and
+the table region matter. Read the trailer at `len - 288` and print, for
+`+0`, `+4`, `+8`, `+12`, `+16`, `+20`: whether `guardByte0` is `0xfdfdfeee`,
+the version word (expect `0x00020003`), the table word, and the four bytes at each
+of `+16` and `+20`. A zero at `+16` followed by `Ange` at `+20` confirms this
+diagnosis outright; `Ange` at `+16` refutes it.
+
+**A second file, if the error came from one.** The message says "Original minimap"
+and the report names `minimap.pck`, while `src/navigation.rs` opens
+`element/surfaces.pck`. If the user's build really opens a `minimap.pck`, that is
+a different file this branch has never read; the sizes differ (the Drive copies of
+`surfaces.pck` are 1,149,108,099 / 690,293,053 / 269,309,408 / 232,590,220 /
+120,297,427 / 100,313,426 / 93,542,325 / 74,388,626 bytes), and 1,149,108,099 is
+the one whose length appears in the refusal, so the two names are the same file.
+
+## B-35: 1.8.4 "no water too" — the area word is `4`, not `0x100SSSSS` (fixed)
+
+**What the client says** (1.8.4, from the shipped `world.ecwld` + `world.ecbsd`):
+
+> water 99: BSData 3 (BSData/4.dat) record 1 skipped: not a water record: the
+> zlib frame does not inflate: deflate decompression error
+> 0 water areas, 0 cells, 0 of them wet
+
+**The cause.** Two facts about the 1.8.4 records, both measured on the files
+rather than inferred from the loader:
+
+1. Their `dwVersion` is a plain `u32 4`. Every earlier revision writes a
+   `0x100SSSSS` word, so `parse_record` saw `4` and reported it as "neither a
+   known `A3DWaterArea` version nor a plausible zlib frame". `BSData/7.dat`
+   record 0 — a complete 32×32 area whose 46 shoreline waves end exactly at the
+   end of the record with `shaders\textures\water\wave1.dds` — is the fixture
+   that proves it, and `4.dat` records 1 and 8 and `44.dat` record 9 agree.
+2. `decode_areas` placed the first area's fields eight bytes past the version
+   word, which is right for a `0x100SSSSS` prefix and wrong for v4. That alone
+   turned a valid grid into nonsense even once the word was accepted.
+
+**The v4 field order is v2/v3's, with one change far downstream.** Measured on
+`7.dat` record 0, offsets relative to the version word + 4:
+
+| offset | field | value |
+|---|---|---|
+| +0 | `dwColor` | 4 |
+| +4 | `fHeight` | 216.0 |
+| +12 / +16 | `dwColumns` / `dwRows` | 32 / 32 |
+| +20 | `fCellSize` | 32.0 |
+| +24 | `vCenter` | 2560, 216, 5120 |
+| +120 | `byCellMask[cols*rows]` | 1024 B, **533 set** |
+| +1144 | `dwWaveCount` | 46, waves run to EOF |
+
+So the difference from v2/v3 is not a reordering: v4 inserts 84 bytes of fields
+between the centre vector and the mask, which moves the mask from +37 to +120.
+
+**Result.** 5 of the 7 water references whose patch is in hand decode as grids:
+`4.dat` 1 (32×32, 17 wet) and 8 (8×8, 39), `7.dat` 0 (32×32, 533), `21.dat` 0
+(60×64, 900), `44.dat` 9 (8×32, 99). The two that do not are `21.dat` records 15
+and 25: they inflate to 32768 bytes whose contents hold no water word at all,
+because they belong to other BSData tables that share the patch. They are refused
+by name, not counted as water.
+
+**Two things deliberately not widened**, because the data does not ask for them:
+
+- `pck::inflate` keeps its exact-size-and-`StreamEnd` contract. All 160
+  zlib-framed water records in the 1.8.4 patches declare a `stored` length that
+  fits inside their record and inflate to exactly `raw` with a real end marker.
+  A lenient variant was tried and removed: nothing needed it, and an unused
+  relaxation of a shared reader is a liability.
+- there is no "try the bytes as an area with no version word" fallback. No real
+  record needs one, and a record whose first word is a small integer reads as a
+  plausible grid (a zero-filled mask is valid), which is how the two non-water
+  `21.dat` records above would have come back as water.

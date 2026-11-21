@@ -777,6 +777,91 @@ mod tests {
         assert!(ViewSettings::decode("cloud_detail=invalid").cloud_detail);
     }
 
+    /// Every field survives a save and a load.
+    ///
+    /// This used to set twenty of the struct's seventy-two fields and call
+    /// itself `round_trip_all_settings`. A field added after it was written had
+    /// nothing checking that `encode` wrote it and `decode` read it back -- and
+    /// a setting that silently fails to persist is the whole of P8.07, so the
+    /// test named after the requirement was the one place that could not catch
+    /// it. The list below is every field, turned off the default so that a
+    /// dropped key shows up as a diff rather than as two equal defaults.
+    #[test]
+    fn every_field_survives_a_save_and_a_load() {
+        let mut s = ViewSettings::default();
+        s.sharpen = !s.sharpen;
+        s.detail.radius = 11;
+        s.detail.tree_lod_scale = 2.5;
+        s.detail.scenery_quality = 4;
+        s.camera_speed = 901.;
+        s.boost = 4.5;
+        s.sensitivity = 0.003;
+        s.far = 9001.;
+        s.time_of_day = 17.5;
+        s.time_pass_enabled = true;
+        s.time_pass_speed = 30.;
+        s.all_to_vram = true;
+        s.whole_world = true;
+        s.water_reflections = !s.water_reflections;
+        s.world_effects = !s.world_effects;
+        s.atmospheric_fog = true;
+        s.bloom = !s.bloom;
+        s.bloom_strength = 2.25;
+        s.bloom_mode = 5;
+        s.bloom_tint = 0x1234_5678;
+        s.bloom_brightness_fade = 0.25;
+        s.bloom_opacity_fade = 0.75;
+        s.client_gamma = !s.client_gamma;
+        s.gamma_setting = 42.5;
+        s.terrain_lightmaps = true;
+        s.model_backface_culling = true;
+        s.music_enabled = !s.music_enabled;
+        s.music_volume = 0.21;
+        s.ambience_enabled = !s.ambience_enabled;
+        s.sound_volume = 0.37;
+        s.effects_enabled = !s.effects_enabled;
+        s.effects_volume = 0.18;
+        s.fullscreen = !s.fullscreen;
+        s.show_zone_entry = !s.show_zone_entry;
+        s.show_minimap = !s.show_minimap;
+        s.minimap_range = 351.;
+        s.tree_wind_strength = 0.6;
+        s.client_tree_wind_preview = true;
+        s.regional_tree_lighting = true;
+        s.grass_distance_fade = !s.grass_distance_fade;
+        s.grass_wind_enabled = !s.grass_wind_enabled;
+        s.grass_wind_amplitude = 0.43;
+        s.streamed_regions = !s.streamed_regions;
+        s.area_grass_lightmaps = !s.area_grass_lightmaps;
+        s.vegetation_authored_mips = !s.vegetation_authored_mips;
+        s.celestial_discs = !s.celestial_discs;
+        s.celestial_brightness = 0.66;
+        s.ignore_celestial_flags = !s.ignore_celestial_flags;
+        s.cloud_detail = !s.cloud_detail;
+        s.resolution_scale = 150.;
+        s.upscale_quality = UpscaleQuality::Balanced;
+        s.frame_generation = FrameGenMethod::Fsr;
+        s.frame_multiplier = FrameMultiplier::X3;
+        s.fsr1_sharpness = 1.5;
+        s.fsr3_sharpness = 0.8;
+        s.dlss_sharpness = 0.7;
+        s.xess_sharpness = 0.6;
+        s.upscale_sdk_dir = "C:/sdk".into();
+        s.latency = LatencyMode::Reflex;
+        s.world_map_style = MapStyle::Original;
+        s.minimap_style = MapStyle::Realistic;
+        s.minimap_shape = MinimapShape::Circular;
+        s.weather_override = WeatherOverride::Rain;
+        s.sky_override = SkyOverride::Overcast;
+        s.effect_shaft = EffectShaft::WorldUp;
+        s.effect_distance = 42.5;
+        s.logging_mask = 11;
+        s.logging_dir = "/tmp/logs".into();
+        s.selected_world = "a37".into();
+        let back = ViewSettings::decode(&s.encode());
+        assert_eq!(back, s);
+    }
+
     #[test]
     fn round_trip_all_settings() {
         let mut s = ViewSettings::default();

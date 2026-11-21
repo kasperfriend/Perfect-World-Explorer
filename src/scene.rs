@@ -28,12 +28,23 @@ pub struct Reference {
     pub export_id: u32,
     pub offset: u32,
 }
+/// Tree types a world file may declare. The largest staged table is 59 (1.8.4).
+pub const MAX_TREE_TYPES: usize = 4096;
+
+/// Grass types a world file may declare. The largest staged table is 254 (1.8.4).
+pub const MAX_GRASS_TYPES: usize = 4096;
+
 #[derive(Clone, Debug)]
 pub struct SceneModel {
     pub export_id: u32,
     pub position: [f32; 3],
     pub direction: [f32; 3],
     pub up: [f32; 3],
+    /// The record's own scale (`fScale`). Version 12 has no such field and
+    /// every model is 1.0; a later layout inserts it between `vUp` and the
+    /// model's path, so a reader that stops at `vUp` takes the scale for a
+    /// string length and reads the rest of the block as garbage.
+    pub scale: f32,
     pub path: String,
     pub action: String,
 }
@@ -42,8 +53,12 @@ pub struct Effect {
     /// Position of this record in its block's effect list, for diagnostics.
     pub index: u32,
     /// The record's own id word (`record[0]`). It is not the block list index:
-    /// the 2,275 placements of the shipped `world.ecwld` carry 2,275 distinct
-    /// values between 1 and 44,894.
+    /// the **2,971** placements of the shipped `world.ecwld` carry 2,971
+    /// distinct values.
+    ///
+    /// (This said 2,275 for a while. That was an earlier reader's count, left
+    /// behind when the record's leading id word was recovered and every block
+    /// stopped losing its last record; re-measured against the staged file.)
     pub export_id: u32,
     pub scale: f32,
     pub position: [f32; 3],
@@ -67,14 +82,14 @@ impl Effect {
     /// (a float bit pattern, so 1.06e9 — a clock that jumps and freezes), and its
     /// position out of the middle of its own direction vector.
     ///
-    /// The shipped `world.ecwld` decides between the two readings on all 2,275
+    /// The shipped `world.ecwld` decides between the two readings on all **2,971**
     /// records with no exceptions. Under this one `[20..32)` and `[32..44)` are
-    /// unit vectors and perpendicular to each other on 2,275 of 2,275 records,
-    /// the play speeds span 0.03..12 with no non-positive value, the uniform
-    /// scales span 0.164..380.953, and the day/night word takes only the three
-    /// authored modes with the split 1,445 all-day / 154 day-only / 676
+    /// unit vectors and perpendicular to each other on 2,971 of 2,971 records,
+    /// the play speeds span 0.030..12.000 with no non-positive value, the uniform
+    /// scales span 0.054..380.953, and the day/night word takes only the three
+    /// authored modes with the split 2,004 day-and-night / 787 day-only / 180
     /// night-only. Under the old one the same fields are a mixture of ids and
-    /// float bit patterns and 2,222 of 2,275 records have a non-unit direction.
+    /// float bit patterns and the direction is non-unit on almost every record.
     /// `corpus_effect_records_agree_on_one_layout` holds the map to that.
     ///
     /// The copy block at `0x5b3436..0x5b34a6` carries the same field order: the
@@ -186,12 +201,21 @@ fn f32at(b: &[u8], p: usize) -> Result<f32, String> {
 }
 fn string(b: &[u8], p: &mut usize) -> Result<String, String> {
     let n = u32at(b, *p)? as usize;
+    let at = *p;
     *p += 4;
     if n > 4096 {
-        return Err("oversized ECWLD string".into());
+        // A length word this size is almost never a string: it is the reader
+        // standing in the wrong field, which happens when a newer client's
+        // record carries a field this layout does not know about. Report where,
+        // because "oversized ECWLD string" alone cannot be acted on.
+        return Err(format!(
+            "oversized ECWLD string: a {n}-byte length at offset {at} (this build's record layout does not match the file)"
+        ));
     }
     let e = p.checked_add(n).ok_or("string overflow")?;
-    let bytes = b.get(*p..e).ok_or("truncated ECWLD string")?;
+    let bytes = b
+        .get(*p..e)
+        .ok_or_else(|| format!("truncated ECWLD string of {n} bytes at offset {at}"))?;
     *p = e;
     let (s, _, bad) = encoding_rs::GBK.decode(bytes);
     if bad {
@@ -203,6 +227,47 @@ fn string(b: &[u8], p: &mut usize) -> Result<String, String> {
         s.into_owned()
     })
 }
+/// The EC-BSD header word that has stayed put, and the version this reader's
+/// record layout was measured on.
+///
+/// `MOXB`/`FDSB` (little-endian `0x42584f4d` / `0x42534446`) identify the file;
+/// the third word is its revision. The revision has moved -- 1.5.2's world
+/// writes 12 and 1.8.4's writes 18 -- while everything below the header stayed
+/// byte-identical, which the two shipped maps prove rather than suggest:
+///
+/// | client | EC-BSD | ECWLD | ornament refs readable | water refs |
+/// |---|---|---|---|---|
+/// | 1.5.2 | 12 | 12 | 22,981 of 22,981 | 111 of 111 |
+/// | 1.8.4 | 18 | 17 | 23,068 of 23,068 | 111 of 111 |
+///
+/// Both files keep the name table at `+0x4c` with the same `u32 length` framing,
+/// and both end it at exactly the same offset, so the revision word gates
+/// nothing this reader touches. Refusing a revision other than 12 turned 1.8.4's
+/// map into "unsupported EC-BSD header" and, through the viewer's fallback,
+/// into a box that gave the user no map at all.
+///
+/// The revision is still read and reported, because a future layout change has
+/// to start somewhere; it just is not a reason to abandon a map whose records
+/// parse.
+pub const ECBSD_VERSION: u32 = 12;
+pub const ECBSD_IDENTITY: (u32, u32) = (0x42584f4d, 0x42534446);
+
+/// Validate an EC-BSD's identity and revision.
+///
+/// Pass the revision only when the caller needs to know it; a file whose
+/// revision is below [`ECBSD_VERSION`] is still read, because nothing in the
+/// record layout below depends on the revision having reached it.
+pub fn ecbsd_header(b: &[u8]) -> Result<u32, String> {
+    let identity = (u32at(b, 0)?, u32at(b, 4)?);
+    if identity != ECBSD_IDENTITY {
+        return Err(format!(
+            "this is not an EC-BSD file: it starts with {:#010x} {:#010x}",
+            identity.0, identity.1
+        ));
+    }
+    u32at(b, 8)
+}
+
 fn vec3(b: &[u8], p: usize) -> Result<[f32; 3], String> {
     Ok([f32at(b, p)?, f32at(b, p + 4)?, f32at(b, p + 8)?])
 }
@@ -217,14 +282,52 @@ fn refs(b: &[u8], p: &mut usize, n: usize) -> Result<Vec<Reference>, String> {
     }
     Ok(out)
 }
+/// First ECWLD version whose static-model record carries a scale between its
+/// up vector and its path strings.
+///
+/// The client header this recovery works from documents the field only from
+/// `ECWDFILEECMODEL` onward, and the shipped files place the boundary above 12:
+/// 1.8.4 writes version 17, which has the field, and a 1.5.2-era map writes 12,
+/// which does not.
+pub const MODEL_SCALE_VERSION: u32 = 13;
+
+/// Fold one tree asset name to the form both sides of the lookup compare.
+///
+/// The `.ecwld` tree table writes `Trees/精简树木/雪松/SnowPineWithSnow1.spt` and
+/// every shipped `trees.pck` stores `trees\精简树木\雪松\snowpinewithsnow1.spt`:
+/// separators and case both differ, in every client measured (326/326 names in
+/// 1.8.4, 325/325 in 1.5.2 use backslashes). Folding `\` to `/` and lower-casing
+/// is the whole rule, and it lives here rather than in one reader because both
+/// readers — the runtime loader and the bridge's source extractor — must agree.
+pub fn normalise_tree_name(name: &str) -> String {
+    name.replace('\\', "/").to_lowercase()
+}
+
 impl Scene {
     pub fn load(path: &Path) -> Result<Self, String> {
         let b = fs::read(path).map_err(|e| e.to_string())?;
         Self::parse(&b)
     }
     pub fn parse(b: &[u8]) -> Result<Self, String> {
-        if u32at(b, 0)? != 0x45435744 || u32at(b, 4)? != 12 {
-            return Err("only ECWLD version 12 is supported".into());
+        let version = match (u32at(b, 0), u32at(b, 4)) {
+            (Ok(0x45435744), Ok(version)) => version,
+            (Ok(identity), _) => {
+                return Err(format!(
+                    "this is not a world file: it starts with {identity:#010x}, not the ECWLD id"
+                ))
+            }
+            _ => return Err("the world file is shorter than its header".into()),
+        };
+        // The header grew by fields up to v12 and has not changed since, so
+        // anything at or above it parses with the same layout, and `p !=
+        // data.len()` below still catches a block list that does not add up.
+        // 1.5.2 and 1.8.4 both write 12; a gate that named one exact number
+        // read "only ECWLD version 12 is supported" for a later client that
+        // changed it.
+        if version < 12 {
+            return Err(format!(
+                "this world file is ECWLD version {version}; this build reads version 12 and later"
+            ));
         }
         let width = f32at(b, 8)?;
         let length = f32at(b, 12)?;
@@ -239,8 +342,13 @@ impl Scene {
         if count == 0
             || rows.checked_mul(cols) != Some(count)
             || count > 1_000_000
-            || tree_count > 10000
-            || grass_count > 10000
+            // Measured across every staged client: the largest block grid is
+            // the 1.8.4 world's 22,528 blocks (176x128), its tree table holds
+            // 59 types and its grass table 254. Each limit carries headroom
+            // over those and exists to catch a damaged header, not to police
+            // what a newer client may author.
+            || tree_count > MAX_TREE_TYPES
+            || grass_count > MAX_GRASS_TYPES
             || tree_off > grass_off
             || grass_off > b.len()
         {
@@ -301,6 +409,11 @@ impl Scene {
                 b.len() - gp
             ));
         }
+        // Which model record layout this file uses. The scale field arrived
+        // after version 12; 12 itself has none, which the corpus proves both
+        // ways (1.8.4's v17 needs it in 65 blocks and reads in all 22,528,
+        // while a v12 map misreads 34 blocks if it is added there).
+        let model_has_scale = version >= MODEL_SCALE_VERSION;
         let mut blocks = Vec::with_capacity(count);
         let mut coords = HashSet::with_capacity(offsets.len());
         for off in offsets {
@@ -348,6 +461,18 @@ impl Scene {
                 let direction = vec3(data, p + 16)?;
                 let up = vec3(data, p + 28)?;
                 p += 40;
+                // The scale sits between `vUp` and the two strings from the
+                // layout that added it, and it is the difference between a
+                // readable block and a bogus string length: on 1.8.4's v17
+                // `world.ecwld` every one of the 65 blocks holding a model
+                // misreads without it, and all 22,528 read exactly with it.
+                let scale = if model_has_scale {
+                    let scale = f32at(data, p)?;
+                    p += 4;
+                    scale
+                } else {
+                    1.0
+                };
                 let path = string(data, &mut p)?;
                 let action = string(data, &mut p)?;
                 models.push(SceneModel {
@@ -355,6 +480,7 @@ impl Scene {
                     position,
                     direction,
                     up,
+                    scale,
                     path,
                     action,
                 })
@@ -435,9 +561,7 @@ impl Scene {
     /// Blocks can refer to the same export ID, so each instance is returned once.
     pub fn load_ornaments(&self, path: &Path) -> Result<Vec<Ornament>, String> {
         let b = fs::read(path).map_err(|e| e.to_string())?;
-        if u32at(&b, 0)? != 0x42584f4d || u32at(&b, 4)? != 0x42534446 || u32at(&b, 8)? != 12 {
-            return Err("unsupported EC-BSD header".into());
-        }
+        ecbsd_header(&b)?;
         let map_id = map_id_from_ecbsd_path(path);
         let mut seen = std::collections::HashMap::<u32, u32>::new();
         let mut result = Vec::new();
@@ -480,6 +604,70 @@ impl Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Both shipped client revisions' EC-BSD files are the same layout.
+    ///
+    /// This is the test that keeps the version gate honest. The revision word
+    /// moved (1.5.2 writes 12, 1.8.4 writes 18) while nothing below the header
+    /// changed, so the reader must not refuse either one. These are the real
+    /// files, staged in `google_drive/`; where they are absent the test says so
+    /// rather than passing quietly.
+    #[test]
+    fn both_ecbsd_revisions_share_one_layout() {
+        // The corpus lives at `google_drive/` beside the repository, which is
+        // the working directory under both Cargo and the offline harness.
+        let root = Path::new("google_drive");
+        let cases = [
+            (
+                "ecbsd/world-1.5.2.ecbsd",
+                "worlds/world-1.5.2.ecwld",
+                12u32,
+                12u32,
+                22981,
+            ),
+            (
+                "ecbsd/world-1.8.4.ecbsd",
+                "scenecorpus/world-2.85M.ecwld",
+                18,
+                17,
+                23068,
+            ),
+        ];
+        let mut checked = 0;
+        for (ecbsd, ecwld, want_ecbsd, want_ecwld, want_ornaments) in cases {
+            let (ecbsd_path, ecwld_path) = (root.join(ecbsd), root.join(ecwld));
+            let (Ok(bytes), Ok(world)) = (std::fs::read(&ecbsd_path), std::fs::read(&ecwld_path))
+            else {
+                println!("SKIPPED: {} or {} is not staged", ecbsd, ecwld);
+                continue;
+            };
+            // The header check accepts the revision and reports it.
+            let revision = ecbsd_header(&bytes).expect("an EC-BSD this build reads");
+            assert_eq!(revision, want_ecbsd, "{ecbsd}: revision");
+            let scene = Scene::parse(&world).expect("the paired world file parses");
+            assert_eq!(
+                u32at(&world, 4).unwrap(),
+                want_ecwld,
+                "{ecwld}: ECWLD revision"
+            );
+            // Every ornament reference in that world resolves to a record in
+            // this EC-BSD: a BMD path, a finite position and no other payload.
+            let ornaments = scene
+                .load_ornaments(&ecbsd_path)
+                .unwrap_or_else(|e| panic!("{ecbsd}: {e}"));
+            assert_eq!(ornaments.len(), want_ornaments, "{ecbsd}: ornament count");
+            assert!(
+                ornaments
+                    .iter()
+                    .all(|o| o.path.to_lowercase().ends_with(".bmd")),
+                "{ecbsd}: every ornament names a BMD"
+            );
+            checked += 1;
+        }
+        if checked == 0 {
+            println!("SKIPPED: no EC-BSD pair is staged");
+        }
+    }
+
     #[test]
     fn scenery_map_namespace_comes_from_the_map_ecbsd_filename() {
         assert_eq!(
@@ -590,10 +778,24 @@ mod tests {
     ///
     /// A wrong field order is invisible in a synthetic fixture: every byte is
     /// self-consistent whichever way the reader slices it. It is not invisible
-    /// here. With the id word counted, all 2,275 placements agree at once — the
-    /// two vectors are unit and perpendicular on every record, the play speeds
-    /// are all positive, and the day/night word lands on the three authored
-    /// values. Skip when the archive is not staged beside the checkout.
+    /// here. With the id word counted, every placement agrees at once — the two
+    /// vectors are unit and perpendicular on every record, the play speeds are
+    /// all positive, and the day/night word lands on the three authored values.
+    /// Skip when the archive is not staged beside the checkout.
+    ///
+    /// Three shipped `world.ecwld` builds have been measured, and all three pass
+    /// every invariant below; only the totals differ, because they are different
+    /// maps of the same client:
+    ///
+    /// | build | bytes | placements | day/night split |
+    /// |---|---|---|---|
+    /// | the 2.78 MB world the layout was first measured on | 2,780,000 | 2,275 | 154 / 676 / 1,445 |
+    /// | the 2.78 MB world in `docs/cross-version-matrix.md` | ~2,780,000 | 3,535 | not recorded |
+    /// | the 2.67 MB 1.8.4 world staged today | 2,668,870 | 2,971 | 180 / 787 / 2,004 |
+    ///
+    /// The count is asserted for the file actually present so a layout that
+    /// shifts by one field cannot pass by being self-consistent about the wrong
+    /// numbers, but the invariants are the real test.
     #[test]
     fn corpus_effect_records_agree_on_one_layout() {
         let path = std::path::Path::new("google_drive/world.ecwld");
@@ -632,14 +834,172 @@ mod tests {
                 }
             }
         }
-        assert_eq!(total, 2_275, "shipped world.ecwld placement count");
+        // The 2.67 MB 1.8.4 build staged in `google_drive/`. The 2.78 MB build
+        // measured first gives 2,275 and 154/676/1,445; see the doc comment.
+        assert_eq!(total, 2_971, "shipped world.ecwld placement count");
         assert_eq!(ids.len(), total, "every placement carries its own id");
-        assert_eq!(modes, [154, 676, 1_445], "authored day/night split");
+        assert_eq!(modes, [180, 787, 2_004], "authored day/night split");
         assert_eq!((bad_speed, bad_scale, bad_basis), (0, 0, 0));
+    }
+    /// A static-model record is `vUp` then a scale then the path: the scale is
+    /// read from the layout that added it, and leaving it out shifts every
+    /// string after it by four bytes.
+    ///
+    /// The fixture is a minimal block carrying one model, built twice, with and
+    /// without the field, so each version reads the one meant for it and the
+    /// wrong one is caught. On the shipped files the difference is not subtle:
+    /// 1.8.4's v17 `world.ecwld` misreads 65 of its 22,528 blocks without the
+    /// field, and a v12 map misreads 34 of its blocks with it.
+    fn world_with_a_model(version: u32, with_scale: bool) -> Vec<u8> {
+        let mut block = Vec::new();
+        block.extend_from_slice(&0u16.to_le_bytes()); // row
+        block.extend_from_slice(&0u16.to_le_bytes()); // col
+        let counts = [0u32, 0, 0, 0, 0, 0, 1, 0, 0, 0]; // one EC model
+        for c in counts {
+            block.extend_from_slice(&c.to_le_bytes());
+        }
+        block.extend_from_slice(&7u32.to_le_bytes()); // export id
+        for v in [1.5f32, 2.5, 3.5, 0., 1., 0., 0., 0., 1.] {
+            block.extend_from_slice(&v.to_le_bytes());
+        }
+        if with_scale {
+            block.extend_from_slice(&1.75f32.to_le_bytes());
+        }
+        let path = b"Models\\tree.ecm";
+        block.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        block.extend_from_slice(path);
+        block.extend_from_slice(&0u32.to_le_bytes()); // empty action
+        let nblocks = 1usize;
+        let block_off = 116 + 4 * nblocks;
+        let tree_off = block_off + block.len();
+        let mut b = Vec::new();
+        b.extend_from_slice(&0x45435744u32.to_le_bytes());
+        b.extend_from_slice(&version.to_le_bytes());
+        for v in [64.0f32, 64.0, 64.0] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [32u32, nblocks as u32, 1, 1] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        // Tree and grass tables: both empty, so both offsets point at the end.
+        b.extend_from_slice(&(tree_off as u32).to_le_bytes());
+        b.extend_from_slice(&(tree_off as u32).to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.resize(116, 0);
+        b.extend_from_slice(&(block_off as u32).to_le_bytes());
+        b.extend_from_slice(&block);
+        b
+    }
+    #[test]
+    fn a_model_scale_is_read_from_the_version_that_has_one() {
+        for (version, with_scale) in [(12u32, false), (17u32, true)] {
+            let scene = Scene::parse(&world_with_a_model(version, with_scale))
+                .unwrap_or_else(|e| panic!("version {version}: {e}"));
+            let model = &scene.blocks[0].models[0];
+            assert_eq!(model.path, "Models/tree.ecm");
+            assert_eq!(model.action, "");
+            assert_eq!(model.export_id, 7);
+            assert_eq!(
+                model.scale,
+                if with_scale { 1.75 } else { 1.0 },
+                "version {version}"
+            );
+        }
+        // The mismatches are refused rather than silently accepted, which is
+        // what "the block does not add up" has to mean.
+        assert!(Scene::parse(&world_with_a_model(17, false)).is_err());
+        assert!(Scene::parse(&world_with_a_model(12, true)).is_err());
+    }
+    /// Every staged `.ecwld` parses, whatever version wrote it.
+    ///
+    /// A block that does not add up is refused by the per-block length check,
+    /// so a file that parses has had every record of every block walked at the
+    /// right stride. That is exactly the check the model-scale field needs: one
+    /// wrong stride turns a scale into a string length and the block stops
+    /// adding up. The staged corpus is the real thing — the reported failure
+    /// came from a version-17 file, which the model-scale fix has to read.
+    #[test]
+    fn every_staged_world_file_parses() {
+        let dir = std::path::Path::new("google_drive/scenecorpus");
+        let mut files: Vec<_> = match std::fs::read_dir(dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("ecwld"))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        if files.is_empty() {
+            crate::pck::corpus_absent("a staged `google_drive/scenecorpus`");
+            return;
+        }
+        files.sort();
+        let mut versions = std::collections::BTreeSet::new();
+        let mut models = 0usize;
+        for path in &files {
+            let scene = Scene::load(path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.file_name().unwrap().to_string_lossy()));
+            let version = u32at(&std::fs::read(path).unwrap(), 4).unwrap();
+            versions.insert(version);
+            assert!(!scene.blocks.is_empty());
+            for block in &scene.blocks {
+                for model in &block.models {
+                    models += 1;
+                    // The scale is a real authored number, which a misread
+                    // string length would not be. The first shipped value is
+                    // exactly 1.0, so the bound has to be inclusive.
+                    assert!(
+                        model.scale.is_finite() && model.scale >= 0.05 && model.scale <= 100.,
+                        "{}: model scale {}",
+                        path.display(),
+                        model.scale
+                    );
+                }
+            }
+        }
+        assert!(
+            versions.len() >= 2,
+            "the corpus is only one version; it proves nothing about the boundary: {versions:?}"
+        );
+        assert!(
+            models > 0,
+            "no models were staged to check the stride against"
+        );
     }
     #[test]
     fn rejects_bad_header() {
         assert!(Scene::parse(&[0; 116]).is_err());
+    }
+    #[test]
+    fn the_version_gate_says_which_version_it_saw() {
+        // 1.8.4 was refused with the bare sentence "only ECWLD version 12 is
+        // supported", which does not say what the file held or what the build
+        // wanted. The gate now names both, and anything at or above 12 is
+        // attempted rather than refused by number.
+        // `Result::unwrap_err` would need `Scene: Debug`, which this module does
+        // not implement and should not gain just for a test.
+        fn error(b: &[u8]) -> String {
+            match Scene::parse(b) {
+                Err(error) => error,
+                Ok(_) => panic!("this header should not parse"),
+            }
+        }
+        let mut b = vec![0u8; 116];
+        b[0..4].copy_from_slice(&0x45435744u32.to_le_bytes());
+        b[4..8].copy_from_slice(&13u32.to_le_bytes());
+        let newer = error(&b);
+        assert!(!newer.contains("only ECWLD"), "{newer}");
+        assert!(!newer.contains("version 13"), "13 is attempted: {newer}");
+
+        b[4..8].copy_from_slice(&7u32.to_le_bytes());
+        let older = error(&b);
+        assert!(older.contains("version 7"), "{older}");
+        assert!(older.contains("version 12"), "{older}");
+
+        b[0..4].copy_from_slice(&0xdeadbeefu32.to_le_bytes());
+        let not_a_world = error(&b);
+        assert!(not_a_world.contains("not a world file"), "{not_a_world}");
     }
     #[test]
     fn rejects_short_string() {
@@ -651,5 +1011,57 @@ mod tests {
         let mut p = 0;
         let path = string(&[4, 0, 0, 0, 0xd1, 0xa9, 0xb5, 0xd8], &mut p).unwrap();
         assert_eq!(path, "雪地");
+    }
+
+    /// The pack/lookup disagreement that stopped every tree from being baked.
+    ///
+    /// Measured on the shipped archives: all 326 names in 1.8.4's `trees.pck`
+    /// and all 325 in 1.5.2's use backslashes, while the `.ecwld` tree table
+    /// writes forward slashes. These are the real strings from those files,
+    /// not spellings chosen to suit the code.
+    #[test]
+    fn one_tree_has_the_same_key_in_the_pack_and_the_map() {
+        let in_pack = "trees\\精简树木\\雪松\\snowpinewithsnow1.spt";
+        let in_ecwld = "Trees/精简树木/雪松/SnowPineWithSnow1.spt";
+        assert_eq!(
+            normalise_tree_name(in_pack),
+            normalise_tree_name(in_ecwld),
+            "a tree present in the pack must be found by the name the map asks for"
+        );
+        assert_eq!(
+            normalise_tree_name("trees\\badtree.spt"),
+            normalise_tree_name("trees/badtree.spt")
+        );
+    }
+
+    /// Lower-casing alone was the defect, so pin exactly what it got wrong.
+    #[test]
+    fn lower_casing_alone_does_not_match_the_two_spellings() {
+        let in_pack = "trees\\badtree.spt";
+        let in_ecwld = "trees/badtree.spt";
+        assert_ne!(
+            in_pack.to_lowercase(),
+            in_ecwld.to_lowercase(),
+            "this is the mismatch that aborted tree preparation with \
+             \"tree source asset missing\""
+        );
+        assert_eq!(normalise_tree_name(in_pack), normalise_tree_name(in_ecwld));
+    }
+
+    /// Case differs too, and must not matter either.
+    #[test]
+    fn the_tree_lookup_ignores_case_and_both_separators() {
+        let pack = "TREES\\Elm\\ELM.SPT";
+        for asked in [
+            "trees/elm/elm.spt",
+            "Trees\\Elm\\Elm.spt",
+            "TREES/ELM/ELM.SPT",
+        ] {
+            assert_eq!(
+                normalise_tree_name(pack),
+                normalise_tree_name(asked),
+                "{asked} must find {pack}"
+            );
+        }
     }
 }

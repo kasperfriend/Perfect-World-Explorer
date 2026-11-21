@@ -13,6 +13,12 @@ mod client_regional_light;
 mod diagnostics;
 #[path = "../ecmodel.rs"]
 mod ecmodel;
+// `world_models_gpu` counts its roots through `crate::effect_census`, so this
+// target needs that module too -- the same way it needs `diagnostics` above.
+// Without it the binary stops compiling the moment the census is called, which
+// is a fact about this file's module list, not about any model.
+#[path = "../effect_census.rs"]
+mod effect_census;
 #[path = "../gfx_catalog.rs"]
 mod gfx_catalog;
 #[path = "../gfx_color_track.rs"]
@@ -29,6 +35,9 @@ mod gfx_light;
 mod gfx_owner;
 #[path = "../gfx_player.rs"]
 mod gfx_player;
+// `sky_gpu`'s own test reads `sky_time::night_weight`, so a `--test` build of
+// this target needs the module. `world_models_gpu` draws sky through the same
+// module, which is why this target carries `sky_gpu` at all.
 #[path = "../model_asset.rs"]
 mod model_asset;
 #[path = "../model_attachment.rs"]
@@ -73,6 +82,8 @@ mod skin_pose;
 mod sky_config;
 #[path = "../sky_gpu.rs"]
 mod sky_gpu;
+#[path = "../sky_time.rs"]
+mod sky_time;
 #[path = "../world_models.rs"]
 mod world_models;
 #[path = "../world_models_gpu.rs"]
@@ -499,6 +510,7 @@ fn main() {
                 position: [0.; 3],
                 direction: [0., 0., 1.],
                 up: [0., 1., 0.],
+                scale: 1.0,
                 path: "models/a/a.ecm".into(),
                 action: "absent".into(),
             },

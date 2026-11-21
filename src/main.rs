@@ -29,6 +29,10 @@ mod angelica_pck;
 mod animation;
 mod bmd;
 mod bmd_baked;
+// The folder scan is filesystem + byte reading only, so `--diagnose-client`
+// works on any host with a client staged. It does read `pck`/`angelica_pck`,
+// and those are Windows-only in this binary, so the module follows them; the
+// `client-check` binary is the cross-platform form of the same report.
 #[cfg(windows)]
 mod client_detect;
 mod client_sun;
@@ -39,16 +43,17 @@ mod cloud_gpu;
 mod cloud_surface;
 mod color_chain;
 mod diagnostics;
+mod sound_key;
+// The effect activation census: which gate leaves a root out, as a partition.
+mod effect_census;
 // A preview is a test-only harness. The skip is on the module: its literals
 // are authored GFX text and its tables are read top to bottom, neither of
 // which formatting improves, and every other module stays checked.
-#[cfg(test)]
-#[rustfmt::skip]
-mod effect_preview;
 mod display_gamma;
 mod dlss;
 mod dxt;
 mod ecmodel;
+mod effect_preview;
 mod environment;
 mod far_trees_gpu;
 mod fog_matrix;
@@ -86,6 +91,7 @@ mod latency;
 #[cfg(windows)]
 mod launcher_ui;
 mod light_consumers;
+mod load_status;
 #[cfg(any(windows, test))]
 mod loading_graph;
 mod material;
@@ -136,6 +142,7 @@ mod world_audio;
 // are kept public and unreferenced here, like `client_sun`.
 #[allow(dead_code)]
 mod sky_transition;
+mod speedtree_version;
 mod terrain_block;
 mod terrain_cutoff;
 mod terrain_gpu;
@@ -171,6 +178,7 @@ mod world_models;
 mod world_models_gpu;
 mod world_objects;
 mod world_page_cache;
+mod world_place_names;
 mod xess;
 struct Terrain {
     element: PathBuf,
@@ -709,14 +717,28 @@ fn terrain(
             if name.contains('/') || name.contains('\\') || name.contains("..") {
                 return Err("unsafe subterrain path".into());
             }
-            let data =
-                fs::read(dir.join(format!("{name}.t2bk"))).map_err(|e| format!("{name}: {e}"))?;
+            // A terrain block that cannot be read costs that block, not the
+            // map: the rest of the terrain, the scenery, the water and the
+            // effects are all still worth showing, and a named block is
+            // something an author can act on. The version check and the layout
+            // check below both report by block name.
+            let Ok(data) = fs::read(dir.join(format!("{name}.t2bk"))) else {
+                eprintln!("terrain block {name}: missing or unreadable, skipped");
+                continue;
+            };
             if u32at(&data, 0)? != 0x54424b42 {
-                return Err(format!("{name}: invalid T2BK"));
+                eprintln!("terrain block {name}: not a T2BK, skipped");
+                continue;
             };
             let v = u32at(&data, 4)?;
-            if !(2..=6).contains(&v) {
-                return Err(format!("{name}: unsupported version {v}"));
+            if !terrain_block::KNOWN_VERSIONS.contains(&v) {
+                eprintln!(
+                    "terrain block {name}: unsupported T2BK version {v} \
+                     (this build reads {}..={}), skipped",
+                    terrain_block::KNOWN_VERSIONS.start(),
+                    terrain_block::KNOWN_VERSIONS.end()
+                );
+                continue;
             }
             let n = u32at(&data, 8)? as usize;
             if n < per * per {
@@ -2341,6 +2363,28 @@ pub fn jitter_offset(frame_index: u32) -> (f32, f32) {
 mod tests {
     use super::*;
 
+    /// Selecting a folder scans it and shows the card; only **Enter world**
+    /// launches. The launcher used to arm a 1800 ms `SetTimer` after a scan and
+    /// launch on `WM_TIMER`, so choosing a folder started the viewer by itself.
+    /// The window procedure cannot be driven from a test, so this guards its
+    /// source: it runs on every platform, which is also why it lives here and
+    /// not beside the `#[cfg(windows)]` code it describes.
+    #[test]
+    fn selecting_a_folder_never_launches_on_a_timer() {
+        let launcher = include_str!("windows_setup.rs");
+        assert!(
+            !launcher.contains("SetTimer"),
+            "the launcher must not arm a timer after a folder scan"
+        );
+        assert!(
+            !launcher.contains("0x113"),
+            "WM_TIMER must not be handled, or an armed timer launches the viewer"
+        );
+        // The two deliberate launches stay: the button id, and the action it sets.
+        assert!(launcher.contains("102 => LAUNCH_ACTION.store(2"));
+        assert!(launcher.contains("2 => {"));
+    }
+
     fn nvidia_rtx4070() -> GpuFacts {
         GpuFacts::from_parts(
             VENDOR_NVIDIA,
@@ -3272,6 +3316,162 @@ fn parse_diagnose_args(args: &[String]) -> Result<DiagnoseArgs, i32> {
     })
 }
 
+/// Scan one client folder and print its versions. No GPU, no window, no world
+/// load, so it also runs on a machine that only has the client staged.
+///
+/// Exit status: `0` loadable (unknown versions are reported, not refused),
+/// `1` missing world/required archive, `2` bad usage.
+///
+/// Windows-only because it shares `pck`/`angelica_pck` with the viewer; the
+/// `client-check` binary prints exactly the same report on any host.
+#[cfg(windows)]
+fn diagnose_client(args: &[String]) -> i32 {
+    let mut json = false;
+    let mut path: Option<&str> = None;
+    for arg in args {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--help" | "-h" => {
+                println!(
+                    "usage: perfect-world-explorer --diagnose-client <client root or element folder> [--json]"
+                );
+                return 0;
+            }
+            other => path = Some(other),
+        }
+    }
+    let Some(path) = path else {
+        eprintln!(
+            "usage: perfect-world-explorer --diagnose-client <client root or element folder> [--json]"
+        );
+        return 2;
+    };
+    let scan = client_detect::scan(Path::new(path));
+    if json {
+        print_client_scan_json(&scan);
+    } else {
+        println!("Perfect World Explorer — diagnose-client");
+        println!();
+        print!("{}", scan.report());
+        println!();
+        println!("Result: {}", scan.headline());
+    }
+    if scan.loadable() {
+        0
+    } else {
+        1
+    }
+}
+
+/// The same flat JSON object `client-check --json` prints, hand-written because
+/// the crate has no serializer.
+#[cfg(windows)]
+fn print_client_scan_json(scan: &client_detect::Scan) {
+    fn quote(text: &str) -> String {
+        let mut out = String::with_capacity(text.len() + 2);
+        out.push('"');
+        for ch in text.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+    let data_files: Vec<String> = scan
+        .data_files
+        .iter()
+        .map(|info| {
+            format!(
+                "    {{\"name\": {}, \"version\": {}}}",
+                quote(&info.name),
+                quote(info.version.as_deref().unwrap_or(""))
+            )
+        })
+        .collect();
+    let archives: Vec<String> = scan
+        .archives
+        .iter()
+        .map(|archive| {
+            format!(
+                "    {{\"name\": {}, \"container\": {}, \"entries\": {}, \"problem\": {}}}",
+                quote(&archive.name),
+                quote(archive.kind.label()),
+                archive
+                    .entries
+                    .map(|entries| entries.to_string())
+                    .unwrap_or_else(|| "null".into()),
+                archive
+                    .problem
+                    .as_deref()
+                    .map(quote)
+                    .unwrap_or_else(|| "null".into())
+            )
+        })
+        .collect();
+    let errors: Vec<String> = scan.errors.iter().map(|error| quote(error)).collect();
+    let notes: Vec<String> = scan.notes.iter().map(|error| quote(error)).collect();
+    let mut fields = vec![
+        format!("  \"element\": {}", quote(&scan.element.to_string_lossy())),
+        format!("  \"loadable\": {}", scan.loadable()),
+        format!("  \"headline\": {}", quote(&scan.headline())),
+    ];
+    if let Some(exe) = &scan.executable {
+        fields.push(format!("  \"executable\": {}", quote(&exe.label())));
+        fields.push(format!("  \"executable_known\": {}", exe.is_known()));
+        fields.push(format!("  \"executable_size\": {}", exe.size));
+        fields.push(format!("  \"executable_sha256\": {}", quote(&exe.sha256)));
+    }
+    // The data version is the `(elements, tasks)` pair; the two halves are
+    // printed separately and together so a script can read either.
+    let (elements_version, tasks_version) = scan.data_versions();
+    fields.push(format!(
+        "  \"elements_version\": {}",
+        elements_version
+            .as_deref()
+            .map(quote)
+            .unwrap_or_else(|| "null".into())
+    ));
+    fields.push(format!(
+        "  \"tasks_version\": {}",
+        tasks_version
+            .as_deref()
+            .map(quote)
+            .unwrap_or_else(|| "null".into())
+    ));
+    fields.push(format!(
+        "  \"data_version\": {}",
+        quote(&scan.data_version_summary())
+    ));
+    if let Some(elements) = &scan.elements {
+        fields.push(format!(
+            "  \"elements_raw\": {}",
+            elements
+                .raw
+                .map(|raw| format!("{raw}"))
+                .unwrap_or_else(|| "null".into())
+        ));
+        fields.push(format!(
+            "  \"elements_label\": {}",
+            quote(elements.version.as_deref().unwrap_or(""))
+        ));
+    }
+    fields.push(format!(
+        "  \"data_files\": [\n{}\n  ]",
+        data_files.join(",\n")
+    ));
+    fields.push(format!("  \"archives\": [\n{}\n  ]", archives.join(",\n")));
+    fields.push(format!("  \"errors\": [{}]", errors.join(", ")));
+    fields.push(format!("  \"notes\": [{}]", notes.join(", ")));
+    println!("{{\n{}\n}}", fields.join(",\n"));
+}
+
 fn diagnose_adapter() -> Option<GpuFacts> {
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -3604,6 +3804,26 @@ fn main() {
     }
     if args.len() >= 2 {
         let flag = args[1].to_string_lossy().into_owned();
+        if flag == "--diagnose-client" {
+            #[cfg(windows)]
+            {
+                let rest: Vec<String> = args[2..]
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                std::process::exit(diagnose_client(&rest));
+            }
+            // The scan itself needs no Windows API; it shares the archive
+            // readers with the viewer, which are Windows-only in this binary.
+            #[cfg(not(windows))]
+            {
+                eprintln!(
+                    "--diagnose-client is built into the Windows viewer; on this host run \
+                     `cargo run --bin client-check -- <folder>` for the same report"
+                );
+                std::process::exit(2);
+            }
+        }
         if flag == "--diagnose-upscale" || flag == "--diagnose-framegen" {
             let rest: Vec<String> = args[2..]
                 .iter()
@@ -3759,9 +3979,12 @@ fn main() {
         };
     if let Some(notice) = fallback_notice.as_deref() {
         preferred_world = "world".into();
-        saved.selected_world = "world".into();
+        // The fallback is a recovery, not a choice: `selected_world` stays the
+        // map the user picked, so the next launch tries it again. Overwriting it
+        // here made one bad load permanent — a client whose map failed once then
+        // opened on the mainland forever, with no way back but the map list.
         if let Err(error) = saved.save() {
-            eprintln!("Could not persist main-world fallback: {error}");
+            eprintln!("Could not persist the recovered main-world session: {error}");
         }
         eprintln!("{notice}");
         #[cfg(windows)]
@@ -3816,9 +4039,11 @@ fn main() {
         if world_load::post_load_failure_decision(&preferred_world, viewer_mode)
             == world_load::PostLoadDecision::RestartMainWorld
         {
-            saved.selected_world = "world".into();
+            // Same rule as the terrain fallback above: restart on the main
+            // world, but leave `selected_world` alone so the map the user chose
+            // is tried again on the next launch instead of being forgotten.
             if let Err(save_error) = saved.save() {
-                eprintln!("Could not persist main-world fallback: {save_error}");
+                eprintln!("Could not persist the recovered main-world session: {save_error}");
             }
             let notice = format!(
                 "Map {} failed after loading. The explorer is restarting in the main world.\n\n{error}",

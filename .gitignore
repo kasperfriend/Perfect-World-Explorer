@@ -16,6 +16,16 @@ Thumbs.db
 .env.*
 # Local toolchains and validation scratch data
 /.cache/
+# Committed real-byte fixtures (tests/fixtures): a real client's own trailer,
+# entry records and payload bytes, trimmed to the entries a test needs. These
+# are exceptions to the `*.pck`/`*.ecwld` ignores above on purpose -- a test
+# that invents its own package cannot prove anything about the shipped format,
+# and the whole point of the tree fixtures is that they ARE the client's bytes.
+!/tests/fixtures/**/*.pck
+!/tests/fixtures/**/*.ecwld
+!/tests/fixtures/**/*.dat
+!/tests/fixtures/**/*.ecbsd
+
 # Private client files staged by the Drive connector
 /google_drive/
 
@@ -71,3 +81,4 @@ google_drive/
 !/sdk/include/xess_fg/**
 !/sdk/include/xell/
 !/sdk/include/xell/**
+/tools/.toolchain/

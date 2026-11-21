@@ -5,6 +5,9 @@ mod navigation;
 mod pck;
 #[path = "../terrain_store.rs"]
 mod terrain_store;
+#[path = "../world_place_names.rs"]
+#[allow(dead_code)]
+mod world_place_names;
 fn main() {
     let root = std::path::PathBuf::from(std::env::args().nth(1).expect("element folder"));
     let d = navigation::destinations(&root.join("maps/world/world_targets.txt")).unwrap();

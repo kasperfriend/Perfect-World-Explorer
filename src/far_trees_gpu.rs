@@ -224,6 +224,9 @@ pub struct FarTrees {
     lod_bind: wgpu::BindGroup,
     lod_params: wgpu::Buffer,
     placements: u32,
+    /// Why no trees are drawn, copied from the loader so the panel and the log
+    /// say the same sentence.
+    off_reason: Option<String>,
     /// Indirect args, one record per batch (`DRAW_ARGS` bytes each), plus the
     /// static part of each record with `instance_count` zeroed.
     lod_args: wgpu::Buffer,
@@ -385,7 +388,11 @@ impl FarTrees {
                     }
                 }
                 let Some((gx, gy)) = found else {
-                    eprintln!("Tree atlas exhausted; type {id} omitted");
+                    crate::diag!(
+                        TimingLoad,
+                        "Tree atlas exhausted; type {id} omitted with {} placements",
+                        positions.len()
+                    );
                     break;
                 };
                 for y in gy..gy + gh {
@@ -430,6 +437,16 @@ impl FarTrees {
                 packed_count += 1;
             }
             if slots.len() != 2 {
+                // One of the two textures had no atlas slot, so this type
+                // cannot be drawn and **every placement of it** goes with it.
+                // It used to fail silently, which made "the trees are missing"
+                // indistinguishable from "the map has no trees here".
+                crate::diag!(
+                    TimingLoad,
+                    "Tree type {id} omitted: {} of 2 textures packed, {} placements dropped",
+                    slots.len(),
+                    positions.len()
+                );
                 continue;
             }
             let first_batch = batches.len();
@@ -1049,6 +1066,7 @@ impl FarTrees {
             lod_bind,
             lod_params,
             placements: placement_count,
+            off_reason: trees.off_reason.clone(),
             lod_args,
             lod_args_reset,
             multi_draw: one_call,
@@ -1165,6 +1183,22 @@ impl FarTrees {
     }
     pub fn residency_stats(&self) -> (usize, u64) {
         (self.capacity, self.instances.size())
+    }
+    /// Why no trees are drawn, when there are none and there ought to be.
+    ///
+    /// The reason comes from the loader rather than being re-derived here, so
+    /// the log line and the on-screen line cannot say different things.
+    pub fn off_reason(&self) -> Option<&str> {
+        self.off_reason.as_deref()
+    }
+    /// Tree types the forest actually built, i.e. those with placements and
+    /// both an atlas slot for their bark and one for their composite.
+    pub fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+    /// GPU batches: three LOD levels per built type.
+    pub fn batch_count(&self) -> usize {
+        self.batches.len()
     }
     /// The per-group height the LOD pass uses, in group order.
     #[allow(dead_code)]

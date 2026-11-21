@@ -258,6 +258,14 @@ fn parse_instance_text(text: &str) -> Vec<InstanceRecord> {
             }
         }
         if fields.len() < 3 {
+            crate::load_status::dropped(
+                crate::load_status::Category::Instances,
+                format!(
+                    "instance list line {}: {} field(s) where the record needs 3",
+                    i + 1,
+                    fields.len()
+                ),
+            );
             continue;
         }
         let Some(id) = fields[0]
@@ -265,9 +273,28 @@ fn parse_instance_text(text: &str) -> Vec<InstanceRecord> {
             .next()
             .and_then(|v| v.parse::<u32>().ok())
         else {
+            // A malformed instance line used to vanish here. That is one
+            // instance the player cannot enter, reported as nothing at all, so
+            // it is counted with the line that lost it.
+            crate::load_status::dropped(
+                crate::load_status::Category::Instances,
+                format!(
+                    "instance list line {}: no numeric id in {:?}",
+                    i + 1,
+                    fields[0]
+                ),
+            );
             continue;
         };
         let Some(path) = quoted(fields[1]).and_then(|p| map_id_from_path(&p)) else {
+            crate::load_status::dropped(
+                crate::load_status::Category::Instances,
+                format!(
+                    "instance list line {}: no map path in {:?}",
+                    i + 1,
+                    fields[1]
+                ),
+            );
             continue;
         };
         let (rows, cols) = parse_pair(fields[2]).unwrap_or((1, 1));
@@ -405,7 +432,12 @@ fn first_zone_name(dir: &Path) -> Option<String> {
                 // Many instance precincts name sub-zones as "Map - Quarter".
                 // The common prefix is a better map label than one quarter.
                 let short = name.split(" - ").next().unwrap_or(&name).trim();
-                return Some(short.to_string());
+                // The map picker draws with egui's Latin faces, so an instance
+                // whose first zone is Chinese would show a label nobody can
+                // read. The instance alias table answers where the world zone
+                // table has no row; an unknown name still stays as authored
+                // because the tooltip is better than a blank.
+                return Some(crate::world_place_names::english(short).to_string());
             }
         }
     }
@@ -459,7 +491,7 @@ fn pretty_id(id: &str) -> String {
 /// Well-known English map labels. The client name is still retained in `name`
 /// and shown in the tooltip; this table only keeps the combo box legible when a
 /// client's instance names use glyphs the default egui font does not embed.
-fn english_name(id: &str) -> Option<&'static str> {
+pub fn english_name(id: &str) -> Option<&'static str> {
     Some(match id.to_ascii_lowercase().as_str() {
         "world" => "Perfect World — Mainland",
         "login" => "Character Selection",

@@ -1,5 +1,6 @@
 //! Experimental positional playback of authored ECWLD sound placements.
 //! Timing, attenuation and voice limits are viewer approximations.
+use crate::sound_key::asset_key;
 use crate::{music, pck, scene};
 use std::{
     collections::HashMap,
@@ -19,23 +20,6 @@ enum Asset {
 struct Emitter {
     sound: scene::Sound,
     asset: Option<Asset>,
-}
-
-fn asset_key(path: &str) -> Option<String> {
-    let path = path.replace('\\', "/");
-    if path.starts_with('/')
-        || path
-            .split('/')
-            .any(|p| p.is_empty() || p == "." || p == ".." || p.contains(':'))
-    {
-        return None;
-    }
-    let path = path.to_lowercase();
-    Some(if path.starts_with("sfx/") {
-        path
-    } else {
-        format!("sfx/{path}")
-    })
 }
 
 #[derive(Clone, Debug)]
@@ -426,26 +410,9 @@ mod tests {
             asset: Some(Asset::Loose(PathBuf::from("unused"))),
         }
     }
-    #[test]
-    fn keys_reject_traversal_and_preserve_audio_extensions() {
-        assert_eq!(
-            asset_key("Effect\\Scene\\bird.wav").as_deref(),
-            Some("sfx/effect/scene/bird.wav")
-        );
-        assert_eq!(
-            asset_key("SFX/Music/a.ogg").as_deref(),
-            Some("sfx/music/a.ogg")
-        );
-        for path in [
-            "../secret.wav",
-            "Effect/../secret.wav",
-            "/sfx/a.wav",
-            "C:/a.wav",
-            "effect//a.wav",
-        ] {
-            assert!(asset_key(path).is_none());
-        }
-    }
+    // The keying rule and its cases moved to `crate::sound_key`, whose tests run
+    // in the harness: this module is not compiled by any mode, so a test here is
+    // a test that never runs.
     #[test]
     fn selects_by_distance_day_night_and_viewer_right() {
         let emitters = vec![

@@ -98,6 +98,33 @@ impl Mask {
 }
 pub(crate) struct Layer {
     pub(crate) texture: usize,
+    /// The authored byte at record `+12`.
+    ///
+    /// **It is a selector the renderer consumes, not the projection axis.** The
+    /// native build copies the whole record into its own 36-byte draw entry and
+    /// calls `0x77f180` with that entry's first dword (`0x7a2579..0x7a25b9`),
+    /// and `0x77f180` never reads byte `+0xc`: it tests the object's own
+    /// `+0x178` flag, dereferences the texture pointer, and either acquires it
+    /// through `0x77c230` or returns the cached id. So the byte reaches the
+    /// renderer, but nothing in `0x77f180` branches on it.
+    ///
+    /// Nothing else in the image branches on it either: scanning all 1,750,808
+    /// disassembled instructions finds `movzx` of `+0xc` exactly once, at
+    /// `0x8213e1`, inside a byte-summing hash loop that adds `+0x0..+0xf` of a
+    /// 16-byte block — not a per-layer consumer.
+    ///
+    /// The viewer used to read this byte *as* the projection axis. It now keeps
+    /// the two apart: `selector` is the authored byte, untouched, and `axis` is
+    /// the projection rule the shaders use, which is derived from the selector
+    /// because that is the only byte the record carries and the three values
+    /// (0/1/2) map one-to-one onto the three projections the client's terrain
+    /// shaders sample with. **The selector's own native meaning is not
+    /// decoded**, and this field is where that is recorded rather than guessed
+    /// away: a value outside 0..=2 is a hard error, so a future archive that
+    /// uses the byte for something else cannot silently pick a projection.
+    pub(crate) selector: u8,
+    /// Projection axis the terrain shaders sample with: 0 = the z/y plane,
+    /// 1 = the ground plane, 2 = the x/y plane. Derived from `selector`.
     pub(crate) axis: u8,
     pub(crate) u: f32,
     pub(crate) v: f32,
@@ -143,6 +170,66 @@ fn gbk_string(b: &[u8], p: &mut usize) -> Result<String, String> {
 /// `axis_projection_matches_the_shader`. It is not yet evidence that the native
 /// client projects identically: the client builds its texcoords in the CPU mesh
 /// path and no address in the surveyed range emits them.
+impl Layer {
+    /// The authored selector byte, as the client's own record carries it.
+    ///
+    /// Exposed so the terrain loader can report the values it met instead of the
+    /// field sitting unread: "which selectors does this archive actually use"
+    /// is the question that would decide whether the byte is a projection at
+    /// all, and it cannot be answered from a struct nobody reads.
+    pub(crate) fn selector(&self) -> u8 {
+        self.selector
+    }
+}
+
+/// A layer's projection plane follows its authored selector 1:1, and nothing
+/// else may reach `layer_uv`.
+///
+/// This is the whole of what is claimed about the byte at record `+12`: the
+/// loader refuses any value outside 0..=2 (see `Layer::selector`), and within
+/// that range the three values pick the three projections the client's terrain
+/// shaders sample with. Keeping the mapping in one function is what makes the
+/// claim checkable — a value threading through from somewhere else could not
+/// select a plane `layer_uv` does not define.
+#[cfg(test)]
+mod selector_tests {
+    use super::*;
+
+    #[test]
+    fn the_selector_accessor_reports_the_authored_byte() {
+        let layer = Layer {
+            texture: 0,
+            selector: 2,
+            axis: 2,
+            u: 1.,
+            v: 1.,
+            mask_size: 0,
+            mask: Mask::raw(Vec::new()),
+        };
+        assert_eq!(
+            layer.selector(),
+            2,
+            "the accessor returns the authored byte"
+        );
+        assert_eq!(layer.axis, 2, "and the axis it was derived into");
+    }
+
+    #[test]
+    fn the_three_authored_selectors_name_the_three_projections() {
+        // Ground plane, z/y plane, x/y plane — distinct for a general point.
+        let point = (3., 5., 7.);
+        let seen = [0u8, 1, 2].map(|selector| layer_uv(selector, point.0, point.1, point.2));
+        // `layer_uv`'s own numbering: 0 = z/y plane, 1 (and the fallback) = the
+        // ground plane, 2 = x/y plane. The selectors map one-to-one onto it.
+        assert_eq!(seen[0], (7., -5.), "selector 0 samples the z/y plane");
+        assert_eq!(seen[1], (3., -7.), "selector 1 samples the ground plane");
+        assert_eq!(seen[2], (3., -5.), "selector 2 samples the x/y plane");
+        assert_ne!(seen[0], seen[1]);
+        assert_ne!(seen[1], seen[2]);
+        assert_ne!(seen[0], seen[2]);
+    }
+}
+
 pub(crate) fn layer_uv(axis: u8, x: f32, y: f32, z: f32) -> (f32, f32) {
     match axis {
         0 => (z, -y),
@@ -157,6 +244,42 @@ fn in_window(id: usize, cols: usize, window: Option<[usize; 4]>) -> bool {
         x >= x0 && x < x1 && y >= y0 && y < y1
     })
 }
+/// The stand-in the client paints where a terrain texture is absent.
+///
+/// `a37` names `Temp\\notex.bmp` in its flat ground texture list and never ships
+/// it. The client substitutes its missing-texture image and keeps the map, so
+/// this builds the same thing the terrain sampler understands: a DXT1 DDS whose
+/// block is the client's missing-texture magenta, with a single mip level.
+/// Sizes stay multiples of four because DXT1 encodes 4x4 blocks.
+fn notex_pixels() -> Vec<u8> {
+    let (width, height) = (4u32, 4u32);
+    let mut dds = vec![0u8; 128];
+    dds[..4].copy_from_slice(b"DDS ");
+    for (p, v) in [
+        (4, 124u32),
+        (12, height),
+        (16, width),
+        (20, width * 2),
+        (28, 1),
+        (76, 32),
+        (80, 0x4),
+        (84, 0x3154_5844),
+    ] {
+        dds[p..p + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    // One colour block: colour0 = magenta, colour1 = black, all-white indices,
+    // which DXT1 resolves to colour0 everywhere.
+    dds.extend_from_slice(&0xf800u16.to_le_bytes());
+    dds.extend_from_slice(&0x0000u16.to_le_bytes());
+    dds.extend_from_slice(&0xffffu32.to_le_bytes());
+    dds
+}
+
+#[cfg(test)]
+pub(crate) fn notex_pixels_for_test() -> Vec<u8> {
+    notex_pixels()
+}
+
 impl Materials {
     pub fn load(
         dir: &Path,
@@ -217,17 +340,44 @@ impl Materials {
             .collect();
         let mut textures = Vec::with_capacity(paths.len());
         for path in paths.iter().filter(|_| colors) {
-            let entry = entry_index
-                .get(&path.to_ascii_lowercase())
-                .map(|&i| &entries[i])
-                .ok_or_else(|| format!("missing texture {path}"))?;
-            let raw = pck::read_entry(&mut file, entry)?;
+            // A map may name a texture the client never packed: `a37` (Morai)
+            // asks for `Temp\notex.bmp` in its flat terrain texture list. The
+            // client paints such a slot with its missing-texture placeholder and
+            // keeps the map, so one absent name must not cost the whole world --
+            // the missing mask is what made the instance fail to load at all.
+            let raw = match entry_index.get(&path.to_ascii_lowercase()) {
+                Some(&i) => pck::read_entry(&mut file, &entries[i])?,
+                None => {
+                    eprintln!(
+                        "terrain: texture {path} is not in textures.pck; using a placeholder"
+                    );
+                    notex_pixels()
+                }
+            };
             // Terrain sources must be one of the compressed formats the client
             // can create; anything else is an explicit error naming the file
             // instead of an `image` crate fallback that silently decodes a
             // format the native device would have rejected.
-            let info = crate::terrain_sampling::parse_terrain_dds(&raw)
-                .map_err(|e| format!("texture {path}: {e}"))?;
+            let info = match crate::terrain_sampling::parse_terrain_dds(&raw) {
+                Ok(info) => info,
+                // Only the stand-in may be re-tried as a placeholder: an
+                // authored DDS the device would reject stays an error.
+                Err(e) if entry_index.contains_key(&path.to_ascii_lowercase()) => {
+                    return Err(format!("texture {path}: {e}"))
+                }
+                Err(_) => {
+                    let raw = notex_pixels();
+                    let info = crate::terrain_sampling::parse_terrain_dds(&raw)
+                        .map_err(|e| format!("placeholder texture: {e}"))?;
+                    textures.push(Texture {
+                        w: info.width as usize,
+                        h: info.height as usize,
+                        source: raw,
+                        levels: Default::default(),
+                    });
+                    continue;
+                }
+            };
             let (w, h) = (info.width as usize, info.height as usize);
             textures.push(Texture {
                 w,
@@ -331,9 +481,20 @@ impl Materials {
                             size = 128;
                         }
                     }
+                    let selector = *data.get(lp + 12).ok_or("truncated layer")?;
+                    if selector > 2 {
+                        // Not a projection the shaders know, and the byte's
+                        // native meaning is undecoded -- refuse rather than
+                        // pick a plane at random.
+                        return Err(format!(
+                            "{name}: layer selector {selector} is not one of the three \
+                             projections this reader implements"
+                        ));
+                    }
                     area.layers.push(Layer {
                         texture,
-                        axis: *data.get(lp + 12).ok_or("truncated layer")?,
+                        selector,
+                        axis: selector,
                         u: f32at(&data, lp + 16)?,
                         v: f32at(&data, lp + 20)?,
                         mask_size: size,
@@ -490,6 +651,7 @@ pub(crate) fn cutoff_mask_fixture() -> Materials {
                 layers: vec![
                     Layer {
                         texture: 0,
+                        selector: 1,
                         axis: 1,
                         u: 1.,
                         v: 1.,
@@ -498,6 +660,7 @@ pub(crate) fn cutoff_mask_fixture() -> Materials {
                     },
                     Layer {
                         texture: 0,
+                        selector: 1,
                         axis: 1,
                         u: 1.,
                         v: 1.,
@@ -565,6 +728,7 @@ mod tests {
                 layers: vec![
                     Layer {
                         texture: 0,
+                        selector: 1,
                         axis: 1,
                         u: 1.,
                         v: 1.,
@@ -573,6 +737,7 @@ mod tests {
                     },
                     Layer {
                         texture: 1,
+                        selector: 1,
                         axis: 1,
                         u: 1.,
                         v: 1.,
@@ -624,6 +789,7 @@ mod tests {
                 .map(|id| Area {
                     layers: vec![Layer {
                         texture: 0,
+                        selector: 1,
                         axis: 1,
                         u: 1.,
                         v: 1.,

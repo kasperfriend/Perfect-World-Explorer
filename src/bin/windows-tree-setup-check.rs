@@ -1,6 +1,9 @@
 //! End-to-end check of the embedded PE32 client DLL bridge on Windows/Wine.
 #![allow(dead_code)]
 #[cfg(windows)]
+#[path = "../angelica_pck.rs"]
+mod angelica_pck;
+#[cfg(windows)]
 #[path = "../client_detect.rs"]
 mod client_detect;
 #[cfg(windows)]
@@ -9,6 +12,8 @@ mod dxt;
 #[cfg(windows)]
 #[path = "../launcher_ui.rs"]
 mod launcher_ui;
+#[path = "../load_status.rs"]
+mod load_status;
 #[cfg(windows)]
 #[path = "../model_dds.rs"]
 mod model_dds;
@@ -21,6 +26,10 @@ mod scene;
 #[cfg(windows)]
 #[path = "../tree_source.rs"]
 mod tree_source;
+// `trees.rs` compiles on every platform and names this module, so the module
+// cannot be Windows-only even though the bridge around it is.
+#[path = "../speedtree_version.rs"]
+mod speedtree_version;
 #[cfg(windows)]
 #[path = "../trees.rs"]
 mod trees;
@@ -30,6 +39,10 @@ mod vegetation_textures;
 #[cfg(windows)]
 #[path = "../windows_setup.rs"]
 mod windows_setup;
+// `windows_setup` draws its load-rate sparkline through
+// `crate::loading_graph`.
+#[path = "../loading_graph.rs"]
+mod loading_graph;
 #[cfg(windows)]
 fn main() {
     let root = std::path::PathBuf::from(std::env::args_os().nth(1).expect("element path"));

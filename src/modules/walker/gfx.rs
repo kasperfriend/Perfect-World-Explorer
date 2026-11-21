@@ -383,6 +383,7 @@ mod tests {
     fn authentic_static_weapon_event_loads_and_action_events_stay_excluded() {
         let element = std::path::Path::new("google_drive/pw142/element");
         if !element.join("models.pck").exists() {
+            crate::pck::corpus_file_absent(&element.join("models.pck"));
             return;
         }
         let mut assets = Assets::open(element).unwrap();

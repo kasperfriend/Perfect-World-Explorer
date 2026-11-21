@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare PWCOMP01 leaf records to lod-explicit-probe automatic hashes.
+"""Compare PWCOMP02 leaf records to lod-explicit-probe automatic hashes.
 
 FNV hashes cover the leaf count, centers, normals, cluster IDs, UVs and
 fixed-camera map coordinates, not material state or animated geometry.
@@ -17,13 +17,13 @@ def leaf_hashes(data):
     def take(n):
         nonlocal offset
         if n < 0 or offset + n > len(data):
-            raise ValueError('truncated PWCOMP01')
+            raise ValueError('truncated PWCOMP02')
         out = data[offset:offset + n]
         offset += n
         return out
     def u32():
         return struct.unpack('<I', take(4))[0]
-    if take(8) != b'PWCOMP01':
+    if take(8) != b'PWCOMP02':
         raise ValueError('unexpected cache version')
     take(12)  # DLL hash, source hash and type ID (checked by Rust reader).
     for _ in range(2):
@@ -57,7 +57,7 @@ def leaf_hashes(data):
             for byte in chunk:
                 h = ((h ^ byte) * 1099511628211) & ((1 << 64) - 1)
         result.append(f'{h:016x}')
-    if offset != len(data): raise ValueError('trailing PWCOMP01 bytes')
+    if offset != len(data): raise ValueError('trailing PWCOMP02 bytes')
     return result
 
 

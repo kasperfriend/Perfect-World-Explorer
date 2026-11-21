@@ -1,4 +1,10 @@
-//! Experimental PWCOMP01 independent component geometry reader.
+//! Experimental PWCOMP02 independent component geometry reader.
+//!
+//! Bumped from `PWCOMP01` because the vertex ceiling moved off the client's u16
+//! index width, so a `PWCOMP02` file may hold a component a `PWCOMP01` reader
+//! would have refused. A renamed magic rebuilds the archive instead of letting
+//! an old one answer for a new limit; `tools/speedtree/` readers are updated
+//! with it.
 //!
 //! This is a diagnostic archive, not a renderer-ready cache: leaf card corners
 //! are for a fixed camera, and wind, material state and LOD transitions are not
@@ -83,8 +89,13 @@ impl<'a> Reader<'a> {
     }
     fn part(&mut self) -> Result<Part, String> {
         let count = self.u32()? as usize;
-        if count > 65535 {
-            return Err("vertex limit".into());
+        // u32 indices (`Part::indices`), so the old 65,535 ceiling refused
+        // valid heavier components. Same limit as `trees.rs`.
+        if count > crate::trees::MAX_TREE_VERTICES {
+            return Err(format!(
+                "vertex limit: {count} in one component (limit {})",
+                crate::trees::MAX_TREE_VERTICES
+            ));
         }
         self.remaining_at_least(count * 32)?;
         let mut vertices = Vec::with_capacity(count);
@@ -112,8 +123,11 @@ impl<'a> Reader<'a> {
     }
     fn leaf_lod(&mut self) -> Result<Vec<Leaf>, String> {
         let count = self.u32()? as usize;
-        if count > 65535 {
-            return Err("leaf limit".into());
+        if count > crate::trees::MAX_TREE_VERTICES {
+            return Err(format!(
+                "leaf limit: {count} in one LOD (limit {})",
+                crate::trees::MAX_TREE_VERTICES
+            ));
         }
         self.remaining_at_least(count * 124)?;
         let mut leaves = Vec::with_capacity(count);
@@ -151,7 +165,7 @@ pub fn parse(
 ) -> Result<Components, String> {
     let mut r = Reader { data, offset: 0 };
     let mut parse_inner = || -> Result<Components, String> {
-        if r.take(8)? != b"PWCOMP01" {
+        if r.take(8)? != b"PWCOMP02" {
             return Err("unknown cache version".into());
         }
         if r.u32()? != hash(runtime) {
@@ -204,7 +218,7 @@ mod tests {
         b.extend(x.to_le_bytes());
     }
     fn fixture() -> Vec<u8> {
-        let mut b = b"PWCOMP01".to_vec();
+        let mut b = b"PWCOMP02".to_vec();
         for v in [hash(b"dll"), hash(b"spt"), 12, 0, 0, 1, 3] {
             u(&mut b, v);
         }
