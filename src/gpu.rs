@@ -5268,6 +5268,27 @@ async fn adapter(
             .ok_or("No compatible GPU adapter")?
     };
     eprintln!("GPU adapter: {:?}", a.get_info());
+    let adapter_limits = a.limits();
+    let mut required_limits =
+        wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits.clone());
+    // Raywatcher's trace pass binds 5 write-only storage textures and 4 storage
+    // buffers; downlevel_defaults() caps storage textures at 4, which triggers
+    // a wgpu validation error on both hardware and software modes.
+    required_limits.max_storage_textures_per_shader_stage = adapter_limits
+        .max_storage_textures_per_shader_stage
+        .max(required_limits.max_storage_textures_per_shader_stage);
+    required_limits.max_storage_buffers_per_shader_stage = adapter_limits
+        .max_storage_buffers_per_shader_stage
+        .max(required_limits.max_storage_buffers_per_shader_stage);
+    required_limits.max_sampled_textures_per_shader_stage = adapter_limits
+        .max_sampled_textures_per_shader_stage
+        .max(required_limits.max_sampled_textures_per_shader_stage);
+    required_limits.max_storage_buffer_binding_size = adapter_limits
+        .max_storage_buffer_binding_size
+        .max(required_limits.max_storage_buffer_binding_size);
+    required_limits.max_buffer_size = adapter_limits
+        .max_buffer_size
+        .max(required_limits.max_buffer_size);
     let (d, q) = a
         .request_device(
             &wgpu::DeviceDescriptor {
@@ -5279,7 +5300,7 @@ async fn adapter(
                     & (wgpu::Features::TEXTURE_COMPRESSION_BC
                         | wgpu::Features::MULTI_DRAW_INDIRECT
                         | wgpu::Features::INDIRECT_FIRST_INSTANCE),
-                required_limits: wgpu::Limits::downlevel_defaults().using_resolution(a.limits()),
+                required_limits,
             },
             None,
         )
