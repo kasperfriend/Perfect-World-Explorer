@@ -752,6 +752,7 @@ fn run(
     let mut skipped = 0usize;
     let mut names_not_resolved = 0usize;
     let mut drawn_placements = 0usize;
+    let mut refused_mesh_messages: Vec<String> = Vec::new();
     let mut pages = 0usize;
     let mut atlas_pages = 0usize;
     let mut atlas_bytes = 0usize;
@@ -780,7 +781,7 @@ fn run(
                 names_not_resolved += 1;
                 continue;
             };
-            drawn_placements += 1;
+            let mut model_emitted_mesh = false;
             // EC-BSD record +36 low bytes, recovered at 0x489f0b/0x489f12.
             // Keep the flags with every index range so a hidden placement is
             // never submitted just because its page is resident.
@@ -798,13 +799,15 @@ fn run(
                 ) {
                     Ok(state) => state.kind,
                     Err(e) => {
-                        // No silent skip: an unrepresentable mesh is an explicit
-                        // error for the whole-world builder, not a dropped
-                        // triangle. The BMD parser already rejects unsupported
-                        // versions by name before this point.
-                        return Err(format!("unsupported baked mesh {}: {e}", mesh.name));
+                        // Refuse this mesh by version and keep loading the rest
+                        // of the world's buildings instead of aborting the
+                        // entire preload on a single v2/v3 mesh.
+                        refused_mesh_messages
+                            .push(format!("unsupported baked mesh {}: {e}", mesh.name));
+                        continue;
                     }
                 };
+                model_emitted_mesh = true;
                 if crate::objects::SdrUvAnim::from_texture_path(&mesh.texture)
                     .is_some_and(|a| a.tc_scroll[1] < 0.0)
                 {
@@ -901,6 +904,9 @@ fn run(
                     });
                 }
             }
+            if model_emitted_mesh {
+                drawn_placements += 1;
+            }
         }
         // A batch holds at most 32 placements' reused-atlas geometry; unlike
         // keeping every atlas builder alive this never retains world pixels.
@@ -947,7 +953,11 @@ fn run(
                 selected: limit.saturating_sub(first),
                 drawn: drawn_placements,
                 names_not_resolved,
-                versions_refused: extract_refused_versions(objects.unavailable_examples()),
+                versions_refused: {
+                    let mut all_msgs = objects.unavailable_examples().to_vec();
+                    all_msgs.extend(refused_mesh_messages);
+                    extract_refused_versions(&all_msgs)
+                },
                 archives_not_indexed: objects.unindexed_archives(),
                 ..Default::default()
             },

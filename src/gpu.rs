@@ -1430,9 +1430,8 @@ fn build(
             ) {
                 Ok(state) => state.kind,
                 Err(e) => {
-                    // Explicit error, not a silently dropped mesh: the BMD
-                    // parser names every unrecovered version before this point.
-                    return Err(format!("unsupported baked mesh {}: {e}", mesh.name));
+                    eprintln!("Skipping unsupported baked mesh {}: {e}", mesh.name);
+                    continue;
                 }
             };
             if crate::objects::SdrUvAnim::from_texture_path(&mesh.texture)

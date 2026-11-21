@@ -243,14 +243,15 @@ pub struct ExecutableInfo {
 }
 
 impl ExecutableInfo {
-    /// Display label: the known build's name, else the resource version, else
-    /// the fingerprint itself.
+    /// Display label: the known build's name, else the release marker from
+    /// `config/element/version.sw`, else the fingerprint itself. The PE
+    /// resource version is never shown as the game version.
     pub fn label(&self) -> String {
         if let Some(known) = self.known {
             return known.to_string();
         }
-        if let Some(version) = &self.file_version {
-            return format!("unverified build {version}");
+        if let Some(release) = &self.release_version {
+            return format!("unverified build {release}");
         }
         format!(
             "unverified build ({} bytes, sha256 {}…)",
@@ -1638,6 +1639,11 @@ mod tests {
             !exe(None).version_row().contains("6154"),
             "resource version must not appear in game version row"
         );
+        assert!(
+            !exe(None).label().contains("6154"),
+            "resource version must not appear in selector headline label"
+        );
+        assert_eq!(exe(Some("1.8.4")).label(), "unverified build 1.8.4");
     }
 
     #[test]
