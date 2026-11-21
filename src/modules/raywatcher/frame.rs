@@ -254,6 +254,59 @@ pub fn sun_ambient_split(
     (sun_f, 1.0 - sun_f)
 }
 
+/// Depth-aware and normal-aware joint bilateral upsample weight matching
+/// `COMPOSITE_SHADER` (Phase 6). Returns `0.0` across sky boundaries or depth
+/// discontinuities (`rel_dz > 0.05`) so shadows/AO never bleed onto foreground
+/// or background silhouettes.
+pub fn bilateral_upsample_weight(
+    z_center: f32,
+    z_sample: f32,
+    n_center: Vec3,
+    n_sample: Vec3,
+    dist_sq: f32,
+) -> f32 {
+    if z_center <= 0.0 || z_sample <= 0.0 {
+        return 0.0;
+    }
+    let rel_dz = (z_center - z_sample).abs() / z_center.max(1e-4);
+    if rel_dz > 0.05 {
+        return 0.0;
+    }
+    let depth_scale = (0.02 * z_center.max(1e-4)).max(1e-5);
+    let w_depth = (-(z_center - z_sample).abs() / depth_scale).exp();
+    let ndot = n_center
+        .normalize_or_zero()
+        .dot(n_sample.normalize_or_zero())
+        .max(0.0);
+    let w_norm = ndot.powf(16.0);
+    let w_spatial = (-0.5 * dist_sq).exp();
+    w_spatial * w_depth * w_norm
+}
+
+/// Evaluate a joint bilateral upsample over `(value, depth, normal, dist_sq)`
+/// taps, falling back to `fallback` if no tap passes the depth/normal gate.
+pub fn joint_bilateral_upsample(
+    z_center: f32,
+    n_center: Vec3,
+    taps: &[(f32, f32, Vec3, f32)],
+    fallback: f32,
+) -> f32 {
+    let mut sum = 0.0;
+    let mut w_sum = 0.0;
+    for &(val, z_tap, n_tap, dist_sq) in taps {
+        let w = bilateral_upsample_weight(z_center, z_tap, n_center, n_tap, dist_sq);
+        if w > 1e-5 {
+            sum += val * w;
+            w_sum += w;
+        }
+    }
+    if w_sum > 1e-5 {
+        sum / w_sum
+    } else {
+        fallback
+    }
+}
+
 /// Phase 2 layered composite reference formula: separates the raster colour into
 /// `raster_sun` and `raster_ambient` via [`sun_ambient_split`] so `V_sun`
 /// multiplies only the sun contribution and `AO` multiplies only the ambient
@@ -818,6 +871,33 @@ mod tests {
         );
         assert!(with_additives.x > raster.x);
         assert!(with_additives.z > raster.z);
+    }
+
+    #[test]
+    fn bilateral_upsample_does_not_cross_depth_discontinuity() {
+        let z_fg = 0.80_f32; // foreground reversed-Z depth (near)
+        let z_bg = 0.10_f32; // background reversed-Z depth (far)
+        let n_up = Vec3::Y;
+        assert_eq!(
+            bilateral_upsample_weight(z_fg, z_bg, n_up, n_up, 0.25),
+            0.0,
+            "bilateral weight must reject samples across a depth discontinuity"
+        );
+        let taps = [
+            (1.0, z_fg, n_up, 0.0),
+            (0.0, z_bg, n_up, 1.0),
+            (0.0, z_bg, n_up, 1.0),
+            (0.0, z_bg, n_up, 2.0),
+        ];
+        let upsampled = joint_bilateral_upsample(z_fg, n_up, &taps, 1.0);
+        assert!(
+            (upsampled - 1.0).abs() < 1e-5,
+            "foreground pixel must not bleed background shadow across depth edge, got {upsampled}"
+        );
+        assert!(
+            bilateral_upsample_weight(z_fg, z_fg, Vec3::Y, Vec3::X, 0.0) < 1e-5,
+            "normal discontinuity must reject orthogonal surface tap"
+        );
     }
 
     #[test]

@@ -1314,13 +1314,18 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Fullscreen layered composite shader: modulates the untouched full raster
-/// world render by Raywatcher's denoised shadow*AO light factor (`src_rt.a`)
-/// and adds denoised RT reflections + indirect GI bounce (`src_rt.rgb`).
+/// Fullscreen layered composite shader (Phase 6): depth-aware and normal-aware
+/// 3x3 joint bilateral upsampling of Raywatcher's denoised lighting layer
+/// (`src_rt`) onto the untouched full-resolution raster world render
+/// (`src_raster`). Replaces raw bilinear sampling so shadow/AO/GI edges snap
+/// cleanly to full-resolution building and terrain silhouettes without bleeding
+/// across depth discontinuities.
 const COMPOSITE_SHADER: &str = r#"
 @group(0) @binding(0) var src_raster: texture_2d<f32>;
 @group(0) @binding(1) var src_rt: texture_2d<f32>;
 @group(0) @binding(2) var src_samp: sampler;
+@group(0) @binding(3) var src_depth: texture_depth_2d;
+@group(0) @binding(4) var src_normals: texture_2d<f32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -1341,10 +1346,80 @@ fn vs(@builtin(vertex_index) idx: u32) -> VOut {
     return out;
 }
 
+fn load_unit_normal(coord: vec2<i32>) -> vec3<f32> {
+    let n = textureLoad(src_normals, coord, 0).xyz;
+    let len = length(n);
+    return select(vec3<f32>(0.0, 1.0, 0.0), n / len, len > 1e-4);
+}
+
 @fragment
 fn fs(i: VOut) -> @location(0) vec4<f32> {
-    let raster = textureSampleLevel(src_raster, src_samp, i.uv, 0.0);
-    let rt = textureSampleLevel(src_rt, src_samp, i.uv, 0.0);
+    let rdim = vec2<i32>(textureDimensions(src_raster));
+    let ddim = vec2<i32>(textureDimensions(src_depth));
+    let rt_dim = vec2<i32>(textureDimensions(src_rt));
+    let ndim = vec2<i32>(textureDimensions(src_normals));
+
+    let px = clamp(vec2<i32>(i.pos.xy), vec2<i32>(0), rdim - vec2<i32>(1));
+    let raster = textureLoad(src_raster, px, 0);
+
+    let dpx = clamp(
+        vec2<i32>(i.uv * vec2<f32>(ddim)),
+        vec2<i32>(0),
+        ddim - vec2<i32>(1),
+    );
+    let z_center = textureLoad(src_depth, dpx, 0);
+    // Sky pixels pass through 100% untouched.
+    if (z_center <= 0.0) {
+        return raster;
+    }
+
+    let n_center_coord = clamp(
+        vec2<i32>(i.uv * vec2<f32>(ndim)),
+        vec2<i32>(0),
+        ndim - vec2<i32>(1),
+    );
+    let n_center = load_unit_normal(n_center_coord);
+
+    let rt_f = i.uv * vec2<f32>(rt_dim) - vec2<f32>(0.5);
+    let rt_base = vec2<i32>(round(rt_f));
+
+    var rt_sum = vec4<f32>(0.0);
+    var w_sum = 0.0;
+    let inv_rt_dim = vec2<f32>(1.0) / max(vec2<f32>(rt_dim), vec2<f32>(1.0));
+    let depth_scale = max(0.02 * max(z_center, 1e-4), 1e-5);
+
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            let tap = clamp(rt_base + vec2<i32>(dx, dy), vec2<i32>(0), rt_dim - vec2<i32>(1));
+            let tap_uv = (vec2<f32>(tap) + vec2<f32>(0.5)) * inv_rt_dim;
+            let tap_dpx = clamp(vec2<i32>(tap_uv * vec2<f32>(ddim)), vec2<i32>(0), ddim - vec2<i32>(1));
+            let z_tap = textureLoad(src_depth, tap_dpx, 0);
+            if (z_tap <= 0.0) {
+                continue;
+            }
+            let rel_dz = abs(z_center - z_tap) / max(z_center, 1e-4);
+            if (rel_dz > 0.05) {
+                continue;
+            }
+            let w_depth = exp(-abs(z_center - z_tap) / depth_scale);
+
+            let tap_ncoord = clamp(vec2<i32>(tap_uv * vec2<f32>(ndim)), vec2<i32>(0), ndim - vec2<i32>(1));
+            let n_tap = load_unit_normal(tap_ncoord);
+            let ndot = max(dot(n_center, n_tap), 0.0);
+            let w_norm = pow(ndot, 16.0);
+
+            let delta = vec2<f32>(tap) - rt_f;
+            let w_spatial = exp(-0.5 * dot(delta, delta));
+            let w = w_spatial * w_depth * w_norm;
+            if (w > 1e-5) {
+                rt_sum = rt_sum + textureLoad(src_rt, tap, 0) * w;
+                w_sum = w_sum + w;
+            }
+        }
+    }
+
+    let rt_fallback = textureLoad(src_rt, clamp(rt_base, vec2<i32>(0), rt_dim - vec2<i32>(1)), 0);
+    let rt = select(rt_fallback, rt_sum / w_sum, w_sum > 1e-5);
     let light_factor = clamp(rt.a, 0.0, 1.0);
     let layered = max(raster.rgb * light_factor + rt.rgb, vec3<f32>(0.0));
     return vec4<f32>(layered, raster.a);
@@ -1674,6 +1749,26 @@ impl Pipelines {
                         binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
                         count: None,
                     },
                 ],
@@ -2498,6 +2593,7 @@ impl RaywatcherGpu {
                 rr.invalidate_prep();
             }
             self.gbuf_prep_bind_group = None;
+            self.raster_copy = None;
             self.frames = 0;
             return true;
         }
@@ -3026,6 +3122,14 @@ impl RaywatcherGpu {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: wgpu::BindingResource::Sampler(&self.pipelines.blit_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(&self.depth),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(&self.grid.gbuf_norm_view),
                     },
                 ],
             });
