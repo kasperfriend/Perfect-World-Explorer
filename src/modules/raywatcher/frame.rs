@@ -683,4 +683,113 @@ mod tests {
         assert!((sun.angular_radius - 0.6f32.to_radians()).abs() < 1e-6);
         assert!((sun.intensity - l.daylight).abs() < 1e-6);
     }
+
+    #[test]
+    fn ray_generation_and_unprojection_match_raster_depth() {
+        let eye = Vec3::new(120.0, 45.0, -310.0);
+        let target = eye + Vec3::new(0.4, -0.15, 0.9).normalize() * 50.0;
+        // Match the viewer's reversed-Z right-handed projection (z=1 near, z=0 far).
+        let view = Mat4::look_at_rh(eye, target, Vec3::Y);
+        let proj = Mat4::perspective_rh(60.0_f32.to_radians(), 16.0 / 9.0, 2000.0, 0.5);
+        let vp = proj * view;
+        let inv_vp = vp.inverse();
+
+        for &dist in &[5.0_f32, 25.0, 180.0, 750.0] {
+            let probe = eye + (target - eye).normalize() * dist + Vec3::new(1.5, -0.7, 0.4);
+            let err = depth_unprojection_error(vp, inv_vp, probe);
+            assert!(
+                err < 0.01,
+                "unprojection error at dist {dist} was {err} (>= 0.01)"
+            );
+            let clip = vp * probe.extend(1.0);
+            let ndc = [clip.x / clip.w, clip.y / clip.w];
+            let ray_dir = ray_through_ndc(inv_vp, ndc);
+            let expected_dir = (probe - eye).normalize();
+            assert!(
+                ray_dir.dot(expected_dir) > 0.9999,
+                "ray direction mismatch at dist {dist}: {ray_dir:?} vs {expected_dir:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn layered_composite_preserves_raster_colour_when_rt_signals_are_neutral() {
+        let raster = Vec3::new(0.42, 0.61, 0.28);
+        let identity = composite_layered(
+            raster,
+            1.0,
+            1.0,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            0.0,
+            true,
+            true,
+            0.8,
+        );
+        assert!(
+            (identity - raster).length() < 1e-6,
+            "neutral RT signals must preserve raster 1:1: {identity:?} vs {raster:?}"
+        );
+
+        let shadowed = composite_layered(
+            raster,
+            0.0,
+            1.0,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            0.0,
+            true,
+            true,
+            0.8,
+        );
+        assert!(shadowed.x < raster.x && shadowed.x > 0.0);
+
+        let with_additives = composite_layered(
+            raster,
+            1.0,
+            1.0,
+            Vec3::new(0.05, 0.04, 0.02),
+            Vec3::new(0.20, 0.12, 0.05),
+            Vec3::new(0.08, 0.10, 0.14),
+            0.0,
+            true,
+            true,
+            0.8,
+        );
+        assert!(with_additives.x > raster.x);
+        assert!(with_additives.z > raster.z);
+    }
+
+    #[test]
+    fn point_light_falloff_decays_smoothly_and_reaches_zero_at_radius() {
+        let r = 20.0;
+        let f_near = point_light_falloff(1.0, r);
+        let f_mid = point_light_falloff(10.0, r);
+        let f_edge = point_light_falloff(19.0, r);
+        let f_at = point_light_falloff(r, r);
+        let f_out = point_light_falloff(25.0, r);
+        assert!(f_near > f_mid && f_mid > f_edge && f_edge > 0.0);
+        assert_eq!(f_at, 0.0);
+        assert_eq!(f_out, 0.0);
+        assert_eq!(point_light_falloff(1.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn distance_scaled_bias_grows_with_distance_and_respects_floor() {
+        let near_b = distance_scaled_bias(0.05, 2.0);
+        let far_b = distance_scaled_bias(0.05, 500.0);
+        assert!(near_b >= 0.05);
+        assert!(far_b > near_b * 5.0);
+    }
+
+    #[test]
+    fn debug_view_tokens_round_trip() {
+        use super::super::plan::DebugView;
+        for (idx, view) in DebugView::ALL.iter().copied().enumerate() {
+            assert_eq!(view.as_u32(), idx as u32);
+            assert_eq!(DebugView::parse(view.token()), Some(view));
+        }
+    }
 }
