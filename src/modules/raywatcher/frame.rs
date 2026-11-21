@@ -185,6 +185,19 @@ pub struct PointLight {
 /// Phase 7 smooth windowed inverse-square falloff for local point lights:
 /// returns `0.0` at `distance >= radius`, decays smoothly with distance, and
 /// avoids singularities near `distance = 0`.
+/// Phase 1 point-light shadow visibility modulation: returns a multiplier in
+/// `(0, 1]` that reduces brightness only where a game `SceneLight` illuminates
+/// the pixel (`light_weight > 0`) and is occluded (`point_vis < 1`). Never
+/// increases brightness above `1.0` (no double-counting over raster).
+pub fn point_light_shadow_modulation(point_vis: f32, light_weight: f32) -> f32 {
+    if light_weight <= 1e-4 {
+        return 1.0;
+    }
+    let vis = point_vis.clamp(0.0, 1.0);
+    let influence = light_weight.clamp(0.0, 0.5);
+    1.0 - influence * (1.0 - vis)
+}
+
 pub fn point_light_falloff(distance: f32, radius: f32) -> f32 {
     if radius <= 1e-4 || distance >= radius {
         return 0.0;
@@ -760,6 +773,18 @@ mod tests {
         );
         assert!(with_additives.x > raster.x);
         assert!(with_additives.z > raster.z);
+    }
+
+    #[test]
+    fn point_light_shadows_modulate_without_adding_light() {
+        let base = Vec3::new(0.6, 0.5, 0.4);
+        let lit_mod = point_light_shadow_modulation(1.0, 0.8);
+        assert!((lit_mod - 1.0).abs() < 1e-6);
+        assert!((base * lit_mod).x <= base.x + 1e-6);
+        let occluded_mod = point_light_shadow_modulation(0.0, 0.6);
+        assert!(occluded_mod < 1.0 && occluded_mod >= 0.5);
+        assert!((base * occluded_mod).x < base.x);
+        assert_eq!(point_light_shadow_modulation(0.0, 0.0), 1.0);
     }
 
     #[test]

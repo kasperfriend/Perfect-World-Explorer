@@ -395,9 +395,15 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
     }
 
-    // Phase 7: Scene point / local lights with smooth inverse-square falloff and shadow rays.
+    // Phase 1: Point-light shadow visibility modulation ONLY (never adds light
+    // in layered mode because raster `world_models_gpu` already applies `SceneLights`).
+    // Opt-in via `point_light_meta.y > 0.5` (off by default); also evaluated in debug_mode == 6.
+    uint debug_mode = uint(round(params.counts.w));
+    bool pl_shadows_enabled = params.point_light_meta.y > 0.5;
     float3 point_lighting = float3(0.0, 0.0, 0.0);
-    if (bits_lighting) {
+    float pl_w_total = 0.0;
+    float pl_w_lit = 0.0;
+    if ((pl_shadows_enabled || !layered || debug_mode == 6u) && bits_lighting) {
         uint pl_count = min(uint(round(params.point_light_meta.x)), 16u);
         for (uint li = 0u; li < pl_count; li = li + 1u) {
             float4 pl_pr = params.point_lights_pos_rad[li];
@@ -414,13 +420,22 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                         if (bits_shadows && occluded(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias), state ^ (li * 131u + 17u))) {
                             pl_vis = 0.0;
                         }
-                        point_lighting += raster_rgb * pl_ci.rgb * (pl_ci.w * atten * pl_ndl * pl_vis);
+                        float w = pl_ci.w * atten * pl_ndl;
+                        pl_w_total += w;
+                        pl_w_lit += w * pl_vis;
+                        if (!layered) {
+                            point_lighting += raster_rgb * pl_ci.rgb * (w * pl_vis);
+                        }
                     }
                 }
             }
         }
         point_lighting *= (1.0 - fog_t);
     }
+    float point_vis = (pl_w_total > 1e-4) ? (pl_w_lit / max(pl_w_total, 1e-5)) : 1.0;
+    float point_shadow_mod = (pl_shadows_enabled && pl_w_total > 1e-4)
+        ? (1.0 - clamp(pl_w_total, 0.0, 0.5) * (1.0 - point_vis))
+        : 1.0;
 
     float inv = 1.0 / float(samples);
     float avg_shadow = accum_shadow * inv;
@@ -432,12 +447,12 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
     float3 out_rgb;
     float out_lf;
     if (layered) {
-        // Modulate the 1:1 raster world by RT sun shadow and contact AO
-        // (attenuated smoothly into raster fog), plus colored GI bounce & point lights.
+        // Modulate the 1:1 raster world by RT sun shadow, contact AO, and opt-in
+        // point-light shadow visibility (never adding double-counted point light).
         float shadow_mod = (bits_shadows && n_dot_l > 0.02) ? lerp(0.30, 1.0, avg_shadow) : 1.0;
         float ao_mod = bits_ao ? lerp(0.58, 1.0, avg_open) : 1.0;
-        out_lf = lerp(shadow_mod * ao_mod, 1.0, fog_t);
-        out_rgb = avg_gi + point_lighting;
+        out_lf = lerp(shadow_mod * ao_mod * point_shadow_mod, 1.0, fog_t);
+        out_rgb = avg_gi;
     } else {
         // Opt-in replace_raster mode: keep 1:1 raster world textures/albedo
         // instead of low-poly proxy boxes, relit purely by RT sun + RT ambient + point lights.
@@ -448,7 +463,6 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         out_lf = 1.0;
     }
 
-    uint debug_mode = uint(round(params.counts.w));
     float3 store_refl = avg_refl;
     if (debug_mode == 1u) {
         out_rgb = raster_rgb;
@@ -471,7 +485,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         out_lf = 1.0;
         store_refl = float3(0.0, 0.0, 0.0);
     } else if (debug_mode == 6u) {
-        out_rgb = point_lighting;
+        out_rgb = float3(point_vis, point_vis, point_vis);
         out_lf = 1.0;
         store_refl = float3(0.0, 0.0, 0.0);
     }

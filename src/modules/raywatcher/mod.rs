@@ -136,6 +136,7 @@ impl Raywatcher {
             || settings.reconstruction != self.settings.reconstruction
             || settings.samples != self.settings.samples
             || settings.replace_raster != self.settings.replace_raster
+            || settings.point_light_shadows != self.settings.point_light_shadows
             || settings.debug_view != self.settings.debug_view
         {
             self.pending_reset = true;
@@ -385,6 +386,13 @@ impl Raywatcher {
             .on_hover_text(
                 "Draws the raw one-sample-per-pixel ray image instead of the filtered one. A debug switch: it makes the denoiser's work visible.",
             );
+        ui.checkbox(
+            &mut settings.point_light_shadows,
+            "RT point-light shadows (opt-in)",
+        )
+        .on_hover_text(
+            "Shadows the game's own SceneLights without adding extra light. Off by default.",
+        );
         ui.checkbox(&mut settings.replace_raster, "Replace raster lighting (debug opt-in)")
             .on_hover_text(
                 "Off by default: Raywatcher layers ray-traced shadows, reflections, AO, point lights and GI over the full textured raster world.",
@@ -500,6 +508,11 @@ impl Raywatcher {
             "replace_raster={}",
             u8::from(self.settings.replace_raster)
         );
+        let _ = writeln!(
+            out,
+            "point_light_shadows={}",
+            u8::from(self.settings.point_light_shadows)
+        );
         let _ = writeln!(out, "debug_view={}", self.settings.debug_view.token());
         let effects = self.settings.effects;
         for (name, on) in [
@@ -557,6 +570,9 @@ impl Raywatcher {
         if let Some(v) = get("replace_raster").and_then(parse_flag) {
             s.replace_raster = v;
         }
+        if let Some(v) = get("point_light_shadows").and_then(parse_flag) {
+            s.point_light_shadows = v;
+        }
         if let Some(v) = get("debug_view").and_then(|v| DebugView::parse(&v)) {
             s.debug_view = v;
         }
@@ -582,6 +598,7 @@ impl Raywatcher {
             || s.reconstruction != self.settings.reconstruction
             || s.samples != self.settings.samples
             || s.replace_raster != self.settings.replace_raster
+            || s.point_light_shadows != self.settings.point_light_shadows
             || s.debug_view != self.settings.debug_view;
         self.settings = s;
         if reset {

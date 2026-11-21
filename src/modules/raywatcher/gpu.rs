@@ -152,7 +152,12 @@ impl RayParams {
                 counts[2] as f32,
                 plan.debug_view.as_u32() as f32,
             ],
-            point_light_meta: [pl_count as f32, 0.0, 0.0, 0.0],
+            point_light_meta: [
+                pl_count as f32,
+                if plan.point_light_shadows { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ],
             point_lights_pos_rad: pl_pos_rad,
             point_lights_col_int: pl_col_int,
         }
@@ -840,9 +845,15 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    // Phase 7: Scene point / local lights with smooth inverse-square falloff and shadow rays.
+    // Phase 1: Point-light shadow visibility modulation ONLY (never adds light
+    // in layered mode because raster `world_models_gpu` already applies `SceneLights`).
+    // Opt-in via `point_light_meta.y > 0.5` (off by default); also evaluated in debug_mode == 6.
+    let debug_mode = u32(round(params.counts.w));
+    let pl_shadows_enabled = params.point_light_meta.y > 0.5;
     var point_lighting = vec3<f32>(0.0);
-    if (bits_lighting) {
+    var pl_w_total = 0.0;
+    var pl_w_lit = 0.0;
+    if ((pl_shadows_enabled || !layered || debug_mode == 6u) && bits_lighting) {
         let pl_count = min(u32(round(params.point_light_meta.x)), 16u);
         for (var li = 0u; li < pl_count; li = li + 1u) {
             let pl_pr = params.point_lights_pos_rad[li];
@@ -859,13 +870,20 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
                         if (bits_shadows && occluded(ray_origin, l_dir, bias * 0.5, max(pl_dist - bias, bias), state ^ (li * 131u + 17u))) {
                             pl_vis = 0.0;
                         }
-                        point_lighting = point_lighting + raster_rgb * pl_ci.rgb * (pl_ci.w * atten * pl_ndl * pl_vis);
+                        let w = pl_ci.w * atten * pl_ndl;
+                        pl_w_total = pl_w_total + w;
+                        pl_w_lit = pl_w_lit + w * pl_vis;
+                        if (!layered) {
+                            point_lighting = point_lighting + raster_rgb * pl_ci.rgb * (w * pl_vis);
+                        }
                     }
                 }
             }
         }
         point_lighting = point_lighting * (1.0 - fog_t);
     }
+    let point_vis = select(1.0, pl_w_lit / max(pl_w_total, 1e-5), pl_w_total > 1e-4);
+    let point_shadow_mod = select(1.0, 1.0 - clamp(pl_w_total, 0.0, 0.5) * (1.0 - point_vis), pl_shadows_enabled && pl_w_total > 1e-4);
 
     let inv = 1.0 / f32(samples);
     let avg_shadow = accum_shadow * inv;
@@ -879,8 +897,8 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     if (layered) {
         let shadow_mod = select(1.0, mix(0.30, 1.0, avg_shadow), bits_shadows && n_dot_l > 0.02);
         let ao_mod = select(1.0, mix(0.58, 1.0, avg_open), bits_ao);
-        out_lf = mix(shadow_mod * ao_mod, 1.0, fog_t);
-        out_rgb = avg_gi + point_lighting;
+        out_lf = mix(shadow_mod * ao_mod * point_shadow_mod, 1.0, fog_t);
+        out_rgb = avg_gi;
     } else {
         let direct = select(vec3<f32>(0.0), params.sun_colour.xyz * (n_dot_l * avg_shadow), bits_lighting);
         let ambient = params.ambient.xyz * (avg_open * params.tuning.z);
@@ -889,7 +907,6 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         out_lf = 1.0;
     }
 
-    let debug_mode = u32(round(params.counts.w));
     var store_refl = avg_refl;
     if (debug_mode == 1u) {
         out_rgb = raster_rgb;
@@ -912,7 +929,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         out_lf = 1.0;
         store_refl = vec3<f32>(0.0);
     } else if (debug_mode == 6u) {
-        out_rgb = point_lighting;
+        out_rgb = vec3<f32>(point_vis);
         out_lf = 1.0;
         store_refl = vec3<f32>(0.0);
     }

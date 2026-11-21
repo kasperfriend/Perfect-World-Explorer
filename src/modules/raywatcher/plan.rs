@@ -312,6 +312,10 @@ pub struct Settings {
     /// `false` so textured terrain, buildings, trees, water, effects, sky and
     /// fog stay intact.
     pub replace_raster: bool,
+    /// Opt-in shadow visibility modulation for the game's own `SceneLights`
+    /// point lights (never adds light on top of raster). Off by default until
+    /// per-light visibility is verified.
+    pub point_light_shadows: bool,
     /// Single-term debug view (Phase 0); `DebugView::None` in normal play.
     pub debug_view: DebugView,
     /// Folder the reconstruction SDKs are loaded from. Empty means
@@ -335,6 +339,7 @@ impl Default for Settings {
             reflection_roughness_cutoff: 0.4,
             show_denoiser_input: false,
             replace_raster: false,
+            point_light_shadows: false,
             debug_view: DebugView::None,
             sdk_dir: String::new(),
         }
@@ -409,6 +414,10 @@ pub struct Plan {
     /// Explicit opt-in to replace raster lighting terms. `false` (default)
     /// keeps the full raster world render untouched and composites RT on top.
     pub replace_raster: bool,
+    /// Opt-in shadow visibility modulation for the game's own `SceneLights`
+    /// point lights (never adds light on top of raster). Off by default until
+    /// per-light visibility is verified.
+    pub point_light_shadows: bool,
     /// Single-term debug view (Phase 0); `DebugView::None` in normal play.
     pub debug_view: DebugView,
 }
@@ -433,6 +442,7 @@ impl Plan {
         grid: (0, 0),
         render: (0, 0),
         replace_raster: false,
+        point_light_shadows: false,
         debug_view: DebugView::None,
     };
 
@@ -488,6 +498,7 @@ impl Plan {
             grid: ((render.0 / ray_scale).max(1), (render.1 / ray_scale).max(1)),
             render,
             replace_raster: settings.replace_raster,
+            point_light_shadows: settings.point_light_shadows,
             debug_view: settings.debug_view,
         }
     }
