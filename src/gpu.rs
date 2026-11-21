@@ -3898,6 +3898,13 @@ impl Renderer {
             && self.lighter.settings.reference
     }
 
+    /// True when Lighter is actively contributing ray lighting to the frame,
+    /// either by replacing the world (Reference mode) or by running the hybrid
+    /// RT overlay on top of the native rasterized world.
+    fn ray_lighting_active(&self) -> bool {
+        !self.local_scenery_skipped && (self.renders_rays() || self.lighter.overlays_world())
+    }
+
     fn render(
         &mut self,
         target: &wgpu::TextureView,
@@ -7719,7 +7726,7 @@ fn run_viewer(
                                 .unwrap_or((0.0, 0.0));
                             if !presented_once && !first_draw_started {
                                 first_draw_started = true;
-                                first_frame_progress(if renderer.renders_rays() { "Drawing the first ray-traced world frame…" } else { "Drawing the first Native world frame…" });
+                                first_frame_progress(if renderer.ray_lighting_active() { "Drawing the first ray-traced world frame…" } else { "Drawing the first Native world frame…" });
                             }
                             let drawn_pose = travel_pose.map(|_| [camera.pos.x,camera.pos.y,camera.pos.z,camera.yaw,camera.pitch]);
                             let native_timer = native_travel_timer.as_ref().filter(|_| {
@@ -7745,7 +7752,7 @@ fn run_viewer(
                             if let Some(snapshot) = restoring.as_ref().filter(|s| !presented_once && s.kind == recovery::RestoreKind::Reload) {
                                 // Native is usable on startup or device recovery,
                                 // but cannot satisfy an explicit ray reload.
-                                let fallback = snapshot.lighter.mode != LighterMode::Off && !renderer.renders_rays() && !renderer.lighter.overlays_world();
+                                let fallback = snapshot.lighter.mode != LighterMode::Off && !renderer.ray_lighting_active();
                                 if let Some(error) = renderer.lighter.error().or_else(|| fallback.then_some("The requested ray renderer did not draw the world.")) {
                                     run_error = Some(format!("{}: {error}", snapshot.kind.label()));
                                     renderer.lighter.retire_failed_start();
@@ -8514,7 +8521,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 if let Some(view) = final_view {
                                     encode.present(&renderer.device, &renderer.queue, view);
                                 } else {
-                                    let drawn_mode = if renderer.renders_rays() { renderer.lighter.settings.mode } else { LighterMode::Off };
+                                    let drawn_mode = if renderer.ray_lighting_active() { renderer.lighter.settings.mode } else { LighterMode::Off };
                                     first_composition = Some((Instant::now(), drawn_mode));
                                     first_frame_progress("First frame submitted; waiting for GPU completion…");
                                     return;
@@ -8634,7 +8641,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                 let present_started = drawn_pose.map(|_| Instant::now());
                                 frame.present();
                                 let presented_at = Instant::now();
-                                if renderer.renders_rays() {
+                                if renderer.ray_lighting_active() {
                                     renderer.lighter.profile_presented(presented_at);
                                 }
                                 if let (Some(flight), Some(pose)) = (&mut travel, drawn_pose) {
@@ -8667,7 +8674,7 @@ if settings.upscaling!=crate::UpscaleMethod::Off || settings.frame_generation!=c
                                     } else { None };
                                     let mut chosen = renderer.lighter.settings.effective();
                                     let committed = std::mem::take(&mut stream_commit_pending);
-                                    let actual_rays = renderer.renders_rays();
+                                    let actual_rays = renderer.ray_lighting_active();
                                     let (trace_extent, experiments) = if actual_rays {
                                         renderer.lighter.travel_trace()
                                     } else {
@@ -9403,7 +9410,7 @@ fn preview_frame_using(
                 "Lighter capture requested raster primary visibility but used full rays".into(),
             );
         }
-        if !ready || (mode != LighterMode::Off && !r.renders_rays()) {
+        if !ready || (mode != LighterMode::Off && !r.ray_lighting_active()) {
             return Err("Lighter capture did not render the requested frame".into());
         }
         assert_preview_provider(required_provider, r.lighter.reconstruction_status())
