@@ -654,7 +654,7 @@ pub fn directory(f: &mut File) -> Result<Vec<Entry>, String> {
 /// full word can name it, and unmasking the low half alone produces
 /// 1,517,810,005 -- a position inside the package but two gibibytes short of
 /// the table. That is what the `entry table overlaps footer` line reported.
-#[cfg(test)]
+#[allow(dead_code)]
 fn table_offset(header: &[u8], rev: &Revision) -> Result<u64, String> {
     let stored = if rev.table_offset_width == 8 {
         u64le(header, rev.table_offset_at)?
