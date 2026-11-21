@@ -438,7 +438,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float3 est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
             float3 receiver_albedo = clamp(
                 raster_rgb / max(est_direct, float3(0.25, 0.25, 0.25)),
-                float3(0.05, 0.05, 0.05),
+                float3(0.12, 0.12, 0.12),
                 float3(0.95, 0.95, 0.95));
             float3 gi_sum = float3(0.0, 0.0, 0.0);
             for (uint g = 0u; g < gi_taps; g = g + 1u) {
@@ -449,26 +449,27 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 sincos(phi, s_phi, c_phi);
                 float z = sqrt(max(0.0, 1.0 - u1));
                 float3 d = t_axis * (r * c_phi) + b_axis * (r * s_phi) + normal * z;
-                Hit bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 48.0));
+                Hit bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 96.0));
                 if (bhit.index != 0xffffffffu) {
                     float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
                     if (b_ndl > 0.01) {
                         float3 bhit_world = ray_origin + d * bhit.t;
+                        float b_bias = max(bias, length(bhit_world - params.eye.xyz) * 0.004);
                         float b_shadow = 1.0;
                         if (bits_shadows) {
-                            float3 bhit_pos = bhit_world + bhit.normal * bias;
-                            if (occluded(bhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y, state ^ (g * 73u + 11u))) {
+                            float3 bhit_pos = bhit_world + bhit.normal * b_bias;
+                            if (occluded(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y, state ^ (g * 73u + 11u))) {
                                 b_shadow = 0.0;
                             }
                         }
                         if (b_shadow > 0.0) {
                             float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
-                            float3 incoming = b_screen.rgb;
+                            float3 incoming = b_screen.rgb * (0.35 + 0.65 * b_ndl);
                             if (b_screen.a < 0.5) {
                                 Material bmat = material_of(bhit.index);
-                                incoming = bmat.albedo.rgb * params.sun_colour.xyz * (b_ndl * b_shadow);
+                                incoming = bmat.albedo.rgb * params.sun_colour.xyz * (b_ndl * b_shadow * 1.35);
                             }
-                            gi_sum += receiver_albedo * incoming * (params.tuning.w * 0.55 * (1.0 - fog_t));
+                            gi_sum += receiver_albedo * incoming * (params.tuning.w * 0.90 * (1.0 - fog_t));
                         }
                     }
                 }

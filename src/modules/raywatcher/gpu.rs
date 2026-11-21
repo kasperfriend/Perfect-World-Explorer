@@ -928,33 +928,34 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         if (bits_gi && params.frame.z >= 1.0 && params.tuning.w > 0.0) {
             let gi_taps = 3u;
             let est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
-            let receiver_albedo = clamp(raster_rgb / max(est_direct, vec3<f32>(0.25)), vec3<f32>(0.05), vec3<f32>(0.95));
+            let receiver_albedo = clamp(raster_rgb / max(est_direct, vec3<f32>(0.25)), vec3<f32>(0.12), vec3<f32>(0.95));
             var gi_sum = vec3<f32>(0.0);
             for (var g = 0u; g < gi_taps; g = g + 1u) {
                 let u1 = (f32(g) + next_f32(&state)) / f32(gi_taps);
                 let phi = f32(g) * 2.39996323 + rot_angle + 1.0471975 + f32(s) * 0.7548776;
                 let r = sqrt(u1);
                 let d = onb * vec3<f32>(r * cos(phi), r * sin(phi), sqrt(max(1.0 - u1, 0.0)));
-                let bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 48.0));
+                let bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 96.0));
                 if (bhit.index != 0xffffffffu) {
                     let b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
                     if (b_ndl > 0.01) {
                         let bhit_world = ray_origin + d * bhit.t;
+                        let b_bias = max(bias, length(bhit_world - params.eye.xyz) * 0.004);
                         var b_shadow = 1.0;
                         if (bits_shadows) {
-                            let bhit_pos = bhit_world + bhit.normal * bias;
-                            if (occluded(bhit_pos, params.sun_dir.xyz, bias * 0.5, params.lens.y, state ^ (g * 73u + 11u))) {
+                            let bhit_pos = bhit_world + bhit.normal * b_bias;
+                            if (occluded(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y, state ^ (g * 73u + 11u))) {
                                 b_shadow = 0.0;
                             }
                         }
                         if (b_shadow > 0.0) {
                             let b_screen = sample_screen_radiance(bhit_world, bhit.t);
-                            var incoming = b_screen.rgb;
+                            var incoming = b_screen.rgb * (0.35 + 0.65 * b_ndl);
                             if (b_screen.a < 0.5) {
                                 let bmaterial = material_of(bhit.index);
-                                incoming = bmaterial.albedo.rgb * params.sun_colour.xyz * (b_ndl * b_shadow);
+                                incoming = bmaterial.albedo.rgb * params.sun_colour.xyz * (b_ndl * b_shadow * 1.35);
                             }
-                            gi_sum = gi_sum + receiver_albedo * incoming * (params.tuning.w * 0.55 * (1.0 - fog_t));
+                            gi_sum = gi_sum + receiver_albedo * incoming * (params.tuning.w * 0.90 * (1.0 - fog_t));
                         }
                     }
                 }
