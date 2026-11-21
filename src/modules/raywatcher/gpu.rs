@@ -387,15 +387,19 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    var roughness = 0.85;
+    // Default terrain/ground roughness is matte (0.92), strictly above
+    // `reflection_roughness_cutoff` (default 0.4) so rough ground never traces
+    // mirror reflections. Only flat horizontal water pixels strictly inside a
+    // water plane's footprint and height band receive low water roughness.
+    var roughness = 0.92;
     let wc = min(u32(prep.water_count.x), 16u);
-    if (n.y > 0.85) {
+    if (n.y > 0.985) {
         for (var wi = 0u; wi < wc; wi = wi + 1u) {
             let wb = prep.water_planes[wi];
             let wh = prep.water_heights[wi / 4u][wi % 4u];
-            if (p.x >= wb.x - 1.0 && p.x <= wb.y + 1.0 &&
-                p.z >= wb.z - 1.0 && p.z <= wb.w + 1.0 &&
-                abs(p.y - wh) < 0.65) {
+            if (p.x >= wb.x && p.x <= wb.y &&
+                p.z >= wb.z && p.z <= wb.w &&
+                abs(p.y - wh) < 0.15) {
                 roughness = 0.06;
                 n = vec3<f32>(0.0, 1.0, 0.0);
                 break;

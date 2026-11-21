@@ -218,6 +218,13 @@ pub fn point_light_falloff(distance: f32, radius: f32) -> f32 {
 /// geometry and its direction projects outside the on-screen raster sky.
 /// Blends smoothly from the game's horizon `fog_colour` to an overhead zenith
 /// tint derived from `ambient` + `fog_colour`, plus a soft sun-glint lobe.
+/// Whether a surface with `roughness` qualifies for reflection tracing under
+/// `reflection_roughness_cutoff` (default `0.4`). Rough ground (`0.85..=0.92`)
+/// is excluded while smooth water (`0.06`) passes.
+pub fn surface_qualifies_for_reflection(roughness: f32, cutoff: f32) -> bool {
+    roughness.is_finite() && cutoff.is_finite() && roughness <= cutoff
+}
+
 pub fn sky_reflection_colour(
     dir: Vec3,
     sun_dir: Vec3,
@@ -1035,5 +1042,27 @@ mod tests {
             assert_eq!(view.as_u32(), idx as u32);
             assert_eq!(DebugView::parse(view.token()), Some(view));
         }
+    }
+
+    #[test]
+    fn reflection_roughness_cutoff_excludes_rough_ground() {
+        let cutoff = crate::modules::raywatcher::shade::TransportConfig::default()
+            .reflection_roughness_cutoff;
+        assert!(
+            cutoff <= 0.45,
+            "default reflection roughness cutoff should stay conservative ({cutoff})"
+        );
+        assert!(
+            !surface_qualifies_for_reflection(0.92, cutoff),
+            "matte terrain (0.92) must never trace reflections"
+        );
+        assert!(
+            !surface_qualifies_for_reflection(0.85, cutoff),
+            "rough sand/ground (0.85) must never trace reflections"
+        );
+        assert!(
+            surface_qualifies_for_reflection(0.06, cutoff),
+            "water surfaces (0.06) must still qualify for reflections"
+        );
     }
 }
