@@ -979,6 +979,7 @@ fn run(
                     extract_refused_versions(&all_msgs)
                 },
                 archives_not_indexed: objects.unindexed_archives(),
+                lossy_gbk_names,
                 ..Default::default()
             },
         },
@@ -1914,6 +1915,7 @@ mod page_tests {
             names_not_resolved: 15,
             versions_refused: extract_refused_versions(&examples),
             archives_not_indexed: vec![("litmodels.pck".into(), "split tail missing".into())],
+            lossy_gbk_names: 2,
             ..Default::default()
         };
         let line = counters.status_line();
@@ -1921,6 +1923,7 @@ mod page_tests {
         assert!(line.contains("selected: 100"), "{line}");
         assert!(line.contains("drawn: 85"), "{line}");
         assert!(line.contains("names not resolved: 15"), "{line}");
+        assert!(line.contains("lossy gbk names: 2"), "{line}");
         assert!(line.contains("0x10000003 (2)"), "{line}");
         assert!(line.contains("0x10000006 (1)"), "{line}");
         assert!(line.contains("litmodels.pck: split tail missing"), "{line}");

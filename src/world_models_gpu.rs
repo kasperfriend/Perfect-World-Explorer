@@ -1639,6 +1639,7 @@ impl World {
             names_not_resolved: self.assets.unloaded.len(),
             versions_refused: extract_refused_versions(&self.reported),
             archives_not_indexed: self.archives_not_indexed.clone(),
+            lossy_gbk_names: 0,
             scene_effect_transform_errors: self
                 .counters
                 .scene_effect_transform_errors
@@ -1958,6 +1959,7 @@ mod tests {
             versions_refused: extract_refused_versions(&reported),
             archives_not_indexed: vec![("gfx.pck".into(), "missing trailer".into())],
             draw_frustum_culls: 10,
+            lossy_gbk_names: 1,
             draw_errors: 2,
             ..Default::default()
         };
@@ -1966,6 +1968,7 @@ mod tests {
         assert!(line.contains("selected: 40"), "{line}");
         assert!(line.contains("drawn: 35"), "{line}");
         assert!(line.contains("names not resolved: 5"), "{line}");
+        assert!(line.contains("lossy gbk names: 1"), "{line}");
         assert!(line.contains("0x00000010 (2)"), "{line}");
         assert!(line.contains("gfx.pck: missing trailer"), "{line}");
         assert!(line.contains("skips: 10"), "{line}");
