@@ -136,6 +136,121 @@ fn trace_source_with_pages(
     trace_source_parts(backend, compact_terrain, screen_reuse, pages, "", temporal)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShaderVariant {
+    /// Compact hybrid RT overlay shader (shadows, AO, short-range GI, reflections).
+    /// Strips the full path-tracer, BSDF, media, and Reference-mode code to cut
+    /// SPIR-V size and driver compile time.
+    Overlay,
+    /// Complete uber-shader with full path-tracing and 32-spp Reference mode.
+    Full,
+}
+
+impl ShaderVariant {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Overlay => "overlay",
+            Self::Full => "full",
+        }
+    }
+}
+
+const OVERLAY_STUBS: &str = r#"
+struct Optics { refracted: vec3<f32>, fresnel: f32 }
+fn dielectric(d: vec3<f32>, n: vec3<f32>, eta: f32) -> Optics {
+    let cos_i = clamp(dot(-d,n),0.,1.);
+    let cos_t2 = 1.-eta*eta*(1.-cos_i*cos_i);
+    if cos_t2<=0. { return Optics(vec3<f32>(0.),1.); }
+    let cos_t = sqrt(cos_t2);
+    let rs = (eta*cos_i-cos_t)/(eta*cos_i+cos_t);
+    let rp = (cos_i-eta*cos_t)/(cos_i+eta*cos_t);
+    return Optics(normalize(eta*d+(eta*cos_i-cos_t)*n),clamp(0.5*(rs*rs+rp*rp),0.,1.));
+}
+fn reference() -> bool { return false; }
+fn diffuse_sky(_d: vec3<f32>) -> vec3<f32> { return vec3<f32>(0.0); }
+fn render_pixel(_id: vec2<u32>, _primary: Hit, _raster: bool, _overlay: bool) {}
+fn reference_emitter(_a: u32, _b: u32, _c: u32, _d: vec3<f32>) -> bool { return false; }
+"#;
+
+const OVERLAY_RENDER_ENTRY: &str = r#"
+@compute @workgroup_size(8,8)
+fn render(@builtin(global_invocation_id) id: vec3<u32>) {
+    if any(id.xy>=frame.extent.xy) { return; }
+    render_overlay_pixel(id.xy);
+}
+"#;
+
+fn overlay_base_wgsl() -> String {
+    let begin = BASE
+        .find("// === FULL_PATH_TRACE_BEGIN ===")
+        .expect("trace.wgsl missing FULL_PATH_TRACE_BEGIN marker");
+    let end = BASE
+        .find("// === FULL_PATH_TRACE_END ===")
+        .expect("trace.wgsl missing FULL_PATH_TRACE_END marker");
+    let entry = BASE
+        .find("// === ENTRY_RENDER_BEGIN ===")
+        .expect("trace.wgsl missing ENTRY_RENDER_BEGIN marker");
+    let mut out = String::with_capacity(BASE.len() - (end - begin) + OVERLAY_RENDER_ENTRY.len());
+    out.push_str(&BASE[..begin]);
+    out.push_str(&BASE[end..entry]);
+    out.push_str(OVERLAY_RENDER_ENTRY);
+    out
+}
+
+pub(crate) fn trace_source_variant(
+    variant: ShaderVariant,
+    backend: &str,
+    compact_terrain: bool,
+    screen_reuse: bool,
+    pages: &str,
+    material_pages: &str,
+    temporal: bool,
+) -> String {
+    let material = if material_pages.is_empty() {
+        MATERIAL_BUFFER_LOAD
+    } else {
+        material_pages
+    };
+    let (terrain, load) = if !pages.is_empty() {
+        (BC_TERRAIN, pages)
+    } else if compact_terrain {
+        (BC_TERRAIN, BC_BUFFER_LOAD)
+    } else {
+        (DECODED_TERRAIN, "")
+    };
+    let reuse = if screen_reuse {
+        SCREEN_REUSE
+    } else {
+        SCREEN_OFF
+    };
+    let inputs = if temporal {
+        temporal::TRACE
+    } else {
+        temporal::TRACE_OFF
+    };
+    match variant {
+        ShaderVariant::Overlay => {
+            let base = overlay_base_wgsl();
+            [
+                PIXELS,
+                OVERLAY_STUBS,
+                base.as_str(),
+                material,
+                terrain,
+                load,
+                reuse,
+                inputs,
+                backend,
+            ]
+            .concat()
+        }
+        ShaderVariant::Full => [
+            PIXELS, BSDF, MEDIA, REFERENCE, BASE, material, terrain, load, reuse, inputs, backend,
+        ]
+        .concat(),
+    }
+}
+
 fn trace_source_parts(
     backend: &str,
     compact_terrain: bool,
@@ -1541,6 +1656,18 @@ impl Lighter {
 
     /// True when Lighter runs as a hybrid RT overlay on top of the native
     /// rasterized world (RT shadows, AO, GI bounce, reflections only).
+    pub(crate) fn desired_shader_variant(&self) -> ShaderVariant {
+        #[cfg(test)]
+        if self.force_world_replacement {
+            return ShaderVariant::Full;
+        }
+        if !self.settings.reference && self.settings.ray_lighting {
+            ShaderVariant::Overlay
+        } else {
+            ShaderVariant::Full
+        }
+    }
+
     pub fn overlays_world(&self) -> bool {
         self.armed
             && self.requested()
@@ -2156,6 +2283,7 @@ impl Lighter {
                 let temporal = self.reconstruction.is_some();
                 let hybrid = self.settings.hybrid_primary;
                 let game = self.game_profile.is_some() && hybrid;
+                let variant = self.desired_shader_variant();
                 let pages = self
                     .world
                     .as_ref()
@@ -2170,7 +2298,7 @@ impl Lighter {
                             let _ = guard.send(ColdRayBuild::Progress(stage, step.to_owned()));
                         }
                     };
-                    let build = |temporal| vulkan::Renderer::new(&device, compact, reuse, pages.as_ref(), temporal, game, &progress);
+                    let build = |temporal| vulkan::Renderer::new(&device, compact, reuse, pages.as_ref(), temporal, game, variant, &progress);
                     let made = match build(temporal) {
                         Err(error) if temporal && !crate::gpu::reconstruction_device_lost(&error) => {
                             eprintln!("Lighter temporal tracer unavailable; using portable resolve: {error}");
@@ -2345,6 +2473,14 @@ impl Lighter {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         if self.settings.mode == Mode::Hardware && self.unavailable().is_none() {
             let (rw, rh) = self.ray_extent(device, w, h)?;
+            let variant = self.desired_shader_variant();
+            if self
+                .hardware
+                .as_ref()
+                .is_some_and(|rt| rt.variant != variant)
+            {
+                self.hardware = None;
+            }
             if self.hardware.is_none() {
                 let build = |temporal| {
                     vulkan::Renderer::new(
@@ -2357,6 +2493,7 @@ impl Lighter {
                             .filter(|_| self.bc_pages),
                         temporal,
                         self.game_profile.is_some() && self.settings.hybrid_primary,
+                        variant,
                         &progress,
                     )
                 };

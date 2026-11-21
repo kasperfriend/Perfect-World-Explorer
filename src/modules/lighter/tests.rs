@@ -5383,3 +5383,56 @@ fn c3_slow_compile_emits_heartbeats_and_does_not_trip_deadline() {
         deadline.on_progress(*ts);
     }
 }
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+#[test]
+fn c5_overlay_shader_variant_compiles_with_naga_and_is_smaller() {
+    let overlay_wgsl = super::trace_source_variant(
+        super::ShaderVariant::Overlay,
+        super::HARDWARE,
+        true,
+        false,
+        "",
+        "",
+        false,
+    );
+    let full_wgsl = super::trace_source_variant(
+        super::ShaderVariant::Full,
+        super::HARDWARE,
+        true,
+        false,
+        "",
+        "",
+        false,
+    );
+
+    let overlay_spirv = super::vulkan::shader(&overlay_wgsl)
+        .expect("overlay shader variant must compile with naga");
+    let full_spirv =
+        super::vulkan::shader(&full_wgsl).expect("full shader variant must compile with naga");
+
+    let overlay_spirv_bytes = overlay_spirv.len() * 4;
+    let full_spirv_bytes = full_spirv.len() * 4;
+    eprintln!(
+        "C5 shader variant sizes: overlay WGSL={} bytes / SPIR-V={} bytes vs full WGSL={} bytes / SPIR-V={} bytes",
+        overlay_wgsl.len(),
+        overlay_spirv_bytes,
+        full_wgsl.len(),
+        full_spirv_bytes
+    );
+
+    assert!(
+        overlay_wgsl.len() < full_wgsl.len(),
+        "overlay WGSL ({}) must be smaller than full WGSL ({})",
+        overlay_wgsl.len(),
+        full_wgsl.len()
+    );
+    assert!(
+        overlay_spirv_bytes < full_spirv_bytes,
+        "overlay SPIR-V ({overlay_spirv_bytes}) must be smaller than full SPIR-V ({full_spirv_bytes})"
+    );
+    assert!(
+        overlay_spirv_bytes * 100 < full_spirv_bytes * 70,
+        "expected >30% SPIR-V reduction for overlay variant ({overlay_spirv_bytes} vs {full_spirv_bytes})"
+    );
+}

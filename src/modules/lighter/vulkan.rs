@@ -1117,6 +1117,7 @@ struct AccelPlan {
 }
 
 pub struct Renderer {
+    pub(super) variant: super::ShaderVariant,
     primary: Option<primary::Primary>,
     primary_failed: bool,
     primary_error_extent: Option<[u32; 4]>,
@@ -1165,6 +1166,7 @@ impl Renderer {
         pages: Option<&super::textures::bc_pages::Plans>,
         temporal: bool,
         game: bool,
+        variant: super::ShaderVariant,
         progress: &(impl Fn(&str) + Sync),
     ) -> R<Self> {
         progress("Preparing the Vulkan ray-query context…");
@@ -1190,7 +1192,8 @@ impl Renderer {
             }
         }
         let build = |bc: &[bc_pages::Atlas]| -> R<(String, Core)> {
-            let source = super::trace_source_parts(
+            let source = super::trace_source_variant(
+                variant,
                 super::HARDWARE,
                 compact || pages.is_some(),
                 reuse,
@@ -1213,8 +1216,7 @@ impl Renderer {
             } else {
                 source
             };
-            let variant_label = if temporal { "temporal" } else { "overlay" };
-            let core = Core::new(ctx.clone(), &spirv, bc.len(), variant_label, progress)?;
+            let core = Core::new(ctx.clone(), &spirv, bc.len(), variant.label(), progress)?;
             progress("Preparing Vulkan RT buffers…");
             Ok((source, core))
         };
@@ -1236,6 +1238,7 @@ impl Renderer {
             HOST,
         )?;
         Ok(Self {
+            variant,
             primary: None,
             primary_failed: false,
             primary_error_extent: None,

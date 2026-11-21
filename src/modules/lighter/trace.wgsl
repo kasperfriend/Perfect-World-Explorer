@@ -1124,6 +1124,11 @@ fn sun_sample(ray: Ray, purpose: u32, seed: ptr<function,u32>) -> vec3<f32> {
     let delta = u.x*0.000011103284; // 1 - cos(0.27 deg)
     return around(frame.sun.xyz,1.-delta,sqrt(delta*(2.-delta)),u.y*6.2831853);
 }
+fn hemisphere(n: vec3<f32>, seed: ptr<function,u32>) -> vec3<f32> {
+    let r = random(seed);
+    return around(n,sqrt(1.-r),sqrt(r),random(seed)*6.2831853);
+}
+// === FULL_PATH_TRACE_BEGIN ===
 fn local_color(s: Surface, light: vec3<f32>, ambient: vec3<f32>) -> vec3<f32> {
     let lit = s.color.rgb*light + ambient + s.emission;
     if s.glaze.a>0. { return linear(mix(encoded(lit),encoded(s.glaze.rgb),s.glaze.a)); }
@@ -1263,10 +1268,6 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u3
     // base colour. Without lighting, direct() returns earlier via the
     // !lit branch. Emissive surfaces are handled at the EMISSIVE check.
     return local_color(s,color,ambient);
-}
-fn hemisphere(n: vec3<f32>, seed: ptr<function,u32>) -> vec3<f32> {
-    let r = random(seed);
-    return around(n,sqrt(1.-r),sqrt(r),random(seed)*6.2831853);
 }
 fn wave(s: Surface, ray: Ray, hit: Hit) -> vec3<f32> {
     let direction = ray.dir;
@@ -1792,6 +1793,7 @@ fn render_pixel(id: vec2<u32>, primary: Hit, raster: bool, overlay: bool) {
     screen_end();
 }
 
+// === FULL_PATH_TRACE_END ===
 fn pack_shadow_ao(shadow: f32, ao: f32) -> u32 {
     let s = u32(round(clamp(shadow, 0.0, 1.0) * 4095.0));
     let a = u32(round(clamp(ao, 0.0, 1.0) * 4095.0));
@@ -1944,6 +1946,7 @@ fn render_overlay_pixel(id: vec2<u32>) {
     image[at] = out;
 }
 
+// === ENTRY_RENDER_BEGIN ===
 @compute @workgroup_size(8,8)
 fn render(@builtin(global_invocation_id) id: vec3<u32>) {
     if any(id.xy>=frame.extent.xy) { return; }
