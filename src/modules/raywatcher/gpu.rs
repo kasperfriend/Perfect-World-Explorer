@@ -2228,7 +2228,11 @@ impl RaywatcherGpu {
         let (guide, guide_view) = plane(device, "raywatcher output guide", w, h, GUIDE_FORMAT);
         let compose_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("raywatcher compose params"),
-            size: 16,
+            // The compose shader declares `var<uniform> extent: vec4<f32>`,
+            // which occupies 64 bytes in the uniform address space. A 16-byte
+            // buffer fails wgpu validation and kills the device on the first
+            // compose dispatch.
+            size: 64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
