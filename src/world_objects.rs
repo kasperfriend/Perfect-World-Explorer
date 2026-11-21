@@ -807,7 +807,7 @@ fn run(
                     crate::diag!(
                         SceneOrnaments,
                         "{}",
-                        mesh.colour_log_line(&objects.ornaments[id].model, mesh_index)
+                        mesh.colour_log_line(&objects.ornaments[id].path, mesh_index)
                     );
                 }
                 // Stage, culling and alpha state come from the single recovered
