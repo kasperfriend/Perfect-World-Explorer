@@ -1177,6 +1177,11 @@ pub struct Lighter {
     cadence: profile::Cadence,
     allocation_sample: Option<(Instant, [u64; 3], u64)>,
     pub(crate) moving_accel: scene::AccelCache,
+    /// Test-only switch allowing world-replacement integration tests (e.g.
+    /// `lighter_streamed_world_pixels`) to exercise unlit full-ray world
+    /// replacement without triggering Reference mode's 32-spp/lit preset.
+    #[cfg(test)]
+    pub(crate) force_world_replacement: bool,
     pub settings: Settings,
     saved_mode: Mode,
     pending_mode: Option<Mode>,
@@ -1256,6 +1261,8 @@ impl Default for Lighter {
             cadence: profile::Cadence::default(),
             allocation_sample: None,
             moving_accel: Default::default(),
+            #[cfg(test)]
+            force_world_replacement: false,
             settings: Settings::default(),
             saved_mode: Mode::Off,
             pending_mode: None,

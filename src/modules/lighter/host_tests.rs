@@ -893,19 +893,19 @@ fn lighter_streamed_world_pixels() {
     });
     let (a, device, queue) = pollster::block_on(adapter(&instance, None, Mode::Software)).unwrap();
     let cpu_adapter = a.get_info().device_type == wgpu::DeviceType::Cpu;
-    let lighter = Lighter::new(
+    let mut lighter = Lighter::new(
         Settings {
             mode: Mode::Software,
             lighting: false,
             shadows: false,
             bounces: 0,
             resolution: 100,
-            reference: true,
             ..Settings::default()
         },
         &a,
         &device,
     );
+    lighter.force_world_replacement = true;
     const SIZE: u32 = 64;
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let mut r = Renderer::new(

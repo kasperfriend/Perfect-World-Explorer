@@ -3893,6 +3893,10 @@ impl Renderer {
         // Standard Lighter runs as a hybrid RT overlay on top of the native
         // rasterized world (preserving crisp raster geometry and Graphics
         // upscalers). Only the 32-spp Reference mode replaces the world.
+        #[cfg(test)]
+        if self.lighter.force_world_replacement {
+            return !self.local_scenery_skipped && self.lighter.replaces_world();
+        }
         !self.local_scenery_skipped
             && self.lighter.replaces_world()
             && self.lighter.settings.reference
