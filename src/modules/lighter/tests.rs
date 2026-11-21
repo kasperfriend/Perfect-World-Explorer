@@ -5053,3 +5053,51 @@ fn r3_ray_lighting_active_rejects_errored_renderer() {
         "smoke assertion must fail when error() is set in reference mode"
     );
 }
+
+#[test]
+fn r4_reload_with_overlay_ready_reports_no_error() {
+    let mut lighter = Lighter::default();
+    lighter.armed = true;
+    lighter.has_hardware_device = true;
+    lighter.adapter_supports_compute = true;
+    lighter.native_backend = wgpu::Backend::Vulkan;
+    lighter.settings.mode = Mode::Hardware;
+    lighter.settings.ray_lighting = true;
+    lighter.settings.reference = false;
+    lighter.install(Ok((Builder::default().finish(), Textures::default())));
+
+    // Before first overlay frame draws, reload check reports pending (Ok(false)), not stale Ok(true).
+    assert!(!lighter.overlay_ready());
+    assert_eq!(lighter.check_reload_state(Mode::Hardware, false), Ok(false));
+
+    // Once the first overlay frame has rendered, reload check passes with no error.
+    lighter.frame_index = 1;
+    assert!(lighter.overlay_ready());
+    assert_eq!(lighter.check_reload_state(Mode::Hardware, false), Ok(true));
+}
+
+#[test]
+fn r4_reload_with_overlay_error_reports_real_failure() {
+    let mut lighter = Lighter::default();
+    lighter.armed = true;
+    lighter.has_hardware_device = true;
+    lighter.adapter_supports_compute = true;
+    lighter.native_backend = wgpu::Backend::Vulkan;
+    lighter.settings.mode = Mode::Hardware;
+    lighter.settings.ray_lighting = true;
+    lighter.settings.reference = false;
+    lighter.install(Ok((Builder::default().finish(), Textures::default())));
+    lighter.fail_frame("Vulkan ray-query pipeline creation failed: VK_ERROR_DEVICE_LOST".into());
+
+    let err = lighter
+        .check_reload_state(Mode::Hardware, false)
+        .expect_err("failed overlay must report an error");
+    assert!(
+        err.contains("VK_ERROR_DEVICE_LOST"),
+        "expected real failure reason, got: {err}"
+    );
+    assert!(
+        !err.contains("did not draw the world"),
+        "must report real failure rather than generic fallback: {err}"
+    );
+}

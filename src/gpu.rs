@@ -5887,6 +5887,7 @@ fn run_viewer(
     // Frame generation takes the window over from wgpu, which presupposes
     // that wgpu has presented on it at least once.
     let mut presented_once = false;
+    let mut reload_ray_verified = false;
     let mut display_gamma: Option<crate::display_gamma::DisplayGamma> = None;
     // Stage the entire first frame (including the menu) offscreen. After the
     // first present, only a UNORM swapchain still needs the intermediate.
@@ -7749,16 +7750,21 @@ fn run_viewer(
                                 gpu_loss.report(error.to_owned());
                             }
                             if gpu_loss.pending() { return; }
-                            if let Some(snapshot) = restoring.as_ref().filter(|s| !presented_once && s.kind == recovery::RestoreKind::Reload) {
+                            if let Some(snapshot) = restoring.as_ref().filter(|s| !reload_ray_verified && s.kind == recovery::RestoreKind::Reload) {
                                 // Native is usable on startup or device recovery,
-                                // but cannot satisfy an explicit ray reload.
-                                let fallback = snapshot.lighter.mode != LighterMode::Off && !renderer.ray_lighting_active();
-                                if let Some(error) = renderer.lighter.error().or_else(|| fallback.then_some("The requested ray renderer did not draw the world.")) {
-                                    run_error = Some(format!("{}: {error}", snapshot.kind.label()));
-                                    renderer.lighter.retire_failed_start();
-                                    target.set_control_flow(winit::event_loop::ControlFlow::Poll);
-                                    target.exit();
-                                    return;
+                                // but cannot satisfy an explicit ray reload. In
+                                // overlay mode, wait until the first overlay frame
+                                // has actually drawn (or surface any error immediately).
+                                match renderer.lighter.check_reload_state(snapshot.lighter.mode, renderer.renders_rays()) {
+                                    Ok(true) => reload_ray_verified = true,
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        run_error = Some(format!("{}: {error}", snapshot.kind.label()));
+                                        renderer.lighter.retire_failed_start();
+                                        target.set_control_flow(winit::event_loop::ControlFlow::Poll);
+                                        target.exit();
+                                        return;
+                                    }
                                 }
                             }
                             if !world_ready {

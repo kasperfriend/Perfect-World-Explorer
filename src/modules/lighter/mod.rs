@@ -1497,6 +1497,47 @@ impl Lighter {
             && !self.settings.reference
     }
 
+    /// True once the hybrid RT overlay is armed, error-free, and has drawn at
+    /// least one overlay frame.
+    pub fn overlay_ready(&self) -> bool {
+        self.overlays_world() && self.frame_index > 0
+    }
+
+    /// Evaluate a pending Reload World request against live Lighter state.
+    /// Returns:
+    /// - `Ok(true)` when the requested ray mode has drawn at least one frame
+    /// - `Ok(false)` when non-blocking overlay startup is still in progress
+    /// - `Err(reason)` when Lighter failed or fell back unexpectedly
+    pub fn check_reload_state(
+        &self,
+        requested_mode: Mode,
+        renders_world: bool,
+    ) -> Result<bool, String> {
+        if requested_mode == Mode::Off {
+            return Ok(true);
+        }
+        if let Some(err) = self.error() {
+            return Err(err.to_string());
+        }
+        if self.settings.reference {
+            return if renders_world {
+                Ok(true)
+            } else {
+                Err("The requested ray renderer did not draw the world.".into())
+            };
+        }
+        if self.overlay_ready() {
+            return Ok(true);
+        }
+        if self.overlays_world() {
+            // Non-blocking background pipeline compile or initial BLAS staging
+            // is still running; keep checking on subsequent frames until the
+            // first overlay frame draws or an error occurs.
+            return Ok(false);
+        }
+        Err("The requested ray renderer did not draw the world.".into())
+    }
+
     pub fn set_graphics_state(&mut self, upscaler: String, frame_gen: String) {
         self.graphics_upscaler = Some(upscaler);
         self.graphics_frame_gen = Some(frame_gen);
