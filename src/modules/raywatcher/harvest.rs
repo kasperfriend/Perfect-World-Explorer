@@ -434,7 +434,15 @@ impl Harvester {
 
         // 3. Reflective water surfaces across the visible frustum.
         let before_water = triangles.len();
-        push_water(&mut triangles, &mut materials, water, eye, &frustum, far);
+        push_water(
+            &mut triangles,
+            &mut materials,
+            water,
+            eye,
+            &frustum,
+            far,
+            ground,
+        );
         let water_quads = (triangles.len() - before_water) / 2;
 
         // 4. Chunked multi-LOD terrain across the entire visible frustum out to
@@ -806,6 +814,11 @@ fn push_real_meshes(
 /// Push reflective water quads across the visible frustum. Water uses low
 /// roughness (`0.06`) so both the WGSL and DXR shaders trace mirror-like
 /// Fresnel reflections on lakes, rivers, and seas.
+///
+/// When a terrain height function (`ground`) is supplied, each water body is
+/// subdivided into world cells and any cell whose terrain rises above
+/// `w.height` is dropped. This prevents rectangular water AABBs from placing
+/// phantom water occluders over dry sandbanks, islands, or adjacent ground.
 fn push_water(
     triangles: &mut Vec<RayTriangle>,
     materials: &mut Vec<RayMaterial>,
@@ -813,6 +826,7 @@ fn push_water(
     eye: Vec3,
     frustum: &Frustum,
     far: f32,
+    ground: Option<&dyn Fn(f32, f32) -> f32>,
 ) {
     if water.is_empty() {
         return;
@@ -834,20 +848,89 @@ fn push_water(
             continue;
         }
         let _ = (frustum, min, max);
-        let mat_id = *water_mat.get_or_insert_with(|| {
-            let id = materials.len() as u32;
-            materials.push(RayMaterial {
-                albedo: [0.10, 0.22, 0.28, 1.0],
-                surface: [0.06, 0.02, KIND_WATER, 1.0],
+        let Some(ground_fn) = ground else {
+            let mat_id = *water_mat.get_or_insert_with(|| {
+                let id = materials.len() as u32;
+                materials.push(RayMaterial {
+                    albedo: [0.10, 0.22, 0.28, 1.0],
+                    surface: [0.06, 0.02, KIND_WATER, 1.0],
+                });
+                id
             });
-            id
-        });
-        let p0 = Vec3::new(x0, w.height, z0);
-        let p1 = Vec3::new(x1, w.height, z0);
-        let p2 = Vec3::new(x1, w.height, z1);
-        let p3 = Vec3::new(x0, w.height, z1);
-        triangles.push(RayTriangle::new(p0, p1, p2, Vec3::Y, mat_id));
-        triangles.push(RayTriangle::new(p0, p2, p3, Vec3::Y, mat_id));
+            let p0 = Vec3::new(x0, w.height, z0);
+            let p1 = Vec3::new(x1, w.height, z0);
+            let p2 = Vec3::new(x1, w.height, z1);
+            let p3 = Vec3::new(x0, w.height, z1);
+            triangles.push(RayTriangle::new(p0, p1, p2, Vec3::Y, mat_id));
+            triangles.push(RayTriangle::new(p0, p2, p3, Vec3::Y, mat_id));
+            continue;
+        };
+
+        // Clamp the subdivided footprint to the visible radius so large sea
+        // planes spend cell resolution near the camera rather than far away.
+        let vx0 = x0.max(eye.x - far);
+        let vx1 = x1.min(eye.x + far);
+        let vz0 = z0.max(eye.z - far);
+        let vz1 = z1.min(eye.z + far);
+        if vx1 <= vx0 || vz1 <= vz0 {
+            continue;
+        }
+        let target_cell = 8.0_f32;
+        let nx = (((vx1 - vx0) / target_cell).ceil() as usize).clamp(1, 64);
+        let nz = (((vz1 - vz0) / target_cell).ceil() as usize).clamp(1, 64);
+        let step_x = (vx1 - vx0) / nx as f32;
+        let step_z = (vz1 - vz0) / nz as f32;
+
+        // Pre-sample grid corner heights once per vertex to avoid redundant
+        // height lookups across shared cell corners.
+        let side_x = nx + 1;
+        let mut corner_h = Vec::with_capacity(side_x * (nz + 1));
+        for iz in 0..=nz {
+            let wz = vz0 + iz as f32 * step_z;
+            for ix in 0..=nx {
+                let wx = vx0 + ix as f32 * step_x;
+                corner_h.push(ground_fn(wx, wz));
+            }
+        }
+
+        for iz in 0..nz {
+            let cz0 = vz0 + iz as f32 * step_z;
+            let cz1 = cz0 + step_z;
+            let row0 = iz * side_x;
+            let row1 = (iz + 1) * side_x;
+            for ix in 0..nx {
+                let cx0 = vx0 + ix as f32 * step_x;
+                let cx1 = cx0 + step_x;
+                let h00 = corner_h[row0 + ix];
+                let h10 = corner_h[row0 + ix + 1];
+                let h11 = corner_h[row1 + ix + 1];
+                let h01 = corner_h[row1 + ix];
+                let h_min = h00.min(h10).min(h11).min(h01);
+                // Drop cells where all corners are above the water plane.
+                if h_min > w.height {
+                    continue;
+                }
+                let hc = ground_fn((cx0 + cx1) * 0.5, (cz0 + cz1) * 0.5);
+                // Drop cells whose centre is dry ground above the water plane.
+                if hc > w.height {
+                    continue;
+                }
+                let mat_id = *water_mat.get_or_insert_with(|| {
+                    let id = materials.len() as u32;
+                    materials.push(RayMaterial {
+                        albedo: [0.10, 0.22, 0.28, 1.0],
+                        surface: [0.06, 0.02, KIND_WATER, 1.0],
+                    });
+                    id
+                });
+                let p0 = Vec3::new(cx0, w.height, cz0);
+                let p1 = Vec3::new(cx1, w.height, cz0);
+                let p2 = Vec3::new(cx1, w.height, cz1);
+                let p3 = Vec3::new(cx0, w.height, cz1);
+                triangles.push(RayTriangle::new(p0, p1, p2, Vec3::Y, mat_id));
+                triangles.push(RayTriangle::new(p0, p2, p3, Vec3::Y, mat_id));
+            }
+        }
     }
 }
 
@@ -1378,5 +1461,42 @@ mod tests {
                 .any(|m| (m.albedo[0] - 0.8).abs() < 0.05),
             "real mesh albedo must survive into the RT material table"
         );
+    }
+
+    #[test]
+    fn water_harvest_drops_cells_where_ground_is_above_water() {
+        // Left half (x < 0) is a submerged lakebed (y = 0.0 < water 5.0).
+        // Right half (x >= 0) is dry sand above water (y = 12.0 > water 5.0).
+        let ground = |x: f32, _z: f32| if x < 0.0 { 0.0 } else { 12.0 };
+        let water = WaterSurface {
+            bounds: [-32.0, 32.0, -32.0, 32.0],
+            height: 5.0,
+        };
+        let eye = Vec3::new(0.0, 20.0, -40.0);
+        let vp = Mat4::perspective_infinite_reverse_rh(60.0f32.to_radians(), 16.0 / 9.0, 0.5)
+            * Mat4::look_to_rh(eye, Vec3::Z, Vec3::Y);
+        let frustum = Frustum::from_view_projection(vp);
+        let mut triangles = Vec::new();
+        let mut materials = Vec::new();
+        push_water(
+            &mut triangles,
+            &mut materials,
+            &[water],
+            eye,
+            &frustum,
+            256.0,
+            Some(&ground),
+        );
+        assert!(
+            !triangles.is_empty(),
+            "submerged half of the water body must still emit water triangles"
+        );
+        for tri in &triangles {
+            let centroid_x = (tri.a[0] + tri.b[0] + tri.c[0]) / 3.0;
+            assert!(
+                centroid_x < 0.0,
+                "dry sand cell (centroid_x={centroid_x}) must not receive a water occluder quad"
+            );
+        }
     }
 }
