@@ -7745,7 +7745,7 @@ fn run_viewer(
                             if let Some(snapshot) = restoring.as_ref().filter(|s| !presented_once && s.kind == recovery::RestoreKind::Reload) {
                                 // Native is usable on startup or device recovery,
                                 // but cannot satisfy an explicit ray reload.
-                                let fallback = snapshot.lighter.mode != LighterMode::Off && !renderer.renders_rays();
+                                let fallback = snapshot.lighter.mode != LighterMode::Off && !renderer.renders_rays() && !renderer.lighter.overlays_world();
                                 if let Some(error) = renderer.lighter.error().or_else(|| fallback.then_some("The requested ray renderer did not draw the world.")) {
                                     run_error = Some(format!("{}: {error}", snapshot.kind.label()));
                                     renderer.lighter.retire_failed_start();
