@@ -187,10 +187,7 @@ fn normalize_v300_colors(b: &[u8], p: &mut usize, vertices: &mut [Vertex]) -> Re
     if n == 0 {
         return Ok(());
     }
-    let opaque_day = vertices
-        .iter()
-        .filter(|v| (v.day_diffuse >> 24) == 0xff)
-        .count();
+    let opaque_day = vertices.iter().filter(|v| (v.day_diffuse >> 24) == 0xff).count();
     if opaque_day * 10 < n * 9 {
         let can_peek = n
             .checked_mul(8)
@@ -223,10 +220,7 @@ fn normalize_v300_colors(b: &[u8], p: &mut usize, vertices: &mut [Vertex]) -> Re
         }
         return Ok(());
     }
-    let opaque_night = vertices
-        .iter()
-        .filter(|v| (v.night_diffuse >> 24) == 0xff)
-        .count();
+    let opaque_night = vertices.iter().filter(|v| (v.night_diffuse >> 24) == 0xff).count();
     if opaque_night * 10 < n * 9 {
         for v in vertices.iter_mut() {
             v.night_diffuse = v.day_diffuse;
