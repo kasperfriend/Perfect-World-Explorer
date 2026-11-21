@@ -11,11 +11,15 @@ struct ExtractParams {
 @group(0) @binding(1) var raster_depth: texture_depth_2d;
 @group(0) @binding(2) var<storage, read_write> out_pixels: array<Pixel>;
 
-fn unproject_raster(px: vec2<i32>, d: f32) -> vec3<f32> {
+fn unproject_w4(px: vec2<i32>, d: f32) -> vec4<f32> {
     let dims = vec2<f32>(extract.extent.zw);
     let uv = (vec2<f32>(px) + 0.5) / dims;
     let ndc = uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
-    let w4 = extract.inv_vp * vec4<f32>(ndc, d, 1.0);
+    return extract.inv_vp * vec4<f32>(ndc, d, 1.0);
+}
+
+fn unproject_raster(px: vec2<i32>, d: f32) -> vec3<f32> {
+    let w4 = unproject_w4(px, d);
     return w4.xyz / max(abs(w4.w), 1.0e-7) * select(1.0, -1.0, w4.w < 0.0);
 }
 
@@ -40,10 +44,19 @@ fn extract_depth(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    let p = unproject_raster(px, d);
+    let w4 = unproject_w4(px, d);
+    // Exact clip-space w = 1 / |inv_vp_w| so post.wgsl reprojection
+    // (previous.w * current.view_depth == old.view_depth) is exact across the FOV.
+    let clip_w = 1.0 / max(abs(w4.w), 1.0e-7);
+    let p = w4.xyz * clip_w * select(1.0, -1.0, w4.w < 0.0);
     let to_eye = extract.eye.xyz - p;
-    let view_depth = max(length(to_eye), 0.001);
-    let view_dir = to_eye / view_depth;
+    let dist2 = dot(to_eye, to_eye);
+    if dist2 >= 450.0 * 450.0 {
+        // Beyond max RT effect distance: skip neighbor depth loads and normal reconstruction.
+        out_pixels[at] = Pixel(0u, 0u, d, clip_w, 0u, 0x00ffffffu, 1u);
+        return;
+    }
+    let view_dir = to_eye * inverseSqrt(max(dist2, 1.0e-6));
 
     // Edge-aware normal reconstruction: pick the closer depth neighbor on each axis
     // to prevent haloing across silhouette edges.
@@ -81,5 +94,5 @@ fn extract_depth(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let packed_n = pack4x8snorm(vec4<f32>(n, 0.0)) & 0x00ffffffu;
-    out_pixels[at] = Pixel(0u, 0u, d, view_depth, packed_n, 0x00ffffffu, 1u);
+    out_pixels[at] = Pixel(0u, 0u, d, clip_w, packed_n, 0x00ffffffu, 1u);
 }

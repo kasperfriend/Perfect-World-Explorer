@@ -1262,15 +1262,6 @@ fn direct(p: vec3<f32>, s: Surface, ray: Ray, t: f32, terminal: bool, medium: u3
     // indirect light (e.g. sky dome radiance) instead of the surface's own
     // base colour. Without lighting, direct() returns earlier via the
     // !lit branch. Emissive surfaces are handled at the EMISSIVE check.
-    if all(color == vec3<f32>(0.)) {
-        var result = s.color.rgb;
-        if terminal && all(s.color.rgb == vec3<f32>(1.)) {
-            result = ambient + s.emission * emission_weight;
-        } else if !terminal && lit {
-            result = vec3<f32>(0.);
-        }
-        return result;
-    }
     return local_color(s,color,ambient);
 }
 fn hemisphere(n: vec3<f32>, seed: ptr<function,u32>) -> vec3<f32> {
@@ -1828,9 +1819,14 @@ fn render_overlay_pixel(id: vec2<u32>) {
     let w4 = frame.inv_vp * vec4<f32>(ndc, gbuf.depth, 1.0);
     let p = w4.xyz / max(abs(w4.w), 1.0e-7) * select(1.0, -1.0, w4.w < 0.0);
 
-    let raw_n = unpack4x8snorm(gbuf.normal_flags & 0x00ffffffu).xyz;
     let to_eye = frame.eye.xyz - p;
     let dist = max(length(to_eye), 0.001);
+    if dist >= 450.0 {
+        // Beyond max RT effect range: 0 rays traced, neutral overlay.
+        image[at] = Pixel(0u, 0u, gbuf.depth, gbuf.view_depth, gbuf.normal_flags & 0x00ffffffu, 0x00ffffffu, 1u);
+        return;
+    }
+    let raw_n = unpack4x8snorm(gbuf.normal_flags & 0x00ffffffu).xyz;
     let v = to_eye / dist;
     let n = select(v, norm(raw_n), dot(raw_n, raw_n) > 1.0e-6);
 

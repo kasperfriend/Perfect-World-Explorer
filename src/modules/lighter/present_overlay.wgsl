@@ -42,7 +42,7 @@ fn unpack_shadow_ao(packed: u32) -> vec2<f32> {
     let extent = present.extent;
     if all(extent.xy == extent.zw) {
         let c = pixels[idx(full_px)];
-        if c.depth <= 0.0 {
+        if c.depth <= 0.0 || c.view_depth >= 450.0 {
             return vec4<f32>(0.0, 0.0, 0.0, 1.0);
         }
         let sa = unpack_shadow_ao(c.albedo_history);
@@ -52,6 +52,10 @@ fn unpack_shadow_ao(packed: u32) -> vec2<f32> {
 
     // Depth-guided 2x2 bilateral upsample from ray resolution to raster resolution.
     let source = coord.xy * vec2<f32>(extent.xy) / vec2<f32>(extent.zw) - 0.5;
+    let nearest = pixels[idx(vec2<i32>(floor(source + 0.5)))];
+    if nearest.view_depth >= 450.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    }
     let p = vec2<i32>(floor(source));
     let f = fract(source);
     var rgb = vec3<f32>(0.0);

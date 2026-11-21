@@ -1214,38 +1214,10 @@ impl super::Renderer {
         }
         let depth = self.depth.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        let resident = self.resident_bounds();
+        // Raster draw_models() already advanced poses, effects, and lights for
+        // this frame; do not double-tick models.update_for_rays() here.
         if let Some(light) = camera.regional_light {
             self.retained_regional_light = Some(light);
-        }
-        if let Some(models) = &mut self.models {
-            let radius = self.detail.radius.max(1) as f32 * self.model_scene.block_size.max(1.);
-            models.set_view_center(camera.pos.x, camera.pos.z, radius);
-            models.set_resident_bounds(resident);
-            models.set_effects_enabled(camera.world_effects);
-            models.set_effect_distance(camera.effect_distance);
-            let direction = frame.direction.extend(frame.daylight).to_array();
-            let normal = frame.uniform(
-                matrix,
-                direction,
-                frame.clip,
-                frame.fog_range,
-                frame.fog_color,
-                [0., 1., 0., 0.],
-            );
-            models.update_for_rays(
-                &self.device,
-                &self.queue,
-                super::receiving_model_frame(
-                    &normal,
-                    camera,
-                    camera.regional_light.or(self.retained_regional_light),
-                ),
-                camera.pos.to_array(),
-                &self.model_lights,
-                crate::environment::night_factor(camera.time_of_day),
-                camera.logic_delta_ms,
-            );
         }
         let [walker, populator] = self.modules.ray_skin_omissions();
         self.lighter.skin_omissions[1..].copy_from_slice(&[walker, populator]);
