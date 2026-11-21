@@ -1083,19 +1083,20 @@ fn push_terrain_frustum(
                 continue;
             }
             let _ = frustum;
-            // Pick compact 360-degree LOD divisions per chunk based on distance
-            // from eye so the full view distance is covered in every direction
-            // without camera-rotation rebuild stalls.
-            let (lod_band, target_step) = if dist <= near_r {
-                (0usize, fine_step * 2.0)
+            // Pick 360-degree LOD divisions per chunk based on distance from
+            // eye. Near chunks use finer subdivisions (up to 48 per chunk,
+            // ~5.3 world units) so terrain valleys never bridge above the
+            // raster ground and cause false self-occlusion blobs.
+            let (lod_band, target_step, max_divs) = if dist <= near_r {
+                (0usize, fine_step, 48u32)
             } else if dist <= mid_r {
-                (1usize, fine_step * 4.0)
+                (1usize, fine_step * 3.0, 24u32)
             } else if dist <= far_r {
-                (2usize, fine_step * 8.0)
+                (2usize, fine_step * 6.0, 16u32)
             } else {
-                (3usize, fine_step * 16.0)
+                (3usize, fine_step * 12.0, 8u32)
             };
-            let divs = ((chunk_size / target_step).round() as u32).clamp(2, 20);
+            let divs = ((chunk_size / target_step).round() as u32).clamp(2, max_divs);
             let step = chunk_size / divs as f32;
             let side = (divs + 1) as usize;
             let mut heights = Vec::with_capacity(side * side);
@@ -1106,34 +1107,101 @@ fn push_terrain_frustum(
                     heights.push(ground(wx, wz));
                 }
             }
+            let tri_normal = |a: Vec3, b: Vec3, c: Vec3| -> Vec3 {
+                let n = (c - a).cross(b - a).normalize_or_zero();
+                if n.length_squared() > 0.5 {
+                    n
+                } else {
+                    Vec3::Y
+                }
+            };
             triangles.reserve((divs * divs * 2) as usize);
             for iz in 0..divs as usize {
                 let wz0 = z0 + iz as f32 * step;
                 let wz1 = wz0 + step;
+                let wzc = (wz0 + wz1) * 0.5;
                 let row0 = iz * side;
                 let row1 = (iz + 1) * side;
                 for ix in 0..divs as usize {
                     let wx0 = x0 + ix as f32 * step;
                     let wx1 = wx0 + step;
-                    let p0 = Vec3::new(wx0, heights[row0 + ix], wz0);
-                    let p1 = Vec3::new(wx1, heights[row0 + ix + 1], wz0);
-                    let p2 = Vec3::new(wx1, heights[row1 + ix + 1], wz1);
-                    let p3 = Vec3::new(wx0, heights[row1 + ix], wz1);
-                    let n0 = (p2 - p0).cross(p1 - p0).normalize_or_zero();
-                    let n0 = if n0.length_squared() > 0.5 {
-                        n0
+                    let wxc = (wx0 + wx1) * 0.5;
+                    let h0 = heights[row0 + ix];
+                    let h1 = heights[row0 + ix + 1];
+                    let h2 = heights[row1 + ix + 1];
+                    let h3 = heights[row1 + ix];
+                    let hc = ground(wxc, wzc);
+                    let diag_chord = (h0 + h2) * 0.5;
+                    let overshoot = diag_chord - hc;
+
+                    if lod_band == 0 && overshoot > 0.05 {
+                        // Concave near-field cell (valley/gully): split into a
+                        // watertight 4-triangle fan through the exact centre
+                        // height so the LOD surface hugs the valley floor and
+                        // cannot bridge above the raster terrain.
+                        let p0 = Vec3::new(wx0, h0, wz0);
+                        let p1 = Vec3::new(wx1, h1, wz0);
+                        let p2 = Vec3::new(wx1, h2, wz1);
+                        let p3 = Vec3::new(wx0, h3, wz1);
+                        let pc = Vec3::new(wxc, hc, wzc);
+                        triangles.push(RayTriangle::new(
+                            p0,
+                            p1,
+                            pc,
+                            tri_normal(p0, p1, pc),
+                            material,
+                        ));
+                        triangles.push(RayTriangle::new(
+                            p1,
+                            p2,
+                            pc,
+                            tri_normal(p1, p2, pc),
+                            material,
+                        ));
+                        triangles.push(RayTriangle::new(
+                            p2,
+                            p3,
+                            pc,
+                            tri_normal(p2, p3, pc),
+                            material,
+                        ));
+                        triangles.push(RayTriangle::new(
+                            p3,
+                            p0,
+                            pc,
+                            tri_normal(p3, p0, pc),
+                            material,
+                        ));
+                        lod_tris[lod_band] += 4;
                     } else {
-                        Vec3::Y
-                    };
-                    let n1 = (p3 - p0).cross(p2 - p0).normalize_or_zero();
-                    let n1 = if n1.length_squared() > 0.5 {
-                        n1
-                    } else {
-                        Vec3::Y
-                    };
-                    triangles.push(RayTriangle::new(p0, p1, p2, n0, material));
-                    triangles.push(RayTriangle::new(p0, p2, p3, n1, material));
-                    lod_tris[lod_band] += 2;
+                        // For mid/far concave cells, depress vertices by the
+                        // chord overshoot so coarse distant quads never float
+                        // above the real raster ground.
+                        let drop = if overshoot > 0.05 {
+                            overshoot.min(6.0)
+                        } else {
+                            0.0
+                        };
+                        let p0 = Vec3::new(wx0, h0 - drop, wz0);
+                        let p1 = Vec3::new(wx1, h1 - drop, wz0);
+                        let p2 = Vec3::new(wx1, h2 - drop, wz1);
+                        let p3 = Vec3::new(wx0, h3 - drop, wz1);
+                        triangles.push(RayTriangle::new(
+                            p0,
+                            p1,
+                            p2,
+                            tri_normal(p0, p1, p2),
+                            material,
+                        ));
+                        triangles.push(RayTriangle::new(
+                            p0,
+                            p2,
+                            p3,
+                            tri_normal(p0, p2, p3),
+                            material,
+                        ));
+                        lod_tris[lod_band] += 2;
+                    }
                 }
             }
         }
@@ -1498,5 +1566,39 @@ mod tests {
                 "dry sand cell (centroid_x={centroid_x}) must not receive a water occluder quad"
             );
         }
+    }
+
+    #[test]
+    fn terrain_lod_does_not_overshoot_valley_floor() {
+        // Concave valley dipping 4.0 units below the surrounding flat plain.
+        let ground = |x: f32, z: f32| {
+            let r2 = x * x + z * z;
+            -4.0 * (-r2 / 36.0).exp()
+        };
+        let eye = Vec3::new(0.0, 12.0, -24.0);
+        let vp = Mat4::perspective_infinite_reverse_rh(60.0f32.to_radians(), 16.0 / 9.0, 0.5)
+            * Mat4::look_to_rh(eye, Vec3::Z, Vec3::Y);
+        let frustum = Frustum::from_view_projection(vp);
+        let mut triangles = Vec::new();
+        let mut materials = Vec::new();
+        push_terrain_frustum(
+            &mut triangles,
+            &mut materials,
+            eye,
+            &frustum,
+            256.0,
+            2.0,
+            HarvestConfig::default(),
+            &ground,
+        );
+        let scene = SceneGeometry::build(triangles, materials);
+        // Shoot an upward ray from 0.25 units above the valley floor at (0, 0):
+        // if the LOD terrain bridged above the valley, the upward ray would hit
+        // the underside of the chord and report occlusion.
+        let origin = Vec3::new(0.0, ground(0.0, 0.0) + 0.25, 0.0);
+        assert!(
+            !scene.occluded(origin, Vec3::Y, 0.05, 50.0),
+            "harvested LOD terrain must not bridge above the valley floor and occlude upward rays"
+        );
     }
 }
