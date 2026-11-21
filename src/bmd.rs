@@ -336,8 +336,10 @@ impl Model {
                         let following_opaque = if can_peek {
                             (0..n)
                                 .filter(|&i| {
-                                    u(b, p + i * 4).is_ok_and(|w| (w >> 24) == 0xff)
-                                        && u(b, p + n * 4 + i * 4).is_ok_and(|w| (w >> 24) == 0xff)
+                                    let d = u(b, p + i * 4).is_ok_and(|w| (w >> 24) == 0xff);
+                                    let t =
+                                        u(b, p + n * 4 + i * 4).is_ok_and(|w| (w >> 24) == 0xff);
+                                    d && t
                                 })
                                 .count()
                         } else {
@@ -886,14 +888,7 @@ mod tests {
         for uv in [0.25f32, 0.5, 0.75, 0.125, 0.5, 0.5] {
             put(&mut b, uv.to_bits());
         }
-        for c in [
-            0xff887766u32,
-            0xff998877,
-            0xffaa9988,
-            0xff223344,
-            0xff334455,
-            0xff445566,
-        ] {
+        for c in [0xff887766u32, 0xff998877, 0xffaa9988, 0xff223344, 0xff334455, 0xff445566] {
             put(&mut b, c);
         }
         b.extend_from_slice(&[0; 150]);
