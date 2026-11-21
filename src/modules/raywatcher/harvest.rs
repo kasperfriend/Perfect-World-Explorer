@@ -486,6 +486,7 @@ impl Harvester {
         let water_quads = 0usize;
         let mut terrain_lod_tris = [0usize; 4];
         if let Some(ground_fn) = ground {
+            let before_terrain = triangles.len();
             terrain_lod_tris = push_terrain_frustum(
                 &mut triangles,
                 &mut materials,
@@ -496,6 +497,35 @@ impl Harvester {
                 config,
                 ground_fn,
             );
+            if std::env::var_os("PWE_RT_DEBUG").is_some() && triangles.len() > before_terrain {
+                let mut max_err = 0.0f32;
+                let offsets = [
+                    (0.0, 0.0),
+                    (5.0, 3.0),
+                    (-7.0, 4.0),
+                    (11.0, -9.0),
+                    (-15.0, -12.0),
+                    (22.0, 14.0),
+                    (-25.0, 18.0),
+                    (31.0, -21.0),
+                    (-36.0, -27.0),
+                    (42.0, 33.0),
+                ];
+                for &(ox, oz) in &offsets {
+                    let sx = eye.x + ox;
+                    let sz = eye.z + oz;
+                    let expected = ground_fn(sx, sz);
+                    if let Some(rt_y) =
+                        sample_terrain_tris_height(&triangles[before_terrain..], sx, sz)
+                    {
+                        max_err = max_err.max((rt_y - expected).abs());
+                    }
+                }
+                eprintln!(
+                    "[Raywatcher] Phase 2 terrain height check (10 pts): max_abs_err={max_err:.4}u (base_cell={:.2})",
+                    base_cell.max(0.5)
+                );
+            }
         }
 
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -1346,20 +1376,25 @@ fn push_terrain_frustum(
                 continue;
             }
             let _ = frustum;
-            // Pick 360-degree LOD divisions per chunk based on distance from
-            // eye. Near chunks use finer subdivisions (up to 48 per chunk,
-            // ~5.3 world units) so terrain valleys never bridge above the
-            // raster ground and cause false self-occlusion blobs.
-            let (lod_band, target_step, max_divs) = if dist <= near_r {
-                (0usize, fine_step, 48u32)
+            // Phase 2: Use power-of-two subdivisions aligned to the raster
+            // terrain grid (`base_cell`, e.g. 2.0u) with the exact same
+            // diagonal (`(p0, p2)` == `(c, d)` in `terrain_lod::block_surface`
+            // and `MapSpace::ground`). Cells immediately around the camera use
+            // 1:1 `base_cell` spacing so RT terrain matches the raster terrain
+            // within 0.1 world units on slopes and paths (no sharp wedges).
+            let _ = fine_step;
+            let cells_per_chunk = (chunk_size / base_cell.max(0.5)).round().max(8.0) as u32;
+            let (lod_band, divs) = if dist <= 64.0 {
+                (0usize, cells_per_chunk.min(128))
+            } else if dist <= near_r {
+                (0usize, (cells_per_chunk / 2).clamp(16, 64))
             } else if dist <= mid_r {
-                (1usize, fine_step * 3.0, 24u32)
+                (1usize, (cells_per_chunk / 4).clamp(8, 32))
             } else if dist <= far_r {
-                (2usize, fine_step * 6.0, 16u32)
+                (2usize, (cells_per_chunk / 8).clamp(4, 16))
             } else {
-                (3usize, fine_step * 12.0, 8u32)
+                (3usize, (cells_per_chunk / 16).clamp(2, 8))
             };
-            let divs = ((chunk_size / target_step).round() as u32).clamp(2, max_divs);
             let step = chunk_size / divs as f32;
             let side = (divs + 1) as usize;
             let mut heights = Vec::with_capacity(side * side);
@@ -1476,6 +1511,44 @@ fn push_terrain_frustum(
         }
     }
     lod_tris
+}
+
+/// Sample the vertical height of the harvested RT terrain triangles at `(x, z)`
+/// by projecting a vertical downward ray onto the terrain triangle list.
+pub(crate) fn sample_terrain_tris_height(tris: &[RayTriangle], x: f32, z: f32) -> Option<f32> {
+    for t in tris {
+        let ax = t.a[0];
+        let az = t.a[2];
+        let bx = t.b[0];
+        let bz = t.b[2];
+        let cx = t.c[0];
+        let cz = t.c[2];
+        let min_x = ax.min(bx).min(cx) - 1e-4;
+        let max_x = ax.max(bx).max(cx) + 1e-4;
+        let min_z = az.min(bz).min(cz) - 1e-4;
+        let max_z = az.max(bz).max(cz) + 1e-4;
+        if x < min_x || x > max_x || z < min_z || z > max_z {
+            continue;
+        }
+        let v0x = bx - ax;
+        let v0z = bz - az;
+        let v1x = cx - ax;
+        let v1z = cz - az;
+        let v2x = x - ax;
+        let v2z = z - az;
+        let det = v0x * v1z - v1x * v0z;
+        if det.abs() < 1e-8 {
+            continue;
+        }
+        let inv = 1.0 / det;
+        let u = (v2x * v1z - v1x * v2z) * inv;
+        let v = (v0x * v2z - v2x * v0z) * inv;
+        if u >= -1e-4 && v >= -1e-4 && u + v <= 1.0001 {
+            let w = 1.0 - u - v;
+            return Some(w * t.a[1] + u * t.b[1] + v * t.c[1]);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1802,6 +1875,61 @@ mod tests {
                 .any(|m| (m.albedo[0] - 0.8).abs() < 0.05),
             "real mesh albedo must survive into the RT material table"
         );
+    }
+
+    #[test]
+    fn rt_terrain_matches_ground_height_within_tenth_unit_on_slopes() {
+        // Piecewise-linear slope/ridge defined on the exact 2.0u raster lattice.
+        let spacing = 2.0f32;
+        let ground = |x: f32, z: f32| {
+            let gx = x / spacing;
+            let gz = z / spacing;
+            let ix = gx.floor();
+            let iz = gz.floor();
+            let fx = gx - ix;
+            let fz = gz - iz;
+            let h = |cx: f32, cz: f32| 3.0 * (cx * 0.25).sin() + 2.0 * (cz * 0.2).cos() + 0.1 * cx;
+            let h0 = h(ix, iz);
+            let h1 = h(ix + 1.0, iz);
+            let h2 = h(ix + 1.0, iz + 1.0);
+            let h3 = h(ix, iz + 1.0);
+            if fx >= fz {
+                h0 + (h1 - h0) * fx + (h2 - h1) * fz
+            } else {
+                h0 + (h2 - h3) * fx + (h3 - h0) * fz
+            }
+        };
+        let eye = Vec3::new(10.0, 20.0, 10.0);
+        let vp = Mat4::perspective_infinite_reverse_rh(60.0f32.to_radians(), 16.0 / 9.0, 0.5)
+            * Mat4::look_to_rh(eye, Vec3::Z, Vec3::Y);
+        let frustum = Frustum::from_view_projection(vp);
+        let mut tris = Vec::new();
+        let mut mats = Vec::new();
+        push_terrain_frustum(
+            &mut tris,
+            &mut mats,
+            eye,
+            &frustum,
+            128.0,
+            spacing,
+            HarvestConfig::default(),
+            &ground,
+        );
+        for &(sx, sz) in &[
+            (10.5, 10.25),
+            (11.3, 12.7),
+            (4.8, 17.1),
+            (19.9, 3.4),
+            (-5.2, 8.6),
+        ] {
+            let expected = ground(sx, sz);
+            let actual = sample_terrain_tris_height(&tris, sx, sz)
+                .expect("near-field terrain must cover sample point");
+            assert!(
+                (actual - expected).abs() < 0.1,
+                "RT terrain height {actual} diverged from ground {expected} at ({sx}, {sz})"
+            );
+        }
     }
 
     #[test]
