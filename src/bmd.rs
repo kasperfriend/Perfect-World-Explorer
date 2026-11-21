@@ -329,18 +329,21 @@ impl Model {
                         .filter(|v| (v.day_diffuse >> 24) == 0xff)
                         .count();
                     if opaque_day * 10 < vertices.len() * 9 {
-                        let extra_bytes = n.checked_mul(8);
-                        let has_following_colors = extra_bytes
-                            .is_some_and(|eb| p.checked_add(eb).is_some_and(|e| e <= b.len()))
-                            && (0..n)
-                                    .filter(|&i| {
-                                        u(b, p + i * 4).is_ok_and(|w| (w >> 24) == 0xff)
-                                            && u(b, p + n * 4 + i * 4)
-                                                .is_ok_and(|w| (w >> 24) == 0xff)
-                                    })
-                                    .count()
-                                    * 10
-                                    >= vertices.len() * 9;
+                        let can_peek = n
+                            .checked_mul(8)
+                            .and_then(|eb| p.checked_add(eb))
+                            .is_some_and(|e| e <= b.len());
+                        let following_opaque = if can_peek {
+                            (0..n)
+                                .filter(|&i| {
+                                    u(b, p + i * 4).is_ok_and(|w| (w >> 24) == 0xff)
+                                        && u(b, p + n * 4 + i * 4).is_ok_and(|w| (w >> 24) == 0xff)
+                                })
+                                .count()
+                        } else {
+                            0
+                        };
+                        let has_following_colors = following_opaque * 10 >= vertices.len() * 9;
                         if has_following_colors {
                             for v in &mut vertices {
                                 v.day_diffuse = u(b, p)?;
@@ -368,7 +371,7 @@ impl Model {
                         }
                     }
                 }
-                // Tail: 48 B AABB + 80 B A3DMaterial ("MATERIAL:  " + 69 B) +
+                // Tail: 48 B AABB + 80 B A3DMaterial ("MATERIAL: \0" + 69 B) +
                 // dwExtraSize (22 B when strDetailMap is empty -> 150 B total).
                 let mut tail_advance = None;
                 let mut material = None;
