@@ -86,14 +86,15 @@ impl Mesh {
     /// Format one diagnostic line for `PWE_BMD_COLOUR_LOG=1`.
     pub fn colour_log_line(&self, model_name: &str, mesh_index: usize) -> String {
         let branch = self.color_branch.map_or("legacy", V300ColorBranch::as_str);
+        let first_day = self.vertices.first().map_or(0, |v| v.day_diffuse);
+        let first_night = self.vertices.first().map_or(0, |v| v.night_diffuse);
         format!(
-            "bmd_colour model={model_name} mesh={mesh_index} bSupportLightMap={} bUseLightMap={} branch={branch} opaque_day={}/{} opaque_night={}/{}",
-            u8::from(self.b_support_lightmap),
-            u8::from(self.b_use_lightmap),
+            "bmd_colour model={model_name} mesh={mesh_index} branch={branch} opaque_day={}/{} opaque_night={}/{} first_day={first_day:#010x} first_night={first_night:#010x} tex={}",
             self.opaque_day_words,
             self.vertices.len(),
             self.opaque_night_words,
             self.vertices.len(),
+            self.texture,
         )
     }
 }
@@ -324,31 +325,15 @@ impl Model {
         let mut lossy_gbk_diagnostics = Vec::new();
         let mut v300_branch_counters = V300BranchCounters::default();
         if is_v300 {
-            // Angelica 2.2 `A3DLitModel.cpp:2693-2886` (`A3DLITMODEL_VERSION_EX`):
-            // model-level `bLightMap` (1 B) + `bSharedData` (1 B), then per mesh:
-            // `bSupportLightMap` (1 B) + `bUseLightMap` (1 B), length-prefixed
-            // name and texture, nVerts/nFaces, 24 B vertices, 32-bit indices,
-            // normals, flag-gated lightmap UVs and/or day/night colours, 48 B
-            // AABB, A3DMaterial, and `dwExtraSize` (which counts its own 4 B:
-            // `dwPos = GetPos(); Read(&dwExtraSize, 4); Seek(dwPos + dwExtraSize)`).
-            let b_lightmap = *b.get(p).ok_or("truncated BMD v300 bLightMap")? != 0;
-            let b_shared_data = *b.get(p + 1).ok_or("truncated BMD v300 bSharedData")? != 0;
-            p += 2;
-            if b_shared_data {
-                let share_len = u(b, p)? as usize;
-                p += 4;
-                if share_len > 4096 {
-                    return Err("oversized BMD v300 shared-data path".into());
-                }
-                let (share_file, _) = fixed_lossy_tracked(b, p, share_len)?;
-                return Err(format!(
-                    "A3DLitModel v300 shared data file {share_file:?} is unsupported"
-                ));
-            }
+            // 1.8.x A3DLitModel (0x10000300..=0x10000305): each mesh carries a
+            // u32 header word, length-prefixed GBK name and texture, vertex and
+            // face counts, 24-byte vertices, 32-bit indices (12 B per face),
+            // normals, day/night vertex colours and/or lightmap UVs, and a tail
+            // of 48 B AABB + "MATERIAL: \0" (80 B) + dwExtraSize (counts its own 4 B).
+            const MAT_TAG: &[u8] = b"MATERIAL: \0";
             for mesh_idx in 0..count {
-                let b_support_lm = *b.get(p).ok_or("truncated BMD v300 bSupportLightMap")? != 0;
-                let b_use_lm = *b.get(p + 1).ok_or("truncated BMD v300 bUseLightMap")? != 0;
-                p += 2;
+                let _mesh_word = u(b, p)?;
+                p += 4;
                 v300_branch_counters.flags_read += 1;
                 let name_len = u(b, p)? as usize;
                 p += 4;
@@ -377,23 +362,12 @@ impl Model {
                 if n > 1_000_000 || faces > 2_000_000 {
                     return Err("invalid BMD mesh size".into());
                 }
-                let has_lm_uvs = b_support_lm;
-                let has_vertex_colors = !b_support_lm || !b_use_lm;
-                let mut needed = n
+                let needed = n
                     .checked_mul(24)
                     .and_then(|v| v.checked_add(faces.checked_mul(12)?))
                     .and_then(|v| v.checked_add(n.checked_mul(12)?))
+                    .and_then(|v| v.checked_add(n.checked_mul(8)?))
                     .ok_or("BMD size overflow")?;
-                if has_lm_uvs {
-                    needed = needed
-                        .checked_add(n.checked_mul(8).ok_or("BMD size overflow")?)
-                        .ok_or("BMD size overflow")?;
-                }
-                if has_vertex_colors {
-                    needed = needed
-                        .checked_add(n.checked_mul(8).ok_or("BMD size overflow")?)
-                        .ok_or("BMD size overflow")?;
-                }
                 if p.checked_add(needed).is_none_or(|e| e > b.len()) {
                     return Err("truncated BMD mesh data".into());
                 }
@@ -424,11 +398,18 @@ impl Model {
                     v.normal = v3(b, p)?;
                     p += 12;
                 }
-                if has_lm_uvs {
-                    p = p.checked_add(n * 8).ok_or("BMD lightmap UV overflow")?;
+                let has_mat_at = |off: usize| -> bool {
+                    off.checked_add(48 + MAT_TAG.len()).is_some_and(|e| {
+                        e <= b.len() && &b[off + 48..off + 48 + MAT_TAG.len()] == MAT_TAG
+                    })
+                };
+                let n8 = n.checked_mul(8).ok_or("BMD size overflow")?;
+                let n16 = n.checked_mul(16).ok_or("BMD size overflow")?;
+                let double_block = p.checked_add(n16).is_some_and(has_mat_at)
+                    && !p.checked_add(n8).is_some_and(has_mat_at);
+                let color_branch = if double_block {
+                    p += n8;
                     v300_branch_counters.uv_block_skipped += 1;
-                }
-                let color_branch = if has_vertex_colors {
                     for v in &mut vertices {
                         v.day_diffuse = u(b, p)?;
                         p += 4;
@@ -438,38 +419,90 @@ impl Model {
                         p += 4;
                     }
                     v300_branch_counters.colours_read += 1;
-                    if has_lm_uvs {
-                        V300ColorBranch::LightmapUvAndVertexColors
-                    } else {
-                        V300ColorBranch::VertexColorsOnly
-                    }
+                    V300ColorBranch::LightmapUvAndVertexColors
                 } else {
                     for v in &mut vertices {
-                        v.day_diffuse = 0xff80_8080;
-                        v.night_diffuse = 0xff80_8080;
+                        v.day_diffuse = u(b, p)?;
+                        p += 4;
                     }
-                    v300_branch_counters.neutral_fallback += 1;
-                    V300ColorBranch::LightmapUvNeutralFallback
+                    for v in &mut vertices {
+                        v.night_diffuse = u(b, p)?;
+                        p += 4;
+                    }
+                    let (opaque_day, _) = count_opaque_words(&vertices);
+                    if n > 0 && opaque_day * 10 < n * 9 {
+                        let following_opaque = p
+                            .checked_add(n8)
+                            .is_some_and(|e| e <= b.len())
+                            .then(|| {
+                                let mut c = 0usize;
+                                for i in 0..n {
+                                    let d_ok = u(b, p + i * 4).is_ok_and(|w| (w >> 24) == 0xff);
+                                    let n_ok =
+                                        u(b, p + n * 4 + i * 4).is_ok_and(|w| (w >> 24) == 0xff);
+                                    if d_ok && n_ok {
+                                        c += 1;
+                                    }
+                                }
+                                c
+                            })
+                            .unwrap_or(0);
+                        v300_branch_counters.uv_block_skipped += 1;
+                        if following_opaque * 10 >= n * 9 {
+                            for v in &mut vertices {
+                                v.day_diffuse = u(b, p)?;
+                                p += 4;
+                            }
+                            for v in &mut vertices {
+                                v.night_diffuse = u(b, p)?;
+                                p += 4;
+                            }
+                            v300_branch_counters.colours_read += 1;
+                            V300ColorBranch::LightmapUvAndVertexColors
+                        } else {
+                            for v in &mut vertices {
+                                v.day_diffuse = 0xff80_8080;
+                                v.night_diffuse = 0xff80_8080;
+                            }
+                            v300_branch_counters.neutral_fallback += 1;
+                            V300ColorBranch::LightmapUvNeutralFallback
+                        }
+                    } else {
+                        v300_branch_counters.colours_read += 1;
+                        V300ColorBranch::VertexColorsOnly
+                    }
                 };
                 let (opaque_day_words, opaque_night_words) = count_opaque_words(&vertices);
-                // AABB (48 B) + A3DMaterial + dwExtraSize (counts its own 4 B).
-                p = p.checked_add(48).ok_or("BMD v300 AABB overflow")?;
-                if p > b.len() {
-                    return Err("truncated BMD v300 AABB".into());
+                // Tail: 48 B AABB + 80 B A3DMaterial ("MATERIAL: \0" + 69 B) +
+                // dwExtraSize (counts its own 4 B; 22 B when strDetailMap is empty -> 150 B total).
+                let mut tail_advance = None;
+                let mut material = None;
+                if p.checked_add(132).is_some_and(|e| e <= b.len())
+                    && &b[p + 48..p + 48 + MAT_TAG.len()] == MAT_TAG
+                {
+                    let mut mat_p = p + 48;
+                    material = parse_material(b, &mut mat_p).ok();
+                    let dw_pos = p + 128;
+                    let extra_size = u(b, dw_pos)? as usize;
+                    if (4..=65536).contains(&extra_size)
+                        && dw_pos.checked_add(extra_size).is_some_and(|e| e <= b.len())
+                    {
+                        tail_advance = Some(128 + extra_size);
+                    }
                 }
-                let material = Some(parse_material(b, &mut p)?);
-                let dw_pos = p;
-                let extra_size = u(b, dw_pos)? as usize;
-                if extra_size < 4 {
-                    return Err(format!("invalid BMD v300 dwExtraSize {extra_size}"));
+                if let Some(step) = tail_advance {
+                    p += step;
+                } else if p.checked_add(150).is_some_and(|e| e <= b.len()) {
+                    let mut mat_p = p + 48;
+                    if b.get(mat_p..mat_p + MAT_TAG.len()) == Some(MAT_TAG) {
+                        material = parse_material(b, &mut mat_p).ok();
+                    }
+                    p += 150;
+                } else if mesh_idx + 1 < count {
+                    return Err("truncated BMD v300 mesh tail".into());
+                } else {
+                    p = b.len();
                 }
-                let next_p = dw_pos
-                    .checked_add(extra_size)
-                    .ok_or("BMD v300 extra overflow")?;
-                if next_p > b.len() {
-                    return Err("truncated BMD v300 extra data".into());
-                }
-                p = next_p;
                 meshes.push(Mesh {
                     name,
                     version,
@@ -478,39 +511,13 @@ impl Model {
                     vertices,
                     indices,
                     color_branch: Some(color_branch),
-                    b_support_lightmap: b_support_lm,
-                    b_use_lightmap: b_use_lm,
+                    b_support_lightmap: false,
+                    b_use_lightmap: false,
                     opaque_day_words,
                     opaque_night_words,
                     name_lossy_gbk,
                     texture_lossy_gbk,
                 });
-            }
-            if b_lightmap {
-                for _ in 0..2 {
-                    let lm_len = u(b, p)? as usize;
-                    p += 4;
-                    if lm_len > 4096 {
-                        return Err("oversized BMD v300 lightmap name".into());
-                    }
-                    p = p
-                        .checked_add(lm_len)
-                        .ok_or("BMD v300 lightmap name overflow")?;
-                    if p > b.len() {
-                        return Err("truncated BMD v300 lightmap name".into());
-                    }
-                }
-            }
-            if p.checked_add(4).is_some_and(|e| e <= b.len()) {
-                let dw_pos = p;
-                let model_extra = u(b, dw_pos)? as usize;
-                if model_extra >= 4
-                    && dw_pos
-                        .checked_add(model_extra)
-                        .is_some_and(|e| e <= b.len())
-                {
-                    p = dw_pos + model_extra;
-                }
             }
         } else {
             for mesh_idx in 0..count {
@@ -890,8 +897,8 @@ mod tests {
 
     fn push_v300_mesh(
         b: &mut Vec<u8>,
-        support_lm: bool,
-        use_lm: bool,
+        has_uv_block: bool,
+        has_color_block: bool,
         name: &[u8],
         tex: &[u8],
         day: [u32; 3],
@@ -899,8 +906,7 @@ mod tests {
         extra_size: u32,
     ) {
         let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
-        b.push(u8::from(support_lm));
-        b.push(u8::from(use_lm));
+        put(b, 0x0000_0001);
         put(b, name.len() as u32);
         b.extend_from_slice(name);
         put(b, tex.len() as u32);
@@ -919,12 +925,12 @@ mod tests {
         put(b, 1);
         put(b, 2);
         b.extend_from_slice(&[0; 36]);
-        if support_lm {
+        if has_uv_block {
             for uv in [0.25f32, 0.5, 0.75, 0.125, 0.5, 0.5] {
                 put(b, uv.to_bits());
             }
         }
-        if !support_lm || !use_lm {
+        if has_color_block {
             for c in day {
                 put(b, c);
             }
@@ -940,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_v300_branches_from_flags_and_advances_by_dw_extra_size() {
+    fn parses_v300_branches_and_advances_by_dw_extra_size() {
         let mut b = Vec::new();
         let put = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
         put(&mut b, 0x42584f4d);
@@ -949,22 +955,20 @@ mod tests {
         put(&mut b, 0x10000302);
         b.extend_from_slice(&[0; 48]);
         put(&mut b, 3);
-        b.push(0);
-        b.push(0);
         push_v300_mesh(
             &mut b,
             false,
-            false,
+            true,
             b"branch_colors_only",
             b"Building\\a.dds",
-            [0x80102030, 0x80203040, 0x80304050],
-            [0x40010203, 0x40020304, 0x40030405],
+            [0xff102030, 0xff203040, 0xff304050],
+            [0xff010203, 0xff020304, 0xff030405],
             16,
         );
         push_v300_mesh(
             &mut b,
             true,
-            false,
+            true,
             b"branch_uv_and_colors",
             b"Building\\b.dds",
             [0xff887766, 0xff998877, 0xffaa9988],
@@ -974,7 +978,7 @@ mod tests {
         push_v300_mesh(
             &mut b,
             true,
-            true,
+            false,
             b"branch_uv_neutral",
             b"Building\\c.dds",
             [0; 3],
@@ -996,8 +1000,8 @@ mod tests {
             model.meshes[0].color_branch,
             Some(V300ColorBranch::VertexColorsOnly)
         );
-        assert_eq!(model.meshes[0].vertices[0].day_diffuse, 0x80102030);
-        assert_eq!(model.meshes[0].vertices[0].night_diffuse, 0x40010203);
+        assert_eq!(model.meshes[0].vertices[0].day_diffuse, 0xff102030);
+        assert_eq!(model.meshes[0].vertices[0].night_diffuse, 0xff010203);
         assert_eq!(
             model.meshes[1].color_branch,
             Some(V300ColorBranch::LightmapUvAndVertexColors)
@@ -1011,7 +1015,8 @@ mod tests {
         assert_eq!(model.meshes[2].vertices[0].day_diffuse, 0xff80_8080);
         assert_eq!(model.meshes[2].vertices[0].night_diffuse, 0xff80_8080);
         let log_line = model.meshes[2].colour_log_line("litmodels/world/1/litmodel_1.bmd", 2);
-        assert!(log_line.contains("bSupportLightMap=1 bUseLightMap=1 branch=lightmap_neutral"));
+        assert!(log_line.contains("branch=lightmap_neutral"));
+        assert!(log_line.contains("first_day=0xff808080"));
     }
 
     #[test]
@@ -1022,12 +1027,10 @@ mod tests {
         put(&mut b, 0x10000305);
         b.extend_from_slice(&[0; 48]);
         put(&mut b, 1);
-        b.push(0);
-        b.push(0);
         push_v300_mesh(
             &mut b,
             false,
-            false,
+            true,
             b"m0",
             b"Building\\bad\xfftex.dds",
             [0xff808080; 3],
