@@ -7755,14 +7755,17 @@ fn run_viewer(
                             }
                             if gpu_loss.pending() { return; }
                             if let Some(snapshot) = restoring.as_ref().filter(|s| !reload_ray_verified && s.kind == recovery::RestoreKind::Reload) {
-                                // Native is usable on startup or device recovery,
-                                // but cannot satisfy an explicit ray reload. In
-                                // overlay mode, wait until the first overlay frame
-                                // has actually drawn (or surface any error immediately).
-                                match renderer.lighter.check_reload_state(snapshot.lighter.mode, renderer.renders_rays()) {
-                                    Ok(true) => reload_ray_verified = true,
-                                    Ok(false) => {}
-                                    Err(error) => {
+                                // In hybrid overlay mode, the raster world stays visible
+                                // while the overlay compiles and even if the overlay fails;
+                                // only Reference world-replacement failure or device loss
+                                // may abort the reload.
+                                match renderer.lighter.resolve_reload_check(&snapshot.lighter, renderer.renders_rays()) {
+                                    crate::modules::lighter::ReloadOutcome::Verified => reload_ray_verified = true,
+                                    crate::modules::lighter::ReloadOutcome::Pending => {}
+                                    crate::modules::lighter::ReloadOutcome::OverlayDegraded(_) => {
+                                        reload_ray_verified = true;
+                                    }
+                                    crate::modules::lighter::ReloadOutcome::Fatal(error) => {
                                         run_error = Some(format!("{}: {error}", snapshot.kind.label()));
                                         renderer.lighter.retire_failed_start();
                                         target.set_control_flow(winit::event_loop::ControlFlow::Poll);

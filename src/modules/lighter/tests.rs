@@ -5251,3 +5251,50 @@ fn r7_native_mode_leaves_lighter_completely_inactive() {
     assert!(!lighter.overlay_ready());
     assert_eq!(lighter.check_reload_state(Mode::Off, false), Ok(true));
 }
+
+#[test]
+fn c1_overlay_startup_failure_keeps_raster_world_and_records_status() {
+    let mut lighter = Lighter::default();
+    lighter.settings.mode = Mode::Hardware;
+    lighter.settings.ray_lighting = true;
+    lighter.settings.reference = false;
+    lighter.has_hardware_device = true;
+    lighter.adapter_supports_compute = true;
+    lighter.native_backend = wgpu::Backend::Vulkan;
+    lighter.armed = true;
+    lighter.install(Err("simulated Vulkan RT compile timeout".into()));
+
+    let requested = lighter.settings;
+    let outcome = lighter.resolve_reload_check(&requested, false);
+    assert_eq!(
+        outcome,
+        super::ReloadOutcome::OverlayDegraded("simulated Vulkan RT compile timeout".into()),
+        "hybrid overlay failure must degrade gracefully instead of aborting reload"
+    );
+    let status = lighter
+        .status_line()
+        .expect("overlay failure must be recorded in Lighter status");
+    assert!(
+        status.contains("simulated Vulkan RT compile timeout"),
+        "status should name the overlay failure, got: {status}"
+    );
+    assert!(
+        !lighter.overlays_world(),
+        "failed overlay must stay inactive while raster world keeps drawing"
+    );
+
+    // Reference mode still treats failure as Fatal because it replaces the world.
+    let mut ref_lighter = Lighter::default();
+    ref_lighter.settings.mode = Mode::Hardware;
+    ref_lighter.settings.reference = true;
+    ref_lighter.has_hardware_device = true;
+    ref_lighter.adapter_supports_compute = true;
+    ref_lighter.native_backend = wgpu::Backend::Vulkan;
+    ref_lighter.armed = true;
+    ref_lighter.install(Err("reference pipeline failed".into()));
+    let ref_req = ref_lighter.settings;
+    assert_eq!(
+        ref_lighter.resolve_reload_check(&ref_req, false),
+        super::ReloadOutcome::Fatal("reference pipeline failed".into())
+    );
+}

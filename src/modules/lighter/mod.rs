@@ -1128,6 +1128,21 @@ enum ColdRayBuild {
     Done(Result<(vulkan::Renderer, bool), String>),
 }
 
+/// Outcome of checking a Reload World request against live Lighter state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadOutcome {
+    /// Requested ray mode has drawn at least one frame (or Lighter is Off).
+    Verified,
+    /// Hybrid overlay is still compiling/staging in the background; keep
+    /// rendering the raster world without blocking or failing.
+    Pending,
+    /// Hybrid overlay failed to start; error is recorded in Lighter status and
+    /// log, failed ray state is retired, and the raster world stays visible.
+    OverlayDegraded(String),
+    /// World-replacing Reference mode failed to draw the world; reload must fail.
+    Fatal(String),
+}
+
 pub struct Lighter {
     // Retire SDK work before releasing imported ray buffers or the device.
     #[cfg(any(target_os = "windows", target_os = "linux"))]
@@ -1591,6 +1606,31 @@ impl Lighter {
             reason: reason.clone(),
         }));
         Err(reason)
+    }
+
+    /// Read-only status string shown in the Lighter panel.
+    pub fn status_line(&self) -> Option<&str> {
+        self.status_line.as_deref()
+    }
+
+    /// Resolve a Reload World check without aborting the app when the hybrid
+    /// overlay fails to start. Overlay failures are recorded in `status_line`
+    /// and the log while the raster world keeps rendering.
+    pub fn resolve_reload_check(
+        &mut self,
+        requested: &Settings,
+        renders_world: bool,
+    ) -> ReloadOutcome {
+        match self.check_reload_state(requested.mode, renders_world) {
+            Ok(true) => ReloadOutcome::Verified,
+            Ok(false) => ReloadOutcome::Pending,
+            Err(reason) if !requested.reference => {
+                self.status_line = Some(format!("Overlay error: {reason}"));
+                self.retire_failed_start();
+                ReloadOutcome::OverlayDegraded(reason)
+            }
+            Err(reason) => ReloadOutcome::Fatal(reason),
+        }
     }
 
     pub fn set_graphics_state(&mut self, upscaler: String, frame_gen: String) {
