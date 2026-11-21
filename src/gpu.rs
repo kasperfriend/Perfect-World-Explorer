@@ -3791,13 +3791,17 @@ impl Renderer {
                 Frustum, InstanceProxy, MeshTriangle, WaterSurface,
             };
             let _ = Frustum::from_view_projection(matrix);
-            let detail_radius = config.radius.max(128.0) * 2.0;
+            // Phase 8: Cover the full view distance with real mesh triangles
+            // for every resident scenery page that has them; fall back to box
+            // proxies ONLY when real mesh triangles are unavailable or beyond
+            // view distance (plus procedural trees which have no static mesh).
+            let detail_radius = view_distance.max(config.radius.max(128.0) * 2.0);
             let detail_radius_sq = detail_radius * detail_radius;
 
-            // Real mesh triangles from ALL resident scenery pages within 360
-            // degrees around the camera so buildings behind or beside the view
-            // still cast accurate mesh shadows onto the 1:1 raster world.
             let mut real_meshes = Vec::new();
+            let mut real_mesh_pages = 0usize;
+            let mut proxy_fallback_models = 0usize;
+            let mut proxies = Vec::new();
             let pages_iter = if self.world_done {
                 self.world_pages.iter()
             } else {
@@ -3813,24 +3817,39 @@ impl Renderer {
                 if dist_sq > detail_radius_sq {
                     continue;
                 }
-                for t in page.rt_triangles() {
-                    real_meshes.push(MeshTriangle {
-                        a: Vec3::from_array(t.a),
-                        b: Vec3::from_array(t.b),
-                        c: Vec3::from_array(t.c),
-                        normal: Vec3::from_array(t.normal),
-                        albedo: t.albedo,
-                        roughness: 0.72,
-                        opacity: t.opacity,
-                    });
+                let tris = page.rt_triangles();
+                if !tris.is_empty() {
+                    real_mesh_pages += 1;
+                    for t in tris {
+                        real_meshes.push(MeshTriangle {
+                            a: Vec3::from_array(t.a),
+                            b: Vec3::from_array(t.b),
+                            c: Vec3::from_array(t.c),
+                            normal: Vec3::from_array(t.normal),
+                            albedo: t.albedo,
+                            roughness: 0.72,
+                            opacity: t.opacity,
+                        });
+                    }
+                } else {
+                    for b in page.placement_bounds() {
+                        let bmin = Vec3::from_array(b.min);
+                        let bmax = Vec3::from_array(b.max);
+                        let centre = (bmin + bmax) * 0.5;
+                        let half = (bmax - bmin) * 0.5;
+                        proxies.push(InstanceProxy {
+                            centre,
+                            half,
+                            albedo: [0.46, 0.44, 0.40],
+                            yaw: 0.0,
+                        });
+                        proxy_fallback_models += 1;
+                    }
                 }
             }
 
-            // Distant scenery & trees use compact box proxies (cheaper than
-            // full distant/foliage triangle soups while preserving silhouettes
-            // and shadow casting out to the far frustum edge). `max_instances`
-            // is enforced per chunk inside `scene_frustum`.
-            let mut proxies = Vec::new();
+            // Scenery beyond `detail_radius` uses compact box proxies so
+            // far-horizon shadows still cast without exceeding BVH budgets.
             if self.world_done {
                 let main_slot = crate::world_objects::GpuPage::world_view_slot(
                     crate::scenery_visibility::Pass::Main,
@@ -3847,6 +3866,7 @@ impl Renderer {
                             albedo: [0.46, 0.44, 0.40],
                             yaw: 0.0,
                         });
+                        proxy_fallback_models += 1;
                     }
                 }
             } else {
@@ -3863,12 +3883,14 @@ impl Renderer {
                                 albedo: [0.46, 0.44, 0.40],
                                 yaw: 0.0,
                             });
+                            proxy_fallback_models += 1;
                         }
                     }
                 }
             }
-            // Trees across frustum-visible scene blocks: canopy box proxies
-            // give soft tree shadows and reflections without per-leaf geometry.
+            // Procedural trees have no static `rt_triangles()`; use canopy
+            // proxies only as fallback for soft tree shadows.
+            let mut tree_proxies = 0usize;
             for block in &self.model_scene.blocks {
                 for tree in &block.trees {
                     let pos = Vec3::from_array(tree.position);
@@ -3878,7 +3900,18 @@ impl Renderer {
                         albedo: [0.18, 0.30, 0.14],
                         yaw: 0.0,
                     });
+                    tree_proxies += 1;
                 }
+            }
+            if std::env::var_os("PWE_RT_DEBUG").is_some() {
+                eprintln!(
+                    "[Raywatcher] harvest: {} real-mesh pages ({} tris), {} proxy fallbacks, {} tree proxies (detail_radius={:.0})",
+                    real_mesh_pages,
+                    real_meshes.len(),
+                    proxy_fallback_models,
+                    tree_proxies,
+                    detail_radius,
+                );
             }
 
             // Reflective water surfaces across the visible frustum.

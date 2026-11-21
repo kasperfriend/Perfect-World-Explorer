@@ -341,24 +341,50 @@ fn gbuf_prep(@builtin(global_invocation_id) id: vec3<u32>) {
     let z_u = textureLoad(src_depth, px_u, 0);
     let z_d = textureLoad(src_depth, px_d, 0);
 
-    var dpdx = vec3<f32>(1.0, 0.0, 0.0);
-    if (abs(z_r - z) < abs(z_l - z) && z_r > 1e-6) {
+    // Phase 8: Relative depth-jump guard prevents thin geometry (fences,
+    // branches, grass blades) from differentiating across background depth
+    // discontinuities and producing grazing/inverted normals.
+    let max_rel_dz = 0.08;
+    let inv_z = 1.0 / max(z, 1e-4);
+    let dz_l = abs(z_l - z);
+    let dz_r = abs(z_r - z);
+    let dz_u = abs(z_u - z);
+    let dz_d = abs(z_d - z);
+    let valid_l = z_l > 1e-6 && (dz_l * inv_z) <= max_rel_dz;
+    let valid_r = z_r > 1e-6 && (dz_r * inv_z) <= max_rel_dz;
+    let valid_u = z_u > 1e-6 && (dz_u * inv_z) <= max_rel_dz;
+    let valid_d = z_d > 1e-6 && (dz_d * inv_z) <= max_rel_dz;
+
+    var dpdx = vec3<f32>(0.0);
+    var has_x = false;
+    if (valid_r && (!valid_l || dz_r <= dz_l)) {
         dpdx = reconstruct_pos(px_r, z_r, render) - p;
-    } else if (z_l > 1e-6) {
+        has_x = true;
+    } else if (valid_l) {
         dpdx = p - reconstruct_pos(px_l, z_l, render);
+        has_x = true;
     }
 
-    var dpdy = vec3<f32>(0.0, 0.0, 1.0);
-    if (abs(z_d - z) < abs(z_u - z) && z_d > 1e-6) {
+    var dpdy = vec3<f32>(0.0);
+    var has_y = false;
+    if (valid_d && (!valid_u || dz_d <= dz_u)) {
         dpdy = reconstruct_pos(px_d, z_d, render) - p;
-    } else if (z_u > 1e-6) {
+        has_y = true;
+    } else if (valid_u) {
         dpdy = p - reconstruct_pos(px_u, z_u, render);
+        has_y = true;
     }
 
-    let raw_n = cross(dpdy, dpdx);
-    var n = select(vec3<f32>(0.0, 1.0, 0.0), normalize(raw_n), length(raw_n) > 1e-6);
-    if (dot(n, view_dir) > 0.0) {
-        n = -n;
+    let fallback_n = normalize(vec3<f32>(0.0, 0.6, 0.0) - view_dir * 0.8);
+    var n = fallback_n;
+    if (has_x && has_y) {
+        let raw_n = cross(dpdy, dpdx);
+        if (length(raw_n) > 1e-6) {
+            n = normalize(raw_n);
+            if (dot(n, view_dir) > 0.0) {
+                n = -n;
+            }
+        }
     }
 
     var roughness = 0.85;
