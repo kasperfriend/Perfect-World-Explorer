@@ -162,10 +162,12 @@ pub enum DebugView {
     OccluderKind,
     /// Colours each reflection hit by its source kind (same palette).
     ReflectionHitKind,
+    /// R = raster-only sun fraction, G = RT sun visibility, B = combined.
+    ShadowSource,
 }
 
 impl DebugView {
-    pub const ALL: [DebugView; 9] = [
+    pub const ALL: [DebugView; 10] = [
         Self::None,
         Self::RasterOnly,
         Self::SunVisibility,
@@ -175,6 +177,7 @@ impl DebugView {
         Self::PointLights,
         Self::OccluderKind,
         Self::ReflectionHitKind,
+        Self::ShadowSource,
     ];
 
     pub fn label(self) -> &'static str {
@@ -190,6 +193,7 @@ impl DebugView {
                 "Occluder kind (cyan=water, orange=terrain, green=mesh, magenta=proxy)"
             }
             Self::ReflectionHitKind => "Reflection hit kind",
+            Self::ShadowSource => "Shadow source (R=raster sun, G=RT vis, B=combined)",
         }
     }
 
@@ -204,6 +208,7 @@ impl DebugView {
             Self::PointLights => "points",
             Self::OccluderKind => "occluder",
             Self::ReflectionHitKind => "reflection_hit",
+            Self::ShadowSource => "shadow_source",
         }
     }
 
@@ -218,6 +223,7 @@ impl DebugView {
             "points" | "point_lights" | "lights" => Some(Self::PointLights),
             "occluder" | "occluder_kind" => Some(Self::OccluderKind),
             "reflection_hit" | "refl_hit" | "reflection_hit_kind" => Some(Self::ReflectionHitKind),
+            "shadow_source" | "shadows_source" => Some(Self::ShadowSource),
             _ => None,
         }
     }
@@ -233,6 +239,7 @@ impl DebugView {
             Self::PointLights => 6,
             Self::OccluderKind => 7,
             Self::ReflectionHitKind => 8,
+            Self::ShadowSource => 9,
         }
     }
 }

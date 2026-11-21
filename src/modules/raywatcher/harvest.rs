@@ -25,7 +25,7 @@ use glam::{Mat4, Vec3};
 
 use super::bvh::{RayMaterial, RayTriangle, SceneGeometry};
 
-/// Per-material source tag stored in `RayMaterial.surface[2]` for
+/// Per-triangle source tag stored in `RayTriangle.normal[3]` for
 /// `DebugView::OccluderKind` and `DebugView::ReflectionHitKind`.
 pub const KIND_NONE: f32 = 0.0;
 pub const KIND_WATER: f32 = 1.0;
@@ -536,8 +536,18 @@ impl Harvester {
                 let bvh_ms = t_bvh.elapsed().as_secs_f64() * 1000.0;
                 let total_ms = t_start.elapsed().as_secs_f64() * 1000.0;
                 if std::env::var_os("PWE_RT_DEBUG").is_some() {
+                    let (mut k_water, mut k_terrain, mut k_mesh, mut k_proxy) = (0usize, 0usize, 0usize, 0usize);
+                    for t in scene.triangles() {
+                        match t.kind() as u32 {
+                            1 => k_water += 1,
+                            2 => k_terrain += 1,
+                            3 => k_mesh += 1,
+                            4 => k_proxy += 1,
+                            _ => {}
+                        }
+                    }
                     eprintln!(
-                        "[Raywatcher] bg_build: water_quads={water_quads} lod_terrain_tris=[near:{}, mid:{}, far:{}, vfar:{}] real_mesh_tris={real_mesh_tris} proxy_tris={proxy_tris} total_tris={total_tris} bvh_build_ms={bvh_ms:.2} total_ms={total_ms:.2}",
+                        "[Raywatcher] bg_build: kinds(water={k_water}, terrain_lod={k_terrain}, real_mesh={k_mesh}, tree_proxy={k_proxy}) water_quads={water_quads} lod_terrain_tris=[near:{}, mid:{}, far:{}, vfar:{}] real_mesh_tris={real_mesh_tris} proxy_tris={proxy_tris} total_tris={total_tris} bvh_build_ms={bvh_ms:.2} total_ms={total_ms:.2}",
                         terrain_lod_tris[0],
                         terrain_lod_tris[1],
                         terrain_lod_tris[2],
@@ -782,7 +792,7 @@ fn push_instances(
             surface: [
                 0.75,
                 0.05,
-                KIND_PROXY,
+                0.0,
                 if instance.albedo[1] > instance.albedo[0] * 1.15
                     && instance.albedo[1] > instance.albedo[2] * 1.15
                 {
@@ -828,8 +838,12 @@ fn push_box(triangles: &mut Vec<RayTriangle>, instance: InstanceProxy, material:
     let mut quad = |a: Vec3, b: Vec3, c: Vec3, d: Vec3, normal: Vec3| {
         let n = (b - a).cross(c - a).normalize_or_zero();
         let normal = if n.length_squared() > 0.5 { n } else { normal };
-        triangles.push(RayTriangle::new(a, b, c, normal, material));
-        triangles.push(RayTriangle::new(a, c, d, normal, material));
+        triangles.push(RayTriangle::with_kind(
+            a, b, c, normal, material, KIND_PROXY,
+        ));
+        triangles.push(RayTriangle::with_kind(
+            a, c, d, normal, material, KIND_PROXY,
+        ));
     };
     let up = Vec3::Y;
     let down = Vec3::NEG_Y;
@@ -866,7 +880,7 @@ fn push_terrain(
         albedo: [0.32, 0.36, 0.28, 1.],
         // Ground is as rough as a surface gets; a tiny sheen only catches the
         // sun at grazing angles, where a wet field should.
-        surface: [0.92, 0., KIND_TERRAIN_LOD, 1.],
+        surface: [0.92, 0., 0., 1.],
     });
     let stride = config.stride.max(1);
     let spacing = field.cell * stride as f32;
@@ -943,8 +957,22 @@ fn push_terrain(
             } else {
                 Vec3::Y
             };
-            triangles.push(RayTriangle::new(p0, p1, p2, n0, material));
-            triangles.push(RayTriangle::new(p0, p2, p3, n1, material));
+            triangles.push(RayTriangle::with_kind(
+                p0,
+                p1,
+                p2,
+                n0,
+                material,
+                KIND_TERRAIN_LOD,
+            ));
+            triangles.push(RayTriangle::with_kind(
+                p0,
+                p2,
+                p3,
+                n1,
+                material,
+                KIND_TERRAIN_LOD,
+            ));
             wx += stride;
         }
         wz += stride;
@@ -1016,11 +1044,18 @@ fn push_real_meshes(
             let id = materials.len() as u32;
             materials.push(RayMaterial {
                 albedo: [m.albedo[0], m.albedo[1], m.albedo[2], 1.0],
-                surface: [m.roughness.clamp(0.04, 1.0), 0.05, KIND_REAL_MESH, opacity],
+                surface: [m.roughness.clamp(0.04, 1.0), 0.05, 0.0, opacity],
             });
             id
         });
-        triangles.push(RayTriangle::new(m.a, m.b, m.c, m.normal, mat_id));
+        triangles.push(RayTriangle::with_kind(
+            m.a,
+            m.b,
+            m.c,
+            m.normal,
+            mat_id,
+            KIND_REAL_MESH,
+        ));
     }
 }
 
@@ -1066,7 +1101,7 @@ fn push_water(
                 let id = materials.len() as u32;
                 materials.push(RayMaterial {
                     albedo: [0.10, 0.22, 0.28, 1.0],
-                    surface: [0.06, 0.02, KIND_WATER, 1.0],
+                    surface: [0.06, 0.02, 0.0, 1.0],
                 });
                 id
             });
@@ -1074,8 +1109,22 @@ fn push_water(
             let p1 = Vec3::new(x1, w.height, z0);
             let p2 = Vec3::new(x1, w.height, z1);
             let p3 = Vec3::new(x0, w.height, z1);
-            triangles.push(RayTriangle::new(p0, p1, p2, Vec3::Y, mat_id));
-            triangles.push(RayTriangle::new(p0, p2, p3, Vec3::Y, mat_id));
+            triangles.push(RayTriangle::with_kind(
+                p0,
+                p1,
+                p2,
+                Vec3::Y,
+                mat_id,
+                KIND_WATER,
+            ));
+            triangles.push(RayTriangle::with_kind(
+                p0,
+                p2,
+                p3,
+                Vec3::Y,
+                mat_id,
+                KIND_WATER,
+            ));
             continue;
         };
 
@@ -1132,7 +1181,7 @@ fn push_water(
                     let id = materials.len() as u32;
                     materials.push(RayMaterial {
                         albedo: [0.10, 0.22, 0.28, 1.0],
-                        surface: [0.06, 0.02, KIND_WATER, 1.0],
+                        surface: [0.06, 0.02, 0.0, 1.0],
                     });
                     id
                 });
@@ -1140,8 +1189,22 @@ fn push_water(
                 let p1 = Vec3::new(cx1, w.height, cz0);
                 let p2 = Vec3::new(cx1, w.height, cz1);
                 let p3 = Vec3::new(cx0, w.height, cz1);
-                triangles.push(RayTriangle::new(p0, p1, p2, Vec3::Y, mat_id));
-                triangles.push(RayTriangle::new(p0, p2, p3, Vec3::Y, mat_id));
+                triangles.push(RayTriangle::with_kind(
+                    p0,
+                    p1,
+                    p2,
+                    Vec3::Y,
+                    mat_id,
+                    KIND_WATER,
+                ));
+                triangles.push(RayTriangle::with_kind(
+                    p0,
+                    p2,
+                    p3,
+                    Vec3::Y,
+                    mat_id,
+                    KIND_WATER,
+                ));
             }
         }
     }
@@ -1224,7 +1287,7 @@ fn push_instances_chunked(
                         instance.albedo[2],
                         1.0,
                     ],
-                    surface: [0.75, 0.05, KIND_PROXY, opacity],
+                    surface: [0.75, 0.05, 0.0, opacity],
                 });
                 id
             });
@@ -1262,7 +1325,7 @@ fn push_terrain_frustum(
     let material = materials.len() as u32;
     materials.push(RayMaterial {
         albedo: [0.32, 0.36, 0.28, 1.0],
-        surface: [0.92, 0.0, KIND_TERRAIN_LOD, 1.0],
+        surface: [0.92, 0.0, 0.0, 1.0],
     });
 
     let min_cx = ((eye.x - far) / chunk_size).floor() as i32;
@@ -1357,33 +1420,37 @@ fn push_terrain_frustum(
                         let p2 = Vec3::new(wx1, h2, wz1);
                         let p3 = Vec3::new(wx0, h3, wz1);
                         let pc = Vec3::new(wxc, hc, wzc);
-                        triangles.push(RayTriangle::new(
+                        triangles.push(RayTriangle::with_kind(
                             p0,
                             p1,
                             pc,
                             tri_normal(p0, p1, pc),
                             material,
+                            KIND_TERRAIN_LOD,
                         ));
-                        triangles.push(RayTriangle::new(
+                        triangles.push(RayTriangle::with_kind(
                             p1,
                             p2,
                             pc,
                             tri_normal(p1, p2, pc),
                             material,
+                            KIND_TERRAIN_LOD,
                         ));
-                        triangles.push(RayTriangle::new(
+                        triangles.push(RayTriangle::with_kind(
                             p2,
                             p3,
                             pc,
                             tri_normal(p2, p3, pc),
                             material,
+                            KIND_TERRAIN_LOD,
                         ));
-                        triangles.push(RayTriangle::new(
+                        triangles.push(RayTriangle::with_kind(
                             p3,
                             p0,
                             pc,
                             tri_normal(p3, p0, pc),
                             material,
+                            KIND_TERRAIN_LOD,
                         ));
                         lod_tris[lod_band] += 4;
                     } else {
@@ -1399,19 +1466,21 @@ fn push_terrain_frustum(
                         let p1 = Vec3::new(wx1, h1 - drop, wz0);
                         let p2 = Vec3::new(wx1, h2 - drop, wz1);
                         let p3 = Vec3::new(wx0, h3 - drop, wz1);
-                        triangles.push(RayTriangle::new(
+                        triangles.push(RayTriangle::with_kind(
                             p0,
                             p1,
                             p2,
                             tri_normal(p0, p1, p2),
                             material,
+                            KIND_TERRAIN_LOD,
                         ));
-                        triangles.push(RayTriangle::new(
+                        triangles.push(RayTriangle::with_kind(
                             p0,
                             p2,
                             p3,
                             tri_normal(p0, p2, p3),
                             material,
+                            KIND_TERRAIN_LOD,
                         ));
                         lod_tris[lod_band] += 2;
                     }

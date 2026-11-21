@@ -1061,34 +1061,42 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         out_lf = 1.0;
         store_refl = vec3<f32>(0.0);
     } else if (debug_mode == 7u) {
-        // Phase 0: OccluderKind — colours each shadow/AO hit by source kind.
+        // Phase 0: OccluderKind — per-triangle kind stored in tri.normal.w.
         var occ_kind = 0.0;
         if (n_dot_l > 0.02) {
             let sh = closest_hit(ray_origin, params.sun_dir.xyz, bias * 0.5, params.lens.y);
             if (sh.index != 0xffffffffu) {
-                occ_kind = material_of(sh.index).surface.z;
+                occ_kind = tris[sh.index].n.w;
             }
         }
         if (occ_kind < 0.5) {
             let ah = closest_hit(ray_origin, normal, bias * 0.5, ao_radius);
             if (ah.index != 0xffffffffu) {
-                occ_kind = material_of(ah.index).surface.z;
+                occ_kind = tris[ah.index].n.w;
             }
         }
         out_rgb = kind_colour(occ_kind);
         out_lf = 1.0;
         store_refl = vec3<f32>(0.0);
     } else if (debug_mode == 8u) {
-        // Phase 0: ReflectionHitKind — colours each reflection hit by source kind.
+        // Phase 0: ReflectionHitKind — per-triangle kind stored in tri.normal.w.
         var rkind = 0.0;
         if (roughness <= params.effects.x) {
             let rdir = reflect(view_dir, normal);
             let rh = closest_hit(ray_origin, rdir, bias, params.lens.y);
             if (rh.index != 0xffffffffu) {
-                rkind = material_of(rh.index).surface.z;
+                rkind = tris[rh.index].n.w;
             }
         }
         out_rgb = kind_colour(rkind);
+        out_lf = 1.0;
+        store_refl = vec3<f32>(0.0);
+    } else if (debug_mode == 9u) {
+        // Phase 0: ShadowSource — R=raster sun fraction, G=RT vis, B=combined.
+        let sun_e = max(luminance(params.sun_colour.xyz), 0.0) * n_dot_l;
+        let amb_e = max(luminance(params.ambient.xyz) * params.tuning.z, 0.05);
+        let sun_f = clamp(sun_e / max(sun_e + amb_e, 1e-4), 0.0, 1.0);
+        out_rgb = vec3<f32>(sun_f, avg_shadow, sun_f * avg_shadow);
         out_lf = 1.0;
         store_refl = vec3<f32>(0.0);
     }
@@ -2228,11 +2236,9 @@ impl RaywatcherGpu {
         let (guide, guide_view) = plane(device, "raywatcher output guide", w, h, GUIDE_FORMAT);
         let compose_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("raywatcher compose params"),
-            // The compose shader declares `var<uniform> extent: vec4<f32>`,
-            // which occupies 64 bytes in the uniform address space. A 16-byte
-            // buffer fails wgpu validation and kills the device on the first
-            // compose dispatch.
-            size: 64,
+            // `var<uniform> extent: vec4<f32>` is 16 bytes in WGSL (verified
+            // under wgpu::InstanceFlags::VALIDATION).
+            size: 16,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2894,6 +2900,13 @@ impl RaywatcherGpu {
         }
         // Copy hardware depth FIRST so both the 1:1 G-buffer prep pass and the
         // denoiser/DLSS RR consume the exact raster depth from the world pass.
+        // WebGPU/wgpu requires depth-texture copies to cover the ENTIRE source
+        // texture (`Transfer(InvalidDepthTextureExtent)` otherwise). Resize
+        // internal render targets first if the incoming depth extent differs.
+        let depth_ext = (depth.width().max(1), depth.height().max(1));
+        if depth_ext != self.render_extent {
+            self.resize(device, depth_ext, plan.grid);
+        }
         let (rw, rh) = self.render_extent;
         encoder.copy_texture_to_texture(
             wgpu::ImageCopyTexture {
@@ -2909,8 +2922,8 @@ impl RaywatcherGpu {
                 aspect: wgpu::TextureAspect::DepthOnly,
             },
             wgpu::Extent3d {
-                width: rw.min(depth.width()),
-                height: rh.min(depth.height()),
+                width: rw,
+                height: rh,
                 depth_or_array_layers: 1,
             },
         );

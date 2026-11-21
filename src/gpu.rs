@@ -3961,15 +3961,19 @@ impl Renderer {
             .raywatcher_scene
             .as_ref()
             .is_some_and(|old| std::sync::Arc::ptr_eq(old, &scene));
+        let depth_extent = (self.depth.width().max(1), self.depth.height().max(1));
         if !same_world {
             match self.raywatcher_gpu.as_mut() {
-                Some(gpu) => gpu.set_scene(&self.device, scene.clone()),
+                Some(gpu) => {
+                    gpu.set_scene(&self.device, scene.clone());
+                    gpu.resize(&self.device, depth_extent, plan.grid);
+                }
                 None => {
                     self.raywatcher_gpu =
                         Some(crate::modules::raywatcher::gpu::RaywatcherGpu::new(
                             &self.device,
                             scene.clone(),
-                            render_extent,
+                            depth_extent,
                             plan.grid,
                         ));
                 }
@@ -3977,7 +3981,7 @@ impl Renderer {
             self.raywatcher_scene = Some(scene);
         } else if let Some(gpu) = self.raywatcher_gpu.as_mut() {
             // A resize is a new extent, not a new world.
-            gpu.resize(&self.device, render_extent, plan.grid);
+            gpu.resize(&self.device, depth_extent, plan.grid);
         }
         let Some(gpu) = self.raywatcher_gpu.as_mut() else {
             return;

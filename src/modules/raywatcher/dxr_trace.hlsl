@@ -582,13 +582,13 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         if (n_dot_l > 0.02) {
             Hit sh = closest_hit(ray_origin, params.sun_dir.xyz, bias * 0.5, params.lens.y);
             if (sh.index != 0xffffffffu) {
-                occ_kind = material_of(sh.index).surface.z;
+                occ_kind = tris[sh.index].n.w;
             }
         }
         if (occ_kind < 0.5) {
             Hit ah = closest_hit(ray_origin, normal, bias * 0.5, ao_radius);
             if (ah.index != 0xffffffffu) {
-                occ_kind = material_of(ah.index).surface.z;
+                occ_kind = tris[ah.index].n.w;
             }
         }
         out_rgb = kind_colour(occ_kind);
@@ -600,10 +600,17 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float3 rdir = reflect(view_dir, normal);
             Hit rh = closest_hit(ray_origin, rdir, bias, params.lens.y);
             if (rh.index != 0xffffffffu) {
-                rkind = material_of(rh.index).surface.z;
+                rkind = tris[rh.index].n.w;
             }
         }
         out_rgb = kind_colour(rkind);
+        out_lf = 1.0;
+        store_refl = float3(0.0, 0.0, 0.0);
+    } else if (debug_mode == 9u) {
+        float sun_e = max(dot(params.sun_colour.xyz, float3(0.2126, 0.7152, 0.0722)), 0.0) * n_dot_l;
+        float amb_e = max(dot(params.ambient.xyz, float3(0.2126, 0.7152, 0.0722)) * params.tuning.z, 0.05);
+        float sun_f = saturate(sun_e / max(sun_e + amb_e, 1e-4));
+        out_rgb = float3(sun_f, avg_shadow, sun_f * avg_shadow);
         out_lf = 1.0;
         store_refl = float3(0.0, 0.0, 0.0);
     }

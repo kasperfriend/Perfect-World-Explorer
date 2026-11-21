@@ -38,16 +38,27 @@ pub struct RayTriangle {
 
 impl RayTriangle {
     pub fn new(a: Vec3, b: Vec3, c: Vec3, normal: Vec3, material: u32) -> Self {
+        Self::with_kind(a, b, c, normal, material, 0.)
+    }
+
+    /// Construct a triangle with a per-triangle source kind stored in
+    /// `normal[3]` (used by `DebugView::OccluderKind` and `ReflectionHitKind`).
+    pub fn with_kind(a: Vec3, b: Vec3, c: Vec3, normal: Vec3, material: u32, kind: f32) -> Self {
         Self {
             a: [a.x, a.y, a.z, 0.],
             b: [b.x, b.y, b.z, material as f32],
             c: [c.x, c.y, c.z, 0.],
-            normal: [normal.x, normal.y, normal.z, 0.],
+            normal: [normal.x, normal.y, normal.z, kind],
         }
     }
 
     pub fn material(&self) -> u32 {
         self.b[3] as u32
+    }
+
+    /// Per-triangle source kind tag (`KIND_*`) stored in `normal[3]`.
+    pub fn kind(&self) -> f32 {
+        self.normal[3]
     }
 
     /// Twice the area, which is also the length of the un-normalised cross
