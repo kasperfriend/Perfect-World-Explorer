@@ -95,6 +95,10 @@ struct FrameSnapshot {
     celestial: [f32; 3],
     time_advances: u32,
     light_publications: u32,
+    /// Raywatcher's raster overrides for this frame. Carried on the snapshot
+    /// rather than read from the renderer so the uniform builder stays a pure
+    /// function of its inputs and the tests can build one without a device.
+    overrides: crate::modules::raywatcher::frame::RasterOverrides,
 }
 impl Default for FrameSnapshot {
     fn default() -> Self {
@@ -126,6 +130,7 @@ impl Default for FrameSnapshot {
             celestial: [0.; 3],
             time_advances: 0,
             light_publications: 0,
+            overrides: crate::modules::raywatcher::frame::RasterOverrides::NONE,
         }
     }
 }
@@ -139,6 +144,35 @@ impl FrameSnapshot {
         fog_color: [f32; 4],
         lod: [f32; 4],
     ) -> Uniform {
+        // Raywatcher's overrides are applied here, at the single place every
+        // view's uniform is built, because that is the only point that covers the
+        // main view, the water's mirrored view and the above-water pass at once.
+        //
+        // The mesh shader computes `light.x + light.y * max(dot(n, sun.xyz), 0)`
+        // and multiplies the result by `light.zww`. Zeroing `x` and `y` is
+        // therefore exactly "the raster sun and sky terms are off": what is left
+        // is the texture, lit only by the ray image's own contribution, which
+        // the Raywatcher compose pass wrote into the same target.
+        let light = if self.overrides.ambient || self.overrides.directional_light {
+            let mut light = self.light;
+            if self.overrides.ambient {
+                light[0] = 0.;
+            }
+            if self.overrides.directional_light {
+                light[1] = 0.;
+            }
+            light
+        } else {
+            self.light
+        };
+        // Fog is one range for every material, so the atmosphere override turns
+        // the range off rather than tinting it (the ray pass has its own
+        // Beer-Lambert extinction, applied per pixel at the distance it knows).
+        let fog_range = if self.overrides.atmosphere_fog {
+            [0.; 4]
+        } else {
+            fog_range
+        };
         Uniform {
             matrix: matrix.to_cols_array_2d(),
             direction,
@@ -146,7 +180,7 @@ impl FrameSnapshot {
             bounds: self.bounds,
             tree_bounds: self.tree_bounds,
             sun: self.sun,
-            light: self.light,
+            light,
             region_ambient: self.region_ambient,
             region_diffuse: self.region_diffuse,
             region_direction: self.region_direction,
@@ -1714,6 +1748,22 @@ fn fs_body(i:VOut, front:bool)->vec4<f32> { if ((i.kind>1.05 && i.kind<1.15) || 
 struct Renderer {
     /// Optional add-ons; default-disabled and absent from headless previews.
     modules: crate::modules::Modules,
+    /// Raywatcher's GPU state, created lazily the first time the module asks
+    /// for a traced frame and dropped when it stops asking. `None` on any frame
+    /// the module is off, so a disabled module owns no GPU memory at all.
+    raywatcher_gpu: Option<crate::modules::raywatcher::gpu::RaywatcherGpu>,
+    /// The geometry the current `raywatcher_gpu` was built from, so a world
+    /// change can drop the tree instead of tracing stale geometry.
+    raywatcher_scene: Option<std::sync::Arc<crate::modules::raywatcher::bvh::SceneGeometry>>,
+    /// Builds and caches the ray scene from the resident world.
+    raywatcher_harvest: crate::modules::raywatcher::harvest::Harvester,
+    /// This frame's ray plan, decided before the world pass and consumed after
+    /// it. `Plan::OFF` on a frame the module is not tracing.
+    raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan,
+    raywatcher_hw_probe: Option<(bool, Option<String>)>,
+    /// The raster effects this frame's ray pass replaces. Read by `render` so a
+    /// replaced effect is not drawn, and by the tab so it can say which.
+    raywatcher_overrides: crate::modules::raywatcher::frame::RasterOverrides,
     module_format: wgpu::TextureFormat,
     models: Option<crate::world_models_gpu::World>,
     model_lights: std::sync::Arc<crate::scene_lights::SceneLights>,
@@ -1854,7 +1904,9 @@ fn object_mv_target(device: &wgpu::Device, w: u32, h: u32) -> (wgpu::Texture, wg
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());
@@ -2478,6 +2530,12 @@ impl Renderer {
         );
         Ok(Self {
             modules: crate::modules::Modules::default(),
+            raywatcher_gpu: None,
+            raywatcher_scene: None,
+            raywatcher_harvest: crate::modules::raywatcher::harvest::Harvester::new(),
+            raywatcher_frame_plan: crate::modules::raywatcher::plan::Plan::OFF,
+            raywatcher_hw_probe: None,
+            raywatcher_overrides: crate::modules::raywatcher::frame::RasterOverrides::NONE,
             module_format: format.remove_srgb_suffix(),
             models,
             model_lights: t.scene_lights.clone(),
@@ -2989,6 +3047,7 @@ impl Renderer {
             celestial,
             time_advances: 1,
             light_publications: 1,
+            overrides: self.raywatcher_overrides,
         };
         self.frame = snapshot;
         snapshot
@@ -3623,6 +3682,386 @@ impl Renderer {
             Some(&self.reflected_far_runs),
         );
     }
+    /// Decide this frame's ray traces and tell the raster pass which original
+    /// effects to leave off.
+    ///
+    /// Called *before* the world pass: an effect the module replaces must not
+    /// draw at all, and the decision has to exist by then. The trace itself runs
+    /// afterwards (see [`Self::raywatcher_record`]) because it consumes the
+    /// motion vectors and depth the world pass writes.
+    fn raywatcher_plan(
+        &mut self,
+        render_extent: (u32, u32),
+        reset_history: bool,
+    ) -> crate::modules::raywatcher::frame::RasterOverrides {
+        use crate::modules::raywatcher::frame::RasterOverrides;
+        let availability = {
+            // The providers are probed from the DLLs that are present, not by
+            // creating a context: a context is created on the first traced
+            // frame, and the tab has to be right before then.
+            let (dlss, fsr) = crate::modules::raywatcher::reconstruct::probe_offline(
+                self.modules.raywatcher().sdk_dir(),
+                cfg!(windows),
+            );
+            (dlss.available, fsr.available)
+        };
+        // Probe DXR Tier 1.1 (`RayQuery`) directly on the underlying DX12
+        // device once per session so RTX 20/30/40/50, RDNA2+, and Intel Arc
+        // GPUs run Hardware mode on their RT cores.
+        let (ray_queries, hw_note) = self
+            .raywatcher_hw_probe
+            .get_or_insert_with(|| crate::modules::raywatcher::dxr::probe_hardware_rt(&self.device))
+            .clone();
+        {
+            let module = self.modules.raywatcher_mut();
+            module.configure(ray_queries, availability);
+            module.set_hardware_note(hw_note);
+            if reset_history {
+                module.reset_history();
+            }
+        }
+        let plan = self
+            .modules
+            .raywatcher()
+            .plan(render_extent, !reset_history);
+        if !plan.trace {
+            // Holding the GPU state would keep a BVH and a dozen targets alive
+            // for a module the user turned off.
+            self.raywatcher_gpu = None;
+            self.raywatcher_scene = None;
+            self.raywatcher_harvest.invalidate();
+            return RasterOverrides::NONE;
+        }
+        self.raywatcher_frame_plan = plan;
+        RasterOverrides::for_plan(&plan)
+    }
+
+    /// Trace and filter this frame's rays, then write the result into the world
+    /// target the upscaler reads.
+    ///
+    /// Runs after the world pass and before the upscaler. Raywatcher never
+    /// changes the render extent, never disables upscaling and never touches
+    /// frame generation: the filtered ray image simply *is* the image the
+    /// upscaler reconstructs.
+    #[allow(clippy::too_many_arguments)]
+    fn raywatcher_record(
+        &mut self,
+        camera: &Camera,
+        encoder: &mut wgpu::CommandEncoder,
+        render_extent: (u32, u32),
+        matrix: Mat4,
+        jitter: (f32, f32),
+        reset_history: bool,
+        map_space: Option<&crate::navigation::MapSpace>,
+        destination: &wgpu::Texture,
+    ) {
+        use crate::modules::raywatcher::frame::{FrameParams, LightingRecord, Sun};
+        let plan = self.raywatcher_frame_plan;
+        if !plan.trace {
+            return;
+        }
+        let reset_history = reset_history || self.modules.raywatcher_mut().take_history_reset();
+        let settings = self.modules.raywatcher().settings().clone();
+        // --- The scene. Frustum-wide chunked LOD terrain + real near meshes +
+        //     per-chunk building/tree proxies + reflective water planes out to
+        //     `camera.far`, rebuilt only when the camera chunk, view sector, or
+        //     loaded world pages change.
+        let config = crate::modules::raywatcher::harvest::HarvestConfig::default();
+        let view_forward = camera.direction();
+        let view_distance = if settings.ray_length > 0. {
+            settings.ray_length
+        } else {
+            camera.far
+        };
+        let content_hash = ((self.local_pages.len() as u64) << 32)
+            ^ ((self.world_pages.len() as u64) << 16)
+            ^ (self.water_batches.len() as u64)
+            ^ (u64::from(self.world_done) << 62);
+        let scene = if let Some(cached) = self.raywatcher_harvest.cached_if_unchanged_frustum(
+            config,
+            camera.pos,
+            view_forward,
+            view_distance,
+            0,
+            content_hash,
+        ) {
+            cached
+        } else {
+            use crate::modules::raywatcher::harvest::{
+                Frustum, InstanceProxy, MeshTriangle, WaterSurface,
+            };
+            let _ = Frustum::from_view_projection(matrix);
+            let detail_radius = config.radius.max(128.0) * 2.0;
+            let detail_radius_sq = detail_radius * detail_radius;
+
+            // Real mesh triangles from ALL resident scenery pages within 360
+            // degrees around the camera so buildings behind or beside the view
+            // still cast accurate mesh shadows onto the 1:1 raster world.
+            let mut real_meshes = Vec::new();
+            let pages_iter = if self.world_done {
+                self.world_pages.iter()
+            } else {
+                self.local_pages.iter()
+            };
+            for page in pages_iter {
+                let (pmin, pmax) = page.page_bounds();
+                let bmin = Vec3::from_array(pmin);
+                let bmax = Vec3::from_array(pmax);
+                let center = (bmin + bmax) * 0.5;
+                let half = (bmax - bmin) * 0.5;
+                let dist_sq = (camera.pos - center).abs().max(half).distance_squared(half);
+                if dist_sq > detail_radius_sq {
+                    continue;
+                }
+                for t in page.rt_triangles() {
+                    real_meshes.push(MeshTriangle {
+                        a: Vec3::from_array(t.a),
+                        b: Vec3::from_array(t.b),
+                        c: Vec3::from_array(t.c),
+                        normal: Vec3::from_array(t.normal),
+                        albedo: t.albedo,
+                        roughness: 0.72,
+                    });
+                }
+            }
+
+            // Distant scenery & trees use compact box proxies (cheaper than
+            // full distant/foliage triangle soups while preserving silhouettes
+            // and shadow casting out to the far frustum edge). `max_instances`
+            // is enforced per chunk inside `scene_frustum`.
+            let mut proxies = Vec::new();
+            if self.world_done {
+                let main_slot = crate::world_objects::GpuPage::world_view_slot(
+                    crate::scenery_visibility::Pass::Main,
+                );
+                for cmd in &self.world_draw_cmds[main_slot].cmds {
+                    let bmin = Vec3::from_array(cmd.min);
+                    let bmax = Vec3::from_array(cmd.max);
+                    let centre = (bmin + bmax) * 0.5;
+                    let half = (bmax - bmin) * 0.5;
+                    if centre.distance_squared(camera.pos) > detail_radius_sq {
+                        proxies.push(InstanceProxy {
+                            centre,
+                            half,
+                            albedo: [0.46, 0.44, 0.40],
+                            yaw: 0.0,
+                        });
+                    }
+                }
+            } else {
+                for page in &self.local_pages {
+                    for b in page.placement_bounds() {
+                        let bmin = Vec3::from_array(b.min);
+                        let bmax = Vec3::from_array(b.max);
+                        let centre = (bmin + bmax) * 0.5;
+                        let half = (bmax - bmin) * 0.5;
+                        if centre.distance_squared(camera.pos) > detail_radius_sq {
+                            proxies.push(InstanceProxy {
+                                centre,
+                                half,
+                                albedo: [0.46, 0.44, 0.40],
+                                yaw: 0.0,
+                            });
+                        }
+                    }
+                }
+            }
+            // Trees across frustum-visible scene blocks: canopy box proxies
+            // give soft tree shadows and reflections without per-leaf geometry.
+            for block in &self.model_scene.blocks {
+                for tree in &block.trees {
+                    let pos = Vec3::from_array(tree.position);
+                    proxies.push(InstanceProxy {
+                        centre: pos + Vec3::new(0.0, 5.5, 0.0),
+                        half: Vec3::new(2.8, 5.5, 2.8),
+                        albedo: [0.18, 0.30, 0.14],
+                        yaw: 0.0,
+                    });
+                }
+            }
+
+            // Reflective water surfaces across the visible frustum.
+            let water: Vec<WaterSurface> = self
+                .water_batches
+                .iter()
+                .map(|w| WaterSurface {
+                    bounds: w.bounds,
+                    height: w.height,
+                })
+                .collect();
+
+            let base_cell = map_space.map(|s| s.spacing).unwrap_or(2.0);
+            let ground_closure =
+                |x: f32, z: f32| -> f32 { map_space.map(|s| s.ground(x, z)).unwrap_or(0.0) };
+            let ground_ref: Option<&dyn Fn(f32, f32) -> f32> =
+                map_space.map(|_| &ground_closure as &dyn Fn(f32, f32) -> f32);
+
+            self.raywatcher_harvest.scene_frustum(
+                config,
+                camera.pos,
+                view_forward,
+                matrix,
+                view_distance,
+                base_cell,
+                0,
+                content_hash,
+                ground_ref,
+                &real_meshes,
+                &proxies,
+                &water,
+            )
+        };
+        let same_world = self
+            .raywatcher_scene
+            .as_ref()
+            .is_some_and(|old| std::sync::Arc::ptr_eq(old, &scene));
+        if !same_world {
+            match self.raywatcher_gpu.as_mut() {
+                Some(gpu) => gpu.set_scene(&self.device, scene.clone()),
+                None => {
+                    self.raywatcher_gpu =
+                        Some(crate::modules::raywatcher::gpu::RaywatcherGpu::new(
+                            &self.device,
+                            scene.clone(),
+                            render_extent,
+                            plan.grid,
+                        ));
+                }
+            }
+            self.raywatcher_scene = Some(scene);
+        } else if let Some(gpu) = self.raywatcher_gpu.as_mut() {
+            // A resize is a new extent, not a new world.
+            gpu.resize(&self.device, render_extent, plan.grid);
+        }
+        let Some(gpu) = self.raywatcher_gpu.as_mut() else {
+            return;
+        };
+        // --- The frame parameters.
+        let fog = camera.air_fog;
+        let lighting = LightingRecord::derive(
+            camera.time_of_day,
+            crate::environment::daylight(camera.time_of_day),
+            camera.regional_light.as_ref(),
+            Vec3::from_array(fog.color),
+            (fog.start, fog.end),
+        );
+        let transport = crate::modules::raywatcher::shade::TransportConfig::new(
+            lighting,
+            settings.ambient_strength,
+            settings.bounce_strength,
+            settings.reflection_roughness_cutoff,
+            2e-3,
+        );
+        let sun = Sun {
+            direction: lighting.direction,
+            colour: lighting.diffuse,
+            angular_radius: settings.sun_radius_degrees.to_radians(),
+            intensity: lighting.daylight,
+        };
+        let params = FrameParams {
+            eye: camera.pos,
+            inv_view_projection: matrix.inverse(),
+            view_projection: matrix,
+            extent: render_extent,
+            grid: plan.grid,
+            near: CAMERA_NEAR,
+            far: if settings.ray_length > 0. {
+                settings.ray_length
+            } else {
+                camera.far
+            },
+            jitter,
+            frame: self.modules.raywatcher().frame_index(),
+            history_valid: u32::from(!reset_history),
+            sun,
+            lighting,
+            bounces: plan.bounces,
+            samples: plan.samples,
+        };
+        let denoise = crate::modules::raywatcher::denoise::DenoiseConfig {
+            iterations: plan.denoise_iterations,
+            ..Default::default()
+        };
+        let hardware_mode = self.modules.raywatcher().effective_mode()
+            == crate::modules::raywatcher::plan::RayTracingMode::Hardware;
+        let layered = !plan.replace_raster;
+        // Always snapshot the untouched 1:1 raster world target so both layered
+        // mode and opt-in `replace_raster` anchor to real textures/geometry
+        // (never coarse proxy boxes).
+        gpu.capture_raster(&self.device, encoder, destination);
+        let mut active_water: Vec<crate::modules::raywatcher::harvest::WaterSurface> = self
+            .water_batches
+            .iter()
+            .map(|w| crate::modules::raywatcher::harvest::WaterSurface {
+                bounds: w.bounds,
+                height: w.height,
+            })
+            .collect();
+        active_water.sort_by(|a, b| {
+            let da = ((a.bounds[0] + a.bounds[1]) * 0.5 - camera.pos.x).powi(2)
+                + ((a.bounds[2] + a.bounds[3]) * 0.5 - camera.pos.z).powi(2);
+            let db = ((b.bounds[0] + b.bounds[1]) * 0.5 - camera.pos.x).powi(2)
+                + ((b.bounds[2] + b.bounds[3]) * 0.5 - camera.pos.z).powi(2);
+            da.total_cmp(&db)
+        });
+        gpu.record(
+            &self.device,
+            &self.queue,
+            encoder,
+            &params,
+            &plan,
+            hardware_mode,
+            &transport,
+            &denoise,
+            &self.object_mv,
+            &self.depth,
+            &active_water,
+        );
+        let mut dlss_rr_ran = false;
+        if plan.reconstruction
+            == crate::modules::raywatcher::plan::RayReconstruction::DlssRayReconstruction
+        {
+            // Flush the trace encoder before NGX DLSS Ray Reconstruction runs
+            // on the native DX12 command queue so it reads the freshly traced
+            // ray grid and G-buffer guides.
+            let pending = std::mem::replace(
+                encoder,
+                self.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("raywatcher post-rr"),
+                    }),
+            );
+            self.queue.submit(Some(pending.finish()));
+            let sdk_dir = self.modules.raywatcher().sdk_dir().to_path_buf();
+            let view = camera.view_matrix();
+            let proj = matrix * view.inverse();
+            if let Some(gpu) = self.raywatcher_gpu.as_mut() {
+                dlss_rr_ran = gpu.reconstruct_dlss_rr(
+                    &self.device,
+                    &self.queue,
+                    encoder,
+                    &sdk_dir,
+                    &params,
+                    &self.object_mv,
+                    reset_history,
+                    layered,
+                    view.to_cols_array_2d(),
+                    proj.to_cols_array_2d(),
+                );
+                if !dlss_rr_ran {
+                    gpu.record_denoise(&self.queue, encoder, &params, &denoise, &self.object_mv);
+                }
+            }
+        }
+        // Composite the denoised RT lighting layer over the untouched raster
+        // world target (or blit directly when DLSS RR already composited or
+        // when `replace_raster` was explicitly opted into).
+        if let Some(gpu) = self.raywatcher_gpu.as_mut() {
+            gpu.composite_to(&self.device, encoder, destination, layered, dlss_rr_ran);
+        }
+        self.modules.raywatcher_mut().next_frame();
+    }
+
     fn render(
         &mut self,
         target: &wgpu::TextureView,
@@ -3659,6 +4098,10 @@ impl Renderer {
         // instead of one call per run.
         self.queue_main_runs();
         lap(STAGE_VISIBILITY, &mut stage_ms, &mut lap_at);
+        // Raywatcher's decision is already on `self.raywatcher_overrides`: it was
+        // made before this call, because the world pass must know which effects
+        // not to draw. `begin_frame` copies it onto the snapshot, which is what
+        // every uniform in this frame is made from.
         let frame = self.begin_frame(camera, w, h);
         self.weather.advance(camera.logic_delta_ms);
         let selected_weather = camera.regional_light.map_or(
@@ -4934,6 +5377,27 @@ async fn adapter(
             .ok_or("No compatible GPU adapter")?
     };
     eprintln!("GPU adapter: {:?}", a.get_info());
+    let adapter_limits = a.limits();
+    let mut required_limits =
+        wgpu::Limits::downlevel_defaults().using_resolution(adapter_limits.clone());
+    // Raywatcher's trace pass binds 5 write-only storage textures and 4 storage
+    // buffers; downlevel_defaults() caps storage textures at 4, which triggers
+    // a wgpu validation error on both hardware and software modes.
+    required_limits.max_storage_textures_per_shader_stage = adapter_limits
+        .max_storage_textures_per_shader_stage
+        .max(required_limits.max_storage_textures_per_shader_stage);
+    required_limits.max_storage_buffers_per_shader_stage = adapter_limits
+        .max_storage_buffers_per_shader_stage
+        .max(required_limits.max_storage_buffers_per_shader_stage);
+    required_limits.max_sampled_textures_per_shader_stage = adapter_limits
+        .max_sampled_textures_per_shader_stage
+        .max(required_limits.max_sampled_textures_per_shader_stage);
+    required_limits.max_storage_buffer_binding_size = adapter_limits
+        .max_storage_buffer_binding_size
+        .max(required_limits.max_storage_buffer_binding_size);
+    required_limits.max_buffer_size = adapter_limits
+        .max_buffer_size
+        .max(required_limits.max_buffer_size);
     let (d, q) = a
         .request_device(
             &wgpu::DeviceDescriptor {
@@ -4945,7 +5409,7 @@ async fn adapter(
                     & (wgpu::Features::TEXTURE_COMPRESSION_BC
                         | wgpu::Features::MULTI_DRAW_INDIRECT
                         | wgpu::Features::INDIRECT_FIRST_INSTANCE),
-                required_limits: wgpu::Limits::downlevel_defaults().using_resolution(a.limits()),
+                required_limits,
             },
             None,
         )
@@ -6633,6 +7097,12 @@ pub fn run(
                                 .or_else(|| xess_upscaler.as_ref().map(|xess| xess.jitter()))
                                 .or_else(|| dlss_upscaler.as_ref().map(|dlss| dlss.jitter()))
                                 .unwrap_or((0.0, 0.0));
+                            // Raywatcher decides before the world pass which
+                            // original effects to leave off, so a replaced
+                            // effect never draws twice (or at all).
+                            let ray_overrides = renderer
+                                .raywatcher_plan(world_extent, camera_jumped);
+                            renderer.raywatcher_overrides = ray_overrides;
                             renderer.render(
                                 &world_view,
                                 &world_raw_view,
@@ -6642,6 +7112,31 @@ pub fn run(
                                 world_extent.1,
                                 camera_jumped,
                             );
+                            // Raywatcher: the plan was decided before the world
+                            // pass (so the effects it replaces never drew), and
+                            // the trace runs now because it consumes the motion
+                            // vectors and depth that pass just wrote. It records
+                            // into its own encoder and submits it, which keeps
+                            // the queue order wgpu already guarantees: world,
+                            // rays, upscale, frame generation, present.
+                            {
+                                let mut ray_encoder = renderer.device.create_command_encoder(
+                                    &wgpu::CommandEncoderDescriptor {
+                                        label: Some("raywatcher"),
+                                    },
+                                );
+                                renderer.raywatcher_record(
+                                    &camera,
+                                    &mut ray_encoder,
+                                    world_extent,
+                                    world_matrix,
+                                    frame_jitter,
+                                    camera_jumped,
+                                    Some(&map_space),
+                                    render_scale.texture(),
+                                );
+                                renderer.queue.submit(Some(ray_encoder.finish()));
+                            }
                             if let Some(fsr) = fsr_upscaler.as_mut() {
                                 match fsr.record(&renderer.device, &renderer.queue, render_scale.texture(), &renderer.depth, &renderer.object_mv_view, &unjittered_vp, camera.lens(), settings.fsr3_sharpness) {
                                     Ok(()) => fsr.composite(&renderer.device, &renderer.queue, scene_view),
