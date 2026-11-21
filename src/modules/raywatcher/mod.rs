@@ -100,6 +100,10 @@ pub struct Raywatcher {
     hardware_note: Option<String>,
     /// True while the background worker thread is rebuilding the BVH.
     scene_building: bool,
+    /// Optional note when `PW_UPSCALER_SDK_DIR` lacked `nvngx_dlssd.dll` and fell back to `<exe>/sdk`.
+    sdk_fallback_note: Option<String>,
+    /// Last runtime NGX DLSS Ray Reconstruction error reported by the GPU runner.
+    dlss_rr_error: Option<String>,
     /// The last frame's status, so the UI can show what the renderer did
     /// rather than what it was asked to do.
     last: Status,
@@ -116,6 +120,8 @@ impl Default for Raywatcher {
             pending_reset: true,
             hardware_note: None,
             scene_building: false,
+            sdk_fallback_note: None,
+            dlss_rr_error: None,
             last: Status::inactive(None),
         }
     }
@@ -126,7 +132,18 @@ impl Raywatcher {
     /// do: the setting if present, then `PW_UPSCALER_SDK_DIR`, then `<exe>/sdk`.
     pub fn new(exe_dir: &Path) -> Self {
         let mut this = Self::default();
-        this.sdk_dir = resolve_sdk_dir(&this.settings.sdk_dir, exe_dir);
+        let (sdk_dir, fallback_note) = resolve_sdk_dir_with_note(&this.settings.sdk_dir, exe_dir);
+        this.sdk_dir = sdk_dir;
+        this.sdk_fallback_note = fallback_note;
+        let dlss_present = this.sdk_dir.join("nvngx_dlssd.dll").is_file();
+        eprintln!(
+            "[Raywatcher] resolved SDK folder: {} (nvngx_dlssd.dll: {})",
+            this.sdk_dir.display(),
+            if dlss_present { "present" } else { "missing" },
+        );
+        if let Some(note) = &this.sdk_fallback_note {
+            eprintln!("[Raywatcher] {note}");
+        }
         this
     }
 
@@ -159,6 +176,12 @@ impl Raywatcher {
     /// Update whether the background ray-scene worker is currently rebuilding.
     pub fn set_scene_building(&mut self, building: bool) {
         self.scene_building = building;
+    }
+
+    /// Record or clear the runtime DLSS Ray Reconstruction failure diagnostic
+    /// so the tab can display it in red under the reconstruction selector.
+    pub fn set_dlss_rr_error(&mut self, error: Option<String>) {
+        self.dlss_rr_error = error;
     }
 
     pub fn hardware_note(&self) -> Option<&str> {
@@ -442,24 +465,34 @@ impl Raywatcher {
                 }
             }
         });
-        ui.label(
+        if let Some(err) = &self.dlss_rr_error {
+            ui.colored_label(
+                egui::Color32::RED,
+                format!("DLSS Ray Reconstruction failed: {err}"),
+            );
+        }
+        let sdk_line = ui.label(
             egui::RichText::new(format!(
-                "SDK folder: {}. DLLs present: DLSS RR {}, FSR RR {}.",
+                "SDK folder: {} | nvngx_dlssd.dll: {} | FSR RR: {}",
                 self.sdk_dir.display(),
                 if self.availability.dlss_rr {
-                    "yes"
+                    "present"
                 } else {
-                    "no"
+                    "missing"
                 },
                 if self.availability.fsr_rr {
-                    "yes"
+                    "present"
                 } else {
-                    "no"
+                    "missing"
                 },
             ))
             .small()
             .weak(),
         );
+        sdk_line.on_hover_text(format!("Resolved SDK folder: {}", self.sdk_dir.display()));
+        if let Some(note) = &self.sdk_fallback_note {
+            ui.label(egui::RichText::new(note).small().weak());
+        }
         if let Some(note) = &self.hardware_note {
             ui.colored_label(egui::Color32::YELLOW, note);
         }
@@ -614,7 +647,10 @@ impl Raywatcher {
         if reset {
             self.pending_reset = true;
         }
-        self.sdk_dir = resolve_sdk_dir(&self.settings.sdk_dir, &self.sdk_dir);
+        let (sdk_dir, fallback_note) =
+            resolve_sdk_dir_with_note(&self.settings.sdk_dir, &self.sdk_dir);
+        self.sdk_dir = sdk_dir;
+        self.sdk_fallback_note = fallback_note;
     }
 }
 
@@ -634,22 +670,51 @@ fn parse_flag(value: String) -> Option<bool> {
 /// the provider can actually run, so the tab can explain the mistake instead of
 /// silently ignoring it.
 pub fn resolve_sdk_dir(configured: &str, fallback: &Path) -> PathBuf {
+    resolve_sdk_dir_with_note(configured, fallback).0
+}
+
+/// Resolve the reconstruction SDK folder, returning an optional diagnostic note
+/// when `PW_UPSCALER_SDK_DIR` does not contain `nvngx_dlssd.dll` and `<exe>/sdk`
+/// does, so the status line can explain the fallback.
+pub fn resolve_sdk_dir_with_note(configured: &str, fallback: &Path) -> (PathBuf, Option<String>) {
+    let env_dir = std::env::var("PW_UPSCALER_SDK_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    resolve_sdk_dir_with_env(configured, fallback, env_dir.as_deref())
+}
+
+fn resolve_sdk_dir_with_env(
+    configured: &str,
+    fallback: &Path,
+    env_dir: Option<&Path>,
+) -> (PathBuf, Option<String>) {
     let configured = configured.trim();
     if !configured.is_empty() {
-        return PathBuf::from(configured);
-    }
-    if let Ok(dir) = std::env::var("PW_UPSCALER_SDK_DIR") {
-        if !dir.trim().is_empty() {
-            return PathBuf::from(dir);
-        }
+        return (PathBuf::from(configured), None);
     }
     // `<exe dir>/sdk` when the fallback path is already a directory, else the
     // fallback's own `sdk` child; both spellings appear in the host's callers.
-    if fallback.ends_with("sdk") {
+    let exe_sdk = if fallback.ends_with("sdk") {
         fallback.to_path_buf()
     } else {
         fallback.join("sdk")
+    };
+    if let Some(dir) = env_dir {
+        let env_has_dlssd = dir.join("nvngx_dlssd.dll").is_file();
+        let exe_has_dlssd = exe_sdk.join("nvngx_dlssd.dll").is_file();
+        if !env_has_dlssd && exe_has_dlssd {
+            let note = format!(
+                "PW_UPSCALER_SDK_DIR ({}) lacked nvngx_dlssd.dll; fell back to {}",
+                dir.display(),
+                exe_sdk.display(),
+            );
+            return (exe_sdk, Some(note));
+        }
+        return (dir.to_path_buf(), None);
     }
+    (exe_sdk, None)
 }
 
 #[cfg(test)]
@@ -894,5 +959,33 @@ mod tests {
         m.frame = u32::MAX;
         m.next_frame();
         assert_eq!(m.frame_index(), 0);
+    }
+
+    #[test]
+    fn pw_upscaler_sdk_dir_without_dlssd_falls_back_to_exe_sdk() {
+        let root = std::env::temp_dir().join(format!("pwe_rw_sdk_fallback_{}", std::process::id()));
+        let env_dir = root.join("env_empty");
+        let exe_dir = root.join("exe_bin");
+        let exe_sdk = exe_dir.join("sdk");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::create_dir_all(&exe_sdk).unwrap();
+        std::fs::write(exe_sdk.join("nvngx_dlssd.dll"), b"stub").unwrap();
+
+        let (resolved, note) = resolve_sdk_dir_with_env("", &exe_dir, Some(&env_dir));
+        assert_eq!(resolved, exe_sdk);
+        let note = note.expect("fallback note must be populated when falling back to <exe>/sdk");
+        assert!(
+            note.contains("nvngx_dlssd.dll"),
+            "fallback note should mention nvngx_dlssd.dll: {note}"
+        );
+
+        // When env_dir DOES contain nvngx_dlssd.dll, keep env_dir with no fallback note.
+        std::fs::write(env_dir.join("nvngx_dlssd.dll"), b"stub").unwrap();
+        let (resolved2, note2) = resolve_sdk_dir_with_env("", &exe_dir, Some(&env_dir));
+        assert_eq!(resolved2, env_dir);
+        assert!(note2.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

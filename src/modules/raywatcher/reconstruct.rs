@@ -94,6 +94,32 @@ pub fn probe_offline(sdk_dir: &Path, platform_supported: bool) -> (Probe, Probe)
 }
 
 /// Per-frame inputs for [`DlssRayReconstructor::evaluate`].
+/// Check whether NVIDIA's NGX Core (`nvngx.dll`) is present in System32 or the
+/// Windows DriverStore FileRepository. Used to diagnose DLSS Ray Reconstruction
+/// runtime init failures in the UI.
+pub fn driver_store_has_nvngx() -> bool {
+    #[cfg(windows)]
+    {
+        if Path::new(r"C:\Windows\System32\nvngx.dll").is_file() {
+            return true;
+        }
+        let repo = Path::new(r"C:\Windows\System32\DriverStore\FileRepository");
+        if let Ok(entries) = std::fs::read_dir(repo) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() && p.join("nvngx.dll").is_file() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 pub struct DlssRrInputs<'a> {
     pub grid_colour: &'a wgpu::TextureView,
     pub grid_reflection: &'a wgpu::TextureView,

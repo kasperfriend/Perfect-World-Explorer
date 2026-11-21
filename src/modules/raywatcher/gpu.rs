@@ -2123,6 +2123,7 @@ pub struct RaywatcherGpu {
     dxr_failed: bool,
     dlss_rr: Option<super::reconstruct::DlssRayReconstructor>,
     dlss_rr_failed: bool,
+    dlss_rr_error: Option<String>,
     blit_pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
     blit_bind_group: wgpu::BindGroup,
     composite_pipeline: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
@@ -2308,6 +2309,7 @@ impl RaywatcherGpu {
             dxr_failed: false,
             dlss_rr: None,
             dlss_rr_failed: false,
+            dlss_rr_error: None,
             blit_pipeline: None,
             blit_bind_group,
             composite_pipeline: None,
@@ -3158,6 +3160,11 @@ impl RaywatcherGpu {
     /// Returns `true` when DLSS RR ran; falls back silently to the in-house
     /// denoiser output already in `self.output` on failure.
     #[allow(clippy::too_many_arguments)]
+    /// Last runtime DLSS Ray Reconstruction failure diagnostic, if any.
+    pub fn dlss_rr_error(&self) -> Option<&str> {
+        self.dlss_rr_error.as_deref()
+    }
+
     pub fn reconstruct_dlss_rr(
         &mut self,
         device: &wgpu::Device,
@@ -3179,7 +3186,14 @@ impl RaywatcherGpu {
             {
                 Ok(rr) => self.dlss_rr = Some(rr),
                 Err(err) => {
-                    eprintln!("[Raywatcher] DLSS Ray Reconstruction init failed ({err}); keeping in-house denoiser");
+                    let nvngx = if super::reconstruct::driver_store_has_nvngx() {
+                        "present"
+                    } else {
+                        "missing"
+                    };
+                    let msg = format!("{err} (DriverStore nvngx.dll: {nvngx})");
+                    eprintln!("[Raywatcher] DLSS Ray Reconstruction init failed: {msg}; keeping in-house denoiser");
+                    self.dlss_rr_error = Some(msg);
                     self.dlss_rr_failed = true;
                     return false;
                 }
@@ -3203,7 +3217,10 @@ impl RaywatcherGpu {
             view_to_clip,
         };
         match rr.evaluate(device, queue, post_encoder, &inputs, &self.output) {
-            Ok(()) => true,
+            Ok(()) => {
+                self.dlss_rr_error = None;
+                true
+            }
             Err(err) => {
                 eprintln!("[Raywatcher] DLSS Ray Reconstruction evaluate failed ({err}); falling back to in-house denoiser");
                 self.dlss_rr = None;

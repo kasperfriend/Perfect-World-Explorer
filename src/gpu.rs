@@ -4168,6 +4168,8 @@ impl Renderer {
                 if !dlss_rr_ran {
                     gpu.record_denoise(&self.queue, encoder, &params, &denoise, &self.object_mv);
                 }
+                let rr_err = gpu.dlss_rr_error().map(str::to_string);
+                self.modules.raywatcher_mut().set_dlss_rr_error(rr_err);
             }
         }
         // Composite the denoised RT lighting layer over the untouched raster
