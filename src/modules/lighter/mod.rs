@@ -271,7 +271,7 @@ const SINGLE_PATH: u32 = 32768;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 const HYBRID_PRIMARY: u32 = 65536;
 const PHYSICAL_BSDF: u32 = 8192;
-const RAY_LIGHTING_OVERLAY: u32 = 512;
+const RAY_LIGHTING_OVERLAY: u32 = 1 << 19;
 pub(super) const RASTER_OVERLAY: u32 = 1 << 20;
 
 pub(crate) fn storage_limit(device: &wgpu::Device) -> usize {
