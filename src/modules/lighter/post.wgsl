@@ -61,6 +61,26 @@ fn clipped_history(old: vec3<f32>, current: Pixel, coord: vec2<u32>) -> vec3<f32
     return select(old,clamp(old,lo,hi),count>=2u);
 }
 
+fn clipped_sa(old_sa: vec2<f32>, current: Pixel, coord: vec2<u32>) -> vec2<f32> {
+    let here = unpack_sa(current);
+    var hi = here;
+    var lo = here;
+    var count = 0u;
+    for (var i = 0u; i < 4u; i++) {
+        let d = select(-1, 1, (i & 1u) != 0u);
+        let pos = vec2<i32>(coord) + select(vec2<i32>(d, 0), vec2<i32>(0, d), i >= 2u);
+        if any(pos < vec2<i32>(0)) || any(pos >= vec2<i32>(params.extent.xy)) { continue; }
+        let neighbor = input_pixels[u32(pos.y) * params.extent.x + u32(pos.x)];
+        if (neighbor.owner & OWNER_MASK) != (current.owner & OWNER_MASK)
+            || guide_weight_mode(guide_of(neighbor), guide_of(current)) < 0.5 { continue; }
+        let sa = unpack_sa(neighbor);
+        hi = max(hi, sa);
+        lo = min(lo, sa);
+        count++;
+    }
+    return select(old_sa, clamp(old_sa, lo, hi), count >= 2u);
+}
+
 fn temporal(current: Pixel, coord: vec2<u32>, i: u32) -> Pixel {
     let reproject = params.history.z!=0u;
     var at = i;
@@ -102,7 +122,9 @@ fn temporal(current: Pixel, coord: vec2<u32>, i: u32) -> Pixel {
     let variance = (1.-alpha)*(old_variance+alpha*delta*delta);
     var out = current;
     if overlay_mode() {
-        let sa = mix(unpack_sa(old), unpack_sa(current), alpha);
+        var old_sa = unpack_sa(old);
+        if reproject { old_sa = clipped_sa(old_sa, current, coord); }
+        let sa = mix(old_sa, unpack_sa(current), alpha);
         out.albedo_history = pack_sa(sa, count << HISTORY_SHIFT);
     } else {
         out.albedo_history |= count << HISTORY_SHIFT;
@@ -131,7 +153,7 @@ fn atrous(coord: vec2<u32>, step: i32) {
     let guide = guide_of(center);
     // No spatial filtering of sky, shifted mirror/refracted silhouettes, or
     // colors with no unique owner. Leave their reverse-Z and temporal mean intact.
-    if guide.x==0u || (guide.w & (GUIDE_UNSAFE|GUIDE_EMISSIVE|GUIDE_WATER))!=0u {
+    if center.depth<=0. || guide.x==0u || (guide.w & (GUIDE_UNSAFE|GUIDE_EMISSIVE|GUIDE_WATER))!=0u {
         output_pixels[i] = center;
         return;
     }

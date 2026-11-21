@@ -1834,10 +1834,12 @@ fn render_overlay_pixel(id: vec2<u32>) {
     let v = to_eye / dist;
     let n = select(v, norm(raw_n), dot(raw_n, raw_n) > 1.0e-6);
 
-    let bias = max(0.05, dist * 0.0025);
-    let origin = p + n * bias;
+    // Combined normal + view bias prevents terrain LOD self-shadowing acne.
+    let bias = max(0.12, dist * 0.004);
+    let origin = p + n * bias + v * (bias * 0.35);
 
-    var seed = hash((id.x + id.y * frame.extent.x + 1u) ^ hash(frame.sampling.x * 1664525u + 1013904223u));
+    let pixel_id = id.x + id.y * frame.extent.x + 1u;
+    var seed = hash(pixel_id ^ hash(frame.sampling.x * 1664525u + 1013904223u));
 
     // Explicitly distinguish Sun (day) vs Moon (night) so 12:00 always uses
     // sun direction/color and 24:00 uses moon direction/color consistently.
@@ -1852,79 +1854,84 @@ fn render_overlay_pixel(id: vec2<u32>) {
     let light_color = select(night_moon_col, day_sun_col, is_day);
 
     // 1. Hardware RT directional shadow (TERMINATE_ON_FIRST_HIT via BLOCKER_MASK).
+    // Distance-culled beyond 450 units and capped at 600-unit ray length for fast TLAS traversal.
     var shadow_vis = 1.0;
-    if (frame.options.x & SHADOWS) != 0u && light_strength > 0.02 && light_dir.y > 0.02 && dot(n, light_dir) > 0.02 {
+    let shadow_fade = 1.0 - smoothstep(350.0, 450.0, dist);
+    if (frame.options.x & SHADOWS) != 0u
+        && shadow_fade > 0.01
+        && light_strength > 0.02
+        && light_dir.y > 0.02
+        && dot(n, light_dir) > 0.02
+    {
         var l_dir = light_dir;
         if (frame.options.x & SOFT_SUN) != 0u {
             let u = vec2<f32>(random(&seed), random(&seed));
-            let delta = u.x * (0.000038);
+            let delta = u.x * 0.000038;
             l_dir = around(light_dir, 1.0 - delta, sqrt(max(0.0, delta * (2.0 - delta))), u.y * 6.2831853);
         }
-        let s_ray = Ray(origin, l_dir, 0.0, frame.eye.w, 0.0, 0.0, 0.5, id.x + id.y * frame.extent.x + 1u);
+        let s_max = min(frame.eye.w, 600.0);
+        let s_ray = Ray(origin, l_dir, 0.02, s_max, 0.0, 0.0, 0.5, pixel_id);
         let s_hit = intersect(s_ray, Query(SHADOW, BLOCKER_MASK, false, vec2<u32>(NIL)));
         shadow_vis = select(0.0, 1.0, s_hit.instance == NIL);
     }
 
-    // 2. Short-range RT Ambient Occlusion (RTAO, TERMINATE_ON_FIRST_HIT).
+    // 2. Short-range RT Ambient Occlusion (1 ray/px + temporal/spatial denoiser, TERMINATE_ON_FIRST_HIT).
+    // Distance-culled beyond 160 units where 10-unit contact AO is sub-pixel.
     var ao = 1.0;
-    if (frame.options.x & LIGHTING) != 0u {
+    let ao_fade = 1.0 - smoothstep(120.0, 160.0, dist);
+    if (frame.options.x & LIGHTING) != 0u && ao_fade > 0.01 {
         let ao_radius = 10.0;
-        let ao_samples = clamp(frame.options.z, 1u, 2u);
-        var ao_sum = 0.0;
-        for (var k = 0u; k < ao_samples; k++) {
-            let d = hemisphere(n, &seed);
-            let ao_ray = Ray(origin, d, 0.0, ao_radius, 0.0, 0.0, 0.5, id.x + id.y * frame.extent.x + 1u);
-            let ao_hit = intersect(ao_ray, Query(DIFFUSE, BLOCKER_MASK, false, vec2<u32>(NIL)));
-            if ao_hit.instance != NIL {
-                let frac = clamp(ao_hit.t / ao_radius, 0.0, 1.0);
-                let occ = (1.0 - frac) * (1.0 - frac);
-                ao_sum += 1.0 - occ;
-            } else {
-                ao_sum += 1.0;
-            }
+        let d = hemisphere(n, &seed);
+        let ao_ray = Ray(origin, d, 0.02, ao_radius, 0.0, 0.0, 0.5, pixel_id);
+        let ao_hit = intersect(ao_ray, Query(DIFFUSE, BLOCKER_MASK, false, vec2<u32>(NIL)));
+        if ao_hit.instance != NIL {
+            let frac = clamp(ao_hit.t / ao_radius, 0.0, 1.0);
+            let occ = (1.0 - frac) * (1.0 - frac);
+            ao = 1.0 - occ * ao_fade;
         }
-        ao = ao_sum / f32(ao_samples);
     }
 
     var added_rgb = vec3<f32>(0.0);
 
-    // 3. Short-range RT indirect bounce lighting (GI).
-    if (frame.options.x & LIGHTING) != 0u && frame.options.y > 0u {
-        let gi_dist = clamp(select(96.0, frame.material_time.w, frame.material_time.w > 0.0), 16.0, 128.0);
+    // 3. Short-range RT indirect bounce lighting (GI), coarse mip spread for L2 cache efficiency.
+    let gi_fade = 1.0 - smoothstep(170.0, 220.0, dist);
+    if (frame.options.x & LIGHTING) != 0u && frame.options.y > 0u && gi_fade > 0.01 {
+        let gi_dist = clamp(select(64.0, frame.material_time.w, frame.material_time.w > 0.0), 16.0, 80.0);
         let gi_dir = hemisphere(n, &seed);
-        let gi_ray = Ray(origin, gi_dir, 0.0, gi_dist, 0.0, 0.02, 0.5, id.x + id.y * frame.extent.x + 1u);
+        let gi_ray = Ray(origin, gi_dir, 0.02, gi_dist, 0.0, 0.08, 0.5, pixel_id);
         let gi_hit = intersect(gi_ray, Query(DIFFUSE, SECONDARY_MASK, false, vec2<u32>(NIL)));
         if gi_hit.instance != NIL {
             let hs = surface(gi_hit, gi_ray);
             let h_ndotl = max(dot(hs.n, light_dir), 0.0);
             let bounce = hs.color.rgb * (light_color * h_ndotl * 0.45 + frame.ambient.rgb * 0.25) + hs.emission * 0.35;
-            added_rgb += bounce * 0.28;
+            added_rgb += bounce * (0.28 * gi_fade);
         }
     }
 
-    // 4. Fresnel-weighted RT reflections (water, glossy, grazing angles).
-    if (frame.options.x & REFLECTIONS) != 0u {
+    // 4. Fresnel-weighted RT reflections (grazing/water/glossy surfaces, distance-culled).
+    let refl_fade = 1.0 - smoothstep(220.0, 280.0, dist);
+    if (frame.options.x & REFLECTIONS) != 0u && refl_fade > 0.01 {
         let ndotv = max(dot(n, v), 0.0);
         let fresnel = 0.04 + 0.96 * pow(1.0 - ndotv, 5.0);
-        if fresnel > 0.07 {
+        if fresnel > 0.12 {
             let refl_dir = reflect(-v, n);
             if dot(refl_dir, n) > 0.0 {
                 let refl_dist = min(frame.eye.w, 256.0);
-                let r_ray = Ray(origin, refl_dir, 0.0, refl_dist, 0.0, 0.01, 0.5, id.x + id.y * frame.extent.x + 1u);
+                let r_ray = Ray(origin, refl_dir, 0.02, refl_dist, 0.0, 0.03, 0.5, pixel_id);
                 let r_hit = intersect(r_ray, Query(SPECULAR, SECONDARY_MASK, false, vec2<u32>(NIL)));
                 if r_hit.instance != NIL {
                     let rs = surface(r_hit, r_ray);
                     let r_ndotl = max(dot(rs.n, light_dir), 0.0);
                     let r_lit = rs.color.rgb * (light_color * r_ndotl + frame.ambient.rgb) + rs.emission;
-                    added_rgb += r_lit * (fresnel * 0.40);
+                    added_rgb += r_lit * (fresnel * 0.40 * refl_fade);
                 } else {
-                    added_rgb += environment(r_ray, true) * (fresnel * 0.22);
+                    added_rgb += environment(r_ray, true) * (fresnel * 0.22 * refl_fade);
                 }
             }
         }
     }
 
-    let shadow_strength = select(0.32, 0.55, is_day) * clamp(light_strength * 1.4, 0.0, 1.0);
+    let shadow_strength = select(0.32, 0.55, is_day) * clamp(light_strength * 1.4, 0.0, 1.0) * shadow_fade;
     let final_shadow = mix(1.0, shadow_vis, shadow_strength);
     let final_ao = mix(1.0, ao, 0.45);
 

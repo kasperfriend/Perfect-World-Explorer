@@ -877,6 +877,10 @@ struct ExtractDepth {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::ComputePipeline,
     params: wgpu::Buffer,
+    cached: Option<(
+        (wgpu::Id<wgpu::TextureView>, wgpu::Id<wgpu::Buffer>),
+        wgpu::BindGroup,
+    )>,
 }
 
 impl ExtractDepth {
@@ -928,11 +932,12 @@ impl ExtractDepth {
             layout,
             pipeline,
             params,
+            cached: None,
         }
     }
 
     fn dispatch(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -946,24 +951,31 @@ impl ExtractDepth {
             extent: frame.extent,
         };
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Lighter raster depth extract bind"),
-            layout: &self.layout,
-            entries: &[
-                resource(0, &self.params),
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(raster_depth),
-                },
-                resource(2, out_pixels),
-            ],
-        });
+        let key = (raster_depth.global_id(), out_pixels.global_id());
+        if self.cached.as_ref().is_none_or(|c| c.0 != key) {
+            self.cached = Some((
+                key,
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Lighter raster depth extract bind"),
+                    layout: &self.layout,
+                    entries: &[
+                        resource(0, &self.params),
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(raster_depth),
+                        },
+                        resource(2, out_pixels),
+                    ],
+                }),
+            ));
+        }
+        let bind = &self.cached.as_ref().unwrap().1;
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("Lighter extract raster depth"),
             timestamp_writes: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind, &[]);
+        pass.set_bind_group(0, bind, &[]);
         pass.dispatch_workgroups(frame.extent[0].div_ceil(8), frame.extent[1].div_ceil(8), 1);
     }
 }
@@ -972,6 +984,10 @@ struct PresentOverlay {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     extent: wgpu::Buffer,
+    cached: Option<(
+        (wgpu::Id<wgpu::Buffer>, wgpu::Id<wgpu::TextureView>),
+        wgpu::BindGroup,
+    )>,
 }
 
 impl PresentOverlay {
@@ -1051,12 +1067,13 @@ impl PresentOverlay {
             layout,
             pipeline,
             extent,
+            cached: None,
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn draw(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
@@ -1066,18 +1083,25 @@ impl PresentOverlay {
         target: &wgpu::TextureView,
     ) {
         queue.write_buffer(&self.extent, 0, bytemuck::bytes_of(&[extent, [1, 0, 0, 0]]));
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Lighter overlay composite bind"),
-            layout: &self.layout,
-            entries: &[
-                resource(0, image),
-                resource(1, &self.extent),
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(raster_depth),
-                },
-            ],
-        });
+        let key = (image.global_id(), raster_depth.global_id());
+        if self.cached.as_ref().is_none_or(|c| c.0 != key) {
+            self.cached = Some((
+                key,
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Lighter overlay composite bind"),
+                    layout: &self.layout,
+                    entries: &[
+                        resource(0, image),
+                        resource(1, &self.extent),
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(raster_depth),
+                        },
+                    ],
+                }),
+            ));
+        }
+        let bind = &self.cached.as_ref().unwrap().1;
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Lighter RT overlay composite"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1093,7 +1117,7 @@ impl PresentOverlay {
             occlusion_query_set: None,
         });
         pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind, &[]);
+        pass.set_bind_group(0, bind, &[]);
         pass.draw(0..3, 0..1);
     }
 }
@@ -2189,6 +2213,9 @@ impl Lighter {
         if let Some(reason) = self.unavailable() {
             return Err(reason.into());
         }
+        if !self.settings.shadows && !self.settings.lighting && !self.settings.reflections {
+            return Ok(false);
+        }
         let [_, _, w, h] = frame.extent;
         if !self.prepare_frame(device, w, h)? {
             return Ok(false);
@@ -2296,7 +2323,7 @@ impl Lighter {
             Mode::Software => {
                 let sw = self.software.as_mut().unwrap();
                 let out_buf = sw.ensure_output(device, bytes);
-                self.extract_depth.as_ref().unwrap().dispatch(
+                self.extract_depth.as_mut().unwrap().dispatch(
                     device,
                     queue,
                     encoder,
@@ -2325,7 +2352,7 @@ impl Lighter {
                         .output_buffer()
                         .ok_or("Lighter Vulkan output buffer is not initialized")?;
                     let mut depth_enc = device.create_command_encoder(&Default::default());
-                    self.extract_depth.as_ref().unwrap().dispatch(
+                    self.extract_depth.as_mut().unwrap().dispatch(
                         device,
                         queue,
                         &mut depth_enc,
@@ -2371,7 +2398,7 @@ impl Lighter {
             image
         };
 
-        self.present_overlay.as_ref().unwrap().draw(
+        self.present_overlay.as_mut().unwrap().draw(
             device,
             queue,
             encoder,
@@ -2381,6 +2408,29 @@ impl Lighter {
             target,
         );
 
+        if settings.dynamic_resolution && self.has_adaptive_samples() {
+            let mut cost = completed
+                .filter(|s| s.mode == settings.mode && s.extent == frame.extent)
+                .map(|s| s.total_ms);
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            if settings.mode == Mode::Hardware {
+                cost = self
+                    .hardware
+                    .as_mut()
+                    .and_then(vulkan::Renderer::take_adaptive_timestamp)
+                    .filter(|(extent, _)| *extent == frame.extent)
+                    .map(|(_, ms)| ms);
+            }
+            if let Some(ms) = cost {
+                let target = if self.target_16_6 {
+                    16.6
+                } else {
+                    f64::from(settings.gpu_target_ms)
+                };
+                self.adaptive
+                    .observe(settings.resolution, ms, target, Instant::now());
+            }
+        }
         self.frame_error = None;
         self.last_trace_extent = (rw, rh);
         self.frame_index += 1;

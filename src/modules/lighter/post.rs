@@ -397,10 +397,10 @@ impl Post {
             let label = "Lighter à-trous radiance";
             // A fresh image cannot use the wide variance passes. Avoid
             // dispatching three full-image copies on nonprogressive frames.
-            let stages = if params.history[0] != 0 {
+            let stages = if overlay {
+                3
+            } else if params.history[0] != 0 {
                 5
-            } else if overlay {
-                4
             } else {
                 2
             };

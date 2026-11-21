@@ -3072,7 +3072,6 @@ fn exercise_sun_and_history(h: &mut Harness) {
     let smooth = h.pixels(frame, &empty);
     h.ray.settings.progressive = saved_progressive;
     h.ray.settings.denoiser = saved_denoiser;
-    h.ray.settings.soft_sun = saved_soft_sun;
     h.ray.reset_history();
     let stats = |pixels: &[([u8; 4], f32)]| {
         let row = (2..SIDE - 2).map(|y| f32::from(pixels[column(y)].0[0]) / f32::from(full));
@@ -3153,6 +3152,7 @@ fn exercise_sun_and_history(h: &mut Harness) {
         (lit_fraction - analytic).abs() < 0.09,
         "disc slice {lit_fraction}, expected {analytic}"
     );
+    h.ray.settings.soft_sun = saved_soft_sun;
     eprintln!("Lighter: penumbra visibility {lit_fraction:.3} (analytic {analytic:.3}); spatial variance {noisy_variance:.4} -> {smooth_variance:.4}");
 
     // Identical receiver depth/normal/albedo, but the camera crosses from
