@@ -506,10 +506,10 @@ fn exercise(mode: Mode, cpu_query: bool) {
         put(&mut b, reject);
     }
     h.ray.install(Ok((b.finish(), bank.clone())));
-    // Green card test checks depth testing, not lighting. Enable lighting
-    // so direct() uses the white-surface ambient path for consistency with
-    // exercise_transport; coloured surfaces still return base colour.
-    h.ray.settings.lighting = true;
+    // Green/red card and sheet ordering tests check primary visibility and
+    // depth testing without sun/ambient attenuation (lighting tests start at
+    // the gray card below).
+    h.ray.settings.lighting = false;
     h.ray.settings.shadows = false;
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     if mode == Mode::Hardware {
@@ -521,8 +521,6 @@ fn exercise(mode: Mode, cpu_query: bool) {
     }
     let (green, z) = h.pixel(frame, &empty);
     assert_eq!(green, [0, 255, 0, 255]);
-    h.ray.settings.lighting = true;
-    h.ray.settings.shadows = true;
     assert!(
         (z - depth_at(frame, Vec3::new(0., 0., -5.))).abs() < 1e-5,
         "{z}"
