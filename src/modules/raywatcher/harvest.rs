@@ -25,6 +25,14 @@ use glam::{Mat4, Vec3};
 
 use super::bvh::{RayMaterial, RayTriangle, SceneGeometry};
 
+/// Per-material source tag stored in `RayMaterial.surface[2]` for
+/// `DebugView::OccluderKind` and `DebugView::ReflectionHitKind`.
+pub const KIND_NONE: f32 = 0.0;
+pub const KIND_WATER: f32 = 1.0;
+pub const KIND_TERRAIN_LOD: f32 = 2.0;
+pub const KIND_REAL_MESH: f32 = 3.0;
+pub const KIND_PROXY: f32 = 4.0;
+
 /// How the harvest is bounded. Every field is a knob the module's UI could
 /// expose later; the defaults are what a 1080p frame at 60 Hz can afford.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -401,14 +409,18 @@ impl Harvester {
         let mut triangles = Vec::new();
         let mut materials = Vec::new();
 
+        let t_harvest = std::time::Instant::now();
         // 1. Real mesh triangles (near-camera buildings/props with real
         //    normals and baked vertex diffuse albedo).
+        let before_mesh = triangles.len();
         push_real_meshes(&mut triangles, &mut materials, real_meshes);
+        let real_mesh_tris = triangles.len() - before_mesh;
 
         // 2. Chunked instance proxies (distant buildings/props and trees:
         //    proxies are much cheaper than full foliage/distant meshes and
         //    still cast accurate silhouettes and reflections). `max_instances`
         //    is enforced per spatial chunk with nearest instances winning.
+        let before_proxy = triangles.len();
         self.instances = push_instances_chunked(
             &mut triangles,
             &mut materials,
@@ -418,14 +430,18 @@ impl Harvester {
             far,
             config,
         );
+        let proxy_tris = triangles.len() - before_proxy;
 
         // 3. Reflective water surfaces across the visible frustum.
+        let before_water = triangles.len();
         push_water(&mut triangles, &mut materials, water, eye, &frustum, far);
+        let water_quads = (triangles.len() - before_water) / 2;
 
         // 4. Chunked multi-LOD terrain across the entire visible frustum out to
         //    `far`.
+        let mut terrain_lod_tris = [0usize; 4];
         if let Some(ground_fn) = ground {
-            push_terrain_frustum(
+            terrain_lod_tris = push_terrain_frustum(
                 &mut triangles,
                 &mut materials,
                 eye,
@@ -443,7 +459,20 @@ impl Harvester {
             None
         };
         self.triangles = triangles.len();
+        let t_bvh = std::time::Instant::now();
         let scene = std::sync::Arc::new(SceneGeometry::build(triangles, materials));
+        let bvh_ms = t_bvh.elapsed().as_secs_f64() * 1000.0;
+        let total_ms = t_harvest.elapsed().as_secs_f64() * 1000.0;
+        if std::env::var_os("PWE_RT_DEBUG").is_some() {
+            eprintln!(
+                "[Raywatcher] scene_frustum: water_quads={water_quads} lod_terrain_tris=[near:{}, mid:{}, far:{}, vfar:{}] real_mesh_tris={real_mesh_tris} proxy_tris={proxy_tris} total_tris={} bvh_build_ms={bvh_ms:.2} total_ms={total_ms:.2}",
+                terrain_lod_tris[0],
+                terrain_lod_tris[1],
+                terrain_lod_tris[2],
+                terrain_lod_tris[3],
+                self.triangles,
+            );
+        }
         self.cached = Some((sig, scene.clone()));
         scene
     }
@@ -532,7 +561,7 @@ fn push_instances(
             surface: [
                 0.75,
                 0.05,
-                0.,
+                KIND_PROXY,
                 if instance.albedo[1] > instance.albedo[0] * 1.15
                     && instance.albedo[1] > instance.albedo[2] * 1.15
                 {
@@ -616,7 +645,7 @@ fn push_terrain(
         albedo: [0.32, 0.36, 0.28, 1.],
         // Ground is as rough as a surface gets; a tiny sheen only catches the
         // sun at grazing angles, where a wet field should.
-        surface: [0.92, 0., 0., 1.],
+        surface: [0.92, 0., KIND_TERRAIN_LOD, 1.],
     });
     let stride = config.stride.max(1);
     let spacing = field.cell * stride as f32;
@@ -766,7 +795,7 @@ fn push_real_meshes(
             let id = materials.len() as u32;
             materials.push(RayMaterial {
                 albedo: [m.albedo[0], m.albedo[1], m.albedo[2], 1.0],
-                surface: [m.roughness.clamp(0.04, 1.0), 0.05, 0.0, opacity],
+                surface: [m.roughness.clamp(0.04, 1.0), 0.05, KIND_REAL_MESH, opacity],
             });
             id
         });
@@ -809,7 +838,7 @@ fn push_water(
             let id = materials.len() as u32;
             materials.push(RayMaterial {
                 albedo: [0.10, 0.22, 0.28, 1.0],
-                surface: [0.06, 0.02, 0.0, 1.0],
+                surface: [0.06, 0.02, KIND_WATER, 1.0],
             });
             id
         });
@@ -899,7 +928,7 @@ fn push_instances_chunked(
                         instance.albedo[2],
                         1.0,
                     ],
-                    surface: [0.75, 0.05, 0.0, opacity],
+                    surface: [0.75, 0.05, KIND_PROXY, opacity],
                 });
                 id
             });
@@ -926,7 +955,8 @@ fn push_terrain_frustum(
     base_cell: f32,
     config: HarvestConfig,
     ground: &dyn Fn(f32, f32) -> f32,
-) {
+) -> [usize; 4] {
+    let mut lod_tris = [0usize; 4];
     let chunk_size = config.chunk_size.max(64.0);
     let near_r = config.radius.max(64.0);
     let mid_r = near_r * 3.0;
@@ -936,7 +966,7 @@ fn push_terrain_frustum(
     let material = materials.len() as u32;
     materials.push(RayMaterial {
         albedo: [0.32, 0.36, 0.28, 1.0],
-        surface: [0.92, 0.0, 0.0, 1.0],
+        surface: [0.92, 0.0, KIND_TERRAIN_LOD, 1.0],
     });
 
     let min_cx = ((eye.x - far) / chunk_size).floor() as i32;
@@ -973,14 +1003,14 @@ fn push_terrain_frustum(
             // Pick compact 360-degree LOD divisions per chunk based on distance
             // from eye so the full view distance is covered in every direction
             // without camera-rotation rebuild stalls.
-            let target_step = if dist <= near_r {
-                fine_step * 2.0
+            let (lod_band, target_step) = if dist <= near_r {
+                (0usize, fine_step * 2.0)
             } else if dist <= mid_r {
-                fine_step * 4.0
+                (1usize, fine_step * 4.0)
             } else if dist <= far_r {
-                fine_step * 8.0
+                (2usize, fine_step * 8.0)
             } else {
-                fine_step * 16.0
+                (3usize, fine_step * 16.0)
             };
             let divs = ((chunk_size / target_step).round() as u32).clamp(2, 20);
             let step = chunk_size / divs as f32;
@@ -1020,10 +1050,12 @@ fn push_terrain_frustum(
                     };
                     triangles.push(RayTriangle::new(p0, p1, p2, n0, material));
                     triangles.push(RayTriangle::new(p0, p2, p3, n1, material));
+                    lod_tris[lod_band] += 2;
                 }
             }
         }
     }
+    lod_tris
 }
 
 #[cfg(test)]

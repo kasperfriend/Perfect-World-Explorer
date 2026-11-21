@@ -261,6 +261,14 @@ bool occluded(float3 origin, float3 dir, float t_min, float t_max, uint seed) {
     return q.CommittedStatus() == COMMITTED_TRIANGLE_HIT;
 }
 
+float3 kind_colour(float kind) {
+    if (kind < 0.5) return float3(0.04, 0.04, 0.04);
+    if (kind < 1.5) return float3(0.0, 0.85, 1.0);   // cyan: water quad
+    if (kind < 2.5) return float3(1.0, 0.55, 0.0);   // orange: LOD terrain
+    if (kind < 3.5) return float3(0.15, 0.90, 0.25); // green: real mesh
+    return float3(0.95, 0.15, 0.85);                 // magenta: instance proxy
+}
+
 [numthreads(8, 8, 1)]
 void trace_pass(uint3 id : SV_DispatchThreadID) {
     uint2 extent = uint2(uint(params.extents.x), uint(params.extents.y));
@@ -566,6 +574,35 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         store_refl = float3(0.0, 0.0, 0.0);
     } else if (debug_mode == 6u) {
         out_rgb = float3(point_vis, point_vis, point_vis);
+        out_lf = 1.0;
+        store_refl = float3(0.0, 0.0, 0.0);
+    } else if (debug_mode == 7u) {
+        float occ_kind = 0.0;
+        if (n_dot_l > 0.02) {
+            Hit sh = closest_hit(ray_origin, params.sun_dir.xyz, bias * 0.5, params.lens.y);
+            if (sh.index != 0xffffffffu) {
+                occ_kind = material_of(sh.index).surface.z;
+            }
+        }
+        if (occ_kind < 0.5) {
+            Hit ah = closest_hit(ray_origin, normal, bias * 0.5, ao_radius);
+            if (ah.index != 0xffffffffu) {
+                occ_kind = material_of(ah.index).surface.z;
+            }
+        }
+        out_rgb = kind_colour(occ_kind);
+        out_lf = 1.0;
+        store_refl = float3(0.0, 0.0, 0.0);
+    } else if (debug_mode == 8u) {
+        float rkind = 0.0;
+        if (roughness <= params.effects.x) {
+            float3 rdir = reflect(view_dir, normal);
+            Hit rh = closest_hit(ray_origin, rdir, bias, params.lens.y);
+            if (rh.index != 0xffffffffu) {
+                rkind = material_of(rh.index).surface.z;
+            }
+        }
+        out_rgb = kind_colour(rkind);
         out_lf = 1.0;
         store_refl = float3(0.0, 0.0, 0.0);
     }

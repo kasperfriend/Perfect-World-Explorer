@@ -157,10 +157,15 @@ pub enum DebugView {
     Reflections,
     /// Local / point-light direct shadowed contribution.
     PointLights,
+    /// Colours each shadow/AO hit by occluder source: cyan = water quad,
+    /// orange = LOD terrain, green = real mesh, magenta = proxy, dark = none.
+    OccluderKind,
+    /// Colours each reflection hit by its source kind (same palette).
+    ReflectionHitKind,
 }
 
 impl DebugView {
-    pub const ALL: [DebugView; 7] = [
+    pub const ALL: [DebugView; 9] = [
         Self::None,
         Self::RasterOnly,
         Self::SunVisibility,
@@ -168,6 +173,8 @@ impl DebugView {
         Self::GlobalIllumination,
         Self::Reflections,
         Self::PointLights,
+        Self::OccluderKind,
+        Self::ReflectionHitKind,
     ];
 
     pub fn label(self) -> &'static str {
@@ -179,6 +186,10 @@ impl DebugView {
             Self::GlobalIllumination => "Global illumination",
             Self::Reflections => "Reflections",
             Self::PointLights => "Point lights",
+            Self::OccluderKind => {
+                "Occluder kind (cyan=water, orange=terrain, green=mesh, magenta=proxy)"
+            }
+            Self::ReflectionHitKind => "Reflection hit kind",
         }
     }
 
@@ -191,6 +202,8 @@ impl DebugView {
             Self::GlobalIllumination => "gi",
             Self::Reflections => "reflections",
             Self::PointLights => "points",
+            Self::OccluderKind => "occluder",
+            Self::ReflectionHitKind => "reflection_hit",
         }
     }
 
@@ -203,6 +216,8 @@ impl DebugView {
             "gi" | "bounce" => Some(Self::GlobalIllumination),
             "reflections" | "refl" => Some(Self::Reflections),
             "points" | "point_lights" | "lights" => Some(Self::PointLights),
+            "occluder" | "occluder_kind" => Some(Self::OccluderKind),
+            "reflection_hit" | "refl_hit" | "reflection_hit_kind" => Some(Self::ReflectionHitKind),
             _ => None,
         }
     }
@@ -216,6 +231,8 @@ impl DebugView {
             Self::GlobalIllumination => 4,
             Self::Reflections => 5,
             Self::PointLights => 6,
+            Self::OccluderKind => 7,
+            Self::ReflectionHitKind => 8,
         }
     }
 }

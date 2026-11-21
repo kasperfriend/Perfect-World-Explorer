@@ -772,6 +772,14 @@ fn ggx_sample(normal: vec3<f32>, roughness: f32, u1: f32, u2: f32) -> vec3<f32> 
     return normalize(orthonormal_basis(normal) * local_h);
 }
 
+fn kind_colour(kind: f32) -> vec3<f32> {
+    if (kind < 0.5) { return vec3<f32>(0.04, 0.04, 0.04); }
+    if (kind < 1.5) { return vec3<f32>(0.0, 0.85, 1.0); }   // cyan: water quad
+    if (kind < 2.5) { return vec3<f32>(1.0, 0.55, 0.0); }   // orange: LOD terrain
+    if (kind < 3.5) { return vec3<f32>(0.15, 0.90, 0.25); } // green: real mesh
+    return vec3<f32>(0.95, 0.15, 0.85);                     // magenta: instance proxy
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
     let extent = vec2<u32>(u32(params.extents.x), u32(params.extents.y));
@@ -1045,6 +1053,37 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         store_refl = vec3<f32>(0.0);
     } else if (debug_mode == 6u) {
         out_rgb = vec3<f32>(point_vis);
+        out_lf = 1.0;
+        store_refl = vec3<f32>(0.0);
+    } else if (debug_mode == 7u) {
+        // Phase 0: OccluderKind — colours each shadow/AO hit by source kind.
+        var occ_kind = 0.0;
+        if (n_dot_l > 0.02) {
+            let sh = closest_hit(ray_origin, params.sun_dir.xyz, bias * 0.5, params.lens.y);
+            if (sh.index != 0xffffffffu) {
+                occ_kind = material_of(sh.index).surface.z;
+            }
+        }
+        if (occ_kind < 0.5) {
+            let ah = closest_hit(ray_origin, normal, bias * 0.5, ao_radius);
+            if (ah.index != 0xffffffffu) {
+                occ_kind = material_of(ah.index).surface.z;
+            }
+        }
+        out_rgb = kind_colour(occ_kind);
+        out_lf = 1.0;
+        store_refl = vec3<f32>(0.0);
+    } else if (debug_mode == 8u) {
+        // Phase 0: ReflectionHitKind — colours each reflection hit by source kind.
+        var rkind = 0.0;
+        if (roughness <= params.effects.x) {
+            let rdir = reflect(view_dir, normal);
+            let rh = closest_hit(ray_origin, rdir, bias, params.lens.y);
+            if (rh.index != 0xffffffffu) {
+                rkind = material_of(rh.index).surface.z;
+            }
+        }
+        out_rgb = kind_colour(rkind);
         out_lf = 1.0;
         store_refl = vec3<f32>(0.0);
     }
