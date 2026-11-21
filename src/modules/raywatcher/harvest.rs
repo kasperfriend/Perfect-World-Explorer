@@ -1047,7 +1047,30 @@ fn push_real_meshes(
     let mut palette: std::collections::HashMap<(u8, u8, u8, u8, u8), u32> =
         std::collections::HashMap::new();
     triangles.reserve(meshes.len());
+    let mut dropped = 0usize;
+    let before = triangles.len();
     for m in meshes {
+        if !m.a.is_finite() || !m.b.is_finite() || !m.c.is_finite() {
+            dropped += 1;
+            continue;
+        }
+        let geo = (m.b - m.a).cross(m.c - m.a);
+        let area2_sq = geo.length_squared();
+        if !area2_sq.is_finite() || area2_sq <= 1e-8 {
+            dropped += 1;
+            continue;
+        }
+        let normal = if m.normal.is_finite() && (m.normal.length() - 1.0).abs() <= 1e-3 {
+            m.normal
+        } else if m.normal.is_finite() && m.normal.length_squared() > 1e-6 {
+            m.normal.normalize()
+        } else {
+            geo / area2_sq.sqrt()
+        };
+        if !normal.is_finite() || (normal.length() - 1.0).abs() > 1e-3 {
+            dropped += 1;
+            continue;
+        }
         let opacity = m.opacity.clamp(0.0, 1.0);
         let key = (
             (m.albedo[0].clamp(0.0, 1.0) * 31.0).round() as u8,
@@ -1068,10 +1091,16 @@ fn push_real_meshes(
             m.a,
             m.b,
             m.c,
-            m.normal,
+            normal,
             mat_id,
             KIND_REAL_MESH,
         ));
+    }
+    if dropped > 0 && std::env::var_os("PWE_RT_DEBUG").is_some() {
+        eprintln!(
+            "[Raywatcher] Phase R3 push_real_meshes: kept={}, dropped_invalid={dropped}",
+            triangles.len() - before
+        );
     }
 }
 
@@ -2201,6 +2230,65 @@ mod tests {
                 geo.y > 0.0 && stored.y > 0.0 && geo.dot(stored) > 0.999,
                 "concave fan terrain winding {geo:?} must match stored normal {stored:?} and face +Y"
             );
+        }
+    }
+
+    #[test]
+    fn phase_r3_real_meshes_drop_zero_area_and_sanitize_normals() {
+        let meshes = vec![
+            // Valid triangle with non-unit normal (should be normalized to unit length).
+            MeshTriangle {
+                a: Vec3::new(0.0, 0.0, 0.0),
+                b: Vec3::new(2.0, 0.0, 0.0),
+                c: Vec3::new(0.0, 2.0, 0.0),
+                normal: Vec3::new(0.0, 0.0, 5.0),
+                albedo: [0.5, 0.4, 0.3],
+                roughness: 0.8,
+                opacity: 1.0,
+            },
+            // Zero-area degenerate triangle (must be dropped).
+            MeshTriangle {
+                a: Vec3::new(1.0, 1.0, 1.0),
+                b: Vec3::new(1.0, 1.0, 1.0),
+                c: Vec3::new(2.0, 2.0, 2.0),
+                normal: Vec3::Y,
+                albedo: [0.5, 0.5, 0.5],
+                roughness: 0.8,
+                opacity: 1.0,
+            },
+            // NaN vertex triangle (must be dropped).
+            MeshTriangle {
+                a: Vec3::new(f32::NAN, 0.0, 0.0),
+                b: Vec3::new(1.0, 0.0, 0.0),
+                c: Vec3::new(0.0, 1.0, 0.0),
+                normal: Vec3::Y,
+                albedo: [0.5, 0.5, 0.5],
+                roughness: 0.8,
+                opacity: 1.0,
+            },
+            // Valid triangle with zero normal (recomputed from geometry).
+            MeshTriangle {
+                a: Vec3::new(0.0, 0.0, 0.0),
+                b: Vec3::new(0.0, 0.0, 2.0),
+                c: Vec3::new(2.0, 0.0, 0.0),
+                normal: Vec3::ZERO,
+                albedo: [0.3, 0.6, 0.3],
+                roughness: 0.85,
+                opacity: 0.7,
+            },
+        ];
+        let mut tris = Vec::new();
+        let mut mats = Vec::new();
+        push_real_meshes(&mut tris, &mut mats, &meshes);
+        assert_eq!(tris.len(), 2, "zero-area and NaN triangles must be dropped");
+        for t in &tris {
+            let n = Vec3::new(t.normal[0], t.normal[1], t.normal[2]);
+            assert!(
+                (n.length() - 1.0).abs() <= 1e-3,
+                "normal must be unit length within 1e-3, got {n:?}"
+            );
+            assert_eq!(t.normal[3], 0.0, "normal[3] must remain 0.0");
+            assert_eq!(t.kind(), KIND_REAL_MESH, "kind must be stored in a[3]");
         }
     }
 }

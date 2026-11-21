@@ -1133,13 +1133,13 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
         if (n_dot_l > 0.02) {
             let sh = closest_hit(ray_origin, params.sun_dir.xyz, bias * 0.5, params.lens.y);
             if (sh.index != 0xffffffffu) {
-                occ_kind = tris[sh.index].n.w;
+                occ_kind = tris[sh.index].a.w;
             }
         }
         if (occ_kind < 0.5) {
             let ah = closest_hit(ray_origin, normal, bias * 0.5, ao_radius);
             if (ah.index != 0xffffffffu) {
-                occ_kind = tris[ah.index].n.w;
+                occ_kind = tris[ah.index].a.w;
             }
         }
         out_rgb = kind_colour(occ_kind);
@@ -1152,7 +1152,7 @@ fn trace_pass(@builtin(global_invocation_id) id: vec3<u32>) {
             let rdir = reflect(view_dir, normal);
             let rh = closest_hit(ray_origin, rdir, bias, params.lens.y);
             if (rh.index != 0xffffffffu) {
-                rkind = tris[rh.index].n.w;
+                rkind = tris[rh.index].a.w;
             }
         }
         out_rgb = kind_colour(rkind);

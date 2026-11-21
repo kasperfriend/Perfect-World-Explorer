@@ -42,13 +42,13 @@ impl RayTriangle {
     }
 
     /// Construct a triangle with a per-triangle source kind stored in
-    /// `normal[3]` (used by `DebugView::OccluderKind` and `ReflectionHitKind`).
+    /// `a[3]` (keeping `normal` strictly `(nx, ny, nz, 0.0)`).
     pub fn with_kind(a: Vec3, b: Vec3, c: Vec3, normal: Vec3, material: u32, kind: f32) -> Self {
         Self {
-            a: [a.x, a.y, a.z, 0.],
+            a: [a.x, a.y, a.z, kind],
             b: [b.x, b.y, b.z, material as f32],
             c: [c.x, c.y, c.z, 0.],
-            normal: [normal.x, normal.y, normal.z, kind],
+            normal: [normal.x, normal.y, normal.z, 0.],
         }
     }
 
@@ -56,9 +56,9 @@ impl RayTriangle {
         self.b[3] as u32
     }
 
-    /// Per-triangle source kind tag (`KIND_*`) stored in `normal[3]`.
+    /// Per-triangle source kind tag (`KIND_*`) stored in `a[3]`.
     pub fn kind(&self) -> f32 {
-        self.normal[3]
+        self.a[3]
     }
 
     /// Twice the area, which is also the length of the un-normalised cross

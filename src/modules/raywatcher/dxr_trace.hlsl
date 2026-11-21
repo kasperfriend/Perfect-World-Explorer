@@ -609,13 +609,13 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         if (n_dot_l > 0.02) {
             Hit sh = closest_hit(ray_origin, params.sun_dir.xyz, bias * 0.5, params.lens.y);
             if (sh.index != 0xffffffffu) {
-                occ_kind = tris[sh.index].n.w;
+                occ_kind = tris[sh.index].a.w;
             }
         }
         if (occ_kind < 0.5) {
             Hit ah = closest_hit(ray_origin, normal, bias * 0.5, ao_radius);
             if (ah.index != 0xffffffffu) {
-                occ_kind = tris[ah.index].n.w;
+                occ_kind = tris[ah.index].a.w;
             }
         }
         out_rgb = kind_colour(occ_kind);
@@ -627,7 +627,7 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
             float3 rdir = reflect(view_dir, normal);
             Hit rh = closest_hit(ray_origin, rdir, bias, params.lens.y);
             if (rh.index != 0xffffffffu) {
-                rkind = tris[rh.index].n.w;
+                rkind = tris[rh.index].a.w;
             }
         }
         out_rgb = kind_colour(rkind);
