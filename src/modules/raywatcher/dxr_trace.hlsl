@@ -456,17 +456,16 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
         }
         accum_refl_dist += refl_dist;
 
-        // Phase 5: 3-tap stratified cosine-weighted indirect GI bounce using
-        // estimated receiver albedo (not already-lit raster colour) and the
-        // screen-space radiance cache for textured colour bleeding (falling
-        // back to harvested baked albedo off-screen).
+        // Phase 6: 4-tap stratified cosine-weighted diffuse GI with stable
+        // receiver albedo, on-screen radiance cache / off-screen baked albedo
+        // bounce, and real SkyGpu+CloudGpu cubemap sky bounce on misses.
         if (bits_gi && params.frame.z >= 1.0 && params.tuning.w > 0.0) {
-            uint gi_taps = 3u;
+            uint gi_taps = 4u;
             float3 est_direct = params.sun_colour.xyz * n_dot_l + params.ambient.xyz * params.tuning.z;
             float3 receiver_albedo = clamp(
-                raster_rgb / max(est_direct, float3(0.25, 0.25, 0.25)),
+                raster_rgb / max(est_direct, float3(0.30, 0.30, 0.30)),
                 float3(0.12, 0.12, 0.12),
-                float3(0.95, 0.95, 0.95));
+                float3(0.90, 0.90, 0.90));
             float3 gi_sum = float3(0.0, 0.0, 0.0);
             for (uint g = 0u; g < gi_taps; g = g + 1u) {
                 float u1 = (float(g) + rand01(state)) / float(gi_taps);
@@ -479,26 +478,27 @@ void trace_pass(uint3 id : SV_DispatchThreadID) {
                 Hit bhit = closest_hit(ray_origin, d, bias, min(params.lens.y, 96.0));
                 if (bhit.index != 0xffffffffu) {
                     float b_ndl = max(dot(bhit.normal, params.sun_dir.xyz), 0.0);
-                    if (b_ndl > 0.01) {
-                        float3 bhit_world = ray_origin + d * bhit.t;
-                        float b_bias = max(bias, length(bhit_world - params.eye.xyz) * 0.004);
-                        float b_shadow = 1.0;
-                        if (bits_shadows) {
-                            float3 bhit_pos = bhit_world + bhit.normal * b_bias;
-                            if (occluded(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y, state ^ (g * 73u + 11u))) {
-                                b_shadow = 0.0;
-                            }
-                        }
-                        if (b_shadow > 0.0) {
-                            float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
-                            float3 incoming = b_screen.rgb * (0.35 + 0.65 * b_ndl);
-                            if (b_screen.a < 0.5) {
-                                Material bmat = material_of(bhit.index);
-                                incoming = bmat.albedo.rgb * params.sun_colour.xyz * (b_ndl * b_shadow * 1.35);
-                            }
-                            gi_sum += receiver_albedo * incoming * (params.tuning.w * 0.90 * (1.0 - fog_t));
+                    float3 bhit_world = ray_origin + d * bhit.t;
+                    float b_bias = max(bias, length(bhit_world - params.eye.xyz) * 0.004);
+                    float b_shadow = 1.0;
+                    if (bits_shadows && b_ndl > 0.01) {
+                        float3 bhit_pos = bhit_world + bhit.normal * b_bias;
+                        if (occluded(bhit_pos, params.sun_dir.xyz, b_bias * 0.5, params.lens.y, state ^ (g * 73u + 11u))) {
+                            b_shadow = 0.0;
                         }
                     }
+                    float4 b_screen = sample_screen_radiance(bhit_world, bhit.t);
+                    float3 incoming = float3(0.0, 0.0, 0.0);
+                    if (b_screen.a >= 0.5) {
+                        incoming = b_screen.rgb * (0.25 + 0.75 * b_ndl * b_shadow);
+                    } else {
+                        Material bmat = material_of(bhit.index);
+                        incoming = bmat.albedo.rgb * (params.sun_colour.xyz * (b_ndl * b_shadow * 1.25) + params.ambient.xyz * (params.tuning.z * 0.35));
+                    }
+                    gi_sum += receiver_albedo * incoming * (params.tuning.w * 0.85 * (1.0 - fog_t));
+                } else {
+                    float3 sky_bounce = sample_sky_env(d);
+                    gi_sum += receiver_albedo * sky_bounce * (params.tuning.w * 0.22 * (1.0 - fog_t));
                 }
             }
             accum_gi += gi_sum * (1.0 / float(gi_taps));
