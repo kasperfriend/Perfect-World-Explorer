@@ -13,11 +13,11 @@ Every place a loader can lose a value without saying so, classified. Generated b
 
 | file | line | pattern | category | code |
 |---|---|---|---|---|
-| `src/bmd.rs` | 169 | `ok-question` | **probe** | `ambient: color(start).ok()?,` |
-| `src/bmd.rs` | 170 | `ok-question` | **probe** | `diffuse: color(start + 16).ok()?,` |
-| `src/bmd.rs` | 171 | `ok-question` | **probe** | `emissive: color(start + 32).ok()?,` |
-| `src/bmd.rs` | 172 | `ok-question` | **probe** | `specular: color(start + 48).ok()?,` |
-| `src/bmd.rs` | 173 | `ok-question` | **probe** | `power: f(tail, start + 64).ok()?,` |
+| `src/bmd.rs` | 177 | `ok-question` | **probe** | `ambient: color(start).ok()?,` |
+| `src/bmd.rs` | 178 | `ok-question` | **probe** | `diffuse: color(start + 16).ok()?,` |
+| `src/bmd.rs` | 179 | `ok-question` | **probe** | `emissive: color(start + 32).ok()?,` |
+| `src/bmd.rs` | 180 | `ok-question` | **probe** | `specular: color(start + 48).ok()?,` |
+| `src/bmd.rs` | 181 | `ok-question` | **probe** | `power: f(tail, start + 64).ok()?,` |
 | `src/client_detect.rs` | 181 | `ok-question` | **probe** | `let word = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 182 | `ok-question` | **probe** | `let timestamp = u32::from_le_bytes(bytes.get(4..8)?.try_into().ok()?);` |
 | `src/client_detect.rs` | 184 | `ok-question` | **probe** | `short: u16::from_le_bytes(bytes.get(0..2)?.try_into().ok()?),` |
